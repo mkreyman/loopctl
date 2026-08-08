@@ -200,6 +200,42 @@ Operator-facing changes for deployments outside the hosted instance.
 
 ### Changed
 
+- **Webhook deliveries now carry a timestamped signature; receivers must migrate (#623).**
+  Every delivery gains an `X-Webhook-Signature` header in the form
+  `t=<unix_seconds>,v1=<hmac_sha256>`, where the MAC covers `"<t>.<raw_body>"` rather than the
+  body alone. Because the timestamp is inside the MAC, a receiver can bound how long a given
+  signature is worth honouring instead of accepting any `(body, signature)` pair indefinitely.
+  **Recommended receiver behaviour:** recompute the MAC over the raw bytes you received (not a
+  re-encoded parse), compare in constant time, reject when `|now - t|` exceeds **300 seconds**,
+  and keep a short-lived cache of `X-Webhook-Id` covering at least that window — loopctl retries
+  a delivery under the SAME id, so cache on "already processed successfully", not "already
+  seen". `README.md` carries a worked example.
+  **Migration:** the legacy `X-Signature-256` header (`sha256=<hmac(raw_body)>`) is STILL SENT
+  unchanged for a deprecation window, so no receiver breaks today; it will be removed. Nothing
+  to configure — signing secrets are unchanged.
+
+- **A webhook delivery failure no longer records the destination's response body.** The stored
+  delivery error, which a tenant reads back through the deliveries API, previously included the
+  first 200 characters of whatever the destination returned. It now carries the status code and
+  the response `content-type` only, so a delivery record describes the failure without carrying
+  back content from wherever loopctl was pointed. Debugging a receiver you own is unaffected:
+  status and content-type identify the failure, and the receiver's own logs hold the rest.
+
+- **`LOCAL_ENDPOINT_ALLOWLIST` entries are now purpose- and port-scoped (breaking for some
+  deployments).** An entry is `host[:port][@purpose[+purpose...]]` or `cidr[@purpose...]`, where
+  purpose is `inference`, `webhook` or `ingest`. **An unqualified entry grants `inference`
+  only.** Previously one entry granted every purpose on every port, so a carve-out made so the
+  deployment could reach its own model endpoint also made those hosts legal destinations for
+  tenant-authored webhook deliveries and tenant-authored ingest fetches, and a
+  `host:port` entry silently granted every port on that host.
+  **Action required** if you rely on an allowlisted host for webhook delivery or content
+  ingestion: name the purpose — `10.0.0.5@webhook`, `ollama.internal@inference+ingest`. Local
+  model endpoints (the common case) need no change. A port written in an entry now binds it to
+  that port; an entry with no port still matches any port — every port on that host, and for
+  `webhook`/`ingest` the destination port is tenant-chosen, so state the port on any entry that
+  exists for a single service. Existing bare-host entries keep working. An IPv6 literal must be
+  bracketed when it carries a port (`[fdaa::1]:8080`) and bare when it does not (`fdaa::1`). An entry naming an unknown purpose grants nothing and is reported by `egress_posture`
+  at `:user`+ (and logged) as a defect rather than dropped silently.
 - **BREAKING (API): `idempotency_key` is no longer returned in any article payload.** It is
   still accepted on create and still a filter on `GET /api/v1/articles?idempotency_key=…`
   (and the `knowledge_list` / `knowledge_count` MCP tools) — the lag-free existence check

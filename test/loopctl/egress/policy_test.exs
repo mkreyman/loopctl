@@ -135,6 +135,61 @@ defmodule Loopctl.Egress.PolicyTest do
     end
   end
 
+  # THE pair the purpose scoping exists for. A deployment whose model endpoint is
+  # network-local must keep working unchanged, while the SAME host stops being an
+  # acceptable destination for a tenant-authored webhook. Both halves are asserted
+  # on ONE host under ONE allowlist so neither can be satisfied by a change that
+  # simply refuses (or admits) everything.
+  describe "an operator carve-out answers for the purpose it names" do
+    test "the UNCHANGED inference deployment still resolves, and webhook does not",
+         %{tenant: t, scope: scope} do
+      :ok = mark_local_only(t.id)
+
+      # The documented, pre-existing form of the entry — a bare host, untouched by
+      # an operator upgrading past this change.
+      with_allowlist(["127.0.0.1"], fn ->
+        assert {:ok, pinned} =
+                 Policy.check(scope, "http://127.0.0.1:11434/v1/embeddings", :inference)
+
+        assert pinned.ip == {127, 0, 0, 1}
+
+        assert {:error, :egress_blocked, details} =
+                 Policy.check(scope, "http://127.0.0.1:11434/hooks", :webhook,
+                   tenant_supplied: true
+                 )
+
+        # `:denylisted`, NOT `:non_local`: an ungranted carve-out must fall back to
+        # what the ADDRESS is, or an unmarked scope would pin and connect to it.
+        assert details.verdict == :denylisted
+      end)
+    end
+
+    test "naming webhook grants it WITHOUT taking inference away", %{tenant: t, scope: scope} do
+      :ok = mark_local_only(t.id)
+
+      with_allowlist(["127.0.0.1@inference+webhook"], fn ->
+        assert {:ok, _} = Policy.check(scope, "http://127.0.0.1:11434/v1/embeddings", :inference)
+
+        assert {:ok, _} =
+                 Policy.check(scope, "http://127.0.0.1:9000/hooks", :webhook,
+                   tenant_supplied: true
+                 )
+      end)
+    end
+
+    test "a port-bound entry keeps inference working on the port it names",
+         %{tenant: t, scope: scope} do
+      :ok = mark_local_only(t.id)
+
+      with_allowlist(["127.0.0.1:11434"], fn ->
+        assert {:ok, _} = Policy.check(scope, "http://127.0.0.1:11434/v1/embeddings", :inference)
+
+        assert {:error, :egress_blocked, _} =
+                 Policy.check(scope, "http://127.0.0.1:8080/v1/embeddings", :inference)
+      end)
+    end
+  end
+
   describe "local_only refusal (AC-41.4.3, TC-41.4.1)" do
     test "a vendor endpoint is refused BEFORE any request", %{tenant: t, scope: scope} do
       :ok = mark_local_only(t.id)
@@ -515,6 +570,105 @@ defmodule Loopctl.Egress.PolicyTest do
                Policy.check(scope, "https://sneaky.example.com/v1", :inference)
 
       assert details.verdict == :denylisted
+    end
+
+    # REGRESSION (review): revalidation re-puts a REFRESHED `:ips` but carries the
+    # ORIGINAL `:ungranted_base` forward. A host allowlisted BY NAME whose DNS
+    # moved from a public to a PRIVATE answer therefore kept `:public`, fell back
+    # to `:non_local` for a purpose the carve-out does not grant, passed the
+    # denylist gate — and was pinned and connected to on the private address.
+    test "a name-allowlisted host that MOVES to a private address is refused, not pinned",
+         %{tenant: t, scope: scope} do
+      with_allowlist(["vendor.example.com@inference"], fn ->
+        stub(Loopctl.MockDnsResolver, :resolve, fn
+          "vendor.example.com" -> {:ok, [{203, 0, 113, 10}]}
+          _ -> {:ok, [{93, 184, 216, 34}]}
+        end)
+
+        assert {:ok, _} = Policy.check(scope, "https://vendor.example.com/v1", :inference)
+
+        # The name still resolves — to the operator's private network now.
+        stub(Loopctl.MockDnsResolver, :resolve, fn
+          "vendor.example.com" -> {:ok, [{10, 0, 0, 5}]}
+          _ -> {:ok, [{93, 184, 216, 34}]}
+        end)
+
+        :ok = PinCache.mark_due(t.id, Scope.key(scope), "vendor.example.com")
+        assert PinCache.refresh_now(t.id) >= 1
+
+        # `webhook` is a purpose the carve-out does not name, so the host falls
+        # back to what its CURRENT addresses make it: denylisted.
+        assert {:error, :egress_blocked, details} =
+                 Policy.check(scope, "https://vendor.example.com/hook", :webhook,
+                   tenant_supplied: true
+                 )
+
+        assert details.verdict == :denylisted
+        assert details.purpose == :webhook
+        assert details.remediation =~ "'webhook' purpose"
+      end)
+    end
+
+    # REGRESSION (review): `repin/3` classified with the `:any` port, which by
+    # design matches only a PORTLESS entry — so a re-pin reported `denylisted` for
+    # a host that inference calls (which carry a port) reach without a problem,
+    # and sent the agent to a remediation only the operator could act on.
+    test "a re-pin reports the verdict for the port the SCOPE actually uses",
+         %{tenant: t, scope: scope} do
+      fixture(:tenant_llm_settings,
+        tenant_id: t.id,
+        chat_provider: "openai_compatible",
+        chat_base_url: "http://ollama.internal:11434/v1",
+        extraction_model: "llama3.1"
+      )
+
+      with_allowlist(["ollama.internal:11434"], fn ->
+        stub(Loopctl.MockDnsResolver, :resolve, fn
+          "ollama.internal" -> {:ok, [{10, 0, 0, 5}]}
+          _ -> {:ok, [{93, 184, 216, 34}]}
+        end)
+
+        assert {:ok, %{verdict: :network_local}} =
+                 Policy.repin(scope, "ollama.internal", :inference)
+      end)
+    end
+
+    # REGRESSION (review): the port came from the FIRST resolved endpoint on the
+    # host (always `:embedding`), so a scope whose embedding and chat endpoints
+    # share a host on different ports re-pinned against the wrong one — answering
+    # `network_local` while the call the agent was recovering stays refused.
+    test "a re-pin over a host reached on two ports reports the LEAST permissive",
+         %{tenant: t, scope: scope} do
+      # The embedding endpoint is `https://api.openai.com/v1` (port 443) under
+      # test config, so pointing chat at the same host on another port is what
+      # makes the two resolved endpoints collide.
+      fixture(:tenant_llm_settings,
+        tenant_id: t.id,
+        chat_provider: "openai_compatible",
+        chat_base_url: "http://api.openai.com:8080/v1",
+        extraction_model: "llama3.1"
+      )
+
+      with_allowlist(["api.openai.com:443"], fn ->
+        stub(Loopctl.MockDnsResolver, :resolve, fn _ -> {:ok, [{10, 0, 0, 5}]} end)
+
+        # 443 is carved out; 8080 — the port the chat call actually uses — is not.
+        assert {:ok, %{verdict: :denylisted}} =
+                 Policy.repin(scope, "api.openai.com", :inference)
+      end)
+    end
+
+    # REGRESSION (review): a host the tenant only DECLARED is not a resolved
+    # endpoint, so the port fell back to `:any`, which by design matches no
+    # port-bound entry — the same wrong verdict the port fix was written to remove.
+    test "a re-pin over a non-endpoint host uses the port the carve-out states",
+         %{scope: scope} do
+      with_allowlist(["declared.internal:11434@inference"], fn ->
+        stub(Loopctl.MockDnsResolver, :resolve, fn _ -> {:ok, [{10, 0, 0, 7}]} end)
+
+        assert {:ok, %{verdict: :network_local}} =
+                 Policy.repin(scope, "declared.internal", :inference)
+      end)
     end
   end
 
