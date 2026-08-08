@@ -16,12 +16,23 @@ defmodule LoopctlWeb.StoryStatusController do
   use OpenApiSpex.ControllerSpecs
 
   alias Loopctl.ApiSpec.Schemas
+  alias Loopctl.Capabilities
   alias Loopctl.Dispatches
   alias Loopctl.Progress
   alias Loopctl.Progress.StateMachine
   alias LoopctlWeb.AuditContext
 
   action_fallback LoopctlWeb.FallbackController
+
+  # #621: the L1 capability layer's two refusal shapes. Both are rendered as 403 by
+  # FallbackController (fallback_controller.ex:259, :272) but previously had no
+  # clause in the controllers' case statements, so they raised CaseClauseError and
+  # surfaced as 500s. Expressed as a guard so each action forwards them in ONE
+  # branch — the controller actions sit at credo's cyclomatic-complexity limit.
+  defguardp is_capability_error(reason)
+            when reason == :missing_capability or
+                   (is_tuple(reason) and tuple_size(reason) == 2 and
+                      elem(reason, 0) == :cap_rejected)
 
   plug LoopctlWeb.Plugs.RequireRole,
        [exact_role: [:agent, :orchestrator]] when action in [:contract]
@@ -60,7 +71,12 @@ defmodule LoopctlWeb.StoryStatusController do
 
   operation(:claim,
     summary: "Claim story",
-    description: "Agent claims a contracted story. Uses pessimistic locking.",
+    description:
+      "Agent claims a contracted story. Uses pessimistic locking. The response carries a " <>
+        "`capability` (a start_cap) which the caller must present to POST /start; it is " <>
+        "bound to the caller's dispatch lineage and expires. Claiming with a " <>
+        "dispatch-minted key also records the implementer's dispatch on the story, which " <>
+        "is what the downstream custody gates compare.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     responses: %{
       200 => {"Story claimed", "application/json", Schemas.StoryStatusResponse},
@@ -73,11 +89,31 @@ defmodule LoopctlWeb.StoryStatusController do
 
   operation(:start,
     summary: "Start story",
-    description: "Agent starts work on an assigned story.",
+    description:
+      "Agent starts work on an assigned story. A tenant with an audit signing key must " <>
+        "present the `start_cap` returned by the claim response (or recovered via " <>
+        "POST /stories/:id/recover-cap) as `capability`; omitting it yields " <>
+        "403 missing_capability. A pre-v2 tenant with no audit key needs no capability.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
+    request_body:
+      {"Start params", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         properties: %{
+           capability: %OpenApiSpex.Schema{
+             type: :string,
+             format: :uuid,
+             description:
+               "The start_cap `cap_id` issued to this caller's dispatch lineage. Accepted " <>
+                 "as `cap_id` as well. Single-use, story-bound, lineage-bound, expiring."
+           }
+         }
+       }},
     responses: %{
       200 => {"Story started", "application/json", Schemas.StoryStatusResponse},
-      403 => {"Not assigned agent", "application/json", Schemas.ErrorResponse},
+      403 =>
+        {"Not assigned agent, or missing/rejected capability", "application/json",
+         Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 => {"Invalid transition", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
@@ -104,6 +140,10 @@ defmodule LoopctlWeb.StoryStatusController do
     description:
       "A DIFFERENT agent (reviewer) reports story as done. " <>
         "The implementing agent cannot call this (chain-of-custody). " <>
+        "No capability token is required or accepted: this transition is gated by " <>
+        "structural lineage separation, not by L1, because a capability can only be " <>
+        "bound to a lineage known when it is minted, and the reporter is by definition " <>
+        "a principal distinct from the implementer who started the work. " <>
         "Optionally includes an artifact report and/or a token usage record.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     request_body:
@@ -164,6 +204,7 @@ defmodule LoopctlWeb.StoryStatusController do
        }},
     responses: %{
       200 => {"Story reported done", "application/json", Schemas.StoryStatusResponse},
+      403 => {"Missing or rejected capability", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 =>
         {"Invalid transition or self-report blocked", "application/json", Schemas.ErrorResponse},
@@ -193,7 +234,10 @@ defmodule LoopctlWeb.StoryStatusController do
   def contract(conn, %{"id" => story_id} = params) do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
-    skip_check = api_key.role in [:orchestrator, :admin]
+    # #624(6): `:admin` was checked here but is not a role in the hierarchy
+    # (superadmin > user > orchestrator > agent — see Loopctl.Auth.Role), so the
+    # atom was dead. Removed rather than left as a misleading forward-reference.
+    skip_check = api_key.role == :orchestrator
 
     opts =
       AuditContext.from_conn(conn)
@@ -230,12 +274,16 @@ defmodule LoopctlWeb.StoryStatusController do
   def claim(conn, %{"id" => story_id}) do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
-    opts = Keyword.merge(AuditContext.from_conn(conn), agent_id: api_key.agent_id)
+
+    opts =
+      AuditContext.from_conn(conn)
+      |> Keyword.merge(agent_id: api_key.agent_id)
+      |> Keyword.merge(custody_identity(api_key))
 
     case Progress.claim_story(tenant_id, story_id, opts) do
       {:ok, story} ->
         role = conn.assigns.current_api_key.role
-        json(conn, %{story: story, next_actions: StateMachine.next_actions(story, role)})
+        respond_with_story(conn, story, role)
 
       {:error, :must_contract_first} ->
         {:error, :must_contract_first}
@@ -259,18 +307,31 @@ defmodule LoopctlWeb.StoryStatusController do
 
   Agent starts work on an assigned story.
   """
-  def start(conn, %{"id" => story_id}) do
+  def start(conn, %{"id" => story_id} = params) do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
-    opts = Keyword.merge(AuditContext.from_conn(conn), agent_id: api_key.agent_id)
+
+    opts =
+      AuditContext.from_conn(conn)
+      |> Keyword.merge(agent_id: api_key.agent_id)
+      |> Keyword.merge(custody_identity(api_key))
+      |> Keyword.put(:cap_id, capability_param(params))
 
     case Progress.start_story(tenant_id, story_id, opts) do
       {:ok, story} ->
         role = conn.assigns.current_api_key.role
-        json(conn, %{story: story, next_actions: StateMachine.next_actions(story, role)})
+        respond_with_story(conn, story, role)
 
       {:error, :not_assigned_agent} ->
         {:error, :forbidden}
+
+      # #621: the capability layer's own refusals had NO clause here, so a missing
+      # or rejected token raised CaseClauseError and surfaced as a 500 instead of
+      # the documented 403 — the failure mode was indistinguishable from a crash.
+      # FallbackController already renders both (fallback_controller.ex:259, :272);
+      # they just have to reach it.
+      {:error, reason} when is_capability_error(reason) ->
+        {:error, reason}
 
       {:error, :must_contract_first} ->
         {:error, :must_contract_first}
@@ -346,6 +407,11 @@ defmodule LoopctlWeb.StoryStatusController do
         # (nil under bearer); Progress records it in the hash-chained audit entry.
         custody_claim: conn.assigns[:custody_signed_claim]
       )
+      # #621: report consumes NO capability — see Progress.start_story/3 for why a
+      # report_cap cannot be bound to a principal permitted to report. The custody
+      # gate fed by :reporter_lineage above is the enforcement. :dispatch_id is
+      # still resolved server-side so the reporter's dispatch is recorded.
+      |> Keyword.merge(custody_identity(api_key))
       |> maybe_add_token_usage(params)
 
     artifact_params = extract_artifact_params(params)
@@ -353,7 +419,7 @@ defmodule LoopctlWeb.StoryStatusController do
     case Progress.report_story(tenant_id, story_id, opts, artifact_params) do
       {:ok, story} ->
         role = conn.assigns.current_api_key.role
-        json(conn, %{story: story, next_actions: StateMachine.next_actions(story, role)})
+        respond_with_story(conn, story, role)
 
       # Custody-gate failures pass through unchanged to the FallbackController:
       #   * :self_report_blocked        — reporter is the implementer.
@@ -429,6 +495,43 @@ defmodule LoopctlWeb.StoryStatusController do
   end
 
   defp extract_artifact_params(_), do: nil
+
+  # Resolves the caller's dispatch identity SERVER-SIDE from the authenticating
+  # key. Never accepts a client-supplied dispatch id or lineage: a self-attested
+  # lineage would defeat both the capability binding and the self-* custody gates.
+  #
+  # Returns `[lineage: []]` for a key not minted by a dispatch (a legacy env-var
+  # key). `[]` is inert — it matches a cap minted for `[]` and is never a lineage
+  # "match" for the custody gates (Dispatches.lineage_shares_prefix?/2), so such a
+  # caller falls back to the agent-id checks rather than short-circuiting them.
+  defp custody_identity(api_key) do
+    case Dispatches.dispatch_for_api_key(api_key.tenant_id, api_key.id) do
+      {:ok, dispatch} -> [dispatch_id: dispatch.id, lineage: dispatch.lineage_path]
+      :none -> [lineage: []]
+    end
+  end
+
+  # Accepts the capability under either key, matching the convention already used
+  # by LoopctlWeb.Plugs.RequireSignedClaim (require_signed_claim.ex:54).
+  defp capability_param(params) do
+    params["capability"] || params["cap_id"]
+  end
+
+  # #621: returns the story plus, when the transition minted one, the capability
+  # the caller needs for its NEXT custody op — under a top-level `capability` key
+  # rather than inside the story object, since it is a credential for the caller
+  # and not story state. Absent (rather than null) when nothing was minted.
+  defp respond_with_story(conn, story, role) do
+    body = %{story: story, next_actions: StateMachine.next_actions(story, role)}
+
+    body =
+      case story.minted_capability do
+        nil -> body
+        cap -> Map.put(body, :capability, Capabilities.serialize(cap))
+      end
+
+    json(conn, body)
+  end
 
   defp maybe_add_token_usage(opts, %{"token_usage" => token_usage}) when is_map(token_usage) do
     Keyword.put(opts, :token_usage, token_usage)

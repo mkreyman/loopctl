@@ -5,6 +5,8 @@ defmodule LoopctlWeb.DispatchController do
 
   use LoopctlWeb, :controller
 
+  require Logger
+
   alias Loopctl.Auth.Role
   alias Loopctl.Dispatches
 
@@ -18,25 +20,50 @@ defmodule LoopctlWeb.DispatchController do
 
   @doc "POST /api/v1/dispatches"
   def create(conn, params) do
-    tenant_id = conn.assigns.current_api_key.tenant_id
+    api_key = conn.assigns.current_api_key
+    tenant_id = api_key.tenant_id
     parent_id = params["parent_dispatch_id"]
 
-    # Role ceiling: a dispatch may not be minted at a HIGHER privilege than the
-    # caller's own key. Without this an orchestrator (or any holder of an attestation
-    # over an agent key) could mint a `:user`-role dispatch bearing that key, escaping
-    # the role hierarchy — the attestation authorizes the KEY, it must not silently
-    # elevate the key's PRIVILEGE. A higher requested role is 403'd here.
-    if role_exceeds_caller?(conn, params["role"]) do
-      reject_role_ceiling(conn, params["role"])
-    else
-      # G6: Non-root dispatches must provide their parent's dispatch ID.
-      # The parent must be active (not revoked, not expired). Root dispatches
-      # (parent_id is nil) are only created at tenant signup.
-      if parent_id do
-        validate_parent_and_create(conn, tenant_id, parent_id, params)
-      else
+    # The CALLER's own lineage, resolved SERVER-SIDE from the authenticating key —
+    # never taken from the request body. See lineage_within_caller?/3.
+    caller_lineage = Dispatches.lineage_for_api_key(tenant_id, api_key.id)
+
+    # The operator privilege — starting a NEW tree, and parenting anywhere in the
+    # tenant — is decided POSITIVELY, not inferred from an absent lineage.
+    # `lineage_for_api_key/2` returns [] for THREE different principals: the tenant's
+    # human-anchored operator key, a legacy long-lived env-var key, and a key whose
+    # dispatch row no longer resolves. Only the first deserves the privilege, and only
+    # it is minted at `role: :user` (Tenants signup ceremony). Treating [] alone as
+    # "operator" left every legacy `:orchestrator` key able to hand ITSELF an
+    # independently-rooted dispatch for the whole deprecation window — the exact escape
+    # the ceiling exists to close.
+    operator? = caller_lineage == [] and Role.role_at_least?(api_key.role, :user)
+
+    cond do
+      # Role ceiling: a dispatch may not be minted at a HIGHER privilege than the
+      # caller's own key. Without this an orchestrator (or any holder of an attestation
+      # over an agent key) could mint a `:user`-role dispatch bearing that key, escaping
+      # the role hierarchy — the attestation authorizes the KEY, it must not silently
+      # elevate the key's PRIVILEGE. A higher requested role is 403'd here.
+      role_exceeds_caller?(conn, params["role"]) ->
+        reject_role_ceiling(conn, params["role"])
+
+      # G6: Non-root dispatches must provide their parent's dispatch ID. The parent
+      # must be active (not revoked, not expired) AND inside the caller's own subtree.
+      parent_id ->
+        validate_parent_and_create(conn, tenant_id, parent_id, caller_lineage, operator?, params)
+
+      # LINEAGE CEILING (root half). A parentless dispatch starts a NEW, independent
+      # lineage tree — one that shares no root with any existing dispatch, and which
+      # the L4 separation checks therefore treat as an unrelated principal. A caller
+      # that is not the operator must not be able to hand itself one: the structural
+      # separation the custody gates rest on is only meaningful if a principal cannot
+      # step outside its own tree on demand.
+      not operator? ->
+        reject_root_mint(conn, api_key, caller_lineage)
+
+      true ->
         do_create_dispatch(conn, tenant_id, params)
-      end
     end
   end
 
@@ -76,23 +103,28 @@ defmodule LoopctlWeb.DispatchController do
     })
   end
 
-  defp validate_parent_and_create(conn, tenant_id, parent_id, params) do
+  defp validate_parent_and_create(conn, tenant_id, parent_id, caller_lineage, operator?, params) do
     case Dispatches.get_dispatch(tenant_id, parent_id) do
       {:ok, parent} ->
         now = DateTime.utc_now()
 
-        if parent.revoked_at || DateTime.compare(parent.expires_at, now) != :gt do
-          conn
-          |> put_status(:forbidden)
-          |> json(%{
-            error: %{
-              code: "parent_dispatch_expired",
-              status: 403,
-              message: "Parent dispatch is expired or revoked"
-            }
-          })
-        else
-          do_create_dispatch(conn, tenant_id, params)
+        cond do
+          parent.revoked_at || DateTime.compare(parent.expires_at, now) != :gt ->
+            conn
+            |> put_status(:forbidden)
+            |> json(%{
+              error: %{
+                code: "parent_dispatch_expired",
+                status: 403,
+                message: "Parent dispatch is expired or revoked"
+              }
+            })
+
+          not lineage_within_caller?(parent.lineage_path, caller_lineage, operator?) ->
+            reject_lineage_escape(conn, conn.assigns.current_api_key, caller_lineage, parent_id)
+
+          true ->
+            do_create_dispatch(conn, tenant_id, params)
         end
 
       {:error, :not_found} ->
@@ -100,6 +132,116 @@ defmodule LoopctlWeb.DispatchController do
         |> put_status(:not_found)
         |> json(%{error: %{message: "Parent dispatch not found", status: 404}})
     end
+  end
+
+  # LINEAGE CEILING (parent half). Rejecting only the parentless case would leave the
+  # same escape open one step further out: any dispatch in the tenant is enumerable
+  # via GET /api/v1/dispatches, so a caller could name a parent under a DIFFERENT root
+  # and mint itself into that unrelated tree. A minted dispatch must therefore descend
+  # from the caller's own dispatch — `parent.lineage_path` must have the caller's
+  # lineage as a prefix.
+  #
+  # The OPERATOR key may parent anywhere in its tenant: it is not inside any tree, so
+  # it cannot escape one. The same reasoning covers a []-lineage NON-operator (a legacy
+  # env-var key): it has no subtree to step outside of, and the ceiling exists to stop a
+  # principal escaping ITS OWN tree. Refusing it here closed the only remaining mint it
+  # had — root minting is already operator-only — leaving a legacy `:orchestrator` key
+  # unable to obtain a lineage by any request at all, against the documented deprecation
+  # window. Naming a parent gives it a lineage, which SUBJECTS it to the custody gates.
+  # A caller that IS inside a tree must stay inside it.
+  defp lineage_within_caller?(_parent_lineage, _caller_lineage, true), do: true
+  defp lineage_within_caller?(_parent_lineage, [], false), do: true
+
+  defp lineage_within_caller?(parent_lineage, [_ | _] = caller_lineage, false)
+       when is_list(parent_lineage),
+       do: List.starts_with?(parent_lineage, caller_lineage)
+
+  defp lineage_within_caller?(_parent_lineage, _caller_lineage, false), do: false
+
+  defp reject_root_mint(conn, api_key, caller_lineage) do
+    log_ceiling_refusal("root_dispatch_forbidden", api_key, caller_lineage, nil)
+
+    conn
+    |> put_status(:forbidden)
+    |> json(%{
+      error: %{
+        status: 403,
+        code: "root_dispatch_forbidden",
+        message:
+          "A parentless dispatch starts a NEW independent lineage tree, which only the " <>
+            "tenant's own operator key (a `user`-role key that no dispatch minted) may do. " <>
+            root_mint_remedy(caller_lineage),
+        remediation: root_mint_remediation(caller_lineage)
+      }
+    })
+  end
+
+  # The remedy must be one the REFUSED caller can actually perform. "Mint inside your
+  # own lineage" is meaningless to a caller that has none — and `your_dispatch_id`
+  # would be a bare null there, which is how the previous wording read to every legacy
+  # key. Name a parent it can obtain instead.
+  defp root_mint_remedy([]),
+    do:
+      "Your key was not minted by a dispatch, so you have no lineage of your own: pass " <>
+        "`parent_dispatch_id` naming any active dispatch in your tenant (GET " <>
+        "/api/v1/dispatches), or have the tenant's `user`-role operator key mint the root."
+
+  defp root_mint_remedy(_caller_lineage),
+    do: "Pass `parent_dispatch_id` and mint this dispatch inside your own lineage."
+
+  # The remediation is only actionable if the caller can NAME its own dispatch, and
+  # nothing else on this API tells it which row is its own. It is already resolved
+  # server-side as the last element of the caller's lineage, so hand it back — and OMIT
+  # the key entirely when there is no such row, rather than emitting null.
+  defp root_mint_remediation([]), do: %{learn_more: "https://loopctl.com/wiki/dispatch-lineage"}
+
+  defp root_mint_remediation(caller_lineage) do
+    %{
+      your_dispatch_id: List.last(caller_lineage),
+      your_lineage_path: caller_lineage,
+      learn_more: "https://loopctl.com/wiki/dispatch-lineage"
+    }
+  end
+
+  defp reject_lineage_escape(conn, api_key, caller_lineage, parent_id) do
+    log_ceiling_refusal("parent_outside_caller_lineage", api_key, caller_lineage, parent_id)
+
+    conn
+    |> put_status(:forbidden)
+    |> json(%{
+      error: %{
+        status: 403,
+        code: "parent_outside_caller_lineage",
+        message:
+          "The requested parent dispatch is not in your lineage. A dispatch may only be " <>
+            "minted beneath the caller's own dispatch, so that the lineage separation the " <>
+            "custody gates rest on cannot be sidestepped. Use your own dispatch id (or one " <>
+            "of its descendants) as `parent_dispatch_id`.",
+        remediation: %{
+          your_dispatch_id: List.last(caller_lineage),
+          your_lineage_path: caller_lineage,
+          learn_more: "https://loopctl.com/wiki/dispatch-lineage"
+        }
+      }
+    })
+  end
+
+  # A principal trying to place itself in a lineage it does not belong to is the
+  # highest-signal event on this endpoint. Without this the refusals were invisible:
+  # a 403 body to the attacker and nothing at all to the operator.
+  defp log_ceiling_refusal(code, api_key, caller_lineage, parent_id) do
+    Logger.warning(
+      "lineage_ceiling_refused: code=#{code} tenant_id=#{api_key.tenant_id} " <>
+        "api_key_id=#{api_key.id} role=#{api_key.role} " <>
+        "caller_lineage_root=#{inspect(List.first(caller_lineage))} " <>
+        "requested_parent_dispatch_id=#{inspect(parent_id)}"
+    )
+
+    :telemetry.execute(
+      [:loopctl, :custody, :lineage_ceiling_refused],
+      %{count: 1},
+      %{code: code, tenant_id: api_key.tenant_id, api_key_id: api_key.id}
+    )
   end
 
   defp do_create_dispatch(conn, tenant_id, params) do

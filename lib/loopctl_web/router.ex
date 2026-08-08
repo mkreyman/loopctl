@@ -345,6 +345,10 @@ defmodule LoopctlWeb.Router do
     # Cap recovery for session-crash resilience
     post "/stories/:id/recover-cap", CapRecoveryController, :recover
 
+    # #621 — delivery of capabilities already issued to the caller's lineage.
+    # Distinct from recover-cap above: this one never mints.
+    get "/stories/:id/capabilities", CapabilityController, :index
+
     # Story status transitions (agent side of two-tier trust model)
     post "/stories/:id/contract", StoryStatusController, :contract
     post "/stories/:id/claim", StoryStatusController, :claim

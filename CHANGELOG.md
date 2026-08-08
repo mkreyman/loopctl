@@ -2,6 +2,131 @@
 
 All notable changes to loopctl are documented here.
 
+## [Unreleased] — 2026-08-07 — Story lifecycle capability delivery
+
+### Fixed
+
+- **The story lifecycle is completable again for tenants with an audit signing key (#621).**
+  Every tenant created through the current signup flow has one, and for those tenants the
+  capability layer rejected start/report/verify because NO client-facing path ever handed the
+  caller a capability token: the tokens were minted at each transition and discarded. The
+  lifecycle has been unusable over the API since 2026-04-12; it went unnoticed because recent
+  work flowed through pull requests rather than the story lifecycle, and because the test
+  suite only exercised the keyless path, where capabilities are not enforced.
+  **What changed for clients:** the `claim` response now carries a `capability` object whose
+  `cap_id` must be presented as the `capability` field on `start`. That is the ONLY capability
+  a client ever has to carry. A new `GET /api/v1/stories/:id/capabilities` returns the live
+  tokens already issued to the caller for a story — the recovery path when the claim response
+  is lost to a crash or timeout; it never mints. `loopctl-mcp-server` handles all of this
+  automatically; upgrade it rather than plumbing tokens by hand. Claiming with a
+  dispatch-minted key now also records `implementer_dispatch_id`, without which every
+  downstream lineage check silently degraded to plain agent-id equality.
+
+- **`report` and `verify` no longer require a capability token, and no `report_cap` or
+  `verify_cap` is minted.** Neither could have worked. A capability binds to exactly one
+  dispatch lineage, but both transitions exist precisely so that a DIFFERENT principal
+  performs them: the `report_cap` authorized the one principal forbidden to report, and the
+  `verify_cap` was bound to whichever dispatch loopctl selected as verifier — which may be an
+  `:agent`-role dispatch that the `exact_role: :orchestrator` verify endpoint rejects, or
+  nothing at all in a tenant whose dispatches share one root, and which a legacy env-var
+  orchestrator key (lineage `[]`) can never hold. The bulk `verify-all` path never sent a cap
+  at all and silently returned `verified_count: 0`. Both transitions are gated by structural
+  lineage separation plus the `exact_role` plugs: `verify` now compares the CALLER's
+  server-resolved dispatch lineage against the implementer's, exactly as `report` does, so an
+  orchestrator key inside the implementer's own dispatch chain is refused with `409
+  self_verify_blocked` even when its `agent_id` differs. That check runs on every path,
+  including the common one where the optional `request-review` was never called; the
+  loopctl-selected verifier is still recorded and compared in addition whenever it exists.
+  See `docs/chain-of-custody-v2.md` §5.2.
+
+- **An unusable capability no longer halts the whole tenant.** Any rejected token produced
+  `{:cap_rejected, _}`, which custody-halts the tenant and 503s every subsequent request from
+  it — so one agent letting a token pass its 1-hour TTL took down every other agent in the
+  tenant. **No capability rejection halts a tenant any more** — not a forged signature, not a
+  double-spent token (see the 2026-07-24 entry below, which supersedes an earlier draft of
+  this line). Every one of them is an ordinary 403; expiry and lineage drift are additionally
+  recorded in the audit chain as `capability_refused` (with the `cap_id`, api key and agent).
+  Alert on the RATE of the `[:loopctl, :custody, :cap_rejected]` telemetry event — that is now
+  the only signal for a forged or replayed token, and a single occurrence is not one.
+  Relatedly, **rotating a tenant's audit signing key no longer invalidates outstanding
+  capability tokens**: verification now also accepts the historical key whose
+  `[rotated_in, rotated_out)` window covers the token's `issued_at`. Without that, a routine
+  rotation made every live token `invalid_signature` — which IS byzantine, so a documented
+  operator action custody-halted the tenant.
+
+- **Capability refusals return their documented 403 instead of a 500.** The controllers had no
+  clause for the capability layer's own error shapes, so a missing or rejected token raised a
+  CaseClauseError — making a correct refusal indistinguishable from a crash in logs and alerts.
+  A non-UUID `capability` value likewise 500'd (`Ecto.Query.CastError`) instead of 403ing.
+
+- **A dispatch may now only be minted inside the caller's own lineage.** `POST
+  /api/v1/dispatches` accepted a parentless request from any orchestrator-or-above key, and
+  accepted any active dispatch in the tenant as `parent_dispatch_id`. Both let a caller place
+  itself in a lineage unrelated to its own, which is the separation the L4 custody gates read
+  as "an independent principal". Two new 403s: `root_dispatch_forbidden` when a key that was
+  itself minted by a dispatch sends no `parent_dispatch_id` (only a key no dispatch minted —
+  the tenant's operator key, rooted in the human anchor — may start a lineage tree), and
+  `parent_outside_caller_lineage` when the named parent is not the caller's own dispatch or a
+  descendant of it. "Operator key" is decided POSITIVELY — `role: :user` AND not minted by a
+  dispatch — because an absent lineage also describes a legacy long-lived key. **What changed
+  for clients:** a sub-agent that used to mint a fresh root must now pass its own dispatch id as
+  `parent_dispatch_id` (the 403 body returns it as `remediation.your_dispatch_id`); a legacy
+  `LOOPCTL_ORCH_KEY` can no longer mint a ROOT — use the tenant's `user`-role operator key —
+  but it may still mint BENEATH any active dispatch, which is how it obtains a lineage during
+  the deprecation window. Minting a second, independently-rooted tree remains worthwhile
+  (`select_verifier/3` prefers a different-root candidate and reports `no_independent_root`
+  without one), but it is not required for liveness: the verify gate compares the caller at
+  chain distance, so a sibling verifier under the same root certifies fine. Both refusals
+  are logged as `lineage_ceiling_refused` and emit
+  `[:loopctl, :custody, :lineage_ceiling_refused]`.
+
+- **Verifier selection is seeded from a server-side secret.** The rotating verifier's index was
+  derived from the tenant's audit signing PUBLIC key, which `/.well-known/loopctl` serves
+  unauthenticated, while the candidate pool is listable by any agent key — so the choice was
+  reproducible by the parties it chooses between. It is now an HMAC keyed by the tenant's audit
+  signing PRIVATE key, domain-separated and bound to the tenant and story. **Operator impact:**
+  a tenant whose audit signing key is not provisioned (or an unreachable secret store) now has
+  no seed and none is invented — selection fails closed, the story is flagged `verifier_needed`,
+  and a `verifier_not_assigned` entry with reason `verifier_seed_unavailable` is written to the
+  audit chain plus an `audit_chain_append_failed`-style error log and a
+  `[:loopctl, :custody, :verifier_seed_unavailable]` telemetry counter — alert on it, since a
+  secret-store outage fires it on every request-review deployment-wide. Verification itself is
+  unaffected: the verify gate enforces lineage separation independently, and now refuses an
+  unlineaged caller outright on a dispatch-minted story rather than falling back to agent-id
+  inequality. Provision the tenant's audit key to restore automatic selection.
+
+- **Backfill can no longer be used to certify work that ran inside loopctl.** `POST
+  /stories/:id/backfill` (and the bulk `mark-complete`) refused stories carrying dispatch
+  markers, but `force-unclaim` clears `assigned_agent_id`, and a story claimed with a key that
+  no dispatch minted never records an implementer dispatch — so a worked story could be
+  returned to a state indistinguishable from pre-loopctl work and then marked verified with no
+  report, review record or independent verifier. Unclaim, force-unclaim and the reject
+  auto-reset now stamp `metadata.lifecycle_entered_at` on the story, and both paths refuse a
+  story carrying it — or a lifecycle entry in the audit log — with a new 422
+  (`story_entered_lifecycle`). The row stamp is the longer-lived half deliberately: `audit_log`
+  is partitioned and pruned at `AUDIT_RETENTION_DAYS` (default 90), so an audit-only guard would
+  have reopened this path on a timer. The stamp is not tamper-proof — `PATCH /stories/:id`
+  replaces `metadata` wholesale, so an orchestrator key can still erase it; both sources are
+  consulted. Imported and never-dispatched work — the case backfill exists for — is unaffected.
+  Backfill is additionally mounted on the LCP-1 signed-claim gate, so under the `signed` custody
+  profile an enrolled caller must sign it exactly as for `verify`, and the verified claim is
+  recorded in the hash-chained audit log (§9.4) as it is for `verify`.
+
+- **The caller's dispatch lineage is now compared on every custody path, not just single-story
+  verify.** `POST /epics/:id/verify-all`, `POST /stories/:id/reject` and the bulk verify/reject
+  endpoints reached the same terminal states while comparing only story fields, so an
+  orchestrator dispatched inside the implementer's own lineage cleared them where
+  `POST /stories/:id/verify` returned `409 self_verify_blocked`. All four now resolve the
+  caller's lineage server-side from the authenticating key. **What changed for clients:** calls
+  that were previously accepted from ON the implementer's lineage chain (an ancestor or a
+  sub-agent; siblings are fine) now return `409 self_verify_blocked` (bulk: a per-story error
+  entry) — use a sibling or independently-rooted verifier dispatch. A key that no dispatch
+  minted (a legacy env-var key) gets `409 caller_lineage_required` on report, review-complete
+  and verify of DISPATCH-MINTED work, because its separation cannot be shown; mint an ephemeral
+  key with `POST /api/v1/dispatches`. That is a plain refusal and records no custody violation,
+  so it never arms a tenant halt. Stories that predate dispatches are unaffected, and `reject`
+  is deliberately exempt so bad work can always be sent back.
+
 ## [Unreleased] — 2026-07-24 — Self-hosting: fresh-install fixes, multilingual search, at-rest ingestion encryption
 
 Operator-facing changes for deployments outside the hosted instance.
@@ -43,6 +168,44 @@ Operator-facing changes for deployments outside the hosted instance.
   idempotency-drift groups — they are REPORTED and withheld instead (nothing is
   unpublished), and the withhold clears itself once vectors exist. This is the behaviour
   title-drift groups have always had on such tenants.
+- **A custody halt now requires a repeated pattern, and it no longer freezes the whole API.**
+  Two behaviour changes an operator will notice.
+
+  **When a halt fires.** Previously a SINGLE chain-of-custody refusal halted the tenant, and
+  clearing a halt requires a human WebAuthn break-glass ceremony. A halt now requires
+  **3 self-report / self-review / self-verify violations within 1 hour** (tunable with
+  `config :loopctl, :custody_halt_threshold` and `:custody_halt_window_seconds`; a value that
+  is not a positive integer is refused back to the default with a warning, since `0` would
+  halt on the first violation and a string from an env var would halt nobody, ever); below the
+  threshold the offending operation is refused exactly as before, with the same 409 — only the
+  escalation changed. The `self_review_blocked` 409 body now carries `code` and
+  `remediation.learn_more` like its two sibling gates, so all three are machine-dispatchable. Capability-token rejections no longer contribute to a halt at all: a
+  capability is single-use with a bounded TTL, so a plain client retry, a resumed agent or an
+  audit-key rotation all produce one, and none of those is evidence of anything. They are now
+  reported as `[:loopctl, :custody, :cap_rejected]` telemetry plus a warning log — **alert on
+  the rate**, not on single events. Halts themselves emit `[:loopctl, :custody, :halt]`
+  telemetry and a `custody_halted` **error** log carrying the tenant, the reason and the count,
+  so a halt reaches your alerting immediately; each halt is also recorded in the hash-chained
+  audit log. Violations are retained in a new `custody_violations` table (tenant-scoped, RLS)
+  as the forensic record behind a halt. New migrations, no manual steps.
+
+  **What a halt blocks.** A halt used to 503 EVERY authenticated request for the tenant,
+  including all reads. It now suspends only the custody surface: story-lifecycle writes,
+  bulk story operations and epic verify-all, dispatch minting, and agent-memory writes.
+  Reads are never blocked on any surface, and knowledge-wiki and coordination writes keep
+  working — a halted tenant retains the audit log, change feed and KB access needed to
+  investigate the halt. Root-of-trust rotation (`POST /tenants/me/custody-owner-key`,
+  `POST /tenants/:id/rotate-audit-key`) also stays reachable, since it is a remediation path.
+  The 503 body now carries `scope: "custody_operations_only"` so a client can tell a scoped
+  halt from an outage. If you have monitoring that treats any 503 `tenant_halted` as
+  "tenant is down", it will now see the halt only on custody calls.
+
+- **`POST /tenants/me/custody-owner-key` is rate limited per tenant (#624).** Registering or
+  rotating the custody owner key now shares the shape of the WebAuthn enrollment ceremony's
+  limiter: an hourly per-tenant budget that **fails closed** — if the rate-limiter store is
+  unavailable the request is refused with `429 rate_limited` rather than allowed through.
+  Rotation was, and remains, additionally gated by proof of possession of the outgoing owner
+  key; this is defence in depth for an expensive verification path.
 
 - **Ingestion now mints self-qualifying article titles (#617).** The extractor was shown only
   a coarse `source_type` ("web_article"), never which document it was reading — so a CHANGELOG
