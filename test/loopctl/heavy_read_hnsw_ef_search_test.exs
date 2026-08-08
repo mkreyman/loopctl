@@ -33,6 +33,7 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
   alias Loopctl.Memory
 
   import Ecto.Query
+  import ExUnit.CaptureLog
 
   setup :verify_on_exit!
 
@@ -400,6 +401,68 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
 
       refute Map.has_key?(healthy, :ann_iterative_scan_reason),
              "a healthy read states the state and adds no degradation prose"
+    end
+
+    test "warn_if_ann_degraded/2 logs an ENVELOPE-LESS degraded read once per window" do
+      # The write-decision paths (novelty, near-dup, vector_search) have no meta to
+      # disclose in, so this warning is their only signal — and the conclusive cause never
+      # self-heals, so an unthrottled line per write would bury it. Both halves asserted:
+      # it FIRES on `unavailable`, and it is SILENT on the repeat and on a healthy read.
+      prime_iterative_scan(1)
+      prime_iterative_scan_supported(false)
+      opts = HeavyRead.opts(:novelty)
+      path = "test.ann_write_#{System.unique_integer([:positive])}"
+
+      on_exit(fn ->
+        :persistent_term.erase({HeavyRead, :iterative_scan_warned, {:degraded_ann_write, path}})
+      end)
+
+      first = capture_log(fn -> HeavyRead.warn_if_ann_degraded(path, opts) end)
+      assert first =~ "#{path} ran WITHOUT hnsw.iterative_scan"
+
+      assert capture_log(fn -> HeavyRead.warn_if_ann_degraded(path, opts) end) == "",
+             "a standing degradation must warn on a window, not once per write"
+
+      prime_iterative_scan_supported(true)
+
+      assert capture_log(fn ->
+               HeavyRead.warn_if_ann_degraded("#{path}_healthy", HeavyRead.opts(:novelty))
+             end) == "",
+             "a healthy read has nothing to warn about"
+    end
+
+    test "the SUGGESTED-LINKS meta discloses, and the no-embedding short-circuit does not" do
+      # `:suggested_links` is an ANN endpoint whose meta already flags one incompleteness
+      # cause (`recall_truncated` = the anti-join cutting a FULL pool) and could not name
+      # the other: an index batch that never reached this tenant's rows reads as
+      # `recall_truncated: false` plus a short list, i.e. "this article has no neighbours".
+      # Both halves are pinned — the merge onto a REAL read, and its absence on the
+      # short-circuit that runs no vector read at all.
+      tenant = fixture(:tenant)
+      article = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      prime_iterative_scan(1)
+      prime_iterative_scan_supported(false)
+
+      assert {:ok, [], bare} = Knowledge.suggest_links_with_meta(tenant.id, article.id)
+
+      refute Map.has_key?(bare, :ann_iterative_scan),
+             "the no-embedding short-circuit runs no vector read and must say nothing"
+
+      {:ok, _} = Knowledge.update_embedding(tenant.id, article.id, test_vec(1536))
+
+      assert {:ok, _suggestions, meta} =
+               Knowledge.suggest_links_with_meta(tenant.id, article.id)
+
+      assert meta.ann_iterative_scan == "unavailable"
+      assert meta.ann_iterative_scan_reason =~ "may be missing from these results"
+
+      prime_iterative_scan_supported(true)
+
+      assert {:ok, _suggestions, healthy} =
+               Knowledge.suggest_links_with_meta(tenant.id, article.id)
+
+      assert healthy.ann_iterative_scan == "applied"
     end
 
     test "the SIDE-TABLE semantic response meta carries the disclosure too" do

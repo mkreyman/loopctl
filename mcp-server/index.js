@@ -4385,7 +4385,11 @@ const TOOLS = [
       "Suggest ranked typed-link CANDIDATES for an article by embedding similarity — " +
       "READ-ONLY, creates nothing. Excludes the article itself and any already-linked " +
       "article (either direction, any relationship type); only embedded published articles. " +
-      "Returns { data: [{id, title, category, similarity_score}] } highest-similarity first. " +
+      "Returns { data: [{id, title, category, similarity_score}], meta } highest-similarity " +
+      "first. Read `meta.ann_iterative_scan` before concluding an article has no neighbours: " +
+      "`unavailable` (with `meta.ann_iterative_scan_reason`) means the vector read ran without " +
+      "pgvector's iterative scan and the list may be INCOMPLETE — `meta.recall_truncated: false` " +
+      "does NOT cover that case. " +
       "Review them and create the one you want as a TYPED link (relates_to/derived_from/" +
       "contradicts/supersedes) — unlike the auto-linker which only makes ambient relates_to. " +
       "Optional: threshold (cosine floor 0–1, default 0.5), limit (default 5).",
@@ -4512,7 +4516,11 @@ const TOOLS = [
       "— a stable tag naming WHY (e.g. no_embedding_key, embedding_circuit_open, " +
       "embedding_provider_error_<status>, embedding_timeout). When the reason is a MISSING " +
       "embedding key (no_embedding_key), the result leads with an ACTION REQUIRED notice + " +
-      "meta.remediation telling you to provision it with set_llm_config (BYO — do it once).",
+      "meta.remediation telling you to provision it with set_llm_config (BYO — do it once). " +
+      "On the semantic/combined paths meta.ann_iterative_scan (`off`/`applied`/`unavailable`, " +
+      "with meta.ann_iterative_scan_reason alongside `unavailable`) discloses whether the vector " +
+      "read ran with pgvector's iterative scan — `unavailable` means results may be INCOMPLETE, " +
+      "which meta.fallback and the total_count fields cannot tell you.",
     inputSchema: {
       type: "object",
       properties: {
@@ -5071,11 +5079,12 @@ const TOOLS = [
       "match with `meta.fallback: true` and a stable `meta.reason` (score is null on that " +
       "path) — check meta.fallback before treating a short/empty result as a genuinely " +
       "empty scope. `meta.total_count` and `meta.underfilled` are also returned so you can " +
-      "distinguish a short page from a hard cap. On the semantic path check " +
-      "`meta.ann_iterative_scan` too: `unavailable` (with `meta.ann_iterative_scan_reason`) " +
-      "means the vector read ran without pgvector's iterative scan and may be INCOMPLETE — " +
-      "a short page then is not evidence of a sparse scope, and meta.fallback/underfilled " +
-      "cannot tell you that.",
+      "distinguish a short page from a hard cap. Check `meta.ann_iterative_scan` too: " +
+      "`unavailable` (with `meta.ann_iterative_scan_reason`) means the vector read ran " +
+      "without pgvector's iterative scan and may be INCOMPLETE — a short page then is not " +
+      "evidence of a sparse scope, and meta.fallback/underfilled cannot tell you that. It " +
+      "is absent on the ILIKE fallback AND on an `include_superseded: true` recall (a " +
+      "bounded exact top-k, no index scan), so absence never means the fallback ran.",
     inputSchema: {
       type: "object",
       properties: {

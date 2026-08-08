@@ -828,16 +828,27 @@ defmodule Loopctl.Memory do
     end
   end
 
-  # `include_superseded: true` on the side table drops the `live_denorm` predicate, so no
-  # per-dimension PARTIAL index matches and the read plans as a bounded top-k SORT (see
-  # `memory_side_table_candidate_query/4`) — an exact top-k that cannot under-return.
-  # Disclosing an iterative-scan verdict there would describe a scan that was never
-  # attempted, the same reason the ILIKE fallback carries no field: state it about a
-  # vector read, or not at all. Every other shape here IS an HNSW scan and discloses.
-  defp ann_scan_meta(_opts, true = _include_superseded?, true = _side_table?), do: %{}
+  # State an iterative-scan verdict about a vector read, or not at all: on the side table
+  # `include_superseded: true` drops the `live_denorm` predicate, so no per-dimension
+  # PARTIAL index matches and the read plans as a bounded top-k SORT that cannot
+  # under-return — a verdict there describes a scan that was never attempted, the same
+  # reason the ILIKE fallback carries no field.
+  #
+  # Whether that shape is index-scanned is NOT re-derived here from the two flags: it is
+  # asked of `VectorSearch.dimension_knn_index_scanned?/1`, which sits on the predicate
+  # that decides it, so a migration changing the per-dimension index set moves the plan
+  # and this disclosure together. The legacy single-column shape is index-ordered in every
+  # variant.
+  defp ann_scan_meta(opts, include_superseded?, side_table?) do
+    if ann_index_scanned?(include_superseded?, side_table?),
+      do: HeavyRead.iterative_scan_meta(opts),
+      else: %{}
+  end
 
-  defp ann_scan_meta(opts, _include_superseded?, _side_table?),
-    do: HeavyRead.iterative_scan_meta(opts)
+  defp ann_index_scanned?(include_superseded?, true = _side_table?),
+    do: VectorSearch.dimension_knn_index_scanned?(live_only: not include_superseded?)
+
+  defp ann_index_scanned?(_include_superseded?, _side_table?), do: true
 
   # HeavyRead opts for a memory recall, with the caller's shed policy layered on. `:raise`
   # is `all_memory`'s own default, so it is only threaded explicitly for `:tag`.
@@ -2806,30 +2817,22 @@ defmodule Loopctl.Memory do
     # `{:error, :heavy_read_overloaded}` (mapped to a loss-free snooze upstream)
     # instead of RAISING an OverloadedError on the promotion write path (US-37.5).
     opts = Keyword.put(HeavyRead.opts(:memory_recall), :on_overload, :tag)
-    warn_near_dup_scan_degraded(scope.tenant_id, opts)
 
     case HeavyRead.all_memory(scope.tenant_id, scope.subject_id, query, opts) do
-      {:error, :heavy_read_overloaded} = err -> err
-      rows when is_list(rows) -> first_promoted_near_dup(rows)
-    end
-  end
+      {:error, :heavy_read_overloaded} = err ->
+        err
 
-  # This ANN degrades exactly like recall's when `hnsw.iterative_scan` is enabled but
-  # unavailable — except the consequence here is a WRITE, not a short read: a near-dup
-  # outside the single index batch is not found, so `promote_one/2` inserts a SECOND live
-  # `:promoted` row instead of superseding the first (AC-29.2.4), permanently forking the
-  # memory. There is no response envelope on this path to disclose it in, so a dedup
-  # decision taken under a starved scan is at least visible to operators in the log.
-  defp warn_near_dup_scan_degraded(tenant_id, opts) do
-    case HeavyRead.iterative_scan_meta(opts) do
-      %{ann_iterative_scan: "unavailable", ann_iterative_scan_reason: reason} ->
-        Logger.warning(
-          "memory.near_dup_scan degraded tenant_id=#{tenant_id} " <>
-            "ann_iterative_scan=unavailable reason=#{reason}"
-        )
-
-      _ ->
-        :ok
+      rows when is_list(rows) ->
+        # This ANN degrades exactly like recall's — except the consequence is a WRITE, not
+        # a short read: a near-dup outside the single index batch is not found, so
+        # `promote_one/2` inserts a SECOND live `:promoted` row instead of superseding the
+        # first (AC-29.2.4), permanently forking the memory. There is no response envelope
+        # here to disclose it in, so the log is the only signal — emitted AFTER the read,
+        # in the branch where a scan ACTUALLY ran (a shed read returns above and took no
+        # dedup decision to warn about), and throttled per window by the shared helper
+        # every envelope-less ANN write path routes through (#634 round-2).
+        HeavyRead.warn_if_ann_degraded("memory.near_dup_scan", opts)
+        first_promoted_near_dup(rows)
     end
   end
 

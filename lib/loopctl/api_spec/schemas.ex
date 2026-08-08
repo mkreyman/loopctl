@@ -4093,9 +4093,9 @@ defmodule Loopctl.ApiSpec.Schemas do
       description:
         "Recall results with pinned meta. `score` is null on the text-match " <>
           "fallback path; `meta.fallback`/`meta.reason` flag degradation and " <>
-          "`meta.underfilled` a short page. On the SEMANTIC path " <>
-          "`meta.ann_iterative_scan` additionally discloses whether the vector read " <>
-          "ran with pgvector's `hnsw.iterative_scan` — the same field, values and " <>
+          "`meta.underfilled` a short page. On a SEMANTIC path that scans the HNSW " <>
+          "index `meta.ann_iterative_scan` additionally discloses whether the vector " <>
+          "read ran with pgvector's `hnsw.iterative_scan` — the same field, values and " <>
           "meaning `/knowledge/search` returns.",
       type: :object,
       properties: %{
@@ -4120,8 +4120,11 @@ defmodule Loopctl.ApiSpec.Schemas do
               type: :string,
               enum: ["off", "applied", "unavailable"],
               description:
-                "SEMANTIC path only (absent on the ILIKE fallback, which runs no vector " <>
-                  "read): whether this recall's vector read ran with pgvector's " <>
+                "Present only for a recall that SCANS the HNSW index — absent on the " <>
+                  "ILIKE fallback (no vector read) AND on an `include_superseded: true` " <>
+                  "side-table recall (an exact bounded top-k sort, no index scan), so " <>
+                  "absence does NOT imply the fallback path (`meta.fallback` does): " <>
+                  "whether this recall's vector read ran with pgvector's " <>
                   "`hnsw.iterative_scan`. `off` = not enabled on this instance (the " <>
                   "default). `applied` = enabled and in force. `unavailable` = enabled, " <>
                   "but the read fell back to a single index batch — your `tenant_id` is " <>

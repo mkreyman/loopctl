@@ -12,8 +12,12 @@ All notable changes to loopctl are documented here.
   It is returned by `GET /api/v1/knowledge/search` in the semantic and combined
   modes, by `GET /api/v1/knowledge/articles/:id/suggested_links`, and by
   `POST /api/v1/memory/recall` (and the `memory` half of
-  `POST /api/v1/recall`) on its semantic path — one field name, one vocabulary, one
-  derivation across every surface. This
+  `POST /api/v1/recall`) on any semantic path that scans the HNSW index — absent on the
+  ILIKE fallback and on an `include_superseded` recall, neither of which scans it, so
+  absence never means the fallback ran. One field name, one vocabulary, one derivation
+  across every surface. The vector reads that have NO response envelope because their
+  consequence is a write — the novelty gate, the memory near-dup dedup scan — instead log
+  one throttled warning per path when they run degraded. This
   matters when an operator has enabled iterative scan (SystemConfig `hnsw_iterative_scan`)
   and the read nonetheless runs without it — either because the backend capability probe was
   inconclusive (a pool-checkout timeout, a DB restart) and FAILED CLOSED, or because the

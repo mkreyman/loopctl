@@ -6564,8 +6564,17 @@ defmodule Loopctl.Knowledge do
     opts = Keyword.put(heavy_read_opts(:novelty), :on_overload, :tag)
 
     case HeavyRead.one(tenant_id, query, opts) do
-      {:error, :heavy_read_overloaded} -> nil
-      distance -> distance
+      {:error, :heavy_read_overloaded} ->
+        nil
+
+      distance ->
+        # `:novelty` is an ANN endpoint with NO response envelope to disclose a degraded
+        # scan in, and its consequence is a WRITE: a starved batch under-states the
+        # nearest prior, the gate scores the idea novel, and a duplicate article is
+        # written into the corpus the gate exists to dedupe. Same helper (and same
+        # throttle) as every other envelope-less ANN write path (#634 round-2).
+        HeavyRead.warn_if_ann_degraded("knowledge.novelty_scan", opts)
+        distance
     end
   end
 

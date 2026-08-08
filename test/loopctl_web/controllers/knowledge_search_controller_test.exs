@@ -192,11 +192,12 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
 
       # The vector read's iterative-scan state REACHES the caller (the meta renderer is a
       # whitelist, so a field the context computes is invisible over HTTP until it is
-      # listed). `applied` is the value for this env — `config/test.exs` pins iterative
-      # scan ON and the test backend is pgvector >= 0.8. The `unavailable` state, which is
-      # the one that matters, needs a primed probe verdict and is covered in the sync
-      # `Loopctl.HeavyReadHnswEfSearchTest`.
-      assert body["meta"]["ann_iterative_scan"] == "applied"
+      # listed). This pins the PASS-THROUGH, not the backend: `config/test.exs` pins
+      # iterative scan ON, so the value is `applied` on a healthy probe and `unavailable`
+      # when a live probe times out on a pool checkout and fails closed — an async file
+      # cannot prime the VM-global verdict without bleeding into concurrent ANN readers.
+      # The exact states are pinned in the sync `Loopctl.HeavyReadHnswEfSearchTest`.
+      assert body["meta"]["ann_iterative_scan"] in ["applied", "unavailable"]
     end
 
     test "COMBINED mode carries the semantic half's iterative-scan disclosure", %{conn: conn} do
@@ -218,7 +219,8 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
 
       body = json_response(conn, 200)
       assert body["meta"]["search_mode"] == "combined"
-      assert body["meta"]["ann_iterative_scan"] == "applied"
+      # Same pass-through pin (and the same live-probe caveat) as the semantic test above.
+      assert body["meta"]["ann_iterative_scan"] in ["applied", "unavailable"]
     end
 
     test "combined mode degrades to keyword-only when embedding fails, with real scores", %{

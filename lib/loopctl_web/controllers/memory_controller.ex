@@ -122,9 +122,12 @@ defmodule LoopctlWeb.MemoryController do
         "path) — never a silent empty result. No silent hard cap: `limit` is " <>
         "clamped to the vector-search max and `meta.underfilled` flags a short page " <>
         "(a small live scope, or a cross-subject/cross-project pool under-fill). " <>
-        "On the semantic path `meta.ann_iterative_scan` (`off`|`applied`|" <>
-        "`unavailable`) discloses whether the vector read ran with pgvector's " <>
-        "`hnsw.iterative_scan`; `unavailable` means the TENANT filter was applied " <>
+        "On a semantic path that scans the HNSW index `meta.ann_iterative_scan` " <>
+        "(`off`|`applied`|`unavailable`) discloses whether the vector read ran with " <>
+        "pgvector's `hnsw.iterative_scan` — it is absent on the ILIKE fallback AND on " <>
+        "an `include_superseded: true` side-table recall (a bounded top-k sort, no " <>
+        "index scan), so absence is not evidence of the fallback path. " <>
+        "`unavailable` means the TENANT filter was applied " <>
         "after a single index batch, so the page may be INCOMPLETE for a reason " <>
         "`meta.underfilled` cannot distinguish from a sparse scope. It says nothing " <>
         "about SUBJECT-level under-return, which is filtered outside the index scan " <>

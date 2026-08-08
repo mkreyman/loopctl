@@ -378,6 +378,39 @@ defmodule Loopctl.HeavyRead do
   defp degraded_meta(reason),
     do: %{ann_iterative_scan: "unavailable", ann_iterative_scan_reason: reason}
 
+  @doc """
+  Log — at most one line per `path` per window — that an ENVELOPE-LESS ANN read ran
+  degraded. Pass the SAME opts the read was issued with, after it actually ran.
+
+  `iterative_scan_meta/1` is the disclosure for a read that HAS a response envelope. A
+  read whose consequence is a WRITE — a novelty verdict, a near-dup dedup decision — has
+  nowhere to put one, and a starved scan there does not shorten a page: the neighbour the
+  batch missed is written as novel, forking the corpus the gate exists to dedupe. This is
+  that read's ONLY signal, so every such path routes through here rather than growing its
+  own wording.
+
+  Throttled through the same `:persistent_term` deadline the probe's own warnings use,
+  because the conclusive `:unsupported` cause NEVER self-heals — unthrottled it is one
+  line per write, forever, burying the signal it exists to raise. Keyed on `path` and not
+  on the tenant: the degradation is a per-NODE backend capability that says nothing about
+  whose read tripped it, and a per-tenant key would grow `:persistent_term` (and its
+  global GC) without adding information.
+  """
+  @spec warn_if_ann_degraded(String.t(), keyword()) :: :ok
+  def warn_if_ann_degraded(path, opts) when is_binary(path) and is_list(opts) do
+    case iterative_scan_meta(opts) do
+      %{ann_iterative_scan: "unavailable", ann_iterative_scan_reason: reason} ->
+        maybe_log_inconclusive(
+          {:degraded_ann_write, path},
+          "#{path} ran WITHOUT hnsw.iterative_scan — a write decision (novelty / near-dup) " <>
+            "was taken on a possibly-incomplete ANN batch. #{reason}"
+        )
+
+      _ ->
+        :ok
+    end
+  end
+
   # The per-read `hnsw.ef_search` value to APPLY via `SET LOCAL`, or `nil` to leave the
   # session/role default untouched. `nil` exactly when the configured (clamped) value equals
   # pgvector's built-in default — so a role-level `ALTER ROLE ... SET hnsw.ef_search` override
