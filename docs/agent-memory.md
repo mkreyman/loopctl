@@ -134,6 +134,22 @@ subquery would flip the planner OFF the pgvector HNSW index (#170/#172). So reca
 reliably recalls its OWN top-k among an ~80k-row multi-subject corpus — i.e. the
 over-fetch pool + outer filter does not *starve* a subject at scale.
 
+Step 1's `tenant_id` is a *residual* the index applies after returning its batch,
+so a vector read that loses pgvector's `hnsw.iterative_scan` can under-return rows
+this subject has — and `underfilled` cannot tell that apart from a sparse scope.
+The semantic path therefore also returns `meta.ann_iterative_scan`
+(`off` | `applied` | `unavailable`), plus `meta.ann_iterative_scan_reason`
+alongside `unavailable` only. It is the *same* field, values and meaning
+`/knowledge/search` returns (one derivation,
+`Loopctl.HeavyRead.iterative_scan_meta/1`), and it is derived from the options
+that read was issued with — never a fresh probe — so it cannot disagree with the
+rows it accompanies. It speaks only to the filters iterative scan governs: step
+2's `subject_id` sits outside the index scan, so subject dilution is bounded by
+the over-fetch pool (measured by the scale gate above), is identical under
+`applied` and `unavailable`, and remains `underfilled`'s job alone. Two reads
+carry no such field because neither scans the index: the `ILIKE` fallback below,
+and the `include_superseded` side-table read (an exact bounded top-k sort).
+
 ### Graceful degradation (never a silent empty)
 
 When embedding generation is unavailable (circuit open / no per-tenant key /
@@ -393,7 +409,9 @@ project-aware surfaces.
 Every read path returns the **pinned envelope**:
 
 - `recall/2` → `%{results: [{memory, score} | ...], meta: %{total_count, fallback,
-  reason, underfilled}}` (`score` is `nil` on the fallback path).
+  reason, underfilled}}` (`score` is `nil` on the fallback path), plus
+  `ann_iterative_scan` (and `ann_iterative_scan_reason` when `unavailable`) on the
+  semantic path — see the index-safety section above.
 - `list/2` / `session_history/2` / `list_all_subjects/2` → `%{results: [memory],
   meta: %{total_count, limit, offset}}`.
 

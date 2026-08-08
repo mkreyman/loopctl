@@ -4093,7 +4093,10 @@ defmodule Loopctl.ApiSpec.Schemas do
       description:
         "Recall results with pinned meta. `score` is null on the text-match " <>
           "fallback path; `meta.fallback`/`meta.reason` flag degradation and " <>
-          "`meta.underfilled` a short page.",
+          "`meta.underfilled` a short page. On a SEMANTIC path that scans the HNSW " <>
+          "index `meta.ann_iterative_scan` additionally discloses whether the vector " <>
+          "read ran with pgvector's `hnsw.iterative_scan` — the same field, values and " <>
+          "meaning `/knowledge/search` returns.",
       type: :object,
       properties: %{
         data: %Schema{
@@ -4112,7 +4115,37 @@ defmodule Loopctl.ApiSpec.Schemas do
             total_count: %Schema{type: :integer},
             fallback: %Schema{type: :boolean},
             reason: %Schema{type: :string, nullable: true},
-            underfilled: %Schema{type: :boolean}
+            underfilled: %Schema{type: :boolean},
+            ann_iterative_scan: %Schema{
+              type: :string,
+              enum: ["off", "applied", "unavailable"],
+              description:
+                "Present only for a recall that SCANS the HNSW index — absent on the " <>
+                  "ILIKE fallback (no vector read) AND on an `include_superseded: true` " <>
+                  "side-table recall (an exact bounded top-k sort, no index scan), so " <>
+                  "absence does NOT imply the fallback path (`meta.fallback` does): " <>
+                  "whether this recall's vector read ran with pgvector's " <>
+                  "`hnsw.iterative_scan`. `off` = not enabled on this instance (the " <>
+                  "default). `applied` = enabled and in force. `unavailable` = enabled, " <>
+                  "but the read fell back to a single index batch — your `tenant_id` is " <>
+                  "applied AFTER that batch, so results may be INCOMPLETE and a short " <>
+                  "page is NOT evidence your memory scope is sparse (`meta.underfilled` " <>
+                  "cannot tell the two apart). It says nothing about SUBJECT-level " <>
+                  "under-return: `subject_id` is filtered outside the index scan, " <>
+                  "bounded by the over-fetch pool and identical under `applied` — " <>
+                  "`meta.underfilled` is the only signal for that. Read " <>
+                  "`ann_iterative_scan_reason` for WHICH cause: an " <>
+                  "inconclusive capability probe self-heals on the next conclusive one, " <>
+                  "while a pgvector that does not support the setting stands until the " <>
+                  "extension is upgraded. Same values and meaning as the " <>
+                  "`/knowledge/search` field of the same name."
+            },
+            ann_iterative_scan_reason: %Schema{
+              type: :string,
+              description:
+                "Present ONLY alongside `ann_iterative_scan: \"unavailable\"`: a " <>
+                  "non-sensitive explanation of the degraded vector read."
+            }
           }
         }
       }
@@ -4200,7 +4233,11 @@ defmodule Loopctl.ApiSpec.Schemas do
         },
         memory: %Schema{
           type: :object,
-          description: "The unchanged /memory/recall envelope (data + meta).",
+          description:
+            "The unchanged /memory/recall envelope (data + meta). Its " <>
+              "`meta.ann_iterative_scan` describes THIS half's vector read only — the " <>
+              "two halves run sequentially and each resolves the backend capability " <>
+              "independently, so they may legitimately differ within one response.",
           properties: %{
             data: %Schema{
               type: :array,
