@@ -1376,8 +1376,36 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
 
     # kb-02: a user (destructive role) records a high-confidence supersede on a REAL
     # potential conflict, and the nightly executor then retires the loser end-to-end.
+    # `evidence` is required at this confidence — it is the verdict that retires an
+    # article with nobody watching.
     test "a user records a high-confidence supersede applied by the executor (loser retired)",
          ctx do
+      %{user_conn: conn, tenant: tenant, a: a, b: b} = ctx
+
+      conn =
+        post(conn, ~p"/api/v1/knowledge/conflicts/resolve", %{
+          "source_article_id" => a.id,
+          "target_article_id" => b.id,
+          "disposition" => "supersede",
+          "authoritative_article_id" => a.id,
+          "confidence" => "high",
+          "evidence" => "B repeats A verbatim; A is the fuller capture"
+        })
+
+      body = json_response(conn, 201)
+      assert body["data"]["disposition"] == "supersede"
+      assert body["data"]["confidence"] == "high"
+      assert is_nil(body["data"]["requested_confidence"])
+      assert body["data"]["executed"] == false
+      assert body["note"] =~ "nightly executor"
+
+      # Executor retires the loser.
+      assert 1 == Loopctl.Knowledge.execute_conflict_resolutions(tenant.id)
+      assert Loopctl.AdminRepo.get(Loopctl.Knowledge.Article, b.id).status == :superseded
+    end
+
+    # A `high` supersede with no evidence is refused outright, at every role.
+    test "422 when a high-confidence supersede carries no evidence", ctx do
       %{user_conn: conn, tenant: tenant, a: a, b: b} = ctx
 
       conn =
@@ -1389,21 +1417,18 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
           "confidence" => "high"
         })
 
-      body = json_response(conn, 201)
-      assert body["data"]["disposition"] == "supersede"
-      assert body["data"]["executed"] == false
-      assert body["note"] =~ "nightly executor"
-
-      # Executor retires the loser.
-      assert 1 == Loopctl.Knowledge.execute_conflict_resolutions(tenant.id)
-      assert Loopctl.AdminRepo.get(Loopctl.Knowledge.Article, b.id).status == :superseded
+      assert json_response(conn, 422)
+      assert 0 == Loopctl.AdminRepo.aggregate(Loopctl.Knowledge.ConflictResolution, :count, :id)
+      assert Loopctl.AdminRepo.get(Loopctl.Knowledge.Article, b.id).status == :published
+      _ = tenant
     end
 
-    # #331: supersede/merge are now agent+ KB-content curation (was user+). An agent
-    # records a high-confidence supersede on a REAL flagged pair, and the privileged
-    # nightly executor retires the loser end-to-end — the verdict IS persisted and
-    # actionable at agent role.
-    test "an agent records a supersede applied by the executor (loser retired)", ctx do
+    # #331: supersede/merge remain agent+ KB-content curation (was user+) — the verdict IS
+    # recorded and visible at agent role. What an agent cannot do is DRIVE the unattended
+    # retirement: the conflict pair is manufacturable (the queue is fed by a similarity
+    # threshold), so the confidence that authorizes the executor is granted from the
+    # recording role rather than accepted from the body. The ask is reported back.
+    test "an agent's supersede is recorded, capped to medium, and NOT applied", ctx do
       %{conn: conn, tenant: tenant, a: a, b: b} = ctx
 
       conn =
@@ -1412,23 +1437,33 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
           "target_article_id" => b.id,
           "disposition" => "supersede",
           "authoritative_article_id" => a.id,
-          "confidence" => "high"
+          "confidence" => "high",
+          "evidence" => "these look identical to me"
         })
 
       body = json_response(conn, 201)
       assert body["data"]["disposition"] == "supersede"
-      assert body["data"]["executed"] == false
-      assert body["note"] =~ "nightly executor"
+      assert body["data"]["confidence"] == "medium"
+      assert body["data"]["requested_confidence"] == "high"
+      assert body["note"] =~ "orchestrator+"
 
-      # The verdict row was persisted (chain intact), so the executor can apply it.
-      refute is_nil(
-               Loopctl.AdminRepo.get_by(Loopctl.Knowledge.ConflictResolution,
-                 tenant_id: tenant.id
+      # The verdict row IS persisted — curation is not withdrawn from agents.
+      resolution =
+        Loopctl.AdminRepo.get_by(Loopctl.Knowledge.ConflictResolution, tenant_id: tenant.id)
+
+      refute is_nil(resolution)
+      assert resolution.annotated_by_role == "agent"
+
+      # But nothing is retired, and no supersedes link is created.
+      assert 0 == Loopctl.Knowledge.execute_conflict_resolutions(tenant.id)
+      assert Loopctl.AdminRepo.get(Loopctl.Knowledge.Article, b.id).status == :published
+
+      assert is_nil(
+               Loopctl.AdminRepo.get_by(ArticleLink,
+                 tenant_id: tenant.id,
+                 relationship_type: :supersedes
                )
              )
-
-      assert 1 == Loopctl.Knowledge.execute_conflict_resolutions(tenant.id)
-      assert Loopctl.AdminRepo.get(Loopctl.Knowledge.Article, b.id).status == :superseded
     end
 
     # #331: an agent may record a MERGE too (the executor synthesizes a DRAFT — never
@@ -1442,11 +1477,16 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
           "target_article_id" => b.id,
           "disposition" => "merge",
           "authoritative_article_id" => a.id,
-          "confidence" => "high"
+          "confidence" => "high",
+          "evidence" => "both cover the same rollout, from different halves"
         })
 
       body = json_response(conn, 201)
       assert body["data"]["disposition"] == "merge"
+
+      # The note must describe what the executor will ACTUALLY do that night — this is the
+      # only feedback an agent gets, and it used to say the merge was not applied yet.
+      assert body["note"] =~ "MERGED DRAFT"
 
       resolution =
         Loopctl.AdminRepo.get_by(Loopctl.Knowledge.ConflictResolution, tenant_id: tenant.id)
@@ -1455,12 +1495,13 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       assert resolution.disposition == :merge
     end
 
-    # (c) curation-log entry is written for an agent's supersede when the tenant has
-    # kb_curation_log on — the executor records a "supersede" curation event.
-    test "an agent supersede executed by the nightly job writes a curation-log entry",
+    # (c) curation-log entry is written for a supersede when the tenant has
+    # kb_curation_log on — the executor records a "supersede" curation event. Recorded by
+    # an ORCHESTRATOR, because that is the role whose verdict the executor acts on.
+    test "a supersede executed by the nightly job writes a curation-log entry",
          %{conn: base_conn} do
       tenant = fixture(:tenant, %{settings: %{"kb_curation_log" => true}})
-      {agent_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      {agent_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
       a = fixture(:article, %{tenant_id: tenant.id, title: "CA", status: :published})
       b = fixture(:article, %{tenant_id: tenant.id, title: "CB", status: :published})
 
@@ -1480,7 +1521,8 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
         "target_article_id" => b.id,
         "disposition" => "supersede",
         "authoritative_article_id" => a.id,
-        "confidence" => "high"
+        "confidence" => "high",
+        "evidence" => "CB repeats CA verbatim"
       })
       |> json_response(201)
 
@@ -1508,7 +1550,8 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
           "target_article_id" => y.id,
           "disposition" => "supersede",
           "authoritative_article_id" => x.id,
-          "confidence" => "high"
+          "confidence" => "high",
+          "evidence" => "fabricated"
         })
 
       assert json_response(conn, 422)
@@ -1563,7 +1606,8 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
           "target_article_id" => b.id,
           "disposition" => "supersede",
           "authoritative_article_id" => a.id,
-          "confidence" => "high"
+          "confidence" => "high",
+          "evidence" => "cross-tenant attempt"
         })
 
       assert json_response(conn, 422)
@@ -1681,15 +1725,21 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
           "target_article_id" => ctx.shared.id,
           "disposition" => "supersede",
           "authoritative_article_id" => ctx.priv.id,
-          "confidence" => "high"
+          "confidence" => "high",
+          "evidence" => "my note already says all of this"
         })
 
+      # 201, not the 422 agent B gets: the visibility check passed and the verdict is
+      # RECORDED. What the recording role governs is separate — an agent's confidence is
+      # capped, so this verdict is not the one the executor acts on. The two gates are
+      # independent and this test owns the visibility one.
       body = json_response(conn, 201)
       assert body["data"]["disposition"] == "supersede"
+      assert body["data"]["confidence"] == "medium"
 
-      # Executor retires the loser (the shared article A judged non-authoritative).
-      assert 1 == Loopctl.Knowledge.execute_conflict_resolutions(ctx.tenant.id)
-      assert AdminRepo.get!(Article, ctx.shared.id).status == :superseded
+      refute is_nil(
+               AdminRepo.get_by(Loopctl.Knowledge.ConflictResolution, tenant_id: ctx.tenant.id)
+             )
     end
   end
 end

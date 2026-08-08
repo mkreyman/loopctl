@@ -157,6 +157,64 @@ Operator-facing changes for deployments outside the hosted instance.
 
 ### Changed
 
+- **BREAKING (API): `idempotency_key` is no longer returned in any article payload.** It is
+  still accepted on create and still a filter on `GET /api/v1/articles?idempotency_key=…`
+  (and the `knowledge_list` / `knowledge_count` MCP tools) — the lag-free existence check
+  is unchanged, answered from `meta.total_count` on a key you already hold. What it no
+  longer does is hand every reader the capture identities of articles it merely has read
+  access to. A key is caller-chosen data that the nightly consolidation pass reads when it
+  groups duplicate captures, so it is write-side identity, not a shared attribute. The
+  same removal applies to the `evidence` entries of `GET /api/v1/knowledge/consolidation`,
+  prior-day reports included. The create no-op response still echoes the key you SUPPLIED on
+  an idempotency hit; nothing else does. A client reading the field off a list/get response
+  must switch to filtering by the key it already holds. The filter is not scoped to keys you
+  wrote, so this removes a bulk disclosure — it does not make the key a secret.
+
+- **A `supersede` verdict's `confidence` is now granted by the server, not accepted
+  from the request** (`POST /api/v1/knowledge/conflicts/resolve`). `confidence: "high"` on a
+  `supersede` is what authorizes the nightly executor to RETIRE an article with nobody in
+  the loop, so it is now capped by the role of the key recording the verdict: an agent-role
+  request asking for `"high"` is recorded at `"medium"`, and the response reports the cap in
+  `data.requested_confidence` and `note`. `merge` is NOT capped — it synthesizes a new draft
+  and retires nothing — so it still executes at agent role. Recording a verdict remains
+  agent-role curation in every disposition; only the unattended retirement is gated.
+  **Both `supersede` AND `merge` recorded at `"high"` now REQUIRE `evidence` (422 without
+  it)** — the merge is uncapped but not free: the executor synthesizes on the tenant's own
+  paid model key and POSTs both article bodies to the provider, so every verdict it applies
+  unattended must carry its reason. A merged draft now also inherits the more restrictive of
+  its two sources' visibility instead of defaulting to tenant-shared, and two sources
+  restricted to DIFFERENT agents are refused before any synthesis.
+  **A capped verdict is neither applied nor auto-dismissed:** a pair whose only verdict the
+  executor will never apply stays listed in `GET /api/v1/knowledge/conflicts` (and keeps its
+  link on `GET /articles/:id`), so an orchestrator+ key can find it and re-record it. A
+  supersede/merge DELIBERATELY recorded below `"high"` is different — the next nightly run
+  closes it as dismissed (both articles retained) and the pair leaves the queue; it is not
+  held for review, so re-record at `"high"` if you mean it to apply. An execution that
+  disposed of NOTHING (a merge skipped for a missing API key, a permanently failed
+  synthesis, a retracted flag) no longer settles the pair either — it stays discoverable
+  instead of vanishing unapplied. Recording ANY verdict, capped or not, releases the pair's
+  articles from curated-retrieval suppression. The
+  migration backfills `annotated_by_role` from the existing `annotated_by` value, so a
+  pending `supersede` an orchestrator recorded before this release still executes.
+
+- **The nightly consolidation pass now keeps the OLDEST member of a duplicate group, not the
+  longest.** Both signals that form a group — the normalized title and the
+  `idempotency_key` — are caller-chosen, and so is the body, so under longest-wins an agent
+  could retire an established published article by publishing a longer near-copy beside it.
+  Age is the one input a later writer cannot manufacture. **Operator impact:** where a
+  fuller re-capture used to win, the earlier capture now survives and the fuller one is
+  unpublished (reversible via publish; its text is retained as a draft).
+
+- **The nightly consolidation pass now requires content corroboration before auto-
+  unpublishing an idempotency-key duplicate group,** as it already did for title-collision
+  groups. An `idempotency_key` is caller-supplied, so two unrelated writers can collide on
+  one deterministically and the two-run agreement gate — which filters transience, not
+  wrongness — would confirm it. Both signals now clear the same bar: the group's live
+  members must also be similar in CONTENT (`knowledge_consolidation_min_duplicate_similarity_pct`).
+  **Operator impact:** a tenant with no BYO embedding key can no longer auto-apply
+  idempotency-drift groups — they are REPORTED and withheld instead (nothing is
+  unpublished), and the withhold clears itself once vectors exist. This is the behaviour
+  title-drift groups have always had on such tenants.
 - **A custody halt now requires a repeated pattern, and it no longer freezes the whole API.**
   Two behaviour changes an operator will notice.
 
