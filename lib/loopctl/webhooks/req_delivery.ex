@@ -104,9 +104,8 @@ defmodule Loopctl.Webhooks.ReqDelivery do
       {:ok, %Req.Response{status: status, body: resp_body}} when status >= 200 and status < 300 ->
         {:ok, %{status: status, body: resp_body_to_string(resp_body)}}
 
-      {:ok, %Req.Response{status: status, body: resp_body}} ->
-        body_snippet = resp_body |> resp_body_to_string() |> String.slice(0, 200)
-        {:error, "HTTP #{status}: #{body_snippet}"}
+      {:ok, %Req.Response{status: status} = resp} ->
+        {:error, "HTTP #{status}#{failure_metadata(resp)}"}
 
       {:error, %Req.TransportError{reason: :timeout}} ->
         {:error, "timeout"}
@@ -116,6 +115,58 @@ defmodule Loopctl.Webhooks.ReqDelivery do
 
       {:error, exception} ->
         {:error, "delivery_error: #{inspect(exception)}"}
+    end
+    |> bound_error()
+  end
+
+  # EVERY failure string this module returns is persisted verbatim on the delivery
+  # event and read back by the tenant through the deliveries API, and the
+  # transport reason and the exception are shaped by the DESTINATION exactly as
+  # the `content-type` header is (a TLS alert description, a peer-chosen error
+  # term). Bounding only the header fragment would leave the same column
+  # inflatable through the sibling branch, so the bound is applied to the WHOLE
+  # string, once, where every branch passes through.
+  @max_error_chars 300
+
+  defp bound_error({:error, message}) when is_binary(message),
+    do: {:error, String.slice(message, 0, @max_error_chars)}
+
+  defp bound_error(result), do: result
+
+  # What a FAILED delivery is allowed to say about the response.
+  #
+  # The error string built here is persisted on the delivery event and read back
+  # by the tenant through the deliveries API, so it must describe the FAILURE
+  # without reproducing what the destination SENT. A destination is
+  # tenant-supplied, so echoing its body would make the delivery record a
+  # general-purpose reader for whatever loopctl can reach — the response content
+  # would flow back out through an API the destination's owner does not control.
+  #
+  # Status code and `content-type` are the two facts a tenant debugging their own
+  # receiver actually needs ("it 500s", "it answered HTML, not JSON"), and neither
+  # carries response content. Everything else stays inside loopctl.
+  #
+  # The header VALUE is still chosen by the destination, so it is TRUNCATED: the
+  # error string is persisted on the delivery event and read back through the
+  # deliveries API, and an unbounded copy would let a hostile receiver inflate
+  # that column at will — reopening, by the byte, the channel this function
+  # closes. No real media type comes near the bound.
+  @max_content_type_chars 96
+
+  defp failure_metadata(%Req.Response{} = resp) do
+    case Req.Response.get_header(resp, "content-type") do
+      [content_type | _] when is_binary(content_type) ->
+        type =
+          content_type
+          |> String.split(";")
+          |> hd()
+          |> String.trim()
+          |> String.slice(0, @max_content_type_chars)
+
+        " (content-type: #{type})"
+
+      _ ->
+        ""
     end
   end
 

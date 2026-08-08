@@ -284,18 +284,34 @@ defmodule Loopctl.Workers.WebhookDeliveryWorker do
     }
   end
 
+  # TWO signature headers, deliberately, for the deprecation window (issue #623):
+  #
+  #   * `x-webhook-signature` — the CURRENT scheme, `t=<unix>,v1=<hmac>`, whose MAC
+  #     covers the timestamp AND the body. The timestamp is therefore a signed
+  #     fact, so a receiver can bound how long a given signature is worth
+  #     honouring (`Signing.tolerance_seconds/0`) instead of accepting any
+  #     `(body, signature)` pair forever. `x-webhook-id` is unique per delivery
+  #     event, so the receiver's replay cache has a key to work from inside that
+  #     window; loopctl RETRIES a delivery under the same id, so the cache must
+  #     record "already processed successfully", not "already seen".
+  #   * `x-signature-256` — the LEGACY body-only value, still emitted so existing
+  #     receivers keep verifying while they migrate. It is removed at the end of
+  #     the deprecation window.
+  #
+  # `x-webhook-timestamp` keeps carrying the same value as the `t=` component so
+  # a receiver reading it today is not broken; the value inside the signature is
+  # the authoritative one.
   defp build_headers(event, webhook, json_body) do
     timestamp = System.system_time(:second)
     signing_secret = webhook.signing_secret_encrypted
-
-    signature = Signing.sign_payload(json_body, signing_secret)
 
     [
       {"content-type", "application/json"},
       {"user-agent", "Loopctl-Webhook/1.0"},
       {"x-webhook-id", event.id},
       {"x-webhook-timestamp", to_string(timestamp)},
-      {"x-signature-256", signature}
+      {"x-webhook-signature", Signing.sign(json_body, signing_secret, timestamp)},
+      {"x-signature-256", Signing.sign_payload(json_body, signing_secret)}
     ]
   end
 

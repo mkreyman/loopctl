@@ -408,6 +408,38 @@ READ-ONLY at every role including `:user` — an agent must never widen its own
 allowlist, and a `:user` key belongs to a tenant, not the operator. A test
 asserts no API path mutates it.
 
+**A carve-out is purpose- and port-scoped, exactly as a tenant declaration is.**
+Entry grammar: `host[:port][@purpose[+purpose...]]`, or `cidr[@purpose...]`.
+
+- **Purpose.** `inference` reaches an endpoint the DEPLOYMENT resolves;
+  `webhook` and `ingest` reach a destination a TENANT writes. Granting all three
+  from one entry would make an operator's model-endpoint carve-out double as
+  permission to POST tenant-authored payloads to — and fetch tenant-authored URLs
+  from — everything it covers. So an **unqualified entry grants `inference`
+  only**; `webhook` and `ingest` must be named. `Loopctl.Egress.Policy` re-derives
+  the grant against the requested purpose on every read, so this cannot be fixed
+  into a cached verdict (and a carve-out REMOVED from the configuration stops
+  granting immediately rather than at the end of the entry's TTL).
+- **Port.** A port written in an entry binds the carve-out to that port. An entry
+  with no port matches any port — the documented primary form is a bare host for
+  a service on a non-default port (`ollama.internal` for `:11434`), so defaulting
+  a portless entry to the scheme's default would silently revoke every existing
+  carve-out. CIDR entries carry no port syntax and are port-independent. The
+  accepted residual: a portless entry grants EVERY port on that host, and for the
+  tenant-writable purposes (`webhook`, `ingest`, and a tenant-configured
+  `chat_base_url` under `inference`) the destination port is chosen by the TENANT
+  — `10.0.0.5@webhook` also makes `10.0.0.5:6379` a legal POST target. **State
+  the port on any entry that exists for one service**; reserve the portless form
+  for hosts that run nothing else. An IPv6 literal is bracketed when it carries a
+  port (`[fdaa::1]:8080`) and bare when it does not (`fdaa::1`); anything else
+  with several colons is rejected as a defect rather than accepted as a host name
+  that can never match.
+
+When a carve-out does not cover the requested `(purpose, port)`, the host falls
+back to what it is WITHOUT the carve-out — for a private address that is
+`:denylisted`, not `:non_local`, so the refusal is the SSRF one rather than a
+locality one an unmarked scope would pass.
+
 ### (b) Tenant ownership — the tenant plane
 
 On the HOSTED instance the server's loopback and private ranges are the
