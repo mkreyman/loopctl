@@ -616,6 +616,10 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
     # was pre-gated by a bare `UrlGuard.pin/1`: an allowlisted private host was a
     # legal WEBHOOK destination but still a hard refusal as an INGESTION source.
     # Now both paths ask the same policy (US-41.5 review).
+    #
+    # The carve-out must NAME `ingest`: an ingestion source is a TENANT-authored
+    # URL, so an entry made for the deployment's own model endpoint does not also
+    # authorize fetching whatever it covers and storing the body as an article.
     test "an OPERATOR-allowlisted private host is fetchable as an ingestion source" do
       %{tenant: tenant} = setup_tenant()
 
@@ -639,7 +643,7 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
          ]}
       end)
 
-      AllowlistSource.put(["10.0.0.0/8"])
+      AllowlistSource.put(["10.0.0.0/8@ingest"])
 
       try do
         assert :ok =
@@ -658,6 +662,35 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
 
       %{data: articles} = Knowledge.list_articles(tenant.id, source_type: "web_article")
       assert Enum.any?(articles, &(&1.title == "Allowlisted host finding"))
+    end
+
+    # The control for the case above: the SAME carve-out without `@ingest` is an
+    # inference carve-out, and an inference carve-out does not authorize fetching
+    # a tenant-authored URL out of the operator's private network.
+    test "a carve-out that does NOT name ingest leaves the host unfetchable" do
+      %{tenant: tenant} = setup_tenant()
+
+      stub(Loopctl.MockDnsResolver, :resolve, fn _host -> {:ok, [{10, 0, 0, 5}]} end)
+
+      AllowlistSource.put(["10.0.0.0/8"])
+
+      try do
+        assert {:cancel, reason} =
+                 ContentIngestionWorker.perform(%Oban.Job{
+                   id: 203,
+                   args: %{
+                     "tenant_id" => tenant.id,
+                     "url" => "https://internal.example.com/doc",
+                     "content_hash" => "allowlisted2",
+                     "source_type" => "web_article"
+                   }
+                 })
+
+        assert reason =~ "egress_blocked"
+        assert reason =~ "denylisted"
+      after
+        AllowlistSource.clear()
+      end
     end
   end
 

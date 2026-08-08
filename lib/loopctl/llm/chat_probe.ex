@@ -226,9 +226,10 @@ defmodule Loopctl.Llm.ChatProbe do
   # Fail-closed: an unclassifiable host does NOT get plaintext.
   defp validate_transport(tenant_id, url) do
     if ChatBaseUrl.plaintext?(url) do
-      host = URI.parse(url).host
+      uri = URI.parse(url)
+      host = uri.host
 
-      case Policy.classify(EgressScope.new(tenant_id), host, :inference) do
+      case Policy.classify(EgressScope.new(tenant_id), host, :inference, Policy.uri_port(uri)) do
         {:ok, %{verdict: :network_local}} ->
           :ok
 
