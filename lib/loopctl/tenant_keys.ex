@@ -9,7 +9,9 @@ defmodule Loopctl.TenantKeys do
   ## ETS table
 
   Created at application start (see `Loopctl.Application`). Table name
-  is `:tenant_key_cache`. Entries are `{tenant_id, private_key, expires_at}`.
+  is `:tenant_key_cache`. Entries are `{tenant_id, result, expires_at}`, where
+  `result` is the `{:ok, key}` / `{:error, reason}` this module returns — FAILURES
+  are cached too, on a shorter TTL. See `@negative_ttl_seconds`.
   """
 
   require Logger
@@ -20,6 +22,19 @@ defmodule Loopctl.TenantKeys do
 
   @cache_table :tenant_key_cache
   @ttl_seconds 300
+
+  # A failure is cached, because the caller that hurts most is the one that repeats:
+  # `Dispatches.verifier_seed/2` asks for this key on EVERY request-review, and with
+  # misses uncached a secret-store outage cost one round trip per call, deployment-wide
+  # — the outage's own load amplified against the store that is already failing.
+  #
+  # The negative TTL is deliberately much shorter than the positive one. A cached
+  # SUCCESS is stale only if the key rotated, and rotation calls `invalidate/1`; a
+  # cached FAILURE would extend a resolved outage by its own TTL, turning a 10-second
+  # blip into 5 minutes of `verifier_seed_unavailable` and stories flagged
+  # `verifier_needed` that did not need to be. Short enough to recover promptly, long
+  # enough to collapse a request storm.
+  @negative_ttl_seconds 15
 
   @doc """
   Ensure the ETS cache table exists. Called from `Application.start/2`.
@@ -46,8 +61,8 @@ defmodule Loopctl.TenantKeys do
     now = System.system_time(:second)
 
     case :ets.lookup(@cache_table, tenant_id) do
-      [{^tenant_id, key, expires_at}] when expires_at > now ->
-        {:ok, key}
+      [{^tenant_id, result, expires_at}] when expires_at > now ->
+        result
 
       _ ->
         fetch_and_cache(tenant_id, now)
@@ -68,7 +83,9 @@ defmodule Loopctl.TenantKeys do
 
     case AdminRepo.one(from(t in Tenant, where: t.id == ^tenant_id, select: t.slug)) do
       nil ->
-        {:error, :tenant_not_found}
+        # A pre-v2 / deleted tenant asks again on every request just as an outage
+        # does, and the answer is just as stable over the negative window.
+        cache_negative(tenant_id, {:error, :tenant_not_found}, now)
 
       slug ->
         secret_name = Secrets.audit_key_secret_name(slug)
@@ -78,7 +95,7 @@ defmodule Loopctl.TenantKeys do
             # Fly secrets store keys as base64 (set via FlyAdapter.set/2).
             # Decode to raw bytes for :crypto.sign/5.
             key = decode_key(encoded)
-            :ets.insert(@cache_table, {tenant_id, key, now + @ttl_seconds})
+            :ets.insert(@cache_table, {tenant_id, {:ok, key}, now + @ttl_seconds})
             {:ok, key}
 
           {:error, reason} ->
@@ -86,9 +103,18 @@ defmodule Loopctl.TenantKeys do
               "Failed to fetch audit key for tenant #{tenant_id}: #{inspect(reason)}"
             )
 
-            {:error, reason}
+            cache_negative(tenant_id, {:error, reason}, now)
         end
     end
+  end
+
+  # Negative entries live in the SAME table under the same key, so `invalidate/1`
+  # (called by rotation and by the enrollment upgrade that provisions a key in the
+  # first place) clears a cached failure the moment the key exists — a tenant that
+  # just earned an audit key never has to wait out the negative TTL.
+  defp cache_negative(tenant_id, result, now) do
+    :ets.insert(@cache_table, {tenant_id, result, now + @negative_ttl_seconds})
+    result
   end
 
   # Keys may be stored as base64 (FlyAdapter encodes) or raw bytes (test mocks).

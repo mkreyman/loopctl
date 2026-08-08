@@ -96,8 +96,8 @@ caller's lineage is always resolved SERVER-SIDE from the authenticating key
   `get_dispatch_lineage/2`) fails **CLOSED**, and the `assigned_agent_id`
   equality check runs IN ADDITION to the lineage comparison rather than being short-circuited by it.
   `verifier_dispatch_id` is written only by the assign-verifier flow (`assign_rotating_verifier/3`,
-  `progress.ex:448-487`); that write is result-checked, and a failure flags `verifier_needed` plus a
-  `verifier_not_assigned` audit event (`flag_verifier_needed/5`, `progress.ex:500`) instead of
+  `progress.ex:484-523`); that write is result-checked, and a failure flags `verifier_needed` plus a
+  `verifier_not_assigned` audit event (`flag_verifier_needed/5`, `progress.ex:536`) instead of
   silently leaving the field nil. `request-review` is OPTIONAL, so most stories reach verify with no
   verifier dispatch — the CALLER-lineage step is what keeps that path lineage-gated.
 - **report** — `validate_not_self_report/3`. `nil` caller blocked
@@ -127,6 +127,20 @@ caller's lineage is always resolved SERVER-SIDE from the authenticating key
 is exactly the orphaned shape — do not delete `custody_orphaned?/1` or `custody_unattributed?/1` as
 redundant with the constraint.
 
+**Backfill is the fourth way to reach `verified`, and its guard is `stories.lifecycle_entered_at`.**
+`backfill_story/4` / `ensure_mark_complete_allowed/2` certify with no report, no review record and no
+verifier, so they are confined to work that never entered the lifecycle. State alone cannot answer
+that: `force_unclaim_story/3` CLEARS `assigned_agent_id`, and a legacy bearer claim never writes
+`implementer_dispatch_id`, so claim -> force-unclaim leaves a worked story indistinguishable from
+pre-loopctl work. `guard_no_lifecycle_history/2` (`progress.ex`) consults three sources: the
+`lifecycle_entered_at` COLUMN, a legacy `metadata["lifecycle_entered_at"]` key, and the `audit_log`
+(retention-bounded — `AuditPartitionWorker` DROPs partitions past `:audit_retention_days`, so it
+expires). The column is stamped by all three paths that clear `assigned_agent_id` on a worked story
+(`unclaim_story/3`, `force_unclaim_story/3`, `perform_auto_reset/4`) and never cleared. **It is a
+column and not a `metadata` key on purpose**: `metadata` is cast by `Story.update_changeset/2` and
+REPLACED wholesale by `PATCH /api/v1/stories/:id`, so one ordinary orchestrator request erased the
+marker and handed the launder path back. Never add `:lifecycle_entered_at` to a `cast` list.
+
 **The MCP server must NEVER hold both an implementer and a reviewer key in one process** — the 409s are
 correct behavior; do not add a workaround.
 
@@ -155,7 +169,7 @@ correct behavior; do not add a workaround.
 **Enforcement is conditional — this is the deprecation seam.** `Progress.maybe_consume_cap/6`
 (`progress.ex:352-398`) is what actually gates the custody ops: a `nil` `cap_id` is rejected with
 `:missing_capability` **only for tenants that have an audit key** (`tenant_has_audit_key?/1`,
-`progress.ex:528-533`); a pre-v2 (keyless) tenant returns `{:ok, :pre_v2_tenant}` and the operation
+`progress.ex:564-569`); a pre-v2 (keyless) tenant returns `{:ok, :pre_v2_tenant}` and the operation
 proceeds with NO capability at all. So L1 strength is per-tenant. A REJECTED cap is split by
 `cap_refusal/4`: only `:invalid_signature` / `:replay` surface as `{:cap_rejected, _}`, which
 FallbackController answers with a plain 403 — it halts NOTHING and counts toward nothing (see the
@@ -199,7 +213,7 @@ exist, but every one descends from the implementer's root — the single-root te
 not a shortage; its remedy is the operator minting an independently-rooted verifier tree.
 
 **Empty-lineage caveat, in BOTH directions.** When the implementer dispatch cannot be loaded,
-`assign_rotating_verifier/3` passes `[]` (`progress.ex:448-452`), and with `[]` the rejection is
+`assign_rotating_verifier/3` passes `[]` (`progress.ex:484-488`), and with `[]` the rejection is
 inert — selection can then pick a same-lineage (even the implementer's own) dispatch. The verify-time
 comparison is fail-closed on an empty lineage, so this is caught at verify rather than at selection;
 do not "simplify" either half.
@@ -229,7 +243,20 @@ Only the first deserves the privilege, so the check is `caller_lineage == [] and
 Role.role_at_least?(role, :user)`. Inferring it from `[]` alone let every legacy `:orchestrator`
 key hand itself an independently-rooted dispatch for the whole deprecation window.
 
-Both refusals are logged (`lineage_ceiling_refused`) and emit
+**The ceiling covers CREDENTIAL MINTING, not just dispatch minting.** A plain API key was
+minted by no dispatch, so `lineage_for_api_key/2` resolves it to `[]` — the same shape the
+root half admits. A dispatch-minted `:user`-role key could therefore mint (or rotate itself)
+a plain key at `POST /api/v1/api_keys` and, holding it, start the independent tree it had
+just been refused. `LoopctlWeb.Plugs.RequireUnlineagedCaller`
+(`lib/loopctl_web/plugs/require_unlineaged_caller.ex`) closes that: `create` and `rotate` —
+the two actions that hand back a raw key — are refused with `403 api_key_mint_forbidden`
+when the caller carries a lineage. The invariant is **credentials that carry no lineage may
+only be minted by a principal that has none**; the key is NOT made to inherit the minter's
+lineage, because a key's lineage IS its `dispatches` row, and a second lineage source that
+the custody gates did not read would be the same failure one layer down. Reads (`index`) and
+`delete` are unaffected.
+
+All three refusals are logged (`lineage_ceiling_refused`) and emit
 `[:loopctl, :custody, :lineage_ceiling_refused]`. A 403 body carries the caller's own
 `your_dispatch_id` when it HAS one — the remediation says "mint under your own dispatch", and
 nothing else on this API tells a caller which row is its own. For a caller with no lineage the key
@@ -266,7 +293,11 @@ clears it, so both its trigger and its blast radius are deliberately bounded.
   TTL, so a client retry (`:replay`), a resumed agent (`:expired`) and an audit-key rotation
   (`:invalid_signature`) all produce one; none is a byzantine signal, and the 403 already
   refuses the operation. It emits `[:loopctl, :custody, :cap_rejected]` telemetry instead —
-  alert on the RATE. Do not re-add a halt there.
+  alert on the RATE. Do not re-add a halt there. **Not halting is not the same as not
+  recording**: EVERY cap refusal is hash-chained by `record_cap_refusal/4` — the byzantine
+  set as `capability_forged` (`byzantine: true`), the rest as `capability_refused`. That used
+  to run the wrong way round, with `:wrong_lineage` chained and a FORGED signature left with
+  only a log line; since the refusal no longer halts, the audit entry IS its durable record.
 - **Scope** — `LoopctlWeb.CustodySurface` (`lib/loopctl_web/custody_surface.ex`) is THE list of
   operations a halt suspends: story-lifecycle writes, bulk story ops + `verify-all`, project
   import (`initial_agent_status` records work as done), dispatch minting, agent-memory writes

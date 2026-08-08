@@ -234,6 +234,45 @@ defmodule LoopctlWeb.StoryLifecycleCapabilityTest do
       assert cap_id == start_cap["cap_id"]
     end
 
+    test "a FORGED signature is recorded at least as durably as a stale token",
+         %{conn: conn} do
+      %{tenant: tenant, story: story, implementer: impl} = keyed_context()
+
+      %{"capability" => start_cap} =
+        conn
+        |> auth(impl.raw_key)
+        |> post("/api/v1/stories/#{story.id}/claim")
+        |> json_response(200)
+
+      # Tamper with the signed fields so the ed25519 signature no longer verifies.
+      # This is the highest-signal event the capability layer can observe, and it used
+      # to leave NOTHING durable: a log line and a telemetry tick, while the BENIGN
+      # refusals above (expired, wrong lineage) were hash-chained. Backwards.
+      Loopctl.Capabilities.CapabilityToken
+      |> AdminRepo.get!(start_cap["cap_id"])
+      |> Ecto.Changeset.change(signature: :crypto.strong_rand_bytes(64))
+      |> AdminRepo.update!()
+
+      conn
+      |> auth(impl.raw_key)
+      |> post("/api/v1/stories/#{story.id}/start", %{"capability" => start_cap["cap_id"]})
+      |> response(403)
+
+      entries =
+        Loopctl.AuditChain.Entry
+        |> where([e], e.tenant_id == ^tenant.id and e.action == "capability_forged")
+        |> AdminRepo.all()
+
+      assert [%{payload: payload}] = entries
+      assert payload["reason"] == "invalid_signature"
+      assert payload["byzantine"] == true
+      assert payload["cap_id"] == start_cap["cap_id"]
+
+      # Recorded, but still not a halt: #629 took cap_rejected off the escalation
+      # path precisely because an audit-key rotation in flight produces this too.
+      assert is_nil(AdminRepo.get!(Loopctl.Tenants.Tenant, tenant.id).custody_halted_at)
+    end
+
     test "a malformed capability is refused, not a 500", %{conn: conn} do
       %{story: story, implementer: impl} = keyed_context()
 

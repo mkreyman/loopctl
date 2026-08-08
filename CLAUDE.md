@@ -174,9 +174,9 @@ in order:
    story that lacks a verifier dispatch.
 
 `verifier_dispatch_id` is written only by the assign-verifier flow
-(`assign_rotating_verifier/3`, `progress.ex:448-487`); that write is checked, and a failure
+(`assign_rotating_verifier/3`, `progress.ex:484-523`); that write is checked, and a failure
 flags `verifier_needed` plus a `verifier_not_assigned` audit event
-(`flag_verifier_needed/5`, `progress.ex:500`) rather than silently leaving the field nil.
+(`flag_verifier_needed/5`, `progress.ex:536`) rather than silently leaving the field nil.
 Because `request-review` is OPTIONAL, a story often reaches verify with no verifier dispatch
 at all — step 3 is what keeps that path lineage-gated instead of a bare agent-id inequality.
 
@@ -215,6 +215,18 @@ The reporter/reviewer lineage both come from `Dispatches.lineage_for_api_key/2` 
 that minted the calling key. A key not minted by a dispatch yields `[]`. On a PRE-DISPATCH story
 that is inert (the agent-id checks are the whole gate, by design); on DISPATCH-MINTED work it is
 refused with `caller_lineage_required` rather than silently short-circuiting the comparison.
+
+**backfill / bulk mark-complete** is the FOURTH way to reach `verified`, and it skips
+report, review and verifier entirely — so it is confined to work that never entered the
+lifecycle. State alone cannot establish that (`force_unclaim_story/3` clears
+`assigned_agent_id`, and a legacy bearer claim never writes `implementer_dispatch_id`), so
+`guard_no_lifecycle_history/2` reads three sources: the `stories.lifecycle_entered_at`
+COLUMN, a legacy `metadata["lifecycle_entered_at"]` key, and the retention-bounded
+`audit_log`. The column is stamped by every path that clears `assigned_agent_id` on a worked
+story and never cleared. **It is a column, not a `metadata` key, because `metadata` is cast
+and whole-map-replaced by `PATCH /api/v1/stories/:id`** — one ordinary request erased the
+marker and restored the claim → force-unclaim → backfill-to-verified launder. Never add
+`:lifecycle_entered_at` to a changeset `cast` list.
 
 **The MCP server must NEVER hold both implementer and reviewer keys in the same process.** The 409 errors are the system working correctly — do not add workarounds.
 
@@ -259,6 +271,21 @@ and an ephemeral API key with a bounded TTL. The MCP server v2 tool
 
 Legacy env-var keys (`LOOPCTL_AGENT_KEY`, `LOOPCTL_ORCH_KEY`, etc.) continue to
 work during the deprecation window but will be removed at the epic merge.
+
+**The lineage ceiling binds every way of obtaining a credential.** A dispatch may
+only be minted INSIDE the caller's own subtree: a parentless create is
+`403 root_dispatch_forbidden` for anyone but the tenant's operator key (a `:user`
+key that no dispatch minted), and a parent outside the caller's lineage is
+`403 parent_outside_caller_lineage`
+(`lib/loopctl_web/controllers/dispatch_controller.ex`). A PLAIN API key carries no
+lineage, which is the same shape the root half admits — so
+`POST /api/v1/api_keys` and its `rotate` sibling are refused with
+`403 api_key_mint_forbidden` to a caller that has one
+(`LoopctlWeb.Plugs.RequireUnlineagedCaller`). Credentials that carry no lineage may
+only be minted by a principal that has none. Do NOT "fix" this by giving an
+`api_keys` row a lineage of its own: a key's lineage IS its `dispatches` row
+(`Dispatches.lineage_for_api_key/2`), and a second source the custody gates do not
+read reopens the same hole one layer down.
 
 ## Dependency Injection — Config-Based (NOT Opts-Based)
 

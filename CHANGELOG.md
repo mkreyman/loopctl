@@ -44,10 +44,13 @@ All notable changes to loopctl are documented here.
   it — so one agent letting a token pass its 1-hour TTL took down every other agent in the
   tenant. **No capability rejection halts a tenant any more** — not a forged signature, not a
   double-spent token (see the 2026-07-24 entry below, which supersedes an earlier draft of
-  this line). Every one of them is an ordinary 403; expiry and lineage drift are additionally
-  recorded in the audit chain as `capability_refused` (with the `cap_id`, api key and agent).
-  Alert on the RATE of the `[:loopctl, :custody, :cap_rejected]` telemetry event — that is now
-  the only signal for a forged or replayed token, and a single occurrence is not one.
+  this line). Every one of them is an ordinary 403, and every one is recorded in the
+  hash-chained audit log with the `cap_id`, api key and agent: expiry and lineage drift as
+  `capability_refused`, a forged signature or a double-spend as `capability_forged`
+  (`payload.byzantine: true`). That recording used to run the wrong way round — the benign
+  refusals were chained and the forged ones left only a log line — so a forged signature is
+  now durable rather than dependent on log retention. Alert on the RATE of the
+  `[:loopctl, :custody, :cap_rejected]` telemetry event; a single occurrence is not a signal.
   Relatedly, **rotating a tenant's audit signing key no longer invalidates outstanding
   capability tokens**: verification now also accepts the historical key whose
   `[rotated_in, rotated_out)` window covers the token's `issued_at`. Without that, a routine
@@ -80,6 +83,22 @@ All notable changes to loopctl are documented here.
   are logged as `lineage_ceiling_refused` and emit
   `[:loopctl, :custody, :lineage_ceiling_refused]`.
 
+- **The lineage ceiling also covers API-key minting.** A plain API key is minted by no
+  dispatch, so it carries no lineage — the same shape the rule above admits as "may start a
+  new tree". A caller whose own key came from a dispatch could therefore mint itself a plain
+  key at `POST /api/v1/api_keys` (or rotate an existing one) and use it to start the
+  independent root it had just been refused. Both raw-key-minting actions —
+  `POST /api/v1/api_keys` and `POST /api/v1/api_keys/:id/rotate` — now return
+  `403 api_key_mint_forbidden` to a caller that carries a dispatch lineage, logged and
+  counted under the same `lineage_ceiling_refused` name. **What changed for clients:** an
+  agent or orchestrator running under a dispatch cannot create long-lived API keys; mint a
+  dispatch beneath its own instead (`POST /api/v1/dispatches` with `parent_dispatch_id`,
+  returned in the 403 as `remediation.your_dispatch_id`), which yields an ephemeral key
+  inside its subtree. The tenant's operator key and legacy env-var keys — neither of which a
+  dispatch minted — are unaffected, as are `GET /api/v1/api_keys` and key revocation.
+  `loopctl-mcp-server`'s `dispatch` tool documentation has been corrected accordingly: it
+  still said to omit `parent_dispatch_id` for a root dispatch, which is now a 403.
+
 - **Verifier selection is seeded from a server-side secret.** The rotating verifier's index was
   derived from the tenant's audit signing PUBLIC key, which `/.well-known/loopctl` serves
   unauthenticated, while the candidate pool is listable by any agent key — so the choice was
@@ -101,13 +120,18 @@ All notable changes to loopctl are documented here.
   no dispatch minted never records an implementer dispatch — so a worked story could be
   returned to a state indistinguishable from pre-loopctl work and then marked verified with no
   report, review record or independent verifier. Unclaim, force-unclaim and the reject
-  auto-reset now stamp `metadata.lifecycle_entered_at` on the story, and both paths refuse a
+  auto-reset now stamp a durable marker on the story, and both paths refuse a
   story carrying it — or a lifecycle entry in the audit log — with a new 422
   (`story_entered_lifecycle`). The row stamp is the longer-lived half deliberately: `audit_log`
   is partitioned and pruned at `AUDIT_RETENTION_DAYS` (default 90), so an audit-only guard would
-  have reopened this path on a timer. The stamp is not tamper-proof — `PATCH /stories/:id`
-  replaces `metadata` wholesale, so an orchestrator key can still erase it; both sources are
-  consulted. Imported and never-dispatched work — the case backfill exists for — is unaffected.
+  have reopened this path on a timer. **The marker is a dedicated
+  `stories.lifecycle_entered_at` column** (migration `20260807153000`, which also carries
+  forward any marker already written): it first shipped inside `metadata`, which
+  `PATCH /api/v1/stories/:id` replaces wholesale, so a single orchestrator-role request erased
+  it and restored the launder path. The column appears in no changeset `cast`, so no request
+  body can reach it; the legacy `metadata` key is still honoured on read. The column is
+  returned on every story payload. Imported and never-dispatched work — the case backfill
+  exists for — is unaffected.
   Backfill is additionally mounted on the LCP-1 signed-claim gate, so under the `signed` custody
   profile an enrolled caller must sign it exactly as for `verify`, and the verified claim is
   recorded in the hash-chained audit log (§9.4) as it is for `verify`.
