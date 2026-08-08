@@ -27,21 +27,25 @@ fly secrets set CLOAK_KEY="GENERATED_BASE64_KEY"
 
 > **Rotating `CLOAK_KEY`:** follow
 > [`docs/runbooks/cloak-key-rotation.md`](../docs/runbooks/cloak-key-rotation.md). In
-> short: set `CLOAK_KEY`, `CLOAK_KEY_TAG` and `CLOAK_RETIRED_KEYS` in ONE
-> `fly secrets set` (the retired key must never land after the new active key), run
-> `mix loopctl.reencrypt_secrets`, let the `:ingestion` queue drain, and only then unset
-> `CLOAK_RETIRED_KEYS`. Ingestion jobs carry their document encrypted in `oban_jobs.args`
-> and live up to the 3600s uniqueness window (longer under snooze); a rotation that drops
-> the old key first makes those in-flight jobs undecryptable, and they discard. The worker
-> logs a distinct warning on every decrypt failure — alert on it, since the same signal
-> also means at-rest tampering.
+> short: publish the new key decrypt-only first (`CLOAK_RETIRED_KEYS="NEWTAG:NEW_KEY"`),
+> then in a SECOND `fly secrets set` promote it to `CLOAK_KEY`/`CLOAK_KEY_TAG` and retire
+> the outgoing key — a single command would leave a rolling-restart window where a
+> not-yet-restarted machine cannot read the new tag. Then run
+> `mix loopctl.reencrypt_secrets`, let the `:ingestion` AND `:cleanup` queues drain, and
+> only then unset `CLOAK_RETIRED_KEYS`. Both queues carry Cloak-encrypted values in
+> `oban_jobs.args` that neither the pass nor its `status` census can see: an ingestion
+> document (up to the 3600s uniqueness window, longer under snooze) and a tenant's old
+> Ed25519 audit private key awaiting restore (10 retries with exponential backoff). Dropping
+> the old key first makes those jobs undecryptable — ingestion discards, and the audit key
+> is lost. The ingestion worker logs a distinct warning on every decrypt failure — alert on
+> it, since the same signal also means at-rest tampering.
 
 ### Key-rotation variables
 
 | Variable              | Default | Description |
 |-----------------------|---------|-------------|
-| `CLOAK_KEY_TAG`       | `AES.GCM.V1` | The cipher tag stamped into the header of every value `CLOAK_KEY` encrypts. **Bump it in the same command that swaps `CLOAK_KEY`** — Cloak selects a decrypt cipher by matching this tag and takes the first hit, so leaving it unchanged during a rotation makes the new key claim the old key's rows and fail their GCM authentication check. Leaving it unset on an install that never rotates is correct; the default is what every existing row carries. A retired entry that reuses the active tag aborts boot |
-| `CLOAK_RETIRED_KEYS`  | - (none) | Comma-separated `TAG:BASE64_KEY` entries naming previous `CLOAK_KEY` values, decrypt-only, so rows written before a rotation stay readable — e.g. `AES.GCM.V1:OLD_BASE64_KEY`. Encoded exactly like `CLOAK_KEY` (base64 of 32 raw bytes) with the tag its ciphertext carries prefixed. A malformed entry, a duplicate tag, a wrong key length, or a collision with `CLOAK_KEY_TAG` **aborts boot naming the entry's position** — a silently dropped retired key means rows nobody can decrypt, which is worse than a failed start. Unset it only after `mix loopctl.reencrypt_secrets status` shows nothing left on the retired tag |
+| `CLOAK_KEY_TAG`       | `AES.GCM.V1` | The cipher tag stamped into the header of every value `CLOAK_KEY` encrypts. **Bump it in the same command that swaps `CLOAK_KEY`** (the promotion command — see the rotation note above) — Cloak selects a decrypt cipher by matching this tag and takes the first hit, so leaving it unchanged during a rotation makes the new key claim the old key's rows and fail their GCM authentication check. Leaving it unset on an install that never rotates is correct; the default is what every existing row carries. A retired entry that reuses the active tag aborts boot |
+| `CLOAK_RETIRED_KEYS`  | - (none) | Comma-separated `TAG:BASE64_KEY` entries naming previous `CLOAK_KEY` values, decrypt-only, so rows written before a rotation stay readable — e.g. `AES.GCM.V1:OLD_BASE64_KEY`. Encoded exactly like `CLOAK_KEY` (base64 of 32 raw bytes) with the tag its ciphertext carries prefixed. A malformed entry, a duplicate tag, a wrong key length, or a collision with `CLOAK_KEY_TAG` **aborts boot naming the entry's position** (its raw comma-separated field number, blanks counted) — a silently dropped retired key means rows nobody can decrypt, which is worse than a failed start. A value that is SET but names no entries (`,` or a blank) aborts too: UNSET the variable to mean "no retired keys". Unset it only after `mix loopctl.reencrypt_secrets status` shows nothing left on the retired tag AND the `:ingestion`/`:cleanup` queues have drained |
 
 ### Environment Variables (set in fly.toml, not secrets)
 

@@ -2,9 +2,10 @@ defmodule Mix.Tasks.Loopctl.ReencryptSecrets do
   @moduledoc """
   Re-encrypts every Cloak-encrypted column onto the vault's ACTIVE cipher (#622).
 
-  Step 4 of `docs/runbooks/cloak-key-rotation.md`. Run it after a new `CLOAK_KEY` is live
+  Step 5 of `docs/runbooks/cloak-key-rotation.md`. Run it after a new `CLOAK_KEY` is live
   and the outgoing key is listed in `CLOAK_RETIRED_KEYS`; when it reports nothing left on
-  the retired tag, that key can be dropped from the secret.
+  the retired tag, AND the `:ingestion` and `:cleanup` queues have drained, that key can be
+  dropped from the secret.
 
   ## Usage
 
@@ -19,8 +20,9 @@ defmodule Mix.Tasks.Loopctl.ReencryptSecrets do
   (`Loopctl.Vault.Rotation.targets/0`), so a newly added `Loopctl.Vault.Binary` field is
   covered without editing this task. `status` prints the list it found.
 
-  Encrypted values inside `oban_jobs.args` are NOT covered — see the runbook's queue-drain
-  step and `Loopctl.Vault.Rotation`'s moduledoc.
+  Encrypted values inside `oban_jobs.args` are NOT covered, and `status` cannot see them
+  either — see the runbook's queue-drain step (both `:ingestion` AND `:cleanup`) and
+  `Loopctl.Vault.Rotation`'s moduledoc.
 
   ## Reading the output
 
@@ -29,11 +31,17 @@ defmodule Mix.Tasks.Loopctl.ReencryptSecrets do
     * `reencrypted` — rewritten onto the active cipher (under `--dry-run`, WOULD be)
     * `skipped_active` — already on the active cipher; this is what makes a re-run cheap
     * `skipped_null` — the row's encrypted columns are all empty
-    * `skipped_concurrent` — the application rewrote the row mid-pass, so it is already
-      on the active cipher; nothing was clobbered
+    * `skipped_concurrent` — the application rewrote the row mid-pass and a re-read
+      confirms it is on the active cipher; nothing was clobbered
+    * `skipped_gone` — the row was deleted mid-pass (routine on the TTL-pruned
+      `idempotency_cache`); there is nothing left to re-encrypt
     * `failed` — the plaintext could NOT be recovered, almost always a retired key missing
       from `CLOAK_RETIRED_KEYS`. The task exits non-zero. Fix the secret and re-run; the
       rows it already converted are skipped the second time.
+
+  A DB error mid-pass ABORTS it: the counts gathered so far are still printed, with the
+  cause listed under failures, and the task exits non-zero. Re-run it — the pass is
+  idempotent, so converted rows are skipped.
 
   A run that reports `reencrypted: 0` with a non-zero `skipped_active` is finished work,
   not a silent no-op — confirm it against `status`, which reads tags off the stored bytes.
@@ -72,6 +80,10 @@ defmodule Mix.Tasks.Loopctl.ReencryptSecrets do
     case Rotation.reencrypt(opts) do
       {:ok, report} ->
         print_report(report)
+
+      {:error, %{aborted: true} = report} ->
+        print_report(report)
+        Mix.raise("the pass aborted before completing (see above); re-running it resumes")
 
       {:error, report} ->
         print_report(report)
@@ -114,7 +126,7 @@ defmodule Mix.Tasks.Loopctl.ReencryptSecrets do
   end
 
   defp format_counts(counts) do
-    ~w(examined reencrypted skipped_active skipped_null skipped_concurrent failed)a
+    ~w(examined reencrypted skipped_active skipped_null skipped_concurrent skipped_gone failed)a
     |> Enum.map_join(" ", fn key -> "#{key}=#{Map.fetch!(counts, key)}" end)
   end
 

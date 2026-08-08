@@ -18,7 +18,8 @@ defmodule Loopctl.Vault.Rotation do
       and `Loopctl.Workers.OrphanedSecretCleanupWorker` call `Vault.encrypt!/1` and
       base64 the result into job args. Those are transient rows an executing job may be
       holding, so rewriting them races the worker. The runbook's queue-drain step covers
-      them instead.
+      them instead — it names BOTH the `:ingestion` and `:cleanup` queues, which
+      `census/1` cannot see, so a clean census does not mean they are done.
     * **An encrypted value inside an array or map column** — no such column exists, and
       rewriting one needs per-element handling this module does not do. `targets/0`
       RAISES on one rather than skipping it silently.
@@ -38,17 +39,20 @@ defmodule Loopctl.Vault.Rotation do
   actually stamps, not against what config claims it stamps. A row already on the active
   tag is skipped, which makes a second run a no-op and an interrupted run cheap to resume.
 
-  Every row is accounted for in the report under exactly one of `reencrypted`,
-  `skipped_active`, `skipped_null`, `skipped_concurrent` or `failed` — the counts sum to
-  `examined`. A row whose plaintext cannot be recovered (its cipher is not configured, or
-  the GCM auth check fails) is a FAILURE, never a skip: that is the one outcome a
-  half-configured `CLOAK_RETIRED_KEYS` produces, and reporting it as success would hide
-  the data loss this task exists to prevent.
+  Every row is accounted for under exactly one of `reencrypted`, `skipped_active`,
+  `skipped_null`, `skipped_concurrent`, `skipped_gone` or `failed` — the counts sum to
+  `examined`. A row whose plaintext cannot be recovered (its cipher is not
+  configured, or the GCM auth check fails) is a FAILURE, never a skip: that is the one
+  outcome a half-configured `CLOAK_RETIRED_KEYS` produces, and reporting it as success
+  would hide the data loss this task exists to prevent.
 
   The write is a compare-and-set on the exact ciphertext bytes
   (`UPDATE ... WHERE pk = $n AND col = <old bytes>`), so a row the application rewrote
-  between our read and our write is left alone and counted `skipped_concurrent` — the
-  application's own write is already on the active cipher.
+  between our read and our write is never clobbered. A 0-row result is NOT read as "the
+  row is on the active cipher": the guard spans every column, so a write to ONE voids it
+  while the rest sit on the retired key, and a DELETE looks identical. The row is re-read
+  and re-decided once — `skipped_gone` if it vanished, a retry if anything is still stale,
+  `skipped_concurrent` only once the re-read shows it converted.
 
   ## Repo choice
 
@@ -65,6 +69,8 @@ defmodule Loopctl.Vault.Rotation do
   runbook puts it in a quiet window.
   """
 
+  require Logger
+
   alias Cloak.Tags.Decoder
   alias Loopctl.AdminRepo
   alias Loopctl.Vault
@@ -74,6 +80,8 @@ defmodule Loopctl.Vault.Rotation do
   # Cap on the failure detail carried back for printing. `failed` still counts them all.
   @max_reported_failures 50
 
+  # A cipher tag is a short printable label ("AES.GCM.V1"). See `tag_of/1`.
+  @max_tag_bytes 32
   @type column :: %{field: atom(), column: String.t()}
   @type target :: %{
           schema: module(),
@@ -87,11 +95,13 @@ defmodule Loopctl.Vault.Rotation do
           skipped_active: non_neg_integer(),
           skipped_null: non_neg_integer(),
           skipped_concurrent: non_neg_integer(),
+          skipped_gone: non_neg_integer(),
           failed: non_neg_integer()
         }
   @type report :: %{
           dry_run: boolean(),
           active_tag: String.t(),
+          aborted: boolean(),
           totals: counts(),
           tables: %{String.t() => counts()},
           failures: [%{table: String.t(), id: String.t(), reason: String.t()}],
@@ -104,6 +114,7 @@ defmodule Loopctl.Vault.Rotation do
     skipped_active: 0,
     skipped_null: 0,
     skipped_concurrent: 0,
+    skipped_gone: 0,
     failed: 0
   }
 
@@ -139,11 +150,18 @@ defmodule Loopctl.Vault.Rotation do
     end
   end
 
-  @doc "The Cloak cipher tag in a raw ciphertext header, or `:error` if it carries none."
+  @doc """
+  The Cloak cipher tag in a raw ciphertext header, or `:error` if it carries none.
+
+  `Cloak.Tags.Decoder` VALIDATES NOTHING: it reads byte 2 as a length and returns the
+  bytes that follow, so plaintext or a truncated value decodes to a "tag" that is really a
+  slice of the stored column — which would become a census bucket and get PRINTED in a
+  failure line. So Cloak's framing byte (reserved `1`) is asserted and the tag bounded.
+  """
   @spec tag_of(binary() | nil) :: {:ok, String.t()} | :error
-  def tag_of(ciphertext) when is_binary(ciphertext) and byte_size(ciphertext) >= 2 do
+  def tag_of(<<1, _rest::binary>> = ciphertext) do
     case Decoder.decode(ciphertext) do
-      %{tag: tag} when is_binary(tag) -> {:ok, tag}
+      %{tag: tag} when is_binary(tag) -> validate_tag(tag)
       _other -> :error
     end
   rescue
@@ -151,6 +169,12 @@ defmodule Loopctl.Vault.Rotation do
   end
 
   def tag_of(_ciphertext), do: :error
+
+  defp validate_tag(tag) when byte_size(tag) > 0 and byte_size(tag) <= @max_tag_bytes do
+    if Regex.match?(~r/\A[\x20-\x7E]+\z/, tag), do: {:ok, tag}, else: :error
+  end
+
+  defp validate_tag(_tag), do: :error
 
   @doc """
   Counts ciphertext by cipher tag, per table and column, changing nothing.
@@ -166,10 +190,15 @@ defmodule Loopctl.Vault.Rotation do
   def census(opts \\ []) do
     tag = active_tag()
 
+    # Merged, not `Map.new/2`: two schemas may share a table, and a fresh map keyed on it
+    # would drop one of their column tallies.
     tables =
       opts
       |> selected_targets()
-      |> Map.new(fn target -> {target.table, census_table(target, batch_size(opts))} end)
+      |> Enum.reduce(%{}, fn target, acc ->
+        columns = census_table(target, batch_size(opts))
+        Map.update(acc, target.table, columns, &Map.merge(&1, columns))
+      end)
 
     %{active_tag: tag, tables: tables}
   end
@@ -194,12 +223,14 @@ defmodule Loopctl.Vault.Rotation do
       batch_size: batch_size(opts)
     }
 
-    report =
-      opts
-      |> selected_targets()
-      |> Enum.reduce(empty_report(context), &reencrypt_table(&1, context, &2))
+    targets = selected_targets(opts)
+    Logger.info("cloak rotation: #{length(targets)} table(s) -> #{context.active_tag}")
 
-    if report.totals.failed == 0, do: {:ok, report}, else: {:error, report}
+    report = Enum.reduce(targets, empty_report(context), &reencrypt_table(&1, context, &2))
+
+    Logger.info("cloak rotation: finished #{inspect(report.totals)}")
+
+    if report.aborted or report.totals.failed > 0, do: {:error, report}, else: {:ok, report}
   end
 
   ## Target enumeration
@@ -239,8 +270,18 @@ defmodule Loopctl.Vault.Rotation do
               "would need a hand-written pass — see docs/runbooks/cloak-key-rotation.md."
     end
 
+    if cloak_type?(type) and labelled?(type) do
+      raise ArgumentError,
+            "#{inspect(schema)}.#{field} declares a Cloak :label, so the application " <>
+              "encrypts it with THAT cipher (Cloak.Ecto.Type calls vault.encrypt!/2), not " <>
+              "the active one. Rewriting it here would move it off its designated key and " <>
+              "every run would flip it back — see docs/runbooks/cloak-key-rotation.md."
+    end
+
     cloak_type?(type)
   end
+
+  defp labelled?(type), do: type.__cloak__()[:label] != nil
 
   defp cloak_type?(type) when is_atom(type) do
     Code.ensure_loaded?(type) and function_exported?(type, :__cloak__, 0) and
@@ -290,6 +331,7 @@ defmodule Loopctl.Vault.Rotation do
     %{
       dry_run: context.dry_run,
       active_tag: context.active_tag,
+      aborted: false,
       totals: @empty_counts,
       tables: %{},
       failures: [],
@@ -297,12 +339,18 @@ defmodule Loopctl.Vault.Rotation do
     }
   end
 
+  defp reencrypt_table(_target, _context, %{aborted: true} = report), do: report
+
   defp reencrypt_table(target, context, report) do
+    # `put_new`: on two schemas sharing a table, resetting the second's counts would drop
+    # the first's while `totals` kept them, breaking the per-table sum.
     report
-    |> Map.put(:tables, Map.put(report.tables, target.table, @empty_counts))
+    |> Map.put(:tables, Map.put_new(report.tables, target.table, @empty_counts))
     |> walk(target, context, nil)
   end
 
+  # The rescue is per BATCH frame, so a mid-pass DB error (dropped connection, statement
+  # timeout) returns the counts gathered so far instead of raising them away.
   defp walk(report, target, context, after_pk) do
     case fetch_batch(target, after_pk, context.batch_size) do
       [] ->
@@ -312,6 +360,18 @@ defmodule Loopctl.Vault.Rotation do
         report = Enum.reduce(rows, report, &apply_row(&1, target, context, &2))
         walk(report, target, context, rows |> List.last() |> hd())
     end
+  rescue
+    error -> abort(report, target, error)
+  end
+
+  defp abort(report, target, error) do
+    reason = "aborted before completing: #{Exception.message(error)}"
+    Logger.error("cloak rotation: #{target.table}: #{reason}")
+    failure = %{table: target.table, id: "(pass)", reason: reason}
+
+    report
+    |> Map.put(:aborted, true)
+    |> Map.put(:failures, report.failures ++ [failure])
   end
 
   defp apply_row([pk | values], target, context, report) do
@@ -377,10 +437,40 @@ defmodule Loopctl.Vault.Rotation do
     tally(report, target.table, :reencrypted)
   end
 
-  defp write_row(report, target, _context, pk, rewrites) do
-    case AdminRepo.query!(update_sql(target, rewrites), update_params(pk, rewrites)) do
-      %{num_rows: 0} -> tally(report, target.table, :skipped_concurrent)
-      _updated -> tally(report, target.table, :reencrypted)
+  defp write_row(report, target, context, pk, rewrites) do
+    case cas(target, pk, rewrites) do
+      0 -> settle_race(report, target, context, pk)
+      _rows -> tally(report, target.table, :reencrypted)
+    end
+  end
+
+  defp cas(target, pk, rewrites) do
+    AdminRepo.query!(update_sql(target, rewrites), update_params(pk, rewrites)).num_rows
+  end
+
+  # A 0-row compare-and-set means the row moved under us, NOT that it is on the active
+  # cipher: it may have been DELETED (routine on the TTL-pruned idempotency_cache), or only
+  # SOME columns rewritten, voiding a guard spanning all of them while the rest sit on the
+  # retired key. So re-read and re-decide once, guarding the retry on the bytes just read.
+  defp settle_race(report, target, context, pk) do
+    case fetch_row(target, pk) do
+      nil ->
+        tally(report, target.table, :skipped_gone)
+
+      values ->
+        case classify(values, target, context.active_tag) do
+          :null -> tally(report, target.table, :skipped_null)
+          :active -> tally(report, target.table, :skipped_concurrent)
+          {:error, reason} -> record_failure(report, target, pk, reason)
+          {:rewrite, rewrites} -> retry_write(report, target, pk, rewrites)
+        end
+    end
+  end
+
+  defp retry_write(report, target, pk, rewrites) do
+    case cas(target, pk, rewrites) do
+      0 -> tally(report, target.table, :skipped_concurrent)
+      _rows -> tally(report, target.table, :reencrypted)
     end
   end
 
@@ -420,8 +510,11 @@ defmodule Loopctl.Vault.Rotation do
     census_walk(target, batch_size, nil, empty)
   end
 
+  # `:header` (the leading 64 bytes), not whole values: `status` classifies on the TLV
+  # header alone, so selecting full columns would drag every encrypted payload
+  # (idempotency_cache holds entire API responses) over one of AdminRepo's 3 connections.
   defp census_walk(target, batch_size, after_pk, acc) do
-    case fetch_batch(target, after_pk, batch_size) do
+    case fetch_batch(target, after_pk, batch_size, :header) do
       [] ->
         acc
 
@@ -452,8 +545,8 @@ defmodule Loopctl.Vault.Rotation do
 
   ## Shared SQL
 
-  defp fetch_batch(target, after_pk, limit) do
-    columns = Enum.map_join(target.columns, ", ", &quote_ident(&1.column))
+  defp fetch_batch(target, after_pk, limit, projection \\ :value) do
+    columns = Enum.map_join(target.columns, ", ", &projected(&1.column, projection))
     pk = target.primary_key
     select = "SELECT #{pk}, #{columns} FROM #{quote_ident(target.table)}"
 
@@ -465,6 +558,17 @@ defmodule Loopctl.Vault.Rotation do
 
     AdminRepo.query!(sql, params).rows
   end
+
+  defp fetch_row(target, pk) do
+    columns = Enum.map_join(target.columns, ", ", &quote_ident(&1.column))
+    sql = "SELECT #{columns} FROM #{quote_ident(target.table)} WHERE #{target.primary_key} = $1"
+
+    # nil when the row is gone — the pk is unique, so there is never a second row.
+    List.first(AdminRepo.query!(sql, [pk]).rows)
+  end
+
+  defp projected(column, :value), do: quote_ident(column)
+  defp projected(column, :header), do: "substring(#{projected(column, :value)} from 1 for 64)"
 
   # Identifiers come from Ecto schema reflection, never from operator input, but they are
   # interpolated into SQL — so the shape is asserted rather than assumed.

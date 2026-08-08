@@ -205,11 +205,14 @@ Operator-facing changes for deployments outside the hosted instance.
   `TAG:BASE64_KEY` entries, decrypt-only), replace the compile-time retired-cipher list that
   previously made a key rotation require a code change and a redeploy. That list was also
   inert: it was configured under a `retired_ciphers:` key Cloak never reads, so following it
-  would have produced undecryptable rows. **Deploy ordering matters:** set `CLOAK_KEY`,
-  `CLOAK_KEY_TAG` and `CLOAK_RETIRED_KEYS` in ONE `fly secrets set` — the retired key must
-  never land after the new active key — and bump the tag in that same command, because Cloak
-  selects a decrypt cipher by tag and a reused tag hands the old key's rows to the new key.
-  A malformed entry, a duplicate tag, a wrong key length, or a tag colliding with
+  would have produced undecryptable rows. **Deploy ordering matters, in TWO commands:**
+  first publish the new key decrypt-only (`CLOAK_RETIRED_KEYS="NEWTAG:NEW_KEY"`), then in a
+  second `fly secrets set` promote it to `CLOAK_KEY`/`CLOAK_KEY_TAG` and retire the outgoing
+  key. One command would leave a rolling-restart window in which a not-yet-restarted machine
+  has no cipher for the new tag; and the retired key must never land after the new active
+  key. Bump the tag in the promotion command, because Cloak selects a decrypt cipher by tag
+  and a reused tag hands the old key's rows to the new key. A malformed entry, a duplicate
+  tag, a wrong key length, a value that is set but names no entries, or a tag colliding with
   `CLOAK_KEY_TAG` aborts boot naming the entry's position, rather than silently dropping a
   key. Full procedure, including when it is safe to unset `CLOAK_RETIRED_KEYS`:
   [`docs/runbooks/cloak-key-rotation.md`](docs/runbooks/cloak-key-rotation.md).
@@ -221,9 +224,10 @@ Operator-facing changes for deployments outside the hosted instance.
   `status` subcommand that counts stored ciphertext by cipher tag so a rotation can be
   verified against the database rather than against the run's own summary. Every examined
   row is accounted for in the counts, and a row whose plaintext cannot be recovered is a
-  reported failure with a non-zero exit — never a silent skip. Encrypted document envelopes
-  inside `oban_jobs.args` are NOT covered; draining the `:ingestion` queue retires those,
-  as before.
+  reported failure with a non-zero exit — never a silent skip. Encrypted values inside
+  `oban_jobs.args` are NOT covered and the `status` census cannot see them; draining BOTH
+  the `:ingestion` and `:cleanup` queues is what retires those before the old key is
+  dropped.
 
 ### Changed
 

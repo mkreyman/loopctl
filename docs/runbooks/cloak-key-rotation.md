@@ -27,10 +27,17 @@ retired key means undecryptable rows, which is worse than a failed boot.
 
 ## Order (this is the part that loses data if you get it wrong)
 
-`CLOAK_RETIRED_KEYS` must be in place **before or in the same command as** the `CLOAK_KEY`
-swap. `fly secrets set A=… B=…` applies atomically and restarts once, so set all three
-together. Setting the new `CLOAK_KEY` first and the retired list second means every row
-written under the old key is unreadable for the window in between.
+Rotate in **two commands**, each with its own restart. `fly secrets set A=… B=…` is atomic
+in the secret store but not in the fleet: it rolls the machines, so for a minute both
+configs are live. Phase 1 publishes the new key DECRYPT-ONLY under its new tag; phase 2
+promotes it and retires the outgoing key. After phase 1 every machine reads both tags, so
+during phase 2's roll each machine can read whatever the other writes.
+
+Doing it in one command leaves a window where a not-yet-restarted machine meets a new-tag
+row it has no cipher for: encrypted columns raise on load, and an ingestion job a new
+machine wrote is DISCARDED as corrupt by an old one — after the client already got its 202.
+Setting the new `CLOAK_KEY` before the retired list is worse still: every row under the old
+key is unreadable until the second command lands.
 
 ## Procedure
 
@@ -38,7 +45,7 @@ Throughout, `mix loopctl.reencrypt_secrets` is the local form. On a release ther
 Mix, so use the running node: `bin/loopctl rpc 'Loopctl.Vault.Rotation.reencrypt() |> IO.inspect()'`
 (and `Loopctl.Vault.Rotation.census()` for `status`).
 
-1. **Census first.** Record what is out there, so step 6 has something to compare against:
+1. **Census first.** Record what is out there, so step 7 has something to compare against:
 
        mix loopctl.reencrypt_secrets status
 
@@ -50,21 +57,29 @@ Mix, so use the running node: `bin/loopctl rpc 'Loopctl.Vault.Rotation.reencrypt
 
        elixir -e ':crypto.strong_rand_bytes(32) |> Base.encode64() |> IO.puts()'
 
-3. **Set all three secrets in one command**, bumping the tag and retiring the outgoing key
-   under the tag it wrote:
+3. **Phase 1 — publish the new key decrypt-only**, under the tag it will write:
+
+       fly secrets set CLOAK_RETIRED_KEYS="AES.GCM.V2:NEW_BASE64_KEY"
+
+   The app restarts. Nothing writes the new key yet; every machine can now read it.
+
+4. **Phase 2 — promote it**, retiring the outgoing key under the tag it wrote:
 
        fly secrets set \
          CLOAK_KEY="NEW_BASE64_KEY" \
          CLOAK_KEY_TAG="AES.GCM.V2" \
          CLOAK_RETIRED_KEYS="AES.GCM.V1:OLD_BASE64_KEY"
 
-   The app restarts. New writes now use the new key; old rows still decrypt through the
-   retired entry. **The system is fully functional in this state** — step 4 can wait for a
-   quiet window. If boot fails, the message names the offending entry by position and says
-   what is wrong with it; nothing was written, so restoring the previous secrets is a
-   complete rollback.
+   New writes now use the new key; old rows still decrypt through the retired entry. **The
+   system is fully functional in this state** — step 5 can wait for a quiet window. Leaving
+   the new key in the retired list here aborts boot (a retired entry may not reuse the
+   active tag): the guard is telling you the promotion is half-done. If boot fails, the
+   message names the offending entry by position and says what is wrong with it; nothing
+   was written, so restoring the previous secrets is a complete rollback. Once the app has
+   RUN on the new key that is no longer true — rows written since carry the new tag, so a
+   revert must list the NEW key in `CLOAK_RETIRED_KEYS` under its new tag, or lose them.
 
-4. **Re-encrypt the stored rows.** Dry-run first to see the size of the job:
+5. **Re-encrypt the stored rows.** Dry-run first to see the size of the job:
 
        mix loopctl.reencrypt_secrets --dry-run
        mix loopctl.reencrypt_secrets
@@ -76,19 +91,24 @@ Mix, so use the running node: `bin/loopctl rpc 'Loopctl.Vault.Rotation.reencrypt
    a quiet window, and `--table` if you want to spread it out.
 
    Read the counts. `reencrypted` + `skipped_active` + `skipped_null` +
-   `skipped_concurrent` + `failed` equals `examined` — every row is accounted for. A
-   non-zero `failed` exits non-zero and names the rows; the overwhelmingly likely cause is
-   a retired key missing from `CLOAK_RETIRED_KEYS`. Fix the secret and re-run; the rows
-   already converted are skipped.
+   `skipped_concurrent` + `skipped_gone` + `failed` equals `examined` — every row is
+   accounted for. A non-zero `failed` exits non-zero and names the rows; the overwhelmingly
+   likely cause is a retired key missing from `CLOAK_RETIRED_KEYS`. Fix the secret and
+   re-run; the rows already converted are skipped.
 
-5. **Drain the `:ingestion` queue.** Ingestion jobs carry their document encrypted inside
-   `oban_jobs.args` (`Loopctl.Ingestion.ContentEnvelope`), which the pass does not touch —
-   it walks schema columns. Those jobs live up to the 3600s uniqueness window, longer under
-   snooze. Leave the retired key in place until the queue is empty, or in-flight jobs fail
-   to decrypt and are discarded (`Loopctl.Workers.ContentIngestionWorker` logs a distinct
-   warning on each, which is worth alerting on: the same signal also means tampering).
+6. **Drain the `:ingestion` AND `:cleanup` queues.** Both carry Cloak-encrypted values
+   inside `oban_jobs.args`, which the pass does not touch — it walks schema columns — and
+   which the census cannot see either, so step 7 will look clean while these are pending.
+   Ingestion jobs (`Loopctl.Ingestion.ContentEnvelope`) live up to the 3600s uniqueness
+   window, longer under snooze; a `:cleanup` restore job
+   (`Loopctl.Workers.OrphanedSecretCleanupWorker`) carries a tenant's OLD Ed25519 audit
+   private key and retries up to 10 times with exponential backoff, so it can sit for
+   hours. Leave the retired key in place until BOTH queues are empty, or those jobs fail to
+   decrypt: ingestion is discarded (`Loopctl.Workers.ContentIngestionWorker` logs a distinct
+   warning on each, which is worth alerting on: the same signal also means tampering) and
+   the audit key is never restored — the exact breakage that worker exists to prevent.
 
-6. **Confirm, then drop the retired key.** Re-run the census; no column should still report
+7. **Confirm, then drop the retired key.** Re-run the census; no column should still report
    the retired tag:
 
        mix loopctl.reencrypt_secrets status
@@ -110,9 +130,11 @@ app and selecting fields whose type is backed by `Loopctl.Vault` — so a newly 
 Two things are deliberately outside it:
 
 - **Encrypted values inside `oban_jobs.args`** — transient, and rewriting a row an executing
-  worker holds would race it. Step 5 is how they are retired.
+  worker holds would race it. Step 6 is how they are retired, and `status` cannot see them.
 - **An encrypted value inside an array or map column** — none exists; `targets/0` raises
-  rather than skipping one silently, so adding one forces a decision here.
+  rather than skipping one silently, so adding one forces a decision here. It raises the
+  same way on a Cloak field declaring a `:label`, which the application encrypts with that
+  labelled cipher rather than the active one.
 
 ## Recovering a mis-sequenced rotation
 
@@ -121,7 +143,9 @@ If rows became unreadable because the old key was dropped too early, put it back
     fly secrets set CLOAK_RETIRED_KEYS="AES.GCM.V1:OLD_BASE64_KEY"
 
 AES-GCM ciphertext is intact until it is overwritten, so as long as the old key material
-still exists, restoring it restores the rows. Then resume at step 4. If the old key is
-genuinely gone, the affected rows are unrecoverable — which is why step 6 comes after a
-clean census, and why a malformed `CLOAK_RETIRED_KEYS` aborts boot instead of dropping an
-entry.
+still exists, restoring it restores the rows. Then resume at step 5. The same move covers a
+rollback in the other direction — reverting to the old `CLOAK_KEY`/`CLOAK_KEY_TAG` after
+the app has run on the new one requires listing the NEW key here, under its new tag. If a
+key is genuinely gone, the rows it wrote are unrecoverable — which is why step 7 comes
+after a clean census and two drained queues, and why a `CLOAK_RETIRED_KEYS` that is
+malformed, or set but naming no entries at all, aborts boot instead of dropping an entry.

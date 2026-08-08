@@ -122,6 +122,22 @@ defmodule Loopctl.Vault.RotationTest do
       assert Rotation.tag_of("") == :error
       assert Rotation.tag_of(nil) == :error
     end
+
+    # Cloak.Tags.Decoder validates nothing — it reads byte 2 as a length and returns the
+    # bytes that follow. Left unchecked it hands back a SLICE OF THE COLUMN as a "tag",
+    # which then becomes a census bucket and gets printed in a failure line. Each of these
+    # decodes to something; none of them may be reported as a tag.
+    test "bytes Decoder would happily decode are still :error, not a tag made of the value" do
+      for bytes <- [<<1, 2, 3, 4, 5>>, <<1, 0>>, <<1, 4, 0, 0, 0, 0>>, "sk-live-abcdefgh"] do
+        assert Rotation.tag_of(bytes) == :error, "leaked a tag out of #{inspect(bytes)}"
+      end
+    end
+
+    test "an oversized decoded tag is rejected rather than echoed" do
+      long = <<1, 40>> <> String.duplicate("A", 40)
+
+      assert Rotation.tag_of(long) == :error
+    end
   end
 
   describe "reencrypt/1" do
@@ -157,7 +173,7 @@ defmodule Loopctl.Vault.RotationTest do
 
       assert counts.examined ==
                counts.reencrypted + counts.skipped_active + counts.skipped_null +
-                 counts.skipped_concurrent + counts.failed
+                 counts.skipped_concurrent + counts.skipped_gone + counts.failed
 
       assert Rotation.tag_of(webhook_raw(retired_row.id)) == {:ok, Rotation.active_tag()}
       assert Rotation.tag_of(webhook_raw(already_active.id)) == {:ok, Rotation.active_tag()}
@@ -312,9 +328,14 @@ defmodule Loopctl.Vault.RotationTest do
     test "labels bytes with no readable header as :untagged, and empty columns as :null" do
       webhook = fixture(:webhook)
       :ok = put_raw(@table, @column, webhook.id, "")
+      # Bytes Decoder decodes into a garbage "tag". They belong in :untagged — the bucket
+      # the runbook tells the operator to look for — never in a bucket named after a slice
+      # of the stored column.
+      corrupt = fixture(:webhook)
+      :ok = put_raw(@table, @column, corrupt.id, <<1, 2, 3, 4, 5>>)
       _settings = fixture(:tenant_llm_settings, %{api_key: nil, chat_api_key: nil})
 
-      assert Rotation.census(table: @table).tables[@table][@column][:untagged] == 1
+      assert Rotation.census(table: @table).tables[@table][@column][:untagged] == 2
 
       settings_tally = Rotation.census(table: @settings_table).tables[@settings_table]
       assert settings_tally["api_key"][:null] == 1

@@ -118,9 +118,25 @@ defmodule Loopctl.Config do
   """
   @spec cloak_retired_ciphers!(String.t() | nil, String.t()) :: keyword()
   def cloak_retired_ciphers!(nil, _active_tag), do: []
+  def cloak_retired_ciphers!("", _active_tag), do: []
 
   def cloak_retired_ciphers!(retired, active_tag) when is_binary(retired) do
-    entries = retired |> String.split(",") |> Enum.map(&String.trim/1) |> Enum.reject(&(&1 == ""))
+    # Indexed BEFORE blanks are dropped, so the position every error message names is the
+    # operator's own comma-separated field number. Counting survivors instead reported
+    # "entry 1" for the third field of ",,TAG:KEY", which is not a position anyone can act on.
+    entries =
+      retired
+      |> String.split(",")
+      |> Enum.map(&String.trim/1)
+      |> Enum.with_index(1)
+      |> Enum.reject(fn {entry, _position} -> entry == "" end)
+
+    if entries == [] do
+      raise ArgumentError,
+            "CLOAK_RETIRED_KEYS is set but names no entries — every comma-separated field is " <>
+              "blank. A deploy that built the value from an empty list must UNSET the variable; " <>
+              "accepting it as 'no retired keys' is how a dropped key becomes undecryptable rows."
+    end
 
     if length(entries) > @cloak_max_retired_keys do
       raise ArgumentError,
@@ -130,7 +146,6 @@ defmodule Loopctl.Config do
     end
 
     entries
-    |> Enum.with_index(1)
     |> Enum.map(&parse_retired_entry!(&1, active_tag))
     |> reject_duplicate_tags!()
   end

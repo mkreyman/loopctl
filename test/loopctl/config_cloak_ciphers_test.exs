@@ -54,8 +54,27 @@ defmodule Loopctl.ConfigCloakCiphersTest do
     end
 
     test "an unset or empty CLOAK_RETIRED_KEYS adds nothing" do
-      for value <- [nil, "", "  ", ",,"] do
+      for value <- [nil, ""] do
         assert [{:default, _cipher}] = Config.cloak_ciphers!(@active, nil, value)
+      end
+    end
+
+    # A deploy script that builds the value from an empty list produces "," or " " — not
+    # the same statement as "unset". Accepting it yields zero retired ciphers on a boot the
+    # operator believes carries them, which is the silent drop this guard exists to stop.
+    test "a value the operator SET that names no entries raises rather than meaning none" do
+      for value <- ["  ", ",", ",,", " , "] do
+        assert_raise ArgumentError, ~r/is set but names no entries/, fn ->
+          Config.cloak_ciphers!(@active, nil, value)
+        end
+      end
+    end
+
+    # The position has to be the operator's field number in the raw string, or the message
+    # points at an entry they cannot find. Blanks are still tolerated; they still count.
+    test "the position names the raw comma-separated field, blanks included" do
+      assert_raise ArgumentError, ~r/entry 3 is not TAG:BASE64_KEY/, fn ->
+        Config.cloak_ciphers!(@active, "AES.GCM.V2", ",,#{@retired}")
       end
     end
 
