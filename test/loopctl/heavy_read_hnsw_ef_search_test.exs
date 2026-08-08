@@ -26,10 +26,14 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
   """
   use Loopctl.DataCase, async: false
 
+  alias Loopctl.Embeddings
   alias Loopctl.HeavyRead
+  alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
 
   import Ecto.Query
+
+  setup :verify_on_exit!
 
   describe "per-query hnsw.ef_search (US-38.4, TC-38.4.1 query side)" do
     test "opts/1 attaches :hnsw_ef_search for ANN endpoints ONLY on a non-default value" do
@@ -309,6 +313,107 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
     end
   end
 
+  describe "iterative-scan DISCLOSURE on the vector-read response meta" do
+    # The fail-closed probe is correct and unchanged. What was missing is that the caller
+    # was never TOLD: an ANN read that lost iterative scan applies `tenant_id` as a
+    # post-index residual filter, so it can under-return, and a short result set with a
+    # bare 200 reads as "the corpus has nothing". Same silent-absence failure
+    # `system_corpus_recall` / `reembed_excluded_reason` exist to prevent, so it is
+    # disclosed the same way. NOT observed in production — a code path, not an incident.
+    test "iterative_scan_meta/1 reports off / applied / unavailable from the read's OWN opts" do
+      # Derived from the real `opts/1` output, never a hand-built keyword list: the
+      # disclosure must describe the read that ran, and a lookalike could drift from it.
+      prime_iterative_scan(0)
+
+      assert HeavyRead.iterative_scan_meta(HeavyRead.opts(:semantic_search)) ==
+               %{ann_iterative_scan: "off"}
+
+      prime_iterative_scan(1)
+      prime_iterative_scan_supported(true)
+
+      assert HeavyRead.iterative_scan_meta(HeavyRead.opts(:semantic_search)) ==
+               %{ann_iterative_scan: "applied"}
+
+      prime_iterative_scan_supported(false)
+      degraded = HeavyRead.iterative_scan_meta(HeavyRead.opts(:semantic_search))
+
+      assert degraded.ann_iterative_scan == "unavailable"
+      assert degraded.ann_iterative_scan_reason =~ "capability probe"
+      assert degraded.ann_iterative_scan_reason =~ "may be missing from these results"
+      assert degraded.ann_iterative_scan_reason =~ "self-heals"
+
+      # A NON-ANN endpoint's opts never carry the state, and a read that cannot touch the
+      # HNSW index must not emit a degradation warning about it.
+      assert HeavyRead.iterative_scan_meta(HeavyRead.opts(:enumeration)) == %{}
+    end
+
+    test "a CONCLUSIVELY unsupported backend is not reported as a self-healing blip" do
+      # `false` from an inconclusive probe clears on the next window; `false` from a probe
+      # that ASKED and got pgvector < 0.8 (or no extension) stands until the extension is
+      # upgraded — the line `maybe_warn_unsupported/2` already draws in the log. Telling the
+      # caller to wait for a self-heal that will never come is a wrong operational answer.
+      prime_iterative_scan(1)
+      prime_iterative_scan_supported(false, :conclusive)
+
+      unsupported = HeavyRead.iterative_scan_meta(HeavyRead.opts(:semantic_search))
+
+      assert unsupported.ann_iterative_scan == "unavailable"
+      assert unsupported.ann_iterative_scan_reason =~ "does NOT support it"
+      assert unsupported.ann_iterative_scan_reason =~ "until the extension is upgraded"
+      refute unsupported.ann_iterative_scan_reason =~ "self-heals"
+    end
+
+    test "a REUSED stale `false` is not reported as a backend incapability" do
+      # The other side of the split, and the one a second `last_conclusive_verdict/0` read got
+      # wrong: an inconclusive probe (HeavyReadRepo saturation) that falls back on a recent
+      # conclusive `false` produces the same boolean as a fresh conclusive `false`. Classifying
+      # on the record rather than on the probe's provenance sent the operator to upgrade an
+      # extension — possibly one already upgraded — over a capacity incident that WILL clear.
+      prime_iterative_scan(1)
+      prime_last_conclusive(false)
+      prime_iterative_scan_supported(false, :reused)
+
+      reused = HeavyRead.iterative_scan_meta(HeavyRead.opts(:semantic_search))
+
+      assert reused.ann_iterative_scan == "unavailable"
+      assert reused.ann_iterative_scan_reason =~ "capability probe"
+      assert reused.ann_iterative_scan_reason =~ "self-heals"
+      refute reused.ann_iterative_scan_reason =~ "does NOT support it"
+    end
+
+    test "the LEGACY semantic response meta carries the disclosure, both states" do
+      tenant = fixture(:tenant)
+      refute Embeddings.side_table_reads_enabled?(), "precondition: legacy read path"
+
+      prime_iterative_scan(1)
+      prime_iterative_scan_supported(false)
+
+      assert {:ok, %{meta: degraded}} = Knowledge.search_semantic(tenant.id, test_vec(1536))
+      assert degraded.ann_iterative_scan == "unavailable"
+      assert degraded.ann_iterative_scan_reason =~ "may be missing from these results"
+
+      prime_iterative_scan_supported(true)
+
+      assert {:ok, %{meta: healthy}} = Knowledge.search_semantic(tenant.id, test_vec(1536))
+      assert healthy.ann_iterative_scan == "applied"
+
+      refute Map.has_key?(healthy, :ann_iterative_scan_reason),
+             "a healthy read states the state and adds no degradation prose"
+    end
+
+    test "the SIDE-TABLE semantic response meta carries the disclosure too" do
+      tenant = fixture(:tenant)
+      stub(Loopctl.MockEmbeddingReadPath, :side_table_reads_enabled?, fn -> true end)
+      assert Embeddings.side_table_reads_enabled?(), "precondition: side-table read path"
+
+      prime_iterative_scan(1)
+      prime_iterative_scan_supported(false)
+
+      assert {:ok, %{meta: meta}} = Knowledge.search_semantic(tenant.id, test_vec(1536))
+      assert meta.ann_iterative_scan == "unavailable"
+    end
+  end
+
   @probe_cache_key {Loopctl.HeavyRead, :iterative_scan_supported}
   @last_conclusive_key {Loopctl.HeavyRead, :iterative_scan_last_conclusive}
 
@@ -324,17 +429,29 @@ defmodule Loopctl.HeavyReadHnswEfSearchTest do
     end)
   end
 
-  defp prime_iterative_scan_supported(verdict) do
+  # `provenance` is HOW the cached verdict was reached (`:conclusive` | `:reused` | `:guess`),
+  # which is what the disclosure classifies on. Defaults to the non-committal `:reused` so a
+  # test that only cares about the boolean cannot accidentally assert backend incapability.
+  defp prime_iterative_scan_supported(verdict, provenance \\ :reused) do
     :persistent_term.put(
       @probe_cache_key,
-      {verdict, System.monotonic_time(:millisecond) + 60_000}
+      {verdict, System.monotonic_time(:millisecond) + 60_000, provenance}
     )
 
     on_exit(fn -> :persistent_term.erase(@probe_cache_key) end)
   end
 
+  defp prime_last_conclusive(verdict) do
+    :persistent_term.put(@last_conclusive_key, {verdict, System.monotonic_time(:millisecond)})
+    on_exit(fn -> :persistent_term.erase(@last_conclusive_key) end)
+  end
+
   defp prime_expired_iterative_scan_supported(verdict) do
-    :persistent_term.put(@probe_cache_key, {verdict, System.monotonic_time(:millisecond) - 1})
+    :persistent_term.put(
+      @probe_cache_key,
+      {verdict, System.monotonic_time(:millisecond) - 1, :conclusive}
+    )
+
     on_exit(fn -> :persistent_term.erase(@probe_cache_key) end)
   end
 

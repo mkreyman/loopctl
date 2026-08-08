@@ -52,6 +52,7 @@ defmodule Loopctl.WorkBreakdown.Story do
              :implementer_dispatch_id,
              :verifier_dispatch_id,
              :verifier_needed,
+             :lifecycle_entered_at,
              :inserted_at,
              :updated_at
            ]}
@@ -82,6 +83,19 @@ defmodule Loopctl.WorkBreakdown.Story do
     field :implementer_dispatch_id, Ecto.UUID
     field :verifier_dispatch_id, Ecto.UUID
     field :verifier_needed, :boolean, default: false
+
+    # The backfill anti-launder marker: set the moment a path that clears the
+    # dispatch markers on a WORKED story runs (unclaim, force-unclaim, reject
+    # auto-reset), and never cleared. `Progress.guard_backfillable/2` refuses to
+    # certify a story that carries it.
+    #
+    # It is DELIBERATELY absent from both changesets' `cast` lists below. It lived
+    # in `metadata` first, and `metadata` is cast + whole-map-replaced by
+    # `PATCH /api/v1/stories/:id`, so one ordinary request erased the marker and
+    # restored the claim -> force-unclaim -> backfill-to-verified launder. Only
+    # `Progress` writes it, via `Ecto.Changeset.change/2` on the struct. Never add
+    # it to a `cast` list.
+    field :lifecycle_entered_at, :utc_datetime_usec
 
     # Issue #621: the capability minted by the lifecycle transition that returned
     # this struct — the credential the caller needs for its NEXT custody op

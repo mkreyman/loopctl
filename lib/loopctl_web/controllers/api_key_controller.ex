@@ -17,15 +17,30 @@ defmodule LoopctlWeb.ApiKeyController do
 
   plug LoopctlWeb.Plugs.RequireRole, role: :user
 
+  # LINEAGE CEILING, minting half. `create` and `rotate` are the two actions that hand
+  # back a raw key, and a plain API key belongs to no dispatch lineage — which is
+  # exactly the shape DispatchController admits as "may start a new root". Without this
+  # a dispatch-minted `:user` key stepped outside its own subtree in one hop by minting
+  # (or rotating itself) a plain key. See the plug's moduledoc for why the credential is
+  # refused rather than made to inherit the minter's lineage.
+  plug LoopctlWeb.Plugs.RequireUnlineagedCaller when action in [:create, :rotate]
+
   tags(["Auth"])
 
   operation(:create,
     summary: "Create API key",
-    description: "Creates a new API key. Returns the raw key once. Requires user role.",
+    description:
+      "Creates a new API key. Returns the raw key once. Requires user role. A caller " <>
+        "whose own key was minted by a dispatch (and therefore carries a lineage) is " <>
+        "refused with 403 `api_key_mint_forbidden`: a long-lived API key belongs to no " <>
+        "lineage, so minting one would place the caller outside its own dispatch subtree. " <>
+        "Mint a dispatch beneath your own instead (POST /api/v1/dispatches).",
     request_body: {"API key params", "application/json", Schemas.ApiKeyCreateRequest},
     responses: %{
       201 => {"API key created", "application/json", Schemas.ApiKeyResponse},
-      403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
+      403 =>
+        {"Forbidden — superadmin role requested, or the caller carries a dispatch lineage " <>
+           "(`api_key_mint_forbidden`)", "application/json", Schemas.ErrorResponse},
       422 => {"Validation error", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
@@ -64,7 +79,10 @@ defmodule LoopctlWeb.ApiKeyController do
   operation(:rotate,
     summary: "Rotate API key",
     description:
-      "Creates a new key with the same name/role and sets a grace period on the old key.",
+      "Creates a new key with the same name/role and sets a grace period on the old key. " <>
+        "Like `create`, this mints a raw key that belongs to no dispatch lineage, so a " <>
+        "caller whose own key carries a lineage is refused with 403 " <>
+        "`api_key_mint_forbidden`.",
     parameters: [
       id: [in: :path, type: :string, description: "API key UUID to rotate"]
     ],
@@ -83,6 +101,9 @@ defmodule LoopctlWeb.ApiKeyController do
       201 =>
         {"Rotated key", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      403 =>
+        {"Forbidden — the caller carries a dispatch lineage (`api_key_mint_forbidden`)",
+         "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       422 => {"Cannot rotate", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}

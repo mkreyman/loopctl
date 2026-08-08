@@ -8,8 +8,9 @@ defmodule Loopctl.TenantKeys do
 
   ## ETS table
 
-  Created at application start (see `Loopctl.Application`). Table name
-  is `:tenant_key_cache`. Entries are `{tenant_id, private_key, expires_at}`.
+  Created at application start (see `Loopctl.Application`). Table name is
+  `:tenant_key_cache`. Entries are `{tenant_id, result, expires_at, epoch}` — the
+  `{:ok, key}` / `{:error, reason}` returned, failures included on a short TTL.
   """
 
   require Logger
@@ -20,6 +21,14 @@ defmodule Loopctl.TenantKeys do
 
   @cache_table :tenant_key_cache
   @ttl_seconds 300
+
+  # Failures are cached because the caller that hurts most repeats: `verifier_seed/2` asks on
+  # EVERY request-review, so an uncached miss costs an AdminRepo query (a deliberately
+  # 3-connection pool) plus a secret-store trip, per call — `:not_found` most of all, since a
+  # tenant with no audit key yet answers it for as long as it has none, a PERMANENT storm.
+  # The TTL is short so a resolved outage, or a key just written, is not extended into
+  # spurious `verifier_needed`; a path that WRITES a key calls `invalidate/1`, not the TTL.
+  @negative_ttl_seconds 15
 
   @doc """
   Ensure the ETS cache table exists. Called from `Application.start/2`.
@@ -44,31 +53,37 @@ defmodule Loopctl.TenantKeys do
   @spec get_private_key(Ecto.UUID.t()) :: {:ok, binary()} | {:error, term()}
   def get_private_key(tenant_id) when is_binary(tenant_id) do
     now = System.system_time(:second)
+    epoch = epoch(tenant_id)
 
     case :ets.lookup(@cache_table, tenant_id) do
-      [{^tenant_id, key, expires_at}] when expires_at > now ->
-        {:ok, key}
-
-      _ ->
-        fetch_and_cache(tenant_id, now)
+      [{^tenant_id, result, expires_at, ^epoch}] when expires_at > now -> result
+      _ -> fetch_and_cache(tenant_id, now, epoch)
     end
   end
 
   @doc """
-  Invalidate the cached key for a tenant (e.g., after key rotation).
+  Invalidate the cached key for a tenant (after key rotation or provisioning).
   """
   @spec invalidate(Ecto.UUID.t()) :: :ok
   def invalidate(tenant_id) do
+    key = {:epoch, tenant_id}
+    :ets.update_counter(@cache_table, key, {2, 1}, {key, 0})
     :ets.delete(@cache_table, tenant_id)
     :ok
   end
 
-  defp fetch_and_cache(tenant_id, now) do
+  # Invalidation must cover a fetch already IN FLIGHT: deleting the row is not enough, because
+  # a slow fetch that began before a rotation and fails after it lands on the empty table and
+  # poisons the freshly rotated key for the negative TTL. An entry carries the epoch it was
+  # fetched under and a read takes only its own, so one bump orphans them all.
+  defp epoch(tenant_id), do: :ets.lookup_element(@cache_table, {:epoch, tenant_id}, 2, 0)
+
+  defp fetch_and_cache(tenant_id, now, epoch) do
     import Ecto.Query
 
     case AdminRepo.one(from(t in Tenant, where: t.id == ^tenant_id, select: t.slug)) do
       nil ->
-        {:error, :tenant_not_found}
+        cache_negative(tenant_id, {:error, :tenant_not_found}, now, epoch)
 
       slug ->
         secret_name = Secrets.audit_key_secret_name(slug)
@@ -78,7 +93,7 @@ defmodule Loopctl.TenantKeys do
             # Fly secrets store keys as base64 (set via FlyAdapter.set/2).
             # Decode to raw bytes for :crypto.sign/5.
             key = decode_key(encoded)
-            :ets.insert(@cache_table, {tenant_id, key, now + @ttl_seconds})
+            :ets.insert(@cache_table, {tenant_id, {:ok, key}, now + @ttl_seconds, epoch})
             {:ok, key}
 
           {:error, reason} ->
@@ -86,9 +101,23 @@ defmodule Loopctl.TenantKeys do
               "Failed to fetch audit key for tenant #{tenant_id}: #{inspect(reason)}"
             )
 
-            {:error, reason}
+            cache_negative(tenant_id, {:error, reason}, now, epoch)
         end
     end
+  end
+
+  # A failure must never overwrite a LIVE positive entry — a slow error can land after a
+  # concurrent success. `select_replace` tests "non-positive or already expired" and writes in
+  # ONE atomic op (lookup-then-insert leaves a window); it matches nothing when the row is
+  # absent, so `insert_new` covers that without clobbering a racing writer.
+  defp cache_negative(tenant_id, result, now, epoch) do
+    entry = {tenant_id, result, now + @negative_ttl_seconds, epoch}
+    stale = {:orelse, {:"/=", {:element, 1, :"$1"}, :ok}, {:"=<", :"$2", now}}
+    ms = [{{tenant_id, :"$1", :"$2", :_}, [stale], [{:const, entry}]}]
+
+    if :ets.select_replace(@cache_table, ms) == 0, do: :ets.insert_new(@cache_table, entry)
+
+    result
   end
 
   # Keys may be stored as base64 (FlyAdapter encodes) or raw bytes (test mocks).

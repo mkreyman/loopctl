@@ -198,6 +198,28 @@ defmodule LoopctlWeb.KnowledgeSearchController do
                        "exceed what relevance pagination reaches, so on `pool_capped: true` " <>
                        "switch to list mode (`cursor`) for full enumeration."
                  },
+                 ann_iterative_scan: %OpenApiSpex.Schema{
+                   type: :string,
+                   enum: ["off", "applied", "unavailable"],
+                   description:
+                     "Relevance modes (semantic / combined): whether the vector read ran " <>
+                       "with pgvector's `hnsw.iterative_scan`. `off` = not enabled on this " <>
+                       "instance (the default). `applied` = enabled and in force. " <>
+                       "`unavailable` = enabled, but the read fell back to a single index " <>
+                       "batch — the tenant filter is applied AFTER that batch, so results " <>
+                       "may be INCOMPLETE. Treat `unavailable` like `pool_capped: true`: a " <>
+                       "short result set is not evidence the corpus is empty. Read " <>
+                       "`ann_iterative_scan_reason` for WHICH cause: an inconclusive " <>
+                       "capability probe self-heals on the next conclusive one, while a " <>
+                       "pgvector that does not support the setting stands until the " <>
+                       "extension is upgraded."
+                 },
+                 ann_iterative_scan_reason: %OpenApiSpex.Schema{
+                   type: :string,
+                   description:
+                     "Present ONLY alongside `ann_iterative_scan: \"unavailable\"`: a " <>
+                       "non-sensitive explanation of the degraded vector read."
+                 },
                  next_cursor: %OpenApiSpex.Schema{
                    type: :string,
                    nullable: true,
