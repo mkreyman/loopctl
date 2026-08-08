@@ -15,9 +15,29 @@ the forbidden operation is structurally unreachable.
 | Type | Minted at | Consumed by | Gates |
 |------|-----------|-------------|-------|
 | `start_cap` | claim_story | start_story | Starting implementation |
-| `report_cap` | start_story | report_story | Reporting work as done |
-| `review_complete_cap` | request_review | review_complete | Recording review |
-| `verify_cap` | request_review | verify_story | Verifying work |
+
+`start_cap` is the only capability minted today. `claim_story` returns it in the
+response body; present it as `capability` on `start_story`.
+
+### Why the others were retired
+
+`report_cap`, `verify_cap` and `review_complete_cap` are no longer minted. A
+capability is bound to one dispatch lineage and verified with an EXACT match, so
+it can only gate a transition whose legitimate actor is known when the token is
+minted. The other three gates are precisely the ones whose actor must DIFFER from
+the implementer, and is not yet known:
+
+- `report_cap` was minted to the implementer's lineage but `report_story` must be
+  called by a different principal — so the only holder was the one principal
+  forbidden to use it.
+- `verify_cap` was minted to the lineage `select_verifier/3` picked, which is
+  routinely not the caller: the pool includes `agent`-role dispatches while the
+  endpoint is orchestrator-only, a legacy key has no lineage to match, and a
+  single-root tenant yields no eligible verifier at all.
+- `review_complete_cap` was never minted or consumed by any code path.
+
+Those transitions are gated by structural lineage separation instead — see
+[Chain of Custody](/wiki/chain-of-custody).
 
 ## Token structure
 
@@ -41,9 +61,15 @@ Include the `cap_id` in your request body. The server verifies:
 
 ## Why caps matter
 
-Without caps, an implementer could forge a verify request. With caps,
-the verify_cap is never minted to the implementer's lineage — they
-literally cannot construct a valid verify request.
+A capability makes a forbidden step unreachable rather than merely refused: the
+token is signed, single-use, story-bound, lineage-bound and expiring, so a caller
+outside the lineage it was issued to cannot construct a valid request at all.
+
+That is why `start_cap` survives and the others did not. It is issued to the
+principal that will spend it — the agent that just claimed the story. Where the
+actor must instead DIFFER from the minter, no token can express the rule, and the
+separation is enforced structurally by comparing the caller's server-resolved
+dispatch lineage against the implementer's.
 
 See [Chain of Custody](/wiki/chain-of-custody) for the full trust model.
 See [Dispatch Lineage](/wiki/dispatch-lineage) for how lineages work.

@@ -5,7 +5,7 @@ defmodule Loopctl.Progress.CustodyInvariantsTest do
   * INVARIANT 1 — `reported_done` ⇒ `assigned_agent_id NOT NULL` (or backfilled).
     Enforced structurally by the DB CHECK `stories_reported_done_requires_agent`
     and backstopped by the fail-closed `validate_not_self_verify/2` guard
-    (surfaced via `ensure_verify_allowed/2`).
+    (surfaced via `ensure_verify_allowed/3`).
 
   * INVARIANT 2 — a review record is bound to the report generation it reviewed
     via `reviewed_report_at`. A review of a superseded report no longer qualifies
@@ -155,7 +155,7 @@ defmodule Loopctl.Progress.CustodyInvariantsTest do
   end
 
   describe "INVARIANT 1: self-verify guard fails closed (backstop)" do
-    test "ensure_verify_allowed/2 rejects a custody-orphaned story with :missing_assigned_agent" do
+    test "ensure_verify_allowed/3 rejects a custody-orphaned story with :missing_assigned_agent" do
       orphan = %Story{
         tenant_id: Ecto.UUID.generate(),
         agent_status: :reported_done,
@@ -167,10 +167,10 @@ defmodule Loopctl.Progress.CustodyInvariantsTest do
 
       # A non-nil verifier would otherwise "!= nil implementer" and pass VACUOUSLY.
       assert {:error, :missing_assigned_agent} =
-               Progress.ensure_verify_allowed(orphan, Ecto.UUID.generate())
+               Progress.ensure_verify_allowed(orphan, Ecto.UUID.generate(), [])
     end
 
-    test "ensure_verify_allowed/2 still separates verifier from a real assigned agent" do
+    test "ensure_verify_allowed/3 still separates verifier from a real assigned agent" do
       implementer = Ecto.UUID.generate()
 
       story = %Story{
@@ -182,8 +182,10 @@ defmodule Loopctl.Progress.CustodyInvariantsTest do
         verifier_dispatch_id: nil
       }
 
-      assert :ok = Progress.ensure_verify_allowed(story, Ecto.UUID.generate())
-      assert {:error, :self_verify_blocked} = Progress.ensure_verify_allowed(story, implementer)
+      assert :ok = Progress.ensure_verify_allowed(story, Ecto.UUID.generate(), [])
+
+      assert {:error, :self_verify_blocked} =
+               Progress.ensure_verify_allowed(story, implementer, [])
     end
 
     test "verify_story/4 fails closed on a persisted custody-orphaned story" do

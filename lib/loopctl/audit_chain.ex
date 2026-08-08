@@ -94,6 +94,39 @@ defmodule Loopctl.AuditChain do
   end
 
   @doc """
+  Passes an `append/2` result through unchanged, logging loudly when it failed.
+
+  For an append INSIDE an `Ecto.Multi`, a failure aborts the transaction and the
+  state change never happens — nothing to report. For an append that runs AFTER its
+  state change has already committed, discarding the result is different in kind:
+  the transition happened and the hash-chained log silently does not record it, so
+  the chain quietly stops being a complete account of custody decisions and nothing
+  anywhere says so. Nothing at that point can roll the write back, so the honest
+  response is to make the gap loud.
+
+  Use at every post-commit append site: `AuditChain.append(t, attrs) |>
+  AuditChain.log_append_failure("action", t, entity_id)`.
+  """
+  @spec log_append_failure(
+          {:ok, Entry.t()} | {:error, term()},
+          String.t(),
+          Ecto.UUID.t(),
+          Ecto.UUID.t() | nil
+        ) :: {:ok, Entry.t()} | {:error, term()}
+  def log_append_failure({:error, reason} = result, action, tenant_id, entity_id) do
+    Logger.error(
+      "audit_chain_append_failed: action=#{action} tenant=#{tenant_id} " <>
+        "entity=#{inspect(entity_id)} error=#{inspect(reason)}. The state change already " <>
+        "committed, so the hash-chained log is missing this entry — reconcile before " <>
+        "relying on the chain for this entity."
+    )
+
+    result
+  end
+
+  def log_append_failure(result, _action, _tenant_id, _entity_id), do: result
+
+  @doc """
   Lists audit chain entries for a tenant with pagination.
 
   ## Options
