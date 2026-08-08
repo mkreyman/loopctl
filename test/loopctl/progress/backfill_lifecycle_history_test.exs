@@ -8,9 +8,14 @@ defmodule Loopctl.Progress.BackfillLifecycleHistoryTest do
   The dispatch markers alone cannot carry that claim, because one of them is erasable:
   `force_unclaim_story/3` clears `assigned_agent_id`, and a story claimed with a key no
   dispatch minted never gets an `implementer_dispatch_id` either. Two sources remember
-  what the story row no longer does: a DURABLE `metadata["lifecycle_entered_at"]` stamp
-  written where the erasure happens, and — only inside the audit retention window — the
+  what the story row no longer does: the DURABLE `stories.lifecycle_entered_at` column,
+  stamped where the erasure happens, and — only inside the audit retention window — the
   `audit_log` lifecycle entries.
+
+  The marker is a COLUMN and not a `metadata` key because `metadata` is cast by
+  `Story.update_changeset/2` and replaced wholesale by `PATCH /api/v1/stories/:id`: one
+  ordinary request erased it and handed the launder path back. See
+  `LoopctlWeb.StoryLifecycleMarkerTest` for the request-level proof.
   """
   use Loopctl.DataCase, async: true
 
@@ -70,7 +75,7 @@ defmodule Loopctl.Progress.BackfillLifecycleHistoryTest do
       {:ok, _} = Progress.claim_story(story.tenant_id, story.id, agent_id: agent.id)
       {:ok, unclaimed} = Progress.force_unclaim_story(story.tenant_id, story.id)
 
-      assert unclaimed.metadata["lifecycle_entered_at"]
+      assert %DateTime{} = unclaimed.lifecycle_entered_at
     end
 
     test "agent self-unclaim stamps it too" do
@@ -80,7 +85,7 @@ defmodule Loopctl.Progress.BackfillLifecycleHistoryTest do
       {:ok, _} = Progress.claim_story(story.tenant_id, story.id, agent_id: agent.id)
       {:ok, unclaimed} = Progress.unclaim_story(story.tenant_id, story.id, agent_id: agent.id)
 
-      assert unclaimed.metadata["lifecycle_entered_at"]
+      assert %DateTime{} = unclaimed.lifecycle_entered_at
       assert {:error, :story_entered_lifecycle} = backfill(unclaimed)
     end
 
@@ -91,10 +96,96 @@ defmodule Loopctl.Progress.BackfillLifecycleHistoryTest do
       # that story — the marker set, not one audit row — and it must still be refused.
       story =
         fixture(:story, %{agent_status: :pending})
-        |> Ecto.Changeset.change(metadata: %{"lifecycle_entered_at" => "2020-01-01T00:00:00Z"})
+        |> Ecto.Changeset.change(lifecycle_entered_at: ~U[2020-01-01 00:00:00.000000Z])
         |> Loopctl.AdminRepo.update!()
 
       assert {:error, :story_entered_lifecycle} = backfill(story)
+    end
+
+    test "the legacy metadata stamp is still honoured" do
+      # Stories stamped while the marker lived in `metadata` (and whose metadata was
+      # replaced before the migration's backfill ran) must keep being refused. This
+      # clause can only make the guard refuse MORE, never less.
+      story =
+        fixture(:story, %{agent_status: :pending})
+        |> Ecto.Changeset.change(metadata: %{"lifecycle_entered_at" => "2020-01-01T00:00:00Z"})
+        |> Loopctl.AdminRepo.update!()
+
+      assert is_nil(story.lifecycle_entered_at)
+      assert {:error, :story_entered_lifecycle} = backfill(story)
+    end
+
+    test "the BULK reject auto-reset stamps it too" do
+      # The fourth site that clears assigned_agent_id on a worked story. Without the
+      # stamp the guard here rests on `verified_status: :rejected` alone.
+      story = fixture(:story, %{agent_status: :reported_done})
+      orch = fixture(:agent, %{tenant_id: story.tenant_id, agent_type: :orchestrator})
+
+      {:ok, [%{status: "success"}]} =
+        Loopctl.BulkOperations.bulk_reject(
+          story.tenant_id,
+          [%{"story_id" => story.id, "reason" => "not done"}],
+          orch.id
+        )
+
+      reset = reload(story)
+      assert is_nil(reset.assigned_agent_id)
+      assert %DateTime{} = reset.lifecycle_entered_at
+    end
+
+    test "neither reject auto-reset stamps a story with no marker to ERASE" do
+      # Both auto-resets stamp through Progress.lifecycle_stamp_change/1. Rejecting an
+      # imported story erases no dispatch marker, so it earns none: the marker is permanent
+      # and uncleanable, and stamping it would refuse that story the backfill it is entitled
+      # to the moment a rejection is reversed. Asserted here rather than through
+      # bulk_reject/3, which cannot reach such a story at all — the custody-orphan guard
+      # refuses a reported_done story with no agent and no lineage before the reset runs.
+      assert Progress.lifecycle_stamp_change(imported_reported_done_story()) == %{}
+
+      # And the worked shape the reject paths actually see still earns the stamp.
+      worked = fixture(:story, %{agent_status: :reported_done})
+      refute is_nil(worked.assigned_agent_id)
+      assert %{lifecycle_entered_at: %DateTime{}} = Progress.lifecycle_stamp_change(worked)
+    end
+
+    test "re-running force-unclaim retro-stamps a worked story already at pending" do
+      # The remedy for a story reset before the column existed: its only remaining
+      # evidence is an audit entry that expires with its partition, and the idempotent
+      # early return made the remedy a no-op. Now it makes that evidence permanent.
+      story = fixture(:story, %{agent_status: :pending})
+      lifecycle_entry(story, "status_changed")
+
+      {:ok, unclaimed} = Progress.force_unclaim_story(story.tenant_id, story.id)
+
+      assert %DateTime{} = unclaimed.lifecycle_entered_at
+    end
+
+    test "re-running force-unclaim does NOT stamp never-dispatched work" do
+      # Force-unclaiming a pending story writes its own audit entry; reading that back
+      # would let the remedy permanently refuse the backfill it exists to permit.
+      story = fixture(:story, %{agent_status: :pending})
+
+      {:ok, _} = Progress.force_unclaim_story(story.tenant_id, story.id)
+      {:ok, twice} = Progress.force_unclaim_story(story.tenant_id, story.id)
+
+      # Still refused while the audit entry lives, but NOT stamped — so the refusal
+      # expires with the partition instead of becoming permanent.
+      assert is_nil(twice.lifecycle_entered_at)
+    end
+
+    test "the marker records the FIRST entry, not the latest erasure" do
+      agent = fixture(:agent, %{agent_type: :implementer})
+      original = ~U[2020-01-01 00:00:00.000000Z]
+
+      story =
+        fixture(:story, %{tenant_id: agent.tenant_id, agent_status: :contracted})
+        |> Ecto.Changeset.change(lifecycle_entered_at: original)
+        |> Loopctl.AdminRepo.update!()
+
+      {:ok, _} = Progress.claim_story(story.tenant_id, story.id, agent_id: agent.id)
+      {:ok, unclaimed} = Progress.force_unclaim_story(story.tenant_id, story.id)
+
+      assert unclaimed.lifecycle_entered_at == original
     end
 
     test "still allows never-dispatched imported work at reported_done" do

@@ -6502,13 +6502,22 @@ const TOOLS = [
     description:
       "Mint an ephemeral api_key for a sub-agent dispatch. " +
       "The raw_key is returned ONCE — pass it to the sub-agent via its launch arguments, " +
-      "never store it in env vars. The key expires after expires_in_seconds.",
+      "never store it in env vars. The key expires after expires_in_seconds. " +
+      "Pass parent_dispatch_id: a dispatch may only be minted INSIDE the caller's own " +
+      "lineage. Omitting it starts a new independent lineage tree, which only the " +
+      "tenant's user-role operator key may do — every other caller gets 403 " +
+      "root_dispatch_forbidden, and the 403 body returns the caller's own dispatch id " +
+      "as remediation.your_dispatch_id.",
     inputSchema: {
       type: "object",
       properties: {
         parent_dispatch_id: {
           type: "string",
-          description: "UUID of the parent dispatch (omit for root dispatch).",
+          description:
+            "UUID of the parent dispatch — your own dispatch id, or one of its " +
+            "descendants. Required in practice: omitting it requests a ROOT dispatch, " +
+            "which is 403 root_dispatch_forbidden for any caller a dispatch minted. " +
+            "A parent outside your lineage is 403 parent_outside_caller_lineage.",
         },
         role: {
           type: "string",

@@ -7346,6 +7346,7 @@ defmodule Loopctl.Knowledge do
   end
 
   defp search_semantic_legacy(tenant_id, query_embedding, limit, offset, status, opts) do
+    heavy_opts = semantic_heavy_read_opts()
     results_query = semantic_results_query(tenant_id, query_embedding, opts)
 
     # COUNT — kept as a SEPARATE full-corpus filtered `count(*)` so `total_count` PRESERVES
@@ -7357,12 +7358,12 @@ defmodule Loopctl.Knowledge do
     # bounded tenant scan — inherently O(tenant rows) for a true `count(*)`).
     count_query = semantic_count_query(tenant_id, query_embedding, status, opts)
 
-    case HeavyRead.all(tenant_id, results_query, semantic_heavy_read_opts()) do
+    case HeavyRead.all(tenant_id, results_query, heavy_opts) do
       {:error, :heavy_read_overloaded} = err ->
         err
 
       results ->
-        case HeavyRead.one(tenant_id, count_query, semantic_heavy_read_opts()) do
+        case HeavyRead.one(tenant_id, count_query, heavy_opts) do
           {:error, :heavy_read_overloaded} = err ->
             err
 
@@ -7387,6 +7388,7 @@ defmodule Loopctl.Knowledge do
                    pool_capped: semantic_pool_capped?(total_count, length(results), limit, offset)
                  }
                  |> Map.merge(legacy_system_corpus_meta())
+                 |> Map.merge(HeavyRead.iterative_scan_meta(heavy_opts))
              }}
         end
     end
@@ -7479,6 +7481,13 @@ defmodule Loopctl.Knowledge do
                    pool_capped: semantic_pool_capped?(total_count, length(results), limit, offset)
                  }
                  |> Map.merge(semantic_disclosure_meta(tenant_id, dimension))
+                 # Derived from `pool_opts` — the opts the inner ANN ACTUALLY ran with —
+                 # not from a fresh probe, so the disclosure can never disagree with the
+                 # rows it accompanies. NOT memoized alongside the tenant-scoped
+                 # disclosures above: this is a per-NODE backend capability with its own
+                 # (much shorter) probe TTL, and caching it per tenant would keep
+                 # reporting a state the node has already left.
+                 |> Map.merge(HeavyRead.iterative_scan_meta(pool_opts))
              }}
         end
     end
@@ -7798,7 +7807,13 @@ defmodule Loopctl.Knowledge do
   # documented post-ANN relevance tradeoff (deep enumeration is the keyset list path's job,
   # US-27.9a, not relevance search). The floor (≥ the `max_relevance_page_size` limit) keeps
   # every in-cap page fully served under the default config.
-  defp semantic_result_pool(needed) when is_integer(needed) and needed > 0 do
+  #
+  # Public-but-`@doc false` for the same reason `semantic_side_table_pool_query/4` is: the
+  # `left: []` diagnostic (`Loopctl.VectorRecallDiagnostics`) must EXPLAIN the pool the read
+  # ACTUALLY used, and a test-side reimplementation of this formula would drift silently and
+  # then describe a query that never ran.
+  @doc false
+  def semantic_result_pool(needed) when is_integer(needed) and needed > 0 do
     floor =
       Application.get_env(
         :loopctl,
@@ -8213,41 +8228,49 @@ defmodule Loopctl.Knowledge do
     {:ok,
      %{
        results: paginated.results,
-       meta: %{
-         # `total_count` = size of the full fused/deduplicated candidate set
-         # pre-pagination. When the (opt-in) graph lane is enabled it also counts the
-         # one-hop neighbors it contributed; with the lane OFF (the default) this is
-         # exactly the keyword ∪ semantic union, byte-for-byte as before.
-         total_count: length(sorted),
-         limit: paginated.limit,
-         offset: paginated.offset,
-         search_mode: "combined",
-         # Names what `total_count` counts so a client can size/interpret the pool.
-         # Default `merged_candidates`: the deduplicated UNION of a keyword and a
-         # semantic sub-search (each capped at 100, so up to ~200 with no overlap),
-         # NOT a corpus total or full match count. When the opt-in graph lane
-         # actually contributes one-hop neighbors, the count folds them in, so the
-         # scope becomes `merged_candidates_with_graph` — the documented
-         # `merged_candidates` invariant (keyword ∪ semantic only) still holds for
-         # its literal value (#470 review). Use list mode or knowledge_stats to size
-         # the corpus.
-         total_count_scope:
-           if(graph_results == [],
-             do: "merged_candidates",
-             else: "merged_candidates_with_graph"
-           ),
-         # Carry the semantic sub-search's relevance-pool truncation forward (US-27.7a)
-         # — combined is the DEFAULT mode, so silently dropping the flag would hide
-         # truncation on the most-used path. `maybe_put` keeps the key absent unless the
-         # semantic half was actually pool-capped.
-         pool_capped: Map.get(semantic_result.meta, :pool_capped, false),
-         # Observability for #297: how many rows the semantic half contributed. A
-         # `0` here with `fallback: false` is the "embed worked but recall is broken"
-         # signal (distinct from an embed-failure keyword_only fallback), so operators
-         # and clients can tell the two silent-degradation causes apart. The graph
-         # lane NEVER inflates this — it stays the semantic lane's own row count.
-         semantic_result_count: length(semantic_result.results)
-       }
+       meta:
+         %{
+           # `total_count` = size of the full fused/deduplicated candidate set
+           # pre-pagination. When the (opt-in) graph lane is enabled it also counts the
+           # one-hop neighbors it contributed; with the lane OFF (the default) this is
+           # exactly the keyword ∪ semantic union, byte-for-byte as before.
+           total_count: length(sorted),
+           limit: paginated.limit,
+           offset: paginated.offset,
+           search_mode: "combined",
+           # Names what `total_count` counts so a client can size/interpret the pool.
+           # Default `merged_candidates`: the deduplicated UNION of a keyword and a
+           # semantic sub-search (each capped at 100, so up to ~200 with no overlap),
+           # NOT a corpus total or full match count. When the opt-in graph lane
+           # actually contributes one-hop neighbors, the count folds them in, so the
+           # scope becomes `merged_candidates_with_graph` — the documented
+           # `merged_candidates` invariant (keyword ∪ semantic only) still holds for
+           # its literal value (#470 review). Use list mode or knowledge_stats to size
+           # the corpus.
+           total_count_scope:
+             if(graph_results == [],
+               do: "merged_candidates",
+               else: "merged_candidates_with_graph"
+             ),
+           # Carry the semantic sub-search's relevance-pool truncation forward (US-27.7a)
+           # — combined is the DEFAULT mode, so silently dropping the flag would hide
+           # truncation on the most-used path. `maybe_put` keeps the key absent unless the
+           # semantic half was actually pool-capped.
+           pool_capped: Map.get(semantic_result.meta, :pool_capped, false),
+           # Observability for #297: how many rows the semantic half contributed. A
+           # `0` here with `fallback: false` is the "embed worked but recall is broken"
+           # signal (distinct from an embed-failure keyword_only fallback), so operators
+           # and clients can tell the two silent-degradation causes apart. The graph
+           # lane NEVER inflates this — it stays the semantic lane's own row count.
+           semantic_result_count: length(semantic_result.results)
+         }
+         # Carried forward for the SAME reason as `pool_capped` above: combined is the
+         # DEFAULT mode, so a degraded vector read that is disclosed only on `mode=semantic`
+         # is undisclosed on the path almost every caller uses. Absent unless the semantic
+         # half emitted it (a keyword-only degrade has no vector read to describe).
+         |> Map.merge(
+           Map.take(semantic_result.meta, [:ann_iterative_scan, :ann_iterative_scan_reason])
+         )
      }}
   end
 
