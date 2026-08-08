@@ -231,8 +231,10 @@ Operator-facing changes for deployments outside the hosted instance.
   **Action required** if you rely on an allowlisted host for webhook delivery or content
   ingestion: name the purpose — `10.0.0.5@webhook`, `ollama.internal@inference+ingest`. Local
   model endpoints (the common case) need no change. A port written in an entry now binds it to
-  that port; an entry with no port still matches any port, so existing bare-host entries keep
-  working. An entry naming an unknown purpose grants nothing and is reported by `egress_posture`
+  that port; an entry with no port still matches any port — every port on that host, and for
+  `webhook`/`ingest` the destination port is tenant-chosen, so state the port on any entry that
+  exists for a single service. Existing bare-host entries keep working. An IPv6 literal must be
+  bracketed when it carries a port (`[fdaa::1]:8080`) and bare when it does not (`fdaa::1`). An entry naming an unknown purpose grants nothing and is reported by `egress_posture`
   at `:user`+ (and logged) as a defect rather than dropped silently.
 - **BREAKING (API): `idempotency_key` is no longer returned in any article payload.** It is
   still accepted on create and still a filter on `GET /api/v1/articles?idempotency_key=…`

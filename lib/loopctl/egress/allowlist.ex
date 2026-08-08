@@ -75,6 +75,20 @@ defmodule Loopctl.Egress.Allowlist do
   believed-in-force-but-isn't failure `defects/0` exists to prevent. An operator
   who wants a port bound states it; the parser then honours the statement.
 
+  That default has an ACCEPTED RESIDUAL an operator must know about: a portless
+  entry grants EVERY port on that host, and for the tenant-writable purposes
+  (`webhook`, `ingest`, and a tenant-configured `chat_base_url` under
+  `inference`) the destination PORT is chosen by the TENANT, not by the operator.
+  So `10.0.0.5@webhook` also makes `10.0.0.5:6379` / `:5432` / `:2375` legal POST
+  targets for tenant-authored payloads. STATE THE PORT on any entry that exists
+  for one service — `10.0.0.5:9000@webhook` — and reserve the portless form for
+  hosts that run nothing else.
+
+  An IPv6 literal is BRACKETED when it carries a port (`[fdaa::1]:8080`) and may
+  be written bare when it does not (`fdaa::1`). Anything else with several colons
+  is a typo and is rejected rather than accepted as a host name that can never
+  match.
+
   CIDR entries carry no port syntax and are port-independent. There is no
   ambiguity to resolve there (nothing was ever written and dropped), and
   `fdaa::/16:8080` would be an unreadable grammar.
@@ -102,6 +116,7 @@ defmodule Loopctl.Egress.Allowlist do
 
   @purposes [:inference, :webhook, :ingest]
   @default_purposes [:inference]
+  @memo_key {__MODULE__, :parsed_entries}
 
   @typedoc "A purpose a carve-out can grant. Mirrors `Loopctl.Egress.Policy.purpose/0`."
   @type purpose :: :inference | :webhook | :ingest
@@ -122,9 +137,29 @@ defmodule Loopctl.Egress.Allowlist do
 
   @doc """
   The configured allowlist entries, parsed. Read-only: there is no writer.
+
+  MEMOIZED against the raw configured value. `Loopctl.Egress.Policy` re-derives
+  the operator grant on EVERY cached read (so a removed carve-out stops granting
+  immediately), which would otherwise put O(entries) string splitting on the
+  egress hot path. The memo is keyed on the raw list itself, so a configuration
+  change re-parses once and can never be served stale.
   """
   @spec entries() :: [entry()]
-  def entries, do: Enum.flat_map(raw_entries(), &parse/1)
+  def entries, do: memoized(raw_entries())
+
+  # Process-local, not `:persistent_term`: the test source is process-local, so a
+  # per-value global put would trigger a global GC pass per async test.
+  defp memoized(raw) do
+    case Process.get(@memo_key) do
+      {^raw, parsed} ->
+        parsed
+
+      _ ->
+        parsed = Enum.flat_map(raw, &parse/1)
+        Process.put(@memo_key, {raw, parsed})
+        parsed
+    end
+  end
 
   @doc """
   The configured entries that could NOT be parsed as a host or a CIDR, or that
@@ -307,8 +342,12 @@ defmodule Loopctl.Egress.Allowlist do
     end
   end
 
+  # The address half is TRIMMED here, exactly as `parse_purposes/1` trims each
+  # purpose: `"ollama.internal @inference"` is a natural thing to type in the `@`
+  # grammar, and an untrimmed `"ollama.internal "` matches nothing while still
+  # parsing — a dead carve-out `defects/0` would never report.
   defp parse_addr(entry, addr, purposes) do
-    case String.split(addr, "/", parts: 2) do
+    case addr |> String.trim() |> String.split("/", parts: 2) do
       [net, bits] -> parse_cidr(entry, net, bits, purposes)
       [host] -> parse_host(entry, host, purposes)
     end
@@ -330,15 +369,47 @@ defmodule Loopctl.Egress.Allowlist do
   defp address_width({_, _, _, _, _, _, _, _}), do: 128
 
   # `127.0.0.1:11434` — the stated port is part of the carve-out (see the
-  # moduledoc); an entry with no port matches any port. IPv6 literals are
-  # bracketed, so only split when there is exactly one colon.
+  # moduledoc); an entry with no port matches any port. A BRACKETED IPv6 literal
+  # is matched explicitly: a colon-count heuristic reads `[fdaa::1]:8080` as a
+  # portless host named `fdaa::1]:8080`, which matches nothing and — because the
+  # entry parsed — is invisible to `defects/0`.
   defp parse_host(entry, host, purposes) do
+    case host do
+      "[" <> rest -> parse_bracketed(entry, rest, purposes)
+      _ -> parse_bare_host(entry, host, purposes)
+    end
+  end
+
+  defp parse_bracketed(entry, rest, purposes) do
+    with [literal, tail] <- String.split(rest, "]", parts: 2),
+         {:ok, _ip} <- :inet.parse_address(String.to_charlist(literal)) do
+      case tail do
+        "" -> [{:host, literal, :any, purposes}]
+        ":" <> port -> parse_host_port(entry, literal, port, purposes)
+        _ -> reject(entry)
+      end
+    else
+      _ -> reject(entry)
+    end
+  end
+
+  defp parse_bare_host(entry, host, purposes) do
     case String.split(host, ":") do
+      [h] ->
+        [{:host, h, :any, purposes}]
+
       [h, port] ->
         parse_host_port(entry, h, port, purposes)
 
       _ ->
-        [{:host, host |> String.trim_leading("[") |> String.trim_trailing("]"), :any, purposes}]
+        # An UNBRACKETED IPv6 literal (`fdaa::1`) is a legal portless entry — it
+        # is what `:inet.ntoa/1` produces, so it matches a resolved address.
+        # Anything else carrying several colons is a typo, and a typo is loud.
+        if match?({:ok, _}, :inet.parse_address(String.to_charlist(host))) do
+          [{:host, host, :any, purposes}]
+        else
+          reject(entry)
+        end
     end
   end
 

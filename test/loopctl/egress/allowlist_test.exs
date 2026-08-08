@@ -190,5 +190,37 @@ defmodule Loopctl.Egress.AllowlistTest do
       assert Allowlist.host_allowed?("fdaa::1")
       assert Allowlist.allowed?("fdaa::1", [], :inference, 8080)
     end
+
+    # REGRESSION (review): the colon-count heuristic read `[fdaa::1]:8080` as a
+    # PORTLESS host literally named `fdaa::1]:8080`. It matched nothing and, since
+    # the entry "parsed", was invisible to `defects/0` too — a carve-out the
+    # operator believes is in force and silently is not, on the one address family
+    # (Fly 6PN) this list is the only route for.
+    test "a BRACKETED IPv6 literal with a port binds that port" do
+      AllowlistSource.put(["[fdaa::1]:8080@webhook", "fdaa::2"])
+
+      assert Allowlist.defects() == []
+      assert Allowlist.allowed?("fdaa::1", [], :webhook, 8080)
+      refute Allowlist.allowed?("fdaa::1", [], :webhook, 8081)
+      # The unbracketed form is still a legal portless entry.
+      assert Allowlist.ips_allowed?([{0xFDAA, 0, 0, 0, 0, 0, 0, 2}])
+    end
+
+    test "any other multi-colon entry is a defect, never an unmatchable host" do
+      AllowlistSource.put(["10.0.0.5:11434:", "[fdaa::1]:8080:x"])
+
+      assert Allowlist.defects() == ["10.0.0.5:11434:", "[fdaa::1]:8080:x"]
+      assert Allowlist.entries() == []
+    end
+
+    # REGRESSION (review): `parse_purposes/1` trimmed each purpose but the address
+    # half was never trimmed, so a space before the `@` left a host named
+    # `"ollama.internal "` that matched nothing and was not a defect either.
+    test "whitespace before the @ qualifier does not kill the carve-out" do
+      AllowlistSource.put(["ollama.internal @inference+webhook"])
+
+      assert Allowlist.defects() == []
+      assert Allowlist.allowed?("ollama.internal", [], :webhook, 11_434)
+    end
   end
 end

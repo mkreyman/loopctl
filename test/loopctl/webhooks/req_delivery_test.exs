@@ -217,6 +217,25 @@ defmodule Loopctl.Webhooks.ReqDeliveryTest do
       refute message =~ secret
     end
 
+    # The header VALUE is chosen by the destination too. The error string is
+    # persisted and read back through the deliveries API, so an unbounded copy
+    # would let a hostile receiver inflate that column at will.
+    test "a hostile content-type is TRUNCATED, not stored whole", %{scope: scope} do
+      padding = String.duplicate("a", 4_000)
+
+      Req.Test.stub(Loopctl.Webhooks.ReqDelivery, fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header("content-type", "application/#{padding}")
+        |> Plug.Conn.send_resp(500, "")
+      end)
+
+      assert {:error, message} =
+               ReqDelivery.deliver("https://93.184.216.34/hooks", "{}", [], scope)
+
+      assert message =~ "500"
+      assert String.length(message) < 200
+    end
+
     test "a body-less failure still reports the status", %{scope: scope} do
       Req.Test.stub(Loopctl.Webhooks.ReqDelivery, fn conn ->
         Plug.Conn.send_resp(conn, 500, "")

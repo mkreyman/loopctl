@@ -130,10 +130,25 @@ defmodule Loopctl.Webhooks.ReqDelivery do
   # Status code and `content-type` are the two facts a tenant debugging their own
   # receiver actually needs ("it 500s", "it answered HTML, not JSON"), and neither
   # carries response content. Everything else stays inside loopctl.
+  #
+  # The header VALUE is still chosen by the destination, so it is TRUNCATED: the
+  # error string is persisted on the delivery event and read back through the
+  # deliveries API, and an unbounded copy would let a hostile receiver inflate
+  # that column at will — reopening, by the byte, the channel this function
+  # closes. No real media type comes near the bound.
+  @max_content_type_chars 96
+
   defp failure_metadata(%Req.Response{} = resp) do
     case Req.Response.get_header(resp, "content-type") do
       [content_type | _] when is_binary(content_type) ->
-        " (content-type: #{content_type |> String.split(";") |> hd() |> String.trim()})"
+        type =
+          content_type
+          |> String.split(";")
+          |> hd()
+          |> String.trim()
+          |> String.slice(0, @max_content_type_chars)
+
+        " (content-type: #{type})"
 
       _ ->
         ""

@@ -562,11 +562,34 @@ defmodule Loopctl.Egress do
       "can carve such a host out of the SSRF denylist; a tenant declaration cannot. A " <>
       "carve-out grants the PURPOSE (and, when stated, the PORT) it names, so an entry " <>
       "made for model inference does not cover webhook delivery — reaching this " <>
-      "destination needs an entry naming the 'webhook' purpose#{port_hint(uri)}."
+      "destination needs an entry naming the 'webhook' purpose#{port_hint(url, uri)}."
   end
 
-  defp port_hint(%URI{port: port}) when is_integer(port), do: " on port #{port}"
-  defp port_hint(_uri), do: ""
+  # ONLY when the destination actually STATES a port. `URI.parse/1` fills the
+  # scheme's default, so guarding on `is_integer(port)` named a port for every
+  # http/https url — pushing an operator toward a narrower carve-out than the
+  # deployment needs and implying a port was part of a request that carried none.
+  defp port_hint(url, %URI{port: port}) when is_integer(port) do
+    if stated_port?(url), do: " on port #{port}", else: ""
+  end
+
+  defp port_hint(_url, _uri), do: ""
+
+  # The authority AS WRITTEN, read off the raw url (`URI.authority/0` is opaque).
+  # Userinfo is dropped first (it may contain a colon) and a bracketed IPv6
+  # literal is closed first (it is all colons).
+  defp stated_port?(url) do
+    url
+    |> String.split("//", parts: 2)
+    |> List.last()
+    |> String.split(["/", "?", "#"], parts: 2)
+    |> hd()
+    |> String.split("@")
+    |> List.last()
+    |> String.split("]")
+    |> List.last()
+    |> String.contains?(":")
+  end
 
   defp webhook_remediation(scope, url, verdict) do
     host = URI.parse(url).host || url
@@ -965,7 +988,12 @@ defmodule Loopctl.Egress do
         tenant_id: scope.tenant_id,
         scope: Scope.key(scope),
         endpoint_host: host,
-        reason: reason
+        reason: reason,
+        # A refusal on an ALREADY-allowlisted host is the expected outcome of a
+        # purpose mismatch, so `denylisted` alone is not diagnosable. It rides in
+        # the metadata rather than in `reason`, which is the deduplication key of
+        # the aggregated row.
+        purpose: Map.get(details, :purpose)
       }
     )
 

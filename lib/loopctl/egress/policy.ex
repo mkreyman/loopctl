@@ -29,6 +29,16 @@ defmodule Loopctl.Egress.Policy do
   for the allowlist, the requested PORT) on every read — see
   `Loopctl.Egress.Allowlist` for the entry grammar that expresses them.
 
+  What a purpose mismatch COSTS differs by who wrote the url. On a
+  TENANT-SUPPLIED url (webhook, ingest, `chat_base_url`) it is a REFUSAL:
+  `denylist_gate/4` turns the reverted `:denylisted` verdict into
+  `:egress_blocked`. On a DEPLOYMENT-configured url (`OPENAI_BASE_URL` and
+  friends) on an unmarked scope it degrades to the pre-US-41.4 behaviour instead
+  — the request proceeds UNPINNED — because the url is operator configuration,
+  not attacker-influenced input, and turning an operator's own misqualified entry
+  into a hard outage buys nothing the operator cannot see. A `local_only` scope
+  refuses on BOTH.
+
   ## Verdicts
 
     * `:network_local` — loopback/private-range host carved out by the operator
@@ -107,6 +117,7 @@ defmodule Loopctl.Egress.Policy do
           required(:host) => String.t() | nil,
           required(:scope) => String.t(),
           required(:verdict) => verdict() | :unclassifiable | :marking_unavailable,
+          optional(:purpose) => purpose(),
           optional(:remediation) => String.t()
         }
 
@@ -200,7 +211,7 @@ defmodule Loopctl.Egress.Policy do
          host when is_binary(host) and host != "" <- uri.host,
          {:ok, %{ips: [ip | _], verdict: verdict}} <-
            cached_classification(scope, host, purpose, uri_port(uri)),
-         :ok <- denylist_gate(scope, host, verdict, tenant_supplied?),
+         :ok <- denylist_gate(scope, host, verdict, tenant_supplied?, purpose),
          # A denylisted host is otherwise left UNPINNED exactly as `UrlGuard.pin/2`
          # used to leave it (`{:error, :blocked_ip}`).
          true <- verdict != :denylisted do
@@ -273,16 +284,16 @@ defmodule Loopctl.Egress.Policy do
   # deployment allowlist. PERMANENT — a configuration state, not a blip — so the
   # existing `:egress_blocked` handling (cancel, never retry) is exactly right, and
   # the details map already carries the operator-allowlist remediation.
-  defp denylist_gate(scope, host, :denylisted, true) do
+  defp denylist_gate(scope, host, :denylisted, true, purpose) do
     Logger.warning(
       "Loopctl.Egress.Policy: refusing a TENANT-SUPPLIED endpoint for " <>
-        "#{Scope.key(scope)}: #{host} is denylisted (SSRF guard)"
+        "#{Scope.key(scope)}: #{host} is denylisted for purpose #{purpose} (SSRF guard)"
     )
 
-    {:error, :egress_blocked, details(scope, host, :denylisted)}
+    {:error, :egress_blocked, details(scope, host, :denylisted, purpose)}
   end
 
-  defp denylist_gate(_scope, _host, _verdict, _tenant_supplied?), do: :ok
+  defp denylist_gate(_scope, _host, _verdict, _tenant_supplied?, _purpose), do: :ok
 
   defp marking_unavailable(scope, url, reason) do
     Logger.warning(
@@ -341,7 +352,24 @@ defmodule Loopctl.Egress.Policy do
   @spec repin(Scope.t(), String.t(), purpose()) :: {:ok, map()} | {:error, term()}
   def repin(%Scope{} = scope, host, purpose \\ :inference) do
     PinCache.delete(scope.tenant_id, Scope.key(scope), host)
-    classify(scope, host, purpose)
+    classify(scope, host, purpose, endpoint_port(scope, host))
+  end
+
+  # The port the SCOPE actually reaches this host on. A re-pin is host-granular,
+  # and `:any` means "no port in hand" — it matches only a PORTLESS entry — so
+  # classifying without it would report `:denylisted` for a host that a
+  # port-bound operator carve-out grants and that inference calls reach without a
+  # problem. The caller reached this host through one of the scope's resolved
+  # endpoints, which is where the port comes from.
+  defp endpoint_port(scope, host) do
+    normalized = String.downcase(host)
+
+    scope
+    |> Egress.resolved_endpoints()
+    |> Enum.find_value(:any, fn {_kind, url} ->
+      uri = URI.parse(url)
+      if is_binary(uri.host) and String.downcase(uri.host) == normalized, do: uri_port(uri)
+    end)
   end
 
   @doc false
@@ -453,7 +481,7 @@ defmodule Loopctl.Egress.Policy do
       {:ok, %{verdict: verdict, pin_stale: true}}
       when verdict in [:network_local, :tenant_declared] ->
         {:error, :pin_stale,
-         details(scope, host, verdict)
+         details(scope, host, verdict, purpose)
          |> Map.put(
            :remediation,
            "The pinned address set for #{host} changed. Re-pin it (no role :user write " <>
@@ -465,10 +493,10 @@ defmodule Loopctl.Egress.Policy do
         {:ok, %{uri: uri, host: host, ip: ip}}
 
       {:ok, %{verdict: verdict}} ->
-        {:error, :egress_blocked, details(scope, host, verdict)}
+        {:error, :egress_blocked, details(scope, host, verdict, purpose)}
 
       {:error, _reason} ->
-        {:error, :egress_blocked, details(scope, host, :unclassifiable)}
+        {:error, :egress_blocked, details(scope, host, :unclassifiable, purpose)}
     end
   end
 
@@ -580,7 +608,7 @@ defmodule Loopctl.Egress.Policy do
       :network_local
     else
       entry
-      |> Map.put(:base_verdict, Map.get(entry, :ungranted_base, :denylisted))
+      |> Map.put(:base_verdict, ungranted_base_of(entry))
       |> verdict_for(purpose, port)
     end
   end
@@ -592,6 +620,16 @@ defmodule Loopctl.Egress.Policy do
   end
 
   defp verdict_for(_entry, _purpose, _port), do: :non_local
+
+  # Derived from the entry's CURRENT addresses, never from the value cached when
+  # the host was first classified. Revalidation re-puts a refreshed `:ips` and
+  # carries the ORIGINAL `:ungranted_base` forward, so a host allowlisted BY NAME
+  # whose DNS moves from a public to a private answer would otherwise keep
+  # `:public` and fall back to `:non_local` — which passes `denylist_gate/5` and
+  # gets pinned and connected to, the exact SSRF refusal this fallback exists to
+  # produce. The cached value survives only for an entry with no addresses.
+  defp ungranted_base_of(%{ips: [_ | _] = ips}), do: ungranted_base(ips)
+  defp ungranted_base_of(entry), do: Map.get(entry, :ungranted_base, :denylisted)
 
   # A cached entry with no `:host` cannot be re-checked against the allowlist, so
   # it does not get the carve-out — the fallback below is the address's own
@@ -668,27 +706,41 @@ defmodule Loopctl.Egress.Policy do
     {:error, :egress_blocked, details(scope, host, :unclassifiable)}
   end
 
-  defp details(scope, host, verdict) do
+  # `purpose` is carried in the map (and named in the remediation) because a
+  # refusal on an ALREADY-allowlisted host is now the expected outcome of a
+  # purpose/port mismatch: without it the record and the remediation cannot tell
+  # an operator which of the two edits their entry is missing.
+  defp details(scope, host, verdict, purpose \\ nil) do
     %{host: host, scope: Scope.key(scope), verdict: verdict}
-    |> Map.put(:remediation, remediation_for(verdict, host))
+    |> maybe_put_purpose(purpose)
+    |> Map.put(:remediation, remediation_for(verdict, host, purpose))
   end
 
-  defp remediation_for(:unclassifiable, host) do
+  defp maybe_put_purpose(details, nil), do: details
+  defp maybe_put_purpose(details, purpose), do: Map.put(details, :purpose, purpose)
+
+  defp remediation_for(:unclassifiable, host, _purpose) do
     "The endpoint #{inspect(host)} could not be classified as local, so the call was " <>
       "refused (fail-closed). Verify the endpoint host resolves, then re-check with the " <>
       "egress_posture tool."
   end
 
-  defp remediation_for(:denylisted, host) do
+  defp remediation_for(:denylisted, host, purpose) do
     "#{host} resolves into a private, loopback, CGNAT, link-local or ULA range. Only the " <>
       "OPERATOR deployment allowlist can carve such a host out of the SSRF denylist — a " <>
-      "tenant declaration cannot. Ask the operator to allowlist it, or use a public host."
+      "tenant declaration cannot. A carve-out grants ONLY the purposes (and, when stated, " <>
+      "the port) its entry names, and an UNQUALIFIED entry grants 'inference' alone — so " <>
+      "an allowlisted host can still be refused here. Ask the operator for an entry naming " <>
+      "#{purpose_label(purpose)} on this host and port, or use a public host."
   end
 
-  defp remediation_for(_verdict, host) do
+  defp remediation_for(_verdict, host, _purpose) do
     "#{host} is not local for this scope. Either declare it as a tenant-trusted endpoint " <>
       "for the required purpose (role :user, and note that a declaration is a " <>
       "tenant-declared (unverified attestation), not network-local), configure a local " <>
       "endpoint AT TENANT level (role :user), or clear the local_only marking (role :user)."
   end
+
+  defp purpose_label(nil), do: "the purpose this call needs"
+  defp purpose_label(purpose), do: "the '#{purpose}' purpose"
 end

@@ -366,6 +366,25 @@ defmodule Loopctl.Egress.WebhookEgressTest do
         # The remediation names the fix, so an operator is not left guessing which
         # of the two edits (purpose, port) their entry is missing.
         assert rest =~ "'webhook' purpose"
+        assert rest =~ "on port 9000"
+      end)
+    end
+
+    # REGRESSION (review): `URI.parse/1` fills the scheme's DEFAULT port, so the
+    # hint named "port 80" for a destination that stated none — pushing an
+    # operator toward a narrower carve-out than the deployment needs.
+    test "the remediation names a port ONLY when the destination states one",
+         %{tenant: tenant} do
+      with_allowlist(["127.0.0.1@inference"], fn ->
+        assert {:error, changeset} =
+                 Webhooks.create_webhook(tenant.id, %{
+                   "url" => "http://127.0.0.1/inbound",
+                   "events" => ["story.status_changed"]
+                 })
+
+        assert %{url: [message]} = errors_on(changeset)
+        assert message =~ "'webhook' purpose"
+        refute message =~ "on port"
       end)
     end
 
@@ -814,6 +833,28 @@ defmodule Loopctl.Egress.WebhookEgressTest do
 
       assert %{project_id: [_]} = errors_on(changeset)
       assert Webhooks.count_webhooks(tenant.id) == 0
+    end
+
+    # REGRESSION (review): the destination was PREWARMED before ownership was
+    # checked, so every rejected write still paid a resolver round-trip (up to 3s
+    # per family) and left a PinCache entry under a scope key no later read can
+    # use. Those entries count against the cache's single global cap, so a tenant
+    # could pressure every other tenant's classification cache with requests that
+    # never succeed.
+    test "a rejected foreign project_id resolves NOTHING and caches NOTHING",
+         %{tenant: tenant} do
+      other = fixture(:tenant)
+      foreign = fixture(:project, %{tenant_id: other.id})
+      foreign_scope = Scope.new(tenant.id, foreign.id)
+
+      assert {:error, _changeset} =
+               Webhooks.create_webhook(tenant.id, %{
+                 "url" => "https://prewarm.example.com/inbound",
+                 "events" => ["story.status_changed"],
+                 "project_id" => foreign.id
+               })
+
+      assert PinCache.fetch(tenant.id, Scope.key(foreign_scope), "prewarm.example.com") == :miss
     end
   end
 

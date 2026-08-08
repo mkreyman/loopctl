@@ -547,8 +547,17 @@ defmodule Loopctl.Webhooks do
   # family on a host that does not answer. Holding one of three BYPASSRLS
   # connections for that long — on a tenant-supplied hostname — puts the egress
   # guard's own marking lookups behind an attacker-influenced delay.
+  #
+  # The SCOPE is checked first. `validate_project_ownership/2` rejects a foreign
+  # (or nonexistent) `project_id` inside the transaction, and warming ahead of it
+  # would let every such rejected request spend a resolver round-trip — up to 3s
+  # per family — and leave a PinCache entry under a scope key no later read can
+  # ever use. Those entries count against the cache's single global cap, so an
+  # authenticated tenant could pressure every other tenant's classification cache
+  # with requests that never succeed.
   defp prewarm_destination(tenant_id, changeset) do
-    if changeset.valid? and egress_decision_changed?(changeset) do
+    if changeset.valid? and egress_decision_changed?(changeset) and
+         owned_scope?(tenant_id, changeset) do
       url = Ecto.Changeset.get_field(changeset, :url)
       project_id = Ecto.Changeset.get_field(changeset, :project_id)
 
@@ -556,6 +565,13 @@ defmodule Loopctl.Webhooks do
     end
 
     :ok
+  end
+
+  defp owned_scope?(tenant_id, changeset) do
+    case Ecto.Changeset.get_field(changeset, :project_id) do
+      nil -> true
+      project_id -> project_of_tenant?(tenant_id, project_id)
+    end
   end
 
   # The two DB-dependent validations, in the order their errors should surface:

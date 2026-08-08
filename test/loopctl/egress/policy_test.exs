@@ -571,6 +571,67 @@ defmodule Loopctl.Egress.PolicyTest do
 
       assert details.verdict == :denylisted
     end
+
+    # REGRESSION (review): revalidation re-puts a REFRESHED `:ips` but carries the
+    # ORIGINAL `:ungranted_base` forward. A host allowlisted BY NAME whose DNS
+    # moved from a public to a PRIVATE answer therefore kept `:public`, fell back
+    # to `:non_local` for a purpose the carve-out does not grant, passed the
+    # denylist gate — and was pinned and connected to on the private address.
+    test "a name-allowlisted host that MOVES to a private address is refused, not pinned",
+         %{tenant: t, scope: scope} do
+      with_allowlist(["vendor.example.com@inference"], fn ->
+        stub(Loopctl.MockDnsResolver, :resolve, fn
+          "vendor.example.com" -> {:ok, [{203, 0, 113, 10}]}
+          _ -> {:ok, [{93, 184, 216, 34}]}
+        end)
+
+        assert {:ok, _} = Policy.check(scope, "https://vendor.example.com/v1", :inference)
+
+        # The name still resolves — to the operator's private network now.
+        stub(Loopctl.MockDnsResolver, :resolve, fn
+          "vendor.example.com" -> {:ok, [{10, 0, 0, 5}]}
+          _ -> {:ok, [{93, 184, 216, 34}]}
+        end)
+
+        :ok = PinCache.mark_due(t.id, Scope.key(scope), "vendor.example.com")
+        assert PinCache.refresh_now(t.id) >= 1
+
+        # `webhook` is a purpose the carve-out does not name, so the host falls
+        # back to what its CURRENT addresses make it: denylisted.
+        assert {:error, :egress_blocked, details} =
+                 Policy.check(scope, "https://vendor.example.com/hook", :webhook,
+                   tenant_supplied: true
+                 )
+
+        assert details.verdict == :denylisted
+        assert details.purpose == :webhook
+        assert details.remediation =~ "'webhook' purpose"
+      end)
+    end
+
+    # REGRESSION (review): `repin/3` classified with the `:any` port, which by
+    # design matches only a PORTLESS entry — so a re-pin reported `denylisted` for
+    # a host that inference calls (which carry a port) reach without a problem,
+    # and sent the agent to a remediation only the operator could act on.
+    test "a re-pin reports the verdict for the port the SCOPE actually uses",
+         %{tenant: t, scope: scope} do
+      fixture(:tenant_llm_settings,
+        tenant_id: t.id,
+        chat_provider: "openai_compatible",
+        chat_base_url: "http://ollama.internal:11434/v1",
+        extraction_model: "llama3.1"
+      )
+
+      with_allowlist(["ollama.internal:11434"], fn ->
+        stub(Loopctl.MockDnsResolver, :resolve, fn
+          "ollama.internal" -> {:ok, [{10, 0, 0, 5}]}
+          _ -> {:ok, [{93, 184, 216, 34}]}
+        end)
+
+        assert {:ok, %{verdict: :network_local}} =
+                 Policy.repin(scope, "ollama.internal", :inference)
+      end)
+    end
   end
 
   # The allowlist is DEPLOYMENT configuration, so a test that exercises an
