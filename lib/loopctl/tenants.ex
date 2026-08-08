@@ -632,8 +632,32 @@ defmodule Loopctl.Tenants do
       end)
 
     case result do
-      {:ok, %{set_public_key: tenant}} -> {:ok, tenant}
-      {:error, _step, reason, _changes} -> {:error, reason}
+      {:ok, %{set_public_key: tenant}} ->
+        # Same cluster bust as `rotate_audit_key/2`, for the mirror-image reason.
+        # A tenant with NO audit key answers `:not_found`, and that failure is
+        # CACHED (`TenantKeys.@negative_ttl_seconds`) — deliberately, because
+        # `Dispatches.verifier_seed/2` asks on every request-review, so a keyless
+        # tenant is a permanent miss storm. Bootstrap ends that state, and until
+        # each peer's own entry lapses it keeps answering `:not_found` for a
+        # tenant that now HAS a key: `verifier_seed/2` fails closed, so a story
+        # gets flagged `verifier_needed` on a tenant that was just made able to
+        # verify. Bounded by the negative TTL rather than the 300s positive one,
+        # which is why this is a smaller window than the rotation bug — not a
+        # different one.
+        #
+        # The SIGNUP paths deliberately do NOT do this: they INSERT the tenant in
+        # the same transaction, so no peer can hold a cached entry for a
+        # tenant_id that did not exist. Bootstrap is the one key-write that runs
+        # against a tenant peers have already been asking about.
+        TenantKeys.invalidate_cluster(tenant.id)
+        # The cached api_key snapshots carry `audit_signing_public_key`; bootstrap
+        # sets it from nil, so they are stale in exactly the way a rotation makes
+        # them stale (US-33.3).
+        Auth.invalidate_tenant_key_cache(tenant.id)
+        {:ok, tenant}
+
+      {:error, _step, reason, _changes} ->
+        {:error, reason}
     end
   end
 
