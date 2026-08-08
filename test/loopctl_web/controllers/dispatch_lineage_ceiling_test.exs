@@ -79,7 +79,14 @@ defmodule LoopctlWeb.DispatchLineageCeilingTest do
         |> auth(legacy_key)
         |> post(~p"/api/v1/dispatches", %{"role" => "orchestrator", "agent_id" => agent.id})
 
-      assert json_response(conn, 403)["error"]["code"] == "root_dispatch_forbidden"
+      error = json_response(conn, 403)["error"]
+      assert error["code"] == "root_dispatch_forbidden"
+
+      # A remedy the refused caller can perform. "Mint under your own dispatch id" is
+      # meaningless with no lineage, and the id would be a bare null.
+      refute Map.has_key?(error["remediation"], "your_dispatch_id")
+      assert error["message"] =~ "parent_dispatch_id"
+      assert error["message"] =~ "operator key"
     end
   end
 
@@ -125,6 +132,27 @@ defmodule LoopctlWeb.DispatchLineageCeilingTest do
         })
 
       assert json_response(conn, 403)["error"]["code"] == "parent_outside_caller_lineage"
+    end
+
+    test "a LEGACY orchestrator key may still mint BENEATH an existing dispatch" do
+      # The ceiling stops a principal escaping ITS OWN tree; a key with no lineage has
+      # none to escape. Refusing it here left a legacy key unable to obtain a lineage by
+      # ANY request — and, with the verify gate refusing unlineaged callers on
+      # dispatch-minted work, unable to certify anything either.
+      ctx = operator_ctx()
+      %{"dispatch" => root} = mint_root(ctx)
+      {legacy_key, _} = fixture(:api_key, %{tenant_id: ctx.tenant.id, role: :orchestrator})
+
+      conn =
+        build_conn()
+        |> auth(legacy_key)
+        |> post(~p"/api/v1/dispatches", %{
+          "role" => "agent",
+          "agent_id" => fixture(:agent, %{tenant_id: ctx.tenant.id, agent_type: :implementer}).id,
+          "parent_dispatch_id" => root["id"]
+        })
+
+      assert json_response(conn, 201)["data"]["dispatch"]["parent_dispatch_id"] == root["id"]
     end
 
     test "an operator key may still parent anywhere in its own tenant" do

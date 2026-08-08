@@ -75,40 +75,46 @@ compare dispatch lineage and all three fail closed on a story with no custody pr
 caller's lineage is always resolved SERVER-SIDE from the authenticating key
 (`Dispatches.lineage_for_api_key/2`, `dispatches.ex:526-536`) — never read from the request body.
 
-- **verify** — `validate_not_self_verify/3` `progress.ex:2006-2064`. `nil` orchestrator identity is
-  untrusted (`progress.ex:2006`); a custody-orphaned story fails closed with
+- **verify** — `validate_not_self_verify/4`. `nil` orchestrator identity is untrusted; a custody-orphaned story fails closed with
   `:missing_assigned_agent` ("nil is never permissive"); then the CALLER's lineage vs the
-  implementer's (`lineage_status/2`, `progress.ex:2661-2687`) — the same tri-state gate report and
-  review-complete use but at `:root` separation, arriving as `:verifier_lineage` and resolved
-  server-side, which is the only clause that binds the principal actually calling. It is REQUIRED
-  on every path that reaches `verified`/`rejected` (`verify`, `verify-all`, `reject`, bulk
-  verify/reject via `ensure_verify_allowed/3`) — the argument has no default, so a path cannot omit
-  it and silently degrade to agent-id inequality, which is what verify-all, reject and bulk did. An
-  EMPTY caller lineage on a story that HAS an `implementer_dispatch_id` is blocked outright
-  (`legacy_caller_on_dispatched_story?/2`): a key no dispatch minted cannot be shown separate from
-  dispatch-minted work. THEN the RECORDED verifier
-  (`verify_recorded_separation/2`, `progress.ex:2068`) when BOTH `implementer_dispatch_id` and
-  `verifier_dispatch_id` are set, decided by `verify_lineage_separated/4` (`progress.ex:2094-2114`).
+  implementer's (`lineage_status/2`) — the SAME gate report and review-complete use, at the SAME
+  `lineage_same_chain?/2` distance (ancestor/descendant blocked, SIBLING allowed), arriving as
+  `:verifier_lineage` and resolved server-side, which is the only clause that binds the principal
+  actually calling. It is passed on every path that reaches `verified`/`rejected` (`verify`,
+  `verify-all`, `reject`, bulk verify/reject via `ensure_verify_allowed/4`); the private guard takes
+  it with no default, and the public opts boundary still defaults it to `[]` — which no longer
+  DEGRADES, because on dispatch-minted work `[]` is `:unlineaged`. An EMPTY caller lineage on a
+  story that HAS an `implementer_dispatch_id` is refused with `:caller_lineage_required` — a key no
+  dispatch minted cannot be shown separate from dispatch-minted work. Its own code, not
+  `self_verify_blocked`: the latter is an L6 byzantine signal that escalates to a tenant-wide halt,
+  and an unmigrated legacy key would have armed it on every call. REJECT is exempt from that one
+  refusal (`unlineaged_caller/3`) — sending work back is the remediation path, and refusing it
+  strands the story at reported_done. THEN the RECORDED verifier
+  (`verify_recorded_separation/2`) when BOTH `implementer_dispatch_id` and
+  `verifier_dispatch_id` are set, decided by `verify_lineage_separated/4`.
   An EMPTY lineage on either side (what an unloadable dispatch yields,
-  `get_dispatch_lineage/2` `progress.ex:2116-2121`) fails **CLOSED**, and the `assigned_agent_id`
+  `get_dispatch_lineage/2`) fails **CLOSED**, and the `assigned_agent_id`
   equality check runs IN ADDITION to the lineage comparison rather than being short-circuited by it.
   `verifier_dispatch_id` is written only by the assign-verifier flow (`assign_rotating_verifier/3`,
   `progress.ex:448-487`); that write is result-checked, and a failure flags `verifier_needed` plus a
   `verifier_not_assigned` audit event (`flag_verifier_needed/5`, `progress.ex:500`) instead of
   silently leaving the field nil. `request-review` is OPTIONAL, so most stories reach verify with no
   verifier dispatch — the CALLER-lineage step is what keeps that path lineage-gated.
-- **report** — `validate_not_self_report/3` `progress.ex:2576-2602`. `nil` caller blocked
-  (`progress.ex:2576`); a story with nil `assigned_agent_id` AND nil `implementer_dispatch_id` is
+- **report** — `validate_not_self_report/3`. `nil` caller blocked
+  ; a story with nil `assigned_agent_id` AND nil `implementer_dispatch_id` is
   **custody-unattributed** and fails closed with `:missing_assigned_agent` + a
-  `custody_orphaned_blocked` log (`custody_unattributed?/1`, `progress.ex:2615-2618`) — it used to
-  pass vacuously; then the reporter's lineage vs the implementer's (`lineage_status/2`,
-  `progress.ex:2661-2687`) — tri-state `:ok | :conflict | :unresolvable`, where an unresolvable
-  implementer dispatch fails CLOSED with `unresolvable_dispatch_lineage` (LCP-1 §7.5); then plain
-  `assigned_agent_id` equality.
-- **review-complete** — `validate_not_self_review/3` `progress.ex:2689-2719`. Custody-orphan backstop
-  first (`progress.ex:2584-2586`), then a **`nil` reviewer is deliberately PERMITTED**
-  (`progress.ex:2593-2594`) because nil means a human operator on a user-role key; then the
-  reviewer's lineage; then plain equality. That nil permit has THREE parts, all of which must change
+  `custody_orphaned_blocked` log (`custody_unattributed?/1`) — it used to
+  pass vacuously; then the reporter's lineage vs the implementer's (`lineage_status/2`) —
+  `:ok | :conflict | :unresolvable | :unlineaged`, where an unresolvable implementer dispatch fails
+  CLOSED with `unresolvable_dispatch_lineage` (LCP-1 §7.5) and is ranked BEFORE `:unlineaged` so an
+  empty caller lineage cannot mask a broken dispatch reference; then plain `assigned_agent_id`
+  equality.
+- **review-complete** — `validate_not_self_review/3`. Custody-orphan backstop first, then a **`nil`
+  reviewer WITH AN EMPTY LINEAGE is deliberately PERMITTED** because that pair means a human
+  operator on a user-role key — the empty-lineage half is load-bearing, since a DISPATCH-minted
+  user-role key also has no `agent_id` and permitting on nil alone let an ANCESTOR of the
+  implementer review its own subtree; then the reviewer's lineage; then plain equality. That nil
+  permit has THREE parts, all of which must change
   together: (a) the `exact_role: [:orchestrator, :user]` plug (`review_record_controller.ex:22-23`),
   which 403s an agent key before the controller runs — so the `:agent` branch of the controller cond
   is unreachable today; (b) `LoopctlWeb.ReviewRecordController.create/2`
@@ -163,9 +169,12 @@ audit-key condition either breaks pre-v2 tenants or silently widens the bypass.
 
 `lib/loopctl/dispatches.ex`: each dispatch carries a `lineage_path` (root → self).
 Two primitives serve the self-* checks and they demand DIFFERENT distance — see "The two lineage
-comparisons" below before touching either. `lineage_shares_prefix?/2` is the stricter one (verify +
-verifier selection): it compares lineage **ROOTS** (element 0) only, not arbitrary prefixes, and an
-empty list on either side is never a match. `select_verifier/3` picks a verifier whose lineage does
+comparisons" below before touching either. `lineage_shares_prefix?/2` is the stricter one, and it
+applies where separation is guaranteed BY CONSTRUCTION (verifier SELECTION, and the RECORDED
+verifier) rather than demanded of an arbitrary caller: it compares lineage **ROOTS** (element 0)
+only, not arbitrary prefixes, and an empty list on either side is never a match. Every CALLER
+comparison — report, review-complete and verify alike — uses `lineage_same_chain?/2`.
+`select_verifier/3` picks a verifier whose lineage does
 NOT share the implementer's root — rejected in SQL (`reject_same_root/2`) and again in Elixir — from
 a pool capped at `@verifier_pool_limit`.
 
@@ -178,8 +187,9 @@ served unauthenticated on the discovery endpoint — every candidate could preco
 selection. No public value is an acceptable fallback, so the no-secret case (pre-v2 tenant,
 unreachable secret store) returns `{:error, :verifier_seed_unavailable}` and the story is flagged
 `verifier_needed` instead: selecting nobody is strictly better than selecting predictably, because
-verify enforces lineage separation either way — it refuses an unlineaged caller on a
-dispatch-minted story rather than falling back to agent-id inequality. That failure also emits
+verify enforces lineage separation either way — it compares the CALLER's lineage on every path and
+refuses an unlineaged caller on a dispatch-minted story rather than falling back to agent-id
+inequality. That failure also emits
 `[:loopctl, :custody, :verifier_seed_unavailable]`; a secret-store outage fires it on every
 request-review deployment-wide, so alert on the counter rather than reading logs.
 
@@ -206,7 +216,11 @@ resolves the CALLER's lineage server-side and refuses two shapes:
   unrelated principal; a caller able to mint one can hand itself separation from its own work.
 - a parent **outside** the caller's lineage → `403 parent_outside_caller_lineage`
   (`lineage_within_caller?/3`). Closing only the parentless case would leave the same escape one
-  step out, since every dispatch id in the tenant is enumerable.
+  step out, since every dispatch id in the tenant is enumerable. A caller with NO lineage of its
+  own is exempt from this half: it has no subtree to step outside of, and refusing it here closed
+  the only mint a legacy `:orchestrator` key had left — leaving it unable to obtain a lineage by
+  ANY request, and therefore unable to verify anything, against the documented deprecation window.
+  Naming a parent gives it a lineage, which SUBJECTS it to the custody gates.
 
 **"Operator" is a POSITIVE test, not an absent lineage**: `lineage_for_api_key/2` returns `[]` for
 three different principals — the tenant's human-anchored operator key (`role: :user`, minted by the
@@ -216,16 +230,20 @@ Role.role_at_least?(role, :user)`. Inferring it from `[]` alone let every legacy
 key hand itself an independently-rooted dispatch for the whole deprecation window.
 
 Both refusals are logged (`lineage_ceiling_refused`) and emit
-`[:loopctl, :custody, :lineage_ceiling_refused]`, and each 403 body carries the caller's own
-`your_dispatch_id` — the remediation says "mint under your own dispatch", and nothing else on this
-API tells a caller which row is its own.
+`[:loopctl, :custody, :lineage_ceiling_refused]`. A 403 body carries the caller's own
+`your_dispatch_id` when it HAS one — the remediation says "mint under your own dispatch", and
+nothing else on this API tells a caller which row is its own. For a caller with no lineage the key
+is OMITTED (never a bare null) and the message names a remedy that caller can actually perform:
+pass any active dispatch as `parent_dispatch_id`, or have the operator key mint the root. **A
+refusal that names an action the refused caller cannot take is a dead end, not a remediation** —
+that is the recurring defect on this surface; check every new 403 message against it.
 
 This is the structural analogue of the role ceiling (`role_exceeds_caller?/2`) directly above it.
-It does mean a tenant is single-rooted unless the OPERATOR mints a second tree — and it must, since
-`select_verifier/3` needs a different-root candidate and the verify gate is root-separated. A
-single-root tenant gets `:no_independent_root` from selection (distinct from an empty pool) and
-`self_verify_blocked` at the gate. Do not "fix" either by relaxing the check; mint a second root
-from the operator key.
+It does mean a tenant is single-rooted unless the OPERATOR mints a second tree. That is a
+selection-quality concern, NOT a liveness one: `select_verifier/3` still wants a different-root
+candidate and reports `:no_independent_root` (distinct from an empty pool) when it has none, but
+the verify GATE is chain-separated, so a sibling verifier under the same root certifies fine. Do
+not "fix" selection by relaxing the ceiling; mint a second root from the operator key.
 
 ## Custody halt (L6) — escalation is thresholded, and the halt is SCOPED
 
@@ -261,25 +279,27 @@ clears it, so both its trigger and its blast radius are deliberately bounded.
 - Root-of-trust rotation and the superadmin break-glass stay reachable during a halt — they are
   the remediation paths. A standalone superadmin key has a nil `tenant_id`, so the halt check
   never applies to it.
-## The two lineage comparisons — report and verify demand DIFFERENT distance
+## The two lineage comparisons — CALLERS and SELECTION demand DIFFERENT distance
 
 There are two, and using the wrong one either breaks the product or weakens the gate:
 
 - `Dispatches.lineage_same_chain?/2` — ancestry: identical, or one an ancestor of the other.
-  A SIBLING passes. Used by **report** and **review-complete** (`lineage_status/3` defaults to
-  `:chain`).
+  A SIBLING passes. Used by every CALLER comparison — **report**, **review-complete** AND
+  **verify** (`lineage_status/2`).
 - `Dispatches.lineage_shares_prefix?/2` — shared ROOT (element 0 only). A sibling is BLOCKED.
-  Used by **verify** (`lineage_status(story, caller, :root)`) and by `select_verifier/3`'s
-  `reject_same_root/2`.
+  Used where separation is guaranteed by CONSTRUCTION rather than demanded of whoever calls:
+  `select_verifier/3`'s `reject_same_root/2`, and `verify_lineage_separated/4` on the RECORDED
+  verifier that selection produced.
 
 Why they differ: the documented dispatch tree puts the implementer and the reviewer side by
 side under one orchestrator, and roots the whole tenant at one operator dispatch. Under a
 root test *every* pair of dispatches in a tenant matches, so the reviewer counts as the
-implementer and nothing can ever be reported — and `select_verifier` rejects its entire pool.
-This was invisible until #621 began recording `implementer_dispatch_id` on the HTTP path,
-which is what made the comparison run at all. Verify stays on the root test deliberately: it
-is the final certification, and the selector already refuses to nominate a same-root verifier,
-so accepting one at the gate would contradict the selection rule.
+implementer and nothing can ever be reported — and applying it to verify's CALLER left a
+single-root tenant with no principal able to certify anything at all, which is why verify's
+caller comparison is `:chain` too. This was invisible until #621 began recording
+`implementer_dispatch_id` on the HTTP path, which is what made the comparison run at all.
+The selector keeps the root test: it CHOOSES the candidate, so it can insist on the stronger
+property without stranding anyone.
 
 Neither relaxes self-approval — `assigned_agent_id` equality is evaluated IN ADDITION at every
 gate, and an empty lineage is never a match.
@@ -296,10 +316,13 @@ gate, and an empty lineage is never a match.
   compare lineage, so this is blocked; do not "route around" it by minting a key outside the lineage.
 - Taking the caller's lineage from request params instead of `Dispatches.lineage_for_api_key/2` —
   a client-supplied lineage is self-attested and defeats the gate.
-- Trusting a `nil` identity as permissive where the code blocks it — `verify`
-  (`progress.ex:2006`) and `report` (`progress.ex:2576`) fail closed on nil *caller identity*. The one
-  documented exception is `review-complete` (`progress.ex:2593-2594`, nil = human operator, paired
-  with the exact_role plug and the controller check). Do not "fix" it without reading its comment.
+- Trusting a `nil` identity as permissive where the code blocks it — `verify` and `report` fail
+  closed on nil *caller identity*. The one documented exception is `review-complete` (nil agent
+  AND empty lineage = human operator, paired with the exact_role plug and the controller check).
+  Do not "fix" it without reading its comment, and do not drop the lineage half.
+- Answering an ordinary configuration refusal with an L6 code. `self_*_blocked` records a custody
+  violation and escalates to a tenant-wide halt; "your key has no dispatch lineage" is a setup
+  state that fires on every call, so it is `caller_lineage_required` (plain 409).
 
 ## Related
 

@@ -71,10 +71,12 @@ All notable changes to loopctl are documented here.
   dispatch — because an absent lineage also describes a legacy long-lived key. **What changed
   for clients:** a sub-agent that used to mint a fresh root must now pass its own dispatch id as
   `parent_dispatch_id` (the 403 body returns it as `remediation.your_dispatch_id`); a legacy
-  `LOOPCTL_ORCH_KEY` can no longer mint a root at all — use the tenant's `user`-role operator
-  key. **Operators must mint at least two roots**: verification is root-separated, so a tenant
-  whose dispatches all descend from one root has no principal that can verify — selection
-  reports `no_independent_root` and the verify gate answers `self_verify_blocked`. Both refusals
+  `LOOPCTL_ORCH_KEY` can no longer mint a ROOT — use the tenant's `user`-role operator key —
+  but it may still mint BENEATH any active dispatch, which is how it obtains a lineage during
+  the deprecation window. Minting a second, independently-rooted tree remains worthwhile
+  (`select_verifier/3` prefers a different-root candidate and reports `no_independent_root`
+  without one), but it is not required for liveness: the verify gate compares the caller at
+  chain distance, so a sibling verifier under the same root certifies fine. Both refusals
   are logged as `lineage_ceiling_refused` and emit
   `[:loopctl, :custody, :lineage_ceiling_refused]`.
 
@@ -98,12 +100,14 @@ All notable changes to loopctl are documented here.
   markers, but `force-unclaim` clears `assigned_agent_id`, and a story claimed with a key that
   no dispatch minted never records an implementer dispatch — so a worked story could be
   returned to a state indistinguishable from pre-loopctl work and then marked verified with no
-  report, review record or independent verifier. Unclaim and force-unclaim now stamp a durable
-  `metadata.lifecycle_entered_at` on the story, and both paths refuse a story carrying it — or
-  a lifecycle entry in the audit log — with a new 422 (`story_entered_lifecycle`). The row stamp
-  is the durable half deliberately: `audit_log` is partitioned and pruned at
-  `AUDIT_RETENTION_DAYS` (default 90), so an audit-only guard would have reopened this path on a
-  timer. Imported and never-dispatched work — the case backfill exists for — is unaffected.
+  report, review record or independent verifier. Unclaim, force-unclaim and the reject
+  auto-reset now stamp `metadata.lifecycle_entered_at` on the story, and both paths refuse a
+  story carrying it — or a lifecycle entry in the audit log — with a new 422
+  (`story_entered_lifecycle`). The row stamp is the longer-lived half deliberately: `audit_log`
+  is partitioned and pruned at `AUDIT_RETENTION_DAYS` (default 90), so an audit-only guard would
+  have reopened this path on a timer. The stamp is not tamper-proof — `PATCH /stories/:id`
+  replaces `metadata` wholesale, so an orchestrator key can still erase it; both sources are
+  consulted. Imported and never-dispatched work — the case backfill exists for — is unaffected.
   Backfill is additionally mounted on the LCP-1 signed-claim gate, so under the `signed` custody
   profile an enrolled caller must sign it exactly as for `verify`, and the verified claim is
   recorded in the hash-chained audit log (§9.4) as it is for `verify`.
@@ -114,9 +118,14 @@ All notable changes to loopctl are documented here.
   orchestrator dispatched inside the implementer's own lineage cleared them where
   `POST /stories/:id/verify` returned `409 self_verify_blocked`. All four now resolve the
   caller's lineage server-side from the authenticating key. **What changed for clients:** calls
-  that were previously accepted from inside the implementer's lineage now return
-  `409 self_verify_blocked` (bulk: a per-story error entry) — use an independently-rooted
-  verifier dispatch.
+  that were previously accepted from ON the implementer's lineage chain (an ancestor or a
+  sub-agent; siblings are fine) now return `409 self_verify_blocked` (bulk: a per-story error
+  entry) — use a sibling or independently-rooted verifier dispatch. A key that no dispatch
+  minted (a legacy env-var key) gets `409 caller_lineage_required` on report, review-complete
+  and verify of DISPATCH-MINTED work, because its separation cannot be shown; mint an ephemeral
+  key with `POST /api/v1/dispatches`. That is a plain refusal and records no custody violation,
+  so it never arms a tenant halt. Stories that predate dispatches are unaffected, and `reject`
+  is deliberately exempt so bad work can always be sent back.
 
 ## [Unreleased] — 2026-07-24 — Self-hosting: fresh-install fixes, multilingual search, at-rest ingestion encryption
 

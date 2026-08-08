@@ -21,6 +21,7 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :self_review_blocked}` -> 409 (implementer tries to review their own work)
   - `{:error, :missing_assigned_agent}` -> 409 (reported_done story has no assigned agent/dispatch lineage; custody chain broken)
   - `{:error, :unresolvable_dispatch_lineage}` -> 409 (a dispatch the story references — implementer, or verifier on verify — could not be resolved; custody gate failed closed on an integrity error, tenant NOT halted)
+  - `{:error, :caller_lineage_required}` -> 409 (a key no dispatch minted tried to report/review/verify dispatch-minted work; a configuration refusal, tenant NOT halted)
   - `{:error, :rate_limited}` -> 429 with retry_after_seconds from header
   - `{:error, :ingestion_backlog_exceeded, retry_after}` -> 429 with `Retry-After` header and
     a machine-readable `code: "ingestion_backlog_exceeded"` (US-36.3 ingest backpressure —
@@ -242,6 +243,27 @@ defmodule LoopctlWeb.FallbackController do
             "This is a lineage-integrity failure; re-establish the dispatch provenance " <>
             "before reporting, reviewing, or verifying.",
         remediation: %{learn_more: "https://loopctl.com/wiki/chain-of-custody"}
+      }
+    })
+  end
+
+  def call(conn, {:error, :caller_lineage_required}) do
+    # The caller's key was not minted by a dispatch, so its separation from
+    # dispatch-minted work cannot be SHOWN. That is a credential/configuration
+    # condition, not a byzantine self-claim: it must NOT record a custody violation
+    # (which escalates to a tenant-wide halt), because it fires on every call an
+    # unmigrated legacy key makes.
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "caller_lineage_required",
+        message:
+          "This story's work was dispatch-minted, so the custody gate compares dispatch " <>
+            "lineages — and your key was not minted by a dispatch, so it has none. Call " <>
+            "again with an ephemeral key from POST /api/v1/dispatches.",
+        remediation: %{learn_more: "https://loopctl.com/wiki/dispatch-lineage"}
       }
     })
   end

@@ -236,6 +236,13 @@ defmodule Loopctl.Custody.SignedProfilePolicy do
   `:bulk_signature_unsupported` told it "your dispatch is enrolled with an agent key"
   (false) and sent it to a single-story path that then 403s the same bearer key —
   a dead end wrapped in a misdescription of its own credential.
+
+  Both remedies are TERMINAL on this endpoint only when read together, so the shared
+  `:agent_enrollment_required` message (`LoopctlWeb.Plugs.RequireSignedClaim.message_for/1`)
+  names both hops for the bulk caller: switch to the enrolled dispatch AND, because bulk
+  refuses that too, verify each story individually on the single-story signed path.
+  Naming only the enrolled dispatch here sent the caller to a credential this same
+  function refuses on its next call.
   """
   @spec verify_bulk_request(:bearer | :signed, Ecto.UUID.t(), Ecto.UUID.t() | nil) ::
           :ok | {:error, :bulk_signature_unsupported | :agent_enrollment_required}

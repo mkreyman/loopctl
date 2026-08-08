@@ -380,7 +380,13 @@ defmodule Loopctl.BulkOperations do
 
     with :ok <- validate_reason(reason),
          :ok <- validate_reject_preconditions(story),
-         :ok <- Progress.ensure_verify_allowed(story, orchestrator_agent_id, ctx.caller_lineage),
+         :ok <-
+           Progress.ensure_verify_allowed(
+             story,
+             orchestrator_agent_id,
+             ctx.caller_lineage,
+             :reject
+           ),
          {:ok, updated} <- apply_rejection(story, reason) do
       create_rejection_result(tenant_id, story, orchestrator_agent_id, params)
       audit_rejection(tenant_id, story, updated, actor_id, actor_label, orchestrator_agent_id)
@@ -866,9 +872,11 @@ defmodule Loopctl.BulkOperations do
 
   defp format_reason(:story_entered_lifecycle),
     do:
-      "story's audit log shows it was worked inside loopctl (a status change or a " <>
-        "force-unclaim), even though its dispatch markers are now clear; use the normal " <>
-        "report → review → verify flow, not mark-complete"
+      "story is recorded as having entered the dispatch lifecycle (a status change, a " <>
+        "force-unclaim or an auto-reset), even though its dispatch markers are now clear; " <>
+        "use the normal report → review → verify flow, not mark-complete. The record is " <>
+        "the story's own lifecycle stamp, the audit log, or both — the audit log is pruned " <>
+        "at AUDIT_RETENTION_DAYS, so an empty story history does not contradict this"
 
   defp format_reason(:story_in_progress),
     do:

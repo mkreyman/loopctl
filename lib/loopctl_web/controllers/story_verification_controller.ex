@@ -338,8 +338,10 @@ defmodule LoopctlWeb.StoryVerificationController do
   end
 
   defp backfill_error_message(:story_entered_lifecycle) do
-    "Story's audit log shows it was worked inside loopctl (a status change or a force-unclaim), " <>
-      "even though its dispatch markers are now clear. Backfill is only for work completed " <>
+    "Story is recorded as having entered the dispatch lifecycle (a status change, a force-unclaim " <>
+      "or an auto-reset) — by its own lifecycle stamp, the audit log, or both; the audit log is " <>
+      "pruned at AUDIT_RETENTION_DAYS, so an empty GET /stories/:id/history does not contradict " <>
+      "this. Its dispatch markers are now clear. Backfill is only for work completed " <>
       "OUTSIDE the loopctl dispatch lifecycle, so it cannot certify this story. " <>
       "Use the normal report_story -> review_complete -> verify_story flow instead."
   end

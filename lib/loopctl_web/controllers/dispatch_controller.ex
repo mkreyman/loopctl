@@ -142,9 +142,15 @@ defmodule LoopctlWeb.DispatchController do
   # lineage as a prefix.
   #
   # The OPERATOR key may parent anywhere in its tenant: it is not inside any tree, so
-  # it cannot escape one. Every other caller — including a []-lineage legacy key, which
-  # is NOT the operator — must name a parent inside its own subtree.
+  # it cannot escape one. The same reasoning covers a []-lineage NON-operator (a legacy
+  # env-var key): it has no subtree to step outside of, and the ceiling exists to stop a
+  # principal escaping ITS OWN tree. Refusing it here closed the only remaining mint it
+  # had — root minting is already operator-only — leaving a legacy `:orchestrator` key
+  # unable to obtain a lineage by any request at all, against the documented deprecation
+  # window. Naming a parent gives it a lineage, which SUBJECTS it to the custody gates.
+  # A caller that IS inside a tree must stay inside it.
   defp lineage_within_caller?(_parent_lineage, _caller_lineage, true), do: true
+  defp lineage_within_caller?(_parent_lineage, [], false), do: true
 
   defp lineage_within_caller?(parent_lineage, [_ | _] = caller_lineage, false)
        when is_list(parent_lineage),
@@ -164,17 +170,37 @@ defmodule LoopctlWeb.DispatchController do
         message:
           "A parentless dispatch starts a NEW independent lineage tree, which only the " <>
             "tenant's own operator key (a `user`-role key that no dispatch minted) may do. " <>
-            "Pass `parent_dispatch_id` and mint this dispatch inside your own lineage.",
-        # The remediation is only actionable if the caller can NAME its own dispatch, and
-        # nothing else on this API tells it which row is its own. It is already resolved
-        # server-side as the last element of the caller's lineage, so hand it back.
-        remediation: %{
-          your_dispatch_id: List.last(caller_lineage),
-          your_lineage_path: caller_lineage,
-          learn_more: "https://loopctl.com/wiki/dispatch-lineage"
-        }
+            root_mint_remedy(caller_lineage),
+        remediation: root_mint_remediation(caller_lineage)
       }
     })
+  end
+
+  # The remedy must be one the REFUSED caller can actually perform. "Mint inside your
+  # own lineage" is meaningless to a caller that has none — and `your_dispatch_id`
+  # would be a bare null there, which is how the previous wording read to every legacy
+  # key. Name a parent it can obtain instead.
+  defp root_mint_remedy([]),
+    do:
+      "Your key was not minted by a dispatch, so you have no lineage of your own: pass " <>
+        "`parent_dispatch_id` naming any active dispatch in your tenant (GET " <>
+        "/api/v1/dispatches), or have the tenant's `user`-role operator key mint the root."
+
+  defp root_mint_remedy(_caller_lineage),
+    do: "Pass `parent_dispatch_id` and mint this dispatch inside your own lineage."
+
+  # The remediation is only actionable if the caller can NAME its own dispatch, and
+  # nothing else on this API tells it which row is its own. It is already resolved
+  # server-side as the last element of the caller's lineage, so hand it back — and OMIT
+  # the key entirely when there is no such row, rather than emitting null.
+  defp root_mint_remediation([]), do: %{learn_more: "https://loopctl.com/wiki/dispatch-lineage"}
+
+  defp root_mint_remediation(caller_lineage) do
+    %{
+      your_dispatch_id: List.last(caller_lineage),
+      your_lineage_path: caller_lineage,
+      learn_more: "https://loopctl.com/wiki/dispatch-lineage"
+    }
   end
 
   defp reject_lineage_escape(conn, api_key, caller_lineage, parent_id) do

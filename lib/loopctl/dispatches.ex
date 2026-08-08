@@ -591,11 +591,13 @@ defmodule Loopctl.Dispatches do
   "same lineage" means for custody separation. An empty lineage on either side is
   never a match.
 
-  This is the STRICTER of the two comparisons and belongs to the VERIFY side —
-  `validate_not_self_verify/3` and `select_verifier/3`'s `reject_same_root/2`,
-  which deliberately declines to pick a verifier under the implementer's root.
-  For the REPORT gate, where a sibling reviewer IS acceptable separation, use
-  `lineage_same_chain?/2` instead and read the note there.
+  This is the STRICTER of the two comparisons, and it applies where separation can be
+  guaranteed BY CONSTRUCTION rather than demanded of an arbitrary caller:
+  `select_verifier/3`'s `reject_same_root/2`, which declines to pick a verifier under
+  the implementer's root, and `Progress.verify_lineage_separated/4`, which compares the
+  verifier dispatch that selection RECORDED. Every CALLER comparison — report,
+  review-complete and verify alike — uses `lineage_same_chain?/2`; read the note there
+  for why demanding a separate root of the caller locks a single-root tenant out.
   """
   @spec lineage_shares_prefix?(list(), list()) :: boolean()
   def lineage_shares_prefix?([], _), do: false
@@ -608,7 +610,7 @@ defmodule Loopctl.Dispatches do
   True when the two dispatches lie on ONE root-to-leaf chain — identical, or one
   an ancestor of the other. Siblings are NOT a match.
 
-  ## Why report needs this and verify does not
+  ## Why every CALLER comparison needs this
 
   The documented dispatch tree puts the implementer and the reviewer side by side
   under one orchestrator, and roots everything at a single operator dispatch:
@@ -633,10 +635,12 @@ defmodule Loopctl.Dispatches do
     * `[r, o, i]` vs `[r, o, v]` (two siblings) — allowed: separate dispatches,
       separate ephemeral keys, separate `agent_id`s.
 
-  VERIFY deliberately stays stricter (`lineage_shares_prefix?/2`): it is the
-  final certification, and `select_verifier/3` already refuses to nominate a
-  verifier sharing the implementer's root, so accepting one at the gate would
-  contradict the selection rule.
+  VERIFY's CALLER comparison uses this too. Demanding a separate ROOT of the
+  caller made verify unreachable in the tree drawn above — every dispatch-minted
+  key shares the one root, so a single-root tenant had no principal that could
+  certify anything. The stricter `lineage_shares_prefix?/2` still governs where
+  selection can satisfy it by construction: `select_verifier/3` will not nominate
+  a same-root verifier, and the RECORDED verifier is compared at root distance.
 
   Self-approval is not relaxed either way — the `assigned_agent_id` equality
   check runs IN ADDITION at every gate, and an empty lineage is never a match.
