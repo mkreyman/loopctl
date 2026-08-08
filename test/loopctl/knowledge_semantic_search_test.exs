@@ -1341,34 +1341,61 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       assert meta.offset == 0
       assert meta.search_mode == "semantic_only"
       assert meta.total_count_scope == "ranked_corpus"
-      # 3 ranked rows <= the (test) relevance-pool cap of 5 → fully reachable, not capped.
+      # 3 ranked rows, well under the relevance-pool cap → fully reachable, not capped.
       assert meta.pool_capped == false
     end
 
     test "corpus larger than the relevance-pool cap: pool_capped true + deep offset truncates" do
       %{tenant: tenant} = setup_tenant()
 
-      # Seed cap+2 near-identical embedded articles (test cap = 5, see config/test.exs).
-      for i <- 1..7, do: create_article_with_embedding(tenant.id, %{title: "Hub #{i}"}, :query)
+      # Every number below is DERIVED from the enforced cap, never hardcoded. A literal
+      # here is what decoupled this test from `config/test.exs` last time: the cap moved
+      # and nothing pointed at it, so the wide-page remedy elsewhere in the suite was
+      # silently clamped for months. `semantic_result_pool/1` is
+      # `min(max(offset + limit, floor), cap)`, so ANY page at least as wide as the cap
+      # resolves to a pool of exactly `cap` — that is the one relationship this test needs,
+      # and it holds for every floor <= cap without restating the formula.
+      cap = Knowledge.semantic_result_pool_cap()
+      wide = cap + 5
+
+      # Seed cap+2 near-identical embedded articles: the smallest corpus that exceeds the
+      # reachable pool, so this stays linear in the cap and no more expensive than it must be.
+      for i <- 1..(cap + 2),
+          do: create_article_with_embedding(tenant.id, %{title: "Hub #{i}"}, :query)
 
       {:ok, %{results: results, meta: meta}} =
-        Knowledge.search_semantic(tenant.id, make_embedding(:query), limit: 10)
+        Knowledge.search_semantic(tenant.id, make_embedding(:query), limit: wide)
 
       # total_count is the FULL ranked corpus (a SEPARATE count, NOT pool-bounded) ...
-      assert meta.total_count == 7
+      assert meta.total_count == cap + 2
       # ... but the relevance pool only surfaces up to the cap, so the tail is unreachable
       # by a deeper offset — and the signal flags it (not silent).
-      assert length(results) == 5
+      assert length(results) == cap
       assert meta.pool_capped == true
 
       # A page past the cap returns empty (documented relevance tradeoff); the signal
       # still flags it so the consumer knows to switch to list mode for full enumeration.
       {:ok, %{results: deep, meta: deep_meta}} =
-        Knowledge.search_semantic(tenant.id, make_embedding(:query), limit: 10, offset: 5)
+        Knowledge.search_semantic(tenant.id, make_embedding(:query), limit: wide, offset: cap)
 
       assert deep == []
-      assert deep_meta.total_count == 7
+      assert deep_meta.total_count == cap + 2
       assert deep_meta.pool_capped == true
+
+      # ...and the CAP arm of the signal specifically, isolated from the pool/filter
+      # starvation arm. Both assertions above are ALSO satisfied by starvation (a short
+      # page with more filtered results behind it), so neither one alone proves
+      # `total_count > cap` is live: deleting that clause from `semantic_pool_capped?/4`
+      # left the whole suite green. A page NARROWER than the cap comes back FULL
+      # (`returned == limit`, so the starvation arm is false by construction) while the
+      # corpus still exceeds the reachable pool — which is exactly the "true regardless of
+      # offset, even on a full page" case the signal documents.
+      {:ok, %{results: full, meta: full_meta}} =
+        Knowledge.search_semantic(tenant.id, make_embedding(:query), limit: cap - 1)
+
+      assert length(full) == cap - 1
+      assert full_meta.total_count == cap + 2
+      assert full_meta.pool_capped == true
     end
   end
 
@@ -1376,11 +1403,17 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
     test "selective filter whose matches fall outside the pool: pool_capped true (not a false negative)" do
       %{tenant: tenant} = setup_tenant()
 
-      # Fill the (test) relevance pool (cap 5) with near-identical :reference articles, and
-      # put the ONLY :pattern match far away (orthogonal → similarity 0, ranked last), so it
-      # sits OUTSIDE the top-5 nearest. A category:pattern search then starves the pool below
-      # the cap. The honest signal must flag this — `total_count > cap` ALONE would miss it.
-      for i <- 1..5,
+      # Fill the relevance pool with near-identical :reference articles, and put the ONLY
+      # :pattern match far away (orthogonal → similarity 0, ranked last) so it sits OUTSIDE
+      # the top-`pool` nearest. A category:pattern search then starves the page. The honest
+      # signal must flag this — `total_count > cap` ALONE would miss it.
+      #
+      # Both numbers derive from the enforced cap (see the sibling test above): a page at
+      # least as wide as the cap pins the pool to exactly `cap`, so seeding `cap` filler
+      # rows fills it precisely — no literal to drift.
+      cap = Knowledge.semantic_result_pool_cap()
+
+      for i <- 1..cap,
           do:
             create_article_with_embedding(
               tenant.id,
@@ -1393,12 +1426,12 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       {:ok, %{results: results, meta: meta}} =
         Knowledge.search_semantic(tenant.id, make_embedding(:query),
           category: :pattern,
-          limit: 10
+          limit: cap + 5
         )
 
       # total_count is the full filtered corpus (1 :pattern article)...
       assert meta.total_count == 1
-      # ...but it fell outside the top-5 nearest, so the page is starved (< total_count)
+      # ...but it fell outside the top-`cap` nearest, so the page is starved (< total_count)
       # and the signal flags incompleteness rather than lying "reachable".
       assert length(results) < meta.total_count
       assert meta.pool_capped == true
@@ -1433,8 +1466,12 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       %{tenant: tenant} = setup_tenant()
 
       # cap+2 embedded articles → the semantic sub-search is pool-capped; combined must
-      # surface that, not drop it (combined is the DEFAULT search mode).
-      for i <- 1..7, do: create_article_with_embedding(tenant.id, %{title: "Hub #{i}"}, :query)
+      # surface that, not drop it (combined is the DEFAULT search mode). Derived from the
+      # enforced cap, never hardcoded — see the truncation test above for why.
+      cap = Knowledge.semantic_result_pool_cap()
+
+      for i <- 1..(cap + 2),
+          do: create_article_with_embedding(tenant.id, %{title: "Hub #{i}"}, :query)
 
       expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
         {:ok, make_embedding(:query)}

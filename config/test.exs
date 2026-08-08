@@ -194,10 +194,32 @@ unless System.get_env("SCALE_NIGHTLY") || System.get_env("SCALE_TESTS") do
 
   # US-27.7a `search_semantic` relevance-pool knobs, shrunk so the deep-offset /
   # `pool_capped` truncation signal is exercisable with a handful of seeded rows (prod
-  # floor/cap are 200/1000). Existing semantic tests seed ≤ cap rows, so they are
-  # unaffected. The SCALE gate keeps the prod defaults. Config-based DI — no put_env.
+  # floor/cap are 200/1000). The SCALE gate keeps the prod defaults. Config-based DI — no
+  # put_env.
+  #
+  # THE CAP IS THE LAST CLAMP, SO IT BOUNDS EVERY TEST, not just the truncation ones:
+  # `semantic_result_pool/1` is `min(max(offset + limit, floor), cap)`. At the old cap of 5
+  # a page of `limit: 50` and a page of `limit: 10` both resolved to a pool of 5, which made
+  # every "widen the page past the candidate set" annotation in
+  # `embeddings_side_table_reads_test.exs` (and its siblings) a NO-OP — the documented
+  # remedy for the `left: []` starvation flake was disconnected from the knob that decides
+  # it. That cost four fixes aimed at pgvector recall.
+  #
+  # 30 is sized off the REAL candidate set, not off a round number. A tenant that has
+  # materialized the shared system corpus (AC-41.1.7) carries one embedding row per
+  # published system article — 23 of them are committed in the test DB — plus its own rows,
+  # so ~25 candidates compete for the page. The side-table inner ANN fetches
+  # `pool * side_table_over_fetch()` (4) rows with `hnsw.ef_search` raised to match, so:
+  #   * default `limit: 10` -> pool 10  -> inner 40  (covers ~25 with margin)
+  #   * wide    `limit: 50` -> pool 30  -> inner 120 (the annotated ranking assertions)
+  # An assertion can no longer be starved by candidates a post-ANN filter then discards.
+  #
+  # The `pool_capped` tests still trip cap truncation cheaply: they seed relative to
+  # `Knowledge.semantic_result_pool_cap/0` rather than to a literal, so they cannot decouple
+  # from this value again. Raising it further is free EXCEPT for their seed cost, which is
+  # linear in the cap — that is the only reason it is 30 and not 300.
   config :loopctl, :semantic_result_pool_floor, 2
-  config :loopctl, :semantic_result_pool_cap, 5
+  config :loopctl, :semantic_result_pool_cap, 30
 
   # US-27.16: the streaming-export concurrency cap (`Loopctl.Knowledge.ExportConcurrency`).
   # The GLOBAL cap (`:export_max_concurrent_global`, prod default 2 — sized to the heavy-read

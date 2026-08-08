@@ -418,6 +418,64 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
       assert article.id in Enum.map(results, & &1.id)
     end
 
+    # THE REGRESSION GUARD FOR THE WIDE-PAGE REMEDY ITSELF.
+    #
+    # Every "PAGE SIZE IS LOAD-BEARING" note in this file asserts a page wider than the
+    # candidate set — but a `limit:` is only a REQUEST. `Knowledge.semantic_result_pool/1`
+    # is `min(max(offset + limit, floor), cap)`, so the cap has the last word: while
+    # `config/test.exs` pinned it at 5, `limit: 50` and `limit: 10` produced the IDENTICAL
+    # pool of 5 and every one of those annotations bought exactly nothing. That is why the
+    # remedy kept "not working" — right diagnosis, disconnected lever.
+    #
+    # This reconstructs the recorded failure geometry rather than describing it: the whole
+    # committed system corpus materialized at the query vector (cosine 1.0) so it outranks
+    # the tenant's own row (`:far`, ~0.71), which lands LAST among the candidates. A pool
+    # smaller than that set evicts it and the assertion sees `left: []` — the exact recorded
+    # signature. A pool larger than it cannot.
+    test "the tenant's own row survives a fully materialized system corpus (pool > candidates)" do
+      tenant = fixture(:tenant)
+
+      system_rows = Embeddings.unmaterialized_system_articles(tenant.id, 1536, limit: 1000)
+      assert system_rows != [], "the committed system corpus is what crowds the ANN pool"
+
+      for article <- system_rows do
+        {:ok, _} =
+          Embeddings.materialize_system_article_embedding(
+            tenant.id,
+            article,
+            vec(1536, :close),
+            "sys",
+            1536
+          )
+      end
+
+      own = embedded_article(tenant.id, %{title: "Own, ranked last"}, :far, 1536)
+
+      # Assert the MARGIN, not a comment about it: the page below is only as wide as the
+      # cap allows, and the cap must clear the candidate set for the ranking assertion to
+      # be about ranking. Lower the cap (or grow the system corpus past it) and this fails
+      # HERE, naming the knob — instead of resurfacing as an intermittent `left: []` in a
+      # sibling suite.
+      candidates = length(system_rows) + 1
+      cap = Knowledge.semantic_result_pool_cap()
+
+      assert cap > candidates,
+             "semantic_result_pool_cap (#{cap}) must exceed the #{candidates}-row candidate " <>
+               "set, or every wide `limit:` in this file is clamped back to it"
+
+      enable_side_table_reads()
+
+      assert {:ok, %{results: results}} =
+               Knowledge.search_semantic(tenant.id, vec(1536, :query), limit: 50)
+
+      ids = Enum.map(results, & &1.id)
+      assert own.id in ids
+      # ...and it really is the WORST-ranked candidate, so its presence is pool capacity
+      # doing its job, not a lucky tie.
+      assert List.last(ids) == own.id
+      assert length(ids) == candidates
+    end
+
     # Review, finding 3: AC-41.1.7 requires the system-corpus recall state be stated
     # EXPLICITLY on EVERY semantic response — "never a silent absence". On the LEGACY
     # path the shared system corpus is not semantically recallable at all (the legacy

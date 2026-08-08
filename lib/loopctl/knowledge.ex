@@ -7815,7 +7815,16 @@ defmodule Loopctl.Knowledge do
   # from the top-`cap` relevance pool, so a consumer can page through at most `cap` ranked
   # rows regardless of `offset`. Drives both the results pool's hard cap and the
   # `meta.pool_capped` truncation signal. Config `:semantic_result_pool_cap`.
-  defp semantic_result_pool_cap,
+  #
+  # Public-but-`@doc false` so the `pool_capped` truncation tests can SEED RELATIVE TO the
+  # enforced value instead of hardcoding it. A hardcoded `cap + 2` silently decouples the
+  # moment the config moves — which is exactly how the wide `limit:` annotations in
+  # `embeddings_side_table_reads_test.exs` became decorative: every one of them was clamped
+  # back to the cap and nobody noticed, because nothing tied a test's numbers to this
+  # function. Read it, never re-derive it.
+  @doc false
+  @spec semantic_result_pool_cap() :: pos_integer()
+  def semantic_result_pool_cap,
     do:
       Application.get_env(:loopctl, :semantic_result_pool_cap, @default_semantic_result_pool_cap)
 
