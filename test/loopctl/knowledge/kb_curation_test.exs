@@ -95,14 +95,21 @@ defmodule Loopctl.Knowledge.KbCurationTest do
       })
       |> AdminRepo.insert!()
 
+      # Recorded as an orchestrator: `:high` is granted from the recording role, and it is
+      # the confidence the executor acts on. A `:high` supersede also carries its evidence.
       {:ok, _} =
-        Knowledge.annotate_conflict(t.id, %{
-          "source_article_id" => a.id,
-          "target_article_id" => b.id,
-          "disposition" => "supersede",
-          "authoritative_article_id" => a.id,
-          "confidence" => "high"
-        })
+        Knowledge.annotate_conflict(
+          t.id,
+          %{
+            "source_article_id" => a.id,
+            "target_article_id" => b.id,
+            "disposition" => "supersede",
+            "authoritative_article_id" => a.id,
+            "confidence" => "high",
+            "evidence" => "Loser repeats Winner verbatim"
+          },
+          actor_role: :orchestrator
+        )
 
       assert 1 == Knowledge.execute_conflict_resolutions(t.id)
 

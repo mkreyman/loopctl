@@ -839,7 +839,7 @@ Full descriptions live in [`mcp-server/README.md`](mcp-server/README.md); summar
 | `knowledge_search` | Search knowledge wiki by topic | agent |
 | `knowledge_get` | Get full article content by ID | agent |
 | `knowledge_context` | Get relevance-ranked articles for a task query, scoped to agent's visible articles (with linked references). | agent |
-| `knowledge_list` | List articles (full fields, lag-free, all-status) — filter by tag/source_type/source_id/idempotency_key for dedup/enumerate/repair. Agent visibility filtering applies. | agent |
+| `knowledge_list` | List articles (full fields except `idempotency_key`, which is filter-only, lag-free, all-status) — filter by tag/source_type/source_id/idempotency_key for dedup/enumerate/repair. Agent visibility filtering applies. | agent |
 | `knowledge_count` | Count articles matching filters within agent's visible set. | agent |
 | `knowledge_facets` | Tag facet counts over agent's visible filtered article set (drives faceted browse). | agent |
 | `knowledge_graph` | Multi-hop link-graph traversal from a seed article, bounded to agent's visible articles (typed edges, depth/fan-out caps). | agent |

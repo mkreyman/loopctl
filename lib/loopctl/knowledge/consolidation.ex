@@ -188,7 +188,7 @@ defmodule Loopctl.Knowledge.Consolidation do
 
   # The signal that formed a duplicate group survives onto the persisted proposal ONLY inside
   # the rationale prose, so the sentence (`duplicate_captures/2`) and the apply-time
-  # classifier (`title_drift?/1`) both interpolate the phrase from HERE. They used to be a
+  # classifier (`drift_signal/1`) both interpolate the phrase from HERE. They used to be a
   # sentence and a substring literal that nothing pinned together — a copy edit would have
   # turned the one content check on the auto-applying class off without failing anything.
   @title_drift "title drift"
@@ -336,7 +336,9 @@ defmodule Loopctl.Knowledge.Consolidation do
   Applies the `:duplicate_capture` proposals that TWO consecutive runs agree on.
 
   The only class this pass applies by itself, and the only action it will take: keep the
-  richest article of a duplicate group and UNPUBLISH the rest.
+  OLDEST article of a duplicate group and UNPUBLISH every later one. Age, not length, is
+  the winner rule — see `apply_live_group/4` for why (age is the one input a later writer
+  cannot manufacture).
 
   ## Why unpublish and never archive
 
@@ -402,15 +404,17 @@ defmodule Loopctl.Knowledge.Consolidation do
   still runs in front of it (which is why the worker calls this only after tonight's report
   was written, `Loopctl.Workers.KnowledgeLintWorker`), but agreement confirms a specific id
   set; it cannot notice that a human retitled three of the five members this morning.
-  ## What a TITLE collision must additionally clear
+  ## What a collision must additionally clear
 
-  Agreement filters transience, not wrongness: a title two unrelated sources share collides
-  deterministically, so both runs agree. A TITLE-signal group is applied only when its live
-  members also corroborate in CONTENT — every member scored wherever this tenant's vectors
-  live (`score_source/1`), worst pair at or above `#{@default_min_duplicate_similarity}`
-  (tunable). One that cannot is REPORTED, counted in `uncorroborated`, and has its missing
-  vectors enqueued so the withhold clears itself; a group withheld because the scoring READ
-  failed enqueues nothing. The idempotency signal is exempt (`corroborated?/3`).
+  Agreement filters transience, not wrongness. A title two unrelated sources share collides
+  deterministically, so both runs agree; and an `idempotency_key` is caller-supplied data,
+  so two writers can collide on one deterministically too. EVERY group — whichever signal
+  formed it — is therefore applied only when its live members also corroborate in CONTENT:
+  every member scored wherever this tenant's vectors live (`score_source/1`), under the same
+  normalized key that formed the group, worst pair at or above
+  `#{@default_min_duplicate_similarity}` (tunable). One that cannot is REPORTED, counted in
+  `uncorroborated`, and has its missing vectors enqueued so the withhold clears itself; a
+  group withheld because the scoring READ failed enqueues nothing (`corroborated?/3`).
   """
   @spec apply_confirmed_duplicates(Ecto.UUID.t(), keyword()) :: %{
           applied: non_neg_integer(),
@@ -503,42 +507,43 @@ defmodule Loopctl.Knowledge.Consolidation do
   # The ONLY heavy read on the apply path, and it runs BEFORE the reduce — so a statement
   # timeout or a `HeavyRead` shed would escape past `tally_apply/5`'s per-group rescue and
   # cost the whole night's drain, deterministically, every night. A failure degrades to
-  # `:unavailable` instead: title-drift groups are withheld one by one (fail-closed, counted
-  # in `uncorroborated`) and idempotency-drift groups still apply.
+  # `:unavailable` instead, which withholds every group one by one (fail-closed, counted in
+  # `uncorroborated`) rather than raising out of the run.
   #
   # `:unavailable` is NOT an empty score map, and the distinction is the whole point: an
   # empty map says "these members have no vectors", which routes the group into
   # `backfill_missing_embeddings/2` — so a shed on this read would answer a DB outage by
   # enqueueing an embedding job per member of every confirmed group, against the same
   # degraded database, and log it as missing vectors.
-  # Only the TITLE-drift proposals' ids, and each id ONCE. The score is consulted for no
-  # other class (`corroborated?/3` exempts idempotency drift), and `title_pairs/2` binds
-  # the list TWICE (`a1.id in ^ids and a2.id in ^ids`) — so at the shipped ceilings an
-  # undeduplicated list carrying both classes approaches Postgres's 65,535 bind-parameter
-  # limit, where a Postgrex encode failure is rescued into `:unavailable` and withholds
-  # EVERY title-drift group for that tenant, deterministically, every night.
+  #
+  # Scored per SIGNAL, in separate queries. The two classes group under different keys
+  # (normalized title vs normalized idempotency key), and a pair query grouped by the wrong
+  # one scores the wrong sets: an idempotency group's members usually have DIFFERENT titles,
+  # so under the title key each would sit alone, produce no pair, and withhold forever.
+  #
+  # Each id appears ONCE per query, and `pair_candidates/3` binds the list TWICE
+  # (`a1.id in ^ids and a2.id in ^ids`) — so an undeduplicated list approaches Postgres's
+  # 65,535 bind-parameter limit, where a Postgrex encode failure is rescued into
+  # `:unavailable` and withholds EVERY group for that tenant, deterministically, every
+  # night.
   # CHUNKED over the proposals, because neither the bind count nor the self-join width may
-  # scale with the apply cap. `title_pairs/2` binds the id list TWICE, so at `max_applies:
-  # 500` groups x 50 members that is ~50,000 bind parameters against Postgres's 65,535
-  # ceiling — and the whole thing runs inside a 10s statement timeout whose failure rescues
-  # to `:unavailable`, withholding EVERY title group for the night. Raising the cap to
-  # drain a backlog faster is exactly what would trip it, so the failure would arrive
-  # precisely when the pass was asked to do more work.
+  # scale with the apply cap: at `max_applies: 500` groups x 50 members an unchunked list
+  # is ~50,000 bind parameters against that ceiling — and the whole thing runs inside a 10s
+  # statement timeout whose failure rescues to `:unavailable`. Raising the cap to drain a
+  # backlog faster is exactly what would trip it, so the failure would arrive precisely when
+  # the pass was asked to do more work.
   #
   # Chunking by GROUP rather than by id keeps each query's pairs whole: a group split
   # across two queries would have its members scored against different pools, and
-  # `min_sim` is a per-group minimum. The merged map is keyed by member id, and a member
-  # shared between groups resolves to the same entry either way.
+  # `min_sim` is a per-group minimum. The merged map is keyed by `{signal, member id}`, and
+  # a member shared between groups of the SAME signal resolves to the same entry either way.
   @score_groups_per_query 25
 
   defp score_groups(tenant_id, proposals) do
     proposals
-    |> Enum.filter(&title_drift?/1)
-    |> Enum.chunk_every(@score_groups_per_query)
-    |> Enum.reduce(%{}, fn chunk, acc ->
-      ids = chunk |> Enum.flat_map(& &1.article_ids) |> Enum.uniq()
-
-      Map.merge(acc, pairwise_similarity_by_group(tenant_id, ids))
+    |> Enum.group_by(&drift_signal/1)
+    |> Enum.reduce(%{}, fn {signal, class_proposals}, acc ->
+      Map.merge(acc, score_signal(tenant_id, signal, class_proposals))
     end)
   rescue
     e -> log_scoring_failed(tenant_id, ExitTag.tag(e))
@@ -546,10 +551,20 @@ defmodule Loopctl.Knowledge.Consolidation do
     :exit, reason -> log_scoring_failed(tenant_id, "exit:" <> ExitTag.tag(reason))
   end
 
+  defp score_signal(tenant_id, signal, proposals) do
+    proposals
+    |> Enum.chunk_every(@score_groups_per_query)
+    |> Enum.reduce(%{}, fn chunk, acc ->
+      ids = chunk |> Enum.flat_map(& &1.article_ids) |> Enum.uniq()
+
+      Map.merge(acc, pairwise_similarity_by_group(tenant_id, ids, signal))
+    end)
+  end
+
   defp log_scoring_failed(tenant_id, tag) do
     Logger.error(
       "Consolidation: tenant=#{tenant_id} duplicate similarity scoring failed (#{tag}); " <>
-        "every title-drift group is withheld this run."
+        "every duplicate group is withheld this run."
     )
 
     :unavailable
@@ -687,7 +702,7 @@ defmodule Loopctl.Knowledge.Consolidation do
         select: %{
           id: a.id,
           body_len: fragment("length(coalesce(?, ''))", a.body),
-          updated_at: a.updated_at,
+          inserted_at: a.inserted_at,
           title_key: fragment(unquote(@title_key_sql), a.title),
           idempotency_key: a.idempotency_key,
           idempotency_key_norm: fragment(unquote(@idempotency_key_sql), a.idempotency_key)
@@ -738,16 +753,16 @@ defmodule Loopctl.Knowledge.Consolidation do
   # left behind is winner-plus-leftovers — the same group converging on the outcome that
   # WAS confirmed. `drained_by_this_pass?/2` is what tells the two apart.
   #
-  # The predicate re-checked is the one that FORMED the group — `title_drift?/1` is the
-  # same classifier `corroborated?/3` branches on, so the two cannot disagree about what a
-  # group is. Re-checking titles on an idempotency-drift group would reject every one of
-  # them: those members collide on a writer-supplied key and have no reason to share a
-  # title.
+  # The predicate re-checked is the one that FORMED the group — `drift_signal/1` is the same
+  # classifier `corroborated?/3` scores under, so the two cannot disagree about what a group
+  # is. Re-checking titles on an idempotency-drift group would reject every one of them:
+  # those members collide on a writer-supplied key and have no reason to share a title.
   defp still_colliding(tenant_id, proposal, live, budget, scored) do
     {signal, key_fun} =
-      if title_drift?(proposal),
-        do: {"normalized title", &title_group_key/1},
-        else: {"normalized idempotency key", &idempotency_group_key/1}
+      case drift_signal(proposal) do
+        :title -> {"normalized title", &title_group_key/1}
+        :idempotency -> {"normalized idempotency key", &idempotency_group_key/1}
+      end
 
     confirmed = Enum.uniq(proposal.article_ids)
 
@@ -890,7 +905,7 @@ defmodule Loopctl.Knowledge.Consolidation do
     # Re-embedding would not help either: the text is over the provider's limit, which is
     # why it is a prefix. So the correct handling is to stop pretending it is a gap.
     # A tenant with no BYO embedding key can NEVER satisfy this gate: every backfill job
-    # it enqueues is discarded `{:no_embedding_key, _}` on pickup, so the title-drift class
+    # it enqueues is discarded `{:no_embedding_key, _}` on pickup, so the duplicate class
     # withholds on every run forever while looking transient in the log ("backfill
     # enqueued") — a drain converging to a floor, and nightly Oban churn to go with it.
     # Say so once, plainly, and enqueue nothing.
@@ -899,9 +914,10 @@ defmodule Loopctl.Knowledge.Consolidation do
     else
       Logger.info(
         "Consolidation: tenant=#{tenant_id} has no embedding key (mandatory BYO), so the " <>
-          "#{length(ids)} unscored member(s) can never be embedded and title-drift groups " <>
-          "stay withheld permanently. Not enqueued — this is a configuration state, not a " <>
-          "transient gap. Idempotency-drift groups are unaffected (they need no vectors)."
+          "#{length(ids)} unscored member(s) can never be embedded and duplicate_capture " <>
+          "groups stay withheld permanently — BOTH signals, since an idempotency_key is " <>
+          "caller-supplied and corroborates nothing on its own. Not enqueued: this is a " <>
+          "configuration state, not a transient gap. Nothing is unpublished while withheld."
       )
 
       :ok
@@ -915,7 +931,7 @@ defmodule Loopctl.Knowledge.Consolidation do
       Logger.info(
         "Consolidation: tenant=#{tenant_id} #{length(prefix)} withheld member(s) carry a " <>
           "PREFIX embedding (input over the provider limit), which cannot corroborate a " <>
-          "title collision and cannot be backfilled. Not enqueued; the group stays withheld " <>
+          "key collision and cannot be backfilled. Not enqueued; the group stays withheld " <>
           "until the article is shortened or split."
       )
     end
@@ -950,19 +966,39 @@ defmodule Loopctl.Knowledge.Consolidation do
   defp enqueue_backfill(_tenant_id, []), do: :ok
 
   defp enqueue_backfill(tenant_id, ids) do
-    ids
-    |> Enum.chunk_every(Knowledge.embedding_batch_max())
-    |> Enum.each(fn chunk ->
-      # `Oban.insert/1` returns `{:error, changeset}` without raising, so throwing the result
-      # away left the ONLY failure mode that does not log — the group counted uncorroborated
-      # with an enqueue that never happened, indistinguishable from a successful one.
-      case %{article_ids: chunk, tenant_id: tenant_id}
-           |> BatchArticleEmbeddingWorker.new()
-           |> Oban.insert() do
-        {:ok, _job} -> :ok
-        {:error, reason} -> log_backfill_failed(tenant_id, "insert:" <> insert_tag(reason))
-      end
-    end)
+    enqueued =
+      ids
+      |> Enum.chunk_every(Knowledge.embedding_batch_max())
+      |> Enum.map(fn chunk ->
+        # `Oban.insert/1` returns `{:error, changeset}` without raising, so throwing the
+        # result away left the ONLY failure mode that does not log — the group counted
+        # uncorroborated with an enqueue that never happened, indistinguishable from a
+        # successful one.
+        case %{article_ids: chunk, tenant_id: tenant_id}
+             |> BatchArticleEmbeddingWorker.new()
+             |> Oban.insert() do
+          {:ok, _job} ->
+            length(chunk)
+
+          {:error, reason} ->
+            log_backfill_failed(tenant_id, "insert:" <> insert_tag(reason))
+            0
+        end
+      end)
+      |> Enum.sum()
+
+    # AFTER the inserts, counting what actually landed. Printed at the top it was the same
+    # before-the-fact claim this path was fixed to stop making: a run where every insert
+    # failed still asserted "enqueued", and the operator scanning for the positive line read
+    # a total failure as a transient gap. Zero enqueued prints nothing — the failures
+    # already logged themselves.
+    if enqueued > 0 do
+      Logger.info(
+        "Consolidation: tenant=#{tenant_id} enqueued an embedding backfill for " <>
+          "#{enqueued} of #{length(ids)} withheld member(s); the withhold clears once the " <>
+          "vectors land."
+      )
+    end
 
     :ok
   rescue
@@ -984,10 +1020,24 @@ defmodule Loopctl.Knowledge.Consolidation do
     :ok
   end
 
+  # The winner is the OLDEST live member, NOT the longest one, and that is a security
+  # property rather than an editorial preference. Every input to a duplicate group is
+  # writable by any agent-role key: it can pick a title that collides under `@title_key_sql`
+  # (or an `idempotency_key` that does), and it can pick a body — so with longest-wins it
+  # could retire an established published article simply by publishing a longer near-copy
+  # beside it and waiting two nights. Content corroboration does not stop that; the
+  # corroborating content is the attacker's own. Age is the one input a later writer cannot
+  # manufacture, so keeping the earliest capture makes "write beside it" a way to unpublish
+  # YOUR OWN article and nobody else's.
+  #
+  # It also matches what the class means: `duplicate_capture` is one thing captured twice,
+  # and the duplicate is the second capture. The cost is that a fuller re-capture loses to
+  # the stub it duplicates — bounded, because the unpublish is reversible and the fuller
+  # text survives as a draft.
   defp apply_live_group(tenant_id, proposal, live, budget) do
     [winner | all_losers] =
       Enum.sort_by(live, fn a ->
-        {-a.body_len, -DateTime.to_unix(a.updated_at, :microsecond), a.id}
+        {DateTime.to_unix(a.inserted_at, :microsecond), -a.body_len, a.id}
       end)
 
     # Drained as far as the budget goes, not skipped whole: the winner is never a candidate
@@ -1199,7 +1249,12 @@ defmodule Loopctl.Knowledge.Consolidation do
             "#{length(ids)} published articles are the same capture under #{reason}. " <>
               "The novelty gate does not catch this: novelty scoring and idempotency are separate paths.",
           suggested_action:
-            "Keep the richest article and UNPUBLISH the rest — do not archive them. " <>
+            "Keep the EARLIEST capture and UNPUBLISH every later one — not the richest, and " <>
+              "do not archive them. Age is the one input a later writer cannot manufacture, " <>
+              "so keeping the oldest is what stops a longer near-copy written beside an " <>
+              "established article from retiring it. This is the rule the nightly pass " <>
+              "applies, so a hand-applied remedy that keeps a different member will be " <>
+              "re-fought by it. " <>
               "`:archived` is TERMINAL for an article: `Article`'s transition table has no " <>
               "`{:archived, _}` and there is no unarchive function, so the only way back is a " <>
               "`user+` PATCH carrying an explicit status. `{:published, :draft}` and " <>
@@ -1317,9 +1372,26 @@ defmodule Loopctl.Knowledge.Consolidation do
   # title-drift group may only survive if its members are also similar in content. The
   # threshold sits in the empty band between the two measured populations.
   #
-  # It applies to the TITLE signal only. `idempotency_drift_groups/1` matches on a key the
-  # WRITER supplied for exactly this purpose, which is real evidence of one capture written
-  # twice; a title is an accident of whatever the source file was called.
+  # It applies to BOTH forming signals, and the IDEMPOTENCY exemption it used to carry is
+  # gone. That exemption read: a key the WRITER supplied to mark one capture is direct
+  # evidence of one capture written twice, unlike a title, which is an accident of whatever
+  # the source file was called. The premise holds for ONE writer. It does not hold in a
+  # tenant where any agent-role key may publish an article and choose its own
+  # `idempotency_key`: the key is then caller-controlled data and the group can span two
+  # unrelated writers, so an uncorroborated idempotency group is a way to have a published
+  # article retired by writing one beside it. Requiring content evidence for both signals
+  # means an auto-unpublish always rests on what the articles SAY, never only on a key one
+  # of them declared. "Confirmed" then means one thing for the whole class, rather than two
+  # things depending on which query formed the group.
+  #
+  # Corroboration alone does NOT close that shape, because the corroborating content is the
+  # same party's to write — `apply_live_group/4` deciding the winner by AGE is what does.
+  #
+  # The cost is real and was the exemption's second argument: a tenant with no embeddings
+  # (mandatory BYO) now has its idempotency groups WITHHELD rather than applied. That is
+  # the safe direction — the proposal is still reported, nothing is unpublished, and the
+  # withhold self-clears the moment vectors exist. Title drift has always behaved exactly
+  # this way for those tenants.
   #
   # FAILS CLOSED on missing evidence, and the withhold is SELF-CLEARING: an article with no
   # embedding where this tenant keeps them (`score_source/1`; the corpus has had 80 such
@@ -1327,29 +1399,25 @@ defmodule Loopctl.Knowledge.Consolidation do
   # its whole group rather than letting it pass on a partial sample, and the missing vectors
   # are enqueued (`backfill_missing_embeddings/2`) so the next run can decide instead of
   # withholding the same group forever.
-  # An IDEMPOTENCY-drift group is exempt. Its members collide on a key the WRITER supplied to
-  # mark one capture, which is direct evidence of one capture written twice; a title is an
-  # accident of whatever the source file happened to be called. Gating the idempotency signal
-  # on vectors would also make the whole class depend on embeddings, and a tenant with no
-  # embedding key (mandatory BYO) has none at all.
   #
   # Scored over the LIVE members, never the scan-time id set, so what is checked is the group
   # that would actually be unpublished.
   defp corroborated?(proposal, live, scored) do
-    if title_drift?(proposal) do
-      # Sorted so the entry a group resolves to is deterministic, and looked up by ANY live
-      # member rather than by the smallest id: the batch is scored once over the union of
-      # every confirmed proposal's SCAN-time ids, so the smallest member of THIS group may
-      # have been unpublished by an earlier group in the same reduce.
-      ids = live |> Enum.map(& &1.id) |> Enum.sort()
-      judge_similarity(lookup_score(scored, ids), ids)
-    else
-      :ok
-    end
+    # Sorted so the entry a group resolves to is deterministic, and looked up by ANY live
+    # member rather than by the smallest id: the batch is scored once over the union of
+    # every confirmed proposal's SCAN-time ids, so the smallest member of THIS group may
+    # have been unpublished by an earlier group in the same reduce.
+    ids = live |> Enum.map(& &1.id) |> Enum.sort()
+    judge_similarity(lookup_score(scored, ids, drift_signal(proposal)), ids)
   end
 
-  defp lookup_score(:unavailable, _ids), do: :unavailable
-  defp lookup_score(scored, ids), do: Enum.find_value(ids, &Map.get(scored, &1))
+  # Keyed by `{signal, member_id}`, never by member id alone: one article can belong to a
+  # title group AND an idempotency group, and the two are scored under different grouping
+  # keys. A flat member key would let one group's `min_sim` answer for the other's.
+  defp lookup_score(:unavailable, _ids, _signal), do: :unavailable
+
+  defp lookup_score(scored, ids, signal),
+    do: Enum.find_value(ids, &Map.get(scored, {signal, &1}))
 
   # FAILS CLOSED on missing evidence, checked against THIS group's scored MEMBER set — never
   # against a pair COUNT, which was counted over the whole batch while the live ids are one
@@ -1376,12 +1444,18 @@ defmodule Loopctl.Knowledge.Consolidation do
   end
 
   # The three withholds have different remedies, so they say different things: a low cosine is
-  # a verdict, missing vectors are a gap this run just enqueued, and a failed read is neither.
+  # a verdict, missing vectors are a gap, and a failed read is neither. What this line does
+  # NOT claim any more is that a backfill was enqueued — it runs BEFORE
+  # `backfill_missing_embeddings/2` decides, and on a tenant with no BYO embedding key (or
+  # whose members carry a truncation-marked PREFIX hash) nothing is enqueued at all. Saying
+  # "backfill enqueued" there made a PERMANENT configuration state read as a transient gap,
+  # which is the exact misreading that module comment exists to prevent. The enqueue owns
+  # its own statement, in all three of its outcomes.
   defp log_uncorroborated(tenant_id, proposal, _live, :unavailable, _unscored) do
     Logger.warning(
       "Consolidation: tenant=#{tenant_id} WITHHELD duplicate_capture proposal " <>
         "##{proposal.number} from auto-apply — similarity scoring failed this run, so there " <>
-        "is no content evidence to judge the title collision on. Reported, not applied. No " <>
+        "is no content evidence to judge the collision on. Reported, not applied. No " <>
         "backfill enqueued: the cause is a failed read, not a missing vector."
     )
   end
@@ -1390,55 +1464,69 @@ defmodule Loopctl.Knowledge.Consolidation do
     detail =
       case {entry, unscored} do
         {_entry, [_ | _] = missing} ->
-          "#{length(missing)} member(s) carry no embedding; backfill enqueued"
+          "#{length(missing)} member(s) carry no embedding"
 
         {%{min_sim: sim, pairs: pairs}, []} ->
           "min cosine #{Float.round(sim, 4)} across #{pairs} scored pair(s), threshold " <>
             "#{min_duplicate_similarity()}"
       end
 
+    key =
+      case drift_signal(proposal) do
+        :title -> "normalized title"
+        :idempotency -> "normalized idempotency key"
+      end
+
     Logger.warning(
       "Consolidation: tenant=#{tenant_id} WITHHELD duplicate_capture proposal " <>
         "##{proposal.number} from auto-apply — #{length(live)} live members share a " <>
-        "normalized title but their bodies do not corroborate it (#{detail}). Reported, " <>
-        "not applied. A shared title is not evidence of a duplicate capture."
+        "#{key} but their bodies do not corroborate it (#{detail}). Reported, not applied. " <>
+        "A shared key is not evidence of a duplicate capture."
     )
   end
 
   # The rationale is the only place the forming signal survives onto the persisted proposal
-  # row, so both sites interpolate the phrase from the same attribute and the test is for the
-  # EXEMPTION, never for the gate. A rationale this cannot classify (reworded, truncated,
-  # non-binary) is GATED: a copy edit can only make this pass more conservative, never
-  # silently turn off the one content check on the class that writes to `articles`.
-  defp title_drift?(%{rationale: rationale}) when is_binary(rationale),
-    do: not String.contains?(rationale, @idempotency_drift)
-
-  defp title_drift?(_proposal), do: true
-
-  # Restricted to the CANDIDATE ids, never the whole corpus: the self-join is over the few
-  # hundred articles that already collided on a normalized title, so this adds a small join
-  # rather than a second 79k-row scan.
+  # row, so both sites interpolate the phrase from the same attribute rather than repeating a
+  # literal. It no longer selects WHETHER a group must corroborate — both signals must — only
+  # which normalized key its members are re-checked and scored under.
   #
-  # Keyed by EVERY scored member, so a caller can resolve its group from any live id it still
-  # has. The grouping expression is the SAME normalized title that formed the group
-  # (`@title_key_sql`, referenced from both sites so they cannot drift), and each entry
-  # carries the member set it scored so the caller can tell a low cosine from a missing one.
-  defp pairwise_similarity_by_group(_tenant_id, []), do: %{}
-
-  defp pairwise_similarity_by_group(tenant_id, ids) do
-    tenant_id
-    |> title_pairs(ids)
-    |> score_pairs(score_source(tenant_id))
-    |> heavy_all(tenant_id)
-    |> index_by_member()
+  # A rationale this cannot classify (reworded, truncated, non-binary) reads as `:title`, and
+  # that is still the conservative answer: the two signals are scored under different keys,
+  # so a misread looks the group up under a key it did not form on, finds no entry, and
+  # WITHHOLDS. A copy edit can cost an apply; it cannot buy one.
+  defp drift_signal(%{rationale: rationale}) when is_binary(rationale) do
+    if String.contains?(rationale, @idempotency_drift), do: :idempotency, else: :title
   end
 
-  defp title_pairs(tenant_id, ids) do
+  defp drift_signal(_proposal), do: :title
+
+  # Restricted to the CANDIDATE ids, never the whole corpus: the self-join is over the few
+  # hundred articles that already collided on a normalized key, so this adds a small join
+  # rather than a second 79k-row scan.
+  #
+  # Keyed by `{signal, EVERY scored member}`, so a caller can resolve its group from any live
+  # id it still has without a title group answering for an idempotency one. The join
+  # predicate and the grouping expression are the SAME normalized key that formed the group
+  # (`@title_key_sql` / `@idempotency_key_sql`, referenced from the deriving query and from
+  # here so they cannot drift), and each entry carries the member set it scored so the caller
+  # can tell a low cosine from a missing one.
+  defp pairwise_similarity_by_group(_tenant_id, [], _signal), do: %{}
+
+  defp pairwise_similarity_by_group(tenant_id, ids, signal) do
+    tenant_id
+    |> pair_candidates(ids, signal)
+    |> score_pairs(score_source(tenant_id))
+    |> group_by_signal(signal)
+    |> heavy_all(tenant_id)
+    |> index_by_member(signal)
+  end
+
+  # `a2` binds tenant_id to the PASSED tenant_id, not transitively to `a1`'s. HeavyRead runs
+  # on a BYPASSRLS pool and its guard requires every base-table source to carry its own
+  # conjunctive equality — a transitive one is not checkable by inspecting the query. It
+  # carries the visibility guard for the same reason `a1` does (`shared_only/1`).
+  defp pair_candidates(tenant_id, ids, :title) do
     from(a1 in published_base(tenant_id),
-      # `a2` binds tenant_id to the PASSED tenant_id, not transitively to `a1`'s. HeavyRead
-      # runs on a BYPASSRLS pool and its guard requires every base-table source to carry its
-      # own conjunctive equality — a transitive one is not checkable by inspecting the query.
-      # It carries the visibility guard for the same reason `a1` does (`shared_only/1`).
       join: a2 in Article,
       on:
         a2.tenant_id == ^tenant_id and a2.status == :published and a1.id < a2.id and
@@ -1447,6 +1535,39 @@ defmodule Loopctl.Knowledge.Consolidation do
       where: a1.id in ^ids and a2.id in ^ids
     )
   end
+
+  # The idempotency twin. The NOT NULL guards mirror `idempotency_drift_groups/1`'s `where`:
+  # SQL would make the key comparison NULL rather than false, but a member whose key was
+  # cleared since the scan is no longer a member the scan would find, and scoring it here
+  # would judge a group the derivation no longer derives.
+  defp pair_candidates(tenant_id, ids, :idempotency) do
+    from(a1 in published_base(tenant_id),
+      join: a2 in Article,
+      on:
+        a2.tenant_id == ^tenant_id and a2.status == :published and a1.id < a2.id and
+          shared_visibility(a2.metadata) and
+          not is_nil(a2.idempotency_key) and
+          fragment(
+            unquote(@idempotency_key_sql <> " = " <> @idempotency_key_sql),
+            a1.idempotency_key,
+            a2.idempotency_key
+          ),
+      where: a1.id in ^ids and a2.id in ^ids,
+      where: not is_nil(a1.idempotency_key)
+    )
+  end
+
+  # Applied AFTER `score_pairs/2` so the aggregate select is written once for both signals.
+  # Positional bindings are unaffected by the embedding joins `score_pairs/2` may append —
+  # `a1`/`a2` stay first.
+  defp group_by_signal(query, :title),
+    do: from([a1, _a2] in query, group_by: fragment(unquote(@title_key_sql), a1.title))
+
+  defp group_by_signal(query, :idempotency),
+    do:
+      from([a1, _a2] in query,
+        group_by: fragment(unquote(@idempotency_key_sql), a1.idempotency_key)
+      )
 
   # WHERE this tenant's vectors live, branched exactly like every other embedding-presence
   # reader in this codebase (`KnowledgeLintWorker.embedded_ids/2`,
@@ -1476,7 +1597,6 @@ defmodule Loopctl.Knowledge.Consolidation do
         not like(coalesce(a1.embedding_content_hash, ""), ^ShrinkLadder.truncated_hash_pattern()),
       where:
         not like(coalesce(a2.embedding_content_hash, ""), ^ShrinkLadder.truncated_hash_pattern()),
-      group_by: fragment(unquote(@title_key_sql), a1.title),
       select: %{
         min_sim: min(fragment("1 - (? <=> ?)", a1.embedding, a2.embedding)),
         pairs: count(a1.id),
@@ -1496,7 +1616,6 @@ defmodule Loopctl.Knowledge.Consolidation do
         not like(coalesce(e1.embedding_content_hash, ""), ^ShrinkLadder.truncated_hash_pattern()),
       where:
         not like(coalesce(e2.embedding_content_hash, ""), ^ShrinkLadder.truncated_hash_pattern()),
-      group_by: fragment(unquote(@title_key_sql), a1.title),
       select: %{
         min_sim: min(fragment("1 - (? <=> ?)", e1.embedding, e2.embedding)),
         pairs: count(a1.id),
@@ -1506,11 +1625,11 @@ defmodule Loopctl.Knowledge.Consolidation do
     )
   end
 
-  defp index_by_member(rows) do
+  defp index_by_member(rows, signal) do
     rows
     |> Enum.flat_map(fn %{min_sim: sim, pairs: pairs, members: members} ->
       entry = %{min_sim: to_float(sim), pairs: pairs, scored: MapSet.new(members)}
-      Enum.map(members, &{&1, entry})
+      Enum.map(members, &{{signal, &1}, entry})
     end)
     |> Map.new()
   end
@@ -1747,14 +1866,20 @@ defmodule Loopctl.Knowledge.Consolidation do
   end
 
   # Every evidence entry carries the SAME key set, whichever branch produced it — the full
-  # one from `evidence_map/2`, this blank, or a redaction. A caller reading
-  # `entry["idempotency_key"]` should get `nil` for an unresolvable article, not a
-  # KeyError-shaped absence that varies by which article in one response it asked about.
+  # one from `evidence_map/2`, this blank, or a redaction. A caller reading `entry["title"]`
+  # should get `nil` for an unresolvable article, not a KeyError-shaped absence that varies
+  # by which article in one response it asked about.
+  #
+  # `idempotency_key` is NOT among those keys. It is write-side capture identity a caller
+  # chose for itself, which is why it was removed from every article payload — and the
+  # consolidation report is a payload like any other: it is served to any orchestrator+ key
+  # for the exact article groups this pass grouped BY that key, and prior-day reports stay
+  # addressable forever via `?day=`. Nothing on the apply path reads it; the grouping is
+  # re-derived in SQL (`pair_candidates/3`).
   defp blank_evidence(article_id) do
     %{
       "article_id" => article_id,
       "title" => nil,
-      "idempotency_key" => nil,
       "excerpt" => ""
     }
   end
@@ -1779,7 +1904,6 @@ defmodule Loopctl.Knowledge.Consolidation do
       select: %{
         id: a.id,
         title: a.title,
-        idempotency_key: a.idempotency_key,
         body: fragment("left(?, ?)", a.body, ^@excerpt_source_chars)
       }
     )
@@ -1790,7 +1914,6 @@ defmodule Loopctl.Knowledge.Consolidation do
        %{
          "article_id" => row.id,
          "title" => row.title,
-         "idempotency_key" => row.idempotency_key,
          "excerpt" => excerpt(row.body)
        }}
     end)
@@ -1820,20 +1943,27 @@ defmodule Loopctl.Knowledge.Consolidation do
     end)
   end
 
+  # The live branch also DROPS `idempotency_key`, which reaches this function only from a
+  # report persisted before the key stopped being copied into evidence. Read-time is where
+  # those rows are served from, so it is the only seam that covers them — a report from
+  # `?day=` two weeks ago goes out under today's rule, not the rule in force when it ran.
   defp redact_entry(%{"article_id" => id} = entry, live) do
     if MapSet.member?(live, id) do
-      entry
+      Map.delete(entry, "idempotency_key")
     else
       %{
         "article_id" => id,
         "title" => nil,
-        "idempotency_key" => nil,
         "excerpt" => "",
         "redacted" => true
       }
     end
   end
 
+  # Catch-all for an entry shape that carries no `article_id` (only a legacy/persisted one
+  # can). It cannot be liveness-checked, but it must not be the one path that serves an
+  # `idempotency_key` back: read-time redaction is unconditional or it is not a rule.
+  defp redact_entry(entry, _live) when is_map(entry), do: Map.delete(entry, "idempotency_key")
   defp redact_entry(entry, _live), do: entry
 
   # Liveness for redaction is "the article still exists and is recoverable" — NOT "still
