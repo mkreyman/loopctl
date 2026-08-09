@@ -100,6 +100,25 @@ defmodule Loopctl.Knowledge.IngestionHealthTest do
       assert IngestionHealth.detect() |> Enum.filter(&(&1.tenant_id == tenant.id)) == []
     end
 
+    test "an EMPTY monitored list retires the detector — no candidate, however stale" do
+      # `config/config.exs` ships `monitored_source_types: []` to retire capture_silence
+      # (owner decision): the signal cannot distinguish a one-off harvest that FINISHED
+      # from a standing feed that BROKE, and every anomaly it raised on this corpus was a
+      # completed import. `[]` must mean "monitor nothing", NOT fall back to `:all` —
+      # `filter_source_types/2`'s list clause builds `source_type in ^[]`, which matches
+      # no row. Without this test the retirement is one `Keyword.get` default away from
+      # silently reverting.
+      tenant = fixture(:tenant)
+      for _ <- 1..10, do: captured(tenant.id, "session_log", @stale_hours)
+
+      assert IngestionHealth.detect(%{
+               monitored_source_types: [],
+               established_threshold: 3,
+               staleness_threshold_hours: 72
+             })
+             |> Enum.filter(&(&1.tenant_id == tenant.id)) == []
+    end
+
     test "honors an explicit config passed to detect/1" do
       tenant = fixture(:tenant)
       for _ <- 1..3, do: captured(tenant.id, "session_log", @stale_hours)

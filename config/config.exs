@@ -240,7 +240,21 @@ config :loopctl,
 # `:reject_window_days` is the rolling window (days) over the `ingestion_write_stats`
 # rollup the reject-rate scan reads.
 config :loopctl, :ingestion_health,
-  monitored_source_types: :all,
+  # capture_silence is RETIRED (owner decision, 2026-08-09): an empty list monitors no
+  # source_type, so `IngestionHealth.detect/0` yields no candidates and the worker flags
+  # nothing. It scopes that detector ONLY — `:high_reject_rate` and `:sweep_stalled` are
+  # separate detectors with their own config and are unaffected.
+  #
+  # Why retire rather than tune: the signal cannot tell a ONE-OFF HARVEST that finished
+  # from a standing feed that broke, and this corpus is built by harvests. Every anomaly
+  # it ever raised (web_article, interview, requirements, repo, newsletter — 5 rows,
+  # 23-31 days stale) was a completed import, so the detector was 100% false-positive
+  # here while `session_log`, the only continuous producer, never tripped it.
+  #
+  # To re-enable for a source that IS a standing feed, name it explicitly rather than
+  # going back to `:all` — e.g. `["session_log"]`. That is the shape this detector is
+  # actually good at.
+  monitored_source_types: [],
   established_threshold: 5,
   staleness_threshold_hours: 72,
   establishment_window_hours: 720,
