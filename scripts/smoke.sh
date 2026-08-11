@@ -36,6 +36,21 @@ SMOKE_MAX_MS="${SMOKE_MAX_MS:-5000}"
 # (an outbound LLM call, ~1-3s), so they get a wider budget than the pure DB paths.
 SMOKE_EMBED_MAX_MS="${SMOKE_EMBED_MAX_MS:-8000}"
 KEY="${LOOPCTL_SMOKE_KEY:-}"
+# Connection-level retry (#652). A check that comes back 000 never reached the app —
+# DNS, connect, or timeout — so it says nothing about the release under test. The app
+# runs with autostop, so a quiet period means the first probe after a deploy can pay a
+# cold start, and a transient network path between the runner and the edge produces the
+# same signature. Both turned master red against a demonstrably healthy release on
+# 2026-08-11: all 8 checks reported 000 while the app was serving its own health check
+# every 10s throughout the window.
+# ONLY 000 is retried. A wrong STATUS (500, 404, 401-where-200-expected) is a real
+# finding about the release and fails on the first attempt — retrying those is how a
+# detector turns into a lie.
+SMOKE_CONNECT_RETRIES="${SMOKE_CONNECT_RETRIES:-3}"
+SMOKE_RETRY_DELAY_SECS="${SMOKE_RETRY_DELAY_SECS:-5}"
+# Warmup budget: how long to wait for the release to answer AT ALL before judging it.
+# Set to 0 to skip (useful when probing a known-warm host).
+SMOKE_WARMUP_SECS="${SMOKE_WARMUP_SECS:-60}"
 
 # ✓ / ⚠ / ✗ markers.
 OK="✓"
@@ -91,16 +106,34 @@ http() {
   local out
   # --max-time gives curl a hard ceiling a few seconds above the widest per-check
   # latency budget so a hung endpoint can't stall the whole run.
-  if out=$(curl -sS -X "$method" \
-      -o "$BODY" -D "$HDRS" \
-      -w '%{http_code} %{time_total}' \
-      --max-time "$CURL_MAX_SECS" \
-      "$@" \
-      "$url" 2>/dev/null); then
-    :
-  else
-    out="000 0"
-  fi
+  local attempt=1
+  while :; do
+    if out=$(curl -sS -X "$method" \
+        -o "$BODY" -D "$HDRS" \
+        -w '%{http_code} %{time_total}' \
+        --max-time "$CURL_MAX_SECS" \
+        "$@" \
+        "$url" 2>/dev/null); then
+      :
+    else
+      out="000 0"
+    fi
+
+    # Retry ONLY a connection-level failure, and only while attempts remain. Any real
+    # HTTP status — including a bad one — is the answer we came for; return it at once.
+    case "${out%% *}" in
+      000)
+        if [ "${HTTP_NO_RETRY:-0}" != "1" ] && [ "$attempt" -lt "$SMOKE_CONNECT_RETRIES" ]; then
+          printf '  … %s %s did not connect (attempt %d/%d), retrying in %ss\n' \
+            "$method" "$url" "$attempt" "$SMOKE_CONNECT_RETRIES" "$SMOKE_RETRY_DELAY_SECS" >&2
+          sleep "$SMOKE_RETRY_DELAY_SECS"
+          attempt=$((attempt + 1))
+          continue
+        fi
+        ;;
+    esac
+    break
+  done
   HTTP_CODE="${out%% *}"
   local secs="${out##* }"
   TIME_MS="$(awk -v t="$secs" 'BEGIN { printf "%d", t * 1000 }')"
@@ -186,6 +219,11 @@ echo "loopctl post-deploy smoke — ${BASE_URL} (budget ${SMOKE_MAX_MS}ms; embed
 # on the first attempt.
 wait_for_health() {
   local attempt=1 max=10 delay=1
+  # This loop IS the connection retry for /health, so the inner per-request retry is
+  # suppressed here (#652). Leaving both on multiplies them — 10 outer attempts x
+  # SMOKE_CONNECT_RETRIES inner x the curl ceiling is a multi-minute stall on a host
+  # that is simply unreachable, which is the case this loop exists to end quickly.
+  local HTTP_NO_RETRY=1
   while [ "$attempt" -le "$max" ]; do
     http GET "$BASE_URL/health"
     if [ "$HTTP_CODE" = "200" ]; then

@@ -227,3 +227,39 @@ release never breaks, and so a rollback is always safe:
 Rule of thumb: **a rollback to the previous release must succeed against the
 current database at all times.** If a migration would break the old release,
 it's not expand–contract — split it.
+
+## Pre-deploy smoke (#652) — and why the post-deploy one is not a required check
+
+There are now TWO smoke jobs running the same `scripts/smoke.sh`:
+
+| Job | Runs on | Probes | Can be a required check? |
+|---|---|---|---|
+| `Pre-deploy Smoke (current release)` | every PR + every master push | the release already live | **yes** |
+| `Post-deploy Smoke` | master push, after deploy | the release just shipped | **no** |
+
+The post-deploy job cannot be made a required branch-protection check. It only runs on a
+master push, i.e. *after* the merge, so it never reports on a PR's head SHA — adding it to
+required checks blocks every PR forever waiting for a check that will never arrive. The
+pre-deploy job exists to be the required one, and `deploy` now `needs:` it, so a release
+never lands on top of a production that is already failing its own smoke.
+
+**Be clear about what pre-deploy proves.** It probes the CURRENTLY-LIVE release, not the
+code in the PR, so it does not validate your diff. It catches, at PR time: production
+already broken; `smoke.sh` itself broken or its key expired/under-privileged; and the
+runner being unable to reach the app at all.
+
+## Connection retry (#652)
+
+`http()` retries **only** an `HTTP 000` — a connection-level failure (DNS, connect,
+timeout) that never reached the app and therefore says nothing about the release. A wrong
+*status* (500, 404, a 401 where 200 was expected) is a real finding and fails on the first
+attempt; retrying those is how a detector becomes a lie.
+
+Knobs: `SMOKE_CONNECT_RETRIES` (default 3), `SMOKE_RETRY_DELAY_SECS` (default 5).
+`wait_for_health` sets `HTTP_NO_RETRY=1` for its own loop — it already owns a 10-attempt
+backoff, and letting both run multiplies into a multi-minute stall on an unreachable host.
+
+Why this was added: on 2026-08-11 all 8 checks reported `HTTP 000` on two consecutive runs
+against a release that was demonstrably healthy — the app served its own Fly health check
+every 10s throughout both windows, and the identical script passed from a workstation
+seconds later. A detector that goes red on network weather is one people learn to ignore.
