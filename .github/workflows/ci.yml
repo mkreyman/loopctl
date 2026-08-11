@@ -891,13 +891,49 @@ jobs:
             echo "::warning::could not drop $SCALE_DB — reclaim it by hand."
           fi
 
+  # --- Pre-deploy smoke (#652) -------------------------------------------------
+  #
+  # Runs the SAME scripts/smoke.sh against the CURRENTLY-LIVE release, on every PR and
+  # every master push, BEFORE deploy. It exists because the post-deploy smoke below can
+  # only ever tell you something is wrong AFTER the bad release is serving traffic —
+  # "we find out late" — and, running only on master push, it can never report on a PR
+  # head SHA, so it CANNOT be made a required branch-protection check without
+  # deadlocking every merge (a required check that never runs on the PR blocks it
+  # forever). This job can, because it runs on pull_request.
+  #
+  # BE CLEAR ABOUT WHAT IT PROVES. It probes the release already in production, NOT the
+  # code in the PR, so it does not validate your diff. What it does catch, at PR time
+  # instead of post-deploy:
+  #   * production is ALREADY broken — do not deploy on top of it;
+  #   * scripts/smoke.sh itself is broken, or its key/secret has expired or lost the
+  #     privileges the checks need — the detector failing silently is how you end up
+  #     trusting a green that means nothing;
+  #   * the runner cannot reach the app at all, which is exactly the 2026-08-11 failure
+  #     (8/8 checks at HTTP 000 against a demonstrably healthy release).
+  #
+  # It does NOT need the deploy credentials — read-only probes with a low-privilege key.
+  smoke-preflight:
+    name: Pre-deploy Smoke (current release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Run smoke against the live release
+        env:
+          BASE_URL: https://loopctl.com
+          LOOPCTL_SMOKE_KEY: ${{ secrets.LOOPCTL_SMOKE_KEY }}
+        run: bash scripts/smoke.sh
+
   deploy:
     name: Deploy
     runs-on: ubuntu-latest
     # pgbouncer-e2e gates deploy (US-27.13): it is the only check that exercises the pgbouncer
     # layer, so a reintroduced pgbouncer-incompatible config must block the deploy, not just
     # go red advisorily.
-    needs: [lint, test, security, dialyzer, pgbouncer-e2e, retrieval-eval]
+    needs: [lint, test, security, dialyzer, pgbouncer-e2e, retrieval-eval, smoke-preflight]
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     steps:
       - uses: actions/checkout@v4
