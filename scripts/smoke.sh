@@ -51,6 +51,13 @@ SMOKE_RETRY_DELAY_SECS="${SMOKE_RETRY_DELAY_SECS:-5}"
 # Warmup budget: how long to wait for the release to answer AT ALL before judging it.
 # Set to 0 to skip (useful when probing a known-warm host).
 SMOKE_WARMUP_SECS="${SMOKE_WARMUP_SECS:-60}"
+# IP version pin. loopctl.com publishes BOTH an A and a AAAA record (Fly gives the app a
+# dedicated v4 and v6 ingress). A host that has an IPv6 address configured but no working
+# IPv6 ROUTE — the normal shape of a GitHub Actions runner — can stall on the v6 attempt
+# instead of falling back, which surfaces as HTTP 000 on every check against an app that
+# is demonstrably healthy from anywhere else. Pinning v4 removes that whole class.
+# Set SMOKE_IP_VERSION="" to let curl choose, or "-6" to force v6.
+SMOKE_IP_VERSION="${SMOKE_IP_VERSION:--4}"
 
 # ✓ / ⚠ / ✗ markers.
 OK="✓"
@@ -108,7 +115,7 @@ http() {
   # latency budget so a hung endpoint can't stall the whole run.
   local attempt=1
   while :; do
-    if out=$(curl -sS -X "$method" \
+    if out=$(curl -sS ${SMOKE_IP_VERSION:+"$SMOKE_IP_VERSION"} -X "$method" \
         -o "$BODY" -D "$HDRS" \
         -w '%{http_code} %{time_total}' \
         --max-time "$CURL_MAX_SECS" \
