@@ -364,6 +364,107 @@ defmodule Loopctl.ObanConfig do
     validate_cron(System.get_env("STH_SWEEP_CRON"), @default_sth_sweep_cron)
   end
 
+  # --- Parked crons (#249: KB job audit, 2026-08-11) ------------------------------
+  #
+  # Workers whose SCHEDULE is dormant by default while their CODE stays intact. Each
+  # earned this by running green and doing nothing — the audit's "level 1" failure,
+  # which no success rate can surface:
+  #
+  #   * The three agent-memory sweeps (MemoryPromotionSweep, MemoryGraduationSweep,
+  #     SessionMemoryPrune) swept an EMPTY tier — production held 0 memories, 0
+  #     session_memories and 0 promotions at audit time, because nothing in the fleet
+  #     calls `memory_remember`. That is ~3,180 no-op executions per week.
+  #   * PromotionEvalWorker scored the memory promoter against a committed 3-session
+  #     labeled dataset. With the tier empty the series is FROZEN — identical
+  #     precision 0.75 / recall 1.0 every day — so it spends 3 LLM extraction calls
+  #     daily to reprint a constant. A frozen metric is a fixture, not a measurement.
+  #   * IngestionHealthWorker's only detector (`capture_silence`) was retired in #641
+  #     as 100% false-positive on this corpus, leaving the hourly run with nothing to
+  #     compute.
+  #
+  # PARKED, NOT DELETED, and specifically not deleted for the memory tier: graduation
+  # is the one knowledge writer here that is DEMAND-gated (a memory graduates to an
+  # article only after >= `:memory_graduation_recall_threshold` healthy recalls),
+  # which is the exact inverse of the supply-driven harvest that diluted the corpus
+  # to a 1.2% read rate. It is worth reviving the moment something writes memories —
+  # so it must stay one env var away, not one archaeology expedition away.
+  #
+  # Revive with `fly secrets set OBAN_UNPARK_CRONS=Elixir.Loopctl.Workers.X,... &&
+  # restart` — no deploy, mirroring `STH_SWEEP_CRON`. Names are matched as full module
+  # atoms; `inspect/1` form (`Loopctl.Workers.X`) is accepted too.
+  @parked_crons [
+    Loopctl.Workers.MemoryPromotionSweepWorker,
+    Loopctl.Workers.MemoryGraduationSweepWorker,
+    Loopctl.Workers.SessionMemoryPruneWorker,
+    Loopctl.Workers.PromotionEvalWorker,
+    Loopctl.Workers.IngestionHealthWorker
+  ]
+
+  @doc """
+  The workers whose crontab entries are dormant by default (see the module note).
+
+  Returned as a list so callers/tests can assert the parked set without reaching into
+  a module attribute.
+  """
+  @spec parked_crons() :: [module()]
+  def parked_crons, do: @parked_crons
+
+  @doc """
+  The subset of `parked_crons/0` an operator has revived via `OBAN_UNPARK_CRONS`.
+
+  Accepts a comma-separated list of module names in either `Elixir.Loopctl.Workers.X`
+  or `Loopctl.Workers.X` form. Unknown or non-parked names RAISE rather than being
+  ignored: a typo'd revive that silently leaves the worker parked is precisely the
+  silent-no-op failure this parking exists to make visible.
+  """
+  @spec unparked_crons() :: [module()]
+  def unparked_crons, do: parse_unparked(System.get_env("OBAN_UNPARK_CRONS"))
+
+  @doc """
+  Pure parser behind `unparked_crons/0` — resolves a raw `OBAN_UNPARK_CRONS` value.
+
+  Public so the parking behaviour can be tested WITHOUT `System.put_env`, which is
+  VM-global and would race every other async test in the suite.
+  """
+  @spec parse_unparked(String.t() | nil) :: [module()]
+  def parse_unparked(nil), do: []
+
+  def parse_unparked(value) when is_binary(value) do
+    value
+    |> String.split(",", trim: true)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.map(&resolve_parked_worker/1)
+  end
+
+  # Matches by STRING against the parked list — never String.to_existing_atom/1, which
+  # would raise on an unloaded module and make a typo indistinguishable from a name that
+  # simply has not been compiled yet.
+  defp resolve_parked_worker(name) do
+    normalized = if String.starts_with?(name, "Elixir."), do: name, else: "Elixir." <> name
+
+    Enum.find(@parked_crons, fn worker -> Atom.to_string(worker) == normalized end) ||
+      raise ArgumentError,
+            "OBAN_UNPARK_CRONS names #{inspect(name)}, which is not a parked cron. " <>
+              "Parked workers are: #{inspect(@parked_crons)}"
+  end
+
+  # Drops every parked worker's entry from `crontab` unless it has been revived via
+  # OBAN_UNPARK_CRONS. Entries are `{schedule, worker}` or `{schedule, worker, opts}`.
+  @doc """
+  Drops every parked worker's entry from `crontab` unless it appears in `unparked`.
+
+  Entries are `{schedule, worker}` or `{schedule, worker, opts}`. `unparked` is an
+  explicit parameter (rather than an internal `unparked_crons/0` call) so tests can
+  exercise both the parked and revived shapes purely.
+  """
+  @spec reject_parked([tuple()], [module()]) :: [tuple()]
+  def reject_parked(crontab, unparked \\ unparked_crons()) do
+    dormant = @parked_crons -- unparked
+
+    Enum.reject(crontab, fn entry -> elem(entry, 1) in dormant end)
+  end
+
   defp validate_cron(nil, default), do: default
 
   defp validate_cron(value, _default) when is_binary(value) do
@@ -398,113 +499,115 @@ defmodule Loopctl.ObanConfig do
   def plugins do
     [
       {Oban.Plugins.Cron,
-       crontab: [
-         {"0 * * * *", Loopctl.Workers.IdempotencyCleanupWorker},
-         {"0 * * * *", Loopctl.Workers.BulkDeleteTokenCleanupWorker},
-         {"0 * * * *", Loopctl.Workers.ReauthChallengeCleanupWorker},
-         {"0 2 * * *", Loopctl.Workers.AuditPartitionWorker},
-         {"0 2 * * *", Loopctl.Workers.CostRollupWorker},
-         {"0 3 * * *", Loopctl.Workers.WebhookCleanupWorker},
-         {"0 3 * * 0", Loopctl.Workers.TokenDataArchivalWorker},
-         {"0 4 * * *", Loopctl.Workers.KnowledgeLintWorker, args: %{"mode" => "all_tenants"}},
-         {"0 5 * * 0", Loopctl.Workers.KnowledgeMocWorker, args: %{"mode" => "all_tenants"}},
-         {"30 4 * * *", Loopctl.Workers.RetrievalMetricsWorker, args: %{"mode" => "all_tenants"}},
-         # Daily promotion-compile-quality eval (Epic 29 / US-29.5): precision/recall of
-         # Loopctl.Memory.Promoter against the committed labeled dataset. Calibration/
-         # observability only — never gates promotion.
-         {"45 4 * * *", Loopctl.Workers.PromotionEvalWorker, args: %{"mode" => "all_tenants"}},
-         {"*/5 * * * *", Loopctl.Workers.PendingEnrollmentCleanupWorker},
-         {"*/5 * * * *", Loopctl.Workers.SessionMemoryPruneWorker},
-         # US-39.5: 30-day TTL sweep for the coordination bus. Hard-deletes
-         # channel_posts past expires_at, bounded per run (single batch, drains a
-         # backlog over successive runs) so a large backlog cannot lock the table.
-         # Runs across all tenants on AdminRepo (BYPASSRLS) — the expiry predicate
-         # is tenant-independent. Keep in sync with the crontab assertion in
-         # oban_plugins_config_test.exs.
-         {"*/5 * * * *", Loopctl.Workers.ChannelPostSweeper},
-         # US-40.B1: lifecycle-aware sweep for coordination-bus CLAIMS. Reclaims
-         # ONLY done-past-retention (done_at < now - 7d) and abandoned-lease
-         # (done_at IS NULL AND lease_expires_at < now) claims — NEVER an open,
-         # unexpired claim. Distinct from the uniform channel_posts TTL sweep.
-         # Bounded per run on AdminRepo (BYPASSRLS). Keep in sync with the crontab
-         # assertion in oban_plugins_config_test.exs.
-         {"*/5 * * * *", Loopctl.Workers.ChannelClaimSweeper},
-         # Issue #499: retroactive secret rescan of LIVE channel_posts against the
-         # current SecretDenylist patterns — the write-time US-39.1 gate never
-         # re-examines a post written before a pattern existed. Quarantines hits
-         # (never auto-deletes), audits each detection, and raises the #498 operator
-         # alert. Bounded single batch per run on AdminRepo (BYPASSRLS), resumable via
-         # channel_posts.rescanned_at. Hourly is enough: the gate already blocks the
-         # known shapes at write time, so this only chases pattern-set updates. Keep in
-         # sync with the crontab assertion in oban_plugins_config_test.exs.
-         {"23 * * * *", Loopctl.Workers.ChannelPostRescanWorker},
-         # US-38.2: prune expired windows from the cluster-global Postgres rate
-         # limiter's counter table. A cheap index-range delete; a no-op when the
-         # Postgres limiter is unselected (table empty). Keep in sync with the
-         # crontab assertion in oban_plugins_config_test.exs.
-         {"*/10 * * * *", Loopctl.Workers.RateLimitCounterCleanupWorker},
-         # Cross-tenant memory-promotion sweep (Epic 29 / US-29.2). Runs every 10 min —
-         # KEEP this in sync with :memory_promotion_sweep_interval_seconds (600) below,
-         # which is the data form of this schedule that the boot invariant reasons over.
-         # The expiry floor MUST exceed this interval and stay shorter than
-         # :session_memory_ttl_seconds (both asserted at boot) so session turns are
-         # promoted before SessionMemoryPruneWorker can delete them (no silent
-         # golden-nugget loss).
-         {"*/10 * * * *", Loopctl.Workers.MemoryPromotionSweepWorker},
-         # #411 Gap 3: HOURLY graduation of HOT long-term memories (recall_count >=
-         # :memory_graduation_recall_threshold) into durable knowledge articles, deduped
-         # via the novelty gate. DELIBERATELY slower than the 10-min promotion sweep —
-         # graduation is not latency-sensitive and an hourly cadence keeps the
-         # novelty-gate embedding spend low. Bounded per run by
-         # :memory_graduation_max_per_run. Keep in sync with the crontab assertion in
-         # oban_plugins_config_test.exs.
-         {"0 * * * *", Loopctl.Workers.MemoryGraduationSweepWorker},
-         # Ingestion capture-silence dead-man's-switch: hourly scan for tenants whose
-         # established article source_types (e.g. session_log) went silent. HARDCODED
-         # schedule (no env var) so app boot never depends on a new env var. Detection
-         # self-gates on "established + stale", so the interval is a latency knob only.
-         # Keep in sync with the crontab assertion in oban_plugins_config_test.exs.
-         {"7 * * * *", Loopctl.Workers.IngestionHealthWorker},
-         # US-35.3: all-tenants STH safety sweep. Reduced from `"* * * * *"` (every
-         # minute) to a low-frequency, config-driven backstop (default `*/5 * * * *`)
-         # that only catches appends the event-driven enqueuer (US-35.2) missed. Each
-         # fanned-out per-tenant job still self-gates on `AuditChain.sth_needed?/1`, so
-         # slowing the poll can never produce a wrong STH — worst case it delays an STH
-         # (for a tenant the event path also missed) by up to one sweep interval. Driven
-         # by `sth_sweep_cron/0` (env `STH_SWEEP_CRON`) so it's tunable/revertible per
-         # environment without a deploy.
-         {sth_sweep_cron(), Loopctl.Workers.ComputeSthWorker, args: %{"mode" => "all_tenants"}},
-         # US-41.7: backstop for custody posture entries committed but never
-         # scheduled. `Custody.enqueue_flush/1` runs AFTER the content transaction
-         # commits and never fails its caller, so a death (or an Oban insert
-         # failure) in that window strands a `pending` outbox row with nothing
-         # scheduled — and the in-flush stranded-row reaper only runs when some
-         # OTHER write for the same tenant enqueues a flush. Enqueues the ordinary
-         # per-tenant flush for tenants with entries pending past the stale window.
-         # Keep in sync with the crontab assertion in oban_plugins_config_test.exs.
-         {"*/5 * * * *", Loopctl.Workers.CustodyPostureSweepWorker},
-         {"* * * * *", Loopctl.Workers.RevokeExpiredDispatchesWorker},
-         {"* * * * *", Loopctl.Workers.SystemConfigRefreshWorker},
-         # US-41.1 (review): the STANDING embedding-side-table reconciliation pass —
-         # sweeps the dual-write crash window (legacy row without its dim-1536 mirror)
-         # AND the active-dimension gap a writer racing complete_reembed's sweep can
-         # strand. Both are otherwise permanent recall blackouts found only by a manual
-         # IEx call. Bounded per run; a backlog drains over successive hourly runs.
-         # Keep in sync with the crontab assertion in oban_plugins_config_test.exs.
-         {"15 * * * *", Loopctl.Workers.EmbeddingReconciliationWorker,
-          args: %{"mode" => "all_tenants"}},
-         # GH #551: the RETIREMENT trigger for the US-41.1 legacy embedding columns.
-         # Records one observation per UTC day (the `idx_scan` deltas that "zero scans
-         # over N days" is made of) and raises an operator alert once retirement is
-         # owed — by evidence, or by the `review_by` deadline if the evidence never
-         # settles. Never drops anything. DAILY and HARDCODED (no env var), like
-         # IngestionHealthWorker: the interval is a latency knob on a decision measured
-         # in months, so app boot must not gain a dependency on a new env var for it.
-         # 03:40 UTC sits between the 03:00 webhook/token cleanups and the 04:00
-         # knowledge-lint fan-out rather than piling onto either. Keep in sync with the
-         # crontab assertion in oban_plugins_config_test.exs.
-         {"40 3 * * *", Loopctl.Workers.LegacyEmbeddingRetirementWorker}
-       ]},
+       crontab:
+         reject_parked([
+           {"0 * * * *", Loopctl.Workers.IdempotencyCleanupWorker},
+           {"0 * * * *", Loopctl.Workers.BulkDeleteTokenCleanupWorker},
+           {"0 * * * *", Loopctl.Workers.ReauthChallengeCleanupWorker},
+           {"0 2 * * *", Loopctl.Workers.AuditPartitionWorker},
+           {"0 2 * * *", Loopctl.Workers.CostRollupWorker},
+           {"0 3 * * *", Loopctl.Workers.WebhookCleanupWorker},
+           {"0 3 * * 0", Loopctl.Workers.TokenDataArchivalWorker},
+           {"0 4 * * *", Loopctl.Workers.KnowledgeLintWorker, args: %{"mode" => "all_tenants"}},
+           {"0 5 * * 0", Loopctl.Workers.KnowledgeMocWorker, args: %{"mode" => "all_tenants"}},
+           {"30 4 * * *", Loopctl.Workers.RetrievalMetricsWorker,
+            args: %{"mode" => "all_tenants"}},
+           # Daily promotion-compile-quality eval (Epic 29 / US-29.5): precision/recall of
+           # Loopctl.Memory.Promoter against the committed labeled dataset. Calibration/
+           # observability only — never gates promotion.
+           {"45 4 * * *", Loopctl.Workers.PromotionEvalWorker, args: %{"mode" => "all_tenants"}},
+           {"*/5 * * * *", Loopctl.Workers.PendingEnrollmentCleanupWorker},
+           {"*/5 * * * *", Loopctl.Workers.SessionMemoryPruneWorker},
+           # US-39.5: 30-day TTL sweep for the coordination bus. Hard-deletes
+           # channel_posts past expires_at, bounded per run (single batch, drains a
+           # backlog over successive runs) so a large backlog cannot lock the table.
+           # Runs across all tenants on AdminRepo (BYPASSRLS) — the expiry predicate
+           # is tenant-independent. Keep in sync with the crontab assertion in
+           # oban_plugins_config_test.exs.
+           {"*/5 * * * *", Loopctl.Workers.ChannelPostSweeper},
+           # US-40.B1: lifecycle-aware sweep for coordination-bus CLAIMS. Reclaims
+           # ONLY done-past-retention (done_at < now - 7d) and abandoned-lease
+           # (done_at IS NULL AND lease_expires_at < now) claims — NEVER an open,
+           # unexpired claim. Distinct from the uniform channel_posts TTL sweep.
+           # Bounded per run on AdminRepo (BYPASSRLS). Keep in sync with the crontab
+           # assertion in oban_plugins_config_test.exs.
+           {"*/5 * * * *", Loopctl.Workers.ChannelClaimSweeper},
+           # Issue #499: retroactive secret rescan of LIVE channel_posts against the
+           # current SecretDenylist patterns — the write-time US-39.1 gate never
+           # re-examines a post written before a pattern existed. Quarantines hits
+           # (never auto-deletes), audits each detection, and raises the #498 operator
+           # alert. Bounded single batch per run on AdminRepo (BYPASSRLS), resumable via
+           # channel_posts.rescanned_at. Hourly is enough: the gate already blocks the
+           # known shapes at write time, so this only chases pattern-set updates. Keep in
+           # sync with the crontab assertion in oban_plugins_config_test.exs.
+           {"23 * * * *", Loopctl.Workers.ChannelPostRescanWorker},
+           # US-38.2: prune expired windows from the cluster-global Postgres rate
+           # limiter's counter table. A cheap index-range delete; a no-op when the
+           # Postgres limiter is unselected (table empty). Keep in sync with the
+           # crontab assertion in oban_plugins_config_test.exs.
+           {"*/10 * * * *", Loopctl.Workers.RateLimitCounterCleanupWorker},
+           # Cross-tenant memory-promotion sweep (Epic 29 / US-29.2). Runs every 10 min —
+           # KEEP this in sync with :memory_promotion_sweep_interval_seconds (600) below,
+           # which is the data form of this schedule that the boot invariant reasons over.
+           # The expiry floor MUST exceed this interval and stay shorter than
+           # :session_memory_ttl_seconds (both asserted at boot) so session turns are
+           # promoted before SessionMemoryPruneWorker can delete them (no silent
+           # golden-nugget loss).
+           {"*/10 * * * *", Loopctl.Workers.MemoryPromotionSweepWorker},
+           # #411 Gap 3: HOURLY graduation of HOT long-term memories (recall_count >=
+           # :memory_graduation_recall_threshold) into durable knowledge articles, deduped
+           # via the novelty gate. DELIBERATELY slower than the 10-min promotion sweep —
+           # graduation is not latency-sensitive and an hourly cadence keeps the
+           # novelty-gate embedding spend low. Bounded per run by
+           # :memory_graduation_max_per_run. Keep in sync with the crontab assertion in
+           # oban_plugins_config_test.exs.
+           {"0 * * * *", Loopctl.Workers.MemoryGraduationSweepWorker},
+           # Ingestion capture-silence dead-man's-switch: hourly scan for tenants whose
+           # established article source_types (e.g. session_log) went silent. HARDCODED
+           # schedule (no env var) so app boot never depends on a new env var. Detection
+           # self-gates on "established + stale", so the interval is a latency knob only.
+           # Keep in sync with the crontab assertion in oban_plugins_config_test.exs.
+           {"7 * * * *", Loopctl.Workers.IngestionHealthWorker},
+           # US-35.3: all-tenants STH safety sweep. Reduced from `"* * * * *"` (every
+           # minute) to a low-frequency, config-driven backstop (default `*/5 * * * *`)
+           # that only catches appends the event-driven enqueuer (US-35.2) missed. Each
+           # fanned-out per-tenant job still self-gates on `AuditChain.sth_needed?/1`, so
+           # slowing the poll can never produce a wrong STH — worst case it delays an STH
+           # (for a tenant the event path also missed) by up to one sweep interval. Driven
+           # by `sth_sweep_cron/0` (env `STH_SWEEP_CRON`) so it's tunable/revertible per
+           # environment without a deploy.
+           {sth_sweep_cron(), Loopctl.Workers.ComputeSthWorker, args: %{"mode" => "all_tenants"}},
+           # US-41.7: backstop for custody posture entries committed but never
+           # scheduled. `Custody.enqueue_flush/1` runs AFTER the content transaction
+           # commits and never fails its caller, so a death (or an Oban insert
+           # failure) in that window strands a `pending` outbox row with nothing
+           # scheduled — and the in-flush stranded-row reaper only runs when some
+           # OTHER write for the same tenant enqueues a flush. Enqueues the ordinary
+           # per-tenant flush for tenants with entries pending past the stale window.
+           # Keep in sync with the crontab assertion in oban_plugins_config_test.exs.
+           {"*/5 * * * *", Loopctl.Workers.CustodyPostureSweepWorker},
+           {"* * * * *", Loopctl.Workers.RevokeExpiredDispatchesWorker},
+           {"* * * * *", Loopctl.Workers.SystemConfigRefreshWorker},
+           # US-41.1 (review): the STANDING embedding-side-table reconciliation pass —
+           # sweeps the dual-write crash window (legacy row without its dim-1536 mirror)
+           # AND the active-dimension gap a writer racing complete_reembed's sweep can
+           # strand. Both are otherwise permanent recall blackouts found only by a manual
+           # IEx call. Bounded per run; a backlog drains over successive hourly runs.
+           # Keep in sync with the crontab assertion in oban_plugins_config_test.exs.
+           {"15 * * * *", Loopctl.Workers.EmbeddingReconciliationWorker,
+            args: %{"mode" => "all_tenants"}},
+           # GH #551: the RETIREMENT trigger for the US-41.1 legacy embedding columns.
+           # Records one observation per UTC day (the `idx_scan` deltas that "zero scans
+           # over N days" is made of) and raises an operator alert once retirement is
+           # owed — by evidence, or by the `review_by` deadline if the evidence never
+           # settles. Never drops anything. DAILY and HARDCODED (no env var), like
+           # IngestionHealthWorker: the interval is a latency knob on a decision measured
+           # in months, so app boot must not gain a dependency on a new env var for it.
+           # 03:40 UTC sits between the 03:00 webhook/token cleanups and the 04:00
+           # knowledge-lint fan-out rather than piling onto either. Keep in sync with the
+           # crontab assertion in oban_plugins_config_test.exs.
+           {"40 3 * * *", Loopctl.Workers.LegacyEmbeddingRetirementWorker}
+         ])},
       # Rescue jobs orphaned in :executing when a node dies mid-run (e.g. a deploy).
       # Without Lifeline these rows stay `executing` forever — 110 such orphans (from
       # 2026-06-22) were found still clogging the queues on 2026-07-10. Reset a stuck
