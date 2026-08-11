@@ -642,7 +642,11 @@ config :loopctl, :memory_promotion_max_candidates, 5
 #   at boot in `Loopctl.Application.start/1` (via `assert_promotion_ttl_invariant!/0`).
 # - sweep_interval_seconds: the ACTUAL cadence of `MemoryPromotionSweepWorker`. It MUST
 #   equal the sweep's crontab entry above (`*/10` = 600s) — it is the data form of that
-#   schedule so the boot invariant can model the REAL binding constraint. The expiry
+#   schedule so the boot invariant can model the REAL binding constraint. NB (#249): that
+#   crontab entry is currently PARKED (`ObanConfig.parked_crons/0`) because the memory tier
+#   holds no rows, so the invariant presently constrains a schedule that is not installed.
+#   Keep the two in sync anyway — `OBAN_UNPARK_CRONS` reinstalls the entry with no deploy,
+#   and the invariant must already be true at the moment it does. The expiry
 #   FLOOR (sweep_window_seconds) MUST be strictly greater than this interval so a turn
 #   created at any point survives until a LATER sweep tick (plus promotion-job latency
 #   headroom) rather than racing its first eligible tick against the prune worker. Keep

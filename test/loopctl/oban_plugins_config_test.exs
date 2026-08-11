@@ -107,34 +107,103 @@ defmodule Loopctl.ObanPluginsConfigTest do
     end
   end
 
-  describe "#411 Gap 3: MemoryGraduationSweepWorker crontab entry" do
+  describe "#249: inert KB crons are PARKED by default" do
     setup do
       plugins = Application.get_env(:loopctl, Oban)[:plugins]
 
       {Oban.Plugins.Cron, cron_opts} =
         Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
 
-      entry =
-        Enum.find(cron_opts[:crontab], fn
-          {_schedule, Loopctl.Workers.MemoryGraduationSweepWorker} -> true
-          {_schedule, Loopctl.Workers.MemoryGraduationSweepWorker, _opts} -> true
-          _ -> false
-        end)
-
-      %{entry: entry}
+      %{workers: Enum.map(cron_opts[:crontab], &elem(&1, 1))}
     end
 
-    test "the MemoryGraduationSweepWorker entry exists in the crontab", %{entry: entry} do
-      assert entry,
-             "expected a MemoryGraduationSweepWorker crontab entry that graduates hot " <>
-               "memories into durable knowledge articles (#411 Gap 3)"
+    test "no parked worker is scheduled with OBAN_UNPARK_CRONS unset", %{workers: workers} do
+      still_scheduled = Enum.filter(Loopctl.ObanConfig.parked_crons(), &(&1 in workers))
+
+      assert still_scheduled == [],
+             "expected every parked worker to be absent from the crontab, but these are " <>
+               "still scheduled: #{inspect(still_scheduled)}. Each was parked because it ran " <>
+               "green while doing nothing (empty memory tier / frozen eval fixture / retired " <>
+               "detector) — re-adding a schedule here silently restores that waste."
     end
 
-    test "its schedule is the hourly sweep (slower than the 10-min promotion sweep)", %{
-      entry: entry
+    test "the parked set is exactly the five workers the audit found inert" do
+      assert Enum.sort(Loopctl.ObanConfig.parked_crons()) ==
+               Enum.sort([
+                 Loopctl.Workers.MemoryPromotionSweepWorker,
+                 Loopctl.Workers.MemoryGraduationSweepWorker,
+                 Loopctl.Workers.SessionMemoryPruneWorker,
+                 Loopctl.Workers.PromotionEvalWorker,
+                 Loopctl.Workers.IngestionHealthWorker
+               ])
+    end
+
+    test "unparked workers are non-empty when nothing is revived (the guard is real)" do
+      # Mutation check: if reject_parked/2 stopped filtering, the assertion above would
+      # pass vacuously only if parked_crons/0 were empty. Prove it is not.
+      refute Loopctl.ObanConfig.parked_crons() == []
+    end
+  end
+
+  describe "#249: OBAN_UNPARK_CRONS revives a parked cron" do
+    # Parsing is exercised purely (never System.put_env) — that is VM-global and would
+    # race the async suite.
+    setup do
+      full_crontab = [
+        {"0 * * * *", Loopctl.Workers.MemoryGraduationSweepWorker},
+        {"*/10 * * * *", Loopctl.Workers.MemoryPromotionSweepWorker},
+        {"0 4 * * *", Loopctl.Workers.KnowledgeLintWorker, args: %{"mode" => "all_tenants"}}
+      ]
+
+      %{crontab: full_crontab}
+    end
+
+    test "reviving one worker restores ONLY that entry", %{crontab: crontab} do
+      unparked = Loopctl.ObanConfig.parse_unparked("Loopctl.Workers.MemoryGraduationSweepWorker")
+
+      workers =
+        crontab
+        |> Loopctl.ObanConfig.reject_parked(unparked)
+        |> Enum.map(&elem(&1, 1))
+
+      assert Loopctl.Workers.MemoryGraduationSweepWorker in workers
+      refute Loopctl.Workers.MemoryPromotionSweepWorker in workers
+      assert Loopctl.Workers.KnowledgeLintWorker in workers
+    end
+
+    test "its schedule is unchanged by parking — the hourly sweep (#411 Gap 3)", %{
+      crontab: crontab
     } do
-      schedule = elem(entry, 0)
-      assert schedule == "0 * * * *"
+      unparked = Loopctl.ObanConfig.parse_unparked("Loopctl.Workers.MemoryGraduationSweepWorker")
+
+      entry =
+        crontab
+        |> Loopctl.ObanConfig.reject_parked(unparked)
+        |> Enum.find(&(elem(&1, 1) == Loopctl.Workers.MemoryGraduationSweepWorker))
+
+      assert elem(entry, 0) == "0 * * * *"
+    end
+
+    test "the Elixir. prefixed form is accepted too" do
+      assert Loopctl.ObanConfig.parse_unparked("Elixir.Loopctl.Workers.PromotionEvalWorker") ==
+               [Loopctl.Workers.PromotionEvalWorker]
+    end
+
+    test "a nil / blank value revives nothing" do
+      assert Loopctl.ObanConfig.parse_unparked(nil) == []
+      assert Loopctl.ObanConfig.parse_unparked("  ,  ") == []
+    end
+
+    test "a typo RAISES rather than silently leaving the worker parked" do
+      assert_raise ArgumentError, ~r/not a parked cron/, fn ->
+        Loopctl.ObanConfig.parse_unparked("Loopctl.Workers.NoSuchWorker")
+      end
+    end
+
+    test "a real but NON-parked worker also raises (cannot unpark what is not parked)" do
+      assert_raise ArgumentError, ~r/not a parked cron/, fn ->
+        Loopctl.ObanConfig.parse_unparked("Loopctl.Workers.KnowledgeLintWorker")
+      end
     end
   end
 
