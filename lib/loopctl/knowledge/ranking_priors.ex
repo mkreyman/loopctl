@@ -110,6 +110,50 @@ defmodule Loopctl.Knowledge.RankingPriors do
   }
   @default_source_authority 0.0
 
+  # Provenance authority (#251). The single strongest measured signal in this table, and
+  # the one the category/source_type weights above could not see.
+  #
+  # Measured on the live corpus 2026-08-11, over 30 days of reads:
+  #
+  #   first-party              3,164 articles   389.7 reads/1k   18.30% ever read
+  #   third-party (harvested) 75,768 articles    14.6 reads/1k    1.09% ever read
+  #
+  # A 26.7x per-article read rate: first-party is 4% of the corpus and 53% of the reads.
+  # The June 2026 bulk harvest added 76k third-party articles, and every query since has
+  # had to pull the ~3k articles anyone actually opens out of that pool.
+  #
+  # Why TAGS and not `source_type`: 83,487 of 85,157 articles carry a NULL `source_type`,
+  # the whole harvest included, so `@source_authority` returns its 0.0 default for
+  # essentially the entire corpus and cannot separate these cohorts at all. The sourcers
+  # DO stamp a structural capture tag (`book-<id>`, `url-<id>`, `yt-<id>`, `doc-<id>`, plus
+  # the bare kind tags below). Verified as a discriminator before being relied on: it marks
+  # 98.5% of the June harvest and 0.4% of the pre-June curated set.
+  #
+  # THIRD-PARTY IS THE POSITIVE TEST, and first-party is the absence of a marker — never the
+  # reverse. A first-party allowlist would have to enumerate every repo/topic tag Mark will
+  # ever use, and each one it missed would silently demote genuinely first-party knowledge.
+  # A missed marker here fails the other way: an unmarked harvest article is merely treated
+  # as neutral, which is exactly today's behaviour.
+  #
+  # The weight is deliberately SMALLER than the measured effect. Priors here break near-ties
+  # (RRF ties by construction), they do not dominate relevance — a 26.7x weight would let
+  # provenance outrank the query. At the default strength 0.05 this is a ~2.5% edge on an
+  # otherwise-equal pair, and it can never flip a cross-lane consensus winner (~2x a
+  # single-lane hit).
+  # SCOPE: these markers are the SOURCERS' own convention (the harvest skills stamp them at
+  # knowledge_create time), not user-authored freeform tags, which is what makes them a
+  # reliable signal. They are nonetheless GLOBAL, like `@category_authority` above, so a
+  # future tenant that uses `book-`/`document` to mean something else would inherit this
+  # prior. The failure is bounded and one-directional — a misread tag costs an article its
+  # 0.5 boost, dropping it to the neutral 0.0 every article gets today — so it can never
+  # demote anything below current behaviour. Revisit if a second real tenant appears; the
+  # right fix then is config-driven weight tables for the whole module, not a special case
+  # for this one term.
+  @harvest_marker_prefixes ~w(book- url- yt- doc-)
+  @harvest_marker_tags ~w(web-article newsletter inbox-harvest youtube document book)
+  @first_party_authority 0.5
+  @third_party_authority 0.0
+
   # A verdict-killed idea and a superseded article are demoted hard regardless of the
   # authority toggle — they are dead doctrine that must not outrank live doctrine.
   @kill_tag "verdict-kill"
@@ -158,11 +202,42 @@ defmodule Loopctl.Knowledge.RankingPriors do
   def authority_factor(result, strength, floor, ceiling) do
     cat = category_authority(Map.get(result, :category))
     src = source_authority(Map.get(result, :source_type))
+    prov = provenance_authority(Map.get(result, :tags))
 
-    (1.0 + strength * (cat + src))
+    (1.0 + strength * (cat + src + prov))
     |> max(floor)
     |> min(ceiling)
   end
+
+  @doc """
+  The provenance weight for a result's `tags`: `#{@first_party_authority}` for first-party
+  knowledge, `#{@third_party_authority}` for third-party harvested material (#251).
+
+  Third-party is the POSITIVE test — a structural capture tag stamped by a sourcer
+  (`book-`/`url-`/`yt-`/`doc-` prefixes, or a bare kind tag). First-party is the absence of
+  one, so a marker this function does not know leaves the article neutral rather than
+  demoting real first-party knowledge. `nil` tags are first-party (an article no sourcer
+  stamped).
+  """
+  @spec provenance_authority([String.t()] | nil) :: float()
+  def provenance_authority(nil), do: @first_party_authority
+
+  def provenance_authority(tags) when is_list(tags) do
+    if Enum.any?(tags, &harvest_marker?/1) do
+      @third_party_authority
+    else
+      @first_party_authority
+    end
+  end
+
+  def provenance_authority(_), do: @first_party_authority
+
+  defp harvest_marker?(tag) when is_binary(tag) do
+    tag in @harvest_marker_tags or
+      Enum.any?(@harvest_marker_prefixes, &String.starts_with?(tag, &1))
+  end
+
+  defp harvest_marker?(_), do: false
 
   @doc """
   The demotion FACTOR for dead doctrine: `#{@demote_factor}` when the result carries the

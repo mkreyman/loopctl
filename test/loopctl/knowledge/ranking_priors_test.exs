@@ -204,4 +204,103 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
       assert mult(any, recency_weight: 0.0, authority?: false) == 1.0
     end
   end
+
+  describe "#251 provenance prior: first-party outranks harvested material on a near-tie" do
+    alias Loopctl.Knowledge.RankingPriors
+
+    test "an article with no sourcer capture tag is first-party" do
+      assert RankingPriors.provenance_authority([]) > 0.0
+      assert RankingPriors.provenance_authority(["elixir", "oban"]) > 0.0
+      assert RankingPriors.provenance_authority(nil) > 0.0
+    end
+
+    test "each structural capture PREFIX marks third-party" do
+      for tag <- ["book-0be008289fe8", "url-d046e10f48b3", "yt-eCx3SSCcISo", "doc-3941363c04b3"] do
+        assert RankingPriors.provenance_authority([tag]) == 0.0,
+               "expected #{tag} to mark the article as harvested"
+      end
+    end
+
+    test "each bare kind tag marks third-party" do
+      for tag <- ~w(web-article newsletter inbox-harvest youtube document book) do
+        assert RankingPriors.provenance_authority([tag]) == 0.0,
+               "expected #{tag} to mark the article as harvested"
+      end
+    end
+
+    test "one marker among many first-party tags is enough" do
+      assert RankingPriors.provenance_authority(["elixir", "oban", "yt-abc123", "patterns"]) ==
+               0.0
+    end
+
+    test "a prefix must be a PREFIX — a tag merely containing it stays first-party" do
+      # "notebook-lm" contains "book-" but does not start with it; "handbook" likewise.
+      assert RankingPriors.provenance_authority(["notebook-lm"]) > 0.0
+      assert RankingPriors.provenance_authority(["handbook"]) > 0.0
+    end
+
+    test "a first-party doc outranks an otherwise-IDENTICAL harvested doc" do
+      first_party = %{category: :finding, updated_at: @now, tags: ["elixir"], status: :published}
+
+      harvested = %{
+        category: :finding,
+        updated_at: @now,
+        tags: ["web-article"],
+        status: :published
+      }
+
+      assert mult(first_party, []) > mult(harvested, [])
+    end
+
+    test "the prior BREAKS ties but never dominates relevance or category" do
+      # A harvested `decision` must still outrank a first-party `idea`: provenance is a
+      # tiebreaker, not an override of the far larger category spread.
+      harvested_decision = %{
+        category: :decision,
+        updated_at: @now,
+        tags: ["web-article"],
+        status: :published
+      }
+
+      first_party_idea = %{category: :idea, updated_at: @now, tags: [], status: :published}
+
+      assert mult(harvested_decision, []) > mult(first_party_idea, [])
+    end
+
+    test "it stays inside the bounded band — no saturation at the common shape" do
+      # source_type is NULL for ~98% of the corpus, so the realistic maximum is
+      # category(1.0) + provenance(0.5) = 1.5, well under the 2.0 the ceiling needs.
+      best = %{category: :decision, updated_at: @now, tags: [], status: :published}
+
+      factor = RankingPriors.authority_factor(best, 0.05, 0.9, 1.1)
+
+      assert factor < 1.1, "expected headroom below the ceiling, got #{factor}"
+      assert factor > 1.0
+    end
+
+    test "a verdict-kill first-party doc is still demoted below a clean harvested one" do
+      killed_first_party = %{
+        category: :decision,
+        updated_at: @now,
+        tags: ["verdict-kill"],
+        status: :published
+      }
+
+      clean_harvested = %{
+        category: :decision,
+        updated_at: @now,
+        tags: ["web-article"],
+        status: :published
+      }
+
+      assert mult(clean_harvested, []) > mult(killed_first_party, [])
+    end
+
+    test "provenance is gated by the authority toggle like the rest of the prior" do
+      first_party = %{category: :finding, updated_at: @now, tags: [], status: :published}
+      harvested = %{category: :finding, updated_at: @now, tags: ["book-abc"], status: :published}
+
+      assert mult(first_party, authority?: false) == mult(harvested, authority?: false)
+    end
+  end
 end

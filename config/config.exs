@@ -927,8 +927,15 @@ config :loopctl, :knowledge_rrf_graph_max_neighbors, 20
 # `1 - w + w*decay` on the fused score. Default weight 0.3 matches knowledge_context.
 config :loopctl, :knowledge_recency_weight, 0.3
 # Source-authority prior: toggle + magnitude. The factor is
-# `clamp(1 + strength * (category_weight + source_type_weight), 0.9, 1.1)`. Because every
-# category/source_type weight is >= 0 and strength is >= 0, `1 + strength*(cat+src)` is
+# `clamp(1 + strength * (category_weight + source_type_weight + provenance_weight), 0.9, 1.1)`.
+# The provenance term (#251) separates first-party knowledge from third-party HARVESTED
+# material by the structural capture tag a sourcer stamps (`book-`/`url-`/`yt-`/`doc-`
+# prefixes and the bare kind tags) — `source_type` cannot, because ~98% of the corpus
+# carries a NULL one. It earns its place: measured 2026-08-11, first-party articles are read
+# 26.7x more per article than harvested ones (389.7 vs 14.6 reads per 1k), and are 4% of the
+# corpus but 53% of the reads. The weight is deliberately far smaller than that ratio —
+# priors break near-ties here, they do not dominate relevance. Because every
+# category/source_type/provenance weight is >= 0 and strength is >= 0, `1 + strength*(sum)` is
 # always >= 1.0 — so the 0.9 floor is UNREACHABLE and the EFFECTIVE range is [1.0, 1.1].
 # The band is one-sided BY DESIGN: authority only ever BOOSTS a higher-authority doc; it
 # never demotes a low-authority raw note below neutral (demotion comes solely from the
