@@ -49,10 +49,20 @@ defmodule Loopctl.Knowledge.HeavyReadStatementTimeoutTest do
     tenant = fixture(:tenant)
     _art = fixture(:article, %{tenant_id: tenant.id})
 
+    # The sleep is deliberately 10s against a 100ms timeout, and the two numbers are
+    # load-bearing TOGETHER. This assertion separates two outcomes: canceled at the
+    # timeout (~100ms + overhead) versus held for the whole query (10s). The wider the
+    # gap, the more machine load the bound tolerates while still meaning what it says.
+    #
+    # It was pg_sleep(1) with a 600ms bound — a 6x margin — and it flaked at 786ms on a
+    # box running two builds (2026-08-10). Do NOT "fix" a future flake by nudging the
+    # bound toward the sleep: at pg_sleep(1), a bound near 1000ms stops distinguishing
+    # cancellation from completion, which is the whole point of the test. Widen the gap
+    # instead, or make the assertion relative.
     slow =
       from(a in Article,
         where: a.tenant_id == ^tenant.id,
-        where: fragment("pg_sleep(1) IS NULL")
+        where: fragment("pg_sleep(10) IS NULL")
       )
 
     {elapsed_us, _} =
@@ -62,9 +72,15 @@ defmodule Loopctl.Knowledge.HeavyReadStatementTimeoutTest do
         end
       end)
 
-    # Canceled near 100ms, NOT held for the full 1s — proves prompt release, no
-    # pool-starvation re-intro on the override (transaction) path.
-    assert elapsed_us / 1_000 < 600
+    elapsed_ms = elapsed_us / 1_000
+
+    # Canceled near 100ms, NOT held for the full 10s — proves prompt release, no
+    # pool-starvation re-intro on the override (transaction) path. 2_000ms absorbs a
+    # 20x overhead spike; a regression that waits out the query lands at ~10_000ms.
+    assert elapsed_ms < 2_000,
+           "expected the override path to cancel near the 100ms statement_timeout, " <>
+             "but it took #{Float.round(elapsed_ms, 1)}ms — at or past this bound the " <>
+             "query is being held rather than canceled (the sleep is 10s)"
 
     # The connection is back in the pool and immediately reusable.
     ok_query = from(a in Article, where: a.tenant_id == ^tenant.id, select: count())
