@@ -205,6 +205,51 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
     end
   end
 
+  describe "#654 MOC hubs are demoted: navigation must not outrank an answer" do
+    alias Loopctl.Knowledge.RankingPriors
+
+    test "both structural tags are required — `moc` alone is a legitimate content tag" do
+      # Market-On-Close, not a generated hub.
+      refute RankingPriors.moc_hub?(["moc", "finance", "trading"])
+      refute RankingPriors.moc_hub?(["hub"])
+      refute RankingPriors.moc_hub?([])
+      refute RankingPriors.moc_hub?(nil)
+
+      assert RankingPriors.moc_hub?(["hub", "moc", "deployment"])
+    end
+
+    test "a hub is demoted below an ordinary article of the SAME category" do
+      hub = %{
+        category: :reference,
+        updated_at: @now,
+        tags: ["hub", "moc", "deployment"],
+        status: :published
+      }
+
+      answer = %{category: :reference, updated_at: @now, tags: ["deployment"], status: :published}
+
+      assert mult(answer, []) > mult(hub, [])
+    end
+
+    test "a hub loses to a real article the CATEGORY TIER would have ranked below it" do
+      # Non-vacuous by construction: a `reference` hub (category weight 0.8) outranks a
+      # `pattern` (0.7) on authority alone, so this ordering can ONLY come from the
+      # demotion. Comparing a hub against a higher-tier `finding` would pass with the
+      # demotion disabled and prove nothing — that is the failure this test shape avoids.
+      hub = %{category: :reference, updated_at: @now, tags: ["hub", "moc"], status: :published}
+      pattern = %{category: :pattern, updated_at: @now, tags: [], status: :published}
+
+      assert mult(pattern, []) > mult(hub, [])
+    end
+
+    test "demotion is independent of the authority toggle, like dead doctrine" do
+      hub = %{category: :reference, updated_at: @now, tags: ["hub", "moc"], status: :published}
+      plain = %{category: :reference, updated_at: @now, tags: [], status: :published}
+
+      assert mult(plain, authority?: false) > mult(hub, authority?: false)
+    end
+  end
+
   describe "#251 provenance prior: first-party outranks harvested material on a near-tie" do
     alias Loopctl.Knowledge.RankingPriors
 
