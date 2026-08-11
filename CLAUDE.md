@@ -78,6 +78,8 @@ lib/loopctl_web/
 
 ## Naming Conventions
 
+**Vocabulary: load the `ubiquitous-language` skill before acting on a term you are unsure of — and before assuming you are sure.** The words that cost the most here look ordinary: `scope` is never a parameter you pass, a `self_*` 409 is the product working rather than a bug, `exact_role:` and `role:` differ in the one way that holds the custody gate, and `retrieve_*` / `knowledge_*` / `memory_*` all "store something for later" while meaning three different things. That glossary is the index; each entry points at the skill with the mechanism. Use this codebase's own name when you write, too.
+
 - Context modules: `Loopctl.Tenants`, `Loopctl.Auth`, `Loopctl.Progress`, etc.
 - Schema modules: `Loopctl.Tenants.Tenant`, `Loopctl.Auth.ApiKey`, etc.
 - Controllers: `LoopctlWeb.TenantController`, `LoopctlWeb.StoryController`, etc.
