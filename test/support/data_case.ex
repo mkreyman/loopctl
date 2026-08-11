@@ -131,12 +131,19 @@ defmodule Loopctl.DataCase do
       &NoopBodyProbe.ignore/1
     end)
 
+    # Shape MUST match `Loopctl.HealthCheck.Default.check/0`. It notably carries NO
+    # `version` key: #461 item 5 removed the app version from this response on purpose,
+    # because /health is the highest-frequency unauthenticated probe and there is no
+    # reason to hand a version fingerprint to every caller. The stub used to return
+    # `version: "0.1.0-test"`, so every test asserting on the health payload was
+    # asserting against a field the real endpoint deliberately does not emit — a test
+    # double that quietly re-adds what production removed cannot catch its removal
+    # regressing.
     Mox.stub(Loopctl.MockHealthChecker, :check, fn ->
       {:ok,
        %{
          status: "ok",
          ready: true,
-         version: "0.1.0-test",
          checks: %{database: "ok", oban: "ok"}
        }}
     end)
