@@ -4778,8 +4778,10 @@ const TOOLS = [
       properties: {
         article_id: {
           type: "string",
-          format: "uuid",
-          description: "The UUID of the article.",
+          description:
+            "The UUID of the article. A unique ID PREFIX (>= 8 hex characters) also " +
+            "resolves, so copy what you have rather than reconstructing 36 characters " +
+            "from memory; an ambiguous prefix is a 404, never a guess.",
         },
         links: {
           type: "string",

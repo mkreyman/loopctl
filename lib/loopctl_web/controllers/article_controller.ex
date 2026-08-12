@@ -272,7 +272,14 @@ defmodule LoopctlWeb.ArticleController do
         "(highest similarity first, then oldest-first) with `conflicts_total` / " <>
         "`conflicts_truncated`.",
     parameters: [
-      id: [in: :path, type: :string, description: "Article UUID"],
+      id: [
+        in: :path,
+        type: :string,
+        description:
+          "Article UUID. A unique ID PREFIX (>= 8 hex characters) also resolves, so a " <>
+            "mistyped or truncated tail still finds the article; a prefix matching more " <>
+            "than one visible article is a 404, never a guess."
+      ],
       links: [
         in: :query,
         type: %OpenApiSpex.Schema{type: :string, enum: ["full", "count", "none"]},
