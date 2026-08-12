@@ -23,6 +23,7 @@ defmodule LoopctlWeb.KnowledgeContextController do
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias LoopctlWeb.Helpers.ProjectId
+  alias LoopctlWeb.Helpers.SearchTelemetry
   alias LoopctlWeb.Helpers.Visibility
 
   action_fallback LoopctlWeb.FallbackController
@@ -155,11 +156,23 @@ defmodule LoopctlWeb.KnowledgeContextController do
         |> Keyword.put(:api_key_id, api_key_id)
         |> Keyword.merge(Visibility.scope_opts(conn))
 
+      started_at = System.monotonic_time(:millisecond)
+
       case Knowledge.get_context(tenant_id, query, opts) do
         {:ok, result} ->
+          record_attempt(conn, query, started_at, %{
+            result_count: length(Map.get(result, :results, []))
+          })
+
           json(conn, LoopctlWeb.KnowledgeContextJSON.context(result))
 
         {:error, :empty_query} ->
+          record_attempt(conn, query, started_at, %{
+            rejected?: true,
+            rejection_reason: "empty_query",
+            result_count: 0
+          })
+
           {:error, :bad_request, "Query parameter 'query' is required and cannot be empty"}
       end
     end
@@ -291,4 +304,24 @@ defmodule LoopctlWeb.KnowledgeContextController do
   end
 
   defp maybe_add_conversation_id(opts, _), do: opts
+
+  # `get_context` suppresses its INNER combined search's recorder so the candidate-pool
+  # query is not counted as a search of its own, and then recorded nothing for the OUTER
+  # call — so this surface wrote article-access rows while its attempts, and every one of
+  # its misses, stayed invisible in the one table built to show them.
+  defp record_attempt(conn, query, started_at, attrs) do
+    SearchTelemetry.record_attempt(
+      conn,
+      Map.merge(
+        %{
+          query: query,
+          tool: "knowledge_context",
+          mode_requested: "combined",
+          mode_used: "combined",
+          duration_ms: System.monotonic_time(:millisecond) - started_at
+        },
+        attrs
+      )
+    )
+  end
 end
