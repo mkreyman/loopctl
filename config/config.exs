@@ -946,6 +946,16 @@ config :loopctl, :knowledge_recency_weight, 0.3
 config :loopctl, :knowledge_authority_prior_enabled, true
 config :loopctl, :knowledge_authority_strength, 0.05
 
+# MOC/index-hub demotion (#654 follow-up). Generated "Index: <tag>" hubs are navigation,
+# not answers: on the live corpus one was rank 1 for 12% of real questions while the whole
+# hub set was opened once. Hub-ness is read from the worker's own `idempotency_key`
+# ("moc:<tag>"), never from tags — `tags` is agent-writable via knowledge_update, so a
+# tag-derived penalty let any agent halve ANOTHER agent's rank. This switch exists because
+# the inference is corpus-wide: a tenant whose MOC output IS what its agents want to read
+# turns the penalty off here without a deploy. Dead doctrine (verdict-kill / :superseded)
+# is demoted regardless — that one is not a matter of taste.
+config :loopctl, :knowledge_hub_demotion_enabled, true
+
 # DI: WebAuthn adapter — defaults to Wax (overridden in test env)
 config :loopctl, :webauthn_adapter, Loopctl.WebAuthn.Wax
 

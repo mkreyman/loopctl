@@ -19,11 +19,11 @@ defmodule LoopctlWeb.KnowledgeSearchController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Egress
   alias Loopctl.Knowledge
-  alias Loopctl.Knowledge.Analytics
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleCursor
   alias LoopctlWeb.Helpers.ClientContext
   alias LoopctlWeb.Helpers.ProjectId
+  alias LoopctlWeb.Helpers.SearchTelemetry
   alias LoopctlWeb.Helpers.TagMatch
   alias LoopctlWeb.Helpers.Visibility
 
@@ -388,22 +388,9 @@ defmodule LoopctlWeb.KnowledgeSearchController do
   end
 
   # Best-effort attempt telemetry. Never raises and never alters the response.
-  defp record_attempt(conn, attrs) do
-    api_key = conn.assigns[:current_api_key]
-
-    if api_key do
-      Analytics.record_search_attempt(
-        api_key.tenant_id,
-        ClientContext.attrs(conn)
-        |> Map.merge(%{api_key_id: api_key.id, agent_id: Map.get(api_key, :agent_id)})
-        |> Map.merge(attrs)
-      )
-    end
-
-    :ok
-  rescue
-    _ -> :ok
-  end
+  # Shared with the hybrid controller — see LoopctlWeb.Helpers.SearchTelemetry for why
+  # this is not a private copy per endpoint.
+  defp record_attempt(conn, attrs), do: SearchTelemetry.record_attempt(conn, attrs)
 
   defp record_rejected_search(conn, params, error) do
     record_attempt(conn, %{

@@ -59,6 +59,7 @@ defmodule Loopctl.Memory do
   alias Loopctl.HeavyRead
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.IdempotencyTag
+  alias Loopctl.Knowledge.RankingPriors
   alias Loopctl.Knowledge.VectorSearch
   alias Loopctl.Llm.ProviderError
   alias Loopctl.Memory.Memory, as: MemorySchema
@@ -1443,6 +1444,14 @@ defmodule Loopctl.Memory do
       # analytics for /recall traffic (the guard in `maybe_record_search_access/5` skips
       # recording when `:api_key_id` is nil). Sibling search/context endpoints set it too.
       |> maybe_put_opt(:api_key_id, opt(opts, :api_key_id, nil))
+      # Attribute the search_events row to THIS surface (#658 follow-up). Without
+      # `_tool` these rows were written as `tool: "knowledge_search"`, so recall traffic
+      # was indistinguishable from real search traffic in the one table built to tell
+      # them apart — and `agent_id` / `duration_ms` were NULL on every one of them.
+      |> Keyword.put(:_tool, "memory_recall")
+      |> Keyword.put(:_started_at, System.monotonic_time(:millisecond))
+      |> maybe_put_opt(:agent_id, opt(opts, :agent_id, nil))
+      |> maybe_put_opt(:_client_context, opt(opts, :_client_context, nil))
       # Reuse the embedding generated ONCE in `recall_context/2` so the knowledge half
       # does not make a second provider call for the identical query (#411 Gap 2).
       |> maybe_put_opt(:embedding, embedding_result)
@@ -1547,7 +1556,14 @@ defmodule Loopctl.Memory do
   # scale. Post-#470 the combined `:final_score` is an RRF `Σ weight/(k+rank)` value (top
   # ~0.008-0.016) — reading it here would systematically sink every knowledge row below
   # every memory row (#470 review). Defaults to 0.0 for a scoreless result map.
-  defp knowledge_score(result) when is_map(result), do: Knowledge.absolute_result_score(result)
+  #
+  # The demotion factor is applied HERE rather than inside `absolute_result_score/1`
+  # (#654 follow-up): that function also backs `hybrid_search/3`'s curated-vs-retrieved
+  # threshold, so folding a hub penalty into it would silently move the provenance
+  # boundary. Recall merges knowledge rows against memory rows on this one number, so an
+  # undemoted hub outranks the agent's own memories on its own recall call.
+  defp knowledge_score(result) when is_map(result),
+    do: Knowledge.absolute_result_score(result) * RankingPriors.demotion_factor(result)
 
   defp knowledge_score(_), do: 0.0
 

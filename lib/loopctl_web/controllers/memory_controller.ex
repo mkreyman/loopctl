@@ -49,6 +49,7 @@ defmodule LoopctlWeb.MemoryController do
   alias Loopctl.Memory
   alias Loopctl.Memory.Scope
   alias LoopctlWeb.AuditContext
+  alias LoopctlWeb.Helpers.ClientContext
   alias LoopctlWeb.Helpers.Visibility
   alias LoopctlWeb.MemoryJSON
   alias LoopctlWeb.RecallJSON
@@ -487,6 +488,12 @@ defmodule LoopctlWeb.MemoryController do
     conn
     |> Visibility.scope_opts()
     |> Keyword.put(:api_key_id, conn.assigns.current_api_key.id)
+    # Recall writes `search_events` rows too (#658 follow-up). Without these the recall
+    # slice of that table carried a NULL agent and no client context, so "which agent
+    # recalls, from which repo, at which effort" was answerable for search and blank for
+    # recall — the two surfaces most worth comparing.
+    |> Keyword.put(:agent_id, conn.assigns.current_api_key.agent_id)
+    |> Keyword.put(:_client_context, ClientContext.attrs(conn))
     |> maybe_force_published(role_atom)
   end
 

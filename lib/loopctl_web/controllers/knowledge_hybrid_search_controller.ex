@@ -31,7 +31,9 @@ defmodule LoopctlWeb.KnowledgeHybridSearchController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
+  alias LoopctlWeb.Helpers.ClientContext
   alias LoopctlWeb.Helpers.ProjectId
+  alias LoopctlWeb.Helpers.SearchTelemetry
   alias LoopctlWeb.Helpers.TagMatch
   alias LoopctlWeb.Helpers.Visibility
 
@@ -144,14 +146,36 @@ defmodule LoopctlWeb.KnowledgeHybridSearchController do
 
   @doc "POST /api/v1/knowledge/hybrid_search"
   def hybrid_search(conn, params) do
-    tenant_id = conn.assigns.current_api_key.tenant_id
-    api_key_id = conn.assigns.current_api_key.id
+    # Record the rejection wherever it was raised, mirroring KnowledgeSearchController:
+    # a refused hybrid call never reaches the search path, so without this wrapper the
+    # hybrid slice of `search_events` showed a 0% rejection rate by construction.
+    case do_hybrid_search(conn, params) do
+      {:error, _status, _msg} = error ->
+        record_rejected_search(conn, params, error)
+        error
+
+      response ->
+        response
+    end
+  end
+
+  defp do_hybrid_search(conn, params) do
+    api_key = conn.assigns.current_api_key
+    tenant_id = api_key.tenant_id
 
     with {:ok, query} <- resolve_query(params),
          {:ok, base_opts} <- build_opts(params) do
       opts =
         base_opts
-        |> Keyword.put(:api_key_id, api_key_id)
+        |> Keyword.put(:api_key_id, api_key.id)
+        # WHO searched, HOW LONG it took, what they ASKED for, and from where. Absent
+        # these, every hybrid row recorded a NULL agent, a NULL duration and an internal
+        # lane label for `mode_requested` — the four columns that make the rest readable.
+        |> Keyword.put(:agent_id, Map.get(api_key, :agent_id))
+        |> Keyword.put(:_started_at, System.monotonic_time(:millisecond))
+        |> Keyword.put(:_tool, "knowledge_hybrid_search")
+        |> Keyword.put(:_mode_requested, "hybrid")
+        |> Keyword.put(:_client_context, ClientContext.attrs(conn))
         |> Keyword.merge(Visibility.scope_opts(conn))
 
       case Knowledge.hybrid_search(tenant_id, query, opts) do
@@ -284,4 +308,31 @@ defmodule LoopctlWeb.KnowledgeHybridSearchController do
   defp maybe_add_offset(opts, _), do: [{:offset, 0} | opts]
 
   defp clamp_offset(value), do: value |> max(0) |> min(@max_offset)
+
+  defp record_rejected_search(conn, params, error) do
+    SearchTelemetry.record_attempt(conn, %{
+      query: params |> Map.get("query") |> trim_query(),
+      tool: "knowledge_hybrid_search",
+      mode_requested: "hybrid",
+      rejected?: true,
+      rejection_reason: rejection_reason(error),
+      result_count: 0
+    })
+  end
+
+  # Mirrors KnowledgeSearchController's classifier. Kept coarse on purpose: the point is
+  # WHICH CLASS of malformed call agents keep making, not a per-message taxonomy.
+  #
+  # No catch-all clause: dialyzer proves every rejection this action can produce is
+  # `{:error, status, binary}`, so a fallback would be unreachable code that reads like
+  # a safety net. The `true ->` branch inside the cond IS the safety net.
+  defp rejection_reason({:error, _status, msg}) when is_binary(msg) do
+    cond do
+      String.contains?(msg, "'query' is required") -> "missing_query"
+      String.contains?(msg, "maximum length") -> "query_too_long"
+      String.contains?(msg, "project_id") -> "invalid_project_id"
+      String.contains?(msg, "weights") -> "invalid_weights"
+      true -> "bad_request"
+    end
+  end
 end
