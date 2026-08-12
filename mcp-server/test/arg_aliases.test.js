@@ -58,10 +58,11 @@ test("a blank alias does not overwrite or invent a canonical", () => {
   assert.equal(out.q, undefined);
 });
 
-test("other canonical names alias too", () => {
-  assert.equal(applyArgAliases({ articleId: "abc" }).article_id, "abc");
-  assert.equal(applyArgAliases({ projectId: "p1" }).project_id, "p1");
-  assert.equal(applyArgAliases({ sinceDays: 7 }).since_days, 7);
+test("an UNOBSERVED spelling is deliberately NOT aliased", () => {
+  // The table carries only what agents were measured to send. `text` in particular must
+  // never map to `q`: memory_remember declares it for a memory's CONTENT.
+  assert.equal(applyArgAliases({ text: "a fact worth remembering" }).q, undefined);
+  assert.equal(applyArgAliases({ articleId: "abc" }).article_id, undefined);
 });
 
 test("unrelated args are passed through untouched and the input is not mutated", () => {
@@ -81,6 +82,89 @@ test("non-object input is returned unchanged rather than throwing", () => {
 
 test("a non-numeric limit string is left alone rather than becoming NaN", () => {
   assert.equal(applyArgAliases({ q: "x", limit: "lots" }).limit, "lots");
+});
+
+// ---------------------------------------------------------------------------------------
+// Data-driven regression: the SIX distinct input shapes that actually produced
+// `400 Query parameter 'q' is required` in the transcripts. Encoded verbatim rather than
+// paraphrased, so this asserts against measured reality instead of against my model of it.
+// Counts are the observed frequency of each shape.
+// ---------------------------------------------------------------------------------------
+const OBSERVED_FAILING_SHAPES = [
+  { count: 42, keys: "max_results,query", input: { query: "fail-open bounded allowance backpressure exit throw classification", max_results: "6" } },
+  { count: 29, keys: "query", input: { query: "idempotency tag namespace collision url- sha1 knowledge article tags" } },
+  { count: 10, keys: "project_id,query", input: { query: "custody halt tenant threshold byzantine detection", project_id: "a40edb79-d290-475f-9bdb-6e6c5458af97" } },
+  { count: 3, keys: "limit,query", input: { query: "catalog probe search_path current_schemas version skew", limit: 8 } },
+  { count: 1, keys: "args,max_results,query", input: { query: "LCP-1 signed custody profile attestation enrollment owner key", max_results: "8", args: {} } },
+];
+
+test("every observed failing shape now yields a usable q", () => {
+  for (const shape of OBSERVED_FAILING_SHAPES) {
+    const out = applyArgAliases(shape.input);
+    assert.ok(
+      typeof out.q === "string" && out.q.length > 0,
+      `shape {${shape.keys}} (${shape.count} real calls) must produce a q, got ${JSON.stringify(out.q)}`,
+    );
+  }
+});
+
+test("the one shape that carried NO query in any spelling is still not invented", () => {
+  // 1 of the 86 genuinely passed no query. Aliasing must not fabricate one — that call
+  // was a real caller bug and should still be rejected loudly.
+  const out = applyArgAliases({ max_results: "1" });
+  assert.equal(out.q, undefined);
+  assert.equal(out.limit, 1);
+});
+
+test("BOTH spellings work, in both directions — the surface is inconsistent by history", () => {
+  // knowledge_search declares `q`; knowledge_hybrid_search / knowledge_context /
+  // memory_recall / recall_context all declare `query`. Either spelling must reach either
+  // family, or an agent that learned one from a sibling tool loses its search.
+  const fromQuery = applyArgAliases({ query: "vector recall degraded fallback" });
+  assert.equal(fromQuery.q, "vector recall degraded fallback", "query must fill q");
+  assert.equal(fromQuery.query, "vector recall degraded fallback", "query must survive");
+
+  const fromQ = applyArgAliases({ q: "vector recall degraded fallback" });
+  assert.equal(fromQ.query, "vector recall degraded fallback", "q must fill query");
+  assert.equal(fromQ.q, "vector recall degraded fallback", "q must survive");
+
+  const limits = applyArgAliases({ q: "x", limit: 5 });
+  assert.equal(limits.max_results, 5, "limit must fill max_results");
+});
+
+test("SCHEMA DRIFT GUARD: no CURRENT alias silently shadows a real tool parameter", async () => {
+  // The invariant: for every alias name the table maps FROM, no tool may declare that name
+  // as its own parameter — unless the pair is deliberately bidirectional (q <-> query,
+  // limit <-> max_results), where both names are canonical for different tools and filling
+  // one from the other is the entire point.
+  //
+  // This guard has already earned its keep twice, on the change that introduced it: it
+  // caught `query` (canonical for four tools) and `text` (memory_remember's memory CONTENT)
+  // being mapped into `q`. Both were speculative aliases with no support in the data.
+  const src = readFileSync(join(here, "..", "index.js"), "utf8");
+  const { ARG_ALIASES } = await import("../lib/arg-aliases.js");
+
+  const bidirectional = new Set(["q", "query", "limit", "max_results"]);
+  const aliasNames = new Set(Object.values(ARG_ALIASES).flat());
+
+  for (const alias of aliasNames) {
+    if (bidirectional.has(alias)) continue;
+    const declared = new RegExp(`^\\s{6,}${alias}:\\s*\\{\\s*$`, "m").test(src);
+    assert.ok(
+      !declared,
+      `'${alias}' is in ARG_ALIASES but a tool declares it as its own parameter — aliasing ` +
+        `it would silently rename that tool's argument. Remove the alias, or make it ` +
+        `tool-scoped, or add it to the deliberate bidirectional set.`,
+    );
+  }
+});
+
+test("the bidirectional pair really is canonical on BOTH sides (not a rationalisation)", () => {
+  // If knowledge_search ever stops declaring `q`, or the `query` family disappears, the
+  // bidirectional exemption above becomes an unexamined hole. Pin both halves.
+  const src = readFileSync(join(here, "..", "index.js"), "utf8");
+  assert.match(src, /^\s{6,}q:\s*\{\s*$/m, "expected some tool to declare `q`");
+  assert.match(src, /^\s{6,}query:\s*\{\s*$/m, "expected some tool to declare `query`");
 });
 
 test("WIRING: index.js applies the aliases at the CallTool dispatch point", () => {

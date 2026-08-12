@@ -24,13 +24,35 @@
  * `q` and `query` gets exactly what it asked for. Only a missing/blank canonical is filled.
  */
 
+// BIDIRECTIONAL BY DESIGN. The 86 failures were not agents guessing wrong — this MCP
+// server's own surface is inconsistent, and `knowledge_search` is the odd one out:
+//
+//     query  ->  knowledge_hybrid_search, knowledge_context, memory_recall, recall_context
+//     q      ->  knowledge_search        (alone)
+//
+// Four sibling tools take `query`; the single most-used tool takes `q`. An agent that
+// learns `query` from any neighbour and applies it to knowledge_search gets a 400. So the
+// mapping runs BOTH ways: whichever spelling arrives, the other is filled in, and each tool
+// reads the key it declares. Handlers select named arguments when building their request,
+// so the extra key is inert rather than forwarded.
+//
+// Renaming knowledge_search's parameter instead would be a breaking change for every
+// existing caller that already passes `q` correctly. Accepting both costs nothing.
+// ONLY OBSERVED ALIASES. This table lists what agents were MEASURED to send, nothing more.
+// The first draft also mapped `search`, `text`, `top_k`, `topK`, `n` and the camelCase id
+// spellings — all invented, none seen in the data — and the drift guard below immediately
+// caught two of them colliding with real parameters that mean something else entirely:
+// four tools declare `query` as their own canonical, and `memory_remember` declares `text`
+// for the CONTENT of a memory. Aliasing that into `q` would have copied a memory's body
+// into a search-query slot.
+//
+// A speculative alias is not free: it is a silent rename of somebody else's parameter.
+// Add one only when a real failing call is observed to need it.
 const ARG_ALIASES = {
-  q: ["query", "search", "text"],
-  limit: ["max_results", "maxResults", "top_k", "topK", "n"],
-  article_id: ["articleId", "id"],
-  project_id: ["projectId"],
-  story_id: ["storyId"],
-  since_days: ["sinceDays", "days"],
+  q: ["query"],
+  query: ["q"],
+  limit: ["max_results"],
+  max_results: ["limit"],
 };
 
 function isBlank(v) {
