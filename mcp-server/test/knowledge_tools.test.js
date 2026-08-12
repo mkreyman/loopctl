@@ -253,9 +253,10 @@ async function knowledgeHybridSearch({ query, project_id, category, tags, match,
 }
 
 // US-31.4 — mirrors index.js knowledgeProgressiveIndex (GET, agent key).
-async function knowledgeProgressiveIndex({ topic, category, limit }) {
+async function knowledgeProgressiveIndex({ topic, query, category, limit }) {
   const params = new URLSearchParams();
-  if (topic != null) params.set("topic", topic);
+  const resolved = topic != null && topic !== "" ? topic : query;
+  if (resolved != null) params.set("topic", resolved);
   if (category) params.set("category", category);
   if (limit != null) params.set("limit", String(limit));
   const result = await apiCall(
@@ -1455,6 +1456,27 @@ describe("US-31.4: knowledge_hybrid_search", () => {
 });
 
 describe("US-31.4: knowledge_progressive_index and knowledge_progressive_drill", () => {
+  // #652 item 6 — the surface converged on ONE spelling. `topic` is the endpoint's
+  // parameter and stays accepted; `query` is what every other search-shaped tool here
+  // declares, so an agent that learned it from a neighbour is not thrown away.
+  test("index accepts the canonical `query` spelling as well as `topic`", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: [], meta: {} });
+
+    await knowledgeProgressiveIndex({ query: "refunds" });
+
+    assert.equal(new URL(calls[0].url).searchParams.get("topic"), "refunds");
+  });
+
+  test("an explicit `topic` still wins when both are supplied", async () => {
+    setupEnv();
+    const calls = mockFetch({ data: [], meta: {} });
+
+    await knowledgeProgressiveIndex({ topic: "chosen", query: "ignored" });
+
+    assert.equal(new URL(calls[0].url).searchParams.get("topic"), "chosen");
+  });
+
   test("index GETs progressive_index with the topic and returns capped stubs", async () => {
     setupEnv();
     const calls = mockFetch({
