@@ -106,6 +106,37 @@ payload until they are restarted. If context columns are unexpectedly sparse, ch
 | `rejected` rows by `rejection_reason` | near zero | a client is sending something the API refuses — that is a tool-surface defect, and historically the largest single class |
 | search→open follow-through | 1–7%, flat | the biggest number in this area and the least moved by anything shipped so far. See #652's closing section |
 
+## 3a. Judging a RANKING change — two objectives, and a position correction
+
+Two rules, both from the IR literature this corpus already carries (Bing Liu, *Web Data
+Mining* 2nd ed.; search the wiki for the `bing-liu` tag). Neither is optional, and both exist
+because a single-proxy loop optimises the wrong thing.
+
+**Never judge a ranking change on follow-through alone.** Engagement and relevance are
+distinct objectives — the sponsored-search finding is that a high-CTR/low-relevance result
+earns revenue while destroying trust, and "revenue optimisation alone is insufficient". Our
+analogue: a ranking can lift opens by returning fewer, safer, more clickable results and be
+worse for the agent. So judge on BOTH:
+
+1. observed opens, position-corrected (below), and
+2. `mix loopctl.retrieval.eval` — the golden-question relevance gate.
+
+**A variant that lifts opens while regressing the eval loses.** And remember the other half:
+a missing open is not disinterest. An agent whose question is answered by the snippet
+correctly opens nothing, and that is a success this metric scores as a failure. Follow-through
+is a floor, never a satisfaction rate.
+
+**Correct for position before comparing two arms.** `mode_used` now distinguishes
+`combined_curated` from `combined_retrieved`, and the curated arm puts its winner at rank 1
+BY CONSTRUCTION. Clicks carry position bias, so rank 1 is opened more whatever sits there —
+a higher raw follow-through on the curated arm is therefore not evidence the hoist helped.
+Compare the arms at the SAME rank, using the position-corrected query in the
+`Loopctl.Knowledge.SearchEvent` moduledoc.
+
+One caution specific to our volume: the arms are thin, and automation rows surface results and
+never open anything, which depresses every rank uniformly. Segment on `client_host IS NOT NULL`
+here too, and do not read a few dozen rows as a result.
+
 ## 4. The trap
 
 Search returns; agents do not open. Search-to-read has sat near 27:1, and 1.74% of
