@@ -2,24 +2,50 @@ name: MCP Server CI
 
 # The main ci.yml is Elixir-only and never touches mcp-server/, so the npm
 # package's own test suite was never run in CI — and the auto-publish workflow
-# ships it to npm on a version bump WITHOUT testing. This job closes that gap:
-# it runs the deterministic node --test unit suite on every push/PR that touches
-# mcp-server/**, so a red suite is caught before merge (and, via the publish
-# gates in mcp-autopublish.yml / npm-publish.yml, before an npm release).
+# ships it to npm on a version bump WITHOUT testing. This workflow closes that
+# gap: it runs the deterministic node --test unit suite on every push/PR that
+# touches mcp-server/**, so a red suite is caught before merge (and, via the
+# publish gates in mcp-autopublish.yml / npm-publish.yml, before an npm release).
+#
+# WHY THE TRIGGER HAS NO paths: FILTER ANY MORE (and the per-job filter instead).
+# "Node unit tests" was never a REQUIRED status check, so a red suite showed up
+# in the checks panel and the PR merged anyway — and auto-publish could then ship
+# it. It could not simply be added to the required contexts either: a path-filtered
+# workflow never reports at all on a PR that misses the filter, so every unrelated
+# PR would sit on "Expected — waiting for status" forever. The fix is the standard
+# one: fire the workflow on EVERY PR, decide inside it whether the suite needs to
+# run, and expose a single always-reporting job ("MCP Server Gate") as the required
+# context. That job is the one to add to branch protection — NOT "Node unit tests",
+# which stays path-conditional and therefore still skippable.
 
 on:
   push:
     branches: [master]
-    paths:
-      - 'mcp-server/**'
   pull_request:
     branches: [master]
-    paths:
-      - 'mcp-server/**'
 
 jobs:
+  # Cheap path probe. `test` keys off this instead of a workflow-level paths:
+  # filter so the gate below always has a job to report on.
+  changes:
+    name: Detect mcp-server changes
+    runs-on: ubuntu-latest
+    outputs:
+      mcp: ${{ steps.filter.outputs.mcp }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            mcp:
+              - 'mcp-server/**'
+              - '.github/workflows/mcp-server-ci.yml'
+
   test:
     name: Node unit tests
+    needs: changes
+    if: needs.changes.outputs.mcp == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -40,3 +66,31 @@ jobs:
       # witness state and would flake CI (run it manually via `npm run test:smoke`).
       - name: Run unit tests
         run: npm test
+
+  # THE REQUIRED CONTEXT. Runs on every PR regardless of paths, so it always
+  # reports; if: always() is what makes it report even when `test` failed or was
+  # skipped. A skipped `test` (no mcp-server/ change) is a pass; anything other
+  # than success or skipped — failure, cancelled, or a `changes` job that itself
+  # blew up — fails the gate. Note the deliberate asymmetry: a SKIPPED test is
+  # only benign because `changes` proved there was nothing to test, so the gate
+  # checks the probe's result too rather than trusting the skip on its own.
+  mcp-gate:
+    name: MCP Server Gate
+    needs: [changes, test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Assert the unit suite did not fail
+        run: |
+          probe='${{ needs.changes.result }}'
+          suite='${{ needs.test.result }}'
+          echo "changes=$probe test=$suite"
+          if [ "$probe" != success ]; then
+            echo "The path probe did not succeed — refusing to pass the gate blind."
+            exit 1
+          fi
+          case "$suite" in
+            success) echo "mcp-server unit suite green." ;;
+            skipped) echo "No mcp-server change in this PR — nothing to test." ;;
+            *)       echo "mcp-server unit suite is $suite."; exit 1 ;;
+          esac
