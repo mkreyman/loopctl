@@ -8,7 +8,7 @@ defmodule Loopctl.Knowledge.SearchEventTest do
   the schema could not represent, and recovering it required hand-mining 6,457 session
   transcripts across two machines.
   """
-  use Loopctl.DataCase, async: true
+  use LoopctlWeb.ConnCase, async: true
 
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.SearchEvent
@@ -150,6 +150,44 @@ defmodule Loopctl.Knowledge.SearchEventTest do
 
       assert all_search_events(tenant_a.id) == []
       assert length(all_search_events(tenant_b.id)) == 1
+    end
+  end
+
+  describe "rejected calls — the population that never reaches the search path" do
+    setup do
+      tenant = fixture(:tenant)
+      {raw, api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      %{tenant: tenant, api_key: api_key, raw: raw}
+    end
+
+    test "a call refused for a missing query IS recorded", %{tenant: tenant, raw: raw} do
+      # The whole reason this table exists. A 400 never reaches maybe_record_search_access,
+      # so without wiring the controller the `rejected` outcome is dead code and the
+      # population the migration promises to capture stays invisible.
+      conn =
+        Phoenix.ConnTest.build_conn()
+        |> Plug.Conn.put_req_header("authorization", "Bearer #{raw}")
+        |> Phoenix.ConnTest.get(~p"/api/v1/knowledge/search")
+
+      assert conn.status == 400
+
+      [event] = all_search_events(tenant.id)
+      assert event.outcome == "rejected"
+      assert event.rejection_reason == "missing_query"
+      assert event.result_count == 0
+      assert event.tenant_id == tenant.id
+    end
+
+    test "the reason is a STABLE tag, not the human-facing prose", %{tenant: tenant, raw: raw} do
+      # A metric keyed on the message text silently splits into two series the day the
+      # wording changes.
+      Phoenix.ConnTest.build_conn()
+      |> Plug.Conn.put_req_header("authorization", "Bearer #{raw}")
+      |> Phoenix.ConnTest.get(~p"/api/v1/knowledge/search")
+
+      [event] = all_search_events(tenant.id)
+      refute event.rejection_reason =~ " "
+      assert event.rejection_reason in ["missing_query", "bad_request", "invalid_cursor"]
     end
   end
 

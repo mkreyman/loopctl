@@ -19,6 +19,7 @@ defmodule LoopctlWeb.KnowledgeSearchController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Egress
   alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.Analytics
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleCursor
   alias LoopctlWeb.Helpers.ProjectId
@@ -342,6 +343,61 @@ defmodule LoopctlWeb.KnowledgeSearchController do
         cursor_mode ->
           run_keyset(conn, tenant_id, query_spec, cursor_mode, opts)
       end
+    else
+      # #658: RECORD THE REJECTION. A call refused here never reaches the search path, so
+      # `maybe_record_search_access/5` — the only other writer — never sees it, and the
+      # rejected population stays invisible to the product's own analytics. That blindness
+      # is exactly why a catalogue of 86 refused calls had to be recovered by hand-mining
+      # session transcripts.
+      #
+      # Catch-all rather than a per-shape match: an error shape added later must still be
+      # counted, and the clause returns `error` untouched so rendering is unchanged.
+      error ->
+        record_rejected_search(conn, params, error)
+        error
+    end
+  end
+
+  # Best-effort rejection telemetry. Never raises and never alters the response.
+  defp record_rejected_search(conn, params, error) do
+    api_key = conn.assigns[:current_api_key]
+
+    if api_key do
+      Analytics.record_search_attempt(api_key.tenant_id, %{
+        api_key_id: api_key.id,
+        agent_id: Map.get(api_key, :agent_id),
+        query: trim_query(params["q"]),
+        tool: "knowledge_search",
+        mode_requested: params["mode"],
+        rejected?: true,
+        rejection_reason: rejection_reason(error),
+        result_count: 0
+      })
+    end
+
+    :ok
+  rescue
+    _ -> :ok
+  end
+
+  # A STABLE tag, not the prose message: the message is tuned for humans and gets reworded,
+  # and a metric keyed on prose silently splits into two series the day it does.
+  #
+  # A STABLE tag, not the prose message: the message is tuned for humans and gets reworded,
+  # and a metric keyed on prose silently splits into two series the day it does.
+  #
+  # ONE clause, no catch-all, because dialyzer proved the error surface reaching this
+  # `else` is exactly `{:error, :bad_request | :unprocessable_entity, binary}` — every
+  # other shape I first wrote (a 2-tuple, an atom-only 3-tuple, a wildcard) was provably
+  # dead code. If a future error shape appears here this raises FunctionClauseError, which
+  # `record_rejected_search/3`'s rescue swallows: the telemetry row is lost and the
+  # response is untouched. That is the correct failure direction for a recorder.
+  defp rejection_reason({:error, _status, msg}) when is_binary(msg) do
+    cond do
+      String.contains?(msg, "'q' is required") -> "missing_query"
+      String.contains?(msg, "cursor") -> "invalid_cursor"
+      String.contains?(msg, "project_id") -> "invalid_project_id"
+      true -> "bad_request"
     end
   end
 
