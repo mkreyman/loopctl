@@ -124,8 +124,51 @@ jobs:
       # That gap stopped being tolerable once /enroll shipped a ceremony that is
       # entirely client-side: for that page, broken JS is a broken feature with a
       # green build. esbuild and tailwind are standalone binaries — no Node.js.
+      # These two standalone binaries are fetched from GitHub's release CDN, and that fetch
+      # gates the deploy. On 2026-08-12 it failed three times in half an hour
+      # (`socket_closed_remotely`, then a plain `503 Service Unavailable`), each time AFTER
+      # format, credo, dialyzer and the whole test suite had passed — so a GitHub outage
+      # skipped Deploy and left master red for a reason with nothing to do with the change
+      # under test.
+      #
+      # TWO layers, because one is not enough and the run that proved it is on record.
+      #
+      # 1. A DEDICATED CACHE, which is the actual fix. `_build` is already cached, but
+      #    `actions/cache` only SAVES on a key miss — so a cache first populated by a run
+      #    where this step had not yet succeeded never gets the binaries added, and every
+      #    later run restores it without them and fetches again. That is why the fault
+      #    recurred rather than being random. Keyed on the two VERSIONS (not mix.lock), so
+      #    one successful fetch is reused until a version actually changes, and an ordinary
+      #    dependency bump does not send us back to the CDN.
+      #
+      # 2. The retry stays, for the brief hiccup a cache miss can still land on. It is NOT
+      #    sufficient on its own: this exact wrapper ran on the outage above, took all three
+      #    attempts, and exited 1 — correctly, but ~30s of backoff cannot outlast a
+      #    multi-minute 503. Do not "fix" that by lengthening the backoff; the cache is what
+      #    removes the dependency, the retry only smooths it.
+      - name: Cache asset toolchain binaries
+        uses: actions/cache@v4
+        with:
+          path: |
+            _build/tailwind-linux-x64
+            _build/esbuild-linux-x64
+          # Keyed on config/config.exs itself, NOT on the version strings written out here.
+          # Both versions live in that file, and a hand-copied key drifts from them silently
+          # — `tailwind.install --if-missing` sees a binary present and does NOT re-fetch, so
+          # a stale key would build the app with the WRONG toolchain version and say nothing.
+          # Hashing the file can only ever cost an unnecessary re-fetch on an unrelated
+          # config edit, which is the harmless direction to be wrong in.
+          key: ${{ runner.os }}-assets-${{ hashFiles('config/config.exs') }}
+
       - name: Install asset toolchain
-        run: mix assets.setup
+        run: |
+          for attempt in 1 2 3; do
+            if mix assets.setup; then exit 0; fi
+            echo "assets.setup failed (attempt $attempt/3); retrying in $((attempt * 5))s"
+            sleep $((attempt * 5))
+          done
+          echo "assets.setup failed after 3 attempts"
+          exit 1
 
       - name: Build assets
         run: mix assets.deploy
