@@ -232,7 +232,11 @@ defmodule LoopctlWeb.ArticleWorkflowController do
       "Lists draft articles ordered by inserted_at desc. " <>
         "Includes source_type and source_id for review queue visibility. Role: orchestrator+.",
     parameters: [
-      project_id: [in: :query, type: :string, description: "Filter by project UUID"],
+      project_id: [
+        in: :query,
+        type: :string,
+        description: "Filter by project: UUID, slug, or repo directory name"
+      ],
       limit: [
         in: :query,
         type: :integer,

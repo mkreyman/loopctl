@@ -75,7 +75,7 @@ defmodule LoopctlWeb.KnowledgeSearchController do
       project_id: [
         in: :query,
         type: :string,
-        description: "Filter by project UUID",
+        description: "Filter by project: UUID, slug, or repo directory name",
         required: false
       ],
       category: [

@@ -21,6 +21,13 @@ defmodule LoopctlWeb.Helpers.ProjectId do
       value that could raise. Rejecting them here would needlessly break clients
       that send array-style params.
 
+  Since #652, `LoopctlWeb.Plugs.ResolveProjectRef` runs LAST in the `:authenticated`
+  pipeline and rewrites a `project_id` that carries a project reference (a slug, or the
+  repo directory name an agent actually types) into that project's UUID first. So by the
+  time this runs, a 422 means genuinely unresolvable — not merely "not a UUID". Keep the
+  two in that order: validating first would 422 the exact values the plug exists to
+  rescue.
+
   The canonical 36-char form is required on purpose: `Ecto.UUID.cast/1` also
   accepts a raw 16-byte binary, so a 16-char junk segment would otherwise coerce
   into a bogus-but-valid UUID and silently narrow (or leak nothing from) a query

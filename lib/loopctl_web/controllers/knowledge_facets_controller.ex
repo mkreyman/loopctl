@@ -51,7 +51,11 @@ defmodule LoopctlWeb.KnowledgeFacetsController do
       source_type: [in: :query, type: :string, description: "Filter by source_type"],
       source_id: [in: :query, type: :string, description: "Filter by source_id"],
       idempotency_key: [in: :query, type: :string, description: "Filter by idempotency_key"],
-      project_id: [in: :query, type: :string, description: "Filter by project UUID"]
+      project_id: [
+        in: :query,
+        type: :string,
+        description: "Filter by project: UUID, slug, or repo directory name"
+      ]
     ],
     responses: %{
       200 =>
@@ -104,7 +108,11 @@ defmodule LoopctlWeb.KnowledgeFacetsController do
       status: [in: :query, type: :string, description: "Filter by status"],
       tags: [in: :query, type: :string, description: "Filter by tags (comma-separated)"],
       match: [in: :query, type: :string, description: "Tag match mode: any (default) or all"],
-      project_id: [in: :query, type: :string, description: "Filter by project UUID"],
+      project_id: [
+        in: :query,
+        type: :string,
+        description: "Filter by project: UUID, slug, or repo directory name"
+      ],
       limit: [
         in: :query,
         type: :integer,
