@@ -896,7 +896,23 @@ defmodule Loopctl.Knowledge do
 
   - `{:ok, %Article{}}` with preloaded links
   - `{:error, :not_found}` if no tenant-owned article and no published system canonical
-    has that id
+    has that id, or if a prefix matches more than one
+
+  ## Prefix resolution (#652)
+
+  An exact miss falls back to resolving `article_id` as a UNIQUE ID PREFIX within the
+  same visibility scope. 16 of 20 sampled `knowledge_get` 404s carried a correct
+  8-character prefix with a confabulated tail — 12 zero-padded
+  (`f09da4ed-0000-0000-0000-000000000000`), 4 bare prefixes, and one fully plausible
+  wrong UUID. Agents cannot reliably retype 36 characters out of context, and this is a
+  found-it-then-lost-it failure: the search worked and the read was thrown away.
+
+  The fallback takes the first 8 hex digits (dashes stripped) and range-scans the
+  primary key between `<prefix>-0000-…` and `<prefix>-ffff-…`, so it costs an index
+  range scan rather than a text scan. It resolves ONLY when exactly one visible article
+  matches; two or more is `:not_found`, never a guess. The scope predicate is identical
+  to the exact lookup, so this widens nothing: a prefix can no more reach another
+  tenant's article than the full id could.
   """
   @spec get_article(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, Article.t()} | {:error, :not_found}
@@ -912,15 +928,95 @@ defmodule Loopctl.Knowledge do
   # a draft or archived canonical — and the tenant arm is unchanged, so a tenant still reads
   # its own drafts.
   def get_article(tenant_id, article_id, opts \\ []) do
-    case AdminRepo.one(
-           from(a in Article,
-             where: a.id == ^article_id,
-             where: a.tenant_id == ^tenant_id or (a.scope == :system and a.status == :published)
-           )
-         ) do
-      nil -> {:error, :not_found}
-      article -> finalize_article_read(tenant_id, article, opts)
+    case locate_article(tenant_id, article_id) do
+      {:ok, article} -> finalize_article_read(tenant_id, article, opts)
+      {:error, :not_found} -> {:error, :not_found}
     end
+  end
+
+  # Exact id first; only a MISS pays for the prefix fallback, so the common read is
+  # byte-for-byte the query it always was.
+  defp locate_article(tenant_id, article_id) do
+    case exact_article(tenant_id, article_id) do
+      nil -> prefix_article(tenant_id, article_id)
+      article -> {:ok, article}
+    end
+  end
+
+  # A non-UUID `article_id` would raise Ecto.Query.CastError here, so it never reaches
+  # the query — a bare prefix goes straight to the fallback instead of a 500.
+  defp exact_article(tenant_id, article_id) when is_binary(article_id) do
+    case Ecto.UUID.cast(article_id) do
+      {:ok, uuid} ->
+        Article
+        |> where([a], a.id == ^uuid)
+        |> visible_article_scope(tenant_id)
+        |> AdminRepo.one()
+
+      :error ->
+        nil
+    end
+  end
+
+  defp exact_article(_tenant_id, _article_id), do: nil
+
+  defp prefix_article(tenant_id, article_id) do
+    case id_prefix_range(article_id) do
+      {:ok, low, high} ->
+        Article
+        |> where([a], a.id >= ^low and a.id <= ^high)
+        |> visible_article_scope(tenant_id)
+        |> limit(2)
+        |> AdminRepo.all()
+        |> case do
+          [article] ->
+            emit_prefix_resolved(tenant_id, article, article_id)
+            {:ok, article}
+
+          _ ->
+            {:error, :not_found}
+        end
+
+      :error ->
+        {:error, :not_found}
+    end
+  end
+
+  # The SAME disjunction the exact lookup uses — kept in one place so the prefix path
+  # can never drift into a wider scope than the id path it backs up.
+  defp visible_article_scope(query, tenant_id) do
+    where(
+      query,
+      [a],
+      a.tenant_id == ^tenant_id or (a.scope == :system and a.status == :published)
+    )
+  end
+
+  # 8 hex digits = 32 bits. Against a corpus of ~10^5 articles a collision is ~0.002%
+  # per lookup, and a collision resolves to :not_found anyway (two matches never
+  # resolve), so the failure mode of being wrong here is the 404 the caller already had.
+  @id_prefix_length 8
+
+  defp id_prefix_range(value) when is_binary(value) do
+    hex = value |> String.replace("-", "") |> String.downcase()
+
+    with true <- String.length(hex) >= @id_prefix_length,
+         prefix <- String.slice(hex, 0, @id_prefix_length),
+         true <- String.match?(prefix, ~r/\A[0-9a-f]{8}\z/) do
+      {:ok, prefix <> "-0000-0000-0000-000000000000", prefix <> "-ffff-ffff-ffff-ffffffffffff"}
+    else
+      _ -> :error
+    end
+  end
+
+  defp id_prefix_range(_value), do: :error
+
+  defp emit_prefix_resolved(tenant_id, article, requested) do
+    :telemetry.execute(
+      Loopctl.TelemetryEvents.article_prefix_resolved(),
+      %{count: 1},
+      %{tenant_id: tenant_id, article_id: article.id, requested: requested}
+    )
   end
 
   # Shared visibility/preload/access-tracking tail of an article fetch, once the row itself
