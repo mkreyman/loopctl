@@ -10,91 +10,45 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
   threaded into the search response `meta` (AC-41.1.7), and the re-embed
   coexistence + pending-dimension exclusion reporting (AC-41.1.10).
 
-  ## The `left: []` flake — LEADING HYPOTHESIS, not proven, no fix landed. Read before touching.
+  ## The `left: []` flake — SETTLED and FIXED (#645). Read before touching.
 
   This file (and its siblings `system_config_read_path_test.exs`,
-  `embeddings_review_fixes_test.exs`) intermittently fails with `left: []` — an
-  assertion expecting article ids gets an empty list. It clears on re-run every time,
-  it moves between files and between tests within a file, and four fixes have been aimed
-  at it. It is still here.
+  `embeddings_review_fixes_test.exs`) intermittently failed with `left: []` — an assertion
+  expecting article ids got an empty list. It cleared on re-run every time, moved between
+  files, and four ANN-recall fixes were aimed at it. It is now reproduced deterministically
+  and fixed at the cause.
 
-  What is actually known:
+  **The cause.** Sandbox rolls back every test, and a rolled-back INSERT leaves its HNSW
+  entry in the shared graph until vacuum. A row inserted afterwards links to its nearest
+  neighbours — which by then are all DEAD elements — and pgvector's scan SKIPS dead elements
+  rather than traversing through them. The live row is therefore UNREACHABLE from the graph
+  entry point: the ANN returns nothing while a `count()` on the same connection shows the row
+  present. That is the captured CI signature exactly — `rows=0` with NO `Rows Removed by
+  Filter` line, because nothing was filtered.
 
-    * **The plan for these reads is NOT STABLE, and that is measured, not theorised.**
-      Running one of these assertions repeatedly against an unchanged database, three
-      shapes appear: a Seq Scan + real Sort, an `article_embeddings_tenant_id_dim_index`
-      (btree) Index Scan + real Sort — both EXACT, they cannot under-return — and an
-      `article_embeddings_hnsw_dim_1536_idx` Index Scan, which is APPROXIMATE. One
-      ten-run sample went 7 exact / 3 HNSW, with the Seq Scan's estimated cost climbing
-      run over run as rolled-back test transactions leave dead tuples behind. So "this
-      suite does not execute the ANN path" and "this suite does execute it" are BOTH
-      true, at different moments. Any claim about this file's plan that does not say
-      WHICH run it describes is not a fact about the suite.
-    * **On the HNSW branch, the `tenant_id` predicate is a POST-INDEX residual Filter**
-      (`Filter: (tenant_id = ...)`, `Rows Removed by Filter: N`), which is the shape
-      that can under-return. Measured on the forced-failure runs of this file: with
-      `hnsw.iterative_scan` OFF the HNSW branch returned `rows=0` and `rows=3` where 23
-      rows were visible; with `relaxed_order` — which is what `HeavyRead` actually
-      applies, and what prod runs — it returned the full `rows=20` every time.
-    * **That hypothesis is now DEAD, and the diagnostic below is what killed it.** It
-      predicted a recurrence would show an HNSW plan with iterative scan ABSENT. A real
-      recurrence was captured (`tenant isolation holds on the side-table read path`) and
-      showed the opposite: `iterative_scan="relaxed_order" (supported?=true)` — applied,
-      not absent — and it under-returned anyway. Do not go looking for a failed
-      capability probe.
-    * **What that capture DOES show is an HNSW plan with a post-ANN tenant `Filter` that
-      under-returned.** The plan was the shared `article_embeddings_hnsw_dim_1536_idx`, so
-      the ANN picks its nearest N across EVERY tenant's rows and discards the non-matching
-      ones afterwards; the inner pool produced 20 and the outer pool truncates to `pool=5`.
-      CANDIDATE STARVATION — the tenant's one `scope: :tenant` row losing all 5 slots to its
-      materialized system rows — fits those numbers and is the leading hypothesis, but is
-      NOT proven by them: the ~24-row corpus the diagnostic printed was captured AFTER the
-      read, and `search_semantic/3` materializes the system corpus as a side effect of
-      building its disclosure `meta`, so that count can be strictly larger than the set the
-      ANN actually scanned (the diagnostic says so itself). Let the next capture's
-      `Rows Removed by Filter` decide it.
-    * **So the page size is the lever that diagnosis points at — and config disables it.** `limit:` is
-      clamped by `semantic_result_pool_cap` (5 in `config/test.exs`), so widening a page
-      buys NOTHING while that cap stands. This is why four fixes and fourteen wide
-      `limit:` annotations did not stop it: the diagnosis was right and the remedy was
-      inert. Adding a fifteenth `limit:` is not the fix; the cap was — for the STARVATION
-      mode only. See the second capture below: the recall-loss mode survives the raised cap.
-    * The one CI failure captured in detail asserted on a raw `HeavyRead.all/2` and
-      never called `search_semantic/3` at all.
-    * Every failure mode seen UNDER-returns. Nothing has ever returned another tenant's
-      rows: this is not an isolation defect.
-    * A dedicated read-only investigation could not reproduce it in 33 local runs.
+  **Why every knob failed.** Reachability is not a breadth problem. Measured in
+  `test/loopctl/embeddings/hnsw_dead_entry_recall_test.exs`: the same read returns `[]` under
+  `hnsw.iterative_scan = off`, under `relaxed_order`, and under `hnsw.ef_search = 1000`.
+  Candidate STARVATION is also retired — the reproduction has no live competitors at all.
 
-  So: do NOT ship a fifth speculative recall fix. `hnsw.ef_search`, exact-scan forcing,
-  `hnsw.iterative_scan` and retry-on-empty have each been tried and each regressed
-  something else — and none of them can be the lever while the pool cap clamps the page.
-  Collect the diagnostic below FIRST and let it name the branch.
+  **The fix.** `test/test_helper.exs` DROPS every pgvector HNSW index unless
+  `SCALE_TESTS` is set, so every vector read in the default suite is served by an EXACT plan
+  (seq or btree + sort) that cannot under-return. Nothing real is lost: this suite's ANN
+  coverage was already accidental (the plan was measured flipping 7 exact / 3 HNSW over ten
+  runs of an unchanged database), and the ANN plan is gated properly by the CI scale job over
+  a committed, ANALYZEd 80k-row corpus — the only corpus whose graph resembles production's.
 
-  The remaining work is to raise `semantic_result_pool_cap` for this suite WITHOUT
-  breaking the three tests that depend on the current value —
-  `knowledge_semantic_search_test.exs:1348`, `:1376` and `:1432` each seed exactly
-  `cap + 2` rows to trip the truncation signal cheaply, so a naive raise fails all
-  three. That is a real constraint, not a reason to leave the cap alone; this repo
-  forbids `Application.put_env` in tests, so it needs either a reseed or a per-call
-  override on those three.
+  So do NOT "restore" the indexes for this suite, and do NOT add a fifth recall knob. If a
+  `left: []` reappears here, it is a NEW defect: `Loopctl.VectorRecallDiagnostics` is still
+  wrapped around every assertion that ever produced the signature and fires only on an empty
+  result, printing (a) whether the row was VISIBLE as unlimited `count()`s and (b) the
+  `EXPLAIN (ANALYZE, BUFFERS)` of the query that just came back empty. Start from that
+  output — and note that on this suite the plan should now never be an HNSW one.
 
-  ### What to do on the next recurrence
-
-  Every assertion in this file that has produced the signature is wrapped in
-  `Loopctl.VectorRecallDiagnostics.diagnose_empty/2`, which fires ONLY on an empty
-  result and dumps the two facts that a bare `left: []` cannot separate:
-
-    * **(a) the row was not VISIBLE** to the read (tenant, `dim`, `live_denorm`, status),
-      printed as unlimited `count()`s (decide on those, not on the capped row sample
-      beside them); versus
-    * **(b) the row was visible and the PLAN did not return it**, printed as
-      `EXPLAIN (ANALYZE, BUFFERS)` of the exact query that just came back empty, run
-      with the `hnsw.*` GUCs that read itself ran with — which for an assertion on a bare
-      `HeavyRead.all/2` means none.
-
-  Paste that output into the next investigation instead of another theory. The two
-  numbers that decide it are the scan node's `actual ... rows=` and, on an HNSW plan,
-  `Rows Removed by Filter`.
+  Two things #535 established that still hold: `SET LOCAL` leaks out of a committed
+  SAVEPOINT (closed in `Loopctl.LocalGuc`, which `HeavyRead` routes every per-read
+  `SET LOCAL` through), and no failure mode has EVER returned another tenant's rows — this
+  was never an isolation defect.
 
   ## Why this is `async: false`
 
@@ -188,6 +142,12 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
   """
 
   use Loopctl.DataCase, async: false
+
+  # #645 — vacuum the pgvector graph before each test in this module. Rolled-back tests
+  # leave DEAD HNSW entries behind, and pgvector's scan skips dead elements rather than
+  # traversing through them, which makes a visible row UNREACHABLE and returns `[]`. See
+  # `Loopctl.DataCase.vacuum_vector_indexes/0`.
+  @moduletag :vacuum_vector_indexes
   use Oban.Testing, repo: Loopctl.Repo
 
   alias Loopctl.AdminRepo
