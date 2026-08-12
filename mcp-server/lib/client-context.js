@@ -87,11 +87,19 @@ function clientContext({ version } = {}) {
     version,
   };
 
-  // A dispatched subagent sets CLAUDE_CODE_CHILD_SESSION=1. Recorded as a real boolean so
-  // the two populations can be compared; left absent when the variable is not set at all,
-  // rather than guessed as false.
+  // main vs child. A dispatched agent sets CLAUDE_CODE_CHILD_SESSION=1.
+  //
+  // Only TWO values, on purpose. A workflow agent cannot be distinguished from an ordinary
+  // subagent here: CLAUDE_CODE_WORKFLOWS is a feature flag that is present in main sessions
+  // too, and nothing else marks one. Since an audit measured materially different failure
+  // rates across main/workflow/subagent, the third value matters — but it is recoverable
+  // only OFFLINE, by joining session_id to the transcript path (wf_* vs subagents/). Report
+  // what is observable and let the join supply the rest; do not guess a value that would
+  // then be analysed as fact.
   const child = env("CLAUDE_CODE_CHILD_SESSION");
-  if (child !== undefined) ctx.subagent = child === "1" || child.toLowerCase() === "true";
+  if (child !== undefined) {
+    ctx.kind = child === "1" || child.toLowerCase() === "true" ? "child" : "main";
+  }
 
   for (const k of Object.keys(ctx)) {
     if (ctx[k] === undefined || ctx[k] === null || ctx[k] === "") delete ctx[k];

@@ -31,6 +31,53 @@ defmodule Loopctl.Knowledge.SearchEvent do
   - `"rejected"` — never ran: a validation failure (a missing query, a malformed id).
     `rejection_reason` carries the code.
 
+  ## Reading it back
+
+  There is deliberately no API endpoint yet: this is an operator/analysis table, and the
+  analysis that motivated it was run with psql against prod. The canonical queries are kept
+  HERE, beside the schema, so the read path is discoverable from the thing it reads — a
+  capture surface with no documented way to query it is how a table becomes write-only.
+
+      -- Outcome mix, and the zero-result rate that was previously unknowable.
+      SELECT outcome, count(*), round(100.0 * count(*) / sum(count(*)) OVER (), 1) AS pct
+        FROM search_events
+       WHERE tenant_id = $1 AND inserted_at > now() - interval '30 days'
+       GROUP BY 1 ORDER BY 2 DESC;
+
+      -- Query SHAPE against success. The single-token and machine-noise classes fall out.
+      SELECT CASE WHEN query_terms IS NULL THEN 'no query'
+                  WHEN query_terms = 1 THEN '1 token'
+                  WHEN query_terms <= 3 THEN '2-3'
+                  ELSE '4+' END AS shape,
+             count(*), count(*) FILTER (WHERE outcome = 'zero_results') AS zero
+        FROM search_events WHERE tenant_id = $1 GROUP BY 1 ORDER BY 1;
+
+      -- WHO searches and who fails: the main/child split, and the repo the agent was in.
+      SELECT client_kind, client_repo, client_effort, count(*),
+             count(*) FILTER (WHERE outcome IN ('zero_results','rejected')) AS bad
+        FROM search_events WHERE tenant_id = $1 GROUP BY 1,2,3 ORDER BY 4 DESC;
+
+      -- Degradation, by cause.
+      SELECT fallback_reason, count(*), count(*) FILTER (WHERE result_count = 0) AS empty
+        FROM search_events WHERE degraded GROUP BY 1 ORDER BY 2 DESC;
+
+      -- Follow-through: did the searcher OPEN anything? The 27:1 search-to-read ratio is
+      -- the biggest number in this whole area, and this join is how to watch it move.
+      SELECT count(*) AS searches,
+             count(*) FILTER (WHERE EXISTS (
+               SELECT 1 FROM article_access_events a
+                WHERE a.tenant_id = s.tenant_id
+                  AND a.access_type IN ('get','context','drill')
+                  AND a.accessed_at BETWEEN s.inserted_at AND s.inserted_at + interval '30 minutes'
+             )) AS followed_through
+        FROM search_events s
+       WHERE s.tenant_id = $1 AND s.outcome = 'ok';
+
+  `client_model` is not populated by the client (no model variable exists in the agent
+  environment); enrich it offline by joining `client_session_id` to the session transcript,
+  which records the model. The same join separates workflow agents from ordinary subagents,
+  which `client_kind` cannot.
+
   ## Recording is best-effort and MUST NOT fail a search
 
   A telemetry write that can break the read path is a worse defect than the blindness it
@@ -80,7 +127,7 @@ defmodule Loopctl.Knowledge.SearchEvent do
     field :client_host, :string
     field :client_repo, :string
     field :client_entrypoint, :string
-    field :client_subagent, :boolean
+    field :client_kind, :string
     field :client_version, :string
 
     field :outcome, :string
@@ -94,7 +141,7 @@ defmodule Loopctl.Knowledge.SearchEvent do
                total_count top_result_id top_result_score result_count degraded
                fallback_reason ann_iterative_scan duration_ms outcome rejection_reason
                client_session_id client_effort client_model client_host client_repo
-               client_entrypoint client_subagent client_version)a
+               client_entrypoint client_kind client_version)a
 
   @doc """
   Builds an insert changeset. `tenant_id` is set programmatically by the caller and is

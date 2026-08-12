@@ -42,27 +42,37 @@ test("captures the facts that ARE observable", () => {
       assert.equal(ctx.session_id, "sess-123");
       assert.equal(ctx.effort, "high");
       assert.equal(ctx.entrypoint, "cli");
-      assert.equal(ctx.subagent, true);
+      assert.equal(ctx.kind, "child");
       assert.equal(ctx.version, "2.9.9");
       assert.ok(ctx.host, "hostname is always available");
     },
   );
 });
 
-test("a MAIN session is distinguishable from a dispatched subagent", () => {
-  // The two populations search differently by construction — a subagent never receives the
-  // recall pack — so averaging them together hides both.
+test("a MAIN session is distinguishable from a dispatched child", () => {
+  // These populations search differently by construction — a child never receives the
+  // recall-pack injection — and an audit measured materially different failure rates
+  // across them, so averaging them hides all of it.
   withEnv({ CLAUDE_CODE_CHILD_SESSION: "1" }, () => {
-    assert.equal(clientContext().subagent, true);
+    assert.equal(clientContext().kind, "child");
   });
   withEnv({ CLAUDE_CODE_CHILD_SESSION: "0" }, () => {
-    assert.equal(clientContext().subagent, false);
+    assert.equal(clientContext().kind, "main");
   });
 });
 
-test("an UNSET subagent flag is omitted, not guessed as false", () => {
+test("an UNSET child flag is omitted, not guessed", () => {
   withEnv({ CLAUDE_CODE_CHILD_SESSION: undefined }, () => {
-    assert.equal("subagent" in clientContext(), false);
+    assert.equal("kind" in clientContext(), false);
+  });
+});
+
+test("a WORKFLOW agent is not falsely labelled — the flag cannot see it", () => {
+  // CLAUDE_CODE_WORKFLOWS is a feature flag present in MAIN sessions too, so it must never
+  // be read as "this is a workflow agent". The third value is an offline join, not a guess.
+  withEnv({ CLAUDE_CODE_WORKFLOWS: "1", CLAUDE_CODE_CHILD_SESSION: undefined }, () => {
+    const ctx = clientContext();
+    assert.equal("kind" in ctx, false, "a feature flag must not be mistaken for a kind");
   });
 });
 

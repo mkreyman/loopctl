@@ -93,10 +93,20 @@ defmodule Loopctl.Repo.Migrations.CreateSearchEvents do
       # without it.
       add :client_repo, :string
       add :client_entrypoint, :string
-      # Main session vs dispatched subagent. Subagents never see the recall pack, so they
-      # search differently by construction; without this the two populations are averaged
-      # together and neither is legible.
-      add :client_subagent, :boolean
+      # Main session vs dispatched child (subagent OR workflow agent). This matters: an
+      # audit measured materially different failure RATES across those populations
+      # (main 8.2%, workflow 6.0%, subagent 3.7% on one failure class), and averaging them
+      # hides all three. Children also never see the recall-pack injection, so they search
+      # differently by construction.
+      #
+      # A STRING, not a boolean, and deliberately only two values. Workflow agents cannot
+      # be told apart from ordinary subagents in the client environment — CLAUDE_CODE_WORKFLOWS
+      # is a feature flag present in main sessions too, and no marker distinguishes them —
+      # so the honest field records what is observable. The three-way split is recoverable
+      # OFFLINE by joining client_session_id to the transcript path (wf_* vs subagents/),
+      # the same enrichment path client_model uses. A boolean would have foreclosed even
+      # naming the third value.
+      add :client_kind, :string
       add :client_version, :string
 
       # ok | zero_results | degraded | rejected
