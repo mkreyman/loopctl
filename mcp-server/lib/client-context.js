@@ -12,18 +12,34 @@
  * remains the sole authority. The server stores these under a `client_` prefix so no later
  * reader mistakes them for server-derived facts.
  *
- * WHAT IS ACTUALLY AVAILABLE (verified on a live session, 2026-08-12):
+ * WHAT IS ACTUALLY AVAILABLE — re-measured 2026-08-12 by reading /proc/<mcp-pid>/environ on
+ * a live session, which corrected two entries an earlier pass got wrong:
  *
- *   CLAUDE_EFFORT=high              -> effort, available
- *   CLAUDE_SESSION_ID=<uuid>        -> session id, available
- *   CLAUDE_CODE_CHILD_SESSION=1     -> subagent vs main session, available
+ *   CLAUDE_CODE_SESSION_ID=<uuid>   -> session id, available
  *   CLAUDE_CODE_ENTRYPOINT=cli      -> entrypoint, available
+ *   CLAUDE_SESSION_ID               -> ABSENT (the CODE_ spelling is the one that is set)
+ *   CLAUDE_EFFORT                   -> ABSENT from THIS process. It is set for Bash-tool
+ *                                      invocations, which is where the earlier claim that
+ *                                      it was "available" came from; the MCP server does
+ *                                      not get it, so `effort` is enriched offline.
+ *   CLAUDE_CODE_CHILD_SESSION       -> ABSENT, and it would not mean what it looks like:
+ *                                      it is set to 1 for Bash-tool invocations of a MAIN
+ *                                      session, so it marks "a child PROCESS", not "a
+ *                                      dispatched agent".
  *   (no model variable)             -> MODEL IS NOT AVAILABLE
  *
- * The model is deliberately still sent when a variable for it appears, because the session
- * TRANSCRIPT does record it (`message.model`, e.g. `claude-opus-5`) keyed by session id —
- * so `client_session_id` is the join key that enriches model offline today, and the field
- * fills itself in the day the runtime exposes one.
+ * THE KIND REPORTED HERE IS THE SESSION'S, NOT THE CALLER'S. One MCP server process is
+ * spawned per session and serves the main session AND every agent it dispatches, and the
+ * environment above is read once and cached for the life of that process. So `kind` is a
+ * property of the session, and every search it labels comes back `main`. The three-way
+ * main/subagent/workflow split a measurement actually needs is recoverable only from the
+ * transcript, where `isSidechain` plus the file's path give it unambiguously.
+ *
+ * Two fields are therefore sent as JOIN KEYS rather than as answers: `session_id` is what
+ * lets `mix loopctl.enrich_search_events` find the transcript that records the model, the
+ * effort and the real kind. Note that a RESUMED session breaks even that — the new process
+ * reports a fresh session id while the transcript keeps appending under the original — so
+ * the enrichment carries a query-only fallback for exactly that case.
  */
 
 import { execFileSync } from "node:child_process";
@@ -87,15 +103,17 @@ function clientContext({ version } = {}) {
     version,
   };
 
-  // main vs child. A dispatched agent sets CLAUDE_CODE_CHILD_SESSION=1.
+  // The SESSION's kind — see the header. This process is shared by the main session and
+  // every agent it dispatches, so in practice this resolves to "main" for all of them and
+  // is NOT caller-level evidence. It is still worth sending: it is the only thing available
+  // before the offline enrichment runs, and the enrichment treats it as an assertion to be
+  // corrected rather than as a value to be preserved.
   //
-  // Only TWO values, on purpose. A workflow agent cannot be distinguished from an ordinary
-  // subagent here: CLAUDE_CODE_WORKFLOWS is a feature flag that is present in main sessions
-  // too, and nothing else marks one. Since an audit measured materially different failure
-  // rates across main/workflow/subagent, the third value matters — but it is recoverable
-  // only OFFLINE, by joining session_id to the transcript path (wf_* vs subagents/). Report
-  // what is observable and let the join supply the rest; do not guess a value that would
-  // then be analysed as fact.
+  // Do not try to widen it to three values from the environment. CLAUDE_CODE_WORKFLOWS is a
+  // feature flag present in main sessions too, and CLAUDE_CODE_CHILD_SESSION marks a child
+  // PROCESS rather than a dispatched agent. Guessing here would be worse than the null it
+  // replaces, because the number this column exists to support is a comparison BETWEEN
+  // kinds.
   const child = env("CLAUDE_CODE_CHILD_SESSION");
   if (child !== undefined) {
     ctx.kind = child === "1" || child.toLowerCase() === "true" ? "child" : "main";

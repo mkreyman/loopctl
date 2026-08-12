@@ -18,7 +18,9 @@ defmodule Loopctl.Knowledge.SearchEventEnrichmentTest do
     path
   end
 
-  defp assistant(model), do: %{"sessionId" => @session, "message" => %{"model" => model}}
+  defp assistant(model, extra \\ %{}) do
+    Map.merge(%{"sessionId" => @session, "message" => %{"model" => model}}, extra)
+  end
 
   defp search(query, tool \\ "mcp__loopctl__knowledge_search", key \\ "query") do
     %{
@@ -60,19 +62,27 @@ defmodule Loopctl.Knowledge.SearchEventEnrichmentTest do
         search("capability token replay")
       ])
 
-      map = SearchEventEnrichment.scan(root)
+      index = SearchEventEnrichment.scan(root)
 
-      assert map[{@session, "rls tenant scoping"}] == %{model: "claude-opus-4-8", kind: "main"}
+      assert index.by_pair[{@session, "rls tenant scoping"}] ==
+               %{model: "claude-opus-4-8", kind: "main", effort: nil}
 
-      assert map[{@session, "dispatch lineage"}] == %{
-               model: "claude-fable-5",
-               kind: "subagent"
-             }
+      assert index.by_pair[{@session, "dispatch lineage"}].kind == "subagent"
+      assert index.by_pair[{@session, "capability token replay"}].kind == "workflow"
+    end
 
-      assert map[{@session, "capability token replay"}] == %{
-               model: "claude-sonnet-5",
-               kind: "workflow"
-             }
+    test "carries the effort recorded on the transcript", %{root: root} do
+      write_transcript(root, "proj/#{@session}/workflows/wf_1/agent-1.jsonl", [
+        assistant("claude-opus-5", %{"effort" => "medium"}),
+        search("hnsw dead entries")
+      ])
+
+      index = SearchEventEnrichment.scan(root)
+
+      # The column this fills was permanently NULL before: CLAUDE_EFFORT is absent from the
+      # environment the MCP server is spawned with, so no client could ever have sent it.
+      assert index.by_pair[{@session, "hnsw dead entries"}] ==
+               %{model: "claude-opus-5", kind: "workflow", effort: "medium"}
     end
 
     test "reads the historical q and topic spellings too", %{root: root} do
@@ -82,10 +92,10 @@ defmodule Loopctl.Knowledge.SearchEventEnrichmentTest do
         search("legacy topic spelling", "mcp__loopctl__knowledge_progressive_index", "topic")
       ])
 
-      map = SearchEventEnrichment.scan(root)
+      index = SearchEventEnrichment.scan(root)
 
-      assert map[{@session, "legacy q spelling"}].kind == "main"
-      assert map[{@session, "legacy topic spelling"}].kind == "main"
+      assert index.by_pair[{@session, "legacy q spelling"}].kind == "main"
+      assert index.by_pair[{@session, "legacy topic spelling"}].kind == "main"
     end
 
     test "drops a pair two files disagree about rather than guessing", %{root: root} do
@@ -99,11 +109,12 @@ defmodule Loopctl.Knowledge.SearchEventEnrichmentTest do
         search("shared query")
       ])
 
-      map = SearchEventEnrichment.scan(root)
+      index = SearchEventEnrichment.scan(root)
 
       # An enrichment that guessed here would move the very number the column exists to
       # measure — the per-kind failure rate.
-      refute Map.has_key?(map, {@session, "shared query"})
+      refute Map.has_key?(index.by_pair, {@session, "shared query"})
+      refute Map.has_key?(index.by_query, "shared query")
     end
 
     test "the same pair recorded identically twice is not ambiguous", %{root: root} do
@@ -113,9 +124,33 @@ defmodule Loopctl.Knowledge.SearchEventEnrichmentTest do
         search("repeated query")
       ])
 
-      map = SearchEventEnrichment.scan(root)
+      index = SearchEventEnrichment.scan(root)
 
-      assert map[{@session, "repeated query"}] == %{model: "claude-opus-4-8", kind: "main"}
+      assert index.by_pair[{@session, "repeated query"}].model == "claude-opus-4-8"
+    end
+
+    test "refuses a path the entry's own isSidechain flag contradicts", %{root: root} do
+      # A `main` transcript whose entries claim to be a sidechain is evidence the path
+      # classification is wrong, not evidence to file the row under.
+      write_transcript(root, "proj/#{@session}.jsonl", [
+        assistant("claude-opus-5"),
+        Map.put(search("contradicted"), "isSidechain", true)
+      ])
+
+      index = SearchEventEnrichment.scan(root)
+
+      refute Map.has_key?(index.by_pair, {@session, "contradicted"})
+    end
+
+    test "an agreeing isSidechain flag leaves the path classification intact", %{root: root} do
+      write_transcript(root, "proj/#{@session}/subagents/agent-a.jsonl", [
+        assistant("claude-opus-5"),
+        Map.put(search("agreeing"), "isSidechain", true)
+      ])
+
+      index = SearchEventEnrichment.scan(root)
+
+      assert index.by_pair[{@session, "agreeing"}].kind == "subagent"
     end
 
     test "ignores non-search tool calls and unparseable lines", %{root: root} do
@@ -138,10 +173,10 @@ defmodule Loopctl.Knowledge.SearchEventEnrichmentTest do
 
       File.write!(path, File.read!(path) <> "this is not json\n")
 
-      assert SearchEventEnrichment.scan(root) == %{}
+      assert SearchEventEnrichment.scan(root) == %SearchEventEnrichment{}
     end
 
-    test "an entry with no sessionId contributes nothing", %{root: root} do
+    test "an entry with no sessionId still indexes by query", %{root: root} do
       write_transcript(root, "proj/orphan.jsonl", [
         %{"message" => %{"model" => "claude-opus-4-8"}},
         %{
@@ -157,12 +192,48 @@ defmodule Loopctl.Knowledge.SearchEventEnrichmentTest do
         }
       ])
 
-      assert SearchEventEnrichment.scan(root) == %{}
+      index = SearchEventEnrichment.scan(root)
+
+      assert index.by_pair == %{}
+      assert index.by_query["unattributable"].model == "claude-opus-4-8"
     end
 
-    test "an empty root is an empty map, not a crash", %{root: root} do
+    test "an empty root is an empty index, not a crash", %{root: root} do
       File.mkdir_p!(root)
-      assert SearchEventEnrichment.scan(root) == %{}
+      assert SearchEventEnrichment.scan(root) == %SearchEventEnrichment{}
+    end
+  end
+
+  describe "lookup/3" do
+    setup %{root: root} do
+      write_transcript(root, "proj/#{@session}/workflows/wf_1/agent-1.jsonl", [
+        assistant("claude-opus-5", %{"effort" => "high"}),
+        search("only in one place")
+      ])
+
+      %{index: SearchEventEnrichment.scan(root)}
+    end
+
+    test "the precise pair wins", %{index: index} do
+      assert SearchEventEnrichment.lookup(index, @session, "only in one place").kind ==
+               "workflow"
+    end
+
+    test "a session id the transcript never recorded falls back to the query", %{index: index} do
+      # This is the RESUMED-session case, measured live: the MCP server reports a fresh
+      # session id while the transcript keeps appending under the original, so the pair key
+      # can never match and every search from a resumed session was unjoinable.
+      assert SearchEventEnrichment.lookup(index, Ecto.UUID.generate(), "only in one place") ==
+               %{model: "claude-opus-5", kind: "workflow", effort: "high"}
+    end
+
+    test "an unknown query resolves to nothing on either key", %{index: index} do
+      assert SearchEventEnrichment.lookup(index, @session, "never searched") == nil
+    end
+
+    test "a missing session id or query is not a lookup", %{index: index} do
+      assert SearchEventEnrichment.lookup(index, nil, "only in one place") == nil
+      assert SearchEventEnrichment.lookup(index, @session, nil) == nil
     end
   end
 end

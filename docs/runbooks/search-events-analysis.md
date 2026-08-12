@@ -10,10 +10,15 @@ procedure, monthly, ~15 minutes.
 
 ## 0. Enrich first, on the machine that did the searching
 
-Two columns cannot be filled by the client and are null until this runs:
+Three columns cannot be filled by the client and are wrong or null until this runs:
 
-- `client_model` — no model variable exists in the agent environment.
-- the `workflow` / `subagent` split — the client can only say `main` or `child`.
+- `client_model` — no model variable exists in the MCP server's environment.
+- `client_effort` — likewise absent from that process (`CLAUDE_EFFORT` is set for Bash-tool
+  invocations, not for the MCP server), so the column is NULL until enriched.
+- `client_kind` — the client reports the SESSION's kind, not the caller's. One MCP process
+  serves a session and every agent it dispatches, so it labels every search `main`. **An
+  un-enriched `client_kind` is not caller-level truth** — do not compute a per-kind rate
+  from one.
 
 ```bash
 # on each dev machine that runs agents (transcripts never leave the machine)
@@ -23,8 +28,16 @@ mix loopctl.enrich_search_events --since-days 45    # then write
 
 It joins on `(client_session_id, query)`, because a subagent's transcript records its
 PARENT's session id — see `Loopctl.Knowledge.SearchEventEnrichment` for why the pair is
-the only unambiguous key, and why a pair two transcripts disagree about is dropped rather
-than guessed. Rows are only filled, never overwritten, so it is safe to re-run.
+the only unambiguous key, and why a key two transcripts disagree about is dropped rather
+than guessed.
+
+A **resumed** session breaks that key: the restarted MCP server reports a fresh session id
+while the transcript keeps appending under the original, so the pair can never match. The
+task falls back to the query alone for those rows, and only for a query that is unambiguous
+across the whole transcript tree (measured: 96% of distinct queries are). `client_model` and
+`client_effort` are filled, never overwritten; `client_kind` IS corrected, because the value
+the client sent is a session-level assertion rather than an observation. Re-running is safe
+and idempotent either way.
 
 ## 1. Run the canonical queries
 
@@ -55,6 +68,19 @@ computed over that mix measures automation, not agents.
 
 Split on `tool`, `client_entrypoint` and `client_kind` first. If a number moved, establish
 which segment moved before attributing it to anything.
+
+**The single most important filter is `client_host IS NOT NULL`.** A row without it never
+passed through the MCP client at all, so it cannot be an agent's search: the UserPromptSubmit
+recall hook and `scripts/smoke.sh` call the API directly. In the first 11 hours after this
+table went live, 131 of 133 rows were exactly that — repeated `elixir` probes from the smoke
+check and keyword-stripped `memory_recall` calls from the recall hook. Any rate computed over
+the unfiltered table measures this project's own automation.
+
+One operational trap belongs here too: **a long-running session keeps the mcp-server build it
+booted with.** `npx` updating the cache does not restart it, so after publishing a version
+that changes what the client sends, sessions started before the publish keep sending the old
+payload until they are restarted. If context columns are unexpectedly sparse, check
+`client_version` before suspecting the server.
 
 ## 3. What to look at, in order
 
