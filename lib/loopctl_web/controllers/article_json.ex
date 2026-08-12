@@ -42,9 +42,105 @@ defmodule LoopctlWeb.ArticleJSON do
 
   `links` selects how much of the link graph to serialize — `:full` (default, back
   compatible), `:count`, or `:none`. See `article_data_with_links/2`.
+
+  `body_window` bounds the serialized `body` — see `apply_body_window/2`.
   """
   def show(%{article: article} = assigns) do
-    %{data: article_data_with_links(article, Map.get(assigns, :links, :full))}
+    data =
+      article
+      |> article_data_with_links(Map.get(assigns, :links, :full))
+      |> apply_body_window(Map.get(assigns, :body_window, default_body_window()))
+
+    %{data: data}
+  end
+
+  # Default serialized-body window for a single-article read (#538, #652 item 4).
+  #
+  # #538 trimmed the LINK half of this response and capped both arrays. What it did not
+  # bound is the body, and that is what is left: four measured `knowledge_get` results of
+  # 61-82KB were rejected CLIENT-side by the harness token cap, so the article was found
+  # and the read discarded whole. A truncated body carrying its own continuation offset
+  # is strictly better than nothing, which is what those four reads got.
+  #
+  # 32KB is ~8k tokens — comfortably under the cap that rejected 61KB, and far above the
+  # ~3KB median article, so the overwhelming majority of reads are byte-identical to
+  # before. Config-overridable so ops can tune it and tests can exercise truncation
+  # cheaply. `body_max_bytes: 0` on the request opts out entirely.
+  @article_body_byte_budget 32_000
+
+  @doc "Default single-article body byte budget. Read by the OpenAPI spec so the two cannot drift."
+  def article_body_byte_budget,
+    do: Application.get_env(:loopctl, :article_body_byte_budget, @article_body_byte_budget)
+
+  defp default_body_window, do: {0, article_body_byte_budget()}
+
+  @doc """
+  Bounds the serialized `body` to a byte window and reports what was withheld.
+
+  `window` is `{offset, max_bytes}`; `max_bytes` of `0` (or a `nil` body) means the whole
+  body, unbounded. The reported byte counts are of the RAW body, so a caller paginating
+  with `next_body_offset` walks the same coordinate space the counts describe.
+
+  Slicing is UTF-8 safe: a window that would land mid-codepoint is shortened to the last
+  whole character, never emitting invalid UTF-8 (which `Jason` would refuse to encode,
+  turning a large read into a 500).
+
+  Fields added whenever a body is present:
+
+    * `body_bytes` — the FULL body size, so the caller can size the remaining fetches
+    * `body_offset` / `body_returned_bytes` — the window actually served
+    * `body_truncated` — whether anything past this window was withheld
+    * `next_body_offset` — where to continue, or `nil` at the end
+
+  These are always present, including on an untruncated read: a caller must be able to
+  tell "this is the whole body" from "this is all I asked for" without a second request.
+  """
+  @spec apply_body_window(map(), {non_neg_integer(), non_neg_integer()}) :: map()
+  def apply_body_window(%{body: body} = data, _window) when not is_binary(body), do: data
+
+  def apply_body_window(%{body: body} = data, {offset, max_bytes}) do
+    total = byte_size(body)
+    offset = body |> advance_to_boundary(min(max(offset, 0), total))
+    remaining = total - offset
+    take = if max_bytes <= 0, do: remaining, else: min(max_bytes, remaining)
+
+    slice = body |> binary_part(offset, take) |> trim_trailing_partial()
+    returned = byte_size(slice)
+    next = offset + returned
+
+    data
+    |> Map.put(:body, slice)
+    |> Map.put(:body_bytes, total)
+    |> Map.put(:body_offset, offset)
+    |> Map.put(:body_returned_bytes, returned)
+    |> Map.put(:body_truncated, next < total)
+    |> Map.put(:next_body_offset, if(next < total, do: next, else: nil))
+  end
+
+  def apply_body_window(data, _window), do: data
+
+  # A caller-supplied offset can land mid-codepoint (it is a byte count, and the caller
+  # may have invented it). Move FORWARD to the next character boundary rather than
+  # emitting a leading partial byte — the result would not be valid UTF-8, and Jason
+  # refuses to encode that, turning a large read into a 500.
+  defp advance_to_boundary(body, offset) do
+    case body do
+      <<_::binary-size(^offset), byte, _::binary>> when byte >= 0x80 and byte < 0xC0 ->
+        advance_to_boundary(body, offset + 1)
+
+      _ ->
+        offset
+    end
+  end
+
+  # Shrink the window (never grow it) until it ENDS on a codepoint boundary. At most 3
+  # bytes are ever dropped, since that is the longest partial UTF-8 sequence.
+  defp trim_trailing_partial(slice) do
+    if slice == "" or String.valid?(slice) do
+      slice
+    else
+      trim_trailing_partial(binary_part(slice, 0, byte_size(slice) - 1))
+    end
   end
 
   @doc "Renders a newly created article."

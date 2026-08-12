@@ -1237,6 +1237,150 @@ defmodule LoopctlWeb.ArticleControllerTest do
       assert body["data"]["links_truncated"] == false
     end
 
+    test "a large body is served in a continuable window rather than whole (#652)",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      # Four measured knowledge_get results of 61-82KB were rejected client-side by the
+      # harness token cap, so the article was found and the read discarded whole.
+      big = String.duplicate("x", 80_000)
+      article = fixture(:article, %{tenant_id: tenant.id, title: "Big", body: big})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles/#{article.id}")
+
+      data = json_response(conn, 200)["data"]
+      budget = LoopctlWeb.ArticleJSON.article_body_byte_budget()
+
+      assert byte_size(data["body"]) == budget
+      assert data["body_bytes"] == 80_000
+      assert data["body_offset"] == 0
+      assert data["body_returned_bytes"] == budget
+      assert data["body_truncated"] == true
+      assert data["next_body_offset"] == budget
+    end
+
+    test "next_body_offset walks the whole body across reads", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      body_text = String.duplicate("abcde", 2_000)
+      article = fixture(:article, %{tenant_id: tenant.id, title: "Walk", body: body_text})
+
+      first =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles/#{article.id}?body_max_bytes=4000")
+        |> json_response(200)
+        |> Map.fetch!("data")
+
+      assert first["body_truncated"] == true
+      assert first["next_body_offset"] == 4000
+
+      second =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles/#{article.id}?body_max_bytes=100000&body_offset=4000")
+        |> json_response(200)
+        |> Map.fetch!("data")
+
+      assert second["body_truncated"] == false
+      assert second["next_body_offset"] == nil
+      assert first["body"] <> second["body"] == body_text
+    end
+
+    test "body_max_bytes=0 opts out of the budget entirely", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      body_text = String.duplicate("y", 50_000)
+      article = fixture(:article, %{tenant_id: tenant.id, title: "Whole", body: body_text})
+
+      data =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles/#{article.id}?body_max_bytes=0")
+        |> json_response(200)
+        |> Map.fetch!("data")
+
+      assert data["body"] == body_text
+      assert data["body_truncated"] == false
+      assert data["next_body_offset"] == nil
+    end
+
+    test "a normal article is unchanged except for the accounting fields", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      article = fixture(:article, %{tenant_id: tenant.id, title: "Small", body: "short body"})
+
+      data =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles/#{article.id}")
+        |> json_response(200)
+        |> Map.fetch!("data")
+
+      assert data["body"] == "short body"
+      assert data["body_truncated"] == false
+      assert data["body_bytes"] == 10
+      # Present even when nothing was withheld: a caller must be able to tell "this is
+      # the whole body" from "this is all I asked for" without a second request.
+      assert data["next_body_offset"] == nil
+    end
+
+    test "a window landing mid-character never emits invalid UTF-8", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      # Each "é" is 2 bytes, so a 5-byte window necessarily splits one.
+      body_text = String.duplicate("é", 20)
+      article = fixture(:article, %{tenant_id: tenant.id, title: "Utf8", body: body_text})
+
+      first =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles/#{article.id}?body_max_bytes=5")
+        |> json_response(200)
+        |> Map.fetch!("data")
+
+      assert String.valid?(first["body"])
+      assert first["body"] == "éé"
+      assert first["body_returned_bytes"] == 4
+
+      # An offset the caller invented, landing mid-character, advances to the next
+      # boundary instead of emitting a leading partial byte.
+      second =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles/#{article.id}?body_max_bytes=4&body_offset=5")
+        |> json_response(200)
+        |> Map.fetch!("data")
+
+      assert String.valid?(second["body"])
+      assert second["body_offset"] == 6
+    end
+
+    test "unparseable window params degrade to the default, never a 422", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      article = fixture(:article, %{tenant_id: tenant.id, title: "Junk", body: "body text"})
+
+      data =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles/#{article.id}?body_max_bytes=huge&body_offset=-5")
+        |> json_response(200)
+        |> Map.fetch!("data")
+
+      assert data["body"] == "body text"
+      assert data["body_offset"] == 0
+    end
+
     test "links=count returns links_total without either array", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
