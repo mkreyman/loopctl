@@ -1,0 +1,114 @@
+/**
+ * #658 — client-supplied search context.
+ *
+ * These pin the OBSERVABILITY contract, not a behaviour of the KB: which facts about the
+ * calling agent the MCP server can actually see, and that it never invents the ones it
+ * cannot. Model is the case that matters — it is NOT in the environment, and a test that
+ * quietly accepted a fabricated value would put a wrong model on every row.
+ */
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+
+import { clientContext, clientContextHeader, resetRepoCache } from "../lib/client-context.js";
+
+function withEnv(vars, fn) {
+  const saved = {};
+  for (const [k, v] of Object.entries(vars)) {
+    saved[k] = process.env[k];
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+  try {
+    return fn();
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
+
+test("captures the facts that ARE observable", () => {
+  withEnv(
+    {
+      CLAUDE_SESSION_ID: "sess-123",
+      CLAUDE_EFFORT: "high",
+      CLAUDE_CODE_ENTRYPOINT: "cli",
+      CLAUDE_CODE_CHILD_SESSION: "1",
+    },
+    () => {
+      const ctx = clientContext({ version: "2.9.9" });
+      assert.equal(ctx.session_id, "sess-123");
+      assert.equal(ctx.effort, "high");
+      assert.equal(ctx.entrypoint, "cli");
+      assert.equal(ctx.subagent, true);
+      assert.equal(ctx.version, "2.9.9");
+      assert.ok(ctx.host, "hostname is always available");
+    },
+  );
+});
+
+test("a MAIN session is distinguishable from a dispatched subagent", () => {
+  // The two populations search differently by construction — a subagent never receives the
+  // recall pack — so averaging them together hides both.
+  withEnv({ CLAUDE_CODE_CHILD_SESSION: "1" }, () => {
+    assert.equal(clientContext().subagent, true);
+  });
+  withEnv({ CLAUDE_CODE_CHILD_SESSION: "0" }, () => {
+    assert.equal(clientContext().subagent, false);
+  });
+});
+
+test("an UNSET subagent flag is omitted, not guessed as false", () => {
+  withEnv({ CLAUDE_CODE_CHILD_SESSION: undefined }, () => {
+    assert.equal("subagent" in clientContext(), false);
+  });
+});
+
+test("model is NOT fabricated when the runtime does not expose it", () => {
+  // Verified 2026-08-12: no model variable exists in a live session's environment. The
+  // field must stay absent so an offline join on session_id supplies the truth, rather
+  // than every row carrying a confident guess.
+  withEnv({ CLAUDE_MODEL: undefined, ANTHROPIC_MODEL: undefined }, () => {
+    assert.equal("model" in clientContext(), false);
+  });
+});
+
+test("model IS captured the day a variable appears", () => {
+  withEnv({ CLAUDE_MODEL: "claude-opus-5" }, () => {
+    assert.equal(clientContext().model, "claude-opus-5");
+  });
+});
+
+test("blank env values are treated as absent, not as empty strings", () => {
+  // Both session variables must be cleared: session_id falls back from CLAUDE_SESSION_ID
+  // to CLAUDE_CODE_SESSION_ID, and a live session sets both.
+  withEnv(
+    { CLAUDE_EFFORT: "   ", CLAUDE_SESSION_ID: "", CLAUDE_CODE_SESSION_ID: undefined },
+    () => {
+      const ctx = clientContext();
+      assert.equal("effort" in ctx, false);
+      assert.equal("session_id" in ctx, false);
+    },
+  );
+});
+
+test("the header is base64 of the JSON payload, and round-trips", () => {
+  withEnv({ CLAUDE_SESSION_ID: "sess-abc", CLAUDE_EFFORT: "low" }, () => {
+    const header = clientContextHeader();
+    const decoded = JSON.parse(Buffer.from(header, "base64").toString("utf8"));
+    assert.equal(decoded.session_id, "sess-abc");
+    assert.equal(decoded.effort, "low");
+  });
+});
+
+test("repo detection normalises a git remote to owner/repo", () => {
+  // Runs against this repo's own remote when present; the assertion tolerates its absence
+  // (a CI checkout without an origin) rather than pinning a value that varies by host.
+  resetRepoCache();
+  const ctx = clientContext();
+  if (ctx.repo) {
+    assert.doesNotMatch(ctx.repo, /^https?:|\.git$|^git@/, "repo must be normalised, not raw");
+  }
+});

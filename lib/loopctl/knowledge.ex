@@ -2531,20 +2531,99 @@ defmodule Loopctl.Knowledge do
   # the whole result set. The cap lives in `Analytics` — the module that writes the rows
   # and documents the key — so the enforcement here and every doc that publishes the
   # number read ONE constant.
+  # Extracted from `maybe_record_search_access/5` so that function stays readable: the
+  # attempt row carries enough of the request to make a MISS interpretable later, which is
+  # a dozen fields, and inlining them buried the control flow they sit inside.
+  defp search_attempt_attrs(search_id, api_key_id, ctx, query_string, results, mode, opts) do
+    top = List.first(results)
+
+    %{
+      search_id: search_id,
+      api_key_id: api_key_id,
+      # WHO searched. api_key_id alone is not the agent: under the v2 dispatch pattern a
+      # key is minted PER DISPATCH, so counting keys counts dispatches, not agents.
+      agent_id: Keyword.get(opts, :agent_id),
+      project_id: Map.get(ctx, :project_id) || Map.get(ctx, "project_id"),
+      story_id: Map.get(ctx, :story_id) || Map.get(ctx, "story_id"),
+      query: query_string,
+      tool: Keyword.get(opts, :_tool, "knowledge_search"),
+      mode_requested: Keyword.get(opts, :_mode_requested, mode),
+      mode_used: mode,
+      # WHICH SLICE of the KB. tenant_id names the corpus; these name the part of it the
+      # query could ever have matched, without which a zero-result row is unreadable.
+      filters: search_filters(opts),
+      limit_requested: Keyword.get(opts, :limit),
+      offset_requested: Keyword.get(opts, :offset),
+      total_count: Keyword.get(opts, :_total_count),
+      top_result_id: top && (top[:id] || Map.get(top, :id)),
+      top_result_score:
+        top && (top[:final_score] || Map.get(top, :final_score) || Map.get(top, :score)),
+      result_count: length(results),
+      duration_ms: Keyword.get(opts, :_duration_ms),
+      ann_iterative_scan: Keyword.get(opts, :_ann_iterative_scan),
+      degraded?: Keyword.get(opts, :_degraded, false),
+      fallback_reason: Keyword.get(opts, :_fallback_reason)
+    }
+  end
+
+  # The corpus slice a search could match, captured so a zero-result row is interpretable.
+  # Only keys the caller actually supplied are recorded — an absent filter and a filter set
+  # to nil are different facts, and flattening them would make an over-scoped search look
+  # identical to an unscoped one.
+  defp search_filters(opts) do
+    [:category, :tags, :status, :project_id, :visibility, :threshold]
+    |> Enum.reduce(%{}, fn key, acc ->
+      case Keyword.fetch(opts, key) do
+        {:ok, nil} -> acc
+        {:ok, value} -> Map.put(acc, Atom.to_string(key), normalize_filter_value(value))
+        :error -> acc
+      end
+    end)
+  end
+
+  defp normalize_filter_value(v) when is_atom(v) and not is_boolean(v) and not is_nil(v),
+    do: Atom.to_string(v)
+
+  defp normalize_filter_value(v) when is_list(v), do: Enum.map(v, &normalize_filter_value/1)
+  defp normalize_filter_value(v), do: v
+
+  # Records BOTH halves of a search's telemetry (#658):
+  #
+  #   * the per-RESULT rows (rank, article_id) in `article_access_events`, unchanged; and
+  #   * ONE row per ATTEMPT in `search_events`, INCLUDING attempts that surfaced nothing.
+  #
+  # The second half exists because this function used to return `:ok` on `results in
+  # [nil, []]`, so a search that found nothing left no trace in the database at all. The
+  # misses — the only searches that tell you the corpus or the query needs work — were the
+  # exact population the schema could not represent, and recovering them meant hand-mining
+  # 6,457 session transcripts. Both halves share one `search_id` so a miss and its (absent)
+  # results are one correlated story.
   defp maybe_record_search_access(tenant_id, results, query_string, opts, mode) do
+    results = results || []
+    api_key_id = Keyword.get(opts, :api_key_id)
+    skip? = Keyword.get(opts, :_skip_record_access, false)
+    search_id = Ecto.UUID.generate()
+
+    unless skip? or is_nil(api_key_id) do
+      ctx = attribution_context(opts)
+
+      Analytics.record_search_attempt(
+        tenant_id,
+        search_attempt_attrs(search_id, api_key_id, ctx, query_string, results, mode, opts)
+      )
+    end
+
     cond do
-      Keyword.get(opts, :_skip_record_access, false) ->
+      skip? ->
         :ok
 
-      results in [nil, []] ->
+      results == [] ->
         :ok
 
-      is_nil(Keyword.get(opts, :api_key_id)) ->
+      is_nil(api_key_id) ->
         :ok
 
       true ->
-        api_key_id = Keyword.fetch!(opts, :api_key_id)
-
         article_ids =
           results
           |> Enum.map(fn r -> r[:id] || Map.get(r, :id) end)
@@ -2557,7 +2636,9 @@ defmodule Loopctl.Knowledge do
           api_key_id,
           query_string,
           %{"mode" => mode, "results_returned" => length(results)},
-          attribution_context(opts)
+          # search_id rides the INTERNAL context, not the metadata map — metadata is
+          # caller-supplied and a forged id would collapse the `searches` denominator (#582).
+          Map.put(attribution_context(opts), :search_id, search_id)
         )
     end
   end

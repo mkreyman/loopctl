@@ -43,6 +43,7 @@ defmodule Loopctl.Knowledge.Analytics do
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleAccessEvent
+  alias Loopctl.Knowledge.SearchEvent
   alias Loopctl.Projects
   alias Loopctl.Projects.Project
   alias Loopctl.WorkBreakdown.Stories
@@ -96,7 +97,14 @@ defmodule Loopctl.Knowledge.Analytics do
   """
   @type context :: %{
           optional(:project_id) => Ecto.UUID.t() | nil,
-          optional(:story_id) => Ecto.UUID.t() | nil
+          optional(:story_id) => Ecto.UUID.t() | nil,
+          # Set by the SEARCH SITE so the per-result rows share an id with the
+          # one-per-attempt row in `search_events` (#658). It lives here, on the
+          # internally-built context, rather than in the caller-supplied `metadata` map,
+          # because a caller-controlled call-level denominator is one the caller can game
+          # (#582). Kept in the closed type deliberately: widening this to `map()` would
+          # let any future key through unchecked.
+          optional(:search_id) => Ecto.UUID.t() | nil
         }
 
   # ---------------------------------------------------------------------------
@@ -196,7 +204,13 @@ defmodule Loopctl.Knowledge.Analytics do
       metadata
       |> ensure_map()
       |> maybe_put_query(query)
-      |> Map.put("search_id", Ecto.UUID.generate())
+      # The search_id is taken from the internally-built `context`, NEVER from the
+      # caller-supplied `metadata` (#582): a call-level denominator the caller controls is a
+      # metric the caller can game — pin every row to one id and `searches` collapses to 1.
+      # #658 needs the per-RESULT rows to share the id with the one-per-ATTEMPT row in
+      # `search_events`, so the SEARCH SITE passes it through `context`, which no API client
+      # can reach. A metadata-supplied id is still discarded.
+      |> Map.put("search_id", context_search_id(context) || Ecto.UUID.generate())
       |> Map.put_new("results_returned", length(article_ids))
 
     items =
@@ -967,6 +981,81 @@ defmodule Loopctl.Knowledge.Analytics do
   # ---------------------------------------------------------------------------
   # Internals
   # ---------------------------------------------------------------------------
+
+  @doc """
+  Records ONE row per search ATTEMPT (#658), including the attempts that surface nothing.
+
+  `record_search_access/6` writes one row per SURFACED RESULT and therefore cannot express
+  a search that found nothing — it has no results to write a row about. That blindness is
+  why 86 rejected calls and a silent embedding-timeout degradation had to be recovered by
+  hand-mining 6,457 session transcripts. This is the counterpart that makes a miss a row.
+
+  Fail-soft by construction: a telemetry write must never break a read. Errors are logged
+  and swallowed.
+
+  `attrs` is a map with any of the `SearchEvent` fields; `:outcome` is derived from
+  `:degraded?` / `:rejected?` / `:result_count` when not supplied.
+  """
+  def record_search_attempt(tenant_id, attrs) when is_binary(tenant_id) and is_map(attrs) do
+    query = Map.get(attrs, :query)
+
+    row =
+      attrs
+      |> Map.drop([:degraded?, :rejected?])
+      |> Map.put(:outcome, Map.get(attrs, :outcome) || SearchEvent.derive_outcome(attrs))
+      |> Map.put(:query_terms, SearchEvent.term_count(query))
+
+    case Application.get_env(:loopctl, :analytics_recording_mode, :async) do
+      :sync ->
+        insert_search_attempt(tenant_id, row)
+
+      _async ->
+        Task.Supervisor.start_child(Loopctl.TaskSupervisor, fn ->
+          insert_search_attempt(tenant_id, row)
+        end)
+
+        :ok
+    end
+  rescue
+    error ->
+      Logger.warning(
+        "Knowledge.Analytics search attempt spawn failed: #{Exception.message(error)}"
+      )
+
+      :ok
+  end
+
+  def record_search_attempt(_tenant_id, _attrs), do: :ok
+
+  @doc false
+  def insert_search_attempt(tenant_id, row) do
+    %SearchEvent{tenant_id: tenant_id}
+    |> SearchEvent.changeset(row)
+    |> Loopctl.AdminRepo.insert()
+    |> case do
+      {:ok, _} ->
+        :ok
+
+      {:error, changeset} ->
+        Logger.warning("search_event insert rejected: #{inspect(changeset.errors)}")
+        :ok
+    end
+  rescue
+    error ->
+      Logger.warning("search_event insert failed: #{Exception.message(error)}")
+      :ok
+  end
+
+  # Reads a search_id the SEARCH SITE threaded through the internal attribution context.
+  # Deliberately not reachable from the caller-supplied metadata map — see #582.
+  defp context_search_id(context) when is_map(context) do
+    case Map.get(context, :search_id) || Map.get(context, "search_id") do
+      id when is_binary(id) -> id
+      _ -> nil
+    end
+  end
+
+  defp context_search_id(_), do: nil
 
   defp do_record_async([], _tenant_id, _api_key_id, _access_type, _context), do: :ok
 
