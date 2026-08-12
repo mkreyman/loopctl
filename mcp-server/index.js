@@ -1537,9 +1537,13 @@ async function knowledgeHybridSearch({ query, project_id, category, tags, match,
   return withRemediationNotice(result);
 }
 
-async function knowledgeProgressiveIndex({ topic, category, limit }) {
+async function knowledgeProgressiveIndex({ topic, query, category, limit }) {
   const params = new URLSearchParams();
-  if (topic != null) params.set("topic", topic);
+  // The endpoint's parameter is `topic`; `query` is the canonical spelling this surface
+  // converged on (#652 item 6). An explicit `topic` still wins, so a caller passing both
+  // gets what it asked for.
+  const resolved = topic != null && topic !== "" ? topic : query;
+  if (resolved != null) params.set("topic", resolved);
   if (category) params.set("category", category);
   if (limit != null) params.set("limit", String(limit));
 
@@ -4573,10 +4577,16 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
-        q: {
+        query: {
           type: "string",
           description:
-            "Search query string. Optional when tags/category are supplied (enumeration mode).",
+            "Search query string. Optional when tags/category are supplied (enumeration mode). " +
+            "`query` is the canonical spelling across every search-shaped tool here; `q` is " +
+            "the historical name and is still accepted.",
+        },
+        q: {
+          type: "string",
+          description: "Deprecated alias for `query`. Accepted; prefer `query`.",
         },
         project_id: {
           type: "string",
@@ -4684,9 +4694,15 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       properties: {
+        query: {
+          type: "string",
+          description:
+            "The topic to index (max 500 characters). Required unless `topic` is given. " +
+            "`query` is the canonical spelling across every search-shaped tool here.",
+        },
         topic: {
           type: "string",
-          description: "The topic to index (max 500 characters). Required.",
+          description: "Historical name for `query`. Accepted; prefer `query`.",
         },
         category: {
           type: "string",
@@ -4697,7 +4713,7 @@ const TOOLS = [
           description: "Optional: top-K override (clamped to the configured cap).",
         },
       },
-      required: ["topic"],
+      required: [],
     },
   },
   {

@@ -5,6 +5,30 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.73.0 — 2026-08-12 (one spelling for the search parameter, plus a body window and prefix-tolerant ids)
+
+### Changed
+
+- **Every search-shaped tool now declares `query`.** Aliasing (2.72.x) rescued the symptom;
+  the defect was that one parameter was spelled three ways — `q` on `knowledge_search`,
+  `query` on `knowledge_hybrid_search` / `knowledge_context` / `memory_recall` /
+  `recall_context`, and `topic` on `knowledge_progressive_index`. The most-used tool was the
+  odd one out. `query` is now the canonical spelling in the schemas of all of them; `q` and
+  `topic` remain accepted, and an explicit legacy value still wins over the canonical one, so
+  nothing that works today stops working.
+
+- **`knowledge_get` and `knowledge_progressive_drill` serve the body in a byte WINDOW**
+  (default 32000 bytes), with `body_bytes`, `body_offset`, `body_returned_bytes`,
+  `body_truncated` and `next_body_offset` on every response. Four measured reads of 61-82KB
+  were rejected client-side by a token cap after the search had already found the article;
+  they now come back in parts instead of being discarded whole. Pass `body_max_bytes: 0` for
+  the whole body in one read.
+
+- **`knowledge_get` resolves a unique ID PREFIX** (>= 8 hex characters), so a mistyped or
+  truncated tail no longer throws away a search that worked. 16 of 20 sampled 404s carried a
+  correct 8-character prefix with a confabulated tail. An ambiguous prefix is a 404, never a
+  guess.
+
 ## 2.72.0 — 2026-08-07 (name the source, so titles can stand alone)
 
 ### Added
