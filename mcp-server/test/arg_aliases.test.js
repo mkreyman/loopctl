@@ -132,6 +132,30 @@ test("BOTH spellings work, in both directions — the surface is inconsistent by
   assert.equal(limits.max_results, 5, "limit must fill max_results");
 });
 
+test("the alias callback fires with the pair, so the rescue stays measurable", () => {
+  // Aliasing treats the symptom; the disease is three spellings for one parameter. If the
+  // rescue is invisible it costs nothing measurable and never gets fixed.
+  const seen = [];
+  applyArgAliases({ query: "x", max_results: "3" }, (pair) => seen.push(pair));
+
+  assert.deepEqual(seen.sort((a, b) => a.canonical.localeCompare(b.canonical)), [
+    { canonical: "limit", alias: "max_results" },
+    { canonical: "q", alias: "query" },
+  ]);
+});
+
+test("a throwing callback never breaks the tool call", () => {
+  const out = applyArgAliases({ query: "still works" }, () => {
+    throw new Error("telemetry exploded");
+  });
+
+  assert.equal(out.q, "still works");
+});
+
+test("no callback is required", () => {
+  assert.equal(applyArgAliases({ query: "x" }).q, "x");
+});
+
 test("SCHEMA DRIFT GUARD: no CURRENT alias silently shadows a real tool parameter", async () => {
   // The invariant: for every alias name the table maps FROM, no tool may declare that name
   // as its own parameter — unless the pair is deliberately bidirectional (q <-> query,
@@ -171,7 +195,9 @@ test("WIRING: index.js applies the aliases at the CallTool dispatch point", () =
   const src = readFileSync(join(here, "..", "index.js"), "utf8");
   assert.match(src, /import \{ applyArgAliases \} from "\.\/lib\/arg-aliases\.js";/);
   // The dispatch must alias the incoming arguments, not read request.params.arguments raw.
-  assert.match(src, /const args = applyArgAliases\(request\.params\.arguments\);/);
+  // Matches the call regardless of whether a telemetry callback is passed, but still
+  // pins that the DISPATCH ARGUMENTS are what gets aliased.
+  assert.match(src, /const args = applyArgAliases\(\s*request\.params\.arguments/);
   assert.doesNotMatch(
     src,
     /const \{ name, arguments: args \} = request\.params;/,

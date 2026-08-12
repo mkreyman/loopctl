@@ -63,7 +63,7 @@ function isBlank(v) {
  * Returns a NEW args object with canonical keys filled in from any alias present.
  * Non-object input (null/undefined/array) is returned unchanged.
  */
-function applyArgAliases(args) {
+function applyArgAliases(args, onAliasUsed) {
   if (!args || typeof args !== "object" || Array.isArray(args)) return args;
 
   const out = { ...args };
@@ -73,6 +73,18 @@ function applyArgAliases(args) {
     for (const alias of aliases) {
       if (!isBlank(out[alias])) {
         out[canonical] = out[alias];
+        // Report every rescue. Aliasing treats the SYMPTOM — the real defect is that the
+        // tool surface spells the same parameter three ways (`q`, `query`, `topic`). If the
+        // rescue is invisible, the inconsistency costs nothing measurable and never gets
+        // fixed, and the alias table quietly becomes load-bearing forever. Counting it
+        // keeps the residual cost on the books.
+        if (typeof onAliasUsed === "function") {
+          try {
+            onAliasUsed({ canonical, alias });
+          } catch {
+            // Telemetry must never break a tool call.
+          }
+        }
         break;
       }
     }

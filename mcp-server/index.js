@@ -16,6 +16,7 @@ import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import path, { dirname, join } from "node:path";
 import { applyArgAliases } from "./lib/arg-aliases.js";
+import { degradedSearchNotice } from "./lib/search-notices.js";
 import {
   projectsPath,
   ingestionJobsPath,
@@ -356,7 +357,10 @@ function llmRemediationNotice(result) {
  */
 function withRemediationNotice(result) {
   const base = toContent(result);
-  const notice = llmRemediationNotice(result);
+  // Two notice sources, in priority order: the BYO-key remediation (more specific), then
+  // the degraded-search notice (#658). At most one is prepended — stacking two leading
+  // blocks buries both. `degradedSearchNotice` already declines the no_embedding_key case.
+  const notice = llmRemediationNotice(result) || degradedSearchNotice(result);
   if (!notice) return base;
   return { ...base, content: [{ type: "text", text: notice }, ...base.content] };
 }
@@ -6941,7 +6945,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name } = request.params;
-  const args = applyArgAliases(request.params.arguments);
+  // The callback keeps the schema inconsistency MEASURABLE rather than merely survivable:
+  // every rescue is a call that would have been a hard 400 before, and a count of them is
+  // the evidence for eventually converging the spellings instead of aliasing forever.
+  const args = applyArgAliases(request.params.arguments, ({ canonical, alias }) => {
+    process.stderr.write(
+      `[loopctl-mcp] arg alias applied: '${alias}' -> '${canonical}' on tool '${name}'\n`,
+    );
+  });
 
   switch (name) {
     // Project Tools
