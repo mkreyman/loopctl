@@ -442,13 +442,35 @@ jobs:
           # config-sensitive deps instead of reusing a stale dep beam.
           key: ${{ runner.os }}-${{ runner.environment }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
 
+      # runner.name IS PART OF THE KEY, and it has to be. A PLT embeds ABSOLUTE paths
+      # to the OTP install that built it, and every runner has its own _work tree, so
+      # a PLT built under runners/loopctl is invalid under runners/loopctl-3:
+      #
+      #   :dialyzer.run error: File not found:
+      #     /home/github-runner/runners/loopctl/_work/_temp/.setup-beam/otp/lib/
+      #     dialyzer-5.4.0.1/ebin/erl_bif_types.beam
+      #
+      # That is not a hypothetical - it is what this job did on its first beelink run,
+      # having restored on runner loopctl-3 a PLT saved by runner loopctl.
+      #
+      # runner.environment was already here and does NOT cover this: it resolves to
+      # `self-hosted` on every self-hosted runner, and nuc and beelink even use the
+      # SAME directory layout, so the single-runner setup shared a PLT across two
+      # machines quite happily. The bug only appears the moment one repo has a second
+      # runner, which is exactly what moving here required. home_care_billing hit it
+      # first and its ci.yml carries the same fix with the same error quoted.
+      #
+      # Cost: one PLT per runner, rebuilt once each. The restore-keys prefix is
+      # scoped the same way so a stale cross-runner PLT cannot be picked up as a
+      # near-miss either - an unscoped prefix would reintroduce the bug on every
+      # mix.lock change.
       - name: Restore PLT cache
         uses: actions/cache@v4
         with:
           path: priv/plts/
-          key: ${{ runner.os }}-${{ runner.environment }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
+          key: ${{ runner.os }}-${{ runner.environment }}-${{ runner.name }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.environment }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+            ${{ runner.os }}-${{ runner.environment }}-${{ runner.name }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
 
       - name: Install dependencies
         run: mix deps.get
