@@ -114,6 +114,33 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   # is counted.
   @enumeration_modes ~w(list list_keyset)
 
+  # Infrastructure traffic is excluded from EVERY figure here, unconditionally (#673).
+  #
+  # `scripts/smoke.sh` issues two searches per run and NEVER opens a result. It is
+  # structurally incapable of contributing to a numerator while contributing to every
+  # denominator, and it was 66% of recorded searches on the first day of data — which is
+  # most of why precision read 1-4% and looked like a catastrophic retrieval failure. A
+  # metric that a health check can only ever drag down is not measuring retrieval.
+  #
+  # No opt-in to include it, deliberately, despite the handoff proposing one. There is no
+  # question this table answers better WITH a health check in the denominator, so a flag
+  # would only offer a way to compute the misleading number on purpose.
+  #
+  # FORWARD-LOOKING ONLY. Rows written before the smoke test began declaring itself carry no
+  # `entrypoint` key at all, so historical days remain contaminated and are NOT comparable
+  # with days after the tag ships. That is stated in the payload rather than left for a
+  # reader to discover from a step change in the series.
+  @infra_entrypoints ~w(smoke)
+
+  defp exclude_infra_traffic(query) do
+    where(
+      query,
+      [s],
+      is_nil(fragment("?->>'entrypoint'", s.metadata)) or
+        fragment("?->>'entrypoint'", s.metadata) not in ^@infra_entrypoints
+    )
+  end
+
   @doc """
   Compute precision for a single `day` (a `Date`) and follow-through `window_seconds`.
 
@@ -152,6 +179,7 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
         where: s.access_type == "search",
         where: s.accessed_at >= ^day_start and s.accessed_at < ^day_end
       )
+      |> exclude_infra_traffic()
 
     searched = AdminRepo.aggregate(searched_q, :count, :id)
     followed = compute_followed_through(searched_q, window_seconds)
