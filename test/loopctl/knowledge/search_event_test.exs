@@ -120,7 +120,27 @@ defmodule Loopctl.Knowledge.SearchEventTest do
       assert event.outcome == "ok"
       assert event.result_count >= 1
       assert event.top_result_id == article.id
+      # The keyword lane names its score :relevance_score, so a recorder reading only
+      # :final_score left the column NULL on every non-fused lane — including the degraded
+      # keyword-only fallback, the population this table was built to analyse.
+      assert is_float(event.top_result_score)
       assert event.search_id, "a search_id is needed to join to the per-result rows"
+    end
+
+    test "the tag MATCH mode is captured — an AND search fails differently from an OR", %{
+      tenant: tenant,
+      api_key: api_key
+    } do
+      {:ok, _} =
+        Knowledge.search_keyword(tenant.id, "anything",
+          limit: 3,
+          api_key_id: api_key.id,
+          tags: ["a", "b"],
+          match: :all
+        )
+
+      [event] = all_search_events(tenant.id)
+      assert event.filters["match"] == "all"
     end
 
     test "the filters are captured, so a zero-result row is interpretable", %{
@@ -247,6 +267,27 @@ defmodule Loopctl.Knowledge.SearchEventTest do
       assert is_integer(event.duration_ms)
     end
 
+    test "an embedding outage on the explicit semantic path leaves a row, not silence", %{
+      tenant: tenant,
+      raw: raw
+    } do
+      # The 503 returns a rendered conn before any search-path recorder runs, so the
+      # failure class this table exists to expose left NO row at all — while the same
+      # provider fault on the combined path was recorded as degraded.
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant, _text ->
+        {:error, :timeout}
+      end)
+
+      assert search(raw, %{q: "chain of custody", mode: "semantic"}).status == 503
+
+      [event] = all_search_events(tenant.id)
+      assert event.degraded == true
+      assert event.fallback_reason == "embedding_unavailable"
+      assert event.query == "chain of custody"
+    end
+
     test "an enumeration is not filed as a search", %{tenant: tenant, raw: raw} do
       search(raw, %{tags: "pagination"})
 
@@ -265,6 +306,47 @@ defmodule Loopctl.Knowledge.SearchEventTest do
       [event] = all_search_events(tenant.id)
       assert event.outcome == "rejected"
       assert event.rejection_reason == "invalid_cursor"
+      # An enumeration that fails is an enumeration. Hardcoding the tool here gave
+      # knowledge_list a 0% rejection rate and made knowledge_search absorb its failures.
+      assert event.tool == "knowledge_list"
+    end
+
+    test "a cursor MENTIONED in the message is not a tampered cursor", %{
+      tenant: tenant,
+      raw: raw
+    } do
+      # `invalid_cursor` means a forged/garbage token. Two other 400s merely NAME the
+      # cursor, and classifying them as tampering sends the investigation after an attack
+      # that is not happening.
+      assert search(raw, %{q: "x", include_body: "true"}).status == 400
+      assert search(raw, %{q: "x", cursor: ""}).status == 400
+
+      assert Enum.map(all_search_events(tenant.id), & &1.rejection_reason) ==
+               ["invalid_include_body", "cursor_with_query"]
+    end
+
+    test "the requested limit is what the CLIENT asked for, not our clamp", %{
+      tenant: tenant,
+      raw: raw
+    } do
+      # The column is named limit_requested. Recording the clamped value made "did callers
+      # ask for more than we return" unanswerable from the one column meant to answer it.
+      search(raw, %{q: "anything", mode: "keyword", limit: "5000"})
+
+      [event] = all_search_events(tenant.id)
+      assert event.limit_requested == 5000
+    end
+
+    test "a default request records the mode it could have asked for, not the lane label",
+         %{tenant: tenant, raw: raw} do
+      # No `mode` param is the documented default. Falling back to the internal lane label
+      # invented mode_requested buckets ("list_keyset", "combined_fallback") that no client
+      # can request, and undercounted the implicit "combined".
+      search(raw, %{tags: "pagination"})
+
+      [event] = all_search_events(tenant.id)
+      assert event.mode_requested == "combined"
+      assert event.mode_used == "list"
     end
   end
 

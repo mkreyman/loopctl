@@ -2549,7 +2549,7 @@ defmodule Loopctl.Knowledge do
   defp search_attempt_attrs(search_id, api_key_id, ctx, query_string, results, mode, opts) do
     top = List.first(results)
 
-    %{
+    attrs = %{
       search_id: search_id,
       api_key_id: api_key_id,
       # WHO searched. api_key_id alone is not the agent: under the v2 dispatch pattern a
@@ -2566,12 +2566,15 @@ defmodule Loopctl.Knowledge do
       # enumeration and hybrid row claim `tool = "knowledge_search"`, so a per-tool
       # breakdown was WRONG rather than merely absent.
       tool: Keyword.get(opts, :_tool) || tool_for_mode(mode),
-      mode_requested: Keyword.get(opts, :_mode_requested) || mode,
+      mode_requested: Keyword.get(opts, :_mode_requested) || requested_mode(mode),
       mode_used: mode,
       # WHICH SLICE of the KB. tenant_id names the corpus; these name the part of it the
       # query could ever have matched, without which a zero-result row is unreadable.
       filters: search_filters(opts),
-      limit_requested: Keyword.get(opts, :limit),
+      # The limit the CLIENT asked for, which is NOT `:limit` — that one has already been
+      # defaulted and clamped by the controller, so "did callers ask for more than we
+      # return" is unanswerable from it.
+      limit_requested: Keyword.get(opts, :_limit_requested) || Keyword.get(opts, :limit),
       offset_requested: Keyword.get(opts, :offset),
       total_count: Keyword.get(opts, :_total_count),
       top_result_id: top_result_id(top),
@@ -2582,19 +2585,38 @@ defmodule Loopctl.Knowledge do
       degraded?: Keyword.get(opts, :_degraded, false),
       fallback_reason: Keyword.get(opts, :_fallback_reason)
     }
-    |> Map.merge(client_context_attrs(opts))
+
+    # Client-asserted context merges UNDER the server-derived facts, never over them: a
+    # request header must not be able to overwrite `agent_id`, `tool` or `outcome`. The
+    # controller's whitelist makes a collision impossible TODAY — this makes it structural.
+    Map.merge(client_context_attrs(opts), attrs)
   end
 
-  # Result shapes differ per lane (keyword rows carry `:relevance_score`, fused rows a
-  # `:final_score`), so the top result's identity is read tolerantly rather than assumed.
+  # Read with `Map.get/2`, never `top[:key]`: Access is undefined on structs, so the Access
+  # form raises on a struct-shaped result and the whole telemetry row is lost to the
+  # recorder's rescue. Each lane names its score differently — fused rows carry
+  # `:final_score`, the semantic lane `:similarity_score`, keyword (and the degraded
+  # keyword-only fallback) `:relevance_score` — so all three are read, or the column the
+  # schema justifies as "judge relevance later without replaying the query" stays NULL for
+  # every non-fused lane.
   defp top_result_id(nil), do: nil
-  defp top_result_id(top), do: top[:id] || Map.get(top, :id)
+  defp top_result_id(top), do: Map.get(top, :id)
 
   defp top_result_score(nil), do: nil
 
   defp top_result_score(top) do
-    top[:final_score] || Map.get(top, :final_score) || Map.get(top, :score)
+    Map.get(top, :final_score) || Map.get(top, :similarity_score) ||
+      Map.get(top, :relevance_score) || Map.get(top, :score)
   end
+
+  # The mode a client can actually REQUEST. `mode` at the record site is the internal LANE
+  # label, so falling back to it invented buckets ("combined_fallback", "list_keyset",
+  # "hybrid_curated") no request can produce and undercounted the implicit default. A lane
+  # entered from combined reports combined; anything else records NULL (undeclared) rather
+  # than a phantom.
+  defp requested_mode(mode) when mode in ~w(keyword semantic combined), do: mode
+  defp requested_mode("combined_fallback"), do: "combined"
+  defp requested_mode(_lane), do: nil
 
   # The tool a row belongs to, derived from the lane that recorded it. `knowledge_list` and
   # `knowledge_hybrid_search` are not searches in the same sense as `knowledge_search`, and
@@ -2640,7 +2662,7 @@ defmodule Loopctl.Knowledge do
   # to nil are different facts, and flattening them would make an over-scoped search look
   # identical to an unscoped one.
   defp search_filters(opts) do
-    [:category, :tags, :status, :project_id, :visibility, :threshold]
+    [:category, :tags, :match, :status, :project_id, :visibility, :threshold]
     |> Enum.reduce(%{}, fn key, acc ->
       case Keyword.fetch(opts, key) do
         {:ok, nil} -> acc
@@ -8261,7 +8283,14 @@ defmodule Loopctl.Knowledge do
               tenant_id,
               merged.results,
               query_string,
-              Keyword.put(opts, :_total_count, merged.meta[:total_count]),
+              # The inner semantic read's scan state rides in `merged.meta`; without
+              # carrying it out the DEFAULT lane recorded NULL while explicit
+              # `mode=semantic` recorded a value, so the column compared a populated
+              # class against an unpopulated one.
+              Keyword.merge(opts,
+                _total_count: merged.meta[:total_count],
+                _ann_iterative_scan: merged.meta[:ann_iterative_scan]
+              ),
               "combined"
             )
 

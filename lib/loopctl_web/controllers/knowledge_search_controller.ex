@@ -22,6 +22,7 @@ defmodule LoopctlWeb.KnowledgeSearchController do
   alias Loopctl.Knowledge.Analytics
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleCursor
+  alias LoopctlWeb.Helpers.ClientContext
   alias LoopctlWeb.Helpers.ProjectId
   alias LoopctlWeb.Helpers.TagMatch
   alias LoopctlWeb.Helpers.Visibility
@@ -33,21 +34,6 @@ defmodule LoopctlWeb.KnowledgeSearchController do
   tags(["Knowledge Wiki"])
 
   @valid_modes ~w(keyword semantic combined)
-
-  # The single header the MCP client sends its (untrusted) context on, base64-encoded JSON
-  # so an arbitrary repo name or hostname cannot break header parsing.
-  @client_context_header "x-loopctl-client-context"
-  @max_client_field_bytes 200
-  @client_context_fields %{
-    "session_id" => :client_session_id,
-    "effort" => :client_effort,
-    "model" => :client_model,
-    "host" => :client_host,
-    "repo" => :client_repo,
-    "entrypoint" => :client_entrypoint,
-    "kind" => :client_kind,
-    "version" => :client_version
-  }
   @valid_categories Ecto.Enum.values(Article, :category)
 
   operation(:search,
@@ -156,6 +142,17 @@ defmodule LoopctlWeb.KnowledgeSearchController do
             "a request with `include_body=true` AND a requested `limit > 25` is rejected " <>
             "with 400 (never a silent oversized response). Only `true` enables it; any " <>
             "other value is false.",
+        required: false
+      ],
+      "x-loopctl-client-context": [
+        in: :header,
+        type: :string,
+        description:
+          "OPTIONAL, analytics-only client context: base64 (unpadded) of a flat JSON " <>
+            "object with any of `session_id`, `effort`, `model`, `host`, `repo`, " <>
+            "`entrypoint`, `kind`, `version` — all strings, each truncated to 200 bytes. " <>
+            "UNTRUSTED: it never authorizes anything (the api key remains the sole " <>
+            "authority) and a malformed header is ignored, never an error.",
         required: false
       ]
     ],
@@ -326,15 +323,10 @@ defmodule LoopctlWeb.KnowledgeSearchController do
 
   @doc "GET /api/v1/knowledge/search"
   def search(conn, params) do
-    # #658: RECORD THE REJECTION, wherever it was raised. A call refused here never reaches
-    # the search path, so `maybe_record_search_access/5` — the only other writer — never
-    # sees it, and the rejected population stays invisible to the product's own analytics.
-    # That blindness is why a catalogue of 86 refused calls had to be recovered by
-    # hand-mining session transcripts.
-    #
-    # Wrapping the WHOLE action, not a `with ... else`: an `else` sees only its own
-    # conditions, so the cursor rejections and `:empty_query` — raised from the body —
-    # bypassed it entirely and stayed unrecorded. Every 4xx return passes through here.
+    # #658: RECORD THE REJECTION, wherever it was raised — a refused call never reaches
+    # `maybe_record_search_access/5`, the only other writer. Wrapping the WHOLE action, not
+    # a `with ... else`: an `else` sees only its own conditions, so the cursor rejections
+    # and `:empty_query` (raised from the body) bypassed it. Every 4xx passes here.
     case do_search(conn, params) do
       {:error, _status, _msg} = error ->
         record_rejected_search(conn, params, error)
@@ -362,8 +354,15 @@ defmodule LoopctlWeb.KnowledgeSearchController do
         # searches under NULL — a wrong answer, not a missing one.
         |> Keyword.put(:agent_id, Map.get(api_key, :agent_id))
         |> Keyword.put(:_started_at, System.monotonic_time(:millisecond))
-        |> Keyword.put(:_mode_requested, params["mode"])
-        |> Keyword.put(:_client_context, client_context_attrs(conn))
+        # The EFFECTIVE requested mode: `params["mode"]` is nil on the (very common)
+        # no-mode request, and the recorder then fell back to the internal LANE label,
+        # inventing `mode_requested` buckets no client can request.
+        |> Keyword.put(:_mode_requested, params["mode"] || mode)
+        # The RAW limit, before `maybe_add_limit/2` defaults and clamps it — `:limit` is
+        # the effective value, and recording it as `limit_requested` reports a number the
+        # client never sent.
+        |> Keyword.put(:_limit_requested, raw_requested_limit(params))
+        |> Keyword.put(:_client_context, ClientContext.attrs(conn))
         |> Keyword.merge(Visibility.scope_opts(conn))
 
       # US-27.9a: the presence of a `cursor` query param (even empty) opts the
@@ -388,23 +387,16 @@ defmodule LoopctlWeb.KnowledgeSearchController do
     end
   end
 
-  # Best-effort rejection telemetry. Never raises and never alters the response.
-  defp record_rejected_search(conn, params, error) do
+  # Best-effort attempt telemetry. Never raises and never alters the response.
+  defp record_attempt(conn, attrs) do
     api_key = conn.assigns[:current_api_key]
 
     if api_key do
       Analytics.record_search_attempt(
         api_key.tenant_id,
-        Map.merge(client_context_attrs(conn), %{
-          api_key_id: api_key.id,
-          agent_id: Map.get(api_key, :agent_id),
-          query: trim_query(params["q"]),
-          tool: "knowledge_search",
-          mode_requested: params["mode"],
-          rejected?: true,
-          rejection_reason: rejection_reason(error),
-          result_count: 0
-        })
+        ClientContext.attrs(conn)
+        |> Map.merge(%{api_key_id: api_key.id, agent_id: Map.get(api_key, :agent_id)})
+        |> Map.merge(attrs)
       )
     end
 
@@ -413,48 +405,54 @@ defmodule LoopctlWeb.KnowledgeSearchController do
     _ -> :ok
   end
 
-  # A STABLE tag, not the prose message: the message is tuned for humans and gets reworded,
-  # and a metric keyed on prose silently splits into two series the day it does.
-  #
-  # Every 4xx this action can return is `{:error, status, binary}`. If a future shape
-  # appears this raises FunctionClauseError, which `record_rejected_search/3`'s rescue
-  # swallows: the telemetry row is lost and the response is untouched. That is the correct
-  # failure direction for a recorder.
-  # Client-asserted context, decoded from the header the MCP server sends (#658).
-  #
-  # UNTRUSTED BY CONSTRUCTION and analytics-only: none of it is derivable server-side (an
-  # api_key names a KEY, and under the v2 dispatch pattern a key is minted per dispatch, so
-  # the server cannot tell which agent searched, at what effort, or from which repo). It
-  # must never gate access — the api key remains the sole authority — which is why every
-  # field is stored under a `client_` prefix. Malformed input yields an empty map, never an
-  # error: a broken header must not fail a search.
-  defp client_context_attrs(conn) do
-    with [raw] <- Plug.Conn.get_req_header(conn, @client_context_header),
-         {:ok, json} <- Base.decode64(raw, padding: false),
-         {:ok, %{} = map} <- JSON.decode(json) do
-      client_fields(map)
-    else
-      _ -> %{}
-    end
+  defp record_rejected_search(conn, params, error) do
+    record_attempt(conn, %{
+      query: trim_query(params["q"]),
+      # Derived from the request shape, as the SUCCESS path derives it: hardcoding
+      # `knowledge_search` gave `knowledge_list` a 0% rejection rate and made this tool
+      # absorb every enumeration failure.
+      tool: request_tool(params),
+      mode_requested: params["mode"],
+      rejected?: true,
+      rejection_reason: rejection_reason(error),
+      result_count: 0
+    })
   end
 
-  # Only the declared keys, only binaries, each length-bounded — the payload is attacker
-  # -shaped by definition and lands in an operator's analysis table.
-  defp client_fields(map) do
-    Enum.reduce(@client_context_fields, %{}, fn {key, field}, acc ->
-      case Map.get(map, key) do
-        value when is_binary(value) and value != "" ->
-          Map.put(acc, field, String.slice(value, 0, @max_client_field_bytes))
-
-        _ ->
-          acc
-      end
-    end)
+  # An embedding outage on the EXPLICIT semantic path returns a rendered 503 before any
+  # search-path recorder runs, so the failure class this table exists to expose left no row
+  # at all — while the same provider fault on combined is recorded as `degraded`.
+  defp record_failed_search(conn, query_spec, mode, opts) do
+    record_attempt(conn, %{
+      query: search_text(query_spec),
+      tool: "knowledge_search",
+      mode_requested: Keyword.get(opts, :_mode_requested),
+      mode_used: mode,
+      degraded?: true,
+      fallback_reason: "embedding_unavailable",
+      result_count: 0
+    })
   end
 
+  defp search_text({:search, q}), do: q
+  defp search_text(_list), do: nil
+
+  defp request_tool(params) do
+    if trim_query(params["q"]) == "" and filter_present?(params),
+      do: "knowledge_list",
+      else: "knowledge_search"
+  end
+
+  # A STABLE tag, not the prose message. Ordering is load-bearing: `invalid_cursor` means a
+  # TAMPERED token, so every other 400 whose text merely MENTIONS a cursor — the
+  # include_body misuse, the q+cursor conflict — is classified BEFORE it, or an operator
+  # chases cursor tampering that is not happening. Both include_body 400s share one tag:
+  # they are two halves of one client error.
   defp rejection_reason({:error, _status, msg}) when is_binary(msg) do
     cond do
       String.contains?(msg, "'q' is required") -> "missing_query"
+      String.contains?(msg, "include_body") -> "invalid_include_body"
+      String.contains?(msg, "only available for list enumeration") -> "cursor_with_query"
       String.contains?(msg, "cursor") -> "invalid_cursor"
       String.contains?(msg, "project_id") -> "invalid_project_id"
       true -> "bad_request"
@@ -467,6 +465,8 @@ defmodule LoopctlWeb.KnowledgeSearchController do
         json(conn, LoopctlWeb.KnowledgeSearchJSON.search(result, mode))
 
       {:error, :embedding_unavailable} ->
+        record_failed_search(conn, query_spec, mode, opts)
+
         conn
         |> put_status(503)
         |> json(%{error: %{status: 503, message: "Embedding service unavailable"}})
@@ -706,6 +706,13 @@ defmodule LoopctlWeb.KnowledgeSearchController do
 
   defp requested_limit(value) when is_integer(value) and value >= 0, do: {:ok, value}
   defp requested_limit(_), do: :none
+
+  defp raw_requested_limit(params) do
+    case requested_limit(params["limit"]) do
+      {:ok, limit} -> limit
+      :none -> nil
+    end
+  end
 
   # `include_body` is strictly opt-in: only the literal string "true" (or boolean
   # true) enables it; anything else — including "1", "yes", or a malformed value —

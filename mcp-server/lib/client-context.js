@@ -99,6 +99,13 @@ function clientContext({ version } = {}) {
   const child = env("CLAUDE_CODE_CHILD_SESSION");
   if (child !== undefined) {
     ctx.kind = child === "1" || child.toLowerCase() === "true" ? "child" : "main";
+  } else if (ctx.session_id) {
+    // A MAIN session sets no child marker at all, so keying on the marker alone filed
+    // every main session under NULL — beside every request from an older client that sends
+    // no context, which is the one population NULL has to keep meaning. An absent marker on
+    // a recognisable session IS main; with nothing identifying the caller, kind stays
+    // absent rather than guessed.
+    ctx.kind = "main";
   }
 
   for (const k of Object.keys(ctx)) {

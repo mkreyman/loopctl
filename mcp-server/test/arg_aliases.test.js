@@ -188,9 +188,10 @@ test("no callback is required", () => {
 
 test("SCHEMA DRIFT GUARD: no CURRENT alias silently shadows a real tool parameter", async () => {
   // The invariant: for every alias name the table maps FROM, no tool may declare that name
-  // as its own parameter — unless the pair is deliberately bidirectional (q <-> query,
-  // limit <-> max_results), where both names are canonical for different tools and filling
-  // one from the other is the entire point.
+  // as its own parameter — unless the pair is deliberately bidirectional (q <-> query),
+  // where both names are canonical for different tools and filling one from the other is
+  // the entire point. `max_results` is NOT in that set: its reverse entry was removed
+  // because no tool declares it, so it is an ordinary alias and the guard must police it.
   //
   // This guard has already earned its keep twice, on the change that introduced it: it
   // caught `query` (canonical for four tools) and `text` (memory_remember's memory CONTENT)
@@ -198,7 +199,7 @@ test("SCHEMA DRIFT GUARD: no CURRENT alias silently shadows a real tool paramete
   const src = readFileSync(join(here, "..", "index.js"), "utf8");
   const { ARG_ALIASES } = await import("../lib/arg-aliases.js");
 
-  const bidirectional = new Set(["q", "query", "limit", "max_results"]);
+  const bidirectional = new Set(["q", "query", "limit"]);
   const aliasNames = new Set(Object.values(ARG_ALIASES).flat());
 
   for (const alias of aliasNames) {

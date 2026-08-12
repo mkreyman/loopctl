@@ -66,19 +66,38 @@ test("a MAIN session is distinguishable from a dispatched child", () => {
   });
 });
 
-test("an UNSET child flag is omitted, not guessed", () => {
-  withEnv({ CLAUDE_CODE_CHILD_SESSION: undefined }, () => {
-    assert.equal("kind" in clientContext(), false);
+test("an UNSET child flag on a recognisable session IS main, not NULL", () => {
+  // A main session sets no child marker, so requiring the marker put every main session in
+  // the NULL bucket — the bucket that has to mean "no context sent at all".
+  withEnv({ CLAUDE_CODE_CHILD_SESSION: undefined, CLAUDE_SESSION_ID: "sess-9" }, () => {
+    assert.equal(clientContext().kind, "main");
   });
+});
+
+test("with nothing identifying the caller, kind is omitted rather than guessed", () => {
+  withEnv(
+    {
+      CLAUDE_CODE_CHILD_SESSION: undefined,
+      CLAUDE_SESSION_ID: undefined,
+      CLAUDE_CODE_SESSION_ID: undefined,
+    },
+    () => {
+      assert.equal("kind" in clientContext(), false);
+    },
+  );
 });
 
 test("a WORKFLOW agent is not falsely labelled — the flag cannot see it", () => {
   // CLAUDE_CODE_WORKFLOWS is a feature flag present in MAIN sessions too, so it must never
   // be read as "this is a workflow agent". The third value is an offline join, not a guess.
-  withEnv({ CLAUDE_CODE_WORKFLOWS: "1", CLAUDE_CODE_CHILD_SESSION: undefined }, () => {
-    const ctx = clientContext();
-    assert.equal("kind" in ctx, false, "a feature flag must not be mistaken for a kind");
-  });
+  withEnv(
+    { CLAUDE_CODE_WORKFLOWS: "1", CLAUDE_CODE_CHILD_SESSION: undefined, CLAUDE_SESSION_ID: "s" },
+    () => {
+      // "main" is what an absent marker means; the flag must never upgrade that to a
+      // workflow label. The third value is an offline join, not a guess.
+      assert.equal(clientContext().kind, "main");
+    },
+  );
 });
 
 test("model is NOT fabricated when the runtime does not expose it", () => {
