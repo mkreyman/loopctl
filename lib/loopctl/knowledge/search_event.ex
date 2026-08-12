@@ -78,6 +78,10 @@ defmodule Loopctl.Knowledge.SearchEvent do
   which records the model. The same join separates workflow agents from ordinary subagents,
   which `client_kind` cannot.
 
+  That join is implemented — `mix loopctl.enrich_search_events`, see
+  `Loopctl.Knowledge.SearchEventEnrichment` — and the monthly procedure that runs it and
+  then runs the queries above is `docs/runbooks/search-events-analysis.md`.
+
   ## Recording is best-effort and MUST NOT fail a search
 
   A telemetry write that can break the read path is a worse defect than the blindness it
