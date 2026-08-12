@@ -28,6 +28,12 @@ defmodule Loopctl.EmbeddingsReviewFixesTest do
   """
 
   use Loopctl.DataCase, async: true
+
+  # #645 — vacuum the pgvector graph before each test in this module. Rolled-back tests
+  # leave DEAD HNSW entries behind, and pgvector's scan skips dead elements rather than
+  # traversing through them, which makes a visible row UNREACHABLE and returns `[]`. See
+  # `Loopctl.DataCase.vacuum_vector_indexes/0`.
+  @moduletag :vacuum_vector_indexes
   use Oban.Testing, repo: Loopctl.Repo
 
   import Ecto.Query
