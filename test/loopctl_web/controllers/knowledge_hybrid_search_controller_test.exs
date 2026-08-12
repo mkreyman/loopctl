@@ -287,6 +287,45 @@ defmodule LoopctlWeb.KnowledgeHybridSearchControllerTest do
       assert is_binary(drill_body["data"]["body"])
     end
 
+    test "a drill bounds an oversized body the same way knowledge_get does (#652)",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      big = String.duplicate("z", 80_000)
+
+      article =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          status: :published,
+          title: "Oversized Drill Target",
+          body: big
+        })
+
+      data =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/progressive/#{article.id}")
+        |> json_response(200)
+        |> Map.fetch!("data")
+
+      budget = LoopctlWeb.ArticleJSON.article_body_byte_budget()
+      assert byte_size(data["body"]) == budget
+      assert data["body_bytes"] == 80_000
+      assert data["body_truncated"] == true
+      assert data["next_body_offset"] == budget
+
+      whole =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/progressive/#{article.id}?body_max_bytes=0")
+        |> json_response(200)
+        |> Map.fetch!("data")
+
+      assert whole["body"] == big
+      assert whole["body_truncated"] == false
+    end
+
     test "a non-binary topic param (array syntax) is a clean 400, not a 500", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
