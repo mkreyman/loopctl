@@ -250,6 +250,27 @@ if [ -n "$STH" ]; then
   AUTH_HDRS+=(-H "X-Loopctl-Last-Known-STH: $STH")
 fi
 
+# Declare this traffic as the smoke test (#673). Two searches per run made this script
+# 135 of the first 204 `search_events` rows — 66% — and it searches without EVER opening
+# a result, so it only ever inflates the denominator of every retrieval metric. Untagged,
+# the table said agents write single-token junk; segmented, real agent queries average 9.5
+# terms. The conclusion reverses on the segmentation alone.
+#
+# `entrypoint` ONLY, deliberately no `host`. `client_host IS NOT NULL` is the documented
+# predicate for "a real agent through the MCP client", and sending a host here would
+# silently fold the smoke test into exactly the population that predicate exists to isolate.
+# This adds a third, positively-identified class instead: smoke is
+# `client_entrypoint = 'smoke'`, agents are `client_host IS NOT NULL`, and what remains is
+# hook-driven recall — three populations that were previously two, one of which was a NULL
+# meaning two different things.
+#
+# Base64 of a JSON object, matching LoopctlWeb.Helpers.ClientContext. Padded output from
+# `base64` is fine: the decoder is `Base.decode64(raw, padding: false)`, which accepts both
+# forms (verified). A malformed header yields an empty map and never fails a request, so
+# this cannot break the smoke run it rides on.
+SMOKE_CLIENT_CONTEXT=$(printf '%s' '{"entrypoint":"smoke"}' | base64 | tr -d '\n')
+AUTH_HDRS+=(-H "x-loopctl-client-context: $SMOKE_CLIENT_CONTEXT")
+
 echo "loopctl post-deploy smoke — ${BASE_URL} (budget ${SMOKE_MAX_MS}ms; embed ${SMOKE_EMBED_MAX_MS}ms)"
 
 # --- Health poll (resilient to a just-deployed release) ------------------------

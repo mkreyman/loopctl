@@ -2742,6 +2742,32 @@ defmodule Loopctl.Knowledge do
   # Wall time from the request entrypoint, which is the only place that knows when the
   # attempt began. Monotonic, so a clock step cannot produce a negative duration. Absent
   # for callers that never stamped a start (recorded as NULL, not as a wrong zero).
+  # The metadata every surfaced-result row carries. `entrypoint` rides along ONLY when the
+  # client declared one, and it is what lets `RetrievalMetrics` exclude infrastructure
+  # traffic without joining back to `search_events` — the same shape `mode` is already
+  # filtered on there (#673).
+  #
+  # It matters because the smoke test searches and NEVER opens: two searches per run made it
+  # 66% of recorded searches, every one of them adding to the denominator of precision and
+  # follow-through while being structurally incapable of adding to the numerator. A 1-4%
+  # precision read as a catastrophic retrieval failure and was largely this.
+  #
+  # Client-asserted and therefore spoofable, exactly like the rest of the `client_*` surface
+  # — analytics only, never an authorization input. The failure it permits is a caller
+  # excluding its OWN rows from a quality metric, which is self-harm rather than an attack
+  # on anyone else's numbers.
+  defp search_access_meta(mode, results, opts) do
+    base = %{"mode" => mode, "results_returned" => length(results)}
+
+    case Map.get(client_context_attrs(opts), :client_entrypoint) do
+      entrypoint when is_binary(entrypoint) and entrypoint != "" ->
+        Map.put(base, "entrypoint", entrypoint)
+
+      _ ->
+        base
+    end
+  end
+
   defp search_duration_ms(opts) do
     case Keyword.get(opts, :_started_at) do
       started when is_integer(started) -> System.monotonic_time(:millisecond) - started
@@ -2834,7 +2860,7 @@ defmodule Loopctl.Knowledge do
           article_ids,
           api_key_id,
           query_string,
-          %{"mode" => mode, "results_returned" => length(results)},
+          search_access_meta(mode, results, opts),
           # search_id rides the INTERNAL context, not the metadata map — metadata is
           # caller-supplied and a forged id would collapse the `searches` denominator (#582).
           Map.put(attribution_context(opts), :search_id, search_id)
