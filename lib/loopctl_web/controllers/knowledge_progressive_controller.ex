@@ -109,8 +109,13 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
       case Knowledge.progressive_index(tenant_id, topic, opts) do
         {:ok, result} ->
           record_attempt(conn, topic, started_at, %{
-            result_count: length(Map.get(result, :results, [])),
-            total_count: Map.get(result, :candidate_count)
+            # `progressive_index/3` returns `%{stubs: [...], meta: %{candidate_count: n}}`,
+            # NOT the `:results` / top-level shape its sibling surfaces use. Reading the
+            # wrong keys recorded every SUCCESSFUL index as `result_count: 0`, which
+            # `derive_outcome/1` then classified `zero_results` — so the surface would have
+            # reported a 100% miss rate, which is worse than the silence it replaced.
+            result_count: length(Map.get(result, :stubs, [])),
+            total_count: get_in(result, [:meta, :candidate_count])
           })
 
           json(conn, LoopctlWeb.KnowledgeProgressiveJSON.index(result))
