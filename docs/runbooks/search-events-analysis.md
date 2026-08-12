@@ -144,3 +144,27 @@ published articles have ever been opened. That is a harness/consumption problem,
 search or corpus one — fixing retrieval further will not move it. Do not spend a month's
 work on the retrieval side on the strength of a utilization number that was never
 segmented by origin (step 2).
+
+## Appendix — regenerating the retrieval baseline
+
+Adding a golden question (for example, one grown from real logged queries) makes the eval
+run `:incomparable`: `question_set_changed?/1` compares the question-id SET and refuses,
+rather than letting an unmatched question read as a non-regression. So the baseline has to be
+regenerated whenever the question set changes.
+
+**Do it in CI, not locally**, and not for the reason it first appears. The eval's vectors are
+deterministic functions of the committed text, so no embedding provider is involved. The
+difference is the CORPUS: the CI job seeds a fresh database, while a developer's dev DB
+carries whatever else it has accumulated. Measured 2026-08-12 on the same commit — CI scored
+`mrr 0.746 / answered 22 of 26`; a local run of the same command scored `0.192 / 5 of 26`. A
+baseline captured locally bakes one machine's private database into a deploy gate for
+everyone.
+
+```bash
+gh workflow run CI --ref <your-branch> -f regenerate_retrieval_baseline=true
+gh run download <run-id> -n retrieval-baseline      # then commit it deliberately
+```
+
+The gate step is skipped on a regeneration run — comparing a run against a baseline it just
+wrote would pass whatever the numbers are. CI never commits the file: a gate that can rewrite
+its own threshold unattended is not a gate.
