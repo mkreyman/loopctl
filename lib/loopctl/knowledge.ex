@@ -8389,7 +8389,10 @@ defmodule Loopctl.Knowledge do
             # because it needs `tenant_id` (a DB read of the link graph); threaded into
             # `merge_results/5` via opts so that function stays a pure fusion function
             # (no DB) — its arity and public contract are unchanged.
-            merge_opts = put_graph_lane(opts, tenant_id, kw, semantic)
+            merge_opts =
+              opts
+              |> put_graph_lane(tenant_id, kw, semantic)
+              |> put_curated_lane(tenant_id, kw, semantic)
 
             {:ok, merged} =
               merge_results(kw, semantic, keyword_weight, semantic_weight, merge_opts)
@@ -8406,7 +8409,7 @@ defmodule Loopctl.Knowledge do
                 _total_count: merged.meta[:total_count],
                 _ann_iterative_scan: merged.meta[:ann_iterative_scan]
               ),
-              "combined"
+              combined_search_mode(merged.meta[:provenance])
             )
 
             {:ok, merged}
@@ -8649,6 +8652,12 @@ defmodule Loopctl.Knowledge do
       # source_type/tags/status, so merge_results/5 stays a DB-free fusion function.
       |> apply_ranking_priors_fused(opts)
 
+    # #31 follow-up: the curated-vs-retrieved decision runs HERE, on the default path,
+    # rather than only inside `hybrid_search/3`. It is a re-rank of this same fused pool —
+    # not a different search — so exposing it as a separate tool asked every agent to know,
+    # per query, whether a governed answer exists. Finding that out IS the search.
+    {sorted, provenance_meta} = apply_curated_provenance(sorted, opts)
+
     paginated = paginate_results(sorted, opts)
 
     {:ok,
@@ -8697,6 +8706,7 @@ defmodule Loopctl.Knowledge do
          |> Map.merge(
            Map.take(semantic_result.meta, [:ann_iterative_scan, :ann_iterative_scan_reason])
          )
+         |> Map.merge(provenance_meta)
      }}
   end
 
@@ -8908,6 +8918,75 @@ defmodule Loopctl.Knowledge do
   # requested-status article maps in that rank order for the fusion. The neighbor maps carry
   # NO `:relevance_score`/`:similarity_score`, so their hybrid-resolver `absolute_score`
   # is 0.0 — a graph-only hit can never falsely win the curated-vs-retrieved decision.
+
+  # The curated candidate ids for this pool, threaded into `merge_results/5` via opts for
+  # the SAME reason `put_graph_lane/4` is: the lookup is a DB read and `merge_results/5`
+  # stays a pure fusion function. One bounded `SELECT id ... WHERE id = ANY($1)` over a pool
+  # already capped at ~200, on a path that has already paid a keyword search, an embedding
+  # and a vector read.
+  defp put_curated_lane(opts, tenant_id, kw, semantic) do
+    if Keyword.get(opts, :_skip_curated_provenance, false) do
+      opts
+    else
+      case kw.results ++ semantic.results do
+        [] -> opts
+        candidates -> Keyword.put(opts, :_curated_ids, curated_source_ids(tenant_id, candidates))
+      end
+    end
+  end
+
+  # Decides provenance over the FUSED pool, and hoists a winning curated article to the front
+  # of the FIRST page only.
+  #
+  # The decision is a property of the POOL, so it is reported on every page — a paginated
+  # caller that lost `meta.provenance` after page 1 would have to branch on page number to
+  # know whether a governed answer exists, and the whole point of the field is that a caller
+  # branches on provenance alone.
+  #
+  # The HOIST is a property of the page, so it applies at offset 0 only: re-serving the
+  # winner at the top of page 2 would show it twice to a caller paging forward.
+  # `hybrid_search/3` forces `offset: 0` on its inner call for the mirror-image reason — so
+  # a curated article ranked outside the caller's window is still FOUND.
+  defp apply_curated_provenance(sorted, opts) do
+    case Keyword.get(opts, :_curated_ids) do
+      nil ->
+        {sorted, %{}}
+
+      curated_ids ->
+        {ordered, decision} = decide_curated_provenance(sorted, curated_ids)
+        if Keyword.get(opts, :offset, 0) == 0, do: {ordered, decision}, else: {sorted, decision}
+    end
+  end
+
+  defp decide_curated_provenance(sorted, curated_ids) do
+    # `candidate_scores/1` reads the per-lane ABSOLUTE score (`similarity_score` /
+    # `relevance_score`), never the fused `:final_score`. That matters: post-#470 the fused
+    # value is an RRF weight topping out near 0.016, so the configured thresholds — tuned
+    # against a 0..1 scale — would be unreachable and every search would resolve
+    # `:retrieved`. Those per-lane fields ride along through fusion, so the decision here is
+    # the same one `hybrid_search/3` makes on the same pool.
+    scores = candidate_scores(sorted)
+    {curated, retrieved} = Enum.split_with(sorted, &MapSet.member?(curated_ids, &1.id))
+    best_curated = Enum.max_by(curated, &Map.fetch!(scores, &1.id), fn -> nil end)
+    curated_score = best_curated && Map.fetch!(scores, best_curated.id)
+    best_retrieved_score = best_score(retrieved, scores)
+    {threshold, margin} = hybrid_curated_threshold_and_margin(best_curated)
+
+    case resolve_provenance(curated_score, best_retrieved_score, threshold, margin) do
+      :curated ->
+        {hoist_to_front(sorted, best_curated.id),
+         %{
+           provenance: :curated,
+           confidence: curated_score,
+           curated_article_id: best_curated.id
+         }}
+
+      :retrieved ->
+        {sorted,
+         %{provenance: :retrieved, confidence: best_retrieved_score, curated_article_id: nil}}
+    end
+  end
+
   defp put_graph_lane(opts, tenant_id, kw, semantic) do
     # Only the RRF fuser consumes `:_graph_lane_results` — `fuse_min_max/4` ignores
     # graph neighbors entirely. Gate the (DB-backed) lane build on the strategy being
@@ -9301,41 +9380,25 @@ defmodule Loopctl.Knowledge do
       |> Keyword.put(:_skip_record_access, true)
       |> Keyword.put(:limit, @max_relevance_page_size)
       |> Keyword.put(:offset, 0)
+      # The default path now runs this same decision inside `merge_results/5`. Skip it on
+      # the INNER call: this function applies `decide_curated_provenance/2` itself, over
+      # the same pool, so letting the inner one run would pay for the curated lookup twice
+      # to reach the identical answer.
+      |> Keyword.put(:_skip_curated_provenance, true)
 
     with {:ok, %{results: pool_results, meta: pool_meta}} <-
            search_combined(tenant_id, query_string, pool_opts) do
+      # ONE implementation of the decision, shared with the default path — see
+      # `decide_curated_provenance/2`. This function's remaining job is the part that IS
+      # specific to it: forcing the full pool at offset 0 so a curated article ranked
+      # outside the caller's window is still found, then paging the reordered pool.
       curated_ids = curated_source_ids(tenant_id, pool_results)
-      scores = candidate_scores(pool_results)
 
-      {curated_candidates, retrieved_candidates} =
-        Enum.split_with(pool_results, &MapSet.member?(curated_ids, &1.id))
+      {ordered_pool, decision} = decide_curated_provenance(pool_results, curated_ids)
 
-      best_curated = Enum.max_by(curated_candidates, &Map.fetch!(scores, &1.id), fn -> nil end)
-      curated_score = best_curated && Map.fetch!(scores, best_curated.id)
-      best_retrieved_score = best_score(retrieved_candidates, scores)
-
-      {threshold, margin} = hybrid_curated_threshold_and_margin(best_curated)
-
-      provenance = resolve_provenance(curated_score, best_retrieved_score, threshold, margin)
-
-      # (finding: mislabeled-authoritative decoy) When `:curated` wins, the winning
-      # curated article MUST actually be present — and first — in the returned page,
-      # never just a label attached to whatever the pool-relative ranking happened to
-      # place in the requested window. Reordering the FULL pool (not just the page)
-      # keeps `results` sourced from the same ranked pool for every offset (AC-31.2.3
-      # shape parity is unaffected — same map shape, just reordered).
-      {ordered_pool, confidence, curated_article_id} =
-        case provenance do
-          :curated ->
-            {hoist_to_front(pool_results, best_curated.id), curated_score, best_curated.id}
-
-          :retrieved ->
-            # (finding: mislabeled confidence) `best_retrieved_score` — NEVER
-            # `best_score(pool_results, scores)`, which would report a REJECTED
-            # curated candidate's score (a different provenance class) as if it were
-            # the winning retrieved candidate's confidence.
-            {pool_results, best_retrieved_score, nil}
-        end
+      provenance = decision.provenance
+      confidence = decision.confidence
+      curated_article_id = decision.curated_article_id
 
       page = paginate_results(ordered_pool, limit: requested_limit, offset: requested_offset)
 
@@ -9480,6 +9543,21 @@ defmodule Loopctl.Knowledge do
   defp hybrid_curated_threshold_and_margin(_candidate) do
     {hybrid_curated_threshold(), hybrid_curated_margin()}
   end
+
+  # The recorded mode carries the provenance DECISION, exactly as `hybrid_search_mode/1`
+  # already does — because that is what makes the decision measurable. `search_events` joins
+  # to `article_access_events` to answer "did the searcher open anything", so labelling the
+  # branch here turns that join into "when we led with a governed article, did they open it,
+  # and more often than when we did not?". That is the only feedback signal in the system
+  # that is derived from what an agent DID rather than from what a ranker scored.
+  #
+  # `combined` (unlabelled) is still emitted when the curated lane did not run — an
+  # inner/pool call that skipped it, or a search whose pool was empty — so the value is never
+  # a guess. Rows written before this landed carry the bare `combined`; treat that as a third
+  # class, not as `combined_retrieved`.
+  defp combined_search_mode(:curated), do: "combined_curated"
+  defp combined_search_mode(:retrieved), do: "combined_retrieved"
+  defp combined_search_mode(_absent), do: "combined"
 
   defp hybrid_search_mode(:curated), do: "hybrid_curated"
   defp hybrid_search_mode(:retrieved), do: "hybrid_retrieved"
