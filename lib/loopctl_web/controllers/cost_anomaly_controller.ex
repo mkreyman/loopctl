@@ -36,7 +36,11 @@ defmodule LoopctlWeb.CostAnomalyController do
         type: :string,
         description: "Filter by anomaly type: high_cost, suspiciously_low, budget_exceeded"
       ],
-      project_id: [in: :query, type: :string, description: "Filter by project UUID"],
+      project_id: [
+        in: :query,
+        type: :string,
+        description: "Filter by project: UUID, slug, or repo directory name"
+      ],
       include_archived: [
         in: :query,
         type: :boolean,

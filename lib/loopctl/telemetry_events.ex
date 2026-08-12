@@ -44,6 +44,18 @@ defmodule Loopctl.TelemetryEvents do
   def audit_log_write, do: [:loopctl, :audit, :write]
 
   @doc """
+  A client-supplied `project_id` carrying a project REFERENCE (a slug, or the repo
+  directory name) was resolved to that project's UUID at the API boundary (#652).
+
+  Metadata: `%{tenant_id, project_id, ref, matched_by, path}` where `matched_by` is
+  `:slug`, `:normalized_slug` or `:repo_name`. Every emission is one request
+  that would previously have 422'd — and, measured, would then have been retried
+  with the scope dropped entirely. A rising count means agents are still reaching
+  for the slug; a falling one means the tool surface taught them the UUID.
+  """
+  def project_ref_resolved, do: [:loopctl, :project_id, :ref_resolved]
+
+  @doc """
   A vector-search read under-filled (US-27.6b): it returned fewer than the
   requested `k` candidates AND above-threshold (near) neighbors the inner ANN
   surfaced were hidden by the already-linked anti-join — `above_threshold >

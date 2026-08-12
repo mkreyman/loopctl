@@ -39,7 +39,11 @@ defmodule LoopctlWeb.AnalyticsController do
       "Returns per-agent cost metrics including efficiency ranking. " <>
         "Filterable by project_id and date range.",
     parameters: [
-      project_id: [in: :query, type: :string, description: "Filter by project UUID"],
+      project_id: [
+        in: :query,
+        type: :string,
+        description: "Filter by project: UUID, slug, or repo directory name"
+      ],
       since: [in: :query, type: :string, description: "Start date (YYYY-MM-DD)"],
       until: [in: :query, type: :string, description: "End date (YYYY-MM-DD)"],
       page: [in: :query, type: :integer, description: "Page number"],
@@ -68,7 +72,11 @@ defmodule LoopctlWeb.AnalyticsController do
       "Returns per-epic cost breakdown including budget utilization and model breakdown. " <>
         "Filterable by project_id.",
     parameters: [
-      project_id: [in: :query, type: :string, description: "Filter by project UUID"],
+      project_id: [
+        in: :query,
+        type: :string,
+        description: "Filter by project: UUID, slug, or repo directory name"
+      ],
       page: [in: :query, type: :integer, description: "Page number"],
       page_size: [in: :query, type: :integer, description: "Items per page"]
     ],
@@ -117,7 +125,11 @@ defmodule LoopctlWeb.AnalyticsController do
       "Returns per-model token usage, cost, and verification correlation metrics. " <>
         "Filterable by project_id and date range.",
     parameters: [
-      project_id: [in: :query, type: :string, description: "Filter by project UUID"],
+      project_id: [
+        in: :query,
+        type: :string,
+        description: "Filter by project: UUID, slug, or repo directory name"
+      ],
       since: [in: :query, type: :string, description: "Start date (YYYY-MM-DD)"],
       until: [in: :query, type: :string, description: "End date (YYYY-MM-DD)"],
       page: [in: :query, type: :integer, description: "Page number"],
@@ -151,7 +163,11 @@ defmodule LoopctlWeb.AnalyticsController do
         type: :string,
         description: "Grouping: 'daily' (default) or 'weekly'"
       ],
-      project_id: [in: :query, type: :string, description: "Filter by project UUID"],
+      project_id: [
+        in: :query,
+        type: :string,
+        description: "Filter by project: UUID, slug, or repo directory name"
+      ],
       since: [in: :query, type: :string, description: "Start date (YYYY-MM-DD)"],
       until: [in: :query, type: :string, description: "End date (YYYY-MM-DD)"],
       page: [in: :query, type: :integer, description: "Page number"],
@@ -182,7 +198,11 @@ defmodule LoopctlWeb.AnalyticsController do
         "mixed-model vs single-model agent averages. " <>
         "Filterable by project_id, agent_id, and date range.",
     parameters: [
-      project_id: [in: :query, type: :string, description: "Filter by project UUID"],
+      project_id: [
+        in: :query,
+        type: :string,
+        description: "Filter by project: UUID, slug, or repo directory name"
+      ],
       agent_id: [in: :query, type: :string, description: "Filter by agent UUID"],
       since: [in: :query, type: :string, description: "Start date (YYYY-MM-DD)"],
       until: [in: :query, type: :string, description: "End date (YYYY-MM-DD)"]
@@ -224,7 +244,11 @@ defmodule LoopctlWeb.AnalyticsController do
         "Filterable by project_id and date range.",
     parameters: [
       id: [in: :path, type: :string, description: "Agent UUID"],
-      project_id: [in: :query, type: :string, description: "Filter by project UUID"],
+      project_id: [
+        in: :query,
+        type: :string,
+        description: "Filter by project: UUID, slug, or repo directory name"
+      ],
       since: [in: :query, type: :string, description: "Start date (YYYY-MM-DD)"],
       until: [in: :query, type: :string, description: "End date (YYYY-MM-DD)"]
     ],

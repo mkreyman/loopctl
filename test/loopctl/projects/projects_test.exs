@@ -216,6 +216,133 @@ defmodule Loopctl.ProjectsTest do
     end
   end
 
+  describe "resolve_project_ref/2" do
+    test "resolves an exact slug" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id, slug: "loopctl"})
+
+      assert {:ok, found, :slug} = Projects.resolve_project_ref(tenant.id, "loopctl")
+      assert found.id == project.id
+    end
+
+    test "resolves the underscored repo directory name against a hyphenated slug" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id, slug: "home-care-billing"})
+
+      assert {:ok, found, :normalized_slug} =
+               Projects.resolve_project_ref(tenant.id, "home_care_billing")
+
+      assert found.id == project.id
+    end
+
+    test "resolves by repo basename when the slug drifted from the repo" do
+      tenant = fixture(:tenant)
+
+      project =
+        fixture(:project, %{
+          tenant_id: tenant.id,
+          slug: "freight-pilot-2",
+          repo_url: "https://github.com/mkreyman/freight-pilot"
+        })
+
+      assert {:ok, found, :repo_name} =
+               Projects.resolve_project_ref(tenant.id, "freight_pilot")
+
+      assert found.id == project.id
+    end
+
+    test "matches a repo basename through the ssh spec and a .git suffix" do
+      tenant = fixture(:tenant)
+
+      project =
+        fixture(:project, %{
+          tenant_id: tenant.id,
+          slug: "harness-kit-2",
+          repo_url: "git@github.com:mkreyman/claude-harness-kit.git"
+        })
+
+      assert {:ok, found, :repo_name} =
+               Projects.resolve_project_ref(tenant.id, "claude-harness-kit")
+
+      assert found.id == project.id
+    end
+
+    test "an exact slug wins over another project's repo basename" do
+      tenant = fixture(:tenant)
+
+      wanted = fixture(:project, %{tenant_id: tenant.id, slug: "api"})
+
+      _decoy =
+        fixture(:project, %{
+          tenant_id: tenant.id,
+          slug: "decoy",
+          repo_url: "https://github.com/acme/api"
+        })
+
+      assert {:ok, found, :slug} = Projects.resolve_project_ref(tenant.id, "api")
+      assert found.id == wanted.id
+    end
+
+    test "two active projects sharing a repo basename are :ambiguous, not oldest-wins" do
+      tenant = fixture(:tenant)
+
+      _one =
+        fixture(:project, %{
+          tenant_id: tenant.id,
+          slug: "api-a",
+          repo_url: "https://github.com/acme/api"
+        })
+
+      _two =
+        fixture(:project, %{
+          tenant_id: tenant.id,
+          slug: "api-b",
+          repo_url: "https://gitlab.com/other/api"
+        })
+
+      assert {:error, :ambiguous} = Projects.resolve_project_ref(tenant.id, "api")
+    end
+
+    test "an archived project does not resolve by repo basename" do
+      tenant = fixture(:tenant)
+
+      project =
+        fixture(:project, %{
+          tenant_id: tenant.id,
+          slug: "retired-2",
+          repo_url: "https://github.com/acme/retired"
+        })
+
+      {:ok, _archived} = Projects.archive_project(tenant.id, project)
+
+      assert {:error, :not_found} = Projects.resolve_project_ref(tenant.id, "retired")
+    end
+
+    test "does not cross tenants" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      _theirs = fixture(:project, %{tenant_id: tenant_b.id, slug: "home-care-billing"})
+
+      assert {:error, :not_found} =
+               Projects.resolve_project_ref(tenant_a.id, "home_care_billing")
+    end
+
+    test "blank and non-binary references are :not_found, never a crash" do
+      tenant = fixture(:tenant)
+
+      for ref <- ["", "   ", nil, 123, ["a"]] do
+        assert {:error, :not_found} = Projects.resolve_project_ref(tenant.id, ref)
+      end
+    end
+
+    test "a reference that normalizes to nothing is :not_found" do
+      tenant = fixture(:tenant)
+      _project = fixture(:project, %{tenant_id: tenant.id, slug: "loopctl"})
+
+      assert {:error, :not_found} = Projects.resolve_project_ref(tenant.id, "___")
+    end
+  end
+
   describe "resolve_project/2" do
     test "resolves by exact slug" do
       tenant = fixture(:tenant)
