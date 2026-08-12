@@ -101,6 +101,12 @@ HDRS="$TMP/hdrs"
 HTTP_CODE=""
 TIME_MS=""
 
+# The last request http() issued, so assert() can re-measure it. See the cold-start note
+# on assert() below.
+LAST_METHOD=""
+LAST_URL=""
+LAST_ARGS=()
+
 # http METHOD URL [extra curl args...]
 # Writes the response body to $BODY and response headers to $HDRS, and sets
 # HTTP_CODE + TIME_MS (milliseconds). A hard curl failure (DNS/connect/timeout)
@@ -110,6 +116,10 @@ http() {
   local method="$1"
   local url="$2"
   shift 2
+  # Remember the request so a latency-only failure can be re-measured once (see assert()).
+  LAST_METHOD="$method"
+  LAST_URL="$url"
+  LAST_ARGS=("$@")
   local out
   # --max-time gives curl a hard ceiling a few seconds above the widest per-check
   # latency budget so a hung endpoint can't stall the whole run.
@@ -171,9 +181,33 @@ assert() {
     return
   fi
 
+  # Cold-start tolerance (#652). This smoke runs the instant a deploy finishes, against an
+  # app that autostops, so the FIRST request of a given SHAPE pays warmup its successors do
+  # not — a cold BEAM, a cold connection pool, a cold index. Measured on master
+  # 2026-08-12: `keyword retrieval floor` took 7704ms while the semantic check right after
+  # it — which additionally makes an outbound LLM call — took 1254ms.
+  #
+  # So a single measurement over budget is re-measured ONCE, and the better of the two is
+  # judged. This is not a retry of a FAILURE: a wrong status is still fatal on the first
+  # attempt (checked above, before we get here), and a genuine slowdown is slow twice, so
+  # the detector survives. It costs nothing on the happy path — the re-probe only fires
+  # when the first measurement already blew the budget.
+  #
+  # /health and /health/ready take the best of several probes for the same reason and say
+  # so at their own call sites; this covers every other latency budget in the script.
   if [ "$TIME_MS" -gt "$budget" ]; then
-    fail "$name" "latency ${TIME_MS}ms exceeds budget ${budget}ms"
-    return
+    local cold_ms="$TIME_MS"
+    http "$LAST_METHOD" "$LAST_URL" "${LAST_ARGS[@]}"
+
+    if [ "$HTTP_CODE" != "$expected" ]; then
+      fail "$name" "expected HTTP $expected on the warm re-probe, got $HTTP_CODE (first attempt was ${cold_ms}ms)"
+      return
+    fi
+
+    if [ "$TIME_MS" -gt "$budget" ]; then
+      fail "$name" "latency ${TIME_MS}ms exceeds budget ${budget}ms (cold ${cold_ms}ms, warm ${TIME_MS}ms — slow twice, not a cold start)"
+      return
+    fi
   fi
 
   if [ -n "$jqfilter" ]; then
@@ -314,24 +348,55 @@ fi
 # The endpoint answers 200 when ready and 503 when not, so any other code — and any
 # code/flag DISAGREEMENT (503 with ready:true, or 200 with ready:false) — is a
 # regression in the status mapping itself and fails hard.
-http GET "$BASE_URL/health/ready"
-ready_scale="$(jq -r '.checks.scale_alerts // "missing"' "$BODY" 2>/dev/null || echo missing)"
-ready_flag="$(jq -r 'if has("ready") then (.ready | tostring) else (.status == "ok" | tostring) end' \
-  "$BODY" 2>/dev/null || echo missing)"
+#
+# Cold-start tolerance (#652): this probe runs deploy-adjacent against an autostopped
+# app, so the first hit pays cold BEAM + cold DB-pool cost that is NOT a latency
+# regression. /health above already takes the best of several probes and says why;
+# readiness did not, so it went red on cold starts alone — it failed exactly that way on
+# PR #651 ("latency 6556ms exceeds budget 5000ms"). A gate that reddens on cold starts
+# trains everyone to ignore it, which is how the post-deploy smoke got ignored in the
+# first place (#363 is the same lesson from a different signal).
+#
+# Best-of-N is a LATENCY tolerance and never a STATUS one: a code outside {200,503} is a
+# regression in the status mapping itself, so the first probe that produces one is kept
+# and the loop stops. Otherwise the FASTEST probe's (code, body, latency) triple is
+# judged as a unit — mixing a fast probe's latency with a slow probe's body would judge
+# two different responses as one.
+READY_BODY="$TMP/ready_body"
+ready_best_ms=""
+ready_code=""
+for _ in 1 2 3; do
+  http GET "$BASE_URL/health/ready"
+  if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "503" ]; then
+    cp "$BODY" "$READY_BODY"
+    ready_code="$HTTP_CODE"
+    ready_best_ms="$TIME_MS"
+    break
+  fi
+  if [ -z "$ready_best_ms" ] || [ "$TIME_MS" -lt "$ready_best_ms" ]; then
+    cp "$BODY" "$READY_BODY"
+    ready_code="$HTTP_CODE"
+    ready_best_ms="$TIME_MS"
+  fi
+done
 
-if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "503" ]; then
+ready_scale="$(jq -r '.checks.scale_alerts // "missing"' "$READY_BODY" 2>/dev/null || echo missing)"
+ready_flag="$(jq -r 'if has("ready") then (.ready | tostring) else (.status == "ok" | tostring) end' \
+  "$READY_BODY" 2>/dev/null || echo missing)"
+
+if [ "$ready_code" != "200" ] && [ "$ready_code" != "503" ]; then
   fail "readiness (scale-alerts config-guard, US-32.4)" \
-    "expected HTTP 200 or 503, got $HTTP_CODE ($(head -c 200 "$BODY" 2>/dev/null | tr '\n' ' '))"
-elif [ "$TIME_MS" -gt "$SMOKE_MAX_MS" ]; then
+    "expected HTTP 200 or 503, got $ready_code ($(head -c 200 "$READY_BODY" 2>/dev/null | tr '\n' ' '))"
+elif [ "$ready_best_ms" -gt "$SMOKE_MAX_MS" ]; then
   fail "readiness (scale-alerts config-guard, US-32.4)" \
-    "latency ${TIME_MS}ms exceeds budget ${SMOKE_MAX_MS}ms"
+    "warm latency ${ready_best_ms}ms exceeds budget ${SMOKE_MAX_MS}ms (cold-start-tolerant best-of-3)"
 elif [ "$ready_scale" != "ok" ] && [ "$ready_scale" != "warn" ] && [ "$ready_scale" != "missing" ]; then
   fail "readiness (scale-alerts config-guard, US-32.4)" \
-    "checks.scale_alerts='${ready_scale}' — $(jq -r '.reasons.scale_alerts // "no reason given"' "$BODY" 2>/dev/null || echo unknown)"
-elif [ "$HTTP_CODE" = "200" ] && [ "$ready_flag" != "true" ]; then
+    "checks.scale_alerts='${ready_scale}' — $(jq -r '.reasons.scale_alerts // "no reason given"' "$READY_BODY" 2>/dev/null || echo unknown)"
+elif [ "$ready_code" = "200" ] && [ "$ready_flag" != "true" ]; then
   fail "readiness (scale-alerts config-guard, US-32.4)" \
     "HTTP 200 with ready='${ready_flag}' — status/flag disagreement, the endpoint must answer 503 when not ready"
-elif [ "$HTTP_CODE" = "503" ] && [ "$ready_flag" = "true" ]; then
+elif [ "$ready_code" = "503" ] && [ "$ready_flag" = "true" ]; then
   fail "readiness (scale-alerts config-guard, US-32.4)" \
     "HTTP 503 with ready=true — status/flag disagreement, the endpoint must answer 200 when ready"
 elif [ "$ready_scale" = "missing" ]; then
@@ -339,12 +404,12 @@ elif [ "$ready_scale" = "missing" ]; then
     "no checks.scale_alerts in the body (ready='${ready_flag}') — the config guard was not evaluated, so this deploy is unchecked rather than clean"
 elif [ "$ready_scale" = "warn" ]; then
   warn "readiness (scale-alerts config, US-32.4)" \
-    "$(jq -r '.reasons.scale_alerts // "no reason given"' "$BODY" 2>/dev/null || echo unknown) — alerting is configured incoherently but the deployment is otherwise healthy; fix the config, do not roll back"
+    "$(jq -r '.reasons.scale_alerts // "no reason given"' "$READY_BODY" 2>/dev/null || echo unknown) — alerting is configured incoherently but the deployment is otherwise healthy; fix the config, do not roll back"
 elif [ "$ready_flag" = "true" ]; then
   pass "readiness (scale-alerts config-guard, US-32.4)"
 else
   warn "readiness (US-32.4)" \
-    "not ready with scale_alerts=ok (oban_orphans='$(jq -r '.checks.oban_orphans // "missing"' "$BODY" 2>/dev/null || echo missing)', status='$(jq -r '.status // "missing"' "$BODY" 2>/dev/null || echo missing)') — pre-existing runtime state, not a deploy config regression"
+    "not ready with scale_alerts=ok (oban_orphans='$(jq -r '.checks.oban_orphans // "missing"' "$READY_BODY" 2>/dev/null || echo missing)', status='$(jq -r '.status // "missing"' "$READY_BODY" 2>/dev/null || echo missing)') — pre-existing runtime state, not a deploy config regression"
 fi
 
 # --- KB retrieval crown jewels (authed, read-only) -----------------------------
