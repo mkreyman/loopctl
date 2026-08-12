@@ -101,6 +101,12 @@ HDRS="$TMP/hdrs"
 HTTP_CODE=""
 TIME_MS=""
 
+# The last request http() issued, so assert() can re-measure it. See the cold-start note
+# on assert() below.
+LAST_METHOD=""
+LAST_URL=""
+LAST_ARGS=()
+
 # http METHOD URL [extra curl args...]
 # Writes the response body to $BODY and response headers to $HDRS, and sets
 # HTTP_CODE + TIME_MS (milliseconds). A hard curl failure (DNS/connect/timeout)
@@ -110,6 +116,10 @@ http() {
   local method="$1"
   local url="$2"
   shift 2
+  # Remember the request so a latency-only failure can be re-measured once (see assert()).
+  LAST_METHOD="$method"
+  LAST_URL="$url"
+  LAST_ARGS=("$@")
   local out
   # --max-time gives curl a hard ceiling a few seconds above the widest per-check
   # latency budget so a hung endpoint can't stall the whole run.
@@ -171,9 +181,33 @@ assert() {
     return
   fi
 
+  # Cold-start tolerance (#652). This smoke runs the instant a deploy finishes, against an
+  # app that autostops, so the FIRST request of a given SHAPE pays warmup its successors do
+  # not — a cold BEAM, a cold connection pool, a cold index. Measured on master
+  # 2026-08-12: `keyword retrieval floor` took 7704ms while the semantic check right after
+  # it — which additionally makes an outbound LLM call — took 1254ms.
+  #
+  # So a single measurement over budget is re-measured ONCE, and the better of the two is
+  # judged. This is not a retry of a FAILURE: a wrong status is still fatal on the first
+  # attempt (checked above, before we get here), and a genuine slowdown is slow twice, so
+  # the detector survives. It costs nothing on the happy path — the re-probe only fires
+  # when the first measurement already blew the budget.
+  #
+  # /health and /health/ready take the best of several probes for the same reason and say
+  # so at their own call sites; this covers every other latency budget in the script.
   if [ "$TIME_MS" -gt "$budget" ]; then
-    fail "$name" "latency ${TIME_MS}ms exceeds budget ${budget}ms"
-    return
+    local cold_ms="$TIME_MS"
+    http "$LAST_METHOD" "$LAST_URL" "${LAST_ARGS[@]}"
+
+    if [ "$HTTP_CODE" != "$expected" ]; then
+      fail "$name" "expected HTTP $expected on the warm re-probe, got $HTTP_CODE (first attempt was ${cold_ms}ms)"
+      return
+    fi
+
+    if [ "$TIME_MS" -gt "$budget" ]; then
+      fail "$name" "latency ${TIME_MS}ms exceeds budget ${budget}ms (cold ${cold_ms}ms, warm ${TIME_MS}ms — slow twice, not a cold start)"
+      return
+    fi
   fi
 
   if [ -n "$jqfilter" ]; then
