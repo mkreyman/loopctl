@@ -260,6 +260,15 @@ defmodule Loopctl.Knowledge.HubDemotionAndSiblingTelemetryTest do
       assert event.tool == "knowledge_progressive_index"
       assert event.agent_id == agent.id
       assert is_integer(event.duration_ms)
+
+      # The COUNT, not just the row. Asserting only tool/agent/duration let a first cut ship
+      # that read `:results` and `:candidate_count` off a result shaped
+      # `%{stubs: [...], meta: %{candidate_count: n}}` — so every successful index recorded
+      # `result_count: 0` and derived `zero_results`, and this test stayed green while the
+      # surface would have reported a 100% miss rate.
+      assert event.result_count > 0
+      assert event.outcome == "ok"
+      assert event.total_count > 0
     end
 
     test "a progressive_index MISS is recorded as zero_results", %{tenant: tenant, raw: raw} do
