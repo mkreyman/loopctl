@@ -78,6 +78,30 @@ defmodule Loopctl.Knowledge.SearchEvent do
         FROM search_events s
        WHERE s.tenant_id = $1 AND s.outcome = 'ok';
 
+      -- POSITION-CORRECTED follow-through, which is the only honest way to compare two
+      -- rankings against each other. Compare a rank band, never the bare rate above.
+      --
+      -- Why: `mode_used` distinguishes `combined_curated` from `combined_retrieved`, and it
+      -- is tempting to read a higher follow-through on the curated arm as the hoist working.
+      -- It is not evidence. The curated arm puts its winner at RANK 1 by construction, and
+      -- clicks carry position bias — rank 1 is opened more whatever sits there. Comparing
+      -- the arms at the SAME rank removes the part the hoist creates by construction.
+      SELECT s.mode_used,
+             (a.metadata->>'rank')::int AS rank,
+             count(*) AS surfaced,
+             count(*) FILTER (WHERE EXISTS (
+               SELECT 1 FROM article_access_events o
+                WHERE o.tenant_id = a.tenant_id AND o.article_id = a.article_id
+                  AND o.access_type IN ('get','context','drill')
+                  AND o.accessed_at BETWEEN s.inserted_at AND s.inserted_at + interval '30 minutes'
+             )) AS opened
+        FROM search_events s
+        JOIN article_access_events a
+          ON a.tenant_id = s.tenant_id
+         AND a.metadata->>'search_id' = s.search_id::text
+       WHERE s.tenant_id = $1 AND s.mode_used LIKE 'combined%'
+       GROUP BY 1, 2 ORDER BY 1, 2;
+
   THREE of the `client_*` columns cannot be filled by the client and are enriched offline
   from the session transcript, joined on `client_session_id`:
 
@@ -101,6 +125,22 @@ defmodule Loopctl.Knowledge.SearchEvent do
   enrichment only FILLS the two columns whose value no client could ever have sent, never
   overwrites a value a client did send, and refines `client_kind` only from `child` to the
   sub-class the transcript proves. Any future writer here needs the same three properties.
+
+  ## Two objectives, never one
+
+  It is tempting to treat follow-through as THE score and tune retrieval to raise it. Do not.
+  The IR literature this corpus already carries is explicit on both halves of why (Bing Liu,
+  *Web Data Mining*, 2nd ed. — see the `bing-liu` tagged articles in the wiki):
+
+  * **Engagement and relevance are DISTINCT objectives, and optimising engagement alone is
+    insufficient** — the sponsored-search result that a high-CTR/low-relevance ad earns
+    revenue while damaging trust. Our analogue: a ranking can raise opens by returning fewer,
+    safer, more clickable results and be worse. So a change is judged on BOTH observed opens
+    AND `mix loopctl.retrieval.eval`'s golden-question relevance. A variant that lifts opens
+    while regressing the eval loses.
+  * **A missing click is not disinterest.** An agent whose question is answered by the
+    snippet correctly opens nothing, and that is a SUCCESS this metric scores as a failure.
+    Read follow-through as a floor, never as a satisfaction rate.
 
   ## Recording is best-effort and MUST NOT fail a search
 
