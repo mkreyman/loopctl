@@ -1497,9 +1497,16 @@ async function knowledgeFacets({
   return toContent(result);
 }
 
-async function knowledgeSearch({ q, project_id, story_id, category, tags, match, mode, limit, offset }) {
+async function knowledgeSearch({ q, project_id, story_id, category, tags, match, mode, format, limit, offset }) {
   const params = new URLSearchParams();
   if (q != null && q !== "") params.set("q", q);
+  // `format` is the SHAPE of the response, not a different search (#678). The server
+  // dispatches `stubs` to the same progressive_index/3 and `bodies` to the same
+  // get_context/3 that knowledge_progressive_index and knowledge_context call, so those
+  // tools remain and are not retired — they are now siblings on one path rather than
+  // separate doors an agent has to choose between. That choice was unobservable and
+  // therefore confounded any measurement of the ranking behind it.
+  if (format) params.set("format", format);
   if (project_id) params.set("project_id", project_id);
   if (story_id) params.set("story_id", story_id);
   if (category) params.set("category", category);
@@ -4615,6 +4622,21 @@ const TOOLS = [
           type: "string",
           enum: ["keyword", "semantic", "combined"],
           description: "Optional: search mode (keyword, semantic, or combined).",
+        },
+        format: {
+          type: "string",
+          enum: ["results", "stubs", "bodies"],
+          description:
+            "Optional: the SHAPE of the response, not a different search. 'results' " +
+            "(default) is ranked results plus snippets and is the only shape that " +
+            "supports cursor pagination. 'stubs' returns capped stubs with one hop of hub " +
+            "enrichment — use it to survey a broad topic without pulling bodies into " +
+            "context, then knowledge_progressive_drill into a chosen stub. 'bodies' " +
+            "returns full article bodies plus linked references for one deep read. " +
+            "'stubs' and 'bodies' REQUIRE a query; sending either without one is a 400, " +
+            "as is an unknown value (it is never silently downgraded to 'results'). These " +
+            "dispatch to exactly the same code knowledge_progressive_index and " +
+            "knowledge_context call, which both remain available.",
         },
         limit: {
           type: "integer",

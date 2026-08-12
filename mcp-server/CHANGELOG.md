@@ -5,6 +5,29 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.74.0 — 2026-08-12 (one search command, three response shapes)
+
+### Added
+
+- **`knowledge_search` takes `format`: `results` (default), `stubs`, or `bodies`.** These are
+  response SHAPES of one search, not different searches — the server dispatches `stubs` to the
+  same `progressive_index/3` and `bodies` to the same `get_context/3` that
+  `knowledge_progressive_index` and `knowledge_context` call.
+
+  **Nothing is retired.** Both sibling tools remain registered and work exactly as before;
+  they are now siblings on one path rather than separate doors to choose between.
+
+  Why it is worth having at all: an agent's choice of entrypoint is unobservable, so it
+  confounds any measurement of the ranking behind it — you cannot separate an algorithm's
+  effect from a choice you cannot see. A parameter is a variable the server controls; a tool
+  choice is a confounder it does not. This is the precondition for judging a ranking change
+  from observed behaviour.
+
+  Two refusals, deliberately not silent: `stubs` and `bodies` REQUIRE a query (they are
+  relevance shapes; there is no stub rendering of an enumeration page), and an unknown value
+  is a 400 rather than a quiet downgrade to `results`. A downgrade would answer a different
+  question than the one asked, and an agent could read the result as an empty corpus.
+
 ## 2.73.0 — 2026-08-12 (one spelling for the search parameter, plus a body window and prefix-tolerant ids)
 
 ### Changed
