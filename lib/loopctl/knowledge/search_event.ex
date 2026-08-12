@@ -52,10 +52,15 @@ defmodule Loopctl.Knowledge.SearchEvent do
              count(*), count(*) FILTER (WHERE outcome = 'zero_results') AS zero
         FROM search_events WHERE tenant_id = $1 GROUP BY 1 ORDER BY 1;
 
-      -- WHO searches and who fails: the main/child split, and the repo the agent was in.
+      -- WHO searches and who fails, once enriched. `client_host IS NOT NULL` is the
+      -- filter that matters: rows without it never came through the MCP client at all
+      -- (the recall hook and scripts/smoke.sh call the API directly), so including them
+      -- measures this project's own automation rather than its agents.
       SELECT client_kind, client_repo, client_effort, count(*),
              count(*) FILTER (WHERE outcome IN ('zero_results','rejected')) AS bad
-        FROM search_events WHERE tenant_id = $1 GROUP BY 1,2,3 ORDER BY 4 DESC;
+        FROM search_events
+       WHERE tenant_id = $1 AND client_host IS NOT NULL
+       GROUP BY 1,2,3 ORDER BY 4 DESC;
 
       -- Degradation, by cause.
       SELECT fallback_reason, count(*), count(*) FILTER (WHERE result_count = 0) AS empty
@@ -73,10 +78,19 @@ defmodule Loopctl.Knowledge.SearchEvent do
         FROM search_events s
        WHERE s.tenant_id = $1 AND s.outcome = 'ok';
 
-  `client_model` is not populated by the client (no model variable exists in the agent
-  environment); enrich it offline by joining `client_session_id` to the session transcript,
-  which records the model. The same join separates workflow agents from ordinary subagents,
-  which `client_kind` cannot.
+  THREE of the `client_*` columns cannot be filled by the client and are enriched offline
+  from the session transcript, joined on `client_session_id`:
+
+  - `client_model` and `client_effort` — neither variable exists in the environment the MCP
+    server is spawned with (`CLAUDE_EFFORT` is set for Bash-tool invocations but not for the
+    MCP server, so `client_effort` was permanently NULL until the enrichment filled it).
+  - `client_kind` — the client reports the kind of the SESSION, not of the CALLER. One MCP
+    process serves a session and every agent it dispatches, with an environment frozen at
+    spawn, so it labels EVERY search `main`. Only the transcript can say whether a search
+    came from the main session, a subagent, or a workflow agent.
+
+  So do NOT read `client_kind` as caller-level truth on an un-enriched row: before the
+  enrichment runs it means "some search from this session".
 
   That join is implemented — `mix loopctl.enrich_search_events`, see
   `Loopctl.Knowledge.SearchEventEnrichment` — and the monthly procedure that runs it and
