@@ -301,6 +301,12 @@ if wait_for_health; then
       best_ms="$TIME_MS"
     fi
   done
+  # Report the number that was JUDGED, not the last probe's. Without this, a run where an
+  # early probe was warm and a later one paid a cold start prints a passing line carrying a
+  # time OVER its own budget — which reads as a broken gate and is how a green check stops
+  # being believed. Observed on master 2026-08-12: `✓ readiness … (6646ms)` against a
+  # 5000ms budget, correct verdict, indefensible number.
+  TIME_MS="$best_ms"
   db_ok="$(jq -r '.checks.database // "missing"' "$BODY" 2>/dev/null || echo missing)"
   status="$(jq -r '.status // "missing"' "$BODY" 2>/dev/null || echo missing)"
 
@@ -380,6 +386,8 @@ for _ in 1 2 3; do
   fi
 done
 
+# Same reason as the health block above: report the judged number.
+TIME_MS="$ready_best_ms"
 ready_scale="$(jq -r '.checks.scale_alerts // "missing"' "$READY_BODY" 2>/dev/null || echo missing)"
 ready_flag="$(jq -r 'if has("ready") then (.ready | tostring) else (.status == "ok" | tostring) end' \
   "$READY_BODY" 2>/dev/null || echo missing)"
