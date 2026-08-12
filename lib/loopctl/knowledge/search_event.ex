@@ -82,6 +82,12 @@ defmodule Loopctl.Knowledge.SearchEvent do
   `Loopctl.Knowledge.SearchEventEnrichment` — and the monthly procedure that runs it and
   then runs the queries above is `docs/runbooks/search-events-analysis.md`.
 
+  It is the ONE sanctioned write after insert, and it does not weaken "immutable" above:
+  what is immutable is the ATTEMPT — what was asked, what came back, and when. The
+  enrichment only FILLS the two columns whose value no client could ever have sent, never
+  overwrites a value a client did send, and refines `client_kind` only from `child` to the
+  sub-class the transcript proves. Any future writer here needs the same three properties.
+
   ## Recording is best-effort and MUST NOT fail a search
 
   A telemetry write that can break the read path is a worse defect than the blindness it
