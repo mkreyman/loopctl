@@ -31,6 +31,11 @@ PARENT's session id — see `Loopctl.Knowledge.SearchEventEnrichment` for why th
 the only unambiguous key, and why a key two transcripts disagree about is dropped rather
 than guessed.
 
+The task is **machine-scoped, and now enforces it**: the query-only fallback below is
+applied only to rows whose `client_host` is the machine you are running on. Another
+machine's rows stay null until you run it there, which is the correct outcome — two machines
+searching the same wording is ordinary, and their transcript trees never see each other.
+
 A **resumed** session breaks that key: the restarted MCP server reports a fresh session id
 while the transcript keeps appending under the original, so the pair can never match. The
 task falls back to the query alone for those rows, and only for a query that is unambiguous

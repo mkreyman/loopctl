@@ -112,7 +112,9 @@ defmodule Mix.Tasks.Loopctl.EnrichSearchEvents do
   end
 
   defp enrich_one(event, {examined, updated}, index, dry_run?) do
-    case SearchEventEnrichment.lookup(index, event.client_session_id, event.query) do
+    opts = [query_fallback: SearchEventEnrichment.same_machine?(event.client_host)]
+
+    case SearchEventEnrichment.lookup(index, event.client_session_id, event.query, opts) do
       nil -> {examined + 1, updated}
       attribution -> {examined + 1, updated + apply_one(event, attribution, dry_run?)}
     end

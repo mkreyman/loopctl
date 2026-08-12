@@ -58,6 +58,9 @@ defmodule Mix.Tasks.Loopctl.EnrichSearchEventsTest do
             outcome: "ok",
             result_count: 3,
             client_session_id: @session,
+            # A real row never has one without the other: the client sends session id and
+            # host in the same payload, and the host is what licenses the query fallback.
+            client_host: local_host(),
             inserted_at: DateTime.utc_now(),
             updated_at: DateTime.utc_now()
           },
@@ -65,6 +68,11 @@ defmodule Mix.Tasks.Loopctl.EnrichSearchEventsTest do
         )
       )
     )
+  end
+
+  defp local_host do
+    {:ok, name} = :inet.gethostname()
+    to_string(name)
   end
 
   defp reload(event), do: AdminRepo.get!(SearchEvent, event.id)
@@ -146,6 +154,39 @@ defmodule Mix.Tasks.Loopctl.EnrichSearchEventsTest do
       run(root)
 
       assert %{client_kind: nil, client_model: nil} = reload(event)
+    end
+
+    test "will not answer another machine's row from this machine's transcripts", %{
+      root: root,
+      tenant: tenant
+    } do
+      write_transcript(root, "p/#{@session}/workflows/wf_1/a.jsonl", "claude-opus-5", "shared q")
+
+      event =
+        record(tenant, %{
+          query: "shared q",
+          client_session_id: Ecto.UUID.generate(),
+          client_host: "Marks-Mac-mini.local"
+        })
+
+      run(root)
+
+      assert %{client_kind: nil, client_model: nil} = reload(event)
+    end
+
+    test "still answers a row from this machine via the fallback", %{root: root, tenant: tenant} do
+      write_transcript(root, "p/#{@session}/workflows/wf_1/a.jsonl", "claude-opus-5", "local q")
+
+      event =
+        record(tenant, %{
+          query: "local q",
+          client_session_id: Ecto.UUID.generate(),
+          client_host: local_host()
+        })
+
+      run(root)
+
+      assert %{client_kind: "workflow", client_model: "claude-opus-5"} = reload(event)
     end
 
     test "--dry-run writes nothing", %{root: root, tenant: tenant} do

@@ -204,6 +204,23 @@ defmodule Loopctl.Knowledge.SearchEventEnrichmentTest do
     end
   end
 
+  describe "same_machine?/1" do
+    test "matches this machine however the client spelled its hostname" do
+      {:ok, name} = :inet.gethostname()
+      bare = to_string(name)
+
+      assert SearchEventEnrichment.same_machine?(bare)
+      assert SearchEventEnrichment.same_machine?(String.upcase(bare))
+      # macOS sends the mDNS form; a verbatim comparison would match nothing there.
+      assert SearchEventEnrichment.same_machine?(bare <> ".local")
+    end
+
+    test "does not match another machine, or an absent host" do
+      refute SearchEventEnrichment.same_machine?("some-other-box")
+      refute SearchEventEnrichment.same_machine?(nil)
+    end
+  end
+
   describe "lookup/3" do
     setup %{root: root} do
       write_transcript(root, "proj/#{@session}/workflows/wf_1/agent-1.jsonl", [
@@ -229,6 +246,24 @@ defmodule Loopctl.Knowledge.SearchEventEnrichmentTest do
 
     test "an unknown query resolves to nothing on either key", %{index: index} do
       assert SearchEventEnrichment.lookup(index, @session, "never searched") == nil
+    end
+
+    test "the query fallback can be refused for another machine's row", %{index: index} do
+      # Two machines searching the same wording is ordinary, and their transcript trees never
+      # see each other — so an ungated fallback would answer a mac-mini row with beelink's
+      # model and kind.
+      assert SearchEventEnrichment.lookup(
+               index,
+               Ecto.UUID.generate(),
+               "only in one place",
+               query_fallback: false
+             ) == nil
+    end
+
+    test "the precise pair still resolves with the fallback refused", %{index: index} do
+      assert SearchEventEnrichment.lookup(index, @session, "only in one place",
+               query_fallback: false
+             ).kind == "workflow"
     end
 
     test "a missing session id or query is not a lookup", %{index: index} do

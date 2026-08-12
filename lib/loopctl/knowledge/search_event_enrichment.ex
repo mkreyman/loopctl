@@ -112,14 +112,50 @@ defmodule Loopctl.Knowledge.SearchEventEnrichment do
   The precise `{session_id, query}` key wins. A miss falls back to the query alone, which is
   what recovers a resumed session — see the moduledoc for why that key goes missing and why
   the fallback cannot manufacture an attribution.
+
+  Pass `query_fallback: false` to disable the fallback for a row this machine's transcripts
+  cannot possibly explain. A session id is a UUID, so the PAIR key is safe to try against any
+  row; a bare query is not. Two machines searching the same wording is ordinary, and their
+  transcript trees never see each other — so an ungated fallback would answer another
+  machine's row with this machine's model and kind. `same_machine?/1` is the intended gate.
   """
-  @spec lookup(t(), String.t() | nil, String.t() | nil) :: attribution() | nil
-  def lookup(%__MODULE__{} = index, session_id, query)
+  @spec lookup(t(), String.t() | nil, String.t() | nil, keyword()) :: attribution() | nil
+  def lookup(index, session_id, query, opts \\ [])
+
+  def lookup(%__MODULE__{} = index, session_id, query, opts)
       when is_binary(session_id) and is_binary(query) do
-    Map.get(index.by_pair, {session_id, query}) || Map.get(index.by_query, query)
+    case Map.get(index.by_pair, {session_id, query}) do
+      nil -> if Keyword.get(opts, :query_fallback, true), do: Map.get(index.by_query, query)
+      attribution -> attribution
+    end
   end
 
-  def lookup(%__MODULE__{}, _session_id, _query), do: nil
+  def lookup(%__MODULE__{}, _session_id, _query, _opts), do: nil
+
+  @doc """
+  Whether `client_host` names the machine this is running on.
+
+  Compared on the normalised first label rather than verbatim, because the two sides do not
+  spell it the same way: the MCP client sends node's `os.hostname()`, which on macOS carries
+  the mDNS suffix (`Marks-Mac-mini.local`), while the BEAM reports the bare name
+  (`Marks-Mac-mini`). A strict comparison would therefore match on Linux and silently match
+  NOTHING on a Mac — the worst shape of failure for a task whose output is a row count.
+  """
+  @spec same_machine?(String.t() | nil) :: boolean()
+  def same_machine?(client_host) when is_binary(client_host) do
+    host_label(client_host) == host_label(local_hostname())
+  end
+
+  def same_machine?(_client_host), do: false
+
+  defp local_hostname do
+    {:ok, name} = :inet.gethostname()
+    to_string(name)
+  end
+
+  defp host_label(host) do
+    host |> String.split(".") |> hd() |> String.downcase()
+  end
 
   @doc """
   Classifies a transcript path.
