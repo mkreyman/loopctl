@@ -107,6 +107,14 @@ defmodule Loopctl.Application do
       {Task.Supervisor,
        name: Loopctl.Telemetry.IngestionWriteStatsTaskSupervisor,
        max_children: Application.get_env(:loopctl, :ingestion_write_stats_max_tasks, 10)},
+      # #658: BOUNDED supervisor for the fire-and-forget `search_events` attempt rows.
+      # Same reasoning and the same sizing as the rollup supervisor above: one AdminRepo
+      # checkout per task on a 3-connection pool, and the highest-rate writer is the
+      # REJECTED path — a client retry-looping a malformed search, i.e. the very incident
+      # the table detects. Over the cap the row drops rather than queueing on the pool.
+      {Task.Supervisor,
+       name: Loopctl.Knowledge.SearchEventTaskSupervisor,
+       max_children: Application.get_env(:loopctl, :search_event_max_tasks, 10)},
       # #411 Gap 3: owns the public ETS table that pre-filters recall-count hotness
       # bumps already inside their per-memory cooldown window, so an idle-window
       # recall issues ZERO background tasks and ZERO DB writes (the DB-side

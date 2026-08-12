@@ -33,6 +33,21 @@ defmodule LoopctlWeb.KnowledgeSearchController do
   tags(["Knowledge Wiki"])
 
   @valid_modes ~w(keyword semantic combined)
+
+  # The single header the MCP client sends its (untrusted) context on, base64-encoded JSON
+  # so an arbitrary repo name or hostname cannot break header parsing.
+  @client_context_header "x-loopctl-client-context"
+  @max_client_field_bytes 200
+  @client_context_fields %{
+    "session_id" => :client_session_id,
+    "effort" => :client_effort,
+    "model" => :client_model,
+    "host" => :client_host,
+    "repo" => :client_repo,
+    "entrypoint" => :client_entrypoint,
+    "kind" => :client_kind,
+    "version" => :client_version
+  }
   @valid_categories Ecto.Enum.values(Article, :category)
 
   operation(:search,
@@ -311,8 +326,28 @@ defmodule LoopctlWeb.KnowledgeSearchController do
 
   @doc "GET /api/v1/knowledge/search"
   def search(conn, params) do
+    # #658: RECORD THE REJECTION, wherever it was raised. A call refused here never reaches
+    # the search path, so `maybe_record_search_access/5` — the only other writer — never
+    # sees it, and the rejected population stays invisible to the product's own analytics.
+    # That blindness is why a catalogue of 86 refused calls had to be recovered by
+    # hand-mining session transcripts.
+    #
+    # Wrapping the WHOLE action, not a `with ... else`: an `else` sees only its own
+    # conditions, so the cursor rejections and `:empty_query` — raised from the body —
+    # bypassed it entirely and stayed unrecorded. Every 4xx return passes through here.
+    case do_search(conn, params) do
+      {:error, _status, _msg} = error ->
+        record_rejected_search(conn, params, error)
+        error
+
+      response ->
+        response
+    end
+  end
+
+  defp do_search(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
-    api_key_id = conn.assigns.current_api_key.id
+    api_key = conn.assigns.current_api_key
 
     with {:ok, query_spec} <- resolve_query(params),
          {:ok, mode} <- validate_mode(params),
@@ -321,7 +356,14 @@ defmodule LoopctlWeb.KnowledgeSearchController do
          {:ok, base_opts} <- build_opts(params) do
       opts =
         base_opts
-        |> Keyword.put(:api_key_id, api_key_id)
+        |> Keyword.put(:api_key_id, api_key.id)
+        # WHO searched, on the SUCCESS path too. Recorded only for rejections, `agent_id`
+        # made every named agent read as a 100% failure rate and filed all its successful
+        # searches under NULL — a wrong answer, not a missing one.
+        |> Keyword.put(:agent_id, Map.get(api_key, :agent_id))
+        |> Keyword.put(:_started_at, System.monotonic_time(:millisecond))
+        |> Keyword.put(:_mode_requested, params["mode"])
+        |> Keyword.put(:_client_context, client_context_attrs(conn))
         |> Keyword.merge(Visibility.scope_opts(conn))
 
       # US-27.9a: the presence of a `cursor` query param (even empty) opts the
@@ -343,18 +385,6 @@ defmodule LoopctlWeb.KnowledgeSearchController do
         cursor_mode ->
           run_keyset(conn, tenant_id, query_spec, cursor_mode, opts)
       end
-    else
-      # #658: RECORD THE REJECTION. A call refused here never reaches the search path, so
-      # `maybe_record_search_access/5` — the only other writer — never sees it, and the
-      # rejected population stays invisible to the product's own analytics. That blindness
-      # is exactly why a catalogue of 86 refused calls had to be recovered by hand-mining
-      # session transcripts.
-      #
-      # Catch-all rather than a per-shape match: an error shape added later must still be
-      # counted, and the clause returns `error` untouched so rendering is unchanged.
-      error ->
-        record_rejected_search(conn, params, error)
-        error
     end
   end
 
@@ -363,16 +393,19 @@ defmodule LoopctlWeb.KnowledgeSearchController do
     api_key = conn.assigns[:current_api_key]
 
     if api_key do
-      Analytics.record_search_attempt(api_key.tenant_id, %{
-        api_key_id: api_key.id,
-        agent_id: Map.get(api_key, :agent_id),
-        query: trim_query(params["q"]),
-        tool: "knowledge_search",
-        mode_requested: params["mode"],
-        rejected?: true,
-        rejection_reason: rejection_reason(error),
-        result_count: 0
-      })
+      Analytics.record_search_attempt(
+        api_key.tenant_id,
+        Map.merge(client_context_attrs(conn), %{
+          api_key_id: api_key.id,
+          agent_id: Map.get(api_key, :agent_id),
+          query: trim_query(params["q"]),
+          tool: "knowledge_search",
+          mode_requested: params["mode"],
+          rejected?: true,
+          rejection_reason: rejection_reason(error),
+          result_count: 0
+        })
+      )
     end
 
     :ok
@@ -383,15 +416,42 @@ defmodule LoopctlWeb.KnowledgeSearchController do
   # A STABLE tag, not the prose message: the message is tuned for humans and gets reworded,
   # and a metric keyed on prose silently splits into two series the day it does.
   #
-  # A STABLE tag, not the prose message: the message is tuned for humans and gets reworded,
-  # and a metric keyed on prose silently splits into two series the day it does.
+  # Every 4xx this action can return is `{:error, status, binary}`. If a future shape
+  # appears this raises FunctionClauseError, which `record_rejected_search/3`'s rescue
+  # swallows: the telemetry row is lost and the response is untouched. That is the correct
+  # failure direction for a recorder.
+  # Client-asserted context, decoded from the header the MCP server sends (#658).
   #
-  # ONE clause, no catch-all, because dialyzer proved the error surface reaching this
-  # `else` is exactly `{:error, :bad_request | :unprocessable_entity, binary}` — every
-  # other shape I first wrote (a 2-tuple, an atom-only 3-tuple, a wildcard) was provably
-  # dead code. If a future error shape appears here this raises FunctionClauseError, which
-  # `record_rejected_search/3`'s rescue swallows: the telemetry row is lost and the
-  # response is untouched. That is the correct failure direction for a recorder.
+  # UNTRUSTED BY CONSTRUCTION and analytics-only: none of it is derivable server-side (an
+  # api_key names a KEY, and under the v2 dispatch pattern a key is minted per dispatch, so
+  # the server cannot tell which agent searched, at what effort, or from which repo). It
+  # must never gate access — the api key remains the sole authority — which is why every
+  # field is stored under a `client_` prefix. Malformed input yields an empty map, never an
+  # error: a broken header must not fail a search.
+  defp client_context_attrs(conn) do
+    with [raw] <- Plug.Conn.get_req_header(conn, @client_context_header),
+         {:ok, json} <- Base.decode64(raw, padding: false),
+         {:ok, %{} = map} <- JSON.decode(json) do
+      client_fields(map)
+    else
+      _ -> %{}
+    end
+  end
+
+  # Only the declared keys, only binaries, each length-bounded — the payload is attacker
+  # -shaped by definition and lands in an operator's analysis table.
+  defp client_fields(map) do
+    Enum.reduce(@client_context_fields, %{}, fn {key, field}, acc ->
+      case Map.get(map, key) do
+        value when is_binary(value) and value != "" ->
+          Map.put(acc, field, String.slice(value, 0, @max_client_field_bytes))
+
+        _ ->
+          acc
+      end
+    end)
+  end
+
   defp rejection_reason({:error, _status, msg}) when is_binary(msg) do
     cond do
       String.contains?(msg, "'q' is required") -> "missing_query"
@@ -708,6 +768,11 @@ defmodule LoopctlWeb.KnowledgeSearchController do
   end
 
   defp execute_search(tenant_id, {:search, q}, "semantic", opts) do
+    # `search_semantic/3` holds only the embedding, so it records `query: nil` unless the
+    # request's own text rides along. Without this every explicit semantic search landed in
+    # the "no query" bucket that exists to mean ENUMERATION.
+    opts = Keyword.put(opts, :_query_string, q)
+
     # US-41.4 (AC-41.4.2): thread the request's `:project_id` filter into the egress
     # scope, so a PROJECT-only `local_only` marking is enforced on the explicit
     # semantic path exactly as it is on combined.
@@ -759,7 +824,17 @@ defmodule LoopctlWeb.KnowledgeSearchController do
   defp semantic_keyword_fallback(tenant_id, q, opts, reason) do
     fallback_reason = Knowledge.record_semantic_fallback(tenant_id, reason, q)
 
-    case Knowledge.search_keyword(tenant_id, q, opts) do
+    # The keyword lane now runs as a DEGRADED attempt, and the row has to say so: filed as
+    # `zero_results` a provider outage reads as a corpus gap (`SearchEvent`: degradation
+    # outranks emptiness).
+    degraded_opts =
+      Keyword.merge(opts,
+        _degraded: true,
+        _fallback_reason: fallback_reason,
+        _mode_requested: "semantic"
+      )
+
+    case Knowledge.search_keyword(tenant_id, q, degraded_opts) do
       {:ok, %{meta: meta} = result} ->
         {:ok,
          %{

@@ -9,8 +9,13 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 
 import { clientContext, clientContextHeader, resetRepoCache } from "../lib/client-context.js";
+
+const here = dirname(fileURLToPath(import.meta.url));
 
 function withEnv(vars, fn) {
   const saved = {};
@@ -121,4 +126,13 @@ test("repo detection normalises a git remote to owner/repo", () => {
   if (ctx.repo) {
     assert.doesNotMatch(ctx.repo, /^https?:|\.git$|^git@/, "repo must be normalised, not raw");
   }
+});
+
+test("WIRING: apiCall actually SENDS the header — an unsent payload is no observability", () => {
+  // The whole point is a populated `client_*` column. A module that builds a header nothing
+  // attaches leaves all eight columns permanently NULL, so the schema's "WHO searches and
+  // who fails" query collapses to one all-NULL group.
+  const src = readFileSync(join(here, "..", "index.js"), "utf8");
+  assert.match(src, /import \{ clientContextHeader \} from "\.\/lib\/client-context\.js";/);
+  assert.match(src, /headers\["x-loopctl-client-context"\] = clientCtx;/);
 });

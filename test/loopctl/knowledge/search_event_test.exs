@@ -191,6 +191,92 @@ defmodule Loopctl.Knowledge.SearchEventTest do
     end
   end
 
+  describe "the facts that make a miss interpretable" do
+    setup do
+      tenant = fixture(:tenant)
+      agent = fixture(:agent, %{tenant_id: tenant.id})
+
+      {raw, api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})
+
+      %{tenant: tenant, api_key: api_key, raw: raw}
+    end
+
+    test "a DEGRADED search is degraded — end to end, not just in derive_outcome/1", %{
+      tenant: tenant,
+      raw: raw
+    } do
+      # The guard was vacuous: nothing threaded the degradation to the recorder, so a
+      # provider outage was written as `zero_results` and read as a corpus gap.
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      expect(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant, _text ->
+        {:error, :no_api_key}
+      end)
+
+      search(raw, %{q: "chain of custody lineage", mode: "semantic"})
+
+      [event] = all_search_events(tenant.id)
+      assert event.degraded == true
+      assert event.fallback_reason == "no_embedding_key"
+      assert event.outcome == "degraded"
+      # An explicit semantic search must not file its query under "no query" (enumeration).
+      assert event.query == "chain of custody lineage"
+      assert event.query_terms == 4
+      assert event.mode_requested == "semantic"
+    end
+
+    test "a SUCCESSFUL search carries the agent, the client context and the pool it chose from",
+         %{tenant: tenant, api_key: api_key, raw: raw} do
+      ctx =
+        Base.encode64(
+          JSON.encode!(%{"session_id" => "sess-1", "kind" => "child", "repo" => "owner/repo"})
+        )
+
+      search(raw, %{q: "anything", mode: "keyword"}, [{"x-loopctl-client-context", ctx}])
+
+      [event] = all_search_events(tenant.id)
+      # Recorded only for REJECTIONS, agent_id read as "this agent only ever fails".
+      assert event.agent_id == api_key.agent_id
+      refute is_nil(event.agent_id)
+      assert event.client_session_id == "sess-1"
+      assert event.client_kind == "child"
+      assert event.client_repo == "owner/repo"
+      assert event.tool == "knowledge_search"
+      assert is_integer(event.total_count)
+      assert is_integer(event.duration_ms)
+    end
+
+    test "an enumeration is not filed as a search", %{tenant: tenant, raw: raw} do
+      search(raw, %{tags: "pagination"})
+
+      [event] = all_search_events(tenant.id)
+      assert event.tool == "knowledge_list"
+      assert event.query_terms == nil
+      assert is_integer(event.total_count)
+    end
+
+    test "a rejection raised INSIDE the pipeline is recorded too", %{tenant: tenant, raw: raw} do
+      # A `with ... else` sees only its own conditions: the cursor rejections returned from
+      # the body bypassed the recorder entirely, and `invalid_cursor` was unreachable.
+      conn = search(raw, %{tags: "pagination", cursor: "not-a-real-cursor"})
+
+      assert conn.status == 400
+      [event] = all_search_events(tenant.id)
+      assert event.outcome == "rejected"
+      assert event.rejection_reason == "invalid_cursor"
+    end
+  end
+
+  defp search(raw, params, headers \\ []) do
+    Enum.reduce(
+      [{"authorization", "Bearer #{raw}"} | headers],
+      Phoenix.ConnTest.build_conn(),
+      fn {k, v}, conn -> Plug.Conn.put_req_header(conn, k, v) end
+    )
+    |> Phoenix.ConnTest.get(~p"/api/v1/knowledge/search", params)
+  end
+
   defp all_search_events(tenant_id) do
     import Ecto.Query
 

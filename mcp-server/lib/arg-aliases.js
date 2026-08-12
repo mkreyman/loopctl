@@ -38,6 +38,14 @@
 //
 // Renaming knowledge_search's parameter instead would be a breaking change for every
 // existing caller that already passes `q` correctly. Accepting both costs nothing.
+//
+// A BIDIRECTIONAL FILL IS NOT A BIDIRECTIONAL RESCUE. Because a blank canonical is filled
+// from whichever spelling arrived, a perfectly correct `knowledge_search` call carrying `q`
+// ALSO gets `query` populated. Counting that as a rescue made the metric count normal
+// traffic — far more often than real rescues — so it could not support the decision it was
+// built to inform. `declared` (below) is the tool's own parameter list: a rescue is counted
+// only when the key the HANDLER READS was blank and the alias supplied it.
+//
 // ONLY OBSERVED ALIASES. This table lists what agents were MEASURED to send, nothing more.
 // The first draft also mapped `search`, `text`, `top_k`, `topK`, `n` and the camelCase id
 // spellings — all invented, none seen in the data — and the drift guard below immediately
@@ -48,11 +56,14 @@
 //
 // A speculative alias is not free: it is a silent rename of somebody else's parameter.
 // Add one only when a real failing call is observed to need it.
+//
+// `max_results` has NO reverse entry on purpose: no tool declares it, so filling it from
+// `limit` rescued nothing and merely put a stderr write on the hot path of every call that
+// paginated correctly.
 const ARG_ALIASES = {
   q: ["query"],
   query: ["q"],
   limit: ["max_results"],
-  max_results: ["limit"],
 };
 
 function isBlank(v) {
@@ -62,23 +73,31 @@ function isBlank(v) {
 /**
  * Returns a NEW args object with canonical keys filled in from any alias present.
  * Non-object input (null/undefined/array) is returned unchanged.
+ *
+ * `declared` is the set/array of parameter names the CALLED TOOL actually declares. When
+ * supplied, only a fill of a declared key is reported as a rescue — the rest are inert
+ * conveniences. Omit it and every fill is reported (the conservative default for a tool
+ * whose schema is not known, e.g. the per-tenant `cr_*` tools).
  */
-function applyArgAliases(args, onAliasUsed) {
+function applyArgAliases(args, onAliasUsed, declared) {
   if (!args || typeof args !== "object" || Array.isArray(args)) return args;
 
   const out = { ...args };
+  const declaredSet = declared ? new Set(declared) : null;
 
   for (const [canonical, aliases] of Object.entries(ARG_ALIASES)) {
     if (!isBlank(out[canonical])) continue;
     for (const alias of aliases) {
       if (!isBlank(out[alias])) {
         out[canonical] = out[alias];
-        // Report every rescue. Aliasing treats the SYMPTOM — the real defect is that the
-        // tool surface spells the same parameter three ways (`q`, `query`, `topic`). If the
-        // rescue is invisible, the inconsistency costs nothing measurable and never gets
+        // Report every real rescue. Aliasing treats the SYMPTOM — the real defect is that
+        // the tool surface spells the same parameter three ways (`q`, `query`, `topic`). If
+        // the rescue is invisible, the inconsistency costs nothing measurable and never gets
         // fixed, and the alias table quietly becomes load-bearing forever. Counting it
-        // keeps the residual cost on the books.
-        if (typeof onAliasUsed === "function") {
+        // keeps the residual cost on the books — which only works if the count is of calls
+        // that WOULD HAVE FAILED, hence the `declared` gate.
+        const rescued = declaredSet === null || declaredSet.has(canonical);
+        if (rescued && typeof onAliasUsed === "function") {
           try {
             onAliasUsed({ canonical, alias });
           } catch {

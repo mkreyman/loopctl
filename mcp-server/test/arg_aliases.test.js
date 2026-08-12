@@ -128,8 +128,38 @@ test("BOTH spellings work, in both directions — the surface is inconsistent by
   assert.equal(fromQ.query, "vector recall degraded fallback", "q must fill query");
   assert.equal(fromQ.q, "vector recall degraded fallback", "q must survive");
 
+  // `max_results` is one-way ONLY: it fills `limit`, never the reverse. No tool declares
+  // `max_results`, so filling it rescued nothing and only put a spurious "rescue" on every
+  // correctly-paginated call.
   const limits = applyArgAliases({ q: "x", limit: 5 });
-  assert.equal(limits.max_results, 5, "limit must fill max_results");
+  assert.equal(limits.limit, 5);
+  assert.equal(limits.max_results, undefined, "limit must NOT invent a max_results");
+});
+
+test("a rescue is counted only when the CALLED TOOL declares the key it filled", () => {
+  // The metric exists to price the residual inconsistency, so it must count calls that
+  // WOULD HAVE FAILED. A correct knowledge_search call carrying `q` still fills `query`
+  // (inert), and counting that made normal traffic the bulk of the "rescues".
+  const correct = [];
+  applyArgAliases({ q: "already correct" }, (pair) => correct.push(pair), ["q", "limit"]);
+  assert.deepEqual(correct, [], "a correctly-spelled call is not a rescue");
+
+  const rescued = [];
+  applyArgAliases({ query: "wrong spelling" }, (pair) => rescued.push(pair), ["q", "limit"]);
+  assert.deepEqual(rescued, [{ canonical: "q", alias: "query" }]);
+
+  // Mirror image: for a tool that declares `query`, arriving with `q` is the rescue.
+  const mirrored = [];
+  applyArgAliases({ q: "wrong spelling" }, (pair) => mirrored.push(pair), ["query"]);
+  assert.deepEqual(mirrored, [{ canonical: "query", alias: "q" }]);
+});
+
+test("WIRING: the dispatch passes the called tool's declared parameters", () => {
+  // Without this argument the gate above is inert in production — the exact shape of
+  // failure (correct logic nothing calls) this investigation started from.
+  const src = readFileSync(join(here, "..", "index.js"), "utf8");
+  assert.match(src, /declaredToolArgs\(name\),/);
+  assert.match(src, /DECLARED_TOOL_ARGS = new Map\(/);
 });
 
 test("the alias callback fires with the pair, so the rescue stays measurable", () => {

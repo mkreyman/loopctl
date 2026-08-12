@@ -1002,6 +1002,11 @@ defmodule Loopctl.Knowledge.Analytics do
     row =
       attrs
       |> Map.drop([:degraded?, :rejected?])
+      # `:degraded?` is the DERIVATION flag; `:degraded` is the COLUMN. Dropping the flag
+      # without projecting it left the column permanently false, so the schema's own
+      # `WHERE degraded` query returned nothing forever and every provider outage was
+      # filed under `zero_results` — the misattribution the moduledoc exists to forbid.
+      |> Map.put(:degraded, Map.get(attrs, :degraded?, false) == true)
       |> Map.put(:outcome, Map.get(attrs, :outcome) || SearchEvent.derive_outcome(attrs))
       |> Map.put(:query_terms, SearchEvent.term_count(query))
 
@@ -1010,7 +1015,14 @@ defmodule Loopctl.Knowledge.Analytics do
         insert_search_attempt(tenant_id, row)
 
       _async ->
-        Task.Supervisor.start_child(Loopctl.TaskSupervisor, fn ->
+        # BOUNDED fan-out, on its own supervisor. Each task takes one `AdminRepo` checkout
+        # from a 3-connection BYPASSRLS pool shared with auth and the rate limiter, and the
+        # highest-rate writer here is the REJECTION path — a misconfigured client in a retry
+        # loop, i.e. exactly the incident this table exists to detect. An unbounded fan-out
+        # would flood that pool precisely then. Over the cap `start_child` returns
+        # `{:error, :max_children}` and the row is DROPPED (best-effort analytics, never
+        # blocks a search), mirroring `Telemetry.IngestionWriteStatsTaskSupervisor`.
+        Task.Supervisor.start_child(Loopctl.Knowledge.SearchEventTaskSupervisor, fn ->
           insert_search_attempt(tenant_id, row)
         end)
 

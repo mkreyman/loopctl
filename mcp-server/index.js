@@ -16,6 +16,7 @@ import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import path, { dirname, join } from "node:path";
 import { applyArgAliases } from "./lib/arg-aliases.js";
+import { clientContextHeader } from "./lib/client-context.js";
 import { degradedSearchNotice } from "./lib/search-notices.js";
 import {
   projectsPath,
@@ -117,6 +118,19 @@ function resolveKey(keyOverride) {
   );
 }
 
+let clientContextHeaderCache;
+function cachedClientContextHeader() {
+  if (clientContextHeaderCache === undefined) {
+    try {
+      clientContextHeaderCache = clientContextHeader({ version: SERVER_VERSION }) || null;
+    } catch {
+      // Analytics must never break a tool call.
+      clientContextHeaderCache = null;
+    }
+  }
+  return clientContextHeaderCache;
+}
+
 async function apiCall(method, path, body, keyOverride, { exactKey = false, timeoutMs } = {}) {
   const url = `${getBaseUrl()}${path}`;
   // Secret-managing tools pass exactKey:true so the request uses the EXACT
@@ -140,6 +154,14 @@ async function apiCall(method, path, body, keyOverride, { exactKey = false, time
     "Content-Type": "application/json",
     Accept: "application/json",
   };
+
+  // #658: client-asserted context (session id, main-vs-child, repo, effort). None of it is
+  // derivable server-side — an api key names a KEY, and under the v2 dispatch pattern a key
+  // is minted per dispatch. UNTRUSTED and analytics-only; the server stores it under a
+  // `client_` prefix and never authorizes on it. Computed once: the environment does not
+  // change mid-process, and a per-call `os.hostname()` + git shell-out is not hot-path work.
+  const clientCtx = cachedClientContextHeader();
+  if (clientCtx) headers["x-loopctl-client-context"] = clientCtx;
 
   const serializedBody =
     body !== undefined && body !== null ? JSON.stringify(body) : undefined;
@@ -6935,6 +6957,17 @@ const server = new Server(
   }
 );
 
+// The parameter names each STATIC tool declares, so the alias layer can tell a rescue from
+// an inert convenience fill. Dynamic per-tenant `cr_*` tools are absent here and fall back
+// to reporting every fill (the conservative default).
+const DECLARED_TOOL_ARGS = new Map(
+  TOOLS.map((t) => [t.name, Object.keys(t.inputSchema?.properties ?? {})]),
+);
+
+function declaredToolArgs(name) {
+  return DECLARED_TOOL_ARGS.get(name);
+}
+
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   // Static hand-maintained tools PLUS the calling tenant's per-tenant generated
   // Context Retriever tools (US-30.5). fetchGeneratedTools degrades to the static
@@ -6948,11 +6981,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   // The callback keeps the schema inconsistency MEASURABLE rather than merely survivable:
   // every rescue is a call that would have been a hard 400 before, and a count of them is
   // the evidence for eventually converging the spellings instead of aliasing forever.
-  const args = applyArgAliases(request.params.arguments, ({ canonical, alias }) => {
-    process.stderr.write(
-      `[loopctl-mcp] arg alias applied: '${alias}' -> '${canonical}' on tool '${name}'\n`,
-    );
-  });
+  //
+  // The tool's OWN declared parameters are passed so only a genuine rescue is reported. The
+  // fill is bidirectional, so without this a correct `knowledge_search` call carrying `q`
+  // also filled `query` and logged a "rescue" — counting normal traffic, and drowning the
+  // signal the count exists to carry.
+  const args = applyArgAliases(
+    request.params.arguments,
+    ({ canonical, alias }) => {
+      process.stderr.write(
+        `[loopctl-mcp] arg alias applied: '${alias}' -> '${canonical}' on tool '${name}'\n`,
+      );
+    },
+    declaredToolArgs(name),
+  );
 
   switch (name) {
     // Project Tools
