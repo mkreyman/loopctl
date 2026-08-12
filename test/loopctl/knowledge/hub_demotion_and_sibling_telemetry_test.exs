@@ -12,7 +12,12 @@ defmodule Loopctl.Knowledge.HubDemotionAndSiblingTelemetryTest do
       (and `knowledge_context` returns FULL BODIES, so an undemoted hub costs more here);
     * `search_events` rows from recall and hybrid search, which were written with a NULL
       agent and mislabelled `tool = "knowledge_search"` — the one table built to tell the
-      surfaces apart could not tell them apart.
+      surfaces apart could not tell them apart;
+    * and, on the third recurrence of the same shape, `progressive_index` and
+      `knowledge_context`, which recorded NO attempt at all. Both suppress their inner
+      search's recorder so a candidate-pool query is not counted as its own search, and
+      neither then recorded the outer call — so on the surface whose documented weakness is
+      a paraphrased miss, every miss was invisible.
   """
   use LoopctlWeb.ConnCase, async: true
 
@@ -209,6 +214,97 @@ defmodule Loopctl.Knowledge.HubDemotionAndSiblingTelemetryTest do
       assert event.outcome == "rejected"
       assert event.tool == "knowledge_hybrid_search"
       assert event.rejection_reason == "missing_query"
+    end
+  end
+
+  describe "progressive_index and knowledge_context record their attempts too" do
+    setup %{tenant: tenant} do
+      agent = fixture(:agent, %{tenant_id: tenant.id})
+
+      {raw, api_key} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})
+
+      %{agent: agent, api_key: api_key, raw: raw}
+    end
+
+    defp authed_get(raw, path) do
+      Phoenix.ConnTest.build_conn()
+      |> Plug.Conn.put_req_header("authorization", "Bearer #{raw}")
+      |> Phoenix.ConnTest.get(path)
+    end
+
+    test "progressive_index records the OUTER attempt, not its seed search", %{
+      tenant: tenant,
+      agent: agent,
+      raw: raw
+    } do
+      marker = "progtel#{System.unique_integer([:positive])}"
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        status: :published,
+        title: "#{marker} note",
+        body: "#{marker} body"
+      })
+
+      authed_get(raw, ~p"/api/v1/knowledge/progressive_index?topic=#{marker}")
+
+      # Exactly ONE row for the call: the outer attempt, never the seed query as well.
+      #
+      # Two things independently keep the seed out, and mutation testing is what separated
+      # them: removing `_skip_record_access: true` from the inner `search_keyword/3` call
+      # changes nothing here, because that call also never threads an `api_key_id` and the
+      # recorder skips a search without one. So this pins the COUNT, which is the property
+      # that matters; it does not prove the flag is what enforces it.
+      assert [event] = all_search_events(tenant.id)
+      assert event.tool == "knowledge_progressive_index"
+      assert event.agent_id == agent.id
+      assert is_integer(event.duration_ms)
+    end
+
+    test "a progressive_index MISS is recorded as zero_results", %{tenant: tenant, raw: raw} do
+      miss = "progmiss#{System.unique_integer([:positive])}"
+
+      authed_get(raw, ~p"/api/v1/knowledge/progressive_index?topic=#{miss}")
+
+      # This is the whole point of covering this surface: a paraphrased topic failing to
+      # reach a lexically dissimilar article is progressive_index's documented weakness, and
+      # it left no trace anywhere before.
+      assert [event] = all_search_events(tenant.id)
+      assert event.outcome == "zero_results"
+      assert event.result_count == 0
+    end
+
+    test "knowledge_context records its attempt naming its own surface", %{
+      tenant: tenant,
+      agent: agent,
+      raw: raw
+    } do
+      marker = "ctxtel#{System.unique_integer([:positive])}"
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        status: :published,
+        title: "#{marker} note",
+        body: "#{marker} body"
+      })
+
+      authed_get(raw, ~p"/api/v1/knowledge/context?query=#{marker}")
+
+      assert [event] = all_search_events(tenant.id)
+      assert event.tool == "knowledge_context"
+      assert event.agent_id == agent.id
+      assert is_integer(event.duration_ms)
+    end
+
+    test "a knowledge_context MISS is recorded as zero_results", %{tenant: tenant, raw: raw} do
+      miss = "ctxmiss#{System.unique_integer([:positive])}"
+
+      authed_get(raw, ~p"/api/v1/knowledge/context?query=#{miss}")
+
+      assert [event] = all_search_events(tenant.id)
+      assert event.outcome == "zero_results"
+      assert event.result_count == 0
     end
   end
 
