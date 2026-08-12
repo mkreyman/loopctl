@@ -201,6 +201,20 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
     # transient/provider fallbacks (a key IS configured there, so "configure a key"
     # would be wrong).
     |> maybe_put(:remediation, Remediation.for_fallback_reason(meta[:fallback_reason]))
+    # The curated-vs-retrieved decision (#670). It is made on the DEFAULT path now, not
+    # only inside hybrid search, so it has to reach the caller here or it is computed and
+    # thrown away: the server recorded `combined_curated` while the response said nothing,
+    # and an agent cannot branch on a verdict it never receives.
+    #
+    # Same three keys, same meanings, as `knowledge_hybrid_search` — `:curated` means a
+    # governed article answered and is FIRST in `results` (and named by
+    # `curated_article_id`); `:retrieved` means nothing curated cleared the bar and this is
+    # the best semantic/keyword match. Deliberately NOT rendered as a bare pass-through of
+    # the internal meta: this whitelist exists so an internal atom can never leak, and
+    # these are three explicitly-chosen keys, not an exception to it.
+    |> maybe_put(:provenance, meta[:provenance])
+    |> maybe_put(:confidence, meta[:confidence])
+    |> maybe_put(:curated_article_id, meta[:curated_article_id])
     # `semantic_result_count` (#297): rows the semantic half contributed in combined
     # mode. `0` with no `fallback` = "embed worked but recall is broken" — distinct
     # from a keyword_only fallback.

@@ -49,6 +49,37 @@ defmodule Loopctl.Knowledge.CuratedFirstOnDefaultSearchTest do
     %{tenant: tenant}
   end
 
+  describe "the decision reaches the caller, not just the database" do
+    test "render_meta/1 emits the three provenance keys" do
+      rendered =
+        LoopctlWeb.KnowledgeSearchJSON.render_meta(%{
+          total_count: 10,
+          limit: 5,
+          offset: 0,
+          provenance: :curated,
+          confidence: 0.91,
+          curated_article_id: "b1ce8ff7-fae5-4464-aa66-9579df2d4308"
+        })
+
+      # `render_meta/1` is a WHITELIST. #670 computed the decision and recorded
+      # `combined_curated` server-side while the response said nothing at all, so an agent
+      # could not branch on a verdict it never received. Caught by probing prod, not by a
+      # test — hence this one.
+      assert rendered.provenance == :curated
+      assert rendered.confidence == 0.91
+      assert rendered.curated_article_id == "b1ce8ff7-fae5-4464-aa66-9579df2d4308"
+    end
+
+    test "a meta without a decision omits the keys rather than emitting nils" do
+      rendered =
+        LoopctlWeb.KnowledgeSearchJSON.render_meta(%{total_count: 1, limit: 1, offset: 0})
+
+      refute Map.has_key?(rendered, :provenance)
+      refute Map.has_key?(rendered, :confidence)
+      refute Map.has_key?(rendered, :curated_article_id)
+    end
+  end
+
   describe "the recorded search_event carries the decision, so it can be measured" do
     setup %{tenant: tenant} do
       {_raw, api_key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
