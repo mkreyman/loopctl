@@ -48,7 +48,16 @@ COPY mcp-server/package.json mcp-server/package.json
 # Compile the release
 RUN mix compile
 
-# Build assets (esbuild + tailwind are standalone binaries — no Node.js needed)
+# Build assets (esbuild + tailwind are standalone binaries — no Node.js needed).
+#
+# The install is SEPARATE and RETRIED. `assets.deploy` runs `tailwind loopctl`, which
+# auto-installs the binary when it is missing — so this line reaches GitHub's release CDN
+# during every image build, and a transient fetch failure there fails a DEPLOY rather than a
+# check. CI hit exactly that fault twice in fifteen minutes on 2026-08-12
+# (`socket_closed_remotely`); the same single point of failure sits here, where it costs
+# more. Splitting the install out makes the retry possible and leaves `assets.deploy` a pure
+# build step.
+RUN for attempt in 1 2 3; do       mix assets.setup && break;       if [ "$attempt" = "3" ]; then echo "assets.setup failed after 3 attempts"; exit 1; fi;       echo "assets.setup failed (attempt $attempt/3); retrying";       sleep $((attempt * 5));     done
 RUN mix assets.deploy
 
 # Changes to config/runtime.exs don't require recompiling the code

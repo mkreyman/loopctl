@@ -124,8 +124,28 @@ jobs:
       # That gap stopped being tolerable once /enroll shipped a ceremony that is
       # entirely client-side: for that page, broken JS is a broken feature with a
       # green build. esbuild and tailwind are standalone binaries — no Node.js.
+      #
+      # RETRIED, because this step reaches out to the network on EVERY run and gates the
+      # deploy. `_build` is cached, but `actions/cache` only SAVES on a key miss, so a cache
+      # populated by a run where this step had not yet succeeded is never updated — every
+      # later run restores it without the binaries and downloads them again. Measured
+      # 2026-08-12: two runs fifteen minutes apart both died here with
+      # `Couldn't fetch .../tailwindcss-linux-x64: {:error, :socket_closed_remotely}`, after
+      # format and credo had already passed, which skipped Deploy and left master red for a
+      # GitHub CDN hiccup that has nothing to do with the change under test.
+      #
+      # A retry, not a wider cache key: the fetch is idempotent and `mix assets.setup` is a
+      # no-op once the binaries exist, so three attempts cost nothing on the happy path,
+      # while changing the cache key would rebuild every dep to fix a download.
       - name: Install asset toolchain
-        run: mix assets.setup
+        run: |
+          for attempt in 1 2 3; do
+            if mix assets.setup; then exit 0; fi
+            echo "assets.setup failed (attempt $attempt/3); retrying in $((attempt * 5))s"
+            sleep $((attempt * 5))
+          done
+          echo "assets.setup failed after 3 attempts"
+          exit 1
 
       - name: Build assets
         run: mix assets.deploy
