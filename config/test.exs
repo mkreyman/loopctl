@@ -30,6 +30,18 @@ test_pool_size = test_concurrency * 2
 # captures at the test level and composes with this.
 config :ex_unit, max_cases: test_concurrency, capture_log: true
 
+# TEST_DB_PORT points the suite at a DIFFERENT Postgres instance, not just a
+# different database on the same one. Defaults to 5432 so local behaviour is
+# unchanged when it is unset.
+#
+# CI sets it to 5433, the CI-only instance (infra postgres/ci/docker-compose.yml,
+# infra decisions/0012): its own volume, durability off, 127.0.0.1 only, and
+# pgvector in the image layer rather than apt-installed into a running container.
+# That matters more here than in most repos, because since the runners moved back
+# to beelink the alternative instance on 5432 is Mark's actual development
+# database, not a disposable CI one.
+test_db_port = String.to_integer(System.get_env("TEST_DB_PORT", "5432"))
+
 # Configure your database
 #
 # The MIX_TEST_PARTITION environment variable can be used
@@ -39,6 +51,7 @@ config :loopctl, Loopctl.Repo,
   username: "postgres",
   password: "postgres",
   hostname: "localhost",
+  port: test_db_port,
   database: "loopctl_test#{System.get_env("MIX_TEST_PARTITION")}",
   pool: Ecto.Adapters.SQL.Sandbox,
   pool_size: test_pool_size
@@ -48,6 +61,7 @@ config :loopctl, Loopctl.AdminRepo,
   username: "postgres",
   password: "postgres",
   hostname: "localhost",
+  port: test_db_port,
   database: "loopctl_test#{System.get_env("MIX_TEST_PARTITION")}",
   pool: Ecto.Adapters.SQL.Sandbox,
   pool_size: test_pool_size,
@@ -72,6 +86,7 @@ config :loopctl, Loopctl.HeavyReadRepo,
   username: "postgres",
   password: "postgres",
   hostname: "localhost",
+  port: test_db_port,
   database: "loopctl_test#{System.get_env("MIX_TEST_PARTITION")}",
   pool: Ecto.Adapters.SQL.Sandbox,
   pool_size: test_pool_size,

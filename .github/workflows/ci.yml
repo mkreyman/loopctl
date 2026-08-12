@@ -17,6 +17,22 @@ on:
   # Without this the matrix change is never exercised by its own PR.
   workflow_dispatch:
 
+# TWO RUNS OF THIS REPO MUST NOT OVERLAP ON ONE RUNNER HOST.
+#
+# The test databases are named from MIX_TEST_PARTITION, which was the constant
+# `ci`, so a PR run and a master run both computed loopctl_testci and whichever
+# reached ecto.create second dropped the database the other was mid-suite on. The
+# run id in MIX_TEST_PARTITION below closes that properly; this group is the
+# cheaper half of the same fix and stops two runs of one branch competing for the
+# five runners.
+#
+# cancel-in-progress is FALSE on master on purpose: a superseded PR run is waste,
+# but a superseded master run is the only CI evidence a merged commit was green,
+# and Deploy hangs off it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
 env:
   MIX_ENV: test
   ELIXIR_VERSION: "1.19.5"
@@ -66,7 +82,7 @@ env:
 jobs:
   lint:
     name: Lint
-    runs-on: [self-hosted, nuc]
+    runs-on: [self-hosted, beelink]
     steps:
       - uses: actions/checkout@v4
 
@@ -116,7 +132,7 @@ jobs:
 
   test:
     name: Test
-    runs-on: [self-hosted, nuc]
+    runs-on: [self-hosted, beelink]
     # NO `services:` block on self-hosted. nuc already runs a long-lived
     # Postgres 16 bound to 127.0.0.1:5432 — reachable because the job runs ON that
     # host — the same database local `mix test`
@@ -125,9 +141,22 @@ jobs:
     # 0.8.2 available, which is why the pgvector image is not needed here.
     # config/test.exs hardcodes localhost + postgres/postgres for all three repos.
     env:
-      # CI gets loopctl_testci, so a CI run and a local `mix test` do not fight
-      # over loopctl_test. config/test.exs builds the name from this.
-      MIX_TEST_PARTITION: ci
+      # ci<run_id>, not the bare `ci` this used to be. The suffix separated CI from a
+      # developer's loopctl_test -- a real fix -- but not one CI run from another,
+      # because it did not vary by run. config/test.exs builds the database name from
+      # this, and the psql steps below interpolate the same variable, so one value
+      # keeps all of them on the same database.
+      #
+      # Safe as a non-integer: this job does not pass `mix test --partitions`, which is
+      # the only thing that validates the variable as a bare 1..N.
+      MIX_TEST_PARTITION: ci${{ github.run_id }}
+      # The CI-only Postgres, NOT the instance on 5432 -- which, now that the runners
+      # are back on beelink, holds Mark's development databases.
+      TEST_DB_PORT: "5433"
+      # The psql steps below use libpq directly; PGPORT is what points THEM at the
+      # same instance the Ecto repos use. Setting only one of the two is the bug
+      # this pairing exists to prevent -- the grants would land on 5432.
+      PGPORT: "5433"
 
     steps:
       - uses: actions/checkout@v4
@@ -225,7 +254,7 @@ jobs:
 
   retrieval-eval:
     name: Retrieval Eval
-    runs-on: [self-hosted, nuc]
+    runs-on: [self-hosted, beelink]
     # MIX_ENV=dev on purpose (the workflow-level default is test): `mix
     # loopctl.retrieval.eval` opens its OWN DB connections, and config/test.exs puts all
     # three repos behind Ecto.Adapters.SQL.Sandbox, where a non-checked-out process has no
@@ -233,10 +262,21 @@ jobs:
     # the task in, so CI exercises the real invocation.
     env:
       MIX_ENV: dev
-    # No services block: nuc's Postgres already holds 127.0.0.1:5432 and has
-    # pgvector 0.8.2 available, so a service container could not bind that port
-    # and is not needed. MIX_ENV=dev here resolves to loopctl_dev, which Mark
-    # confirmed is disposable on nuc.
+      # THIS JOB USED TO POINT AT loopctl_dev, and the note that made that safe was
+      # "which Mark confirmed is disposable on nuc". Moving the runners back to
+      # beelink invalidated it: there, loopctl_dev is Mark's REAL development
+      # database, and this job does not just read -- it runs ecto.create, ecto.migrate
+      # and GRANTs, so every CI run would apply the branch's migrations to live dev
+      # data. config/dev.exs now takes these two overrides, defaulting to the old
+      # values so a developer sees no change.
+      DEV_DB_NAME: loopctl_ci_eval_${{ github.run_id }}
+      DEV_DB_PORT: "5433"
+      # psql in the steps below picks the port up from PGPORT; the Ecto repos use
+      # DEV_DB_PORT above. Both name the CI-only instance, never 5432.
+      PGPORT: "5433"
+    # No services block on self-hosted: the host already holds 5432 and 5433, so a
+    # service container could not bind either. 5433 is the CI-only instance, which
+    # carries pgvector in the image layer.
     steps:
       - uses: actions/checkout@v4
 
@@ -311,7 +351,7 @@ jobs:
 
       - name: Grant RLS roles access to tables
         run: |
-          PGPASSWORD=postgres psql -h localhost -U postgres -d loopctl_dev -c "
+          PGPASSWORD=postgres psql -h localhost -U postgres -d "$DEV_DB_NAME" -c "
             GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO loopctl_app;
             GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO loopctl_app;
           "
@@ -344,7 +384,7 @@ jobs:
 
   security:
     name: Security
-    runs-on: [self-hosted, nuc]
+    runs-on: [self-hosted, beelink]
     steps:
       - uses: actions/checkout@v4
 
@@ -382,7 +422,7 @@ jobs:
 
   dialyzer:
     name: Dialyzer
-    runs-on: [self-hosted, nuc]
+    runs-on: [self-hosted, beelink]
     steps:
       - uses: actions/checkout@v4
 
@@ -402,13 +442,35 @@ jobs:
           # config-sensitive deps instead of reusing a stale dep beam.
           key: ${{ runner.os }}-${{ runner.environment }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
 
+      # runner.name IS PART OF THE KEY, and it has to be. A PLT embeds ABSOLUTE paths
+      # to the OTP install that built it, and every runner has its own _work tree, so
+      # a PLT built under runners/loopctl is invalid under runners/loopctl-3:
+      #
+      #   :dialyzer.run error: File not found:
+      #     /home/github-runner/runners/loopctl/_work/_temp/.setup-beam/otp/lib/
+      #     dialyzer-5.4.0.1/ebin/erl_bif_types.beam
+      #
+      # That is not a hypothetical - it is what this job did on its first beelink run,
+      # having restored on runner loopctl-3 a PLT saved by runner loopctl.
+      #
+      # runner.environment was already here and does NOT cover this: it resolves to
+      # `self-hosted` on every self-hosted runner, and nuc and beelink even use the
+      # SAME directory layout, so the single-runner setup shared a PLT across two
+      # machines quite happily. The bug only appears the moment one repo has a second
+      # runner, which is exactly what moving here required. home_care_billing hit it
+      # first and its ci.yml carries the same fix with the same error quoted.
+      #
+      # Cost: one PLT per runner, rebuilt once each. The restore-keys prefix is
+      # scoped the same way so a stale cross-runner PLT cannot be picked up as a
+      # near-miss either - an unscoped prefix would reintroduce the bug on every
+      # mix.lock change.
       - name: Restore PLT cache
         uses: actions/cache@v4
         with:
           path: priv/plts/
-          key: ${{ runner.os }}-${{ runner.environment }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
+          key: ${{ runner.os }}-${{ runner.environment }}-${{ runner.name }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock') }}
           restore-keys: |
-            ${{ runner.os }}-${{ runner.environment }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
+            ${{ runner.os }}-${{ runner.environment }}-${{ runner.name }}-plt-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-
 
       - name: Install dependencies
         run: mix deps.get
@@ -669,7 +731,7 @@ jobs:
     # other's ANALYZE results any more than two containers could. What a shared cluster
     # DOES share is CPU, shared_buffers and disk — which affects timing, not the plan
     # CHOICE these tests assert on, and the matrix runs serially on one runner anyway.
-    runs-on: [self-hosted, nuc]
+    runs-on: [self-hosted, beelink]
     # MANUAL DISPATCH, PLUS THE WEEKLY CRON ONLY. Not every-PR (the 80k seed per file is far
     # too slow for every push) and no longer every night. The enforced pre-merge step for a
     # Theme-2/3/4 (query/index) change is `gh workflow run CI --ref <branch>` or the local
@@ -687,6 +749,15 @@ jobs:
     # shift, a migration that fails to build an HNSW index — will not be caught until
     # somebody dispatches it. Dispatch it after any such infrastructure change.
     if: github.event_name == 'workflow_dispatch'
+    env:
+      # scale-nightly derives its own database per matrix file (loopctl_test_sn_<file>)
+      # and drops it again at the end, so it never shared a name with anything. What it
+      # DID share, once the runners moved back to beelink, is the instance: without
+      # these it would create and seed multi-hundred-thousand-row scale databases inside
+      # Mark's development Postgres. Both variables are needed -- TEST_DB_PORT for the
+      # Ecto repos, PGPORT for the psql steps.
+      TEST_DB_PORT: "5433"
+      PGPORT: "5433"
     # The derived database is named from the scale FILE alone (loopctl_test_sn_<file>, no
     # run id — a leftover has to name the file that made it, and run_id would push the
     # identifier past Postgres's 63-byte limit). So two runs of the same leg would SHARE
