@@ -1060,7 +1060,24 @@ jobs:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
   smoke:
-    name: Post-deploy Smoke
+    # The name carries the job's own status, because the run summary cannot (#675). This job
+    # gates NOTHING — it is `needs: [deploy]` and appears in no other job's `needs`, and it
+    # is not among master's required checks — but when it fails, `gh run list` shows the same
+    # red X as a run where a GATING job failed and `Deploy` was skipped. Red is a property of
+    # the RUN; "did we ship" is a property of a JOB inside it.
+    #
+    # That cost a real misreading on 2026-08-12: a session reviewing the day's CI concluded
+    # "every deploy blocked today was blocked by the gate misfiring" and filed a
+    # three-for-three scoreboard. Two of those three were THIS job failing on releases that
+    # had already deployed and were serving; exactly one deploy was blocked.
+    #
+    # The cost is not bookkeeping. "The gate misfires" argues for LOOSENING gates — raise
+    # budgets, add retries, downgrade to advisory — which was right for the cold-start
+    # latency defect (#664) and exactly backwards for the toolchain fetch (#674), where the
+    # build genuinely could not produce assets and the fix was to remove the network
+    # dependency. Conflate the two shapes a few more times and you get a gate that passes
+    # everything.
+    name: Post-deploy Smoke (advisory — release already shipped)
     runs-on: ubuntu-latest
     # Runs AFTER the Fly deploy so it validates the freshly-deployed release, not
     # the old one. It does NOT gate anything (deploy already happened) — it is a
@@ -1083,4 +1100,9 @@ jobs:
         env:
           BASE_URL: https://loopctl.com
           LOOPCTL_SMOKE_KEY: ${{ secrets.LOOPCTL_SMOKE_KEY }}
+          # Tells smoke.sh which of its two jobs this is, so a failure can say whether it
+          # BLOCKED the release (pre-deploy) or merely reports on one already serving
+          # (here). The pre-deploy job deliberately does NOT set this — its failures gate,
+          # and telling an operator "nothing was blocked" there would be false.
+          SMOKE_CONTEXT: post-deploy
         run: bash scripts/smoke.sh

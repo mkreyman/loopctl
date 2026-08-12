@@ -515,5 +515,17 @@ if [ "$FAILURES" -eq 0 ]; then
   exit 0
 else
   echo "$NO $FAILURES smoke check(s) failed"
+  # Say which SHAPE of failure this is, because the run summary cannot (#675). The same
+  # script runs in two jobs with opposite consequences: pre-deploy GATES (deploy needs it, so
+  # a red one stopped the release), post-deploy does NOT (the release already shipped and is
+  # serving). Both render as an identical red X, and reading one as the other led to a
+  # documented misdiagnosis — "the deploy was blocked" about a release that was live.
+  if [ "${SMOKE_CONTEXT:-}" = "post-deploy" ]; then
+    echo
+    echo "  NOTE: this check is ADVISORY. The deploy already succeeded and the release at"
+    echo "  ${BASE_URL} is LIVE and serving traffic right now — nothing was blocked."
+    echo "  Your decision is whether to ROLL BACK, not whether to re-run this job."
+    echo "  See docs/runbooks/post-deploy-smoke.md."
+  fi
   exit 1
 fi

@@ -235,7 +235,17 @@ There are now TWO smoke jobs running the same `scripts/smoke.sh`:
 | Job | Runs on | Probes | Can be a required check? |
 |---|---|---|---|
 | `Pre-deploy Smoke (current release)` | every PR + every master push | the release already live | **yes** |
-| `Post-deploy Smoke` | master push, after deploy | the release just shipped | **no** |
+| `Post-deploy Smoke (advisory — release already shipped)` | master push, after deploy | the release just shipped | **no** |
+
+The job carries "advisory" in its NAME on purpose (#675). It gates nothing, but a failure
+renders the same red X as a run where a gating job failed and `Deploy` was skipped — and
+`gh run list` shows only the run's colour, never which job inside it went red. That
+ambiguity produced a real misdiagnosis on 2026-08-12: two advisory smoke failures on
+already-serving releases were counted as blocked deploys, supporting a conclusion that "the
+gates are misfiring". Loosening gates is the right response to a genuine false positive and
+the wrong response to a build that truly could not produce assets, so the two shapes must
+stay tellable apart. On failure the script now says so directly, and names rollback rather
+than re-run as the operator's decision.
 
 The post-deploy job cannot be made a required branch-protection check. It only runs on a
 master push, i.e. *after* the merge, so it never reports on a PR's head SHA — adding it to
