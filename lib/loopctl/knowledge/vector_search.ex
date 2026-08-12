@@ -647,6 +647,9 @@ defmodule Loopctl.Knowledge.VectorSearch do
       category: a.category,
       status: a.status,
       tags: a.tags,
+      # The MOC-hub demotion signal (#654 follow-up) — RankingPriors fails open without
+      # it, so the semantic lane would keep ranking hubs undemoted while keyword did not.
+      idempotency_key: a.idempotency_key,
       metadata: a.metadata,
       inserted_at: a.inserted_at,
       updated_at: a.updated_at,
@@ -944,6 +947,8 @@ defmodule Loopctl.Knowledge.VectorSearch do
       tags: a.tags,
       # source_type feeds the #471 authority prior in Loopctl.Knowledge.search_combined/3.
       source_type: a.source_type,
+      # idempotency_key feeds the MOC-hub demotion in the same place (#654 follow-up).
+      idempotency_key: a.idempotency_key,
       metadata: a.metadata,
       inserted_at: a.inserted_at,
       updated_at: a.updated_at,

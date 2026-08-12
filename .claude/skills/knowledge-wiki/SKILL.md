@@ -44,7 +44,7 @@ never pass `tenant_id`/`subject_id`.
    caller passing `on_gate_unavailable: :skip` gets `{:error, :gate_unavailable}` and nothing is
    created (`:509-515`). The assessor is config-injected (`Loopctl.Knowledge.ProposalGate`, `:463-466`)
    — do not hardcode it.
-2. **Hybrid search provenance** — `Loopctl.Knowledge.hybrid_search/3` (`knowledge.ex:9175`).
+2. **Hybrid search provenance** — `Loopctl.Knowledge.hybrid_search/3` (`knowledge.ex:9194`).
    `:curated` wins ONLY when a governed curated source's **absolute** (never pool-relative) confidence
    (`absolute_score/1`, `:9306-9311`) clears a scale-matched threshold AND beats the best retrieved
    candidate by a margin (`hybrid_curated_threshold_and_margin/1`, `:9328-9338`; the pure decision is
@@ -91,7 +91,7 @@ never pass `tenant_id`/`subject_id`.
    `{drift_signal, member_id}` — a group scored under the other signal's normalized key finds
    nothing and withholds (fail-closed).
 5. **Heat must not rank on a signal heat produces** — `Knowledge.heat_index/2`
-   (`knowledge.ex:9820`; the counted set is `@heat_read_access_types`, `:9690`). The heat index is the one retrieval route that
+   (`knowledge.ex:9839`; the counted set is `@heat_read_access_types`, `:9690`). The heat index is the one retrieval route that
    takes NO query, so its misses are uncorrelated with embedding similarity — which is worth nothing
    if its ordering is something a caller or the route itself generates. It has been violated FOUR
    times, each differently — and once by a FIX for one of the others — so treat any new input to

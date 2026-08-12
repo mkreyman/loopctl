@@ -1880,7 +1880,20 @@ defmodule Loopctl.Knowledge do
           # Single source of truth for the exp(-age_days/30) decay — shared with the #471
           # search_combined priors (RankingPriors.recency_decay/2).
           recency_score = RankingPriors.recency_decay(article.updated_at, now)
-          combined = (1.0 - recency_weight) * relevance + recency_weight * recency_score
+
+          # Demote MOC hubs and dead doctrine HERE too (#654 follow-up). This surface
+          # re-ranks on its own `combined_score` and never sees `search_combined`'s fused
+          # `:final_score`, so without this a hub demoted out of the search top-3 came
+          # straight back at rank 1 — and `knowledge_context` returns FULL BODIES, so the
+          # undemoted hub cost far more context here than it did in search.
+          #
+          # Applied per-surface rather than folded into `absolute_score/1`: that function
+          # also feeds `hybrid_search/3`'s curated-vs-retrieved threshold, and moving a
+          # score there would silently move the provenance decision boundary with it.
+          demotion = RankingPriors.demotion_factor(article)
+
+          combined =
+            ((1.0 - recency_weight) * relevance + recency_weight * recency_score) * demotion
 
           linked = Map.get(linked_map, article.id, [])
 
@@ -2068,6 +2081,10 @@ defmodule Loopctl.Knowledge do
               # default elsewhere); carried on the keyword lane so the priors apply on the
               # degraded keyword_only fallback too (AC-5).
               source_type: a.source_type,
+              # idempotency_key is the MOC-hub signal (#654 follow-up). Projected for the
+              # SAME reason as source_type: RankingPriors fails open on a missing field,
+              # so a lane that omits it silently stops demoting hubs on that lane only.
+              idempotency_key: a.idempotency_key,
               inserted_at: a.inserted_at,
               updated_at: a.updated_at,
               relevance_score:
@@ -8028,6 +8045,8 @@ defmodule Loopctl.Knowledge do
         # source_type feeds the #471 authority prior (see the keyword select). The inner
         # pool_select(:semantic) must project it for this outer select to read it.
         source_type: c.source_type,
+        # Same contract for the MOC-hub demotion signal: inner projects it, outer reads it.
+        idempotency_key: c.idempotency_key,
         inserted_at: c.inserted_at,
         updated_at: c.updated_at,
         similarity_score: c.similarity_score

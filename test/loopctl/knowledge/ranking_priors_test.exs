@@ -208,27 +208,33 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
   describe "#654 MOC hubs are demoted: navigation must not outrank an answer" do
     alias Loopctl.Knowledge.RankingPriors
 
-    test "both structural tags are required — `moc` alone is a legitimate content tag" do
-      # Market-On-Close, not a generated hub.
-      refute RankingPriors.moc_hub?(["moc", "finance", "trading"])
-      refute RankingPriors.moc_hub?(["hub"])
-      refute RankingPriors.moc_hub?([])
+    test "hub-ness comes from the worker's idempotency_key, never from tags" do
+      # The security property, not a naming preference. `tags` is in Article's
+      # @cast_fields AND update_changeset/2, and knowledge_update is agent-role, so a
+      # tag-derived penalty let any agent halve ANOTHER agent's article. idempotency_key
+      # is cast on CREATE only, so the worst an agent can do is demote its own new row.
+      refute RankingPriors.moc_hub?(%{tags: ["hub", "moc", "deployment"]})
+      refute RankingPriors.moc_hub?(%{tags: ["moc", "finance", "trading"]})
+      refute RankingPriors.moc_hub?(%{})
       refute RankingPriors.moc_hub?(nil)
 
-      assert RankingPriors.moc_hub?(["hub", "moc", "deployment"])
+      assert RankingPriors.moc_hub?(%{idempotency_key: "moc:deployment"})
+    end
+
+    test "a non-hub idempotency_key is not a hub" do
+      refute RankingPriors.moc_hub?(%{idempotency_key: "session:abc"})
+      refute RankingPriors.moc_hub?(%{idempotency_key: ""})
+      refute RankingPriors.moc_hub?(%{idempotency_key: nil})
+    end
+
+    test "a result map that does not project idempotency_key fails OPEN (no demotion)" do
+      # A lane that forgets the projection must under-demote, never mis-demote.
+      assert mult(%{category: :reference, updated_at: @now, tags: [], status: :published}, []) ==
+               mult(%{category: :reference, updated_at: @now, status: :published}, [])
     end
 
     test "a hub is demoted below an ordinary article of the SAME category" do
-      hub = %{
-        category: :reference,
-        updated_at: @now,
-        tags: ["hub", "moc", "deployment"],
-        status: :published
-      }
-
-      answer = %{category: :reference, updated_at: @now, tags: ["deployment"], status: :published}
-
-      assert mult(answer, []) > mult(hub, [])
+      assert mult(answer(), []) > mult(hub(), [])
     end
 
     test "a hub loses to a real article the CATEGORY TIER would have ranked below it" do
@@ -236,18 +242,51 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
       # `pattern` (0.7) on authority alone, so this ordering can ONLY come from the
       # demotion. Comparing a hub against a higher-tier `finding` would pass with the
       # demotion disabled and prove nothing — that is the failure this test shape avoids.
-      hub = %{category: :reference, updated_at: @now, tags: ["hub", "moc"], status: :published}
       pattern = %{category: :pattern, updated_at: @now, tags: [], status: :published}
 
-      assert mult(pattern, []) > mult(hub, [])
+      assert mult(pattern, []) > mult(hub(), [])
     end
 
     test "demotion is independent of the authority toggle, like dead doctrine" do
-      hub = %{category: :reference, updated_at: @now, tags: ["hub", "moc"], status: :published}
-      plain = %{category: :reference, updated_at: @now, tags: [], status: :published}
-
-      assert mult(plain, authority?: false) > mult(hub, authority?: false)
+      assert mult(answer(), authority?: false) > mult(hub(), authority?: false)
     end
+
+    test "the hub factor is sized for RRF: a two-lane rank-1 hub loses to a one-lane rank-1 answer" do
+      # The #654 regression this follow-up exists for. A fused score is
+      # `Σ_lane weight/(60 + rank)`. At the dead-doctrine 0.5 the arithmetic below is an
+      # exact TIE, decided by the UUID tiebreak — a coin flip, not a demotion.
+      two_lane_rank1 = 1.0 / 61.0 + 1.0 / 61.0
+      one_lane_rank1 = 1.0 / 61.0
+
+      demoted_hub = two_lane_rank1 * RankingPriors.demotion_factor(hub())
+
+      assert demoted_hub < one_lane_rank1,
+             "a hub topping BOTH lanes must lose to an answer topping one"
+    end
+
+    test "the kill switch disables hub demotion without touching dead doctrine" do
+      killed = %{
+        category: :reference,
+        updated_at: @now,
+        tags: ["verdict-kill"],
+        status: :published
+      }
+
+      assert RankingPriors.demotion_factor(hub(), hub_demotion?: false) == 1.0
+      assert RankingPriors.demotion_factor(killed, hub_demotion?: false) < 1.0
+    end
+
+    defp hub,
+      do: %{
+        category: :reference,
+        updated_at: @now,
+        tags: ["hub", "moc", "deployment"],
+        status: :published,
+        idempotency_key: "moc:deployment"
+      }
+
+    defp answer,
+      do: %{category: :reference, updated_at: @now, tags: ["deployment"], status: :published}
   end
 
   describe "#251 provenance prior: first-party outranks harvested material on a near-tie" do
