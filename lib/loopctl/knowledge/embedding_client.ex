@@ -194,6 +194,16 @@ defmodule Loopctl.Knowledge.EmbeddingClient do
       # NOTE: never log `opts` / `api_key` — the key is a tenant secret.
       headers: [{"authorization", "Bearer #{api_key}"}],
       retry: :transient,
+      # DO NOT RAISE THIS DEFAULT WITHOUT MOVING `@embedding_yield_ms` (#658).
+      # An audit recommended defaulting it to 1, since 6 of 7 observed degradations were
+      # transient provider 500s/timeouts that one retry would cover. That is unsafe as a
+      # standalone change: `Loopctl.Knowledge.@embedding_yield_ms` (5_000) is documented as
+      # kept STRICTLY ABOVE this client's worst case, which assumes a SINGLE attempt at the
+      # 4s receive_timeout. A second attempt pushes the worst case to ~8s, so `Task.yield`
+      # would kill a slow-but-valid embed and miscount it as a circuit-breaker failure —
+      # the precise miscount review #10 engineered against, and it would make degradation
+      # MORE frequent, not less. Raising retries requires raising the yield budget too,
+      # which costs interactive latency on every search. Left at 0 deliberately.
       max_retries: SystemConfig.get_int("embedding_max_retries", 0),
       receive_timeout: receive_timeout
     ]

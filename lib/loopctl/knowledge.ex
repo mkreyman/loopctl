@@ -2111,7 +2111,13 @@ defmodule Loopctl.Knowledge do
           |> offset(^offset)
           |> AdminRepo.all()
 
-        maybe_record_search_access(tenant_id, results, query_string, opts, "keyword")
+        maybe_record_search_access(
+          tenant_id,
+          results,
+          query_string,
+          Keyword.put(opts, :_total_count, total_count),
+          "keyword"
+        )
 
         {:ok,
          %{
@@ -2190,7 +2196,13 @@ defmodule Loopctl.Knowledge do
 
     results = HeavyRead.all(tenant_id, results_query, heavy_read_opts(:enumeration))
 
-    maybe_record_search_access(tenant_id, results, "", opts, "list")
+    maybe_record_search_access(
+      tenant_id,
+      results,
+      "",
+      Keyword.put(opts, :_total_count, total_count),
+      "list"
+    )
 
     {:ok,
      %{
@@ -2531,20 +2543,173 @@ defmodule Loopctl.Knowledge do
   # the whole result set. The cap lives in `Analytics` — the module that writes the rows
   # and documents the key — so the enforcement here and every doc that publishes the
   # number read ONE constant.
+  # Extracted from `maybe_record_search_access/5` so that function stays readable: the
+  # attempt row carries enough of the request to make a MISS interpretable later, which is
+  # a dozen fields, and inlining them buried the control flow they sit inside.
+  defp search_attempt_attrs(search_id, api_key_id, ctx, query_string, results, mode, opts) do
+    top = List.first(results)
+
+    attrs = %{
+      search_id: search_id,
+      api_key_id: api_key_id,
+      # WHO searched. api_key_id alone is not the agent: under the v2 dispatch pattern a
+      # key is minted PER DISPATCH, so counting keys counts dispatches, not agents.
+      agent_id: Keyword.get(opts, :agent_id),
+      project_id: Map.get(ctx, :project_id) || Map.get(ctx, "project_id"),
+      story_id: Map.get(ctx, :story_id) || Map.get(ctx, "story_id"),
+      # An explicit `mode=semantic` search holds only the embedding by the time it records,
+      # so the site passes `nil`; the request's own query rides `:_query_string`. Without it
+      # every semantic search filed itself under `query_terms IS NULL` — the "no query"
+      # bucket the moduledoc keeps separate from a one-token query on purpose.
+      query: query_string || Keyword.get(opts, :_query_string),
+      # DERIVED from the lane, not defaulted to a literal. Defaulting made every
+      # enumeration and hybrid row claim `tool = "knowledge_search"`, so a per-tool
+      # breakdown was WRONG rather than merely absent.
+      tool: Keyword.get(opts, :_tool) || tool_for_mode(mode),
+      mode_requested: Keyword.get(opts, :_mode_requested) || requested_mode(mode),
+      mode_used: mode,
+      # WHICH SLICE of the KB. tenant_id names the corpus; these name the part of it the
+      # query could ever have matched, without which a zero-result row is unreadable.
+      filters: search_filters(opts),
+      # The limit the CLIENT asked for, which is NOT `:limit` — that one has already been
+      # defaulted and clamped by the controller, so "did callers ask for more than we
+      # return" is unanswerable from it.
+      limit_requested: Keyword.get(opts, :_limit_requested) || Keyword.get(opts, :limit),
+      offset_requested: Keyword.get(opts, :offset),
+      total_count: Keyword.get(opts, :_total_count),
+      top_result_id: top_result_id(top),
+      top_result_score: top_result_score(top),
+      result_count: length(results),
+      duration_ms: search_duration_ms(opts),
+      ann_iterative_scan: Keyword.get(opts, :_ann_iterative_scan),
+      degraded?: Keyword.get(opts, :_degraded, false),
+      fallback_reason: Keyword.get(opts, :_fallback_reason)
+    }
+
+    # Client-asserted context merges UNDER the server-derived facts, never over them: a
+    # request header must not be able to overwrite `agent_id`, `tool` or `outcome`. The
+    # controller's whitelist makes a collision impossible TODAY — this makes it structural.
+    Map.merge(client_context_attrs(opts), attrs)
+  end
+
+  # Read with `Map.get/2`, never `top[:key]`: Access is undefined on structs, so the Access
+  # form raises on a struct-shaped result and the whole telemetry row is lost to the
+  # recorder's rescue. Each lane names its score differently — fused rows carry
+  # `:final_score`, the semantic lane `:similarity_score`, keyword (and the degraded
+  # keyword-only fallback) `:relevance_score` — so all three are read, or the column the
+  # schema justifies as "judge relevance later without replaying the query" stays NULL for
+  # every non-fused lane.
+  defp top_result_id(nil), do: nil
+  defp top_result_id(top), do: Map.get(top, :id)
+
+  defp top_result_score(nil), do: nil
+
+  defp top_result_score(top) do
+    Map.get(top, :final_score) || Map.get(top, :similarity_score) ||
+      Map.get(top, :relevance_score) || Map.get(top, :score)
+  end
+
+  # The mode a client can actually REQUEST. `mode` at the record site is the internal LANE
+  # label, so falling back to it invented buckets ("combined_fallback", "list_keyset",
+  # "hybrid_curated") no request can produce and undercounted the implicit default. A lane
+  # entered from combined reports combined; anything else records NULL (undeclared) rather
+  # than a phantom.
+  defp requested_mode(mode) when mode in ~w(keyword semantic combined), do: mode
+  defp requested_mode("combined_fallback"), do: "combined"
+  defp requested_mode(_lane), do: nil
+
+  # The tool a row belongs to, derived from the lane that recorded it. `knowledge_list` and
+  # `knowledge_hybrid_search` are not searches in the same sense as `knowledge_search`, and
+  # folding them into one label polluted its outcome mix with enumeration calls.
+  defp tool_for_mode(mode) when mode in ["list", "list_keyset"], do: "knowledge_list"
+  defp tool_for_mode("hybrid_curated"), do: "knowledge_hybrid_search"
+  defp tool_for_mode("hybrid_retrieved"), do: "knowledge_hybrid_search"
+  defp tool_for_mode(_mode), do: "knowledge_search"
+
+  # Wall time from the request entrypoint, which is the only place that knows when the
+  # attempt began. Monotonic, so a clock step cannot produce a negative duration. Absent
+  # for callers that never stamped a start (recorded as NULL, not as a wrong zero).
+  defp search_duration_ms(opts) do
+    case Keyword.get(opts, :_started_at) do
+      started when is_integer(started) -> System.monotonic_time(:millisecond) - started
+      _ -> nil
+    end
+  end
+
+  # Client-asserted context (#658), threaded from the HTTP layer which decoded it from the
+  # request header. UNTRUSTED and analytics-only — the api key remains the sole authority.
+  defp client_context_attrs(opts) do
+    case Keyword.get(opts, :_client_context) do
+      %{} = attrs -> attrs
+      _ -> %{}
+    end
+  end
+
+  # Attaches the two facts a semantic lane knows and the recorder cannot recompute: the
+  # candidate pool the ranker chose FROM (a page of 5 out of 100 and a page of 5 out of 5
+  # are different retrieval events) and whether the ANN ran under `hnsw.iterative_scan`.
+  # The scan state is read from the SAME opts the read was issued with, via the one
+  # derivation `HeavyRead.iterative_scan_meta/1` — never a fresh probe.
+  defp attempt_meta(opts, total_count, read_opts) do
+    Keyword.merge(opts,
+      _total_count: total_count,
+      _ann_iterative_scan: Map.get(HeavyRead.iterative_scan_meta(read_opts), :ann_iterative_scan)
+    )
+  end
+
+  # The corpus slice a search could match, captured so a zero-result row is interpretable.
+  # Only keys the caller actually supplied are recorded — an absent filter and a filter set
+  # to nil are different facts, and flattening them would make an over-scoped search look
+  # identical to an unscoped one.
+  defp search_filters(opts) do
+    [:category, :tags, :match, :status, :project_id, :visibility, :threshold]
+    |> Enum.reduce(%{}, fn key, acc ->
+      case Keyword.fetch(opts, key) do
+        {:ok, nil} -> acc
+        {:ok, value} -> Map.put(acc, Atom.to_string(key), normalize_filter_value(value))
+        :error -> acc
+      end
+    end)
+  end
+
+  defp normalize_filter_value(v) when is_atom(v) and not is_boolean(v) and not is_nil(v),
+    do: Atom.to_string(v)
+
+  defp normalize_filter_value(v) when is_list(v), do: Enum.map(v, &normalize_filter_value/1)
+  defp normalize_filter_value(v), do: v
+
+  # Records BOTH halves of a search's telemetry (#658):
+  #
+  #   * the per-RESULT rows (rank, article_id) in `article_access_events`, unchanged; and
+  #   * ONE row per ATTEMPT in `search_events`, INCLUDING attempts that surfaced nothing.
+  #
+  # The second half exists because this function used to return `:ok` on `results in
+  # [nil, []]`, so a search that found nothing left no trace in the database at all. The
+  # misses — the only searches that tell you the corpus or the query needs work — were the
+  # exact population the schema could not represent, and recovering them meant hand-mining
+  # 6,457 session transcripts. Both halves share one `search_id` so a miss and its (absent)
+  # results are one correlated story.
   defp maybe_record_search_access(tenant_id, results, query_string, opts, mode) do
+    results = results || []
+    api_key_id = Keyword.get(opts, :api_key_id)
+    skip? = Keyword.get(opts, :_skip_record_access, false)
+    search_id = Ecto.UUID.generate()
+
+    unless skip? or is_nil(api_key_id) do
+      record_search_attempt(tenant_id, search_id, api_key_id, query_string, results, mode, opts)
+    end
+
     cond do
-      Keyword.get(opts, :_skip_record_access, false) ->
+      skip? ->
         :ok
 
-      results in [nil, []] ->
+      results == [] ->
         :ok
 
-      is_nil(Keyword.get(opts, :api_key_id)) ->
+      is_nil(api_key_id) ->
         :ok
 
       true ->
-        api_key_id = Keyword.fetch!(opts, :api_key_id)
-
         article_ids =
           results
           |> Enum.map(fn r -> r[:id] || Map.get(r, :id) end)
@@ -2557,9 +2722,28 @@ defmodule Loopctl.Knowledge do
           api_key_id,
           query_string,
           %{"mode" => mode, "results_returned" => length(results)},
-          attribution_context(opts)
+          # search_id rides the INTERNAL context, not the metadata map — metadata is
+          # caller-supplied and a forged id would collapse the `searches` denominator (#582).
+          Map.put(attribution_context(opts), :search_id, search_id)
         )
     end
+  end
+
+  # `Analytics.record_search_attempt/2` rescues its OWN body, which does not cover building
+  # the attrs map at the call site: a struct-shaped result (Access is undefined on structs)
+  # raised straight out of the search and 500'd the request. Recording is best-effort by
+  # contract, so the construction has to sit inside the same rescue as the write.
+  defp record_search_attempt(tenant_id, search_id, api_key_id, query_string, results, mode, opts) do
+    ctx = attribution_context(opts)
+
+    Analytics.record_search_attempt(
+      tenant_id,
+      search_attempt_attrs(search_id, api_key_id, ctx, query_string, results, mode, opts)
+    )
+  rescue
+    error ->
+      Logger.warning("knowledge.search_attempt_attrs failed: #{Exception.message(error)}")
+      :ok
   end
 
   @doc """
@@ -7388,7 +7572,13 @@ defmodule Loopctl.Knowledge do
             err
 
           total_count ->
-            maybe_record_search_access(tenant_id, results, nil, opts, "semantic")
+            maybe_record_search_access(
+              tenant_id,
+              results,
+              nil,
+              attempt_meta(opts, total_count, heavy_opts),
+              "semantic"
+            )
 
             {:ok,
              %{
@@ -7494,7 +7684,13 @@ defmodule Loopctl.Knowledge do
             {results, survived} =
               hydrate_semantic_pool(tenant_id, pool_rows, status, opts, limit, offset)
 
-            maybe_record_search_access(tenant_id, results, nil, opts, "semantic")
+            maybe_record_search_access(
+              tenant_id,
+              results,
+              nil,
+              attempt_meta(opts, total_count, pool_opts),
+              "semantic"
+            )
 
             {:ok,
              %{
@@ -8087,7 +8283,14 @@ defmodule Loopctl.Knowledge do
               tenant_id,
               merged.results,
               query_string,
-              opts,
+              # The inner semantic read's scan state rides in `merged.meta`; without
+              # carrying it out the DEFAULT lane recorded NULL while explicit
+              # `mode=semantic` recorded a value, so the column compared a populated
+              # class against an unpopulated one.
+              Keyword.merge(opts,
+                _total_count: merged.meta[:total_count],
+                _ann_iterative_scan: merged.meta[:ann_iterative_scan]
+              ),
               "combined"
             )
 
@@ -8127,11 +8330,18 @@ defmodule Loopctl.Knowledge do
     reranked = apply_ranking_priors_fallback(kw.results, opts)
     paginated = paginate_results(reranked, opts)
 
+    # The DEGRADATION, carried to the recorder. Without it the row lands as
+    # `zero_results` and the provider outage reads as a corpus gap — the exact
+    # misattribution `SearchEvent` documents as the thing that must not happen.
     maybe_record_search_access(
       tenant_id,
       paginated.results,
       query_string,
-      opts,
+      Keyword.merge(opts,
+        _degraded: true,
+        _fallback_reason: fallback_reason,
+        _total_count: kw.meta.total_count
+      ),
       "combined_fallback"
     )
 
@@ -9018,7 +9228,11 @@ defmodule Loopctl.Knowledge do
         tenant_id,
         page.results,
         query_string,
-        opts,
+        Keyword.merge(opts,
+          _total_count: pool_meta[:total_count],
+          _degraded: pool_meta[:fallback] == true,
+          _fallback_reason: pool_meta[:fallback_reason]
+        ),
         hybrid_search_mode(provenance)
       )
 
