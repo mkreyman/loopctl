@@ -1567,10 +1567,19 @@ async function knowledgeHeatIndex({ category, limit, since }) {
   return toContent(result);
 }
 
-async function knowledgeProgressiveDrill({ article_id }) {
+async function knowledgeProgressiveDrill({ article_id, body_max_bytes, body_offset }) {
+  const params = new URLSearchParams();
+  // 0 is meaningful on both (whole body / start at the beginning), so test for
+  // null/undefined rather than truthiness.
+  if (body_max_bytes !== undefined && body_max_bytes !== null)
+    params.set("body_max_bytes", String(body_max_bytes));
+  if (body_offset !== undefined && body_offset !== null)
+    params.set("body_offset", String(body_offset));
+  const qs = params.toString();
+  const base = `/api/v1/knowledge/progressive/${article_id}`;
   const result = await apiCall(
     "GET",
-    `/api/v1/knowledge/progressive/${article_id}`,
+    qs ? `${base}?${qs}` : base,
     null,
     process.env.LOOPCTL_AGENT_KEY,
   );
@@ -1614,11 +1623,24 @@ async function knowledgeList({
   return toContent(result);
 }
 
-async function knowledgeGet({ article_id, project_id, story_id, links }) {
+async function knowledgeGet({
+  article_id,
+  project_id,
+  story_id,
+  links,
+  body_max_bytes,
+  body_offset,
+}) {
   const params = new URLSearchParams();
   if (project_id) params.set("project_id", project_id);
   if (story_id) params.set("story_id", story_id);
   if (links) params.set("links", links);
+  // 0 is meaningful on both (whole body / start at the beginning), so test for
+  // null/undefined rather than truthiness.
+  if (body_max_bytes !== undefined && body_max_bytes !== null)
+    params.set("body_max_bytes", String(body_max_bytes));
+  if (body_offset !== undefined && body_offset !== null)
+    params.set("body_offset", String(body_offset));
   const qs = params.toString();
   const path = qs ? `/api/v1/articles/${article_id}?${qs}` : `/api/v1/articles/${article_id}`;
   const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
@@ -4734,7 +4756,11 @@ const TOOLS = [
       "reach — both resolve the same ids now. A drill records an UNCOUNTED read, so " +
       "following an index never raises the heat of what that index just showed you; " +
       "knowledge_get records a counted one, which is a vote that the article was worth " +
-      "opening on its own. Following a list is not a vote.",
+      "opening on its own. Following a list is not a vote.\n\n" +
+      "BODY: served in a byte WINDOW (default 32000 bytes) exactly like knowledge_get, so " +
+      "an oversized article comes back in parts instead of being rejected whole by a client " +
+      "token cap. Read body_truncated / next_body_offset to continue, or pass " +
+      "body_max_bytes: 0 for the whole body.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4742,6 +4768,19 @@ const TOOLS = [
           type: "string",
           format: "uuid",
           description: "The UUID of the article to open (from a progressive index stub).",
+        },
+        body_max_bytes: {
+          type: "integer",
+          minimum: 0,
+          description:
+            "Optional: serialized-body byte budget (default 32000). 0 returns the whole body.",
+        },
+        body_offset: {
+          type: "integer",
+          minimum: 0,
+          description:
+            "Optional: byte offset to start the body window at (default 0). Pass the " +
+            "previous response's next_body_offset to read the next part.",
         },
       },
       required: ["article_id"],
@@ -4772,7 +4811,13 @@ const TOOLS = [
       "`potential_conflicts` is returned in all three modes, so opting out of the link " +
       "list never hides a conflict from you; it is capped at 25 (strongest first) with " +
       "`conflicts_total` / `conflicts_truncated`. To actually traverse the graph, use " +
-      "knowledge_graph rather than raising this cap.",
+      "knowledge_graph rather than raising this cap.\n\n" +
+      "BODY: the body is served in a byte WINDOW (default 32000 bytes) so an oversized " +
+      "article is returned in parts instead of being rejected whole by a client token " +
+      "cap - four measured reads of 61-82KB were discarded that way after the search had " +
+      "already found them. Every response carries body_bytes (the full size), body_offset, " +
+      "body_returned_bytes, body_truncated and next_body_offset; pass next_body_offset back " +
+      "as body_offset to continue, or body_max_bytes: 0 for the whole body in one read.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4789,6 +4834,20 @@ const TOOLS = [
             "capped arrays; 'count' = just links_total + links_truncated; 'none' = omit " +
             "link fields. potential_conflicts (capped, with conflicts_total) is always " +
             "returned.",
+        },
+        body_max_bytes: {
+          type: "integer",
+          minimum: 0,
+          description:
+            "Optional: serialized-body byte budget (default 32000). 0 returns the whole " +
+            "body. Read body_truncated / next_body_offset to continue.",
+        },
+        body_offset: {
+          type: "integer",
+          minimum: 0,
+          description:
+            "Optional: byte offset to start the body window at (default 0). Pass the " +
+            "previous response's next_body_offset to read the next part.",
         },
         project_id: {
           type: "string",
