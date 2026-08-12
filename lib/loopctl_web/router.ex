@@ -48,6 +48,11 @@ defmodule LoopctlWeb.Router do
     plug LoopctlWeb.Plugs.UpdateLastSeen
     plug LoopctlWeb.Plugs.ValidateWitnessHeader
     plug LoopctlWeb.Plugs.CheckCustodyHalt
+    # #652 — LAST in the pipeline: needs the resolved key (for the tenant) and must
+    # not run for a request that auth, rate limiting or the custody halt already
+    # refused. Rewrites a `project_id` param that carries a project reference (a slug,
+    # or the repo directory name agents actually type) into that project's UUID.
+    plug LoopctlWeb.Plugs.ResolveProjectRef
   end
 
   # Landing page — browser pipeline (HTML)

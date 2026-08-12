@@ -855,6 +855,47 @@ defmodule LoopctlWeb.KnowledgeSearchControllerTest do
       assert Enum.any?(body["data"], &(&1["title"] == "Scoped Ecto Pattern"))
     end
 
+    test "a project_id carrying the repo directory name scopes the search (#652)",
+         %{conn: conn} do
+      # The measured failure: agents pass the checkout directory name, get a 422, and
+      # then retry with project_id DROPPED — losing the scope silently. Resolving at
+      # the boundary means the scope intent survives.
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      project = fixture(:project, %{tenant_id: tenant.id, slug: "home-care-billing"})
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        project_id: project.id,
+        title: "Scoped By Slug Ecto",
+        body: "Use Ecto.Multi for atomic operations.",
+        category: :pattern,
+        status: :published
+      })
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Other Project Ecto",
+        body: "Use Ecto.Multi for atomic operations.",
+        category: :pattern,
+        status: :published
+      })
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/search", %{
+          q: "Ecto",
+          mode: "keyword",
+          project_id: "home_care_billing"
+        })
+
+      body = json_response(conn, 200)
+      titles = Enum.map(body["data"], & &1["title"])
+      assert "Scoped By Slug Ecto" in titles
+      refute "Other Project Ecto" in titles
+    end
+
     test "an absent project_id returns 200 tenant-wide", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})

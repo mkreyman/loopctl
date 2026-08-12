@@ -37,6 +37,7 @@ defmodule LoopctlWeb.ArticleController do
   alias Loopctl.TelemetryEvents
   alias LoopctlWeb.ArticleJSON
   alias LoopctlWeb.AuditContext
+  alias LoopctlWeb.Helpers.BodyWindow
   alias LoopctlWeb.Helpers.Pagination
   alias LoopctlWeb.Helpers.ProjectId
   alias LoopctlWeb.Helpers.TagMatch
@@ -288,6 +289,25 @@ defmodule LoopctlWeb.ArticleController do
           "Link detail level (default `full`). `count` returns `links_total` and " <>
             "`links_truncated`; `none` omits the link fields. `potential_conflicts` " <>
             "(capped, with `conflicts_total`) is always returned."
+      ],
+      body_max_bytes: [
+        in: :query,
+        type: :integer,
+        required: false,
+        description:
+          "Serialized-body byte budget (default #{ArticleJSON.article_body_byte_budget()}). " <>
+            "`0` returns the whole body. The response always carries `body_bytes`, " <>
+            "`body_offset`, `body_returned_bytes`, `body_truncated` and `next_body_offset`, " <>
+            "so a truncated read can be continued rather than discarded."
+      ],
+      body_offset: [
+        in: :query,
+        type: :integer,
+        required: false,
+        description:
+          "Byte offset to start the body window at (default 0). Pass the previous " <>
+            "response's `next_body_offset` to continue. An offset landing mid-character " <>
+            "advances to the next character boundary."
       ],
       project_id: [
         in: :query,
@@ -799,7 +819,14 @@ defmodule LoopctlWeb.ArticleController do
 
     with :ok <- ProjectId.validate(params["project_id"]),
          {:ok, article} <- Knowledge.get_article(tenant_id, article_id, opts) do
-      json(conn, ArticleJSON.show(%{article: article, links: links_mode(params)}))
+      json(
+        conn,
+        ArticleJSON.show(%{
+          article: article,
+          links: links_mode(params),
+          body_window: BodyWindow.parse(params)
+        })
+      )
     end
   end
 

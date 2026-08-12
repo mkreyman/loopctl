@@ -141,6 +141,124 @@ defmodule Loopctl.Projects do
   end
 
   @doc """
+  Resolves a project REFERENCE — the string an agent actually types when it means
+  "this repo" — to a project within a tenant (#652).
+
+  Measured on ~2,100 real agent searches: when a UUID is demanded and an agent
+  supplies something else, it supplies the repo's DIRECTORY name, exactly as the
+  checkout spells it — `home_care_billing` (x24), `loopctl` (x3). Never a name, never
+  a path, never a malformed UUID. `home_care_billing` is not this tenant's slug
+  (`home-care-billing` is) and it is not a resolvable `repo_url` either (a bare basename
+  has no `owner/repo` shape), so neither `get_project_by_slug/2` nor `resolve_project/2`
+  answers the case that actually occurs. This does.
+
+  Three passes, most-specific first:
+
+    1. the exact `slug`;
+    2. the slug NORMALIZED — downcased, `_`/whitespace/`.` folded to `-` — which is
+       precisely the transform between a repo directory and this app's slug format;
+    3. the repo BASENAME of an active project's `repo_url`, compared on the same
+       normalized form. This is what resolves a project whose slug drifted from its
+       repo (`freight-pilot` -> slug `freight-pilot-2`).
+
+  Pass 3 is `:ambiguous` rather than oldest-wins when two active projects share a
+  basename: silently picking one would scope a query to the wrong repo, which is the
+  failure mode this whole change exists to remove.
+
+  Tenant-scoped by an explicit predicate on every pass, so a reference belonging to
+  another tenant is indistinguishable from a typo.
+
+  ## Returns
+
+  - `{:ok, %Project{}, :slug | :normalized_slug | :repo_name}` on a single match
+  - `{:error, :not_found}` when nothing matches (including a blank reference)
+  - `{:error, :ambiguous}` when the basename pass matches more than one project
+  """
+  # Same bound, and for the same reason, as @resolve_candidate_limit below: the tenant's
+  # active-project set is already small (max_projects defaults to 50), so this only keeps
+  # a raised limit from materializing an unbounded set. Declared separately because a
+  # module attribute must exist before the function that reads it.
+  @project_ref_candidate_limit 100
+
+  @spec resolve_project_ref(Ecto.UUID.t(), term()) ::
+          {:ok, Project.t(), :slug | :normalized_slug | :repo_name}
+          | {:error, :not_found | :ambiguous}
+  def resolve_project_ref(tenant_id, ref) when is_binary(ref) do
+    case presence(ref) do
+      nil ->
+        {:error, :not_found}
+
+      trimmed ->
+        normalized = normalize_project_ref(trimmed)
+
+        with :error <- resolve_ref_by_slug(tenant_id, trimmed, :slug),
+             :error <- resolve_ref_by_normalized_slug(tenant_id, trimmed, normalized) do
+          resolve_ref_by_repo_name(tenant_id, normalized)
+        end
+    end
+  end
+
+  def resolve_project_ref(_tenant_id, _ref), do: {:error, :not_found}
+
+  defp resolve_ref_by_slug(tenant_id, slug, matched_by) do
+    case AdminRepo.get_by(Project, slug: slug, tenant_id: tenant_id) do
+      nil -> :error
+      project -> {:ok, project, matched_by}
+    end
+  end
+
+  # Skipped when normalization is a no-op, so the identical lookup is not run twice.
+  defp resolve_ref_by_normalized_slug(_tenant_id, same, same), do: :error
+  defp resolve_ref_by_normalized_slug(_tenant_id, _trimmed, ""), do: :error
+
+  defp resolve_ref_by_normalized_slug(tenant_id, _trimmed, normalized),
+    do: resolve_ref_by_slug(tenant_id, normalized, :normalized_slug)
+
+  defp resolve_ref_by_repo_name(_tenant_id, ""), do: {:error, :not_found}
+
+  defp resolve_ref_by_repo_name(tenant_id, normalized) do
+    # Bounded by the tenant's project count (max_projects defaults to 50) and capped
+    # again here; the basename comparison is on the NORMALIZED form, which no SQL
+    # predicate can express, so the narrowing happens in Elixir over a small set.
+    Project
+    |> where([p], p.tenant_id == ^tenant_id and not is_nil(p.repo_url))
+    |> where([p], p.status == :active)
+    |> order_by([p], asc: p.inserted_at)
+    |> limit(@project_ref_candidate_limit)
+    |> AdminRepo.all()
+    |> Enum.filter(fn project ->
+      normalize_project_ref(repo_basename(project.repo_url)) == normalized
+    end)
+    |> case do
+      [project] -> {:ok, project, :repo_name}
+      [] -> {:error, :not_found}
+      [_ | _] -> {:error, :ambiguous}
+    end
+  end
+
+  # The transform between a repo DIRECTORY name and this app's slug format
+  # (lowercase alphanumeric + hyphens, per `Project.create_changeset/2`).
+  defp normalize_project_ref(nil), do: ""
+
+  defp normalize_project_ref(value) when is_binary(value) do
+    value
+    |> String.trim()
+    |> String.downcase()
+    |> String.replace(~r/[^a-z0-9]+/u, "-")
+    |> String.trim("-")
+  end
+
+  # Trailing path segment of a repo URL / ssh spec / bare owner/repo, ".git" stripped.
+  defp repo_basename(nil), do: nil
+
+  defp repo_basename(url) when is_binary(url) do
+    url
+    |> normalize_repo_url()
+    |> String.split(~r{[/:]}, trim: true)
+    |> List.last()
+  end
+
+  @doc """
   Resolves a project within a tenant from one or more identifiers.
 
   Intended as the single cheap call the harness uses to turn "I'm working in

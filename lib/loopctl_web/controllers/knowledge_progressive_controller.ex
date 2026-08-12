@@ -21,6 +21,7 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
+  alias LoopctlWeb.Helpers.BodyWindow
   alias LoopctlWeb.Helpers.Visibility
 
   action_fallback LoopctlWeb.FallbackController
@@ -245,6 +246,24 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
         type: :string,
         description: "Article UUID to drill into.",
         required: true
+      ],
+      body_max_bytes: [
+        in: :query,
+        type: :integer,
+        required: false,
+        description:
+          "Serialized-body byte budget (default #{LoopctlWeb.ArticleJSON.article_body_byte_budget()}). " <>
+            "`0` returns the whole body. The response carries `body_bytes`, `body_offset`, " <>
+            "`body_returned_bytes`, `body_truncated` and `next_body_offset` so a truncated " <>
+            "read can be continued rather than discarded."
+      ],
+      body_offset: [
+        in: :query,
+        type: :integer,
+        required: false,
+        description:
+          "Byte offset to start the body window at (default 0). Pass the previous " <>
+            "response's `next_body_offset` to continue."
       ]
     ],
     responses: %{
@@ -265,7 +284,7 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
   )
 
   @doc "GET /api/v1/knowledge/progressive/:id"
-  def drill(conn, %{"id" => article_id}) do
+  def drill(conn, %{"id" => article_id} = params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
     api_key_id = conn.assigns.current_api_key.id
 
@@ -279,7 +298,16 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
 
     with {:ok, article} <-
            Knowledge.progressive_drill(tenant_id, article_id, opts) do
-      json(conn, %{data: LoopctlWeb.ArticleJSON.article_data(article)})
+      # Same serialized-body window as ArticleController.show (#652 item 4). A drill is
+      # the DOCUMENTED way to follow an index, so leaving it unbounded would put the
+      # oversized-read failure back on the path the docs send people down — the same
+      # counted/uncounted split #572 had to undo.
+      data =
+        article
+        |> LoopctlWeb.ArticleJSON.article_data()
+        |> LoopctlWeb.ArticleJSON.apply_body_window(BodyWindow.parse(params))
+
+      json(conn, %{data: data})
     end
   end
 
