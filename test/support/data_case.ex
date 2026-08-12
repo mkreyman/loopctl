@@ -41,6 +41,7 @@ defmodule Loopctl.DataCase do
   end
 
   setup tags do
+    if tags[:vacuum_vector_indexes], do: Loopctl.DataCase.vacuum_vector_indexes()
     Loopctl.DataCase.setup_sandbox(tags)
     Mox.set_mox_from_context(tags)
     stub_all_defaults()
@@ -49,6 +50,59 @@ defmodule Loopctl.DataCase do
     # Setup runs in the test process, so `Process.get(:test_vec_axis)` at insert time sees it.
     Process.put(:test_vec_axis, System.unique_integer([:positive]))
     :ok
+  end
+
+  # Tables carrying a pgvector HNSW index. Vacuuming these is what removes dead index
+  # entries from the graph; the two side tables are where the flake actually bit, and the
+  # two legacy ones carry indexes over the pre-cutover `embedding` columns.
+  @vector_tables ~w(article_embeddings memory_embeddings articles memories)
+
+  @doc """
+  Removes dead pgvector HNSW entries left in the shared index graph by rolled-back tests
+  (#645). Opt in per module with `@moduletag :vacuum_vector_indexes`.
+
+  ## Why a test suite has to do this at all
+
+  Sandbox rolls back every test, and a rolled-back INSERT leaves its HNSW entry in the
+  graph until vacuum. A row inserted afterwards links to its nearest neighbours — which by
+  then are all DEAD elements — and pgvector's scan SKIPS dead elements rather than
+  traversing through them. The live row ends up UNREACHABLE from the graph entry point, so
+  an ANN read returns NOTHING while a `count()` on the same connection shows the row
+  present. That is the long-running `left: []` flake, reproduced deterministically in
+  `test/loopctl/embeddings/hnsw_dead_entry_recall_test.exs`.
+
+  It is a REACHABILITY failure, not a breadth one, which is why `hnsw.ef_search`,
+  `hnsw.iterative_scan` and exact-scan forcing each failed to fix it: measured in that
+  file, the read still returns `[]` under `relaxed_order` AND under `ef_search = 1000`.
+  Vacuuming is the only thing that repairs the graph, and it repairs it completely — the
+  same poisoned index answers correctly immediately afterwards.
+
+  Production is not affected: its rows are committed, so its graph is not made of dead
+  entries.
+
+  Runs unboxed (VACUUM cannot run inside a transaction) and never fails a test: a vacuum
+  that cannot run leaves the suite exactly as flaky as it was before, which is a worse
+  outcome to hide behind an exception than to carry on with.
+  """
+  @spec vacuum_vector_indexes() :: :ok
+  def vacuum_vector_indexes do
+    Sandbox.unboxed_run(Loopctl.AdminRepo, fn ->
+      for table <- @vector_tables do
+        Loopctl.AdminRepo.query!("VACUUM (INDEX_CLEANUP ON) #{table}", [])
+      end
+    end)
+
+    :ok
+  rescue
+    error ->
+      require Logger
+
+      Logger.warning(
+        "vacuum_vector_indexes failed (#{inspect(error.__struct__)}) — ANN recall in this " <>
+          "module is unprotected against dead HNSW entries (#645)"
+      )
+
+      :ok
   end
 
   @doc """
