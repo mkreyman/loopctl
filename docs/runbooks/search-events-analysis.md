@@ -20,11 +20,21 @@ Three columns cannot be filled by the client and are wrong or null until this ru
   un-enriched `client_kind` is not caller-level truth** — do not compute a per-kind rate
   from one.
 
+The task writes through `AdminRepo`, so point `DATABASE_URL` at prod first — same recipe as
+step 1 below, via the `fly-mpg-connect` skill:
+
 ```bash
+flyctl proxy 15432:5432 -a ecf-postgres &          # loopctl's database is named `loopctl`
+export DATABASE_URL=postgres://<user>:<pass>@localhost:15432/loopctl
+
 # on each dev machine that runs agents (transcripts never leave the machine)
 mix loopctl.enrich_search_events --dry-run          # see what would change
 mix loopctl.enrich_search_events --since-days 45    # then write
 ```
+
+Run it on EVERY machine that runs agents, not just one. The task only answers rows whose
+`client_host` is the machine you are on (see below), so another machine's rows stay null
+until you run it there.
 
 It joins on `(client_session_id, query)`, because a subagent's transcript records its
 PARENT's session id — see `Loopctl.Knowledge.SearchEventEnrichment` for why the pair is
