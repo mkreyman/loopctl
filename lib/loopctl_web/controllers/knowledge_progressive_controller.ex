@@ -22,6 +22,7 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias LoopctlWeb.Helpers.BodyWindow
+  alias LoopctlWeb.Helpers.SearchTelemetry
   alias LoopctlWeb.Helpers.Visibility
 
   action_fallback LoopctlWeb.FallbackController
@@ -102,14 +103,24 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
         |> maybe_add_limit(params["limit"])
         |> Keyword.merge(Visibility.scope_opts(conn))
 
-      case Knowledge.progressive_index(tenant_id, coerce_topic(params["topic"]), opts) do
+      topic = coerce_topic(params["topic"])
+      started_at = System.monotonic_time(:millisecond)
+
+      case Knowledge.progressive_index(tenant_id, topic, opts) do
         {:ok, result} ->
+          record_attempt(conn, topic, started_at, %{
+            result_count: length(Map.get(result, :results, [])),
+            total_count: Map.get(result, :candidate_count)
+          })
+
           json(conn, LoopctlWeb.KnowledgeProgressiveJSON.index(result))
 
         {:error, :empty_query} ->
+          record_rejected(conn, topic, started_at, "empty_query")
           {:error, :bad_request, "Query parameter 'topic' is required and cannot be empty"}
 
         {:error, :bad_request, msg} ->
+          record_rejected(conn, topic, started_at, rejection_reason(msg))
           {:error, :bad_request, msg}
       end
     end
@@ -353,4 +364,51 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
 
   defp maybe_add_limit(opts, value) when is_integer(value), do: [{:limit, max(value, 1)} | opts]
   defp maybe_add_limit(opts, _), do: opts
+
+  # `progressive_index` is a SEARCH, and until #666's follow-up it was the one search-shaped
+  # surface that recorded nothing at all. That is backwards from what the table is for: its
+  # sibling `progressive_drill` is a READ, already covered by `article_access_events`, while
+  # a progressive_index MISS is invisible everywhere else — and a miss is this surface's
+  # documented weakness, since a paraphrased topic can fail to reach a lexically dissimilar
+  # article. `_skip_record_access: true` on the inner `search_keyword/3` call suppresses the
+  # SEED search so it is not counted as its own query; this records the OUTER attempt, whose
+  # result_count is the top-K the caller actually received.
+  defp record_attempt(conn, topic, started_at, attrs) do
+    SearchTelemetry.record_attempt(
+      conn,
+      Map.merge(
+        %{
+          query: topic,
+          tool: "knowledge_progressive_index",
+          mode_requested: "progressive",
+          mode_used: "progressive",
+          duration_ms: System.monotonic_time(:millisecond) - started_at
+        },
+        attrs
+      )
+    )
+  end
+
+  defp record_rejected(conn, topic, started_at, reason) do
+    record_attempt(conn, topic, started_at, %{
+      rejected?: true,
+      rejection_reason: reason,
+      result_count: 0
+    })
+  end
+
+  # Coarse on purpose, matching the sibling controllers: the question this answers is WHICH
+  # CLASS of malformed call agents keep making, not a per-message taxonomy.
+  #
+  # No catch-all clause, for the same reason KnowledgeHybridSearchController states: dialyzer
+  # proves every rejection this action can produce is a binary message, so a fallback clause
+  # would be unreachable code that reads like a safety net. The `true ->` branch inside the
+  # cond IS the safety net.
+  defp rejection_reason(msg) when is_binary(msg) do
+    cond do
+      String.contains?(msg, "category") -> "invalid_category"
+      String.contains?(msg, "limit") -> "invalid_limit"
+      true -> "bad_request"
+    end
+  end
 end
