@@ -15,6 +15,7 @@ import os from "node:os";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import path, { dirname, join } from "node:path";
+import { applyArgAliases } from "./lib/arg-aliases.js";
 import {
   projectsPath,
   ingestionJobsPath,
@@ -6939,7 +6940,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+  const { name } = request.params;
+  const args = applyArgAliases(request.params.arguments);
 
   switch (name) {
     // Project Tools
