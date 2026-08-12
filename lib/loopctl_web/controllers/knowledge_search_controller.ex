@@ -72,6 +72,16 @@ defmodule LoopctlWeb.KnowledgeSearchController do
         description: "Search mode: keyword, semantic, or combined (default: combined)",
         required: false
       ],
+      format: [
+        in: :query,
+        type: :string,
+        description:
+          "Response shape: results (default, ranked results + snippets), stubs (capped " <>
+            "stubs with hub enrichment, for surveying a topic without pulling bodies), or " <>
+            "bodies (full bodies + linked references). stubs and bodies require a query " <>
+            "and do not support cursor pagination. An unknown value is a 400.",
+        required: false
+      ],
       project_id: [
         in: :query,
         type: :string,
@@ -342,6 +352,7 @@ defmodule LoopctlWeb.KnowledgeSearchController do
     api_key = conn.assigns.current_api_key
 
     with {:ok, query_spec} <- resolve_query(params),
+         {:ok, format} <- validate_format(params),
          {:ok, mode} <- validate_mode(params),
          :ok <- validate_search_limit(params, query_spec),
          :ok <- validate_include_body(params),
@@ -376,7 +387,7 @@ defmodule LoopctlWeb.KnowledgeSearchController do
       #   - param malformed   → 400 (not a string)
       case keyset_cursor(params) do
         :none ->
-          run_search(conn, tenant_id, query_spec, mode, opts)
+          run_in_format(conn, tenant_id, query_spec, mode, opts, format)
 
         :invalid ->
           {:error, :bad_request, "cursor parameter must be a string"}
@@ -443,6 +454,97 @@ defmodule LoopctlWeb.KnowledgeSearchController do
       String.contains?(msg, "cursor") -> "invalid_cursor"
       String.contains?(msg, "project_id") -> "invalid_project_id"
       true -> "bad_request"
+    end
+  end
+
+  # ONE search command, three response shapes (#670 follow-up).
+  #
+  # `progressive_index/3` and `get_context/3` are not different searches. The first calls
+  # `search_keyword/3` and then caps-and-stubs; the second is the combined search returning
+  # full bodies. Exposed as separate TOOLS they asked an agent to decide, per query, which
+  # door to knock on — and that decision is unobservable, so it confounds every measurement
+  # of the ranking behind them: you cannot tell an algorithm's effect from an agent's choice
+  # of entrypoint. A parameter is a variable we control; a tool choice is a confounder we do
+  # not.
+  #
+  # The existing tools/endpoints stay and are NOT retired — they now share this path.
+  #
+  #   results (default) — ranked results + snippets. Unchanged; the only shape that
+  #                       supports keyset pagination, which is why the dispatch sits on the
+  #                       `:none` cursor branch.
+  #   stubs             — capped stubs with hub enrichment, for surveying a broad topic
+  #                       without pulling bodies into context.
+  #   bodies            — full bodies plus linked references, for one deep read.
+  @formats ~w(results stubs bodies)
+
+  defp validate_format(params) do
+    case params["format"] do
+      nil -> {:ok, "results"}
+      value when value in @formats -> {:ok, value}
+      _other -> {:error, :bad_request, "format must be one of: #{Enum.join(@formats, ", ")}"}
+    end
+  end
+
+  defp run_in_format(conn, tenant_id, query_spec, mode, opts, "results"),
+    do: run_search(conn, tenant_id, query_spec, mode, opts)
+
+  defp run_in_format(conn, tenant_id, query_spec, _mode, opts, format) do
+    case search_text(query_spec) do
+      nil ->
+        # The shaped formats are relevance shapes; there is no stub or body rendering of an
+        # enumeration page, and silently returning the ranked shape instead would answer a
+        # different question than the one asked.
+        {:error, :bad_request, "format=#{format} requires a query"}
+
+      query ->
+        shaped_result(conn, tenant_id, query, opts, format)
+    end
+  end
+
+  defp shaped_result(conn, tenant_id, query, opts, "stubs") do
+    case Knowledge.progressive_index(tenant_id, query, opts) do
+      {:ok, result} ->
+        record_shaped_attempt(conn, query, opts, "progressive", length(result.stubs))
+        json(conn, LoopctlWeb.KnowledgeProgressiveJSON.index(result))
+
+      {:error, :empty_query} ->
+        {:error, :bad_request, "Query parameter 'q' is required and cannot be empty"}
+
+      {:error, :bad_request, msg} ->
+        {:error, :bad_request, msg}
+    end
+  end
+
+  defp shaped_result(conn, tenant_id, query, opts, "bodies") do
+    case Knowledge.get_context(tenant_id, query, opts) do
+      {:ok, result} ->
+        record_shaped_attempt(conn, query, opts, "context", length(result.results))
+        json(conn, LoopctlWeb.KnowledgeContextJSON.context(result))
+
+      {:error, :empty_query} ->
+        {:error, :bad_request, "Query parameter 'q' is required and cannot be empty"}
+    end
+  end
+
+  # Attributed to `knowledge_search`, because that is the tool the caller used — the shape is
+  # a PARAMETER of this command, not a different surface. Recording it as the sibling tool
+  # would split one command's traffic across three names and undo the very comparability the
+  # parameter exists to create. The shape rides in `mode_used`.
+  defp record_shaped_attempt(conn, query, opts, mode, result_count) do
+    SearchTelemetry.record_attempt(conn, %{
+      query: query,
+      tool: "knowledge_search",
+      mode_requested: Keyword.get(opts, :_mode_requested),
+      mode_used: mode,
+      result_count: result_count,
+      duration_ms: shaped_duration_ms(opts)
+    })
+  end
+
+  defp shaped_duration_ms(opts) do
+    case Keyword.get(opts, :_started_at) do
+      started when is_integer(started) -> System.monotonic_time(:millisecond) - started
+      _ -> nil
     end
   end
 
