@@ -1,11 +1,30 @@
 import Config
 
+# DEV_DB_NAME / DEV_DB_PORT exist for ONE caller: the Retrieval Eval CI job.
+#
+# That job runs MIX_ENV=dev on purpose -- `mix loopctl.retrieval.eval` opens its own
+# connections and config/test.exs puts all three repos behind the Sandbox, where a
+# non-checked-out process owns nothing and every query fails. So CI has to exercise
+# the dev config, and the dev config named `loopctl_dev` on localhost:5432 outright.
+#
+# On nuc that was safe and the workflow said so: "loopctl_dev, which Mark confirmed
+# is disposable on nuc". It stopped being true the moment the runners moved back to
+# beelink, where `loopctl_dev` on 5432 is Mark's REAL development database -- and the
+# job does not merely read it. It runs `mix ecto.create && mix ecto.migrate` and
+# GRANTs roles, so every CI run would apply the branch's migrations to live dev data.
+#
+# Defaults are the historical values, so a developer who sets neither variable sees
+# no change at all.
+db_name = System.get_env("DEV_DB_NAME", "loopctl_dev")
+db_port = String.to_integer(System.get_env("DEV_DB_PORT", "5432"))
+
 # Configure your database
 config :loopctl, Loopctl.Repo,
   username: "postgres",
   password: "postgres",
   hostname: "localhost",
-  database: "loopctl_dev",
+  port: db_port,
+  database: db_name,
   stacktrace: true,
   show_sensitive_data_on_connection_error: true,
   pool_size: 10
@@ -15,7 +34,8 @@ config :loopctl, Loopctl.AdminRepo,
   username: "postgres",
   password: "postgres",
   hostname: "localhost",
-  database: "loopctl_dev",
+  port: db_port,
+  database: db_name,
   stacktrace: true,
   show_sensitive_data_on_connection_error: true,
   pool_size: 3
@@ -29,7 +49,8 @@ config :loopctl, Loopctl.HeavyReadRepo,
   username: "postgres",
   password: "postgres",
   hostname: "localhost",
-  database: "loopctl_dev",
+  port: db_port,
+  database: db_name,
   stacktrace: true,
   show_sensitive_data_on_connection_error: true,
   pool_size: 3
