@@ -695,6 +695,128 @@ defmodule Loopctl.KnowledgeTest do
 
   # --- TC-19.3.4: Get article preloads outgoing and incoming links ---
 
+  describe "get_article/3 unique-prefix resolution (#652)" do
+    # 16 of 20 sampled knowledge_get 404s carried a correct 8-char prefix with a
+    # confabulated tail. Each shape below is one of those observed shapes.
+    setup do
+      %{tenant: tenant} = setup_tenant()
+
+      {:ok, article} =
+        Knowledge.create_article(tenant.id, %{
+          title: "Prefix Target",
+          body: "Body",
+          category: :pattern
+        })
+
+      %{tenant: tenant, article: article}
+    end
+
+    defp prefix8(id), do: String.slice(id, 0, 8)
+
+    test "resolves a zero-padded tail", %{tenant: tenant, article: article} do
+      requested = prefix8(article.id) <> "-0000-0000-0000-000000000000"
+      refute requested == article.id
+
+      assert {:ok, found} = Knowledge.get_article(tenant.id, requested)
+      assert found.id == article.id
+    end
+
+    test "resolves a bare 8-character prefix", %{tenant: tenant, article: article} do
+      assert {:ok, found} = Knowledge.get_article(tenant.id, prefix8(article.id))
+      assert found.id == article.id
+    end
+
+    test "resolves a plausible-but-wrong full UUID sharing the prefix",
+         %{tenant: tenant, article: article} do
+      requested = prefix8(article.id) <> "-4fc1-48be-9999-999999999999"
+      refute requested == article.id
+
+      assert {:ok, found} = Knowledge.get_article(tenant.id, requested)
+      assert found.id == article.id
+    end
+
+    test "an exact id still wins over the prefix path", %{tenant: tenant, article: article} do
+      assert {:ok, found} = Knowledge.get_article(tenant.id, article.id)
+      assert found.id == article.id
+    end
+
+    test "too short a prefix does not resolve", %{tenant: tenant, article: article} do
+      assert {:error, :not_found} =
+               Knowledge.get_article(tenant.id, String.slice(article.id, 0, 6))
+    end
+
+    test "a non-hex value is :not_found, never a CastError", %{tenant: tenant} do
+      assert {:error, :not_found} = Knowledge.get_article(tenant.id, "not-an-article-id")
+      assert {:error, :not_found} = Knowledge.get_article(tenant.id, "zzzzzzzz")
+    end
+
+    test "another tenant's article never resolves by prefix" do
+      %{tenant: tenant_a} = setup_tenant()
+      %{tenant: tenant_b} = setup_tenant()
+
+      {:ok, theirs} =
+        Knowledge.create_article(tenant_b.id, %{
+          title: "Their Article",
+          body: "Body",
+          category: :pattern
+        })
+
+      assert {:error, :not_found} = Knowledge.get_article(tenant_a.id, prefix8(theirs.id))
+    end
+
+    test "an ambiguous prefix refuses rather than guessing", %{tenant: tenant} do
+      # Two articles forced to share an 8-hex prefix: the fallback must return
+      # :not_found, never one of them.
+      prefix = "abcd1234"
+      one = Ecto.UUID.generate()
+      two = Ecto.UUID.generate()
+
+      {:ok, a} =
+        Knowledge.create_article(tenant.id, %{title: "Amb One", body: "B", category: :pattern})
+
+      {:ok, b} =
+        Knowledge.create_article(tenant.id, %{title: "Amb Two", body: "B", category: :pattern})
+
+      new_a = prefix <> String.slice(one, 8, 28)
+      new_b = prefix <> String.slice(two, 8, 28)
+
+      AdminRepo.update_all(
+        from(x in Article, where: x.id == ^a.id),
+        set: [id: new_a]
+      )
+
+      AdminRepo.update_all(
+        from(x in Article, where: x.id == ^b.id),
+        set: [id: new_b]
+      )
+
+      assert {:error, :not_found} = Knowledge.get_article(tenant.id, prefix)
+    end
+
+    test "emits telemetry naming the id the caller actually sent",
+         %{tenant: tenant, article: article} do
+      :telemetry.attach(
+        "article-prefix-resolved-test",
+        Loopctl.TelemetryEvents.article_prefix_resolved(),
+        fn event, measurements, metadata, pid ->
+          send(pid, {:telemetry, event, measurements, metadata})
+        end,
+        self()
+      )
+
+      on_exit(fn -> :telemetry.detach("article-prefix-resolved-test") end)
+
+      requested = prefix8(article.id) <> "-0000-0000-0000-000000000000"
+      {:ok, _} = Knowledge.get_article(tenant.id, requested)
+
+      assert_receive {:telemetry, [:loopctl, :knowledge, :article_prefix_resolved], %{count: 1},
+                      metadata}
+
+      assert metadata.requested == requested
+      assert metadata.article_id == article.id
+    end
+  end
+
   describe "get_article/2" do
     test "preloads outgoing links with target articles and incoming links with source articles" do
       %{tenant: tenant} = setup_tenant()

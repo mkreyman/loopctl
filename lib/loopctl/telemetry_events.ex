@@ -56,6 +56,17 @@ defmodule Loopctl.TelemetryEvents do
   def project_ref_resolved, do: [:loopctl, :project_id, :ref_resolved]
 
   @doc """
+  An article read that missed on the exact id was rescued by UNIQUE PREFIX
+  resolution (#652).
+
+  Metadata: `%{tenant_id, article_id, requested}` — `requested` is the id the caller
+  actually sent, so the confabulation shapes (zero-padded tail, bare prefix, plausible
+  wrong UUID) stay countable. Every emission is one knowledge read that used to be a
+  404 after a search had already found the article.
+  """
+  def article_prefix_resolved, do: [:loopctl, :knowledge, :article_prefix_resolved]
+
+  @doc """
   A vector-search read under-filled (US-27.6b): it returned fewer than the
   requested `k` candidates AND above-threshold (near) neighbors the inner ANN
   surfaced were hidden by the already-linked anti-join — `above_threshold >
