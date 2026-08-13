@@ -303,6 +303,29 @@ jobs:
         env:
           DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
 
+      # Drop this run's database the moment the job ends, pass OR fail.
+      #
+      # Nothing dropped these. `infra-ci-db-reap` sweeps them on a 2-day retention,
+      # which made a backstop into the primary mechanism -- 440 live databases on the
+      # CI instance on 2026-08-12, each waiting up to two days for a sweep that only
+      # exists because this step did not. There was never a rationale for keeping
+      # them; it was an omission.
+      #
+      # The reaper STAYS: a cancelled or killed job never reaches its own cleanup, so
+      # end-of-job dropping cannot be the only mechanism. Backstop second, not first.
+      #
+      # One database covers all three repos -- Repo, AdminRepo and HeavyReadRepo all
+      # resolve to `loopctl_test${MIX_TEST_PARTITION}`.
+      #
+      # `if: always()` because a FAILED suite strands a database exactly like a
+      # passing one. Best-effort, so a cleanup problem cannot turn a green run red.
+      - name: Drop this run's test database
+        if: always()
+        run: |
+          db="loopctl_test${MIX_TEST_PARTITION}"
+          dropdb --if-exists -h localhost -p "${PGPORT}" -U postgres "$db" 2>&1 || true
+          echo "cleanup: dropped ${db} (best effort)"
+
   retrieval-eval:
     name: Retrieval Eval
     runs-on: [self-hosted, beelink]
