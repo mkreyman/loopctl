@@ -490,6 +490,20 @@ jobs:
           exit "$status"
         timeout-minutes: 15
 
+      # This job builds its OWN database (DEV_DB_NAME, run-scoped) and never dropped
+      # it. The drop step added for `test` covered only the ExUnit database, so every
+      # eval run left a `loopctl_ci_eval_<run id>` behind on the shared CI instance
+      # for the reaper to find two days later.
+      #
+      # Same shape as the miss in ecommerce-friendly#101: the port and the run-scoped
+      # NAME were applied to every database-creating job, the DROP to only one, and
+      # the gap is invisible in a diff -- it shows up as a count on the server.
+      - name: Drop this run's eval database
+        if: always()
+        run: |
+          dropdb --if-exists -h localhost -p "${PGPORT}" -U postgres "${DEV_DB_NAME}" 2>&1 || true
+          echo "cleanup: dropped ${DEV_DB_NAME} (best effort)"
+
   security:
     name: Security
     runs-on: [self-hosted, beelink]
