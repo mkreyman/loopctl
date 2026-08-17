@@ -152,13 +152,24 @@ run `:incomparable`: `question_set_changed?/1` compares the question-id SET and 
 rather than letting an unmatched question read as a non-regression. So the baseline has to be
 regenerated whenever the question set changes.
 
-**Do it in CI, not locally**, and not for the reason it first appears. The eval's vectors are
-deterministic functions of the committed text, so no embedding provider is involved. The
-difference is the CORPUS: the CI job seeds a fresh database, while a developer's dev DB
-carries whatever else it has accumulated. Measured 2026-08-12 on the same commit — CI scored
-`mrr 0.746 / answered 22 of 26`; a local run of the same command scored `0.192 / 5 of 26`. A
-baseline captured locally bakes one machine's private database into a deploy gate for
-everyone.
+**Either CI or a local run is fine — what must match is the Postgres MAJOR.** The eval's
+vectors are deterministic functions of the committed text, so no embedding provider is
+involved, and the corpus cannot vary either: the task mints a THROWAWAY TENANT and
+`search_combined/3` is tenant-scoped, so a developer's accumulated dev rows are invisible to
+it. The one real cross-environment variable is Postgres `english` FTS stemming and
+`ts_rank_cd`, which are stable within a PG major and can shift across one — so re-baseline on
+pg16, matching CI's `pgvector/pgvector:pg16`. See `retrieval_eval.md`.
+
+**This paragraph previously said the opposite** — "do it in CI, not locally", because "CI
+scored `mrr 0.746 / answered 22 of 26`; a local run of the same command scored
+`0.192 / 5 of 26`". Those two figures are not CI vs local: they are the **embeddings** and
+**keyword_only ARMS** of the same `--mode both` run on golden_v2, which scores exactly
+0.7463/22 and 0.1923/5. Disproved directly on 2026-08-17: a golden_v3 baseline regenerated
+LOCALLY on pg16 was reproduced by CI to three decimals on both arms (`delta=+0.000` for
+mrr, ndcg@5, ndcg@10 and answered@5). Recorded rather than deleted because the claim cost a
+CI round-trip per re-baseline and would have been re-derived from the same misreading.
+
+The CI path remains available and is the better choice when you do not have a pg16 to hand:
 
 ```bash
 gh workflow run CI --ref <your-branch> -f regenerate_retrieval_baseline=true
