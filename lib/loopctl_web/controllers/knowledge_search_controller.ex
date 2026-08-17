@@ -40,7 +40,16 @@ defmodule LoopctlWeb.KnowledgeSearchController do
     summary: "Search knowledge articles",
     description:
       "Unified search endpoint supporting keyword, semantic, and combined modes. " <>
-        "Returns article metadata with scores and snippets (max 300 chars). " <>
+        "Returns article metadata with scores and snippets (max 300 chars). EVERY result " <>
+        "now carries a `snippet` plus a `snippet_source`: `highlight` when the KEYWORD " <>
+        "lane matched (a `ts_headline` fragment, marking matched terms with **term** and " <>
+        "able to open mid-sentence), or `lead` when it did not (an extract of the " <>
+        "article's own opening prose, skipping banners/headings/bullets). Previously the " <>
+        "key was simply ABSENT on a semantic-only hit — so the results the query did not " <>
+        "lexically match, which is exactly what the semantic lane exists to find, were " <>
+        "the ones with nothing to explain them. Branch on `snippet_source` if you render " <>
+        "the two differently; never treat its absence as an error (it is absent only " <>
+        "when there is no snippet at all). " <>
         "No full body is returned. Combined mode is the default and falls back to " <>
         "keyword-only if embedding generation fails. " <>
         "`q` is optional when `tags` and/or `category` are supplied: in that " <>

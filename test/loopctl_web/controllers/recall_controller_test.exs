@@ -97,9 +97,14 @@ defmodule LoopctlWeb.RecallControllerTest do
       # result map's internal scoring fields, status, tenant_id, project_id, timestamps.
       know_item = Enum.find(know_data, &(&1["id"] == article.id))
 
+      # `snippet_source` rides along deliberately: /recall is what the injected recall hook
+      # renders, and a `ts_headline` highlight (carrying **term** markers, able to open
+      # mid-sentence) reads very differently from a lead extract of the article's own
+      # opening prose. The hook cannot render them appropriately without being told which
+      # it has.
       assert Map.keys(know_item)
              |> Enum.sort()
-             |> Enum.all?(&(&1 in ~w(id title category tags score snippet)))
+             |> Enum.all?(&(&1 in ~w(id title category tags score snippet snippet_source)))
 
       refute Map.has_key?(know_item, "tenant_id")
       refute Map.has_key?(know_item, "status")
