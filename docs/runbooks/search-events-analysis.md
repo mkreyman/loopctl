@@ -169,6 +169,50 @@ Cross-key attribution is circumstantial by construction — two agents in one te
 one article independently — which is why it is a separate labelled field rather than folded
 into `attributed_opens`.
 
+## 3c. Segmenting opens by entrypoint — and the join key that is not the primary key
+
+`origin_search_id` is what finally lets an open be attributed to the CHANNEL that surfaced
+it, because `client_entrypoint` lives on `search_events` and nothing on the read row carries
+it. The join is:
+
+```sql
+JOIN search_events se ON se.search_id = a.origin_search_id
+```
+
+**`search_events.search_id`, never `search_events.id`.** They are different columns: `id` is
+the row's primary key, `search_id` is the per-call correlation id the search site mints once
+and threads to BOTH the `search_events` row and every surfaced `article_access_events` row.
+Joining on `id` returns zero matches for every entrypoint, which reads exactly like "nothing
+follows through" — the failure that produced the withdrawn table in the retrieval plan's
+§3.1, made again on 2026-08-17 by the person who had just written that section. Sanity-check
+any such query with
+
+```sql
+SELECT count(*) FROM article_access_events a
+WHERE a.origin_search_id IS NOT NULL
+  AND NOT EXISTS (SELECT 1 FROM search_events se WHERE se.search_id = a.origin_search_id);
+```
+
+which must be 0. A non-zero count means retention has already pruned `search_events` (it is
+the shorter-lived table), not that attribution is broken — bound the window and re-run.
+
+### First traffic (v523, 2026-08-17 18:00-21:00 UTC)
+
+| entrypoint | tool | searches | searches opened | attribution of the opens |
+|---|---|---:|---:|---|
+| `hook` | `memory_recall` | 31 | 2 | 3 reads, ALL `cross_key` |
+| `cli` | `knowledge_search` | 6 | 3 | 3 reads, `same_key` |
+| `cli` | `knowledge_hybrid_search` | 6 | 2 | 2 reads, `same_key` |
+| `smoke` | `knowledge_search` | 14 | 0 | - |
+| `session-start` | `memory_recall` | 10 | 0 | - |
+
+Three hours is not a rate and must not be quoted as one. What it does establish is
+MECHANISM: every hook open is `cross_key` and every cli open is `same_key`, which is the
+predicted split, and it confirms the old same-key metric could not have counted a single one
+of the hook's. Also note `session-start` is now its own entrypoint rather than sitting inside
+`unattributed`; its queries are bare repo names by construction, so it belongs with `smoke`
+in the filter-me-out class, not with real traffic.
+
 ## 4. The trap
 
 Search returns; agents do not open. Search-to-read has sat near 27:1, and 1.74% of
