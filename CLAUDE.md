@@ -428,6 +428,7 @@ changes). Refactors, test fixes, and internal hardening stay out — `git log
 | roles, auth pipeline, story lifecycle (report / review-complete / verify), capability tokens, dispatch lineage, WebAuthn / human anchor, audit chain | `.claude/skills/chain-of-custody/SKILL.md` |
 | tenant scoping, RLS policies, migrations, new tables, the three repos, heavy/vector reads | `.claude/skills/tenancy-rls/SKILL.md` |
 | Knowledge Wiki, agent memory, context retriever, hybrid search, novelty gate, embeddings, KB curation permissions | `.claude/skills/knowledge-wiki/SKILL.md` |
+| Oban health in production — are the cron jobs firing, is a queue backed up, is a worker stuck | `.claude/skills/oban-health/SKILL.md` |
 
 ## MCP Server
 

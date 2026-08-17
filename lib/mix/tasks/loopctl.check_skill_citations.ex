@@ -224,8 +224,16 @@ defmodule Mix.Tasks.Loopctl.CheckSkillCitations do
   # Qualified: `foo.ex:12`, `foo/bar.ex:12-34`. Bare: `:12`, `:12-34` — these
   # inherit the file of the most recent qualified citation in the document
   # (`current`), which is exactly how the prose reads them.
+  #
+  # The leading `(?<!\w)` is load-bearing. The file half is OPTIONAL, so without it
+  # the bare form matches a `:NN` ANYWHERE in the line — including inside a clock time
+  # (`04:00` -> `:00`), a host:port (`127.0.0.1:15432`), or a port forward
+  # (`15432:5432`). Those reported as ":0: invalid citation range" against prose that
+  # contains no citation at all. A genuine bare citation always follows whitespace, a
+  # backtick, or an opening paren — never a word character — so requiring that is
+  # exact, not a heuristic.
   defp citations_in(line, current) do
-    ~r{(?:([\w./-]+\.exs?))?:(\d+)(?:-(\d+))?}
+    ~r{(?<!\w)(?:([\w./-]+\.exs?))?:(\d+)(?:-(\d+))?}
     |> Regex.scan(line)
     |> Enum.reduce({[], current}, fn match, {acc, current} ->
       {file, start_line, end_line} = parse_match(match)
