@@ -13,6 +13,34 @@ defmodule Loopctl.CheckSkillCitationsTest do
 
   alias Mix.Tasks.Loopctl.CheckSkillCitations
 
+  # Deliberately NOT ExUnit's `:tmp_dir` tag. That derives the directory from the
+  # TEST NAME, so any punctuation in the name lands in the absolute path these
+  # fixtures are then cited by — and the checker's path class is `[\w./-]`, which
+  # excludes a comma because a real citation never contains one. A test merely
+  # NAMED "a clock time, a host:port, or a port forward" therefore had its fixture
+  # path truncated at the first comma and failed as "no such file": the harness
+  # leaking into the assertion, so the test failed for its own name instead of for
+  # the behaviour it covers.
+  #
+  # Sanitizing here rather than widening the checker's path class, which would be a
+  # production-semantics change made to suit a test — with a comma admitted,
+  # `a.ex,b.ex:2` would resolve as one long filename instead of two citations.
+  # Names stay free-form; only the directory derived from them is normalized.
+  setup context do
+    slug =
+      context.test
+      |> Atom.to_string()
+      |> String.replace(~r/[^A-Za-z0-9]+/, "_")
+      |> String.slice(0, 100)
+
+    dir = Path.join(["tmp", "check_skill_citations", slug])
+    File.rm_rf!(dir)
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+
+    {:ok, tmp_dir: dir}
+  end
+
   @tmp_doc "citations_doc.md"
   @fixture_source """
   defmodule Fixture do
@@ -34,7 +62,6 @@ defmodule Loopctl.CheckSkillCitationsTest do
     assert Enum.all?(sources, &File.exists?/1)
   end
 
-  @tag :tmp_dir
   test "flags a citation whose line is past the end of the file", %{tmp_dir: tmp_dir} do
     src = write_fixture(tmp_dir)
     doc = write_doc(tmp_dir, "See `#{src}:9999999` for details.")
@@ -43,7 +70,6 @@ defmodule Loopctl.CheckSkillCitationsTest do
     assert problem =~ "has only"
   end
 
-  @tag :tmp_dir
   test "flags a citation whose named symbol is not defined in the cited range", %{
     tmp_dir: tmp_dir
   } do
@@ -54,7 +80,6 @@ defmodule Loopctl.CheckSkillCitationsTest do
     assert problem =~ "alpha"
   end
 
-  @tag :tmp_dir
   test "flags a citation to a file that does not exist", %{tmp_dir: tmp_dir} do
     doc = write_doc(tmp_dir, "See `no_such_module_here.ex:1`.")
 
@@ -62,7 +87,6 @@ defmodule Loopctl.CheckSkillCitationsTest do
     assert problem =~ "no such file"
   end
 
-  @tag :tmp_dir
   test "accepts a citation whose named symbol is defined in the cited range", %{tmp_dir: tmp_dir} do
     src = write_fixture(tmp_dir)
     doc = write_doc(tmp_dir, "`alpha/1` `#{src}:2-3` is the entry point.")
@@ -70,7 +94,6 @@ defmodule Loopctl.CheckSkillCitationsTest do
     assert CheckSkillCitations.check([doc]) == []
   end
 
-  @tag :tmp_dir
   test "finds a symbol named on the PRECEDING line when markdown wraps", %{tmp_dir: tmp_dir} do
     src = write_fixture(tmp_dir)
     doc = write_doc(tmp_dir, "The private `beta/1`\n(`#{src}:2-3`) is the guard.")
@@ -79,7 +102,6 @@ defmodule Loopctl.CheckSkillCitationsTest do
     assert problem =~ "beta"
   end
 
-  @tag :tmp_dir
   test "checks a BARE citation against the file of the last qualified citation", %{
     tmp_dir: tmp_dir
   } do
@@ -90,7 +112,6 @@ defmodule Loopctl.CheckSkillCitationsTest do
     assert problem =~ "has only"
   end
 
-  @tag :tmp_dir
   test "rejects an invalid citation range instead of slicing from the end", %{tmp_dir: tmp_dir} do
     src = write_fixture(tmp_dir)
 
@@ -102,7 +123,6 @@ defmodule Loopctl.CheckSkillCitationsTest do
     end
   end
 
-  @tag :tmp_dir
   test "reports a MISSING source document instead of silently skipping it", %{tmp_dir: tmp_dir} do
     missing = Path.join(tmp_dir, "gone.md")
 
@@ -110,7 +130,6 @@ defmodule Loopctl.CheckSkillCitationsTest do
     assert problem =~ "source document not found"
   end
 
-  @tag :tmp_dir
   test "reports checked/skipped coverage counts", %{tmp_dir: tmp_dir} do
     src = write_fixture(tmp_dir)
     doc = write_doc(tmp_dir, "(`:12`) then `#{src}:2` and (`:3`).")
@@ -118,15 +137,13 @@ defmodule Loopctl.CheckSkillCitationsTest do
     assert {[], %{checked: 2, skipped: 1}} = CheckSkillCitations.check_with_stats([doc])
   end
 
-  @tag :tmp_dir
   test "resolves a root-level basename such as mix.exs", %{tmp_dir: tmp_dir} do
     doc = write_doc(tmp_dir, "The precommit alias lives in `mix.exs:1`.")
 
     assert CheckSkillCitations.check([doc]) == []
   end
 
-  @tag :tmp_dir
-  test "does not read a clock time or host port as a bare citation", %{
+  test "does not read a clock time, host:port, or port forward as a bare citation", %{
     tmp_dir: tmp_dir
   } do
     src = write_fixture(tmp_dir)
@@ -144,8 +161,7 @@ defmodule Loopctl.CheckSkillCitationsTest do
     assert {[], %{checked: 1, skipped: 0}} = CheckSkillCitations.check_with_stats([doc])
   end
 
-  @tag :tmp_dir
-  test "still reads a genuine bare citation after a backtick or paren", %{
+  test "still reads a genuine bare citation after a backtick, space or paren", %{
     tmp_dir: tmp_dir
   } do
     src = write_fixture(tmp_dir)
