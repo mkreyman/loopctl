@@ -107,6 +107,52 @@ defmodule Loopctl.ObanPluginsConfigTest do
     end
   end
 
+  describe "DraftDuplicateSweepWorker crontab entry" do
+    setup do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+
+      {Oban.Plugins.Cron, cron_opts} =
+        Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      entry =
+        Enum.find(cron_opts[:crontab], fn
+          {_schedule, Loopctl.Workers.DraftDuplicateSweepWorker} -> true
+          {_schedule, Loopctl.Workers.DraftDuplicateSweepWorker, _opts} -> true
+          _ -> false
+        end)
+
+      %{entry: entry, crontab: cron_opts[:crontab]}
+    end
+
+    test "the DraftDuplicateSweepWorker entry exists in the crontab", %{entry: entry} do
+      assert entry,
+             "expected a DraftDuplicateSweepWorker crontab entry that drains the draft " <>
+               "queue of published-duplicate holds"
+    end
+
+    test "it runs weekly and fans out across all tenants", %{entry: entry} do
+      assert elem(entry, 0) == "50 5 * * 0"
+      assert {_schedule, _worker, opts} = entry
+      assert opts[:args] == %{"mode" => "all_tenants"}
+    end
+
+    test "it does not collide with the Sunday KnowledgeMoc fan-out", %{
+      entry: entry,
+      crontab: crontab
+    } do
+      # Both target the shared :knowledge lane on a Sunday. The sweep is deliberately
+      # scheduled AFTER the MOC pass rather than at the same minute, so a wide MOC
+      # fan-out is not competing with the sweep for the same queue slots.
+      moc =
+        Enum.find(crontab, fn tuple ->
+          elem(tuple, 1) == Loopctl.Workers.KnowledgeMocWorker
+        end)
+
+      assert moc, "expected a KnowledgeMocWorker crontab entry to compare against"
+      refute elem(entry, 0) == elem(moc, 0)
+    end
+  end
+
   describe "#249: inert KB crons are PARKED by default" do
     setup do
       plugins = Application.get_env(:loopctl, Oban)[:plugins]
