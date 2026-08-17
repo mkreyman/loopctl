@@ -136,6 +136,9 @@ Rules the loader ENFORCES (it raises rather than silently scoring fewer question
 * `graded` values are integers 0..3 and refer to docs in that corpus. A relevant doc with
   no explicit grade defaults to 1.
 * `category` is one of `Loopctl.Knowledge.Categories.all/0`.
+* `links` (optional) endpoints are both in that question's own corpus, are never equal, and
+  never repeat the same `{from, to, type}` triple; `type` is one of the five `ArticleLink`
+  relationship types. See the multi-hop section below for when to add them.
 
 Write questions the way an agent actually asks them, and give each one plausible
 distractors — a corpus where only the answer shares any vocabulary with the question
@@ -226,6 +229,48 @@ Three of the distilled forms also exposed defects in the distiller's stop list, 
 they are worth reading individually rather than only in aggregate: `http`, `not` and `back`
 are all stop-listed, so "which **http** client should a new integration use" distils to
 "client new integration", and "prove it was **not** rewritten" to "prove rewritten".
+
+## Multi-hop questions: is the graph lane worth its read? (golden_v4)
+
+A question carries an optional `links` list of `{"from": doc_id, "to": doc_id, "type": ...}`
+edges (type defaults to `relates_to`), seeded as real `article_links` rows alongside its
+corpus. Both endpoints must be in that question's own corpus; a `corpus_ref` pair inherits
+its owner's edges along with the corpus, so a pair still differs in the QUERY and nothing
+else.
+
+**Why it exists.** #470 shipped the RRF graph-neighbour lane behind a flag and defaulted it
+OFF, and it stayed off for months because it could not be judged: the eval seeded no edges at
+all, so the lane was a strict no-op here and a lane-on run returned `delta = 0.000`. An
+uninformative delta reads as "harmless" and is not a result. Four multi-hop questions
+(`q-mh-*`) now put the relevant document on the FAR side of an edge, unreachable from the
+query text, so a lane-off run scores them near zero by construction — which is the point.
+
+**Running the experiment.**
+
+```bash
+mix loopctl.retrieval.eval --mode both --no-graph-lane --json > off.json
+mix loopctl.retrieval.eval --mode both --graph-lane   --json > on.json
+mix loopctl.retrieval.eval --mode embeddings --graph-lane --graph-weight 0.10   # sweep
+```
+
+Compare the two runs to EACH OTHER, never a lane-on run to the committed baseline — the
+baseline is recorded under the shipped default, so that comparison would attribute the
+config change to the code change. Three things to know before reading the output:
+
+- **The keyword-only arm cannot move.** The lane lives in the branch where BOTH keyword and
+  semantic succeeded, so `--mode keyword_only` is a no-op. In production that also means an
+  embedding outage silently disables graph expansion.
+- **Read `answered` and `recall`, not MRR alone.** The lane's whole claim is that it makes
+  an otherwise-unreachable document reachable; it does not improve the ordering of things
+  already found, and it slightly perturbs it. A weight high enough to raise MRR does not
+  exist on this curve.
+- **Check the single-fact questions for losses, per question.** The aggregate hides the one
+  thing that decides the tradeoff. At weight 0.25 the aggregate looked better than at 0.15
+  (+1 answered) while `q-liveview-mount` had lost its answer entirely.
+
+The shipped setting (`0.15`) is the largest weight at which no question loses recall or its
+answer. The full sweep table lives in `config/config.exs` next to the value, and the
+reasoning in `docs/research/kb-retrieval-improvement-plan.md`.
 
 ## Re-baselining
 

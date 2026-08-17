@@ -888,14 +888,42 @@ config :loopctl, :knowledge_hybrid_curated_margin_keyword, 0.1
 config :loopctl, :knowledge_fusion_strategy, :rrf
 # RRF smoothing constant. Default 60 per the canonical RRF formula (KB f4a10824).
 config :loopctl, :knowledge_rrf_k, 60
-# Optional third graph-neighbor lane (#470): one-hop link-graph neighbors of the top
-# merged candidates fed into the fusion. OFF by default — a purely additive recall
-# lane that a caller opts into. Graph-only neighbors carry no relevance/similarity
-# score (their hybrid-resolver absolute_score stays 0.0) and never inflate
+# Third graph-neighbor lane (#470): one-hop link-graph neighbors of the top merged
+# candidates fed into the fusion. Graph-only neighbors carry no relevance/similarity score
+# (their hybrid-resolver absolute_score stays 0.0) and never inflate
 # meta.semantic_result_count.
-config :loopctl, :knowledge_rrf_graph_lane_enabled, false
-# Weight of the graph-neighbor lane in RRF fusion when enabled. Defaults to 0.25 —
-# STRICTLY BELOW the keyword/semantic per-lane weight (0.5 each). The graph lane carries
+#
+# ON since the Phase 5 retrieval experiment (see docs/research/kb-retrieval-improvement-
+# plan.md). It shipped OFF because nothing could adjudicate it: the eval corpus seeded no
+# `article_links` at all, so the lane was a strict no-op there and a lane-on run scored an
+# identical, entirely uninformative delta. golden_v4 seeds real edges and adds multi-hop
+# questions whose relevant document is reachable ONLY through one, at which point the
+# measurement was decisive — see the weight comment below for the numbers.
+#
+# It costs one bounded, tenant-scoped HeavyRead per combined search (capped at
+# 200 link rows), shed to an empty lane when the tenant is over its in-flight cap. That
+# is a real added read on the DEFAULT search path, and it is the price of the recall gain.
+config :loopctl, :knowledge_rrf_graph_lane_enabled, true
+# Weight of the graph-neighbor lane in RRF fusion. 0.15, chosen by measurement rather than
+# by the "comfortably below 0.5" argument that picked the original 0.25. Swept on golden_v4
+# (embeddings arm, 60 questions), lane off as the reference:
+#
+#   weight | answered | mrr    | recall@5 | multi-hop answered | single-fact answers lost
+#   off    | 45       | 0.6500 | 0.642    | 0 of 8             | -
+#   0.10   | 47       | 0.6431 | 0.675    | 2                  | -
+#   0.15   | 48       | 0.6492 | 0.692    | 3                  | -           <-- shipped
+#   0.25   | 49       | 0.6326 | 0.717    | 5                  | q-liveview-mount
+#   0.40   | 51       | 0.5992 | 0.750    | 7                  | q-liveview-mount
+#
+# The literature's warning is that graph retrieval WINS on multi-hop and LOSES on
+# single-fact lookups, and that is exactly the shape of this curve. 0.15 is the largest
+# weight that buys multi-hop recall while costing no question its answer: three single-fact
+# questions drop in MRR, all keeping their answer inside the top 5. 0.25 buys two more
+# multi-hop answers and takes one away from q-liveview-mount, which is the trade the plan's
+# own pass/fail refuses ("no regression on single-fact ones"). Re-run the sweep with
+# `mix loopctl.retrieval.eval --graph-lane --graph-weight <w>` before moving this number.
+#
+# STRICTLY BELOW the keyword/semantic per-lane weight (0.5 each) as well. The graph lane carries
 # NO relevance/similarity signal (a neighbor surfaces only because it is link-adjacent to
 # a seed), so it must never tie OR outrank a genuine single-lane hit. At the primary weight
 # (0.5) a graph-rank-1 neighbor scores 0.5/(k+1) — EXACTLY equal to a single-lane rank-1
@@ -904,8 +932,9 @@ config :loopctl, :knowledge_rrf_graph_lane_enabled, false
 # graph-rank-1 neighbor scores 0.25/(k+1) < 0.5/(k+1), so the "never outranks a genuine
 # single-lane top hit" invariant holds by construction, in POSITION not just in score. A
 # doc that is ALSO a genuine hit still sums its primary-lane contribution, so real
-# cross-lane consensus is unaffected.
-config :loopctl, :knowledge_rrf_graph_weight, 0.25
+# cross-lane consensus is unaffected. (That argument bounds the weight from above; it never
+# said which value below the bound was right, which is what the sweep settles.)
+config :loopctl, :knowledge_rrf_graph_weight, 0.15
 # Number of top merged candidates used as graph-lane seeds (bounds link fan-out).
 config :loopctl, :knowledge_rrf_graph_seed_count, 10
 # Overall cap on distinct graph-lane neighbors injected into the fusion.

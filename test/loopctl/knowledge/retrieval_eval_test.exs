@@ -9,6 +9,7 @@ defmodule Loopctl.Knowledge.RetrievalEvalTest do
   alias Loopctl.AdminRepo
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.RetrievalEval
   alias Loopctl.Knowledge.RetrievalEval.Baseline
   alias Loopctl.Knowledge.RetrievalEval.GoldenSet
@@ -384,6 +385,122 @@ defmodule Loopctl.Knowledge.RetrievalEvalTest do
       # The shared corpus seeds ONCE: two questions, two docs, not four. A doubled corpus
       # would make each copy the other's strongest distractor and measure the duplication.
       assert length(GoldenSet.corpus(golden)) == 2
+    end
+
+    test "links parse, default to relates_to, and dedupe across paired questions (golden_v4)" do
+      header = ~s({"kind":"header","version":"golden_v4"})
+
+      owner =
+        ~s({"kind":"question","id":"q-own","question":"the prose question","relevant":["d2"],) <>
+          ~s("links":[{"from":"d1","to":"d2"},) <>
+          ~s({"from":"d1","to":"d3","type":"potential_conflict"}],) <>
+          ~s("corpus":[{"doc_id":"d1","title":"t1","body":"b1","category":"pattern"},) <>
+          ~s({"doc_id":"d2","title":"t2","body":"b2","category":"pattern"},) <>
+          ~s({"doc_id":"d3","title":"t3","body":"b3","category":"pattern"}]})
+
+      paired =
+        ~s({"kind":"question","id":"q-own-kwbag","question":"prose question",) <>
+          ~s("corpus_ref":"q-own"})
+
+      golden = GoldenSet.parse!(header <> "\n" <> owner <> "\n" <> paired <> "\n")
+      [own, ref] = golden.questions
+
+      assert own.links == [
+               %{from: "d1", to: "d2", type: :relates_to},
+               %{from: "d1", to: "d3", type: :potential_conflict}
+             ]
+
+      # A paired question inherits the edge set with the corpus: the pair must differ in
+      # the QUERY and nothing else, or it measures the topology instead of the query.
+      assert ref.links == own.links
+
+      # ...and the union seeds ONCE, for the same reason the corpus does — `article_links`
+      # carries a unique index on exactly {source, target, type}.
+      assert GoldenSet.links(golden) == own.links
+    end
+
+    test "rejects a link that is dangling, self-referential, duplicated, or wrongly typed" do
+      header = ~s({"kind":"header","version":"golden_v4"})
+
+      base =
+        ~s("relevant":["d1"],) <>
+          ~s("corpus":[{"doc_id":"d1","title":"t1","body":"b1","category":"pattern"},) <>
+          ~s({"doc_id":"d2","title":"t2","body":"b2","category":"pattern"}])
+
+      question = fn links ->
+        header <>
+          "\n" <>
+          ~s({"kind":"question","id":"q-x","question":"q","links":) <>
+          links <>
+          "," <>
+          base <> ~s(})
+      end
+
+      # An endpoint outside this question's own corpus names a doc it never seeds, so the
+      # edge would either fail to insert or silently wire this question's seeds to another
+      # question's docs and change what BOTH measure.
+      assert_raise ArgumentError, ~r/link endpoint "d-nope" is not in its corpus/, fn ->
+        GoldenSet.parse!(question.(~s([{"from":"d1","to":"d-nope"}])))
+      end
+
+      assert_raise ArgumentError, ~r/link from "d1" to itself/, fn ->
+        GoldenSet.parse!(question.(~s([{"from":"d1","to":"d1"}])))
+      end
+
+      # The (tenant, source, target, type) unique index would otherwise reject this at
+      # insert time with an opaque constraint error naming no question.
+      assert_raise ArgumentError, ~r/duplicate link in question q-x/, fn ->
+        GoldenSet.parse!(
+          question.(~s([{"from":"d1","to":"d2"},{"from":"d1","to":"d2","type":"relates_to"}]))
+        )
+      end
+
+      # An unknown type must be loud: silently dropping it would leave an untraversed edge
+      # and a question that scores as if the lane had failed.
+      assert_raise ArgumentError, ~r/unknown link type "sort_of_related"/, fn ->
+        GoldenSet.parse!(question.(~s([{"from":"d1","to":"d2","type":"sort_of_related"}])))
+      end
+    end
+
+    test "a corpus_ref question may not declare its own links" do
+      header = ~s({"kind":"header","version":"golden_v4"})
+
+      owner =
+        ~s({"kind":"question","id":"q-own","question":"prose","relevant":["d1"],) <>
+          ~s("corpus":[{"doc_id":"d1","title":"t1","body":"b1","category":"pattern"}]})
+
+      bad =
+        ~s({"kind":"question","id":"q-bad","question":"q","corpus_ref":"q-own",) <>
+          ~s("links":[{"from":"d1","to":"d1"}]})
+
+      assert_raise ArgumentError,
+                   ~r/must not declare their own corpus, relevant, graded or links/,
+                   fn ->
+                     GoldenSet.parse!(header <> "\n" <> owner <> "\n" <> bad <> "\n")
+                   end
+    end
+
+    test "the committed set carries multi-hop questions whose answer is ONLY link-reachable" do
+      golden = fixture(:retrieval_golden_set)
+
+      multi_hop = Enum.filter(golden.questions, &(&1.links != []))
+
+      assert multi_hop != [],
+             "golden_v4 must seed edges — with none, the graph lane is a strict no-op and " <>
+               "a lane-on eval run scores an identical, uninformative delta"
+
+      Enum.each(multi_hop, fn question ->
+        link_targets = MapSet.new(question.links, & &1.to)
+
+        # The point of a multi-hop question: its relevant doc is the FAR side of an edge,
+        # not the doc the query text matches. A question whose answer is also its bridge
+        # would be answerable without the lane and would measure nothing.
+        Enum.each(question.relevant, fn doc_id ->
+          assert MapSet.member?(link_targets, doc_id),
+                 "#{question.id}: relevant #{doc_id} is not the target of any link, so the " <>
+                   "graph lane cannot be what retrieves it"
+        end)
+      end)
     end
 
     test "a corpus_ref question is exempt from doc-id uniqueness, not a hole in it" do
@@ -1080,6 +1197,38 @@ defmodule Loopctl.Knowledge.RetrievalEvalTest do
       assert article_count(tenant_a.id) == 0
     end
 
+    test "seeded links are real article_links rows, and cleanup deletes them BEFORE the articles" do
+      tenant = fixture(:tenant)
+      golden = linked_golden_set()
+
+      seeded = RetrievalEval.seed_corpus(tenant.id, golden)
+
+      assert link_count(tenant.id) == 1,
+             "the golden set's links must be seeded as real rows — without them the graph " <>
+               "lane has nothing to traverse and is a strict no-op"
+
+      # `article_links` FKs both endpoints with `on_delete: :restrict`, so deleting the
+      # articles first raises a foreign-key violation from inside `compute/2`'s `after`,
+      # where it would replace the real result with a constraint error AND leave the whole
+      # corpus behind for every later run. Reverse the two deletes in `delete_corpus/2` and
+      # this assertion is what fails.
+      RetrievalEval.delete_corpus(tenant.id, Map.keys(seeded))
+
+      assert link_count(tenant.id) == 0
+      assert article_count(tenant.id) == 0
+    end
+
+    test "compute/2 cleans up its links too, on the path that raises" do
+      tenant = fixture(:tenant)
+
+      assert_raise Enum.EmptyError, fn ->
+        RetrievalEval.compute(tenant.id, golden_set: linked_golden_set(), k_values: [])
+      end
+
+      assert link_count(tenant.id) == 0
+      assert article_count(tenant.id) == 0
+    end
+
     test "compute/2 leaves no rows behind on the happy path" do
       tenant = fixture(:tenant)
 
@@ -1237,5 +1386,37 @@ defmodule Loopctl.Knowledge.RetrievalEvalTest do
 
   defp article_count(tenant_id) do
     AdminRepo.aggregate(from(a in Article, where: a.tenant_id == ^tenant_id), :count, :id)
+  end
+
+  defp link_count(tenant_id) do
+    AdminRepo.aggregate(from(l in ArticleLink, where: l.tenant_id == ^tenant_id), :count, :id)
+  end
+
+  # A two-doc question carrying ONE edge — the minimum that exercises link seeding and the
+  # ordering of the two deletes in `delete_corpus/2`.
+  defp linked_golden_set do
+    question =
+      build(:retrieval_golden_question, %{
+        id: "q-linked",
+        question: "postgres advisory lock distributed coordination",
+        relevant: ["adv-lock-far"],
+        graded: %{},
+        links: [%{from: "adv-lock", to: "adv-lock-far", type: :relates_to}],
+        corpus: [
+          build(:retrieval_golden_doc, %{
+            doc_id: "adv-lock",
+            title: "Postgres advisory lock for distributed coordination",
+            body:
+              "Take a postgres advisory lock so concurrent nodes cannot run the same step twice."
+          }),
+          build(:retrieval_golden_doc, %{
+            doc_id: "adv-lock-far",
+            title: "Releasing the lock on node death",
+            body: "A session scoped lock is released automatically when its connection dies."
+          })
+        ]
+      })
+
+    %{version: "golden_v4_test", description: nil, questions: [question]}
   end
 end

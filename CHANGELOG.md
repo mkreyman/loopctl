@@ -4,6 +4,26 @@ All notable changes to loopctl are documented here.
 
 ## [Unreleased] — 2026-08-07 — Story lifecycle capability delivery
 
+### Changed
+
+- **Combined search now fuses a third lane of link-graph neighbours**, and it is ON by
+  default (`:knowledge_rrf_graph_lane_enabled` flips `false` -> `true`,
+  `:knowledge_rrf_graph_weight` `0.25` -> `0.15`). The lane takes the top merged candidates
+  as seeds and adds their one-hop `article_links` neighbours as a third RRF input, so a
+  document that no query term reaches but that hangs off a document the query does reach can
+  now be retrieved at all.
+
+  **Operator impact: one additional read per combined search.** It is tenant-scoped, capped
+  at 200 link rows, routed to the heavy-read pool with its own statement timeout, and shed to
+  an empty lane when a tenant is over its in-flight cap — never a 429, never the admin pool.
+  `search_combined/3` is the default search path, so this is on every search and every
+  `/recall`. Set `:knowledge_rrf_graph_lane_enabled` to `false` to restore the previous
+  behaviour exactly.
+
+  The weight was chosen by sweeping it on the eval, not by argument: 0.15 is the largest
+  value that gains multi-hop answers while costing no question its answer, and the old 0.25
+  would have cost one. Numbers and method in `docs/research/kb-retrieval-improvement-plan.md`.
+
 ### Added
 
 - **Every search result now carries a snippet**, plus a `snippet_source` naming which kind

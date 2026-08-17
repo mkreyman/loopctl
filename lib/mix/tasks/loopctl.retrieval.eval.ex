@@ -29,6 +29,16 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
       baseline by more than the tolerance. This is what CI runs.
     * `--tolerance` — float slack below baseline that is not a regression.
     * `--json` — emit the machine-readable result instead of the text report.
+    * `--graph-lane` / `--no-graph-lane` — force the optional RRF graph-neighbour lane
+      (#470) on or off, overriding `:knowledge_rrf_graph_lane_enabled`. Absent, the run
+      inherits the application default, which is what the committed baseline was measured
+      under. A graph-lane experiment is therefore two runs of this task compared to EACH
+      OTHER — never a lane-on run compared to a lane-off baseline. Note the lane lives in
+      the branch where BOTH keyword and semantic succeeded, so it is a no-op under
+      `--mode keyword_only`.
+    * `--graph-weight` — override the graph lane's RRF weight for this run. This is the
+      knob that trades the lane's multi-hop recall gain against the top-rank perturbation
+      it causes on single-fact questions.
     * `--cleanup` — reap any leaked eval tenants and their seeded corpus, then exit
       without running an eval. Use after a run was killed (OOM / SIGKILL / CI cancel)
       mid-flight and left rows behind. A tenant qualifies ONLY when it carries the
@@ -97,7 +107,9 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
     json: :boolean,
     cleanup: :boolean,
     allow_prod: :boolean,
-    min_age: :integer
+    min_age: :integer,
+    graph_lane: :boolean,
+    graph_weight: :float
   ]
 
   @impl Mix.Task
@@ -146,10 +158,10 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
     results =
       with_tenant(fn tenant_id ->
         Enum.map(modes, fn mode ->
-          RetrievalEval.run(tenant_id,
-            golden_set: golden,
-            mode: mode,
-            k_values: k_values
+          RetrievalEval.run(
+            tenant_id,
+            [golden_set: golden, mode: mode, k_values: k_values]
+            |> maybe_put_graph_lane(opts)
           )
         end)
       end)
@@ -162,6 +174,26 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
   end
 
   # ===========================================================================
+
+  # `--graph-lane` / `--no-graph-lane` force the optional RRF graph-neighbour lane on or off
+  # for this run, overriding `:knowledge_rrf_graph_lane_enabled`. Absent, the run inherits
+  # the application default — which is what the COMMITTED baseline is measured under, so a
+  # graph-lane experiment is two runs compared to each other, never one run compared to a
+  # baseline recorded under different retrieval settings.
+  defp maybe_put_graph_lane(run_opts, opts) do
+    case Keyword.fetch(opts, :graph_lane) do
+      {:ok, value} -> Keyword.put(run_opts, :graph_lane, value)
+      :error -> run_opts
+    end
+    |> maybe_put_graph_weight(opts)
+  end
+
+  defp maybe_put_graph_weight(run_opts, opts) do
+    case Keyword.fetch(opts, :graph_weight) do
+      {:ok, value} -> Keyword.put(run_opts, :graph_weight, value)
+      :error -> run_opts
+    end
+  end
 
   defp modes(opts) do
     case Keyword.get(opts, :mode) do
