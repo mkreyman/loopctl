@@ -272,11 +272,28 @@ published articles (2026-08-17), 30,187 tag instances:
 fifths of the hand-curated topical vocabulary in this corpus could not be keyword-matched at
 all** — a plain missing input, not a modelling problem, and free to fix.
 
-**Shipped:** tags at weight `C`, strictly below title and body, with the nine measured
-machine-minted provenance families excluded. That exclusion is not tidiness: Postgres
-tokenizes a hyphenated word into the compound AND its parts, so indexing `url-42516bb95051`
-puts the bare lexeme `url` on 8,671 rows (`doc-` on 37,877, `book-` on 17,047) — and those
-prefixes are ordinary English query words, so the cost would be precision on real queries.
+**Shipped:** tags at weight `C`, strictly below title and body, with the machine-minted
+provenance prefixes excluded. That exclusion is not tidiness: Postgres tokenizes a hyphenated
+word into the compound AND its parts, so indexing `url-42516bb95051` puts the bare lexeme
+`url` on 8,671 rows (`doc-` on 37,377, `book-` on 17,047) — and those prefixes are ordinary
+English query words, so the cost would be precision on real queries.
+
+The exclusion list is NOT written for this feature. It is
+`Loopctl.Knowledge.ProvenanceTags`, which now owns the one answer this repo had already
+worked out for MOC hub selection and derives `idem-` from `IdempotencyTag.reserved_prefix/0`.
+**The first draft here did hand-write a list, and it omitted `idem-` entirely** — so every
+capture id minted after #583 would have been indexed, putting the lexeme `idem` on every
+future article. It also excluded `url-` by bare prefix, which would have dropped a
+legitimate `url-design` topic tag; `IdempotencyTag`'s own docs name that collision as the
+reason its legacy matcher is shape-based. Worth recording because the failure was not
+carelessness — a plausible list was measured from production data and was still wrong,
+because the question had already been answered elsewhere.
+
+Where tags come from, since it decides how much this can ever be worth: they are
+**LLM-generated once at ingest** (`ContentIngestionWorker` hands the content to the
+configured extractor, which returns title/body/category/tags in one shot). Nothing re-tags
+an existing article, so the corpus's tag quality is fixed at capture time and improving it
+retroactively is a separate, unbuilt thing.
 
 Eval, golden_v5, no regression on any question in either arm:
 

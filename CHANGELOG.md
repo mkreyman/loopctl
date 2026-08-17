@@ -12,11 +12,16 @@ All notable changes to loopctl are documented here.
   vocabulary appearing nowhere in that article's own title or body**, so roughly three
   fifths of the curated topical vocabulary was unsearchable by keyword.
 
-  Nine machine-minted provenance tag families (`url-`, `yt-`, `book-`, `doc-`, `pp-`,
-  `doi-`, `isbn-`, `chapter-`, `part-`) are excluded by the new IMMUTABLE
+  Machine-minted provenance tag prefixes (`url-`, `yt-`, `book-`, `doc-`, `pp-`, `chunk-`,
+  `chapter-`, `part-`, the reserved `idem-` namespace, and the rest of
+  `Loopctl.Knowledge.ProvenanceTags.prefixes/0`) are excluded by the new IMMUTABLE
   `loopctl_searchable_tags(text[])` function. Postgres tokenizes a hyphenated word into the
-  compound and its parts, so indexing those would put the bare lexemes `url`, `book`, `doc`
-  on tens of thousands of rows, and those are ordinary query words.
+  compound and its parts, so indexing those would put the bare lexemes `url`, `book`, `doc`,
+  `idem` on tens of thousands of rows, and those are ordinary query words.
+
+  That list also now backs `KnowledgeMocWorker`'s hub-topic exclusion, which previously
+  owned it. `chapter-` and `part-` are new to it — the same chunk-coordinate class as `pp-`
+  and `chunk-` — so those tags stop being eligible as MOC hub topics as well.
 
   **DEPLOY IMPACT — read before rolling this out.** The migration DROPs and re-ADDs the
   generated column and rebuilds its GIN index, which takes an ACCESS EXCLUSIVE lock on
