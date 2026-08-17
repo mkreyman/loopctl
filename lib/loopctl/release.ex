@@ -36,11 +36,44 @@ defmodule Loopctl.Release do
     # We specify the path explicitly because AdminRepo defaults to
     # priv/admin_repo/migrations/ but all migrations live in priv/repo/.
     {:ok, _, _} =
-      Ecto.Migrator.with_repo(Loopctl.AdminRepo, fn repo ->
-        path = Ecto.Migrator.migrations_path(Loopctl.Repo)
-        Ecto.Migrator.run(repo, path, :up, all: true)
-      end)
+      Ecto.Migrator.with_repo(
+        Loopctl.AdminRepo,
+        fn repo ->
+          path = Ecto.Migrator.migrations_path(Loopctl.Repo)
+          Ecto.Migrator.run(repo, path, :up, all: true)
+        end,
+        migration_connection_opts()
+      )
   end
+
+  @doc """
+  Connection options for the release-time migration repo.
+
+  **Disables `idle_in_transaction_session_timeout` for the migrator's connections, and
+  nothing else's.** `Ecto.Migrator` takes a Postgres advisory lock inside a transaction and
+  then leaves that connection IDLE for as long as the migration runs. The server's
+  `idle_in_transaction_session_timeout` counts that as an idle transaction and kills the
+  connection — so a migration that takes longer than the timeout FAILS THE RELEASE COMMAND
+  even after the migration itself has fully succeeded.
+
+  That is not hypothetical. On 2026-08-17 the `articles.search_vector` rebuild
+  (`20260817212906`) logged `== Migrated 20260817212906 in 59.8s` against a server whose
+  timeout is 60000ms, then died with `FATAL 25P03 idle_in_transaction_session_timeout` in
+  `do_lock_for_migrations`, and Fly aborted the deployment. Production was left with the new
+  SCHEMA and the previous release's CODE — harmless that time only because the change was
+  additive, which is luck rather than design.
+
+  Scoped deliberately: the timeout is a good guard for the APPLICATION (a connection stuck
+  idle in a transaction holds locks and blocks vacuum), so it stays on there. The migrator
+  is a short-lived release process whose whole job is to hold one lock for the duration, and
+  it is the one caller for which the guard is wrong.
+
+  Public so the setting is assertable — the behaviour it prevents needs a migration slower
+  than the server timeout to reproduce, which no test suite should manufacture.
+  """
+  @spec migration_connection_opts() :: keyword()
+  def migration_connection_opts,
+    do: [parameters: [idle_in_transaction_session_timeout: "0"]]
 
   @doc """
   Rolls back the last migration using AdminRepo.
@@ -49,10 +82,14 @@ defmodule Loopctl.Release do
     load_app()
 
     {:ok, _, _} =
-      Ecto.Migrator.with_repo(Loopctl.AdminRepo, fn repo ->
-        path = Ecto.Migrator.migrations_path(Loopctl.Repo)
-        Ecto.Migrator.run(repo, path, :down, to: version)
-      end)
+      Ecto.Migrator.with_repo(
+        Loopctl.AdminRepo,
+        fn repo ->
+          path = Ecto.Migrator.migrations_path(Loopctl.Repo)
+          Ecto.Migrator.run(repo, path, :down, to: version)
+        end,
+        migration_connection_opts()
+      )
   end
 
   @doc """
