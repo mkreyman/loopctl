@@ -606,7 +606,19 @@ defmodule Loopctl.ObanConfig do
            # 03:40 UTC sits between the 03:00 webhook/token cleanups and the 04:00
            # knowledge-lint fan-out rather than piling onto either. Keep in sync with the
            # crontab assertion in oban_plugins_config_test.exs.
-           {"40 3 * * *", Loopctl.Workers.LegacyEmbeddingRetirementWorker}
+           {"40 3 * * *", Loopctl.Workers.LegacyEmbeddingRetirementWorker},
+           # Weekly drain for the DRAFT queue. The capture hook holds every
+           # machine-extracted finding/pattern/playbook as a draft (claude-config#203);
+           # without a drain that hold is a landfill, and the 2026-08-17 manual drain
+           # measured 453 of 530 held drafts to be pure duplicates. This retires the
+           # duplicate majority (published-neighbour similarity >= the worker's
+           # threshold) and leaves the judgement half — does the claim survive contact
+           # with its source? — to an agent that can open a repo. 05:50 UTC Sunday sits
+           # AFTER the 05:00 Sunday KnowledgeMoc fan-out rather than contending with it
+           # for the same :knowledge lane. Keep in sync with the crontab assertion in
+           # oban_plugins_config_test.exs.
+           {"50 5 * * 0", Loopctl.Workers.DraftDuplicateSweepWorker,
+            args: %{"mode" => "all_tenants"}}
          ])},
       # Rescue jobs orphaned in :executing when a node dies mid-run (e.g. a deploy).
       # Without Lifeline these rows stay `executing` forever — 110 such orphans (from
