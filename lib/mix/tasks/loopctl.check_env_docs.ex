@@ -77,7 +77,18 @@ defmodule Mix.Tasks.Loopctl.CheckEnvDocs do
 
   # Variables deliberately NOT in the operator docs. Each needs a reason.
   # (Empty today — every scanned variable is documented.)
-  @exempt %{}
+  @exempt %{
+    # NOT an operator variable, and documenting it would be worse than leaving it out.
+    # `config/runtime.exs` states in as many words that there is intentionally no global
+    # ANTHROPIC_API_KEY path for tenant LLM work — that is mandatory BYO, per tenant, via
+    # `Loopctl.Llm.resolve/2`. This read is in `mix loopctl.retrieval.eval --record-rerank`,
+    # a developer-only tool that records a rerank fixture against a THROWAWAY eval tenant
+    # which by construction has no stored LLM settings. A row in FLY_SECRETS.md would tell
+    # an operator to set a production secret that does nothing in production.
+    "ANTHROPIC_API_KEY" =>
+      "developer-only: read by mix loopctl.retrieval.eval --record-rerank against the " <>
+        "eval's throwaway tenant. Tenant LLM work is mandatory-BYO with no global key path."
+  }
 
   # Files that read env by a name built at RUNTIME (or through a captured getter), which no
   # textual scan can resolve. `{names, reason}` — each entry NAMES the knobs it reads and

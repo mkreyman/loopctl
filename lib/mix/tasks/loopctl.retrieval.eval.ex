@@ -67,6 +67,7 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.Reranker
   alias Loopctl.Knowledge.RetrievalEval
   alias Loopctl.Knowledge.RetrievalEval.Baseline
   alias Loopctl.Knowledge.RetrievalEval.GoldenSet
@@ -96,6 +97,11 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
   # live run. Any normal run finishes well inside this window. `--min-age` overrides it.
   @reap_min_age_minutes 15
 
+  # The model a `--record-rerank` run asks. Named here rather than resolved per tenant
+  # because the recording is one deliberate experiment, and the fixture records which model
+  # produced it. Override with `--rerank-model`.
+  @default_rerank_model "claude-haiku-4-5-20251001"
+
   @switches [
     golden: :string,
     mode: :string,
@@ -109,7 +115,11 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
     allow_prod: :boolean,
     min_age: :integer,
     graph_lane: :boolean,
-    graph_weight: :float
+    graph_weight: :float,
+    rerank: :boolean,
+    record_rerank: :boolean,
+    rerank_fixture: :string,
+    rerank_model: :string
   ]
 
   @impl Mix.Task
@@ -155,6 +165,8 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
     k_values = k_values(opts)
     baseline_path = Keyword.get(opts, :baseline, Baseline.default_path())
 
+    if Keyword.get(opts, :record_rerank, false), do: start_recorder!()
+
     results =
       with_tenant(fn tenant_id ->
         Enum.map(modes, fn mode ->
@@ -165,6 +177,8 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
           )
         end)
       end)
+
+    if Keyword.get(opts, :record_rerank, false), do: dump_rerank_fixture(opts, golden)
 
     if Keyword.get(opts, :update_baseline, false) do
       update_baseline(results, baseline_path)
@@ -186,12 +200,110 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
       :error -> run_opts
     end
     |> maybe_put_graph_weight(opts)
+    |> maybe_put_rerank(opts)
+  end
+
+  # `--rerank` scores the Phase 4 second stage. `--record-rerank` implies it and swaps the
+  # implementation for the REAL provider-backed one, writing what it returns to the fixture;
+  # otherwise the run replays the committed recording, so CI never bills a provider and two
+  # runs of the same commit score identically.
+  defp maybe_put_rerank(run_opts, opts) do
+    recording? = Keyword.get(opts, :record_rerank, false)
+    rerank? = recording? or Keyword.get(opts, :rerank, false)
+
+    if rerank? do
+      run_opts
+      |> Keyword.put(:rerank, true)
+      |> Keyword.put(:reranker, if(recording?, do: Reranker.Recorder, else: Reranker.Fixture))
+      |> then(&if recording?, do: Keyword.merge(&1, recording_credentials!(opts)), else: &1)
+      |> maybe_put_fixture_path(opts)
+    else
+      run_opts
+    end
+  end
+
+  # The eval mints a THROWAWAY tenant, which by construction has no stored LLM settings —
+  # and tenant LLM work is mandatory-BYO with no global key path (config/runtime.exs says
+  # so in as many words). So a recording run reads `ANTHROPIC_API_KEY` and passes it
+  # explicitly rather than writing a credential into a tenant row that exists for two
+  # minutes. Refused loudly when absent: a recording run that silently produced nothing
+  # would then be caught by `dump_rerank_fixture/2`, but the message here names the actual
+  # remedy.
+  defp recording_credentials!(opts) do
+    api_key =
+      System.get_env("ANTHROPIC_API_KEY") ||
+        Mix.raise(
+          "retrieval eval: --record-rerank needs ANTHROPIC_API_KEY. The eval's tenant is " <>
+            "throwaway and has no stored LLM settings, and there is no global key path for " <>
+            "tenant LLM work."
+        )
+
+    [
+      rerank_api_key: api_key,
+      rerank_model: Keyword.get(opts, :rerank_model, @default_rerank_model)
+    ]
+  end
+
+  # Write the recording collected during a `--record-rerank` run. Refuses to overwrite the
+  # committed file with NOTHING: an empty entry map means every provider call failed (no
+  # key, a 401, a timeout), and replacing a real recording with that turns a provider
+  # outage into a silent, permanent "the reranker never reorders anything".
+  defp dump_rerank_fixture(opts, golden) do
+    entries = Reranker.Recorder.entries()
+    path = Keyword.get(opts, :rerank_fixture, default_rerank_fixture_path())
+
+    if entries == %{} do
+      Mix.raise(
+        "retrieval eval: --record-rerank observed nothing — every reranker call failed " <>
+          "(no API key, provider error, or unparseable replies). Refusing to overwrite " <>
+          "#{path} with an empty recording."
+      )
+    end
+
+    payload = %{
+      "golden_version" => golden.version,
+      "model" => Keyword.get(opts, :rerank_model, @default_rerank_model),
+      "note" =>
+        "Recorded by `mix loopctl.retrieval.eval --record-rerank` from " <>
+          "Loopctl.Knowledge.Reranker.Llm. Values are candidate TITLES in the model's " <>
+          "chosen order. Regenerate after changing the golden set; a key that is not " <>
+          "recorded replays as 'keep the fused order', never as an error.",
+      "entries" => entries
+    }
+
+    File.write!(path, JSON.encode!(payload))
+    Mix.shell().info("retrieval eval: recorded #{map_size(entries)} rerank orderings to #{path}")
+  end
+
+  # `priv/` inside the CHECKOUT, not the build's app_dir: a recording written into
+  # `_build` is invisible to git and would be silently discarded by the next `mix clean`.
+  defp default_rerank_fixture_path,
+    do: Path.join(File.cwd!(), "priv/retrieval_eval/rerank_fixture.json")
+
+  defp maybe_put_fixture_path(run_opts, opts) do
+    case Keyword.fetch(opts, :rerank_fixture) do
+      {:ok, path} -> Keyword.put(run_opts, :rerank_fixture_path, path)
+      :error -> run_opts
+    end
   end
 
   defp maybe_put_graph_weight(run_opts, opts) do
     case Keyword.fetch(opts, :graph_weight) do
       {:ok, value} -> Keyword.put(run_opts, :graph_weight, value)
       :error -> run_opts
+    end
+  end
+
+  defp start_recorder! do
+    case Reranker.Recorder.start_link() do
+      {:ok, _pid} ->
+        :ok
+
+      {:error, {:already_started, _pid}} ->
+        :ok
+
+      {:error, reason} ->
+        Mix.raise("retrieval eval: could not start the rerank recorder: #{inspect(reason)}")
     end
   end
 

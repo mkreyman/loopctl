@@ -69,6 +69,7 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.Knowledge.KbCuration
   alias Loopctl.Knowledge.OKF
   alias Loopctl.Knowledge.RankingPriors
+  alias Loopctl.Knowledge.Reranker
   alias Loopctl.Knowledge.VectorSearch
   alias Loopctl.Llm.ProviderError
   alias Loopctl.LocalGuc
@@ -8600,7 +8601,20 @@ defmodule Loopctl.Knowledge do
             # Filled AFTER recording so the analytics rows describe what was retrieved, not
             # what was decorated, and once — on the merged page rather than either lane's
             # wide pool.
-            {:ok, %{merged | results: with_snippets(tenant_id, merged.results, opts)}}
+            with_snippets = with_snippets(tenant_id, merged.results, opts)
+
+            # Phase 4 reranking (#470 successor), OFF by default. It runs LAST, on the
+            # already-paginated page, for two reasons: `merge_results/5` is a pure DB-free
+            # fusion function and this is an outbound provider call, and reranking the page
+            # bounds the cost by the caller's limit instead of by the candidate pool.
+            # AFTER snippets because the snippet is what the reranker judges relevance on —
+            # ordering by titles alone throws away the one line #690 exists to provide.
+            # `maybe_rerank/4` fails OPEN: every error path returns this same list.
+            {:ok,
+             %{
+               merged
+               | results: Reranker.maybe_rerank(tenant_id, query_string, with_snippets, opts)
+             }}
 
           # US-41.1: `:semantic_recall_unavailable` joins `:heavy_read_overloaded`
           # here — the query vector cannot be compared against the corpus this tenant

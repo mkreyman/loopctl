@@ -4,6 +4,24 @@ All notable changes to loopctl are documented here.
 
 ## [Unreleased] — 2026-08-07 — Story lifecycle capability delivery
 
+### Added
+
+- **A second-stage reranking seam for combined search** (`Loopctl.Knowledge.Reranker`),
+  **disabled by default** (`:knowledge_reranker_enabled` is `false`, `:knowledge_reranker`
+  is the no-op). Nothing changes for any deployment that does not turn it on, and turning it
+  on puts an LLM call on every search and every `/recall`.
+
+  It reorders the returned page rather than the fused pool, and it fails OPEN: no key, a
+  provider error, a timeout, a malformed reply, or an ordering that is not a permutation of
+  the page all return the fused order unchanged. A reranker can permute results, never
+  inject, drop or edit one.
+
+  Measured on the retrieval eval it improves every aggregate (MRR +0.105, nDCG@5 +0.087,
+  answered +1) AND drives two multi-hop questions from recall@5 1.0 to 0.0, because it
+  re-applies the surface-similarity judgement the graph lane exists to bypass. That is why it
+  ships off; the reasoning and the overturn condition are in
+  `docs/research/kb-retrieval-improvement-plan.md`.
+
 ### Changed
 
 - **`articles.tags` are now part of the keyword index**, at weight `C` (below title `A` and

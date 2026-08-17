@@ -1,4 +1,23 @@
 defmodule Loopctl.KnowledgeSemanticSearchTest do
+  # Defined HERE rather than borrowed from `Loopctl.Knowledge.RerankerTest`: `mix test
+  # <one file>` loads only that file, so a stub living in a sibling test module is
+  # undefined, `Reranker` rescues the UndefinedFunctionError, and the test passes VACUOUSLY
+  # by observing the un-reranked order it was checking against.
+  defmodule ReversingReranker do
+    @moduledoc false
+    @behaviour Loopctl.Knowledge.Reranker
+    @impl true
+    def rerank(_scope, _query, candidates, _opts),
+      do: {:ok, candidates |> Enum.map(& &1.id) |> Enum.reverse()}
+  end
+
+  defmodule RaisingReranker do
+    @moduledoc false
+    @behaviour Loopctl.Knowledge.Reranker
+    @impl true
+    def rerank(_scope, _query, _candidates, _opts), do: raise("boom")
+  end
+
   use Loopctl.DataCase, async: true
 
   setup :verify_on_exit!
@@ -1708,6 +1727,40 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       })
 
       %{seed: seed, neighbor: neighbor}
+    end
+
+    test "a reranker reaches the combined-search page, and cannot break it" do
+      %{tenant: tenant} = setup_tenant()
+      Knowledge.reset_circuit_breaker(tenant.id)
+      %{seed: seed, neighbor: neighbor} = seed_and_neighbor(tenant.id)
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:ok, make_embedding(:query)}
+      end)
+
+      {:ok, %{results: fused}} = Knowledge.search_combined(tenant.id, "graphlane")
+      assert length(fused) > 1
+      assert seed.id in Enum.map(fused, & &1.id)
+      assert neighbor.id in Enum.map(fused, & &1.id)
+
+      # The seam is wired into the real search path, not just unit-tested in isolation.
+      {:ok, %{results: reranked}} =
+        Knowledge.search_combined(tenant.id, "graphlane",
+          rerank: true,
+          reranker: __MODULE__.ReversingReranker
+        )
+
+      assert Enum.map(reranked, & &1.id) == fused |> Enum.map(& &1.id) |> Enum.reverse()
+
+      # And a reranker that blows up degrades the ORDER, never the search — the whole
+      # reason `search_combined/3` has no error branch for it.
+      {:ok, %{results: survived}} =
+        Knowledge.search_combined(tenant.id, "graphlane",
+          rerank: true,
+          reranker: __MODULE__.RaisingReranker
+        )
+
+      assert Enum.map(survived, & &1.id) == Enum.map(fused, & &1.id)
     end
 
     test "is ON by default, and `graph_lane: false` still turns it off" do

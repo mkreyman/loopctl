@@ -303,6 +303,45 @@ table** — the unsampled form times out.
 production's ~10, so the eval's job here is to prove no regression and to carry the one
 capability question, not to size the gain.
 
+## Scoring an LLM stage offline (the rerank fixture)
+
+The eval's provider lane is synthetic by design, so an LLM stage cannot be scored by running
+it — CI has no key, a real call costs money, and two runs of the same commit would disagree.
+The way round it is record-once / replay-always:
+
+```bash
+# once, with a real key, to produce the evidence
+ANTHROPIC_API_KEY=... mix loopctl.retrieval.eval --mode embeddings --record-rerank
+
+# thereafter, offline and deterministic
+mix loopctl.retrieval.eval --mode embeddings           # reranker off
+mix loopctl.retrieval.eval --mode embeddings --rerank  # replays the recording
+```
+
+`--record-rerank` runs `Loopctl.Knowledge.Reranker.Llm` for real and writes
+`priv/retrieval_eval/rerank_fixture.json`; `--rerank` replays it through
+`Reranker.Fixture`. Four things about that file:
+
+- **It is a recording, not an expectation.** A hand-written fixture measures the author's
+  taste and reports it as a model's judgement.
+- **Keys are the query plus the candidate TITLES in their pre-rerank order.** Ids fold in the
+  throwaway tenant id and change every run. Reordering the input is a different question, so
+  it must miss rather than replay an ordering chosen for a different starting point.
+- **A miss is a no-op, never an error.** Add a golden question and it replays unreranked
+  until you re-record — visible in the delta, not as a crash. Re-record after ANY change
+  that moves the candidate set, tag indexing and the graph lane weight included.
+- **An empty recording is refused.** If every call fails (no key, a 401, a timeout) the task
+  raises rather than overwriting real evidence with a provider outage.
+
+Read the result with two cautions. `--mode keyword_only` is unaffected (the reranker sits on
+the combined page). And reranking is the measurement most contaminated by the synthetic
+vectors: it exists to repair a bad ordering, and the ordering it repairs here was produced by
+a random projection, which is bad in ways the real one is not.
+
+**Always read the per-question table, not the aggregate.** Reranking scored +0.105 MRR and
++1 answered while taking `q-mh-rotating-verifier` and its pair from recall@5 1.0 to 0.0 —
+the aggregate stayed positive because other questions gained at the same time.
+
 ## Re-baselining
 
 ```

@@ -319,15 +319,61 @@ that would show the remaining gap is semantic rather than lexical.
 
 **Check (met):** no regression, plus a question that is unanswerable without the change.
 
-### Phase 4 — Reranking
+### Phase 4 — Reranking *(BUILT, MEASURED, and shipped OFF)*
 *(Phase 5 landed first: it needed no new vendor, no LLM on the recall path, and the lane it
-turns on was already written and reviewed. Reranking's own case is unchanged and still the
-weakest — see §5.)*
+turns on was already written and reviewed.)*
 Two-stage retrieval over the top-N candidates. The literature's 67% figure is *combined with*
 Phase 3, so it is sequenced after it. Cheapest viable implementation is an LLM reranker over
 the existing BYO-key `Loopctl.LLM` plumbing — no new vendor — but it puts an LLM call on the
 recall path (~200/day), so cost is part of the experiment, not an afterthought.
 **Check:** nDCG@5 and answered@5 vs baseline; measured cost per recall.
+
+**The instrument had to come first, again.** An LLM stage cannot be scored by an eval whose
+provider lane is synthetic by design, so `mix loopctl.retrieval.eval --record-rerank` runs
+`Reranker.Llm` against the golden set once with a real key and commits what it returned;
+every later run replays that recording through `Reranker.Fixture`. CI scores a real model's
+judgement with no key, no bill and no run-to-run disagreement — verified: two replays of the
+same commit are byte-identical. A hand-written fixture would have measured the author's taste
+and reported it as a model's.
+
+**Result (golden_v5, embeddings arm, claude-haiku-4-5):**
+
+| metric | off | on | delta |
+|---|---:|---:|---:|
+| MRR | 0.6729 | **0.7783** | **+0.1054** |
+| nDCG@5 | 0.6486 | 0.7353 | +0.0867 |
+| recall@5 | 0.6935 | 0.7097 | +0.0161 |
+| answered | 49 | 50 | +1 |
+
+Every aggregate improves, and MRR by more than anything else in this plan. **It ships OFF
+anyway**, for four reasons that the aggregates hide:
+
+1. **It undoes Phase 5.** `q-mh-rotating-verifier` and its distilled pair go from recall@5
+   **1.0 to 0.0** — the multi-hop questions the graph lane was added for, hours earlier. A
+   reranker judges a candidate from the query, its title and its snippet, which is exactly
+   the surface-similarity criterion the graph lane exists to bypass. The aggregate recall
+   stayed positive only because other questions gained at the same time; the interaction is
+   invisible in the headline and visible only per question. A positional pin on
+   graph-lane-only candidates was tried and is inert — with the eval's synthetic embeddings
+   those documents also carry a weak semantic score, so nothing on the fused result says
+   "the graph lane is why this is here".
+2. **This is the result most contaminated by the synthetic embedding stand-in**, and it is
+   the one where that matters most. Reranking is by definition "repair a bad ordering", and
+   the ordering it repairs here was produced by a random-projection vector, which is bad in
+   ways the real one is not. Phase 3 was measured against real Postgres FTS and Phase 5
+   against a real link graph; this is not comparable evidence.
+3. **It puts an LLM call on the DEFAULT search path** — every `knowledge_search` and every
+   injected `/recall`, on the order of 200+/day — to improve something no production
+   measurement implicates.
+4. **Ranking is one of the three causes already eliminated** for the injected channel's
+   follow-through gap (§2b), so the phase aims at a problem the measurements say we do not
+   have.
+
+**Overturn condition:** Phase 2c's counters showing that surfaced-and-not-opened traffic is
+an ORDERING problem — e.g. cross-key opens concentrated on results below rank 3 while rank 1
+goes unread. Then turn it on (`:knowledge_reranker_enabled`), and budget for fixing the
+graph-lane interaction first, because that fix is a change to what `merge_results/5` tells
+its consumers about a candidate's provenance.
 
 ### Phase 5 — Use the graph at retrieval time *(DONE)*
 We hold 526k edges and traverse none of them when answering. The research says vector-for-
@@ -416,11 +462,15 @@ otherwise be asked to compensate for it and cannot.
 - Phase 5 — **DONE.** The graph lane is ON at weight 0.15, chosen by a sweep on golden_v4
   rather than by argument. What blocked it was never the code (#470 built the lane) but the
   instrument: the eval seeded no edges, so the lane was unjudgeable there. See Phase 5 above.
-- Phases 3, 4, 6, 7 — not started, and the ordering has moved on the evidence:
-  - **Phase 4 (reranking) is the weakest-motivated of them.** Ranking, query length and
-    distillation are each eliminated as the cause of the injected channel's gap, so a better
-    ranker improves something no measurement implicates. It should not be started until
-    Phase 2c's counters say ranking is the problem.
+- Phase 4 — **BUILT AND MEASURED, shipped OFF** (see above). The seam, both
+  implementations, the recording instrument and the evidence are in the repo; the default is
+  `false` with a written overturn condition. This is the opposite of where the graph lane sat
+  this morning — off, but no longer unjudged.
+- Phases 6, 7 — not started:
+  - **Phase 4's weak motivation survived contact with its own measurement.** It was called
+    the weakest-motivated phase before it was built, on the grounds that ranking is an
+    eliminated cause; building it produced the plan's largest MRR gain AND a capability
+    regression, which does not change that verdict — it sharpens it.
   - **Phases 3 and 5 both landed on that reasoning** — each changes what is retrievable at
     all rather than how a fixed candidate set is ordered, which is why both were adjudicable
     on the eval alone.

@@ -133,6 +133,14 @@ defmodule Loopctl.Knowledge.RetrievalEval do
       `:knowledge_rrf_graph_lane_enabled`. This is what makes the lane an A/B rather than a
       belief: run the same golden set twice and compare, instead of comparing a lane-on run
       against a baseline recorded with the lane off.
+    * `:rerank` — passed through as the per-call override of
+      `:knowledge_reranker_enabled`. With `:knowledge_reranker` left at its configured
+      value this scores whatever implementation is wired up; the eval task points it at
+      `Reranker.Fixture` so CI replays a recording instead of billing a provider.
+    * `:reranker` — the implementation module for this run, overriding
+      `:knowledge_reranker`. The eval task uses it to select replay vs recording without
+      mutating VM-global config.
+    * `:rerank_fixture_path` — override the recording `Reranker.Fixture` replays.
     * `:graph_weight` — passed through as the per-call override of
       `:knowledge_rrf_graph_weight`. The lane's RRF weight is the knob that trades its
       multi-hop recall gain against the top-rank perturbation it causes on single-fact
@@ -325,7 +333,17 @@ defmodule Loopctl.Knowledge.RetrievalEval do
 
     search_opts =
       opts
-      |> Keyword.take([:keyword_weight, :semantic_weight, :graph_lane, :graph_weight])
+      |> Keyword.take([
+        :keyword_weight,
+        :semantic_weight,
+        :graph_lane,
+        :graph_weight,
+        :rerank,
+        :reranker,
+        :rerank_fixture_path,
+        :rerank_api_key,
+        :rerank_model
+      ])
       |> Keyword.merge(
         limit: max_k,
         status: :published,
