@@ -428,10 +428,10 @@ that extends it. The structural ripple is there; what is missing is the TYPED ju
 
 **And the typed half has never existed at all.** Production edge census, 2026-08-17:
 
-| relationship | edges | with a recorded verdict |
+| relationship | edges | verdicts in `conflict_resolutions` |
 |---|---:|---:|
 | `relates_to` | 502,370 | — |
-| `potential_conflict` | 23,617 | **0** |
+| `potential_conflict` | 23,617 | **23,610 — the queue is 99.97% drained** |
 | `contradicts` | **0** | — |
 | `supersedes` | **0** | — |
 | `derived_from` | **0** | — |
@@ -439,15 +439,23 @@ that extends it. The structural ripple is there; what is missing is the TYPED ju
 Three of the five declared link types have never been written by anything, ever. And
 `find_contradiction_clusters/2` (`knowledge.ex:12119`) reads `:contradicts` — **a consumer
 with no producer**, so that lint report can only ever return empty. That is Karpathy #5's gap
-exactly, and the obvious Phase 6 is to build the missing producer.
+exactly, and Phase 6 is to build the missing producer.
 
-**It should not be built yet, and the reason is a number rather than a preference.** The
-existing conflict queue holds **23,617 pairs, of which ZERO have ever had a verdict
-recorded, and 13,502 arrived in the last 30 days** — roughly 450/day, unread. Adding a
-second, stronger flag on top of that is adding supply to a backlog nobody draws down, which
-is the failure #605 already named ("a queue whose only consumer is a human nobody staffs" —
-hit four times in this codebase). The right order is: make the EXISTING queue get consumed,
-then decide whether a sharper signal is what it was missing.
+**A correction, because the first version of this section argued the opposite from a bad
+query.** It reported the queue as holding 23,617 pairs with ZERO verdicts and concluded that
+building a producer would be adding supply to a backlog nobody draws down. That number came
+from looking for a `conflict_disposition` key in the LINK's metadata — a key that has never
+existed. Verdicts are rows in the `conflict_resolutions` TABLE, and there are **23,610 of
+them**, written nightly by `worker:knowledge_lint`, most recent today. The queue is consumed.
+
+**What the drained queue actually shows is a sharper gap than the backlog would have.** Every
+one of those 23,610 verdicts is `disposition: dismiss, classification: redundant`, and the
+judge that wrote them says why in its own evidence string: *"similarity cannot distinguish
+agreement from disagreement, so this pair was never evidence of a conflict."* It never reads
+the two articles. So the pipeline flags a pair on cosine similarity and then dismisses it on
+cosine similarity — **a genuine contradiction is auto-dismissed with the same sentence as a
+harmless duplicate**, and `contradicts` stays at zero because nothing on this path can ever
+emit it.
 
 **The literal Karpathy form — an unattended writer EDITING published article bodies — is
 refused outright**, separately from the ordering above. It is the highest blast radius in
@@ -457,8 +465,10 @@ applies only what two consecutive runs agree on and retracts with `unpublish` ra
 (#606/#608). Nothing here has a comparable undo — an edited body has no prior version to
 restore.
 
-**Revisit when:** the conflict queue's verdict count is non-zero and its backlog is falling.
-That is the observation showing a consumer exists for what a producer would emit.
+**The precondition is already met**: a consumer exists and keeps up. What it lacks is
+judgement, which is exactly what an LLM-backed judge supplies — and unlike the reranker, this
+one writes a durable, reviewable record rather than reordering a page, so the cost is per
+FLAGGED PAIR (bounded, nightly, ~450/day) rather than per search.
 
 ### Phase 7 — Cap the collector's fallacy
 The 1.8% read rate is a capture-policy problem and cannot be fixed by retrieval. Decide a
@@ -466,12 +476,13 @@ harvest budget and a promotion bar for what may enter the published corpus at al
 **Owner decision, not an engineering one** — recorded here because the preceding phases will
 otherwise be asked to compensate for it and cannot.
 
-**Phase 6's census sharpens the case, with a second independent number.** §1 measured the
-symptom as 1.8% of articles ever read. The conflict queue measures the same thing from the
-supply side: **13,502 new near-duplicate pairs in 30 days**, ~450/day, none triaged. Those
-are not retrieval failures — they are captures similar enough to something already held that
-a mechanical threshold flagged them. Two unrelated instruments now point at capture volume
-rather than at retrieval.
+**Phase 6's census supplies a second number, though a weaker one than first claimed.** §1
+measured the symptom as 1.8% of articles ever read. The conflict queue measures capture rate
+from the supply side: **13,502 new near-duplicate pairs in 30 days**, ~450/day. An earlier
+version of this paragraph added "none triaged", which was wrong — they are all triaged, and
+auto-dismissed. So the signal is about how much NEAR-DUPLICATE material is being captured,
+not about an unworked queue: ~450 pairs a day similar enough to something already held that a
+mechanical threshold flagged them.
 
 Concretely, what the owner is deciding between:
 
@@ -479,7 +490,9 @@ Concretely, what the owner is deciding between:
   rate stops outrunning any conceivable curation rate.
 - **A promotion bar** — capture everything, but publish only what clears a bar, leaving the
   rest as drafts. (`status: :draft` already exists and is already excluded from search.)
-- **Consuming the queue** — staff the 23,617 pairs, which is also Phase 6's precondition.
+- **Nothing** — accept the near-duplicate rate, on the grounds that the nightly judge
+  already absorbs it at no human cost. That is the current de-facto policy and is a
+  legitimate choice, but it should be a chosen one.
 
 Nothing in Phases 1-5 substitutes for any of these, which is the whole reason this phase is
 in the plan rather than left implicit.
@@ -522,10 +535,12 @@ in the plan rather than left implicit.
   implementations, the recording instrument and the evidence are in the repo; the default is
   `false` with a written overturn condition. This is the opposite of where the graph lane sat
   this morning — off, but no longer unjudged.
-- Phase 6 — **NOT BUILT, on a measurement.** Half of it already ships (the auto-linker's
-  `relates_to` plus `incoming_links`); the typed half has a consumer and no producer; and
-  the queue it would feed holds 23,617 pairs with zero verdicts ever. The unattended
-  body-editing form is refused outright. Overturn condition recorded above.
+- Phase 6 — **IN PROGRESS.** Half already ships (the auto-linker's `relates_to` plus
+  `incoming_links`). The typed half has a consumer and no producer: `contradicts` is read by
+  the lint and written by nothing, because the nightly judge decides on cosine similarity and
+  can only ever say "redundant". The unattended body-editing form stays refused outright.
+  (This entry previously said NOT BUILT, on a queue-backlog argument that came from querying
+  the wrong table — see Phase 6 above.)
 - Phase 7 — the owner's call, now with a second independent number behind it:
   - **Phase 4's weak motivation survived contact with its own measurement.** It was called
     the weakest-motivated phase before it was built, on the grounds that ranking is an
@@ -536,8 +551,8 @@ in the plan rather than left implicit.
     on the eval alone.
   - **Phase 7 is the owner's call and is the only phase left with work in it** — a 1.8% read
     rate is a capture-policy problem and no retrieval phase can compensate for it. It is now
-    backed by a second, independent number: 13,502 near-duplicate pairs flagged in 30 days,
-    none triaged.
+    backed by a second number: 13,502 near-duplicate pairs flagged in 30 days — all
+    auto-dismissed, which makes it a capture-rate signal rather than a backlog.
 
   - **What every phase that landed has in common.** Phases 2b, 2c, 3, 4 and 5 each spent
     most of their effort on the INSTRUMENT rather than the technique — a paired golden
