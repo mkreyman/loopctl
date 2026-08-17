@@ -774,10 +774,25 @@ jobs:
       - name: Install and start pgbouncer (transaction pooling) in front of Postgres
         run: |
           # Retry the install so a transient apt-mirror hiccup doesn't block a deploy.
-          for attempt in 1 2 3; do
-            sudo apt-get update && sudo apt-get install -y pgbouncer && break
-            echo "apt install attempt $attempt failed; retrying"; sleep 5
-          done
+          #
+          # Each apt call is wrapped in `timeout` because the retry loop was written for the
+          # wrong failure mode: it handles apt EXITING non-zero, and what actually happens on
+          # this self-hosted runner is apt HANGING — on a dpkg/apt lock held by
+          # unattended-upgrades, or on an unresponsive mirror. A hung call never returns, so
+          # the loop never reaches attempt 2 and the whole job dies on the 15-minute limit
+          # with one attempt made. That happened twice on 2026-08-17 (PRs #694 and #697),
+          # blocking merges both times and needing a manual re-run.
+          #
+          # Skip `apt-get update` when the package is already installed: the cached case is
+          # the common one on a self-hosted runner, and it is the update that hangs.
+          if ! command -v pgbouncer >/dev/null; then
+            for attempt in 1 2 3; do
+              timeout 180 sudo apt-get update \
+                && timeout 180 sudo apt-get install -y pgbouncer \
+                && break
+              echo "apt install attempt $attempt failed or timed out; retrying"; sleep 5
+            done
+          fi
           command -v pgbouncer >/dev/null || { echo "pgbouncer install failed after retries"; exit 1; }
           # The apt package enables/starts a default pgbouncer (own /etc/pgbouncer.ini on
           # :6432 with no loopctl_test db). Stop it so OUR instance owns the port.
