@@ -43,9 +43,14 @@ in §2.1 survived — the segmentation trap is documented there in step 2.
   single largest caveat on the whole plan**: the headline metric cannot separate "surfaced and
   ignored" from "surfaced and sufficient".
 - **The documented healthy band is 1–7%, "the biggest number in this area and the least moved
-  by anything shipped so far."** The attributed hook channel measures **11.3%** (§2.1), which
-  is ABOVE that band. So the honest reading of the injected channel is *at or above its
-  historical norm*, not collapsing.
+  by anything shipped so far."** The attributed hook channel measures 11.3% (§2.1) — but that
+  comparison is only suggestive, and saying so is the point of §2.1: the runbook does not state
+  its attribution rule, and 11.3% is an UPPER bound (the cross-key rule it requires is
+  confounded whenever the deliberate channel surfaced the same article). Two follow-through
+  numbers computed under unstated rules are not comparable, which is exactly the mistake this
+  note already made once. What survives is the weaker, sufficient claim: **there is no
+  measurement here showing the injected channel below its historical norm**, so "follow-through
+  is collapsing" is unsupported rather than refuted.
 - **Step 4, verbatim: "Do not spend a month's work on the retrieval side on the strength of a
   utilization number that was never segmented by origin."** Phases 3–5 are retrieval-side
   work, and §1's numbers were unsegmented. That warning lands on this plan.
