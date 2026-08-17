@@ -152,7 +152,12 @@ defmodule LoopctlWeb.Plugs.DBErrorBackstopTest do
       # The leak is a property of the nested struct (statement + bound args), not of WHICH
       # process called the pool, so classifying by the call element alone left this shape raw.
       {conn, tenant} = authed_conn(conn)
-      conn = put_req_header(conn, "x-test-raise-db-error", "exit-task")
+      request_id = unique_request_id()
+
+      conn =
+        conn
+        |> put_req_header("x-test-raise-db-error", "exit-task")
+        |> put_req_header("x-request-id", request_id)
 
       {_, log} =
         with_log(fn ->
@@ -165,6 +170,12 @@ defmodule LoopctlWeb.Plugs.DBErrorBackstopTest do
       assert log =~ "sqlstate=42P01"
       # The exit path attributes the fault WITHOUT the router frame (Logger metadata).
       assert log =~ "tenant_id=#{tenant.id}"
+
+      # The POSITIVE half of `refute_backstop_mapped/2`. Without an assertion somewhere that
+      # this exact shape DOES appear when the backstop maps a request, the two refutes below
+      # would be unfalsifiable — a typo in the regex, or a request id that never reaches the
+      # line, and they would pass forever while asserting nothing.
+      assert log =~ ~r/db_error mapped to HTTP[^\n]*request_id=#{Regex.escape(request_id)}/
     end
 
     test "a NON-DB exception nested under a pool call element keeps its identity",
@@ -172,27 +183,59 @@ defmodule LoopctlWeb.Plugs.DBErrorBackstopTest do
       # Dressing it as a `DBConnection.ConnectionError` advertised a permanent defect as a
       # retryable 503 and erased the only record of what actually failed.
       {conn, _tenant} = authed_conn(conn)
-      conn = put_req_header(conn, "x-test-raise-db-error", "exit-nested-runtime")
+      request_id = unique_request_id()
+
+      conn =
+        conn
+        |> put_req_header("x-test-raise-db-error", "exit-nested-runtime")
+        |> put_req_header("x-request-id", request_id)
 
       {reason, log} = with_log(fn -> catch_exit(LoopctlWeb.Endpoint.call(conn, [])) end)
 
       assert {{%RuntimeError{message: "pool process defect"}, []}, {DBConnection, :run, []}} =
                reason
 
-      refute log =~ "db_error mapped to HTTP"
+      refute_backstop_mapped(log, request_id)
     end
 
     test "a FOREIGN exit is re-exited untouched and not attributed to the database",
          %{conn: conn} do
       {conn, _tenant} = authed_conn(conn)
-      conn = put_req_header(conn, "x-test-raise-db-error", "exit-foreign")
+      request_id = unique_request_id()
+
+      conn =
+        conn
+        |> put_req_header("x-test-raise-db-error", "exit-foreign")
+        |> put_req_header("x-request-id", request_id)
 
       {reason, log} =
         with_log(fn -> catch_exit(LoopctlWeb.Endpoint.call(conn, [])) end)
 
       assert {:timeout, {GenServer, :call, _args}} = reason
       refute log =~ "DBErrorBackstop"
-      refute log =~ "db_error mapped to HTTP"
+      refute_backstop_mapped(log, request_id)
     end
+  end
+
+  # `with_log/1` captures the GLOBAL Logger and this suite is `async: true`, so a bare
+  # `refute log =~ "db_error mapped to HTTP"` fails whenever ANY concurrent test logs that
+  # line — observed 2026-08-17 against a foreign tenant's `sqlstate=57014`, reddening a PR
+  # that touched none of this.
+  #
+  # Scoping by TENANT was tried first and is wrong: these two tests assert the backstop
+  # stayed silent, so their capture never mentions their own tenant either, and the refute
+  # becomes one that can never fail. Verified by mutation. The request id is the right
+  # discriminator because `DBErrorBackstop` puts it on the SAME line as the phrase, so the
+  # assertion is exactly as strong as the bare one and is about THIS request.
+  defp refute_backstop_mapped(log, request_id) do
+    refute log =~ ~r/db_error mapped to HTTP[^\n]*request_id=#{Regex.escape(request_id)}/,
+           "the backstop mapped this request when it should have left the exit alone"
+  end
+
+  # `Plug.RequestId` only honours an inbound header that looks like a request id (20..200
+  # chars, a restricted alphabet), so this has to be shaped like one rather than be any
+  # unique string — otherwise the plug silently generates its own and the scoping is lost.
+  defp unique_request_id do
+    "dbbackstoptest" <> Integer.to_string(System.unique_integer([:positive]) + 1_000_000_000)
   end
 end
