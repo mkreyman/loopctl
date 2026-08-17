@@ -300,12 +300,22 @@ defmodule Loopctl.Knowledge.RetrievalEvalTest do
       end)
     end
 
-    test "doc_ids and titles are unique across the whole committed file" do
+    test "doc_ids and titles are unique across every question that OWNS a corpus" do
       golden = fixture(:retrieval_golden_set)
-      docs = Enum.flat_map(golden.questions, & &1.corpus)
+
+      # Scoped to own-corpus questions: a `corpus_ref` question holds a COPY of the docs
+      # its pair owns (golden_v3), so counting it here compares every shared doc against
+      # itself. The uniqueness that matters is over what is actually SEEDED, which is what
+      # `GoldenSet.corpus/1` returns — asserted below so the exemption cannot widen into a
+      # file where two owners collide.
+      docs = golden.questions |> Enum.filter(&is_nil(&1.corpus_ref)) |> Enum.flat_map(& &1.corpus)
 
       assert length(Enum.uniq_by(docs, & &1.doc_id)) == length(docs)
       assert length(Enum.uniq_by(docs, & &1.title)) == length(docs)
+
+      seeded = GoldenSet.corpus(golden)
+      assert length(seeded) == length(docs), "every owned doc is seeded exactly once"
+      assert length(Enum.uniq_by(seeded, & &1.title)) == length(seeded)
     end
 
     test "the committed baseline was measured against the committed golden version" do
@@ -345,6 +355,114 @@ defmodule Loopctl.Knowledge.RetrievalEvalTest do
       assert_raise ArgumentError, ~r/age_days must be a non-negative number/, fn ->
         GoldenSet.parse!(header <> "\n" <> negative <> "\n")
       end
+    end
+
+    test "corpus_ref borrows the referenced question's corpus and labels (golden_v3)" do
+      header = ~s({"kind":"header","version":"golden_v3"})
+
+      owner =
+        ~s({"kind":"question","id":"q-own","question":"the prose question","relevant":["d1"],) <>
+          ~s("graded":{"d1":3},) <>
+          ~s("corpus":[{"doc_id":"d1","title":"t1","body":"b1","category":"pattern"},) <>
+          ~s({"doc_id":"d2","title":"t2","body":"b2","category":"pattern"}]})
+
+      paired =
+        ~s({"kind":"question","id":"q-own-kwbag","question":"prose question",) <>
+          ~s("corpus_ref":"q-own"})
+
+      golden = GoldenSet.parse!(header <> "\n" <> owner <> "\n" <> paired <> "\n")
+      [own, ref] = golden.questions
+
+      assert ref.corpus_ref == "q-own"
+      assert Enum.map(ref.corpus, & &1.doc_id) == Enum.map(own.corpus, & &1.doc_id)
+      assert ref.relevant == own.relevant
+      assert ref.graded == own.graded
+
+      # Its own query text is what makes the pair a measurement, so it must NOT be copied.
+      refute ref.question == own.question
+
+      # The shared corpus seeds ONCE: two questions, two docs, not four. A doubled corpus
+      # would make each copy the other's strongest distractor and measure the duplication.
+      assert length(GoldenSet.corpus(golden)) == 2
+    end
+
+    test "a corpus_ref question is exempt from doc-id uniqueness, not a hole in it" do
+      header = ~s({"kind":"header","version":"golden_v3"})
+
+      owner =
+        ~s({"kind":"question","id":"q-a","question":"qa","relevant":["dup"],) <>
+          ~s("corpus":[{"doc_id":"dup","title":"tdup","body":"b","category":"pattern"}]})
+
+      # Two OWN-corpus questions sharing a doc_id must still be rejected.
+      other =
+        ~s({"kind":"question","id":"q-b","question":"qb","relevant":["dup"],) <>
+          ~s("corpus":[{"doc_id":"dup","title":"tdup2","body":"b","category":"pattern"}]})
+
+      assert_raise ArgumentError, ~r/duplicate corpus doc_id/, fn ->
+        GoldenSet.parse!(header <> "\n" <> owner <> "\n" <> other <> "\n")
+      end
+    end
+
+    test "rejects a corpus_ref that is unresolvable, self-referential, chained, or shadowed" do
+      header = ~s({"kind":"header","version":"golden_v3"})
+
+      owner =
+        ~s({"kind":"question","id":"q-own","question":"q","relevant":["d1"],) <>
+          ~s("corpus":[{"doc_id":"d1","title":"t1","body":"b","category":"pattern"}]})
+
+      missing = ~s({"kind":"question","id":"q-x","question":"q","corpus_ref":"q-nope"})
+
+      assert_raise ArgumentError, ~r/names no question in this file/, fn ->
+        GoldenSet.parse!(header <> "\n" <> owner <> "\n" <> missing <> "\n")
+      end
+
+      itself = ~s({"kind":"question","id":"q-self","question":"q","corpus_ref":"q-self"})
+
+      # Pinned on the SPECIFIC message: a self-ref is also caught by the chain guard below
+      # (it has a non-nil corpus_ref), so a loose regex here would pass with this guard
+      # deleted and the reader would get "chains are not allowed" for a self-reference.
+      assert_raise ArgumentError, ~r/points at itself/, fn ->
+        GoldenSet.parse!(header <> "\n" <> owner <> "\n" <> itself <> "\n")
+      end
+
+      # A chain would resolve differently depending on file ORDER, so one hop only.
+      hop1 = ~s({"kind":"question","id":"q-h1","question":"q","corpus_ref":"q-own"})
+      hop2 = ~s({"kind":"question","id":"q-h2","question":"q","corpus_ref":"q-h1"})
+
+      assert_raise ArgumentError, ~r/chains are not allowed/, fn ->
+        GoldenSet.parse!(header <> "\n" <> owner <> "\n" <> hop1 <> "\n" <> hop2 <> "\n")
+      end
+
+      # Declaring both is ambiguous about which corpus scores.
+      shadowed =
+        ~s({"kind":"question","id":"q-both","question":"q","corpus_ref":"q-own",) <>
+          ~s("relevant":["d9"],) <>
+          ~s("corpus":[{"doc_id":"d9","title":"t9","body":"b","category":"pattern"}]})
+
+      assert_raise ArgumentError, ~r/must not declare their own/, fn ->
+        GoldenSet.parse!(header <> "\n" <> owner <> "\n" <> shadowed <> "\n")
+      end
+    end
+
+    test "the committed set pairs every prose question with a DIFFERENT distilled query" do
+      golden = fixture(:retrieval_golden_set)
+      by_id = Map.new(golden.questions, &{&1.id, &1})
+      {paired, prose} = Enum.split_with(golden.questions, & &1.corpus_ref)
+
+      assert paired != [], "golden_v3 must carry paired -kwbag questions"
+
+      # Every prose question has a pair, and every pair differs from its source in QUERY
+      # only. A pair whose text drifted back to the prose form measures nothing, and this
+      # is the one property no aggregate metric would reveal.
+      Enum.each(prose, fn q ->
+        pair =
+          Map.get(by_id, q.id <> "-kwbag") ||
+            flunk("#{q.id} has no -kwbag pair; the paired design is only valid as a full set")
+
+        assert pair.corpus_ref == q.id
+        refute pair.question == q.question, "#{pair.id} is not distilled — same text as #{q.id}"
+        assert pair.relevant == q.relevant
+      end)
     end
 
     test "raises with a clear message on a malformed entry" do

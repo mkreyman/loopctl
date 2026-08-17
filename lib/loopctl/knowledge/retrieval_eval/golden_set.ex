@@ -59,6 +59,29 @@ defmodule Loopctl.Knowledge.RetrievalEval.GoldenSet do
       is grade 0 regardless. Because a grade on a non-relevant doc is therefore inert (and
       almost always a mistake), the loader rejects a `graded` key that is not also in
       `relevant`.
+    * `corpus_ref` — optional id of ANOTHER question whose `corpus`, `relevant` and
+      `graded` this question borrows (golden_v3). A question using it supplies only its own
+      `question` text and must declare none of those three itself. See below.
+
+  ## Paired questions: measuring query SHAPE (`corpus_ref`, golden_v3)
+
+  Production traffic is not shaped like a hand-authored question. 71% of this KB's search
+  volume is the injected recall hook, which distils the user's prompt into a stop-word-
+  stripped salience bag of at most 8 terms — "enable row level security new tenant scoped
+  table", not "how do I enable row level security on a new tenant scoped table". Whether
+  retrieval survives that transformation was unmeasurable while every golden question was
+  prose.
+
+  `corpus_ref` makes it a controlled experiment. The paired question carries the hook's
+  output verbatim as its `question` and points at the prose question's corpus, so both are
+  scored against an IDENTICAL corpus with IDENTICAL labels and the per-question delta is
+  attributable to the query alone. Duplicating the corpus under fresh doc_ids would instead
+  seed two near-identical article sets into the one shared tenant, where each copy becomes
+  the other's strongest distractor — that measures the duplication, not the query.
+
+  Refs are resolved at load time and are deliberately restricted: one hop only (no chains,
+  whose resolution would depend on file order), no self-reference, and the referring
+  question may not declare its own corpus/labels.
 
   ## Adding a labeled question
 
@@ -94,7 +117,8 @@ defmodule Loopctl.Knowledge.RetrievalEval.GoldenSet do
           source: String.t() | nil,
           corpus: [doc()],
           relevant: [String.t()],
-          graded: %{String.t() => non_neg_integer()}
+          graded: %{String.t() => non_neg_integer()},
+          corpus_ref: String.t() | nil
         }
 
   @type t :: %{version: String.t(), description: String.t() | nil, questions: [question()]}
@@ -152,7 +176,7 @@ defmodule Loopctl.Knowledge.RetrievalEval.GoldenSet do
         set = %{
           version: fetch_string!(header, "version", "header"),
           description: header["description"],
-          questions: questions
+          questions: resolve_corpus_refs!(questions)
         }
 
         validate!(set)
@@ -195,6 +219,60 @@ defmodule Loopctl.Knowledge.RetrievalEval.GoldenSet do
   end
 
   # ===========================================================================
+  # corpus_ref — a PAIRED question (golden_v3)
+  # ===========================================================================
+
+  # A `corpus_ref` question supplies only its own `question` text and borrows the corpus
+  # AND labels of the question it names. That is what makes query SHAPE measurable: the
+  # prose question and the keyword-bag the recall hook distils it into are scored against
+  # an identical corpus with identical labels, so the per-question delta between the pair
+  # is attributable to the query alone. Duplicating the corpus under fresh doc_ids instead
+  # would seed two near-identical article sets into one tenant, and each copy would become
+  # the other's strongest distractor — measuring the duplication, not the query.
+  #
+  # Resolution happens at LOAD time, so every consumer downstream (`compute/2`,
+  # `corpus/1`, `grade/2`, the report) sees an ordinary fully-populated question and needed
+  # no change. `corpus/1` de-duplicates by doc_id, so a shared corpus is still seeded once.
+  defp resolve_corpus_refs!(questions) do
+    by_id = Map.new(questions, &{&1.id, &1})
+
+    Enum.map(questions, fn
+      %{corpus_ref: nil} = question ->
+        question
+
+      %{corpus_ref: ref, id: id} = question ->
+        # A ref question declaring its own corpus/labels is ambiguous about which set
+        # scores, so it is rejected rather than silently resolved one way.
+        if question.corpus != [] or question.relevant != [] or question.graded != %{} do
+          raise ArgumentError,
+                "golden question #{id}: corpus_ref questions must not declare their own " <>
+                  "corpus, relevant or graded (they borrow the referenced question's)"
+        end
+
+        target =
+          Map.get(by_id, ref) ||
+            raise ArgumentError,
+                  "golden question #{id}: corpus_ref #{inspect(ref)} names no question in " <>
+                    "this file"
+
+        if ref == id do
+          raise ArgumentError, "golden question #{id}: corpus_ref points at itself"
+        end
+
+        # No chains: resolving A -> B -> C would depend on file ORDER, and a cycle would
+        # not terminate. One hop keeps the reference relation trivially total.
+        if target.corpus_ref != nil do
+          raise ArgumentError,
+                "golden question #{id}: corpus_ref #{inspect(ref)} is itself a corpus_ref " <>
+                  "question (chains are not allowed — point at the question that owns the " <>
+                  "corpus)"
+        end
+
+        %{question | corpus: target.corpus, relevant: target.relevant, graded: target.graded}
+    end)
+  end
+
+  # ===========================================================================
   # Decoding — a FIXED set of string keys mapped to atom keys. Never
   # `String.to_atom/1` on file content.
   # ===========================================================================
@@ -213,7 +291,8 @@ defmodule Loopctl.Knowledge.RetrievalEval.GoldenSet do
       source: raw["source"],
       corpus: Enum.map(raw["corpus"] || [], &normalize_doc!(&1, line_no)),
       relevant: raw["relevant"] || [],
-      graded: raw["graded"] || %{}
+      graded: raw["graded"] || %{},
+      corpus_ref: raw["corpus_ref"]
     }
   end
 
@@ -296,7 +375,12 @@ defmodule Loopctl.Knowledge.RetrievalEval.GoldenSet do
     if questions == [], do: raise(ArgumentError, "golden set has no questions")
 
     validate_unique!(Enum.map(questions, & &1.id), "question id")
-    all_docs = Enum.flat_map(questions, & &1.corpus)
+
+    # Only questions that DECLARE a corpus contribute to doc-id/title uniqueness. A
+    # `corpus_ref` question was handed a copy of another question's docs by
+    # `resolve_corpus_refs!/1`, so counting it here would flag every shared doc as a
+    # duplicate of itself.
+    all_docs = questions |> Enum.filter(&is_nil(&1.corpus_ref)) |> Enum.flat_map(& &1.corpus)
     validate_doc_uniqueness!(all_docs)
     Enum.each(questions, &validate_question!/1)
 
