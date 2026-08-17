@@ -137,6 +137,38 @@ One caution specific to our volume: the arms are thin, and automation rows surfa
 never open anything, which depresses every rank uniformly. Segment on `client_host IS NOT NULL`
 here too, and do not read a few dozen rows as a result.
 
+## 3b. The follow-through number has a channel-shaped hole — and now a second reading
+
+`search_follow_through` and `followed_through` correlate a search with an open on
+`api_key_id`. The injected recall hook searches under a DIFFERENT key from the session that
+reads: measured 2026-08-17, the hook's key made 1,071 searches and **1** deliberate read
+ever, the MCP/session key 0 such searches and 2,535 reads. **So the channel carrying 71% of
+search volume has always scored a structural zero in those fields, and that zero means
+unmeasurable, not unread.**
+
+Reads now carry `origin_search_id` / `origin_attribution`, resolved server-side at write
+time, and the metrics payload reports:
+
+| field | unit | read it as |
+|---|---|---|
+| `attributed_opens` | READS | opens whose originating search is known |
+| `cross_key_opens` | READS | **the injected channel** — surfaced by one key, read by another |
+| `direct_opens` | READS | agent went straight to the article (link, cited id) — not a miss |
+| `searches_reformulated` | SEARCH CALLS | asked again, in-window, nothing opened — a real failure |
+| `searches_quiet` | SEARCH CALLS | neither opened nor re-asked — **still ambiguous** |
+
+Two things to hold onto when reading them:
+
+- **Units differ from `followed_through`.** That counts SURFACED RESULTS later opened; the
+  `*_opens` fields count READS. They are not comparable and neither supersedes the other.
+- **`quiet` is not "sufficed".** Splitting `reformulated` out removes the one unambiguous
+  failure from the not-opened bucket; it does NOT resolve the snippet-sufficed-vs-ignored
+  ambiguity in step 4 below. Nothing here turns a floor into a satisfaction rate.
+
+Cross-key attribution is circumstantial by construction — two agents in one tenant can reach
+one article independently — which is why it is a separate labelled field rather than folded
+into `attributed_opens`.
+
 ## 4. The trap
 
 Search returns; agents do not open. Search-to-read has sat near 27:1, and 1.74% of

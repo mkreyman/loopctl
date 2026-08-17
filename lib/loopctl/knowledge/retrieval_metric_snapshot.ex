@@ -71,6 +71,18 @@ defmodule Loopctl.Knowledge.RetrievalMetricSnapshot do
     field :retrieved_searched, :integer, default: 0
     field :retrieved_followed_through, :integer, default: 0
     field :retrieved_precision, :float, default: 0.0
+
+    # Unit: READS (get/context/drill rows), NOT surfaced results and NOT search calls.
+    # `followed_through` above counts SURFACED RESULTS that were later opened, so it is not
+    # comparable with these three — the naming keeps the units legible.
+    field :attributed_opens, :integer, default: 0
+    field :cross_key_opens, :integer, default: 0
+    field :direct_opens, :integer, default: 0
+
+    # Unit: SEARCH CALLS. With `searches_with_follow_through` these partition `searches`.
+    field :searches_reformulated, :integer, default: 0
+    field :searches_quiet, :integer, default: 0
+
     field :computed_at, :utc_datetime_usec
 
     timestamps(type: :utc_datetime_usec)
@@ -92,6 +104,11 @@ defmodule Loopctl.Knowledge.RetrievalMetricSnapshot do
     :retrieved_searched,
     :retrieved_followed_through,
     :retrieved_precision,
+    :attributed_opens,
+    :cross_key_opens,
+    :direct_opens,
+    :searches_reformulated,
+    :searches_quiet,
     :computed_at
   ]
 

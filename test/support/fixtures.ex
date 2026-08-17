@@ -937,7 +937,13 @@ defmodule Loopctl.Fixtures do
         accessed_at: data.accessed_at
       })
 
-    AdminRepo.insert!(changeset)
+    # Origin is writer-resolved and therefore NOT castable (see
+    # `ArticleAccessEvent.create_changeset/2`). A metrics test still needs rows in a known
+    # attribution class without replaying a whole search, so seed them past the changeset
+    # here — deliberately the only place that does, so production code has no such path.
+    changeset
+    |> Ecto.Changeset.change(Map.take(attrs, [:origin_search_id, :origin_attribution]))
+    |> AdminRepo.insert!()
   end
 
   def fixture(:project, attrs) do

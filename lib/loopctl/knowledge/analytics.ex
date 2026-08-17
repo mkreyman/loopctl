@@ -52,6 +52,20 @@ defmodule Loopctl.Knowledge.Analytics do
   # `"drill"` exists and why the two allowlists move together (#569).
   @valid_access_types ~w(search get context index drill)
 
+  # The access types that mean "a body was DELIVERED to the agent" — the ones worth
+  # attributing back to a search. Deliberately the same three `RetrievalMetrics` counts as
+  # follow-through, INCLUDING `drill`: #569 split drill out of the heat index so that index
+  # could not rank on reads it caused itself, but "was this read produced by a search" is a
+  # different question and a drill delivers a body like any other read.
+  @attributable_access_types ~w(get context drill)
+
+  # How far back a read looks for the search that surfaced it. Fixed at WRITE time, which is
+  # the one thing that makes `origin_search_id` cheap and stable — but it means the
+  # attributed counters do NOT move with `RetrievalMetrics`' query-time `window_seconds`.
+  # Same default (30 min) so the two agree by construction on the common case; stated in the
+  # metrics payload so nobody reads a divergence as a bug.
+  @origin_window_seconds 1800
+
   @doc """
   The access types `record_access/6` will write.
 
@@ -63,6 +77,22 @@ defmodule Loopctl.Knowledge.Analytics do
   """
   @spec valid_access_types() :: [String.t()]
   def valid_access_types, do: @valid_access_types
+
+  @doc """
+  The access types whose rows get an `origin_search_id` resolved at write time.
+  """
+  @spec attributable_access_types() :: [String.t()]
+  def attributable_access_types, do: @attributable_access_types
+
+  @doc """
+  The write-time lookback, in seconds, for resolving a read's originating search.
+
+  Exposed because it is NOT the same knob as `RetrievalMetrics`' query-time
+  `window_seconds`: this one is baked into each row when it is written and cannot be
+  re-asked of history.
+  """
+  @spec origin_window_seconds() :: pos_integer()
+  def origin_window_seconds, do: @origin_window_seconds
 
   # How many of a search's results get an `article_access_events` row (#582). Rows are
   # written per SURFACED RESULT, so an uncapped search would write an unbounded batch on
@@ -1107,6 +1137,9 @@ defmodule Loopctl.Knowledge.Analytics do
 
     rows =
       Enum.map(items, fn {article_id, meta} ->
+        {origin_search_id, origin_attribution} =
+          resolve_origin(tenant_id, article_id, api_key_id, access_type, now)
+
         %{
           id: Ecto.UUID.generate(),
           tenant_id: tenant_id,
@@ -1116,7 +1149,9 @@ defmodule Loopctl.Knowledge.Analytics do
           story_id: story_id,
           access_type: access_type,
           metadata: ensure_map(meta),
-          accessed_at: now
+          accessed_at: now,
+          origin_search_id: origin_search_id,
+          origin_attribution: origin_attribution
         }
       end)
 
@@ -1138,6 +1173,87 @@ defmodule Loopctl.Knowledge.Analytics do
 
       :ok
   end
+
+  # ---------------------------------------------------------------------------
+  # Origin attribution — which search surfaced the article this read opened
+  # ---------------------------------------------------------------------------
+
+  @doc false
+  # Resolves `{origin_search_id, origin_attribution}` for a READ row, server-side.
+  #
+  # WHY THIS IS NOT A CALLER PARAMETER. `search_id` is already withheld from callers (#582)
+  # because a call-level identity the caller controls is a metric the caller can game. An
+  # `origin_search_id` a caller could assert is strictly worse: it would let one agent
+  # manufacture follow-through for its own article, which is the heat-index failure
+  # (#567/#569) reproduced one table over. The MCP server could technically thread it — it is
+  # one process per session and knows what the last search returned — and that is exactly
+  # what must not be built.
+  #
+  # WHY A LOOKUP AND NOT A JOIN AT READ TIME. `get`/`context`/`drill` rows carry no
+  # `search_id`, so there is nothing to join ON; and the correlation that would substitute
+  # for it binds `api_key_id`, which makes the injected recall hook — a different key from
+  # the session that reads — structurally invisible. Resolving once at write time fixes both
+  # and costs one indexed point query per read
+  # (`article_access_events_surface_lookup_idx`), on a path that is already async and
+  # already best-effort.
+  #
+  # PREFERENCE ORDER, and why it is not "most recent wins": a surfacing by the READER'S OWN
+  # key is direct evidence, so it is taken ahead of any other key's even when the other is
+  # more recent. Only when no same-key surfacing exists does a cross-key one apply, and it is
+  # labelled `cross_key` precisely because it is circumstantial — two agents in one tenant
+  # can reach the same article independently.
+  def resolve_origin(tenant_id, article_id, api_key_id, access_type, now)
+
+  def resolve_origin(_tenant_id, _article_id, _api_key_id, access_type, _now)
+      when access_type not in @attributable_access_types,
+      do: {nil, nil}
+
+  def resolve_origin(tenant_id, article_id, api_key_id, _access_type, now)
+      when is_binary(article_id) and is_binary(api_key_id) do
+    since = DateTime.add(now, -@origin_window_seconds, :second)
+
+    query =
+      from(s in ArticleAccessEvent,
+        where: s.tenant_id == ^tenant_id,
+        where: s.article_id == ^article_id,
+        where: s.access_type == "search",
+        where: s.accessed_at >= ^since and s.accessed_at <= ^now,
+        # Same key first (direct evidence), then most recent. `desc:` on the boolean puts
+        # true ahead of false.
+        order_by: [
+          desc: fragment("? = ?", s.api_key_id, type(^api_key_id, Ecto.UUID)),
+          desc: s.accessed_at
+        ],
+        limit: 1,
+        select: {fragment("?->>'search_id'", s.metadata), s.api_key_id}
+      )
+
+    case AdminRepo.one(query) do
+      nil ->
+        {nil, "none"}
+
+      {nil, _key} ->
+        # A surfacing row from before #582 carries no search_id. The article WAS surfaced,
+        # so this is not `none` — but there is no id to point at, and inventing one would
+        # put an unattributable read in the attributed bucket.
+        {nil, nil}
+
+      {search_id, ^api_key_id} ->
+        {search_id, "same_key"}
+
+      {search_id, _other_key} ->
+        {search_id, "cross_key"}
+    end
+  rescue
+    # Attribution is an enrichment, never a reason to lose the event. The caller's rescue in
+    # `do_record_sync/5` would drop the whole row; this one degrades to an unattributed read.
+    error ->
+      Logger.warning("Knowledge.Analytics origin resolution failed: #{Exception.message(error)}")
+
+      {nil, nil}
+  end
+
+  def resolve_origin(_tenant_id, _article_id, _api_key_id, _access_type, _now), do: {nil, nil}
 
   # ---------------------------------------------------------------------------
   # Attribution resolution

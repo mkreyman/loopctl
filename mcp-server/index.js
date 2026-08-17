@@ -6493,7 +6493,25 @@ const TOOLS = [
       "search_follow_through carries two further biases pointing OPPOSITE ways: the 20-row " +
       "recording cap hides opens of results ranked beyond it (DOWN on large pages), while " +
       "one open credits EVERY search in the window that surfaced that article, not just the " +
-      "preceding one (UP when an agent refines and re-searches).",
+      "preceding one (UP when an agent refines and re-searches).\n\n" +
+      "Exact attribution (unit: READS — not surfaced results, not calls): attributed_opens " +
+      "/ cross_key_opens / direct_opens count READ rows by how their originating search was " +
+      "established, resolved server-side at write time and never accepted from a caller. " +
+      "Not comparable with followed_through, which counts SURFACED RESULTS later opened. " +
+      "cross_key_opens is the population followed_through cannot see: it correlates on " +
+      "api_key_id, and the injected recall hook searches under a different key from the " +
+      "session that reads, so that channel scores a structural ZERO there — meaning " +
+      "UNMEASURABLE, not unread. Cross-key attribution is circumstantial (two agents in one " +
+      "tenant can reach one article independently), hence labelled rather than folded in. " +
+      "direct_opens is the agent going straight to an article by link or cited id, which " +
+      "used to look identical to 'surfaced and ignored' — close to its opposite.\n\n" +
+      "Disposition (unit: SEARCH CALLS): searches_with_follow_through, " +
+      "searches_reformulated and searches_quiet PARTITION searches. Treating every " +
+      "not-opened search as a failure is wrong — an agent answered by the result snippet " +
+      "correctly opens nothing, and that is a success. A reformulation (same key, different " +
+      "query, in-window, nothing opened) is the one unambiguous failure, so it is split out; " +
+      "what remains is `quiet` and is STILL a mixture of 'snippet sufficed' and 'rows " +
+      "ignored'. This surface does not separate them — do not read quiet as either.",
     inputSchema: {
       type: "object",
       properties: {

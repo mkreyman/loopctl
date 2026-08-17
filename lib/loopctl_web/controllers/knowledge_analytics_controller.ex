@@ -341,7 +341,35 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
         "carries two further biases pointing OPPOSITE ways: the recording cap hides opens " <>
         "of results ranked beyond it (biases it DOWN on large pages), while one open " <>
         "credits EVERY search in the window that surfaced that article, not just the " <>
-        "preceding one (biases it UP when an agent refines and re-searches).",
+        "preceding one (biases it UP when an agent refines and re-searches).\n\n" <>
+        "EXACT ATTRIBUTION (unit: READS, not surfaced results and not calls) — " <>
+        "`attributed_opens` / `cross_key_opens` / `direct_opens` count READ rows by how " <>
+        "their originating search was established server-side at write time. These are " <>
+        "NOT comparable with `followed_through`, which counts SURFACED RESULTS later " <>
+        "opened. `cross_key_opens` is the population `followed_through` cannot see at " <>
+        "all: it correlates on `api_key_id`, and the injected recall hook searches under " <>
+        "a different key from the session that reads, so that channel scores a structural " <>
+        "ZERO there — meaning UNMEASURABLE, not unread. Cross-key attribution is " <>
+        "circumstantial by construction (two agents in one tenant can reach one article " <>
+        "independently), which is why it is labelled rather than folded in silently. " <>
+        "`direct_opens` is the agent going straight to an article by link or cited id — " <>
+        "previously indistinguishable from 'surfaced and ignored', close to its " <>
+        "opposite. A read with no attribution is in none of the three (pre-migration " <>
+        "rows, and a surfacing row predating #582 that carries no search identity).\n\n" <>
+        "TWO WINDOWS, NOT ONE KNOB — attribution is baked in at WRITE time and cannot be " <>
+        "re-asked of history; the correlated metrics take `window_seconds` at QUERY time. " <>
+        "They share a default, so a divergence after passing a different `window_seconds` " <>
+        "is that mismatch, not a bug.\n\n" <>
+        "DISPOSITION (unit: SEARCH CALLS) — `searches_with_follow_through`, " <>
+        "`searches_reformulated` and `searches_quiet` PARTITION `searches`. Treating " <>
+        "every not-opened search as a failure is wrong: an agent whose question is " <>
+        "answered by the result snippet correctly opens nothing, and that is a success. " <>
+        "A REFORMULATION (same key, different query, inside the window, having opened " <>
+        "nothing) is the one unambiguous failure in that bucket, so it is reported " <>
+        "separately. What remains is `quiet` and is STILL a mixture of 'the snippet " <>
+        "sufficed' and 'the rows were ignored' — this surface does NOT separate them. " <>
+        "Do not read `quiet` as either; follow-through is a floor, never a satisfaction " <>
+        "rate.",
     parameters: [
       limit: [
         in: :query,

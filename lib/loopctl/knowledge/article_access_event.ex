@@ -66,6 +66,14 @@ defmodule Loopctl.Knowledge.ArticleAccessEvent do
   # silently unwritable or silently unvalidated), but do not read this list as a gate.
   @access_types ~w(search get context index drill)
 
+  # HOW an `origin_search_id` was established. Recorded rather than inferred at read time so
+  # a consumer never mistakes an inference for an observation — `cross_key` is the injected
+  # recall hook's shape (it searches under one key, the session reads under another) and is
+  # PLAUSIBLE, not proof: two agents in one tenant can reach the same article independently.
+  # `none` is not a failure — it is the agent going straight to an article by link or cited
+  # id, which used to be indistinguishable from "surfaced and ignored".
+  @origin_attributions ~w(same_key cross_key none)
+
   schema "article_access_events" do
     tenant_field()
     belongs_to :article, Loopctl.Knowledge.Article
@@ -77,6 +85,14 @@ defmodule Loopctl.Knowledge.ArticleAccessEvent do
     field :metadata, :map, default: %{}
     field :accessed_at, :utc_datetime_usec
 
+    # Which search surfaced this article to the agent that then opened it, resolved
+    # SERVER-SIDE at write time and never accepted from a caller — the same rule
+    # `metadata["search_id"]` follows (#582), for the same reason: a forged origin lets an
+    # agent manufacture follow-through for its own article. Both are nil on surfacing rows
+    # (`search`, `index`) and on everything written before the column existed.
+    field :origin_search_id, Ecto.UUID
+    field :origin_attribution, :string
+
     # No timestamps() — accessed_at is the only timestamp.
   end
 
@@ -85,6 +101,16 @@ defmodule Loopctl.Knowledge.ArticleAccessEvent do
   """
   @spec access_types() :: [String.t()]
   def access_types, do: @access_types
+
+  @doc """
+  Returns the list of valid `origin_attribution` values.
+
+  Same caveat as `access_types/0`: the production write path is `insert_all` and builds no
+  changeset, so this list is not a gate — `Analytics.resolve_origin/4` is the only writer,
+  and the drift test binds the two.
+  """
+  @spec origin_attributions() :: [String.t()]
+  def origin_attributions, do: @origin_attributions
 
   @doc """
   Changeset for creating a new article access event.
@@ -105,6 +131,11 @@ defmodule Loopctl.Knowledge.ArticleAccessEvent do
       :metadata,
       :accessed_at
     ])
+    # `origin_search_id` / `origin_attribution` are deliberately NOT cast, for the same
+    # reason `tenant_id` is not: they are resolved by the writer
+    # (`Analytics.resolve_origin/5`), never supplied. Adding them here would give an API
+    # caller a way to assert which search produced its own read — the forgery #582 closed
+    # for `search_id`, and the self-inflating loop #567/#569 closed for the heat index.
     |> validate_required([:article_id, :api_key_id, :access_type, :accessed_at])
     |> validate_inclusion(:access_type, @access_types)
     |> foreign_key_constraint(:article_id)

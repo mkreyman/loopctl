@@ -85,6 +85,61 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
      set — the modal agent flow — credits the missed search as well as the successful
      one, in exactly the repeated-near-miss case this metric exists to surface.
 
+  ## Exact attribution, and the channel the correlated metric cannot see
+
+  `followed_through` correlates on `(tenant, api_key, article, window)`. That `api_key`
+  binding is deliberate and is pinned by a test ("an open by a DIFFERENT api_key does not
+  count") — but it has a consequence nothing recorded until now: **the injected recall hook
+  searches under a different key from the session that reads.** Measured on prod
+  2026-08-17, the hook's key made 1,071 searches and 1 deliberate read ever, while the
+  session key made 2,535 reads. So the channel carrying 71% of all search volume scores a
+  structural ZERO in `followed_through`, and that zero means "unmeasurable", not "unread" —
+  the same `0.0`-vs-`n/a` distinction `RetrievalEval` already insists on.
+
+  `Analytics.resolve_origin/5` therefore resolves each read's originating search at WRITE
+  time, server-side, into `article_access_events.origin_search_id` / `origin_attribution`,
+  and three counters are reported beside the correlated ones:
+
+  - `attributed_opens` — reads whose originating search is known (`same_key` + `cross_key`).
+  - `cross_key_opens` — the subset surfaced by a different key. **This is the injected
+    channel.** It is circumstantial by construction: two agents in one tenant can reach the
+    same article independently, which is why it is labelled rather than merged into
+    `attributed_opens` blindly.
+  - `direct_opens` — reads nothing surfaced (`none`): the agent went to an article by link
+    or cited id. Previously indistinguishable from "surfaced and ignored", which is close to
+    its opposite.
+
+  **Unit warning, because this is exactly where #582 went wrong once already.** These three
+  count READS. `followed_through` counts SURFACED RESULTS that were later opened. They are
+  not comparable and neither is a refinement of the other — keep both.
+
+  A read whose `origin_attribution` is NULL is in none of the three: pre-migration rows,
+  surfacing rows, and the one case `resolve_origin/5` refuses to classify (a surfacing row
+  predating #582 carries no `search_id`, so the article WAS surfaced — `none` would be false
+  — but there is no id to attribute to).
+
+  **Two windows, and they are not the same knob.** `origin_attribution` is baked in at write
+  time using `Analytics.origin_window_seconds/0` and cannot be re-asked of history; the
+  correlated metrics take `window_seconds` at query time. They share a default so the common
+  case agrees by construction. A divergence between `attributed_opens` and
+  `followed_through` after someone passes a different `window_seconds` is that mismatch, not
+  a bug.
+
+  ## What `quiet` does NOT mean
+
+  `searches_with_follow_through`, `searches_reformulated` and `searches_quiet` partition
+  `searches`. The partition exists because treating every not-opened search as a failure is
+  wrong, and `docs/runbooks/search-events-analysis.md` says so outright: "an agent whose
+  question is answered by the snippet correctly opens nothing, and that is a success this
+  metric scores as a failure."
+
+  A REFORMULATION — the same key issuing a different query inside the window, having opened
+  nothing — is the one member of that bucket that is unambiguously a failure, so it is peeled
+  out. What remains is named `quiet` and is STILL a mixture: "the snippet sufficed" and "the
+  rows were ignored" are indistinguishable here, and this instrumentation does not resolve
+  them. Do not rename it to anything that asserts satisfaction, and do not compute a rate
+  that treats it as either. Follow-through remains a floor, never a satisfaction rate.
+
   ## The proxy is gameable in one direction — never optimise it alone
 
   `precision` rises when a search returns FEWER results, with no better retrieval
@@ -198,6 +253,8 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
     retrieved_precision = safe_precision(retrieved_followed, retrieved_searched)
 
     call = compute_call_level(searched_q, window_seconds)
+    opens = compute_open_attribution(tenant_id, day_start, day_end)
+    dispositions = compute_dispositions(searched_q, window_seconds, call)
 
     %{
       day: day,
@@ -215,7 +272,89 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
       curated_precision: curated_precision,
       retrieved_searched: retrieved_searched,
       retrieved_followed_through: retrieved_followed,
-      retrieved_precision: retrieved_precision
+      retrieved_precision: retrieved_precision,
+      attributed_opens: opens.attributed_opens,
+      cross_key_opens: opens.cross_key_opens,
+      direct_opens: opens.direct_opens,
+      searches_reformulated: dispositions.searches_reformulated,
+      searches_quiet: dispositions.searches_quiet
+    }
+  end
+
+  # ---------------------------------------------------------------------------
+  # Exact attribution (unit: READS) and search disposition (unit: SEARCH CALLS)
+  # ---------------------------------------------------------------------------
+
+  # Counts READ rows by how their originating search was established
+  # (`ArticleAccessEvent.origin_attribution/0`, resolved server-side at write time).
+  #
+  # This is the counterpart to `followed_through`, not a replacement, and the two are NOT
+  # comparable: `followed_through` counts SURFACED RESULTS that were later opened, this
+  # counts the OPENS themselves. Both are kept because each answers a question the other
+  # cannot:
+  #
+  #   * `followed_through` correlates on `api_key_id`, so the injected recall hook — which
+  #     searches under one key while the session reads under another — scores a structural
+  #     ZERO there. `cross_key_opens` is exactly that population, and it was unrepresentable
+  #     before the column existed.
+  #   * `direct_opens` (`origin_attribution = "none"`) is the agent going straight to an
+  #     article by link or cited id. It used to be indistinguishable from "surfaced and
+  #     ignored", which is close to its opposite.
+  #
+  # A row whose attribution is NULL is neither: pre-migration rows, surfacing rows, and the
+  # one case `resolve_origin/5` deliberately refuses to classify (a surfacing row from before
+  # #582 that carries no `search_id` — the article WAS surfaced, so calling it `none` would
+  # be false, and there is no id to attribute to).
+  defp compute_open_attribution(tenant_id, day_start, day_end) do
+    rows =
+      from(o in ArticleAccessEvent,
+        where: o.tenant_id == ^tenant_id,
+        where: o.accessed_at >= ^day_start and o.accessed_at < ^day_end,
+        where: not is_nil(o.origin_attribution),
+        group_by: o.origin_attribution,
+        select: {o.origin_attribution, count(o.id)}
+      )
+      |> AdminRepo.all()
+      |> Map.new()
+
+    same = Map.get(rows, "same_key", 0)
+    cross = Map.get(rows, "cross_key", 0)
+
+    %{
+      attributed_opens: same + cross,
+      cross_key_opens: cross,
+      direct_opens: Map.get(rows, "none", 0)
+    }
+  end
+
+  # Partitions `searches` into opened / reformulated / quiet.
+  #
+  # WHY THIS EXISTS. `search_follow_through` treats every not-opened search as a failure, and
+  # `docs/runbooks/search-events-analysis.md` is explicit that this is wrong: "an agent whose
+  # question is answered by the snippet correctly opens nothing, and that is a success this
+  # metric scores as a failure." The not-opened bucket is therefore a mixture, and until now
+  # there was no way to see inside it.
+  #
+  # A REFORMULATION is the one member of that bucket that is unambiguously a failure: the
+  # agent asked again, from the same key, inside the window, with a DIFFERENT query. So it is
+  # peeled out and the remainder is named `quiet` — deliberately not `sufficed`, because it
+  # is still "the snippet answered it OR the rows were ignored" and this instrumentation does
+  # NOT resolve that. Naming it for the outcome it cannot establish is how a floor gets read
+  # as a rate.
+  #
+  # The three partition `searches` exactly, so `quiet` is computed by subtraction rather than
+  # by a third query whose predicate could drift out of agreement with the other two.
+  defp compute_dispositions(searched_q, window_seconds, call) do
+    reformulated =
+      searched_q
+      |> qualifying_calls()
+      |> where(^dynamic(not (^follow_through_exists(window_seconds))))
+      |> where(^reformulation_exists(window_seconds))
+      |> count_distinct_searches()
+
+    %{
+      searches_reformulated: reformulated,
+      searches_quiet: max(call.searches - call.searches_with_follow_through - reformulated, 0)
     }
   end
 
@@ -279,13 +418,7 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   # ROW, so a day mixing browse pages, legacy rows and real searches reports only the
   # real searches here rather than an all-or-nothing 0.
   defp compute_call_level(searched_q, window_seconds) do
-    with_id =
-      searched_q
-      |> where([s], not is_nil(fragment("?->>'search_id'", s.metadata)))
-      |> where(
-        [s],
-        fragment("coalesce(?->>'mode', '')", s.metadata) not in ^@enumeration_modes
-      )
+    with_id = qualifying_calls(searched_q)
 
     searches = count_distinct_searches(with_id)
     with_ft = with_id |> with_follow_through(window_seconds) |> count_distinct_searches()
@@ -296,6 +429,79 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
       search_follow_through: safe_precision(with_ft, searches),
       results_returned: sum_results_returned(with_id)
     }
+  end
+
+  # The per-CALL population: rows carrying a search identity (#582) that are not
+  # query-less enumeration pages. Extracted so `compute_call_level/2` and
+  # `compute_dispositions/3` cannot drift apart — a disposition computed over a different
+  # population than its own denominator would not partition it, and the `quiet` figure is
+  # derived by subtraction, so a drift there would show up as a silent miscount rather than
+  # an error.
+  defp qualifying_calls(searched_q) do
+    searched_q
+    |> where([s], not is_nil(fragment("?->>'search_id'", s.metadata)))
+    |> where(
+      [s],
+      fragment("coalesce(?->>'mode', '')", s.metadata) not in ^@enumeration_modes
+    )
+  end
+
+  # "The same key issued a DIFFERENT query inside the window." Different is compared on the
+  # search identity, not the query text: an agent re-running the identical query (a retry
+  # after a degraded response, say) is not reformulating, but it is also not a distinct
+  # search call in any sense this metric wants to count, and `search_id` already separates
+  # calls from rows.
+  #
+  # Bounded on BOTH sides by the window, and strictly after the surfacing row, so a search
+  # is never called a reformulation of one that came later.
+  defp reformulation_exists(window_seconds) do
+    dynamic(
+      [s],
+      exists(
+        from(r in ArticleAccessEvent,
+          where:
+            r.tenant_id == parent_as(:s).tenant_id and
+              r.api_key_id == parent_as(:s).api_key_id and
+              r.access_type == "search" and
+              not is_nil(fragment("?->>\'search_id\'", r.metadata)) and
+              fragment("?->>\'search_id\'", r.metadata) !=
+                fragment("?->>\'search_id\'", parent_as(:s).metadata) and
+              r.accessed_at > parent_as(:s).accessed_at and
+              fragment(
+                "? <= ? + (? * interval \'1 second\')",
+                r.accessed_at,
+                parent_as(:s).accessed_at,
+                ^window_seconds
+              )
+        )
+      )
+    )
+  end
+
+  # The same correlated-exists `with_follow_through/2` applies, expressed as a `dynamic` so
+  # it can be NEGATED in the disposition query. Kept adjacent to that function so the two
+  # definitions are read together; a change to one that is not made to the other breaks the
+  # partition.
+  defp follow_through_exists(window_seconds) do
+    dynamic(
+      [s],
+      exists(
+        from(o in ArticleAccessEvent,
+          where:
+            o.tenant_id == parent_as(:s).tenant_id and
+              o.api_key_id == parent_as(:s).api_key_id and
+              o.article_id == parent_as(:s).article_id and
+              o.access_type in ["get", "context", "drill"] and
+              o.accessed_at > parent_as(:s).accessed_at and
+              fragment(
+                "? <= ? + (? * interval \'1 second\')",
+                o.accessed_at,
+                parent_as(:s).accessed_at,
+                ^window_seconds
+              )
+        )
+      )
+    )
   end
 
   defp count_distinct_searches(query) do
@@ -358,6 +564,11 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
       retrieved_searched: m.retrieved_searched,
       retrieved_followed_through: m.retrieved_followed_through,
       retrieved_precision: m.retrieved_precision,
+      attributed_opens: m.attributed_opens,
+      cross_key_opens: m.cross_key_opens,
+      direct_opens: m.direct_opens,
+      searches_reformulated: m.searches_reformulated,
+      searches_quiet: m.searches_quiet,
       computed_at: DateTime.utc_now()
     }
 
@@ -380,6 +591,11 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
            :retrieved_searched,
            :retrieved_followed_through,
            :retrieved_precision,
+           :attributed_opens,
+           :cross_key_opens,
+           :direct_opens,
+           :searches_reformulated,
+           :searches_quiet,
            :computed_at,
            :updated_at
          ]},
@@ -426,7 +642,26 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
           curated_precision: s.curated_precision,
           retrieved_searched: s.retrieved_searched,
           retrieved_followed_through: s.retrieved_followed_through,
-          retrieved_precision: s.retrieved_precision
+          retrieved_precision: s.retrieved_precision,
+
+          # Unit: READS. NOT comparable with `followed_through`, which counts surfaced
+          # RESULTS that were later opened. `cross_key_opens` is the injected recall hook's
+          # population — it searches under one key and the session reads under another, so
+          # the key-correlated `followed_through` scores that whole channel a structural
+          # zero, and a zero there means unmeasurable rather than unread.
+          attributed_opens: s.attributed_opens,
+          cross_key_opens: s.cross_key_opens,
+
+          # An agent going straight to an article by link or cited id. Used to be
+          # indistinguishable from "surfaced and ignored", which is close to its opposite.
+          direct_opens: s.direct_opens,
+
+          # Unit: SEARCH CALLS. With `searches_with_follow_through` these partition
+          # `searches`. `quiet` is "the snippet sufficed OR the rows were ignored" and this
+          # instrumentation does NOT separate those — only `reformulated`, the one member of
+          # the not-opened bucket that is unambiguously a failure, is peeled out.
+          searches_reformulated: s.searches_reformulated,
+          searches_quiet: s.searches_quiet
         }
       )
       |> AdminRepo.all()

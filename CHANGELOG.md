@@ -6,6 +6,35 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **A read now records WHICH search surfaced it**, on two new
+  `article_access_events` columns (`origin_search_id`, `origin_attribution`) resolved
+  SERVER-SIDE at write time and never accepted from a caller — the same rule
+  `metadata.search_id` already follows (#582), because an origin a caller can assert is
+  follow-through a caller can manufacture. `GET /api/v1/knowledge/analytics/retrieval-metrics`
+  and the `knowledge_retrieval_metrics` MCP tool gain five fields, and
+  `retrieval_metric_snapshots` gains the columns behind them (both migrations are additive,
+  default 0, no manual step; historical rows read 0 because the data did not exist, not
+  because it was zero).
+
+  Why it matters to an operator reading the existing series: `followed_through` correlates a
+  search and an open on `api_key_id`, and the injected recall hook searches under a
+  DIFFERENT key from the session that reads it — measured 2026-08-17, the hook's key made
+  1,071 searches and 1 read ever, while the session key made 2,535 reads. So the channel
+  carrying 71% of all search volume has always scored a structural ZERO there, meaning
+  UNMEASURABLE rather than unread. `cross_key_opens` is that population. `direct_opens` is
+  an agent going straight to an article by link or cited id, previously indistinguishable
+  from "surfaced and ignored" — close to its opposite. Unit warning: these count READS,
+  while `followed_through` counts SURFACED RESULTS later opened; they are not comparable and
+  neither replaces the other, so the existing series is unchanged and remains valid across
+  this migration.
+
+  `searches_with_follow_through` / `searches_reformulated` / `searches_quiet` now partition
+  `searches`. Treating every not-opened search as a failure is wrong — an agent answered by
+  the result snippet correctly opens nothing, and that is a success. A reformulation is the
+  one unambiguous failure in that bucket, so it is split out; `quiet` is STILL a mixture of
+  "the snippet sufficed" and "the rows were ignored", and this release does not separate
+  them.
+
 - **Vector-read responses now disclose whether the read ran with `hnsw.iterative_scan`,**
   on a new `meta.ann_iterative_scan` (`off` | `applied` |
   `unavailable`) plus an `ann_iterative_scan_reason` alongside `unavailable` only.

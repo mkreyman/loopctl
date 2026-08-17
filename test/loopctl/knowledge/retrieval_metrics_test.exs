@@ -135,7 +135,12 @@ defmodule Loopctl.Knowledge.RetrievalMetricsTest do
                curated_precision: 0.0,
                retrieved_searched: 0,
                retrieved_followed_through: 0,
-               retrieved_precision: 0.0
+               retrieved_precision: 0.0,
+               attributed_opens: 0,
+               cross_key_opens: 0,
+               direct_opens: 0,
+               searches_reformulated: 0,
+               searches_quiet: 0
              }
     end
   end
