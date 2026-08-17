@@ -115,6 +115,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
+  alias Loopctl.Knowledge.ConflictJudge
   alias Loopctl.Knowledge.ConflictResolution
   alias Loopctl.Knowledge.Consolidation
   alias Loopctl.Knowledge.LinkPruning
@@ -140,12 +141,6 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # promoted and 2000 judged per night the backlog falls by 1500/night; equal caps would
   # merely hold the line at whatever level it had already reached.
   @default_max_conflict_judgements 2000
-
-  # Similarity at or above this is treated as high-confidence redundancy. Below it the pair
-  # is still redundant enough to have been promoted, just less certainly so — the
-  # `confidence` field records which, so a future reader can re-judge the weak ones without
-  # re-deriving the set.
-  @high_confidence_similarity 0.95
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"mode" => "all_tenants"}}) do
@@ -442,13 +437,32 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
       )
       |> AdminRepo.all()
 
-    Enum.reduce(unjudged, 0, fn pair, count ->
-      case insert_redundancy_verdict(tenant_id, pair) do
-        {:ok, _} -> count + 1
-        {:error, _} -> count
-      end
+    # CONCURRENT on purpose. Each pair now costs an outbound provider call (see
+    # `Loopctl.Knowledge.ConflictJudge`), so a sequential reduce would turn a 450-pair night
+    # into ~450 round trips end to end and a full 2000-pair catch-up run into something that
+    # cannot finish inside a nightly window at all. `async_stream` gives bounded concurrency
+    # with backpressure; the bound is small because it is a shared provider rate limit and a
+    # shared DB pool on the other side, not because the work is expensive here.
+    #
+    # `timeout: :infinity` on the stream with the per-task bound coming from the provider
+    # client's own timeout — a stream timeout would kill the task and lose the verdict while
+    # the request kept running and got billed.
+    unjudged
+    |> Task.async_stream(
+      fn pair -> judge_and_record(tenant_id, pair) end,
+      max_concurrency: judge_concurrency(),
+      timeout: :infinity,
+      on_timeout: :kill_task,
+      ordered: false
+    )
+    |> Enum.reduce(0, fn
+      {:ok, {:ok, _}}, count -> count + 1
+      _other, count -> count
     end)
   end
+
+  defp judge_concurrency,
+    do: Application.get_env(:loopctl, :knowledge_conflict_judge_concurrency, 4)
 
   # Correlated on the enclosing `as: :link`, TRUE when a `conflict_resolutions` row already
   # exists for the pair in EITHER direction. Mirrors `Knowledge.conflict_unresolved_subquery/0`
@@ -466,7 +480,19 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     )
   end
 
-  defp insert_redundancy_verdict(tenant_id, %{similarity: similarity} = pair) do
+  @doc """
+  Judge ONE flagged pair and record the verdict, plus a `contradicts` edge when the judge
+  says the two articles disagree.
+
+  Public with an `opts` seam so a test can supply a judge implementation per call. The
+  alternative — `Application.put_env` — mutates VM-global state that every other test in this
+  `async: true` suite would see, which is why this repo forbids it outright.
+  """
+  @spec judge_and_record(Ecto.UUID.t(), map(), keyword()) ::
+          {:ok, struct()} | {:error, Ecto.Changeset.t()}
+  def judge_and_record(tenant_id, pair, opts \\ [])
+
+  def judge_and_record(tenant_id, %{similarity: similarity} = pair, opts) do
     # `validate_pair_order/1` requires source <= target by UUID string; links carry no such
     # guarantee, so canonicalise here rather than letting the changeset reject half of them.
     {src, tgt} =
@@ -474,26 +500,68 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         do: {pair.source_article_id, pair.target_article_id},
         else: {pair.target_article_id, pair.source_article_id}
 
+    verdict = judge_pair(tenant_id, src, tgt, similarity, opts)
+
+    with {:ok, _} = ok <- record_verdict(tenant_id, src, tgt, verdict) do
+      maybe_record_contradiction(tenant_id, src, tgt, verdict)
+      ok
+    end
+  end
+
+  # Load both bodies and hand them to the judge. A pair whose articles cannot both be loaded
+  # (deleted between the flag and the judgement) falls back to the similarity verdict rather
+  # than going unjudged — leaving it unjudged would put it back at the head of tomorrow's
+  # highest-similarity-first queue forever.
+  defp judge_pair(tenant_id, src, tgt, similarity, opts) do
+    case load_pair(tenant_id, src, tgt) do
+      {:ok, left, right} -> ConflictJudge.judge(tenant_id, left, right, similarity, opts)
+      :error -> ConflictJudge.Similarity.verdict(similarity)
+    end
+  end
+
+  defp load_pair(tenant_id, src, tgt) do
+    rows =
+      from(a in Article,
+        where: a.tenant_id == ^tenant_id and a.id in ^[src, tgt],
+        select: %{id: a.id, title: a.title, body: a.body}
+      )
+      |> AdminRepo.all()
+      |> Map.new(&{&1.id, &1})
+
+    case {Map.get(rows, src), Map.get(rows, tgt)} do
+      {%{} = left, %{} = right} -> {:ok, left, right}
+      _ -> :error
+    end
+  end
+
+  defp record_verdict(tenant_id, src, tgt, verdict) do
     now = DateTime.utc_now()
-    sim = similarity || 0.0
 
     attrs = %{
       source_article_id: src,
       target_article_id: tgt,
-      classification: :redundant,
+      # `ConflictResolution`'s enum is exactly the judge's three values, so no mapping —
+      # and deliberately no fallback clause, because a value outside the enum must reach
+      # the changeset as a validation error rather than be silently coerced to
+      # `:redundant`, which is the answer this judge exists to stop assuming.
+      classification: verdict.classification,
+      # ALWAYS `dismiss`, whatever the classification. `supersede`/`merge` defer to the
+      # nightly executor and a `:high` supersede authorizes an unattended retirement — a
+      # judge that both classifies a pair and certifies its own verdict as executable is
+      # exactly what `Knowledge.annotate_conflict/3` caps agent-role callers to prevent.
+      # Deciding which of two contradicting articles is right is not an unattended call.
       disposition: :dismiss,
-      confidence: if(sim >= @high_confidence_similarity, do: :high, else: :medium),
-      evidence:
-        "Auto-judged by the nightly lint: cosine similarity #{Float.round(sim, 4)} indicates " <>
-          "REDUNDANCY (the same knowledge stated twice), not contradiction. Similarity cannot " <>
-          "distinguish agreement from disagreement, so this pair was never evidence of a " <>
-          "conflict. Both articles are retained; re-annotate this pair to override.",
+      confidence: verdict.confidence,
+      evidence: verdict.rationale,
       annotated_by: "worker:knowledge_lint",
       annotated_at: now,
       # Dismiss has nothing to execute — mark it done so it never enters the executor's
       # pending set (which would leave it in the same limbo this drain exists to end).
       executed_at: now,
-      execution_result: %{"action" => "noop", "reason" => "auto_dismissed_redundant"}
+      execution_result: %{
+        "action" => "noop",
+        "reason" => "auto_judged_#{verdict.classification}"
+      }
     }
 
     %ConflictResolution{tenant_id: tenant_id}
@@ -503,6 +571,26 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
       conflict_target: [:tenant_id, :source_article_id, :target_article_id]
     )
   end
+
+  # The missing producer. `find_contradiction_clusters/2` reads `:contradicts` links and,
+  # until this existed, could only ever return empty because nothing wrote one. Additive and
+  # idempotent: an edge appears, nothing is retired or rewritten, and `on_conflict: :nothing`
+  # against the pair's unique index makes a re-judgement a no-op.
+  defp maybe_record_contradiction(tenant_id, src, tgt, %{classification: :contradictory}) do
+    %ArticleLink{tenant_id: tenant_id}
+    |> ArticleLink.changeset(%{
+      source_article_id: src,
+      target_article_id: tgt,
+      relationship_type: :contradicts,
+      metadata: %{"auto_generated" => true, "judged_by" => "worker:knowledge_lint"}
+    })
+    |> AdminRepo.insert(
+      on_conflict: :nothing,
+      conflict_target: [:tenant_id, :source_article_id, :target_article_id, :relationship_type]
+    )
+  end
+
+  defp maybe_record_contradiction(_tenant_id, _src, _tgt, _verdict), do: :ok
 
   defp embedded_ids(_tenant_id, []), do: MapSet.new()
 

@@ -940,6 +940,21 @@ config :loopctl, :knowledge_rrf_graph_seed_count, 10
 # Overall cap on distinct graph-lane neighbors injected into the fusion.
 config :loopctl, :knowledge_rrf_graph_max_neighbors, 20
 
+# Semantic conflict judge (Phase 6). The nightly lint flags a pair on cosine similarity and,
+# until this existed, DISMISSED it on cosine similarity too — so every one of the 23,610
+# verdicts on the hosted instance reads `redundant`, a genuine contradiction included, and
+# `contradicts` sat at 0 edges while `find_contradiction_clusters/2` read it.
+#
+# ON by default: it degrades to the previous similarity-only verdict on a tenant with no LLM
+# key, a provider outage or an unparseable reply, so a deployment that cannot use it is
+# exactly where it was. Cost is bounded by the judgement cap (`:knowledge_lint_max_conflict_
+# judgements`, 2000/night) and is per FLAGGED PAIR — ~450/day in practice — not per search.
+config :loopctl, :knowledge_conflict_judge_enabled, true
+config :loopctl, :knowledge_conflict_judge, Loopctl.Knowledge.ConflictJudge.Llm
+# Concurrent judgements per nightly run. Small on purpose: the limit on the other side is a
+# shared provider rate limit and the AdminRepo pool, not CPU here.
+config :loopctl, :knowledge_conflict_judge_concurrency, 4
+
 # Phase 4 second-stage reranking. OFF by default: it puts an outbound provider call on the
 # DEFAULT search path, and the measurements that motivated the retrieval plan eliminate
 # ranking as the cause of the injected channel's follow-through gap — so a better ranker

@@ -850,3 +850,9 @@ config :loopctl, :hnsw_iterative_scan_default, 1
 config :loopctl,
   knowledge_consolidation_max_applies: 2,
   knowledge_consolidation_max_unpublishes: 1
+
+# The semantic conflict judge makes an outbound provider call per flagged pair. Tests that
+# exercise the nightly lint must not, so the default here is the similarity verdict — the
+# same one production falls back to. Tests that DO want the semantic path pass
+# `conflict_judge_impl:` explicitly rather than mutating this.
+config :loopctl, :knowledge_conflict_judge, Loopctl.Knowledge.ConflictJudge.Similarity
