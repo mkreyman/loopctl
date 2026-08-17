@@ -59,9 +59,15 @@ defmodule Loopctl.Knowledge.RetrievalEval.GoldenSet do
       is grade 0 regardless. Because a grade on a non-relevant doc is therefore inert (and
       almost always a mistake), the loader rejects a `graded` key that is not also in
       `relevant`.
-    * `corpus_ref` — optional id of ANOTHER question whose `corpus`, `relevant` and
-      `graded` this question borrows (golden_v3). A question using it supplies only its own
-      `question` text and must declare none of those three itself. See below.
+    * `links` — optional list of directed edges seeded into `article_links` for this
+      question, each `{"from": doc_id, "to": doc_id, "type": relationship_type}` with
+      `type` optional (default `relates_to`). Both endpoints must be in this question's own
+      corpus. This is what makes the graph lane evaluable: without edges the lane is a
+      strict no-op and enabling it scores an identical, entirely uninformative delta. See
+      below.
+    * `corpus_ref` — optional id of ANOTHER question whose `corpus`, `relevant`, `graded`
+      and `links` this question borrows (golden_v3). A question using it supplies only its
+      own `question` text and must declare none of those four itself. See below.
 
   ## Paired questions: measuring query SHAPE (`corpus_ref`, golden_v3)
 
@@ -82,6 +88,25 @@ defmodule Loopctl.Knowledge.RetrievalEval.GoldenSet do
   Refs are resolved at load time and are deliberately restricted: one hop only (no chains,
   whose resolution would depend on file order), no self-reference, and the referring
   question may not declare its own corpus/labels.
+
+  ## Multi-hop questions: measuring the graph lane (`links`, golden_v4)
+
+  The optional RRF graph lane (#470) takes the top merged candidates as seeds and adds their
+  `article_links` neighbours as a third lane. It cannot help a question whose answer is
+  already retrievable lexically or semantically — the research is explicit that graph
+  retrieval WINS on multi-hop and LOSES on single-fact lookups, so an eval that only asks
+  single-fact questions can measure the loss and never the win.
+
+  A multi-hop question is therefore built so the relevant document is deliberately NOT
+  reachable from the query text: the query names a bridge document, and the answer hangs off
+  that bridge by a link. Both documents live in the same corpus, both are seeded, and the
+  ONLY thing connecting the query to the answer is the edge. A run with the lane off scores
+  such a question near zero by construction; that is the point, and it is what makes the
+  lane-on run a measurement rather than a demonstration.
+
+  Because the lane's `list_links_for_seed_set/3` filters by neither relationship type nor
+  direction, `links` can express any of the five types and the lane will traverse it either
+  way round. Production is 96% `relates_to`, which is the default.
 
   ## Adding a labeled question
 
@@ -111,6 +136,8 @@ defmodule Loopctl.Knowledge.RetrievalEval.GoldenSet do
           age_days: number() | nil
         }
 
+  @type link :: %{from: String.t(), to: String.t(), type: atom()}
+
   @type question :: %{
           id: String.t(),
           question: String.t(),
@@ -118,6 +145,7 @@ defmodule Loopctl.Knowledge.RetrievalEval.GoldenSet do
           corpus: [doc()],
           relevant: [String.t()],
           graded: %{String.t() => non_neg_integer()},
+          links: [link()],
           corpus_ref: String.t() | nil
         }
 
@@ -198,6 +226,25 @@ defmodule Loopctl.Knowledge.RetrievalEval.GoldenSet do
   end
 
   @doc """
+  The de-duplicated UNION of every question's `links`, in file order.
+
+  De-duplicated on `{from, to, type}` for the same reason `corpus/1` de-duplicates on
+  `doc_id`: paired (`corpus_ref`) questions share one edge set, and `article_links` carries
+  a unique index on exactly that triple, so seeding it twice is an insert error rather than
+  a second edge.
+  """
+  @spec links(t()) :: [link()]
+  def links(%{questions: questions}) do
+    questions
+    # `Map.get/3`, not `.links`: a question map built in memory by a test never passes
+    # through `decode_question!/1` and so carries no `:links` key. Seeding must treat that
+    # as "no edges", exactly as `grade/2` treats a missing `:graded`, rather than raising
+    # from inside the corpus seeder.
+    |> Enum.flat_map(&Map.get(&1, :links, []))
+    |> Enum.uniq_by(&{&1.from, &1.to, &1.type})
+  end
+
+  @doc """
   The nDCG gain for `doc_id` under `question`: the graded value when present, 1 for a
   relevant doc with no explicit grade, 0 otherwise.
   """
@@ -243,10 +290,12 @@ defmodule Loopctl.Knowledge.RetrievalEval.GoldenSet do
       %{corpus_ref: ref, id: id} = question ->
         # A ref question declaring its own corpus/labels is ambiguous about which set
         # scores, so it is rejected rather than silently resolved one way.
-        if question.corpus != [] or question.relevant != [] or question.graded != %{} do
+        if question.corpus != [] or question.relevant != [] or question.graded != %{} or
+             question.links != [] do
           raise ArgumentError,
                 "golden question #{id}: corpus_ref questions must not declare their own " <>
-                  "corpus, relevant or graded (they borrow the referenced question's)"
+                  "corpus, relevant, graded or links (they borrow the referenced " <>
+                  "question's)"
         end
 
         target =
@@ -268,7 +317,16 @@ defmodule Loopctl.Knowledge.RetrievalEval.GoldenSet do
                   "corpus)"
         end
 
-        %{question | corpus: target.corpus, relevant: target.relevant, graded: target.graded}
+        # `links` is inherited with the corpus for the same reason the corpus is shared:
+        # the pair must differ in the QUERY and nothing else. A paired question that saw a
+        # different edge set would be measuring the topology, not the query shape.
+        %{
+          question
+          | corpus: target.corpus,
+            relevant: target.relevant,
+            graded: target.graded,
+            links: target.links
+        }
     end)
   end
 
@@ -292,8 +350,41 @@ defmodule Loopctl.Knowledge.RetrievalEval.GoldenSet do
       corpus: Enum.map(raw["corpus"] || [], &normalize_doc!(&1, line_no)),
       relevant: raw["relevant"] || [],
       graded: raw["graded"] || %{},
+      links: Enum.map(raw["links"] || [], &normalize_link!(&1, line_no)),
       corpus_ref: raw["corpus_ref"]
     }
+  end
+
+  # The five `ArticleLink` relationship types, as a FIXED string->atom map. Never
+  # `String.to_atom/1` on file content, and an unknown type is a loud failure rather than a
+  # silently-untraversed edge.
+  @relationship_types %{
+    "relates_to" => :relates_to,
+    "derived_from" => :derived_from,
+    "contradicts" => :contradicts,
+    "supersedes" => :supersedes,
+    "potential_conflict" => :potential_conflict
+  }
+
+  defp normalize_link!(raw, line_no) when is_map(raw) do
+    context = "line #{line_no}"
+    from = fetch_string!(raw, "from", context)
+    to = fetch_string!(raw, "to", context)
+    raw_type = raw["type"] || "relates_to"
+
+    type =
+      Map.get(@relationship_types, raw_type) ||
+        raise ArgumentError,
+              "golden set #{context}: unknown link type #{inspect(raw_type)} " <>
+                "(expected one of #{Enum.join(Map.keys(@relationship_types), ", ")})"
+
+    %{from: from, to: to, type: type}
+  end
+
+  defp normalize_link!(raw, line_no) do
+    raise ArgumentError,
+          "golden set line #{line_no}: each link must be an object with from/to, " <>
+            "got #{inspect(raw)}"
   end
 
   defp decode_line!(line, line_no) do
@@ -392,7 +483,8 @@ defmodule Loopctl.Knowledge.RetrievalEval.GoldenSet do
          question: question,
          corpus: corpus,
          relevant: relevant,
-         graded: graded
+         graded: graded,
+         links: links
        }) do
     if corpus == [], do: raise(ArgumentError, "golden question #{id}: corpus is empty")
     if relevant == [], do: raise(ArgumentError, "golden question #{id}: relevant is empty")
@@ -414,6 +506,36 @@ defmodule Loopctl.Knowledge.RetrievalEval.GoldenSet do
     validate_unique!(relevant, "relevant doc_id in question #{id}")
 
     Enum.each(graded, &validate_graded!(id, &1, corpus_ids, relevant_ids))
+    validate_links!(id, links, corpus_ids)
+  end
+
+  # A link endpoint outside this question's own corpus names a doc this question never
+  # seeds, so the edge would either fail to insert or (worse) wire this question's seeds to
+  # another question's docs and silently change what BOTH measure.
+  defp validate_links!(id, links, corpus_ids) do
+    Enum.each(links, &validate_link!(id, &1, corpus_ids))
+
+    # The `(tenant, source, target, type)` unique index would reject a duplicate at insert
+    # time with an opaque constraint error; reject it here, naming the question.
+    validate_unique!(
+      Enum.map(links, &{&1.from, &1.to, &1.type}),
+      "link in question #{id}"
+    )
+  end
+
+  defp validate_link!(id, %{from: from, to: to}, corpus_ids) do
+    Enum.each([from, to], fn doc_id ->
+      unless MapSet.member?(corpus_ids, doc_id) do
+        raise ArgumentError,
+              "golden question #{id}: link endpoint #{inspect(doc_id)} is not in its corpus"
+      end
+    end)
+
+    if from == to do
+      raise ArgumentError,
+            "golden question #{id}: link from #{inspect(from)} to itself " <>
+              "(article_links rejects self-links)"
+    end
   end
 
   defp validate_question_length!(id, question) do

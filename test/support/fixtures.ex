@@ -217,7 +217,8 @@ defmodule Loopctl.Fixtures do
         source: "fixture",
         corpus: [],
         relevant: [],
-        graded: %{}
+        graded: %{},
+        links: []
       },
       Enum.into(attrs, %{})
     )

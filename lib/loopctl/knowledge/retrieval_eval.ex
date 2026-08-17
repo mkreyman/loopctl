@@ -77,6 +77,7 @@ defmodule Loopctl.Knowledge.RetrievalEval do
   alias Loopctl.AdminRepo
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.RetrievalEval.GoldenSet
 
   @default_k_values [5, 10]
@@ -128,6 +129,14 @@ defmodule Loopctl.Knowledge.RetrievalEval do
     * `:mode` — `:embeddings` (default) or `:keyword_only`.
     * `:k_values` — the k's for recall@k / nDCG@k (default `#{inspect(@default_k_values)}`).
     * `:keyword_weight` / `:semantic_weight` — passed through to `search_combined/3`.
+    * `:graph_lane` — passed through to `search_combined/3` as the per-call override of
+      `:knowledge_rrf_graph_lane_enabled`. This is what makes the lane an A/B rather than a
+      belief: run the same golden set twice and compare, instead of comparing a lane-on run
+      against a baseline recorded with the lane off.
+    * `:graph_weight` — passed through as the per-call override of
+      `:knowledge_rrf_graph_weight`. The lane's RRF weight is the knob that trades its
+      multi-hop recall gain against the top-rank perturbation it causes on single-fact
+      questions, so tuning it is part of the experiment rather than a follow-up.
 
   Returns a result map with aggregate metrics, the observed mode, the no-retrieval arm,
   the with-vs-without spread, and a per-question breakdown (`:question_results`).
@@ -316,7 +325,7 @@ defmodule Loopctl.Knowledge.RetrievalEval do
 
     search_opts =
       opts
-      |> Keyword.take([:keyword_weight, :semantic_weight])
+      |> Keyword.take([:keyword_weight, :semantic_weight, :graph_lane, :graph_weight])
       |> Keyword.merge(
         limit: max_k,
         status: :published,
@@ -499,7 +508,42 @@ defmodule Loopctl.Knowledge.RetrievalEval do
       end)
 
     insert_corpus(tenant_id, seeded)
+    insert_links(tenant_id, golden)
     Map.new(seeded, fn {id, doc} -> {id, doc.doc_id} end)
+  end
+
+  # Seed the golden set's `links` as real `article_links` rows. Endpoint ids come from the
+  # same `deterministic_article_id/2` the corpus was seeded with, so no id map has to be
+  # threaded through.
+  #
+  # Without these rows the optional RRF graph lane (#470) has nothing to traverse and is a
+  # strict no-op, so a lane-on run scores an identical delta and "proves" the lane harmless
+  # rather than measuring it. That silent no-result is the reason link seeding lives here
+  # rather than in whichever test happens to want it.
+  defp insert_links(_tenant_id, %{questions: []}), do: :ok
+
+  defp insert_links(tenant_id, golden) do
+    # Full microsecond precision: `article_links.inserted_at` is `:utc_datetime_usec`,
+    # and a truncated value is rejected outright by the Ecto type rather than rounded.
+    now = DateTime.utc_now()
+
+    rows =
+      golden
+      |> GoldenSet.links()
+      |> Enum.map(fn %{from: from, to: to, type: type} ->
+        %{
+          id: Ecto.UUID.generate(),
+          tenant_id: tenant_id,
+          source_article_id: deterministic_article_id(tenant_id, from),
+          target_article_id: deterministic_article_id(tenant_id, to),
+          relationship_type: type,
+          metadata: %{"retrieval_eval" => true},
+          inserted_at: now
+        }
+      end)
+
+    if rows != [], do: AdminRepo.insert_all(ArticleLink, rows)
+    :ok
   end
 
   # A deterministic, well-formed (version-5, variant-10) UUID for a seeded article.
@@ -569,6 +613,17 @@ defmodule Loopctl.Knowledge.RetrievalEval do
   """
   @spec delete_corpus(Ecto.UUID.t(), [Ecto.UUID.t()]) :: :ok
   def delete_corpus(tenant_id, article_ids) do
+    # Links FIRST. `article_links` FKs both endpoints with `on_delete: :restrict`, so
+    # deleting an article that still has an edge raises a foreign-key violation — from
+    # inside `compute/2`'s `after`, where it would replace the real failure (or the real
+    # result) with a constraint error and leave the corpus behind for every later run.
+    from(l in ArticleLink,
+      where:
+        l.tenant_id == ^tenant_id and
+          (l.source_article_id in ^article_ids or l.target_article_id in ^article_ids)
+    )
+    |> AdminRepo.delete_all()
+
     from(a in Article, where: a.tenant_id == ^tenant_id and a.id in ^article_ids)
     |> AdminRepo.delete_all()
 

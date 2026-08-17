@@ -261,19 +261,56 @@ source/hub context before embedding beats what the suffix already buys.
 **Check:** recall@5 and answered@5 vs baseline. Ship only on a positive delta.
 
 ### Phase 4 — Reranking
+*(Phase 5 landed first: it needed no new vendor, no LLM on the recall path, and the lane it
+turns on was already written and reviewed. Reranking's own case is unchanged and still the
+weakest — see §5.)*
 Two-stage retrieval over the top-N candidates. The literature's 67% figure is *combined with*
 Phase 3, so it is sequenced after it. Cheapest viable implementation is an LLM reranker over
 the existing BYO-key `Loopctl.LLM` plumbing — no new vendor — but it puts an LLM call on the
 recall path (~200/day), so cost is part of the experiment, not an afterthought.
 **Check:** nDCG@5 and answered@5 vs baseline; measured cost per recall.
 
-### Phase 5 — Use the graph at retrieval time
+### Phase 5 — Use the graph at retrieval time *(DONE)*
 We hold 526k edges and traverse none of them when answering. The research says vector-for-
-neighbourhood plus graph-for-expansion beats either alone on multi-hop questions. Start with
-one hop of `relates_to` expansion on the retrieved set (progressive_index already does a
-limited version of this for hubs).
+neighbourhood plus graph-for-expansion beats either alone on multi-hop questions.
 **Check:** improvement concentrated on multi-hop eval questions; no regression on single-fact
 ones — the research is explicit that graph retrieval *loses* on those.
+
+**The lane was already built.** #470 shipped a one-hop link-neighbour lane as a third RRF
+input — bounded, visibility-filtered, heavy-read routed, sheddable — behind
+`:knowledge_rrf_graph_lane_enabled`, defaulted OFF. So the engineering was not the work; the
+ADJUDICATION was, and it was blocked on something the plan did not anticipate: **the eval
+corpus seeded no `article_links` at all**, so the lane was a strict no-op on the only
+instrument that could judge it. Enabling it would have scored `delta = 0.000` and read as
+"harmless", which is not a result.
+
+golden_v4 fixes that with a `links` field seeded as real rows, plus four multi-hop questions
+(and their `-kwbag` pairs) whose relevant document is deliberately unreachable from the query
+text and hangs off an edge from the document the query *does* match. With that, the weight
+sweep is decisive:
+
+| graph weight | answered | MRR | recall@5 | multi-hop answered (of 8) | single-fact answers lost |
+|---|---:|---:|---:|---:|---|
+| off | 45 | 0.6500 | 0.642 | 0 | — |
+| 0.10 | 47 | 0.6431 | 0.675 | 2 | — |
+| **0.15** | **48** | **0.6492** | **0.692** | **3** | **—** |
+| 0.25 *(the old default)* | 49 | 0.6326 | 0.717 | 5 | `q-liveview-mount` |
+| 0.40 | 51 | 0.5992 | 0.750 | 7 | `q-liveview-mount` |
+
+The curve is the literature's claim, reproduced: every gain is on multi-hop, and pushing the
+weight up starts taking answers away from single-fact questions. **0.15 is the largest weight
+that passes BOTH clauses of the check** — three multi-hop questions gain their answer, three
+single-fact questions drop in MRR while keeping their answer inside the top 5, and nothing
+loses recall. 0.25 would have failed the second clause, which is the whole reason the check
+was written with two clauses.
+
+**Shipped:** lane ON at weight 0.15; baseline regenerated on golden_v4. The keyword-only arm
+is unchanged by construction — the lane lives in the branch where BOTH keyword and semantic
+succeeded, so an embedding outage silently disables graph expansion too.
+
+**Cost:** one bounded (200-link) tenant-scoped HeavyRead per combined search, shed to an empty
+lane over the in-flight cap. `search_combined/3` is the default path, so this is a real added
+read on every recall — named here because it is the price of the recall gain, not a footnote.
 
 ### Phase 6 — Ripple-on-ingest
 Karpathy #5, validated by A-MEM. On capture, update the neighbour articles a new source
@@ -315,18 +352,27 @@ otherwise be asked to compensate for it and cannot.
   fixable here (the caller must declare itself, as `smoke.sh` does): handed to
   claude-config#317.
 - Phase 2d — **DONE, deployed v523** (#690). Every search result carries a snippet.
-- Phases 3–7 — not started, and the ordering has moved on the evidence:
+- Phase 5 — **DONE.** The graph lane is ON at weight 0.15, chosen by a sweep on golden_v4
+  rather than by argument. What blocked it was never the code (#470 built the lane) but the
+  instrument: the eval seeded no edges, so the lane was unjudgeable there. See Phase 5 above.
+- Phases 3, 4, 6, 7 — not started, and the ordering has moved on the evidence:
   - **Phase 4 (reranking) is the weakest-motivated of them.** Ranking, query length and
     distillation are each eliminated as the cause of the injected channel's gap, so a better
     ranker improves something no measurement implicates. It should not be started until
     Phase 2c's counters say ranking is the problem.
-  - **Phase 3 and Phase 5 are the live engineering candidates**, both because they change
-    what is retrievable at all rather than how a fixed candidate set is ordered.
+  - **Phase 3 is the remaining live engineering candidate**, for the reason that also made
+    Phase 5 worth doing first: it changes what is retrievable at all rather than how a fixed
+    candidate set is ordered.
   - **Phase 7 is the owner's call and is unchanged by any of this** — a 1.8% read rate is a
     capture-policy problem and no retrieval phase can compensate for it.
-  - **The honest sequencing note:** Phase 2c's whole point is to make phases 3–5 falsifiable
-    on production traffic rather than only on a synthetic eval corpus. Starting them before
-    it has collected anything would forfeit exactly the check it was built to provide.
+  - **The honest sequencing note, revised.** Phase 2c exists to make phases 3–5 falsifiable
+    on PRODUCTION traffic, and it has collected three hours (§5.1). Phase 5 shipped anyway,
+    on a different justification: its pass/fail was answerable on the eval alone, because
+    the thing it changes — whether a link-only-reachable document can be retrieved at all —
+    is a property of the retriever, not of what real users happen to ask. What still needs
+    production traffic is the question 2c was built for: whether the injected channel's
+    follow-through moves. That is the 1-2 week measurement, and shipping retrieval work in
+    the meantime does not spend it.
 
 ### 5.1 First traffic against the new counters (2026-08-17, ~3h post-cutover)
 

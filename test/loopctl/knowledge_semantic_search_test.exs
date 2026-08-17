@@ -1710,7 +1710,7 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       %{seed: seed, neighbor: neighbor}
     end
 
-    test "is OFF by default — no neighbors injected" do
+    test "is ON by default, and `graph_lane: false` still turns it off" do
       %{tenant: tenant} = setup_tenant()
       Knowledge.reset_circuit_breaker(tenant.id)
       %{neighbor: neighbor} = seed_and_neighbor(tenant.id)
@@ -1719,9 +1719,20 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
         {:ok, make_embedding(:query)}
       end)
 
-      {:ok, %{results: results}} = Knowledge.search_combined(tenant.id, "graphlane")
+      # The lane shipped OFF and was flipped ON once golden_v4 gave the eval edges to
+      # traverse and the weight sweep settled at 0.15 (see the Phase 5 section of
+      # docs/research/kb-retrieval-improvement-plan.md). A link-only-reachable neighbor is
+      # now retrieved by an unadorned call — which is the whole point, since agents are only
+      # ever told about plain search.
+      {:ok, %{results: on}} = Knowledge.search_combined(tenant.id, "graphlane")
+      assert Enum.any?(on, &(&1.id == neighbor.id))
 
-      refute Enum.any?(results, &(&1.id == neighbor.id))
+      # The per-call escape hatch is what a lane-off eval arm and an operator rollback both
+      # depend on, so it is asserted here rather than assumed from the config default.
+      {:ok, %{results: off}} =
+        Knowledge.search_combined(tenant.id, "graphlane", graph_lane: false)
+
+      refute Enum.any?(off, &(&1.id == neighbor.id))
     end
 
     test "when ON, one-hop neighbors join the fusion" do
@@ -1793,14 +1804,24 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
       seed_result = Enum.find(results, &(&1.id == seed.id))
       neighbor_result = Enum.find(results, &(&1.id == neighbor.id))
 
-      # The seed is keyword rank 1 (0.5/(k+1)); the graph-only neighbor is graph rank 1.
-      # The graph lane is weighted 0.25 — STRICTLY BELOW the 0.5 primary per-lane weight — so
-      # the neighbor scores 0.25/(k+1), strictly LESS than the seed's 0.5/(k+1). It can
-      # therefore neither tie NOR (via the deterministic {final_score, id} desc tiebreak,
-      # which a larger neighbor id would otherwise win) float ABOVE the genuine top hit in
-      # POSITION. At the old 0.5 tie-weight a larger-id neighbor could sort above the seed
-      # (#470 review).
-      assert_in_delta neighbor_result.final_score, 0.25 / 61, 1.0e-9
+      # The seed is keyword rank 1 (0.5/(k+1)); the graph-only neighbor is graph rank 1, so
+      # it scores `graph_weight/(k+1)`. The INVARIANT under test is that the graph weight is
+      # STRICTLY BELOW the 0.5 primary per-lane weight, so a zero-signal neighbor can neither
+      # tie NOR (via the deterministic {final_score, id} desc tiebreak, which a larger
+      # neighbor id would otherwise win) float ABOVE the genuine top hit in POSITION. At a
+      # 0.5 tie-weight a larger-id neighbor could sort above the seed (#470 review).
+      #
+      # Read from config rather than hardcoded: the weight is a TUNING value the retrieval
+      # eval's sweep is expected to move (0.25 -> 0.15 in the Phase 5 experiment), while the
+      # ceiling below is the invariant that must not move. Pinning the tuning value here made
+      # this test fail for a reason it does not test.
+      graph_weight = Application.get_env(:loopctl, :knowledge_rrf_graph_weight)
+
+      assert graph_weight < 0.5,
+             "the graph lane must stay strictly below the primary per-lane weight, or a " <>
+               "zero-signal neighbor can tie and then win the id tiebreak"
+
+      assert_in_delta neighbor_result.final_score, graph_weight / 61, 1.0e-9
       assert neighbor_result.final_score < seed_result.final_score
 
       seed_pos = Enum.find_index(results, &(&1.id == seed.id))
