@@ -125,6 +125,35 @@ defmodule Loopctl.CheckSkillCitationsTest do
     assert CheckSkillCitations.check([doc]) == []
   end
 
+  @tag :tmp_dir
+  test "does not read a clock time or host port as a bare citation", %{
+    tmp_dir: tmp_dir
+  } do
+    src = write_fixture(tmp_dir)
+
+    doc =
+      write_doc(tmp_dir, """
+      The daily fan-outs run at 04:00, 04:30 and 05:00 UTC, after the 02:00 rollup.
+      Proxy with `flyctl proxy 15432:5432` then connect to 127.0.0.1:15432.
+      The real citation is `#{src}:2`.
+      """)
+
+    # Without the `(?<!\w)` guard each of those `:NN` fragments matched the BARE
+    # citation form, resolved to line 0, and reported ":0: invalid citation range"
+    # against prose containing no citation at all.
+    assert {[], %{checked: 1, skipped: 0}} = CheckSkillCitations.check_with_stats([doc])
+  end
+
+  @tag :tmp_dir
+  test "still reads a genuine bare citation after a backtick or paren", %{
+    tmp_dir: tmp_dir
+  } do
+    src = write_fixture(tmp_dir)
+    doc = write_doc(tmp_dir, "See `#{src}:2`, also (`:4`) and `:2`.")
+
+    assert {[], %{checked: 3, skipped: 0}} = CheckSkillCitations.check_with_stats([doc])
+  end
+
   defp write_doc(tmp_dir, body) do
     path = Path.join(tmp_dir, @tmp_doc)
     File.write!(path, body <> "\n")
