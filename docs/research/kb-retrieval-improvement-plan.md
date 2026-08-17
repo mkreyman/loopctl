@@ -308,12 +308,12 @@ otherwise be asked to compensate for it and cannot.
   same day (§2.1, §3.1); the fix is still worth having, on a ~4x effect rather than 11x.
 - Phase 2b — **DONE.** golden_v3 + `corpus_ref` paired questions; baseline regenerated. Its
   result retires Phase 2's premise rather than confirming it (see above).
-- Phase 2c — **DONE, deployed v523** (#689). The injected channel is now measurable instead
-  of scoring a structural zero. **Nothing can be concluded from it yet**: it measures forward
-  only, so it needs a week or two of real traffic, and one contaminant is still open —
-  the recall canary declares `client_entrypoint: "hook"`, identical to real traffic, so its
-  fixed prompt list sits inside the new counters. Not fixable here (the caller must declare
-  itself, as `smoke.sh` does): handed to claude-config#317.
+- Phase 2c — **DONE, deployed v523** (#689), and **verified on real traffic** — see below.
+  The injected channel is now measurable instead of scoring a structural zero. One
+  contaminant is still open: the recall canary declares `client_entrypoint: "hook"`,
+  identical to real traffic, so its fixed prompt list sits inside the new counters. Not
+  fixable here (the caller must declare itself, as `smoke.sh` does): handed to
+  claude-config#317.
 - Phase 2d — **DONE, deployed v523** (#690). Every search result carries a snippet.
 - Phases 3–7 — not started, and the ordering has moved on the evidence:
   - **Phase 4 (reranking) is the weakest-motivated of them.** Ranking, query length and
@@ -327,6 +327,32 @@ otherwise be asked to compensate for it and cannot.
   - **The honest sequencing note:** Phase 2c's whole point is to make phases 3–5 falsifiable
     on production traffic rather than only on a synthetic eval corpus. Starting them before
     it has collected anything would forfeit exactly the check it was built to provide.
+
+### 5.1 First traffic against the new counters (2026-08-17, ~3h post-cutover)
+
+The Phase 2c check was "`cross_key_opens` non-zero on real traffic — i.e. the channel is
+visible at all". It **passes**, and the shape is the predicted one:
+
+| entrypoint | searches | searches opened | attribution of the opens |
+|---|---:|---:|---|
+| `hook` / `memory_recall` | 31 | 2 | 3 reads, **all `cross_key`** |
+| `cli` / `knowledge_search` | 6 | 3 | 3 reads, `same_key` |
+| `cli` / `knowledge_hybrid_search` | 6 | 2 | 2 reads, `same_key` |
+| `smoke`, `session-start` | 24 | 0 | - |
+
+Every hook open is cross-key and every cli open is same-key. That is the diagnosis in §2.1
+confirmed from the other direction: the shipped same-key metric could not have counted ONE
+of the injected channel's opens, and the zero it reported was `n/a`.
+
+**Three hours is a mechanism check, not a rate**, and no phase ordering should move on it.
+The evaluation window is 1-2 weeks from the cutover (2026-08-17T18:00Z), with `smoke` and
+`session-start` excluded and the canary contaminant (claude-config#317) resolved first.
+
+The audit also re-ran §3.1's own failure live: the entrypoint segmentation joins
+`search_events.search_id`, NOT `search_events.id` — different columns — and the wrong one
+returns a clean, plausible, entirely false "0 opens" for every entrypoint. The corrected
+query and its integrity check are now in `docs/runbooks/search-events-analysis.md` §3c so the
+next person joins the right column instead of rediscovering this.
 
 ### 3.1 What the ordering cost us to learn, twice
 
