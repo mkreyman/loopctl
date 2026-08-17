@@ -30,6 +30,32 @@ Two framings that matter more than any single number:
 - **We are not short of edges. We are short of reads.** The graph is healthy. The corpus is
   read at 1.8%. Whatever is wrong is on the retrieval/consumption side, not the linking side.
 
+## 1.1 What this repo's own runbook already said, and this plan under-weighted
+
+`docs/runbooks/search-events-analysis.md` predates this note and contains three warnings that
+bear directly on it. They were not consulted before §1 was written, which is how the confound
+in §2.1 survived — the segmentation trap is documented there in step 2.
+
+- **Follow-through is a FLOOR, not a satisfaction rate.** "An agent whose question is answered
+  by the snippet correctly opens nothing, and that is a success this metric scores as a
+  failure." The injected block renders a title and snippet per row, so an agent that reads the
+  snippet and needs no more is indistinguishable here from one that ignored it. **This is the
+  single largest caveat on the whole plan**: the headline metric cannot separate "surfaced and
+  ignored" from "surfaced and sufficient".
+- **The documented healthy band is 1–7%, "the biggest number in this area and the least moved
+  by anything shipped so far."** The attributed hook channel measures **11.3%** (§2.1), which
+  is ABOVE that band. So the honest reading of the injected channel is *at or above its
+  historical norm*, not collapsing.
+- **Step 4, verbatim: "Do not spend a month's work on the retrieval side on the strength of a
+  utilization number that was never segmented by origin."** Phases 3–5 are retrieval-side
+  work, and §1's numbers were unsegmented. That warning lands on this plan.
+
+Read together with §2.1 and Phase 2b, the case for the retrieval-side phases is weaker than
+this note originally made it, and the case for Phase 7 (capture policy) and for better
+INSTRUMENTATION — a signal that distinguishes a sufficient snippet from an ignored one — is
+stronger. Neither conclusion is reached by argument here; both are what the measurements left
+standing.
+
 ## 2.1 Correction: how the follow-through numbers were got wrong (2026-08-17)
 
 The first version of this note carried a follow-through-by-query-length table
