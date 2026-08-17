@@ -417,16 +417,72 @@ succeeded, so an embedding outage silently disables graph expansion too.
 lane over the in-flight cap. `search_combined/3` is the default path, so this is a real added
 read on every recall — named here because it is the price of the recall gain, not a footnote.
 
-### Phase 6 — Ripple-on-ingest
+### Phase 6 — Ripple-on-ingest *(NOT BUILT — the measurement says the queue it would feed is inert)*
 Karpathy #5, validated by A-MEM. On capture, update the neighbour articles a new source
 extends or contradicts, instead of only appending a new node and its links.
 **Check:** neighbour-update rate per ingest; no growth in the duplicate-capture proposal rate.
+
+**Half of it already ships.** The auto-linker writes `relates_to` on ingest and
+`knowledge_get` returns `incoming_links`, so an older article *does* learn about a newer one
+that extends it. The structural ripple is there; what is missing is the TYPED judgement.
+
+**And the typed half has never existed at all.** Production edge census, 2026-08-17:
+
+| relationship | edges | with a recorded verdict |
+|---|---:|---:|
+| `relates_to` | 502,370 | — |
+| `potential_conflict` | 23,617 | **0** |
+| `contradicts` | **0** | — |
+| `supersedes` | **0** | — |
+| `derived_from` | **0** | — |
+
+Three of the five declared link types have never been written by anything, ever. And
+`find_contradiction_clusters/2` (`knowledge.ex:12119`) reads `:contradicts` — **a consumer
+with no producer**, so that lint report can only ever return empty. That is Karpathy #5's gap
+exactly, and the obvious Phase 6 is to build the missing producer.
+
+**It should not be built yet, and the reason is a number rather than a preference.** The
+existing conflict queue holds **23,617 pairs, of which ZERO have ever had a verdict
+recorded, and 13,502 arrived in the last 30 days** — roughly 450/day, unread. Adding a
+second, stronger flag on top of that is adding supply to a backlog nobody draws down, which
+is the failure #605 already named ("a queue whose only consumer is a human nobody staffs" —
+hit four times in this codebase). The right order is: make the EXISTING queue get consumed,
+then decide whether a sharper signal is what it was missing.
+
+**The literal Karpathy form — an unattended writer EDITING published article bodies — is
+refused outright**, separately from the ordering above. It is the highest blast radius in
+this plan, and this repo's own doctrine is built against it: the nightly consolidation pass
+applies only what two consecutive runs agree on and retracts with `unpublish` rather than
+`archive` precisely because one is reversible in code and the other is a one-way door
+(#606/#608). Nothing here has a comparable undo — an edited body has no prior version to
+restore.
+
+**Revisit when:** the conflict queue's verdict count is non-zero and its backlog is falling.
+That is the observation showing a consumer exists for what a producer would emit.
 
 ### Phase 7 — Cap the collector's fallacy
 The 1.8% read rate is a capture-policy problem and cannot be fixed by retrieval. Decide a
 harvest budget and a promotion bar for what may enter the published corpus at all.
 **Owner decision, not an engineering one** — recorded here because the preceding phases will
 otherwise be asked to compensate for it and cannot.
+
+**Phase 6's census sharpens the case, with a second independent number.** §1 measured the
+symptom as 1.8% of articles ever read. The conflict queue measures the same thing from the
+supply side: **13,502 new near-duplicate pairs in 30 days**, ~450/day, none triaged. Those
+are not retrieval failures — they are captures similar enough to something already held that
+a mechanical threshold flagged them. Two unrelated instruments now point at capture volume
+rather than at retrieval.
+
+Concretely, what the owner is deciding between:
+
+- **A harvest budget** — a cap on what may enter per source or per day, so the flagged-pair
+  rate stops outrunning any conceivable curation rate.
+- **A promotion bar** — capture everything, but publish only what clears a bar, leaving the
+  rest as drafts. (`status: :draft` already exists and is already excluded from search.)
+- **Consuming the queue** — staff the 23,617 pairs, which is also Phase 6's precondition.
+
+Nothing in Phases 1-5 substitutes for any of these, which is the whole reason this phase is
+in the plan rather than left implicit.
 
 ## 4. Deliberately not doing
 
@@ -466,7 +522,11 @@ otherwise be asked to compensate for it and cannot.
   implementations, the recording instrument and the evidence are in the repo; the default is
   `false` with a written overturn condition. This is the opposite of where the graph lane sat
   this morning — off, but no longer unjudged.
-- Phases 6, 7 — not started:
+- Phase 6 — **NOT BUILT, on a measurement.** Half of it already ships (the auto-linker's
+  `relates_to` plus `incoming_links`); the typed half has a consumer and no producer; and
+  the queue it would feed holds 23,617 pairs with zero verdicts ever. The unattended
+  body-editing form is refused outright. Overturn condition recorded above.
+- Phase 7 — the owner's call, now with a second independent number behind it:
   - **Phase 4's weak motivation survived contact with its own measurement.** It was called
     the weakest-motivated phase before it was built, on the grounds that ranking is an
     eliminated cause; building it produced the plan's largest MRR gain AND a capability
@@ -474,8 +534,20 @@ otherwise be asked to compensate for it and cannot.
   - **Phases 3 and 5 both landed on that reasoning** — each changes what is retrievable at
     all rather than how a fixed candidate set is ordered, which is why both were adjudicable
     on the eval alone.
-  - **Phase 7 is the owner's call and is unchanged by any of this** — a 1.8% read rate is a
-    capture-policy problem and no retrieval phase can compensate for it.
+  - **Phase 7 is the owner's call and is the only phase left with work in it** — a 1.8% read
+    rate is a capture-policy problem and no retrieval phase can compensate for it. It is now
+    backed by a second, independent number: 13,502 near-duplicate pairs flagged in 30 days,
+    none triaged.
+
+  - **What every phase that landed has in common.** Phases 2b, 2c, 3, 4 and 5 each spent
+    most of their effort on the INSTRUMENT rather than the technique — a paired golden
+    question, an origin column, an edge in the eval corpus, a recorded LLM fixture — and in
+    every case the instrument changed the answer. Phase 2's premise was retired by 2b.
+    Phase 5 was unjudgeable until the eval had links. Phase 3 turned out not to need an LLM
+    at all. Phase 4 produced the largest gain in the plan and still ships off. The
+    generalisable form: **in a retrieval plan, the phase that measures what the system is
+    actually being asked is worth more than the phase that improves how it answers**, and it
+    is nearly always cheaper.
   - **The honest sequencing note, revised.** Phase 2c exists to make phases 3–5 falsifiable
     on PRODUCTION traffic, and it has collected three hours (§5.1). Phase 5 shipped anyway,
     on a different justification: its pass/fail was answerable on the eval alone, because
