@@ -221,6 +221,38 @@ PROMPTS, not from well-formed questions, so a real one can be about the wrong to
 eliminated (ranking, query length, distillation) and that one is not.**
 **Done:** golden_v3 committed with 26 paired questions; baseline regenerated on pg16.
 
+### Phase 2c — Make the injected channel measurable at all *(DONE: #689)*
+*(not in the original seven — it fell out of §1.1, which found the headline metric could not
+tell success from failure)*
+
+Nothing distinguished "the snippet sufficed" from "the row was ignored", and worse,
+`RetrievalMetrics` correlated a search with an open on `api_key_id` — while the injected hook
+searches under a DIFFERENT key from the session that reads. So the channel carrying 71% of
+volume scored a STRUCTURAL ZERO in the shipped metric, meaning unmeasurable rather than
+unread. Reads now carry an origin resolved server-side at write time (never a caller
+parameter — an assertable origin is follow-through a caller can manufacture), and searches
+are partitioned `opened` / `reformulated` / `quiet`.
+
+**`quiet` is deliberately still ambiguous.** Splitting out `reformulated` removes the one
+unambiguous failure from the not-opened bucket; it does not resolve snippet-sufficed vs
+ignored, and naming it for the outcome it cannot establish is how a floor gets read as a rate.
+**Check:** `cross_key_opens` non-zero on real traffic — i.e. the channel is visible at all.
+
+### Phase 2d — Make plain search legible without a second call *(DONE: #690)*
+
+`snippet` is a `ts_headline` fragment and therefore came ONLY from the keyword lane, so a
+result the query did not lexically match — precisely what the semantic lane exists to find —
+arrived as a bare title. The rows most in need of an explanatory line were exactly the ones
+that had none, and an agent handed a bare title either opens it blindly or ignores it: both
+land in the metric above as retrieval's fault. Every result now carries a highlight or a lead
+extract, labelled `snippet_source`.
+
+This is the shape of work the owner's constraint calls for — agents are only ever told about
+plain search, so anything that makes results judgeable belongs on the server, not in an
+agent's tool choice. Phases 3–5 should be read the same way.
+**Check:** the injected block's rows are judgeable without a `knowledge_get`; re-measure
+`searches_quiet` against `cross_key_opens` once Phase 2c has collected real traffic.
+
 ### Phase 3 — Contextual embeddings for atomic notes
 An atomic note extracted from a book or video loses the context of its source. We partially
 compensate today with a title suffix (`— Blackmagic_Converters_Manual`), which is why this is
@@ -276,11 +308,25 @@ otherwise be asked to compensate for it and cannot.
   same day (§2.1, §3.1); the fix is still worth having, on a ~4x effect rather than 11x.
 - Phase 2b — **DONE.** golden_v3 + `corpus_ref` paired questions; baseline regenerated. Its
   result retires Phase 2's premise rather than confirming it (see above).
-- Phases 3–7 — not started. **Phase 4 (reranking) is now the weakest-motivated of them**:
-  ranking, query length and distillation are all eliminated as the cause of the injected
-  channel's gap, so a better ranker is improving something that was not measured to be
-  broken. Prefer Phase 3 (contextual embeddings, which changes what is retrievable at all)
-  and Phase 7 (capture policy) until something re-implicates ranking.
+- Phase 2c — **DONE, deployed v523** (#689). The injected channel is now measurable instead
+  of scoring a structural zero. **Nothing can be concluded from it yet**: it measures forward
+  only, so it needs a week or two of real traffic, and one contaminant is still open —
+  the recall canary declares `client_entrypoint: "hook"`, identical to real traffic, so its
+  fixed prompt list sits inside the new counters. Not fixable here (the caller must declare
+  itself, as `smoke.sh` does): handed to claude-config#317.
+- Phase 2d — **DONE, deployed v523** (#690). Every search result carries a snippet.
+- Phases 3–7 — not started, and the ordering has moved on the evidence:
+  - **Phase 4 (reranking) is the weakest-motivated of them.** Ranking, query length and
+    distillation are each eliminated as the cause of the injected channel's gap, so a better
+    ranker improves something no measurement implicates. It should not be started until
+    Phase 2c's counters say ranking is the problem.
+  - **Phase 3 and Phase 5 are the live engineering candidates**, both because they change
+    what is retrievable at all rather than how a fixed candidate set is ordered.
+  - **Phase 7 is the owner's call and is unchanged by any of this** — a 1.8% read rate is a
+    capture-policy problem and no retrieval phase can compensate for it.
+  - **The honest sequencing note:** Phase 2c's whole point is to make phases 3–5 falsifiable
+    on production traffic rather than only on a synthetic eval corpus. Starting them before
+    it has collected anything would forfeit exactly the check it was built to provide.
 
 ### 3.1 What the ordering cost us to learn, twice
 
