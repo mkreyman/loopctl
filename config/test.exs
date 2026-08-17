@@ -850,3 +850,7 @@ config :loopctl, :hnsw_iterative_scan_default, 1
 config :loopctl,
   knowledge_consolidation_max_applies: 2,
   knowledge_consolidation_max_unpublishes: 1
+
+# The re-tagger makes an outbound provider call per article. Tests pass `tagger_impl:`
+# explicitly; this default guarantees a test that forgets cannot reach a provider.
+config :loopctl, :knowledge_tagger, Loopctl.Knowledge.Tagger.Llm
