@@ -150,6 +150,53 @@ defmodule Loopctl.Workers.DraftDuplicateSweepWorkerTest do
     end
   end
 
+  describe "sparing another worker's reversible retraction" do
+    # Consolidation retracts a confirmed duplicate with `unpublish`, never `archive`,
+    # so an unattended pass keeps an undo (#605/#606/#608). Its output is BY
+    # CONSTRUCTION a draft above this worker's threshold — that similarity is why it
+    # was retracted — so without the exclusion the sweep archives exactly the set
+    # another worker took care to leave reversible.
+    test "never archives a draft that consolidation unpublished" do
+      tenant = fixture(:tenant)
+      vector = unit_vector(0)
+
+      _published = tenant.id |> article(:published) |> then(&embed(tenant.id, &1, vector))
+      draft = tenant.id |> article(:draft) |> then(&embed(tenant.id, &1, vector))
+
+      AdminRepo.insert_all("audit_log", [
+        %{
+          id: Ecto.UUID.bingenerate(),
+          tenant_id: Ecto.UUID.dump!(tenant.id),
+          entity_type: "article",
+          entity_id: Ecto.UUID.dump!(draft.id),
+          action: "article.unpublished",
+          actor_type: "worker",
+          actor_label: "worker:consolidation",
+          inserted_at: NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
+        }
+      ])
+
+      assert :ok = perform_job(DraftDuplicateSweepWorker, %{"tenant_id" => tenant.id})
+
+      assert status_of(draft.id) == :draft,
+             "consolidation chose a REVERSIBLE retraction; this worker must not convert " <>
+               "it into a terminal one a week later"
+    end
+
+    test "still archives an identical draft that consolidation did NOT retract" do
+      tenant = fixture(:tenant)
+      vector = unit_vector(0)
+
+      _published = tenant.id |> article(:published) |> then(&embed(tenant.id, &1, vector))
+      draft = tenant.id |> article(:draft) |> then(&embed(tenant.id, &1, vector))
+
+      assert :ok = perform_job(DraftDuplicateSweepWorker, %{"tenant_id" => tenant.id})
+
+      assert status_of(draft.id) == :archived,
+             "the exclusion must be scoped to consolidation's output, not disable the sweep"
+    end
+  end
+
   describe "absence of evidence" do
     # NB this pins the OUTCOME, not the mechanism. The invariant is protected twice over
     # — the worker's inner join never loads an unembedded draft, and a nil embedding

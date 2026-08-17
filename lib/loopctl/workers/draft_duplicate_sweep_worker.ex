@@ -53,6 +53,25 @@ defmodule Loopctl.Workers.DraftDuplicateSweepWorker do
   "reversible" are different properties, and this worker only has the first. Treat the
   threshold as the safety mechanism it is, and do not lower it without re-measuring.
 
+  ## What it must NOT sweep: another worker's reversible retraction
+
+  `Loopctl.Knowledge.Consolidation` retracts a confirmed duplicate with `unpublish`
+  and never `archive`, deliberately, so an unattended pass keeps an undo
+  (#605/#606/#608). Its output is a DRAFT whose published winner is by construction at
+  or above this worker's similarity threshold — that similarity is *why* it was
+  retracted. So a naive sweep archives exactly the set another worker took care to
+  leave reversible, one week later, unattended, converting a considered
+  `{:published, :draft}` into a terminal `:archived`.
+
+  That is not a hypothetical: on 2026-08-17 a manual drain archived 418 drafts, and all
+  418 turned out to be consolidation retractions from 2026-08-06/07. Zero of the 420
+  consolidation had ever retracted remained reversible afterwards.
+
+  Sparing them costs nothing. A draft is already withheld from every read path, so the
+  queue-hygiene argument for archiving it is weak, while the undo it preserves is the
+  entire reason consolidation chose `unpublish`. Consolidation owns its own output; this
+  worker drains what the CAPTURE path holds.
+
   ## Scope discipline
 
   * Only drafts that HAVE an embedding are considered. An unembedded draft is not
@@ -80,6 +99,10 @@ defmodule Loopctl.Workers.DraftDuplicateSweepWorker do
   alias Loopctl.Tenants.Tenant
 
   @actor_label "worker:draft_duplicate_sweep"
+
+  # The nightly consolidation pass's actor label. Its retractions are SPARED — see
+  # `load_embedded_drafts/2`.
+  @consolidation_actor "worker:consolidation"
 
   # Chosen from the 2026-08-17 drain: every one of the 271 drafts at >= 0.95 that was
   # inspected was a true duplicate, and the ONE inspected article that scored below
@@ -164,11 +187,26 @@ defmodule Loopctl.Workers.DraftDuplicateSweepWorker do
   # for want of a neighbour it was never able to have.
   defp load_embedded_drafts(tenant_id, dimension) do
     from(a in Knowledge.Article,
+      as: :draft,
       join: e in ArticleEmbedding,
       on: e.article_id == a.id and e.tenant_id == a.tenant_id,
       where: a.tenant_id == ^tenant_id,
       where: a.status == :draft,
       where: e.dim == ^dimension and e.live_denorm == true,
+      # Spare consolidation's retractions — the exclusion is applied HERE rather than
+      # before the archive so the sweep does not even spend an ANN read on a draft it
+      # must not touch. There is no marker on the article itself; the audit_log is the
+      # only record that consolidation was the actor.
+      where:
+        not exists(
+          from(al in "audit_log",
+            where: al.entity_id == parent_as(:draft).id,
+            where: al.entity_type == "article",
+            where: al.action == "article.unpublished",
+            where: al.actor_label == ^@consolidation_actor,
+            select: 1
+          )
+        ),
       order_by: [asc: a.inserted_at],
       limit: ^scan_limit(),
       select: %{id: a.id, title: a.title, embedding: e.embedding}
