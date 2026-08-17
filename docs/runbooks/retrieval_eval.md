@@ -77,7 +77,9 @@ what it does and does NOT buy before relying on it:
 * **It is pinned near the metric floor.** `search_keyword` builds its tsquery with
   `websearch_to_tsquery('english', ?)`, which ANDs every non-stop lexeme, so a 10–12 word
   natural-language golden question matches essentially no document. In the committed
-  baseline this arm answers only ~4 of 25 questions, with most per-question MRRs at 0. A
+  baseline this arm answers a small minority of the prose questions, with most
+  per-question MRRs at 0 (the distilled `-kwbag` pairs do better — that is the point of
+  the paired section below). A
   floored metric registers *improvements* but almost never *regressions* (a regression
   needs `current < baseline - tolerance`, and you cannot drop below a floor), so its real
   gate signal covers only the handful of questions that clear the floor.
@@ -125,8 +127,11 @@ Rules the loader ENFORCES (it raises rather than silently scoring fewer question
 
 * `id` is unique across the file, and is the row key in the per-question table — renaming
   one discards its baseline history.
-* `doc_id`s **and titles** are unique across the WHOLE file. Every question's corpus is
-  seeded into one tenant, where each other question's documents act as distractors.
+* `doc_id`s **and titles** are unique across every question that OWNS a corpus. Every
+  corpus is seeded into one tenant, where each other question's documents act as
+  distractors. A `corpus_ref` question is exempt because it holds a COPY of its pair's docs
+  (see the paired-questions section); the exemption is scoped to those, so two owners
+  colliding is still rejected.
 * Every `relevant` doc_id exists in that question's own `corpus`.
 * `graded` values are integers 0..3 and refer to docs in that corpus. A relevant doc with
   no explicit grade defaults to 1.
@@ -153,6 +158,74 @@ stable `doc_id`s — same portability, but the distractors are the ones fusion (
 recency/authority (#471) actually have to disambiguate, which is exactly where those
 changes bite. Until that mining pass lands, read a green embeddings arm as "did not
 regress on a synthetic corpus", not "is good on production traffic".
+
+golden_v3 closes the QUERY half of this gap and not the corpus half: the paired `-kwbag`
+questions carry query text produced by the real production distiller, but the documents they
+are scored against are still the invented prose described above.
+
+## Paired questions: is the injected channel's query shape hurting retrieval? (golden_v3)
+
+71% of this KB's search volume is the injected recall hook, which does not ask questions —
+it distils the user's prompt into a stop-word-stripped salience bag of at most 8 terms
+(`kb_recall_query`, claude-config `hooks/lib/kb-recall.sh`). Every golden question through
+golden_v2 was hand-authored prose, so nothing in this harness could say whether retrieval
+survives that transformation.
+
+golden_v3 adds `corpus_ref`, and with it one **paired** question per prose question:
+`q-<topic>-kwbag` carries the hook's actual output for that question verbatim and points at
+the prose question's corpus, so both are scored against an IDENTICAL corpus with IDENTICAL
+labels. The per-question delta is therefore attributable to the query alone.
+
+```json
+{"kind":"question","id":"q-rls-new-table-kwbag","question":"enable row level security new tenant scoped table","source":"hook-distilled form of q-rls-new-table ...","corpus_ref":"q-rls-new-table"}
+```
+
+Rules the loader enforces: the referring question declares NO corpus/relevant/graded of its
+own, the ref resolves to a question in the same file, it is not self-referential, and it is
+not itself a ref (one hop — a chain would resolve differently depending on file order).
+Refs resolve at LOAD time, so `compute/2`, `corpus/1`, `grade/2` and the report needed no
+change, and `corpus/1` still de-duplicates by `doc_id` so a shared corpus is seeded once.
+
+**Do NOT implement a pair by duplicating the corpus under fresh doc_ids.** All corpora seed
+into one tenant, so the copy becomes its twin's strongest distractor and the pair measures
+the duplication rather than the query.
+
+### The first result: distillation HELPS, in both lanes (measured 2026-08-17)
+
+| metric | prose (26q) | distilled (26q) | delta |
+|--------|------------:|----------------:|------:|
+| embeddings MRR | 0.7463 | 0.8444 | **+0.0981** |
+| embeddings nDCG@5 | 0.7204 | 0.7717 | +0.0513 |
+| embeddings recall@5 | 0.7308 | 0.7500 | +0.0192 |
+| embeddings answered@5 | 22/26 | 23/26 | +1 |
+| keyword_only MRR | 0.1923 | 0.2692 | **+0.0769** |
+| keyword_only recall@5 | 0.1538 | 0.2115 | +0.0577 |
+| keyword_only answered@5 | 5/26 | 7/26 | +2 |
+
+Six questions improve and **none regresses**: `q-liveview-mount` and `q-audit-chain-sth` go
+MRR 0.333 -> 1.000, `q-dispatch-keys` and `q-tenant-id-cast` 0.500 -> 1.000, and in the
+keyword arm `q-oban-backoff` and `q-embedding-dimensions` go 0.000 -> 1.000.
+
+**Read the two arms differently, because only one of them transfers.**
+
+* The **keyword_only** result has a mechanical cause that is real in production:
+  `search_keyword` builds its tsquery with `websearch_to_tsquery('english', ?)`, which ANDs
+  every non-stop lexeme. Dropping five function words from a 13-word question makes a
+  conjunctive match far likelier. Shorter genuinely retrieves better on this lane.
+* The **embeddings** result is measured against the synthetic random-projection stand-in (see
+  the synthetic-embeddings section above), and a bag-of-words projection is structurally
+  friendly to a bag-of-words query. Do not read +0.098 MRR as a claim about any real
+  provider.
+
+What the pair does NOT settle: production hook queries are distilled from CONVERSATIONAL
+PROMPTS, not from well-formed questions, so a real one can be off-topic in a way no pair here
+reproduces. The pair rules out "the distillation itself degrades retrieval"; it does not rule
+out "the prompt was never about the KB topic".
+
+Three of the distilled forms also exposed defects in the distiller's stop list, which is why
+they are worth reading individually rather than only in aggregate: `http`, `not` and `back`
+are all stop-listed, so "which **http** client should a new integration use" distils to
+"client new integration", and "prove it was **not** rewritten" to "prove rewritten".
 
 ## Re-baselining
 

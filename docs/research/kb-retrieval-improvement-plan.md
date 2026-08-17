@@ -16,7 +16,7 @@ Source: `article_access_events` (back to 2026-04-10), `search_events`,
 | Deliberate reads/week | 414 (wk of Jul 6) → **147** (wk of Aug 10) |
 | Results-surfaced → read conversion | 5.18% → **1.67%** (denominator stable at 4.5–5.5 results/search) |
 | Published articles EVER deliberately read | **1,443 of 79,074 — 1.8%** |
-| Share of search traffic that is machine-injected | **71%** (`memory_recall`, 1,053 of 1,486 calls) |
+| Share of search traffic that is machine-injected | **71%** (`memory_recall`, 1,053 of 1,486 calls) — but see §2.1: a further ~11% is smoke/canary traffic, so filter `client_entrypoint` |
 | Share using the richer entrypoints | **1.1%** (hybrid 15, progressive_index 1, heat_index 0, context 1) |
 | Graph edges | 525,932 over 79,074 articles (~6.6/article); 92% have inbound links |
 | Edge types | `relates_to` 502,315 (**96%**), `potential_conflict` 23,617 |
@@ -29,6 +29,81 @@ Two framings that matter more than any single number:
   the headline metric, not agent-initiated search volume.
 - **We are not short of edges. We are short of reads.** The graph is healthy. The corpus is
   read at 1.8%. Whatever is wrong is on the retrieval/consumption side, not the linking side.
+
+## 1.1 What this repo's own runbook already said, and this plan under-weighted
+
+`docs/runbooks/search-events-analysis.md` predates this note and contains three warnings that
+bear directly on it. They were not consulted before §1 was written, which is how the confound
+in §2.1 survived — the segmentation trap is documented there in step 2.
+
+- **Follow-through is a FLOOR, not a satisfaction rate.** "An agent whose question is answered
+  by the snippet correctly opens nothing, and that is a success this metric scores as a
+  failure." The injected block renders a title and snippet per row, so an agent that reads the
+  snippet and needs no more is indistinguishable here from one that ignored it. **This is the
+  single largest caveat on the whole plan**: the headline metric cannot separate "surfaced and
+  ignored" from "surfaced and sufficient".
+- **The documented healthy band is 1–7%, "the biggest number in this area and the least moved
+  by anything shipped so far."** The attributed hook channel measures 11.3% (§2.1) — but that
+  comparison is only suggestive, and saying so is the point of §2.1: the runbook does not state
+  its attribution rule, and 11.3% is an UPPER bound (the cross-key rule it requires is
+  confounded whenever the deliberate channel surfaced the same article). Two follow-through
+  numbers computed under unstated rules are not comparable, which is exactly the mistake this
+  note already made once. What survives is the weaker, sufficient claim: **there is no
+  measurement here showing the injected channel below its historical norm**, so "follow-through
+  is collapsing" is unsupported rather than refuted.
+- **Step 4, verbatim: "Do not spend a month's work on the retrieval side on the strength of a
+  utilization number that was never segmented by origin."** Phases 3–5 are retrieval-side
+  work, and §1's numbers were unsegmented. That warning lands on this plan.
+
+Read together with §2.1 and Phase 2b, the case for the retrieval-side phases is weaker than
+this note originally made it, and the case for Phase 7 (capture policy) and for better
+INSTRUMENTATION — a signal that distinguishes a sufficient snippet from an ignored one — is
+stronger. Neither conclusion is reached by argument here; both are what the measurements left
+standing.
+
+## 2.1 Correction: how the follow-through numbers were got wrong (2026-08-17)
+
+The first version of this note carried a follow-through-by-query-length table
+(0.9% / 2.4% / 17.8% / 45.8%) and drew the plan's ordering from it. **The table was
+confounded and is withdrawn.** Re-derived with an explicit, stated attribution rule, the
+sound measurement is by CLIENT ENTRYPOINT (1,525 events, 2026-08-12..17):
+
+| entrypoint | tool | searches | avg terms | followed | rate |
+|---|---|---|---:|---:|---:|
+| `cli` | `knowledge_hybrid_search` | 7 | 13.0 | 6 | **85.7%** |
+| `cli` | `knowledge_search` | 150 | 10.8 | 60 | **40.0%** |
+| `sdk-cli` | `knowledge_search` | 20 | 9.0 | 6 | 30.0% |
+| `hook` | `memory_recall` | 522 | 6.5 | 59 | **11.3%** |
+| unattributed | `knowledge_search` | 181 | 3.5 | 6 | 3.3% |
+| unattributed | `memory_recall` | 504 | 1.8 | 13 | 2.6% |
+| `smoke` | `knowledge_search` | 86 | 1.0 | 0 | 0.0% |
+
+This CONFIRMS §1's "injected follow-through is 5-13%" (it is 11.3% on attributed hook
+traffic) and refutes the 11x query-length spread. Length and DELIBERATENESS co-vary here and
+this dataset cannot fully separate them; the one comparison holding the tool constant
+(`memory_recall`: 1.8 terms -> 2.6%, 6.5 terms -> 11.3%) puts the length effect at ~4x.
+
+### The three traps, because each one produces a plausible wrong number
+
+- **`get`/`context` rows carry NO `search_id`.** Only `access_type = 'search'` rows do (one
+  per surfaced result). So the obvious `search_events -> article_access_events` join on
+  `metadata->>'search_id'` silently matches only SURFACED rows, and a "followed through"
+  column built that way is really "did the search return anything" — which is ~98%
+  everywhere. Follow-through has to be inferred: article A was surfaced by search S, and A
+  was later read by a `get`.
+- **The hook and the session hold DIFFERENT `api_key_id`s.** Measured: the hook's key made
+  1,071 recalls and **1** deliberate read ever; the MCP/session key made 0 recalls and 2,535
+  reads. So a same-key join reports the injected channel at exactly 0 follow-through — and
+  that 0 is **`n/a`, not 0**, the distinction this repo's own eval harness is careful about
+  ("`0.0` is 'it ran and retrieved nothing'; `n/a` is 'there was nothing to score'").
+  Cross-key attribution is required, and it is confounded whenever both channels surface the
+  same article, so isolate articles only ONE channel surfaced.
+- **`search_events` carries synthetic traffic.** `client_entrypoint = 'smoke'` is the smoke
+  test (86 rows, all 1-term, 0% follow-through by construction), and the canary replays a
+  fixed prompt list — visible as distinct queries each appearing exactly 12 times. Together
+  with SessionStart's bare-repo-name queries these dominate the short-query buckets, which
+  is most of what the withdrawn table was measuring. **Filter on `client_entrypoint` before
+  drawing any conclusion.** Also note the table is a rolling ~5-day window, not history.
 
 ## 2. What the research says
 
@@ -83,47 +158,68 @@ well it is regarded elsewhere.
 
 Ordered by evidence-backed leverage, and by the rule that prompt work precedes ranking work.
 
-### Phase 1 — The injected recall block *(routed: claude-config#312)*
-*(still worth doing, but demoted below Phase 2 by the query-length measurement)*
+### Phase 1 — The injected recall block *(LANDED: claude-config#314)*
+*(briefly demoted below Phase 2 by the query-length measurement; restored when that
+measurement was withdrawn — §2.1)*
 Give the auto-injected block a trigger condition, tool routing by question shape, and a call
 budget with a stop rule. Highest leverage because it is the channel that actually fires, and
 cheapest because it is prose in a cacheable prefix.
 **Check:** `search_follow_through` and surfaced→read conversion vs the baseline in §1, two
 weeks after landing.
-**Not in this repo** — `block-foreign-config-write.sh`; tracked as claude-config#312.
+**Not in this repo** — `block-foreign-config-write.sh`; landed as claude-config#314.
 
-### Phase 2 — Fix the injected QUERY, before anything downstream of it
-*(promoted above the eval work on 2026-08-17 by the measurement below — see §3.1)*
+### Phase 2 — Fix the injected QUERY *(landed: claude-config#314)*
+*(promoted above Phase 1 on 2026-08-17, then RETRACTED the same day — see §3.1)*
 
-The recall hook builds its query as a stop-word-stripped keyword bag from the user's prompt
-wording, producing queries like `infra`, `remove well`, `claude-config`, `yes schedule job
-weekly`. **46% of all searches carry <= 2 terms.** Follow-through by query length, joined
-through `search_events.search_id` -> `article_access_events.metadata->>'search_id'`:
+The recall hook built its query as a stop-word-stripped keyword bag in document order, so a
+long prompt was distilled from its opening clause — throat-clearing rather than subject.
+`kb_recall_query` now scores every surviving term by salience (repetition, weak-word
+penalty, identifier shape, a short-acronym allowlist standing in for IDF) and keeps the best
+8 in first-appearance order.
 
-| query terms | searches | followed through | rate |
-|---|---|---|---|
-| <= 2 | 675 | 6 | **0.9%** |
-| 3-5 | 165 | 4 | 2.4% |
-| 6-9 | 495 | 88 | 17.8% |
-| 10+ | 120 | 55 | **45.8%** |
+**The measurement that promoted this phase was confounded and its headline does not
+survive.** See §2.1 for the sound version and the three traps that produced the bad one.
+What holds: query length and follow-through do move together, but the only *within-tool*
+comparison available puts the effect at ~4x (2.6% -> 11.3%), not the 11x first reported —
+and a well-formed injected query still tops out at 11.3% against 40% for a deliberate one,
+so most of the gap this plan is chasing is NOT query construction.
+**Check:** median `query_terms` for `memory_recall` above 6, and the <= 2-term share below 10%.
 
-Controlled for tool (the 10+ bucket is dominated by deliberate `hybrid_search` calls, which
-would convert better regardless), the effect survives **within `memory_recall` alone**:
-1.4% / 2.5% / 15.2% across the first three buckets — an 11x spread, with 44% of the hook's
-searches in the worst one.
+### Phase 2b — Extend the eval set before changing retrieval *(DONE)*
+The current eval is the only thing that can adjudicate phases 3–5, so it had to first be
+representative of what the injected channel actually asks — every golden question was
+hand-authored prose, while 71% of traffic is an 8-term distilled keyword bag.
 
-A two-term query cannot be rescued by any ranker, any embedding, or any prompt guide. This
-is upstream of every other phase and is why they are all sequenced behind it.
-**Check:** median query_terms for `memory_recall` above 6, and the <= 2-term share below 10%;
-then re-measure follow-through.
-**Not in this repo** — the hook lives in claude-config; folded into claude-config#312.
+**Mining real queries turned out to be the wrong instrument, and the reason matters.** The
+hook channel follows through on ~2% of what it surfaces, and those few reads are
+cross-key and confounded (§2.1), so production traffic cannot supply trustworthy relevance
+LABELS at any useful volume. What it can supply is trustworthy query SHAPE. So the eval now
+carries a **paired** question instead: golden_v3's `corpus_ref` lets `q-<topic>-kwbag` supply
+only its own query text — the real `kb_recall_query` distiller's output for that question,
+generated by running it through the production function — and borrow the prose question's
+corpus and labels. Identical corpus, identical labels, one variable.
 
-### Phase 2b — Extend the eval set before changing retrieval
-The current eval is the only thing that can adjudicate phases 3–5, so it must first be
-representative of what the injected channel actually asks. Harvest real queries from
-`search_events` (1,486 available), label the ones the recall hook issued, and grow the eval
-set from those rather than from hand-written questions.
-**Check:** eval set covers the observed query distribution; baseline regenerated and committed.
+**The result contradicts this plan's Phase 2 premise.** Distillation does not degrade
+retrieval; it improves it, in both arms, with six questions up and none down:
+
+| metric | prose (26q) | distilled (26q) | delta |
+|---|---:|---:|---:|
+| embeddings MRR | 0.7463 | 0.8444 | **+0.0981** |
+| embeddings nDCG@5 | 0.7204 | 0.7717 | +0.0513 |
+| embeddings answered@5 | 22/26 | 23/26 | +1 |
+| keyword_only MRR | 0.1923 | 0.2692 | **+0.0769** |
+| keyword_only answered@5 | 5/26 | 7/26 | +2 |
+
+Only the keyword arm transfers: `websearch_to_tsquery` ANDs every lexeme, so dropping five
+function words from a 13-word query makes a conjunctive match likelier — real in production.
+The embeddings arm is the synthetic random-projection stand-in, and a bag-of-words projection
+flatters a bag-of-words query, so read that half as "not harmful", not as a gain.
+
+What this does NOT settle: production hook queries are distilled from CONVERSATIONAL
+PROMPTS, not from well-formed questions, so a real one can be about the wrong topic entirely
+— a failure no pair here reproduces. **Three hypotheses for the 11.3%-vs-40% gap are now
+eliminated (ranking, query length, distillation) and that one is not.**
+**Done:** golden_v3 committed with 26 paired questions; baseline regenerated on pg16.
 
 ### Phase 3 — Contextual embeddings for atomic notes
 An atomic note extracted from a book or video loses the context of its source. We partially
@@ -172,14 +268,43 @@ otherwise be asked to compensate for it and cannot.
 
 ## 5. Status
 
-- Phase 1 — routed, claude-config#312 + `handoff:claude-config#312`.
-- Phase 2 — MEASURED (see the table above) and folded into claude-config#312; not yet fixed.
-- Phases 2b–7 — not started.
+- Phase 1 — **LANDED** as claude-config#314 (the injected block now ships a trigger
+  condition, a routing table by question shape, and a 3-call budget with a stop rule; the
+  usage guide lives in the cached `~/.claude/CLAUDE.md` prefix, not in the per-turn block).
+- Phase 2 — **LANDED** as claude-config#314. `kb_recall_query` selects terms by salience
+  rather than document order, capped at 8. Its promotion above Phase 1 was retracted the
+  same day (§2.1, §3.1); the fix is still worth having, on a ~4x effect rather than 11x.
+- Phase 2b — **DONE.** golden_v3 + `corpus_ref` paired questions; baseline regenerated. Its
+  result retires Phase 2's premise rather than confirming it (see above).
+- Phases 3–7 — not started. **Phase 4 (reranking) is now the weakest-motivated of them**:
+  ranking, query length and distillation are all eliminated as the cause of the injected
+  channel's gap, so a better ranker is improving something that was not measured to be
+  broken. Prefer Phase 3 (contextual embeddings, which changes what is retrievable at all)
+  and Phase 7 (capture policy) until something re-implicates ranking.
 
-### 3.1 What the ordering cost us to learn
+### 3.1 What the ordering cost us to learn, twice
 
-The first version of this plan led with the prompt guide (Phase 1) and put the eval work
-second. Following it methodically is what produced the query-length measurement, and that
-measurement demoted the plan's own top item. Recorded because the lesson generalises: the
-cheapest phase in a retrieval plan is usually the one that measures what the system is
-actually being asked, and it belongs first even when a more interesting fix is available.
+**First lesson (stands).** The plan led with the prompt guide and put the eval/measurement
+work second. Following it methodically produced a query-length measurement that demoted the
+plan's own top item. The cheapest phase in a retrieval plan is usually the one that measures
+what the system is actually being asked, and it belongs first.
+
+**Second lesson (why that first one was half-right).** Continuing methodically then
+invalidated the promotion itself: the query-length table was confounded three ways (§2.1),
+and with the confounds removed Phase 1 is back above Phase 2 on the merits. A measurement is
+not automatically the sound part of a plan just because it is a measurement — and the
+specific failure was reaching for the join that EXISTS (`metadata->>'search_id'`) instead of
+the join the question needs, then reading its output as follow-through. Both numbers were
+produced by the same person on the same day with the same care; what separated them was
+stating the attribution rule out loud, at which point the confound was visible immediately.
+
+Two consequences worth carrying beyond this note:
+
+- **A ratio of two aggregates survived; a per-row join did not.** §1's conversion (5.18% ->
+  1.67%) and 1.8%-ever-read numbers were computed as counts over counts and all hold up.
+  Every number that needed rows to be MATCHED to each other was wrong. Prefer the aggregate
+  when the linking key is not one you can point at.
+- **`n/a` is not `0`.** The same-key join said the injected channel converts at 0%, which
+  reads as a devastating finding and is merely an unmeasurable one. This repo already
+  encodes that doctrine in `RetrievalEval` for exactly this reason; it applies to ad-hoc
+  production analysis too.
