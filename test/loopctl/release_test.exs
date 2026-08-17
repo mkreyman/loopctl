@@ -32,6 +32,56 @@ defmodule Loopctl.ReleaseTest do
     end
   end
 
+  describe "migration_connection_opts/0" do
+    test "sets a Postgres runtime parameter the server actually honours" do
+      assert [parameters: [idle_in_transaction_session_timeout: "0"]] =
+               Release.migration_connection_opts()
+    end
+
+    test "the parameter name and shape reach the server (not just the keyword list)" do
+      # The failure this guards is a WRONG OPTION rather than a wrong value: a misspelled
+      # parameter, or `parameters:` nested at the wrong level, is silently ignored by
+      # Postgrex and the migrator keeps dying on long migrations exactly as before. So the
+      # assertion is end-to-end against a real connection.
+      #
+      # A PROBE value is used rather than the shipped "0" because the server's own default
+      # differs by environment — 0 on a developer box, 60000ms on the hosted instance — so
+      # asserting "0" would pass vacuously wherever the default is already 0.
+      config = Application.get_env(:loopctl, Loopctl.AdminRepo)
+
+      conn_opts = [
+        hostname: config[:hostname] || "127.0.0.1",
+        port: config[:port] || 5432,
+        username: config[:username],
+        password: config[:password],
+        database: config[:database],
+        parameters: [idle_in_transaction_session_timeout: "12345"]
+      ]
+
+      # `start_link` LINKS the connection to this test process, so it is torn down when the
+      # test ends — no `on_exit` teardown, which is what matters here: this suite shares a
+      # box with two other repos' pools, and a leaked connection per run is how a suite
+      # starts failing on connection exhaustion for reasons nobody can find.
+      {:ok, conn} = Postgrex.start_link(conn_opts)
+
+      assert %{rows: [["12345ms"]]} =
+               Postgrex.query!(conn, "SHOW idle_in_transaction_session_timeout", [])
+    end
+
+    test "both migrate/0 and rollback/1 pass it, so a long DOWN cannot fail the same way" do
+      source = File.read!("lib/loopctl/release.ex")
+
+      # `Ecto.Migrator` holds its advisory lock idle-in-transaction for the whole run in
+      # either direction. Migration 20260817212906's UP took 59.8s against a 60000ms
+      # timeout and killed the release command 0.2s from the finish; its DOWN rebuilds the
+      # same generated column and would do exactly the same thing.
+      assert source
+             |> String.split("migration_connection_opts()")
+             |> length() >= 4,
+             "migrate/0 and rollback/1 must both pass migration_connection_opts/0"
+    end
+  end
+
   describe "rollback/1" do
     test "accepts a version argument for targeted rollback" do
       Code.ensure_loaded!(Release)

@@ -4,6 +4,25 @@ All notable changes to loopctl are documented here.
 
 ## [Unreleased] — 2026-08-07 — Story lifecycle capability delivery
 
+### Fixed
+
+- **A migration slower than the database's `idle_in_transaction_session_timeout` no longer
+  fails the release command after succeeding.** `Ecto.Migrator` takes its advisory lock
+  inside a transaction and leaves that connection idle for the whole run, so Postgres kills
+  it once the migration outlives the timeout — the migration itself commits, then the
+  release command exits non-zero and the deploy aborts.
+
+  Observed on 2026-08-17: the `articles.search_vector` rebuild logged
+  `== Migrated 20260817212906 in 59.8s` against a 60000ms timeout, died with
+  `FATAL 25P03` in `do_lock_for_migrations`, and Fly aborted the deployment. Production was
+  left running the NEW schema with the PREVIOUS release's code — harmless only because that
+  change was additive.
+
+  `Loopctl.Release.migrate/0` and `rollback/1` now disable the timeout for the migrator's
+  own connections. **Scoped to the migrator**: the timeout stays on for the application,
+  where a connection stuck idle in a transaction holds locks and blocks vacuum. No operator
+  action and no database setting change.
+
 ### Added
 
 - **A second-stage reranking seam for combined search** (`Loopctl.Knowledge.Reranker`),
