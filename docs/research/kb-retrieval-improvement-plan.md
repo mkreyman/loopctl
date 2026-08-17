@@ -84,6 +84,7 @@ well it is regarded elsewhere.
 Ordered by evidence-backed leverage, and by the rule that prompt work precedes ranking work.
 
 ### Phase 1 — The injected recall block *(routed: claude-config#312)*
+*(still worth doing, but demoted below Phase 2 by the query-length measurement)*
 Give the auto-injected block a trigger condition, tool routing by question shape, and a call
 budget with a stop rule. Highest leverage because it is the channel that actually fires, and
 cheapest because it is prose in a cacheable prefix.
@@ -91,7 +92,33 @@ cheapest because it is prose in a cacheable prefix.
 weeks after landing.
 **Not in this repo** — `block-foreign-config-write.sh`; tracked as claude-config#312.
 
-### Phase 2 — Extend the eval set before changing retrieval
+### Phase 2 — Fix the injected QUERY, before anything downstream of it
+*(promoted above the eval work on 2026-08-17 by the measurement below — see §3.1)*
+
+The recall hook builds its query as a stop-word-stripped keyword bag from the user's prompt
+wording, producing queries like `infra`, `remove well`, `claude-config`, `yes schedule job
+weekly`. **46% of all searches carry <= 2 terms.** Follow-through by query length, joined
+through `search_events.search_id` -> `article_access_events.metadata->>'search_id'`:
+
+| query terms | searches | followed through | rate |
+|---|---|---|---|
+| <= 2 | 675 | 6 | **0.9%** |
+| 3-5 | 165 | 4 | 2.4% |
+| 6-9 | 495 | 88 | 17.8% |
+| 10+ | 120 | 55 | **45.8%** |
+
+Controlled for tool (the 10+ bucket is dominated by deliberate `hybrid_search` calls, which
+would convert better regardless), the effect survives **within `memory_recall` alone**:
+1.4% / 2.5% / 15.2% across the first three buckets — an 11x spread, with 44% of the hook's
+searches in the worst one.
+
+A two-term query cannot be rescued by any ranker, any embedding, or any prompt guide. This
+is upstream of every other phase and is why they are all sequenced behind it.
+**Check:** median query_terms for `memory_recall` above 6, and the <= 2-term share below 10%;
+then re-measure follow-through.
+**Not in this repo** — the hook lives in claude-config; folded into claude-config#312.
+
+### Phase 2b — Extend the eval set before changing retrieval
 The current eval is the only thing that can adjudicate phases 3–5, so it must first be
 representative of what the injected channel actually asks. Harvest real queries from
 `search_events` (1,486 available), label the ones the recall hook issued, and grow the eval
@@ -146,4 +173,13 @@ otherwise be asked to compensate for it and cannot.
 ## 5. Status
 
 - Phase 1 — routed, claude-config#312 + `handoff:claude-config#312`.
-- Phases 2–7 — not started.
+- Phase 2 — MEASURED (see the table above) and folded into claude-config#312; not yet fixed.
+- Phases 2b–7 — not started.
+
+### 3.1 What the ordering cost us to learn
+
+The first version of this plan led with the prompt guide (Phase 1) and put the eval work
+second. Following it methodically is what produced the query-length measurement, and that
+measurement demoted the plan's own top item. Recorded because the lesson generalises: the
+cheapest phase in a retrieval plan is usually the one that measures what the system is
+actually being asked, and it belongs first even when a more interesting fix is available.
