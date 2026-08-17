@@ -15,7 +15,9 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
 
   alias Loopctl.Llm.Remediation
 
-  @max_snippet_length 300
+  # One constant, shared with the backfill that PRODUCES snippets, so the produced length
+  # and the enforced length cannot drift.
+  @max_snippet_length Loopctl.Knowledge.max_snippet_length()
 
   @doc "Renders search results with unified score field and truncated snippets."
   def search(%{results: results, meta: meta}, mode) do
@@ -136,10 +138,25 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
     result[:final_score] || result[:relevance_score] || result[:similarity_score] || 0.0
   end
 
+  # Every result that can carry a snippet now does: a `ts_headline` highlight when the
+  # KEYWORD lane matched, and a lead extract of the body when it did not. Before the
+  # backfill the key was simply absent on semantic-only hits — so the rows the query did
+  # NOT lexically match, which is exactly what the semantic lane exists to find, were the
+  # ones with nothing to explain them.
+  #
+  # `snippet_source` is reported because the two read very differently and a consumer may
+  # want to render them differently: a highlight carries `**term**` markers and can open
+  # mid-sentence, while a lead is the article's own opening prose. Absent when there is no
+  # snippet at all, so it never implies one.
   defp maybe_add_snippet(base, result) do
     case result[:snippet] do
-      nil -> base
-      snippet -> Map.put(base, :snippet, truncate_snippet(snippet))
+      nil ->
+        base
+
+      snippet ->
+        base
+        |> Map.put(:snippet, truncate_snippet(snippet))
+        |> Map.put(:snippet_source, result[:snippet_source] || "highlight")
     end
   end
 

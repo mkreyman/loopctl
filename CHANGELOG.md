@@ -6,6 +6,23 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Every search result now carries a snippet**, plus a `snippet_source` naming which kind
+  it is (`highlight` | `lead`). `snippet` is a `ts_headline` fragment and therefore came
+  ONLY from the keyword lane, so a result the query did not lexically match — precisely
+  what the semantic lane exists to find — arrived with no snippet key at all. The rows
+  most in need of an explanatory line were exactly the ones that had none, and an agent
+  handed a bare title either opens it blindly or ignores it. A `lead` is an extract of the
+  article's own opening prose, skipping the front matter that would otherwise fill it
+  (99 articles in one corpus begin with an auto-extraction banner, and a lead built from
+  that explains nothing while looking like it does).
+
+  Affects `GET /api/v1/knowledge/search` (semantic and combined modes) and
+  `POST /api/v1/recall`, so the injected recall hook gets it too. Additive: consumers that
+  ignore `snippet_source` are unaffected, but one that used the ABSENCE of `snippet` to
+  detect a semantic-only hit should now read `snippet_source == "lead"`. The fill is
+  bounded to the returned page and runs on the HeavyRead pool, never AdminRepo, and sheds
+  under load — a shed backfill costs a snippet, never a result.
+
 - **A read now records WHICH search surfaced it**, on two new
   `article_access_events` columns (`origin_search_id`, `origin_attribution`) resolved
   SERVER-SIDE at write time and never accepted from a caller — the same rule

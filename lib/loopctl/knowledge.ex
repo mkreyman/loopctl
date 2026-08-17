@@ -2656,6 +2656,16 @@ defmodule Loopctl.Knowledge do
   # the whole result set. The cap lives in `Analytics` — the module that writes the rows
   # and documents the key — so the enforcement here and every doc that publishes the
   # number read ONE constant.
+  # The serialized snippet cap. Lives here rather than in the renderer so the value the
+  # backfill PRODUCES and the value the renderer ENFORCES are one constant.
+  @max_snippet_length 300
+
+  # How much of a body the lead extractor reads. Bigger than the snippet cap on purpose:
+  # front matter that has to be skipped (an auto-extraction banner, a heading, a metadata
+  # table) can easily run past 300 bytes, and scanning only 300 would return the banner it
+  # was supposed to skip.
+  @snippet_scan_bytes 1500
+
   # Extracted from `maybe_record_search_access/5` so that function stays readable: the
   # attempt row carries enough of the request to make a MISS interpretable later, which is
   # a dozen fields, and inlining them buried the control flow they sit inside.
@@ -2828,6 +2838,151 @@ defmodule Loopctl.Knowledge do
   # exact population the schema could not represent, and recovering them meant hand-mining
   # 6,457 session transcripts. Both halves share one `search_id` so a miss and its (absent)
   # results are one correlated story.
+
+  # ---------------------------------------------------------------------------
+  # Snippet backfill — every result explains itself, whichever lane found it
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  The maximum serialized snippet length. Referenced by the renderer too, so the enforced
+  cap and the documented one cannot drift.
+  """
+  @spec max_snippet_length() :: pos_integer()
+  def max_snippet_length, do: @max_snippet_length
+
+  # WHY THIS EXISTS. `snippet` is a `ts_headline` highlight and therefore comes ONLY from
+  # the KEYWORD lane. A result the query did not lexically match — which is precisely what
+  # the semantic lane is FOR — arrived with no snippet key at all, so the rows most in need
+  # of an explanatory line were exactly the ones that had none. An agent handed a bare title
+  # can neither judge it nor skip it honestly: it opens blindly or ignores the row, and both
+  # show up in the follow-through metric as the retrieval's fault.
+  #
+  # Cost is bounded to the RETURNED PAGE, never the candidate pool: combined search runs its
+  # sub-searches at `@max_relevance_page_size` and passes `_skip_snippet_backfill`, exactly
+  # as it already passes `_skip_record_access`, so the fill happens once on the merged page.
+  # One primary-key batch read of a bounded body prefix.
+  defp with_snippets(tenant_id, results, opts) do
+    if Keyword.get(opts, :_skip_snippet_backfill, false) do
+      results
+    else
+      backfill_snippets(tenant_id, results)
+    end
+  end
+
+  defp backfill_snippets(tenant_id, results) when is_list(results) do
+    # NB this filter is a COST optimisation, not a correctness guard, and mutation testing
+    # says so: `apply_leads/2` independently refuses to overwrite a result that already has
+    # a snippet, so widening this to every result is behaviour-preserving and fails no test.
+    # It stays because it decides how many bodies are read, which no test can see.
+    missing = Enum.filter(results, &is_nil(Map.get(&1, :snippet)))
+
+    case Enum.map(missing, & &1.id) do
+      [] ->
+        results
+
+      ids ->
+        query =
+          from(a in Article,
+            where: a.tenant_id == ^tenant_id and a.id in ^ids,
+            select: {a.id, fragment("left(?, ?)", a.body, @snippet_scan_bytes)}
+          )
+
+        # HeavyRead, NOT AdminRepo: this runs on the public search path, and AdminRepo's
+        # small pool is load-bearing for every authentication — the keyword lane already
+        # spends one connection there per search, and a second would double that for a
+        # cosmetic field. HeavyRead has its own pool and may SHED under load, which is the
+        # correct degradation here: a shed backfill costs a snippet, never a result.
+        tenant_id
+        |> HeavyRead.all(query, semantic_heavy_read_opts())
+        |> apply_lead_rows(results)
+    end
+  rescue
+    # A snippet is an aid, never the answer. If the backfill fails the results still stand.
+    error ->
+      Logger.warning("Knowledge snippet backfill failed: #{Exception.message(error)}")
+      results
+  end
+
+  defp apply_lead_rows({:error, :heavy_read_overloaded}, results), do: results
+
+  defp apply_lead_rows(rows, results) when is_list(rows) do
+    apply_leads(results, Map.new(rows, fn {id, prefix} -> {id, lead_extract(prefix)} end))
+  end
+
+  defp apply_leads(results, leads) do
+    Enum.map(results, fn result ->
+      case {Map.get(result, :snippet), Map.get(leads, result.id)} do
+        {nil, lead} when is_binary(lead) and lead != "" ->
+          result |> Map.put(:snippet, lead) |> Map.put(:snippet_source, "lead")
+
+        _ ->
+          result
+      end
+    end)
+  end
+
+  # The first SUBSTANTIVE prose of a body.
+  #
+  # Naive `left(body, 300)` is not good enough here and the corpus says why: 99 articles
+  # begin with the auto-extraction banner ("> ... NOT verified by a human"), many begin with
+  # a markdown heading, and a lead built from either explains nothing while looking like it
+  # does. So leading blockquotes, headings, rules, list bullets, images/badges and fenced
+  # code are skipped, and the first real paragraph is taken.
+  defp lead_extract(nil), do: nil
+
+  defp lead_extract(body) when is_binary(body) do
+    body
+    |> String.split("\n")
+    |> drop_front_matter()
+    |> Enum.take_while(&(String.trim(&1) != ""))
+    |> Enum.join(" ")
+    |> strip_light_markup()
+    |> truncate_on_word_boundary(@max_snippet_length)
+  end
+
+  defp drop_front_matter(lines) do
+    lines
+    |> Enum.drop_while(&skippable_lead_line?/1)
+    |> case do
+      # A body that is nothing BUT front matter still deserves a snippet, so fall back to
+      # its first non-blank line rather than returning an empty string.
+      [] -> Enum.reject(lines, &(String.trim(&1) == ""))
+      kept -> kept
+    end
+  end
+
+  defp skippable_lead_line?(line) do
+    trimmed = String.trim(line)
+
+    trimmed == "" or
+      String.starts_with?(trimmed, [">", "#", "---", "***", "```", "|", "!["]) or
+      String.match?(trimmed, ~r/^[-*+]\s/)
+  end
+
+  # Deliberately LIGHT: unwrap link text, drop emphasis/backtick markers, collapse
+  # whitespace. Not a markdown renderer — the goal is a line a human or an agent can read at
+  # a glance, and an over-clever transform on untrusted body text is a bigger risk than a
+  # stray character.
+  defp strip_light_markup(text) do
+    text
+    |> String.replace(~r/!\[[^\]]*\]\([^)]*\)/, "")
+    |> String.replace(~r/\[([^\]]*)\]\([^)]*\)/, "\\1")
+    |> String.replace(~r/[*_`]+/, "")
+    |> String.replace(~r/\s+/, " ")
+    |> String.trim()
+  end
+
+  defp truncate_on_word_boundary(text, max) do
+    if String.length(text) <= max do
+      text
+    else
+      text
+      |> String.slice(0, max)
+      |> String.replace(~r/\s+\S*$/, "")
+      |> Kernel.<>("…")
+    end
+  end
+
   defp maybe_record_search_access(tenant_id, results, query_string, opts, mode) do
     results = results || []
     api_key_id = Keyword.get(opts, :api_key_id)
@@ -7721,7 +7876,7 @@ defmodule Loopctl.Knowledge do
 
             {:ok,
              %{
-               results: results,
+               results: with_snippets(tenant_id, results, opts),
                meta:
                  %{
                    total_count: total_count,
@@ -7833,7 +7988,7 @@ defmodule Loopctl.Knowledge do
 
             {:ok,
              %{
-               results: results,
+               results: with_snippets(tenant_id, results, opts),
                meta:
                  %{
                    total_count: total_count,
@@ -8383,6 +8538,10 @@ defmodule Loopctl.Knowledge do
       opts
       |> Keyword.merge(limit: @max_relevance_page_size, offset: 0)
       |> Keyword.put(:_skip_record_access, true)
+      # Same reason as `_skip_record_access`: the sub-searches run at the wide pool size,
+      # so filling snippets here would read bodies for candidates that never reach the
+      # caller. The merged page is filled once, below.
+      |> Keyword.put(:_skip_snippet_backfill, true)
 
     keyword_result = search_keyword(tenant_id, query_string, sub_opts)
 
@@ -8438,7 +8597,10 @@ defmodule Loopctl.Knowledge do
               combined_search_mode(merged.meta[:provenance])
             )
 
-            {:ok, merged}
+            # Filled AFTER recording so the analytics rows describe what was retrieved, not
+            # what was decorated, and once — on the merged page rather than either lane's
+            # wide pool.
+            {:ok, %{merged | results: with_snippets(tenant_id, merged.results, opts)}}
 
           # US-41.1: `:semantic_recall_unavailable` joins `:heavy_read_overloaded`
           # here — the query vector cannot be compared against the corpus this tenant
