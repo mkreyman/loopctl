@@ -940,6 +940,17 @@ config :loopctl, :knowledge_rrf_graph_seed_count, 10
 # Overall cap on distinct graph-lane neighbors injected into the fusion.
 config :loopctl, :knowledge_rrf_graph_max_neighbors, 20
 
+# Phase 4 second-stage reranking. OFF by default: it puts an outbound provider call on the
+# DEFAULT search path, and the measurements that motivated the retrieval plan eliminate
+# ranking as the cause of the injected channel's follow-through gap — so a better ranker
+# improves something no measurement implicates. The seam exists so the experiment is
+# runnable (`mix loopctl.retrieval.eval --rerank`) rather than argued about.
+#
+# It reorders the RETURNED PAGE, not the fused pool, so it can move recall below the page
+# size and MRR/nDCG within it, and cannot move recall AT the page size.
+config :loopctl, :knowledge_reranker_enabled, false
+config :loopctl, :knowledge_reranker, Loopctl.Knowledge.Reranker.Noop
+
 # search_combined/3 post-fusion ranking priors (#471, epic #468 — the Cerebras RAG
 # playbook). Two priors re-rank the fused candidate list AFTER RRF/min-max fusion but
 # BEFORE the top-k cut, and they also apply on the degraded keyword_only fallback (both
