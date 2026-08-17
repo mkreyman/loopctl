@@ -272,6 +272,37 @@ The shipped setting (`0.15`) is the largest weight at which no question loses re
 answer. The full sweep table lives in `config/config.exs` next to the value, and the
 reasoning in `docs/research/kb-retrieval-improvement-plan.md`.
 
+## Tags in the keyword index (golden_v5)
+
+`articles.search_vector` indexes `title` (A), `body` (B) and, since the Phase 3 change,
+`loopctl_searchable_tags(tags)` (C). `q-tag-only` is its capability check: the question's
+distinguishing term lives ONLY in the answer's tags, so rolling the migration back drops it
+to 0.0 in both arms.
+
+Re-measure the motivating number — how much curated tag vocabulary the index cannot see —
+against production with:
+
+```sql
+WITH sample AS (
+  SELECT id, title, body, tags FROM articles
+  WHERE status = 'published' AND tags <> '{}' ORDER BY id LIMIT 3000
+), t AS (SELECT id, title, body, unnest(tags) AS tag FROM sample)
+SELECT (tag ~ '^(url|yt|book|doi|isbn)-') AS provenance,
+       count(*) AS tag_instances,
+       round(100.0 * count(*) FILTER (
+         WHERE NOT (to_tsvector('english', coalesce(title,'') || ' ' || coalesce(body,''))
+                    @@ plainto_tsquery('english', replace(tag, '-', ' ')))) / count(*), 1
+       ) AS pct_invisible
+FROM t GROUP BY 1;
+```
+
+It read 59.9% invisible for topical tags on 2026-08-17. **Sample, do not scan the whole
+table** — the unsampled form times out.
+
+**The golden corpus understates this by construction**: its docs carry ~2 tags each against
+production's ~10, so the eval's job here is to prove no regression and to carry the one
+capability question, not to size the gain.
+
 ## Re-baselining
 
 ```

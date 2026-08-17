@@ -83,6 +83,102 @@ defmodule Loopctl.KnowledgeSearchTest do
 
   # --- TC-20.1.2: Filters by project_id, category, tags ---
 
+  describe "search_keyword/3 - tags are indexed at weight C" do
+    test "an article is findable by a tag whose vocabulary appears nowhere in its text" do
+      %{tenant: tenant} = setup_tenant()
+
+      tagged =
+        create_published_article(tenant.id, %{
+          title: "Atomic notes should stand alone",
+          body: "A note carries one idea and reads without its neighbours.",
+          tags: ["zettelkasten", "note-taking"]
+        })
+
+      create_published_article(tenant.id, %{
+        title: "Atomic notes and chunk size",
+        body: "Chunk size trades a sharper signal against surrounding context.",
+        tags: ["chunking"]
+      })
+
+      # Measured on production 2026-08-17: 59.9% of topical tag instances carry vocabulary
+      # that appears nowhere in their article's title or body, so before tags were indexed
+      # roughly three fifths of the curated vocabulary in this corpus was unsearchable.
+      assert {:ok, %{results: results}} = Knowledge.search_keyword(tenant.id, "zettelkasten")
+      assert Enum.map(results, & &1.id) == [tagged.id]
+    end
+
+    test "a tag never outranks a title match on the same term" do
+      %{tenant: tenant} = setup_tenant()
+
+      in_title =
+        create_published_article(tenant.id, %{
+          title: "Zettelkasten in practice",
+          body: "Unrelated body text.",
+          tags: []
+        })
+
+      in_tag =
+        create_published_article(tenant.id, %{
+          title: "Some other note",
+          body: "Unrelated body text.",
+          tags: ["zettelkasten"]
+        })
+
+      # Tags are setweight 'C', strictly below title 'A' and body 'B'. Assert the SCORES,
+      # not just the order: with both at weight A the two rank EQUAL and the deterministic
+      # id tiebreak decides, so an order-only assertion passes or fails on which UUID the
+      # fixture happened to mint — verified by promoting tags to 'A' and watching an
+      # order-only version of this test still pass.
+      assert {:ok, %{results: results}} = Knowledge.search_keyword(tenant.id, "zettelkasten")
+      assert length(results) == 2
+
+      title_hit = Enum.find(results, &(&1.id == in_title.id))
+      tag_hit = Enum.find(results, &(&1.id == in_tag.id))
+
+      assert title_hit.relevance_score > tag_hit.relevance_score,
+             "a tag match must never rank at or above a title match on the same term"
+
+      assert Enum.map(results, & &1.id) == [in_title.id, in_tag.id]
+    end
+
+    test "machine-minted provenance tags contribute no lexemes at all" do
+      %{tenant: tenant} = setup_tenant()
+
+      create_published_article(tenant.id, %{
+        title: "A captured web article",
+        body: "Body text that mentions neither of the two words under test.",
+        tags: ["url-42516bb95051", "book-0be008289fe8", "structured-concurrency"]
+      })
+
+      # Postgres tokenizes a hyphenated word into the compound AND its parts, so indexing
+      # `url-<hash>` would put the bare lexeme `url` on tens of thousands of rows (measured
+      # 2026-08-17: `doc-` 37,877 instances, `book-` 17,047, `url-` 8,671). Those prefixes
+      # are ordinary English query words, so the cost would be precision, not index size.
+      assert {:ok, %{results: []}} = Knowledge.search_keyword(tenant.id, "url")
+      assert {:ok, %{results: []}} = Knowledge.search_keyword(tenant.id, "book")
+
+      # ...while an ordinary hyphenated tag still contributes, by the compound and by parts.
+      assert {:ok, %{results: [_]}} =
+               Knowledge.search_keyword(tenant.id, "structured concurrency")
+
+      assert {:ok, %{results: [_]}} = Knowledge.search_keyword(tenant.id, "concurrency")
+    end
+
+    test "an untagged article is unaffected, and a nil-ish tag list does not break the column" do
+      %{tenant: tenant} = setup_tenant()
+
+      article =
+        create_published_article(tenant.id, %{
+          title: "Advisory locks for coordination",
+          body: "Take an advisory lock so two nodes cannot run the same step twice.",
+          tags: []
+        })
+
+      assert {:ok, %{results: [found]}} = Knowledge.search_keyword(tenant.id, "advisory lock")
+      assert found.id == article.id
+    end
+  end
+
   describe "search_keyword/3 - filters" do
     test "filters by project_id" do
       %{tenant: tenant, project: project} = setup_tenant_with_project()

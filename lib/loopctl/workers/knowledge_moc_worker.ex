@@ -45,7 +45,7 @@ defmodule Loopctl.Workers.KnowledgeMocWorker do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.Knowledge
-  alias Loopctl.Knowledge.IdempotencyTag
+  alias Loopctl.Knowledge.ProvenanceTags
   alias Loopctl.Oban.FairShare
   alias Loopctl.Tenants.Tenant
 
@@ -82,18 +82,11 @@ defmodule Loopctl.Workers.KnowledgeMocWorker do
   )
 
   # Provenance-id and chunk-coordinate prefixes (`yt-<id>`, `pp-1-12` = pages 1–12,
-  # `chunk-7`, …) — these identify WHERE in a source an article came from, never a
-  # topic. Kept to concrete observed patterns: a broad `p-` would wrongly drop real
-  # hyphenated topics (`p-value`, …).
-  #
-  # `idem-` (#583) is the RESERVED namespace those same provenance ids now move into
-  # (`idem-url-<digest>`), and the match here is by PREFIX — `url-` does not match
-  # `idem-url-…` — so it must be listed in its own right or every promoted and every
-  # future capture id becomes MOC-eligible and can be PUBLISHED as an `Index: idem-url-…`
-  # hub. Taken from `IdempotencyTag.reserved_prefix/0` so it cannot drift from the
-  # namespace it suppresses.
-  @excluded_prefixes ~w(yt- doc- repo- url- book- img- file- vid- web- chunk- pp- www-) ++
-                       [IdempotencyTag.reserved_prefix()]
+  # `chunk-7`, …) — these identify WHERE in a source an article came from, never a topic,
+  # so an `Index: url-42516bb95051` hub is noise. The list moved to
+  # `Loopctl.Knowledge.ProvenanceTags` when the keyword index needed the same answer; read
+  # its moduledoc for why `idem-` must be listed in its own right and why `p-` must not be.
+  @excluded_prefixes ProvenanceTags.prefixes()
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"mode" => "all_tenants"}}) do

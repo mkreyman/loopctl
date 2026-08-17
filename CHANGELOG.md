@@ -6,6 +6,30 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **`articles.tags` are now part of the keyword index**, at weight `C` (below title `A` and
+  body `B`). `articles.search_vector` has indexed title and body since April and never
+  tags; sampling 3,000 published articles found **59.9% of topical tag instances carry
+  vocabulary appearing nowhere in that article's own title or body**, so roughly three
+  fifths of the curated topical vocabulary was unsearchable by keyword.
+
+  Machine-minted provenance tag prefixes (`url-`, `yt-`, `book-`, `doc-`, `pp-`, `chunk-`,
+  `chapter-`, `part-`, the reserved `idem-` namespace, and the rest of
+  `Loopctl.Knowledge.ProvenanceTags.prefixes/0`) are excluded by the new IMMUTABLE
+  `loopctl_searchable_tags(text[])` function. Postgres tokenizes a hyphenated word into the
+  compound and its parts, so indexing those would put the bare lexemes `url`, `book`, `doc`,
+  `idem` on tens of thousands of rows, and those are ordinary query words.
+
+  That list also now backs `KnowledgeMocWorker`'s hub-topic exclusion, which previously
+  owned it. `chapter-` and `part-` are new to it — the same chunk-coordinate class as `pp-`
+  and `chunk-` — so those tags stop being eligible as MOC hub topics as well.
+
+  **DEPLOY IMPACT — read before rolling this out.** The migration DROPs and re-ADDs the
+  generated column and rebuilds its GIN index, which takes an ACCESS EXCLUSIVE lock on
+  `articles`: reads AND writes to that table block for the duration. Measured on the hosted
+  instance 2026-08-17: 85,294 rows, 138 MB heap, 59 MB FTS index — expect roughly a minute
+  or two. Schedule it accordingly; there is no online path for a generated column. The
+  migration is reversible (`down` rebuilds the column without tags).
+
 - **Combined search now fuses a third lane of link-graph neighbours**, and it is ON by
   default (`:knowledge_rrf_graph_lane_enabled` flips `false` -> `true`,
   `:knowledge_rrf_graph_weight` `0.25` -> `0.15`). The lane takes the top merged candidates

@@ -253,12 +253,71 @@ agent's tool choice. Phases 3–5 should be read the same way.
 **Check:** the injected block's rows are judgeable without a `knowledge_get`; re-measure
 `searches_quiet` against `cross_key_opens` once Phase 2c has collected real traffic.
 
-### Phase 3 — Contextual embeddings for atomic notes
-An atomic note extracted from a book or video loses the context of its source. We partially
-compensate today with a title suffix (`— Blackmagic_Converters_Manual`), which is why this is
-an experiment and not an obvious win: measure whether prepending a generated
-source/hub context before embedding beats what the suffix already buys.
-**Check:** recall@5 and answered@5 vs baseline. Ship only on a positive delta.
+### Phase 3 — Context an atomic note has lost *(DONE for the lexical half; the LLM half is refused, with a condition)*
+An atomic note extracted from a book or video loses the context of its source. The plan
+assumed the answer was Anthropic's Contextual Retrieval — generate 50-100 tokens of context
+per chunk with an LLM, prepend it before embedding and before indexing.
+
+**Measuring first changed the answer.** Anthropic's technique exists because their chunks
+carry NO metadata. Ours carry a curated tag set, a category and a source. So the first
+question is not "what should we generate" but "what are we failing to use". Sampled 3,000
+published articles (2026-08-17), 30,187 tag instances:
+
+| tag kind | instances | vocabulary present in title+body | **invisible to the index** |
+|---|---:|---:|---:|
+| topical (`chunking`, `rls`, `bing-liu`) | 28,720 | 11,508 | **59.9%** |
+| machine provenance (`url-…`, `yt-…`) | 1,467 | 54 | 96.3% |
+
+`articles.search_vector` indexed `title` (A) and `body` (B) and never `tags`. **About three
+fifths of the hand-curated topical vocabulary in this corpus could not be keyword-matched at
+all** — a plain missing input, not a modelling problem, and free to fix.
+
+**Shipped:** tags at weight `C`, strictly below title and body, with the machine-minted
+provenance prefixes excluded. That exclusion is not tidiness: Postgres tokenizes a hyphenated
+word into the compound AND its parts, so indexing `url-42516bb95051` puts the bare lexeme
+`url` on 8,671 rows (`doc-` on 37,377, `book-` on 17,047) — and those prefixes are ordinary
+English query words, so the cost would be precision on real queries.
+
+The exclusion list is NOT written for this feature. It is
+`Loopctl.Knowledge.ProvenanceTags`, which now owns the one answer this repo had already
+worked out for MOC hub selection and derives `idem-` from `IdempotencyTag.reserved_prefix/0`.
+**The first draft here did hand-write a list, and it omitted `idem-` entirely** — so every
+capture id minted after #583 would have been indexed, putting the lexeme `idem` on every
+future article. It also excluded `url-` by bare prefix, which would have dropped a
+legitimate `url-design` topic tag; `IdempotencyTag`'s own docs name that collision as the
+reason its legacy matcher is shape-based. Worth recording because the failure was not
+carelessness — a plausible list was measured from production data and was still wrong,
+because the question had already been answered elsewhere.
+
+Where tags come from, since it decides how much this can ever be worth: they are
+**LLM-generated once at ingest** (`ContentIngestionWorker` hands the content to the
+configured extractor, which returns title/body/category/tags in one shot). Nothing re-tags
+an existing article, so the corpus's tag quality is fixed at capture time and improving it
+retroactively is a separate, unbuilt thing.
+
+Eval, golden_v5, no regression on any question in either arm:
+
+| arm | answered | MRR | recall@5 |
+|---|---|---|---|
+| keyword_only | 12 → **16** | 0.1855 → **0.2500** | 0.158 → **0.192** |
+| embeddings | 47 → **49** | 0.6305 → **0.6729** | — |
+
+The golden corpus carries ~2 tags per doc against production's ~10, so the eval understates
+this; its job here was to prove no regression and to carry `q-tag-only`, a question whose
+answer holds the distinguishing term ONLY in its tags. Rolling the migration back drops that
+question to 0.0 in both arms, which is what makes it a capability test rather than decoration.
+
+**The LLM half is deliberately NOT shipped, and the reason is a claim that can be checked.**
+Generated context would cost ~85k LLM calls plus a full corpus re-embed, and it aims at the
+lane that needs it least: the semantic lane already generalises across vocabulary, so an
+article tagged `contextual-embeddings` whose body says "inject surrounding context into chunk
+embeddings" is ALREADY close to a query about contextual embeddings. It is the LEXICAL lane
+that matches literally and therefore misses, which is exactly what the 59.9% measures.
+**Revisit if** the Phase 2c counters show searches going quiet on topics the corpus demonstrably
+covers *after* tag indexing has been live for the 1-2 week window — that is the observation
+that would show the remaining gap is semantic rather than lexical.
+
+**Check (met):** no regression, plus a question that is unanswerable without the change.
 
 ### Phase 4 — Reranking
 *(Phase 5 landed first: it needed no new vendor, no LLM on the recall path, and the lane it
@@ -352,6 +411,8 @@ otherwise be asked to compensate for it and cannot.
   fixable here (the caller must declare itself, as `smoke.sh` does): handed to
   claude-config#317.
 - Phase 2d — **DONE, deployed v523** (#690). Every search result carries a snippet.
+- Phase 3 — **DONE for the lexical half.** Tags are indexed at weight C; the LLM-generated
+  context half is refused on a stated argument with a stated overturn condition (above).
 - Phase 5 — **DONE.** The graph lane is ON at weight 0.15, chosen by a sweep on golden_v4
   rather than by argument. What blocked it was never the code (#470 built the lane) but the
   instrument: the eval seeded no edges, so the lane was unjudgeable there. See Phase 5 above.
@@ -360,9 +421,9 @@ otherwise be asked to compensate for it and cannot.
     distillation are each eliminated as the cause of the injected channel's gap, so a better
     ranker improves something no measurement implicates. It should not be started until
     Phase 2c's counters say ranking is the problem.
-  - **Phase 3 is the remaining live engineering candidate**, for the reason that also made
-    Phase 5 worth doing first: it changes what is retrievable at all rather than how a fixed
-    candidate set is ordered.
+  - **Phases 3 and 5 both landed on that reasoning** — each changes what is retrievable at
+    all rather than how a fixed candidate set is ordered, which is why both were adjudicable
+    on the eval alone.
   - **Phase 7 is the owner's call and is unchanged by any of this** — a 1.8% read rate is a
     capture-policy problem and no retrieval phase can compensate for it.
   - **The honest sequencing note, revised.** Phase 2c exists to make phases 3–5 falsifiable
