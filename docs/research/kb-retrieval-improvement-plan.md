@@ -16,7 +16,7 @@ Source: `article_access_events` (back to 2026-04-10), `search_events`,
 | Deliberate reads/week | 414 (wk of Jul 6) → **147** (wk of Aug 10) |
 | Results-surfaced → read conversion | 5.18% → **1.67%** (denominator stable at 4.5–5.5 results/search) |
 | Published articles EVER deliberately read | **1,443 of 79,074 — 1.8%** |
-| Share of search traffic that is machine-injected | **71%** (`memory_recall`, 1,053 of 1,486 calls) — but see §2.1: a further ~11% is smoke/canary traffic, so filter `client_entrypoint` |
+| Share of search traffic that is machine-injected | **71%** (`memory_recall`, 1,053 of 1,486 calls) — but see §2.1: a further ~11% is smoke/skill-eval traffic, so filter `client_entrypoint` |
 | Share using the richer entrypoints | **1.1%** (hybrid 15, progressive_index 1, heat_index 0, context 1) |
 | Graph edges | 525,932 over 79,074 articles (~6.6/article); 92% have inbound links |
 | Edge types | `relates_to` 502,315 (**96%**), `potential_conflict` 23,617 |
@@ -99,8 +99,10 @@ this dataset cannot fully separate them; the one comparison holding the tool con
   Cross-key attribution is required, and it is confounded whenever both channels surface the
   same article, so isolate articles only ONE channel surfaced.
 - **`search_events` carries synthetic traffic.** `client_entrypoint = 'smoke'` is the smoke
-  test (86 rows, all 1-term, 0% follow-through by construction), and the canary replays a
-  fixed prompt list — visible as distinct queries each appearing exactly 12 times. Together
+  test (86 rows, all 1-term, 0% follow-through by construction), and `skill-eval` is
+  `bin/skill-trigger-eval.py` — visible as distinct queries each appearing exactly 12 times
+  (4 runs x 3 repeats), whose subjects are killed at their first tool call. (This bullet
+  first attributed the 12x pattern to the recall canary; see §5.) Together
   with SessionStart's bare-repo-name queries these dominate the short-query buckets, which
   is most of what the withdrawn table was measuring. **Filter on `client_entrypoint` before
   drawing any conclusion.** Also note the table is a rolling ~5-day window, not history.
@@ -451,11 +453,17 @@ otherwise be asked to compensate for it and cannot.
 - Phase 2b — **DONE.** golden_v3 + `corpus_ref` paired questions; baseline regenerated. Its
   result retires Phase 2's premise rather than confirming it (see above).
 - Phase 2c — **DONE, deployed v523** (#689), and **verified on real traffic** — see below.
-  The injected channel is now measurable instead of scoring a structural zero. One
-  contaminant is still open: the recall canary declares `client_entrypoint: "hook"`,
-  identical to real traffic, so its fixed prompt list sits inside the new counters. Not
-  fixable here (the caller must declare itself, as `smoke.sh` does): handed to
-  claude-config#317.
+  The injected channel is now measurable instead of scoring a structural zero.
+
+  **The contaminant is identified and excluded, and this plan named the wrong culprit.** It
+  blamed the recall canary; claude-config#322 established the canary issues no request to
+  loopctl at all (every hook invocation is pinned to `http://127.0.0.1:9` behind a recording
+  curl shim). The real source is `bin/skill-trigger-eval.py`, which runs each eval query
+  through a real `claude -p` subject whose recall hooks search for real and which is then
+  KILLED at its first tool call — so those searches can never follow through while landing in
+  every denominator. It now declares `client_entrypoint: skill-eval`, which loopctl excludes
+  alongside `smoke`. `session-start` also began declaring itself and is deliberately COUNTED,
+  as its own channel.
 - Phase 2d — **DONE, deployed v523** (#690). Every search result carries a snippet.
 - Phase 3 — **DONE for the lexical half.** Tags are indexed at weight C; the LLM-generated
   context half is refused on a stated argument with a stated overturn condition (above).
@@ -502,8 +510,9 @@ confirmed from the other direction: the shipped same-key metric could not have c
 of the injected channel's opens, and the zero it reported was `n/a`.
 
 **Three hours is a mechanism check, not a rate**, and no phase ordering should move on it.
-The evaluation window is 1-2 weeks from the cutover (2026-08-17T18:00Z), with `smoke` and
-`session-start` excluded and the canary contaminant (claude-config#317) resolved first.
+The evaluation window is 1-2 weeks from the cutover (2026-08-17T18:00Z). `smoke` and
+`skill-eval` are excluded server-side (`@infra_entrypoints`); `session-start` is COUNTED as
+its own channel. claude-config#317 is closed — see §5 for what it corrected.
 
 The audit also re-ran §3.1's own failure live: the entrypoint segmentation joins
 `search_events.search_id`, NOT `search_events.id` — different columns — and the wrong one

@@ -83,6 +83,27 @@ defmodule Loopctl.Knowledge.InfraTrafficExcludedTest do
     assert %{searched: 1} = RetrievalMetrics.compute(ctx.tenant.id, ctx.day)
   end
 
+  test "a skill-eval search is in no denominator either", ctx do
+    # `bin/skill-trigger-eval.py` runs each eval query through a real `claude -p` subject
+    # whose recall hooks search for real, and the subject is KILLED at its first tool call.
+    # Structurally the same defect as the smoke test: it can never contribute to a numerator
+    # while contributing to every denominator (claude-config#322).
+    surfaced(ctx, %{"entrypoint" => "skill-eval"})
+
+    assert %{searched: 0, results_recorded: 0} = RetrievalMetrics.compute(ctx.tenant.id, ctx.day)
+  end
+
+  test "session-start is COUNTED, not excluded", ctx do
+    # One auto-query per session from `hooks/session-start.sh` — a real session that goes on
+    # to do real work, so it is a channel to measure rather than infrastructure to drop.
+    # It began declaring itself in claude-config#322; before that it sat in the NULL bucket.
+    # The runbook briefly claimed it belonged with `smoke`; this asserts the opposite so the
+    # claim cannot drift back.
+    surfaced(ctx, %{"entrypoint" => "session-start"})
+
+    assert %{searched: 1} = RetrievalMetrics.compute(ctx.tenant.id, ctx.day)
+  end
+
   test "smoke rows do not dilute a real search's precision", ctx do
     # The exact shape of the defect: one agent search, many smoke searches, none of which
     # can ever be opened. Undeleted, precision here would be 1/6; the agent row is the only
