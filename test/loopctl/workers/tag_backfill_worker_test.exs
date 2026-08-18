@@ -138,5 +138,20 @@ defmodule Loopctl.Workers.TagBackfillWorkerTest do
       assert "rare" in vocabulary
       refute "url-42516bb95051" in vocabulary
     end
+
+    test "excludes STRUCTURAL tags, however heavily they are used" do
+      # Measured on production 2026-08-18: the corpus's most-used tags began `reference,
+      # document, pdf, book, youtube`. Offering those as the vocabulary to PREFER teaches
+      # the model to tag FORMAT instead of SUBJECT — the opposite of the point — and a
+      # verification run with them present added `document` and `code` to real articles.
+      # They must lose to a topical tag used far less.
+      tenant = fixture(:tenant)
+      for _ <- 1..8, do: published(tenant.id, ["pdf", "document", "reference"])
+      published(tenant.id, ["kalman-filters"])
+
+      vocabulary = TagBackfillWorker.established_vocabulary(tenant.id)
+
+      assert vocabulary == ["kalman-filters"]
+    end
   end
 end

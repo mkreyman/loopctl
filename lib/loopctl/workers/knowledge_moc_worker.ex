@@ -72,14 +72,7 @@ defmodule Loopctl.Workers.KnowledgeMocWorker do
   # Exclude them, plus the per-source provenance-id tags (`yt-…`, `doc-…`, …) and
   # non-topical sentinels (`unknown`, `untagged`, `misc`, …).
   # Corpus-specific source collections are added via `:knowledge_moc_excluded_tags`.
-  @structural_tags ~w(
-    hub moc reference document documents doc book books code repo repository
-    web web-article webpage url file pdf md markdown html htm xml docx txt text
-    epub csv json yaml image png jpg jpeg gif svg video audio youtube newsletter
-    manual agent session_log session-log skill ingestion review_finding review-finding
-    readme gdrive gdoc gsheet onedrive dropbox notion confluence chunk page
-    unknown untagged uncategorized misc miscellaneous general other none na tbd todo
-  )
+  @structural_tags ProvenanceTags.structural()
 
   # Provenance-id and chunk-coordinate prefixes (`yt-<id>`, `pp-1-12` = pages 1–12,
   # `chunk-7`, …) — these identify WHERE in a source an article came from, never a topic,
