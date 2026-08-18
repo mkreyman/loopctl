@@ -153,6 +153,47 @@ defmodule Loopctl.Knowledge.OriginAttributionTest do
       assert row.origin_attribution == "none"
     end
 
+    test "a DRILL nothing surfaced is UNCLASSIFIED, never a direct open" do
+      # `progressive_index/3` runs its inner search with `_skip_record_access`, so the index
+      # that surfaced the stub writes no row to attribute to. Calling the DOCUMENTED way of
+      # following an index a `direct_open` — "the agent went straight to an article by link
+      # or cited id" — would populate that counter with its own opposite.
+      tenant = fixture(:tenant)
+      article = fixture(:article, %{tenant_id: tenant.id})
+      key = key_for(tenant.id)
+
+      assert {nil, nil} =
+               Analytics.resolve_origin(tenant.id, article.id, key, "drill", DateTime.utc_now())
+    end
+
+    test "a batch resolves every item's origin in ONE lookup" do
+      # `do_record_sync/5` used to issue a point query PER ROW on the 3-connection AdminRepo
+      # pool that every authenticated request also checks out of. The batch form must return
+      # the same verdicts it did per row.
+      tenant = fixture(:tenant)
+      surfaced_article = fixture(:article, %{tenant_id: tenant.id})
+      unsurfaced = fixture(:article, %{tenant_id: tenant.id})
+      key = key_for(tenant.id)
+      search_id = Ecto.UUID.generate()
+
+      surfacing_row(tenant.id, surfaced_article.id, key, search_id)
+
+      origins =
+        Analytics.resolve_origins(
+          tenant.id,
+          [surfaced_article.id, unsurfaced.id],
+          key,
+          "get",
+          DateTime.utc_now()
+        )
+
+      assert origins[surfaced_article.id] == {search_id, "same_key"}
+      refute Map.has_key?(origins, unsurfaced.id)
+
+      assert {nil, "none"} =
+               Analytics.resolve_origin(tenant.id, unsurfaced.id, key, "get", DateTime.utc_now())
+    end
+
     test "surfacing rows themselves are never attributed" do
       tenant = fixture(:tenant)
       article = fixture(:article, %{tenant_id: tenant.id})
@@ -354,6 +395,57 @@ defmodule Loopctl.Knowledge.OriginAttributionTest do
 
       assert m.searches_reformulated == 0,
              "opened outranks reformulated; the buckets are disjoint"
+    end
+
+    test "a MULTI-RESULT search that was opened is not also a reformulation" do
+      # The shape the single-result tests could not see, and the one production has: a
+      # search surfaces several results and the agent opens ONE. The remaining rows are
+      # unopened, so a ROW-level `not follow_through_exists` matched them and counted the
+      # search in `reformulated` as well as `with_follow_through` — while `quiet`, derived
+      # by subtraction and clamped at 0, silently swallowed the double count and lost the
+      # genuinely quiet search.
+      tenant = fixture(:tenant)
+      opened = fixture(:article, %{tenant_id: tenant.id})
+      ignored = fixture(:article, %{tenant_id: tenant.id})
+      quiet_hit = fixture(:article, %{tenant_id: tenant.id})
+      key = key_for(tenant.id)
+      day = Date.utc_today()
+      base = DateTime.new!(day, ~T[12:00:00.000000], "Etc/UTC")
+
+      # S1 surfaces two results; only one is opened.
+      s1 = Ecto.UUID.generate()
+      search_call(tenant.id, opened.id, key, s1, base)
+      search_call(tenant.id, ignored.id, key, s1, base)
+
+      fixture(:article_access_event, %{
+        tenant_id: tenant.id,
+        article_id: opened.id,
+        api_key_id: key,
+        access_type: "get",
+        accessed_at: DateTime.add(base, 300, :second)
+      })
+
+      # S2, later and in-window, opens nothing — this is the quiet one.
+      search_call(
+        tenant.id,
+        quiet_hit.id,
+        key,
+        Ecto.UUID.generate(),
+        DateTime.add(base, 600, :second)
+      )
+
+      m = RetrievalMetrics.compute(tenant.id, day)
+
+      assert m.searches == 2
+      assert m.searches_with_follow_through == 1
+
+      assert m.searches_reformulated == 0,
+             "S1 was opened; its unopened ROWS must not make the CALL a reformulation"
+
+      assert m.searches_quiet == 1, "S2 is the quiet search and must not be clamped away"
+
+      assert m.searches ==
+               m.searches_with_follow_through + m.searches_reformulated + m.searches_quiet
     end
 
     test "a lone search with no read and no follow-up query is quiet, not reformulated" do

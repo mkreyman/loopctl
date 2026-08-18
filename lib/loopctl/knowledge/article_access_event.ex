@@ -71,7 +71,9 @@ defmodule Loopctl.Knowledge.ArticleAccessEvent do
   # recall hook's shape (it searches under one key, the session reads under another) and is
   # PLAUSIBLE, not proof: two agents in one tenant can reach the same article independently.
   # `none` is not a failure — it is the agent going straight to an article by link or cited
-  # id, which used to be indistinguishable from "surfaced and ignored".
+  # id, which used to be indistinguishable from "surfaced and ignored". It is asserted only
+  # where the absence of a surfacing row MEANS that: a `drill` nothing surfaced stays NULL,
+  # because `progressive_index/3` records no surfacing row for the index that showed the stub.
   @origin_attributions ~w(same_key cross_key none)
 
   schema "article_access_events" do

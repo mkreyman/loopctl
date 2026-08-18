@@ -72,6 +72,10 @@ defmodule Loopctl.Workers.DraftDuplicateSweepWorker do
   entire reason consolidation chose `unpublish`. Consolidation owns its own output; this
   worker drains what the CAPTURE path holds.
 
+  The exemption is read out of the `audit_log`, which is retention-bounded, so the sweep
+  is bounded to match: a draft last touched before `:audit_retention_days` ago is skipped
+  outright rather than judged on evidence that may already have been dropped.
+
   ## Scope discipline
 
   * Only drafts that HAVE an embedding are considered. An unembedded draft is not
@@ -193,13 +197,25 @@ defmodule Loopctl.Workers.DraftDuplicateSweepWorker do
       where: a.tenant_id == ^tenant_id,
       where: a.status == :draft,
       where: e.dim == ^dimension and e.live_denorm == true,
+      # FAIL CLOSED past the audit horizon. The consolidation exemption below is evidence
+      # the RETENTION SWEEP deletes: `audit_log` is range-partitioned on `inserted_at` and
+      # `AuditPartitionWorker` DROPs partitions older than `:audit_retention_days`, while
+      # this worker runs weekly forever and the drafts it protects live forever. Without
+      # this bound, every consolidation retraction became archivable ~90 days after it
+      # happened — the whole aged cohort at once, silently, through the one-way door the
+      # moduledoc says must stay shut. A draft the audit_log can no longer speak for is
+      # left alone; nothing is lost but a late sweep of stale drafts.
+      where: a.updated_at >= ^audit_evidence_horizon(),
       # Spare consolidation's retractions — the exclusion is applied HERE rather than
       # before the archive so the sweep does not even spend an ANN read on a draft it
       # must not touch. There is no marker on the article itself; the audit_log is the
-      # only record that consolidation was the actor.
+      # only record that consolidation was the actor. `tenant_id` is constrained so the
+      # correlated NOT EXISTS can use `audit_log_tenant_entity_idx`, whose leading column
+      # it is — without it every candidate scanned every retained partition.
       where:
         not exists(
           from(al in "audit_log",
+            where: al.tenant_id == parent_as(:draft).tenant_id,
             where: al.entity_id == parent_as(:draft).id,
             where: al.entity_type == "article",
             where: al.action == "article.unpublished",
@@ -212,6 +228,14 @@ defmodule Loopctl.Workers.DraftDuplicateSweepWorker do
       select: %{id: a.id, title: a.title, embedding: e.embedding}
     )
     |> AdminRepo.all()
+  end
+
+  # The oldest point the `audit_log` is still guaranteed to speak for — the same retention
+  # `Loopctl.Workers.AuditPartitionWorker` enforces, read from the same config key so the two
+  # cannot drift.
+  defp audit_evidence_horizon do
+    days = Application.get_env(:loopctl, :audit_retention_days, 90)
+    DateTime.add(DateTime.utc_now(), -days * 86_400, :second)
   end
 
   defp unembedded_count(tenant_id, dimension) do

@@ -76,6 +76,40 @@ defmodule Loopctl.Knowledge.TaggerTest do
     test "nil existing tags are treated as empty" do
       assert {["chunking"], ["chunking"]} = Tagger.merge(nil, ["chunking"])
     end
+
+    test "a tag the Article changeset would reject is never accepted here" do
+      # `TagBackfillWorker` writes with `update_all`, which runs NO changeset — so a tag
+      # accepted here lands in the row unvalidated and surfaces later as a 422 on an
+      # unrelated caller's PATCH, for a tag that caller never supplied. Dots are the case
+      # that shipped: the tagging prompt offered them and `Article`'s pattern rejects them.
+      {tags, added} = Tagger.merge([], ["phoenix.liveview", "ecto.multi", "rls"])
+
+      assert added == ["rls"]
+
+      changeset =
+        Article.update_changeset(
+          %Article{tenant_id: Ecto.UUID.generate(), title: "t", body: "b", category: :pattern},
+          %{tags: tags}
+        )
+
+      assert changeset.valid?, "every merged tag must pass the schema that will store it"
+    end
+
+    test "a STRUCTURAL tag is refused even when the model proposes it unprompted" do
+      # Filtering the vocabulary makes `pdf`/`document` unlikely; this makes them impossible.
+      # They name an article's FORMAT, and since tags entered `search_vector` they cost
+      # precision on the ordinary English queries "document" and "pdf".
+      {_tags, added} = Tagger.merge([], ["document", "pdf", "postgres"])
+
+      assert added == ["postgres"]
+    end
+
+    test "an existing UPPERCASE tag is not duplicated by its lowercase suggestion" do
+      # `Article`'s pattern permits uppercase, so such rows exist. Comparing raw existing
+      # tags against normalised suggestions let `RLS` and `rls` both persist — two lexemes
+      # for one idea, which is the fragmentation this feature exists to reduce.
+      assert {["RLS"], []} = Tagger.merge(["RLS"], ["rls"])
+    end
   end
 
   describe "retag/4" do
@@ -110,6 +144,11 @@ defmodule Loopctl.Knowledge.TaggerTest do
     test "the system prompt makes reuse the default rather than a suggestion" do
       assert Llm.system_prompt() =~ "Prefer the vocabulary"
       assert Llm.system_prompt() =~ "Propose a NEW tag only when"
+    end
+
+    test "the prompt does not offer a character the article changeset rejects" do
+      refute Llm.system_prompt() =~ "dots",
+             "telling the model dots are allowed produced tags `Article` rejects"
     end
 
     test "parse_tags/1 accepts a list and rejects everything else" do

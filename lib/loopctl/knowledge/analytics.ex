@@ -1135,10 +1135,16 @@ defmodule Loopctl.Knowledge.Analytics do
     {project_id, story_id} = resolve_attribution(tenant_id, api_key_id, context)
     now = DateTime.utc_now()
 
+    # ONE lookup for the whole batch, not one per item. A `context` call delivers up to a
+    # page of articles, and a point query per row multiplied this path's `AdminRepo`
+    # checkouts by the batch size — on a 3-connection BYPASSRLS pool (`ADMIN_POOL_SIZE`,
+    # config/runtime.exs) that every authenticated request's rate-limit check also needs.
+    origins =
+      resolve_origins(tenant_id, Enum.map(items, &elem(&1, 0)), api_key_id, access_type, now)
+
     rows =
       Enum.map(items, fn {article_id, meta} ->
-        {origin_search_id, origin_attribution} =
-          resolve_origin(tenant_id, article_id, api_key_id, access_type, now)
+        {origin_search_id, origin_attribution} = origin_for(origins, article_id, access_type)
 
         %{
           id: Ecto.UUID.generate(),
@@ -1192,8 +1198,8 @@ defmodule Loopctl.Knowledge.Analytics do
   # WHY A LOOKUP AND NOT A JOIN AT READ TIME. `get`/`context`/`drill` rows carry no
   # `search_id`, so there is nothing to join ON; and the correlation that would substitute
   # for it binds `api_key_id`, which makes the injected recall hook — a different key from
-  # the session that reads — structurally invisible. Resolving once at write time fixes both
-  # and costs one indexed point query per read
+  # the session that reads — structurally invisible. Resolving at write time fixes both and
+  # costs one indexed lookup per RECORDED BATCH — `resolve_origins/5`, never one per row —
   # (`article_access_events_surface_lookup_idx`), on a path that is already async and
   # already best-effort.
   #
@@ -1202,58 +1208,86 @@ defmodule Loopctl.Knowledge.Analytics do
   # more recent. Only when no same-key surfacing exists does a cross-key one apply, and it is
   # labelled `cross_key` precisely because it is circumstantial — two agents in one tenant
   # can reach the same article independently.
-  def resolve_origin(tenant_id, article_id, api_key_id, access_type, now)
-
-  def resolve_origin(_tenant_id, _article_id, _api_key_id, access_type, _now)
-      when access_type not in @attributable_access_types,
+  def resolve_origin(_tenant_id, article_id, _api_key_id, _access_type, _now)
+      when not is_binary(article_id),
       do: {nil, nil}
 
-  def resolve_origin(tenant_id, article_id, api_key_id, _access_type, now)
-      when is_binary(article_id) and is_binary(api_key_id) do
+  def resolve_origin(tenant_id, article_id, api_key_id, access_type, now) do
+    case resolve_origins(tenant_id, [article_id], api_key_id, access_type, now) do
+      origins when is_map(origins) -> origin_for(origins, article_id, access_type)
+      _unresolvable -> {nil, nil}
+    end
+  end
+
+  @doc false
+  # The batch form: `%{article_id => {origin_search_id, origin_attribution}}` for the ids a
+  # surfacing row was found for, `:unattributable` when the access type gets no attribution
+  # at all, `:unavailable` when the lookup itself failed. An id absent from a returned map
+  # was not surfaced in the window — `origin_for/3` decides what that means.
+  def resolve_origins(_tenant_id, _article_ids, _api_key_id, access_type, _now)
+      when access_type not in @attributable_access_types,
+      do: :unattributable
+
+  def resolve_origins(tenant_id, article_ids, api_key_id, _access_type, now)
+      when is_binary(api_key_id) and is_list(article_ids) do
     since = DateTime.add(now, -@origin_window_seconds, :second)
+    ids = article_ids |> Enum.filter(&is_binary/1) |> Enum.uniq()
 
     query =
       from(s in ArticleAccessEvent,
         where: s.tenant_id == ^tenant_id,
-        where: s.article_id == ^article_id,
+        where: s.article_id in ^ids,
         where: s.access_type == "search",
         where: s.accessed_at >= ^since and s.accessed_at <= ^now,
-        # Same key first (direct evidence), then most recent. `desc:` on the boolean puts
-        # true ahead of false.
+        # One winner per article: same key first (direct evidence), then most recent.
+        # `desc:` on the boolean puts true ahead of false.
+        distinct: s.article_id,
         order_by: [
+          asc: s.article_id,
           desc: fragment("? = ?", s.api_key_id, type(^api_key_id, Ecto.UUID)),
           desc: s.accessed_at
         ],
-        limit: 1,
-        select: {fragment("?->>'search_id'", s.metadata), s.api_key_id}
+        select: {s.article_id, fragment("?->>'search_id'", s.metadata), s.api_key_id}
       )
 
-    case AdminRepo.one(query) do
-      nil ->
-        {nil, "none"}
-
-      {nil, _key} ->
-        # A surfacing row from before #582 carries no search_id. The article WAS surfaced,
-        # so this is not `none` — but there is no id to point at, and inventing one would
-        # put an unattributable read in the attributed bucket.
-        {nil, nil}
-
-      {search_id, ^api_key_id} ->
-        {search_id, "same_key"}
-
-      {search_id, _other_key} ->
-        {search_id, "cross_key"}
-    end
+    query
+    |> AdminRepo.all()
+    |> Map.new(fn
+      # A surfacing row from before #582 carries no search_id. The article WAS surfaced,
+      # so this is not `none` — but there is no id to point at, and inventing one would
+      # put an unattributable read in the attributed bucket.
+      {article_id, nil, _key} -> {article_id, {nil, nil}}
+      {article_id, search_id, ^api_key_id} -> {article_id, {search_id, "same_key"}}
+      {article_id, search_id, _other_key} -> {article_id, {search_id, "cross_key"}}
+    end)
   rescue
     # Attribution is an enrichment, never a reason to lose the event. The caller's rescue in
     # `do_record_sync/5` would drop the whole row; this one degrades to an unattributed read.
     error ->
       Logger.warning("Knowledge.Analytics origin resolution failed: #{Exception.message(error)}")
 
-      {nil, nil}
+      :unavailable
   end
 
-  def resolve_origin(_tenant_id, _article_id, _api_key_id, _access_type, _now), do: {nil, nil}
+  def resolve_origins(_tenant_id, _article_ids, _api_key_id, _access_type, _now), do: :unavailable
+
+  defp origin_for(origins, article_id, access_type) when is_map(origins) do
+    case Map.fetch(origins, article_id) do
+      {:ok, resolved} -> resolved
+      :error -> unsurfaced_origin(access_type)
+    end
+  end
+
+  defp origin_for(_unresolvable, _article_id, _access_type), do: {nil, nil}
+
+  # A read with no surfacing row is `none` — the agent went straight to the article — EXCEPT
+  # for a drill. `progressive_index/3` runs its inner search with `_skip_record_access`, so
+  # the index that surfaced the stub writes no row to find, and calling the documented way of
+  # following an index a `direct_open` would populate that counter with its own opposite.
+  # Unclassified (NULL) instead: it is in neither bucket until an index surfacing is
+  # recorded.
+  defp unsurfaced_origin("drill"), do: {nil, nil}
+  defp unsurfaced_origin(_access_type), do: {nil, "none"}
 
   # ---------------------------------------------------------------------------
   # Attribution resolution

@@ -264,6 +264,8 @@ defmodule Loopctl.Workers.TagBackfillWorker do
   defp maybe_bump(query, true, now), do: update(query, set: [updated_at: ^now])
   defp maybe_bump(query, _false, _now), do: query
 
+  # Below `ADMIN_POOL_SIZE` (default 3): each task writes through AdminRepo, whose pool
+  # every authenticated request also checks out of.
   defp concurrency,
-    do: Application.get_env(:loopctl, :knowledge_tag_backfill_concurrency, 4)
+    do: Application.get_env(:loopctl, :knowledge_tag_backfill_concurrency, 2)
 end

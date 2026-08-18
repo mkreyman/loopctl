@@ -47,10 +47,14 @@ defmodule Loopctl.Knowledge.Tagger do
 
   require Logger
 
-  # Mirrors `ContentIngestionWorker`'s per-tag validation. A suggestion that would be
-  # rejected by the changeset is dropped here instead, so one malformed tag cannot fail the
-  # whole article's re-tag.
-  @tag_pattern ~r/^[a-z0-9][a-z0-9._-]*$/
+  # The pattern `Loopctl.Knowledge.Article`'s changeset enforces (`~r/^[a-zA-Z0-9_-]+$/`),
+  # narrowed to the lowercase form `normalize/1` produces. A suggestion the changeset would
+  # reject is dropped HERE, so one malformed tag cannot fail the whole article's re-tag —
+  # and, more importantly, cannot be written at all: `TagBackfillWorker` persists with
+  # `update_all`, which runs no changeset, so an accepted-here tag lands unvalidated and
+  # only surfaces later as a 422 on an unrelated caller's PATCH. No `.`: the changeset
+  # rejects it, and the tagging prompt must not offer it either.
+  @tag_pattern ~r/^[a-z0-9][a-z0-9_-]*$/
   @max_tag_length 64
 
   @doc """
@@ -85,15 +89,20 @@ defmodule Loopctl.Knowledge.Tagger do
   @spec merge([String.t()], [String.t()]) :: {[String.t()], [String.t()]}
   def merge(existing, suggested) do
     existing = existing || []
-    known = MapSet.new(existing)
+    # Compared in the SAME normal form the suggestions are normalised into, or an existing
+    # `RLS` fails to match a suggested `rls` and the article ends up carrying both — two
+    # lexemes for one idea, which is the fragmentation this exists to reduce.
+    known = MapSet.new(existing, &normalize/1)
 
     added =
       suggested
       |> Enum.map(&normalize/1)
       |> Enum.filter(&valid?/1)
-      # A suggestion must never mint a provenance-shaped tag: those identify WHERE an article
-      # came from, and a generated one would be a false claim about its source.
-      |> Enum.reject(&(MapSet.member?(known, &1) or provenance?(&1)))
+      # A suggestion must never mint a provenance-shaped tag (those identify WHERE an
+      # article came from, so a generated one would be a false claim about its source) nor a
+      # STRUCTURAL one (`pdf`, `document`): filtering the vocabulary makes those unlikely,
+      # this makes them impossible. `topical?/1` is the single predicate both consumers use.
+      |> Enum.reject(&(MapSet.member?(known, &1) or not ProvenanceTags.topical?(&1)))
       |> Enum.uniq()
       |> Enum.take(max(Article.max_tags() - length(existing), 0))
 
@@ -115,7 +124,4 @@ defmodule Loopctl.Knowledge.Tagger do
 
   defp valid?(tag),
     do: tag != "" and String.length(tag) <= @max_tag_length and Regex.match?(@tag_pattern, tag)
-
-  defp provenance?(tag),
-    do: Enum.any?(ProvenanceTags.prefixes(), &String.starts_with?(tag, &1))
 end

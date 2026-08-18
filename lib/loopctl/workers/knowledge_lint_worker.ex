@@ -442,7 +442,9 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     # into ~450 round trips end to end and a full 2000-pair catch-up run into something that
     # cannot finish inside a nightly window at all. `async_stream` gives bounded concurrency
     # with backpressure; the bound is small because it is a shared provider rate limit and a
-    # shared DB pool on the other side, not because the work is expensive here.
+    # shared DB pool on the other side, not because the work is expensive here — and it is
+    # kept BELOW `ADMIN_POOL_SIZE` (default 3) so a nightly run can never hold every
+    # AdminRepo connection that authentication also needs.
     #
     # `timeout: :infinity` on the stream with the per-task bound coming from the provider
     # client's own timeout — a stream timeout would kill the task and lose the verdict while
@@ -462,7 +464,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   end
 
   defp judge_concurrency,
-    do: Application.get_env(:loopctl, :knowledge_conflict_judge_concurrency, 4)
+    do: Application.get_env(:loopctl, :knowledge_conflict_judge_concurrency, 2)
 
   # Correlated on the enclosing `as: :link`, TRUE when a `conflict_resolutions` row already
   # exists for the pair in EITHER direction. Mirrors `Knowledge.conflict_unresolved_subquery/0`

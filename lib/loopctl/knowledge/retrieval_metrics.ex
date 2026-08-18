@@ -114,9 +114,11 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   not comparable and neither is a refinement of the other — keep both.
 
   A read whose `origin_attribution` is NULL is in none of the three: pre-migration rows,
-  surfacing rows, and the one case `resolve_origin/5` refuses to classify (a surfacing row
-  predating #582 carries no `search_id`, so the article WAS surfaced — `none` would be false
-  — but there is no id to attribute to).
+  surfacing rows, and the two cases `resolve_origin/5` refuses to classify — a surfacing row
+  predating #582 carries no `search_id` (the article WAS surfaced, so `none` would be false,
+  but there is no id to attribute to), and a `drill` nothing surfaced (the progressive index
+  records no surfacing row, so calling the documented way of following it a direct open
+  would be its opposite).
 
   **Two windows, and they are not the same knob.** `origin_attribution` is baked in at write
   time using `Analytics.origin_window_seconds/0` and cannot be re-asked of history; the
@@ -133,9 +135,10 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   question is answered by the snippet correctly opens nothing, and that is a success this
   metric scores as a failure."
 
-  A REFORMULATION — the same key issuing a different query inside the window, having opened
-  nothing — is the one member of that bucket that is unambiguously a failure, so it is peeled
-  out. What remains is named `quiet` and is STILL a mixture: "the snippet sufficed" and "the
+  A REFORMULATION — the same key issuing a LATER SEARCH CALL inside the window, having opened
+  nothing — is the one member of that bucket that is closest to an unambiguous failure, so it
+  is peeled out. It is compared on the search identity, not the query text, so a verbatim
+  retry of a degraded search counts here too. What remains is named `quiet` and is STILL a mixture: "the snippet sufficed" and "the
   rows were ignored" are indistinguishable here, and this instrumentation does not resolve
   them. Do not rename it to anything that asserts satisfaction, and do not compute a rate
   that treats it as either. Follow-through remains a floor, never a satisfaction rate.
@@ -321,9 +324,10 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   #     ignored", which is close to its opposite.
   #
   # A row whose attribution is NULL is neither: pre-migration rows, surfacing rows, and the
-  # one case `resolve_origin/5` deliberately refuses to classify (a surfacing row from before
-  # #582 that carries no `search_id` — the article WAS surfaced, so calling it `none` would
-  # be false, and there is no id to attribute to).
+  # two cases `resolve_origin/5` deliberately refuses to classify — a surfacing row from
+  # before #582 that carries no `search_id` (the article WAS surfaced, so calling it `none`
+  # would be false, and there is no id to attribute to), and a `drill` with no surfacing row
+  # (the progressive index writes none, so `none` would name the index's own opposite).
   defp compute_open_attribution(tenant_id, day_start, day_end) do
     rows =
       from(o in ArticleAccessEvent,
@@ -333,6 +337,11 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
         group_by: o.origin_attribution,
         select: {o.origin_attribution, count(o.id)}
       )
+      # Same infra exclusion as every other counter on this payload. Without it the two
+      # families describe different populations — the searches an excluded entrypoint made
+      # are gone from `searched`/`searches` while its reads still count here — and an
+      # operator comparing them reads a gap that is bookkeeping, not behaviour.
+      |> exclude_infra_traffic()
       |> AdminRepo.all()
       |> Map.new()
 
@@ -363,12 +372,25 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   #
   # The three partition `searches` exactly, so `quiet` is computed by subtraction rather than
   # by a third query whose predicate could drift out of agreement with the other two.
+  #
+  # THE EXCLUSION IS PER SEARCH CALL, NOT PER ROW, and that distinction is the whole
+  # correctness of the partition. A search writes one row per surfaced result and an agent
+  # typically opens ONE of them, so negating the row-level `follow_through_exists/1` matched
+  # the still-unopened rows of a search that WAS followed through — counting it in two
+  # buckets at once, and (because `quiet` is the remainder) silently zeroing the bucket the
+  # genuinely quiet searches belong to. So the opened SEARCH IDS are subtracted as a set.
   defp compute_dispositions(searched_q, window_seconds, call) do
+    opened_ids =
+      searched_q
+      |> qualifying_calls()
+      |> with_follow_through(window_seconds)
+      |> select([s], fragment("?->>'search_id'", s.metadata))
+
     reformulated =
       searched_q
       |> qualifying_calls()
-      |> where(^dynamic(not (^follow_through_exists(window_seconds))))
       |> where(^reformulation_exists(window_seconds))
+      |> where([s], fragment("?->>'search_id'", s.metadata) not in subquery(opened_ids))
       |> count_distinct_searches()
 
     %{
@@ -465,11 +487,11 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
     )
   end
 
-  # "The same key issued a DIFFERENT query inside the window." Different is compared on the
-  # search identity, not the query text: an agent re-running the identical query (a retry
-  # after a degraded response, say) is not reformulating, but it is also not a distinct
-  # search call in any sense this metric wants to count, and `search_id` already separates
-  # calls from rows.
+  # "The same key issued a LATER SEARCH CALL inside the window." Distinctness is compared on
+  # the search identity, never the query text — `search_id` is minted per call, so an agent
+  # re-running the IDENTICAL query (a retry after a degraded response, say) satisfies this
+  # too. The published descriptions say "a later search call" for that reason; do not
+  # restate them as "a different query" without also comparing the query text here.
   #
   # Bounded on BOTH sides by the window, and strictly after the surfacing row, so a search
   # is never called a reformulation of one that came later.
@@ -489,32 +511,6 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
               fragment(
                 "? <= ? + (? * interval \'1 second\')",
                 r.accessed_at,
-                parent_as(:s).accessed_at,
-                ^window_seconds
-              )
-        )
-      )
-    )
-  end
-
-  # The same correlated-exists `with_follow_through/2` applies, expressed as a `dynamic` so
-  # it can be NEGATED in the disposition query. Kept adjacent to that function so the two
-  # definitions are read together; a change to one that is not made to the other breaks the
-  # partition.
-  defp follow_through_exists(window_seconds) do
-    dynamic(
-      [s],
-      exists(
-        from(o in ArticleAccessEvent,
-          where:
-            o.tenant_id == parent_as(:s).tenant_id and
-              o.api_key_id == parent_as(:s).api_key_id and
-              o.article_id == parent_as(:s).article_id and
-              o.access_type in ["get", "context", "drill"] and
-              o.accessed_at > parent_as(:s).accessed_at and
-              fragment(
-                "? <= ? + (? * interval \'1 second\')",
-                o.accessed_at,
                 parent_as(:s).accessed_at,
                 ^window_seconds
               )

@@ -183,6 +183,31 @@ defmodule Loopctl.Workers.DraftDuplicateSweepWorkerTest do
                "it into a terminal one a week later"
     end
 
+    test "a draft older than the audit retention window is left alone" do
+      # The exemption above is read out of `audit_log`, which `AuditPartitionWorker` DROPs
+      # partition-by-partition past `:audit_retention_days` — while this worker runs weekly
+      # forever and the drafts it protects live forever. Judging an aged draft on evidence
+      # that may already be gone archived the whole aged cohort of consolidation retractions
+      # at once, through a door with no way back. Past the horizon the sweep fails CLOSED.
+      tenant = fixture(:tenant)
+      vector = unit_vector(0)
+      days = Application.get_env(:loopctl, :audit_retention_days, 90)
+      long_ago = DateTime.add(DateTime.utc_now(), -(days + 7) * 86_400, :second)
+
+      _published = tenant.id |> article(:published) |> then(&embed(tenant.id, &1, vector))
+      draft = tenant.id |> article(:draft) |> then(&embed(tenant.id, &1, vector))
+
+      AdminRepo.update_all(
+        from(a in Article, where: a.id == ^draft.id),
+        set: [updated_at: long_ago]
+      )
+
+      assert :ok = perform_job(DraftDuplicateSweepWorker, %{"tenant_id" => tenant.id})
+
+      assert status_of(draft.id) == :draft,
+             "past the audit horizon the exemption cannot be proved, so nothing is archived"
+    end
+
     test "still archives an identical draft that consolidation did NOT retract" do
       tenant = fixture(:tenant)
       vector = unit_vector(0)

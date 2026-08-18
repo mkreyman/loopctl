@@ -104,6 +104,25 @@ defmodule Loopctl.Knowledge.InfraTrafficExcludedTest do
     assert %{searched: 1} = RetrievalMetrics.compute(ctx.tenant.id, ctx.day)
   end
 
+  test "an excluded entrypoint's OPEN is out of the attribution counters too", ctx do
+    # The two families on this payload must describe ONE population. `attributed_opens` /
+    # `direct_opens` are built straight off `article_access_events`, so without the same
+    # exclusion an infra channel's reads counted while its searches did not, and an operator
+    # comparing them read a gap that is bookkeeping rather than behaviour.
+    AdminRepo.insert!(%ArticleAccessEvent{
+      tenant_id: ctx.tenant.id,
+      article_id: ctx.article.id,
+      api_key_id: ctx.api_key.id,
+      access_type: "get",
+      origin_attribution: "none",
+      metadata: %{"entrypoint" => "smoke"},
+      accessed_at: DateTime.utc_now()
+    })
+
+    assert %{direct_opens: 0, attributed_opens: 0} =
+             RetrievalMetrics.compute(ctx.tenant.id, ctx.day)
+  end
+
   test "smoke rows do not dilute a real search's precision", ctx do
     # The exact shape of the defect: one agent search, many smoke searches, none of which
     # can ever be opened. Undeleted, precision here would be 1/6; the agent row is the only
