@@ -104,6 +104,24 @@ defmodule Loopctl.Knowledge.TaggerTest do
       assert added == ["postgres"]
     end
 
+    test "a SUBJECT that merely starts with a provenance prefix is kept" do
+      # The prefix list drops `url-42516bb95051` because it is an opaque id, and asking it
+      # "may this be a tag" instead of "is this a hub" also dropped `web-scraping`,
+      # `file-upload`, `part-of-speech` and `doc-generation` — the tags naming what the
+      # article is ABOUT. A later tag query for the subject then misses the article.
+      {_tags, added} =
+        Tagger.merge([], [
+          "web-scraping",
+          "file-upload",
+          "part-of-speech",
+          "doc-generation",
+          "url-42516bb95051",
+          "pp-1-12"
+        ])
+
+      assert added == ["web-scraping", "file-upload", "part-of-speech", "doc-generation"]
+    end
+
     test "an existing UPPERCASE tag is not duplicated by its lowercase suggestion" do
       # `Article`'s pattern permits uppercase, so such rows exist. Comparing raw existing
       # tags against normalised suggestions let `RLS` and `rls` both persist — two lexemes

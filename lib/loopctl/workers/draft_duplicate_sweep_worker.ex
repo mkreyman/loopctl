@@ -197,15 +197,28 @@ defmodule Loopctl.Workers.DraftDuplicateSweepWorker do
       where: a.tenant_id == ^tenant_id,
       where: a.status == :draft,
       where: e.dim == ^dimension and e.live_denorm == true,
-      # FAIL CLOSED past the audit horizon. The consolidation exemption below is evidence
-      # the RETENTION SWEEP deletes: `audit_log` is range-partitioned on `inserted_at` and
-      # `AuditPartitionWorker` DROPs partitions older than `:audit_retention_days`, while
-      # this worker runs weekly forever and the drafts it protects live forever. Without
-      # this bound, every consolidation retraction became archivable ~90 days after it
-      # happened — the whole aged cohort at once, silently, through the one-way door the
-      # moduledoc says must stay shut. A draft the audit_log can no longer speak for is
-      # left alone; nothing is lost but a late sweep of stale drafts.
-      where: a.updated_at >= ^audit_evidence_horizon(),
+      # FAIL CLOSED past the audit horizon, measured on the draft's CREATION. The
+      # consolidation exemption below is evidence the RETENTION SWEEP deletes: `audit_log`
+      # is range-partitioned on `inserted_at` and `AuditPartitionWorker` DROPs partitions
+      # older than `:audit_retention_days`, while this worker runs weekly forever and the
+      # drafts it protects live forever. Without a bound, every consolidation retraction
+      # became archivable ~90 days after it happened — the whole aged cohort at once,
+      # silently, through the one-way door the moduledoc says must stay shut.
+      #
+      # `inserted_at` and NOT `updated_at`: creation is the only clock that cannot move
+      # after the retraction it is standing in for. A retraction always happens AFTER the
+      # draft exists, so a draft created inside the window still has its audit row. Bounding
+      # on the last WRITE instead re-armed the archive for exactly the draft this protects —
+      # one `knowledge_update` on a long-retracted draft bumped `updated_at` to now while its
+      # `article.unpublished` partition was already dropped, and the correlated NOT EXISTS
+      # then found nothing to spare it with.
+      #
+      # The cost is that a draft older than the retention window is never a candidate again.
+      # That is acceptable only because the worker runs WEEKLY on a queue the capture path
+      # fills continuously, so a duplicate gets ~13 runs inside the window; a durable
+      # retraction marker on the article row (a non-cast column, the way
+      # `stories.lifecycle_entered_at` is) is what would let this bound go entirely.
+      where: a.inserted_at >= ^audit_evidence_horizon(),
       # Spare consolidation's retractions — the exclusion is applied HERE rather than
       # before the archive so the sweep does not even spend an ANN read on a draft it
       # must not touch. There is no marker on the article itself; the audit_log is the

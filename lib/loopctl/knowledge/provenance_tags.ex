@@ -91,6 +91,28 @@ defmodule Loopctl.Knowledge.ProvenanceTags do
 
   def topical?(_tag), do: false
 
+  @doc """
+  Whether a GENERATED tag may be WRITTEN at all. NOT `topical?/1` — hub eligibility drops a
+  whole prefixed class for free and admission cannot (see `Tagger.merge/2`), so a prefix
+  disqualifies only before an OPAQUE id (`url-42516bb95051`); `structural/0` is whole-word.
+  """
+  @spec admissible_suggestion?(String.t()) :: boolean()
+  def admissible_suggestion?(tag) when is_binary(tag) do
+    tag not in @structural and not String.starts_with?(tag, IdempotencyTag.reserved_prefix()) and
+      not Enum.any?(@prefixes, &opaque_id?(tag, &1))
+  end
+
+  def admissible_suggestion?(_tag), do: false
+
+  defp opaque_id?(tag, prefix) do
+    String.starts_with?(tag, prefix) and opaque_suffix?(String.replace_prefix(tag, prefix, ""))
+  end
+
+  defp opaque_suffix?(s) do
+    Regex.match?(~r/^\d+(-\d+)*$/, s) or Regex.match?(~r/^[0-9a-f]{8,}$/, s) or
+      (Regex.match?(~r/^[0-9a-z]{6,}$/, s) and Regex.match?(~r/\d/, s))
+  end
+
   @doc "The provenance/chunk-coordinate tag prefixes, each including its trailing hyphen."
   @spec prefixes() :: [String.t()]
   def prefixes, do: @prefixes

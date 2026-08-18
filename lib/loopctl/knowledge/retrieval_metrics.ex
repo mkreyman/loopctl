@@ -218,6 +218,30 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
     )
   end
 
+  # The read-side half of the same exclusion: drop an open whose SURFACING search declared
+  # an infra entrypoint. The lookback reaches one day before the counted day because an open
+  # is attributed to a search inside the follow-through window, which can cross midnight;
+  # `search_id` is filtered non-null so the `NOT IN` can never go NULL and silently drop the
+  # whole day.
+  defp exclude_infra_origins(query, tenant_id, day_start, day_end) do
+    infra_search_ids =
+      from(s in ArticleAccessEvent,
+        where: s.tenant_id == ^tenant_id,
+        where: s.access_type == "search",
+        where: s.accessed_at >= ^DateTime.add(day_start, -1, :day),
+        where: s.accessed_at < ^day_end,
+        where: fragment("?->>'entrypoint'", s.metadata) in ^@infra_entrypoints,
+        where: not is_nil(fragment("?->>'search_id'", s.metadata)),
+        select: fragment("(?->>'search_id')::uuid", s.metadata)
+      )
+
+    where(
+      query,
+      [o],
+      is_nil(o.origin_search_id) or o.origin_search_id not in subquery(infra_search_ids)
+    )
+  end
+
   @doc """
   Compute precision for a single `day` (a `Date`) and follow-through `window_seconds`.
 
@@ -341,7 +365,16 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
       # families describe different populations — the searches an excluded entrypoint made
       # are gone from `searched`/`searches` while its reads still count here — and an
       # operator comparing them reads a gap that is bookkeeping, not behaviour.
+      #
+      # It takes TWO predicates because a READ row is not a search row. `entrypoint` is
+      # written by `search_access_meta/3` onto `access_type = "search"` rows only, so
+      # `exclude_infra_traffic/1` alone matched nothing here and the exclusion was inert.
+      # The read's own link to the infra channel is `origin_search_id` — resolved
+      # server-side at write time — so an open is dropped when the search that SURFACED it
+      # declared an infra entrypoint. `exclude_infra_traffic/1` still runs, for a read that
+      # carries its own `:access_metadata`.
       |> exclude_infra_traffic()
+      |> exclude_infra_origins(tenant_id, day_start, day_end)
       |> AdminRepo.all()
       |> Map.new()
 

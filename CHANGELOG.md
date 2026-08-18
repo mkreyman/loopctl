@@ -179,7 +179,9 @@ All notable changes to loopctl are documented here.
   from "surfaced and ignored" — close to its opposite. Unit warning: these count READS,
   while `followed_through` counts SURFACED RESULTS later opened; they are not comparable and
   neither replaces the other, so the existing series is unchanged and remains valid across
-  this migration.
+  this migration. Both open counters drop reads whose SURFACING search declared an infra
+  entrypoint (`smoke`, `skill-eval`), so they describe the same population as
+  `searched`/`searches` rather than a wider one.
 
   `searches_with_follow_through` / `searches_reformulated` / `searches_quiet` now partition
   `searches`. Treating every not-opened search as a failure is wrong — an agent answered by

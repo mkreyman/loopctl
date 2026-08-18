@@ -163,8 +163,8 @@ defmodule Loopctl.Knowledge.SnippetBackfillTest do
       tenant = fixture(:tenant)
 
       body =
-        "Every context function takes tenant_id first, and `__MODULE__` wraps it in " <>
-          "*emphasis* that must go."
+        "Every context function takes tenant_id first, and `__MODULE__` with an _unused " <>
+          "arg wraps it in *emphasis* that must go."
 
       article = published(tenant.id, "Identifiers #{System.unique_integer([:positive])}", body)
 
@@ -174,6 +174,12 @@ defmodule Loopctl.Knowledge.SnippetBackfillTest do
       hit = Enum.find(results, &(&1.id == article.id))
 
       assert hit.snippet =~ "tenant_id"
+      # The EDGES too: a token-boundary rule protects only underscores flanked by
+      # alphanumerics on both sides, so `__MODULE__` came back as `MODULE` and `_unused` as
+      # `unused` — identifiers the corpus does not contain, which is the same defect one
+      # character over.
+      assert hit.snippet =~ "__MODULE__"
+      assert hit.snippet =~ "_unused"
       refute hit.snippet =~ "`"
       refute hit.snippet =~ "*emphasis*"
       assert hit.snippet =~ "emphasis"

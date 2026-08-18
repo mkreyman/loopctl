@@ -101,8 +101,17 @@ defmodule Loopctl.Knowledge.Tagger do
       # A suggestion must never mint a provenance-shaped tag (those identify WHERE an
       # article came from, so a generated one would be a false claim about its source) nor a
       # STRUCTURAL one (`pdf`, `document`): filtering the vocabulary makes those unlikely,
-      # this makes them impossible. `topical?/1` is the single predicate both consumers use.
-      |> Enum.reject(&(MapSet.member?(known, &1) or not ProvenanceTags.topical?(&1)))
+      # this makes them impossible. It asks `admissible_suggestion?/1`, NOT `topical?/1`:
+      # the latter drops EVERYTHING under a provenance prefix, which is right for a hub or
+      # an index lexeme and wrong here — `web-scraping`, `file-upload`, `part-of-speech` and
+      # `doc-generation` are subjects that merely start with one, and dropping them silently
+      # re-tags an article without the tag naming what it is about, so a later tag query for
+      # that subject misses it. There the whole prefixed class costs nothing; here it costs
+      # the tag. That is the moduledoc's "split this into two lists rather than widening
+      # one", and the opaque-id test is what keeps `url-42516bb95051` out regardless.
+      |> Enum.reject(
+        &(MapSet.member?(known, &1) or not ProvenanceTags.admissible_suggestion?(&1))
+      )
       |> Enum.uniq()
       |> Enum.take(max(Article.max_tags() - length(existing), 0))
 

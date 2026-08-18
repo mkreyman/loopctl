@@ -15,6 +15,7 @@ defmodule Loopctl.Knowledge.InfraTrafficExcludedTest do
   setup :verify_on_exit!
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Knowledge.Analytics
   alias Loopctl.Knowledge.ArticleAccessEvent
   alias Loopctl.Knowledge.RetrievalMetrics
 
@@ -109,18 +110,36 @@ defmodule Loopctl.Knowledge.InfraTrafficExcludedTest do
     # `direct_opens` are built straight off `article_access_events`, so without the same
     # exclusion an infra channel's reads counted while its searches did not, and an operator
     # comparing them read a gap that is bookkeeping rather than behaviour.
-    AdminRepo.insert!(%ArticleAccessEvent{
-      tenant_id: ctx.tenant.id,
-      article_id: ctx.article.id,
-      api_key_id: ctx.api_key.id,
-      access_type: "get",
-      origin_attribution: "none",
-      metadata: %{"entrypoint" => "smoke"},
-      accessed_at: DateTime.utc_now()
-    })
+    #
+    # The row is built the way PRODUCTION builds it, not by hand: `entrypoint` is written by
+    # `search_access_meta/3` onto SEARCH rows only, so a `get` carrying that key is a shape
+    # nothing can write, and a test asserting on it passes while the metric is unchanged.
+    # A read's link to the channel is `origin_search_id`, resolved server-side at write time.
+    search_id = Ecto.UUID.generate()
+    surfaced(ctx, %{"entrypoint" => "smoke", "search_id" => search_id})
+
+    Analytics.do_record_sync([{ctx.article.id, %{}}], ctx.tenant.id, ctx.api_key.id, "get")
+
+    assert [%{origin_search_id: ^search_id, origin_attribution: "same_key"}] =
+             AdminRepo.all(
+               from(e in ArticleAccessEvent,
+                 where: e.tenant_id == ^ctx.tenant.id and e.access_type == "get"
+               )
+             )
 
     assert %{direct_opens: 0, attributed_opens: 0} =
              RetrievalMetrics.compute(ctx.tenant.id, ctx.day)
+  end
+
+  test "an ordinary channel's OPEN still counts", ctx do
+    # The other half of the exclusion: a predicate that dropped every open would pass the
+    # test above and report zero reads forever.
+    search_id = Ecto.UUID.generate()
+    surfaced(ctx, %{"entrypoint" => "cli", "search_id" => search_id})
+
+    Analytics.do_record_sync([{ctx.article.id, %{}}], ctx.tenant.id, ctx.api_key.id, "get")
+
+    assert %{attributed_opens: 1} = RetrievalMetrics.compute(ctx.tenant.id, ctx.day)
   end
 
   test "smoke rows do not dilute a real search's precision", ctx do

@@ -77,7 +77,18 @@ defmodule Loopctl.Release do
   A startup `parameters:` entry would be the wrong shape besides: pgbouncer rejects an
   unknown startup parameter with `08P01` (see `config/runtime.exs`, and the same reason
   `HeavyRead` applies its `statement_timeout` per read rather than at connect). A plain
-  `SET` on an established connection is accepted either way.
+  `SET` on an established connection is accepted by pgbouncer in any pool mode.
+
+  ## What this depends on, and what to reach for if it fails again
+
+  Accepted is not the same as PERSISTENT. This is a SESSION-level `SET`, so it holds for the
+  migrator's advisory-lock transaction under **session** pooling — which is what Fly MPG
+  documents as its default (`docs/runbooks/knowledge-scale.md`, "VERIFY the live pgbouncer
+  config"). Under **transaction** pooling a session `SET` lands on whichever server backend
+  served that one implicit transaction, and the lock transaction may open on another. If a
+  release ever dies with `FATAL 25P03` again, read `pool_mode` from the pgbouncer admin
+  console FIRST: the lever for a GUC that must survive a checkout there is a role-scoped
+  `ALTER ROLE`, exactly as the runbook prescribes for `hnsw.ef_search`, not a bigger `SET`.
 
   Public so the setting is assertable — the behaviour it prevents needs a migration slower
   than the server timeout to reproduce, which no test suite should manufacture.
@@ -88,12 +99,20 @@ defmodule Loopctl.Release do
       after_connect: {Postgrex, :query!, ["SET idle_in_transaction_session_timeout = 0", []]}
     ]
 
+  @doc false
+  # The config the migrator's repo is started FROM: AdminRepo's own config plus
+  # `migration_connection_opts/0`. Split out of the writer below so a test can assert the
+  # MERGE — where the setting actually has to land — without mutating application env.
+  @spec migration_repo_config(keyword()) :: keyword()
+  def migration_repo_config(config),
+    do: Keyword.merge(config, migration_connection_opts())
+
   # Merges `migration_connection_opts/0` into AdminRepo's application config so the repo the
   # migrator starts inherits it. Scoped to this OS process: the release `eval` node exits
   # when the command returns, and serving nodes never run this.
   defp configure_migration_connections do
     config = Application.get_env(@app, AdminRepo, [])
-    Application.put_env(@app, AdminRepo, Keyword.merge(config, migration_connection_opts()))
+    Application.put_env(@app, AdminRepo, migration_repo_config(config))
   end
 
   @doc """

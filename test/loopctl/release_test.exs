@@ -46,12 +46,28 @@ defmodule Loopctl.ReleaseTest do
       assert sql =~ ~r/^SET idle_in_transaction_session_timeout = 0$/
     end
 
-    test "the statement it carries actually clears the timeout on a real connection" do
-      # End-to-end against the server, and NOT vacuous: the session is first set to a
-      # non-zero probe, so a statement the server ignored (or a misspelled GUC, which
-      # `SET` would reject outright) leaves 12345ms behind and fails the assertion. The
-      # probe is needed because the server default differs by environment — 0 on a
-      # developer box, 60000ms on the hosted instance.
+    test "the merge puts it where the migrator reads the repo config from" do
+      # The delivery, which asserting on `migration_connection_opts/0` alone cannot see:
+      # `Ecto.Migrator.with_repo/3` starts the repo from its APPLICATION CONFIG, so the
+      # option has to survive the merge onto AdminRepo's own config — and must not drop the
+      # keys (url, pool_size) without which the migrator cannot connect at all.
+      merged = Release.migration_repo_config(url: "postgres://example", pool_size: 2)
+
+      assert merged[:url] == "postgres://example"
+      assert merged[:pool_size] == 2
+      assert merged[:after_connect] == Release.migration_connection_opts()[:after_connect]
+    end
+
+    test "the option it carries actually clears the timeout on a real connection" do
+      # End-to-end against the server, THROUGH the delivery mechanism: the opts are handed
+      # to the connection as `after_connect` (what a repo started from this config does)
+      # rather than run by hand, so a shape Postgrex would not honour fails here.
+      #
+      # Non-vacuity is bought by the second connection: it runs the same mechanism with a
+      # non-zero probe, so `after_connect` being ignored entirely would show the server
+      # default (0 on a developer box, 60000ms on the hosted instance) instead of 12345 and
+      # fail. Without it, an ignored `after_connect` on a box whose default is already 0
+      # would read as a pass.
       config = Application.get_env(:loopctl, Loopctl.AdminRepo)
 
       conn_opts = [
@@ -79,17 +95,19 @@ defmodule Loopctl.ReleaseTest do
       # `start_link` LINKS the connection to this test process, so it is torn down when the
       # test ends — no `on_exit` teardown, and no leaked connection making the next run's
       # exhaustion slightly likelier.
-      assert %{rows: [["0"]]} = show_timeout_with_retry(conn_opts, 5)
+      after_connect = Keyword.fetch!(Release.migration_repo_config(conn_opts), :after_connect)
+
+      assert %{rows: [["0"]]} =
+               show_timeout_with_retry(Keyword.put(conn_opts, :after_connect, after_connect), 5)
+
+      probe = {Postgrex, :query!, ["SET idle_in_transaction_session_timeout = 12345", []]}
+
+      assert %{rows: [["12345ms"]]} =
+               show_timeout_with_retry(Keyword.put(conn_opts, :after_connect, probe), 5)
     end
 
     defp show_timeout_with_retry(conn_opts, attempts_left) do
       {:ok, conn} = Postgrex.start_link(conn_opts)
-      Postgrex.query!(conn, "SET idle_in_transaction_session_timeout = 12345", [])
-
-      {Postgrex, :query!, [sql, params]} =
-        Keyword.fetch!(Release.migration_connection_opts(), :after_connect)
-
-      Postgrex.query!(conn, sql, params)
       Postgrex.query!(conn, "SHOW idle_in_transaction_session_timeout", [], timeout: 10_000)
     rescue
       error in [DBConnection.ConnectionError, Postgrex.Error] ->
