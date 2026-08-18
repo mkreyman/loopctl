@@ -218,13 +218,23 @@ defmodule Loopctl.Workers.DraftDuplicateSweepWorker do
       # fills continuously, so a duplicate gets ~13 runs inside the window; a durable
       # retraction marker on the article row (a non-cast column, the way
       # `stories.lifecycle_entered_at` is) is what would let this bound go entirely.
+      # The horizon STAYS, and the durable marker does not replace it — it shrinks what it
+      # has to cover. `consolidation_retracted_at` proves authorship for every retraction
+      # from 20260818055453 onward, and the migration backfilled every earlier one the
+      # audit_log could still prove. What neither can reach is a retraction whose audit
+      # partition was ALREADY dropped before that backfill ran: no marker, no evidence, and
+      # nothing that can ever produce one. Failing closed on those is the whole reason this
+      # bound exists, and removing it would archive that cohort through a one-way door.
       where: a.inserted_at >= ^audit_evidence_horizon(),
       # Spare consolidation's retractions — the exclusion is applied HERE rather than
       # before the archive so the sweep does not even spend an ANN read on a draft it
-      # must not touch. There is no marker on the article itself; the audit_log is the
-      # only record that consolidation was the actor. `tenant_id` is constrained so the
+      # must not touch. TWO independent records now: the durable
+      # `consolidation_retracted_at` column (authoritative, survives audit retention) and
+      # the audit_log, still read because a marker can only exist from migration
+      # 20260818055453 onward. `tenant_id` is constrained so the
       # correlated NOT EXISTS can use `audit_log_tenant_entity_idx`, whose leading column
       # it is — without it every candidate scanned every retained partition.
+      where: is_nil(a.consolidation_retracted_at),
       where:
         not exists(
           from(al in "audit_log",
@@ -245,7 +255,7 @@ defmodule Loopctl.Workers.DraftDuplicateSweepWorker do
 
   # The oldest point the `audit_log` is still guaranteed to speak for — the same retention
   # `Loopctl.Workers.AuditPartitionWorker` enforces, read from the same config key so the two
-  # cannot drift.
+  # cannot drift. Still needed alongside `consolidation_retracted_at`: see the query above.
   defp audit_evidence_horizon do
     days = Application.get_env(:loopctl, :audit_retention_days, 90)
     DateTime.add(DateTime.utc_now(), -days * 86_400, :second)

@@ -65,6 +65,15 @@ defmodule Loopctl.Knowledge.Article do
     field :idempotency_key, :string
     field :metadata, :map, default: %{}
 
+    # Written ONLY by `Loopctl.Knowledge.Consolidation` when it unpublishes a confirmed
+    # duplicate, and read by `DraftDuplicateSweepWorker` so it can tell consolidation's own
+    # retraction from a human draft WITHOUT depending on the retention-bounded audit_log.
+    #
+    # A COLUMN rather than a `metadata` key for the `stories.lifecycle_entered_at` reason:
+    # metadata is cast and whole-map-replaced by PATCH, so one ordinary update would erase
+    # the marker. NEVER add this to a `cast` list.
+    field :consolidation_retracted_at, :utc_datetime_usec
+
     field :embedding, Pgvector.Ecto.Vector, load_in_query: false
     # Virtual boolean projection of `not is_nil(embedding)` — lets the bulk-embedding
     # path (US-37.4) null-check presence WITHOUT transferring the 1536-dim vector for
@@ -237,6 +246,25 @@ defmodule Loopctl.Knowledge.Article do
 
   @doc "Maximum number of tags allowed per article (single source of truth)."
   def max_tags, do: @max_tags
+
+  @doc """
+  The shape a single tag must have to survive this changeset.
+
+  Public because a tag can reach the database WITHOUT passing through here —
+  `Loopctl.Workers.TagBackfillWorker` persists with `update_all` — so any writer that
+  bypasses the changeset must validate against the SAME pattern or it stores rows this
+  module would have rejected. Those surface later as a 422 on an unrelated caller's PATCH,
+  which is a defect report pointing at the wrong code.
+
+  A caller may be STRICTER (the re-tagger requires lowercase, because it normalises first).
+  It may not be looser.
+  """
+  @spec tag_pattern() :: Regex.t()
+  def tag_pattern, do: @tag_pattern
+
+  @doc "Maximum length of a single tag (single source of truth, same reason as `tag_pattern/0`)."
+  @spec max_tag_length() :: pos_integer()
+  def max_tag_length, do: @max_tag_length
 
   @valid_transitions [
     {:draft, :published},

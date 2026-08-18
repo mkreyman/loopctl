@@ -54,8 +54,11 @@ defmodule Loopctl.Knowledge.Tagger do
   # `update_all`, which runs no changeset, so an accepted-here tag lands unvalidated and
   # only surfaces later as a 422 on an unrelated caller's PATCH. No `.`: the changeset
   # rejects it, and the tagging prompt must not offer it either.
-  @tag_pattern ~r/^[a-z0-9][a-z0-9_-]*$/
-  @max_tag_length 64
+  # The pattern and the length are TAKEN from `Article` rather than restated, so the two
+  # cannot drift; the lowercase-start narrowing is this module's own and stays here, because
+  # `normalize/1` has already lowercased the input by the time this runs. Stricter is fine —
+  # different is the bug.
+  @lowercase_start ~r/^[a-z0-9]/
 
   @doc """
   Suggest tags for `article` and return the MERGED tag list, or the unchanged list.
@@ -131,6 +134,10 @@ defmodule Loopctl.Knowledge.Tagger do
   defp normalize(tag) when is_binary(tag), do: tag |> String.trim() |> String.downcase()
   defp normalize(_tag), do: ""
 
-  defp valid?(tag),
-    do: tag != "" and String.length(tag) <= @max_tag_length and Regex.match?(@tag_pattern, tag)
+  defp valid?(tag) do
+    tag != "" and
+      String.length(tag) <= Article.max_tag_length() and
+      Regex.match?(Article.tag_pattern(), tag) and
+      Regex.match?(@lowercase_start, tag)
+  end
 end

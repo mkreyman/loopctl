@@ -61,7 +61,7 @@ defmodule Loopctl.Knowledge.TaggerTest do
           "has spaces",
           "-leading-hyphen",
           "",
-          String.duplicate("x", 80)
+          String.duplicate("x", Article.max_tag_length() + 1)
         ])
 
       assert added == ["good-tag"]
@@ -128,6 +128,33 @@ defmodule Loopctl.Knowledge.TaggerTest do
       # for one idea, which is the fragmentation this feature exists to reduce.
       assert {["RLS"], []} = Tagger.merge(["RLS"], ["rls"])
     end
+  end
+
+  test "the tag rule is Article's, not a copy — a suggestion the changeset rejects is refused" do
+    # This existed as THREE hand-synced copies that disagreed: Article and the ingestion
+    # worker allowed `[a-zA-Z0-9_-]` up to 100, the tagger allowed lowercase up to 64. It
+    # matters more here than anywhere, because `TagBackfillWorker` persists with
+    # `update_all` and runs no changeset — a tag this module accepts and Article rejects
+    # lands in the database and resurfaces as a 422 on an unrelated caller's PATCH.
+    long = String.duplicate("a", Article.max_tag_length() + 1)
+
+    {_tags, added} = Tagger.merge([], ["has.dot", long, "ok-tag"])
+
+    assert added == ["ok-tag"]
+    refute Regex.match?(Article.tag_pattern(), "has.dot")
+  end
+
+  test "the tagger may be STRICTER than Article, and is — lowercase start" do
+    # Article accepts an uppercase tag; the tagger normalises first, so requiring a
+    # lowercase start is a stricter rule on already-normalised input rather than a
+    # divergent one. Asserting both halves keeps the distinction from being "fixed" away.
+    assert Regex.match?(Article.tag_pattern(), "RLS")
+
+    {_tags, added} = Tagger.merge([], ["RLS"])
+    assert added == ["rls"], "normalised, then accepted"
+
+    {_tags, none} = Tagger.merge([], ["-leading-hyphen"])
+    assert none == []
   end
 
   describe "retag/4" do

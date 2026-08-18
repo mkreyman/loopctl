@@ -59,6 +59,33 @@ All notable changes to loopctl are documented here.
 
 ### Fixed
 
+- **`articles.consolidation_retracted_at`** — a durable, non-cast marker that the nightly
+  consolidation pass retracted an article. `DraftDuplicateSweepWorker` must not re-archive a
+  draft consolidation deliberately unpublished, and the only record of that authorship was
+  the retention-bounded `audit_log`; past `:audit_retention_days` the sweep could not tell
+  consolidation's retraction from a human draft.
+
+  **The migration BACKFILLS from the audit_log**, which is a one-time opportunity — after the
+  next partition drop those rows are unprovable forever. The sweep's fail-closed horizon
+  stays as the backstop for anything already past retention when this ran.
+
+  A COLUMN rather than a `metadata` key, for the `stories.lifecycle_entered_at` reason:
+  `metadata` is cast and whole-map-replaced by `PATCH`, so one ordinary update would erase
+  it. Never add it to a `cast` list — a test asserts that against the source.
+
+  The `ALTER` is catalog-only (nullable, no default), so no table rewrite.
+
+- **`Loopctl.Knowledge.Article` now owns the tag rule.** `tag_pattern/0` and
+  `max_tag_length/0` are public, and `Tagger` and `ContentIngestionWorker` read them instead
+  of keeping copies. There were three hand-synced copies and they disagreed — `Article` and
+  the ingestion worker allowed `[a-zA-Z0-9_-]` up to 100, the re-tagger lowercase up to 64.
+  That matters because `TagBackfillWorker` persists with `update_all` and runs no changeset,
+  so a looser rule stores rows the changeset rejects, surfacing later as a 422 on an
+  unrelated caller's PATCH. The re-tagger stays STRICTER (lowercase start, on already
+  normalised input) — stricter is fine, different was the bug.
+
+
+
 - **A migration slower than the database's `idle_in_transaction_session_timeout` no longer
   fails the release command after succeeding.** `Ecto.Migrator` takes its advisory lock
   inside a transaction and leaves that connection idle for the whole run, so Postgres kills
