@@ -56,29 +56,39 @@ defmodule Loopctl.ReleaseTest do
         password: config[:password],
         database: config[:database],
         parameters: [idle_in_transaction_session_timeout: "12345"],
-        # This test opens its OWN connection, outside the sandbox pools, so during a full
-        # suite run it asks the server for one more while three repos already hold theirs
-        # and Oban holds its notifier. The default 4s checkout deadline expires there
-        # reproducibly — it passes alone and fails in `mix precommit`, which is the worst
-        # shape of flake because the failure names a change that did not cause it.
-        # Waiting longer IS the fix: the connection is wanted for a single `SHOW`, so a
-        # slow checkout costs seconds while failing costs a red suite.
-        queue_target: 5_000,
-        queue_interval: 15_000,
-        connect_timeout: 15_000,
-        timeout: 15_000
+        queue_target: 2_000,
+        queue_interval: 5_000,
+        connect_timeout: 10_000,
+        timeout: 10_000
       ]
 
+      # RETRIED, because this test opens its OWN connection outside the sandbox pools and
+      # therefore asks the server for one more at the exact moment the suite is holding the
+      # most: three repos' pools plus Oban's notifier, and on this box a second project's
+      # suite besides. `too_many_clients` there is a property of when the test runs, not of
+      # what it asserts — it passed alone and failed in `mix precommit` repeatedly, which is
+      # the worst shape of flake because the failure names a change that did not cause it.
+      #
+      # Waiting longer alone did NOT fix it (30s deadlines still expired), so the retry is
+      # the fix: the pressure is transient and a few seconds later there is room.
+      #
       # `start_link` LINKS the connection to this test process, so it is torn down when the
-      # test ends — no `on_exit` teardown, which is what matters here: this suite shares a
-      # box with two other repos' pools, and a leaked connection per run is how a suite
-      # starts failing on connection exhaustion for reasons nobody can find.
-      {:ok, conn} = Postgrex.start_link(conn_opts)
+      # test ends — no `on_exit` teardown, and no leaked connection making the next run's
+      # exhaustion slightly likelier.
+      assert %{rows: [["12345ms"]]} = show_timeout_with_retry(conn_opts, 5)
+    end
 
-      assert %{rows: [["12345ms"]]} =
-               Postgrex.query!(conn, "SHOW idle_in_transaction_session_timeout", [],
-                 timeout: 15_000
-               )
+    defp show_timeout_with_retry(conn_opts, attempts_left) do
+      {:ok, conn} = Postgrex.start_link(conn_opts)
+      Postgrex.query!(conn, "SHOW idle_in_transaction_session_timeout", [], timeout: 10_000)
+    rescue
+      error in [DBConnection.ConnectionError, Postgrex.Error] ->
+        if attempts_left > 1 do
+          Process.sleep(1_000)
+          show_timeout_with_retry(conn_opts, attempts_left - 1)
+        else
+          reraise error, __STACKTRACE__
+        end
     end
 
     test "both migrate/0 and rollback/1 pass it, so a long DOWN cannot fail the same way" do
