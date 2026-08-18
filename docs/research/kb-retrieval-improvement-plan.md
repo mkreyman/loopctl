@@ -419,7 +419,7 @@ succeeded, so an embedding outage silently disables graph expansion too.
 lane over the in-flight cap. `search_combined/3` is the default path, so this is a real added
 read on every recall — named here because it is the price of the recall gain, not a footnote.
 
-### Phase 6 — Ripple-on-ingest *(NOT BUILT — the measurement says the queue it would feed is inert)*
+### Phase 6 — Ripple-on-ingest *(the typed half SHIPPED, #701; body-editing refused)*
 Karpathy #5, validated by A-MEM. On capture, update the neighbour articles a new source
 extends or contradicts, instead of only appending a new node and its links.
 **Check:** neighbour-update rate per ingest; no growth in the duplicate-capture proposal rate.
@@ -467,10 +467,25 @@ applies only what two consecutive runs agree on and retracts with `unpublish` ra
 (#606/#608). Nothing here has a comparable undo — an edited body has no prior version to
 restore.
 
-**The precondition is already met**: a consumer exists and keeps up. What it lacks is
-judgement, which is exactly what an LLM-backed judge supplies — and unlike the reranker, this
-one writes a durable, reviewable record rather than reordering a page, so the cost is per
-FLAGGED PAIR (bounded, nightly, ~450/day) rather than per search.
+**The precondition was already met**: a consumer exists and keeps up. What it lacked is
+judgement, which is what an LLM-backed judge supplies — and unlike the reranker, this one
+writes a durable, reviewable record rather than reordering a page, so the cost is per FLAGGED
+PAIR (bounded, nightly, ~450/day) rather than per search.
+
+**Shipped as #701.** `Loopctl.Knowledge.ConflictJudge` reads both articles and classifies the
+pair `redundant` / `contradictory` / `complementary`; a contradictory verdict writes the
+`contradicts` edge `find_contradiction_clusters/2` has always read and nothing has ever
+produced. Additive only — the disposition stays `dismiss` whatever the classification,
+because `supersede` and `merge` defer to the nightly executor and a `:high` supersede
+authorizes an unattended retirement. Deciding which of two contradicting articles is right is
+not a call an unattended judge is entitled to make, and the stored rationale says so in the
+record a human reads. Every failure path falls back to the previous similarity verdict, so
+the queue never stops being consumed because the judge got better.
+
+**Not yet verified on production data.** The judge is on by default and has not run a nightly
+pass, so nothing here yet shows what share of the ~450 daily pairs it calls contradictory —
+which is the number that says whether the classification is trustworthy or whether the prompt
+needs tightening. Read the first `contradicts` edges before trusting the rate.
 
 ### Phase 7 — Cap the collector's fallacy
 The 1.8% read rate is a capture-policy problem and cannot be fixed by retrieval. Decide a
@@ -543,12 +558,20 @@ in the plan rather than left implicit.
   implementations, the recording instrument and the evidence are in the repo; the default is
   `false` with a written overturn condition. This is the opposite of where the graph lane sat
   this morning — off, but no longer unjudged.
-- Phase 6 — **IN PROGRESS.** Half already ships (the auto-linker's `relates_to` plus
-  `incoming_links`). The typed half has a consumer and no producer: `contradicts` is read by
-  the lint and written by nothing, because the nightly judge decides on cosine similarity and
-  can only ever say "redundant". The unattended body-editing form stays refused outright.
-  (This entry previously said NOT BUILT, on a queue-backlog argument that came from querying
-  the wrong table — see Phase 6 above.)
+- Phase 6 — **DONE for the typed half** (#701); the unattended body-editing form stays
+  refused outright. The nightly judge now reads both articles instead of deciding on the
+  cosine score, and produces the `contradicts` edges the lint has always read and nothing has
+  ever written. Its classification rate on real traffic is unmeasured — see Phase 6.
+  (This entry twice said otherwise: first NOT BUILT on a queue-backlog argument that came
+  from querying the wrong table, then IN PROGRESS after the producer had already merged.)
+
+- **Tag vocabulary** (#702, not a numbered phase) — a consequence of Phase 3 rather than of
+  the original plan. Once tags entered `articles.search_vector`, their FRAGMENTATION became a
+  search problem: 33,234 of 60,141 distinct topical tags are used exactly once, and only 4.5%
+  of that is spelling variants. `Loopctl.Workers.TagBackfillWorker` re-tags concurrently
+  against the established vocabulary. It is NOT the Phase 3 LLM half above — that is
+  generated per-chunk CONTEXT prepended before embedding, and it remains unshipped for the
+  reason given there.
 - Phase 7 — the owner's call, now with a second independent number behind it:
   - **Phase 4's weak motivation survived contact with its own measurement.** It was called
     the weakest-motivated phase before it was built, on the grounds that ranking is an
