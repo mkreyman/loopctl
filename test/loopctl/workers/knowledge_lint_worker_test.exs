@@ -393,6 +393,77 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       |> AdminRepo.all()
     end
 
+    defp contradicts_links(tenant_id, a_id, b_id) do
+      from(l in ArticleLink,
+        where: l.tenant_id == ^tenant_id,
+        where: l.relationship_type == :contradicts,
+        where:
+          (l.source_article_id == ^a_id and l.target_article_id == ^b_id) or
+            (l.source_article_id == ^b_id and l.target_article_id == ^a_id)
+      )
+      |> AdminRepo.all()
+    end
+
+    defmodule ContradictingJudge do
+      @moduledoc false
+      @behaviour Loopctl.Knowledge.ConflictJudge
+      @impl true
+      def judge(_scope, _left, _right, _opts) do
+        {:ok,
+         %{
+           classification: :contradictory,
+           confidence: :high,
+           rationale: "A requires the lock, B forbids it"
+         }}
+      end
+    end
+
+    test "the judge decides the classification, and a contradiction adds a contradicts edge" do
+      # `find_contradiction_clusters/2` reads `:contradicts` links and, until the semantic
+      # judge existed, could only ever return empty: the nightly judge decided on cosine
+      # similarity, which cannot tell agreement from disagreement, so `contradicts` sat at 0
+      # edges across the whole hosted corpus. This is the producer.
+      #
+      # The implementation is injected per CALL rather than through `Application.put_env`,
+      # which would mutate VM-global state every other test in this async suite can see.
+      tenant = fixture(:tenant)
+      a = published_article_with_embedding(tenant.id, similar_embedding())
+      b = published_article_with_embedding(tenant.id, near_similar_embedding())
+
+      pair = %{source_article_id: a.id, target_article_id: b.id, similarity: 0.96}
+
+      assert {:ok, _} =
+               KnowledgeLintWorker.judge_and_record(tenant.id, pair,
+                 conflict_judge_impl: ContradictingJudge
+               )
+
+      assert [verdict] = resolutions(tenant.id, a.id, b.id)
+      assert verdict.classification == :contradictory
+      # STILL a dismiss. `supersede`/`merge` defer to the executor and a `:high` supersede
+      # authorizes an unattended retirement — deciding which of two contradicting articles is
+      # right is not a call this judge is entitled to make.
+      assert verdict.disposition == :dismiss
+      assert verdict.evidence =~ "A requires the lock, B forbids it"
+
+      assert [edge] = contradicts_links(tenant.id, a.id, b.id)
+      assert edge.metadata["judged_by"] == "worker:knowledge_lint"
+    end
+
+    test "a redundant verdict writes NO contradicts edge" do
+      # The edge is the part a human reads as a real disagreement, so it must appear only on
+      # the classification that means one. Swap the judge above for the default and it goes.
+      tenant = fixture(:tenant)
+      a = published_article_with_embedding(tenant.id, similar_embedding())
+      b = published_article_with_embedding(tenant.id, near_similar_embedding())
+
+      pair = %{source_article_id: a.id, target_article_id: b.id, similarity: 0.96}
+
+      assert {:ok, _} = KnowledgeLintWorker.judge_and_record(tenant.id, pair)
+
+      assert [%{classification: :redundant}] = resolutions(tenant.id, a.id, b.id)
+      assert contradicts_links(tenant.id, a.id, b.id) == []
+    end
+
     test "a promoted conflict is JUDGED the same night, as redundant rather than contradictory" do
       # Before this, nothing ever closed a potential_conflict: the count was monotone by
       # construction and every open one withheld BOTH articles from curated answers. With no

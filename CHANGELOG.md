@@ -4,6 +4,35 @@ All notable changes to loopctl are documented here.
 
 ## [Unreleased] — 2026-08-07 — Story lifecycle capability delivery
 
+### Changed
+
+- **The nightly conflict judge now READS both articles instead of deciding on cosine
+  similarity.** The novelty gate flags a pair when similarity clears a threshold, and the
+  nightly lint then judged that pair on the same number — so every verdict came out
+  `dismiss / redundant`, a genuine contradiction included. The judge said so itself in the
+  evidence it wrote: *"similarity cannot distinguish agreement from disagreement."*
+  Consequently `contradicts` sat at **0 edges** across the corpus while
+  `find_contradiction_clusters/2` read it — a consumer with no producer, whose report could
+  only ever be empty.
+
+  `Loopctl.Knowledge.ConflictJudge` classifies a pair as `redundant`, `contradictory` or
+  `complementary`, and a `contradictory` verdict now writes the `contradicts` edge that the
+  lint report has always been waiting for.
+
+  **Additive only.** The disposition stays `dismiss` whatever the classification: `supersede`
+  and `merge` defer to the nightly executor and a `:high` supersede authorizes an unattended
+  retirement, and deciding which of two contradicting articles is right is not a call an
+  unattended judge is entitled to make. An edge appears and a row appears; nothing is
+  retired, rewritten or hidden.
+
+  **Operator impact: one provider call per FLAGGED PAIR** — bounded by the existing nightly
+  judgement cap (2000) and ~450/day in practice, not per search. Judgements run concurrently
+  (`:knowledge_conflict_judge_concurrency`, default 4) because a sequential run of a 2000-pair
+  catch-up could not finish in a nightly window. Every failure path — no LLM key, provider
+  error, unparseable reply, an article deleted between the flag and the judgement — falls back
+  to the previous similarity verdict, so a deployment that cannot use it is exactly where it
+  was. Set `:knowledge_conflict_judge_enabled` to `false` to keep the old behaviour outright.
+
 ### Fixed
 
 - **A migration slower than the database's `idle_in_transaction_session_timeout` no longer
