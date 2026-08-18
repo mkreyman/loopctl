@@ -209,9 +209,25 @@ the shorter-lived table), not that attribution is broken — bound the window an
 Three hours is not a rate and must not be quoted as one. What it does establish is
 MECHANISM: every hook open is `cross_key` and every cli open is `same_key`, which is the
 predicted split, and it confirms the old same-key metric could not have counted a single one
-of the hook's. Also note `session-start` is now its own entrypoint rather than sitting inside
-`unattributed`; its queries are bare repo names by construction, so it belongs with `smoke`
-in the filter-me-out class, not with real traffic.
+of the hook's.
+
+**Correction (2026-08-17):** an earlier version of this paragraph said `session-start`
+"belongs with `smoke` in the filter-me-out class". **It does not, and it is not excluded.**
+It is one auto-query per session from `hooks/session-start.sh`, issued by a real session that
+goes on to do real work — a channel to be measured, not infrastructure. It began declaring
+itself in claude-config#322; before that it sent no client context and sat in the NULL
+bucket, so expect a step change out of NULL dated 2026-08-17 that is bookkeeping rather than
+behaviour.
+
+What IS excluded alongside `smoke` is `skill-eval` (`@infra_entrypoints`):
+`bin/skill-trigger-eval.py` runs each eval query through a real `claude -p` subject whose
+recall hooks search for real, and **the subject is killed at its first tool call** — those
+searches can never follow through while landing in every denominator. Two of its queries were
+identifiable as distinct strings appearing exactly 12 times (4 runs x 3 repeats).
+
+The retrieval plan blamed the recall CANARY for this contamination and was wrong: the canary
+pins every hook invocation to `http://127.0.0.1:9` behind a recording curl shim and issues no
+request to loopctl at all.
 
 ## 4. The trap
 

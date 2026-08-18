@@ -55,7 +55,18 @@ defmodule Loopctl.ReleaseTest do
         username: config[:username],
         password: config[:password],
         database: config[:database],
-        parameters: [idle_in_transaction_session_timeout: "12345"]
+        parameters: [idle_in_transaction_session_timeout: "12345"],
+        # This test opens its OWN connection, outside the sandbox pools, so during a full
+        # suite run it asks the server for one more while three repos already hold theirs
+        # and Oban holds its notifier. The default 4s checkout deadline expires there
+        # reproducibly — it passes alone and fails in `mix precommit`, which is the worst
+        # shape of flake because the failure names a change that did not cause it.
+        # Waiting longer IS the fix: the connection is wanted for a single `SHOW`, so a
+        # slow checkout costs seconds while failing costs a red suite.
+        queue_target: 5_000,
+        queue_interval: 15_000,
+        connect_timeout: 15_000,
+        timeout: 15_000
       ]
 
       # `start_link` LINKS the connection to this test process, so it is torn down when the
@@ -65,7 +76,9 @@ defmodule Loopctl.ReleaseTest do
       {:ok, conn} = Postgrex.start_link(conn_opts)
 
       assert %{rows: [["12345ms"]]} =
-               Postgrex.query!(conn, "SHOW idle_in_transaction_session_timeout", [])
+               Postgrex.query!(conn, "SHOW idle_in_transaction_session_timeout", [],
+                 timeout: 15_000
+               )
     end
 
     test "both migrate/0 and rollback/1 pass it, so a long DOWN cannot fail the same way" do

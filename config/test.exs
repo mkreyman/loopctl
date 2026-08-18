@@ -854,3 +854,8 @@ config :loopctl,
 # The re-tagger makes an outbound provider call per article. Tests pass `tagger_impl:`
 # explicitly; this default guarantees a test that forgets cannot reach a provider.
 config :loopctl, :knowledge_tagger, Loopctl.Knowledge.Tagger.Llm
+# The semantic conflict judge makes an outbound provider call per flagged pair. Tests that
+# exercise the nightly lint must not, so the default here is the similarity verdict — the
+# same one production falls back to. Tests that DO want the semantic path pass
+# `conflict_judge_impl:` explicitly rather than mutating this.
+config :loopctl, :knowledge_conflict_judge, Loopctl.Knowledge.ConflictJudge.Similarity
