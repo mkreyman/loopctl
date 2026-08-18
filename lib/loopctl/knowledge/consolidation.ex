@@ -1121,13 +1121,40 @@ defmodule Loopctl.Knowledge.Consolidation do
            actor_type: "system",
            actor_label: "worker:consolidation"
          ) do
-      {:ok, _} -> true
-      other -> log_unpublish_failure(tenant_id, loser, unpublish_error_tag(other))
+      {:ok, _} ->
+        stamp_retraction(tenant_id, loser.id)
+        true
+
+      other ->
+        log_unpublish_failure(tenant_id, loser, unpublish_error_tag(other))
     end
   rescue
     e -> log_unpublish_failure(tenant_id, loser, ExitTag.tag(e))
   catch
     :exit, reason -> log_unpublish_failure(tenant_id, loser, "exit:" <> ExitTag.tag(reason))
+  end
+
+  # The DURABLE record that consolidation was the actor. The audit_log already carries it,
+  # but retention-bounded (`:audit_retention_days`): past that horizon
+  # `DraftDuplicateSweepWorker` could not tell this retraction from a human draft, and the
+  # safe reading of an absent record is wrong in one direction — it would archive
+  # consolidation's own work through a one-way door.
+  #
+  # AFTER the unpublish, never inside it: a stamp on an article that did not actually get
+  # unpublished would suppress the sweep on a still-published article forever. Best-effort by
+  # design — a failed stamp costs the horizon bound the sweep already falls back to, whereas
+  # raising here would lose the remaining confirmed groups for the tenant.
+  defp stamp_retraction(tenant_id, article_id) do
+    from(a in Knowledge.Article,
+      where: a.tenant_id == ^tenant_id and a.id == ^article_id
+    )
+    |> AdminRepo.update_all(set: [consolidation_retracted_at: DateTime.utc_now()])
+  rescue
+    e ->
+      Logger.warning(
+        "Consolidation: tenant=#{tenant_id} unpublished #{article_id} but could not stamp " <>
+          "the retraction marker (#{ExitTag.tag(e)}); the sweep falls back to the audit_log."
+      )
   end
 
   defp log_unpublish_failure(tenant_id, loser, tag) do

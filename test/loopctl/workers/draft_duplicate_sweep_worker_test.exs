@@ -192,6 +192,51 @@ defmodule Loopctl.Workers.DraftDuplicateSweepWorkerTest do
                "it into a terminal one a week later"
     end
 
+    test "the durable marker spares a retraction the audit_log can no longer prove" do
+      # The point of `consolidation_retracted_at`: authorship survives the audit window. An
+      # aged draft with the marker is spared on the marker alone — no audit entry needed —
+      # which is what shrinks the horizon bound from "every aged draft" to "only those
+      # retracted before the column existed AND already past retention".
+      tenant = fixture(:tenant)
+      vector = unit_vector(0)
+
+      _published = tenant.id |> article(:published) |> then(&embed(tenant.id, &1, vector))
+      draft = tenant.id |> article(:draft) |> then(&embed(tenant.id, &1, vector))
+
+      Loopctl.AdminRepo.update_all(
+        from(a in Article, where: a.id == ^draft.id),
+        set: [consolidation_retracted_at: DateTime.utc_now()]
+      )
+
+      assert :ok = perform_job(DraftDuplicateSweepWorker, %{"tenant_id" => tenant.id})
+
+      assert status_of(draft.id) == :draft,
+             "a marked retraction must be spared whatever the audit_log still holds"
+    end
+
+    test "the marker is NOT castable — a PATCH cannot clear it" do
+      # The `stories.lifecycle_entered_at` lesson: `metadata` is cast and whole-map-replaced
+      # by PATCH, so a marker living there is erased by one ordinary update and the sweep
+      # gets its ambiguity back. Asserted against the SOURCE because Ecto exposes no
+      # introspection for `cast/3`'s permitted list.
+      src = File.read!("lib/loopctl/knowledge/article.ex")
+
+      # Both the inline list and the @cast_fields module attribute it uses.
+      permitted =
+        Regex.scan(~r/cast\(attrs,\s*(\[[^\]]*\]|@cast_fields)/s, src) ++
+          Regex.scan(~r/@cast_fields\s*(\[[^\]]*\]|~w\([^)]*\)[a-z]*)/s, src)
+
+      assert length(permitted) >= 3,
+             "found too few cast sources to check — the assertion below would pass vacuously"
+
+      for [_, list] <- permitted do
+        refute list =~ "consolidation_retracted_at",
+               "consolidation_retracted_at must never be castable"
+      end
+
+      assert :consolidation_retracted_at in Article.__schema__(:fields)
+    end
+
     test "a draft created before the audit retention window is left alone" do
       # The exemption above is read out of `audit_log`, which `AuditPartitionWorker` DROPs
       # partition-by-partition past `:audit_retention_days` — while this worker runs weekly

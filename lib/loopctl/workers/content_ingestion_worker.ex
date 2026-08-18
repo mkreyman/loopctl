@@ -149,10 +149,13 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
   @binary_content_type_prefixes ~w(image/ audio/ video/ font/)
   # Single source of truth: the canonical taxonomy (avoids drift).
   @valid_categories Loopctl.Knowledge.Categories.all()
-  @tag_pattern ~r/^[a-zA-Z0-9_-]+$/
+  # From `Article`, not a copy. This worker validates BEFORE the changeset so one malformed
+  # tag drops a single article instead of failing the whole ingestion batch — which only
+  # works while the two rules are identical.
+  @tag_pattern Loopctl.Knowledge.Article.tag_pattern()
   # Single source of truth: the Article schema's tag cap (avoids drift).
   @max_tags Loopctl.Knowledge.Article.max_tags()
-  @max_tag_length 100
+  @max_tag_length Loopctl.Knowledge.Article.max_tag_length()
 
   @impl Oban.Worker
   def perform(%Oban.Job{
