@@ -4,30 +4,6 @@ All notable changes to loopctl are documented here.
 
 ## [Unreleased] — 2026-08-07 — Story lifecycle capability delivery
 
-### Added
-
-- **Retroactive tagging** (`Loopctl.Workers.TagBackfillWorker`). Tags were LLM-generated once
-  at ingest and nothing ever revisited them, so there was no way to improve an article's tags
-  after capture at all. There is now.
-
-  It re-tags against the corpus's **established vocabulary**, which is the entire point.
-  Measured on the hosted instance: 684,883 topical tag instances across **60,141 distinct
-  tags, of which 33,234 (55.3%) are used exactly once** — each capture invented plausible
-  strings for ideas the corpus already had words for. Only 4.5% of that is spelling variants,
-  so normalisation cannot fix it. Coverage is not the problem either (8.66 topical tags per
-  article, 46 published articles below three), which is why a re-tagger that just generates
-  more tags in isolation would make things worse.
-
-  Concurrent (`Task.async_stream`, `:knowledge_tag_backfill_concurrency`, default 4),
-  bounded per run, resumable via `metadata.retagged_at`, and **append-only** — an existing tag
-  is never removed, because they carry provenance ids and the reserved `idem-` namespace a
-  sourcer reads to know an article was already captured. A provider failure leaves the article
-  eligible for the next run rather than silently stamping it as done.
-
-  **Deliberately not on a cron**: one provider call per article, so it is started on purpose:
-
-      Loopctl.Workers.TagBackfillWorker.enqueue_all_tenants(limit: 200)
-
 ### Changed
 
 - **The nightly conflict judge now READS both articles instead of deciding on cosine

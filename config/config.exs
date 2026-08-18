@@ -940,18 +940,6 @@ config :loopctl, :knowledge_rrf_graph_seed_count, 10
 # Overall cap on distinct graph-lane neighbors injected into the fusion.
 config :loopctl, :knowledge_rrf_graph_max_neighbors, 20
 
-# Retroactive tagging (`Loopctl.Workers.TagBackfillWorker`). Tags were LLM-generated once at
-# ingest and nothing ever revisited them, so 33,234 of 60,141 distinct topical tags (55.3%)
-# are used exactly ONCE — each capture invented plausible strings for ideas the corpus already
-# had words for. The backfill re-tags against the ESTABLISHED vocabulary, which is the whole
-# mechanism; generating more tags in isolation would make the fragmentation worse.
-#
-# Deliberately NOT on a cron: it costs one provider call per article, so it is started on
-# purpose and bounded per run. Concurrency is small because the constraint is a shared
-# provider rate limit and the AdminRepo pool.
-config :loopctl, :knowledge_tagger, Loopctl.Knowledge.Tagger.Llm
-config :loopctl, :knowledge_tag_backfill_concurrency, 4
-
 # Semantic conflict judge (Phase 6). The nightly lint flags a pair on cosine similarity and,
 # until this existed, DISMISSED it on cosine similarity too — so every one of the 23,610
 # verdicts on the hosted instance reads `redundant`, a genuine contradiction included, and
