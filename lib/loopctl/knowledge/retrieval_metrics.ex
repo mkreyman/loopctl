@@ -185,7 +185,26 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   # `entrypoint` key at all, so historical days remain contaminated and are NOT comparable
   # with days after the tag ships. That is stated in the payload rather than left for a
   # reader to discover from a step change in the series.
-  @infra_entrypoints ~w(smoke)
+  #
+  # `skill-eval` joined on 2026-08-17 (claude-config#322). It is the same SHAPE of traffic as
+  # `smoke` and for a sharper reason: `bin/skill-trigger-eval.py` runs each eval query through
+  # a real `claude -p` subject whose recall hooks then search for real, and **the subject is
+  # killed at its first tool call** — so those searches are structurally incapable of ever
+  # following through, while contributing to every denominator. Two of its queries were
+  # visible in the data as distinct strings appearing exactly 12 times (4 runs x 3 repeats).
+  #
+  # This corrects an attribution I got wrong: the plan blamed the recall CANARY, which turns
+  # out to issue no request to loopctl at all — every one of its hook invocations is pinned to
+  # `http://127.0.0.1:9` behind a recording curl shim. Giving the canary a label would have
+  # changed nothing.
+  #
+  # `session-start` is deliberately NOT here. It is one auto-query per session from
+  # `hooks/session-start.sh`, which began declaring itself in the same change; before that it
+  # sent no client context at all and sat in the NULL bucket. It is REAL traffic from a real
+  # session that goes on to do real work, so it is its own channel to be measured, not infra
+  # to be excluded. Expect a step change out of NULL dated 2026-08-17 that is bookkeeping
+  # rather than behaviour.
+  @infra_entrypoints ~w(smoke skill-eval)
 
   defp exclude_infra_traffic(query) do
     where(
