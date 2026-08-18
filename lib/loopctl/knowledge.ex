@@ -2882,20 +2882,20 @@ defmodule Loopctl.Knowledge do
         results
 
       ids ->
-        query =
-          from(a in Article,
-            where: a.tenant_id == ^tenant_id and a.id in ^ids,
-            select: {a.id, fragment("left(?, ?)", a.body, @snippet_scan_bytes)}
-          )
+        case tenant_lead_rows(tenant_id, ids) do
+          # A SHED is not "this tenant owns none of these ids". Collapsing it to an empty
+          # list handed EVERY id on the page to `system_lead_rows/1`, so a shed spent an
+          # AdminRepo connection under exactly the load the shed exists to relieve. The
+          # degradation is: a shed backfill costs a snippet, and never a second query.
+          :shed ->
+            results
 
-        # HeavyRead, NOT AdminRepo: this runs on the public search path, and AdminRepo's
-        # small pool is load-bearing for every authentication — the keyword lane already
-        # spends one connection there per search, and a second would double that for a
-        # cosmetic field. HeavyRead has its own pool and may SHED under load, which is the
-        # correct degradation here: a shed backfill costs a snippet, never a result.
-        tenant_id
-        |> HeavyRead.all(query, semantic_heavy_read_opts())
-        |> apply_lead_rows(results)
+          rows ->
+            resolved = MapSet.new(rows, &elem(&1, 0))
+
+            (rows ++ system_lead_rows(Enum.reject(ids, &MapSet.member?(resolved, &1))))
+            |> apply_lead_rows(results)
+        end
     end
   rescue
     # A snippet is an aid, never the answer. If the backfill fails the results still stand.
@@ -2904,7 +2904,43 @@ defmodule Loopctl.Knowledge do
       results
   end
 
-  defp apply_lead_rows({:error, :heavy_read_overloaded}, results), do: results
+  # HeavyRead, NOT AdminRepo: this runs on the public search path, and AdminRepo's small
+  # pool is load-bearing for every authentication — the keyword lane already spends one
+  # connection there per search, and a second would double that for a cosmetic field.
+  # HeavyRead has its own pool and may SHED under load, which is the correct degradation
+  # here: a shed backfill costs a snippet, never a result.
+  defp tenant_lead_rows(tenant_id, ids) do
+    query =
+      from(a in Article,
+        where: a.tenant_id == ^tenant_id and a.id in ^ids,
+        select: {a.id, fragment("left(?, ?)", a.body, @snippet_scan_bytes)}
+      )
+
+    case HeavyRead.all(tenant_id, query, semantic_heavy_read_opts()) do
+      rows when is_list(rows) -> rows
+      _shed -> :shed
+    end
+  end
+
+  # Every search population here is the DISJUNCTIVE `tenant_id == ^t or scope == :system`, so
+  # a page can carry system canonicals — whose NULL `tenant_id` can never satisfy the
+  # heavy-read tenant guard (`HeavyRead.guard!/2` refuses an OR-bypass, which is why
+  # `hydrate_semantic_pool/6` reads them through AdminRepo too). Without this they were the
+  # one class of result that still came back with a bare title.
+  #
+  # This is the one AdminRepo query the comment above tolerates, and it is bounded on both
+  # sides: only the ids the tenant-scoped read did not resolve are asked for, so a page with
+  # no canonical spends nothing, and a SHED never reaches here at all — `backfill_snippets/2`
+  # returns on `:shed` rather than treating the whole page as unresolved.
+  defp system_lead_rows([]), do: []
+
+  defp system_lead_rows(ids) do
+    from(a in Article,
+      where: a.id in ^ids and a.scope == :system,
+      select: {a.id, fragment("left(?, ?)", a.body, @snippet_scan_bytes)}
+    )
+    |> AdminRepo.all()
+  end
 
   defp apply_lead_rows(rows, results) when is_list(rows) do
     apply_leads(results, Map.new(rows, fn {id, prefix} -> {id, lead_extract(prefix)} end))
@@ -2968,7 +3004,17 @@ defmodule Loopctl.Knowledge do
     text
     |> String.replace(~r/!\[[^\]]*\]\([^)]*\)/, "")
     |> String.replace(~r/\[([^\]]*)\]\([^)]*\)/, "\\1")
-    |> String.replace(~r/[*_`]+/, "")
+    # Backticks anywhere; `*` at token boundaries; `_` only when it touches no word
+    # character at all. An unanchored `[*_`]+` ate the underscores INSIDE identifiers
+    # (`tenant_id` rendered `tenantid`), and the token-boundary form still ate the ones at
+    # their EDGES (`__MODULE__` rendered `MODULE`, `_unused` rendered `unused`) — which is
+    # most of what this corpus's prose is made of, and a snippet naming an identifier the
+    # corpus does not contain is worse than no snippet. An underscore emphasis marker is
+    # indistinguishable from those by shape, so it survives as a literal `_`, which is a
+    # character the corpus really does contain.
+    |> String.replace(~r/`+/, "")
+    |> String.replace(~r/(?<![\p{L}\p{N}])\*+|\*+(?![\p{L}\p{N}])/u, "")
+    |> String.replace(~r/(?<![\p{L}\p{N}_])_+(?![\p{L}\p{N}_])/u, "")
     |> String.replace(~r/\s+/, " ")
     |> String.trim()
   end
@@ -2977,8 +3023,11 @@ defmodule Loopctl.Knowledge do
     if String.length(text) <= max do
       text
     else
+      # `max - 1` so the ellipsis fits INSIDE the cap. At `max` the result was `max + 1`
+      # graphemes whenever the trailing-word trim found no whitespace to remove, and the
+      # renderer then re-truncated it and appended a SECOND ellipsis.
       text
-      |> String.slice(0, max)
+      |> String.slice(0, max - 1)
       |> String.replace(~r/\s+\S*$/, "")
       |> Kernel.<>("…")
     end

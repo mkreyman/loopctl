@@ -12,8 +12,10 @@ defmodule Loopctl.Knowledge.SnippetBackfillTest do
 
   setup :verify_on_exit!
 
+  alias Loopctl.AdminRepo
   alias Loopctl.Embeddings
   alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.Article
 
   # The test-mode embedding mock returns a per-tenant CONSTANT vector, so the semantic lane
   # cannot discriminate on its own. Seed a known vector explicitly and query with it — the
@@ -36,7 +38,7 @@ defmodule Loopctl.Knowledge.SnippetBackfillTest do
     article =
       article
       |> Ecto.Changeset.change(%{status: :published})
-      |> Loopctl.AdminRepo.update!()
+      |> AdminRepo.update!()
 
     {:ok, _} = Embeddings.upsert_article_embedding(tenant_id, article, query_vector())
     article
@@ -134,8 +136,9 @@ defmodule Loopctl.Knowledge.SnippetBackfillTest do
       refute hit.snippet =~ "https://example.com"
       assert hit.snippet =~ "link", "link TEXT is kept; only the url is dropped"
 
-      assert String.length(hit.snippet) <= Knowledge.max_snippet_length() + 1,
-             "the +1 is the ellipsis"
+      assert String.length(hit.snippet) <= Knowledge.max_snippet_length(),
+             "the ellipsis fits INSIDE the cap — at cap+1 the renderer re-truncates and " <>
+               "appends a second one"
 
       # The real check: the final token must be a WHOLE word of the source, not a fragment
       # of one. (An earlier version of this test asserted a regex that matched every
@@ -151,6 +154,35 @@ defmodule Loopctl.Knowledge.SnippetBackfillTest do
 
       assert String.match?(body, ~r/(^|\s)#{Regex.escape(last_token)}(\s|$)/),
              "snippet ended on #{inspect(last_token)}, which is not a whole word of the body"
+    end
+
+    test "an identifier's underscores and backticks survive the markup strip" do
+      # An unanchored `[*_`]+` ate the underscores INSIDE identifiers, so `tenant_id` was
+      # shown as `tenantid` — a snippet naming things the corpus does not contain is worse
+      # than no snippet, and the reranker judges relevance on the same text.
+      tenant = fixture(:tenant)
+
+      body =
+        "Every context function takes tenant_id first, and `__MODULE__` with an _unused " <>
+          "arg wraps it in *emphasis* that must go."
+
+      article = published(tenant.id, "Identifiers #{System.unique_integer([:positive])}", body)
+
+      {:ok, %{results: results}} =
+        Knowledge.search_semantic(tenant.id, query_vector(), limit: 20)
+
+      hit = Enum.find(results, &(&1.id == article.id))
+
+      assert hit.snippet =~ "tenant_id"
+      # The EDGES too: a token-boundary rule protects only underscores flanked by
+      # alphanumerics on both sides, so `__MODULE__` came back as `MODULE` and `_unused` as
+      # `unused` — identifiers the corpus does not contain, which is the same defect one
+      # character over.
+      assert hit.snippet =~ "__MODULE__"
+      assert hit.snippet =~ "_unused"
+      refute hit.snippet =~ "`"
+      refute hit.snippet =~ "*emphasis*"
+      assert hit.snippet =~ "emphasis"
     end
   end
 
@@ -188,6 +220,44 @@ defmodule Loopctl.Knowledge.SnippetBackfillTest do
 
       assert hit.snippet_source == "lead"
       assert hit.snippet =~ "Quiescent apparatus"
+    end
+
+    test "a system-scope canonical gets a lead too, not a bare title" do
+      # Every search population here is the DISJUNCTIVE `tenant_id == ^t or scope ==
+      # :system`, so a page can carry system canonicals — whose NULL `tenant_id` cannot
+      # satisfy the heavy-read tenant guard. Filling only the tenant-scoped rows left the
+      # shared canon as exactly the bare-title case this feature exists to remove, and made
+      # one page inconsistent with itself.
+      tenant = fixture(:tenant)
+      stub(Loopctl.MockEmbeddingReadPath, :side_table_reads_enabled?, fn -> true end)
+
+      canonical =
+        %Article{tenant_id: nil, scope: :system}
+        |> Article.create_changeset(%{
+          title: "Shared canonical #{System.unique_integer([:positive])}",
+          body: "Chain of custody separates the implementer from the verifier.",
+          category: :reference,
+          status: :published,
+          scope: :system
+        })
+        |> AdminRepo.insert!()
+
+      {:ok, _} =
+        Embeddings.materialize_system_article_embedding(
+          tenant.id,
+          canonical,
+          query_vector(),
+          "sys",
+          1536
+        )
+
+      {:ok, %{results: results}} =
+        Knowledge.search_semantic(tenant.id, query_vector(), limit: 20)
+
+      hit = Enum.find(results, &(&1.id == canonical.id))
+      assert hit, "the canonical must be retrievable for this assertion to mean anything"
+      assert hit.snippet_source == "lead"
+      assert hit.snippet =~ "Chain of custody"
     end
 
     test "another tenant's body is never used to fill a snippet" do

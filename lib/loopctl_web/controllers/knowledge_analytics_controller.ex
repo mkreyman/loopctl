@@ -355,7 +355,9 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
         "`direct_opens` is the agent going straight to an article by link or cited id — " <>
         "previously indistinguishable from 'surfaced and ignored', close to its " <>
         "opposite. A read with no attribution is in none of the three (pre-migration " <>
-        "rows, and a surfacing row predating #582 that carries no search identity).\n\n" <>
+        "rows, a surfacing row predating #582 that carries no search identity, and a " <>
+        "`drill` with no surfacing row — the progressive index records none, so calling " <>
+        "it a direct open would be false).\n\n" <>
         "TWO WINDOWS, NOT ONE KNOB — attribution is baked in at WRITE time and cannot be " <>
         "re-asked of history; the correlated metrics take `window_seconds` at QUERY time. " <>
         "They share a default, so a divergence after passing a different `window_seconds` " <>
@@ -364,8 +366,9 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
         "`searches_reformulated` and `searches_quiet` PARTITION `searches`. Treating " <>
         "every not-opened search as a failure is wrong: an agent whose question is " <>
         "answered by the result snippet correctly opens nothing, and that is a success. " <>
-        "A REFORMULATION (same key, different query, inside the window, having opened " <>
-        "nothing) is the one unambiguous failure in that bucket, so it is reported " <>
+        "A REFORMULATION (same key, a LATER SEARCH CALL inside the window, having opened " <>
+        "nothing — compared on search identity, so a verbatim retry counts) is the " <>
+        "closest thing to an unambiguous failure in that bucket, so it is reported " <>
         "separately. What remains is `quiet` and is STILL a mixture of 'the snippet " <>
         "sufficed' and 'the rows were ignored' — this surface does NOT separate them. " <>
         "Do not read `quiet` as either; follow-through is a floor, never a satisfaction " <>

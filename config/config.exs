@@ -948,9 +948,11 @@ config :loopctl, :knowledge_rrf_graph_max_neighbors, 20
 #
 # Deliberately NOT on a cron: it costs one provider call per article, so it is started on
 # purpose and bounded per run. Concurrency is small because the constraint is a shared
-# provider rate limit and the AdminRepo pool.
+# provider rate limit and the AdminRepo pool — and STRICTLY BELOW that pool
+# (`ADMIN_POOL_SIZE`, default 3 in config/runtime.exs), because every authenticated request
+# takes a checkout there too and a backfill that can occupy the whole pool times those out.
 config :loopctl, :knowledge_tagger, Loopctl.Knowledge.Tagger.Llm
-config :loopctl, :knowledge_tag_backfill_concurrency, 4
+config :loopctl, :knowledge_tag_backfill_concurrency, 2
 # Semantic conflict judge (Phase 6). The nightly lint flags a pair on cosine similarity and,
 # until this existed, DISMISSED it on cosine similarity too — so every one of the 23,610
 # verdicts on the hosted instance reads `redundant`, a genuine contradiction included, and
@@ -963,8 +965,11 @@ config :loopctl, :knowledge_tag_backfill_concurrency, 4
 config :loopctl, :knowledge_conflict_judge_enabled, true
 config :loopctl, :knowledge_conflict_judge, Loopctl.Knowledge.ConflictJudge.Llm
 # Concurrent judgements per nightly run. Small on purpose: the limit on the other side is a
-# shared provider rate limit and the AdminRepo pool, not CPU here.
-config :loopctl, :knowledge_conflict_judge_concurrency, 4
+# shared provider rate limit and the AdminRepo pool, not CPU here — and strictly below that
+# pool (`ADMIN_POOL_SIZE`, default 3), which every authenticated request also checks out of.
+# The provider call dominates wall time and holds no connection, so a bound of 2 costs the
+# run very little.
+config :loopctl, :knowledge_conflict_judge_concurrency, 2
 
 # Phase 4 second-stage reranking. OFF by default: it puts an outbound provider call on the
 # DEFAULT search path, and the measurements that motivated the retrieval plan eliminate

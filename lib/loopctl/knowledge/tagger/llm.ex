@@ -34,7 +34,8 @@ defmodule Loopctl.Knowledge.Tagger.Llm do
 
   Return between 3 and 8 tags describing what the article is ABOUT. Do not tag the format, \
   the source or the file type. Each tag must be lowercase, and may contain only letters, \
-  digits, dots, underscores and hyphens.
+  digits, underscores and hyphens — a dot is rejected by the article changeset, so a tag \
+  carrying one is dropped.
 
   Reply with a single compact JSON object with exactly one key, "tags", whose value is an \
   array of strings. Output nothing except that JSON object.\

@@ -30,20 +30,17 @@ defmodule Loopctl.Release do
   """
   def migrate do
     load_app()
+    configure_migration_connections()
 
     # Run migrations from priv/repo/migrations/ using AdminRepo.
     # AdminRepo has BYPASSRLS privilege needed for RLS policy DDL.
     # We specify the path explicitly because AdminRepo defaults to
     # priv/admin_repo/migrations/ but all migrations live in priv/repo/.
     {:ok, _, _} =
-      Ecto.Migrator.with_repo(
-        Loopctl.AdminRepo,
-        fn repo ->
-          path = Ecto.Migrator.migrations_path(Loopctl.Repo)
-          Ecto.Migrator.run(repo, path, :up, all: true)
-        end,
-        migration_connection_opts()
-      )
+      Ecto.Migrator.with_repo(Loopctl.AdminRepo, fn repo ->
+        path = Ecto.Migrator.migrations_path(Loopctl.Repo)
+        Ecto.Migrator.run(repo, path, :up, all: true)
+      end)
   end
 
   @doc """
@@ -68,12 +65,55 @@ defmodule Loopctl.Release do
   is a short-lived release process whose whole job is to hold one lock for the duration, and
   it is the one caller for which the guard is wrong.
 
+  ## Why it is `after_connect` on the REPO CONFIG and not an option to the migrator
+
+  `Ecto.Migrator.with_repo/3` reads exactly TWO keys out of its `opts` — `:mode` and
+  `:pool_size` — and then starts the repo with `repo.start_link(pool_size: pool_size)`
+  (ecto_sql 3.13, `ensure_repo_started/2`). Anything else handed to it, `parameters:`
+  included, is DISCARDED without a word, so the setting has to be on the config the
+  migrator starts the repo FROM. `configure_migration_connections/0` merges it there,
+  in the eval process only, before `with_repo` runs.
+
+  A startup `parameters:` entry would be the wrong shape besides: pgbouncer rejects an
+  unknown startup parameter with `08P01` (see `config/runtime.exs`, and the same reason
+  `HeavyRead` applies its `statement_timeout` per read rather than at connect). A plain
+  `SET` on an established connection is accepted by pgbouncer in any pool mode.
+
+  ## What this depends on, and what to reach for if it fails again
+
+  Accepted is not the same as PERSISTENT. This is a SESSION-level `SET`, so it holds for the
+  migrator's advisory-lock transaction under **session** pooling — which is what Fly MPG
+  documents as its default (`docs/runbooks/knowledge-scale.md`, "VERIFY the live pgbouncer
+  config"). Under **transaction** pooling a session `SET` lands on whichever server backend
+  served that one implicit transaction, and the lock transaction may open on another. If a
+  release ever dies with `FATAL 25P03` again, read `pool_mode` from the pgbouncer admin
+  console FIRST: the lever for a GUC that must survive a checkout there is a role-scoped
+  `ALTER ROLE`, exactly as the runbook prescribes for `hnsw.ef_search`, not a bigger `SET`.
+
   Public so the setting is assertable — the behaviour it prevents needs a migration slower
   than the server timeout to reproduce, which no test suite should manufacture.
   """
   @spec migration_connection_opts() :: keyword()
   def migration_connection_opts,
-    do: [parameters: [idle_in_transaction_session_timeout: "0"]]
+    do: [
+      after_connect: {Postgrex, :query!, ["SET idle_in_transaction_session_timeout = 0", []]}
+    ]
+
+  @doc false
+  # The config the migrator's repo is started FROM: AdminRepo's own config plus
+  # `migration_connection_opts/0`. Split out of the writer below so a test can assert the
+  # MERGE — where the setting actually has to land — without mutating application env.
+  @spec migration_repo_config(keyword()) :: keyword()
+  def migration_repo_config(config),
+    do: Keyword.merge(config, migration_connection_opts())
+
+  # Merges `migration_connection_opts/0` into AdminRepo's application config so the repo the
+  # migrator starts inherits it. Scoped to this OS process: the release `eval` node exits
+  # when the command returns, and serving nodes never run this.
+  defp configure_migration_connections do
+    config = Application.get_env(@app, AdminRepo, [])
+    Application.put_env(@app, AdminRepo, migration_repo_config(config))
+  end
 
   @doc """
   Rolls back the last migration using AdminRepo.
@@ -81,15 +121,13 @@ defmodule Loopctl.Release do
   def rollback(version) do
     load_app()
 
+    configure_migration_connections()
+
     {:ok, _, _} =
-      Ecto.Migrator.with_repo(
-        Loopctl.AdminRepo,
-        fn repo ->
-          path = Ecto.Migrator.migrations_path(Loopctl.Repo)
-          Ecto.Migrator.run(repo, path, :down, to: version)
-        end,
-        migration_connection_opts()
-      )
+      Ecto.Migrator.with_repo(Loopctl.AdminRepo, fn repo ->
+        path = Ecto.Migrator.migrations_path(Loopctl.Repo)
+        Ecto.Migrator.run(repo, path, :down, to: version)
+      end)
   end
 
   @doc """

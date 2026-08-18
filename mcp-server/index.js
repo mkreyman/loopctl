@@ -6508,8 +6508,9 @@ const TOOLS = [
       "Disposition (unit: SEARCH CALLS): searches_with_follow_through, " +
       "searches_reformulated and searches_quiet PARTITION searches. Treating every " +
       "not-opened search as a failure is wrong — an agent answered by the result snippet " +
-      "correctly opens nothing, and that is a success. A reformulation (same key, different " +
-      "query, in-window, nothing opened) is the one unambiguous failure, so it is split out; " +
+      "correctly opens nothing, and that is a success. A reformulation (same key, a LATER " +
+      "SEARCH CALL in-window, nothing opened — compared on search identity, so a verbatim " +
+      "retry counts) is the closest thing to an unambiguous failure, so it is split out; " +
       "what remains is `quiet` and is STILL a mixture of 'snippet sufficed' and 'rows " +
       "ignored'. This surface does not separate them — do not read quiet as either.",
     inputSchema: {

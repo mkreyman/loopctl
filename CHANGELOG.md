@@ -154,8 +154,10 @@ All notable changes to loopctl are documented here.
   `POST /api/v1/recall`, so the injected recall hook gets it too. Additive: consumers that
   ignore `snippet_source` are unaffected, but one that used the ABSENCE of `snippet` to
   detect a semantic-only hit should now read `snippet_source == "lead"`. The fill is
-  bounded to the returned page and runs on the HeavyRead pool, never AdminRepo, and sheds
-  under load — a shed backfill costs a snippet, never a result.
+  bounded to the returned page and runs on the HeavyRead pool, which sheds under load — a
+  shed backfill costs a snippet, never a result. System-scope canonicals are the one
+  exception: their NULL `tenant_id` cannot satisfy the heavy-read tenant guard, so those
+  bodies are read through AdminRepo, and only for the ids the tenant-scoped read left.
 
 - **A read now records WHICH search surfaced it**, on two new
   `article_access_events` columns (`origin_search_id`, `origin_attribution`) resolved
@@ -177,12 +179,16 @@ All notable changes to loopctl are documented here.
   from "surfaced and ignored" — close to its opposite. Unit warning: these count READS,
   while `followed_through` counts SURFACED RESULTS later opened; they are not comparable and
   neither replaces the other, so the existing series is unchanged and remains valid across
-  this migration.
+  this migration. Both open counters drop reads whose SURFACING search declared an infra
+  entrypoint (`smoke`, `skill-eval`), so they describe the same population as
+  `searched`/`searches` rather than a wider one.
 
   `searches_with_follow_through` / `searches_reformulated` / `searches_quiet` now partition
   `searches`. Treating every not-opened search as a failure is wrong — an agent answered by
-  the result snippet correctly opens nothing, and that is a success. A reformulation is the
-  one unambiguous failure in that bucket, so it is split out; `quiet` is STILL a mixture of
+  the result snippet correctly opens nothing, and that is a success. A reformulation — the
+  same key issuing a LATER SEARCH CALL in the window, having opened nothing (compared on
+  search identity, so a verbatim retry counts) — is the closest thing to an unambiguous
+  failure in that bucket, so it is split out; `quiet` is STILL a mixture of
   "the snippet sufficed" and "the rows were ignored", and this release does not separate
   them.
 

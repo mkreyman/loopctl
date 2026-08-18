@@ -67,6 +67,15 @@ defmodule Loopctl.Workers.DraftDuplicateSweepWorkerTest do
     AdminRepo.one(from(a in Article, where: a.id == ^id, select: a.status))
   end
 
+  defp long_ago do
+    days = Application.get_env(:loopctl, :audit_retention_days, 90)
+    DateTime.add(DateTime.utc_now(), -(days + 7) * 86_400, :second)
+  end
+
+  defp age(id, sets) do
+    AdminRepo.update_all(from(a in Article, where: a.id == ^id), set: sets)
+  end
+
   describe "retiring published duplicates" do
     test "archives a draft whose nearest published neighbour clears the threshold" do
       tenant = fixture(:tenant)
@@ -181,6 +190,46 @@ defmodule Loopctl.Workers.DraftDuplicateSweepWorkerTest do
       assert status_of(draft.id) == :draft,
              "consolidation chose a REVERSIBLE retraction; this worker must not convert " <>
                "it into a terminal one a week later"
+    end
+
+    test "a draft created before the audit retention window is left alone" do
+      # The exemption above is read out of `audit_log`, which `AuditPartitionWorker` DROPs
+      # partition-by-partition past `:audit_retention_days` — while this worker runs weekly
+      # forever and the drafts it protects live forever. Judging an aged draft on evidence
+      # that may already be gone archived the whole aged cohort of consolidation retractions
+      # at once, through a door with no way back. Past the horizon the sweep fails CLOSED.
+      tenant = fixture(:tenant)
+      vector = unit_vector(0)
+
+      _published = tenant.id |> article(:published) |> then(&embed(tenant.id, &1, vector))
+      draft = tenant.id |> article(:draft) |> then(&embed(tenant.id, &1, vector))
+
+      age(draft.id, inserted_at: long_ago(), updated_at: long_ago())
+
+      assert :ok = perform_job(DraftDuplicateSweepWorker, %{"tenant_id" => tenant.id})
+
+      assert status_of(draft.id) == :draft,
+             "past the audit horizon the exemption cannot be proved, so nothing is archived"
+    end
+
+    test "an EDIT does not re-arm the archive for a draft whose evidence has aged out" do
+      # `updated_at` was the wrong clock: it advances on every ordinary write, so one
+      # `knowledge_update` on a draft consolidation retracted months ago put it back in the
+      # candidate set with its `article.unpublished` partition already dropped — the sweep
+      # then found no evidence to spare it with and archived it terminally. Creation is the
+      # clock that cannot move after the retraction it stands in for.
+      tenant = fixture(:tenant)
+      vector = unit_vector(0)
+
+      _published = tenant.id |> article(:published) |> then(&embed(tenant.id, &1, vector))
+      draft = tenant.id |> article(:draft) |> then(&embed(tenant.id, &1, vector))
+
+      age(draft.id, inserted_at: long_ago(), updated_at: DateTime.utc_now())
+
+      assert :ok = perform_job(DraftDuplicateSweepWorker, %{"tenant_id" => tenant.id})
+
+      assert status_of(draft.id) == :draft,
+             "a recent edit must not re-open the one-way door on evidence that is gone"
     end
 
     test "still archives an identical draft that consolidation did NOT retract" do
