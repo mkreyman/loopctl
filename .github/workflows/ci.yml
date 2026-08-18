@@ -785,12 +785,18 @@ jobs:
           #
           # Skip `apt-get update` when the package is already installed: the cached case is
           # the common one on a self-hosted runner, and it is the update that hangs.
+          # Try the INSTALL FIRST, from whatever package lists the runner already has.
+          # `update && install` means an unreachable mirror takes the install down with it,
+          # even when the cached lists were perfectly sufficient — observed 2026-08-18 on
+          # master, where azure.archive.ubuntu.com went dark, every `apt-get update` burned
+          # its full 180s timeout, and the deploy was blocked by a package that was one
+          # cached-list install away. Only refresh the lists when the install actually fails.
           if ! command -v pgbouncer >/dev/null; then
             for attempt in 1 2 3; do
-              timeout 180 sudo apt-get update \
-                && timeout 180 sudo apt-get install -y pgbouncer \
-                && break
-              echo "apt install attempt $attempt failed or timed out; retrying"; sleep 5
+              timeout 180 sudo apt-get install -y pgbouncer && break
+              echo "pgbouncer install attempt $attempt failed; refreshing lists"
+              timeout 180 sudo apt-get update || echo "apt-get update failed; retrying install anyway"
+              sleep 5
             done
           fi
           command -v pgbouncer >/dev/null || { echo "pgbouncer install failed after retries"; exit 1; }
@@ -1140,12 +1146,14 @@ jobs:
         # Skip entirely when jq is there (the normal case on a self-hosted runner), and bound
         # each apt call so a hang becomes a failure the retry can act on.
         run: |
+          # Install first from cached lists; refresh only if that fails. See the pgbouncer
+          # step for why `update && install` is the wrong order when a mirror goes dark.
           if ! command -v jq >/dev/null; then
             for attempt in 1 2 3; do
-              timeout 180 sudo apt-get update \
-                && timeout 180 sudo apt-get install -y jq \
-                && break
-              echo "apt install attempt $attempt failed or timed out; retrying"; sleep 5
+              timeout 180 sudo apt-get install -y jq && break
+              echo "jq install attempt $attempt failed; refreshing lists"
+              timeout 180 sudo apt-get update || echo "apt-get update failed; retrying install anyway"
+              sleep 5
             done
           fi
           command -v jq >/dev/null || { echo "jq install failed after retries"; exit 1; }
@@ -1214,12 +1222,14 @@ jobs:
         # Skip entirely when jq is there (the normal case on a self-hosted runner), and bound
         # each apt call so a hang becomes a failure the retry can act on.
         run: |
+          # Install first from cached lists; refresh only if that fails. See the pgbouncer
+          # step for why `update && install` is the wrong order when a mirror goes dark.
           if ! command -v jq >/dev/null; then
             for attempt in 1 2 3; do
-              timeout 180 sudo apt-get update \
-                && timeout 180 sudo apt-get install -y jq \
-                && break
-              echo "apt install attempt $attempt failed or timed out; retrying"; sleep 5
+              timeout 180 sudo apt-get install -y jq && break
+              echo "jq install attempt $attempt failed; refreshing lists"
+              timeout 180 sudo apt-get update || echo "apt-get update failed; retrying install anyway"
+              sleep 5
             done
           fi
           command -v jq >/dev/null || { echo "jq install failed after retries"; exit 1; }
