@@ -51,6 +51,46 @@ defmodule Loopctl.Knowledge.ProvenanceTags do
               chapter- part-
             ) ++ [IdempotencyTag.reserved_prefix()]
 
+  # Whole tags that describe an article's FORMAT or SOURCE TYPE rather than its subject.
+  # Distinct from the prefixes above, which are opaque per-source ids: these are ordinary
+  # words that are simply not what an article is ABOUT. `KnowledgeMocWorker` has excluded
+  # them from hub topics since it was written; the re-tagger needs the same answer, because
+  # showing a model `reference, document, pdf, book, youtube` as the vocabulary to PREFER
+  # teaches it to tag format instead of subject. Measured 2026-08-18: those five were the
+  # top of the hosted corpus's most-used tags, and a verification run of the backfill added
+  # `document` and `code` to articles because of it.
+  @structural ~w(
+                hub moc reference document documents doc book books code repo repository
+                web web-article webpage url file pdf md markdown html htm xml docx txt text
+                epub csv json yaml image png jpg jpeg gif svg video audio youtube newsletter
+                manual agent session_log session-log skill ingestion review_finding
+                review-finding readme gdrive gdoc gsheet onedrive dropbox notion confluence
+                chunk page unknown untagged uncategorized misc miscellaneous general other
+                none na tbd todo
+              )
+
+  @doc """
+  Whole tags naming an article's format or source type rather than its subject.
+
+  Consumers: `KnowledgeMocWorker` (a hub called `Index: pdf` is noise) and
+  `TagBackfillWorker`'s vocabulary (a model told to prefer `pdf` will tag format).
+  """
+  @spec structural() :: [String.t()]
+  def structural, do: @structural
+
+  @doc """
+  Whether a tag names a SUBJECT — neither a provenance id nor a structural descriptor.
+
+  The single predicate both consumers should use, so a tag cannot be topical to one and not
+  the other.
+  """
+  @spec topical?(String.t()) :: boolean()
+  def topical?(tag) when is_binary(tag) do
+    tag not in @structural and not Enum.any?(@prefixes, &String.starts_with?(tag, &1))
+  end
+
+  def topical?(_tag), do: false
+
   @doc "The provenance/chunk-coordinate tag prefixes, each including its trailing hyphen."
   @spec prefixes() :: [String.t()]
   def prefixes, do: @prefixes

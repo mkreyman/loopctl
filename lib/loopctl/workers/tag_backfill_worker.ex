@@ -131,13 +131,24 @@ defmodule Loopctl.Workers.TagBackfillWorker do
 
   Ordered by usage on purpose. Showing a model the whole 60,141-tag vocabulary would be both
   enormous and useless — the point is to offer the tags that already GROUP things, and a tag
-  used once groups nothing. Provenance families are excluded because they name a source
-  rather than a subject and must never be suggested for an article that did not come from it.
+  used once groups nothing.
+
+  **NON-TOPICAL tags are excluded, and that exclusion is the difference between this working
+  and actively harming the corpus.** Provenance families name a source rather than a subject.
+  STRUCTURAL tags name a format: measured 2026-08-18, the hosted corpus's most-used tags
+  began `reference, document, pdf, book, youtube` — so an unfiltered vocabulary teaches the
+  model to tag FORMAT instead of SUBJECT, which is the opposite of the point. A verification
+  run against production with the unfiltered list added `document` and `code` to real
+  articles before this was caught.
   """
   @spec established_vocabulary(Ecto.UUID.t(), pos_integer()) :: [String.t()]
   def established_vocabulary(tenant_id, limit \\ 150) do
     pattern = ProvenanceTags.sql_pattern()
 
+    # Over-fetch, then filter structural tags in Elixir against the SAME predicate the MOC
+    # worker uses. Passing the ~70-item list as a SQL array would work too, but then the
+    # two consumers would agree only by coincidence — `ProvenanceTags.topical?/1` is the one
+    # definition, and it cannot drift from itself.
     """
     SELECT tag FROM (
       SELECT unnest(tags) AS tag FROM articles
@@ -148,10 +159,13 @@ defmodule Loopctl.Workers.TagBackfillWorker do
     ORDER BY count(*) DESC, tag
     LIMIT $3
     """
-    |> AdminRepo.query([Ecto.UUID.dump!(tenant_id), pattern, limit])
+    |> AdminRepo.query([Ecto.UUID.dump!(tenant_id), pattern, limit * 3])
     |> case do
-      {:ok, %{rows: rows}} -> Enum.map(rows, &hd/1)
-      {:error, _} -> []
+      {:ok, %{rows: rows}} ->
+        rows |> Enum.map(&hd/1) |> Enum.filter(&ProvenanceTags.topical?/1) |> Enum.take(limit)
+
+      {:error, _} ->
+        []
     end
   end
 
