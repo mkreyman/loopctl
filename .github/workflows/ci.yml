@@ -1131,7 +1131,24 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
+        # Same hang #699 fixed for pgbouncer, in a step that had no retry at all: apt blocks
+        # on a dpkg lock held by unattended-upgrades or on an unresponsive mirror, never
+        # returns, and the job dies on its timeout. Observed 2026-08-17 on PR #702, where
+        # `Install jq` sat pending for ~25 minutes and blocked the merge — with jq ALREADY
+        # PRESENT on the runner, so the update was pure cost.
+        #
+        # Skip entirely when jq is there (the normal case on a self-hosted runner), and bound
+        # each apt call so a hang becomes a failure the retry can act on.
+        run: |
+          if ! command -v jq >/dev/null; then
+            for attempt in 1 2 3; do
+              timeout 180 sudo apt-get update \
+                && timeout 180 sudo apt-get install -y jq \
+                && break
+              echo "apt install attempt $attempt failed or timed out; retrying"; sleep 5
+            done
+          fi
+          command -v jq >/dev/null || { echo "jq install failed after retries"; exit 1; }
 
       - name: Run smoke against the live release
         env:
@@ -1188,7 +1205,24 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
+        # Same hang #699 fixed for pgbouncer, in a step that had no retry at all: apt blocks
+        # on a dpkg lock held by unattended-upgrades or on an unresponsive mirror, never
+        # returns, and the job dies on its timeout. Observed 2026-08-17 on PR #702, where
+        # `Install jq` sat pending for ~25 minutes and blocked the merge — with jq ALREADY
+        # PRESENT on the runner, so the update was pure cost.
+        #
+        # Skip entirely when jq is there (the normal case on a self-hosted runner), and bound
+        # each apt call so a hang becomes a failure the retry can act on.
+        run: |
+          if ! command -v jq >/dev/null; then
+            for attempt in 1 2 3; do
+              timeout 180 sudo apt-get update \
+                && timeout 180 sudo apt-get install -y jq \
+                && break
+              echo "apt install attempt $attempt failed or timed out; retrying"; sleep 5
+            done
+          fi
+          command -v jq >/dev/null || { echo "jq install failed after retries"; exit 1; }
 
       # LOOPCTL_SMOKE_KEY MUST be a LOW-PRIVILEGE READ key (agent role is enough):
       # smoke.sh issues only read-only requests, and CI secrets should carry the
