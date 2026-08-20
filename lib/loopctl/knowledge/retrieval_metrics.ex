@@ -176,6 +176,39 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
 
   @default_window_seconds 1800
 
+  # WHICH SET OF DEFINITIONS PRODUCED A ROW.
+  #
+  # Stamped on every snapshot and published in the series. Three changes have already altered
+  # what a figure here MEANS, each forward-looking, each leaving no mark on the row:
+  #
+  #   * #582 redefined `searched` from search CALLS to recorded surfaced RESULTS;
+  #   * #673 began excluding infrastructure traffic, so days either side are not comparable;
+  #   * #711 rescoped the disposition trio onto `searches_scored` and fixed a reformulation
+  #     predicate that had been measuring search density.
+  #
+  # A session comparing across one of those boundaries is comparing DEFINITIONS, not days, and
+  # nothing in the data let it notice. That is the machine that manufactures "numbers that
+  # don't make sense", and this column is the mark that stops it.
+  #
+  # BUMP THIS whenever you change what an existing figure means, add one, remove one, or
+  # rename one — then RE-SNAPSHOT the affected days, or accept that the series carries two
+  # definitions and say so. `retrieval_metrics_test.exs` pins the version against the exact
+  # key set `compute/3` returns, so a SHAPE change cannot land without a bump. A change of
+  # MEANING that keeps the same keys — #711 was exactly that — is not mechanically detectable,
+  # so it is on you: if a reader would draw a different conclusion from the same number, bump.
+  #
+  #   v0  rows predating this column. Definitions unknown; do not compare them with v1+.
+  #   v1  post-#711/#712/#713: disposition trio partitions `searches_scored`; no curated /
+  #       retrieved provenance breakdown; reads and impressions separated on the analytics
+  #       surfaces.
+  @metric_version 1
+
+  @doc """
+  The definition-set version stamped on snapshots written by this code. See `@metric_version`.
+  """
+  @spec metric_version() :: pos_integer()
+  def metric_version, do: @metric_version
+
   # `"search"` access rows are ALSO written by the query-less enumeration paths —
   # `Knowledge.list_filtered/2` (mode `"list"`) and `Knowledge.list_keyset/2` (mode
   # `"list_keyset"`). They belong in `searched` (they did surface results) but NOT in the
@@ -687,6 +720,7 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
       searches_scored_with_follow_through: m.searches_scored_with_follow_through,
       searches_reformulated: m.searches_reformulated,
       searches_quiet: m.searches_quiet,
+      metric_version: @metric_version,
       computed_at: DateTime.utc_now()
     }
 
@@ -710,6 +744,7 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
            :searches_scored_with_follow_through,
            :searches_reformulated,
            :searches_quiet,
+           :metric_version,
            :computed_at,
            :updated_at
          ]},
@@ -774,7 +809,12 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
           searches_scored: s.searches_scored,
           searches_scored_with_follow_through: s.searches_scored_with_follow_through,
           searches_reformulated: s.searches_reformulated,
-          searches_quiet: s.searches_quiet
+          searches_quiet: s.searches_quiet,
+
+          # Which set of definitions produced this row. Rows are comparable only WITHIN a
+          # version: a change here means a figure's meaning changed, not that the world did.
+          # `0` predates the stamp and its definitions are unknown.
+          metric_version: s.metric_version
         }
       )
       |> AdminRepo.all()

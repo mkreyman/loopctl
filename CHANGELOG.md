@@ -4,6 +4,31 @@ All notable changes to loopctl are documented here.
 
 ## [Unreleased] — 2026-08-07 — Story lifecycle capability delivery
 
+### Added
+
+- **`metric_version` on retrieval-metric snapshots** (migration `20260820030000`, additive,
+  `default 0`, no manual step). Every row now records which set of definitions produced it,
+  and the value is published in the series payload.
+
+  Three changes have already altered what a figure in this table *means*, each
+  forward-looking and each leaving no mark on the row: `searched` was redefined from search
+  calls to recorded surfaced results, infrastructure traffic began being excluded, and the
+  disposition trio was rescoped onto `searches_scored`. A reader comparing across one of those
+  boundaries was comparing definitions rather than days, with nothing in the data to reveal
+  it. That is the mechanism behind every "these numbers don't make sense" report this table
+  has produced.
+
+  **Compare rows only within a version.** Existing rows report `0` — "written before the
+  stamp, definitions unknown" — and are deliberately **not** backfilled to `1`, because
+  claiming they were computed under current definitions is the exact false confidence the
+  column exists to remove.
+
+  The bump is enforced as far as it mechanically can be: a test pins the current version
+  against the exact key set `compute/3` returns, so a field cannot be added, removed or
+  renamed without failing. A change of *meaning* that keeps the same keys is not detectable
+  that way, so the rule is written at the definition site: if a reader would draw a different
+  conclusion from the same number, bump the version and re-snapshot the affected days.
+
 ### Changed
 
 - **The KB analytics surfaces now count READS, not impressions — and several payload keys are
