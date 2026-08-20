@@ -208,6 +208,80 @@ defmodule Loopctl.Knowledge.StructuralLinksTest do
     end
   end
 
+  describe "adopting the hub the extraction pipeline already made" do
+    test "an existing hub-tagged sibling becomes the star centre, and nothing is minted" do
+      tenant = fixture(:tenant)
+
+      # This is the real corpus shape: every extraction skill emits "hub + atomic notes",
+      # so the source already has a hub carrying its actual NAME. Minting beside it would
+      # put "Source: book 6a3020c2cd15" next to "Advanced Cypher Concepts".
+      existing =
+        article(tenant, ["book-adopt", "hub"], %{title: "Advanced Cypher Concepts"})
+
+      members = for _ <- 1..3, do: article(tenant, ["book-adopt"])
+
+      assert {:ok, report} = StructuralLinks.harvest(tenant.id)
+
+      assert report.hubs_adopted == 1
+      assert report.hubs_created == 0
+      assert hubs(tenant.id) == [], "no synthetic hub_kind article should exist"
+
+      edges = links(tenant.id, :derived_from)
+      assert Enum.all?(edges, &(&1.target == existing.id))
+      assert length(edges) == 3
+      assert MapSet.new(edges, & &1.source) == MapSet.new(members, & &1.id)
+    end
+
+    test "the adopted hub is never linked to itself" do
+      tenant = fixture(:tenant)
+      existing = article(tenant, ["book-adopt2", "hub"], %{title: "Real Title"})
+      for _ <- 1..3, do: article(tenant, ["book-adopt2"])
+
+      assert {:ok, _} = StructuralLinks.harvest(tenant.id)
+
+      refute Enum.any?(links(tenant.id, :derived_from), &(&1.source == existing.id))
+    end
+
+    test "adoption is idempotent and picks the same hub on a re-run" do
+      tenant = fixture(:tenant)
+      existing = article(tenant, ["book-adopt3", "hub"], %{title: "Stable"})
+      for _ <- 1..3, do: article(tenant, ["book-adopt3"])
+
+      assert {:ok, first} = StructuralLinks.harvest(tenant.id)
+      assert {:ok, second} = StructuralLinks.harvest(tenant.id)
+
+      assert first.edges_created == 3
+      assert second.edges_created == 0
+      assert second.hubs_adopted == 1
+
+      assert Enum.all?(links(tenant.id, :derived_from), &(&1.target == existing.id))
+    end
+
+    test "a source with no existing hub still mints one" do
+      tenant = fixture(:tenant)
+      for _ <- 1..3, do: article(tenant, ["book-nohub"])
+
+      assert {:ok, report} = StructuralLinks.harvest(tenant.id)
+
+      assert report.hubs_created == 1
+      assert report.hubs_adopted == 0
+      assert [_minted] = hubs(tenant.id)
+    end
+
+    test "a hub tag belonging to a DIFFERENT source is not adopted" do
+      tenant = fixture(:tenant)
+      # A hub for another book must not become this book's centre just by carrying "hub".
+      article(tenant, ["book-other", "hub"], %{title: "Someone Else's Book"})
+      for _ <- 1..3, do: article(tenant, ["book-mine"])
+
+      assert {:ok, report} = StructuralLinks.harvest(tenant.id)
+
+      assert report.hubs_created == 1, "book-mine had no hub of its own, so one is minted"
+      [minted] = hubs(tenant.id)
+      assert Enum.all?(links(tenant.id, :derived_from), &(&1.target == minted.id))
+    end
+  end
+
   describe "the hub is reachable, but does not rank" do
     test "AC-42.1.8: knowledge_get surfaces the hub from a member, and members from the hub" do
       tenant = fixture(:tenant)

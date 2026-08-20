@@ -174,27 +174,62 @@ defmodule Loopctl.Knowledge.StructuralLinks do
       {:ok, hub, :resolved} ->
         write_edges(tenant_id, hub, members, %{acc | hubs_resolved: acc.hubs_resolved + 1})
 
+      {:ok, hub, :adopted} ->
+        write_edges(tenant_id, hub, members, %{acc | hubs_adopted: acc.hubs_adopted + 1})
+
       {:error, reason} ->
         Logger.warning("structural_links: hub failed for #{source}: #{inspect(reason)}")
         %{acc | hub_failures: acc.hub_failures + 1}
     end
   end
 
+  # Three steps, in this order, and the middle one is the point.
+  #
+  # Most sources ALREADY HAVE A HUB. Every extraction skill produces one — `book-`,
+  # `doc-`, `yt-` and `repo-` captures each emit "hub + atomic notes" — and that hub
+  # carries the source's REAL name ("Advanced Cypher Concepts", not
+  # "book-6a3020c2cd15"). Minting our own beside it would put a digest-named rival next
+  # to a well-named article that is already there, and doing that weekly across every
+  # tenant would quietly double the hub population. So: adopt what exists, mint only
+  # where nothing does.
+  #
+  # Adoption keys off the `hub` TAG, and tags are agent-writable via knowledge_update —
+  # which is exactly why `KnowledgeMocWorker` keys its own hubs off an idempotency_key
+  # instead. The weaker signal is acceptable HERE and not there: the choice is only ever
+  # between articles inside one tenant's own source group, the effect is which sibling
+  # becomes the centre of a navigational star, and nothing is destroyed either way.
+  # Selection is oldest-first so a re-run is stable rather than racing ties.
   defp resolve_or_create_hub(tenant_id, source) do
     key = hub_idempotency_key(source)
 
-    case AdminRepo.one(
-           from(a in Article,
-             where: a.tenant_id == ^tenant_id and a.idempotency_key == ^key,
-             select: a
-           )
-         ) do
-      %Article{} = hub ->
-        {:ok, hub, :resolved}
-
-      nil ->
-        create_hub(tenant_id, source, key)
+    cond do
+      hub = minted_hub(tenant_id, key) -> {:ok, hub, :resolved}
+      hub = existing_source_hub(tenant_id, source) -> {:ok, hub, :adopted}
+      true -> create_hub(tenant_id, source, key)
     end
+  end
+
+  defp minted_hub(tenant_id, key) do
+    AdminRepo.one(
+      from(a in Article,
+        where: a.tenant_id == ^tenant_id and a.idempotency_key == ^key,
+        select: a
+      )
+    )
+  end
+
+  defp existing_source_hub(tenant_id, source) do
+    AdminRepo.one(
+      from(a in Article,
+        where: a.tenant_id == ^tenant_id,
+        where: a.status == :published,
+        where: ^source in a.tags,
+        where: "hub" in a.tags,
+        order_by: [asc: a.inserted_at, asc: a.id],
+        limit: 1,
+        select: a
+      )
+    )
   end
 
   defp create_hub(tenant_id, source, key) do
@@ -308,6 +343,7 @@ defmodule Loopctl.Knowledge.StructuralLinks do
     %{
       hubs_created: 0,
       hubs_resolved: 0,
+      hubs_adopted: 0,
       hub_failures: 0,
       edges_created: 0,
       sources_below_floor: length(skipped),
@@ -321,6 +357,7 @@ defmodule Loopctl.Knowledge.StructuralLinks do
   defp log_report(tenant_id, report) do
     Logger.info(
       "structural_links: tenant=#{tenant_id} hubs_created=#{report.hubs_created} " <>
+        "hubs_adopted=#{report.hubs_adopted} " <>
         "hubs_resolved=#{report.hubs_resolved} edges_created=#{report.edges_created} " <>
         "sources_below_floor=#{report.sources_below_floor} " <>
         "articles_without_source=#{report.articles_without_source} " <>
