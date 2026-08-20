@@ -173,6 +173,7 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   alias Loopctl.AdminRepo
   alias Loopctl.Knowledge.ArticleAccessEvent
   alias Loopctl.Knowledge.RetrievalMetricSnapshot
+  alias Loopctl.Tenants.Tenant
 
   @default_window_seconds 1800
 
@@ -470,6 +471,108 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   # the still-unopened rows of a search that WAS followed through — counting it in two
   # buckets at once, and (because `quiet` is the remainder) silently zeroing the bucket the
   # genuinely quiet searches belong to. So the opened SEARCH IDS are subtracted as a set.
+  @doc """
+  One row PER TENANT for a single day — the cross-tenant BREAKDOWN, never a cross-tenant total.
+
+  Superadmin-only, and the shape is the point. Each tenant's KB is a different corpus with a
+  different size, subject mix and traffic profile, so a figure summed or averaged across them
+  describes no corpus that exists: a 2% read rate over 79,000 articles and a 40% read rate
+  over 30 says nothing when blended, and the blend hides exactly the account you were trying
+  to find. This function therefore returns ROWS and deliberately reports no aggregate — the
+  operator question it exists to answer is "WHICH tenant's KB is unhealthy", which only a
+  breakdown can answer.
+
+  **Do not add a totals row, a mean, or a `summary` key to this payload.** If a caller wants a
+  platform-wide number, that is a different question about a different unit (the platform, not
+  a KB) and belongs in `Tenants.system_stats/0`, which counts inventory rather than quality.
+
+  Tenants with no snapshot for `day` are INCLUDED with `snapshot: nil` rather than omitted.
+  A tenant that recorded nothing is a finding — a KB nobody queried, or a broken ingest — and
+  dropping it makes the most interesting row invisible. `active_only: false` additionally
+  includes suspended/deactivated tenants.
+
+  Rows carry their own `metric_version`, and they can DIFFER across tenants in the same
+  response: a tenant not re-snapshotted since a definition change still carries the older one.
+  Compare a column across tenants only where the versions match.
+
+  Opts: `:day` (default: yesterday, the day the nightly worker snapshots),
+  `:window_seconds`, `:active_only` (default `true`).
+  """
+  @spec tenant_breakdown(keyword()) :: %{rows: [map()], meta: map()}
+  def tenant_breakdown(opts \\ []) do
+    day = Keyword.get(opts, :day) || Date.add(Date.utc_today(), -1)
+    window = Keyword.get(opts, :window_seconds, @default_window_seconds)
+    active_only = Keyword.get(opts, :active_only, true)
+
+    tenants =
+      Tenant
+      |> scope_tenants_by_status(active_only)
+      |> order_by([t], asc: t.name)
+      |> select([t], %{id: t.id, name: t.name, status: t.status})
+      |> AdminRepo.all()
+
+    snapshots =
+      from(s in RetrievalMetricSnapshot,
+        where: s.day == ^day,
+        where: s.window_seconds == ^window
+      )
+      |> AdminRepo.all()
+      |> Map.new(fn s -> {s.tenant_id, s} end)
+
+    rows =
+      Enum.map(tenants, fn t ->
+        %{
+          tenant_id: t.id,
+          tenant_name: t.name,
+          tenant_status: t.status,
+          snapshot: snapshots |> Map.get(t.id) |> present_snapshot()
+        }
+      end)
+
+    %{
+      rows: rows,
+      meta: %{
+        day: day,
+        window_seconds: window,
+        active_only: active_only,
+        tenant_count: length(rows),
+        # Stated in the payload, not only in the docs, because the shape is what stops a
+        # reader summing it: this is a breakdown, and a cross-tenant total of a per-corpus
+        # rate is meaningless.
+        aggregation: :none,
+        note:
+          "One row per tenant. These figures are NOT summable or averageable across " <>
+            "tenants — each row describes a different corpus. Compare a column across rows " <>
+            "only where metric_version matches."
+      }
+    }
+  end
+
+  defp scope_tenants_by_status(query, true), do: where(query, [t], t.status == :active)
+  defp scope_tenants_by_status(query, _), do: query
+
+  defp present_snapshot(nil), do: nil
+
+  defp present_snapshot(%RetrievalMetricSnapshot{} = s) do
+    %{
+      searched: s.searched,
+      followed_through: s.followed_through,
+      precision: s.precision,
+      searches: s.searches,
+      searches_with_follow_through: s.searches_with_follow_through,
+      search_follow_through: s.search_follow_through,
+      searches_scored: s.searches_scored,
+      searches_scored_with_follow_through: s.searches_scored_with_follow_through,
+      searches_reformulated: s.searches_reformulated,
+      searches_quiet: s.searches_quiet,
+      attributed_opens: s.attributed_opens,
+      cross_key_opens: s.cross_key_opens,
+      direct_opens: s.direct_opens,
+      metric_version: s.metric_version,
+      computed_at: s.computed_at
+    }
+  end
+
   defp compute_dispositions(searched_q, window_seconds) do
     scoreable = reformulation_scoreable(searched_q)
 

@@ -673,8 +673,13 @@ defmodule LoopctlWeb.Router do
     post "/tenants/:id/suspend", AdminTenantController, :suspend
     post "/tenants/:id/activate", AdminTenantController, :activate
 
-    # System-wide stats
+    # System-wide stats — INVENTORY counts, which are summable across tenants.
     get "/stats", AdminStatsController, :show
+
+    # Per-tenant KB retrieval BREAKDOWN — deliberately NOT part of /stats above. Retrieval
+    # quality is per-corpus and does not sum across tenants; this returns one row per tenant
+    # and no totals. See AdminKnowledgeStatsController.
+    get "/knowledge/retrieval-metrics", AdminKnowledgeStatsController, :index
 
     # Cross-tenant audit log
     get "/audit", AdminAuditController, :index

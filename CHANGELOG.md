@@ -6,6 +6,31 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **`GET /api/v1/admin/knowledge/retrieval-metrics`** — per-tenant KB retrieval breakdown for
+  superadmins. One row per tenant for a single day, so an operator can see **which** account's
+  KB is unhealthy. Optional `day`, `window_seconds`, `active_only`; a malformed `day` or
+  `window_seconds` is a 400, never a silent fall back to the default window.
+
+  **It is a breakdown and deliberately never a roll-up, and the payload says so
+  (`meta.aggregation: "none"`).** Each tenant's KB is a different corpus with a different size
+  and traffic profile, so a total or mean across them describes no corpus that exists — a 2%
+  read rate over 79,000 articles blended with 40% over 30 is not a fact about either, and the
+  blend hides the account you were looking for. Platform-wide numbers stay in
+  `GET /api/v1/admin/stats`, which counts inventory (summable) rather than retrieval quality
+  (not).
+
+  Tenants with no snapshot for the day are **included** with `snapshot: null` rather than
+  omitted — a KB nobody queried, or a broken ingest, is a finding, and dropping the row hides
+  the most interesting one. Rows carry their own `metric_version` and these can differ within
+  one response, because a tenant not re-snapshotted since a definition change still carries
+  the older one; compare a column across tenants only where the versions match.
+
+  No new environment variables, and **no MCP tool**: cross-tenant reads are a superadmin
+  capability, and pinning a superadmin key into the agent-facing MCP config to make a stats
+  tool convenient would put a cross-tenant credential in every agent's reach. Call it with a
+  superadmin key directly.
+
+
 - **`metric_version` on retrieval-metric snapshots** (migration `20260820030000`, additive,
   `default 0`, no manual step). Every row now records which set of definitions produced it,
   and the value is published in the series payload.
