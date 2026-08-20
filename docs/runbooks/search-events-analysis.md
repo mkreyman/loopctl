@@ -154,13 +154,24 @@ time, and the metrics payload reports:
 | `attributed_opens` | READS | opens whose originating search is known |
 | `cross_key_opens` | READS | **the injected channel** — surfaced by one key, read by another |
 | `direct_opens` | READS | agent went straight to the article (link, cited id) — not a miss |
-| `searches_reformulated` | SEARCH CALLS | asked again, in-window, nothing opened — a real failure |
+| `searches_scored` | SEARCH CALLS | the base the three below partition — **not** `searches` |
+| `searches_scored_with_follow_through` | SEARCH CALLS | of those, the ones that opened something |
+| `searches_reformulated` | SEARCH CALLS | same SESSION asked a DIFFERENT question, in-window, nothing opened — a real failure |
 | `searches_quiet` | SEARCH CALLS | neither opened nor re-asked — **still ambiguous** |
 
 Two things to hold onto when reading them:
 
 - **Units differ from `followed_through`.** That counts SURFACED RESULTS later opened; the
   `*_opens` fields count READS. They are not comparable and neither supersedes the other.
+- **`searches - searches_scored` is `n/a`, not zero.** A search is scoreable for
+  reformulation only if it carries a session identity (stamped forward-looking, so every row
+  written before it shipped is unscoreable) and comes from a channel that can react to a
+  result — the recall hook and the session-start auto-query cannot, because each emits one
+  mechanically-distilled query per prompt and never sees what came back. Both remain in every
+  other denominator, precision included; only this one metric cannot see them. Scoring on
+  `api_key_id` instead is step 2's shared-key trap re-entered one metric later: two keys
+  search this system, the median gap between consecutive searches on one is 127 seconds, and
+  the figure that produced was 97% where the session-scoped one is 27%.
 - **`quiet` is not "sufficed".** Splitting `reformulated` out removes the one unambiguous
   failure from the not-opened bucket; it does NOT resolve the snippet-sufficed-vs-ignored
   ambiguity in step 4 below. Nothing here turns a floor into a satisfaction rate.
