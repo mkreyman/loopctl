@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://loopctl.com/schemas/user-story.schema.json",
   "title": "loopctl authored user story",
-  "description": "The shape of docs/user_stories/epic_N_name/us_N.M.json. This is the DECLARATION the user-story-writer skill emits against, and test/loopctl/user_story_schema_test.exs validates the committed corpus against it. It describes the AUTHORED FILE format, which is NOT the /api/v1 import payload (that one keys stories by `number`, not `id`). The two share the acceptance-criteria shape, and Loopctl.ImportExport enforces that half on the import path; the drift test binds the two so the shared half cannot diverge. Every rule below was DERIVED from all 240 committed stories on 2026-08-20, never invented: where the corpus is inconsistent this schema stays permissive and says so, because a schema that fails the corpus it describes is a schema nobody can turn on.",
+  "description": "The shape of docs/user_stories/epic_N_name/us_N.M.json. This is the DECLARATION the user-story-writer skill emits against, and test/loopctl/user_story_schema_test.exs validates the committed corpus against it. It describes the AUTHORED FILE format, which is NOT the /api/v1 import payload (that one keys stories by `number`, not `id`). The two share the acceptance-criteria shape, and Loopctl.ImportExport enforces that half on the import path; the drift test binds the two so the shared half cannot diverge. Every rule below was DERIVED from the committed corpus as it stood on 2026-08-20, never invented: where the corpus is inconsistent this schema stays permissive and says so, because a schema that fails the corpus it describes is a schema nobody can turn on.",
   "type": "object",
   "required": [
     "id",
@@ -36,7 +36,7 @@
     "priority": {
       "type": "string",
       "enum": ["critical", "high", "medium", "low"],
-      "description": "Enumerated because the corpus is already clean on this field: exactly these four values across all 240 stories."
+      "description": "Enumerated because the corpus was already clean on this field when the schema was derived (2026-08-20): these four values and no others."
     },
     "phase": { "type": "string", "minLength": 1 },
     "background": {
