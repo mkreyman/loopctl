@@ -80,6 +80,10 @@ defmodule Loopctl.Knowledge.RetrievalMetricSnapshot do
     field :searches_reformulated, :integer, default: 0
     field :searches_quiet, :integer, default: 0
 
+    # Which set of DEFINITIONS produced this row (see `RetrievalMetrics.@metric_version`).
+    # Rows are comparable only within a version. `0` predates the stamp.
+    field :metric_version, :integer, default: 0
+
     field :computed_at, :utc_datetime_usec
 
     timestamps(type: :utc_datetime_usec)
@@ -102,6 +106,7 @@ defmodule Loopctl.Knowledge.RetrievalMetricSnapshot do
     :searches_scored_with_follow_through,
     :searches_reformulated,
     :searches_quiet,
+    :metric_version,
     :computed_at
   ]
 

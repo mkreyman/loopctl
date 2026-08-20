@@ -391,7 +391,14 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
         "distilled query per prompt and never see what came back, so they cannot " <>
         "reformulate by construction. They remain in every other denominator on this " <>
         "surface, including precision. Read `searches - searches_scored` as n/a, never " <>
-        "as zero.",
+        "as zero.\n\n" <>
+        "COMPARE ROWS ONLY WITHIN A `metric_version`. Every row carries the version of the " <>
+        "definition set that produced it. Three changes have already altered what a figure " <>
+        "here MEANS — `searched` went from search calls to surfaced results, infrastructure " <>
+        "traffic began being excluded, and the disposition trio was rescoped — each " <>
+        "forward-looking and each previously leaving no mark on the row, so a series read " <>
+        "across one of those boundaries compares definitions rather than days. `0` means " <>
+        "the row predates the stamp and its definitions are unknown.",
     parameters: [
       limit: [
         in: :query,

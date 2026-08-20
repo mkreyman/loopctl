@@ -396,6 +396,59 @@ defmodule Loopctl.Knowledge.RetrievalMetricsTest do
     end
   end
 
+  describe "metric_version" do
+    # This is the mechanical half of the bump discipline. It CANNOT see a change of MEANING
+    # that keeps the same keys (#711 was exactly that, and is why the rule is written down at
+    # `@metric_version` rather than left to this test). It can and does see a field being
+    # added, removed or renamed — the shape changes that have historically shipped without any
+    # mark on the row, leaving a series where a value's meaning depends on when it was
+    # computed.
+    test "the published key set is pinned to the current version" do
+      keys =
+        RetrievalMetrics.compute(fixture(:tenant).id, @day, 1800)
+        |> Map.keys()
+        |> Enum.sort()
+
+      assert RetrievalMetrics.metric_version() == 1,
+             "the version changed — update the pinned key set below and RE-SNAPSHOT the " <>
+               "affected days, or the series silently carries two definitions"
+
+      assert keys == [
+               :attributed_opens,
+               :cross_key_opens,
+               :day,
+               :direct_opens,
+               :followed_through,
+               :precision,
+               :results_recorded,
+               :results_returned,
+               :search_follow_through,
+               :searched,
+               :searches,
+               :searches_quiet,
+               :searches_reformulated,
+               :searches_scored,
+               :searches_scored_with_follow_through,
+               :searches_with_follow_through,
+               :window_seconds
+             ],
+             "the shape of the published metric changed. That is a definition change: bump " <>
+               "`@metric_version`, update this list, and re-snapshot affected days."
+    end
+
+    test "a snapshot is stamped with the version that computed it" do
+      tenant = fixture(:tenant)
+
+      assert {:ok, snap} = RetrievalMetrics.snapshot(tenant.id, @day, 1800)
+      assert snap.metric_version == RetrievalMetrics.metric_version()
+
+      %{data: [row]} = RetrievalMetrics.list_snapshots(tenant.id)
+
+      assert row.metric_version == RetrievalMetrics.metric_version(),
+             "the version must reach the payload; a stamp nobody can read is not a stamp"
+    end
+  end
+
   describe "snapshot/3 + list_snapshots/2" do
     test "records a snapshot and is idempotent per tenant/day/window", ctx do
       %{tenant: t, key: k, x: x} = ctx
