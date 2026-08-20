@@ -10508,6 +10508,14 @@ defmodule Loopctl.Knowledge do
     from(a in Article,
       where: a.tenant_id == ^tenant_id or a.scope == :system,
       where: a.status == :published,
+      # Machine-generated source hubs (US-42.1) are navigation, not knowledge, and are
+      # excluded from the heat ranking. A hub exists to be traversed — every article from
+      # its source points at it — so it accumulates readers as a FUNCTION of how many
+      # siblings the harvest gave it, not of whether anyone found it useful. Letting that
+      # rank would put the biggest imported book at the top of an index designed to be
+      # pasted into a cached prefix, which is the same failure #567/#569/#572 each fixed
+      # once: heat must not rank on a signal heat's own plumbing produces.
+      where: fragment("coalesce(? ->> 'hub_kind', '') <> 'source'", a.metadata),
       select: a.id
     )
     |> heat_filter_category(category)
