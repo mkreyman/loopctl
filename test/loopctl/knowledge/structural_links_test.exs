@@ -309,6 +309,51 @@ defmodule Loopctl.Knowledge.StructuralLinksTest do
       assert again.title == "Source: the better name"
     end
 
+    test "two sources that compute the SAME name get two hubs, never one" do
+      tenant = fixture(:tenant)
+
+      # The real case: every document in a Synology share carries `synology-netbackup`,
+      # so it is universal for each of them separately. Returning the first source's hub
+      # for the second merged 85 sources onto one node and 6,471 members with it.
+      for _ <- 1..5, do: article(tenant, ["doc-aaa111", "synology-netbackup"])
+      for _ <- 1..5, do: article(tenant, ["doc-bbb222", "synology-netbackup"])
+
+      assert {:ok, report} = StructuralLinks.harvest(tenant.id)
+
+      assert report.hubs_created == 2, "each source gets its OWN hub"
+      hub_ids = hubs(tenant.id) |> Enum.map(& &1.id) |> Enum.uniq()
+      assert length(hub_ids) == 2
+
+      # And no hub may serve members drawn from more than one source.
+      edges = links(tenant.id, :derived_from)
+
+      for hub_id <- hub_ids do
+        sources =
+          edges
+          |> Enum.filter(&(&1.target == hub_id))
+          |> Enum.map(fn e ->
+            AdminRepo.get!(Article, e.source).tags
+            |> Enum.find(&String.starts_with?(&1, "doc-"))
+          end)
+          |> Enum.uniq()
+
+        assert length(sources) == 1, "a hub must serve exactly one source"
+      end
+    end
+
+    test "the disambiguated title keeps the readable name and adds the digest" do
+      tenant = fixture(:tenant)
+      for _ <- 1..5, do: article(tenant, ["doc-ccc333", "shared-collection"])
+      for _ <- 1..5, do: article(tenant, ["doc-ddd444", "shared-collection"])
+
+      assert {:ok, _} = StructuralLinks.harvest(tenant.id)
+
+      titles = hubs(tenant.id) |> Enum.map(& &1.title) |> Enum.sort()
+      assert length(Enum.uniq(titles)) == 2, "titles must be distinct"
+      assert Enum.any?(titles, &(&1 == "Source: shared collection"))
+      assert Enum.any?(titles, &String.contains?(&1, "shared collection ("))
+    end
+
     test "a title that is not ours is never overwritten" do
       tenant = fixture(:tenant)
       for _ <- 1..5, do: article(tenant, ["book-handnamed", "an-author"])
