@@ -140,7 +140,9 @@ defmodule Loopctl.Knowledge.RetrievalMetricsTest do
                cross_key_opens: 0,
                direct_opens: 0,
                searches_reformulated: 0,
-               searches_quiet: 0
+               searches_quiet: 0,
+               searches_scored: 0,
+               searches_scored_with_follow_through: 0
              }
     end
   end

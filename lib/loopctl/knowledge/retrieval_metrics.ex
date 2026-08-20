@@ -129,19 +129,33 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
 
   ## What `quiet` does NOT mean
 
-  `searches_with_follow_through`, `searches_reformulated` and `searches_quiet` partition
-  `searches`. The partition exists because treating every not-opened search as a failure is
-  wrong, and `docs/runbooks/search-events-analysis.md` says so outright: "an agent whose
-  question is answered by the snippet correctly opens nothing, and that is a success this
-  metric scores as a failure."
+  `searches_scored_with_follow_through`, `searches_reformulated` and `searches_quiet`
+  partition `searches_scored` — NOT `searches` (#711). The partition exists because treating
+  every not-opened search as a failure is wrong, and
+  `docs/runbooks/search-events-analysis.md` says so outright: "an agent whose question is
+  answered by the snippet correctly opens nothing, and that is a success this metric scores
+  as a failure."
 
-  A REFORMULATION — the same key issuing a LATER SEARCH CALL inside the window, having opened
-  nothing — is the one member of that bucket that is closest to an unambiguous failure, so it
-  is peeled out. It is compared on the search identity, not the query text, so a verbatim
-  retry of a degraded search counts here too. What remains is named `quiet` and is STILL a mixture: "the snippet sufficed" and "the
-  rows were ignored" are indistinguishable here, and this instrumentation does not resolve
-  them. Do not rename it to anything that asserts satisfaction, and do not compute a rate
-  that treats it as either. Follow-through remains a floor, never a satisfaction rate.
+  A REFORMULATION — the SAME SESSION issuing a LATER SEARCH CALL with a DIFFERENT QUERY
+  inside the window, having opened nothing — is the one member of that bucket that is closest
+  to an unambiguous failure, so it is peeled out. What remains is named `quiet` and is STILL
+  a mixture: "the snippet sufficed" and "the rows were ignored" are indistinguishable here,
+  and this instrumentation does not resolve them. Do not rename it to anything that asserts
+  satisfaction, and do not compute a rate that treats it as either. Follow-through remains a
+  floor, never a satisfaction rate.
+
+  `searches_scored` is smaller than `searches`, and the gap is NOT quiet traffic. A search is
+  scoreable only if it carries a session identity (stamped forward-looking, so every row
+  written before #711 is unscoreable) and comes from a channel that can react to a result at
+  all (the recall hook and the session-start auto-query cannot — see
+  `@no_reformulation_entrypoints`). Report `searches - searches_scored` as unscoreable rather
+  than inferring anything from it: it is an `n/a`, not a zero.
+
+  Both of those replaced proxies that were measuring something else. Scoring on `api_key_id`
+  made the figure a function of search DENSITY — two shared keys, a 127-second median gap
+  between searches on one of them, so "another search happened on this key" was ~always true
+  and read as 97% reformulation. Comparing `search_id` without the query text counted a
+  verbatim retry as a reformulation. Both are documented at `reformulation_exists/1`.
 
   ## The proxy is gameable in one direction — never optimise it alone
 
@@ -209,6 +223,20 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   # rather than behaviour.
   @infra_entrypoints ~w(smoke skill-eval)
 
+  # Channels that are counted everywhere else but CANNOT be scored for reformulation (#711).
+  #
+  # The recall hook (`hook`) and the session-start auto-query (`session-start`) each emit
+  # exactly ONE mechanically-distilled query per prompt. They are shell scripts issuing
+  # direct HTTP: they never see what the previous query returned, hold no conversation state,
+  # and cannot decide to ask again. A channel with no feedback loop cannot reformulate, so
+  # counting it as such is a category error rather than a measurement — and it was the single
+  # largest contributor to the inflated figure, because `hook` fires on every user prompt.
+  #
+  # They are deliberately NOT `@infra_entrypoints`. Their traffic is real, a real session goes
+  # on to open what they surface, and `cross_key_opens` exists precisely to credit that. This
+  # narrows ONE metric that cannot see them, and changes no denominator anywhere else.
+  @no_reformulation_entrypoints ~w(hook session-start)
+
   defp exclude_infra_traffic(query) do
     where(
       query,
@@ -248,7 +276,9 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   Returns `%{searched, results_recorded, followed_through, precision, searches,
   searches_with_follow_through, search_follow_through, results_returned, day,
   window_seconds, curated_searched, curated_followed_through, curated_precision,
-  retrieved_searched, retrieved_followed_through, retrieved_precision}`.
+  retrieved_searched, retrieved_followed_through, retrieved_precision, attributed_opens,
+  cross_key_opens, direct_opens, searches_scored, searches_scored_with_follow_through,
+  searches_reformulated, searches_quiet}`.
 
   `searched` (and its self-describing twin `results_recorded`) is a count of RECORDED
   SURFACED RESULTS — capped at the first
@@ -300,7 +330,7 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
 
     call = compute_call_level(searched_q, window_seconds)
     opens = compute_open_attribution(tenant_id, day_start, day_end)
-    dispositions = compute_dispositions(searched_q, window_seconds, call)
+    dispositions = compute_dispositions(searched_q, window_seconds)
 
     %{
       day: day,
@@ -322,6 +352,8 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
       attributed_opens: opens.attributed_opens,
       cross_key_opens: opens.cross_key_opens,
       direct_opens: opens.direct_opens,
+      searches_scored: dispositions.searches_scored,
+      searches_scored_with_follow_through: dispositions.searches_scored_with_follow_through,
       searches_reformulated: dispositions.searches_reformulated,
       searches_quiet: dispositions.searches_quiet
     }
@@ -412,24 +444,49 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   # the still-unopened rows of a search that WAS followed through — counting it in two
   # buckets at once, and (because `quiet` is the remainder) silently zeroing the bucket the
   # genuinely quiet searches belong to. So the opened SEARCH IDS are subtracted as a set.
-  defp compute_dispositions(searched_q, window_seconds, call) do
+  defp compute_dispositions(searched_q, window_seconds) do
+    scoreable = reformulation_scoreable(searched_q)
+
+    scored = count_distinct_searches(scoreable)
+    scored_with_ft = scoreable |> with_follow_through(window_seconds) |> count_distinct_searches()
+
     opened_ids =
-      searched_q
-      |> qualifying_calls()
+      scoreable
       |> with_follow_through(window_seconds)
       |> select([s], fragment("?->>'search_id'", s.metadata))
 
     reformulated =
-      searched_q
-      |> qualifying_calls()
+      scoreable
       |> where(^reformulation_exists(window_seconds))
       |> where([s], fragment("?->>'search_id'", s.metadata) not in subquery(opened_ids))
       |> count_distinct_searches()
 
     %{
+      searches_scored: scored,
+      searches_scored_with_follow_through: scored_with_ft,
       searches_reformulated: reformulated,
-      searches_quiet: max(call.searches - call.searches_with_follow_through - reformulated, 0)
+      searches_quiet: max(scored - scored_with_ft - reformulated, 0)
     }
+  end
+
+  # The population the disposition trio partitions: qualifying calls that COULD be OBSERVED
+  # reformulating. It is a SUBSET of `compute_call_level/2`'s population, which is why the
+  # trio partitions `searches_scored` and NOT `searches` — the remainder is reported as
+  # `searches` minus `searches_scored` rather than folded into `searches_quiet`.
+  #
+  # That distinction is the whole point. `quiet` means "the snippet answered it OR the rows
+  # were ignored"; a row with no session identity means "this instrument cannot see". Folding
+  # the second into the first publishes a structural `n/a` as a number, which is the failure
+  # `Loopctl.Knowledge.RetrievalEval` already names in so many words ("`0.0` is 'it ran and
+  # retrieved nothing'; `n/a` is 'there was nothing to score'").
+  defp reformulation_scoreable(searched_q) do
+    searched_q
+    |> qualifying_calls()
+    |> where([s], not is_nil(fragment("?->>'session_id'", s.metadata)))
+    |> where(
+      [s],
+      fragment("coalesce(?->>'entrypoint', '')", s.metadata) not in ^@no_reformulation_entrypoints
+    )
   end
 
   # Shared "searched -> followed-through within window" correlated-exists count, reused
@@ -520,11 +577,31 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
     )
   end
 
-  # "The same key issued a LATER SEARCH CALL inside the window." Distinctness is compared on
-  # the search identity, never the query text — `search_id` is minted per call, so an agent
-  # re-running the IDENTICAL query (a retry after a degraded response, say) satisfies this
-  # too. The published descriptions say "a later search call" for that reason; do not
-  # restate them as "a different query" without also comparing the query text here.
+  # "The SAME SESSION asked a DIFFERENT question inside the window" — the one member of the
+  # not-opened bucket that is unambiguously a retrieval failure.
+  #
+  # TWO PROXIES WERE REPLACED HERE, AND EACH MEASURED SOMETHING OTHER THAN REFORMULATION.
+  #
+  # 1. THE QUERY TEXT is now compared, not just `search_id`. `search_id` is minted per call,
+  #    so an agent re-running the IDENTICAL query (a retry after a degraded response) used to
+  #    satisfy this: 142 of the 311 flagged rows on 2026-08-17 had a byte-identical successor.
+  #    This module previously permitted that on the condition that the published descriptions
+  #    said "a later search call" — but the exported field is `searches_reformulated`, and the
+  #    name is what leaves the system and what a reader acts on. The name won; the code moved
+  #    to meet it. THE TWO MUST KEEP MOVING TOGETHER: do not relax the query comparison here
+  #    without renaming the field and every description in `@disposition_fields`.
+  #
+  # 2. THE SESSION is now the asker, not `api_key_id`. Only TWO keys search this system — the
+  #    recall hook's and the shared MCP key that every session and subagent authenticates
+  #    with — and the median gap between consecutive searches on one key is 127 seconds. So
+  #    "was there another search on this key inside the window" was true ~97% of the time BY
+  #    CONSTRUCTION: it measured search DENSITY and published it as agent frustration. It is
+  #    the same shared-key confound that makes the search-to-read join unusable
+  #    (`docs/runbooks/search-events-analysis.md` step 2), re-entered one metric later.
+  #
+  # Rows carrying no session identity are not compared at all — `reformulation_scoreable/1`
+  # removes them, because a NULL-matches-NULL join would rebuild the shared-key bug out of
+  # exactly the rows that lack the field.
   #
   # Bounded on BOTH sides by the window, and strictly after the surfacing row, so a search
   # is never called a reformulation of one that came later.
@@ -535,14 +612,18 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
         from(r in ArticleAccessEvent,
           where:
             r.tenant_id == parent_as(:s).tenant_id and
-              r.api_key_id == parent_as(:s).api_key_id and
               r.access_type == "search" and
-              not is_nil(fragment("?->>\'search_id\'", r.metadata)) and
-              fragment("?->>\'search_id\'", r.metadata) !=
-                fragment("?->>\'search_id\'", parent_as(:s).metadata) and
+              not is_nil(fragment("?->>'search_id'", r.metadata)) and
+              fragment("?->>'search_id'", r.metadata) !=
+                fragment("?->>'search_id'", parent_as(:s).metadata) and
+              not is_nil(fragment("?->>'session_id'", r.metadata)) and
+              fragment("?->>'session_id'", r.metadata) ==
+                fragment("?->>'session_id'", parent_as(:s).metadata) and
+              fragment("coalesce(?->>'query', '')", r.metadata) !=
+                fragment("coalesce(?->>'query', '')", parent_as(:s).metadata) and
               r.accessed_at > parent_as(:s).accessed_at and
               fragment(
-                "? <= ? + (? * interval \'1 second\')",
+                "? <= ? + (? * interval '1 second')",
                 r.accessed_at,
                 parent_as(:s).accessed_at,
                 ^window_seconds
@@ -615,6 +696,8 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
       attributed_opens: m.attributed_opens,
       cross_key_opens: m.cross_key_opens,
       direct_opens: m.direct_opens,
+      searches_scored: m.searches_scored,
+      searches_scored_with_follow_through: m.searches_scored_with_follow_through,
       searches_reformulated: m.searches_reformulated,
       searches_quiet: m.searches_quiet,
       computed_at: DateTime.utc_now()
@@ -642,6 +725,8 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
            :attributed_opens,
            :cross_key_opens,
            :direct_opens,
+           :searches_scored,
+           :searches_scored_with_follow_through,
            :searches_reformulated,
            :searches_quiet,
            :computed_at,
@@ -704,10 +789,15 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
           # indistinguishable from "surfaced and ignored", which is close to its opposite.
           direct_opens: s.direct_opens,
 
-          # Unit: SEARCH CALLS. With `searches_with_follow_through` these partition
-          # `searches`. `quiet` is "the snippet sufficed OR the rows were ignored" and this
-          # instrumentation does NOT separate those — only `reformulated`, the one member of
-          # the not-opened bucket that is unambiguously a failure, is peeled out.
+          # Unit: SEARCH CALLS. These three partition `searches_scored`, NOT `searches` —
+          # a search is scoreable only if it carries a session identity and comes from a
+          # channel that can react to a result at all. `searches - searches_scored` is
+          # unscoreable traffic and is an `n/a`, never a quiet search. `quiet` is "the
+          # snippet sufficed OR the rows were ignored" and this instrumentation does NOT
+          # separate those — only `reformulated`, the one member of the not-opened bucket
+          # that is unambiguously a failure, is peeled out.
+          searches_scored: s.searches_scored,
+          searches_scored_with_follow_through: s.searches_scored_with_follow_through,
           searches_reformulated: s.searches_reformulated,
           searches_quiet: s.searches_quiet
         }

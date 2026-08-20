@@ -2767,17 +2767,30 @@ defmodule Loopctl.Knowledge do
   # — analytics only, never an authorization input. The failure it permits is a caller
   # excluding its OWN rows from a quality metric, which is self-harm rather than an attack
   # on anyone else's numbers.
+  # `session_id` rides along on the same terms and for a metric that could not be computed
+  # without it (#711). `RetrievalMetrics` decides whether a search was REFORMULATED by asking
+  # whether the same asker queried again inside the window. It used to ask that of
+  # `api_key_id`, which is not an asker: only two keys search this system — the recall hook's
+  # and the shared MCP key every session and subagent authenticates with — so the answer was
+  # governed by how busy the system was, not by whether anyone was struggling. Without a
+  # session on the SURFACED-RESULT row there is no way to scope the comparison, because that
+  # metric reads `article_access_events` and never joins back to `search_events`.
+  #
+  # Same trust posture as `entrypoint`: client-asserted, spoofable, analytics-only. Rows that
+  # do not carry it are excluded from that metric rather than compared on a weaker key —
+  # see `RetrievalMetrics.reformulation_scoreable/1`.
   defp search_access_meta(mode, results, opts) do
-    base = %{"mode" => mode, "results_returned" => length(results)}
+    attrs = client_context_attrs(opts)
 
-    case Map.get(client_context_attrs(opts), :client_entrypoint) do
-      entrypoint when is_binary(entrypoint) and entrypoint != "" ->
-        Map.put(base, "entrypoint", entrypoint)
-
-      _ ->
-        base
-    end
+    %{"mode" => mode, "results_returned" => length(results)}
+    |> put_client_meta("entrypoint", Map.get(attrs, :client_entrypoint))
+    |> put_client_meta("session_id", Map.get(attrs, :client_session_id))
   end
+
+  defp put_client_meta(meta, key, value) when is_binary(value) and value != "",
+    do: Map.put(meta, key, value)
+
+  defp put_client_meta(meta, _key, _value), do: meta
 
   defp search_duration_ms(opts) do
     case Keyword.get(opts, :_started_at) do

@@ -4,6 +4,45 @@ All notable changes to loopctl are documented here.
 
 ## [Unreleased] — 2026-08-07 — Story lifecycle capability delivery
 
+### Changed
+
+- **`searches_reformulated` was measuring search density, not reformulation** — the figure it
+  published was wrong by a wide margin and is now corrected. On the hosted instance it read
+  **97%** where the session-scoped figure is **27%**. It is exposed by
+  `GET /api/v1/knowledge/retrieval_metrics` and the `knowledge_retrieval_metrics` MCP tool,
+  so any dashboard, report, or decision taken from it before this release should be re-read.
+
+  Two independent causes, both now fixed:
+
+  - It scoped "the same asker queried again" to `api_key_id`. Only two keys search a typical
+    deployment — the recall hook's and the shared MCP key that every session and subagent
+    authenticates with — and the median gap between consecutive searches on one of them is
+    ~127 seconds. "Another search happened on this key inside the window" was therefore true
+    almost always, by construction. It is now scoped to the **client session**.
+  - It compared `search_id` only, never the query text, so a **verbatim retry** of a degraded
+    search counted as a reformulation (142 of 311 flagged rows on one measured day). The query
+    text is now compared.
+
+  Two new columns, added by
+  `20260820011500_add_scored_disposition_base_to_retrieval_snapshots` (additive, both
+  `default 0`, no backfill, no manual step):
+
+  - `searches_scored` — the base the dispositions now partition.
+  - `searches_scored_with_follow_through` — of those, the ones that opened something.
+
+  **The partition moved.** `searches_scored_with_follow_through + searches_reformulated +
+  searches_quiet` now sums to `searches_scored`, **not** to `searches`. A search is scoreable
+  only if it carries a session identity and comes from a channel able to react to a result;
+  the recall hook and the session-start auto-query emit one distilled query per prompt and
+  never see what came back, so they are excluded from this metric alone. They remain in every
+  other denominator on that endpoint, precision included. Read `searches - searches_scored` as
+  **n/a, never as zero**.
+
+  The session identity is stamped forward-looking onto surfaced-result rows from the existing
+  client-context header, so **snapshots for days before this release report
+  `searches_scored: 0`** — which is how "not computed" is distinguished from "nothing scored".
+  No historical row is rewritten.
+
 ### Added
 
 - **Retroactive tagging** (`Loopctl.Workers.TagBackfillWorker`). Tags were LLM-generated once

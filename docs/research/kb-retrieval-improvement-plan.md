@@ -253,7 +253,9 @@ This is the shape of work the owner's constraint calls for — agents are only e
 plain search, so anything that makes results judgeable belongs on the server, not in an
 agent's tool choice. Phases 3–5 should be read the same way.
 **Check:** the injected block's rows are judgeable without a `knowledge_get`; re-measure
-`searches_quiet` against `cross_key_opens` once Phase 2c has collected real traffic.
+`searches_quiet` against `cross_key_opens` once Phase 2c has collected real traffic — noting
+that since #711 `searches_quiet` partitions `searches_scored`, not `searches`, and the hook
+channel `cross_key_opens` measures is deliberately outside that base.
 
 ### Phase 3 — Context an atomic note has lost *(DONE for the lexical half; the LLM half is refused, with a condition)*
 An atomic note extracted from a book or video loses the context of its source. The plan

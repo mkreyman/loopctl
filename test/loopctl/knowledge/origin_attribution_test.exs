@@ -310,14 +310,30 @@ defmodule Loopctl.Knowledge.OriginAttributionTest do
       assert m.cross_key_opens == 0
     end
 
-    defp search_call(tenant_id, article_id, api_key_id, search_id, at) do
+    # `session_id` DEFAULTS TO ONE DERIVED FROM THE KEY, so every test written before #711
+    # keeps exactly the meaning it had: same key means same session, different keys mean
+    # different sessions. The default `query` is derived from the search id so that two
+    # distinct calls are two distinct questions unless a test says otherwise — which is what
+    # "asked again" meant before the query text was compared at all.
+    defp search_call(tenant_id, article_id, api_key_id, search_id, at, opts \\ []) do
+      optional =
+        [
+          {"session_id", Keyword.get(opts, :session_id, "sess-" <> api_key_id)},
+          {"query", Keyword.get(opts, :query, "q-" <> search_id)},
+          {"entrypoint", Keyword.get(opts, :entrypoint)}
+        ]
+        |> Enum.reject(fn {_k, v} -> is_nil(v) end)
+        |> Map.new()
+
+      meta = Map.merge(%{"search_id" => search_id, "rank" => 1, "mode" => "combined"}, optional)
+
       fixture(:article_access_event, %{
         tenant_id: tenant_id,
         article_id: article_id,
         api_key_id: api_key_id,
         access_type: "search",
         accessed_at: at,
-        metadata: %{"search_id" => search_id, "rank" => 1, "mode" => "combined"}
+        metadata: meta
       })
     end
 
@@ -354,12 +370,20 @@ defmodule Loopctl.Knowledge.OriginAttributionTest do
 
       m = RetrievalMetrics.compute(tenant.id, day)
 
-      assert m.searches ==
-               m.searches_with_follow_through + m.searches_reformulated + m.searches_quiet,
-             "the three must partition `searches`; `quiet` is derived by subtraction, so a " <>
-               "drift between the disposition population and the denominator shows up here"
+      assert m.searches_scored ==
+               m.searches_scored_with_follow_through + m.searches_reformulated +
+                 m.searches_quiet,
+             "the three must partition `searches_scored`; `quiet` is derived by " <>
+               "subtraction, so a drift between the disposition population and its own " <>
+               "denominator shows up here"
+
+      assert m.searches_scored == m.searches,
+             "every row here carries a session and a scoreable entrypoint, so nothing is " <>
+               "unscoreable; if this drifts the partition above is measuring a subset " <>
+               "without saying so"
 
       assert m.searches_with_follow_through == 1
+      assert m.searches_scored_with_follow_through == 1
       assert m.searches_reformulated == 1
     end
 
@@ -444,8 +468,9 @@ defmodule Loopctl.Knowledge.OriginAttributionTest do
 
       assert m.searches_quiet == 1, "S2 is the quiet search and must not be clamped away"
 
-      assert m.searches ==
-               m.searches_with_follow_through + m.searches_reformulated + m.searches_quiet
+      assert m.searches_scored ==
+               m.searches_scored_with_follow_through + m.searches_reformulated +
+                 m.searches_quiet
     end
 
     test "a lone search with no read and no follow-up query is quiet, not reformulated" do
@@ -462,6 +487,114 @@ defmodule Loopctl.Knowledge.OriginAttributionTest do
       assert m.searches == 1
       assert m.searches_reformulated == 0
       assert m.searches_quiet == 1
+    end
+
+    test "a VERBATIM retry is not a reformulation" do
+      tenant = fixture(:tenant)
+      article = fixture(:article, %{tenant_id: tenant.id})
+      key = key_for(tenant.id)
+      day = Date.utc_today()
+      base = DateTime.new!(day, ~T[12:00:00.000000], "Etc/UTC")
+
+      search_call(tenant.id, article.id, key, Ecto.UUID.generate(), base, query: "same question")
+
+      search_call(
+        tenant.id,
+        article.id,
+        key,
+        Ecto.UUID.generate(),
+        DateTime.add(base, 120, :second),
+        query: "same question"
+      )
+
+      m = RetrievalMetrics.compute(tenant.id, day)
+
+      assert m.searches_scored == 2
+      assert m.searches_quiet == 2
+
+      assert m.searches_reformulated == 0,
+             "re-running the identical query is a retry, not a reformulation; scoring it " <>
+               "on `search_id` alone flagged 142 of 311 rows on 2026-08-17"
+    end
+
+    test "another SESSION on the SAME KEY is not a reformulation" do
+      tenant = fixture(:tenant)
+      article = fixture(:article, %{tenant_id: tenant.id})
+      key = key_for(tenant.id)
+      day = Date.utc_today()
+      base = DateTime.new!(day, ~T[12:00:00.000000], "Etc/UTC")
+
+      search_call(tenant.id, article.id, key, Ecto.UUID.generate(), base, session_id: "sess-a")
+
+      search_call(
+        tenant.id,
+        article.id,
+        key,
+        Ecto.UUID.generate(),
+        DateTime.add(base, 120, :second),
+        session_id: "sess-b"
+      )
+
+      m = RetrievalMetrics.compute(tenant.id, day)
+
+      assert m.searches_scored == 2
+
+      assert m.searches_reformulated == 0,
+             "one shared MCP key serves every session and subagent, and the median gap " <>
+               "between searches on it is ~2 minutes — scoring on `api_key_id` made this " <>
+               "metric a function of search DENSITY (97% observed, 27% session-scoped)"
+    end
+
+    test "a search with NO session identity is unscoreable, not quiet" do
+      tenant = fixture(:tenant)
+      article = fixture(:article, %{tenant_id: tenant.id})
+      key = key_for(tenant.id)
+      day = Date.utc_today()
+      base = DateTime.new!(day, ~T[12:00:00.000000], "Etc/UTC")
+
+      search_call(tenant.id, article.id, key, Ecto.UUID.generate(), base, session_id: nil)
+
+      m = RetrievalMetrics.compute(tenant.id, day)
+
+      assert m.searches == 1, "it is still a search everywhere else"
+
+      assert m.searches_scored == 0,
+             "no session identity means the comparison cannot be scoped at all"
+
+      assert m.searches_quiet == 0,
+             "an `n/a` folded into `quiet` publishes a blind spot as an observation"
+    end
+
+    test "the recall hook is counted everywhere but scored nowhere" do
+      tenant = fixture(:tenant)
+      article = fixture(:article, %{tenant_id: tenant.id})
+      key = key_for(tenant.id)
+      day = Date.utc_today()
+      base = DateTime.new!(day, ~T[12:00:00.000000], "Etc/UTC")
+
+      for {entry, offset} <- [{"hook", 0}, {"session-start", 120}] do
+        search_call(
+          tenant.id,
+          article.id,
+          key,
+          Ecto.UUID.generate(),
+          DateTime.add(base, offset, :second),
+          entrypoint: entry,
+          session_id: "sess-shared"
+        )
+      end
+
+      m = RetrievalMetrics.compute(tenant.id, day)
+
+      assert m.searches == 2,
+             "these are NOT `@infra_entrypoints` — real traffic, still in every other " <>
+               "denominator including precision"
+
+      assert m.searches_scored == 0,
+             "a shell script emitting one distilled query per prompt never sees what came " <>
+               "back, so it cannot reformulate by construction"
+
+      assert m.searches_reformulated == 0
     end
 
     test "another KEY's later query is not a reformulation of mine" do

@@ -6505,14 +6505,21 @@ const TOOLS = [
       "tenant can reach one article independently), hence labelled rather than folded in. " +
       "direct_opens is the agent going straight to an article by link or cited id, which " +
       "used to look identical to 'surfaced and ignored' — close to its opposite.\n\n" +
-      "Disposition (unit: SEARCH CALLS): searches_with_follow_through, " +
-      "searches_reformulated and searches_quiet PARTITION searches. Treating every " +
-      "not-opened search as a failure is wrong — an agent answered by the result snippet " +
-      "correctly opens nothing, and that is a success. A reformulation (same key, a LATER " +
-      "SEARCH CALL in-window, nothing opened — compared on search identity, so a verbatim " +
-      "retry counts) is the closest thing to an unambiguous failure, so it is split out; " +
-      "what remains is `quiet` and is STILL a mixture of 'snippet sufficed' and 'rows " +
-      "ignored'. This surface does not separate them — do not read quiet as either.",
+      "Disposition (unit: SEARCH CALLS): searches_scored_with_follow_through, " +
+      "searches_reformulated and searches_quiet PARTITION searches_scored — NOT searches. " +
+      "Treating every not-opened search as a failure is wrong — an agent answered by the " +
+      "result snippet correctly opens nothing, and that is a success. A reformulation (the " +
+      "SAME SESSION issuing a later search call with a DIFFERENT QUERY in-window, nothing " +
+      "opened) is the closest thing to an unambiguous failure, so it is split out; what " +
+      "remains is `quiet` and is STILL a mixture of 'snippet sufficed' and 'rows ignored'. " +
+      "This surface does not separate them — do not read quiet as either.\n\n" +
+      "searches_scored is SMALLER than searches and the gap is NOT quiet traffic. A search " +
+      "is scoreable only if it carries a session identity (stamped forward-looking, so a " +
+      "pre-migration row reports searches_scored: 0) and comes from a channel that can " +
+      "react to a result at all — the recall hook and the session-start auto-query emit one " +
+      "distilled query per prompt and never see what came back, so they cannot reformulate " +
+      "by construction. They stay in every other denominator here, precision included. " +
+      "Read searches - searches_scored as n/a, never as zero.",
     inputSchema: {
       type: "object",
       properties: {

@@ -79,7 +79,14 @@ defmodule Loopctl.Knowledge.RetrievalMetricSnapshot do
     field :cross_key_opens, :integer, default: 0
     field :direct_opens, :integer, default: 0
 
-    # Unit: SEARCH CALLS. With `searches_with_follow_through` these partition `searches`.
+    # Unit: SEARCH CALLS. These four partition each other, not `searches`:
+    # `searches_scored_with_follow_through + searches_reformulated + searches_quiet ==
+    # searches_scored`. A search is SCORED only if it carries a session identity and comes
+    # from a channel that can react to a result at all, so `searches - searches_scored` is
+    # unscoreable traffic — an `n/a`, never a quiet search (#711). A pre-#711 row has
+    # `searches_scored = 0`, which is how "not computed" is told apart from "nothing scored".
+    field :searches_scored, :integer, default: 0
+    field :searches_scored_with_follow_through, :integer, default: 0
     field :searches_reformulated, :integer, default: 0
     field :searches_quiet, :integer, default: 0
 
@@ -107,6 +114,8 @@ defmodule Loopctl.Knowledge.RetrievalMetricSnapshot do
     :attributed_opens,
     :cross_key_opens,
     :direct_opens,
+    :searches_scored,
+    :searches_scored_with_follow_through,
     :searches_reformulated,
     :searches_quiet,
     :computed_at

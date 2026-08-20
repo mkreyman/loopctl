@@ -362,17 +362,26 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
         "re-asked of history; the correlated metrics take `window_seconds` at QUERY time. " <>
         "They share a default, so a divergence after passing a different `window_seconds` " <>
         "is that mismatch, not a bug.\n\n" <>
-        "DISPOSITION (unit: SEARCH CALLS) — `searches_with_follow_through`, " <>
-        "`searches_reformulated` and `searches_quiet` PARTITION `searches`. Treating " <>
-        "every not-opened search as a failure is wrong: an agent whose question is " <>
-        "answered by the result snippet correctly opens nothing, and that is a success. " <>
-        "A REFORMULATION (same key, a LATER SEARCH CALL inside the window, having opened " <>
-        "nothing — compared on search identity, so a verbatim retry counts) is the " <>
+        "DISPOSITION (unit: SEARCH CALLS) — `searches_scored_with_follow_through`, " <>
+        "`searches_reformulated` and `searches_quiet` PARTITION `searches_scored`, NOT " <>
+        "`searches`. Treating every not-opened search as a failure is wrong: an agent " <>
+        "whose question is answered by the result snippet correctly opens nothing, and " <>
+        "that is a success. A REFORMULATION (the SAME SESSION issuing a later search " <>
+        "call with a DIFFERENT QUERY inside the window, having opened nothing) is the " <>
         "closest thing to an unambiguous failure in that bucket, so it is reported " <>
         "separately. What remains is `quiet` and is STILL a mixture of 'the snippet " <>
         "sufficed' and 'the rows were ignored' — this surface does NOT separate them. " <>
         "Do not read `quiet` as either; follow-through is a floor, never a satisfaction " <>
-        "rate.",
+        "rate.\n\n" <>
+        "`searches_scored` IS SMALLER THAN `searches`, AND THE GAP IS NOT QUIET " <>
+        "TRAFFIC. A search is scoreable only if it carries a session identity (stamped " <>
+        "forward-looking, so every row predating it is unscoreable and a pre-migration " <>
+        "row reports `searches_scored: 0`) and comes from a channel that can react to a " <>
+        "result at all — the recall hook and the session-start auto-query emit one " <>
+        "distilled query per prompt and never see what came back, so they cannot " <>
+        "reformulate by construction. They remain in every other denominator on this " <>
+        "surface, including precision. Read `searches - searches_scored` as n/a, never " <>
+        "as zero.",
     parameters: [
       limit: [
         in: :query,
