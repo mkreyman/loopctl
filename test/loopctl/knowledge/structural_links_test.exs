@@ -208,6 +208,47 @@ defmodule Loopctl.Knowledge.StructuralLinksTest do
     end
   end
 
+  describe "the corpus scan is paged, and paging must not change the answer" do
+    test "a source spanning many pages is grouped whole" do
+      tenant = fixture(:tenant)
+      members = for _ <- 1..7, do: article(tenant, ["book-paged"])
+
+      # scan_batch: 2 forces four pages over seven rows. The regression this guards is
+      # silent UNDER-counting: a source split across pages that is grouped per-page would
+      # look smaller than it is and could fall under the floor, producing no hub at all.
+      assert {:ok, report} = StructuralLinks.harvest(tenant.id, scan_batch: 2)
+
+      assert report.edges_created == 7
+      [hub] = hubs(tenant.id)
+
+      edges = links(tenant.id, :derived_from)
+      assert MapSet.new(edges, & &1.source) == MapSet.new(members, & &1.id)
+      assert Enum.all?(edges, &(&1.target == hub.id))
+    end
+
+    test "paging does not change which sources clear the floor" do
+      tenant = fixture(:tenant)
+      for _ <- 1..5, do: article(tenant, ["book-justover"])
+      for _ <- 1..2, do: article(tenant, ["book-justunder"])
+
+      assert {:ok, paged} = StructuralLinks.harvest(tenant.id, scan_batch: 1, min_siblings: 5)
+
+      assert paged.hubs_created == 1, "the 5-article source clears a floor of 5"
+      assert paged.sources_below_floor == 1
+      assert paged.edges_created == 5
+    end
+
+    test "articles with no source are counted once, not once per page" do
+      tenant = fixture(:tenant)
+      for _ <- 1..3, do: article(tenant, ["book-counted"])
+      for _ <- 1..4, do: article(tenant, ["no-source-here"])
+
+      assert {:ok, report} = StructuralLinks.harvest(tenant.id, scan_batch: 2)
+
+      assert report.articles_without_source == 4
+    end
+  end
+
   describe "adopting the hub the extraction pipeline already made" do
     test "an existing hub-tagged sibling becomes the star centre, and nothing is minted" do
       tenant = fixture(:tenant)
