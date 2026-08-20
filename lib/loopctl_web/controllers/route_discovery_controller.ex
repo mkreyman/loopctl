@@ -12,7 +12,29 @@ defmodule LoopctlWeb.RouteDiscoveryController do
   use LoopctlWeb, :controller
 
   def index(conn, _params) do
-    routes = [
+    routes = curated_routes()
+
+    json(conn, %{
+      routes: routes,
+      count: length(routes),
+      openapi: "/api/v1/openapi",
+      note:
+        "Curated index of common routes — the authoritative full API surface is the OpenAPI spec at /api/v1/openapi."
+    })
+  end
+
+  @doc """
+  The hand-curated route index.
+
+  Public so tests can check it against `LoopctlWeb.Router.__routes__/0` in BOTH directions:
+  no phantom entry for a route the router does not serve, and no `/api/v1/admin` GET route
+  missing from it. Omission is legal in general — this is a "common routes" index, not the
+  API surface, which is the OpenAPI spec — but admin is a small closed set whose whole
+  audience discovers routes here, so a superadmin endpoint absent from it is invisible.
+  """
+  @spec curated_routes() :: [%{method: String.t(), path: String.t(), description: String.t()}]
+  def curated_routes do
+    [
       # Route discovery
       %{method: "GET", path: "/api/v1/routes", description: "This endpoint — list all routes"},
 
@@ -612,13 +634,18 @@ defmodule LoopctlWeb.RouteDiscoveryController do
         method: "GET",
         path: "/api/v1/knowledge/analytics/top-articles",
         description:
-          "Top accessed articles for the tenant. " <>
+          "Top READ articles for the tenant (bodies actually delivered). access_type " <>
+            "DEFAULTS TO READS, not every event — search/index rows are ranker impressions " <>
+            "and outnumber reads ~50:1; pass access_type=all for the old behaviour. " <>
             "Params: limit, since_days, access_type. Role: orchestrator+."
       },
       %{
         method: "GET",
         path: "/api/v1/knowledge/articles/:id/stats",
-        description: "Per-article usage stats (counts, unique agents, recent events)"
+        description:
+          "Per-article usage stats: total_events (impressions included), total_reads, " <>
+            "unique_keys (distinct API KEYS, not agents — one key is minted per dispatch), " <>
+            "by-type breakdown, recent events."
       },
       %{
         method: "GET",
@@ -630,7 +657,9 @@ defmodule LoopctlWeb.RouteDiscoveryController do
         method: "GET",
         path: "/api/v1/knowledge/analytics/unused-articles",
         description:
-          "Published articles with zero accesses. Params: days_unused, limit. Role: orchestrator+."
+          "Published articles never READ in the window (no get/context/drill). NOT " <>
+            "\"no event\" — an article the ranker surfaces constantly and nobody opens is " <>
+            "dead weight, not usage. Params: days_unused, limit. Role: orchestrator+."
       },
       %{
         method: "GET",
@@ -732,15 +761,23 @@ defmodule LoopctlWeb.RouteDiscoveryController do
         method: "GET",
         path: "/api/v1/admin/audit",
         description: "Cross-tenant audit log (superadmin only)"
+      },
+      %{
+        method: "GET",
+        path: "/api/v1/admin/violators",
+        description:
+          "Pre-existing chain-of-custody violations awaiting triage (superadmin only). " <>
+            "Resolve or ignore via POST /api/v1/admin/violators/:id/{resolve,ignore}."
+      },
+      %{
+        method: "GET",
+        path: "/api/v1/admin/knowledge/retrieval-metrics",
+        description:
+          "Per-tenant KB retrieval BREAKDOWN (superadmin only) — one row per tenant, and " <>
+            "deliberately no cross-tenant total: each tenant's KB is a different corpus, so " <>
+            "a blended rate describes none of them and hides the account you are looking " <>
+            "for. Params: day, window_seconds, active_only."
       }
     ]
-
-    json(conn, %{
-      routes: routes,
-      count: length(routes),
-      openapi: "/api/v1/openapi",
-      note:
-        "Curated index of common routes — the authoritative full API surface is the OpenAPI spec at /api/v1/openapi."
-    })
   end
 end
