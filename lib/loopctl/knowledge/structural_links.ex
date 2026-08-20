@@ -374,17 +374,53 @@ defmodule Loopctl.Knowledge.StructuralLinks do
       {:ok, %Article{} = hub} ->
         {:ok, hub, :created}
 
-      # A title collision means a hub for this source already exists under a different
-      # idempotency_key — treat it as resolved, never as a failure, so a re-run converges
-      # instead of logging the same error every night.
-      {:error, :duplicate_title, %Article{} = hub} ->
-        {:ok, hub, :resolved}
+      # A title collision is NOT this source's hub. It is a DIFFERENT source that happened
+      # to compute the same name, and returning it here merged them: measured on the live
+      # corpus, one "Source: synology netbackup" node ended up serving 85 distinct sources
+      # and 6,471 members, at which point a derived_from edge no longer means "derived from
+      # this source" but "derived from something that shared a name" — which is exactly the
+      # precision the whole feature exists to add.
+      #
+      # Names are not unique and were never going to be: the naming rule picks a tag every
+      # member shares, and a collection tag like `synology-netbackup` is universal across
+      # every document in that share. So disambiguate with the digest, which IS unique, and
+      # keep the readable name in front of it.
+      {:error, :duplicate_title, _other_sources_hub} ->
+        create_hub_disambiguated(tenant_id, source, key, member_count)
 
       {:error, reason} ->
         {:error, reason}
 
       other ->
         {:error, other}
+    end
+  end
+
+  defp create_hub_disambiguated(tenant_id, source, key, member_count) do
+    name = hub_title(tenant_id, source, member_count)
+    digest = digest_title(source)
+
+    title =
+      if name == digest, do: "Source: #{digest}", else: "Source: #{name} (#{digest})"
+
+    attrs = %{
+      title: title,
+      body: hub_body(source),
+      category: "reference",
+      status: :published,
+      tags: [source, "hub", "source-hub"],
+      idempotency_key: key,
+      metadata: %{
+        "hub_kind" => "source",
+        "source_key" => source,
+        "hub_title_generated" => title
+      }
+    }
+
+    case Knowledge.create_article(tenant_id, attrs) do
+      {:ok, %Article{} = hub} -> {:ok, hub, :created}
+      {:error, reason} -> {:error, reason}
+      other -> {:error, other}
     end
   end
 
