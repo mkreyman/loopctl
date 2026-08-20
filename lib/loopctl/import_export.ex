@@ -865,24 +865,68 @@ defmodule Loopctl.ImportExport do
     end
   end
 
+  # An ABSENT or EMPTY acceptance_criteria list stays accepted, deliberately: importing
+  # a skeleton for pre-loopctl work is a supported path (`backfill_story`,
+  # `bulk_mark_complete`), and historical work legitimately has no criteria to record.
+  # Requiring them here would break that path to enforce a rule whose real home is the
+  # verify gate.
+  #
+  # What is enforced is that a criterion which IS present carries text. The previous
+  # version checked only `is_map/1` — so `%{}` and `%{"note" => "tbd"}` passed — while
+  # printing an error asserting that every entry "must be an array of objects with 'id'
+  # and 'description' keys". Two things were wrong with that message and both mattered:
+  # it stated a contract the code did not hold, and the contract it stated was not even
+  # the right one, because this endpoint accepts `criterion` as an alternative to
+  # `description` (#509) and has never required `id`. A textless criterion is the real
+  # defect: it survives normalization into a story's acceptance_criteria as an entry
+  # with nothing for `verify_story` to be judged against.
+  #
+  # The AUTHORED-file schema (`docs/user_stories/story.schema.json`) is stricter — it
+  # requires a non-empty list and an `id` on every criterion — because generated stories
+  # should carry both. `user_story_schema_test.exs` binds the shared half (a criterion
+  # must carry text) so the two declarations cannot drift apart.
   defp validate_acceptance_criteria(nil, _path), do: :ok
   defp validate_acceptance_criteria([], _path), do: :ok
 
   defp validate_acceptance_criteria(acs, path) when is_list(acs) do
-    if Enum.all?(acs, &is_map/1) do
-      :ok
-    else
-      {:error,
-       "#{path}.acceptance_criteria must be an array of objects with 'id' and 'description' keys, " <>
-         "e.g. [{\"id\": \"AC-1\", \"description\": \"Feature works\"}]"}
-    end
+    acs
+    |> Enum.with_index()
+    |> Enum.reduce_while(:ok, fn {ac, index}, :ok ->
+      case validate_single_criterion(ac, "#{path}.acceptance_criteria[#{index}]") do
+        :ok -> {:cont, :ok}
+        error -> {:halt, error}
+      end
+    end)
   end
 
   defp validate_acceptance_criteria(_acs, path) do
     {:error,
-     "#{path}.acceptance_criteria must be an array of objects with 'id' and 'description' keys, " <>
-       "e.g. [{\"id\": \"AC-1\", \"description\": \"Feature works\"}]"}
+     "#{path}.acceptance_criteria: must be an array of objects carrying 'description' " <>
+       "(or 'criterion'), e.g. [{\"id\": \"AC-1\", \"description\": \"Feature works\"}]"}
   end
+
+  defp validate_single_criterion(ac, path) when is_map(ac) do
+    if blank?(ac["description"]) and blank?(ac["criterion"]) do
+      {:error,
+       "#{path}: must carry a non-empty 'description' (or 'criterion'), " <>
+         "e.g. {\"id\": \"AC-1\", \"description\": \"Feature works\"}"}
+    else
+      :ok
+    end
+  end
+
+  defp validate_single_criterion(ac, path),
+    do: {:error, "#{path}: must be an object, not #{inspect_kind(ac)}"}
+
+  defp inspect_kind(value) when is_binary(value), do: "a string"
+  defp inspect_kind(value) when is_list(value), do: "an array"
+  defp inspect_kind(value) when is_number(value), do: "a number"
+  defp inspect_kind(nil), do: "null"
+  defp inspect_kind(_value), do: "a scalar"
+
+  defp blank?(nil), do: true
+  defp blank?(value) when is_binary(value), do: String.trim(value) == ""
+  defp blank?(_value), do: false
 
   # Normalizes epic numbers to integers and story numbers to strings so the
   # merge lookup keys (pulled from DB rows) match the payload. Clients often

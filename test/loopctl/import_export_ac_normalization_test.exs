@@ -159,7 +159,78 @@ defmodule Loopctl.ImportExportAcNormalizationTest do
       assert {:error, :validation, message} = run_import(tenant.id, project.id, payload)
 
       assert message =~ "acceptance_criteria"
-      assert message =~ "objects"
+      assert message =~ "must be an object"
+
+      # The message now LOCATES the offending entry rather than describing the
+      # array generically, so an import carrying 40 criteria names which one is
+      # wrong. Asserting the index is what keeps that specific.
+      assert message =~ "acceptance_criteria[0]"
+      assert message =~ "not a string"
+    end
+
+    test "a criterion carrying no text at all is rejected, and located" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      # `%{}` and `%{"note" => ...}` both used to pass: the old guard checked only
+      # `is_map/1` while printing an error claiming 'id' and 'description' were
+      # required. A textless criterion normalizes into the story with nothing for
+      # verify_story to be judged against, which is the defect that mattered.
+      payload =
+        base_payload(%{
+          "acceptance_criteria" => [
+            %{"id" => "AC-1", "description" => "Feature works"},
+            %{"id" => "AC-2", "note" => "tbd"}
+          ]
+        })
+
+      assert {:error, :validation, message} = run_import(tenant.id, project.id, payload)
+
+      assert message =~ "acceptance_criteria[1]"
+      assert message =~ "description"
+      assert message =~ "criterion"
+    end
+
+    test "a criterion with a blank description is rejected" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      payload =
+        base_payload(%{"acceptance_criteria" => [%{"id" => "AC-1", "description" => "   "}]})
+
+      assert {:error, :validation, message} = run_import(tenant.id, project.id, payload)
+      assert message =~ "acceptance_criteria[0]"
+    end
+
+    test "the 'criterion' key alone still satisfies the text requirement (#509)" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      # Regression guard. This endpoint has accepted `criterion` as an alternative
+      # to `description` since #509 and has never required `id`; tightening the
+      # textless check must not quietly re-impose either.
+      payload = base_payload(%{"acceptance_criteria" => [%{"criterion" => "Feature works"}]})
+
+      assert {:ok, _summary} = run_import(tenant.id, project.id, payload)
+    end
+
+    test "an AC-less story still imports, so backfill of pre-loopctl work keeps working" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      # Deliberate, not an oversight: importing a skeleton for historical work is a
+      # supported path (backfill_story / bulk_mark_complete). The "a story must have
+      # criteria" rule belongs at the verify gate, not at the import boundary, and
+      # enforcing it here would break backfill to close a hole it does not close.
+      # A separate project per import: the same epic/story numbers imported twice
+      # into ONE project is a duplicate-number conflict, which would fail this test
+      # for a reason that has nothing to do with acceptance criteria.
+      other = fixture(:project, %{tenant_id: tenant.id})
+
+      assert {:ok, _} = run_import(tenant.id, project.id, base_payload(%{}))
+
+      assert {:ok, _} =
+               run_import(tenant.id, other.id, base_payload(%{"acceptance_criteria" => []}))
     end
 
     test "includes path context in error message" do
