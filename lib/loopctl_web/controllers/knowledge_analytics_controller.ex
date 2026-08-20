@@ -39,6 +39,11 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
   # from the enforced one either.
   @valid_access_types Analytics.valid_access_types()
 
+  # What a CALLER may ask for, which is the stored types PLUS `"all"`. Kept separate from
+  # `@valid_access_types` on purpose: that list validates the type of a RECORDED event, and
+  # `"all"` is a query selector rather than a storable type.
+  @selectable_access_types Analytics.selectable_access_types()
+
   # Same discipline as the line above: the published cap is READ from the module that
   # enforces it (`Knowledge.maybe_record_search_access/5` takes exactly this many), so
   # raising the cap cannot leave the API description stating the old number.
@@ -74,7 +79,12 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
         in: :query,
         type: :string,
         description:
-          "Restrict to a single access type (#{Enum.join(@valid_access_types, ", ")}). " <>
+          "Restrict to a single access type (#{Enum.join(@valid_access_types, ", ")}), or " <>
+            "\"all\" for every event type. DEFAULTS TO READS " <>
+            "(#{Enum.join(Analytics.read_access_types(), ", ")}) rather than to every event: " <>
+            "`search` and `index` are IMPRESSIONS the ranker produced, they outnumber reads " <>
+            "roughly 50:1, and counting them made this endpoint rank ranker output under a " <>
+            "name that promises usage. Pass \"all\" for the pre-#713 behaviour. " <>
             "An unrecognised value is a 400, never a silently unfiltered result.",
         required: false
       ],
@@ -531,11 +541,11 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
   # filter had applied. A caller cannot tell that from a real answer.
   defp validate_access_type(nil), do: :ok
   defp validate_access_type(""), do: :ok
-  defp validate_access_type(value) when value in @valid_access_types, do: :ok
+  defp validate_access_type(value) when value in @selectable_access_types, do: :ok
 
   defp validate_access_type(value) when is_binary(value) do
     {:error, :bad_request,
-     "Invalid access_type #{inspect(value)}. Valid values: #{Enum.join(@valid_access_types, ", ")}"}
+     "Invalid access_type #{inspect(value)}. Valid values: #{Enum.join(@selectable_access_types, ", ")}"}
   end
 
   defp validate_access_type(_value),
