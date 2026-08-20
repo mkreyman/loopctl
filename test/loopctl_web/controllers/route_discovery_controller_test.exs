@@ -11,6 +11,50 @@ defmodule LoopctlWeb.RouteDiscoveryControllerTest do
     put_req_header(conn, "authorization", "Bearer #{raw_key}")
   end
 
+  describe "curated index vs the router" do
+    # The index is HAND-CURATED and says so ("common routes"), which makes omission legal in
+    # general — but not for /admin. That is a small closed set, every other member is listed,
+    # and a superadmin route missing from the index is invisible to the one audience that
+    # goes looking for it. This caught exactly that: the per-tenant KB breakdown shipped and
+    # the index still listed only stats and audit.
+    test "every /api/v1/admin GET route in the router appears in the curated index" do
+      router_admin_gets =
+        LoopctlWeb.Router.__routes__()
+        |> Enum.filter(&(&1.verb == :get and String.starts_with?(&1.path, "/api/v1/admin")))
+        |> Enum.map(& &1.path)
+        |> MapSet.new()
+
+      indexed =
+        LoopctlWeb.RouteDiscoveryController.curated_routes()
+        |> Enum.filter(&(&1.method == "GET"))
+        |> Enum.map(& &1.path)
+        |> MapSet.new()
+
+      missing = MapSet.difference(router_admin_gets, indexed)
+
+      assert MapSet.size(router_admin_gets) > 0,
+             "the filter matched nothing — it has drifted from the router's shape and this " <>
+               "test is now vacuous"
+
+      assert MapSet.equal?(missing, MapSet.new()),
+             "admin GET routes missing from the curated /routes index: " <>
+               inspect(MapSet.to_list(missing))
+    end
+
+    test "every path in the curated index actually exists in the router" do
+      router_paths =
+        LoopctlWeb.Router.__routes__() |> Enum.map(& &1.path) |> MapSet.new()
+
+      phantom =
+        LoopctlWeb.RouteDiscoveryController.curated_routes()
+        |> Enum.map(& &1.path)
+        |> Enum.reject(&MapSet.member?(router_paths, &1))
+
+      assert phantom == [],
+             "the index advertises routes the router does not serve: " <> inspect(phantom)
+    end
+  end
+
   describe "GET /api/v1/routes" do
     test "returns list of routes with method, path, description", %{conn: conn} do
       tenant = fixture(:tenant)
