@@ -59,6 +59,7 @@ defmodule Loopctl.Knowledge.StructuralLinks do
 
   import Ecto.Query
 
+  alias Ecto.Adapters.SQL
   alias Loopctl.AdminRepo
   alias Loopctl.HeavyRead
   alias Loopctl.Knowledge
@@ -70,6 +71,14 @@ defmodule Loopctl.Knowledge.StructuralLinks do
   @source_tag_prefixes ~w(book- doc- repo- yt-)
 
   @default_min_siblings 3
+
+  # A tag must cover at least this fraction of a source's members to name its hub. High on
+  # purpose: the point is to abstain rather than to guess (see hub_title/3).
+  @hub_name_coverage 0.9
+
+  # Format and structure tags: true of the source but not a NAME for it.
+  @hub_name_stoplist ~w(book books document documents reference hub moc source-hub actionable
+                        pdf epub md txt html code external youtube video article audible)
 
   # Keyset page size for the corpus scan. Bounds PEAK MEMORY, not total work — every
   # article is still visited, just never all at once. See collect_sources/2.
@@ -220,7 +229,7 @@ defmodule Loopctl.Knowledge.StructuralLinks do
   # ------------------------------------------------------------------
 
   defp harvest_one_source(tenant_id, source, member_ids, acc) do
-    case resolve_or_create_hub(tenant_id, source) do
+    case resolve_or_create_hub(tenant_id, source, length(member_ids)) do
       {:ok, hub, :created} ->
         write_edges(tenant_id, hub, member_ids, %{acc | hubs_created: acc.hubs_created + 1})
 
@@ -252,13 +261,34 @@ defmodule Loopctl.Knowledge.StructuralLinks do
   # between articles inside one tenant's own source group, the effect is which sibling
   # becomes the centre of a navigational star, and nothing is destroyed either way.
   # Selection is oldest-first so a re-run is stable rather than racing ties.
-  defp resolve_or_create_hub(tenant_id, source) do
+  defp resolve_or_create_hub(tenant_id, source, member_count) do
     key = hub_idempotency_key(source)
 
     cond do
-      hub = minted_hub(tenant_id, key) -> {:ok, hub, :resolved}
-      hub = existing_source_hub(tenant_id, source) -> {:ok, hub, :adopted}
-      true -> create_hub(tenant_id, source, key)
+      hub = minted_hub(tenant_id, key) ->
+        {:ok, maybe_retitle(tenant_id, hub, source, member_count), :resolved}
+
+      hub = existing_source_hub(tenant_id, source) ->
+        {:ok, hub, :adopted}
+
+      true ->
+        create_hub(tenant_id, source, key, member_count)
+    end
+  end
+
+  # A hub minted before a name was derivable keeps its digest title forever otherwise.
+  # Retitle ONLY when the stored title is still exactly the digest form we generated: that
+  # way a name a human (or a later, better rule) put there is never overwritten by this.
+  defp maybe_retitle(tenant_id, hub, source, member_count) do
+    desired = "Source: " <> hub_title(tenant_id, source, member_count)
+
+    if hub.title == "Source: " <> digest_title(source) and hub.title != desired do
+      case Knowledge.update_article(tenant_id, hub.id, %{title: desired}) do
+        {:ok, updated} -> updated
+        _ -> hub
+      end
+    else
+      hub
     end
   end
 
@@ -285,9 +315,9 @@ defmodule Loopctl.Knowledge.StructuralLinks do
     )
   end
 
-  defp create_hub(tenant_id, source, key) do
+  defp create_hub(tenant_id, source, key, member_count) do
     attrs = %{
-      title: "Source: #{hub_title(source)}",
+      title: "Source: #{hub_title(tenant_id, source, member_count)}",
       # Never invent a source's human name. A hub named by its digest is still a
       # navigational win over no hub; a hub named by a hallucinated book title is worse
       # than nothing, because it reads as a fact.
@@ -373,11 +403,73 @@ defmodule Loopctl.Knowledge.StructuralLinks do
 
   # The tag IS the name we have. Strip the family prefix for readability and leave the
   # digest — see the comment in create_hub/3 about never inventing a title.
-  defp hub_title(source) do
+  # Name the hub from a tag its members UNIVERSALLY share, or abstain to the digest.
+  #
+  # The digest names the first 17 hubs produced ("Source: doc a8d8cf71c5df") and they are
+  # poor articles: published, searchable, and telling a reader nothing about what the
+  # source is. The corpus can usually do better, because the extraction skills tag every
+  # member of a source with something identifying — measured 2026-08-20:
+  #
+  #   book-9baec82a16b7  -> chris-mccord-bruce-tate-jos-valim   813/813 members
+  #   doc-d690c97f3116   -> iota                                416/416
+  #   doc-a8d8cf71c5df   -> synology-netbackup                 1404/1404
+  #   book-aca9eec5858f  -> nothing universal (top real tag `scalability` covers 19/338)
+  #
+  # That last row is why the rule is UNIVERSALITY and not popularity. "Most common tag"
+  # would have titled a 338-article source "scalability" on 6% coverage — a confident,
+  # wrong name, which is worse than a digest because it reads as a fact. So a candidate
+  # must cover at least @hub_name_coverage of the members, structural and format tags are
+  # excluded, and when nothing qualifies the digest stands. Never invent a name.
+  defp hub_title(tenant_id, source, member_count) do
+    case universal_tag(tenant_id, source, member_count) do
+      nil -> digest_title(source)
+      tag -> humanize_tag(tag)
+    end
+  end
+
+  defp digest_title(source) do
     Enum.reduce(@source_tag_prefixes, source, fn prefix, acc ->
       String.replace_prefix(acc, prefix, String.trim_trailing(prefix, "-") <> " ")
     end)
   end
+
+  defp humanize_tag(tag), do: tag |> String.replace("-", " ") |> String.trim()
+
+  # Raw SQL rather than Ecto here for one reason: this aggregates over `unnest(tags)`, and
+  # the Postgres adapter cannot select from a fragment join. Every value is a bound
+  # parameter — nothing is interpolated — and the result is a single row.
+  defp universal_tag(tenant_id, source, member_count) when member_count > 0 do
+    threshold = ceil(member_count * @hub_name_coverage)
+
+    sql = """
+    SELECT t
+    FROM articles a, unnest(a.tags) AS t
+    WHERE a.tenant_id = $1
+      AND a.status = 'published'
+      AND (a.metadata->>'hub_kind') IS NULL
+      AND $2 = ANY(a.tags)
+      AND NOT (t = ANY($3))
+      AND t NOT LIKE 'book-%'
+      AND t NOT LIKE 'doc-%'
+      AND t NOT LIKE 'repo-%'
+      AND t NOT LIKE 'yt-%'
+      AND t NOT LIKE 'pp-%'
+    GROUP BY t
+    HAVING count(*) >= $4
+    ORDER BY count(*) DESC, length(t) DESC, t ASC
+    LIMIT 1
+    """
+
+    with {:ok, tid} <- Ecto.UUID.dump(tenant_id),
+         %{rows: [[tag]]} <-
+           SQL.query!(AdminRepo, sql, [tid, source, @hub_name_stoplist, threshold]) do
+      tag
+    else
+      _ -> nil
+    end
+  end
+
+  defp universal_tag(_tenant_id, _source, _member_count), do: nil
 
   defp hub_body(source) do
     """

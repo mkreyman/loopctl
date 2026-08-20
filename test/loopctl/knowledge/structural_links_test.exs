@@ -208,6 +208,85 @@ defmodule Loopctl.Knowledge.StructuralLinksTest do
     end
   end
 
+  describe "naming a minted hub" do
+    test "a tag every member shares names the hub" do
+      tenant = fixture(:tenant)
+      for _ <- 1..5, do: article(tenant, ["book-named", "chris-mccord-bruce-tate-jos-valim"])
+
+      assert {:ok, _} = StructuralLinks.harvest(tenant.id)
+
+      [hub] = hubs(tenant.id)
+      assert hub.title == "Source: chris mccord bruce tate jos valim"
+    end
+
+    test "a POPULAR but not universal tag is refused, and the digest stands" do
+      tenant = fixture(:tenant)
+      # 2 of 6 carry it. Naming the source "scalability" off 33% would be a confident
+      # wrong answer — the real case was a 338-article book whose top real tag covered 19.
+      for _ <- 1..2, do: article(tenant, ["book-partial", "scalability"])
+      for _ <- 1..4, do: article(tenant, ["book-partial"])
+
+      assert {:ok, _} = StructuralLinks.harvest(tenant.id)
+
+      [hub] = hubs(tenant.id)
+      assert hub.title == "Source: book partial"
+      refute hub.title =~ "scalability"
+    end
+
+    test "format and structure tags never name a hub" do
+      tenant = fixture(:tenant)
+      # Universal, but they describe the FORMAT, not the source.
+      for _ <- 1..5, do: article(tenant, ["book-formatty", "book", "reference", "pdf"])
+
+      assert {:ok, _} = StructuralLinks.harvest(tenant.id)
+
+      [hub] = hubs(tenant.id)
+      assert hub.title == "Source: book formatty"
+    end
+
+    test "another source's tag never names this hub" do
+      tenant = fixture(:tenant)
+      for _ <- 1..5, do: article(tenant, ["book-a1b2c3", "doc-deadbeef"])
+
+      assert {:ok, _} = StructuralLinks.harvest(tenant.id)
+
+      titles = Enum.map(hubs(tenant.id), & &1.title)
+      # Both source tags are universal here; neither may be used as the other's NAME.
+      assert Enum.all?(titles, &(&1 in ["Source: book a1b2c3", "Source: doc deadbeef"]))
+    end
+
+    test "a hub minted with a digest title is retitled once a name becomes derivable" do
+      tenant = fixture(:tenant)
+      for _ <- 1..4, do: article(tenant, ["book-latename"])
+
+      assert {:ok, _} = StructuralLinks.harvest(tenant.id)
+      [first] = hubs(tenant.id)
+      assert first.title == "Source: book latename"
+
+      # The corpus grows a universal identifying tag (a re-tag pass, a later import).
+      for _ <- 1..40, do: article(tenant, ["book-latename", "some-real-author"])
+
+      assert {:ok, _} = StructuralLinks.harvest(tenant.id)
+      [again] = hubs(tenant.id)
+
+      assert again.id == first.id, "retitle must not mint a second hub"
+      assert again.title == "Source: some real author"
+    end
+
+    test "a title that is not ours is never overwritten" do
+      tenant = fixture(:tenant)
+      for _ <- 1..5, do: article(tenant, ["book-handnamed", "an-author"])
+      assert {:ok, _} = StructuralLinks.harvest(tenant.id)
+      [hub] = hubs(tenant.id)
+
+      {:ok, _} = Knowledge.update_article(tenant.id, hub.id, %{title: "A Human Chose This"})
+
+      assert {:ok, _} = StructuralLinks.harvest(tenant.id)
+      [after_run] = hubs(tenant.id)
+      assert after_run.title == "A Human Chose This"
+    end
+  end
+
   describe "the corpus scan is paged, and paging must not change the answer" do
     test "a source spanning many pages is grouped whole" do
       tenant = fixture(:tenant)
