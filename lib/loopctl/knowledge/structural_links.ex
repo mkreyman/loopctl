@@ -78,7 +78,10 @@ defmodule Loopctl.Knowledge.StructuralLinks do
 
   # Format and structure tags: true of the source but not a NAME for it.
   @hub_name_stoplist ~w(book books document documents reference hub moc source-hub actionable
-                        pdf epub md txt html code external youtube video article audible)
+                        pdf epub md txt html code external youtube video article audible
+                        administrator admin user users owner author guest unknown untitled
+                        none default temp draft copy final new old misc other
+                        microsoft-word word excel powerpoint scan scanned export)
 
   # Keyset page size for the corpus scan. Bounds PEAK MEMORY, not total work — every
   # article is still visited, just never all at once. See collect_sources/2.
@@ -282,8 +285,13 @@ defmodule Loopctl.Knowledge.StructuralLinks do
   defp maybe_retitle(tenant_id, hub, source, member_count) do
     desired = "Source: " <> hub_title(tenant_id, source, member_count)
 
-    if hub.title == "Source: " <> digest_title(source) and hub.title != desired do
-      case Knowledge.update_article(tenant_id, hub.id, %{title: desired}) do
+    if ours_to_retitle?(hub, source) and hub.title != desired do
+      attrs = %{
+        title: desired,
+        metadata: Map.put(hub.metadata || %{}, "hub_title_generated", desired)
+      }
+
+      case Knowledge.update_article(tenant_id, hub.id, attrs) do
         {:ok, updated} -> updated
         _ -> hub
       end
@@ -291,6 +299,20 @@ defmodule Loopctl.Knowledge.StructuralLinks do
       hub
     end
   end
+
+  # A stored title is ours to change only while it is exactly the one we last generated.
+  # The moment anyone edits it, it stops being ours and we leave it alone forever.
+  #
+  # The `nil` clause is one-time compatibility for hubs minted before the marker existed:
+  # those carry no record of what we wrote, so fall back to "it is ours if it still looks
+  # generated" — the digest form, or any `Source: ` title on a row we created.
+  defp ours_to_retitle?(%{metadata: %{"hub_title_generated" => generated}} = hub, _source),
+    do: hub.title == generated
+
+  defp ours_to_retitle?(hub, source),
+    do:
+      hub.title == "Source: " <> digest_title(source) or
+        String.starts_with?(hub.title, "Source: ")
 
   defp minted_hub(tenant_id, key) do
     AdminRepo.one(
@@ -332,7 +354,14 @@ defmodule Loopctl.Knowledge.StructuralLinks do
       status: :published,
       tags: [source, "hub", "source-hub"],
       idempotency_key: key,
-      metadata: %{"hub_kind" => "source", "source_key" => source}
+      # Record the title WE generated. maybe_retitle/4 compares against this to decide
+      # whether a stored title is still ours to change, which is what lets a bad
+      # generated name be corrected later without ever overwriting a human's.
+      metadata: %{
+        "hub_kind" => "source",
+        "source_key" => source,
+        "hub_title_generated" => "Source: #{hub_title(tenant_id, source, member_count)}"
+      }
     }
 
     # The novelty gate lives in `propose_article/3`, NOT here: `create_article/3` is the
@@ -423,7 +452,7 @@ defmodule Loopctl.Knowledge.StructuralLinks do
   defp hub_title(tenant_id, source, member_count) do
     case universal_tag(tenant_id, source, member_count) do
       nil -> digest_title(source)
-      tag -> humanize_tag(tag)
+      tag -> if name_shaped?(tag), do: humanize_tag(tag), else: digest_title(source)
     end
   end
 
@@ -434,6 +463,27 @@ defmodule Loopctl.Knowledge.StructuralLinks do
   end
 
   defp humanize_tag(tag), do: tag |> String.replace("-", " ") |> String.trim()
+
+  # Universality is necessary and NOT sufficient — a junk tag can sit on 100% of members.
+  # Measured on the first 17 retitles: 5 improved, 9 correctly abstained, and 3 came out
+  # WORSE than the digest they replaced:
+  #
+  #   2222-location-reporting-sometimes-goes-w   a truncated sentence used as a tag
+  #   administrator                              PDF document-property metadata
+  #   dropbox                                    the storage provider, not the source
+  #
+  # The stoplist handles the identity/format words. This handles the shape: a real source
+  # name does not begin with a number, does not trail off in a one-letter word (the tell
+  # of truncation), and is not a sentence. Anything failing that falls back to the digest,
+  # which is uninformative but at least never wrong.
+  defp name_shaped?(tag) do
+    words = String.split(tag, "-", trim: true)
+
+    String.length(tag) <= 48 and
+      length(words) <= 6 and
+      not String.match?(tag, ~r/^\d/) and
+      not Enum.any?(words, &(String.length(&1) < 2))
+  end
 
   # Raw SQL rather than Ecto here for one reason: this aggregates over `unnest(tags)`, and
   # the Postgres adapter cannot select from a fragment join. Every value is a bound

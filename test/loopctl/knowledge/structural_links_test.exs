@@ -273,6 +273,42 @@ defmodule Loopctl.Knowledge.StructuralLinksTest do
       assert again.title == "Source: some real author"
     end
 
+    test "a universal tag that is not name-SHAPED is refused" do
+      tenant = fixture(:tenant)
+
+      # All three sat on 100% of a real source's members and each produced a hub title
+      # worse than the digest it replaced.
+      for {src, junk} <- [
+            {"book-frag", "2222-location-reporting-sometimes-goes-w"},
+            {"book-role", "administrator"},
+            {"book-trunc", "some-real-name-x"}
+          ] do
+        for _ <- 1..5, do: article(tenant, [src, junk])
+      end
+
+      assert {:ok, _} = StructuralLinks.harvest(tenant.id)
+
+      titles = hubs(tenant.id) |> Enum.map(& &1.title) |> Enum.sort()
+      assert titles == ["Source: book frag", "Source: book role", "Source: book trunc"]
+    end
+
+    test "a generated title that turned out badly can be corrected later" do
+      tenant = fixture(:tenant)
+      for _ <- 1..5, do: article(tenant, ["book-fixme", "an-early-name"])
+      assert {:ok, _} = StructuralLinks.harvest(tenant.id)
+      [first] = hubs(tenant.id)
+      assert first.title == "Source: an early name"
+
+      # The early name stops being universal as the source grows; a better one takes over.
+      for _ <- 1..60, do: article(tenant, ["book-fixme", "the-better-name"])
+
+      assert {:ok, _} = StructuralLinks.harvest(tenant.id)
+      [again] = hubs(tenant.id)
+
+      assert again.id == first.id
+      assert again.title == "Source: the better name"
+    end
+
     test "a title that is not ours is never overwritten" do
       tenant = fixture(:tenant)
       for _ <- 1..5, do: article(tenant, ["book-handnamed", "an-author"])
