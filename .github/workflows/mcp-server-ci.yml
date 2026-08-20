@@ -42,6 +42,59 @@ jobs:
               - 'mcp-server/**'
               - '.github/workflows/mcp-server-ci.yml'
 
+  # A published-file change with no version bump never reaches npm. mcp-autopublish.yml
+  # fires on `mcp-server/package.json` changing, so editing index.js alone is silently a
+  # no-op for every agent: the server deploys, the client keeps the OLD tool descriptions,
+  # and the two then disagree about what the payload contains. That happened across six PRs
+  # (#689, #708, #711-#714) before this guard existed — the last four had removed and
+  # renamed payload fields the published descriptions still advertised.
+  #
+  # Same failure the autopublish workflow was itself written for, one layer up: that one
+  # fixed "the bump happened but no tag was pushed", this fixes "the code changed but no
+  # bump happened".
+  #
+  # Scoped to what npm actually SHIPS (package.json `files`), so test-only, smoke-test and
+  # workflow edits do not demand a bump.
+  version-bump:
+    name: Published files require a version bump
+    needs: changes
+    if: needs.changes.outputs.mcp == 'true' && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fail if a shipped file changed without a version bump
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          changed=$(git diff --name-only "$BASE" "$HEAD" -- \
+            'mcp-server/index.js' 'mcp-server/lib/**' 'mcp-server/README.md')
+
+          if [ -z "$changed" ]; then
+            echo "No published mcp-server file changed; no bump required."
+            exit 0
+          fi
+
+          echo "Published files changed in this PR:"
+          echo "$changed"
+
+          base_version=$(git show "$BASE:mcp-server/package.json" | node -p "JSON.parse(require('fs').readFileSync(0,'utf8')).version")
+          head_version=$(node -p "require('./mcp-server/package.json').version")
+
+          echo "version: base=$base_version head=$head_version"
+
+          if [ "$base_version" = "$head_version" ]; then
+            echo "::error::mcp-server published files changed but the version is still $head_version. Nothing publishes to npm without a version bump, so agents keep the OLD tool descriptions while the server serves the new payload. Bump mcp-server/package.json."
+            exit 1
+          fi
+
+          echo "Version bumped $base_version -> $head_version."
+
   test:
     name: Node unit tests
     needs: changes
@@ -74,17 +127,24 @@ jobs:
   # blew up — fails the gate. Note the deliberate asymmetry: a SKIPPED test is
   # only benign because `changes` proved there was nothing to test, so the gate
   # checks the probe's result too rather than trusting the skip on its own.
+  # The single required check. It must depend on EVERY job whose failure should block a
+  # merge — a job branch protection does not key on can go red without stopping anything,
+  # which is the quietest way to have a guard that does not guard.
   mcp-gate:
     name: MCP Server Gate
-    needs: [changes, test]
+    needs: [changes, test, version-bump]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Assert the unit suite did not fail
+      - name: Assert the unit suite and the version-bump guard did not fail
         run: |
           probe='${{ needs.changes.result }}'
           suite='${{ needs.test.result }}'
-          echo "changes=$probe test=$suite"
+          # Bracket syntax is REQUIRED for a hyphenated job id: `needs.version-bump.result`
+          # parses as a subtraction (`needs.version` minus `bump.result`) and silently
+          # evaluates to empty, which the case below would then treat as a failure.
+          bump='${{ needs['version-bump'].result }}'
+          echo "changes=$probe test=$suite version-bump=$bump"
           if [ "$probe" != success ]; then
             echo "The path probe did not succeed — refusing to pass the gate blind."
             exit 1
@@ -93,4 +153,11 @@ jobs:
             success) echo "mcp-server unit suite green." ;;
             skipped) echo "No mcp-server change in this PR — nothing to test." ;;
             *)       echo "mcp-server unit suite is $suite."; exit 1 ;;
+          esac
+          # `skipped` is legitimate here and only here: the guard is PR-only (it needs a base
+          # SHA to diff against), so a push to master skips it by design.
+          case "$bump" in
+            success) echo "version-bump guard green." ;;
+            skipped) echo "version-bump guard not applicable (push, or no mcp-server change)." ;;
+            *)       echo "version-bump guard is $bump."; exit 1 ;;
           esac
