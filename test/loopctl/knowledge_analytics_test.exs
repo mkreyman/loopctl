@@ -199,8 +199,9 @@ defmodule Loopctl.KnowledgeAnalyticsTest do
       stats = Knowledge.get_article_stats(tenant.id, article.id)
 
       assert stats.article_id == article.id
-      assert stats.total_accesses == 3
-      assert stats.unique_agents == 2
+      assert stats.total_events == 3, "impressions included"
+      assert stats.total_reads == 2, "get + context; the `search` impression is not a read"
+      assert stats.unique_keys == 2
       assert stats.accesses_by_type == %{"get" => 1, "search" => 1, "context" => 1}
       assert is_struct(stats.last_accessed_at, DateTime)
       assert length(stats.recent_accesses) == 3
@@ -212,8 +213,9 @@ defmodule Loopctl.KnowledgeAnalyticsTest do
 
       stats = Knowledge.get_article_stats(tenant.id, article.id)
 
-      assert stats.total_accesses == 0
-      assert stats.unique_agents == 0
+      assert stats.total_events == 0
+      assert stats.total_reads == 0
+      assert stats.unique_keys == 0
       assert stats.accesses_by_type == %{}
       assert stats.last_accessed_at == nil
       assert stats.recent_accesses == []
@@ -237,7 +239,7 @@ defmodule Loopctl.KnowledgeAnalyticsTest do
       rows = Knowledge.list_top_articles(tenant.id, since: hours_ago(1))
 
       assert [%{title: "Hot", access_count: 3} = top | _] = rows
-      assert top.unique_agents == 1
+      assert top.unique_keys == 1
       titles = Enum.map(rows, & &1.title)
       assert "Cold" in titles
     end
@@ -271,6 +273,32 @@ defmodule Loopctl.KnowledgeAnalyticsTest do
       assert "Canon" in titles, "a system canonical's reads were dropped by the article join"
       assert "Own" in titles
       assert Enum.find(rows, &(&1.title == "Canon")).access_count == 2
+    end
+
+    test "defaults to READS, not to every event" do
+      tenant = fixture(:tenant)
+      {_raw, agent} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      read_me = fixture(:article, %{tenant_id: tenant.id, title: "Read", status: :published})
+      surfaced = fixture(:article, %{tenant_id: tenant.id, title: "Surfaced", status: :published})
+
+      Knowledge.record_access(tenant.id, read_me.id, agent.id, "get")
+
+      # Surfaced five times by the ranker and never once opened.
+      for _ <- 1..5 do
+        Knowledge.record_access(tenant.id, surfaced.id, agent.id, "search")
+      end
+
+      rows = Knowledge.list_top_articles(tenant.id, since: hours_ago(1))
+      titles = Enum.map(rows, & &1.title)
+
+      assert titles == ["Read"],
+             "impressions outnumber reads ~50:1 in production, so an unfiltered default " <>
+               "ranks ranker output under a name that promises reads"
+
+      # The escape hatch still returns the old view, and the ordering flips — which is
+      # exactly how badly the default was misreporting.
+      all_rows = Knowledge.list_top_articles(tenant.id, since: hours_ago(1), access_type: "all")
+      assert Enum.map(all_rows, & &1.title) == ["Surfaced", "Read"]
     end
 
     test "filters by access_type" do
@@ -321,7 +349,13 @@ defmodule Loopctl.KnowledgeAnalyticsTest do
 
       assert usage.resolved_as == :api_key
       assert usage.api_key_id == agent_a.id
-      assert usage.total_reads == 3
+      assert usage.total_events == 3, "every event on this key"
+
+      assert usage.total_reads == 2,
+             "get + context. `total_reads` counted the `search` impression too, so the " <>
+               "recall hook's key reported thousands of reads for a shell script that has " <>
+               "deliberately read one article ever"
+
       assert usage.unique_articles == 2
       assert usage.access_by_type == %{"get" => 1, "search" => 1, "context" => 1}
       assert length(usage.top_articles) == 2
@@ -329,6 +363,22 @@ defmodule Loopctl.KnowledgeAnalyticsTest do
   end
 
   describe "list_unused_articles/2" do
+    test "an article surfaced constantly but never read counts as UNUSED" do
+      tenant = fixture(:tenant)
+      {_raw, agent} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      article = fixture(:article, %{tenant_id: tenant.id, title: "Ghost", status: :published})
+
+      for _ <- 1..10 do
+        Knowledge.record_access(tenant.id, article.id, agent.id, "search")
+      end
+
+      rows = Knowledge.list_unused_articles(tenant.id, days_unused: 7)
+
+      assert Enum.map(rows, & &1.title) == ["Ghost"],
+             "on 'no event of any type' the dead-weight detector was blind to the largest " <>
+               "class of dead weight: surfaced constantly, opened never"
+    end
+
     test "returns published articles with zero accesses in the window" do
       tenant = fixture(:tenant)
       {_raw, agent} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
@@ -416,7 +466,7 @@ defmodule Loopctl.KnowledgeAnalyticsTest do
       Knowledge.record_access(tenant_b.id, article_b.id, agent_b.id, "get")
 
       stats_a_from_b = Knowledge.get_article_stats(tenant_b.id, article_a.id)
-      assert stats_a_from_b.total_accesses == 0
+      assert stats_a_from_b.total_events == 0
 
       top_a = Knowledge.list_top_articles(tenant_a.id, since: hours_ago(1))
       assert Enum.all?(top_a, &(&1.article_id == article_a.id))

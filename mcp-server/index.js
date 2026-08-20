@@ -6546,8 +6546,15 @@ const TOOLS = [
   {
     name: "knowledge_analytics_top",
     description:
-      "Return the top accessed knowledge articles for the tenant. " +
-      "Use to identify which articles agents actually read. Requires orchestrator role.",
+      "Return the top READ knowledge articles for the tenant — articles whose body was " +
+      "actually delivered (get/context/drill). Requires orchestrator role.\n\n" +
+      "access_type DEFAULTS TO READS, not to every event. `search` and `index` rows are " +
+      "IMPRESSIONS the ranker produced — one per surfaced result — and they outnumber reads " +
+      "roughly 50:1, so the old unfiltered default ranked ranker output while claiming to " +
+      "show what agents read. Pass access_type:'all' if you genuinely want impressions " +
+      "counted, or a single type to select one. unique_keys counts distinct API KEYS, not " +
+      "agents: v2 mints one ephemeral key per dispatch, so one agent dispatched N times is " +
+      "N keys.",
     inputSchema: {
       type: "object",
       properties: {
@@ -6580,8 +6587,12 @@ const TOOLS = [
   {
     name: "knowledge_article_stats",
     description:
-      "Return per-article usage statistics: total accesses, unique agents, " +
-      "by-type breakdown, and the 10 most recent events. Requires orchestrator role.",
+      "Return per-article usage statistics: total_events (impressions included), " +
+      "total_reads (bodies actually delivered — get/context/drill), unique_keys, a by-type " +
+      "breakdown, and the 10 most recent events. Requires orchestrator role.\n\n" +
+      "Read total_reads, not total_events, when you want usage: impressions outnumber reads " +
+      "roughly 50:1. unique_keys counts distinct API KEYS rather than agents — v2 mints one " +
+      "ephemeral key per dispatch.",
     inputSchema: {
       type: "object",
       properties: {
@@ -6596,7 +6607,8 @@ const TOOLS = [
   {
     name: "knowledge_agent_usage",
     description:
-      "Return knowledge usage for an agent: total reads, unique articles, top read articles. " +
+      "Return knowledge usage for an agent: total_reads (bodies actually delivered), " +
+      "total_events (impressions included), unique articles, top read articles. " +
       "Pass api_key_id (api_keys.id credential) OR agent_id (agents.id logical identity) — not both. " +
       "Requires orchestrator role.",
     inputSchema: {
@@ -6631,8 +6643,11 @@ const TOOLS = [
   {
     name: "knowledge_unused_articles",
     description:
-      "Return published articles that have not been accessed in the configured " +
-      "time window. Use to identify dead-weight knowledge. Requires orchestrator role.",
+      "Return published articles that have not been READ in the configured time window. " +
+      "Use to identify dead-weight knowledge. Requires orchestrator role.\n\n" +
+      "\"Not read\" means no get/context/drill. It deliberately does NOT mean \"no event\": " +
+      "on that definition an article the ranker surfaces constantly and nobody ever opens " +
+      "counted as USED, which made this blind to the largest class of dead weight there is.",
     inputSchema: {
       type: "object",
       properties: {

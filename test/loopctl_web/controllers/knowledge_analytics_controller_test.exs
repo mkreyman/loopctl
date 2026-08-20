@@ -85,7 +85,7 @@ defmodule LoopctlWeb.KnowledgeAnalyticsControllerTest do
       [first | _] = body["data"]
       assert first["title"] == "Hot"
       assert first["access_count"] == 3
-      assert first["unique_agents"] == 1
+      assert first["unique_keys"] == 1
       assert is_map(body["meta"])
     end
 
@@ -156,8 +156,9 @@ defmodule LoopctlWeb.KnowledgeAnalyticsControllerTest do
       data = json_response(conn, 200)["data"]
       assert data["article_id"] == article.id
       assert data["title"] == article.title
-      assert data["total_accesses"] == 2
-      assert data["unique_agents"] == 1
+      assert data["total_events"] == 2, "impressions included"
+      assert data["total_reads"] == 1, "the `search` row is an impression, not a read"
+      assert data["unique_keys"] == 1
       assert data["accesses_by_type"] == %{"get" => 1, "search" => 1}
       assert is_list(data["recent_accesses"])
     end

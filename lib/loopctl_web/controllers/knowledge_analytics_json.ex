@@ -44,8 +44,9 @@ defmodule LoopctlWeb.KnowledgeAnalyticsJSON do
         category: to_string(article.category),
         status: to_string(article.status),
         tags: article.tags || [],
-        total_accesses: stats.total_accesses,
-        unique_agents: stats.unique_agents,
+        total_events: stats.total_events,
+        total_reads: stats.total_reads,
+        unique_keys: stats.unique_keys,
         last_accessed_at: encode_dt(stats.last_accessed_at),
         accesses_by_type: stats.accesses_by_type,
         recent_accesses: Enum.map(stats.recent_accesses, &render_recent/1)
@@ -139,7 +140,7 @@ defmodule LoopctlWeb.KnowledgeAnalyticsJSON do
       title: row.title,
       category: row.category,
       access_count: row.access_count,
-      unique_agents: Map.get(row, :unique_agents)
+      unique_keys: Map.get(row, :unique_keys)
     }
     |> compact()
   end

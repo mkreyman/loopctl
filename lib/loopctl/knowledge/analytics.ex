@@ -52,6 +52,26 @@ defmodule Loopctl.Knowledge.Analytics do
   # `"drill"` exists and why the two allowlists move together (#569).
   @valid_access_types ~w(search get context index drill)
 
+  # A READ is a body actually delivered to an agent. `search` and `index` are IMPRESSIONS —
+  # rows the RANKER produced, one per surfaced result — and they outnumber reads ~50:1 here.
+  #
+  # The distinction is enforced at ONE seam (`maybe_filter_access_type/2`, whose `nil` clause
+  # means "reads", not "everything"), because the KB records the failure of assuming it at
+  # each query surface instead: "the recording is transparent — each access row looks
+  # identical whether from a direct get (user intent) or from a query result", so an aggregate
+  # `COUNT(*) by article_id` ranks ranker output while reading as usage. Every surface that
+  # exposes this data applies it, for the same reason a new exclusion has to be threaded
+  # through per-article, per-project, per-agent, stats AND unused rather than only the primary
+  # one — missing a single surface reintroduces the whole defect there. The three usage
+  # builders construct their own `top_articles` query without the `:event` alias, so they
+  # carry the predicate explicitly rather than through the seam.
+  #
+  # `drill` counts as a read: progressive disclosure delivers a body. It is deliberately
+  # EXCLUDED from the heat index (`Knowledge.@heat_read_access_types`), and that divergence is
+  # intended — heat asks "was this a deliberate vote", this asks "was a body delivered". Do
+  # not unify the two lists.
+  @read_access_types ~w(get context drill)
+
   # The access types that mean "a body was DELIVERED to the agent" — the ones worth
   # attributing back to a search. Deliberately the same three `RetrievalMetrics` counts as
   # follow-through, INCLUDING `drill`: #569 split drill out of the heat index so that index
@@ -77,6 +97,25 @@ defmodule Loopctl.Knowledge.Analytics do
   """
   @spec valid_access_types() :: [String.t()]
   def valid_access_types, do: @valid_access_types
+
+  @doc """
+  The access types that count as a READ (a body delivered), as opposed to an impression.
+
+  Public so callers and tests can assert the set without reaching into the attribute.
+  """
+  @spec read_access_types() :: [String.t()]
+  def read_access_types, do: @read_access_types
+
+  @doc """
+  Access-type values a CALLER may select on an analytics query.
+
+  This is `valid_access_types/0` plus `"all"`, and the two lists are deliberately separate.
+  `@valid_access_types` validates the access_type of a RECORDED event (`record_access/6`),
+  so `"all"` must never appear there — it is a query selector, not a storable type, and
+  admitting it would let a caller persist an event whose type means "every type".
+  """
+  @spec selectable_access_types() :: [String.t()]
+  def selectable_access_types, do: ["all" | @valid_access_types]
 
   @doc """
   The access types whose rows get an `origin_search_id` resolved at write time.
@@ -308,8 +347,10 @@ defmodule Loopctl.Knowledge.Analytics do
 
   A map with:
 
-  - `:total_accesses` -- total event count
-  - `:unique_agents` -- distinct `api_key_id` count
+  - `:total_events` -- total event count, impressions included
+  - `:total_reads` -- events that delivered a body (`get`/`context`/`drill`)
+  - `:unique_keys` -- distinct `api_key_id` count. NOT an agent count: v2 mints one
+    ephemeral key per dispatch, so one agent dispatched N times is N keys
   - `:last_accessed_at` -- most recent `accessed_at` (or nil)
   - `:accesses_by_type` -- `%{"search" => N, "get" => N, ...}`
   - `:recent_accesses` -- last 10 events as plain maps
@@ -321,9 +362,13 @@ defmodule Loopctl.Knowledge.Analytics do
         where: e.tenant_id == ^tenant_id and e.article_id == ^article_id
       )
 
-    total = AdminRepo.aggregate(base, :count, :id)
+    total_events = AdminRepo.aggregate(base, :count, :id)
 
-    unique_agents =
+    total_reads =
+      from(e in base, where: e.access_type in @read_access_types)
+      |> AdminRepo.aggregate(:count, :id)
+
+    unique_keys =
       from(e in base, select: count(e.api_key_id, :distinct))
       |> AdminRepo.one()
       |> Kernel.||(0)
@@ -353,8 +398,9 @@ defmodule Loopctl.Knowledge.Analytics do
 
     %{
       article_id: article_id,
-      total_accesses: total,
-      unique_agents: unique_agents,
+      total_events: total_events,
+      total_reads: total_reads,
+      unique_keys: unique_keys,
       last_accessed_at: last_accessed_at,
       accesses_by_type: accesses_by_type,
       recent_accesses: recent_accesses
@@ -377,7 +423,11 @@ defmodule Loopctl.Knowledge.Analytics do
   - `:group_by` -- `:article` (default), `:project`, or `:agent`
 
   When `group_by` is `:article`, each row is:
-  `%{article_id, title, category, access_count, unique_agents}`.
+  `%{article_id, title, category, access_count, unique_keys}`.
+
+  `access_type` defaults to READS (`get`/`context`/`drill`), not to every event. Pass
+  `access_type: "all"` for the old impressions-included behaviour, or a single type to
+  select one. See `@read_access_types`.
 
   When `group_by` is `:project`, each row is:
   `%{project_id, project_name, access_count, unique_articles, unique_api_keys}`.
@@ -433,7 +483,7 @@ defmodule Loopctl.Knowledge.Analytics do
           title: a.title,
           category: a.category,
           access_count: count(e.id),
-          unique_agents: count(e.api_key_id, :distinct)
+          unique_keys: count(e.api_key_id, :distinct)
         }
       )
 
@@ -661,7 +711,11 @@ defmodule Loopctl.Knowledge.Analytics do
         where: e.accessed_at >= ^since
       )
 
-    total_reads = AdminRepo.aggregate(base, :count, :id)
+    total_events = AdminRepo.aggregate(base, :count, :id)
+
+    total_reads =
+      from(e in base, where: e.access_type in @read_access_types)
+      |> AdminRepo.aggregate(:count, :id)
 
     unique_articles =
       from(e in base, select: count(e.article_id, :distinct))
@@ -680,6 +734,7 @@ defmodule Loopctl.Knowledge.Analytics do
         where: e.tenant_id == ^tenant_id,
         where: e.api_key_id == ^api_key_id,
         where: e.accessed_at >= ^since,
+        where: e.access_type in @read_access_types,
         group_by: [a.id, a.title, a.category],
         order_by: [desc: count(e.id)],
         limit: ^limit,
@@ -696,6 +751,7 @@ defmodule Loopctl.Knowledge.Analytics do
     %{
       resolved_as: :api_key,
       api_key_id: api_key_id,
+      total_events: total_events,
       total_reads: total_reads,
       unique_articles: unique_articles,
       access_by_type: access_by_type,
@@ -739,7 +795,11 @@ defmodule Loopctl.Knowledge.Analytics do
         where: e.accessed_at >= ^since
       )
 
-    total_reads = AdminRepo.aggregate(base, :count, :id)
+    total_events = AdminRepo.aggregate(base, :count, :id)
+
+    total_reads =
+      from(e in base, where: e.access_type in @read_access_types)
+      |> AdminRepo.aggregate(:count, :id)
 
     unique_articles =
       from(e in base, select: count(e.article_id, :distinct))
@@ -765,6 +825,7 @@ defmodule Loopctl.Knowledge.Analytics do
         where: e.tenant_id == ^tenant_id,
         where: e.api_key_id in subquery(live_keys),
         where: e.accessed_at >= ^since,
+        where: e.access_type in @read_access_types,
         group_by: [a.id, a.title, a.category],
         order_by: [desc: count(e.id)],
         limit: ^limit,
@@ -784,6 +845,7 @@ defmodule Loopctl.Knowledge.Analytics do
       agent_name: agent && agent.name,
       agent_type: agent && agent.agent_type && Atom.to_string(agent.agent_type),
       api_key_count: api_key_count,
+      total_events: total_events,
       total_reads: total_reads,
       unique_articles: unique_articles,
       access_by_type: access_by_type,
@@ -845,7 +907,11 @@ defmodule Loopctl.Knowledge.Analytics do
         where: e.accessed_at >= ^since
       )
 
-    total_reads = AdminRepo.aggregate(base, :count, :id)
+    total_events = AdminRepo.aggregate(base, :count, :id)
+
+    total_reads =
+      from(e in base, where: e.access_type in @read_access_types)
+      |> AdminRepo.aggregate(:count, :id)
 
     unique_articles =
       from(e in base, select: count(e.article_id, :distinct))
@@ -879,6 +945,7 @@ defmodule Loopctl.Knowledge.Analytics do
         where: e.tenant_id == ^tenant_id,
         where: e.project_id == ^project.id,
         where: e.accessed_at >= ^since,
+        where: e.access_type in @read_access_types,
         group_by: [a.id, a.title, a.category],
         order_by: [desc: count(e.id)],
         limit: ^limit,
@@ -897,6 +964,7 @@ defmodule Loopctl.Knowledge.Analytics do
     %{
       project_id: project.id,
       project_name: project.name,
+      total_events: total_events,
       total_reads: total_reads,
       unique_articles: unique_articles,
       unique_api_keys: unique_api_keys,
@@ -987,6 +1055,10 @@ defmodule Loopctl.Knowledge.Analytics do
               where: e.tenant_id == ^tenant_id,
               where: e.accessed_at >= ^cutoff,
               where: e.article_id == parent_as(:article).id,
+              # READS only. On "any event at all", an article the ranker surfaces constantly
+              # and nobody ever opens counted as USED — leaving the dead-weight detector
+              # blind to the largest class of dead weight there is.
+              where: e.access_type in @read_access_types,
               select: 1
             )
           ),
@@ -1462,7 +1534,15 @@ defmodule Loopctl.Knowledge.Analytics do
   defp maybe_put_query(map, query) when is_binary(query), do: Map.put(map, "query", query)
   defp maybe_put_query(map, _), do: map
 
-  defp maybe_filter_access_type(query, nil), do: query
+  # Unspecified means READS, never "every row". The previous default mixed impressions into
+  # every figure whose name promised reads, and impressions outnumber reads ~50:1, so the
+  # default answer was ranker output wearing a usage label.
+  defp maybe_filter_access_type(query, nil) do
+    from([event: e] in query, where: e.access_type in @read_access_types)
+  end
+
+  # The explicit escape hatch for "I really do want impressions counted too".
+  defp maybe_filter_access_type(query, "all"), do: query
 
   defp maybe_filter_access_type(query, type) when type in @valid_access_types do
     from([event: e] in query, where: e.access_type == ^type)

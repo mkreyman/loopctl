@@ -4,6 +4,43 @@ All notable changes to loopctl are documented here.
 
 ## [Unreleased] — 2026-08-07 — Story lifecycle capability delivery
 
+### Changed
+
+- **The KB analytics surfaces now count READS, not impressions — and several payload keys are
+  renamed.** `article_access_events` holds two populations distinguished only by
+  `access_type`: reads (`get`/`context`/`drill`, a body actually delivered) and impressions
+  (`search`/`index`, one row per result the ranker surfaced). Impressions outrun reads roughly
+  50:1, and four surfaces headlined an unfiltered count of both under names that promised
+  reads. **Any dashboard reading these will report different — much smaller, and correct —
+  numbers after this release.**
+
+  Behaviour changes:
+
+  - `knowledge_analytics_top` / `GET .../analytics/top-articles` — `access_type` now defaults
+    to reads instead of every event. Pass `access_type=all` for the previous behaviour; single
+    types are unchanged. It was ranking ranker output while documented as "which articles
+    agents actually read".
+  - `knowledge_unused_articles` — "unused" now means **not read**, where it previously meant
+    "no event of any type". On the old definition an article the ranker surfaced constantly
+    and nobody ever opened counted as *used*, so the dead-weight detector was blind to the
+    largest class of dead weight.
+  - `knowledge_agent_usage` — `total_reads` now counts reads. It counted every event, so the
+    recall hook's key reported thousands of "reads" for a shell script that has deliberately
+    read one article ever. `total_events` is added for the old figure.
+
+  Renamed payload keys:
+
+  | surface | was | now |
+  |---|---|---|
+  | `knowledge_article_stats` | `total_accesses` | `total_events` (plus a new `total_reads`) |
+  | `knowledge_article_stats` | `unique_agents` | `unique_keys` |
+  | `knowledge_analytics_top` rows | `unique_agents` | `unique_keys` |
+
+  `unique_agents` was `count(DISTINCT api_key_id)`. That is not an agent count — the v2
+  dispatch pattern mints one ephemeral key per dispatch, so one agent dispatched N times is N
+  keys. The per-project `unique_agents` figure is unchanged: it joins `api_keys` and counts
+  distinct `agent_id`, so it always meant what it said.
+
 ### Removed
 
 - **The six `curated_*` / `retrieved_*` provenance fields** are gone from
