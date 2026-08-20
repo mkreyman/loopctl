@@ -45,9 +45,13 @@ defmodule Loopctl.Knowledge.StructuralLinks do
     every authenticated request. `HeavyRead`'s `guard!/2` additionally RAISES unless every
     base-table source carries a conjunctive `tenant_id` predicate bound to the passed
     tenant, which is what makes the isolation structural rather than a promise.
-  * A heavy read can be SHED. `scan/2` asks for `on_overload: :tag` and the caller
+  * The scan is KEYSET-BATCHED and reduces each page to `source => [id]` before reading
+    the next. Loading the whole corpus at once OOM-killed the production BEAM on the first
+    real run; the `tags` array was the weight, not the row count. See `collect_sources/2`.
+  * A heavy read can be SHED. Each page asks for `on_overload: :tag` and the caller
     propagates `{:error, :heavy_read_overloaded}` — binding a shed result as a list would
-    crash exactly under the load the gate exists for.
+    crash exactly under the load the gate exists for, and a partially-grouped corpus is
+    not a usable answer anyway.
   * The WRITES are bounded (one hub plus N edges per qualifying source) and follow the
     other system link-writers onto `AdminRepo`. RLS does nothing there, so the explicit
     `tenant_id` is the only isolation and it is set programmatically, never cast.
@@ -67,6 +71,10 @@ defmodule Loopctl.Knowledge.StructuralLinks do
 
   @default_min_siblings 3
 
+  # Keyset page size for the corpus scan. Bounds PEAK MEMORY, not total work — every
+  # article is still visited, just never all at once. See collect_sources/2.
+  @scan_batch 2000
+
   @doc """
   Harvests source hubs and their `derived_from` star edges for one tenant.
 
@@ -81,20 +89,20 @@ defmodule Loopctl.Knowledge.StructuralLinks do
   def harvest(tenant_id, opts \\ []) when is_binary(tenant_id) do
     floor = Keyword.get(opts, :min_siblings, min_siblings())
 
-    case scan(tenant_id, opts) do
+    case collect_sources(tenant_id, opts) do
       {:error, :heavy_read_overloaded} = shed ->
         shed
 
-      articles ->
+      {:ok, groups, without_source} ->
         {qualifying, skipped} =
-          articles
-          |> group_by_source()
-          |> Enum.split_with(fn {_source, members} -> length(members) >= floor end)
+          groups
+          |> Enum.sort_by(fn {source, _ids} -> source end)
+          |> Enum.split_with(fn {_source, ids} -> length(ids) >= floor end)
 
         report =
-          Enum.reduce(qualifying, blank_report(skipped, articles, floor), fn {source, members},
-                                                                             acc ->
-            harvest_one_source(tenant_id, source, members, acc)
+          Enum.reduce(qualifying, blank_report(skipped, without_source, floor), fn {source, ids},
+                                                                                   acc ->
+            harvest_one_source(tenant_id, source, ids, acc)
           end)
 
         log_report(tenant_id, report)
@@ -103,19 +111,75 @@ defmodule Loopctl.Knowledge.StructuralLinks do
   end
 
   # ------------------------------------------------------------------
-  # Scan
+  # Scan — KEYSET-BATCHED, and that is not a refinement
   # ------------------------------------------------------------------
 
-  defp scan(tenant_id, opts) do
+  # This used to be one `HeavyRead.all` selecting every published article of the tenant
+  # with its `tags` array, then grouping the whole list in memory.
+  #
+  # That OOM-killed the production BEAM on the first real run (2026-08-20, 512MB machine:
+  # "Out of memory: Killed process 647 (beam.smp)"). The row COUNT was not the problem —
+  # ~79k ids is about a megabyte. The `tags` ARRAY was: every row dragged a list of tag
+  # strings, and the whole decoded result set had to exist at once before a single group
+  # could be formed.
+  #
+  # So the fix is not a bigger machine or a smaller corpus. It is to never hold the corpus:
+  # read a bounded keyset page, reduce it IMMEDIATELY to `source => [id]` so the tags are
+  # discarded with the page, and carry only the id map forward. Peak memory becomes one
+  # page plus the ids, which is what the accumulation was always worth.
+  #
+  # A shed (`{:error, :heavy_read_overloaded}`) is propagated from any page — partial
+  # grouping is not a usable answer, because a source that straddles two pages would be
+  # counted short and could fall under the floor.
+  defp collect_sources(tenant_id, opts) do
+    batch = Keyword.get(opts, :scan_batch, @scan_batch)
+    collect_pages(tenant_id, opts, batch, nil, %{}, 0)
+  end
+
+  defp collect_pages(tenant_id, opts, batch, after_id, groups, without_source) do
+    case fetch_page(tenant_id, opts, batch, after_id) do
+      {:error, :heavy_read_overloaded} = shed ->
+        shed
+
+      [] ->
+        {:ok, groups, without_source}
+
+      rows ->
+        {groups, without_source} = reduce_page(rows, groups, without_source)
+        last = rows |> List.last() |> Map.fetch!(:id)
+        collect_pages(tenant_id, opts, batch, last, groups, without_source)
+    end
+  end
+
+  # Reducing the page HERE, not at the call site, is what discards the `tags` arrays with
+  # the page rather than carrying them to the end of the scan.
+  defp reduce_page(rows, groups, without_source) do
+    Enum.reduce(rows, {groups, without_source}, fn row, {acc, missing} ->
+      case source_key(row) do
+        nil -> {acc, missing + 1}
+        key -> {Map.update(acc, key, [row.id], &[row.id | &1]), missing}
+      end
+    end)
+  end
+
+  defp fetch_page(tenant_id, opts, batch, after_id) do
     query =
       from(a in Article,
         where: a.tenant_id == ^tenant_id,
         where: a.status == :published,
         where: is_nil(a.metadata["hub_kind"]),
+        order_by: [asc: a.id],
+        limit: ^batch,
         select: %{id: a.id, tags: a.tags, source_type: a.source_type, source_id: a.source_id}
       )
 
-    HeavyRead.all(tenant_id, query, Keyword.merge([on_overload: :tag], opts))
+    query = if after_id, do: where(query, [a], a.id > ^after_id), else: query
+
+    HeavyRead.all(
+      tenant_id,
+      query,
+      opts |> Keyword.drop([:scan_batch, :min_siblings]) |> Keyword.merge(on_overload: :tag)
+    )
   end
 
   # ------------------------------------------------------------------
@@ -151,31 +215,20 @@ defmodule Loopctl.Knowledge.StructuralLinks do
 
   defp column_source(_article), do: nil
 
-  defp group_by_source(articles) do
-    articles
-    |> Enum.reduce(%{}, fn article, acc ->
-      case source_key(article) do
-        nil -> acc
-        key -> Map.update(acc, key, [article], &[article | &1])
-      end
-    end)
-    |> Enum.sort_by(fn {key, _members} -> key end)
-  end
-
   # ------------------------------------------------------------------
   # Hub + edges
   # ------------------------------------------------------------------
 
-  defp harvest_one_source(tenant_id, source, members, acc) do
+  defp harvest_one_source(tenant_id, source, member_ids, acc) do
     case resolve_or_create_hub(tenant_id, source) do
       {:ok, hub, :created} ->
-        write_edges(tenant_id, hub, members, %{acc | hubs_created: acc.hubs_created + 1})
+        write_edges(tenant_id, hub, member_ids, %{acc | hubs_created: acc.hubs_created + 1})
 
       {:ok, hub, :resolved} ->
-        write_edges(tenant_id, hub, members, %{acc | hubs_resolved: acc.hubs_resolved + 1})
+        write_edges(tenant_id, hub, member_ids, %{acc | hubs_resolved: acc.hubs_resolved + 1})
 
       {:ok, hub, :adopted} ->
-        write_edges(tenant_id, hub, members, %{acc | hubs_adopted: acc.hubs_adopted + 1})
+        write_edges(tenant_id, hub, member_ids, %{acc | hubs_adopted: acc.hubs_adopted + 1})
 
       {:error, reason} ->
         Logger.warning("structural_links: hub failed for #{source}: #{inspect(reason)}")
@@ -276,19 +329,21 @@ defmodule Loopctl.Knowledge.StructuralLinks do
     end
   end
 
-  defp write_edges(tenant_id, hub, members, acc) do
+  defp write_edges(tenant_id, hub, member_ids, acc) do
     # ArticleLink.inserted_at is :utc_datetime_usec — truncating to :second makes Ecto
     # raise on dump. It also has no updated_at (links are immutable), so only one stamp.
     now = DateTime.utc_now()
 
+    # `member_ids` are bare ids, not rows: the batched scan discards everything except the
+    # id as each page is reduced, which is what keeps peak memory bounded.
     rows =
-      members
-      |> Enum.reject(&(&1.id == hub.id))
+      member_ids
+      |> Enum.reject(&(&1 == hub.id))
       |> Enum.map(
         &%{
           id: Ecto.UUID.generate(),
           tenant_id: tenant_id,
-          source_article_id: &1.id,
+          source_article_id: &1,
           target_article_id: hub.id,
           relationship_type: :derived_from,
           metadata: %{"origin" => "structural_links"},
@@ -339,7 +394,7 @@ defmodule Loopctl.Knowledge.StructuralLinks do
     Application.get_env(:loopctl, :structural_hub_min_siblings, @default_min_siblings)
   end
 
-  defp blank_report(skipped, articles, floor) do
+  defp blank_report(skipped, without_source, floor) do
     %{
       hubs_created: 0,
       hubs_resolved: 0,
@@ -347,7 +402,7 @@ defmodule Loopctl.Knowledge.StructuralLinks do
       hub_failures: 0,
       edges_created: 0,
       sources_below_floor: length(skipped),
-      articles_without_source: Enum.count(articles, &is_nil(source_key(&1))),
+      articles_without_source: without_source,
       min_siblings: floor
     }
   end
