@@ -1,6 +1,6 @@
 # Epic 42 — Recorded Structure
 
-**Status: PARTLY DELIVERED — US-42.2 is in PR #718; US-42.1 is specified and not implemented.** Per-story state and its merge PR live in the Stories table
+**Status: BOTH STORIES IMPLEMENTED.** US-42.2 merged in #718. US-42.1's harvester is built and tested; nothing schedules it yet, which is a deliberate separate decision recorded in that story. Per-story state and its merge PR live in the Stories table
 below — that table is the single source of truth for what is done, and this header is
 the only place that summarises it. Prose below is the epic's DESIGN record, written
 against master 2026-08-20; read its present tense as "at design time".
@@ -66,7 +66,7 @@ entire custody chain to `verified` with nothing that could have been verified.
 
 | Story | Title | Status | PR |
 |-------|-------|--------|----|
-| US-42.1 | Per-source hub articles and `derived_from` star edges | **not implemented** — spec corrected against measurement, see its technical notes | — |
+| US-42.1 | Per-source hub articles and `derived_from` star edges | **implemented** — scheduling deliberately separate, see its technical notes | — |
 | US-42.2 | A declared schema for work-breakdown imports, enforced instead of described | **merged-pending** | #718 |
 
 Neither story depends on the other; they can land in either order.

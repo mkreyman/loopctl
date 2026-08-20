@@ -18,47 +18,47 @@
     {
       "id": "AC-42.1.1",
       "description": "A source hub is an ordinary article (no new table) with category 'reference', title 'Source: <human-readable source name>', and metadata.hub_kind = 'source'. It is identified by a deterministic idempotency_key derived from (tenant_id, source_type, source_id) so a re-run resolves the existing hub rather than creating a second one.",
-      "status": "pending"
+      "status": "complete"
     },
     {
       "id": "AC-42.1.2",
       "description": "CORRECTED 2026-08-20 BY MEASUREMENT. Resolve each article's source from its SOURCE-FAMILY TAG (book-, doc-, repo-, yt- prefixes) FIRST, with the source_type/source_id COLUMNS as the fallback - the inverse of this story's original assumption. knowledge_get on a book-extracted article (360cd5a5, tagged book-9baec82a16b7) returns source_type: null and source_id: null, so the columns are largely unpopulated and a column-first harvest would find almost nothing. Loopctl.Knowledge.StructuralLinks.harvest/2 then creates, for each article with a resolvable source, exactly one derived_from edge from that article to its source hub. Direction is article -> hub. No sibling-to-sibling edge is ever written.",
-      "status": "pending"
+      "status": "complete"
     },
     {
       "id": "AC-42.1.3",
       "description": "The harvest is idempotent: running it twice over an unchanged corpus creates zero additional edges and zero additional hubs. It relies on the existing composite unique index on (tenant_id, source_article_id, target_article_id, relationship_type) rather than on a pre-read.",
-      "status": "pending"
+      "status": "complete"
     },
     {
       "id": "AC-42.1.4",
       "description": "A source below a configurable :structural_hub_min_siblings floor (default 3) gets NO hub and NO edges. A two-article source produces a hub with less information than the two articles already carry, and 210 book sources plus every one-off document would otherwise flood the corpus with near-empty reference articles.",
-      "status": "pending"
+      "status": "complete"
     },
     {
       "id": "AC-42.1.5",
       "description": "VERIFIED ALREADY TRUE, so this reduces to a regression test. LinkPruning filters on relationship_type = 'relates_to' (link_pruning.ex:265,285), so derived_from is exempt BY CONSTRUCTION and no code change is needed. Add the test asserting a derived_from edge survives a prune run which removes relates_to edges on the same article, so a future widening of the prune predicate cannot silently start evicting structural edges.",
-      "status": "pending"
+      "status": "complete"
     },
     {
       "id": "AC-42.1.6",
       "description": "Hub articles are excluded from the novelty gate's duplicate detection when created by the harvester (they are structurally near-identical to each other by construction), and are excluded from knowledge_heat_index ranking so a hub cannot displace real articles in an index designed to be pasted into a cached prefix (#567/#569).",
-      "status": "pending"
+      "status": "complete"
     },
     {
       "id": "AC-42.1.7",
-      "description": "OPEN DESIGN DECISION, deliberately not settled in the story. The harvest is a corpus-wide sweep and the repo choice is a capacity and isolation decision, not a detail: AdminRepo's 3-connection pool (config/runtime.exs:190) is load-bearing for every authenticated request and the recorded KB finding is to keep heavy reads off it - yet the existing system link-writers (ArticleLinkingWorker, promote_conflicts) insert via AdminRepo directly. The likely shape is Loopctl.HeavyRead for the scan plus a tenant-scoped RLS write, but settle it against tenancy-rls/SKILL.md before writing code. Whatever is chosen, the harvest must be tenant-scoped and a tenant-isolation test must assert that one tenant's harvest can neither read nor link another tenant's articles.",
-      "status": "pending"
+      "description": "SETTLED AND IMPLEMENTED against tenancy-rls/SKILL.md: the SCAN goes through Loopctl.HeavyRead (whose guard!/2 raises unless every base-table source carries a conjunctive tenant_id predicate, making isolation structural) with on_overload: :tag so a shed is propagated rather than bound as a list; the BOUNDED writes go to AdminRepo like the other system link-writers, with tenant_id set programmatically. Original note follows. The harvest is a corpus-wide sweep and the repo choice is a capacity and isolation decision, not a detail: AdminRepo's 3-connection pool (config/runtime.exs:190) is load-bearing for every authenticated request and the recorded KB finding is to keep heavy reads off it - yet the existing system link-writers (ArticleLinkingWorker, promote_conflicts) insert via AdminRepo directly. The likely shape is Loopctl.HeavyRead for the scan plus a tenant-scoped RLS write, but settle it against tenancy-rls/SKILL.md before writing code. Whatever is chosen, the harvest must be tenant-scoped and a tenant-isolation test must assert that one tenant's harvest can neither read nor link another tenant's articles.",
+      "status": "complete"
     },
     {
       "id": "AC-42.1.8",
       "description": "knowledge_get on an article with a hub returns the hub in outgoing_links, and knowledge_get on the hub returns its siblings in incoming_links, subject to the existing 25-per-direction cap with links_total reporting the true count.",
-      "status": "pending"
+      "status": "complete"
     },
     {
       "id": "AC-42.1.9",
       "description": "The harvester reports, per run: hubs created, hubs resolved, edges created, sources skipped below the floor, and articles with no resolvable source. A run that creates nothing logs that fact rather than exiting silently.",
-      "status": "pending"
+      "status": "complete"
     }
   ],
   "test_cases": [
@@ -77,7 +77,7 @@
         "exactly 6 derived_from edges exist",
         "zero edges exist between two non-hub articles"
       ],
-      "status": "pending"
+      "status": "complete"
     },
     {
       "id": "TC-42.1.2",
@@ -94,7 +94,7 @@
         "edge count unchanged",
         "the run reports 1 hub resolved and 0 created"
       ],
-      "status": "pending"
+      "status": "complete"
     },
     {
       "id": "TC-42.1.3",
@@ -111,7 +111,7 @@
         "no derived_from edge references those two articles",
         "the run reports 1 source skipped below the floor"
       ],
-      "status": "pending"
+      "status": "complete"
     },
     {
       "id": "TC-42.1.4",
@@ -127,7 +127,7 @@
         "relates_to edges are reduced to top-K",
         "the derived_from edge is still present"
       ],
-      "status": "pending"
+      "status": "complete"
     },
     {
       "id": "TC-42.1.5",
@@ -144,7 +144,7 @@
         "tenant B gains no hub and no edges",
         "no edge crosses tenants"
       ],
-      "status": "pending"
+      "status": "complete"
     },
     {
       "id": "TC-42.1.6",
@@ -160,7 +160,7 @@
         "the hub does not appear in the ranked stubs",
         "non-hub articles rank unchanged"
       ],
-      "status": "pending"
+      "status": "complete"
     },
     {
       "id": "TC-42.1.7",
@@ -175,7 +175,7 @@
       "expected_results": [
         "TC-42.1.3 fails"
       ],
-      "status": "pending"
+      "status": "complete"
     }
   ],
   "technical_notes": [
@@ -185,7 +185,8 @@
     "Run it as an Oban worker on the existing knowledge cadence rather than inline on write - the harvest is a whole-corpus sweep and must not sit in the ingestion request path. Idempotency (AC-42.1.3) is what makes an unattended repeat safe.",
     "This is stage 0.5 of #611, sitting between the shipped prune (stage 0) and the LLM relation typing (stage 1). It is deliberately cheap: no model call, no embedding, no judgment. Land it before stage 1 so the expensive pass has a set of known-true edges to calibrate against.",
     "Do NOT extend this to co-membership of a project_id or a shared topical tag. Those are set memberships, not relations, and harvesting them reintroduces the clique problem this story's star shape exists to avoid.",
-    "STATUS 2026-08-20: NOT IMPLEMENTED. Specified, and two acceptance criteria corrected against evidence gathered while starting it (AC-42.1.2 source resolution, AC-42.1.5 already-true-by-construction). AC-42.1.7 is a genuine open decision about repo and RLS that a session should settle deliberately rather than inherit. The measurement that shaped the whole story - 210 distinct book- sources, the largest over 1,500 articles, hence a star and never a clique - came from knowledge_facets(tag_prefix: 'book-') and is worth re-running before implementing, since the corpus grows."
+    "STATUS 2026-08-20: IMPLEMENTED. Loopctl.Knowledge.StructuralLinks plus 15 tests, all nine acceptance criteria met. Four guards verified NON-VACUOUS by mutation: disabling the sibling floor, flipping source resolution to column-first, turning the star into a clique, and removing the heat-index exclusion each fail a test. That last mutation initially failed to fail, and the diagnosis was a REAL defect rather than a weak test - create_article/3 defaults to :draft, so hubs were being created unpublished, invisible to search and the index and therefore never heat candidates at all. Hubs are now explicitly :published.",
+    "SCHEDULING IS DELIBERATELY A SEPARATE CHANGE. harvest/2 is callable and idempotent but nothing runs it on a cadence. An all-tenants nightly sweep is not a free addition here: the recorded KB finding is that self-signup permanently joins every all-tenants cron fan-out and per-IP caps do not bound that growth, so the fan-out shape wants deciding on its own rather than inheriting from whichever worker it is folded into. Enabling it should also start with the sibling floor deliberately high on the hosted corpus, since the first run creates one hub per qualifying source across every source family at once."
   ],
   "dependencies": [],
   "estimated_tokens": 120000
