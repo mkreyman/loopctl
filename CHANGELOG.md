@@ -4,6 +4,36 @@ All notable changes to loopctl are documented here.
 
 ## [Unreleased] — 2026-08-07 — Story lifecycle capability delivery
 
+### Removed
+
+- **The six `curated_*` / `retrieved_*` provenance fields** are gone from
+  `GET /api/v1/knowledge/retrieval_metrics`, the `knowledge_retrieval_metrics` MCP tool, and
+  the `retrieval_metric_snapshots` table (migration `20260820020000`, which drops six
+  columns). Any consumer reading those keys must stop; nothing else on the payload changed.
+
+  They could never report anything, and published a confident `0` instead of an absence:
+
+  - **Nothing has ever been curated.** A source counts as curated only if its article has
+    `curated_at` set, and that was NULL on all 85,325 production articles — the shipped
+    `scope: :system` canonicals included. Every provenance decision therefore resolves
+    `retrieved` over an empty candidate set.
+  - **The buckets read a tag namespace the default path does not write.** They filtered
+    `mode` for `hybrid_curated` / `hybrid_retrieved`, which only `knowledge_hybrid_search`
+    produces, while the default search path has tagged the same decision `combined_curated` /
+    `combined_retrieved` since the hybrid resolver moved onto it. At removal that was 8,090
+    rows the metric could not see against 252 it could — roughly 97% of the traffic its own
+    documentation claimed it made observable.
+
+  No data is lost that could not be recomputed: every value derived from
+  `article_access_events`, which is not pruned. Reintroducing the breakdown requires BOTH
+  that something actually sets `curated_at` and that the filter match the `combined_*` tags.
+
+- **`knowledge_hybrid_search` now says the curated branch is unreachable.** Its tool
+  description told agents that a `curated` verdict means a canonical article answered and to
+  trust it. That outcome cannot occur while no article is marked curated, so the description
+  now says so and tells agents to read `retrieved` as the normal case rather than as evidence
+  that a curated answer was considered and rejected. The line comes out when curation exists.
+
 ### Changed
 
 - **`searches_reformulated` was measuring search density, not reformulation** — the figure it
