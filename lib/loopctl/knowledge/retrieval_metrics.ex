@@ -275,8 +275,7 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
 
   Returns `%{searched, results_recorded, followed_through, precision, searches,
   searches_with_follow_through, search_follow_through, results_returned, day,
-  window_seconds, curated_searched, curated_followed_through, curated_precision,
-  retrieved_searched, retrieved_followed_through, retrieved_precision, attributed_opens,
+  window_seconds, attributed_opens,
   cross_key_opens, direct_opens, searches_scored, searches_scored_with_follow_through,
   searches_reformulated, searches_quiet}`.
 
@@ -289,14 +288,26 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   are reported, for the cap's opposite-signed effects on `search_follow_through`, and for
   why neither ratio may be optimised alone.
 
-  The `curated_*`/`retrieved_*` fields (US-31.2, AC-31.2.5) are the SAME
-  searched/followed_through/precision computation, restricted to `"search"` events
-  whose `metadata->>'mode'` is `"hybrid_curated"` / `"hybrid_retrieved"` (set by
-  `Loopctl.Knowledge.hybrid_search/3`) — so the hybrid resolver's provenance decision
-  is observable through this NAMED surface, not just via ad-hoc raw
-  `article_access_events` queries on the mode tag. Non-hybrid search events (`"keyword"`,
-  `"semantic"`, `"combined"`, etc.) contribute to the top-level `searched`/
-  `followed_through`/`precision` only, never to either provenance bucket.
+  There is deliberately NO `curated_*`/`retrieved_*` provenance breakdown here any more
+  (US-31.2 / AC-31.2.5, removed #712). It was structurally incapable of reporting anything,
+  for two independent reasons, and published a confident `0` for both:
+
+    * NOTHING HAS EVER BEEN CURATED. `list_curated_sources` requires `curated_at IS NOT
+      NULL` (`Knowledge.curated_sources_base_query/2`); production held 0 such articles out
+      of 85,325 at removal, the shipped `scope: :system` canonicals included. Every
+      provenance decision therefore resolves `:retrieved` over an empty candidate set, so
+      `curated_searched` was a constant `0` that looked like a measurement.
+    * IT READ THE WRONG TAG NAMESPACE. The buckets filtered `mode` for `"hybrid_curated"` /
+      `"hybrid_retrieved"`, which only `hybrid_search/3` writes. Since #670 the DEFAULT
+      search path makes the same provenance decision and tags it `"combined_curated"` /
+      `"combined_retrieved"` (`Knowledge.combined_search_mode/1`). At removal that was 8,090
+      rows the metric could not see against 252 it could — so it ignored ~97% of the very
+      traffic its own docstring claimed made the decision "observable through this NAMED
+      surface".
+
+  If the provenance question is worth answering again, BOTH must be true first: something
+  must actually set `curated_at`, and the filter must match the `combined_*` tags. Restoring
+  the fields without the second is restoring a metric that reads a namespace nothing writes.
   """
   @spec compute(Ecto.UUID.t(), Date.t(), pos_integer()) :: map()
   def compute(tenant_id, %Date{} = day, window_seconds \\ @default_window_seconds) do
@@ -316,18 +327,6 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
     followed = compute_followed_through(searched_q, window_seconds)
     precision = safe_precision(followed, searched)
 
-    curated_q = where(searched_q, [s], fragment("?->>'mode' = ?", s.metadata, "hybrid_curated"))
-    curated_searched = AdminRepo.aggregate(curated_q, :count, :id)
-    curated_followed = compute_followed_through(curated_q, window_seconds)
-    curated_precision = safe_precision(curated_followed, curated_searched)
-
-    retrieved_q =
-      where(searched_q, [s], fragment("?->>'mode' = ?", s.metadata, "hybrid_retrieved"))
-
-    retrieved_searched = AdminRepo.aggregate(retrieved_q, :count, :id)
-    retrieved_followed = compute_followed_through(retrieved_q, window_seconds)
-    retrieved_precision = safe_precision(retrieved_followed, retrieved_searched)
-
     call = compute_call_level(searched_q, window_seconds)
     opens = compute_open_attribution(tenant_id, day_start, day_end)
     dispositions = compute_dispositions(searched_q, window_seconds)
@@ -343,12 +342,6 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
       searches_with_follow_through: call.searches_with_follow_through,
       search_follow_through: call.search_follow_through,
       results_returned: call.results_returned,
-      curated_searched: curated_searched,
-      curated_followed_through: curated_followed,
-      curated_precision: curated_precision,
-      retrieved_searched: retrieved_searched,
-      retrieved_followed_through: retrieved_followed,
-      retrieved_precision: retrieved_precision,
       attributed_opens: opens.attributed_opens,
       cross_key_opens: opens.cross_key_opens,
       direct_opens: opens.direct_opens,
@@ -687,12 +680,6 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
       searches_with_follow_through: m.searches_with_follow_through,
       search_follow_through: m.search_follow_through,
       results_returned: m.results_returned,
-      curated_searched: m.curated_searched,
-      curated_followed_through: m.curated_followed_through,
-      curated_precision: m.curated_precision,
-      retrieved_searched: m.retrieved_searched,
-      retrieved_followed_through: m.retrieved_followed_through,
-      retrieved_precision: m.retrieved_precision,
       attributed_opens: m.attributed_opens,
       cross_key_opens: m.cross_key_opens,
       direct_opens: m.direct_opens,
@@ -716,12 +703,6 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
            :searches_with_follow_through,
            :search_follow_through,
            :results_returned,
-           :curated_searched,
-           :curated_followed_through,
-           :curated_precision,
-           :retrieved_searched,
-           :retrieved_followed_through,
-           :retrieved_precision,
            :attributed_opens,
            :cross_key_opens,
            :direct_opens,
@@ -770,12 +751,6 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
           searches_with_follow_through: s.searches_with_follow_through,
           search_follow_through: s.search_follow_through,
           results_returned: s.results_returned,
-          curated_searched: s.curated_searched,
-          curated_followed_through: s.curated_followed_through,
-          curated_precision: s.curated_precision,
-          retrieved_searched: s.retrieved_searched,
-          retrieved_followed_through: s.retrieved_followed_through,
-          retrieved_precision: s.retrieved_precision,
 
           # Unit: READS. NOT comparable with `followed_through`, which counts surfaced
           # RESULTS that were later opened. `cross_key_opens` is the injected recall hook's

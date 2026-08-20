@@ -4665,7 +4665,12 @@ const TOOLS = [
       "trustworthy answer plus its provenance rather than a ranked list to triage yourself; " +
       "use knowledge_search when you want to browse/enumerate matches. Additive — existing " +
       "knowledge tools are unchanged. If semantic ranking is unavailable it degrades to " +
-      "keyword-only (meta.fallback/fallback_reason), same as knowledge_search.",
+      "keyword-only (meta.fallback/fallback_reason), same as knowledge_search.\n\n" +
+      "TODAY THE CURATED BRANCH IS UNREACHABLE ON THIS DEPLOYMENT: a source counts as " +
+      "curated only if its article has curated_at set, and no article does — so every " +
+      "call returns provenance 'retrieved' and a null curated_article_id. Read a " +
+      "'retrieved' verdict as the normal case, not as evidence that a curated answer " +
+      "was considered and rejected. This line comes out when something actually curates.",
     inputSchema: {
       type: "object",
       properties: {

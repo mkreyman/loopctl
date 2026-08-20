@@ -9595,9 +9595,12 @@ defmodule Loopctl.Knowledge do
   `mode: "hybrid_curated"` or `mode: "hybrid_retrieved"` in the `ArticleAccessEvent`
   metadata — an additive extension of the existing mode tags (`"keyword"`,
   `"semantic"`, `"combined"`). This rides the existing
-  `Loopctl.Knowledge.RetrievalMetrics` / `article_access_events` pipeline (see its
-  `curated_searched`/`retrieved_searched` breakdown), so "prefer-curated silently
-  hiding better retrieval" is observable per tenant without a new table. That DB-backed
+  `Loopctl.Knowledge.RetrievalMetrics` / `article_access_events` pipeline. NOTE: the
+  named `curated_*`/`retrieved_*` breakdown this used to point at was removed in #712 —
+  it read only these `hybrid_*` tags while the default path writes `combined_*`, so it
+  saw ~3% of the decisions. "Prefer-curated silently hiding better retrieval" is
+  observable per tenant by querying the mode tag directly, until a breakdown that reads
+  BOTH namespaces earns its way back. That DB-backed
   recording still requires a non-empty page + `:api_key_id` (an inherited constraint of
   `article_access_events`, whose `article_id`/`api_key_id` are NOT NULL); a MISS
   (empty page) or a keyless call additionally emits a bare

@@ -36,15 +36,11 @@ defmodule Loopctl.Knowledge.RetrievalMetricSnapshot do
   (UP). Full derivation, those biases, and the two structural exclusions (zero-result and
   keyless searches) are in `Loopctl.Knowledge.RetrievalMetrics`.
 
-  The `curated_*`/`retrieved_*` columns (US-31.2, AC-31.2.5) are the SAME searched /
-  followed_through / precision breakdown, restricted to `article_access_events` whose
-  `metadata->>'mode'` is `"hybrid_curated"` / `"hybrid_retrieved"` respectively — so an
-  operator can tell whether the hybrid resolver's `:curated` answers are actually
-  followed through on as often as `:retrieved` ones (a "prefer-curated silently hides
-  better retrieval" regression would show up as `curated_precision` trending well below
-  `retrieved_precision`). Rows written before US-31.2 (or by non-hybrid searches) simply
-  carry `0`/`0.0` in these columns — same "additive, never breaking" convention as the
-  rest of this schema.
+  The `curated_*`/`retrieved_*` columns were dropped in #712. They could never report
+  anything: nothing has ever set `curated_at`, and the buckets filtered a `mode` tag
+  namespace (`hybrid_*`) that the default search path does not write (`combined_*`). See
+  `Loopctl.Knowledge.RetrievalMetrics` for the full reasoning and the two conditions that
+  would have to hold before reintroducing them.
 
   `tenant_id` is set programmatically, never cast.
   """
@@ -65,12 +61,6 @@ defmodule Loopctl.Knowledge.RetrievalMetricSnapshot do
     field :searches_with_follow_through, :integer, default: 0
     field :search_follow_through, :float, default: 0.0
     field :results_returned, :integer, default: 0
-    field :curated_searched, :integer, default: 0
-    field :curated_followed_through, :integer, default: 0
-    field :curated_precision, :float, default: 0.0
-    field :retrieved_searched, :integer, default: 0
-    field :retrieved_followed_through, :integer, default: 0
-    field :retrieved_precision, :float, default: 0.0
 
     # Unit: READS (get/context/drill rows), NOT surfaced results and NOT search calls.
     # `followed_through` above counts SURFACED RESULTS that were later opened, so it is not
@@ -105,12 +95,6 @@ defmodule Loopctl.Knowledge.RetrievalMetricSnapshot do
     :searches_with_follow_through,
     :search_follow_through,
     :results_returned,
-    :curated_searched,
-    :curated_followed_through,
-    :curated_precision,
-    :retrieved_searched,
-    :retrieved_followed_through,
-    :retrieved_precision,
     :attributed_opens,
     :cross_key_opens,
     :direct_opens,
@@ -136,12 +120,6 @@ defmodule Loopctl.Knowledge.RetrievalMetricSnapshot do
       :searches_with_follow_through,
       :search_follow_through,
       :results_returned,
-      :curated_searched,
-      :curated_followed_through,
-      :curated_precision,
-      :retrieved_searched,
-      :retrieved_followed_through,
-      :retrieved_precision,
       :computed_at
     ])
     |> unique_constraint([:tenant_id, :day, :window_seconds],
