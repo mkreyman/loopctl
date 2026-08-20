@@ -22,7 +22,7 @@
     },
     {
       "id": "AC-42.1.2",
-      "description": "Loopctl.Knowledge.StructuralLinks.harvest/2 creates, for each article carrying a resolvable source, exactly one derived_from edge from that article to its source hub. Direction is article -> hub (the article is derived from the source). No sibling-to-sibling edge is ever written.",
+      "description": "CORRECTED 2026-08-20 BY MEASUREMENT. Resolve each article's source from its SOURCE-FAMILY TAG (book-, doc-, repo-, yt- prefixes) FIRST, with the source_type/source_id COLUMNS as the fallback - the inverse of this story's original assumption. knowledge_get on a book-extracted article (360cd5a5, tagged book-9baec82a16b7) returns source_type: null and source_id: null, so the columns are largely unpopulated and a column-first harvest would find almost nothing. Loopctl.Knowledge.StructuralLinks.harvest/2 then creates, for each article with a resolvable source, exactly one derived_from edge from that article to its source hub. Direction is article -> hub. No sibling-to-sibling edge is ever written.",
       "status": "pending"
     },
     {
@@ -37,7 +37,7 @@
     },
     {
       "id": "AC-42.1.5",
-      "description": "derived_from edges are EXEMPT from LinkPruning. Pruning targets relationship_type = 'relates_to' only (link_pruning.ex:265,285); a structural edge is exact and must never be evicted by a similarity ranking. A test asserts a derived_from edge survives a prune run that removes relates_to edges on the same article.",
+      "description": "VERIFIED ALREADY TRUE, so this reduces to a regression test. LinkPruning filters on relationship_type = 'relates_to' (link_pruning.ex:265,285), so derived_from is exempt BY CONSTRUCTION and no code change is needed. Add the test asserting a derived_from edge survives a prune run which removes relates_to edges on the same article, so a future widening of the prune predicate cannot silently start evicting structural edges.",
       "status": "pending"
     },
     {
@@ -47,7 +47,7 @@
     },
     {
       "id": "AC-42.1.7",
-      "description": "The harvest is tenant-scoped and runs through Loopctl.Repo under RLS, never AdminRepo. A tenant's harvest can never read or link another tenant's articles, and a tenant-isolation test asserts it.",
+      "description": "OPEN DESIGN DECISION, deliberately not settled in the story. The harvest is a corpus-wide sweep and the repo choice is a capacity and isolation decision, not a detail: AdminRepo's 3-connection pool (config/runtime.exs:190) is load-bearing for every authenticated request and the recorded KB finding is to keep heavy reads off it - yet the existing system link-writers (ArticleLinkingWorker, promote_conflicts) insert via AdminRepo directly. The likely shape is Loopctl.HeavyRead for the scan plus a tenant-scoped RLS write, but settle it against tenancy-rls/SKILL.md before writing code. Whatever is chosen, the harvest must be tenant-scoped and a tenant-isolation test must assert that one tenant's harvest can neither read nor link another tenant's articles.",
       "status": "pending"
     },
     {
@@ -180,11 +180,12 @@
   ],
   "technical_notes": [
     "derived_from already exists in ArticleLink's @relationship_type_values and in the composite unique index - this story adds a PRODUCER for a declared-but-unwritten type, not a new type. No migration is required for the edges themselves.",
-    "Resolve the source from the source_type/source_id COLUMNS first and fall back to the source-family tag prefixes (book-, doc-, repo-, yt-) only where the columns are null. Per the recorded finding on #137, source_id is deliberately NOT per-article unique - shared source_id across siblings is the signal this story consumes, not a defect to repair.",
+    "CORRECTED BY MEASUREMENT 2026-08-20: resolve the source from the source-family TAG PREFIX first (book-, doc-, repo-, yt-), not from the source_type/source_id columns. Those columns are null on the book-extracted articles sampled, so the tags are the real signal. Per the recorded finding on #137, source_id is deliberately NOT per-article unique - a shared source across siblings is the signal this story consumes, not a defect to repair.",
     "The human-readable source name for the hub title has to come from somewhere: prefer an existing sibling's metadata, else the source_type plus a shortened digest. Never invent a title. A hub whose name is a digest is still a navigational win over no hub; a hub whose name is a hallucinated book title is worse than nothing.",
     "Run it as an Oban worker on the existing knowledge cadence rather than inline on write - the harvest is a whole-corpus sweep and must not sit in the ingestion request path. Idempotency (AC-42.1.3) is what makes an unattended repeat safe.",
     "This is stage 0.5 of #611, sitting between the shipped prune (stage 0) and the LLM relation typing (stage 1). It is deliberately cheap: no model call, no embedding, no judgment. Land it before stage 1 so the expensive pass has a set of known-true edges to calibrate against.",
-    "Do NOT extend this to co-membership of a project_id or a shared topical tag. Those are set memberships, not relations, and harvesting them reintroduces the clique problem this story's star shape exists to avoid."
+    "Do NOT extend this to co-membership of a project_id or a shared topical tag. Those are set memberships, not relations, and harvesting them reintroduces the clique problem this story's star shape exists to avoid.",
+    "STATUS 2026-08-20: NOT IMPLEMENTED. Specified, and two acceptance criteria corrected against evidence gathered while starting it (AC-42.1.2 source resolution, AC-42.1.5 already-true-by-construction). AC-42.1.7 is a genuine open decision about repo and RLS that a session should settle deliberately rather than inherit. The measurement that shaped the whole story - 210 distinct book- sources, the largest over 1,500 articles, hence a star and never a clique - came from knowledge_facets(tag_prefix: 'book-') and is worth re-running before implementing, since the corpus grows."
   ],
   "dependencies": [],
   "estimated_tokens": 120000
