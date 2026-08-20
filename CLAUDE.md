@@ -370,7 +370,14 @@ mix ecto.reset         # Drop, create, migrate
   outlives the code. Prior art, what was measured, and what was rejected and why. Read the
   relevant one before redesigning a subsystem it covers; a decision reversed without its
   rationale tends to get re-reversed.
-- **User Stories**: `docs/user_stories/epic_N_name/us_N.M.json` — one file per story, one folder per epic
+- **User Stories**: `docs/user_stories/epic_N_name/us_N.M.json` — one file per story, one folder per epic.
+  Their shape is DECLARED in `docs/user_stories/story.schema.json` — write a new story against it, and
+  do not relax it to make a story pass. It is deliberately STRICTER than the `/api/v1` import payload
+  (authored stories require a non-empty `acceptance_criteria` list with an `id` on every criterion; the
+  import path accepts an empty list, and takes `criterion` as an alias for `description`), because a
+  generated story should carry both and a backfill of pre-loopctl work legitimately carries neither.
+  `test/loopctl/user_story_schema_test.exs` validates the whole committed corpus against it and binds
+  the half the two declarations share, so they cannot drift apart.
 - **Orchestration skills**: `skills/loopctl-*.md` — the orchestration LOOP itself (dispatch, review, verify)
 - **Domain skills**: `.claude/skills/<domain>/SKILL.md` — code-map + invariants skills, loaded when you touch that domain (routing table below). Distinct from the `skills/loopctl-*.md` orchestration skills above.
 - **Orchestration Guide**: `docs/orchestration-guide.md` — methodology: loop, trust model, checkpointing

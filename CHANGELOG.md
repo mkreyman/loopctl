@@ -2,6 +2,43 @@
 
 All notable changes to loopctl are documented here.
 
+## [Unreleased] — 2026-08-20 — Work-breakdown import: a criterion must carry text
+
+### Changed
+
+- **`POST /api/v1/projects/:id/import` (and the merge variant) now reject an acceptance
+  criterion carrying no text.** An entry with neither `description` nor `criterion` — or with
+  only whitespace in both — returns `422` naming the offending index, e.g.
+  `epics[0].stories[0].acceptance_criteria[1]: must carry a non-empty 'description' (or
+  'criterion')`. Previously such an entry was accepted: the guard checked only that each
+  member was an object, so `{}` and `{"note": "tbd"}` passed while the error message it
+  would have printed claimed that `id` and `description` were both required. The message
+  stated a contract the code did not hold, and the contract it stated was not the right one
+  either — this endpoint has accepted `criterion` as an alternative to `description` since
+  the 2026-03-28 discoverability change, and has never required `id`.
+
+  **What did NOT change, deliberately:** an absent or empty `acceptance_criteria` list is
+  still accepted. Importing a skeleton for pre-loopctl work is a supported path — the same
+  payload carries `initial_agent_status: "reported_done"` precisely for completed historical
+  work — and requiring criteria at the import boundary would break that to enforce a rule
+  whose real home is the verify gate. `id` is still optional here.
+
+  **Operator impact:** an integration that has been sending textless criteria will start
+  getting a 422 where it previously got a 200. The criteria it was sending were being stored
+  as entries with nothing for `verify_story` to be judged against, so the failure is
+  surfacing existing bad data rather than creating a new restriction. No migration, no new
+  environment variable.
+
+### Added
+
+- **`docs/user_stories/story.schema.json`** — the declared shape of an authored user story
+  (`docs/user_stories/epic_N_name/us_N.M.json`), derived from all 240 committed stories
+  rather than invented. It is stricter than the import payload on purpose (a non-empty
+  criteria list, an `id` on every criterion), and `test/loopctl/user_story_schema_test.exs`
+  binds the two so the half they share — that a criterion carries text — cannot drift apart.
+  No new runtime dependency: the schema is a declaration, and the test is the only place it
+  needs to be executable.
+
 ## [Unreleased] — 2026-08-07 — Story lifecycle capability delivery
 
 ### Added

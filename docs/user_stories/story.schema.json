@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://loopctl.com/schemas/user-story.schema.json",
+  "title": "loopctl authored user story",
+  "description": "The shape of docs/user_stories/epic_N_name/us_N.M.json. This is the DECLARATION the user-story-writer skill emits against, and test/loopctl/user_story_schema_test.exs validates the committed corpus against it. It describes the AUTHORED FILE format, which is NOT the /api/v1 import payload (that one keys stories by `number`, not `id`). The two share the acceptance-criteria shape, and Loopctl.ImportExport enforces that half on the import path; the drift test binds the two so the shared half cannot diverge. Every rule below was DERIVED from all 240 committed stories on 2026-08-20, never invented: where the corpus is inconsistent this schema stays permissive and says so, because a schema that fails the corpus it describes is a schema nobody can turn on.",
+  "type": "object",
+  "required": [
+    "id",
+    "title",
+    "epic",
+    "priority",
+    "story",
+    "rationale",
+    "acceptance_criteria",
+    "test_cases",
+    "technical_notes",
+    "dependencies"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^US-[0-9]+\\.[0-9A-Za-z.]+$",
+      "description": "US-<epic>.<story>. The story segment is deliberately loose: the corpus carries US-26.1.1 (three-part), US-27.6a (letter suffix) and US-40.D1 (letter prefix), all legitimate."
+    },
+    "title": { "type": "string", "minLength": 1 },
+    "epic": {
+      "type": "object",
+      "required": ["id", "name"],
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "pattern": "^epic_[0-9]+$" },
+        "name": { "type": "string", "minLength": 1 }
+      }
+    },
+    "priority": {
+      "type": "string",
+      "enum": ["critical", "high", "medium", "low"],
+      "description": "Enumerated because the corpus is already clean on this field: exactly these four values across all 240 stories."
+    },
+    "phase": { "type": "string", "minLength": 1 },
+    "background": {
+      "description": "Either free prose or a structured note. The corpus carries BOTH — 101 objects of {reference, includes} and 9 plain strings — so this stays a union rather than forcing 101 already-merged stories into a shape they never used.",
+      "oneOf": [
+        { "type": "string", "minLength": 1 },
+        { "type": "object", "minProperties": 1, "additionalProperties": true }
+      ]
+    },
+    "story": {
+      "type": "object",
+      "required": ["as_a", "i_want_to", "so_that"],
+      "additionalProperties": true,
+      "properties": {
+        "as_a": { "type": "string", "minLength": 1 },
+        "i_want_to": { "type": "string", "minLength": 1 },
+        "so_that": { "type": "string", "minLength": 1 }
+      }
+    },
+    "rationale": { "type": "string", "minLength": 1 },
+    "acceptance_criteria": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Non-empty, and every member carries a non-empty id and description. This is the load-bearing rule in the whole schema: acceptance criteria are what verify_story is judged against, so a story with none can traverse the entire custody chain to `verified` with nothing that could have been verified.",
+      "items": {
+        "type": "object",
+        "required": ["id", "description"],
+        "additionalProperties": true,
+        "properties": {
+          "id": { "type": "string", "pattern": "^AC-[0-9]+\\.[0-9A-Za-z.]+$" },
+          "description": { "type": "string", "minLength": 1 },
+          "status": {
+            "type": "string",
+            "minLength": 1,
+            "description": "NOT enumerated on purpose. The corpus carries pending, complete, completed, removed and satisfied — complete/completed/satisfied being synonyms that drifted. Enumerating that set would bless the drift; forbidding it would fail 23 criteria in already-merged stories for no functional gain, since authored status is descriptive and the live status lives in the database. Converging the vocabulary is its own change, not a side effect of declaring the schema."
+          }
+        }
+      }
+    },
+    "test_cases": {
+      "type": "array",
+      "description": "May be empty: a few stories are pure documentation or configuration changes with nothing to exercise.",
+      "items": {
+        "type": "object",
+        "required": ["id", "name", "type", "steps", "expected_results"],
+        "additionalProperties": true,
+        "properties": {
+          "id": { "type": "string", "pattern": "^TC-[0-9]+\\.[0-9A-Za-z.]+$" },
+          "name": { "type": "string", "minLength": 1 },
+          "type": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Observed values: integration, unit, manual. Left open rather than enumerated so a story can legitimately declare e2e, property or scale without a schema change first."
+          },
+          "preconditions": { "type": "array", "items": { "type": "string" } },
+          "steps": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+          "expected_results": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+          "status": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "technical_notes": { "type": "array", "items": { "type": "string" } },
+    "dependencies": {
+      "type": "array",
+      "description": "Story ids this story depends on. Empty array when there are none.",
+      "items": { "type": "string", "pattern": "^US-[0-9]+\\.[0-9A-Za-z.]+$" }
+    },
+    "estimated_hours": { "type": "number", "exclusiveMinimum": 0 },
+    "estimated_tokens": { "type": "integer", "exclusiveMinimum": 0 }
+  }
+}

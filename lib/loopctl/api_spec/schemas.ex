@@ -2137,16 +2137,27 @@ defmodule Loopctl.ApiSpec.Schemas do
       description:
         ~s(A single acceptance criterion. ) <>
           ~s(Accepts both `{"criterion": "..."}` and `{"id": "AC-1", "description": "..."}` formats. ) <>
-          "When `description` is present it is mapped to `criterion` automatically.",
+          "When `description` is present it is mapped to `criterion` automatically. " <>
+          "**Every criterion must carry text in one of those two keys**: an entry with " <>
+          "neither, or with only whitespace, is rejected with a 422 naming its index " <>
+          "(e.g. `epics[0].stories[0].acceptance_criteria[1]`). `id` remains optional. " <>
+          "An ABSENT or EMPTY acceptance_criteria list is still accepted, so a skeleton " <>
+          "import for pre-existing work (see `initial_agent_status: \"reported_done\"`) " <>
+          "keeps working.",
       type: :object,
       properties: %{
         criterion: %Schema{
           type: :string,
-          description: "Acceptance criterion text (canonical key)"
+          minLength: 1,
+          description:
+            "Acceptance criterion text (canonical key). Required unless `description` is given."
         },
         description: %Schema{
           type: :string,
-          description: "Acceptance criterion text (alias for criterion, normalized on import)"
+          minLength: 1,
+          description:
+            "Acceptance criterion text (alias for criterion, normalized on import). " <>
+              "Required unless `criterion` is given."
         },
         id: %Schema{
           type: :string,

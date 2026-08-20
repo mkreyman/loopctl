@@ -1,0 +1,159 @@
+{
+  "id": "US-42.2",
+  "title": "A declared schema for work-breakdown imports, enforced instead of described",
+  "epic": {
+    "id": "epic_42",
+    "name": "Recorded Structure"
+  },
+  "priority": "high",
+  "phase": "core",
+  "background": "loopctl carries 39 epic folders of hand- and LLM-authored us_N.M.json and no schema anywhere that says what one is. Validation on the import path is a handful of hand-written guards in lib/loopctl/import_export.ex, and they do not enforce what they claim. validate_acceptance_criteria/2 (import_export.ex:868-885) returns :ok for nil, returns :ok for [], and its only substantive check is Enum.all?(acs, &is_map/1) - while the error message it would print asserts that acceptance criteria 'must be an array of objects with id and description keys'. A story with zero acceptance criteria imports clean. So does one whose criteria are maps carrying neither key. The message states a contract the code does not hold, which is the worst arrangement available: a reader trusts it and nothing checks it. This matters more here than in a typical import path because acceptance criteria are the thing verify_story is judged against - an AC-less story can traverse claim, start, report, review-complete and verify and reach 'verified' with nothing that could have been verified.",
+  "story": {
+    "as_a": "an orchestrator importing a generated epic",
+    "i_want_to": "have malformed stories rejected at the boundary against one declared schema",
+    "so_that": "the shape of a story is enforced where it enters the system rather than described in an error message that never fires"
+  },
+  "rationale": "One declaration, two consumers. The same schema constrains GENERATION (the user-story-writer skill emits against it) and validates INGESTION (import_export checks against it), so the generator cannot negotiate the shape and the importer cannot drift from the generator. Writing the guards by hand is how the current mismatch arose: each guard was written next to the field it checks, nobody owned the whole, and the error strings aged into fiction. A schema is a single artifact that a reviewer can read in one sitting and a test can execute.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-42.2.1",
+      "description": "A JSON Schema for an AUTHORED user story lives at docs/user_stories/story.schema.json and is the single declaration of that shape. It requires id, title, epic{id,name}, priority, story{as_a,i_want_to,so_that}, rationale, test_cases, technical_notes, dependencies and a non-empty acceptance_criteria array whose members each require a non-empty id and description. Every rule is DERIVED from the committed corpus, never invented: where the corpus is legitimately inconsistent (status vocabulary, test-case type, background as string-or-object, letter-suffixed ids) the schema stays permissive and records why.",
+      "status": "complete"
+    },
+    {
+      "id": "AC-42.2.2",
+      "description": "REVISED DURING IMPLEMENTATION. The import path enforces that a criterion which IS PRESENT carries text in 'description' or 'criterion'; an entry with neither, or whitespace in both, is rejected. An ABSENT or EMPTY acceptance_criteria list stays ACCEPTED, and 'id' stays optional on this path. The story originally called for rejecting nil/[] and requiring id+description; both were wrong and the evidence is in the repo. Importing a skeleton for pre-loopctl work is a supported path - the same payload carries initial_agent_status: 'reported_done' for completed historical work - so rejecting empty criteria would break backfill to enforce a rule whose real home is the verify gate. And this endpoint has accepted 'criterion' as an alias for 'description' with no id since the 2026-03-28 discoverability change, so requiring id+description would have regressed a documented format. The genuine defect - a textless criterion passing while the error message claimed id and description were required - is fixed.",
+      "status": "complete"
+    },
+    {
+      "id": "AC-42.2.3",
+      "description": "Rejection is per-story and names the path already threaded through the validator (e.g. 'epics[2].stories[5].acceptance_criteria[0].description'), so an import of 60 stories reports which one is malformed rather than failing anonymously.",
+      "status": "complete"
+    },
+    {
+      "id": "AC-42.2.4",
+      "description": "Existing committed stories are checked against the schema by a test that walks docs/user_stories/*/us_*.json. Any story already in the repo that does not conform is FIXED in this story's branch, not exempted - the schema is worthless if the corpus it describes violates it on day one.",
+      "status": "complete"
+    },
+    {
+      "id": "AC-42.2.5",
+      "description": "The tightened validation changes the import contract and is documented as such: CHANGELOG.md carries an operator-facing entry stating what now 422s, what deliberately did not change, and that the failure surfaces existing bad data rather than creating a new restriction; the AcceptanceCriterion OpenAPI schema records the text requirement, the indexed 422, that id stays optional, and that an empty list is still accepted.",
+      "status": "complete"
+    },
+    {
+      "id": "AC-42.2.6",
+      "description": "The schema and the validator cannot drift: ONE test loads story.schema.json, derives the required-key set from it, and asserts the Elixir validator rejects a fixture missing each required key in turn. Adding a required key to the schema without teaching the validator fails that test.",
+      "status": "complete"
+    },
+    {
+      "id": "AC-42.2.7",
+      "description": "The generator is pointed at the schema. Done IN THIS REPO via CLAUDE.md's Key Documents entry, which every session and subagent on loopctl is guaranteed to read. The user-story-writer SKILL itself lives in the claude-config repo, which this session cannot write to - that half is a cross-repo change, not a loopctl one, and is unmade.",
+      "status": "partial - loopctl half complete, claude-config half is cross-repo"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-42.2.1",
+      "name": "a story with no acceptance criteria is rejected",
+      "type": "unit",
+      "preconditions": [
+        "an import payload whose story omits acceptance_criteria"
+      ],
+      "steps": [
+        "call import_project/4"
+      ],
+      "expected_results": [
+        "the import fails",
+        "the error names the story path and the acceptance_criteria key"
+      ],
+      "status": "revised - see AC-42.2.2"
+    },
+    {
+      "id": "TC-42.2.2",
+      "name": "an empty acceptance_criteria array is rejected",
+      "type": "unit",
+      "preconditions": [
+        "a story with acceptance_criteria: []"
+      ],
+      "steps": [
+        "call import_project/4"
+      ],
+      "expected_results": [
+        "the import fails rather than returning :ok"
+      ],
+      "status": "revised - see AC-42.2.2"
+    },
+    {
+      "id": "TC-42.2.3",
+      "name": "a criterion missing description is rejected and located",
+      "type": "unit",
+      "preconditions": [
+        "a story whose acceptance_criteria[1] is a map with only an id"
+      ],
+      "steps": [
+        "call import_project/4"
+      ],
+      "expected_results": [
+        "the import fails",
+        "the error names index 1 and the missing 'description' key"
+      ],
+      "status": "complete"
+    },
+    {
+      "id": "TC-42.2.4",
+      "name": "a well-formed story still imports",
+      "type": "integration",
+      "preconditions": [
+        "a payload conforming to story.schema.json"
+      ],
+      "steps": [
+        "call import_project/4"
+      ],
+      "expected_results": [
+        "the import succeeds",
+        "acceptance criteria are persisted unchanged"
+      ],
+      "status": "complete"
+    },
+    {
+      "id": "TC-42.2.5",
+      "name": "every committed story conforms to the schema",
+      "type": "integration",
+      "preconditions": [
+        "docs/user_stories/*/us_*.json on this branch"
+      ],
+      "steps": [
+        "validate each file against story.schema.json"
+      ],
+      "expected_results": [
+        "zero violations"
+      ],
+      "status": "complete"
+    },
+    {
+      "id": "TC-42.2.6",
+      "name": "schema and validator cannot drift",
+      "type": "unit",
+      "preconditions": [
+        "story.schema.json declares its required keys"
+      ],
+      "steps": [
+        "for each required key, build a fixture omitting it and validate"
+      ],
+      "expected_results": [
+        "the Elixir validator rejects every one of them"
+      ],
+      "status": "complete"
+    }
+  ],
+  "technical_notes": [
+    "Do NOT add a JSON-Schema runtime dependency to the Elixir app for this. The schema is the DECLARATION and the source of truth for reviewers, the generator and the drift test; the import path stays plain Elixir guards that the drift test (AC-42.2.6) binds to it. Adding an ex_json_schema dependency to enforce one shape on one endpoint buys less than the test does and puts a parser in the request path.",
+    "AC-42.2.4 is the part most likely to grow: some of the 39 epics predate any convention and may carry stories with no acceptance criteria at all. Fix them in this branch. If a story genuinely has none because it was a placeholder, deleting it is a valid fix; exempting it from the schema is not.",
+    "The tightening changes behaviour for any existing caller importing AC-less stories. That is the point - such a story can reach 'verified' with nothing verified - but it is a breaking change and AC-42.2.5 is what stops it shipping silently.",
+    "Keep the path threading that already exists in validate_story/2; the current code computes a useful path and then discards its specificity in a generic message. The fix is mostly to stop throwing that information away.",
+    "This story pairs with US-42.1 under one thesis: both replace an inference with a record of something the system already knows. There is no code dependency between them and they can land in either order.",
+    "IMPLEMENTATION NOTE (2026-08-20): AC-42.2.2 was revised against evidence found while building it - see its text. The corpus check that AC-42.2.4 called for found ZERO violations across all 240 committed stories, so no story needed fixing: the convention was already real and universally followed, it had simply never been written down or enforced."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 90000
+}
