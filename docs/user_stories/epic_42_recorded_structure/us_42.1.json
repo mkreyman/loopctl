@@ -17,7 +17,7 @@
   "acceptance_criteria": [
     {
       "id": "AC-42.1.1",
-      "description": "A source hub is an ordinary article (no new table) with category 'reference', title 'Source: <human-readable source name>', and metadata.hub_kind = 'source'. It is identified by a deterministic idempotency_key derived from (tenant_id, source_type, source_id) so a re-run resolves the existing hub rather than creating a second one.",
+      "description": "A source hub is an ordinary article (no new table) with category 'reference', title 'Source: <human-readable source name>', and metadata.hub_kind = 'source'. It is identified by a deterministic idempotency_key derived from (tenant_id, source_type, source_id) so a re-run resolves the existing hub rather than creating a second one. AMENDED 2026-08-20: minting is the FALLBACK, not the default. Most sources already have a hub - every extraction skill emits 'hub + atomic notes' and that article carries the source's real name (book-6a3020c2cd15 is 'Advanced Cypher Concepts') - so the harvester ADOPTS an existing published article carrying the source tag and the 'hub' tag, oldest-first for stability, and mints a synthetic hub only where none exists. Adopting also disposes of the naming problem: a minted hub can only be named from a digest, an adopted one already has the real title.",
       "status": "complete"
     },
     {
