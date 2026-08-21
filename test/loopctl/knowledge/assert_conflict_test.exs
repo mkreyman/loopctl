@@ -13,6 +13,8 @@ defmodule Loopctl.Knowledge.AssertConflictTest do
   """
   use Loopctl.DataCase, async: true
 
+  import Ecto.Query, only: [from: 2]
+
   alias Loopctl.AdminRepo
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.ArticleLink
@@ -44,6 +46,13 @@ defmodule Loopctl.Knowledge.AssertConflictTest do
       ),
       opts
     )
+  end
+
+  # TENANT-SCOPED, never a global aggregate: AdminRepo is BYPASSRLS, so counting every
+  # article_link in the database makes these assertions fail on any test DB that carries a
+  # committed row (the :scale suite commits its corpus into the shared one).
+  defp link_count(tenant_id) do
+    AdminRepo.aggregate(from(l in ArticleLink, where: l.tenant_id == ^tenant_id), :count, :id)
   end
 
   defp system_flag(tenant_id, a, b, score) do
@@ -90,7 +99,9 @@ defmodule Loopctl.Knowledge.AssertConflictTest do
       assert row.similarity == nil
       assert row.assertion.classification == "contradictory"
       assert row.assertion.evidence =~ "does not follow"
-      assert row.assertion.asserted_by == "agent:corrector"
+      # The server-derived PRINCIPAL, not the audit label: the label is
+      # "<role>:<key_name>" and this queue is an agent-role read surface.
+      assert row.assertion.asserted_by == "agent-writing-the-correction"
       assert Enum.map(row.articles, & &1.title) |> Enum.sort() == ["A", "B"]
     end
 
@@ -262,6 +273,115 @@ defmodule Loopctl.Knowledge.AssertConflictTest do
       assert {:error, :same_article} = assert_pair(t.id, a, a)
     end
 
+    # `:binary_id` normalizes case only at DUMP time, so an uppercase spelling used to pass
+    # both this guard and the changeset's `validate_no_self_link` and land as a row whose
+    # two FK columns hold identical bytes.
+    test "an article cannot be asserted against itself under a different UUID casing" do
+      t = fixture(:tenant)
+      a = published(t.id, "A")
+
+      assert {:error, :same_article} =
+               assert_pair(t.id, a, %{a | id: String.upcase(a.id)})
+    end
+
+    test "a malformed article id is refused, never interpolated into the query" do
+      t = fixture(:tenant)
+      a = published(t.id, "A")
+
+      assert {:error, :missing_article_id} =
+               assert_pair(t.id, a, %{a | id: "not-a-uuid"})
+    end
+
+    test "classification must be one of the three declared values" do
+      t = fixture(:tenant)
+      a = published(t.id, "A")
+      b = published(t.id, "B")
+
+      assert {:error, :invalid_classification} =
+               assert_pair(t.id, a, b, @asserter, %{"classification" => "authoritative"})
+    end
+
+    test "the proposed winner must be a member of the pair" do
+      t = fixture(:tenant)
+      a = published(t.id, "A")
+      b = published(t.id, "B")
+      elsewhere = published(t.id, "C")
+
+      assert {:error, :invalid_proposed_article} =
+               assert_pair(t.id, a, b, @asserter, %{
+                 "proposed_authoritative_article_id" => elsewhere.id
+               })
+
+      assert {:error, :invalid_proposed_article} =
+               assert_pair(t.id, a, b, @asserter, %{
+                 "proposed_authoritative_article_id" => "not-a-uuid"
+               })
+    end
+
+    test "evidence is bounded — it is echoed on every row of the queue" do
+      t = fixture(:tenant)
+      a = published(t.id, "A")
+      b = published(t.id, "B")
+
+      oversized = String.duplicate("x", Knowledge.max_assertion_evidence_bytes() + 1)
+
+      assert {:error, :evidence_too_long} =
+               assert_pair(t.id, a, b, @asserter, %{"evidence" => oversized})
+    end
+
+    # The queue admits two provenances and a reviewer must be able to ask for ONE —
+    # asserted rows lead the ordering, so page 1 is otherwise caller-controlled.
+    test "the queue can be filtered to one provenance" do
+      t = fixture(:tenant)
+      a = published(t.id, "A")
+      b = published(t.id, "B")
+      c = published(t.id, "C")
+      d = published(t.id, "D")
+      system_flag(t.id, a, b, 0.99)
+      assert {:ok, _link, :created} = assert_pair(t.id, c, d)
+
+      assert %{data: [only], meta: %{total_count: 1}} =
+               Knowledge.list_potential_conflicts(t.id, origin: "system")
+
+      assert only.origin == "system"
+
+      assert %{data: [asserted], meta: %{total_count: 1}} =
+               Knowledge.list_potential_conflicts(t.id, origin: "asserted")
+
+      assert asserted.origin == "asserted"
+    end
+
+    # The inverse of "an assertion must not suppress": two principals must not be able to
+    # pre-settle an arbitrary pair against a system flag raised over it LATER.
+    test "a verdict cannot settle a system flag that did not exist when it was recorded" do
+      t = fixture(:tenant)
+      a = published(t.id, "A")
+      b = published(t.id, "B")
+      assert {:ok, link, :created} = assert_pair(t.id, a, b)
+
+      assert {:ok, %ConflictResolution{}} =
+               Knowledge.annotate_conflict(
+                 t.id,
+                 %{
+                   "source_article_id" => a.id,
+                   "target_article_id" => b.id,
+                   "disposition" => "dismiss"
+                 },
+                 @judge
+               )
+
+      assert %{meta: %{total_count: 0}} = Knowledge.list_potential_conflicts(t.id)
+
+      # The asserted flag is retracted and the sweep later raises a GENUINE system flag over
+      # the same two articles. The verdict above judged a flag that no longer exists, so it
+      # must not arrive pre-settled.
+      AdminRepo.delete!(link)
+      system_flag(t.id, a, b, 0.99)
+
+      assert %{data: [row], meta: %{total_count: 1}} = Knowledge.list_potential_conflicts(t.id)
+      assert row.origin == "system"
+    end
+
     test "an agent cannot assert a conflict over an article it cannot see" do
       t = fixture(:tenant)
       mine = published(t.id, "mine", %{"visibility" => "shared"})
@@ -280,7 +400,7 @@ defmodule Loopctl.Knowledge.AssertConflictTest do
       assert {:ok, link, :existing} = assert_pair(t.id, a, b)
       assert link.metadata["auto_generated"] == true
       refute link.metadata["asserted"]
-      assert AdminRepo.aggregate(ArticleLink, :count, :id) == 1
+      assert link_count(t.id) == 1
     end
 
     test "asserting the same pair twice is idempotent, in either direction" do
@@ -291,7 +411,7 @@ defmodule Loopctl.Knowledge.AssertConflictTest do
       assert {:ok, first, :created} = assert_pair(t.id, a, b)
       assert {:ok, again, :existing} = assert_pair(t.id, b, a)
       assert again.id == first.id
-      assert AdminRepo.aggregate(ArticleLink, :count, :id) == 1
+      assert link_count(t.id) == 1
     end
   end
 

@@ -619,6 +619,24 @@ defmodule LoopctlWeb.FallbackController do
     })
   end
 
+  # #730: the assertion's transaction failed in a step the caller cannot fix (the audit
+  # entry) and rolled back, so no link exists. ONE stable code rather than the failing
+  # step's own term — an audit-log changeset rendered as a 422 would assert the request
+  # body was invalid using fields the caller never sent.
+  def call(conn, {:error, :assertion_not_recorded}) do
+    conn
+    |> put_status(:internal_server_error)
+    |> json(%{
+      error: %{
+        status: 500,
+        code: "assertion_not_recorded",
+        message:
+          "The conflict assertion could not be recorded in the audit trail and was rolled " <>
+            "back; no pair was flagged. Nothing about your request is wrong — retry it."
+      }
+    })
+  end
+
   def call(conn, {:error, :unprocessable_entity, message}) when is_binary(message) do
     conn
     |> put_status(:unprocessable_entity)

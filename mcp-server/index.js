@@ -2096,11 +2096,18 @@ async function knowledgeResolveConflict({
   if (classification) payload.classification = classification;
   if (evidence) payload.evidence = evidence;
   if (confidence) payload.confidence = confidence;
+  // #730: the ORCHESTRATOR key first, falling back to the agent key. An assertion is made
+  // with LOOPCTL_AGENT_KEY, and the server refuses a verdict from the principal that
+  // asserted the pair (409 self_asserted_conflict) — so forwarding the verdict on the same
+  // key made every asserted pair permanently unjudgeable through the shipped client, in
+  // this session and every later one, since the agent key resolves to one principal. The
+  // orchestrator key is also the one that can record a supersede at "high" without being
+  // capped, so it is the right default for a verdict on either origin.
   const result = await apiCall(
     "POST",
     "/api/v1/knowledge/conflicts/resolve",
     payload,
-    process.env.LOOPCTL_AGENT_KEY,
+    process.env.LOOPCTL_ORCH_KEY || process.env.LOOPCTL_AGENT_KEY,
   );
   return toContent(result);
 }
@@ -5761,7 +5768,10 @@ const TOOLS = [
       "Only pairs with a real flag are reachable here — if the pair you want was never " +
       "flagged (you just wrote an article refuting another), assert it first with " +
       "knowledge_assert_conflict; a DIFFERENT key then records the verdict, since the " +
-      "asserter of a pair may not judge it (409 self_asserted_conflict). " +
+      "asserter of a pair may not judge it (409 self_asserted_conflict). This tool sends " +
+      "LOOPCTL_ORCH_KEY when one is configured (falling back to LOOPCTL_AGENT_KEY), which " +
+      "is what makes an asserted pair judgeable at all — with only an agent key configured, " +
+      "a pair you asserted yourself stays 409 forever. " +
       "Last-write-wins per pair, so re-recording with fresher ground truth overrides. " +
       "Resolve only conflicts material to your current task; adjudicate against the actual " +
       "system, and if you can't tell which is right, LEAVE IT UNRECORDED rather than " +

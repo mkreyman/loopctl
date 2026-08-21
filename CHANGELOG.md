@@ -22,8 +22,11 @@ All notable changes to loopctl are documented here.
   existing call does.** Two behaviours worth knowing:
 
   - `GET /api/v1/knowledge/conflicts` now returns asserted pairs alongside system-flagged
-    ones. Every row carries `origin`, so a consumer that must see only the mechanical
-    flags can filter on it.
+    ones, and asserted rows lead the ordering. Every row carries `origin`, and the endpoint
+    takes `?origin=system` / `?origin=asserted` so a reviewer can read one provenance
+    alone. `evidence` is capped at 4000 bytes (it is echoed on every row of that queue),
+    and a principal may hold only 25 UNJUDGED assertions at once — both are `422`s, so no
+    one caller decides what page 1 of the queue holds.
   - `POST /knowledge/conflicts/resolve` gains a `409 self_asserted_conflict`: the principal
     that asserted a pair may not also record its verdict. An asserted pair is named by its
     caller, so judging it is someone else's call — the same separation the `supersede`

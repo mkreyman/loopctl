@@ -33,6 +33,15 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   Idempotent per pair, in either direction; re-asserting returns the existing flag with
   `created: false` and never overwrites a system flag's provenance.
 
+### Changed
+
+- **`knowledge_resolve_conflict` now forwards `LOOPCTL_ORCH_KEY` when one is configured**,
+  falling back to `LOOPCTL_AGENT_KEY`. It previously always sent the agent key — the same
+  key `knowledge_assert_conflict` asserts with — so an asserted pair answered
+  `409 self_asserted_conflict` to every later call from any session on that configuration,
+  and the pair could never be judged through the shipped client. Configure both keys to use
+  the assert → judge loop; with only an agent key, a pair you asserted yourself stays 409.
+
 ## 2.74.0 — 2026-08-12 (one search command, three response shapes)
 
 ### Added

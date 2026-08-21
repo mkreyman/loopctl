@@ -1421,20 +1421,62 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       assert json_response(conn, 422)["error"]["message"] =~ "evidence is required"
     end
 
-    test "returns 422 naming the offending field for an article in another tenant", ctx do
-      %{conn: conn, correction: correction} = ctx
+    # An id an agent cannot SEE and an id that does not exist must be the SAME answer, or
+    # the two statuses together enumerate which private/foreign article ids are real.
+    test "an unreachable article is 404, indistinguishable from one that does not exist", ctx do
+      %{conn: conn, correction: correction, tenant: tenant} = ctx
       other = fixture(:tenant)
       theirs = fixture(:article, %{tenant_id: other.id, status: :published})
 
+      hidden =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          status: :published,
+          metadata: %{"visibility" => "private", "agent_id" => Ecto.UUID.generate()}
+        })
+
+      for target <- [theirs.id, hidden.id, Ecto.UUID.generate()] do
+        conn =
+          post(conn, ~p"/api/v1/knowledge/conflicts", %{
+            "source_article_id" => correction.id,
+            "target_article_id" => target,
+            "evidence" => "unreachable"
+          })
+
+        assert json_response(conn, 404)
+      end
+    end
+
+    # The 422 stays for a caller that sees everything: no oracle to protect, and naming the
+    # offending field is what makes a genuine typo fixable.
+    test "a user key still gets a 422 naming the offending field", %{conn: conn, tenant: tenant} do
+      {user_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      mine = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
       conn =
-        post(conn, ~p"/api/v1/knowledge/conflicts", %{
-          "source_article_id" => correction.id,
-          "target_article_id" => theirs.id,
-          "evidence" => "cross-tenant"
+        post(auth_conn(conn, user_key), ~p"/api/v1/knowledge/conflicts", %{
+          "source_article_id" => mine.id,
+          "target_article_id" => Ecto.UUID.generate(),
+          "evidence" => "no such article"
         })
 
       body = json_response(conn, 422)
       assert body["error"]["details"]["target_article_id"] == ["does not exist in this tenant"]
+    end
+
+    # An ordinary client typo must not reach `where: a.id == ^"not-a-uuid"`, which raises
+    # Ecto.Query.CastError — a 500 on a malformed request the spec documents as a 422.
+    test "a malformed article id is a 422, not a 500", ctx do
+      %{conn: conn, correction: correction} = ctx
+
+      conn =
+        post(conn, ~p"/api/v1/knowledge/conflicts", %{
+          "source_article_id" => correction.id,
+          "target_article_id" => "not-a-uuid",
+          "evidence" => "typo"
+        })
+
+      assert json_response(conn, 422)["error"]["message"] =~ "UUID"
     end
   end
 

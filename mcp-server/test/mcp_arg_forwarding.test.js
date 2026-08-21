@@ -1070,6 +1070,19 @@ describe("#730: knowledge_assert_conflict wiring", () => {
     assert.match(body, /if \(proposed_authoritative_article_id\)/);
   });
 
+  // The completion path has to EXIST for the shipped client: the asserter cannot judge its
+  // own pair, so if both tools forward the same key every asserted pair is unjudgeable
+  // forever — in this session and every later one on the same config.
+  test("knowledge_resolve_conflict prefers the orchestrator key over the asserting one", () => {
+    const body = functionSource("knowledgeResolveConflict");
+    assert.match(
+      body,
+      /process\.env\.LOOPCTL_ORCH_KEY \|\| process\.env\.LOOPCTL_AGENT_KEY/,
+      "the verdict must go out on the orchestrator key when one is configured, or a pair " +
+        "asserted with LOOPCTL_AGENT_KEY can never be resolved (409 self_asserted_conflict)",
+    );
+  });
+
   test("the tool description states what it does NOT grant", () => {
     // The two properties a caller will otherwise assume it bought: an assertion neither
     // retires the loser nor lets its asserter judge the pair. Both are refusals the server
