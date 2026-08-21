@@ -143,14 +143,20 @@ defmodule Loopctl.Memory.GraduationTest do
           text: "a near-duplicate of something already published"
         )
 
-      before = AdminRepo.aggregate(Article, :count, :id)
+      # TENANT-SCOPED, all three. `AdminRepo` is BYPASSRLS, so an unscoped aggregate counts
+      # EVERY tenant's rows: any concurrent async test — or a row a probe script committed
+      # into the shared test DB — makes these assertions report this test's own behaviour
+      # wrongly. The count pair survives that (both sides shift together) but the `refute`
+      # does not: one draft belonging to anyone else fails a test about THIS graduation.
+      mine = from(a in Article, where: a.tenant_id == ^scope.tenant_id)
+      before = AdminRepo.aggregate(mine, :count, :id)
 
       assert {:ok, :skipped_low_novelty, nil} = Memory.graduate_memory(scope, memory.id)
 
-      assert AdminRepo.aggregate(Article, :count, :id) == before,
+      assert AdminRepo.aggregate(mine, :count, :id) == before,
              "a low-novelty graduation must create NO article row — not even a draft"
 
-      refute AdminRepo.exists?(from(a in Article, where: a.status == :draft)),
+      refute AdminRepo.exists?(from(a in mine, where: a.status == :draft)),
              "the whole point is that no draft is produced for an unattended writer"
     end
 
