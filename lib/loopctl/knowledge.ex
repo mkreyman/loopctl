@@ -2175,13 +2175,15 @@ defmodule Loopctl.Knowledge do
               category: a.category,
               status: a.status,
               tags: a.tags,
-              # source_type feeds the #471 authority prior (it is NOT projected by
-              # default elsewhere); carried on the keyword lane so the priors apply on the
-              # degraded keyword_only fallback too (AC-5).
+              # Retained for LANE-SHAPE SYMMETRY only — every lane projects the same keys
+              # so fusion compares like with like. It feeds no ranking prior (the
+              # source-type authority prior was removed on 2026-08-21; RankingPriors, note
+              # above `@kill_tag`) and no search renderer emits it.
               source_type: a.source_type,
-              # idempotency_key is the MOC-hub signal (#654 follow-up). Projected for the
-              # SAME reason as source_type: RankingPriors fails open on a missing field,
-              # so a lane that omits it silently stops demoting hubs on that lane only.
+              # idempotency_key is the MOC-hub signal (#654 follow-up) and, UNLIKE
+              # source_type above, it is a live ranking input: RankingPriors fails open on
+              # a missing field, so a lane that omits it silently stops demoting hubs on
+              # that lane only.
               idempotency_key: a.idempotency_key,
               inserted_at: a.inserted_at,
               updated_at: a.updated_at,
@@ -8771,6 +8773,10 @@ defmodule Loopctl.Knowledge do
           category: a.category,
           status: a.status,
           tags: a.tags,
+          # The MOC-hub demotion signal, on the side-table path exactly as on
+          # pool_select(:semantic): RankingPriors fails open without it, so omitting it here
+          # made the WHOLE semantic lane hub-blind once side-table reads are on.
+          idempotency_key: a.idempotency_key,
           inserted_at: a.inserted_at,
           updated_at: a.updated_at
         }
@@ -8973,10 +8979,12 @@ defmodule Loopctl.Knowledge do
         category: c.category,
         status: c.status,
         tags: c.tags,
-        # source_type feeds the #471 authority prior (see the keyword select). The inner
-        # pool_select(:semantic) must project it for this outer select to read it.
+        # Lane-shape symmetry only — no longer a ranking input, and no search renderer
+        # emits it (see the keyword select). The inner pool_select(:semantic) must project
+        # it for this outer select to read it.
         source_type: c.source_type,
-        # Same contract for the MOC-hub demotion signal: inner projects it, outer reads it.
+        # Same projection contract for the MOC-hub demotion signal, which unlike
+        # source_type IS still ranked on: inner projects it, outer reads it.
         idempotency_key: c.idempotency_key,
         inserted_at: c.inserted_at,
         updated_at: c.updated_at,
@@ -9125,7 +9133,7 @@ defmodule Loopctl.Knowledge do
     - `:recency_weight` -- per-call override for the bounded recency prior weight
       (#471; default `:knowledge_recency_weight`, 0.3), clamped to `[0.0, 1.0]`. A
       weight of 0 makes recency a no-op. See `Loopctl.Knowledge.RankingPriors`.
-    - `:authority_prior` -- per-call boolean toggle for the source/category authority
+    - `:authority_prior` -- per-call boolean toggle for the CATEGORY authority
       prior (default `:knowledge_authority_prior_enabled`, true). The dead-doctrine
       demotion (`verdict-kill`/`:superseded`) applies regardless of this toggle.
     - `:authority_strength` -- per-call override for the authority prior strength
@@ -9502,9 +9510,10 @@ defmodule Loopctl.Knowledge do
             opts
           )
       end
-      # #471: re-rank the fused list by the recency + source-authority priors BEFORE the
-      # top-k cut. Pure (no DB) — the result maps already carry updated_at/category/
-      # source_type/tags/status, so merge_results/5 stays a DB-free fusion function.
+      # #471: re-rank the fused list by the recency + CATEGORY-authority priors (plus the
+      # dead-doctrine and MOC-hub demotions) BEFORE the top-k cut. Pure (no DB) — the
+      # result maps already carry updated_at/category/tags/status, so merge_results/5 stays
+      # a DB-free fusion function. Provenance priors were removed 2026-08-21.
       |> apply_ranking_priors_fused(opts)
 
     # #31 follow-up: the curated-vs-retrieved decision runs HERE, on the default path,
@@ -9662,7 +9671,7 @@ defmodule Loopctl.Knowledge do
     Keyword.get(opts, :rrf_k, Application.get_env(:loopctl, :knowledge_rrf_k, 60))
   end
 
-  # --- Recency + source-authority priors (#471) -------------------------------
+  # --- Recency + category-authority priors (#471) -----------------------------
   #
   # Post-fusion re-ranking applied on `search_combined/3`'s fused candidate list (and,
   # via apply_ranking_priors_fallback/2, on the degraded keyword_only path). PURE re-rank:
@@ -10003,13 +10012,17 @@ defmodule Loopctl.Knowledge do
           project_id: a.project_id,
           title: a.title,
           category: a.category,
-          # source_type is projected here for symmetry with the keyword lane
-          # (knowledge.ex ~1870) and the semantic pool (vector_search.ex ~499) so
-          # RankingPriors.authority_factor reads the SAME source-authority prior no
-          # matter which lane first surfaced a doc. Without it a graph-lane-only doc
-          # would fall back to source_authority(nil) (the 0.0 neutral floor) and get a
-          # category-only authority factor — asymmetric with kw/sem (#471 review).
+          # Projected for symmetry with the keyword lane and the semantic pool, and for
+          # nothing else: it feeds no ranking prior (the source-type authority prior was
+          # removed on 2026-08-21 — provenance must not move ranking; see the note above
+          # `@kill_tag` in RankingPriors) and no search renderer emits it. ArticleJSON
+          # surfaces the column on the article CRUD path, never on this one.
           source_type: a.source_type,
+          # UNLIKE source_type, this one IS a live ranking input: RankingPriors fails open
+          # on a missing field, so a lane that omits it silently stops demoting MOC hubs on
+          # that lane only — and a hub links to every member, so it is the likeliest
+          # graph-ONLY candidate there is (#654 follow-up).
+          idempotency_key: a.idempotency_key,
           status: a.status,
           tags: a.tags,
           inserted_at: a.inserted_at,

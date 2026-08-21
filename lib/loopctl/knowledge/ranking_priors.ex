@@ -19,8 +19,8 @@ defmodule Loopctl.Knowledge.RankingPriors do
       > decay as the single source of truth), but #471 now surfaces it on the PRIMARY search
       > path. If you run a mass re-embed, expect ranking to shift until authored-age drift
       > re-accumulates; there is no separate authored/source timestamp to fall back to.
-    * **Source authority** — a bounded prior derived from `category` / `source_type` /
-      `tags`, centered on 1.0 and clamped to a narrow band, so it re-ranks NEAR-TIES
+    * **Category authority** — a bounded prior derived from `category` ALONE, centered on
+      1.0 and clamped to a narrow band, so it re-ranks NEAR-TIES
       (which post-#470 Reciprocal Rank Fusion produces by construction) rather than
       overriding strong relevance. `verdict-kill` ideas and `:superseded` articles are
       demoted regardless of the authority toggle, so dead doctrine stops outranking live
@@ -43,8 +43,9 @@ defmodule Loopctl.Knowledge.RankingPriors do
   Post-#470 the fused `:final_score` is `Σ_lane weight/(k + rank)`. Two docs that each top
   a single lane tie EXACTLY; a doc with cross-lane consensus scores ~2x a single-lane hit.
   The authority factor clamps to `[0.9, 1.1]`, but the band is ONE-SIDED in practice: every
-  category/source weight is >= 0 and `strength` >= 0, so `1 + strength*(cat+src)` is always
-  >= 1.0 and the 0.9 floor is unreachable — the EFFECTIVE range is `[1.0, 1.1]`. Authority
+  category weight is >= 0 and `strength` >= 0, so `1 + strength*cat` is always >= 1.0 and
+  the 0.9 floor is unreachable — the EFFECTIVE range is `[1.0, 1 + strength*max_cat]`,
+  which at the default strength 0.05 tops out at 1.05, short of the 1.1 ceiling. Authority
   therefore only ever BOOSTS a higher-authority doc; it never demotes a low-authority raw
   note below neutral (that demotion is the SEPARATE `demotion_factor/1` job). Even so it can
   flip an exact/near tie but can NEVER flip a 2x-stronger consensus winner — precisely the
@@ -94,65 +95,66 @@ defmodule Loopctl.Knowledge.RankingPriors do
   # `idea`, per the issue's "decision/playbook/finding > idea > raw atomic note".
   @default_category_authority 0.0
 
-  # Source-type authority (data-driven). Human/reviewed provenance over raw automated
-  # ingests. Keys mirror Loopctl.Knowledge.Article.known_source_types/0; an unknown or
-  # nil source_type is neutral (0.0).
-  @source_authority %{
-    "review_finding" => 1.0,
-    "manual" => 0.8,
-    "skill" => 0.6,
-    "channel_graduation" => 0.5,
-    "session_log" => 0.2,
-    "agent" => 0.2,
-    "newsletter" => 0.1,
-    "web_article" => 0.1,
-    "ingestion" => 0.0
-  }
-  @default_source_authority 0.0
-
-  # Provenance authority (#251). The single strongest measured signal in this table, and
-  # the one the category/source_type weights above could not see.
+  # PROVENANCE PRIORS REMOVED (2026-08-21, owner decision).
   #
-  # Measured on the live corpus 2026-08-11, over 30 days of reads:
+  # This module carried two priors keyed on WHERE A DOCUMENT CAME FROM: a source_type
+  # table ("human/reviewed provenance over raw automated ingests") and a first-party /
+  # third-party split keyed on the sourcers' capture tags (`book-`/`url-`/`yt-`/`doc-`).
+  # Both are gone, and the reason they must not come back is worth more than the code was.
   #
-  #   first-party              3,164 articles   389.7 reads/1k   18.30% ever read
-  #   third-party (harvested) 75,768 articles    14.6 reads/1k    1.09% ever read
+  # THE EVIDENCE THEY RESTED ON DID NOT HOLD. The provenance prior cited a 26.7x
+  # per-article read rate. That statistic carries the harvest's own volume in its
+  # denominator — third-party was ~96% of the corpus — so with a roughly fixed query rate
+  # it falls ~1/N mechanically, whatever the material is worth. The number that actually
+  # answers "is this material worse?" is SURFACED-TO-OPENED CONVERSION, and nobody had
+  # taken it. Measured 2026-08-21 over the whole history of `article_access_events`, using
+  # this module's own discriminator and stratified by rank to remove position bias:
   #
-  # A 26.7x per-article read rate: first-party is 4% of the corpus and 53% of the reads.
-  # The June 2026 bulk harvest added 76k third-party articles, and every query since has
-  # had to pull the ~3k articles anyone actually opens out of that pool.
+  #   rank | first-party (+0.5) | third-party (0.0)
+  #      1 |  8.30% (6,144)     |  4.48% (3,304)
+  #      2 |  3.91% (5,390)     |  2.75% (3,927)
+  #      3 |  2.57% (5,167)     |  2.41% (4,019)
+  #      4 |  1.95% (4,916)     |  1.96% (3,477)
+  #      5 |  1.57% (4,774)     |  1.74% (3,455)
   #
-  # Why TAGS and not `source_type`: 83,487 of 85,157 articles carry a NULL `source_type`,
-  # the whole harvest included, so `@source_authority` returns its 0.0 default for
-  # essentially the entire corpus and cannot separate these cohorts at all. The sourcers
-  # DO stamp a structural capture tag (`book-<id>`, `url-<id>`, `yt-<id>`, `doc-<id>`, plus
-  # the bare kind tags below). Verified as a discriminator before being relied on: it marks
-  # 98.5% of the June harvest and 0.4% of the pre-June curated set.
+  # Converged by rank 3 and INVERTED by rank 4. Controlling for position, provenance
+  # carried almost no signal — and the residual top-of-list gap is partly the prior marking
+  # its own homework, since it lifted first-party into the positions where conversion is
+  # highest and that conversion then read as evidence for the prior.
   #
-  # THIRD-PARTY IS THE POSITIVE TEST, and first-party is the absence of a marker — never the
-  # reverse. A first-party allowlist would have to enumerate every repo/topic tag Mark will
-  # ever use, and each one it missed would silently demote genuinely first-party knowledge.
-  # A missed marker here fails the other way: an unmarked harvest article is merely treated
-  # as neutral, which is exactly today's behaviour.
+  # The discriminator's own verification had also gone stale: it was justified as marking
+  # "98.5% of the June harvest and 0.4% of the pre-June curated set". On the live corpus in
+  # August the split was 82,851 / 3,562 and no longer separated the cohorts that cleanly.
   #
-  # The weight is deliberately SMALLER than the measured effect. Priors here break near-ties
-  # (RRF ties by construction), they do not dominate relevance — a 26.7x weight would let
-  # provenance outrank the query. At the default strength 0.05 this is a ~2.5% edge on an
-  # otherwise-equal pair, and it can never flip a cross-lane consensus winner (~2x a
-  # single-lane hit).
-  # SCOPE: these markers are the SOURCERS' own convention (the harvest skills stamp them at
-  # knowledge_create time), not user-authored freeform tags, which is what makes them a
-  # reliable signal. They are nonetheless GLOBAL, like `@category_authority` above, so a
-  # future tenant that uses `book-`/`document` to mean something else would inherit this
-  # prior. The failure is bounded and one-directional — a misread tag costs an article its
-  # 0.5 boost, dropping it to the neutral 0.0 every article gets today — so it can never
-  # demote anything below current behaviour. Revisit if a second real tenant appears; the
-  # right fix then is config-driven weight tables for the whole module, not a special case
-  # for this one term.
-  @harvest_marker_prefixes ~w(book- url- yt- doc-)
-  @harvest_marker_tags ~w(web-article newsletter inbox-harvest youtube document book)
-  @first_party_authority 0.5
-  @third_party_authority 0.0
+  # THE OWNER'S REASONING, which outlives the measurement (Mark, 2026-08-21):
+  #
+  #   "If we heavily favor the internally produced knowledge, we would never learn anything
+  #    new and unexpectedly useful. Besides, agents improve and I don't want less
+  #    intelligent agents to decide what to pick for more intelligent future agents. I want
+  #    the decision of what knowledge to use and how to combine it to be done on the
+  #    receiving side."
+  #
+  # Two failure modes that argument names, neither of which a measurement would catch:
+  # a provenance prior is a CLOSED LOOP (demote unread material, it stays unread, cite the
+  # ratio as proof), and it is a RATCHET (a weight shipped once by one model constrains
+  # every future receiver regardless of how much more capable that receiver is).
+  #
+  # WHAT IS STILL ALLOWED HERE, so this is a rule and not a mood:
+  #   * relevance itself (RRF over the lanes) — that IS the retrieval, not a prior;
+  #   * DELIBERATE EDITORIAL ACTS — `verdict-kill`, `:superseded`, curation. Someone judged
+  #     the content on its merits;
+  #   * FORM, not origin — the MOC-hub demotion below. A navigation stub is not an answer
+  #     whoever generated it;
+  #   * `@category_authority` above, KEPT by explicit owner decision on the same date: it
+  #     keys on an editorial classification, not on how a document was ingested.
+  #
+  # What is forbidden is a weight keyed on HOW A DOCUMENT GOT IN — its sourcer, its capture
+  # tag, its source_type, its ingestion batch. If a future measurement seems to justify one,
+  # re-read the table above first: that is what the last one looked like.
+  #
+  # WHAT WOULD OVERTURN THIS: the owner saying so, or a conversion measurement that is
+  # rank-stratified, uses a discriminator verified against the CURRENT corpus, and still
+  # shows a durable gap. Reads-per-article is not that measurement and never was.
 
   # A verdict-killed idea and a superseded article are demoted hard regardless of the
   # authority toggle — they are dead doctrine that must not outrank live doctrine.
@@ -236,11 +238,15 @@ defmodule Loopctl.Knowledge.RankingPriors do
 
   @doc """
   The bounded authority FACTOR for a result map, centered on 1.0 and clamped to
-  `[floor, ceiling]`. `strength` scales the combined category + source_type prior; a
+  `[floor, ceiling]`. `strength` scales the CATEGORY prior — the only one left; a
   `strength` of 0 makes authority a no-op (factor 1.0).
 
-  NOTE the band is effectively ONE-SIDED: every category/source weight is >= 0 and
-  `strength` >= 0, so `1 + strength*(cat+src)` is always >= 1.0 and the `floor` (0.9 in
+  It keys on `:category` and nothing else. The `source_type` and capture-tag provenance
+  priors were removed on 2026-08-21 — see the long note above `@kill_tag` for why, and for
+  what would have to be true to bring one back.
+
+  NOTE the band is effectively ONE-SIDED: every category weight is >= 0 and
+  `strength` >= 0, so `1 + strength*cat` is always >= 1.0 and the `floor` (0.9 in
   the default config) is never hit — the reachable range is `[1.0, ceiling]`. This factor
   only ever BOOSTS; demoting dead doctrine below neutral is `demotion_factor/1`'s job.
   """
@@ -249,43 +255,11 @@ defmodule Loopctl.Knowledge.RankingPriors do
 
   def authority_factor(result, strength, floor, ceiling) do
     cat = category_authority(Map.get(result, :category))
-    src = source_authority(Map.get(result, :source_type))
-    prov = provenance_authority(Map.get(result, :tags))
 
-    (1.0 + strength * (cat + src + prov))
+    (1.0 + strength * cat)
     |> max(floor)
     |> min(ceiling)
   end
-
-  @doc """
-  The provenance weight for a result's `tags`: `#{@first_party_authority}` for first-party
-  knowledge, `#{@third_party_authority}` for third-party harvested material (#251).
-
-  Third-party is the POSITIVE test — a structural capture tag stamped by a sourcer
-  (`book-`/`url-`/`yt-`/`doc-` prefixes, or a bare kind tag). First-party is the absence of
-  one, so a marker this function does not know leaves the article neutral rather than
-  demoting real first-party knowledge. `nil` tags are first-party (an article no sourcer
-  stamped).
-  """
-  @spec provenance_authority([String.t()] | nil) :: float()
-  def provenance_authority(nil), do: @first_party_authority
-
-  def provenance_authority(tags) when is_list(tags) do
-    if Enum.any?(tags, &harvest_marker?/1) do
-      @third_party_authority
-    else
-      @first_party_authority
-    end
-  end
-
-  def provenance_authority(_), do: @first_party_authority
-
-  defp harvest_marker?(tag) when is_binary(tag) do
-    tag in @harvest_marker_tags or
-      Enum.any?(@harvest_marker_prefixes, &String.starts_with?(tag, &1))
-  end
-
-  defp harvest_marker?(_), do: false
 
   @doc """
   The demotion FACTOR for a result that should not win a question: `#{@demote_factor}`
@@ -382,11 +356,5 @@ defmodule Loopctl.Knowledge.RankingPriors do
 
   defp category_authority(category) do
     Map.get(@category_authority, to_string(category), @default_category_authority)
-  end
-
-  defp source_authority(nil), do: @default_source_authority
-
-  defp source_authority(source_type) do
-    Map.get(@source_authority, to_string(source_type), @default_source_authority)
   end
 end

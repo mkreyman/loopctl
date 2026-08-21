@@ -288,7 +288,7 @@ defmodule Loopctl.Knowledge.VectorSearch do
         # the two reads would let the query BUILD (side table, pool*4 over-fetch) and the
         # ef_search DECISION disagree — build side-table but not raise ef_search → transient
         # under-recall. This is the same "resolve once and thread" invariant candidate_pool_query
-        # documents (vector_search.ex:447-452) and suggest_links honors (knowledge.ex:4711).
+        # documents (vector_search.ex:447-452) and suggest_links honors (knowledge.ex:4713).
         opts =
           Keyword.put_new_lazy(opts, :reads_side_table, &Embeddings.side_table_reads_enabled?/0)
 
@@ -945,7 +945,9 @@ defmodule Loopctl.Knowledge.VectorSearch do
       category: a.category,
       status: a.status,
       tags: a.tags,
-      # source_type feeds the #471 authority prior in Loopctl.Knowledge.search_combined/3.
+      # source_type is projected for lane-shape symmetry, NOT for ranking and not for any
+      # search response: the source-type authority prior was removed on 2026-08-21 (see
+      # RankingPriors, note above @kill_tag).
       source_type: a.source_type,
       # idempotency_key feeds the MOC-hub demotion in the same place (#654 follow-up).
       idempotency_key: a.idempotency_key,
