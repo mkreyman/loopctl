@@ -14,6 +14,7 @@ defmodule Loopctl.Knowledge.StructuralLinksTest do
   setup :verify_on_exit!
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Audit.AuditLog
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
@@ -292,6 +293,26 @@ defmodule Loopctl.Knowledge.StructuralLinksTest do
 
       assert again.id == first.id
       assert again.title == "Source: advanced cypher concepts"
+    end
+
+    test "an unattended mint is audited as the system worker, not as an API key" do
+      tenant = fixture(:tenant)
+      for _ <- 1..4, do: article(tenant, ["book-attributed"])
+
+      assert {:ok, _} = StructuralLinks.harvest(tenant.id, min_siblings: 3)
+      [hub] = hubs(tenant.id)
+
+      entry =
+        from(e in AuditLog,
+          where: e.tenant_id == ^tenant.id,
+          where: e.action == "article.created" and e.entity_id == ^hub.id
+        )
+        |> AdminRepo.one()
+
+      # `Knowledge` defaults actor_type to "api_key" with a nil id, so an unattended
+      # writer records every hub against an API key that does not exist.
+      assert entry.actor_type == "system"
+      assert entry.actor_label == "worker:structural_links"
     end
 
     test "a universal tag that is not name-SHAPED is refused" do

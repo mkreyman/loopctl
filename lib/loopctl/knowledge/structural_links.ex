@@ -74,6 +74,13 @@ defmodule Loopctl.Knowledge.StructuralLinks do
 
   @default_min_siblings 3
 
+  # These writes are made by a scheduled worker holding no key, so they are attributed to
+  # the SYSTEM actor. `Knowledge` otherwise defaults `actor_type` to "api_key" with a nil
+  # id, which records every unattended hub mint and retitle against an API key that does
+  # not exist — in a product whose premise is attributable custody. Same shape as
+  # `KnowledgeMocWorker`.
+  @actor [actor_type: "system", actor_label: "worker:structural_links"]
+
   # A tag must cover at least this fraction of a source's members to name its hub. High on
   # purpose: the point is to abstain rather than to guess (see hub_title/3).
   @hub_name_coverage 0.9
@@ -319,7 +326,7 @@ defmodule Loopctl.Knowledge.StructuralLinks do
         metadata: Map.put(hub.metadata || %{}, "hub_title_generated", desired)
       }
 
-      case Knowledge.update_article(tenant_id, hub.id, attrs) do
+      case Knowledge.update_article(tenant_id, hub.id, attrs, @actor) do
         {:ok, updated} -> updated
         _ -> hub
       end
@@ -420,7 +427,7 @@ defmodule Loopctl.Knowledge.StructuralLinks do
     # would stage every one after the first as a draft and the harvest would silently
     # produce unpublished hubs. Using the ungated path is the deliberate choice; do not
     # "improve" this by routing it through propose_article.
-    case Knowledge.create_article(tenant_id, attrs) do
+    case Knowledge.create_article(tenant_id, attrs, @actor) do
       {:ok, %Article{} = hub} ->
         {:ok, hub, :created}
 
@@ -467,7 +474,7 @@ defmodule Loopctl.Knowledge.StructuralLinks do
       }
     }
 
-    case Knowledge.create_article(tenant_id, attrs) do
+    case Knowledge.create_article(tenant_id, attrs, @actor) do
       {:ok, %Article{} = hub} -> {:ok, hub, :created}
       {:error, reason} -> {:error, reason}
       other -> {:error, other}
