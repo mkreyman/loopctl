@@ -401,4 +401,48 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
              "provenance_authority/1 is back — the prior it computes is the one that was removed"
     end
   end
+
+  describe "#654 the hub demotion needs its signal on EVERY ranking-fed lane" do
+    # `moc_hub?/1` fails OPEN on a missing `:idempotency_key`, so a lane whose select omits
+    # it stops demoting hubs on that lane ALONE — invisibly, because fusion unions the lane
+    # maps and a hub some OTHER lane also returned keeps the key. Only lane-ONLY candidates
+    # lose the demotion, which is exactly the set each lane exists to add (a MOC hub links
+    # to every member, so it is the likeliest graph-only candidate there is). No behavioural
+    # test can see that, so anchor to the SELECT SOURCE of every lane feeding
+    # `apply_ranking_priors_fused/2`.
+    @ranking_lanes [
+      {"lib/loopctl/knowledge.ex", "def search_keyword(tenant_id, query_string, opts) do"},
+      {"lib/loopctl/knowledge.ex",
+       "defp hydrate_semantic_pool(tenant_id, pool_rows, status, opts, limit, offset) do"},
+      {"lib/loopctl/knowledge.ex",
+       "def semantic_results_query(tenant_id, query_embedding, opts) do"},
+      {"lib/loopctl/knowledge.ex",
+       "defp fetch_graph_lane_articles(tenant_id, ranked_ids, status) do"},
+      {"lib/loopctl/knowledge/vector_search.ex",
+       "defp dimension_pool_select(query, :semantic) do"},
+      {"lib/loopctl/knowledge/vector_search.ex", "defp pool_select(base, :semantic, target) do"}
+    ]
+
+    test "every lane select projects idempotency_key" do
+      for {path, head} <- @ranking_lanes do
+        source = File.read!(path)
+
+        # Positive control: a renamed or moved lane fails LOUDLY here instead of passing
+        # vacuously on a substring that no longer exists.
+        assert String.contains?(source, head),
+               "#{path}: lane head moved, re-anchor this guard -- #{head}"
+
+        body =
+          source
+          |> String.split(head, parts: 2)
+          |> List.last()
+          |> String.split(~r/\n  end\n/, parts: 2)
+          |> hd()
+
+        assert String.contains?(body, "idempotency_key:"),
+               "#{path}: #{head} does not project idempotency_key -- RankingPriors fails " <>
+                 "open, so a MOC hub seen ONLY on this lane keeps its full fused score"
+      end
+    end
+  end
 end

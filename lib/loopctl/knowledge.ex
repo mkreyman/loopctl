@@ -8773,6 +8773,10 @@ defmodule Loopctl.Knowledge do
           category: a.category,
           status: a.status,
           tags: a.tags,
+          # The MOC-hub demotion signal, on the side-table path exactly as on
+          # pool_select(:semantic): RankingPriors fails open without it, so omitting it here
+          # made the WHOLE semantic lane hub-blind once side-table reads are on.
+          idempotency_key: a.idempotency_key,
           inserted_at: a.inserted_at,
           updated_at: a.updated_at
         }
@@ -10014,6 +10018,11 @@ defmodule Loopctl.Knowledge do
           # `@kill_tag` in RankingPriors) and no search renderer emits it. ArticleJSON
           # surfaces the column on the article CRUD path, never on this one.
           source_type: a.source_type,
+          # UNLIKE source_type, this one IS a live ranking input: RankingPriors fails open
+          # on a missing field, so a lane that omits it silently stops demoting MOC hubs on
+          # that lane only — and a hub links to every member, so it is the likeliest
+          # graph-ONLY candidate there is (#654 follow-up).
+          idempotency_key: a.idempotency_key,
           status: a.status,
           tags: a.tags,
           inserted_at: a.inserted_at,
