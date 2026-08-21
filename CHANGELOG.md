@@ -34,6 +34,27 @@ All notable changes to loopctl are documented here.
     confidence cap already draws between recording a retirement and authorizing one. A
     system-flagged pair is unaffected; it carries no asserter.
 
+  **Migration:** `20260821120000_widen_potential_conflict_partial_index_for_assertions`
+  rebuilds `article_links_potential_conflict_idx` CONCURRENTLY so its partial predicate
+  covers asserted rows too. Without it the conflict queue's `auto_generated OR asserted`
+  filter no longer implies the index's `auto_generated`-only predicate, and the endpoint
+  falls back to the seq scan + sort that 20260804220000 measured at 313 ms against the
+  index's 0.131 ms. No downtime, no table lock, and it DROPs only a mismatched or INVALID
+  catalog entry — an out-of-band prod build or a retry keeps its live index.
+
+  **Behaviour change in the nightly `KnowledgeLintWorker`:** an asserted flag no longer
+  pre-empts the system conflict pipeline. `promote_conflicts/1` ignores asserted rows when
+  choosing candidates and UPGRADES an existing one in place (stamping `auto_generated` and
+  the real similarity score, preserving the claim and its asserter), because the pair's
+  `potential_conflict` slot is unique and an assertion sitting in it would otherwise mean
+  the system flag could never be stamped — and therefore curated suppression could never
+  fire for that pair again. The similarity-based judge skips asserted pairs outright: it
+  can only ever record `:redundant`, a `dismiss` is terminal on record, and auto-dismissing
+  a deliberate contradiction as redundancy would destroy the evidence the night it was
+  raised. `LinkPruning` likewise requires SYSTEM provenance before releasing the
+  high-similarity spare, so an assertion cannot trigger deletion of the `relates_to` edge
+  the promoter needs.
+
   An assertion grants reachability and nothing else. It does NOT suppress either article
   from curated answers — `open_conflict_subquery/1` and `authoritative_curated?/2` still
   require `auto_generated: true`, or any key could retract any article from the governed

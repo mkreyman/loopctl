@@ -538,6 +538,18 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
     from(l in ArticleLink,
       where: l.tenant_id == ^tenant_id,
       where: l.relationship_type == ^type,
+      # An ASSERTED conflict (#730) DOES suppress this worker, deliberately, and the
+      # pre-emption it would otherwise cause is fixed one layer over — in
+      # `KnowledgeLintWorker.promote_conflicts/1`, which ignores an asserted row when
+      # choosing candidates and then UPGRADES it in place to carry system provenance.
+      #
+      # Making this dedupe skip asserted rows too was the obvious symmetric fix and it is
+      # wrong: the pair's `potential_conflict` slot is UNIQUE, so the worker would go on to
+      # insert a second row for a pair that already has one and collide on
+      # `article_links_tenant_src_tgt_rel_index`. That buys nothing the promoter does not
+      # already do — the `relates_to` edge this worker writes alongside is exactly the
+      # promoter's input, so an asserted pair above the conflict threshold is upgraded on
+      # the next nightly run through ONE well-tested path instead of two racing ones.
       where: l.source_article_id == ^article_id or l.target_article_id == ^article_id,
       select: {l.source_article_id, l.target_article_id}
     )

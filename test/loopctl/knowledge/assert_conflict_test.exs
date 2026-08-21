@@ -19,6 +19,7 @@ defmodule Loopctl.Knowledge.AssertConflictTest do
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.ConflictResolution
+  alias Loopctl.Workers.KnowledgeLintWorker
 
   @asserter [actor_principal: "agent-writing-the-correction", actor_label: "agent:corrector"]
   @judge [actor_principal: "someone-else", actor_label: "orchestrator:judge"]
@@ -586,6 +587,95 @@ defmodule Loopctl.Knowledge.AssertConflictTest do
 
       {new_a, new_b} = Enum.at(pairs, 25)
       assert {:error, :too_many_open_assertions} = assert_pair(t.id, new_a, new_b)
+    end
+  end
+
+  # #730 review, out-of-scope round: an assertion must not PRE-EMPT the system pipeline.
+  # The pair's `potential_conflict` slot is unique, so before these fixes asserting a
+  # conflict permanently stopped the promoter and the linker from ever stamping the SYSTEM
+  # flag for those two articles — and since curated suppression requires `auto_generated`,
+  # that turned "assert a conflict" into "immunise this pair from suppression, forever".
+  # The mirror image of the attack the feature guards against.
+  describe "an assertion never pre-empts the system pipeline" do
+    test "the nightly promoter upgrades an asserted flag in place, preserving the claim" do
+      t = fixture(:tenant)
+      a = published(t.id, "A")
+      b = published(t.id, "B")
+      assert {:ok, asserted, :created} = assert_pair(t.id, a, b)
+
+      # The promoter's input: a system relates_to edge above the conflict threshold.
+      %ArticleLink{tenant_id: t.id}
+      |> ArticleLink.changeset(%{
+        source_article_id: a.id,
+        target_article_id: b.id,
+        relationship_type: :relates_to,
+        metadata: %{"auto_generated" => true, "similarity_score" => 0.97}
+      })
+      |> AdminRepo.insert!()
+
+      assert :ok =
+               KnowledgeLintWorker.perform(%Oban.Job{
+                 args: %{"tenant_id" => t.id}
+               })
+
+      upgraded = AdminRepo.get!(ArticleLink, asserted.id)
+      assert upgraded.metadata["auto_generated"] == true
+      assert upgraded.metadata["similarity_score"] == 0.97
+      assert upgraded.metadata["promoted_from"] == "asserted"
+      # The claim survives — and so does the asserter's identity, so the separation holds.
+      assert upgraded.metadata["asserted"] == true
+      assert upgraded.metadata["asserted_by_principal"] == "agent-writing-the-correction"
+      assert upgraded.metadata["evidence"] =~ "does not follow"
+      # ONE row, not a second in the opposite direction.
+      assert AdminRepo.aggregate(
+               from(l in ArticleLink,
+                 where: l.tenant_id == ^t.id and l.relationship_type == :potential_conflict
+               ),
+               :count,
+               :id
+             ) == 1
+    end
+
+    test "an upgraded pair still refuses its asserter's verdict" do
+      t = fixture(:tenant)
+      a = published(t.id, "A")
+      b = published(t.id, "B")
+      assert {:ok, link, :created} = assert_pair(t.id, a, b)
+
+      # Simulate the promoter's upgrade.
+      AdminRepo.update_all(
+        from(l in ArticleLink, where: l.id == ^link.id),
+        set: [metadata: Map.put(link.metadata, "auto_generated", true)]
+      )
+
+      assert {:error, :self_asserted_conflict} =
+               Knowledge.annotate_conflict(
+                 t.id,
+                 %{
+                   "source_article_id" => a.id,
+                   "target_article_id" => b.id,
+                   "disposition" => "dismiss"
+                 },
+                 @asserter
+               )
+    end
+
+    test "the nightly judge never auto-dismisses an assertion as redundant" do
+      t = fixture(:tenant)
+      a = published(t.id, "A")
+      b = published(t.id, "B")
+      assert {:ok, link, :created} = assert_pair(t.id, a, b)
+
+      # Upgraded to system provenance — the judge's own filter would otherwise take it.
+      AdminRepo.update_all(
+        from(l in ArticleLink, where: l.id == ^link.id),
+        set: [metadata: Map.put(link.metadata, "auto_generated", true)]
+      )
+
+      KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => t.id}})
+
+      refute AdminRepo.exists?(from(r in ConflictResolution, where: r.tenant_id == ^t.id)),
+             "a deliberate assertion must not be closed as redundancy by a similarity drain"
     end
   end
 

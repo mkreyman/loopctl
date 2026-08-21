@@ -223,6 +223,15 @@ defmodule Loopctl.Knowledge.LinkPruning do
                   SELECT 1 FROM article_links pc
                   WHERE pc.tenant_id = $1
                     AND pc.relationship_type = 'potential_conflict'
+                    -- Only a SYSTEM flag lifts the >=0.93 spare (#730). The spare exists
+                    -- to protect `promote_conflicts/1`'s only input, and it is safe to
+                    -- lift once the pair IS flagged because the edge has then done its
+                    -- job. An ASSERTED flag has not done that job: the pair was never
+                    -- promoted, so lifting the spare on it let any agent delete the very
+                    -- `relates_to` edge the promoter needs — a caller-triggered deletion
+                    -- of system data, and permanent, since nothing recreates a pruned
+                    -- edge below the linker's cap.
+                    AND (pc.metadata->>'auto_generated') = 'true'
                     AND ((pc.source_article_id = e.a AND pc.target_article_id = e.b)
                       OR (pc.source_article_id = e.b AND pc.target_article_id = e.a))
                 ))

@@ -94,6 +94,54 @@ defmodule Loopctl.Knowledge.PotentialConflictsTest do
       assert pid == peer.id
     end
 
+    # #730: this payload is the WHOLE point of asserting a conflict — the structured signal
+    # a prose "SUPERSEDED" banner in the loser's body could never be, because a caller
+    # reading snippets or `links: "count"` never sees a banner. Two ways it was silently
+    # lost before this test: an assertion carries no similarity score, so ranking on
+    # `similarity || 0.0` sorted every assertion BEHIND every system flag and truncated it
+    # out at the cap; and nothing distinguished it from a stray unscored link once it did
+    # survive.
+    test "an ASSERTED conflict leads the list and carries its claim" do
+      tenant = fixture(:tenant)
+      a = published(tenant.id, "Main")
+      contested = published(tenant.id, "Contested")
+
+      # Enough scored system flags to fill the cap and push an unscored link off the end.
+      for n <- 1..ArticleJSON.max_conflicts() do
+        conflict_link(tenant.id, a, published(tenant.id, "Sys #{n}"), 0.99)
+      end
+
+      %ArticleLink{tenant_id: tenant.id}
+      |> ArticleLink.changeset(%{
+        source_article_id: a.id,
+        target_article_id: contested.id,
+        relationship_type: :potential_conflict,
+        metadata: %{
+          "auto_generated" => false,
+          "asserted" => true,
+          "asserted_by_principal" => "agent-x",
+          "classification" => "contradictory",
+          "evidence" => "the measurement does not support the conclusion",
+          "asserted_at" => "2026-08-21T00:00:00Z"
+        }
+      })
+      |> AdminRepo.insert!()
+
+      {:ok, loaded} = Knowledge.get_article(tenant.id, a.id)
+      json = ArticleJSON.article_data_with_links(loaded)
+
+      assert [first | _] = json.potential_conflicts
+      assert first.article_id == contested.id
+      assert first.origin == "asserted"
+      assert first.assertion.classification == "contradictory"
+      assert first.assertion.evidence == "the measurement does not support the conclusion"
+      refute Map.has_key?(first, :similarity)
+
+      # A system flag still says which it is, so a reader can tell the two apart.
+      assert Enum.all?(tl(json.potential_conflicts), &(&1.origin == "system"))
+      refute Map.has_key?(hd(tl(json.potential_conflicts)), :assertion)
+    end
+
     test "is an empty list when the article has no conflicts" do
       tenant = fixture(:tenant)
       a = published(tenant.id, "Solo")
