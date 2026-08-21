@@ -7,6 +7,7 @@ defmodule Loopctl.Workers.KnowledgeMocWorkerTest do
   import Ecto.Query
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Audit.AuditLog
   alias Loopctl.Knowledge.Article
   alias Loopctl.Workers.KnowledgeMocWorker
 
@@ -176,6 +177,51 @@ defmodule Loopctl.Workers.KnowledgeMocWorkerTest do
       refute moc_hub(tenant.id, "idem-book-7ebe1ca33431")
       refute moc_hub(tenant.id, "url-7ebe1ca33431")
       assert moc_hub(tenant.id, "otp")
+    end
+  end
+
+  describe "audit attribution" do
+    # Both writes this worker makes are unattended — it holds no key. `Knowledge` defaults
+    # `actor_type` to "api_key" with a nil id, so an omitted actor records a hub mint in
+    # the immutable audit log against an API key that does not exist, in a product whose
+    # premise is attributable custody. The UPDATE carried the system actor from the start
+    # and the CREATE beside it did not, which is the drift these two tests pin.
+    test "the first mint of a MOC hub is audited as the system worker" do
+      tenant = fixture(:tenant)
+      published(tenant.id, "One", ["attributed"])
+      published(tenant.id, "Two", ["attributed"])
+
+      assert :ok = run(tenant.id)
+      hub = moc_hub(tenant.id, "attributed")
+
+      entry =
+        from(e in AuditLog,
+          where: e.tenant_id == ^tenant.id,
+          where: e.action == "article.created" and e.entity_id == ^hub.id
+        )
+        |> AdminRepo.one()
+
+      assert entry.actor_type == "system"
+      assert entry.actor_label == "worker:knowledge_moc"
+    end
+
+    test "the weekly body refresh is audited as the system worker too" do
+      tenant = fixture(:tenant)
+      published(tenant.id, "One", ["refreshed"])
+      published(tenant.id, "Two", ["refreshed"])
+
+      assert :ok = run(tenant.id)
+      hub = moc_hub(tenant.id, "refreshed")
+
+      entry =
+        from(e in AuditLog,
+          where: e.tenant_id == ^tenant.id,
+          where: e.action == "article.updated" and e.entity_id == ^hub.id
+        )
+        |> AdminRepo.one()
+
+      assert entry.actor_type == "system"
+      assert entry.actor_label == "worker:knowledge_moc"
     end
   end
 
