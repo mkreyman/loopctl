@@ -113,7 +113,7 @@ defmodule Loopctl.Workers.StructuralLinksWorkerTest do
       assert harvest_audits(tenant.id) == []
     end
 
-    test "cancels instead of snoozing forever once the shed count is capped" do
+    test "cancels instead of snoozing forever once the hour of trying is spent" do
       tenant = fixture(:tenant)
 
       expect(MockStructuralLinksHarvester, :harvest, fn _tenant, _opts ->
@@ -125,7 +125,26 @@ defmodule Loopctl.Workers.StructuralLinksWorkerTest do
       # minutes forever while nothing fails and nothing alerts, and each Sunday's cron
       # would add another job doing the same.
       assert {:cancel, :heavy_read_overloaded} =
-               perform_job(StructuralLinksWorker, %{"tenant_id" => tenant.id}, attempt: 12)
+               perform_job(StructuralLinksWorker, %{"tenant_id" => tenant.id},
+                 inserted_at: DateTime.add(DateTime.utc_now(), -3601, :second)
+               )
+    end
+
+    test "a job that has only been FairShare-snoozed still gets its shed retries" do
+      tenant = fixture(:tenant)
+
+      expect(MockStructuralLinksHarvester, :harvest, fn _tenant, _opts ->
+        {:error, :heavy_read_overloaded}
+      end)
+
+      # `attempt` is the job-wide counter and FairShare consumes it at a 5-10 second
+      # cadence against this branch's 300s, so bounding on `attempt` cancelled the harvest
+      # after ~90 seconds of ordinary queue contention without ever having shed once.
+      assert {:snooze, _} =
+               perform_job(StructuralLinksWorker, %{"tenant_id" => tenant.id},
+                 attempt: 12,
+                 inserted_at: DateTime.add(DateTime.utc_now(), -90, :second)
+               )
     end
   end
 

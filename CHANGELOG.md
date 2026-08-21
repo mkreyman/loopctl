@@ -33,7 +33,9 @@ All notable changes to loopctl are documented here.
   that put 85 sources and 6,471 members on a single node before #724. Two sources sharing
   a hub that tags them BOTH is the ordinary dual-tagged shape and is reported as
   `shared_hubs`, not as a failure, so the verdict is not permanently false on a healthy
-  corpus. A mismatch is reported, never raised.
+  corpus. A mismatch is reported, never raised — and the affected source's `derived_from`
+  edges are REFUSED rather than written, so `hubs_unattributed` counts sources that were
+  skipped, not edges that need cleaning up afterwards.
 
 ## [Unreleased] — 2026-08-20 — Work-breakdown import: a criterion must carry text
 

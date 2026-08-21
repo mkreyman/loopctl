@@ -103,9 +103,15 @@ defmodule Loopctl.Workers.StructuralLinksWorker do
   # into `discarded` — the trap `.claude/skills/oban-health/SKILL.md` names outright: a
   # job gated on a permanently-wrong condition re-scans forever while nothing fails and
   # nothing alerts, and next Sunday's cron adds another (the 300s unique window does not
-  # reach a week back). Twelve sheds is an hour of trying; past that the job is CANCELLED,
-  # which is visible in Oban, and the weekly cron re-enqueues it.
-  @max_shed_attempts 12
+  # reach a week back). An hour of trying; past that the job is CANCELLED, which is
+  # visible in Oban, and the weekly cron re-enqueues it.
+  #
+  # The bound is ELAPSED TIME, not `attempt`. `attempt` is the job-wide counter and the
+  # FairShare branch in `perform/1` consumes it too, at a 5-10 second cadence against this
+  # branch's 300s — so a cap of twelve ATTEMPTS cancelled the harvest after ~90 seconds of
+  # ordinary queue contention, having never once been shed. The hour is what the bound was
+  # always about, so it is measured directly off the job's own `inserted_at`.
+  @max_shed_seconds 3600
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"mode" => "all_tenants"}}) do
@@ -114,12 +120,12 @@ defmodule Loopctl.Workers.StructuralLinksWorker do
     :ok
   end
 
-  def perform(%Oban.Job{id: id, attempt: attempt, args: %{"tenant_id" => tenant_id}}) do
+  def perform(%Oban.Job{id: id, inserted_at: inserted_at, args: %{"tenant_id" => tenant_id}}) do
     # The dispatcher clause above is deliberately NOT gated — it carries no tenant_id.
     # `id` excludes THIS already-executing job from its own count (US-36.2).
     case FairShare.gate(tenant_id, :knowledge, id) do
       {:snooze, _n} = snooze -> snooze
-      :ok -> harvest(tenant_id, attempt)
+      :ok -> harvest(tenant_id, inserted_at)
     end
   end
 
@@ -138,10 +144,10 @@ defmodule Loopctl.Workers.StructuralLinksWorker do
     end
   end
 
-  defp harvest(tenant_id, attempt) do
+  defp harvest(tenant_id, inserted_at) do
     case @harvester.harvest(tenant_id, min_siblings: min_siblings()) do
       {:error, :heavy_read_overloaded} ->
-        shed(tenant_id, attempt)
+        shed(tenant_id, inserted_at)
 
       {:ok, report} ->
         log_audit(tenant_id, report)
@@ -149,20 +155,29 @@ defmodule Loopctl.Workers.StructuralLinksWorker do
     end
   end
 
-  defp shed(tenant_id, attempt) when is_integer(attempt) and attempt >= @max_shed_attempts do
-    Logger.error(
-      "structural_links_worker shed #{attempt} times: tenant=#{tenant_id} — cancelling " <>
-        "rather than snoozing forever; the weekly cron re-enqueues"
-    )
+  defp shed(tenant_id, inserted_at) do
+    if shed_budget_spent?(inserted_at) do
+      Logger.error(
+        "structural_links_worker still shedding after #{@max_shed_seconds}s: " <>
+          "tenant=#{tenant_id} — cancelling rather than snoozing forever; the weekly cron " <>
+          "re-enqueues"
+      )
 
-    {:cancel, :heavy_read_overloaded}
+      {:cancel, :heavy_read_overloaded}
+    else
+      Logger.info(
+        "structural_links_worker shed: tenant=#{tenant_id} reason=heavy_read_overloaded"
+      )
+
+      {:snooze, @shed_snooze_seconds}
+    end
   end
 
-  defp shed(tenant_id, _attempt) do
-    Logger.info("structural_links_worker shed: tenant=#{tenant_id} reason=heavy_read_overloaded")
+  # A job with no `inserted_at` (a hand-built struct) has spent nothing — snooze.
+  defp shed_budget_spent?(%DateTime{} = inserted_at),
+    do: DateTime.diff(DateTime.utc_now(), inserted_at, :second) >= @max_shed_seconds
 
-    {:snooze, @shed_snooze_seconds}
-  end
+  defp shed_budget_spent?(_inserted_at), do: false
 
   # ACTIVE **and carrying a published article**. The recorded finding "self-signup
   # permanently joins every all-tenants cron fan-out — per-IP caps don't bound the growth"
