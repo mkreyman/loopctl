@@ -1252,7 +1252,9 @@ defmodule Loopctl.Knowledge.Consolidation do
   # The pass runs as the SYSTEM. It holds no agent identity, so it can never be the owner
   # that `Knowledge`'s read paths let through; "not visible to this caller" is total here,
   # not conditional. Same `COALESCE(..., 'shared')` spelling as those paths
-  # (`knowledge.ex:5902` and friends) so an article with no `visibility` key stays in scope.
+  # (`knowledge.ex:7293` and friends) so an article with no `visibility` key stays in scope.
+  # NOTE: `mix loopctl.check_skill_citations` scans docs, not `.ex` comments, so a cite like
+  # this one drifts silently — the previous anchor pointed at a bare `end`.
   defp shared_only(query), do: where(query, [a], shared_visibility(a.metadata))
 
   defp heavy_opts, do: HeavyRead.opts(@heavy_endpoint)

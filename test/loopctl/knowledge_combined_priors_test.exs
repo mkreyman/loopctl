@@ -1,5 +1,7 @@
 defmodule Loopctl.KnowledgeCombinedPriorsTest do
-  # #471 — recency + source-authority priors applied post-fusion in search_combined/3.
+  # #471 — recency + category-authority priors applied post-fusion in search_combined/3.
+  # The source_type/provenance half of the authority prior was removed 2026-08-21 (owner
+  # decision: ranking must not key on how a document got in).
   use Loopctl.DataCase, async: true
 
   setup :verify_on_exit!
