@@ -11,10 +11,12 @@ defmodule Loopctl.Workers.StructuralLinksWorker do
   own rather than being inherited from whichever worker the harvest was folded into. This
   worker is that decision, and it makes three of them:
 
-  * **Fan-out is per tenant, gated.** One dispatcher job enqueues one job per ACTIVE
-    tenant, and each per-tenant job passes `FairShare.gate/3` before it touches the
-    corpus — so a tenant with a large corpus cannot monopolise the shared `:knowledge`
-    lane, which is the concern the story raised and `FairShare` already answers.
+  * **Fan-out is per tenant, gated, and bounded by who has a corpus.** One dispatcher job
+    enqueues one job per ACTIVE tenant THAT HAS A PUBLISHED ARTICLE, and each per-tenant
+    job passes `FairShare.gate/3` before it touches the corpus — so a tenant with a large
+    corpus cannot monopolise the shared `:knowledge` lane, which is the concern the story
+    raised and `FairShare` already answers. The corpus predicate answers the other half,
+    the one the recorded fan-out finding poses: see `harvestable_tenants/0`.
   * **A shed heavy read SNOOZES the tenant, it does not fail it.** `harvest/2` returns
     `{:error, :heavy_read_overloaded}` when the scan is shed, and binding that as a list
     would crash under exactly the load the shedder exists to relieve. A partial harvest is
@@ -74,6 +76,7 @@ defmodule Loopctl.Workers.StructuralLinksWorker do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
+  alias Loopctl.Knowledge.Article
   alias Loopctl.Oban.FairShare
   alias Loopctl.Tenants.Tenant
 
@@ -97,8 +100,7 @@ defmodule Loopctl.Workers.StructuralLinksWorker do
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"mode" => "all_tenants"}}) do
-    from(t in Tenant, where: t.status == :active, select: t.id)
-    |> AdminRepo.all()
+    harvestable_tenants()
     |> Enum.each(fn tenant_id ->
       %{"tenant_id" => tenant_id} |> __MODULE__.new() |> Oban.insert()
     end)
@@ -128,6 +130,35 @@ defmodule Loopctl.Workers.StructuralLinksWorker do
         log_audit(tenant_id, report)
         :ok
     end
+  end
+
+  # ACTIVE **and carrying a published article**. The recorded finding "self-signup
+  # permanently joins every all-tenants cron fan-out — per-IP caps don't bound the growth"
+  # closes with the test to apply to any NEW all-tenants worker: what set does it
+  # enumerate, and what SHRINKS that set? Enumerating `status == :active` alone answers
+  # "every tenant that ever signed up" and "nothing" — a scripted junk signup then costs a
+  # job insert plus a scan every week, forever, for a corpus that does not exist.
+  #
+  # An empty tenant is exactly the one this worker has nothing to do for, so the EXISTS
+  # probe is both the cheap answer and the correct one: no corpus, no hub, no job. It is a
+  # per-tenant index probe on `articles`, not an enumeration of the corpus — the scan
+  # itself stays on HeavyRead where it belongs, and AdminRepo's 3-connection pool sees one
+  # bounded query per week.
+  defp harvestable_tenants do
+    published =
+      from(a in Article,
+        where: a.tenant_id == parent_as(:tenant).id,
+        where: a.status == :published,
+        select: 1
+      )
+
+    from(t in Tenant,
+      as: :tenant,
+      where: t.status == :active,
+      where: exists(published),
+      select: t.id
+    )
+    |> AdminRepo.all()
   end
 
   defp min_siblings do

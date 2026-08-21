@@ -2,8 +2,8 @@ defmodule Loopctl.Workers.StructuralLinksWorkerTest do
   @moduledoc """
   The weekly cadence for the US-42.1 provenance harvest (#725).
 
-  Three of these tests pin decisions rather than mechanics, because each one is a place
-  where the obvious implementation is wrong at production scale:
+  Several of these tests pin DECISIONS rather than mechanics, because each is a place where
+  the obvious implementation is wrong at production scale:
 
   * the unattended floor is **25**, not the library default of 3 — measured on the hosted
     corpus, 3 mints ~1,900 extra hubs from the smallest sources, where a usable name is
@@ -11,8 +11,9 @@ defmodule Loopctl.Workers.StructuralLinksWorkerTest do
   * a shed heavy read must SNOOZE, not fail — the harvest returns
     `{:error, :heavy_read_overloaded}` under exactly the load the shedder exists to
     relieve, and burning attempts there is how a tenant loses a week's hubs;
-  * the fan-out is per ACTIVE tenant, since a suspended tenant's corpus is not ours to
-    keep writing to.
+  * the fan-out skips a suspended tenant (its corpus is not ours to keep writing to) AND a
+    tenant with no published article at all — a signup that never wrote anything must not
+    cost a job insert and a scan every week forever.
   """
   use Loopctl.DataCase, async: true
   use Oban.Testing, repo: Loopctl.Repo
@@ -146,6 +147,24 @@ defmodule Loopctl.Workers.StructuralLinksWorkerTest do
 
       assert [_hub] = source_hubs(active.id)
       assert source_hubs(suspended.id) == []
+    end
+
+    test "an active tenant with no published corpus is not enqueued at all" do
+      # The recorded fan-out finding's test: what shrinks the enumerated set? A tenant
+      # that signed up and never wrote anything has nothing to harvest, so it must not
+      # cost a job insert and a scan every week forever. No job means no audit entry.
+      with_corpus = fixture(:tenant)
+      empty = fixture(:tenant)
+      drafts_only = fixture(:tenant)
+
+      for _ <- 1..25, do: article(with_corpus.id, ["book-real"])
+      fixture(:article, %{tenant_id: drafts_only.id, tags: ["book-draft"], status: :draft})
+
+      assert :ok = StructuralLinksWorker.perform(%Oban.Job{args: %{"mode" => "all_tenants"}})
+
+      assert [_entry] = harvest_audits(with_corpus.id)
+      assert harvest_audits(empty.id) == []
+      assert harvest_audits(drafts_only.id) == []
     end
 
     test "a tenant's harvest never reaches another tenant's corpus" do

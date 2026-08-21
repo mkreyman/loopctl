@@ -9,8 +9,10 @@ All notable changes to loopctl are documented here.
 - **`Loopctl.Workers.StructuralLinksWorker` — weekly `derived_from` harvest, `0 6 * * 0`.**
   US-42.1 shipped `Knowledge.StructuralLinks.harvest/2` with nothing running it, so only the
   one manual backfill ever produced source hubs; every source created since has had none.
-  The worker fans out one job per ACTIVE tenant, each gated by `FairShare`, and snoozes the
-  tenant (rather than failing an attempt) when the corpus scan is shed. Sunday 06:00 UTC puts
+  The worker fans out one job per ACTIVE tenant that has a published article, each gated by
+  `FairShare`, and snoozes the tenant (rather than failing an attempt) when the corpus scan
+  is shed. A tenant with no corpus is skipped outright, so a junk signup does not buy itself
+  a weekly job insert and scan in perpetuity. Sunday 06:00 UTC puts
   it after the 05:00 MOC fan-out and the 05:50 draft sweep so the three weekly `:knowledge`
   passes do not contend for the lane.
 
