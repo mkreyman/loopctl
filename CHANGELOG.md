@@ -4,6 +4,28 @@ All notable changes to loopctl are documented here.
 
 ## [Unreleased] — 2026-08-21 — The provenance harvest runs on a cadence
 
+### Changed
+
+- **Search ranking no longer keys on a document's provenance.** `Loopctl.Knowledge.RankingPriors`
+  carried two priors keyed on where a document came from — a `source_type` authority table and a
+  first-party/third-party split keyed on the sourcers' capture tags (`book-`/`url-`/`yt-`/`doc-`
+  plus `web-article`/`newsletter`/`inbox-harvest`/`youtube`/`document`/`book`). Both are removed.
+  `authority_factor/4` now reads `:category` alone; `provenance_authority/1` is gone.
+
+  **Operator impact:** results may reorder on NEAR-TIES only. Both priors were bounded
+  tie-breakers at the default strength 0.05 (a ~2.5% edge on an otherwise-equal pair, unable to
+  flip a cross-lane consensus winner), so no strong-relevance ordering changes. On the hosted
+  corpus 82,851 of 86,413 articles sat on the third-party side and now rank neutrally against the
+  other 3,562. `mix loopctl.retrieval.eval` reports `+0.000` on every golden question — but that
+  green is near-vacuous here, because only 1 of 124 golden docs carries a harvest marker and none
+  carry a `source_type`. **No baseline change, no migration, no configuration change.**
+  `:knowledge_authority_prior_enabled` and `:knowledge_hub_demotion_enabled` are unaffected.
+
+  Why: the prior rested on a 26.7x reads-per-article gap whose denominator is the harvest's own
+  volume, so it falls ~1/N mechanically. Rank-stratified surfaced-to-opened conversion converged
+  by rank 3 and inverted by rank 4. Dead-doctrine demotion (`verdict-kill`, `:superseded`), the
+  MOC-hub demotion, recency decay and category authority are all unchanged.
+
 ### Added
 
 - **`POST /api/v1/knowledge/conflicts` — assert a conflict pair the system never flagged

@@ -575,6 +575,14 @@ semantic/keyword **retrieval** result, on one uniform shape carrying
 - **#305/#306 are the same feature** (this epic implements both) — recommend
   closing one as a duplicate of the other rather than tracking them separately.
 
+## Ranking must never key on HOW a document got in (owner decision, 2026-08-21)
+
+`Loopctl.Knowledge.RankingPriors` no longer carries any PROVENANCE prior. The `source_type` authority table and the first-party/third-party split keyed on the sourcers' capture tags (`book-`/`url-`/`yt-`/`doc-` and the bare kind tags) were both removed. Mark: *"if we heavily favor the internally produced knowledge, we would never learn anything new and unexpectedly useful... agents improve and I don't want less intelligent agents to decide what to pick for more intelligent future agents. I want the decision of what knowledge to use and how to combine it to be done on the receiving side."*
+
+The prior rested on a 26.7x reads-per-article gap, which carries the harvest's own volume in its denominator (~96% of the corpus) and so falls ~1/N mechanically. Rank-stratified surfaced-to-opened conversion — the measure that actually answers the question — converged by rank 3 and inverted by rank 4 on the live corpus.
+
+STILL ALLOWED: relevance (RRF), deliberate editorial acts (`verdict-kill`, `:superseded`, curation), FORM rather than origin (the MOC-hub demotion), and `@category_authority` (kept by explicit owner decision — a category is an editorial classification, not an ingestion method). FORBIDDEN: any weight keyed on a document's sourcer, capture tag, `source_type`, or ingestion batch. Note that the golden-question eval cannot catch a reintroduction (1 of 124 golden docs carries a harvest marker, none carry a `source_type`) — the guard is `test/loopctl/knowledge/ranking_priors_test.exs`. Full reasoning and what would overturn it: the note above `@kill_tag` in `ranking_priors.ex` and the `knowledge-wiki` skill.
+
 ## Elixir / Phoenix guidelines
 
 These are the stock `phx.new` rules, condensed. Each line is a hard rule.

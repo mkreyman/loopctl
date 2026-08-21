@@ -945,7 +945,8 @@ defmodule Loopctl.Knowledge.VectorSearch do
       category: a.category,
       status: a.status,
       tags: a.tags,
-      # source_type feeds the #471 authority prior in Loopctl.Knowledge.search_combined/3.
+      # source_type is projected for the response shape, NOT for ranking: the source-type
+      # authority prior was removed on 2026-08-21 (see RankingPriors, note above @kill_tag).
       source_type: a.source_type,
       # idempotency_key feeds the MOC-hub demotion in the same place (#654 follow-up).
       idempotency_key: a.idempotency_key,

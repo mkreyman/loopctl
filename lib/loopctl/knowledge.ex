@@ -2175,9 +2175,9 @@ defmodule Loopctl.Knowledge do
               category: a.category,
               status: a.status,
               tags: a.tags,
-              # source_type feeds the #471 authority prior (it is NOT projected by
-              # default elsewhere); carried on the keyword lane so the priors apply on the
-              # degraded keyword_only fallback too (AC-5).
+              # Projected for the response shape, not for ranking: the source-type
+              # authority prior was removed on 2026-08-21 (RankingPriors, note above
+              # `@kill_tag`). `category` is what the surviving authority prior reads.
               source_type: a.source_type,
               # idempotency_key is the MOC-hub signal (#654 follow-up). Projected for the
               # SAME reason as source_type: RankingPriors fails open on a missing field,
@@ -8973,8 +8973,8 @@ defmodule Loopctl.Knowledge do
         category: c.category,
         status: c.status,
         tags: c.tags,
-        # source_type feeds the #471 authority prior (see the keyword select). The inner
-        # pool_select(:semantic) must project it for this outer select to read it.
+        # Response shape only — no longer a ranking input (see the keyword select). The
+        # inner pool_select(:semantic) must project it for this outer select to read it.
         source_type: c.source_type,
         # Same contract for the MOC-hub demotion signal: inner projects it, outer reads it.
         idempotency_key: c.idempotency_key,
@@ -9502,9 +9502,10 @@ defmodule Loopctl.Knowledge do
             opts
           )
       end
-      # #471: re-rank the fused list by the recency + source-authority priors BEFORE the
-      # top-k cut. Pure (no DB) — the result maps already carry updated_at/category/
-      # source_type/tags/status, so merge_results/5 stays a DB-free fusion function.
+      # #471: re-rank the fused list by the recency + CATEGORY-authority priors (plus the
+      # dead-doctrine and MOC-hub demotions) BEFORE the top-k cut. Pure (no DB) — the
+      # result maps already carry updated_at/category/tags/status, so merge_results/5 stays
+      # a DB-free fusion function. Provenance priors were removed 2026-08-21.
       |> apply_ranking_priors_fused(opts)
 
     # #31 follow-up: the curated-vs-retrieved decision runs HERE, on the default path,
@@ -10003,12 +10004,11 @@ defmodule Loopctl.Knowledge do
           project_id: a.project_id,
           title: a.title,
           category: a.category,
-          # source_type is projected here for symmetry with the keyword lane
-          # (knowledge.ex ~1870) and the semantic pool (vector_search.ex ~499) so
-          # RankingPriors.authority_factor reads the SAME source-authority prior no
-          # matter which lane first surfaced a doc. Without it a graph-lane-only doc
-          # would fall back to source_authority(nil) (the 0.0 neutral floor) and get a
-          # category-only authority factor — asymmetric with kw/sem (#471 review).
+          # Projected for symmetry with the keyword lane and the semantic pool, and
+          # surfaced to callers by ArticleJSON. It NO LONGER feeds any ranking prior —
+          # the source-type authority prior was removed on 2026-08-21 (provenance must
+          # not move ranking; see the note above `@kill_tag` in RankingPriors). Kept as
+          # a projected FIELD, not as a ranking input.
           source_type: a.source_type,
           status: a.status,
           tags: a.tags,

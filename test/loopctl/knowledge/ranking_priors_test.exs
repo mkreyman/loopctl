@@ -76,7 +76,7 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
     end
   end
 
-  describe "authority_factor/4 (data-driven from category + source_type, bounded)" do
+  describe "authority_factor/4 (data-driven from category, bounded)" do
     test "a zero strength makes authority a no-op" do
       assert RankingPriors.authority_factor(%{category: :decision}, 0.0, @floor, @ceiling) == 1.0
     end
@@ -119,15 +119,17 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
                RankingPriors.authority_factor(%{category: nil}, 0.05, @floor, @ceiling)
     end
 
-    test "source_type lifts an otherwise identical article" do
+    test "source_type does NOT lift an article — that prior was removed (2026-08-21)" do
+      # It was the same provenance question as the capture-tag prior, keyed on a column
+      # instead of a tag: "human/reviewed provenance over raw automated ingests". Both are
+      # gone; see the note above `@kill_tag` in RankingPriors.
       reviewed = %{category: :finding, source_type: "review_finding"}
       raw_ingest = %{category: :finding, source_type: "ingestion"}
       none = %{category: :finding, source_type: nil}
 
-      assert RankingPriors.authority_factor(reviewed, 0.05, @floor, @ceiling) >
+      assert RankingPriors.authority_factor(reviewed, 0.05, @floor, @ceiling) ==
                RankingPriors.authority_factor(raw_ingest, 0.05, @floor, @ceiling)
 
-      # ingestion is weighted 0.0, so it ties the nil (unknown) source.
       assert RankingPriors.authority_factor(raw_ingest, 0.05, @floor, @ceiling) ==
                RankingPriors.authority_factor(none, 0.05, @floor, @ceiling)
     end
@@ -289,102 +291,104 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
       do: %{category: :reference, updated_at: @now, tags: ["deployment"], status: :published}
   end
 
-  describe "#251 provenance prior: first-party outranks harvested material on a near-tie" do
+  describe "provenance priors are GONE — ranking must not key on how a document got in" do
     alias Loopctl.Knowledge.RankingPriors
 
-    test "an article with no sourcer capture tag is first-party" do
-      assert RankingPriors.provenance_authority([]) > 0.0
-      assert RankingPriors.provenance_authority(["elixir", "oban"]) > 0.0
-      assert RankingPriors.provenance_authority(nil) > 0.0
-    end
+    # Owner decision, 2026-08-21: "if we heavily favor the internally produced knowledge,
+    # we would never learn anything new and unexpectedly useful... I want the decision of
+    # what knowledge to use and how to combine it to be done on the receiving side."
+    #
+    # The evidence that justified the removed prior was a 26.7x reads-per-article gap,
+    # which carries the harvest's own volume in its denominator. Rank-stratified conversion
+    # — the measure that actually answers "is this worse?" — converged by rank 3 and
+    # inverted by rank 4. These tests are what stops it coming back by accident.
 
-    test "each structural capture PREFIX marks third-party" do
-      for tag <- ["book-0be008289fe8", "url-d046e10f48b3", "yt-eCx3SSCcISo", "doc-3941363c04b3"] do
-        assert RankingPriors.provenance_authority([tag]) == 0.0,
-               "expected #{tag} to mark the article as harvested"
+    test "a harvested doc and a first-party doc rank IDENTICALLY when all else is equal" do
+      for marker <- [
+            "book-0be008289fe8",
+            "url-d046e10f48b3",
+            "yt-eCx3SSCcISo",
+            "doc-3941363c04b3",
+            "web-article",
+            "newsletter",
+            "inbox-harvest",
+            "youtube",
+            "document",
+            "book"
+          ] do
+        harvested = %{category: :finding, updated_at: @now, tags: [marker], status: :published}
+
+        first_party = %{
+          category: :finding,
+          updated_at: @now,
+          tags: ["elixir"],
+          status: :published
+        }
+
+        assert mult(harvested, []) == mult(first_party, []),
+               "#{marker} still changes the ranking — a provenance prior has come back"
       end
     end
 
-    test "each bare kind tag marks third-party" do
-      for tag <- ~w(web-article newsletter inbox-harvest youtube document book) do
-        assert RankingPriors.provenance_authority([tag]) == 0.0,
-               "expected #{tag} to mark the article as harvested"
-      end
-    end
-
-    test "one marker among many first-party tags is enough" do
-      assert RankingPriors.provenance_authority(["elixir", "oban", "yt-abc123", "patterns"]) ==
-               0.0
-    end
-
-    test "a prefix must be a PREFIX — a tag merely containing it stays first-party" do
-      # "notebook-lm" contains "book-" but does not start with it; "handbook" likewise.
-      assert RankingPriors.provenance_authority(["notebook-lm"]) > 0.0
-      assert RankingPriors.provenance_authority(["handbook"]) > 0.0
-    end
-
-    test "a first-party doc outranks an otherwise-IDENTICAL harvested doc" do
-      first_party = %{category: :finding, updated_at: @now, tags: ["elixir"], status: :published}
-
-      harvested = %{
+    test "source_type does not move the ranking either" do
+      # The other provenance prior: "human/reviewed provenance over raw automated ingests".
+      # It keyed on `source_type`, which is the same question wearing a different column.
+      reviewed = %{
         category: :finding,
         updated_at: @now,
-        tags: ["web-article"],
-        status: :published
+        tags: [],
+        status: :published,
+        source_type: "review_finding"
       }
 
-      assert mult(first_party, []) > mult(harvested, [])
+      ingested = %{
+        category: :finding,
+        updated_at: @now,
+        tags: [],
+        status: :published,
+        source_type: "ingestion"
+      }
+
+      assert mult(reviewed, []) == mult(ingested, [])
     end
 
-    test "the prior BREAKS ties but never dominates relevance or category" do
-      # A harvested `decision` must still outrank a first-party `idea`: provenance is a
-      # tiebreaker, not an override of the far larger category spread.
-      harvested_decision = %{
+    test "authority now keys on CATEGORY and nothing else" do
+      # Kept by explicit owner decision on the same date: a category is an editorial
+      # classification, not a statement about how the document was ingested.
+      decision = %{
         category: :decision,
         updated_at: @now,
         tags: ["web-article"],
         status: :published
       }
 
-      first_party_idea = %{category: :idea, updated_at: @now, tags: [], status: :published}
+      raw = %{category: nil, updated_at: @now, tags: [], status: :published}
 
-      assert mult(harvested_decision, []) > mult(first_party_idea, [])
+      assert mult(decision, []) > mult(raw, []),
+             "category authority was removed too — only the PROVENANCE priors should be gone"
     end
 
-    test "it stays inside the bounded band — no saturation at the common shape" do
-      # source_type is NULL for ~98% of the corpus, so the realistic maximum is
-      # category(1.0) + provenance(0.5) = 1.5, well under the 2.0 the ceiling needs.
-      best = %{category: :decision, updated_at: @now, tags: [], status: :published}
+    test "deliberate editorial acts still demote — this is not a ban on all re-ranking" do
+      # Dead doctrine and navigation stubs are judged on their merits and their FORM, not
+      # on where they came from, so they are untouched by the provenance decision.
+      live = %{category: :finding, updated_at: @now, tags: [], status: :published}
+      killed = %{category: :finding, updated_at: @now, tags: ["verdict-kill"], status: :published}
 
-      factor = RankingPriors.authority_factor(best, 0.05, 0.9, 1.1)
-
-      assert factor < 1.1, "expected headroom below the ceiling, got #{factor}"
-      assert factor > 1.0
-    end
-
-    test "a verdict-kill first-party doc is still demoted below a clean harvested one" do
-      killed_first_party = %{
-        category: :decision,
+      hub = %{
+        category: :reference,
         updated_at: @now,
-        tags: ["verdict-kill"],
-        status: :published
+        tags: [],
+        status: :published,
+        idempotency_key: "moc:deployment"
       }
 
-      clean_harvested = %{
-        category: :decision,
-        updated_at: @now,
-        tags: ["web-article"],
-        status: :published
-      }
-
-      assert mult(clean_harvested, []) > mult(killed_first_party, [])
+      assert mult(killed, []) < mult(live, [])
+      assert mult(hub, []) < mult(live, [])
     end
 
-    test "provenance is gated by the authority toggle like the rest of the prior" do
-      first_party = %{category: :finding, updated_at: @now, tags: [], status: :published}
-      harvested = %{category: :finding, updated_at: @now, tags: ["book-abc"], status: :published}
-
-      assert mult(first_party, authority?: false) == mult(harvested, authority?: false)
+    test "the removed functions are gone, not merely unused" do
+      refute function_exported?(RankingPriors, :provenance_authority, 1),
+             "provenance_authority/1 is back — the prior it computes is the one that was removed"
     end
   end
 end

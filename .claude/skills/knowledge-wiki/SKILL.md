@@ -182,6 +182,45 @@ never pass `tenant_id`/`subject_id`.
    depth, not authority. The server-guaranteed key is the `articles.idempotency_key` column with
    its per-tenant unique index — prefer it, and do not treat a tag as proof of capture identity.
 
+## Ranking must never key on HOW a document got in (owner decision, 2026-08-21)
+
+`Loopctl.Knowledge.RankingPriors` carried two PROVENANCE priors — a `source_type` table
+("human/reviewed provenance over raw automated ingests") and a first-party/third-party split
+keyed on the sourcers' capture tags (`book-`/`url-`/`yt-`/`doc-` and the bare kind tags).
+**Both are removed.** Mark's reasoning, which outlives the measurement: *"if we heavily favor
+the internally produced knowledge, we would never learn anything new and unexpectedly
+useful... agents improve and I don't want less intelligent agents to decide what to pick for
+more intelligent future agents. I want the decision of what knowledge to use and how to
+combine it to be done on the receiving side."*
+
+The prior's own evidence did not survive checking. It cited a 26.7x reads-per-article gap —
+a statistic whose denominator is the harvest's own volume (~96% of the corpus), so it falls
+~1/N mechanically. The measure that actually answers "is this material worse?" is
+**surfaced-to-opened conversion**, and rank-stratified on the live corpus it converged by
+rank 3 and INVERTED by rank 4 (first-party 1.95% vs third-party 1.96% at rank 4; 1.57% vs
+1.74% at rank 5). Its discriminator-verification claim (98.5%/0.4%) had also gone stale.
+
+**What is still allowed**, so this is a rule and not a mood: relevance itself (RRF — that IS
+the retrieval); DELIBERATE EDITORIAL ACTS (`verdict-kill`, `:superseded`, curation); FORM
+rather than origin (the MOC-hub demotion — a navigation stub is not an answer whoever wrote
+it); and `@category_authority`, KEPT by explicit owner decision on the same date because a
+category is an editorial classification, not an ingestion method.
+
+**What is forbidden** is a weight keyed on a document's sourcer, capture tag, `source_type`,
+or ingestion batch. Two failure modes no measurement catches: a provenance prior is a CLOSED
+LOOP (demote unread material → it stays unread → cite the ratio as proof) and a RATCHET (a
+weight shipped once by one model constrains every future receiver). Guarded by
+`test/loopctl/knowledge/ranking_priors_test.exs` — "provenance priors are GONE".
+
+**The golden-question eval below cannot catch a reintroduction.** Measured 2026-08-21: 1 of
+124 docs in `priv/retrieval_eval/golden.jsonl` carries a harvest marker and NONE carry a
+`source_type`, so removing both priors moved every metric by exactly `+0.000`. That green is
+near-vacuous for this class of change — the unit guard is the real one.
+
+**What would overturn this:** the owner saying so, or a conversion measurement that is
+rank-stratified, uses a discriminator verified against the CURRENT corpus, and still shows a
+durable gap. Reads-per-article is not that measurement.
+
 ## Ranking changes are gated by the golden-question eval (#469)
 
 Any change to `search_combined/3` ranking (weights, fusion, recency/authority) must ship with a
