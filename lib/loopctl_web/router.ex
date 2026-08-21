@@ -540,7 +540,10 @@ defmodule LoopctlWeb.Router do
     post "/knowledge/bulk-delete", ArticleWorkflowController, :bulk_delete
     get "/knowledge/drafts", ArticleWorkflowController, :drafts
     get "/knowledge/conflicts", ArticleWorkflowController, :conflicts
+    # Declared BEFORE the bare POST so the more specific path wins regardless of how
+    # Phoenix orders same-prefix routes.
     post "/knowledge/conflicts/resolve", ArticleWorkflowController, :resolve_conflict
+    post "/knowledge/conflicts", ArticleWorkflowController, :assert_conflict
 
     # Knowledge Index (lightweight catalog)
     get "/knowledge/index", KnowledgeIndexController, :index

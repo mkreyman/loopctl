@@ -1022,3 +1022,61 @@ describe("#249 mcp-03: parseJsonResponseBody (shared with apiCall)", () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// #730: knowledge_assert_conflict — registered, dispatched, and pointed at the
+// assert endpoint rather than the resolve one
+// ---------------------------------------------------------------------------
+
+describe("#730: knowledge_assert_conflict wiring", () => {
+  test("the tool is registered with evidence required", () => {
+    assert.match(
+      INDEX_SRC,
+      /name: "knowledge_assert_conflict"/,
+      "index.js must register the knowledge_assert_conflict tool",
+    );
+    assert.match(
+      INDEX_SRC,
+      /name: "knowledge_assert_conflict"[\s\S]*?required: \["source_article_id", "target_article_id", "evidence"\]/,
+      "evidence must be a REQUIRED input — an assertion carries no similarity score, so " +
+        "the argument is the whole evidence a reviewer judges",
+    );
+  });
+
+  test("the dispatch case calls knowledgeAssertConflict", () => {
+    assert.match(
+      INDEX_SRC,
+      /case "knowledge_assert_conflict":\s*\n\s*return await knowledgeAssertConflict\(args\);/,
+      "a registered tool with no dispatch case is invisible at call time",
+    );
+  });
+
+  test("it POSTs to the ASSERT endpoint with the agent key", () => {
+    const body = functionSource("knowledgeAssertConflict");
+    assert.match(body, /"POST"/);
+    assert.match(
+      body,
+      /"\/api\/v1\/knowledge\/conflicts"/,
+      "must post to /knowledge/conflicts — /knowledge/conflicts/resolve is the verdict path " +
+        "and would 422 on an unflagged pair, which is the whole bug this closes",
+    );
+    assert.doesNotMatch(body, /conflicts\/resolve/);
+    assert.match(body, /process\.env\.LOOPCTL_AGENT_KEY/);
+  });
+
+  test("optional fields are omitted rather than sent as undefined", () => {
+    const body = functionSource("knowledgeAssertConflict");
+    assert.match(body, /if \(classification\) payload\.classification = classification;/);
+    assert.match(body, /if \(proposed_authoritative_article_id\)/);
+  });
+
+  test("the tool description states what it does NOT grant", () => {
+    // The two properties a caller will otherwise assume it bought: an assertion neither
+    // retires the loser nor lets its asserter judge the pair. Both are refusals the server
+    // enforces, so a description that omits them sends agents into a 409 they can't parse.
+    const start = INDEX_SRC.indexOf('name: "knowledge_assert_conflict"');
+    const description = INDEX_SRC.slice(start, start + 3000);
+    assert.match(description, /self_asserted_conflict/);
+    assert.match(description, /curated answers/);
+  });
+});

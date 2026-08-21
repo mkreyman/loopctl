@@ -6,6 +6,35 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **`POST /api/v1/knowledge/conflicts` — assert a conflict pair the system never flagged
+  (agent+, #730).** `POST /knowledge/conflicts/resolve` could only reach pairs the
+  auto-linker had flagged by cosine similarity, which is the wrong precondition for a
+  DELIBERATE correction: the pair is minutes old so the nightly linker has not run, and a
+  correction that argues about a conclusion may never cross the similarity threshold at all.
+  The new endpoint creates the `:potential_conflict` link itself (`auto_generated: false`,
+  `asserted: true`), carrying the claim — `classification`, a REQUIRED `evidence`, and an
+  optional `proposed_authoritative_article_id`. The pair then appears in
+  `GET /api/v1/knowledge/conflicts` with a new `origin` field (`"system"` / `"asserted"`)
+  and, for an assertion, an `assertion` block; asserted pairs lead the queue, since they
+  carry an argument rather than a similarity score.
+
+  **Operator impact: no migration, no new environment variable, and no change to what any
+  existing call does.** Two behaviours worth knowing:
+
+  - `GET /api/v1/knowledge/conflicts` now returns asserted pairs alongside system-flagged
+    ones. Every row carries `origin`, so a consumer that must see only the mechanical
+    flags can filter on it.
+  - `POST /knowledge/conflicts/resolve` gains a `409 self_asserted_conflict`: the principal
+    that asserted a pair may not also record its verdict. An asserted pair is named by its
+    caller, so judging it is someone else's call — the same separation the `supersede`
+    confidence cap already draws between recording a retirement and authorizing one. A
+    system-flagged pair is unaffected; it carries no asserter.
+
+  An assertion grants reachability and nothing else. It does NOT suppress either article
+  from curated answers — `open_conflict_subquery/1` and `authoritative_curated?/2` still
+  require `auto_generated: true`, or any key could retract any article from the governed
+  answer path by disputing it — and it never overwrites a system flag's provenance.
+
 - **`Loopctl.Workers.StructuralLinksWorker` — weekly `derived_from` harvest, `0 6 * * 0`.**
   US-42.1 shipped `Knowledge.StructuralLinks.harvest/2` with nothing running it, so only the
   one manual backfill ever produced source hubs; every source created since has had none.

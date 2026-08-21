@@ -8,6 +8,7 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   - `POST /api/v1/knowledge/bulk-publish` -- bulk publish drafts (user+)
   - `POST /api/v1/knowledge/bulk-delete` -- bulk archive/soft-delete (user+)
   - `GET /api/v1/knowledge/drafts` -- list draft articles (orchestrator+)
+  - `POST /api/v1/knowledge/conflicts` -- assert a conflict the system never flagged (agent+)
 
   Role note (#331): single-article `archive` and `resolve_conflict` (all
   dispositions, incl. supersede/merge) are agent+ KB-content curation —
@@ -52,7 +53,7 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   # archive is visibility-scoped in-action.
   plug LoopctlWeb.Plugs.RequireRole,
        [role: :agent]
-       when action in [:archive, :conflicts, :resolve_conflict]
+       when action in [:archive, :conflicts, :resolve_conflict, :assert_conflict]
 
   tags(["Knowledge Wiki"])
 
@@ -287,6 +288,68 @@ defmodule LoopctlWeb.ArticleWorkflowController do
              meta: %OpenApiSpex.Schema{type: :object}
            }
          }},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  operation(:assert_conflict,
+    summary: "Assert a conflict pair the system never flagged",
+    description:
+      "Opens a `:potential_conflict` pair for two articles the auto-linker did NOT flag, " <>
+        "so a DELIBERATE correction is reachable: a session that just wrote an article " <>
+        "refuting another has a pair minutes old (the nightly linker has not run) which may " <>
+        "never be lexically similar enough to be flagged at all. The pair then appears in " <>
+        "GET /api/v1/knowledge/conflicts with `origin: \"asserted\"` and the claim " <>
+        "attached, and in both articles' `potential_conflicts`. Role: agent+. " <>
+        "`evidence` is REQUIRED — an assertion with no argument is noise on the one queue " <>
+        "a reviewer reads. " <>
+        "**This opens the pair; it does not decide it.** An assertion does NOT suppress " <>
+        "either article from curated answers (that still requires a system flag), and the " <>
+        "asserting principal may NOT record the pair's verdict — " <>
+        "POST /knowledge/conflicts/resolve returns 409 `self_asserted_conflict` to it. The " <>
+        "pair is manufacturable by construction (you named both ids), so judging it is " <>
+        "someone else's call, exactly as the confidence cap already separates recording a " <>
+        "supersede from authorizing one. " <>
+        "Idempotent per pair: an existing flag is returned (`created: false`) rather than " <>
+        "duplicated, and an assertion never overwrites a system flag's provenance.",
+    request_body:
+      {"Assertion", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         required: [:source_article_id, :target_article_id, :evidence],
+         properties: %{
+           source_article_id: %OpenApiSpex.Schema{type: :string, format: :uuid},
+           target_article_id: %OpenApiSpex.Schema{type: :string, format: :uuid},
+           classification: %OpenApiSpex.Schema{
+             type: :string,
+             enum: ["redundant", "complementary", "contradictory"]
+           },
+           evidence: %OpenApiSpex.Schema{
+             type: :string,
+             description:
+               "REQUIRED. Why these two conflict — ideally the ground truth that settles " <>
+                 "it (commit, file:line, URL, observed behaviour). This is what a reviewer " <>
+                 "judges the pair on; it travels with the pair in the conflict queue."
+           },
+           proposed_authoritative_article_id: %OpenApiSpex.Schema{
+             type: :string,
+             format: :uuid,
+             description:
+               "Optional: which of the two you believe should win. Recorded as your CLAIM " <>
+                 "on the queue row — it is not a verdict and applies nothing."
+           }
+         }
+       }},
+    responses: %{
+      201 =>
+        {"Pair asserted (`data.created` is false when an equivalent flag already existed)",
+         "application/json", %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      404 =>
+        {"One or both articles not found in this tenant", "application/json",
+         Schemas.ErrorResponse},
+      422 =>
+        {"Validation error (missing/blank `evidence`, the same article twice, or a member " <>
+           "the caller cannot see)", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -771,6 +834,97 @@ defmodule LoopctlWeb.ArticleWorkflowController do
     end
   end
 
+  @doc "POST /api/v1/knowledge/conflicts"
+  def assert_conflict(conn, params) do
+    api_key = conn.assigns.current_api_key
+
+    attrs = %{
+      "source_article_id" => params["source_article_id"],
+      "target_article_id" => params["target_article_id"],
+      "classification" => params["classification"],
+      "evidence" => params["evidence"],
+      "proposed_authoritative_article_id" => params["proposed_authoritative_article_id"]
+    }
+
+    opts =
+      AuditContext.from_conn(conn) ++
+        Visibility.scope_opts(conn) ++
+        [actor_principal: actor_principal(api_key)]
+
+    case Knowledge.assert_conflict(api_key.tenant_id, attrs, opts) do
+      {:ok, link, outcome} ->
+        conn
+        |> put_status(:created)
+        |> json(%{
+          data: %{
+            link_id: link.id,
+            source_article_id: link.source_article_id,
+            target_article_id: link.target_article_id,
+            origin: if(link.metadata["asserted"] == true, do: "asserted", else: "system"),
+            created: outcome == :created
+          },
+          note: assertion_note(link, outcome)
+        })
+
+      {:error, :evidence_required} ->
+        {:error, :unprocessable_entity,
+         "evidence is required: an asserted conflict carries no similarity score, so the " <>
+           "argument IS the evidence a reviewer judges the pair on."}
+
+      {:error, :same_article} ->
+        {:error, :unprocessable_entity,
+         "source_article_id and target_article_id must name two different articles."}
+
+      {:error, :missing_article_id} ->
+        {:error, :unprocessable_entity,
+         "source_article_id and target_article_id are both required."}
+
+      # An article the caller cannot SEE is answered as not-found, deliberately identical
+      # to an article that does not exist (parity with resolve_conflict): an agent must not
+      # be able to probe which private article ids exist by comparing the two answers.
+      # A member that genuinely does not exist falls through to the changeset below, which
+      # names the offending field.
+      {:error, :article_not_visible} ->
+        {:error, :not_found}
+
+      # Server-derived; a caller cannot cause this by any request it can make. It means the
+      # authenticated key resolved to no principal at all, and an assertion nobody can be
+      # held apart from is worse than no assertion.
+      {:error, :unattributed_assertion} ->
+        {:error, :unprocessable_entity,
+         "This key resolves to no principal, so an assertion recorded under it could not " <>
+           "be held apart from the verdict that judges it. Use a key with an agent identity."}
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, changeset}
+    end
+  end
+
+  defp assertion_note(_link, :existing),
+    do:
+      "This pair was already flagged — nothing was created and the existing flag's " <>
+        "provenance is unchanged. It is in GET /api/v1/knowledge/conflicts."
+
+  defp assertion_note(_link, :created),
+    do:
+      "Asserted. The pair is now in GET /api/v1/knowledge/conflicts (origin \"asserted\") " <>
+        "and in both articles' potential_conflicts. Neither article is suppressed from " <>
+        "curated answers — an assertion is a claim, not a system finding — and YOU cannot " <>
+        "record its verdict (409 self_asserted_conflict); another key judges it."
+
+  # The principal an assertion is attributed to, and the one a later verdict is held apart
+  # from. `agent_id` first because that is the identity the KB already treats as an actor
+  # (visibility scoping, and the heat index's `coalesce(agent_id, api_key_id)` reader); the
+  # key id is the fallback for roles that carry no agent. Under v2 per-dispatch ephemeral
+  # keys the key id alone would count DISPATCHES rather than actors, which is why the agent
+  # id has to win when both exist.
+  defp actor_principal(api_key) do
+    case api_key.agent_id do
+      nil -> to_string(api_key.id)
+      agent_id -> to_string(agent_id)
+    end
+  end
+
   @doc "POST /api/v1/knowledge/conflicts/resolve"
   def resolve_conflict(conn, params) do
     # #331: recording a verdict on a potential-conflict pair — dismiss, supersede,
@@ -797,7 +951,13 @@ defmodule LoopctlWeb.ArticleWorkflowController do
     opts =
       AuditContext.from_conn(conn) ++
         Visibility.scope_opts(conn) ++
-        [actor_role: conn.assigns.current_api_key.role]
+        [
+          actor_role: conn.assigns.current_api_key.role,
+          # #730: identifies the RECORDER, so a verdict on an ASSERTED pair can be refused
+          # when it comes from the principal that asserted it. Inert on a system-flagged
+          # pair, which carries no asserter.
+          actor_principal: actor_principal(conn.assigns.current_api_key)
+        ]
 
     attrs = %{
       "source_article_id" => params["source_article_id"],
@@ -834,6 +994,10 @@ defmodule LoopctlWeb.ArticleWorkflowController do
         {:error, :unprocessable_entity,
          "No potential-conflict link exists for this article pair. Only pairs the system " <>
            "flagged as potential conflicts (see GET /api/v1/knowledge/conflicts) can be resolved."}
+
+      # #730 — rendered by the FallbackController as 409 self_asserted_conflict.
+      {:error, :self_asserted_conflict} = error ->
+        error
 
       {:error, %Ecto.Changeset{} = changeset} ->
         {:error, changeset}

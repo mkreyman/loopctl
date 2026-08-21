@@ -2062,6 +2062,26 @@ async function knowledgeConflicts({ limit, offset }) {
   return toContent(result);
 }
 
+async function knowledgeAssertConflict({
+  source_article_id,
+  target_article_id,
+  classification,
+  evidence,
+  proposed_authoritative_article_id,
+}) {
+  const payload = { source_article_id, target_article_id, evidence };
+  if (classification) payload.classification = classification;
+  if (proposed_authoritative_article_id)
+    payload.proposed_authoritative_article_id = proposed_authoritative_article_id;
+  const result = await apiCall(
+    "POST",
+    "/api/v1/knowledge/conflicts",
+    payload,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
 async function knowledgeResolveConflict({
   source_article_id,
   target_article_id,
@@ -5662,6 +5682,65 @@ const TOOLS = [
     },
   },
   {
+    name: "knowledge_assert_conflict",
+    description:
+      "ASSERT a conflict between two articles the system never flagged — the way to contest " +
+      "an article you have just deliberately refuted. knowledge_resolve_conflict only " +
+      "reaches pairs the AUTO-LINKER flagged by similarity, which is exactly wrong for a " +
+      "correction: your pair is minutes old (the nightly linker has not run), and a good " +
+      "correction argues about the CONCLUSION so it may never be similar enough to be " +
+      "flagged at all. Use this the moment you write an article that contradicts an " +
+      "existing one — do not settle for a 'SUPERSEDED' banner in the loser's body, which " +
+      "changes no ranking and is invisible to any caller reading snippets. " +
+      "`evidence` is REQUIRED: an assertion carries no similarity score, so your argument " +
+      "IS what the reviewer judges. " +
+      "WHAT THIS DOES: the pair appears in knowledge_conflicts with origin \"asserted\" and " +
+      "your claim attached, and in both articles' potential_conflicts. " +
+      "WHAT IT DOES NOT DO: it does not retire, hide, or down-rank either article, and it " +
+      "does not remove either from curated answers (that still needs a system flag). AND " +
+      "YOU CANNOT JUDGE YOUR OWN ASSERTION — knowledge_resolve_conflict returns 409 " +
+      "self_asserted_conflict to the key that asserted the pair, because you named both " +
+      "ids and a party that arranges a pair does not also certify the verdict on it. " +
+      "Another key (a human, an orchestrator, a later session) decides. " +
+      "Idempotent per pair: re-asserting returns the existing flag (created: false) and " +
+      "never overwrites a system flag's provenance. Agent role.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        source_article_id: {
+          type: "string",
+          description: "One article of the pair (UUID). Order does not matter.",
+        },
+        target_article_id: {
+          type: "string",
+          description: "The other article of the pair (UUID).",
+        },
+        classification: {
+          type: "string",
+          enum: ["redundant", "complementary", "contradictory"],
+          description:
+            "What kind of conflict you are asserting: redundant (same claim twice), " +
+            "complementary (same topic, different facets), or contradictory (cannot both " +
+            "be true — the usual reason to assert).",
+        },
+        evidence: {
+          type: "string",
+          description:
+            "REQUIRED. Why these two conflict, ideally the ground truth that settles it " +
+            "(commit, file:line, URL, measurement, observed behavior). This travels with " +
+            "the pair in knowledge_conflicts and is what the deciding key reads.",
+        },
+        proposed_authoritative_article_id: {
+          type: "string",
+          description:
+            "Optional: which of the two you believe should win. Recorded as your CLAIM on " +
+            "the queue row — it applies nothing and is not a verdict.",
+        },
+      },
+      required: ["source_article_id", "target_article_id", "evidence"],
+    },
+  },
+  {
     name: "knowledge_resolve_conflict",
     description:
       "Record YOUR verdict on a potential-conflict pair (from knowledge_conflicts or an " +
@@ -5679,6 +5758,10 @@ const TOOLS = [
       "recorded as \"medium\" (see data.requested_confidence and note in the response) and " +
       "the pair STAYS in knowledge_conflicts until an orchestrator+ key records it at high. " +
       "'merge' is never capped and executes normally at agent role. " +
+      "Only pairs with a real flag are reachable here — if the pair you want was never " +
+      "flagged (you just wrote an article refuting another), assert it first with " +
+      "knowledge_assert_conflict; a DIFFERENT key then records the verdict, since the " +
+      "asserter of a pair may not judge it (409 self_asserted_conflict). " +
       "Last-write-wins per pair, so re-recording with fresher ground truth overrides. " +
       "Resolve only conflicts material to your current task; adjudicate against the actual " +
       "system, and if you can't tell which is right, LEAVE IT UNRECORDED rather than " +
@@ -7402,6 +7485,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "knowledge_conflicts":
       return await knowledgeConflicts(args);
+
+    case "knowledge_assert_conflict":
+      return await knowledgeAssertConflict(args);
 
     case "knowledge_resolve_conflict":
       return await knowledgeResolveConflict(args);

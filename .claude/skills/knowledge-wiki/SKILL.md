@@ -44,7 +44,7 @@ never pass `tenant_id`/`subject_id`.
    caller passing `on_gate_unavailable: :skip` gets `{:error, :gate_unavailable}` and nothing is
    created (`:509-515`). The assessor is config-injected (`Loopctl.Knowledge.ProposalGate`, `:463-466`)
    — do not hardcode it.
-2. **Hybrid search provenance** — `Loopctl.Knowledge.hybrid_search/3` (`knowledge.ex:9633`).
+2. **Hybrid search provenance** — `Loopctl.Knowledge.hybrid_search/3` (`knowledge.ex:9971`).
    `:curated` wins ONLY when a governed curated source's **absolute** (never pool-relative) confidence
    (`absolute_score/1`, `:9735-9740`) clears a scale-matched threshold AND beats the best retrieved
    candidate by a margin (`hybrid_curated_threshold_and_margin/1`, `:9786-9796`; the pure decision is
@@ -82,7 +82,23 @@ never pass `tenant_id`/`subject_id`.
    disposition and bought no safety. Scope any new gate to what it actually protects.
    A verdict nothing will act on does NOT settle the pair: `conflict_unresolved_subquery/0`
    settles on `executable_resolution/0`, so a capped or unattributed row leaves its pair in
-   `GET /knowledge/conflicts` to be re-recorded. Hiding a pair behind a row that will never
+   `GET /knowledge/conflicts` to be re-recorded.
+   **A pair the system never flagged is REACHABLE but not self-judgeable (#730).**
+   `Knowledge.assert_conflict/3` (`POST /api/v1/knowledge/conflicts`, agent+) creates the
+   `:potential_conflict` link a caller cannot create directly, stamped
+   `auto_generated: false, asserted: true` and carrying a REQUIRED `evidence` — the case it
+   exists for is a session that just wrote a correction, whose pair is minutes old and may
+   never be similar enough to be auto-flagged. Three properties keep the kb-02 guard intact,
+   and each has a mutation-verified test: an assertion **never reaches curated suppression**
+   (`open_conflict_subquery/1` and `article_in_open_conflict?/2` still require
+   `auto_generated`, or an agent could retract any article from the governed answer path by
+   disputing it); the **asserter may not record the verdict**
+   (`validate_not_self_asserted/2` → `409 self_asserted_conflict`, fail-closed on an unknown
+   recorder, re-checked in `apply_flagged_resolution/3` at execution time per the KB's
+   confused-deputy pattern); and an assertion **never overwrites a system flag** —
+   `fetch_conflict_flag/3` prefers `auto_generated` on a tie. The self-refusal is what stops
+   assert-then-`dismiss` pre-settling an arbitrary pair against a genuine system flag raised
+   over it later, which is why it covers ALL dispositions rather than just `:supersede`. Hiding a pair behind a row that will never
    apply is the black hole to avoid.
    **Corroboration covers BOTH duplicate signals** (`Consolidation.corroborated?/3`), and the
    winner is the OLDEST member, not the longest. An `idempotency_key` AND a normalized title
@@ -91,7 +107,7 @@ never pass `tenant_id`/`subject_id`.
    `{drift_signal, member_id}` — a group scored under the other signal's normalized key finds
    nothing and withholds (fail-closed).
 5. **Heat must not rank on a signal heat produces** — `Knowledge.heat_index/2`
-   (`knowledge.ex:10277`; the counted set is `@heat_read_access_types`, `:10147`). The heat index is the one retrieval route that
+   (`knowledge.ex:10615`; the counted set is `@heat_read_access_types`, `:10485`). The heat index is the one retrieval route that
    takes NO query, so its misses are uncorrelated with embedding similarity — which is worth nothing
    if its ordering is something a caller or the route itself generates. It has been violated FOUR
    times, each differently — and once by a FIX for one of the others — so treat any new input to

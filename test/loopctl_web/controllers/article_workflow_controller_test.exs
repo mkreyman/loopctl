@@ -1332,6 +1332,112 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
     end
   end
 
+  describe "POST /api/v1/knowledge/conflicts (assert, #730)" do
+    setup %{conn: conn} do
+      tenant = fixture(:tenant)
+      agent = fixture(:agent, %{tenant_id: tenant.id})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})
+      correction = fixture(:article, %{tenant_id: tenant.id, title: "A", status: :published})
+      original = fixture(:article, %{tenant_id: tenant.id, title: "B", status: :published})
+
+      %{
+        conn: auth_conn(conn, raw_key),
+        tenant: tenant,
+        agent: agent,
+        correction: correction,
+        original: original
+      }
+    end
+
+    test "an agent key asserts a pair the linker never flagged", ctx do
+      %{conn: conn, correction: correction, original: original} = ctx
+
+      conn =
+        post(conn, ~p"/api/v1/knowledge/conflicts", %{
+          "source_article_id" => correction.id,
+          "target_article_id" => original.id,
+          "classification" => "contradictory",
+          "evidence" => "the correction cites the measurement the original lacked",
+          "proposed_authoritative_article_id" => correction.id
+        })
+
+      body = json_response(conn, 201)
+      assert body["data"]["created"] == true
+      assert body["data"]["origin"] == "asserted"
+      assert body["note"] =~ "self_asserted_conflict"
+
+      link = AdminRepo.get!(ArticleLink, body["data"]["link_id"])
+      assert link.relationship_type == :potential_conflict
+      assert link.metadata["auto_generated"] == false
+      assert link.metadata["asserted_by_principal"] == ctx.agent.id
+    end
+
+    test "the asserted pair is then visible on GET /knowledge/conflicts", ctx do
+      %{conn: conn, correction: correction, original: original} = ctx
+
+      post(conn, ~p"/api/v1/knowledge/conflicts", %{
+        "source_article_id" => correction.id,
+        "target_article_id" => original.id,
+        "evidence" => "measured against the live corpus"
+      })
+
+      body = json_response(get(conn, ~p"/api/v1/knowledge/conflicts"), 200)
+      assert [pair] = body["data"]
+      assert pair["origin"] == "asserted"
+      assert pair["assertion"]["evidence"] == "measured against the live corpus"
+    end
+
+    # The API-level statement of the separation: the same key that asserted gets a 409 with
+    # a machine-readable code, not a silent no-op and not a 422 that reads as "bad request".
+    test "the asserting key is refused when it tries to resolve its own pair", ctx do
+      %{conn: conn, correction: correction, original: original} = ctx
+
+      post(conn, ~p"/api/v1/knowledge/conflicts", %{
+        "source_article_id" => correction.id,
+        "target_article_id" => original.id,
+        "evidence" => "measured against the live corpus"
+      })
+
+      resolved =
+        post(conn, ~p"/api/v1/knowledge/conflicts/resolve", %{
+          "source_article_id" => correction.id,
+          "target_article_id" => original.id,
+          "disposition" => "dismiss"
+        })
+
+      body = json_response(resolved, 409)
+      assert body["error"]["code"] == "self_asserted_conflict"
+    end
+
+    test "returns 422 without evidence", ctx do
+      %{conn: conn, correction: correction, original: original} = ctx
+
+      conn =
+        post(conn, ~p"/api/v1/knowledge/conflicts", %{
+          "source_article_id" => correction.id,
+          "target_article_id" => original.id
+        })
+
+      assert json_response(conn, 422)["error"]["message"] =~ "evidence is required"
+    end
+
+    test "returns 422 naming the offending field for an article in another tenant", ctx do
+      %{conn: conn, correction: correction} = ctx
+      other = fixture(:tenant)
+      theirs = fixture(:article, %{tenant_id: other.id, status: :published})
+
+      conn =
+        post(conn, ~p"/api/v1/knowledge/conflicts", %{
+          "source_article_id" => correction.id,
+          "target_article_id" => theirs.id,
+          "evidence" => "cross-tenant"
+        })
+
+      body = json_response(conn, 422)
+      assert body["error"]["details"]["target_article_id"] == ["does not exist in this tenant"]
+    end
+  end
+
   describe "POST /api/v1/knowledge/conflicts/resolve" do
     setup %{conn: conn} do
       tenant = fixture(:tenant)
