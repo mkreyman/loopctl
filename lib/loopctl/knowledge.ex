@@ -50,6 +50,7 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Custody
   alias Loopctl.DbCapacity
+  alias Loopctl.Dispatches
   alias Loopctl.Egress
   alias Loopctl.Egress.Policy, as: EgressPolicy
   alias Loopctl.Egress.Scope, as: EgressScope
@@ -3685,12 +3686,33 @@ defmodule Loopctl.Knowledge do
   # can discover it in, leaving the documented remedy ("re-record it at :high") reachable
   # only by someone who already memorised both article ids.
   defp conflict_unresolved_subquery do
-    from(r in pair_resolutions(), where: ^settled_resolution())
+    from(r in pair_resolutions(),
+      where: ^settled_resolution(),
+      # A verdict settles only a flag that already EXISTED when it was recorded. The
+      # correlation is on the article PAIR alone, which #730 turned into a way to pre-settle
+      # an arbitrary pair forever: one principal asserts it, a second records a dismiss, and
+      # every LATER system flag over those two articles is born settled — dropped from the
+      # queue before a reviewer ever sees it. Compared against the LINK's `inserted_at`
+      # (article_links has no `updated_at`) and COALESCEd to the row's own so a pre-column
+      # verdict still settles.
+      where:
+        fragment(
+          "COALESCE(?, ?) >= ?",
+          r.annotated_at,
+          r.inserted_at,
+          parent_as(:link).inserted_at
+        )
+    )
   end
 
   # The same correlation with NO predicate on the verdict: TRUE when ANY verdict exists for
   # the pair. Only curated SUPPRESSION uses this — see the note at its call site for why the
-  # two questions must not share one predicate.
+  # two questions must not share one predicate, and why the postdate predicate above is
+  # deliberately NOT here: the automatic drain
+  # (`Loopctl.Workers.KnowledgeLintWorker.judge_redundant_conflicts/1`) skips any pair that
+  # already has a verdict row, so a re-flagged judged pair that suppression counted as
+  # unjudged would withhold BOTH its articles for the whole window with nothing able to
+  # release them.
   defp judged_pair_subquery, do: pair_resolutions()
 
   defp pair_resolutions do
@@ -4853,10 +4875,11 @@ defmodule Loopctl.Knowledge do
   sweep, highest-overlap first (most likely a true duplicate). The KB does not decide
   redundancy-vs-contradiction; this is the queue a consumer/human resolves.
 
-  Opts: `:limit` (default 50, clamped to the max page size), `:offset` (default 0).
+  Opts: `:limit` (default 50, clamped to the max page size), `:offset` (default 0),
+  `:origin` (`"system"` or `"asserted"` — anything else is no filter).
 
-  Returns `%{data: [%{link_id, similarity, articles: [%{id, title, status, category},
-  ...]}], meta: %{limit, offset, total_count}}`.
+  Returns `%{data: [%{link_id, similarity, origin, articles: [%{id, title, status,
+  category}, ...]}], meta: %{limit, offset, total_count}}`.
   """
   @spec list_potential_conflicts(Ecto.UUID.t(), keyword()) :: %{data: [map()], meta: map()}
   def list_potential_conflicts(tenant_id, opts \\ []) do
@@ -4881,19 +4904,33 @@ defmodule Loopctl.Knowledge do
         on: t.id == l.target_article_id,
         where: l.tenant_id == ^tenant_id,
         where: l.relationship_type == :potential_conflict,
-        # kb-02: only surface SYSTEM-flagged conflicts as resolvable evidence, so a stray
-        # or legacy non-system potential_conflict row is never presented to a :user.
-        where: fragment("(?->>'auto_generated') = 'true'", l.metadata),
+        # kb-02: only surface flags with real provenance, so a stray or legacy
+        # potential_conflict row is never presented as resolvable evidence. Two kinds
+        # qualify and the row says which: `auto_generated` (the linker/lint sweep found
+        # it) and `asserted` (#730 — a caller deliberately contested the pair, and the
+        # row carries who and why). They are equally REACHABLE and not equally
+        # AUTHORITATIVE: an assertion never suppresses its articles from curated answers
+        # (`open_conflict_subquery/1` still requires `auto_generated`), and its asserter
+        # may not judge it (`validate_not_self_asserted/2`).
+        where:
+          fragment("(?->>'auto_generated') = 'true'", l.metadata) or
+            fragment("(?->>'asserted') = 'true'", l.metadata),
         where: not exists(conflict_unresolved_subquery())
       )
       |> filter_conflict_pairs_by_visibility(vis)
+      |> filter_conflict_pairs_by_origin(Keyword.get(opts, :origin))
 
     total_count = AdminRepo.aggregate(base, :count, :id)
 
     rows =
       from([link: l, source: s, target: t] in base,
+        # ASSERTED pairs lead, and that is a decision rather than an accident of NULL
+        # ordering: they carry no similarity score (nothing measured them), and a pair a
+        # caller deliberately contested with an argument is a stronger review signal than
+        # the mechanical 0.93 threshold that produced most of this queue. Spelled
+        # `desc_nulls_first` so the intent survives a Postgres default nobody remembers.
         order_by: [
-          desc: fragment("(?->>'similarity_score')::float", l.metadata),
+          desc_nulls_first: fragment("(?->>'similarity_score')::float", l.metadata),
           asc: l.id
         ],
         limit: ^limit,
@@ -4901,19 +4938,62 @@ defmodule Loopctl.Knowledge do
         select: %{
           link_id: l.id,
           similarity: fragment("(?->>'similarity_score')::float", l.metadata),
+          metadata: l.metadata,
           source: %{id: s.id, title: s.title, status: s.status, category: s.category},
           target: %{id: t.id, title: t.title, status: t.status, category: t.category}
         }
       )
       |> AdminRepo.all()
 
-    data =
-      Enum.map(rows, fn r ->
-        %{link_id: r.link_id, similarity: r.similarity, articles: [r.source, r.target]}
-      end)
+    data = Enum.map(rows, &conflict_queue_row/1)
 
     %{data: data, meta: %{limit: limit, offset: offset, total_count: total_count}}
   end
+
+  # One queue row. `origin` is the field a reviewer decides on: a `system` pair was flagged
+  # by cosine similarity, which measures REDUNDANCY and cannot see contradiction, so its
+  # `similarity` is the whole evidence; an `asserted` pair (#730) has no similarity score at
+  # all and carries an argument instead, so the claim travels WITH the pair rather than
+  # living in a body the reviewer would have to go and read. Named `origin` and not
+  # `auto_generated` because a boolean invites reading the two as "real" and "not real"
+  # when the difference is provenance, not validity.
+  defp conflict_queue_row(%{metadata: metadata} = r) do
+    asserted? = metadata["asserted"] == true
+
+    base = %{
+      link_id: r.link_id,
+      similarity: r.similarity,
+      origin: if(asserted?, do: "asserted", else: "system"),
+      articles: [r.source, r.target]
+    }
+
+    if asserted? do
+      Map.put(base, :assertion, %{
+        # The server-derived PRINCIPAL, never the audit label. The label is
+        # `"<role>:<key_name>"`, so echoing it here would enumerate the tenant's key names
+        # and the roles behind them to every agent-role reader of the queue.
+        asserted_by: metadata["asserted_by_principal"],
+        asserted_at: metadata["asserted_at"],
+        classification: metadata["classification"],
+        evidence: metadata["evidence"],
+        proposed_authoritative_article_id: metadata["proposed_authoritative_article_id"]
+      })
+    else
+      base
+    end
+  end
+
+  # `origin` filter (#730). The queue admits two provenances and a reviewer must be able to
+  # ask for ONE: asserted rows lead the ordering and no nightly pass drains them, so without
+  # this any agent-role caller decides what a reviewer sees first. An unrecognized value is
+  # no filter rather than an error — this is a discovery surface, not a write.
+  defp filter_conflict_pairs_by_origin(query, "system"),
+    do: from([link: l] in query, where: fragment("(?->>'auto_generated') = 'true'", l.metadata))
+
+  defp filter_conflict_pairs_by_origin(query, "asserted"),
+    do: from([link: l] in query, where: fragment("(?->>'asserted') = 'true'", l.metadata))
+
+  defp filter_conflict_pairs_by_origin(query, _origin), do: query
 
   # Visibility predicate for the conflict queue: BOTH members of a pair must be
   # visible to an agent caller (shared/non-memory, or owned by the caller). nil
@@ -4930,6 +5010,351 @@ defmodule Loopctl.Knowledge do
              fragment("?->>'agent_id' = ?", t.metadata, ^agent_id))
     )
   end
+
+  @doc """
+  ASSERT a conflict between two articles the system never flagged (#730).
+
+  `annotate_conflict/3` can only judge a pair the AUTO-LINKER flagged by mechanical
+  similarity, which is exactly the wrong precondition for a DELIBERATE correction: a
+  session that has just written an article refuting another has a pair that is minutes
+  old (the nightly linker has not run) and may never be lexically similar enough to be
+  flagged at all — a good correction argues about the CONCLUSION and can share little
+  vocabulary with what it corrects. So the moment you most want to contest an article is
+  the moment the queue is unreachable.
+
+  This opens the pair, and nothing else. The assertion:
+
+    * creates the `:potential_conflict` link the caller cannot create directly (the
+      public link controller still 422s that type), stamped `auto_generated: false` so
+      it is never mistaken for system evidence;
+    * carries the CLAIM — `classification`, `evidence` (required) and an optional
+      `proposed_authoritative_article_id` — so a reviewer sees the argument, not just
+      two ids;
+    * surfaces the pair in `GET /api/v1/knowledge/conflicts` and in both articles'
+      `potential_conflicts`, which is the structured signal a prose "SUPERSEDED" banner
+      in the loser's body could never be (a caller reading snippets never sees a banner).
+
+  ## What it deliberately does NOT do
+
+  **It does not suppress either article from curated answers.** `open_conflict_subquery/1`
+  and `article_in_open_conflict?/2` still require `auto_generated == true`, so an agent
+  cannot retract an arbitrary article from the governed answer path by asserting a dispute
+  over it. Suppression is a system judgement about a system flag.
+
+  **It does not let the asserter act on its own assertion.** `annotate_conflict/3` refuses
+  a verdict whose recorder is the principal that asserted the pair
+  (`{:error, :self_asserted_conflict}`), and `apply_resolution/2` re-checks it at execution
+  time. The pair is manufacturable BY CONSTRUCTION here — the caller names it — so this is
+  the same structural separation the story lifecycle enforces between implementing and
+  verifying, and the rule the KB's own confused-deputy pattern prescribes for any unattended
+  actor consuming caller-recorded intent: the disposition's author must not have created
+  both sides of the relationship. Reachability of the pair is what was missing; authority
+  over it was not.
+
+  Idempotent per pair: an existing flag (system or asserted, either direction) is returned
+  as `{:ok, link, :existing}` rather than duplicated, so a retry is safe and an assertion
+  can never overwrite a system flag's provenance.
+
+  ## Options
+
+    * `:visibility_agent_id` — agent-role scope; BOTH members must be visible, refused as
+      `:article_not_visible` otherwise (parity with `annotate_conflict/3` and `create_link/3`).
+    * `:actor_principal` — the asserting principal, resolved server-side from the key
+      (`agent_id || api_key_id`). Persisted as `asserted_by_principal` and compared against
+      the recorder's on every later verdict. **Required**: without it there is no identity
+      to hold apart, so the assertion is refused rather than recorded unattributed.
+    * `:actor_lineage` — the asserting key's dispatch lineage (root → leaf), resolved
+      server-side. Persisted as `asserted_by_lineage`; a later verdict from an ancestor or
+      descendant dispatch of the same operator is refused too (siblings are separation).
+    * `:actor_label` / `:actor_id` / `:actor_type` — the usual audit context.
+  """
+  @spec assert_conflict(Ecto.UUID.t(), map(), keyword()) ::
+          {:ok, ArticleLink.t(), :created | :existing}
+          | {:error,
+             Ecto.Changeset.t()
+             | :article_not_visible
+             | :same_article
+             | :missing_article_id
+             | :evidence_required
+             | :evidence_too_long
+             | :invalid_classification
+             | :invalid_proposed_article
+             | :too_many_open_assertions
+             | :unattributed_assertion
+             | :assertion_not_recorded}
+  def assert_conflict(tenant_id, attrs, opts \\ []) do
+    get = fn key -> attrs[key] || attrs[to_string(key)] end
+    # Checked in the order SUPPLIED and canonicalized only for storage: canonicalizing
+    # first sorts the pair by UUID, so a bad `target_article_id` could come back as an
+    # error naming `source_article_id`.
+    raw_src = get.(:source_article_id)
+    raw_tgt = get.(:target_article_id)
+    principal = normalize_principal(Keyword.get(opts, :actor_principal))
+
+    with {:ok, src_id, tgt_id} <- cast_distinct_pair(raw_src, raw_tgt),
+         :ok <- validate_assertion_attributed(principal),
+         :ok <- validate_assertion_evidence(get.(:evidence)),
+         :ok <- validate_assertion_classification(get.(:classification)),
+         :ok <-
+           validate_proposed_authoritative(
+             get.(:proposed_authoritative_article_id),
+             src_id,
+             tgt_id
+           ),
+         # VISIBILITY BEFORE EXISTENCE. To an agent caller an id it cannot see and an id
+         # that does not exist must be the SAME answer, or the pair of them (404 here, a
+         # 422 naming the field below) enumerates which private article ids are real —
+         # exactly the probe the visibility model exists to prevent. A higher role passes
+         # no scope, sees everything, and still gets the naming 422.
+         :ok <-
+           validate_assertion_visible(
+             tenant_id,
+             src_id,
+             tgt_id,
+             Keyword.get(opts, :visibility_agent_id)
+           ),
+         :ok <- validate_articles_exist(tenant_id, src_id, tgt_id) do
+      {src, tgt} = canonical_pair(src_id, tgt_id)
+
+      case fetch_conflict_flag(tenant_id, src, tgt) do
+        {:ok, %ArticleLink{} = existing} ->
+          {:ok, existing, :existing}
+
+        {:error, :no_potential_conflict} ->
+          open_new_assertion(tenant_id, src, tgt, attrs, principal, opts)
+      end
+    end
+  end
+
+  # The budget bounds how many NEW pairs one principal may OPEN, so it is checked HERE and
+  # not in `assert_conflict/3`'s `with`: re-asserting an already-flagged pair creates
+  # nothing, and refusing that at the cap breaks the idempotency the function documents
+  # ("a retry is safe") for the one caller who most needs it — a client retrying a timeout.
+  defp open_new_assertion(tenant_id, src, tgt, attrs, principal, opts) do
+    with :ok <- validate_open_assertion_budget(tenant_id, principal) do
+      insert_asserted_conflict(tenant_id, src, tgt, attrs, principal, opts)
+    end
+  end
+
+  defp insert_asserted_conflict(tenant_id, src, tgt, attrs, principal, opts) do
+    get = fn key -> attrs[key] || attrs[to_string(key)] end
+
+    # Written through AdminRepo rather than `create_link/3` on purpose: `create_link/3`
+    # runs `strip_system_metadata/1`, which exists to stop a CALLER planting provenance
+    # markers. The markers here are SERVER-authored (`auto_generated: false` is the one
+    # that matters, and the caller has no way to influence it), so this is the same
+    # posture the system conflict-writers take — the stripping stays the guard on the
+    # caller-facing path it was built for.
+    link_attrs = %{
+      source_article_id: src,
+      target_article_id: tgt,
+      relationship_type: :potential_conflict,
+      metadata: %{
+        # NEVER `true`. This is what keeps an assertion out of curated suppression and
+        # out of any future site that reads the marker as "the system found this".
+        "auto_generated" => false,
+        "asserted" => true,
+        "asserted_by_principal" => principal,
+        # The asserting key's dispatch lineage (root → leaf), so a later verdict from an
+        # ANCESTOR or DESCENDANT dispatch of the same operator can be held apart from one
+        # by a genuinely separate party. `[]` for a key no dispatch minted.
+        "asserted_by_lineage" => normalize_lineage(Keyword.get(opts, :actor_lineage)),
+        # The audit label, kept for the execution-time backstop's fallback branch only
+        # (`apply_flagged_resolution/3`) and deliberately NOT rendered on the queue: it is
+        # `"<role>:<key_name>"`, which would enumerate tenant key names to every
+        # agent-role reader.
+        "asserted_by" => Keyword.get(opts, :actor_label) || Keyword.get(opts, :actor_id),
+        "asserted_at" => DateTime.to_iso8601(DateTime.utc_now()),
+        "classification" => scalar_or_nil(get.(:classification)),
+        "evidence" => scalar_or_nil(get.(:evidence)),
+        "proposed_authoritative_article_id" =>
+          canonical_uuid_or_nil(get.(:proposed_authoritative_article_id))
+      }
+    }
+
+    multi =
+      Multi.new()
+      |> Multi.insert(
+        :link,
+        ArticleLink.changeset(%ArticleLink{tenant_id: tenant_id}, link_attrs)
+      )
+      |> Audit.log_in_multi(:audit, &build_assert_conflict_audit(tenant_id, &1, opts))
+
+    case AdminRepo.transaction(multi) do
+      {:ok, %{link: link}} ->
+        {:ok, link, :created}
+
+      # Lost the insert race against a concurrent assertion (or the nightly promoter):
+      # the unique index on (tenant, source, target, relationship_type) fired. The pair
+      # IS flagged, which is all this call promises, so re-read rather than 422.
+      {:error, :link, %Ecto.Changeset{} = changeset, _} ->
+        case fetch_conflict_flag(tenant_id, src, tgt) do
+          {:ok, %ArticleLink{} = existing} -> {:ok, existing, :existing}
+          {:error, :no_potential_conflict} -> {:error, changeset}
+        end
+
+      # The only other step is the AUDIT insert, and its failure is not the caller's to
+      # fix: the transaction rolled back, so no link exists. One stable term rather than a
+      # CaseClauseError escaping the context as an unrenderable 500.
+      {:error, _step, _reason, _changes} ->
+        {:error, :assertion_not_recorded}
+    end
+  end
+
+  defp build_assert_conflict_audit(tenant_id, %{link: link}, opts) do
+    %{
+      tenant_id: tenant_id,
+      entity_type: "article_link",
+      entity_id: link.id,
+      action: "knowledge.conflict_asserted",
+      actor_type: Keyword.get(opts, :actor_type, "api_key"),
+      actor_id: Keyword.get(opts, :actor_id),
+      actor_label: Keyword.get(opts, :actor_label),
+      new_state: %{
+        "source_article_id" => to_string(link.source_article_id),
+        "target_article_id" => to_string(link.target_article_id),
+        "relationship_type" => to_string(link.relationship_type),
+        # The identity the separation turns on, recorded where it cannot be edited: a
+        # later verdict on this pair is refused if it comes from this principal.
+        "asserted_by_principal" => link.metadata["asserted_by_principal"],
+        "classification" => link.metadata["classification"],
+        "evidence" => link.metadata["evidence"]
+      }
+    }
+  end
+
+  # An article cannot conflict with itself, and the canonical-pair ordering would collapse
+  # such a request into a self-link the unique index does not forbid. Decided on the CAST
+  # uuid, never the raw string: `:binary_id` normalizes case only at DUMP time, so
+  # "0B27..." and "0b27..." are distinct binaries to this guard AND to the changeset's
+  # `validate_no_self_link`, and one article landed as a row whose two FK columns hold
+  # identical bytes. The cast is also what keeps a non-uuid out of `where: a.id == ^value`,
+  # which raises `Ecto.Query.CastError` — a 500 on an ordinary client typo.
+  defp cast_distinct_pair(a, b) do
+    with {:ok, cast_a} <- cast_article_id(a),
+         {:ok, cast_b} <- cast_article_id(b) do
+      if cast_a == cast_b, do: {:error, :same_article}, else: {:ok, cast_a, cast_b}
+    end
+  end
+
+  defp cast_article_id(value) when is_binary(value) do
+    case Ecto.UUID.cast(value) do
+      {:ok, uuid} -> {:ok, uuid}
+      :error -> {:error, :missing_article_id}
+    end
+  end
+
+  defp cast_article_id(_value), do: {:error, :missing_article_id}
+
+  defp canonical_uuid_or_nil(value) do
+    case cast_article_id(value) do
+      {:ok, uuid} -> uuid
+      {:error, :missing_article_id} -> nil
+    end
+  end
+
+  # The three values the tool schema and the OpenAPI request body both declare. Validated
+  # rather than trusted because nothing casts this endpoint's params: an unconstrained
+  # free-text classification is rendered verbatim to every reviewer of the queue and
+  # defeats any consumer that branches on it. Absent is fine; wrong is not.
+  @assertion_classifications ~w(redundant complementary contradictory)
+
+  defp validate_assertion_classification(nil), do: :ok
+
+  defp validate_assertion_classification(value)
+       when is_binary(value) and value in @assertion_classifications,
+       do: :ok
+
+  defp validate_assertion_classification(_value), do: {:error, :invalid_classification}
+
+  # The proposal is a CLAIM a reviewer reads, so it must at least name a member of the pair.
+  # Unchecked it accepted any string — a non-uuid, or an article in another tenant — and
+  # rendered it as the asserter's proposed winner for anything downstream to carry forward.
+  defp validate_proposed_authoritative(nil, _src, _tgt), do: :ok
+
+  defp validate_proposed_authoritative(value, src, tgt) do
+    case cast_article_id(value) do
+      {:ok, uuid} when uuid == src or uuid == tgt -> :ok
+      _ -> {:error, :invalid_proposed_article}
+    end
+  end
+
+  # A principal may hold only so many UNJUDGED assertions at once. Asserted rows lead the
+  # queue and no nightly pass drains them (the auto-judge acts on system flags only), so
+  # unbounded, one agent-role key decides what every reviewer sees first. Counted per
+  # PRINCIPAL, not per tenant: the bound is on one caller monopolizing the page, never on a
+  # tenant genuinely having many open disputes.
+  @max_open_assertions_per_principal 25
+
+  defp validate_open_assertion_budget(tenant_id, principal) do
+    open =
+      from(l in ArticleLink,
+        as: :link,
+        where: l.tenant_id == ^tenant_id,
+        where: l.relationship_type == :potential_conflict,
+        where: fragment("(?->>'asserted') = 'true'", l.metadata),
+        where: fragment("?->>'asserted_by_principal' = ?", l.metadata, ^principal),
+        where: not exists(conflict_unresolved_subquery())
+      )
+      |> AdminRepo.aggregate(:count, :id)
+
+    if open >= @max_open_assertions_per_principal,
+      do: {:error, :too_many_open_assertions},
+      else: :ok
+  end
+
+  # FAIL CLOSED on an unattributed assertion. `asserted_by_principal` is the ONLY thing
+  # separating the asserter from the judge; recorded as nil it would compare equal to every
+  # other unattributed caller, which reads as maximum separation while providing none.
+  defp validate_assertion_attributed(nil), do: {:error, :unattributed_assertion}
+  defp validate_assertion_attributed(_principal), do: :ok
+
+  # Evidence is required because an assertion with no argument is indistinguishable from
+  # noise on the one queue a human reviews, and the queue is the whole deliverable here.
+  # BOUNDED because it is echoed on every row of that queue and copied into the
+  # append-only audit log: the only other limit is the 2 MB request body, which one
+  # assertion turns into a multi-megabyte page for every reviewer.
+  @max_assertion_evidence_bytes 4_000
+
+  @doc """
+  Byte cap on an asserted conflict's `evidence`, so the guard and the endpoint's OpenAPI
+  description read ONE number.
+  """
+  @spec max_assertion_evidence_bytes() :: pos_integer()
+  def max_assertion_evidence_bytes, do: @max_assertion_evidence_bytes
+
+  defp validate_assertion_evidence(evidence) when is_binary(evidence) do
+    cond do
+      String.trim(evidence) == "" -> {:error, :evidence_required}
+      byte_size(evidence) > @max_assertion_evidence_bytes -> {:error, :evidence_too_long}
+      true -> :ok
+    end
+  end
+
+  defp validate_assertion_evidence(_evidence), do: {:error, :evidence_required}
+
+  defp validate_assertion_visible(tenant_id, src, tgt, agent_id) do
+    case validate_pair_visible(tenant_id, src, tgt, agent_id) do
+      :ok -> :ok
+      {:error, :no_potential_conflict} -> {:error, :article_not_visible}
+    end
+  end
+
+  # A principal is a server-derived id string; anything else (a map, a list, an empty
+  # string) is no identity at all and is normalized to nil so the fail-closed checks fire.
+  defp normalize_principal(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      trimmed -> trimmed
+    end
+  end
+
+  defp normalize_principal(_value), do: nil
+
+  # Link metadata is JSONB: keep only scalars a caller could reasonably have meant, so a
+  # nested object in `classification` cannot be smuggled into the reviewer's view.
+  defp scalar_or_nil(value) when is_binary(value), do: value
+  defp scalar_or_nil(_value), do: nil
 
   @doc """
   Record a retrieving agent's VERDICT on a potential-conflict pair (route-the-findings
@@ -4963,7 +5388,7 @@ defmodule Loopctl.Knowledge do
   """
   @spec annotate_conflict(Ecto.UUID.t(), map(), keyword()) ::
           {:ok, ConflictResolution.t()}
-          | {:error, Ecto.Changeset.t() | :no_potential_conflict}
+          | {:error, Ecto.Changeset.t() | :no_potential_conflict | :self_asserted_conflict}
   def annotate_conflict(tenant_id, attrs, opts \\ []) do
     get = fn key -> attrs[key] || attrs[to_string(key)] end
     {src, tgt} = canonical_pair(get.(:source_article_id), get.(:target_article_id))
@@ -4983,7 +5408,9 @@ defmodule Loopctl.Knowledge do
     # private ids exist. Higher roles pass no scope and see everything.
     with :ok <-
            validate_pair_visible(tenant_id, src, tgt, Keyword.get(opts, :visibility_agent_id)),
-         :ok <- validate_potential_conflict_exists(tenant_id, src, tgt) do
+         {:ok, flag} <- conflict_flag_for_verdict(tenant_id, src, tgt),
+         # #730: an ASSERTED pair is reachable, but never by the principal that asserted it.
+         :ok <- validate_not_self_asserted(flag, opts) do
       disposition = get.(:disposition)
       now = DateTime.utc_now()
       role = recorder_role(opts)
@@ -5046,9 +5473,51 @@ defmodule Loopctl.Knowledge do
         )
       end
 
+      stamp_verdict_principal(flag, result, opts)
+
       result
     end
   end
+
+  # #730: record the RECORDER's principal next to the asserter's, so the execution-time
+  # separation re-check compares two server-derived identities. It used to compare audit
+  # LABELS (`"<role>:<key_name>"`), and nothing makes a key name unique: a collision
+  # silently discarded a legitimate verdict and closed the row, while two dispatch keys of
+  # ONE agent never collide at all — so the backstop fired where it must not and stayed
+  # quiet where it must. Only an asserted flag carries an asserter, so only it is stamped.
+  defp stamp_verdict_principal(%ArticleLink{} = flag, {:ok, %ConflictResolution{}}, opts) do
+    case normalize_principal(flag.metadata["asserted_by_principal"]) do
+      nil ->
+        :ok
+
+      _asserted_by ->
+        recorder = normalize_principal(Keyword.get(opts, :actor_principal))
+        metadata = Map.put(flag.metadata, "verdict_by_principal", recorder)
+
+        # `update_all` on the id, never `Repo.update/1`: this runs AFTER the verdict has
+        # committed and outside its transaction, and a `:user` may retract the flag in that
+        # window (see `apply_resolution/2`). `Repo.update/1` raises Ecto.StaleEntryError on
+        # a row that is gone, which would answer 500 for a verdict that WAS recorded;
+        # matching zero rows is the right outcome for a pair nobody is judging any more.
+        {updated, _} =
+          from(l in ArticleLink, where: l.id == ^flag.id)
+          |> AdminRepo.update_all(set: [metadata: metadata])
+
+        if updated == 0 do
+          # Not silent: unstamped, the execution-time backstop falls back to comparing
+          # audit LABELS, which are not unique.
+          Logger.warning(
+            "knowledge: verdict principal not stamped on asserted flag #{flag.id} " <>
+              "(link retracted concurrently); execution-time self-assertion re-check " <>
+              "falls back to the audit label for this pair."
+          )
+        end
+
+        :ok
+    end
+  end
+
+  defp stamp_verdict_principal(_flag, _result, _opts), do: :ok
 
   # The roles whose recorded verdict may authorize an UNATTENDED RETIREMENT, and the one
   # place that set is written down. Read by `grant_confidence/3` (which caps what a
@@ -5151,23 +5620,103 @@ defmodule Loopctl.Knowledge do
   # link controller now refuses to create that type, requiring the provenance marker
   # means no future/alternate path that plants such a link can be leveraged to fabricate
   # a destructive verdict.
-  defp validate_potential_conflict_exists(tenant_id, src, tgt)
-       when is_binary(src) and is_binary(tgt) do
-    exists? =
-      from(l in ArticleLink,
-        where: l.tenant_id == ^tenant_id,
-        where: l.relationship_type == :potential_conflict,
-        where: fragment("(?->>'auto_generated') = 'true'", l.metadata),
-        where:
-          (l.source_article_id == ^src and l.target_article_id == ^tgt) or
-            (l.source_article_id == ^tgt and l.target_article_id == ^src)
-      )
-      |> AdminRepo.exists?()
+  # The flag lookup AS THE VERDICT PATH needs it. When an id is missing we return
+  # `:deferred` and let the changeset's required-field validation produce the 422, rather
+  # than masking a malformed request as "no conflict" — the same deferral the pre-#730
+  # `validate_potential_conflict_exists/3` made, and the reason it is preserved here
+  # instead of collapsing both callers onto one lookup.
+  defp conflict_flag_for_verdict(tenant_id, src, tgt) when is_binary(src) and is_binary(tgt),
+    do: fetch_conflict_flag(tenant_id, src, tgt)
 
-    if exists?, do: :ok, else: {:error, :no_potential_conflict}
+  defp conflict_flag_for_verdict(_tenant_id, _src, _tgt), do: {:ok, :deferred}
+
+  # The same lookup, returning the LINK so its provenance can be read. A SYSTEM flag
+  # (`auto_generated: true`) and an ASSERTED one (#730) are both real flags for the purpose
+  # of "may a verdict be recorded here" — the distinction is not reachability but WHO may
+  # record it, which `validate_not_self_asserted/2` decides from the link's stamped
+  # `asserted_by_principal`. A SYSTEM flag is preferred when both somehow exist so the
+  # stronger provenance wins the tie and an assertion can never downgrade a system flag.
+  defp fetch_conflict_flag(tenant_id, src, tgt) when is_binary(src) and is_binary(tgt) do
+    from(l in ArticleLink,
+      where: l.tenant_id == ^tenant_id,
+      where: l.relationship_type == :potential_conflict,
+      where:
+        fragment("(?->>'auto_generated') = 'true'", l.metadata) or
+          fragment("(?->>'asserted') = 'true'", l.metadata),
+      where:
+        (l.source_article_id == ^src and l.target_article_id == ^tgt) or
+          (l.source_article_id == ^tgt and l.target_article_id == ^src),
+      order_by: [desc: fragment("(?->>'auto_generated') = 'true'", l.metadata)],
+      limit: 1
+    )
+    |> AdminRepo.one()
+    |> case do
+      %ArticleLink{} = link -> {:ok, link}
+      nil -> {:error, :no_potential_conflict}
+    end
   end
 
-  defp validate_potential_conflict_exists(_tenant_id, _src, _tgt), do: :ok
+  defp fetch_conflict_flag(_tenant_id, _src, _tgt), do: {:error, :no_potential_conflict}
+
+  # #730: the asserter of a pair may not also judge it.
+  #
+  # An ASSERTED pair is manufacturable by definition — the caller named both ids — so the
+  # one property that made `annotate_conflict/3` safe on a SYSTEM flag (the pair predates
+  # and is independent of the caller) is absent by construction. The KB's own
+  # confused-deputy pattern names the remedy: the disposition's author must not have
+  # created both sides of the relationship. Role separation alone is not it, because a
+  # `:merge` is never role-capped and a `:dismiss` is terminal the moment it is recorded —
+  # so without this, asserting a pair and immediately dismissing it would let any caller
+  # pre-settle an arbitrary pair and suppress a GENUINE system flag raised over it later.
+  #
+  # Fail closed on an unknown recorder: an assertion cannot be recorded without a principal
+  # (`validate_assertion_attributed/1`), so a nil on THIS side means the verdict path did
+  # not supply one, and permitting it would make "no identity" the way through.
+  # `:deferred` — a malformed request whose 422 belongs to the changeset (see
+  # `conflict_flag_for_verdict/3`). There is no pair to hold anyone apart from.
+  defp validate_not_self_asserted(:deferred, _opts), do: :ok
+
+  defp validate_not_self_asserted(%ArticleLink{metadata: metadata}, opts) do
+    asserted_by = normalize_principal(metadata["asserted_by_principal"])
+    recorder = normalize_principal(Keyword.get(opts, :actor_principal))
+
+    cond do
+      # A system flag carries no asserter — nothing to hold apart.
+      is_nil(asserted_by) -> :ok
+      is_nil(recorder) -> {:error, :self_asserted_conflict}
+      asserted_by == recorder -> {:error, :self_asserted_conflict}
+      same_dispatch_chain?(metadata, opts) -> {:error, :self_asserted_conflict}
+      true -> :ok
+    end
+  end
+
+  # One operator dispatching two keys is ONE party, so a verdict from an ANCESTOR or
+  # DESCENDANT of the asserting dispatch is self-judgement even though the two key ids
+  # differ. SIBLINGS are separation, and that distinction is not a preference: comparing the
+  # lineage ROOT instead collapses every dispatch-minted key in the documented single-root
+  # tenant into one principal, which is precisely what made `verify` unreachable before
+  # (CLAUDE.md, "a SIBLING is separation"). `Dispatches.lineage_same_chain?/2` is the same
+  # test the L4 custody gates run. A caller with NO lineage — the tenant's own operator key
+  # — is the documented human judge and is permitted; nothing on a dispatch row records
+  # which key minted a ROOT, so that identity is not derivable here.
+  defp same_dispatch_chain?(metadata, opts) do
+    Dispatches.lineage_same_chain?(
+      normalize_lineage(metadata["asserted_by_lineage"]),
+      normalize_lineage(Keyword.get(opts, :actor_lineage))
+    )
+  end
+
+  # A lineage is a list of server-derived id strings; anything else is no lineage at all.
+  defp normalize_lineage(lineage) when is_list(lineage) do
+    Enum.flat_map(lineage, fn value ->
+      case normalize_principal(value) do
+        nil -> []
+        id -> [id]
+      end
+    end)
+  end
+
+  defp normalize_lineage(_lineage), do: []
 
   @doc """
   Nightly executor for conflict resolutions (route-the-findings #4). Applies only
@@ -5338,9 +5887,9 @@ defmodule Loopctl.Knowledge do
   # recorded and before the nightly run. Re-validate the SYSTEM flag still exists right
   # before acting; if it was retracted, noop (audited) instead of retiring/merging.
   defp apply_resolution(tenant_id, %ConflictResolution{} = r) do
-    case validate_potential_conflict_exists(tenant_id, r.source_article_id, r.target_article_id) do
-      :ok ->
-        apply_disposition(tenant_id, r)
+    case fetch_conflict_flag(tenant_id, r.source_article_id, r.target_article_id) do
+      {:ok, %ArticleLink{} = flag} ->
+        apply_flagged_resolution(tenant_id, r, flag)
 
       {:error, :no_potential_conflict} ->
         mark_resolution_executed(r, %{
@@ -5349,6 +5898,48 @@ defmodule Loopctl.Knowledge do
         })
 
         false
+    end
+  end
+
+  # #730, defense in depth. `annotate_conflict/3` already refuses a verdict recorded by the
+  # principal that asserted the pair, so this should be unreachable — it is here because the
+  # KB's confused-deputy pattern prescribes re-validating at EXECUTION time that the
+  # disposition's author did not create both sides, and a guard that only runs at write time
+  # is one code path away from being bypassed by a future caller.
+  #
+  # It compares PRINCIPALS — the asserter's is stamped at assert time and the recorder's at
+  # verdict time (`stamp_verdict_principal/3`) — and the audit LABELS are evaluated IN
+  # ADDITION, never as an else-branch, the same "in addition to, never short-circuited by"
+  # rule the custody gates in `Progress` state. `verdict_by_principal` carries only the LAST
+  # verdict that went through `annotate_conflict/3`, so an earlier legitimate verdict left
+  # a non-nil principal on the row and an else-branch made the label check unreachable for
+  # every later write — exactly the alternate-route write this backstop exists for. Labels
+  # are `"<role>:<key_name>"` and nothing makes a key name unique, which is why they decide
+  # nothing on their own but still refuse a match. Closed as executed (audited) rather than
+  # skipped, so a refused row can never sit pending forever while `executable_resolution/0`
+  # reads its pair as settled.
+  defp apply_flagged_resolution(tenant_id, %ConflictResolution{} = r, %ArticleLink{} = flag) do
+    asserted_by = normalize_principal(flag.metadata["asserted_by_principal"])
+    recorder = normalize_principal(flag.metadata["verdict_by_principal"])
+    label = normalize_principal(flag.metadata["asserted_by"])
+
+    self_asserted? =
+      not is_nil(asserted_by) and
+        (asserted_by == recorder or
+           (not is_nil(label) and label == normalize_principal(r.annotated_by)))
+
+    if self_asserted? do
+      mark_resolution_executed(r, %{
+        "action" => "noop",
+        "reason" => "self_asserted_conflict",
+        "detail" =>
+          "The verdict was recorded by the same actor that asserted this pair. An " <>
+            "asserted pair is named by its caller, so its judge must be someone else."
+      })
+
+      false
+    else
+      apply_disposition(tenant_id, r)
     end
   end
 

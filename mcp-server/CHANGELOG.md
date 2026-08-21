@@ -5,6 +5,44 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.76.0 — 2026-08-21 (contest an article you just refuted)
+
+### Added
+
+- **`knowledge_assert_conflict`** — assert a conflict between two articles the system never
+  flagged. `knowledge_resolve_conflict` could only reach pairs the AUTO-LINKER flagged by
+  cosine similarity, which is precisely the wrong precondition for a deliberate correction:
+  the pair is minutes old so the nightly linker has not run, and a good correction argues
+  about the CONCLUSION rather than restating the vocabulary, so it may never cross the
+  similarity threshold at all. The moment you most want to contest an article was the moment
+  the mechanism refused (`422 No potential-conflict link exists for this article pair`).
+
+  The asserted pair reaches `knowledge_conflicts` with `origin: "asserted"` and the claim
+  (`classification`, `evidence`, an optional proposed winner) attached, and shows up in both
+  articles' `potential_conflicts`. `evidence` is required — an assertion carries no
+  similarity score, so the argument is what a reviewer judges.
+
+  **Reachability is all it grants.** An assertion retires, hides and down-ranks nothing, and
+  does NOT remove either article from curated answers — suppression still requires a system
+  flag, or any key could retract any article from the governed answer path by disputing it.
+  And the asserting key may not record the pair's verdict: `knowledge_resolve_conflict`
+  answers it `409 self_asserted_conflict`, because a party that names a pair does not also
+  certify the verdict on it. That is the same separation the `supersede` confidence cap
+  already draws between recording a retirement and authorizing one.
+
+  Idempotent per pair, in either direction; re-asserting returns the existing flag with
+  `created: false` and never overwrites a system flag's provenance.
+
+### Notes
+
+- **`knowledge_resolve_conflict` still sends `LOOPCTL_AGENT_KEY`**, deliberately. A pair you
+  asserted answers `409 self_asserted_conflict` to your own key, and the completion path is
+  a DIFFERENT principal — a second session, an orchestrator, or a human operator — not this
+  process reaching for `LOOPCTL_ORCH_KEY`. Holding the asserter's key and the judge's key in
+  one process makes the separation nominal, and it would also lift the agent-role
+  `supersede` confidence cap and the agent visibility scope on every verdict, including the
+  system-flagged pairs that have nothing to do with assertions.
+
 ## 2.74.0 — 2026-08-12 (one search command, three response shapes)
 
 ### Added

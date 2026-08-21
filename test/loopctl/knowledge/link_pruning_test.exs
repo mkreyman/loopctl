@@ -293,6 +293,46 @@ defmodule Loopctl.Knowledge.LinkPruningTest do
       assert MapSet.member?(edge_ids(tenant.id, :potential_conflict), flagged.id)
     end
 
+    test "an ASSERTED flag does NOT release the band spare (#730)" do
+      # The mirror of the test above, and the reason it cannot be unconditional. The spare
+      # protects `promote_conflicts/1`'s only input, and it is safe to release once the
+      # pair IS flagged because the edge has then done its job. An ASSERTED flag has done
+      # no such thing — the pair was never promoted — so releasing the spare on it let any
+      # agent trigger the deletion of the very `relates_to` edge the promoter needs, and
+      # nothing recreates a pruned edge below the linker's cap. Assert a conflict, wait one
+      # night, and the pair can never be system-flagged again.
+      tenant = fixture(:tenant)
+      band = Application.get_env(:loopctl, :knowledge_conflict_threshold, 0.93)
+      hub = published(tenant.id)
+      target = published(tenant.id)
+
+      link(tenant.id, hub, published(tenant.id), band + 0.05)
+      link(tenant.id, hub, published(tenant.id), band + 0.04)
+      link(tenant.id, target, published(tenant.id), band + 0.05)
+      link(tenant.id, target, published(tenant.id), band + 0.04)
+
+      in_band = link(tenant.id, hub, target, band)
+
+      fixture(:article_link, %{
+        tenant_id: tenant.id,
+        source_article_id: target.id,
+        target_article_id: hub.id,
+        relationship_type: :potential_conflict,
+        metadata: %{
+          "auto_generated" => false,
+          "asserted" => true,
+          "asserted_by_principal" => "some-agent",
+          "evidence" => "these two disagree"
+        }
+      })
+
+      assert {:ok, %{pruned: 0}} =
+               LinkPruning.prune(tenant.id, target_degree: 2, max_per_run: 1000)
+
+      assert MapSet.member?(edge_ids(tenant.id), in_band.id),
+             "an agent's claim must not be able to delete the promoter's input"
+    end
+
     test "the prune is ONE statement, and it carries the predicate" do
       # The delete and the remainder count used to be two statements, so the guard could
       # drift between them and the worker would report a backlog it was structurally unable

@@ -6,6 +6,60 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **`POST /api/v1/knowledge/conflicts` — assert a conflict pair the system never flagged
+  (agent+, #730).** `POST /knowledge/conflicts/resolve` could only reach pairs the
+  auto-linker had flagged by cosine similarity, which is the wrong precondition for a
+  DELIBERATE correction: the pair is minutes old so the nightly linker has not run, and a
+  correction that argues about a conclusion may never cross the similarity threshold at all.
+  The new endpoint creates the `:potential_conflict` link itself (`auto_generated: false`,
+  `asserted: true`), carrying the claim — `classification`, a REQUIRED `evidence`, and an
+  optional `proposed_authoritative_article_id`. The pair then appears in
+  `GET /api/v1/knowledge/conflicts` with a new `origin` field (`"system"` / `"asserted"`)
+  and, for an assertion, an `assertion` block; asserted pairs lead the queue, since they
+  carry an argument rather than a similarity score.
+
+  **Operator impact: no migration, no new environment variable, and no change to what any
+  existing call does.** Two behaviours worth knowing:
+
+  - `GET /api/v1/knowledge/conflicts` now returns asserted pairs alongside system-flagged
+    ones, and asserted rows lead the ordering. Every row carries `origin`, and the endpoint
+    takes `?origin=system` / `?origin=asserted` so a reviewer can read one provenance
+    alone. `evidence` is capped at 4000 bytes (it is echoed on every row of that queue),
+    and a principal may hold only 25 UNJUDGED assertions at once — both are `422`s, so no
+    one caller decides what page 1 of the queue holds. The cap bounds pairs a principal
+    OPENS, so re-asserting an already-flagged pair stays idempotent at the cap.
+  - `POST /knowledge/conflicts/resolve` gains a `409 self_asserted_conflict`: the principal
+    that asserted a pair may not also record its verdict. An asserted pair is named by its
+    caller, so judging it is someone else's call — the same separation the `supersede`
+    confidence cap already draws between recording a retirement and authorizing one. A
+    system-flagged pair is unaffected; it carries no asserter.
+
+  **Migration:** `20260821120000_widen_potential_conflict_partial_index_for_assertions`
+  rebuilds `article_links_potential_conflict_idx` CONCURRENTLY so its partial predicate
+  covers asserted rows too. Without it the conflict queue's `auto_generated OR asserted`
+  filter no longer implies the index's `auto_generated`-only predicate, and the endpoint
+  falls back to the seq scan + sort that 20260804220000 measured at 313 ms against the
+  index's 0.131 ms. No downtime, no table lock, and it DROPs only a mismatched or INVALID
+  catalog entry — an out-of-band prod build or a retry keeps its live index.
+
+  **Behaviour change in the nightly `KnowledgeLintWorker`:** an asserted flag no longer
+  pre-empts the system conflict pipeline. `promote_conflicts/1` ignores asserted rows when
+  choosing candidates and UPGRADES an existing one in place (stamping `auto_generated` and
+  the real similarity score, preserving the claim and its asserter), because the pair's
+  `potential_conflict` slot is unique and an assertion sitting in it would otherwise mean
+  the system flag could never be stamped — and therefore curated suppression could never
+  fire for that pair again. The similarity-based judge skips asserted pairs outright: it
+  can only ever record `:redundant`, a `dismiss` is terminal on record, and auto-dismissing
+  a deliberate contradiction as redundancy would destroy the evidence the night it was
+  raised. `LinkPruning` likewise requires SYSTEM provenance before releasing the
+  high-similarity spare, so an assertion cannot trigger deletion of the `relates_to` edge
+  the promoter needs.
+
+  An assertion grants reachability and nothing else. It does NOT suppress either article
+  from curated answers — `open_conflict_subquery/1` and `authoritative_curated?/2` still
+  require `auto_generated: true`, or any key could retract any article from the governed
+  answer path by disputing it — and it never overwrites a system flag's provenance.
+
 - **`Loopctl.Workers.StructuralLinksWorker` — weekly `derived_from` harvest, `0 6 * * 0`.**
   US-42.1 shipped `Knowledge.StructuralLinks.harvest/2` with nothing running it, so only the
   one manual backfill ever produced source hubs; every source created since has had none.

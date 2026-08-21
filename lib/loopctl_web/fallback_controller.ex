@@ -596,6 +596,47 @@ defmodule LoopctlWeb.FallbackController do
     |> json(%{error: %{status: 400, message: message}})
   end
 
+  # #730: a verdict on an ASSERTED conflict pair, recorded by the principal that asserted
+  # it. Deliberately NOT `record_custody_violation/2`: unlike the `self_*_blocked` story
+  # gates above this is not an L6 byzantine signal, it is a separation-of-duties refusal on
+  # a curation surface — the caller did nothing dishonest, it simply cannot both name a
+  # pair and judge it. Recording it as byzantium would escalate ordinary curation into a
+  # tenant-wide halt. 409 (not 422) because the request is well-formed and the pair exists;
+  # what is wrong is WHO is asking.
+  def call(conn, {:error, :self_asserted_conflict}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "self_asserted_conflict",
+        message:
+          "You asserted this conflict pair, so you cannot also record its verdict. An " <>
+            "asserted pair is named by its caller; a pair the system flagged independently " <>
+            "(GET /api/v1/knowledge/conflicts, origin \"system\") carries no such " <>
+            "restriction. The pair stays in the queue for another key to judge."
+      }
+    })
+  end
+
+  # #730: the assertion's transaction failed in a step the caller cannot fix (the audit
+  # entry) and rolled back, so no link exists. ONE stable code rather than the failing
+  # step's own term — an audit-log changeset rendered as a 422 would assert the request
+  # body was invalid using fields the caller never sent.
+  def call(conn, {:error, :assertion_not_recorded}) do
+    conn
+    |> put_status(:internal_server_error)
+    |> json(%{
+      error: %{
+        status: 500,
+        code: "assertion_not_recorded",
+        message:
+          "The conflict assertion could not be recorded in the audit trail and was rolled " <>
+            "back; no pair was flagged. Nothing about your request is wrong — retry it."
+      }
+    })
+  end
+
   def call(conn, {:error, :unprocessable_entity, message}) when is_binary(message) do
     conn
     |> put_status(:unprocessable_entity)

@@ -181,6 +181,52 @@ defmodule Loopctl.Workers.ArticleLinkingWorkerTest do
       assert conflict.metadata["auto_generated"] == true
     end
 
+    # #730: an ASSERTED conflict is a caller's CLAIM, not a system finding. The pair's
+    # `potential_conflict` slot is unique, so treating an assertion as "already linked" let
+    # any agent permanently stop this worker from ever flagging two articles of its
+    # choosing — and curated suppression, which requires `auto_generated`, could then never
+    # fire for that pair again.
+    test "an agent-asserted conflict leaves the relates_to edge the promoter needs" do
+      %{tenant: tenant} = setup_tenant()
+      source = create_published_article(tenant.id)
+      dup = create_published_article(tenant.id)
+
+      %ArticleLink{tenant_id: tenant.id}
+      |> ArticleLink.changeset(%{
+        source_article_id: source.id,
+        target_article_id: dup.id,
+        relationship_type: :potential_conflict,
+        metadata: %{
+          "auto_generated" => false,
+          "asserted" => true,
+          "asserted_by_principal" => "some-agent",
+          "evidence" => "these two disagree about the conclusion"
+        }
+      })
+      |> AdminRepo.insert!()
+
+      expect(MockArticleSimilaritySearch, :nearest, fn _t, _emb, _k, _opts ->
+        [candidate(dup, 0.99)]
+      end)
+
+      assert :ok =
+               ArticleLinkingWorker.perform(%Oban.Job{
+                 args: %{"article_id" => source.id, "tenant_id" => tenant.id}
+               })
+
+      # The assertion keeps its slot and this worker adds no second row — the unique index
+      # makes one row per pair the only correct outcome.
+      assert [only] = links_of_type(tenant.id, source.id, dup.id, :potential_conflict)
+      assert only.metadata["asserted"] == true
+
+      # What matters is that the pair is not STRANDED: the `relates_to` edge is still
+      # written, and that edge is `KnowledgeLintWorker.promote_conflicts/1`'s input, so the
+      # nightly run upgrades the asserted row to system provenance. Without this edge the
+      # assertion would pre-empt the system pipeline permanently.
+      assert [relates] = links_of_type(tenant.id, source.id, dup.id, :relates_to)
+      assert relates.metadata["similarity_score"] >= 0.93
+    end
+
     test "a merely-related pair (below the conflict threshold) gets NO conflict flag" do
       %{tenant: tenant} = setup_tenant()
       source = create_published_article(tenant.id)

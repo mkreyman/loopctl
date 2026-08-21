@@ -327,9 +327,20 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         where:
           not exists(
             from(pc in ArticleLink,
+              # An ASSERTED flag (#730) does NOT block promotion. The pair's
+              # `potential_conflict` slot is UNIQUE, so treating an assertion as
+              # "already flagged" let any agent permanently pre-empt the system
+              # pipeline for two articles of its choosing: the system flag could never
+              # be stamped, and curated suppression — which requires `auto_generated`
+              # — could therefore never fire for that pair again. An assertion is a
+              # CLAIM awaiting review; only a system flag is a system finding, and
+              # only a system finding may stand in for one. A legacy markerless row
+              # still blocks, exactly as before: this carve-out is scoped to the one
+              # provenance a caller can create.
               where:
                 pc.tenant_id == parent_as(:rel).tenant_id and
                   pc.relationship_type == :potential_conflict and
+                  fragment("COALESCE(?->>'asserted', 'false') <> 'true'", pc.metadata) and
                   ((pc.source_article_id == parent_as(:rel).source_article_id and
                       pc.target_article_id == parent_as(:rel).target_article_id) or
                      (pc.source_article_id == parent_as(:rel).target_article_id and
@@ -363,14 +374,73 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         }
       }
 
-      changeset = ArticleLink.changeset(%ArticleLink{tenant_id: tenant_id}, attrs)
-
-      case AdminRepo.insert(changeset) do
-        {:ok, _} -> count + 1
-        # Lost a race / already exists — skip, stay idempotent.
-        {:error, _} -> count
-      end
+      if flag_conflict(tenant_id, c, attrs), do: count + 1, else: count
     end)
+  end
+
+  # One candidate's write. Extracted so `promote_conflicts/1` stays inside Credo's
+  # complexity and nesting bars, and because the UPGRADE-before-INSERT ordering is the part
+  # worth reading on its own.
+  #
+  # The pair may already carry an ASSERTED row, which the candidate query above now
+  # deliberately ignores (#730) — inserting over it would violate
+  # `article_links_tenant_src_tgt_rel_index` and be swallowed as "already exists", leaving
+  # the pair unpromoted forever. An explicit update is also direction-safe: an assertion
+  # stores its pair canonically (src <= tgt) while this candidate carries the `relates_to`
+  # edge's own order, so an upsert keyed on the unique target could miss and create a
+  # SECOND row for the same pair.
+  defp flag_conflict(tenant_id, candidate, attrs) do
+    case upgrade_asserted_conflict(tenant_id, candidate) do
+      :upgraded ->
+        true
+
+      :none ->
+        changeset = ArticleLink.changeset(%ArticleLink{tenant_id: tenant_id}, attrs)
+
+        case AdminRepo.insert(changeset) do
+          {:ok, _} -> true
+          # Lost a race / already exists — skip, stay idempotent.
+          {:error, _} -> false
+        end
+    end
+  end
+
+  # The assertion's own fields are PRESERVED, `asserted_by_principal` above all: the system
+  # confirming a pair independently does not make its asserter a disinterested judge of it,
+  # so `Knowledge.validate_not_self_asserted/2` must keep refusing them afterwards.
+  #
+  # Stamp system provenance onto an existing ASSERTED flag for this pair, in either
+  # direction. Returns `:upgraded` when a row was updated, `:none` when there is none to
+  # upgrade (the ordinary path). `jsonb ||` merges, so every assertion field survives and
+  # only the two system keys are written.
+  defp upgrade_asserted_conflict(tenant_id, candidate) do
+    src = candidate.source_article_id
+    tgt = candidate.target_article_id
+    score = candidate.metadata["similarity_score"]
+
+    {updated, _} =
+      from(l in ArticleLink,
+        where: l.tenant_id == ^tenant_id,
+        where: l.relationship_type == :potential_conflict,
+        where: fragment("(?->>'asserted') = 'true'", l.metadata),
+        where: fragment("COALESCE(?->>'auto_generated', 'false') <> 'true'", l.metadata),
+        where:
+          (l.source_article_id == ^src and l.target_article_id == ^tgt) or
+            (l.source_article_id == ^tgt and l.target_article_id == ^src),
+        update: [
+          set: [
+            metadata:
+              fragment(
+                "? || jsonb_build_object('auto_generated', true, 'similarity_score', ?::float, 'promoted_from', 'asserted')",
+                l.metadata,
+                ^score
+              )
+          ]
+        ]
+      )
+      |> AdminRepo.update_all([])
+
+    if updated > 0, do: :upgraded, else: :none
   end
 
   # ---------------------------------------------------------------------------
@@ -423,6 +493,15 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         where: l.tenant_id == ^tenant_id,
         where: l.relationship_type == :potential_conflict,
         where: fragment("(?->>'auto_generated') = 'true'", l.metadata),
+        # NEVER an ASSERTED pair (#730), including one this worker's own promoter has just
+        # upgraded to `auto_generated`. This judge exists because cosine similarity
+        # measures REDUNDANCY and cannot see contradiction, so `:redundant` is the only
+        # honest verdict it can record. An assertion is the opposite case: a caller read
+        # both articles and argued, in writing, that they CONTRADICT. Auto-dismissing that
+        # as redundancy would destroy the evidence on the same night it was raised — and a
+        # dismiss is terminal on record, so nothing would bring the pair back. A human or
+        # an orchestrator judges an assertion; this drain judges what a threshold found.
+        where: fragment("COALESCE(?->>'asserted', 'false') <> 'true'", l.metadata),
         where: not exists(judged_pair_subquery()),
         # Highest similarity first: the most certainly-redundant pairs are judged before a
         # bounded run runs out of budget. The promoter's own candidate query has no
@@ -470,6 +549,13 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # exists for the pair in EITHER direction. Mirrors `Knowledge.conflict_unresolved_subquery/0`
   # — the pair is stored canonically (source <= target) but links are not, so both
   # orientations must be checked or a judged pair is judged again every night.
+  # "Has this FLAG already been judged?" — which is not "has this PAIR ever been judged".
+  # The postdate predicate mirrors `Knowledge.conflict_unresolved_subquery/0` exactly: a
+  # verdict settles only a flag that already existed when it was recorded. Without it, a
+  # pair judged once and later RE-flagged is skipped by this drain forever while the queue
+  # (which does postdate) still shows it as unjudged — the two surfaces disagreeing about
+  # the same pair, with the drain's answer being the one that strands it. COALESCEd to
+  # `inserted_at` so a verdict written before `annotated_at` existed still settles.
   defp judged_pair_subquery do
     from(r in "conflict_resolutions",
       where: r.tenant_id == parent_as(:link).tenant_id,
@@ -478,6 +564,13 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
            r.target_article_id == parent_as(:link).target_article_id) or
           (r.source_article_id == parent_as(:link).target_article_id and
              r.target_article_id == parent_as(:link).source_article_id),
+      where:
+        fragment(
+          "COALESCE(?, ?) >= ?",
+          r.annotated_at,
+          r.inserted_at,
+          parent_as(:link).inserted_at
+        ),
       select: 1
     )
   end

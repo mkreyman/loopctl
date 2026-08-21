@@ -8,6 +8,7 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   - `POST /api/v1/knowledge/bulk-publish` -- bulk publish drafts (user+)
   - `POST /api/v1/knowledge/bulk-delete` -- bulk archive/soft-delete (user+)
   - `GET /api/v1/knowledge/drafts` -- list draft articles (orchestrator+)
+  - `POST /api/v1/knowledge/conflicts` -- assert a conflict the system never flagged (agent+)
 
   Role note (#331): single-article `archive` and `resolve_conflict` (all
   dispositions, incl. supersede/merge) are agent+ KB-content curation —
@@ -30,6 +31,7 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   use OpenApiSpex.ControllerSpecs
 
   alias Loopctl.ApiSpec.Schemas
+  alias Loopctl.Dispatches
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.BulkOps
   alias LoopctlWeb.ArticleJSON
@@ -52,7 +54,7 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   # archive is visibility-scoped in-action.
   plug LoopctlWeb.Plugs.RequireRole,
        [role: :agent]
-       when action in [:archive, :conflicts, :resolve_conflict]
+       when action in [:archive, :conflicts, :resolve_conflict, :assert_conflict]
 
   tags(["Knowledge Wiki"])
 
@@ -275,7 +277,16 @@ defmodule LoopctlWeb.ArticleWorkflowController do
           "Max results per page (default 50, max 1000). A limit above the max is " <>
             "clamped to the maximum — never rejected — so pagination stays complete."
       ],
-      offset: [in: :query, type: :integer, description: "Records to skip"]
+      offset: [in: :query, type: :integer, description: "Records to skip"],
+      origin: [
+        in: :query,
+        type: :string,
+        description:
+          "Filter by provenance: `system` (flagged by the auto-linker / lint sweep) or " <>
+            "`asserted` (a caller contested the pair, #730). Asserted rows lead the " <>
+            "default ordering, so pass `system` to review machine-flagged pairs alone. " <>
+            "Any other value is no filter."
+      ]
     ],
     responses: %{
       200 =>
@@ -287,6 +298,81 @@ defmodule LoopctlWeb.ArticleWorkflowController do
              meta: %OpenApiSpex.Schema{type: :object}
            }
          }},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  operation(:assert_conflict,
+    summary: "Assert a conflict pair the system never flagged",
+    description:
+      "Opens a `:potential_conflict` pair for two articles the auto-linker did NOT flag, " <>
+        "so a DELIBERATE correction is reachable: a session that just wrote an article " <>
+        "refuting another has a pair minutes old (the nightly linker has not run) which may " <>
+        "never be lexically similar enough to be flagged at all. The pair then appears in " <>
+        "GET /api/v1/knowledge/conflicts with `origin: \"asserted\"` and the claim " <>
+        "attached, and in both articles' `potential_conflicts`. Role: agent+. " <>
+        "`evidence` is REQUIRED — an assertion with no argument is noise on the one queue " <>
+        "a reviewer reads. " <>
+        "**This opens the pair; it does not decide it.** An assertion does NOT suppress " <>
+        "either article from curated answers (that still requires a system flag), and the " <>
+        "asserting principal may NOT record the pair's verdict — " <>
+        "POST /knowledge/conflicts/resolve returns 409 `self_asserted_conflict` to it. The " <>
+        "pair is manufacturable by construction (you named both ids), so judging it is " <>
+        "someone else's call, exactly as the confidence cap already separates recording a " <>
+        "supersede from authorizing one. " <>
+        "Idempotent per pair: an existing flag is returned (`created: false`) rather than " <>
+        "duplicated, and an assertion never overwrites a system flag's provenance.",
+    request_body:
+      {"Assertion", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         required: [:source_article_id, :target_article_id, :evidence],
+         properties: %{
+           source_article_id: %OpenApiSpex.Schema{type: :string, format: :uuid},
+           target_article_id: %OpenApiSpex.Schema{type: :string, format: :uuid},
+           classification: %OpenApiSpex.Schema{
+             type: :string,
+             enum: ["redundant", "complementary", "contradictory"]
+           },
+           evidence: %OpenApiSpex.Schema{
+             type: :string,
+             # No `maxLength`: JSON Schema counts CHARACTERS and the guard counts BYTES, so
+             # the same number means two different limits and a spec-conforming multibyte
+             # body would still be refused. The cap is stated in bytes below, from the one
+             # attribute the guard reads.
+             description:
+               "REQUIRED. Why these two conflict — ideally the ground truth that settles " <>
+                 "it (commit, file:line, URL, observed behaviour). This is what a reviewer " <>
+                 "judges the pair on; it travels with the pair in the conflict queue. " <>
+                 "Capped at #{Knowledge.max_assertion_evidence_bytes()} bytes — it is " <>
+                 "echoed on every row of that queue."
+           },
+           proposed_authoritative_article_id: %OpenApiSpex.Schema{
+             type: :string,
+             format: :uuid,
+             description:
+               "Optional: which of the two you believe should win. Recorded as your CLAIM " <>
+                 "on the queue row — it is not a verdict and applies nothing."
+           }
+         }
+       }},
+    responses: %{
+      201 =>
+        {"Pair asserted (`data.created` is false when an equivalent flag already existed)",
+         "application/json", %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      500 =>
+        {"The assertion could not be recorded in the audit trail and was rolled back",
+         "application/json", Schemas.ErrorResponse},
+      404 =>
+        {"One or both articles not found in this tenant, OR not visible to the caller — " <>
+           "deliberately the same answer, so an agent cannot probe which private article " <>
+           "ids exist", "application/json", Schemas.ErrorResponse},
+      422 =>
+        {"Validation error: missing/blank/over-long `evidence`, a malformed article id, " <>
+           "the same article twice, a `classification` outside the enum, a " <>
+           "`proposed_authoritative_article_id` that is not one of the pair, or more " <>
+           "unjudged assertions already open under this principal than the cap allows",
+         "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -761,6 +847,9 @@ defmodule LoopctlWeb.ArticleWorkflowController do
         []
         |> maybe_add_opt(:limit, effective_limit)
         |> maybe_add_opt(:offset, parse_int(params["offset"]))
+        # #730: a reviewer must be able to ask for ONE provenance. Asserted rows lead the
+        # ordering, so without this an agent-role caller decides what page 1 holds.
+        |> maybe_add_opt(:origin, params["origin"])
         # Visibility scope (#331): an agent must not even see a conflict pair whose
         # member is another agent's private/owner memory — parity with resolve.
         |> Keyword.merge(Visibility.scope_opts(conn))
@@ -770,6 +859,148 @@ defmodule LoopctlWeb.ArticleWorkflowController do
       json(conn, result)
     end
   end
+
+  @doc "POST /api/v1/knowledge/conflicts"
+  def assert_conflict(conn, params) do
+    api_key = conn.assigns.current_api_key
+
+    attrs = %{
+      "source_article_id" => params["source_article_id"],
+      "target_article_id" => params["target_article_id"],
+      "classification" => params["classification"],
+      "evidence" => params["evidence"],
+      "proposed_authoritative_article_id" => params["proposed_authoritative_article_id"]
+    }
+
+    opts =
+      AuditContext.from_conn(conn) ++
+        Visibility.scope_opts(conn) ++
+        [actor_principal: actor_principal(api_key), actor_lineage: actor_lineage(api_key)]
+
+    case Knowledge.assert_conflict(api_key.tenant_id, attrs, opts) do
+      {:ok, link, outcome} ->
+        conn
+        |> put_status(:created)
+        |> json(%{
+          data: %{
+            link_id: link.id,
+            source_article_id: link.source_article_id,
+            target_article_id: link.target_article_id,
+            origin: if(link.metadata["asserted"] == true, do: "asserted", else: "system"),
+            created: outcome == :created
+          },
+          note: assertion_note(link, outcome)
+        })
+
+      {:error, reason} ->
+        assert_conflict_error(reason)
+    end
+  end
+
+  # One clause per refusal `Knowledge.assert_conflict/3` can return, kept out of the action
+  # so the request shaping stays readable.
+  defp assert_conflict_error(:evidence_required),
+    do:
+      {:error, :unprocessable_entity,
+       "evidence is required: an asserted conflict carries no similarity score, so the " <>
+         "argument IS the evidence a reviewer judges the pair on."}
+
+  defp assert_conflict_error(:evidence_too_long),
+    do:
+      {:error, :unprocessable_entity,
+       "evidence exceeds the #{Knowledge.max_assertion_evidence_bytes()}-byte limit; it is " <>
+         "echoed on every row of the conflict queue, so keep it to the argument."}
+
+  defp assert_conflict_error(:same_article),
+    do:
+      {:error, :unprocessable_entity,
+       "source_article_id and target_article_id must name two different articles."}
+
+  defp assert_conflict_error(:missing_article_id),
+    do:
+      {:error, :unprocessable_entity,
+       "source_article_id and target_article_id are both required, and each must be a UUID."}
+
+  defp assert_conflict_error(:invalid_classification),
+    do:
+      {:error, :unprocessable_entity,
+       "classification must be one of: redundant, complementary, contradictory."}
+
+  defp assert_conflict_error(:invalid_proposed_article),
+    do:
+      {:error, :unprocessable_entity,
+       "proposed_authoritative_article_id must name one of the two articles in the pair."}
+
+  defp assert_conflict_error(:too_many_open_assertions),
+    do:
+      {:error, :unprocessable_entity,
+       "You already hold the maximum number of UNJUDGED assertions. Nothing drains them " <>
+         "automatically and they lead the conflict queue, so get the open ones judged " <>
+         "(GET /api/v1/knowledge/conflicts?origin=asserted) before asserting more."}
+
+  # An article the caller cannot SEE is answered as not-found, deliberately identical to an
+  # article that does not exist: the context checks visibility BEFORE existence, so an agent
+  # cannot probe which private article ids are real by comparing the two answers. A caller
+  # that sees everything (no visibility scope) still gets the changeset naming the field.
+  defp assert_conflict_error(:article_not_visible), do: {:error, :not_found}
+
+  # Server-derived; a caller cannot cause this by any request it can make. It means the
+  # authenticated key resolved to no principal at all, and an assertion nobody can be held
+  # apart from is worse than no assertion.
+  defp assert_conflict_error(:unattributed_assertion),
+    do:
+      {:error, :unprocessable_entity,
+       "This key resolves to no principal, so an assertion recorded under it could not be " <>
+         "held apart from the verdict that judges it. Use a key with an agent identity."}
+
+  # The audit step of the write rolled the whole transaction back, so nothing was recorded.
+  # A 500 through the FallbackController rather than a CaseClauseError out of the action.
+  defp assert_conflict_error(:assertion_not_recorded), do: {:error, :assertion_not_recorded}
+
+  defp assert_conflict_error(%Ecto.Changeset{} = changeset), do: {:error, changeset}
+
+  defp assertion_note(_link, :existing),
+    do:
+      "This pair was already flagged — nothing was created and the existing flag's " <>
+        "provenance is unchanged. It is in GET /api/v1/knowledge/conflicts."
+
+  defp assertion_note(_link, :created),
+    do:
+      "Asserted. The pair is now in GET /api/v1/knowledge/conflicts (origin \"asserted\") " <>
+        "and in both articles' potential_conflicts. Neither article is suppressed from " <>
+        "curated answers — an assertion is a claim, not a system finding — and YOU cannot " <>
+        "record its verdict (409 self_asserted_conflict); another key judges it."
+
+  # The principal an assertion is attributed to, and the one a later verdict is held apart
+  # from. `agent_id` first because that is the identity the KB already treats as an actor
+  # (visibility scoping, and the heat index's `coalesce(agent_id, api_key_id)` reader); the
+  # key id is the fallback for roles that carry no agent. Under v2 per-dispatch ephemeral
+  # keys the key id alone would count DISPATCHES rather than actors, which is why the agent
+  # id has to win when both exist.
+  defp actor_principal(api_key) do
+    case api_key.agent_id do
+      nil -> unlineaged_principal(api_key)
+      agent_id -> to_string(agent_id)
+    end
+  end
+
+  # A key with NO agent (orchestrator/user, including every user-role dispatch key) has no
+  # actor id of its own, so the key id is the identity. It is deliberately NOT collapsed to
+  # the lineage ROOT: v2 mints a key per dispatch, and in the documented single-root tenant
+  # every dispatch shares one root, so a root principal makes each of them the same party
+  # and NO dispatch-minted key can ever judge a pair another one asserted. CLAUDE.md records
+  # that exact trade on the custody side — "a SIBLING is separation — demanding a separate
+  # ROOT of the caller made verify unreachable in the documented single-root tenant".
+  # Ancestor/descendant reuse (assert through D1, judge through its child) is held by
+  # `:actor_lineage` below instead, which refuses a shared CHAIN and permits siblings.
+  defp unlineaged_principal(api_key), do: to_string(api_key.id)
+
+  # The key's dispatch lineage (root → leaf), or `[]` for a key no dispatch minted — the
+  # tenant's own operator key, the documented human judge.
+  # `minting_lineage_for_api_key/2` rather than `lineage_for_api_key/2`: a revoked dispatch
+  # must not read as a fresh party.
+  defp actor_lineage(api_key),
+    do: Dispatches.minting_lineage_for_api_key(api_key.tenant_id, api_key.id)
 
   @doc "POST /api/v1/knowledge/conflicts/resolve"
   def resolve_conflict(conn, params) do
@@ -797,7 +1028,16 @@ defmodule LoopctlWeb.ArticleWorkflowController do
     opts =
       AuditContext.from_conn(conn) ++
         Visibility.scope_opts(conn) ++
-        [actor_role: conn.assigns.current_api_key.role]
+        [
+          actor_role: conn.assigns.current_api_key.role,
+          # #730: identifies the RECORDER, so a verdict on an ASSERTED pair can be refused
+          # when it comes from the principal that asserted it. Inert on a system-flagged
+          # pair, which carries no asserter.
+          actor_principal: actor_principal(conn.assigns.current_api_key),
+          # The same identity one layer out: an ancestor or descendant dispatch of the
+          # asserting one is the same operator, so it is refused as well.
+          actor_lineage: actor_lineage(conn.assigns.current_api_key)
+        ]
 
     attrs = %{
       "source_article_id" => params["source_article_id"],
@@ -834,6 +1074,10 @@ defmodule LoopctlWeb.ArticleWorkflowController do
         {:error, :unprocessable_entity,
          "No potential-conflict link exists for this article pair. Only pairs the system " <>
            "flagged as potential conflicts (see GET /api/v1/knowledge/conflicts) can be resolved."}
+
+      # #730 — rendered by the FallbackController as 409 self_asserted_conflict.
+      {:error, :self_asserted_conflict} = error ->
+        error
 
       {:error, %Ecto.Changeset{} = changeset} ->
         {:error, changeset}

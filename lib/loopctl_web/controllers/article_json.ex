@@ -307,8 +307,15 @@ defmodule LoopctlWeb.ArticleJSON do
     kept =
       all
       |> Enum.sort_by(fn {link, _peer, peer_id} ->
-        {-(link_similarity(link) || 0.0), DateTime.to_unix(link.inserted_at, :microsecond),
-         peer_id}
+        # ASSERTED conflicts (#730) lead, matching `Knowledge.list_potential_conflicts/2`'s
+        # ordering. They carry no similarity score — nothing measured them — so ranking on
+        # `similarity || 0.0` alone sorted every assertion BEHIND every system flag and
+        # then truncated it out at `@max_conflicts`. That silently deleted the one thing an
+        # assertion exists to do: signal "this article is contested" to a reader who never
+        # opens the conflict queue. A caller deliberately contesting a pair is a stronger
+        # signal than the mechanical 0.93 threshold that produced most of this list.
+        {if(asserted_conflict?(link), do: 0, else: 1), -(link_similarity(link) || 0.0),
+         DateTime.to_unix(link.inserted_at, :microsecond), peer_id}
       end)
       |> Enum.take(@max_conflicts)
       |> Enum.map(fn {link, peer, peer_id} -> conflict_peer(link, peer, peer_id) end)
@@ -345,13 +352,39 @@ defmodule LoopctlWeb.ArticleJSON do
   # link omits `similarity` in both places, so a caller branching on key presence cannot
   # get two answers about the same link inside one response.
   defp conflict_peer(link, peer_article, peer_id) do
-    base = %{article_id: peer_id, title: loaded_title(peer_article)}
+    base =
+      %{article_id: peer_id, title: loaded_title(peer_article)}
+      |> Map.put(:origin, if(asserted_conflict?(link), do: "asserted", else: "system"))
+      |> put_assertion_claim(link)
 
     case link_similarity(link) do
       nil -> base
       score -> Map.put(base, :similarity, score)
     end
   end
+
+  # An assertion's argument travels WITH it. Without this a reader sees an unexplained,
+  # unscored conflict and has no way to tell it from a stray link — the prose "SUPERSEDED"
+  # banner problem #730 exists to replace, reintroduced one layer out. `evidence` is
+  # required at write time, so it is present on every asserted link.
+  defp put_assertion_claim(base, link) do
+    if asserted_conflict?(link) do
+      metadata = link.metadata || %{}
+
+      Map.put(base, :assertion, %{
+        classification: metadata["classification"],
+        evidence: metadata["evidence"],
+        asserted_at: metadata["asserted_at"]
+      })
+    else
+      base
+    end
+  end
+
+  defp asserted_conflict?(%{metadata: metadata}) when is_map(metadata),
+    do: metadata["asserted"] == true
+
+  defp asserted_conflict?(_link), do: false
 
   # `far_id`/`far_article` are the OTHER end of the link — the target for an outgoing
   # link, the source for an incoming one. `similarity` is the auto-linker's recorded

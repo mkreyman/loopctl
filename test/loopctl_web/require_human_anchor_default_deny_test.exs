@@ -118,6 +118,18 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
                {:post, "/api/v1/knowledge/bulk-unpublish"},
                {:post, "/api/v1/knowledge/bulk-delete"},
                {:post, "/api/v1/knowledge/conflicts/resolve"},
+               # Asserting a conflict pair (#730) — the same KB-tier curation
+               # surface as `conflicts/resolve` above, and STRICTLY weaker than
+               # it: an assertion carries no disposition, retires nothing,
+               # never reaches curated suppression (`auto_generated` stays
+               # false), and cannot be judged by the principal that made it. It
+               # is agent-role KB curation on the tenant's own corpus, which is
+               # what an agent-rooted tenant exists to do; there is no
+               # chain-of-custody state behind it for the human anchor to
+               # protect. If a future change ever let an assertion suppress or
+               # retire an article, this exemption stops being sound and the
+               # route must move behind the tier gate.
+               {:post, "/api/v1/knowledge/conflicts"},
                {:post, "/api/v1/knowledge/novelty"},
                # Hybrid retrieval (US-31.4) — a POST-shaped READ over the wiki
                # (curated-first, retrieval-fallback resolution with provenance),

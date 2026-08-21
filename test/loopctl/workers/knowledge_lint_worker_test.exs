@@ -525,6 +525,50 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       assert second.new_state["conflicts_judged_redundant"] == 0
     end
 
+    # #730 review: the queue settles a flag only with a verdict that POSTDATES it, but this
+    # worker's own `judged_pair_subquery/0` is a SECOND copy of that question and had no
+    # such predicate. So a pair judged once and later RE-flagged read as unjudged on the
+    # queue and as judged by the drain — and the drain's answer is the one that strands it,
+    # since nothing else drains the queue.
+    test "a RE-flagged pair is judged again, not skipped forever on an older verdict" do
+      tenant = fixture(:tenant)
+      a = published_article_with_embedding(tenant.id, similar_embedding())
+      b = published_article_with_embedding(tenant.id, near_similar_embedding())
+      relates_link(tenant.id, a.id, b.id, 0.94)
+
+      assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
+      assert [first] = resolutions(tenant.id, a.id, b.id)
+
+      # Retract the flag and raise a NEW one — a fresh link, created after that verdict.
+      # (An operator deleting a mistaken flag, or a re-promotion after a corpus edit.)
+      assert [flag] = conflict_links(tenant.id, a.id, b.id)
+      AdminRepo.delete!(flag)
+      # The relates_to edge survives, so the promoter raises a fresh flag on the next run.
+
+      # Backdate the verdict a day. `article_links.inserted_at` is SECOND precision while
+      # `conflict_resolutions.annotated_at` is microsecond, so a verdict and a flag created
+      # in the same second compare as verdict-after-flag whichever order they really
+      # happened in. Re-flagging is a different-night event in the real flow, so the day
+      # gap is the realistic case — shrinking it would be testing the timestamp precision,
+      # not the predicate.
+      AdminRepo.update_all(
+        from(r in Loopctl.Knowledge.ConflictResolution, where: r.id == ^first.id),
+        set: [annotated_at: DateTime.add(first.annotated_at, -1, :day)]
+      )
+
+      assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
+
+      # The observable is the DRAIN'S OWN COUNTER, not the verdict row: `record_verdict/4`
+      # inserts `on_conflict: :nothing`, so a re-judged pair keeps its existing row and
+      # nothing about that row moves. What the fix changes is whether the pair is SELECTED
+      # as unjudged at all — the sibling idempotency test above asserts this counter is 0
+      # when a pair genuinely has not been re-flagged, so the two pin both directions.
+      assert [_first_run, second_run] = lint_audit_entries(tenant.id)
+
+      assert second_run.new_state["conflicts_judged_redundant"] == 1,
+             "the drain skipped a flag raised AFTER the verdict it was matched against"
+    end
+
     test "promotes a high-similarity relates_to link to a :potential_conflict flag" do
       tenant = fixture(:tenant)
       a = published_article_with_embedding(tenant.id, similar_embedding())
