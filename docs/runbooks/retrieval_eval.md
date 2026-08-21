@@ -371,7 +371,8 @@ re-baselining on pg16.
 
 ### #471 re-baseline: the priors are a like-for-like improvement (no accepted regression)
 
-The #471 ranking priors (recency + source/category authority) ship **default-on in every
+The #471 ranking priors (recency + category authority — the source_type/provenance half was
+removed on 2026-08-21 by owner decision) ship **default-on in every
 env** (`config/config.exs`: `knowledge_recency_weight` 0.3, `knowledge_authority_prior_enabled`
 true, `knowledge_authority_strength` 0.05 — no `test.exs` override). golden_v2 also adds one
 new question (`q-recency-fusion`) that exercises the recency prior directly.
