@@ -57,6 +57,8 @@ defmodule Loopctl.Knowledge.StructuralLinks do
     `tenant_id` is the only isolation and it is set programmatically, never cast.
   """
 
+  @behaviour Loopctl.Knowledge.StructuralLinksBehaviour
+
   import Ecto.Query
 
   alias Ecto.Adapters.SQL
@@ -95,7 +97,12 @@ defmodule Loopctl.Knowledge.StructuralLinks do
   index on `(tenant_id, source_article_id, target_article_id, relationship_type)`.
 
   Returns `{:ok, report}` or `{:error, :heavy_read_overloaded}`.
+
+  The report ASSERTS ITS OWN ARITHMETIC: `reconciled` is true only when every qualifying
+  source is accounted for once and each one landed on its own hub (`distinct_hubs`). See
+  `reconcile/1` for why that second sum is the one worth computing.
   """
+  @impl Loopctl.Knowledge.StructuralLinksBehaviour
   @spec harvest(binary(), keyword()) ::
           {:ok, map()} | {:error, :heavy_read_overloaded}
   def harvest(tenant_id, opts \\ []) when is_binary(tenant_id) do
@@ -112,10 +119,12 @@ defmodule Loopctl.Knowledge.StructuralLinks do
           |> Enum.split_with(fn {_source, ids} -> length(ids) >= floor end)
 
         report =
-          Enum.reduce(qualifying, blank_report(skipped, without_source, floor), fn {source, ids},
-                                                                                   acc ->
-            harvest_one_source(tenant_id, source, ids, acc)
-          end)
+          qualifying
+          |> Enum.reduce(
+            blank_report(skipped, without_source, floor, length(qualifying)),
+            fn {source, ids}, acc -> harvest_one_source(tenant_id, source, ids, acc) end
+          )
+          |> reconcile()
 
         log_report(tenant_id, report)
         {:ok, report}
@@ -233,20 +242,22 @@ defmodule Loopctl.Knowledge.StructuralLinks do
 
   defp harvest_one_source(tenant_id, source, member_ids, acc) do
     case resolve_or_create_hub(tenant_id, source, length(member_ids)) do
-      {:ok, hub, :created} ->
-        write_edges(tenant_id, hub, member_ids, %{acc | hubs_created: acc.hubs_created + 1})
-
-      {:ok, hub, :resolved} ->
-        write_edges(tenant_id, hub, member_ids, %{acc | hubs_resolved: acc.hubs_resolved + 1})
-
-      {:ok, hub, :adopted} ->
-        write_edges(tenant_id, hub, member_ids, %{acc | hubs_adopted: acc.hubs_adopted + 1})
+      {:ok, hub, outcome} when outcome in [:created, :resolved, :adopted] ->
+        # Record WHICH hub this source landed on, not just that it landed on one. The
+        # count of distinct hubs is half of the reconciliation below, and it is the half
+        # that catches a merge — see reconcile/1.
+        acc = %{acc | hub_ids: MapSet.put(acc.hub_ids, hub.id)}
+        write_edges(tenant_id, hub, member_ids, count_outcome(acc, outcome))
 
       {:error, reason} ->
         Logger.warning("structural_links: hub failed for #{source}: #{inspect(reason)}")
         %{acc | hub_failures: acc.hub_failures + 1}
     end
   end
+
+  defp count_outcome(acc, :created), do: %{acc | hubs_created: acc.hubs_created + 1}
+  defp count_outcome(acc, :resolved), do: %{acc | hubs_resolved: acc.hubs_resolved + 1}
+  defp count_outcome(acc, :adopted), do: %{acc | hubs_adopted: acc.hubs_adopted + 1}
 
   # Three steps, in this order, and the middle one is the point.
   #
@@ -572,7 +583,7 @@ defmodule Loopctl.Knowledge.StructuralLinks do
     Application.get_env(:loopctl, :structural_hub_min_siblings, @default_min_siblings)
   end
 
-  defp blank_report(skipped, without_source, floor) do
+  defp blank_report(skipped, without_source, floor, qualifying) do
     %{
       hubs_created: 0,
       hubs_resolved: 0,
@@ -581,8 +592,49 @@ defmodule Loopctl.Knowledge.StructuralLinks do
       edges_created: 0,
       sources_below_floor: length(skipped),
       articles_without_source: without_source,
-      min_siblings: floor
+      min_siblings: floor,
+      sources_qualifying: qualifying,
+      # Bounded by the qualifying source count (313 at floor 25 on the live corpus,
+      # 3,713 at floor 3) — a set of UUIDs at that scale is nothing, and unlike the
+      # scan it never holds an article row.
+      hub_ids: MapSet.new()
     }
+  end
+
+  # The run asserts its own arithmetic (#725). Two independent sums must agree, and the
+  # reason this exists is that on the first production backfill they did not:
+  #
+  #   * every qualifying source is accounted for exactly once — created + resolved +
+  #     adopted + failed == qualifying;
+  #   * every accounted source landed on its OWN hub — distinct hub targets == created +
+  #     resolved + adopted.
+  #
+  # The second is the one that matters. `duplicate_title` was once mapped to "resolved",
+  # so 85 distinct sources with 6,471 members between them all became "Source: synology
+  # netbackup" — at which point a `derived_from` edge means "derived from something that
+  # shared a name", which is precisely the precision the feature exists to add. The first
+  # sum looked perfectly healthy throughout; the merge was found ONLY by deriving the two
+  # counts separately and noticing they disagreed (312 sources qualified, 146 hubs
+  # existed). Neither number looks wrong alone, which is why this must be computed rather
+  # than eyeballed.
+  #
+  # A mismatch is REPORTED, never raised: by the time it is computable the edges are
+  # already written, and a crash here would only lose the finding. `reconciled: false`
+  # rides in the report, the log line and the worker's audit entry.
+  #
+  # It can also be false without a defect — an article carrying TWO source tags and the
+  # `hub` tag is adoptable by both of its sources (1,195 dual-tagged articles measured on
+  # the live corpus), which genuinely puts two sources on one hub. That is worth surfacing
+  # on exactly the same signal rather than special-casing away.
+  defp reconcile(report) do
+    linked = report.hubs_created + report.hubs_resolved + report.hubs_adopted
+    accounted = linked + report.hub_failures
+    distinct = MapSet.size(report.hub_ids)
+
+    report
+    |> Map.delete(:hub_ids)
+    |> Map.put(:distinct_hubs, distinct)
+    |> Map.put(:reconciled, accounted == report.sources_qualifying and distinct == linked)
   end
 
   # A run that creates nothing says so, rather than exiting silently (AC-42.1.9): "no new
@@ -594,7 +646,22 @@ defmodule Loopctl.Knowledge.StructuralLinks do
         "hubs_resolved=#{report.hubs_resolved} edges_created=#{report.edges_created} " <>
         "sources_below_floor=#{report.sources_below_floor} " <>
         "articles_without_source=#{report.articles_without_source} " <>
-        "hub_failures=#{report.hub_failures}"
+        "hub_failures=#{report.hub_failures} " <>
+        "sources_qualifying=#{report.sources_qualifying} " <>
+        "distinct_hubs=#{report.distinct_hubs} reconciled=#{report.reconciled}"
     )
+
+    unless report.reconciled do
+      Logger.error(
+        "structural_links RECONCILIATION FAILED: tenant=#{tenant_id} " <>
+          "qualifying=#{report.sources_qualifying} " <>
+          "accounted=#{report.hubs_created + report.hubs_resolved + report.hubs_adopted + report.hub_failures} " <>
+          "distinct_hubs=#{report.distinct_hubs} " <>
+          "linked=#{report.hubs_created + report.hubs_resolved + report.hubs_adopted}. " <>
+          "Fewer distinct hubs than linked sources means two sources share one hub, so " <>
+          "their derived_from edges no longer mean 'derived from this source' — inspect " <>
+          "before trusting this run's edges."
+      )
+    end
   end
 end

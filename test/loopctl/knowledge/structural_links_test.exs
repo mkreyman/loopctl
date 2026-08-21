@@ -409,6 +409,43 @@ defmodule Loopctl.Knowledge.StructuralLinksTest do
     end
   end
 
+  describe "the report reconciles its own arithmetic (#725)" do
+    test "a clean run accounts for every source and gives each one its own hub" do
+      tenant = fixture(:tenant)
+      for _ <- 1..3, do: article(tenant, ["book-recon-a"])
+      for _ <- 1..3, do: article(tenant, ["book-recon-b"])
+
+      assert {:ok, report} = StructuralLinks.harvest(tenant.id, min_siblings: 3)
+
+      assert report.sources_qualifying == 2
+      assert report.distinct_hubs == 2
+      assert report.hubs_created == 2
+      assert report.reconciled
+    end
+
+    test "two sources landing on ONE hub is reported as unreconciled" do
+      tenant = fixture(:tenant)
+
+      # The live shape this catches: 1,195 articles carry two source tags, so a
+      # `hub`-tagged one is adoptable by BOTH of its sources. Two sources then share a
+      # star centre and a `derived_from` edge stops meaning "derived from this source" —
+      # the same corruption class as the #724 title merge, which was found only by
+      # deriving these two counts separately.
+      _dual = article(tenant, ["book-dual-a", "book-dual-b", "hub"], %{title: "Two Sources"})
+      for _ <- 1..3, do: article(tenant, ["book-dual-a"])
+      for _ <- 1..3, do: article(tenant, ["book-dual-b"])
+
+      assert {:ok, report} = StructuralLinks.harvest(tenant.id, min_siblings: 3)
+
+      assert report.hubs_adopted == 2
+      assert report.distinct_hubs == 1
+
+      refute report.reconciled,
+             "two sources on one hub must be REPORTED — the counts each look healthy " <>
+               "alone, which is exactly why the run has to compare them itself"
+    end
+  end
+
   describe "adopting the hub the extraction pipeline already made" do
     test "an existing hub-tagged sibling becomes the star centre, and nothing is minted" do
       tenant = fixture(:tenant)

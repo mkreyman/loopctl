@@ -404,6 +404,12 @@ config :loopctl, :scale_alerts_config_checker, Loopctl.MockScaleAlertsConfigChec
 # ScaleMetrics.count_oban_executing_orphans/0.
 config :loopctl, :oban_orphan_count_checker, Loopctl.MockObanOrphanCountChecker
 
+# #725: DI seam for Loopctl.Workers.StructuralLinksWorker's harvester. The default stub in
+# DataCase delegates to the real Loopctl.Knowledge.StructuralLinks, so worker tests run the
+# genuine harvest; only the shed test overrides it to return
+# {:error, :heavy_read_overloaded} — the one shape a sandboxed pool cannot produce.
+config :loopctl, :structural_links_harvester, Loopctl.MockStructuralLinksHarvester
+
 # US-36.3: batch-ingest backlog admission gate's count DI seam. Default stub in
 # DataCase.stub_all_defaults/0 delegates to the real FairShare.in_flight_ingestion_backlog/1;
 # the fail-open test overrides it to raise.
