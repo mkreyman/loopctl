@@ -49,6 +49,12 @@ defmodule Loopctl.Workers.KnowledgeMocWorker do
   alias Loopctl.Oban.FairShare
   alias Loopctl.Tenants.Tenant
 
+  # These writes are made by a scheduled worker holding no key. Attribute BOTH of them —
+  # `Knowledge` defaults `actor_type` to "api_key" with a nil id, so an unattended write
+  # that omits this records itself in the immutable audit log against an API key that does
+  # not exist. One attribute, so the create and the update cannot drift apart again.
+  @actor [actor_type: "system", actor_label: "worker:knowledge_moc"]
+
   @default_min_tag_count 25
   @default_max_tags 50
   @max_members 300
@@ -185,13 +191,7 @@ defmodule Loopctl.Workers.KnowledgeMocWorker do
     # already-published article is a no-op the changeset rejects.
     with {:ok, id} <- ensure_hub(tenant_id, attrs),
          {:ok, _} <-
-           Knowledge.update_article(
-             tenant_id,
-             id,
-             %{body: body, tags: moc_tags},
-             actor_type: "system",
-             actor_label: "worker:knowledge_moc"
-           ) do
+           Knowledge.update_article(tenant_id, id, %{body: body, tags: moc_tags}, @actor) do
       :ok
     else
       other ->
@@ -204,7 +204,7 @@ defmodule Loopctl.Workers.KnowledgeMocWorker do
   # `{:ok, :deduplicated, article}` (or another reason tuple) when the
   # idempotency_key already exists — normalize both to the hub id.
   defp ensure_hub(tenant_id, attrs) do
-    case Knowledge.create_article(tenant_id, attrs) do
+    case Knowledge.create_article(tenant_id, attrs, @actor) do
       {:ok, %{id: id}} -> {:ok, id}
       {:ok, _reason, %{id: id}} -> {:ok, id}
       other -> other
