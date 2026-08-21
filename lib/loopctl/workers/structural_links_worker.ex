@@ -22,7 +22,8 @@ defmodule Loopctl.Workers.StructuralLinksWorker do
     would crash under exactly the load the shedder exists to relieve. A partial harvest is
     also not a usable answer: a source whose members straddle the shed boundary would be
     counted short and could fall under the floor, producing no hub for a source that
-    qualifies. So the whole tenant retries later. (Same reading as
+    qualifies. So the whole tenant retries later — but a BOUNDED number of times, because
+    a snooze can never exhaust into `discarded` on its own. (Same reading as
     `DraftDuplicateSweepWorker`.)
   * **The unattended floor is higher than the library default.** See below.
 
@@ -98,38 +99,69 @@ defmodule Loopctl.Workers.StructuralLinksWorker do
   # the burst that shed it, short enough that a weekly pass still completes today.
   @shed_snooze_seconds 300
 
+  # ...but BOUNDED. A snooze raises `max_attempts` in lockstep, so it can never exhaust
+  # into `discarded` — the trap `.claude/skills/oban-health/SKILL.md` names outright: a
+  # job gated on a permanently-wrong condition re-scans forever while nothing fails and
+  # nothing alerts, and next Sunday's cron adds another (the 300s unique window does not
+  # reach a week back). Twelve sheds is an hour of trying; past that the job is CANCELLED,
+  # which is visible in Oban, and the weekly cron re-enqueues it.
+  @max_shed_attempts 12
+
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"mode" => "all_tenants"}}) do
-    harvestable_tenants()
-    |> Enum.each(fn tenant_id ->
-      %{"tenant_id" => tenant_id} |> __MODULE__.new() |> Oban.insert()
-    end)
+    Enum.each(harvestable_tenants(), &enqueue_tenant/1)
 
     :ok
   end
 
-  def perform(%Oban.Job{id: id, args: %{"tenant_id" => tenant_id}}) do
+  def perform(%Oban.Job{id: id, attempt: attempt, args: %{"tenant_id" => tenant_id}}) do
     # The dispatcher clause above is deliberately NOT gated — it carries no tenant_id.
     # `id` excludes THIS already-executing job from its own count (US-36.2).
     case FairShare.gate(tenant_id, :knowledge, id) do
       {:snooze, _n} = snooze -> snooze
-      :ok -> harvest(tenant_id)
+      :ok -> harvest(tenant_id, attempt)
     end
   end
 
-  defp harvest(tenant_id) do
+  # A dropped insert is a tenant that silently gets no harvest this week — the dispatcher
+  # would still complete green, with no failed job row to find it by.
+  defp enqueue_tenant(tenant_id) do
+    case %{"tenant_id" => tenant_id} |> __MODULE__.new() |> Oban.insert() do
+      {:ok, _job} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.error(
+          "structural_links_worker enqueue failed: tenant=#{tenant_id} " <>
+            "reason=#{inspect(reason)} — no harvest for this tenant this week"
+        )
+    end
+  end
+
+  defp harvest(tenant_id, attempt) do
     case @harvester.harvest(tenant_id, min_siblings: min_siblings()) do
       {:error, :heavy_read_overloaded} ->
-        Logger.info(
-          "structural_links_worker shed: tenant=#{tenant_id} reason=heavy_read_overloaded"
-        )
-
-        {:snooze, @shed_snooze_seconds}
+        shed(tenant_id, attempt)
 
       {:ok, report} ->
         log_audit(tenant_id, report)
         :ok
     end
+  end
+
+  defp shed(tenant_id, attempt) when is_integer(attempt) and attempt >= @max_shed_attempts do
+    Logger.error(
+      "structural_links_worker shed #{attempt} times: tenant=#{tenant_id} — cancelling " <>
+        "rather than snoozing forever; the weekly cron re-enqueues"
+    )
+
+    {:cancel, :heavy_read_overloaded}
+  end
+
+  defp shed(tenant_id, _attempt) do
+    Logger.info("structural_links_worker shed: tenant=#{tenant_id} reason=heavy_read_overloaded")
+
+    {:snooze, @shed_snooze_seconds}
   end
 
   # ACTIVE **and carrying a published article**. The recorded finding "self-signup
@@ -141,9 +173,9 @@ defmodule Loopctl.Workers.StructuralLinksWorker do
   #
   # An empty tenant is exactly the one this worker has nothing to do for, so the EXISTS
   # probe is both the cheap answer and the correct one: no corpus, no hub, no job. It is a
-  # per-tenant index probe on `articles`, not an enumeration of the corpus — the scan
-  # itself stays on HeavyRead where it belongs, and AdminRepo's 3-connection pool sees one
-  # bounded query per week.
+  # per-tenant index probe on `articles`, not an enumeration of the corpus. It is the ONLY
+  # AdminRepo query this worker itself issues; the harvest it schedules reads through
+  # HeavyRead and touches AdminRepo only for its bounded, chunked edge writes.
   defp harvestable_tenants do
     published =
       from(a in Article,

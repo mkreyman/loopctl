@@ -112,6 +112,21 @@ defmodule Loopctl.Workers.StructuralLinksWorkerTest do
       assert {:snooze, _} = perform_job(StructuralLinksWorker, %{"tenant_id" => tenant.id})
       assert harvest_audits(tenant.id) == []
     end
+
+    test "cancels instead of snoozing forever once the shed count is capped" do
+      tenant = fixture(:tenant)
+
+      expect(MockStructuralLinksHarvester, :harvest, fn _tenant, _opts ->
+        {:error, :heavy_read_overloaded}
+      end)
+
+      # A snooze raises `max_attempts` in lockstep, so it can NEVER exhaust into
+      # `discarded`: a tenant shedding persistently would re-scan the corpus every five
+      # minutes forever while nothing fails and nothing alerts, and each Sunday's cron
+      # would add another job doing the same.
+      assert {:cancel, :heavy_read_overloaded} =
+               perform_job(StructuralLinksWorker, %{"tenant_id" => tenant.id}, attempt: 12)
+    end
   end
 
   describe "the audit record" do
@@ -129,9 +144,9 @@ defmodule Loopctl.Workers.StructuralLinksWorkerTest do
       assert entry.new_state["distinct_hubs"] == 1
 
       assert entry.new_state["reconciled"] == true,
-             "a run whose two independently-derived counts disagree is how the #724 " <>
-               "hub merge was found — the verdict has to survive in the audit log, not " <>
-               "only in a log line"
+             "a source landing on a hub that does not carry its tag is how the #724 hub " <>
+               "merge shows up — the verdict has to survive in the audit log, not only " <>
+               "in a log line"
     end
   end
 
@@ -188,12 +203,14 @@ defmodule Loopctl.Workers.StructuralLinksWorkerTest do
       hubs_resolved: 0,
       hubs_adopted: 0,
       hub_failures: 0,
+      hubs_unattributed: 0,
       edges_created: 0,
       sources_below_floor: 0,
       articles_without_source: 0,
       min_siblings: 25,
       sources_qualifying: 0,
       distinct_hubs: 0,
+      shared_hubs: 0,
       reconciled: true
     }
   end

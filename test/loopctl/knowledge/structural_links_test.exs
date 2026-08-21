@@ -273,6 +273,27 @@ defmodule Loopctl.Knowledge.StructuralLinksTest do
       assert again.title == "Source: some real author"
     end
 
+    test "a name is never reverted to a digest when the source grows" do
+      tenant = fixture(:tenant)
+      for _ <- 1..10, do: article(tenant, ["book-flip", "advanced-cypher-concepts"])
+
+      assert {:ok, _} = StructuralLinks.harvest(tenant.id, min_siblings: 3)
+      [first] = hubs(tenant.id)
+      assert first.title == "Source: advanced cypher concepts"
+
+      # Three untagged members put the naming tag under the 0.9 coverage floor, which is
+      # recomputed against the CURRENT member count on every run. Weekly (#725) that
+      # flips a well-named hub back to a digest and pays for a re-embedding each time,
+      # then flips back when enough tagged members arrive.
+      for _ <- 1..3, do: article(tenant, ["book-flip"])
+
+      assert {:ok, _} = StructuralLinks.harvest(tenant.id, min_siblings: 3)
+      [again] = hubs(tenant.id)
+
+      assert again.id == first.id
+      assert again.title == "Source: advanced cypher concepts"
+    end
+
     test "a universal tag that is not name-SHAPED is refused" do
       tenant = fixture(:tenant)
 
@@ -423,14 +444,13 @@ defmodule Loopctl.Knowledge.StructuralLinksTest do
       assert report.reconciled
     end
 
-    test "two sources landing on ONE hub is reported as unreconciled" do
+    test "two sources sharing a hub that tags them BOTH is counted, not alarmed" do
       tenant = fixture(:tenant)
 
-      # The live shape this catches: 1,195 articles carry two source tags, so a
-      # `hub`-tagged one is adoptable by BOTH of its sources. Two sources then share a
-      # star centre and a `derived_from` edge stops meaning "derived from this source" —
-      # the same corruption class as the #724 title merge, which was found only by
-      # deriving these two counts separately.
+      # The live shape: 1,195 articles carry two source tags, so a `hub`-tagged one is
+      # adoptable by BOTH of its sources. That is ordinary and permanent, so pinning the
+      # tenant-wide verdict false on it would leave the weekly :error log always on — and
+      # an alarm that never clears cannot detect the merge it exists for.
       _dual = article(tenant, ["book-dual-a", "book-dual-b", "hub"], %{title: "Two Sources"})
       for _ <- 1..3, do: article(tenant, ["book-dual-a"])
       for _ <- 1..3, do: article(tenant, ["book-dual-b"])
@@ -439,10 +459,36 @@ defmodule Loopctl.Knowledge.StructuralLinksTest do
 
       assert report.hubs_adopted == 2
       assert report.distinct_hubs == 1
+      assert report.shared_hubs == 1
+
+      assert report.reconciled,
+             "both sources tag this hub, so its derived_from edges still mean what they " <>
+               "say — reporting it as corruption is how the #724 detector goes deaf"
+    end
+
+    test "a source landing on a hub that does not carry its tag IS unreconciled" do
+      tenant = fixture(:tenant)
+
+      # The #724 merge, reduced: a hub row already answers this source's idempotency_key
+      # but is tagged for a DIFFERENT source, so a `derived_from` edge to it means
+      # "derived from something else". Every other count in the report stays healthy.
+      article(tenant, ["book-somebody-else", "hub"], %{
+        title: "Source: somebody else",
+        idempotency_key: "structural-hub-book-orphan",
+        metadata: %{"hub_kind" => "source", "source_key" => "book-somebody-else"}
+      })
+
+      for _ <- 1..3, do: article(tenant, ["book-orphan"])
+
+      assert {:ok, report} = StructuralLinks.harvest(tenant.id, min_siblings: 3)
+
+      assert report.hubs_resolved == 1
+      assert report.hubs_unattributed == 1
+      assert report.shared_hubs == 0
 
       refute report.reconciled,
-             "two sources on one hub must be REPORTED — the counts each look healthy " <>
-               "alone, which is exactly why the run has to compare them itself"
+             "attribution is the whole verdict — delete count_attribution/3 and this is " <>
+               "the test that must fail"
     end
   end
 

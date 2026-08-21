@@ -20,16 +20,20 @@ All notable changes to loopctl are documented here.
   their composite unique index, so a re-run over an unchanged corpus writes nothing. The
   unattended sibling floor is **25**, not the library default of 3: at 3 the hosted corpus
   yields 2,145 minted hubs against 25's 241, and the extra ~1,900 come from the smallest
-  sources where a usable name is least likely. Tune with
-  `:structural_links_min_siblings` (worker) or `:structural_hub_min_siblings` (explicit
-  calls). No new environment variable, no migration.
+  sources where a usable name is least likely. That floor is a DEPLOY-TIME constant
+  (`:structural_links_min_siblings` for the worker, `:structural_hub_min_siblings` for an
+  explicit call) — it is read from application config with no environment variable behind
+  it, so changing it takes a code change and a deploy. No new environment variable, no
+  migration.
 
 - **The harvest report reconciles itself.** Each run now reports `sources_qualifying`,
-  `distinct_hubs` and a `reconciled` verdict, recorded in the audit log under
-  `knowledge.structural_links_harvested`. `reconciled: false` means two sources landed on one
-  hub — the corruption class that put 85 sources and 6,471 members on a single node before
-  #724, found only by deriving the two counts separately. A mismatch is reported, never
-  raised.
+  `distinct_hubs`, `shared_hubs`, `hubs_unattributed` and a `reconciled` verdict, recorded
+  in the audit log under `knowledge.structural_links_harvested`. `reconciled: false` means
+  a source landed on a hub that does not carry that source's tag — the corruption class
+  that put 85 sources and 6,471 members on a single node before #724. Two sources sharing
+  a hub that tags them BOTH is the ordinary dual-tagged shape and is reported as
+  `shared_hubs`, not as a failure, so the verdict is not permanently false on a healthy
+  corpus. A mismatch is reported, never raised.
 
 ## [Unreleased] — 2026-08-20 — Work-breakdown import: a criterion must carry text
 
