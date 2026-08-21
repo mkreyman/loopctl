@@ -336,7 +336,10 @@ defmodule LoopctlWeb.ArticleWorkflowController do
            },
            evidence: %OpenApiSpex.Schema{
              type: :string,
-             maxLength: Knowledge.max_assertion_evidence_bytes(),
+             # No `maxLength`: JSON Schema counts CHARACTERS and the guard counts BYTES, so
+             # the same number means two different limits and a spec-conforming multibyte
+             # body would still be refused. The cap is stated in bytes below, from the one
+             # attribute the guard reads.
              description:
                "REQUIRED. Why these two conflict — ideally the ground truth that settles " <>
                  "it (commit, file:line, URL, observed behaviour). This is what a reviewer " <>
@@ -872,7 +875,7 @@ defmodule LoopctlWeb.ArticleWorkflowController do
     opts =
       AuditContext.from_conn(conn) ++
         Visibility.scope_opts(conn) ++
-        [actor_principal: actor_principal(api_key)]
+        [actor_principal: actor_principal(api_key), actor_lineage: actor_lineage(api_key)]
 
     case Knowledge.assert_conflict(api_key.tenant_id, attrs, opts) do
       {:ok, link, outcome} ->
@@ -982,19 +985,22 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   end
 
   # A key with NO agent (orchestrator/user, including every user-role dispatch key) has no
-  # actor id of its own, and the key id is not one: v2 mints a key per dispatch, so one
-  # operator asserting through D1 and judging through D2 read as two principals and the
-  # separation evaporates. Fall back to the ROOT of the key's dispatch lineage — one id for
-  # the whole tree that operator dispatched — and only to the key id when no dispatch minted
-  # it at all (the tenant's own operator key, which is a human acting deliberately).
+  # actor id of its own, so the key id is the identity. It is deliberately NOT collapsed to
+  # the lineage ROOT: v2 mints a key per dispatch, and in the documented single-root tenant
+  # every dispatch shares one root, so a root principal makes each of them the same party
+  # and NO dispatch-minted key can ever judge a pair another one asserted. CLAUDE.md records
+  # that exact trade on the custody side — "a SIBLING is separation — demanding a separate
+  # ROOT of the caller made verify unreachable in the documented single-root tenant".
+  # Ancestor/descendant reuse (assert through D1, judge through its child) is held by
+  # `:actor_lineage` below instead, which refuses a shared CHAIN and permits siblings.
+  defp unlineaged_principal(api_key), do: to_string(api_key.id)
+
+  # The key's dispatch lineage (root → leaf), or `[]` for a key no dispatch minted — the
+  # tenant's own operator key, the documented human judge.
   # `minting_lineage_for_api_key/2` rather than `lineage_for_api_key/2`: a revoked dispatch
-  # must not read as a fresh principal.
-  defp unlineaged_principal(api_key) do
-    case Dispatches.minting_lineage_for_api_key(api_key.tenant_id, api_key.id) do
-      [root | _] -> to_string(root)
-      _ -> to_string(api_key.id)
-    end
-  end
+  # must not read as a fresh party.
+  defp actor_lineage(api_key),
+    do: Dispatches.minting_lineage_for_api_key(api_key.tenant_id, api_key.id)
 
   @doc "POST /api/v1/knowledge/conflicts/resolve"
   def resolve_conflict(conn, params) do
@@ -1027,7 +1033,10 @@ defmodule LoopctlWeb.ArticleWorkflowController do
           # #730: identifies the RECORDER, so a verdict on an ASSERTED pair can be refused
           # when it comes from the principal that asserted it. Inert on a system-flagged
           # pair, which carries no asserter.
-          actor_principal: actor_principal(conn.assigns.current_api_key)
+          actor_principal: actor_principal(conn.assigns.current_api_key),
+          # The same identity one layer out: an ancestor or descendant dispatch of the
+          # asserting one is the same operator, so it is refused as well.
+          actor_lineage: actor_lineage(conn.assigns.current_api_key)
         ]
 
     attrs = %{

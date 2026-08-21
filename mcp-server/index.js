@@ -2096,18 +2096,20 @@ async function knowledgeResolveConflict({
   if (classification) payload.classification = classification;
   if (evidence) payload.evidence = evidence;
   if (confidence) payload.confidence = confidence;
-  // #730: the ORCHESTRATOR key first, falling back to the agent key. An assertion is made
-  // with LOOPCTL_AGENT_KEY, and the server refuses a verdict from the principal that
-  // asserted the pair (409 self_asserted_conflict) — so forwarding the verdict on the same
-  // key made every asserted pair permanently unjudgeable through the shipped client, in
-  // this session and every later one, since the agent key resolves to one principal. The
-  // orchestrator key is also the one that can record a supersede at "high" without being
-  // capped, so it is the right default for a verdict on either origin.
+  // #730: the AGENT key, the same one every other knowledge_* verb sends. It must NOT
+  // reach for LOOPCTL_ORCH_KEY to get past a 409 self_asserted_conflict: that 409 is the
+  // separation working, and clearing it by handing this process a second, higher-privileged
+  // key is the workaround this repo forbids outright ("the MCP server must NEVER hold both
+  // implementer and reviewer keys in the same process"). It would also lift the #331
+  // supersede confidence cap and the agent visibility scope on EVERY verdict, not just on
+  // an asserted pair — an agent-role "high" supersede would stop being capped to "medium"
+  // and the nightly executor would retire the loser unattended. A pair you asserted is
+  // judged by a DIFFERENT key: another session, an orchestrator, or a human operator.
   const result = await apiCall(
     "POST",
     "/api/v1/knowledge/conflicts/resolve",
     payload,
-    process.env.LOOPCTL_ORCH_KEY || process.env.LOOPCTL_AGENT_KEY,
+    process.env.LOOPCTL_AGENT_KEY,
   );
   return toContent(result);
 }
@@ -5767,11 +5769,11 @@ const TOOLS = [
       "'merge' is never capped and executes normally at agent role. " +
       "Only pairs with a real flag are reachable here — if the pair you want was never " +
       "flagged (you just wrote an article refuting another), assert it first with " +
-      "knowledge_assert_conflict; a DIFFERENT key then records the verdict, since the " +
+      "knowledge_assert_conflict; a DIFFERENT PRINCIPAL then records the verdict, since the " +
       "asserter of a pair may not judge it (409 self_asserted_conflict). This tool sends " +
-      "LOOPCTL_ORCH_KEY when one is configured (falling back to LOOPCTL_AGENT_KEY), which " +
-      "is what makes an asserted pair judgeable at all — with only an agent key configured, " +
-      "a pair you asserted yourself stays 409 forever. " +
+      "LOOPCTL_AGENT_KEY, so a pair YOU asserted answers 409 here by design — hand it to " +
+      "another session, an orchestrator, or a human operator rather than reaching for a " +
+      "higher-privileged key. " +
       "Last-write-wins per pair, so re-recording with fresher ground truth overrides. " +
       "Resolve only conflicts material to your current task; adjudicate against the actual " +
       "system, and if you can't tell which is right, LEAVE IT UNRECORDED rather than " +

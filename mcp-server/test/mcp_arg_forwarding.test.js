@@ -1070,16 +1070,18 @@ describe("#730: knowledge_assert_conflict wiring", () => {
     assert.match(body, /if \(proposed_authoritative_article_id\)/);
   });
 
-  // The completion path has to EXIST for the shipped client: the asserter cannot judge its
-  // own pair, so if both tools forward the same key every asserted pair is unjudgeable
-  // forever — in this session and every later one on the same config.
-  test("knowledge_resolve_conflict prefers the orchestrator key over the asserting one", () => {
+  // The verdict must NOT escalate to a second, higher-privileged key to clear the 409 the
+  // asserter gets: that would put the asserter's key and the judge's key in one process,
+  // and it would lift the supersede confidence cap and the agent visibility scope on every
+  // verdict, not only on an asserted pair.
+  test("knowledge_resolve_conflict does not escalate to the orchestrator key", () => {
     const body = functionSource("knowledgeResolveConflict");
-    assert.match(
+    assert.match(body, /process\.env\.LOOPCTL_AGENT_KEY/);
+    assert.doesNotMatch(
       body,
-      /process\.env\.LOOPCTL_ORCH_KEY \|\| process\.env\.LOOPCTL_AGENT_KEY/,
-      "the verdict must go out on the orchestrator key when one is configured, or a pair " +
-        "asserted with LOOPCTL_AGENT_KEY can never be resolved (409 self_asserted_conflict)",
+      /process\.env\.LOOPCTL_ORCH_KEY/,
+      "a 409 self_asserted_conflict is the separation working — another principal records " +
+        "the verdict; the client must not hold both sides",
     );
   });
 

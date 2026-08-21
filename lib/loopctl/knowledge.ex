@@ -50,6 +50,7 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Custody
   alias Loopctl.DbCapacity
+  alias Loopctl.Dispatches
   alias Loopctl.Egress
   alias Loopctl.Egress.Policy, as: EgressPolicy
   alias Loopctl.Egress.Scope, as: EgressScope
@@ -3685,12 +3686,33 @@ defmodule Loopctl.Knowledge do
   # can discover it in, leaving the documented remedy ("re-record it at :high") reachable
   # only by someone who already memorised both article ids.
   defp conflict_unresolved_subquery do
-    from(r in pair_resolutions(), where: ^settled_resolution())
+    from(r in pair_resolutions(),
+      where: ^settled_resolution(),
+      # A verdict settles only a flag that already EXISTED when it was recorded. The
+      # correlation is on the article PAIR alone, which #730 turned into a way to pre-settle
+      # an arbitrary pair forever: one principal asserts it, a second records a dismiss, and
+      # every LATER system flag over those two articles is born settled — dropped from the
+      # queue before a reviewer ever sees it. Compared against the LINK's `inserted_at`
+      # (article_links has no `updated_at`) and COALESCEd to the row's own so a pre-column
+      # verdict still settles.
+      where:
+        fragment(
+          "COALESCE(?, ?) >= ?",
+          r.annotated_at,
+          r.inserted_at,
+          parent_as(:link).inserted_at
+        )
+    )
   end
 
   # The same correlation with NO predicate on the verdict: TRUE when ANY verdict exists for
   # the pair. Only curated SUPPRESSION uses this — see the note at its call site for why the
-  # two questions must not share one predicate.
+  # two questions must not share one predicate, and why the postdate predicate above is
+  # deliberately NOT here: the automatic drain
+  # (`Loopctl.Workers.KnowledgeLintWorker.judge_redundant_conflicts/1`) skips any pair that
+  # already has a verdict row, so a re-flagged judged pair that suppression counted as
+  # unjudged would withhold BOTH its articles for the whole window with nothing able to
+  # release them.
   defp judged_pair_subquery, do: pair_resolutions()
 
   defp pair_resolutions do
@@ -3701,23 +3723,6 @@ defmodule Loopctl.Knowledge do
               r.target_article_id == parent_as(:link).target_article_id) or
              (r.source_article_id == parent_as(:link).target_article_id and
                 r.target_article_id == parent_as(:link).source_article_id))
-    )
-    |> where(
-      # A verdict settles only a flag that already EXISTED when it was recorded. The
-      # correlation above is on the article PAIR alone, which #730 turned into a way to
-      # pre-settle an arbitrary pair forever: one principal asserts it, a second records a
-      # dismiss, and every LATER system flag over those two articles is born settled —
-      # dropped from the queue and released from curated suppression before a reviewer ever
-      # sees it. Compared against the LINK's `inserted_at` (article_links has no
-      # `updated_at`) and COALESCEd to the row's own so a pre-column verdict still settles
-      # rather than re-suppressing a corpus.
-      [r],
-      fragment(
-        "COALESCE(?, ?) >= ?",
-        r.annotated_at,
-        r.inserted_at,
-        parent_as(:link).inserted_at
-      )
     )
   end
 
@@ -5058,6 +5063,9 @@ defmodule Loopctl.Knowledge do
       (`agent_id || api_key_id`). Persisted as `asserted_by_principal` and compared against
       the recorder's on every later verdict. **Required**: without it there is no identity
       to hold apart, so the assertion is refused rather than recorded unattributed.
+    * `:actor_lineage` — the asserting key's dispatch lineage (root → leaf), resolved
+      server-side. Persisted as `asserted_by_lineage`; a later verdict from an ancestor or
+      descendant dispatch of the same operator is refused too (siblings are separation).
     * `:actor_label` / `:actor_id` / `:actor_type` — the usual audit context.
   """
   @spec assert_conflict(Ecto.UUID.t(), map(), keyword()) ::
@@ -5105,8 +5113,7 @@ defmodule Loopctl.Knowledge do
              tgt_id,
              Keyword.get(opts, :visibility_agent_id)
            ),
-         :ok <- validate_articles_exist(tenant_id, src_id, tgt_id),
-         :ok <- validate_open_assertion_budget(tenant_id, principal) do
+         :ok <- validate_articles_exist(tenant_id, src_id, tgt_id) do
       {src, tgt} = canonical_pair(src_id, tgt_id)
 
       case fetch_conflict_flag(tenant_id, src, tgt) do
@@ -5114,8 +5121,18 @@ defmodule Loopctl.Knowledge do
           {:ok, existing, :existing}
 
         {:error, :no_potential_conflict} ->
-          insert_asserted_conflict(tenant_id, src, tgt, attrs, principal, opts)
+          open_new_assertion(tenant_id, src, tgt, attrs, principal, opts)
       end
+    end
+  end
+
+  # The budget bounds how many NEW pairs one principal may OPEN, so it is checked HERE and
+  # not in `assert_conflict/3`'s `with`: re-asserting an already-flagged pair creates
+  # nothing, and refusing that at the cap breaks the idempotency the function documents
+  # ("a retry is safe") for the one caller who most needs it — a client retrying a timeout.
+  defp open_new_assertion(tenant_id, src, tgt, attrs, principal, opts) do
+    with :ok <- validate_open_assertion_budget(tenant_id, principal) do
+      insert_asserted_conflict(tenant_id, src, tgt, attrs, principal, opts)
     end
   end
 
@@ -5138,6 +5155,10 @@ defmodule Loopctl.Knowledge do
         "auto_generated" => false,
         "asserted" => true,
         "asserted_by_principal" => principal,
+        # The asserting key's dispatch lineage (root → leaf), so a later verdict from an
+        # ANCESTOR or DESCENDANT dispatch of the same operator can be held apart from one
+        # by a genuinely separate party. `[]` for a key no dispatch minted.
+        "asserted_by_lineage" => normalize_lineage(Keyword.get(opts, :actor_lineage)),
         # The audit label, kept for the execution-time backstop's fallback branch only
         # (`apply_flagged_resolution/3`) and deliberately NOT rendered on the queue: it is
         # `"<role>:<key_name>"`, which would enumerate tenant key names to every
@@ -5473,9 +5494,24 @@ defmodule Loopctl.Knowledge do
         recorder = normalize_principal(Keyword.get(opts, :actor_principal))
         metadata = Map.put(flag.metadata, "verdict_by_principal", recorder)
 
-        flag
-        |> Ecto.Changeset.change(metadata: metadata)
-        |> AdminRepo.update()
+        # `update_all` on the id, never `Repo.update/1`: this runs AFTER the verdict has
+        # committed and outside its transaction, and a `:user` may retract the flag in that
+        # window (see `apply_resolution/2`). `Repo.update/1` raises Ecto.StaleEntryError on
+        # a row that is gone, which would answer 500 for a verdict that WAS recorded;
+        # matching zero rows is the right outcome for a pair nobody is judging any more.
+        {updated, _} =
+          from(l in ArticleLink, where: l.id == ^flag.id)
+          |> AdminRepo.update_all(set: [metadata: metadata])
+
+        if updated == 0 do
+          # Not silent: unstamped, the execution-time backstop falls back to comparing
+          # audit LABELS, which are not unique.
+          Logger.warning(
+            "knowledge: verdict principal not stamped on asserted flag #{flag.id} " <>
+              "(link retracted concurrently); execution-time self-assertion re-check " <>
+              "falls back to the audit label for this pair."
+          )
+        end
 
         :ok
     end
@@ -5649,9 +5685,38 @@ defmodule Loopctl.Knowledge do
       is_nil(asserted_by) -> :ok
       is_nil(recorder) -> {:error, :self_asserted_conflict}
       asserted_by == recorder -> {:error, :self_asserted_conflict}
+      same_dispatch_chain?(metadata, opts) -> {:error, :self_asserted_conflict}
       true -> :ok
     end
   end
+
+  # One operator dispatching two keys is ONE party, so a verdict from an ANCESTOR or
+  # DESCENDANT of the asserting dispatch is self-judgement even though the two key ids
+  # differ. SIBLINGS are separation, and that distinction is not a preference: comparing the
+  # lineage ROOT instead collapses every dispatch-minted key in the documented single-root
+  # tenant into one principal, which is precisely what made `verify` unreachable before
+  # (CLAUDE.md, "a SIBLING is separation"). `Dispatches.lineage_same_chain?/2` is the same
+  # test the L4 custody gates run. A caller with NO lineage — the tenant's own operator key
+  # — is the documented human judge and is permitted; nothing on a dispatch row records
+  # which key minted a ROOT, so that identity is not derivable here.
+  defp same_dispatch_chain?(metadata, opts) do
+    Dispatches.lineage_same_chain?(
+      normalize_lineage(metadata["asserted_by_lineage"]),
+      normalize_lineage(Keyword.get(opts, :actor_lineage))
+    )
+  end
+
+  # A lineage is a list of server-derived id strings; anything else is no lineage at all.
+  defp normalize_lineage(lineage) when is_list(lineage) do
+    Enum.flat_map(lineage, fn value ->
+      case normalize_principal(value) do
+        nil -> []
+        id -> [id]
+      end
+    end)
+  end
+
+  defp normalize_lineage(_lineage), do: []
 
   @doc """
   Nightly executor for conflict resolutions (route-the-findings #4). Applies only
@@ -5842,30 +5907,26 @@ defmodule Loopctl.Knowledge do
   # disposition's author did not create both sides, and a guard that only runs at write time
   # is one code path away from being bypassed by a future caller.
   #
-  # It compares PRINCIPALS whenever both are on the row — the asserter's is stamped at
-  # assert time and the recorder's at verdict time (`stamp_verdict_principal/3`) — and only
-  # falls back to the audit LABELS when no verdict principal was stamped, which is exactly
-  # the alternate-route write this backstop exists for. Labels are `"<role>:<key_name>"` and
-  # nothing makes a key name unique, so deciding on them alone silently discarded a
-  # legitimate verdict on a name collision and never fired for the two dispatch keys of one
-  # agent. Closed as executed (audited) rather than skipped, so a refused row can never sit
-  # pending forever while `executable_resolution/0` reads its pair as settled.
+  # It compares PRINCIPALS — the asserter's is stamped at assert time and the recorder's at
+  # verdict time (`stamp_verdict_principal/3`) — and the audit LABELS are evaluated IN
+  # ADDITION, never as an else-branch, the same "in addition to, never short-circuited by"
+  # rule the custody gates in `Progress` state. `verdict_by_principal` carries only the LAST
+  # verdict that went through `annotate_conflict/3`, so an earlier legitimate verdict left
+  # a non-nil principal on the row and an else-branch made the label check unreachable for
+  # every later write — exactly the alternate-route write this backstop exists for. Labels
+  # are `"<role>:<key_name>"` and nothing makes a key name unique, which is why they decide
+  # nothing on their own but still refuse a match. Closed as executed (audited) rather than
+  # skipped, so a refused row can never sit pending forever while `executable_resolution/0`
+  # reads its pair as settled.
   defp apply_flagged_resolution(tenant_id, %ConflictResolution{} = r, %ArticleLink{} = flag) do
     asserted_by = normalize_principal(flag.metadata["asserted_by_principal"])
     recorder = normalize_principal(flag.metadata["verdict_by_principal"])
+    label = normalize_principal(flag.metadata["asserted_by"])
 
     self_asserted? =
-      cond do
-        is_nil(asserted_by) ->
-          false
-
-        not is_nil(recorder) ->
-          asserted_by == recorder
-
-        true ->
-          label = normalize_principal(flag.metadata["asserted_by"])
-          not is_nil(label) and label == normalize_principal(r.annotated_by)
-      end
+      not is_nil(asserted_by) and
+        (asserted_by == recorder or
+           (not is_nil(label) and label == normalize_principal(r.annotated_by)))
 
     if self_asserted? do
       mark_resolution_executed(r, %{

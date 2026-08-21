@@ -55,6 +55,14 @@ defmodule Loopctl.Knowledge.AssertConflictTest do
     AdminRepo.aggregate(from(l in ArticleLink, where: l.tenant_id == ^tenant_id), :count, :id)
   end
 
+  defp judge(tenant_id, a, b, opts \\ []) do
+    Knowledge.annotate_conflict(
+      tenant_id,
+      %{"source_article_id" => a.id, "target_article_id" => b.id, "disposition" => "dismiss"},
+      @judge ++ opts
+    )
+  end
+
   defp system_flag(tenant_id, a, b, score) do
     %ArticleLink{tenant_id: tenant_id}
     |> ArticleLink.changeset(%{
@@ -135,7 +143,7 @@ defmodule Loopctl.Knowledge.AssertConflictTest do
       t = fixture(:tenant)
       winner = published(t.id, "winner")
       loser = published(t.id, "loser")
-      assert {:ok, _link, :created} = assert_pair(t.id, winner, loser)
+      assert {:ok, link, :created} = assert_pair(t.id, winner, loser)
 
       assert {:ok, %ConflictResolution{}} =
                Knowledge.annotate_conflict(
@@ -150,6 +158,11 @@ defmodule Loopctl.Knowledge.AssertConflictTest do
                  },
                  @judge ++ [actor_role: :orchestrator]
                )
+
+      # The recorder's principal is stamped on the flag, which is what the execution-time
+      # re-check compares — an unstamped flag silently demotes it to the audit labels.
+      assert AdminRepo.get(ArticleLink, link.id).metadata["verdict_by_principal"] ==
+               "someone-else"
 
       assert 1 == Knowledge.execute_conflict_resolutions(t.id)
       assert AdminRepo.get(Loopctl.Knowledge.Article, loser.id).status == :superseded
@@ -382,6 +395,32 @@ defmodule Loopctl.Knowledge.AssertConflictTest do
       assert row.origin == "system"
     end
 
+    # The other half of the same predicate, and the reason it is NOT shared with curated
+    # suppression: suppression asks "has anyone JUDGED this?", while the automatic drain
+    # (`KnowledgeLintWorker.judge_redundant_conflicts/1`) skips any pair that already carries
+    # a verdict row. A re-flagged judged pair that suppression counted as unjudged would
+    # withhold BOTH articles for the whole window with nothing able to release them.
+    test "a re-flagged pair that was already judged is not suppressed a second time" do
+      t = fixture(:tenant)
+      {:ok, a} = Knowledge.mark_curated(t.id, published(t.id, "A").id, actor_label: "user:admin")
+      b = published(t.id, "B")
+      flag = system_flag(t.id, a, b, 0.99)
+      refute Knowledge.authoritative_curated?(a, t.id)
+
+      assert {:ok, %ConflictResolution{}} = judge(t.id, a, b)
+      assert Knowledge.authoritative_curated?(a, t.id)
+
+      # Retracted, then re-raised by the nightly sweep AFTER the verdict was recorded.
+      AdminRepo.delete!(flag)
+      system_flag(t.id, a, b, 0.99)
+
+      assert Knowledge.authoritative_curated?(a, t.id),
+             "nothing would ever release it: the drain reads the pair as judged"
+
+      # It is back in the QUEUE, which is where a reviewer picks it up.
+      assert %{meta: %{total_count: 1}} = Knowledge.list_potential_conflicts(t.id)
+    end
+
     test "an agent cannot assert a conflict over an article it cannot see" do
       t = fixture(:tenant)
       mine = published(t.id, "mine", %{"visibility" => "shared"})
@@ -452,6 +491,101 @@ defmodule Loopctl.Knowledge.AssertConflictTest do
       refute is_nil(row.executed_at), "the refused row must be closed, never left pending"
       assert row.execution_result["reason"] == "self_asserted_conflict"
       assert AdminRepo.get(Loopctl.Knowledge.Article, loser.id).status == :published
+    end
+
+    # `verdict_by_principal` carries only the LAST verdict recorded through
+    # `annotate_conflict/3`, so an EARLIER legitimate verdict leaves a non-nil principal on
+    # the flag. Deciding on the principals alone in that state makes the label comparison
+    # unreachable exactly when the backstop is needed.
+    test "an earlier legitimate verdict does not disable the audit-label backstop" do
+      t = fixture(:tenant)
+      winner = published(t.id, "winner")
+      loser = published(t.id, "loser")
+      assert {:ok, _link, :created} = assert_pair(t.id, winner, loser)
+      assert {:ok, %ConflictResolution{}} = judge(t.id, winner, loser)
+
+      # The ASSERTER now overwrites the verdict by some other route (the row is a
+      # last-write-wins upsert on the pair) — the alternate-route write this exists for.
+      AdminRepo.get_by(ConflictResolution, tenant_id: t.id)
+      |> Ecto.Changeset.change(%{
+        disposition: :supersede,
+        confidence: :high,
+        authoritative_article_id: winner.id,
+        annotated_by: "agent:corrector",
+        annotated_by_role: "orchestrator",
+        annotated_at: DateTime.utc_now(),
+        executed_at: nil,
+        execution_result: %{}
+      })
+      |> AdminRepo.update!()
+
+      assert 0 == Knowledge.execute_conflict_resolutions(t.id)
+
+      row = AdminRepo.get_by(ConflictResolution, tenant_id: t.id)
+      assert row.execution_result["reason"] == "self_asserted_conflict"
+      assert AdminRepo.get(Loopctl.Knowledge.Article, loser.id).status == :published
+    end
+  end
+
+  # The principal alone cannot hold two DISPATCH keys of one operator apart: v2 mints a key
+  # per dispatch, so the ids differ. The lineage is what decides, and it decides the same way
+  # the L4 custody gates do — a shared root-to-leaf CHAIN is one party, siblings are two.
+  describe "assert_conflict/3 — dispatch lineage separation" do
+    test "a descendant dispatch cannot judge the pair, a sibling can" do
+      t = fixture(:tenant)
+      a = published(t.id, "A")
+      b = published(t.id, "B")
+      root = Ecto.UUID.generate()
+      asserting = Ecto.UUID.generate()
+
+      assert {:ok, _link, :created} =
+               assert_pair(t.id, a, b, @asserter ++ [actor_lineage: [root, asserting]])
+
+      assert {:error, :self_asserted_conflict} =
+               judge(t.id, a, b, actor_lineage: [root, asserting, Ecto.UUID.generate()])
+
+      # A SIBLING is separation. Comparing the lineage ROOT instead would collapse every
+      # dispatch-minted key in the documented single-root tenant into one party, and the
+      # pair could never be judged by anything but the raw operator key.
+      assert {:ok, %ConflictResolution{}} =
+               judge(t.id, a, b, actor_lineage: [root, Ecto.UUID.generate()])
+    end
+
+    test "a caller with no lineage — the tenant operator key — may judge" do
+      t = fixture(:tenant)
+      a = published(t.id, "A")
+      b = published(t.id, "B")
+
+      assert {:ok, _link, :created} =
+               assert_pair(t.id, a, b, @asserter ++ [actor_lineage: [Ecto.UUID.generate()]])
+
+      assert {:ok, %ConflictResolution{}} = judge(t.id, a, b)
+    end
+  end
+
+  # The budget bounds how many pairs one principal may OPEN. A call that opens nothing is
+  # not what it is bounding, and refusing one breaks the idempotency this endpoint documents
+  # for exactly the caller who needs it — a client retrying after a timeout.
+  describe "assert_conflict/3 — open-assertion budget" do
+    test "at the cap a re-assert is still idempotent while a NEW pair is refused" do
+      t = fixture(:tenant)
+      articles = for i <- 1..8, do: published(t.id, "cap-#{i}")
+
+      pairs =
+        for {x, i} <- Enum.with_index(articles),
+            y <- Enum.drop(articles, i + 1),
+            do: {x, y}
+
+      [{held_a, held_b} | _] = Enum.take(pairs, 25)
+
+      for {x, y} <- Enum.take(pairs, 25) do
+        assert {:ok, _link, :created} = assert_pair(t.id, x, y)
+      end
+
+      assert {:ok, _existing, :existing} = assert_pair(t.id, held_a, held_b)
+
+      {new_a, new_b} = Enum.at(pairs, 25)
+      assert {:error, :too_many_open_assertions} = assert_pair(t.id, new_a, new_b)
     end
   end
 
