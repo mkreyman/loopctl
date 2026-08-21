@@ -2,6 +2,41 @@
 
 All notable changes to loopctl are documented here.
 
+## [Unreleased] — 2026-08-21 — The provenance harvest runs on a cadence
+
+### Added
+
+- **`Loopctl.Workers.StructuralLinksWorker` — weekly `derived_from` harvest, `0 6 * * 0`.**
+  US-42.1 shipped `Knowledge.StructuralLinks.harvest/2` with nothing running it, so only the
+  one manual backfill ever produced source hubs; every source created since has had none.
+  The worker fans out one job per ACTIVE tenant that has a published article, each gated by
+  `FairShare`, and snoozes the tenant (rather than failing an attempt) when the corpus scan
+  is shed. A tenant with no corpus is skipped outright, so a junk signup does not buy itself
+  a weekly job insert and scan in perpetuity. Sunday 06:00 UTC puts
+  it after the 05:00 MOC fan-out and the 05:50 draft sweep so the three weekly `:knowledge`
+  passes do not contend for the lane.
+
+  **Operator impact:** additive and idempotent — hubs resolve by `idempotency_key`, edges by
+  their composite unique index, so a re-run over an unchanged corpus writes nothing. The
+  unattended sibling floor is **25**, not the library default of 3: at 3 the hosted corpus
+  yields 2,145 minted hubs against 25's 241, and the extra ~1,900 come from the smallest
+  sources where a usable name is least likely. That floor is a DEPLOY-TIME constant
+  (`:structural_links_min_siblings` for the worker, `:structural_hub_min_siblings` for an
+  explicit call) — it is read from application config with no environment variable behind
+  it, so changing it takes a code change and a deploy. No new environment variable, no
+  migration.
+
+- **The harvest report reconciles itself.** Each run now reports `sources_qualifying`,
+  `distinct_hubs`, `shared_hubs`, `hubs_unattributed` and a `reconciled` verdict, recorded
+  in the audit log under `knowledge.structural_links_harvested`. `reconciled: false` means
+  a source landed on a hub that does not carry that source's tag — the corruption class
+  that put 85 sources and 6,471 members on a single node before #724. Two sources sharing
+  a hub that tags them BOTH is the ordinary dual-tagged shape and is reported as
+  `shared_hubs`, not as a failure, so the verdict is not permanently false on a healthy
+  corpus. A mismatch is reported, never raised — and the affected source's `derived_from`
+  edges are REFUSED rather than written, so `hubs_unattributed` counts sources that were
+  skipped, not edges that need cleaning up afterwards.
+
 ## [Unreleased] — 2026-08-20 — Work-breakdown import: a criterion must carry text
 
 ### Changed

@@ -14,6 +14,7 @@ defmodule Loopctl.Knowledge.StructuralLinksTest do
   setup :verify_on_exit!
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Audit.AuditLog
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
@@ -273,6 +274,117 @@ defmodule Loopctl.Knowledge.StructuralLinksTest do
       assert again.title == "Source: some real author"
     end
 
+    test "a name is never reverted to a digest when the source grows" do
+      tenant = fixture(:tenant)
+      for _ <- 1..10, do: article(tenant, ["book-flip", "advanced-cypher-concepts"])
+
+      assert {:ok, _} = StructuralLinks.harvest(tenant.id, min_siblings: 3)
+      [first] = hubs(tenant.id)
+      assert first.title == "Source: advanced cypher concepts"
+
+      # Three untagged members put the naming tag under the 0.9 coverage floor, which is
+      # recomputed against the CURRENT member count on every run. Weekly (#725) that
+      # flips a well-named hub back to a digest and pays for a re-embedding each time,
+      # then flips back when enough tagged members arrive.
+      for _ <- 1..3, do: article(tenant, ["book-flip"])
+
+      assert {:ok, _} = StructuralLinks.harvest(tenant.id, min_siblings: 3)
+      [again] = hubs(tenant.id)
+
+      assert again.id == first.id
+      assert again.title == "Source: advanced cypher concepts"
+    end
+
+    test "an unattended mint is audited as the system worker, not as an API key" do
+      tenant = fixture(:tenant)
+      for _ <- 1..4, do: article(tenant, ["book-attributed"])
+
+      assert {:ok, _} = StructuralLinks.harvest(tenant.id, min_siblings: 3)
+      [hub] = hubs(tenant.id)
+
+      entry =
+        from(e in AuditLog,
+          where: e.tenant_id == ^tenant.id,
+          where: e.action == "article.created" and e.entity_id == ^hub.id
+        )
+        |> AdminRepo.one()
+
+      # `Knowledge` defaults actor_type to "api_key" with a nil id, so an unattended
+      # writer records every hub against an API key that does not exist.
+      assert entry.actor_type == "system"
+      assert entry.actor_label == "worker:structural_links"
+    end
+
+    test "an unattended RETITLE is audited as the system worker too" do
+      tenant = fixture(:tenant)
+      for _ <- 1..4, do: article(tenant, ["book-retitled"])
+      assert {:ok, _} = StructuralLinks.harvest(tenant.id, min_siblings: 3)
+      [hub] = hubs(tenant.id)
+      assert hub.title == "Source: book retitled"
+
+      # On an established corpus the retitle is the write an unattended run makes MOST
+      # often — most hubs already exist — so attributing only the mint leaves the common
+      # case recorded against an API key that does not exist.
+      for _ <- 1..40, do: article(tenant, ["book-retitled", "derivable-name"])
+      assert {:ok, _} = StructuralLinks.harvest(tenant.id, min_siblings: 3)
+
+      entry =
+        from(e in AuditLog,
+          where: e.tenant_id == ^tenant.id,
+          where: e.action == "article.updated" and e.entity_id == ^hub.id
+        )
+        |> AdminRepo.one()
+
+      assert entry.actor_type == "system"
+      assert entry.actor_label == "worker:structural_links"
+    end
+
+    test "a DISAMBIGUATED mint is audited as the system worker too" do
+      tenant = fixture(:tenant)
+      for _ <- 1..5, do: article(tenant, ["doc-eee555", "colliding-collection"])
+      for _ <- 1..5, do: article(tenant, ["doc-fff666", "colliding-collection"])
+
+      assert {:ok, _} = StructuralLinks.harvest(tenant.id)
+
+      # The second source's hub goes through create_hub_disambiguated/4, a THIRD write
+      # site the attribution fix touched and no test covered.
+      disambiguated = Enum.find(hubs(tenant.id), &String.contains?(&1.title, "("))
+      assert disambiguated
+
+      entry =
+        from(e in AuditLog,
+          where: e.tenant_id == ^tenant.id,
+          where: e.action == "article.created" and e.entity_id == ^disambiguated.id
+        )
+        |> AdminRepo.one()
+
+      assert entry.actor_type == "system"
+      assert entry.actor_label == "worker:structural_links"
+    end
+
+    test "a title is never flipped back to one this hub has already left" do
+      tenant = fixture(:tenant)
+
+      # Two name-shaped tags on one source. `universal_tag/3` orders by count, and coverage
+      # is recomputed against the CURRENT member count, so which one clears the 0.9 floor
+      # flips as partially-tagged members arrive — measured A -> B -> A across three runs,
+      # each flip paying for an article.updated entry and a re-embedding, weekly, forever.
+      for _ <- 1..10, do: article(tenant, ["book-churn", "alpha-name", "beta-longer-name"])
+      assert {:ok, _} = StructuralLinks.harvest(tenant.id, min_siblings: 3)
+      [first] = hubs(tenant.id)
+
+      for _ <- 1..3, do: article(tenant, ["book-churn", "alpha-name"])
+      assert {:ok, _} = StructuralLinks.harvest(tenant.id, min_siblings: 3)
+      [second] = hubs(tenant.id)
+
+      for _ <- 1..30, do: article(tenant, ["book-churn", "beta-longer-name"])
+      assert {:ok, _} = StructuralLinks.harvest(tenant.id, min_siblings: 3)
+      [third] = hubs(tenant.id)
+
+      assert second.title != first.title, "the corpus really does flip which tag wins"
+      assert third.title == second.title, "and the hub must not flip back to the first"
+    end
+
     test "a universal tag that is not name-SHAPED is refused" do
       tenant = fixture(:tenant)
 
@@ -406,6 +518,83 @@ defmodule Loopctl.Knowledge.StructuralLinksTest do
       assert {:ok, report} = StructuralLinks.harvest(tenant.id, scan_batch: 2)
 
       assert report.articles_without_source == 4
+    end
+  end
+
+  describe "the report reconciles its own arithmetic (#725)" do
+    test "a clean run accounts for every source and gives each one its own hub" do
+      tenant = fixture(:tenant)
+      for _ <- 1..3, do: article(tenant, ["book-recon-a"])
+      for _ <- 1..3, do: article(tenant, ["book-recon-b"])
+
+      assert {:ok, report} = StructuralLinks.harvest(tenant.id, min_siblings: 3)
+
+      assert report.sources_qualifying == 2
+      assert report.distinct_hubs == 2
+      assert report.hubs_created == 2
+      assert report.reconciled
+    end
+
+    test "two sources sharing a hub that tags them BOTH is counted, not alarmed" do
+      tenant = fixture(:tenant)
+
+      # The live shape: 1,195 articles carry two source tags, so a `hub`-tagged one is
+      # adoptable by BOTH of its sources. That is ordinary and permanent, so pinning the
+      # tenant-wide verdict false on it would leave the weekly :error log always on — and
+      # an alarm that never clears cannot detect the merge it exists for.
+      _dual = article(tenant, ["book-dual-a", "book-dual-b", "hub"], %{title: "Two Sources"})
+      for _ <- 1..3, do: article(tenant, ["book-dual-a"])
+      for _ <- 1..3, do: article(tenant, ["book-dual-b"])
+
+      assert {:ok, report} = StructuralLinks.harvest(tenant.id, min_siblings: 3)
+
+      assert report.hubs_adopted == 2
+      assert report.distinct_hubs == 1
+      assert report.shared_hubs == 1
+
+      assert report.reconciled,
+             "both sources tag this hub, so its derived_from edges still mean what they " <>
+               "say — reporting it as corruption is how the #724 detector goes deaf"
+    end
+
+    test "a source landing on a hub that does not carry its tag IS unreconciled" do
+      tenant = fixture(:tenant)
+
+      # The #724 merge, reduced: a hub row already answers this source's idempotency_key
+      # but is tagged for a DIFFERENT source, so a `derived_from` edge to it means
+      # "derived from something else". Every other count in the report stays healthy.
+      other =
+        article(tenant, ["book-somebody-else", "hub"], %{
+          title: "Source: somebody else",
+          idempotency_key: "structural-hub-book-orphan",
+          metadata: %{"hub_kind" => "source", "source_key" => "book-somebody-else"}
+        })
+
+      # The orphan's members carry a name-shaped universal tag, so the retitle this run
+      # would attempt is a real NAME rather than a digest — `digest_downgrade?/2` does not
+      # block it, and only the attribution check stands between the other source's title
+      # and being overwritten.
+      for _ <- 1..3, do: article(tenant, ["book-orphan", "neo4j-graph-databases"])
+
+      assert {:ok, report} = StructuralLinks.harvest(tenant.id, min_siblings: 3)
+
+      assert report.hubs_resolved == 1
+      assert report.hubs_unattributed == 1
+      assert report.shared_hubs == 0
+
+      refute report.reconciled,
+             "attribution is the whole verdict — delete count_attribution/3 and this is " <>
+               "the test that must fail"
+
+      # Detecting the merge is only half of it. Writing the edges anyway and reporting
+      # `reconciled: false` records the corruption instead of preventing it: thousands of
+      # members per run told they derive from a source they do not.
+      assert report.edges_created == 0
+      assert links(tenant.id, :derived_from) == []
+
+      # And the other source's published article keeps its own title — a rename here
+      # destroys it, re-embeds it, and repeats every week.
+      assert AdminRepo.get!(Article, other.id).title == "Source: somebody else"
     end
   end
 

@@ -22,6 +22,7 @@ defmodule Loopctl.DataCase do
   alias Loopctl.Embeddings.LegacyRetirement
   alias Loopctl.Embeddings.SystemConfigReadPath
   alias Loopctl.Knowledge.StreamingExport.NoopBodyProbe
+  alias Loopctl.Knowledge.StructuralLinks
   alias Loopctl.Oban.FairShare
   alias Loopctl.Telemetry.ScaleAlerts
   alias Loopctl.Telemetry.ScaleMetrics
@@ -177,6 +178,13 @@ defmodule Loopctl.DataCase do
 
     Mox.stub(Loopctl.MockLegacyRetirement, :record, &LegacyRetirement.record/2)
     Mox.stub(Loopctl.MockLegacyRetirement, :evaluate, &LegacyRetirement.evaluate/2)
+
+    # #725: default to the REAL harvest, so the StructuralLinksWorker tests exercise the
+    # genuine hub/edge writes in their own sandboxed transaction. Only the shed test
+    # overrides this, with `{:error, :heavy_read_overloaded}` — a shed the test pool
+    # cannot produce, and the branch whose absence would crash the worker under exactly
+    # the load the shedder exists to relieve.
+    Mox.stub(Loopctl.MockStructuralLinksHarvester, :harvest, &StructuralLinks.harvest/2)
 
     # US-27.16: default to PRODUCTION behaviour — the streaming-export producer observes
     # (and therefore retains) nothing. Only the bounded-memory scale gate overrides this,

@@ -23,6 +23,15 @@ Mox.defmock(Loopctl.MockCategoryClassifier, for: Loopctl.Knowledge.ClassifierBeh
 Mox.defmock(Loopctl.MockWebAuthn, for: Loopctl.WebAuthn.Behaviour)
 Mox.defmock(Loopctl.MockSecrets, for: Loopctl.Secrets.Behaviour)
 Mox.defmock(Loopctl.MockSuggestLinks, for: Loopctl.Knowledge.SuggestLinksBehaviour)
+
+# #725: the StructuralLinksWorker's shed branch. `harvest/2` answers
+# `{:error, :heavy_read_overloaded}` only when the heavy-read gate sheds the corpus scan,
+# which a sandboxed suite never does — so the worker's snooze is only testable through
+# this seam. DataCase stubs it to the real harvester, so every other test is unaffected.
+Mox.defmock(Loopctl.MockStructuralLinksHarvester,
+  for: Loopctl.Knowledge.StructuralLinksBehaviour
+)
+
 Mox.defmock(Loopctl.MockProposalAssessor, for: Loopctl.Knowledge.ProposalAssessorBehaviour)
 Mox.defmock(Loopctl.MockMergeSynthesizer, for: Loopctl.Knowledge.MergeSynthesizerBehaviour)
 

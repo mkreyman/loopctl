@@ -57,6 +57,8 @@ defmodule Loopctl.Knowledge.StructuralLinks do
     `tenant_id` is the only isolation and it is set programmatically, never cast.
   """
 
+  @behaviour Loopctl.Knowledge.StructuralLinksBehaviour
+
   import Ecto.Query
 
   alias Ecto.Adapters.SQL
@@ -71,6 +73,13 @@ defmodule Loopctl.Knowledge.StructuralLinks do
   @source_tag_prefixes ~w(book- doc- repo- yt-)
 
   @default_min_siblings 3
+
+  # These writes are made by a scheduled worker holding no key, so they are attributed to
+  # the SYSTEM actor. `Knowledge` otherwise defaults `actor_type` to "api_key" with a nil
+  # id, which records every unattended hub mint and retitle against an API key that does
+  # not exist — in a product whose premise is attributable custody. Same shape as
+  # `KnowledgeMocWorker`.
+  @actor [actor_type: "system", actor_label: "worker:structural_links"]
 
   # A tag must cover at least this fraction of a source's members to name its hub. High on
   # purpose: the point is to abstain rather than to guess (see hub_title/3).
@@ -87,6 +96,10 @@ defmodule Loopctl.Knowledge.StructuralLinks do
   # article is still visited, just never all at once. See collect_sources/2.
   @scan_batch 2000
 
+  # Rows per `insert_all`. ArticleLink writes 7 fields, so Postgres's 65,535-parameter
+  # wire ceiling is reached at 9,363 rows — see write_edges/4.
+  @edge_insert_chunk 2000
+
   @doc """
   Harvests source hubs and their `derived_from` star edges for one tenant.
 
@@ -95,7 +108,12 @@ defmodule Loopctl.Knowledge.StructuralLinks do
   index on `(tenant_id, source_article_id, target_article_id, relationship_type)`.
 
   Returns `{:ok, report}` or `{:error, :heavy_read_overloaded}`.
+
+  The report ASSERTS ITS OWN ATTRIBUTION: `reconciled` is true only when every source
+  landed on a hub carrying that source's own tag. Two sources legitimately sharing a hub
+  that tags them both is counted as `shared_hubs`, not as a failure. See `reconcile/1`.
   """
+  @impl Loopctl.Knowledge.StructuralLinksBehaviour
   @spec harvest(binary(), keyword()) ::
           {:ok, map()} | {:error, :heavy_read_overloaded}
   def harvest(tenant_id, opts \\ []) when is_binary(tenant_id) do
@@ -111,15 +129,33 @@ defmodule Loopctl.Knowledge.StructuralLinks do
           |> Enum.sort_by(fn {source, _ids} -> source end)
           |> Enum.split_with(fn {_source, ids} -> length(ids) >= floor end)
 
-        report =
-          Enum.reduce(qualifying, blank_report(skipped, without_source, floor), fn {source, ids},
-                                                                                   acc ->
-            harvest_one_source(tenant_id, source, ids, acc)
-          end)
+        blank = blank_report(skipped, without_source, floor, length(qualifying))
 
-        log_report(tenant_id, report)
-        {:ok, report}
+        case harvest_sources(tenant_id, qualifying, blank) do
+          {:error, :heavy_read_overloaded} = shed ->
+            shed
+
+          {:ok, acc} ->
+            report = reconcile(acc)
+            log_report(tenant_id, report)
+            {:ok, report}
+        end
     end
+  end
+
+  # A shed HUB LOOKUP halts the whole tenant, exactly as a shed scan page does. The two
+  # per-source lookups run on HeavyRead too, and folding their shed into `hub_failures`
+  # made a load-shed run indistinguishable from a clean one: `harvest/2` returned
+  # `{:ok, report}` with `reconciled: true`, the worker wrote a green audit entry, and the
+  # shed sources got no hub and no edges until next Sunday. Halting restores the worker's
+  # documented contract - "the whole tenant retries later".
+  defp harvest_sources(tenant_id, qualifying, blank) do
+    Enum.reduce_while(qualifying, {:ok, blank}, fn {source, ids}, {:ok, acc} ->
+      case harvest_one_source(tenant_id, source, ids, acc) do
+        {:error, :heavy_read_overloaded} = shed -> {:halt, shed}
+        acc -> {:cont, {:ok, acc}}
+      end
+    end)
   end
 
   # ------------------------------------------------------------------
@@ -233,20 +269,43 @@ defmodule Loopctl.Knowledge.StructuralLinks do
 
   defp harvest_one_source(tenant_id, source, member_ids, acc) do
     case resolve_or_create_hub(tenant_id, source, length(member_ids)) do
-      {:ok, hub, :created} ->
-        write_edges(tenant_id, hub, member_ids, %{acc | hubs_created: acc.hubs_created + 1})
+      {:ok, hub, outcome} when outcome in [:created, :resolved, :adopted] ->
+        # Record WHICH hub this source landed on, and whether that hub carries the
+        # source's own tag. The second is the reconciliation — see reconcile/1.
+        acc = %{acc | hub_ids: MapSet.put(acc.hub_ids, hub.id)}
+        counted = acc |> count_attribution(source, hub) |> count_outcome(outcome)
 
-      {:ok, hub, :resolved} ->
-        write_edges(tenant_id, hub, member_ids, %{acc | hubs_resolved: acc.hubs_resolved + 1})
+        # ...and an unattributed hub gets NO EDGES. Reporting the #724 merge while still
+        # writing one `derived_from` edge per member to another source's hub records the
+        # corruption instead of preventing it: an agent traversing those edges is told the
+        # article came from a source it did not come from.
+        if attributed?(source, hub),
+          do: write_edges(tenant_id, hub, member_ids, counted),
+          else: counted
 
-      {:ok, hub, :adopted} ->
-        write_edges(tenant_id, hub, member_ids, %{acc | hubs_adopted: acc.hubs_adopted + 1})
+      {:error, :heavy_read_overloaded} = shed ->
+        shed
 
       {:error, reason} ->
         Logger.warning("structural_links: hub failed for #{source}: #{inspect(reason)}")
         %{acc | hub_failures: acc.hub_failures + 1}
     end
   end
+
+  # A hub that does not carry the source's OWN tag is not that source's hub. Adoption and
+  # creation both guarantee the tag; only a resolve handing back somebody ELSE's row can
+  # break it, which is precisely the #724 merge. See reconcile/1.
+  defp count_attribution(acc, source, hub) do
+    if attributed?(source, hub),
+      do: acc,
+      else: %{acc | hubs_unattributed: acc.hubs_unattributed + 1}
+  end
+
+  defp attributed?(source, hub), do: source in (hub.tags || [])
+
+  defp count_outcome(acc, :created), do: %{acc | hubs_created: acc.hubs_created + 1}
+  defp count_outcome(acc, :resolved), do: %{acc | hubs_resolved: acc.hubs_resolved + 1}
+  defp count_outcome(acc, :adopted), do: %{acc | hubs_adopted: acc.hubs_adopted + 1}
 
   # Three steps, in this order, and the middle one is the point.
   #
@@ -267,31 +326,54 @@ defmodule Loopctl.Knowledge.StructuralLinks do
   defp resolve_or_create_hub(tenant_id, source, member_count) do
     key = hub_idempotency_key(source)
 
-    cond do
-      hub = minted_hub(tenant_id, key) ->
-        {:ok, maybe_retitle(tenant_id, hub, source, member_count), :resolved}
+    case minted_hub(tenant_id, key) do
+      {:error, _reason} = shed -> shed
+      nil -> adopt_or_create_hub(tenant_id, source, key, member_count)
+      hub -> {:ok, maybe_retitle(tenant_id, hub, source, member_count), :resolved}
+    end
+  end
 
-      hub = existing_source_hub(tenant_id, source) ->
-        {:ok, hub, :adopted}
-
-      true ->
-        create_hub(tenant_id, source, key, member_count)
+  defp adopt_or_create_hub(tenant_id, source, key, member_count) do
+    case existing_source_hub(tenant_id, source) do
+      {:error, _reason} = shed -> shed
+      nil -> create_hub(tenant_id, source, key, member_count)
+      hub -> {:ok, hub, :adopted}
     end
   end
 
   # A hub minted before a name was derivable keeps its digest title forever otherwise.
   # Retitle ONLY when the stored title is still exactly the digest form we generated: that
   # way a name a human (or a later, better rule) put there is never overwritten by this.
+  # The cheap predicates come FIRST: `hub_title/3` runs a full-corpus `unnest(tags)`
+  # aggregate, and computing `desired` before consulting them paid for it on every
+  # resolved hub of every weekly run, including the ones that were never ours to touch.
   defp maybe_retitle(tenant_id, hub, source, member_count) do
-    desired = "Source: " <> hub_title(tenant_id, source, member_count)
+    if retitleable?(hub, source),
+      do: retitle(tenant_id, hub, source, member_count),
+      else: hub
+  end
 
-    if ours_to_retitle?(hub, source) and hub.title != desired do
+  # A hub that does not carry this source's own tag is NOT this source's hub — the #724
+  # shape, where a row answering our idempotency_key belongs to somebody else. Renaming it
+  # to our name destroys another source's title, re-embeds it, and repeats every week.
+  defp retitleable?(hub, source), do: attributed?(source, hub) and ours_to_retitle?(hub, source)
+
+  defp retitle(tenant_id, hub, source, member_count) do
+    desired = "Source: " <> hub_title(tenant_id, source, member_count)
+    metadata = hub.metadata || %{}
+    retired = Map.get(metadata, "hub_titles_retired", [])
+
+    if hub.title != desired and not digest_downgrade?(desired, source) and
+         desired not in retired do
       attrs = %{
         title: desired,
-        metadata: Map.put(hub.metadata || %{}, "hub_title_generated", desired)
+        metadata:
+          metadata
+          |> Map.put("hub_title_generated", desired)
+          |> Map.put("hub_titles_retired", Enum.uniq([hub.title | retired]))
       }
 
-      case Knowledge.update_article(tenant_id, hub.id, attrs) do
+      case Knowledge.update_article(tenant_id, hub.id, attrs, @actor) do
         {:ok, updated} -> updated
         _ -> hub
       end
@@ -299,6 +381,22 @@ defmodule Loopctl.Knowledge.StructuralLinks do
       hub
     end
   end
+
+  # Naming is MONOTONIC, and it has to be monotonic in BOTH directions a title can move.
+  #
+  # `digest_downgrade?/2` blocks name -> digest: `universal_tag/3` recomputes coverage
+  # against the CURRENT member count, so a source that grows by a handful of untagged
+  # articles drops under the 0.9 floor and the name it earned reverts to
+  # "Source: doc a8d8cf71c5df".
+  #
+  # The retired-title ledger blocks name -> NAME -> the same name again, which the digest
+  # rule never saw. `universal_tag/3` orders by `count(*) DESC`, so with two name-shaped
+  # tags on one source, which one clears the floor flips as untagged and partially-tagged
+  # members arrive: measured A -> B -> A across three runs. Correcting a bad generated
+  # name is still allowed — moving FORWARD to a title we have not used before — but a
+  # title this hub has already left is never returned to, so the oscillation terminates.
+  # Every flip it prevents is an article.updated entry and a re-embedding not paid for.
+  defp digest_downgrade?(desired, source), do: desired == "Source: " <> digest_title(source)
 
   # A stored title is ours to change only while it is exactly the one we last generated.
   # The moment anyone edits it, it stops being ours and we leave it alone forever.
@@ -314,17 +412,26 @@ defmodule Loopctl.Knowledge.StructuralLinks do
       hub.title == "Source: " <> digest_title(source) or
         String.starts_with?(hub.title, "Source: ")
 
+  # These are READS, so they belong on HeavyRead and not on AdminRepo's 3-connection pool,
+  # which `ValidateWitnessHeader` needs on every authenticated request. One lookup per
+  # qualifying source (313 on the live corpus), three tenant jobs at a time, would
+  # otherwise queue the authenticated API behind the Sunday harvest. A shed lookup is
+  # PROPAGATED, never coerced to nil: nil means "no hub exists" and would mint a rival
+  # beside one that does.
   defp minted_hub(tenant_id, key) do
-    AdminRepo.one(
+    HeavyRead.one(
+      tenant_id,
       from(a in Article,
         where: a.tenant_id == ^tenant_id and a.idempotency_key == ^key,
         select: a
-      )
+      ),
+      on_overload: :tag
     )
   end
 
   defp existing_source_hub(tenant_id, source) do
-    AdminRepo.one(
+    HeavyRead.one(
+      tenant_id,
       from(a in Article,
         where: a.tenant_id == ^tenant_id,
         where: a.status == :published,
@@ -333,13 +440,18 @@ defmodule Loopctl.Knowledge.StructuralLinks do
         order_by: [asc: a.inserted_at, asc: a.id],
         limit: 1,
         select: a
-      )
+      ),
+      on_overload: :tag
     )
   end
 
   defp create_hub(tenant_id, source, key, member_count) do
+    # ONE naming query, not two: hub_title/3 runs a per-source `unnest(tags)` aggregate
+    # and it was being paid twice per minted hub, for the title and for the marker below.
+    title = "Source: #{hub_title(tenant_id, source, member_count)}"
+
     attrs = %{
-      title: "Source: #{hub_title(tenant_id, source, member_count)}",
+      title: title,
       # Never invent a source's human name. A hub named by its digest is still a
       # navigational win over no hub; a hub named by a hallucinated book title is worse
       # than nothing, because it reads as a fact.
@@ -360,7 +472,7 @@ defmodule Loopctl.Knowledge.StructuralLinks do
       metadata: %{
         "hub_kind" => "source",
         "source_key" => source,
-        "hub_title_generated" => "Source: #{hub_title(tenant_id, source, member_count)}"
+        "hub_title_generated" => title
       }
     }
 
@@ -370,9 +482,17 @@ defmodule Loopctl.Knowledge.StructuralLinks do
     # would stage every one after the first as a draft and the harvest would silently
     # produce unpublished hubs. Using the ungated path is the deliberate choice; do not
     # "improve" this by routing it through propose_article.
-    case Knowledge.create_article(tenant_id, attrs) do
+    case Knowledge.create_article(tenant_id, attrs, @actor) do
       {:ok, %Article{} = hub} ->
         {:ok, hub, :created}
+
+      # `create_article/3`'s THIRD success shape: our `idempotency_key` already exists, so
+      # this IS our hub, returned unchanged. It is reachable whenever `minted_hub/2` missed
+      # it — a lagging read replica (`REPLICA_DATABASE_URL`), or two harvests overlapping
+      # outside Oban's 300s unique window. Mapping it to `{:error, ...}` logged "hub failed"
+      # and wrote zero edges for a source whose hub was sitting right there.
+      {:ok, :deduplicated, %Article{} = hub} ->
+        {:ok, hub, :resolved}
 
       # A title collision is NOT this source's hub. It is a DIFFERENT source that happened
       # to compute the same name, and returning it here merged them: measured on the live
@@ -390,9 +510,6 @@ defmodule Loopctl.Knowledge.StructuralLinks do
 
       {:error, reason} ->
         {:error, reason}
-
-      other ->
-        {:error, other}
     end
   end
 
@@ -417,10 +534,14 @@ defmodule Loopctl.Knowledge.StructuralLinks do
       }
     }
 
-    case Knowledge.create_article(tenant_id, attrs) do
+    # Same three shapes as `create_hub/4`. The disambiguated title carries the source's own
+    # unique digest, so a collision on it — by key or by title — is this source's own hub,
+    # not another's; `attributed?/2` still re-checks the tag before any edge is written.
+    case Knowledge.create_article(tenant_id, attrs, @actor) do
       {:ok, %Article{} = hub} -> {:ok, hub, :created}
+      {:ok, :deduplicated, %Article{} = hub} -> {:ok, hub, :resolved}
+      {:error, :duplicate_title, %Article{} = hub} -> {:ok, hub, :resolved}
       {:error, reason} -> {:error, reason}
-      other -> {:error, other}
     end
   end
 
@@ -446,16 +567,27 @@ defmodule Loopctl.Knowledge.StructuralLinks do
         }
       )
 
-    {inserted, _} =
-      AdminRepo.insert_all(ArticleLink, rows,
-        on_conflict: :nothing,
-        conflict_target: [
-          :tenant_id,
-          :source_article_id,
-          :target_article_id,
-          :relationship_type
-        ]
-      )
+    # CHUNKED. Seven bind parameters per row against Postgres's hard 65,535-parameter wire
+    # ceiling puts the raise at 9,363 members, and the live corpus already carries a
+    # 6,471-member source. Unattended (#725) that raise is a discarded Oban job and a
+    # tenant that silently stops getting hubs.
+    inserted =
+      rows
+      |> Enum.chunk_every(@edge_insert_chunk)
+      |> Enum.reduce(0, fn chunk, total ->
+        {count, _} =
+          AdminRepo.insert_all(ArticleLink, chunk,
+            on_conflict: :nothing,
+            conflict_target: [
+              :tenant_id,
+              :source_article_id,
+              :target_article_id,
+              :relationship_type
+            ]
+          )
+
+        total + count
+      end)
 
     %{acc | edges_created: acc.edges_created + inserted}
   end
@@ -548,7 +680,7 @@ defmodule Loopctl.Knowledge.StructuralLinks do
 
     with {:ok, tid} <- Ecto.UUID.dump(tenant_id),
          %{rows: [[tag]]} <-
-           SQL.query!(AdminRepo, sql, [tid, source, @hub_name_stoplist, threshold]) do
+           naming_scan(tenant_id, sql, [tid, source, @hub_name_stoplist, threshold]) do
       tag
     else
       _ -> nil
@@ -556,6 +688,22 @@ defmodule Loopctl.Knowledge.StructuralLinks do
   end
 
   defp universal_tag(_tenant_id, _source, _member_count), do: nil
+
+  # This is the HEAVIEST query in the harvest — a full `unnest(tags)` aggregate over the
+  # tenant's published corpus, once per qualifying source (313 on the live corpus, three
+  # tenant jobs at a time). It belongs on the heavy-read pool for the same reason the scan
+  # and the hub lookups do: AdminRepo's 3 connections are what `ValidateWitnessHeader`
+  # needs on every authenticated request, so running it there queues the API behind the
+  # Sunday harvest. Gated through `HeavyRead.with_slot/3` so it is counted against the
+  # tenant's in-flight budget rather than slipping past it as raw SQL.
+  #
+  # A shed ABSTAINS to the digest rather than propagating: a name is an improvement, never
+  # a correctness condition, and the ledger in `retitle/4` lets the next run upgrade it.
+  defp naming_scan(tenant_id, sql, params) do
+    HeavyRead.with_slot(tenant_id, [on_overload: :tag], fn ->
+      SQL.query!(HeavyRead.repo_for(nil), sql, params)
+    end)
+  end
 
   defp hub_body(source) do
     """
@@ -572,17 +720,59 @@ defmodule Loopctl.Knowledge.StructuralLinks do
     Application.get_env(:loopctl, :structural_hub_min_siblings, @default_min_siblings)
   end
 
-  defp blank_report(skipped, without_source, floor) do
+  defp blank_report(skipped, without_source, floor, qualifying) do
     %{
       hubs_created: 0,
       hubs_resolved: 0,
       hubs_adopted: 0,
       hub_failures: 0,
+      hubs_unattributed: 0,
       edges_created: 0,
       sources_below_floor: length(skipped),
       articles_without_source: without_source,
-      min_siblings: floor
+      min_siblings: floor,
+      sources_qualifying: qualifying,
+      # Bounded by the qualifying source count (313 at floor 25 on the live corpus,
+      # 3,713 at floor 3) — a set of UUIDs at that scale is nothing, and unlike the
+      # scan it never holds an article row.
+      hub_ids: MapSet.new()
     }
+  end
+
+  # The run asserts its own arithmetic (#725), and the assertion that matters is
+  # ATTRIBUTION: every source must land on a hub carrying that source's OWN tag.
+  #
+  # That is the #724 merge in one predicate. `duplicate_title` was once mapped to
+  # "resolved", so 85 distinct sources with 6,471 members between them all landed on
+  # "Source: synology netbackup" — a node tagged for exactly one of them — at which point
+  # a `derived_from` edge means "derived from something that shared a name". Every count
+  # in the report looked healthy throughout, which is why this must be computed.
+  #
+  # What is NOT a defect and must not be reported as one: two sources SHARING a hub that
+  # tags them both. An article carrying two source tags and the `hub` tag is legitimately
+  # adoptable by both (1,195 dual-tagged articles measured on the live corpus), so a
+  # tenant-wide `distinct_hubs < linked` verdict would sit permanently false on a healthy
+  # corpus and the weekly :error log would be pure noise — an alarm that is always on
+  # detects nothing. Sharing is counted as `shared_hubs` and kept OUT of the verdict.
+  #
+  # `created + resolved + adopted + failed == sources_qualifying` is deliberately not
+  # checked: harvest_one_source/4 increments exactly one counter per qualifying source, so
+  # it holds by construction and could never fail.
+  #
+  # A mismatch is REPORTED, never raised — but it is also ACTED ON before it gets here:
+  # `harvest_one_source/4` computes attribution BEFORE the write and skips the edges for an
+  # unattributed hub, so the count below records sources that were REFUSED rather than
+  # sources that were corrupted. `reconciled: false` rides in the report, the log line and
+  # the worker's audit entry; a crash here would only lose the finding.
+  defp reconcile(report) do
+    linked = report.hubs_created + report.hubs_resolved + report.hubs_adopted
+    distinct = MapSet.size(report.hub_ids)
+
+    report
+    |> Map.delete(:hub_ids)
+    |> Map.put(:distinct_hubs, distinct)
+    |> Map.put(:shared_hubs, linked - distinct)
+    |> Map.put(:reconciled, report.hubs_unattributed == 0)
   end
 
   # A run that creates nothing says so, rather than exiting silently (AC-42.1.9): "no new
@@ -594,7 +784,21 @@ defmodule Loopctl.Knowledge.StructuralLinks do
         "hubs_resolved=#{report.hubs_resolved} edges_created=#{report.edges_created} " <>
         "sources_below_floor=#{report.sources_below_floor} " <>
         "articles_without_source=#{report.articles_without_source} " <>
-        "hub_failures=#{report.hub_failures}"
+        "hub_failures=#{report.hub_failures} " <>
+        "sources_qualifying=#{report.sources_qualifying} " <>
+        "distinct_hubs=#{report.distinct_hubs} shared_hubs=#{report.shared_hubs} " <>
+        "hubs_unattributed=#{report.hubs_unattributed} reconciled=#{report.reconciled}"
     )
+
+    unless report.reconciled do
+      Logger.error(
+        "structural_links RECONCILIATION FAILED: tenant=#{tenant_id} " <>
+          "hubs_unattributed=#{report.hubs_unattributed} of " <>
+          "#{report.sources_qualifying} qualifying sources. A source landed on a hub that " <>
+          "does not carry that source's tag, so its derived_from edges no longer mean " <>
+          "'derived from this source' — inspect before trusting this run's edges. " <>
+          "(shared_hubs=#{report.shared_hubs} is the benign dual-tagged shape, not this.)"
+      )
+    end
   end
 end

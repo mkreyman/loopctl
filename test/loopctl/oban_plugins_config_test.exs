@@ -153,6 +153,58 @@ defmodule Loopctl.ObanPluginsConfigTest do
     end
   end
 
+  describe "StructuralLinksWorker crontab entry" do
+    setup do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+
+      {Oban.Plugins.Cron, cron_opts} =
+        Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      entry =
+        Enum.find(cron_opts[:crontab], fn
+          {_schedule, Loopctl.Workers.StructuralLinksWorker} -> true
+          {_schedule, Loopctl.Workers.StructuralLinksWorker, _opts} -> true
+          _ -> false
+        end)
+
+      %{entry: entry, crontab: cron_opts[:crontab]}
+    end
+
+    test "the StructuralLinksWorker entry exists in the crontab", %{entry: entry} do
+      assert entry,
+             "expected a StructuralLinksWorker crontab entry — US-42.1 shipped harvest/2 " <>
+               "with nothing running it on a cadence, and an unscheduled harvester leaves " <>
+               "every source created after the one manual backfill without a hub"
+    end
+
+    test "it runs weekly and fans out across all tenants", %{entry: entry} do
+      assert elem(entry, 0) == "0 6 * * 0"
+      assert {_schedule, _worker, opts} = entry
+      assert opts[:args] == %{"mode" => "all_tenants"}
+    end
+
+    test "it shares a minute with no other weekly :knowledge pass", %{
+      entry: entry,
+      crontab: crontab
+    } do
+      # KnowledgeMoc (05:00 Sun) and DraftDuplicateSweep (05:50 Sun) target the same
+      # shared lane. Each of the three is scheduled at its own minute so a wide fan-out
+      # is never competing with another fan-out for :knowledge queue slots.
+      others =
+        crontab
+        |> Enum.filter(fn tuple ->
+          elem(tuple, 1) in [
+            Loopctl.Workers.KnowledgeMocWorker,
+            Loopctl.Workers.DraftDuplicateSweepWorker
+          ]
+        end)
+        |> Enum.map(&elem(&1, 0))
+
+      assert length(others) == 2, "expected both weekly :knowledge fan-outs to compare against"
+      refute elem(entry, 0) in others
+    end
+  end
+
   describe "#249: inert KB crons are PARKED by default" do
     setup do
       plugins = Application.get_env(:loopctl, Oban)[:plugins]

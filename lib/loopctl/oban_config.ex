@@ -618,7 +618,17 @@ defmodule Loopctl.ObanConfig do
            # for the same :knowledge lane. Keep in sync with the crontab assertion in
            # oban_plugins_config_test.exs.
            {"50 5 * * 0", Loopctl.Workers.DraftDuplicateSweepWorker,
-            args: %{"mode" => "all_tenants"}}
+            args: %{"mode" => "all_tenants"}},
+           # US-42.1 / #725: weekly harvest of `derived_from` star edges from the
+           # provenance the corpus already carries. Additive and idempotent — a run over
+           # an unchanged corpus writes nothing — so the weekly cadence is a refresh, not
+           # an accumulation. 06:00 Sunday puts it AFTER the 05:00 KnowledgeMoc fan-out
+           # and the 05:50 draft sweep rather than contending with either for the
+           # :knowledge lane, and means a hub minted this week is indexed by next week's
+           # MOC rather than half-way through one. The unattended sibling floor is 25 (a
+           # measured trade — see the worker's moduledoc), NOT the library default of 3.
+           # Keep in sync with the crontab assertion in oban_plugins_config_test.exs.
+           {"0 6 * * 0", Loopctl.Workers.StructuralLinksWorker, args: %{"mode" => "all_tenants"}}
          ])},
       # Rescue jobs orphaned in :executing when a node dies mid-run (e.g. a deploy).
       # Without Lifeline these rows stay `executing` forever — 110 such orphans (from
