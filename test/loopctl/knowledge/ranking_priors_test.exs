@@ -387,7 +387,17 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
     end
 
     test "the removed functions are gone, not merely unused" do
-      refute function_exported?(RankingPriors, :provenance_authority, 1),
+      # NEVER use function_exported?/3 here: it answers false for an UNLOADED module, so it
+      # passes vacuously whenever this test runs before anything else touches RankingPriors
+      # (a line-filtered run, or an unlucky within-module shuffle). Load first, read the
+      # export list, and keep the positive control so the guard cannot go silently inert.
+      Code.ensure_loaded!(RankingPriors)
+      exports = RankingPriors.__info__(:functions)
+
+      assert {:authority_factor, 4} in exports,
+             "positive control failed — this guard is not reading a real export list"
+
+      refute {:provenance_authority, 1} in exports,
              "provenance_authority/1 is back — the prior it computes is the one that was removed"
     end
   end

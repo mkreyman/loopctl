@@ -43,8 +43,9 @@ defmodule Loopctl.Knowledge.RankingPriors do
   Post-#470 the fused `:final_score` is `Σ_lane weight/(k + rank)`. Two docs that each top
   a single lane tie EXACTLY; a doc with cross-lane consensus scores ~2x a single-lane hit.
   The authority factor clamps to `[0.9, 1.1]`, but the band is ONE-SIDED in practice: every
-  category/source weight is >= 0 and `strength` >= 0, so `1 + strength*(cat+src)` is always
-  >= 1.0 and the 0.9 floor is unreachable — the EFFECTIVE range is `[1.0, 1.1]`. Authority
+  category weight is >= 0 and `strength` >= 0, so `1 + strength*cat` is always >= 1.0 and
+  the 0.9 floor is unreachable — the EFFECTIVE range is `[1.0, 1 + strength*max_cat]`,
+  which at the default strength 0.05 tops out at 1.05, short of the 1.1 ceiling. Authority
   therefore only ever BOOSTS a higher-authority doc; it never demotes a low-authority raw
   note below neutral (that demotion is the SEPARATE `demotion_factor/1` job). Even so it can
   flip an exact/near tie but can NEVER flip a 2x-stronger consensus winner — precisely the
