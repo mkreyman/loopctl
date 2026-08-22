@@ -644,6 +644,28 @@ async function channelClaim({ project_id, ref, lease_seconds }) {
   return toContent(result);
 }
 
+async function channelClaims({ project_id, ref, limit }) {
+  // Repo Coordination Bus (Epic 40, US-40.B1 / issue #707): the NON-DESTRUCTIVE
+  // claim-state read on the AGENT key. Read this instead of probing by claiming —
+  // channel_claim is idempotent for the owning AGENT, so on a fleet whose sessions
+  // share one agent_id a probe returns a PEER SESSION's claim as if it were yours,
+  // and the release that tidies the probe up deletes it.
+  const params = new URLSearchParams();
+  if (project_id) params.set("project_id", project_id);
+  // Send ref whenever it was PASSED, even blank: the server refuses a malformed ref
+  // with a 422, and dropping it here would silently widen a point lookup into a
+  // whole-channel list the caller then reads as "my ref is taken" (#707).
+  if (ref !== undefined && ref !== null) params.set("ref", ref);
+  if (limit) params.set("limit", limit);
+  const result = await apiCall(
+    "GET",
+    `/api/v1/channel/claims?${params}`,
+    null,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
 async function channelRelease({ project_id, ref }) {
   // Repo Coordination Bus (Epic 40, US-40.B1): RELEASE (delete) your OWN claim on
   // ref so it reopens for the next racer. Owner-scoped: a non-owner / cross-tenant /
@@ -3398,7 +3420,7 @@ const TOOLS = [
   {
     name: "channel_claim",
     description:
-      "Claim a handoff ref for EXACTLY ONE agent on a repo coordination channel (Epic 40 Repo Coordination Bus, US-40.B1), on the agent key. Use this to coordinate an out-of-band unit of work (e.g. 'handoff:repo#812') among several agents racing on the same repo, so only ONE picks it up. INSERT-to-claim: the first agent to claim (tenant, project, ref) wins and gets the claim. Re-claiming YOUR OWN still-active ref is idempotent — it returns your existing claim, so a lost response / timeout is safe to retry with the same ref. A 409 already_claimed means the ref is TAKEN — either another agent owns it, or you already completed it — so do NOT retry the same ref, move on to other work. A channel IS a project_id; the claim is tenant-isolated and project-scoped by membership (you must be a writable member of the project). tenant/agent are server-stamped from your verified key. Mark the work finished with channel_done, or give it up for another agent with channel_release.",
+      "Claim a handoff ref for EXACTLY ONE agent on a repo coordination channel (Epic 40 Repo Coordination Bus, US-40.B1), on the agent key. Use this to coordinate an out-of-band unit of work (e.g. 'handoff:repo#812') among several agents racing on the same repo, so only ONE picks it up. INSERT-to-claim: the first agent to claim (tenant, project, ref) wins and gets the claim. Re-claiming YOUR OWN still-active ref is idempotent — it returns your existing claim, so a lost response / timeout is safe to retry with the same ref. A 409 tells you WHICH of four situations you hit, in its error.code — do not treat every 409 the same. 409 already_claimed means a peer holds a live claim, or you already completed this one: the ref is taken, so move on to other work. 409 claim_lease_expired means the lease died without completion and the row is only awaiting the sweeper — nobody is working it, so retry THIS ref shortly rather than moving on. 409 ref_superseded means the ref's instructions were retired by a successor post: nobody holds it, claim the successor instead. 409 claim_budget_exhausted is a limit on YOU, not a statement about the ref — finish or release one of your open claims and retry. channel_claims shows the same distinction on each row via its expired and done flags. A channel IS a project_id; the claim is tenant-isolated and project-scoped by membership (you must be a writable member of the project). tenant/agent are server-stamped from your verified key. Mark the work finished with channel_done, or give it up for another agent with channel_release. NEVER USE THIS AS A PROBE: because re-claiming your own active ref is idempotent, and because a fleet's sessions typically all authenticate as ONE agent_id, claiming just to find out whether a ref is free returns a PEER SESSION's claim as though it were yours — and the channel_release you then call to tidy up DELETES it, reopening a handoff someone is actively working (issue #707). Call channel_claims to read claim state; it writes nothing and answers the same question.",
     inputSchema: {
       type: "object",
       properties: {
@@ -3423,7 +3445,7 @@ const TOOLS = [
   {
     name: "channel_release",
     description:
-      "Release (give up) YOUR OWN claim on a handoff ref on a repo coordination channel (Epic 40 Repo Coordination Bus, US-40.B1), on the agent key — deletes the claim so the ref reopens and another agent can claim it. Owner-scoped: you can only release a claim you made; a claim you do not own, or one in another tenant, or a nonexistent one, returns a byte-identical 404 (no existence oracle).",
+      "Release (give up) YOUR OWN claim on a handoff ref on a repo coordination channel (Epic 40 Repo Coordination Bus, US-40.B1), on the agent key — deletes the claim so the ref reopens and another agent can claim it. Owner-scoped: you can only release a claim you made; a claim you do not own, or one in another tenant, or a nonexistent one, returns a byte-identical 404 (no existence oracle). SCOPE WARNING: ownership is (tenant, project, AGENT, ref) — there is NO session dimension, so two sessions sharing one agent key are not isolated and either can release the other's claim, indistinguishably to the server. Release only a ref YOU claimed in THIS session, and read channel_claims rather than claiming to find out what is held. A claim whose session died is protected by the abandoned-lease sweep, not by this call.",
     inputSchema: {
       type: "object",
       properties: {
@@ -3490,6 +3512,27 @@ const TOOLS = [
         },
       },
       required: ["project_id", "target"],
+    },
+  },
+  {
+    name: "channel_claims",
+    description:
+      "List the unswept handoff claims on a repo coordination channel (Epic 40 Repo Coordination Bus, US-40.B1), on the agent key — the NON-DESTRUCTIVE way to ask 'is this ref already taken, and by whom'. READ THIS INSTEAD OF PROBING BY CLAIMING. channel_claim is IDEMPOTENT for the owning AGENT (re-claiming your own active ref returns your existing claim rather than a 409), and every session in a fleet typically authenticates as ONE agent_id — so 'claim it and see what happens' hands you a PEER SESSION's claim as though it were your own, and the channel_release you then call to tidy up DELETES it. The peer keeps working a handoff the bus has already reopened and a second machine picks it up (issue #707 recorded exactly that). This read writes nothing. Pass ref for the point lookup you actually want before claiming: a ref is listed while a row HOLDS its slot, so an empty claims array means nothing holds that ref. That is the safe direction, and it is NOT a promise the claim will succeed — channel_claim also refuses a superseded ref, a caller already holding 50 open claims, and a non-member (this read is not membership-gated). Nor does a LISTED row always mean refusal: a row whose claimant_agent_id is your own still-open claim is returned to you idempotently, and re-claiming it just to check IS the #707 probe. Each row carries ref, claimant_agent_id, claimed_at, lease_expires_at, done_at and two derived flags. done:true is terminal, and an unexpired lease_expires_at means someone is working it — either way the ref is out of channel_handoffs, so this is also the answer to 'why is that handoff missing from my handoffs list'. expired:true means the lease ran out without a done: the claim no longer holds the handoff out of channel_handoffs, but the row still holds the ref slot until the sweeper reaps it (about 5 minutes), so a claim gets 409 — retry that ref shortly rather than moving on. Confirm with channel_handoffs first: whether the handoff is actually back is a fact about the POST, and a superseded, quarantined or TTL-expired one never returns, so a claim on it stays refused however long you wait. NOTE the ownership scope it reveals: claims are scoped to your AGENT, not your session, so two sessions sharing one agent key can channel_done or channel_release each other's claims and the server cannot tell them apart — the abandoned-lease sweep, not the release path, is what protects a claim whose session died. DONE rows are listed LAST, so truncation drops finished rows before rows that still hold a ref; check meta.overflow anyway before reading an absent ref as free. Tenant-scoped and oracle-safe: a foreign or nonexistent project_id returns an empty set, never a 404 — but a MISSING or non-UUID project_id, and a blank or malformed ref, are a 422, because an empty page here reads as 'nothing holds it' and you must never read it as that when you simply left the parameter out.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", description: "UUID of the channel (project)." },
+        ref: {
+          type: "string",
+          description:
+            "Optional: narrow to ONE anchor (e.g. 'handoff:repo#812'). An empty result means no row holds that ref — the answer that used to require a destructive probe. A blank or malformed ref is a 422, never an empty page and never a widening back to the whole channel.",
+        },
+        limit: {
+          type: "integer",
+          description: "Optional page cap (default 100, max 200).",
+        },
+      },
+      required: ["project_id"],
     },
   },
   {
@@ -7300,6 +7343,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "channel_unlock":
       return await channelUnlock(args);
+
+    case "channel_claims":
+      return await channelClaims(args);
 
     case "channel_locks":
       return await channelLocks(args);

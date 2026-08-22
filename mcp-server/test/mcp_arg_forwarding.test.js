@@ -324,11 +324,32 @@ describe("US-40.B1: channel_claim / channel_release / channel_done wiring", () =
     assert.match(INDEX_SRC, /name: "channel_done",/, 'must declare a "channel_done" tool');
   });
 
-  test("channel_claim description maps 409 already_claimed to an honest 'ref is taken' message", () => {
+  test("channel_claim description splits the 409 by error.code, not one 'move on' for all four", () => {
+    // #707 follow-up. The description used to map EVERY 409 to "move on to other work".
+    // That is wrong for exactly one of the four causes: a lease that expired without
+    // completion is a row awaiting the sweeper, so the ref is about to be free and the
+    // caller should retry IT rather than abandon it. Each cause now has its own code in
+    // the body, and the description must name all four — an agent that cannot tell them
+    // apart drops work the server was about to hand back.
     assert.match(
       INDEX_SRC,
-      /409 already_claimed[\s\S]*?either another agent owns it, or you already completed it/,
-      "channel_claim must honestly tell a loser the ref is taken — either another agent owns it or you already completed it (move on)",
+      /409 already_claimed means a peer holds a live claim, or you already completed this one/,
+      "channel_claim must say already_claimed means the ref is genuinely taken (move on)",
+    );
+    assert.match(
+      INDEX_SRC,
+      /409 claim_lease_expired[\s\S]*?retry THIS ref shortly rather than moving on/,
+      "channel_claim must tell an agent to RETRY on claim_lease_expired, never to move on",
+    );
+    assert.match(
+      INDEX_SRC,
+      /409 ref_superseded[\s\S]*?claim the successor instead/,
+      "channel_claim must route ref_superseded to the successor handoff",
+    );
+    assert.match(
+      INDEX_SRC,
+      /409 claim_budget_exhausted is a limit on YOU, not a statement about the ref/,
+      "channel_claim must not let a caller record the ref as taken when its own budget is the limit",
     );
   });
 

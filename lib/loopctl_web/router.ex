@@ -243,6 +243,13 @@ defmodule LoopctlWeb.Router do
     # "handoff:repo#812"), never the path, so done/release are POSTs too. The static
     # /release and /done paths are declared BEFORE the bare create path is irrelevant
     # (all three are distinct literal paths — no :id capture to shadow).
+    # Non-destructive claim-state read (#707). Until this existed, the only way to
+    # learn whether a ref was claimed was to ATTEMPT a claim — which on a fleet whose
+    # sessions share one agent_id hands back a PEER SESSION's claim as if it were your
+    # own, so the release that tidies the probe up deletes it. STATIC path, listed
+    # before the POST siblings for the same reason /channel/handoffs is.
+    get "/channel/claims", ChannelClaimController, :index
+
     post "/channel/claims", ChannelClaimController, :create
     post "/channel/claims/done", ChannelClaimController, :done
     post "/channel/claims/release", ChannelClaimController, :release

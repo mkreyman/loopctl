@@ -4,7 +4,48 @@ All notable changes to loopctl are documented here.
 
 ## [Unreleased] — 2026-08-21 — The provenance harvest runs on a cadence
 
+### Added
+
+- **`GET /api/v1/channel/claims` — a non-destructive read of coordination claim state
+  (#707).** Until now the only way to learn whether a handoff `ref` was claimed was to
+  attempt the claim: `201` meant free, `409` meant taken. That probe is destructive on a
+  fleet whose sessions share one `agent_id` — `channel_claim` is idempotent for the owning
+  AGENT, so a probe issued while a PEER SESSION holds the ref returns that peer's claim as
+  if it were the prober's own, and the `release` that tidies the probe up DELETES it,
+  reopening a handoff someone is actively working. The read writes nothing. Agent role,
+  tenant-scoped, not membership-gated (uniform with `GET /channel/locks`). MCP tool
+  `channel_claims`, server 2.77.0. **Operator impact:** none required; existing callers are
+  unaffected.
+
 ### Changed
+
+- **`POST /api/v1/channel/claims` now returns FOUR distinct 409 codes where it returned one
+  (#707).** `already_claimed` previously covered four unrelated situations, and its body
+  says "Do not retry the same ref; move on to other work" — advice that is correct for two
+  of them and actively lossy for the other two. **Operator impact: a client branching on
+  `error.code == "already_claimed"` for a superseded ref or an exhausted claim budget must
+  be updated.** The HTTP status is 409 in all four cases; only the code and message differ.
+
+  | code | meaning | what the caller should do |
+  |---|---|---|
+  | `already_claimed` | a peer holds a live claim, or you already completed this one | move on to another ref |
+  | `claim_lease_expired` | the lease died without completion; the row is awaiting `ChannelClaimSweeper` | **retry THIS ref shortly** (carries `retry-after: 60`) |
+  | `ref_superseded` | the ref's newest live post was superseded; nobody holds it | claim the successor handoff |
+  | `claim_budget_exhausted` | you are at `max_concurrent_open_claims/0` | finish or release one of your own claims; the ref may well be free |
+
+  `claim_lease_expired` is the one that was costing work: `GET /channel/claims` lists that
+  same row and flags it expired, so before this split the read and the write told the caller
+  opposite stories about the same ref.
+
+- **A tag with surrounding whitespace is now rejected on every article write, not just a
+  reserved one (#733 review).** `Article`'s tag pattern was `~r/^[a-zA-Z0-9_-]+$/`, and in PCRE
+  `$` also matches immediately BEFORE a trailing newline, so `"elixir\n"` stored as a valid
+  tag. It is now anchored `\A`/`\z`. A dirty tag was unrepairable once stored: it reads as free
+  text everywhere downstream, and `IdempotencyTag.legacy?/1` refuses it, so the #583 promotion
+  could never reach it either. **Operator impact:** a create/update carrying such a tag returns
+  422 instead of storing it; the tag-shape rule is now published in the OpenAPI `tags`
+  description and the 422 text. Whitespace-dirty tags already in a corpus are unaffected and
+  still need a cleanup pass — the hosted corpus has none.
 
 - **`mix loopctl.reserve_idempotency_tags` has a production entry point that is not a Mix
   task.** The sweep moved into `Loopctl.DataMigrations.ReserveIdempotencyTags`, which

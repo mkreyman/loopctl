@@ -238,7 +238,9 @@ defmodule Loopctl.Coordination.ChannelPostQuarantineTest do
         })
 
       # Superseded AND live: the claim is refused because the ref points at retired work.
-      assert {:error, :already_claimed} =
+      # Its OWN code, not :already_claimed — nobody holds this ref, so telling the caller
+      # "already claimed, move on" would hide the successor it should claim instead.
+      assert {:error, :ref_superseded} =
                Coordination.claim(
                  ctx.tenant.id,
                  ctx.agent_id,

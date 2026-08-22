@@ -154,6 +154,16 @@ defmodule Loopctl.Coordination do
   @default_active_locks_limit 100
   @max_active_locks_limit 200
 
+  # Page bounds on the CLAIM read (#707). A claim is one row per outstanding unit of
+  # work on a channel, so a healthy repo's live set is a handful; these bound the
+  # pathological case without truncating any real one. Mirrors the lock bounds above
+  # rather than inventing a second convention. Unlike locks, the fairness axis that
+  # matters is NOT the holder (a fleet's sessions share one agent_id, so a per-agent
+  # partition would never bind) but the LIFECYCLE: `claims_page/3` orders OPEN rows
+  # ahead of terminal ones so retained DONE rows cannot evict a live claim.
+  @default_claims_limit 100
+  @max_claims_limit 200
+
   # FAIRNESS bound on the pinned active-lock read (review #451). The page cap above
   # truncates NEWEST-first, so without this one noisy holder — the lock write cap is
   # 120/min against a 900s TTL — could fill every slot and evict every peer's lock
@@ -1513,6 +1523,20 @@ defmodule Loopctl.Coordination do
   @spec default_lease_seconds() :: pos_integer()
   def default_lease_seconds, do: @default_lease_seconds
 
+  # Per-agent concurrent open claim bound (anti-squatting, AC-40.B1 review finding).
+  # Deliberately generous — normal agents should never hit this — but prevents a
+  # single compromised/broken agent from enumerating and claiming every open handoff.
+  @max_concurrent_open_claims 50
+
+  @doc """
+  The maximum concurrent OPEN claims one agent may hold on one project.
+
+  Exceeding it is `{:error, :claim_budget_exhausted}` — a limit on the CALLER, never a
+  statement about the ref, which may well be free.
+  """
+  @spec max_concurrent_open_claims() :: pos_integer()
+  def max_concurrent_open_claims, do: @max_concurrent_open_claims
+
   @doc """
   Claims a handoff `ref` for exactly ONE agent — the INSERT-to-claim write
   (US-40.B1). A successful INSERT returns `{:ok, %ChannelClaim{}}`; a concurrent
@@ -1563,20 +1587,37 @@ defmodule Loopctl.Coordination do
   owns the slot), and the owner re-claiming its OWN already-DONE claim, still get
   `{:error, :already_claimed}`.
 
+  ## The 409 is split by CAUSE (#707 follow-up)
+
+  Four different situations refuse a claim, and "move on to another ref" is the right
+  advice for only two of them. They used to share `:already_claimed`, whose rendered
+  message says "Do not retry the same ref" — so a caller that hit either of the other two
+  abandoned work it could have had.
+
+    * `:already_claimed` — a PEER holds a live claim, or the caller already COMPLETED
+      this one. The ref is genuinely taken: move on.
+    * `:claim_lease_expired` — a row still holds the unique slot but its lease expired
+      without completion (the caller's own or a peer's). Nobody is working it and
+      `ChannelClaimSweeper` will reap it: RETRY THIS REF shortly. `claims_page/3` lists
+      that same row and flags it expired, so without this code the write contradicted
+      the read.
+    * `:ref_superseded` — the ref's newest live post was superseded; nobody holds the
+      ref at all, and the caller should claim the successor.
+    * `:claim_budget_exhausted` — the caller is at `max_concurrent_open_claims/0`. A
+      limit on the CALLER, saying nothing about the ref, which may well be free.
+
   Returns `{:ok, %ChannelClaim{}}` (fresh claim OR idempotent owner re-claim),
-  `{:error, :already_claimed}`,
+  one of the four 409 reasons above,
   `{:error, :not_found}` (missing/cross-tenant/cross-project),
   `{:error, :agent_not_found}` (foreign-tenant server-stamped agent), or
   `{:error, %Ecto.Changeset{}}` (a bad `ref` — over-length or NUL byte).
   """
-  # Per-agent concurrent open claim bound (anti-squatting, AC-40.B1 review finding).
-  # Deliberately generous — normal agents should never hit this — but prevents a
-  # single compromised/broken agent from enumerating and claiming every open handoff.
-  @max_concurrent_open_claims 50
-
   @spec claim(Ecto.UUID.t(), Ecto.UUID.t(), term(), term(), keyword()) ::
           {:ok, ChannelClaim.t()}
           | {:error, :already_claimed}
+          | {:error, :claim_lease_expired}
+          | {:error, :ref_superseded}
+          | {:error, :claim_budget_exhausted}
           | {:error, :not_found}
           | {:error, :agent_not_found}
           | {:error, Ecto.Changeset.t()}
@@ -1585,23 +1626,28 @@ defmodule Loopctl.Coordination do
     audit = Keyword.get(opts, :audit, [])
     lease_seconds = normalize_lease_seconds(Keyword.get(opts, :lease_seconds))
 
+    now = DateTime.utc_now()
+
+    changeset =
+      %ChannelClaim{
+        tenant_id: tenant_id,
+        project_id: project_id,
+        claimant_agent_id: agent_id,
+        claimed_at: now,
+        lease_expires_at: DateTime.add(now, lease_seconds, :second)
+      }
+      |> ChannelClaim.create_changeset(%{ref: ref})
+
     with {:ok, _project} <- Projects.get_project(tenant_id, project_id),
          {:ok, _agent} <- agent_owned(tenant_id, agent_id),
          :ok <- project_writable_by_agent(tenant_id, agent_id, project_id, role),
+         # The ref must be shown well-formed BEFORE any query compares it against a
+         # `text` column: a NUL byte is valid UTF-8 that Postgres refuses (22021), so
+         # `verify_ref_not_superseded/3` below would raise a 500 instead of returning
+         # the 422 this changeset already carries.
+         {:ok, %ChannelClaim{ref: ref}} <- Ecto.Changeset.apply_action(changeset, :insert),
          :ok <- verify_ref_not_superseded(tenant_id, project_id, ref),
          :ok <- verify_agent_claim_budget(tenant_id, project_id, agent_id) do
-      now = DateTime.utc_now()
-
-      changeset =
-        %ChannelClaim{
-          tenant_id: tenant_id,
-          project_id: project_id,
-          claimant_agent_id: agent_id,
-          claimed_at: now,
-          lease_expires_at: DateTime.add(now, lease_seconds, :second)
-        }
-        |> ChannelClaim.create_changeset(%{ref: ref})
-
       run_claim(tenant_id, project_id, agent_id, changeset, audit)
     end
   end
@@ -1690,16 +1736,182 @@ defmodule Loopctl.Coordination do
     end
   end
 
+  @doc """
+  The channel's UNSWEPT claim rows — the NON-DESTRUCTIVE way to ask "is this ref
+  claimed, and by whom" (#707).
+
+  ## Why this read exists
+
+  Until it did, the only way to learn whether a ref was claimed was to ATTEMPT a claim
+  and read the result: a `201` meant it was free, a `409 already_claimed` meant it was
+  taken. That probe is destructive on a shared-agent fleet. `claim/5` is IDEMPOTENT
+  for the owning AGENT, and every session on this fleet authenticates as the same
+  `agent_id`, so a probe issued while a PEER SESSION holds the ref returns that peer's
+  claim as if it were the prober's own — and the release that tidies the probe up
+  DELETES IT. The peer keeps working a handoff the bus has already reopened, and a
+  second machine picks it up. That is not hypothetical: it is what #707 recorded.
+
+  So: read with this, never by claiming.
+
+  ## The predicate is the CLAIM-side one: does a row still hold the slot
+
+  Every row listed here is a row `claim/5` would collide with, because the
+  `(tenant_id, project_id, ref)` unique index does not care about lifecycle state: a
+  DONE claim, an OPEN one, and one whose lease EXPIRED before `ChannelClaimSweeper`
+  reaped it all refuse a fresh claim identically. So LISTED means "a row holds this
+  ref's slot", and ABSENT means no row does.
+
+  That is what the reader needs and it is NOT an equivalence with the claim outcome —
+  say only what holds, because a reader that over-trusts this read goes back to
+  probing. A listed row whose `claimant_agent_id` is the CALLER's own still-open claim
+  is returned idempotently, not refused (`resolve_claim_collision/4`), which on a fleet
+  sharing one `agent_id` is the common case. And `claim/5` refuses on three further
+  grounds that put no row here at all: a superseded ref, an exhausted per-agent claim
+  budget, and a non-member caller (the read is not membership-gated).
+
+  It is deliberately NOT `active_claim_subquery/1`, the handoffs EXCLUSION. That
+  predicate (DONE **or** unexpired) drops the expired-but-unswept row, so this read
+  reported such a ref as free while `claim/5` still answered `409 already_claimed` —
+  an agent told "free", then told "taken, move on", for up to one sweeper interval.
+  The two flags the handoffs question needs ride on each row instead: a row with
+  `done_at` set, or with a lease still in the future, is one EXCLUDING its handoff; an
+  expired, not-done row no longer excludes it and is merely awaiting sweep. Whether that
+  handoff is actually BACK in `directed_handoffs_page/3` is a question about the POST,
+  not the claim — a superseded, quarantined or TTL-expired post never reappears.
+
+  A RELEASED claim (row deleted) and a SWEPT one are absent, which is also exactly
+  when the ref becomes claimable again.
+
+  ## Scope, ordering, bounds
+
+  Tenant- AND project-scoped explicitly on `AdminRepo` (the module convention — a query
+  omitting the tenant filter is a bug). Optional `:ref` narrows to one anchor, which is
+  the point-lookup shape a session about to claim actually wants; a MALFORMED `:ref`
+  (blank, non-binary, or carrying a NUL byte, which is valid UTF-8 that Postgres refuses
+  to compare against `text`) yields an EMPTY page — it must never fall back to the
+  unfiltered query, which would answer another ref's claim to a caller asking about its
+  own.
+
+  Ordered OPEN claims first, then EXPIRED-awaiting-sweep, then DONE, each newest-claimed
+  first, capped at `clamp_claims_limit/1`. The ordering is the truncation bound that
+  matters here: DONE claims are retained `claim_done_retention_days/0` days, so on a busy
+  channel they outnumber every other state, and a plain newest-first page would drop a
+  row that still HOLDS a ref to make room for a week-old finished one — telling a reader
+  that a held ref is free. DONE last is what prevents that; an expired-unswept row holds
+  the slot just as an open one does, so it sorts ahead of DONE too. A truncated page can
+  still have dropped a DONE row, so `meta.overflow` must invalidate an "absent =
+  claimable" conclusion. The cap is reported rather than silently applied —
+  `{claims, overflowed?}`.
+
+  ## Oracle-safety
+
+  Identical posture to `active_locks_page/3` and `directed_handoffs_page/3`: a malformed
+  `tenant_id`/`project_id` returns `{[], false}` via the `valid_uuid?/1` guard, and a
+  cross-tenant or nonexistent `project_id` naturally returns an empty page rather than a
+  404. Like `GET /channel/locks`, the read is TENANT-scoped and NOT membership-gated —
+  any agent in the tenant may read any of that tenant's channels' claims. The US-40.D3
+  membership gate applies to the WRITE path (`claim/5`), not here.
+
+  Returns `{[%ChannelClaim{}], overflowed?}`.
+  """
+  @spec claims_page(term(), term(), keyword()) :: {[ChannelClaim.t()], boolean()}
+  def claims_page(tenant_id, project_id, opts \\ []) do
+    limit = opts |> Keyword.get(:limit) |> clamp_claims_limit()
+
+    with true <- valid_uuid?(tenant_id) and valid_uuid?(project_id),
+         {:ok, ref_filter} <- normalize_ref_filter(Keyword.get(opts, :ref)) do
+      now = DateTime.utc_now()
+
+      rows =
+        ChannelClaim
+        |> where([c], c.tenant_id == ^tenant_id and c.project_id == ^project_id)
+        |> filter_claims_by_ref(ref_filter)
+        # OPEN, then EXPIRED-unswept, then DONE, then newest-claimed. See the ordering
+        # note above: DONE last is what keeps a week of retained finished rows from
+        # evicting a row that still HOLDS its ref off the page.
+        |> order_by([c],
+          desc: fragment("(? IS NULL AND ? > ?)", c.done_at, c.lease_expires_at, ^now),
+          desc: fragment("(? IS NULL)", c.done_at),
+          desc: c.claimed_at,
+          desc: c.id
+        )
+        # One row over the cap, so overflow is DETECTED rather than inferred from
+        # `length(rows) == limit` — which is ambiguous on an exactly-full page.
+        |> limit(^(limit + 1))
+        |> AdminRepo.all()
+
+      {Enum.take(rows, limit), length(rows) > limit}
+    else
+      _ -> {[], false}
+    end
+  end
+
+  # `nil` is LIST mode; anything else must be a well-formed `ref`. The controller
+  # already refuses a malformed one with a 422 — this is the defense-in-depth half, and
+  # it must never fall through to the UNFILTERED query: silently widening a point lookup
+  # hands a caller asking about ONE ref some OTHER ref's claim, read as "mine is taken".
+  defp normalize_ref_filter(nil), do: {:ok, :all}
+
+  defp normalize_ref_filter(ref) do
+    if valid_ref?(ref), do: {:ok, ref}, else: :error
+  end
+
+  defp filter_claims_by_ref(query, :all), do: query
+  defp filter_claims_by_ref(query, ref), do: where(query, [c], c.ref == ^ref)
+
+  @doc """
+  Is `ref` a well-formed claim anchor? The SINGLE definition of that, shared by the read
+  filter, the pre-query write guards, and the controller's 422.
+
+  Mirrors `ChannelClaim.create_changeset/2`'s own rules rather than restating them: a
+  blank or whitespace-only ref is no anchor, a NUL byte is valid UTF-8 that Postgres
+  refuses to compare against `text` (22021, i.e. a 500), and the byte cap is the stored
+  column's. Two copies of this rule would drift, and the drift shows up as a ref the
+  WRITE refuses with a 422 reading back from `claims_page/3` as an empty page — which
+  this surface documents as "nothing holds it".
+  """
+  @spec valid_ref?(term()) :: boolean()
+  def valid_ref?(ref) when is_binary(ref) do
+    String.trim(ref) != "" and not String.contains?(ref, <<0>>) and
+      byte_size(ref) <= ChannelClaim.ref_max_length()
+  end
+
+  def valid_ref?(_ref), do: false
+
+  @doc "Default page size for `claims_page/3`."
+  @spec default_claims_limit() :: pos_integer()
+  def default_claims_limit, do: @default_claims_limit
+
+  @doc """
+  Clamps a caller-supplied `claims_page/3` limit to
+  `[1, #{@max_claims_limit}]`, defaulting anything unparseable to
+  `#{@default_claims_limit}`. Mirrors `clamp_active_locks_limit/1`.
+  """
+  @spec clamp_claims_limit(term()) :: pos_integer()
+  def clamp_claims_limit(limit) when is_integer(limit) and limit > 0,
+    do: min(limit, @max_claims_limit)
+
+  def clamp_claims_limit(limit) when is_binary(limit) do
+    case Integer.parse(limit) do
+      {n, ""} when n > 0 -> clamp_claims_limit(n)
+      _ -> @default_claims_limit
+    end
+  end
+
+  def clamp_claims_limit(_), do: @default_claims_limit
+
   # Fetch the caller's OWN claim CONSTRAINED to (tenant_id, project_id,
   # claimant_agent_id, ref) — the oracle-safe owner boundary on the AdminRepo
   # (BYPASSRLS) path. A non-owner, cross-tenant, cross-project, or nonexistent claim
   # all return nil, collapsing to the same `{:error, :not_found}`. `tenant_id` and
   # `project_id` are guarded with `valid_uuid?/1` (a malformed path segment is a
-  # clean nil, never an `Ecto.Query.CastError`/500); `ref` is a free string but must
-  # be a binary to match a stored `text` value.
+  # clean nil, never an `Ecto.Query.CastError`/500); `ref` is a free string but must be
+  # WELL-FORMED (`valid_ref?/1`) before it is compared against a stored `text` value —
+  # a NUL byte reaching this query raises 22021 (a 500) on `done`/`release`, and no
+  # changeset runs on those paths to catch it first.
   defp fetch_owned_claim(tenant_id, agent_id, project_id, ref) do
     if valid_uuid?(tenant_id) and valid_uuid?(agent_id) and valid_uuid?(project_id) and
-         is_binary(ref) do
+         valid_ref?(ref) do
       ChannelClaim
       |> where(
         [c],
@@ -1774,7 +1986,17 @@ defmodule Loopctl.Coordination do
   # holds instead of being falsely told "another agent owns this, move on" and
   # abandoning it until the lease expires. Anything else (a peer's claim, a
   # since-released/gone row, or the caller's OWN already-DONE claim) is a real
-  # collision -> {:error, :already_claimed} (409).
+  # collision -> a 409.
+  #
+  # The 409 is SPLIT by cause, because "move on to other work" is the right advice for
+  # only some of them (#707 follow-up). A row whose lease EXPIRED without completion —
+  # the caller's own or a peer's — still holds the unique slot, so the insert fails, but
+  # nobody is working it and `ChannelClaimSweeper` is about to reap it: that is
+  # `:claim_lease_expired`, and the caller should RETRY THIS REF SHORTLY. Everything else
+  # (a peer's live claim, the caller's own DONE claim, a row released between the insert
+  # and this read) is `:already_claimed`, where moving on IS correct. `claims_page/3`
+  # already draws the same line with its `expired` flag; without this split the API told
+  # the caller one thing and the read told it the other.
   #
   # No new TOCTOU window: the unique index still enforces exactly-once at INSERT time;
   # this read runs AFTER the failed insert only to CLASSIFY the loser, never to decide
@@ -1789,12 +2011,16 @@ defmodule Loopctl.Coordination do
         if DateTime.compare(lease, now) == :gt do
           {:ok, existing}
         else
-          # Expired lease: the owner is re-claiming a dead handoff. Treat as a real
-          # collision so the caller learns the ref is NOT held (the sweeper will reap
-          # it shortly, or the caller can retry). This keeps discovery (which treats
-          # expired leases as inactive) and claim semantics consistent.
-          {:error, :already_claimed}
+          {:error, :claim_lease_expired}
         end
+
+      # A PEER's dead lease is the same situation from the other side: the row still
+      # holds the unique slot, so the insert failed, but nobody is working it and the
+      # sweeper is about to reap it. Retry shortly — do NOT move on.
+      %ChannelClaim{done_at: nil, lease_expires_at: lease} ->
+        if DateTime.compare(lease, now) == :gt,
+          do: {:error, :already_claimed},
+          else: {:error, :claim_lease_expired}
 
       _ ->
         {:error, :already_claimed}
@@ -1839,7 +2065,7 @@ defmodule Loopctl.Coordination do
 
     case newest do
       %ChannelPost{superseded_by: nil} -> :ok
-      %ChannelPost{} -> {:error, :already_claimed}
+      %ChannelPost{} -> {:error, :ref_superseded}
       nil -> :ok
     end
   end
@@ -1860,7 +2086,7 @@ defmodule Loopctl.Coordination do
       |> AdminRepo.aggregate(:count)
 
     if count >= @max_concurrent_open_claims do
-      {:error, :already_claimed}
+      {:error, :claim_budget_exhausted}
     else
       :ok
     end

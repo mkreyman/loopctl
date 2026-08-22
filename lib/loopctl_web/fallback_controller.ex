@@ -12,7 +12,15 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :unauthorized}` -> 401
   - `{:error, :forbidden}` -> 403
   - `{:error, :conflict}` -> 409
-  - `{:error, :already_claimed}` -> 409 (US-40.B1: a coordination handoff ref was already claimed by another agent)
+  - `{:error, :already_claimed}` -> 409 (US-40.B1: a coordination handoff ref is held by a live
+    peer claim, or by the caller's own COMPLETED one — move on to another ref)
+  - `{:error, :claim_lease_expired}` -> 409 (the ref's claim lease expired without completion and
+    the row is awaiting the sweeper; nobody is working it, so RETRY THIS REF shortly. Split out of
+    `:already_claimed` because "move on" is wrong for exactly this case — see #707)
+  - `{:error, :ref_superseded}` -> 409 (the ref's newest live post has been superseded; its
+    instructions were retired, so claim the successor instead)
+  - `{:error, :claim_budget_exhausted}` -> 409 (the caller already holds the maximum concurrent
+    open claims on this project; finish or release one first — the ref itself may well be free)
   - `{:error, :ambiguous_resolution}` -> 409 (a fuzzy identifier matched >1 active project)
   - `{:error, :must_contract_first}` -> 409 (claim before contracting)
   - `{:error, :must_claim_first}` -> 409 (start before claiming)
@@ -106,6 +114,54 @@ defmodule LoopctlWeb.FallbackController do
         code: "already_claimed",
         message:
           "This ref is already claimed (by another agent, or already completed by you). Do not retry the same ref; move on to other work."
+      }
+    })
+  end
+
+  # The ONE 409 on this surface where "move on" is wrong (#707). The row still holds the
+  # unique slot, so the INSERT failed — but its lease expired without completion, nobody
+  # is working it, and `ChannelClaimSweeper` will reap it. `retry-after` is advisory and
+  # deliberately short: the caller is waiting on a sweep, not on a peer finishing.
+  def call(conn, {:error, :claim_lease_expired}) do
+    conn
+    |> put_resp_header("retry-after", "60")
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "claim_lease_expired",
+        message:
+          "This ref's claim lease expired without completion and the row is awaiting the sweeper. Nobody is working it — retry THIS ref shortly rather than moving on. GET /api/v1/channel/claims?ref=... shows the row with expired: true."
+      }
+    })
+  end
+
+  # Not a claim collision at all: the ref's instructions were retired by a successor
+  # post. Distinct from `already_claimed` so a caller does not conclude a peer holds it.
+  def call(conn, {:error, :ref_superseded}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "ref_superseded",
+        message:
+          "This ref's newest live post has been superseded — its instructions were retired. Claim the successor handoff instead; nobody holds this ref."
+      }
+    })
+  end
+
+  # A limit on the CALLER, not a statement about the ref — which may well be free. Kept
+  # distinct so an agent throttled by its own budget does not record the ref as taken.
+  def call(conn, {:error, :claim_budget_exhausted}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "claim_budget_exhausted",
+        message:
+          "You already hold the maximum concurrent open claims on this project. Finish one with channel_done or give one up with channel_release, then retry. This says nothing about whether the ref is free."
       }
     })
   end
