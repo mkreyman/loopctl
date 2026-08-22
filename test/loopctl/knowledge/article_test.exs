@@ -391,6 +391,22 @@ defmodule Loopctl.Knowledge.ArticleTest do
       assert errors_on(changeset)[:tags]
     end
 
+    test "rejects a tag with a trailing newline" do
+      # PCRE `$` matches immediately BEFORE a trailing newline, so the pattern used to be
+      # `~r/^[a-zA-Z0-9_-]+$/` and this stored as a valid tag. A dirty tag reads as free
+      # text everywhere downstream and no promotion path can repair it (#733 review).
+      changeset =
+        Article.create_changeset(%Article{}, %{
+          title: "Dirty Tag Article",
+          body: "Content",
+          category: :pattern,
+          tags: ["elixir\n"]
+        })
+
+      refute changeset.valid?
+      assert errors_on(changeset)[:tags]
+    end
+
     test "accepts valid tag patterns" do
       changeset =
         Article.create_changeset(%Article{}, %{

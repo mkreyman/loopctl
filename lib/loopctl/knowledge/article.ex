@@ -41,7 +41,12 @@ defmodule Loopctl.Knowledge.Article do
   @status_values [:draft, :published, :archived, :superseded]
   @scope_values [:tenant, :system]
   @known_source_types ~w(review_finding manual agent session_log newsletter skill web_article ingestion channel_graduation)
-  @tag_pattern ~r/^[a-zA-Z0-9_-]+$/
+  # `\A`/`\z`, never `^`/`$`: in PCRE `$` also matches immediately BEFORE a
+  # trailing newline, so `~r/^[a-zA-Z0-9_-]+$/` accepted "elixir\n" and stored a
+  # whitespace-dirty tag as valid. That tag then reads as free text everywhere
+  # downstream — `Loopctl.Knowledge.IdempotencyTag.legacy?/1` refuses it, so the
+  # #583 promotion can never repair it either (#733 review).
+  @tag_pattern ~r/\A[a-zA-Z0-9_-]+\z/
   @slug_format ~r/^[a-z0-9][a-z0-9-]*[a-z0-9]$/
   # Topical tags only. Structural identity (e.g. a "hub", or an article's source)
   # is carried by source_type/source_id and idempotency_key (#137), so we raise
@@ -261,6 +266,22 @@ defmodule Loopctl.Knowledge.Article do
   """
   @spec tag_pattern() :: Regex.t()
   def tag_pattern, do: @tag_pattern
+
+  @doc """
+  The tag-shape contract as published to API callers.
+
+  Interpolated into the OpenAPI `tags` description on create and update, next to
+  `Loopctl.Knowledge.IdempotencyTag.contract_description/0`, so the spec and the enforcement
+  cannot state different rules. The character class and the length are read from the same
+  attributes the changeset validates against, not restated.
+  """
+  @spec tag_contract_description() :: String.t()
+  def tag_contract_description do
+    "Each tag must match #{Regex.source(@tag_pattern)} — letters, digits, underscore and " <>
+      "hyphen only, anchored end to end, so surrounding whitespace (including a trailing " <>
+      "newline) is rejected 422 rather than stored. Maximum #{@max_tag_length} characters " <>
+      "per tag and #{@max_tags} tags per article."
+  end
 
   @doc "Maximum length of a single tag (single source of truth, same reason as `tag_pattern/0`)."
   @spec max_tag_length() :: pos_integer()

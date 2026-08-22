@@ -58,6 +58,7 @@ defmodule Loopctl.Memory do
   alias Loopctl.Embeddings.ShrinkLadder
   alias Loopctl.HeavyRead
   alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.IdempotencyTag
   alias Loopctl.Knowledge.RankingPriors
   alias Loopctl.Knowledge.VectorSearch
@@ -2219,19 +2220,23 @@ defmodule Loopctl.Memory do
   # `do_graduate_memory_record/2` take its structural-error branch, which STAMPS the memory
   # as graduated, and `resolve_existing_graduation/2` then returns `:already_graduated`
   # forever — a memory tagged `idem-design` would burn its one-shot graduation with no
-  # article created. Every rule this mirrors must move when the Article changeset does.
-  @graduation_max_tags 50
-  @graduation_max_tag_length 100
-  @graduation_tag_pattern ~r/^[a-zA-Z0-9_-]+$/
+  # article created.
+  #
+  # The three constraints are TAKEN from `Article` rather than restated, the way
+  # `Loopctl.Knowledge.Tagger` already takes them, so the mirror cannot drift. The hand-copied
+  # regex here did drift: `Article` re-anchored its pattern with `\A`/`\z` after `$` was found
+  # to match before a trailing newline, and this copy still admitted "elixir\n" — a tag the
+  # article changeset now rejects, which is exactly the invalid-changeset path the paragraph
+  # above says burns the graduation (#733 review).
   defp sanitize_graduation_tags(tags) when is_list(tags) do
     tags
     |> Enum.filter(fn tag ->
       is_binary(tag) and byte_size(tag) > 0 and
-        String.length(tag) <= @graduation_max_tag_length and
-        Regex.match?(@graduation_tag_pattern, tag) and
+        String.length(tag) <= Article.max_tag_length() and
+        Regex.match?(Article.tag_pattern(), tag) and
         not (IdempotencyTag.reserved?(tag) and not IdempotencyTag.well_formed?(tag))
     end)
-    |> Enum.take(@graduation_max_tags)
+    |> Enum.take(Article.max_tags())
   end
 
   defp sanitize_graduation_tags(_), do: []

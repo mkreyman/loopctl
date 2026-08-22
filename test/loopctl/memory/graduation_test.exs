@@ -306,6 +306,30 @@ defmodule Loopctl.Memory.GraduationTest do
       assert count == 1
     end
 
+    test "a memory carrying a whitespace-dirty tag still graduates (the mirror tracks the anchors)",
+         %{scope: scope, tenant: tenant} do
+      # The same mirror, one rule later: Article anchored @tag_pattern with \A/\z after `$`
+      # was found to match before a trailing newline. While this sanitizer kept its own
+      # `$`-anchored copy it PASSED "elixir\n" through to an article changeset that now
+      # rejects it — the invalid-changeset path that burns the one-shot graduation.
+      memory =
+        fixture(:memory,
+          tenant_id: scope.tenant_id,
+          subject_id: scope.subject_id,
+          text: "a memory whose extractor left a newline on a tag",
+          tags: ["elixir\n", "phoenix"]
+        )
+
+      assert {:ok, _verdict, article} = Memory.graduate_memory(scope, memory.id)
+      assert "phoenix" in article.tags
+      refute "elixir\n" in article.tags
+
+      count =
+        from(a in Article, where: a.tenant_id == ^tenant.id) |> AdminRepo.aggregate(:count, :id)
+
+      assert count == 1
+    end
+
     test "a WELL-FORMED reserved capture tag survives graduation (the capture identity is kept)",
          %{scope: scope} do
       memory =

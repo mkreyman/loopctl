@@ -6,6 +6,22 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **A tag with surrounding whitespace is now rejected on every article write, not just a
+  reserved one (#733 review).** `Article`'s tag pattern was `~r/^[a-zA-Z0-9_-]+$/`, and in PCRE
+  `$` also matches immediately BEFORE a trailing newline, so `"elixir\n"` stored as a valid
+  tag. It is now anchored `\A`/`\z`. A dirty tag was unrepairable once stored: it reads as free
+  text everywhere downstream, and `IdempotencyTag.legacy?/1` refuses it, so the #583 promotion
+  could never reach it either. **Operator impact:** a create/update carrying such a tag returns
+  422 instead of storing it; the tag-shape rule is now published in the OpenAPI `tags`
+  description and the 422 text. Whitespace-dirty tags already in a corpus are unaffected and
+  still need a cleanup pass — the hosted corpus has none.
+
+  `Loopctl.Memory`'s graduation sanitizer carried a hand-copied version of that pattern and had
+  already drifted; it now TAKES the pattern, the length and the count from `Article`, the way
+  `Knowledge.Tagger` does. That mirror is load-bearing rather than cosmetic: a tag this filter
+  passes but the article changeset rejects makes graduation take its structural-error branch,
+  which stamps the memory graduated and burns its one-shot with no article created.
+
 - **`mix loopctl.reserve_idempotency_tags` now promotes the `email-` and `corpus-` families
   too (#733).** The #583 census missed both: bare `email-<sha1(message_id)[:12]>` (the inbox
   sourcer) and `corpus-<sha1(member ids)>` (the corpus synthesizer) are per-capture ids exactly
