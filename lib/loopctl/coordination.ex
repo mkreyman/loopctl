@@ -1595,23 +1595,28 @@ defmodule Loopctl.Coordination do
     audit = Keyword.get(opts, :audit, [])
     lease_seconds = normalize_lease_seconds(Keyword.get(opts, :lease_seconds))
 
+    now = DateTime.utc_now()
+
+    changeset =
+      %ChannelClaim{
+        tenant_id: tenant_id,
+        project_id: project_id,
+        claimant_agent_id: agent_id,
+        claimed_at: now,
+        lease_expires_at: DateTime.add(now, lease_seconds, :second)
+      }
+      |> ChannelClaim.create_changeset(%{ref: ref})
+
     with {:ok, _project} <- Projects.get_project(tenant_id, project_id),
          {:ok, _agent} <- agent_owned(tenant_id, agent_id),
          :ok <- project_writable_by_agent(tenant_id, agent_id, project_id, role),
+         # The ref must be shown well-formed BEFORE any query compares it against a
+         # `text` column: a NUL byte is valid UTF-8 that Postgres refuses (22021), so
+         # `verify_ref_not_superseded/3` below would raise a 500 instead of returning
+         # the 422 this changeset already carries.
+         {:ok, %ChannelClaim{ref: ref}} <- Ecto.Changeset.apply_action(changeset, :insert),
          :ok <- verify_ref_not_superseded(tenant_id, project_id, ref),
          :ok <- verify_agent_claim_budget(tenant_id, project_id, agent_id) do
-      now = DateTime.utc_now()
-
-      changeset =
-        %ChannelClaim{
-          tenant_id: tenant_id,
-          project_id: project_id,
-          claimant_agent_id: agent_id,
-          claimed_at: now,
-          lease_expires_at: DateTime.add(now, lease_seconds, :second)
-        }
-        |> ChannelClaim.create_changeset(%{ref: ref})
-
       run_claim(tenant_id, project_id, agent_id, changeset, audit)
     end
   end
@@ -1722,9 +1727,16 @@ defmodule Loopctl.Coordination do
   Every row listed here is a row `claim/5` would collide with, because the
   `(tenant_id, project_id, ref)` unique index does not care about lifecycle state: a
   DONE claim, an OPEN one, and one whose lease EXPIRED before `ChannelClaimSweeper`
-  reaped it all refuse a fresh claim identically. The listed set is therefore exactly
-  the NOT-claimable set, and an absent ref is claimable — the equivalence the caller
-  acts on.
+  reaped it all refuse a fresh claim identically. So LISTED means "a row holds this
+  ref's slot", and ABSENT means no row does.
+
+  That is what the reader needs and it is NOT an equivalence with the claim outcome —
+  say only what holds, because a reader that over-trusts this read goes back to
+  probing. A listed row whose `claimant_agent_id` is the CALLER's own still-open claim
+  is returned idempotently, not refused (`resolve_claim_collision/4`), which on a fleet
+  sharing one `agent_id` is the common case. And `claim/5` refuses on three further
+  grounds that put no row here at all: a superseded ref, an exhausted per-agent claim
+  budget, and a non-member caller (the read is not membership-gated).
 
   It is deliberately NOT `active_claim_subquery/1`, the handoffs EXCLUSION. That
   predicate (DONE **or** unexpired) drops the expired-but-unswept row, so this read
@@ -1747,14 +1759,16 @@ defmodule Loopctl.Coordination do
   unfiltered query, which would answer another ref's claim to a caller asking about its
   own.
 
-  Ordered OPEN claims FIRST, then terminal ones (done, or expired-awaiting-sweep), each
-  newest-claimed first, capped at `clamp_claims_limit/1`. The ordering is the truncation
-  bound that matters here: DONE claims are retained `claim_done_retention_days/0` days,
-  so on a busy channel they outnumber the live ones, and a plain newest-first page would
-  drop a LIVE claim to make room for a week-old finished one — telling a reader that a
-  held ref is free. With OPEN first, a truncated page can only have dropped terminal
-  rows unless every row it returned is open. The cap is reported rather than silently
-  applied — `{claims, overflowed?}`.
+  Ordered OPEN claims first, then EXPIRED-awaiting-sweep, then DONE, each newest-claimed
+  first, capped at `clamp_claims_limit/1`. The ordering is the truncation bound that
+  matters here: DONE claims are retained `claim_done_retention_days/0` days, so on a busy
+  channel they outnumber every other state, and a plain newest-first page would drop a
+  row that still HOLDS a ref to make room for a week-old finished one — telling a reader
+  that a held ref is free. DONE last is what prevents that; an expired-unswept row holds
+  the slot just as an open one does, so it sorts ahead of DONE too. A truncated page can
+  still have dropped a DONE row, so `meta.overflow` must invalidate an "absent =
+  claimable" conclusion. The cap is reported rather than silently applied —
+  `{claims, overflowed?}`.
 
   ## Oracle-safety
 
@@ -1779,10 +1793,12 @@ defmodule Loopctl.Coordination do
         ChannelClaim
         |> where([c], c.tenant_id == ^tenant_id and c.project_id == ^project_id)
         |> filter_claims_by_ref(ref_filter)
-        # OPEN first, then newest-claimed. See the ordering note above: this is what
-        # keeps a week of retained DONE rows from evicting a live claim off the page.
+        # OPEN, then EXPIRED-unswept, then DONE, then newest-claimed. See the ordering
+        # note above: DONE last is what keeps a week of retained finished rows from
+        # evicting a row that still HOLDS its ref off the page.
         |> order_by([c],
           desc: fragment("(? IS NULL AND ? > ?)", c.done_at, c.lease_expires_at, ^now),
+          desc: fragment("(? IS NULL)", c.done_at),
           desc: c.claimed_at,
           desc: c.id
         )
@@ -1797,22 +1813,37 @@ defmodule Loopctl.Coordination do
     end
   end
 
-  # `nil` is LIST mode. A well-formed binary is the point lookup. ANY other shape — a
-  # blank string, a `?ref[]=x` list, or a NUL byte (valid UTF-8, so Plug forwards it,
-  # but Postgres raises 22021 comparing it against a `text` column, i.e. a 500) — is a
-  # malformed filter and collapses to an empty page. Never fall through to the
-  # UNFILTERED query: silently widening a point lookup hands a caller asking about ONE
-  # ref some OTHER ref's claim, which it reads as "mine is taken".
+  # `nil` is LIST mode; anything else must be a well-formed `ref`. The controller
+  # already refuses a malformed one with a 422 — this is the defense-in-depth half, and
+  # it must never fall through to the UNFILTERED query: silently widening a point lookup
+  # hands a caller asking about ONE ref some OTHER ref's claim, read as "mine is taken".
   defp normalize_ref_filter(nil), do: {:ok, :all}
 
-  defp normalize_ref_filter(ref) when is_binary(ref) do
-    if ref != "" and not String.contains?(ref, <<0>>), do: {:ok, ref}, else: :error
+  defp normalize_ref_filter(ref) do
+    if valid_ref?(ref), do: {:ok, ref}, else: :error
   end
-
-  defp normalize_ref_filter(_ref), do: :error
 
   defp filter_claims_by_ref(query, :all), do: query
   defp filter_claims_by_ref(query, ref), do: where(query, [c], c.ref == ^ref)
+
+  @doc """
+  Is `ref` a well-formed claim anchor? The SINGLE definition of that, shared by the read
+  filter, the pre-query write guards, and the controller's 422.
+
+  Mirrors `ChannelClaim.create_changeset/2`'s own rules rather than restating them: a
+  blank or whitespace-only ref is no anchor, a NUL byte is valid UTF-8 that Postgres
+  refuses to compare against `text` (22021, i.e. a 500), and the byte cap is the stored
+  column's. Two copies of this rule would drift, and the drift shows up as a ref the
+  WRITE refuses with a 422 reading back from `claims_page/3` as an empty page — which
+  this surface documents as "nothing holds it".
+  """
+  @spec valid_ref?(term()) :: boolean()
+  def valid_ref?(ref) when is_binary(ref) do
+    String.trim(ref) != "" and not String.contains?(ref, <<0>>) and
+      byte_size(ref) <= ChannelClaim.ref_max_length()
+  end
+
+  def valid_ref?(_ref), do: false
 
   @doc "Default page size for `claims_page/3`."
   @spec default_claims_limit() :: pos_integer()
@@ -1841,11 +1872,13 @@ defmodule Loopctl.Coordination do
   # (BYPASSRLS) path. A non-owner, cross-tenant, cross-project, or nonexistent claim
   # all return nil, collapsing to the same `{:error, :not_found}`. `tenant_id` and
   # `project_id` are guarded with `valid_uuid?/1` (a malformed path segment is a
-  # clean nil, never an `Ecto.Query.CastError`/500); `ref` is a free string but must
-  # be a binary to match a stored `text` value.
+  # clean nil, never an `Ecto.Query.CastError`/500); `ref` is a free string but must be
+  # WELL-FORMED (`valid_ref?/1`) before it is compared against a stored `text` value —
+  # a NUL byte reaching this query raises 22021 (a 500) on `done`/`release`, and no
+  # changeset runs on those paths to catch it first.
   defp fetch_owned_claim(tenant_id, agent_id, project_id, ref) do
     if valid_uuid?(tenant_id) and valid_uuid?(agent_id) and valid_uuid?(project_id) and
-         is_binary(ref) do
+         valid_ref?(ref) do
       ChannelClaim
       |> where(
         [c],
@@ -1936,9 +1969,9 @@ defmodule Loopctl.Coordination do
           {:ok, existing}
         else
           # Expired lease: the owner is re-claiming a dead handoff. Treat as a real
-          # collision so the caller learns the ref is NOT held (the sweeper will reap
-          # it shortly, or the caller can retry). This keeps discovery (which treats
-          # expired leases as inactive) and claim semantics consistent.
+          # collision so the caller learns the ref is NOT held. Discovery agrees — it
+          # LISTS the row (it still holds the unique slot) and flags it `expired`, so
+          # the caller is told to retry once the sweeper reaps it, not to move on.
           {:error, :already_claimed}
         end
 

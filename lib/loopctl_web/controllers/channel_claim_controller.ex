@@ -10,7 +10,7 @@ defmodule LoopctlWeb.ChannelClaimController do
   - `POST /api/v1/channel/claims/done` — agent+, mark the caller's OWN claim done.
   - `POST /api/v1/channel/claims/release` — agent+, DELETE the caller's OWN claim so
     the ref reopens for the next racer.
-  - `GET /api/v1/channel/claims` — agent+, the channel's ACTIVE claims, so a session
+  - `GET /api/v1/channel/claims` — agent+, the channel's UNSWEPT claims, so a session
     can see "this ref is taken, by this agent, until this time" WITHOUT writing.
 
   ## Read to find out whether a ref is claimed. NEVER probe by claiming. (#707)
@@ -71,6 +71,7 @@ defmodule LoopctlWeb.ChannelClaimController do
   require Logger
 
   alias Loopctl.Coordination
+  alias Loopctl.Coordination.ChannelClaim
   alias Loopctl.Projects
   alias Loopctl.RateLimiter.FailOpenLog
   alias Loopctl.Tenants
@@ -94,9 +95,9 @@ defmodule LoopctlWeb.ChannelClaimController do
   # pipeline limiter (LoopctlWeb.Plugs.RateLimiter) counts EVERY authenticated request,
   # reads included, so a read cap merely bounded BY the pipeline budget could still
   # exhaust it and 429 the caller out of claiming. `claim_read_limit/1` therefore clamps
-  # the read to a bounded SHARE (a quarter) of that budget, which is what makes the
-  # guarantee true: sustained polling at the cap still leaves three quarters of the
-  # per-key budget for claiming and everything else.
+  # the read to a SHARE (a quarter) of that budget — but never BELOW the claim write
+  # cap, which would invert the guarantee and 429 the caller out of the very read that
+  # replaces the probe.
   plug :rate_limit_claim_read when action in [:index]
 
   # 60s fixed window, matching the ETS/Hammer contract the pipeline limiter uses.
@@ -112,9 +113,11 @@ defmodule LoopctlWeb.ChannelClaimController do
   @default_claim_read_limit 120
 
   # The read's share of the per-key PIPELINE budget (see the `:rate_limit_claim_read`
-  # plug note). A quarter: enough that polling before every claim is never the binding
-  # constraint, bounded enough that it can neither 429 the caller out of claiming nor
-  # aim an unbounded poll rate at AdminRepo's small pool.
+  # plug note). A quarter, FLOORED at the claim write cap by `claim_read_limit/1`: the
+  # share bounds an unbounded poll rate aimed at AdminRepo's small pool, and the floor
+  # keeps the read at least as available as the write it precedes. On the default
+  # 300/min pipeline budget the effective read cap is therefore 75, not the 120 above —
+  # the 120 is the cap this endpoint asks for, the pipeline share is what it gets.
   @claim_read_pipeline_share 4
 
   # Fallback for the generic per-key pipeline limit, kept in sync with
@@ -128,6 +131,11 @@ defmodule LoopctlWeb.ChannelClaimController do
   # The READ refuses a missing/non-UUID project_id rather than answering an empty page,
   # which it documents as "these refs are claimable". Says nothing about existence.
   @missing_project_message "project_id is required and must be a UUID"
+
+  # Mirrors `Coordination.valid_ref?/1`, which mirrors the claim changeset. Says nothing
+  # about whether the ref is claimed.
+  @invalid_ref_message "ref must be a non-blank string with no NUL bytes, at most " <>
+                         "#{ChannelClaim.ref_max_length()} bytes"
 
   @doc """
   POST /api/v1/channel/claims
@@ -221,30 +229,47 @@ defmodule LoopctlWeb.ChannelClaimController do
 
   `GET /api/v1/channel/claims?project_id=<uuid>[&ref=<anchor>][&limit=<n>]`
 
-  A ref is listed exactly while a fresh `claim` on it would be REFUSED: DONE, still
-  within its lease, or expired and not yet swept (the unique slot is held in all three).
-  So an empty `claims` array means that ref is claimable right now, and `ref` is the
-  point lookup a session about to claim actually wants. Each row carries `done` and
+  A ref is listed while a row HOLDS its `(tenant, project, ref)` slot: DONE, still within
+  its lease, or expired and not yet swept. So an empty `claims` array means no row holds
+  that ref, and `ref` is the point lookup a session about to claim actually wants. It is
+  not a promise the claim will succeed: `claim` also refuses a superseded ref, a caller
+  over its concurrent-claim budget, and a non-member — and it returns the CALLER's own
+  listed open claim idempotently rather than refusing it. Each row carries `done` and
   `expired` for the handoffs question: `done`, or an unexpired lease, is what keeps the
   ref out of `GET /channel/handoffs`; `expired: true` means the handoff has already
   reopened and the row is merely awaiting the sweeper — retry shortly, do not move on.
 
   Tenant-scoped from the verified key and NOT membership-gated (see the moduledoc). A
   cross-tenant or nonexistent `project_id` returns an empty page, never a 404 — the same
-  no-oracle posture as `GET /channel/locks`. A MISSING or non-UUID `project_id` is a 422
-  instead: it is a client fault decidable without touching a row, and answering it with
-  an empty page would tell the caller every ref is free.
+  no-oracle posture as `GET /channel/locks`. A MISSING or non-UUID `project_id`, and a
+  malformed `ref`, are 422 instead: both are client faults decidable without touching a
+  row, and answering either with an empty page would tell the caller the ref is free.
 
-  OPEN claims are ordered first, so a page truncated by `limit` can only have dropped
-  terminal rows unless every row it returned is open. `meta.overflow` reports the cap.
+  DONE rows are ordered LAST, so a truncated page drops finished rows before it drops
+  one that still holds a ref — but `meta.overflow: true` still invalidates an
+  "absent = free" conclusion.
   """
   def index(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
-    case Ecto.UUID.cast(params["project_id"]) do
-      {:ok, project_id} -> render_claims(conn, tenant_id, project_id, params)
+    with {:ok, project_id} <- Ecto.UUID.cast(params["project_id"]),
+         :ok <- validate_ref_filter(params["ref"]) do
+      render_claims(conn, tenant_id, project_id, params)
+    else
       :error -> {:error, :unprocessable_entity, @missing_project_message}
+      {:error, _status, _message} = refusal -> refusal
     end
+  end
+
+  # A malformed `ref` gets the same 422 a malformed `project_id` does, for the same
+  # reason: an empty page means "no row holds it", and a ref the WRITE would refuse with
+  # a 422 must never read back that way. `nil` is LIST mode, not a malformed filter.
+  defp validate_ref_filter(nil), do: :ok
+
+  defp validate_ref_filter(ref) do
+    if Coordination.valid_ref?(ref),
+      do: :ok,
+      else: {:error, :unprocessable_entity, @invalid_ref_message}
   end
 
   defp render_claims(conn, tenant_id, project_id, params) do
@@ -456,7 +481,12 @@ defmodule LoopctlWeb.ChannelClaimController do
       )
       |> coerce_positive_int(default_claim_read_limit())
 
-    min(configured, max(1, div(pipeline_per_key_limit(tenant), @claim_read_pipeline_share)))
+    # NEVER below `claim_limit/1`: a read cap tighter than the write cap 429s the caller
+    # out of reading while it can still claim, which is the destructive probe again.
+    min(
+      configured,
+      max(claim_limit(tenant), div(pipeline_per_key_limit(tenant), @claim_read_pipeline_share))
+    )
   end
 
   defp default_claim_read_limit do

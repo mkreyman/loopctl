@@ -99,7 +99,7 @@ defmodule Loopctl.CoordinationClaimReadTest do
                )
     end
 
-    test "OPEN claims are ordered ahead of terminal ones, so a truncated page keeps them" do
+    test "DONE rows sort last, so truncation drops them before rows that still hold a ref" do
       %{tenant: tenant, project: project, agent_id: agent_id} = setup_member()
 
       # The live claim is the OLDEST row: a plain newest-first page would drop it, which
@@ -110,10 +110,16 @@ defmodule Loopctl.CoordinationClaimReadTest do
       assert {:ok, _} =
                Coordination.done(tenant.id, agent_id, project.id, "handoff:done", audit())
 
-      expire!(claim!(tenant, agent_id, project, "handoff:stale"))
+      stale = claim!(tenant, agent_id, project, "handoff:stale")
+      expire!(stale)
 
       assert {[first], true} = Coordination.claims_page(tenant.id, project.id, limit: 1)
       assert first.id == open.id
+
+      # An EXPIRED-unswept row holds the slot exactly as an open one does, so it must
+      # outrank the newer DONE row too — otherwise truncation reports a held ref free.
+      assert {[_, second], true} = Coordination.claims_page(tenant.id, project.id, limit: 2)
+      assert second.id == stale.id
     end
 
     test "claiming swaps a ref out of the handoffs list and into this read" do
@@ -189,8 +195,31 @@ defmodule Loopctl.CoordinationClaimReadTest do
       # A NUL byte is valid UTF-8 so Plug forwards it, and Postgres raises 22021 (a 500)
       # comparing it against `text`. Blank/non-binary refs must not widen the point
       # lookup back to the whole channel — the caller would read a stranger's claim.
-      for bad <- [<<"handoff:", 0, "x">>, "", ["handoff:repo#817"]] do
+      # The controller refuses all of these with a 422; this is the defense-in-depth half.
+      for bad <- [<<"handoff:", 0, "x">>, "", "   ", String.duplicate("x", 513), ["a"]] do
+        refute Coordination.valid_ref?(bad)
         assert {[], false} = Coordination.claims_page(tenant.id, project.id, ref: bad)
+      end
+    end
+
+    test "the WRITE twins refuse the same malformed refs the read does — never a 22021" do
+      %{tenant: tenant, project: project, agent_id: agent_id} = setup_member()
+
+      # claim/5 compares the ref against `channel_posts.key` and done/release against
+      # `channel_claims.ref` BEFORE any changeset runs, so an unguarded NUL byte escaped
+      # as a Postgrex 22021 (a 500) rather than the 422/404 the caller is owed.
+      for bad <- [<<"handoff:", 0, "x">>, "   ", String.duplicate("x", 513)] do
+        assert {:error, %Ecto.Changeset{}} =
+                 Coordination.claim(tenant.id, agent_id, project.id, bad,
+                   role: :agent,
+                   audit: audit()
+                 )
+
+        assert {:error, :not_found} =
+                 Coordination.done(tenant.id, agent_id, project.id, bad, audit())
+
+        assert {:error, :not_found} =
+                 Coordination.release(tenant.id, agent_id, project.id, bad, audit())
       end
     end
   end

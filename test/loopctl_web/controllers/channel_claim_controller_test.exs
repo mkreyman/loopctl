@@ -289,7 +289,7 @@ defmodule LoopctlWeb.ChannelClaimControllerTest do
              |> json_response(409)
     end
 
-    test "a malformed ref is an empty page, not a 500 and not the whole channel" do
+    test "a malformed ref is refused, not answered with the whole channel and not a 500" do
       tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
       project = fixture(:project, %{tenant_id: tenant.id})
       {raw, _key, _agent} = member_agent_key(tenant, project)
@@ -299,13 +299,14 @@ defmodule LoopctlWeb.ChannelClaimControllerTest do
              |> json_response(201)
 
       # A NUL byte is valid UTF-8, so Plug forwards it; Postgres refuses to compare it
-      # against `text` and would 500 if it reached the query.
-      body =
-        raw
-        |> get_json(@claim_path, %{project_id: project.id, ref: <<"handoff:", 0, "x">>})
-        |> json_response(200)
-
-      assert body["claims"] == []
+      # against `text` and would 500 if it reached the query. An empty page is no answer
+      # either — it reads as "nothing holds this ref", and the WRITE refuses these with
+      # a 422, so the read must not report them free.
+      for bad <- [<<"handoff:", 0, "x">>, "", "   ", String.duplicate("x", 513)] do
+        assert raw
+               |> get_json(@claim_path, %{project_id: project.id, ref: bad})
+               |> json_response(422)
+      end
     end
 
     test "the cap is reported rather than silently applied" do
