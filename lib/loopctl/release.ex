@@ -16,6 +16,7 @@ defmodule Loopctl.Release do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.Custody.SignedProfilePolicy
+  alias Loopctl.DataMigrations
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.SystemConfig
   alias Loopctl.Tenants.Tenant
@@ -341,6 +342,38 @@ defmodule Loopctl.Release do
   # Ensure AdminRepo is running for the duration of `fun`. `Ecto.Migrator.with_repo/2`
   # starts the repo if it is not already up (the eval-node case) and leaves an
   # already-started repo untouched (the test-sandbox case), so this is safe in both.
+  @doc """
+  #583/#733 — promote pre-reservation idempotency tags into the reserved namespace.
+
+      bin/loopctl eval "Loopctl.Release.reserve_idempotency_tags()"
+      bin/loopctl eval "Loopctl.Release.reserve_idempotency_tags(apply: true)"
+
+  DRY RUN BY DEFAULT, like every other data migration here: a tag rewrite is visible
+  to every reader, so committing it is an explicit act. Options are passed straight
+  through to `Loopctl.DataMigrations.ReserveIdempotencyTags.backfill/1` — `:apply`,
+  `:tenant`, `:drop_legacy`, `:batch_size`, `:throttle`.
+
+  This is the entry point to prefer over the Mix task for anything touching
+  production: `mix` does not exist in a release, and running the sweep from outside
+  the datacenter costs a network round trip per changed row (~6.4 rows/s measured,
+  against seconds from inside). It starts ONLY `AdminRepo` — not the full
+  application — so it adds no second Oban node to a running deployment.
+  """
+  @spec reserve_idempotency_tags(keyword()) :: map()
+  def reserve_idempotency_tags(opts \\ []) do
+    with_admin_repo(fn ->
+      report = DataMigrations.ReserveIdempotencyTags.backfill(opts)
+
+      IO.puts(
+        "#{if report.applied?, do: "applied", else: "dry run"}: " <>
+          "#{report.scanned} article(s) scanned, #{report.changed} with legacy " <>
+          "idempotency tags, #{report.skipped_tag_cap} skipped (tag cap)"
+      )
+
+      report
+    end)
+  end
+
   defp with_admin_repo(fun) do
     load_app()
 
