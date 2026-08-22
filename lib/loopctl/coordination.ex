@@ -154,6 +154,13 @@ defmodule Loopctl.Coordination do
   @default_active_locks_limit 100
   @max_active_locks_limit 200
 
+  # Page bounds on the active-CLAIM read (#707). A claim is one row per outstanding
+  # unit of work on a channel, so a healthy repo's live set is a handful; these bound
+  # the pathological case without truncating any real one. Mirrors the lock bounds
+  # above rather than inventing a second convention.
+  @default_active_claims_limit 100
+  @max_active_claims_limit 200
+
   # FAIRNESS bound on the pinned active-lock read (review #451). The page cap above
   # truncates NEWEST-first, so without this one noisy holder — the lock write cap is
   # 120/min against a 900s TTL — could fill every slot and evict every peer's lock
@@ -1689,6 +1696,108 @@ defmodule Loopctl.Coordination do
         {:error, :not_found}
     end
   end
+
+  @doc """
+  The channel's ACTIVE claims — the NON-DESTRUCTIVE way to ask "is this ref claimed,
+  and by whom" (#707).
+
+  ## Why this read exists
+
+  Until it did, the only way to learn whether a ref was claimed was to ATTEMPT a claim
+  and read the result: a `201` meant it was free, a `409 already_claimed` meant it was
+  taken. That probe is destructive on a shared-agent fleet. `claim/5` is IDEMPOTENT
+  for the owning AGENT, and every session on this fleet authenticates as the same
+  `agent_id`, so a probe issued while a PEER SESSION holds the ref returns that peer's
+  claim as if it were the prober's own — and the release that tidies the probe up
+  DELETES IT. The peer keeps working a handoff the bus has already reopened, and a
+  second machine picks it up. That is not hypothetical: it is what #707 recorded.
+
+  So: read with this, never by claiming. `active?` here answers the same question a
+  `409` does, and answers it without writing anything.
+
+  ## The predicate is the handoffs exclusion, deliberately
+
+  A row is ACTIVE when it is DONE (`done_at IS NOT NULL`, terminal) **or** still OPEN
+  (`lease_expires_at > now`) — byte-for-byte the condition
+  `active_claim_subquery/1` uses to EXCLUDE a handoff from `directed_handoffs_page/3`.
+  That coupling is the whole point: this read must answer "why is that handoff missing
+  from my handoffs list", and a predicate that merely resembled the exclusion would
+  answer a subtly different question and send the reader back to probing. If one moves,
+  move the other.
+
+  A RELEASED claim (row deleted) and a lease that EXPIRED without completion are both
+  absent here, exactly as both reopen the handoff.
+
+  ## Scope, ordering, bounds
+
+  Tenant- AND project-scoped explicitly on `AdminRepo` (the module convention — a query
+  omitting the tenant filter is a bug). Optional `:ref` narrows to one anchor, which is
+  the point-lookup shape a session about to claim actually wants. Ordered newest-claimed
+  first and capped at `clamp_active_claims_limit/1`; the cap is reported rather than
+  silently applied — `{claims, overflowed?}`.
+
+  ## Oracle-safety
+
+  Identical posture to `active_locks_page/3` and `directed_handoffs_page/3`: a malformed
+  `tenant_id`/`project_id` returns `{[], false}` via the `valid_uuid?/1` guard, and a
+  cross-tenant or nonexistent `project_id` naturally returns an empty page rather than a
+  404. Membership is enforced by the caller (the US-40.D3 gate in the controller), never
+  here.
+
+  Returns `{[%ChannelClaim{}], overflowed?}`.
+  """
+  @spec active_claims_page(term(), term(), keyword()) :: {[ChannelClaim.t()], boolean()}
+  def active_claims_page(tenant_id, project_id, opts \\ []) do
+    limit = opts |> Keyword.get(:limit) |> clamp_active_claims_limit()
+    ref = Keyword.get(opts, :ref)
+
+    if valid_uuid?(tenant_id) and valid_uuid?(project_id) do
+      now = DateTime.utc_now()
+
+      rows =
+        ChannelClaim
+        |> where([c], c.tenant_id == ^tenant_id and c.project_id == ^project_id)
+        # The handoffs exclusion, mirrored. See the moduledoc above.
+        |> where([c], not is_nil(c.done_at) or c.lease_expires_at > ^now)
+        |> filter_claims_by_ref(ref)
+        |> order_by([c], desc: c.claimed_at, desc: c.id)
+        # One row over the cap, so overflow is DETECTED rather than inferred from
+        # `length(rows) == limit` — which is ambiguous on an exactly-full page.
+        |> limit(^(limit + 1))
+        |> AdminRepo.all()
+
+      {Enum.take(rows, limit), length(rows) > limit}
+    else
+      {[], false}
+    end
+  end
+
+  defp filter_claims_by_ref(query, ref) when is_binary(ref) and ref != "",
+    do: where(query, [c], c.ref == ^ref)
+
+  defp filter_claims_by_ref(query, _ref), do: query
+
+  @doc "Default page size for `active_claims_page/3`."
+  @spec default_active_claims_limit() :: pos_integer()
+  def default_active_claims_limit, do: @default_active_claims_limit
+
+  @doc """
+  Clamps a caller-supplied `active_claims_page/3` limit to
+  `[1, #{@max_active_claims_limit}]`, defaulting anything unparseable to
+  `#{@default_active_claims_limit}`. Mirrors `clamp_active_locks_limit/1`.
+  """
+  @spec clamp_active_claims_limit(term()) :: pos_integer()
+  def clamp_active_claims_limit(limit) when is_integer(limit) and limit > 0,
+    do: min(limit, @max_active_claims_limit)
+
+  def clamp_active_claims_limit(limit) when is_binary(limit) do
+    case Integer.parse(limit) do
+      {n, ""} when n > 0 -> clamp_active_claims_limit(n)
+      _ -> @default_active_claims_limit
+    end
+  end
+
+  def clamp_active_claims_limit(_), do: @default_active_claims_limit
 
   # Fetch the caller's OWN claim CONSTRAINED to (tenant_id, project_id,
   # claimant_agent_id, ref) — the oracle-safe owner boundary on the AdminRepo

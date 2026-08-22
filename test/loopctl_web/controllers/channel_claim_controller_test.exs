@@ -1,7 +1,8 @@
 defmodule LoopctlWeb.ChannelClaimControllerTest do
   @moduledoc """
   US-40.B1 — the coordination-bus CLAIM endpoints:
-  `POST /api/v1/channel/claims` (claim), `/done`, `/release`.
+  `POST /api/v1/channel/claims` (claim), `/done`, `/release`, and the #707
+  non-destructive read `GET /api/v1/channel/claims`.
 
   Auth resolution and the claim writes both run through `Loopctl.AdminRepo` (one
   sandbox connection), so this stays `async: true`.
@@ -48,6 +49,8 @@ defmodule LoopctlWeb.ChannelClaimControllerTest do
   end
 
   defp post_json(raw, path, params), do: authed_conn(raw) |> post(path, params)
+
+  defp get_json(raw, path, params), do: authed_conn(raw) |> get(path, params)
 
   describe "POST /api/v1/channel/claims" do
     test "a member agent claims a ref -> 201 with the claim" do
@@ -154,6 +157,123 @@ defmodule LoopctlWeb.ChannelClaimControllerTest do
       conn = post_json(raw, @claim_path, %{project_id: project.id, ref: "r"})
       body = json_response(conn, 403)
       assert body["error"]["code"] == "agent_identity_required"
+    end
+  end
+
+  describe "GET /api/v1/channel/claims (#707)" do
+    test "reports a claimed ref without writing anything — the point of the endpoint" do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, agent} = member_agent_key(tenant, project)
+
+      assert %{"claim" => %{"id" => claim_id}} =
+               raw
+               |> post_json(@claim_path, %{project_id: project.id, ref: "handoff:repo#812"})
+               |> json_response(201)
+
+      body = raw |> get_json(@claim_path, %{project_id: project.id}) |> json_response(200)
+
+      assert [listed] = body["claims"]
+      assert listed["id"] == claim_id
+      assert listed["ref"] == "handoff:repo#812"
+      assert listed["claimant_agent_id"] == agent.id
+      assert listed["done"] == false
+      assert body["meta"]["count"] == 1
+      assert body["meta"]["overflow"] == false
+
+      # The read did not disturb the claim: the owner can still release it, which it
+      # could not do if the read had consumed or rewritten the row.
+      assert raw
+             |> post_json(@release_path, %{project_id: project.id, ref: "handoff:repo#812"})
+             |> json_response(200)
+    end
+
+    test "an unclaimed ref is an empty list — the answer that used to require a probe" do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = member_agent_key(tenant, project)
+
+      body =
+        raw
+        |> get_json(@claim_path, %{project_id: project.id, ref: "handoff:repo#never"})
+        |> json_response(200)
+
+      assert body["claims"] == []
+      assert body["meta"]["count"] == 0
+    end
+
+    test "a PEER SESSION's claim is visible to the reader, and reading leaves it intact" do
+      # The #707 shape: two sessions, ONE agent key. Before this endpoint the only way
+      # for the second session to learn the ref was taken was to claim it — which, being
+      # idempotent for the owning agent, handed back the peer's claim, and the tidy-up
+      # release then deleted it.
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = member_agent_key(tenant, project)
+
+      assert %{"claim" => %{"id" => claim_id}} =
+               raw
+               |> post_json(@claim_path, %{project_id: project.id, ref: "handoff:repo#813"})
+               |> json_response(201)
+
+      body =
+        raw
+        |> get_json(@claim_path, %{project_id: project.id, ref: "handoff:repo#813"})
+        |> json_response(200)
+
+      assert [%{"id" => ^claim_id}] = body["claims"]
+
+      # Still there after the read.
+      assert [%{"id" => ^claim_id}] =
+               raw
+               |> get_json(@claim_path, %{project_id: project.id})
+               |> json_response(200)
+               |> Map.fetch!("claims")
+    end
+
+    test "another tenant's project returns an empty page, never a 404 and never its rows" do
+      tenant_a = fixture(:tenant, %{trust_tier: :agent_rooted})
+      project_a = fixture(:project, %{tenant_id: tenant_a.id})
+      {raw_a, _k, _a} = member_agent_key(tenant_a, project_a)
+
+      tenant_b = fixture(:tenant, %{trust_tier: :agent_rooted})
+      project_b = fixture(:project, %{tenant_id: tenant_b.id})
+      {raw_b, _k2, _b} = member_agent_key(tenant_b, project_b)
+
+      assert raw_b
+             |> post_json(@claim_path, %{project_id: project_b.id, ref: "handoff:shared#1"})
+             |> json_response(201)
+
+      body = raw_a |> get_json(@claim_path, %{project_id: project_b.id}) |> json_response(200)
+      assert body["claims"] == []
+    end
+
+    test "a malformed project_id is an empty page, not a 500" do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = member_agent_key(tenant, project)
+
+      body = raw |> get_json(@claim_path, %{project_id: "not-a-uuid"}) |> json_response(200)
+      assert body["claims"] == []
+    end
+
+    test "the cap is reported rather than silently applied" do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = member_agent_key(tenant, project)
+
+      for n <- 1..3 do
+        assert raw
+               |> post_json(@claim_path, %{project_id: project.id, ref: "handoff:repo##{n}"})
+               |> json_response(201)
+      end
+
+      body =
+        raw |> get_json(@claim_path, %{project_id: project.id, limit: "2"}) |> json_response(200)
+
+      assert length(body["claims"]) == 2
+      assert body["meta"]["overflow"] == true
+      assert body["meta"]["limit"] == 2
     end
   end
 end
