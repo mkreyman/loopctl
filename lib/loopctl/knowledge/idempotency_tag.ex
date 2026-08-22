@@ -80,8 +80,9 @@ defmodule Loopctl.Knowledge.IdempotencyTag do
   # `email-marketing` is left alone, while `topical?/1` and the search vector
   # match the bare PREFIX, where `email-`/`corpus-` would drop those real topics
   # the way a broad `p-` drops `p-value`. Its shape-aware
-  # `admissible_suggestion?/1` has no such problem and DOES still admit a bare
-  # `email-<digest>` — closable only by the SPLIT its moduledoc prescribes.
+  # `admissible_suggestion?/1` has no such problem, so that is where those two
+  # families live over there: `ProvenanceTags.opaque_only_prefixes/0`, the SPLIT
+  # its moduledoc prescribes, added in #739.
   #
   # `email` and `corpus` joined in #733, after the #583 census missed them. Both
   # ARE per-capture ids — `email-<sha1(message_id)[:12]>` and
