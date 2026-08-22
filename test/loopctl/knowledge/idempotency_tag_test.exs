@@ -58,7 +58,8 @@ defmodule Loopctl.Knowledge.IdempotencyTagTest do
 
     test "never matches a genuine topical tag" do
       for tag <- ~w(url-design url-generation url-encoding url-routing
-                    url-normalization url-management doc-string book-review elixir) do
+                    url-normalization url-management doc-string book-review elixir
+                    email-marketing email-deliverability corpus-linguistics) do
         refute Tag.legacy?(tag), tag
       end
     end
@@ -86,8 +87,29 @@ defmodule Loopctl.Knowledge.IdempotencyTagTest do
     end
 
     test "matches every family the sourcers emit" do
-      for family <- ~w(url doc book yt repo img file vid web) do
+      for family <- Tag.legacy_families() do
         assert Tag.legacy?("#{family}-#{@hex12}"), family
+      end
+
+      # Named, not just looped: the loop above passes vacuously if a family is
+      # dropped from the allowlist, and #733 was filed because a family that was
+      # never in it went unpromoted for months.
+      for family <- ~w(url doc book repo email corpus) do
+        assert family in Tag.legacy_families(), family
+        assert Tag.legacy?("#{family}-#{@hex12}"), family
+      end
+    end
+
+    test "a real YouTube id can never be promoted from the bare form, `yt` allowlisted or not" do
+      # A YouTube id is case-sensitive base64url, never lowercase hex, so the
+      # digest half refuses it even though `yt` is an allowlisted family. This is
+      # why the sourcer emits `idem-yt-<sha1(video_id)[:12]>` itself — see the
+      # note above @legacy_families.
+      assert "yt" in Tag.legacy_families()
+
+      for id <- ~w(04pdq5IppL8 1Ty_MHZu9nM y-8QpYH4lL0 vSwumoSlZTo) do
+        refute Tag.legacy?("yt-#{id}"), id
+        assert Tag.promote("yt-#{id}") == :error, id
       end
     end
   end

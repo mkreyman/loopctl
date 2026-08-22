@@ -74,7 +74,28 @@ defmodule Loopctl.Knowledge.IdempotencyTag do
   # identity, and `--drop-legacy` would then DELETE the original. An unknown
   # family is left alone instead, which costs only an unpromoted tag that still
   # reads exactly as it did before.
-  @legacy_families ~w(url doc book yt repo img file vid web)
+  #
+  # `email` and `corpus` joined the list in #733, after the #583 census counted
+  # only four families and missed them. Both ARE per-capture ids emitted by real
+  # sourcers — `email-<sha1(message_id)[:12]>` from claude-config's
+  # `extract_email_bodies.py` and `corpus-<sha1(member ids)>` from
+  # `synthesize_batch.py` — so promoting them invents no identity, which is the
+  # only hazard this allowlist exists to prevent. The digest half still does the
+  # discriminating: of 1,496 live `email-` tags, 1,104 are digest-shaped capture
+  # ids and the other 392 are topical (`email-marketing`), and only the first
+  # group promotes.
+  #
+  # `yt` is in the list but can never match, and the reason is worth keeping so
+  # it is not re-litigated: a YouTube id is case-sensitive base64url
+  # (`yt-04pdq5IppL8`), never lowercase hex, so no `yt-` tag in the corpus
+  # satisfies `<digest>` — 0 of 14,191, measured. claude-config#222 reached the
+  # same "leave `yt-` alone" answer from the WRONG premise, that a `yt-` tag is
+  # a grouping tag rather than a capture identity; every family here is carried
+  # by all the atomic notes of one capture, so that would rule out `url` and
+  # `doc` too. SHAPE is the reason, and it is why the YouTube sourcer emits its
+  # own reserved `idem-yt-<sha1(video_id)[:12]>` instead: the server can never
+  # reach that family from the bare form.
+  @legacy_families ~w(url doc book yt repo img file vid web email corpus)
   @legacy_family_source "(?:" <> Enum.join(@legacy_families, "|") <> ")"
 
   @reserved_regex Regex.compile!(
@@ -93,6 +114,15 @@ defmodule Loopctl.Knowledge.IdempotencyTag do
   @doc "The reserved tag prefix. Single source of truth for every derived form."
   @spec reserved_prefix() :: String.t()
   def reserved_prefix, do: @reserved_prefix
+
+  @doc """
+  The source families `legacy?/1` will promote from the bare form.
+
+  Exposed so callers and tests read the enforced list rather than restating it —
+  a second copy is how a family gets added here and silently missed there.
+  """
+  @spec legacy_families() :: [String.t()]
+  def legacy_families, do: @legacy_families
 
   @doc "Human-readable shape of a well-formed reserved tag."
   @spec shape() :: String.t()
