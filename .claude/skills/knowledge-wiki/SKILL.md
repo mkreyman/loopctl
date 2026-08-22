@@ -182,6 +182,43 @@ never pass `tenant_id`/`subject_id`.
    depth, not authority. The server-guaranteed key is the `articles.idempotency_key` column with
    its per-tenant unique index — prefer it, and do not treat a tag as proof of capture identity.
 
+### Three dedup mechanisms, three different questions — do not read one's coverage as another's gap
+
+They are not redundant and they are not substitutes. Before proposing that one "should" cover
+what another does, work out which question you are asking:
+
+| mechanism | the question it answers | granularity |
+|---|---|---|
+| `articles.idempotency_key` | "is THIS EXACT ARTICLE already here?" | per ARTICLE, per-tenant unique, opt-in |
+| `idem-<family>-<digest>` tag | "have I captured THIS SOURCE?" | per SOURCE CAPTURE, shared by every note of it |
+| the novelty gate | "is this near-duplicate of something we hold?" | semantic, no identity needed |
+
+**Never backfill the column from the tag.** The tag is shared by every atomic note of one
+capture — measured 2026-08-22 on the hosted corpus at **15.1 articles per capture** — so a raw
+copy collides on `articles_tenant_idempotency_key_idx` for all but one row per capture. Worse
+than failing: any rows that DID land are then grouped by `Consolidation.idempotency_drift_groups/1`,
+classified `:duplicate_capture`, and **auto-unpublished** (#608). If you need a per-article key
+derived from a capture, the digest can only be a PREFIX plus a stable per-article discriminator —
+exactly what `content_ingestion_worker.ex` does with `ingest:<hash>:<chunk>:<article>`.
+
+**A low `idempotency_key` coverage number is not a defect, and #733 is the worked example.**
+Measured 2026-08-22: the column is set on 813 of 86,431 articles (0.94%), which reads alarming
+until you ask which population it is supposed to cover. Every loopctl-internal writer that
+should set one already does — the ingestion worker, `KnowledgeMocWorker` (`moc:<tag>`),
+`StructuralLinks` (`structural-hub-<source>`), and memory graduation. Of the 16,223 articles
+(18.8%) carrying no identity at all, **14,935 have no `source_type`**: they are agent-authored
+findings, insights and patterns written about the session's own work. They were never captured
+FROM anything, so capture identity is meaningless for them and the novelty gate is their
+mechanism, by design.
+
+The outcome is what to measure, and it was clean: **0 duplicate titles across 80,130 published
+articles, and 0 intra-capture duplicates.** One historical incident exists — a YouTube talk
+captured three times on 2026-07-02 — and it had already been remediated, its 36 redundant copies
+archived with exactly one published copy per title left standing. Note also what that incident
+proves about scope: all three copies shared ONE capture tag, so a source-level tag structurally
+could not have caught it. Only a per-article key could, which is the case the column exists for
+and the reason clients that publish many notes per capture are the ones worth adopting it.
+
 ## Ranking must never key on HOW a document got in (owner decision, 2026-08-21)
 
 `Loopctl.Knowledge.RankingPriors` carried two PROVENANCE priors — a `source_type` table
