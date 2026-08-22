@@ -75,9 +75,13 @@ defmodule Loopctl.Knowledge.IdempotencyTag do
   # before.
   #
   # This is NOT the question `Loopctl.Knowledge.ProvenanceTags` answers — which
-  # prefixes are provenance rather than subject, for MOC hub eligibility and the
-  # search vector. The two lists diverge: `email`/`corpus` are here and not
-  # there, so do not read either as a mirror of the other.
+  # prefixes are provenance rather than subject. The lists diverge because the
+  # MATCHERS do: this one requires the digest half, so `email` is safe here and
+  # `email-marketing` is left alone, while `topical?/1` and the search vector
+  # match the bare PREFIX, where `email-`/`corpus-` would drop those real topics
+  # the way a broad `p-` drops `p-value`. Its shape-aware
+  # `admissible_suggestion?/1` has no such problem and DOES still admit a bare
+  # `email-<digest>` — closable only by the SPLIT its moduledoc prescribes.
   #
   # `email` and `corpus` joined in #733, after the #583 census missed them. Both
   # ARE per-capture ids — `email-<sha1(message_id)[:12]>` and

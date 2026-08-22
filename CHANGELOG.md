@@ -21,7 +21,10 @@ All notable changes to loopctl are documented here.
   newline, so `idem-url-<digest>\n` stored as well-formed and a bare `email-<digest>\n` would
   have been promoted into the reserved namespace with the newline embedded — after which
   `--drop-legacy` deletes the only readable copy. Both anchors are now `\z`. **Operator impact:**
-  a create/update carrying such a tag is now rejected 422 instead of stored.
+  a create/update carrying a RESERVED `idem-...` tag with a trailing newline is now rejected
+  422 instead of stored. A tag without that prefix is unchanged at write time — the article
+  tag-format check still admits it — and now stays put instead of promoting dirty, so any
+  whitespace-dirty tags already in the corpus still need a cleanup pass.
 
 - **Search ranking no longer keys on a document's provenance.** `Loopctl.Knowledge.RankingPriors`
   carried two priors keyed on where a document came from — a `source_type` authority table and a
