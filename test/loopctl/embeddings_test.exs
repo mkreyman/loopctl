@@ -28,9 +28,30 @@ defmodule Loopctl.EmbeddingsTest do
 
   setup :verify_on_exit!
 
-  defp vec(dim), do: Enum.map(1..dim, fn i -> :math.sin(i / dim) end)
+  # Both helpers ride this test's OWN sparse dimensions (`test_vec/2`, seeded per test by
+  # `Process.put(:test_vec_axis, ...)` in DataCase.setup) rather than a shape every test
+  # shares. They used to be `sin(i / dim)` and `sin((i + seed) / dim)` — DENSE and IDENTICAL
+  # across every test at a given dim, which is a distance-0 clique in the shared pgvector
+  # HNSW index: under concurrent load the graph walk cannot navigate a clique of exact ties
+  # and non-deterministically misses exact matches (KB `4e5ccb17`, `0bdadd52`). It is the
+  # same reason DataCase's default MockEmbeddingClient stub keys its vector on `tenant_id`
+  # instead of returning a constant.
+  #
+  # NOT "dead tuples crowd out the live row" — KB `c6fd1e5d` lists that as a dead theory,
+  # disproved by probe (pgvector skips invisible tuples and keeps scanning past 2000
+  # rolled-back ties). Read that article before touching this; the family has been
+  # misdiagnosed twice.
+  defp vec(dim), do: test_vec(dim, :primary)
 
-  defp vec(dim, seed), do: Enum.map(1..dim, fn i -> :math.sin((i + seed) / dim) end)
+  # N DISTINCT vectors that all stay inside THIS test's region: the primary window carries
+  # the identity, and a seed-scaled component on the test's own orthogonal window separates
+  # the members from each other. No call site depends on a particular similarity BETWEEN
+  # them — they just have to be distinct and findable.
+  defp vec(dim, seed) do
+    base = test_vec(dim, :primary)
+    orthogonal = test_vec(dim, :orthogonal)
+    Enum.zip_with(base, orthogonal, fn b, o -> b + o * (seed / 10.0) end)
+  end
 
   # ---------------------------------------------------------------------------
   # AC-41.1.4 / TC-41.1.4 — the tenant's dimension and legible rejection
