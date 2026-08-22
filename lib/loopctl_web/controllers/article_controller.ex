@@ -101,7 +101,8 @@ defmodule LoopctlWeb.ArticleController do
            tags: %OpenApiSpex.Schema{
              type: :array,
              items: %OpenApiSpex.Schema{type: :string},
-             description: IdempotencyTag.contract_description()
+             description:
+               Article.tag_contract_description() <> " " <> IdempotencyTag.contract_description()
            },
            project_id: %OpenApiSpex.Schema{type: :string, format: :uuid, nullable: true},
            source_type: %OpenApiSpex.Schema{type: :string, nullable: true},
@@ -156,9 +157,12 @@ defmodule LoopctlWeb.ArticleController do
         {"Title taken by an article with different content", "application/json",
          Schemas.ErrorResponse},
       422 =>
-        {"Validation error — includes a tag claiming the reserved idempotency " <>
-           "namespace without matching its shape. " <> IdempotencyTag.contract_description(),
-         "application/json", Schemas.ErrorResponse},
+        {"Validation error — includes a malformed tag: one carrying disallowed " <>
+           "characters or surrounding whitespace, or one claiming the reserved idempotency " <>
+           "namespace without matching its shape. " <>
+           Article.tag_contract_description() <>
+           " " <> IdempotencyTag.contract_description(), "application/json",
+         Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -360,9 +364,12 @@ defmodule LoopctlWeb.ArticleController do
          Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       422 =>
-        {"Validation error — includes a tag claiming the reserved idempotency " <>
-           "namespace without matching its shape. " <> IdempotencyTag.contract_description(),
-         "application/json", Schemas.ErrorResponse},
+        {"Validation error — includes a malformed tag: one carrying disallowed " <>
+           "characters or surrounding whitespace, or one claiming the reserved idempotency " <>
+           "namespace without matching its shape. " <>
+           Article.tag_contract_description() <>
+           " " <> IdempotencyTag.contract_description(), "application/json",
+         Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )

@@ -47,7 +47,7 @@ defmodule Loopctl.Knowledge.Tagger do
 
   require Logger
 
-  # The pattern `Loopctl.Knowledge.Article`'s changeset enforces (`~r/^[a-zA-Z0-9_-]+$/`),
+  # The pattern `Loopctl.Knowledge.Article`'s changeset enforces (`~r/\A[a-zA-Z0-9_-]+\z/`),
   # narrowed to the lowercase form `normalize/1` produces. A suggestion the changeset would
   # reject is dropped HERE, so one malformed tag cannot fail the whole article's re-tag —
   # and, more importantly, cannot be written at all: `TagBackfillWorker` persists with

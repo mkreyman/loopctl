@@ -707,7 +707,7 @@ defmodule Loopctl.Knowledge.OKF do
     end
   end
 
-  # loopctl tags must match ~r/^[a-zA-Z0-9_-]+$/ (<=50 tags, <=100 chars). OKF
+  # loopctl tags must match ~r/\A[a-zA-Z0-9_-]+\z/ (<=50 tags, <=100 chars). OKF
   # tags are free strings, so sanitize foreign tags to fit; the originals are
   # preserved under metadata["okf"]["tags"] for lossless re-export.
   #
