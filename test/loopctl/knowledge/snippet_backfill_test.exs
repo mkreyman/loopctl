@@ -21,7 +21,25 @@ defmodule Loopctl.Knowledge.SnippetBackfillTest do
   # cannot discriminate on its own. Seed a known vector explicitly and query with it — the
   # same approach the retrieval eval takes, and it keeps these tests about the SNIPPET
   # rather than about ranking.
-  defp query_vector, do: [1.0 | List.duplicate(0.0, 1535)]
+  # Every vector here — the stored embeddings AND the query — rides `test_vec/2`, so this
+  # test's rows occupy its OWN sparse dimensions of the shared pgvector HNSW index
+  # (`Process.put(:test_vec_axis, ...)` in DataCase.setup). The literal it replaced was
+  # `[1.0 | zeros]`: dimension 0, shared by every test in this file and colliding with any
+  # peer that also reached for the obvious vector.
+  #
+  # That literal is why this file hit #645 in CI on 2026-08-22 ("the canonical must be
+  # retrievable for this assertion to mean anything", green on rerun). The sandbox rolls
+  # each test back, a rolled-back INSERT leaves a dead entry in the graph, and a live row
+  # that links only to dead neighbours becomes UNREACHABLE — so the ANN read returns nothing
+  # while the row is demonstrably present. Sharing one axis is what puts this file's rows in
+  # the same corner of the graph as everyone else's corpses.
+  #
+  # The alternative repair, `@moduletag :vacuum_vector_indexes`, works but is not free:
+  # measured on this suite, adding it to this ONE module took the full run from 37.9s to
+  # 56.2s (+50%), because the VACUUM contends with every other async worker rather than
+  # costing anything much on its own. Prefer the axis; reach for the vacuum only where an
+  # ANN assertion genuinely cannot be isolated onto one.
+  defp query_vector, do: test_vec(1536, :primary)
 
   defp published(tenant_id, title, body) do
     {:ok, article} =
