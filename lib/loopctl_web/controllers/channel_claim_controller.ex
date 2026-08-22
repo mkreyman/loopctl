@@ -236,8 +236,10 @@ defmodule LoopctlWeb.ChannelClaimController do
   over its concurrent-claim budget, and a non-member — and it returns the CALLER's own
   listed open claim idempotently rather than refusing it. Each row carries `done` and
   `expired` for the handoffs question: `done`, or an unexpired lease, is what keeps the
-  ref out of `GET /channel/handoffs`; `expired: true` means the handoff has already
-  reopened and the row is merely awaiting the sweeper — retry shortly, do not move on.
+  ref out of `GET /channel/handoffs`; `expired: true` means the claim no longer holds it
+  out and the row is merely awaiting the sweeper — so retry shortly rather than moving
+  on, but check `GET /channel/handoffs`: a superseded, quarantined or TTL-expired post
+  does not come back, and a claim on it is refused however long you wait.
 
   Tenant-scoped from the verified key and NOT membership-gated (see the moduledoc). A
   cross-tenant or nonexistent `project_id` returns an empty page, never a 404 — the same
@@ -323,7 +325,8 @@ defmodule LoopctlWeb.ChannelClaimController do
       # them subtly different from the ones the server enforces. `done` (terminal) or a
       # future lease is what EXCLUDES the handoff; `expired` is the row that no longer
       # excludes it but still holds the unique slot, so a claim on it is refused until
-      # the ChannelClaimSweeper reaps it.
+      # the ChannelClaimSweeper reaps it — which does NOT promise the handoff is back in
+      # `GET /channel/handoffs`, since a superseded/quarantined/expired post never is.
       done: not is_nil(claim.done_at),
       expired: is_nil(claim.done_at) and DateTime.compare(claim.lease_expires_at, now) != :gt
     }

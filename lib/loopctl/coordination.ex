@@ -1744,7 +1744,9 @@ defmodule Loopctl.Coordination do
   an agent told "free", then told "taken, move on", for up to one sweeper interval.
   The two flags the handoffs question needs ride on each row instead: a row with
   `done_at` set, or with a lease still in the future, is one EXCLUDING its handoff; an
-  expired, not-done row has already reopened its handoff and is merely awaiting sweep.
+  expired, not-done row no longer excludes it and is merely awaiting sweep. Whether that
+  handoff is actually BACK in `directed_handoffs_page/3` is a question about the POST,
+  not the claim — a superseded, quarantined or TTL-expired post never reappears.
 
   A RELEASED claim (row deleted) and a SWEPT one are absent, which is also exactly
   when the ref becomes claimable again.
