@@ -21,7 +21,32 @@ defmodule Loopctl.Knowledge.SnippetBackfillTest do
   # cannot discriminate on its own. Seed a known vector explicitly and query with it — the
   # same approach the retrieval eval takes, and it keeps these tests about the SNIPPET
   # rather than about ranking.
-  defp query_vector, do: [1.0 | List.duplicate(0.0, 1535)]
+  # Every vector here — the stored embeddings AND the query — rides `test_vec/2`, so this
+  # module's rows occupy its OWN sparse dimensions of the shared pgvector HNSW index
+  # (`Process.put(:test_vec_axis, ...)` in DataCase.setup). The literal it replaced was
+  # `[1.0 | zeros]`: dimension 0, shared by all ten tests in this file.
+  #
+  # THE MECHANISM IS THE DISTANCE-0 CLIQUE, not dead tuples. Ten rows at an identical
+  # vector are all exact ties, and under concurrent full-suite load the graph walk cannot
+  # navigate that clique — it non-deterministically misses exact matches. That is KB
+  # `4e5ccb17` and `0bdadd52` ("the fix is per-tenant mock embeddings, NOT raising
+  # ef_search"), and it is the same reason `DataCase`'s default `MockEmbeddingClient` stub
+  # keys `deterministic_embedding/1` on `tenant_id` rather than returning a constant.
+  #
+  # Do NOT re-explain this as "rolled-back tuples crowd out the live row". KB `c6fd1e5d`
+  # lists that as a DEAD THEORY, disproved by probe: pgvector returns the live row past
+  # 2000 rolled-back distance-0 ties, because it skips invisible tuples and keeps scanning.
+  # That article exists because this family has been misdiagnosed twice, each time costing
+  # reverted fixes — so match on the mechanism, and read it before touching this.
+  #
+  # WHY NOT `@moduletag :vacuum_vector_indexes`. It is the other documented repair and it
+  # works, but it is not free, and the cost is invisible if you measure one file: adding it
+  # to this ONE module took the full suite from 37.9s to 56.2s (+50%), and on 24 ANN-reading
+  # modules to 744s (18.6x). The VACUUM contends with every other async worker rather than
+  # costing much on its own, so it taxes the WHOLE suite, not the module that opts in. The
+  # axis is free — 37.97s against a 37.85s baseline. Prefer the axis; reach for the vacuum
+  # only where an ANN assertion genuinely cannot be isolated onto one.
+  defp query_vector, do: test_vec(1536, :primary)
 
   defp published(tenant_id, title, body) do
     {:ok, article} =
