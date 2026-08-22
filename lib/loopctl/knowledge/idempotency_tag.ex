@@ -62,19 +62,50 @@ defmodule Loopctl.Knowledge.IdempotencyTag do
   @family_source "[a-z][a-z0-9]{1,15}"
   @digest_source "[0-9a-f]{12}|[0-9a-f]{40}"
 
-  # The source families the harvest sourcers actually emit, mirroring the
-  # provenance-id prefixes `Loopctl.Workers.KnowledgeMocWorker` already excludes
-  # from hub topics. This allowlist constrains the LEGACY matcher only, and the
-  # asymmetry is the point: the reserved form is EXPLICITLY claimed by its
-  # writer, so any family is legal there, while the legacy form is INFERRED by
-  # shape from an unprefixed tag and so must be conservative. A bare
-  # `<anything>-<12|40 hex>` also describes a git object id (`commit-<sha>`), a
-  # timestamp (`release-202604150930`) and a zero-padded id
-  # (`ticket-000000012345`) — promoting one of those fabricates a capture
-  # identity, and `--drop-legacy` would then DELETE the original. An unknown
-  # family is left alone instead, which costs only an unpromoted tag that still
-  # reads exactly as it did before.
-  @legacy_families ~w(url doc book yt repo img file vid web)
+  # The source families the harvest sourcers write per-capture ids under. This
+  # allowlist constrains the LEGACY matcher only, and the asymmetry is the
+  # point: the reserved form is EXPLICITLY claimed by its writer, so any family
+  # is legal there, while the legacy form is INFERRED by shape from an
+  # unprefixed tag and so must be conservative. A bare `<anything>-<12|40 hex>`
+  # also describes a git object id (`commit-<sha>`), a timestamp
+  # (`release-202604150930`) and a zero-padded id (`ticket-000000012345`) —
+  # promoting one of those fabricates a capture identity, and `--drop-legacy`
+  # would then DELETE the original. An unknown family is left alone instead,
+  # which costs only an unpromoted tag that still reads exactly as it did
+  # before.
+  #
+  # This is NOT the question `Loopctl.Knowledge.ProvenanceTags` answers — which
+  # prefixes are provenance rather than subject. The lists diverge because the
+  # MATCHERS do: this one requires the digest half, so `email` is safe here and
+  # `email-marketing` is left alone, while `topical?/1` and the search vector
+  # match the bare PREFIX, where `email-`/`corpus-` would drop those real topics
+  # the way a broad `p-` drops `p-value`. Its shape-aware
+  # `admissible_suggestion?/1` has no such problem and DOES still admit a bare
+  # `email-<digest>` — closable only by the SPLIT its moduledoc prescribes.
+  #
+  # `email` and `corpus` joined in #733, after the #583 census missed them. Both
+  # ARE per-capture ids — `email-<sha1(message_id)[:12]>` and
+  # `corpus-<sha1(member ids)>` — so promoting them invents no identity, which
+  # is the only hazard this allowlist exists to prevent. Their sourcers
+  # (claude-config's `extract_email_bodies.py` and `synthesize_batch.py`) emit
+  # the RESERVED form directly now; what this list reaches is the BACKLOG of
+  # bare tags written before that, which nothing else can promote. The digest
+  # half still does the discriminating, so a topical `email-marketing` is left
+  # alone. `art` was assessed at the same time and deliberately left out:
+  # claude-config's `prune_kb.py` names it in a local list, but no sourcer emits
+  # an `art-` capture id, and a family with no writer is exactly the guess this
+  # allowlist refuses to make.
+  #
+  # `yt` is in the list but can never match, and the reason is worth keeping so
+  # it is not re-litigated: a YouTube id is ELEVEN characters and
+  # `@digest_source` accepts only 12 or 40, so length refuses every `yt-<id>`
+  # whatever its alphabet. claude-config#222 reached the same "leave `yt-` alone"
+  # answer from the WRONG premise, that a `yt-` tag is a grouping tag rather than
+  # a capture identity; every family here is carried by all the atomic notes of
+  # one capture, so that would rule out `url` and `doc` too. That is why the
+  # YouTube sourcer emits its own reserved `idem-yt-<sha1(video_id)[:12]>`: the
+  # server can never reach that family from the bare form.
+  @legacy_families ~w(url doc book yt repo img file vid web email corpus)
   @legacy_family_source "(?:" <> Enum.join(@legacy_families, "|") <> ")"
 
   @reserved_regex Regex.compile!(
@@ -83,9 +114,9 @@ defmodule Loopctl.Knowledge.IdempotencyTag do
                       "(" <>
                       @family_source <>
                       ")-(" <>
-                      @digest_source <> ")$"
+                      @digest_source <> ")\\z"
                   )
-  @legacy_regex Regex.compile!("^(" <> @legacy_family_source <> ")-(" <> @digest_source <> ")$")
+  @legacy_regex Regex.compile!("^(" <> @legacy_family_source <> ")-(" <> @digest_source <> ")\\z")
 
   @shape "#{@reserved_prefix}<family>-<digest>"
   @example "#{@reserved_prefix}url-7ebe1ca33431"
@@ -93,6 +124,15 @@ defmodule Loopctl.Knowledge.IdempotencyTag do
   @doc "The reserved tag prefix. Single source of truth for every derived form."
   @spec reserved_prefix() :: String.t()
   def reserved_prefix, do: @reserved_prefix
+
+  @doc """
+  The source families `legacy?/1` will promote from the bare form.
+
+  Exposed so callers and tests read the enforced list rather than restating it —
+  a second copy is how a family gets added here and silently missed there.
+  """
+  @spec legacy_families() :: [String.t()]
+  def legacy_families, do: @legacy_families
 
   @doc "Human-readable shape of a well-formed reserved tag."
   @spec shape() :: String.t()

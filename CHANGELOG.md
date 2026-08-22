@@ -6,6 +6,26 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **`mix loopctl.reserve_idempotency_tags` now promotes the `email-` and `corpus-` families
+  too (#733).** The #583 census missed both: bare `email-<sha1(message_id)[:12]>` (the inbox
+  sourcer) and `corpus-<sha1(member ids)>` (the corpus synthesizer) are per-capture ids exactly
+  like `url-`/`doc-`, but were absent from the legacy allowlist, so the backfill would have left
+  that backlog in the ambiguous namespace forever. Both halves of the shape rule are unchanged,
+  so only the digest-shaped tags promote — a topical `email-marketing` is still left alone, and
+  `yt-` and `art-` stay unpromotable (the note above `@legacy_families` records why).
+  **Operator impact:** re-run the task; it is idempotent, so rows promoted by an earlier run are
+  untouched and only the newly-eligible families are written.
+
+- **A tag with a trailing newline no longer satisfies the idempotency-tag shape rules.** Both
+  matchers were anchored with `$`, which in PCRE also matches immediately before a trailing
+  newline, so `idem-url-<digest>\n` stored as well-formed and a bare `email-<digest>\n` would
+  have been promoted into the reserved namespace with the newline embedded — after which
+  `--drop-legacy` deletes the only readable copy. Both anchors are now `\z`. **Operator impact:**
+  a create/update carrying a RESERVED `idem-...` tag with a trailing newline is now rejected
+  422 instead of stored. A tag without that prefix is unchanged at write time — the article
+  tag-format check still admits it — and now stays put instead of promoting dirty, so any
+  whitespace-dirty tags already in the corpus still need a cleanup pass.
+
 - **Search ranking no longer keys on a document's provenance.** `Loopctl.Knowledge.RankingPriors`
   carried two priors keyed on where a document came from — a `source_type` authority table and a
   first-party/third-party split keyed on the sourcers' capture tags (`book-`/`url-`/`yt-`/`doc-`

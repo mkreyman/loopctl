@@ -45,6 +45,9 @@ defmodule Loopctl.Knowledge.IdempotencyTagTest do
       refute Tag.well_formed?("idem-url-#{String.upcase(@hex12)}")
       refute Tag.well_formed?("url-#{@hex12}")
       refute Tag.well_formed?(nil)
+      # PCRE `$` also matches before a trailing newline, so the anchors are `\\z`:
+      # a whitespace-dirty tag must not store as well-formed.
+      refute Tag.well_formed?("idem-url-#{@hex12}\n")
     end
   end
 
@@ -58,7 +61,8 @@ defmodule Loopctl.Knowledge.IdempotencyTagTest do
 
     test "never matches a genuine topical tag" do
       for tag <- ~w(url-design url-generation url-encoding url-routing
-                    url-normalization url-management doc-string book-review elixir) do
+                    url-normalization url-management doc-string book-review elixir
+                    email-marketing email-deliverability corpus-linguistics) do
         refute Tag.legacy?(tag), tag
       end
     end
@@ -86,8 +90,33 @@ defmodule Loopctl.Knowledge.IdempotencyTagTest do
     end
 
     test "matches every family the sourcers emit" do
-      for family <- ~w(url doc book yt repo img file vid web) do
+      # Named literally and pinned in BOTH directions: a loop over
+      # `legacy_families/0` alone asserts the list against itself and so passes
+      # vacuously when a family is dropped, which is the half #733 was filed for.
+      families = ~w(url doc book yt repo img file vid web email corpus)
+      assert Enum.sort(Tag.legacy_families()) == Enum.sort(families)
+
+      for family <- families do
         assert Tag.legacy?("#{family}-#{@hex12}"), family
+      end
+    end
+
+    test "a trailing newline is not a legacy tag — it must not promote" do
+      dirty = "email-#{@hex12}\n"
+      refute Tag.legacy?(dirty)
+      assert Tag.promote(dirty) == :error
+      assert Tag.promote_tags([dirty], drop_legacy: true) == [dirty]
+    end
+
+    test "a real YouTube id can never be promoted from the bare form, `yt` allowlisted or not" do
+      # A YouTube id is ELEVEN characters and the digest half accepts only 12 or
+      # 40, so LENGTH refuses it even though `yt` is allowlisted — the alphabet
+      # never gets a say. See the note above @legacy_families.
+      assert "yt" in Tag.legacy_families()
+
+      for id <- ~w(04pdq5IppL8 1Ty_MHZu9nM y-8QpYH4lL0 vSwumoSlZTo) do
+        refute Tag.legacy?("yt-#{id}"), id
+        assert Tag.promote("yt-#{id}") == :error, id
       end
     end
   end
