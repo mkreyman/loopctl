@@ -11,6 +11,8 @@ defmodule LoopctlWeb.ChannelClaimControllerTest do
 
   import Ecto.Query, only: [from: 2]
 
+  alias Loopctl.Coordination
+
   setup :verify_on_exit!
 
   @claim_path "/api/v1/channel/claims"
@@ -326,6 +328,61 @@ defmodule LoopctlWeb.ChannelClaimControllerTest do
       assert length(body["claims"]) == 2
       assert body["meta"]["overflow"] == true
       assert body["meta"]["limit"] == 2
+    end
+  end
+
+  describe "the 409 is split by cause (#707 follow-up)" do
+    test "an expired-but-unswept lease -> 409 claim_lease_expired with a retry-after" do
+      # The one 409 on this surface where the old unconditional "move on to other work"
+      # was wrong: the row is a husk awaiting the sweeper, so the ref is about to be free.
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = member_agent_key(tenant, project)
+
+      assert %{"claim" => %{"id" => claim_id}} =
+               raw
+               |> post_json(@claim_path, %{project_id: project.id, ref: "handoff:expired"})
+               |> json_response(201)
+
+      Loopctl.AdminRepo.update_all(
+        from(c in Loopctl.Coordination.ChannelClaim, where: c.id == ^claim_id),
+        set: [lease_expires_at: DateTime.add(DateTime.utc_now(), -5, :second)]
+      )
+
+      conn = post_json(raw, @claim_path, %{project_id: project.id, ref: "handoff:expired"})
+      body = json_response(conn, 409)
+
+      assert body["error"]["code"] == "claim_lease_expired"
+      assert body["error"]["message"] =~ "retry THIS ref"
+      assert [_] = get_resp_header(conn, "retry-after")
+    end
+
+    test "a caller at its claim budget -> 409 claim_budget_exhausted, and the ref is free" do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = member_agent_key(tenant, project)
+
+      for n <- 1..Coordination.max_concurrent_open_claims() do
+        assert raw
+               |> post_json(@claim_path, %{project_id: project.id, ref: "handoff:b##{n}"})
+               |> json_response(201)
+      end
+
+      body =
+        raw
+        |> post_json(@claim_path, %{project_id: project.id, ref: "handoff:untouched"})
+        |> json_response(409)
+
+      assert body["error"]["code"] == "claim_budget_exhausted"
+
+      # The distinction is load-bearing, not cosmetic: a DIFFERENT agent takes the very
+      # ref the first was refused, which is why reporting this as already_claimed made
+      # the caller record a free ref as taken.
+      {raw_b, _k, _a} = member_agent_key(tenant, project)
+
+      assert raw_b
+             |> post_json(@claim_path, %{project_id: project.id, ref: "handoff:untouched"})
+             |> json_response(201)
     end
   end
 end

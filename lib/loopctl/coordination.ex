@@ -1523,6 +1523,20 @@ defmodule Loopctl.Coordination do
   @spec default_lease_seconds() :: pos_integer()
   def default_lease_seconds, do: @default_lease_seconds
 
+  # Per-agent concurrent open claim bound (anti-squatting, AC-40.B1 review finding).
+  # Deliberately generous — normal agents should never hit this — but prevents a
+  # single compromised/broken agent from enumerating and claiming every open handoff.
+  @max_concurrent_open_claims 50
+
+  @doc """
+  The maximum concurrent OPEN claims one agent may hold on one project.
+
+  Exceeding it is `{:error, :claim_budget_exhausted}` — a limit on the CALLER, never a
+  statement about the ref, which may well be free.
+  """
+  @spec max_concurrent_open_claims() :: pos_integer()
+  def max_concurrent_open_claims, do: @max_concurrent_open_claims
+
   @doc """
   Claims a handoff `ref` for exactly ONE agent — the INSERT-to-claim write
   (US-40.B1). A successful INSERT returns `{:ok, %ChannelClaim{}}`; a concurrent
@@ -1573,20 +1587,37 @@ defmodule Loopctl.Coordination do
   owns the slot), and the owner re-claiming its OWN already-DONE claim, still get
   `{:error, :already_claimed}`.
 
+  ## The 409 is split by CAUSE (#707 follow-up)
+
+  Four different situations refuse a claim, and "move on to another ref" is the right
+  advice for only two of them. They used to share `:already_claimed`, whose rendered
+  message says "Do not retry the same ref" — so a caller that hit either of the other two
+  abandoned work it could have had.
+
+    * `:already_claimed` — a PEER holds a live claim, or the caller already COMPLETED
+      this one. The ref is genuinely taken: move on.
+    * `:claim_lease_expired` — a row still holds the unique slot but its lease expired
+      without completion (the caller's own or a peer's). Nobody is working it and
+      `ChannelClaimSweeper` will reap it: RETRY THIS REF shortly. `claims_page/3` lists
+      that same row and flags it expired, so without this code the write contradicted
+      the read.
+    * `:ref_superseded` — the ref's newest live post was superseded; nobody holds the
+      ref at all, and the caller should claim the successor.
+    * `:claim_budget_exhausted` — the caller is at `max_concurrent_open_claims/0`. A
+      limit on the CALLER, saying nothing about the ref, which may well be free.
+
   Returns `{:ok, %ChannelClaim{}}` (fresh claim OR idempotent owner re-claim),
-  `{:error, :already_claimed}`,
+  one of the four 409 reasons above,
   `{:error, :not_found}` (missing/cross-tenant/cross-project),
   `{:error, :agent_not_found}` (foreign-tenant server-stamped agent), or
   `{:error, %Ecto.Changeset{}}` (a bad `ref` — over-length or NUL byte).
   """
-  # Per-agent concurrent open claim bound (anti-squatting, AC-40.B1 review finding).
-  # Deliberately generous — normal agents should never hit this — but prevents a
-  # single compromised/broken agent from enumerating and claiming every open handoff.
-  @max_concurrent_open_claims 50
-
   @spec claim(Ecto.UUID.t(), Ecto.UUID.t(), term(), term(), keyword()) ::
           {:ok, ChannelClaim.t()}
           | {:error, :already_claimed}
+          | {:error, :claim_lease_expired}
+          | {:error, :ref_superseded}
+          | {:error, :claim_budget_exhausted}
           | {:error, :not_found}
           | {:error, :agent_not_found}
           | {:error, Ecto.Changeset.t()}
@@ -1955,7 +1986,17 @@ defmodule Loopctl.Coordination do
   # holds instead of being falsely told "another agent owns this, move on" and
   # abandoning it until the lease expires. Anything else (a peer's claim, a
   # since-released/gone row, or the caller's OWN already-DONE claim) is a real
-  # collision -> {:error, :already_claimed} (409).
+  # collision -> a 409.
+  #
+  # The 409 is SPLIT by cause, because "move on to other work" is the right advice for
+  # only some of them (#707 follow-up). A row whose lease EXPIRED without completion —
+  # the caller's own or a peer's — still holds the unique slot, so the insert fails, but
+  # nobody is working it and `ChannelClaimSweeper` is about to reap it: that is
+  # `:claim_lease_expired`, and the caller should RETRY THIS REF SHORTLY. Everything else
+  # (a peer's live claim, the caller's own DONE claim, a row released between the insert
+  # and this read) is `:already_claimed`, where moving on IS correct. `claims_page/3`
+  # already draws the same line with its `expired` flag; without this split the API told
+  # the caller one thing and the read told it the other.
   #
   # No new TOCTOU window: the unique index still enforces exactly-once at INSERT time;
   # this read runs AFTER the failed insert only to CLASSIFY the loser, never to decide
@@ -1970,12 +2011,16 @@ defmodule Loopctl.Coordination do
         if DateTime.compare(lease, now) == :gt do
           {:ok, existing}
         else
-          # Expired lease: the owner is re-claiming a dead handoff. Treat as a real
-          # collision so the caller learns the ref is NOT held. Discovery agrees — it
-          # LISTS the row (it still holds the unique slot) and flags it `expired`, so
-          # the caller is told to retry once the sweeper reaps it, not to move on.
-          {:error, :already_claimed}
+          {:error, :claim_lease_expired}
         end
+
+      # A PEER's dead lease is the same situation from the other side: the row still
+      # holds the unique slot, so the insert failed, but nobody is working it and the
+      # sweeper is about to reap it. Retry shortly — do NOT move on.
+      %ChannelClaim{done_at: nil, lease_expires_at: lease} ->
+        if DateTime.compare(lease, now) == :gt,
+          do: {:error, :already_claimed},
+          else: {:error, :claim_lease_expired}
 
       _ ->
         {:error, :already_claimed}
@@ -2020,7 +2065,7 @@ defmodule Loopctl.Coordination do
 
     case newest do
       %ChannelPost{superseded_by: nil} -> :ok
-      %ChannelPost{} -> {:error, :already_claimed}
+      %ChannelPost{} -> {:error, :ref_superseded}
       nil -> :ok
     end
   end
@@ -2041,7 +2086,7 @@ defmodule Loopctl.Coordination do
       |> AdminRepo.aggregate(:count)
 
     if count >= @max_concurrent_open_claims do
-      {:error, :already_claimed}
+      {:error, :claim_budget_exhausted}
     else
       :ok
     end

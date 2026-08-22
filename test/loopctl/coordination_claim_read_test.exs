@@ -92,7 +92,10 @@ defmodule Loopctl.CoordinationClaimReadTest do
       assert {[listed], false} = Coordination.claims_page(tenant.id, project.id)
       assert listed.id == claim.id
 
-      assert {:error, :already_claimed} =
+      # ...and the 409 carries the code that matches what the read just showed: an
+      # expired husk to retry, NOT a taken ref to move on from. Asserting the specific
+      # code here is what pins read and write to the same story.
+      assert {:error, :claim_lease_expired} =
                Coordination.claim(tenant.id, agent_id, project.id, "handoff:repo#814",
                  role: :agent,
                  audit: audit()

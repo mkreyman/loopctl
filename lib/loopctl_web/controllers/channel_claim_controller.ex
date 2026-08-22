@@ -160,6 +160,15 @@ defmodule LoopctlWeb.ChannelClaimController do
           # another agent owns the ref — never confused with a validation 422.
           {:error, :already_claimed}
 
+        # The other three causes of a 409 on this path, each with its own code so the
+        # advice in the body can be right (#707). Passed straight through — the
+        # FallbackController owns the wording, and listing them here rather than under a
+        # catch-all keeps this case statement an explicit inventory of what claim/5
+        # returns, so a new cause is a compile-time CaseClauseError and not a silent 500.
+        {:error, reason}
+        when reason in [:claim_lease_expired, :ref_superseded, :claim_budget_exhausted] ->
+          {:error, reason}
+
         {:error, :not_found} ->
           # Missing / cross-tenant / cross-PROJECT (non-member) all collapse to one
           # byte-identical 422 — no oracle distinguishing them.
