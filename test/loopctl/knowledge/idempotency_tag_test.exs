@@ -45,6 +45,9 @@ defmodule Loopctl.Knowledge.IdempotencyTagTest do
       refute Tag.well_formed?("idem-url-#{String.upcase(@hex12)}")
       refute Tag.well_formed?("url-#{@hex12}")
       refute Tag.well_formed?(nil)
+      # PCRE `$` also matches before a trailing newline, so the anchors are `\\z`:
+      # a whitespace-dirty tag must not store as well-formed.
+      refute Tag.well_formed?("idem-url-#{@hex12}\n")
     end
   end
 
@@ -87,24 +90,28 @@ defmodule Loopctl.Knowledge.IdempotencyTagTest do
     end
 
     test "matches every family the sourcers emit" do
-      for family <- Tag.legacy_families() do
-        assert Tag.legacy?("#{family}-#{@hex12}"), family
-      end
+      # Named literally and pinned in BOTH directions: a loop over
+      # `legacy_families/0` alone asserts the list against itself and so passes
+      # vacuously when a family is dropped, which is the half #733 was filed for.
+      families = ~w(url doc book yt repo img file vid web email corpus)
+      assert Enum.sort(Tag.legacy_families()) == Enum.sort(families)
 
-      # Named, not just looped: the loop above passes vacuously if a family is
-      # dropped from the allowlist, and #733 was filed because a family that was
-      # never in it went unpromoted for months.
-      for family <- ~w(url doc book repo email corpus) do
-        assert family in Tag.legacy_families(), family
+      for family <- families do
         assert Tag.legacy?("#{family}-#{@hex12}"), family
       end
     end
 
+    test "a trailing newline is not a legacy tag — it must not promote" do
+      dirty = "email-#{@hex12}\n"
+      refute Tag.legacy?(dirty)
+      assert Tag.promote(dirty) == :error
+      assert Tag.promote_tags([dirty], drop_legacy: true) == [dirty]
+    end
+
     test "a real YouTube id can never be promoted from the bare form, `yt` allowlisted or not" do
-      # A YouTube id is case-sensitive base64url, never lowercase hex, so the
-      # digest half refuses it even though `yt` is an allowlisted family. This is
-      # why the sourcer emits `idem-yt-<sha1(video_id)[:12]>` itself — see the
-      # note above @legacy_families.
+      # A YouTube id is ELEVEN characters and the digest half accepts only 12 or
+      # 40, so LENGTH refuses it even though `yt` is allowlisted — the alphabet
+      # never gets a say. See the note above @legacy_families.
       assert "yt" in Tag.legacy_families()
 
       for id <- ~w(04pdq5IppL8 1Ty_MHZu9nM y-8QpYH4lL0 vSwumoSlZTo) do

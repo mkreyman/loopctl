@@ -7,18 +7,21 @@ All notable changes to loopctl are documented here.
 ### Changed
 
 - **`mix loopctl.reserve_idempotency_tags` now promotes the `email-` and `corpus-` families
-  too (#733).** The #583 census counted four families and missed two: `email-<sha1(id)[:12]>`
-  (claude-config's inbox sourcer) and `corpus-<sha1(member ids)>` (the corpus synthesizer) are
-  per-capture ids exactly like `url-`/`doc-`, but were absent from the legacy allowlist, so the
-  backfill would have left them in the ambiguous namespace forever. Both halves of the shape
-  rule are unchanged, so only the digest-shaped tags promote — a topical `email-marketing` is
-  still left alone. **Operator impact:** re-run the task; it is idempotent, so rows promoted by
-  an earlier run are untouched and only the newly-eligible families are written.
+  too (#733).** The #583 census missed both: bare `email-<sha1(message_id)[:12]>` (the inbox
+  sourcer) and `corpus-<sha1(member ids)>` (the corpus synthesizer) are per-capture ids exactly
+  like `url-`/`doc-`, but were absent from the legacy allowlist, so the backfill would have left
+  that backlog in the ambiguous namespace forever. Both halves of the shape rule are unchanged,
+  so only the digest-shaped tags promote — a topical `email-marketing` is still left alone, and
+  `yt-` and `art-` stay unpromotable (the note above `@legacy_families` records why).
+  **Operator impact:** re-run the task; it is idempotent, so rows promoted by an earlier run are
+  untouched and only the newly-eligible families are written.
 
-  `yt-` is deliberately still unpromotable, and NOT because a `yt-` tag is a grouping tag rather
-  than a capture id (that reasoning ruled out `url-` and `doc-` as well). A YouTube id is
-  case-sensitive base64url, never lowercase hex, so it can never satisfy `<digest>`; the YouTube
-  sourcer emits `idem-yt-<sha1(video_id)[:12]>` itself for that reason.
+- **A tag with a trailing newline no longer satisfies the idempotency-tag shape rules.** Both
+  matchers were anchored with `$`, which in PCRE also matches immediately before a trailing
+  newline, so `idem-url-<digest>\n` stored as well-formed and a bare `email-<digest>\n` would
+  have been promoted into the reserved namespace with the newline embedded — after which
+  `--drop-legacy` deletes the only readable copy. Both anchors are now `\z`. **Operator impact:**
+  a create/update carrying such a tag is now rejected 422 instead of stored.
 
 - **Search ranking no longer keys on a document's provenance.** `Loopctl.Knowledge.RankingPriors`
   carried two priors keyed on where a document came from — a `source_type` authority table and a
