@@ -22,23 +22,30 @@ defmodule Loopctl.Knowledge.SnippetBackfillTest do
   # same approach the retrieval eval takes, and it keeps these tests about the SNIPPET
   # rather than about ranking.
   # Every vector here — the stored embeddings AND the query — rides `test_vec/2`, so this
-  # test's rows occupy its OWN sparse dimensions of the shared pgvector HNSW index
+  # module's rows occupy its OWN sparse dimensions of the shared pgvector HNSW index
   # (`Process.put(:test_vec_axis, ...)` in DataCase.setup). The literal it replaced was
-  # `[1.0 | zeros]`: dimension 0, shared by every test in this file and colliding with any
-  # peer that also reached for the obvious vector.
+  # `[1.0 | zeros]`: dimension 0, shared by all ten tests in this file.
   #
-  # That literal is why this file hit #645 in CI on 2026-08-22 ("the canonical must be
-  # retrievable for this assertion to mean anything", green on rerun). The sandbox rolls
-  # each test back, a rolled-back INSERT leaves a dead entry in the graph, and a live row
-  # that links only to dead neighbours becomes UNREACHABLE — so the ANN read returns nothing
-  # while the row is demonstrably present. Sharing one axis is what puts this file's rows in
-  # the same corner of the graph as everyone else's corpses.
+  # THE MECHANISM IS THE DISTANCE-0 CLIQUE, not dead tuples. Ten rows at an identical
+  # vector are all exact ties, and under concurrent full-suite load the graph walk cannot
+  # navigate that clique — it non-deterministically misses exact matches. That is KB
+  # `4e5ccb17` and `0bdadd52` ("the fix is per-tenant mock embeddings, NOT raising
+  # ef_search"), and it is the same reason `DataCase`'s default `MockEmbeddingClient` stub
+  # keys `deterministic_embedding/1` on `tenant_id` rather than returning a constant.
   #
-  # The alternative repair, `@moduletag :vacuum_vector_indexes`, works but is not free:
-  # measured on this suite, adding it to this ONE module took the full run from 37.9s to
-  # 56.2s (+50%), because the VACUUM contends with every other async worker rather than
-  # costing anything much on its own. Prefer the axis; reach for the vacuum only where an
-  # ANN assertion genuinely cannot be isolated onto one.
+  # Do NOT re-explain this as "rolled-back tuples crowd out the live row". KB `c6fd1e5d`
+  # lists that as a DEAD THEORY, disproved by probe: pgvector returns the live row past
+  # 2000 rolled-back distance-0 ties, because it skips invisible tuples and keeps scanning.
+  # That article exists because this family has been misdiagnosed twice, each time costing
+  # reverted fixes — so match on the mechanism, and read it before touching this.
+  #
+  # WHY NOT `@moduletag :vacuum_vector_indexes`. It is the other documented repair and it
+  # works, but it is not free, and the cost is invisible if you measure one file: adding it
+  # to this ONE module took the full suite from 37.9s to 56.2s (+50%), and on 24 ANN-reading
+  # modules to 744s (18.6x). The VACUUM contends with every other async worker rather than
+  # costing much on its own, so it taxes the WHOLE suite, not the module that opts in. The
+  # axis is free — 37.97s against a 37.85s baseline. Prefer the axis; reach for the vacuum
+  # only where an ANN assertion genuinely cannot be isolated onto one.
   defp query_vector, do: test_vec(1536, :primary)
 
   defp published(tenant_id, title, body) do
