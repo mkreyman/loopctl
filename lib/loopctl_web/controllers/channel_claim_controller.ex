@@ -39,6 +39,16 @@ defmodule LoopctlWeb.ChannelClaimController do
   isolation. The abandoned-lease sweep, not the release path, is what protects a claim
   whose session died.
 
+  ## The READ is tenant-scoped, not membership-gated
+
+  `index/2` is deliberately uniform with `GET /channel/locks` and `channel_recent`: it
+  filters on the key-derived `tenant_id` plus the requested `project_id` only, so any
+  agent in the tenant may read any of that tenant's channels' claims. The US-40.D3
+  membership gate applies to the WRITE path (`Coordination.claim/5`), NOT to this read.
+  A missing or non-UUID `project_id` is refused (422) rather than answered with an empty
+  page, because an empty page here MEANS "that ref is claimable" and a caller that
+  simply forgot the parameter must not be told every ref is free.
+
   ## Trust posture (owner decision #331 — same as channel posts)
 
   A COORDINATION surface, NOT chain-of-custody: `role: :agent`, deliberately NOT
@@ -61,6 +71,7 @@ defmodule LoopctlWeb.ChannelClaimController do
   require Logger
 
   alias Loopctl.Coordination
+  alias Loopctl.Projects
   alias Loopctl.RateLimiter.FailOpenLog
   alias Loopctl.Tenants
   alias LoopctlWeb.AuditContext
@@ -78,9 +89,14 @@ defmodule LoopctlWeb.ChannelClaimController do
   plug :rate_limit_claim when action in [:create]
 
   # The read gets its OWN bucket, not a share of the write cap (#707). This endpoint
-  # exists to replace a destructive probe, so a session that polls it must never be
-  # able to rate-limit itself out of CLAIMING — which is what a shared counter would
-  # do, and would push the caller straight back to probing by claim.
+  # exists to replace a destructive probe, so polling it must not spend the CLAIM write
+  # budget. A separate bucket alone does NOT deliver that, though: the generic per-key
+  # pipeline limiter (LoopctlWeb.Plugs.RateLimiter) counts EVERY authenticated request,
+  # reads included, so a read cap merely bounded BY the pipeline budget could still
+  # exhaust it and 429 the caller out of claiming. `claim_read_limit/1` therefore clamps
+  # the read to a bounded SHARE (a quarter) of that budget, which is what makes the
+  # guarantee true: sustained polling at the cap still leaves three quarters of the
+  # per-key budget for claiming and everything else.
   plug :rate_limit_claim_read when action in [:index]
 
   # 60s fixed window, matching the ETS/Hammer contract the pipeline limiter uses.
@@ -95,6 +111,12 @@ defmodule LoopctlWeb.ChannelClaimController do
   # read is cheap, idempotent, and is the behaviour we are trying to make the easy one.
   @default_claim_read_limit 120
 
+  # The read's share of the per-key PIPELINE budget (see the `:rate_limit_claim_read`
+  # plug note). A quarter: enough that polling before every claim is never the binding
+  # constraint, bounded enough that it can neither 429 the caller out of claiming nor
+  # aim an unbounded poll rate at AdminRepo's small pool.
+  @claim_read_pipeline_share 4
+
   # Fallback for the generic per-key pipeline limit, kept in sync with
   # LoopctlWeb.Plugs.RateLimiter's @default_per_key_limit.
   @pipeline_per_key_limit_default 300
@@ -102,6 +124,10 @@ defmodule LoopctlWeb.ChannelClaimController do
   # A missing/cross-tenant/cross-project project returns this ONE message on the
   # claim path — no existence oracle (mirrors ChannelPostController).
   @ownership_error_message "project_id does not exist or does not belong to your tenant"
+
+  # The READ refuses a missing/non-UUID project_id rather than answering an empty page,
+  # which it documents as "these refs are claimable". Says nothing about existence.
+  @missing_project_message "project_id is required and must be a UUID"
 
   @doc """
   POST /api/v1/channel/claims
@@ -191,34 +217,62 @@ defmodule LoopctlWeb.ChannelClaimController do
   end
 
   @doc """
-  The channel's ACTIVE claims — a read, so nobody has to probe by claiming (#707).
+  The channel's unswept claims — a read, so nobody has to probe by claiming (#707).
 
   `GET /api/v1/channel/claims?project_id=<uuid>[&ref=<anchor>][&limit=<n>]`
 
-  A claim is listed while it would EXCLUDE its handoff from `GET /channel/handoffs` —
-  DONE (terminal) or still within its lease. A released claim and a lease that expired
-  without completion are both absent, exactly as both reopen the handoff. Pass `ref` for
-  the point lookup a session about to claim actually wants: an empty `claims` array means
-  the ref is free right now.
+  A ref is listed exactly while a fresh `claim` on it would be REFUSED: DONE, still
+  within its lease, or expired and not yet swept (the unique slot is held in all three).
+  So an empty `claims` array means that ref is claimable right now, and `ref` is the
+  point lookup a session about to claim actually wants. Each row carries `done` and
+  `expired` for the handoffs question: `done`, or an unexpired lease, is what keeps the
+  ref out of `GET /channel/handoffs`; `expired: true` means the handoff has already
+  reopened and the row is merely awaiting the sweeper — retry shortly, do not move on.
 
-  Tenant-scoped from the verified key. A cross-tenant or nonexistent `project_id`
-  returns an empty page, never a 404 — the same no-oracle posture as
-  `GET /channel/locks` and `GET /channel/handoffs`.
+  Tenant-scoped from the verified key and NOT membership-gated (see the moduledoc). A
+  cross-tenant or nonexistent `project_id` returns an empty page, never a 404 — the same
+  no-oracle posture as `GET /channel/locks`. A MISSING or non-UUID `project_id` is a 422
+  instead: it is a client fault decidable without touching a row, and answering it with
+  an empty page would tell the caller every ref is free.
 
-  `meta.overflow` is true when more active claims matched than `limit` admits.
+  OPEN claims are ordered first, so a page truncated by `limit` can only have dropped
+  terminal rows unless every row it returned is open. `meta.overflow` reports the cap.
   """
   def index(conn, params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
-    limit = Coordination.clamp_active_claims_limit(params["limit"])
+
+    case Ecto.UUID.cast(params["project_id"]) do
+      {:ok, project_id} -> render_claims(conn, tenant_id, project_id, params)
+      :error -> {:error, :unprocessable_entity, @missing_project_message}
+    end
+  end
+
+  defp render_claims(conn, tenant_id, project_id, params) do
+    limit = Coordination.clamp_claims_limit(params["limit"])
+
+    # A well-formed but foreign/nonexistent project still gets the oracle-safe empty
+    # page — but it is RECORDED, so enumerating projects through this read leaves the
+    # same trail the write path already leaves as :ownership_rejected. Without it the
+    # highest-frequency call on this surface is the one probe with no audit signal.
+    case Projects.get_project(tenant_id, project_id) do
+      {:ok, _project} ->
+        :ok
+
+      {:error, :not_found} ->
+        emit_security_event(:ownership_rejected, %{
+          tenant_id: tenant_id,
+          api_key_id: conn.assigns.current_api_key.id,
+          project_id: project_id
+        })
+    end
 
     {claims, overflow?} =
-      Coordination.active_claims_page(tenant_id, params["project_id"],
-        limit: limit,
-        ref: params["ref"]
-      )
+      Coordination.claims_page(tenant_id, project_id, limit: limit, ref: params["ref"])
+
+    now = DateTime.utc_now()
 
     json(conn, %{
-      claims: Enum.map(claims, &claim_json/1),
+      claims: Enum.map(claims, &claim_json(&1, now)),
       meta: %{
         count: length(claims),
         limit: limit,
@@ -232,7 +286,7 @@ defmodule LoopctlWeb.ChannelClaimController do
   # struct). Projected explicitly anyway so a future column added to the schema is not
   # silently published by a LIST read, which is a much wider audience than the
   # single-row write responses.
-  defp claim_json(claim) do
+  defp claim_json(claim, now) do
     %{
       id: claim.id,
       ref: claim.ref,
@@ -240,10 +294,13 @@ defmodule LoopctlWeb.ChannelClaimController do
       claimed_at: claim.claimed_at,
       lease_expires_at: claim.lease_expires_at,
       done_at: claim.done_at,
-      # Derived so a caller never has to re-implement the DONE-or-unexpired predicate
-      # (and get it subtly different from the handoffs exclusion, which is the failure
-      # this endpoint exists to prevent).
-      done: not is_nil(claim.done_at)
+      # Derived so a caller never has to re-implement the lifecycle predicates and get
+      # them subtly different from the ones the server enforces. `done` (terminal) or a
+      # future lease is what EXCLUDES the handoff; `expired` is the row that no longer
+      # excludes it but still holds the unique slot, so a claim on it is refused until
+      # the ChannelClaimSweeper reaps it.
+      done: not is_nil(claim.done_at),
+      expired: is_nil(claim.done_at) and DateTime.compare(claim.lease_expires_at, now) != :gt
     }
   end
 
@@ -399,7 +456,7 @@ defmodule LoopctlWeb.ChannelClaimController do
       )
       |> coerce_positive_int(default_claim_read_limit())
 
-    min(configured, pipeline_per_key_limit(tenant))
+    min(configured, max(1, div(pipeline_per_key_limit(tenant), @claim_read_pipeline_share)))
   end
 
   defp default_claim_read_limit do

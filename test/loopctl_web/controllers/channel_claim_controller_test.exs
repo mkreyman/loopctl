@@ -9,6 +9,8 @@ defmodule LoopctlWeb.ChannelClaimControllerTest do
   """
   use LoopctlWeb.ConnCase, async: true
 
+  import Ecto.Query, only: [from: 2]
+
   setup :verify_on_exit!
 
   @claim_path "/api/v1/channel/claims"
@@ -248,12 +250,61 @@ defmodule LoopctlWeb.ChannelClaimControllerTest do
       assert body["claims"] == []
     end
 
-    test "a malformed project_id is an empty page, not a 500" do
+    test "a missing or malformed project_id is refused, never answered as 'all free'" do
       tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
       project = fixture(:project, %{tenant_id: tenant.id})
       {raw, _key, _agent} = member_agent_key(tenant, project)
 
-      body = raw |> get_json(@claim_path, %{project_id: "not-a-uuid"}) |> json_response(200)
+      # An empty page is documented as "that ref is claimable", so a caller that simply
+      # omitted project_id (the MCP client only sets it when present) must not be told
+      # every ref is free. A syntactically invalid id leaks no existence oracle.
+      assert raw |> get_json(@claim_path, %{project_id: "not-a-uuid"}) |> json_response(422)
+      assert raw |> get_json(@claim_path, %{}) |> json_response(422)
+    end
+
+    test "an expired-but-unswept claim is listed with expired: true — not reported free" do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = member_agent_key(tenant, project)
+
+      assert raw
+             |> post_json(@claim_path, %{project_id: project.id, ref: "handoff:repo#814"})
+             |> json_response(201)
+
+      Loopctl.AdminRepo.update_all(
+        from(c in Loopctl.Coordination.ChannelClaim, where: c.tenant_id == ^tenant.id),
+        set: [lease_expires_at: DateTime.add(DateTime.utc_now(), -5, :second)]
+      )
+
+      body =
+        raw
+        |> get_json(@claim_path, %{project_id: project.id, ref: "handoff:repo#814"})
+        |> json_response(200)
+
+      assert [%{"expired" => true, "done" => false}] = body["claims"]
+
+      # And the write agrees: this ref is NOT claimable, which is why the read lists it.
+      assert raw
+             |> post_json(@claim_path, %{project_id: project.id, ref: "handoff:repo#814"})
+             |> json_response(409)
+    end
+
+    test "a malformed ref is an empty page, not a 500 and not the whole channel" do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = member_agent_key(tenant, project)
+
+      assert raw
+             |> post_json(@claim_path, %{project_id: project.id, ref: "handoff:repo#818"})
+             |> json_response(201)
+
+      # A NUL byte is valid UTF-8, so Plug forwards it; Postgres refuses to compare it
+      # against `text` and would 500 if it reached the query.
+      body =
+        raw
+        |> get_json(@claim_path, %{project_id: project.id, ref: <<"handoff:", 0, "x">>})
+        |> json_response(200)
+
       assert body["claims"] == []
     end
 
