@@ -41,6 +41,36 @@ defmodule LoopctlWeb.RouteDiscoveryControllerTest do
                inspect(MapSet.to_list(missing))
     end
 
+    # The SECOND closed set that earns coverage, for the same reason /admin does and not
+    # merely because it would be tidy. The coordination bus is the mechanism a session is
+    # TOLD to reach for when it hands work to another machine, and this index is what an
+    # agent reads "before probing blindly" — so a channel route missing here is invisible
+    # to exactly the audience that needs it, and the failure mode is work done twice or
+    # dropped, not a mild inconvenience. The whole surface was absent until #707's read
+    # was added; without this test it can silently fall out again.
+    test "every /api/v1/channel route in the router appears in the curated index" do
+      router_channel =
+        LoopctlWeb.Router.__routes__()
+        |> Enum.filter(&String.starts_with?(&1.path, "/api/v1/channel"))
+        |> Enum.map(&{verb_string(&1.verb), &1.path})
+        |> MapSet.new()
+
+      indexed =
+        LoopctlWeb.RouteDiscoveryController.curated_routes()
+        |> Enum.map(&{&1.method, &1.path})
+        |> MapSet.new()
+
+      assert MapSet.size(router_channel) > 0,
+             "the filter matched nothing — it has drifted from the router's shape and this " <>
+               "test is now vacuous"
+
+      missing = MapSet.difference(router_channel, indexed)
+
+      assert MapSet.equal?(missing, MapSet.new()),
+             "coordination-bus routes missing from the curated /routes index: " <>
+               inspect(MapSet.to_list(missing))
+    end
+
     test "every path in the curated index actually exists in the router" do
       router_paths =
         LoopctlWeb.Router.__routes__() |> Enum.map(& &1.path) |> MapSet.new()
@@ -54,6 +84,8 @@ defmodule LoopctlWeb.RouteDiscoveryControllerTest do
              "the index advertises routes the router does not serve: " <> inspect(phantom)
     end
   end
+
+  defp verb_string(verb), do: verb |> to_string() |> String.upcase()
 
   describe "GET /api/v1/routes" do
     test "returns list of routes with method, path, description", %{conn: conn} do
