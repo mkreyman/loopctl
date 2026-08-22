@@ -47,11 +47,24 @@ All notable changes to loopctl are documented here.
   description and the 422 text. Whitespace-dirty tags already in a corpus are unaffected and
   still need a cleanup pass — the hosted corpus has none.
 
-  `Loopctl.Memory`'s graduation sanitizer carried a hand-copied version of that pattern and had
-  already drifted; it now TAKES the pattern, the length and the count from `Article`, the way
-  `Knowledge.Tagger` does. That mirror is load-bearing rather than cosmetic: a tag this filter
-  passes but the article changeset rejects makes graduation take its structural-error branch,
-  which stamps the memory graduated and burns its one-shot with no article created.
+- **`mix loopctl.reserve_idempotency_tags` has a production entry point that is not a Mix
+  task.** The sweep moved into `Loopctl.DataMigrations.ReserveIdempotencyTags`, which
+  references no `Mix` at all, and `Loopctl.Release.reserve_idempotency_tags/1` runs it:
+
+      bin/loopctl eval "Loopctl.Release.reserve_idempotency_tags()"
+      bin/loopctl eval "Loopctl.Release.reserve_idempotency_tags(apply: true)"
+
+  Dry run by default, like every other data migration here. The Mix task is unchanged as
+  the development entry point and now just parses argv and delegates.
+
+  **Operator impact:** run production sweeps through the release entry point. `mix` does not
+  exist in a compiled release, and the old task reached `Mix.shell/0` on two per-row paths,
+  so a production run had to be driven from outside and would raise the moment either path
+  was hit. Driving it from outside is also slow in a way that is easy to miss: the sweep
+  issues one compare-and-set UPDATE per changed row, so its cost is a network round trip per
+  row — measured ~6.4 rows/s over a `fly proxy`, about three hours for 68,544 rows, against
+  seconds from inside the datacenter. The release entry point starts only `AdminRepo`, so it
+  adds no second Oban node to a running deployment.
 
 - **`mix loopctl.reserve_idempotency_tags` now promotes the `email-` and `corpus-` families
   too (#733).** The #583 census missed both: bare `email-<sha1(message_id)[:12]>` (the inbox

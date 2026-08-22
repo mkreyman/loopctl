@@ -4,8 +4,9 @@ defmodule Mix.Tasks.Loopctl.ReserveIdempotencyTagsTest do
   setup :verify_on_exit!
 
   alias Loopctl.AdminRepo
+  alias Loopctl.DataMigrations.ReserveIdempotencyTags, as: Task
   alias Loopctl.Knowledge.Article
-  alias Mix.Tasks.Loopctl.ReserveIdempotencyTags, as: Task
+  alias Mix.Tasks.Loopctl.ReserveIdempotencyTags, as: MixTask
 
   @hex12 "7ebe1ca33431"
 
@@ -176,7 +177,7 @@ defmodule Mix.Tasks.Loopctl.ReserveIdempotencyTagsTest do
       article = fixture(:article, tenant_id: tenant.id, tags: ["url-#{@hex12}"])
 
       assert_raise Mix.Error, ~r/--tenat/, fn ->
-        Task.run(["--apply", "--tenat", tenant.id])
+        MixTask.run(["--apply", "--tenat", tenant.id])
       end
 
       assert tags_of(article) == ["url-#{@hex12}"]
@@ -184,7 +185,7 @@ defmodule Mix.Tasks.Loopctl.ReserveIdempotencyTagsTest do
 
     test "a leftover positional argument aborts" do
       assert_raise Mix.Error, ~r/deadbeef/, fn ->
-        Task.run(["--apply", "deadbeef"])
+        MixTask.run(["--apply", "deadbeef"])
       end
     end
   end
