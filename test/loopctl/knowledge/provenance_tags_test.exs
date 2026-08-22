@@ -83,4 +83,45 @@ defmodule Loopctl.Knowledge.ProvenanceTagsTest do
       refute Regex.match?(regex, "docker")
     end
   end
+
+  describe "opaque_only_prefixes/0 — the families that may only be matched by shape" do
+    test "a bare capture id under one of them is refused admission" do
+      # #733: `email`/`corpus` became capture families in IdempotencyTag, and the re-tagger
+      # would otherwise mint one article's capture identity onto an unrelated one — after
+      # which the "have I captured this source?" query answers about the wrong row.
+      for prefix <- ProvenanceTags.opaque_only_prefixes() do
+        refute ProvenanceTags.admissible_suggestion?("#{prefix}a1b2c3d4e5f6"), prefix
+      end
+
+      # Named, so shrinking the list to [] cannot make the loop above pass vacuously.
+      assert Enum.sort(ProvenanceTags.opaque_only_prefixes()) == ~w(corpus- email-)
+    end
+
+    test "the genuine subject tags that share those prefixes are untouched" do
+      # This is WHY they are a separate list: `@prefixes` is matched bare, so putting
+      # `email-` there would drop these the way a broad `p-` drops `p-value`.
+      for tag <- ~w(email-marketing email-deliverability corpus-linguistics) do
+        assert ProvenanceTags.admissible_suggestion?(tag), tag
+        assert ProvenanceTags.topical?(tag), tag
+      end
+
+      {:ok, regex} = Regex.compile(ProvenanceTags.sql_pattern())
+
+      for tag <- ~w(email-marketing corpus-linguistics) do
+        refute Regex.match?(regex, tag), tag
+      end
+    end
+
+    test "they are deliberately absent from the bare-matched list" do
+      for prefix <- ProvenanceTags.opaque_only_prefixes() do
+        refute prefix in ProvenanceTags.prefixes(), prefix
+      end
+    end
+
+    test "the reserved counterpart is still refused by prefix alone" do
+      # Once the --drop-legacy pass runs, this is the only form left, and `idem-` covers it.
+      refute ProvenanceTags.admissible_suggestion?("idem-email-a1b2c3d4e5f6")
+      refute ProvenanceTags.topical?("idem-email-a1b2c3d4e5f6")
+    end
+  end
 end
