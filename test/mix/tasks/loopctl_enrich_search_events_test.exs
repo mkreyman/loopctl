@@ -75,6 +75,11 @@ defmodule Mix.Tasks.Loopctl.EnrichSearchEventsTest do
     to_string(name)
   end
 
+  # A host that is guaranteed NOT to be this machine, on every machine. Built from the
+  # local hostname so it cannot accidentally coincide with it, and suffixed .invalid
+  # (RFC 2606) so it can never name a real host in any fleet.
+  defp foreign_host, do: "not-" <> local_host() <> ".invalid"
+
   defp reload(event), do: AdminRepo.get!(SearchEvent, event.id)
 
   defp run(root, extra \\ []) do
@@ -166,7 +171,13 @@ defmodule Mix.Tasks.Loopctl.EnrichSearchEventsTest do
         record(tenant, %{
           query: "shared q",
           client_session_id: Ecto.UUID.generate(),
-          client_host: "Marks-Mac-mini.local"
+          # DERIVED from the local host, never a literal. This used to name a real
+          # machine in the fleet ("Marks-Mac-mini.local"), which made the test pass
+          # only where it was written: run it ON that machine and "another machine"
+          # IS this machine, so the row is legitimately enriched and the assertion
+          # inverts. The sibling test below is the positive case on local_host/0, so
+          # the two were asserting opposite outcomes for the same host.
+          client_host: foreign_host()
         })
 
       run(root)
