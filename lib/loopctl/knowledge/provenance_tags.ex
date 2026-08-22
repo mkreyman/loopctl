@@ -51,6 +51,28 @@ defmodule Loopctl.Knowledge.ProvenanceTags do
               chapter- part-
             ) ++ [IdempotencyTag.reserved_prefix()]
 
+  # Families whose bare prefix is SHARED with genuine subject tags, so they may only ever be
+  # matched SHAPE-AWARE. `email-marketing` and `corpus-linguistics` are real topics, and
+  # `@prefixes` is matched by bare `String.starts_with?/2` in `topical?/1` and `sql_pattern/0`
+  # — putting `email-`/`corpus-` there would drop those the way a broad `p-` drops `p-value`,
+  # which is the hazard the comment above names. `admissible_suggestion?/1` is the one consumer
+  # that already discriminates by shape (`opaque_id?/2`), so it is the one that can carry them.
+  #
+  # This is the SPLIT the moduledoc prescribes rather than a widening of one list, and it is
+  # not hypothetical: #733 made `email`/`corpus` capture families in `IdempotencyTag`, and
+  # `admissible_suggestion?("email-a1b2c3d4e5f6")` returned true — so the re-tagger could mint
+  # one article's capture identity onto an unrelated one, which is exactly what makes the
+  # "have I captured this source?" query answer about the wrong row.
+  #
+  # The SEARCH-VECTOR half of the same gap is deliberately not closed here. A bare
+  # `email-<digest>` still indexes the lexeme `email`, an ordinary query word — but that
+  # pattern is baked into a generated column, so closing it costs a migration, and the operator
+  # pass that removes the cause outright is already sequenced: `mix
+  # loopctl.reserve_idempotency_tags --apply --drop-legacy` deletes the bare tags once their
+  # reserved counterparts are in place, and `idem-` is excluded above. Reach for the migration
+  # only if that pass is abandoned.
+  @opaque_only_prefixes ~w(email- corpus-)
+
   # Whole tags that describe an article's FORMAT or SOURCE TYPE rather than its subject.
   # Distinct from the prefixes above, which are opaque per-source ids: these are ordinary
   # words that are simply not what an article is ABOUT. `KnowledgeMocWorker` has excluded
@@ -95,11 +117,14 @@ defmodule Loopctl.Knowledge.ProvenanceTags do
   Whether a GENERATED tag may be WRITTEN at all. NOT `topical?/1` — hub eligibility drops a
   whole prefixed class for free and admission cannot (see `Tagger.merge/2`), so a prefix
   disqualifies only before an OPAQUE id (`url-42516bb95051`); `structural/0` is whole-word.
+
+  Because it discriminates by SHAPE it also carries `@opaque_only_prefixes` — the families
+  whose bare prefix is shared with real subject tags and so cannot go in `@prefixes` at all.
   """
   @spec admissible_suggestion?(String.t()) :: boolean()
   def admissible_suggestion?(tag) when is_binary(tag) do
     tag not in @structural and not String.starts_with?(tag, IdempotencyTag.reserved_prefix()) and
-      not Enum.any?(@prefixes, &opaque_id?(tag, &1))
+      not Enum.any?(@prefixes ++ @opaque_only_prefixes, &opaque_id?(tag, &1))
   end
 
   def admissible_suggestion?(_tag), do: false
@@ -112,6 +137,15 @@ defmodule Loopctl.Knowledge.ProvenanceTags do
     Regex.match?(~r/^\d+(-\d+)*$/, s) or Regex.match?(~r/^[0-9a-f]{8,}$/, s) or
       (Regex.match?(~r/^[0-9a-z]{6,}$/, s) and Regex.match?(~r/\d/, s))
   end
+
+  @doc """
+  Prefixes matched only SHAPE-AWARE, by `admissible_suggestion?/1`.
+
+  Deliberately NOT part of `prefixes/0`: that list is matched bare, and these prefixes are
+  shared with genuine subject tags (`email-marketing`). See the note above the attribute.
+  """
+  @spec opaque_only_prefixes() :: [String.t()]
+  def opaque_only_prefixes, do: @opaque_only_prefixes
 
   @doc "The provenance/chunk-coordinate tag prefixes, each including its trailing hyphen."
   @spec prefixes() :: [String.t()]
