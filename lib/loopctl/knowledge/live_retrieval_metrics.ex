@@ -56,13 +56,19 @@ defmodule Loopctl.Knowledge.LiveRetrievalMetrics do
   alias Loopctl.HeavyRead
   alias Loopctl.Knowledge.Analytics
   alias Loopctl.Knowledge.ArticleAccessEvent
+  alias Loopctl.Knowledge.RetrievalMetrics
 
   @mode_family ["combined", "combined_curated", "combined_retrieved", "combined_fallback"]
   @chosen_read_types ["get", "drill"]
   # Traffic loopctl generates about itself: a release week of deploys must not read as a
   # retrieval change. Kept in step with `RetrievalMetrics`' own private list (which carries the
   # rationale) by a test reading that module's SOURCE — nothing else binds them.
-  @infra_entrypoints ["smoke", "skill-eval"]
+  # No `heavy_read_statement_timeout_overrides` entry, and that is measured rather than
+  # assumed: against a copy of production traffic (27,177 access-event rows, 151 confirmed
+  # pairs) `pairs/3` runs in 62 ms and `matched_pairs/5` in 20 ms, against the 10,000 ms
+  # default — three orders of magnitude of headroom. The `@max_pairs` cap plus the join on
+  # `article_access_events_origin_search_idx` is what keeps it there. Add an override only
+  # when a measurement says the budget is tight, not on the shape of the query.
   @max_pairs 50_000
   @min_pairs 30
   # A week is a far smaller sample than a comparison window, so it gets its own floor: at this
@@ -93,7 +99,7 @@ defmodule Loopctl.Knowledge.LiveRetrievalMetrics do
 
   @doc "Entrypoints excluded as loopctl's own traffic, kept in step with `RetrievalMetrics`."
   @spec infra_entrypoints() :: [String.t()]
-  def infra_entrypoints, do: @infra_entrypoints
+  def infra_entrypoints, do: RetrievalMetrics.infra_entrypoints()
 
   @doc "Pairs whose SEARCH is in `[from, to)`, oldest first, newest kept at `max_pairs/0`."
   @spec pairs(Ecto.UUID.t(), DateTime.t(), DateTime.t()) :: [pair()]
@@ -117,7 +123,7 @@ defmodule Loopctl.Knowledge.LiveRetrievalMetrics do
         where: fragment("?->>'rank' ~ '^[1-9][0-9]{0,8}$'", s.metadata),
         where: fragment("coalesce(?->>'query', '')", s.metadata) != "",
         where: fragment("?->>'mode'", s.metadata) in ^@mode_family,
-        where: fragment("coalesce(?->>'entrypoint', '')", s.metadata) not in ^@infra_entrypoints,
+        where: fragment("coalesce(?->>'entrypoint', '')", s.metadata) not in ^infra_entrypoints(),
         # The search CALL is the observation and `search_id` is its only reliable identity (#582):
         # the proxy it replaced — a key plus a truncated `accessed_at` — collides across concurrent
         # searches by one key, merging two calls and keeping the better rank. Collapsing re-reads
@@ -281,8 +287,8 @@ defmodule Loopctl.Knowledge.LiveRetrievalMetrics do
         where: fragment("coalesce(?->>'query', '')", b.metadata) != "",
         where: fragment("?->>'mode'", b.metadata) in ^@mode_family,
         where: fragment("?->>'mode'", a.metadata) in ^@mode_family,
-        where: fragment("coalesce(?->>'entrypoint', '')", b.metadata) not in ^@infra_entrypoints,
-        where: fragment("coalesce(?->>'entrypoint', '')", a.metadata) not in ^@infra_entrypoints,
+        where: fragment("coalesce(?->>'entrypoint', '')", b.metadata) not in ^infra_entrypoints(),
+        where: fragment("coalesce(?->>'entrypoint', '')", a.metadata) not in ^infra_entrypoints(),
         where: b.accessed_at >= ^before_from and b.accessed_at < ^before_to,
         where: a.accessed_at >= ^after_from and a.accessed_at < ^after_to,
         group_by: [fragment("?->>'query'", b.metadata), b.article_id],

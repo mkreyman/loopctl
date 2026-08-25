@@ -41,19 +41,28 @@ defmodule LoopctlWeb.Plugs.DBErrorBackstopTest do
     test "57014 is logged with the real SQLSTATE + request_id and re-raised sanitized",
          %{conn: conn} do
       {conn, tenant} = authed_conn(conn)
+      request_id = unique_request_id()
+      conn = put_req_header(conn, "x-request-id", request_id)
 
       {_result, log} = raise_uncaught(conn, "57014")
 
       # AC-27.3.3: structured SQLSTATE line emitted on the UNCAUGHT path too.
       assert log =~ "sqlstate=57014"
       assert log =~ "mapped_code=db_statement_timeout"
-      assert log =~ "request_id="
+      assert log =~ "request_id=#{request_id}"
       assert log =~ "tenant_id=#{tenant.id}"
 
       # AC-27.3.8: the structured log never echoes the raw SQL / vector / params.
-      refute log =~ "SELECT"
-      refute log =~ "embedding <=>"
-      refute log =~ "::vector"
+      #
+      # Scoped to THIS request's lines for the reason `refute_backstop_mapped/2` below
+      # already documents: `with_log/1` captures the GLOBAL Logger and this suite is
+      # `async: true`, so a bare `refute log =~ "SELECT"` fails whenever ANY concurrent
+      # test logs that word. Observed 2026-08-25, reddening a commit that touched none of
+      # this. The assertion is exactly as strong — the backstop puts the request id on the
+      # SAME line as anything it logs about the request, so a real SQL echo would be caught.
+      refute_in_request(log, request_id, "SELECT")
+      refute_in_request(log, request_id, "embedding <=>")
+      refute_in_request(log, request_id, "::vector")
       refute log =~ "0.123"
     end
 
@@ -227,6 +236,21 @@ defmodule LoopctlWeb.Plugs.DBErrorBackstopTest do
   # becomes one that can never fail. Verified by mutation. The request id is the right
   # discriminator because `DBErrorBackstop` puts it on the SAME line as the phrase, so the
   # assertion is exactly as strong as the bare one and is about THIS request.
+  # Refute a pattern only among the log lines belonging to THIS request. A bare refute over
+  # a globally-captured log in an async suite is a test that fails for reasons unrelated to
+  # what it guards.
+  defp refute_in_request(log, request_id, pattern) do
+    mine =
+      log
+      |> String.split("\n")
+      |> Enum.filter(&String.contains?(&1, "request_id=" <> request_id))
+
+    assert mine != [], "no captured log line carried request_id=#{request_id}"
+
+    refute Enum.any?(mine, &String.contains?(&1, pattern)),
+           "this request's log echoed #{inspect(pattern)}"
+  end
+
   defp refute_backstop_mapped(log, request_id) do
     refute log =~ ~r/db_error mapped to HTTP[^\n]*request_id=#{Regex.escape(request_id)}/,
            "the backstop mapped this request when it should have left the exit alone"
