@@ -1395,7 +1395,16 @@ defmodule Loopctl.HeavyRead do
     :ok
   end
 
-  defp force_exact_scan?, do: Application.get_env(:loopctl, :heavy_read_force_exact_scan, false)
+  @doc """
+  Whether heavy reads are currently forced onto an EXACT plan (see
+  `maybe_force_exact_scan/1`). FALSE in every non-test environment.
+
+  Public because `Loopctl.VectorRecallDiagnostics` must reproduce the read's GUCs around its
+  EXPLAIN — a diagnostic that explains a different plan than the read it is diagnosing is
+  worse than none, which is the whole reason that wrapper exists.
+  """
+  @spec force_exact_scan?() :: boolean()
+  def force_exact_scan?, do: Application.get_env(:loopctl, :heavy_read_force_exact_scan, false)
 
   # `SET LOCAL hnsw.ef_search = N` for an ANN read (US-38.4). Only fired when the caller
   # (via `HeavyRead.opts/1` for an `ann_endpoints/0` endpoint) supplies a positive integer
