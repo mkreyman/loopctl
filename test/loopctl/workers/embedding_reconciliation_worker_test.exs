@@ -96,6 +96,64 @@ defmodule Loopctl.Workers.EmbeddingReconciliationWorkerTest do
       refute empty.id in ids
     end
 
+    test "returns the OLDEST gaps first" do
+      # Oldest-first is the documented contract: an article unsearchable since June has been
+      # failing longer than one ingested this morning, and a bounded run should repair the
+      # longest-standing gap first. It became assertable-and-unasserted when the lookup was
+      # split into an id anti-join plus a fetch-by-id -- the ORDER BY has to be repeated on
+      # the second query, and nothing here would have noticed it missing.
+      #
+      # The rows are INSERTED newest-first and back-dated in reverse, so physical order is
+      # the exact opposite of the answer. A first cut of this test created them oldest-first,
+      # which made unordered output indistinguishable from ordered output: deleting the
+      # ORDER BY left it green.
+      tenant = fixture(:tenant)
+
+      [newest, middle, oldest] =
+        for days_ago <- [10, 20, 30] do
+          at = DateTime.add(DateTime.utc_now(), -days_ago * 86_400, :second)
+
+          tenant.id
+          |> published_unembedded()
+          |> Ecto.Changeset.change(%{inserted_at: at})
+          |> AdminRepo.update!()
+        end
+
+      seeded = [oldest.id, middle.id, newest.id]
+      ids = tenant.id |> Embeddings.unembedded_articles(100) |> Enum.map(& &1.id)
+
+      assert Enum.filter(ids, &(&1 in seeded)) == seeded
+    end
+
+    test "an empty-bodied backlog cannot starve a real gap out of a bounded batch" do
+      # The LIMIT is applied to EMBEDDABLE articles, not to candidate rows that are then
+      # filtered. Were the empty-body test applied after the limit instead, these two older
+      # blanks would consume a batch of two forever and the real gap behind them would never
+      # be repaired -- a silent permanent blackout, which is the exact defect this whole
+      # worker exists to close.
+      tenant = fixture(:tenant)
+
+      for days_ago <- [40, 39] do
+        at = DateTime.utc_now() |> DateTime.add(-days_ago * 86_400, :second)
+
+        tenant.id
+        |> published_unembedded()
+        |> Ecto.Changeset.change(%{body: "   ", inserted_at: at})
+        |> AdminRepo.update!()
+      end
+
+      real =
+        tenant.id
+        |> published_unembedded()
+        |> Ecto.Changeset.change(%{
+          inserted_at: DateTime.add(DateTime.utc_now(), -38 * 86_400, :second)
+        })
+        |> AdminRepo.update!()
+
+      ids = tenant.id |> Embeddings.unembedded_articles(2) |> Enum.map(& &1.id)
+      assert real.id in ids
+    end
+
     test "is tenant-isolated" do
       tenant_a = fixture(:tenant)
       tenant_b = fixture(:tenant)
