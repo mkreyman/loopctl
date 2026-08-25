@@ -1,7 +1,8 @@
 defmodule Loopctl.ObanPluginsConfigTest do
   @moduledoc """
-  US-34.1 (AC-34.1.4, TC-34.1.4): `Oban.Plugins.Reindexer` is configured, and the
-  pre-existing Lifeline/Pruner plugins are unchanged.
+  US-34.1 (AC-34.1.4, TC-34.1.4): `Oban.Plugins.Reindexer` is configured, Lifeline is
+  unchanged, and the Pruner keeps its seven-day `max_age` but now sets an explicit sweep
+  `interval` instead of taking the library's 30-second default.
 
   Pure config read — no DB, no running Oban needed (`config/test.exs` sets
   `testing: :inline`, under which plugins are not started). As of US-35.3 the
@@ -32,11 +33,26 @@ defmodule Loopctl.ObanPluginsConfigTest do
       assert opts[:rescue_after] == :timer.minutes(30)
     end
 
-    test "Pruner is unchanged (max_age: 7 days)", %{plugins: plugins} do
+    test "Pruner keeps 7 days, and sweeps on an interval proportionate to that", %{
+      plugins: plugins
+    } do
       assert {Oban.Plugins.Pruner, opts} =
                Enum.find(plugins, &match?({Oban.Plugins.Pruner, _}, &1))
 
       assert opts[:max_age] == 60 * 60 * 24 * 7
+
+      # The interval must be SET, because the library default is 30 seconds and nothing
+      # about a seven-day retention wants a half-minute sweep. Measured on the hosted
+      # database over the 19 days to 2026-08-25, the default cost 53,748 calls / 457s /
+      # 12.1% of everything that database did, to delete ~5,600 rows a day.
+      #
+      # Asserted as a RANGE rather than an equality: the exact cadence is a tuning knob,
+      # what must not regress is the ORDER of magnitude against max_age. Anything under a
+      # minute is the pathology; anything over an hour delays reclaim enough to be a
+      # deliberate decision rather than a tweak.
+      assert is_integer(opts[:interval])
+      assert opts[:interval] >= :timer.minutes(1)
+      assert opts[:interval] <= :timer.hours(1)
     end
 
     test "Cron is still present (unchanged by this story)", %{plugins: plugins} do
