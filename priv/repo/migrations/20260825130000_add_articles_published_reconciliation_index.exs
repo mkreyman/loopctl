@@ -36,7 +36,11 @@ defmodule Loopctl.Repo.Migrations.AddArticlesPublishedReconciliationIndex do
   4.6 MB on the hosted corpus. CONCURRENTLY so the build does not block writes to articles.
   Same `ensure_index/2` guard as 20260821120000: `IF NOT EXISTS` matches on NAME, not
   validity, so an interrupted concurrent build would otherwise leave an INVALID index that
-  no planner uses and every later deploy trips over.
+  no planner uses and every later deploy trips over. The guard reconciles SHAPE too, which
+  is why the trim-set correction carries a FRESH VERSION rather than editing the version it
+  first shipped under (20260825120000): Ecto keys on the version, so a rewrite in place
+  would never re-run on a database that had already recorded it, and every such database
+  would silently keep the space-only index the planner cannot use here.
   """
   use Ecto.Migration
 
@@ -46,8 +50,9 @@ defmodule Loopctl.Repo.Migrations.AddArticlesPublishedReconciliationIndex do
   @name "articles_tenant_embeddable_inserted_id_idx"
 
   # Loose on the deparser's parenthesisation (version dependent), exact on key order and on
-  # every predicate arm — a catalog carrying the space-only `btrim` must read as stale.
-  @shape ~r/USING btree \(tenant_id, inserted_at, id\) WHERE .*'published'.*body IS NOT NULL.*btrim\(body, /s
+  # every predicate arm INCLUDING THE TRIM SET — both `btrim(body)` and a 2-arg spelling over
+  # a different character set leave the query's predicate unprovable, so both read as stale.
+  @shape ~r/USING btree \(tenant_id, inserted_at, id\) WHERE .*'published'.*body IS NOT NULL.*btrim\(body, ' \t\r\n'/s
 
   @create """
   CREATE INDEX CONCURRENTLY IF NOT EXISTS articles_tenant_embeddable_inserted_id_idx

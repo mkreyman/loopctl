@@ -138,8 +138,10 @@ defmodule Loopctl.Workers.EmbeddingReconciliationWorkerTest do
       # worker exists to close.
       tenant = fixture(:tenant)
 
-      # One of each blank spelling: the batch of two is only consumed if BOTH are excluded.
-      for {days_ago, blank} <- [{40, "   "}, {39, "\n\t\n"}] do
+      # BOTH blanks are line-break-only -- the spelling bare `btrim(body)` does NOT strip, so
+      # reverting the trim set lets both back in, they consume the batch of two, and the real
+      # gap falls off the end. One leaking blank alone would leave this assertion green.
+      for {days_ago, blank} <- [{40, "\n\t\n"}, {39, "\r\n"}] do
         at = DateTime.utc_now() |> DateTime.add(-days_ago * 86_400, :second)
 
         tenant.id
