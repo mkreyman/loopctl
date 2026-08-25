@@ -43,9 +43,13 @@ defmodule Loopctl.Embeddings.HnswDeadEntryRecallTest do
   the shipped remedy existed only in a docstring. This one reads the planner GUCs from
   inside a real `Loopctl.HeavyRead` read — the actual chokepoint, at the actual
   configuration — so it goes red the moment `maybe_force_exact_scan/1` or
-  `:heavy_read_force_exact_scan` stops being wired. Verified by mutation: replace the
-  `SET LOCAL enable_indexscan = off` with a no-op and this test fails while every other
-  assertion in the file still passes.
+  `:heavy_read_force_exact_scan` stops being wired. BOTH halves are policed only because
+  the expectation is derived from `SCALE_TESTS`/`SCALE_NIGHTLY` rather than from the config
+  key the code reads: unwiring the key flips the observed GUC and NOT the expectation.
+  Verified by mutation on a DEFAULT run: replace the `SET LOCAL enable_indexscan = off`
+  with a no-op and this test fails while every other assertion in the file still passes.
+  Under `SCALE_TESTS` that mutation is invisible here by design — that run asserts the
+  forcing is NOT applied, so it catches the forcing becoming unconditional instead.
 
   `async: false`: it deliberately fills a shared graph with dead entries.
   """
@@ -241,12 +245,15 @@ defmodule Loopctl.Embeddings.HnswDeadEntryRecallTest do
           limit: 1
         )
 
-      # Asserted against the CONFIGURED value, not a literal "off": `config/test.exs` turns
-      # `:heavy_read_force_exact_scan` off for a `SCALE_TESTS`/`SCALE_NIGHTLY` run, and a
-      # guard that goes red on an env var is noise, not a guard. Both directions are
-      # meaningful — the scale jobs must reach the real HNSW plan.
+      # The expectation is derived from the ENV, never from `:heavy_read_force_exact_scan`:
+      # reading the key `force_exact_scan?/0` reads would make this guard TRACK the config
+      # instead of CHECKING it, and deleting the config line would then leave it green. The
+      # env is what `config/test.exs` computes that key from, so it is an independent source
+      # of truth for both halves of the wiring. A default run must have the forcing applied;
+      # a `SCALE_TESTS`/`SCALE_NIGHTLY` run must NOT, so the scale jobs still reach the real
+      # HNSW plan — that branch catches the forcing becoming unconditional, nothing else.
       expected =
-        if Application.get_env(:loopctl, :heavy_read_force_exact_scan, false),
+        if is_nil(System.get_env("SCALE_TESTS")) and is_nil(System.get_env("SCALE_NIGHTLY")),
           do: "off",
           else: "on"
 
