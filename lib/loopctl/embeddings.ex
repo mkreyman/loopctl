@@ -1908,31 +1908,70 @@ defmodule Loopctl.Embeddings do
   """
   @spec unembedded_articles(Ecto.UUID.t(), pos_integer()) :: [Article.t()]
   def unembedded_articles(tenant_id, limit) when is_binary(tenant_id) and is_integer(limit) do
-    AdminRepo.all(
-      from(a in Article,
-        as: :article,
-        where: a.tenant_id == ^tenant_id,
-        where: a.status == :published,
-        where: not is_nil(a.body) and fragment("length(btrim(?)) > 0", a.body),
-        where:
-          not exists(
-            from(ae in ArticleEmbedding,
-              # Tenant-scoped like every sibling anti-join here. Not exploitable today (the
-              # outer scan is already tenant-owned articles), but the failure direction is a
-              # FALSE NEGATIVE — an article wrongly classed "already embedded" and left
-              # unsearchable, which is the exact defect this function exists to close.
-              where: ae.tenant_id == ^tenant_id,
-              where: ae.article_id == parent_as(:article).id,
-              select: 1
-            )
-          ),
-        # Oldest first: an article unsearchable since June has been failing longer than one
-        # ingested this morning, and a bounded run should repair the longest-standing gap
-        # first rather than an arbitrary slice.
-        order_by: [asc: a.inserted_at],
-        limit: ^limit
+    case unembedded_article_ids(tenant_id, limit) do
+      [] ->
+        []
+
+      ids ->
+        AdminRepo.all(
+          from(a in Article,
+            where: a.tenant_id == ^tenant_id,
+            where: a.id in ^ids,
+            order_by: [asc: a.inserted_at]
+          )
+        )
+    end
+  end
+
+  # The id-only half of `unembedded_articles/2`. Every predicate the public function
+  # documents lives HERE, so the LIMIT is applied to genuinely embeddable articles and a
+  # backlog of empty-bodied ones can never mask a real gap behind it.
+  #
+  # Its whole value is that the articles side touches NO heap: it is served index-only by
+  # `articles_tenant_embeddable_inserted_id_idx`, whose PARTIAL PREDICATE is the status and
+  # non-blank-body test (which index the planner picks for the embeddings side is its own
+  # choice and is not pinned here). That placement is the point — `length(btrim(body, ...))`
+  # has to DETOAST every body it evaluates, so as a scan predicate it read the whole 146 MB
+  # heap plus its TOAST to answer a question about ~0 rows; as an index predicate it is
+  # settled at write time and index membership proves it.
+  #
+  # The second `btrim` argument is load-bearing: bare
+  # `btrim(body)` strips SPACES ONLY, so a newline/tab-only body reads as non-blank and gets
+  # embedded from its title alone. Keep the two spellings IDENTICAL: the planner uses a
+  # partial index only when it can prove the query implies the predicate, and a cosmetically
+  # different but equivalent rewrite here silently costs the heap back.
+  #
+  # Measured on the hosted corpus 2026-08-25 (86,476 articles / 85,559 embeddings, warm):
+  # 40,968 shared buffers and ~400 ms before, 1,181 and ~76 ms after.
+  #
+  # `AS MATERIALIZED` is load-bearing, not decoration. Inlined, the planner reads its own
+  # estimate that the anti-join yields few rows, assumes the LIMIT stops it early, and picks
+  # a nested loop -- which then probes the embeddings index 80,125 times because the true
+  # answer is zero (240,958 buffers). Materializing forces one scan per side and a hash
+  # anti-join over them.
+  #
+  # Raw SQL rather than Ecto because `AS MATERIALIZED` has no Ecto expression.
+  defp unembedded_article_ids(tenant_id, limit) do
+    %{rows: rows} =
+      AdminRepo.query!(
+        """
+        WITH have AS MATERIALIZED (
+          SELECT ae.article_id FROM article_embeddings ae WHERE ae.tenant_id = $1
+        )
+        SELECT a.id
+          FROM articles a
+         WHERE a.tenant_id = $1
+           AND a.status = 'published'
+           AND a.body IS NOT NULL
+           AND length(btrim(a.body, E' \\t\\r\\n')) > 0
+           AND NOT EXISTS (SELECT 1 FROM have h WHERE h.article_id = a.id)
+         ORDER BY a.inserted_at
+         LIMIT $2
+        """,
+        [Ecto.UUID.dump!(tenant_id), limit]
       )
-    )
+
+    Enum.map(rows, fn [id] -> Ecto.UUID.load!(id) end)
   end
 
   @doc "The memories twin of `pending_reembed_articles/3`."
