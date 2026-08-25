@@ -393,6 +393,16 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
         {result, %{status: :regression} = comparison} ->
           ["#{result.mode}: regression in #{Enum.join(comparison.regressions, ", ")}"]
 
+        # A shared-question regression is a REAL drop even when the aggregates cannot be
+        # compared, so it must reach the gate message by name. Reporting only "cannot
+        # compare" is what let three questions lose a rank apiece across the golden_v3 ->
+        # v4 -> v5 growth without anyone reading it.
+        {result, %{status: :question_set_mismatch, question_regressions: [_ | _] = ids}} ->
+          [
+            "#{result.mode}: cannot compare aggregates (question set changed), AND " <>
+              "#{length(ids)} shared question(s) regressed: #{Enum.join(ids, ", ")}"
+          ]
+
         {result, %{status: status}} ->
           ["#{result.mode}: cannot compare (#{status})"]
 

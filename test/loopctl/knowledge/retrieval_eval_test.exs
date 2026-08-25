@@ -929,7 +929,7 @@ defmodule Loopctl.Knowledge.RetrievalEvalTest do
       assert "mrr" in comparison.regressions
     end
 
-    test "a changed question set blocks comparison even if the version string is unchanged",
+    test "a changed question set blocks the AGGREGATE comparison but not the per-question one",
          %{result: result, baseline: baseline} do
       # Simulate a golden question added without re-baselining: the baseline covers fewer
       # questions than the run, but the free-text version header was left untouched.
@@ -938,9 +938,60 @@ defmodule Loopctl.Knowledge.RetrievalEvalTest do
 
       comparison = Baseline.compare(result, stale)
 
+      # The aggregates average over different question sets, so they stay uncomparable and
+      # the gate still fails closed on this status.
       assert comparison.status == :question_set_mismatch
       assert comparison.aggregate == []
-      assert Report.render(result, comparison) =~ "re-baseline before comparing"
+
+      # But the questions on BOTH sides were still compared, and the report says how many.
+      assert comparison.shared_question_count > 0
+      refute Enum.any?(comparison.questions, &(&1.id == "q-ecto-multi"))
+      assert Report.render(result, comparison) =~ "AGGREGATES INCOMPARABLE"
+    end
+
+    test "a shared question that regressed is NAMED even though the question set changed",
+         %{result: result, baseline: baseline} do
+      # This is the case the gate was blind to for three golden-set generations. Adding a
+      # golden question forces a re-baseline (the runbook says so), and the all-or-nothing
+      # mismatch threw away every comparable question to avoid mis-scoring the new one. A
+      # controlled A/B on 2026-08-25 found three questions whose correct answer had moved
+      # DOWN the ranking across golden_v3 -> v4 -> v5, all three present in every baseline.
+      [%{id: shared_id} | _] = result.question_results
+
+      stale =
+        baseline
+        |> update_in(["modes", "embeddings", "questions"], &Map.delete(&1, "q-ecto-multi"))
+        |> put_in(["modes", "embeddings", "questions", shared_id, "mrr"], 1.0)
+
+      worse = %{
+        result
+        | question_results:
+            Enum.map(result.question_results, fn q ->
+              if q.id == shared_id, do: %{q | mrr: 0.25}, else: q
+            end)
+      }
+
+      comparison = Baseline.compare(worse, stale)
+
+      assert comparison.status == :question_set_mismatch
+      assert shared_id in comparison.question_regressions
+
+      rendered = Report.render(worse, comparison)
+      assert rendered =~ "REGRESSED"
+      assert rendered =~ shared_id
+    end
+
+    test "a question absent from the baseline cannot be reported as a regression",
+         %{result: result, baseline: baseline} do
+      # A brand-new golden question has no baseline row, so every delta against it is nil.
+      # Counting that as a regression would make adding a question impossible; counting it
+      # as a win would be just as wrong. It is inert.
+      stale =
+        update_in(baseline["modes"]["embeddings"]["questions"], &Map.delete(&1, "q-ecto-multi"))
+
+      comparison = Baseline.compare(result, stale)
+
+      refute "q-ecto-multi" in comparison.question_regressions
     end
 
     test "a metric with no baseline counterpart is INCOMPARABLE, not ok", %{result: result} do

@@ -140,9 +140,29 @@ defmodule Loopctl.Knowledge.RetrievalEval.Report do
     "BASELINE\n  golden set version changed (#{gv.baseline} -> #{gv.current}) — re-baseline before comparing"
   end
 
-  defp baseline_section(%{status: :question_set_mismatch}) do
-    "BASELINE\n  golden question set differs from the baseline's (added/removed/renamed a " <>
-      "question without re-baselining) — re-baseline before comparing"
+  # The aggregates are genuinely not comparable across two question sets, so this still
+  # fails the gate. What it must NOT do is stop there: every question present on BOTH sides
+  # is still comparable, and the losers among them are exactly what a re-baseline is about
+  # to absorb. Printing them is the whole point of this branch.
+  defp baseline_section(%{status: :question_set_mismatch} = comparison) do
+    header =
+      "BASELINE\n  status: AGGREGATES INCOMPARABLE — the golden question set differs from " <>
+        "the baseline's (a question was added, removed or renamed), so the aggregate " <>
+        "metrics average over different questions and are not compared.\n" <>
+        "  #{comparison.shared_question_count} question(s) appear on BOTH sides and WERE " <>
+        "compared:"
+
+    regressed =
+      case comparison.question_regressions do
+        [] ->
+          "\n  no shared question regressed."
+
+        ids ->
+          "\n  REGRESSED (shared with the baseline, so this is a real drop, not " <>
+            "composition):\n" <> Enum.map_join(ids, "\n", &"    #{&1}")
+      end
+
+    header <> regressed <> "\n" <> winners_losers(comparison)
   end
 
   defp baseline_section(%{status: :incomparable} = comparison) do
