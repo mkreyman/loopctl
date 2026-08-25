@@ -1,7 +1,8 @@
 defmodule Loopctl.ObanPluginsConfigTest do
   @moduledoc """
-  US-34.1 (AC-34.1.4, TC-34.1.4): `Oban.Plugins.Reindexer` is configured, and the
-  pre-existing Lifeline/Pruner plugins are unchanged.
+  US-34.1 (AC-34.1.4, TC-34.1.4): `Oban.Plugins.Reindexer` is configured, Lifeline is
+  unchanged, and the Pruner keeps its seven-day `max_age` but now sets an explicit sweep
+  `interval` instead of taking the library's 30-second default.
 
   Pure config read — no DB, no running Oban needed (`config/test.exs` sets
   `testing: :inline`, under which plugins are not started). As of US-35.3 the

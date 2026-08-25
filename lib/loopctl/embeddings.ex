@@ -1927,15 +1927,19 @@ defmodule Loopctl.Embeddings do
   # documents lives HERE, so the LIMIT is applied to genuinely embeddable articles and a
   # backlog of empty-bodied ones can never mask a real gap behind it.
   #
-  # Its whole value is that it touches NO heap. Both sides are served index-only: the
-  # embeddings side by `article_embeddings_tenant_article_dim_index`, the articles side by
+  # Its whole value is that the articles side touches NO heap: it is served index-only by
   # `articles_tenant_embeddable_inserted_id_idx`, whose PARTIAL PREDICATE is the status and
-  # non-empty-body test. That placement is the point — `length(btrim(body))` has to DETOAST
-  # every body it evaluates, so as a scan predicate it read the whole 146 MB heap plus its
-  # TOAST to answer a question about ~0 rows; as an index predicate it is settled at write
-  # time and index membership proves it. Keep the two spellings IDENTICAL: the planner uses
-  # a partial index only when it can prove the query implies the predicate, and a
-  # cosmetically different but equivalent rewrite here silently costs the heap back.
+  # non-blank-body test (which index the planner picks for the embeddings side is its own
+  # choice and is not pinned here). That placement is the point — `length(btrim(body, ...))`
+  # has to DETOAST every body it evaluates, so as a scan predicate it read the whole 146 MB
+  # heap plus its TOAST to answer a question about ~0 rows; as an index predicate it is
+  # settled at write time and index membership proves it.
+  #
+  # The second `btrim` argument is load-bearing: bare
+  # `btrim(body)` strips SPACES ONLY, so a newline/tab-only body reads as non-blank and gets
+  # embedded from its title alone. Keep the two spellings IDENTICAL: the planner uses a
+  # partial index only when it can prove the query implies the predicate, and a cosmetically
+  # different but equivalent rewrite here silently costs the heap back.
   #
   # Measured on the hosted corpus 2026-08-25 (86,476 articles / 85,559 embeddings, warm):
   # 40,968 shared buffers and ~400 ms before, 1,181 and ~76 ms after.
@@ -1959,7 +1963,7 @@ defmodule Loopctl.Embeddings do
          WHERE a.tenant_id = $1
            AND a.status = 'published'
            AND a.body IS NOT NULL
-           AND length(btrim(a.body)) > 0
+           AND length(btrim(a.body, E' \\t\\r\\n')) > 0
            AND NOT EXISTS (SELECT 1 FROM have h WHERE h.article_id = a.id)
          ORDER BY a.inserted_at
          LIMIT $2

@@ -85,15 +85,20 @@ defmodule Loopctl.Workers.EmbeddingReconciliationWorkerTest do
 
       # The changeset requires a body, so blank it through the repo — which is also how a
       # whitespace-only body could realistically arrive (a direct write, an import).
-      empty =
-        tenant.id
-        |> published_unembedded()
-        |> Ecto.Changeset.change(%{body: "   "})
-        |> AdminRepo.update!()
+      [empty, breaks] =
+        for blank <- ["   ", "\n\t\n"] do
+          tenant.id
+          |> published_unembedded()
+          |> Ecto.Changeset.change(%{body: blank})
+          |> AdminRepo.update!()
+        end
 
       ids = tenant.id |> Embeddings.unembedded_articles(100) |> Enum.map(& &1.id)
       refute draft.id in ids
       refute empty.id in ids
+      # Bare `btrim(body)` strips SPACES ONLY, so a line-break-only body passed the filter,
+      # got embedded from its title alone, and then matched search as if it had content.
+      refute breaks.id in ids
     end
 
     test "returns the OLDEST gaps first" do
@@ -133,12 +138,13 @@ defmodule Loopctl.Workers.EmbeddingReconciliationWorkerTest do
       # worker exists to close.
       tenant = fixture(:tenant)
 
-      for days_ago <- [40, 39] do
+      # One of each blank spelling: the batch of two is only consumed if BOTH are excluded.
+      for {days_ago, blank} <- [{40, "   "}, {39, "\n\t\n"}] do
         at = DateTime.utc_now() |> DateTime.add(-days_ago * 86_400, :second)
 
         tenant.id
         |> published_unembedded()
-        |> Ecto.Changeset.change(%{body: "   ", inserted_at: at})
+        |> Ecto.Changeset.change(%{body: blank, inserted_at: at})
         |> AdminRepo.update!()
       end
 

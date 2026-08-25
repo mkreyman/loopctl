@@ -30,7 +30,9 @@ All notable changes to loopctl are documented here.
   calls, 457s, 12.1% of that database's total query time, to remove ~5,600 rows a day.
   **Operator impact:** the deploy adds `articles_tenant_embeddable_inserted_id_idx`
   (4.6 MB on the hosted corpus) via `CREATE INDEX CONCURRENTLY`, which cannot run inside a
-  transaction and takes about a second at that size; it does not block writes. Terminal
+  transaction and takes about a second at that size; it does not block writes. The
+  migration is re-runnable — it drops a leftover INVALID index from an interrupted build
+  before creating, so a failed release does not wedge later deploys. Terminal
   Oban jobs are now removed up to five minutes later than before, which is invisible
   against a seven-day `max_age`. No configuration change is required.
 
