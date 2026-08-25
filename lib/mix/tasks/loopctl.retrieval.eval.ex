@@ -116,6 +116,7 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
     json: :boolean,
     cleanup: :boolean,
     allow_prod: :boolean,
+    allow_dirty: :boolean,
     min_age: :integer,
     graph_lane: :boolean,
     graph_weight: :float,
@@ -139,8 +140,50 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
     if Keyword.get(opts, :cleanup, false) do
       reap_leaked_tenants(opts)
     else
+      refuse_on_leaked_corpus!(opts)
       run_eval(opts)
     end
+  end
+
+  # REFUSE to score against a database that still holds another run's seeded corpus.
+  #
+  # The ANN is ONE HNSW index shared by every tenant, and `search_semantic` applies the
+  # tenant predicate as a residual AFTER the index returns its neighbourhood (see the wiki
+  # article "Multi-tenant HNSW: residual filter drops results under cross-tenant density").
+  # So a leaked corpus is not inert background: it crowds the neighbourhood, and this
+  # tenant's own answers fall outside the window and simply do not come back.
+  #
+  # Measured 2026-08-25, and it is why this guard exists. A `--filler` sweep was killed
+  # mid-run by a timeout, leaving 12,500 filler rows in two abandoned tenants. Every later
+  # cell of that sweep then scored against a progressively dirtier index, and nine golden
+  # questions went from MRR 1.000 to 0.000 — the answer not demoted but ABSENT. Read as a
+  # pool-depth curve it said "a deeper pool is worse", which is a conclusion about run
+  # ORDER wearing a pool's clothes. Every number from that sweep was discarded.
+  #
+  # Fails CLOSED, and names the remedy: a sweep that silently tolerates this produces
+  # confident numbers that mean nothing.
+  defp refuse_on_leaked_corpus!(opts) do
+    leaked =
+      AdminRepo.aggregate(
+        from(a in Loopctl.Knowledge.Article,
+          where: fragment("coalesce((?->>'retrieval_eval')::boolean, false)", a.metadata)
+        ),
+        :count
+      )
+
+    if leaked > 0 and not Keyword.get(opts, :allow_dirty, false) do
+      Mix.raise("""
+      retrieval eval: #{leaked} seeded eval row(s) from a previous run are still in this       database.
+
+      The ANN index is shared across tenants and the tenant filter is applied AFTER it, so       a leaked corpus crowds this run's neighbourhood and its answers silently drop out of       the results. Any metric produced now would describe the leftovers, not the ranking.
+
+      Reap them first:   mix loopctl.retrieval.eval --cleanup
+
+      (--allow-dirty overrides this, for diagnosing the leak itself. Never for a measurement.)
+      """)
+    end
+
+    :ok
   end
 
   defp guard_prod!(opts) do
@@ -497,6 +540,32 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
           select: t.id
         )
       )
+
+    # Seeded rows can outlive their tenant row: a killed run leaves both, but a partly-torn-
+    # down one can leave articles whose tenant was already deleted. Reaping by tenant alone
+    # left those behind, and they are exactly as damaging to the shared ANN index — so sweep
+    # the marker too, independently of which tenants are found.
+    seeded =
+      from(a in Loopctl.Knowledge.Article,
+        where: fragment("coalesce((?->>'retrieval_eval')::boolean, false)", a.metadata),
+        select: a.id
+      )
+
+    # LINKS FIRST. `article_links` FKs both endpoints with `on_delete: :restrict`, so
+    # deleting a linked article raises a foreign-key violation and reaps NOTHING —
+    # `delete_corpus/2` carries the same ordering and the same comment, and this reaper
+    # was written without it and failed on its first real run against a dirty database.
+    AdminRepo.delete_all(
+      from(l in Loopctl.Knowledge.ArticleLink,
+        where: l.source_article_id in subquery(seeded) or l.target_article_id in subquery(seeded)
+      )
+    )
+
+    {orphaned, _} = AdminRepo.delete_all(seeded)
+
+    if orphaned > 0 do
+      Mix.shell().info("Retrieval eval cleanup: deleted #{orphaned} seeded eval article(s).")
+    end
 
     if tenant_ids == [] do
       Mix.shell().info("Retrieval eval cleanup: no leaked eval tenants found.")
