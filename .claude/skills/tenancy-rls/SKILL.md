@@ -54,11 +54,11 @@ reads through `Loopctl.HeavyRead` (`lib/loopctl/heavy_read.ex`), which owns the 
 6. **On `AdminRepo`/`HeavyReadRepo`, RLS does NOTHING — the explicit `tenant_id` predicate is the only
    isolation there** (`knowledge.ex:9-14`, `heavy_read.ex:3-7`). This is the compensating invariant for
    the other two repos, and it is enforced structurally on the heavy path: the private `guard!/2`
-   (`heavy_read.ex:1474-1492`) RAISES unless EVERY base-table source — `from`, every join, and every
+   (`heavy_read.ex:1520-1538`) RAISES unless EVERY base-table source — `from`, every join, and every
    subquery, recursively — carries a conjunctive `x.tenant_id == ^tenant_id` bound to the passed
    `tenant_id`; `test/loopctl/heavy_read_guard_test.exs` additionally bars direct `HeavyReadRepo` calls.
    Agent-memory reads need a SECOND predicate: `all_memory/4` (`:1090`) also requires a conjunctive
-   `subject_id` equality on the outermost query (private `guard_memory!/3`, `heavy_read.ex:1496-1528`), because `subject_id`
+   `subject_id` equality on the outermost query (private `guard_memory!/3`, `heavy_read.ex:1542-1564`), because `subject_id`
    scoping is application-level only. Always go through `Loopctl.HeavyRead`, never `HeavyReadRepo`
    directly; on `AdminRepo` there is no guard at all, so the predicate is on you.
 7. **Heavy reads can be SHED — handle `{:error, :heavy_read_overloaded}`.** `all/3` (`heavy_read.ex:1128`),

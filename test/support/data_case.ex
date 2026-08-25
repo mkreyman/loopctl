@@ -75,8 +75,23 @@ defmodule Loopctl.DataCase do
   It is a REACHABILITY failure, not a breadth one, which is why `hnsw.ef_search`,
   `hnsw.iterative_scan` and exact-scan forcing each failed to fix it: measured in that
   file, the read still returns `[]` under `relaxed_order` AND under `ef_search = 1000`.
-  Vacuuming is the only thing that repairs the graph, and it repairs it completely — the
-  same poisoned index answers correctly immediately afterwards.
+  Vacuuming repairs the graph completely on a QUIET database — the same poisoned index
+  answers correctly immediately afterwards, which is what the reproduction asserts. It does
+  NOT follow that vacuuming can carry a whole async suite, and measurement on minis
+  2026-08-24 says it cannot: a janitor vacuuming every 2s still failed 2 of 6 full-suite
+  runs, because VACUUM cannot reclaim a tuple still visible to any open snapshot and an async
+  Sandbox suite holds ~`max_cases` transactions open for practically the entire run. This
+  function works because it runs in `setup`, BEFORE its own test opens the transaction the
+  assertion reads through. The suite-wide repair is
+  `Loopctl.HeavyRead.maybe_force_exact_scan/1`, which takes the graph out of the picture
+  rather than repairing it.
+
+  **That suite-wide repair does NOT make this tag redundant — measured, do not remove it.**
+  Taking the three `@moduletag :vacuum_vector_indexes` off their modules with the exact-scan
+  forcing in place produced a failure in 4 full-suite runs and no speedup at all (51s against
+  45s WITH the tags — slower, not faster), so the tag is not the tax it looks like here. The
+  two work on different things: the exact plan covers reads that go through
+  `Loopctl.HeavyRead`, and this covers what a module does around them.
 
   Production is not affected: its rows are committed, so its graph is not made of dead
   entries.
