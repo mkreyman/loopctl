@@ -81,6 +81,17 @@ defmodule Loopctl.Knowledge.RetrievalEvalTest do
     build(:retrieval_golden_set, %{questions: [q1, q2]})
   end
 
+  # Push ONE question's mrr down, leaving the rest of the run untouched.
+  defp degrade_mrr(result, id, value \\ 0.25) do
+    %{
+      result
+      | question_results:
+          Enum.map(result.question_results, fn q ->
+            if q.id == id, do: %{q | mrr: value}, else: q
+          end)
+    }
+  end
+
   defp golden_jsonl(golden) do
     header = JSON.encode!(%{"kind" => "header", "version" => golden.version})
 
@@ -929,7 +940,7 @@ defmodule Loopctl.Knowledge.RetrievalEvalTest do
       assert "mrr" in comparison.regressions
     end
 
-    test "a changed question set blocks comparison even if the version string is unchanged",
+    test "a changed question set blocks the AGGREGATE comparison but not the per-question one",
          %{result: result, baseline: baseline} do
       # Simulate a golden question added without re-baselining: the baseline covers fewer
       # questions than the run, but the free-text version header was left untouched.
@@ -938,9 +949,237 @@ defmodule Loopctl.Knowledge.RetrievalEvalTest do
 
       comparison = Baseline.compare(result, stale)
 
+      # The aggregates average over different question sets, so they stay uncomparable and
+      # the gate still fails closed on this status.
       assert comparison.status == :question_set_mismatch
       assert comparison.aggregate == []
-      assert Report.render(result, comparison) =~ "re-baseline before comparing"
+
+      # But the questions on BOTH sides were still compared, and the report says how many.
+      assert comparison.shared_question_count > 0
+      refute Enum.any?(comparison.questions, &(&1.id == "q-ecto-multi"))
+      assert Report.render(result, comparison) =~ "AGGREGATES INCOMPARABLE"
+    end
+
+    test "a shared question that regressed is NAMED even though the question set changed",
+         %{result: result, baseline: baseline} do
+      # This is the case the gate was blind to for three golden-set generations. Adding a
+      # golden question forces a re-baseline (the runbook says so), and the all-or-nothing
+      # mismatch threw away every comparable question to avoid mis-scoring the new one. A
+      # controlled A/B on 2026-08-25 found three questions whose correct answer had moved
+      # DOWN the ranking across golden_v3 -> v4 -> v5, all three present in every baseline.
+      %{id: shared_id} = Enum.find(result.question_results, &(&1.id != "q-ecto-multi"))
+
+      stale =
+        baseline
+        |> update_in(["modes", "embeddings", "questions"], &Map.delete(&1, "q-ecto-multi"))
+        |> put_in(["modes", "embeddings", "questions", shared_id, "mrr"], 1.0)
+
+      worse = degrade_mrr(result, shared_id)
+
+      comparison = Baseline.compare(worse, stale)
+
+      assert comparison.status == :question_set_mismatch
+      assert shared_id in comparison.question_regressions
+
+      rendered = Report.render(worse, comparison)
+      assert rendered =~ "REGRESSED"
+      assert rendered =~ shared_id
+    end
+
+    test "a question absent from the baseline is dropped from the comparison entirely",
+         %{result: result, baseline: baseline} do
+      # A brand-new golden question has no baseline row, so every delta against it is nil.
+      # Counting that as a regression would make adding a question impossible; counting it
+      # as a win would be just as wrong. It is not comparable at all, so it appears in
+      # neither the compared set nor any verdict drawn from it.
+      stale =
+        update_in(baseline["modes"]["embeddings"]["questions"], &Map.delete(&1, "q-ecto-multi"))
+
+      comparison = Baseline.compare(result, stale)
+
+      refute Enum.any?(comparison.questions, &(&1.id == "q-ecto-multi"))
+      refute "q-ecto-multi" in comparison.question_regressions
+      refute "q-ecto-multi" in comparison.winners
+      refute "q-ecto-multi" in comparison.losers
+    end
+
+    test "a shared question with no baseline value for a metric is UNCOMPARABLE, not clean",
+         %{result: result, baseline: baseline} do
+      # The per-question twin of the aggregate `uncomparable`: the baseline row kept mrr
+      # but not recall@3, so recall@3 has nothing to compare against. regression?/3 says
+      # "not a regression" for a nil baseline, and reporting that as "no shared question
+      # regressed" would be an all-clear drawn from a comparison that did not happen.
+      %{id: shared_id} = Enum.find(result.question_results, &(&1.id != "q-ecto-multi"))
+
+      stale =
+        baseline
+        |> update_in(["modes", "embeddings", "questions"], &Map.delete(&1, "q-ecto-multi"))
+        |> update_in(
+          ["modes", "embeddings", "questions", shared_id, "recall_at_k"],
+          &Map.delete(&1, "3")
+        )
+
+      comparison = Baseline.compare(result, stale)
+
+      assert shared_id in comparison.question_uncomparable
+      refute shared_id in comparison.question_regressions
+      assert Report.render(result, comparison) =~ "uncomparable, not clean"
+    end
+
+    test "bumping the golden version still names a shared question that regressed",
+         %{result: result, baseline: baseline} do
+      # The version header IS bumped whenever a golden question is added (golden_v1..v5 in
+      # priv/retrieval_eval/golden.jsonl), so this — not the stale-header case — is the
+      # branch every real re-baseline lands in. Giving up on the whole comparison here left
+      # the intersection unreachable in the only workflow that produces it.
+      %{id: shared_id} = Enum.find(result.question_results, &(&1.id != "q-ecto-multi"))
+
+      stale =
+        baseline
+        |> Map.put("golden_version", "golden_v99")
+        |> update_in(["modes", "embeddings", "questions"], &Map.delete(&1, "q-ecto-multi"))
+        |> put_in(["modes", "embeddings", "questions", shared_id, "mrr"], 1.0)
+
+      worse = degrade_mrr(result, shared_id)
+
+      comparison = Baseline.compare(worse, stale)
+
+      assert comparison.status == :golden_version_mismatch
+      assert comparison.aggregate == []
+      assert shared_id in comparison.question_regressions
+
+      rendered = Report.render(worse, comparison)
+      assert rendered =~ "re-baseline before comparing"
+      assert rendered =~ "REGRESSED"
+      assert rendered =~ shared_id
+    end
+
+    test "an empty intersection never renders as an all-clear", %{result: result} do
+      # Every question renamed: the mismatch fires, nothing is comparable, and "no shared
+      # question regressed" would be a reassurance produced by comparing nothing.
+      renamed =
+        [result]
+        |> Baseline.from_results()
+        |> update_in(["modes", "embeddings", "questions"], fn questions ->
+          Map.new(questions, fn {id, row} -> {"renamed-" <> id, row} end)
+        end)
+
+      comparison = Baseline.compare(result, renamed)
+
+      assert comparison.status == :question_set_mismatch
+      assert comparison.shared_question_count == 0
+
+      rendered = Report.render(result, comparison)
+      assert rendered =~ "nothing was comparable per-question"
+      refute rendered =~ "no shared question regressed"
+    end
+
+    test "a per-question regression is reported even when the aggregates hold steady",
+         %{result: result, baseline: baseline} do
+      # One question loses a rank while another gains: the aggregate nets out and the
+      # question set is unchanged, so nothing but the per-question comparison can see it.
+      %{id: loser_id} = Enum.find(result.question_results, &(&1.id != "q-ecto-multi"))
+
+      raised = put_in(baseline["modes"]["embeddings"]["questions"][loser_id]["mrr"], 1.0)
+      worse = degrade_mrr(result, loser_id)
+
+      comparison = Baseline.compare(worse, raised)
+
+      assert comparison.status == :ok
+      assert loser_id in comparison.question_regressions
+      assert Report.render(worse, comparison) =~ "PER-QUESTION REGRESSION"
+    end
+
+    test "a per-question metric with no baseline value is not an all-clear on the OK path",
+         %{result: result, baseline: baseline} do
+      # The question set and version are unchanged, so the AGGREGATE guard never fires and
+      # this is the only thing standing between "could not be compared" and a green run.
+      stale =
+        update_in(
+          baseline["modes"]["embeddings"]["questions"]["q-ecto-multi"]["recall_at_k"],
+          &Map.delete(&1, "3")
+        )
+
+      comparison = Baseline.compare(result, stale)
+
+      assert comparison.status == :ok
+      assert "q-ecto-multi" in comparison.question_uncomparable
+
+      rendered = Report.render(result, comparison)
+      refute rendered =~ "OK (no regression)"
+      assert rendered =~ "uncomparable, not clean"
+      assert Report.to_json_map(result, comparison)["baseline"]["status"] != "ok"
+    end
+
+    test "a regressed AND an uncomparable shared question are BOTH named",
+         %{result: result, baseline: baseline} do
+      # Two independent verdicts over the same intersection: naming only the regression
+      # leaves the reader believing the other question was compared and was fine.
+      stale =
+        baseline
+        |> put_in(["modes", "embeddings", "questions", "q-advisory-lock", "mrr"], 1.0)
+        |> update_in(
+          ["modes", "embeddings", "questions", "q-ecto-multi", "recall_at_k"],
+          &Map.delete(&1, "3")
+        )
+        |> Map.put("golden_version", "golden_v99")
+
+      worse = degrade_mrr(result, "q-advisory-lock")
+
+      comparison = Baseline.compare(worse, stale)
+
+      assert comparison.question_regressions == ["q-advisory-lock"]
+      assert comparison.question_uncomparable == ["q-ecto-multi"]
+
+      rendered = Report.render(worse, comparison)
+      assert rendered =~ "q-advisory-lock"
+      assert rendered =~ "uncomparable, not clean"
+      assert rendered =~ "q-ecto-multi"
+      refute rendered =~ "WERE compared"
+    end
+
+    test "a per-question regression keeps --json from answering ok",
+         %{result: result, baseline: baseline} do
+      # The gate exits non-zero and the text report says PER-QUESTION REGRESSION; a machine
+      # consumer keying on `status` must not read the same run as clean.
+      raised = put_in(baseline["modes"]["embeddings"]["questions"]["q-ecto-multi"]["mrr"], 1.0)
+      worse = degrade_mrr(result, "q-ecto-multi")
+
+      comparison = Baseline.compare(worse, raised)
+
+      assert comparison.status == :ok
+      assert Report.to_json_map(worse, comparison)["baseline"]["status"] == "question_regression"
+    end
+
+    test "a baseline whose questions map is null still reports the mismatch",
+         %{result: result, baseline: baseline} do
+      # A PRESENT-but-null key is not a missing key: `Map.get/3`'s default never fires, so
+      # this shape used to crash the whole run after it had already seeded and scored.
+      nulled = put_in(baseline["modes"]["embeddings"]["questions"], nil)
+
+      comparison = Baseline.compare(%{result | golden_version: "golden_v99"}, nulled)
+
+      assert comparison.status == :golden_version_mismatch
+      assert comparison.shared_question_count == 0
+    end
+
+    test "the --json view carries the per-question verdict the text report does",
+         %{result: result, baseline: baseline} do
+      # --json is the machine-readable surface; a consumer keying on it must not read a
+      # named regression as a clean run just because the aggregates were not comparable.
+      %{id: shared_id} = Enum.find(result.question_results, &(&1.id != "q-ecto-multi"))
+
+      stale =
+        baseline
+        |> update_in(["modes", "embeddings", "questions"], &Map.delete(&1, "q-ecto-multi"))
+        |> put_in(["modes", "embeddings", "questions", shared_id, "mrr"], 1.0)
+
+      worse = degrade_mrr(result, shared_id)
+      json = Report.to_json_map(worse, Baseline.compare(worse, stale))
+
+      assert json["baseline"]["question_regressions"] == [shared_id]
+      assert json["baseline"]["shared_question_count"] == 1
+      assert json["baseline"]["question_uncomparable"] == []
     end
 
     test "a metric with no baseline counterpart is INCOMPARABLE, not ok", %{result: result} do

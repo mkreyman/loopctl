@@ -25,8 +25,11 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
     * `--baseline` — path to the baseline JSON (default the committed one).
     * `--update-baseline` — rewrite the baseline from this run instead of comparing.
       Implies `--mode both` unless a mode is given explicitly.
-    * `--fail-on-regression` — exit non-zero when any aggregate metric is below
-      baseline by more than the tolerance. This is what CI runs.
+    * `--fail-on-regression` — exit non-zero when any aggregate metric is below baseline
+      by more than the tolerance, AND whenever a question shared with the baseline
+      regressed or carried a metric the baseline has no value for. Those two gate on every
+      status, including one whose aggregates are fine or not comparable. This is what CI
+      runs.
     * `--tolerance` — float slack below baseline that is not a regression.
     * `--json` — emit the machine-readable result instead of the text report.
     * `--graph-lane` / `--no-graph-lane` — force the optional RRF graph-neighbour lane
@@ -387,14 +390,20 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
   defp maybe_fail(comparisons, true) do
     problems =
       Enum.flat_map(comparisons, fn
-        {_result, %{status: :ok}} ->
+        {_result, %{status: :ok, question_regressions: [], question_uncomparable: []}} ->
           []
 
-        {result, %{status: :regression} = comparison} ->
-          ["#{result.mode}: regression in #{Enum.join(comparison.regressions, ", ")}"]
+        {result, %{status: :ok} = comparison} ->
+          ["#{result.mode}: aggregates OK, but #{question_phrase(comparison)}"]
 
-        {result, %{status: status}} ->
-          ["#{result.mode}: cannot compare (#{status})"]
+        {result, %{status: :regression} = comparison} ->
+          [
+            "#{result.mode}: regression in #{Enum.join(comparison.regressions, ", ")}" <>
+              also_per_question(comparison)
+          ]
+
+        {result, %{status: status} = comparison} ->
+          ["#{result.mode}: cannot compare (#{status})" <> also_per_question(comparison)]
 
         {result, nil} ->
           ["#{result.mode}: no baseline to compare against"]
@@ -407,6 +416,34 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
       Mix.raise("retrieval eval gate failed")
     end
   end
+
+  # A per-question verdict gates and is named on EVERY path — never only where the aggregate
+  # happened to fail. A question that loses a rank while another gains nets out to a flat
+  # aggregate (the runbook's own reranking case), and a moved question set makes the
+  # aggregate uncomparable without making the shared questions so — that is what let three
+  # questions lose a rank apiece across the golden_v3 -> v5 growth without anyone reading
+  # it. A metric with NO baseline value gates for the same reason its aggregate twin does:
+  # "could not be compared" is not "did not regress".
+  defp also_per_question(comparison) do
+    case question_phrase(comparison) do
+      "" -> ""
+      phrase -> ", AND " <> phrase
+    end
+  end
+
+  defp question_phrase(comparison) do
+    [
+      phrase(comparison.question_regressions, "regressed"),
+      phrase(comparison.question_uncomparable, "had no baseline value for a metric")
+    ]
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.join(", and ")
+  end
+
+  defp phrase([], _what), do: ""
+
+  defp phrase(ids, what),
+    do: "#{length(ids)} shared question(s) #{what}: #{Enum.join(ids, ", ")}"
 
   # A throwaway tenant per run: the eval seeds a corpus, and seeding it into a real
   # tenant would pollute that tenant's KB. Deleted in an `after` so a raising run leaves
