@@ -45,11 +45,36 @@ defmodule Loopctl.Knowledge.RetrievalEval.Report do
 
     """
     Retrieval eval — golden set #{result.golden_version}
+    #{provenance_banner()}
       requested mode : #{result.mode}
       observed mode  : #{result.observed_mode}
       fallback reason: #{reasons}
       questions      : #{result.question_count}\
     """
+  end
+
+  # Every number this report prints is produced on a SYNTHETIC fixture, and the banner
+  # exists because that fact does not survive being quoted.
+  #
+  # The limitation was already written down — the runbook says "read the numbers as a
+  # REGRESSION signal, not an absolute quality score" and "there is no real-embedding-
+  # provider path" — and on 2026-08-25 a session that had READ that runbook still reported
+  # this eval's +6.5% MRR to the owner as the answer to "did the search refactor improve
+  # search?". Measured against production traffic the same day, the real answer was "no
+  # measurable change in either direction" (weekly MRR sigma 0.045; the observed gap 0.022).
+  #
+  # So the caveat is attached to the ARTIFACT rather than to a document about the artifact.
+  # A doc can be read and then not applied at reporting time; a banner travels with the
+  # number into whatever paraphrases it. Do not remove it to tidy the output, and do not
+  # weaken it to "synthetic embeddings" alone — the CORPUS is invented too (hand-authored
+  # prose, median body 123 characters, against a production corpus of ~86,000 real
+  # articles), and that is the half that misleads about absolute quality.
+  @spec provenance_banner() :: String.t()
+  def provenance_banner do
+    "  ⚠ SYNTHETIC FIXTURE — invented corpus + synthetic embeddings. Valid as a\n" <>
+      "    REGRESSION signal between two runs of this harness. NOT a measurement of\n" <>
+      "    production retrieval quality; do not quote these figures as one. For the\n" <>
+      "    real corpus, measure logged traffic (docs/runbooks/retrieval_eval.md)."
   end
 
   defp aggregate_section(result, comparison) do
@@ -238,6 +263,12 @@ defmodule Loopctl.Knowledge.RetrievalEval.Report do
   @spec to_json_map(map(), map() | nil) :: map()
   def to_json_map(result, comparison \\ nil) do
     %{
+      # The JSON path is the one a script or another agent consumes, so it carries the
+      # same disclosure as the text report rather than relying on the reader having seen it.
+      "provenance" => "synthetic_fixture",
+      "provenance_note" =>
+        "Invented corpus and synthetic embeddings. Valid as a regression signal between " <>
+          "runs of this harness; NOT a measurement of production retrieval quality.",
       "golden_version" => result.golden_version,
       "mode" => to_string(result.mode),
       "observed_mode" => result.observed_mode,

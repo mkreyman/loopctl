@@ -1577,6 +1577,70 @@ defmodule Loopctl.Knowledge.RetrievalEvalTest do
   # 10. Deterministic seeded ids (reproducibility of the deploy gate)
   # =========================================================================
 
+  # Minimal result shape for the report tests — every metric undefined, so a rendering
+  # assertion cannot accidentally depend on a particular score.
+  defp sample_result do
+    %{
+      golden_version: "v",
+      mode: :embeddings,
+      observed_mode: "combined",
+      fallback_reasons: %{},
+      question_count: 1,
+      k_values: [5],
+      recall_at_k: %{5 => nil},
+      ndcg_at_k: %{5 => nil},
+      mrr: nil,
+      answered: 0,
+      answered_k: 5,
+      no_retrieval: %{recall_at_k: %{5 => nil}, ndcg_at_k: %{5 => nil}, mrr: nil, answered: 0},
+      spread: %{answered: 0, recall_at_k: %{5 => nil}, ndcg_at_k: %{5 => nil}, mrr: nil},
+      question_results: [
+        %{
+          id: "q",
+          question: "q?",
+          observed_mode: "combined",
+          fallback: false,
+          fallback_reason: nil,
+          ranked: [],
+          relevant: [],
+          recall_at_k: %{5 => nil},
+          mrr: nil,
+          ndcg_at_k: %{5 => nil},
+          answered: false
+        }
+      ]
+    }
+  end
+
+  describe "provenance disclosure" do
+    # These figures were quoted to the owner as production retrieval quality on 2026-08-25.
+    # The limitation was documented in the runbook at the time and the session had read it,
+    # so a doc is demonstrably not sufficient. The disclosure now rides the output itself,
+    # and these tests are what stop it being tidied away again.
+    test "the text report says the corpus is synthetic and must not be read as production" do
+      rendered = Report.render(sample_result(), nil)
+
+      assert rendered =~ "SYNTHETIC FIXTURE"
+      assert rendered =~ "REGRESSION signal"
+
+      # The CORPUS being invented is the half that misleads about absolute quality —
+      # "synthetic embeddings" alone would read as a limitation of the semantic lane only.
+      assert rendered =~ "invented corpus"
+
+      assert rendered =~ "NOT a measurement of",
+             "the report must say what it is not, not merely what it is"
+    end
+
+    test "the JSON output carries the same disclosure" do
+      # JSON is what a script or another agent consumes; a banner only in the human report
+      # leaves the machine path able to quote a bare number.
+      json = Report.to_json_map(sample_result(), nil)
+
+      assert json["provenance"] == "synthetic_fixture"
+      assert json["provenance_note"] =~ "NOT a measurement of production"
+    end
+  end
+
   describe "seed_corpus/2 deterministic ids" do
     test "re-seeding the same tenant yields byte-identical ids (no random UUIDs)" do
       tenant = fixture(:tenant)
