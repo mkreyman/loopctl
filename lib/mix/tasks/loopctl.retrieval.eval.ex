@@ -387,24 +387,20 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
   defp maybe_fail(comparisons, true) do
     problems =
       Enum.flat_map(comparisons, fn
-        {_result, %{status: :ok}} ->
+        {_result, %{status: :ok, question_regressions: []}} ->
           []
 
-        {result, %{status: :regression} = comparison} ->
-          ["#{result.mode}: regression in #{Enum.join(comparison.regressions, ", ")}"]
+        {result, %{status: :ok} = comparison} ->
+          ["#{result.mode}: aggregates OK, but #{question_phrase(comparison)}"]
 
-        # A shared-question regression is a REAL drop even when the aggregates cannot be
-        # compared, so it must reach the gate message by name. Reporting only "cannot
-        # compare" is what let three questions lose a rank apiece across the golden_v3 ->
-        # v4 -> v5 growth without anyone reading it.
-        {result, %{status: :question_set_mismatch, question_regressions: [_ | _] = ids}} ->
+        {result, %{status: :regression} = comparison} ->
           [
-            "#{result.mode}: cannot compare aggregates (question set changed), AND " <>
-              "#{length(ids)} shared question(s) regressed: #{Enum.join(ids, ", ")}"
+            "#{result.mode}: regression in #{Enum.join(comparison.regressions, ", ")}" <>
+              also_per_question(comparison)
           ]
 
-        {result, %{status: status}} ->
-          ["#{result.mode}: cannot compare (#{status})"]
+        {result, %{status: status} = comparison} ->
+          ["#{result.mode}: cannot compare (#{status})" <> also_per_question(comparison)]
 
         {result, nil} ->
           ["#{result.mode}: no baseline to compare against"]
@@ -417,6 +413,20 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
       Mix.raise("retrieval eval gate failed")
     end
   end
+
+  # A per-question regression is a REAL drop whatever the aggregate did, so it gates and is
+  # named on EVERY path — never only where the aggregate happened to fail. A question that
+  # loses a rank while another gains nets out to a flat aggregate (the runbook's own
+  # reranking case), and a moved question set makes the aggregate uncomparable without
+  # making the shared questions so — that is what let three questions lose a rank apiece
+  # across the golden_v3 -> v4 -> v5 growth without anyone reading it.
+  defp also_per_question(%{question_regressions: [_ | _]} = comparison),
+    do: ", AND " <> question_phrase(comparison)
+
+  defp also_per_question(_comparison), do: ""
+
+  defp question_phrase(%{question_regressions: ids}),
+    do: "#{length(ids)} shared question(s) regressed: #{Enum.join(ids, ", ")}"
 
   # A throwaway tenant per run: the eval seeds a corpus, and seeding it into a real
   # tenant would pollute that tenant's KB. Deleted in an `after` so a raising run leaves

@@ -136,37 +136,32 @@ defmodule Loopctl.Knowledge.RetrievalEval.Report do
     "BASELINE\n  no baseline entry for this mode (golden #{gv.baseline || "n/a"}) — nothing to compare"
   end
 
-  defp baseline_section(%{status: :golden_version_mismatch, golden_version: gv}) do
-    "BASELINE\n  golden set version changed (#{gv.baseline} -> #{gv.current}) — re-baseline before comparing"
+  # Both mismatch statuses drop the AGGREGATES only, so neither may stop at "cannot
+  # compare": every question present on BOTH sides is still comparable, and the losers
+  # among them are exactly what a re-baseline is about to absorb. The version branch needs
+  # this MORE than the question-set one -- bumping the version is the documented way to add
+  # a golden question, so it is the branch every real re-baseline actually lands in.
+  defp baseline_section(%{status: :golden_version_mismatch, golden_version: gv} = comparison) do
+    "BASELINE\n  status: AGGREGATES INCOMPARABLE — golden set version changed " <>
+      "(#{gv.baseline} -> #{gv.current}) — re-baseline before comparing." <>
+      shared_question_lines(comparison)
   end
 
-  # The aggregates are genuinely not comparable across two question sets, so this still
-  # fails the gate. What it must NOT do is stop there: every question present on BOTH sides
-  # is still comparable, and the losers among them are exactly what a re-baseline is about
-  # to absorb. Printing them is the whole point of this branch.
   defp baseline_section(%{status: :question_set_mismatch} = comparison) do
-    header =
-      "BASELINE\n  status: AGGREGATES INCOMPARABLE — the golden question set differs from " <>
-        "the baseline's (a question was added, removed or renamed), so the aggregate " <>
-        "metrics average over different questions and are not compared.\n" <>
-        "  #{comparison.shared_question_count} question(s) appear on BOTH sides and WERE " <>
-        "compared:"
-
-    regressed =
-      case comparison.question_regressions do
-        [] ->
-          "\n  no shared question regressed."
-
-        ids ->
-          "\n  REGRESSED (shared with the baseline, so this is a real drop, not " <>
-            "composition):\n" <> Enum.map_join(ids, "\n", &"    #{&1}")
-      end
-
-    header <> regressed <> "\n" <> winners_losers(comparison)
+    "BASELINE\n  status: AGGREGATES INCOMPARABLE — the golden question set differs from " <>
+      "the baseline's (a question was added, removed or renamed), so the aggregate " <>
+      "metrics average over different questions and are not compared." <>
+      shared_question_lines(comparison)
   end
 
   defp baseline_section(%{status: :incomparable} = comparison) do
     "BASELINE\n  status: INCOMPARABLE — no baseline value for #{Enum.join(comparison.uncomparable, ", ")}\n" <>
+      winners_losers(comparison)
+  end
+
+  defp baseline_section(%{status: :ok, question_regressions: [_ | _] = ids} = comparison) do
+    "BASELINE\n  status: PER-QUESTION REGRESSION (aggregates OK — a question that loses a " <>
+      "rank while another gains nets out): #{Enum.join(ids, ", ")}\n" <>
       winners_losers(comparison)
   end
 
@@ -178,6 +173,29 @@ defmodule Loopctl.Knowledge.RetrievalEval.Report do
     "BASELINE\n  status: REGRESSION in #{Enum.join(comparison.regressions, ", ")}\n" <>
       winners_losers(comparison)
   end
+
+  # An EMPTY intersection is a THIRD answer — nothing was compared — and must never render
+  # as the all-clear that "no shared question regressed" reads as.
+  defp shared_question_lines(%{shared_question_count: 0}) do
+    "\n  no question appears on BOTH sides — nothing was comparable per-question either."
+  end
+
+  defp shared_question_lines(comparison) do
+    "\n  #{comparison.shared_question_count} question(s) appear on BOTH sides and WERE " <>
+      "compared:" <> shared_verdict(comparison) <> "\n" <> winners_losers(comparison)
+  end
+
+  defp shared_verdict(%{question_regressions: [_ | _] = ids}) do
+    "\n  REGRESSED (shared with the baseline, so this is a real drop, not " <>
+      "composition):\n" <> Enum.map_join(ids, "\n", &"    #{&1}")
+  end
+
+  defp shared_verdict(%{question_uncomparable: [_ | _] = ids}) do
+    "\n  no shared question regressed, but #{length(ids)} carried a metric with NO " <>
+      "baseline value (#{Enum.join(ids, ", ")}) — uncomparable, not clean."
+  end
+
+  defp shared_verdict(_comparison), do: "\n  no shared question regressed."
 
   defp winners_losers(comparison) do
     "  winners: #{list(comparison.winners)}\n  losers : #{list(comparison.losers)}"
@@ -255,6 +273,9 @@ defmodule Loopctl.Knowledge.RetrievalEval.Report do
       "status" => to_string(comparison.status),
       "regressions" => comparison.regressions,
       "uncomparable" => Map.get(comparison, :uncomparable, []),
+      "shared_question_count" => Map.get(comparison, :shared_question_count, 0),
+      "question_regressions" => Map.get(comparison, :question_regressions, []),
+      "question_uncomparable" => Map.get(comparison, :question_uncomparable, []),
       "winners" => comparison.winners,
       "losers" => comparison.losers,
       "aggregate" =>

@@ -161,11 +161,17 @@ defmodule Loopctl.Knowledge.RetrievalEval.Baseline do
         golden_version: %{current: .., baseline: ..},
         aggregate: [%{metric: "recall@5", current: .., baseline: .., delta: ..,
                       regression?: .., uncomparable?: ..}],
-        questions: [%{id: .., metric deltas ..}],
+        questions: [%{id: .., regressed_metrics: [..], uncomparable_metrics: [..],
+                      metric deltas ..}],
+        shared_question_count: <questions present on BOTH sides>,
+        question_regressions: [question ids], question_uncomparable: [question ids],
         winners: [..], losers: [..],
         regressions: [metric names],
         uncomparable: [metric names]
       }
+
+  Both mismatch statuses still carry the per-question comparison over the questions the
+  baseline still has — only the AGGREGATES are dropped.
   """
   @spec compare(map(), t(), keyword()) :: map()
   def compare(result, baseline, opts \\ []) do
@@ -179,10 +185,10 @@ defmodule Loopctl.Knowledge.RetrievalEval.Baseline do
         base_report(result, baseline_golden, :missing_mode)
 
       baseline_golden != result.golden_version ->
-        base_report(result, baseline_golden, :golden_version_mismatch)
+        shared_report(result, baseline_mode, baseline_golden, tolerance, :golden_version_mismatch)
 
       question_set_changed?(result, baseline_mode) ->
-        shared_question_report(result, baseline_mode, baseline_golden, tolerance)
+        shared_report(result, baseline_mode, baseline_golden, tolerance, :question_set_mismatch)
 
       true ->
         build_comparison(result, baseline_mode, baseline_golden, tolerance)
@@ -209,6 +215,7 @@ defmodule Loopctl.Knowledge.RetrievalEval.Baseline do
       questions: [],
       shared_question_count: 0,
       question_regressions: [],
+      question_uncomparable: [],
       winners: [],
       losers: [],
       regressions: [],
@@ -237,8 +244,8 @@ defmodule Loopctl.Knowledge.RetrievalEval.Baseline do
       aggregate: aggregate,
       questions: questions,
       shared_question_count: length(questions),
-      question_regressions:
-        questions |> Enum.filter(&(&1.regressed_metrics != [])) |> Enum.map(& &1.id),
+      question_regressions: ids_with(questions, :regressed_metrics),
+      question_uncomparable: ids_with(questions, :uncomparable_metrics),
       # Winners/losers span EVERY per-question metric delta (mrr, recall@k, nDCG@k), not
       # mrr alone: a change that lifts mrr while dropping recall must show up as a loser,
       # so a question can legitimately be BOTH a winner and a loser — that IS the tradeoff.
@@ -325,10 +332,12 @@ defmodule Loopctl.Knowledge.RetrievalEval.Baseline do
 
     Enum.map(result.question_results, fn q ->
       base = Map.get(baseline_questions, q.id, %{})
+      {regressed, uncomparable} = question_verdicts(q, base, result.k_values, tolerance)
 
       %{
         id: q.id,
-        regressed_metrics: question_regressed_metrics(q, base, result.k_values, tolerance),
+        regressed_metrics: regressed,
+        uncomparable_metrics: uncomparable,
         observed_mode: q.observed_mode,
         fallback_reason: q.fallback_reason,
         mrr: q.mrr,
@@ -348,66 +357,51 @@ defmodule Loopctl.Knowledge.RetrievalEval.Baseline do
     end)
   end
 
-  # Which of THIS question's metrics regressed against its own baseline row. Reused by the
-  # ordinary comparison and by the shared-question one, so both answer "did this question
-  # get worse" the same way. A question absent from the baseline yields `base == %{}` and
-  # therefore no regressions -- a brand-new question cannot regress.
-  defp question_regressed_metrics(q, base, k_values, tolerance) do
-    mrr = if regression?(q.mrr, base["mrr"], tolerance), do: ["mrr"], else: []
+  # Which of THIS question's metrics regressed against its own baseline row, and which
+  # had NO baseline value to compare against at all (the per-question twin of the
+  # aggregate `uncomparable`, e.g. `--k 3` against a k=5/k=10 baseline). "Did not regress"
+  # and "could not be compared" are different answers, and the report must never print the
+  # first when it means the second. A question absent from the baseline yields `base ==
+  # %{}` -- it cannot regress, and every metric of it is uncomparable.
+  defp question_verdicts(q, base, k_values, tolerance) do
+    metrics =
+      [{"mrr", q.mrr, base["mrr"]}] ++
+        Enum.flat_map(k_values, fn k ->
+          [
+            {"recall@#{k}", q.recall_at_k[k], get_in(base, ["recall_at_k", to_string(k)])},
+            {"ndcg@#{k}", q.ndcg_at_k[k], get_in(base, ["ndcg_at_k", to_string(k)])}
+          ]
+        end)
 
-    per_k =
-      Enum.flat_map(k_values, fn k ->
-        recall =
-          if regression?(
-               q.recall_at_k[k],
-               get_in(base, ["recall_at_k", to_string(k)]),
-               tolerance
-             ),
-             do: ["recall@#{k}"],
-             else: []
-
-        ndcg =
-          if regression?(q.ndcg_at_k[k], get_in(base, ["ndcg_at_k", to_string(k)]), tolerance),
-            do: ["ndcg@#{k}"],
-            else: []
-
-        recall ++ ndcg
-      end)
-
-    mrr ++ per_k
+    {for({m, current, base_value} <- metrics, regression?(current, base_value, tolerance), do: m),
+     for({m, current, base_value} <- metrics, uncomparable?(current, base_value), do: m)}
   end
 
-  # The question SET moved, so the AGGREGATES are not comparable -- they average over
-  # different questions and a rise can be composition rather than improvement. The
-  # per-question rows still are, for every question present on BOTH sides, and throwing
-  # those away was a real blind spot rather than a conservative default.
-  #
-  # It is structural, not careless: `question_set_changed?/2` fires whenever a golden
-  # question is ADDED, and the runbook correctly tells you to regenerate the baseline to
-  # add one. So every growth of the golden set arrived as a commit the gate had already
-  # given up on, and the losers inside it were absorbed into the new baseline unseen.
-  # Measured 2026-08-25 by scoring pre-#693 code against golden_v5: three questions had
-  # their correct answer pushed DOWN the ranking (q-self-report 1.00 -> 0.33 mrr,
-  # q-egress-policy 1.00 -> 0.50, q-audit-chain-sth 0.33 -> 0.25) across the golden_v3 ->
-  # v4 -> v5 growth. All three existed in ALL THREE baselines, so an intersection
-  # comparison would have named them at the time.
-  #
-  # The status stays NON-`:ok` either way, so gate mode still fails closed and a
-  # re-baseline stays a deliberate act. What changes is that the report now names the
-  # questions that got worse instead of printing only "cannot compare".
-  defp shared_question_report(result, baseline_mode, baseline_golden, tolerance) do
+  defp ids_with(questions, key), do: for(q <- questions, Map.fetch!(q, key) != [], do: q.id)
+
+  # The AGGREGATES are not comparable here -- across two question sets they average over
+  # different questions, and across two golden versions the labels themselves moved -- so
+  # both mismatch statuses stay NON-`:ok` and gate mode still fails closed. The
+  # per-question rows ARE comparable for every question present on BOTH sides, and
+  # throwing those away was a real blind spot: the runbook tells you to bump the version
+  # and regenerate the baseline to add a golden question, so EVERY growth of the golden
+  # set arrived as a commit the gate had already given up on, and the losers inside it
+  # were absorbed unseen. Measured 2026-08-25 by scoring pre-#693 code against golden_v5:
+  # q-self-report 1.00 -> 0.33 mrr, q-egress-policy 1.00 -> 0.50, q-audit-chain-sth 0.33
+  # -> 0.25 across golden_v3 -> v4 -> v5, all three present in all three baselines.
+  defp shared_report(result, baseline_mode, baseline_golden, tolerance, status) do
     questions = question_rows(result, baseline_mode, tolerance)
     baseline_ids = baseline_mode |> Map.get("questions", %{}) |> Map.keys() |> MapSet.new()
     shared = Enum.filter(questions, &MapSet.member?(baseline_ids, &1.id))
-    regressed = shared |> Enum.filter(&(&1.regressed_metrics != [])) |> Enum.map(& &1.id)
 
     %{
-      status: :question_set_mismatch,
+      status: status,
       golden_version: %{current: result.golden_version, baseline: baseline_golden},
       aggregate: [],
       questions: shared,
       shared_question_count: length(shared),
-      question_regressions: regressed,
+      question_regressions: ids_with(shared, :regressed_metrics),
+      question_uncomparable: ids_with(shared, :uncomparable_metrics),
       winners: shared |> Enum.filter(&any_positive_delta?/1) |> Enum.map(& &1.id),
       losers: shared |> Enum.filter(&any_negative_delta?/1) |> Enum.map(& &1.id),
       regressions: [],
