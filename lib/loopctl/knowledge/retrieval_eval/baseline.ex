@@ -69,11 +69,23 @@ defmodule Loopctl.Knowledge.RetrievalEval.Baseline do
   @spec default_tolerance() :: float()
   def default_tolerance, do: @default_tolerance
 
-  @doc "Load a baseline file. Returns `{:error, :enoent}` when it has not been created yet."
+  @doc """
+  Load a baseline file.
+
+  Returns `{:error, :enoent}` when it has not been created yet, and
+  `{:error, :malformed_baseline}` when it decodes to something other than a document with
+  a `"modes"` map.
+  """
   @spec load(String.t()) :: {:ok, t()} | {:error, term()}
   def load(path) do
-    with {:ok, contents} <- File.read(path) do
-      JSON.decode(contents)
+    with {:ok, contents} <- File.read(path),
+         {:ok, doc} <- JSON.decode(contents) do
+      # Valid JSON of the WRONG SHAPE — a bare list, a document that lost its top-level
+      # object in a merge — must reach the caller as an error naming the baseline path, not
+      # raise an Access error out of `compare/3` naming nothing.
+      if is_map(doc) and is_map(Map.get(doc, "modes")),
+        do: {:ok, doc},
+        else: {:error, :malformed_baseline}
     end
   end
 
@@ -175,6 +187,10 @@ defmodule Loopctl.Knowledge.RetrievalEval.Baseline do
 
   Both mismatch statuses still carry the per-question comparison over the questions the
   baseline still has — only the AGGREGATES are dropped.
+
+  `Report.to_json_map/2` narrows an `:ok` that carries a per-question verdict to the
+  JSON-only `"question_regression"` / `"question_uncomparable"` — the gate exits non-zero
+  on those, so the machine-readable view may not answer `"ok"` to them.
   """
   @spec compare(map(), t(), keyword()) :: map()
   def compare(result, baseline, opts \\ []) do
@@ -184,7 +200,9 @@ defmodule Loopctl.Knowledge.RetrievalEval.Baseline do
     baseline_golden = baseline["golden_version"]
 
     cond do
-      is_nil(baseline_mode) ->
+      # A mode entry that is not a map at all (a hand-edited `"embeddings": "x"`) can no
+      # more be compared than an absent one, and must not raise out of the readers below.
+      not is_map(baseline_mode) ->
         base_report(result, baseline_golden, :missing_mode)
 
       baseline_golden != result.golden_version ->
@@ -202,13 +220,22 @@ defmodule Loopctl.Knowledge.RetrievalEval.Baseline do
   # adding/removing/renaming a question without bumping it would let a stale baseline pass:
   # a new question missing from the baseline yields nil per-question deltas that read as
   # non-regressions, and a differing question COUNT is never compared. Comparing the actual
-  # question-id SET closes that gap independently of the version string — the gate refuses
-  # to compare a run whose questions do not match the baseline's exactly.
+  # question-id SET closes that gap independently of the version string — the AGGREGATES
+  # are dropped when the sets differ, while the questions present on BOTH sides are still
+  # scored and can fail the gate by name.
   defp question_set_changed?(result, baseline_mode) do
     current_ids = MapSet.new(result.question_results, & &1.id)
-    baseline_ids = baseline_mode |> Map.get("questions", %{}) |> Map.keys() |> MapSet.new()
+    baseline_ids = baseline_mode["questions"] |> map_or_empty() |> Map.keys() |> MapSet.new()
     not MapSet.equal?(current_ids, baseline_ids)
   end
+
+  # `Map.get/3`'s default fires only on an ABSENT key and `||` only on nil/false, so neither
+  # covers the shapes a HAND-EDITED baseline reaches these readers with: `"questions": null`,
+  # but equally `[]`, `""` or a number, each of which is truthy and each of which raises
+  # BadMapError after the run has already seeded the corpus and scored every question.
+  # Anything that is not a map reads as absent, so the gate fails closed by status instead.
+  defp map_or_empty(value) when is_map(value), do: value
+  defp map_or_empty(_value), do: %{}
 
   defp base_report(result, baseline_golden, status) do
     %{
@@ -331,10 +358,10 @@ defmodule Loopctl.Knowledge.RetrievalEval.Baseline do
   end
 
   defp question_rows(result, baseline_mode, tolerance) do
-    baseline_questions = baseline_mode["questions"] || %{}
+    baseline_questions = map_or_empty(baseline_mode["questions"])
 
     Enum.map(result.question_results, fn q ->
-      base = Map.get(baseline_questions, q.id, %{})
+      base = baseline_questions |> Map.get(q.id) |> map_or_empty()
       {regressed, uncomparable} = question_verdicts(q, base, result.k_values, tolerance)
 
       %{
@@ -394,9 +421,7 @@ defmodule Loopctl.Knowledge.RetrievalEval.Baseline do
   # relabel -- so the report words them as candidates.
   defp shared_report(result, baseline_mode, baseline_golden, tolerance, status) do
     questions = question_rows(result, baseline_mode, tolerance)
-    # `Map.get/3`'s default never fires on a PRESENT-but-null "questions" -- the shape a
-    # hand-edited baseline reaches this branch with.
-    baseline_ids = MapSet.new(Map.keys(baseline_mode["questions"] || %{}))
+    baseline_ids = baseline_mode["questions"] |> map_or_empty() |> Map.keys() |> MapSet.new()
     shared = Enum.filter(questions, &MapSet.member?(baseline_ids, &1.id))
 
     %{
