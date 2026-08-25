@@ -1135,7 +1135,7 @@ defmodule Loopctl.Knowledge.RetrievalEvalTest do
       assert rendered =~ "q-advisory-lock"
       assert rendered =~ "uncomparable, not clean"
       assert rendered =~ "q-ecto-multi"
-      refute rendered =~ "WERE compared"
+      refute rendered =~ "no shared question regressed"
     end
 
     test "a per-question regression keeps --json from answering ok",
@@ -1161,6 +1161,38 @@ defmodule Loopctl.Knowledge.RetrievalEvalTest do
 
       assert comparison.status == :golden_version_mismatch
       assert comparison.shared_question_count == 0
+
+      # The version MATCHING is the branch that reaches `question_set_changed?/2`, the one
+      # reader of the same field that the version-mismatch clause short-circuits past.
+      matched = Baseline.compare(result, nulled)
+
+      assert matched.status == :question_set_mismatch
+      assert matched.shared_question_count == 0
+    end
+
+    test "a malformed baseline reports a status instead of raising", %{result: result} do
+      # `||` rescues only nil/false, so every other truthy hand-edit shape ([], "", a
+      # number) used to reach `Map.keys/1` and raise BadMapError after the run had already
+      # seeded the corpus and scored every question. Same one level up: a mode entry that
+      # is not a map raised out of `Access.get/3`, and a document that is not a map at all
+      # raised out of `get_in/2` instead of failing the gate by the baseline path.
+      for shape <- [[], "", 0] do
+        listed = %{
+          "golden_version" => result.golden_version,
+          "modes" => %{"embeddings" => %{"questions" => shape}}
+        }
+
+        assert Baseline.compare(result, listed).status == :question_set_mismatch
+
+        assert Baseline.compare(result, %{"modes" => %{"embeddings" => shape}}).status ==
+                 :missing_mode
+      end
+
+      path = Path.join(System.tmp_dir!(), "baseline-#{System.unique_integer([:positive])}.json")
+      on_exit(fn -> File.rm(path) end)
+      File.write!(path, JSON.encode!([]))
+
+      assert Baseline.load(path) == {:error, :malformed_baseline}
     end
 
     test "the --json view carries the per-question verdict the text report does",
@@ -1383,6 +1415,42 @@ defmodule Loopctl.Knowledge.RetrievalEvalTest do
           EvalTask.run(args)
         end
       end)
+    end
+
+    test "the gate fails on a shared question even when the aggregates hold", ctx do
+      # The gating half of the per-question verdict: raising ONE question's baseline mrr in
+      # the file leaves the mode-level aggregates untouched, so nothing but the per-question
+      # branch of `maybe_fail/2` stands between this run and a green exit.
+      args = ["--golden", ctx.golden_path, "--baseline", ctx.baseline_path, "--k", "1"]
+
+      capture_io(fn -> EvalTask.run(args ++ ["--update-baseline"]) end)
+
+      baseline = ctx.baseline_path |> File.read!() |> JSON.decode!()
+
+      raised =
+        update_in(
+          baseline["modes"]["embeddings"]["questions"]["q-advisory-lock"]["mrr"],
+          &(&1 + 0.5)
+        )
+
+      File.write!(ctx.baseline_path, JSON.encode!(raised))
+
+      # The gate names its problems on STDERR (`Mix.shell().error/1`); the report goes to
+      # stdout, so both have to be captured to see the whole verdict.
+      stderr =
+        capture_io(:stderr, fn ->
+          stdout =
+            capture_io(fn ->
+              assert_raise Mix.Error, ~r/retrieval eval gate failed/, fn ->
+                EvalTask.run(args ++ ["--fail-on-regression"])
+              end
+            end)
+
+          refute stdout =~ "no regression against baseline"
+        end)
+
+      assert stderr =~ "aggregates OK, but"
+      assert stderr =~ "q-advisory-lock"
     end
 
     test "emits machine-readable json with --json", ctx do
