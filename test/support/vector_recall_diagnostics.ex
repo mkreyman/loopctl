@@ -81,6 +81,14 @@ defmodule Loopctl.VectorRecallDiagnostics do
   # let the EXPLAIN walk further than the read could.
   @read_gucs ["hnsw.ef_search", "hnsw.iterative_scan", "hnsw.max_scan_tuples"]
 
+  # The planner GUCs `HeavyRead` sets on EVERY heavy read when
+  # `:heavy_read_force_exact_scan` is on (the default suite — see
+  # `Loopctl.HeavyRead.maybe_force_exact_scan/1`). They are tracked separately from
+  # `@read_gucs` because they are not ANN opts: `@read_gucs` is armed only for a read that
+  # asked for an ef_search, while these apply to a bare `HeavyRead.all/2` as well, which is
+  # exactly the `:session_defaults` case below.
+  @exact_scan_gucs ["enable_indexscan", "enable_bitmapscan"]
+
   @doc """
   Prints the (a)-visibility / (b)-plan diagnostic when `observed` is empty, and returns
   `observed` unchanged so it can be used inline or as a bare statement before the assertion.
@@ -314,22 +322,53 @@ defmodule Loopctl.VectorRecallDiagnostics do
   # arming ef_search/iterative_scan here would print a healthy plan for a read that ran
   # without them, and iterative-scan-on-vs-off is exactly the difference between an ANN that
   # under-returns past its first batch and one that does not.
+  # `:session_defaults` reproduces a read that set no ANN GUC — but "no ANN GUC" was never
+  # "no GUC at all". When exact-scan forcing is on, `HeavyRead` applies it to EVERY heavy
+  # read including a bare `HeavyRead.all/2`, so this branch must arm it too or it prints an
+  # INDEX plan for a read that could not have used the index.
   defp with_read_gucs(:session_defaults, fun) do
-    {:ok, result} = AdminRepo.transaction(fn -> fun.() end)
+    {:ok, result} =
+      AdminRepo.transaction(fn ->
+        LocalGuc.scoped(AdminRepo, exact_scan_gucs(), fn ->
+          set_exact_scan()
+          fun.()
+        end)
+      end)
+
     result
   end
 
   defp with_read_gucs(ef_search, fun) do
     {:ok, result} =
       AdminRepo.transaction(fn ->
-        LocalGuc.scoped(AdminRepo, @read_gucs, fn ->
+        LocalGuc.scoped(AdminRepo, @read_gucs ++ exact_scan_gucs(), fn ->
           set_iterative_scan()
+          set_exact_scan()
           AdminRepo.query!("SET LOCAL hnsw.ef_search = #{ef_search}", [])
           fun.()
         end)
       end)
 
     result
+  end
+
+  # Deliberately reads the SAME source of truth `HeavyRead` reads
+  # (`HeavyRead.force_exact_scan?/0` -> `:heavy_read_force_exact_scan`). This is the
+  # opposite of the rule the chokepoint GUARD in
+  # `test/loopctl/embeddings/hnsw_dead_entry_recall_test.exs` follows, and the difference is
+  # the point: a guard needs an INDEPENDENT source or it moves with the thing it guards and
+  # goes vacuous, while a diagnostic needs the SAME source or it stops describing the read
+  # it is explaining. Do not "fix" this one to derive from `SCALE_TESTS`.
+  defp exact_scan_gucs do
+    if HeavyRead.force_exact_scan?(), do: @exact_scan_gucs, else: []
+  end
+
+  defp set_exact_scan do
+    if HeavyRead.force_exact_scan?() do
+      Enum.each(@exact_scan_gucs, &AdminRepo.query!("SET LOCAL #{&1} = off", []))
+    end
+
+    :ok
   end
 
   defp set_iterative_scan do
