@@ -25,14 +25,17 @@ defmodule Loopctl.Embeddings.HnswDeadEntryRecallTest do
       one visible row, and the scan still returns nothing.
     * **No ANN knob fixes it.** This test asserts the failure under `hnsw.iterative_scan =
       off`, under `relaxed_order`, and under `hnsw.ef_search = 1000`. Reachability is not a
-      breadth problem. That is why `ef_search`, exact-scan forcing, `iterative_scan` and
-      retry-on-empty were each tried and each failed.
+      breadth problem. That is why `ef_search`, `iterative_scan` and retry-on-empty were
+      each tried and each failed.
 
-  The remedy is therefore not a fifth knob: VACUUM is the only thing that repairs the
-  graph, and it repairs it completely. `Loopctl.DataCase.vacuum_vector_indexes/0` does that
-  before each test in the modules that produced the signature (opt in with
+  The remedy is therefore not a fifth breadth knob. Two things DO work, for different
+  reasons, and this test asserts both. Forcing an EXACT plan sidesteps the graph entirely
+  (`exact_read/0` returns the row from the still-poisoned index) — that is the suite-wide
+  repair, `config/test.exs` + `Loopctl.HeavyRead.maybe_force_exact_scan/1`. VACUUM instead
+  repairs the graph, completely: `Loopctl.DataCase.vacuum_vector_indexes/0` does that before
+  each test in the modules that produced the signature (opt in with
   `@moduletag :vacuum_vector_indexes`), and the last assertion of the first test here is that
-  half — the same poisoned index, vacuumed, answers correctly.
+  half — the same poisoned index, vacuumed, answers the ANN correctly.
 
   The SECOND test is the one that would have caught #645 never landing. Everything above it
   measures the mechanism through hand-built SQL with a pinned plan; none of it touches the
@@ -238,7 +241,16 @@ defmodule Loopctl.Embeddings.HnswDeadEntryRecallTest do
           limit: 1
         )
 
-      assert [%{indexscan: "off", bitmapscan: "off"}] = HeavyRead.all(tenant.id, query)
+      # Asserted against the CONFIGURED value, not a literal "off": `config/test.exs` turns
+      # `:heavy_read_force_exact_scan` off for a `SCALE_TESTS`/`SCALE_NIGHTLY` run, and a
+      # guard that goes red on an env var is noise, not a guard. Both directions are
+      # meaningful — the scale jobs must reach the real HNSW plan.
+      expected =
+        if Application.get_env(:loopctl, :heavy_read_force_exact_scan, false),
+          do: "off",
+          else: "on"
+
+      assert [%{indexscan: ^expected, bitmapscan: ^expected}] = HeavyRead.all(tenant.id, query)
     end
   end
 end

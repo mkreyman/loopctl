@@ -72,9 +72,11 @@ defmodule Loopctl.DataCase do
   present. That is the long-running `left: []` flake, reproduced deterministically in
   `test/loopctl/embeddings/hnsw_dead_entry_recall_test.exs`.
 
-  It is a REACHABILITY failure, not a breadth one, which is why `hnsw.ef_search`,
-  `hnsw.iterative_scan` and exact-scan forcing each failed to fix it: measured in that
-  file, the read still returns `[]` under `relaxed_order` AND under `ef_search = 1000`.
+  It is a REACHABILITY failure, not a breadth one, which is why the BREADTH knobs
+  (`hnsw.ef_search`, `hnsw.iterative_scan`, retry-on-empty) each failed to fix it: measured
+  in that file, the read still returns `[]` under `relaxed_order` AND under
+  `ef_search = 1000`. Forcing an EXACT plan DOES recover the row — measured in the same
+  file — because it takes the graph out of the plan rather than searching it wider.
   Vacuuming repairs the graph completely on a QUIET database — the same poisoned index
   answers correctly immediately afterwards, which is what the reproduction asserts. It does
   NOT follow that vacuuming can carry a whole async suite, and measurement on minis
@@ -87,7 +89,7 @@ defmodule Loopctl.DataCase do
   rather than repairing it.
 
   **That suite-wide repair does NOT make this tag redundant — measured, do not remove it.**
-  Taking the three `@moduletag :vacuum_vector_indexes` off their modules with the exact-scan
+  Taking `@moduletag :vacuum_vector_indexes` off the modules carrying it with the exact-scan
   forcing in place produced a failure in 4 full-suite runs and no speedup at all (51s against
   45s WITH the tags — slower, not faster), so the tag is not the tax it looks like here. The
   two work on different things: the exact plan covers reads that go through

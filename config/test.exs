@@ -799,10 +799,16 @@ config :loopctl, :fair_share_counter, Loopctl.MockFairShareCounter
 # the measurements and for why the two repairs already in the tree cannot cover the suite.
 #
 # OFF for the scale jobs, which are the ones that must exercise the real HNSW plan: they run
-# over a committed, ANALYZEd 80k-row corpus whose graph resembles production's, and their
-# plan assertions (`Loopctl.PlanAssertions.assert_hnsw_index/1`) would fail without it.
-# NOTE for local use: this only changes the PLAN, never the catalog — the indexes stay put,
-# so alternating between `mix test` and `SCALE_TESTS=true mix test` needs no `ecto.reset`.
+# over a committed, ANALYZEd 80k-row corpus whose graph resembles production's, and the scale
+# tests that EXECUTE reads through `HeavyRead` (recall / e2e latency) would be served by a seq
+# scan instead of the ANN. `Loopctl.PlanAssertions.assert_hnsw_index/1` is NOT the reason: it
+# EXPLAINs on `AdminRepo` outside any `HeavyRead` transaction, so the `SET LOCAL` never
+# reaches it and it reads the same plan either way.
+# NOTE for local use: this changes the PLAN, never the catalog — the indexes stay put. But a
+# scale run COMMITS its 80k-row corpus into the same database, and an exact plan over that
+# corpus is now DETERMINISTIC (before, it was a lottery), so it blows the 250ms heavy-read
+# statement_timeout above. After `SCALE_TESTS=true mix test`, truncate the scale corpus (or
+# `mix ecto.reset`) before the next default run.
 config :loopctl,
        :heavy_read_force_exact_scan,
        is_nil(System.get_env("SCALE_TESTS")) and is_nil(System.get_env("SCALE_NIGHTLY"))

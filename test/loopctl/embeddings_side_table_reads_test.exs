@@ -48,7 +48,8 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
   looking for a different cause. A doc asserting a mechanism it cannot point at is worth
   less than no doc: verify the citation, not just the reasoning.
 
-  So do NOT "restore" the indexes for this suite, and do NOT add a fifth recall knob. If a
+  The indexes all still EXIST — nothing drops them; only the plan changes. So do NOT turn
+  `:heavy_read_force_exact_scan` off for this suite, and do NOT add a fifth recall knob. If a
   `left: []` reappears here, it is a NEW defect: `Loopctl.VectorRecallDiagnostics` is still
   wrapped around every assertion that ever produced the signature and fires only on an empty
   result, printing (a) whether the row was VISIBLE as unlimited `count()`s and (b) the

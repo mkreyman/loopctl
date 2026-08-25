@@ -57,7 +57,7 @@ reads through `Loopctl.HeavyRead` (`lib/loopctl/heavy_read.ex`), which owns the 
    (`heavy_read.ex:1520-1538`) RAISES unless EVERY base-table source — `from`, every join, and every
    subquery, recursively — carries a conjunctive `x.tenant_id == ^tenant_id` bound to the passed
    `tenant_id`; `test/loopctl/heavy_read_guard_test.exs` additionally bars direct `HeavyReadRepo` calls.
-   Agent-memory reads need a SECOND predicate: `all_memory/4` (`:1090`) also requires a conjunctive
+   Agent-memory reads need a SECOND predicate: `all_memory/4` (`:1187`) also requires a conjunctive
    `subject_id` equality on the outermost query (private `guard_memory!/3`, `heavy_read.ex:1542-1564`), because `subject_id`
    scoping is application-level only. Always go through `Loopctl.HeavyRead`, never `HeavyReadRepo`
    directly; on `AdminRepo` there is no guard at all, so the predicate is on you.
