@@ -789,6 +789,30 @@ config :loopctl, :legacy_retirement, Loopctl.MockLegacyRetirement
 # the ones that seed real oban_jobs rows — exercises the real count unchanged.
 config :loopctl, :fair_share_counter, Loopctl.MockFairShareCounter
 
+# #645 and its 2026-08-25 recurrence — force an EXACT plan for every `Loopctl.HeavyRead`
+# vector read in the default suite. Sandbox rolls back every test, and a rolled-back INSERT
+# leaves its entry in the SHARED pgvector HNSW graph; pgvector's scan SKIPS dead elements
+# rather than traversing them, so a row inserted afterwards links only to dead neighbours and
+# becomes UNREACHABLE from the graph entry point — the ANN returns nothing while a `count()`
+# on the same connection shows the row present. Reachability, not breadth: no `ef_search` /
+# `iterative_scan` value recovers it. See `Loopctl.HeavyRead.maybe_force_exact_scan/1` for
+# the measurements and for why the two repairs already in the tree cannot cover the suite.
+#
+# OFF for the scale jobs, which are the ones that must exercise the real HNSW plan: they run
+# over a committed, ANALYZEd 80k-row corpus whose graph resembles production's, and the scale
+# tests that EXECUTE reads through `HeavyRead` (recall / e2e latency) would be served by a seq
+# scan instead of the ANN. `Loopctl.PlanAssertions.assert_hnsw_index/1` is NOT the reason: it
+# EXPLAINs on `AdminRepo` outside any `HeavyRead` transaction, so the `SET LOCAL` never
+# reaches it and it reads the same plan either way.
+# NOTE for local use: this changes the PLAN, never the catalog — the indexes stay put. But a
+# scale run COMMITS its 80k-row corpus into the same database, and an exact plan over that
+# corpus is now DETERMINISTIC (before, it was a lottery), so it blows the 250ms heavy-read
+# statement_timeout above. After `SCALE_TESTS=true mix test`, truncate the scale corpus (or
+# `mix ecto.reset`) before the next default run.
+config :loopctl,
+       :heavy_read_force_exact_scan,
+       is_nil(System.get_env("SCALE_TESTS")) and is_nil(System.get_env("SCALE_NIGHTLY"))
+
 # GH #551: a SHORT evidence window in tests. The production bar is 30 days; asserting
 # against it would mean fabricating 30 observation rows per test to say something that
 # is true at 3. The window LENGTH is not what the tests are checking — the gate logic
