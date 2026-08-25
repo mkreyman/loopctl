@@ -1090,6 +1090,79 @@ defmodule Loopctl.Knowledge.RetrievalEvalTest do
       assert Report.render(worse, comparison) =~ "PER-QUESTION REGRESSION"
     end
 
+    test "a per-question metric with no baseline value is not an all-clear on the OK path",
+         %{result: result, baseline: baseline} do
+      # The question set and version are unchanged, so the AGGREGATE guard never fires and
+      # this is the only thing standing between "could not be compared" and a green run.
+      stale =
+        update_in(
+          baseline["modes"]["embeddings"]["questions"]["q-ecto-multi"]["recall_at_k"],
+          &Map.delete(&1, "3")
+        )
+
+      comparison = Baseline.compare(result, stale)
+
+      assert comparison.status == :ok
+      assert "q-ecto-multi" in comparison.question_uncomparable
+
+      rendered = Report.render(result, comparison)
+      refute rendered =~ "OK (no regression)"
+      assert rendered =~ "uncomparable, not clean"
+      assert Report.to_json_map(result, comparison)["baseline"]["status"] != "ok"
+    end
+
+    test "a regressed AND an uncomparable shared question are BOTH named",
+         %{result: result, baseline: baseline} do
+      # Two independent verdicts over the same intersection: naming only the regression
+      # leaves the reader believing the other question was compared and was fine.
+      stale =
+        baseline
+        |> put_in(["modes", "embeddings", "questions", "q-advisory-lock", "mrr"], 1.0)
+        |> update_in(
+          ["modes", "embeddings", "questions", "q-ecto-multi", "recall_at_k"],
+          &Map.delete(&1, "3")
+        )
+        |> Map.put("golden_version", "golden_v99")
+
+      worse = degrade_mrr(result, "q-advisory-lock")
+
+      comparison = Baseline.compare(worse, stale)
+
+      assert comparison.question_regressions == ["q-advisory-lock"]
+      assert comparison.question_uncomparable == ["q-ecto-multi"]
+
+      rendered = Report.render(worse, comparison)
+      assert rendered =~ "q-advisory-lock"
+      assert rendered =~ "uncomparable, not clean"
+      assert rendered =~ "q-ecto-multi"
+      refute rendered =~ "WERE compared"
+    end
+
+    test "a per-question regression keeps --json from answering ok",
+         %{result: result, baseline: baseline} do
+      # The gate exits non-zero and the text report says PER-QUESTION REGRESSION; a machine
+      # consumer keying on `status` must not read the same run as clean.
+      raised = put_in(baseline["modes"]["embeddings"]["questions"]["q-ecto-multi"]["mrr"], 1.0)
+      worse = degrade_mrr(result, "q-ecto-multi")
+
+      comparison = Baseline.compare(worse, raised)
+
+      assert comparison.status == :ok
+      assert Report.to_json_map(worse, comparison)["baseline"]["status"] == "question_regression"
+    end
+
+    test "a baseline whose questions map is null still reports the mismatch",
+         %{result: result, baseline: baseline} do
+      # A PRESENT-but-null key is not a missing key: `Map.get/3`'s default never fires, so
+      # this shape used to crash the whole run after it had already seeded and scored.
+      nulled = put_in(baseline["modes"]["embeddings"]["questions"], nil)
+
+      comparison = Baseline.compare(%{result | golden_version: "golden_v99"}, nulled)
+
+      assert comparison.status == :golden_version_mismatch
+      assert comparison.shared_question_count == 0
+    end
+
     test "the --json view carries the per-question verdict the text report does",
          %{result: result, baseline: baseline} do
       # --json is the machine-readable surface; a consumer keying on it must not read a

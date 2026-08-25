@@ -31,11 +31,13 @@ defmodule Loopctl.Knowledge.RetrievalEval.Baseline do
       }
 
   `golden_version` is recorded so a re-labelled golden set cannot be silently compared
-  against stale numbers — `compare/3` flags the mismatch instead of reporting deltas that
-  mean nothing. Because the version is free text the loader never checksums, `compare/3`
-  ALSO compares the actual question-id SET and flags `:question_set_mismatch` when the run
-  and the baseline cover different questions, even if the version string was left
-  untouched.
+  against stale numbers — on a mismatch `compare/3` drops the AGGREGATES and keeps the
+  per-question rows the baseline still has. Those drops are CANDIDATES, not proven ranking
+  regressions: the seeded corpus is the UNION of every question's docs, so a question added
+  alongside the bump adds distractors for the rest, and a bump may relabel the shared ones.
+  Because the version is free text the loader never checksums, `compare/3` ALSO compares the
+  question-id SET and flags `:question_set_mismatch` when the run and the baseline cover
+  different questions, even if the version was left untouched.
 
   ## Regression rule
 
@@ -45,7 +47,8 @@ defmodule Loopctl.Knowledge.RetrievalEval.Baseline do
   metric stopped being computable — counts as a regression; `nil` on BOTH sides is inert.
   A metric that is a NUMBER now with NO baseline counterpart (e.g. a `--k` not in the
   baseline) is `:incomparable`, not `:ok` — the gate fails closed rather than pretending
-  it compared something it could not.
+  it compared something it could not. Both apply PER QUESTION too: `question_regressions`
+  and `question_uncomparable` fail the gate on EVERY status, `:ok` included.
   """
 
   @relative_path "retrieval_eval/baseline_v1.json"
@@ -381,17 +384,19 @@ defmodule Loopctl.Knowledge.RetrievalEval.Baseline do
 
   # The AGGREGATES are not comparable here -- across two question sets they average over
   # different questions, and across two golden versions the labels themselves moved -- so
-  # both mismatch statuses stay NON-`:ok` and gate mode still fails closed. The
-  # per-question rows ARE comparable for every question present on BOTH sides, and
-  # throwing those away was a real blind spot: the runbook tells you to bump the version
-  # and regenerate the baseline to add a golden question, so EVERY growth of the golden
-  # set arrived as a commit the gate had already given up on, and the losers inside it
-  # were absorbed unseen. Measured 2026-08-25 by scoring pre-#693 code against golden_v5:
-  # q-self-report 1.00 -> 0.33 mrr, q-egress-policy 1.00 -> 0.50, q-audit-chain-sth 0.33
-  # -> 0.25 across golden_v3 -> v4 -> v5, all three present in all three baselines.
+  # both mismatch statuses stay NON-`:ok` and gate mode still fails closed. The per-question
+  # rows for the shared questions are still worth SCORING, and throwing them away was a real
+  # blind spot: the runbook tells you to bump the version and regenerate the baseline to add
+  # a question, so EVERY growth of the golden set arrived as a commit the gate had given up
+  # on. Scored 2026-08-25 against golden_v5, pre-#693 code: q-self-report 1.00 -> 0.33 mrr,
+  # q-egress-policy 1.00 -> 0.50, q-audit-chain-sth 0.33 -> 0.25 across golden_v3 -> v5.
+  # What a drop CANNOT establish is its own cause -- the corpus is a union and a bump may
+  # relabel -- so the report words them as candidates.
   defp shared_report(result, baseline_mode, baseline_golden, tolerance, status) do
     questions = question_rows(result, baseline_mode, tolerance)
-    baseline_ids = baseline_mode |> Map.get("questions", %{}) |> Map.keys() |> MapSet.new()
+    # `Map.get/3`'s default never fires on a PRESENT-but-null "questions" -- the shape a
+    # hand-edited baseline reaches this branch with.
+    baseline_ids = MapSet.new(Map.keys(baseline_mode["questions"] || %{}))
     shared = Enum.filter(questions, &MapSet.member?(baseline_ids, &1.id))
 
     %{
