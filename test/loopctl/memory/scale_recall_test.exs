@@ -180,6 +180,40 @@ defmodule Loopctl.Memory.ScaleRecallTest do
     {:ok, tenant: tenant, seed: seed}
   end
 
+  # The TRUE nearest distance among the decoys and among subject A's rows.
+  #
+  # Two separate filtered aggregates rather than one GROUP BY. The grouped spelling is the
+  # obvious one and it does not work: Ecto renders a pinned `^subject_a` as a fresh
+  # parameter per occurrence, so `select: fragment("? = ?", m.subject_id, ^subject_a)` with
+  # the same fragment in `group_by` emits `$1` in the SELECT and `$5` in the GROUP BY, and
+  # Postgres — which compares grouping expressions syntactically — rejects it with
+  # `42803 grouping_error`. Two queries carry no such trap.
+  #
+  # `MIN()` is load-bearing, not incidental: an aggregate cannot be served by an HNSW
+  # ordering, so Postgres must compute every distance in the filtered set and the answer is
+  # EXACT. `ORDER BY distance LIMIT 1` would read more naturally and would be wrong here —
+  # the planner could serve it from the very approximate index this assertion exists to be
+  # independent of.
+  defp exact_nearest_by_class(tenant_id, target, subject_a) do
+    {nearest(tenant_id, target, dynamic([m], like(m.subject_id, "scale-decoy-%"))) ||
+       flunk("no decoy rows in the seeded corpus — the seed did not run"),
+     nearest(tenant_id, target, dynamic([m], m.subject_id == ^subject_a)) ||
+       flunk("no subject-A rows in the seeded corpus — the seed did not run")}
+  end
+
+  defp nearest(tenant_id, target, subject_filter) do
+    unboxed(fn ->
+      AdminRepo.one(
+        from(m in MemorySchema,
+          where: m.tenant_id == ^tenant_id,
+          where: is_nil(m.superseded_by),
+          where: ^subject_filter,
+          select: min(fragment("? <=> ?::vector", m.embedding, ^target))
+        )
+      )
+    end)
+  end
+
   test "a needle subject fills its own top-k when foreign subjects dominate the ANN pool at scale (TC-28.5.3)",
        %{tenant: tenant, seed: seed} do
     # Seeded at least the prod floor, spread across many subjects.
@@ -235,17 +269,39 @@ defmodule Loopctl.Memory.ScaleRecallTest do
 
     pool_subjects = Enum.map(pool_rows, & &1.subject_id)
 
-    # Cross-subject DOMINANCE observed (robust form): subject A is present in the pool
-    # but is NOT its nearest row — at least one FOREIGN row is strictly nearer, so the
-    # outer filter has real work (it must DISCARD nearer foreign rows to reach A). We
-    # assert the cluster-level fact the approximate index reliably delivers (≥ 1 of the
-    # 8 globally-nearest decoys surfaces), not the exact per-node top-k ordering it
-    # cannot guarantee at ef_search 40.
     first_a_rank = Enum.find_index(pool_subjects, &(&1 == seed.subject_a))
     assert first_a_rank != nil, "subject A must appear in the subject-agnostic ANN pool"
 
-    assert first_a_rank >= 1,
-           "at least one FOREIGN row must be nearer than A's nearest pool row (cross-subject dominance)"
+    # Cross-subject DOMINANCE, asserted against TRUE distances rather than against what
+    # this HNSW build happened to surface.
+    #
+    # This assertion used to be `first_a_rank >= 1` — "the pool ranks at least one foreign
+    # decoy ahead of A". That is a claim about the APPROXIMATION, and the comment three
+    # lines above already conceded the approximation is not stable: which near rows the
+    # index surfaces "varies per HNSW build (randomized layer assignment)". It duly failed
+    # on a freshly built index (minis, 2026-08-25, `first_a_rank == 0`) with nothing wrong
+    # in the product — no decoy had been surfaced, so A was the pool's nearest row. An
+    # assertion belongs on something that cannot legitimately happen; this one could, and
+    # then did.
+    #
+    # The dominance the test actually needs is a property of the SEED, and there it IS an
+    # invariant: `ScaleSeed`'s moduledoc states that every decoy sits at a phase in
+    # `0..(decoy_count - 1)` while A starts at `subject_a_phase_lo = decoy_count`, so
+    # "EVERY decoy is strictly NEARER to the query than any of subject A's rows". Asserting
+    # THAT is deterministic, and it is strictly stronger than the old form: the old one was
+    # satisfied by a single decoy surfacing, this one holds over all of them.
+    #
+    # What is deliberately NOT asserted any more is that the outer filter had foreign rows
+    # to discard on this particular run. Whether the ANN surfaces a decoy is the index's
+    # choice, not the product's, and every claim about the FILTER below is pool-relative —
+    # they hold, and stay exact, whatever the pool turned out to contain.
+    {decoy_nearest, a_nearest} = exact_nearest_by_class(tenant.id, target, seed.subject_a)
+
+    assert decoy_nearest < a_nearest,
+           "seed invariant broken: the nearest decoy (#{decoy_nearest}) must be strictly " <>
+             "nearer to the query than the nearest subject-A row (#{a_nearest}) — see " <>
+             "ScaleSeed's phase layout (decoys at phases 0..decoy_count-1, A from " <>
+             "subject_a_phase_lo = decoy_count)"
 
     # Every row the pool ranks AHEAD of A is a foreign decoy — never A, never haystack.
     # Exact even under approximation: distances are computed in SQL, and by seed
