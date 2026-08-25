@@ -9,10 +9,10 @@ defmodule Loopctl.Knowledge.LiveRetrievalMetricsTest do
 
   alias Loopctl.Knowledge.LiveRetrievalMetrics, as: Live
 
-  @from ~U[2026-08-01 00:00:00.000000Z]
-  @to ~U[2026-09-01 00:00:00.000000Z]
-  @at ~U[2026-08-10 10:00:00.000000Z]
-  @then ~U[2026-08-10 10:01:00.000000Z]
+  @from ~U[2026-08-17 00:00:00.000000Z]
+  @to ~U[2026-08-19 00:00:00.000000Z]
+  @at ~U[2026-08-18 10:00:00.000000Z]
+  @then ~U[2026-08-18 10:01:00.000000Z]
 
   # Returns the `search_id`, the only thing that can link a read back to this search.
   defp surfaced(tenant_id, article_id, query, rank, at \\ @at, extra \\ %{}) do
@@ -86,7 +86,7 @@ defmodule Loopctl.Knowledge.LiveRetrievalMetricsTest do
       sid = surfaced(t.id, a, "read twice", 2)
 
       read(t.id, a, sid)
-      read(t.id, a, sid, "drill", ~U[2026-08-10 10:02:00.000000Z])
+      read(t.id, a, sid, "drill", ~U[2026-08-18 10:02:00.000000Z])
 
       assert [%{rank: 2}] = Live.pairs(t.id, @from, @to)
     end
@@ -94,16 +94,18 @@ defmodule Loopctl.Knowledge.LiveRetrievalMetricsTest do
     test "every combined label is ONE population, and other modes are excluded" do
       # 2026-08-12 SPLIT `combined` three ways; never a rename. Taking only
       # `combined_retrieved` after the split against everything before it drops the
-      # curated-led searches from one side, which reads as a regression.
+      # curated-led searches from one side. A degraded lane is still a combined search.
       t = fixture(:tenant)
 
-      for mode <- ["combined", "combined_curated", "combined_retrieved", "keyword"] do
+      modes = ~w(combined combined_curated combined_fallback combined_retrieved)
+
+      for mode <- modes ++ ["keyword"] do
         a = article(t.id)
         read(t.id, a, surfaced(t.id, a, mode, 1, @at, %{"mode" => mode}))
       end
 
       queries = t.id |> Live.pairs(@from, @to) |> Enum.map(& &1.query) |> Enum.sort()
-      assert queries == ["combined", "combined_curated", "combined_retrieved"]
+      assert queries == modes
     end
 
     test "an unscorable row costs its own observation, never the whole read" do
@@ -117,9 +119,29 @@ defmodule Loopctl.Knowledge.LiveRetrievalMetricsTest do
 
       read(t.id, good, surfaced(t.id, good, "good", 1))
       read(t.id, bad, surfaced(t.id, bad, "bad", "n/a"))
+      # Rank 0 divides by zero, 10 digits overflow int4, a non-uuid `search_id` 22P02s the
+      # join: three ABORTS, not three lost observations.
+      read(t.id, bad, surfaced(t.id, bad, "zero", "0"))
+      read(t.id, bad, surfaced(t.id, bad, "overflow", "9999999999"))
+      surfaced(t.id, bad, "junk id", 1, @at, %{"search_id" => "x"})
       read(t.id, smoke, surfaced(t.id, smoke, "smoke", 1, @at, %{"entrypoint" => "smoke"}))
 
-      assert [%{query: "good"}] = Live.pairs(t.id, @from, @to)
+      assert [%{query: "good"}] = pairs = Live.pairs(t.id, @from, @to)
+      assert %{mrr: 1.0} = Live.summarise(pairs)
+    end
+
+    test "a window this instrument cannot measure raises instead of answering nothing" do
+      # Before #689 no read carried an `origin_search_id`, and a `to` inside the attribution
+      # window is short. Both returned `[]`, which reads as "nobody followed through".
+      t = fixture(:tenant)
+
+      assert_raise ArgumentError, ~r/different instrument/, fn ->
+        Live.pairs(t.id, ~U[2026-08-16 23:59:59.000000Z], @to)
+      end
+
+      assert_raise ArgumentError, ~r/censoring window/, fn ->
+        Live.pairs(t.id, @from, DateTime.utc_now())
+      end
     end
 
     test "is tenant-isolated" do
@@ -130,6 +152,17 @@ defmodule Loopctl.Knowledge.LiveRetrievalMetricsTest do
       read(theirs.id, a, surfaced(theirs.id, a, "theirs", 1))
 
       assert Live.pairs(mine.id, @from, @to) == []
+    end
+  end
+
+  describe "the infra-entrypoint exclusion" do
+    test "is the same set RetrievalMetrics excludes" do
+      # Two copies of one rule; the copy carrying the rationale is private, so the test reads
+      # its source, as `TierCapabilities`' does.
+      source = File.read!("lib/loopctl/knowledge/retrieval_metrics.ex")
+      [_, listed] = Regex.run(~r/@infra_entrypoints ~w\(([^)]+)\)/, source)
+
+      assert Enum.sort(String.split(listed)) == Enum.sort(Live.infra_entrypoints())
     end
   end
 
@@ -204,8 +237,12 @@ defmodule Loopctl.Knowledge.LiveRetrievalMetricsTest do
     end
 
     test "sigma is computed across the weeks that clear the floor" do
+      # A week holds pairs in the TENS, so `min_pairs/0` scored none of them.
+      n = Live.min_week_pairs()
+      assert n < Live.min_pairs()
+
       noise =
-        Live.weekly_noise(sample(1, 30, ~U[2026-08-03 10:00:00.000000Z]) ++ sample(4, 30, @at))
+        Live.weekly_noise(sample(1, n, ~U[2026-08-03 10:00:00.000000Z]) ++ sample(4, n, @at))
 
       assert noise.scored_week_count == 2
       assert noise.sigma > 0
@@ -224,26 +261,40 @@ defmodule Loopctl.Knowledge.LiveRetrievalMetricsTest do
   end
 
   describe "matched_pairs/5" do
-    @mid ~U[2026-08-10 00:00:00.000000Z]
+    @mid ~U[2026-08-18 00:00:00.000000Z]
 
     test "the same query on the same article reports its rank movement" do
       t = fixture(:tenant)
       a = article(t.id)
 
-      surfaced(t.id, a, "same q", 5, ~U[2026-08-02 10:00:00.000000Z])
-      surfaced(t.id, a, "same q", 1, ~U[2026-08-20 10:00:00.000000Z])
+      surfaced(t.id, a, "same q", 5, ~U[2026-08-17 10:00:00.000000Z])
+      surfaced(t.id, a, "same q", 1, @at)
 
       assert %{matched: 1, mean_rank_before: 5.0, mean_rank_after: 1.0} =
                Live.matched_pairs(t.id, @from, @mid, @mid, @to)
     end
 
-    test "overlapping windows raise rather than join every row in the overlap to itself" do
+    test "infra traffic and off-family modes are excluded on BOTH sides" do
+      # Unfiltered, a release week of smoke checks reads as a ranker change.
+      t = fixture(:tenant)
+
+      for extra <- [%{"entrypoint" => "smoke"}, %{"mode" => "keyword"}] do
+        a = article(t.id)
+        surfaced(t.id, a, "q", 5, ~U[2026-08-17 10:00:00.000000Z], extra)
+        surfaced(t.id, a, "q", 1, @at, extra)
+      end
+
+      assert %{matched: 0, mean_rank_before: nil} =
+               Live.matched_pairs(t.id, @from, @mid, @mid, @to)
+    end
+
+    test "windows out of order raise rather than join every row in the overlap to itself" do
       # A self-join reports a row's rank unchanged, indistinguishable from a real no-change,
       # and nothing in the return shape would show the caller why.
       t = fixture(:tenant)
 
-      assert_raise ArgumentError, ~r/must not overlap/, fn ->
-        Live.matched_pairs(t.id, @from, ~U[2026-08-20 00:00:00.000000Z], @mid, @to)
+      assert_raise ArgumentError, ~r/chronological and disjoint/, fn ->
+        Live.matched_pairs(t.id, @from, @to, @mid, @to)
       end
     end
   end
