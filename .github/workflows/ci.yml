@@ -87,12 +87,53 @@ env:
 #                   deploy credentials there widens the blast radius of any
 #                   compromised dependency far more than the ~0.8 min/month of
 #                   billed time is worth.
+# KEEPING THE COMPILED TREE
+#
+# Two facts, and acting on either one alone makes things worse rather than better.
+#
+# 1. `actions/checkout` defaults to `clean: true`, which runs `git clean -ffdx`. The
+#    -x deletes IGNORED files: `_build`, `deps`, and the Dialyzer PLT. On a persistent
+#    self-hosted runner every job therefore began by throwing away the compiled tree
+#    the previous job had left at that same path.
+#
+# 2. The `_build` entry in the `actions/cache` steps was there to compensate, and
+#    mostly could not. Mix records the working directory it compiled at and
+#    force-recompiles the whole project when it does not match (Elixir 1.19,
+#    lib/mix/lib/mix/compilers/elixir.ex writes it at :962, reads it at :104), while a
+#    GitHub cache is shared across runners and a repo sits at as many absolute paths as
+#    there are runners on the host. A restored cache avoided a rebuild only when it
+#    happened to have been saved by a job at the same path.
+#
+# Fix: keep the tree (`clean: false` plus an explicit clean that excepts the expensive
+# directories), and drop `_build` from the shared cache so nothing overwrites a runner's
+# own manifest with a foreign one. Each runner's path is stable, so its tree simply
+# stays warm. A runner with no history pays exactly one cold compile — which is what
+# every job paid on every run before.
+#
+# Measured on home_care_billing (PR #1369): compile across a whole run 638s -> under
+# 10s, wall clock 9m44s -> 5m22s. Full write-up, including two remedies that look right
+# and are not (`check_cwd: false`, and bind-mounting the runner work dir): loopctl KB
+# article 09245ceb.
+#
+# NOTE the exception list is per-repo. This repo keeps its PLT in `priv/plts`, not in
+# `_build`, so deleting it would cost a full PLT rebuild every run.
+
 jobs:
   lint:
     name: Lint
     runs-on: [self-hosted, beelink]
     steps:
       - uses: actions/checkout@v4
+        with:
+          # clean: false — see KEEPING THE COMPILED TREE at the top of this file.
+          # The default deletes _build, so every job recompiled from scratch.
+          clean: false
+
+      # See KEEPING THE COMPILED TREE at the top of this file.
+      - name: Clean the workspace, keeping the compiled tree
+        run: |
+          git clean -ffdx -e _build -e deps -e priv/plts -e mcp-server/node_modules
+          git reset --hard HEAD
 
       - uses: erlef/setup-beam@v1
         with:
@@ -104,7 +145,6 @@ jobs:
         with:
           path: |
             deps
-            _build
           # Key on config/*.exs too: deps like phoenix_ecto read parent-app
           # config (e.g. :exclude_ecto_exceptions_from_plug) at THEIR compile
           # time, but a config-only change does not mark the dep stale. Without
@@ -211,6 +251,16 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # clean: false — see KEEPING THE COMPILED TREE at the top of this file.
+          # The default deletes _build, so every job recompiled from scratch.
+          clean: false
+
+      # See KEEPING THE COMPILED TREE at the top of this file.
+      - name: Clean the workspace, keeping the compiled tree
+        run: |
+          git clean -ffdx -e _build -e deps -e priv/plts -e mcp-server/node_modules
+          git reset --hard HEAD
 
       - uses: erlef/setup-beam@v1
         with:
@@ -222,7 +272,6 @@ jobs:
         with:
           path: |
             deps
-            _build
           # See lint job: config/*.exs is part of the key so a config-only change
           # (e.g. :exclude_ecto_exceptions_from_plug) forces a clean recompile of
           # config-sensitive deps instead of reusing a stale dep beam.
@@ -353,6 +402,16 @@ jobs:
     # carries pgvector in the image layer.
     steps:
       - uses: actions/checkout@v4
+        with:
+          # clean: false — see KEEPING THE COMPILED TREE at the top of this file.
+          # The default deletes _build, so every job recompiled from scratch.
+          clean: false
+
+      # See KEEPING THE COMPILED TREE at the top of this file.
+      - name: Clean the workspace, keeping the compiled tree
+        run: |
+          git clean -ffdx -e _build -e deps -e priv/plts -e mcp-server/node_modules
+          git reset --hard HEAD
 
       - uses: erlef/setup-beam@v1
         with:
@@ -364,7 +423,6 @@ jobs:
         with:
           path: |
             deps
-            _build
           # See lint job: config/*.exs is part of the key so a config-only change
           # forces a clean recompile of config-sensitive deps instead of reusing a
           # stale dep beam. No loose restore-keys, for the same reason.
@@ -513,6 +571,16 @@ jobs:
     runs-on: [self-hosted, beelink]
     steps:
       - uses: actions/checkout@v4
+        with:
+          # clean: false — see KEEPING THE COMPILED TREE at the top of this file.
+          # The default deletes _build, so every job recompiled from scratch.
+          clean: false
+
+      # See KEEPING THE COMPILED TREE at the top of this file.
+      - name: Clean the workspace, keeping the compiled tree
+        run: |
+          git clean -ffdx -e _build -e deps -e priv/plts -e mcp-server/node_modules
+          git reset --hard HEAD
 
       - uses: erlef/setup-beam@v1
         with:
@@ -524,7 +592,6 @@ jobs:
         with:
           path: |
             deps
-            _build
           # See lint job: config/*.exs is part of the key so a config-only change
           # (e.g. :exclude_ecto_exceptions_from_plug) forces a clean recompile of
           # config-sensitive deps instead of reusing a stale dep beam.
@@ -551,6 +618,16 @@ jobs:
     runs-on: [self-hosted, beelink]
     steps:
       - uses: actions/checkout@v4
+        with:
+          # clean: false — see KEEPING THE COMPILED TREE at the top of this file.
+          # The default deletes _build, so every job recompiled from scratch.
+          clean: false
+
+      # See KEEPING THE COMPILED TREE at the top of this file.
+      - name: Clean the workspace, keeping the compiled tree
+        run: |
+          git clean -ffdx -e _build -e deps -e priv/plts -e mcp-server/node_modules
+          git reset --hard HEAD
 
       - uses: erlef/setup-beam@v1
         with:
@@ -562,7 +639,6 @@ jobs:
         with:
           path: |
             deps
-            _build
           # See lint job: config/*.exs is part of the key so a config-only change
           # (e.g. :exclude_ecto_exceptions_from_plug) forces a clean recompile of
           # config-sensitive deps instead of reusing a stale dep beam.
@@ -946,6 +1022,16 @@ jobs:
     # supplying, so the image is not needed — only its port was ever in the way.
     steps:
       - uses: actions/checkout@v4
+        with:
+          # clean: false — see KEEPING THE COMPILED TREE at the top of this file.
+          # The default deletes _build, so every job recompiled from scratch.
+          clean: false
+
+      # See KEEPING THE COMPILED TREE at the top of this file.
+      - name: Clean the workspace, keeping the compiled tree
+        run: |
+          git clean -ffdx -e _build -e deps -e priv/plts -e mcp-server/node_modules
+          git reset --hard HEAD
 
       # Isolation, replacing the per-job fresh container (see the note on `runs-on`).
       #
@@ -986,7 +1072,6 @@ jobs:
         with:
           path: |
             deps
-            _build
           # Include config/*.exs in the key and NO loose restore-keys — a partial-key
           # restore would reuse a _build compiled under the old config, keeping a stale
           # dep beam (phoenix_ecto's Plug.Exception.Postgrex.Error) that collides with our
