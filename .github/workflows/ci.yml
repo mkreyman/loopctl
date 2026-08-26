@@ -744,6 +744,7 @@ jobs:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
 
+      - name: Cache Dialyzer PLT
         uses: actions/cache@v4
         with:
           path: priv/plts/
