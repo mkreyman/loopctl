@@ -503,10 +503,14 @@ jobs:
       # code across the tee so a regression still fails the job.
       # REGENERATING THE BASELINE, on demand, here rather than on a laptop.
       #
-      # A new or renamed golden question makes the run `:incomparable` — `question_set_changed?/1`
-      # compares the question-id SET and refuses rather than letting an unmatched question read
-      # as a non-regression. So the baseline MUST be regenerated to add a question, and adding
-      # questions is the whole path to a golden set grown from real logged queries.
+      # A new or renamed golden question drops the AGGREGATES (they would average over
+      # different questions), while every question present on BOTH sides is still scored and
+      # can fail the gate BY NAME. Which status says so depends on the golden header: bumping
+      # `version` alongside the question reports `:golden_version_mismatch` (that clause is
+      # tested FIRST in `Baseline.compare/3`), leaving it untouched reports
+      # `:question_set_mismatch`. So the baseline MUST be regenerated to add a question, and
+      # adding questions is the whole path to a golden set grown from real logged queries.
+      # See docs/runbooks/retrieval_eval.md.
       #
       # It does NOT have to happen here — this path is a convenience, not the only sound way.
       # The claim that used to sit in this comment ("CI scored mrr 0.746 / answered 22 of 26, a

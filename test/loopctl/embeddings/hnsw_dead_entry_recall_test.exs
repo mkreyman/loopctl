@@ -1,7 +1,10 @@
 defmodule Loopctl.Embeddings.HnswDeadEntryRecallTest do
   @moduledoc """
   #645 — the reproduction of the long-running `left: []` vector-recall flake, and the
-  evidence for the fix `test/test_helper.exs` applies.
+  evidence for the fix `config/test.exs` + `Loopctl.HeavyRead.maybe_force_exact_scan/1`
+  apply. (This said `test/test_helper.exs` from #645 until 2026-08-25, naming an index-drop
+  that was never actually written — see the moduledoc of
+  `test/loopctl/embeddings_side_table_reads_test.exs`.)
 
   ## The mechanism, measured rather than theorised
 
@@ -22,14 +25,31 @@ defmodule Loopctl.Embeddings.HnswDeadEntryRecallTest do
       one visible row, and the scan still returns nothing.
     * **No ANN knob fixes it.** This test asserts the failure under `hnsw.iterative_scan =
       off`, under `relaxed_order`, and under `hnsw.ef_search = 1000`. Reachability is not a
-      breadth problem. That is why `ef_search`, exact-scan forcing, `iterative_scan` and
-      retry-on-empty were each tried and each failed.
+      breadth problem. That is why `ef_search`, `iterative_scan` and retry-on-empty were
+      each tried and each failed.
 
-  The remedy is therefore not a fifth knob: VACUUM is the only thing that repairs the
-  graph, and it repairs it completely. `Loopctl.DataCase.vacuum_vector_indexes/0` does that
-  before each test in the modules that produced the signature (opt in with
-  `@moduletag :vacuum_vector_indexes`), and the last assertion here is that half — the same
-  poisoned index, vacuumed, answers correctly.
+  The remedy is therefore not a fifth breadth knob. Two things DO work, for different
+  reasons, and this test asserts both. Forcing an EXACT plan sidesteps the graph entirely
+  (`exact_read/0` returns the row from the still-poisoned index) — that is the suite-wide
+  repair, `config/test.exs` + `Loopctl.HeavyRead.maybe_force_exact_scan/1`. VACUUM instead
+  repairs the graph, completely: `Loopctl.DataCase.vacuum_vector_indexes/0` does that before
+  each test in the modules that produced the signature (opt in with
+  `@moduletag :vacuum_vector_indexes`), and the last assertion of the first test here is that
+  half — the same poisoned index, vacuumed, answers the ANN correctly.
+
+  The SECOND test is the one that would have caught #645 never landing. Everything above it
+  measures the mechanism through hand-built SQL with a pinned plan; none of it touches the
+  code the request path actually runs, so all of it stayed green for the two months in which
+  the shipped remedy existed only in a docstring. This one reads the planner GUCs from
+  inside a real `Loopctl.HeavyRead` read — the actual chokepoint, at the actual
+  configuration — so it goes red the moment `maybe_force_exact_scan/1` or
+  `:heavy_read_force_exact_scan` stops being wired. BOTH halves are policed only because
+  the expectation is derived from `SCALE_TESTS`/`SCALE_NIGHTLY` rather than from the config
+  key the code reads: unwiring the key flips the observed GUC and NOT the expectation.
+  Verified by mutation on a DEFAULT run: replace the `SET LOCAL enable_indexscan = off`
+  with a no-op and this test fails while every other assertion in the file still passes.
+  Under `SCALE_TESTS` that mutation is invisible here by design — that run asserts the
+  forcing is NOT applied, so it catches the forcing becoming unconditional instead.
 
   `async: false`: it deliberately fills a shared graph with dead entries.
   """
@@ -39,6 +59,8 @@ defmodule Loopctl.Embeddings.HnswDeadEntryRecallTest do
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
+  alias Loopctl.HeavyRead
+  alias Loopctl.Knowledge.ArticleEmbedding
 
   # Comfortably above pgvector's default `hnsw.ef_search` of 40. Small enough to stay a
   # sub-second test.
@@ -194,6 +216,48 @@ defmodule Loopctl.Embeddings.HnswDeadEntryRecallTest do
       Loopctl.DataCase.vacuum_vector_indexes()
 
       assert ann_read(mode: "off") == [article.id]
+    end
+
+    test "the SHIPPED default-suite read path has the ANN plan disabled at the chokepoint" do
+      tenant = fixture(:tenant)
+      article = fixture(:article, %{tenant_id: tenant.id, status: :published, title: "Live"})
+      insert_embedding(tenant.id, article.id, live_vec())
+
+      # Read the planner GUCs FROM INSIDE a real `HeavyRead` read, which is the only place
+      # the claim can be checked: `SET LOCAL` is scoped to that transaction, so asking any
+      # other connection returns the session default and proves nothing.
+      #
+      # This asserts the MECHANISM rather than a recovered row on purpose. A recall
+      # assertion here is INERT — verified by mutation: with `maybe_force_exact_scan/1`
+      # removed, a poisoned-index read through `HeavyRead` still returned the row, because
+      # on a table holding one live tuple the planner picks an exact plan on cost anyway.
+      # That is the same plan lottery the first test has to pin `enable_seqscan` to escape
+      # (7 exact / 3 HNSW measured over ten runs), and a guard that only fires on 3 runs in
+      # 10 is not a guard. What broke in #645 was never the recall — it was the remedy
+      # silently not being wired, and this is the assertion that goes red for that.
+      query =
+        from(ae in ArticleEmbedding,
+          where: ae.tenant_id == ^tenant.id,
+          select: %{
+            indexscan: fragment("current_setting('enable_indexscan')"),
+            bitmapscan: fragment("current_setting('enable_bitmapscan')")
+          },
+          limit: 1
+        )
+
+      # The expectation is derived from the ENV, never from `:heavy_read_force_exact_scan`:
+      # reading the key `force_exact_scan?/0` reads would make this guard TRACK the config
+      # instead of CHECKING it, and deleting the config line would then leave it green. The
+      # env is what `config/test.exs` computes that key from, so it is an independent source
+      # of truth for both halves of the wiring. A default run must have the forcing applied;
+      # a `SCALE_TESTS`/`SCALE_NIGHTLY` run must NOT, so the scale jobs still reach the real
+      # HNSW plan — that branch catches the forcing becoming unconditional, nothing else.
+      expected =
+        if is_nil(System.get_env("SCALE_TESTS")) and is_nil(System.get_env("SCALE_NIGHTLY")),
+          do: "off",
+          else: "on"
+
+      assert [%{indexscan: ^expected, bitmapscan: ^expected}] = HeavyRead.all(tenant.id, query)
     end
   end
 end

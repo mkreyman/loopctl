@@ -28,6 +28,10 @@ defmodule Loopctl.EmbeddingsTest do
 
   setup :verify_on_exit!
 
+  # Traced by `count_calls/2` for the AC-41.1.11 N+1 guards (see the helpers at the bottom).
+  @resolve_dimension_mfa {Loopctl.Embeddings, :resolve_write_dimension, 1}
+  @sub_batch_mfa {Loopctl.Workers.BatchArticleEmbeddingWorker, :embed_and_store_sub_batch, 3}
+
   # Both helpers ride this test's OWN sparse dimensions (`test_vec/2`, seeded per test by
   # `Process.put(:test_vec_axis, ...)` in DataCase.setup) rather than a shape every test
   # shares. They used to be `sin(i / dim)` and `sin((i + seed) / dim)` — DENSE and IDENTICAL
@@ -604,27 +608,17 @@ defmodule Loopctl.EmbeddingsTest do
           {fixture(:article, tenant_id: tenant.id), vec(1536, i), "h#{i}"}
         end
 
-      parent = self()
-      handler_id = "us411-dim-#{System.unique_integer([:positive])}"
+      {counts, result} =
+        count_calls([resolution: @resolve_dimension_mfa], fn ->
+          Embeddings.upsert_article_embeddings(tenant.id, entries)
+        end)
 
-      :telemetry.attach(
-        handler_id,
-        [:loopctl, :repo, :query],
-        fn _event, _measurements, metadata, _config ->
-          if metadata[:query] =~ "FROM \"tenants\"" do
-            send(parent, :tenant_query)
-          end
-        end,
-        nil
-      )
-
-      on_exit(fn -> :telemetry.detach(handler_id) end)
-
-      assert {:ok, rows} = Embeddings.upsert_article_embeddings(tenant.id, entries)
+      assert {:ok, rows} = result
       assert length(rows) == 100
 
-      assert tenant_query_count() <= 1,
-             "the tenant dimension must be resolved ONCE per batch, not per item"
+      assert counts.resolution == 1,
+             "the dimension was resolved #{counts.resolution} times for a 100-item batch; " <>
+               "AC-41.1.11 requires exactly one resolution, threaded into every write"
     end
   end
 
@@ -633,15 +627,28 @@ defmodule Loopctl.EmbeddingsTest do
     # PRODUCT actually runs is `BatchArticleEmbeddingWorker.store_all/2`, which loops
     # `Knowledge.update_embedding/5` once per article — so asserting only the former
     # let the gate pass while the production path did ~100 tenant lookups per batch
-    # (review #5). This asserts on the SHAPE that matters: the tenant-query count must
-    # NOT scale with the batch size.
-    test "the tenant dimension lookup does not scale with the batch size" do
-      small = batch_worker_tenant_queries(3)
-      large = batch_worker_tenant_queries(30)
+    # (review #5). This asserts on the SHAPE that matters: the dimension is resolved once
+    # per provider sub-batch, so the count tracks the SUB-BATCH count and never the
+    # article count.
+    test "the tenant dimension is resolved once per sub-batch, never per article" do
+      for n <- [3, 30] do
+        counts = batch_worker_dimension_resolutions(n)
 
-      assert large <= small,
-             "tenant lookups scaled with batch size (#{small} -> #{large}) — the dimension " <>
-               "is being resolved per ARTICLE, which is exactly the AC-41.1.11 N+1"
+        # This one is what keeps the next assertion DISCRIMINATING, so it is asserted
+        # rather than assumed: a ratio of resolutions to sub-batches cannot tell a
+        # per-ARTICLE N+1 from a per-SUB-BATCH resolution once the two counts coincide,
+        # which is exactly what a one-article-per-sub-batch byte budget produces.
+        assert counts.sub_batch == 1,
+               "expected #{n} tiny articles to ride ONE provider sub-batch at the default " <>
+                 "byte budget, got #{counts.sub_batch} — with one article per sub-batch " <>
+                 "the resolution count below cannot detect the N+1 at all"
+
+        assert counts.resolution == 1,
+               "for #{n} articles the dimension was resolved #{counts.resolution} time(s) " <>
+                 "across #{counts.sub_batch} provider sub-batch(es); AC-41.1.11 requires " <>
+                 "exactly one resolution per sub-batch. A count that tracks the ARTICLE " <>
+                 "count IS the N+1."
+      end
     end
   end
 
@@ -737,40 +744,104 @@ defmodule Loopctl.EmbeddingsTest do
 
   # --- helpers ---
 
-  # Runs the REAL batch worker over `n` articles and returns how many `tenants`
-  # SELECTs it issued.
-  defp batch_worker_tenant_queries(n) do
-    tenant = fixture(:tenant)
-    articles = for _ <- 1..n, do: fixture(:article, tenant_id: tenant.id)
-    handler_id = "us411-batch-#{System.unique_integer([:positive])}"
-    parent = self()
+  # AC-41.1.11 says the tenant dimension is resolved ONCE per provider sub-batch and threaded
+  # into every write. Both guards above used to count `FROM "tenants"` QUERIES, which cannot see
+  # that for two independent reasons — and did it anyway from 2026-08 until 2026-08-25:
+  #
+  #   1. `:telemetry.attach/4` is VM-GLOBAL. The handler matched any query containing
+  #      `FROM "tenants"`, and the whole async suite queries tenants constantly, so every
+  #      OTHER test running concurrently posted into this test's mailbox. The count measured
+  #      how busy the box was. On the `<= 1` assertion foreign traffic could only push the
+  #      number UP, which is a spurious FAILURE — the flake.
+  #   2. Worse, the number being reached for is ZERO either way: `resolve_write_dimension/1`
+  #      reads a CACHE, so a correct implementation and an N+1 one both emit no tenants
+  #      query here. Measured 2026-08-25 with correct scoping: both counts were 0, so
+  #      `large <= small` was `0 <= 0` and `<= 1` was `0 <= 1` — vacuously true, forever,
+  #      for any implementation. Neither guard could fail. Neither protected AC-41.1.11.
+  #
+  # So count the RESOLUTIONS themselves. `:erlang.trace/3` is scoped to a single PID and every
+  # call site here runs inline in the test process, so no other test can be observed — which
+  # fixes (1) structurally rather than by filtering — and it measures the invariant directly
+  # rather than a proxy that caching had already zeroed out, which fixes (2). A count of zero
+  # is asserted against too: it means the code under test never ran.
+  defp count_calls(labelled_mfas, fun) do
+    collector = spawn_link(fn -> collect_traces(%{}) end)
 
-    :telemetry.attach(
-      handler_id,
-      [:loopctl, :repo, :query],
-      fn _event, _measurements, metadata, _config ->
-        if metadata[:query] =~ "FROM \"tenants\"", do: send(parent, :tenant_query)
-      end,
-      nil
-    )
+    # Load-bearing: `trace_pattern` on an UNLOADED module matches nothing and silently
+    # traces nothing. Without this, the first call in a fresh VM reported 0 resolutions and
+    # the second reported 1 — an invented asymmetry that looks exactly like a real finding.
+    Enum.each(labelled_mfas, fn {_label, {module, _f, _a}} ->
+      {:module, _} = Code.ensure_loaded(module)
+    end)
 
-    on_exit(fn -> :telemetry.detach(handler_id) end)
+    :erlang.trace(self(), true, [:call, {:tracer, collector}])
 
-    :ok =
-      perform_job(Loopctl.Workers.BatchArticleEmbeddingWorker, %{
-        "tenant_id" => tenant.id,
-        "article_ids" => Enum.map(articles, & &1.id)
-      })
+    # The match count is asserted so a future rename cannot make this guard quietly count
+    # nothing and pass.
+    Enum.each(labelled_mfas, fn {label, mfa} ->
+      assert :erlang.trace_pattern(mfa, true, [:local]) == 1,
+             "trace_pattern matched no #{label} function — nothing would have been counted"
+    end)
 
-    tenant_query_count()
+    result =
+      try do
+        fun.()
+      after
+        :erlang.trace(self(), false, [:call])
+      end
+
+    send(collector, {:report, self()})
+
+    traced =
+      receive do
+        {:traces, counts} -> counts
+      after
+        2_000 -> flunk("the trace collector never reported")
+      end
+
+    {Map.new(labelled_mfas, fn {label, mfa} -> {label, Map.get(traced, mfa, 0)} end), result}
   end
 
-  defp tenant_query_count(acc \\ 0) do
+  defp collect_traces(counts) do
     receive do
-      :tenant_query -> tenant_query_count(acc + 1)
-    after
-      0 -> acc
+      {:trace, _pid, :call, {m, f, args}} ->
+        collect_traces(Map.update(counts, {m, f, length(args)}, 1, &(&1 + 1)))
+
+      {:report, pid} ->
+        send(pid, {:traces, counts})
     end
+  end
+
+  # Runs the REAL batch worker over `n` articles and returns how many times it resolved the
+  # dimension, alongside how many provider sub-batches it ran. Both numbers are returned
+  # because the caller needs BOTH: `generate_and_store_project_group/3` splits by
+  # `Knowledge.embedding_batch_max_chars/0`, and at a budget that puts one article per
+  # sub-batch a per-ARTICLE resolution and a per-SUB-BATCH one are the same number, so a
+  # bare ratio between them would be inert. The budget here is the 1_000_000-char default:
+  # its `:persistent_term` cache is VM-global, but every test that shrinks it lives in
+  # `batch_article_embedding_worker_test.exs`, which is `async: false` PRECISELY so the
+  # write cannot leak (ExUnit runs sync modules only after every async module has finished).
+  # Do NOT add such a write to an async module — that is the cross-module leakage
+  # `config_embedding_read_path_test.exs` guards against.
+  defp batch_worker_dimension_resolutions(n) do
+    tenant = fixture(:tenant)
+    articles = for _ <- 1..n, do: fixture(:article, tenant_id: tenant.id)
+
+    {counts, result} =
+      count_calls([resolution: @resolve_dimension_mfa, sub_batch: @sub_batch_mfa], fn ->
+        perform_job(Loopctl.Workers.BatchArticleEmbeddingWorker, %{
+          "tenant_id" => tenant.id,
+          "article_ids" => Enum.map(articles, & &1.id)
+        })
+      end)
+
+    # A snooze or a provider error would leave the counts below meaningless; say so instead
+    # of raising a MatchError that reads like the N+1 guard itself failed.
+    assert result == :ok,
+           "the batch worker did not complete (#{inspect(result)}), so the resolution " <>
+             "counts prove nothing about AC-41.1.11"
+
+    counts
   end
 
   defp ann_ids(tenant_id, schema, dim) do

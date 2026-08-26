@@ -25,8 +25,11 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
     * `--baseline` — path to the baseline JSON (default the committed one).
     * `--update-baseline` — rewrite the baseline from this run instead of comparing.
       Implies `--mode both` unless a mode is given explicitly.
-    * `--fail-on-regression` — exit non-zero when any aggregate metric is below
-      baseline by more than the tolerance. This is what CI runs.
+    * `--fail-on-regression` — exit non-zero when any aggregate metric is below baseline
+      by more than the tolerance, AND whenever a question shared with the baseline
+      regressed or carried a metric the baseline has no value for. Those two gate on every
+      status, including one whose aggregates are fine or not comparable. This is what CI
+      runs.
     * `--tolerance` — float slack below baseline that is not a regression.
     * `--json` — emit the machine-readable result instead of the text report.
     * `--graph-lane` / `--no-graph-lane` — force the optional RRF graph-neighbour lane
@@ -113,6 +116,7 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
     json: :boolean,
     cleanup: :boolean,
     allow_prod: :boolean,
+    allow_dirty: :boolean,
     min_age: :integer,
     graph_lane: :boolean,
     graph_weight: :float,
@@ -136,8 +140,50 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
     if Keyword.get(opts, :cleanup, false) do
       reap_leaked_tenants(opts)
     else
+      refuse_on_leaked_corpus!(opts)
       run_eval(opts)
     end
+  end
+
+  # REFUSE to score against a database that still holds another run's seeded corpus.
+  #
+  # The ANN is ONE HNSW index shared by every tenant, and `search_semantic` applies the
+  # tenant predicate as a residual AFTER the index returns its neighbourhood (see the wiki
+  # article "Multi-tenant HNSW: residual filter drops results under cross-tenant density").
+  # So a leaked corpus is not inert background: it crowds the neighbourhood, and this
+  # tenant's own answers fall outside the window and simply do not come back.
+  #
+  # Measured 2026-08-25, and it is why this guard exists. A `--filler` sweep was killed
+  # mid-run by a timeout, leaving 12,500 filler rows in two abandoned tenants. Every later
+  # cell of that sweep then scored against a progressively dirtier index, and nine golden
+  # questions went from MRR 1.000 to 0.000 — the answer not demoted but ABSENT. Read as a
+  # pool-depth curve it said "a deeper pool is worse", which is a conclusion about run
+  # ORDER wearing a pool's clothes. Every number from that sweep was discarded.
+  #
+  # Fails CLOSED, and names the remedy: a sweep that silently tolerates this produces
+  # confident numbers that mean nothing.
+  defp refuse_on_leaked_corpus!(opts) do
+    leaked =
+      AdminRepo.aggregate(
+        from(a in Loopctl.Knowledge.Article,
+          where: fragment("coalesce((?->>'retrieval_eval')::boolean, false)", a.metadata)
+        ),
+        :count
+      )
+
+    if leaked > 0 and not Keyword.get(opts, :allow_dirty, false) do
+      Mix.raise("""
+      retrieval eval: #{leaked} seeded eval row(s) from a previous run are still in this       database.
+
+      The ANN index is shared across tenants and the tenant filter is applied AFTER it, so       a leaked corpus crowds this run's neighbourhood and its answers silently drop out of       the results. Any metric produced now would describe the leftovers, not the ranking.
+
+      Reap them first:   mix loopctl.retrieval.eval --cleanup
+
+      (--allow-dirty overrides this, for diagnosing the leak itself. Never for a measurement.)
+      """)
+    end
+
+    :ok
   end
 
   defp guard_prod!(opts) do
@@ -387,14 +433,20 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
   defp maybe_fail(comparisons, true) do
     problems =
       Enum.flat_map(comparisons, fn
-        {_result, %{status: :ok}} ->
+        {_result, %{status: :ok, question_regressions: [], question_uncomparable: []}} ->
           []
 
-        {result, %{status: :regression} = comparison} ->
-          ["#{result.mode}: regression in #{Enum.join(comparison.regressions, ", ")}"]
+        {result, %{status: :ok} = comparison} ->
+          ["#{result.mode}: aggregates OK, but #{question_phrase(comparison)}"]
 
-        {result, %{status: status}} ->
-          ["#{result.mode}: cannot compare (#{status})"]
+        {result, %{status: :regression} = comparison} ->
+          [
+            "#{result.mode}: regression in #{Enum.join(comparison.regressions, ", ")}" <>
+              also_per_question(comparison)
+          ]
+
+        {result, %{status: status} = comparison} ->
+          ["#{result.mode}: cannot compare (#{status})" <> also_per_question(comparison)]
 
         {result, nil} ->
           ["#{result.mode}: no baseline to compare against"]
@@ -407,6 +459,34 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
       Mix.raise("retrieval eval gate failed")
     end
   end
+
+  # A per-question verdict gates and is named on EVERY path — never only where the aggregate
+  # happened to fail. A question that loses a rank while another gains nets out to a flat
+  # aggregate (the runbook's own reranking case), and a moved question set makes the
+  # aggregate uncomparable without making the shared questions so — that is what let three
+  # questions lose a rank apiece across the golden_v3 -> v5 growth without anyone reading
+  # it. A metric with NO baseline value gates for the same reason its aggregate twin does:
+  # "could not be compared" is not "did not regress".
+  defp also_per_question(comparison) do
+    case question_phrase(comparison) do
+      "" -> ""
+      phrase -> ", AND " <> phrase
+    end
+  end
+
+  defp question_phrase(comparison) do
+    [
+      phrase(comparison.question_regressions, "regressed"),
+      phrase(comparison.question_uncomparable, "had no baseline value for a metric")
+    ]
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.join(", and ")
+  end
+
+  defp phrase([], _what), do: ""
+
+  defp phrase(ids, what),
+    do: "#{length(ids)} shared question(s) #{what}: #{Enum.join(ids, ", ")}"
 
   # A throwaway tenant per run: the eval seeds a corpus, and seeding it into a real
   # tenant would pollute that tenant's KB. Deleted in an `after` so a raising run leaves
@@ -460,6 +540,32 @@ defmodule Mix.Tasks.Loopctl.Retrieval.Eval do
           select: t.id
         )
       )
+
+    # Seeded rows can outlive their tenant row: a killed run leaves both, but a partly-torn-
+    # down one can leave articles whose tenant was already deleted. Reaping by tenant alone
+    # left those behind, and they are exactly as damaging to the shared ANN index — so sweep
+    # the marker too, independently of which tenants are found.
+    seeded =
+      from(a in Loopctl.Knowledge.Article,
+        where: fragment("coalesce((?->>'retrieval_eval')::boolean, false)", a.metadata),
+        select: a.id
+      )
+
+    # LINKS FIRST. `article_links` FKs both endpoints with `on_delete: :restrict`, so
+    # deleting a linked article raises a foreign-key violation and reaps NOTHING —
+    # `delete_corpus/2` carries the same ordering and the same comment, and this reaper
+    # was written without it and failed on its first real run against a dirty database.
+    AdminRepo.delete_all(
+      from(l in Loopctl.Knowledge.ArticleLink,
+        where: l.source_article_id in subquery(seeded) or l.target_article_id in subquery(seeded)
+      )
+    )
+
+    {orphaned, _} = AdminRepo.delete_all(seeded)
+
+    if orphaned > 0 do
+      Mix.shell().info("Retrieval eval cleanup: deleted #{orphaned} seeded eval article(s).")
+    end
 
     if tenant_ids == [] do
       Mix.shell().info("Retrieval eval cleanup: no leaked eval tenants found.")

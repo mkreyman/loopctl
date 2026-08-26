@@ -1338,6 +1338,7 @@ defmodule Loopctl.HeavyRead do
         read_repo.query!("SET LOCAL statement_timeout = #{ms}")
         maybe_set_ef_search(read_repo, ef)
         maybe_set_iterative_scan(read_repo, iter)
+        maybe_force_exact_scan(read_repo)
         fun.()
       end)
     end)
@@ -1348,8 +1349,62 @@ defmodule Loopctl.HeavyRead do
   defp captured_gucs(ef, iter) do
     ["statement_timeout"] ++
       if(is_integer(ef), do: ["hnsw.ef_search"], else: []) ++
-      if(is_binary(iter), do: ["hnsw.iterative_scan", "hnsw.max_scan_tuples"], else: [])
+      if(is_binary(iter), do: ["hnsw.iterative_scan", "hnsw.max_scan_tuples"], else: []) ++
+      if(force_exact_scan?(), do: ["enable_indexscan", "enable_bitmapscan"], else: [])
   end
+
+  # `SET LOCAL enable_indexscan = off` for a heavy read — TEST-ENV ONLY, and off by default
+  # so production is untouched (`config/test.exs` is the only place that turns it on).
+  #
+  # #645, and the recurrence that failed the 2026-08-25 nightly on an UNCHANGED master.
+  # Under `Ecto.Adapters.SQL.Sandbox` every rolled-back test INSERT leaves its entry in the
+  # SHARED pgvector HNSW graph, and pgvector's scan SKIPS dead elements rather than
+  # traversing through them: a row inserted later links only to dead neighbours and becomes
+  # UNREACHABLE from the graph entry point, so the ANN returns nothing while a `count()` on
+  # the same connection shows the row present. It is a REACHABILITY failure, so no breadth
+  # knob touches it — measured in `test/loopctl/embeddings/hnsw_dead_entry_recall_test.exs`,
+  # the read still returns `[]` under `relaxed_order` and under `ef_search = 1000`.
+  #
+  # An exact plan reads the heap, so the graph is not in the picture at all. Nothing real is
+  # lost: the default suite's ANN coverage was already accidental (the plan was measured
+  # flipping 7 exact / 3 HNSW over ten runs of an unchanged database), and the ANN plan is
+  # gated properly by the CI scale jobs over a committed, ANALYZEd 80k-row corpus — the only
+  # corpus whose graph resembles production's — which run with `SCALE_TESTS` set and
+  # therefore leave this off.
+  #
+  # WHY NOT the two repairs already in the tree. `@moduletag :vacuum_vector_indexes`
+  # (`Loopctl.DataCase.vacuum_vector_indexes/0`) is per-test and correct, but the index is
+  # SHARED, so every ANN-reading module is exposed and the failure MOVES between them — the
+  # nightly failed in `EmbeddingsTest`, a full-suite run the same evening failed six
+  # assertions in `MemoryContextTest` instead. Tagging modules one at a time is whack-a-mole,
+  # and it does not scale: the tag on ONE module took the suite 37.9s -> 56.2s (+50%), with
+  # 744s (18.6x) projected over 24 ANN-reading modules. Measured on minis 2026-08-24, VACUUM
+  # also cannot carry a whole async suite: a janitor vacuuming every 2s still failed 2 of 6
+  # full-suite runs, because VACUUM cannot reclaim a tuple visible to any open snapshot and
+  # an async Sandbox suite holds ~max_cases transactions open for practically the whole run.
+  # (REINDEX does repair it — 13 MB -> 16 kB, 8 of 8 failures -> clean — but only from a
+  # QUIET database: as a background pass its ACCESS EXCLUSIVE lock fought the suite and broke
+  # unrelated modules outright.) The per-test tag still works where it is used, because it
+  # runs in `setup` before its own test opens the transaction it reads through; it stays.
+  defp maybe_force_exact_scan(read_repo) do
+    if force_exact_scan?() do
+      read_repo.query!("SET LOCAL enable_indexscan = off")
+      read_repo.query!("SET LOCAL enable_bitmapscan = off")
+    end
+
+    :ok
+  end
+
+  @doc """
+  Whether heavy reads are currently forced onto an EXACT plan (see
+  `maybe_force_exact_scan/1`). FALSE in every non-test environment.
+
+  Public because `Loopctl.VectorRecallDiagnostics` must reproduce the read's GUCs around its
+  EXPLAIN — a diagnostic that explains a different plan than the read it is diagnosing is
+  worse than none, which is the whole reason that wrapper exists.
+  """
+  @spec force_exact_scan?() :: boolean()
+  def force_exact_scan?, do: Application.get_env(:loopctl, :heavy_read_force_exact_scan, false)
 
   # `SET LOCAL hnsw.ef_search = N` for an ANN read (US-38.4). Only fired when the caller
   # (via `HeavyRead.opts/1` for an `ann_endpoints/0` endpoint) supplies a positive integer

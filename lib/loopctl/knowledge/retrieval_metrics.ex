@@ -257,6 +257,18 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   # rather than behaviour.
   @infra_entrypoints ~w(smoke skill-eval)
 
+  @doc """
+  Client entrypoints that are loopctl's own infrastructure and must never enter a retrieval
+  denominator.
+
+  Public because `LiveRetrievalMetrics` applies the SAME exclusion and previously carried its
+  own copy of the list. Two literals with 25 lines of rationale attached to only one of them
+  drift the moment a third infra entrypoint appears — and the module a future editor finds
+  first was the copy WITHOUT the reasoning.
+  """
+  @spec infra_entrypoints() :: [String.t()]
+  def infra_entrypoints, do: @infra_entrypoints
+
   # Channels that are counted everywhere else but CANNOT be scored for reformulation (#711).
   #
   # The recall hook (`hook`) and the session-start auto-query (`session-start`) each emit

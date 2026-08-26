@@ -45,11 +45,36 @@ defmodule Loopctl.Knowledge.RetrievalEval.Report do
 
     """
     Retrieval eval — golden set #{result.golden_version}
+    #{provenance_banner()}
       requested mode : #{result.mode}
       observed mode  : #{result.observed_mode}
       fallback reason: #{reasons}
       questions      : #{result.question_count}\
     """
+  end
+
+  # Every number this report prints is produced on a SYNTHETIC fixture, and the banner
+  # exists because that fact does not survive being quoted.
+  #
+  # The limitation was already written down — the runbook says "read the numbers as a
+  # REGRESSION signal, not an absolute quality score" and "there is no real-embedding-
+  # provider path" — and on 2026-08-25 a session that had READ that runbook still reported
+  # this eval's +6.5% MRR to the owner as the answer to "did the search refactor improve
+  # search?". Measured against production traffic the same day, the real answer was "no
+  # measurable change in either direction" (weekly MRR sigma 0.045; the observed gap 0.022).
+  #
+  # So the caveat is attached to the ARTIFACT rather than to a document about the artifact.
+  # A doc can be read and then not applied at reporting time; a banner travels with the
+  # number into whatever paraphrases it. Do not remove it to tidy the output, and do not
+  # weaken it to "synthetic embeddings" alone — the CORPUS is invented too (hand-authored
+  # prose, median body 123 characters, against a production corpus of ~86,000 real
+  # articles), and that is the half that misleads about absolute quality.
+  @spec provenance_banner() :: String.t()
+  def provenance_banner do
+    "  ⚠ SYNTHETIC FIXTURE — invented corpus + synthetic embeddings. Valid as a\n" <>
+      "    REGRESSION signal between two runs of this harness. NOT a measurement of\n" <>
+      "    production retrieval quality; do not quote these figures as one. For the\n" <>
+      "    real corpus, measure logged traffic (docs/runbooks/retrieval_eval.md)."
   end
 
   defp aggregate_section(result, comparison) do
@@ -136,18 +161,34 @@ defmodule Loopctl.Knowledge.RetrievalEval.Report do
     "BASELINE\n  no baseline entry for this mode (golden #{gv.baseline || "n/a"}) — nothing to compare"
   end
 
-  defp baseline_section(%{status: :golden_version_mismatch, golden_version: gv}) do
-    "BASELINE\n  golden set version changed (#{gv.baseline} -> #{gv.current}) — re-baseline before comparing"
+  # Both mismatch statuses drop the AGGREGATES only — the shared questions are still scored.
+  defp baseline_section(%{status: :golden_version_mismatch, golden_version: gv} = comparison) do
+    "BASELINE\n  status: AGGREGATES INCOMPARABLE — golden set version changed " <>
+      "(#{gv.baseline} -> #{gv.current}) — re-baseline before comparing." <>
+      shared_question_lines(comparison)
   end
 
-  defp baseline_section(%{status: :question_set_mismatch}) do
-    "BASELINE\n  golden question set differs from the baseline's (added/removed/renamed a " <>
-      "question without re-baselining) — re-baseline before comparing"
+  defp baseline_section(%{status: :question_set_mismatch} = comparison) do
+    "BASELINE\n  status: AGGREGATES INCOMPARABLE — the golden question set differs from " <>
+      "the baseline's (a question was added, removed or renamed), so the aggregate " <>
+      "metrics average over different questions and are not compared." <>
+      shared_question_lines(comparison)
   end
 
   defp baseline_section(%{status: :incomparable} = comparison) do
-    "BASELINE\n  status: INCOMPARABLE — no baseline value for #{Enum.join(comparison.uncomparable, ", ")}\n" <>
-      winners_losers(comparison)
+    "BASELINE\n  status: INCOMPARABLE — no baseline value for #{Enum.join(comparison.uncomparable, ", ")}" <>
+      question_notes(comparison) <> "\n" <> winners_losers(comparison)
+  end
+
+  defp baseline_section(%{status: :ok, question_regressions: [_ | _]} = comparison) do
+    "BASELINE\n  status: PER-QUESTION REGRESSION (aggregates OK — a question that loses a " <>
+      "rank while another gains nets out)" <>
+      question_notes(comparison) <> "\n" <> winners_losers(comparison)
+  end
+
+  defp baseline_section(%{status: :ok, question_uncomparable: [_ | _]} = comparison) do
+    "BASELINE\n  status: NOT FULLY COMPARED (the aggregates held)" <>
+      question_notes(comparison) <> "\n" <> winners_losers(comparison)
   end
 
   defp baseline_section(%{status: :ok} = comparison) do
@@ -155,13 +196,45 @@ defmodule Loopctl.Knowledge.RetrievalEval.Report do
   end
 
   defp baseline_section(%{status: :regression} = comparison) do
-    "BASELINE\n  status: REGRESSION in #{Enum.join(comparison.regressions, ", ")}\n" <>
-      winners_losers(comparison)
+    "BASELINE\n  status: REGRESSION in #{Enum.join(comparison.regressions, ", ")}" <>
+      question_notes(comparison) <> "\n" <> winners_losers(comparison)
   end
+
+  # An EMPTY intersection is a THIRD answer — nothing was compared, which is not an all-clear.
+  defp shared_question_lines(%{shared_question_count: 0}) do
+    "\n  no question appears on BOTH sides — nothing was comparable per-question either."
+  end
+
+  defp shared_question_lines(comparison) do
+    verdict =
+      case question_notes(comparison) do
+        "" -> "\n  no shared question regressed."
+        notes -> notes
+      end
+
+    "\n  #{comparison.shared_question_count} question(s) appear on BOTH sides (a golden-set " <>
+      "change also moves the shared corpus and the labels, so confirm the cause of any " <>
+      "drop):" <> verdict <> "\n" <> winners_losers(comparison)
+  end
+
+  # Two INDEPENDENT lists over the same questions, so BOTH render (picking one clause hid
+  # every uncomparable id behind any regression) and on EVERY status, as the gate does.
+  defp question_notes(cmp) do
+    note("REGRESSED per-question", Map.get(cmp, :question_regressions, [])) <>
+      note("NOT COMPARED (uncomparable, not clean)", Map.get(cmp, :question_uncomparable, []))
+  end
+
+  defp note(_label, []), do: ""
+  defp note(label, ids), do: "\n  #{label}: #{Enum.join(ids, ", ")}"
 
   defp winners_losers(comparison) do
     "  winners: #{list(comparison.winners)}\n  losers : #{list(comparison.losers)}"
   end
+
+  # The gate exits non-zero on a per-question verdict, so `--json` may not answer "ok" to it.
+  defp json_status(%{status: :ok, question_regressions: [_ | _]}), do: "question_regression"
+  defp json_status(%{status: :ok, question_uncomparable: [_ | _]}), do: "question_uncomparable"
+  defp json_status(%{status: status}), do: to_string(status)
 
   defp list([]), do: "none"
   defp list(ids), do: Enum.join(ids, ", ")
@@ -190,6 +263,12 @@ defmodule Loopctl.Knowledge.RetrievalEval.Report do
   @spec to_json_map(map(), map() | nil) :: map()
   def to_json_map(result, comparison \\ nil) do
     %{
+      # The JSON path is the one a script or another agent consumes, so it carries the
+      # same disclosure as the text report rather than relying on the reader having seen it.
+      "provenance" => "synthetic_fixture",
+      "provenance_note" =>
+        "Invented corpus and synthetic embeddings. Valid as a regression signal between " <>
+          "runs of this harness; NOT a measurement of production retrieval quality.",
       "golden_version" => result.golden_version,
       "mode" => to_string(result.mode),
       "observed_mode" => result.observed_mode,
@@ -232,9 +311,12 @@ defmodule Loopctl.Knowledge.RetrievalEval.Report do
 
   defp comparison_json(comparison) do
     %{
-      "status" => to_string(comparison.status),
+      "status" => json_status(comparison),
       "regressions" => comparison.regressions,
       "uncomparable" => Map.get(comparison, :uncomparable, []),
+      "shared_question_count" => Map.get(comparison, :shared_question_count, 0),
+      "question_regressions" => Map.get(comparison, :question_regressions, []),
+      "question_uncomparable" => Map.get(comparison, :question_uncomparable, []),
       "winners" => comparison.winners,
       "losers" => comparison.losers,
       "aggregate" =>

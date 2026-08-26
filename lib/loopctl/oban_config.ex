@@ -638,7 +638,15 @@ defmodule Loopctl.ObanConfig do
       {Oban.Plugins.Lifeline, rescue_after: :timer.minutes(30)},
       # Prune terminal (completed/discarded/cancelled) jobs older than 7 days so the
       # oban_jobs table doesn't grow unbounded.
-      {Oban.Plugins.Pruner, max_age: 60 * 60 * 24 * 7},
+      #
+      # The INTERVAL is set explicitly because the library default is 30 seconds, and a
+      # 30-second sweep against a SEVEN-DAY retention is 2,880 scans a day to delete rows
+      # that had a week to live. Measured on the hosted database over the 19 days to
+      # 2026-08-25: 53,748 calls, 457s, 12.1% of all query time this database spent --
+      # the single largest recurring cost, to remove ~5,600 rows a day. At five minutes
+      # the same rows are deleted at most five minutes later than they would have been,
+      # which is invisible against max_age, and the bill drops roughly tenfold.
+      {Oban.Plugins.Pruner, max_age: 60 * 60 * 24 * 7, interval: :timer.minutes(5)},
       # US-34.1 (AC-34.1.4): periodically REINDEX CONCURRENTLY the oban_jobs indexes
       # (default: oban_jobs_args_index + oban_jobs_meta_index, once daily at midnight
       # UTC) so index bloat from this table's high churn (state transitions on every

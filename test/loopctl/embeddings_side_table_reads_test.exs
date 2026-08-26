@@ -31,14 +31,25 @@ defmodule Loopctl.EmbeddingsSideTableReadsTest do
   `hnsw.iterative_scan = off`, under `relaxed_order`, and under `hnsw.ef_search = 1000`.
   Candidate STARVATION is also retired — the reproduction has no live competitors at all.
 
-  **The fix.** `test/test_helper.exs` DROPS every pgvector HNSW index unless
-  `SCALE_TESTS` is set, so every vector read in the default suite is served by an EXACT plan
-  (seq or btree + sort) that cannot under-return. Nothing real is lost: this suite's ANN
-  coverage was already accidental (the plan was measured flipping 7 exact / 3 HNSW over ten
-  runs of an unchanged database), and the ANN plan is gated properly by the CI scale job over
-  a committed, ANALYZEd 80k-row corpus — the only corpus whose graph resembles production's.
+  **The fix.** `config/test.exs` sets `:heavy_read_force_exact_scan` unless `SCALE_TESTS` /
+  `SCALE_NIGHTLY` is set, and `Loopctl.HeavyRead.maybe_force_exact_scan/1` turns that into a
+  `SET LOCAL enable_indexscan = off` on each heavy read — so every vector read in the default
+  suite is served by an EXACT plan (seq or btree + sort) that cannot under-return. Nothing
+  real is lost: this suite's ANN coverage was already accidental (the plan was measured
+  flipping 7 exact / 3 HNSW over ten runs of an unchanged database), and the ANN plan is
+  gated properly by the CI scale job over a committed, ANALYZEd 80k-row corpus — the only
+  corpus whose graph resembles production's.
 
-  So do NOT "restore" the indexes for this suite, and do NOT add a fifth recall knob. If a
+  This paragraph described a DIFFERENT fix — dropping every HNSW index in
+  `test/test_helper.exs` — from #645 until 2026-08-25. That code was never written: the last
+  commit to touch `test_helper.exs` predates #645, and the three HNSW indexes were still in
+  the test database. The design was sound and is what this change implements; only the claim
+  that it had shipped was false, and it read as settled for long enough that #748 went
+  looking for a different cause. A doc asserting a mechanism it cannot point at is worth
+  less than no doc: verify the citation, not just the reasoning.
+
+  The indexes all still EXIST — nothing drops them; only the plan changes. So do NOT turn
+  `:heavy_read_force_exact_scan` off for this suite, and do NOT add a fifth recall knob. If a
   `left: []` reappears here, it is a NEW defect: `Loopctl.VectorRecallDiagnostics` is still
   wrapped around every assertion that ever produced the signature and fires only on an empty
   result, printing (a) whether the row was VISIBLE as unlimited `count()`s and (b) the

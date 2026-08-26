@@ -19,6 +19,23 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **The hourly embedding reconciler no longer reads the whole `articles` heap to find
+  nothing, and Oban prunes on a five-minute interval instead of every 30 seconds.** Both
+  were measured on the hosted database over the 19 days to 2026-08-25. The reconciler's
+  anti-join spent 168s across 275 runs (4.5% of everything that database did) and returned
+  roughly one row per run, because `length(btrim(body)) > 0` had to detoast every body to
+  answer a question about zero rows; the filter now rides a new partial index and the scan
+  is index-only, 40,968 shared buffers and ~400 ms down to 1,181 and ~76 ms. The Oban
+  pruner ran on the library's 30-second default against a SEVEN-DAY retention: 53,748
+  calls, 457s, 12.1% of that database's total query time, to remove ~5,600 rows a day.
+  **Operator impact:** the deploy adds `articles_tenant_embeddable_inserted_id_idx`
+  (4.6 MB on the hosted corpus) via `CREATE INDEX CONCURRENTLY`, which cannot run inside a
+  transaction and takes about a second at that size; it does not block writes. The
+  migration is re-runnable — it drops a leftover INVALID index from an interrupted build
+  before creating, so a failed release does not wedge later deploys. Terminal
+  Oban jobs are now removed up to five minutes later than before, which is invisible
+  against a seven-day `max_age`. No configuration change is required.
+
 - **`POST /api/v1/channel/claims` now returns FOUR distinct 409 codes where it returned one
   (#707).** `already_claimed` previously covered four unrelated situations, and its body
   says "Do not retry the same ref; move on to other work" — advice that is correct for two
