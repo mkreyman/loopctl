@@ -102,13 +102,22 @@ env:
 #    lib/mix/lib/mix/compilers/elixir.ex writes it at :962, reads it at :104), while a
 #    GitHub cache is shared across runners and a repo sits at as many absolute paths as
 #    there are runners on the host. A restored cache avoided a rebuild only when it
-#    happened to have been saved by a job at the same path.
+#    happened to have been saved by a job at the same path. That is true of the app's own
+#    modules; compiled DEPS survived a foreign-path restore, which is the larger half.
 #
 # Fix: keep the tree (`clean: false` plus an explicit clean that excepts the expensive
 # directories), and drop `_build` from the shared cache so nothing overwrites a runner's
 # own manifest with a foreign one. Each runner's path is stable, so its tree simply
-# stays warm. A runner with no history pays exactly one cold compile — which is what
-# every job paid on every run before.
+# stays warm.
+#
+# WHAT A COLD PATH COSTS, stated accurately. This said a runner with no history "pays
+# exactly one cold compile — which is what every job paid on every run before". Wrong,
+# and generously so. Mix's cwd check governs the PROJECT manifest only; a dependency's
+# compile status comes from a lock fingerprint in
+# `_build/<env>/lib/<dep>/.mix/compile.<scm>`, which has no path component, so the old
+# foreign-path restore forced a rebuild of the app while KEEPING all its compiled deps.
+# A cold path now pays app compile PLUS dep compile. Once per path, still worth it,
+# but not parity.
 #
 # Measured on home_care_billing (PR #1369): compile across a whole run 638s -> under
 # 10s, wall clock 9m44s -> 5m22s. Full write-up, including two remedies that look right
@@ -138,9 +147,23 @@ jobs:
           # immortal on every runner. The PLT exception names the two artifacts rather
           # than the directory, so the tracked dialyzer_ignore.exs is untouched (reset
           # restores it anyway) and untracked cruft in priv/plts is still cleaned.
-          git clean -ffdx -e /_build -e /deps \
-            -e /priv/plts/dialyzer.plt -e /priv/plts/dialyzer.plt.hash \
-            -e /mcp-server/node_modules
+          # The PLT is deliberately NOT excepted, and that is a correction. mix.exs:49
+          # pins `plt_file` to a fixed filename with no toolchain in it, and dialyxir's
+          # staleness gate is a hash of mix.lock plus the app list and nothing else
+          # (deps/dialyxir/lib/mix/tasks/dialyzer.ex:423) -- on a match it prints "PLT is
+          # up to date!" and skips Plt.check entirely. So a PLT surviving an OTP or
+          # Elixir bump gets used against the wrong toolchain: either the "File not
+          # found: ... dialyzer-<old>/ebin/erl_bif_types.beam" this file already
+          # documents, or a silent pass against stale specs. Its own actions/cache key
+          # DOES embed both versions, so letting the cache own it is what keeps it
+          # honest, and deleting it here costs a cache restore rather than a rebuild.
+          #
+          # `-e /mcp-server/node_modules` is gone too: it was inert. Only
+          # mcp-server-ci.yml runs `npm ci`, and all of its jobs are ubuntu-latest.
+          git clean -ffdx -e /_build -e /deps || {
+            echo "clean failed; wiping the workspace so the next run re-clones"
+            find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} + || true
+          }
           # ...but NOT the asset toolchain binaries, even though they live under _build.
           # `tailwind.install --if-missing` / `esbuild.install --if-missing` re-verify
           # only by RUNNING the file and reading its version string. Under the old
@@ -155,20 +178,6 @@ jobs:
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
-
-      - name: Restore dependencies cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            deps
-          # Key on config/*.exs too: deps like phoenix_ecto read parent-app
-          # config (e.g. :exclude_ecto_exceptions_from_plug) at THEIR compile
-          # time, but a config-only change does not mark the dep stale. Without
-          # this, a restored _build can keep a stale dep beam that collides with
-          # our own defimpl and fails `mix compile --warnings-as-errors`. No loose
-          # restore-keys for the same reason — a config change must not silently
-          # reuse a _build compiled under the old config.
-          key: ${{ runner.os }}-${{ runner.environment }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
 
       - name: Install dependencies
         run: mix deps.get
@@ -197,7 +206,9 @@ jobs:
       #
       # TWO layers, because one is not enough and the run that proved it is on record.
       #
-      # 1. A DEDICATED CACHE, which is the actual fix. `_build` is already cached, but
+      # 1. A DEDICATED CACHE, which is the actual fix. (`_build` USED to be cached too;
+      #    it no longer is for any self-hosted job -- see the header. This cache is now
+      #    the only thing that carries these binaries between runners.) But
       #    `actions/cache` only SAVES on a key miss — so a cache first populated by a run
       #    where this step had not yet succeeded never gets the binaries added, and every
       #    later run restores it without them and fetches again. That is why the fault
@@ -280,9 +291,23 @@ jobs:
           # immortal on every runner. The PLT exception names the two artifacts rather
           # than the directory, so the tracked dialyzer_ignore.exs is untouched (reset
           # restores it anyway) and untracked cruft in priv/plts is still cleaned.
-          git clean -ffdx -e /_build -e /deps \
-            -e /priv/plts/dialyzer.plt -e /priv/plts/dialyzer.plt.hash \
-            -e /mcp-server/node_modules
+          # The PLT is deliberately NOT excepted, and that is a correction. mix.exs:49
+          # pins `plt_file` to a fixed filename with no toolchain in it, and dialyxir's
+          # staleness gate is a hash of mix.lock plus the app list and nothing else
+          # (deps/dialyxir/lib/mix/tasks/dialyzer.ex:423) -- on a match it prints "PLT is
+          # up to date!" and skips Plt.check entirely. So a PLT surviving an OTP or
+          # Elixir bump gets used against the wrong toolchain: either the "File not
+          # found: ... dialyzer-<old>/ebin/erl_bif_types.beam" this file already
+          # documents, or a silent pass against stale specs. Its own actions/cache key
+          # DOES embed both versions, so letting the cache own it is what keeps it
+          # honest, and deleting it here costs a cache restore rather than a rebuild.
+          #
+          # `-e /mcp-server/node_modules` is gone too: it was inert. Only
+          # mcp-server-ci.yml runs `npm ci`, and all of its jobs are ubuntu-latest.
+          git clean -ffdx -e /_build -e /deps || {
+            echo "clean failed; wiping the workspace so the next run re-clones"
+            find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} + || true
+          }
           # ...but NOT the asset toolchain binaries, even though they live under _build.
           # `tailwind.install --if-missing` / `esbuild.install --if-missing` re-verify
           # only by RUNNING the file and reading its version string. Under the old
@@ -297,16 +322,6 @@ jobs:
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
-
-      - name: Restore dependencies cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            deps
-          # See lint job: config/*.exs is part of the key so a config-only change
-          # (e.g. :exclude_ecto_exceptions_from_plug) forces a clean recompile of
-          # config-sensitive deps instead of reusing a stale dep beam.
-          key: ${{ runner.os }}-${{ runner.environment }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
 
       - name: Install dependencies
         run: mix deps.get
@@ -446,9 +461,23 @@ jobs:
           # immortal on every runner. The PLT exception names the two artifacts rather
           # than the directory, so the tracked dialyzer_ignore.exs is untouched (reset
           # restores it anyway) and untracked cruft in priv/plts is still cleaned.
-          git clean -ffdx -e /_build -e /deps \
-            -e /priv/plts/dialyzer.plt -e /priv/plts/dialyzer.plt.hash \
-            -e /mcp-server/node_modules
+          # The PLT is deliberately NOT excepted, and that is a correction. mix.exs:49
+          # pins `plt_file` to a fixed filename with no toolchain in it, and dialyxir's
+          # staleness gate is a hash of mix.lock plus the app list and nothing else
+          # (deps/dialyxir/lib/mix/tasks/dialyzer.ex:423) -- on a match it prints "PLT is
+          # up to date!" and skips Plt.check entirely. So a PLT surviving an OTP or
+          # Elixir bump gets used against the wrong toolchain: either the "File not
+          # found: ... dialyzer-<old>/ebin/erl_bif_types.beam" this file already
+          # documents, or a silent pass against stale specs. Its own actions/cache key
+          # DOES embed both versions, so letting the cache own it is what keeps it
+          # honest, and deleting it here costs a cache restore rather than a rebuild.
+          #
+          # `-e /mcp-server/node_modules` is gone too: it was inert. Only
+          # mcp-server-ci.yml runs `npm ci`, and all of its jobs are ubuntu-latest.
+          git clean -ffdx -e /_build -e /deps || {
+            echo "clean failed; wiping the workspace so the next run re-clones"
+            find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} + || true
+          }
           # ...but NOT the asset toolchain binaries, even though they live under _build.
           # `tailwind.install --if-missing` / `esbuild.install --if-missing` re-verify
           # only by RUNNING the file and reading its version string. Under the old
@@ -463,23 +492,6 @@ jobs:
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
-
-      - name: Restore dependencies cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            deps
-          # See lint job: config/*.exs is part of the key so a config-only change
-          # forces a clean recompile of config-sensitive deps instead of reusing a
-          # stale dep beam. No loose restore-keys, for the same reason.
-          #
-          # `-dev` suffix on purpose: this is the ONLY job that runs MIX_ENV=dev. Sharing
-          # the exact key of the MIX_ENV=test jobs means that on a key miss GitHub saves
-          # from whichever job finishes first — if it is this one, the saved _build holds
-          # only _build/dev and every test job then restores a tree with no test artifacts
-          # and recompiles. A distinct key keeps the dev and test build trees from
-          # clobbering each other in the cache.
-          key: ${{ runner.os }}-${{ runner.environment }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}-dev
 
       - name: Install dependencies
         run: mix deps.get
@@ -634,9 +646,23 @@ jobs:
           # immortal on every runner. The PLT exception names the two artifacts rather
           # than the directory, so the tracked dialyzer_ignore.exs is untouched (reset
           # restores it anyway) and untracked cruft in priv/plts is still cleaned.
-          git clean -ffdx -e /_build -e /deps \
-            -e /priv/plts/dialyzer.plt -e /priv/plts/dialyzer.plt.hash \
-            -e /mcp-server/node_modules
+          # The PLT is deliberately NOT excepted, and that is a correction. mix.exs:49
+          # pins `plt_file` to a fixed filename with no toolchain in it, and dialyxir's
+          # staleness gate is a hash of mix.lock plus the app list and nothing else
+          # (deps/dialyxir/lib/mix/tasks/dialyzer.ex:423) -- on a match it prints "PLT is
+          # up to date!" and skips Plt.check entirely. So a PLT surviving an OTP or
+          # Elixir bump gets used against the wrong toolchain: either the "File not
+          # found: ... dialyzer-<old>/ebin/erl_bif_types.beam" this file already
+          # documents, or a silent pass against stale specs. Its own actions/cache key
+          # DOES embed both versions, so letting the cache own it is what keeps it
+          # honest, and deleting it here costs a cache restore rather than a rebuild.
+          #
+          # `-e /mcp-server/node_modules` is gone too: it was inert. Only
+          # mcp-server-ci.yml runs `npm ci`, and all of its jobs are ubuntu-latest.
+          git clean -ffdx -e /_build -e /deps || {
+            echo "clean failed; wiping the workspace so the next run re-clones"
+            find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} + || true
+          }
           # ...but NOT the asset toolchain binaries, even though they live under _build.
           # `tailwind.install --if-missing` / `esbuild.install --if-missing` re-verify
           # only by RUNNING the file and reading its version string. Under the old
@@ -651,16 +677,6 @@ jobs:
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
-
-      - name: Restore dependencies cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            deps
-          # See lint job: config/*.exs is part of the key so a config-only change
-          # (e.g. :exclude_ecto_exceptions_from_plug) forces a clean recompile of
-          # config-sensitive deps instead of reusing a stale dep beam.
-          key: ${{ runner.os }}-${{ runner.environment }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
 
       - name: Install dependencies
         run: mix deps.get
@@ -696,9 +712,23 @@ jobs:
           # immortal on every runner. The PLT exception names the two artifacts rather
           # than the directory, so the tracked dialyzer_ignore.exs is untouched (reset
           # restores it anyway) and untracked cruft in priv/plts is still cleaned.
-          git clean -ffdx -e /_build -e /deps \
-            -e /priv/plts/dialyzer.plt -e /priv/plts/dialyzer.plt.hash \
-            -e /mcp-server/node_modules
+          # The PLT is deliberately NOT excepted, and that is a correction. mix.exs:49
+          # pins `plt_file` to a fixed filename with no toolchain in it, and dialyxir's
+          # staleness gate is a hash of mix.lock plus the app list and nothing else
+          # (deps/dialyxir/lib/mix/tasks/dialyzer.ex:423) -- on a match it prints "PLT is
+          # up to date!" and skips Plt.check entirely. So a PLT surviving an OTP or
+          # Elixir bump gets used against the wrong toolchain: either the "File not
+          # found: ... dialyzer-<old>/ebin/erl_bif_types.beam" this file already
+          # documents, or a silent pass against stale specs. Its own actions/cache key
+          # DOES embed both versions, so letting the cache own it is what keeps it
+          # honest, and deleting it here costs a cache restore rather than a rebuild.
+          #
+          # `-e /mcp-server/node_modules` is gone too: it was inert. Only
+          # mcp-server-ci.yml runs `npm ci`, and all of its jobs are ubuntu-latest.
+          git clean -ffdx -e /_build -e /deps || {
+            echo "clean failed; wiping the workspace so the next run re-clones"
+            find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} + || true
+          }
           # ...but NOT the asset toolchain binaries, even though they live under _build.
           # `tailwind.install --if-missing` / `esbuild.install --if-missing` re-verify
           # only by RUNNING the file and reading its version string. Under the old
@@ -714,39 +744,7 @@ jobs:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
 
-      - name: Restore dependencies cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            deps
-          # See lint job: config/*.exs is part of the key so a config-only change
-          # (e.g. :exclude_ecto_exceptions_from_plug) forces a clean recompile of
-          # config-sensitive deps instead of reusing a stale dep beam.
-          key: ${{ runner.os }}-${{ runner.environment }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
-
-      # runner.name IS PART OF THE KEY, and it has to be. A PLT embeds ABSOLUTE paths
-      # to the OTP install that built it, and every runner has its own _work tree, so
-      # a PLT built under runners/loopctl is invalid under runners/loopctl-3:
-      #
-      #   :dialyzer.run error: File not found:
-      #     /home/github-runner/runners/loopctl/_work/_temp/.setup-beam/otp/lib/
-      #     dialyzer-5.4.0.1/ebin/erl_bif_types.beam
-      #
-      # That is not a hypothetical - it is what this job did on its first beelink run,
-      # having restored on runner loopctl-3 a PLT saved by runner loopctl.
-      #
-      # runner.environment was already here and does NOT cover this: it resolves to
-      # `self-hosted` on every self-hosted runner, and nuc and beelink even use the
-      # SAME directory layout, so the single-runner setup shared a PLT across two
-      # machines quite happily. The bug only appears the moment one repo has a second
-      # runner, which is exactly what moving here required. home_care_billing hit it
-      # first and its ci.yml carries the same fix with the same error quoted.
-      #
-      # Cost: one PLT per runner, rebuilt once each. The restore-keys prefix is
-      # scoped the same way so a stale cross-runner PLT cannot be picked up as a
-      # near-miss either - an unscoped prefix would reintroduce the bug on every
-      # mix.lock change.
-      - name: Restore PLT cache
+      - name: Cache Dialyzer PLT
         uses: actions/cache@v4
         with:
           path: priv/plts/
@@ -1115,9 +1113,23 @@ jobs:
           # immortal on every runner. The PLT exception names the two artifacts rather
           # than the directory, so the tracked dialyzer_ignore.exs is untouched (reset
           # restores it anyway) and untracked cruft in priv/plts is still cleaned.
-          git clean -ffdx -e /_build -e /deps \
-            -e /priv/plts/dialyzer.plt -e /priv/plts/dialyzer.plt.hash \
-            -e /mcp-server/node_modules
+          # The PLT is deliberately NOT excepted, and that is a correction. mix.exs:49
+          # pins `plt_file` to a fixed filename with no toolchain in it, and dialyxir's
+          # staleness gate is a hash of mix.lock plus the app list and nothing else
+          # (deps/dialyxir/lib/mix/tasks/dialyzer.ex:423) -- on a match it prints "PLT is
+          # up to date!" and skips Plt.check entirely. So a PLT surviving an OTP or
+          # Elixir bump gets used against the wrong toolchain: either the "File not
+          # found: ... dialyzer-<old>/ebin/erl_bif_types.beam" this file already
+          # documents, or a silent pass against stale specs. Its own actions/cache key
+          # DOES embed both versions, so letting the cache own it is what keeps it
+          # honest, and deleting it here costs a cache restore rather than a rebuild.
+          #
+          # `-e /mcp-server/node_modules` is gone too: it was inert. Only
+          # mcp-server-ci.yml runs `npm ci`, and all of its jobs are ubuntu-latest.
+          git clean -ffdx -e /_build -e /deps || {
+            echo "clean failed; wiping the workspace so the next run re-clones"
+            find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} + || true
+          }
           # ...but NOT the asset toolchain binaries, even though they live under _build.
           # `tailwind.install --if-missing` / `esbuild.install --if-missing` re-verify
           # only by RUNNING the file and reading its version string. Under the old
@@ -1161,17 +1173,6 @@ jobs:
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
-
-      - name: Restore dependencies cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            deps
-          # Include config/*.exs in the key and NO loose restore-keys — a partial-key
-          # restore would reuse a _build compiled under the old config, keeping a stale
-          # dep beam (phoenix_ecto's Plug.Exception.Postgrex.Error) that collides with our
-          # own defimpl and fails `mix compile --warnings-as-errors`. Matches the other jobs.
-          key: ${{ runner.os }}-${{ runner.environment }}-mix-${{ env.ELIXIR_VERSION }}-${{ env.OTP_VERSION }}-${{ hashFiles('mix.lock', 'config/*.exs') }}
 
       - name: Install dependencies
         run: mix deps.get
