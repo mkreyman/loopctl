@@ -115,8 +115,9 @@ env:
 # and are not (`check_cwd: false`, and bind-mounting the runner work dir): loopctl KB
 # article 09245ceb.
 #
-# NOTE the exception list is per-repo. This repo keeps its PLT in `priv/plts`, not in
-# `_build`, so deleting it would cost a full PLT rebuild every run.
+# NOTE the exception list is per-repo. This repo keeps its PROJECT PLT in `priv/plts`
+# rather than in `_build`, so it needs excepting by name; the dialyxir CORE plts live in
+# each runner's own $MIX_HOME, outside the workspace, and the clean never reached them.
 
 jobs:
   lint:
@@ -132,7 +133,22 @@ jobs:
       # See KEEPING THE COMPILED TREE at the top of this file.
       - name: Clean the workspace, keeping the compiled tree
         run: |
-          git clean -ffdx -e _build -e deps -e priv/plts -e mcp-server/node_modules
+          # Patterns are ANCHORED. Without a leading slash a pattern matches at any
+          # depth, so a future fixture directory named `deps` or `_build` would become
+          # immortal on every runner. The PLT exception names the two artifacts rather
+          # than the directory, so the tracked dialyzer_ignore.exs is untouched (reset
+          # restores it anyway) and untracked cruft in priv/plts is still cleaned.
+          git clean -ffdx -e /_build -e /deps \
+            -e /priv/plts/dialyzer.plt -e /priv/plts/dialyzer.plt.hash \
+            -e /mcp-server/node_modules
+          # ...but NOT the asset toolchain binaries, even though they live under _build.
+          # `tailwind.install --if-missing` / `esbuild.install --if-missing` re-verify
+          # only by RUNNING the file and reading its version string. Under the old
+          # `clean: true` these were scrubbed every job; retaining _build would let a
+          # binary written by a pull_request job be executed by the next push-to-master
+          # job on the same slot, with none of the ref scoping GitHub's cache gives.
+          # They have their own dedicated cache below, so deleting them costs nothing.
+          rm -rf _build/tailwind-linux-x64 _build/esbuild-linux-x64
           git reset --hard HEAD
 
       - uses: erlef/setup-beam@v1
@@ -259,7 +275,22 @@ jobs:
       # See KEEPING THE COMPILED TREE at the top of this file.
       - name: Clean the workspace, keeping the compiled tree
         run: |
-          git clean -ffdx -e _build -e deps -e priv/plts -e mcp-server/node_modules
+          # Patterns are ANCHORED. Without a leading slash a pattern matches at any
+          # depth, so a future fixture directory named `deps` or `_build` would become
+          # immortal on every runner. The PLT exception names the two artifacts rather
+          # than the directory, so the tracked dialyzer_ignore.exs is untouched (reset
+          # restores it anyway) and untracked cruft in priv/plts is still cleaned.
+          git clean -ffdx -e /_build -e /deps \
+            -e /priv/plts/dialyzer.plt -e /priv/plts/dialyzer.plt.hash \
+            -e /mcp-server/node_modules
+          # ...but NOT the asset toolchain binaries, even though they live under _build.
+          # `tailwind.install --if-missing` / `esbuild.install --if-missing` re-verify
+          # only by RUNNING the file and reading its version string. Under the old
+          # `clean: true` these were scrubbed every job; retaining _build would let a
+          # binary written by a pull_request job be executed by the next push-to-master
+          # job on the same slot, with none of the ref scoping GitHub's cache gives.
+          # They have their own dedicated cache below, so deleting them costs nothing.
+          rm -rf _build/tailwind-linux-x64 _build/esbuild-linux-x64
           git reset --hard HEAD
 
       - uses: erlef/setup-beam@v1
@@ -410,7 +441,22 @@ jobs:
       # See KEEPING THE COMPILED TREE at the top of this file.
       - name: Clean the workspace, keeping the compiled tree
         run: |
-          git clean -ffdx -e _build -e deps -e priv/plts -e mcp-server/node_modules
+          # Patterns are ANCHORED. Without a leading slash a pattern matches at any
+          # depth, so a future fixture directory named `deps` or `_build` would become
+          # immortal on every runner. The PLT exception names the two artifacts rather
+          # than the directory, so the tracked dialyzer_ignore.exs is untouched (reset
+          # restores it anyway) and untracked cruft in priv/plts is still cleaned.
+          git clean -ffdx -e /_build -e /deps \
+            -e /priv/plts/dialyzer.plt -e /priv/plts/dialyzer.plt.hash \
+            -e /mcp-server/node_modules
+          # ...but NOT the asset toolchain binaries, even though they live under _build.
+          # `tailwind.install --if-missing` / `esbuild.install --if-missing` re-verify
+          # only by RUNNING the file and reading its version string. Under the old
+          # `clean: true` these were scrubbed every job; retaining _build would let a
+          # binary written by a pull_request job be executed by the next push-to-master
+          # job on the same slot, with none of the ref scoping GitHub's cache gives.
+          # They have their own dedicated cache below, so deleting them costs nothing.
+          rm -rf _build/tailwind-linux-x64 _build/esbuild-linux-x64
           git reset --hard HEAD
 
       - uses: erlef/setup-beam@v1
@@ -583,7 +629,22 @@ jobs:
       # See KEEPING THE COMPILED TREE at the top of this file.
       - name: Clean the workspace, keeping the compiled tree
         run: |
-          git clean -ffdx -e _build -e deps -e priv/plts -e mcp-server/node_modules
+          # Patterns are ANCHORED. Without a leading slash a pattern matches at any
+          # depth, so a future fixture directory named `deps` or `_build` would become
+          # immortal on every runner. The PLT exception names the two artifacts rather
+          # than the directory, so the tracked dialyzer_ignore.exs is untouched (reset
+          # restores it anyway) and untracked cruft in priv/plts is still cleaned.
+          git clean -ffdx -e /_build -e /deps \
+            -e /priv/plts/dialyzer.plt -e /priv/plts/dialyzer.plt.hash \
+            -e /mcp-server/node_modules
+          # ...but NOT the asset toolchain binaries, even though they live under _build.
+          # `tailwind.install --if-missing` / `esbuild.install --if-missing` re-verify
+          # only by RUNNING the file and reading its version string. Under the old
+          # `clean: true` these were scrubbed every job; retaining _build would let a
+          # binary written by a pull_request job be executed by the next push-to-master
+          # job on the same slot, with none of the ref scoping GitHub's cache gives.
+          # They have their own dedicated cache below, so deleting them costs nothing.
+          rm -rf _build/tailwind-linux-x64 _build/esbuild-linux-x64
           git reset --hard HEAD
 
       - uses: erlef/setup-beam@v1
@@ -630,7 +691,22 @@ jobs:
       # See KEEPING THE COMPILED TREE at the top of this file.
       - name: Clean the workspace, keeping the compiled tree
         run: |
-          git clean -ffdx -e _build -e deps -e priv/plts -e mcp-server/node_modules
+          # Patterns are ANCHORED. Without a leading slash a pattern matches at any
+          # depth, so a future fixture directory named `deps` or `_build` would become
+          # immortal on every runner. The PLT exception names the two artifacts rather
+          # than the directory, so the tracked dialyzer_ignore.exs is untouched (reset
+          # restores it anyway) and untracked cruft in priv/plts is still cleaned.
+          git clean -ffdx -e /_build -e /deps \
+            -e /priv/plts/dialyzer.plt -e /priv/plts/dialyzer.plt.hash \
+            -e /mcp-server/node_modules
+          # ...but NOT the asset toolchain binaries, even though they live under _build.
+          # `tailwind.install --if-missing` / `esbuild.install --if-missing` re-verify
+          # only by RUNNING the file and reading its version string. Under the old
+          # `clean: true` these were scrubbed every job; retaining _build would let a
+          # binary written by a pull_request job be executed by the next push-to-master
+          # job on the same slot, with none of the ref scoping GitHub's cache gives.
+          # They have their own dedicated cache below, so deleting them costs nothing.
+          rm -rf _build/tailwind-linux-x64 _build/esbuild-linux-x64
           git reset --hard HEAD
 
       - uses: erlef/setup-beam@v1
@@ -1034,7 +1110,22 @@ jobs:
       # See KEEPING THE COMPILED TREE at the top of this file.
       - name: Clean the workspace, keeping the compiled tree
         run: |
-          git clean -ffdx -e _build -e deps -e priv/plts -e mcp-server/node_modules
+          # Patterns are ANCHORED. Without a leading slash a pattern matches at any
+          # depth, so a future fixture directory named `deps` or `_build` would become
+          # immortal on every runner. The PLT exception names the two artifacts rather
+          # than the directory, so the tracked dialyzer_ignore.exs is untouched (reset
+          # restores it anyway) and untracked cruft in priv/plts is still cleaned.
+          git clean -ffdx -e /_build -e /deps \
+            -e /priv/plts/dialyzer.plt -e /priv/plts/dialyzer.plt.hash \
+            -e /mcp-server/node_modules
+          # ...but NOT the asset toolchain binaries, even though they live under _build.
+          # `tailwind.install --if-missing` / `esbuild.install --if-missing` re-verify
+          # only by RUNNING the file and reading its version string. Under the old
+          # `clean: true` these were scrubbed every job; retaining _build would let a
+          # binary written by a pull_request job be executed by the next push-to-master
+          # job on the same slot, with none of the ref scoping GitHub's cache gives.
+          # They have their own dedicated cache below, so deleting them costs nothing.
+          rm -rf _build/tailwind-linux-x64 _build/esbuild-linux-x64
           git reset --hard HEAD
 
       # Isolation, replacing the per-job fresh container (see the note on `runs-on`).
