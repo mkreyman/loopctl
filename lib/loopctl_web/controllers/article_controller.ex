@@ -275,7 +275,12 @@ defmodule LoopctlWeb.ArticleController do
         "entirely). An unrecognized value is treated as `full`. `potential_conflicts` is " <>
         "returned in ALL THREE modes, itself capped at #{@max_conflicts} " <>
         "(highest similarity first, then oldest-first) with `conflicts_total` / " <>
-        "`conflicts_truncated`.",
+        "`conflicts_truncated`.\n\n" <>
+        "**`previous_title` (#765).** Non-null only on an article the nightly consolidation " <>
+        "pass retitled from its own content, where it carries the placeholder title that " <>
+        "was replaced. It is the UNDO record for that unattended write, so it is a column " <>
+        "rather than a `metadata` key and a PATCH cannot erase it; restore it by PATCHing " <>
+        "`title` back. Read-only — it is not accepted on create or update.",
     parameters: [
       id: [
         in: :path,

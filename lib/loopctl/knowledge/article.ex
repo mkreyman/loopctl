@@ -79,6 +79,19 @@ defmodule Loopctl.Knowledge.Article do
     # the marker. NEVER add this to a `cast` list.
     field :consolidation_retracted_at, :utc_datetime_usec
 
+    # The DURABLE undo record for the nightly `:generic_title` retitle: the title that
+    # `Loopctl.Knowledge.Consolidation` replaced, written by `retitle_changeset/2` and by
+    # nothing else.
+    #
+    # A COLUMN rather than a `metadata` key for the same reason as the field above, and it is
+    # load-bearing HERE in a way it is not there: what licenses an unattended machine retitle
+    # at all is that it can be undone, so an undo record an ordinary caller PATCH erases is
+    # not a record. `metadata` is cast and whole-map-replaced, and the audit_log's `old_state`
+    # carries the replaced title only until `:audit_retention_days` drops the partition.
+    #
+    # NEVER add this to a `cast` list.
+    field :previous_title, :string
+
     field :embedding, Pgvector.Ecto.Vector, load_in_query: false
     # Virtual boolean projection of `not is_nil(embedding)` — lets the bulk-embedding
     # path (US-37.4) null-check presence WITHOUT transferring the 1536-dim vector for
@@ -193,7 +206,12 @@ defmodule Loopctl.Knowledge.Article do
     )
     |> unique_constraint([:tenant_id, :slug],
       name: :articles_tenant_slug_idx,
-      message: "has already been taken for this tenant"
+      message: "has already been taken for this tenant",
+      # Without it the violation lands on `:tenant_id` — the first field of the index — which
+      # is the same misleading attribution `:articles_tenant_title_active_idx` was already
+      # corrected for, and it reaches an operator as `[:tenant_id]` in the consolidation
+      # retitle's rejection log. `Loopctl.Projects.Project` sets it for the same reason.
+      error_key: :slug
     )
   end
 
@@ -242,8 +260,65 @@ defmodule Loopctl.Knowledge.Article do
     )
     |> unique_constraint([:tenant_id, :slug],
       name: :articles_tenant_slug_idx,
-      message: "has already been taken for this tenant"
+      message: "has already been taken for this tenant",
+      # Without it the violation lands on `:tenant_id` — the first field of the index — which
+      # is the same misleading attribution `:articles_tenant_title_active_idx` was already
+      # corrected for, and it reaches an operator as `[:tenant_id]` in the consolidation
+      # retitle's rejection log. `Loopctl.Projects.Project` sets it for the same reason.
+      error_key: :slug
     )
+  end
+
+  @doc """
+  Changeset for the nightly consolidation pass's `:generic_title` retitle.
+
+  `update_changeset/2` plus the two things that make an UNATTENDED, machine-authored title
+  change safe and coherent, neither of which an ordinary caller edit wants:
+
+  1. **It stamps `:previous_title`** — the durable undo record. What licenses
+     `Loopctl.Knowledge.Consolidation` to retitle a placeholder without a human is that the
+     write is reversible, so the record of what to restore must outlive an ordinary caller
+     `PATCH`. It is a COLUMN and is not castable anywhere; this function is its only writer.
+     The `consolidation_title_generated` MARKER stays on `metadata` deliberately — that one
+     is advisory (it answers "is this title ours to replace"), and losing it fails SAFE, by
+     declining a future retitle rather than by performing an unrecorded one.
+
+  2. **It regenerates `:slug`** — `maybe_generate_slug/1` fires only when the slug is absent,
+     so `update_changeset/2` leaves a retitled article on the slug derived from its old
+     title FOREVER. On this path the old title is a placeholder by construction, so the old
+     slug is `untitled-a1b2c3` and no reader is served by keeping it. It is scoped to THIS
+     changeset rather than added to `update_changeset/2` for the obvious reason: a slug is a
+     URL, and silently rotating it on every human title edit would break every standing link
+     in the wiki to buy nothing.
+
+  Both fire only when `:title` actually changes, so a metadata-only write through this
+  function neither stamps an undo record nor rotates a URL.
+
+  A regenerated slug carries a random suffix and so effectively never collides — but
+  `update_changeset/2`'s `unique_constraint`s on both slug indexes are inherited, so if one
+  ever does, the write comes back `{:error, changeset}` tagged `[:slug]` and the caller
+  skips exactly as it does for a taken title. It is never an exception.
+  """
+  @spec retitle_changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+  def retitle_changeset(article, attrs) do
+    article
+    |> update_changeset(attrs)
+    |> stamp_previous_title(article)
+    |> regenerate_slug()
+  end
+
+  defp stamp_previous_title(changeset, article) do
+    case get_change(changeset, :title) do
+      nil -> changeset
+      _changed -> put_change(changeset, :previous_title, article.title)
+    end
+  end
+
+  defp regenerate_slug(changeset) do
+    case get_change(changeset, :title) do
+      title when is_binary(title) and title != "" -> maybe_put_generated_slug(changeset, title)
+      _ -> changeset
+    end
   end
 
   @doc false

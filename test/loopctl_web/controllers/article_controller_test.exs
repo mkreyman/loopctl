@@ -1199,6 +1199,30 @@ defmodule LoopctlWeb.ArticleControllerTest do
   end
 
   describe "GET /api/v1/articles/:id" do
+    test "exposes previous_title, so the retitle's undo record is readable", %{conn: conn} do
+      # A durable undo record nobody can read is not an undo. The consolidation retitle is
+      # licensed by reversibility, and reversing it means PATCHing this value back into
+      # `title` — which requires an operator being able to SEE it. It is on the full read
+      # only; `article_summary/1` (the list path) does not pay for a field that is null on
+      # nearly every article.
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      article =
+        tenant.id
+        |> then(&fixture(:article, %{tenant_id: &1, title: "A machine-generated title"}))
+        |> Ecto.Changeset.change(%{previous_title: "Untitled"})
+        |> Loopctl.AdminRepo.update!()
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles/#{article.id}")
+        |> json_response(200)
+
+      assert body["data"]["previous_title"] == "Untitled"
+    end
+
     test "returns article with preloaded links", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})

@@ -15,6 +15,7 @@ defmodule Loopctl.Knowledge.ConsolidationGenericTitleTest do
   import Ecto.Query
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.Consolidation
   alias Loopctl.MockContentExtractor
@@ -82,18 +83,55 @@ defmodule Loopctl.Knowledge.ConsolidationGenericTitleTest do
     end
 
     test "records the title it replaced, and marks the new one machine-generated" do
-      # A convenience, not a guarantee: `metadata` is cast as a whole map, so an ordinary
-      # PATCH erases both keys. What it buys is the READING — a later pass or an operator can
-      # tell this pass's work from a person's, as StructuralLinks' `hub_title_generated` does.
+      # Two records, deliberately in two places. The REPLACED TITLE is the undo record and
+      # goes on a column; the machine-generated MARKER is advisory (it answers "is this ours
+      # to replace"), is allowed to be erasable, and keeps StructuralLinks' shape.
       tenant = fixture(:tenant)
       article = placeholder(tenant.id)
       expect_title(@specific_title)
 
       assert %{applied: 1} = Consolidation.apply_confirmed_generic_titles(tenant.id)
 
-      metadata = reload(article.id).metadata
-      assert metadata["consolidation_previous_title"] == "Untitled"
-      assert metadata["consolidation_title_generated"] == @specific_title
+      retitled = reload(article.id)
+      assert retitled.previous_title == "Untitled"
+      assert retitled.metadata["consolidation_title_generated"] == @specific_title
+    end
+
+    test "the undo record SURVIVES an ordinary metadata-replacing update" do
+      # The whole reason it is a COLUMN. `metadata` is cast as a WHOLE MAP, so one ordinary
+      # `PATCH /api/v1/knowledge/:id` replaces it — which used to destroy the record of what
+      # to restore while leaving the retitle standing. Reversibility is the only thing
+      # licensing an unattended machine retitle, so an erasable undo record is not one.
+      # The advisory marker going away in the same call is the contrast, not a defect.
+      tenant = fixture(:tenant)
+      article = placeholder(tenant.id)
+      expect_title(@specific_title)
+
+      assert %{applied: 1} = Consolidation.apply_confirmed_generic_titles(tenant.id)
+
+      {:ok, _} =
+        Knowledge.update_article(tenant.id, article.id, %{
+          metadata: %{"visibility" => "shared"}
+        })
+
+      patched = reload(article.id)
+      assert patched.previous_title == "Untitled"
+      assert patched.title == @specific_title
+      refute Map.has_key?(patched.metadata, "consolidation_title_generated")
+    end
+
+    test "regenerates the slug, so a placeholder slug does not outlive the placeholder title" do
+      # `maybe_generate_slug/1` runs only in `create_changeset/2`, so a retitled article kept
+      # its `untitled-a1b2c3` slug forever — and this step is what makes that fire unattended,
+      # at scale, on exactly the articles whose slug is a placeholder.
+      tenant = fixture(:tenant)
+      article = placeholder(tenant.id)
+      assert article.slug =~ ~r/\Auntitled-/
+      expect_title(@specific_title)
+
+      assert %{applied: 1} = Consolidation.apply_confirmed_generic_titles(tenant.id)
+
+      assert reload(article.id).slug =~ ~r/\Aecto-changesets-validate-before-they-cast-/
     end
   end
 

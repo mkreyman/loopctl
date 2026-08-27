@@ -74,9 +74,15 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
   (`KnowledgeLintWorker.judge_redundant_conflicts/2`), and a second cap here would withhold
   pairs from that consumer rather than protect anything. Note what that consumer's bound
   actually is (#761): a WALL CLOCK, not the count cap it looks like, so the drain is roughly
-  1,400 pairs a night gross and ~900 net of the promoter's own share — NOT a queue that
+  1,260 pairs a night gross and ~760 net of the promoter's own share — NOT a queue that
   converges by arithmetic regardless of inflow. It absorbs a burst over one to three weeks;
-  an inflow sustained above ~900 a night would need a bound, and this is where one would go.
+  an inflow sustained above ~760 a night would need a bound, and this is where one would go.
+
+  Both figures are DERIVED from the judge's wall-clock budget and move whenever it does —
+  #765 carved a retitle reserve out of the same job timeout and took the budget from 20
+  minutes to 18. They are restated here rather than re-derived: the arithmetic and its
+  measurement live once, in the note beside `KnowledgeLintWorker`'s
+  `@default_judge_budget_ms`, which is the only place to change them.
 
   Two things this bound is NOT, stated because both are easy to read into it:
 
@@ -237,8 +243,10 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
         # threshold and its own consumer — `KnowledgeLintWorker.judge_redundant_conflicts/2`
         # drains it — so a second cap here would silently withhold pairs from that consumer.
         # What it would NOT do is make the queue converge: since #761 the drain's real bound
-        # is a wall clock (~1,400 pairs a night gross, ~900 net of the promoter), not the
-        # count cap, so this queue absorbs a burst rather than converging by arithmetic.
+        # is a wall clock (~1,260 pairs a night gross, ~760 net of the promoter — derived
+        # from `KnowledgeLintWorker`'s `@default_judge_budget_ms`, where the arithmetic
+        # lives), not the count cap, so this queue absorbs a burst rather than converging
+        # by arithmetic.
         relates =
           build_links(
             article.id,

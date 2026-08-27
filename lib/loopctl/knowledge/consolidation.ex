@@ -5,7 +5,8 @@ defmodule Loopctl.Knowledge.Consolidation do
   It REPORTS on two defect classes and APPLIES both, each with the write its own
   reversibility licenses and neither without two consecutive runs agreeing:
   `:duplicate_capture` as `unpublish` (`apply_confirmed_duplicates/2`), `:generic_title` as a
-  retitle from the article's own content, with the previous title recorded on the article
+  retitle from the article's own content, with the previous title recorded on the article's
+  own `previous_title` COLUMN — where a caller `PATCH` cannot erase it, unlike `metadata`
   (`apply_confirmed_generic_titles/2`). Those two functions carry the whole safety model
   between them.
 
@@ -18,7 +19,8 @@ defmodule Loopctl.Knowledge.Consolidation do
   articles involved and carrying a QUOTED excerpt from each as evidence. It writes
   its findings to `consolidation_reports` / `consolidation_proposals`. The only other
   writes it can make are the two confirmed applies above — an `unpublish`, and a `title`
-  (plus its own provenance keys on that article's metadata); it never writes
+  (plus that article's regenerated `slug`, its `previous_title` undo record, and one
+  provenance marker on its metadata); it never writes
   `article_links` or `conflict_resolutions` (the nightly lint judge owns conflicts).
   There is no human approve/reject stage and there will not be one (#605 supersedes
   #594): a queue whose only consumer is a human nobody staffs is the failure this
@@ -1548,7 +1550,7 @@ defmodule Loopctl.Knowledge.Consolidation do
   # exists to prevent on the other class); a curation that landed during the call is not
   # silently cleared by the title change; and the metadata merged into is the LIVE map, so a
   # concurrent `visibility` flip or ingestion write is not reverted by a snapshot one round
-  # trip old. `consolidation_previous_title` then names what was really replaced.
+  # trip old. `previous_title` then names what was really replaced.
   #
   # This narrows the window to the statement pair below rather than closing it: a
   # precondition ON the update would have to live in `Knowledge.update_article/4`, which
@@ -1719,18 +1721,24 @@ defmodule Loopctl.Knowledge.Consolidation do
     |> String.trim()
   end
 
-  # The previous title is recorded on the article's own metadata BEFORE it is replaced, and
-  # the new one is marked as machine-generated — the same shape
-  # `Loopctl.Knowledge.StructuralLinks` uses (`hub_title_generated`), so a later pass, an
-  # operator, or a human reading the row can tell this pass's work from a person's.
+  # The two records this write leaves behind are NOT the same kind of thing, and the split is
+  # the whole point of `Knowledge.retitle_article/4`:
   #
-  # It is a CONVENIENCE, not a guarantee, and the difference is worth stating because the
-  # opposite is easy to assume. `metadata` is cast as a whole map, so one ordinary
-  # `PATCH /api/v1/knowledge/:id` erases both keys — the `lifecycle_entered_at` lesson
-  # (CLAUDE.md), which is why a marker that MUST survive a caller PATCH gets a COLUMN of its
-  # own. The audit log's `old_state` carries the replaced title too and is retention-bounded.
-  # What licenses this write is not that the previous title is stored forever; it is that a
-  # title is replaceable at all, by anyone, at any time — unlike `:archived`.
+  # - The REPLACED TITLE — what an undo restores — goes on the `previous_title` COLUMN,
+  #   stamped by `Article.retitle_changeset/2` and castable from nowhere. What licenses this
+  #   pass to retitle without a human is REVERSIBILITY, so an undo record an ordinary
+  #   `PATCH /api/v1/knowledge/:id` can erase is not a record: `metadata` is cast as a whole
+  #   MAP, so one agent request would have destroyed it while leaving the retitle standing.
+  #   That is the `stories.lifecycle_entered_at` lesson (CLAUDE.md) reached a second time.
+  #   The audit log's `old_state` carries the replaced title too, but only until
+  #   `:audit_retention_days` drops the partition.
+  #
+  # - The MACHINE-GENERATED MARKER stays on `metadata`, the same shape
+  #   `Loopctl.Knowledge.StructuralLinks` uses (`hub_title_generated`), so a later pass or a
+  #   human reading the row can tell this pass's work from a person's. It is advisory and it
+  #   is allowed to be erasable, because it only answers "is this title ours to replace" and
+  #   losing it fails SAFE — a future night declines the retitle rather than making an
+  #   unrecorded one.
   #
   # The metadata map is MERGED, never replaced: `update_changeset/2` casts `:metadata` as a
   # whole map, so building the attrs from anything but the LIVE map (re-read by
@@ -1741,13 +1749,10 @@ defmodule Loopctl.Knowledge.Consolidation do
 
     attrs = %{
       title: title,
-      metadata:
-        metadata
-        |> Map.put("consolidation_title_generated", title)
-        |> Map.put("consolidation_previous_title", article.title)
+      metadata: Map.put(metadata, "consolidation_title_generated", title)
     }
 
-    case Knowledge.update_article(tenant_id, article.id, attrs,
+    case Knowledge.retitle_article(tenant_id, article.id, attrs,
            actor_type: "system",
            actor_label: "worker:consolidation"
          ) do
@@ -1755,7 +1760,7 @@ defmodule Loopctl.Knowledge.Consolidation do
         Logger.info(
           "Consolidation: tenant=#{tenant_id} applied generic_title proposal " <>
             "##{proposal.number} — retitled #{article.id} from its content. The previous " <>
-            "title is on the article's metadata; reversible via PATCH."
+            "title is on the article's previous_title column; reversible via PATCH."
         )
 
         :applied
@@ -1775,7 +1780,7 @@ defmodule Loopctl.Knowledge.Consolidation do
   # collision therefore reads `[:title]`.
   #
   # No catch-all clause, deliberately, and this is the one place in the module without one:
-  # `Knowledge.update_article/4`'s return type is CLOSED at `{:ok, article} | {:error,
+  # `Knowledge.retitle_article/4`'s return type is CLOSED at `{:ok, article} | {:error,
   # :not_found} | {:error, changeset}`, so a wildcard here is unreachable and dialyzer says
   # so. If that shape ever gains a member, the FunctionClauseError is contained by
   # `tally_retitle/4`'s rescue — one article counted `failed` and logged, never a lost run —

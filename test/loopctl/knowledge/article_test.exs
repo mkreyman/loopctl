@@ -604,6 +604,119 @@ defmodule Loopctl.Knowledge.ArticleTest do
     end
   end
 
+  describe "retitle_changeset/2 — the consolidation pass's governed retitle" do
+    defp retitleable(tenant_id, title) do
+      %Article{tenant_id: tenant_id}
+      |> Article.create_changeset(%{title: title, body: "Body about Ecto.", category: :pattern})
+      |> Loopctl.AdminRepo.insert!()
+    end
+
+    test "stamps previous_title with the title it replaced" do
+      # The DURABLE half of the undo record. It is a column precisely so the next test's
+      # metadata replacement cannot reach it.
+      tenant = fixture(:tenant)
+      article = retitleable(tenant.id, "Untitled")
+
+      cs = Article.retitle_changeset(article, %{title: "Ecto changesets validate then cast"})
+
+      assert Ecto.Changeset.get_change(cs, :previous_title) == "Untitled"
+    end
+
+    test "does NOT stamp previous_title when the title is unchanged" do
+      # A metadata-only write through this function is not a retitle, and recording an undo
+      # record for it would overwrite a real one with a no-op.
+      tenant = fixture(:tenant)
+      article = retitleable(tenant.id, "Untitled")
+
+      cs = Article.retitle_changeset(article, %{metadata: %{"a" => "b"}})
+
+      assert Ecto.Changeset.get_change(cs, :previous_title) == nil
+    end
+
+    test "regenerates the slug from the new title" do
+      # `maybe_generate_slug/1` fires only on an ABSENT slug, so without this the article
+      # keeps the slug derived from its placeholder title forever — and this pass runs
+      # unattended on exactly the articles whose slug is a placeholder.
+      tenant = fixture(:tenant)
+      article = retitleable(tenant.id, "Untitled")
+      assert article.slug =~ ~r/\Auntitled-/
+
+      cs = Article.retitle_changeset(article, %{title: "Ecto changesets validate then cast"})
+
+      slug = Ecto.Changeset.get_change(cs, :slug)
+      assert slug =~ ~r/\Aecto-changesets-validate-then-cast-/
+      refute slug == article.slug
+    end
+
+    test "does NOT rotate the slug when the title is unchanged" do
+      tenant = fixture(:tenant)
+      article = retitleable(tenant.id, "Untitled")
+
+      cs = Article.retitle_changeset(article, %{metadata: %{"a" => "b"}})
+
+      assert Ecto.Changeset.get_change(cs, :slug) == nil
+    end
+
+    test "update_changeset/2 still leaves the slug alone on a title change" do
+      # The scoping decision, pinned. A slug is a URL: rotating it on every human title edit
+      # would break every standing wiki link to buy nothing. Regeneration belongs to the
+      # unattended path that created the problem, not to the shared agent-facing one.
+      tenant = fixture(:tenant)
+      article = retitleable(tenant.id, "Untitled")
+
+      cs = Article.update_changeset(article, %{title: "A human's considered new title"})
+
+      assert Ecto.Changeset.get_change(cs, :slug) == nil
+    end
+
+    test "previous_title is castable from NOWHERE — not create, not update" do
+      # The column is the undo record only because a caller cannot reach it. If it were
+      # castable, one `PATCH {"previous_title": ...}` would rewrite what an undo restores,
+      # which is strictly worse than the erasable metadata key it replaced. `retitle_changeset/2`
+      # is its only writer, and it writes it with `put_change/3`.
+      tenant = fixture(:tenant)
+      article = retitleable(tenant.id, "Untitled")
+
+      created =
+        Article.create_changeset(%Article{tenant_id: tenant.id}, %{
+          title: "Fresh",
+          body: "Body",
+          category: :pattern,
+          previous_title: "Injected"
+        })
+
+      updated = Article.update_changeset(article, %{previous_title: "Injected"})
+
+      assert Ecto.Changeset.get_change(created, :previous_title) == nil
+      assert Ecto.Changeset.get_change(updated, :previous_title) == nil
+    end
+
+    test "a slug collision comes back as a changeset error, never an exception" do
+      # The generated slug carries a random suffix, so a collision is vanishingly unlikely —
+      # but `update_changeset/2`'s slug `unique_constraint`s are inherited so that when one
+      # happens it lands in the same `{:error, changeset}` branch a taken title does, and
+      # `Consolidation.write_title/4` skips. Made deterministic by reading the slug this
+      # changeset generated and planting it on another article before the update runs.
+      tenant = fixture(:tenant)
+      article = retitleable(tenant.id, "Untitled")
+
+      cs = Article.retitle_changeset(article, %{title: "Ecto changesets validate then cast"})
+      taken = Ecto.Changeset.get_change(cs, :slug)
+
+      %Article{tenant_id: tenant.id}
+      |> Article.create_changeset(%{
+        title: "Incumbent holding that slug",
+        body: "Body",
+        category: :pattern,
+        slug: taken
+      })
+      |> Loopctl.AdminRepo.insert!()
+
+      assert {:error, failed} = Loopctl.AdminRepo.update(cs)
+      assert errors_on(failed)[:slug]
+    end
+  end
+
   describe "schema associations" do
     test "declares outgoing_links association" do
       assoc = Article.__schema__(:association, :outgoing_links)
