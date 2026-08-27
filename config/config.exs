@@ -962,9 +962,10 @@ config :loopctl, :knowledge_tag_backfill_concurrency, 2
 # key, a provider outage or an unparseable reply, so a deployment that cannot use it is
 # exactly where it was. Cost is per FLAGGED PAIR, not per search, and is bounded by BOTH the
 # judgement cap (`:knowledge_lint_max_conflict_judgements`, 2000/night) and the wall-clock
-# budget below. It used to say "~450/day in practice" and lean on the count cap alone; the
-# practice changed on 2026-08-20 — 15,246 pairs arrived in four days through the ingestion
-# novelty gate, which no promoter cap bounds — and the count cap held nothing (#761).
+# budget below. It used to say "~450/day in practice" and lean on the count cap alone; on
+# 2026-08-20 a BURST through the ingestion novelty gate, which no promoter cap bounds, put
+# 15,246 pairs in over four days and the count cap held nothing (#761). Take the burst-vs-
+# rate reading from the budget comment below, never from that figure on its own.
 config :loopctl, :knowledge_conflict_judge_enabled, true
 config :loopctl, :knowledge_conflict_judge, Loopctl.Knowledge.ConflictJudge.Llm
 # Concurrent judgements per nightly run. Small on purpose: the limit on the other side is a
@@ -978,15 +979,21 @@ config :loopctl, :knowledge_conflict_judge_concurrency, 2
 # cap above counts ATTEMPTS; this counts TIME, which is what a step whose per-item cost is
 # an outbound provider call really spends. Measured in production 2026-08-27 on the
 # 86k-article tenant, one judgement is ~1.7 s wall / ~0.85 s at concurrency 2, so 20 minutes
-# drains ~1,400 pairs a night, which covers the promoter's 500/night with room to spare.
+# drains ~1,400 pairs a night GROSS — ~900 net of the promoter's own 500/night cap, which
+# feeds the same queue.
 #
 # The ingestion-time novelty gate is a SECOND producer that no promoter cap bounds, but its
-# #761 numbers are a BURST and not a rate: flags per day were a flat 500 through 08-19, then
-# 8,569 / 1,506 / 656 / 4,515 on 08-20 through 08-23, then ZERO on 08-24 through 08-27. A
-# burst of that shape truncates some nights, says so, and drains at ~1,400/night until it is
-# caught up. Only an inflow sustained above the drain would need a bound of its own, and the
-# reading that would say so — never yet observed — is `conflicts_judge_candidates` rising run
-# over run with `conflicts_judge_count_capped` or `conflicts_judge_budget_exhausted` set.
+# #761 numbers are a BURST and not a rate: TOTAL flags per day were a flat 500 through 08-19
+# (the promoter saturating its cap), then 8,569 / 1,506 / 656 / 4,515 on 08-20 through 08-23,
+# then zero on 08-24 through 08-27, with the backlog down to 227 by 08-27. A burst of that
+# shape truncates some nights, says so, and drains at ~900-1,400/night until it is caught up
+# — 15,246 takes roughly seventeen nights, and its causes (a tag backfill, a structural-
+# linking pass) are operator-started and repeatable. Only an inflow sustained above the drain
+# needs a bound of its own, and the reading that says so is `conflicts_judge_count_capped` /
+# `conflicts_judge_budget_exhausted` STAYING SET beyond the nights a burst of known size
+# needs — NOT `conflicts_judge_candidates` rising, which saturates at the judgement cap by
+# construction and reads flat on a queue of any size above it. Both flags shipped with this
+# budget in #762 and no night has reported through them yet, so their silence is not evidence.
 #
 # `Loopctl.Workers.KnowledgeLintWorker.timeout/1` is DERIVED from this value plus a
 # five-minute reserve for the rest of the night. The value itself is CLAMPED so that sum

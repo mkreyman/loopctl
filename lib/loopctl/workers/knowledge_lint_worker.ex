@@ -155,39 +155,56 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   @default_orphan_link_threshold 0.5
   @default_max_conflict_promotions 500
 
-  # The DRAIN for auto-generated `potential_conflict` links, and it is deliberately LARGER
-  # than the promotion cap above so the queue converges instead of oscillating. At 500
-  # promoted and 2000 judged per night the backlog falls by 1500/night; equal caps would
-  # merely hold the line at whatever level it had already reached.
+  # The SECONDARY drain bound for auto-generated `potential_conflict` links: larger than the
+  # promotion cap above, so a count can never be what holds the queue level. It is not the
+  # drain, though — 2000 judgements is ~28 minutes at ~0.85 s each and the wall clock below
+  # cuts in first (#761). The drain that actually holds is ~1,400 a night, ~900 net of the
+  # promoter; see `@default_judge_budget_ms`. This number's remaining job is bounding the
+  # candidate query.
   @default_max_conflict_judgements 2000
 
   # The bound that actually holds, and the one this step never had (#761). `cap` above
   # counts ATTEMPTS; this counts TIME, which is what a step whose per-item cost is an
   # outbound provider call is really spending. Measured in production 2026-08-27 on the
   # 86k-article tenant: one judgement is ~1.7 s wall, ~0.85 s at concurrency 2, so 20
-  # minutes drains ~1,400 pairs a night.
-  #
-  # A drain of ~1,400 covers `promote_conflicts/1` (at most
-  # `@default_max_conflict_promotions`, 500 a night) with room to spare, which is what makes
-  # the queue converge in the steady state.
+  # minutes drains ~1,400 pairs a night GROSS. `promote_conflicts/1` feeds the same queue up
+  # to `@default_max_conflict_promotions` (500) a night, so against an existing backlog the
+  # NET drain is ~900 — and 500 is a CAP, not a rate (2026-08-27 measured the promoter at 0
+  # candidates), so ~900 is the worst case and ~1,400 the best.
   #
   # The SECOND producer is the ingestion-time novelty gate, and no promoter cap bounds it.
-  # Do not read its #761 numbers as a rate: flags created per day were a flat 500 through
-  # 08-19, then 8,569 / 1,506 / 656 / 4,515 on 08-20 through 08-23, then **ZERO on 08-24
-  # through 08-27** (measured, 2026-08-27). That was a BURST — a corpus tag backfill and a
-  # structural-linking pass landing together — not a nightly inflow, and averaging its four
-  # days into "~3,800 a night" is a mistake this comment made until it was checked against
-  # the per-day counts.
+  # Do not read its #761 numbers as a rate. TOTAL flags created per day — both producers —
+  # were a flat 500 through 08-19 (the promoter saturating its own cap), then 8,569 / 1,506
+  # / 656 / 4,515 on 08-20 through 08-23, then zero on 08-24 through 08-27, with the backlog
+  # itself down to 227 by 08-27. So ~13,000 of the 15,246 was a BURST — a corpus tag
+  # backfill and a structural-linking pass landing together — and averaging four days of it
+  # into "~3,800 a night" is a mistake this comment made until the per-day counts were
+  # checked. Weigh the zeros lightly on their own: the judge was dying nightly across that
+  # same window, so it is the drained backlog, not the zeros, that says the burst ended.
   #
-  # So a burst is absorbed rather than fatal: it truncates some nights, says so, and drains
-  # at ~1,400 a night until it is caught up (the 15,246-flag burst clears in about eleven).
+  # A burst is therefore absorbed rather than fatal: it truncates some nights, says so, and
+  # drains at ~900-1,400 a night until it is caught up — 15,246 takes roughly SEVENTEEN
+  # nights, not eleven, because the promoter keeps its share of the drain. That holds only
+  # while a fresh burst does not land before the last one clears, and both causes are
+  # operator-started and repeatable (`TagBackfillWorker` is deliberately not on a cron), so
+  # a re-run means another ~17 truncated nights rather than a fault. The broken 3x10-minute
+  # path incidentally judged 1,700-2,800 a night by dying three times; it also lost the
+  # night's audit event and re-spent the nightly caps per attempt, so that is not a
+  # throughput to miss.
+  #
   # What no value HERE could fix is an inflow that ran above the drain INDEFINITELY —
   # `timeout/1` is clamped below the Lifeline window, so ~20 minutes is a ceiling rather
   # than a starting point, and raising concurrency is not the lever either (it is
-  # deliberately below `ADMIN_POOL_SIZE`, default 3, the pool every authenticated request
-  # also checks out of). Bounding the flag inflow would be. The reading that would say it is
-  # needed — and which has never been observed — is `conflicts_judge_candidates` rising run
-  # over run with `conflicts_judge_count_capped` or `conflicts_judge_budget_exhausted` set.
+  # deliberately below `ADMIN_POOL_SIZE`, default 3 at `config/runtime.exs:277`, the pool
+  # every authenticated request also checks out of). Bounding the flag inflow would be, and
+  # the reading that says so is `conflicts_judge_count_capped` or
+  # `conflicts_judge_budget_exhausted` STAYING SET beyond the nights a burst of known size
+  # needs. It is NOT `conflicts_judge_candidates` rising run over run: that number cannot
+  # rise above `cap`, because the candidate query takes `limit: cap + 1` and splits at
+  # `cap`, so a 2,001-pair night and a 200,000-pair night both report a flat 2,000 forever
+  # — a divergent queue looks IDENTICAL to a converged one there. And no night has reported
+  # through either flag yet (both shipped with this clock bound in #762), so their silence
+  # so far is an absence of instrument, not an absence of divergence.
   @default_judge_budget_ms :timer.minutes(20)
 
   @impl Oban.Worker
