@@ -123,6 +123,65 @@ defmodule LoopctlWeb.ArticleControllerTest do
       assert body["note"] =~ "publish"
     end
 
+    test "draft: true leaves a DURABLE marker the nightly consumer can honour", %{conn: conn} do
+      # Without it the drain cannot tell a deliberate stage from a capture nobody came
+      # back for, and has to apply one blind age floor to both.
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Deliberately Staged",
+          "body" => "the caller asked for this to be held",
+          "category" => "pattern",
+          "draft" => true
+        })
+
+      id = json_response(conn, 201)["data"]["id"]
+      assert %Article{staged_draft_at: %DateTime{}} = AdminRepo.get!(Article, id)
+    end
+
+    test "a PUBLISHED create carries no staged-draft marker", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/articles", %{
+          "title" => "Published Immediately",
+          "body" => "nobody asked to stage this one",
+          "category" => "pattern"
+        })
+
+      id = json_response(conn, 201)["data"]["id"]
+      assert AdminRepo.get!(Article, id).staged_draft_at == nil
+    end
+
+    test "the marker is NOT castable — a PATCH cannot set or clear it" do
+      # The `stories.lifecycle_entered_at` lesson, reached a third time: `metadata` is
+      # cast and whole-map-replaced by PATCH, so a marker living there is erased by one
+      # ordinary update. A caller that could write this column could also hold its own
+      # draft out of the drain for as long as it liked. Asserted against the SOURCE
+      # because Ecto exposes no introspection for `cast/3`'s permitted list.
+      src = File.read!("lib/loopctl/knowledge/article.ex")
+
+      permitted =
+        Regex.scan(~r/cast\(attrs,\s*(\[[^\]]*\]|@cast_fields)/s, src) ++
+          Regex.scan(~r/@cast_fields\s*(\[[^\]]*\]|~w\([^)]*\)[a-z]*)/s, src)
+
+      assert length(permitted) >= 3,
+             "found too few cast sources to check — the assertion below would pass vacuously"
+
+      for [_, list] <- permitted do
+        refute list =~ "staged_draft_at", "staged_draft_at must never be castable"
+      end
+
+      assert :staged_draft_at in Article.__schema__(:fields)
+    end
+
     test "status: \"draft\" is honoured as the draft opt-in", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})

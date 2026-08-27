@@ -53,11 +53,17 @@ defmodule Loopctl.Knowledge.SimilaritySearchBehaviour do
   passes `on_overload: :tag` (US-37.5), an over-cap heavy-read shed returns
   `{:error, :heavy_read_overloaded}` instead of raising — the graceful-degrade path
   (the auto-link worker snoozes; the ProposalGate write-back gate falls open).
+
+  `on_unavailable: :tag` does the same for the OTHER way a search can fail to
+  happen: a query vector the tenant's read dimension cannot serve returns
+  `{:error, :search_unavailable}` rather than the empty list a caller would
+  otherwise read as "nothing is similar". Default `:empty` keeps the historical
+  degrade for read callers.
   """
   @callback nearest(
               tenant_id :: binary(),
               target_embedding :: term(),
               k :: pos_integer(),
               opts :: keyword()
-            ) :: [candidate()] | {:error, :heavy_read_overloaded}
+            ) :: [candidate()] | {:error, :heavy_read_overloaded} | {:error, :search_unavailable}
 end

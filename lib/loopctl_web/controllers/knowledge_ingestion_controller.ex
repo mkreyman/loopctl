@@ -163,7 +163,13 @@ defmodule LoopctlWeb.KnowledgeIngestionController do
              type: :boolean,
              description:
                "Publish extracted articles immediately instead of staging them as " <>
-                 "drafts. Default false (draft)."
+                 "drafts. Default false (draft). Staging is a HOLD and not a veto: a " <>
+                 "staged draft is recorded as deliberately staged and published " <>
+                 "automatically by the nightly draft consumer once it is a week old, " <>
+                 "linked to its nearest published neighbour if it is a near-duplicate. " <>
+                 "There is no human approver in this system, so a draft nothing ever " <>
+                 "drains is invisible to every agent forever. Publish or delete inside " <>
+                 "the week if the outcome matters."
            },
            metadata: %OpenApiSpex.Schema{
              type: :object,

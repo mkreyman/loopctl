@@ -192,6 +192,38 @@ defmodule Loopctl.Workers.DraftDuplicateSweepWorkerTest do
                "it into a terminal one a week later"
     end
 
+    test "never archives a draft a HUMAN unpublished, not just consolidation's own" do
+      # The audit clause used to require `actor_label == "worker:consolidation"`, while
+      # `Loopctl.Knowledge.DraftConsumer.draft_scope/1` — the same rule, in front of a
+      # REVERSIBLE action — spared a retraction by any actor. The narrower guard was the
+      # one in front of the terminal action. `Knowledge.unpublish_article/3` is the
+      # `role: :user` retraction lever, so this row is a human pulling an article out of
+      # the corpus; archiving it a week later escalates a human-gated act unattended.
+      tenant = fixture(:tenant)
+      vector = unit_vector(0)
+
+      _published = tenant.id |> article(:published) |> then(&embed(tenant.id, &1, vector))
+      draft = tenant.id |> article(:draft) |> then(&embed(tenant.id, &1, vector))
+
+      AdminRepo.insert_all("audit_log", [
+        %{
+          id: Ecto.UUID.bingenerate(),
+          tenant_id: Ecto.UUID.dump!(tenant.id),
+          entity_type: "article",
+          entity_id: Ecto.UUID.dump!(draft.id),
+          action: "article.unpublished",
+          actor_type: "api_key",
+          actor_label: "user:operator",
+          inserted_at: NaiveDateTime.utc_now() |> NaiveDateTime.truncate(:second)
+        }
+      ])
+
+      assert :ok = perform_job(DraftDuplicateSweepWorker, %{"tenant_id" => tenant.id})
+
+      assert status_of(draft.id) == :draft,
+             "a retraction is spared by the RECORD of it, never by who wrote the record"
+    end
+
     test "the durable marker spares a retraction the audit_log can no longer prove" do
       # The point of `consolidation_retracted_at`: authorship survives the audit window. An
       # aged draft with the marker is spared on the marker alone — no audit entry needed —

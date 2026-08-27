@@ -29,6 +29,37 @@ defmodule Loopctl.Knowledge.ProposalGate do
   gate's "never block write-back" invariant holds during exactly the high-load
   incident it exists to survive. (Contrast a plain API kNN read, which defaults to
   `:raise` → a legitimate 429.)
+
+  ## `comparison` — falling open is not the same as answering
+
+  Every assessment this module returns carries `comparison: :complete | :unavailable`,
+  which answers a question the `verdict` cannot: did the nearest-neighbour search
+  actually run?
+
+  It cannot, because an unrunnable search returns an EMPTY neighbour list, and an
+  empty list is scored as maximally novel. `:novel` is therefore the verdict a total
+  search failure produces, character for character the same as a genuinely novel
+  proposal's. The one case where that mattered and was invisible is
+  `VectorSearch.nearest/4`'s query-vector dimension guard: a tenant whose configured
+  embedding model returns a length this instance cannot index gets `[]` for EVERY
+  query, forever (`Embeddings.recall_availability/2` states exactly this), so every
+  proposal it ever makes reads `:novel` having been compared against nothing.
+
+  The verdict is deliberately NOT changed for that case. The create path must not
+  block a write and has its own opt-out (`on_gate_unavailable: :skip`), and moving
+  the dimension case to `:unknown` would flip that opt-out's callers from creating
+  to dropping — on a condition that never clears, so their retry never would either
+  (the same trap `cap_truncated/2` documents below). An UNATTENDED consumer, whose
+  next act is a publish rather than a create, reads `comparison` instead and holds.
+
+  What `comparison` deliberately does NOT cover is a DEGRADED scan: a read that ran
+  without `hnsw.iterative_scan` returns a possibly-incomplete batch, and this still
+  reports `:complete`. That is a recall reduction rather than an absence of comparison,
+  it affects a NON-empty result just as much as an empty one, and its `:unsupported`
+  cause never self-heals (`HeavyRead.warn_if_ann_degraded/2` says so) — so treating it
+  as unassessed would stop an unattended drain permanently on any deployment running
+  pgvector below 0.8, which is the total loss the drain exists to prevent. The existing
+  throttled warning from that function is its signal.
   """
 
   @behaviour Loopctl.Knowledge.ProposalAssessorBehaviour
@@ -90,6 +121,10 @@ defmodule Loopctl.Knowledge.ProposalGate do
         case VectorSearch.nearest(tenant_id, vector, @neighbors_k,
                threshold: overlap,
                on_overload: :tag,
+               # See the moduledoc: without this the dimension guard's degrade is an
+               # empty list, and an empty list is a `:novel` verdict taken on no
+               # comparison at all.
+               on_unavailable: :tag,
                visibility_agent_id: Keyword.get(opts, :visibility_agent_id)
              ) do
           {:error, :heavy_read_overloaded} ->
@@ -99,13 +134,30 @@ defmodule Loopctl.Knowledge.ProposalGate do
 
             open_verdict()
 
+          {:error, :search_unavailable} ->
+            # The VERDICT stays what it has always been here — `:novel`, from a `nil`
+            # score — so no existing caller's branch moves. `comparison` is what says
+            # the corpus was never searched.
+            Logger.warning(
+              "ProposalGate: novelty read unavailable (query vector unsearchable at this " <>
+                "tenant's read dimension); the verdict rests on NO comparison"
+            )
+
+            %{
+              verdict: classify(nil, dup, overlap),
+              score: nil,
+              neighbors: [],
+              comparison: :unavailable
+            }
+
           neighbors when is_list(neighbors) ->
             score = neighbors |> List.first() |> neighbor_score()
 
             %{
               verdict: score |> classify(dup, overlap) |> cap_truncated(truncated?),
               score: score,
-              neighbors: neighbors
+              neighbors: neighbors,
+              comparison: :complete
             }
         end
 
@@ -215,7 +267,18 @@ defmodule Loopctl.Knowledge.ProposalGate do
     TextBudget.initial("#{title}\n\n#{body}")
   end
 
-  defp open_verdict, do: %{verdict: :unknown, score: nil, neighbors: [], gate_embedded: false}
+  # Every path that reaches here failed BEFORE the corpus could be searched — no key, a
+  # provider error, a shed read, a system-scoped proposal that skips the gate — so the
+  # comparison is unavailable on all of them. `:unknown` already says as much to the
+  # create path; `comparison` says it in the one vocabulary every branch shares.
+  defp open_verdict,
+    do: %{
+      verdict: :unknown,
+      score: nil,
+      neighbors: [],
+      gate_embedded: false,
+      comparison: :unavailable
+    }
 
   defp config(key, default), do: Application.get_env(:loopctl, key, default)
 end

@@ -96,7 +96,13 @@ defmodule LoopctlWeb.ArticleController do
                  "Publishing a staged draft afterwards (POST /articles/:id/publish) " <>
                  "requires orchestrator role; publish-on-create does not. (Note: the " <>
                  "ingestion path has the OPPOSITE polarity — POST /knowledge/ingest is " <>
-                 "draft-by-default; pass publish: true there.)"
+                 "draft-by-default; pass publish: true there.) A draft is NOT held " <>
+                 "indefinitely: the nightly draft consumer publishes it automatically " <>
+                 "once it is a week old, linking it to its nearest published neighbour " <>
+                 "if it is a near-duplicate. Staging is a HOLD, not a veto — there is no " <>
+                 "human approver in this system, so a draft nothing ever drains is " <>
+                 "invisible to every agent forever. Publish or delete it inside the week " <>
+                 "if the outcome matters."
            },
            tags: %OpenApiSpex.Schema{
              type: :array,
@@ -547,7 +553,17 @@ defmodule LoopctlWeb.ArticleController do
   defp create_article(conn, tenant_id, attrs, audit_opts, draft?, gate?) do
     # Pass the caller's visibility scope so idempotency dedup can't echo a private
     # memory the agent can't see (#163).
-    opts = audit_opts ++ Visibility.scope_opts(conn) ++ low_novelty_opts(attrs)
+    #
+    # `staged_draft: draft?` records the OPT-IN durably (`articles.staged_draft_at`).
+    # `draft: true` / `status: "draft"` is advertised staging, and until this marker
+    # existed it left no trace at all, so the nightly `Loopctl.Knowledge.DraftConsumer`
+    # could not tell a deliberate stage from a capture nobody came back for and had to
+    # apply one blind age floor to both. It carries `draft?` — what the CALLER asked
+    # for — and not the resulting status, so a `:low_novelty` proposal the gate drafts
+    # on behalf of a caller who asked to PUBLISH is not recorded as a stage.
+    opts =
+      audit_opts ++
+        Visibility.scope_opts(conn) ++ low_novelty_opts(attrs) ++ [staged_draft: draft?]
 
     if gate? do
       render_proposal(conn, Knowledge.propose_article(tenant_id, attrs, opts), attrs, draft?)

@@ -65,11 +65,18 @@ defmodule Loopctl.Knowledge.DraftConsumer do
       an orchestrator. Under the owner decision that is the accepted cost of the default —
       a recorded duplicate is recoverable, a held article is not — and it is the cost of
       PUBLISHING one, not of the edge: the auto-linker writes the same pair either way.
-    * assessment genuinely **unavailable** (`:unknown` — provider down, no BYO key, heavy
-      read shed) → the draft is **left alone and counted**. `ProposalGate` falls open by
-      contract, so `:unknown` means "not assessed", never "not a duplicate". Publishing on
-      it would publish unassessed drafts through a provider outage, and dropping it would be
-      the loss this worker exists to stop.
+    * assessment genuinely **unavailable** → the draft is **left alone and counted**. TWO
+      shapes reach this, and only the first announces itself. `:unknown` (provider down, no
+      BYO key, heavy read shed) is `ProposalGate` falling open by contract, so it means
+      "not assessed", never "not a duplicate". The second shape is `comparison:
+      :unavailable` on an ORDINARY-LOOKING verdict: a search that cannot run returns an
+      empty neighbour list, an empty list scores as maximally novel, so a total search
+      failure and a genuinely novel draft produce the identical `:novel`. That is not
+      theoretical — a tenant whose configured embedding model returns a length this
+      instance cannot index gets an empty result for every query, permanently, which would
+      publish its entire draft pile having compared nothing. Publishing on either would
+      publish unassessed drafts through an outage, and dropping them would be the loss this
+      worker exists to stop.
 
   ## What it must NOT do: archive
 
@@ -124,10 +131,21 @@ defmodule Loopctl.Knowledge.DraftConsumer do
   **A HOLD THAT IS STILL FRESH.** `POST /api/v1/knowledge` with `draft: true`, and ingestion
   with `publish: false`, are advertised opt-ins into staging; publishing one the same night
   makes the opt-in unobservable. There is no approver to wait for, so the reconciliation is a
-  FLOOR rather than a veto: a draft is offered only once it is 48h old, which leaves whoever
-  staged it two nightly runs to publish or delete it, and still drains everything abandoned
-  past that. The floor costs the drain nothing — inflow ages into the pool at the rate it
-  arrives.
+  FLOOR rather than a veto, and there are TWO of them.
+
+  A draft carrying `articles.staged_draft_at` was staged because a caller ASKED for it, and
+  is held for a week from that stamp. Everything else — a capture nobody came back for, a
+  proposal the novelty gate drafted on behalf of a caller who asked to PUBLISH — is held for
+  48h from creation, which leaves whoever staged it two nightly runs to publish or delete it
+  and still drains everything abandoned past that. Either floor costs the drain nothing:
+  inflow ages into the pool at the rate it arrives.
+
+  The marker is a COLUMN and not a `metadata` key, for the `stories.lifecycle_entered_at`
+  reason this scope already relies on twice — `metadata` is cast and whole-map-replaced by an
+  agent-role `PATCH`, so a marker living there would let one ordinary request silently
+  shorten the hold its caller asked for. And it is a longer floor rather than the VETO it may
+  look like it should be: a veto is a state whose only exit is a human, and holding is total
+  loss here, so the marker buys the stager a longer window and never a permanent one.
 
   ## What bounds one night
 
@@ -195,6 +213,18 @@ defmodule Loopctl.Knowledge.DraftConsumer do
   # advertised opt-ins into staging, and a drain that runs tonight makes them unobservable.
   # See the moduledoc: a floor, not a veto — there is no approver to wait for.
   @min_draft_age_hours 48
+
+  # The floor for a draft that carries `articles.staged_draft_at` — a stage the caller
+  # ASKED for, rather than one inferred from the row being young. A WEEK, so a deliberate
+  # stage survives a full cycle of whatever attention it was staged for, where an
+  # abandoned capture waits two nightly runs.
+  #
+  # It is a longer FLOOR and deliberately not a veto, which is the whole reason the marker
+  # is safe to add: holding is TOTAL LOSS (no read path serves a draft, and there is no
+  # human approver — owner decision 2026-08-27), so a marker that exempted a draft from
+  # the drain outright would be a state whose only exit is a human, which is what #765
+  # forbids. The marker buys the stager a longer window, never a permanent one.
+  @staged_draft_age_hours 24 * 7
 
   # Fallback wall clock. `Loopctl.Workers.KnowledgeLintWorker` always passes `:budget_ms` —
   # the time ITS job has left (`draft_budget_remaining/1`) — so this applies only to a direct
@@ -402,13 +432,30 @@ defmodule Loopctl.Knowledge.DraftConsumer do
       # A FRESH HOLD is staged on purpose too — `draft: true` and ingestion's `publish: false`
       # are advertised opt-ins, and a drain that runs tonight makes them unobservable. A floor,
       # not a veto: two nightly runs to publish or delete it, then it drains like the rest.
-      where: a.inserted_at <= ago(@min_draft_age_hours, "hour"),
+      #
+      # TWO floors, because the opt-in is now RECORDED rather than guessed at. A draft
+      # carrying `staged_draft_at` was staged because a caller asked for it, and gets the
+      # longer `@staged_draft_age_hours` window measured from the stamp; everything else —
+      # an abandoned capture, a gate-drafted proposal whose caller asked to publish — keeps
+      # the 48h floor measured from creation. The marker is a COLUMN precisely so an
+      # ordinary `PATCH` (which casts and whole-map-replaces `metadata`) cannot silently
+      # shorten a hold the caller asked for. Neither branch is a veto: see
+      # `@staged_draft_age_hours`.
+      where:
+        (is_nil(a.staged_draft_at) and a.inserted_at <= ago(@min_draft_age_hours, "hour")) or
+          (not is_nil(a.staged_draft_at) and
+             a.staged_draft_at <= ago(@staged_draft_age_hours, "hour")),
       # The RETRACTION guard, in its THREE independent records. See the moduledoc. The audit
       # clause is deliberately NOT narrowed to `worker:consolidation`:
       # `Knowledge.unpublish_article/3` and `bulk_unpublish/3` are the `role: :user`
       # retraction lever, and republishing what a human just pulled reverts a human-gated act
       # unattended. `tenant_id` is constrained inside the subquery so the correlated NOT
       # EXISTS can use `audit_log_tenant_entity_idx`, whose leading column it is.
+      #
+      # `Loopctl.Workers.DraftDuplicateSweepWorker.load_embedded_drafts/2` spells the SAME
+      # rule for its own candidates. It was narrowed to `worker:consolidation` while this
+      # one was not, which put the narrower guard in front of the TERMINAL action of the
+      # pair; both are unnarrowed now. Change them together.
       #
       # Neither the column nor the audit row is durable ALONE — the column is stamped only by
       # consolidation and only since 20260818055453, and `AuditPartitionWorker` DROPs the
@@ -418,6 +465,30 @@ defmodule Loopctl.Knowledge.DraftConsumer do
       # row was PUBLISHED once (`maybe_enqueue_embedding/3` enqueues at `:published` only,
       # ingestion only under `publish: true`), and it survives every partition drop. Existence
       # at ANY dimension, and the legacy column too — currency is not the question.
+      #
+      # THE RESIDUAL, stated deliberately rather than left to be rediscovered as a bug.
+      # One retraction escapes all three records: a published article that never got an
+      # embedding (its tenant had no BYO key at the time, or the job failed permanently),
+      # retracted by a human, aged past `:audit_retention_days`, and predating
+      # 20260818055453. It has no evidence of ever having been published, so this scope
+      # offers it and it is republished ONCE.
+      #
+      # Once, and not repeatedly: `publish_article/3` goes through `transition_article/5`,
+      # whose `maybe_enqueue_embedding/3` fires at `:published`, so the republish writes
+      # the durable record that was missing and any later retraction is spared. And the
+      # keyless case cannot fire at all while it is keyless — `consume/2` stops at the
+      # `:no_embedding_key` gate before this query runs — so it needs a tenant that
+      # acquired a key after the fact.
+      #
+      # Failing CLOSED on it is not available. The only rule that would catch it is "hold
+      # anything older than the audit horizon with no positive evidence", which is exactly
+      # what `DraftDuplicateSweepWorker` does — it can, because its action is terminal and
+      # holding costs it nothing. Here holding IS the loss: every draft in the standing
+      # backlog crosses that horizon eventually, carrying no `article.unpublished` row and
+      # no embedding, so that rule would strand the whole capture-path pile permanently,
+      # which is the total loss this step exists to prevent. A bounded single republish of
+      # a rare row is the smaller cost, and it is recoverable — `unpublish_article/3` puts
+      # it back, and this time the record survives.
       where: is_nil(a.consolidation_retracted_at),
       where: is_nil(a.embedding),
       where:
@@ -551,14 +622,25 @@ defmodule Loopctl.Knowledge.DraftConsumer do
     attrs = %{"title" => draft.title, "body" => draft.body, "project_id" => draft.project_id}
 
     case assessor(opts).assess(tenant_id, attrs, []) do
+      %{verdict: :unknown} ->
+        unassessed(tenant_id, draft, "gate_unavailable")
+
+      # BEFORE any usable verdict is read. An assessment whose comparison did not happen
+      # carries a verdict derived from an EMPTY neighbour list, and that verdict is
+      # `:novel` — character for character the one a genuinely novel draft gets. Publishing
+      # on it publishes unassessed, which is precisely what the `:unknown` clause above
+      # refuses; the two differ only in whether the gate could name its own failure as a
+      # fall-open. `ProposalGate`'s moduledoc says why the verdict is deliberately left
+      # alone there instead of being moved to `:unknown` — doing that would change the
+      # create path, whose contract is that a write is never blocked.
+      %{comparison: :unavailable} ->
+        unassessed(tenant_id, draft, "comparison_unavailable")
+
       %{verdict: :novel} ->
         publish(tenant_id, draft, :novel, nil)
 
       %{verdict: verdict} = assessment when verdict in [:low_novelty, :duplicate] ->
         publish(tenant_id, draft, verdict, neighbour(tenant_id, assessment, draft))
-
-      %{verdict: :unknown} ->
-        unassessed(tenant_id, draft, "gate_unavailable")
 
       other ->
         # An implementation that answers outside the behaviour's four verdicts. Treated as

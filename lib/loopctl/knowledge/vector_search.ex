@@ -267,17 +267,31 @@ defmodule Loopctl.Knowledge.VectorSearch do
 
   `target_embedding` is a plain `[float()]` list or a `%Pgvector{}` — normalized to
   a bound `^[float()]` param via `to_embedding_list/1` (never the struct — #168).
+
+  ## `:on_unavailable` — telling "no neighbours" apart from "no search"
+
+  A query vector whose length disagrees with the tenant's read dimension cannot be
+  searched at all, and the graceful degrade for it is an EMPTY list (below). For a
+  caller whose next act is a READ that is exactly right: zero results renders as zero
+  results. For a caller whose next act is a WRITE it is a silent falsehood — an empty
+  pool scores as maximally novel, so an UNSEARCHABLE proposal reads as a genuinely
+  novel one and gets published without any comparison having happened.
+
+    * `:empty` (default) — `[]`, the historical degrade. Every existing caller keeps it.
+    * `:tag` — `{:error, :search_unavailable}`, so a write-deciding caller can hold
+      instead of guessing. Mirrors `on_overload: :tag` exactly, and for the same reason.
   """
   @impl true
   @spec nearest(Ecto.UUID.t(), target_embedding(), pos_integer(), keyword()) ::
-          [candidate()] | {:error, :heavy_read_overloaded}
+          [candidate()] | {:error, :heavy_read_overloaded} | {:error, :search_unavailable}
   def nearest(tenant_id, target_embedding, k, opts \\ []) when is_binary(tenant_id) do
     # Query-vector length guard (review): the side-table ANN binds the target into the
     # per-dimension `(embedding::vector(N))` cast, so a fresh query vector whose length
     # disagrees with the read dimension (mid-model-change / stale setting / pin conflict)
     # would raise pgvector's "different vector dimensions" 500 on this request path. An
-    # EMPTY result is the documented graceful degrade — every caller already handles "no
-    # neighbours" (suggest-links empty, ProposalGate novel, ArticleLinkingWorker no links).
+    # EMPTY result is the documented graceful degrade — every read caller already handles
+    # "no neighbours" (suggest-links empty, ArticleLinkingWorker no links) — but see
+    # `:on_unavailable` above for why a caller that WRITES on this result must not.
     case Embeddings.check_query_vector(tenant_id, to_embedding_list(target_embedding)) do
       :ok ->
         # Resolve the side-table cutover flag ONCE and thread it into `opts` before
@@ -311,7 +325,14 @@ defmodule Loopctl.Knowledge.VectorSearch do
         end
 
       {:error, _mismatch} ->
-        []
+        # The dimension state that produces this does NOT self-heal on its own — a tenant
+        # whose configured model returns a length this instance cannot index keeps
+        # returning it (`Embeddings.recall_availability/2` says so in as many words) — so
+        # a `:tag` caller is being told about a standing condition, not a blip.
+        case Keyword.get(opts, :on_unavailable, :empty) do
+          :tag -> {:error, :search_unavailable}
+          _empty -> []
+        end
     end
   end
 

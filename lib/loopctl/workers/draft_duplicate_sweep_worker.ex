@@ -2,6 +2,39 @@ defmodule Loopctl.Workers.DraftDuplicateSweepWorker do
   @moduledoc """
   Weekly sweep that retires DRAFT articles which duplicate an already-published one.
 
+  ## PARKED — this does not run unless an operator asks for it
+
+  This worker is in `Loopctl.ObanConfig.parked_crons/0`: its crontab entry is declared
+  but filtered out of the live schedule, and it runs only when an operator names it in
+  `OBAN_UNPARK_CRONS`. Three things put it there, on 2026-08-27.
+
+  **Its action is terminal, and an unattended writer may not take one.** Owner decision,
+  KB `837daaa0`: a writer with no human approver earns automatic action by being
+  REVERSIBLE, not by being confident. `:archived` is one-way (see below), so no
+  threshold can license it here. The section below this one used to argue that a high
+  threshold made archive acceptable; that argument predates the decision and does not
+  survive it. Nothing was swapped in for archive because a draft is ALREADY the bottom
+  of the reversible lifecycle — `{:published, :draft}` and `{:draft, :published}` are
+  the pair, and `:archived` is the exit from it — so there is no reversible retirement
+  to move to. Parking changes the AUTHORITY instead of the action: a human may take a
+  terminal act, and an operator unparking this is a human asking for exactly that.
+
+  **Its backlog has another drain.** The capture-path pile this was built for is now
+  consumed NIGHTLY by `Loopctl.Knowledge.DraftConsumer`, which publishes a held draft
+  and records the redundancy as a `relates_to` edge instead of retiring it. Weekly
+  archiving after a nightly publish would only reach what that step deliberately kept.
+
+  **What it can still REACH is not that backlog anyway.** It sweeps only drafts that
+  HAVE an embedding; embeddings are enqueued at `status: :published` only
+  (`Loopctl.Knowledge.maybe_enqueue_embedding/3` gates on it, and the bulk reconciler
+  filters the same way), so every row it can archive was PUBLISHED ONCE AND THEN
+  RETRACTED. That is the class this worker's own "What it must NOT sweep" section says
+  to spare, and it spares only the half of it that consolidation wrote — a human
+  retraction via `Knowledge.unpublish_article/3` reaches this query.
+
+  Everything below is preserved as-is: it is the design a revive restores, and the
+  measurement behind the threshold is the reason not to lower it if one happens.
+
   ## Why this exists
 
   The draft queue is a holding area, not a destination: `hooks/knowledge-capture.sh`
@@ -50,8 +83,12 @@ defmodule Loopctl.Workers.DraftDuplicateSweepWorker do
   There is no equivalent reversible step for a draft: a draft is already unpublished,
   so archive is the only move down. The row survives and every archive is audited via
   `Knowledge.bulk_archive/3`, so nothing is destroyed — but "non-destructive" and
-  "reversible" are different properties, and this worker only has the first. Treat the
-  threshold as the safety mechanism it is, and do not lower it without re-measuring.
+  "reversible" are different properties, and this worker only has the first.
+
+  This paragraph used to end "treat the threshold as the safety mechanism it is". It is
+  not one, and that is why this worker is parked: a threshold bounds how OFTEN a
+  one-way door is opened, never whether it can be closed again. The safety mechanism is
+  the human who unparks it.
 
   ## What it must NOT sweep: another worker's reversible retraction
 
@@ -103,10 +140,6 @@ defmodule Loopctl.Workers.DraftDuplicateSweepWorker do
   alias Loopctl.Tenants.Tenant
 
   @actor_label "worker:draft_duplicate_sweep"
-
-  # The nightly consolidation pass's actor label. Its retractions are SPARED — see
-  # `load_embedded_drafts/2`.
-  @consolidation_actor "worker:consolidation"
 
   # Chosen from the 2026-08-17 drain: every one of the 271 drafts at >= 0.95 that was
   # inspected was a true duplicate, and the ONE inspected article that scored below
@@ -226,14 +259,23 @@ defmodule Loopctl.Workers.DraftDuplicateSweepWorker do
       # nothing that can ever produce one. Failing closed on those is the whole reason this
       # bound exists, and removing it would archive that cohort through a one-way door.
       where: a.inserted_at >= ^audit_evidence_horizon(),
-      # Spare consolidation's retractions — the exclusion is applied HERE rather than
-      # before the archive so the sweep does not even spend an ANN read on a draft it
-      # must not touch. TWO independent records now: the durable
-      # `consolidation_retracted_at` column (authoritative, survives audit retention) and
-      # the audit_log, still read because a marker can only exist from migration
-      # 20260818055453 onward. `tenant_id` is constrained so the
-      # correlated NOT EXISTS can use `audit_log_tenant_entity_idx`, whose leading column
-      # it is — without it every candidate scanned every retained partition.
+      # Spare a RETRACTION — the exclusion is applied HERE rather than before the archive
+      # so the sweep does not even spend an ANN read on a draft it must not touch. TWO
+      # independent records: the durable `consolidation_retracted_at` column
+      # (authoritative, survives audit retention) and the audit_log, still read because a
+      # marker can only exist from migration 20260818055453 onward. `tenant_id` is
+      # constrained so the correlated NOT EXISTS can use `audit_log_tenant_entity_idx`,
+      # whose leading column it is — without it every candidate scanned every retained
+      # partition.
+      #
+      # The audit clause is deliberately NOT narrowed to `worker:consolidation`. It was,
+      # and that made this the NARROWER of two implementations of one rule:
+      # `Loopctl.Knowledge.DraftConsumer.draft_scope/1` reads the same record by ANY
+      # actor, because `Knowledge.unpublish_article/3` and `bulk_unpublish/3` are the
+      # `role: :user` retraction lever and a human retraction must be spared for the
+      # stronger of the two reasons. The narrower guard sat in front of the TERMINAL
+      # action of the pair. Keep these two spellings identical — a divergence here is
+      # invisible until it archives something.
       where: is_nil(a.consolidation_retracted_at),
       where:
         not exists(
@@ -242,7 +284,6 @@ defmodule Loopctl.Workers.DraftDuplicateSweepWorker do
             where: al.entity_id == parent_as(:draft).id,
             where: al.entity_type == "article",
             where: al.action == "article.unpublished",
-            where: al.actor_label == ^@consolidation_actor,
             select: 1
           )
         ),

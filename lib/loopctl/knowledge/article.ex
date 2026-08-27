@@ -92,6 +92,23 @@ defmodule Loopctl.Knowledge.Article do
     # NEVER add this to a `cast` list.
     field :previous_title, :string
 
+    # The DURABLE record that this draft was staged ON PURPOSE — `draft: true` /
+    # `status: "draft"` on create, or ingestion's `publish: false` — rather than being a
+    # capture nobody came back for. `Loopctl.Knowledge.DraftConsumer` reads it to give a
+    # deliberate stage a longer hold than an abandoned one, and it is a LONGER FLOOR and
+    # never a veto: holding is total loss (KB `837daaa0`), so no marker may stop the drain.
+    #
+    # A COLUMN rather than a `metadata` key for the same reason as the two fields above,
+    # and load-bearing here in its own way: a marker an ordinary `PATCH` erases would
+    # silently shorten the hold the caller asked for, which is the failure mode of a
+    # marker nobody can see fail.
+    #
+    # Written by `stamp_staged_draft/1` (from `Loopctl.Knowledge.create_article/3` under an
+    # explicit `:staged_draft` option) and by `Loopctl.Workers.ContentIngestionWorker`'s
+    # `insert_all` rows. NEVER add this to a `cast` list — a caller that could write it
+    # could hold its own draft out of the drain for as long as it liked.
+    field :staged_draft_at, :utc_datetime_usec
+
     field :embedding, Pgvector.Ecto.Vector, load_in_query: false
     # Virtual boolean projection of `not is_nil(embedding)` — lets the bulk-embedding
     # path (US-37.4) null-check presence WITHOUT transferring the 1536-dim vector for
@@ -305,6 +322,23 @@ defmodule Loopctl.Knowledge.Article do
     |> update_changeset(attrs)
     |> stamp_previous_title(article)
     |> regenerate_slug()
+  end
+
+  @doc """
+  Stamps `staged_draft_at` on a create changeset whose caller explicitly asked to stage.
+
+  A no-op unless the article is actually landing as a `:draft`: the option says what the
+  CALLER asked for, and a `force: true` or ungated create that ends up published was not a
+  stage. `:staged_draft_at` is not in any `cast` list, so this `put_change/3` — never
+  caller input — is the only way it moves on this path.
+  """
+  @spec stamp_staged_draft(Ecto.Changeset.t()) :: Ecto.Changeset.t()
+  def stamp_staged_draft(changeset) do
+    if get_field(changeset, :status) == :draft do
+      put_change(changeset, :staged_draft_at, DateTime.utc_now())
+    else
+      changeset
+    end
   end
 
   defp stamp_previous_title(changeset, article) do
