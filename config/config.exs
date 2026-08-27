@@ -978,11 +978,18 @@ config :loopctl, :knowledge_conflict_judge_concurrency, 2
 # cap above counts ATTEMPTS; this counts TIME, which is what a step whose per-item cost is
 # an outbound provider call really spends. Measured in production 2026-08-27 on the
 # 86k-article tenant, one judgement is ~1.7 s wall / ~0.85 s at concurrency 2, so 20 minutes
-# drains ~1,400 pairs — comfortably above the promoter's 500/night, so the queue converges.
+# drains ~1,400 pairs a night. That covers the promoter's 500/night with room to spare; it
+# does NOT cover the ingestion novelty gate, which no cap bounds and which put 15,246 flags
+# in over four days — ~3,800 a night. While the inflow runs above the drain the queue
+# DIVERGES, and no value here fixes that: bounding the flag inflow is the lever, and
+# `conflicts_judge_candidates` rising run over run with `conflicts_judge_count_capped` or
+# `conflicts_judge_budget_exhausted` set is the reading that says it is needed.
 #
 # `Loopctl.Workers.KnowledgeLintWorker.timeout/1` is DERIVED from this value plus a
-# five-minute reserve for the rest of the night, so raising it raises the job that contains
-# it. That derivation is the fix: a flat 10-minute job timeout stood next to a 2000-call
+# five-minute reserve for the rest of the night, and CLAMPED below Oban's 30-minute Lifeline
+# rescue window (a job that outlasts it is re-dispatched concurrently with itself). So
+# raising this raises the job that contains it, up to that ceiling — which ~20 minutes plus
+# the reserve already reaches. That derivation is the fix: a flat 10-minute job timeout stood next to a 2000-call
 # ceiling worth ~28 minutes, latent until an ingestion burst outgrew the promoter cap on
 # 2026-08-20, after which every attempt on six consecutive nights was discarded with
 # Oban.TimeoutError and no consolidation report was produced at all.

@@ -110,11 +110,12 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   Conflict judging is bounded twice, by a count
   (`:knowledge_lint_max_conflict_judgements`) and by a wall clock
   (`:knowledge_lint_conflict_judge_budget_ms`), because only the second one bounds
-  what the step actually spends. When the clock truncates a run it is logged AND
-  recorded in the audit event (`conflicts_judge_budget_exhausted`) — a truncated
-  night and a night with nothing left to judge are the same `judged` count
-  otherwise, and telling them apart is the only way to see the queue stop
-  converging.
+  what the step actually spends. EITHER truncation is logged AND recorded in the
+  audit event (`conflicts_judge_budget_exhausted`, `conflicts_judge_count_capped`)
+  — a truncated night and a night with nothing left to judge are the same `judged`
+  count otherwise, and telling them apart is the only way to see the queue stop
+  converging. Neither flag is set on a run that drained everything it was offered:
+  a bound reported unconditionally says nothing at all.
   """
 
   use Oban.Worker,
@@ -166,12 +167,16 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # 86k-article tenant: one judgement is ~1.7 s wall, ~0.85 s at concurrency 2, so 20
   # minutes drains ~1,400 pairs a night.
   #
-  # Sized against the INFLOW, not against the backlog: `promote_conflicts/1` adds at most
-  # `@default_max_conflict_promotions` (500) a night, so a drain of ~1,400 keeps the queue
-  # converging with room for the ingestion-gate inflow the promoter cap does not bound —
-  # which is what put 15,246 flags in over four days and broke the old flat timeout.
-  # Raising concurrency instead is NOT the lever: it is deliberately below `ADMIN_POOL_SIZE`
-  # (default 3), the pool every authenticated request also checks out of.
+  # A drain of ~1,400 covers `promote_conflicts/1` (at most
+  # `@default_max_conflict_promotions`, 500 a night) with room to spare. It does NOT cover
+  # the ingestion novelty gate, which no cap bounds and which put 15,246 flags in over four
+  # days — ~3,800 a night, above this drain, so while that inflow persists the queue
+  # DIVERGES and no value here fixes it: `timeout/1` is clamped below the Lifeline window,
+  # which makes ~20 minutes the ceiling rather than a starting point, and raising concurrency
+  # is not the lever either (it is deliberately below `ADMIN_POOL_SIZE`, default 3, the pool
+  # every authenticated request also checks out of). Bounding the flag inflow is. The reading
+  # that says it is needed is `conflicts_judge_candidates` rising run over run with
+  # `conflicts_judge_count_capped` or `conflicts_judge_budget_exhausted` set.
   @default_judge_budget_ms :timer.minutes(20)
 
   @impl Oban.Worker
@@ -201,6 +206,11 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   end
 
   defp lint_tenant(tenant_id) do
+    # The clock the judge's budget is measured against. See `judge_budget_remaining/1`: the
+    # judge gets the time this job has LEFT, not a fresh budget beside a reserve nothing
+    # enforces.
+    started_at = System.monotonic_time(:millisecond)
+
     {:ok, report} = Knowledge.lint(tenant_id, max_per_category: @lint_max_per_category)
 
     action = act_on_orphans(tenant_id, report)
@@ -224,7 +234,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     # reports agree" and unpublish on evidence nobody re-derived, every night the scan keeps
     # failing.
     applied = apply_consolidation(tenant_id, consolidation)
-    resolutions_applied = Knowledge.execute_conflict_resolutions(tenant_id)
+    resolutions_applied = execute_resolutions(tenant_id)
     # The judge runs AFTER promotion so a pair flagged tonight is also judged tonight and
     # never spends a night suppressing its two articles, and LAST of all the steps because it
     # is the only one whose cost is an outbound call per item. Measured in production
@@ -232,7 +242,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     # combined ten seconds — against ~0.85 s PER PAIR here at concurrency 2. Ordering it last
     # means the cheap, fail-soft work of the night is already committed before the expensive
     # step starts, so a judge that exhausts its budget costs the night nothing but judgements.
-    judged = judge_redundant_conflicts(tenant_id)
+    judged = judge_conflicts(tenant_id, judge_budget_remaining(started_at))
 
     log_audit_event(tenant_id, report, %{
       action: action,
@@ -253,6 +263,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         "conflicts_promoted=#{promoted} conflicts_judged_redundant=#{judged.judged} " <>
         "conflicts_judge_candidates=#{judged.candidates} " <>
         "conflicts_judge_budget_exhausted=#{judged.budget_exhausted} " <>
+        "conflicts_judge_count_capped=#{judged.count_capped} " <>
         "links_pruned=#{pruned.pruned} links_prunable_remaining=#{pruned.remaining} " <>
         "resolutions_applied=#{resolutions_applied} " <>
         "duplicates_unpublished=#{applied.applied} duplicate_groups_skipped=#{applied.skipped} " <>
@@ -284,10 +295,77 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # Rounded up hard, because a reserve that is too small resurrects exactly this bug.
   @job_reserve_ms :timer.minutes(5)
 
+  # And CLAMPED below Oban's Lifeline window (`rescue_after: :timer.minutes(30)`,
+  # `Loopctl.ObanConfig.plugins/0`). Lifeline never checks whether a job is still alive: it
+  # moves anything left `executing` past that window back to `available`, so a run allowed to
+  # outlast it is re-dispatched CONCURRENTLY WITH ITSELF — two nightly passes on one tenant,
+  # the same pairs judged and billed twice, and two `apply_consolidation/2` runs against one
+  # report. Raising the judge budget past this ceiling therefore raises nothing; the test
+  # reads the real plugin option and binds it to this constant so the two cannot drift.
+  @lifeline_rescue_after_ms :timer.minutes(30)
+  @job_timeout_ceiling_ms @lifeline_rescue_after_ms - :timer.minutes(5)
+
   @impl Oban.Worker
-  def timeout(_job), do: judge_budget_ms() + @job_reserve_ms
+  def timeout(_job), do: job_timeout_ms()
 
   # --- Private ---
+
+  defp job_timeout_ms,
+    do: min(judge_budget_ms() + @job_reserve_ms, @job_timeout_ceiling_ms)
+
+  # The judge is handed the time the job has LEFT, never a fresh budget. `@job_reserve_ms` is
+  # a MEASURED constant and nothing makes the steps before the judge respect it, so a night
+  # whose prelude overruns — a slow consolidate, an executor that spends its whole ~2-minute
+  # budget — would otherwise start a full-length judging step inside a job that can no longer
+  # contain it and die with `Oban.TimeoutError`: #761 again, and now with tonight's
+  # unpublishes already committed and an Oban retry about to spend the nightly caps again.
+  # `@judge_overshoot_ms` pays for the one in-flight provider call the deadline cannot
+  # interrupt (Anthropic `receive_timeout` 25 s).
+  @judge_overshoot_ms :timer.seconds(45)
+
+  defp judge_budget_remaining(started_at) do
+    elapsed = System.monotonic_time(:millisecond) - started_at
+
+    (job_timeout_ms() - elapsed - @judge_overshoot_ms)
+    |> max(0)
+    |> min(judge_budget_ms())
+  end
+
+  # FAIL-SOFT, like every step that runs after the night has already written state
+  # (`consolidate/1`, `apply_consolidation/2`). Both of these now run AFTER the unpublishes,
+  # so a raise escaping either would discard the audit event AND hand the night to an Oban
+  # retry that re-runs `apply_consolidation/2` from the top, spending
+  # `:knowledge_consolidation_max_unpublishes` a second and a third time — a cap that is the
+  # operator's only mid-incident lever (#617). Eating the error costs one night of executions
+  # or judgements; not eating it costs a tripled cap.
+  @no_judgements %{judged: 0, candidates: 0, budget_exhausted: false, count_capped: false}
+
+  defp execute_resolutions(tenant_id) do
+    Knowledge.execute_conflict_resolutions(tenant_id)
+  rescue
+    error -> step_failed(tenant_id, "conflict resolution execution", ExitTag.tag(error), 0)
+  catch
+    :exit, reason ->
+      step_failed(tenant_id, "conflict resolution execution", "exit:" <> ExitTag.tag(reason), 0)
+  end
+
+  defp judge_conflicts(tenant_id, budget_ms) do
+    judge_redundant_conflicts(tenant_id, budget_ms: budget_ms)
+  rescue
+    error -> step_failed(tenant_id, "conflict judging", ExitTag.tag(error), @no_judgements)
+  catch
+    :exit, reason ->
+      step_failed(tenant_id, "conflict judging", "exit:" <> ExitTag.tag(reason), @no_judgements)
+  end
+
+  defp step_failed(tenant_id, step, tag, zero) do
+    Logger.error(
+      "KnowledgeLintWorker: tenant=#{tenant_id} #{step} FAILED (#{tag}) — the lint pass and " <>
+        "its audit event still complete; the remainder is retried next run."
+    )
+
+    zero
+  end
 
   # Orphans split two ways:
   #   * has an embedding -> re-link at the lenient orphan threshold (its nearest
@@ -539,9 +617,16 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   @spec judge_redundant_conflicts(Ecto.UUID.t(), keyword()) :: %{
           judged: non_neg_integer(),
           candidates: non_neg_integer(),
-          budget_exhausted: boolean()
+          budget_exhausted: boolean(),
+          count_capped: boolean()
         }
   def judge_redundant_conflicts(tenant_id, opts \\ []) do
+    # Deadline FIRST, so the candidate query below — a correlated NOT EXISTS against
+    # `conflict_resolutions` ordered on a jsonb cast — is charged to this clock too. The job
+    # that contains it charges it either way.
+    budget_ms = Keyword.get_lazy(opts, :budget_ms, &judge_budget_ms/0)
+    deadline = System.monotonic_time(:millisecond) + budget_ms
+
     cap =
       Keyword.get_lazy(opts, :cap, fn ->
         Application.get_env(
@@ -551,7 +636,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         )
       end)
 
-    unjudged =
+    {unjudged, count_capped} =
       from(l in ArticleLink,
         as: :link,
         where: l.tenant_id == ^tenant_id,
@@ -571,7 +656,12 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         # bounded run runs out of budget. The promoter's own candidate query has no
         # ORDER BY and takes an arbitrary 500; this one is deliberate.
         order_by: [desc: fragment("(?->>'similarity_score')::float", l.metadata)],
-        limit: ^cap,
+        # ONE row more than the cap, so the count bound can say whether it BOUND anything:
+        # `candidates` is `cap` on every night bigger than the cap, which reads identically to
+        # a night that had exactly that many and drained them. That is the older of the two
+        # bounds and the one that held a 15,246-flag backlog at 2000/night while the audit
+        # event read as converged (#761).
+        limit: ^(cap + 1),
         select: %{
           source_article_id: l.source_article_id,
           target_article_id: l.target_article_id,
@@ -579,6 +669,8 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         }
       )
       |> AdminRepo.all()
+      |> Enum.split(cap)
+      |> then(fn {offered, over_cap} -> {offered, over_cap != []} end)
 
     # CONCURRENT on purpose. Each pair now costs an outbound provider call (see
     # `Loopctl.Knowledge.ConflictJudge`), so a sequential reduce would turn a 450-pair night
@@ -601,10 +693,9 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     # `judge_concurrency()` in-flight calls are abandoned when it fires: those are billed
     # and their verdicts lost, which is the price of the step ending on time, and the pairs
     # return at the head of tomorrow's highest-similarity-first queue.
-    budget_ms = Keyword.get_lazy(opts, :budget_ms, &judge_budget_ms/0)
-    deadline = System.monotonic_time(:millisecond) + budget_ms
+    total = length(unjudged)
 
-    {judged, budget_exhausted} =
+    {judged, processed} =
       unjudged
       |> Task.async_stream(
         fn pair -> judge_and_record(tenant_id, pair, opts) end,
@@ -613,30 +704,51 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         on_timeout: :kill_task,
         ordered: false
       )
-      |> Enum.reduce_while({0, false}, fn result, {count, _} ->
+      |> Enum.reduce_while({0, 0}, fn result, {count, processed} ->
         count =
           case result do
             {:ok, {:ok, _}} -> count + 1
             _other -> count
           end
 
-        if System.monotonic_time(:millisecond) >= deadline,
-          do: {:halt, {count, true}},
-          else: {:cont, {count, false}}
+        processed = processed + 1
+
+        # The clock is only a TRUNCATION while work is LEFT. The check runs after each result
+        # including the last, so a night that drained every candidate and crossed the deadline
+        # on its way out reported itself truncated — and a flag that is true on a converged
+        # night is as unreadable as no flag, which is the whole point of having it.
+        if processed < total and System.monotonic_time(:millisecond) >= deadline,
+          do: {:halt, {count, processed}},
+          else: {:cont, {count, processed}}
       end)
+
+    budget_exhausted = processed < total
 
     # NEVER silent (#761 acceptance). A truncated night and a night with nothing left to
     # judge are the same number in `judged` alone, and telling them apart is the whole
-    # question when the queue stops converging.
+    # question when the queue stops converging — which is why the COUNT cap gets its own
+    # line: it truncates without the clock ever firing.
     if budget_exhausted do
       Logger.warning(
         "KnowledgeLintWorker: tenant=#{tenant_id} conflict judging hit its " <>
-          "#{budget_ms}ms budget after #{judged} of #{length(unjudged)} candidates; " <>
+          "#{budget_ms}ms budget after #{judged} of #{total} candidates; " <>
           "the remainder is retried next run."
       )
     end
 
-    %{judged: judged, candidates: length(unjudged), budget_exhausted: budget_exhausted}
+    if count_capped do
+      Logger.warning(
+        "KnowledgeLintWorker: tenant=#{tenant_id} conflict judging was truncated by its " <>
+          "#{cap}-judgement count cap; more pairs are flagged than one night can offer."
+      )
+    end
+
+    %{
+      judged: judged,
+      candidates: total,
+      budget_exhausted: budget_exhausted,
+      count_capped: count_capped
+    }
   end
 
   defp judge_concurrency,
@@ -710,10 +822,21 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
 
     verdict = judge_pair(tenant_id, src, tgt, similarity, opts)
 
-    with {:ok, _} = ok <- record_verdict(tenant_id, src, tgt, verdict) do
-      maybe_record_contradiction(tenant_id, src, tgt, verdict)
-      ok
-    end
+    # ONE transaction across both writes. The budget's halt kills whatever the reduce
+    # abandons (`Task.async_stream` brutal-kills in-flight tasks), and a kill landing between
+    # them would leave a `:contradictory` verdict recorded with no `:contradicts` edge —
+    # permanently, since `judged_pair_subquery/0` never offers a judged pair again and
+    # `Knowledge.find_contradiction_clusters/2` reads only the edge.
+    AdminRepo.transaction(fn ->
+      case record_verdict(tenant_id, src, tgt, verdict) do
+        {:ok, recorded} ->
+          maybe_record_contradiction(tenant_id, src, tgt, verdict)
+          recorded
+
+        {:error, changeset} ->
+          AdminRepo.rollback(changeset)
+      end
+    end)
   end
 
   # Load both bodies and hand them to the judge. A pair whose articles cannot both be loaded
@@ -1105,12 +1228,15 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         # over several nights, the drain is merely holding the line and the caps need
         # revisiting — that is not visible from either number alone.
         "conflicts_judged_redundant" => judged.judged,
-        # And the two numbers that say WHY judged is what it is. Without them a night the
-        # budget truncated and a night with nothing left to judge are indistinguishable in
-        # the audit trail, so "the drain is holding the line" above cannot be read at all
-        # — the reading that was unavailable for the six nights of #761.
+        # And the three numbers that say WHY judged is what it is. Without them a night one
+        # of the two bounds truncated and a night with nothing left to judge are
+        # indistinguishable in the audit trail, so "the drain is holding the line" above
+        # cannot be read at all — the reading that was unavailable for the six nights of
+        # #761. Both bounds report: the clock, and the count cap that truncates silently
+        # while the clock never fires.
         "conflicts_judge_candidates" => judged.candidates,
         "conflicts_judge_budget_exhausted" => judged.budget_exhausted,
+        "conflicts_judge_count_capped" => judged.count_capped,
         # Same convergence reading as the pair above, for the graph. `links_prunable_remaining`
         # is what a capped run could not reach; 0 means nothing DELETABLE is left, which is
         # weaker than "at target degree" — an edge spared as conflict-promoter input is

@@ -795,6 +795,24 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       assert timeout - KnowledgeLintWorker.judge_budget_ms() >= :timer.minutes(2)
     end
 
+    test "the job timeout stays UNDER Oban's Lifeline rescue window" do
+      # Lifeline does not check whether a job is alive: past `rescue_after` it moves anything
+      # still `executing` back to `available`. A timeout above that window buys a SECOND
+      # concurrent nightly pass on the same tenant — the same pairs billed twice and two
+      # `apply_consolidation/2` runs against one report. Read from the real plugin list, so
+      # lowering `rescue_after` fails here instead of in production.
+      rescue_after =
+        Enum.find_value(Loopctl.ObanConfig.plugins(), fn
+          {Oban.Plugins.Lifeline, opts} -> Keyword.fetch!(opts, :rescue_after)
+          _other -> nil
+        end)
+
+      assert is_integer(rescue_after)
+
+      assert KnowledgeLintWorker.timeout(%Oban.Job{args: %{}}) < rescue_after,
+             "a job allowed to outlast the rescue window runs concurrently with itself"
+    end
+
     test "an exhausted budget stops the stream, is reported, and is LOGGED" do
       # Budget injected per call rather than through `Application.put_env`, which would
       # mutate VM-global state every other test in this async suite can see.
@@ -823,6 +841,43 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       assert log =~ "1 of 2 candidates"
     end
 
+    test "a run that drains every candidate is NOT reported as truncated, however late" do
+      # The false alarm this bound is worthless without. The deadline is checked after each
+      # result including the last, so a spent clock on the FINAL judgement used to halt with
+      # `budget_exhausted: true` while nothing remained — the audit event calling a converged
+      # night truncated, on the exact night it converged.
+      tenant = fixture(:tenant)
+      a = published_article_with_embedding(tenant.id, similar_embedding())
+      b = published_article_with_embedding(tenant.id, near_similar_embedding())
+      flagged_pair(tenant.id, a.id, b.id, 0.97)
+
+      result = KnowledgeLintWorker.judge_redundant_conflicts(tenant.id, budget_ms: 0)
+
+      assert result.judged == 1
+      assert result.candidates == 1
+      refute result.budget_exhausted, "there is no remainder to retry"
+    end
+
+    test "the COUNT cap truncates visibly too, not only the clock" do
+      # The count cap is the older bound and truncates while the clock never fires: with
+      # `candidates` capped by the same limit, a night bigger than the cap reads exactly like
+      # a night that had that many and drained them — which is how 15,246 flags sat at
+      # 2000/night for eleven nights behind an audit event that said the queue had converged.
+      tenant = fixture(:tenant)
+      a = published_article_with_embedding(tenant.id, similar_embedding())
+      b = published_article_with_embedding(tenant.id, near_similar_embedding())
+      c = published_article_with_embedding(tenant.id, similar_embedding())
+      d = published_article_with_embedding(tenant.id, near_similar_embedding())
+      flagged_pair(tenant.id, a.id, b.id, 0.97)
+      flagged_pair(tenant.id, c.id, d.id, 0.96)
+
+      capped = KnowledgeLintWorker.judge_redundant_conflicts(tenant.id, cap: 1)
+
+      assert capped.candidates == 1
+      assert capped.judged == 1
+      assert capped.count_capped, "a pair was left unoffered and nothing says so"
+    end
+
     test "the untruncated run judges everything and says the budget was NOT the reason" do
       # The negative half of the pair above: without it, a bound that fires unconditionally
       # would pass every assertion in the truncation test.
@@ -839,6 +894,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       assert result.judged == 2
       assert result.candidates == 2
       refute result.budget_exhausted
+      refute result.count_capped
     end
 
     test "the audit event separates a truncated night from a night with nothing to judge" do
@@ -856,6 +912,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       # are the same judged count without them.
       assert entry.new_state["conflicts_judge_candidates"] == 1
       assert entry.new_state["conflicts_judge_budget_exhausted"] == false
+      assert entry.new_state["conflicts_judge_count_capped"] == false
     end
   end
 end
