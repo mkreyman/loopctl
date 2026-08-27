@@ -206,12 +206,13 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # same window, so it is the drained backlog, not the zeros, that says the burst ended.
   #
   # A burst is therefore absorbed rather than fatal: it truncates some nights, says so, and
-  # drains at ~760-1,260 a night until it is caught up — 15,246 takes TWELVE nights at the
-  # promoter rate measured on 2026-08-27 (0 candidates) and TWENTY if the promoter
-  # saturates its 500/night cap; quote the range, not one end of it. That holds only
-  # while a fresh burst does not land before the last one clears, and both causes are
+  # drains at ~760-1,260 a night until it is caught up — 15,246 takes THIRTEEN nights at the
+  # promoter rate measured on 2026-08-27 (0 candidates) and TWENTY-ONE if the promoter
+  # saturates its 500/night cap; quote the range, not one end of it, and CEIL it — a
+  # remainder is a whole further night, on which the flags still report truncated. That holds
+  # only while a fresh burst does not land before the last one clears, and both causes are
   # operator-started and repeatable (`TagBackfillWorker` is deliberately not on a cron), so
-  # a re-run means another ~20 truncated nights rather than a fault. The broken 3x10-minute
+  # a re-run means another ~21 truncated nights rather than a fault. The broken 3x10-minute
   # path incidentally judged 1,700-2,800 a night by dying three times; it also lost the
   # night's audit event and re-spent the nightly caps per attempt, so that is not a
   # throughput to miss.
@@ -415,15 +416,42 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # budget — would otherwise start a full-length judging step inside a job that can no longer
   # contain it and die with `Oban.TimeoutError`: #761 again, and now with tonight's
   # unpublishes already committed and an Oban retry about to spend the nightly caps again.
-  # `@judge_overshoot_ms` pays for the one in-flight provider call the deadline cannot
-  # interrupt. Sized for the WORST such call rather than the typical one: Anthropic
-  # `receive_timeout` 25 s x `extraction_max_retries` + 1 attempts, plus Req's ~1 s backoff
-  # (`claude_content_extractor.ex:119-129`). At 45 s it was sized for a single attempt, so
-  # one slow-transient call could outlast the whole allowance and push the job past
-  # `timeout/1` — an `Oban.TimeoutError` retry that re-runs `apply_consolidation/2` and
-  # spends the nightly caps again, which is #761's shape. Both clock-bounded steps subtract
-  # it, and both have exactly this exposure.
-  @judge_overshoot_ms :timer.seconds(60)
+  # `judge_overshoot_ms/0` pays for the one in-flight provider call the deadline cannot
+  # interrupt, sized for the WORST such call rather than the typical one. It is DERIVED at
+  # call time from the two values that set that worst case — `extraction_receive_timeout_ms`
+  # x `extraction_max_retries` + 1 attempts, plus Req's ~1 s backoff
+  # (`claude_content_extractor.ex:119-129`) — and not written down as a literal, because both
+  # are live-tunable `SystemConfig` rows with no upper clamp: a literal is a second source of
+  # truth that an operator raising either row moves out from under with no signal at all.
+  # At a hardcoded 45 s it was sized for a single attempt, so one slow-transient call could
+  # outlast the whole allowance and push the job past `timeout/1` — an `Oban.TimeoutError`
+  # retry that re-runs `apply_consolidation/2` and spends the nightly caps again, which is
+  # #761's shape. `SystemConfig.get_int/2` reads `:persistent_term` and never raises, so this
+  # costs no query. The FLOOR keeps the seeded defaults (25 s x 2 + 1 s = 51 s) at the 60 s
+  # they were raised to; the derivation is what tracks a raised row. Both clock-bounded steps
+  # subtract it, and both have exactly this exposure.
+  @judge_overshoot_floor_ms :timer.seconds(60)
+  @req_transient_backoff_ms :timer.seconds(1)
+
+  @doc false
+  @spec judge_overshoot_ms() :: pos_integer()
+  def judge_overshoot_ms do
+    judge_overshoot_ms(
+      SystemConfig.get_int("extraction_receive_timeout_ms", 25_000),
+      SystemConfig.get_int("extraction_max_retries", 1)
+    )
+  end
+
+  @doc false
+  @spec judge_overshoot_ms(integer(), integer()) :: pos_integer()
+  def judge_overshoot_ms(receive_timeout_ms, max_retries) do
+    attempts = max(max_retries, 0) + 1
+
+    max(
+      max(receive_timeout_ms, 0) * attempts + @req_transient_backoff_ms,
+      @judge_overshoot_floor_ms
+    )
+  end
 
   @doc false
   @spec judge_budget_remaining(integer()) :: non_neg_integer()
@@ -431,7 +459,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     elapsed = System.monotonic_time(:millisecond) - started_at
     budget = judge_budget_ms()
 
-    (budget + @job_reserve_ms - elapsed - @judge_overshoot_ms)
+    (budget + @job_reserve_ms - elapsed - judge_overshoot_ms())
     |> max(0)
     |> min(budget)
   end
@@ -443,7 +471,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   handed the time the job has LEFT once the judge's own budget is set aside, never a fresh
   budget beside a reserve nothing enforces. `job_timeout_ms/1 - judge_budget_ms/0` is the
   reserve, so a prelude that overran shrinks THIS step rather than pushing the night past
-  `timeout/1` — with `@judge_overshoot_ms` paying for the one in-flight provider call a
+  `timeout/1` — with `judge_overshoot_ms/0` paying for the one in-flight provider call a
   deadline cannot interrupt, which this step has exactly as much as the judge does.
 
   Public (`@doc false`-adjacent) so a test can read the same number on both sides of the
@@ -454,7 +482,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     elapsed = System.monotonic_time(:millisecond) - started_at
 
     (job_timeout_ms(configured_judge_budget_ms()) - judge_budget_ms() - elapsed -
-       @judge_overshoot_ms)
+       judge_overshoot_ms())
     |> max(0)
     |> min(retitle_budget_ms())
   end
@@ -862,39 +890,45 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     #
     # And a COUNT is not a bound on this step (#761). `cap` bounds how many pairs are
     # attempted; it says nothing about what they cost, because the cost per pair is an
-    # outbound call whose latency belongs to a provider. `Enum.reduce_while/3` over the
-    # stream adds the bound that is actually load-bearing — a wall clock — and it is
-    # checked as each result lands, so the granularity is one judgement (~1.7 s). At most
-    # `judge_concurrency()` in-flight calls are abandoned when it fires: those are billed
-    # and their verdicts lost, which is the price of the step ending on time, and the pairs
-    # return at the head of tomorrow's highest-similarity-first queue.
+    # outbound call whose latency belongs to a provider. A wall clock is the bound that is
+    # actually load-bearing, and it is checked at the HEAD of each task — before the call,
+    # never after the result. `async_stream` starts `judge_concurrency()` tasks before the
+    # reducer sees anything, so a post-item check was unconditionally committed to that many
+    # outbound calls and their writes; a `:dismiss` is TERMINAL on record, so nothing brings
+    # those pairs back. A budget of exactly 0 — the state a night whose prelude overran
+    # arrives in, and `judge_budget_remaining/1` floors at 0 — must therefore buy no call at
+    # all. The retitle drain checks its own deadline the same way, for the same reason.
+    #
+    # An `:expired` task made no call and judged nothing, so it is not counted as processed:
+    # `processed < total` is what reports the truncation, and a night that drained every
+    # candidate never reaches another check, so a converged night is never flagged truncated.
+    # At most `judge_concurrency()` calls already in flight when the clock fires are
+    # abandoned: those are billed and their verdicts lost, which is the price of the step
+    # ending on time, and the pairs return at the head of tomorrow's
+    # highest-similarity-first queue.
     total = length(unjudged)
 
     {judged, processed} =
       unjudged
       |> Task.async_stream(
-        fn pair -> judge_pair_safely(tenant_id, pair, opts) end,
+        fn pair ->
+          if System.monotonic_time(:millisecond) >= deadline do
+            :expired
+          else
+            judge_pair_safely(tenant_id, pair, opts)
+          end
+        end,
         max_concurrency: judge_concurrency(),
         timeout: :infinity,
         on_timeout: :kill_task,
         ordered: false
       )
       |> Enum.reduce_while({0, 0}, fn result, {count, processed} ->
-        count =
-          case result do
-            {:ok, {:ok, _}} -> count + 1
-            _other -> count
-          end
-
-        processed = processed + 1
-
-        # The clock is only a TRUNCATION while work is LEFT. The check runs after each result
-        # including the last, so a night that drained every candidate and crossed the deadline
-        # on its way out reported itself truncated — and a flag that is true on a converged
-        # night is as unreadable as no flag, which is the whole point of having it.
-        if processed < total and System.monotonic_time(:millisecond) >= deadline,
-          do: {:halt, {count, processed}},
-          else: {:cont, {count, processed}}
+        case result do
+          {:ok, :expired} -> {:halt, {count, processed}}
+          {:ok, {:ok, _}} -> {:cont, {count + 1, processed + 1}}
+          _other -> {:cont, {count, processed + 1}}
+        end
       end)
 
     budget_exhausted = processed < total

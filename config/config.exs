@@ -971,7 +971,7 @@ config :loopctl, :knowledge_tag_backfill_concurrency, 2
 # ON by default: it degrades to the previous similarity-only verdict on a tenant with no LLM
 # key, a provider outage or an unparseable reply, so a deployment that cannot use it is
 # exactly where it was. Cost is per FLAGGED PAIR, not per search, and the bound that holds is
-# the wall-clock budget below (~1,400 judgements a night); the judgement cap
+# the wall-clock budget below (~1,260 judgements a night); the judgement cap
 # (`:knowledge_lint_max_conflict_judgements`, 2000) sits ABOVE it and never fires first. It
 # used to say "~450/day in practice" and lean on that count cap alone; on 2026-08-20 a BURST
 # through the ingestion novelty gate, which no promoter cap bounds, put ~13,000 of a
@@ -990,9 +990,11 @@ config :loopctl, :knowledge_conflict_judge_concurrency, 2
 # WALL-CLOCK budget for that step, and the bound that actually holds (#761). The judgement
 # cap above counts ATTEMPTS; this counts TIME, which is what a step whose per-item cost is
 # an outbound provider call really spends. Measured in production 2026-08-27 on the
-# 86k-article tenant, one judgement is ~1.7 s wall / ~0.85 s at concurrency 2, so 20 minutes
-# drains ~1,400 pairs a night GROSS — ~900 net of the promoter's own 500/night cap, which
-# feeds the same queue.
+# 86k-article tenant, one judgement is ~1.7 s wall / ~0.85 s at concurrency 2, so ~70 pairs a
+# minute. The 20 minutes set below is a REQUEST, not the budget: the worker clamps it to 18
+# (`@judge_budget_ceiling_ms`, once the retitle step's reserve is carved out of the same job),
+# so the drain is ~1,260 pairs a night GROSS — ~760 net of the promoter's own 500/night cap,
+# which feeds the same queue.
 #
 # The ingestion-time novelty gate is a SECOND producer that no promoter cap bounds, but its
 # #761 numbers are a BURST and not a rate: TOTAL flags per day were a flat 500 through 08-19
@@ -1001,9 +1003,10 @@ config :loopctl, :knowledge_conflict_judge_concurrency, 2
 # drain ran ~2,150/night, ABOVE the fixed path's ceiling, because the broken 3x10-minute path
 # incidentally judged 1,700-2,800 a night by dying three times — losing the night's audit
 # event and re-spending the nightly caps per attempt, so it is not a throughput to miss. A
-# burst of that shape truncates some nights, says so, and drains at ~900-1,400/night until it
-# is caught up — 15,246 takes ELEVEN nights at the promoter rate measured on 2026-08-27 (0
-# candidates) and SEVENTEEN if the promoter saturates its 500/night cap. Its causes (a tag
+# burst of that shape truncates some nights, says so, and drains at ~760-1,260/night until it
+# is caught up — 15,246 takes THIRTEEN nights at the promoter rate measured on 2026-08-27 (0
+# candidates) and TWENTY-ONE if the promoter saturates its 500/night cap (CEILED: a remainder
+# is a whole further truncated night). Its causes (a tag
 # backfill, a structural-linking pass) are operator-started and repeatable. Only an inflow
 # sustained above the drain
 # needs a bound of its own, and the reading that says so is `conflicts_judge_count_capped` /
@@ -1016,11 +1019,12 @@ config :loopctl, :knowledge_conflict_judge_concurrency, 2
 # silence is not evidence.
 #
 # `Loopctl.Workers.KnowledgeLintWorker.timeout/1` is DERIVED from this value plus a
-# five-minute reserve for the rest of the night. The value itself is CLAMPED so that sum
-# stays below Oban's 30-minute Lifeline rescue window (a job that outlasts it is
-# re-dispatched concurrently with itself), which puts the ceiling at the 20 minutes set
-# here: raising this number therefore raises NOTHING — not the job, and not the budget any
-# reader of it gets. That derivation is the fix: a flat 10-minute job timeout stood next to
+# reserve for the rest of the night. The value itself is CLAMPED so that sum stays below
+# Oban's 30-minute Lifeline rescue window (a job that outlasts it is re-dispatched
+# concurrently with itself), and that ceiling is 18 MINUTES — below the 20 set here, so the
+# 20 is already clamped and raising it changes NOTHING: not the job, not the budget any
+# reader of it gets, and not the derived figures above, which are all 18-minute numbers.
+# `Loopctl.Workers.KnowledgeLintWorker.judge_budget_ms/0` is the value actually spent. That derivation is the fix: a flat 10-minute job timeout stood next to
 # a 2000-call ceiling worth ~28 minutes, latent until an ingestion burst outgrew the promoter cap on
 # 2026-08-20, after which every attempt on six consecutive nights was discarded with
 # Oban.TimeoutError and no consolidation report was produced at all.

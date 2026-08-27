@@ -1248,22 +1248,25 @@ defmodule Loopctl.Knowledge.Consolidation do
 
   ## Nothing is trusted from the proposal
 
-  The article is re-fetched LIVE and must still be published, still shared-visibility, and
-  its title must still match the placeholder pattern. Between the scan and the write a human
-  may have retitled it, and completing their edit for them — with a machine title, hours
-  later — is exactly the failure `still_colliding/5` exists to prevent on the other class.
-  A CURATED article is skipped too: `Article.update_changeset/2` clears the governed curated
-  marker on any title change, and clearing it is the one part of this write that putting the
-  title back would NOT undo.
+  The article is re-fetched LIVE — before the provider call and AGAIN after it — and must
+  still be published, still shared-visibility, and its title must still match the placeholder
+  pattern. Between the scan and the write a human may have retitled it, and completing their
+  edit for them — with a machine title, hours later — is exactly the failure
+  `still_colliding/5` exists to prevent on the other class. A CURATED article is skipped too:
+  `Article.update_changeset/2` clears the governed curated marker on any title change, and
+  clearing it is the one part of this write that putting the title back would NOT undo. So is
+  a title that normalizes onto another live SHARED published article's (`title_key_taken`) —
+  writing it would manufacture the `:duplicate_capture` group the sibling drain retracts.
 
   ## Abstention beats invention
 
   The title is derived from the article's own opening bytes through the existing
   `Loopctl.Knowledge.ContentExtractorBehaviour` seam (per-tenant BYO provider, so an
   Anthropic and an OpenAI-compatible tenant both work through `ContentExtractorRouter`).
-  A provider error, an unparseable reply, an empty body, a reply whose title is itself a
-  placeholder, one over the 500-character column limit, or one that normalizes to the title
-  already there — every one of them ABSTAINS and is counted in `abstained`. A wrong title is
+  A provider error, an unparseable reply, a reply naming SEVERAL articles rather than one, an
+  empty body, a reply whose title is itself a placeholder, one over the 500-character column
+  limit, or one that normalizes to the title already there — every one of them ABSTAINS and
+  is counted in `abstained`, whether it is noticed before the provider call or after. A wrong title is
   worse than a placeholder: the placeholder announces that nobody has named the article,
   while a confident wrong name does not.
 
@@ -1550,11 +1553,16 @@ defmodule Loopctl.Knowledge.Consolidation do
   # This narrows the window to the statement pair below rather than closing it: a
   # precondition ON the update would have to live in `Knowledge.update_article/4`, which
   # every other caller shares. The remaining window is microseconds against 25 seconds.
+  # The two outcomes stay DISTINCT across the call, exactly as `retitle_proposal/3` keeps
+  # them ten lines above: `classify_live/1` makes an empty body an abstention on purpose
+  # ("the article is still a live candidate"), so funnelling it into `:skip` here counted
+  # one condition in two different buckets depending only on whether the provider call had
+  # already returned — and moved it out of the counter `log_provider_unconfigured/2` reads.
   defp revalidate_and_write(tenant_id, proposal, title) do
     case live_placeholder(tenant_id, proposal) do
       {:ok, live} -> checked_write(tenant_id, proposal, live, title)
       {:skip, reason} -> retitle_skip(tenant_id, proposal, reason)
-      {:abstain, reason} -> retitle_skip(tenant_id, proposal, reason)
+      {:abstain, reason} -> retitle_abstain(tenant_id, proposal, reason)
     end
   end
 
@@ -1563,12 +1571,33 @@ defmodule Loopctl.Knowledge.Consolidation do
     :skip
   end
 
+  defp retitle_abstain(tenant_id, proposal, reason) do
+    log_retitle_abstained(tenant_id, proposal, reason)
+    :abstain
+  end
+
   defp checked_write(tenant_id, proposal, article, title) do
     if title_key_taken?(tenant_id, article.id, title) do
-      retitle_skip(tenant_id, proposal, :title_key_taken)
+      log_retitle_collided(tenant_id, proposal)
+      :skip
     else
       write_title(tenant_id, proposal, article, title)
     end
+  end
+
+  # Its OWN line, not `log_retitle_skipped/3`'s: that sentence says the article "is no longer
+  # the candidate that was confirmed", which is the one thing this skip is not — the article
+  # is exactly the confirmed candidate, and the collision recurs at one provider call a night
+  # until generation differs. An operator reading the tally needs to see the recurring cost,
+  # not a class that reads as self-resolving.
+  defp log_retitle_collided(tenant_id, proposal) do
+    Logger.info(
+      "Consolidation: tenant=#{tenant_id} skipped generic_title proposal " <>
+        "##{proposal.number} (title_key_taken) — the generated title normalizes onto a live " <>
+        "shared article's, so applying it would manufacture the very duplicate group this " <>
+        "pass retracts. The placeholder stands and is re-offered, at one provider call a " <>
+        "night, until a generation differs."
+    )
   end
 
   # The generated title must not collide with another live article under the pass's OWN
@@ -1580,15 +1609,29 @@ defmodule Loopctl.Knowledge.Consolidation do
   # it is a SKIP: the placeholder stands and tomorrow's generation may differ. Both sides are
   # normalized by Postgres (`@title_key_sql`), never by the Elixir twin, so the comparison is
   # the one the grouping will actually make.
+  #
+  # Scoped by `published_base/1` — `status == :published` composed with `shared_only/1` — for
+  # the same reason: it is the SAME set `title_drift_groups/1` groups over, so this refuses
+  # exactly the collisions that can manufacture the group and no others. Scoping it to the
+  # raw index's `not in [:archived, :superseded]` instead let a DRAFT, or an agent's PRIVATE
+  # memory, veto a shared retitle that could never have formed a group — and that refusal is
+  # PERMANENT, since the collision is deterministic and the placeholder is re-offered every
+  # night. `shared_only/1` is composed into every place that decides whether an article of
+  # this tenant is in scope, and this is one of them.
+  #
+  # And on `heavy_all/2`, not `AdminRepo`, like every other whole-corpus scan here: there is
+  # no expression index on `@title_key_sql`, so this evaluates the normalization per row, and
+  # the AdminRepo pool is 3 connections that every authenticated request also checks out of.
   defp title_key_taken?(tenant_id, article_id, title) do
-    from(a in Article,
-      where: a.tenant_id == ^tenant_id,
+    from(a in published_base(tenant_id),
       where: a.id != ^article_id,
-      where: a.status not in [:archived, :superseded],
       where:
-        fragment(unquote(@title_key_sql), a.title) == fragment(unquote(@title_key_sql), ^title)
+        fragment(unquote(@title_key_sql), a.title) == fragment(unquote(@title_key_sql), ^title),
+      limit: 1,
+      select: 1
     )
-    |> AdminRepo.exists?()
+    |> heavy_all(tenant_id)
+    |> Enum.any?()
   end
 
   # The provider call, and the ONE place bytes of this tenant's corpus leave. Scoped to the

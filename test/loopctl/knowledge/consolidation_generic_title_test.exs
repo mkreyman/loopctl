@@ -412,6 +412,60 @@ defmodule Loopctl.Knowledge.ConsolidationGenericTitleTest do
 
       assert reload(article.id).title == "Untitled"
     end
+
+    test "a DRAFT or an agent-PRIVATE article never blocks a retitle it could not group with" do
+      # The group this guard exists to prevent is built by `title_drift_groups/1` over
+      # `published_base/1` — published AND shared-visibility — so the guard is scoped the same
+      # way. Scoped instead to the raw index's active statuses, rows that can never join that
+      # group vetoed the write, and PERMANENTLY: the collision is deterministic, so the
+      # placeholder was re-offered, re-generated at one provider call a night, and never fixed.
+      tenant = fixture(:tenant)
+
+      fixture(:article, %{
+        tenant_id: tenant.id,
+        title: "Ecto changesets: validate before cast",
+        category: :pattern,
+        tags: [],
+        body: "A draft nobody published."
+      })
+
+      published(tenant.id, %{
+        title: "Ecto changesets, validate before cast",
+        metadata: %{"visibility" => "private"}
+      })
+
+      article = placeholder(tenant.id)
+      expect_title("Ecto Changesets - Validate Before Cast")
+
+      assert %{applied: 1, skipped: 0, abstained: 0, failed: 0, offered: 1} =
+               Consolidation.apply_confirmed_generic_titles(tenant.id)
+
+      assert reload(article.id).title == "Ecto Changesets - Validate Before Cast"
+    end
+
+    test "an empty body found AFTER the provider call ABSTAINS, exactly as it does before" do
+      # `classify_live/1` makes an empty body an abstention on purpose — the article is still
+      # a live candidate, it just cannot be named from content it does not have. The post-call
+      # re-read runs the same classifier, so the same condition must land in the same counter;
+      # funnelling it into `skipped` made the bucket depend only on whether the provider call
+      # had already returned, and moved it out of the tally the keyless-tenant warning reads.
+      tenant = fixture(:tenant)
+      article = placeholder(tenant.id)
+
+      Mox.expect(MockContentExtractor, :extract_from_content, fn _scope, _content, _opts ->
+        article.id
+        |> reload()
+        |> Ecto.Changeset.change(%{body: "   "})
+        |> AdminRepo.update!()
+
+        {:ok, [%{title: @specific_title, body: "b", category: :pattern, tags: [], metadata: %{}}]}
+      end)
+
+      assert %{applied: 0, skipped: 0, abstained: 1, failed: 0, offered: 1} =
+               Consolidation.apply_confirmed_generic_titles(tenant.id)
+
+      assert reload(article.id).title == "Untitled"
+    end
   end
 
   describe "a write that could not be made" do

@@ -875,6 +875,25 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
 
       assert KnowledgeLintWorker.retitle_budget_remaining(now - :timer.hours(1)) == 0
     end
+
+    test "the overshoot allowance TRACKS the provider knobs it is sized for" do
+      # `extraction_receive_timeout_ms` and `extraction_max_retries` are live-tunable
+      # SystemConfig rows with no upper clamp, so a HARDCODED allowance stops covering the
+      # in-flight call it was sized for the moment an operator raises either one — silently,
+      # and what it lets through is an `Oban.TimeoutError` retry that re-runs
+      # `apply_consolidation/2` and re-spends the nightly caps (#761's shape). Read through
+      # the pure arity-2 form so nothing VM-global is mutated in this async suite.
+      assert KnowledgeLintWorker.judge_overshoot_ms(25_000, 1) == :timer.seconds(60),
+             "the seeded defaults sit under the floor, which is what keeps them at 60 s"
+
+      assert KnowledgeLintWorker.judge_overshoot_ms(45_000, 1) == :timer.seconds(91),
+             "a raised receive timeout raises the allowance with it"
+
+      assert KnowledgeLintWorker.judge_overshoot_ms(25_000, 3) == :timer.seconds(101),
+             "and so does a raised retry count"
+
+      assert KnowledgeLintWorker.judge_overshoot_ms() >= :timer.seconds(60)
+    end
   end
 
   describe "conflict judging is bounded by a wall clock, not only by a count (#761)" do
@@ -1005,34 +1024,44 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
         capture_log(fn ->
           result = KnowledgeLintWorker.judge_redundant_conflicts(tenant.id, budget_ms: 0)
 
-          # The deadline is checked as each result lands, so a spent budget stops the stream
-          # after the FIRST judgement rather than before it — the step always makes progress.
-          assert result.judged == 1
+          # The deadline is checked at the HEAD of each task, so a spent budget buys no
+          # judgement at all — not the rounded-up one a post-result check was committed to.
+          assert result.judged == 0
           assert result.candidates == 2
           assert result.budget_exhausted
         end)
 
-      # NEVER silent. `judged: 1` alone reads identically to "there was one pair", which is
+      # NEVER silent. `judged: 0` alone reads identically to "there were no pairs", which is
       # the reading that hid six dead nights.
       assert log =~ "conflict judging hit its"
-      assert log =~ "1 of 2 candidates"
+      assert log =~ "0 of 2 candidates"
     end
 
-    test "a run that drains every candidate is NOT reported as truncated, however late" do
-      # The false alarm this bound is worthless without. The deadline is checked after each
-      # result including the last, so a spent clock on the FINAL judgement used to halt with
-      # `budget_exhausted: true` while nothing remained — the audit event calling a converged
-      # night truncated, on the exact night it converged.
+    test "an EXHAUSTED clock buys zero provider calls, not a rounded-up one" do
+      # `async_stream` starts `judge_concurrency()` tasks before the reducer sees anything,
+      # so a check that ran after each RESULT was committed to that many outbound calls and
+      # their writes — and a `:dismiss` is terminal on record. The judge here EXITS on any
+      # call, so its tag in the log is the proof a call was made; a spent clock must produce
+      # none. The drained-night half of this pair is the untruncated test below.
       tenant = fixture(:tenant)
       a = published_article_with_embedding(tenant.id, similar_embedding())
       b = published_article_with_embedding(tenant.id, near_similar_embedding())
       flagged_pair(tenant.id, a.id, b.id, 0.97)
 
-      result = KnowledgeLintWorker.judge_redundant_conflicts(tenant.id, budget_ms: 0)
+      log =
+        capture_log(fn ->
+          result =
+            KnowledgeLintWorker.judge_redundant_conflicts(tenant.id,
+              budget_ms: 0,
+              conflict_judge_impl: ExitingJudge
+            )
 
-      assert result.judged == 1
-      assert result.candidates == 1
-      refute result.budget_exhausted, "there is no remainder to retry"
+          assert result.judged == 0
+          assert result.candidates == 1
+          assert result.budget_exhausted, "one candidate was left unjudged"
+        end)
+
+      refute log =~ "pool_checkout_timeout", "a spent clock reached the provider anyway"
     end
 
     test "the COUNT cap truncates visibly too, not only the clock" do
