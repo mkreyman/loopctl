@@ -978,12 +978,15 @@ config :loopctl, :knowledge_conflict_judge_concurrency, 2
 # cap above counts ATTEMPTS; this counts TIME, which is what a step whose per-item cost is
 # an outbound provider call really spends. Measured in production 2026-08-27 on the
 # 86k-article tenant, one judgement is ~1.7 s wall / ~0.85 s at concurrency 2, so 20 minutes
-# drains ~1,400 pairs a night. That covers the promoter's 500/night with room to spare; it
-# does NOT cover the ingestion novelty gate, which no cap bounds and which put 15,246 flags
-# in over four days — ~3,800 a night. While the inflow runs above the drain the queue
-# DIVERGES, and no value here fixes that: bounding the flag inflow is the lever, and
-# `conflicts_judge_candidates` rising run over run with `conflicts_judge_count_capped` or
-# `conflicts_judge_budget_exhausted` set is the reading that says it is needed.
+# drains ~1,400 pairs a night, which covers the promoter's 500/night with room to spare.
+#
+# The ingestion-time novelty gate is a SECOND producer that no promoter cap bounds, but its
+# #761 numbers are a BURST and not a rate: flags per day were a flat 500 through 08-19, then
+# 8,569 / 1,506 / 656 / 4,515 on 08-20 through 08-23, then ZERO on 08-24 through 08-27. A
+# burst of that shape truncates some nights, says so, and drains at ~1,400/night until it is
+# caught up. Only an inflow sustained above the drain would need a bound of its own, and the
+# reading that would say so — never yet observed — is `conflicts_judge_candidates` rising run
+# over run with `conflicts_judge_count_capped` or `conflicts_judge_budget_exhausted` set.
 #
 # `Loopctl.Workers.KnowledgeLintWorker.timeout/1` is DERIVED from this value plus a
 # five-minute reserve for the rest of the night. The value itself is CLAMPED so that sum

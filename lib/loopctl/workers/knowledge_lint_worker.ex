@@ -168,15 +168,26 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # minutes drains ~1,400 pairs a night.
   #
   # A drain of ~1,400 covers `promote_conflicts/1` (at most
-  # `@default_max_conflict_promotions`, 500 a night) with room to spare. It does NOT cover
-  # the ingestion novelty gate, which no cap bounds and which put 15,246 flags in over four
-  # days — ~3,800 a night, above this drain, so while that inflow persists the queue
-  # DIVERGES and no value here fixes it: `timeout/1` is clamped below the Lifeline window,
-  # which makes ~20 minutes the ceiling rather than a starting point, and raising concurrency
-  # is not the lever either (it is deliberately below `ADMIN_POOL_SIZE`, default 3, the pool
-  # every authenticated request also checks out of). Bounding the flag inflow is. The reading
-  # that says it is needed is `conflicts_judge_candidates` rising run over run with
-  # `conflicts_judge_count_capped` or `conflicts_judge_budget_exhausted` set.
+  # `@default_max_conflict_promotions`, 500 a night) with room to spare, which is what makes
+  # the queue converge in the steady state.
+  #
+  # The SECOND producer is the ingestion-time novelty gate, and no promoter cap bounds it.
+  # Do not read its #761 numbers as a rate: flags created per day were a flat 500 through
+  # 08-19, then 8,569 / 1,506 / 656 / 4,515 on 08-20 through 08-23, then **ZERO on 08-24
+  # through 08-27** (measured, 2026-08-27). That was a BURST — a corpus tag backfill and a
+  # structural-linking pass landing together — not a nightly inflow, and averaging its four
+  # days into "~3,800 a night" is a mistake this comment made until it was checked against
+  # the per-day counts.
+  #
+  # So a burst is absorbed rather than fatal: it truncates some nights, says so, and drains
+  # at ~1,400 a night until it is caught up (the 15,246-flag burst clears in about eleven).
+  # What no value HERE could fix is an inflow that ran above the drain INDEFINITELY —
+  # `timeout/1` is clamped below the Lifeline window, so ~20 minutes is a ceiling rather
+  # than a starting point, and raising concurrency is not the lever either (it is
+  # deliberately below `ADMIN_POOL_SIZE`, default 3, the pool every authenticated request
+  # also checks out of). Bounding the flag inflow would be. The reading that would say it is
+  # needed — and which has never been observed — is `conflicts_judge_candidates` rising run
+  # over run with `conflicts_judge_count_capped` or `conflicts_judge_budget_exhausted` set.
   @default_judge_budget_ms :timer.minutes(20)
 
   @impl Oban.Worker
