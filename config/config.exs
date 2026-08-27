@@ -986,11 +986,12 @@ config :loopctl, :knowledge_conflict_judge_concurrency, 2
 # `conflicts_judge_budget_exhausted` set is the reading that says it is needed.
 #
 # `Loopctl.Workers.KnowledgeLintWorker.timeout/1` is DERIVED from this value plus a
-# five-minute reserve for the rest of the night, and CLAMPED below Oban's 30-minute Lifeline
-# rescue window (a job that outlasts it is re-dispatched concurrently with itself). So
-# raising this raises the job that contains it, up to that ceiling — which ~20 minutes plus
-# the reserve already reaches. That derivation is the fix: a flat 10-minute job timeout stood next to a 2000-call
-# ceiling worth ~28 minutes, latent until an ingestion burst outgrew the promoter cap on
+# five-minute reserve for the rest of the night. The value itself is CLAMPED so that sum
+# stays below Oban's 30-minute Lifeline rescue window (a job that outlasts it is
+# re-dispatched concurrently with itself), which puts the ceiling at the 20 minutes set
+# here: raising this number therefore raises NOTHING — not the job, and not the budget any
+# reader of it gets. That derivation is the fix: a flat 10-minute job timeout stood next to
+# a 2000-call ceiling worth ~28 minutes, latent until an ingestion burst outgrew the promoter cap on
 # 2026-08-20, after which every attempt on six consecutive nights was discarded with
 # Oban.TimeoutError and no consolidation report was produced at all.
 config :loopctl, :knowledge_lint_conflict_judge_budget_ms, :timer.minutes(20)

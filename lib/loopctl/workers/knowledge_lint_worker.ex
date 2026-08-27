@@ -304,14 +304,21 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # reads the real plugin option and binds it to this constant so the two cannot drift.
   @lifeline_rescue_after_ms :timer.minutes(30)
   @job_timeout_ceiling_ms @lifeline_rescue_after_ms - :timer.minutes(5)
+  # The ceiling is applied to the BUDGET, never to the derived timeout, so one clamped
+  # number is read on both sides of the derivation. Clamping the timeout alone left
+  # `judge_budget_ms/0` free to exceed the job containing it — the public
+  # `judge_redundant_conflicts/2` default takes it raw — and compressed `@job_reserve_ms`
+  # to nothing besides. Both are #761's shape.
+  @judge_budget_ceiling_ms @job_timeout_ceiling_ms - @job_reserve_ms
 
   @impl Oban.Worker
-  def timeout(_job), do: job_timeout_ms()
+  def timeout(_job), do: job_timeout_ms(configured_judge_budget_ms())
+
+  @doc false
+  @spec job_timeout_ms(pos_integer()) :: pos_integer()
+  def job_timeout_ms(configured_ms), do: judge_budget_ms(configured_ms) + @job_reserve_ms
 
   # --- Private ---
-
-  defp job_timeout_ms,
-    do: min(judge_budget_ms() + @job_reserve_ms, @job_timeout_ceiling_ms)
 
   # The judge is handed the time the job has LEFT, never a fresh budget. `@job_reserve_ms` is
   # a MEASURED constant and nothing makes the steps before the judge respect it, so a night
@@ -323,12 +330,15 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # interrupt (Anthropic `receive_timeout` 25 s).
   @judge_overshoot_ms :timer.seconds(45)
 
-  defp judge_budget_remaining(started_at) do
+  @doc false
+  @spec judge_budget_remaining(integer()) :: non_neg_integer()
+  def judge_budget_remaining(started_at) do
     elapsed = System.monotonic_time(:millisecond) - started_at
+    budget = judge_budget_ms()
 
-    (job_timeout_ms() - elapsed - @judge_overshoot_ms)
+    (budget + @job_reserve_ms - elapsed - @judge_overshoot_ms)
     |> max(0)
-    |> min(judge_budget_ms())
+    |> min(budget)
   end
 
   # FAIL-SOFT, like every step that runs after the night has already written state
@@ -338,33 +348,53 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # `:knowledge_consolidation_max_unpublishes` a second and a third time — a cap that is the
   # operator's only mid-incident lever (#617). Eating the error costs one night of executions
   # or judgements; not eating it costs a tripled cap.
-  @no_judgements %{judged: 0, candidates: 0, budget_exhausted: false, count_capped: false}
+  #
+  # A FAILED step reports -1, never 0 — the same convention as `prune_failed/2`'s
+  # `remaining: -1`, and for the same reason: a zero here is what a night with nothing left
+  # to do reports, so a step that died every night would read as a converged queue in the
+  # audit event, which is the exact misreading #761 is about. `candidates: -1` carries it
+  # because `judged: 0` is honest on a failed night and `candidates` is the convergence
+  # number the operator reads run over run.
+  @judging_failed %{judged: 0, candidates: -1, budget_exhausted: false, count_capped: false}
+  @executions_failed -1
 
   defp execute_resolutions(tenant_id) do
     Knowledge.execute_conflict_resolutions(tenant_id)
   rescue
-    error -> step_failed(tenant_id, "conflict resolution execution", ExitTag.tag(error), 0)
+    error ->
+      step_failed(
+        tenant_id,
+        "conflict resolution execution",
+        ExitTag.tag(error),
+        @executions_failed
+      )
   catch
     :exit, reason ->
-      step_failed(tenant_id, "conflict resolution execution", "exit:" <> ExitTag.tag(reason), 0)
+      step_failed(
+        tenant_id,
+        "conflict resolution execution",
+        "exit:" <> ExitTag.tag(reason),
+        @executions_failed
+      )
   end
 
   defp judge_conflicts(tenant_id, budget_ms) do
     judge_redundant_conflicts(tenant_id, budget_ms: budget_ms)
   rescue
-    error -> step_failed(tenant_id, "conflict judging", ExitTag.tag(error), @no_judgements)
+    error -> step_failed(tenant_id, "conflict judging", ExitTag.tag(error), @judging_failed)
   catch
     :exit, reason ->
-      step_failed(tenant_id, "conflict judging", "exit:" <> ExitTag.tag(reason), @no_judgements)
+      step_failed(tenant_id, "conflict judging", "exit:" <> ExitTag.tag(reason), @judging_failed)
   end
 
-  defp step_failed(tenant_id, step, tag, zero) do
+  defp step_failed(tenant_id, step, tag, fallback) do
     Logger.error(
-      "KnowledgeLintWorker: tenant=#{tenant_id} #{step} FAILED (#{tag}) — the lint pass and " <>
-        "its audit event still complete; the remainder is retried next run."
+      "KnowledgeLintWorker: tenant=#{tenant_id} #{step} FAILED (#{tag}) — the night's " <>
+        "already-committed work stands and the job is NOT retried; this step is retried " <>
+        "next run."
     )
 
-    zero
+    fallback
   end
 
   # Orphans split two ways:
@@ -698,7 +728,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     {judged, processed} =
       unjudged
       |> Task.async_stream(
-        fn pair -> judge_and_record(tenant_id, pair, opts) end,
+        fn pair -> judge_pair_safely(tenant_id, pair, opts) end,
         max_concurrency: judge_concurrency(),
         timeout: :infinity,
         on_timeout: :kill_task,
@@ -751,24 +781,62 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     }
   end
 
+  # TOTAL inside the task, on purpose. `Task.async_stream/3` LINKS its tasks to this
+  # process, so a raise or an exit inside one arrives here as an exit SIGNAL, which no
+  # `try/rescue` in `judge_conflicts/2`'s own stack can intercept — it would only ever have
+  # covered the candidate query. Every outbound call and every insert of this step runs in
+  # here, so one `Ecto.ConstraintError` or one AdminRepo checkout exit would otherwise still
+  # kill the night's audit event and hand the job to an Oban retry that re-runs
+  # `apply_consolidation/2` and spends `:knowledge_consolidation_max_unpublishes` again.
+  # A failed pair is simply not counted and returns at the head of tomorrow's queue.
+  defp judge_pair_safely(tenant_id, pair, opts) do
+    judge_and_record(tenant_id, pair, opts)
+  rescue
+    error -> judge_pair_failed(tenant_id, pair, ExitTag.tag(error))
+  catch
+    :exit, reason -> judge_pair_failed(tenant_id, pair, "exit:" <> ExitTag.tag(reason))
+  end
+
+  defp judge_pair_failed(tenant_id, pair, tag) do
+    Logger.error(
+      "KnowledgeLintWorker: tenant=#{tenant_id} judging pair " <>
+        "#{pair.source_article_id}/#{pair.target_article_id} FAILED (#{tag}); " <>
+        "the pair is offered again next run."
+    )
+
+    {:error, tag}
+  end
+
   defp judge_concurrency,
     do: Application.get_env(:loopctl, :knowledge_conflict_judge_concurrency, 2)
 
   @doc """
   Wall-clock budget for the nightly conflict-judging step, in milliseconds.
 
+  CLAMPED at `@judge_budget_ceiling_ms`, so every reader of this number — `timeout/1`,
+  `judge_budget_remaining/1`, and the public `judge_redundant_conflicts/2` default alike —
+  gets a budget the job can contain. A budget larger than the job containing it is
+  precisely the defect (#761) this replaces, so raising the config past the ceiling raises
+  nothing anywhere.
+
   Public because `timeout/1` is DERIVED from it and a test has to be able to read the same
-  number both sides of that derivation — a budget larger than the job that contains it is
-  precisely the defect (#761) this replaces.
+  number both sides of that derivation. The arity-1 form takes the configured value as an
+  argument so a test can drive a budget above the ceiling without `Application.put_env`.
   """
   @spec judge_budget_ms() :: pos_integer()
-  def judge_budget_ms do
-    Application.get_env(
-      :loopctl,
-      :knowledge_lint_conflict_judge_budget_ms,
-      @default_judge_budget_ms
-    )
-  end
+  def judge_budget_ms, do: judge_budget_ms(configured_judge_budget_ms())
+
+  @doc false
+  @spec judge_budget_ms(pos_integer()) :: pos_integer()
+  def judge_budget_ms(configured_ms), do: min(configured_ms, @judge_budget_ceiling_ms)
+
+  defp configured_judge_budget_ms,
+    do:
+      Application.get_env(
+        :loopctl,
+        :knowledge_lint_conflict_judge_budget_ms,
+        @default_judge_budget_ms
+      )
 
   # Correlated on the enclosing `as: :link`, TRUE when a `conflict_resolutions` row already
   # exists for the pair in EITHER direction. Mirrors `Knowledge.conflict_unresolved_subquery/0`
@@ -822,19 +890,20 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
 
     verdict = judge_pair(tenant_id, src, tgt, similarity, opts)
 
-    # ONE transaction across both writes. The budget's halt kills whatever the reduce
-    # abandons (`Task.async_stream` brutal-kills in-flight tasks), and a kill landing between
-    # them would leave a `:contradictory` verdict recorded with no `:contradicts` edge —
-    # permanently, since `judged_pair_subquery/0` never offers a judged pair again and
-    # `Knowledge.find_contradiction_clusters/2` reads only the edge.
+    # ONE transaction across both writes, and BOTH results decide it. The budget's halt kills
+    # whatever the reduce abandons (`Task.async_stream` brutal-kills in-flight tasks), and a
+    # kill landing between them would leave a `:contradictory` verdict recorded with no
+    # `:contradicts` edge — permanently, since `judged_pair_subquery/0` never offers a judged
+    # pair again and `Knowledge.find_contradiction_clusters/2` reads only the edge. A REJECTED
+    # edge insert leaves exactly the same permanent hole and is the likelier of the two:
+    # `ArticleLink.changeset/2` declares `foreign_key_constraint/2` on both ids, so an article
+    # deleted since `load_pair/3` comes back as `{:error, changeset}` rather than raising.
     AdminRepo.transaction(fn ->
-      case record_verdict(tenant_id, src, tgt, verdict) do
-        {:ok, recorded} ->
-          maybe_record_contradiction(tenant_id, src, tgt, verdict)
-          recorded
-
-        {:error, changeset} ->
-          AdminRepo.rollback(changeset)
+      with {:ok, recorded} <- record_verdict(tenant_id, src, tgt, verdict),
+           {:ok, _edge} <- maybe_record_contradiction(tenant_id, src, tgt, verdict) do
+        recorded
+      else
+        {:error, changeset} -> AdminRepo.rollback(changeset)
       end
     end)
   end
@@ -921,7 +990,9 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     )
   end
 
-  defp maybe_record_contradiction(_tenant_id, _src, _tgt, _verdict), do: :ok
+  # `{:ok, _}` and not `:ok`, so the caller's `with` reads one shape for "the edge is in
+  # place" whether one was needed or not.
+  defp maybe_record_contradiction(_tenant_id, _src, _tgt, _verdict), do: {:ok, :not_contradictory}
 
   defp embedded_ids(_tenant_id, []), do: MapSet.new()
 
@@ -1234,6 +1305,8 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         # cannot be read at all — the reading that was unavailable for the six nights of
         # #761. Both bounds report: the clock, and the count cap that truncates silently
         # while the clock never fires.
+        # A -1 in `conflicts_judge_candidates` (and in `resolutions_applied` below) means the
+        # step FAILED and is deliberately not 0, which would read as a drained queue.
         "conflicts_judge_candidates" => judged.candidates,
         "conflicts_judge_budget_exhausted" => judged.budget_exhausted,
         "conflicts_judge_count_capped" => judged.count_capped,
@@ -1248,5 +1321,15 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         "consolidation" => consolidation_state(consolidation, applied)
       }
     })
+  rescue
+    # FAIL-SOFT for the same reason the two steps before it are: this runs AFTER
+    # `apply_consolidation/2` committed tonight's unpublishes, so a raise here would hand the
+    # night to an Oban retry that re-runs them from the top and spends
+    # `:knowledge_consolidation_max_unpublishes` a second time. Losing the event is bad; a
+    # doubled cap is worse, and the Logger.info line in `lint_tenant/1` still carries the
+    # night's numbers.
+    error -> step_failed(tenant_id, "audit event", ExitTag.tag(error), :error)
+  catch
+    :exit, reason -> step_failed(tenant_id, "audit event", "exit:" <> ExitTag.tag(reason), :error)
   end
 end

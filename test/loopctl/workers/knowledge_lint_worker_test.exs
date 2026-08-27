@@ -811,6 +811,72 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
 
       assert KnowledgeLintWorker.timeout(%Oban.Job{args: %{}}) < rescue_after,
              "a job allowed to outlast the rescue window runs concurrently with itself"
+
+      # And at a budget that WOULD breach it: the default sits under the window with or
+      # without the clamp, so asserting only on the default cannot tell whether the clamp is
+      # there. The configured value is passed as an argument rather than through
+      # `Application.put_env`, which every other test in this async suite would see.
+      assert KnowledgeLintWorker.job_timeout_ms(:timer.minutes(40)) < rescue_after,
+             "raising the configured budget past the ceiling must raise nothing"
+
+      # The clamp holds the derivation's other half too — the reserve stays whole.
+      assert KnowledgeLintWorker.job_timeout_ms(:timer.minutes(40)) -
+               KnowledgeLintWorker.judge_budget_ms(:timer.minutes(40)) >= :timer.minutes(2)
+    end
+
+    test "the judge is handed the time the job has LEFT, never a fresh budget" do
+      # `@job_reserve_ms` is a measured constant and nothing makes the steps before the judge
+      # respect it, so a night whose prelude overran would otherwise start a full-length
+      # judging step inside a job that can no longer contain it and die with
+      # `Oban.TimeoutError` — #761 again, with tonight's unpublishes already committed.
+      now = System.monotonic_time(:millisecond)
+      full = KnowledgeLintWorker.judge_budget_ms()
+
+      assert KnowledgeLintWorker.judge_budget_remaining(now) == full,
+             "a night whose prelude cost nothing gets the whole budget, never more"
+
+      spent = now - (KnowledgeLintWorker.timeout(%Oban.Job{args: %{}}) - :timer.minutes(1))
+
+      assert KnowledgeLintWorker.judge_budget_remaining(spent) < full,
+             "a prelude that overran must shrink the judging step, not start a fresh one"
+
+      # Floors at 0: a negative budget is a deadline already in the past, which the reduce
+      # reads as "halt after the first result" rather than as "no budget".
+      assert KnowledgeLintWorker.judge_budget_remaining(now - :timer.hours(1)) == 0
+    end
+
+    defmodule ExitingJudge do
+      @moduledoc false
+      @behaviour Loopctl.Knowledge.ConflictJudge
+      @impl true
+      def judge(_scope, _left, _right, _opts), do: exit(:pool_checkout_timeout)
+    end
+
+    test "a pair that EXITS is contained inside its task, not taken out of the night" do
+      # `Task.async_stream/3` LINKS its tasks, so an exit inside one — an AdminRepo checkout
+      # timeout on the 3-connection pool is the production shape — arrives here as a SIGNAL
+      # that no rescue around the stream can intercept. Uncontained it kills the whole job:
+      # the night's audit event is lost and Oban retries a job whose unpublishes already
+      # committed, spending `:knowledge_consolidation_max_unpublishes` again. `ConflictJudge`
+      # rescues a RAISE for us; an exit is the half that has to be caught in the task.
+      tenant = fixture(:tenant)
+      a = published_article_with_embedding(tenant.id, similar_embedding())
+      b = published_article_with_embedding(tenant.id, near_similar_embedding())
+      flagged_pair(tenant.id, a.id, b.id, 0.97)
+
+      log =
+        capture_log(fn ->
+          result =
+            KnowledgeLintWorker.judge_redundant_conflicts(tenant.id,
+              conflict_judge_impl: ExitingJudge
+            )
+
+          assert result.candidates == 1
+          assert result.judged == 0, "a pair that never returned a verdict was not judged"
+          refute result.budget_exhausted, "the clock was not what stopped it"
+        end)
+
+      assert log =~ "pool_checkout_timeout"
     end
 
     test "an exhausted budget stops the stream, is reported, and is LOGGED" do
