@@ -44,6 +44,18 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
      cheap, and makes **no** embedding-API calls (orphans missing an embedding
      simply no-op in the linking worker — backfilling those is a separate
      concern, out of scope here).
+  2b. **Consumes the DRAFT queue** (#765/#766) — `Loopctl.Knowledge.DraftConsumer.consume/2`
+     assesses each held draft against the published corpus through the existing
+     `ProposalGate` seam and PUBLISHES it: a near-duplicate is published AND annotated with a
+     `relates_to` edge carrying its cosine score, which the promoter below turns into a
+     RECORDED `:potential_conflict` — a record for a human or an orchestrator, not a
+     retraction (see that module's doc for where the pair actually ends). Nothing is archived
+     — `:archived` is terminal, and an unattended writer may not take a one-way door
+     (#605/#606/#608). It runs HERE, first of the acting steps, so tonight's annotation is at
+     least flagged tonight; see the call site in `lint_tenant/1` for the full ordering
+     argument. It is the THIRD step whose per-item cost
+     is an outbound provider call, so it carries a wall clock of its own
+     (`draft_budget_remaining/1`) carved out of the same `timeout/1` — never beside it.
   3. **Prunes the `relates_to` graph to top-K degree** (#611 stage 0) via
      `Loopctl.Knowledge.LinkPruning`. A similarity threshold is not a bound: above
      0.6 the linking worker admitted every kNN candidate, and the hosted corpus
@@ -93,7 +105,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
      disposition: :dismiss`, because cosine similarity measures REDUNDANCY and
      cannot see contradiction, so recording what was actually measured is the
      only honest verdict available. The pile is drained by a WALL CLOCK and not
-     by the count cap — ~1,260 pairs a night gross, ~760 net of the promoter's
+     by the count cap — ~1,120 pairs a night gross, ~620 net of the promoter's
      own 500 (see `@default_judge_budget_ms`) — and the drain stays within the
      same night as the promoter so a pair flagged tonight never spends a night
      suppressing both its articles from curated answers.
@@ -127,6 +139,11 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   night and a night with nothing left to retitle are the same `generic_titles_retitled`
   otherwise.
 
+  Draft consumption is bounded by a wall clock (`draft_budget_remaining/1`, out of
+  `@draft_reserve_ms`) with `:knowledge_draft_consumer_max_publishes` bounding only the
+  candidate query, and it reports `drafts_offered` and `drafts_budget_exhausted` beside
+  `drafts_published` for the same reason the retitle step does.
+
   Conflict judging is bounded twice, by a count
   (`:knowledge_lint_max_conflict_judgements`) and by a wall clock
   (`:knowledge_lint_conflict_judge_budget_ms`), because only the second one bounds
@@ -157,6 +174,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   alias Loopctl.Knowledge.ConflictJudge
   alias Loopctl.Knowledge.ConflictResolution
   alias Loopctl.Knowledge.Consolidation
+  alias Loopctl.Knowledge.DraftConsumer
   alias Loopctl.Knowledge.LinkPruning
   alias Loopctl.Oban.FairShare
   alias Loopctl.SystemConfig
@@ -188,12 +206,12 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # outbound provider call is really spending. Measured in production 2026-08-27 on the
   # 86k-article tenant: one judgement is ~1.7 s wall, ~0.85 s at concurrency 2, so ~70 pairs
   # a minute. The 20 below is a REQUEST, not the budget: `@judge_budget_ceiling_ms` clamps it
-  # to 18 minutes once `@retitle_reserve_ms` is carved out of the same job (#765), so the
-  # drain is ~1,260 pairs a night GROSS. `promote_conflicts/1` feeds the same queue up
+  # to 16 minutes once `@retitle_reserve_ms` and `@draft_reserve_ms` are carved out of the same
+  # job (#765/#766), so the drain is ~1,120 pairs a night GROSS. `promote_conflicts/1` feeds the same queue up
   # to `@default_max_conflict_promotions` (500) a night, so against an existing backlog the
-  # NET drain is ~760 — and 500 is a CAP, not a rate (2026-08-27 measured the promoter at 0
-  # candidates), so ~760 is the worst case and ~1,260 the best. Every figure below is derived
-  # from that 18, so any change to either reserve moves them all.
+  # NET drain is ~620 — and 500 is a CAP, not a rate (2026-08-27 measured the promoter at 0
+  # candidates), so ~620 is the worst case and ~1,120 the best. Every figure below is derived
+  # from that 16, so any change to ANY of the three reserves moves them all.
   #
   # The SECOND producer is the ingestion-time novelty gate, and no promoter cap bounds it.
   # Do not read its #761 numbers as a rate. TOTAL flags created per day — both producers —
@@ -206,13 +224,13 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # same window, so it is the drained backlog, not the zeros, that says the burst ended.
   #
   # A burst is therefore absorbed rather than fatal: it truncates some nights, says so, and
-  # drains at ~760-1,260 a night until it is caught up — 15,246 takes THIRTEEN nights at the
-  # promoter rate measured on 2026-08-27 (0 candidates) and TWENTY-ONE if the promoter
+  # drains at ~620-1,120 a night until it is caught up — 15,246 takes FOURTEEN nights at the
+  # promoter rate measured on 2026-08-27 (0 candidates) and TWENTY-FIVE if the promoter
   # saturates its 500/night cap; quote the range, not one end of it, and CEIL it — a
   # remainder is a whole further night, on which the flags still report truncated. That holds
   # only while a fresh burst does not land before the last one clears, and both causes are
   # operator-started and repeatable (`TagBackfillWorker` is deliberately not on a cron), so
-  # a re-run means another ~21 truncated nights rather than a fault. The broken 3x10-minute
+  # a re-run means another ~25 truncated nights rather than a fault. The broken 3x10-minute
   # path incidentally judged 1,700-2,800 a night by dying three times; it also lost the
   # night's audit event and re-spent the nightly caps per attempt, so that is not a
   # throughput to miss.
@@ -269,6 +287,31 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     {:ok, report} = Knowledge.lint(tenant_id, max_per_category: @lint_max_per_category)
 
     action = act_on_orphans(tenant_id, report)
+    # FIRST of the acting steps, and the ordering is load-bearing in three ways.
+    #
+    # (1) SAME-NIGHT FLAGGING. A near-duplicate draft is published with a `relates_to` edge
+    #     carrying `auto_generated` and the cosine score — exactly what `promote_conflicts/1`
+    #     below reads. Running before it means the pair is flagged `:potential_conflict`
+    #     tonight rather than a night later, which is the same argument that already puts the
+    #     judge after the promoter. It does NOT mean the pair is judged tonight: the judge
+    #     takes its candidates in similarity order out of a standing backlog this file puts at
+    #     14-25 nights, and a flagged pair suppresses BOTH its articles from curated answers
+    #     for as long as it waits. That cost belongs to publishing the near-duplicate, which
+    #     the auto-linker would flag from the stored vector anyway; ordering only decides
+    #     whether it starts tonight or tomorrow.
+    # (2) SAME-NIGHT CONSOLIDATION. `consolidate/1` scans the published corpus, so an article
+    #     published here enters TONIGHT's `:duplicate_capture` report and can be confirmed
+    #     tomorrow. That is the reversible retraction path this step deliberately hands its
+    #     redundancy to, and it is also what terminates the one-round flip-flop the consumer's
+    #     moduledoc describes.
+    # (3) ITS BUDGET IS ACTUALLY THERE. `draft_budget_remaining/1` measures from the job start
+    #     out of the shared reserve, exactly as the retitle step's does, so the earlier it
+    #     runs the less of its own allowance a slow prelude has already spent.
+    #
+    # It does NOT run before `Knowledge.lint/2`: an article published here has no embedding
+    # yet (the publish only ENQUEUES one), so it would be reported as an orphan and
+    # `act_on_orphans/2` would enqueue a second embedding job for it the same night.
+    drafts = consume_drafts(tenant_id, draft_budget_remaining(started_at))
     # Ordering the prune against its neighbours is a matter of cost, not correctness, and both
     # halves of that are structural rather than positional. Union-kNN keeps every article's own
     # top-K, so an article holding at least one edge holds it at rank 1 and the prune cannot
@@ -310,6 +353,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
 
     log_audit_event(tenant_id, report, %{
       action: action,
+      drafts: drafts,
       pruned: pruned,
       promoted: promoted,
       judged: judged,
@@ -326,8 +370,17 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
       # OFFERED and the bound flag are both here, never just the applied count: a night the
       # clock cut short and a night with nothing left to retitle report the same
       # `generic_titles_retitled` otherwise, and that silent pair is the #761 misreading.
+      # OFFERED and the bound flag ride with the applied count for the #761 reason: a night
+      # the clock cut short and a night with no drafts left to consume report the same
+      # `drafts_published` otherwise.
       "KnowledgeLintWorker: tenant=#{tenant_id} issues=#{report.summary.total_issues} " <>
         "orphans_relinked=#{action.relinked} orphans_embedding_enqueued=#{action.embedding_enqueued} " <>
+        "drafts_published=#{drafts.published} drafts_offered=#{drafts.offered} " <>
+        "drafts_linked=#{drafts.linked} drafts_link_failed=#{drafts.link_failed} " <>
+        "drafts_unassessed=#{drafts.unassessed} drafts_skipped=#{drafts.skipped} " <>
+        "drafts_failed=#{drafts.failed} " <>
+        "drafts_budget_exhausted=#{drafts.budget_exhausted} " <>
+        "drafts_gate=#{drafts.gate} " <>
         "conflicts_promoted=#{promoted} conflicts_judged_redundant=#{judged.judged} " <>
         "conflicts_judge_candidates=#{judged.candidates} " <>
         "conflicts_judge_budget_exhausted=#{judged.budget_exhausted} " <>
@@ -381,9 +434,16 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # exactly what this step may spend, and `timeout/1` does not move. Raising `timeout/1` to
   # pay for a new step is the move #761 makes fatal — the Lifeline window is the real ceiling
   # and it is not ours to raise.
+  #   * `@draft_reserve_ms` is a BUDGET on the same terms as the one below it: the draft
+  #     consumer's per-item cost is an outbound EMBEDDING call, so it is bounded by a clock of
+  #     its own (`draft_budget_remaining/1`) rather than by how many drafts a night finds.
+  #     It COSTS the judge exactly two minutes — the judge's ceiling falls from 18 minutes to
+  #     16, ~1,120 pairs a night gross rather than ~1,260 — which is the arithmetic this
+  #     shared reserve exists to make automatic.
   @prelude_reserve_ms :timer.minutes(5)
   @retitle_reserve_ms :timer.minutes(2)
-  @job_reserve_ms @prelude_reserve_ms + @retitle_reserve_ms
+  @draft_reserve_ms :timer.minutes(2)
+  @job_reserve_ms @prelude_reserve_ms + @retitle_reserve_ms + @draft_reserve_ms
 
   # And CLAMPED below Oban's Lifeline window (`rescue_after: :timer.minutes(30)`,
   # `Loopctl.ObanConfig.plugins/0`). Lifeline never checks whether a job is still alive: it
@@ -500,12 +560,41 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   def retitle_budget_ms, do: @retitle_reserve_ms
 
   @doc """
+  Wall-clock budget (ms) the draft consumer may spend, given the job start.
+
+  DERIVED exactly as `retitle_budget_remaining/1` is, out of the SAME shared reserve, so a
+  prelude that overran shrinks this step rather than pushing the night past `timeout/1`.
+  `judge_overshoot_ms/0` pays for the one in-flight provider call a deadline cannot
+  interrupt — this step makes an embedding call per item and has that exposure in full.
+  """
+  @spec draft_budget_remaining(integer()) :: non_neg_integer()
+  def draft_budget_remaining(started_at) do
+    elapsed = System.monotonic_time(:millisecond) - started_at
+
+    (job_timeout_ms(configured_judge_budget_ms()) - judge_budget_ms() - elapsed -
+       judge_overshoot_ms())
+    |> max(0)
+    |> min(draft_budget_ms())
+  end
+
+  @doc """
+  The reserve carved out of `timeout/1` for the draft consumer.
+
+  Public for the same single assertion `retitle_budget_ms/0` is: a test binds it to
+  `Loopctl.Knowledge.DraftConsumer.default_budget_ms/0` — the fallback that applies when the
+  step is called directly rather than from here — so the two cannot drift into a budget
+  bigger than the job containing it, which is #761 in miniature.
+  """
+  @spec draft_budget_ms() :: pos_integer()
+  def draft_budget_ms, do: @draft_reserve_ms
+
+  @doc """
   The MEASURED part of the reserve: what the rest of the night costs besides the two
   clock-bounded steps.
 
   Public for one assertion, and it is the assertion that catches a new step being paid for
-  out of thin air: `judge_budget_ms/0 + retitle_budget_ms/0 + prelude_reserve_ms/0` must fit
-  inside `timeout/1`. Every other reading of these numbers stays true when a budget is added
+  out of thin air: `judge_budget_ms/0 + retitle_budget_ms/0 + draft_budget_ms/0 +
+  prelude_reserve_ms/0` must fit inside `timeout/1`. Every other reading of these numbers stays true when a budget is added
   beside the reserve instead of inside it, which is exactly how #761 shipped.
   """
   @spec prelude_reserve_ms() :: pos_integer()
@@ -1314,6 +1403,20 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     )
   end
 
+  # The draft consumer's own operator lever, resolved exactly like the three above (DB row ->
+  # app config -> module default). It matters here for the same reason it does on the retitle
+  # drain: this step spends a tenant's embedding budget per item, and `0` is an explicit pause
+  # an operator can reach mid-incident without a deploy.
+  @doc false
+  @spec draft_publishes_cap() :: integer()
+  def draft_publishes_cap do
+    tunable(
+      "knowledge_draft_consumer_max_publishes",
+      :knowledge_draft_consumer_max_publishes,
+      DraftConsumer.default_max_publishes()
+    )
+  end
+
   @doc false
   @spec per_class_cap() :: integer()
   def per_class_cap do
@@ -1372,6 +1475,49 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     e -> retitle_step_failed(tenant_id, ExitTag.tag(e))
   catch
     :exit, reason -> retitle_step_failed(tenant_id, "exit:" <> ExitTag.tag(reason))
+  end
+
+  # FAIL-SOFT, like every step that writes before the night's audit event does. This one runs
+  # EARLY — see the call site in `lint_tenant/1` — so a raise escaping it would abort the pass
+  # before `promote_conflicts/1`, `consolidate/1` and the judge had run at all, and hand the
+  # night to an Oban retry. Per-ITEM failures are contained inside `DraftConsumer.consume/2`'s
+  # own reduce; what reaches this rescue is a failure BEFORE any write, so a zero tally is true.
+  defp consume_drafts(tenant_id, budget_ms) do
+    DraftConsumer.consume(tenant_id,
+      max_publishes: draft_publishes_cap(),
+      budget_ms: budget_ms
+    )
+  rescue
+    e -> draft_step_failed(tenant_id, ExitTag.tag(e))
+  catch
+    :exit, reason -> draft_step_failed(tenant_id, "exit:" <> ExitTag.tag(reason))
+  end
+
+  defp draft_step_failed(tenant_id, tag) do
+    Logger.error(
+      "KnowledgeLintWorker: tenant=#{tenant_id} draft consumption failed (#{tag}); " <>
+        "no drafts were published this run and they stay held."
+    )
+
+    empty_draft_tally(:apply_failed, tag)
+  end
+
+  # The `empty_tally/2` rule, applied to the third tally: ONE constructor carrying every key
+  # the summary line interpolates, so no fail-soft path can raise a KeyError one line after
+  # the rescue that exists to prevent exactly that.
+  defp empty_draft_tally(gate, error) do
+    %{
+      published: 0,
+      linked: 0,
+      link_failed: 0,
+      unassessed: 0,
+      skipped: 0,
+      failed: 0,
+      offered: 0,
+      budget_exhausted: false,
+      gate: gate,
+      error: error
+    }
   end
 
   defp retitle_step_failed(tenant_id, tag) do
@@ -1540,6 +1686,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # that long silently accepts two same-typed counts swapped at the call site.
   defp log_audit_event(tenant_id, report, %{
          action: action,
+         drafts: drafts,
          pruned: pruned,
          promoted: promoted,
          judged: judged,
@@ -1559,6 +1706,26 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         "summary" => report.summary,
         "orphans_relinked" => action.relinked,
         "orphans_embedding_enqueued" => action.embedding_enqueued,
+        # The draft consumer's whole reading, and every key is load-bearing together.
+        # `drafts_published` alone reads 0 on an empty queue, on a night every assessment fell
+        # open, on a night the clock cut short after one draft, and on a night an operator
+        # paused the drain — so `offered`, `unassessed`, `budget_exhausted` and the gate are
+        # what tell those four apart. `linked` is the annotation actually written;
+        # `link_failed` is a near-duplicate published WITHOUT one, which must never hide
+        # inside `published`. A -1 is impossible here: a failed step reports through
+        # `drafts_gate` (`apply_failed`) instead, which the tally carries on every path.
+        "drafts_published" => drafts.published,
+        "drafts_offered" => drafts.offered,
+        "drafts_linked" => drafts.linked,
+        "drafts_link_failed" => drafts.link_failed,
+        "drafts_unassessed" => drafts.unassessed,
+        "drafts_skipped" => drafts.skipped,
+        "drafts_failed" => drafts.failed,
+        "drafts_budget_exhausted" => drafts.budget_exhausted,
+        # Read with `.gate`, never a defaulted `Map.get`: an `:open` default would record a
+        # crashed step as a clean night, which is the exact distinction this key exists for.
+        "drafts_gate" => to_string(drafts.gate),
+        "drafts_error" => Map.get(drafts, :error),
         "conflicts_promoted" => promoted,
         # Both numbers are recorded because the DIFFERENCE bounds the NET drain: while
         # judged > promoted the backlog is falling. It is not the convergence reading on its

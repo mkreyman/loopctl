@@ -12,6 +12,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
   alias Loopctl.HeavyRead.TenantGate
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.Consolidation
+  alias Loopctl.Knowledge.DraftConsumer
   alias Loopctl.MockArticleSimilaritySearch
   alias Loopctl.Workers.KnowledgeLintWorker
 
@@ -86,6 +87,35 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       assert is_integer(entry.new_state["summary"]["total_issues"])
       assert is_integer(entry.new_state["orphans_relinked"])
       assert is_integer(entry.new_state["orphans_embedding_enqueued"])
+    end
+
+    test "consumes the DRAFT queue and reports the whole reading in the audit event" do
+      tenant = fixture(:tenant)
+
+      # Backdated past the consumer's 48h hold floor: a draft this fresh is being STAGED on
+      # purpose (`draft: true` / ingestion without `publish: true`) and is held by design.
+      held =
+        fixture(:article, %{tenant_id: tenant.id, status: :draft})
+        |> Ecto.Changeset.change(%{
+          inserted_at: DateTime.add(DateTime.utc_now(), -7, :day)
+        })
+        |> AdminRepo.update!()
+
+      assert :ok =
+               KnowledgeLintWorker.perform(%Oban.Job{id: 0, args: %{"tenant_id" => tenant.id}})
+
+      assert AdminRepo.get!(Loopctl.Knowledge.Article, held.id).status == :published
+
+      assert [entry] = lint_audit_entries(tenant.id)
+      assert entry.new_state["drafts_published"] == 1
+      # OFFERED and the bound flag are recorded even on a night that drained everything: a
+      # truncated night and a night with nothing to consume must never be the same numbers.
+      assert entry.new_state["drafts_offered"] == 1
+      assert entry.new_state["drafts_budget_exhausted"] == false
+      # Read with `.gate`, never a defaulted Map.get — a crashed step must not record itself
+      # as a clean night.
+      assert entry.new_state["drafts_gate"] == "open"
+      assert entry.new_state["drafts_unassessed"] == 0
     end
 
     test "re-links orphan articles against the current corpus" do
@@ -851,14 +881,45 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       # t=0 — stays true when the retitle budget is paid for out of thin air, which is
       # precisely how #761 shipped.
       assert KnowledgeLintWorker.judge_budget_ms() + KnowledgeLintWorker.retitle_budget_ms() +
-               KnowledgeLintWorker.prelude_reserve_ms() <= timeout,
-             "the judge's budget, this step's budget and the measured prelude must fit in the job"
+               KnowledgeLintWorker.draft_budget_ms() + KnowledgeLintWorker.prelude_reserve_ms() <=
+               timeout,
+             "every claim on the job's clock must fit inside the job"
 
       # And the context's own fallback — used when the step is called directly rather than
       # from here — can never exceed the reserve carved out for it. Nothing but this
       # assertion can notice those two drifting apart.
       assert KnowledgeLintWorker.retitle_budget_ms() >=
                Consolidation.default_retitle_budget_ms()
+    end
+
+    test "the draft consumer's clock comes out of the SAME reserve, and its fallback fits it" do
+      # The THIRD step whose per-item cost is an outbound provider call. Added to the reserve
+      # rather than taken out of the judge's budget at the call site, so the ONE clamp keeps
+      # doing the arithmetic: the judge's ceiling falls by exactly this much and `timeout/1`
+      # does not move. Raising `timeout/1` to pay for a new step is what #761 makes fatal.
+      assert KnowledgeLintWorker.draft_budget_ms() >= DraftConsumer.default_budget_ms(),
+             "the context's direct-call fallback must never exceed the reserve carved out for it"
+
+      # The assertion that catches THIS step's budget being added beside the reserve rather
+      # than inside it. Every weaker reading — the timeout, what this step is handed at t=0 —
+      # stays true when it is paid for out of thin air, which is exactly how #761 shipped.
+      assert KnowledgeLintWorker.judge_budget_ms() + KnowledgeLintWorker.retitle_budget_ms() +
+               KnowledgeLintWorker.draft_budget_ms() + KnowledgeLintWorker.prelude_reserve_ms() <=
+               KnowledgeLintWorker.timeout(%Oban.Job{args: %{}}),
+             "the draft reserve must come OUT of the job's clock, never be added beside it"
+
+      now = System.monotonic_time(:millisecond)
+      full = KnowledgeLintWorker.draft_budget_ms()
+
+      assert KnowledgeLintWorker.draft_budget_remaining(now) == full,
+             "a night whose prelude cost nothing gets the whole budget, never more"
+
+      spent = now - (KnowledgeLintWorker.timeout(%Oban.Job{args: %{}}) - :timer.minutes(1))
+
+      assert KnowledgeLintWorker.draft_budget_remaining(spent) < full,
+             "a prelude that overran must shrink this step, not start a fresh one"
+
+      assert KnowledgeLintWorker.draft_budget_remaining(now - :timer.hours(1)) == 0
     end
 
     test "the step is handed the time the job has LEFT, never a fresh budget" do

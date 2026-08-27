@@ -817,6 +817,21 @@ config :loopctl,
   knowledge_consolidation_max_retitles: 25,
   knowledge_consolidation_min_duplicate_similarity: 0.80
 
+# DraftConsumer (#765/#766): how many held DRAFT articles one nightly run may OFFER to the
+# consumer. It bounds the candidate query only — each item costs an outbound EMBEDDING call,
+# so the bound that actually holds is a WALL CLOCK
+# (Loopctl.Workers.KnowledgeLintWorker.draft_budget_remaining/1), carved out of the same job
+# timeout so it can never exceed the job containing it. It also resolves through a SystemConfig
+# DB row first (knowledge_draft_consumer_max_publishes) so an operator can move it without a
+# deploy, and 0 is an explicit PAUSE that leaves every draft held.
+#
+# Deliberately ABOVE the producer rate rather than below it: the capture path adds ~11 drafts a
+# night, so a cap at or under that is not a drain at all. Read the NET drain, never the cap: at
+# 30 offered against ~11 arriving the backlog falls by ~19 a night, so the 113 standing drafts
+# measured on 2026-08-27 clear in about SIX nights — 113/30 gives four only by leaving inflow
+# out of the denominator.
+config :loopctl, :knowledge_draft_consumer_max_publishes, 30
+
 # LinkPruning (#611 stage 0): how many over-degree `relates_to` edges one nightly run may
 # DELETE, worst-first. Sized to converge in a few nights rather than a few months — the
 # standing backlog on the hosted corpus was ~903,600 edges (1,402,699 total, 499,058
