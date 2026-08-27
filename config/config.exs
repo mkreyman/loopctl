@@ -801,10 +801,20 @@ config :loopctl,
 # threshold 0 is REFUSED rather than honoured — min_sim >= 0.0 holds for every pair, so it
 # would turn the only content check on the auto-applying class fully off, which is the
 # opposite of what an operator typing 0 means.
+#
+# knowledge_consolidation_max_retitles is the SECOND applying class's cap: how many
+# confirmed placeholder-title articles one night may offer to the retitle step. It is
+# deliberately small, because unlike the two above it bounds a step whose per-item cost is an
+# outbound LLM call — and the bound that actually holds there is a WALL CLOCK
+# (Loopctl.Workers.KnowledgeLintWorker.retitle_budget_remaining/1), carved out of the same
+# job timeout so it can never exceed the job containing it. 0 PAUSES that drain the same way,
+# and it is the lever to reach for first during an incident because it is the one nightly
+# step that spends a tenant's provider budget.
 config :loopctl,
   knowledge_consolidation_max_per_class: 500,
   knowledge_consolidation_max_applies: 500,
   knowledge_consolidation_max_unpublishes: 500,
+  knowledge_consolidation_max_retitles: 25,
   knowledge_consolidation_min_duplicate_similarity: 0.80
 
 # LinkPruning (#611 stage 0): how many over-degree `relates_to` edges one nightly run may

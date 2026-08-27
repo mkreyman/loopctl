@@ -75,6 +75,16 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
      so the two-run comparison is tonight-against-last-night. Unpublish, never
      archive: `:archived` is terminal for an article and nothing unattended may
      take a one-way door.
+  6b. **Applies the confirmed placeholder titles** —
+     `apply_confirmed_generic_titles/2` retitles each `:generic_title` article both
+     reports propose, from the article's own content, recording the previous title
+     on the article so the write is undoable in practice and not only in
+     principle. Same report gate, same reason for the ordering. It ABSTAINS rather
+     than invents: a provider failure or a reply that does not support a specific
+     title leaves the placeholder alone and is counted as an abstention. It is the
+     SECOND step whose per-item cost is an outbound call, so it carries a wall
+     clock of its own (`retitle_budget_remaining/1`) carved out of the same
+     `timeout/1` — never beside it.
   7. **Executes recorded conflict dispositions** —
      `Knowledge.execute_conflict_resolutions/2`, itself budget-bounded (~2 min).
   8. **Judges the flagged conflicts** — `judge_redundant_conflicts/1` records a
@@ -107,6 +117,14 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   `:knowledge_lint_max_orphan_relink` (default 500). When the true orphan count
   exceeds what we act on, the gap is logged — never silently dropped — so an
   operator can see that a backlog remains for the next run.
+
+  Generic-title retitling is bounded by a wall clock
+  (`retitle_budget_remaining/1`, out of `@retitle_reserve_ms`) with
+  `:knowledge_consolidation_max_retitles` bounding only the candidate query. The night
+  reports what it was OFFERED alongside what it applied, and a
+  `generic_title_budget_exhausted` flag — for the same reason the judge does: a truncated
+  night and a night with nothing left to retitle are the same `generic_titles_retitled`
+  otherwise.
 
   Conflict judging is bounded twice, by a count
   (`:knowledge_lint_max_conflict_judgements`) and by a wall clock
@@ -266,6 +284,15 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     # reports agree" and unpublish on evidence nobody re-derived, every night the scan keeps
     # failing.
     applied = apply_consolidation(tenant_id, consolidation)
+    # The SECOND consumer of tonight's report, gated on the same `{:ok, _}` and for the same
+    # reason: on a tenant whose scans deterministically fail, the two most recent reports are
+    # last night and the night before, and "two stale reports agree" is not the transience
+    # filter the gate claims to be. It runs here rather than beside the judge because it
+    # spends the reserve `retitle_budget_remaining/1` measures from the job start — the
+    # earlier it runs, the more of its own budget is actually there.
+    retitled =
+      apply_generic_titles(tenant_id, consolidation, retitle_budget_remaining(started_at))
+
     resolutions_applied = execute_resolutions(tenant_id)
     # The judge runs AFTER promotion so a pair flagged tonight is also judged tonight and
     # never spends a night suppressing its two articles, and LAST of all the steps because it
@@ -283,13 +310,17 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
       judged: judged,
       resolutions_applied: resolutions_applied,
       consolidation: consolidation,
-      applied: applied
+      applied: applied,
+      retitled: retitled
     })
 
     Logger.info(
       # The #616 content gate is the single most likely reason a night applied nothing, and
       # without this counter that night is byte-identical to a clean corpus in both this
       # line and the audit event.
+      # OFFERED and the bound flag are both here, never just the applied count: a night the
+      # clock cut short and a night with nothing left to retitle report the same
+      # `generic_titles_retitled` otherwise, and that silent pair is the #761 misreading.
       "KnowledgeLintWorker: tenant=#{tenant_id} issues=#{report.summary.total_issues} " <>
         "orphans_relinked=#{action.relinked} orphans_embedding_enqueued=#{action.embedding_enqueued} " <>
         "conflicts_promoted=#{promoted} conflicts_judged_redundant=#{judged.judged} " <>
@@ -302,6 +333,13 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         "duplicate_apply_gate=#{applied.gate} " <>
         "duplicates_unpublish_failed=#{applied.failed} " <>
         "duplicate_groups_uncorroborated=#{applied.uncorroborated} " <>
+        "generic_titles_retitled=#{retitled.applied} " <>
+        "generic_titles_offered=#{retitled.offered} " <>
+        "generic_titles_skipped=#{retitled.skipped} " <>
+        "generic_titles_abstained=#{retitled.abstained} " <>
+        "generic_titles_failed=#{retitled.failed} " <>
+        "generic_title_budget_exhausted=#{retitled.budget_exhausted} " <>
+        "generic_title_gate=#{retitled.gate} " <>
         consolidation_log(consolidation)
     )
 
@@ -321,11 +359,26 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # novelty gate, which that cap does not bound, and every attempt on all six following
   # nights was killed inside the judge with `Oban.TimeoutError` after 600000ms.
   #
-  # `@job_reserve_ms` is what the REST of the night costs, measured in production
-  # 2026-08-27 on the 86k-article tenant: ~10 s for lint + prune + promote + consolidate,
-  # plus the ~2-minute internal budget of `Knowledge.execute_conflict_resolutions/2`.
-  # Rounded up hard, because a reserve that is too small resurrects exactly this bug.
-  @job_reserve_ms :timer.minutes(5)
+  # `@job_reserve_ms` is what the REST of the night costs. Two components, kept separate
+  # because they are known in different ways:
+  #
+  #   * `@prelude_reserve_ms` is MEASURED — production 2026-08-27 on the 86k-article tenant,
+  #     ~10 s for lint + prune + promote + consolidate, plus the ~2-minute internal budget of
+  #     `Knowledge.execute_conflict_resolutions/2`. Rounded up hard, because a reserve that is
+  #     too small resurrects exactly this bug.
+  #   * `@retitle_reserve_ms` is a BUDGET, not a measurement: the generic-title retitle step
+  #     is the SECOND step whose per-item cost is an outbound provider call, so it is bounded
+  #     by a clock of its own (`retitle_budget_remaining/1`) rather than by the count of
+  #     placeholder titles a night finds.
+  #
+  # It is added to the reserve rather than taken out of the judge's budget at the call site,
+  # so the ONE clamp below keeps doing the arithmetic for both: the judge's ceiling falls by
+  # exactly what this step may spend, and `timeout/1` does not move. Raising `timeout/1` to
+  # pay for a new step is the move #761 makes fatal — the Lifeline window is the real ceiling
+  # and it is not ours to raise.
+  @prelude_reserve_ms :timer.minutes(5)
+  @retitle_reserve_ms :timer.minutes(2)
+  @job_reserve_ms @prelude_reserve_ms + @retitle_reserve_ms
 
   # And CLAMPED below Oban's Lifeline window (`rescue_after: :timer.minutes(30)`,
   # `Loopctl.ObanConfig.plugins/0`). Lifeline never checks whether a job is still alive: it
@@ -372,6 +425,53 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     |> max(0)
     |> min(budget)
   end
+
+  @doc """
+  Wall-clock budget (ms) the generic-title retitle step may spend, given the job start.
+
+  DERIVED the same way `judge_budget_remaining/1` is, and for the same reason: the step is
+  handed the time the job has LEFT once the judge's own budget is set aside, never a fresh
+  budget beside a reserve nothing enforces. `job_timeout_ms/1 - judge_budget_ms/0` is the
+  reserve, so a prelude that overran shrinks THIS step rather than pushing the night past
+  `timeout/1` — with `@judge_overshoot_ms` paying for the one in-flight provider call a
+  deadline cannot interrupt, which this step has exactly as much as the judge does.
+
+  Public (`@doc false`-adjacent) so a test can read the same number on both sides of the
+  derivation, exactly as `judge_budget_ms/0` is.
+  """
+  @spec retitle_budget_remaining(integer()) :: non_neg_integer()
+  def retitle_budget_remaining(started_at) do
+    elapsed = System.monotonic_time(:millisecond) - started_at
+
+    (job_timeout_ms(configured_judge_budget_ms()) - judge_budget_ms() - elapsed -
+       @judge_overshoot_ms)
+    |> max(0)
+    |> min(retitle_budget_ms())
+  end
+
+  @doc """
+  The reserve carved out of `timeout/1` for the retitle step.
+
+  Public so `test/loopctl/workers/knowledge_lint_worker_test.exs` can bind it to
+  `Loopctl.Knowledge.Consolidation.default_retitle_budget_ms/0` — the fallback that applies
+  when the step is called directly rather than from here. A fallback larger than the reserve
+  is a budget bigger than the job containing it, which is #761 in miniature, and nothing but
+  a test can notice the two drifting apart.
+  """
+  @spec retitle_budget_ms() :: pos_integer()
+  def retitle_budget_ms, do: @retitle_reserve_ms
+
+  @doc """
+  The MEASURED part of the reserve: what the rest of the night costs besides the two
+  clock-bounded steps.
+
+  Public for one assertion, and it is the assertion that catches a new step being paid for
+  out of thin air: `judge_budget_ms/0 + retitle_budget_ms/0 + prelude_reserve_ms/0` must fit
+  inside `timeout/1`. Every other reading of these numbers stays true when a budget is added
+  beside the reserve instead of inside it, which is exactly how #761 shipped.
+  """
+  @spec prelude_reserve_ms() :: pos_integer()
+  def prelude_reserve_ms, do: @prelude_reserve_ms
 
   # FAIL-SOFT, like every step that runs after the night has already written state
   # (`consolidate/1`, `apply_consolidation/2`). Both of these now run AFTER the unpublishes,
@@ -1156,6 +1256,20 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     )
   end
 
+  # The retitle step's own operator lever, resolved exactly like the two above (DB row -> app
+  # config -> module default). It matters MORE here than on the unpublish drain, not less:
+  # this is the one nightly step that spends a tenant's provider budget per item, and `0` is
+  # an explicit pause an operator can reach without a deploy.
+  @doc false
+  @spec retitles_cap() :: integer()
+  def retitles_cap do
+    tunable(
+      "knowledge_consolidation_max_retitles",
+      :knowledge_consolidation_max_retitles,
+      Consolidation.default_max_retitles()
+    )
+  end
+
   @doc false
   @spec per_class_cap() :: integer()
   def per_class_cap do
@@ -1193,6 +1307,52 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     )
 
     default
+  end
+
+  # FAIL-SOFT and report-gated, exactly like `apply_consolidation/2` above. This step makes
+  # outbound provider calls and then writes `articles.title`, so it has both failure modes
+  # the night must survive: a raise here would discard the audit event AND hand the job to an
+  # Oban retry that re-runs `apply_consolidation/2` from the top, spending
+  # `:knowledge_consolidation_max_unpublishes` a second time. Per-ITEM failures are contained
+  # inside `apply_confirmed_generic_titles/2`'s own reduce (which is not transactional); what
+  # reaches this rescue is a failure BEFORE any write, so a zero tally here is true.
+  defp apply_generic_titles(_tenant_id, {:error, _tag}, _budget_ms),
+    do: empty_retitle_tally(:scan_failed)
+
+  defp apply_generic_titles(tenant_id, {:ok, _report}, budget_ms) do
+    Consolidation.apply_confirmed_generic_titles(tenant_id,
+      max_retitles: retitles_cap(),
+      budget_ms: budget_ms
+    )
+  rescue
+    e -> retitle_step_failed(tenant_id, ExitTag.tag(e))
+  catch
+    :exit, reason -> retitle_step_failed(tenant_id, "exit:" <> ExitTag.tag(reason))
+  end
+
+  defp retitle_step_failed(tenant_id, tag) do
+    Logger.error(
+      "KnowledgeLintWorker: tenant=#{tenant_id} generic_title retitling failed " <>
+        "(#{tag}); no placeholder titles were replaced this run."
+    )
+
+    empty_retitle_tally(:apply_failed, tag)
+  end
+
+  # The `empty_tally/2` rule, applied to the second tally: ONE constructor, carrying every
+  # key the summary line interpolates, so no fail-soft path can raise a KeyError one line
+  # after the rescue that exists to prevent exactly that.
+  defp empty_retitle_tally(gate, error \\ nil) do
+    %{
+      applied: 0,
+      skipped: 0,
+      abstained: 0,
+      failed: 0,
+      offered: 0,
+      budget_exhausted: false,
+      gate: gate,
+      error: error
+    }
   end
 
   defp apply_failed(tenant_id, tag) do
@@ -1267,7 +1427,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # apply never got past its SELECT) are what tell those apart. Each individual unpublish
   # also writes its own audit event through `Knowledge.unpublish_article/3`
   # (`actor_label: "worker:consolidation"`).
-  defp consolidation_state({:ok, consolidation}, applied) do
+  defp consolidation_state({:ok, consolidation}, applied, retitled) do
     %{
       "status" => "ok",
       "day" => Date.to_iso8601(consolidation.day),
@@ -1292,18 +1452,44 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
       "duplicate_apply_gate" => to_string(applied.gate),
       "apply_error" => Map.get(applied, :error)
     }
+    |> Map.merge(generic_title_state(retitled))
   end
 
   # No report tonight means no apply ran at all (`apply_consolidation/2` is gated on the
   # `{:ok, _}`), so there are no counts to record here — but `duplicate_apply_gate` is
   # recorded anyway. It is the key an auditor parses to learn WHY nothing applied, and an
   # absent key on exactly the nights the pass failed is the one answer it must not give.
-  defp consolidation_state({:error, tag}, applied),
-    do: %{
-      "status" => "failed",
-      "error" => tag,
-      "duplicate_apply_gate" => to_string(applied.gate)
+  defp consolidation_state({:error, tag}, applied, retitled),
+    do:
+      %{
+        "status" => "failed",
+        "error" => tag,
+        "duplicate_apply_gate" => to_string(applied.gate)
+      }
+      |> Map.merge(generic_title_state(retitled))
+
+  # The `:generic_title` half of the report, and the same four-way reading its
+  # `:duplicate_capture` sibling gets. `generic_titles_retitled` alone reads 0 on a clean
+  # corpus, on a night every generation abstained, on a night every write was rejected, and
+  # on a night the clock cut short after one item — so `offered` (what the gate confirmed),
+  # `abstained` (the provider declined or was not trusted), `skipped` (the article stopped
+  # being the candidate that was confirmed, or the write was rejected), `failed` (a write
+  # that could not be made) and `budget_exhausted` are all load-bearing together. A truncated
+  # night and a night with nothing to do MUST NOT report the same numbers.
+  defp generic_title_state(retitled) do
+    %{
+      "generic_titles_retitled" => retitled.applied,
+      "generic_titles_offered" => retitled.offered,
+      "generic_titles_skipped" => retitled.skipped,
+      "generic_titles_abstained" => retitled.abstained,
+      "generic_titles_failed" => retitled.failed,
+      "generic_title_budget_exhausted" => retitled.budget_exhausted,
+      # WHY nothing was retitled, when nothing was — read with `.gate`, never a defaulted
+      # `Map.get`, so a crashed step can never record itself as a clean night.
+      "generic_title_apply_gate" => to_string(retitled.gate),
+      "generic_title_error" => Map.get(retitled, :error)
     }
+  end
 
   # The per-step results arrive as ONE map rather than nine positionals. That is not only
   # arity hygiene: every step this worker gains adds a parameter here, and a positional list
@@ -1315,7 +1501,8 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
          judged: judged,
          resolutions_applied: resolutions_applied,
          consolidation: consolidation,
-         applied: applied
+         applied: applied,
+         retitled: retitled
        }) do
     Audit.create_log_entry(tenant_id, %{
       entity_type: "knowledge_lint",
@@ -1354,7 +1541,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         "links_pruned" => pruned.pruned,
         "links_prunable_remaining" => pruned.remaining,
         "resolutions_applied" => resolutions_applied,
-        "consolidation" => consolidation_state(consolidation, applied)
+        "consolidation" => consolidation_state(consolidation, applied, retitled)
       }
     })
   rescue
