@@ -70,8 +70,13 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
   `LinkPruning.reclaimable_query/1` says the prune can free. The cut runs AFTER the
   already-linked rejection, so a re-link (nightly orphan pass, a re-embed) tops the article up
   to K rather than adding K more. `:potential_conflict` is NOT capped — it has its own
-  threshold and its own draining consumer, and a second cap there would withhold pairs from a
-  queue designed to converge.
+  threshold and its own draining consumer
+  (`KnowledgeLintWorker.judge_redundant_conflicts/2`), and a second cap here would withhold
+  pairs from that consumer rather than protect anything. Note what that consumer's bound
+  actually is (#761): a WALL CLOCK, not the count cap it looks like, so the drain is roughly
+  1,400 pairs a night gross and ~900 net of the promoter's own share — NOT a queue that
+  converges by arithmetic regardless of inflow. It absorbs a burst over one to three weeks;
+  an inflow sustained above ~900 a night would need a bound, and this is where one would go.
 
   Two things this bound is NOT, stated because both are easy to read into it:
 
@@ -229,9 +234,11 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
         # spending its budget on.
         #
         # `:potential_conflict` is deliberately NOT capped here. It has its own (much higher)
-        # threshold and its own consumer — `KnowledgeLintWorker.judge_redundant_conflicts/1`
-        # drains it, capped above the promotion rate — so a second cap would silently withhold
-        # pairs from a queue that is already designed to converge.
+        # threshold and its own consumer — `KnowledgeLintWorker.judge_redundant_conflicts/2`
+        # drains it — so a second cap here would silently withhold pairs from that consumer.
+        # What it would NOT do is make the queue converge: since #761 the drain's real bound
+        # is a wall clock (~1,400 pairs a night gross, ~900 net of the promoter), not the
+        # count cap, so this queue absorbs a burst rather than converging by arithmetic.
         relates =
           build_links(
             article.id,

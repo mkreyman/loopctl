@@ -927,8 +927,10 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
     test "the COUNT cap truncates visibly too, not only the clock" do
       # The count cap is the older bound and truncates while the clock never fires: with
       # `candidates` capped by the same limit, a night bigger than the cap reads exactly like
-      # a night that had that many and drained them — which is how 15,246 flags sat at
-      # 2000/night for eleven nights behind an audit event that said the queue had converged.
+      # a night that had that many and drained them. That silence is the whole reason this
+      # flag exists. It is NOT what happened during #761 — those runs were killed by the
+      # 10-minute job timeout and wrote no audit event at all, so there was nothing to
+      # misread; this guards the failure mode that would have replaced it.
       tenant = fixture(:tenant)
       a = published_article_with_embedding(tenant.id, similar_embedding())
       b = published_article_with_embedding(tenant.id, near_similar_embedding())
