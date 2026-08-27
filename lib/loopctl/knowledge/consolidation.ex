@@ -1875,9 +1875,13 @@ defmodule Loopctl.Knowledge.Consolidation do
   # `:contradiction_candidate` WAS a class here. It is not any more, and the reason is
   # ownership rather than value.
   #
-  # `Loopctl.Workers.KnowledgeLintWorker.judge_redundant_conflicts/1` now resolves exactly
-  # these pairs automatically, recording `classification: :redundant, disposition: :dismiss`
-  # — capped ABOVE the promotion rate so the queue converges. Proposing them here as well
+  # `Loopctl.Workers.KnowledgeLintWorker.judge_redundant_conflicts/2` now resolves exactly
+  # these pairs automatically, recording `classification: :redundant, disposition: :dismiss`.
+  # The OWNERSHIP is what settles this, not a promise about latency: that drain is bounded by
+  # a wall clock since #761 (~1,400 pairs a night gross, ~900 net of the promoter's own
+  # share), so a backlog is worked through over days rather than cleared promptly — this
+  # comment used to say "capped ABOVE the promotion rate so the queue converges", which read
+  # as the latter. Proposing them here as well
   # put two subsystems on one pile: one resolving it, the other re-reporting it nightly.
   # That is the "second scheduler over the same corpus" failure #584 named, arrived at from
   # the other direction.
