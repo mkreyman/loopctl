@@ -3131,51 +3131,80 @@ defmodule Loopctl.Knowledge do
 
     with :ok <- validate_project_ownership(tenant_id, project_id),
          {:ok, article} <- fetch_article(tenant_id, article_id, opts) do
-      actor_id = Keyword.get(opts, :actor_id)
-      actor_label = Keyword.get(opts, :actor_label)
-      actor_type = Keyword.get(opts, :actor_type, "api_key")
-      old_state = article_state_snapshot(article)
-      changeset = Article.update_changeset(article, attrs)
+      apply_article_update(tenant_id, article, Article.update_changeset(article, attrs), opts)
+    end
+  end
 
-      changed_fields = changeset.changes |> Map.keys() |> Enum.map(&to_string/1)
+  @doc """
+  Retitles an article, recording the replaced title on the durable `previous_title` column.
 
-      # Check changeset BEFORE Multi: only enqueue embedding when
-      # title/body changed OR status transitions to :published.
-      needs_embedding? = content_or_publish_changed?(changeset)
+  The governed writer for the nightly `:generic_title` consolidation retitle, and the ONLY
+  caller of `Article.retitle_changeset/2` — which is in turn the only writer of
+  `:previous_title` (the column is not castable anywhere). Separate from
+  `update_article/4` for the `mark_curated/3` reason: a field that must not be reachable
+  from the ordinary agent-facing edit path gets its own changeset and its own context
+  function, rather than an option that makes the shared path behave two ways.
 
-      multi =
-        Multi.new()
-        |> Multi.update(:article, changeset)
-        |> Audit.log_in_multi(:audit, fn %{article: updated} ->
-          %{
-            tenant_id: tenant_id,
-            entity_type: "article",
-            entity_id: updated.id,
-            action: "article.updated",
-            actor_type: actor_type,
-            actor_id: actor_id,
-            actor_label: actor_label,
-            old_state: old_state,
-            new_state: article_state_snapshot(updated)
-          }
-        end)
-        |> EventGenerator.generate_events(:webhook_events, fn %{article: updated} ->
-          %{
-            tenant_id: tenant_id,
-            event_type: "article.updated",
-            project_id: updated.project_id,
-            payload:
-              updated
-              |> article_event_payload()
-              |> Map.put("changed_fields", changed_fields)
-          }
-        end)
-        |> maybe_enqueue_embedding(tenant_id, needs_embedding?)
+  What an unattended machine retitle rests on is that it can be UNDONE, so the record of
+  what to restore has to survive an ordinary caller `PATCH` — which whole-map-replaces
+  `metadata` — and outlive `:audit_retention_days`. It also regenerates the slug, since the
+  title it replaces is a placeholder by construction; see `Article.retitle_changeset/2`.
 
-      case AdminRepo.transaction(multi) do
-        {:ok, %{article: updated}} -> {:ok, updated}
-        {:error, :article, changeset, _} -> {:error, changeset}
-      end
+  Emits the same `article.updated` audit event, webhook event and embedding enqueue as
+  `update_article/4`, and returns the same shapes.
+  """
+  @spec retitle_article(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
+          {:ok, Article.t()} | {:error, Ecto.Changeset.t() | :not_found}
+  def retitle_article(tenant_id, article_id, attrs, opts \\ []) do
+    with {:ok, article} <- fetch_article(tenant_id, article_id, opts) do
+      apply_article_update(tenant_id, article, Article.retitle_changeset(article, attrs), opts)
+    end
+  end
+
+  defp apply_article_update(tenant_id, article, changeset, opts) do
+    actor_id = Keyword.get(opts, :actor_id)
+    actor_label = Keyword.get(opts, :actor_label)
+    actor_type = Keyword.get(opts, :actor_type, "api_key")
+    old_state = article_state_snapshot(article)
+
+    changed_fields = changeset.changes |> Map.keys() |> Enum.map(&to_string/1)
+
+    # Check changeset BEFORE Multi: only enqueue embedding when
+    # title/body changed OR status transitions to :published.
+    needs_embedding? = content_or_publish_changed?(changeset)
+
+    multi =
+      Multi.new()
+      |> Multi.update(:article, changeset)
+      |> Audit.log_in_multi(:audit, fn %{article: updated} ->
+        %{
+          tenant_id: tenant_id,
+          entity_type: "article",
+          entity_id: updated.id,
+          action: "article.updated",
+          actor_type: actor_type,
+          actor_id: actor_id,
+          actor_label: actor_label,
+          old_state: old_state,
+          new_state: article_state_snapshot(updated)
+        }
+      end)
+      |> EventGenerator.generate_events(:webhook_events, fn %{article: updated} ->
+        %{
+          tenant_id: tenant_id,
+          event_type: "article.updated",
+          project_id: updated.project_id,
+          payload:
+            updated
+            |> article_event_payload()
+            |> Map.put("changed_fields", changed_fields)
+        }
+      end)
+      |> maybe_enqueue_embedding(tenant_id, needs_embedding?)
+
+    case AdminRepo.transaction(multi) do
+      {:ok, %{article: updated}} -> {:ok, updated}
+      {:error, :article, failed, _} -> {:error, failed}
     end
   end
 

@@ -177,6 +177,11 @@ defmodule LoopctlWeb.ArticleJSON do
       tenant_id: article.tenant_id,
       project_id: article.project_id,
       title: article.title,
+      # The undo record for the nightly consolidation retitle, and the reason it is on the
+      # FULL read and not on `article_summary/1`: a durable record nobody can read is not an
+      # undo. `null` on every article no machine has retitled — which is nearly all of them,
+      # so the enumeration path does not pay for it.
+      previous_title: article.previous_title,
       body: article.body,
       category: article.category,
       status: article.status,
