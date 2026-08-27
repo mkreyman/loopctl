@@ -397,20 +397,29 @@ defmodule Loopctl.Knowledge.DraftConsumer do
   def held_drafts?(tenant_id), do: tenant_id |> draft_scope() |> AdminRepo.exists?()
 
   @doc """
-  The same question as `held_drafts?/1`, asked ONCE for every tenant at a time.
+  The same question as `held_drafts?/1`, asked for a NAMED SET of tenants at once.
 
   The dead-man's-switch runs across every tenant in one hourly job, and an install-wide
   pause (a cap set to 0, no embedding key configured fleet-wide) puts EVERY tenant on the
   corroboration path — which as N sequential `held_drafts?/1` calls is N round trips on
-  the 3-connection AdminRepo pool. This is the bounded read that replaces them.
+  the 3-connection AdminRepo pool. This replaces them with ONE read, and the caller's
+  tenant list is what bounds it: an unqualified `DISTINCT` over `articles` has no tenant
+  predicate to lead an index with, no early exit, and no LIMIT, so on a large corpus it
+  can outlast the pool timeout — and the worker's rescue would then report the whole
+  detection run as "nothing wrong".
   """
-  @spec tenant_ids_holding_drafts() :: MapSet.t(Ecto.UUID.t())
-  def tenant_ids_holding_drafts do
+  @spec tenant_ids_holding_drafts([Ecto.UUID.t()]) :: MapSet.t(Ecto.UUID.t())
+  def tenant_ids_holding_drafts(tenant_ids),
+    do: tenant_ids |> holding_draft_ids() |> MapSet.new()
+
+  defp holding_draft_ids([]), do: []
+
+  defp holding_draft_ids(tenant_ids) do
     draft_scope()
+    |> where([draft: a], a.tenant_id in ^tenant_ids)
     |> distinct(true)
     |> select([draft: a], a.tenant_id)
     |> AdminRepo.all()
-    |> MapSet.new()
   end
 
   defp candidate_ids(_tenant_id, limit, _direction) when limit <= 0, do: []

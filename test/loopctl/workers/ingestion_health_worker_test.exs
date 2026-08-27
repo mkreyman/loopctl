@@ -134,6 +134,39 @@ defmodule Loopctl.Workers.IngestionHealthWorkerTest do
       for t <- tenants, do: assert([_] = consumer_anomalies(t.id))
     end
 
+    test "a DROPPED pass-alert enqueue leaves the anomaly unalerted so the next run re-fires" do
+      tenant = fixture(:tenant)
+      knowledge_lint_run(tenant.id, 100, build(:knowledge_lint_state, %{}))
+
+      failing_insert = fn _job -> {:error, %Ecto.Changeset{valid?: false}} end
+      candidate = %{tenant_id: tenant.id, hours_stale: 100}
+
+      anomaly =
+        fixture(:ingestion_anomaly, %{
+          tenant_id: tenant.id,
+          source_type: IngestionHealth.consumer_pass_source_type(),
+          anomaly_type: :consumer_stalled,
+          last_event_at: nil,
+          hours_stale: 100,
+          sample_count: 1
+        })
+
+      log =
+        capture_log(fn ->
+          assert :error =
+                   IngestionHealthWorker.commit_consumer_pass_alert(
+                     [{candidate, anomaly}],
+                     failing_insert
+                   )
+        end)
+
+      # KILLS: flipping `alerted` before the enqueue succeeds. The pass alert is the ONLY
+      # operator signal for a globally dead nightly cron, and a run that drops it must
+      # leave the rows re-firable rather than record an alert that never left.
+      assert log =~ "left unalerted for re-fire next run"
+      refute AdminRepo.get!(IngestionAnomaly, anomaly.id).alerted
+    end
+
     test "an archived stall is never re-flagged" do
       tenant = fixture(:tenant)
 

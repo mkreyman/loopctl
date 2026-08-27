@@ -40,6 +40,17 @@ defmodule Loopctl.Knowledge.IngestionHealthConsumerStallTest do
   defp consumer_of(candidates, consumer),
     do: Enum.find(candidates, &(&1.consumer == consumer))
 
+  defp stall_anomaly(tenant_id) do
+    fixture(:ingestion_anomaly, %{
+      tenant_id: tenant_id,
+      source_type: "knowledge_lint_drafts",
+      anomaly_type: :consumer_stalled,
+      last_event_at: nil,
+      hours_stale: 72,
+      sample_count: @runs
+    })
+  end
+
   # A draft this consumer would actually pick up: past the 48h fresh-hold floor, tenant
   # scope, shared visibility.
   defp held_draft(tenant_id) do
@@ -95,24 +106,24 @@ defmodule Loopctl.Knowledge.IngestionHealthConsumerStallTest do
              )
     end
 
-    test "a night of deliberate REFUSALS is not work waiting" do
+    test "refusals alongside real dispositions are not work waiting" do
       tenant = fixture(:tenant)
 
       state =
         with_consolidation(%{
           "by_class" => %{"duplicate_capture" => 2, "generic_title" => 3},
           "duplicate_groups_uncorroborated" => 2,
+          "duplicates_unpublished" => 1,
           "generic_titles_offered" => 3,
           "generic_titles_abstained" => 2,
-          "generic_titles_skipped" => 1
+          "generic_titles_retitled" => 1
         })
 
       lint_runs(tenant.id, @runs, state)
 
-      # KILLS: subtracting the refusals in `class_reading/2`. A group the #616 gate
-      # WITHHELD, an abstention, a `{:skip, :curated}` — each is the step acting correctly,
-      # and the scan re-proposes the same items every night, so counting them as work
-      # waiting is a page that can never come down.
+      # KILLS: `applied == 0` in the two refusal-saturation clauses of class_reading/2.
+      # A withhold or an abstention beside a real disposition is the step choosing, and a
+      # clause that reads the refusal alone pages on every healthy mixed night.
       assert candidates_for(tenant.id) == []
     end
 
@@ -236,6 +247,34 @@ defmodule Loopctl.Knowledge.IngestionHealthConsumerStallTest do
       assert candidate.evidence["paused_runs"] == @runs
     end
 
+    test "flags a class that refused EVERY offer and disposed of nothing" do
+      tenant = fixture(:tenant)
+
+      state =
+        with_consolidation(%{
+          "by_class" => %{"duplicate_capture" => 2, "generic_title" => 3},
+          "duplicate_groups_uncorroborated" => 2,
+          "generic_titles_offered" => 3,
+          "generic_titles_abstained" => 2,
+          "generic_titles_skipped" => 1
+        })
+
+      lint_runs(tenant.id, @runs, state)
+
+      # KILLS: the refusal-saturation clauses. `abstained` is where a provider ERROR, a
+      # raise and an exit land too, and `uncorroborated` saturates when the vectorisation
+      # input is dead — so subtracting them unconditionally makes a 100%-refusing consumer
+      # structurally unable to alarm, on exactly the outage the switch exists for.
+      titles = tenant.id |> candidates_for() |> consumer_of(:generic_titles)
+      dupes = tenant.id |> candidates_for() |> consumer_of(:duplicates)
+
+      assert titles.evidence["hard_blind_runs"] == @runs
+      # The subtraction still earns its keep in the EVIDENCE: this is a refusal, not a
+      # queue the step never reached.
+      assert titles.evidence["work_observed"] == false
+      assert dupes.evidence["hard_blind_runs"] == @runs
+    end
+
     test "flags a pass dead for longer than the derived class window" do
       tenant = fixture(:tenant)
       # 20 days: past `consumer_history_days(3, 72)`, well inside the audit retention.
@@ -332,25 +371,37 @@ defmodule Loopctl.Knowledge.IngestionHealthConsumerStallTest do
       refute reloaded.resolved
     end
 
-    test "leaves an anomaly open when the queue merely went quiet" do
+    test "closes and RE-ARMS an anomaly whose queue is genuinely empty" do
       tenant = fixture(:tenant)
       lint_runs(tenant.id, @runs, quiet_state())
 
-      fixture(:ingestion_anomaly, %{
-        tenant_id: tenant.id,
-        source_type: "knowledge_lint_drafts",
-        anomaly_type: :consumer_stalled,
-        last_event_at: nil,
-        hours_stale: 72,
-        sample_count: @runs
-      })
-
+      anomaly = stall_anomaly(tenant.id)
       scan = IngestionHealth.detect_consumer_stalled_scan(@opts)
 
-      # KILLS: `recovered_keys`. A dead drain stops being a candidate the moment the sweep
-      # archives the drafts behind it; closing on that stamps "resumed" into the
-      # append-only audit log about a consumer that has still disposed of nothing.
+      # KILLS: requiring a DISPOSITION as the only recovery evidence. A consumer whose
+      # queue legitimately empties never applies anything again, so its anomaly could
+      # never close — and the operator's only remedy, `resolve_anomaly/3`, leaves
+      # `last_event_at` NULL, which is the shape `resolved_episode_suppression?/1` reads
+      # as suppression. Clearing one stuck row would blind the key for good.
+      assert IngestionHealth.auto_resolve_recovered_consumer_stalled(scan) >= 1
+
+      reloaded = Loopctl.AdminRepo.get!(Loopctl.Knowledge.IngestionAnomaly, anomaly.id)
+      assert reloaded.resolved
+      refute is_nil(reloaded.last_event_at)
+    end
+
+    test "leaves an anomaly open while the drain is still PAUSED" do
+      tenant = fixture(:tenant)
+      lint_runs(tenant.id, @runs, quiet_state(%{"drafts_gate" => "drain_disabled"}))
+
+      anomaly = stall_anomaly(tenant.id)
+      scan = IngestionHealth.detect_consumer_stalled_scan(@opts)
+
+      # KILLS: the `not paused?` half of the quiet test. A pause is a state an operator
+      # holds open, not evidence that the drain works, so an empty queue behind one must
+      # not stamp "resumed" into the append-only audit log.
       assert IngestionHealth.auto_resolve_recovered_consumer_stalled(scan) == 0
+      refute Loopctl.AdminRepo.get!(Loopctl.Knowledge.IngestionAnomaly, anomaly.id).resolved
     end
 
     test "leaves a still-stalled consumer's anomaly open" do

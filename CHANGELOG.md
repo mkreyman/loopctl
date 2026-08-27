@@ -40,8 +40,9 @@ All notable changes to loopctl are documented here.
      untouched.
   2. **The deploy adds two migrations, neither of which pauses writes.** One widens the
      `ingestion_anomalies.anomaly_type` CHECK to admit `consumer_stalled` (catalog-only);
-     its `down` RETAGS any recorded stall rather than deleting it, so the audit entries
-     pointing at those rows stay resolvable. The other creates
+     its `down` RETAGS any recorded stall (resolved + archived, marked
+     `rolled_back_from`) rather than deleting it, so the audit entries pointing at those
+     rows stay resolvable without surfacing a mis-typed anomaly. The other creates
      `audit_log_knowledge_lint_idx`, a partial index over `entity_type =
      'knowledge_lint'`. `audit_log` is a RANGE-partitioned parent, where `CREATE INDEX
      CONCURRENTLY` is unsupported on the PARENT but supported per PARTITION — so the
@@ -52,9 +53,10 @@ All notable changes to loopctl are documented here.
      pool.
   3. **Three new tunables**, each resolving DB `system_config` row -> app config -> module
      default, so a window can be widened mid-incident without a deploy:
-     `knowledge_consumer_stall_runs` (7, CLAMPED to `audit_retention_days` — a streak
-     longer than the evidence could never fill and would silently switch the detector
-     off), `knowledge_consumer_pass_staleness_hours` (72), `knowledge_consumer_scan_limit`
+     `knowledge_consumer_stall_runs` (7, CLAMPED to HALF `audit_retention_days` — the
+     streak window is double this number, so above half it could never fill and the
+     detector would switch off in silence), `knowledge_consumer_pass_staleness_hours`
+     (72), `knowledge_consumer_scan_limit`
      (20000). No new environment variables. Coverage is bounded by `audit_retention_days`
      (90 by default): a pass dead for longer than that leaves no events to judge.
   4. **A stall surfaces the way every other `ingestion_anomalies` detector does** — a
@@ -66,8 +68,9 @@ All notable changes to loopctl are documented here.
      `knowledge_lint_generic_titles`, `knowledge_lint_conflict_judge`), so `resolve` and
      `archive` on `/api/v1/ingestion_anomalies` work per consumer: archiving a
      deliberately paused draft drain does not blind the conflict judge. A stall
-     auto-resolves only on POSITIVE evidence — the consumer applying again, or the pass
-     completing — never merely because the queue behind it emptied.
+     auto-resolves only on POSITIVE evidence — the consumer applying again, the pass
+     completing, or a whole window in which nothing was offered and no gate was blind or
+     paused. A drain still PAUSED never auto-closes.
 
      The `knowledge_lint_pass` half is the exception to the per-tenant alert: its cause is
      the single global nightly cron, so one dead pass emits ONE system-scope

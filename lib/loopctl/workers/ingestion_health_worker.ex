@@ -900,10 +900,23 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
           []
       end)
 
-    if notified == [], do: :ok, else: commit_consumer_pass_alert(notified)
+    commit_consumer_pass_alert(notified)
   end
 
-  defp commit_consumer_pass_alert(notified) do
+  @doc false
+  # Same seam, and for the same reason, as `commit_sweep_system_alert/2`: this is the
+  # enqueue-THEN-flip step, and the branch that matters is the one where the enqueue is
+  # DROPPED — which `Oban.insert/1` cannot be made to take under the sandbox. `notified`
+  # is a list of `{candidate, anomaly}`. Not a public API; prod uses the default insert.
+  @spec commit_consumer_pass_alert([{map(), IngestionAnomaly.t()}], (Oban.Job.changeset() ->
+                                                                       {:ok, Oban.Job.t()}
+                                                                       | {:error, term()})) ::
+          :ok | :error
+  def commit_consumer_pass_alert(notified, insert_fn \\ &Oban.insert/1)
+
+  def commit_consumer_pass_alert([], _insert_fn), do: :ok
+
+  def commit_consumer_pass_alert(notified, insert_fn) do
     candidates = Enum.map(notified, fn {candidate, _anomaly} -> candidate end)
     pass_hours = IngestionHealth.consumer_pass_staleness_hours()
     max_stale = candidates |> Enum.map(& &1.hours_stale) |> Enum.max()
@@ -925,12 +938,14 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
         "affected_tenants=#{length(candidates)} max_hours_stale=#{max_stale}"
     )
 
-    case enqueue_system_alert(payload, &Oban.insert/1) do
+    case enqueue_system_alert(payload, insert_fn) do
       :ok ->
         Enum.each(notified, fn {_candidate, anomaly} -> mark_alerted(anomaly) end)
         :ok
 
       :error ->
+        # Deliberately leave every participating row `alerted: false`, so the next hourly
+        # run re-fires rather than dropping the only operator signal for a dead cron.
         Logger.error(
           "IngestionHealthWorker: lint-pass system alert was NOT enqueued; " <>
             "#{length(notified)} anomaly(ies) left unalerted for re-fire next run"

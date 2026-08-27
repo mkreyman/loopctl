@@ -105,8 +105,8 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   Those three knobs are NOT part of the `:ingestion_health` keyword list above. They
   resolve `SystemConfig` row -> TOP-LEVEL `config :loopctl, :<key>` -> module default
   (`tunable/3`), so a value set under `:ingestion_health` is silently ignored:
-  `:knowledge_consumer_stall_runs` (default `7`, clamped to the `audit_log` retention —
-  a streak longer than the evidence can never fill), `:knowledge_consumer_pass_staleness_hours`
+  `:knowledge_consumer_stall_runs` (default `7`, clamped to HALF the `audit_log` retention —
+  the streak window is double it, so above half it can never fill), `:knowledge_consumer_pass_staleness_hours`
   (default `72`) and `:knowledge_consumer_scan_limit` (default `20_000`).
 
   ## Retention-sweep stall detector (`:sweep_stalled`, issue #498)
@@ -1068,11 +1068,15 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   `:duplicate_capture` produces 0-1 — so a 2-night window would fire on ordinary
   quiet, and 14+ is half a month of a dead consumer.
 
-  CLAMPED to `audit_retention_days/0` at the top as well as to 1 at the bottom, and the
-  clamp is load-bearing: the nightly pass writes at most one event a night, so a streak
-  longer than the retention can NEVER fill, every per-class check stops judging, and the
-  run still reports "0 candidates" — byte-identical to a healthy install. An operator
-  widening the window mid-incident must not be able to switch the detector off in silence.
+  CLAMPED to HALF `audit_retention_days/0` at the top as well as to 1 at the bottom, and
+  the clamp is load-bearing in both directions: the nightly pass writes at most one event
+  a night, so a streak longer than the evidence can NEVER fill, every per-class check
+  stops judging, and the run still reports "0 candidates" — byte-identical to a healthy
+  install. HALF, not the whole, because `consumer_history_days/2` is DOUBLE this number
+  and is clamped to the same retention: at anything above half the two collapse onto one
+  value, the derived window's documented miss-tolerance goes to zero, and a single missed
+  night leaves every tenant permanently short of a full window. The warning fires whenever
+  the clamp bites, so shortening RETENTION cannot switch the detector off in silence either.
   """
   @spec consumer_stall_runs() :: pos_integer()
   def consumer_stall_runs do
@@ -1084,15 +1088,17 @@ defmodule Loopctl.Knowledge.IngestionHealth do
       )
 
     retention = audit_retention_days()
+    bound = max(div(retention, 2), 1)
 
-    if configured > retention do
+    if configured > bound do
       Logger.warning(
-        "IngestionHealth: knowledge_consumer_stall_runs=#{configured} exceeds the " <>
-          "#{retention}-day audit_log retention the streak is read from; using #{retention}."
+        "IngestionHealth: knowledge_consumer_stall_runs=#{configured} exceeds half the " <>
+          "#{retention}-day audit_log retention the streak is read from, so the derived " <>
+          "window could never fill; using #{bound}."
       )
     end
 
-    configured |> max(1) |> min(retention)
+    configured |> max(1) |> min(bound)
   end
 
   @doc """
@@ -1266,10 +1272,10 @@ defmodule Loopctl.Knowledge.IngestionHealth do
     * `:evaluated_keys` — every `{tenant_id, source_type}` this run could actually judge.
       A key absent from it was NOT observed healthy; it was not observed at all, so
       recovery must leave its anomaly open.
-    * `:recovered_keys` — the subset that showed POSITIVE evidence of a working consumer:
-      a class that applied something inside the window, or a pass that completed inside
-      its staleness window. Absence from `:candidates` is not that — a class stops being
-      a candidate the moment its queue empties by any route.
+    * `:recovered_keys` — the subset that showed POSITIVE evidence: a class that applied
+      something or whose whole window was offer-free with no blind and no paused gate, or
+      a pass that completed inside its staleness window. Absence from `:candidates` is
+      not enough on its own — a PAUSED drain with an empty queue is neither.
     * `:truncated?` — the bounded read hit `consumer_scan_limit/0`, so tenants past the
       cut were not read. They are absent from `:evaluated_keys` by construction, so this
       flag is for observability rather than a recovery veto.
@@ -1332,16 +1338,18 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   # forever, and a stalled consumer there was invisible on every one of them.
   defp rotation_salt(now), do: now |> DateTime.to_unix() |> div(3600) |> Integer.to_string()
 
-  # ONE cross-tenant read for the draft corroboration, and only when some run actually
-  # reports a paused drain — the per-tenant `held_drafts?/1` call this replaces was a
-  # round trip per tenant on the 3-connection AdminRepo pool, and an install-wide pause
-  # (a cap set to 0, a missing embedding key fleet-wide) makes every tenant take it.
+  # ONE cross-tenant read for the draft corroboration, RESTRICTED to the tenants that
+  # actually reported a paused drain — the per-tenant `held_drafts?/1` call this replaces
+  # was a round trip per tenant on the 3-connection AdminRepo pool, and an install-wide
+  # pause (a cap set to 0, a missing embedding key fleet-wide) makes every tenant take it.
+  # The tenant list is what keeps the replacement bounded: an unqualified DISTINCT over
+  # `articles` would trade N indexed probes for one unbounded scan on the same small pool.
   defp held_draft_tenants(rows) do
-    if Enum.any?(rows, &(string_at(&1.state, "drafts_gate") in @paused_draft_gates)) do
-      DraftConsumer.tenant_ids_holding_drafts()
-    else
-      MapSet.new()
-    end
+    rows
+    |> Enum.filter(&(string_at(&1.state, "drafts_gate") in @paused_draft_gates))
+    |> Enum.map(& &1.tenant_id)
+    |> Enum.uniq()
+    |> DraftConsumer.tenant_ids_holding_drafts()
   end
 
   # One tenant's whole reading: the pass freshness check (evaluable from a single run)
@@ -1387,11 +1395,21 @@ defmodule Loopctl.Knowledge.IngestionHealth do
     readings = Enum.map(window, &class_reading(class.key, &1.state))
     applied_total = readings |> Enum.map(&max(&1.applied, 0)) |> Enum.sum()
 
-    # RECOVERY IS A POSITIVE CLAIM. A class stops being a candidate the moment its queue
-    # empties by ANY route — a sweep archiving the held drafts, an operator deleting them
-    # — and closing on that stamps "resumed" into the append-only audit log for a drain
-    # that is still dead. Only a disposition proves the consumer works.
-    recovered = if applied_total > 0, do: MapSet.put(recovered, key), else: recovered
+    # RECOVERY IS A POSITIVE CLAIM, and there are TWO ways to make it. A disposition proves
+    # the consumer works. A full window in which nothing was offered, no gate was blind and
+    # no gate was paused proves the queue is EMPTY — the other honest reading, and it has
+    # to count: requiring a disposition alone left a healthy-but-idle consumer's anomaly
+    # open forever, and the operator's only remedy (`resolve_anomaly/3`) does not stamp
+    # `last_event_at`, so clearing it by hand made `resolved_episode_suppression?/1`
+    # silence every FUTURE stall of that key. Closing on an empty queue is safe because the
+    # close RE-ARMS — work arriving at a still-dead drain flags it again next run. A PAUSED
+    # drain is excluded: a pause is a state an operator holds open, not evidence.
+    quiet? =
+      applied_total == 0 and
+        Enum.all?(readings, &(not &1.work? and not &1.hard_blind? and not &1.paused?))
+
+    recovered =
+      if applied_total > 0 or quiet?, do: MapSet.put(recovered, key), else: recovered
 
     case class_candidate(tenant_id, class, window, {readings, applied_total}, cfg) do
       nil -> {cands, evaluated, recovered}
@@ -1496,25 +1514,25 @@ defmodule Loopctl.Knowledge.IngestionHealth do
     applied = int_at(consolidation, "duplicates_unpublished")
     gate = string_at(consolidation, "duplicate_apply_gate")
 
-    # A group the #616 corroboration gate WITHHELD is the gate WORKING (title collision,
-    # bodies disagree, members not yet vectorised — and for a tenant with no embedding key,
-    # `Consolidation.log_permanent_withhold/2` says outright that it can never clear). The
-    # scan re-proposes it every night, so counting it as work waiting is a false page that
-    # can never come down: it is subtracted from the proposal count rather than added to
-    # `touched`. `skipped` (the group dissolved) and `unpublish_failed` (a write that could
-    # not be made) stay — neither is a by-design steady state.
+    # A group the #616 corroboration gate WITHHELD is not, on its own, work waiting: the
+    # scan re-proposes it every night, so counting the whole proposal count as a queue
+    # alarms on a tenant whose withholds are permanent. It is subtracted from the
+    # proposals rather than added to `touched`. But SATURATION is the opposite reading —
+    # withholding EVERY group while unpublishing none is what a dead vectorisation input
+    # looks like, and the same counter carries both, so it must not be able to subtract
+    # the class down to silence. `skipped` (the group dissolved) and `unpublish_failed`
+    # (a write that could not be made) stay in `touched`; neither is a steady state.
     touched =
       int_at(consolidation, "duplicate_groups_skipped") +
         int_at(consolidation, "duplicates_unpublish_failed")
 
-    actionable =
-      proposals_for(consolidation, "duplicate_capture") -
-        int_at(consolidation, "duplicate_groups_uncorroborated")
+    withheld = int_at(consolidation, "duplicate_groups_uncorroborated")
+    actionable = proposals_for(consolidation, "duplicate_capture") - withheld
 
     %{
       applied: applied,
       work?: actionable > 0 or touched > 0,
-      hard_blind?: gate in ["apply_failed", "scan_failed"],
+      hard_blind?: gate in ["apply_failed", "scan_failed"] or (withheld > 0 and applied == 0),
       paused?: gate in ["drain_disabled", "report_gap", "insufficient_history"],
       gate: gate
     }
@@ -1526,11 +1544,13 @@ defmodule Loopctl.Knowledge.IngestionHealth do
     gate = string_at(consolidation, "generic_title_apply_gate")
     budget_exhausted? = state_true?(consolidation, "generic_title_budget_exhausted")
 
-    # `abstained` (the provider declined or was not trusted) and `skipped` (the article
-    # stopped being the candidate — `{:skip, :curated}` is PERMANENT, since a retitle on a
-    # curated article is the one write this step cannot undo) are both the step acting
-    # correctly. The scan re-proposes those articles every night, so counting the OFFER
-    # rather than the un-dispositioned residue alarms forever on a healthy corpus.
+    # `abstained` and `skipped` are the step declining an article it saw, so they are
+    # subtracted from the offer rather than counted as a queue — a corpus whose residue is
+    # permanently un-retitlable must not alarm on the OFFER every night. They are NOT
+    # evidence of health: `Consolidation.generated_title/3` folds a provider error, a
+    # raise and an exit into `abstained` too, so REFUSING EVERYTHING while retitling none
+    # is exactly the shape of a dead extraction provider. Saturation therefore reads as
+    # blind, and only the mixed night — some refused, some applied — reads as quiet.
     refused =
       int_at(consolidation, "generic_titles_abstained") +
         int_at(consolidation, "generic_titles_skipped")
@@ -1545,7 +1565,8 @@ defmodule Loopctl.Knowledge.IngestionHealth do
       applied: applied,
       work?: actionable > 0,
       hard_blind?:
-        gate in ["apply_failed", "scan_failed"] or (budget_exhausted? and applied == 0),
+        gate in ["apply_failed", "scan_failed"] or (budget_exhausted? and applied == 0) or
+          (refused > 0 and applied == 0),
       paused?: gate in ["drain_disabled", "report_gap", "insufficient_history"],
       gate: gate
     }
@@ -1658,9 +1679,10 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   consumer resumed, on the exact tenants where it most likely did not.
 
   And gated on POSITIVE evidence (`scan.recovered_keys`) rather than on the stall
-  condition merely lapsing: a dead draft drain stops being a candidate as soon as the
-  weekly sweep archives the drafts behind it, and closing on that writes "resumed" into
-  the audit log about a consumer that has still disposed of nothing.
+  condition merely lapsing: a drain an operator PAUSED stops being a candidate without
+  having disposed of anything. A disposition, or a whole window with nothing offered and
+  no gate blind or paused, is what closes it — and the close stamps `last_event_at`, which
+  is the only thing that re-arms the key, since the manual `resolve_changeset/1` does not.
 
   Gated on the anomaly's tenant still being ACTIVE, for the same reason
   `auto_resolve_recovered_sweep_stalled/1` is: a suspended tenant stops producing runs,

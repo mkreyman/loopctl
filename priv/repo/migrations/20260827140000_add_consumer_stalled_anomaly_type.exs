@@ -11,7 +11,11 @@ defmodule Loopctl.Repo.Migrations.AddConsumerStalledAnomalyType do
   set. Reversible, and non-destructive in that direction — the `down` RETAGS any persisted
   `consumer_stalled` row (which the narrowed CHECK would reject, failing the ADD CONSTRAINT)
   instead of deleting it, because the append-only `audit_log` holds `detected` entries whose
-  `entity_id` points at those rows and a DELETE strands them.
+  `entity_id` points at those rows and a DELETE strands them. The retag is to a value the
+  narrowed CHECK admits, so the row is also RESOLVED and ARCHIVED: `capture_silence` under a
+  `knowledge_lint_*` source_type is not a capture stream, and leaving it listable would show
+  the operator a mis-typed anomaly the rolled-back code cannot explain. `rolled_back_from`
+  records what it really was.
   """
 
   def up do
@@ -31,11 +35,13 @@ defmodule Loopctl.Repo.Migrations.AddConsumerStalledAnomalyType do
       "ALTER TABLE ingestion_anomalies DROP CONSTRAINT ingestion_anomalies_anomaly_type_check"
     )
 
-    # A value the narrowed CHECK admits, resolved so the rolled-back code ignores it, marked.
+    # A value the narrowed CHECK admits; resolved AND archived so neither the rolled-back
+    # code nor the default anomaly list surfaces a capture_silence row for a consumer.
     execute("""
     UPDATE ingestion_anomalies
        SET anomaly_type = 'capture_silence',
            resolved = true,
+           archived = true,
            metadata = COALESCE(metadata, '{}'::jsonb) ||
                       '{"rolled_back_from": "consumer_stalled"}'::jsonb
      WHERE anomaly_type = 'consumer_stalled'

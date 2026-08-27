@@ -14,7 +14,9 @@ defmodule Loopctl.Repo.Migrations.AddAuditLogKnowledgeLintIndex do
   built CONCURRENTLY and ATTACHed. Building it on the parent instead holds a lock per partition for
   the whole build, blocking audit writes — and so every mutating API request — for a time that grows
   with the retained corpus; here only the brief ATTACH blocks. A build that dies midway leaves an
-  INVALID index, and this skips a partition that already has one by name: drop it by hand and re-run.
+  INVALID index behind, so the probe below asks for a VALID index ATTACHED to the parent rather than
+  for one of the right NAME — matching by name alone let a re-run skip the orphan, never attach it,
+  and exit 0 with the parent index unusable. Any such orphan is dropped and rebuilt.
   Future partitions inherit it (`AuditPartitionWorker` uses `CREATE TABLE ... PARTITION OF`), and
   `down` drops the parent index with every attached partition index.
   """
@@ -29,22 +31,27 @@ defmodule Loopctl.Repo.Migrations.AddAuditLogKnowledgeLintIndex do
   def up do
     execute("CREATE INDEX IF NOT EXISTS #{@index} ON ONLY audit_log #{@shape}")
 
-    for partition <- partitions_without_index() do
+    for partition <- partitions_without_valid_index() do
       child = "#{partition}_knowledge_lint_idx"
-      execute("CREATE INDEX CONCURRENTLY IF NOT EXISTS #{child} ON #{partition} #{@shape}")
+      # Only an unattached or INVALID leftover can be named here, so dropping it is the
+      # repair: attaching an invalid child marks the parent invalid for good.
+      execute("DROP INDEX CONCURRENTLY IF EXISTS #{child}")
+      execute("CREATE INDEX CONCURRENTLY #{child} ON #{partition} #{@shape}")
       execute("ALTER INDEX #{@index} ATTACH PARTITION #{child}")
     end
   end
 
   def down, do: execute("DROP INDEX IF EXISTS #{@index}")
 
-  defp partitions_without_index do
+  defp partitions_without_valid_index do
     %{rows: rows} =
       repo().query!(
         "SELECT c.relname FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid " <>
           "JOIN pg_class p ON p.oid = i.inhparent WHERE p.relname = 'audit_log' AND NOT " <>
-          "EXISTS (SELECT 1 FROM pg_class x WHERE x.relname = c.relname || " <>
-          "'_knowledge_lint_idx') ORDER BY c.relname"
+          "EXISTS (SELECT 1 FROM pg_class x JOIN pg_index ix ON ix.indexrelid = x.oid " <>
+          "JOIN pg_inherits xi ON xi.inhrelid = x.oid JOIN pg_class xp ON xp.oid = " <>
+          "xi.inhparent WHERE x.relname = c.relname || '_knowledge_lint_idx' AND " <>
+          "ix.indisvalid AND xp.relname = '#{@index}') ORDER BY c.relname"
       )
 
     Enum.map(rows, fn [name] -> name end)
