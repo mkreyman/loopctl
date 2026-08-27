@@ -12,6 +12,7 @@ defmodule Loopctl.Knowledge.DraftConsumerTest do
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.DraftConsumer
+  alias Loopctl.Knowledge.ProposalGate
   alias Loopctl.MockProposalAssessor
 
   # The assessor is injected PER CALL through the `:proposal_assessor` opt, never through
@@ -20,8 +21,9 @@ defmodule Loopctl.Knowledge.DraftConsumerTest do
   # same mock, so passing it explicitly exercises the opt seam rather than bypassing it.
   @assessor [proposal_assessor: MockProposalAssessor]
 
+  # Backdated past the 48h hold floor — a FRESH draft is held on purpose (own test below).
   defp draft(tenant_id, attrs \\ %{}) do
-    fixture(:article, Map.merge(%{tenant_id: tenant_id, status: :draft}, attrs))
+    fixture(:article, Map.merge(%{tenant_id: tenant_id, status: :draft}, attrs)) |> aged(-7)
   end
 
   defp published(tenant_id, attrs \\ %{}) do
@@ -262,25 +264,37 @@ defmodule Loopctl.Knowledge.DraftConsumerTest do
       assert reload(held).status == :published
     end
 
-    test "the OLDEST drafts are drained first, so a capped run cannot starve the backlog" do
+    test "the OLDEST drafts are drained first, with a slice reserved for the NEWEST" do
       tenant = fixture(:tenant)
       # Inserted NEWEST-first on purpose: heap order then disagrees with `inserted_at`, so
       # only the ORDER BY can produce this result. Created oldest-first, the assertion passes
       # on scan order alone and says nothing.
-      recent = aged(draft(tenant.id), -1)
+      recent = aged(draft(tenant.id), -3)
       middle = aged(draft(tenant.id), -20)
       old = aged(draft(tenant.id), -30)
       stub_verdict(verdict(:novel))
 
       DraftConsumer.consume(tenant.id, Keyword.put(@assessor, :max_publishes, 2))
 
+      # The backlog bias takes the oldest; the reserved slice takes the newest, which is what
+      # keeps the drain positive when a permanently unconsumable head owns every backlog slot.
       assert reload(old).status == :published
-      assert reload(middle).status == :published
-      assert reload(recent).status == :draft
+      assert reload(recent).status == :published
+      assert reload(middle).status == :draft
+    end
+
+    test "a draft younger than the hold floor is never offered" do
+      tenant = fixture(:tenant)
+      # `draft: true` (and ingestion without `publish: true`) is an advertised staging opt-in.
+      fresh = aged(draft(tenant.id), 0)
+      stub_verdict(verdict(:novel))
+
+      assert DraftConsumer.consume(tenant.id, @assessor).offered == 0
+      assert reload(fresh).status == :draft
     end
   end
 
-  describe "consume/2 — the flip-flop guard" do
+  describe "consume/2 — drafts that were held on purpose" do
     test "a draft consolidation retracted is never republished (durable marker)" do
       tenant = fixture(:tenant)
 
@@ -298,28 +312,37 @@ defmodule Loopctl.Knowledge.DraftConsumerTest do
       assert reload(held).status == :draft
     end
 
-    test "a draft consolidation retracted is never republished (audit_log record)" do
+    test "a draft ANY actor retracted is never republished (audit_log record)" do
       tenant = fixture(:tenant)
-      held = draft(tenant.id)
-
       # The pre-marker shape: retracted before migration 20260818055453 stamped the column.
-      {:ok, _} =
-        Audit.create_log_entry(tenant.id, %{
-          entity_type: "article",
-          entity_id: held.id,
-          action: "article.unpublished",
-          actor_type: "system",
-          actor_id: nil,
-          actor_label: "worker:consolidation",
-          new_state: %{"status" => "draft"}
+      # `unpublish_article/3` / `bulk_unpublish/3` leave the same row behind, so the guard is
+      # NOT narrowed to one actor label — republishing a `role: :user` retraction would revert
+      # a human-gated act unattended.
+      by_worker = draft(tenant.id)
+      by_human = draft(tenant.id)
+      unpublished_by(tenant.id, by_worker.id, "worker:consolidation")
+      unpublished_by(tenant.id, by_human.id, "human:operator")
+      stub_verdict(verdict(:novel))
+
+      assert DraftConsumer.consume(tenant.id, @assessor).offered == 0
+      assert reload(by_worker).status == :draft
+      assert reload(by_human).status == :draft
+    end
+
+    test "a conflict-MERGE draft is never auto-published" do
+      tenant = fixture(:tenant)
+
+      # The carve-out that lets an AGENT-role key record a merge verdict rests on the
+      # synthesised draft never being auto-published.
+      merged =
+        draft(tenant.id, %{
+          metadata: %{"merged_from" => [Ecto.UUID.generate(), Ecto.UUID.generate()]}
         })
 
       stub_verdict(verdict(:novel))
 
-      tally = DraftConsumer.consume(tenant.id, @assessor)
-
-      assert tally.offered == 0
-      assert reload(held).status == :draft
+      assert DraftConsumer.consume(tenant.id, @assessor).offered == 0
+      assert reload(merged).status == :draft
     end
   end
 
@@ -335,6 +358,49 @@ defmodule Loopctl.Knowledge.DraftConsumerTest do
       assert tally.offered == 0
       assert reload(private).status == :draft
       assert reload(owner).status == :draft
+    end
+
+    test "a keyless tenant is not offered its drafts at all" do
+      tenant = fixture(:tenant)
+      held = draft(tenant.id)
+
+      # Every assessment on a keyless tenant falls open on `{:error, :no_api_key}` AND appends
+      # an `llm.blocked_no_api_key` row to the hash-chained audit_log — for a known-zero run.
+      tally = DraftConsumer.consume(tenant.id, proposal_assessor: ProposalGate)
+
+      assert tally.gate == :no_embedding_key
+      assert tally.offered == 0
+      assert reload(held).status == :draft
+    end
+
+    # `ArticleLinkingWorker` scopes neighbours `project_or_global` and skips private/owner rows,
+    # so the graph has never held either edge — and the promoter, which cannot tell one from an
+    # auto-linker edge, would flag a pair that suppresses BOTH its articles from curated answers.
+    test "a neighbour in ANOTHER project is published unannotated, never linked" do
+      tenant = fixture(:tenant)
+
+      elsewhere =
+        published(tenant.id, %{project_id: fixture(:project, %{tenant_id: tenant.id}).id})
+
+      held = draft(tenant.id, %{project_id: fixture(:project, %{tenant_id: tenant.id}).id})
+      stub_verdict(verdict(:duplicate, [neighbor(elsewhere, 0.99)]))
+
+      log = capture_log(fn -> DraftConsumer.consume(tenant.id, @assessor) end)
+
+      assert reload(held).status == :published
+      assert links_from(held.id) == []
+      assert log =~ "no usable neighbour"
+    end
+
+    test "a PRIVATE neighbour is published unannotated, never linked" do
+      tenant = fixture(:tenant)
+      secret = published(tenant.id, %{metadata: %{"visibility" => "private"}})
+      held = draft(tenant.id)
+      stub_verdict(verdict(:duplicate, [neighbor(secret, 0.99)]))
+
+      capture_log(fn -> assert DraftConsumer.consume(tenant.id, @assessor).published == 1 end)
+
+      assert links_from(held.id) == []
     end
 
     test "a draft that stops being eligible after the offer is SKIPPED, never published" do
@@ -388,6 +454,19 @@ defmodule Loopctl.Knowledge.DraftConsumerTest do
 
   # `inserted_at` is not castable, so age it directly — the ordering guard is about which
   # rows a capped run reaches, and every fixture row is otherwise inserted in the same second.
+  defp unpublished_by(tenant_id, article_id, actor_label) do
+    {:ok, _} =
+      Audit.create_log_entry(tenant_id, %{
+        entity_type: "article",
+        entity_id: article_id,
+        action: "article.unpublished",
+        actor_type: "system",
+        actor_id: nil,
+        actor_label: actor_label,
+        new_state: %{"status" => "draft"}
+      })
+  end
+
   defp aged(article, days) do
     article
     |> Ecto.Changeset.change(%{

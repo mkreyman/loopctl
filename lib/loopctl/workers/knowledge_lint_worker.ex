@@ -47,11 +47,13 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   2b. **Consumes the DRAFT queue** (#765/#766) — `Loopctl.Knowledge.DraftConsumer.consume/2`
      assesses each held draft against the published corpus through the existing
      `ProposalGate` seam and PUBLISHES it: a near-duplicate is published AND annotated with a
-     `relates_to` edge carrying its cosine score, so the promoter and judge below handle the
-     redundancy reversibly. Nothing is archived — `:archived` is terminal, and an unattended
-     writer may not take a one-way door (#605/#606/#608). It runs HERE, first of the acting
-     steps, so tonight's annotation is flagged and judged tonight; see the call site in
-     `lint_tenant/1` for the full ordering argument. It is the THIRD step whose per-item cost
+     `relates_to` edge carrying its cosine score, which the promoter below turns into a
+     RECORDED `:potential_conflict` — a record for a human or an orchestrator, not a
+     retraction (see that module's doc for where the pair actually ends). Nothing is archived
+     — `:archived` is terminal, and an unattended writer may not take a one-way door
+     (#605/#606/#608). It runs HERE, first of the acting steps, so tonight's annotation is at
+     least flagged tonight; see the call site in `lint_tenant/1` for the full ordering
+     argument. It is the THIRD step whose per-item cost
      is an outbound provider call, so it carries a wall clock of its own
      (`draft_budget_remaining/1`) carved out of the same `timeout/1` — never beside it.
   3. **Prunes the `relates_to` graph to top-K degree** (#611 stage 0) via
@@ -287,13 +289,16 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     action = act_on_orphans(tenant_id, report)
     # FIRST of the acting steps, and the ordering is load-bearing in three ways.
     #
-    # (1) SAME-NIGHT ANNOTATION. A near-duplicate draft is published with a `relates_to` edge
+    # (1) SAME-NIGHT FLAGGING. A near-duplicate draft is published with a `relates_to` edge
     #     carrying `auto_generated` and the cosine score — exactly what `promote_conflicts/1`
     #     below reads. Running before it means the pair is flagged `:potential_conflict`
-    #     tonight and judged tonight, which is the same argument that already puts the judge
-    #     after the promoter. Running after it would cost every near-duplicate a full night
-    #     unflagged, and a flagged pair suppresses BOTH its articles from curated answers
-    #     while it stands.
+    #     tonight rather than a night later, which is the same argument that already puts the
+    #     judge after the promoter. It does NOT mean the pair is judged tonight: the judge
+    #     takes its candidates in similarity order out of a standing backlog this file puts at
+    #     14-25 nights, and a flagged pair suppresses BOTH its articles from curated answers
+    #     for as long as it waits. That cost belongs to publishing the near-duplicate, which
+    #     the auto-linker would flag from the stored vector anyway; ordering only decides
+    #     whether it starts tonight or tomorrow.
     # (2) SAME-NIGHT CONSOLIDATION. `consolidate/1` scans the published corpus, so an article
     #     published here enters TONIGHT's `:duplicate_capture` report and can be confirmed
     #     tomorrow. That is the reversible retraction path this step deliberately hands its

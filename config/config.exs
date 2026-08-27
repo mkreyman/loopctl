@@ -826,8 +826,10 @@ config :loopctl,
 # deploy, and 0 is an explicit PAUSE that leaves every draft held.
 #
 # Deliberately ABOVE the producer rate rather than below it: the capture path adds ~11 drafts a
-# night, so a cap at or under that is not a drain at all. At 30 the standing backlog measured on
-# 2026-08-27 (113) clears in four nights while inflow is absorbed.
+# night, so a cap at or under that is not a drain at all. Read the NET drain, never the cap: at
+# 30 offered against ~11 arriving the backlog falls by ~19 a night, so the 113 standing drafts
+# measured on 2026-08-27 clear in about SIX nights — 113/30 gives four only by leaving inflow
+# out of the denominator.
 config :loopctl, :knowledge_draft_consumer_max_publishes, 30
 
 # LinkPruning (#611 stage 0): how many over-degree `relates_to` edges one nightly run may

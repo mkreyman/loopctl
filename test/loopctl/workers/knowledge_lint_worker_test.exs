@@ -91,7 +91,15 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
 
     test "consumes the DRAFT queue and reports the whole reading in the audit event" do
       tenant = fixture(:tenant)
-      held = fixture(:article, %{tenant_id: tenant.id, status: :draft})
+
+      # Backdated past the consumer's 48h hold floor: a draft this fresh is being STAGED on
+      # purpose (`draft: true` / ingestion without `publish: true`) and is held by design.
+      held =
+        fixture(:article, %{tenant_id: tenant.id, status: :draft})
+        |> Ecto.Changeset.change(%{
+          inserted_at: DateTime.add(DateTime.utc_now(), -7, :day)
+        })
+        |> AdminRepo.update!()
 
       assert :ok =
                KnowledgeLintWorker.perform(%Oban.Job{id: 0, args: %{"tenant_id" => tenant.id}})
