@@ -78,8 +78,9 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   6b. **Applies the confirmed placeholder titles** —
      `apply_confirmed_generic_titles/2` retitles each `:generic_title` article both
      reports propose, from the article's own content, recording the previous title
-     on the article so the write is undoable in practice and not only in
-     principle. Same report gate, same reason for the ordering. It ABSTAINS rather
+     on the article — a convenience an ordinary PATCH can erase, not a guarantee;
+     what licenses the write is that a title is replaceable by anyone at any time.
+     Same report gate, same reason for the ordering. It ABSTAINS rather
      than invents: a provider failure or a reply that does not support a specific
      title leaves the placeholder alone and is counted as an abstention. It is the
      SECOND step whose per-item cost is an outbound call, so it carries a wall
@@ -92,14 +93,14 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
      disposition: :dismiss`, because cosine similarity measures REDUNDANCY and
      cannot see contradiction, so recording what was actually measured is the
      only honest verdict available. The pile is drained by a WALL CLOCK and not
-     by the count cap — ~1,400 pairs a night gross, ~900 net of the promoter's
+     by the count cap — ~1,260 pairs a night gross, ~760 net of the promoter's
      own 500 (see `@default_judge_budget_ms`) — and the drain stays within the
      same night as the promoter so a pair flagged tonight never spends a night
      suppressing both its articles from curated answers.
 
-     It runs LAST because it is the only step whose per-item cost is an outbound
-     provider call, and it therefore carries the one bound the others do not
-     need: a wall-clock budget (`judge_budget_ms/0`), from which this worker's
+     It runs LAST of the TWO steps whose per-item cost is an outbound provider
+     call (6b above is the other), and it therefore carries the bound the rest do
+     not need: a wall-clock budget (`judge_budget_ms/0`), from which this worker's
      own `timeout/1` is derived. A count cap alone bounds attempts, not cost —
      which is how a 2000-call ceiling came to sit inside a 10-minute job and kill
      six consecutive nights once the inflow outgrew the promoter's cap (#761).
@@ -177,7 +178,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # The SECONDARY drain bound for auto-generated `potential_conflict` links: larger than the
   # promotion cap above, so a count can never be what holds the queue level. It is not the
   # drain, though — 2000 judgements is ~28 minutes at ~0.85 s each and the wall clock below
-  # cuts in first (#761). The drain that actually holds is ~1,400 a night, ~900 net of the
+  # cuts in first (#761). The drain that actually holds is ~1,260 a night, ~760 net of the
   # promoter; see `@default_judge_budget_ms`. This number's remaining job is bounding the
   # candidate query.
   @default_max_conflict_judgements 2000
@@ -185,11 +186,14 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # The bound that actually holds, and the one this step never had (#761). `cap` above
   # counts ATTEMPTS; this counts TIME, which is what a step whose per-item cost is an
   # outbound provider call is really spending. Measured in production 2026-08-27 on the
-  # 86k-article tenant: one judgement is ~1.7 s wall, ~0.85 s at concurrency 2, so 20
-  # minutes drains ~1,400 pairs a night GROSS. `promote_conflicts/1` feeds the same queue up
+  # 86k-article tenant: one judgement is ~1.7 s wall, ~0.85 s at concurrency 2, so ~70 pairs
+  # a minute. The 20 below is a REQUEST, not the budget: `@judge_budget_ceiling_ms` clamps it
+  # to 18 minutes once `@retitle_reserve_ms` is carved out of the same job (#765), so the
+  # drain is ~1,260 pairs a night GROSS. `promote_conflicts/1` feeds the same queue up
   # to `@default_max_conflict_promotions` (500) a night, so against an existing backlog the
-  # NET drain is ~900 — and 500 is a CAP, not a rate (2026-08-27 measured the promoter at 0
-  # candidates), so ~900 is the worst case and ~1,400 the best.
+  # NET drain is ~760 — and 500 is a CAP, not a rate (2026-08-27 measured the promoter at 0
+  # candidates), so ~760 is the worst case and ~1,260 the best. Every figure below is derived
+  # from that 18, so any change to either reserve moves them all.
   #
   # The SECOND producer is the ingestion-time novelty gate, and no promoter cap bounds it.
   # Do not read its #761 numbers as a rate. TOTAL flags created per day — both producers —
@@ -202,12 +206,12 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # same window, so it is the drained backlog, not the zeros, that says the burst ended.
   #
   # A burst is therefore absorbed rather than fatal: it truncates some nights, says so, and
-  # drains at ~900-1,400 a night until it is caught up — 15,246 takes ELEVEN nights at the
-  # promoter rate measured on 2026-08-27 (0 candidates) and SEVENTEEN if the promoter
+  # drains at ~760-1,260 a night until it is caught up — 15,246 takes TWELVE nights at the
+  # promoter rate measured on 2026-08-27 (0 candidates) and TWENTY if the promoter
   # saturates its 500/night cap; quote the range, not one end of it. That holds only
   # while a fresh burst does not land before the last one clears, and both causes are
   # operator-started and repeatable (`TagBackfillWorker` is deliberately not on a cron), so
-  # a re-run means another ~17 truncated nights rather than a fault. The broken 3x10-minute
+  # a re-run means another ~20 truncated nights rather than a fault. The broken 3x10-minute
   # path incidentally judged 1,700-2,800 a night by dying three times; it also lost the
   # night's audit event and re-spent the nightly caps per attempt, so that is not a
   # throughput to miss.
@@ -412,8 +416,14 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # contain it and die with `Oban.TimeoutError`: #761 again, and now with tonight's
   # unpublishes already committed and an Oban retry about to spend the nightly caps again.
   # `@judge_overshoot_ms` pays for the one in-flight provider call the deadline cannot
-  # interrupt (Anthropic `receive_timeout` 25 s).
-  @judge_overshoot_ms :timer.seconds(45)
+  # interrupt. Sized for the WORST such call rather than the typical one: Anthropic
+  # `receive_timeout` 25 s x `extraction_max_retries` + 1 attempts, plus Req's ~1 s backoff
+  # (`claude_content_extractor.ex:119-129`). At 45 s it was sized for a single attempt, so
+  # one slow-transient call could outlast the whole allowance and push the job past
+  # `timeout/1` — an `Oban.TimeoutError` retry that re-runs `apply_consolidation/2` and
+  # spends the nightly caps again, which is #761's shape. Both clock-bounded steps subtract
+  # it, and both have exactly this exposure.
+  @judge_overshoot_ms :timer.seconds(60)
 
   @doc false
   @spec judge_budget_remaining(integer()) :: non_neg_integer()

@@ -50,6 +50,11 @@ defmodule Loopctl.Knowledge.ConsolidationGenericTitleTest do
     article
   end
 
+  defp three_placeholders(tenant_id) do
+    for t <- ["Untitled", "Draft", "New Article"], do: published(tenant_id, %{title: t})
+    confirm_over_two_nights(tenant_id)
+  end
+
   # One extraction returning one usable article; only its TITLE is ever read.
   defp expect_title(title) do
     Mox.expect(MockContentExtractor, :extract_from_content, fn _scope, _content, _opts ->
@@ -77,10 +82,9 @@ defmodule Loopctl.Knowledge.ConsolidationGenericTitleTest do
     end
 
     test "records the title it replaced, and marks the new one machine-generated" do
-      # "Undoable in practice, not just in principle": the audit log carries the old title
-      # too, but it is retention-bounded. This is not — and it is what lets a later pass or
-      # an operator tell this pass's work from a person's, exactly as StructuralLinks'
-      # `hub_title_generated` does.
+      # A convenience, not a guarantee: `metadata` is cast as a whole map, so an ordinary
+      # PATCH erases both keys. What it buys is the READING — a later pass or an operator can
+      # tell this pass's work from a person's, as StructuralLinks' `hub_title_generated` does.
       tenant = fixture(:tenant)
       article = placeholder(tenant.id)
       expect_title(@specific_title)
@@ -90,22 +94,6 @@ defmodule Loopctl.Knowledge.ConsolidationGenericTitleTest do
       metadata = reload(article.id).metadata
       assert metadata["consolidation_previous_title"] == "Untitled"
       assert metadata["consolidation_title_generated"] == @specific_title
-    end
-
-    test "MERGES the metadata rather than replacing it" do
-      # `update_changeset/2` casts `:metadata` as a whole map, so building the attrs from
-      # anything but the live map would erase an ingestion's provenance — or an agent's
-      # `visibility` — as a side effect of a retitle.
-      tenant = fixture(:tenant)
-
-      article =
-        published(tenant.id, %{title: "Untitled", metadata: %{"source_url" => "https://ex.com"}})
-
-      confirm_over_two_nights(tenant.id)
-      expect_title(@specific_title)
-
-      assert %{applied: 1} = Consolidation.apply_confirmed_generic_titles(tenant.id)
-      assert reload(article.id).metadata["source_url"] == "https://ex.com"
     end
   end
 
@@ -220,6 +208,46 @@ defmodule Loopctl.Knowledge.ConsolidationGenericTitleTest do
       assert reload(article.id).title == "Untitled"
     end
 
+    test "re-checks the live row AFTER the provider call, not only before it" do
+      # `classify_live/1` runs BEFORE a call the provider may hold for 25 s; a human who
+      # retitles inside that window must not have their edit completed for them.
+      tenant = fixture(:tenant)
+      article = placeholder(tenant.id)
+
+      Mox.expect(MockContentExtractor, :extract_from_content, fn _scope, _content, _opts ->
+        reload(article.id)
+        |> Ecto.Changeset.change(%{title: "A human named this properly"})
+        |> AdminRepo.update!()
+
+        {:ok, [%{title: @specific_title, body: "b", category: :pattern, tags: [], metadata: %{}}]}
+      end)
+
+      assert %{applied: 0, skipped: 1, abstained: 0, failed: 0, offered: 1} =
+               Consolidation.apply_confirmed_generic_titles(tenant.id)
+
+      assert reload(article.id).title == "A human named this properly"
+    end
+
+    test "merges into the metadata as it is AFTER the provider call" do
+      # `:metadata` is cast as a WHOLE map, so writing back a snapshot one round-trip old
+      # reverts whatever landed during the call (`visibility`, ingestion provenance).
+      tenant = fixture(:tenant)
+      article = placeholder(tenant.id)
+
+      Mox.expect(MockContentExtractor, :extract_from_content, fn _scope, _content, _opts ->
+        reload(article.id)
+        |> Ecto.Changeset.change(%{metadata: %{"source_url" => "https://ex.com"}})
+        |> AdminRepo.update!()
+
+        {:ok, [%{title: @specific_title, body: "b", category: :pattern, tags: [], metadata: %{}}]}
+      end)
+
+      assert %{applied: 1, offered: 1} =
+               Consolidation.apply_confirmed_generic_titles(tenant.id)
+
+      assert reload(article.id).metadata["source_url"] == "https://ex.com"
+    end
+
     test "skips a CURATED article, whose retitle is the one part that is NOT undoable" do
       # Any title change clears `curated_at`/`curated_by`, and putting the title back does
       # not put the governed marker back — re-curation has to go through `mark_curated/3`.
@@ -292,6 +320,26 @@ defmodule Loopctl.Knowledge.ConsolidationGenericTitleTest do
       assert reload(article.id).title == "Untitled"
     end
 
+    test "abstains on a reply that names SEVERAL articles" do
+      # The extractor SPLITS content into up to ten articles, and saw only the opening 4 KB:
+      # candidate #1 names the article's first section, not the article.
+      tenant = fixture(:tenant)
+      article = placeholder(tenant.id)
+
+      Mox.expect(MockContentExtractor, :extract_from_content, fn _scope, _content, _opts ->
+        {:ok,
+         [
+           %{title: @specific_title, body: "b", category: :pattern, tags: [], metadata: %{}},
+           %{title: "Oban unique jobs", body: "b", category: :pattern, tags: [], metadata: %{}}
+         ]}
+      end)
+
+      assert %{applied: 0, abstained: 1, offered: 1} =
+               Consolidation.apply_confirmed_generic_titles(tenant.id)
+
+      assert reload(article.id).title == "Untitled"
+    end
+
     test "abstains when the reply is not a list of articles at all" do
       tenant = fixture(:tenant)
       article = placeholder(tenant.id)
@@ -349,6 +397,23 @@ defmodule Loopctl.Knowledge.ConsolidationGenericTitleTest do
     end
   end
 
+  describe "the pass's own normalization" do
+    test "skips a generated title that collides with another article only under normalization" do
+      # The unique index is on the RAW `(tenant_id, title)`, so a case/punctuation variant
+      # stores fine — and the two are then ONE `:duplicate_capture` group, which the sibling
+      # drain unpublishes two nights later.
+      tenant = fixture(:tenant)
+      _incumbent = published(tenant.id, %{title: "Ecto changesets: validate before cast"})
+      article = placeholder(tenant.id)
+      expect_title("Ecto Changesets - Validate Before Cast")
+
+      assert %{applied: 0, skipped: 1, abstained: 0, failed: 0, offered: 1} =
+               Consolidation.apply_confirmed_generic_titles(tenant.id)
+
+      assert reload(article.id).title == "Untitled"
+    end
+  end
+
   describe "a write that could not be made" do
     test "counts as a FAILURE, and the reduce carries on" do
       # The per-item rescue: this reduce is not transactional, so a raise escaping it would
@@ -369,40 +434,59 @@ defmodule Loopctl.Knowledge.ConsolidationGenericTitleTest do
   end
 
   describe "the wall-clock bound" do
+    test "an EXHAUSTED clock buys zero provider calls, not a rounded-up one" do
+      # The deadline is checked BEFORE each item: a post-item check is unconditionally
+      # committed to item #1, so a budget of exactly 0 still bought one outbound call.
+      tenant = fixture(:tenant)
+      three_placeholders(tenant.id)
+
+      assert %{
+               applied: 0,
+               skipped: 0,
+               abstained: 0,
+               failed: 0,
+               offered: 3,
+               budget_exhausted: true,
+               gate: :open
+             } =
+               Consolidation.apply_confirmed_generic_titles(tenant.id, budget_ms: 0)
+
+      assert AdminRepo.aggregate(
+               from(a in Article, where: a.tenant_id == ^tenant.id and a.title == "Untitled"),
+               :count
+             ) == 1
+    end
+
     test "a truncated night REPORTS the truncation instead of looking like a quiet one" do
       # The #761 acceptance criterion, in this step: `applied` alone reads the same on a
       # night the clock cut short and a night with nothing left to do. `offered` and
       # `budget_exhausted` are what tell them apart.
       tenant = fixture(:tenant)
-      published(tenant.id, %{title: "Untitled"})
-      published(tenant.id, %{title: "Draft"})
-      published(tenant.id, %{title: "New Article"})
-      confirm_over_two_nights(tenant.id)
-      expect_title(@specific_title)
+      three_placeholders(tenant.id)
 
-      result =
-        Consolidation.apply_confirmed_generic_titles(tenant.id, budget_ms: 0)
+      # ONE expectation for three candidates: the halt keeps `verify_on_exit!` green.
+      Mox.expect(MockContentExtractor, :extract_from_content, fn _scope, _content, _opts ->
+        Process.sleep(40)
+        {:ok, [%{title: @specific_title, body: "b", category: :pattern, tags: [], metadata: %{}}]}
+      end)
+
+      result = Consolidation.apply_confirmed_generic_titles(tenant.id, budget_ms: 20)
 
       assert %{offered: 3, budget_exhausted: true, gate: :open} = result
 
       assert result.applied + result.skipped + result.abstained + result.failed == 1,
-             "an exhausted budget must halt after the item that crossed it"
-
-      assert AdminRepo.aggregate(
-               from(a in Article, where: a.tenant_id == ^tenant.id and a.title == "Untitled"),
-               :count
-             ) in [0, 1]
+             "an exhausted budget must halt before the item it cannot pay for"
     end
 
     test "a night that drained everything it was offered is NOT reported as truncated" do
       # A flag that is true on a converged night is as unreadable as no flag at all — the
-      # deadline is checked only while work is LEFT.
+      # head check is never reached again once the last candidate is processed.
       tenant = fixture(:tenant)
       placeholder(tenant.id)
       expect_title(@specific_title)
 
       assert %{applied: 1, offered: 1, budget_exhausted: false} =
-               Consolidation.apply_confirmed_generic_titles(tenant.id, budget_ms: 0)
+               Consolidation.apply_confirmed_generic_titles(tenant.id)
     end
   end
 

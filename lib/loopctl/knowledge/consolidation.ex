@@ -1352,29 +1352,60 @@ defmodule Loopctl.Knowledge.Consolidation do
   end
 
   defp drain_retitles(tenant_id, proposals, opts) do
-    # Deadline taken BEFORE the first item, and checked after each one — so the granularity
-    # is a single provider call and the last item's own overrun cannot be spent twice.
+    # Deadline taken before the first item and checked BEFORE each one, never after. A
+    # post-item check is unconditionally committed to item #1, so a budget of exactly 0 — the
+    # state a night whose prelude overran arrives in — still bought one full provider call
+    # and one write out of a reserve that was already spent. Checking at the head also keeps
+    # the flag readable for free: a night that processed its LAST candidate and only then
+    # crossed the deadline never reaches another check, so a DRAINED night is never reported
+    # as truncated.
     budget_ms = Keyword.get(opts, :budget_ms, @default_retitle_budget_ms)
     deadline = System.monotonic_time(:millisecond) + budget_ms
     offered = length(proposals)
 
     result =
       Enum.reduce_while(proposals, %{retitle_tally(:open) | offered: offered}, fn proposal, acc ->
-        acc = tally_retitle(tenant_id, proposal, acc, opts)
-
-        # The clock is a TRUNCATION only while work is LEFT: a night that processed every
-        # candidate and crossed the deadline on its way out is a DRAINED night, and a flag
-        # that is true on a drained night is as unreadable as no flag at all.
-        if processed(acc) < offered and System.monotonic_time(:millisecond) >= deadline do
+        if System.monotonic_time(:millisecond) >= deadline do
           {:halt, %{acc | budget_exhausted: true}}
         else
-          {:cont, acc}
+          {:cont, tally_retitle(tenant_id, proposal, acc, opts)}
         end
       end)
 
     log_retitle_truncation(tenant_id, budget_ms, result)
+    log_provider_unconfigured(tenant_id, result)
     result
   end
+
+  # ONCE PER RUN, and a WARNING rather than the per-item info line — the
+  # `log_permanent_withhold/2` lesson, applied to the second applying class.
+  # `{:error, :no_api_key}` is the one abstention reason that is PERMANENT, self-inflicted
+  # and operator-fixable, and `generated_title/3` folds it into the same `provider:` tag a
+  # transient model refusal gets. Without this line a keyless tenant offers the same
+  # placeholders every night, abstains on every one of them, and the audit event reads
+  # exactly like a model that declined 25 times — the #620 shape, one class over.
+  # Self-guarded for the same reason its sibling is: this runs AFTER the drain, so a repo
+  # blip reading the tenant's LLM settings must not discard a completed run's tally.
+  defp log_provider_unconfigured(tenant_id, %{abstained: abstained}) when abstained > 0 do
+    if Llm.has_api_key?(tenant_id) do
+      :ok
+    else
+      Logger.warning(
+        "Consolidation: tenant=#{tenant_id} has no extraction key (mandatory BYO), so its " <>
+          "#{abstained} abstained generic_title candidate(s) can never be titled at all and " <>
+          "are re-offered every night. This is a configuration state, not a provider that " <>
+          "declined. Nothing is retitled while it stands."
+      )
+    end
+
+    :ok
+  rescue
+    _e -> :ok
+  catch
+    :exit, _reason -> :ok
+  end
+
+  defp log_provider_unconfigured(_tenant_id, _result), do: :ok
 
   defp processed(%{applied: a, skipped: s, abstained: b, failed: f}), do: a + s + b + f
 
@@ -1497,12 +1528,67 @@ defmodule Loopctl.Knowledge.Consolidation do
   defp generate_and_write(tenant_id, proposal, article, opts) do
     case generated_title(tenant_id, article, opts) do
       {:ok, title} ->
-        write_title(tenant_id, proposal, article, title)
+        revalidate_and_write(tenant_id, proposal, title)
 
       {:abstain, reason} ->
         log_retitle_abstained(tenant_id, proposal, reason)
         :abstain
     end
+  end
+
+  # `classify_live/1` made this check ALREADY — and then `generated_title/3` spent a whole
+  # provider round-trip (Anthropic `receive_timeout` 25 s, one retry) in between, which is
+  # long enough for every state it validated to move. So it is made again, against the row
+  # as it is NOW, and the write is built from THAT row rather than from the pre-call
+  # snapshot. Three things ride on it: a human who retitled the article during the call does
+  # not get their edit completed for them by a machine title (the failure `still_colliding/5`
+  # exists to prevent on the other class); a curation that landed during the call is not
+  # silently cleared by the title change; and the metadata merged into is the LIVE map, so a
+  # concurrent `visibility` flip or ingestion write is not reverted by a snapshot one round
+  # trip old. `consolidation_previous_title` then names what was really replaced.
+  #
+  # This narrows the window to the statement pair below rather than closing it: a
+  # precondition ON the update would have to live in `Knowledge.update_article/4`, which
+  # every other caller shares. The remaining window is microseconds against 25 seconds.
+  defp revalidate_and_write(tenant_id, proposal, title) do
+    case live_placeholder(tenant_id, proposal) do
+      {:ok, live} -> checked_write(tenant_id, proposal, live, title)
+      {:skip, reason} -> retitle_skip(tenant_id, proposal, reason)
+      {:abstain, reason} -> retitle_skip(tenant_id, proposal, reason)
+    end
+  end
+
+  defp retitle_skip(tenant_id, proposal, reason) do
+    log_retitle_skipped(tenant_id, proposal, reason)
+    :skip
+  end
+
+  defp checked_write(tenant_id, proposal, article, title) do
+    if title_key_taken?(tenant_id, article.id, title) do
+      retitle_skip(tenant_id, proposal, :title_key_taken)
+    else
+      write_title(tenant_id, proposal, article, title)
+    end
+  end
+
+  # The generated title must not collide with another live article under the pass's OWN
+  # normalization, not merely under the raw-title unique index. That index is on
+  # `(tenant_id, title)` VERBATIM, so "Ecto Changesets" lands beside "Ecto changesets"
+  # without complaint — and `title_drift_groups/1` then reads the two as one
+  # `:duplicate_capture` group, which this pass's sibling drain unpublishes two nights later.
+  # A retitle that manufactures the very class the pass retracts is not one worth making, so
+  # it is a SKIP: the placeholder stands and tomorrow's generation may differ. Both sides are
+  # normalized by Postgres (`@title_key_sql`), never by the Elixir twin, so the comparison is
+  # the one the grouping will actually make.
+  defp title_key_taken?(tenant_id, article_id, title) do
+    from(a in Article,
+      where: a.tenant_id == ^tenant_id,
+      where: a.id != ^article_id,
+      where: a.status not in [:archived, :superseded],
+      where:
+        fragment(unquote(@title_key_sql), a.title) == fragment(unquote(@title_key_sql), ^title)
+    )
+    |> AdminRepo.exists?()
   end
 
   # The provider call, and the ONE place bytes of this tenant's corpus leave. Scoped to the
@@ -1526,7 +1612,7 @@ defmodule Loopctl.Knowledge.Consolidation do
     case extractor(opts).extract_from_content(scope, article.body,
            source_type: article.source_type || "unknown"
          ) do
-      {:ok, candidates} -> first_usable_title(candidates, article)
+      {:ok, candidates} -> sole_usable_title(candidates, article)
       {:error, reason} -> {:abstain, "provider:" <> ExitTag.tag(reason)}
     end
   rescue
@@ -1536,18 +1622,30 @@ defmodule Loopctl.Knowledge.Consolidation do
   end
 
   # The extractor is a knowledge EXTRACTOR: it returns whole article attribute maps. Only the
-  # first usable TITLE is taken and everything else is discarded — this step creates nothing,
-  # publishes nothing, and rewrites no body. Reusing the seam rather than adding a second
-  # provider surface is what keeps per-tenant BYO, the router's provider choice, the egress
-  # marking and the token accounting working here for free.
-  defp first_usable_title(candidates, article) when is_list(candidates) do
-    case Enum.find_value(candidates, &usable_title(&1, article)) do
+  # TITLE is taken and everything else is discarded — this step creates nothing, publishes
+  # nothing, and rewrites no body. Reusing the seam rather than adding a second provider
+  # surface is what keeps per-tenant BYO, the router's provider choice, the egress marking
+  # and the token accounting working here for free.
+  #
+  # ONE candidate, or nothing. A reply naming SEVERAL articles is a DECOMPOSITION of the
+  # content — the extractor's contract is to split raw content into up to ten articles — and
+  # taking candidate #1 would name the whole article after whatever its opening section
+  # happens to discuss. The body is truncated to `@title_source_chars` besides, so the model
+  # saw only that opening. A sole candidate is the only reply shape that answers the question
+  # this step asked, and abstention beats invention.
+  defp sole_usable_title([candidate], article) do
+    case usable_title(candidate, article) do
       nil -> {:abstain, "no_usable_title"}
       title -> {:ok, title}
     end
   end
 
-  defp first_usable_title(_other, _article), do: {:abstain, "unparseable_reply"}
+  defp sole_usable_title([], _article), do: {:abstain, "no_usable_title"}
+
+  defp sole_usable_title(candidates, _article) when is_list(candidates),
+    do: {:abstain, "multi_candidate_reply"}
+
+  defp sole_usable_title(_other, _article), do: {:abstain, "unparseable_reply"}
 
   # Every rejection here is a reason to keep the placeholder. A blank or over-long title is
   # a write the changeset would reject anyway; a title that is ITSELF a placeholder would be
@@ -1581,12 +1679,20 @@ defmodule Loopctl.Knowledge.Consolidation do
   # The previous title is recorded on the article's own metadata BEFORE it is replaced, and
   # the new one is marked as machine-generated — the same shape
   # `Loopctl.Knowledge.StructuralLinks` uses (`hub_title_generated`), so a later pass, an
-  # operator, or a human reading the row can tell this pass's work from a person's. The audit
-  # log carries the old title too, but it is retention-bounded; this is not.
+  # operator, or a human reading the row can tell this pass's work from a person's.
+  #
+  # It is a CONVENIENCE, not a guarantee, and the difference is worth stating because the
+  # opposite is easy to assume. `metadata` is cast as a whole map, so one ordinary
+  # `PATCH /api/v1/knowledge/:id` erases both keys — the `lifecycle_entered_at` lesson
+  # (CLAUDE.md), which is why a marker that MUST survive a caller PATCH gets a COLUMN of its
+  # own. The audit log's `old_state` carries the replaced title too and is retention-bounded.
+  # What licenses this write is not that the previous title is stored forever; it is that a
+  # title is replaceable at all, by anyone, at any time — unlike `:archived`.
   #
   # The metadata map is MERGED, never replaced: `update_changeset/2` casts `:metadata` as a
-  # whole map, so building the attrs from anything but the live map would erase an agent's
-  # `visibility` or an ingestion's provenance as a side effect of a retitle.
+  # whole map, so building the attrs from anything but the LIVE map (re-read by
+  # `revalidate_and_write/4` after the provider call, never the pre-call snapshot) would
+  # erase an agent's `visibility` or an ingestion's provenance as a side effect of a retitle.
   defp write_title(tenant_id, proposal, article, title) do
     metadata = article.metadata || %{}
 
@@ -2365,7 +2471,7 @@ defmodule Loopctl.Knowledge.Consolidation do
   # `Loopctl.Workers.KnowledgeLintWorker.judge_redundant_conflicts/2` now resolves exactly
   # these pairs automatically, recording `classification: :redundant, disposition: :dismiss`.
   # The OWNERSHIP is what settles this, not a promise about latency: that drain is bounded by
-  # a wall clock since #761 (~1,400 pairs a night gross, ~900 net of the promoter's own
+  # a wall clock since #761 (~1,260 pairs a night gross, ~760 net of the promoter's own
   # share), so a backlog is worked through over days rather than cleared promptly — this
   # comment used to say "capped ABOVE the promotion rate so the queue converges", which read
   # as the latter. Proposing them here as well
