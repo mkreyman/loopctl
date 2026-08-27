@@ -115,6 +115,25 @@ defmodule Loopctl.Workers.IngestionHealthWorkerTest do
       assert detected_audit_count(tenant.id, "knowledge_lint_drafts") == 1
     end
 
+    test "a globally dead pass pages ONCE, not once per tenant" do
+      tenants = for _ <- 1..3, do: fixture(:tenant)
+      for t <- tenants, do: knowledge_lint_run(t.id, 100, build(:knowledge_lint_state, %{}))
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+
+        # KILLS: the `pass` clause in notify/2 + fire_consumer_pass_system_alert/1. The
+        # cause is the ONE nightly cron, so the per-tenant path pages N times for it —
+        # 2,000 pages at the documented sizing, for a single dead worker.
+        assert [job] = all_enqueued(worker: ScaleAlertDeliveryWorker)
+        assert job.args["payload"]["scope"] == "system"
+        assert job.args["payload"]["affected_tenants"] == 3
+      end)
+
+      # One anomaly row per tenant all the same, so `resolve`/`archive` stay per tenant.
+      for t <- tenants, do: assert([_] = consumer_anomalies(t.id))
+    end
+
     test "an archived stall is never re-flagged" do
       tenant = fixture(:tenant)
 

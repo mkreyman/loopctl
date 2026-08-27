@@ -396,6 +396,23 @@ defmodule Loopctl.Knowledge.DraftConsumer do
   @spec held_drafts?(Ecto.UUID.t()) :: boolean()
   def held_drafts?(tenant_id), do: tenant_id |> draft_scope() |> AdminRepo.exists?()
 
+  @doc """
+  The same question as `held_drafts?/1`, asked ONCE for every tenant at a time.
+
+  The dead-man's-switch runs across every tenant in one hourly job, and an install-wide
+  pause (a cap set to 0, no embedding key configured fleet-wide) puts EVERY tenant on the
+  corroboration path — which as N sequential `held_drafts?/1` calls is N round trips on
+  the 3-connection AdminRepo pool. This is the bounded read that replaces them.
+  """
+  @spec tenant_ids_holding_drafts() :: MapSet.t(Ecto.UUID.t())
+  def tenant_ids_holding_drafts do
+    draft_scope()
+    |> distinct(true)
+    |> select([draft: a], a.tenant_id)
+    |> AdminRepo.all()
+    |> MapSet.new()
+  end
+
   defp candidate_ids(_tenant_id, limit, _direction) when limit <= 0, do: []
 
   defp candidate_ids(tenant_id, limit, direction) do
@@ -410,10 +427,15 @@ defmodule Loopctl.Knowledge.DraftConsumer do
   # The ONE definition of "a draft this step may touch", composed into both the candidate
   # query and the per-item live re-fetch. Two hand-copied predicate lists is how the offer
   # and the write come to disagree about the same row.
-  defp draft_scope(tenant_id) do
+  defp draft_scope(tenant_id),
+    do: draft_scope() |> where([draft: a], a.tenant_id == ^tenant_id)
+
+  # The tenant-agnostic half, so `tenant_ids_holding_drafts/0` asks EXACTLY the question
+  # the per-tenant scope asks. Two hand-copied predicate lists is how the offer and the
+  # corroboration come to disagree about the same row.
+  defp draft_scope do
     from(a in Article,
       as: :draft,
-      where: a.tenant_id == ^tenant_id,
       where: a.status == :draft,
       # TENANT scope only. A `:system` canonical is shared-corpus content that no per-tenant
       # nightly pass owns, and publishing one on a tenant's behalf is not this step's call.

@@ -193,19 +193,28 @@ never pass `tenant_id`/`subject_id`.
      cannot report that. For the same reason the streak has a PASS half counted over NIGHTS
      (`consumer_pass_source_type/0`) rather than only a per-class streak counted over EVENTS,
      which would freeze exactly when the system broke.
-   - **Quiet must stay quiet.** A run offered nothing with every gate `open` neither starts nor
-     extends a streak; a candidate needs work waiting, a hard-blind step (`apply_failed` /
-     `scan_failed` / the `-1` sentinel / a `*_budget_exhausted` that cut in before the first
-     application), or a PAUSED gate whose work is corroborated independently — `by_class` for the
-     consolidation classes, `DraftConsumer.held_drafts?/1` for drafts. `drain_disabled` and
-     `no_embedding_key` report `offered: 0` whether the queue is full or empty, so treating either
-     as evidence on its own alarms forever on healthy installs and gets the switch muted.
-   - **Recovery closes on `evaluated_keys`, never on absence from the candidate list.** A tenant
-     with too few completed runs, or whose events aged past `consumer_history_days/0`, is
-     UNEVALUATED, not recovered; closing it would stamp a false `resolved` into the append-only
-     audit log on exactly the tenants whose evidence went missing. `consumer_history_days/0` is
-     DERIVED from the two thresholds (double the longer, clamped to the 90-day `audit_log`
-     retention) rather than picked beside them — the #761 lesson.
+   - **Quiet must stay quiet, and a REFUSAL is quiet.** A run offered nothing with every gate
+     `open` neither starts nor extends a streak; nor does one whose only outcomes were deliberate
+     refusals — a `duplicate_groups_uncorroborated` withhold, a `generic_titles_abstained`, a
+     `{:skip, :curated}` — because the scan re-proposes those same items every night, so counting
+     them as work waiting is a page that can never come down. A candidate needs ACTIONABLE work
+     waiting, a hard-blind step (`apply_failed` / `scan_failed` / the `-1` sentinel / a
+     `*_budget_exhausted` that cut in before the first application), or a PAUSED gate whose work is
+     corroborated independently — `by_class` for the consolidation classes,
+     `DraftConsumer.tenant_ids_holding_drafts/0` (batched, never per tenant on the 3-connection
+     admin pool) for drafts. `drain_disabled` and `no_embedding_key` report `offered: 0` whether the
+     queue is full or empty, so treating either as evidence on its own alarms forever on healthy
+     installs and gets the switch muted. Suspended tenants are excluded at the READ, like every
+     sibling detector: suspension is what STOPS the pass, and recovery is status-gated, so a
+     flagged suspended tenant could never be auto-closed.
+   - **Recovery needs POSITIVE evidence (`recovered_keys`), never mere absence from the candidate
+     list.** A class stops being a candidate the moment its queue empties by any route, and a
+     tenant with too few completed runs is UNEVALUATED rather than recovered; closing on either
+     stamps a false `resolved` into the append-only audit log. Two windows, deliberately: the READ
+     runs to `audit_retention_days/0` so a pass dead for months is still flagged, while
+     `consumer_history_days/0` (double the longer threshold, clamped to that retention) bounds only
+     the per-class STREAK. Deriving the read from the streak window made the longest outages — the
+     ones this exists for — structurally invisible.
 
 ### Three dedup mechanisms, three different questions — do not read one's coverage as another's gap
 

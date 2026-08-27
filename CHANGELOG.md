@@ -38,21 +38,25 @@ All notable changes to loopctl are documented here.
      failure it exists for includes the pass dying, and a detector hosted inside the pass
      cannot report that. `KnowledgeLintWorker`'s `timeout/1` and its budget arithmetic are
      untouched.
-  2. **The deploy adds two migrations.** One widens the `ingestion_anomalies.anomaly_type`
-     CHECK to admit `consumer_stalled` (catalog-only). The other creates
+  2. **The deploy adds two migrations, neither of which pauses writes.** One widens the
+     `ingestion_anomalies.anomaly_type` CHECK to admit `consumer_stalled` (catalog-only);
+     its `down` RETAGS any recorded stall rather than deleting it, so the audit entries
+     pointing at those rows stay resolvable. The other creates
      `audit_log_knowledge_lint_idx`, a partial index over `entity_type =
-     'knowledge_lint'`. `audit_log` is a RANGE-partitioned parent and `CREATE INDEX
-     CONCURRENTLY` is not supported there, so **it takes a SHARE lock per retained
-     partition while it builds and blocks audit writes (and therefore mutating API
-     requests) for that time** — the same trade
-     `20260403232059_add_audit_log_metadata_story_id_index` already made on this table.
-     Deploy it in a window where a brief write pause is acceptable. Without the index the
-     detector's cross-tenant read degrades to a sequential scan of the recent partitions
-     on the 3-connection admin pool.
+     'knowledge_lint'`. `audit_log` is a RANGE-partitioned parent, where `CREATE INDEX
+     CONCURRENTLY` is unsupported on the PARENT but supported per PARTITION — so the
+     parent index is created `ON ONLY` and each partition's is built CONCURRENTLY and
+     ATTACHed. It runs outside a DDL transaction and outside the migration lock; only the
+     brief ATTACH blocks writes. Without the index the detector's cross-tenant read
+     degrades to a sequential scan of the recent partitions on the 3-connection admin
+     pool.
   3. **Three new tunables**, each resolving DB `system_config` row -> app config -> module
      default, so a window can be widened mid-incident without a deploy:
-     `knowledge_consumer_stall_runs` (7), `knowledge_consumer_pass_staleness_hours` (72),
-     `knowledge_consumer_scan_limit` (20000). No new environment variables.
+     `knowledge_consumer_stall_runs` (7, CLAMPED to `audit_retention_days` — a streak
+     longer than the evidence could never fill and would silently switch the detector
+     off), `knowledge_consumer_pass_staleness_hours` (72), `knowledge_consumer_scan_limit`
+     (20000). No new environment variables. Coverage is bounded by `audit_retention_days`
+     (90 by default): a pass dead for longer than that leaves no events to judge.
   4. **A stall surfaces the way every other `ingestion_anomalies` detector does** — a
      `Logger.error`, an `ingestion_anomaly`/`detected` audit entry, an operator alert
      through `ScaleAlertDeliveryWorker` (a no-op when `SCALE_ALERT_WEBHOOK_URL` is unset),
@@ -62,7 +66,14 @@ All notable changes to loopctl are documented here.
      `knowledge_lint_generic_titles`, `knowledge_lint_conflict_judge`), so `resolve` and
      `archive` on `/api/v1/ingestion_anomalies` work per consumer: archiving a
      deliberately paused draft drain does not blind the conflict judge. A stall
-     auto-resolves once its consumer applies again.
+     auto-resolves only on POSITIVE evidence — the consumer applying again, or the pass
+     completing — never merely because the queue behind it emptied.
+
+     The `knowledge_lint_pass` half is the exception to the per-tenant alert: its cause is
+     the single global nightly cron, so one dead pass emits ONE system-scope
+     `knowledge.lint_pass_stalled` operator alert per run carrying the affected-tenant
+     count, not one page per tenant. The per-tenant anomaly rows and webhooks are
+     unchanged.
 
 ### Changed
 

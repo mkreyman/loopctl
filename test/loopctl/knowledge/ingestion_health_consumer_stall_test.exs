@@ -95,6 +95,37 @@ defmodule Loopctl.Knowledge.IngestionHealthConsumerStallTest do
              )
     end
 
+    test "a night of deliberate REFUSALS is not work waiting" do
+      tenant = fixture(:tenant)
+
+      state =
+        with_consolidation(%{
+          "by_class" => %{"duplicate_capture" => 2, "generic_title" => 3},
+          "duplicate_groups_uncorroborated" => 2,
+          "generic_titles_offered" => 3,
+          "generic_titles_abstained" => 2,
+          "generic_titles_skipped" => 1
+        })
+
+      lint_runs(tenant.id, @runs, state)
+
+      # KILLS: subtracting the refusals in `class_reading/2`. A group the #616 gate
+      # WITHHELD, an abstention, a `{:skip, :curated}` — each is the step acting correctly,
+      # and the scan re-proposes the same items every night, so counting them as work
+      # waiting is a page that can never come down.
+      assert candidates_for(tenant.id) == []
+    end
+
+    test "a SUSPENDED tenant is never a candidate" do
+      tenant = fixture(:tenant, %{status: :suspended})
+      lint_run(tenant.id, 100, quiet_state(%{"drafts_offered" => 11}))
+
+      # KILLS: the active-tenant join in consumer_runs/4. Suspension is what STOPS the
+      # pass, and recovery is status-gated — so a flagged suspended tenant pages the
+      # operator three days after they turned it off and can never auto-close.
+      assert candidates_for(tenant.id) == []
+    end
+
     test "a paused drain with an empty draft queue does not alarm" do
       tenant = fixture(:tenant)
       lint_runs(tenant.id, @runs, quiet_state(%{"drafts_gate" => "drain_disabled"}))
@@ -205,6 +236,17 @@ defmodule Loopctl.Knowledge.IngestionHealthConsumerStallTest do
       assert candidate.evidence["paused_runs"] == @runs
     end
 
+    test "flags a pass dead for longer than the derived class window" do
+      tenant = fixture(:tenant)
+      # 20 days: past `consumer_history_days(3, 72)`, well inside the audit retention.
+      lint_run(tenant.id, 480, quiet_state())
+
+      # KILLS: reading over `audit_retention_days/0`. Bound the READ to the class window
+      # and the longest outages leave no rows inside it, so the switch goes silent
+      # exactly when it must not.
+      assert (tenant.id |> candidates_for() |> consumer_of(:pass)).hours_stale >= 480
+    end
+
     test "flags the pass itself when no run has completed inside the staleness window" do
       tenant = fixture(:tenant)
       lint_run(tenant.id, 96, quiet_state())
@@ -288,6 +330,27 @@ defmodule Loopctl.Knowledge.IngestionHealthConsumerStallTest do
 
       reloaded = Loopctl.AdminRepo.get!(Loopctl.Knowledge.IngestionAnomaly, anomaly.id)
       refute reloaded.resolved
+    end
+
+    test "leaves an anomaly open when the queue merely went quiet" do
+      tenant = fixture(:tenant)
+      lint_runs(tenant.id, @runs, quiet_state())
+
+      fixture(:ingestion_anomaly, %{
+        tenant_id: tenant.id,
+        source_type: "knowledge_lint_drafts",
+        anomaly_type: :consumer_stalled,
+        last_event_at: nil,
+        hours_stale: 72,
+        sample_count: @runs
+      })
+
+      scan = IngestionHealth.detect_consumer_stalled_scan(@opts)
+
+      # KILLS: `recovered_keys`. A dead drain stops being a candidate the moment the sweep
+      # archives the drafts behind it; closing on that stamps "resumed" into the
+      # append-only audit log about a consumer that has still disposed of nothing.
+      assert IngestionHealth.auto_resolve_recovered_consumer_stalled(scan) == 0
     end
 
     test "leaves a still-stalled consumer's anomaly open" do
