@@ -53,6 +53,22 @@ defmodule Loopctl.Knowledge.IngestionAnomaly do
     reviews the post and either redacts it (`Coordination.delete_post/5`) or resolves
     the anomaly — nothing about a later clean rescan means the leak was handled.
 
+  - `consumer_stalled` -- the nightly knowledge-lint CONSUMERS are disposing of nothing
+    (#765 item 6). Once every queue class has an automatic consumer, a night on which
+    every one of them applies zero is indistinguishable from a clean corpus in the log
+    line and the audit event alike — which is exactly how six consecutive nights of a
+    dead conflict judge read as quiet success (#761). Detected off the nightly
+    `knowledge.lint_completed` audit events, not off any table the consumers write, so
+    the detector survives the pass it watches dying. Freshness fields are repurposed like
+    the other episode types: `sample_count` = the runs examined; `hours_stale` = how long
+    the drought has been observable (for `pass`, hours since the last completed run);
+    `last_event_at` starts nil while the stall is ACTIVE and is stamped with the recovery
+    time by `Loopctl.Knowledge.IngestionHealth.auto_resolve_recovered_consumer_stalled/1`
+    — that stamp re-arms detection so a future stall re-fires. Recorded under one
+    reserved sentinel `source_type` PER CONSUMER
+    (`IngestionHealth.consumer_source_types/0`), so an operator can archive one stalled
+    consumer without blinding the other four.
+
   ## Fields
 
   - `source_type` -- the article `source_type` whose capture stream went silent /
@@ -81,7 +97,13 @@ defmodule Loopctl.Knowledge.IngestionAnomaly do
   # Extensible list — kept in sync with the `ingestion_anomalies_anomaly_type_check`
   # DB CHECK constraint (widened per new value via migration). A future detector can
   # be added here alongside a CHECK-widening migration.
-  @anomaly_types [:capture_silence, :high_reject_rate, :sweep_stalled, :secret_detected]
+  @anomaly_types [
+    :capture_silence,
+    :high_reject_rate,
+    :sweep_stalled,
+    :secret_detected,
+    :consumer_stalled
+  ]
 
   @derive {Jason.Encoder,
            only: [
@@ -163,6 +185,10 @@ defmodule Loopctl.Knowledge.IngestionAnomaly do
       :high_reject_rate -> validate_number(changeset, :hours_stale, greater_than_or_equal_to: 0)
       :sweep_stalled -> validate_number(changeset, :hours_stale, greater_than_or_equal_to: 0)
       :secret_detected -> validate_number(changeset, :hours_stale, greater_than_or_equal_to: 0)
+      # A consumer stall carries a real staleness (how long the drought has been
+      # observable), but the very first run that can see one is only hours old on a
+      # freshly-configured window, so a genuine stall may round to 0 whole hours.
+      :consumer_stalled -> validate_number(changeset, :hours_stale, greater_than_or_equal_to: 0)
       _ -> changeset
     end
   end

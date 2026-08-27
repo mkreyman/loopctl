@@ -47,6 +47,157 @@ defmodule Loopctl.Workers.IngestionHealthWorkerTest do
     from(a in IngestionAnomaly, where: a.tenant_id == ^tenant_id) |> AdminRepo.all()
   end
 
+  describe "perform/1 — nightly consumer-stall detection (#765 item 6)" do
+    # The real defaults apply here on purpose: this is the wiring test, and the number of
+    # runs it takes to trip the switch in production is part of the wiring.
+    defp consumer_anomalies(tenant_id) do
+      tenant_id |> anomalies_for() |> Enum.filter(&(&1.anomaly_type == :consumer_stalled))
+    end
+
+    test "flags a starved consumer, writing audit + operator alert" do
+      tenant = fixture(:tenant)
+
+      knowledge_lint_runs(
+        tenant.id,
+        IngestionHealth.consumer_stall_runs(),
+        build(:knowledge_lint_state, %{"drafts_offered" => 11})
+      )
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+
+        assert_enqueued(worker: ScaleAlertDeliveryWorker)
+      end)
+
+      assert [anomaly] = consumer_anomalies(tenant.id)
+      assert anomaly.source_type == "knowledge_lint_drafts"
+      assert anomaly.sample_count == IngestionHealth.consumer_stall_runs()
+      assert anomaly.metadata["consumer"] == "drafts"
+      assert anomaly.metadata["reason"] == "no_dispositions"
+      # The alert fired and the row records that it did, so a healthy next run takes the
+      # silent update path instead of re-paging.
+      assert anomaly.alerted
+
+      assert detected_audit_count(tenant.id, "knowledge_lint_drafts") == 1
+    end
+
+    test "a healthy nightly pass produces no consumer-stall anomaly" do
+      tenant = fixture(:tenant)
+
+      knowledge_lint_runs(
+        tenant.id,
+        IngestionHealth.consumer_stall_runs(),
+        build(:knowledge_lint_state, %{})
+      )
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+      end)
+
+      assert consumer_anomalies(tenant.id) == []
+    end
+
+    test "an existing stall is refreshed silently — no second audit entry" do
+      tenant = fixture(:tenant)
+
+      knowledge_lint_runs(
+        tenant.id,
+        IngestionHealth.consumer_stall_runs(),
+        build(:knowledge_lint_state, %{"drafts_offered" => 11})
+      )
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+      end)
+
+      assert [_one] = consumer_anomalies(tenant.id)
+      assert detected_audit_count(tenant.id, "knowledge_lint_drafts") == 1
+    end
+
+    test "a globally dead pass pages ONCE, not once per tenant" do
+      tenants = for _ <- 1..3, do: fixture(:tenant)
+      for t <- tenants, do: knowledge_lint_run(t.id, 100, build(:knowledge_lint_state, %{}))
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+
+        # KILLS: the `pass` clause in notify/2 + fire_consumer_pass_system_alert/1. The
+        # cause is the ONE nightly cron, so the per-tenant path pages N times for it —
+        # 2,000 pages at the documented sizing, for a single dead worker.
+        assert [job] = all_enqueued(worker: ScaleAlertDeliveryWorker)
+        assert job.args["payload"]["scope"] == "system"
+        assert job.args["payload"]["affected_tenants"] == 3
+      end)
+
+      # One anomaly row per tenant all the same, so `resolve`/`archive` stay per tenant.
+      for t <- tenants, do: assert([_] = consumer_anomalies(t.id))
+    end
+
+    test "a DROPPED pass-alert enqueue leaves the anomaly unalerted so the next run re-fires" do
+      tenant = fixture(:tenant)
+      knowledge_lint_run(tenant.id, 100, build(:knowledge_lint_state, %{}))
+
+      failing_insert = fn _job -> {:error, %Ecto.Changeset{valid?: false}} end
+      candidate = %{tenant_id: tenant.id, hours_stale: 100}
+
+      anomaly =
+        fixture(:ingestion_anomaly, %{
+          tenant_id: tenant.id,
+          source_type: IngestionHealth.consumer_pass_source_type(),
+          anomaly_type: :consumer_stalled,
+          last_event_at: nil,
+          hours_stale: 100,
+          sample_count: 1
+        })
+
+      log =
+        capture_log(fn ->
+          assert :error =
+                   IngestionHealthWorker.commit_consumer_pass_alert(
+                     [{candidate, anomaly}],
+                     failing_insert
+                   )
+        end)
+
+      # KILLS: flipping `alerted` before the enqueue succeeds. The pass alert is the ONLY
+      # operator signal for a globally dead nightly cron, and a run that drops it must
+      # leave the rows re-firable rather than record an alert that never left.
+      assert log =~ "left unalerted for re-fire next run"
+      refute AdminRepo.get!(IngestionAnomaly, anomaly.id).alerted
+    end
+
+    test "an archived stall is never re-flagged" do
+      tenant = fixture(:tenant)
+
+      knowledge_lint_runs(
+        tenant.id,
+        IngestionHealth.consumer_stall_runs(),
+        build(:knowledge_lint_state, %{"drafts_offered" => 11})
+      )
+
+      fixture(:ingestion_anomaly, %{
+        tenant_id: tenant.id,
+        source_type: "knowledge_lint_drafts",
+        anomaly_type: :consumer_stalled,
+        last_event_at: nil,
+        hours_stale: 72,
+        sample_count: 7,
+        archived: true
+      })
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+      end)
+
+      # The operator escape hatch: exactly the row that was already there, unresolved and
+      # unrefreshed, and no new one beside it.
+      assert [existing] = consumer_anomalies(tenant.id)
+      assert existing.archived
+      assert detected_audit_count(tenant.id, "knowledge_lint_drafts") == 0
+    end
+  end
+
   describe "perform/1 — capture-silence detection" do
     test "flags an established + stale source_type, writing audit + operator alert" do
       tenant = fixture(:tenant)

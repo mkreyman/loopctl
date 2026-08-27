@@ -382,7 +382,45 @@ defmodule Loopctl.Knowledge.DraftConsumer do
   defp interleave(rest, []), do: rest
   defp interleave([a | as], [b | bs]), do: [a, b | interleave(as, bs)]
 
-  defp held_drafts?(tenant_id), do: tenant_id |> draft_scope() |> AdminRepo.exists?()
+  @doc """
+  Whether the tenant currently holds at least one draft this consumer would pick up.
+
+  Public for the consumer-stall dead-man's-switch
+  (`Loopctl.Knowledge.IngestionHealth.detect_consumer_stalled_scan/1`), which needs it as
+  CORROBORATION and cannot get it from the audit event: the `drain_disabled` and
+  `no_embedding_key` gates below short-circuit BEFORE the candidate query, so the night's
+  tally reports `offered: 0` whether the queue holds a hundred drafts or none. Without
+  this the switch would either miss a paused drain with a full queue or alarm forever on
+  a keyless tenant with an empty one.
+  """
+  @spec held_drafts?(Ecto.UUID.t()) :: boolean()
+  def held_drafts?(tenant_id), do: tenant_id |> draft_scope() |> AdminRepo.exists?()
+
+  @doc """
+  The same question as `held_drafts?/1`, asked for a NAMED SET of tenants at once.
+
+  The dead-man's-switch runs across every tenant in one hourly job, and an install-wide
+  pause (a cap set to 0, no embedding key configured fleet-wide) puts EVERY tenant on the
+  corroboration path — which as N sequential `held_drafts?/1` calls is N round trips on
+  the 3-connection AdminRepo pool. This replaces them with ONE read, and the caller's
+  tenant list is what bounds it: an unqualified `DISTINCT` over `articles` has no tenant
+  predicate to lead an index with, no early exit, and no LIMIT, so on a large corpus it
+  can outlast the pool timeout — and the worker's rescue would then report the whole
+  detection run as "nothing wrong".
+  """
+  @spec tenant_ids_holding_drafts([Ecto.UUID.t()]) :: MapSet.t(Ecto.UUID.t())
+  def tenant_ids_holding_drafts(tenant_ids),
+    do: tenant_ids |> holding_draft_ids() |> MapSet.new()
+
+  defp holding_draft_ids([]), do: []
+
+  defp holding_draft_ids(tenant_ids) do
+    draft_scope()
+    |> where([draft: a], a.tenant_id in ^tenant_ids)
+    |> distinct(true)
+    |> select([draft: a], a.tenant_id)
+    |> AdminRepo.all()
+  end
 
   defp candidate_ids(_tenant_id, limit, _direction) when limit <= 0, do: []
 
@@ -398,10 +436,15 @@ defmodule Loopctl.Knowledge.DraftConsumer do
   # The ONE definition of "a draft this step may touch", composed into both the candidate
   # query and the per-item live re-fetch. Two hand-copied predicate lists is how the offer
   # and the write come to disagree about the same row.
-  defp draft_scope(tenant_id) do
+  defp draft_scope(tenant_id),
+    do: draft_scope() |> where([draft: a], a.tenant_id == ^tenant_id)
+
+  # The tenant-agnostic half, so `tenant_ids_holding_drafts/0` asks EXACTLY the question
+  # the per-tenant scope asks. Two hand-copied predicate lists is how the offer and the
+  # corroboration come to disagree about the same row.
+  defp draft_scope do
     from(a in Article,
       as: :draft,
-      where: a.tenant_id == ^tenant_id,
       where: a.status == :draft,
       # TENANT scope only. A `:system` canonical is shared-corpus content that no per-tenant
       # nightly pass owns, and publishing one on a tenant's behalf is not this step's call.

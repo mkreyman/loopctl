@@ -474,6 +474,25 @@ defmodule Loopctl.TelemetryEvents do
     do: [:loopctl, :knowledge, :sweep_stall_detection_failed]
 
   @doc """
+  The nightly consumer-stall detector (`:consumer_stalled`, #765 item 6) FAILED inside
+  `Loopctl.Workers.IngestionHealthWorker`'s isolated rescue.
+
+  Same contract, and the same reason, as `sweep_stall_detection_failed/0`: the detector
+  runs in its own failure domain so a statement timeout on the `audit_log` read cannot
+  take capture-silence flagging down with it, and that isolation must not make the
+  MONITOR's own death silent. A dead-man's-switch whose own failure is invisible has
+  reproduced, one level up, the assumed-healthy failure it was built to close.
+
+  ## Payload (atoms/bounded tags only)
+
+    * `measurements`: `%{count: 1}` — a pure increment.
+    * `metadata`: `%{error_class}` — the raised exception's MODULE name, or the literal
+      `"exit"` for a non-exception process exit. Never the failure's message.
+  """
+  def consumer_stall_detection_failed,
+    do: [:loopctl, :knowledge, :consumer_stall_detection_failed]
+
+  @doc """
   The retroactive US-39.1 denylist rescan (`Loopctl.Workers.ChannelPostRescanWorker`)
   COMPLETED a run (issue #499). Emitted on EVERY successful run, including a run that
   scanned nothing and quarantined nothing — for the same reason as
@@ -569,6 +588,7 @@ defmodule Loopctl.TelemetryEvents do
       channel_post_swept(),
       channel_post_sweep_failed(),
       sweep_stall_detection_failed(),
+      consumer_stall_detection_failed(),
       channel_post_rescanned(),
       channel_post_rescan_failed(),
       channel_post_quarantined(),

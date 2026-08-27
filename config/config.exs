@@ -1045,6 +1045,31 @@ config :loopctl, :knowledge_conflict_judge_concurrency, 2
 # Oban.TimeoutError and no consolidation report was produced at all.
 config :loopctl, :knowledge_lint_conflict_judge_budget_ms, :timer.minutes(20)
 
+# The nightly knowledge-lint CONSUMER dead-man's-switch (#765 item 6). Once every queue
+# class has an automatic consumer, the remaining failure is not a crash — a crash logs.
+# It is a pass that completes and applies NOTHING, night after night, which is
+# byte-identical to a clean corpus in the summary line and the audit event alike. The
+# detector lives in Loopctl.Knowledge.IngestionHealth and runs from the hourly
+# IngestionHealthWorker, NOT from the nightly pass: #761 killed that pass on six
+# consecutive nights, so a detector inside it would have been just as dead.
+#
+# Every value below resolves DB row -> this config -> module default, so an operator can
+# widen a window mid-incident without a deploy.
+#
+# 7 runs: measured cadence 2026-08-27 is ~11 drafts a night, ~1 generic_title, 0-1
+# duplicate_capture, so a 2-night window fires on ordinary quiet. A QUIET night never
+# extends the streak, so 7 means 7 nights on which work was actually waiting or the step
+# could not act at all.
+config :loopctl, :knowledge_consumer_stall_runs, 7
+
+# 72 hours: three consecutive missed nightly runs, matching the capture-silence
+# staleness threshold and surviving a deploy window or one bad night.
+config :loopctl, :knowledge_consumer_pass_staleness_hours, 72
+
+# 20_000 rows: the cross-tenant read is `runs x tenants` already; this is the backstop
+# that keeps it bounded on the 3-connection AdminRepo pool as the tenant count grows.
+config :loopctl, :knowledge_consumer_scan_limit, 20_000
+
 # Phase 4 second-stage reranking. OFF by default: it puts an outbound provider call on the
 # DEFAULT search path, and the measurements that motivated the retrieval plan eliminate
 # ranking as the cause of the injected channel's follow-through gap — so a better ranker

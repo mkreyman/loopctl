@@ -182,6 +182,44 @@ never pass `tenant_id`/`subject_id`.
    depth, not authority. The server-guaranteed key is the `articles.idempotency_key` column with
    its per-tenant unique index — prefer it, and do not treat a tag as proof of capture identity.
 
+7. **The nightly consumers are watched by something OUTSIDE them (#765 item 6)** —
+   `Loopctl.Knowledge.IngestionHealth.detect_consumer_stalled_scan/1`, flagged by the hourly
+   `IngestionHealthWorker` as `:consumer_stalled` anomalies. Now that drafts, `:duplicate_capture`,
+   `:generic_title` and the conflict judge all have automatic consumers, the failure left is a
+   pass that COMPLETES and applies nothing — byte-identical, in the audit event and the summary
+   line, to a clean corpus. Three properties are load-bearing and easy to break while tuning it:
+   - **It is not hosted in `KnowledgeLintWorker`.** The failure includes the pass dying (#761: six
+     nights killed inside the judge, no audit event written at all), and a detector inside the pass
+     cannot report that. For the same reason the streak has a PASS half counted over NIGHTS
+     (`consumer_pass_source_type/0`) rather than only a per-class streak counted over EVENTS,
+     which would freeze exactly when the system broke.
+   - **Quiet must stay quiet, but a REFUSAL is only quiet beside a DISPOSITION.** A run offered
+     nothing with every gate `open` neither starts nor extends a streak, and a deliberate refusal —
+     a `duplicate_groups_uncorroborated` withhold, a `generic_titles_abstained`, a
+     `{:skip, :curated}` — is subtracted from the work signal rather than counted as a queue, since
+     the scan re-proposes those same items every night. SATURATION is the opposite reading and must
+     stay visible: refusing EVERY offer while applying none is what a dead extraction provider or a
+     dead vectorisation input looks like (`generated_title/3` folds a provider error, a raise and an
+     exit into `abstained`), so it reads as hard-blind. A candidate needs actionable work waiting, a
+     hard-blind step (`apply_failed` / `scan_failed` / the `-1` sentinel / a `*_budget_exhausted`
+     that cut in before the first application / refusal saturation), or a PAUSED gate whose work is
+     corroborated independently — `by_class` for the consolidation classes,
+     `DraftConsumer.tenant_ids_holding_drafts/1` (ONE read over the paused tenants named by the
+     caller, never per tenant and never unqualified, on the 3-connection admin pool) for drafts.
+     `drain_disabled` and `no_embedding_key` report `offered: 0` whether the queue is full or empty,
+     so treating either as evidence on its own alarms forever on healthy installs. Suspended tenants
+     are excluded at the READ, like every sibling detector: suspension is what STOPS the pass.
+   - **Recovery needs POSITIVE evidence (`recovered_keys`), never mere absence from the candidate
+     list.** Two routes make the claim: the consumer APPLIED something, or a full window offered
+     nothing with no gate blind and none PAUSED (the queue is demonstrably empty). A tenant with too
+     few completed runs is UNEVALUATED rather than recovered. The empty-queue route is not optional:
+     the auto-close is the only path that stamps `last_event_at`, and an operator clearing a stuck
+     row by hand does not — `resolved_episode_suppression?/1` then silences that key forever. Two
+     windows, deliberately: the READ runs to `audit_retention_days/0` so a pass dead for months is
+     still flagged, while `consumer_history_days/0` (double the longer threshold, clamped to that
+     retention) bounds only the per-class STREAK — which is why `consumer_stall_runs/0` is clamped
+     to HALF the retention, so the derived window still fits inside the evidence.
+
 ### Three dedup mechanisms, three different questions — do not read one's coverage as another's gap
 
 They are not redundant and they are not substitutes. Before proposing that one "should" cover

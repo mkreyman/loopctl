@@ -49,7 +49,16 @@ defmodule LoopctlWeb.IngestionAnomalyController do
         "/api/v1/channel/posts/quarantined (role user), then redacted with DELETE " <>
         "/api/v1/channel/posts/{id} or exonerated with POST " <>
         "/api/v1/channel/posts/{id}/release. " <>
-        "NOTE — surface overload: sweep_stalled is a COORDINATION-BUS retention alert, " <>
+        "consumer_stalled (a nightly knowledge CONSUMER applied nothing across a window " <>
+        "of runs while work was waiting, or while a gate it could not act behind stayed " <>
+        "closed \u2014 the classes are the draft consumer, the duplicate drain, the " <>
+        "generic-title retitle and the conflict judge, recorded under reserved " <>
+        "knowledge_lint_* source_types). consumer_stalled is a DEAD-MAN'S SWITCH: it " <>
+        "detects ABSENCE rather than failure, so a genuinely clean corpus with nothing " <>
+        "offered and every gate open stays silent indefinitely, and an episode " <>
+        "auto-resolves once the consumer applies again or its queue is positively " <>
+        "observed empty. " <>
+        "NOTE \u2014 surface overload: sweep_stalled is a COORDINATION-BUS retention alert, " <>
         "not a knowledge-ingestion one. It is served here because it reuses the same " <>
         "anomaly record, alerting and recovery machinery; filter on anomaly_type to " <>
         "separate them. Its WEBHOOK is a distinct event type " <>
@@ -72,8 +81,8 @@ defmodule LoopctlWeb.IngestionAnomalyController do
         in: :query,
         type: :string,
         description:
-          "Filter by anomaly type: capture_silence, high_reject_rate, sweep_stalled, or " <>
-            "secret_detected"
+          "Filter by anomaly type: capture_silence, high_reject_rate, sweep_stalled, " <>
+            "secret_detected, or consumer_stalled"
       ],
       include_archived: [
         in: :query,

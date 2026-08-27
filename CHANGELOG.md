@@ -17,6 +17,67 @@ All notable changes to loopctl are documented here.
   `channel_claims`, server 2.77.0. **Operator impact:** none required; existing callers are
   unaffected.
 
+- **A dead-man's-switch over the nightly knowledge-lint consumers (#765 item 6).** Now
+  that every queue class has an automatic consumer — drafts publish, `:generic_title`
+  retitles, `:duplicate_capture` unpublishes, flagged conflicts are judged — the
+  remaining failure is not a crash. It is a nightly pass that COMPLETES and disposes of
+  nothing, night after night, because a step is broken, starved of its shared wall-clock
+  reserve, or gated off. In the summary line and the audit event alike, that night is
+  byte-identical to a night on a clean corpus. That is exactly how six consecutive nights
+  of a dead conflict judge read as quiet success in #761.
+
+  `Loopctl.Knowledge.IngestionHealth.detect_consumer_stalled_scan/1` reads the nightly
+  `knowledge.lint_completed` audit events and flags two things: a consumer that applied
+  ZERO for `knowledge_consumer_stall_runs` consecutive runs while work was waiting (or
+  while the step could not act at all), and a nightly pass whose last completed run is
+  older than `knowledge_consumer_pass_staleness_hours`. A genuinely clean, quiet corpus
+  never alarms — a run that was offered nothing with every gate open neither starts nor
+  extends a streak. **Operator impact, in four parts.**
+
+  1. **It runs from `IngestionHealthWorker` (hourly), NOT from the nightly pass.** The
+     failure it exists for includes the pass dying, and a detector hosted inside the pass
+     cannot report that. `KnowledgeLintWorker`'s `timeout/1` and its budget arithmetic are
+     untouched.
+  2. **The deploy adds two migrations, neither of which pauses writes.** One widens the
+     `ingestion_anomalies.anomaly_type` CHECK to admit `consumer_stalled` (catalog-only);
+     its `down` RETAGS any recorded stall (resolved + archived, marked
+     `rolled_back_from`) rather than deleting it, so the audit entries pointing at those
+     rows stay resolvable without surfacing a mis-typed anomaly. The other creates
+     `audit_log_knowledge_lint_idx`, a partial index over `entity_type =
+     'knowledge_lint'`. `audit_log` is a RANGE-partitioned parent, where `CREATE INDEX
+     CONCURRENTLY` is unsupported on the PARENT but supported per PARTITION — so the
+     parent index is created `ON ONLY` and each partition's is built CONCURRENTLY and
+     ATTACHed. It runs outside a DDL transaction and outside the migration lock; only the
+     brief ATTACH blocks writes. Without the index the detector's cross-tenant read
+     degrades to a sequential scan of the recent partitions on the 3-connection admin
+     pool.
+  3. **Three new tunables**, each resolving DB `system_config` row -> app config -> module
+     default, so a window can be widened mid-incident without a deploy:
+     `knowledge_consumer_stall_runs` (7, CLAMPED to HALF `audit_retention_days` — the
+     streak window is double this number, so above half it could never fill and the
+     detector would switch off in silence), `knowledge_consumer_pass_staleness_hours`
+     (72), `knowledge_consumer_scan_limit`
+     (20000). No new environment variables. Coverage is bounded by `audit_retention_days`
+     (90 by default): a pass dead for longer than that leaves no events to judge.
+  4. **A stall surfaces the way every other `ingestion_anomalies` detector does** — a
+     `Logger.error`, an `ingestion_anomaly`/`detected` audit entry, an operator alert
+     through `ScaleAlertDeliveryWorker` (a no-op when `SCALE_ALERT_WEBHOOK_URL` is unset),
+     and the existing `knowledge.ingestion_anomaly_detected` webhook. It is recorded
+     under one reserved sentinel `source_type` PER CONSUMER
+     (`knowledge_lint_pass`, `knowledge_lint_drafts`, `knowledge_lint_duplicates`,
+     `knowledge_lint_generic_titles`, `knowledge_lint_conflict_judge`), so `resolve` and
+     `archive` on `/api/v1/ingestion_anomalies` work per consumer: archiving a
+     deliberately paused draft drain does not blind the conflict judge. A stall
+     auto-resolves only on POSITIVE evidence — the consumer applying again, the pass
+     completing, or a whole window in which nothing was offered and no gate was blind or
+     paused. A drain still PAUSED never auto-closes.
+
+     The `knowledge_lint_pass` half is the exception to the per-tenant alert: its cause is
+     the single global nightly cron, so one dead pass emits ONE system-scope
+     `knowledge.lint_pass_stalled` operator alert per run carrying the affected-tenant
+     count, not one page per tenant. The per-tenant anomaly rows and webhooks are
+     unchanged.
+
 ### Changed
 
 - **A draft is no longer held forever: the nightly pass now publishes held drafts, and
