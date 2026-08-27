@@ -128,6 +128,46 @@ defmodule Loopctl.Knowledge.ProposeArticleTest do
       assert id == existing.id
     end
 
+    test "a GATE-drafted proposal is not marked as a deliberate stage", %{tenant: tenant} do
+      # `staged_draft_at` records what the CALLER asked for, never what happened. This
+      # caller asked to publish and the gate held it, so it earns the ordinary 48h floor
+      # in `Loopctl.Knowledge.DraftConsumer`, not the long one a deliberate stage gets.
+      existing =
+        fixture(:article, %{tenant_id: tenant.id, title: "Adjacent again", status: :published})
+
+      assessor(:low_novelty, [neighbor(existing, 0.91)], 0.91)
+
+      assert {:ok, %{verdict: :gated_to_draft, article: article}} =
+               Knowledge.propose_article(tenant.id, %{
+                 "title" => "Held by the gate, not by its author",
+                 "body" => "Mostly covered by an adjacent article.",
+                 "category" => "finding",
+                 "status" => "published"
+               })
+
+      assert article.status == :draft
+      assert article.staged_draft_at == nil
+    end
+
+    test "an explicit :staged_draft opt DOES mark it", %{tenant: tenant} do
+      assessor(:novel)
+
+      assert {:ok, %{article: article}} =
+               Knowledge.propose_article(
+                 tenant.id,
+                 %{
+                   "title" => "Staged on purpose",
+                   "body" => "The caller asked for this to be held.",
+                   "category" => "finding",
+                   "status" => "draft"
+                 },
+                 staged_draft: true
+               )
+
+      assert article.status == :draft
+      assert %DateTime{} = article.staged_draft_at
+    end
+
     test "on_low_novelty: :skip creates nothing and returns the neighbor", %{tenant: tenant} do
       existing =
         fixture(:article, %{tenant_id: tenant.id, title: "Already covered", status: :published})

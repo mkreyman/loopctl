@@ -186,6 +186,39 @@ defmodule Loopctl.Knowledge.VectorSearchTest do
     end
   end
 
+  describe "nearest/4 — an unsearchable query vector is distinguishable from an empty corpus" do
+    # A query vector whose length disagrees with the tenant's read dimension cannot be
+    # searched at all. The historical degrade is `[]`, which is right for a caller that
+    # RENDERS the result and wrong for one that WRITES on it: an empty pool scores as
+    # maximally novel, so an unsearchable proposal reads as a genuinely novel one.
+    test "the default degrade is still the empty list every read caller expects" do
+      tenant = fixture(:tenant)
+      _present = article_with_embedding(tenant.id, base_embedding())
+
+      assert VectorSearch.nearest(tenant.id, [1.0, 0.0, 0.0], 5) == []
+    end
+
+    test "on_unavailable: :tag names it instead, so a write-deciding caller can hold" do
+      tenant = fixture(:tenant)
+      _present = article_with_embedding(tenant.id, base_embedding())
+
+      assert VectorSearch.nearest(tenant.id, [1.0, 0.0, 0.0], 5, on_unavailable: :tag) ==
+               {:error, :search_unavailable}
+    end
+
+    test "a SEARCHABLE vector with no neighbours is still the empty list under :tag" do
+      # The tag must mean "the search did not run", never "the search found nothing" —
+      # otherwise it would hold every genuinely novel proposal in the corpus.
+      tenant = fixture(:tenant)
+      _far = article_with_embedding(tenant.id, orthogonal_embedding())
+
+      assert VectorSearch.nearest(tenant.id, base_embedding(), 5,
+               threshold: 0.99,
+               on_unavailable: :tag
+             ) == []
+    end
+  end
+
   describe "candidate_query/4 — structural guard (AC-27.6a.2)" do
     test "the index-ordered inner subquery has NO join and NO distance-WHERE" do
       tenant = fixture(:tenant)

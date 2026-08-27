@@ -19,6 +19,43 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **A draft is no longer held forever: the nightly pass now publishes held drafts, and
+  the weekly draft-archiving sweep is parked (#765).** Before this, `status: :draft` had
+  no automatic consumer at all — 113 articles were sitting in it on 2026-08-27, growing
+  about 11 a night, and no read path serves a draft, so each was indistinguishable from a
+  capture that never happened. `Loopctl.Knowledge.DraftConsumer` now runs inside the
+  nightly knowledge-lint job: it assesses each eligible draft against the published
+  corpus and publishes it, adding a `relates_to` edge to its nearest neighbour when the
+  draft is a near-duplicate. **Operator impact, in four parts.**
+
+  1. **`draft: true` (and ingestion's `publish: false`) has changed meaning.** It is now
+     a HOLD, not a veto: an explicitly staged draft is recorded as such and published
+     automatically once it is a week old; anything else drains after 48h. A caller that
+     relied on a draft staying unpublished indefinitely must publish or delete it inside
+     that window. The OpenAPI descriptions for both fields say so.
+  2. **The deploy adds two migrations to `articles`.** `staged_draft_at` is a nullable
+     column (catalog-only ALTER, no rewrite) that records the staging opt-in durably,
+     because `metadata` is cast and whole-map-replaced by `PATCH /api/v1/knowledge/:id`.
+     `articles_tenant_draft_inserted_id_idx` is a partial index over `status = 'draft'`
+     built with `CREATE INDEX CONCURRENTLY`, which **cannot run inside a transaction** —
+     the migration therefore disables the DDL transaction and the migration lock, and is
+     re-runnable (it drops a leftover INVALID index from an interrupted build before
+     creating), so a failed release does not wedge later deploys. It is small at hosted
+     scale and does not block writes. It exists because the drain's candidate query runs
+     on `AdminRepo`'s three-connection pool, which every authenticated request also uses.
+  3. **The drain is paused without a deploy** by setting the
+     `knowledge_draft_consumer_max_publishes` `SystemConfig` row to `0`; any positive
+     value caps how many drafts one night may offer (default 30, chosen above the
+     measured ~11-a-night producer rate so the backlog actually falls).
+  4. **`DraftDuplicateSweepWorker` no longer runs.** It ARCHIVES a draft whose nearest
+     published neighbour clears 0.95, and `:archived` is terminal — there is no unarchive
+     path, so only a `user`-role PATCH brings a row back. An unattended writer may not
+     take a terminal act, so the worker joins the parked set: its code and its 05:50
+     Sunday schedule are unchanged, but it is filtered out of the live crontab unless an
+     operator names it in `OBAN_UNPARK_CRONS`. **Weekly automatic archiving of duplicate
+     drafts has therefore stopped**; the drafts it targeted are published and linked by
+     the nightly consumer instead.
+
 - **The hourly embedding reconciler no longer reads the whole `articles` heap to find
   nothing, and Oban prunes on a five-minute interval instead of every 30 seconds.** Both
   were measured on the hosted database over the 19 days to 2026-08-25. The reconciler's

@@ -1115,7 +1115,12 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
         source_type: ctx.source_type,
         source_id: ctx.source_id,
         status: status,
-        project_id: project_id
+        project_id: project_id,
+        # `publish: false` is this endpoint's ADVERTISED default and an explicit opt-in
+        # to staging, so record it durably (`articles.staged_draft_at`) rather than
+        # leaving `Loopctl.Knowledge.DraftConsumer` to infer intent from a row's age.
+        # A column and not `metadata`: metadata is cast and whole-map-replaced by PATCH.
+        staged_draft_at: if(status == :draft, do: now)
       }
 
       changeset = Article.create_changeset(base, attrs)
@@ -1134,7 +1139,7 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
 
   @insert_all_fields ~w(
     tenant_id title body category status scope slug tags
-    source_type source_id idempotency_key metadata project_id
+    source_type source_id idempotency_key metadata project_id staged_draft_at
   )a
   defp changeset_to_row(changeset, now) do
     changeset

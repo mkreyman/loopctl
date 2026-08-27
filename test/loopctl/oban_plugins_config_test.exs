@@ -123,7 +123,7 @@ defmodule Loopctl.ObanPluginsConfigTest do
     end
   end
 
-  describe "DraftDuplicateSweepWorker crontab entry" do
+  describe "DraftDuplicateSweepWorker is PARKED, so it never archives unattended" do
     setup do
       plugins = Application.get_env(:loopctl, Oban)[:plugins]
 
@@ -140,32 +140,18 @@ defmodule Loopctl.ObanPluginsConfigTest do
       %{entry: entry, crontab: cron_opts[:crontab]}
     end
 
-    test "the DraftDuplicateSweepWorker entry exists in the crontab", %{entry: entry} do
-      assert entry,
-             "expected a DraftDuplicateSweepWorker crontab entry that drains the draft " <>
-               "queue of published-duplicate holds"
+    test "it is in the parked set" do
+      assert Loopctl.Workers.DraftDuplicateSweepWorker in Loopctl.ObanConfig.parked_crons(),
+             "the sweep ARCHIVES a draft, and `:archived` is terminal — `Article`'s " <>
+               "@valid_transitions has no `{:archived, _}` entry and there is no unarchive " <>
+               "function. An unattended writer may not take a terminal act (owner decision " <>
+               "2026-08-27, KB 837daaa0), so this runs only when a human unparks it"
     end
 
-    test "it runs weekly and fans out across all tenants", %{entry: entry} do
-      assert elem(entry, 0) == "50 5 * * 0"
-      assert {_schedule, _worker, opts} = entry
-      assert opts[:args] == %{"mode" => "all_tenants"}
-    end
-
-    test "it does not collide with the Sunday KnowledgeMoc fan-out", %{
-      entry: entry,
-      crontab: crontab
-    } do
-      # Both target the shared :knowledge lane on a Sunday. The sweep is deliberately
-      # scheduled AFTER the MOC pass rather than at the same minute, so a wide MOC
-      # fan-out is not competing with the sweep for the same queue slots.
-      moc =
-        Enum.find(crontab, fn tuple ->
-          elem(tuple, 1) == Loopctl.Workers.KnowledgeMocWorker
-        end)
-
-      assert moc, "expected a KnowledgeMocWorker crontab entry to compare against"
-      refute elem(entry, 0) == elem(moc, 0)
+    test "and is therefore absent from the live crontab", %{entry: entry} do
+      refute entry,
+             "expected NO scheduled DraftDuplicateSweepWorker entry with OBAN_UNPARK_CRONS " <>
+               "unset — a schedule here archives drafts weekly with nobody asking"
     end
   end
 
@@ -204,8 +190,10 @@ defmodule Loopctl.ObanPluginsConfigTest do
       crontab: crontab
     } do
       # KnowledgeMoc (05:00 Sun) and DraftDuplicateSweep (05:50 Sun) target the same
-      # shared lane. Each of the three is scheduled at its own minute so a wide fan-out
-      # is never competing with another fan-out for :knowledge queue slots.
+      # shared lane. Each is scheduled at its own minute so a wide fan-out is never
+      # competing with another fan-out for :knowledge queue slots. The sweep is PARKED,
+      # so it is compared against only when an operator has revived it — the collision it
+      # would cause is real again the moment it is scheduled again.
       others =
         crontab
         |> Enum.filter(fn tuple ->
@@ -216,7 +204,7 @@ defmodule Loopctl.ObanPluginsConfigTest do
         end)
         |> Enum.map(&elem(&1, 0))
 
-      assert length(others) == 2, "expected both weekly :knowledge fan-outs to compare against"
+      assert others != [], "expected at least one weekly :knowledge fan-out to compare against"
       refute elem(entry, 0) in others
     end
   end
@@ -241,14 +229,17 @@ defmodule Loopctl.ObanPluginsConfigTest do
                "detector) — re-adding a schedule here silently restores that waste."
     end
 
-    test "the parked set is exactly the five workers the audit found inert" do
+    test "the parked set is the five the audit found inert, plus the one that is not" do
+      # DraftDuplicateSweepWorker is parked for the OPPOSITE reason to the other five:
+      # not for doing nothing, but for taking a TERMINAL action unattended.
       assert Enum.sort(Loopctl.ObanConfig.parked_crons()) ==
                Enum.sort([
                  Loopctl.Workers.MemoryPromotionSweepWorker,
                  Loopctl.Workers.MemoryGraduationSweepWorker,
                  Loopctl.Workers.SessionMemoryPruneWorker,
                  Loopctl.Workers.PromotionEvalWorker,
-                 Loopctl.Workers.IngestionHealthWorker
+                 Loopctl.Workers.IngestionHealthWorker,
+                 Loopctl.Workers.DraftDuplicateSweepWorker
                ])
     end
 

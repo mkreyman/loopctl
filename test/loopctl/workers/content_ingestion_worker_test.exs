@@ -271,6 +271,46 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
       assert is_nil(with_embedding.embedding)
     end
 
+    test "an UNPUBLISHED ingest marks its drafts as deliberately staged" do
+      # `publish: false` is this endpoint's advertised default and an explicit opt-in to
+      # staging. Recording it durably is what lets `Loopctl.Knowledge.DraftConsumer` give
+      # it the longer hold instead of guessing intent from the row's age.
+      %{tenant: tenant} = setup_tenant()
+
+      expect(Loopctl.MockContentExtractor, :extract_from_content, fn _tenant_id,
+                                                                     _content,
+                                                                     _opts ->
+        {:ok,
+         [
+           %{
+             title: "Staged from ingest",
+             body: "Held for review by default.",
+             category: :pattern,
+             tags: ["x"]
+           }
+         ]}
+      end)
+
+      assert :ok =
+               ContentIngestionWorker.perform(%Oban.Job{
+                 id: 44,
+                 args: %{
+                   "tenant_id" => tenant.id,
+                   "content" => "raw",
+                   "content_hash" => "staged123",
+                   "source_type" => "newsletter"
+                 }
+               })
+
+      %{data: [article]} = Knowledge.list_articles(tenant.id, source_type: "newsletter")
+      assert article.status == :draft
+
+      # Read the ROW: `list_articles/2` projects a fixed summary field set that does not
+      # carry this column, and the marker is internal to the drain, not an API field.
+      assert %DateTime{} =
+               Loopctl.AdminRepo.get!(Loopctl.Knowledge.Article, article.id).staged_draft_at
+    end
+
     test "publishes extracted articles when publish: true is set" do
       %{tenant: tenant} = setup_tenant()
 
@@ -302,6 +342,9 @@ defmodule Loopctl.Workers.ContentIngestionWorkerTest do
 
       %{data: [article]} = Knowledge.list_articles(tenant.id, source_type: "newsletter")
       assert article.status == :published
+
+      # An opted-in PUBLISH is not a stage, so it carries no marker.
+      assert Loopctl.AdminRepo.get!(Loopctl.Knowledge.Article, article.id).staged_draft_at == nil
 
       # Published articles are embedded (Oban runs :inline in tests, so the
       # enqueued BatchArticleEmbeddingWorker has already populated the vector).

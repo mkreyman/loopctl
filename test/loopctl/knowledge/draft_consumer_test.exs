@@ -165,6 +165,38 @@ defmodule Loopctl.Knowledge.DraftConsumerTest do
       assert tally.offered == 1
     end
 
+    test "a :novel verdict whose COMPARISON never ran is NOT published" do
+      tenant = fixture(:tenant)
+      held = draft(tenant.id)
+
+      # The shape a permanently-unsearchable tenant produces: `ProposalGate` scores an
+      # empty neighbour list as maximally novel, so the verdict is indistinguishable from
+      # a genuinely novel draft's. `comparison` is the only thing that says the corpus
+      # was never searched, and publishing on it would publish the whole pile uncompared.
+      stub_verdict(%{verdict: :novel, score: nil, neighbors: [], comparison: :unavailable})
+
+      tally = DraftConsumer.consume(tenant.id, @assessor)
+
+      assert reload(held).status == :draft
+      assert tally.unassessed == 1
+      assert tally.published == 0
+      assert tally.offered == 1
+    end
+
+    test "an assessment that says its comparison IS complete still publishes" do
+      # The other half of the guard: it must key on the flag, not on an empty neighbour
+      # list, or every genuinely novel draft in the corpus would be held forever.
+      tenant = fixture(:tenant)
+      held = draft(tenant.id)
+      stub_verdict(%{verdict: :novel, score: nil, neighbors: [], comparison: :complete})
+
+      tally = DraftConsumer.consume(tenant.id, @assessor)
+
+      assert reload(held).status == :published
+      assert tally.published == 1
+      assert tally.unassessed == 0
+    end
+
     test "a verdict outside the behaviour's vocabulary is NOT treated as novel" do
       tenant = fixture(:tenant)
       held = draft(tenant.id)
@@ -315,6 +347,34 @@ defmodule Loopctl.Knowledge.DraftConsumerTest do
 
       assert DraftConsumer.consume(tenant.id, @assessor).offered == 0
       assert reload(fresh).status == :draft
+    end
+
+    test "a DELIBERATELY staged draft gets the longer floor, not the 48h one" do
+      # `staged_draft_at` records that a caller ASKED to stage — `draft: true`, or
+      # ingestion's `publish: false`. Before it existed the consumer could only guess
+      # from age, so a deliberate stage and a capture nobody came back for were the
+      # same row. Three days old: past the 48h floor an unmarked draft gets, inside the
+      # week a marked one does.
+      tenant = fixture(:tenant)
+      staged = tenant.id |> draft() |> aged(-3) |> staged_at(-3)
+      stub_verdict(verdict(:novel))
+
+      assert DraftConsumer.consume(tenant.id, @assessor).offered == 0
+      assert reload(staged).status == :draft
+    end
+
+    test "the longer floor is a FLOOR, not a veto — the stage still drains past it" do
+      # Holding is TOTAL LOSS (no read path serves a draft, and there is no human
+      # approver), so no marker may exempt a draft from the drain permanently. A marker
+      # that did would be a state whose only exit is a human.
+      tenant = fixture(:tenant)
+      staged = tenant.id |> draft() |> aged(-30) |> staged_at(-30)
+      stub_verdict(verdict(:novel))
+
+      tally = DraftConsumer.consume(tenant.id, @assessor)
+
+      assert reload(staged).status == :published
+      assert tally.published == 1
     end
   end
 
@@ -560,6 +620,14 @@ defmodule Loopctl.Knowledge.DraftConsumerTest do
         actor_label: actor_label,
         new_state: %{"status" => "draft"}
       })
+  end
+
+  defp staged_at(article, days) do
+    article
+    |> Ecto.Changeset.change(%{
+      staged_draft_at: DateTime.add(DateTime.utc_now(), days * 86_400, :second)
+    })
+    |> AdminRepo.update!()
   end
 
   defp aged(article, days) do

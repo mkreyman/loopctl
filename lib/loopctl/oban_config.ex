@@ -366,9 +366,10 @@ defmodule Loopctl.ObanConfig do
 
   # --- Parked crons (#249: KB job audit, 2026-08-11) ------------------------------
   #
-  # Workers whose SCHEDULE is dormant by default while their CODE stays intact. Each
-  # earned this by running green and doing nothing — the audit's "level 1" failure,
-  # which no success rate can surface:
+  # Workers whose SCHEDULE is dormant by default while their CODE stays intact. Five of
+  # the six earned it by running green and doing nothing — the audit's "level 1" failure,
+  # which no success rate can surface. The sixth (below) earned it the opposite way, by
+  # doing something an UNATTENDED writer may not do:
   #
   #   * The three agent-memory sweeps (MemoryPromotionSweep, MemoryGraduationSweep,
   #     SessionMemoryPrune) swept an EMPTY tier — production held 0 memories, 0
@@ -381,6 +382,33 @@ defmodule Loopctl.ObanConfig do
   #   * IngestionHealthWorker's only detector (`capture_silence`) was retired in #641
   #     as 100% false-positive on this corpus, leaving the hourly run with nothing to
   #     compute.
+  #
+  #   * DraftDuplicateSweepWorker ARCHIVES a draft whose nearest published neighbour
+  #     clears 0.95, and `:archived` is TERMINAL — `Article`'s `@valid_transitions` has
+  #     no `{:archived, _}` entry and there is no unarchive function, so only a
+  #     `user`-role PATCH ever brings a row back. The owner decision of 2026-08-27 (KB
+  #     `837daaa0`) is that an unattended writer earns automatic action by being
+  #     REVERSIBLE, not by being confident, and that there are no terminal acts for one.
+  #     Its own moduledoc argued archive was acceptable because the threshold is high;
+  #     that argument predates the decision and does not survive it.
+  #
+  #     There is no reversible retirement to swap in: a draft is ALREADY the bottom of
+  #     the reversible lifecycle (`{:published, :draft}` and `{:draft, :published}` are
+  #     the pair; `:archived` is one way out of it), which is why the nightly
+  #     consolidation pass retracts with `unpublish` and this worker had nothing
+  #     equivalent to reach for. So the fix is not a different action but a different
+  #     AUTHORITY: parking makes every archive it takes an act a human asked for, and a
+  #     human may take a terminal act — that is what `role: :user` means everywhere else
+  #     in this codebase. The threshold, the measurement behind it and the exemptions all
+  #     stay in the code, one env var away.
+  #
+  #     Two facts make parking cost nothing at the default. The capture-path backlog it
+  #     was built for is now drained by `Loopctl.Knowledge.DraftConsumer`, nightly rather
+  #     than weekly. And what it can still REACH is not that backlog: it sweeps only
+  #     drafts that HAVE an embedding, embeddings are enqueued at `status: :published`
+  #     only (`Loopctl.Knowledge.maybe_enqueue_embedding/3`), so every row it can archive
+  #     was published once and then retracted — which its own moduledoc says must be
+  #     spared, having spared consolidation's for exactly that reason.
   #
   # PARKED, NOT DELETED, and specifically not deleted for the memory tier: graduation
   # is the one knowledge writer here that is DEMAND-gated (a memory graduates to an
@@ -397,7 +425,8 @@ defmodule Loopctl.ObanConfig do
     Loopctl.Workers.MemoryGraduationSweepWorker,
     Loopctl.Workers.SessionMemoryPruneWorker,
     Loopctl.Workers.PromotionEvalWorker,
-    Loopctl.Workers.IngestionHealthWorker
+    Loopctl.Workers.IngestionHealthWorker,
+    Loopctl.Workers.DraftDuplicateSweepWorker
   ]
 
   @doc """
@@ -607,15 +636,21 @@ defmodule Loopctl.ObanConfig do
            # knowledge-lint fan-out rather than piling onto either. Keep in sync with the
            # crontab assertion in oban_plugins_config_test.exs.
            {"40 3 * * *", Loopctl.Workers.LegacyEmbeddingRetirementWorker},
+           # PARKED (see `@parked_crons`) — DECLARED here, filtered out of the live
+           # crontab by `reject_parked/2` unless an operator names it in
+           # `OBAN_UNPARK_CRONS`. Its action is `archive`, which is TERMINAL, and an
+           # unattended writer may not take a terminal act (owner decision 2026-08-27,
+           # KB `837daaa0`). Parking does not weaken the act; it moves the authority for
+           # it to a human, who may take one. The schedule is kept so a revive restores
+           # the original placement: 05:50 UTC Sunday, AFTER the 05:00 Sunday KnowledgeMoc
+           # fan-out rather than contending with it for the same :knowledge lane.
+           #
            # Weekly drain for the DRAFT queue. The capture hook holds every
            # machine-extracted finding/pattern/playbook as a draft (claude-config#203);
            # without a drain that hold is a landfill, and the 2026-08-17 manual drain
-           # measured 453 of 530 held drafts to be pure duplicates. This retires the
-           # duplicate majority (published-neighbour similarity >= the worker's
-           # threshold) and leaves the judgement half — does the claim survive contact
-           # with its source? — to an agent that can open a repo. 05:50 UTC Sunday sits
-           # AFTER the 05:00 Sunday KnowledgeMoc fan-out rather than contending with it
-           # for the same :knowledge lane. Keep in sync with the crontab assertion in
+           # measured 453 of 530 held drafts to be pure duplicates. That backlog is now
+           # drained NIGHTLY by `Loopctl.Knowledge.DraftConsumer`, which publishes and
+           # links rather than archiving. Keep in sync with the crontab assertion in
            # oban_plugins_config_test.exs.
            {"50 5 * * 0", Loopctl.Workers.DraftDuplicateSweepWorker,
             args: %{"mode" => "all_tenants"}},

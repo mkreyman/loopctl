@@ -26,7 +26,7 @@ never pass `tenant_id`/`subject_id`.
 ## Invariants (cited)
 
 1. **Novelty / dedup gate on create** — `Knowledge.propose_article/3` → the private `gate_proposal/4`
-   (`propose_article/3` at `knowledge.ex:462`; the four `gate_proposal/4` clauses at `:472-522`).
+   (`propose_article/3` at `knowledge.ex:469`; the four `gate_proposal/4` clauses at `:490-540`).
    **SIX outcomes, not four** — `:duplicate`, `:low_novelty`, `:unknown`, `:novel`,
    `:deduplicated` (`created: false`, returned when `create_article` hits the idempotency-key path,
    `knowledge.ex:573-575`), and `:skipped_low_novelty` (`created: false`, `article` may be `nil`).
@@ -115,7 +115,7 @@ never pass `tenant_id`/`subject_id`.
    `{drift_signal, member_id}` — a group scored under the other signal's normalized key finds
    nothing and withholds (fail-closed).
 5. **Heat must not rank on a signal heat produces** — `Knowledge.heat_index/2`
-   (`knowledge.ex:10913`; the counted set is `@heat_read_access_types`, `:10783`). The heat index is the one retrieval route that
+   (`knowledge.ex:10931`; the counted set is `@heat_read_access_types`, `:10801`). The heat index is the one retrieval route that
    takes NO query, so its misses are uncorrelated with embedding similarity — which is worth nothing
    if its ordering is something a caller or the route itself generates. It has been violated FOUR
    times, each differently — and once by a FIX for one of the others — so treat any new input to

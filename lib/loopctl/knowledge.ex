@@ -284,7 +284,13 @@ defmodule Loopctl.Knowledge do
   - `attrs` -- map with title (required), body (required), category (required),
     and optional: status, tags, source_type, source_id, idempotency_key,
     metadata, project_id
-  - `opts` -- keyword list with `:actor_id`, `:actor_label`, `:actor_type`
+  - `opts` -- keyword list with `:actor_id`, `:actor_label`, `:actor_type`, and
+    `:staged_draft` (default `false`) — set it when the CALLER explicitly asked to
+    stage rather than publish (`draft: true` / `status: "draft"` on the API, ingestion's
+    `publish: false`), which stamps the durable `staged_draft_at` marker
+    `Loopctl.Knowledge.DraftConsumer` reads. Do NOT set it for a draft the NOVELTY GATE
+    produced: `gate_proposal/4` drafts a `:low_novelty` proposal whose caller asked to
+    publish, and the marker records what was asked for, not what happened.
 
   ## Returns
 
@@ -336,6 +342,7 @@ defmodule Loopctl.Knowledge do
       changeset =
         %Article{tenant_id: effective_tenant_id}
         |> Article.create_changeset(attrs)
+        |> maybe_stamp_staged_draft(opts)
 
       # Content is always "changed" on create (title + body are required).
       # Only enqueue embedding if the article will be published.
@@ -467,6 +474,17 @@ defmodule Loopctl.Knowledge do
 
   defp proposal_assessor do
     Application.get_env(:loopctl, :proposal_assessor, Loopctl.Knowledge.ProposalGate)
+  end
+
+  # The `:staged_draft` opt, applied at the ONE place a create changeset is built. Off
+  # unless a caller opted in, so nothing that merely happens to land as a draft — a
+  # gate-drafted `:low_novelty` proposal above all — is recorded as a deliberate stage.
+  defp maybe_stamp_staged_draft(changeset, opts) do
+    if Keyword.get(opts, :staged_draft, false) do
+      Article.stamp_staged_draft(changeset)
+    else
+      changeset
+    end
   end
 
   defp gate_proposal(tenant_id, attrs, %{verdict: :duplicate} = assessment, opts) do

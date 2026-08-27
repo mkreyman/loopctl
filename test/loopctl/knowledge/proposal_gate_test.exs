@@ -129,4 +129,70 @@ defmodule Loopctl.Knowledge.ProposalGateTest do
       TenantGate.release(tenant.id, cap)
     end
   end
+
+  describe "assess/3 — `comparison` tells a real answer from no answer" do
+    setup do
+      tenant = fixture(:tenant)
+      existing = published_with_embedding(tenant.id, "Supervisors and OTP", [1.0])
+      %{tenant: tenant, existing: existing}
+    end
+
+    test "a search that RAN is marked :complete, whatever it found", %{tenant: tenant} do
+      stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:ok, e([1.0])}
+      end)
+
+      assessment = ProposalGate.assess(tenant.id, %{"title" => "Supervisors", "body" => "OTP"})
+
+      assert assessment.verdict == :duplicate
+      assert assessment.comparison == :complete
+    end
+
+    test "an EMPTY result from a search that ran is :complete, not :unavailable", %{
+      tenant: tenant
+    } do
+      # The distinction is the whole point: "nothing is similar" must stay publishable,
+      # or the flag would hold every genuinely novel draft in the corpus.
+      stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:ok, e([0.0, 1.0])}
+      end)
+
+      assessment = ProposalGate.assess(tenant.id, %{"title" => "Billing", "body" => "invoices"})
+
+      assert assessment.verdict == :novel
+      assert assessment.neighbors == []
+      assert assessment.comparison == :complete
+    end
+
+    test "an UNSEARCHABLE query vector keeps the :novel verdict but is marked :unavailable",
+         %{tenant: tenant} do
+      # A tenant whose configured model returns a length this instance cannot index gets
+      # an empty result for EVERY query, permanently — and an empty result scores as
+      # maximally novel. The verdict is deliberately unchanged (the create path must not
+      # block a write); `comparison` is the only thing that says nothing was compared.
+      stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:ok, [1.0, 0.0, 0.0]}
+      end)
+
+      assessment = ProposalGate.assess(tenant.id, %{"title" => "Supervisors", "body" => "OTP"})
+
+      assert assessment.verdict == :novel
+      assert assessment.score == nil
+      assert assessment.neighbors == []
+      assert assessment.comparison == :unavailable
+    end
+
+    test "a fall-open is :unavailable too — no comparison happened there either", %{
+      tenant: tenant
+    } do
+      stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:error, :timeout}
+      end)
+
+      assessment = ProposalGate.assess(tenant.id, %{"title" => "X", "body" => "Y"})
+
+      assert assessment.verdict == :unknown
+      assert assessment.comparison == :unavailable
+    end
+  end
 end

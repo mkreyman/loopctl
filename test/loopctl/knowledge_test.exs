@@ -25,6 +25,26 @@ defmodule Loopctl.KnowledgeTest do
   # --- TC-19.3.1: Create article, verify audit log entry ---
 
   describe "create_article/3" do
+    test "staged_draft: true never marks a PUBLISHED row" do
+      # `staged_draft_at` is the drain's record that a DRAFT was held on purpose, so it
+      # must not appear on a row that was published: a marker whose invariant does not
+      # hold is worse than none, and nothing downstream would ever notice.
+      %{tenant: tenant} = setup_tenant()
+
+      attrs = %{
+        title: "Published despite the opt",
+        body: "The opt says what was asked; the status says what happened.",
+        category: :pattern,
+        status: :published
+      }
+
+      assert {:ok, %Article{} = article} =
+               Knowledge.create_article(tenant.id, attrs, staged_draft: true)
+
+      assert article.status == :published
+      assert article.staged_draft_at == nil
+    end
+
     test "creates article with valid attributes and records audit log" do
       %{tenant: tenant} = setup_tenant()
 
