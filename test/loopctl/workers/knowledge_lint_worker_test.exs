@@ -5,6 +5,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
   setup :verify_on_exit!
 
   import Ecto.Query
+  import ExUnit.CaptureLog
 
   alias Loopctl.AdminRepo
   alias Loopctl.Audit.AuditLog
@@ -229,7 +230,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
     end
 
     # The consolidation stage runs AFTER the effectful steps (orphan re-link, conflict
-    # promotion, applied resolutions) and BEFORE the audit event. If it could abort the run,
+    # promotion) and BEFORE the audit event. If it could abort the run,
     # a tenant whose corpus deterministically fails those scans would lose the pre-existing
     # lint pass's observability entirely while Oban redid the effectful steps each retry.
     # Forced here through a REAL failure mode: the tenant's whole HeavyRead in-flight budget
@@ -762,6 +763,99 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
 
       assert applied["duplicate_groups_skipped"] == 1,
              ":max_applies was not honoured — a third proposal was fetched and skipped"
+    end
+  end
+
+  describe "conflict judging is bounded by a wall clock, not only by a count (#761)" do
+    defp flagged_pair(tenant_id, src_id, tgt_id, score) do
+      %ArticleLink{tenant_id: tenant_id}
+      |> ArticleLink.changeset(%{
+        source_article_id: src_id,
+        target_article_id: tgt_id,
+        relationship_type: :potential_conflict,
+        metadata: %{"auto_generated" => true, "similarity_score" => score}
+      })
+      |> AdminRepo.insert!()
+    end
+
+    test "the job timeout is DERIVED from the judge budget, never picked beside it" do
+      # This is the whole of #761 as one assertion. A flat `:timer.minutes(10)` stood next to
+      # a judging step allowed 2000 outbound calls at ~0.85 s each — a ~28-minute ceiling
+      # inside a 10-minute job. Nothing was wrong with either number on its own, which is why
+      # it survived review and then killed every attempt on six consecutive nights once the
+      # nightly inflow outgrew the promoter's 500/night cap.
+      timeout = KnowledgeLintWorker.timeout(%Oban.Job{args: %{}})
+
+      assert timeout > KnowledgeLintWorker.judge_budget_ms(),
+             "the job must outlast the budget of the one step inside it that spends a clock"
+
+      # And by enough to pay for the rest of the night: `execute_conflict_resolutions/2`
+      # alone carries a ~2-minute internal budget, so a reserve smaller than that hands the
+      # timeout back to the same race.
+      assert timeout - KnowledgeLintWorker.judge_budget_ms() >= :timer.minutes(2)
+    end
+
+    test "an exhausted budget stops the stream, is reported, and is LOGGED" do
+      # Budget injected per call rather than through `Application.put_env`, which would
+      # mutate VM-global state every other test in this async suite can see.
+      tenant = fixture(:tenant)
+      a = published_article_with_embedding(tenant.id, similar_embedding())
+      b = published_article_with_embedding(tenant.id, near_similar_embedding())
+      c = published_article_with_embedding(tenant.id, similar_embedding())
+      d = published_article_with_embedding(tenant.id, near_similar_embedding())
+      flagged_pair(tenant.id, a.id, b.id, 0.97)
+      flagged_pair(tenant.id, c.id, d.id, 0.96)
+
+      log =
+        capture_log(fn ->
+          result = KnowledgeLintWorker.judge_redundant_conflicts(tenant.id, budget_ms: 0)
+
+          # The deadline is checked as each result lands, so a spent budget stops the stream
+          # after the FIRST judgement rather than before it — the step always makes progress.
+          assert result.judged == 1
+          assert result.candidates == 2
+          assert result.budget_exhausted
+        end)
+
+      # NEVER silent. `judged: 1` alone reads identically to "there was one pair", which is
+      # the reading that hid six dead nights.
+      assert log =~ "conflict judging hit its"
+      assert log =~ "1 of 2 candidates"
+    end
+
+    test "the untruncated run judges everything and says the budget was NOT the reason" do
+      # The negative half of the pair above: without it, a bound that fires unconditionally
+      # would pass every assertion in the truncation test.
+      tenant = fixture(:tenant)
+      a = published_article_with_embedding(tenant.id, similar_embedding())
+      b = published_article_with_embedding(tenant.id, near_similar_embedding())
+      c = published_article_with_embedding(tenant.id, similar_embedding())
+      d = published_article_with_embedding(tenant.id, near_similar_embedding())
+      flagged_pair(tenant.id, a.id, b.id, 0.97)
+      flagged_pair(tenant.id, c.id, d.id, 0.96)
+
+      result = KnowledgeLintWorker.judge_redundant_conflicts(tenant.id)
+
+      assert result.judged == 2
+      assert result.candidates == 2
+      refute result.budget_exhausted
+    end
+
+    test "the audit event separates a truncated night from a night with nothing to judge" do
+      tenant = fixture(:tenant)
+      a = published_article_with_embedding(tenant.id, similar_embedding())
+      b = published_article_with_embedding(tenant.id, near_similar_embedding())
+      relates_link(tenant.id, a.id, b.id, 0.96)
+
+      assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
+
+      assert [entry] = lint_audit_entries(tenant.id)
+      assert entry.new_state["conflicts_judged_redundant"] == 1
+      # The two keys that make `conflicts_judged_redundant` readable at all: how many were
+      # OFFERED, and whether the clock cut the run short. A quiet night and a truncated one
+      # are the same judged count without them.
+      assert entry.new_state["conflicts_judge_candidates"] == 1
+      assert entry.new_state["conflicts_judge_budget_exhausted"] == false
     end
   end
 end

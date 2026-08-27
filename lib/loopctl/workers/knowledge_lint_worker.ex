@@ -55,17 +55,9 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
      create an orphan. An edge at or above the conflict threshold is ranked but spared
      until step 4's promoter has flagged the pair, so the promoter keeps every candidate
      it has not reached yet. Bounded per run, worst-first, and FAIL-SOFT.
-  4. **Promotes, judges and executes conflicts**, in that order and in one pass
-     (#601, #606). `promote_conflicts/1` flags high-similarity pairs;
-     `judge_redundant_conflicts/1` then records a verdict on them —
-     `classification: :redundant, disposition: :dismiss`, because cosine
-     similarity measures REDUNDANCY and cannot see contradiction, so recording
-     what was actually measured is the only honest verdict available;
-     `Knowledge.execute_conflict_resolutions/2` carries out the recorded
-     dispositions. The judge is deliberately capped ABOVE the promoter, so the
-     pile shrinks by arithmetic rather than by hoping the inflow stops. The judge
-     runs after the promoter within the same night so a pair flagged tonight
-     never spends a night suppressing both its articles from curated answers.
+  4. **Promotes conflicts** (#601, #606) — `promote_conflicts/1` flags
+     high-similarity pairs, bounded at
+     `:knowledge_lint_max_conflict_promotions` (500) a night.
   5. **Consolidates the corpus** (#584, #605) — runs
      `Loopctl.Knowledge.Consolidation.run/2`, which emits numbered,
      evidence-carrying proposals for the two live defect classes and persists them
@@ -83,7 +75,24 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
      so the two-run comparison is tonight-against-last-night. Unpublish, never
      archive: `:archived` is terminal for an article and nothing unattended may
      take a one-way door.
-  7. **Surfaces all findings** via an immutable audit event
+  7. **Executes recorded conflict dispositions** —
+     `Knowledge.execute_conflict_resolutions/2`, itself budget-bounded (~2 min).
+  8. **Judges the flagged conflicts** — `judge_redundant_conflicts/1` records a
+     verdict on the promoter's pile: `classification: :redundant,
+     disposition: :dismiss`, because cosine similarity measures REDUNDANCY and
+     cannot see contradiction, so recording what was actually measured is the
+     only honest verdict available. It is capped ABOVE the promoter, so the pile
+     shrinks by arithmetic rather than by hoping the inflow stops, and it stays
+     within the same night as the promoter so a pair flagged tonight never spends
+     a night suppressing both its articles from curated answers.
+
+     It runs LAST because it is the only step whose per-item cost is an outbound
+     provider call, and it therefore carries the one bound the others do not
+     need: a wall-clock budget (`judge_budget_ms/0`), from which this worker's
+     own `timeout/1` is derived. A count cap alone bounds attempts, not cost —
+     which is how a 2000-call ceiling came to sit inside a 10-minute job and kill
+     six consecutive nights once the inflow outgrew the promoter's cap (#761).
+  9. **Surfaces all findings** via an immutable audit event
      (`knowledge.lint_completed`) carrying the full lint summary, so coverage
      gaps / broken sources / stale counts are observable in the change feed even
      though nothing repairs them — each would need a correctness signal this
@@ -97,6 +106,15 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   `:knowledge_lint_max_orphan_relink` (default 500). When the true orphan count
   exceeds what we act on, the gap is logged — never silently dropped — so an
   operator can see that a backlog remains for the next run.
+
+  Conflict judging is bounded twice, by a count
+  (`:knowledge_lint_max_conflict_judgements`) and by a wall clock
+  (`:knowledge_lint_conflict_judge_budget_ms`), because only the second one bounds
+  what the step actually spends. When the clock truncates a run it is logged AND
+  recorded in the audit event (`conflicts_judge_budget_exhausted`) — a truncated
+  night and a night with nothing left to judge are the same `judged` count
+  otherwise, and telling them apart is the only way to see the queue stop
+  converging.
   """
 
   use Oban.Worker,
@@ -142,6 +160,20 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # merely hold the line at whatever level it had already reached.
   @default_max_conflict_judgements 2000
 
+  # The bound that actually holds, and the one this step never had (#761). `cap` above
+  # counts ATTEMPTS; this counts TIME, which is what a step whose per-item cost is an
+  # outbound provider call is really spending. Measured in production 2026-08-27 on the
+  # 86k-article tenant: one judgement is ~1.7 s wall, ~0.85 s at concurrency 2, so 20
+  # minutes drains ~1,400 pairs a night.
+  #
+  # Sized against the INFLOW, not against the backlog: `promote_conflicts/1` adds at most
+  # `@default_max_conflict_promotions` (500) a night, so a drain of ~1,400 keeps the queue
+  # converging with room for the ingestion-gate inflow the promoter cap does not bound —
+  # which is what put 15,246 flags in over four days and broke the old flat timeout.
+  # Raising concurrency instead is NOT the lever: it is deliberately below `ADMIN_POOL_SIZE`
+  # (default 3), the pool every authenticated request also checks out of.
+  @default_judge_budget_ms :timer.minutes(20)
+
   @impl Oban.Worker
   def perform(%Oban.Job{args: %{"mode" => "all_tenants"}}) do
     tenant_ids =
@@ -183,11 +215,6 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     # promoter input, and an unconditional exemption would make it permanently unprunable.
     pruned = prune_links(tenant_id)
     promoted = promote_conflicts(tenant_id)
-    # The judge runs AFTER promotion so a pair flagged tonight is also judged tonight and
-    # never spends a night suppressing its two articles. It is bounded above the promotion
-    # cap, so the same pass also eats into the backlog.
-    judged = judge_redundant_conflicts(tenant_id)
-    resolutions_applied = Knowledge.execute_conflict_resolutions(tenant_id)
     consolidation = consolidate(tenant_id)
     # Apply AFTER consolidate/1 wrote tonight's report, so the two-run confirmation compares
     # tonight against last night rather than last night against the night before — and ONLY
@@ -197,6 +224,15 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     # reports agree" and unpublish on evidence nobody re-derived, every night the scan keeps
     # failing.
     applied = apply_consolidation(tenant_id, consolidation)
+    resolutions_applied = Knowledge.execute_conflict_resolutions(tenant_id)
+    # The judge runs AFTER promotion so a pair flagged tonight is also judged tonight and
+    # never spends a night suppressing its two articles, and LAST of all the steps because it
+    # is the only one whose cost is an outbound call per item. Measured in production
+    # 2026-08-27, this tenant: lint 350 ms, prune 2.9 s, promote 232 ms, consolidate 3 s — a
+    # combined ten seconds — against ~0.85 s PER PAIR here at concurrency 2. Ordering it last
+    # means the cheap, fail-soft work of the night is already committed before the expensive
+    # step starts, so a judge that exhausts its budget costs the night nothing but judgements.
+    judged = judge_redundant_conflicts(tenant_id)
 
     log_audit_event(tenant_id, report, %{
       action: action,
@@ -214,7 +250,9 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
       # line and the audit event.
       "KnowledgeLintWorker: tenant=#{tenant_id} issues=#{report.summary.total_issues} " <>
         "orphans_relinked=#{action.relinked} orphans_embedding_enqueued=#{action.embedding_enqueued} " <>
-        "conflicts_promoted=#{promoted} conflicts_judged_redundant=#{judged} " <>
+        "conflicts_promoted=#{promoted} conflicts_judged_redundant=#{judged.judged} " <>
+        "conflicts_judge_candidates=#{judged.candidates} " <>
+        "conflicts_judge_budget_exhausted=#{judged.budget_exhausted} " <>
         "links_pruned=#{pruned.pruned} links_prunable_remaining=#{pruned.remaining} " <>
         "resolutions_applied=#{resolutions_applied} " <>
         "duplicates_unpublished=#{applied.applied} duplicate_groups_skipped=#{applied.skipped} " <>
@@ -228,13 +266,26 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   end
 
   # Hard wall-clock backstop for a shared `:knowledge` queue slot (review #4).
-  # `Knowledge.execute_conflict_resolutions/2` is itself budget-bounded (~2 min),
-  # and orphan re-link only ENQUEUES cheap jobs, so a healthy per-tenant run is
-  # well under this; without it, an Oban default of `:infinity` would let a
-  # pathological run pin a slot indefinitely (concurrency 5) and starve other
-  # tenants' ingestion/review jobs.
+  # Without it, an Oban default of `:infinity` would let a pathological run pin a
+  # slot indefinitely (concurrency 3) and starve other tenants' ingestion/review jobs.
+  #
+  # DERIVED from the judge's budget rather than picked, because the two drifting apart is
+  # the failure this replaces (#761). A flat 10 minutes stood here while
+  # `judge_redundant_conflicts/1` was allowed 2000 outbound calls at ~0.85 s each — a
+  # ~28-minute ceiling inside a 10-minute job, latent for as long as the nightly inflow
+  # stayed at the promoter's 500/night cap and fatal the moment it did not. It did not on
+  # 2026-08-20: an ingestion burst put 15,246 `potential_conflict` flags in through the
+  # novelty gate, which that cap does not bound, and every attempt on all six following
+  # nights was killed inside the judge with `Oban.TimeoutError` after 600000ms.
+  #
+  # `@job_reserve_ms` is what the REST of the night costs, measured in production
+  # 2026-08-27 on the 86k-article tenant: ~10 s for lint + prune + promote + consolidate,
+  # plus the ~2-minute internal budget of `Knowledge.execute_conflict_resolutions/2`.
+  # Rounded up hard, because a reserve that is too small resurrects exactly this bug.
+  @job_reserve_ms :timer.minutes(5)
+
   @impl Oban.Worker
-  def timeout(_job), do: :timer.minutes(10)
+  def timeout(_job), do: judge_budget_ms() + @job_reserve_ms
 
   # --- Private ---
 
@@ -479,13 +530,26 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # `potential_conflict`: the count was monotone by construction, and every open one
   # withheld BOTH its articles from curated answers. The suppression window is the backstop
   # for a judge that stalls; this is the judge.
-  defp judge_redundant_conflicts(tenant_id) do
+  #
+  # Public with an `opts` seam, for the same reason `judge_and_record/3` is: a test needs to
+  # drive the budget and the judge implementation PER CALL, and the alternative —
+  # `Application.put_env` — mutates VM-global state that every other test in this `async:
+  # true` suite would see. `:budget_ms` and `:cap` default to the configured values, and
+  # every other key is passed through to `judge_and_record/3`.
+  @spec judge_redundant_conflicts(Ecto.UUID.t(), keyword()) :: %{
+          judged: non_neg_integer(),
+          candidates: non_neg_integer(),
+          budget_exhausted: boolean()
+        }
+  def judge_redundant_conflicts(tenant_id, opts \\ []) do
     cap =
-      Application.get_env(
-        :loopctl,
-        :knowledge_lint_max_conflict_judgements,
-        @default_max_conflict_judgements
-      )
+      Keyword.get_lazy(opts, :cap, fn ->
+        Application.get_env(
+          :loopctl,
+          :knowledge_lint_max_conflict_judgements,
+          @default_max_conflict_judgements
+        )
+      end)
 
     unjudged =
       from(l in ArticleLink,
@@ -528,22 +592,71 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     # `timeout: :infinity` on the stream with the per-task bound coming from the provider
     # client's own timeout — a stream timeout would kill the task and lose the verdict while
     # the request kept running and got billed.
-    unjudged
-    |> Task.async_stream(
-      fn pair -> judge_and_record(tenant_id, pair) end,
-      max_concurrency: judge_concurrency(),
-      timeout: :infinity,
-      on_timeout: :kill_task,
-      ordered: false
-    )
-    |> Enum.reduce(0, fn
-      {:ok, {:ok, _}}, count -> count + 1
-      _other, count -> count
-    end)
+    #
+    # And a COUNT is not a bound on this step (#761). `cap` bounds how many pairs are
+    # attempted; it says nothing about what they cost, because the cost per pair is an
+    # outbound call whose latency belongs to a provider. `Enum.reduce_while/3` over the
+    # stream adds the bound that is actually load-bearing — a wall clock — and it is
+    # checked as each result lands, so the granularity is one judgement (~1.7 s). At most
+    # `judge_concurrency()` in-flight calls are abandoned when it fires: those are billed
+    # and their verdicts lost, which is the price of the step ending on time, and the pairs
+    # return at the head of tomorrow's highest-similarity-first queue.
+    budget_ms = Keyword.get_lazy(opts, :budget_ms, &judge_budget_ms/0)
+    deadline = System.monotonic_time(:millisecond) + budget_ms
+
+    {judged, budget_exhausted} =
+      unjudged
+      |> Task.async_stream(
+        fn pair -> judge_and_record(tenant_id, pair, opts) end,
+        max_concurrency: judge_concurrency(),
+        timeout: :infinity,
+        on_timeout: :kill_task,
+        ordered: false
+      )
+      |> Enum.reduce_while({0, false}, fn result, {count, _} ->
+        count =
+          case result do
+            {:ok, {:ok, _}} -> count + 1
+            _other -> count
+          end
+
+        if System.monotonic_time(:millisecond) >= deadline,
+          do: {:halt, {count, true}},
+          else: {:cont, {count, false}}
+      end)
+
+    # NEVER silent (#761 acceptance). A truncated night and a night with nothing left to
+    # judge are the same number in `judged` alone, and telling them apart is the whole
+    # question when the queue stops converging.
+    if budget_exhausted do
+      Logger.warning(
+        "KnowledgeLintWorker: tenant=#{tenant_id} conflict judging hit its " <>
+          "#{budget_ms}ms budget after #{judged} of #{length(unjudged)} candidates; " <>
+          "the remainder is retried next run."
+      )
+    end
+
+    %{judged: judged, candidates: length(unjudged), budget_exhausted: budget_exhausted}
   end
 
   defp judge_concurrency,
     do: Application.get_env(:loopctl, :knowledge_conflict_judge_concurrency, 2)
+
+  @doc """
+  Wall-clock budget for the nightly conflict-judging step, in milliseconds.
+
+  Public because `timeout/1` is DERIVED from it and a test has to be able to read the same
+  number both sides of that derivation — a budget larger than the job that contains it is
+  precisely the defect (#761) this replaces.
+  """
+  @spec judge_budget_ms() :: pos_integer()
+  def judge_budget_ms do
+    Application.get_env(
+      :loopctl,
+      :knowledge_lint_conflict_judge_budget_ms,
+      @default_judge_budget_ms
+    )
+  end
 
   # Correlated on the enclosing `as: :link`, TRUE when a `conflict_resolutions` row already
   # exists for the pair in EITHER direction. Mirrors `Knowledge.conflict_unresolved_subquery/0`
@@ -991,7 +1104,13 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         # judged > promoted the backlog is draining. If a future reading shows them equal
         # over several nights, the drain is merely holding the line and the caps need
         # revisiting — that is not visible from either number alone.
-        "conflicts_judged_redundant" => judged,
+        "conflicts_judged_redundant" => judged.judged,
+        # And the two numbers that say WHY judged is what it is. Without them a night the
+        # budget truncated and a night with nothing left to judge are indistinguishable in
+        # the audit trail, so "the drain is holding the line" above cannot be read at all
+        # — the reading that was unavailable for the six nights of #761.
+        "conflicts_judge_candidates" => judged.candidates,
+        "conflicts_judge_budget_exhausted" => judged.budget_exhausted,
         # Same convergence reading as the pair above, for the graph. `links_prunable_remaining`
         # is what a capped run could not reach; 0 means nothing DELETABLE is left, which is
         # weaker than "at target degree" — an edge spared as conflict-promoter input is
