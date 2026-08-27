@@ -51,8 +51,8 @@ defmodule Loopctl.Knowledge.DraftConsumer do
       neighbour with a `relates_to` edge carrying the cosine `similarity_score` and
       `auto_generated: true` — the SAME edge `ArticleLinkingWorker` derives from the stored
       vector once the publish's embedding lands, written tonight instead of whenever that
-      queue drains, and under the same project/visibility scope that worker applies so this
-      step adds no edge class the graph did not already have.
+      queue drains, under that worker's own project scope and a STRICTER visibility one
+      (`linkable?/3`), so this step adds no edge class the graph did not already have.
       What the edge buys is a RECORD, not a retraction, and the honest reading of where it
       ends is: `KnowledgeLintWorker.promote_conflicts/1` flags a pair at or above the
       conflict threshold `:potential_conflict`, which SUPPRESSES both its articles from
@@ -96,20 +96,30 @@ defmodule Loopctl.Knowledge.DraftConsumer do
   `articles.consolidation_retracted_at` is never a candidate, and neither is one the
   `audit_log` records as `article.unpublished` BY ANY ACTOR.
 
-  That leaves one residual, deliberately. The durable column exists only from migration
-  `20260818055453` onward and only consolidation stamps it, so the audit row is what carries
-  every other retraction, and a retraction older than audit retention is republished once.
-  `DraftDuplicateSweepWorker` fails closed there and this one does not, because the direction
-  of the danger is inverted: the sweep's action is terminal, so an unprovable retraction must
-  be spared; this one's is reversible, and failing closed here would strand every pre-marker
-  draft permanently, which is the total loss. A durable `unpublished_at` stamped by every
-  retraction path would remove the residual outright.
+  Neither of those two records is durable on its own. The column exists only from migration
+  `20260818055453` onward and only consolidation stamps it; the `audit_log` is
+  range-partitioned and its partitions are DROPped past `:audit_retention_days`, so a human
+  retraction older than retention would be republished — and a `user+` PATCH to
+  `status: :draft` is a retraction that writes `article.updated` and no `article.unpublished`
+  at all. A THIRD record closes both: a draft carrying an EMBEDDING was PUBLISHED once,
+  because `maybe_enqueue_embedding/3` enqueues only at `status: :published` and ingestion only
+  under `publish: true`, and that row outlives every audit partition. It also splits the queue
+  cleanly: `DraftDuplicateSweepWorker` sweeps the EMBEDDED drafts (retractions), this step
+  drains the unembedded ones (captures that were never published) — 112 of the 113 measured.
 
   **A MERGE.** `Knowledge.execute_conflict_resolutions/2` lands its LLM-synthesised merge as
   a draft, and CLAUDE.md's KB-content carve-out rests on that draft never being
   auto-published: it is exactly what separates an agent-role key RECORDING a merge verdict
-  from the same key authorising unattended synthesised text into the corpus. A draft
-  carrying `metadata.merged_from` is never a candidate.
+  from the same key authorising unattended synthesised text into the corpus. So a merge draft
+  is excluded by TWO records: `metadata.merged_from`, and the executor's own
+  `conflict_resolutions.execution_result->>'draft_id'`. The second is what makes it hold —
+  `metadata` is CAST and whole-map-replaced by an agent-role `PATCH /api/v1/knowledge/:id`
+  (the `previous_title` and `stories.lifecycle_entered_at` lesson), so a marker living only
+  there is one ordinary request away from auto-publishing the synthesised text; the
+  executor's row is not caster-writable. That does leave a merge draft with no AUTOMATIC
+  exit, against #765's rule that no state has a human as its only exit. The carve-out is the
+  narrower rule and governs: the exit is an orchestrator publishing or deleting the draft,
+  and it is never this step.
 
   **A HOLD THAT IS STILL FRESH.** `POST /api/v1/knowledge` with `draft: true`, and ingestion
   with `publish: false`, are advertised opt-ins into staging; publishing one the same night
@@ -156,6 +166,7 @@ defmodule Loopctl.Knowledge.DraftConsumer do
   alias Loopctl.ExitTag
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.ArticleEmbedding
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.ProposalGate
   alias Loopctl.Llm
@@ -254,11 +265,16 @@ defmodule Loopctl.Knowledge.DraftConsumer do
       # `ProposalAssessorBehaviour` may not need a tenant embedding key at all, and a
       # pre-check that assumed one would silently stop a drain that would have worked.
       assessor(opts) == ProposalGate and not embedding_key?(tenant_id) ->
-        Logger.warning(
-          "DraftConsumer: tenant=#{tenant_id} has no embedding key (mandatory BYO), so no " <>
-            "draft can be assessed at all; the drain is stopped and every draft stays held. " <>
-            "This is a configuration state, not a provider that failed."
-        )
+        # Guarded on there being something HELD, the condition the removed
+        # `log_provider_unconfigured/2` carried: a keyless tenant with an empty queue has
+        # nothing stuck, and a nightly warning asserting otherwise is how a real one gets muted.
+        if held_drafts?(tenant_id) do
+          Logger.warning(
+            "DraftConsumer: tenant=#{tenant_id} has no embedding key (mandatory BYO), so no " <>
+              "draft can be assessed at all; the drain is stopped and every draft stays held. " <>
+              "This is a configuration state, not a provider that failed."
+          )
+        end
 
         tally(:no_embedding_key)
 
@@ -320,10 +336,23 @@ defmodule Loopctl.Knowledge.DraftConsumer do
   # would leave the 113 oldest drafts held forever while the queue looked healthy. The
   # remainder is taken NEWEST first so a permanently unconsumable head cannot take the drain
   # to zero — see `@backlog_share`.
+  #
+  # INTERLEAVED, never appended. The cap bounds the QUERY; the bound that actually cuts the
+  # night is the wall clock in `drain/3`, which truncates the TAIL. Appended, the reserve was
+  # the first thing a slow unconsumable head discarded — a head that fails in ~5s an item
+  # spends the whole 2-minute budget inside the backlog slice — so the one slice that exists
+  # to keep the drain positive was exactly the one that never ran.
   defp candidates(tenant_id, cap) do
     oldest = candidate_ids(tenant_id, max(trunc(cap * @backlog_share), 1), :asc)
-    Enum.uniq(oldest ++ candidate_ids(tenant_id, cap - length(oldest), :desc))
+    newest = candidate_ids(tenant_id, cap - length(oldest), :desc)
+    Enum.uniq(interleave(newest, oldest))
   end
+
+  defp interleave([], rest), do: rest
+  defp interleave(rest, []), do: rest
+  defp interleave([a | as], [b | bs]), do: [a, b | interleave(as, bs)]
+
+  defp held_drafts?(tenant_id), do: tenant_id |> draft_scope() |> AdminRepo.exists?()
 
   defp candidate_ids(_tenant_id, limit, _direction) when limit <= 0, do: []
 
@@ -356,22 +385,49 @@ defmodule Loopctl.Knowledge.DraftConsumer do
         fragment("COALESCE(?->>'visibility', 'shared') NOT IN ('private','owner')", a.metadata),
       # A MERGE is staged on purpose. `execute_conflict_resolutions/2` lands LLM-synthesised
       # text as a draft, and the KB-content carve-out that lets an agent-role key record a
-      # merge verdict at all rests on that draft never being auto-published.
+      # merge verdict at all rests on that draft never being auto-published. TWO records,
+      # because `metadata` is cast and whole-map-replaced by an agent-role PATCH: the marker
+      # the executor wrote there, and the executor's own `conflict_resolutions` row, which no
+      # caller can cast.
       where: fragment("? -> 'merged_from' IS NULL", a.metadata),
+      where:
+        not exists(
+          from(cr in "conflict_resolutions",
+            where: cr.tenant_id == parent_as(:draft).tenant_id,
+            where:
+              fragment("? ->> 'draft_id' = ?::text", cr.execution_result, parent_as(:draft).id),
+            select: 1
+          )
+        ),
       # A FRESH HOLD is staged on purpose too — `draft: true` and ingestion's `publish: false`
       # are advertised opt-ins, and a drain that runs tonight makes them unobservable. A floor,
       # not a veto: two nightly runs to publish or delete it, then it drains like the rest.
       where: a.inserted_at <= ago(@min_draft_age_hours, "hour"),
-      # The RETRACTION guard, in its two independent records. See the moduledoc: the durable
-      # column is authoritative and survives audit retention; the audit_log is still read
-      # because the column only exists from migration 20260818055453 onward and only
-      # consolidation stamps it. The audit clause is deliberately NOT narrowed to
-      # `worker:consolidation`: `Knowledge.unpublish_article/3` and `bulk_unpublish/3` are
-      # the `role: :user` retraction lever, and republishing what a human just pulled reverts a
-      # human-gated act unattended, inside 24 hours. `tenant_id` is constrained inside the
-      # subquery so the correlated NOT EXISTS can use `audit_log_tenant_entity_idx`, whose
-      # leading column it is.
+      # The RETRACTION guard, in its THREE independent records. See the moduledoc. The audit
+      # clause is deliberately NOT narrowed to `worker:consolidation`:
+      # `Knowledge.unpublish_article/3` and `bulk_unpublish/3` are the `role: :user`
+      # retraction lever, and republishing what a human just pulled reverts a human-gated act
+      # unattended. `tenant_id` is constrained inside the subquery so the correlated NOT
+      # EXISTS can use `audit_log_tenant_entity_idx`, whose leading column it is.
+      #
+      # Neither the column nor the audit row is durable ALONE — the column is stamped only by
+      # consolidation and only since 20260818055453, and `AuditPartitionWorker` DROPs the
+      # audit partition past `:audit_retention_days`, which also leaves a `user+` PATCH to
+      # `status: :draft` (an `article.updated`, never an `article.unpublished`) with no record
+      # here at all. An EMBEDDING is the third and the durable one: it exists only because the
+      # row was PUBLISHED once (`maybe_enqueue_embedding/3` enqueues at `:published` only,
+      # ingestion only under `publish: true`), and it survives every partition drop. Existence
+      # at ANY dimension, and the legacy column too — currency is not the question.
       where: is_nil(a.consolidation_retracted_at),
+      where: is_nil(a.embedding),
+      where:
+        not exists(
+          from(e in ArticleEmbedding,
+            where: e.tenant_id == parent_as(:draft).tenant_id,
+            where: e.article_id == parent_as(:draft).id,
+            select: 1
+          )
+        ),
       where:
         not exists(
           from(al in "audit_log",
@@ -529,31 +585,36 @@ defmodule Loopctl.Knowledge.DraftConsumer do
   defp verdict_tag(other) when is_map(other), do: "no_verdict_key:" <> inspect(Map.keys(other))
   defp verdict_tag(_other), do: "not_a_map"
 
-  # The nearest PUBLISHED neighbour the gate scored, or `nil`. A `:low_novelty`/`:duplicate`
-  # verdict is DERIVED from the top neighbour's score, so an empty list here is an
-  # implementation contradicting itself; the draft is still published (that is the default,
-  # and withholding it over a malformed assessment would be the total loss), it simply
-  # carries no annotation.
-  defp neighbour(tenant_id, %{neighbors: [%{id: id, similarity_score: score} | _]}, %{
-         id: draft_id,
-         project_id: project_id
-       })
-       when is_binary(id) and id != draft_id do
-    if linkable?(tenant_id, id, project_id) do
-      %{id: id, similarity_score: score}
-    end
+  # The nearest LINKABLE neighbour the gate scored, or `nil`. The whole list is walked, not
+  # just its head: `ProposalGate.assess/3` passes no project or visibility filter, so in a
+  # multi-project tenant the top neighbour being out of scope is ordinary, and judging the
+  # head alone threw away an in-scope pair at rank 2 that the auto-linker links anyway.
+  # `nil` means no candidate survived (or a malformed assessment carried none); the draft is
+  # still published — that is the default, and withholding it would be the total loss — it
+  # simply carries no annotation, and `link/4` counts that separately.
+  defp neighbour(tenant_id, %{neighbors: neighbors}, %{id: draft_id, project_id: project_id})
+       when is_list(neighbors) do
+    Enum.find_value(neighbors, fn
+      %{id: id, similarity_score: score} when is_binary(id) and id != draft_id ->
+        if linkable?(tenant_id, id, project_id), do: %{id: id, similarity_score: score}
+
+      _other ->
+        nil
+    end)
   end
 
   defp neighbour(_tenant_id, _assessment, _draft), do: nil
 
-  # The AUTO-LINKER's own neighbour scope, applied to the edge this step writes tonight:
+  # The scope this step's edge is held to. The PROJECT half mirrors the auto-linker exactly —
   # `ArticleLinkingWorker` passes `project_or_global: article.project_id` and never links out
-  # of a project. `ProposalGate.assess/3` carries no such filter — it scopes the vector read
-  # for egress only — so without this the annotation would be an edge class the graph has
-  # never held: cross-project, or pointing at another agent's `private`/`owner` memory. The
-  # promoter cannot tell such an edge from an auto-linker one, and a promoted pair suppresses
-  # BOTH its articles from curated answers. A `nil` project is GLOBAL on both sides, exactly as
-  # `maybe_filter_by_project_or_global/2` reads it.
+  # of a project, while `ProposalGate.assess/3` carries no such filter (it scopes the vector
+  # read for egress only), so without it the annotation would be an edge class the graph has
+  # never held. A `nil` project is GLOBAL on both sides, exactly as
+  # `maybe_filter_by_project_or_global/2` reads it. The VISIBILITY half is deliberately
+  # STRICTER than the auto-linker, which passes no `:visibility_agent_id` at all
+  # (`VectorSearch.maybe_filter_by_visibility(query, nil)` is a no-op): it delays nothing this
+  # step owes, since that worker may still derive the same edge from the stored vector, and it
+  # keeps an unattended writer out of another agent's `private`/`owner` memory tonight.
   defp linkable?(tenant_id, neighbour_id, project_id) do
     from(a in Article,
       where: a.tenant_id == ^tenant_id,
@@ -606,18 +667,24 @@ defmodule Loopctl.Knowledge.DraftConsumer do
 
   defp link(_tenant_id, _draft, :novel, _neighbour), do: :published
 
+  # `:published_link_failed`, never `:published`: a near-duplicate published with no
+  # annotation is the outcome this step exists to make impossible, and it must not read like a
+  # novel publish in the nightly audit event. Two causes reach here and the line names both —
+  # every scored neighbour was out of `linkable?/3`'s scope (routine in a multi-project
+  # tenant), or the assessment carried none at all (an implementation contradicting itself).
   defp link(tenant_id, draft, _verdict, nil) do
     Logger.warning(
-      "DraftConsumer: tenant=#{tenant_id} draft #{draft.id} assessed as a near-duplicate " <>
-        "but the assessment carried no usable neighbour; published WITHOUT an annotation."
+      "DraftConsumer: tenant=#{tenant_id} draft #{draft.id} assessed as a near-duplicate but " <>
+        "no scored neighbour was linkable (another project, private/owner, or none scored); " <>
+        "published WITHOUT an annotation."
     )
 
-    :published
+    :published_link_failed
   end
 
   # The annotation, and the only thing that separates this step from a bulk publish. It is
   # shaped as the auto-linker's own edge — `auto_generated: true` plus the cosine
-  # `similarity_score`, inside the same project/visibility scope (`linkable?/3`) — because
+  # `similarity_score`, inside `linkable?/3`'s scope — because
   # `KnowledgeLintWorker.promote_conflicts/1` reads exactly that shape, and because the
   # asynchronous `ArticleLinkingWorker` that `publish_article/3` chains to derives the SAME
   # edge from the stored vector once it lands. So this write moves the annotation to tonight;

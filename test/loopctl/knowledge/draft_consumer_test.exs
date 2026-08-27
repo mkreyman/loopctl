@@ -10,7 +10,9 @@ defmodule Loopctl.Knowledge.DraftConsumerTest do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.ArticleEmbedding
   alias Loopctl.Knowledge.ArticleLink
+  alias Loopctl.Knowledge.ConflictResolution
   alias Loopctl.Knowledge.DraftConsumer
   alias Loopctl.Knowledge.ProposalGate
   alias Loopctl.MockProposalAssessor
@@ -112,11 +114,16 @@ defmodule Loopctl.Knowledge.DraftConsumerTest do
       stub_verdict(verdict(:low_novelty, []))
 
       log =
-        capture_log(fn -> assert DraftConsumer.consume(tenant.id, @assessor).published == 1 end)
+        capture_log(fn ->
+          # COUNTED, never folded into a plain publish: an unannotated near-duplicate must not
+          # report the same numbers as a night of novel drafts.
+          tally = DraftConsumer.consume(tenant.id, @assessor)
+          assert tally.published == 1 and tally.link_failed == 1
+        end)
 
       assert reload(held).status == :published
       assert links_from(held.id) == []
-      assert log =~ "no usable neighbour"
+      assert log =~ "no scored neighbour was linkable"
     end
 
     test "nothing this step touches reaches a TERMINAL state" do
@@ -283,6 +290,23 @@ defmodule Loopctl.Knowledge.DraftConsumerTest do
       assert reload(middle).status == :draft
     end
 
+    test "the reserved NEWEST slice is offered BEFORE the backlog, not behind it" do
+      tenant = fixture(:tenant)
+      for d <- 1..4, do: aged(draft(tenant.id), -30 - d)
+      recent = aged(draft(tenant.id), -3)
+
+      Mox.stub(MockProposalAssessor, :assess, fn _tenant_id, attrs, _opts ->
+        send(self(), {:assessed, attrs["title"]})
+        verdict(:novel)
+      end)
+
+      # The wall clock truncates the TAIL, so a reserve appended behind the backlog is the
+      # first thing a slow unconsumable head discards — the stall it exists to prevent.
+      DraftConsumer.consume(tenant.id, Keyword.put(@assessor, :max_publishes, 5))
+      assert_received {:assessed, first}
+      assert first == recent.title
+    end
+
     test "a draft younger than the hold floor is never offered" do
       tenant = fixture(:tenant)
       # `draft: true` (and ingestion without `publish: true`) is an advertised staging opt-in.
@@ -329,6 +353,26 @@ defmodule Loopctl.Knowledge.DraftConsumerTest do
       assert reload(by_human).status == :draft
     end
 
+    test "a draft that was PUBLISHED once is never republished (durable embedding record)" do
+      tenant = fixture(:tenant)
+      # No marker and no audit row — what a `user+` PATCH to `:draft` leaves, and what every
+      # retraction decays to once its audit partition is dropped.
+      retracted = draft(tenant.id)
+
+      %ArticleEmbedding{}
+      |> Ecto.Changeset.change(%{
+        tenant_id: tenant.id,
+        article_id: retracted.id,
+        dim: 768,
+        embedding: List.duplicate(0.1, 768)
+      })
+      |> AdminRepo.insert!()
+
+      stub_verdict(verdict(:novel))
+      assert DraftConsumer.consume(tenant.id, @assessor).offered == 0
+      assert reload(retracted).status == :draft
+    end
+
     test "a conflict-MERGE draft is never auto-published" do
       tenant = fixture(:tenant)
 
@@ -341,6 +385,28 @@ defmodule Loopctl.Knowledge.DraftConsumerTest do
 
       stub_verdict(verdict(:novel))
 
+      assert DraftConsumer.consume(tenant.id, @assessor).offered == 0
+      assert reload(merged).status == :draft
+    end
+
+    test "a merge draft whose metadata a PATCH erased is still never auto-published" do
+      tenant = fixture(:tenant)
+      # An agent-role PATCH whole-map-replaces `metadata`; the executor's row is what holds.
+      merged = draft(tenant.id, %{metadata: %{}})
+
+      %ConflictResolution{tenant_id: tenant.id}
+      |> Ecto.Changeset.change(%{
+        source_article_id: published(tenant.id).id,
+        target_article_id: published(tenant.id).id,
+        classification: :redundant,
+        disposition: :merge,
+        annotated_at: DateTime.utc_now(),
+        executed_at: DateTime.utc_now(),
+        execution_result: %{"action" => "merged_draft", "draft_id" => merged.id}
+      })
+      |> AdminRepo.insert!()
+
+      stub_verdict(verdict(:novel))
       assert DraftConsumer.consume(tenant.id, @assessor).offered == 0
       assert reload(merged).status == :draft
     end
@@ -373,6 +439,17 @@ defmodule Loopctl.Knowledge.DraftConsumerTest do
       assert reload(held).status == :draft
     end
 
+    test "a keyless tenant with NOTHING held does not warn that drafts are held" do
+      tenant = fixture(:tenant)
+
+      log =
+        capture_log(fn ->
+          assert DraftConsumer.consume(tenant.id, proposal_assessor: ProposalGate).offered == 0
+        end)
+
+      refute log =~ "every draft stays held"
+    end
+
     # `ArticleLinkingWorker` scopes neighbours `project_or_global` and skips private/owner rows,
     # so the graph has never held either edge — and the promoter, which cannot tell one from an
     # auto-linker edge, would flag a pair that suppresses BOTH its articles from curated answers.
@@ -385,11 +462,28 @@ defmodule Loopctl.Knowledge.DraftConsumerTest do
       held = draft(tenant.id, %{project_id: fixture(:project, %{tenant_id: tenant.id}).id})
       stub_verdict(verdict(:duplicate, [neighbor(elsewhere, 0.99)]))
 
-      log = capture_log(fn -> DraftConsumer.consume(tenant.id, @assessor) end)
+      log =
+        capture_log(fn -> assert DraftConsumer.consume(tenant.id, @assessor).link_failed == 1 end)
 
       assert reload(held).status == :published
       assert links_from(held.id) == []
-      assert log =~ "no usable neighbour"
+      assert log =~ "no scored neighbour was linkable"
+    end
+
+    test "an in-scope neighbour at rank 2 is linked when the TOP one is out of scope" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      elsewhere =
+        published(tenant.id, %{project_id: fixture(:project, %{tenant_id: tenant.id}).id})
+
+      sibling = published(tenant.id, %{project_id: project.id})
+      held = draft(tenant.id, %{project_id: project.id})
+      stub_verdict(verdict(:duplicate, [neighbor(elsewhere, 0.99), neighbor(sibling, 0.97)]))
+
+      assert DraftConsumer.consume(tenant.id, @assessor).linked == 1
+      assert [link] = links_from(held.id)
+      assert link.target_article_id == sibling.id
     end
 
     test "a PRIVATE neighbour is published unannotated, never linked" do
@@ -417,9 +511,10 @@ defmodule Loopctl.Knowledge.DraftConsumerTest do
       # embedding call has been paid for on a row that had already moved. `verify_on_exit!`
       # fails the test on a second invocation.
       Mox.expect(MockProposalAssessor, :assess, 1, fn _t, attrs, _o ->
-        if attrs["title"] == first.title do
-          second |> Ecto.Changeset.change(%{status: :archived}) |> AdminRepo.update!()
-        end
+        # Whichever the interleaved candidate order reaches first archives the OTHER, so the
+        # remaining one has moved by the time the reduce gets to it.
+        other = if attrs["title"] == first.title, do: second, else: first
+        other |> Ecto.Changeset.change(%{status: :archived}) |> AdminRepo.update!()
 
         verdict(:novel)
       end)
@@ -431,7 +526,7 @@ defmodule Loopctl.Knowledge.DraftConsumerTest do
       assert tally.skipped == 1
       # It is SKIPPED, not published and not failed: nothing is wrong and nothing is owed.
       assert tally.failed == 0
-      assert reload(second).status == :archived
+      assert Enum.count([first, second], &(reload(&1).status == :archived)) == 1
     end
   end
 
