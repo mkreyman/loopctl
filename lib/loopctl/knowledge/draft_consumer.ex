@@ -382,7 +382,19 @@ defmodule Loopctl.Knowledge.DraftConsumer do
   defp interleave(rest, []), do: rest
   defp interleave([a | as], [b | bs]), do: [a, b | interleave(as, bs)]
 
-  defp held_drafts?(tenant_id), do: tenant_id |> draft_scope() |> AdminRepo.exists?()
+  @doc """
+  Whether the tenant currently holds at least one draft this consumer would pick up.
+
+  Public for the consumer-stall dead-man's-switch
+  (`Loopctl.Knowledge.IngestionHealth.detect_consumer_stalled_scan/1`), which needs it as
+  CORROBORATION and cannot get it from the audit event: the `drain_disabled` and
+  `no_embedding_key` gates below short-circuit BEFORE the candidate query, so the night's
+  tally reports `offered: 0` whether the queue holds a hundred drafts or none. Without
+  this the switch would either miss a paused drain with a full queue or alarm forever on
+  a keyless tenant with an empty one.
+  """
+  @spec held_drafts?(Ecto.UUID.t()) :: boolean()
+  def held_drafts?(tenant_id), do: tenant_id |> draft_scope() |> AdminRepo.exists?()
 
   defp candidate_ids(_tenant_id, limit, _direction) when limit <= 0, do: []
 

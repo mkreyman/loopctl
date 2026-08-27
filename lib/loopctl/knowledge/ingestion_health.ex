@@ -86,10 +86,28 @@ defmodule Loopctl.Knowledge.IngestionHealth do
     flagged REGARDLESS of drain capacity — see the retention-sweep detector below)
   - `:sweep_drain_rate_per_hour` -- default `12_000` (rows/hour the bounded sweep can
     delete install-wide: `@batch_size` 1000 × the `*/5 * * * *` cadence's 12 runs/hour)
+  - `:knowledge_consumer_stall_runs` -- default `7` (consecutive nightly runs a knowledge-lint
+    consumer must dispose of nothing, with work waiting, before it is flagged). Also
+    resolvable from the `SystemConfig` row of the same name.
+  - `:knowledge_consumer_pass_staleness_hours` -- default `72` (hours since the last completed
+    nightly pass past which the pass itself is flagged). Also a `SystemConfig` row.
+  - `:knowledge_consumer_scan_limit` -- default `20_000` (hard cap on `knowledge.lint_completed`
+    rows read per detection run). Also a `SystemConfig` row.
   - `:sweep_scan_limit` -- default `100_000` (hard cap on the residue rows scanned per
     detection, so the cross-tenant read stays bounded on the small AdminRepo pool). MUST
     stay above `sweep_drain_rate_per_hour * sweep_staleness_hours` or the drain-capacity
     rule below becomes unreachable — see "Stalled vs merely BACKLOGGED".
+
+  ## Nightly consumer-stall detector (`:consumer_stalled`, #765 item 6)
+
+  `detect_sweep_stalled/0`'s third sibling, and the one that watches a WORKER rather than
+  a table: `detect_consumer_stalled_scan/1` reads the nightly `knowledge.lint_completed`
+  audit events and flags a consumer that has disposed of nothing for
+  `consumer_stall_runs/0` consecutive runs while work was waiting, plus a nightly pass
+  that has stopped completing at all. Full contract on
+  `detect_consumer_stalled_scan/0`; its config knobs are `consumer_stall_runs/0`,
+  `consumer_pass_staleness_hours/0`, `consumer_scan_limit/0` and the DERIVED
+  `consumer_history_days/0`.
 
   ## Retention-sweep stall detector (`:sweep_stalled`, issue #498)
 
@@ -145,13 +163,17 @@ defmodule Loopctl.Knowledge.IngestionHealth do
 
   import Ecto.Query
 
+  require Logger
+
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Coordination
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.DraftConsumer
   alias Loopctl.Knowledge.IngestionAnomaly
   alias Loopctl.Knowledge.IngestionWriteStats
+  alias Loopctl.SystemConfig
   alias Loopctl.Tenants.Tenant
 
   @default_monitored_source_types :all
@@ -203,6 +225,61 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   # requires a NOT NULL source_type (and the unresolved-unique partial index keys on it),
   # but the sweep is not an article source_type at all — so it is recorded under this
   # reserved, non-article sentinel (precedent: @unstamped_source_type below).
+  # Nightly knowledge-lint consumer-stall detector defaults (#765 item 6).
+  #
+  # SEVEN consecutive nightly runs with nothing disposed. Measured cadence on the hosted
+  # corpus 2026-08-27: ~11 drafts arrive a night, `:generic_title` produces ~1 and
+  # `:duplicate_capture` 0-1 — so a two-night window fires on ordinary quiet, and a
+  # fortnight is half a month of a dead consumer. A QUIET night never extends the streak
+  # (see `detect_consumer_stalled_scan/1`), so seven is seven nights on which work was
+  # actually waiting or the step could not act.
+  @default_consumer_stall_runs 7
+
+  # Three consecutive missed nightly runs before the PASS ITSELF is flagged — the same
+  # 72 hours `@default_staleness_threshold_hours` uses for capture silence, and for the
+  # same reason: past any deploy window or single bad night, well inside the point at
+  # which a human would have wanted to know. This is the half that catches #761.
+  @default_consumer_pass_staleness_hours 72
+
+  # Backstop on the bounded cross-tenant read: `runs x tenants` rows at the default is
+  # 2,000 tenants, on the 3-connection AdminRepo pool.
+  @default_consumer_scan_limit 20_000
+
+  # `Loopctl.Workers.AuditPartitionWorker`'s @default_retention_days. The detector reads
+  # `audit_log`, so this is the hard ceiling on how far back any window can see, and
+  # `consumer_history_days/2` clamps to it rather than asking for rows that were dropped
+  # with their partition.
+  @audit_retention_days 90
+
+  @lint_entity_type "knowledge_lint"
+  @lint_action "knowledge.lint_completed"
+
+  # Reserved sentinel `source_type`s for the consumer-stall detector, for the same reason
+  # @sweep_source_type is one: `ingestion_anomalies.source_type` is NOT NULL and the
+  # unresolved-unique partial index keys on it, but a nightly consumer is not an article
+  # source_type. ONE PER CONSUMER, so archiving a legitimately-paused draft drain does not
+  # also blind the conflict judge.
+  @consumer_pass_source_type "knowledge_lint_pass"
+
+  @consumer_classes [
+    %{key: :drafts, source_type: "knowledge_lint_drafts", label: "draft publishing"},
+    %{
+      key: :duplicates,
+      source_type: "knowledge_lint_duplicates",
+      label: "duplicate unpublishing"
+    },
+    %{
+      key: :generic_titles,
+      source_type: "knowledge_lint_generic_titles",
+      label: "generic-title retitling"
+    },
+    %{
+      key: :conflict_judge,
+      source_type: "knowledge_lint_conflict_judge",
+      label: "conflict judging"
+    }
+  ]
+
   @sweep_source_type "channel_post_sweep"
 
   # Fixed sentinel `source_type` for the retroactive denylist rescan detector (#499),
@@ -260,6 +337,28 @@ defmodule Loopctl.Knowledge.IngestionHealth do
           residue_tenant_ids: MapSet.t(Ecto.UUID.t()),
           truncated?: boolean(),
           scanned: non_neg_integer()
+        }
+
+  @type consumer_candidate :: %{
+          tenant_id: Ecto.UUID.t(),
+          source_type: String.t(),
+          anomaly_type: :consumer_stalled,
+          consumer: :pass | :drafts | :duplicates | :generic_titles | :conflict_judge,
+          reason: :no_completion | :no_dispositions,
+          hours_stale: non_neg_integer(),
+          runs_examined: pos_integer(),
+          evidence: map()
+        }
+
+  @typedoc """
+  One consumer-stall scan: the `{tenant, consumer}` pairs to FLAG plus the raw facts
+  recovery needs. See `detect_consumer_stalled_scan/0`.
+  """
+  @type consumer_scan :: %{
+          candidates: [consumer_candidate()],
+          evaluated_keys: MapSet.t({Ecto.UUID.t(), String.t()}),
+          truncated?: boolean(),
+          runs_scanned: non_neg_integer()
         }
 
   # --- Config accessors (documented defaults) ---
@@ -922,6 +1021,544 @@ defmodule Loopctl.Knowledge.IngestionHealth do
     |> MapSet.new()
   end
 
+  # --- Nightly knowledge-lint consumer-stall detector (#765 item 6) ---
+
+  @doc """
+  Reserved sentinel `source_type` for the "the nightly pass is not completing at all"
+  half of the consumer-stall detector. See `consumer_source_types/0`.
+  """
+  @spec consumer_pass_source_type() :: String.t()
+  def consumer_pass_source_type, do: @consumer_pass_source_type
+
+  @doc """
+  Every reserved sentinel `source_type` the `:consumer_stalled` detector records under,
+  newest-run-first order irrelevant: `consumer_pass_source_type/0` plus one per consumer
+  class.
+
+  One row PER CONSUMER rather than one per tenant, so the existing per-`source_type`
+  operator escape hatches keep working at the granularity that matters: archiving a
+  legitimately-paused draft drain must not blind the conflict judge as well.
+  """
+  @spec consumer_source_types() :: [String.t()]
+  def consumer_source_types,
+    do: [@consumer_pass_source_type | Enum.map(@consumer_classes, & &1.source_type)]
+
+  @doc """
+  Consecutive nightly runs a consumer must dispose of NOTHING before it is flagged.
+
+  Resolution order is DB row -> app config -> module default, the same order (and the
+  same reason) as `Loopctl.Workers.KnowledgeLintWorker`'s caps: this is the operator's
+  only mid-incident lever over an alarm, and a lever that needs a deploy is not one.
+
+  The default is #{@default_consumer_stall_runs}. Measured cadence on the hosted corpus
+  2026-08-27: drafts arrive ~11 a night, `:generic_title` produces ~1, and
+  `:duplicate_capture` produces 0-1 — so a 2-night window would fire on ordinary
+  quiet, and 14+ is half a month of a dead consumer. Seven is also comfortably inside
+  the 90-day `audit_log` retention this detector reads through, so the streak never
+  spans a dropped partition.
+  """
+  @spec consumer_stall_runs() :: pos_integer()
+  def consumer_stall_runs do
+    max(
+      tunable(
+        "knowledge_consumer_stall_runs",
+        :knowledge_consumer_stall_runs,
+        @default_consumer_stall_runs
+      ),
+      1
+    )
+  end
+
+  @doc """
+  Hours since the last completed nightly pass past which the PASS itself is flagged.
+
+  Same DB row -> app config -> module default resolution as `consumer_stall_runs/0`.
+  The default is #{@default_consumer_pass_staleness_hours} — three consecutive missed
+  nightly runs, which matches `staleness_threshold_hours/0`'s reasoning for capture
+  silence and survives a deploy window or a single bad night. This is the half that
+  catches #761: six consecutive nights died inside the judge with `Oban.TimeoutError`,
+  wrote NO `knowledge.lint_completed` event at all, and nothing noticed.
+  """
+  @spec consumer_pass_staleness_hours() :: pos_integer()
+  def consumer_pass_staleness_hours do
+    max(
+      tunable(
+        "knowledge_consumer_pass_staleness_hours",
+        :knowledge_consumer_pass_staleness_hours,
+        @default_consumer_pass_staleness_hours
+      ),
+      1
+    )
+  end
+
+  @doc """
+  Hard cap on `knowledge.lint_completed` rows read per detection run.
+
+  The read is bounded by `runs x tenants` already; this is the backstop that keeps it
+  bounded when the tenant count grows, on the 3-connection AdminRepo pool.
+  """
+  @spec consumer_scan_limit() :: pos_integer()
+  def consumer_scan_limit do
+    max(
+      tunable(
+        "knowledge_consumer_scan_limit",
+        :knowledge_consumer_scan_limit,
+        @default_consumer_scan_limit
+      ),
+      1
+    )
+  end
+
+  @doc """
+  How far back the detector reads `knowledge.lint_completed` events, in whole days.
+
+  DERIVED from the two thresholds rather than picked beside them — the #761 lesson, in
+  which a 2000-call ceiling sat inside a 10-minute job because the two numbers were
+  chosen independently. It is DOUBLE the longer of the two windows, so a tenant that
+  misses up to half its nightly runs still has `consumer_stall_runs/0` events inside the
+  window to judge, and it is CLAMPED to the `audit_log` retention (#{@audit_retention_days}
+  days, `Loopctl.Workers.AuditPartitionWorker`), past which the rows this reads do not
+  exist at all.
+
+  The clamp is the detector's real coverage limit and it is worth stating plainly: a
+  pass that has been dead longer than the retention leaves no events in the window, so
+  the tenant becomes UNEVALUABLE rather than recovered. That is why recovery is gated on
+  `:evaluated_keys` (see `auto_resolve_recovered_consumer_stalled/1`) — an open stall
+  anomaly stays open instead of being auto-closed by its own evidence expiring.
+  """
+  @spec consumer_history_days() :: pos_integer()
+  def consumer_history_days,
+    do: consumer_history_days(consumer_stall_runs(), consumer_pass_staleness_hours())
+
+  @doc false
+  @spec consumer_history_days(pos_integer(), pos_integer()) :: pos_integer()
+  def consumer_history_days(runs, pass_staleness_hours) do
+    pass_days = ceil(pass_staleness_hours / 24)
+
+    runs
+    |> max(pass_days)
+    |> Kernel.*(2)
+    |> max(1)
+    |> min(@audit_retention_days)
+  end
+
+  @doc """
+  The nightly consumer-stall dead-man's-switch: candidates only.
+
+  The worker uses `detect_consumer_stalled_scan/0,1` instead, because RECOVERY must be
+  decided against the keys this run could actually JUDGE, not against the absence of a
+  candidate — a tenant whose pass is so dead that its events aged out of the window has
+  no candidate and has not recovered.
+  """
+  @spec detect_consumer_stalled() :: [consumer_candidate()]
+  def detect_consumer_stalled, do: detect_consumer_stalled_scan().candidates
+
+  @doc """
+  `detect_consumer_stalled/0` with explicit config (`:consumer_stall_runs`,
+  `:consumer_pass_staleness_hours`, `:consumer_scan_limit`), so a caller can drive
+  detection without touching global app env.
+  """
+  @spec detect_consumer_stalled(map()) :: [consumer_candidate()]
+  def detect_consumer_stalled(%{} = opts), do: detect_consumer_stalled_scan(opts).candidates
+
+  @doc """
+  `detect_consumer_stalled/0` plus the raw facts recovery needs.
+
+  ## What it detects, and what it deliberately does not
+
+  Once every queue class has an automatic consumer, the remaining failure is not a
+  crash — a crash logs. It is a pass that completes and disposes of NOTHING, night
+  after night, because a step is broken, starved of its shared wall-clock reserve, or
+  gated off. In the audit event and the summary line alike, that night is
+  byte-identical to a night on a clean corpus.
+
+  So the detector separates the two the same way the truncation flags already do:
+
+    * **Quiet** — the class was offered nothing and its gate was `open`. A clean corpus
+      is quiet forever and MUST never alert. Quiet neither starts nor extends a streak.
+    * **Work waiting** — the class had candidates (`*_offered`, `conflicts_judge_candidates`,
+      or the consolidation report's own `by_class` proposal count, which is recorded
+      even on a night the apply never ran) and applied zero.
+    * **Hard-blind** — the step could not act at all: an `apply_failed` / `scan_failed`
+      gate, the `-1` step-failed sentinel, or a wall-clock `*_budget_exhausted` that cut
+      in before the first application. This counts on its own, because a step that
+      crashes or is starved every night is a defect whether or not work happened to be
+      waiting.
+    * **Paused** — an operator set a cap to `0` (`drain_disabled`), the tenant has no
+      embedding key (`no_embedding_key`), or the two-run agreement gate refused
+      (`report_gap` / `insufficient_history`). These short-circuit BEFORE the candidate
+      query, so the tally reports `offered: 0` and cannot say whether a queue is full or
+      empty. A pause therefore counts only when work is corroborated independently —
+      `by_class` for the two consolidation classes, `DraftConsumer.held_drafts?/1` for
+      drafts. Without that a keyless tenant with an empty draft queue would alarm
+      forever, which is how a real switch gets muted.
+
+  A class is a candidate when, across the last `consumer_stall_runs/0` runs, it applied
+  ZERO and at least one run showed work waiting or was hard-blind (or paused with work
+  corroborated).
+
+  ## The pass half
+
+  A run that never completes writes no event, so a streak counted over EVENTS would
+  freeze exactly when the system is broken — the detector becoming the thing it watches.
+  The `consumer_pass_source_type/0` candidate closes that: an ESTABLISHED tenant (at
+  least one completed run inside the window) whose most recent run is older than
+  `consumer_pass_staleness_hours/0` is flagged, and the per-class checks only ever judge
+  runs that did complete.
+
+  ## Independence
+
+  This reads `audit_log`, which `Loopctl.Workers.KnowledgeLintWorker` writes, and it runs
+  from `Loopctl.Workers.IngestionHealthWorker` — a different worker, on a different
+  queue, on a different cadence. Hosting it inside the nightly pass would have made a
+  dead pass unable to report itself, which is the failure mode this whole class of
+  detector exists to remove.
+
+  Returns `t:consumer_scan/0`:
+
+    * `:candidates` — the `{tenant, consumer}` pairs to flag.
+    * `:evaluated_keys` — every `{tenant_id, source_type}` this run could actually judge.
+      A key absent from it was NOT observed healthy; it was not observed at all, so
+      recovery must leave its anomaly open.
+    * `:truncated?` — the bounded read hit `consumer_scan_limit/0`, so tenants past the
+      cut were not read. They are absent from `:evaluated_keys` by construction, so this
+      flag is for observability rather than a recovery veto.
+    * `:runs_scanned` — rows read, for observability.
+  """
+  @spec detect_consumer_stalled_scan() :: consumer_scan()
+  def detect_consumer_stalled_scan, do: detect_consumer_stalled_scan(%{})
+
+  @doc """
+  `detect_consumer_stalled_scan/0` with explicit config (same option handling as
+  `detect_consumer_stalled/1`).
+  """
+  @spec detect_consumer_stalled_scan(map()) :: consumer_scan()
+  def detect_consumer_stalled_scan(%{} = opts) do
+    now = DateTime.utc_now()
+    runs = Map.get(opts, :consumer_stall_runs, consumer_stall_runs())
+    pass_hours = Map.get(opts, :consumer_pass_staleness_hours, consumer_pass_staleness_hours())
+    scan_limit = Map.get(opts, :consumer_scan_limit, consumer_scan_limit())
+    cutoff = DateTime.add(now, -consumer_history_days(runs, pass_hours) * 86_400, :second)
+
+    rows = consumer_runs(cutoff, runs, scan_limit)
+
+    by_tenant =
+      rows
+      |> Enum.group_by(& &1.tenant_id)
+      |> Enum.map(fn {tenant_id, tenant_rows} ->
+        {tenant_id, Enum.sort_by(tenant_rows, & &1.inserted_at, {:desc, DateTime})}
+      end)
+
+    {candidates, evaluated} =
+      Enum.reduce(by_tenant, {[], MapSet.new()}, fn {tenant_id, tenant_runs}, acc ->
+        evaluate_tenant_consumers(tenant_id, tenant_runs, runs, pass_hours, now, acc)
+      end)
+
+    %{
+      candidates: Enum.reverse(candidates),
+      evaluated_keys: evaluated,
+      truncated?: length(rows) >= scan_limit,
+      runs_scanned: length(rows)
+    }
+  end
+
+  # One tenant's whole reading: the pass freshness check (evaluable from a single run)
+  # plus the per-class streak (evaluable only with a full window of runs).
+  defp evaluate_tenant_consumers(
+         tenant_id,
+         tenant_runs,
+         runs,
+         pass_hours,
+         now,
+         {cands, evaluated}
+       ) do
+    {cands, evaluated} =
+      case pass_candidate(tenant_id, tenant_runs, pass_hours, now) do
+        nil -> {cands, evaluated}
+        candidate -> {[candidate | cands], evaluated}
+      end
+
+    evaluated = MapSet.put(evaluated, {tenant_id, @consumer_pass_source_type})
+
+    window = Enum.take(tenant_runs, runs)
+
+    # A window SHORT of `runs` is not enough to judge a streak. Deliberately neither a
+    # candidate nor an evaluated key: a tenant that ran the pass for the first time last
+    # night has no drought to report, and one whose runs STOPPED is the pass half's
+    # business — and leaving the key unevaluated is what keeps recovery from closing its
+    # anomaly on evidence that went missing.
+    if length(window) < runs,
+      do: {cands, evaluated},
+      else:
+        Enum.reduce(
+          @consumer_classes,
+          {cands, evaluated},
+          &class_step(&1, &2, tenant_id, window, now)
+        )
+  end
+
+  # One class's contribution to the tenant's fold. Extracted so `evaluate_tenant_consumers/6`
+  # stays inside Credo's nesting bar.
+  defp class_step(class, {cands, evaluated}, tenant_id, window, now) do
+    evaluated = MapSet.put(evaluated, {tenant_id, class.source_type})
+
+    case class_candidate(tenant_id, class, window, now) do
+      nil -> {cands, evaluated}
+      candidate -> {[candidate | cands], evaluated}
+    end
+  end
+
+  defp pass_candidate(tenant_id, [latest | _] = tenant_runs, pass_hours, now) do
+    hours = max(hours_between(latest.inserted_at, now), 0)
+
+    if hours > pass_hours do
+      %{
+        tenant_id: tenant_id,
+        source_type: @consumer_pass_source_type,
+        anomaly_type: :consumer_stalled,
+        consumer: :pass,
+        reason: :no_completion,
+        hours_stale: hours,
+        runs_examined: length(tenant_runs),
+        evidence: %{
+          "consumer" => "pass",
+          "reason" => "no_completion",
+          "hours_since_last_run" => hours,
+          "threshold_hours" => pass_hours,
+          "last_run_at" => iso8601(latest.inserted_at),
+          "runs_in_window" => length(tenant_runs)
+        }
+      }
+    end
+  end
+
+  defp class_candidate(tenant_id, class, window, now) do
+    readings = Enum.map(window, &class_reading(class.key, &1.state))
+    applied_total = readings |> Enum.map(&max(&1.applied, 0)) |> Enum.sum()
+    work? = Enum.any?(readings, & &1.work?)
+    hard_blind = Enum.count(readings, & &1.hard_blind?)
+    paused = Enum.count(readings, & &1.paused?)
+    oldest = List.last(window)
+
+    stalled? =
+      applied_total == 0 and
+        (work? or hard_blind > 0 or (paused > 0 and corroborated?(class.key, tenant_id)))
+
+    if stalled? do
+      %{
+        tenant_id: tenant_id,
+        source_type: class.source_type,
+        anomaly_type: :consumer_stalled,
+        consumer: class.key,
+        reason: :no_dispositions,
+        hours_stale: max(hours_between(oldest.inserted_at, now), 0),
+        runs_examined: length(window),
+        evidence: %{
+          "consumer" => to_string(class.key),
+          "label" => class.label,
+          "reason" => "no_dispositions",
+          "runs_examined" => length(window),
+          "applied_total" => applied_total,
+          "work_observed" => work?,
+          "hard_blind_runs" => hard_blind,
+          "paused_runs" => paused,
+          "gates" => readings |> Enum.map(& &1.gate) |> Enum.reject(&is_nil/1) |> Enum.uniq(),
+          "newest_run_at" => iso8601(hd(window).inserted_at),
+          "oldest_run_at" => iso8601(oldest.inserted_at)
+        }
+      }
+    end
+  end
+
+  # The ONE place a paused-but-uncorroborated class can still become a candidate, and it
+  # is deliberately a LIVE read rather than another audit field: `drain_disabled` /
+  # `no_embedding_key` short-circuit before the draft candidate query, so `drafts_offered`
+  # is 0 whether the queue holds 113 drafts or none. The consolidation classes need no
+  # equivalent — their `by_class` proposal count is written by the SCAN, which runs even
+  # on a night the apply is paused. Guarded by the caller's `and`, so it is reached only
+  # for a class that is otherwise about to be dismissed as quiet.
+  defp corroborated?(:drafts, tenant_id), do: DraftConsumer.held_drafts?(tenant_id)
+  defp corroborated?(_class, _tenant_id), do: false
+
+  # Per-class reading of ONE night's audit event. Every key is read defensively: an event
+  # written before a class existed simply has none of its keys, and that night is QUIET
+  # for it — a step that did not run cannot have starved.
+  defp class_reading(:drafts, state) do
+    applied = int_at(state, "drafts_published")
+    gate = string_at(state, "drafts_gate")
+    budget_exhausted? = state_true?(state, "drafts_budget_exhausted")
+
+    %{
+      applied: applied,
+      work?: int_at(state, "drafts_offered") > 0,
+      hard_blind?: gate == "apply_failed" or (budget_exhausted? and applied == 0),
+      paused?: gate in ["drain_disabled", "no_embedding_key"],
+      gate: gate
+    }
+  end
+
+  defp class_reading(:duplicates, state) do
+    consolidation = map_at(state, "consolidation")
+    applied = int_at(consolidation, "duplicates_unpublished")
+    gate = string_at(consolidation, "duplicate_apply_gate")
+
+    touched =
+      int_at(consolidation, "duplicate_groups_skipped") +
+        int_at(consolidation, "duplicates_unpublish_failed") +
+        int_at(consolidation, "duplicate_groups_uncorroborated")
+
+    %{
+      applied: applied,
+      work?: proposals_for(consolidation, "duplicate_capture") > 0 or touched > 0,
+      hard_blind?: gate in ["apply_failed", "scan_failed"],
+      paused?: gate in ["drain_disabled", "report_gap", "insufficient_history"],
+      gate: gate
+    }
+  end
+
+  defp class_reading(:generic_titles, state) do
+    consolidation = map_at(state, "consolidation")
+    applied = int_at(consolidation, "generic_titles_retitled")
+    gate = string_at(consolidation, "generic_title_apply_gate")
+    budget_exhausted? = state_true?(consolidation, "generic_title_budget_exhausted")
+
+    %{
+      applied: applied,
+      work?:
+        int_at(consolidation, "generic_titles_offered") > 0 or
+          proposals_for(consolidation, "generic_title") > 0,
+      hard_blind?:
+        gate in ["apply_failed", "scan_failed"] or (budget_exhausted? and applied == 0),
+      paused?: gate in ["drain_disabled", "report_gap", "insufficient_history"],
+      gate: gate
+    }
+  end
+
+  defp class_reading(:conflict_judge, state) do
+    applied = int_at(state, "conflicts_judged_redundant")
+    candidates = int_at(state, "conflicts_judge_candidates", 0)
+    budget_exhausted? = state_true?(state, "conflicts_judge_budget_exhausted")
+
+    %{
+      applied: applied,
+      work?: candidates > 0,
+      # `-1` is the step-FAILED sentinel (`@judging_failed`), deliberately not 0 —
+      # see `Loopctl.Workers.KnowledgeLintWorker`. It is the only field that can carry
+      # a judge that died, because both truncation flags are hardcoded false there.
+      hard_blind?: candidates == -1 or (budget_exhausted? and applied == 0),
+      paused?: false,
+      gate: nil
+    }
+  end
+
+  defp proposals_for(consolidation, class) do
+    consolidation |> map_at("by_class") |> int_at(class)
+  end
+
+  defp map_at(state, key) do
+    case Map.get(state, key) do
+      %{} = nested -> nested
+      _ -> %{}
+    end
+  end
+
+  defp int_at(state, key, default \\ 0) do
+    case Map.get(state, key) do
+      n when is_integer(n) -> n
+      _ -> default
+    end
+  end
+
+  defp string_at(state, key) do
+    case Map.get(state, key) do
+      s when is_binary(s) -> s
+      _ -> nil
+    end
+  end
+
+  defp state_true?(state, key), do: Map.get(state, key) == true
+
+  # The last `runs` completed passes PER TENANT, cross-tenant, in one bounded read.
+  #
+  # `row_number()` rather than a per-tenant query: the alternative is one round trip per
+  # active tenant on the 3-connection AdminRepo pool, and the alternative to THAT — an
+  # unwindowed read — is unbounded in a tenant's run history.
+  #
+  # `new_state - 'summary'` strips the lint report's own findings block, which is by far
+  # the largest thing in the row and which no consumer reading here uses. What remains is
+  # the tally: scalars plus the `consolidation` object.
+  defp consumer_runs(cutoff, runs, scan_limit) do
+    ranked =
+      from(a in AuditLog,
+        where: a.entity_type == ^@lint_entity_type,
+        where: a.action == ^@lint_action,
+        where: a.inserted_at >= ^cutoff,
+        where: not is_nil(a.new_state),
+        select: %{
+          tenant_id: a.tenant_id,
+          inserted_at: a.inserted_at,
+          state: fragment("? - 'summary'::text", a.new_state),
+          rn:
+            fragment(
+              "row_number() OVER (PARTITION BY ? ORDER BY ? DESC)",
+              a.tenant_id,
+              a.inserted_at
+            )
+        }
+      )
+
+    from(r in subquery(ranked),
+      where: r.rn <= ^runs,
+      order_by: [asc: r.tenant_id, desc: r.inserted_at],
+      limit: ^scan_limit,
+      select: %{tenant_id: r.tenant_id, inserted_at: r.inserted_at, state: r.state}
+    )
+    |> AdminRepo.all()
+    |> Enum.map(&%{&1 | inserted_at: to_utc_datetime(&1.inserted_at), state: &1.state || %{}})
+  end
+
+  @doc """
+  Closes `:consumer_stalled` anomalies whose consumer has RECOVERED.
+
+  Episode-shaped like its two siblings — a stalled consumer has no natural "resumed"
+  event — but with one difference that matters: recovery is gated on
+  `scan.evaluated_keys` rather than on mere absence from `scan.candidates`. A key can be
+  absent for two reasons that are NOT recovery: the tenant produced too few completed
+  runs to judge a streak, or its events aged past `consumer_history_days/0` entirely
+  because the pass has been dead for longer than that. Closing on either would stamp
+  `resolved: true` into the append-only, hash-chained audit log as a claim that a
+  consumer resumed, on the exact tenants where it most likely did not.
+
+  Gated on the anomaly's tenant still being ACTIVE, for the same reason
+  `auto_resolve_recovered_sweep_stalled/1` is: a suspended tenant stops producing runs,
+  and that is not a consumer that recovered.
+
+  Returns the number of anomalies closed.
+  """
+  @spec auto_resolve_recovered_consumer_stalled(consumer_scan()) :: non_neg_integer()
+  def auto_resolve_recovered_consumer_stalled(%{
+        candidates: candidates,
+        evaluated_keys: evaluated
+      }) do
+    now = DateTime.utc_now()
+    candidate_keys = MapSet.new(candidates, &{&1.tenant_id, &1.source_type})
+    anomalies = active_episode_anomalies(:consumer_stalled)
+    active_tenants = active_tenant_ids(Enum.map(anomalies, & &1.tenant_id))
+
+    Enum.reduce(anomalies, 0, fn anomaly, acc ->
+      key = {anomaly.tenant_id, anomaly.source_type}
+
+      recovered? =
+        MapSet.member?(active_tenants, anomaly.tenant_id) and
+          MapSet.member?(evaluated, key) and
+          not MapSet.member?(candidate_keys, key)
+
+      if recovered?,
+        do: acc + close_recovered_episode(anomaly, now, "auto_resolve_consumer_stalled"),
+        else: acc
+    end)
+  end
+
   @doc """
   Whether the tenant has EVER seen ingestion activity for `source_type` — either a
   recorded write-outcome (`ingestion_write_stats`, the create-path telemetry) OR a
@@ -942,6 +1579,19 @@ defmodule Loopctl.Knowledge.IngestionHealth do
   """
   @spec source_type_seen?(Ecto.UUID.t(), String.t()) :: boolean()
   def source_type_seen?(_tenant_id, @sweep_source_type), do: true
+
+  # Same special case, for the consumer-stall sentinels: they name nightly consumers
+  # rather than ingestion streams, so no `articles` / `ingestion_write_stats` row will
+  # ever carry one and the generic probe would falsely warn on a legitimate filter.
+  def source_type_seen?(_tenant_id, source_type)
+      when source_type in [
+             @consumer_pass_source_type,
+             "knowledge_lint_drafts",
+             "knowledge_lint_duplicates",
+             "knowledge_lint_generic_titles",
+             "knowledge_lint_conflict_judge"
+           ],
+      do: true
 
   def source_type_seen?(tenant_id, source_type) when is_binary(source_type) do
     write_stats_seen?(tenant_id, source_type) or articles_seen?(tenant_id, source_type)
@@ -1456,4 +2106,36 @@ defmodule Loopctl.Knowledge.IngestionHealth do
 
   defp to_utc_datetime(%DateTime{} = dt), do: dt
   defp to_utc_datetime(%NaiveDateTime{} = ndt), do: DateTime.from_naive!(ndt, "Etc/UTC")
+
+  defp iso8601(nil), do: nil
+  defp iso8601(value), do: value |> to_utc_datetime() |> DateTime.to_iso8601()
+
+  # DB row -> app config -> module default, the resolution order (and the reasoning)
+  # `Loopctl.Workers.KnowledgeLintWorker.tunable/3` established for the nightly caps: the
+  # DB row is the only layer an operator can move mid-incident without a deploy, and it
+  # survives a restart and propagates to the fleet, which `Application.put_env/3` does
+  # neither of. `SystemConfig.get_int/2` reads `:persistent_term` and never raises, so
+  # this costs no query.
+  #
+  # Used ONLY by the consumer-stall knobs. The older accessors above stay app-config-only
+  # deliberately: retrofitting them is a behaviour change to detectors nobody asked to
+  # change here.
+  defp tunable(db_key, app_key, default) do
+    SystemConfig.get_int(db_key, coerce_int(Application.get_env(:loopctl, app_key), default))
+  end
+
+  # `SystemConfig.get_int/2` requires an INTEGER default and would raise a
+  # FunctionClauseError on a `nil` or a `"7"` from a hand-edited config — inside the
+  # worker's rescue that surfaces as an outage rather than the config typo it is.
+  defp coerce_int(value, _default) when is_integer(value), do: value
+  defp coerce_int(nil, default), do: default
+
+  defp coerce_int(other, default) do
+    Logger.warning(
+      "IngestionHealth: ignoring non-integer consumer-stall setting #{inspect(other)}; " <>
+        "using #{default}."
+    )
+
+    default
+  end
 end

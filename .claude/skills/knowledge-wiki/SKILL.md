@@ -182,6 +182,31 @@ never pass `tenant_id`/`subject_id`.
    depth, not authority. The server-guaranteed key is the `articles.idempotency_key` column with
    its per-tenant unique index — prefer it, and do not treat a tag as proof of capture identity.
 
+7. **The nightly consumers are watched by something OUTSIDE them (#765 item 6)** —
+   `Loopctl.Knowledge.IngestionHealth.detect_consumer_stalled_scan/1`, flagged by the hourly
+   `IngestionHealthWorker` as `:consumer_stalled` anomalies. Now that drafts, `:duplicate_capture`,
+   `:generic_title` and the conflict judge all have automatic consumers, the failure left is a
+   pass that COMPLETES and applies nothing — byte-identical, in the audit event and the summary
+   line, to a clean corpus. Three properties are load-bearing and easy to break while tuning it:
+   - **It is not hosted in `KnowledgeLintWorker`.** The failure includes the pass dying (#761: six
+     nights killed inside the judge, no audit event written at all), and a detector inside the pass
+     cannot report that. For the same reason the streak has a PASS half counted over NIGHTS
+     (`consumer_pass_source_type/0`) rather than only a per-class streak counted over EVENTS,
+     which would freeze exactly when the system broke.
+   - **Quiet must stay quiet.** A run offered nothing with every gate `open` neither starts nor
+     extends a streak; a candidate needs work waiting, a hard-blind step (`apply_failed` /
+     `scan_failed` / the `-1` sentinel / a `*_budget_exhausted` that cut in before the first
+     application), or a PAUSED gate whose work is corroborated independently — `by_class` for the
+     consolidation classes, `DraftConsumer.held_drafts?/1` for drafts. `drain_disabled` and
+     `no_embedding_key` report `offered: 0` whether the queue is full or empty, so treating either
+     as evidence on its own alarms forever on healthy installs and gets the switch muted.
+   - **Recovery closes on `evaluated_keys`, never on absence from the candidate list.** A tenant
+     with too few completed runs, or whose events aged past `consumer_history_days/0`, is
+     UNEVALUATED, not recovered; closing it would stamp a false `resolved` into the append-only
+     audit log on exactly the tenants whose evidence went missing. `consumer_history_days/0` is
+     DERIVED from the two thresholds (double the longer, clamped to the 90-day `audit_log`
+     retention) rather than picked beside them — the #761 lesson.
+
 ### Three dedup mechanisms, three different questions — do not read one's coverage as another's gap
 
 They are not redundant and they are not substitutes. Before proposing that one "should" cover

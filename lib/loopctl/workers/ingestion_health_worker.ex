@@ -69,11 +69,51 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
   `Loopctl.TelemetryEvents.sweep_stall_detection_failed/0` so that isolation never makes
   the monitor's own death silent.
 
+  ## Nightly consumer-stall detector (`:consumer_stalled`, #765 item 6)
+
+  The same run drives `IngestionHealth.detect_consumer_stalled_scan/0` — the
+  absence-of-success detector for `Loopctl.Workers.KnowledgeLintWorker`'s nightly
+  CONSUMERS (draft publishing, duplicate unpublishing, generic-title retitling, conflict
+  judging). Once every queue class has an automatic consumer, the remaining failure is
+  not a crash: it is a pass that completes and disposes of NOTHING, night after night,
+  which reads byte-identically to a clean corpus in both the summary line and the audit
+  event. Its anomalies are `:consumer_stalled` rows under the reserved sentinel
+  `source_type`s in `IngestionHealth.consumer_source_types/0` — one per consumer, so
+  archiving a legitimately-paused draft drain does not also blind the conflict judge.
+
+  ### It is hosted HERE, not in the pass it watches
+
+  Deliberate, and the reason is the failure that motivated it: on six consecutive nights
+  in #761 the nightly pass was killed inside the conflict judge with `Oban.TimeoutError`
+  and wrote no `knowledge.lint_completed` event at all. A detector living inside that
+  pass would have been just as dead, and a streak counted over EVENTS would have frozen
+  exactly when the system was broken. So this worker — a different queue, a different
+  cadence, reading only the durable `audit_log` rows the pass leaves behind — owns it,
+  and the detector's PASS half flags the tenant whose most recent completed run is older
+  than `IngestionHealth.consumer_pass_staleness_hours/0`.
+
+  ### One cause per tenant, so no system-scope special case
+
+  Unlike `:sweep_stalled`, the cause here IS per-tenant (`KnowledgeLintWorker` fans out
+  one job per active tenant) and per-consumer, so `notify/2`'s DEFAULT path applies
+  unchanged: per-tenant operator alert, per-tenant webhook, `alerted` flipped after both.
+
+  ### Isolated failure domain
+
+  `run_consumer_stalled_detection/0` has its own rescue, like the sweep detector: its
+  read is a cross-tenant window function over `audit_log` on the small `AdminRepo` pool,
+  and a statement timeout there must not take capture-silence flagging down with it. Both
+  failure shapes emit `Loopctl.TelemetryEvents.consumer_stall_detection_failed/0`, so the
+  isolation never makes the monitor's own death silent.
+
   ## Recovery: auto-resolve when the outage clears
 
   After detection, `Loopctl.Knowledge.IngestionHealth.auto_resolve_recovered/0`
   closes any open capture-silence anomaly whose `(tenant, source_type)` has produced
   an article newer than the anomaly's `last_event_at`.
+  `auto_resolve_recovered_consumer_stalled/1` does the analogous close for
+  consumer stalls, gated on the keys the scan could actually JUDGE rather than on mere
+  absence from the candidate list (see that function).
   `auto_resolve_recovered_reject_rate/1` does the analogous close for high_reject_rate
   anomalies whose reject rate fell back below threshold (no longer a candidate).
   Without this a fully-recovered stream would keep a stale open anomaly forever,
@@ -193,6 +233,15 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
     # expected success), same alert/recovery/webhook machinery — reused rather than
     # duplicated in a bespoke worker.
     run_sweep_stalled_detection()
+
+    # #765 item 6: the nightly knowledge-lint CONSUMER dead-man's-switch. Same detector
+    # class again (absence of expected success), same machinery — and hosted HERE rather
+    # than inside `Loopctl.Workers.KnowledgeLintWorker` on purpose. The failure it exists
+    # for includes the nightly pass dying, and a detector living inside the pass cannot
+    # report that: it is the "keep the detector independent of the thing it watches" rule,
+    # and #761 is the case (six consecutive nights killed inside the judge, no audit event
+    # written, read as quiet success).
+    run_consumer_stalled_detection()
 
     # Close capture-silence anomalies whose captures have resumed (recovered streams),
     # so an open anomaly always means "still silent" and not "recovered but never
@@ -346,6 +395,88 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
     end
   end
 
+  # The nightly knowledge-lint consumer-stall detector (#765 item 6). Gated on the
+  # CHECK-widening migration exactly like the two detectors above, so the version-skew
+  # window (this code on the hourly crontab before
+  # `20260827140000_add_consumer_stalled_anomaly_type` landed) skips quietly instead of
+  # raising a CHECK violation inside the Multi and burning Oban retries. Recovery is
+  # guarded TOO — an empty candidate list from a skipped detection must never read as
+  # "everything recovered" and mass-close active stall anomalies.
+  #
+  # Wrapped in its OWN rescue for the same reason the sweep detector is: its read is a
+  # cross-tenant window function over `audit_log` on the 3-connection AdminRepo pool, and
+  # a statement timeout or a checkout failure there must not abort the hourly job. And
+  # for the same reason again, that isolation emits
+  # `TelemetryEvents.consumer_stall_detection_failed/0` — a dead-man's-switch whose own
+  # death is silent has reproduced the failure it was built to close.
+  defp run_consumer_stalled_detection do
+    do_run_consumer_stalled_detection()
+  rescue
+    error ->
+      Logger.error(
+        "IngestionHealthWorker: consumer-stall detection failed " <>
+          "(#{inspect(error.__struct__)}): #{Exception.message(error)}; other detectors continue"
+      )
+
+      observe_consumer_detection_failure(error.__struct__ |> Module.split() |> Enum.join("."))
+  catch
+    :exit, reason ->
+      Logger.error(
+        "IngestionHealthWorker: consumer-stall detection exited (#{inspect(reason)}); " <>
+          "other detectors continue"
+      )
+
+      observe_consumer_detection_failure("exit")
+  end
+
+  defp observe_consumer_detection_failure(error_class) do
+    :telemetry.execute(
+      TelemetryEvents.consumer_stall_detection_failed(),
+      %{count: 1},
+      %{error_class: error_class}
+    )
+
+    :ok
+  end
+
+  defp do_run_consumer_stalled_detection do
+    if consumer_stalled_check_ready?() do
+      scan = IngestionHealth.detect_consumer_stalled_scan()
+
+      Logger.info(
+        "IngestionHealthWorker: #{length(scan.candidates)} consumer-stall candidate(s) " <>
+          "detected across #{scan.runs_scanned} nightly run(s)"
+      )
+
+      # The bounded read cut tenants off entirely rather than sampling them thinly, so
+      # those tenants are absent from `evaluated_keys` and neither flag nor close. Say it
+      # out loud anyway: silent partial coverage in a dead-man's-switch is the defect.
+      if scan.truncated? do
+        Logger.warning(
+          "IngestionHealthWorker: consumer-stall scan TRUNCATED at #{scan.runs_scanned} " <>
+            "run(s) — tenant coverage is incomplete this run"
+        )
+      end
+
+      flag_candidates(scan.candidates, :consumer_stalled)
+
+      closed = IngestionHealth.auto_resolve_recovered_consumer_stalled(scan)
+
+      if closed > 0 do
+        Logger.info("IngestionHealthWorker: auto-closed #{closed} recovered consumer-stall(s)")
+      end
+
+      :ok
+    else
+      Logger.warning(
+        "IngestionHealthWorker: ingestion_anomalies CHECK does not admit 'consumer_stalled' " <>
+          "yet (migration pending); skipping consumer-stall detection this run"
+      )
+
+      :ok
+    end
+  end
+
   # Reject-rate detection needs BOTH the rollup table (migration 20260717210000) AND
   # the WIDENED anomaly_type CHECK that admits 'high_reject_rate' (migration
   # 20260717210001). In a partial deploy where the first migration landed but the
@@ -369,6 +500,9 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
 
   # True once that CHECK admits 'sweep_stalled' (#498).
   defp sweep_stalled_check_ready?, do: anomaly_type_check_admits?("sweep_stalled")
+
+  # True once that CHECK admits 'consumer_stalled' (#765 item 6).
+  defp consumer_stalled_check_ready?, do: anomaly_type_check_admits?("consumer_stalled")
 
   # Reads the constraint definition from the catalog (crash-free): absent constraint
   # or a definition that does not yet mention the value ⇒ not ready.
@@ -443,6 +577,9 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
 
   defp flag_candidate(:sweep_stalled, candidate, rows),
     do: flag_episode(:sweep_stalled, candidate, rows)
+
+  defp flag_candidate(:consumer_stalled, candidate, rows),
+    do: flag_episode(:consumer_stalled, candidate, rows)
 
   defp flag_capture_silence(
          %{
@@ -575,6 +712,19 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
       hours_stale: candidate.hours_stale,
       sample_count: candidate.overdue_count,
       metadata: sweep_metadata(candidate)
+    }
+  end
+
+  # `sample_count` is the RUNS this verdict was drawn from — the number the whole alarm
+  # rests on, and the one an operator re-derives it with. `hours_stale` is how long the
+  # drought has been observable (for the `pass` consumer, hours since the last completed
+  # run). The evidence map the detector built rides in `metadata` unchanged, so the audit
+  # entry and the webhook carry the same reading the log line does.
+  defp episode_figures(:consumer_stalled, candidate) do
+    %{
+      hours_stale: candidate.hours_stale,
+      sample_count: candidate.runs_examined,
+      metadata: candidate.evidence
     }
   end
 
@@ -829,6 +979,17 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
     )
   end
 
+  defp log_detected_alarm(tenant_id, %IngestionAnomaly{anomaly_type: :consumer_stalled} = anomaly) do
+    md = anomaly.metadata || %{}
+
+    Logger.error(
+      "IngestionHealthWorker: nightly knowledge-lint consumer stalled — tenant=#{tenant_id} " <>
+        "consumer=#{md["consumer"]} reason=#{md["reason"]} runs=#{anomaly.sample_count} " <>
+        "hours_stale=#{anomaly.hours_stale} work_observed=#{md["work_observed"]} " <>
+        "hard_blind_runs=#{md["hard_blind_runs"]} anomaly_id=#{anomaly.id}"
+    )
+  end
+
   defp log_detected_alarm(tenant_id, anomaly) do
     Logger.error(
       "IngestionHealthWorker: capture-silence detected — tenant=#{tenant_id} " <>
@@ -1006,6 +1167,31 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
     })
   end
 
+  defp log_detected(tenant_id, %IngestionAnomaly{anomaly_type: :consumer_stalled} = anomaly) do
+    md = anomaly.metadata || %{}
+
+    Audit.create_log_entry(tenant_id, %{
+      entity_type: "ingestion_anomaly",
+      entity_id: anomaly.id,
+      action: "detected",
+      actor_type: "system",
+      new_state:
+        Map.merge(md, %{
+          "anomaly_type" => to_string(anomaly.anomaly_type),
+          "source_type" => anomaly.source_type,
+          "hours_stale" => anomaly.hours_stale,
+          "runs_examined" => anomaly.sample_count
+        }),
+      metadata: %{
+        "anomaly_id" => anomaly.id,
+        "source_type" => anomaly.source_type,
+        "anomaly_type" => to_string(anomaly.anomaly_type),
+        "consumer" => md["consumer"],
+        "reason" => md["reason"]
+      }
+    })
+  end
+
   defp log_detected(tenant_id, anomaly) do
     Audit.create_log_entry(tenant_id, %{
       entity_type: "ingestion_anomaly",
@@ -1049,6 +1235,44 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
       "total_attempts" => md["total_attempts"],
       "rejects" => md["rejects"],
       "dominant_reason" => md["dominant_reason"],
+      "at" => DateTime.utc_now() |> DateTime.to_iso8601()
+    }
+
+    enqueue_operator_alert(payload, anomaly)
+  end
+
+  # The consumer stall's cause IS per-tenant (`KnowledgeLintWorker` fans out one job per
+  # tenant) and per-CONSUMER, so unlike `:sweep_stalled` it keeps the per-tenant operator
+  # alert. `threshold`/`value` are the two numbers the verdict rests on, in the shape the
+  # shared ScaleAlert channel renders.
+  defp fire_operator_alert(
+         tenant_id,
+         %IngestionAnomaly{anomaly_type: :consumer_stalled} = anomaly
+       ) do
+    md = anomaly.metadata || %{}
+    pass? = md["consumer"] == "pass"
+
+    threshold =
+      if pass?,
+        do: md["threshold_hours"] || IngestionHealth.consumer_pass_staleness_hours(),
+        else: IngestionHealth.consumer_stall_runs()
+
+    payload = %{
+      "alert" => "knowledge.lint_consumer_stalled",
+      "metric" =>
+        if(pass?,
+          do: "knowledge.lint_consumer_stalled.hours_since_last_run",
+          else: "knowledge.lint_consumer_stalled.runs_without_disposition"
+        ),
+      "value" => if(pass?, do: anomaly.hours_stale, else: anomaly.sample_count),
+      "threshold" => threshold,
+      "window_seconds" => anomaly.hours_stale * 3600,
+      "tenant_id" => tenant_id,
+      "source_type" => anomaly.source_type,
+      "consumer" => md["consumer"],
+      "reason" => md["reason"],
+      "runs_examined" => anomaly.sample_count,
+      "hours_stale" => anomaly.hours_stale,
       "at" => DateTime.utc_now() |> DateTime.to_iso8601()
     }
 
@@ -1145,6 +1369,23 @@ defmodule Loopctl.Workers.IngestionHealthWorker do
       "overdue_count" => md["overdue_count"],
       "oldest_expires_at" => md["oldest_expires_at"],
       "grace_hours" => md["grace_hours"]
+    }
+  end
+
+  defp anomaly_webhook_payload(%IngestionAnomaly{anomaly_type: :consumer_stalled} = anomaly) do
+    md = anomaly.metadata || %{}
+
+    %{
+      "anomaly_id" => anomaly.id,
+      "source_type" => anomaly.source_type,
+      "anomaly_type" => to_string(anomaly.anomaly_type),
+      "consumer" => md["consumer"],
+      "reason" => md["reason"],
+      "runs_examined" => anomaly.sample_count,
+      "hours_stale" => anomaly.hours_stale,
+      "work_observed" => md["work_observed"],
+      "hard_blind_runs" => md["hard_blind_runs"],
+      "gates" => md["gates"]
     }
   end
 

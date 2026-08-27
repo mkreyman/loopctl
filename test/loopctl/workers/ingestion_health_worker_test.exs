@@ -47,6 +47,105 @@ defmodule Loopctl.Workers.IngestionHealthWorkerTest do
     from(a in IngestionAnomaly, where: a.tenant_id == ^tenant_id) |> AdminRepo.all()
   end
 
+  describe "perform/1 — nightly consumer-stall detection (#765 item 6)" do
+    # The real defaults apply here on purpose: this is the wiring test, and the number of
+    # runs it takes to trip the switch in production is part of the wiring.
+    defp consumer_anomalies(tenant_id) do
+      tenant_id |> anomalies_for() |> Enum.filter(&(&1.anomaly_type == :consumer_stalled))
+    end
+
+    test "flags a starved consumer, writing audit + operator alert" do
+      tenant = fixture(:tenant)
+
+      knowledge_lint_runs(
+        tenant.id,
+        IngestionHealth.consumer_stall_runs(),
+        build(:knowledge_lint_state, %{"drafts_offered" => 11})
+      )
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+
+        assert_enqueued(worker: ScaleAlertDeliveryWorker)
+      end)
+
+      assert [anomaly] = consumer_anomalies(tenant.id)
+      assert anomaly.source_type == "knowledge_lint_drafts"
+      assert anomaly.sample_count == IngestionHealth.consumer_stall_runs()
+      assert anomaly.metadata["consumer"] == "drafts"
+      assert anomaly.metadata["reason"] == "no_dispositions"
+      # The alert fired and the row records that it did, so a healthy next run takes the
+      # silent update path instead of re-paging.
+      assert anomaly.alerted
+
+      assert detected_audit_count(tenant.id, "knowledge_lint_drafts") == 1
+    end
+
+    test "a healthy nightly pass produces no consumer-stall anomaly" do
+      tenant = fixture(:tenant)
+
+      knowledge_lint_runs(
+        tenant.id,
+        IngestionHealth.consumer_stall_runs(),
+        build(:knowledge_lint_state, %{})
+      )
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+      end)
+
+      assert consumer_anomalies(tenant.id) == []
+    end
+
+    test "an existing stall is refreshed silently — no second audit entry" do
+      tenant = fixture(:tenant)
+
+      knowledge_lint_runs(
+        tenant.id,
+        IngestionHealth.consumer_stall_runs(),
+        build(:knowledge_lint_state, %{"drafts_offered" => 11})
+      )
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+      end)
+
+      assert [_one] = consumer_anomalies(tenant.id)
+      assert detected_audit_count(tenant.id, "knowledge_lint_drafts") == 1
+    end
+
+    test "an archived stall is never re-flagged" do
+      tenant = fixture(:tenant)
+
+      knowledge_lint_runs(
+        tenant.id,
+        IngestionHealth.consumer_stall_runs(),
+        build(:knowledge_lint_state, %{"drafts_offered" => 11})
+      )
+
+      fixture(:ingestion_anomaly, %{
+        tenant_id: tenant.id,
+        source_type: "knowledge_lint_drafts",
+        anomaly_type: :consumer_stalled,
+        last_event_at: nil,
+        hours_stale: 72,
+        sample_count: 7,
+        archived: true
+      })
+
+      Oban.Testing.with_testing_mode(:manual, fn ->
+        assert :ok = IngestionHealthWorker.perform(%Oban.Job{args: %{}})
+      end)
+
+      # The operator escape hatch: exactly the row that was already there, unresolved and
+      # unrefreshed, and no new one beside it.
+      assert [existing] = consumer_anomalies(tenant.id)
+      assert existing.archived
+      assert detected_audit_count(tenant.id, "knowledge_lint_drafts") == 0
+    end
+  end
+
   describe "perform/1 — capture-silence detection" do
     test "flags an established + stale source_type, writing audit + operator alert" do
       tenant = fixture(:tenant)
