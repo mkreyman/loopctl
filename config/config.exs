@@ -960,11 +960,14 @@ config :loopctl, :knowledge_tag_backfill_concurrency, 2
 #
 # ON by default: it degrades to the previous similarity-only verdict on a tenant with no LLM
 # key, a provider outage or an unparseable reply, so a deployment that cannot use it is
-# exactly where it was. Cost is per FLAGGED PAIR, not per search, and is bounded by BOTH the
-# judgement cap (`:knowledge_lint_max_conflict_judgements`, 2000/night) and the wall-clock
-# budget below. It used to say "~450/day in practice" and lean on the count cap alone; the
-# practice changed on 2026-08-20 — 15,246 pairs arrived in four days through the ingestion
-# novelty gate, which no promoter cap bounds — and the count cap held nothing (#761).
+# exactly where it was. Cost is per FLAGGED PAIR, not per search, and the bound that holds is
+# the wall-clock budget below (~1,400 judgements a night); the judgement cap
+# (`:knowledge_lint_max_conflict_judgements`, 2000) sits ABOVE it and never fires first. It
+# used to say "~450/day in practice" and lean on that count cap alone; on 2026-08-20 a BURST
+# through the ingestion novelty gate, which no promoter cap bounds, put ~13,000 of a
+# 15,246-pair four-day total in — the rest is the promoter saturating its own 500/day cap —
+# and the count cap held nothing (#761). Take the burst-vs-rate reading from the budget
+# comment below, never from that figure on its own.
 config :loopctl, :knowledge_conflict_judge_enabled, true
 config :loopctl, :knowledge_conflict_judge, Loopctl.Knowledge.ConflictJudge.Llm
 # Concurrent judgements per nightly run. Small on purpose: the limit on the other side is a
@@ -978,12 +981,29 @@ config :loopctl, :knowledge_conflict_judge_concurrency, 2
 # cap above counts ATTEMPTS; this counts TIME, which is what a step whose per-item cost is
 # an outbound provider call really spends. Measured in production 2026-08-27 on the
 # 86k-article tenant, one judgement is ~1.7 s wall / ~0.85 s at concurrency 2, so 20 minutes
-# drains ~1,400 pairs a night. That covers the promoter's 500/night with room to spare; it
-# does NOT cover the ingestion novelty gate, which no cap bounds and which put 15,246 flags
-# in over four days — ~3,800 a night. While the inflow runs above the drain the queue
-# DIVERGES, and no value here fixes that: bounding the flag inflow is the lever, and
-# `conflicts_judge_candidates` rising run over run with `conflicts_judge_count_capped` or
-# `conflicts_judge_budget_exhausted` set is the reading that says it is needed.
+# drains ~1,400 pairs a night GROSS — ~900 net of the promoter's own 500/night cap, which
+# feeds the same queue.
+#
+# The ingestion-time novelty gate is a SECOND producer that no promoter cap bounds, but its
+# #761 numbers are a BURST and not a rate: TOTAL flags per day were a flat 500 through 08-19
+# (the promoter saturating its cap), then 8,569 / 1,506 / 656 / 4,515 on 08-20 through 08-23,
+# then zero on 08-24 through 08-27, with the backlog down to 227 by 08-27. That observed
+# drain ran ~2,150/night, ABOVE the fixed path's ceiling, because the broken 3x10-minute path
+# incidentally judged 1,700-2,800 a night by dying three times — losing the night's audit
+# event and re-spending the nightly caps per attempt, so it is not a throughput to miss. A
+# burst of that shape truncates some nights, says so, and drains at ~900-1,400/night until it
+# is caught up — 15,246 takes ELEVEN nights at the promoter rate measured on 2026-08-27 (0
+# candidates) and SEVENTEEN if the promoter saturates its 500/night cap. Its causes (a tag
+# backfill, a structural-linking pass) are operator-started and repeatable. Only an inflow
+# sustained above the drain
+# needs a bound of its own, and the reading that says so is `conflicts_judge_count_capped` /
+# `conflicts_judge_budget_exhausted` STAYING SET beyond the nights a burst of known size
+# needs — NOT `conflicts_judge_candidates` rising, which saturates at the judgement cap by
+# construction and reads flat on a queue of any size above it. `candidates` still carries the
+# other half of the reading: -1 run over run is the step FAILING, and it is the only field in
+# the event that says so, since both flags report `false` on a failed night. Both flags
+# shipped with this budget in #762 and no night has reported through them yet, so their
+# silence is not evidence.
 #
 # `Loopctl.Workers.KnowledgeLintWorker.timeout/1` is DERIVED from this value plus a
 # five-minute reserve for the rest of the night. The value itself is CLAMPED so that sum

@@ -81,10 +81,11 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
      verdict on the promoter's pile: `classification: :redundant,
      disposition: :dismiss`, because cosine similarity measures REDUNDANCY and
      cannot see contradiction, so recording what was actually measured is the
-     only honest verdict available. It is capped ABOVE the promoter, so the pile
-     shrinks by arithmetic rather than by hoping the inflow stops, and it stays
-     within the same night as the promoter so a pair flagged tonight never spends
-     a night suppressing both its articles from curated answers.
+     only honest verdict available. The pile is drained by a WALL CLOCK and not
+     by the count cap — ~1,400 pairs a night gross, ~900 net of the promoter's
+     own 500 (see `@default_judge_budget_ms`) — and the drain stays within the
+     same night as the promoter so a pair flagged tonight never spends a night
+     suppressing both its articles from curated answers.
 
      It runs LAST because it is the only step whose per-item cost is an outbound
      provider call, and it therefore carries the one bound the others do not
@@ -155,28 +156,59 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   @default_orphan_link_threshold 0.5
   @default_max_conflict_promotions 500
 
-  # The DRAIN for auto-generated `potential_conflict` links, and it is deliberately LARGER
-  # than the promotion cap above so the queue converges instead of oscillating. At 500
-  # promoted and 2000 judged per night the backlog falls by 1500/night; equal caps would
-  # merely hold the line at whatever level it had already reached.
+  # The SECONDARY drain bound for auto-generated `potential_conflict` links: larger than the
+  # promotion cap above, so a count can never be what holds the queue level. It is not the
+  # drain, though — 2000 judgements is ~28 minutes at ~0.85 s each and the wall clock below
+  # cuts in first (#761). The drain that actually holds is ~1,400 a night, ~900 net of the
+  # promoter; see `@default_judge_budget_ms`. This number's remaining job is bounding the
+  # candidate query.
   @default_max_conflict_judgements 2000
 
   # The bound that actually holds, and the one this step never had (#761). `cap` above
   # counts ATTEMPTS; this counts TIME, which is what a step whose per-item cost is an
   # outbound provider call is really spending. Measured in production 2026-08-27 on the
   # 86k-article tenant: one judgement is ~1.7 s wall, ~0.85 s at concurrency 2, so 20
-  # minutes drains ~1,400 pairs a night.
+  # minutes drains ~1,400 pairs a night GROSS. `promote_conflicts/1` feeds the same queue up
+  # to `@default_max_conflict_promotions` (500) a night, so against an existing backlog the
+  # NET drain is ~900 — and 500 is a CAP, not a rate (2026-08-27 measured the promoter at 0
+  # candidates), so ~900 is the worst case and ~1,400 the best.
   #
-  # A drain of ~1,400 covers `promote_conflicts/1` (at most
-  # `@default_max_conflict_promotions`, 500 a night) with room to spare. It does NOT cover
-  # the ingestion novelty gate, which no cap bounds and which put 15,246 flags in over four
-  # days — ~3,800 a night, above this drain, so while that inflow persists the queue
-  # DIVERGES and no value here fixes it: `timeout/1` is clamped below the Lifeline window,
-  # which makes ~20 minutes the ceiling rather than a starting point, and raising concurrency
-  # is not the lever either (it is deliberately below `ADMIN_POOL_SIZE`, default 3, the pool
-  # every authenticated request also checks out of). Bounding the flag inflow is. The reading
-  # that says it is needed is `conflicts_judge_candidates` rising run over run with
-  # `conflicts_judge_count_capped` or `conflicts_judge_budget_exhausted` set.
+  # The SECOND producer is the ingestion-time novelty gate, and no promoter cap bounds it.
+  # Do not read its #761 numbers as a rate. TOTAL flags created per day — both producers —
+  # were a flat 500 through 08-19 (the promoter saturating its own cap), then 8,569 / 1,506
+  # / 656 / 4,515 on 08-20 through 08-23, then zero on 08-24 through 08-27, with the backlog
+  # itself down to 227 by 08-27. So ~13,000 of the 15,246 was a BURST — a corpus tag
+  # backfill and a structural-linking pass landing together — and averaging four days of it
+  # into "~3,800 a night" is a mistake this comment made until the per-day counts were
+  # checked. Weigh the zeros lightly on their own: the judge was dying nightly across that
+  # same window, so it is the drained backlog, not the zeros, that says the burst ended.
+  #
+  # A burst is therefore absorbed rather than fatal: it truncates some nights, says so, and
+  # drains at ~900-1,400 a night until it is caught up — 15,246 takes ELEVEN nights at the
+  # promoter rate measured on 2026-08-27 (0 candidates) and SEVENTEEN if the promoter
+  # saturates its 500/night cap; quote the range, not one end of it. That holds only
+  # while a fresh burst does not land before the last one clears, and both causes are
+  # operator-started and repeatable (`TagBackfillWorker` is deliberately not on a cron), so
+  # a re-run means another ~17 truncated nights rather than a fault. The broken 3x10-minute
+  # path incidentally judged 1,700-2,800 a night by dying three times; it also lost the
+  # night's audit event and re-spent the nightly caps per attempt, so that is not a
+  # throughput to miss.
+  #
+  # What no value HERE could fix is an inflow that ran above the drain INDEFINITELY —
+  # `timeout/1` is clamped below the Lifeline window, so ~20 minutes is a ceiling rather
+  # than a starting point, and raising concurrency is not the lever either (it is
+  # deliberately below `ADMIN_POOL_SIZE`, default 3 at `config/runtime.exs:277`, the pool
+  # every authenticated request also checks out of). Bounding the flag inflow would be, and
+  # the reading takes BOTH halves of the audit event. DIVERGENCE is
+  # `conflicts_judge_count_capped` or `conflicts_judge_budget_exhausted` STAYING SET beyond
+  # the nights a burst of known size needs. STEP FAILURE is `conflicts_judge_candidates` at
+  # -1 run over run, and only that: both flags are hardcoded `false` in `@judging_failed`, so
+  # a judge that dies every night reports through them exactly as a drained queue does. What
+  # `candidates` can never show is queue DEPTH — it cannot rise above `cap`, because the
+  # candidate query takes `limit: cap + 1` and splits at `cap`, so a 2,001-pair night and a
+  # 200,000-pair night both report a flat 2,000 forever. And no night has reported through
+  # either flag yet (both shipped with this clock bound in #762), so their silence so far is
+  # an absence of instrument, not an absence of divergence.
   @default_judge_budget_ms :timer.minutes(20)
 
   @impl Oban.Worker
@@ -353,8 +385,10 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   # `remaining: -1`, and for the same reason: a zero here is what a night with nothing left
   # to do reports, so a step that died every night would read as a converged queue in the
   # audit event, which is the exact misreading #761 is about. `candidates: -1` carries it
-  # because `judged: 0` is honest on a failed night and `candidates` is the convergence
-  # number the operator reads run over run.
+  # because `judged: 0` is honest on a failed night, and because it is the ONLY field here
+  # that can: both bound flags are hardcoded `false`, so they report a died-every-night step
+  # exactly as they report a drained queue. `candidates` is a FAILURE marker, not a
+  # queue-depth reading — above `cap` it saturates (see `@default_judge_budget_ms`).
   @judging_failed %{judged: 0, candidates: -1, budget_exhausted: false, count_capped: false}
   @executions_failed -1
 
@@ -689,8 +723,9 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         # ONE row more than the cap, so the count bound can say whether it BOUND anything:
         # `candidates` is `cap` on every night bigger than the cap, which reads identically to
         # a night that had exactly that many and drained them. That is the older of the two
-        # bounds and the one that held a 15,246-flag backlog at 2000/night while the audit
-        # event read as converged (#761).
+        # bounds and it held NOTHING through #761: the 10-minute job timeout killed the run
+        # long before 2000 attempts, and those nights wrote no audit event at all. This flag
+        # is what makes the truncation legible now.
         limit: ^(cap + 1),
         select: %{
           source_article_id: l.source_article_id,
@@ -1294,10 +1329,11 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         "orphans_relinked" => action.relinked,
         "orphans_embedding_enqueued" => action.embedding_enqueued,
         "conflicts_promoted" => promoted,
-        # Both numbers are recorded because the DIFFERENCE is the convergence signal: while
-        # judged > promoted the backlog is draining. If a future reading shows them equal
-        # over several nights, the drain is merely holding the line and the caps need
-        # revisiting — that is not visible from either number alone.
+        # Both numbers are recorded because the DIFFERENCE bounds the NET drain: while
+        # judged > promoted the backlog is falling. It is not the convergence reading on its
+        # own — `judged` is clock-truncated below the count cap, so `judged > promoted` holds
+        # on every night of a long burst drain and every night of an unbounded divergence
+        # alike. The convergence reading is the two truncation flags below (#761).
         "conflicts_judged_redundant" => judged.judged,
         # And the three numbers that say WHY judged is what it is. Without them a night one
         # of the two bounds truncated and a night with nothing left to judge are
@@ -1310,7 +1346,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         "conflicts_judge_candidates" => judged.candidates,
         "conflicts_judge_budget_exhausted" => judged.budget_exhausted,
         "conflicts_judge_count_capped" => judged.count_capped,
-        # Same convergence reading as the pair above, for the graph. `links_prunable_remaining`
+        # Same drain-vs-remaining pair as above, for the graph. `links_prunable_remaining`
         # is what a capped run could not reach; 0 means nothing DELETABLE is left, which is
         # weaker than "at target degree" — an edge spared as conflict-promoter input is
         # over-degree and uncounted. A -1 means the prune FAILED and is deliberately not 0 — a
