@@ -960,8 +960,11 @@ config :loopctl, :knowledge_tag_backfill_concurrency, 2
 #
 # ON by default: it degrades to the previous similarity-only verdict on a tenant with no LLM
 # key, a provider outage or an unparseable reply, so a deployment that cannot use it is
-# exactly where it was. Cost is bounded by the judgement cap (`:knowledge_lint_max_conflict_
-# judgements`, 2000/night) and is per FLAGGED PAIR — ~450/day in practice — not per search.
+# exactly where it was. Cost is per FLAGGED PAIR, not per search, and is bounded by BOTH the
+# judgement cap (`:knowledge_lint_max_conflict_judgements`, 2000/night) and the wall-clock
+# budget below. It used to say "~450/day in practice" and lean on the count cap alone; the
+# practice changed on 2026-08-20 — 15,246 pairs arrived in four days through the ingestion
+# novelty gate, which no promoter cap bounds — and the count cap held nothing (#761).
 config :loopctl, :knowledge_conflict_judge_enabled, true
 config :loopctl, :knowledge_conflict_judge, Loopctl.Knowledge.ConflictJudge.Llm
 # Concurrent judgements per nightly run. Small on purpose: the limit on the other side is a
@@ -970,6 +973,28 @@ config :loopctl, :knowledge_conflict_judge, Loopctl.Knowledge.ConflictJudge.Llm
 # The provider call dominates wall time and holds no connection, so a bound of 2 costs the
 # run very little.
 config :loopctl, :knowledge_conflict_judge_concurrency, 2
+
+# WALL-CLOCK budget for that step, and the bound that actually holds (#761). The judgement
+# cap above counts ATTEMPTS; this counts TIME, which is what a step whose per-item cost is
+# an outbound provider call really spends. Measured in production 2026-08-27 on the
+# 86k-article tenant, one judgement is ~1.7 s wall / ~0.85 s at concurrency 2, so 20 minutes
+# drains ~1,400 pairs a night. That covers the promoter's 500/night with room to spare; it
+# does NOT cover the ingestion novelty gate, which no cap bounds and which put 15,246 flags
+# in over four days — ~3,800 a night. While the inflow runs above the drain the queue
+# DIVERGES, and no value here fixes that: bounding the flag inflow is the lever, and
+# `conflicts_judge_candidates` rising run over run with `conflicts_judge_count_capped` or
+# `conflicts_judge_budget_exhausted` set is the reading that says it is needed.
+#
+# `Loopctl.Workers.KnowledgeLintWorker.timeout/1` is DERIVED from this value plus a
+# five-minute reserve for the rest of the night. The value itself is CLAMPED so that sum
+# stays below Oban's 30-minute Lifeline rescue window (a job that outlasts it is
+# re-dispatched concurrently with itself), which puts the ceiling at the 20 minutes set
+# here: raising this number therefore raises NOTHING — not the job, and not the budget any
+# reader of it gets. That derivation is the fix: a flat 10-minute job timeout stood next to
+# a 2000-call ceiling worth ~28 minutes, latent until an ingestion burst outgrew the promoter cap on
+# 2026-08-20, after which every attempt on six consecutive nights was discarded with
+# Oban.TimeoutError and no consolidation report was produced at all.
+config :loopctl, :knowledge_lint_conflict_judge_budget_ms, :timer.minutes(20)
 
 # Phase 4 second-stage reranking. OFF by default: it puts an outbound provider call on the
 # DEFAULT search path, and the measurements that motivated the retrieval plan eliminate
