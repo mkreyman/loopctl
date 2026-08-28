@@ -94,6 +94,15 @@ defmodule Loopctl.Corpus.IndexerTest do
 
   defp statuses(result), do: Enum.map(result.items, & &1.status)
 
+  defp index_audit_entries(tenant_id) do
+    AdminRepo.all(
+      from(a in Loopctl.Audit.AuditLog,
+        where: a.tenant_id == ^tenant_id and a.action == "corpus_indexed",
+        order_by: [asc: a.inserted_at, asc: a.id]
+      )
+    )
+  end
+
   describe "index_chunks/4 — first pass" do
     test "inserts every chunk with a server-computed hash and its embedding" do
       tenant = fixture(:tenant)
@@ -266,12 +275,12 @@ defmodule Loopctl.Corpus.IndexerTest do
       assert length(chunks_of(corpus)) == 4
     end
 
-    # The rule the code ENFORCES, asserted so it cannot be misread again: a named source
-    # is reconciled against THAT request alone. Naming it on the last batch of a split
-    # document deletes what the earlier batches wrote, which is why the corrected
-    # AC-43.2.3 and the batch_too_large message both say a source larger than one batch is
-    # indexed across batches WITHOUT being named.
-    test "a named source is reconciled against the naming request alone" do
+    # THE case a bare name cannot serve, and the interlock that stops it destroying the
+    # document instead. A bare name asserts "what I carry IS the whole source"; on the
+    # last batch of a split document that assertion is false, and unguarded it deleted
+    # everything the earlier batches wrote. The refusal happens inside the transaction,
+    # so nothing is lost and the caller is pointed at the form that does work.
+    test "a bare name whose prune would exceed what the request carries is refused" do
       tenant = fixture(:tenant)
       corpus = create_corpus!(tenant.id)
 
@@ -281,11 +290,180 @@ defmodule Loopctl.Corpus.IndexerTest do
       index!(tenant.id, corpus, Enum.slice(all, 3..5))
       assert length(chunks_of(corpus)) == 6
 
-      result = index!(tenant.id, corpus, Enum.slice(all, 6..8), source_complete: ["big.pdf"])
+      assert {:error, {:prune_exceeds_carried, "big.pdf", 6, 3}} =
+               Indexer.index_chunks(tenant.id, corpus.id, Enum.slice(all, 6..8),
+                 source_complete: ["big.pdf"],
+                 audit: audit_opts()
+               )
 
-      assert result.pruned == 6
-      assert result.pruned_by_source == %{"big.pdf" => 6}
+      # Rolled back in full: the earlier batches survive AND the last batch is not
+      # half-applied.
+      assert length(chunks_of(corpus)) == 6
+    end
+
+    # The finding this interlock closes, at its named scale: ONE chunk of a large source,
+    # bare-named, used to delete every other chunk of it on a `role: :agent` key.
+    test "one chunk of a large source cannot bare-name away the rest" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      index!(tenant.id, corpus, pages("big.pdf", 40))
+
+      assert {:error, {:prune_exceeds_carried, "big.pdf", 39, 1}} =
+               Indexer.index_chunks(tenant.id, corpus.id, [chunk("big.pdf", 1, "page 1")],
+                 source_complete: ["big.pdf"],
+                 audit: audit_opts()
+               )
+
+      assert length(chunks_of(corpus)) == 40
+      assert embedding_count(corpus) == 40
+    end
+
+    # The manifest form, and the reason it exists: a document larger than one batch could
+    # otherwise never be reconciled at all — naming it on the completing batch deleted the
+    # earlier batches, and not naming it pruned nothing, so a book that lost a page kept
+    # serving that page forever and the only removal path was destroying the corpus.
+    test "a manifest reconciles a document spanning several batches without deleting them" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      all = pages("big.pdf", 9)
+
+      index!(tenant.id, corpus, Enum.slice(all, 0..2))
+      index!(tenant.id, corpus, Enum.slice(all, 3..5))
+      index!(tenant.id, corpus, Enum.slice(all, 6..8))
+      assert length(chunks_of(corpus)) == 9
+
+      # The document lost page 4. It is re-indexed across the same bounded batches, and
+      # the LAST one names it with the whole surviving locator set.
+      surviving = Enum.reject(all, &(&1["locator"] == %{"page" => 4}))
+
+      index!(tenant.id, corpus, Enum.slice(surviving, 0..2))
+      index!(tenant.id, corpus, Enum.slice(surviving, 3..4))
+
+      result =
+        index!(tenant.id, corpus, Enum.slice(surviving, 5..7),
+          source_complete: [
+            %{
+              "source_ref" => "big.pdf",
+              "locators" => Enum.map(surviving, & &1["locator"])
+            }
+          ]
+        )
+
+      assert result.pruned == 1
+      assert result.pruned_by_source == %{"big.pdf" => 1}
+
+      locators = chunks_of(corpus) |> Enum.map(& &1.locator)
+      assert length(locators) == 8
+      refute %{"page" => 4} in locators
+      assert embedding_count(corpus) == 8
+    end
+
+    # jsonb compares numbers numerically and renders every key as a string, so a manifest
+    # must match a stored locator the way the unique index does — not by term equality.
+    test "a manifest locator matches a stored one the way jsonb compares them" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      index!(tenant.id, corpus, pages("a.pdf", 3))
+
+      result =
+        index!(
+          tenant.id,
+          corpus,
+          [chunk("a.pdf", 3, "Loop 2310B carries the rendering provider, page 3")],
+          source_complete: [
+            %{
+              source_ref: "a.pdf",
+              locators: [%{"page" => 1.0}, %{page: 2}, %{"page" => 3}]
+            }
+          ]
+        )
+
+      assert result.pruned == 0
       assert length(chunks_of(corpus)) == 3
+    end
+
+    test "a manifest that omits a locator this request carries is refused" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      index!(tenant.id, corpus, pages("a.pdf", 3))
+
+      assert {:error, {:source_manifest_omits_carried, "a.pdf", omitted}} =
+               Indexer.index_chunks(tenant.id, corpus.id, pages("a.pdf", 3),
+                 source_complete: [%{"source_ref" => "a.pdf", "locators" => [%{"page" => 1}]}],
+                 audit: audit_opts()
+               )
+
+      assert length(omitted) == 2
+      assert length(chunks_of(corpus)) == 3
+    end
+
+    test "a manifest naming a source the batch does not carry is refused" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      index!(tenant.id, corpus, pages("a.pdf", 2) ++ pages("b.pdf", 2))
+
+      assert {:error, {:source_complete_not_carried, ["b.pdf"]}} =
+               Indexer.index_chunks(tenant.id, corpus.id, pages("a.pdf", 2),
+                 source_complete: [%{"source_ref" => "b.pdf", "locators" => []}],
+                 audit: audit_opts()
+               )
+
+      assert length(chunks_of(corpus)) == 4
+    end
+
+    test "a manifest larger than the ceiling is refused" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      index!(tenant.id, corpus, pages("a.pdf", 1))
+
+      oversize = for page <- 1..(Indexer.max_source_manifest() + 1), do: %{"page" => page}
+
+      assert {:error, {:source_manifest_too_large, "a.pdf", _max}} =
+               Indexer.index_chunks(tenant.id, corpus.id, pages("a.pdf", 1),
+                 source_complete: [%{"source_ref" => "a.pdf", "locators" => oversize}],
+                 audit: audit_opts()
+               )
+
+      assert length(chunks_of(corpus)) == 1
+    end
+
+    # A `source_complete` that is not a LIST at all. It used to take the carried refusal
+    # with an EMPTY `missing` list, telling the caller that a source it plainly DID carry
+    # was not carried, with no way to learn the real fault was the type.
+    test "a non-list source_complete is refused with its own code, echoing what arrived" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      index!(tenant.id, corpus, pages("a.pdf", 2))
+
+      assert {:error, {:source_complete_invalid, "a.pdf"}} =
+               Indexer.index_chunks(tenant.id, corpus.id, pages("a.pdf", 2),
+                 source_complete: "a.pdf",
+                 audit: audit_opts()
+               )
+
+      assert length(chunks_of(corpus)) == 2
+    end
+
+    test "a member that is an object without a locators list is refused as invalid" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      index!(tenant.id, corpus, pages("a.pdf", 2))
+
+      assert {:error, {:source_complete_invalid, %{"source_ref" => "a.pdf"}}} =
+               Indexer.index_chunks(tenant.id, corpus.id, pages("a.pdf", 2),
+                 source_complete: [%{"source_ref" => "a.pdf"}],
+                 audit: audit_opts()
+               )
+
+      assert length(chunks_of(corpus)) == 2
     end
 
     test "naming a source the batch does not carry is refused" do
@@ -302,6 +480,71 @@ defmodule Loopctl.Corpus.IndexerTest do
 
       # Nothing was pruned: the refusal is what keeps this verb below the :user line.
       assert length(chunks_of(corpus)) == 4
+    end
+  end
+
+  describe "the audit entry for a request that pruned" do
+    # `POST /corpora/:id/index` is the one index verb that DESTROYS data, and it is held
+    # at `role: :agent` on the argument that its delete is bounded and attributable. An
+    # append-only log that recorded only item counts could not say what an agent-role key
+    # deleted, so the request that removed three pages and the one that removed none were
+    # indistinguishable in it.
+    test "records the prune, in total and per named source" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      index!(tenant.id, corpus, pages("a.pdf", 5))
+      index!(tenant.id, corpus, Enum.take(pages("a.pdf", 5), 3), source_complete: ["a.pdf"])
+
+      [_first, pruning] = index_audit_entries(tenant.id)
+
+      assert pruning.new_state["pruned"] == 2
+      assert pruning.new_state["pruned_by_source"] == %{"a.pdf" => 2}
+      assert pruning.new_state["source_complete"] == ["a.pdf"]
+    end
+
+    test "records a zero prune for a request that named nothing" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      index!(tenant.id, corpus, pages("a.pdf", 2))
+
+      [entry] = index_audit_entries(tenant.id)
+
+      assert entry.new_state["pruned"] == 0
+      assert entry.new_state["pruned_by_source"] == %{}
+    end
+  end
+
+  describe "a snippet longer than the documented bound" do
+    # The ingest request schema publishes `snippet.maxLength`; nothing enforced it, so a
+    # 50 KB snippet was accepted and stored verbatim against a cap the server did not
+    # have. Both ends now read `DocumentChunk.max_snippet_chars/0`.
+    test "is refused rather than stored against a cap the server does not have" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      over = String.duplicate("y", DocumentChunk.max_snippet_chars() + 1)
+      item = Map.put(chunk("a.pdf", 1, "the loop 2310B body"), "snippet", over)
+
+      assert {:error, {:invalid_chunk, 0, %Ecto.Changeset{} = changeset}} =
+               Indexer.index_chunks(tenant.id, corpus.id, [item], audit: audit_opts())
+
+      assert %{snippet: [_message]} = Ecto.Changeset.traverse_errors(changeset, & &1)
+      assert chunks_of(corpus) == []
+    end
+
+    test "a snippet at exactly the bound is accepted" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      at_bound = String.duplicate("y", DocumentChunk.max_snippet_chars())
+      item = Map.put(chunk("a.pdf", 1, "the loop 2310B body"), "snippet", at_bound)
+
+      index!(tenant.id, corpus, [item])
+
+      assert [stored] = chunks_of(corpus)
+      assert stored.snippet == at_bound
     end
   end
 

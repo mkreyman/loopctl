@@ -19,6 +19,7 @@ defmodule LoopctlWeb.CorpusControllerTest do
   alias Loopctl.Corpus.DocumentChunkEmbedding
   alias Loopctl.Corpus.Indexer
   alias Loopctl.Corpus.Search
+  alias LoopctlWeb.CorpusController
 
   setup :verify_on_exit!
 
@@ -420,6 +421,98 @@ defmodule LoopctlWeb.CorpusControllerTest do
       assert AdminRepo.all(from(c in DocumentChunk, where: c.corpus_id == ^corpus.id)) == []
     end
 
+    # A bare name asserts "what I carry IS the whole source". On the last batch of a split
+    # document that is false, and unguarded it deleted everything the earlier batches
+    # wrote — a set-based delete on a `role: :agent` key.
+    test "a bare source_complete whose prune would exceed the carried set is refused",
+         %{conn: conn} do
+      {tenant, raw_key} = keyed_tenant()
+      corpus = create_corpus!(tenant.id)
+
+      {:ok, _} =
+        Indexer.index_chunks(tenant.id, corpus.id, for(page <- 1..6, do: page_chunk(page)),
+          audit: [actor_type: "api_key"]
+        )
+
+      body =
+        conn
+        |> auth(raw_key)
+        |> post(~p"/api/v1/corpora/#{corpus.id}/index", %{
+          "chunks" => [page_chunk(1)],
+          "source_complete" => ["a.pdf"]
+        })
+        |> json_response(422)
+
+      assert body["error"]["code"] == "prune_exceeds_carried"
+      assert body["error"]["details"]["would_prune"] == 5
+      assert body["error"]["details"]["carried"] == 1
+
+      assert AdminRepo.aggregate(
+               from(c in DocumentChunk, where: c.corpus_id == ^corpus.id),
+               :count,
+               :id
+             ) == 6
+    end
+
+    # The manifest form: the SAME last-batch request, now declaring the document's whole
+    # locator set, keeps what the earlier batches wrote and prunes only the surplus.
+    test "a manifest reconciles a document larger than one batch", %{conn: conn} do
+      {tenant, raw_key} = keyed_tenant()
+      corpus = create_corpus!(tenant.id)
+
+      {:ok, _} =
+        Indexer.index_chunks(tenant.id, corpus.id, for(page <- 1..6, do: page_chunk(page)),
+          audit: [actor_type: "api_key"]
+        )
+
+      body =
+        conn
+        |> auth(raw_key)
+        |> post(~p"/api/v1/corpora/#{corpus.id}/index", %{
+          # The document lost page 6. This is the batch that COMPLETES the re-index, and
+          # it declares the whole surviving locator set.
+          "chunks" => [page_chunk(4), page_chunk(5)],
+          "source_complete" => [
+            %{
+              "source_ref" => "a.pdf",
+              "locators" => for(page <- 1..5, do: %{"page" => page})
+            }
+          ]
+        })
+        |> json_response(200)
+
+      assert body["meta"]["pruned"] == 1
+      assert body["meta"]["pruned_by_source"] == %{"a.pdf" => 1}
+
+      assert AdminRepo.aggregate(
+               from(c in DocumentChunk, where: c.corpus_id == ^corpus.id),
+               :count,
+               :id
+             ) == 5
+    end
+
+    # It used to take the carried refusal with an EMPTY `missing` list: the caller was
+    # told a source it plainly DID carry was not carried, with nothing pointing at the
+    # real fault (the type).
+    test "a non-list source_complete is refused with its own code", %{conn: conn} do
+      {tenant, raw_key} = keyed_tenant()
+      corpus = create_corpus!(tenant.id)
+
+      body =
+        conn
+        |> auth(raw_key)
+        |> post(~p"/api/v1/corpora/#{corpus.id}/index", %{
+          "chunks" => [page_chunk(1)],
+          "source_complete" => "a.pdf"
+        })
+        |> json_response(422)
+
+      assert body["error"]["code"] == "source_complete_invalid"
+      assert body["error"]["details"]["received"] =~ "a.pdf"
+
+      assert AdminRepo.all(from(c in DocumentChunk, where: c.corpus_id == ^corpus.id)) == []
+    end
+
     # TC-43.2.9
     test "the rate limit is charged per ITEM, so the ceiling is reached at the item count",
          %{conn: conn} do
@@ -452,6 +545,57 @@ defmodule LoopctlWeb.CorpusControllerTest do
       assert body["error"]["code"] == "rate_limited"
       assert :counters.get(counters, 1) == 6
       assert AdminRepo.all(from(c in DocumentChunk, where: c.corpus_id == ^corpus.id)) == []
+    end
+
+    # A per-ITEM charge that walks the bucket item by item spends the tenant's remaining
+    # budget on a request it is going to refuse anyway: with 100 of 240 consumed, a
+    # 200-chunk batch used to charge 140 tokens, be denied at 141, write NOTHING, and
+    # leave the tenant unable to afford even a one-chunk request it could have made. The
+    # first call's post-increment count IS the headroom, so the batch is now decided
+    # before the rest of it is charged.
+    test "a batch that cannot fit the remaining budget is refused after ONE charge",
+         %{conn: conn} do
+      {tenant, raw_key} = keyed_tenant()
+      corpus = create_corpus!(tenant.id)
+
+      counters = :counters.new(1, [])
+
+      stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, _window, _limit ->
+        if String.starts_with?(bucket, "corpus_index:tenant:") do
+          :counters.add(counters, 1, 1)
+          # 100 already spent this minute against the default 240 cap.
+          {:allow, 100 + :counters.get(counters, 1)}
+        else
+          {:allow, 1}
+        end
+      end)
+
+      body =
+        conn
+        |> auth(raw_key)
+        |> post(~p"/api/v1/corpora/#{corpus.id}/index", %{
+          "chunks" => for(page <- 1..200, do: page_chunk(page))
+        })
+        |> json_response(429)
+
+      assert body["error"]["code"] == "rate_limited"
+      # ONE token, the same one every refused request on every other bucket spends —
+      # not 140.
+      assert :counters.get(counters, 1) == 1
+      assert AdminRepo.all(from(c in DocumentChunk, where: c.corpus_id == ^corpus.id)) == []
+    end
+
+    # Under `RATE_LIMITER=postgres` the limiter store IS `AdminRepo`, so a per-ITEM charge
+    # turned ONE ordinary index request into up to `max_batch_size` sequential upserts on
+    # a single hot row, taken from the 3-connection BYPASSRLS pool that also carries
+    # custody writes — before the request did any work. The pin is a PURE function of the
+    # configured impl precisely so it is testable: in the test env `RateLimiter.impl/0` is
+    # always the Mox mock, so the clause would otherwise be dead code.
+    test "the per-item index bucket is pinned away from the AdminRepo-backed limiter" do
+      assert CorpusController.index_meter(Loopctl.RateLimiter.Postgres) ==
+               Loopctl.RateLimiter.default_impl()
+
+      assert CorpusController.index_meter(Loopctl.MockRateLimiter) == Loopctl.MockRateLimiter
     end
   end
 
@@ -552,6 +696,47 @@ defmodule LoopctlWeb.CorpusControllerTest do
       assert String.length(snippet) == documented
       assert String.length(long) > documented
       assert documented == Search.max_snippet_chars()
+    end
+
+    # The REQUEST side of the same bound. The spec declared `snippet.maxLength` and
+    # nothing enforced it — the router mounts no `CastAndValidate`, and neither the
+    # changeset nor the indexer looked at the length — so a 50 KB snippet was accepted
+    # and stored verbatim against a cap the server did not have. Read out of the
+    # GENERATED spec and held against a real request, so it cannot pass on a
+    # both-sides-read-one-attribute tautology.
+    test "the snippet maxLength in the request schema is a bound the server enforces",
+         %{conn: conn} do
+      spec = Loopctl.ApiSpec.spec()
+
+      documented =
+        spec.paths["/api/v1/corpora/{id}/index"].post.requestBody.content["application/json"].schema.properties.chunks.items.properties.snippet.maxLength
+
+      assert is_integer(documented) and documented > 0
+
+      {tenant, raw_key} = keyed_tenant()
+      corpus = create_corpus!(tenant.id)
+      over = String.duplicate("y", documented + 1)
+
+      body =
+        conn
+        |> auth(raw_key)
+        |> post(~p"/api/v1/corpora/#{corpus.id}/index", %{
+          "chunks" => [Map.put(page_chunk(1), "snippet", over)]
+        })
+        |> json_response(422)
+
+      assert body["error"]["code"] == "invalid_chunk"
+      assert body["error"]["details"]["errors"]["snippet"] != nil
+      assert AdminRepo.all(from(c in DocumentChunk, where: c.corpus_id == ^corpus.id)) == []
+    end
+
+    test "the manifest maxItems in the OpenAPI document is the enforced ceiling" do
+      spec = Loopctl.ApiSpec.spec()
+
+      [_string_form, object_form] =
+        spec.paths["/api/v1/corpora/{id}/index"].post.requestBody.content["application/json"].schema.properties.source_complete.items.oneOf
+
+      assert object_form.properties.locators.maxItems == Indexer.max_source_manifest()
     end
 
     test "the batch maxItems in the OpenAPI document is the enforced batch ceiling" do

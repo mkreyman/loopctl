@@ -13,7 +13,7 @@ defmodule LoopctlWeb.CorpusController do
   | `GET /api/v1/corpora` | `:agent` | a read |
   | `GET /api/v1/corpora/:id` | `:agent` | a read |
   | `GET /api/v1/corpora/:id/status` | `:agent` | a read |
-  | `POST /api/v1/corpora/:id/index` | `:agent` | it DOES delete, but neither set-based nor a one-way door: the prune reaches only `source_ref`s the SAME request carries chunks for and names complete, and re-indexing the file restores them |
+  | `POST /api/v1/corpora/:id/index` | `:agent` | it DOES delete, but the delete set is the exact complement of a set the caller wrote down: the prune reaches only `source_ref`s the request both carries chunks for AND names complete, keeps every chunk the name's manifest declares, and re-indexing the file restores what it took |
   | `POST /api/v1/corpora/:id/search` | `:agent` | a POST-shaped read (the query body is richer than a query string) |
   | `DELETE /api/v1/corpora/:id` | `:user` | set-based blast radius AND irreversible: one call destroys every chunk and vector in the corpus and nothing restores them |
 
@@ -23,8 +23,14 @@ defmodule LoopctlWeb.CorpusController do
   `500 audit_write_failed`.
 
   `DELETE` is the one verb that is both set-based and irrecoverable, which is exactly
-  the CLAUDE.md test for the `:user` line. `index`'s delete is bounded by AC-43.2.3's
-  reconciliation rule, so it stays below it.
+  the CLAUDE.md test for the `:user` line — an AND, and `index`'s delete fails BOTH
+  halves of it. It is scoped to one explicitly named `source_ref` at a time, keeps
+  everything the caller either resent or listed in that source's manifest, refuses a bare
+  name whose prune would exceed what the request carried, reports what each name cost in
+  `meta.pruned_by_source` AND in the audit entry — and it is RECOVERABLE, because the
+  file it indexes is the client's and re-indexing restores what a prune took. That last
+  property is the one this tier is built on: the pointer keeps the file the source of
+  truth, so nothing here is a one-way door.
 
   ## `corpus_search` is NOT a recall surface
 
@@ -69,6 +75,7 @@ defmodule LoopctlWeb.CorpusController do
   # also enforces them, so the published OpenAPI bounds and the runtime guards read the
   # same numbers and cannot drift (the `@max_inline_content_bytes` precedent).
   @max_batch_size Indexer.max_batch_size()
+  @max_source_manifest Indexer.max_source_manifest()
   @max_snippet_chars Search.max_snippet_chars()
   @max_search_limit Search.max_limit()
   @max_query_chars Search.max_query_chars()
@@ -183,8 +190,10 @@ defmodule LoopctlWeb.CorpusController do
   operation(:show,
     summary: "Get one corpus with its status",
     description:
-      "Returns the corpus and its aggregate index status (source and chunk counts). " <>
-        "Accepts an id or a slug. Role: agent+.",
+      "Returns the corpus and ONE aggregate: status.has_sources, a boolean saying " <>
+        "whether anything is indexed in it yet. Per-source chunk counts and content " <>
+        "hashes are NOT here — they are GET /api/v1/corpora/:id/status, which is " <>
+        "bounded and paginated. Accepts an id or a slug. Role: agent+.",
     parameters: [
       id: [in: :path, type: :string, description: "Corpus id or slug.", required: true]
     ],
@@ -199,12 +208,11 @@ defmodule LoopctlWeb.CorpusController do
   def show(conn, %{"id" => id}) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
-    with {:ok, corpus} <- Corpus.get_corpus(tenant_id, id),
-         {:ok, counts} <- Corpus.source_status(tenant_id, corpus.id, limit: 1) do
+    with {:ok, corpus} <- Corpus.get_corpus(tenant_id, id) do
       json(conn, %{
         data:
           Map.put(render_corpus(corpus), :status, %{
-            has_sources: counts.sources != [] or counts.has_more
+            has_sources: Corpus.any_chunks?(tenant_id, corpus.id)
           })
       })
     end
@@ -288,13 +296,17 @@ defmodule LoopctlWeb.CorpusController do
         "client in mode A. Indexing is idempotent on (corpus_id, source_ref, locator): an " <>
         "unchanged batch writes nothing, spends no embedding tokens, and reports every item " <>
         "as unchanged; a chunk whose text is unchanged but whose snippet or ordinal moved is " <>
-        "reported replaced — the row is rewritten and no embedding is spent. Name a source in " <>
-        "source_complete ONLY when this request carries that source in FULL — a named source " <>
-        "is reconciled against THIS request alone, so every stored chunk of it the request " <>
-        "does not carry is deleted, and meta.pruned_by_source reports what each name cost. A " <>
-        "source larger than the batch ceiling therefore cannot be reconciled in one request: " <>
-        "index it across batches without naming it. Naming a source the batch does not carry " <>
-        "is refused. Rate limited per ITEM. Role: agent+.",
+        "reported replaced — the row is rewritten and no embedding is spent. source_complete " <>
+        "names the sources to RECONCILE, and each name declares that source's COMPLETE chunk " <>
+        "set: a bare string means the set is what THIS request carries for it, while " <>
+        "{source_ref, locators} declares the set explicitly so a document spanning several " <>
+        "batches can be reconciled on the batch that completes it without deleting what the " <>
+        "earlier batches wrote. Every stored chunk of a named source that is neither carried " <>
+        "nor declared is deleted, and meta.pruned_by_source reports what each name cost. " <>
+        "Naming a source the batch does not carry is refused, as is a manifest that omits a " <>
+        "chunk the same request carries, as is a BARE name whose prune would exceed the " <>
+        "number of chunks the request carries for that source (declare the locators " <>
+        "instead). Rate limited per ITEM. Role: agent+.",
     parameters: [
       id: [in: :path, type: :string, description: "Corpus id or slug.", required: true]
     ],
@@ -324,8 +336,32 @@ defmodule LoopctlWeb.CorpusController do
            },
            source_complete: %OpenApiSpex.Schema{
              type: :array,
-             items: %OpenApiSpex.Schema{type: :string},
-             description: "The source_refs this request carries in FULL."
+             items: %OpenApiSpex.Schema{
+               oneOf: [
+                 %OpenApiSpex.Schema{
+                   type: :string,
+                   description:
+                     "A source_ref whose COMPLETE chunk set is what this request carries."
+                 },
+                 %OpenApiSpex.Schema{
+                   type: :object,
+                   required: [:source_ref, :locators],
+                   properties: %{
+                     source_ref: %OpenApiSpex.Schema{type: :string},
+                     locators: %OpenApiSpex.Schema{
+                       type: :array,
+                       maxItems: @max_source_manifest,
+                       description:
+                         "The source's COMPLETE locator set. Chunks at these locators are " <>
+                           "kept even when this request does not carry them, which is how a " <>
+                           "document larger than the batch ceiling is reconciled. Must " <>
+                           "include every locator this request carries for the source."
+                     }
+                   }
+                 }
+               ]
+             },
+             description: "The sources to reconcile, each declaring its complete chunk set."
            }
          }
        }},
@@ -375,7 +411,9 @@ defmodule LoopctlWeb.CorpusController do
         "the per-dimension HNSW index and keyword over the chunk text — fused by the same " <>
         "Reciprocal Rank Fusion the article path uses. Returns {source_ref, locator, snippet, " <>
         "score, corpus_id, chunk_id} by descending score and NEVER the full chunk text. " <>
-        "meta.lanes names the lanes that actually ran. Scores are RANK-derived and comparable " <>
+        "meta.lanes names the lanes that actually ran, and meta.semantic_under_filled says " <>
+        "when the semantic lane ran but could not reach the whole corpus. Scores are " <>
+        "RANK-derived and comparable " <>
         "only WITHIN one result set — there is no absolute floor. Role: agent+. This endpoint " <>
         "is deliberately NOT part of /api/v1/recall.",
     parameters: [
@@ -427,8 +465,10 @@ defmodule LoopctlWeb.CorpusController do
       422 =>
         {"Empty or over-long query, or a client_embedded corpus", "application/json",
          Schemas.ErrorResponse},
-      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
-      503 => {"Both lanes shed under load", "application/json", Schemas.ErrorResponse}
+      429 =>
+        {"Rate limited (code rate_limited), or BOTH lanes shed by the per-tenant " <>
+           "heavy-read gate (code heavy_read_overloaded, with Retry-After)", "application/json",
+         Schemas.RateLimitError}
     }
   )
 
@@ -504,6 +544,61 @@ defmodule LoopctlWeb.CorpusController do
     )
   end
 
+  # Its OWN code, and it ECHOES what arrived. Folded into source_complete_not_carried
+  # this answered "you do not carry that source" with an EMPTY missing list to a request
+  # that plainly did carry it — both halves false, and no way for the caller to learn the
+  # real fault is the type.
+  defp handle_index_error(conn, {:source_complete_invalid, received}) do
+    error(
+      conn,
+      422,
+      "source_complete_invalid",
+      "source_complete must be a LIST whose members are either a source_ref string or " <>
+        "an object with a source_ref and a locators array declaring that source's " <>
+        "complete locator set.",
+      %{received: inspect(received)}
+    )
+  end
+
+  defp handle_index_error(conn, {:prune_exceeds_carried, source_ref, pruned, carried}) do
+    error(
+      conn,
+      422,
+      "prune_exceeds_carried",
+      "Naming #{source_ref} in source_complete without a locator manifest would delete " <>
+        "#{pruned} stored chunks while this request carries only #{carried} for it, so the " <>
+        "whole request was rolled back and nothing changed. A bare name asserts that what " <>
+        "you sent IS the whole document; if it is (you are removing most of it) or if this " <>
+        "is the last batch of a split document, name the source as an object and declare " <>
+        "its complete locators array instead.",
+      %{source_ref: source_ref, would_prune: pruned, carried: carried}
+    )
+  end
+
+  defp handle_index_error(conn, {:source_manifest_too_large, source_ref, max}) do
+    error(
+      conn,
+      422,
+      "source_manifest_too_large",
+      "A source_complete manifest declares at most #{max} locators.",
+      %{source_ref: source_ref, max_locators: max}
+    )
+  end
+
+  # A manifest that omits a locator the SAME request carries would have the transaction
+  # write that chunk and delete it again, silently losing the write the caller just made.
+  defp handle_index_error(conn, {:source_manifest_omits_carried, source_ref, omitted}) do
+    error(
+      conn,
+      422,
+      "source_manifest_omits_carried",
+      "The source_complete manifest for #{source_ref} omits locators this request carries " <>
+        "for it, so those chunks would be written and immediately deleted. A manifest " <>
+        "declares the source's COMPLETE chunk set, which includes everything in this batch.",
+      %{source_ref: source_ref, omitted: Enum.map(omitted, &inspect/1)}
+    )
+  end
+
   defp handle_index_error(conn, {:embedding_failed, reason, failed}) do
     conn
     |> put_status(:bad_gateway)
@@ -564,18 +659,17 @@ defmodule LoopctlWeb.CorpusController do
   defp query_too_long_message,
     do: "The query is longer than #{@max_query_chars} characters."
 
-  # States the rule the code ENFORCES, which is not the one this message used to give.
-  # `source_complete` is reconciled against THIS request alone: every stored chunk of a
-  # named source that the request does not carry is deleted. Naming a source on the LAST
-  # batch of a split document therefore deletes the earlier batches. So a source is named
-  # only by a request that carries it in FULL, which bounds a reconcilable source at the
-  # batch ceiling; a larger source is indexed across batches and simply not reconciled.
+  # States the rule the code ENFORCES, including the one that makes a document larger
+  # than the ceiling reconcilable at all: the completing batch names the source WITH its
+  # full locator manifest, so the chunks the earlier batches wrote are kept rather than
+  # deleted.
   defp batch_too_large_message(max) do
-    "A batch carries at most #{max} chunks. Split the document across several requests, " <>
-      "and name a source in source_complete ONLY on a request that carries that source in " <>
-      "FULL — a named source is reconciled against that one request, so every stored chunk " <>
-      "of it the request does not carry is deleted. A source larger than #{max} chunks " <>
-      "cannot be reconciled in one request: index it across batches without naming it."
+    "A batch carries at most #{max} chunks. Split the document across several requests. " <>
+      "To reconcile it, name it in source_complete on the batch that COMPLETES it as an " <>
+      "object carrying its source_ref and its whole locators array, so the chunks the " <>
+      "earlier batches wrote are kept and only surplus chunks are deleted. A " <>
+      "bare source_ref name reconciles against that one request alone, which is correct " <>
+      "only for a document that fits in one batch."
   end
 
   defp changeset_errors(changeset) do
@@ -621,12 +715,15 @@ defmodule LoopctlWeb.CorpusController do
       |> error(422, "batch_too_large", batch_too_large_message(@max_batch_size))
       |> halt()
     else
-      gate(conn, "corpus_index:tenant:#{tenant_id(conn)}", ingest_limit(conn), max(items, 1))
+      bucket = "corpus_index:tenant:#{tenant_id(conn)}"
+      gate(conn, charge_items(bucket, ingest_limit(conn), max(items, 1)))
     end
   end
 
   defp rate_limit_search(conn, _opts) do
-    gate(conn, "corpus_search:tenant:#{tenant_id(conn)}", search_limit(conn), 1)
+    bucket = "corpus_search:tenant:#{tenant_id(conn)}"
+
+    gate(conn, RateLimiter.within_limit?(bucket, @rate_limit_window_ms, search_limit(conn)))
   end
 
   # Bucketed per TENANT, not per key: indexing and searching a corpus are TENANT
@@ -635,36 +732,95 @@ defmodule LoopctlWeb.CorpusController do
   # pattern, it does routinely (one ephemeral key per dispatch).
   defp tenant_id(conn), do: conn.assigns.current_api_key.tenant_id
 
-  defp gate(conn, bucket, limit, charges) do
-    if charge(bucket, limit, charges) do
-      conn
-    else
-      retry_after = max(1, window_reset_at() - System.system_time(:second))
+  defp gate(conn, true), do: conn
 
-      conn
-      |> put_resp_header("retry-after", to_string(retry_after))
-      |> put_status(:too_many_requests)
-      |> json(%{error: %{status: 429, code: "rate_limited", message: "Rate limit exceeded"}})
-      |> halt()
+  defp gate(conn, false) do
+    retry_after = max(1, window_reset_at() - System.system_time(:second))
+
+    conn
+    |> put_resp_header("retry-after", to_string(retry_after))
+    |> put_status(:too_many_requests)
+    |> json(%{error: %{status: 429, code: "rate_limited", message: "Rate limit exceeded"}})
+    |> halt()
+  end
+
+  # AC-43.2.7's per-ITEM charge. `check_rate/3` increments by ONE per call, so N items
+  # cost N calls — and the FIRST call's post-increment count is the tenant's headroom,
+  # which decides the rest of the batch before any of it is charged.
+  #
+  # Without that headroom read the loop charged item by item until it was denied
+  # mid-batch, so a 200-chunk request with 140 tokens left spent all 140, wrote nothing,
+  # and left the tenant unable to afford even a one-chunk request it could otherwise have
+  # made. A refused batch now costs exactly ONE token — the same token every refused
+  # request on every other bucket in this codebase spends, since `check_rate/3` increments
+  # before it compares.
+  defp charge_items(bucket, limit, items) do
+    case consult(bucket, limit) do
+      {:metered, count} -> charge_rest(bucket, limit, items, count)
+      :unmetered -> true
+      :denied -> false
     end
   end
 
-  # `within_limit?/3` normalises the `{:error, term()}` the behaviour also permits and
-  # fails OPEN through the shared throttled `FailOpenLog`, so a limiter outage degrades
-  # to "no gate" rather than a CaseClauseError 500.
-  defp charge(bucket, limit, charges) do
-    Enum.reduce_while(1..charges, true, fn _charge, _acc ->
-      if RateLimiter.within_limit?(bucket, @rate_limit_window_ms, limit) do
-        {:cont, true}
-      else
-        {:halt, false}
+  defp charge_rest(_bucket, limit, items, count) when items - 1 > limit - count, do: false
+  defp charge_rest(_bucket, _limit, items, _count) when items <= 1, do: true
+
+  defp charge_rest(bucket, limit, items, _count) do
+    Enum.reduce_while(2..items, true, fn _charge, _acc ->
+      case consult(bucket, limit) do
+        :denied -> {:halt, false}
+        _outcome -> {:cont, true}
       end
     end)
-  rescue
-    error ->
-      FailOpenLog.warn(:corpus, bucket, Exception.message(error))
-      true
   end
+
+  # One limiter round trip, normalised. `{:allow, 0}` is the Postgres impl's fail-open
+  # SENTINEL, not a real count, so it is reported `:unmetered` and never fed to the
+  # headroom arithmetic — read as a count it would refuse a batch the limiter never
+  # actually measured.
+  #
+  # The METER is pinned away from `RateLimiter.Postgres` (see `index_meter/1`): with a
+  # per-ITEM charge, one ordinary 200-chunk request was 200 SEQUENTIAL `AdminRepo`
+  # upserts on ONE hot row, taken from the 3-connection BYPASSRLS pool that also carries
+  # custody writes, BEFORE the request did any work — including for a batch that turned
+  # out to be entirely unchanged and wrote nothing.
+  defp consult(bucket, limit) do
+    case index_meter(RateLimiter.impl()).check_rate(bucket, @rate_limit_window_ms, limit) do
+      {:allow, count} when is_integer(count) and count > 0 -> {:metered, count}
+      {:allow, _sentinel} -> :unmetered
+      {:deny, _limit} -> :denied
+      other -> fail_open(bucket, "limiter returned #{inspect(other)}")
+    end
+  rescue
+    error -> fail_open(bucket, Exception.message(error))
+  catch
+    :exit, reason -> fail_open(bucket, "exit: #{inspect(reason)}")
+    :throw, value -> fail_open(bucket, "throw: #{inspect(value)}")
+  end
+
+  defp fail_open(bucket, detail) do
+    FailOpenLog.warn(:corpus, bucket, detail)
+    :unmetered
+  end
+
+  @doc """
+  The limiter implementation the per-ITEM index bucket charges against.
+
+  Honours `RateLimiter.impl/0` except for ONE case: under `RATE_LIMITER=postgres` the
+  limiter store IS `AdminRepo`, so a per-item charge turns one index request into up to
+  #{@max_batch_size} sequential upserts on a single hot row, taken from the 3-connection
+  BYPASSRLS pool that also carries custody writes — the failure mode
+  `LoopctlWeb.KnowledgeIngestionController.fail_open_meter/1` pins away from for the same
+  reason. The SEARCH bucket is charged once per request, in the same unit the shared
+  buckets count, so it is NOT pinned and stays cluster-global.
+
+  PUBLIC and a pure function of the configured impl so the pin is testable: in the test
+  env `RateLimiter.impl/0` is always the Mox mock, so the `Postgres` clause would
+  otherwise be dead code a later edit could invert with a green suite.
+  """
+  @spec index_meter(module()) :: module()
+  def index_meter(RateLimiter.Postgres), do: RateLimiter.default_impl()
+  def index_meter(impl), do: impl
 
   # NOT clamped against the pipeline cap, unlike `search_limit/1`. This bucket is charged
   # per ITEM while `rate_limit_requests_per_minute` is charged once per REQUEST, so a

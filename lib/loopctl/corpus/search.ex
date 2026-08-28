@@ -32,9 +32,25 @@ defmodule Loopctl.Corpus.Search do
   That makes `corpus_id` a POST-ANN residual on top of the `tenant_id` residual the
   partial index already leaves (the index is partial on `(dim, live_denorm)` only),
   and `hnsw.iterative_scan` is default-off in production — so the inner limit is
-  over-fetched (`side_table_inner_pool/1` times `@corpus_pool_multiplier`) and
-  `hnsw.ef_search` is raised in lockstep. An HNSW scan returns ~`ef_search` nodes
-  regardless of LIMIT, so the over-fetch is inert without that.
+  over-fetched (`side_table_inner_pool/1` times `@corpus_pool_multiplier`, and never
+  below `VectorSearch.max_side_table_ef_search/0`) and `hnsw.ef_search` is raised in
+  lockstep. An HNSW scan returns ~`ef_search` nodes regardless of LIMIT, so the
+  over-fetch is inert without that, and an inner limit BELOW the configured ef ceiling
+  leaves breadth the deployment already allows unused.
+
+  ## An under-filled semantic lane SAYS SO
+
+  The over-fetch bounds the hazard; it cannot remove it. `hnsw.ef_search` is capped by
+  `:side_table_max_ef_search`, so a tenant whose nearest ~`ef_search` chunk vectors all
+  belong to ANOTHER corpus still yields few rows — or none — for the target. That case
+  used to answer `{:ok, []}` with the lane still named in `meta.lanes`, which a caller
+  reads as "this corpus has nothing" rather than "the scan did not reach it".
+
+  So a short lane is checked against the corpus itself with a BOUNDED probe: a corpus
+  holding no more chunks than the lane returned did not under-fill, it is simply that
+  small. One that holds more did, and `meta.semantic_under_filled` says so — the corpus
+  tier's form of the article path's under-fill disclosure. Narrowing the query, or a
+  corpus of its own for the material, is what a caller does about it.
 
   ## Not a recall surface
 
@@ -54,10 +70,11 @@ defmodule Loopctl.Corpus.Search do
   alias Loopctl.Knowledge.VectorSearch
   alias Loopctl.Search.Regconfig
 
-  # The snippet ceiling. ONE attribute: the truncation below and the controller's
-  # OpenAPI `maxLength` both read it, so the documented bound and the enforced bound
-  # cannot drift (AC-43.2.4).
-  @max_snippet_chars 320
+  # The snippet ceiling, read from the SCHEMA that stores the column. The truncation
+  # below, `DocumentChunk.changeset/2`'s `validate_length` on the write, and the
+  # controller's OpenAPI `maxLength` on BOTH the request and the response all read this
+  # one number, so a documented bound can never outrun an enforced one (AC-43.2.4).
+  @max_snippet_chars DocumentChunk.max_snippet_chars()
 
   @default_limit 10
   @max_limit 50
@@ -101,7 +118,8 @@ defmodule Loopctl.Corpus.Search do
   Returns `{:ok, %{results: [...], meta: %{lanes: [...], ...}}}`. Both lanes failing
   is the only case that returns `{:error, :heavy_read_overloaded}` — a semantic lane
   that cannot run (no embedding key, an embed failure, a shed heavy read) degrades to
-  keyword-only and says so in `meta`, the way semantic article search does.
+  keyword-only and says so in `meta`, the way semantic article search does. A semantic
+  lane that RAN but could not reach the whole corpus sets `meta.semantic_under_filled`.
   """
   @spec search(Ecto.UUID.t(), String.t(), String.t(), keyword()) ::
           {:ok, %{results: [map()], meta: map()}}
@@ -164,12 +182,13 @@ defmodule Loopctl.Corpus.Search do
   end
 
   defp lane_results({:ok, results}), do: results
+  defp lane_results({:partial, results}), do: results
   defp lane_results({:error, _reason}), do: []
 
   defp meta(corpus, keyword, semantic, limit) do
     lanes =
       [{"keyword", keyword}, {"semantic", semantic}]
-      |> Enum.filter(&match?({_name, {:ok, _}}, &1))
+      |> Enum.reject(&match?({_name, {:error, _}}, &1))
       |> Enum.map(&elem(&1, 0))
 
     %{
@@ -189,15 +208,24 @@ defmodule Loopctl.Corpus.Search do
     }
     |> maybe_put_reason(:keyword_unavailable_reason, keyword)
     |> maybe_put_reason(:semantic_unavailable_reason, semantic)
+    |> maybe_put_under_fill(semantic)
   end
+
+  # NAMED, never inferred, for the same reason `lanes` is: a lane that ran but could not
+  # reach the whole corpus returns FEWER results, not an error, so nothing else in the
+  # response distinguishes it from a corpus that genuinely holds nothing.
+  defp maybe_put_under_fill(meta, {:partial, _results}),
+    do: Map.put(meta, :semantic_under_filled, true)
+
+  defp maybe_put_under_fill(meta, _semantic), do: meta
 
   defp search_mode(["keyword", "semantic"]), do: "combined"
   defp search_mode(["keyword"]), do: "keyword_only"
   defp search_mode(["semantic"]), do: "semantic_only"
   defp search_mode(_lanes), do: "none"
 
-  defp maybe_put_reason(meta, _key, {:ok, _results}), do: meta
   defp maybe_put_reason(meta, key, {:error, reason}), do: Map.put(meta, key, to_tag(reason))
+  defp maybe_put_reason(meta, _key, _lane), do: meta
 
   defp to_tag(reason) when is_atom(reason), do: Atom.to_string(reason)
   defp to_tag({tag, _detail}) when is_atom(tag), do: Atom.to_string(tag)
@@ -279,7 +307,7 @@ defmodule Loopctl.Corpus.Search do
   defp validate_dimension(_vector, _dim), do: {:error, :dimension_mismatch}
 
   defp ann(tenant_id, corpus, vector) do
-    inner_pool = VectorSearch.side_table_inner_pool(@lane_pool) * @corpus_pool_multiplier
+    inner_pool = inner_pool()
 
     inner =
       DocumentChunkEmbedding
@@ -311,7 +339,49 @@ defmodule Loopctl.Corpus.Search do
         VectorSearch.side_table_ef_search(inner_pool)
       )
 
-    read(tenant_id, query, opts)
+    case read(tenant_id, query, opts) do
+      {:ok, rows} when length(rows) < @lane_pool -> classify_fill(tenant_id, corpus, rows)
+      other -> other
+    end
+  end
+
+  # `side_table_ef_search/1` is `min(inner_pool, max_side_table_ef_search())`, and an HNSW
+  # scan inspects ~`ef_search` graph nodes regardless of the LIMIT — so an inner pool
+  # BELOW that ceiling asks for less breadth than the deployment already permits, which
+  # is exactly the breadth the `corpus_id` residual spends. The floor makes the pool track
+  # the CONFIGURED ceiling instead of a bare constant.
+  defp inner_pool do
+    max(
+      VectorSearch.side_table_inner_pool(@lane_pool) * @corpus_pool_multiplier,
+      VectorSearch.max_side_table_ef_search()
+    )
+  end
+
+  # A short lane is either a small corpus or a residual that emptied a saturated pool, and
+  # the two are indistinguishable from the result set alone. The BOUNDED probe below
+  # separates them: it counts the corpus's chunks only up to the lane pool, so it is a
+  # `LIMIT #{@lane_pool}` index scan and never an aggregate over the corpus. A probe that
+  # is itself shed leaves the lane reported as complete rather than inventing a
+  # degradation from a failed measurement.
+  defp classify_fill(tenant_id, corpus, rows) do
+    case corpus_chunks_up_to(tenant_id, corpus, @lane_pool) do
+      {:ok, available} when available > length(rows) -> {:partial, rows}
+      _outcome -> {:ok, rows}
+    end
+  end
+
+  defp corpus_chunks_up_to(tenant_id, corpus, cap) do
+    query =
+      from(c in DocumentChunk,
+        where: c.tenant_id == ^tenant_id and c.corpus_id == ^corpus.id,
+        limit: ^cap,
+        select: 1
+      )
+
+    case read(tenant_id, query, heavy_opts()) do
+      {:ok, rows} -> {:ok, length(rows)}
+      error -> error
+    end
   end
 
   # --- shared plumbing ---

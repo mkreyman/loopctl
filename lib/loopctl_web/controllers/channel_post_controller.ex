@@ -366,8 +366,10 @@ defmodule LoopctlWeb.ChannelPostController do
          Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       500 =>
-        {"The delete could not be recorded in the audit trail and was rolled back; " <>
-           "the post still exists. Retry the request.", "application/json", Schemas.ErrorResponse}
+        {"Audit write failed: the whole transaction rolled back, so the post was NOT " <>
+           "deleted and still exists. The body carries code audit_write_failed with a " <>
+           "caller-neutral message (the same one every audited mutation returns) — retry " <>
+           "the request.", "application/json", Schemas.ErrorResponse}
     }
   )
 
@@ -443,8 +445,10 @@ defmodule LoopctlWeb.ChannelPostController do
          "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       500 =>
-        {"The release could not be recorded in the audit trail and was rolled back; the post " <>
-           "is still quarantined. Retry the request.", "application/json", Schemas.ErrorResponse}
+        {"Audit write failed: the whole transaction rolled back, so the post was NOT " <>
+           "released and is still quarantined. The body carries code audit_write_failed " <>
+           "with a caller-neutral message (the same one every audited mutation returns) — " <>
+           "retry the request.", "application/json", Schemas.ErrorResponse}
     }
   )
 

@@ -731,15 +731,25 @@ defmodule LoopctlWeb.FallbackController do
   # US-43.2 AC-43.2.10: BOTH lanes of a heavy read were shed by the per-tenant gate.
   # A single shed lane never reaches here — the caller degrades to the surviving lane
   # and names the degradation in `meta`. This is the case where nothing ran, so it is
-  # reported as the transient capacity condition it is (503 + Retry-After) rather than
-  # as an empty result set, which a caller would read as "the corpus has nothing".
+  # reported as the transient capacity condition it is rather than as an empty result
+  # set, which a caller would read as "the corpus has nothing".
+  #
+  # 429, NOT 503, and the status is the load-bearing part: the SAME condition already
+  # has a rendering — `LoopctlWeb.Plugs.HeavyReadOverloadHandler` raising through to
+  # `ErrorJSON.render("429.json", ...)` — which answers 429 under this exact `code`.
+  # The code exists so a client can tell per-tenant heavy-read backpressure apart from a
+  # generic rate-limit 429; two statuses for one code would put that client back to
+  # guessing, decided only by whether the endpoint asked for `on_overload: :raise` or
+  # `:tag` — which is not observable to it. AC-43.2.10 forbids RAISING a 429 through to
+  # the agent, which this does not: the tag is caught, the lanes degrade first, and only
+  # a both-lanes shed reaches here, as a coded body with a Retry-After.
   def call(conn, {:error, :heavy_read_overloaded}) do
     conn
     |> put_resp_header("retry-after", "1")
-    |> put_status(:service_unavailable)
+    |> put_status(:too_many_requests)
     |> json(%{
       error: %{
-        status: 503,
+        status: 429,
         code: "heavy_read_overloaded",
         message:
           "This tenant has too many heavy reads in flight; the query was shed rather " <>

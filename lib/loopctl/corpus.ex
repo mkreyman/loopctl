@@ -249,6 +249,25 @@ defmodule Loopctl.Corpus do
   end
 
   @doc """
+  Whether `corpus_id` holds ANY chunk at all — the one aggregate `GET /corpora/:id`
+  reports.
+
+  Deliberately `exists?/1` (a `LIMIT 1` existence probe) rather than
+  `source_status/3`: that function's `GROUP BY source_ref` with its
+  `md5(string_agg(...))` aggregates the corpus's WHOLE chunk set before the page
+  limit applies, which is far more work than a boolean needs. Per-source counts and
+  hashes are `GET /corpora/:id/status`'s job (AC-43.2.6).
+  """
+  @spec any_chunks?(Ecto.UUID.t(), Ecto.UUID.t()) :: boolean()
+  def any_chunks?(tenant_id, corpus_id) when is_binary(tenant_id) and is_binary(corpus_id) do
+    AdminRepo.exists?(
+      from(c in DocumentChunk,
+        where: c.tenant_id == ^tenant_id and c.corpus_id == ^corpus_id
+      )
+    )
+  end
+
+  @doc """
   Per-SOURCE index state for `corpus_id` — one row per `source_ref` with its chunk
   count and a content hash over that source's chunks (US-43.2 AC-43.2.6).
 

@@ -85,6 +85,28 @@ defmodule LoopctlWeb.FallbackControllerTest do
       refute body["error"]["message"] =~ "post"
     end
 
+    # ONE code, ONE status. The same condition already had a rendering — the
+    # `HeavyReadOverloadHandler` `Plug.Exception` impl raising through to
+    # `ErrorJSON.render("429.json", ...)` — which answers 429 under this exact code. The
+    # code exists so a client can tell per-tenant heavy-read backpressure apart from a
+    # generic rate-limit 429; two statuses for one code would put it back to guessing,
+    # decided only by whether the endpoint asked for `on_overload: :raise` or `:tag`,
+    # which is not observable to it.
+    test "renders :heavy_read_overloaded as 429 — the status its other rendering uses",
+         %{conn: conn} do
+      conn = call_fallback(conn, {:error, :heavy_read_overloaded})
+
+      assert conn.status == 429
+      body = Jason.decode!(conn.resp_body)
+      assert body["error"]["status"] == 429
+      assert body["error"]["code"] == "heavy_read_overloaded"
+      assert Plug.Conn.get_resp_header(conn, "retry-after") == ["1"]
+
+      # Bound to the OTHER rendering rather than to a literal, so the two cannot drift.
+      assert body["error"]["code"] ==
+               LoopctlWeb.ErrorJSON.render("429.json", %{})[:error][:code]
+    end
+
     test "renders 429 for :rate_limited with default retry hint", %{conn: conn} do
       conn = call_fallback(conn, {:error, :rate_limited})
 

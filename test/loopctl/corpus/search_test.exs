@@ -263,6 +263,76 @@ defmodule Loopctl.Corpus.SearchTest do
 
       assert meta.lanes == ["keyword", "semantic"]
       assert [%{source_ref: "target.pdf"}] = results
+      refute Map.has_key?(meta, :semantic_under_filled)
+    end
+
+    # The version of the case above that CAN fail. The one above cannot: 41 rows against
+    # a >=1000-row inner pool can never empty the residual, and the suite's default stub
+    # is one vector per TENANT, so every chunk of a tenant sits at the same point and the
+    # ANN cannot prefer the noise corpus over the target.
+    #
+    # Here the noise EXCEEDS the inner pool and every noise vector is strictly nearer the
+    # query than the target's, so the pool can only be noise however the planner serves
+    # it — an exact sort and an HNSW scan both exclude the target — and the `corpus_id`
+    # residual empties it. That is the silently-empty search the story names, and what is
+    # asserted is that it is no longer SILENT.
+    test "an under-filled semantic lane is named rather than answering an empty set" do
+      tenant = fixture(:tenant)
+      target = create_corpus!(tenant.id)
+      noise = create_corpus!(tenant.id)
+
+      near = fn nudge -> [1.0, nudge] ++ List.duplicate(0.0, 1534) end
+      far = [0.0, 0.0, 1.0] ++ List.duplicate(0.0, 1533)
+
+      # Per-CHUNK distinguishable, and keyed on the TEXT so the query and the noise land
+      # together while the target's single chunk lands far away.
+      vector = fn
+        "target " <> _rest -> far
+        text -> near.(:erlang.phash2(text, 1000) / 1_000_000)
+      end
+
+      stub(Loopctl.MockEmbeddingClient, :generate_embeddings, fn _scope, texts, _opts ->
+        {:ok, Enum.map(texts, vector)}
+      end)
+
+      stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _scope, text, _opts ->
+        {:ok, vector.(text)}
+      end)
+
+      index!(tenant.id, target, [chunk("target.pdf", 1, "target rendering provider")])
+
+      # Above the inner pool, which is at least `max_side_table_ef_search/0` (1000).
+      for batch <- Enum.chunk_every(1..1010, 200) do
+        index!(
+          tenant.id,
+          noise,
+          for(page <- batch, do: chunk("noise.pdf", page, "filler #{page}"))
+        )
+      end
+
+      # A query the KEYWORD lane cannot rescue: it matches nothing in either corpus, so
+      # what comes back is the semantic lane alone.
+      {:ok, %{results: results, meta: meta}} =
+        Search.search(tenant.id, target.id, "zorbitrandex")
+
+      assert results == []
+      assert meta.semantic_under_filled == true
+      assert "semantic" in meta.lanes
+    end
+
+    # The discriminator: a corpus that simply holds fewer chunks than the lane pool has
+    # NOT under-filled, and reporting every small corpus as degraded would make the
+    # signal meaningless.
+    test "a corpus smaller than the lane pool is not reported under-filled" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      index!(tenant.id, corpus, [chunk("a.pdf", 1, "rendering provider taxonomy code")])
+
+      {:ok, %{results: results, meta: meta}} = Search.search(tenant.id, corpus.id, "taxonomy")
+
+      assert length(results) == 1
+      refute Map.has_key?(meta, :semantic_under_filled)
     end
   end
 end

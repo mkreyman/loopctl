@@ -28,25 +28,46 @@ defmodule Loopctl.Corpus.Indexer do
   (`replaced`) without re-embedding. Deciding both on the hash silently discarded a
   corrected snippet and left no later re-index able to apply it.
 
-  ## Pruning is reconciliation, never inference
+  ## Pruning is reconciliation against a DECLARED chunk set, never inference
 
-  A batch is not a document. A large document split across several bounded batches
-  would otherwise have batch one delete the chunks batches two and three are about
-  to send. So the request NAMES the sources it carries in full
-  (`source_complete: [source_ref, ...]`) and only those are reconciled — a source
-  whose chunk set shrank has its surplus chunks deleted, so a document that lost a
-  page stops serving it.
+  A batch is not a document. So the request NAMES the sources it is reconciling
+  (`source_complete`) and only those are touched — a source whose chunk set shrank has
+  its surplus chunks deleted, so a document that lost a page stops serving it.
 
-  A `source_ref` may be named ONLY if the same request carries at least one chunk
-  for it. That is what keeps the verb below the `:user` line: no request can prune
-  content it does not resend, and re-indexing the file restores what a prune took.
+  A name carries the source's COMPLETE chunk set, in one of two forms:
 
-  Reconciliation is therefore scoped to ONE request and bounded by `max_batch_size/0`:
-  a named source is reconciled against the chunks THAT request carries, so naming a
-  source on the last batch of a split document deletes the earlier batches. A source
-  larger than one batch is indexed across batches WITHOUT being named, and simply not
-  reconciled — the `batch_too_large` message says so in the same words, and
-  `pruned_by_source` in the response reports exactly what each named source lost.
+    * `"a.pdf"` — the complete set is what THIS request carries for `"a.pdf"`. The
+      form for a document that fits in one batch.
+    * `%{"source_ref" => "big.pdf", "locators" => [loc, ...]}` — the complete set is
+      the DECLARED locator manifest, which may name chunks earlier batches of the same
+      re-index wrote. The form for a document larger than `max_batch_size/0`.
+
+  The manifest form is what makes a large document reconcilable at all. Without it a
+  source of more than `max_batch_size/0` chunks could never be named — naming it on the
+  batch that completed it deleted what the earlier batches had just written, and not
+  naming it pruned nothing — so a 500-chunk book that lost page 47 kept serving page 47
+  forever, and the only removal path was destroying the whole corpus. With it, the
+  completing batch names the source and lists the document's locators, and nothing an
+  earlier batch wrote is deleted.
+
+  Two rules keep the verb below the `:user` line, and they are what make "no request
+  prunes content it did not account for" TRUE rather than asserted:
+
+    * a `source_ref` may be named ONLY if the same request carries at least one chunk
+      for it, and
+    * every chunk the request carries for a named source must appear in that source's
+      manifest — otherwise the request would write a chunk and delete it in the same
+      transaction.
+
+  And a BARE name — which declares no manifest — may delete at most as many chunks as the
+  request carried for that source (`refute_runaway_prune/4`). Without that interlock a
+  request carrying ONE chunk of a 5,000-chunk source deleted 4,999 rows, which is a
+  set-based delete however it is named. A caller genuinely removing most of a document
+  says so with a manifest.
+
+  The delete set is therefore the exact complement of a set the caller wrote down, per
+  source, and re-indexing the file restores what a prune took. `pruned_by_source` in
+  the response reports what each name cost, and the audit entry records the same map.
 
   ## Over-long chunks
 
@@ -81,6 +102,16 @@ defmodule Loopctl.Corpus.Indexer do
   @spec max_batch_size() :: pos_integer()
   def max_batch_size, do: @max_batch_size
 
+  # The ceiling on ONE source's declared locator manifest. Unlike the batch ceiling
+  # this does not bound the WRITE — a manifest carries no content — it bounds the set
+  # the request asks the server to hold in memory while it resolves the keep set. Read
+  # by the guard and by the OpenAPI `maxItems`, the same way `@max_batch_size` is.
+  @max_source_manifest 20_000
+
+  @doc "The maximum number of locators one `source_complete` manifest may declare."
+  @spec max_source_manifest() :: pos_integer()
+  def max_source_manifest, do: @max_source_manifest
+
   @type item_report :: %{source_ref: String.t(), locator: term(), status: atom()}
 
   @type error ::
@@ -91,6 +122,10 @@ defmodule Loopctl.Corpus.Indexer do
           | {:invalid_chunk, non_neg_integer(), String.t() | Ecto.Changeset.t()}
           | {:duplicate_chunk_key, {String.t(), term()}}
           | {:source_complete_not_carried, [term()]}
+          | {:source_complete_invalid, term()}
+          | {:source_manifest_too_large, String.t(), pos_integer()}
+          | {:source_manifest_omits_carried, String.t(), [term()]}
+          | {:prune_exceeds_carried, String.t(), non_neg_integer(), non_neg_integer()}
           | {:embedding_failed, term(), [map()]}
           | {:write_failed, term(), term()}
 
@@ -102,8 +137,12 @@ defmodule Loopctl.Corpus.Indexer do
 
   `opts`:
 
-    * `:source_complete` — the `source_ref`s this request carries in FULL. Only
-      these are reconciled, and each must be carried by the batch.
+    * `:source_complete` — the sources to RECONCILE. Each member is either a
+      `source_ref` string (the complete set is what this request carries for it) or
+      `%{"source_ref" => ref, "locators" => [locator, ...]}` (the complete set is the
+      declared manifest, so a document spanning several batches can be reconciled on
+      the batch that completes it). Each named source must be carried by the batch,
+      and every carried chunk of it must appear in its manifest.
     * `:audit` — the actor-context keyword list from
       `LoopctlWeb.AuditContext.from_conn/1`.
 
@@ -202,12 +241,41 @@ defmodule Loopctl.Corpus.Indexer do
     end
   end
 
-  # AC-43.2.3: a source may be named complete ONLY if this request carries at least
-  # one chunk for it. Naming a source the batch does not carry would let one request
-  # prune content it never resent — a set-based delete wearing an index request's
-  # clothes, and the reason this verb could not otherwise stay at `role: :agent`.
+  # AC-43.2.3. Normalises every member to `%{source_ref: ref, locators: manifest | nil}`
+  # and enforces the two rules that bound the delete:
+  #
+  #   * a source may be named ONLY if this request carries at least one chunk for it,
+  #     and
+  #   * every carried chunk of a named source must appear in that source's manifest —
+  #     otherwise the request would write a chunk and delete it in the same transaction.
+  #
+  # `nil` locators means "the complete set is what this request carries", which is the
+  # bare-string form and the whole document for anything that fits in one batch.
   defp validate_source_complete(_items, nil), do: {:ok, []}
   defp validate_source_complete(_items, []), do: {:ok, []}
+
+  defp validate_source_complete(items, members) when is_list(members) do
+    carried = carried_locators(items)
+
+    Enum.reduce_while(members, {:ok, []}, fn member, {:ok, acc} ->
+      case normalise_member(member, carried) do
+        {:ok, entry} -> {:cont, {:ok, [entry | acc]}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, entries} -> {:ok, entries |> Enum.reverse() |> Enum.uniq_by(& &1.source_ref)}
+      error -> error
+    end
+  end
+
+  # A `source_complete` that is not a LIST at all — `source_complete: "docs/837p.pdf"`,
+  # the obvious client mistake. It gets its OWN code rather than being folded into
+  # `source_complete_not_carried`, which would have told the caller that a source it DOES
+  # carry is not carried, with an empty `missing` list as the only evidence and no way to
+  # learn the real fault is the type.
+  defp validate_source_complete(_items, value),
+    do: {:error, {:source_complete_invalid, value}}
 
   # Every member is checked against the carried set, INCLUDING a non-binary one. Filtering
   # non-binaries out first discarded them BEFORE the carried-check could refuse them, so
@@ -215,18 +283,56 @@ defmodule Loopctl.Corpus.Indexer do
   # — a client that believed it had reconciled a shrunk document while the surplus chunks
   # stayed indexed and kept being returned by search. A `source_ref` column is a string,
   # so a non-binary is never carried and takes the same 422 the string case takes.
-  defp validate_source_complete(items, refs) when is_list(refs) do
-    carried = MapSet.new(items, & &1.source_ref)
-    refs = Enum.uniq(refs)
-
-    case Enum.reject(refs, &MapSet.member?(carried, &1)) do
-      [] -> {:ok, refs}
-      missing -> {:error, {:source_complete_not_carried, missing}}
+  defp normalise_member(source_ref, carried) when is_binary(source_ref) do
+    if Map.has_key?(carried, source_ref) do
+      {:ok, %{source_ref: source_ref, locators: nil}}
+    else
+      {:error, {:source_complete_not_carried, [source_ref]}}
     end
   end
 
-  defp validate_source_complete(_items, _refs),
-    do: {:error, {:source_complete_not_carried, []}}
+  defp normalise_member(member, carried) when is_map(member) and not is_struct(member),
+    do: normalise_object(stringify_keys(member), carried)
+
+  # A member that is neither a string nor an object is never carried — a `source_ref`
+  # column is a string — so it takes the carried refusal, which NAMES it rather than
+  # dropping it.
+  defp normalise_member(member, _carried),
+    do: {:error, {:source_complete_not_carried, [member]}}
+
+  defp normalise_object(%{"source_ref" => source_ref, "locators" => locators}, carried)
+       when is_binary(source_ref) and is_list(locators) do
+    with :ok <- refute_uncarried(source_ref, carried),
+         :ok <- refute_oversize_manifest(source_ref, locators) do
+      manifest = MapSet.new(locators, &Corpus.canonical_locator/1)
+
+      case Enum.reject(Map.fetch!(carried, source_ref), &MapSet.member?(manifest, &1)) do
+        [] -> {:ok, %{source_ref: source_ref, locators: manifest}}
+        omitted -> {:error, {:source_manifest_omits_carried, source_ref, omitted}}
+      end
+    end
+  end
+
+  defp normalise_object(object, _carried), do: {:error, {:source_complete_invalid, object}}
+
+  defp refute_uncarried(source_ref, carried) do
+    if Map.has_key?(carried, source_ref),
+      do: :ok,
+      else: {:error, {:source_complete_not_carried, [source_ref]}}
+  end
+
+  defp refute_oversize_manifest(source_ref, locators)
+       when length(locators) > @max_source_manifest,
+       do: {:error, {:source_manifest_too_large, source_ref, @max_source_manifest}}
+
+  defp refute_oversize_manifest(_source_ref, _locators), do: :ok
+
+  # `source_ref => [canonical locator]` for what this request carries, canonicalised the
+  # way Postgres compares jsonb so a manifest written `{"page": 1}` matches a carried
+  # `{"page": 1.0}` exactly as the unique index would.
+  defp carried_locators(items) do
+    Enum.group_by(items, & &1.source_ref, &Corpus.canonical_locator(&1.locator))
+  end
 
   # --- classification ---
 
@@ -374,8 +480,21 @@ defmodule Loopctl.Corpus.Indexer do
       items
       |> Enum.reduce(Multi.new(), &add_item(&2, tenant_id, corpus, &1))
       |> add_prunes(tenant_id, corpus, complete, items)
-      |> Audit.log_in_multi(:audit, fn _changes ->
-        audit_attrs(tenant_id, corpus, items, complete, audit)
+      # The prune steps run BEFORE this one, so `changes` already carries every prune
+      # count — which is why the closure reads its argument rather than discarding it.
+      # `POST /corpora/:id/index` is the one index verb that DESTROYS data and it is held
+      # at `role: :agent` on the argument that its delete is bounded and attributable, so
+      # an append-only log that could not say what an agent-role key deleted would not be
+      # answering the question the gate is justified by.
+      |> Audit.log_in_multi(:audit, fn changes ->
+        audit_attrs(
+          tenant_id,
+          corpus,
+          items,
+          complete,
+          audit,
+          pruned_by_source(changes, complete)
+        )
       end)
 
     case AdminRepo.transaction(multi) do
@@ -399,6 +518,12 @@ defmodule Loopctl.Corpus.Indexer do
       # mis-mapping an audit failure onto a write failure.
       {:error, :audit, %Ecto.Changeset{}, _changes} ->
         {:error, :audit_write_failed}
+
+      # The bare-name interlock, raised from inside the prune step so the whole request
+      # rolls back. Mapped to its OWN term (a 422 the caller can act on), never to the
+      # generic write failure, whose 500 would read as a server fault.
+      {:error, {:prune, _ref}, {:prune_exceeds_carried, _, _, _} = reason, _changes} ->
+        {:error, reason}
 
       {:error, step, reason, _changes} ->
         {:error, {:write_failed, step, reason}}
@@ -469,14 +594,23 @@ defmodule Loopctl.Corpus.Indexer do
   # Prune steps are added AFTER every chunk step, so `changes` already carries the
   # ids this request wrote and the kept set is exact. Deleting by id (rather than by
   # "locator NOT IN") is what keeps the comparison out of jsonb entirely.
+  #
+  # The kept set is the ids this request wrote or confirmed, PLUS — for a manifest name —
+  # the ids of stored chunks the manifest declares. That second half is what lets a
+  # document larger than `max_batch_size/0` be reconciled at all: the completing batch
+  # lists the document's locators, so the chunks earlier batches wrote are kept instead of
+  # deleted. A bare name declares no manifest and reconciles against the carried set alone.
   defp add_prunes(multi, tenant_id, corpus, complete, items) do
-    Enum.reduce(complete, multi, fn source_ref, acc ->
+    Enum.reduce(complete, multi, fn %{source_ref: source_ref, locators: manifest}, acc ->
       of_source = Enum.filter(items, &(&1.source_ref == source_ref))
       unchanged = for i <- of_source, i.rewrite == :none, do: i.chunk_id
       written = for i <- of_source, i.rewrite != :none, do: i.index
 
       Multi.run(acc, {:prune, source_ref}, fn repo, changes ->
-        kept = unchanged ++ Enum.map(written, &Map.fetch!(changes, {:chunk, &1}).id)
+        kept =
+          unchanged ++
+            Enum.map(written, &Map.fetch!(changes, {:chunk, &1}).id) ++
+            declared_ids(repo, tenant_id, corpus, source_ref, manifest)
 
         {count, _} =
           from(c in DocumentChunk,
@@ -486,16 +620,60 @@ defmodule Loopctl.Corpus.Indexer do
           )
           |> repo.delete_all()
 
-        {:ok, count}
+        refute_runaway_prune(source_ref, manifest, count, length(of_source))
       end)
     end)
   end
 
-  defp pruned_by_source(changes, complete) do
-    Map.new(complete, fn source_ref -> {source_ref, Map.get(changes, {:prune, source_ref}, 0)} end)
+  # The BARE-name safety interlock, and the reason `POST /corpora/:id/index` can hold its
+  # `role: :agent` gate honestly.
+  #
+  # A bare name asserts "the complete set is what I carry", and the server cannot tell a
+  # genuine shrink from a client that named the source on the LAST batch of a split
+  # document — both look like "carries fewer chunks than are stored". Unguarded, one
+  # request carrying ONE chunk of a 5,000-chunk source deleted 4,999 rows and their
+  # vectors, which is a set-based delete wearing an index request's clothes.
+  #
+  # So a bare name may delete at most as many chunks as the request carried for that
+  # source. A real reconciliation resends the document and removes a few pages, which
+  # clears this comfortably; the batch-3-of-3 mistake does not. The refusal happens INSIDE
+  # the transaction, after the delete has counted itself, so the whole request rolls back
+  # and nothing is lost. A caller that really is removing most of a document declares the
+  # surviving locators explicitly — the manifest form, which is exempt precisely because
+  # the caller then wrote the keep set down.
+  defp refute_runaway_prune(_source_ref, manifest, count, _carried) when manifest != nil,
+    do: {:ok, count}
+
+  defp refute_runaway_prune(source_ref, _manifest, count, carried) when count > carried,
+    do: {:error, {:prune_exceeds_carried, source_ref, count, carried}}
+
+  defp refute_runaway_prune(_source_ref, _manifest, count, _carried), do: {:ok, count}
+
+  # The stored chunks of `source_ref` whose locator the manifest declares. Resolved to
+  # IDS here, in Elixir, against `Corpus.canonical_locator/1` — the same normalisation the
+  # duplicate-key guard uses and the one jsonb itself applies — so the delete stays an
+  # `id not in` and never becomes a jsonb comparison in the WHERE clause.
+  defp declared_ids(_repo, _tenant_id, _corpus, _source_ref, nil), do: []
+
+  defp declared_ids(repo, tenant_id, corpus, source_ref, manifest) do
+    from(c in DocumentChunk,
+      where:
+        c.tenant_id == ^tenant_id and c.corpus_id == ^corpus.id and
+          c.source_ref == ^source_ref,
+      select: %{id: c.id, locator: c.locator}
+    )
+    |> repo.all()
+    |> Enum.filter(&MapSet.member?(manifest, Corpus.canonical_locator(&1.locator)))
+    |> Enum.map(& &1.id)
   end
 
-  defp audit_attrs(tenant_id, corpus, items, complete, audit) do
+  defp pruned_by_source(changes, complete) do
+    Map.new(complete, fn %{source_ref: source_ref} ->
+      {source_ref, Map.get(changes, {:prune, source_ref}, 0)}
+    end)
+  end
+
+  defp audit_attrs(tenant_id, corpus, items, complete, audit, pruned_by_source) do
     counts = Enum.frequencies_by(items, & &1.status)
 
     %{
@@ -511,7 +689,9 @@ defmodule Loopctl.Corpus.Indexer do
         "inserted" => Map.get(counts, :inserted, 0),
         "replaced" => Map.get(counts, :replaced, 0),
         "unchanged" => Map.get(counts, :unchanged, 0),
-        "source_complete" => complete
+        "pruned" => pruned_by_source |> Map.values() |> Enum.sum(),
+        "pruned_by_source" => pruned_by_source,
+        "source_complete" => Enum.map(complete, & &1.source_ref)
       },
       metadata: Keyword.get(audit, :metadata, %{})
     }
