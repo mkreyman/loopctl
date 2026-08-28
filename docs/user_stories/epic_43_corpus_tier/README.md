@@ -101,6 +101,36 @@ forget. That is a positive argument for a distinct tier rather than an article
 subtype, and US-43.1 carries a guard test so the property is asserted rather than
 assumed.
 
+## Reuse boundaries the implementation must respect
+
+Surveyed against master 2026-08-27. Each of these is a place where writing new code
+instead of reusing the existing machinery reintroduces a defect this repo has already
+paid for:
+
+| reuse | why not writing it fresh |
+|---|---|
+| `HnswIndex.create_dimension_index_sql/2` for the index, `VectorSearch.index_safe_dimension_knn_base/6` for the query | the vector cast must be CHARACTER-IDENTICAL on both sides or the planner cannot match them, and both the dim and the typmod must be compile-time literals — a bound `$1` disqualifies the partial index under a generic plan and reverts to a seq scan (the #170/#172 outage) |
+| the one-Multi batch shape of `Embeddings.upsert_article_embeddings/3` | its per-item predecessor opened ~100 transactions on a 3-connection pool with no atomicity, so a failure at item 60 left 59 rows written and re-billed the provider for all 100 on retry |
+| `Audit.log_in_multi/3` inside the mutation's own Multi | a post-commit audit append can silently not record a transition that happened |
+| the `EmbeddingBehaviour` client and `ShrinkLadder` | vectors must map back by the response's `index` field never by array position, a partial response must fail the batch, and a truncated vector must be marked in the content hash or re-indexing reads it as unchanged forever |
+
+Two column-naming constraints follow from the first row and are not cosmetic. The
+embeddings table's columns must be named exactly `tenant_id`, `dim`, `embedding` and
+`live_denorm`, because the query builder is schema-parameterized on those names — and
+`live_denorm` must EXIST even though a chunk has no supersession state, because the
+shared index SQL emits `WHERE dim = N AND live_denorm`. It is deliberately inert: the
+column is load-bearing, the trigger pair is not.
+
+## The dimension resolvers are both wrong here, and one of them writes
+
+`Embeddings.active_dimension/1` resolves per tenant and would return 1536 for a 768
+corpus. `resolve_write_dimension/1` is the worse trap: it PINS
+`tenants.tenant_embedding_dimension` and `tenant_embedding_model` as a side effect, so
+one corpus write by a tenant that had not yet embedded an article would pin that
+tenant's ARTICLE corpus to the local document model. The corpus's own `dim` is read
+from the corpus row and from nowhere else, and US-43.1 carries a test asserting
+neither resolver is referenced on this path.
+
 ## Role gating
 
 Applying the CLAUDE.md checklist rather than inheriting the KB's answers:

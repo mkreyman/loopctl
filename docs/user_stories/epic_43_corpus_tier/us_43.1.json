@@ -1,7 +1,10 @@
 {
   "id": "US-43.1",
   "title": "Corpus storage: a corpus that pins its own dimension, and chunks excluded from the article corpus by construction",
-  "epic": { "id": "epic_43", "name": "Corpus Tier" },
+  "epic": {
+    "id": "epic_43",
+    "name": "Corpus Tier"
+  },
   "priority": "high",
   "phase": "foundation",
   "background": "loopctl already stores dimension-tagged vectors well: article_embeddings uses an unconstrained vector column with an explicit dim discriminator and a vector_dims(embedding) = dim CHECK (priv/repo/migrations/20260721000100_create_embedding_side_tables.exs), and per-dimension HNSW indexes are built from one single-sourced SQL generator (lib/loopctl/repo/hnsw_index.ex) over Loopctl.Embeddings.supported_dimensions/0, currently [768, 1024, 1536]. What it does not have is anywhere to put a VERBATIM document chunk. The corpus tier needs three tables and one decision that the originating issue did not make: where the embedding dimension is pinned. Loopctl.Embeddings.active_dimension/1 resolves a dimension per TENANT, and the 20260721000300 migration pinned it deliberately so the stored corpus's actual shape, not a mutable model setting, is authoritative. A tenant whose article corpus is pinned at 1536 will index a document corpus with a LOCAL 768-dimension model, and both must coexist in the same tenant at the same time. Reading the tenant pin for a corpus makes the epic's first consumer unimplementable.",
@@ -24,7 +27,7 @@
     },
     {
       "id": "AC-43.1.3",
-      "description": "A `document_chunk_embeddings` table mirrors article_embeddings exactly in shape and constraint set: tenant_id, document_chunk_id (FK, ON DELETE CASCADE), dim (integer, CHECK dim > 0), embedding (UNCONSTRAINED vector), embedding_content_hash, timestamps, plus a CONSTRAINT document_chunk_embeddings_dim_matches_vector CHECK (vector_dims(embedding) = dim) and a unique index on (tenant_id, document_chunk_id, dim). It carries NO live_denorm column: a chunk has no supersession state, so the trigger pair that article_embeddings needs has nothing to mirror here and adding one would be dead machinery.",
+      "description": "A `document_chunk_embeddings` table mirrors article_embeddings exactly in shape and constraint set, and its columns are named EXACTLY tenant_id, dim, embedding and live_denorm: those four names are what let the schema-parameterized query builder Loopctl.Knowledge.VectorSearch.index_safe_dimension_knn_base/6 be reused unchanged. It carries tenant_id, document_chunk_id (FK, ON DELETE CASCADE), dim (integer, CHECK dim > 0), embedding (UNCONSTRAINED vector), live_denorm (boolean NOT NULL DEFAULT true), embedding_content_hash, timestamps, a CONSTRAINT document_chunk_embeddings_dim_matches_vector CHECK (vector_dims(embedding) = dim), and a unique index on (tenant_id, document_chunk_id, dim). live_denorm carries NO TRIGGER and is never written false: a chunk has no supersession state, so the PL/pgSQL trigger pair article_embeddings needs has nothing to mirror. The COLUMN is still required — HnswIndex.create_dimension_index_sql/2 emits WHERE dim = N AND live_denorm, and maybe_live_denorm_only/2 adds the matching query predicate — so dropping it would fork both the index SQL and the query builder. A comment in the migration records that the column is load-bearing for index reuse and deliberately inert, so nobody later removes it as dead.",
       "status": "pending"
     },
     {
@@ -34,7 +37,7 @@
     },
     {
       "id": "AC-43.1.5",
-      "description": "Per-dimension partial HNSW expression indexes are created on document_chunk_embeddings for every value of Loopctl.Embeddings.supported_dimensions/0, using Loopctl.Repo.HnswIndex.create_dimension_index_sql/2 — the SAME generator the article/memory side tables use, so build parameters (m, ef_construction) cannot drift between tiers. The migration uses CREATE INDEX CONCURRENTLY with @disable_ddl_transaction and @disable_migration_lock, matching 20260721000200.",
+      "description": "Per-dimension partial HNSW expression indexes are created on document_chunk_embeddings for every value of Loopctl.Embeddings.supported_dimensions/0 using Loopctl.Repo.HnswIndex.create_dimension_index_sql/2 — the SAME generator the article and memory side tables use, so the cast expression stays CHARACTER-IDENTICAL between the index and the query (the planner cannot match them otherwise) and the build parameters m and ef_construction cannot drift between tiers. The new table is ADDED to HnswIndex's @side_tables list, so the missing_dimension_indexes/1 drift guard covers it — a dimension published in config but never index-built makes every read at that dimension seq-scan the corpus, which is the #170/#172 class of outage. The migration uses CREATE INDEX CONCURRENTLY with @disable_ddl_transaction and @disable_migration_lock, matching 20260721000200, and is a SEPARATE file from the table creation.",
       "status": "pending"
     },
     {
@@ -61,6 +64,16 @@
       "id": "AC-43.1.10",
       "description": "Loopctl.Corpus context module exposes create_corpus/2, get_corpus/2, list_corpora/2, delete_corpus/2, upsert_chunks/3 and delete_chunks_for_source/3, every one taking tenant_id as its first argument, with tenant_id never in a changeset cast. No HTTP surface is added in this story — the API and MCP tools are US-43.2 and US-43.4.",
       "status": "pending"
+    },
+    {
+      "id": "AC-43.1.11",
+      "description": "Neither Loopctl.Embeddings.active_dimension/1 NOR resolve_write_dimension/1 is called anywhere on the corpus path, and a test asserts the Corpus modules reference neither. active_dimension/1 resolves per TENANT and would silently return 1536 for a 768 corpus. resolve_write_dimension/1 is worse than wrong: it PINS tenants.tenant_embedding_dimension and tenant_embedding_model as a side effect, so one corpus write by a tenant that had not yet embedded an article would pin that tenant's ARTICLE corpus to the local document model. The corpus's own dim is read from the corpus row and from nowhere else.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.1.12",
+      "description": "document_chunks and document_chunk_embeddings are append-heavy and get the same autovacuum tuning the existing embedding tables carry (autovacuum_analyze_scale_factor 0.05, autovacuum_vacuum_insert_scale_factor 0.1, per migration 20260804230000). This matters more here than for articles: a corpus re-index rewrites whole documents at once, so dead tuples arrive in bursts, and the standing finding that pgvector HNSW skips dead index entries — making a live row UNREACHABLE rather than merely slow — means an untuned table degrades recall silently rather than visibly.",
+      "status": "pending"
     }
   ],
   "test_cases": [
@@ -68,72 +81,132 @@
       "id": "TC-43.1.1",
       "name": "a corpus pins its own dimension independent of the tenant pin",
       "type": "integration",
-      "preconditions": ["a tenant whose tenant_embedding_dimension is pinned at 1536"],
-      "steps": ["create a corpus with dim 768 and embedding_model nomic-embed-text", "insert a chunk and a 768-length vector"],
-      "expected_results": ["the corpus is created", "the vector stores without violating the CHECK", "Embeddings.active_dimension/1 for the tenant still returns 1536", "articles in the same tenant continue to embed and search at 1536"],
+      "preconditions": [
+        "a tenant whose tenant_embedding_dimension is pinned at 1536"
+      ],
+      "steps": [
+        "create a corpus with dim 768 and embedding_model nomic-embed-text",
+        "insert a chunk and a 768-length vector"
+      ],
+      "expected_results": [
+        "the corpus is created",
+        "the vector stores without violating the CHECK",
+        "Embeddings.active_dimension/1 for the tenant still returns 1536",
+        "articles in the same tenant continue to embed and search at 1536"
+      ],
       "status": "pending"
     },
     {
       "id": "TC-43.1.2",
       "name": "a wrong-length vector cannot be stored even bypassing the changeset",
       "type": "integration",
-      "preconditions": ["a corpus at dim 768"],
-      "steps": ["insert a document_chunk_embeddings row with a 1536-length vector and dim 768 via raw SQL"],
-      "expected_results": ["the insert fails on document_chunk_embeddings_dim_matches_vector"],
+      "preconditions": [
+        "a corpus at dim 768"
+      ],
+      "steps": [
+        "insert a document_chunk_embeddings row with a 1536-length vector and dim 768 via raw SQL"
+      ],
+      "expected_results": [
+        "the insert fails on document_chunk_embeddings_dim_matches_vector"
+      ],
       "status": "pending"
     },
     {
       "id": "TC-43.1.3",
       "name": "dim, mode and embedding_model are immutable after creation",
       "type": "unit",
-      "preconditions": ["an existing corpus"],
-      "steps": ["build an update changeset attempting to change dim", "repeat for mode", "repeat for embedding_model"],
-      "expected_results": ["each changeset is invalid or leaves the field unchanged", "no path in the context module can alter any of the three"],
+      "preconditions": [
+        "an existing corpus"
+      ],
+      "steps": [
+        "build an update changeset attempting to change dim",
+        "repeat for mode",
+        "repeat for embedding_model"
+      ],
+      "expected_results": [
+        "each changeset is invalid or leaves the field unchanged",
+        "no path in the context module can alter any of the three"
+      ],
       "status": "pending"
     },
     {
       "id": "TC-43.1.4",
       "name": "an unsupported dimension is refused at creation",
       "type": "unit",
-      "preconditions": ["supported_dimensions/0 returns [768, 1024, 1536]"],
-      "steps": ["create a corpus with dim 3072"],
-      "expected_results": ["creation fails", "the error names the supported set and says a new dimension needs a migration"],
+      "preconditions": [
+        "supported_dimensions/0 returns [768, 1024, 1536]"
+      ],
+      "steps": [
+        "create a corpus with dim 3072"
+      ],
+      "expected_results": [
+        "creation fails",
+        "the error names the supported set and says a new dimension needs a migration"
+      ],
       "status": "pending"
     },
     {
       "id": "TC-43.1.5",
       "name": "tenant isolation on all three tables",
       "type": "integration",
-      "preconditions": ["tenant A and tenant B each with a corpus, chunks and chunk embeddings"],
-      "steps": ["as tenant A, list corpora, chunks and embeddings through Loopctl.Repo"],
-      "expected_results": ["only tenant A rows are returned from each of the three tables"],
+      "preconditions": [
+        "tenant A and tenant B each with a corpus, chunks and chunk embeddings"
+      ],
+      "steps": [
+        "as tenant A, list corpora, chunks and embeddings through Loopctl.Repo"
+      ],
+      "expected_results": [
+        "only tenant A rows are returned from each of the three tables"
+      ],
       "status": "pending"
     },
     {
       "id": "TC-43.1.6",
       "name": "chunks are invisible to the article-corpus paths",
       "type": "unit",
-      "preconditions": ["the recall, heat, novelty and consolidation modules on this branch"],
-      "steps": ["inspect each for a reference to DocumentChunk or DocumentChunkEmbedding"],
-      "expected_results": ["zero references", "the set of modules inspected is non-empty"],
+      "preconditions": [
+        "the recall, heat, novelty and consolidation modules on this branch"
+      ],
+      "steps": [
+        "inspect each for a reference to DocumentChunk or DocumentChunkEmbedding"
+      ],
+      "expected_results": [
+        "zero references",
+        "the set of modules inspected is non-empty"
+      ],
       "status": "pending"
     },
     {
       "id": "TC-43.1.7",
       "name": "a heavy read joining chunks to embeddings scopes both sources",
       "type": "unit",
-      "preconditions": ["a query joining document_chunks to document_chunk_embeddings"],
-      "steps": ["pass it to HeavyRead with a tenant_id", "then pass a variant that scopes only the from source"],
-      "expected_results": ["the fully scoped query is accepted", "the partially scoped variant is rejected by guard!/2"],
+      "preconditions": [
+        "a query joining document_chunks to document_chunk_embeddings"
+      ],
+      "steps": [
+        "pass it to HeavyRead with a tenant_id",
+        "then pass a variant that scopes only the from source"
+      ],
+      "expected_results": [
+        "the fully scoped query is accepted",
+        "the partially scoped variant is rejected by guard!/2"
+      ],
       "status": "pending"
     },
     {
       "id": "TC-43.1.8",
       "name": "corpus delete cascades",
       "type": "integration",
-      "preconditions": ["a corpus with 3 chunks, each with an embedding"],
-      "steps": ["delete the corpus row"],
-      "expected_results": ["zero document_chunks rows remain for that corpus", "zero document_chunk_embeddings rows remain"],
+      "preconditions": [
+        "a corpus with 3 chunks, each with an embedding"
+      ],
+      "steps": [
+        "delete the corpus row"
+      ],
+      "expected_results": [
+        "zero document_chunks rows remain for that corpus",
+        "zero document_chunk_embeddings rows remain"
+      ],
       "status": "pending"
     }
   ],
@@ -144,7 +217,10 @@
     "The per-dimension HNSW migration must be a SEPARATE migration file from the table creation, exactly as 20260721000200 is separate from 20260721000100, because CREATE INDEX CONCURRENTLY cannot run inside the DDL transaction the table creation uses.",
     "AC-43.1.8's guard test is the one most likely to be written vacuously. Anchor it to the modules by name, assert the inspected set is non-empty, and verify it by mutation: temporarily add a reference to DocumentChunk in the recall module and confirm the test fails. A guard that passes against a deliberately broken tree is not a guard.",
     "allow_snippets on the corpus is created in this story but is only ENFORCED in US-43.3, where mode B's snippet policy lives. Creating the column here avoids a second migration on the same table.",
-    "Do not add a corpus-level updated-at-driven re-embed path. Re-dimensioning a corpus is delete-and-re-index by design: the source files are the truth and nothing distilled would be lost."
+    "Do not add a corpus-level updated-at-driven re-embed path. Re-dimensioning a corpus is delete-and-re-index by design: the source files are the truth and nothing distilled would be lost.",
+    "The unique index in AC-43.1.2 puts a jsonb column in a btree, which Postgres allows but caps at ~2704 bytes per index entry; an index insert over that raises. Locators are small in every anticipated use (a page number, a byte range, a heading path), but the migration should note the cap, and if a client ever needs a large locator the fix is a generated locator_hash column in the index rather than widening the entry.",
+    "Reuse index_safe_dimension_knn_base/6 rather than writing a KNN query. It emits ONLY the predicates the partial index carries — tenant_id equality, the dimension literal, live_denorm, the cast ORDER BY, and LIMIT — and both the dim literal and the vector typmod are COMPILE-TIME literals, one function clause per supported dimension. That is deliberate: under a Postgres generic plan the planner cannot prove dim = $1 implies dim = 768, so a bound parameter disqualifies the partial index and reverts to a seq scan plus sort. Anything selective added to that inner query is the same regression.",
+    "Follow priv/repo/migrations/20260721000100_create_embedding_side_tables.exs closely — it is the reference implementation, and its moduledoc records why each decision was made. Note that RlsHelpers.enable_rls/1's own docstring claims it executes FORCE ROW LEVEL SECURITY and the code does not; trust the code. ENABLE alone is correct here because in production the table owner is schema_admin WITHOUT BYPASSRLS."
   ],
   "dependencies": [],
   "estimated_tokens": 260000

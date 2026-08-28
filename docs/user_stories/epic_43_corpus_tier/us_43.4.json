@@ -1,7 +1,10 @@
 {
   "id": "US-43.4",
   "title": "The corpus_* tool surface, and a routing rule that says when to reach for it",
-  "epic": { "id": "epic_43", "name": "Corpus Tier" },
+  "epic": {
+    "id": "epic_43",
+    "name": "Corpus Tier"
+  },
   "priority": "high",
   "phase": "adoption",
   "background": "After US-43.3 the tier is complete and unreachable from an agent, which is the state a capability dies in. This repo has a measured case: knowledge_context was allowlisted everywhere, documented, and got ONE call in roughly 2100 searches. The audit that found it also found that availability is not what drives tool choice — agents run the verb the protocol prescribes, so the protocol has to prescribe it. A new search verb with no line in a routing table saying which question shape it answers is a tool that exists and is never called. This story therefore has two halves of comparable weight: the mcp-server tool definitions, and the routing prose that makes an agent reach for corpus_search instead of knowledge_search at the right moment.",
@@ -39,7 +42,7 @@
     },
     {
       "id": "AC-43.4.6",
-      "description": "Agent allowlists are updated so the roles that should call these tools can: read and search tools are available to agent-role keys, corpus_delete is not exposed to a key that cannot use it. A tool visible in ListTools that always 403s is a worse experience than one that is absent, so visibility follows capability.",
+      "description": "Role visibility is handled honestly rather than invented. There is NO role filtering in the MCP server's ListTools — it returns the static TOOLS array unconditionally plus the tenant's generated cr_* tools — and there is no server-side allowlist of MCP tool NAMES anywhere; role is enforced only by RequireRole on the HTTP endpoint, with the client choosing which env key to send. So corpus_delete is listed like every other tool and its description states that it is user-role and irreversible, and the story does NOT build an allowlist layer. Making the tools visible to SUBAGENTS is a separate matter: each agent definition in claude-config carries an explicit tools: frontmatter list, so a mcp__loopctl__corpus_* tool is invisible to every one of them until added there. That is a cross-repo change and is named in this story's closing report as unmade, not silently skipped.",
       "status": "pending"
     },
     {
@@ -51,6 +54,11 @@
       "id": "AC-43.4.8",
       "description": "An end-to-end test indexes a small corpus through the MCP tool surface and searches it, asserting the returned pointer identifies a chunk that was actually indexed. This is the only test in the epic that exercises the whole path an agent uses, and it is what proves the tier is reachable rather than merely present.",
       "status": "pending"
+    },
+    {
+      "id": "AC-43.4.9",
+      "description": "mcp-server/package.json is version-bumped in the SAME PR as the index.js, lib/ and README changes. The mcp-server-ci.yml version-bump job fails a PR that touches the published files without one, with the message that nothing publishes to npm without a version bump so agents keep the OLD tool descriptions while the server serves the new payload — a failure mode that shipped six times before the guard existed. The required branch-protection context is the MCP Server Gate job, not the Node unit tests job.",
+      "status": "pending"
     }
   ],
   "test_cases": [
@@ -58,45 +66,83 @@
       "id": "TC-43.4.1",
       "name": "each corpus tool builds the right path",
       "type": "unit",
-      "preconditions": ["the exported path builders in lib/http-helpers.js"],
-      "steps": ["call each with representative args"],
-      "expected_results": ["each produces the documented /api/v1 path", "unset optional params are omitted from the query string"],
+      "preconditions": [
+        "the exported path builders in lib/http-helpers.js"
+      ],
+      "steps": [
+        "call each with representative args"
+      ],
+      "expected_results": [
+        "each produces the documented /api/v1 path",
+        "unset optional params are omitted from the query string"
+      ],
       "status": "pending"
     },
     {
       "id": "TC-43.4.2",
       "name": "mode B search forwards a vector",
       "type": "unit",
-      "preconditions": ["a corpus_search call carrying a query vector"],
-      "steps": ["inspect the forwarded request body"],
-      "expected_results": ["the vector is forwarded", "no query string field is synthesised"],
+      "preconditions": [
+        "a corpus_search call carrying a query vector"
+      ],
+      "steps": [
+        "inspect the forwarded request body"
+      ],
+      "expected_results": [
+        "the vector is forwarded",
+        "no query string field is synthesised"
+      ],
       "status": "pending"
     },
     {
       "id": "TC-43.4.3",
       "name": "end-to-end index and search through the tool surface",
       "type": "integration",
-      "preconditions": ["a running server and a small document set"],
-      "steps": ["corpus_create", "corpus_index a handful of chunks", "corpus_search for a phrase in one of them"],
-      "expected_results": ["the top result names the source_ref and locator of the chunk that contains it", "no body is returned"],
+      "preconditions": [
+        "a running server and a small document set"
+      ],
+      "steps": [
+        "corpus_create",
+        "corpus_index a handful of chunks",
+        "corpus_search for a phrase in one of them"
+      ],
+      "expected_results": [
+        "the top result names the source_ref and locator of the chunk that contains it",
+        "no body is returned"
+      ],
       "status": "pending"
     },
     {
       "id": "TC-43.4.4",
       "name": "the routing table names the corpus tier",
       "type": "manual",
-      "preconditions": ["CLAUDE.md on this branch"],
-      "steps": ["read the Knowledge Wiki routing section"],
-      "expected_results": ["a row keys the quote-the-document question shape to corpus_search", "it states that a pointer, not a body, comes back", "it names the failure the rule prevents"],
+      "preconditions": [
+        "CLAUDE.md on this branch"
+      ],
+      "steps": [
+        "read the Knowledge Wiki routing section"
+      ],
+      "expected_results": [
+        "a row keys the quote-the-document question shape to corpus_search",
+        "it states that a pointer, not a body, comes back",
+        "it names the failure the rule prevents"
+      ],
       "status": "pending"
     },
     {
       "id": "TC-43.4.5",
       "name": "no tool count is written into any doc",
       "type": "unit",
-      "preconditions": ["the docs changed by this story"],
-      "steps": ["grep for a numeric tool count"],
-      "expected_results": ["none is present", "the README remains the list itself rather than a tally"],
+      "preconditions": [
+        "the docs changed by this story"
+      ],
+      "steps": [
+        "grep for a numeric tool count"
+      ],
+      "expected_results": [
+        "none is present",
+        "the README remains the list itself rather than a tally"
+      ],
       "status": "pending"
     }
   ],
@@ -105,8 +151,12 @@
     "Write the tool descriptions for a model choosing between verbs, not for a human reading a manual. The distinguishing sentence is the first one: what question does this answer that knowledge_search does not. Everything after that is parameters.",
     "Do not add the corpus tools to any auto-injected recall or hint block. The tier's discoverability comes from the routing rule, not from injecting rows into every prompt — the injected channel already measures at 5-13% follow-through and adding a second stream of unopened rows would make that worse, not better.",
     "AC-43.4.6 needs the actual mechanism checked at implementation time rather than assumed: confirm whether ListTools filtering is server-side by role, client-side, or absent, and implement visibility in whichever layer actually decides it. If no such mechanism exists, say so in the report and leave corpus_delete visible with its role stated in the description — inventing an allowlist layer is out of scope for this story.",
-    "The end-to-end test in AC-43.4.8 is the acceptance criterion the whole epic is judged against. Everything before it can pass with a tier no agent can reach."
+    "The end-to-end test in AC-43.4.8 is the acceptance criterion the whole epic is judged against. Everything before it can pass with a tier no agent can reach.",
+    "Put anything with real logic — query-string building, argument coercion, batch shaping — into mcp-server/lib/ rather than index.js. index.js is a stdio entry point with top-level await, so importing it boots the server and tests cannot reach its handlers; the existing suite RE-IMPLEMENTS handler bodies inside the test file to work around that, which means those tests can pass against a mirror while the shipped code regresses. Code in lib/ is imported and exercised for real.",
+    "AC-43.4.9's version bump is easy to forget precisely because it is not part of the feature. Bump it in the same commit that adds the tools, not as a follow-up."
   ],
-  "dependencies": ["US-43.3"],
+  "dependencies": [
+    "US-43.3"
+  ],
   "estimated_tokens": 220000
 }
