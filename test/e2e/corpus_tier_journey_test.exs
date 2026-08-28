@@ -4,9 +4,12 @@ defmodule Loopctl.E2E.CorpusTierJourneyTest do
   FULL path an agent takes across the MCP tool surface and the HTTP API.
 
   `corpus_create` -> `corpus_index` (with `source_complete`) -> `corpus_search`, driven
-  through the REAL endpoints, with every request body derived from the SAME builders the
-  MCP client ships (`mcp-server/lib/http-helpers.js`: `buildCorpusCreateBody`,
-  `buildCorpusIndexBody`, `buildCorpusSearchBody`). This is the only test in the epic
+  through the REAL endpoints, with every request body built the way the MCP client's
+  shipped builders build it (`mcp-server/lib/http-helpers.js`: `buildCorpusCreateBody`,
+  `buildCorpusIndexBody`, `buildCorpusSearchBody`). The bodies below are hand-written
+  Elixir MIRRORS of those three functions — nothing here executes JavaScript, so a
+  regression in a builder itself fails in `mcp-server/test/corpus_tools.test.js`, which
+  imports the shipped code, and not here. This is the only test in the epic
   that exercises the whole path an agent uses, and it is what proves the tier is
   REACHABLE rather than merely present: US-43.1/43.2/43.3 each verified their own layer,
   and a tool surface that forwarded the wrong body would pass every one of them.
@@ -47,9 +50,11 @@ defmodule Loopctl.E2E.CorpusTierJourneyTest do
   # Mirrors of the MCP client's request-body builders
   # (`mcp-server/lib/http-helpers.js`). Deriving the bodies here the way the JS
   # dispatch derives them is what makes this a test of the AGENT's path rather
-  # than of the HTTP surface a second time: a builder that dropped
-  # `source_complete`, or emitted `query_vector: null` for an unset optional,
-  # fails HERE.
+  # than of the HTTP surface a second time. They are MIRRORS, not the shipped
+  # code: a builder that dropped `source_complete`, or emitted
+  # `query_vector: null` for an unset optional, fails in
+  # `mcp-server/test/corpus_tools.test.js` (which imports the real builders),
+  # not here. Keep the two in step when either changes.
   # ---------------------------------------------------------------------------
 
   defp mcp_create_body(args) do
@@ -235,7 +240,11 @@ defmodule Loopctl.E2E.CorpusTierJourneyTest do
       # query found nothing.
       assert [%{"corpus_id" => corpus_id}] = body["data"]
       assert {:ok, _} = Corpus.get_corpus(other_tenant.id, "isolation-probe")
-      refute Enum.any?(body["data"], &(&1["corpus_id"] != corpus_id))
+
+      # Asserting against `mine` — the CALLER's corpus — rather than against the
+      # returned row itself is what catches SUBSTITUTION: one row carrying the
+      # other tenant's chunk would satisfy the arity-1 pattern above.
+      assert corpus_id == mine
     end
   end
 

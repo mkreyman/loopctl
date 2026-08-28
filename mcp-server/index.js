@@ -7295,7 +7295,7 @@ const TOOLS = [
       "at source_ref/locator. A server_embedded corpus takes `query` (a string) and fuses a " +
       "semantic and a keyword lane. A client_embedded corpus is SEMANTIC-ONLY — loopctl " +
       "holds no text to index — so send `query_vector` (its length must equal the corpus " +
-      "dim, from corpus_list/corpus_get); a query STRING there is refused (422 " +
+      "dim, from corpus_list); a query STRING there is refused (422 " +
       "query_string_not_accepted) and so is asking for the keyword lane (422 " +
       "keyword_lane_unavailable). Send exactly ONE of query/query_vector: both is 422 " +
       "ambiguous_query, and a query_vector to a server_embedded corpus is 422 " +
