@@ -52,6 +52,28 @@ defmodule Loopctl.Corpus.Search do
   tier's form of the article path's under-fill disclosure. Narrowing the query, or a
   corpus of its own for the material, is what a caller does about it.
 
+  ## Mode B is SEMANTIC-ONLY, and says so (US-43.3)
+
+  A `:client_embedded` corpus stores vectors loopctl did not make and cannot read, so
+  the query vector arrives from the client too (`search_vector/4`) and the KEYWORD lane
+  does not exist — there is no text to index. That is STATED rather than discovered:
+  `meta.lanes` is `["semantic"]`, `meta.search_mode` is `"semantic_only"`, and a request
+  that asks for the keyword lane on a mode B corpus is REFUSED
+  (`:keyword_lane_unavailable`) instead of answering an empty set, which an agent reads
+  as an empty corpus.
+
+  The two entry points refuse each other's corpus for the same reason: a query STRING
+  against mode B is `:query_string_not_accepted` (the server cannot embed for this
+  corpus — send `query_vector`), and a query VECTOR against mode A is
+  `:query_vector_not_accepted`.
+
+  Mode B routes through the SAME `ann/3` as mode A — the over-fetched inner pool, the
+  raised `side_table_ef_search` and the bounded under-fill probe are what stop a corpus
+  that is a small minority of the tenant's chunk rows from answering an empty 200, and
+  in mode B there is no keyword lane to mask that. The RESULT and META key sets are
+  identical to mode A's, so a caller branches on `meta` and never on which mode
+  answered.
+
   ## Not a recall surface
 
   `corpus_search` must NEVER be wired into `/api/v1/recall`. That hook injects into
@@ -83,6 +105,9 @@ defmodule Loopctl.Corpus.Search do
   # Per-lane candidate pool before fusion.
   @lane_pool 50
 
+  # The lane names a request may ask for. A mode B corpus admits only `"semantic"`.
+  @lanes ["keyword", "semantic"]
+
   # Extra inner-ANN over-fetch for the corpus residual, ON TOP of the side table's
   # own `side_table_over_fetch/0`. The article path's over-fetch offsets a
   # status/visibility trim; this one additionally offsets `corpus_id`, which can
@@ -110,10 +135,15 @@ defmodule Loopctl.Corpus.Search do
   @spec max_query_chars() :: pos_integer()
   def max_query_chars, do: @max_query_chars
 
-  @doc """
-  Searches `corpus_id` (an id or a slug) for `query_string`.
+  @doc "The lanes a search request may ask for."
+  @spec lanes() :: [String.t()]
+  def lanes, do: @lanes
 
-  `opts`: `:limit` (default #{@default_limit}, clamped to #{@max_limit}).
+  @doc """
+  Searches a `:server_embedded` corpus (an id or a slug) for `query_string`.
+
+  `opts`: `:limit` (default #{@default_limit}, clamped to #{@max_limit}) and `:lanes`
+  (a non-empty subset of `lanes/0`, default all of them).
 
   Returns `{:ok, %{results: [...], meta: %{lanes: [...], ...}}}`. Both lanes failing
   is the only case that returns `{:error, :heavy_read_overloaded}` — a semantic lane
@@ -125,40 +155,136 @@ defmodule Loopctl.Corpus.Search do
           {:ok, %{results: [map()], meta: map()}}
           | {:error,
              :not_found
-             | :mode_mismatch
+             | :query_string_not_accepted
+             | :keyword_lane_unavailable
+             | {:invalid_lanes, term()}
              | :empty_query
              | :query_too_long
              | :heavy_read_overloaded}
   def search(tenant_id, corpus_id, query_string, opts \\ []) when is_binary(tenant_id) do
     with {:ok, corpus} <- Corpus.get_corpus(tenant_id, corpus_id),
-         :ok <- validate_mode(corpus),
+         :ok <- require_mode(corpus, :server_embedded),
+         {:ok, lanes} <- validate_lanes(corpus, opts),
          {:ok, query_string} <- validate_query(query_string) do
-      limit = opts |> Keyword.get(:limit, @default_limit) |> clamp_limit()
-
-      run(tenant_id, corpus, query_string, limit)
+      run(tenant_id, corpus, {:string, query_string}, lanes, limit(opts))
     end
   end
 
-  # The SAME refusal `Loopctl.Corpus.Indexer.validate_mode/1` gives the ingest verb. A
-  # client_embedded corpus holds vectors the server did not make and cannot read: without
-  # this clause a search against one embedded the query on the tenant's own key, billed
-  # the provider call, and answered 200 with an empty set — one half of the surface
-  # refusing mode B with a coded 422 while the other half charged for a query the corpus
-  # can never serve. Both halves refuse it until US-43.3 defines mode B's retrieval
-  # contract.
-  defp validate_mode(%CorpusRow{mode: :server_embedded}), do: :ok
-  defp validate_mode(%CorpusRow{}), do: {:error, :mode_mismatch}
+  @doc """
+  Searches a `:client_embedded` corpus with a CLIENT-SUPPLIED query vector.
 
-  defp run(tenant_id, corpus, query_string, limit) do
-    keyword = keyword_lane(tenant_id, corpus, query_string)
-    semantic = semantic_lane(tenant_id, corpus, query_string)
+  The server cannot embed for a mode B corpus, so the caller sends the vector it
+  produced with the same local pipeline that produced the stored ones. Its length must
+  equal the corpus's pinned `dim`; a mismatch is refused HERE, naming both numbers,
+  rather than reaching pgvector as a raw `different vector dimensions` error.
 
-    case {keyword, semantic} do
-      {{:error, reason}, {:error, _}} ->
-        {:error, reason}
+  Only the SEMANTIC lane exists — there is no text to index — so `meta.lanes` is
+  `["semantic"]` and `meta.search_mode` is `"semantic_only"`. The result and meta key
+  sets are identical to `search/4`'s.
+  """
+  @spec search_vector(Ecto.UUID.t(), String.t(), [number()], keyword()) ::
+          {:ok, %{results: [map()], meta: map()}}
+          | {:error,
+             :not_found
+             | :query_vector_not_accepted
+             | :keyword_lane_unavailable
+             | {:invalid_lanes, term()}
+             | :invalid_query_vector
+             | {:query_vector_dimension_mismatch, non_neg_integer(), pos_integer()}
+             | :heavy_read_overloaded}
+  def search_vector(tenant_id, corpus_id, vector, opts \\ []) when is_binary(tenant_id) do
+    with {:ok, corpus} <- Corpus.get_corpus(tenant_id, corpus_id),
+         :ok <- require_mode(corpus, :client_embedded),
+         {:ok, lanes} <- validate_lanes(corpus, opts),
+         :ok <- validate_query_vector(vector, corpus.dim) do
+      run(tenant_id, corpus, {:vector, vector}, lanes, limit(opts))
+    end
+  end
 
-      _ ->
-        {:ok, fuse(corpus, keyword, semantic, limit)}
+  # Each entry point serves ONE mode and refuses the other by name. A mode mismatch is
+  # never an empty result set: an agent reads that as an empty corpus, so every refusal
+  # here carries the remedy — send `query_vector` for a client_embedded corpus, send
+  # `query` for a server_embedded one.
+  defp require_mode(%CorpusRow{mode: mode}, mode), do: :ok
+
+  defp require_mode(%CorpusRow{mode: :client_embedded}, _mode),
+    do: {:error, :query_string_not_accepted}
+
+  defp require_mode(%CorpusRow{}, _mode), do: {:error, :query_vector_not_accepted}
+
+  # The keyword lane is UNAVAILABLE on a mode B corpus, and asking for it is an ERROR
+  # rather than an empty lane: a request that believes it ran a keyword search over
+  # text loopctl never received must learn that, not read zero hits as zero matches.
+  defp validate_lanes(corpus, opts) do
+    available = available_lanes(corpus)
+
+    case Keyword.get(opts, :lanes) do
+      nil -> {:ok, available}
+      requested -> check_lanes(requested, available)
+    end
+  end
+
+  defp available_lanes(%CorpusRow{mode: :client_embedded}), do: ["semantic"]
+  defp available_lanes(%CorpusRow{}), do: @lanes
+
+  defp check_lanes(requested, available) when is_list(requested) and requested != [] do
+    cond do
+      not Enum.all?(requested, &(&1 in @lanes)) -> {:error, {:invalid_lanes, requested}}
+      "keyword" in requested and "keyword" not in available -> {:error, :keyword_lane_unavailable}
+      true -> {:ok, Enum.uniq(requested)}
+    end
+  end
+
+  defp check_lanes(requested, _available), do: {:error, {:invalid_lanes, requested}}
+
+  defp validate_query_vector(vector, dim) when is_list(vector) do
+    cond do
+      vector == [] or not Enum.all?(vector, &is_number/1) -> {:error, :invalid_query_vector}
+      length(vector) != dim -> {:error, {:query_vector_dimension_mismatch, length(vector), dim}}
+      true -> :ok
+    end
+  end
+
+  defp validate_query_vector(_vector, _dim), do: {:error, :invalid_query_vector}
+
+  defp limit(opts), do: opts |> Keyword.get(:limit, @default_limit) |> clamp_limit()
+
+  defp run(tenant_id, corpus, query, lanes, limit) do
+    keyword = run_lane(:keyword, tenant_id, corpus, query, lanes)
+    semantic = run_lane(:semantic, tenant_id, corpus, query, lanes)
+
+    case attempted_outcome([keyword, semantic]) do
+      {:error, reason} -> {:error, reason}
+      :ok -> {:ok, fuse(corpus, keyword, semantic, limit)}
+    end
+  end
+
+  # A lane that was never asked for is `:skipped`, which is NOT a degradation: it is
+  # absent from `meta.lanes` and contributes no `*_unavailable_reason` key, so a mode B
+  # response carries exactly the meta keys a mode A one does.
+  defp run_lane(:keyword, tenant_id, corpus, {:string, query_string}, lanes) do
+    if "keyword" in lanes, do: keyword_lane(tenant_id, corpus, query_string), else: :skipped
+  end
+
+  defp run_lane(:keyword, _tenant_id, _corpus, {:vector, _vector}, _lanes), do: :skipped
+
+  defp run_lane(:semantic, tenant_id, corpus, {:string, query_string}, lanes) do
+    if "semantic" in lanes, do: semantic_lane(tenant_id, corpus, query_string), else: :skipped
+  end
+
+  defp run_lane(:semantic, tenant_id, corpus, {:vector, vector}, _lanes),
+    do: ann(tenant_id, corpus, vector)
+
+  # Only the lanes that were ATTEMPTED decide this: every attempted lane failing is the
+  # one case with nothing to fuse and no degraded answer to give.
+  defp attempted_outcome(lanes) do
+    attempted = Enum.reject(lanes, &(&1 == :skipped))
+    errors = Enum.filter(attempted, &match?({:error, _reason}, &1))
+
+    case {attempted, errors} do
+      {[], _errors} -> :ok
+      {same, same} -> hd(errors)
+      _partial -> :ok
     end
   end
 
@@ -184,11 +310,12 @@ defmodule Loopctl.Corpus.Search do
   defp lane_results({:ok, results}), do: results
   defp lane_results({:partial, results}), do: results
   defp lane_results({:error, _reason}), do: []
+  defp lane_results(:skipped), do: []
 
   defp meta(corpus, keyword, semantic, limit) do
     lanes =
       [{"keyword", keyword}, {"semantic", semantic}]
-      |> Enum.reject(&match?({_name, {:error, _}}, &1))
+      |> Enum.reject(&(match?({_name, {:error, _reason}}, &1) or match?({_name, :skipped}, &1)))
       |> Enum.map(&elem(&1, 0))
 
     %{

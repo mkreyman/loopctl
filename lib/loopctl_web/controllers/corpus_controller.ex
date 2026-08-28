@@ -38,6 +38,18 @@ defmodule LoopctlWeb.CorpusController do
   session, and verbatim spec chunks there are precisely the pollution the corpus tier's
   separate tables exist to prevent BY CONSTRUCTION.
 
+  ## Mode B: loopctl stores and ranks vectors it cannot read (US-43.3)
+
+  A `client_embedded` corpus is indexed with `{source_ref, locator, vector,
+  content_hash, ordinal, snippet?}`. There is NO parameter on this surface that accepts
+  chunk text for such a corpus, and a chunk carrying `text` is refused
+  (`422 text_not_accepted`) rather than silently ignored. `content_hash` is
+  CLIENT-SUPPLIED and opaque — loopctl holds no text to hash and cannot verify the hash
+  corresponds to the vector or to the file; the client owns that correspondence.
+  Retrieval is semantic-only (there is no text to index) and takes a client-supplied
+  `query_vector`. Every mode mismatch on this surface is a coded 422 with a remedy,
+  never an empty 200 — an agent reads an empty result set as an empty corpus.
+
   ## Mode A is mandatory-BYO, and the failure is moved forward
 
   A `server_embedded` corpus embeds SERVER-SIDE on the TENANT's own embedding key, so a
@@ -79,6 +91,7 @@ defmodule LoopctlWeb.CorpusController do
   @max_snippet_chars Search.max_snippet_chars()
   @max_search_limit Search.max_limit()
   @max_query_chars Search.max_query_chars()
+  @search_lanes Search.lanes()
 
   @rate_limit_window_ms 60_000
 
@@ -113,7 +126,11 @@ defmodule LoopctlWeb.CorpusController do
         "In mode server_embedded loopctl embeds the chunk text you send, on YOUR embedding " <>
         "key — a tenant with no embedding credential is refused here (422 no_embedding_key) " <>
         "rather than at first index. A declared dim that disagrees with the model's native " <>
-        "dimension is refused too; an UNKNOWN model is accepted (the server cannot check it).",
+        "dimension is refused too; an UNKNOWN model is accepted (the server cannot check it). " <>
+        "In mode client_embedded loopctl never embeds anything: you send vectors and it " <>
+        "stores content it cannot read, so no embedding key is required and " <>
+        "allow_snippets defaults to FALSE — the privacy-preserving default, since a " <>
+        "snippet IS text the server would then hold. Ask for it explicitly if you want it.",
     request_body:
       {"Corpus attributes", "application/json",
        %OpenApiSpex.Schema{
@@ -291,9 +308,20 @@ defmodule LoopctlWeb.CorpusController do
   operation(:ingest,
     summary: "Index a batch of chunks",
     description:
-      "Accepts up to #{@max_batch_size} chunks, each {source_ref, locator, text, ordinal}. " <>
-        "content_hash is computed SERVER-SIDE from the text and is not accepted from the " <>
-        "client in mode A. Indexing is idempotent on (corpus_id, source_ref, locator): an " <>
+      "Accepts up to #{@max_batch_size} chunks. In a server_embedded corpus each chunk is " <>
+        "{source_ref, locator, text, ordinal} and content_hash is computed SERVER-SIDE from " <>
+        "the text, not accepted from the client. In a client_embedded corpus each chunk is " <>
+        "{source_ref, locator, vector, content_hash, ordinal, snippet?}: there is NO text " <>
+        "parameter, and a chunk carrying text is refused (422 text_not_accepted) rather " <>
+        "than silently ignored, because dropping it would let you believe the keyword lane " <>
+        "works on a corpus with no text to index. In that mode content_hash is yours and is " <>
+        "treated as an OPAQUE IDEMPOTENCY TOKEN, never as an integrity proof — loopctl " <>
+        "cannot verify that it corresponds to the vector or to the file, and you own that " <>
+        "correspondence. The vector's length must equal the corpus dim (422 " <>
+        "vector_dimension_mismatch, naming both numbers), and nothing verifies which model " <>
+        "produced it: that is not computable from a vector. A snippet is refused (422 " <>
+        "snippets_not_allowed) unless the corpus was created with allow_snippets true, " <>
+        "which for a client_embedded corpus defaults to FALSE. Indexing is idempotent on (corpus_id, source_ref, locator): an " <>
         "unchanged batch writes nothing, spends no embedding tokens, and reports every item " <>
         "as unchanged; a chunk whose text is unchanged but whose snippet or ordinal moved is " <>
         "reported replaced — the row is rewritten and no embedding is spent. source_complete " <>
@@ -320,18 +348,55 @@ defmodule LoopctlWeb.CorpusController do
              type: :array,
              maxItems: @max_batch_size,
              items: %OpenApiSpex.Schema{
-               type: :object,
-               required: [:source_ref, :text],
-               properties: %{
-                 source_ref: %OpenApiSpex.Schema{type: :string},
-                 locator: %OpenApiSpex.Schema{
+               oneOf: [
+                 %OpenApiSpex.Schema{
+                   type: :object,
+                   title: "ServerEmbeddedChunk",
                    description:
-                     "Opaque client-owned pointer (object, array or scalar), stored verbatim."
+                     "A chunk for a server_embedded corpus. content_hash is computed " <>
+                       "server-side from the text and is not accepted here.",
+                   required: [:source_ref, :text],
+                   properties: %{
+                     source_ref: %OpenApiSpex.Schema{type: :string},
+                     locator: %OpenApiSpex.Schema{
+                       description:
+                         "Opaque client-owned pointer (object, array or scalar), stored verbatim."
+                     },
+                     text: %OpenApiSpex.Schema{type: :string},
+                     ordinal: %OpenApiSpex.Schema{type: :integer},
+                     snippet: %OpenApiSpex.Schema{type: :string, maxLength: @max_snippet_chars}
+                   }
                  },
-                 text: %OpenApiSpex.Schema{type: :string},
-                 ordinal: %OpenApiSpex.Schema{type: :integer},
-                 snippet: %OpenApiSpex.Schema{type: :string, maxLength: @max_snippet_chars}
-               }
+                 %OpenApiSpex.Schema{
+                   type: :object,
+                   title: "ClientEmbeddedChunk",
+                   description:
+                     "A chunk for a client_embedded corpus. There is no text property: " <>
+                       "sending one is refused, not ignored. content_hash is YOURS and is " <>
+                       "an opaque idempotency token — loopctl cannot verify that it " <>
+                       "corresponds to the vector or to the file, and you own that " <>
+                       "correspondence. snippet is accepted only when the corpus allows " <>
+                       "snippets, which defaults to false in this mode.",
+                   required: [:source_ref, :vector, :content_hash],
+                   properties: %{
+                     source_ref: %OpenApiSpex.Schema{type: :string},
+                     locator: %OpenApiSpex.Schema{
+                       description:
+                         "Opaque client-owned pointer (object, array or scalar), stored verbatim."
+                     },
+                     vector: %OpenApiSpex.Schema{
+                       type: :array,
+                       items: %OpenApiSpex.Schema{type: :number},
+                       description:
+                         "The locally-produced embedding. Its length must equal the " <>
+                           "corpus dim."
+                     },
+                     content_hash: %OpenApiSpex.Schema{type: :string},
+                     ordinal: %OpenApiSpex.Schema{type: :integer},
+                     snippet: %OpenApiSpex.Schema{type: :string, maxLength: @max_snippet_chars}
+                   }
+                 }
+               ]
              }
            },
            source_complete: %OpenApiSpex.Schema{
@@ -407,9 +472,18 @@ defmodule LoopctlWeb.CorpusController do
   operation(:search,
     summary: "Search a corpus for pointers",
     description:
-      "Embeds the query with the CORPUS's pinned model and runs both lanes — semantic over " <>
-        "the per-dimension HNSW index and keyword over the chunk text — fused by the same " <>
-        "Reciprocal Rank Fusion the article path uses. Returns {source_ref, locator, snippet, " <>
+      "In a server_embedded corpus, embeds the query with the CORPUS's pinned model and " <>
+        "runs both lanes — semantic over the per-dimension HNSW index and keyword over the " <>
+        "chunk text — fused by the same " <>
+        "Reciprocal Rank Fusion the article path uses. A client_embedded corpus is " <>
+        "SEMANTIC-ONLY, because there is no text to index: send query_vector (validated " <>
+        "against the corpus dim) instead of query, and meta.lanes is [semantic]. Sending a " <>
+        "query STRING to a client_embedded corpus is refused (422 " <>
+        "query_string_not_accepted) rather than answered with an empty set, as is sending " <>
+        "a query_vector to a server_embedded one (422 query_vector_not_accepted) and asking " <>
+        "for the keyword lane on a client_embedded one (422 keyword_lane_unavailable). The " <>
+        "result and meta key sets are the same in both modes, so branch on meta rather than " <>
+        "on the mode. Returns {source_ref, locator, snippet, " <>
         "score, corpus_id, chunk_id} by descending score and NEVER the full chunk text. " <>
         "meta.lanes names the lanes that actually ran, and meta.semantic_under_filled says " <>
         "when the semantic lane ran but could not reach the whole corpus. Scores are " <>
@@ -423,9 +497,27 @@ defmodule LoopctlWeb.CorpusController do
       {"Search request", "application/json",
        %OpenApiSpex.Schema{
          type: :object,
-         required: [:query],
+         description: "Exactly one of query (server_embedded) or query_vector (client_embedded).",
          properties: %{
-           query: %OpenApiSpex.Schema{type: :string, maxLength: @max_query_chars},
+           query: %OpenApiSpex.Schema{
+             type: :string,
+             maxLength: @max_query_chars,
+             description: "A query string. server_embedded corpora only."
+           },
+           query_vector: %OpenApiSpex.Schema{
+             type: :array,
+             items: %OpenApiSpex.Schema{type: :number},
+             description:
+               "A locally-produced query vector whose length equals the corpus dim. " <>
+                 "client_embedded corpora only — the server cannot embed for them."
+           },
+           lanes: %OpenApiSpex.Schema{
+             type: :array,
+             items: %OpenApiSpex.Schema{type: :string, enum: @search_lanes},
+             description:
+               "The lanes to run (default: all available). A client_embedded corpus " <>
+                 "offers only the semantic lane; asking for keyword there is refused."
+           },
            limit: %OpenApiSpex.Schema{type: :integer, maximum: @max_search_limit}
          }
        }},
@@ -463,7 +555,11 @@ defmodule LoopctlWeb.CorpusController do
       401 => {"Unauthorized", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       422 =>
-        {"Empty or over-long query, or a client_embedded corpus", "application/json",
+        {"Empty or over-long query (empty_query, query_too_long), a query/corpus mode " <>
+           "mismatch (query_string_not_accepted, query_vector_not_accepted), a keyword " <>
+           "lane asked of a client_embedded corpus (keyword_lane_unavailable), an " <>
+           "unknown lane (invalid_lanes), or a malformed or wrong-length query_vector " <>
+           "(invalid_query_vector, query_vector_dimension_mismatch)", "application/json",
          Schemas.ErrorResponse},
       429 =>
         {"Rate limited (code rate_limited), or BOTH lanes shed by the per-tenant " <>
@@ -475,35 +571,139 @@ defmodule LoopctlWeb.CorpusController do
   @doc "POST /api/v1/corpora/:id/search"
   def search(conn, %{"id" => id} = params) do
     tenant_id = conn.assigns.current_api_key.tenant_id
-    opts = [limit: to_int(Map.get(params, "limit"))] |> Enum.reject(&is_nil(elem(&1, 1)))
 
-    case Search.search(tenant_id, id, Map.get(params, "query"), opts) do
-      {:ok, result} ->
-        json(conn, %{data: result.results, meta: result.meta})
+    opts =
+      [limit: to_int(Map.get(params, "limit")), lanes: Map.get(params, "lanes")]
+      |> Enum.reject(&is_nil(elem(&1, 1)))
 
-      {:error, :empty_query} ->
-        error(conn, 422, "empty_query", "A query string is required.")
-
-      {:error, :query_too_long} ->
-        error(conn, 422, "query_too_long", query_too_long_message())
-
-      {:error, :mode_mismatch} ->
-        error(conn, 422, "mode_mismatch", search_mode_mismatch_message())
-
-      {:error, reason} ->
-        {:error, reason}
+    case run_search(tenant_id, id, params, opts) do
+      {:ok, result} -> json(conn, %{data: result.results, meta: result.meta})
+      {:error, reason} -> handle_search_error(conn, reason)
     end
   end
 
-  # --- error rendering ---
+  # A `query_vector` names the mode B path; the MODE decides whether it is accepted, so a
+  # vector sent to a server_embedded corpus is refused by name rather than embedded or
+  # ignored.
+  defp run_search(tenant_id, id, %{"query_vector" => vector}, opts),
+    do: Search.search_vector(tenant_id, id, vector, opts)
 
-  defp handle_index_error(conn, :mode_mismatch) do
+  defp run_search(tenant_id, id, params, opts),
+    do: Search.search(tenant_id, id, Map.get(params, "query"), opts)
+
+  defp handle_search_error(conn, :empty_query),
+    do: error(conn, 422, "empty_query", "A query string is required.")
+
+  defp handle_search_error(conn, :query_too_long),
+    do: error(conn, 422, "query_too_long", query_too_long_message())
+
+  # NOT an empty 200. An agent reads an empty result set as an empty corpus, so every
+  # mode mismatch names the remedy instead.
+  defp handle_search_error(conn, :query_string_not_accepted) do
     error(
       conn,
       422,
-      "mode_mismatch",
-      "This corpus is client_embedded: it stores vectors the server cannot read, so it " <>
-        "does not accept chunk text on this endpoint."
+      "query_string_not_accepted",
+      "This corpus is client_embedded: it stores vectors loopctl did not make and cannot " <>
+        "read, so the server cannot embed a query for it. Send query_vector — a vector " <>
+        "from the same local pipeline that produced the stored ones, at this corpus's dim."
+    )
+  end
+
+  defp handle_search_error(conn, :query_vector_not_accepted) do
+    error(
+      conn,
+      422,
+      "query_vector_not_accepted",
+      "This corpus is server_embedded: loopctl embeds the query with the corpus's own " <>
+        "pinned model. Send query instead of query_vector."
+    )
+  end
+
+  defp handle_search_error(conn, :keyword_lane_unavailable) do
+    error(
+      conn,
+      422,
+      "keyword_lane_unavailable",
+      "This corpus is client_embedded, so it is SEMANTIC-ONLY: loopctl never received " <>
+        "the chunk text and has nothing to index for a keyword lane. Ask for the semantic " <>
+        "lane, or omit lanes entirely."
+    )
+  end
+
+  defp handle_search_error(conn, {:invalid_lanes, received}) do
+    error(
+      conn,
+      422,
+      "invalid_lanes",
+      "lanes must be a non-empty array drawn from #{inspect(@search_lanes)}.",
+      %{received: inspect(received)}
+    )
+  end
+
+  defp handle_search_error(conn, :invalid_query_vector) do
+    error(
+      conn,
+      422,
+      "invalid_query_vector",
+      "query_vector must be a non-empty array of numbers at this corpus's dim."
+    )
+  end
+
+  defp handle_search_error(conn, {:query_vector_dimension_mismatch, got, expected}) do
+    error(
+      conn,
+      422,
+      "query_vector_dimension_mismatch",
+      "query_vector has #{got} dimensions but this corpus is pinned at #{expected}. " <>
+        "Embed the query with the same local model that produced the stored vectors.",
+      %{received_dim: got, corpus_dim: expected}
+    )
+  end
+
+  defp handle_search_error(_conn, reason), do: {:error, reason}
+
+  # --- error rendering ---
+
+  # REFUSED, never dropped. Accepting the item and ignoring the text would leave the
+  # client believing loopctl holds text it never received — and therefore believing the
+  # keyword lane works on a corpus that has none.
+  defp handle_index_error(conn, {:text_not_accepted, index}) do
+    error(
+      conn,
+      422,
+      "text_not_accepted",
+      "chunks[#{index}] carries text, but this corpus is client_embedded: it has no text " <>
+        "lane and loopctl must never receive the content. Send only {source_ref, locator, " <>
+        "vector, content_hash, ordinal, snippet?}.",
+      %{index: index}
+    )
+  end
+
+  # Names BOTH numbers, at the boundary, so the caller does not meet the
+  # document_chunk_embeddings_dim_matches_vector CHECK as a raw Postgrex 500.
+  defp handle_index_error(conn, {:vector_dimension_mismatch, index, got, expected}) do
+    error(
+      conn,
+      422,
+      "vector_dimension_mismatch",
+      "chunks[#{index}] carries a #{got}-dimension vector but this corpus is pinned at " <>
+        "#{expected}. The dimension is pinned at creation; re-dimensioning a corpus is " <>
+        "delete-and-re-index by design.",
+      %{index: index, received_dim: got, corpus_dim: expected}
+    )
+  end
+
+  defp handle_index_error(conn, {:snippets_not_allowed, index}) do
+    error(
+      conn,
+      422,
+      "snippets_not_allowed",
+      "chunks[#{index}] carries a snippet, but this corpus forbids them " <>
+        "(allow_snippets is false — the default for a client_embedded corpus, since a " <>
+        "snippet IS text the server would then hold). Create a corpus with " <>
+        "allow_snippets true if you want readable results.",
+      %{index: index}
     )
   end
 
@@ -646,15 +846,6 @@ defmodule LoopctlWeb.CorpusController do
     |> put_status(status)
     |> json(%{error: if(details, do: Map.put(body, :details, details), else: body)})
   end
-
-  # The mode refusal the INGEST verb already gives, in the read verb's own words: both
-  # halves of the surface refuse a client_embedded corpus identically, rather than one
-  # answering a coded 422 and the other spending a provider embedding call to return an
-  # empty set with a 200.
-  defp search_mode_mismatch_message,
-    do:
-      "This corpus is client_embedded: it stores vectors loopctl did not make and cannot " <>
-        "read, so the server cannot embed a query against it."
 
   defp query_too_long_message,
     do: "The query is longer than #{@max_query_chars} characters."
