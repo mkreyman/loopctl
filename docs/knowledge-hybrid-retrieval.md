@@ -5,10 +5,10 @@ single entrypoint that prefers a **governed curated** answer when one genuinely
 answers a query, else falls back to semantic/keyword **retrieval** — returning
 **provenance** (`:curated` | `:retrieved`) on one uniform shape so a caller never
 branches on "RAG-or-curated." This sits INSIDE the Knowledge Wiki layer (it does
-not add a fourth agent-information surface) — see
-[the three-layer model](#the-three-layer-model-knowledge-wiki-vs-agent-memory-vs-context-retriever)
-below for how it relates to Agent Memory (Epic 28) and the Context Retriever
-(Epic 30).
+not add an agent-information surface of its own) — see
+[the four-layer model](#the-four-layer-model-knowledge-wiki-vs-agent-memory-vs-context-retriever-vs-corpus-tier)
+below for how it relates to Agent Memory (Epic 28), the Context Retriever
+(Epic 30) and the Corpus tier (Epic 43).
 
 > loopctl is **agent-native**: there is no web UI for hybrid search. Every call is
 > an API/MCP call made by an agent under its own key.
@@ -312,18 +312,20 @@ opening on its own. `meta.drill` states this in the payload.
 
 ---
 
-## The three-layer model: Knowledge Wiki vs Agent Memory vs Context Retriever
+## The four-layer model: Knowledge Wiki vs Agent Memory vs Context Retriever vs Corpus tier
 
 Hybrid retrieval is a **capability of the Knowledge Wiki layer** — it does not
-add a fourth surface. The three layers (full references:
+add a surface of its own. The four layers (full references:
 [`docs/agent-memory.md`](agent-memory.md),
-[`docs/context-retriever.md`](context-retriever.md)):
+[`docs/context-retriever.md`](context-retriever.md),
+[`docs/user_stories/epic_43_corpus_tier/README.md`](user_stories/epic_43_corpus_tier/README.md)):
 
 | Layer | What it holds | Scope / owner | Lifecycle | Reach it via |
 |-------|---------------|---------------|-----------|--------------|
 | **Knowledge Wiki** (incl. hybrid retrieval) | Curated, *shared* tenant knowledge — patterns, decisions, findings, references (documents). Hybrid search prefers a governed **curated** answer, else falls back to semantic/keyword **retrieval**, on one uniform shape with `provenance`. | Tenant (with per-article agent visibility) | Human/agent-curated, versioned, linked, conflict-resolved | `knowledge_*` tools / `/api/v1/knowledge*` |
 | **Agent Memory** | An agent subject's *private* working memory — session turns + long-term facts about *its* work | `(tenant, subject_id)` — one agent | Append/embed/supersede/forget; session tier expires | `memory_*` tools / `/api/v1/memory*` |
 | **Context Retriever** | *Governed, structured* access to *live business data* (rows, not documents) | Tenant, schema-scoped | Read-through over the operational store; entity definitions are admin-authored | `retrieve_*` tools / `/api/v1/entities*` + `/api/v1/retrieve/*` |
+| **Corpus tier** | An index over *reference documents* whose files stay in the client's own repo — VERBATIM chunks, never distilled. `corpus_search` returns a POINTER plus a bounded snippet, never the chunk body. | Tenant, per corpus | Indexed from the client's files; a corpus pins its own dimension and is re-indexed, never edited in place | `corpus_*` tools / `/api/v1/corpora*` |
 
 Rule of thumb, extended for hybrid search: *asking a question that MIGHT have a
 governed answer, and you want to know whether the answer is authoritative or "our
@@ -333,7 +335,10 @@ browsing/enumerating a topic cheaply?* → `knowledge_progressive_index` +
 don't yet know what to ask?* → `knowledge_heat_index` (no query, so its misses
 are uncorrelated with the ones that just failed you). *A fact only you need to
 recall about your own work?* → `memory_remember`. *A live structured row (a
-story, a project)?* → `retrieve_*`.
+story, a project)?* → `retrieve_*`. *Quote me the exact text of an authoritative
+document?* → `corpus_search`, then open the file it points at — a hybrid-search
+miss says nothing about whether that document is indexed in a corpus, so check
+`corpus_list` before concluding it is not.
 
 ---
 

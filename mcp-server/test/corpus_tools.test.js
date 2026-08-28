@@ -43,6 +43,77 @@ const KB_SKILL = readFileSync(
   "utf8",
 );
 
+const repoFile = (...parts) => readFileSync(path.join(DIR, "..", "..", ...parts), "utf8");
+
+const UBIQUITOUS_SKILL = repoFile(".claude", "skills", "ubiquitous-language", "SKILL.md");
+
+/**
+ * The documents CLAUDE.md / AGENTS.md / the two skills now CITE as the corpus
+ * reference, plus the layer-model docs those same sentences name. The routing prose IS
+ * the mechanism this story ships, so a copy still ASSERTING the three-surface model is
+ * not cosmetic drift: it is the direct negation of the rule an agent just followed,
+ * one link away from it, and the fallback is the exact `knowledge_search` failure
+ * AC-43.4.5 names.
+ *
+ * `forbidden` matches the ASSERTED sentence, never the bare word "three" — the epic
+ * README deliberately QUOTES its own superseded design-time claim, and a guard that
+ * cannot tell a quotation from an assertion would forbid recording the history.
+ */
+const SURFACE_DOCS = [
+  {
+    label: "docs/user_stories/epic_43_corpus_tier/README.md",
+    src: repoFile("docs", "user_stories", "epic_43_corpus_tier", "README.md"),
+    required: [/FOURTH agent information surface/, /`corpus_\*`/],
+    forbidden: [
+      /^It is a third storage tier/m,
+      // Cited five times from this branch; a "NOT IMPLEMENTED" header on the file an
+      // agent is sent to reads as "this surface does not exist yet".
+      /Status: DESIGNED, NOT IMPLEMENTED/,
+    ],
+  },
+  {
+    label: "docs/context-retriever.md",
+    src: repoFile("docs", "context-retriever.md"),
+    required: [/four agent\s+information layers/, /\*\*Corpus tier\*\*/, /`corpus_search`/],
+    forbidden: [
+      /third of loopctl's three agent/,
+      /## The three-layer mental model/,
+      /three distinct places/,
+    ],
+  },
+  {
+    label: "docs/knowledge-hybrid-retrieval.md",
+    src: repoFile("docs", "knowledge-hybrid-retrieval.md"),
+    required: [/## The four-layer model/, /\*\*Corpus tier\*\*/, /`corpus_search`/],
+    forbidden: [
+      /## The three-layer model/,
+      /The three layers/,
+      // Epic 31 is a CAPABILITY of the wiki layer, so its disclaimer must deny a
+      // surface of its own — not deny "a fourth", which now exists and is the corpus.
+      /fourth agent-information surface/,
+      /does not\s+add a fourth surface/,
+    ],
+  },
+  {
+    label: "docs/agent-memory.md",
+    src: repoFile("docs", "agent-memory.md"),
+    required: [/## The four-layer mental model/, /\*\*Corpus tier\*\*/, /`corpus_search`/],
+    forbidden: [/## The three-layer mental model/, /three distinct places/],
+  },
+  {
+    label: "README.md",
+    src: repoFile("README.md"),
+    required: [/\*\*Corpus tier\*\*/, /four agent layers/],
+    forbidden: [/third of loopctl's three agent layers/],
+  },
+  {
+    label: ".claude/skills/ubiquitous-language/SKILL.md",
+    src: UBIQUITOUS_SKILL,
+    required: [/## The four surfaces people conflate/, /\*\*`corpus_\*` — Corpus tier\*\*/],
+    forbidden: [/## The three surfaces people conflate/, /all three\s+"store something for later"/],
+  },
+];
+
 /** Tool name -> the handler its dispatch case MUST call. */
 const CORPUS_DISPATCH = {
   corpus_create: "corpusCreate",
@@ -470,6 +541,17 @@ describe("the routing rule reaches the docs an agent reads (AC-43.4.4/AC-43.4.5)
     assert.match(REPO_AGENTS_MD, /\*\*`corpus_\*` — Corpus tier\*\*/);
     assert.match(REPO_AGENTS_MD, /quote\s+me\s+the\s+exact\s+text[\s\S]{0,200}?corpus_search/);
   });
+
+  for (const { label, src, required, forbidden } of SURFACE_DOCS) {
+    test(`${label} carries the four-surface model, not the three it superseded`, () => {
+      for (const re of required) {
+        assert.match(src, re, `${label} must assert the four-surface model (${re})`);
+      }
+      for (const re of forbidden) {
+        assert.doesNotMatch(src, re, `${label} still asserts the retired model (${re})`);
+      }
+    });
+  }
 
   test("the knowledge-wiki skill routes corpus_* — it loads when an agent picks a verb", () => {
     // CLAUDE.md's domain-skill routing table hands this file to anyone touching
