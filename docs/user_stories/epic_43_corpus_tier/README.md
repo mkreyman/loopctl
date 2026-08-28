@@ -172,8 +172,8 @@ Building this first gives ContextForge a real consumer to develop against.
 
 | Story | Title | Status | PR |
 |-------|-------|--------|----|
-| US-43.1 | Corpus storage: a corpus that pins its own dimension, and chunks excluded from the article corpus by construction | not started | — |
-| US-43.2 | Mode A — server-embedded ingest and pointer-plus-snippet retrieval | not started | — |
+| US-43.1 | Corpus storage: a corpus that pins its own dimension, and chunks excluded from the article corpus by construction | merged | #772 |
+| US-43.2 | Mode A — server-embedded ingest and pointer-plus-snippet retrieval | in review | #773 |
 | US-43.3 | Mode B — the server stores and ranks vectors it cannot read | not started | — |
 | US-43.4 | The `corpus_*` tool surface, and a routing rule that says when to reach for it | not started | — |
 
