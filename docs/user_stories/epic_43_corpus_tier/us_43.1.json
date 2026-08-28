@@ -1,0 +1,151 @@
+{
+  "id": "US-43.1",
+  "title": "Corpus storage: a corpus that pins its own dimension, and chunks excluded from the article corpus by construction",
+  "epic": { "id": "epic_43", "name": "Corpus Tier" },
+  "priority": "high",
+  "phase": "foundation",
+  "background": "loopctl already stores dimension-tagged vectors well: article_embeddings uses an unconstrained vector column with an explicit dim discriminator and a vector_dims(embedding) = dim CHECK (priv/repo/migrations/20260721000100_create_embedding_side_tables.exs), and per-dimension HNSW indexes are built from one single-sourced SQL generator (lib/loopctl/repo/hnsw_index.ex) over Loopctl.Embeddings.supported_dimensions/0, currently [768, 1024, 1536]. What it does not have is anywhere to put a VERBATIM document chunk. The corpus tier needs three tables and one decision that the originating issue did not make: where the embedding dimension is pinned. Loopctl.Embeddings.active_dimension/1 resolves a dimension per TENANT, and the 20260721000300 migration pinned it deliberately so the stored corpus's actual shape, not a mutable model setting, is authoritative. A tenant whose article corpus is pinned at 1536 will index a document corpus with a LOCAL 768-dimension model, and both must coexist in the same tenant at the same time. Reading the tenant pin for a corpus makes the epic's first consumer unimplementable.",
+  "story": {
+    "as_a": "an agent maintaining a reference-document corpus that lives in its own repo",
+    "i_want_to": "have loopctl store verbatim chunks and their vectors in tables of their own, with the corpus pinning its own embedding model and dimension",
+    "so_that": "a local 768-dimension model can index my documents without disturbing the tenant's 1536-dimension article corpus, and those chunks can never leak into recall"
+  },
+  "rationale": "Two structural decisions carry the whole epic, and both belong in the storage layer where they cannot be argued with later. First, dimension is a property of the CORPUS, not the tenant: pinning it at creation and refusing to change it makes a mixed-dimension tenant ordinary rather than exceptional. Second, chunks live in their own tables, so exclusion from recall, heat, novelty and consolidation is a consequence of the schema rather than a policy any future change could forget to apply.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-43.1.1",
+      "description": "A `corpora` table exists with tenant_id (NOT NULL, FK to tenants, ON DELETE CASCADE), project_id (nullable FK), slug, name, description, mode (enum: server_embedded | client_embedded), embedding_model (text), dim (integer, NOT NULL, CHECK dim > 0), allow_snippets (boolean), and timestamps. (tenant_id, slug) is unique. dim and embedding_model and mode are set at creation and are NOT castable on update — a changeset that attempts to change any of the three is rejected, and a test asserts each one.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.1.2",
+      "description": "A `document_chunks` table exists with tenant_id, corpus_id (FK, ON DELETE CASCADE), source_ref (text, NOT NULL — a repo-relative path or URL), locator (jsonb — page, byte range, or heading path; the shape is the client's, loopctl only stores and returns it), text (nullable — NULL is the mode B state), snippet (nullable), content_hash (text, NOT NULL), ordinal (integer) and timestamps. A unique index on (corpus_id, source_ref, locator, content_hash) is what makes corpus_index idempotent.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.1.3",
+      "description": "A `document_chunk_embeddings` table mirrors article_embeddings exactly in shape and constraint set: tenant_id, document_chunk_id (FK, ON DELETE CASCADE), dim (integer, CHECK dim > 0), embedding (UNCONSTRAINED vector), embedding_content_hash, timestamps, plus a CONSTRAINT document_chunk_embeddings_dim_matches_vector CHECK (vector_dims(embedding) = dim) and a unique index on (tenant_id, document_chunk_id, dim). It carries NO live_denorm column: a chunk has no supersession state, so the trigger pair that article_embeddings needs has nothing to mirror here and adding one would be dead machinery.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.1.4",
+      "description": "The corpus's dim MUST be in Loopctl.Embeddings.supported_dimensions/0 at creation time, rejected with a named error otherwise, because a dimension outside that set has no pre-built HNSW index and index DDL is migration-plane only. The rejection message names the supported set and states why (the same reason .well-known/loopctl publishes it).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.1.5",
+      "description": "Per-dimension partial HNSW expression indexes are created on document_chunk_embeddings for every value of Loopctl.Embeddings.supported_dimensions/0, using Loopctl.Repo.HnswIndex.create_dimension_index_sql/2 — the SAME generator the article/memory side tables use, so build parameters (m, ef_construction) cannot drift between tiers. The migration uses CREATE INDEX CONCURRENTLY with @disable_ddl_transaction and @disable_migration_lock, matching 20260721000200.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.1.6",
+      "description": "All three tables ENABLE ROW LEVEL SECURITY via Loopctl.Repo.RlsHelpers.enable_rls/1 (not FORCE — the production role owns the tables without BYPASSRLS), and each has a tenant isolation test proving tenant A cannot read tenant B's corpora, chunks or chunk embeddings through Loopctl.Repo.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.1.7",
+      "description": "Every heavy/vector read this story introduces goes through Loopctl.HeavyRead and satisfies its conjunctive predicate contract: the from source AND every joined source carries x.tenant_id == ^tenant_id bound to the caller's tenant. A read that joins document_chunks to document_chunk_embeddings scopes BOTH. The existing heavy_read_guard_test.exs build guard (no lib/ module may reach HeavyReadRepo directly) keeps passing.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.1.8",
+      "description": "A GUARD TEST asserts the exclusion the epic depends on: no query built by the recall path, knowledge_heat_index, novelty scoring or the consolidation pass reads document_chunks or document_chunk_embeddings. It is anchored to code rather than prose — it inspects the modules those paths are built from for a reference to the new schemas and fails on any — and it asserts its own matched set is non-empty so it cannot go vacuous if a module is renamed.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.1.9",
+      "description": "Deleting a corpus cascades to its chunks and their embeddings in one statement, leaving no orphans; a test inserts a corpus with chunks and embeddings, deletes the corpus row, and asserts zero rows remain in both child tables. Cascade is declared in the DDL, not implemented in application code.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.1.10",
+      "description": "Loopctl.Corpus context module exposes create_corpus/2, get_corpus/2, list_corpora/2, delete_corpus/2, upsert_chunks/3 and delete_chunks_for_source/3, every one taking tenant_id as its first argument, with tenant_id never in a changeset cast. No HTTP surface is added in this story — the API and MCP tools are US-43.2 and US-43.4.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-43.1.1",
+      "name": "a corpus pins its own dimension independent of the tenant pin",
+      "type": "integration",
+      "preconditions": ["a tenant whose tenant_embedding_dimension is pinned at 1536"],
+      "steps": ["create a corpus with dim 768 and embedding_model nomic-embed-text", "insert a chunk and a 768-length vector"],
+      "expected_results": ["the corpus is created", "the vector stores without violating the CHECK", "Embeddings.active_dimension/1 for the tenant still returns 1536", "articles in the same tenant continue to embed and search at 1536"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-43.1.2",
+      "name": "a wrong-length vector cannot be stored even bypassing the changeset",
+      "type": "integration",
+      "preconditions": ["a corpus at dim 768"],
+      "steps": ["insert a document_chunk_embeddings row with a 1536-length vector and dim 768 via raw SQL"],
+      "expected_results": ["the insert fails on document_chunk_embeddings_dim_matches_vector"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-43.1.3",
+      "name": "dim, mode and embedding_model are immutable after creation",
+      "type": "unit",
+      "preconditions": ["an existing corpus"],
+      "steps": ["build an update changeset attempting to change dim", "repeat for mode", "repeat for embedding_model"],
+      "expected_results": ["each changeset is invalid or leaves the field unchanged", "no path in the context module can alter any of the three"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-43.1.4",
+      "name": "an unsupported dimension is refused at creation",
+      "type": "unit",
+      "preconditions": ["supported_dimensions/0 returns [768, 1024, 1536]"],
+      "steps": ["create a corpus with dim 3072"],
+      "expected_results": ["creation fails", "the error names the supported set and says a new dimension needs a migration"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-43.1.5",
+      "name": "tenant isolation on all three tables",
+      "type": "integration",
+      "preconditions": ["tenant A and tenant B each with a corpus, chunks and chunk embeddings"],
+      "steps": ["as tenant A, list corpora, chunks and embeddings through Loopctl.Repo"],
+      "expected_results": ["only tenant A rows are returned from each of the three tables"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-43.1.6",
+      "name": "chunks are invisible to the article-corpus paths",
+      "type": "unit",
+      "preconditions": ["the recall, heat, novelty and consolidation modules on this branch"],
+      "steps": ["inspect each for a reference to DocumentChunk or DocumentChunkEmbedding"],
+      "expected_results": ["zero references", "the set of modules inspected is non-empty"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-43.1.7",
+      "name": "a heavy read joining chunks to embeddings scopes both sources",
+      "type": "unit",
+      "preconditions": ["a query joining document_chunks to document_chunk_embeddings"],
+      "steps": ["pass it to HeavyRead with a tenant_id", "then pass a variant that scopes only the from source"],
+      "expected_results": ["the fully scoped query is accepted", "the partially scoped variant is rejected by guard!/2"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-43.1.8",
+      "name": "corpus delete cascades",
+      "type": "integration",
+      "preconditions": ["a corpus with 3 chunks, each with an embedding"],
+      "steps": ["delete the corpus row"],
+      "expected_results": ["zero document_chunks rows remain for that corpus", "zero document_chunk_embeddings rows remain"],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Follow priv/repo/migrations/20260721000100_create_embedding_side_tables.exs closely — it is the reference implementation for an unconstrained vector column with a dim discriminator, and its moduledoc records why each decision was made. The one thing NOT to copy is the live_denorm trigger pair: it exists because article supersession is not expressible across tables, and a document chunk has no supersession state.",
+    "locator is jsonb and its INTERNAL shape belongs to the client. loopctl must not validate that it looks like a page number, because the same tier serves a PDF (page), a source file (line range) and an EDI guide (loop and segment). It is stored, returned verbatim, and participates in the idempotency key. Do NOT normalise it — a normalisation that reorders keys changes the idempotency key and silently duplicates every chunk on the next index run.",
+    "Because locator is part of the unique index, it must be indexed in a form Postgres can compare deterministically. Store it as jsonb and add the unique index on (corpus_id, source_ref, locator, content_hash) — jsonb equality is well-defined and key order is normalised by the type itself, which is the one normalisation that is safe precisely because the database does it consistently.",
+    "The per-dimension HNSW migration must be a SEPARATE migration file from the table creation, exactly as 20260721000200 is separate from 20260721000100, because CREATE INDEX CONCURRENTLY cannot run inside the DDL transaction the table creation uses.",
+    "AC-43.1.8's guard test is the one most likely to be written vacuously. Anchor it to the modules by name, assert the inspected set is non-empty, and verify it by mutation: temporarily add a reference to DocumentChunk in the recall module and confirm the test fails. A guard that passes against a deliberately broken tree is not a guard.",
+    "allow_snippets on the corpus is created in this story but is only ENFORCED in US-43.3, where mode B's snippet policy lives. Creating the column here avoids a second migration on the same table.",
+    "Do not add a corpus-level updated-at-driven re-embed path. Re-dimensioning a corpus is delete-and-re-index by design: the source files are the truth and nothing distilled would be lost."
+  ],
+  "dependencies": [],
+  "estimated_tokens": 260000
+}

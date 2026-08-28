@@ -1,0 +1,168 @@
+{
+  "id": "US-43.2",
+  "title": "Mode A — server-embedded ingest and pointer-plus-snippet retrieval",
+  "epic": { "id": "epic_43", "name": "Corpus Tier" },
+  "priority": "high",
+  "phase": "core",
+  "background": "US-43.1 gives the tier storage and no way to reach it. This story adds the HTTP surface for the mode where loopctl does the embedding: the client sends chunk text, loopctl embeds it with the corpus's pinned model, and corpus_search returns ranked pointers. Mode A is the right shape for material that is public anyway — HCPF companion guides, X12 Glass captures, published books — where there is nothing to protect and the keyword lane is worth having. The retrieval contract is the part that most needs holding: corpus_search returns {source_ref, locator, snippet, score, corpus_id} and deliberately does NOT return whole documents. The agent is told page 47 of a named file and opens it. That keeps responses small, keeps the loop honest about where truth lives, and is identical in both modes, which is what lets US-43.3 add mode B without a second retrieval contract.",
+  "story": {
+    "as_a": "an agent that needs to quote an authoritative reference document",
+    "i_want_to": "index a corpus of verbatim chunks and search it, getting back a file pointer and a snippet",
+    "so_that": "I can open the exact page of the exact document instead of trusting a summary or reading 1300 pages"
+  },
+  "rationale": "Pointer-plus-snippet is the whole design in one contract. Returning bodies would make this a slower Knowledge Wiki with worse writing; returning only scores would make it unusable. The pointer keeps the file the source of truth, which is what makes the tier safe to point at a repo it does not own. Mode A ships first because it needs no client-side machinery, so the retrieval contract can be proven correct before US-43.3 removes the server's ability to read the text.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-43.2.1",
+      "description": "POST /api/v1/corpora creates a corpus (mode server_embedded), GET /api/v1/corpora lists them, GET /api/v1/corpora/:id returns one with its status, DELETE /api/v1/corpora/:id deletes it. Role gates follow the CLAUDE.md checklist and are stated in each controller's moduledoc: create/list/status are role: :agent (non-destructive and audited), DELETE is role: :user (set-based blast radius AND irreversible — one call destroys every chunk and vector in the corpus and nothing restores them).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.2.2",
+      "description": "POST /api/v1/corpora/:id/index accepts a batch of chunks, each {source_ref, locator, text, ordinal}, and is role: :agent. loopctl computes content_hash server-side from the text — the client does not supply it in mode A — embeds each chunk with the corpus's pinned model and dim, and writes chunk plus embedding in one transaction per chunk so a partial batch never leaves an unembedded chunk that search would silently skip.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.2.3",
+      "description": "Indexing is IDEMPOTENT on (corpus_id, source_ref, locator, content_hash): re-submitting an unchanged batch performs no writes, spends no embedding tokens, and reports per-item {unchanged | inserted | replaced}. A chunk whose content_hash changed REPLACES the row at the same (corpus_id, source_ref, locator) and re-embeds. A source_ref whose chunk set shrank has its surplus chunks deleted, so a document that lost a page does not keep serving it.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.2.4",
+      "description": "POST /api/v1/corpora/:id/search takes a query string, embeds it with the corpus's pinned model, and returns ranked results as {source_ref, locator, snippet, score, corpus_id, chunk_id} ordered by descending score. It NEVER returns the full chunk text — the snippet is bounded by one module attribute that the OpenAPI spec's maxLength and the enforcing truncation both read, so the documented bound and the enforced bound cannot drift.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.2.5",
+      "description": "Search runs both lanes in mode A — semantic over the per-dimension HNSW index, and keyword over the chunk text — fused by the same RRF the article path uses, so scores are rank-derived and comparable within a result set. The response's meta names which lanes ran, so a caller can tell a semantic-only result set from a fused one without inferring it.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.2.6",
+      "description": "GET /api/v1/corpora/:id/status reports per-source content hashes and chunk counts, so a client can index only what moved rather than resubmitting the corpus. The response is bounded and paginated; a corpus with thousands of sources does not return them all in one body.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.2.7",
+      "description": "Every mutating endpoint writes to the append-only audit log, fail-closed — an audit write failure fails the request rather than completing it unaudited — matching the pattern the existing knowledge mutation endpoints follow. Indexing and search are rate-limited per tenant via Loopctl.RateLimiter, with the limit charged per ITEM for index (not per request), because one request may carry a large batch and a request-denominated limit is the wrong unit.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.2.8",
+      "description": "Every new endpoint carries an OpenApiSpex operation/2 spec declaring its parameters, its size caps, its 4xx codes and its role requirement. A new environment variable, if any is introduced (batch ceiling, snippet length, rate-limit window), gets a row in deploy/FLY_SECRETS.md with its default and what breaks if it is wrong — mix loopctl.check_env_docs runs in mix precommit and fails the build otherwise.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.2.9",
+      "description": "A tenant with no configured embedding credential gets a named 422 at corpus_create time in mode A, not a failure at first index. The error states that mode A embeds server-side on the tenant's own key and names the one call that provisions it, matching the BYO remediation shape the ingestion endpoint already uses.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.2.10",
+      "description": "Search is a heavy read: it goes through Loopctl.HeavyRead with a tagged endpoint, inherits the per-read SET LOCAL statement_timeout, and degrades on overload the way semantic article search does — returning a tagged error the caller maps to keyword-only rather than raising a 429 through to the agent.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-43.2.1",
+      "name": "re-indexing an unchanged corpus is a no-op",
+      "type": "integration",
+      "preconditions": ["a mode A corpus with 50 indexed chunks"],
+      "steps": ["submit the identical batch again"],
+      "expected_results": ["every item reports unchanged", "no embedding call is made", "chunk and embedding row counts are unchanged", "updated_at on the chunks is unchanged"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-43.2.2",
+      "name": "a changed document replaces only its own chunks",
+      "type": "integration",
+      "preconditions": ["a corpus with chunks from two source_refs"],
+      "steps": ["resubmit one source_ref with altered text for one chunk"],
+      "expected_results": ["that chunk is replaced and re-embedded", "the other chunks of that source are unchanged", "the other source_ref is untouched"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-43.2.3",
+      "name": "a document that lost chunks stops serving them",
+      "type": "integration",
+      "preconditions": ["a source_ref indexed with 10 chunks"],
+      "steps": ["resubmit that source_ref with 7 chunks"],
+      "expected_results": ["3 chunks are deleted", "their embeddings are deleted", "search never returns the removed locators"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-43.2.4",
+      "name": "search returns pointers and never bodies",
+      "type": "integration",
+      "preconditions": ["a corpus with a chunk whose text is far longer than the snippet bound"],
+      "steps": ["search for a phrase in that chunk"],
+      "expected_results": ["the result carries source_ref, locator, a snippet at or under the bound, a score and ids", "no field in the response contains the full chunk text"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-43.2.5",
+      "name": "the documented snippet bound equals the enforced one",
+      "type": "unit",
+      "preconditions": ["the controller module attribute and its operation/2 spec"],
+      "steps": ["read the maxLength from the generated OpenAPI spec", "read the truncation bound applied at runtime"],
+      "expected_results": ["they are the same value and both derive from one attribute"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-43.2.6",
+      "name": "delete requires a user key",
+      "type": "integration",
+      "preconditions": ["an agent-role key and a user-role key in the same tenant"],
+      "steps": ["DELETE the corpus with the agent key", "then with the user key"],
+      "expected_results": ["the agent key is refused with insufficient_role", "the user key succeeds", "chunks and embeddings are gone"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-43.2.7",
+      "name": "a partial batch leaves no unembedded chunk",
+      "type": "integration",
+      "preconditions": ["a batch of 10 chunks where embedding fails on the 6th"],
+      "steps": ["submit the batch"],
+      "expected_results": ["no chunk exists without an embedding", "the response names which items succeeded and which did not", "a retry of the whole batch converges"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-43.2.8",
+      "name": "tenant isolation on search",
+      "type": "integration",
+      "preconditions": ["tenant A and tenant B each with a corpus containing a distinctive phrase"],
+      "steps": ["as tenant A, search for tenant B's phrase"],
+      "expected_results": ["zero results", "no cross-tenant chunk id appears in any field"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-43.2.9",
+      "name": "index rate limit is charged per item",
+      "type": "integration",
+      "preconditions": ["a tenant near its index rate limit"],
+      "steps": ["submit one request carrying a large batch"],
+      "expected_results": ["the limit is charged once per item, not once per request", "the ceiling is reached at the item count, not the request count"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-43.2.10",
+      "name": "an audit write failure fails the request",
+      "type": "integration",
+      "preconditions": ["a corpus and an audit path stubbed to fail"],
+      "steps": ["index a batch"],
+      "expected_results": ["the request fails", "no chunk is persisted", "the failure is distinguishable from a validation error"],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Reuse the retrieval machinery rather than writing a second one. The candidate-pool shape in Loopctl.Knowledge.VectorSearch exists because applying selective filters on the index-ordered scan flipped the planner off HNSW at production scale (the #170/#172 shape, verified by EXPLAIN at 80k articles). A corpus search filtered by corpus_id has exactly the same hazard, so filter on the OUTER over-the-pool subquery, not on the inner ANN.",
+    "corpus_id is a selective filter and a corpus is usually a small fraction of a tenant's chunks, which is the case where an ANN pool can come back empty after filtering. Size the pool against the corpus, or scope the ANN by corpus in a way that stays index-safe, and test the case where the target corpus is a small minority of the tenant's chunk rows. This is the most likely source of a silently-empty search.",
+    "The keyword lane needs an FTS index on document_chunks.text. Note that FTS_REGCONFIG is already an environment variable in this app — reuse the configured regconfig rather than hard-coding english, or the corpus lane will disagree with the article lane on a non-English deployment.",
+    "Do NOT reuse Loopctl.Embeddings.active_dimension/1 anywhere in this story. The corpus's own dim is authoritative (US-43.1). A single call to the tenant resolver is the defect this epic exists to avoid, and it will look correct.",
+    "The per-item transaction in AC-43.2.2 is deliberate and costs throughput. The alternative — one transaction for the batch — makes a 500-chunk index all-or-nothing on a provider hiccup, which for a 1300-page corpus means never converging. Per-item plus idempotency means a retry is cheap and converges.",
+    "corpus_search must NOT be added to /api/v1/recall, and this is worth stating in the controller moduledoc rather than only in the epic README. The recall hook injects into every repo's session; verbatim spec chunks there would be the pollution the separate table exists to prevent."
+  ],
+  "dependencies": ["US-43.1"],
+  "estimated_tokens": 420000
+}
