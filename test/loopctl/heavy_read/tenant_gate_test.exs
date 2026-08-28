@@ -301,7 +301,10 @@ defmodule Loopctl.HeavyRead.TenantGateTest do
       heat_index: :heavy,
       # #584: heavy — GROUP BY over a regexp_replace normalization of every published
       # article; unindexable by construction and growing with the corpus.
-      consolidation: :heavy
+      consolidation: :heavy,
+      # US-43.2: heavy — a pgvector ANN read like its semantic siblings, over-fetching
+      # further because `corpus_id` is a post-ANN residual.
+      corpus_search: :heavy
     }
 
     test "every @heavy_endpoints atom is a known HeavyRead endpoint (no orphan/typo)" do

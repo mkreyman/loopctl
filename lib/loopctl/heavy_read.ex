@@ -214,7 +214,11 @@ defmodule Loopctl.HeavyRead do
   pool. The conflict-link and judged-pair scans this used to list moved to
   `KnowledgeLintWorker` on AdminRepo with #606 and never reach this endpoint), and
   `:llm_usage` (the customer-facing LLM-usage aggregate over `llm_usage_events`, a
-  bounded indexed COUNT/GROUP BY — classified LIGHT by the gate), and `:graph_lane` (the
+  bounded indexed COUNT/GROUP BY — classified LIGHT by the gate), and `:corpus_search` (the US-43.2 corpus tier's
+  two-lane read: a per-dimension HNSW ANN over `document_chunk_embeddings` whose
+  `corpus_id` filter is applied OUTSIDE the index-ordered pool, plus the keyword lane
+  over `document_chunks.search_vector` — classified HEAVY by the gate, like every
+  other ANN read), and `:graph_lane` (the
   #470 opt-in graph-neighbor lane of `search_combined/3`: a bounded, index-backed
   `ArticleLink` seed-set read plus a bounded neighbor-article fetch — classified HEAVY by
   the gate since it fans a preload across up to `@graph_lane_link_limit` link rows).
@@ -241,6 +245,7 @@ defmodule Loopctl.HeavyRead do
     novelty
     vector_search
     memory_recall
+    corpus_search
   )a
 
   # pgvector's default `hnsw.ef_search` (the per-query search breadth / recall ceiling).
@@ -447,6 +452,7 @@ defmodule Loopctl.HeavyRead do
     graph_lane
     heat_index
     consolidation
+    corpus_search
   )a
 
   @doc """

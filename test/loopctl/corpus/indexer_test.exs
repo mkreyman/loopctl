@@ -1,0 +1,380 @@
+defmodule Loopctl.Corpus.IndexerTest do
+  @moduledoc """
+  US-43.2 — mode A ingest.
+
+  Covers TC-43.2.1 (an unchanged re-index is a no-op: no writes, no provider call, no
+  `updated_at` churn), TC-43.2.2 (a changed document replaces only its own chunk),
+  TC-43.2.3 (`source_complete` is what prunes, and only what the request carries),
+  TC-43.2.7 (a failed batch leaves nothing behind, names the failing item, and the
+  corrected resubmit converges) and TC-43.2.10 (a failed audit write rolls the whole
+  request back and is distinguishable from a validation error), plus the mandatory
+  tenant-isolation case.
+  """
+
+  use Loopctl.DataCase, async: true
+
+  import Ecto.Query
+
+  alias Loopctl.AdminRepo
+  alias Loopctl.Corpus
+  alias Loopctl.Corpus.DocumentChunk
+  alias Loopctl.Corpus.DocumentChunkEmbedding
+  alias Loopctl.Corpus.Indexer
+  alias Loopctl.Embeddings.ShrinkLadder
+
+  setup :verify_on_exit!
+
+  # The default MockEmbeddingClient stub returns a 1536-dim vector per text, so the
+  # corpus is pinned at the model whose NATIVE dimension is 1536. That is also what
+  # makes each TENANT's vectors a distinct family (the stub is a pure function of
+  # tenant_id), which is what keeps the shared HNSW index navigable across the suite.
+  defp create_corpus!(tenant_id, attrs \\ %{}) do
+    seq = System.unique_integer([:positive])
+
+    {:ok, corpus} =
+      Corpus.create_corpus(
+        tenant_id,
+        Map.merge(
+          %{
+            slug: "guides-#{seq}",
+            name: "Companion guides",
+            mode: :server_embedded,
+            embedding_model: "text-embedding-3-small",
+            dim: 1536
+          },
+          attrs
+        )
+      )
+
+    corpus
+  end
+
+  defp chunk(source_ref, page, text) do
+    %{
+      "source_ref" => source_ref,
+      "locator" => %{"page" => page},
+      "text" => text,
+      "ordinal" => page
+    }
+  end
+
+  defp pages(source_ref, count, prefix \\ "Loop 2310B carries the rendering provider, page ") do
+    for page <- 1..count, do: chunk(source_ref, page, prefix <> Integer.to_string(page))
+  end
+
+  defp audit_opts, do: [actor_type: "api_key", actor_label: "agent:test"]
+
+  defp chunks_of(corpus) do
+    AdminRepo.all(from(c in DocumentChunk, where: c.corpus_id == ^corpus.id))
+  end
+
+  defp embedding_count(corpus) do
+    AdminRepo.aggregate(
+      from(e in DocumentChunkEmbedding,
+        join: c in DocumentChunk,
+        on: c.id == e.document_chunk_id,
+        where: c.corpus_id == ^corpus.id
+      ),
+      :count,
+      :id
+    )
+  end
+
+  defp index!(tenant_id, corpus, chunks, opts \\ []) do
+    {:ok, result} =
+      Indexer.index_chunks(
+        tenant_id,
+        corpus.id,
+        chunks,
+        Keyword.put_new(opts, :audit, audit_opts())
+      )
+
+    result
+  end
+
+  defp statuses(result), do: Enum.map(result.items, & &1.status)
+
+  describe "index_chunks/4 — first pass" do
+    test "inserts every chunk with a server-computed hash and its embedding" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      result = index!(tenant.id, corpus, pages("a.pdf", 3))
+
+      assert statuses(result) == [:inserted, :inserted, :inserted]
+      assert length(chunks_of(corpus)) == 3
+      assert embedding_count(corpus) == 3
+
+      # The client never supplies content_hash in mode A — the server derives it from
+      # the text, so a client cannot claim a chunk is unchanged when its text moved.
+      [%DocumentChunk{} = stored | _] = chunks_of(corpus)
+      assert stored.content_hash =~ ~r/\A[0-9a-f]{64}\z/
+    end
+
+    test "an empty batch is refused rather than committing a transaction that does nothing" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      assert {:error, {:invalid_chunk, 0, _}} = Indexer.index_chunks(tenant.id, corpus.id, [])
+    end
+
+    test "a batch above the ceiling is refused, and the ceiling is the published one" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+      oversize = pages("a.pdf", Indexer.max_batch_size() + 1)
+
+      assert {:error, {:batch_too_large, max}} =
+               Indexer.index_chunks(tenant.id, corpus.id, oversize)
+
+      assert max == Indexer.max_batch_size()
+    end
+
+    test "a client_embedded corpus refuses this endpoint" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id, %{mode: :client_embedded})
+
+      assert {:error, :mode_mismatch} =
+               Indexer.index_chunks(tenant.id, corpus.id, pages("a.pdf", 1))
+    end
+
+    test "two chunks sharing one (source_ref, locator) in ONE batch are refused" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      batch = [chunk("a.pdf", 1, "first"), chunk("a.pdf", 1, "second")]
+
+      assert {:error, {:duplicate_chunk_key, {"a.pdf", _}}} =
+               Indexer.index_chunks(tenant.id, corpus.id, batch)
+    end
+  end
+
+  # TC-43.2.1
+  describe "re-indexing an unchanged corpus" do
+    test "is a no-op: every item unchanged, no provider call, no row or timestamp churn" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+      batch = pages("a.pdf", 5)
+
+      index!(tenant.id, corpus, batch)
+      before = chunks_of(corpus) |> Map.new(&{&1.id, &1.updated_at})
+
+      # Zero permitted invocations: a re-index that re-embedded would re-bill the
+      # provider for a corpus that did not move, which is the whole point of hashing.
+      expect(Loopctl.MockEmbeddingClient, :generate_embeddings, 0, fn _scope, _texts, _opts ->
+        {:ok, []}
+      end)
+
+      result = index!(tenant.id, corpus, batch)
+
+      assert statuses(result) == List.duplicate(:unchanged, 5)
+      assert result.pruned == 0
+      assert length(chunks_of(corpus)) == 5
+      assert embedding_count(corpus) == 5
+      assert Map.new(chunks_of(corpus), &{&1.id, &1.updated_at}) == before
+    end
+  end
+
+  # TC-43.2.2
+  describe "a changed document" do
+    test "replaces only its own chunk and leaves its siblings and the other source alone" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      index!(tenant.id, corpus, pages("a.pdf", 3) ++ pages("b.pdf", 2))
+      before = chunks_of(corpus) |> Map.new(&{{&1.source_ref, &1.locator}, &1})
+
+      changed = [
+        chunk("a.pdf", 1, "Loop 2310B carries the rendering provider, page 1"),
+        chunk("a.pdf", 2, "REWRITTEN: loop 2310B is now the referring provider"),
+        chunk("a.pdf", 3, "Loop 2310B carries the rendering provider, page 3")
+      ]
+
+      result = index!(tenant.id, corpus, changed)
+
+      assert statuses(result) == [:unchanged, :replaced, :unchanged]
+
+      after_rows = chunks_of(corpus) |> Map.new(&{{&1.source_ref, &1.locator}, &1})
+
+      # Replaced IN PLACE at the same (corpus_id, source_ref, locator) — a second row
+      # at the same locator is exactly what keying on content_hash would have produced.
+      assert map_size(after_rows) == 5
+      replaced = after_rows[{"a.pdf", %{"page" => 2}}]
+      assert replaced.id == before[{"a.pdf", %{"page" => 2}}].id
+      assert replaced.text =~ "REWRITTEN"
+      assert replaced.content_hash != before[{"a.pdf", %{"page" => 2}}].content_hash
+
+      for key <- [{"a.pdf", %{"page" => 1}}, {"a.pdf", %{"page" => 3}}, {"b.pdf", %{"page" => 1}}] do
+        assert after_rows[key].updated_at == before[key].updated_at
+      end
+
+      assert embedding_count(corpus) == 5
+    end
+  end
+
+  # TC-43.2.3
+  describe "a document that lost chunks" do
+    test "keeps serving them until the source is named complete, then stops" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      index!(tenant.id, corpus, pages("a.pdf", 10) ++ pages("b.pdf", 2))
+      assert length(chunks_of(corpus)) == 12
+
+      # Batch one of a multi-batch document: it does NOT name the source, so it must
+      # not delete the chunks the later batches are about to send.
+      shrunk = Enum.take(pages("a.pdf", 10), 7)
+      result = index!(tenant.id, corpus, shrunk)
+
+      assert result.pruned == 0
+      assert length(chunks_of(corpus)) == 12
+
+      # The same seven chunks, now declared to be the whole document.
+      result = index!(tenant.id, corpus, shrunk, source_complete: ["a.pdf"])
+
+      assert result.pruned == 3
+      assert statuses(result) == List.duplicate(:unchanged, 7)
+
+      remaining = chunks_of(corpus)
+      assert length(remaining) == 9
+      assert embedding_count(corpus) == 9
+
+      surviving_pages =
+        remaining |> Enum.filter(&(&1.source_ref == "a.pdf")) |> Enum.map(& &1.locator)
+
+      refute %{"page" => 8} in surviving_pages
+      refute %{"page" => 9} in surviving_pages
+      refute %{"page" => 10} in surviving_pages
+      assert Enum.count(remaining, &(&1.source_ref == "b.pdf")) == 2
+    end
+
+    test "naming a source the batch does not carry is refused" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      index!(tenant.id, corpus, pages("a.pdf", 2) ++ pages("b.pdf", 2))
+
+      assert {:error, {:source_complete_not_carried, ["b.pdf"]}} =
+               Indexer.index_chunks(tenant.id, corpus.id, pages("a.pdf", 2),
+                 source_complete: ["a.pdf", "b.pdf"],
+                 audit: audit_opts()
+               )
+
+      # Nothing was pruned: the refusal is what keeps this verb below the :user line.
+      assert length(chunks_of(corpus)) == 4
+    end
+  end
+
+  # TC-43.2.7
+  describe "a failed batch" do
+    test "leaves nothing behind, names the failing item, and a corrected resubmit converges" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      batch =
+        for page <- 1..10 do
+          text = if page == 6, do: "OVER-LONG PAGE", else: "page #{page} body"
+          chunk("a.pdf", page, text)
+        end
+
+      # The provider rejects any array containing the offending member and names no
+      # member (its real behaviour). The ShrinkLadder bisect is what isolates it.
+      stub(Loopctl.MockEmbeddingClient, :generate_embeddings, fn _scope, texts, _opts ->
+        if Enum.any?(texts, &(&1 == "OVER-LONG PAGE")) do
+          {:error, {:api_error, 400, :context_length_exceeded}}
+        else
+          {:ok, Enum.map(texts, fn _text -> List.duplicate(0.01, 1536) end)}
+        end
+      end)
+
+      assert {:error, {:embedding_failed, _reason, failed}} =
+               Indexer.index_chunks(tenant.id, corpus.id, batch, audit: audit_opts())
+
+      # The item at fault is named — by its position in the submitted batch and by the
+      # pointer the client can act on.
+      assert %{index: 5, source_ref: "a.pdf", locator: %{"page" => 6}} =
+               Enum.find(failed, &(&1.index == 5))
+
+      # All-or-nothing: not one chunk and not one vector survived the failure.
+      assert chunks_of(corpus) == []
+      assert embedding_count(corpus) == 0
+
+      corrected = List.replace_at(batch, 5, chunk("a.pdf", 6, "page 6 body"))
+      result = index!(tenant.id, corpus, corrected)
+
+      assert statuses(result) == List.duplicate(:inserted, 10)
+      assert length(chunks_of(corpus)) == 10
+      assert embedding_count(corpus) == 10
+    end
+
+    test "a truncated vector is marked in the STORED embedding hash, never in the chunk hash" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+      long = String.duplicate("edi table row ", 2_000)
+
+      stub(Loopctl.MockEmbeddingClient, :generate_embeddings, fn _scope, texts, _opts ->
+        if Enum.any?(texts, &(byte_size(&1) > 16_000)) do
+          {:error, {:api_error, 400, :context_length_exceeded}}
+        else
+          {:ok, Enum.map(texts, fn _text -> List.duplicate(0.02, 1536) end)}
+        end
+      end)
+
+      index!(tenant.id, corpus, [chunk("a.pdf", 1, long)])
+
+      [stored] = chunks_of(corpus)
+
+      [embedding] =
+        AdminRepo.all(from(e in DocumentChunkEmbedding, where: e.tenant_id == ^tenant.id))
+
+      # The vector covers a PREFIX, so it is not comparable with whole-text vectors and
+      # says so. The CHUNK hash stays the whole-text hash — it is the idempotency key's
+      # input, and marking it there would make an unchanged chunk look changed forever.
+      assert ShrinkLadder.truncated_hash?(embedding.embedding_content_hash)
+      refute ShrinkLadder.truncated_hash?(stored.content_hash)
+      assert ShrinkLadder.whole_hash(embedding.embedding_content_hash) == stored.content_hash
+    end
+  end
+
+  # TC-43.2.10
+  describe "an audit write failure" do
+    test "fails the request, persists nothing, and is distinguishable from a validation error" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      # `actor_type` is required by `AuditLog.create_changeset/1`, so a nil one is an
+      # audit write that cannot succeed — the fail-closed path, exercised end to end.
+      assert {:error, :audit_write_failed} =
+               Indexer.index_chunks(tenant.id, corpus.id, pages("a.pdf", 3),
+                 audit: [actor_type: nil]
+               )
+
+      assert chunks_of(corpus) == []
+      assert embedding_count(corpus) == 0
+
+      # A validation error is a DIFFERENT term, so the controller can render one as a
+      # 422 the caller fixes and the other as a 500 the caller retries.
+      assert {:error, {:invalid_chunk, 0, _}} =
+               Indexer.index_chunks(tenant.id, corpus.id, [chunk("a.pdf", 1, "   ")],
+                 audit: audit_opts()
+               )
+    end
+  end
+
+  describe "tenant isolation" do
+    test "a corpus of another tenant is not indexable and its chunks are untouched" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      corpus_b = create_corpus!(tenant_b.id)
+
+      index!(tenant_b.id, corpus_b, pages("b.pdf", 2))
+
+      assert {:error, :not_found} =
+               Indexer.index_chunks(tenant_a.id, corpus_b.id, pages("b.pdf", 2),
+                 source_complete: ["b.pdf"],
+                 audit: audit_opts()
+               )
+
+      assert length(chunks_of(corpus_b)) == 2
+    end
+  end
+end

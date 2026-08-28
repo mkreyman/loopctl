@@ -534,6 +534,18 @@ defmodule LoopctlWeb.Router do
     get "/retrieve/tools", ContextRetrieverController, :tools
     post "/retrieve/:entity", ContextRetrieverController, :retrieve
 
+    # Corpus tier (Epic 43) — the index for reference documents whose files stay in
+    # the client's own repo. Same ordering discipline as the knowledge block above:
+    # every LITERAL path first, then the parameterized sub-resources, then the bare
+    # `/corpora/:id` — so a literal segment can never be shadowed by `:id`.
+    get "/corpora", CorpusController, :index
+    post "/corpora", CorpusController, :create
+    post "/corpora/:id/index", CorpusController, :ingest
+    post "/corpora/:id/search", CorpusController, :search
+    get "/corpora/:id/status", CorpusController, :status
+    get "/corpora/:id", CorpusController, :show
+    delete "/corpora/:id", CorpusController, :delete
+
     # Knowledge Wiki (Epic 19)
     # Publish workflow routes (must precede resources to avoid route conflicts)
     post "/articles/:id/publish", ArticleWorkflowController, :publish

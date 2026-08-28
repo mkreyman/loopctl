@@ -71,6 +71,36 @@ defmodule LoopctlWeb.RouteDiscoveryControllerTest do
                inspect(MapSet.to_list(missing))
     end
 
+    # The THIRD closed set, added with US-43.2 and for the same reason as the other two.
+    # The router-to-index direction of this file is filtered by PREFIX, so without an arm
+    # of its own an omitted corpus route fails nothing and the whole surface ships
+    # undiscoverable via GET /api/v1/routes — which is where an agent is told to look
+    # "before probing blindly", and the corpus tier is a surface an agent has no other way
+    # to learn about. Carries the same non-empty-filter assertion, so it cannot go vacuous
+    # if the route shape drifts.
+    test "every /api/v1/corpora route in the router appears in the curated index" do
+      router_corpora =
+        LoopctlWeb.Router.__routes__()
+        |> Enum.filter(&String.starts_with?(&1.path, "/api/v1/corpora"))
+        |> Enum.map(&{verb_string(&1.verb), &1.path})
+        |> MapSet.new()
+
+      indexed =
+        LoopctlWeb.RouteDiscoveryController.curated_routes()
+        |> Enum.map(&{&1.method, &1.path})
+        |> MapSet.new()
+
+      assert MapSet.size(router_corpora) > 0,
+             "the filter matched nothing — it has drifted from the router's shape and this " <>
+               "test is now vacuous"
+
+      missing = MapSet.difference(router_corpora, indexed)
+
+      assert MapSet.equal?(missing, MapSet.new()),
+             "corpus-tier routes missing from the curated /routes index: " <>
+               inspect(MapSet.to_list(missing))
+    end
+
     test "every path in the curated index actually exists in the router" do
       router_paths =
         LoopctlWeb.Router.__routes__() |> Enum.map(& &1.path) |> MapSet.new()

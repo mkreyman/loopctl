@@ -38,6 +38,7 @@ defmodule Loopctl.Corpus.Corpus do
   import Ecto.Changeset
 
   alias Loopctl.Embeddings
+  alias Loopctl.Embeddings.Dimensions
   alias Loopctl.Projects.Project
 
   @type t :: %__MODULE__{}
@@ -99,6 +100,7 @@ defmodule Loopctl.Corpus.Corpus do
       message: "must be lowercase alphanumeric with hyphens or underscores"
     )
     |> validate_supported_dimension()
+    |> validate_model_dimension_agreement()
     |> put_allow_snippets_from_mode()
     |> validate_required([:allow_snippets])
     |> foreign_key_constraint(:tenant_id)
@@ -157,6 +159,43 @@ defmodule Loopctl.Corpus.Corpus do
         ]
       end
     end)
+  end
+
+  # US-43.2 AC-43.2.9 — the ONE model failure the server can detect without a provider
+  # call: a `:server_embedded` corpus whose declared `dim` disagrees with the model's
+  # NATIVE dimension. Discovered at creation, every vector this corpus ever writes
+  # would fail its own `vector_dims(embedding) = dim` CHECK, and the corpus would be
+  # unusable with no supported repair but delete-and-re-create.
+  #
+  # An UNKNOWN model is NOT rejected. `Dimensions.for_model/1` returns nil outside its
+  # curated table, and the article path reads that nil as CANNOT-CHECK rather than as
+  # invalid (`Loopctl.Embeddings.pin_set/2`'s nil clause) — refusing it here would block
+  # a fine-tuned or locally-named model that embeds perfectly well. Whether the
+  # tenant's endpoint actually SERVES the named model is not knowable server-side at
+  # all, and stays a first-index failure.
+  #
+  # Scoped to `:server_embedded` deliberately: in `:client_embedded` mode loopctl never
+  # calls a model, so the name is a label for the client's own pipeline.
+  defp validate_model_dimension_agreement(changeset) do
+    mode = get_field(changeset, :mode)
+    dim = get_field(changeset, :dim)
+    native = Dimensions.for_model(get_field(changeset, :embedding_model))
+
+    # Skipped once `:dim` already carries the supported-set error: that check is the
+    # prior gate, and stacking a second message about the SAME field on one attempt
+    # only makes the actionable one harder to find.
+    if not Keyword.has_key?(changeset.errors, :dim) and mode == :server_embedded and
+         is_integer(dim) and is_integer(native) and native != dim do
+      add_error(
+        changeset,
+        :dim,
+        "is #{dim}, but #{get_field(changeset, :embedding_model)} natively embeds at " <>
+          "#{native} — a server_embedded corpus embeds with that model, so every vector " <>
+          "it wrote would fail the vector_dims(embedding) = dim CHECK"
+      )
+    else
+      changeset
+    end
   end
 
   # The mode-conditional default the DDL cannot express. An explicit value from the

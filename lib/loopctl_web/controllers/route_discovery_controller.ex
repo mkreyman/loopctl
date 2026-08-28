@@ -38,6 +38,50 @@ defmodule LoopctlWeb.RouteDiscoveryController do
       # Route discovery
       %{method: "GET", path: "/api/v1/routes", description: "This endpoint — list all routes"},
 
+      # Corpus tier (Epic 43) — reference documents indexed here, files stay in your repo
+      %{
+        method: "GET",
+        path: "/api/v1/corpora",
+        description: "List document corpora (agent+)"
+      },
+      %{
+        method: "POST",
+        path: "/api/v1/corpora",
+        description:
+          "Create a corpus pinning its own embedding model and dimension. Mode server_embedded " <>
+            "embeds on YOUR key, so a keyless tenant is refused here rather than at first index."
+      },
+      %{
+        method: "POST",
+        path: "/api/v1/corpora/:id/index",
+        description:
+          "Index a bounded batch of verbatim chunks. Idempotent on (source_ref, locator); name a " <>
+            "source in source_complete only when this request carries it in full."
+      },
+      %{
+        method: "POST",
+        path: "/api/v1/corpora/:id/search",
+        description:
+          "Search a corpus. Returns {source_ref, locator, snippet, score} pointers — never the " <>
+            "document body. Deliberately NOT part of /api/v1/recall."
+      },
+      %{
+        method: "GET",
+        path: "/api/v1/corpora/:id/status",
+        description: "Per-source chunk counts and content hashes, so you index only what moved"
+      },
+      %{
+        method: "GET",
+        path: "/api/v1/corpora/:id",
+        description: "One corpus with its status (agent+)"
+      },
+      %{
+        method: "DELETE",
+        path: "/api/v1/corpora/:id",
+        description:
+          "Destroy a corpus with every chunk and vector in it. Role: user — set-based and irreversible."
+      },
+
       # Tenant management
       %{method: "GET", path: "/api/v1/tenants/me", description: "Current tenant info"},
       %{

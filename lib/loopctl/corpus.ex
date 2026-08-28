@@ -169,7 +169,7 @@ defmodule Loopctl.Corpus do
       when is_binary(tenant_id) and is_list(chunks) do
     with {:ok, corpus} <- get_corpus(tenant_id, corpus_id),
          {:ok, rows} <- build_chunk_rows(tenant_id, corpus, chunks),
-         :ok <- refute_duplicate_keys(rows) do
+         :ok <- refute_duplicate_keys(chunk_key_pairs(rows)) do
       {_count, inserted} =
         AdminRepo.insert_all(DocumentChunk, rows,
           on_conflict: {:replace, [:text, :snippet, :content_hash, :ordinal, :updated_at]},
@@ -206,7 +206,73 @@ defmodule Loopctl.Corpus do
     end
   end
 
+  @doc """
+  Per-SOURCE index state for `corpus_id` — one row per `source_ref` with its chunk
+  count and a content hash over that source's chunks (US-43.2 AC-43.2.6).
+
+  A client compares these against what it holds on disk and re-indexes only the
+  sources that moved, rather than resubmitting the corpus. The per-source hash is
+  an md5 over that source's chunk hashes in locator order, so it changes when ANY
+  chunk of the source changes AND when a chunk is added or removed — the two things
+  a client needs to detect.
+
+  The response is BOUNDED and paginated: a corpus with thousands of sources must not
+  return them all in one body. `:limit` is clamped to #{@max_list_limit} and `:offset`
+  floored at 0, exactly as `list_corpora/2` sanitises them. `has_more` is derived by
+  over-fetching one row, so the caller never has to run a second COUNT over the corpus.
+  """
+  @spec source_status(Ecto.UUID.t(), String.t(), keyword()) ::
+          {:ok,
+           %{
+             corpus: Corpus.t(),
+             sources: [map()],
+             limit: pos_integer(),
+             offset: non_neg_integer(),
+             has_more: boolean()
+           }}
+          | {:error, :not_found}
+  def source_status(tenant_id, corpus_id, opts \\ []) when is_binary(tenant_id) do
+    with {:ok, corpus} <- get_corpus(tenant_id, corpus_id) do
+      limit = opts |> Keyword.get(:limit, @default_list_limit) |> clamp_limit()
+      offset = opts |> Keyword.get(:offset, 0) |> clamp_offset()
+
+      rows =
+        from(c in DocumentChunk,
+          where: c.tenant_id == ^tenant_id and c.corpus_id == ^corpus.id,
+          group_by: c.source_ref,
+          order_by: [asc: c.source_ref],
+          limit: ^(limit + 1),
+          offset: ^offset,
+          select: %{
+            source_ref: c.source_ref,
+            chunk_count: count(c.id),
+            content_hash:
+              fragment("md5(string_agg(?, ',' ORDER BY ?, ?))", c.content_hash, c.locator, c.id)
+          }
+        )
+        |> AdminRepo.all()
+
+      {sources, has_more} = {Enum.take(rows, limit), length(rows) > limit}
+
+      {:ok,
+       %{
+         corpus: corpus,
+         sources: sources,
+         limit: limit,
+         offset: offset,
+         has_more: has_more
+       }}
+    end
+  end
+
   # --- internals ---
+
+  # `refute_duplicate_keys/1` compares `{source_ref, locator}` pairs so BOTH callers —
+  # this one, over `insert_all` keyword rows, and `Loopctl.Corpus.Indexer`, over its own
+  # item maps — reach the SAME jsonb-equality comparison rather than each carrying a copy.
+  defp chunk_key_pairs(rows) do
+    Enum.map(rows, &{Keyword.fetch!(&1, :source_ref), Keyword.fetch!(&1, :locator)})
+  end
 
   # `project_id` IS cast from caller input, and the insert runs on the BYPASSRLS
   # `AdminRepo`, so the schema's `foreign_key_constraint(:project_id)` is evaluated
@@ -361,11 +427,12 @@ defmodule Loopctl.Corpus do
   # value would not be the value sent and no comparison form can fix that.
   # The canonical form is used for the COMPARISON only; the reported key and the
   # stored value stay verbatim.
-  defp refute_duplicate_keys(rows) do
-    rows
-    |> Enum.reduce_while(MapSet.new(), fn row, seen ->
-      source_ref = Keyword.fetch!(row, :source_ref)
-      locator = Keyword.fetch!(row, :locator)
+  @doc false
+  @spec refute_duplicate_keys([{String.t(), term()}]) ::
+          :ok | {:error, {:duplicate_chunk_key, {String.t(), term()}}}
+  def refute_duplicate_keys(pairs) do
+    pairs
+    |> Enum.reduce_while(MapSet.new(), fn {source_ref, locator}, seen ->
       key = {source_ref, canonical_locator(locator)}
 
       if MapSet.member?(seen, key) do
@@ -384,21 +451,23 @@ defmodule Loopctl.Corpus do
   # numerically (`1 = 1.0`). A sorted list of stringified-key pairs with integral
   # floats folded to integers reproduces that equality without touching the value
   # that gets stored.
-  defp canonical_locator(value) when is_map(value) and not is_struct(value) do
+  @doc false
+  @spec canonical_locator(term()) :: term()
+  def canonical_locator(value) when is_map(value) and not is_struct(value) do
     value
     |> Enum.map(fn {key, inner} -> {to_string(key), canonical_locator(inner)} end)
     |> Enum.sort()
   end
 
-  defp canonical_locator(value) when is_list(value), do: Enum.map(value, &canonical_locator/1)
+  def canonical_locator(value) when is_list(value), do: Enum.map(value, &canonical_locator/1)
 
-  defp canonical_locator(value) when is_float(value) do
+  def canonical_locator(value) when is_float(value) do
     if value == trunc(value), do: trunc(value), else: value
   end
 
-  defp canonical_locator(value)
-       when is_binary(value) or is_integer(value) or is_boolean(value) or is_nil(value),
-       do: value
+  def canonical_locator(value)
+      when is_binary(value) or is_integer(value) or is_boolean(value) or is_nil(value),
+      do: value
 
   # A bare atom and a struct are not JSON types, and the jsonb encoder renders both
   # as STRINGS: `%{"kind" => :page}` and `%{"kind" => "page"}` are ONE jsonb value
@@ -408,7 +477,7 @@ defmodule Loopctl.Corpus do
   # decoding yields the value jsonb will hold; the STORED value is untouched.
   # `Loopctl.Corpus.Locator` has already refused anything that cannot be encoded,
   # so `Jason.encode!/1` here cannot raise.
-  defp canonical_locator(value),
+  def canonical_locator(value),
     do: value |> Jason.encode!() |> Jason.decode!() |> canonical_locator()
 
   defp stringify_keys(attrs) when is_map(attrs) do

@@ -172,6 +172,10 @@ defmodule Loopctl.HeavyRead.TenantGate do
   # `regexp_replace` expression over every published article, so no index can serve them and
   # their cost grows with the corpus. It is a nightly report-only pass, so shedding it costs
   # one night of a proposal list; starving the request path costs requests.
+  # `corpus_search` (US-43.2) is HEAVY for the plainest reason on the list: it is a pgvector
+  # ANN read, the same shape as `semantic_search` and `vector_search`, and it over-fetches the
+  # inner pool further still because `corpus_id` is a post-ANN residual. Admitting it at light
+  # weight would let a corpus search burst crowd out the article searches it is priced beside.
   @heavy_endpoints ~w(
     vector_search
     semantic_search
@@ -184,6 +188,7 @@ defmodule Loopctl.HeavyRead.TenantGate do
     graph_lane
     heat_index
     consolidation
+    corpus_search
   )a
 
   # --- Client API ---

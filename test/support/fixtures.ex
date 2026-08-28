@@ -455,6 +455,11 @@ defmodule Loopctl.Fixtures do
   def build(:tenant_llm_settings, attrs) do
     Enum.into(attrs, %{
       api_key: "test-anthropic-test-#{System.unique_integer([:positive])}",
+      # US-43.2: the EMBEDDING credential is a separate encrypted column from the
+      # Anthropic one, and `Llm.resolve/2` reads only this column for `:embedding`.
+      # Default nil so every existing fixture caller keeps its keyless-embedding
+      # posture; pass it explicitly to exercise a BYO-embedding path.
+      embedding_api_key: nil,
       extraction_model: nil,
       classification_model: nil,
       merge_model: nil,
@@ -1533,6 +1538,7 @@ defmodule Loopctl.Fixtures do
       |> TenantLlmSettings.models_changeset(data)
       |> TenantLlmSettings.put_api_key(api_key)
       |> TenantLlmSettings.put_chat_api_key(chat_api_key)
+      |> TenantLlmSettings.put_embedding_api_key(Map.get(data, :embedding_api_key))
       |> Ecto.Changeset.put_change(:tenant_id, tenant_id)
       |> AdminRepo.insert!()
 

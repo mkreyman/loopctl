@@ -706,6 +706,45 @@ defmodule LoopctlWeb.FallbackController do
   # stranger agent can provision its own key from the response ALONE — no human
   # needed. Ingest is always the Anthropic path, so the missing credential is the
   # `api_key`.
+  # US-43.2 AC-43.2.9: mode A embeds SERVER-SIDE on the TENANT's own key, so a corpus
+  # created in that mode by a keyless tenant could only fail at first index — long
+  # after the call that could have said so. The remediation is the EMBEDDING
+  # credential (`Remediation.for_credential(:embedding)`), not the Anthropic one the
+  # clause below carries: they are different fields and naming the wrong one sends an
+  # agent to provision a key that would not have helped.
+  def call(conn, {:error, :no_embedding_key_configured, message}) when is_binary(message) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        code: "no_embedding_key",
+        message: message,
+        remediation: Remediation.for_credential(:embedding)
+      }
+    })
+  end
+
+  # US-43.2 AC-43.2.10: BOTH lanes of a heavy read were shed by the per-tenant gate.
+  # A single shed lane never reaches here — the caller degrades to the surviving lane
+  # and names the degradation in `meta`. This is the case where nothing ran, so it is
+  # reported as the transient capacity condition it is (503 + Retry-After) rather than
+  # as an empty result set, which a caller would read as "the corpus has nothing".
+  def call(conn, {:error, :heavy_read_overloaded}) do
+    conn
+    |> put_resp_header("retry-after", "1")
+    |> put_status(:service_unavailable)
+    |> json(%{
+      error: %{
+        status: 503,
+        code: "heavy_read_overloaded",
+        message:
+          "This tenant has too many heavy reads in flight; the query was shed rather " <>
+            "than queued. Retry shortly."
+      }
+    })
+  end
+
   def call(conn, {:error, :no_api_key_configured, message}) when is_binary(message) do
     conn
     |> put_status(:unprocessable_entity)

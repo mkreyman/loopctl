@@ -191,6 +191,23 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
                # are (correctly) absent from this allowlist and asserted to 403.
                {:post, "/api/v1/retrieve/:entity"},
 
+               # Corpus tier (Epic 43): the same class as the KB content surface #331 made
+               # fully agent-usable — verbatim reference chunks whose FILES stay in the
+               # client's own repo, carrying NO chain-of-custody surface at all. Create /
+               # index / search are non-destructive-or-bounded and audited; an agent-rooted
+               # (KB-tier) tenant is the intended user, so tier-gating them would make the
+               # tier unreachable from the tier it is built for. `index` DOES delete, but its
+               # prune reaches only source_refs the SAME request carries chunks for and names
+               # complete, and re-indexing the file restores them — neither set-based nor a
+               # one-way door. `search` is a POST-shaped READ. DELETE is the one verb that is
+               # both set-based and irreversible and is held at `role: :user` in
+               # LoopctlWeb.CorpusController; that is a ROLE gate, which applies
+               # independently of the tier gate.
+               {:post, "/api/v1/corpora"},
+               {:post, "/api/v1/corpora/:id/index"},
+               {:post, "/api/v1/corpora/:id/search"},
+               {:delete, "/api/v1/corpora/:id"},
+
                # KB-only project scope: agent-createable by design (extends owner
                # decision #331 — the KB surface is fully agent-usable). It forces
                # kind: :kb and carries NO chain-of-custody surface, so it is correctly
