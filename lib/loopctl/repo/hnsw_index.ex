@@ -264,13 +264,15 @@ defmodule Loopctl.Repo.HnswIndex do
   def drop_dimension_index_sql(table, dim),
     do: "DROP INDEX CONCURRENTLY IF EXISTS #{dimension_index_name(table, dim)};"
 
-  # The two embedding side tables that carry a per-dimension HNSW index per supported
-  # dimension.
-  @side_tables ["article_embeddings", "memory_embeddings"]
+  # The embedding side tables that carry a per-dimension HNSW index per supported
+  # dimension. `document_chunk_embeddings` (US-43.1, the corpus tier) is here for the
+  # same reason as the other two: the drift guard below must cover every table whose
+  # reads depend on a pre-built per-dimension index.
+  @side_tables ["article_embeddings", "memory_embeddings", "document_chunk_embeddings"]
 
   @doc """
   Every per-dimension HNSW index the CURRENT published supported-dimension set
-  requires across both embedding side tables, as `{table, dim, index_name}` triples.
+  requires across the embedding side tables, as `{table, dim, index_name}` triples.
 
   The dimension set is read from `:supported_embedding_dimensions` config — the SAME
   set `.well-known` advertises and `Loopctl.Embeddings.supported_dimensions/0`
@@ -294,7 +296,7 @@ defmodule Loopctl.Repo.HnswIndex do
   cast/where clauses generate fine) yet makes every read at that dimension emit an
   unindexable `(embedding::vector(N))` cast that sequential-scans the whole corpus —
   the #170/#172 planner-incident class. An EMPTY list means every published dimension
-  is indexed on BOTH side tables; a non-empty list is a deploy that advertised a
+  is indexed on EVERY side table; a non-empty list is a deploy that advertised a
   dimension whose migration has not run. Asserted by a fast (non-scale) drift test so
   it fails on the PR that introduces the config/index mismatch, not in production.
   """
