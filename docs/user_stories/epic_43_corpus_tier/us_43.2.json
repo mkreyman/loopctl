@@ -27,7 +27,7 @@
     },
     {
       "id": "AC-43.2.3",
-      "description": "Indexing is IDEMPOTENT on (corpus_id, source_ref, locator, content_hash): re-submitting an unchanged batch performs no writes, spends no embedding tokens, and reports per-item {unchanged | inserted | replaced}. A chunk whose content_hash changed REPLACES the row at the same (corpus_id, source_ref, locator) and re-embeds. A source_ref whose chunk set shrank has its surplus chunks deleted, so a document that lost a page does not keep serving it.",
+      "description": "Indexing is IDEMPOTENT: a chunk row is KEYED by (corpus_id, source_ref, locator) — the unique index of US-43.1 AC-43.1.2 — and content_hash is the ordinary column that decides whether that row is rewritten. Re-submitting an unchanged batch performs no writes, spends no embedding tokens, and reports per-item {unchanged | inserted | replaced}. A chunk whose content_hash changed REPLACES the row at the same (corpus_id, source_ref, locator) and re-embeds. Pruning is reconciliation over a source's COMPLETE chunk set, so it is never inferred from a batch: the request names source_complete: [source_ref, ...] for the sources it carries in full, and only those are reconciled — a source_ref whose chunk set shrank then has its surplus chunks deleted, so a document that lost a page does not keep serving it. A large document split across several bounded batches names the source only on the batch that completes it, so batch one never deletes the chunks batches two and three are about to send.",
       "status": "pending"
     },
     {
@@ -37,7 +37,7 @@
     },
     {
       "id": "AC-43.2.5",
-      "description": "Search runs both lanes in mode A — semantic over the per-dimension HNSW index, and keyword over the chunk text — fused by the same RRF the article path uses, so scores are rank-derived and comparable within a result set. The response's meta names which lanes ran, so a caller can tell a semantic-only result set from a fused one without inferring it.",
+      "description": "Search runs both lanes in mode A — semantic over the per-dimension HNSW index, and keyword over the chunk text — fused by the SAME RRF the article path uses. That fuser is today Loopctl.Knowledge's private fuse_rrf/6 with article-shaped lanes, so \"the same\" is not reachable as written: this story LIFTS it into a shared lane-shape-agnostic function both paths call, keeping one rrf_k (the :knowledge_rrf_k setting, default 60) and one tiebreak, rather than writing a second fuser that drifts. The article path's behaviour must not change and its existing fusion tests are the evidence. Scores stay rank-derived and comparable within a result set. The response's meta names which lanes ran, so a caller can tell a semantic-only result set from a fused one without inferring it.",
       "status": "pending"
     },
     {
@@ -57,7 +57,7 @@
     },
     {
       "id": "AC-43.2.9",
-      "description": "A tenant with no configured embedding credential gets a named 422 at corpus_create time in mode A, not a failure at first index. The error states that mode A embeds server-side on the tenant's own key and names the one call that provisions it, matching the BYO remediation shape the ingestion endpoint already uses.",
+      "description": "A tenant with no configured embedding credential gets a named 422 at corpus_create time in mode A, not a failure at first index. The error states that mode A embeds server-side on the tenant's own key and names the one call that provisions it, matching the BYO remediation shape the ingestion endpoint already uses. Creation also rejects a mode A corpus whose embedding_model is unknown to Loopctl.Embeddings.Dimensions.for_model/1, or whose declared dim disagrees with that table's native dimension for the model — the two model failures the server can detect without a provider call. Whether the tenant's endpoint actually SERVES the named model is not knowable server-side and stays a first-index failure; the criterion does not claim otherwise.",
       "status": "pending"
     },
     {
@@ -67,12 +67,17 @@
     },
     {
       "id": "AC-43.2.11",
-      "description": "The corpus search endpoint is REGISTERED in both places a heavy ANN read must appear: Loopctl.HeavyRead's @ann_endpoints, without which it gets no SET LOCAL hnsw.ef_search and the HNSW scan returns pgvector's default breadth regardless of how large a pool the code asks for; and TenantGate's @heavy_endpoints, without which it is admitted at the wrong cost weight and cannot be shed under load. A test asserts the endpoint atom appears in both lists.",
+      "description": "The corpus search endpoint is REGISTERED in all THREE places a heavy ANN read must appear: Loopctl.HeavyRead's @known_endpoints, which is the source of truth the other two are partitioned from — heavy_read_hnsw_ef_search_test.exs asserts ann_endpoints/0 is a subset of it, and heavy_read_guard_test.exs statically scans lib/ for every literal HeavyRead.opts(:endpoint) atom against it, so registering only the other two fails both tests; Loopctl.HeavyRead's @ann_endpoints, without which it gets no SET LOCAL hnsw.ef_search and the HNSW scan returns pgvector's default breadth regardless of how large a pool the code asks for; and TenantGate's @heavy_endpoints, without which it is admitted at the wrong cost weight and cannot be shed under load. A test asserts the endpoint atom appears in all three lists.",
       "status": "pending"
     },
     {
       "id": "AC-43.2.12",
-      "description": "The new routes are declared with every LITERAL path before any parameterized sibling (the router invariant stated in comments throughout the knowledge block), a new OpenAPI tag is added to Loopctl.ApiSpec's tags list so the endpoints are grouped rather than untagged, and the routes are added to LoopctlWeb.RouteDiscoveryController's hand-curated curated_routes/0 — which is asserted against the router in BOTH directions, so omitting them fails an existing test rather than silently shipping an undiscoverable surface.",
+      "description": "The new routes are declared with every LITERAL path before any parameterized sibling (the router invariant stated in comments throughout the knowledge block), and a new OpenAPI tag is added to Loopctl.ApiSpec's tags list so the endpoints are grouped rather than untagged.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.2.13",
+      "description": "The routes are added to LoopctlWeb.RouteDiscoveryController's hand-curated curated_routes/0 AND a /api/v1/corpora arm is added to test/loopctl_web/controllers/route_discovery_controller_test.exs alongside the existing /api/v1/admin and /api/v1/channel arms. Only the index-to-router direction is universal there; the router-to-index direction is filtered to those two prefixes, so WITHOUT a corpora arm an omitted route fails nothing and the surface ships undiscoverable via GET /api/v1/routes. The new arm carries the same non-empty-filter assertion the other two do, so it cannot go vacuous if the route shape drifts.",
       "status": "pending"
     }
   ],
@@ -120,12 +125,13 @@
         "a source_ref indexed with 10 chunks"
       ],
       "steps": [
-        "resubmit that source_ref with 7 chunks"
+        "resubmit that source_ref with 7 chunks, naming it in source_complete"
       ],
       "expected_results": [
         "3 chunks are deleted",
         "their embeddings are deleted",
-        "search never returns the removed locators"
+        "search never returns the removed locators",
+        "a batch that does NOT name the source in source_complete deletes nothing"
       ],
       "status": "pending"
     },
@@ -252,7 +258,6 @@
     "corpus_id is a selective filter and a corpus is usually a small fraction of a tenant's chunks, which is the case where an ANN pool can come back empty after filtering. Size the pool against the corpus, or scope the ANN by corpus in a way that stays index-safe, and test the case where the target corpus is a small minority of the tenant's chunk rows. This is the most likely source of a silently-empty search.",
     "The keyword lane needs an FTS index on document_chunks.text. Note that FTS_REGCONFIG is already an environment variable in this app — reuse the configured regconfig rather than hard-coding english, or the corpus lane will disagree with the article lane on a non-English deployment.",
     "Do NOT reuse Loopctl.Embeddings.active_dimension/1 anywhere in this story. The corpus's own dim is authoritative (US-43.1). A single call to the tenant resolver is the defect this epic exists to avoid, and it will look correct.",
-    "The per-item transaction in AC-43.2.2 is deliberate and costs throughput. The alternative — one transaction for the batch — makes a 500-chunk index all-or-nothing on a provider hiccup, which for a 1300-page corpus means never converging. Per-item plus idempotency means a retry is cheap and converges.",
     "corpus_search must NOT be added to /api/v1/recall, and this is worth stating in the controller moduledoc rather than only in the epic README. The recall hook injects into every repo's session; verbatim spec chunks there would be the pollution the separate table exists to prevent.",
     "An over-long chunk is a real case for a verbatim tier — a page of dense EDI tables can exceed the provider's input limit. Loopctl.Embeddings.ShrinkLadder already handles it and its contract must be honoured: a shrunk vector returns {:ok, vector, :truncated} rather than a bare {:ok, vector}, and the truncation is marked in the content hash via truncated_hash/1, because a prefix vector is not comparable with whole-text vectors. Do not silently truncate; a chunk whose vector covers only its first half must be distinguishable, or re-indexing will read it as unchanged forever.",
     "The batch embed path takes ONE admission token for the whole array, and vectors must be mapped back by the provider response's index field NEVER by array position, with a partial response failing the whole batch. That is the EmbeddingBehaviour contract; reuse it rather than writing a second client.",

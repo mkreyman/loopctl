@@ -140,10 +140,13 @@ Applying the CLAUDE.md checklist rather than inheriting the KB's answers:
 | `corpus_create`, `corpus_index`, `corpus_list`, `corpus_status`, `corpus_search` | `:agent` | non-destructive + audited — the same criteria that earn the KB content carve-out its agent role |
 | `corpus_delete` | `:user` | set-based blast radius AND irreversible: one call destroys every chunk and vector in a corpus, and nothing restores them |
 
-`corpus_index` is a mutating write, but it is idempotent on `(corpus_id, source_ref,
-locator, content_hash)` and destroys nothing, so it does not reach the `:user` line.
-Re-indexing a changed document replaces only that document's chunks; there is no
-set-based delete verb below `:user`.
+`corpus_index` is a mutating write and it DOES delete: US-43.2 AC-43.2.3 prunes a
+source's surplus chunks when its chunk set shrinks. That stays below the `:user` line
+because the deletion is not set-based and not a one-way door — it is confined to the
+`source_ref`s the caller names as complete in that same request, it is the direct
+consequence of the file the caller is resubmitting, and re-indexing that file restores
+it. `corpus_delete` is the verb that is both set-based and irrecoverable, and it is the
+one at `:user`.
 
 ## What this epic deliberately does not do
 

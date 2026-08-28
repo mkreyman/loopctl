@@ -32,7 +32,7 @@
     },
     {
       "id": "AC-43.4.4",
-      "description": "The loopctl CLAUDE.md Knowledge Wiki section gains a paragraph and a routing-table row distinguishing the tier from the three existing information surfaces, keyed on the SHAPE of the question: quote me the exact text of an authoritative document goes to corpus_search; what did we learn about X goes to knowledge_search; a live structured business row goes to retrieve_*; a fact only I need goes to memory_remember. The row states what corpus_search returns (a pointer plus a snippet, not a body) so the caller knows the next step is to open the file.",
+      "description": "This repo's own CLAUDE.md — NOT the user-level ~/.claude/CLAUDE.md, which is where the \"Knowledge Wiki\" heading actually lives and is out of scope here — gains a paragraph and a row in the routing table under the \"Epic 30: Context Retriever — three surfaces\" heading, the section that carries the retrieve_* / knowledge_* / memory_* rule, distinguishing the tier from the three existing information surfaces, keyed on the SHAPE of the question: quote me the exact text of an authoritative document goes to corpus_search; what did we learn about X goes to knowledge_search; a live structured business row goes to retrieve_*; a fact only I need goes to memory_remember. The row states what corpus_search returns (a pointer plus a snippet, not a body) so the caller knows the next step is to open the file.",
       "status": "pending"
     },
     {
@@ -42,21 +42,16 @@
     },
     {
       "id": "AC-43.4.6",
-      "description": "Role visibility is handled honestly rather than invented. There is NO role filtering in the MCP server's ListTools — it returns the static TOOLS array unconditionally plus the tenant's generated cr_* tools — and there is no server-side allowlist of MCP tool NAMES anywhere; role is enforced only by RequireRole on the HTTP endpoint, with the client choosing which env key to send. So corpus_delete is listed like every other tool and its description states that it is user-role and irreversible, and the story does NOT build an allowlist layer. Making the tools visible to SUBAGENTS is a separate matter: each agent definition in claude-config carries an explicit tools: frontmatter list, so a mcp__loopctl__corpus_* tool is invisible to every one of them until added there. That is a cross-repo change and is named in this story's closing report as unmade, not silently skipped.",
+      "description": "mcp-server tests cover the new tools by IMPORTING the builders from mcp-server/lib/ and exercising the shipped code — explicitly NOT in the style of knowledge_tools.test.js, whose own header records that it re-implements the handler bodies inside the test file, so those tests can pass against a mirror while index.js regresses. They cover the argument forwarding, the path building for each tool, and at least one test asserting that a mode B search forwards a vector rather than a query string.",
       "status": "pending"
     },
     {
       "id": "AC-43.4.7",
-      "description": "mcp-server tests cover the new tools in the style of the existing knowledge_tools.test.js: the argument forwarding, the path building for each tool, and at least one test asserting that a mode B search forwards a vector rather than a query string.",
-      "status": "pending"
-    },
-    {
-      "id": "AC-43.4.8",
       "description": "An end-to-end test indexes a small corpus through the MCP tool surface and searches it, asserting the returned pointer identifies a chunk that was actually indexed. This is the only test in the epic that exercises the whole path an agent uses, and it is what proves the tier is reachable rather than merely present.",
       "status": "pending"
     },
     {
-      "id": "AC-43.4.9",
+      "id": "AC-43.4.8",
       "description": "mcp-server/package.json is version-bumped in the SAME PR as the index.js, lib/ and README changes. The mcp-server-ci.yml version-bump job fails a PR that touches the published files without one, with the message that nothing publishes to npm without a version bump so agents keep the OLD tool descriptions while the server serves the new payload — a failure mode that shipped six times before the guard existed. The required branch-protection context is the MCP Server Gate job, not the Node unit tests job.",
       "status": "pending"
     }
@@ -120,7 +115,7 @@
         "CLAUDE.md on this branch"
       ],
       "steps": [
-        "read the Knowledge Wiki routing section"
+        "read the Epic 30 three-surfaces routing section in this repo's CLAUDE.md"
       ],
       "expected_results": [
         "a row keys the quote-the-document question shape to corpus_search",
@@ -147,13 +142,12 @@
     }
   ],
   "technical_notes": [
-    "The routing paragraph belongs in loopctl's CLAUDE.md, which every session and subagent on this repo is guaranteed to read. The claude-config half — a line in the user-level routing guidance so sessions in OTHER repos know the tier exists — is a cross-repo change and is NOT this story. Say so explicitly in the story's closing report rather than leaving it implied, the way US-42.2's AC-42.2.7 did.",
+    "The routing paragraph belongs in loopctl's CLAUDE.md, which every session and subagent on this repo is guaranteed to read. The claude-config half — a line in the user-level routing guidance so sessions in OTHER repos know the tier exists — is a cross-repo change and is NOT this story. Say so explicitly in the story's closing report rather than leaving it implied, the way US-42.2's AC-42.2.7 did. Tool VISIBILITY is settled and needs no criterion of its own: the MCP server's ListTools returns the static TOOLS array unconditionally plus the tenant's generated cr_* tools, there is no server-side allowlist of tool NAMES anywhere, and role is enforced only by RequireRole on the HTTP endpoint — so corpus_delete is listed like every other tool with its user-role irreversibility stated in its description (AC-43.4.2), and this story builds no allowlist layer. Making the tools reach SUBAGENTS is the other half of the same cross-repo change: each agent definition in claude-config carries an explicit tools: frontmatter list, so mcp__loopctl__corpus_* is invisible to every one of them until added there.",
     "Write the tool descriptions for a model choosing between verbs, not for a human reading a manual. The distinguishing sentence is the first one: what question does this answer that knowledge_search does not. Everything after that is parameters.",
     "Do not add the corpus tools to any auto-injected recall or hint block. The tier's discoverability comes from the routing rule, not from injecting rows into every prompt — the injected channel already measures at 5-13% follow-through and adding a second stream of unopened rows would make that worse, not better.",
-    "AC-43.4.6 needs the actual mechanism checked at implementation time rather than assumed: confirm whether ListTools filtering is server-side by role, client-side, or absent, and implement visibility in whichever layer actually decides it. If no such mechanism exists, say so in the report and leave corpus_delete visible with its role stated in the description — inventing an allowlist layer is out of scope for this story.",
-    "The end-to-end test in AC-43.4.8 is the acceptance criterion the whole epic is judged against. Everything before it can pass with a tier no agent can reach.",
+    "The end-to-end test in AC-43.4.7 is the acceptance criterion the whole epic is judged against. Everything before it can pass with a tier no agent can reach.",
     "Put anything with real logic — query-string building, argument coercion, batch shaping — into mcp-server/lib/ rather than index.js. index.js is a stdio entry point with top-level await, so importing it boots the server and tests cannot reach its handlers; the existing suite RE-IMPLEMENTS handler bodies inside the test file to work around that, which means those tests can pass against a mirror while the shipped code regresses. Code in lib/ is imported and exercised for real.",
-    "AC-43.4.9's version bump is easy to forget precisely because it is not part of the feature. Bump it in the same commit that adds the tools, not as a follow-up."
+    "AC-43.4.8's version bump is easy to forget precisely because it is not part of the feature. Bump it in the same commit that adds the tools, not as a follow-up."
   ],
   "dependencies": [
     "US-43.3"
