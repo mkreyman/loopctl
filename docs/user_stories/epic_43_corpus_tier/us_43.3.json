@@ -14,7 +14,7 @@
   "acceptance_criteria": [
     {
       "id": "AC-43.3.1",
-      "description": "A corpus created with mode client_embedded accepts index items of the shape {source_ref, locator, vector, content_hash, ordinal, snippet?} and has NO parameter that accepts chunk text. Submitting text to a mode B corpus is refused with a named error rather than silently ignored, because silently dropping it would let a client believe the keyword lane works.",
+      "description": "A corpus created with mode client_embedded accepts index items of the shape {source_ref, locator, vector, content_hash, ordinal, snippet?} plus the same top-level source_complete list US-43.2 AC-43.2.3 defines, under the same bound, and has NO parameter that accepts chunk text. Submitting text to a mode B corpus is refused with a named error rather than silently ignored, because silently dropping it would let a client believe the keyword lane works.",
       "status": "pending"
     },
     {
@@ -142,7 +142,7 @@
     "AC-43.3.8's test is the story's real deliverable. Write it so it would FAIL if someone later added a convenience field that echoed a snippet or logged a request body. Verify it by mutation: temporarily echo the submitted payload into a log line and confirm the test catches it.",
     "The refusals in AC-43.3.1, AC-43.3.4 and AC-43.3.5 all exist for one reason: an empty result set is read by an agent as an empty corpus. That is the exact failure mkreyman/home_care_billing#1385 documents — a documented tool returning empty is worse than no tool, because a session trusts the empty answer. Every mode mismatch must be an error with a remedy, never silence.",
     "allow_snippets defaulting to FALSE for mode B is deliberate and will feel inconvenient during the first cutover, because a snippet makes results much more readable. That is the correct trade: the operator who wants snippets can create the corpus asking for them, and the one who forgets gets the safe behaviour.",
-    "There is no batching subtlety here that US-43.2 did not already solve — mode B reuses the same per-item transaction and the same idempotency key. The only difference is that content_hash arrives rather than being computed."
+    "There is no batching subtlety here that US-43.2 did not already solve — mode B reuses the same ONE-Ecto.Multi batch shape (AC-43.2.2) and the same (corpus_id, source_ref, locator) key. The only difference is that content_hash arrives rather than being computed."
   ],
   "dependencies": ["US-43.2"],
   "estimated_tokens": 280000

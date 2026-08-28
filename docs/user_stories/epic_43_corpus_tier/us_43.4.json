@@ -17,7 +17,7 @@
   "acceptance_criteria": [
     {
       "id": "AC-43.4.1",
-      "description": "mcp-server declares corpus_create, corpus_index, corpus_search, corpus_list, corpus_status and corpus_delete as statically-declared typed tools, following the existing definition-plus-dispatch-case pattern in mcp-server/index.js, with path-building logic placed in lib/http-helpers.js so it is importable and unit-testable rather than embedded in the stdio entry point.",
+      "description": "mcp-server declares corpus_create, corpus_index, corpus_search, corpus_list, corpus_status and corpus_delete as statically-declared typed tools, following the existing definition-plus-dispatch-case pattern in mcp-server/index.js, with the path-building AND request-body-building logic for every corpus tool placed in lib/http-helpers.js so both are importable and unit-testable rather than embedded in the stdio entry point — that placement is what makes AC-43.4.6's import-the-shipped-code requirement satisfiable. corpus_index's arguments carry the source_complete list of US-43.2 AC-43.2.3, or the prune is unreachable through the only surface an agent uses.",
       "status": "pending"
     },
     {
@@ -32,7 +32,7 @@
     },
     {
       "id": "AC-43.4.4",
-      "description": "This repo's own CLAUDE.md — NOT the user-level ~/.claude/CLAUDE.md, which is where the \"Knowledge Wiki\" heading actually lives and is out of scope here — gains a paragraph and a row in the routing table under the \"Epic 30: Context Retriever — three surfaces\" heading, the section that carries the retrieve_* / knowledge_* / memory_* rule, distinguishing the tier from the three existing information surfaces, keyed on the SHAPE of the question: quote me the exact text of an authoritative document goes to corpus_search; what did we learn about X goes to knowledge_search; a live structured business row goes to retrieve_*; a fact only I need goes to memory_remember. The row states what corpus_search returns (a pointer plus a snippet, not a body) so the caller knows the next step is to open the file.",
+      "description": "This repo's own CLAUDE.md — NOT the user-level ~/.claude/CLAUDE.md, which is where the \"Knowledge Wiki\" heading actually lives and is out of scope here — gains a bullet and a Rule-of-thumb clause in the section headed \"Epic 30: Context Retriever — three surfaces\", which carries the retrieve_* / knowledge_* / memory_* rule as a bullet list plus a Rule-of-thumb line and NOT a table, and whose heading and THIRD-surface opening are updated to four; distinguishing the tier from the three existing information surfaces, keyed on the SHAPE of the question: quote me the exact text of an authoritative document goes to corpus_search; what did we learn about X goes to knowledge_search; a live structured business row goes to retrieve_*; a fact only I need goes to memory_remember. The bullet states what corpus_search returns (a pointer plus a snippet, not a body) so the caller knows the next step is to open the file.",
       "status": "pending"
     },
     {
@@ -109,7 +109,7 @@
     },
     {
       "id": "TC-43.4.4",
-      "name": "the routing table names the corpus tier",
+      "name": "the routing section names the corpus tier",
       "type": "manual",
       "preconditions": [
         "CLAUDE.md on this branch"
@@ -118,7 +118,7 @@
         "read the Epic 30 three-surfaces routing section in this repo's CLAUDE.md"
       ],
       "expected_results": [
-        "a row keys the quote-the-document question shape to corpus_search",
+        "the bullet and the Rule-of-thumb line key the quote-the-document question shape to corpus_search",
         "it states that a pointer, not a body, comes back",
         "it names the failure the rule prevents"
       ],

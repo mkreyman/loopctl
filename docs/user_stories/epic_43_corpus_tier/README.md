@@ -137,16 +137,16 @@ Applying the CLAUDE.md checklist rather than inheriting the KB's answers:
 
 | operation | role | why |
 |---|---|---|
-| `corpus_create`, `corpus_index`, `corpus_list`, `corpus_status`, `corpus_search` | `:agent` | non-destructive + audited — the same criteria that earn the KB content carve-out its agent role |
+| `corpus_create`, `corpus_list`, `corpus_status`, `corpus_search` | `:agent` | non-destructive + audited — the same criteria that earn the KB content carve-out its agent role |
+| `corpus_index` | `:agent` | it DOES delete, but neither set-based nor a one-way door: the prune reaches only `source_ref`s the same request carries chunks for and names complete, and re-indexing the file restores them |
 | `corpus_delete` | `:user` | set-based blast radius AND irreversible: one call destroys every chunk and vector in a corpus, and nothing restores them |
 
-`corpus_index` is a mutating write and it DOES delete: US-43.2 AC-43.2.3 prunes a
-source's surplus chunks when its chunk set shrinks. That stays below the `:user` line
-because the deletion is not set-based and not a one-way door — it is confined to the
-`source_ref`s the caller names as complete in that same request, it is the direct
-consequence of the file the caller is resubmitting, and re-indexing that file restores
-it. `corpus_delete` is the verb that is both set-based and irrecoverable, and it is the
-one at `:user`.
+`corpus_index`'s delete is US-43.2 AC-43.2.3's prune: a source's surplus chunks go when
+its chunk set shrinks. AC-43.2.3 bounds it — a `source_ref` may be named in
+`source_complete` only if the same request carries at least one chunk for it — so no
+request can prune content it does not resend, and an empty batch cannot reach the
+corpus. `corpus_delete` is the verb that is both set-based and irrecoverable, and it is
+the one at `:user`.
 
 ## What this epic deliberately does not do
 

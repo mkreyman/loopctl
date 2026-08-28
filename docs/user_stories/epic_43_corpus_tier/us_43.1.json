@@ -17,12 +17,12 @@
   "acceptance_criteria": [
     {
       "id": "AC-43.1.1",
-      "description": "A `corpora` table exists with tenant_id (NOT NULL, FK to tenants, ON DELETE CASCADE), project_id (nullable FK), slug, name, description, mode (enum: server_embedded | client_embedded), embedding_model (text), dim (integer, NOT NULL, CHECK dim > 0), allow_snippets (boolean, NOT NULL, with NO DDL default), and timestamps. (tenant_id, slug) is unique. allow_snippets carries no column default deliberately: US-43.3 AC-43.3.6 requires the default to be FALSE for a client_embedded corpus and it is TRUE for server_embedded, and a mode-conditional default is expressible in the changeset but not in DDL.",
+      "description": "A `corpora` table exists with tenant_id (NOT NULL, FK to tenants, ON DELETE CASCADE), project_id (nullable FK), slug, name, description, mode (enum: server_embedded | client_embedded), embedding_model (text), dim (integer, NOT NULL, CHECK dim > 0), allow_snippets (boolean, NOT NULL, with NO DDL default), and timestamps. (tenant_id, slug) is unique. allow_snippets carries no column default deliberately: it is TRUE for a server_embedded corpus (loopctl holds the text already) and FALSE for a client_embedded one (the privacy-preserving default US-43.3 AC-43.3.6 states), and a mode-conditional default is expressible in the changeset but not in DDL. THIS story's changeset supplies it from mode, so US-43.2's create cannot insert a NULL before US-43.3 lands.",
       "status": "pending"
     },
     {
       "id": "AC-43.1.2",
-      "description": "A `document_chunks` table exists with tenant_id, corpus_id (FK, ON DELETE CASCADE), source_ref (text, NOT NULL — a repo-relative path or URL), locator (jsonb — page, byte range, or heading path; the shape is the client's, loopctl only stores and returns it), text (nullable — NULL is the mode B state), snippet (nullable), content_hash (text, NOT NULL), ordinal (integer), a search_vector tsvector GENERATED ALWAYS AS a to_tsvector over text STORED with a GIN index over it, and timestamps. The regconfig is BAKED IN at migration time the way 20260724190000_apply_fts_regconfig.exs bakes it for articles (a generated column cannot read config at runtime), so the corpus keyword lane of US-43.2 AC-43.2.5 hits the GIN index and cannot disagree with the article lane on a non-English deployment. A unique index on (corpus_id, source_ref, locator) — content_hash is NOT in the key — is what makes corpus_index idempotent. content_hash is an ordinary column compared against the incoming chunk to decide unchanged vs replaced; putting it in the key would let a chunk whose text moved insert a SECOND row at the same locator instead of replacing the first, which is exactly what US-43.2 AC-43.2.3 forbids.",
+      "description": "A `document_chunks` table exists with tenant_id, corpus_id (FK, ON DELETE CASCADE), source_ref (text, NOT NULL — a repo-relative path or URL), locator (jsonb — page, byte range, or heading path; the shape is the client's, loopctl only stores and returns it), text (nullable — NULL is the mode B state), snippet (nullable), content_hash (text, NOT NULL), ordinal (integer) and timestamps. The keyword lane's FTS column and index belong to US-43.2, which owns that lane and its regconfig decision. A unique index on (corpus_id, source_ref, locator) — content_hash is NOT in the key — is what makes corpus_index idempotent. content_hash is an ordinary column compared against the incoming chunk to decide unchanged vs replaced; putting it in the key would let a chunk whose text moved insert a SECOND row at the same locator instead of replacing the first, which is exactly what US-43.2 AC-43.2.3 forbids.",
       "status": "pending"
     },
     {
@@ -47,7 +47,7 @@
     },
     {
       "id": "AC-43.1.7",
-      "description": "This story adds NO heavy or vector read — the first is US-43.2 corpus_search — so what is asserted here is the CONTRACT the new schemas must be able to satisfy when that read arrives, rather than a property of code this story ships. A query joining document_chunks to document_chunk_embeddings must be able to carry x.tenant_id == ^tenant_id on the from source AND on every joined source, which is what Loopctl.HeavyRead's conjunctive predicate guard demands; TC-43.1.7 asserts guard!/2 ACCEPTS the fully scoped join and REJECTS the variant scoping only the from source, so a schema that made the join un-scopeable fails here and not in US-43.2. The existing heavy_read_guard_test.exs build guard (no lib/ module may reach HeavyReadRepo directly) keeps passing.",
+      "description": "This story adds NO heavy or vector read — the first is US-43.2 corpus_search — so what is asserted here is the CONTRACT the new schemas must be able to satisfy when that read arrives, rather than a property of code this story ships. A query joining document_chunks to document_chunk_embeddings must be able to carry x.tenant_id == ^tenant_id on the from source AND on every joined source, which is what Loopctl.HeavyRead's conjunctive predicate guard demands; guard!/2 is private, so TC-43.1.7 asserts it through the only reachable path — HeavyRead.all/2 accepts the fully scoped join and raises ArgumentError (not fully scoped to the given tenant) on the variant scoping only the from source, exactly as test/loopctl/embeddings_side_table_reads_test.exs:310-328 already does, so a schema that made the join un-scopeable fails here and not in US-43.2. The existing heavy_read_guard_test.exs build guard (no lib/ module may reach HeavyReadRepo directly) keeps passing.",
       "status": "pending"
     },
     {
@@ -129,7 +129,7 @@
         "repeat for embedding_model"
       ],
       "expected_results": [
-        "each changeset is invalid or leaves the field unchanged",
+        "each changeset is invalid with an error on the field — silently dropping the change does not satisfy AC-43.1.13",
         "no path in the context module can alter any of the three"
       ],
       "status": "pending"
@@ -184,7 +184,7 @@
     {
       "id": "TC-43.1.7",
       "name": "a heavy read joining chunks to embeddings scopes both sources",
-      "type": "unit",
+      "type": "integration",
       "preconditions": [
         "a query joining document_chunks to document_chunk_embeddings"
       ],
@@ -194,7 +194,7 @@
       ],
       "expected_results": [
         "the fully scoped query is accepted",
-        "the partially scoped variant is rejected by guard!/2"
+        "the partially scoped variant raises ArgumentError out of HeavyRead.all/2"
       ],
       "status": "pending"
     },
@@ -224,7 +224,7 @@
     "allow_snippets on the corpus is created in this story but is only ENFORCED in US-43.3, where mode B's snippet policy lives. Creating the column here avoids a second migration on the same table.",
     "Do not add a corpus-level updated-at-driven re-embed path. Re-dimensioning a corpus is delete-and-re-index by design: the source files are the truth and nothing distilled would be lost.",
     "The unique index in AC-43.1.2 puts a jsonb column in a btree, which Postgres allows but caps at ~2704 bytes per index entry; an index insert over that raises. Locators are small in every anticipated use (a page number, a byte range, a heading path), but the migration should note the cap, and if a client ever needs a large locator the fix is a generated locator_hash column in the index rather than widening the entry.",
-    "Reuse index_safe_dimension_knn_base/6 rather than writing a KNN query. It emits ONLY the predicates the partial index carries — tenant_id equality, the dimension literal, live_denorm, the cast ORDER BY, and LIMIT — and both the dim literal and the vector typmod are COMPILE-TIME literals, one function clause per supported dimension. That is deliberate: under a Postgres generic plan the planner cannot prove dim = $1 implies dim = 768, so a bound parameter disqualifies the partial index and reverts to a seq scan plus sort. Anything selective added to that inner query is the same regression."
+    "US-43.2's search must reuse index_safe_dimension_knn_base/6 rather than writing a KNN query — the constraint is recorded here because AC-43.1.4's column names are what keep that reuse possible. It emits ONLY the predicates the partial index carries — tenant_id equality, the dimension literal, live_denorm, the cast ORDER BY, and LIMIT — and both the dim literal and the vector typmod are COMPILE-TIME literals, one function clause per supported dimension. That is deliberate: under a Postgres generic plan the planner cannot prove dim = $1 implies dim = 768, so a bound parameter disqualifies the partial index and reverts to a seq scan plus sort. Anything selective added to that inner query is the same regression."
   ],
   "dependencies": [],
   "estimated_tokens": 260000
