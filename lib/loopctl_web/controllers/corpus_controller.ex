@@ -17,6 +17,11 @@ defmodule LoopctlWeb.CorpusController do
   | `POST /api/v1/corpora/:id/search` | `:agent` | a POST-shaped read (the query body is richer than a query string) |
   | `DELETE /api/v1/corpora/:id` | `:user` | set-based blast radius AND irreversible: one call destroys every chunk and vector in the corpus and nothing restores them |
 
+  Every MUTATING verb — create, index and delete — writes its audit entry inside the
+  mutation's own transaction (AC-43.2.7), so a corpus that could not be recorded is
+  neither created nor destroyed: the audit step failing rolls the write back and answers
+  `500 audit_write_failed`.
+
   `DELETE` is the one verb that is both set-based and irrecoverable, which is exactly
   the CLAUDE.md test for the `:user` line. `index`'s delete is bounded by AC-43.2.3's
   reconciliation rule, so it stays below it.
@@ -74,10 +79,11 @@ defmodule LoopctlWeb.CorpusController do
   # rather than as a named schema (there is no shared success schema in `Schemas`).
   @ok_object %OpenApiSpex.Schema{type: :object}
 
-  # Per-minute caps, both set BELOW the pipeline per-key default so the specific 429
-  # stays the binding, observable constraint instead of being shadowed by an anonymous
-  # pipeline 429. `index` is charged per ITEM (one request may carry @max_batch_size
-  # chunks), which is why its cap is the larger number in the same unit as the work.
+  # Per-minute caps. `search` is charged once per REQUEST and is clamped below the
+  # pipeline per-key default, so the specific 429 stays the binding, observable
+  # constraint instead of being shadowed by an anonymous pipeline 429. `index` is charged
+  # per ITEM (one request may carry @max_batch_size chunks), which is why its cap is the
+  # larger number — and why it is NOT clamped against a per-request setting.
   @default_index_limit 240
   @default_search_limit 120
   @pipeline_per_key_limit_default 300
@@ -124,7 +130,10 @@ defmodule LoopctlWeb.CorpusController do
       422 =>
         {"Validation failed, or no embedding key for mode A", "application/json",
          Schemas.ErrorResponse},
-      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      500 =>
+        {"Audit write failed — the corpus was NOT created", "application/json",
+         Schemas.ErrorResponse}
     }
   )
 
@@ -134,7 +143,7 @@ defmodule LoopctlWeb.CorpusController do
     attrs = Map.drop(params, ["_json"])
 
     with :ok <- require_embedding_key(tenant_id, Map.get(attrs, "mode")),
-         {:ok, corpus} <- Corpus.create_corpus(tenant_id, attrs) do
+         {:ok, corpus} <- Corpus.create_corpus(tenant_id, attrs, AuditContext.from_conn(conn)) do
       conn
       |> put_status(:created)
       |> json(%{data: render_corpus(corpus)})
@@ -246,7 +255,8 @@ defmodule LoopctlWeb.CorpusController do
     description:
       "Destroys the corpus, every chunk in it and every vector, via the declared cascade. " <>
         "IRREVERSIBLE and set-based, which is why it is role: user while every other verb " <>
-        "on this surface is agent+.",
+        "on this surface is agent+. The delete and its audit entry share one transaction: " <>
+        "an audit write that fails rolls the delete back (500 audit_write_failed).",
     parameters: [
       id: [in: :path, type: :string, description: "Corpus id or slug.", required: true]
     ],
@@ -254,7 +264,10 @@ defmodule LoopctlWeb.CorpusController do
       200 => {"Deleted", "application/json", @ok_object},
       401 => {"Unauthorized", "application/json", Schemas.ErrorResponse},
       403 => {"Insufficient role", "application/json", Schemas.ErrorResponse},
-      404 => {"Not found", "application/json", Schemas.ErrorResponse}
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      500 =>
+        {"Audit write failed — the corpus was NOT deleted", "application/json",
+         Schemas.ErrorResponse}
     }
   )
 
@@ -262,7 +275,7 @@ defmodule LoopctlWeb.CorpusController do
   def delete(conn, %{"id" => id}) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
-    with {:ok, corpus} <- Corpus.delete_corpus(tenant_id, id) do
+    with {:ok, corpus} <- Corpus.delete_corpus(tenant_id, id, AuditContext.from_conn(conn)) do
       json(conn, %{data: render_corpus(corpus)})
     end
   end
@@ -274,9 +287,14 @@ defmodule LoopctlWeb.CorpusController do
         "content_hash is computed SERVER-SIDE from the text and is not accepted from the " <>
         "client in mode A. Indexing is idempotent on (corpus_id, source_ref, locator): an " <>
         "unchanged batch writes nothing, spends no embedding tokens, and reports every item " <>
-        "as unchanged. Name a source in source_complete ONLY when this request carries that " <>
-        "source in FULL — those sources are then reconciled and their surplus chunks deleted. " <>
-        "Naming a source the batch does not carry is refused. Rate limited per ITEM. Role: agent+.",
+        "as unchanged; a chunk whose text is unchanged but whose snippet or ordinal moved is " <>
+        "reported replaced — the row is rewritten and no embedding is spent. Name a source in " <>
+        "source_complete ONLY when this request carries that source in FULL — a named source " <>
+        "is reconciled against THIS request alone, so every stored chunk of it the request " <>
+        "does not carry is deleted, and meta.pruned_by_source reports what each name cost. A " <>
+        "source larger than the batch ceiling therefore cannot be reconciled in one request: " <>
+        "index it across batches without naming it. Naming a source the batch does not carry " <>
+        "is refused. Rate limited per ITEM. Role: agent+.",
     parameters: [
       id: [in: :path, type: :string, description: "Corpus id or slug.", required: true]
     ],
@@ -340,6 +358,7 @@ defmodule LoopctlWeb.CorpusController do
           meta: %{
             corpus_id: result.corpus.id,
             pruned: result.pruned,
+            pruned_by_source: result.pruned_by_source,
             counts: Enum.frequencies_by(result.items, & &1.status)
           }
         })
@@ -405,7 +424,9 @@ defmodule LoopctlWeb.CorpusController do
          }},
       401 => {"Unauthorized", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      422 => {"Empty or over-long query", "application/json", Schemas.ErrorResponse},
+      422 =>
+        {"Empty or over-long query, or a client_embedded corpus", "application/json",
+         Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       503 => {"Both lanes shed under load", "application/json", Schemas.ErrorResponse}
     }
@@ -417,10 +438,20 @@ defmodule LoopctlWeb.CorpusController do
     opts = [limit: to_int(Map.get(params, "limit"))] |> Enum.reject(&is_nil(elem(&1, 1)))
 
     case Search.search(tenant_id, id, Map.get(params, "query"), opts) do
-      {:ok, result} -> json(conn, %{data: result.results, meta: result.meta})
-      {:error, :empty_query} -> error(conn, 422, "empty_query", "A query string is required.")
-      {:error, :query_too_long} -> error(conn, 422, "query_too_long", query_too_long_message())
-      {:error, reason} -> {:error, reason}
+      {:ok, result} ->
+        json(conn, %{data: result.results, meta: result.meta})
+
+      {:error, :empty_query} ->
+        error(conn, 422, "empty_query", "A query string is required.")
+
+      {:error, :query_too_long} ->
+        error(conn, 422, "query_too_long", query_too_long_message())
+
+      {:error, :mode_mismatch} ->
+        error(conn, 422, "mode_mismatch", search_mode_mismatch_message())
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
@@ -437,13 +468,7 @@ defmodule LoopctlWeb.CorpusController do
   end
 
   defp handle_index_error(conn, {:batch_too_large, max}) do
-    error(
-      conn,
-      422,
-      "batch_too_large",
-      "A batch carries at most #{max} chunks. Split the document across several requests " <>
-        "and name it in source_complete only on the request that completes it."
-    )
+    error(conn, 422, "batch_too_large", batch_too_large_message(max))
   end
 
   defp handle_index_error(conn, {:invalid_chunk, index, %Ecto.Changeset{} = changeset}) do
@@ -527,8 +552,31 @@ defmodule LoopctlWeb.CorpusController do
     |> json(%{error: if(details, do: Map.put(body, :details, details), else: body)})
   end
 
+  # The mode refusal the INGEST verb already gives, in the read verb's own words: both
+  # halves of the surface refuse a client_embedded corpus identically, rather than one
+  # answering a coded 422 and the other spending a provider embedding call to return an
+  # empty set with a 200.
+  defp search_mode_mismatch_message,
+    do:
+      "This corpus is client_embedded: it stores vectors loopctl did not make and cannot " <>
+        "read, so the server cannot embed a query against it."
+
   defp query_too_long_message,
     do: "The query is longer than #{@max_query_chars} characters."
+
+  # States the rule the code ENFORCES, which is not the one this message used to give.
+  # `source_complete` is reconciled against THIS request alone: every stored chunk of a
+  # named source that the request does not carry is deleted. Naming a source on the LAST
+  # batch of a split document therefore deletes the earlier batches. So a source is named
+  # only by a request that carries it in FULL, which bounds a reconcilable source at the
+  # batch ceiling; a larger source is indexed across batches and simply not reconciled.
+  defp batch_too_large_message(max) do
+    "A batch carries at most #{max} chunks. Split the document across several requests, " <>
+      "and name a source in source_complete ONLY on a request that carries that source in " <>
+      "FULL — a named source is reconciled against that one request, so every stored chunk " <>
+      "of it the request does not carry is deleted. A source larger than #{max} chunks " <>
+      "cannot be reconciled in one request: index it across batches without naming it."
+  end
 
   defp changeset_errors(changeset) do
     Ecto.Changeset.traverse_errors(changeset, fn {message, opts} ->
@@ -557,10 +605,24 @@ defmodule LoopctlWeb.CorpusController do
   # call, so the charge is explicit: one call per chunk, short-circuiting on the first
   # denial. Without it a client could submit @max_batch_size chunks per request and pay
   # the same as a client submitting one.
+  #
+  # The batch ceiling is applied HERE, before the charge, and not only inside the action:
+  # a controller plug runs first, so an over-size batch would otherwise spend the
+  # tenant's whole per-minute index budget one item at a time and come back as an opaque
+  # 429 — for a request that is invalid on its face, wrote nothing, and reproduces the
+  # same 429 on every retry while refusing a well-formed batch in the same window. The
+  # 422 that NAMES the ceiling is the one the caller can act on, so it wins the race, and
+  # both refusals read the same `@max_batch_size` and the same message.
   defp rate_limit_ingest(conn, _opts) do
-    items = conn.body_params |> chunk_params() |> length() |> max(1)
+    items = conn.body_params |> chunk_params() |> length()
 
-    gate(conn, "corpus_index:tenant:#{tenant_id(conn)}", ingest_limit(conn), items)
+    if items > @max_batch_size do
+      conn
+      |> error(422, "batch_too_large", batch_too_large_message(@max_batch_size))
+      |> halt()
+    else
+      gate(conn, "corpus_index:tenant:#{tenant_id(conn)}", ingest_limit(conn), max(items, 1))
+    end
   end
 
   defp rate_limit_search(conn, _opts) do
@@ -604,29 +666,38 @@ defmodule LoopctlWeb.CorpusController do
       true
   end
 
+  # NOT clamped against the pipeline cap, unlike `search_limit/1`. This bucket is charged
+  # per ITEM while `rate_limit_requests_per_minute` is charged once per REQUEST, so a
+  # `min/2` of the two puts a request count into an item ceiling: a tenant that lowered
+  # the pipeline setting to 60 — an ordinary conservative throttle — would have every
+  # batch above 60 chunks refused in every window, permanently, while the OpenAPI
+  # `maxItems` kept advertising #{@max_batch_size} and nothing in the 429 named the
+  # cause. The ChannelPostController clamp this idiom comes from is unit-consistent
+  # because its buckets are charged per request; this one is not.
   defp ingest_limit(conn),
-    do: clamped_limit(conn, "corpus_index_limit_per_minute", @default_index_limit)
+    do: configured_limit(conn, "corpus_index_limit_per_minute", @default_index_limit)
 
   defp search_limit(conn),
     do: clamped_limit(conn, "corpus_search_limit_per_minute", @default_search_limit)
 
+  defp configured_limit(conn, setting, default) do
+    conn.assigns[:current_tenant]
+    |> setting_value(setting, default)
+    |> coerce_positive_int(default)
+  end
+
   # Clamped BELOW the generic per-key pipeline limiter, which runs FIRST and emits no
   # corpus-specific signal: a tenant that raised this setting above the pipeline cap
-  # would see every corpus trip shadowed by an anonymous pipeline 429.
+  # would see every corpus trip shadowed by an anonymous pipeline 429. Sound HERE and
+  # only here — search is charged one token per request, the same unit the pipeline cap
+  # counts in.
   defp clamped_limit(conn, setting, default) do
-    tenant = conn.assigns[:current_tenant]
-
-    configured =
-      tenant
-      |> setting_value(setting, default)
-      |> coerce_positive_int(default)
-
     pipeline =
-      tenant
+      conn.assigns[:current_tenant]
       |> setting_value("rate_limit_requests_per_minute", @pipeline_per_key_limit_default)
       |> coerce_positive_int(@pipeline_per_key_limit_default)
 
-    min(configured, pipeline)
+    min(configured_limit(conn, setting, default), pipeline)
   end
 
   defp setting_value(nil, _setting, default), do: default

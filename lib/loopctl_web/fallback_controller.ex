@@ -41,8 +41,9 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, %Ecto.Changeset{}}` -> 422 with field-level details
   - `{:error, :bad_request, message}` -> 400 with custom message
   - `{:error, :unprocessable_entity, message}` -> 422 with custom message
-  - `{:error, :audit_write_failed}` -> 500 (US-39.7 redact path: a hard delete whose
-    audit insert failed, rolling the delete back — never masked as a 404)
+  - `{:error, :audit_write_failed}` -> 500 (a mutation whose audit insert failed, rolling
+    the whole write back — the US-39.7 redact path and every corpus-tier mutation; the
+    message is caller-neutral and it is never masked as a 404)
   - `{:error, %Postgrex.Error{}}` -> 504/503/500 by SQLSTATE class (US-27.3)
   - `{:error, %DBConnection.ConnectionError{}}` -> 503 with Retry-After (US-27.3)
   """
@@ -573,12 +574,13 @@ defmodule LoopctlWeb.FallbackController do
   def call(conn, {:error, %DBConnection.ConnectionError{} = error}),
     do: render_db_error(conn, error)
 
-  # US-39.7 redact path: a channel-post HARD delete could not be durably recorded
-  # in the audit trail, so the whole transaction rolled back and the post STILL
-  # EXISTS. Fail-safe-on-security-path: a rolled-back redaction is NEVER reported as
-  # a 404 ("already gone/handled") — that would let an agent believe a leaked secret
-  # was removed when it was not. A 500 tells the caller the delete did NOT happen so
-  # it retries the redaction.
+  # A mutation whose audit entry could not be written, rolling the whole transaction
+  # back — the US-39.7 channel-post redact path, and every corpus-tier mutation
+  # (US-43.2 AC-43.2.7). Fail-safe-on-security-path: a rolled-back write is NEVER
+  # reported as a 404 ("already gone/handled"), which would let an agent believe a
+  # leaked secret was removed when it was not. The message is CALLER-NEUTRAL: it says
+  # the write did not happen and the prior state stands, because a corpus index request
+  # has no post to still exist and naming one asserted something that did not occur.
   def call(conn, {:error, :audit_write_failed}) do
     conn
     |> put_status(:internal_server_error)
@@ -587,8 +589,9 @@ defmodule LoopctlWeb.FallbackController do
         status: 500,
         code: "audit_write_failed",
         message:
-          "The delete could not be recorded in the audit trail and was rolled back; " <>
-            "the post still exists. Retry the request."
+          "The write could not be recorded in the audit trail and was rolled back, so it " <>
+            "did NOT happen — nothing was persisted and the prior state still stands. " <>
+            "Retry the request."
       }
     })
   end

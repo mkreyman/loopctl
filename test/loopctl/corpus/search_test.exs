@@ -99,6 +99,42 @@ defmodule Loopctl.Corpus.SearchTest do
       assert {:error, :not_found} = Search.search(other.id, corpus.id, "rendering provider")
     end
 
+    # The ingest verb guards mode explicitly; without the same clause here, searching a
+    # client_embedded corpus spent a provider embedding call on the tenant's own key and
+    # answered 200 with an empty set for an operation the corpus can never serve.
+    test "a client_embedded corpus is refused before any provider call" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id, %{mode: :client_embedded})
+
+      calls = :counters.new(1, [])
+
+      stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _scope, _text, _opts ->
+        :counters.add(calls, 1, 1)
+        {:ok, List.duplicate(0.01, 1536)}
+      end)
+
+      assert {:error, :mode_mismatch} = Search.search(tenant.id, corpus.id, "taxonomy code")
+      assert :counters.get(calls, 1) == 0
+    end
+
+    # `allow_snippets` is a corpus POLICY and this is the only place a snippet can reach a
+    # caller. Settable-but-inert is the codebase's own named anti-pattern.
+    test "a corpus with allow_snippets: false serves pointers with a null snippet" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id, %{allow_snippets: false})
+
+      index!(tenant.id, corpus, [chunk("a.pdf", 1, "rendering provider taxonomy code")])
+
+      {:ok, %{results: [result], meta: meta}} =
+        Search.search(tenant.id, corpus.id, "rendering provider")
+
+      assert Map.has_key?(result, :snippet)
+      assert result.snippet == nil
+      assert meta.allow_snippets == false
+      assert result.source_ref == "a.pdf"
+      assert result.locator == %{"page" => 1}
+    end
+
     test "an empty or over-long query is refused before any lane runs" do
       tenant = fixture(:tenant)
       corpus = create_corpus!(tenant.id)

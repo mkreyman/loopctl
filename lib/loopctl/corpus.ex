@@ -45,7 +45,9 @@ defmodule Loopctl.Corpus do
 
   import Ecto.Query
 
+  alias Ecto.Multi
   alias Loopctl.AdminRepo
+  alias Loopctl.Audit
   alias Loopctl.Corpus.Corpus
   alias Loopctl.Corpus.DocumentChunk
   alias Loopctl.Projects
@@ -67,15 +69,36 @@ defmodule Loopctl.Corpus do
   A `slug` that already addresses ANOTHER corpus of this tenant as an id is
   refused, because `get_corpus/2` resolves an id before a slug (see
   `validate_slug_does_not_address_another_corpus/2`).
+
+  The insert and its audit entry share ONE `Ecto.Multi` (AC-43.2.7), so a corpus
+  that could not be recorded is not created: the audit step failing returns
+  `{:error, :audit_write_failed}` and the row is rolled back. `opts` is the
+  actor-context keyword list from `LoopctlWeb.AuditContext.from_conn/1`.
   """
-  @spec create_corpus(Ecto.UUID.t(), map()) ::
-          {:ok, Corpus.t()} | {:error, Ecto.Changeset.t()}
-  def create_corpus(tenant_id, attrs) when is_binary(tenant_id) do
-    %Corpus{tenant_id: tenant_id}
-    |> Corpus.create_changeset(attrs)
-    |> validate_project_ownership(tenant_id)
-    |> validate_slug_does_not_address_another_corpus(tenant_id)
-    |> AdminRepo.insert()
+  @spec create_corpus(Ecto.UUID.t(), map(), keyword()) ::
+          {:ok, Corpus.t()} | {:error, Ecto.Changeset.t() | :audit_write_failed}
+  def create_corpus(tenant_id, attrs, opts \\ []) when is_binary(tenant_id) do
+    changeset =
+      %Corpus{tenant_id: tenant_id}
+      |> Corpus.create_changeset(attrs)
+      |> validate_project_ownership(tenant_id)
+      |> validate_slug_does_not_address_another_corpus(tenant_id)
+
+    multi =
+      Multi.new()
+      |> Multi.insert(:corpus, changeset)
+      |> Audit.log_in_multi(:audit, fn %{corpus: corpus} ->
+        audit_attrs(corpus, "corpus_created", opts, new_state: corpus_state(corpus))
+      end)
+
+    case AdminRepo.transaction(multi) do
+      {:ok, %{corpus: corpus}} -> {:ok, corpus}
+      # Matched on the STEP atom, never `_step`: an audit failure and a corpus
+      # failure are both changesets, and mapping one onto the other would answer a
+      # rolled-back write with a 422 naming fields the caller never sent.
+      {:error, :audit, %Ecto.Changeset{}, _changes} -> {:error, :audit_write_failed}
+      {:error, :corpus, %Ecto.Changeset{} = changeset, _changes} -> {:error, changeset}
+    end
   end
 
   @doc """
@@ -134,12 +157,31 @@ defmodule Loopctl.Corpus do
   The chunks and their vectors go with it via `ON DELETE CASCADE` declared in the
   DDL (AC-43.1.9) — this function issues ONE statement and no application-level
   child cleanup, so no path can leave orphans behind.
+
+  This is the one verb on the surface that is both set-based and irreversible, so
+  it is also the one whose audit entry matters most: the delete and its audit row
+  share ONE `Ecto.Multi` (AC-43.2.7) and a failed audit rolls the delete back
+  (`{:error, :audit_write_failed}`) rather than destroying a corpus nobody can
+  attribute. `opts` is the actor-context keyword list from
+  `LoopctlWeb.AuditContext.from_conn/1`.
   """
-  @spec delete_corpus(Ecto.UUID.t(), String.t()) ::
-          {:ok, Corpus.t()} | {:error, :not_found | Ecto.Changeset.t()}
-  def delete_corpus(tenant_id, id_or_slug) when is_binary(tenant_id) do
+  @spec delete_corpus(Ecto.UUID.t(), String.t(), keyword()) ::
+          {:ok, Corpus.t()}
+          | {:error, :not_found | :audit_write_failed | Ecto.Changeset.t()}
+  def delete_corpus(tenant_id, id_or_slug, opts \\ []) when is_binary(tenant_id) do
     with {:ok, corpus} <- get_corpus(tenant_id, id_or_slug) do
-      AdminRepo.delete(corpus)
+      multi =
+        Multi.new()
+        |> Multi.delete(:corpus, corpus)
+        |> Audit.log_in_multi(:audit, fn _changes ->
+          audit_attrs(corpus, "corpus_deleted", opts, old_state: corpus_state(corpus))
+        end)
+
+      case AdminRepo.transaction(multi) do
+        {:ok, %{corpus: deleted}} -> {:ok, deleted}
+        {:error, :audit, %Ecto.Changeset{}, _changes} -> {:error, :audit_write_failed}
+        {:error, :corpus, %Ecto.Changeset{} = changeset, _changes} -> {:error, changeset}
+      end
     end
   end
 
@@ -266,6 +308,33 @@ defmodule Loopctl.Corpus do
   end
 
   # --- internals ---
+
+  # ONE shape for both mutating verbs, so the actor context and the entity keys
+  # cannot drift between create and delete.
+  defp audit_attrs(%Corpus{} = corpus, action, opts, state) do
+    %{
+      tenant_id: corpus.tenant_id,
+      project_id: corpus.project_id,
+      entity_type: "corpus",
+      entity_id: corpus.id,
+      action: action,
+      actor_type: Keyword.get(opts, :actor_type, "system"),
+      actor_id: Keyword.get(opts, :actor_id),
+      actor_label: Keyword.get(opts, :actor_label),
+      metadata: Keyword.get(opts, :metadata, %{})
+    }
+    |> Map.merge(Map.new(state))
+  end
+
+  defp corpus_state(%Corpus{} = corpus) do
+    %{
+      "slug" => corpus.slug,
+      "name" => corpus.name,
+      "mode" => to_string(corpus.mode),
+      "embedding_model" => corpus.embedding_model,
+      "dim" => corpus.dim
+    }
+  end
 
   # `refute_duplicate_keys/1` compares `{source_ref, locator}` pairs so BOTH callers —
   # this one, over `insert_all` keyword rows, and `Loopctl.Corpus.Indexer`, over its own

@@ -247,6 +247,47 @@ defmodule Loopctl.Corpus.IndexerTest do
       assert Enum.count(remaining, &(&1.source_ref == "b.pdf")) == 2
     end
 
+    # A NON-STRING member used to be filtered out before the carried-check could see it,
+    # so `source_complete: [123]` collapsed to the empty list, pruned nothing and returned
+    # 200 — a client that believed it had reconciled a shrunk document while the surplus
+    # chunks stayed indexed and kept being served by search.
+    test "a non-string source_complete member is refused, not silently dropped" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      index!(tenant.id, corpus, pages("a.pdf", 4))
+
+      assert {:error, {:source_complete_not_carried, [123]}} =
+               Indexer.index_chunks(tenant.id, corpus.id, Enum.take(pages("a.pdf", 4), 2),
+                 source_complete: [123],
+                 audit: audit_opts()
+               )
+
+      assert length(chunks_of(corpus)) == 4
+    end
+
+    # The rule the code ENFORCES, asserted so it cannot be misread again: a named source
+    # is reconciled against THAT request alone. Naming it on the last batch of a split
+    # document deletes what the earlier batches wrote, which is why the corrected
+    # AC-43.2.3 and the batch_too_large message both say a source larger than one batch is
+    # indexed across batches WITHOUT being named.
+    test "a named source is reconciled against the naming request alone" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      all = pages("big.pdf", 9)
+
+      index!(tenant.id, corpus, Enum.slice(all, 0..2))
+      index!(tenant.id, corpus, Enum.slice(all, 3..5))
+      assert length(chunks_of(corpus)) == 6
+
+      result = index!(tenant.id, corpus, Enum.slice(all, 6..8), source_complete: ["big.pdf"])
+
+      assert result.pruned == 6
+      assert result.pruned_by_source == %{"big.pdf" => 6}
+      assert length(chunks_of(corpus)) == 3
+    end
+
     test "naming a source the batch does not carry is refused" do
       tenant = fixture(:tenant)
       corpus = create_corpus!(tenant.id)
@@ -261,6 +302,75 @@ defmodule Loopctl.Corpus.IndexerTest do
 
       # Nothing was pruned: the refusal is what keeps this verb below the :user line.
       assert length(chunks_of(corpus)) == 4
+    end
+  end
+
+  describe "a chunk whose text held still while its snippet or ordinal moved" do
+    # `content_hash` covers the TEXT only. Deciding the WRITE on it too answered
+    # "unchanged" to a request that corrected a snippet or renumbered a chunk, dropped
+    # both values, and left no later re-index able to apply them — the hash never moves
+    # again. The row is rewritten; the embedding is NOT re-spent.
+    test "is rewritten and reported replaced, without spending an embedding" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      first =
+        Map.merge(chunk("a.pdf", 1, "the loop 2310B body"), %{
+          "snippet" => "old snippet",
+          "ordinal" => 1
+        })
+
+      index!(tenant.id, corpus, [first])
+
+      calls = :counters.new(1, [])
+
+      stub(Loopctl.MockEmbeddingClient, :generate_embeddings, fn _scope, texts, _opts ->
+        :counters.add(calls, 1, 1)
+        {:ok, Enum.map(texts, fn _text -> List.duplicate(0.02, 1536) end)}
+      end)
+
+      corrected = Map.merge(first, %{"snippet" => "corrected snippet", "ordinal" => 7})
+      result = index!(tenant.id, corpus, [corrected])
+
+      assert statuses(result) == [:replaced]
+      assert :counters.get(calls, 1) == 0
+
+      [stored] = chunks_of(corpus)
+      assert stored.snippet == "corrected snippet"
+      assert stored.ordinal == 7
+      assert embedding_count(corpus) == 1
+    end
+
+    test "an identical resubmit is still unchanged and writes nothing" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      item = Map.put(chunk("a.pdf", 1, "the loop 2310B body"), "snippet", "a snippet")
+
+      index!(tenant.id, corpus, [item])
+      [before] = chunks_of(corpus)
+
+      result = index!(tenant.id, corpus, [item])
+
+      assert statuses(result) == [:unchanged]
+      [after_row] = chunks_of(corpus)
+      assert after_row.updated_at == before.updated_at
+    end
+
+    # A metadata rewrite is a row this request wrote, so the prune must KEEP it.
+    test "survives the prune of a source named complete in the same request" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      index!(tenant.id, corpus, pages("a.pdf", 3))
+
+      kept = Enum.map(Enum.take(pages("a.pdf", 3), 2), &Map.put(&1, "snippet", "new"))
+      result = index!(tenant.id, corpus, kept, source_complete: ["a.pdf"])
+
+      assert statuses(result) == [:replaced, :replaced]
+      assert result.pruned == 1
+      assert length(chunks_of(corpus)) == 2
+      assert Enum.all?(chunks_of(corpus), &(&1.snippet == "new"))
     end
   end
 

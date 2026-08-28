@@ -745,6 +745,98 @@ defmodule Loopctl.CorpusTest do
     end
   end
 
+  # AC-43.2.7 — EVERY mutating verb on this surface audits, inside the mutation's own
+  # transaction. Delete is the one that is both set-based and irreversible, so it is the
+  # one whose absence from the trail would matter most.
+  describe "the audit entry of create_corpus/3 and delete_corpus/3" do
+    test "create records corpus_created with the caller's actor context" do
+      tenant = fixture(:tenant)
+
+      {:ok, corpus} =
+        Corpus.create_corpus(
+          tenant.id,
+          corpus_attrs(),
+          actor_type: "api_key",
+          actor_id: nil,
+          actor_label: "agent:test"
+        )
+
+      entry = only_audit_entry!(tenant.id, "corpus_created")
+
+      assert entry.entity_type == "corpus"
+      assert entry.entity_id == corpus.id
+      assert entry.actor_label == "agent:test"
+      assert entry.new_state["slug"] == corpus.slug
+      assert entry.new_state["dim"] == corpus.dim
+    end
+
+    test "delete records corpus_deleted with the state that went" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id, %{dim: 768})
+
+      {:ok, _} =
+        Corpus.delete_corpus(tenant.id, corpus.id,
+          actor_type: "api_key",
+          actor_label: "user:operator"
+        )
+
+      entry = only_audit_entry!(tenant.id, "corpus_deleted")
+
+      assert entry.entity_id == corpus.id
+      assert entry.actor_label == "user:operator"
+      assert entry.old_state["slug"] == corpus.slug
+    end
+
+    # Fail-closed, and the SAME shape the index path already has: `actor_type` is
+    # required by `AuditLog.create_changeset/1`, so a nil one is an audit write that
+    # cannot succeed. The mutation must go with it.
+    test "an audit write that cannot succeed rolls the create back" do
+      tenant = fixture(:tenant)
+
+      assert {:error, :audit_write_failed} =
+               Corpus.create_corpus(tenant.id, corpus_attrs(), actor_type: nil)
+
+      assert Corpus.list_corpora(tenant.id) == []
+    end
+
+    test "an audit write that cannot succeed rolls the delete back, chunks and all" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id, %{dim: 768})
+
+      {:ok, chunks} =
+        Corpus.upsert_chunks(tenant.id, corpus.id, [chunk_attrs(%{locator: %{"page" => 1}})])
+
+      Enum.each(chunks, &embed_chunk!(tenant.id, &1, 768))
+
+      assert {:error, :audit_write_failed} =
+               Corpus.delete_corpus(tenant.id, corpus.id, actor_type: nil)
+
+      assert {:ok, _} = Corpus.get_corpus(tenant.id, corpus.id)
+      assert chunk_count(corpus.id) == 1
+      assert embedding_count(tenant.id) == 1
+    end
+
+    # A validation failure is still a CHANGESET, never the audit term — the controller
+    # renders one as a 422 the caller fixes and the other as a 500 it retries.
+    test "a validation failure is still reported as a changeset" do
+      tenant = fixture(:tenant)
+
+      assert {:error, %Ecto.Changeset{}} =
+               Corpus.create_corpus(tenant.id, corpus_attrs(%{dim: 7}), actor_type: "api_key")
+    end
+  end
+
+  defp only_audit_entry!(tenant_id, action) do
+    [entry] =
+      AdminRepo.all(
+        from(a in Loopctl.Audit.AuditLog,
+          where: a.tenant_id == ^tenant_id and a.action == ^action
+        )
+      )
+
+    entry
+  end
+
   # TC-43.1.7 / AC-43.1.7
   describe "the heavy-read tenant guard on a chunk-to-embedding join" do
     test "accepts the join scoped on BOTH sources and refuses the from-only variant" do

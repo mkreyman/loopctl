@@ -68,6 +68,17 @@ defmodule LoopctlWeb.CorpusControllerTest do
     }
   end
 
+  defp only_audit_entry!(tenant_id, action) do
+    [entry] =
+      AdminRepo.all(
+        from(a in Loopctl.Audit.AuditLog,
+          where: a.tenant_id == ^tenant_id and a.action == ^action
+        )
+      )
+
+    entry
+  end
+
   describe "POST /api/v1/corpora" do
     test "creates a corpus for an agent key", %{conn: conn} do
       {_tenant, raw_key} = keyed_tenant()
@@ -81,6 +92,25 @@ defmodule LoopctlWeb.CorpusControllerTest do
       assert body["data"]["mode"] == "server_embedded"
       assert body["data"]["dim"] == 1536
       assert body["data"]["allow_snippets"] == true
+    end
+
+    # AC-43.2.7 — the moduledoc's role table earns `create` its agent role on "audited".
+    test "records corpus_created against the calling key", %{conn: conn} do
+      {tenant, raw_key} = keyed_tenant()
+
+      body =
+        conn
+        |> auth(raw_key)
+        |> post(~p"/api/v1/corpora", corpus_body())
+        |> json_response(201)
+
+      entry = only_audit_entry!(tenant.id, "corpus_created")
+
+      assert entry.entity_type == "corpus"
+      assert entry.entity_id == body["data"]["id"]
+      assert entry.actor_type == "api_key"
+      assert entry.actor_id
+      assert entry.new_state["slug"] == body["data"]["slug"]
     end
 
     # AC-43.2.9 — the failure moves from first index to creation.
@@ -222,6 +252,14 @@ defmodule LoopctlWeb.CorpusControllerTest do
 
       assert AdminRepo.all(from(e in DocumentChunkEmbedding, where: e.tenant_id == ^tenant.id)) ==
                []
+
+      # AC-43.2.7 — the one verb that is both set-based and irreversible is the one whose
+      # absence from the trail would matter most: it leaves a row naming who destroyed it.
+      entry = only_audit_entry!(tenant.id, "corpus_deleted")
+
+      assert entry.entity_id == corpus.id
+      assert entry.actor_type == "api_key"
+      assert entry.old_state["slug"] == corpus.slug
     end
   end
 
@@ -284,6 +322,74 @@ defmodule LoopctlWeb.CorpusControllerTest do
 
       assert body["error"]["code"] == "batch_too_large"
       assert body["error"]["message"] =~ Integer.to_string(Indexer.max_batch_size())
+    end
+
+    # The rate-limit plug runs BEFORE the action, and the bucket is charged once per
+    # ITEM. Without the ceiling in the plug an over-size batch spent the tenant's whole
+    # per-minute index budget one item at a time and came back as an opaque 429 — for a
+    # request that was invalid on its face, wrote nothing, and reproduced the same 429 on
+    # every retry while refusing well-formed batches in the same window.
+    test "an over-size batch is refused before the rate limiter is charged at all",
+         %{conn: conn} do
+      {tenant, raw_key} = keyed_tenant()
+      corpus = create_corpus!(tenant.id)
+      oversize = for page <- 1..(Indexer.max_batch_size() + 1), do: page_chunk(page)
+
+      charges = :counters.new(1, [])
+
+      stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, _window, _limit ->
+        if String.starts_with?(bucket, "corpus_index:tenant:"), do: :counters.add(charges, 1, 1)
+        {:allow, 1}
+      end)
+
+      body =
+        conn
+        |> auth(raw_key)
+        |> post(~p"/api/v1/corpora/#{corpus.id}/index", %{"chunks" => oversize})
+        |> json_response(422)
+
+      assert body["error"]["code"] == "batch_too_large"
+      assert :counters.get(charges, 1) == 0
+    end
+
+    # The index bucket is charged per ITEM; `rate_limit_requests_per_minute` is charged
+    # once per REQUEST. Clamping the first to the second put a request count into an item
+    # ceiling, so a tenant that lowered the pipeline setting had every full-size batch
+    # refused in every window, permanently, with nothing in the 429 naming the cause. The
+    # search bucket IS charged per request, so it stays clamped.
+    test "the per-ITEM index cap is not clamped to the per-REQUEST pipeline setting",
+         %{conn: conn} do
+      tenant = fixture(:tenant, %{settings: %{"rate_limit_requests_per_minute" => 60}})
+      fixture(:tenant_llm_settings, %{tenant_id: tenant.id, embedding_api_key: "test-embed-key"})
+      {raw_key, _key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      corpus = create_corpus!(tenant.id)
+
+      seen = :counters.new(2, [])
+
+      stub(Loopctl.MockRateLimiter, :check_rate, fn bucket, _window, limit ->
+        cond do
+          String.starts_with?(bucket, "corpus_index:tenant:") -> :counters.put(seen, 1, limit)
+          String.starts_with?(bucket, "corpus_search:tenant:") -> :counters.put(seen, 2, limit)
+          true -> :ok
+        end
+
+        {:allow, 1}
+      end)
+
+      conn
+      |> auth(raw_key)
+      |> post(~p"/api/v1/corpora/#{corpus.id}/index", %{"chunks" => [page_chunk(1)]})
+      |> json_response(200)
+
+      conn
+      |> auth(raw_key)
+      |> post(~p"/api/v1/corpora/#{corpus.id}/search", %{"query" => "body of page"})
+      |> json_response(200)
+
+      # The published maxItems is the batch ceiling; a per-request setting of 60 must not
+      # become the item ceiling.
+      assert :counters.get(seen, 1) > Indexer.max_batch_size()
+      assert :counters.get(seen, 2) == 60
     end
 
     # AC-43.2.9 scopes itself honestly: whether the tenant's endpoint actually SERVES
@@ -372,6 +478,30 @@ defmodule LoopctlWeb.CorpusControllerTest do
       assert String.length(result["snippet"]) <= Search.max_snippet_chars()
       refute result["snippet"] == long
       assert body["meta"]["lanes"] == ["keyword", "semantic"]
+    end
+
+    # Both halves of the surface refuse a client_embedded corpus identically: the ingest
+    # verb already answered a coded 422 while search spent a provider call and answered
+    # 200 with an empty set.
+    test "a client_embedded corpus is a coded 422, not an empty 200", %{conn: conn} do
+      {tenant, raw_key} = keyed_tenant()
+
+      {:ok, corpus} =
+        Corpus.create_corpus(tenant.id, %{
+          slug: "byo-#{System.unique_integer([:positive])}",
+          name: "Client embedded",
+          mode: :client_embedded,
+          embedding_model: "text-embedding-3-small",
+          dim: 1536
+        })
+
+      body =
+        conn
+        |> auth(raw_key)
+        |> post(~p"/api/v1/corpora/#{corpus.id}/search", %{"query" => "taxonomy"})
+        |> json_response(422)
+
+      assert body["error"]["code"] == "mode_mismatch"
     end
 
     test "an empty query is a coded 422", %{conn: conn} do

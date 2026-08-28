@@ -46,6 +46,7 @@ defmodule Loopctl.Corpus.Search do
   import Ecto.Query
 
   alias Loopctl.Corpus
+  alias Loopctl.Corpus.Corpus, as: CorpusRow
   alias Loopctl.Corpus.DocumentChunk
   alias Loopctl.Corpus.DocumentChunkEmbedding
   alias Loopctl.HeavyRead
@@ -104,15 +105,31 @@ defmodule Loopctl.Corpus.Search do
   """
   @spec search(Ecto.UUID.t(), String.t(), String.t(), keyword()) ::
           {:ok, %{results: [map()], meta: map()}}
-          | {:error, :not_found | :empty_query | :query_too_long | :heavy_read_overloaded}
+          | {:error,
+             :not_found
+             | :mode_mismatch
+             | :empty_query
+             | :query_too_long
+             | :heavy_read_overloaded}
   def search(tenant_id, corpus_id, query_string, opts \\ []) when is_binary(tenant_id) do
     with {:ok, corpus} <- Corpus.get_corpus(tenant_id, corpus_id),
+         :ok <- validate_mode(corpus),
          {:ok, query_string} <- validate_query(query_string) do
       limit = opts |> Keyword.get(:limit, @default_limit) |> clamp_limit()
 
       run(tenant_id, corpus, query_string, limit)
     end
   end
+
+  # The SAME refusal `Loopctl.Corpus.Indexer.validate_mode/1` gives the ingest verb. A
+  # client_embedded corpus holds vectors the server did not make and cannot read: without
+  # this clause a search against one embedded the query on the tenant's own key, billed
+  # the provider call, and answered 200 with an empty set — one half of the surface
+  # refusing mode B with a coded 422 while the other half charged for a query the corpus
+  # can never serve. Both halves refuse it until US-43.3 defines mode B's retrieval
+  # contract.
+  defp validate_mode(%CorpusRow{mode: :server_embedded}), do: :ok
+  defp validate_mode(%CorpusRow{}), do: {:error, :mode_mismatch}
 
   defp run(tenant_id, corpus, query_string, limit) do
     keyword = keyword_lane(tenant_id, corpus, query_string)
@@ -141,7 +158,7 @@ defmodule Loopctl.Corpus.Search do
         []
       )
       |> Enum.take(limit)
-      |> Enum.map(&render/1)
+      |> Enum.map(&render(&1, corpus))
 
     %{results: results, meta: meta(corpus, keyword, semantic, limit)}
   end
@@ -167,7 +184,8 @@ defmodule Loopctl.Corpus.Search do
       # no absolute floor is published: changing the fusion strategy would silently
       # invalidate any threshold a caller had written down.
       score_basis: "rrf",
-      snippet_max_chars: @max_snippet_chars
+      snippet_max_chars: @max_snippet_chars,
+      allow_snippets: corpus.allow_snippets
     }
     |> maybe_put_reason(:keyword_unavailable_reason, keyword)
     |> maybe_put_reason(:semantic_unavailable_reason, semantic)
@@ -309,13 +327,26 @@ defmodule Loopctl.Corpus.Search do
     end
   end
 
-  defp render(result) do
+  # `allow_snippets` is a corpus POLICY, so it is honoured HERE, on the read — the one
+  # place a snippet can reach a caller. Suppressing it at write instead would contradict
+  # US-43.1, which deliberately keeps the flag castable and lets an explicit caller value
+  # win over the mode-derived default. A corpus that says it serves no snippets serves
+  # none: the key is still present and null, so a client reads a pointer rather than
+  # inferring one from a missing field.
+  defp render(result, %CorpusRow{allow_snippets: false}) do
+    result |> render_pointer() |> Map.put(:snippet, nil)
+  end
+
+  defp render(result, %CorpusRow{}) do
+    result |> render_pointer() |> Map.put(:snippet, result[:snippet])
+  end
+
+  defp render_pointer(result) do
     %{
       chunk_id: result.id,
       corpus_id: result.corpus_id,
       source_ref: result.source_ref,
       locator: result.locator,
-      snippet: result[:snippet],
       score: result.final_score
     }
   end

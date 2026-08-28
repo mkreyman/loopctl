@@ -22,6 +22,12 @@ defmodule Loopctl.Corpus.Indexer do
   chunk to classify it `unchanged | inserted | replaced`. An unchanged batch writes
   no chunk row, spends no embedding token, and leaves `updated_at` alone.
 
+  `content_hash` covers the TEXT, so it decides the EMBEDDING. It does not decide the
+  WRITE: `snippet` and `ordinal` are cast from the client and are in the upsert's
+  replace list, so a chunk whose text held still while one of them moved is rewritten
+  (`replaced`) without re-embedding. Deciding both on the hash silently discarded a
+  corrected snippet and left no later re-index able to apply it.
+
   ## Pruning is reconciliation, never inference
 
   A batch is not a document. A large document split across several bounded batches
@@ -34,6 +40,13 @@ defmodule Loopctl.Corpus.Indexer do
   A `source_ref` may be named ONLY if the same request carries at least one chunk
   for it. That is what keeps the verb below the `:user` line: no request can prune
   content it does not resend, and re-indexing the file restores what a prune took.
+
+  Reconciliation is therefore scoped to ONE request and bounded by `max_batch_size/0`:
+  a named source is reconciled against the chunks THAT request carries, so naming a
+  source on the last batch of a split document deletes the earlier batches. A source
+  larger than one batch is indexed across batches WITHOUT being named, and simply not
+  reconciled — the `batch_too_large` message says so in the same words, and
+  `pruned_by_source` in the response reports exactly what each named source lost.
 
   ## Over-long chunks
 
@@ -77,7 +90,7 @@ defmodule Loopctl.Corpus.Indexer do
           | {:batch_too_large, pos_integer()}
           | {:invalid_chunk, non_neg_integer(), String.t() | Ecto.Changeset.t()}
           | {:duplicate_chunk_key, {String.t(), term()}}
-          | {:source_complete_not_carried, [String.t()]}
+          | {:source_complete_not_carried, [term()]}
           | {:embedding_failed, term(), [map()]}
           | {:write_failed, term(), term()}
 
@@ -94,8 +107,10 @@ defmodule Loopctl.Corpus.Indexer do
     * `:audit` — the actor-context keyword list from
       `LoopctlWeb.AuditContext.from_conn/1`.
 
-  Returns `{:ok, %{items: [...], pruned: n, corpus: corpus}}`, where each item
-  reports `unchanged | inserted | replaced` for its `(source_ref, locator)`.
+  Returns `{:ok, %{items: [...], pruned: n, pruned_by_source: %{ref => n}, corpus:
+  corpus}}`, where each item reports `unchanged | inserted | replaced` for its
+  `(source_ref, locator)`. A chunk whose TEXT is unchanged but whose `snippet` or
+  `ordinal` moved is `replaced`: the row is rewritten, and no embedding is spent.
   """
   @spec index_chunks(Ecto.UUID.t(), String.t(), [map()], keyword()) ::
           {:ok, map()} | {:error, error()}
@@ -194,9 +209,15 @@ defmodule Loopctl.Corpus.Indexer do
   defp validate_source_complete(_items, nil), do: {:ok, []}
   defp validate_source_complete(_items, []), do: {:ok, []}
 
+  # Every member is checked against the carried set, INCLUDING a non-binary one. Filtering
+  # non-binaries out first discarded them BEFORE the carried-check could refuse them, so
+  # `source_complete: [123]` collapsed to the empty list, pruned nothing and returned 200
+  # — a client that believed it had reconciled a shrunk document while the surplus chunks
+  # stayed indexed and kept being returned by search. A `source_ref` column is a string,
+  # so a non-binary is never carried and takes the same 422 the string case takes.
   defp validate_source_complete(items, refs) when is_list(refs) do
     carried = MapSet.new(items, & &1.source_ref)
-    refs = refs |> Enum.filter(&is_binary/1) |> Enum.uniq()
+    refs = Enum.uniq(refs)
 
     case Enum.reject(refs, &MapSet.member?(carried, &1)) do
       [] -> {:ok, refs}
@@ -215,14 +236,34 @@ defmodule Loopctl.Corpus.Indexer do
     {:ok, Enum.map(items, &classify_item(&1, existing))}
   end
 
+  # TWO decisions, deliberately separate. `status` is what the caller is told; `rewrite`
+  # is what the transaction does.
+  #
+  # `content_hash` covers TEXT only, and it is the right input for the EMBEDDING decision
+  # — re-embedding text that did not move spends tokens for an identical vector. It is
+  # the wrong input for the WRITE decision: `snippet` and `ordinal` are cast from the
+  # client and are both in the upsert's replace list, so deciding on the hash alone
+  # answered "unchanged" to a request that corrected a snippet or renumbered a chunk,
+  # dropped the values, and left no later re-index able to apply them — the text hash
+  # never moves again. A metadata-only change therefore rewrites the ROW (reported
+  # `replaced`, because the row was) and skips the embedding entirely.
   defp classify_item(item, existing) do
     case Map.get(existing, {item.source_ref, Corpus.canonical_locator(item.locator)}) do
       nil ->
-        Map.merge(item, %{status: :inserted, chunk_id: nil})
+        Map.merge(item, %{status: :inserted, rewrite: :full, chunk_id: nil})
 
-      %{id: id, content_hash: stored} ->
-        status = if stored == item.content_hash, do: :unchanged, else: :replaced
-        Map.merge(item, %{status: status, chunk_id: id})
+      %{id: id} = stored ->
+        {status, rewrite} = classify_change(stored, item)
+        Map.merge(item, %{status: status, rewrite: rewrite, chunk_id: id})
+    end
+  end
+
+  defp classify_change(stored, item) do
+    cond do
+      stored.content_hash != item.content_hash -> {:replaced, :full}
+      stored.snippet != item.snippet -> {:replaced, :metadata}
+      stored.ordinal != item.ordinal -> {:replaced, :metadata}
+      true -> {:unchanged, :none}
     end
   end
 
@@ -235,13 +276,15 @@ defmodule Loopctl.Corpus.Indexer do
         id: c.id,
         source_ref: c.source_ref,
         locator: c.locator,
-        content_hash: c.content_hash
+        content_hash: c.content_hash,
+        snippet: c.snippet,
+        ordinal: c.ordinal
       }
     )
     |> AdminRepo.all()
     |> Map.new(fn row ->
       {{row.source_ref, Corpus.canonical_locator(row.locator)},
-       %{id: row.id, content_hash: row.content_hash}}
+       Map.take(row, [:id, :content_hash, :snippet, :ordinal])}
     end)
   end
 
@@ -252,7 +295,7 @@ defmodule Loopctl.Corpus.Indexer do
   # never by array position here. A partial response fails the whole batch. Only
   # changed items are sent, so a re-index of an unchanged corpus spends nothing.
   defp embed_changed(tenant_id, corpus, items) do
-    targets = Enum.reject(items, &(&1.status == :unchanged))
+    targets = Enum.filter(items, &(&1.rewrite == :full))
 
     if targets == [] do
       {:ok, Enum.map(items, &Map.merge(&1, %{embedding: nil, truncated?: false}))}
@@ -337,11 +380,17 @@ defmodule Loopctl.Corpus.Indexer do
 
     case AdminRepo.transaction(multi) do
       {:ok, changes} ->
+        by_source = pruned_by_source(changes, complete)
+
         {:ok,
          %{
            corpus: corpus,
            items: Enum.map(items, &Map.take(&1, [:source_ref, :locator, :status])),
-           pruned: pruned_count(changes, complete)
+           # Reported PER SOURCE as well as in total: a named source is reconciled
+           # against this request alone, so the caller must be able to see exactly what
+           # each name cost rather than reading one aggregate.
+           pruned: by_source |> Map.values() |> Enum.sum(),
+           pruned_by_source: by_source
          }}
 
       # Matching `:audit` explicitly (never `_step`) keeps the compile-time gate: if
@@ -356,7 +405,16 @@ defmodule Loopctl.Corpus.Indexer do
     end
   end
 
-  defp add_item(multi, _tenant_id, _corpus, %{status: :unchanged}), do: multi
+  defp add_item(multi, _tenant_id, _corpus, %{rewrite: :none}), do: multi
+
+  # Metadata-only: the row is rewritten so the corrected snippet/ordinal land, and the
+  # embedding step is SKIPPED — the text did not move, so the stored vector and its hash
+  # are still the right ones and there is nothing to re-embed.
+  defp add_item(multi, tenant_id, corpus, %{rewrite: :metadata} = item) do
+    Multi.run(multi, {:chunk, item.index}, fn repo, _changes ->
+      upsert_chunk(repo, tenant_id, corpus, item)
+    end)
+  end
 
   defp add_item(multi, tenant_id, corpus, item) do
     multi
@@ -414,8 +472,8 @@ defmodule Loopctl.Corpus.Indexer do
   defp add_prunes(multi, tenant_id, corpus, complete, items) do
     Enum.reduce(complete, multi, fn source_ref, acc ->
       of_source = Enum.filter(items, &(&1.source_ref == source_ref))
-      unchanged = for i <- of_source, i.status == :unchanged, do: i.chunk_id
-      written = for i <- of_source, i.status != :unchanged, do: i.index
+      unchanged = for i <- of_source, i.rewrite == :none, do: i.chunk_id
+      written = for i <- of_source, i.rewrite != :none, do: i.index
 
       Multi.run(acc, {:prune, source_ref}, fn repo, changes ->
         kept = unchanged ++ Enum.map(written, &Map.fetch!(changes, {:chunk, &1}).id)
@@ -433,10 +491,8 @@ defmodule Loopctl.Corpus.Indexer do
     end)
   end
 
-  defp pruned_count(changes, complete) do
-    Enum.reduce(complete, 0, fn source_ref, acc ->
-      acc + Map.get(changes, {:prune, source_ref}, 0)
-    end)
+  defp pruned_by_source(changes, complete) do
+    Map.new(complete, fn source_ref -> {source_ref, Map.get(changes, {:prune, source_ref}, 0)} end)
   end
 
   defp audit_attrs(tenant_id, corpus, items, complete, audit) do
