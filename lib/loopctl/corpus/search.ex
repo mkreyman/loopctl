@@ -145,11 +145,16 @@ defmodule Loopctl.Corpus.Search do
   `opts`: `:limit` (default #{@default_limit}, clamped to #{@max_limit}) and `:lanes`
   (a non-empty subset of `lanes/0`, default all of them).
 
-  Returns `{:ok, %{results: [...], meta: %{lanes: [...], ...}}}`. Both lanes failing
-  is the only case that returns `{:error, :heavy_read_overloaded}` — a semantic lane
-  that cannot run (no embedding key, an embed failure, a shed heavy read) degrades to
+  Returns `{:ok, %{results: [...], meta: %{lanes: [...], ...}}}`. A semantic lane that
+  cannot run (no embedding key, an embed failure, a shed heavy read) degrades to
   keyword-only and says so in `meta`, the way semantic article search does. A semantic
   lane that RAN but could not reach the whole corpus sets `meta.semantic_under_filled`.
+
+  Every ATTEMPTED lane failing is the only error case: a shed heavy read is
+  `{:error, :heavy_read_overloaded}`, and a semantic lane asked for ALONE that failed
+  for any other reason is `{:error, {:semantic_lane_unavailable, tag}}` — a NAMED term
+  carrying the same bounded tag `meta.semantic_unavailable_reason` uses, never the raw
+  provider reason.
   """
   @spec search(Ecto.UUID.t(), String.t(), String.t(), keyword()) ::
           {:ok, %{results: [map()], meta: map()}}
@@ -160,6 +165,7 @@ defmodule Loopctl.Corpus.Search do
              | {:invalid_lanes, term()}
              | :empty_query
              | :query_too_long
+             | {:semantic_lane_unavailable, String.t()}
              | :heavy_read_overloaded}
   def search(tenant_id, corpus_id, query_string, opts \\ []) when is_binary(tenant_id) do
     with {:ok, corpus} <- Corpus.get_corpus(tenant_id, corpus_id),
@@ -191,6 +197,8 @@ defmodule Loopctl.Corpus.Search do
              | {:invalid_lanes, term()}
              | :invalid_query_vector
              | {:query_vector_dimension_mismatch, non_neg_integer(), pos_integer()}
+             | {:query_vector_out_of_range, non_neg_integer()}
+             | {:semantic_lane_unavailable, String.t()}
              | :heavy_read_overloaded}
   def search_vector(tenant_id, corpus_id, vector, opts \\ []) when is_binary(tenant_id) do
     with {:ok, corpus} <- Corpus.get_corpus(tenant_id, corpus_id),
@@ -237,11 +245,24 @@ defmodule Loopctl.Corpus.Search do
 
   defp check_lanes(requested, _available), do: {:error, {:invalid_lanes, requested}}
 
+  # The RANGE check is not decoration: pgvector's `vector` is float32, so an element
+  # outside that range (`1.0e40` is legal JSON and a legal Elixir number) is rejected by
+  # Postgres itself with `infinite value not allowed in vector` — RAISED, not returned,
+  # and rendered to the caller as an opaque 500 by the DB backstop. A client-side input
+  # error is refused HERE, naming the bound, exactly as a length mismatch is.
   defp validate_query_vector(vector, dim) when is_list(vector) do
     cond do
-      vector == [] or not Enum.all?(vector, &is_number/1) -> {:error, :invalid_query_vector}
-      length(vector) != dim -> {:error, {:query_vector_dimension_mismatch, length(vector), dim}}
-      true -> :ok
+      vector == [] or not Enum.all?(vector, &is_number/1) ->
+        {:error, :invalid_query_vector}
+
+      length(vector) != dim ->
+        {:error, {:query_vector_dimension_mismatch, length(vector), dim}}
+
+      true ->
+        case DocumentChunkEmbedding.out_of_float32_range_index(vector) do
+          nil -> :ok
+          index -> {:error, {:query_vector_out_of_range, index}}
+        end
     end
   end
 
@@ -283,8 +304,29 @@ defmodule Loopctl.Corpus.Search do
 
     case {attempted, errors} do
       {[], _errors} -> :ok
-      {same, same} -> hd(errors)
+      {same, same} -> all_failed(errors)
       _partial -> :ok
+    end
+  end
+
+  # Every attempted lane failed, so there is nothing to fuse and no degraded answer to
+  # give. A shed heavy read keeps its own tag — that is the documented 429 with a
+  # Retry-After, and it is the ONLY reason the keyword lane produces.
+  #
+  # Anything else is an EMBEDDING failure, reachable since a request may ask for the
+  # semantic lane ALONE, and it is wrapped in a NAMED term rather than returned raw:
+  # `Knowledge.generate_embedding/3` yields `:no_api_key`, `:timeout`, `:circuit_open`,
+  # `:rate_limited_local` and `{:embedding_crash, _}`, none of which the
+  # FallbackController has a clause for — leaking one answers 500 instead of a code the
+  # caller can branch on. The tag is the same BOUNDED one
+  # `meta.semantic_unavailable_reason` carries, so no provider body can ride out on it.
+  defp all_failed(errors) do
+    reasons = Enum.map(errors, fn {:error, reason} -> reason end)
+
+    if :heavy_read_overloaded in reasons do
+      {:error, :heavy_read_overloaded}
+    else
+      {:error, {:semantic_lane_unavailable, to_tag(hd(reasons))}}
     end
   end
 

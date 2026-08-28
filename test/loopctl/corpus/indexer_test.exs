@@ -885,6 +885,32 @@ defmodule Loopctl.Corpus.IndexerTest do
       assert embedding_count(corpus) == 0
     end
 
+    # `Pgvector.Ecto.Vector`'s cast DISCARDS an element outside pgvector's float32 element
+    # range instead of erroring, so an over-long value arrives at the changeset as a
+    # SHORT vector and fails the dimension validator with numbers the caller never sent —
+    # a 500 for a purely client-side input error. Refused at the same boundary instead.
+    test "an out-of-float32-range element is refused at the boundary, naming the element" do
+      tenant = fixture(:tenant)
+      corpus = mode_b_corpus!(tenant.id)
+
+      out_of_range =
+        tenant.id
+        |> client_vector(0..7)
+        |> List.replace_at(5, 1.0e40)
+
+      batch = [
+        tenant.id
+        |> vector_chunk("spec.pdf", 1, 0..7, "hash-one")
+        |> Map.put("vector", out_of_range)
+      ]
+
+      assert {:error, {:vector_out_of_range, 0, 5}} =
+               Indexer.index_chunks(tenant.id, corpus.id, batch, audit: audit_opts())
+
+      assert chunks_of(corpus) == []
+      assert embedding_count(corpus) == 0
+    end
+
     # TC-43.3.5, the write half. `allow_snippets` defaults to FALSE in mode B, and the
     # refusal is what makes that default enforceable rather than advisory.
     test "a snippet is refused when the corpus forbids them, and bounded when it allows them" do

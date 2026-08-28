@@ -222,6 +222,27 @@ defmodule Loopctl.Corpus.SearchTest do
       assert meta.semantic_unavailable_reason == "dimension_mismatch"
     end
 
+    # The semantic lane asked for ALONE and failing leaves nothing to fuse and no degraded
+    # answer. The raw provider reason must never escape: the FallbackController has no
+    # clause for one, so returning it verbatim answers 500 instead of a coded refusal.
+    test "a semantic-only request whose embedding fails returns a NAMED error" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+      index!(tenant.id, corpus, [chunk("a.pdf", 1, "rendering provider taxonomy code")])
+
+      stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _scope, _text, _opts ->
+        {:error, :no_api_key}
+      end)
+
+      assert {:error, {:semantic_lane_unavailable, "no_api_key"}} =
+               Search.search(tenant.id, corpus.id, "taxonomy", lanes: ["semantic"])
+
+      # The SAME failure with the keyword lane available is still a degradation, not an
+      # error — the behaviour the named term must not have changed.
+      assert {:ok, %{meta: %{lanes: ["keyword"]}}} =
+               Search.search(tenant.id, corpus.id, "taxonomy")
+    end
+
     test "the semantic lane alone still answers when the query matches no keyword" do
       tenant = fixture(:tenant)
       corpus = create_corpus!(tenant.id)
@@ -479,6 +500,19 @@ defmodule Loopctl.Corpus.SearchTest do
                Search.search_vector(tenant.id, corpus.id, client_vector(tenant.id, 0..7),
                  lanes: ["graph"]
                )
+    end
+
+    # pgvector's element type is float32, and Postgres RAISES on a larger value rather
+    # than returning an error — refused at the boundary, naming the element, the same way
+    # a length mismatch is.
+    test "an out-of-float32-range element in the query vector is refused at the boundary" do
+      tenant = fixture(:tenant)
+      corpus = mode_b_corpus!(tenant.id)
+
+      vector = List.replace_at(client_vector(tenant.id, 0..7), 3, 1.0e40)
+
+      assert {:error, {:query_vector_out_of_range, 3}} =
+               Search.search_vector(tenant.id, corpus.id, vector)
     end
 
     test "a query vector against a mode A corpus is refused by name" do

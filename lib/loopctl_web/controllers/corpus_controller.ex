@@ -64,6 +64,7 @@ defmodule LoopctlWeb.CorpusController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Corpus
+  alias Loopctl.Corpus.DocumentChunkEmbedding
   alias Loopctl.Corpus.Indexer
   alias Loopctl.Corpus.Search
   alias Loopctl.Llm
@@ -92,6 +93,7 @@ defmodule LoopctlWeb.CorpusController do
   @max_search_limit Search.max_limit()
   @max_query_chars Search.max_query_chars()
   @search_lanes Search.lanes()
+  @float32_max DocumentChunkEmbedding.float32_max()
 
   @rate_limit_window_ms 60_000
 
@@ -389,7 +391,10 @@ defmodule LoopctlWeb.CorpusController do
                        items: %OpenApiSpex.Schema{type: :number},
                        description:
                          "The locally-produced embedding. Its length must equal the " <>
-                           "corpus dim."
+                           "corpus dim, and every element must be float32-representable " <>
+                           "(magnitude at most #{@float32_max}) — pgvector stores float32, " <>
+                           "so a larger value is refused (422 vector_out_of_range) rather " <>
+                           "than silently dropped."
                      },
                      content_hash: %OpenApiSpex.Schema{type: :string},
                      ordinal: %OpenApiSpex.Schema{type: :integer},
@@ -435,7 +440,10 @@ defmodule LoopctlWeb.CorpusController do
       401 => {"Unauthorized", "application/json", Schemas.ErrorResponse},
       403 => {"Insufficient role", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      422 => {"Invalid batch", "application/json", Schemas.ErrorResponse},
+      422 =>
+        {"Invalid batch — includes text_not_accepted, vector_dimension_mismatch, " <>
+           "vector_out_of_range and snippets_not_allowed", "application/json",
+         Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       500 =>
         {"Audit write failed — nothing was written", "application/json", Schemas.ErrorResponse},
@@ -502,14 +510,18 @@ defmodule LoopctlWeb.CorpusController do
            query: %OpenApiSpex.Schema{
              type: :string,
              maxLength: @max_query_chars,
-             description: "A query string. server_embedded corpora only."
+             description:
+               "A query string. server_embedded corpora only. Send this OR query_vector, " <>
+                 "never both."
            },
            query_vector: %OpenApiSpex.Schema{
              type: :array,
              items: %OpenApiSpex.Schema{type: :number},
              description:
-               "A locally-produced query vector whose length equals the corpus dim. " <>
-                 "client_embedded corpora only — the server cannot embed for them."
+               "A locally-produced query vector whose length equals the corpus dim and " <>
+                 "whose elements are float32-representable (magnitude at most " <>
+                 "#{@float32_max}). client_embedded corpora only — the server cannot " <>
+                 "embed for them. Send this OR query, never both."
            },
            lanes: %OpenApiSpex.Schema{
              type: :array,
@@ -555,16 +567,24 @@ defmodule LoopctlWeb.CorpusController do
       401 => {"Unauthorized", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       422 =>
-        {"Empty or over-long query (empty_query, query_too_long), a query/corpus mode " <>
+        {"Empty or over-long query (empty_query, query_too_long), both query and " <>
+           "query_vector given (ambiguous_query), a query/corpus mode " <>
            "mismatch (query_string_not_accepted, query_vector_not_accepted), a keyword " <>
            "lane asked of a client_embedded corpus (keyword_lane_unavailable), an " <>
-           "unknown lane (invalid_lanes), or a malformed or wrong-length query_vector " <>
-           "(invalid_query_vector, query_vector_dimension_mismatch)", "application/json",
+           "unknown lane (invalid_lanes), or a malformed, wrong-length or " <>
+           "out-of-float32-range query_vector (invalid_query_vector, " <>
+           "query_vector_dimension_mismatch, query_vector_out_of_range)", "application/json",
          Schemas.ErrorResponse},
       429 =>
         {"Rate limited (code rate_limited), or BOTH lanes shed by the per-tenant " <>
            "heavy-read gate (code heavy_read_overloaded, with Retry-After)", "application/json",
-         Schemas.RateLimitError}
+         Schemas.RateLimitError},
+      502 =>
+        {"Every lane attempted failed and none of them was a shed heavy read (code " <>
+           "semantic_lane_unavailable, details.reason naming the bounded embedding " <>
+           "failure tag). Reachable when the semantic lane is the only lane attempted — " <>
+           "asked for by lanes:[semantic], or by a client_embedded corpus, which has no " <>
+           "other lane.", "application/json", Schemas.ErrorResponse}
     }
   )
 
@@ -585,11 +605,32 @@ defmodule LoopctlWeb.CorpusController do
   # A `query_vector` names the mode B path; the MODE decides whether it is accepted, so a
   # vector sent to a server_embedded corpus is refused by name rather than embedded or
   # ignored.
-  defp run_search(tenant_id, id, %{"query_vector" => vector}, opts),
-    do: Search.search_vector(tenant_id, id, vector, opts)
+  #
+  # Dispatch is on the VALUE, never on the key's presence. Emitting `null` for an absent
+  # optional is ordinary client serialization (Go's encoding/json without omitempty,
+  # `json.dumps({"query_vector": None})`, most generated clients), and matching the key
+  # sent such a request down the mode B path to be refused with
+  # `query_vector_not_accepted` — a message telling the caller to send the `query` it had
+  # already sent. The mirror case, BOTH given, used to silently drop `query`; the request
+  # schema says exactly one, so it is refused by name instead of one being preferred.
+  defp run_search(tenant_id, id, params, opts) do
+    query = Map.get(params, "query")
+    vector = Map.get(params, "query_vector")
 
-  defp run_search(tenant_id, id, params, opts),
-    do: Search.search(tenant_id, id, Map.get(params, "query"), opts)
+    cond do
+      given?(query) and given?(vector) -> {:error, :ambiguous_query}
+      given?(vector) -> Search.search_vector(tenant_id, id, vector, opts)
+      true -> Search.search(tenant_id, id, query, opts)
+    end
+  end
+
+  # A blank string is ABSENT for dispatch purposes, for the same serialization reason a
+  # null is: a client without omitempty sends `query: ""` alongside a real vector. An
+  # empty ARRAY is present — it is a malformed vector, and `invalid_query_vector` says
+  # more than routing it to the query lane would.
+  defp given?(nil), do: false
+  defp given?(value) when is_binary(value), do: String.trim(value) != ""
+  defp given?(_value), do: true
 
   defp handle_search_error(conn, :empty_query),
     do: error(conn, 422, "empty_query", "A query string is required.")
@@ -661,6 +702,45 @@ defmodule LoopctlWeb.CorpusController do
     )
   end
 
+  defp handle_search_error(conn, {:query_vector_out_of_range, index}) do
+    error(
+      conn,
+      422,
+      "query_vector_out_of_range",
+      "query_vector[#{index}] is outside the range pgvector's float32 element type can " <>
+        "represent (magnitude at most #{@float32_max}). Postgres refuses such a value, so " <>
+        "it is refused here rather than reaching the database as an unactionable error.",
+      %{index: index}
+    )
+  end
+
+  # The lanes that ran all failed AND none of them was the shed heavy read, which is only
+  # reachable when the semantic lane was asked for alone. There is no degraded answer to
+  # give, and the raw provider reason must never reach the FallbackController — it has no
+  # clause for one and would answer 500 instead of a code the caller can branch on.
+  defp handle_search_error(conn, {:semantic_lane_unavailable, reason}) do
+    error(
+      conn,
+      502,
+      "semantic_lane_unavailable",
+      "The semantic lane could not run and it was the only lane attempted, so there is no " <>
+        "degraded answer to return. Retry; on a server_embedded corpus, omitting lanes " <>
+        "lets the keyword lane answer while the embedding path is unavailable.",
+      %{reason: reason}
+    )
+  end
+
+  defp handle_search_error(conn, :ambiguous_query) do
+    error(
+      conn,
+      422,
+      "ambiguous_query",
+      "Send exactly one of query (server_embedded) or query_vector (client_embedded). " <>
+        "Both arrived non-empty, and silently preferring one would answer a search the " <>
+        "caller did not ask for."
+    )
+  end
+
   defp handle_search_error(_conn, reason), do: {:error, reason}
 
   # --- error rendering ---
@@ -691,6 +771,21 @@ defmodule LoopctlWeb.CorpusController do
         "#{expected}. The dimension is pinned at creation; re-dimensioning a corpus is " <>
         "delete-and-re-index by design.",
       %{index: index, received_dim: got, corpus_dim: expected}
+    )
+  end
+
+  # `Pgvector.Ecto.Vector` DISCARDS an out-of-float32-range element on cast rather than
+  # erroring, so without this the item reaches the changeset one element short and the
+  # request fails as a 500 corpus_write_failed naming numbers the caller never sent.
+  defp handle_index_error(conn, {:vector_out_of_range, index, at}) do
+    error(
+      conn,
+      422,
+      "vector_out_of_range",
+      "chunks[#{index}].vector[#{at}] is outside the range pgvector's float32 element " <>
+        "type can represent (magnitude at most #{@float32_max}). Re-embed with a pipeline " <>
+        "that emits float32-representable values.",
+      %{index: index, element_index: at}
     )
   end
 

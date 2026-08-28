@@ -872,6 +872,35 @@ defmodule LoopctlWeb.CorpusControllerTest do
     end
   end
 
+  describe "mode B ingest rejects a vector pgvector cannot store" do
+    # `Pgvector.Ecto.Vector` DISCARDS an out-of-float32-range element on cast instead of
+    # erroring, so the item reached the changeset one element short and the request
+    # failed as a 500 corpus_write_failed naming numbers the caller never sent.
+    test "an out-of-float32-range element is a coded 422 naming the element", %{conn: conn} do
+      {tenant, raw_key} = keyed_tenant()
+      corpus = mode_b_corpus!(tenant.id)
+
+      vector = List.replace_at(mode_b_vector(tenant.id), 5, -1.0e40)
+
+      body =
+        conn
+        |> auth(raw_key)
+        |> post(~p"/api/v1/corpora/#{corpus.id}/index", %{
+          "chunks" => [mode_b_chunk(tenant.id, %{"vector" => vector})]
+        })
+        |> json_response(422)
+
+      assert body["error"]["code"] == "vector_out_of_range"
+      assert body["error"]["details"] == %{"index" => 0, "element_index" => 5}
+
+      assert AdminRepo.aggregate(
+               from(c in DocumentChunk, where: c.corpus_id == ^corpus.id),
+               :count,
+               :id
+             ) == 0
+    end
+  end
+
   describe "mode B search (US-43.3)" do
     test "a query vector answers pointers and names the semantic lane alone", %{conn: conn} do
       {tenant, raw_key} = keyed_tenant()
@@ -943,6 +972,152 @@ defmodule LoopctlWeb.CorpusControllerTest do
       assert body["error"]["code"] == "query_vector_not_accepted"
       assert body["error"]["message"] =~ "query"
     end
+
+    # pgvector's element type is float32. Postgres RAISES on a larger value
+    # (`infinite value not allowed in vector`), which the DB backstop renders as an
+    # opaque 500 — a caller-side input error answered with a server error.
+    test "an out-of-float32-range query vector is a coded 422, not a 500", %{conn: conn} do
+      {tenant, raw_key} = keyed_tenant()
+      corpus = mode_b_corpus!(tenant.id)
+
+      vector = List.replace_at(mode_b_vector(tenant.id), 3, 1.0e40)
+
+      body =
+        conn
+        |> auth(raw_key)
+        |> post(~p"/api/v1/corpora/#{corpus.id}/search", %{"query_vector" => vector})
+        |> json_response(422)
+
+      assert body["error"]["code"] == "query_vector_out_of_range"
+      assert body["error"]["details"] == %{"index" => 3}
+    end
+  end
+
+  # The dispatch defects the enhanced review found: a search must be routed by the VALUE
+  # of query_vector, and a lane set that leaves the semantic lane alone must not leak a
+  # raw provider term into the FallbackController.
+  describe "search dispatch and lane-failure coding" do
+    # Emitting `null` for an absent optional is ordinary client serialization. Matching
+    # the KEY sent this valid mode A request down the mode B path, where it was refused
+    # with a message telling the caller to send the `query` it had already sent.
+    test "an explicit query_vector null on a mode A corpus is a normal search", %{conn: conn} do
+      {tenant, raw_key} = keyed_tenant()
+      corpus = create_corpus!(tenant.id)
+
+      {:ok, _result} =
+        Indexer.index_chunks(tenant.id, corpus.id, [page_chunk(1, "taxonomy code")],
+          audit: [actor_type: "api_key"]
+        )
+
+      body =
+        conn
+        |> auth(raw_key)
+        |> post(~p"/api/v1/corpora/#{corpus.id}/search", %{
+          "query" => "taxonomy code",
+          "query_vector" => nil
+        })
+        |> json_response(200)
+
+      assert [%{"source_ref" => "a.pdf"}] = body["data"]
+    end
+
+    # The mirror serialization case: a client without omitempty sends `query: ""`
+    # alongside the vector it means.
+    test "an empty query string alongside a query vector still runs the vector search",
+         %{conn: conn} do
+      {tenant, raw_key} = keyed_tenant()
+      corpus = mode_b_corpus!(tenant.id)
+
+      conn
+      |> auth(raw_key)
+      |> post(~p"/api/v1/corpora/#{corpus.id}/index", %{"chunks" => [mode_b_chunk(tenant.id)]})
+      |> json_response(200)
+
+      body =
+        conn
+        |> auth(raw_key)
+        |> post(~p"/api/v1/corpora/#{corpus.id}/search", %{
+          "query" => "",
+          "query_vector" => mode_b_vector(tenant.id)
+        })
+        |> json_response(200)
+
+      assert [%{"source_ref" => "spec.pdf"}] = body["data"]
+      assert body["meta"]["lanes"] == ["semantic"]
+    end
+
+    # Both given is genuinely ambiguous, and silently preferring the vector answered a
+    # search the caller did not ask for.
+    test "both query and query_vector given is a coded 422", %{conn: conn} do
+      {tenant, raw_key} = keyed_tenant()
+      corpus = mode_b_corpus!(tenant.id)
+
+      body =
+        conn
+        |> auth(raw_key)
+        |> post(~p"/api/v1/corpora/#{corpus.id}/search", %{
+          "query" => "taxonomy",
+          "query_vector" => mode_b_vector(tenant.id)
+        })
+        |> json_response(422)
+
+      assert body["error"]["code"] == "ambiguous_query"
+    end
+
+    # The semantic lane asked for ALONE and failing leaves no degraded answer. The raw
+    # provider reason has no FallbackController clause, so returning it verbatim raised
+    # a FunctionClauseError and answered 500.
+    test "a semantic-only request whose embedding fails is a coded 502", %{conn: conn} do
+      {tenant, raw_key} = keyed_tenant()
+      corpus = create_corpus!(tenant.id)
+
+      {:ok, _result} =
+        Indexer.index_chunks(tenant.id, corpus.id, [page_chunk(1, "taxonomy code")],
+          audit: [actor_type: "api_key"]
+        )
+
+      stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _scope, _text, _opts ->
+        {:error, :circuit_open}
+      end)
+
+      body =
+        conn
+        |> auth(raw_key)
+        |> post(~p"/api/v1/corpora/#{corpus.id}/search", %{
+          "query" => "taxonomy",
+          "lanes" => ["semantic"]
+        })
+        |> json_response(502)
+
+      assert body["error"]["code"] == "semantic_lane_unavailable"
+      assert body["error"]["details"] == %{"reason" => "circuit_open"}
+    end
+
+    # The same failure with the keyword lane still available is a DEGRADATION, not an
+    # error — the behaviour this fix must not have changed.
+    test "the same embedding failure with both lanes still degrades to keyword-only",
+         %{conn: conn} do
+      {tenant, raw_key} = keyed_tenant()
+      corpus = create_corpus!(tenant.id)
+
+      {:ok, _result} =
+        Indexer.index_chunks(tenant.id, corpus.id, [page_chunk(1, "taxonomy code")],
+          audit: [actor_type: "api_key"]
+        )
+
+      stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _scope, _text, _opts ->
+        {:error, :circuit_open}
+      end)
+
+      body =
+        conn
+        |> auth(raw_key)
+        |> post(~p"/api/v1/corpora/#{corpus.id}/search", %{"query" => "taxonomy code"})
+        |> json_response(200)
+
+      assert body["meta"]["lanes"] == ["keyword"]
+      assert body["meta"]["semantic_unavailable_reason"] == "circuit_open"
+    end
   end
 
   # The mode B half of TC-43.2.5's discipline: the DOCUMENTED shape is read out of the
@@ -981,6 +1156,61 @@ defmodule LoopctlWeb.CorpusControllerTest do
       assert search.description =~ "SEMANTIC-ONLY"
       assert search.description =~ "no text to index"
       assert search.description =~ "query_string_not_accepted"
+    end
+
+    # A status a caller can meet must be a status the document names. The 502 is
+    # reachable whenever the semantic lane is the only lane attempted, which the new
+    # `lanes` parameter made askable on a mode A corpus too.
+    test "the statuses and codes a search can answer with are the documented ones" do
+      spec = Loopctl.ApiSpec.spec()
+      search = spec.paths["/api/v1/corpora/{id}/search"].post
+
+      assert 502 in Map.keys(search.responses)
+      assert search.responses[502].description =~ "semantic_lane_unavailable"
+      assert search.responses[422].description =~ "ambiguous_query"
+      assert search.responses[422].description =~ "query_vector_out_of_range"
+    end
+
+    # The float32 element bound is BOTH documented and enforced, so both sides read the
+    # one attribute — and the documented number is then held against a real refusal so
+    # the assertion is not a both-sides-read-one-attribute tautology.
+    test "the documented float32 element bound is the one the ingest enforces", %{conn: conn} do
+      spec = Loopctl.ApiSpec.spec()
+
+      client_schema =
+        spec.paths["/api/v1/corpora/{id}/index"].post.requestBody.content["application/json"].schema.properties.chunks.items.oneOf
+        |> Enum.find(&(&1.title == "ClientEmbeddedChunk"))
+
+      documented = client_schema.properties.vector.description
+
+      assert documented =~ to_string(DocumentChunkEmbedding.float32_max())
+
+      {tenant, raw_key} = keyed_tenant()
+      corpus = mode_b_corpus!(tenant.id)
+
+      over = DocumentChunkEmbedding.float32_max() * 10
+      vector = List.replace_at(mode_b_vector(tenant.id), 0, over)
+
+      body =
+        conn
+        |> auth(raw_key)
+        |> post(~p"/api/v1/corpora/#{corpus.id}/index", %{
+          "chunks" => [mode_b_chunk(tenant.id, %{"vector" => vector})]
+        })
+        |> json_response(422)
+
+      assert body["error"]["code"] == "vector_out_of_range"
+
+      # And a value just INSIDE the documented bound is accepted, so the assertion above
+      # is a boundary and not a blanket refusal.
+      inside = List.replace_at(mode_b_vector(tenant.id), 0, 1.0e38)
+
+      conn
+      |> auth(raw_key)
+      |> post(~p"/api/v1/corpora/#{corpus.id}/index", %{
+        "chunks" => [mode_b_chunk(tenant.id, %{"vector" => inside})]
+      })
+      |> json_response(200)
     end
   end
 end

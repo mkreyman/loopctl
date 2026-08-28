@@ -151,6 +151,7 @@ defmodule Loopctl.Corpus.Indexer do
           | {:duplicate_chunk_key, {String.t(), term()}}
           | {:text_not_accepted, non_neg_integer()}
           | {:vector_dimension_mismatch, non_neg_integer(), non_neg_integer(), pos_integer()}
+          | {:vector_out_of_range, non_neg_integer(), non_neg_integer()}
           | {:snippets_not_allowed, non_neg_integer()}
           | {:source_complete_not_carried, [term()]}
           | {:source_complete_invalid, term()}
@@ -274,6 +275,9 @@ defmodule Loopctl.Corpus.Indexer do
       length(vector) != corpus.dim ->
         {:error, {:vector_dimension_mismatch, index, length(vector), corpus.dim}}
 
+      out_of_range_index(vector) ->
+        {:error, {:vector_out_of_range, index, out_of_range_index(vector)}}
+
       snippet_forbidden?(corpus, attrs) ->
         {:error, {:snippets_not_allowed, index}}
 
@@ -300,6 +304,14 @@ defmodule Loopctl.Corpus.Indexer do
     do: value != [] and Enum.all?(value, &is_number/1)
 
   defp vector?(_value), do: false
+
+  # `Pgvector.Ecto.Vector`'s cast DISCARDS an element outside pgvector's float32 element
+  # range instead of erroring, so a 1536-element vector carrying one arrives at the
+  # changeset 1535 long and fails the dimension validator with numbers that describe
+  # nothing the caller sent — surfacing as an opaque 500. Refused here, at the same
+  # boundary and in the same shape as the length mismatch above.
+  defp out_of_range_index(vector),
+    do: DocumentChunkEmbedding.out_of_float32_range_index(vector)
 
   defp changeset_item(corpus, attrs, index) do
     text = Map.fetch!(attrs, "text")

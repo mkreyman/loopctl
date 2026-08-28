@@ -28,15 +28,24 @@ All notable changes to loopctl are documented here.
   corresponds to the vector or to the file, and you own that correspondence. Nothing
   checks which model produced a vector either — that is not computable from a vector.
   What IS enforced is the vector's LENGTH against the corpus `dim`, at the API boundary
-  and again by a database CHECK constraint.
+  and again by a database CHECK constraint — and that every element is representable in
+  pgvector's float32 element type, refused as `422 vector_out_of_range` rather than
+  silently truncated by the cast into a phantom dimension mismatch.
 
   **Retrieval is semantic-only,** because there is no text to index. `POST
   /api/v1/corpora/:id/search` takes `query_vector` (validated against the corpus `dim`)
   instead of `query`, and `meta.lanes` is `["semantic"]`. Every mode mismatch is a coded
   422 with a remedy — `query_string_not_accepted`, `query_vector_not_accepted`,
-  `keyword_lane_unavailable`, `query_vector_dimension_mismatch` — never an empty `200`,
-  which an agent reads as an empty corpus. Result and `meta` key sets are identical to a
-  `server_embedded` corpus's, so a client branches on `meta`, not on the mode.
+  `keyword_lane_unavailable`, `query_vector_dimension_mismatch`,
+  `query_vector_out_of_range` — never an empty `200`, which an agent reads as an empty
+  corpus. Send exactly ONE of `query` and `query_vector`: sending both is
+  `422 ambiguous_query`, and an explicit `null` for either counts as absent, so a client
+  that serializes omitted optionals as `null` is not routed to the wrong mode. When the
+  semantic lane is the only lane attempted — a `client_embedded` corpus, or
+  `lanes: ["semantic"]` on a `server_embedded` one — and it fails, the answer is
+  `502 semantic_lane_unavailable` carrying a bounded `details.reason`, never a raw
+  provider term. Result and `meta` key sets are identical to a `server_embedded`
+  corpus's, so a client branches on `meta`, not on the mode.
 
   **Operator impact:** none for existing corpora. `mode` is pinned at creation and
   immutable in BOTH directions — a `server_embedded` corpus can never become

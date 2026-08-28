@@ -255,16 +255,21 @@ defmodule Loopctl.Corpus.ModeBPrivacyTest do
   # `:info`, so a `Logger.debug`/`Logger.info` echoing a request body would emit in
   # production and be invisible here. Read the source instead.
   #
-  # MUTATION-VERIFIED: adding `Logger.info("payload " <> inspect(chunks))` to
-  # `Loopctl.Corpus.Indexer.index_chunks/4` turns this red.
+  # MUTATION-VERIFIED, in the INTERPOLATED form — the one an author actually writes, and
+  # the one an earlier version of this guard could not see because it rejected every line
+  # containing a `#` (the first character of `\#{}`) as a comment: adding
+  # `Logger.info("payload \#{inspect(chunks)}")` to `Loopctl.Corpus.Indexer.index_chunks/4`
+  # turns this red, as does the `<>` concatenation form.
   describe "no module on the mode B path logs the payload" do
     test "every Logger call on the ingest and search path is free of payload bindings" do
       call_sites =
         Enum.flat_map(@mode_b_path, fn path ->
-          lines = path |> File.read!() |> String.split("\n")
+          # Comments are stripped, not used to reject the whole line: a trailing `# ...`
+          # must not hide the code before it, and an interpolation is not a comment.
+          lines = path |> File.read!() |> String.split("\n") |> Enum.map(&strip_comment/1)
 
           for {line, index} <- Enum.with_index(lines),
-              String.contains?(line, "Logger.") and not String.contains?(line, "#"),
+              String.contains?(line, "Logger."),
               do: {path, index + 1, lines |> Enum.slice(index, 4) |> Enum.join(" ")}
         end)
 
@@ -275,10 +280,21 @@ defmodule Loopctl.Corpus.ModeBPrivacyTest do
       offenders =
         for {path, line, window} <- call_sites,
             binding <- @payload_bindings,
-            Regex.match?(~r/\binspect\(#{binding}\)|\#\{#{binding}\}/, window),
+            Regex.match?(payload_regex(binding), window),
             do: "#{path}:#{line} logs #{binding}"
 
       assert offenders == []
     end
   end
+
+  # Everything from the first `#` that does not open an interpolation. Crude for Elixir
+  # in general (a literal `#` inside a string is not a comment), but exact for the one
+  # question asked here: whether a Logger call names a payload binding.
+  defp strip_comment(line), do: line |> String.split(~r/#(?!\{)/, parts: 2) |> hd()
+
+  # The binding may be reached through a field or an index (`inspect(item.snippet)`,
+  # `\#{hd(chunks)}`), so it is matched as a WORD anywhere inside the `inspect(...)` call
+  # or the interpolation rather than as the whole argument.
+  defp payload_regex(binding),
+    do: ~r/inspect\([^)]*\b#{binding}\b|\#\{[^}]*\b#{binding}\b/
 end
