@@ -48,6 +48,7 @@ defmodule Loopctl.Corpus do
   alias Loopctl.AdminRepo
   alias Loopctl.Corpus.Corpus
   alias Loopctl.Corpus.DocumentChunk
+  alias Loopctl.Projects
 
   @default_list_limit 50
   @max_list_limit 200
@@ -58,30 +59,37 @@ defmodule Loopctl.Corpus do
   `tenant_id` is set on the struct, never cast. `dim` must be a published
   supported dimension (AC-43.1.4) and, together with `embedding_model` and `mode`,
   is pinned here and immutable thereafter.
+
+  A `project_id` is validated for tenant OWNERSHIP here, before the write — the
+  schema's `foreign_key_constraint(:project_id)` is an existence check and never
+  the tenant boundary.
   """
   @spec create_corpus(Ecto.UUID.t(), map()) ::
           {:ok, Corpus.t()} | {:error, Ecto.Changeset.t()}
   def create_corpus(tenant_id, attrs) when is_binary(tenant_id) do
     %Corpus{tenant_id: tenant_id}
     |> Corpus.create_changeset(attrs)
+    |> validate_project_ownership(tenant_id)
     |> AdminRepo.insert()
   end
 
   @doc """
-  Fetches one corpus of `tenant_id` by id, or — when `id_or_slug` is not a UUID —
-  by its `(tenant_id, slug)` unique key.
+  Fetches one corpus of `tenant_id` by id, falling back to its `(tenant_id, slug)`
+  unique key when the id lookup misses.
+
+  The fallback is what makes the contract true for every slug the create changeset
+  accepts: `Ecto.UUID.cast/1` parses a canonical lowercase UUID (all of whose
+  characters the slug format validator allows) AND any 16-BYTE string as a raw
+  UUID, so an id-only resolver made such a corpus creatable and then permanently
+  unreachable by slug — including through `delete_corpus/2`, `upsert_chunks/3` and
+  `delete_chunks_for_source/3`, which all resolve here. The second query is paid
+  only when the id branch was attempted and missed.
   """
   @spec get_corpus(Ecto.UUID.t(), String.t()) :: {:ok, Corpus.t()} | {:error, :not_found}
   def get_corpus(tenant_id, id_or_slug) when is_binary(tenant_id) and is_binary(id_or_slug) do
-    query =
-      case Ecto.UUID.cast(id_or_slug) do
-        {:ok, id} -> from(c in Corpus, where: c.tenant_id == ^tenant_id and c.id == ^id)
-        :error -> from(c in Corpus, where: c.tenant_id == ^tenant_id and c.slug == ^id_or_slug)
-      end
-
-    case AdminRepo.one(query) do
-      nil -> {:error, :not_found}
-      corpus -> {:ok, corpus}
+    with :error <- fetch_corpus_by_id(tenant_id, id_or_slug),
+         :error <- fetch_corpus_by_slug(tenant_id, id_or_slug) do
+      {:error, :not_found}
     end
   end
 
@@ -89,18 +97,21 @@ defmodule Loopctl.Corpus do
   Lists `tenant_id`'s corpora, newest first.
 
   Options: `:project_id` (restrict to one project scope), `:limit` (clamped to
-  #{@max_list_limit}), `:offset`.
+  #{@max_list_limit}), `:offset` (floored at 0 — Postgres refuses a negative
+  OFFSET, and this function sanitises BOTH pagination opts or neither).
   """
   @spec list_corpora(Ecto.UUID.t(), keyword()) :: [Corpus.t()]
   def list_corpora(tenant_id, opts \\ []) when is_binary(tenant_id) do
     limit = opts |> Keyword.get(:limit, @default_list_limit) |> clamp_limit()
+
+    offset = opts |> Keyword.get(:offset, 0) |> clamp_offset()
 
     Corpus
     |> where([c], c.tenant_id == ^tenant_id)
     |> maybe_filter_project(Keyword.get(opts, :project_id))
     |> order_by([c], desc: c.inserted_at, desc: c.id)
     |> limit(^limit)
-    |> offset(^Keyword.get(opts, :offset, 0))
+    |> offset(^offset)
     |> AdminRepo.all()
   end
 
@@ -132,7 +143,9 @@ defmodule Loopctl.Corpus do
   index behind. Two chunks sharing one `(source_ref, locator)` within a single
   batch are refused (`{:error, {:duplicate_chunk_key, key}}`): Postgres cannot
   affect the same row twice in one `ON CONFLICT DO UPDATE`, and silently keeping
-  the last one would hide a client-side chunking bug.
+  the last one would hide a client-side chunking bug. "Sharing" is judged as
+  POSTGRES will judge it — `%{page: 1}`, `%{"page" => 1}` and `%{"page" => 1.0}`
+  are one jsonb key and one row — so the refusal covers every pair the index does.
   """
   @spec upsert_chunks(Ecto.UUID.t(), String.t(), [map()]) ::
           {:ok, [DocumentChunk.t()]}
@@ -181,6 +194,58 @@ defmodule Loopctl.Corpus do
 
   # --- internals ---
 
+  # `project_id` IS cast from caller input, and the insert runs on the BYPASSRLS
+  # `AdminRepo`, so the schema's `foreign_key_constraint(:project_id)` is evaluated
+  # against `projects` in EVERY tenant: it is an EXISTENCE check, never the tenant
+  # boundary. Validating ownership here makes a foreign project and a nonexistent
+  # one take the SAME error path, so the FK cannot serve as a cross-tenant
+  # existence oracle, and no cross-tenant edge is persisted — which would also let
+  # the OTHER tenant deleting its project mutate this row through the DDL's
+  # `ON DELETE SET NULL`. `nil` (tenant-wide) is always allowed. Mirrors
+  # `Loopctl.Knowledge.validate_project_ownership/2` and
+  # `Loopctl.Memory.validate_project_scope/1`; `Projects.get_project/2` carries the
+  # UUID guard, so a malformed value is a changeset error, never a CastError 500.
+  defp validate_project_ownership(changeset, tenant_id) do
+    case Ecto.Changeset.get_field(changeset, :project_id) do
+      nil ->
+        changeset
+
+      project_id ->
+        case Projects.get_project(tenant_id, project_id) do
+          {:ok, _project} ->
+            changeset
+
+          {:error, :not_found} ->
+            Ecto.Changeset.add_error(
+              changeset,
+              :project_id,
+              "is invalid or does not belong to this tenant"
+            )
+        end
+    end
+  end
+
+  defp fetch_corpus_by_id(tenant_id, id_or_slug) do
+    case Ecto.UUID.cast(id_or_slug) do
+      {:ok, id} ->
+        fetch_corpus(from(c in Corpus, where: c.tenant_id == ^tenant_id and c.id == ^id))
+
+      :error ->
+        :error
+    end
+  end
+
+  defp fetch_corpus_by_slug(tenant_id, slug) do
+    fetch_corpus(from(c in Corpus, where: c.tenant_id == ^tenant_id and c.slug == ^slug))
+  end
+
+  defp fetch_corpus(query) do
+    case AdminRepo.one(query) do
+      nil -> :error
+      corpus -> {:ok, corpus}
+    end
+  end
+
   defp maybe_filter_project(query, nil), do: query
 
   defp maybe_filter_project(query, project_id),
@@ -190,6 +255,9 @@ defmodule Loopctl.Corpus do
     do: min(limit, @max_list_limit)
 
   defp clamp_limit(_), do: @default_list_limit
+
+  defp clamp_offset(offset) when is_integer(offset) and offset > 0, do: offset
+  defp clamp_offset(_), do: 0
 
   # Validated through the changeset (so `locator`'s default and the required fields
   # are enforced once, in one place), then flattened to `insert_all` rows: one
@@ -231,14 +299,53 @@ defmodule Loopctl.Corpus do
     |> Map.to_list()
   end
 
+  # Compared on the form POSTGRES will compare, not on the Elixir term: the
+  # uniqueness this guards is a btree over a jsonb `locator`, so two locators that
+  # are distinct maps but equal as jsonb reach one row twice and Postgres raises
+  # `cardinality_violation` ("ON CONFLICT DO UPDATE command cannot affect row a
+  # second time") — an unmatched raise where the @spec promises
+  # `{:error, {:duplicate_chunk_key, key}}`. Two classes get past a term
+  # comparison: atom vs string keys (`stringify_keys/1` normalises the TOP-LEVEL
+  # attrs only, and it must — the STORED locator is never normalised), and jsonb's
+  # numeric equality, where `1` and `1.0` are the same key but different terms.
+  # The canonical form is used for the COMPARISON only; the reported key and the
+  # stored value stay verbatim.
   defp refute_duplicate_keys(rows) do
-    keys = Enum.map(rows, &{Keyword.fetch!(&1, :source_ref), Keyword.fetch!(&1, :locator)})
+    rows
+    |> Enum.reduce_while(MapSet.new(), fn row, seen ->
+      source_ref = Keyword.fetch!(row, :source_ref)
+      locator = Keyword.fetch!(row, :locator)
+      key = {source_ref, canonical_locator(locator)}
 
-    case keys -- Enum.uniq(keys) do
-      [] -> :ok
-      [duplicate | _] -> {:error, {:duplicate_chunk_key, duplicate}}
+      if MapSet.member?(seen, key) do
+        {:halt, {:error, {:duplicate_chunk_key, {source_ref, locator}}}}
+      else
+        {:cont, MapSet.put(seen, key)}
+      end
+    end)
+    |> case do
+      {:error, _} = error -> error
+      _seen -> :ok
     end
   end
+
+  # jsonb sorts object keys, renders every key as a string, and compares numbers
+  # numerically (`1 = 1.0`). A sorted list of stringified-key pairs with integral
+  # floats folded to integers reproduces that equality without touching the value
+  # that gets stored.
+  defp canonical_locator(value) when is_map(value) and not is_struct(value) do
+    value
+    |> Enum.map(fn {key, inner} -> {to_string(key), canonical_locator(inner)} end)
+    |> Enum.sort()
+  end
+
+  defp canonical_locator(value) when is_list(value), do: Enum.map(value, &canonical_locator/1)
+
+  defp canonical_locator(value) when is_float(value) do
+    if value == trunc(value), do: trunc(value), else: value
+  end
+
+  defp canonical_locator(value), do: value
 
   defp stringify_keys(attrs) when is_map(attrs) do
     Map.new(attrs, fn

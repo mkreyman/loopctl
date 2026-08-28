@@ -115,14 +115,21 @@ defmodule Loopctl.Corpus.Corpus do
   them is an ERROR on that field rather than a silent drop (AC-43.1.13 / TC-43.1.3).
   A silent drop would let a caller believe it had re-dimensioned a corpus whose
   vectors are all still at the old dimension.
+
+  `project_id` is not cast either, and that is a TENANT-BOUNDARY decision rather
+  than an immutability one: `foreign_key_constraint(:project_id)` is an existence
+  check evaluated against every tenant's projects on the BYPASSRLS `AdminRepo`, so
+  the ownership check has to live in the context, where `tenant_id` is (see
+  `Loopctl.Corpus.create_corpus/2`). Leaving the field castable here with only the
+  FK behind it would pre-open a cross-tenant edge for whatever adds the first
+  update path. A future re-scope adds the cast AND that check together.
   """
   @spec update_changeset(t(), map()) :: Ecto.Changeset.t()
   def update_changeset(%__MODULE__{} = corpus, attrs) do
     corpus
-    |> cast(attrs, [:name, :description, :allow_snippets, :project_id])
+    |> cast(attrs, [:name, :description, :allow_snippets])
     |> validate_required([:name, :allow_snippets])
     |> reject_immutable_changes(attrs)
-    |> foreign_key_constraint(:project_id)
   end
 
   defp validate_supported_dimension(changeset) do

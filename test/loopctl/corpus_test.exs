@@ -121,6 +121,60 @@ defmodule Loopctl.CorpusTest do
       assert message =~ "no pre-built"
       assert message =~ "migration"
     end
+
+    test "a project_id belonging to ANOTHER tenant is refused, persisting no row" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      theirs = fixture(:project, tenant_id: tenant_b.id)
+
+      assert {:error, changeset} =
+               Corpus.create_corpus(tenant_a.id, corpus_attrs(%{project_id: theirs.id}))
+
+      assert %{project_id: ["is invalid or does not belong to this tenant"]} =
+               errors_on(changeset)
+
+      assert Corpus.list_corpora(tenant_a.id) == []
+      assert Corpus.list_corpora(tenant_a.id, project_id: theirs.id) == []
+    end
+
+    test "a NONEXISTENT project_id is indistinguishable from a foreign one" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      theirs = fixture(:project, tenant_id: tenant_b.id)
+
+      assert {:error, foreign} =
+               Corpus.create_corpus(tenant_a.id, corpus_attrs(%{project_id: theirs.id}))
+
+      assert {:error, absent} =
+               Corpus.create_corpus(
+                 tenant_a.id,
+                 corpus_attrs(%{project_id: Ecto.UUID.generate()})
+               )
+
+      assert errors_on(foreign).project_id == errors_on(absent).project_id,
+             "the two must not be distinguishable — that is the cross-tenant existence oracle"
+    end
+
+    test "a malformed project_id is a changeset error, never a raise" do
+      tenant = fixture(:tenant)
+
+      for value <- ["not-a-uuid", 42] do
+        assert {:error, changeset} =
+                 Corpus.create_corpus(tenant.id, corpus_attrs(%{project_id: value}))
+
+        assert Map.has_key?(errors_on(changeset), :project_id)
+      end
+    end
+
+    test "the tenant's own project_id is accepted and scopes the corpus" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, tenant_id: tenant.id)
+
+      assert {:ok, corpus} =
+               Corpus.create_corpus(tenant.id, corpus_attrs(%{project_id: project.id}))
+
+      assert corpus.project_id == project.id
+    end
   end
 
   # TC-43.1.3 / AC-43.1.13
@@ -177,6 +231,21 @@ defmodule Loopctl.CorpusTest do
         })
 
       assert changeset.valid?
+    end
+
+    test "project_id is not castable on update — ownership is the context's to check",
+         %{corpus: corpus, tenant: tenant} do
+      other = fixture(:tenant)
+      theirs = fixture(:project, tenant_id: other.id)
+      mine = fixture(:project, tenant_id: tenant.id)
+
+      for project <- [theirs, mine] do
+        changeset =
+          CorpusSchema.update_changeset(corpus, %{name: corpus.name, project_id: project.id})
+
+        assert changeset.valid?
+        refute Map.has_key?(changeset.changes, :project_id)
+      end
     end
 
     test "no path in the context module can alter a corpus row at all" do
@@ -335,6 +404,50 @@ defmodule Loopctl.CorpusTest do
                Corpus.upsert_chunks(tenant.id, corpus.id, [attrs, attrs])
     end
 
+    test "locators that are DISTINCT terms but EQUAL as jsonb are refused, not raised" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      # Each pair reaches ONE row of the (corpus_id, source_ref, locator) unique
+      # index, where Postgres raises cardinality_violation out of ON CONFLICT DO
+      # UPDATE. The guard must name it instead: jsonb renders keys as strings and
+      # compares numbers numerically.
+      pairs = [
+        {%{page: 1}, %{"page" => 1}},
+        {%{"page" => 1}, %{"page" => 1.0}},
+        {%{"page" => 1, "line" => 2}, %{"line" => 2, "page" => 1}},
+        {%{"path" => ["a", 1]}, %{"path" => ["a", 1.0]}}
+      ]
+
+      for {left, right} <- pairs do
+        chunks = [
+          chunk_attrs(%{source_ref: "same.pdf", locator: left}),
+          chunk_attrs(%{source_ref: "same.pdf", locator: right})
+        ]
+
+        assert {:error, {:duplicate_chunk_key, {"same.pdf", _}}} =
+                 Corpus.upsert_chunks(tenant.id, corpus.id, chunks),
+               "#{inspect(left)} and #{inspect(right)} are one jsonb key"
+      end
+
+      assert chunk_count(corpus.id) == 0
+    end
+
+    test "locators that differ as jsonb are both written" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      chunks = [
+        chunk_attrs(%{source_ref: "same.pdf", locator: %{"page" => 1}}),
+        chunk_attrs(%{source_ref: "same.pdf", locator: %{"page" => 1.5}}),
+        chunk_attrs(%{source_ref: "same.pdf", locator: %{"page" => "1"}}),
+        chunk_attrs(%{source_ref: "other.pdf", locator: %{"page" => 1}})
+      ]
+
+      assert {:ok, written} = Corpus.upsert_chunks(tenant.id, corpus.id, chunks)
+      assert length(written) == 4
+    end
+
     test "another tenant's corpus is not found" do
       tenant_a = fixture(:tenant)
       tenant_b = fixture(:tenant)
@@ -357,6 +470,38 @@ defmodule Loopctl.CorpusTest do
       assert {:error, :not_found} = Corpus.get_corpus(tenant_b.id, corpus.slug)
     end
 
+    test "a UUID-shaped slug is still reachable — and still deletable — by slug" do
+      tenant = fixture(:tenant)
+
+      # The slug format validator accepts both: a canonical lowercase UUID is
+      # lowercase hex plus hyphens, and any 16-BYTE string is a raw UUID to
+      # `Ecto.UUID.cast/1`. An id-only resolver made either corpus unreachable on
+      # every verb, including the one that would remove it.
+      for slug <- [Ecto.UUID.generate(), "abcdefghijklmnop"] do
+        corpus = create_corpus!(tenant.id, %{slug: slug})
+
+        assert {:ok, %{id: id}} = Corpus.get_corpus(tenant.id, slug)
+        assert id == corpus.id
+
+        assert {:ok, _} = Corpus.upsert_chunks(tenant.id, slug, [chunk_attrs()])
+
+        assert {:ok, 1} =
+                 Corpus.delete_chunks_for_source(tenant.id, slug, "docs/hcpf-edi/837p.pdf")
+
+        assert {:ok, _} = Corpus.delete_corpus(tenant.id, slug)
+        assert {:error, :not_found} = Corpus.get_corpus(tenant.id, slug)
+      end
+    end
+
+    test "a UUID-shaped slug of ANOTHER tenant stays not_found" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      slug = Ecto.UUID.generate()
+      _theirs = create_corpus!(tenant_b.id, %{slug: slug})
+
+      assert {:error, :not_found} = Corpus.get_corpus(tenant_a.id, slug)
+    end
+
     test "list_corpora/2 returns only the tenant's own rows" do
       tenant_a = fixture(:tenant)
       tenant_b = fixture(:tenant)
@@ -374,6 +519,17 @@ defmodule Loopctl.CorpusTest do
 
       assert Enum.map(Corpus.list_corpora(tenant.id, project_id: project.id), & &1.id) ==
                [scoped.id]
+    end
+
+    test "list_corpora/2 sanitises BOTH pagination opts, not just :limit" do
+      tenant = fixture(:tenant)
+      mine = create_corpus!(tenant.id)
+
+      # Postgres refuses a negative OFFSET, so an unsanitised one raises where the
+      # @spec declares a list. :limit was already clamped; :offset was not.
+      assert Enum.map(Corpus.list_corpora(tenant.id, limit: 5, offset: -1), & &1.id) == [mine.id]
+      assert Corpus.list_corpora(tenant.id, offset: "3") == [mine]
+      assert Corpus.list_corpora(tenant.id, offset: 1) == []
     end
 
     test "delete_chunks_for_source/3 removes one source's chunks and leaves the rest" do
