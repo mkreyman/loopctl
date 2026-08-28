@@ -416,7 +416,13 @@ defmodule Loopctl.CorpusTest do
         {%{page: 1}, %{"page" => 1}},
         {%{"page" => 1}, %{"page" => 1.0}},
         {%{"page" => 1, "line" => 2}, %{"line" => 2, "page" => 1}},
-        {%{"path" => ["a", 1]}, %{"path" => ["a", 1.0]}}
+        {%{"path" => ["a", 1]}, %{"path" => ["a", 1.0]}},
+        # VALUES, not just keys: the jsonb encoder renders an atom and a struct as
+        # STRINGS, so each of these pairs is one jsonb value and one row.
+        {%{"kind" => :page}, %{"kind" => "page"}},
+        {%{"on" => ~D[2026-01-01]}, %{"on" => "2026-01-01"}},
+        {%{"path" => [:a, "b"]}, %{"path" => ["a", "b"]}},
+        {:page, "page"}
       ]
 
       for {left, right} <- pairs do
@@ -446,6 +452,76 @@ defmodule Loopctl.CorpusTest do
 
       assert {:ok, written} = Corpus.upsert_chunks(tenant.id, corpus.id, chunks)
       assert length(written) == 4
+    end
+
+    test "a locator may be ANY jsonb value — an array or a scalar, not only an object" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      # AC-43.1.2 gives the shape to the client ("loopctl only stores and returns
+      # it") and the column is plain jsonb. `field :locator, :map` refused a heading
+      # path (the AC's own third example) and a bare page number on the way IN, and
+      # could not LOAD either on the way out.
+      locators = [
+        ["Chapter 1", "Section 2"],
+        7,
+        "page-7",
+        true,
+        %{"path" => ["a", "b"]}
+      ]
+
+      for locator <- locators do
+        assert {:ok, [chunk]} =
+                 Corpus.upsert_chunks(tenant.id, corpus.id, [chunk_attrs(%{locator: locator})])
+
+        assert chunk.locator == locator
+        assert AdminRepo.get!(DocumentChunk, chunk.id).locator == locator
+      end
+
+      assert chunk_count(corpus.id) == length(locators)
+    end
+
+    test "an array locator is the idempotency key it claims to be" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+      attrs = chunk_attrs(%{locator: ["Chapter 1", "Section 2"], content_hash: "sha256:one"})
+
+      {:ok, [first]} = Corpus.upsert_chunks(tenant.id, corpus.id, [attrs])
+      {:ok, [second]} = Corpus.upsert_chunks(tenant.id, corpus.id, [%{attrs | text: "moved"}])
+
+      assert second.id == first.id
+      assert chunk_count(corpus.id) == 1
+    end
+
+    test "a locator the jsonb encoder cannot render is a changeset error, never a raise" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      assert {:error, {:invalid_chunk, 0, changeset}} =
+               Corpus.upsert_chunks(tenant.id, corpus.id, [
+                 chunk_attrs(%{locator: %{"span" => {1, 2}}})
+               ])
+
+      assert Map.has_key?(errors_on(changeset), :locator)
+      assert chunk_count(corpus.id) == 0
+    end
+
+    test "a locator whose keys collide as jsonb strings is refused, not silently truncated" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      # `'{"a":1,"a":2}'::jsonb` is `{"a": 2}` — Postgres keeps the LAST duplicate
+      # key, so this locator has no faithful stored form and the term-comparing
+      # duplicate guard cannot see the collision either.
+      for locator <- [%{:page => 1, "page" => 2}, %{"loc" => %{:page => 1, "page" => 2}}] do
+        assert {:error, {:invalid_chunk, 0, changeset}} =
+                 Corpus.upsert_chunks(tenant.id, corpus.id, [chunk_attrs(%{locator: locator})])
+
+        assert [message] = errors_on(changeset).locator
+        assert message =~ "collide"
+      end
+
+      assert chunk_count(corpus.id) == 0
     end
 
     test "another tenant's corpus is not found" do
@@ -493,6 +569,24 @@ defmodule Loopctl.CorpusTest do
       end
     end
 
+    test "a slug that is already another corpus's id in this tenant is refused at creation" do
+      tenant = fixture(:tenant)
+      other = create_corpus!(tenant.id)
+
+      # `get_corpus/2` resolves an id BEFORE a slug, so this corpus would be
+      # addressable by nobody and `delete_corpus/2` would destroy the OTHER row —
+      # with its chunks and vectors — for a caller that named its own slug.
+      assert {:error, changeset} =
+               Corpus.create_corpus(tenant.id, corpus_attrs(%{slug: other.id}))
+
+      assert [message] = errors_on(changeset).slug
+      assert message =~ "id of another corpus"
+
+      # Scoped to the tenant, and the UUID-shaped-slug support itself is untouched.
+      assert {:ok, _} =
+               Corpus.create_corpus(fixture(:tenant).id, corpus_attrs(%{slug: other.id}))
+    end
+
     test "a UUID-shaped slug of ANOTHER tenant stays not_found" do
       tenant_a = fixture(:tenant)
       tenant_b = fixture(:tenant)
@@ -500,6 +594,16 @@ defmodule Loopctl.CorpusTest do
       _theirs = create_corpus!(tenant_b.id, %{slug: slug})
 
       assert {:error, :not_found} = Corpus.get_corpus(tenant_a.id, slug)
+    end
+
+    test "list_corpora/2 returns no rows for a malformed project_id rather than raising" do
+      tenant = fixture(:tenant)
+      _corpus = create_corpus!(tenant.id)
+
+      # A caller-supplied value lands on a `:binary_id` column, where a non-UUID
+      # raises `Ecto.Query.CastError` — a 500 out of a function whose @spec promises
+      # a list. `Projects.get_project/2` carries the same guard.
+      assert Corpus.list_corpora(tenant.id, project_id: "not-a-uuid") == []
     end
 
     test "list_corpora/2 returns only the tenant's own rows" do
@@ -625,6 +729,42 @@ defmodule Loopctl.CorpusTest do
         HeavyRead.all(tenant.id, from_only)
       end
     end
+  end
+
+  describe "cascade-path indexes" do
+    test "every new FK has an index LEADING with its referencing column" do
+      # Postgres's RI cascade issues `DELETE FROM <child> WHERE <fk> = $1` with no
+      # tenant predicate, so a btree leading with `tenant_id` cannot serve it. This
+      # is the defect `20260721090000` fixed on `article_embeddings`; the corpus
+      # tier copied that table's create migration and not its corrective index.
+      for {table, column} <- [
+            {"document_chunk_embeddings", "document_chunk_id"},
+            {"document_chunks", "tenant_id"},
+            {"corpora", "project_id"}
+          ] do
+        assert leading_index?(table, column),
+               "#{table}.#{column} has no valid index leading with it, so its cascade seq-scans"
+      end
+    end
+  end
+
+  # `indkey[0]` is the index's FIRST key column (int2vector, 0-based). `indisvalid`
+  # matters because a failed CONCURRENTLY build leaves an INVALID index behind that
+  # `pg_indexes` still renders and the planner never uses.
+  defp leading_index?(table, column) do
+    %{rows: [[count]]} =
+      AdminRepo.query!(
+        """
+        SELECT count(*)
+        FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indrelid
+        JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = i.indkey[0]
+        WHERE c.relname = $1 AND a.attname = $2 AND i.indisvalid
+        """,
+        [table, column]
+      )
+
+    count > 0
   end
 
   defp stored_vector_dims(embedding_id) do

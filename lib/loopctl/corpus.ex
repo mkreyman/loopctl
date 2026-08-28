@@ -63,6 +63,10 @@ defmodule Loopctl.Corpus do
   A `project_id` is validated for tenant OWNERSHIP here, before the write — the
   schema's `foreign_key_constraint(:project_id)` is an existence check and never
   the tenant boundary.
+
+  A `slug` that already addresses ANOTHER corpus of this tenant as an id is
+  refused, because `get_corpus/2` resolves an id before a slug (see
+  `validate_slug_does_not_address_another_corpus/2`).
   """
   @spec create_corpus(Ecto.UUID.t(), map()) ::
           {:ok, Corpus.t()} | {:error, Ecto.Changeset.t()}
@@ -70,6 +74,7 @@ defmodule Loopctl.Corpus do
     %Corpus{tenant_id: tenant_id}
     |> Corpus.create_changeset(attrs)
     |> validate_project_ownership(tenant_id)
+    |> validate_slug_does_not_address_another_corpus(tenant_id)
     |> AdminRepo.insert()
   end
 
@@ -84,6 +89,14 @@ defmodule Loopctl.Corpus do
   unreachable by slug — including through `delete_corpus/2`, `upsert_chunks/3` and
   `delete_chunks_for_source/3`, which all resolve here. The second query is paid
   only when the id branch was attempted and missed.
+
+  The precedence is unambiguous because `create_corpus/2` refuses a slug that is
+  already another corpus's id in this tenant. Without that refusal the id branch
+  won silently: `get_corpus/2` returned the OTHER corpus, and `delete_corpus/2`
+  destroyed it — with its chunks and vectors, via the declared cascade — for a
+  caller that named a slug the unique index says belongs to exactly one corpus.
+  Reversing the precedence only mirrors the collision, so the refusal is at the
+  one point where the ambiguity can be prevented rather than resolved.
   """
   @spec get_corpus(Ecto.UUID.t(), String.t()) :: {:ok, Corpus.t()} | {:error, :not_found}
   def get_corpus(tenant_id, id_or_slug) when is_binary(tenant_id) and is_binary(id_or_slug) do
@@ -145,7 +158,8 @@ defmodule Loopctl.Corpus do
   affect the same row twice in one `ON CONFLICT DO UPDATE`, and silently keeping
   the last one would hide a client-side chunking bug. "Sharing" is judged as
   POSTGRES will judge it — `%{page: 1}`, `%{"page" => 1}` and `%{"page" => 1.0}`
-  are one jsonb key and one row — so the refusal covers every pair the index does.
+  are one jsonb key and one row, as are `%{"kind" => :page}` and
+  `%{"kind" => "page"}` — so the refusal covers every pair the index does.
   """
   @spec upsert_chunks(Ecto.UUID.t(), String.t(), [map()]) ::
           {:ok, [DocumentChunk.t()]}
@@ -225,6 +239,29 @@ defmodule Loopctl.Corpus do
     end
   end
 
+  # `get_corpus/2` resolves an id BEFORE a slug, and the slug format validator
+  # accepts a canonical lowercase UUID (the branch's own tests create one). A corpus
+  # whose slug is another corpus's id would therefore be addressable by nobody and
+  # would silently redirect every verb — `delete_corpus/2` included — at the OTHER
+  # row. Refuse it here, the one point where the ambiguity can be PREVENTED:
+  # reversing the resolver's precedence only mirrors the same collision onto a
+  # caller passing a real id. The extra query is paid only by a slug that parses as
+  # a UUID, which is the rare case.
+  defp validate_slug_does_not_address_another_corpus(changeset, tenant_id) do
+    with slug when is_binary(slug) <- Ecto.Changeset.get_field(changeset, :slug),
+         {:ok, _corpus} <- fetch_corpus_by_id(tenant_id, slug) do
+      Ecto.Changeset.add_error(
+        changeset,
+        :slug,
+        "is already the id of another corpus in this tenant — a corpus is resolved " <>
+          "by id before slug, so this one would be unreachable and every verb would " <>
+          "address the other row"
+      )
+    else
+      _ -> changeset
+    end
+  end
+
   defp fetch_corpus_by_id(tenant_id, id_or_slug) do
     case Ecto.UUID.cast(id_or_slug) do
       {:ok, id} ->
@@ -248,8 +285,18 @@ defmodule Loopctl.Corpus do
 
   defp maybe_filter_project(query, nil), do: query
 
-  defp maybe_filter_project(query, project_id),
-    do: where(query, [c], c.project_id == ^project_id)
+  # `project_id` is caller-supplied and lands on a `:binary_id` column, where a
+  # non-UUID value raises `Ecto.Query.CastError` — a 500 out of a function whose
+  # @spec promises a list. `Projects.get_project/2` carries the same guard for the
+  # same reason (`create_corpus/2` inherits it through `validate_project_ownership/2`);
+  # here the clean shape is an empty result, since no corpus can be scoped to a
+  # project id no project can have.
+  defp maybe_filter_project(query, project_id) do
+    case Ecto.UUID.cast(project_id) do
+      {:ok, id} -> where(query, [c], c.project_id == ^id)
+      :error -> where(query, [c], false)
+    end
+  end
 
   defp clamp_limit(limit) when is_integer(limit) and limit > 0,
     do: min(limit, @max_list_limit)
@@ -304,10 +351,14 @@ defmodule Loopctl.Corpus do
   # are distinct maps but equal as jsonb reach one row twice and Postgres raises
   # `cardinality_violation` ("ON CONFLICT DO UPDATE command cannot affect row a
   # second time") — an unmatched raise where the @spec promises
-  # `{:error, {:duplicate_chunk_key, key}}`. Two classes get past a term
-  # comparison: atom vs string keys (`stringify_keys/1` normalises the TOP-LEVEL
-  # attrs only, and it must — the STORED locator is never normalised), and jsonb's
-  # numeric equality, where `1` and `1.0` are the same key but different terms.
+  # `{:error, {:duplicate_chunk_key, key}}`. Three classes get past a term
+  # comparison: atom vs string KEYS (`stringify_keys/1` normalises the TOP-LEVEL
+  # attrs only, and it must — the STORED locator is never normalised); atom or
+  # struct VALUES, which the jsonb encoder renders as strings; and jsonb's numeric
+  # equality, where `1` and `1.0` are the same key but different terms. A FOURTH —
+  # an object whose keys collide once stringified, where jsonb keeps only the last
+  # — is refused upstream by `DocumentChunk.changeset/2`, because there the stored
+  # value would not be the value sent and no comparison form can fix that.
   # The canonical form is used for the COMPARISON only; the reported key and the
   # stored value stay verbatim.
   defp refute_duplicate_keys(rows) do
@@ -345,7 +396,20 @@ defmodule Loopctl.Corpus do
     if value == trunc(value), do: trunc(value), else: value
   end
 
-  defp canonical_locator(value), do: value
+  defp canonical_locator(value)
+       when is_binary(value) or is_integer(value) or is_boolean(value) or is_nil(value),
+       do: value
+
+  # A bare atom and a struct are not JSON types, and the jsonb encoder renders both
+  # as STRINGS: `%{"kind" => :page}` and `%{"kind" => "page"}` are ONE jsonb value
+  # and ONE row, as are `~D[2026-01-01]` and "2026-01-01". A term comparison sees
+  # two, and Postgres then raises `cardinality_violation` out of the very
+  # `ON CONFLICT DO UPDATE` this guard exists to keep it out of. Encoding and
+  # decoding yields the value jsonb will hold; the STORED value is untouched.
+  # `Loopctl.Corpus.Locator` has already refused anything that cannot be encoded,
+  # so `Jason.encode!/1` here cannot raise.
+  defp canonical_locator(value),
+    do: value |> Jason.encode!() |> Jason.decode!() |> canonical_locator()
 
   defp stringify_keys(attrs) when is_map(attrs) do
     Map.new(attrs, fn
