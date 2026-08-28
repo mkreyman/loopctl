@@ -1,27 +1,36 @@
 ---
 name: knowledge-wiki
-description: Use when working on loopctl's knowledge/retrieval product — the shared Knowledge Wiki, agent memory, the context retriever, hybrid (curated + RAG) search, the novelty/dedup gate, embeddings, conflict resolution, or KB curation permissions. Covers the three agent information surfaces and how to pick between them. Triggers on: knowledge, wiki, knowledge_create, knowledge_search, hybrid_search, novelty, dedup, proposal gate, embedding, vector search, conflict, curation, memory_remember, memory_recall, retrieve_, context retriever, entity, RAG, progressive disclosure, OKF.
+description: Use when working on loopctl's knowledge/retrieval product — the shared Knowledge Wiki, agent memory, the context retriever, hybrid (curated + RAG) search, the novelty/dedup gate, embeddings, conflict resolution, or KB curation permissions. Covers the four agent information surfaces and how to pick between them. Triggers on: knowledge, wiki, knowledge_create, knowledge_search, hybrid_search, novelty, dedup, proposal gate, embedding, vector search, conflict, curation, memory_remember, memory_recall, retrieve_, context retriever, entity, RAG, progressive disclosure, OKF, corpus_search, corpus tier, verbatim text, source_ref.
 ---
 
 # Knowledge Wiki & Retrieval Surfaces
 
 The knowledge/retrieval stack is loopctl's product core (it *is* the second brain). It is large
-(`lib/loopctl/knowledge/`) and split across three distinct agent-facing surfaces plus a
+(`lib/loopctl/knowledge/`) and split across four distinct agent-facing surfaces plus a
 hybrid retrieval capability. This skill routes you to the right surface and the load-bearing invariants;
 full references live in `docs/agent-memory.md`, `docs/context-retriever.md`,
-`docs/knowledge-hybrid-retrieval.md`. AGENTS.md carries the same three-surface routing for quick recall.
+`docs/knowledge-hybrid-retrieval.md`, `docs/user_stories/epic_43_corpus_tier/README.md`.
+AGENTS.md carries the same four-surface routing for quick recall.
 
-## Three surfaces — pick by WHAT THE DATA IS
+## Four surfaces — pick by WHAT THE DATA IS
 
 | Surface | Module / tables | What it is | Pick when |
 |---------|-----------------|------------|-----------|
 | `retrieve_*` **Context Retriever** (Epic 30) | `Loopctl.ContextRetriever.*` — a NAMESPACE, not a module (`Scope`/`Executor`/`Registry`/`Entity`/`ToolGenerator` under `lib/loopctl/context_retriever/`; there is no `context_retriever.ex`), `entity_definitions` | governed, structured access to loopctl's own live rows (projects/stories/epics) | you'd query live operational state by a structured filter / full-text search |
 | `knowledge_*` **Knowledge Wiki** | `Loopctl.Knowledge` (`lib/loopctl/knowledge.ex`) | SHARED, curated tenant DOCUMENTS, deduped + linked | the insight is worth ANOTHER agent reading |
 | `memory_*` **Agent Memory** (Epic 28) | `Loopctl.Memory`, `memories`/`session_memories` | PRIVATE `(tenant, subject_id)` working memory | a fact only THIS agent needs to recall about its own work |
+| `corpus_*` **Corpus tier** (Epic 43) | `Loopctl.Corpus`, `corpora`/`document_chunks` | an index over REFERENCE DOCUMENTS whose files stay in the CLIENT's repo; `corpus_search` answers with a POINTER (`source_ref` + `locator`) plus a bounded snippet, never the chunk body | you need the EXACT WORDING of an authoritative document — a spec, a contract, an RFC, a manual — rather than what we learned about it |
 
-Rule of thumb: *live structured business row?* → `retrieve_*`. *worth another agent reading?* →
-`knowledge_create`. *a fact only I need?* → `memory_remember`. Scope is **key-derived server-side** — you
+Rule of thumb: *quote me the exact text of an authoritative document?* → `corpus_search`, then open the
+file it points at. *what did we learn about X?* → `knowledge_search`. *live structured business row?* →
+`retrieve_*`. *worth another agent reading?* → `knowledge_create`. *a fact only I need?* →
+`memory_remember`. Scope is **key-derived server-side** — you
 never pass `tenant_id`/`subject_id`.
+
+`knowledge_search` never covers the corpus tables, so an empty wiki result says NOTHING about whether a
+document is indexed — check `corpus_list` before concluding it is not. And `corpus_search` is
+deliberately absent from `/api/v1/recall`: verbatim spec chunks auto-injected into every session are
+exactly the pollution the separate tables prevent.
 
 ## Invariants (cited)
 

@@ -1,6 +1,6 @@
 ---
 name: ubiquitous-language
-description: Glossary of loopctl's own vocabulary — the terms that cross the custody, knowledge and tenancy skills and therefore belong to none of them: the three information surfaces (retrieve_ vs knowledge_ vs memory_), custody words (exact-role, human anchor, trust tier, lineage, the self-* 409s), and the transparency-log words (audit chain, STH, inclusion proof, egress posture). Load it before acting on any term that is unfamiliar OR ordinary-looking-but-load-bearing here — scope, capability, graduate, novelty, cap, verify. Triggers on glossary, terminology, jargon, abbreviation, acronym, what does X mean, what do we call this, ubiquitous language, domain vocabulary.
+description: Glossary of loopctl's own vocabulary — the terms that cross the custody, knowledge and tenancy skills and therefore belong to none of them: the four information surfaces (retrieve_ vs knowledge_ vs memory_ vs corpus_), custody words (exact-role, human anchor, trust tier, lineage, the self-* 409s), and the transparency-log words (audit chain, STH, inclusion proof, egress posture). Load it before acting on any term that is unfamiliar OR ordinary-looking-but-load-bearing here — scope, capability, graduate, novelty, cap, verify. Triggers on glossary, terminology, jargon, abbreviation, acronym, what does X mean, what do we call this, ubiquitous language, domain vocabulary.
 ---
 
 # Ubiquitous Language — loopctl
@@ -25,9 +25,9 @@ One-sentence definition grounded in the actual code.
 
 ---
 
-## The three surfaces people conflate
+## The four surfaces people conflate
 
-Picking the wrong one is the most common vocabulary mistake here, and it is silent — all three
+Picking the wrong one is the most common vocabulary mistake here, and it is silent — all four
 "store something for later".
 
 **`retrieve_*` — Context Retriever** (Epic 30) — *Surface*
@@ -42,6 +42,15 @@ insight is worth ANOTHER agent reading.
 PRIVATE `(tenant_id, subject_id)` working memory. Pick it for a fact only THIS agent needs about
 its own work.
 ↳ See: `knowledge-wiki`
+
+**`corpus_*` — Corpus tier** (Epic 43) — *Surface*
+An index over REFERENCE DOCUMENTS whose files stay in the client's own repo (`Loopctl.Corpus`).
+`corpus_search` returns a POINTER plus a bounded snippet, never the chunk body, so the next step
+is always to open the file yourself. Pick it when you need the EXACT WORDING of an authoritative
+document — a spec, a contract, an RFC, a manual — rather than what we learned about it. An empty
+`knowledge_search` says nothing about whether a document is indexed here; check `corpus_list`.
+↳ See: `CLAUDE.md` "four agent information surfaces",
+`docs/user_stories/epic_43_corpus_tier/README.md`
 
 ---
 
@@ -58,6 +67,15 @@ marked their own work done" checkable after the fact rather than merely enforced
 The bearer of a delegated, scoped permission in the dispatch path — how an orchestrator hands an
 agent the right to act without handing over its own role.
 ↳ See: `chain-of-custody`
+
+**Chunk / pointer / `source_ref`** — *Corpus tier*
+A corpus stores CHUNKS of a reference document and answers with a POINTER — `source_ref` (the
+path in the client's own repo) plus `locator` (page/heading/line) plus a bounded snippet. The
+chunk body is never returned, so "found it" means "open that file at that place", not "here is
+the text". A `server_embedded` corpus takes a query string; a `client_embedded` one is
+semantic-only and takes a `query_vector`, because loopctl holds no text there.
+↳ See: `CLAUDE.md` "four agent information surfaces",
+`docs/user_stories/epic_43_corpus_tier/README.md`
 
 **Chain of custody** — *Custody*
 The core product guarantee: **nobody marks their own work as done.** An agent implements; an
@@ -133,7 +151,7 @@ from query-level filtering. Read the skill before touching any query that crosse
 ## S
 
 **Scope** — *Ambiguous — but never a parameter you pass*
-Across all three surfaces, scope is **key-derived server-side**: you never pass `tenant_id` or
+Across all four surfaces, scope is **key-derived server-side**: you never pass `tenant_id` or
 `subject_id`. "Scope" also names a KB scope (`create_kb_scope` / `archive_kb_scope`) and
 `ContextRetriever.Scope`; read which one is meant before wiring anything that looks like a tenant
 filter.

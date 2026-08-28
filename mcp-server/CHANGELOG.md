@@ -5,6 +5,49 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.78.0 — 2026-08-28 (the corpus tier becomes reachable from an agent)
+
+### Added
+
+- **`corpus_search`, `corpus_create`, `corpus_index`, `corpus_list`, `corpus_status`,
+  `corpus_delete`** — the Epic 43 CORPUS TIER: an index over reference documents whose
+  FILES stay in your own repo. loopctl holds chunk pointers (and, in mode A, the text it
+  embeds); a search returns `{source_ref, locator, snippet, score}` and NEVER the chunk
+  body, so the next step is always to open the file yourself. The HTTP surface shipped in
+  US-43.1/43.2/43.3; until now it was reachable only by hand.
+
+  **Which tool, and when.** `corpus_search` when you need the VERBATIM text of an
+  authoritative document — a spec, a contract, an RFC. `knowledge_search` when you want
+  what we LEARNED about a topic. Searching the wiki for a distillation of a document whose
+  exact wording you needed is the failure this tier exists to prevent; so is reading an
+  empty wiki result as an empty corpus.
+
+  **Two modes, pinned at `corpus_create`.** `server_embedded` takes chunk TEXT and embeds
+  it on YOUR key, so a tenant with no embedding credential is refused at create
+  (`422 no_embedding_key`) rather than at first index, and both search lanes work.
+  `client_embedded` takes VECTORS and loopctl stores content it cannot read: no embedding
+  key, SEMANTIC-ONLY search, `allow_snippets` defaults to FALSE, and a chunk carrying
+  `text` is refused (`422 text_not_accepted`) rather than silently ignored. Every mode
+  restriction is stated in the tool DESCRIPTION — a caller should never discover one from
+  an error.
+
+  `corpus_index` carries `source_complete` in both of its forms (a bare `source_ref`
+  string, or `{source_ref, locators}` for a document spanning several batches). It is the
+  only way to prune what a re-indexed document no longer contains; without it on the tool
+  surface, stale chunks would survive forever.
+
+  `corpus_delete` is the ONE verb here that needs `LOOPCTL_USER_KEY`: set-based AND
+  irreversible, the same AND that puts the knowledge bulk ops behind a user key.
+
+### Notes
+
+- **`corpus_search` is deliberately NOT part of `recall_context`** and is never
+  auto-injected into a session. Verbatim spec chunks in every repo's recall pack are
+  exactly the pollution the corpus tier's separate tables prevent by construction.
+- Path building AND request-body building for every corpus tool live in
+  `lib/http-helpers.js`, so the test suite exercises the code this server ships rather
+  than a mirror re-implemented inside a test file.
+
 ## 2.76.0 — 2026-08-21 (contest an article you just refuted)
 
 ### Added

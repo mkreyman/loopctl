@@ -2,9 +2,9 @@
 
 Authoritative reference for loopctl's **agent-memory** subsystem: what it is, the
 two tiers, the scope/isolation model, when to reach for it vs the Knowledge Wiki
-(vs the future context retriever), its PII/secret stance, and the **auto-promotion
-lifecycle** (Epic 29 / Part 2) that compiles session turns into durable long-term
-memories.
+(vs the Context Retriever, vs the Corpus tier), its PII/secret stance, and the
+**auto-promotion lifecycle** (Epic 29 / Part 2) that compiles session turns into
+durable long-term memories.
 
 > loopctl is **agent-native**: there is **no web UI, no LiveView, no human login**
 > for memory. Every memory operation is an API/MCP call made by an agent under its
@@ -13,16 +13,17 @@ memories.
 
 ---
 
-## The three-layer mental model (decide fast)
+## The four-layer mental model (decide fast)
 
-loopctl gives an agent three distinct places to put/get information. Pick by
+loopctl gives an agent four distinct places to put/get information. Pick by
 **ownership + lifecycle**, not by "where will I find it later":
 
 | Layer | What it holds | Scope / owner | Lifecycle | Reach it via |
 |-------|---------------|---------------|-----------|--------------|
 | **Knowledge Wiki** | Curated, *shared* tenant knowledge — patterns, decisions, findings, references | Tenant (with per-article agent visibility) | Human/agent-curated, versioned, linked, conflict-resolved | `knowledge_*` tools / `/api/v1/knowledge*` |
 | **Agent Memory** | An agent subject's *private* working memory — session turns + long-term facts about *its* work | `(tenant, subject_id)` — one agent | Append/embed/supersede/forget; session tier expires | `memory_*` tools / `/api/v1/memory*` |
-| **Context Retriever** *(future, #309/#310)* | Governed, structured access to *live business data* (entities, not documents) | Tenant, schema-scoped | Read-through over the operational store | *not yet built* |
+| **Context Retriever** (Epic 30) | Governed, structured access to *live business data* (entities, not documents) | Tenant, schema-scoped | Read-through over the operational store; entity definitions are admin-authored | `retrieve_*` (generated `cr_*`) tools / `/api/v1/entities*` + `/api/v1/retrieve/*` |
+| **Corpus tier** (Epic 43) | An index over *reference documents* whose files stay in the client's own repo — VERBATIM chunks, never distilled | Tenant, per corpus | Indexed from the client's files; a corpus pins its own dimension and is re-indexed, never edited in place | `corpus_*` tools / `/api/v1/corpora*` |
 
 Rules of thumb:
 
@@ -31,8 +32,16 @@ Rules of thumb:
 - **Is it a fact THIS agent learned about ITS task/user that only it needs to
   recall later?** → Agent Memory (`memory_remember`). It's private to the subject.
 - **Is it live operational state (an order, a story, a ticket) you'd query by
-  structured filters?** → that's the *context retriever*'s job (query the domain
-  API directly today; the auto-generated retriever layer is future work).
+  structured filters?** → the Context Retriever (`retrieve_*`), which reads
+  loopctl's real rows through a governed, parameterized, tenant-scoped query. See
+  [`docs/context-retriever.md`](context-retriever.md).
+- **Do you need the EXACT WORDING of an authoritative document — a spec, a
+  contract, an RFC, a manual?** → the Corpus tier (`corpus_search`). It answers
+  with a POINTER plus a bounded snippet, never the chunk body, so the next step is
+  to open that file yourself. An empty `knowledge_search` says nothing about
+  whether the document is indexed — check `corpus_list` before concluding it is
+  not. See
+  [`docs/user_stories/epic_43_corpus_tier/README.md`](user_stories/epic_43_corpus_tier/README.md).
 
 This layering follows the "database as the agent's context layer, split into a
 context-retriever + agent-memory" architecture (Cole Medin, *"I Love the Karpathy

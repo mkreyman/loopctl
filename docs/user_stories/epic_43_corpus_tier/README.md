@@ -1,8 +1,9 @@
 # Epic 43 — Corpus Tier
 
-**Status: DESIGNED, NOT IMPLEMENTED.** Per-story state and its merge PR live in the
-Stories table below — that table is the single source of truth for what is done, and
-this header is the only place that summarises it. Prose below is the epic's DESIGN
+**Status: IMPLEMENTED — US-43.1 through US-43.3 are on master; US-43.4 is in review.**
+Per-story state and its merge PR live in the Stories table below — that table is the
+single source of truth for what is done, and this header is the only place that
+summarises it. Prose below is the epic's DESIGN
 record, written against master `0a6b48f` on 2026-08-27; read its present tense as
 "at design time".
 
@@ -16,8 +17,11 @@ corpus needs a second, per-machine RAG stack beside loopctl. This epic lets loop
 **host the index while the physical files stay in their own repo**: retrieval returns
 `{source_ref, locator, snippet, score}` and the agent opens the local file itself.
 
-It is a third storage tier, not a fourth agent surface in the Epic 28/30 sense — it
-sits beside the Knowledge Wiki with a different contract:
+It is loopctl's FOURTH agent information surface — `corpus_*`, alongside `retrieve_*`
+/ `knowledge_*` / `memory_*` (CLAUDE.md, "Epic 30 + Epic 43: four agent information
+surfaces"; AGENTS.md and the `ubiquitous-language` skill carry the same routing) — and
+it is also a distinct storage tier, sitting beside the Knowledge Wiki with a different
+contract:
 
 | | Knowledge Wiki (`knowledge_*`) | Corpus tier (`corpus_*`) |
 |---|---|---|
@@ -30,6 +34,14 @@ The distinction is not stylistic. A companion-guide summary is the one thing you
 cannot cite back to a payer, so `knowledge_ingest` — which runs LLM extraction and
 yields articles — is the wrong shape for this material even though it is the right
 shape for the lesson learned from reading it.
+
+At design time this section read "a third storage tier, not a fourth agent surface in
+the Epic 28/30 sense". US-43.4 settled it the other way: the tier ships its own
+`corpus_*` tool family and its own routing clause in the docs an agent actually reads,
+which is what makes a surface. The storage-tier reading is not wrong and the two were
+never exclusive — but an agent picking a retrieval verb is choosing between FOUR
+surfaces, not three, and this file is cited from CLAUDE.md, AGENTS.md and two skills as
+the corpus reference. Revisit if the `corpus_*` tool family is ever withdrawn.
 
 ## What already exists (verified against master, 2026-08-27)
 
@@ -181,9 +193,9 @@ Building this first gives ContextForge a real consumer to develop against.
 | Story | Title | Status | PR |
 |-------|-------|--------|----|
 | US-43.1 | Corpus storage: a corpus that pins its own dimension, and chunks excluded from the article corpus by construction | merged | #772 |
-| US-43.2 | Mode A — server-embedded ingest and pointer-plus-snippet retrieval | in review | #773 |
-| US-43.3 | Mode B — the server stores and ranks vectors it cannot read | not started | — |
-| US-43.4 | The `corpus_*` tool surface, and a routing rule that says when to reach for it | not started | — |
+| US-43.2 | Mode A — server-embedded ingest and pointer-plus-snippet retrieval | merged | #773 |
+| US-43.3 | Mode B — the server stores and ranks vectors it cannot read | merged | #774 |
+| US-43.4 | The `corpus_*` tool surface, and a routing rule that says when to reach for it | in review | #775 |
 
 Strictly sequential: each depends on its predecessor.
 
