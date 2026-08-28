@@ -37,15 +37,23 @@ const DIR = path.dirname(fileURLToPath(import.meta.url));
 const INDEX_SRC = readFileSync(path.join(DIR, "..", "index.js"), "utf8");
 const README = readFileSync(path.join(DIR, "..", "README.md"), "utf8");
 const REPO_CLAUDE_MD = readFileSync(path.join(DIR, "..", "..", "CLAUDE.md"), "utf8");
+const REPO_AGENTS_MD = readFileSync(path.join(DIR, "..", "..", "AGENTS.md"), "utf8");
+const KB_SKILL = readFileSync(
+  path.join(DIR, "..", "..", ".claude", "skills", "knowledge-wiki", "SKILL.md"),
+  "utf8",
+);
 
-const CORPUS_TOOLS = [
-  "corpus_create",
-  "corpus_index",
-  "corpus_search",
-  "corpus_list",
-  "corpus_status",
-  "corpus_delete",
-];
+/** Tool name -> the handler its dispatch case MUST call. */
+const CORPUS_DISPATCH = {
+  corpus_create: "corpusCreate",
+  corpus_index: "corpusIndex",
+  corpus_search: "corpusSearch",
+  corpus_list: "corpusList",
+  corpus_status: "corpusStatus",
+  corpus_delete: "corpusDelete",
+};
+
+const CORPUS_TOOLS = Object.keys(CORPUS_DISPATCH);
 
 function functionSource(name) {
   const declaration = `async function ${name}(`;
@@ -69,8 +77,14 @@ function toolDefinitionSource(name) {
   const start = INDEX_SRC.indexOf(`name: "${name}",`);
   assert.notEqual(start, -1, `index.js must declare a tool named ${name}`);
   const rest = INDEX_SRC.slice(start);
-  const next = rest.indexOf("\n  {\n");
-  return next === -1 ? rest : rest.slice(0, next);
+  // Bound at whichever comes first: the next tool object, or the TOOLS array's own
+  // terminator. The second bound matters for the LAST entry (corpus_delete) — without
+  // it the slice runs past `];` to EOF, and the description assertions are satisfied
+  // by any unrelated source that happens to follow.
+  const bounds = ["\n  {\n", "\n];\n"]
+    .map((marker) => rest.indexOf(marker))
+    .filter((at) => at !== -1);
+  return bounds.length === 0 ? rest : rest.slice(0, Math.min(...bounds));
 }
 
 // ---------------------------------------------------------------------------
@@ -271,19 +285,30 @@ describe("buildCorpusSearchBody", () => {
 // ---------------------------------------------------------------------------
 
 describe("index.js wiring (AC-43.4.1)", () => {
-  for (const name of CORPUS_TOOLS) {
-    test(`${name} is declared and dispatched`, () => {
+  for (const [name, handler] of Object.entries(CORPUS_DISPATCH)) {
+    test(`${name} is declared and dispatched to ${handler}`, () => {
       assert.ok(INDEX_SRC.includes(`name: "${name}",`), `${name} must be in TOOLS`);
-      assert.ok(INDEX_SRC.includes(`case "${name}":`), `${name} must have a dispatch case`);
+      // Pin the case to its HANDLER, not just to the label — the discipline in
+      // test/mcp_arg_forwarding.test.js and test/memory_tools.test.js. A label-only
+      // `includes` is satisfied whichever function the case returns, so
+      // `case "corpus_status": return await corpusList(args);` would pass it while
+      // the tool answers with the corpus LIST. Nothing else executes this switch:
+      // the builder tests import lib/http-helpers.js, and the Elixir journey test
+      // runs no JavaScript.
+      assert.match(
+        INDEX_SRC,
+        new RegExp(`case "${name}":\\s*\\n\\s*return await ${handler}\\(args\\);`),
+        `${name} must dispatch to ${handler}(args)`,
+      );
     });
   }
 
   test("every corpus handler builds its path with the shared helper, not inline", () => {
     assert.match(functionSource("corpusCreate"), /corporaPath\(/);
-    assert.match(functionSource("corpusList"), /corporaPath\(/);
+    assert.match(functionSource("corpusList"), /corporaPath\(args\)/);
     assert.match(functionSource("corpusIndex"), /corpusIndexPath\(corpus_id\)/);
     assert.match(functionSource("corpusSearch"), /corpusSearchPath\(corpus_id\)/);
-    assert.match(functionSource("corpusStatus"), /corpusStatusPath\(corpus_id/);
+    assert.match(functionSource("corpusStatus"), /corpusStatusPath\(corpus_id, \{ limit, offset \}\)/);
     assert.match(functionSource("corpusDelete"), /corpusPath\(corpus_id\)/);
   });
 
@@ -341,9 +366,14 @@ describe("index.js wiring (AC-43.4.1)", () => {
   test("corpus_search is NOT wired into the recall path", () => {
     // The controller moduledoc forbids it: verbatim spec chunks auto-injected into
     // every session are exactly the pollution the separate tables prevent.
-    const recall = INDEX_SRC.slice(INDEX_SRC.indexOf("async function recallContext("));
-    const bounded = recall.slice(0, recall.indexOf("\nasync function ", 1));
-    assert.ok(!/corpus/i.test(bounded), "recallContext must not reach the corpus tier");
+    // Via functionSource, NOT an inline slice: on a renamed target indexOf returns
+    // -1 and the slice collapses to the empty string, which passes a NEGATIVE
+    // assertion vacuously. functionSource asserts the declaration exists and the
+    // body is non-empty first.
+    assert.ok(
+      !/corpus/i.test(functionSource("recallContext")),
+      "recallContext must not reach the corpus tier",
+    );
   });
 });
 
@@ -429,5 +459,25 @@ describe("the routing rule reaches the docs an agent reads (AC-43.4.4/AC-43.4.5)
     assert.match(REPO_CLAUDE_MD, /reading\s+an\s+empty\s+wiki\s+result\s+as\s+an\s+empty\s+corpus/i);
     // The bullet must say what comes back, so the caller knows to open the file.
     assert.match(REPO_CLAUDE_MD, /POINTER\s+plus\s+a\s+bounded\s+snippet/);
+  });
+
+  test("AGENTS.md carries the same routing — CLAUDE.md mandates reading it", () => {
+    // CLAUDE.md's fourth line says "Also read AGENTS.md", so a stale copy here is a
+    // guaranteed misroute, not a cosmetic drift: an agent needing verbatim text finds
+    // no clause for it in the Rule of thumb and falls through to knowledge_search.
+    assert.match(REPO_AGENTS_MD, /FOUR agent information surfaces/);
+    assert.doesNotMatch(REPO_AGENTS_MD, /THREE agent information surfaces/);
+    assert.match(REPO_AGENTS_MD, /\*\*`corpus_\*` — Corpus tier\*\*/);
+    assert.match(REPO_AGENTS_MD, /quote\s+me\s+the\s+exact\s+text[\s\S]{0,200}?corpus_search/);
+  });
+
+  test("the knowledge-wiki skill routes corpus_* — it loads when an agent picks a verb", () => {
+    // CLAUDE.md's domain-skill routing table hands this file to anyone touching
+    // "Knowledge Wiki, agent memory, context retriever, hybrid search" — i.e. exactly
+    // the agent choosing a retrieval verb.
+    assert.match(KB_SKILL, /## Four surfaces/);
+    assert.doesNotMatch(KB_SKILL, /three (agent information surfaces|distinct agent-facing surfaces)/);
+    assert.match(KB_SKILL, /`corpus_\*` \*\*Corpus tier\*\*/);
+    assert.match(KB_SKILL, /quote\s+me\s+the\s+exact\s+text[\s\S]{0,200}?corpus_search/);
   });
 });

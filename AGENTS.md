@@ -5,11 +5,12 @@ This is a web application written using the Phoenix web framework.
 - Use `mix precommit` alias when you are done with all changes and fix any pending issues
 - Use the already included and available `:req` (`Req`) library for HTTP requests, **avoid** `:httpoison`, `:tesla`, and `:httpc`. Req is included by default and is the preferred HTTP client for Phoenix apps
 
-### `retrieve_*` (Context Retriever) vs `knowledge_*` (Wiki, incl. hybrid retrieval) vs `memory_*` (Memory)
+### `retrieve_*` (Context Retriever) vs `knowledge_*` (Wiki, incl. hybrid retrieval) vs `memory_*` (Memory) vs `corpus_*` (Corpus tier)
 
-loopctl has THREE agent information surfaces — pick by WHAT THE DATA IS (full
+loopctl has FOUR agent information surfaces — pick by WHAT THE DATA IS (full
 references: `docs/context-retriever.md`, `docs/agent-memory.md`,
-`docs/knowledge-hybrid-retrieval.md`):
+`docs/knowledge-hybrid-retrieval.md`,
+`docs/user_stories/epic_43_corpus_tier/README.md`):
 
 - **`retrieve_*` — Context Retriever** (Epic 30; `Loopctl.ContextRetriever`, table
   `entity_definitions`): GOVERNED, structured access to loopctl's own live ROWS
@@ -48,8 +49,20 @@ references: `docs/context-retriever.md`, `docs/agent-memory.md`,
     cheap, top-K-capped, curated-preferred topic browse (compact stubs, then a
     full-body drill) — NOT a substitute for `hybrid_search`'s semantic/governed
     resolution (a fuzzy topic can miss a lexically-dissimilar curated article).
+- **`corpus_*` — Corpus tier** (Epic 43; `Loopctl.Corpus`): an index over REFERENCE
+  DOCUMENTS whose files stay in the client's own repo. `corpus_search` returns a
+  POINTER plus a bounded snippet — `{source_ref, locator, snippet, score}`, never the
+  chunk body — so the next step is always to OPEN THE FILE at that pointer yourself.
+  Use it when you need the EXACT WORDING of an authoritative document: a spec, a
+  contract, an RFC, a manual. A `server_embedded` corpus takes a query string; a
+  `client_embedded` one is semantic-only and takes a `query_vector`, because loopctl
+  holds no text to index there. Deliberately NOT part of `/api/v1/recall` — nothing
+  on this surface is auto-injected.
 
-Rule of thumb: *live structured business row?* → `retrieve_*`; *worth another
+Rule of thumb: *quote me the exact text of an authoritative document?* →
+`corpus_search`, then open the file it points at (an empty `knowledge_search` says
+nothing about whether that document is indexed — check `corpus_list` before
+concluding it is not); *live structured business row?* → `retrieve_*`; *worth another
 agent reading?* → `knowledge_create`; *a fact only I need to recall about my own
 work?* → `memory_remember`; *might have a governed answer, need to know if it's
 authoritative or "best guess"?* → `knowledge_hybrid_search`. Scope is key-derived
