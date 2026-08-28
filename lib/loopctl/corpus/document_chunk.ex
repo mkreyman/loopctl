@@ -74,7 +74,12 @@ defmodule Loopctl.Corpus.DocumentChunk do
     |> foreign_key_constraint(:tenant_id)
     |> foreign_key_constraint(:corpus_id)
     |> unique_constraint([:corpus_id, :source_ref, :locator],
-      name: :document_chunks_corpus_source_locator_index
+      name: :document_chunks_corpus_source_locator_index,
+      message: "has already been taken for this locator in this corpus",
+      # `:corpus_id` is the first field of the index, but `upsert_chunks/3` OVERRIDES it with the
+      # tenant-resolved corpus's id, so it is not a field the caller can act on. Attribute the
+      # collision to the identity the caller does supply. Same reason as `Loopctl.Corpus.Corpus`.
+      error_key: :source_ref
     )
   end
 

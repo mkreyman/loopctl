@@ -69,7 +69,11 @@ defmodule Loopctl.Corpus.DocumentChunkEmbedding do
     |> foreign_key_constraint(:tenant_id)
     |> foreign_key_constraint(:document_chunk_id)
     |> unique_constraint([:tenant_id, :document_chunk_id, :dim],
-      name: :document_chunk_embeddings_tenant_chunk_dim_index
+      name: :document_chunk_embeddings_tenant_chunk_dim_index,
+      message: "already has an embedding at this dimension",
+      # Without it the violation lands on `:tenant_id`, which is never cast, and `:dim` is forced
+      # from the corpus above — neither is caller-controlled. Same reason as `Loopctl.Corpus.Corpus`.
+      error_key: :document_chunk_id
     )
     |> check_constraint(:embedding,
       name: :document_chunk_embeddings_dim_matches_vector,

@@ -103,7 +103,15 @@ defmodule Loopctl.Corpus.Corpus do
     |> validate_required([:allow_snippets])
     |> foreign_key_constraint(:tenant_id)
     |> foreign_key_constraint(:project_id)
-    |> unique_constraint([:tenant_id, :slug], name: :corpora_tenant_id_slug_index)
+    |> unique_constraint([:tenant_id, :slug],
+      name: :corpora_tenant_id_slug_index,
+      message: "has already been taken for this tenant",
+      # Without it the violation lands on `:tenant_id` — the first field of the index, and one
+      # the client never sends and cannot control — so a slug collision would reach the caller
+      # of US-43.2's `POST /corpora` as a 422 naming a field it has no way to change.
+      # `Loopctl.Knowledge.Article` and `Loopctl.Projects.Project` set it for the same reason.
+      error_key: :slug
+    )
     |> check_constraint(:dim, name: :corpora_dim_positive, message: "must be greater than 0")
     |> check_constraint(:mode, name: :corpora_mode_valid, message: "is invalid")
   end

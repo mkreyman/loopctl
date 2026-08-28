@@ -105,7 +105,11 @@ defmodule Loopctl.CorpusTest do
 
       assert {:ok, _} = Corpus.create_corpus(tenant_a.id, attrs)
       assert {:error, changeset} = Corpus.create_corpus(tenant_a.id, attrs)
-      assert %{tenant_id: ["has already been taken"]} = errors_on(changeset)
+
+      # The collision is attributed to `:slug`, NOT to `:tenant_id` — the index's first field,
+      # and one the caller never sends. `error_key:` is what holds that.
+      assert %{slug: ["has already been taken for this tenant"]} = errors_on(changeset)
+      refute Map.has_key?(errors_on(changeset), :tenant_id)
 
       assert {:ok, _} = Corpus.create_corpus(tenant_b.id, attrs)
     end
@@ -338,6 +342,28 @@ defmodule Loopctl.CorpusTest do
       refute changeset.valid?
       assert Map.has_key?(errors_on(changeset), :embedding)
     end
+
+    test "a second embedding for the same chunk and dim is attributed to the chunk, not tenant_id" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id, %{dim: 768})
+      {:ok, [chunk]} = Corpus.upsert_chunks(tenant.id, corpus.id, [chunk_attrs()])
+      embed_chunk!(tenant.id, chunk, 768)
+
+      assert {:error, changeset} =
+               %DocumentChunkEmbedding{tenant_id: tenant.id}
+               |> DocumentChunkEmbedding.changeset(
+                 %{document_chunk_id: chunk.id, embedding: test_vec(768)},
+                 768
+               )
+               |> AdminRepo.insert()
+
+      # `:tenant_id` is never cast and `:dim` is forced from the corpus — neither is a field the
+      # caller could act on, so the index's first field is the wrong place for this error.
+      assert %{document_chunk_id: ["already has an embedding at this dimension"]} =
+               errors_on(changeset)
+
+      refute Map.has_key?(errors_on(changeset), :tenant_id)
+    end
   end
 
   describe "upsert_chunks/3" do
@@ -357,6 +383,27 @@ defmodule Loopctl.CorpusTest do
       assert second.text == "second"
       assert second.content_hash == "sha256:two"
       assert chunk_count(corpus.id) == 1
+    end
+
+    test "a duplicate key reaching the index is attributed to source_ref, not corpus_id" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+      attrs = chunk_attrs(%{locator: %{"page" => 7}})
+
+      {:ok, [_]} = Corpus.upsert_chunks(tenant.id, corpus.id, [attrs])
+
+      # The upsert's ON CONFLICT masks this today; US-43.2 surfaces the changeset directly.
+      # `:corpus_id` is the index's first field but `upsert_chunks/3` overrides it server-side,
+      # so the caller cannot act on it.
+      assert {:error, changeset} =
+               %DocumentChunk{tenant_id: tenant.id}
+               |> DocumentChunk.changeset(Map.put(attrs, :corpus_id, corpus.id))
+               |> AdminRepo.insert()
+
+      assert %{source_ref: ["has already been taken for this locator in this corpus"]} =
+               errors_on(changeset)
+
+      refute Map.has_key?(errors_on(changeset), :corpus_id)
     end
 
     test "stores the locator verbatim, without normalising it" do
