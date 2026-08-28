@@ -214,3 +214,150 @@ export function parseJsonResponseBody(rawText, status) {
     };
   }
 }
+
+// ---------------------------------------------------------------------------
+// Corpus tier (Epic 43) — paths and request bodies for the `corpus_*` tools.
+//
+// EVERY corpus tool's path AND body is built here rather than inline in
+// index.js, because index.js is a stdio entry point with top-level await that
+// cannot be imported by a test (AC-43.4.1). Extracting both halves is what lets
+// the corpus tests exercise the SHIPPED code instead of a hand-copied mirror.
+//
+// The bodies are built to the shapes `LoopctlWeb.CorpusController`'s `operation/2`
+// specs declare. A nullish optional is OMITTED rather than sent as `null`: the
+// search action dispatches on the VALUE of `query_vector`, so emitting an explicit
+// `null` for an unset one sent a mode A request down the mode B path to be refused
+// with `query_vector_not_accepted`. An EMPTY ARRAY is deliberately NOT treated as
+// absent — the server refuses it by name (`invalid_query_vector`), and swallowing
+// it here would turn a malformed vector into a silently different request.
+// ---------------------------------------------------------------------------
+
+/**
+ * Path for `corpus_list` (GET /api/v1/corpora), honoring project_id/limit/offset.
+ *
+ * @param {{ project_id?: string, limit?: number, offset?: number }} [args]
+ * @returns {string}
+ */
+export function corporaPath({ project_id, limit, offset } = {}) {
+  return `/api/v1/corpora${buildQuery([
+    ["project_id", project_id],
+    ["limit", limit],
+    ["offset", offset],
+  ])}`;
+}
+
+/**
+ * Path for one corpus (GET/DELETE /api/v1/corpora/:id). The segment accepts an id
+ * OR a slug, both client-supplied, so it is encoded (the `retrieveEntityPath`
+ * precedent) rather than interpolated raw.
+ *
+ * @param {string} id
+ * @returns {string}
+ */
+export function corpusPath(id) {
+  return `/api/v1/corpora/${encodeURIComponent(id)}`;
+}
+
+/**
+ * Path for `corpus_index` (POST /api/v1/corpora/:id/index).
+ *
+ * @param {string} id
+ * @returns {string}
+ */
+export function corpusIndexPath(id) {
+  return `${corpusPath(id)}/index`;
+}
+
+/**
+ * Path for `corpus_search` (POST /api/v1/corpora/:id/search).
+ *
+ * @param {string} id
+ * @returns {string}
+ */
+export function corpusSearchPath(id) {
+  return `${corpusPath(id)}/search`;
+}
+
+/**
+ * Path for `corpus_status` (GET /api/v1/corpora/:id/status), honoring limit/offset
+ * — the per-source listing is paginated, so a corpus with thousands of sources
+ * does not come back in one body.
+ *
+ * @param {string} id
+ * @param {{ limit?: number, offset?: number }} [args]
+ * @returns {string}
+ */
+export function corpusStatusPath(id, { limit, offset } = {}) {
+  return `${corpusPath(id)}/status${buildQuery([
+    ["limit", limit],
+    ["offset", offset],
+  ])}`;
+}
+
+/**
+ * Body for `corpus_create` (POST /api/v1/corpora).
+ *
+ * `allow_snippets` is filtered on `!= null`, never on falsiness: `false` is the
+ * meaningful mode B default and a truthiness check would drop an explicit opt-out.
+ *
+ * @param {{ slug?: string, name?: string, mode?: string, embedding_model?: string,
+ *   dim?: number, description?: string, allow_snippets?: boolean, project_id?: string }} [args]
+ * @returns {object}
+ */
+export function buildCorpusCreateBody(args = {}) {
+  const body = {};
+  for (const key of [
+    "slug",
+    "name",
+    "mode",
+    "embedding_model",
+    "dim",
+    "description",
+    "allow_snippets",
+    "project_id",
+  ]) {
+    if (args[key] != null) body[key] = args[key];
+  }
+  return body;
+}
+
+/**
+ * Body for `corpus_index` (POST /api/v1/corpora/:id/index).
+ *
+ * `chunks` passes through verbatim — its shape is mode-dependent (mode A carries
+ * `text`, mode B carries `vector` + `content_hash`) and the server is the one that
+ * decides, so nothing is reshaped or filtered here.
+ *
+ * `source_complete` is forwarded in BOTH declared forms (a bare `source_ref`
+ * string, or `{source_ref, locators}`) because it is the ONLY way to reach US-43.2's
+ * prune: omit it from the tool surface and a re-indexed document's removed chunks
+ * are unreachable through the surface an agent actually uses (AC-43.4.1).
+ *
+ * @param {{ chunks?: unknown[], source_complete?: unknown[] }} [args]
+ * @returns {object}
+ */
+export function buildCorpusIndexBody({ chunks, source_complete } = {}) {
+  const body = { chunks: chunks ?? [] };
+  if (source_complete != null) body.source_complete = source_complete;
+  return body;
+}
+
+/**
+ * Body for `corpus_search` (POST /api/v1/corpora/:id/search).
+ *
+ * The parameter is named `query` (not `q`) to match every sibling on this surface
+ * except legacy `knowledge_search` — agents copy parameter spellings from
+ * neighbouring tools, and `lib/arg-aliases.js` documents the 8% of searches that
+ * cost.
+ *
+ * @param {{ query?: string, query_vector?: number[], lanes?: string[], limit?: number }} [args]
+ * @returns {object}
+ */
+export function buildCorpusSearchBody({ query, query_vector, lanes, limit } = {}) {
+  const body = {};
+  if (query != null) body.query = query;
+  if (query_vector != null) body.query_vector = query_vector;
+  if (lanes != null) body.lanes = lanes;
+  if (limit != null) body.limit = limit;
+  return body;
+}

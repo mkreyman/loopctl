@@ -491,12 +491,14 @@ I need to recall about my own work?"* → `memory_remember`. Scope is derived fr
 your key server-side — you never pass `tenant_id`/`subject_id`. loopctl is
 agent-native (no memory UI); operator oversight is the superadmin API path.
 
-## Epic 30: Context Retriever — three surfaces (`retrieve_*` vs `knowledge_*` vs `memory_*`)
+## Epic 30 + Epic 43: four agent information surfaces (`retrieve_*` vs `knowledge_*` vs `memory_*` vs `corpus_*`)
 
 Epic 30 adds a THIRD agent information surface (`Loopctl.ContextRetriever`, tables
-`entity_definitions`) alongside the Knowledge Wiki and Agent Memory. Full
-reference: [`docs/context-retriever.md`](docs/context-retriever.md). Pick by what
-the data IS:
+`entity_definitions`) alongside the Knowledge Wiki and Agent Memory, and Epic 43 adds
+a FOURTH (`Loopctl.Corpus`) — so there are four. Full references:
+[`docs/context-retriever.md`](docs/context-retriever.md) and the corpus design record
+at [`docs/user_stories/epic_43_corpus_tier/README.md`](docs/user_stories/epic_43_corpus_tier/README.md).
+Pick by what the data IS:
 
 - **`retrieve_*` (Context Retriever)** — GOVERNED, structured access to loopctl's
   own live rows (`projects`/`stories`/`epics`). A tenant admin declares an
@@ -512,16 +514,36 @@ the data IS:
   the insight is worth another agent reading.
 - **`memory_*` (Agent Memory)** — PRIVATE `(tenant, subject_id)` working memory.
   Use for facts only THIS agent needs to recall about its own work.
+- **`corpus_*` (Corpus tier)** — an index over REFERENCE DOCUMENTS whose files stay
+  in the client's own repo. `corpus_search` returns a POINTER plus a bounded snippet
+  — `{source_ref, locator, snippet, score}`, never the chunk body — so the next step
+  is always to OPEN THE FILE at that pointer yourself. Use it when you need the
+  EXACT WORDING of an authoritative document: a spec, a contract, an RFC, a manual.
+  A `server_embedded` corpus takes a query string (loopctl embeds on the tenant's own
+  key); a `client_embedded` corpus is semantic-only and takes a `query_vector`, because
+  loopctl holds no text to index there. `corpus_search` is deliberately NOT part of
+  `/api/v1/recall` — nothing here is auto-injected.
 
-Rule of thumb: *live structured business row?* → `retrieve_*`. *worth another
-agent reading?* → `knowledge_create`. *a fact only I need?* → `memory_remember`.
+Rule of thumb: *quote me the exact text of an authoritative document?* → `corpus_search`
+(then open the file it points at). *what did we learn about X?* → `knowledge_search`.
+*live structured business row?* → `retrieve_*`. *worth another agent reading?* →
+`knowledge_create`. *a fact only I need?* → `memory_remember`.
+
+The failure the corpus clause prevents, named so you can recognise it: **searching the
+wiki for a distillation of a document whose VERBATIM text you needed** — an article
+about the retention rule is not the retention clause, and quoting the article as if it
+were is how a wrong number reaches a customer. Its mirror is **reading an empty wiki
+result as an empty corpus**: `knowledge_search` never covers the corpus tables, so a
+miss there says nothing about whether the document is indexed. Check with `corpus_list`
+before concluding it is not.
+
 Defining an entity is a security root (role ≥ `user` + human-anchor); querying is
 authenticated-only. You never pass `tenant_id` — scope is key-derived.
 
 ## Epic 31: Hybrid (curated + RAG) Knowledge Retrieval
 
-Epic 31 adds a **capability of the Knowledge Wiki layer** — not a fourth agent
-surface — that resolves a query to EITHER a governed **curated** answer OR a
+Epic 31 adds a **capability of the Knowledge Wiki layer** — not an agent
+information surface of its own — that resolves a query to EITHER a governed **curated** answer OR a
 semantic/keyword **retrieval** result, on one uniform shape carrying
 `meta.provenance` (`:curated`/`:retrieved`). Full reference:
 [`docs/knowledge-hybrid-retrieval.md`](docs/knowledge-hybrid-retrieval.md).

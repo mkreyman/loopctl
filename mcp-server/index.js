@@ -24,6 +24,14 @@ import {
   llmUsagePath,
   memoryPath,
   parseJsonResponseBody,
+  corporaPath,
+  corpusPath,
+  corpusIndexPath,
+  corpusSearchPath,
+  corpusStatusPath,
+  buildCorpusCreateBody,
+  buildCorpusIndexBody,
+  buildCorpusSearchBody,
 } from "./lib/http-helpers.js";
 import {
   createWitnessClient,
@@ -3007,6 +3015,83 @@ async function recoverCap({ story_id }) {
 // US-26: Acceptance criteria for a story
 async function getAcceptanceCriteria({ story_id }) {
   const result = await apiCall("GET", `/api/v1/stories/${story_id}/acceptance_criteria`);
+  return toContent(result);
+}
+
+// ---------------------------------------------------------------------------
+// Corpus tier (Epic 43) — the index for reference documents whose files stay in
+// the caller's own repo.
+//
+// Every path AND request body below is built in lib/http-helpers.js, imported
+// above, so the corpus tests exercise the code this server ships rather than a
+// mirror re-implemented inside a test file (AC-43.4.1/AC-43.4.6).
+//
+// `corpus_delete` is the ONE verb here that takes LOOPCTL_USER_KEY: it is
+// set-based AND irreversible, the same AND that puts the KB's bulk ops behind a
+// user key. Everything else on this surface is agent-role.
+// ---------------------------------------------------------------------------
+
+async function corpusCreate(args) {
+  const result = await apiCall(
+    "POST",
+    corporaPath(),
+    buildCorpusCreateBody(args),
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
+async function corpusList(args = {}) {
+  const result = await apiCall(
+    "GET",
+    corporaPath(args),
+    null,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
+async function corpusIndex({ corpus_id, chunks, source_complete }) {
+  // source_complete is forwarded in both of its declared forms; without it the
+  // prune is unreachable through the only surface an agent uses (AC-43.4.1).
+  const result = await apiCall(
+    "POST",
+    corpusIndexPath(corpus_id),
+    buildCorpusIndexBody({ chunks, source_complete }),
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
+async function corpusSearch({ corpus_id, query, query_vector, lanes, limit }) {
+  const result = await apiCall(
+    "POST",
+    corpusSearchPath(corpus_id),
+    buildCorpusSearchBody({ query, query_vector, lanes, limit }),
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  // Pointers + snippets only — the caller's next step is to open the file at
+  // source_ref/locator. Nothing here is auto-injected into a recall pack.
+  return toContent(result);
+}
+
+async function corpusStatus({ corpus_id, limit, offset }) {
+  const result = await apiCall(
+    "GET",
+    corpusStatusPath(corpus_id, { limit, offset }),
+    null,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
+async function corpusDelete({ corpus_id }) {
+  const result = await apiCall(
+    "DELETE",
+    corpusPath(corpus_id),
+    null,
+    process.env.LOOPCTL_USER_KEY,
+  );
   return toContent(result);
 }
 
@@ -7196,6 +7281,260 @@ const TOOLS = [
       required: ["story_id"],
     },
   },
+  // Corpus Tools (Epic 43) — verbatim reference documents whose FILES stay in your
+  // own repo. loopctl indexes chunks and hands back pointers; it never hosts the file.
+  {
+    name: "corpus_search",
+    description:
+      "Search an indexed reference DOCUMENT for the place that says it — use this when you " +
+      "need the VERBATIM text of an authoritative source (a spec, a contract, an RFC, a " +
+      "manual), and knowledge_search when you want what we LEARNED about a topic. " +
+      "TRADE-OFF: this returns POINTERS, not bodies. Each result is {source_ref, locator, " +
+      "snippet, score, chunk_id, corpus_id}; the snippet is a bounded excerpt and the full " +
+      "chunk text is NEVER returned, so your next step is always to open the file yourself " +
+      "at source_ref/locator. A server_embedded corpus takes `query` (a string) and fuses a " +
+      "semantic and a keyword lane. A client_embedded corpus is SEMANTIC-ONLY — loopctl " +
+      "holds no text to index — so send `query_vector` (its length must equal the corpus " +
+      "dim, from corpus_list/corpus_get); a query STRING there is refused (422 " +
+      "query_string_not_accepted) and so is asking for the keyword lane (422 " +
+      "keyword_lane_unavailable). Send exactly ONE of query/query_vector: both is 422 " +
+      "ambiguous_query, and a query_vector to a server_embedded corpus is 422 " +
+      "query_vector_not_accepted. Scores are rank-derived (RRF) and comparable only WITHIN " +
+      "one result set — there is no absolute floor, so judge by rank. Deliberately NOT part " +
+      "of recall_context: nothing here is auto-injected. Agent key.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        corpus_id: {
+          type: "string",
+          description: "The corpus id or slug to search.",
+        },
+        query: {
+          type: "string",
+          description:
+            "The query text. server_embedded corpora ONLY. Send this or query_vector, never both.",
+        },
+        query_vector: {
+          type: "array",
+          items: { type: "number" },
+          description:
+            "A locally-produced query vector whose length equals the corpus dim. " +
+            "client_embedded corpora ONLY. Send this or query, never both.",
+        },
+        lanes: {
+          type: "array",
+          items: { type: "string", enum: ["semantic", "keyword"] },
+          description:
+            "Optional: the lanes to run (default: every lane the corpus offers). A " +
+            "client_embedded corpus offers only `semantic`.",
+        },
+        limit: { type: "integer", description: "Optional: max results (clamped server-side)." },
+      },
+      required: ["corpus_id"],
+    },
+  },
+  {
+    name: "corpus_create",
+    description:
+      "Create a corpus — a named index over reference documents whose FILES stay in your own " +
+      "repo (use knowledge_create instead when you are writing a curated article loopctl " +
+      "should own). TRADE-OFF: `mode` is pinned at creation and decides everything after " +
+      "it. In `server_embedded` you send chunk TEXT and loopctl embeds it on YOUR embedding " +
+      "key — so a tenant with no embedding credential is refused HERE (422 no_embedding_key) " +
+      "rather than at first index — and both search lanes work. In `client_embedded` you " +
+      "send VECTORS and loopctl stores content it cannot read: no embedding key is needed, " +
+      "search is semantic-only, and allow_snippets defaults to FALSE (a snippet IS text the " +
+      "server would then hold) — ask for it explicitly if you want excerpts back. " +
+      "`embedding_model` and `dim` are pinned too, and a dim that disagrees with a known " +
+      "model's native dimension is refused. Agent key.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        slug: { type: "string", description: "URL-safe identifier, unique per tenant." },
+        name: { type: "string", description: "Human-readable name." },
+        mode: {
+          type: "string",
+          enum: ["server_embedded", "client_embedded"],
+          description:
+            "server_embedded: you send text, loopctl embeds it on your key, both lanes " +
+            "work. client_embedded: you send vectors, loopctl never sees the text, " +
+            "semantic lane only. Permanent for the corpus.",
+        },
+        embedding_model: {
+          type: "string",
+          description: "The embedding model this corpus is pinned to, e.g. text-embedding-3-small.",
+        },
+        dim: {
+          type: "integer",
+          description: "The embedding dimension. Every vector indexed or searched must match it.",
+        },
+        description: { type: "string", description: "Optional: what this corpus holds." },
+        allow_snippets: {
+          type: "boolean",
+          description:
+            "Optional: allow stored excerpts to come back on search results. Defaults to " +
+            "FALSE in client_embedded mode, because a snippet is text the server would hold.",
+        },
+        project_id: { type: "string", description: "Optional: scope the corpus to one project." },
+      },
+      required: ["slug", "name", "mode", "embedding_model", "dim"],
+    },
+  },
+  {
+    name: "corpus_index",
+    description:
+      "Index a batch of chunks into a corpus — this is how a document becomes searchable; " +
+      "it never uploads the file, only pointers plus whatever the corpus mode needs to rank " +
+      "them. TRADE-OFF: the chunk shape is decided by the corpus mode and a mismatch is " +
+      "REFUSED, not ignored. In a server_embedded corpus a chunk is {source_ref, locator, " +
+      "text, ordinal?, snippet?} and content_hash is computed server-side. In a " +
+      "client_embedded corpus a chunk is {source_ref, locator, vector, content_hash, " +
+      "ordinal?, snippet?} — there is NO text parameter, and a chunk carrying one is 422 " +
+      "text_not_accepted (dropping it would let you believe a keyword lane works on a corpus " +
+      "with no text). Indexing is IDEMPOTENT on (corpus, source_ref, locator): an unchanged " +
+      "batch writes nothing and spends no embedding tokens. `source_complete` is what makes " +
+      "a RE-index remove what the document no longer contains: name a source_ref as a bare " +
+      "STRING to declare that this request carries its complete chunk set, or as " +
+      "{source_ref, locators} to declare that set explicitly when the document spans several " +
+      "batches. Every stored chunk of a named source that is neither carried nor declared is " +
+      "DELETED, and meta.pruned_by_source reports what each name cost. Omit source_complete " +
+      "and stale chunks survive forever. Split large batches — an over-size body is 413 and " +
+      "vectors are bytes. Agent key.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        corpus_id: { type: "string", description: "The corpus id or slug to index into." },
+        chunks: {
+          type: "array",
+          description:
+            "The chunks to index. server_embedded: {source_ref, locator, text, ordinal?, " +
+            "snippet?}. client_embedded: {source_ref, locator, vector, content_hash, " +
+            "ordinal?, snippet?} — no text.",
+          items: {
+            type: "object",
+            properties: {
+              source_ref: {
+                type: "string",
+                description: "The document this chunk came from, e.g. a repo-relative file path.",
+              },
+              locator: {
+                description:
+                  "Your own opaque pointer into that document (a page, a heading, a line " +
+                  "range), stored verbatim and handed back on every search hit.",
+              },
+              text: {
+                type: "string",
+                description: "The chunk text. server_embedded ONLY — refused in client_embedded.",
+              },
+              vector: {
+                type: "array",
+                items: { type: "number" },
+                description:
+                  "Your locally-produced embedding. client_embedded ONLY; length must equal " +
+                  "the corpus dim.",
+              },
+              content_hash: {
+                type: "string",
+                description:
+                  "client_embedded ONLY: your opaque idempotency token for this chunk. " +
+                  "loopctl cannot verify it against the vector or the file — rotate it to " +
+                  "publish a new vector for an otherwise unchanged chunk.",
+              },
+              ordinal: { type: "integer", description: "Optional: order within the source." },
+              snippet: {
+                type: "string",
+                description:
+                  "Optional excerpt returned on search hits. Refused (422 " +
+                  "snippets_not_allowed) unless the corpus was created with allow_snippets.",
+              },
+            },
+            required: ["source_ref"],
+          },
+        },
+        source_complete: {
+          type: "array",
+          description:
+            "The sources to RECONCILE, each declaring its complete chunk set. A bare " +
+            "source_ref string means this request carries that source's whole set; " +
+            "{source_ref, locators} declares it explicitly so a document spanning several " +
+            "batches is reconciled on the batch that completes it. Anything stored under a " +
+            "named source and neither carried nor declared is deleted.",
+          items: {
+            oneOf: [
+              { type: "string" },
+              {
+                type: "object",
+                properties: {
+                  source_ref: { type: "string" },
+                  locators: {
+                    type: "array",
+                    description:
+                      "The source's COMPLETE locator set. Must include every locator this " +
+                      "request carries for it.",
+                  },
+                },
+                required: ["source_ref", "locators"],
+              },
+            ],
+          },
+        },
+      },
+      required: ["corpus_id", "chunks"],
+    },
+  },
+  {
+    name: "corpus_list",
+    description:
+      "List this tenant's corpora, newest first — call it before corpus_search to learn a " +
+      "corpus's slug, its `mode` (which decides whether you send a query string or a query " +
+      "vector) and its `dim`. Reading a mode off an ERROR is the failure this avoids. " +
+      "Agent key.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        project_id: { type: "string", description: "Optional: restrict to one project scope." },
+        limit: { type: "integer", description: "Optional: page size (clamped)." },
+        offset: { type: "integer", description: "Optional: rows to skip." },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "corpus_status",
+    description:
+      "List what is actually indexed in a corpus, one row per source_ref with its chunk " +
+      "count and a content hash over that source's chunks. TRADE-OFF: use it to re-index " +
+      "only the documents that MOVED instead of resubmitting the corpus — a hash that " +
+      "matches your local one means that source needs no work. Paginated: a corpus with " +
+      "thousands of sources does not come back in one body. Agent key.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        corpus_id: { type: "string", description: "The corpus id or slug." },
+        limit: { type: "integer", description: "Optional: sources per page (clamped)." },
+        offset: { type: "integer", description: "Optional: sources to skip." },
+      },
+      required: ["corpus_id"],
+    },
+  },
+  {
+    name: "corpus_delete",
+    description:
+      "Delete a corpus and every chunk and vector in it. **Requires LOOPCTL_USER_KEY** " +
+      "(user role — an agent or orchestrator key is NOT sufficient), because this is the " +
+      "one verb on this surface that is both set-based and IRREVERSIBLE: nothing in loopctl " +
+      "restores it. The files themselves are yours and were never uploaded, so the recovery " +
+      "path is to re-create the corpus and re-index them. To drop chunks a document no longer " +
+      "contains, re-index that document with corpus_index's source_complete instead of " +
+      "deleting the corpus. Agent and orchestrator keys get 403.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        corpus_id: { type: "string", description: "The corpus id or slug to destroy." },
+      },
+      required: ["corpus_id"],
+    },
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -7681,6 +8020,25 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "get_acceptance_criteria":
       return await getAcceptanceCriteria(args);
+
+    // Corpus Tools (Epic 43)
+    case "corpus_create":
+      return await corpusCreate(args);
+
+    case "corpus_index":
+      return await corpusIndex(args);
+
+    case "corpus_search":
+      return await corpusSearch(args);
+
+    case "corpus_list":
+      return await corpusList(args);
+
+    case "corpus_status":
+      return await corpusStatus(args);
+
+    case "corpus_delete":
+      return await corpusDelete(args);
 
     default:
       // Per-tenant generated Context Retriever tools (US-30.5) are not in the

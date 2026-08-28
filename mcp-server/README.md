@@ -347,6 +347,40 @@ nothing changes until a scope opts in.
 | `custody_claim` | The recorded **egress custody claim** for one article or memory row: the append-only sequence of per-operation postures (create, each embed, each re-embed, each classification, each merge) with the endpoints resolved for THAT operation and their verdicts, plus the aggregate. Rides the existing hash-chained audit log + signed tree heads — each entry carries a `chain_position` and the leaf's `chain_entry_hash`, so `GET /api/v1/audit/sth/{tenant_id}/inclusion/{position}` proves inclusion of *that* leaf, and the leaf's payload names this row by a recomputable `posture_digest`. THREE states, only one an attestation: `no_claim_recorded`, `claim_pending`, `claim_recorded` (`complete` / `partial_history` / `incomplete`). Completeness is measured against a persisted per-row high-water mark, so losing the tail of a sequence is a gap, not a clean claim. `third_party_egress_on_covered_paths` is `false` only for NETWORK-local endpoints; a tenant-declared (unverified) endpoint yields `"tenant_declared_unverified"`. Attests ONLY to the endpoints loopctl called on the paths in `coverage` — never to what those endpoints did afterwards. **Agent** key. |
 | `custody_failures` | Custody posture entries whose chain append was DROPPED after exhausting retries, plus `stale_pending` entries stranded by a flush that died outside its own final-attempt branch. Surfaced rather than silently absent: each `data` entry degrades its row's claim to `incomplete`, and a stranded entry would otherwise read as an in-flight claim forever. **Agent** key. |
 
+### Corpus Tools (Epic 43) — verbatim reference documents
+
+The corpus tier indexes documents whose **files stay in your own repo**. loopctl holds
+chunk pointers (and, in mode A, the text it embeds); a search hands back
+`{source_ref, locator, snippet, score}` and **never the chunk body** — you open the file
+yourself at that pointer. That is what keeps the file the source of truth and lets the
+tier be pointed at a repo loopctl does not own.
+
+**When to reach for it.** `corpus_search` when you need the **verbatim text of an
+authoritative document** — a spec, a contract, an RFC, a manual. `knowledge_search` when
+you want **what we learned** about a topic. Searching the wiki for a distillation of a
+document whose exact wording you needed is the failure this tier exists to prevent; so is
+reading an empty wiki result as an empty corpus.
+
+Two modes, pinned at creation:
+
+- **`server_embedded`** — you send chunk TEXT; loopctl embeds it on **your** embedding key
+  (BYO), and search runs a semantic and a keyword lane. A tenant with no embedding
+  credential is refused at `corpus_create` (`422 no_embedding_key`), not at first index.
+- **`client_embedded`** — you send **vectors**; loopctl stores content it cannot read. No
+  embedding key is needed, search is **semantic-only** (there is no text to index), and
+  `allow_snippets` defaults to **false** — a snippet is text the server would then hold.
+
+`corpus_search` is deliberately **not** part of `recall_context` and is never auto-injected.
+
+| Tool | Description |
+|---|---|
+| `corpus_search` | Search a corpus for POINTERS into files loopctl does not host. Returns `{source_ref, locator, snippet, score, chunk_id, corpus_id}` — a bounded excerpt, never the chunk body — so the next step is always to open the file. `server_embedded`: send `query`. `client_embedded`: send `query_vector` (length = the corpus `dim`); a query string there is `422 query_string_not_accepted` and asking for the keyword lane is `422 keyword_lane_unavailable`. Exactly one of `query`/`query_vector` (both is `422 ambiguous_query`). Scores are rank-derived (RRF) and comparable only WITHIN one result set. Agent key. |
+| `corpus_create` | Create a corpus, pinning `mode`, `embedding_model` and `dim`. Required: `slug`, `name`, `mode`, `embedding_model`, `dim`. Optional: `description`, `allow_snippets`, `project_id`. Agent key. |
+| `corpus_index` | Index a batch of chunks. `server_embedded` chunk: `{source_ref, locator, text, ordinal?, snippet?}`. `client_embedded` chunk: `{source_ref, locator, vector, content_hash, ordinal?, snippet?}` — there is **no** `text` parameter and sending one is `422 text_not_accepted`, not ignored. Idempotent on `(corpus, source_ref, locator)`. `source_complete` is how a RE-index removes what the document no longer contains: a bare `source_ref` string means this request carries that source's complete set, `{source_ref, locators}` declares the set explicitly for a document spanning several batches. Anything under a named source that is neither carried nor declared is deleted, and `meta.pruned_by_source` reports the cost. Agent key. |
+| `corpus_list` | List this tenant's corpora, newest first. Call it before searching to learn a corpus's `mode` (which decides string vs vector) and its `dim`. Optional: `project_id`, `limit`, `offset`. Agent key. |
+| `corpus_status` | Per-`source_ref` chunk count and content hash, paginated — re-index only the documents that moved. Agent key. |
+| `corpus_delete` | **Requires `LOOPCTL_USER_KEY`.** Destroy a corpus and every chunk and vector in it. Irreversible and set-based, which is why it is the one user-role verb on this surface; the files were never uploaded, so recovery means re-creating and re-indexing. To drop chunks a document no longer contains, re-index it with `source_complete` instead. |
+
 ### Discovery Tools
 
 | Tool | Description |
