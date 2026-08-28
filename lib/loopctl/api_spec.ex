@@ -59,6 +59,13 @@ defmodule Loopctl.ApiSpec do
         %Tag{name: "Webhooks", description: "Webhook subscriptions and delivery"},
         %Tag{name: "Import/Export", description: "Bulk import/export of project data"},
         %Tag{name: "Skills", description: "Skill versioning and performance tracking"},
+        %Tag{
+          name: "Corpus",
+          description:
+            "Reference-document corpora (Epic 43): index verbatim chunks whose files stay " <>
+              "in your own repo, and search them for a {source_ref, locator, snippet} " <>
+              "pointer rather than a body."
+        },
         %Tag{name: "Admin", description: "Superadmin tenant management and system stats"},
         %Tag{name: "Audit", description: "Immutable audit log and change feed"},
         %Tag{

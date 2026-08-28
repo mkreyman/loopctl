@@ -39,6 +39,18 @@ defmodule Loopctl.Corpus.DocumentChunk do
 
   @type t :: %__MODULE__{}
 
+  # The snippet ceiling, declared HERE — on the schema that stores the column — because
+  # BOTH ends read it: `changeset/2` refuses a longer one on the WRITE, and
+  # `Loopctl.Corpus.Search` reads it for the `left(...)` truncation on the READ and for
+  # the OpenAPI `maxLength` the controller publishes. Declared on the reader alone, the
+  # request schema advertised a cap nothing enforced and a 50 KB snippet was accepted and
+  # stored verbatim (the `@max_inline_content_bytes` drift class).
+  @max_snippet_chars 320
+
+  @doc "The maximum length a stored `snippet` may have."
+  @spec max_snippet_chars() :: pos_integer()
+  def max_snippet_chars, do: @max_snippet_chars
+
   schema "document_chunks" do
     tenant_field()
 
@@ -58,6 +70,10 @@ defmodule Loopctl.Corpus.DocumentChunk do
   Changeset for a chunk. `tenant_id` is NEVER cast — `Loopctl.Corpus.upsert_chunks/3`
   sets it on the struct.
 
+  `snippet` is bounded by `max_snippet_chars/0` — the SAME attribute the search path
+  truncates to and the OpenAPI request schema publishes — so the documented bound and
+  the enforced bound are one number.
+
   `locator` is cast as-is and is NOT validated or normalised (see the moduledoc); it
   defaults to `%{}` rather than NULL because a NULL locator is DISTINCT from every
   other NULL in a btree unique index and would silently defeat the idempotency the
@@ -69,6 +85,7 @@ defmodule Loopctl.Corpus.DocumentChunk do
     chunk
     |> cast(attrs, [:corpus_id, :source_ref, :locator, :text, :snippet, :content_hash, :ordinal])
     |> validate_required([:corpus_id, :source_ref, :content_hash])
+    |> validate_length(:snippet, max: @max_snippet_chars)
     |> put_default_locator()
     |> validate_storable_locator()
     |> foreign_key_constraint(:tenant_id)

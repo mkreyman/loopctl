@@ -138,15 +138,23 @@ Applying the CLAUDE.md checklist rather than inheriting the KB's answers:
 | operation | role | why |
 |---|---|---|
 | `corpus_create`, `corpus_list`, `corpus_status`, `corpus_search` | `:agent` | non-destructive + audited — the same criteria that earn the KB content carve-out its agent role |
-| `corpus_index` | `:agent` | it DOES delete, but neither set-based nor a one-way door: the prune reaches only `source_ref`s the same request carries chunks for and names complete, and re-indexing the file restores them |
+| `corpus_index` | `:agent` | it DOES delete, but the delete set is the exact complement of a set the caller wrote down: one explicitly named `source_ref` at a time, keeping everything the request either resent or listed in that source's manifest — and re-indexing the file restores what it took |
 | `corpus_delete` | `:user` | set-based blast radius AND irreversible: one call destroys every chunk and vector in a corpus, and nothing restores them |
 
 `corpus_index`'s delete is US-43.2 AC-43.2.3's prune: a source's surplus chunks go when
-its chunk set shrinks. AC-43.2.3 bounds it — a `source_ref` may be named in
-`source_complete` only if the same request carries at least one chunk for it — so no
-request can prune content it does not resend, and an empty batch cannot reach the
-corpus. `corpus_delete` is the verb that is both set-based and irrecoverable, and it is
-the one at `:user`.
+its chunk set shrinks. AC-43.2.3 bounds it three ways. A `source_ref` may be named in
+`source_complete` only if the same request carries at least one chunk for it, so an empty
+batch cannot reach the corpus. A name DECLARES that source's complete chunk set — either
+implicitly (a bare string: what this request carries) or explicitly
+(`{source_ref, locators}`, which is what makes a document larger than the batch ceiling
+reconcilable without deleting the batches that preceded it) — and a manifest may not omit
+a locator the same request carries. And a BARE name may not delete more chunks than the
+request carried for that source, so one chunk of a 5,000-chunk source can never destroy
+the other 4,999; a caller genuinely removing most of a document declares the surviving
+locators instead. The CLAUDE.md `:user` test is an AND, and this verb fails both halves:
+the prune is scoped and declared rather than set-based, and it is recoverable because the
+file is the client's and re-indexing restores it. `corpus_delete` is the verb that is
+both set-based and irrecoverable, and it is the one at `:user`.
 
 ## What this epic deliberately does not do
 
@@ -172,8 +180,8 @@ Building this first gives ContextForge a real consumer to develop against.
 
 | Story | Title | Status | PR |
 |-------|-------|--------|----|
-| US-43.1 | Corpus storage: a corpus that pins its own dimension, and chunks excluded from the article corpus by construction | not started | — |
-| US-43.2 | Mode A — server-embedded ingest and pointer-plus-snippet retrieval | not started | — |
+| US-43.1 | Corpus storage: a corpus that pins its own dimension, and chunks excluded from the article corpus by construction | merged | #772 |
+| US-43.2 | Mode A — server-embedded ingest and pointer-plus-snippet retrieval | in review | #773 |
 | US-43.3 | Mode B — the server stores and ranks vectors it cannot read | not started | — |
 | US-43.4 | The `corpus_*` tool surface, and a routing rule that says when to reach for it | not started | — |
 

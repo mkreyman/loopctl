@@ -67,9 +67,11 @@ defmodule LoopctlWeb.FallbackControllerTest do
       assert body["error"]["message"] == "Conflict"
     end
 
-    # US-39.7 redact path: a rolled-back hard delete (audit insert failed) must
-    # surface as a 5xx, never a masking 404 — the post still exists, so the agent
-    # must retry rather than believe a leaked secret was removed.
+    # A rolled-back mutation (its audit insert failed) must surface as a 5xx, never a
+    # masking 404 — the write did not happen, so the caller must retry rather than
+    # believe a leaked secret was removed. The message is CALLER-NEUTRAL: this clause
+    # serves the US-39.7 redact path AND every corpus-tier mutation (US-43.2), and a
+    # corpus index request has no post to still exist.
     test "renders 500 for :audit_write_failed (never masked as a 404)", %{conn: conn} do
       conn = call_fallback(conn, {:error, :audit_write_failed})
 
@@ -77,8 +79,32 @@ defmodule LoopctlWeb.FallbackControllerTest do
       body = Jason.decode!(conn.resp_body)
       assert body["error"]["status"] == 500
       assert body["error"]["code"] == "audit_write_failed"
-      assert body["error"]["message"] =~ "still exists"
+      assert body["error"]["message"] =~ "rolled back"
+      assert body["error"]["message"] =~ "did NOT happen"
       assert body["error"]["message"] =~ "Retry"
+      refute body["error"]["message"] =~ "post"
+    end
+
+    # ONE code, ONE status. The same condition already had a rendering — the
+    # `HeavyReadOverloadHandler` `Plug.Exception` impl raising through to
+    # `ErrorJSON.render("429.json", ...)` — which answers 429 under this exact code. The
+    # code exists so a client can tell per-tenant heavy-read backpressure apart from a
+    # generic rate-limit 429; two statuses for one code would put it back to guessing,
+    # decided only by whether the endpoint asked for `on_overload: :raise` or `:tag`,
+    # which is not observable to it.
+    test "renders :heavy_read_overloaded as 429 — the status its other rendering uses",
+         %{conn: conn} do
+      conn = call_fallback(conn, {:error, :heavy_read_overloaded})
+
+      assert conn.status == 429
+      body = Jason.decode!(conn.resp_body)
+      assert body["error"]["status"] == 429
+      assert body["error"]["code"] == "heavy_read_overloaded"
+      assert Plug.Conn.get_resp_header(conn, "retry-after") == ["1"]
+
+      # Bound to the OTHER rendering rather than to a literal, so the two cannot drift.
+      assert body["error"]["code"] ==
+               LoopctlWeb.ErrorJSON.render("429.json", %{})[:error][:code]
     end
 
     test "renders 429 for :rate_limited with default retry hint", %{conn: conn} do

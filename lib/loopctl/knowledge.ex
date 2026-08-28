@@ -9549,11 +9549,11 @@ defmodule Loopctl.Knowledge do
 
         _rrf ->
           fuse_rrf(
-            keyword_result.results,
-            semantic_result.results,
-            graph_results,
-            kw_weight,
-            sem_weight,
+            [
+              {keyword_result.results, kw_weight},
+              {semantic_result.results, sem_weight},
+              {graph_results, rrf_graph_weight(opts)}
+            ],
             opts
           )
       end
@@ -9633,15 +9633,17 @@ defmodule Loopctl.Knowledge do
   # (keyword desc ts_rank_cd, semantic desc cosine similarity, graph desc consensus),
   # so its position IS its rank. Duplicate docs across lanes merge to one, summing
   # their contributions and keeping the UNION of raw fields.
-  defp fuse_rrf(kw_results, sem_results, graph_results, kw_weight, sem_weight, opts) do
+  # US-43.2 AC-43.2.5: PUBLIC, and taking the LANE LIST rather than three fixed lanes.
+  # The body only ever keyed on `result.id`, so it was always lane-shape-agnostic —
+  # `defp` plus the fixed arity was the whole of what blocked reuse. The corpus tier
+  # (`Loopctl.Corpus.Search`) calls this with its keyword and semantic lanes plus an
+  # empty graph lane, so both tiers share ONE `rrf_k` and ONE tiebreak instead of a
+  # second fuser that drifts. The article path passes exactly the three lanes it
+  # always did (see `merge_results/5`), so its behaviour is unchanged.
+  @doc false
+  @spec fuse_rrf([{[map()], number()}], keyword()) :: [map()]
+  def fuse_rrf(lanes, opts) when is_list(lanes) do
     k = rrf_k(opts)
-    graph_weight = rrf_graph_weight(opts)
-
-    lanes = [
-      {kw_results, kw_weight},
-      {sem_results, sem_weight},
-      {graph_results, graph_weight}
-    ]
 
     lanes
     |> Enum.reduce(%{}, fn {results, weight}, acc ->

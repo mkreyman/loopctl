@@ -41,8 +41,9 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, %Ecto.Changeset{}}` -> 422 with field-level details
   - `{:error, :bad_request, message}` -> 400 with custom message
   - `{:error, :unprocessable_entity, message}` -> 422 with custom message
-  - `{:error, :audit_write_failed}` -> 500 (US-39.7 redact path: a hard delete whose
-    audit insert failed, rolling the delete back — never masked as a 404)
+  - `{:error, :audit_write_failed}` -> 500 (a mutation whose audit insert failed, rolling
+    the whole write back — the US-39.7 redact path and every corpus-tier mutation; the
+    message is caller-neutral and it is never masked as a 404)
   - `{:error, %Postgrex.Error{}}` -> 504/503/500 by SQLSTATE class (US-27.3)
   - `{:error, %DBConnection.ConnectionError{}}` -> 503 with Retry-After (US-27.3)
   """
@@ -573,12 +574,13 @@ defmodule LoopctlWeb.FallbackController do
   def call(conn, {:error, %DBConnection.ConnectionError{} = error}),
     do: render_db_error(conn, error)
 
-  # US-39.7 redact path: a channel-post HARD delete could not be durably recorded
-  # in the audit trail, so the whole transaction rolled back and the post STILL
-  # EXISTS. Fail-safe-on-security-path: a rolled-back redaction is NEVER reported as
-  # a 404 ("already gone/handled") — that would let an agent believe a leaked secret
-  # was removed when it was not. A 500 tells the caller the delete did NOT happen so
-  # it retries the redaction.
+  # A mutation whose audit entry could not be written, rolling the whole transaction
+  # back — the US-39.7 channel-post redact path, and every corpus-tier mutation
+  # (US-43.2 AC-43.2.7). Fail-safe-on-security-path: a rolled-back write is NEVER
+  # reported as a 404 ("already gone/handled"), which would let an agent believe a
+  # leaked secret was removed when it was not. The message is CALLER-NEUTRAL: it says
+  # the write did not happen and the prior state stands, because a corpus index request
+  # has no post to still exist and naming one asserted something that did not occur.
   def call(conn, {:error, :audit_write_failed}) do
     conn
     |> put_status(:internal_server_error)
@@ -587,8 +589,9 @@ defmodule LoopctlWeb.FallbackController do
         status: 500,
         code: "audit_write_failed",
         message:
-          "The delete could not be recorded in the audit trail and was rolled back; " <>
-            "the post still exists. Retry the request."
+          "The write could not be recorded in the audit trail and was rolled back, so it " <>
+            "did NOT happen — nothing was persisted and the prior state still stands. " <>
+            "Retry the request."
       }
     })
   end
@@ -706,6 +709,55 @@ defmodule LoopctlWeb.FallbackController do
   # stranger agent can provision its own key from the response ALONE — no human
   # needed. Ingest is always the Anthropic path, so the missing credential is the
   # `api_key`.
+  # US-43.2 AC-43.2.9: mode A embeds SERVER-SIDE on the TENANT's own key, so a corpus
+  # created in that mode by a keyless tenant could only fail at first index — long
+  # after the call that could have said so. The remediation is the EMBEDDING
+  # credential (`Remediation.for_credential(:embedding)`), not the Anthropic one the
+  # clause below carries: they are different fields and naming the wrong one sends an
+  # agent to provision a key that would not have helped.
+  def call(conn, {:error, :no_embedding_key_configured, message}) when is_binary(message) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        code: "no_embedding_key",
+        message: message,
+        remediation: Remediation.for_credential(:embedding)
+      }
+    })
+  end
+
+  # US-43.2 AC-43.2.10: BOTH lanes of a heavy read were shed by the per-tenant gate.
+  # A single shed lane never reaches here — the caller degrades to the surviving lane
+  # and names the degradation in `meta`. This is the case where nothing ran, so it is
+  # reported as the transient capacity condition it is rather than as an empty result
+  # set, which a caller would read as "the corpus has nothing".
+  #
+  # 429, NOT 503, and the status is the load-bearing part: the SAME condition already
+  # has a rendering — `LoopctlWeb.Plugs.HeavyReadOverloadHandler` raising through to
+  # `ErrorJSON.render("429.json", ...)` — which answers 429 under this exact `code`.
+  # The code exists so a client can tell per-tenant heavy-read backpressure apart from a
+  # generic rate-limit 429; two statuses for one code would put that client back to
+  # guessing, decided only by whether the endpoint asked for `on_overload: :raise` or
+  # `:tag` — which is not observable to it. AC-43.2.10 forbids RAISING a 429 through to
+  # the agent, which this does not: the tag is caught, the lanes degrade first, and only
+  # a both-lanes shed reaches here, as a coded body with a Retry-After.
+  def call(conn, {:error, :heavy_read_overloaded}) do
+    conn
+    |> put_resp_header("retry-after", "1")
+    |> put_status(:too_many_requests)
+    |> json(%{
+      error: %{
+        status: 429,
+        code: "heavy_read_overloaded",
+        message:
+          "This tenant has too many heavy reads in flight; the query was shed rather " <>
+            "than queued. Retry shortly."
+      }
+    })
+  end
+
   def call(conn, {:error, :no_api_key_configured, message}) when is_binary(message) do
     conn
     |> put_status(:unprocessable_entity)
