@@ -58,6 +58,31 @@ defmodule Loopctl.Corpus.IndexerTest do
     }
   end
 
+  # US-43.3. Mode B carries no text at all — only a locally-produced vector and the
+  # client's own opaque hash.
+  defp mode_b_corpus!(tenant_id, attrs \\ %{}),
+    do: create_corpus!(tenant_id, Map.merge(%{mode: :client_embedded}, attrs))
+
+  defp vector_chunk(tenant_id, source_ref, page, dims, hash) do
+    %{
+      "source_ref" => source_ref,
+      "locator" => %{"page" => page},
+      "vector" => client_vector(tenant_id, dims),
+      "content_hash" => hash,
+      "ordinal" => page
+    }
+  end
+
+  # Each tenant's vectors occupy its OWN contiguous block of the space, so tenants stay
+  # well-separated points in the shared HNSW index — the same reason the suite's default
+  # embedding stub keys on `tenant_id`.
+  defp client_vector(tenant_id, dims) do
+    base = rem(:erlang.phash2(tenant_id), 1500)
+    hot = MapSet.new(dims, &(base + &1))
+
+    Enum.map(0..1535, fn i -> if MapSet.member?(hot, i), do: 1.0, else: 0.0 end)
+  end
+
   defp pages(source_ref, count, prefix \\ "Loop 2310B carries the rendering provider, page ") do
     for page <- 1..count, do: chunk(source_ref, page, prefix <> Integer.to_string(page))
   end
@@ -78,6 +103,21 @@ defmodule Loopctl.Corpus.IndexerTest do
       :count,
       :id
     )
+  end
+
+  # The stored VECTORS, not just their count — the only way to see whether a rewrite
+  # actually adopted the vector the request carried.
+  defp stored_vectors(corpus) do
+    AdminRepo.all(
+      from(e in DocumentChunkEmbedding,
+        join: c in DocumentChunk,
+        on: c.id == e.document_chunk_id,
+        where: c.corpus_id == ^corpus.id,
+        order_by: [asc: c.ordinal],
+        select: e.embedding
+      )
+    )
+    |> Enum.map(&Pgvector.to_list/1)
   end
 
   defp index!(tenant_id, corpus, chunks, opts \\ []) do
@@ -138,12 +178,16 @@ defmodule Loopctl.Corpus.IndexerTest do
       assert max == Indexer.max_batch_size()
     end
 
-    test "a client_embedded corpus refuses this endpoint" do
+    test "a mode A corpus still requires the text it embeds" do
       tenant = fixture(:tenant)
-      corpus = create_corpus!(tenant.id, %{mode: :client_embedded})
+      corpus = create_corpus!(tenant.id)
 
-      assert {:error, :mode_mismatch} =
-               Indexer.index_chunks(tenant.id, corpus.id, pages("a.pdf", 1))
+      assert {:error, {:invalid_chunk, 0, message}} =
+               Indexer.index_chunks(tenant.id, corpus.id, [
+                 %{"source_ref" => "a.pdf", "locator" => %{"page" => 1}}
+               ])
+
+      assert message =~ "text is required"
     end
 
     test "two chunks sharing one (source_ref, locator) in ONE batch are refused" do
@@ -728,6 +772,325 @@ defmodule Loopctl.Corpus.IndexerTest do
                )
 
       assert length(chunks_of(corpus_b)) == 2
+    end
+  end
+
+  # --- US-43.3: mode B, the ingest path for vectors loopctl cannot read ---
+
+  describe "index_chunks/4 in mode B (US-43.3)" do
+    test "accepts {source_ref, locator, vector, content_hash, ordinal} and stores no text" do
+      tenant = fixture(:tenant)
+      corpus = mode_b_corpus!(tenant.id)
+
+      calls = :counters.new(1, [])
+
+      stub(Loopctl.MockEmbeddingClient, :generate_embeddings, fn _scope, texts, _opts ->
+        :counters.add(calls, 1, 1)
+        {:ok, Enum.map(texts, fn _text -> client_vector(tenant.id, 0..7) end)}
+      end)
+
+      result =
+        index!(tenant.id, corpus, [
+          vector_chunk(tenant.id, "spec.pdf", 1, 0..7, "hash-one"),
+          vector_chunk(tenant.id, "spec.pdf", 2, 8..15, "hash-two")
+        ])
+
+      assert statuses(result) == [:inserted, :inserted]
+      assert embedding_count(corpus) == 2
+      # NOT ONE provider call: the vector arrived with the chunk.
+      assert :counters.get(calls, 1) == 0
+
+      chunks = chunks_of(corpus) |> Enum.sort_by(& &1.ordinal)
+      assert Enum.map(chunks, & &1.text) == [nil, nil]
+      assert Enum.map(chunks, & &1.snippet) == [nil, nil]
+      # The CLIENT's hash, verbatim — the server has no text to hash.
+      assert Enum.map(chunks, & &1.content_hash) == ["hash-one", "hash-two"]
+      assert Enum.map(chunks, & &1.locator) == [%{"page" => 1}, %{"page" => 2}]
+    end
+
+    # TC-43.3.2 — refused, not ignored. Dropping the text would let a client believe the
+    # keyword lane works on a corpus that has no text to index.
+    test "a chunk carrying text is REFUSED by name and nothing is written" do
+      tenant = fixture(:tenant)
+      corpus = mode_b_corpus!(tenant.id)
+
+      batch = [
+        vector_chunk(tenant.id, "spec.pdf", 1, 0..7, "hash-one"),
+        tenant.id
+        |> vector_chunk("spec.pdf", 2, 8..15, "hash-two")
+        |> Map.put("text", "Loop 2310B carries the rendering provider")
+      ]
+
+      assert {:error, {:text_not_accepted, 1}} =
+               Indexer.index_chunks(tenant.id, corpus.id, batch, audit: audit_opts())
+
+      assert chunks_of(corpus) == []
+    end
+
+    # A nil or empty `text` is the SAME misunderstanding as a page of it, so the refusal
+    # is on the KEY's presence. Answering 200 to this would be the silent drop.
+    test "an empty or nil text key is refused too" do
+      tenant = fixture(:tenant)
+      corpus = mode_b_corpus!(tenant.id)
+
+      for value <- ["", nil] do
+        batch = [
+          tenant.id
+          |> vector_chunk("spec.pdf", 1, 0..7, "hash-one")
+          |> Map.put("text", value)
+        ]
+
+        assert {:error, {:text_not_accepted, 0}} =
+                 Indexer.index_chunks(tenant.id, corpus.id, batch, audit: audit_opts())
+      end
+
+      assert chunks_of(corpus) == []
+    end
+
+    test "content_hash is required and is client-supplied" do
+      tenant = fixture(:tenant)
+      corpus = mode_b_corpus!(tenant.id)
+
+      batch = [
+        tenant.id |> vector_chunk("spec.pdf", 1, 0..7, "hash-one") |> Map.delete("content_hash")
+      ]
+
+      assert {:error, {:invalid_chunk, 0, message}} =
+               Indexer.index_chunks(tenant.id, corpus.id, batch, audit: audit_opts())
+
+      assert message =~ "content_hash is required"
+      assert message =~ "idempotency token"
+      assert chunks_of(corpus) == []
+    end
+
+    test "a missing or non-numeric vector is refused" do
+      tenant = fixture(:tenant)
+      corpus = mode_b_corpus!(tenant.id)
+
+      for value <- [nil, "not-a-vector", [], ["a", "b"]] do
+        batch = [
+          tenant.id |> vector_chunk("spec.pdf", 1, 0..7, "hash-one") |> Map.put("vector", value)
+        ]
+
+        assert {:error, {:invalid_chunk, 0, message}} =
+                 Indexer.index_chunks(tenant.id, corpus.id, batch, audit: audit_opts())
+
+        assert message =~ "vector is required"
+      end
+
+      assert chunks_of(corpus) == []
+    end
+
+    # TC-43.3.4, write side. The CHECK constraint is the second enforcement point; this
+    # one exists so the caller meets a named 422 rather than a raw Postgrex error.
+    test "a wrong-length vector is refused at the boundary, naming BOTH numbers" do
+      tenant = fixture(:tenant)
+      corpus = mode_b_corpus!(tenant.id)
+
+      short = List.duplicate(0.0, 768)
+
+      batch = [
+        tenant.id |> vector_chunk("spec.pdf", 1, 0..7, "hash-one") |> Map.put("vector", short)
+      ]
+
+      assert {:error, {:vector_dimension_mismatch, 0, 768, 1536}} =
+               Indexer.index_chunks(tenant.id, corpus.id, batch, audit: audit_opts())
+
+      assert chunks_of(corpus) == []
+      assert embedding_count(corpus) == 0
+    end
+
+    # `Pgvector.Ecto.Vector`'s cast DISCARDS an element outside pgvector's float32 element
+    # range instead of erroring, so an over-long value arrives at the changeset as a
+    # SHORT vector and fails the dimension validator with numbers the caller never sent —
+    # a 500 for a purely client-side input error. Refused at the same boundary instead.
+    test "an out-of-float32-range element is refused at the boundary, naming the element" do
+      tenant = fixture(:tenant)
+      corpus = mode_b_corpus!(tenant.id)
+
+      out_of_range =
+        tenant.id
+        |> client_vector(0..7)
+        |> List.replace_at(5, 1.0e40)
+
+      batch = [
+        tenant.id
+        |> vector_chunk("spec.pdf", 1, 0..7, "hash-one")
+        |> Map.put("vector", out_of_range)
+      ]
+
+      assert {:error, {:vector_out_of_range, 0, 5}} =
+               Indexer.index_chunks(tenant.id, corpus.id, batch, audit: audit_opts())
+
+      assert chunks_of(corpus) == []
+      assert embedding_count(corpus) == 0
+    end
+
+    # TC-43.3.5, the write half. `allow_snippets` defaults to FALSE in mode B, and the
+    # refusal is what makes that default enforceable rather than advisory.
+    test "a snippet is refused when the corpus forbids them, and bounded when it allows them" do
+      tenant = fixture(:tenant)
+      closed = mode_b_corpus!(tenant.id)
+      open = mode_b_corpus!(tenant.id, %{allow_snippets: true})
+
+      refute closed.allow_snippets
+      assert open.allow_snippets
+
+      carrying = fn ref, snippet ->
+        [
+          tenant.id
+          |> vector_chunk(ref, 1, 0..7, "hash-one")
+          |> Map.put("snippet", snippet)
+        ]
+      end
+
+      assert {:error, {:snippets_not_allowed, 0}} =
+               Indexer.index_chunks(tenant.id, closed.id, carrying.("spec.pdf", "page 1 excerpt"),
+                 audit: audit_opts()
+               )
+
+      assert chunks_of(closed) == []
+
+      index!(tenant.id, open, carrying.("spec.pdf", "page 1 excerpt"))
+      assert [%{snippet: "page 1 excerpt", text: nil}] = chunks_of(open)
+
+      # The SAME bound the search truncation and the OpenAPI maxLength read.
+      too_long = String.duplicate("x", DocumentChunk.max_snippet_chars() + 1)
+
+      assert {:error, {:invalid_chunk, 0, changeset}} =
+               Indexer.index_chunks(tenant.id, open.id, carrying.("other.pdf", too_long),
+                 audit: audit_opts()
+               )
+
+      assert errors_on(changeset).snippet != []
+    end
+
+    test "re-indexing an unchanged mode B batch writes nothing" do
+      tenant = fixture(:tenant)
+      corpus = mode_b_corpus!(tenant.id)
+      batch = [vector_chunk(tenant.id, "spec.pdf", 1, 0..7, "hash-one")]
+
+      index!(tenant.id, corpus, batch)
+      [before] = chunks_of(corpus)
+
+      result = index!(tenant.id, corpus, batch)
+
+      assert statuses(result) == [:unchanged]
+      assert [^before] = chunks_of(corpus)
+      assert embedding_count(corpus) == 1
+    end
+
+    test "a moved content_hash replaces the row and its vector" do
+      tenant = fixture(:tenant)
+      corpus = mode_b_corpus!(tenant.id)
+
+      index!(tenant.id, corpus, [vector_chunk(tenant.id, "spec.pdf", 1, 0..7, "hash-one")])
+
+      result =
+        index!(tenant.id, corpus, [vector_chunk(tenant.id, "spec.pdf", 1, 8..15, "hash-two")])
+
+      assert statuses(result) == [:replaced]
+      assert [%{content_hash: "hash-two"}] = chunks_of(corpus)
+      assert embedding_count(corpus) == 1
+      assert stored_vectors(corpus) == [client_vector(tenant.id, 8..15)]
+    end
+
+    # In mode A a metadata-only change skips the embedding step because the server
+    # computed the hash from the text it embedded, so hash-unchanged PROVES
+    # vector-unchanged. In mode B the hash and the vector are two independent client
+    # inputs and that implication is gone: the request was answered `replaced` while the
+    # vector it carried was dropped, and search went on ranking the chunk by the old one
+    # with no error and no meta flag to read. An `ordinal` move alone reaches this, so it
+    # needs no snippet and is reachable on the DEFAULT (allow_snippets false) corpus.
+    test "a metadata-only rewrite stores the vector that came with it" do
+      tenant = fixture(:tenant)
+      corpus = mode_b_corpus!(tenant.id)
+
+      index!(tenant.id, corpus, [vector_chunk(tenant.id, "spec.pdf", 1, 0..7, "hash-one")])
+      assert stored_vectors(corpus) == [client_vector(tenant.id, 0..7)]
+
+      moved =
+        tenant.id
+        |> vector_chunk("spec.pdf", 1, 8..15, "hash-one")
+        |> Map.put("ordinal", 7)
+
+      result = index!(tenant.id, corpus, [moved])
+
+      assert statuses(result) == [:replaced]
+      assert [%{ordinal: 7, content_hash: "hash-one"}] = chunks_of(corpus)
+      assert embedding_count(corpus) == 1
+      assert stored_vectors(corpus) == [client_vector(tenant.id, 8..15)]
+    end
+
+    # The other half of the same rule: with hash, snippet and ordinal all identical,
+    # writing nothing is the documented idempotency contract, so rotating `content_hash`
+    # is how a client publishes a new vector for a chunk that did not otherwise move.
+    test "an unchanged item does NOT adopt a newly submitted vector" do
+      tenant = fixture(:tenant)
+      corpus = mode_b_corpus!(tenant.id)
+
+      index!(tenant.id, corpus, [vector_chunk(tenant.id, "spec.pdf", 1, 0..7, "hash-one")])
+
+      result =
+        index!(tenant.id, corpus, [vector_chunk(tenant.id, "spec.pdf", 1, 8..15, "hash-one")])
+
+      assert statuses(result) == [:unchanged]
+      assert stored_vectors(corpus) == [client_vector(tenant.id, 0..7)]
+    end
+
+    test "source_complete prunes a mode B source exactly as it does a mode A one" do
+      tenant = fixture(:tenant)
+      corpus = mode_b_corpus!(tenant.id)
+
+      index!(tenant.id, corpus, [
+        vector_chunk(tenant.id, "spec.pdf", 1, 0..7, "hash-one"),
+        vector_chunk(tenant.id, "spec.pdf", 2, 8..15, "hash-two")
+      ])
+
+      result =
+        index!(
+          tenant.id,
+          corpus,
+          [vector_chunk(tenant.id, "spec.pdf", 1, 0..7, "hash-one")],
+          source_complete: ["spec.pdf"]
+        )
+
+      assert result.pruned == 1
+      assert result.pruned_by_source == %{"spec.pdf" => 1}
+      assert [%{ordinal: 1}] = chunks_of(corpus)
+    end
+
+    test "a mode A corpus refuses a vector item's missing text" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      assert {:error, {:invalid_chunk, 0, message}} =
+               Indexer.index_chunks(
+                 tenant.id,
+                 corpus.id,
+                 [vector_chunk(tenant.id, "spec.pdf", 1, 0..7, "hash-one")],
+                 audit: audit_opts()
+               )
+
+      assert message =~ "text is required"
+    end
+
+    test "another tenant cannot index a mode B corpus it does not own" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      corpus_b = mode_b_corpus!(tenant_b.id)
+
+      index!(tenant_b.id, corpus_b, [vector_chunk(tenant_b.id, "spec.pdf", 1, 0..7, "hash-one")])
+
+      assert {:error, :not_found} =
+               Indexer.index_chunks(
+                 tenant_a.id,
+                 corpus_b.id,
+                 [vector_chunk(tenant_a.id, "spec.pdf", 1, 0..7, "hash-evil")],
+                 audit: audit_opts()
+               )
+
+      assert [%{content_hash: "hash-one"}] = chunks_of(corpus_b)
     end
   end
 end

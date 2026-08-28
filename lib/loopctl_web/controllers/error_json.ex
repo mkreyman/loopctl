@@ -89,6 +89,30 @@ defmodule LoopctlWeb.ErrorJSON do
     }
   end
 
+  # US-43.3 (review): `Plug.Parsers` raises RequestTooLargeError in the ENDPOINT, before
+  # any controller plug runs — so a corpus ingest batch that exceeds the byte cap never
+  # reaches the 422 that names the item ceiling and used to fall to the catch-all below
+  # as {"status": 413, "message": "Request Entity Too Large"}: no code, no remedy, and no
+  # hint that the body rather than the item count was the binding bound. That is exactly
+  # the opaque answer the mode B refusals exist to avoid. The cap is read from
+  # LoopctlWeb.RequestLimits — the same value the parser enforces and the ingest OpenAPI
+  # description publishes.
+  def render("413.json", _assigns) do
+    %{
+      error: %{
+        status: 413,
+        code: "request_too_large",
+        message:
+          "The request body exceeds #{LoopctlWeb.RequestLimits.max_body_bytes()} bytes and " <>
+            "was refused before it was parsed. Send the same work in smaller requests. " <>
+            "On a client_embedded corpus this bound, not the per-request item ceiling, is " <>
+            "usually what binds: a JSON-serialized vector costs roughly its dimension " <>
+            "times 20 bytes, so a batch of them runs out of bytes long before it runs out " <>
+            "of items."
+      }
+    }
+  end
+
   # Catch-all for any other status code templates
   def render(template, _assigns) do
     status =

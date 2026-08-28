@@ -332,8 +332,17 @@ config :loopctl, Loopctl.Repo,
 config :loopctl, LoopctlWeb.Endpoint,
   url: [host: "localhost"],
   adapter: Bandit.PhoenixAdapter,
+  # JSON is FIRST because the first entry is the FALLBACK for a request whose format
+  # could not be negotiated, and the requests that reach here without one are API
+  # requests: an error raised BEFORE the router — `Plug.Parsers`' 413 is the live case —
+  # never ran the `plug :accepts, ["json"]` that gives an /api/v1 response its format,
+  # and the conn Phoenix rescues with is the endpoint's ENTRY conn, so nothing an earlier
+  # plug set survives to say so. loopctl is agent-native: a client with no Accept header
+  # is a curl or an SDK, not a browser, and it was being handed an HTML error page for a
+  # JSON request. Browsers are unaffected — they send `Accept: text/html`, which
+  # negotiates `html` explicitly.
   render_errors: [
-    formats: [html: LoopctlWeb.ErrorHTML, json: LoopctlWeb.ErrorJSON],
+    formats: [json: LoopctlWeb.ErrorJSON, html: LoopctlWeb.ErrorHTML],
     layout: false
   ],
   pubsub_server: Loopctl.PubSub,

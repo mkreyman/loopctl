@@ -39,6 +39,14 @@ defmodule Loopctl.Corpus.DocumentChunkEmbedding do
 
   @type t :: %__MODULE__{}
 
+  # pgvector's `vector` element type is float32. An element outside that range is
+  # neither storable nor comparable: Postgres RAISES `infinite value not allowed in
+  # vector` on the write and on a query parameter alike, and `Pgvector.Ecto.Vector`'s
+  # cast silently DISCARDS such elements, which turns a bad element into a phantom
+  # length mismatch. Both are refused at the boundary instead — see the callers in
+  # `Loopctl.Corpus.Indexer` and `Loopctl.Corpus.Search`.
+  @float32_max 3.4_028_235e38
+
   schema "document_chunk_embeddings" do
     tenant_field()
 
@@ -79,5 +87,27 @@ defmodule Loopctl.Corpus.DocumentChunkEmbedding do
       name: :document_chunk_embeddings_dim_matches_vector,
       message: "vector length must equal dim"
     )
+  end
+
+  @doc """
+  The largest magnitude pgvector's float32 element type can represent.
+
+  The ONE number the boundary refusals in `Loopctl.Corpus.Indexer` and
+  `Loopctl.Corpus.Search` enforce and their OpenAPI descriptions state, so the
+  documented bound and the enforced bound cannot drift.
+  """
+  @spec float32_max() :: float()
+  def float32_max, do: @float32_max
+
+  @doc """
+  The index of the first element of `vector` that pgvector's float32 element type
+  cannot represent, or `nil` when every element fits.
+
+  Returns the INDEX rather than a boolean so the refusal can name the offending
+  position, the way the dimension refusals name both numbers.
+  """
+  @spec out_of_float32_range_index([number()]) :: non_neg_integer() | nil
+  def out_of_float32_range_index(vector) when is_list(vector) do
+    Enum.find_index(vector, &(not (is_number(&1) and abs(&1) <= @float32_max)))
   end
 end

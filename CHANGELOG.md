@@ -6,6 +6,76 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Corpus mode B (`client_embedded`) — loopctl stores and ranks vectors it cannot read
+  (US-43.3).** A corpus created with `mode: "client_embedded"` is indexed and searched
+  without loopctl ever receiving the document text. **This is the property an operator
+  points a regulated corpus at, so here is exactly what crosses the wire.**
+
+  **What loopctl RECEIVES per chunk:** `source_ref` (your file path or identifier),
+  `locator` (your opaque pointer — a page, a byte range, an EDI loop — stored verbatim),
+  `vector` (the embedding you produced locally, whose length must equal the corpus's
+  pinned `dim`), `content_hash` (yours), `ordinal`, and `snippet` ONLY if the corpus was
+  created with `allow_snippets: true`.
+
+  **What loopctl does NOT receive:** the chunk text — there is no parameter that accepts
+  it, and a chunk carrying `text` is refused with `422 text_not_accepted` rather than
+  silently ignored. And no snippet at all by default: `allow_snippets` defaults to FALSE
+  for a `client_embedded` corpus (a snippet IS text the server would then hold). Ask for
+  it explicitly if you want readable results.
+
+  **What loopctl does NOT verify.** `content_hash` is treated as an opaque idempotency
+  token, never as an integrity proof: holding no text, loopctl cannot check that it
+  corresponds to the vector or to the file, and you own that correspondence. Nothing
+  checks which model produced a vector either — that is not computable from a vector.
+  What IS enforced is the vector's LENGTH against the corpus `dim`, at the API boundary
+  and again by a database CHECK constraint — and that every element is representable in
+  pgvector's float32 element type, refused as `422 vector_out_of_range` rather than
+  silently truncated by the cast into a phantom dimension mismatch.
+
+  **Retrieval is semantic-only,** because there is no text to index. `POST
+  /api/v1/corpora/:id/search` takes `query_vector` (validated against the corpus `dim`)
+  instead of `query`, and `meta.lanes` is `["semantic"]`. Every mode mismatch is a coded
+  422 with a remedy — `query_string_not_accepted`, `query_vector_not_accepted`,
+  `keyword_lane_unavailable`, `query_vector_dimension_mismatch`,
+  `query_vector_out_of_range` — never an empty `200`, which an agent reads as an empty
+  corpus. Send exactly ONE of `query` and `query_vector`: sending both is
+  `422 ambiguous_query`, and an explicit `null` for either counts as absent, so a client
+  that serializes omitted optionals as `null` is not routed to the wrong mode. An EMPTY
+  ARRAY is not absent — it is a malformed vector and is refused as
+  `422 invalid_query_vector` even when a `query` accompanies it. When the
+  semantic lane is the only lane attempted — a `client_embedded` corpus, or
+  `lanes: ["semantic"]` on a `server_embedded` one — and it fails, the answer is
+  `502 semantic_lane_unavailable` carrying a bounded `details.reason`, never a raw
+  provider term. Result and `meta` key sets are identical to a `server_embedded`
+  corpus's, so a client branches on `meta`, not on the mode.
+
+  **Batch sizing.** A request is bounded BOTH by its item count (`422 batch_too_large`)
+  and by the request body byte cap, and on a `client_embedded` corpus it is the byte one
+  that binds: a JSON-serialized vector costs roughly its dimension times 20 bytes, so a
+  full-size batch of 768-dimension vectors is already over the cap. An over-size body is
+  refused by the parser as `413 request_too_large`, which now carries a code and names
+  the cap. Split the batch — indexing is idempotent, and `source_complete`'s manifest
+  form keeps a document spanning several batches reconcilable.
+
+  **Re-indexing in mode B.** `content_hash` and `vector` are two independent inputs the
+  server cannot relate, so ANY rewrite stores the vector that came with it: a chunk whose
+  only change is its `ordinal` or `snippet` adopts the new vector too (no provider call
+  and no tokens, since none is needed in this mode). An item where the hash, snippet and
+  ordinal are all unchanged still writes nothing — so ROTATE `content_hash` to publish a
+  re-embedded vector for a chunk that did not otherwise move.
+
+  **Operator impact:** none for existing corpora. `mode` is pinned at creation and
+  immutable in BOTH directions — a `server_embedded` corpus can never become
+  `client_embedded` or the reverse; changing tier is delete-and-re-index by design. No
+  new environment variable and no migration.
+
+- **API error responses default to JSON when a client sends no `Accept` header.** Error
+  bodies are negotiated from `Accept`, and the fallback for a request that never
+  negotiated one was HTML — so an error raised BEFORE the router (the body-size `413` is
+  the live case, since `plug :accepts, ["json"]` has not run yet) reached a header-less
+  API client as a web page. The fallback is now JSON. Browsers are unaffected: they send
+  `Accept: text/html`, which still selects the HTML error page.
+
 - **`GET /api/v1/channel/claims` — a non-destructive read of coordination claim state
   (#707).** Until now the only way to learn whether a handoff `ref` was claimed was to
   attempt the claim: `201` meant free, `409` meant taken. That probe is destructive on a

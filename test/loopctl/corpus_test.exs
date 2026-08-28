@@ -197,13 +197,32 @@ defmodule Loopctl.CorpusTest do
       refute Map.has_key?(changeset.changes, :dim)
     end
 
-    test "changing mode is an ERROR on :mode", %{corpus: corpus} do
+    # TC-43.3.7 — BOTH directions. A mode A corpus can never become mode B and a mode B
+    # corpus can never become mode A: mode decides whether the server holds text at all,
+    # so a flip would leave every stored chunk in the wrong shape with no repair. The
+    # error names the supported path.
+    test "changing mode is an ERROR on :mode in BOTH directions", %{
+      corpus: corpus,
+      tenant: tenant
+    } do
       changeset =
         CorpusSchema.update_changeset(corpus, %{name: corpus.name, mode: :client_embedded})
 
       refute changeset.valid?
-      assert [_] = errors_on(changeset).mode
+      assert [message] = errors_on(changeset).mode
+      assert message =~ "pinned at creation"
+      assert message =~ "delete-and-re-index"
       refute Map.has_key?(changeset.changes, :mode)
+
+      mode_b = create_corpus!(tenant.id, %{mode: :client_embedded})
+
+      reverse =
+        CorpusSchema.update_changeset(mode_b, %{name: mode_b.name, mode: :server_embedded})
+
+      refute reverse.valid?
+      assert [reverse_message] = errors_on(reverse).mode
+      assert reverse_message =~ "delete-and-re-index"
+      refute Map.has_key?(reverse.changes, :mode)
     end
 
     test "changing embedding_model is an ERROR on :embedding_model", %{corpus: corpus} do

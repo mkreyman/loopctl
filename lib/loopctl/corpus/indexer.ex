@@ -1,10 +1,39 @@
 defmodule Loopctl.Corpus.Indexer do
   @moduledoc """
-  US-43.2 — the MODE A ingest path: `POST /api/v1/corpora/:id/index`.
+  The ingest path for BOTH corpus modes: `POST /api/v1/corpora/:id/index`.
 
-  The client sends verbatim chunks; loopctl computes each chunk's `content_hash`
-  server-side, embeds only what actually moved, and writes every chunk and its
-  vector in ONE `Ecto.Multi`, committed once.
+  In mode A (`:server_embedded`) the client sends verbatim chunks; loopctl computes
+  each chunk's `content_hash` server-side, embeds only what actually moved, and
+  writes every chunk and its vector in ONE `Ecto.Multi`, committed once.
+
+  ## Mode B (`:client_embedded`) — US-43.3
+
+  The client embeds locally and sends `{source_ref, locator, vector, content_hash,
+  ordinal, snippet?}`. loopctl NEVER receives the chunk text: there is no parameter
+  that accepts it, and a chunk carrying a `text` key is REFUSED
+  (`{:text_not_accepted, index}`) rather than silently ignored — a dropped `text`
+  would let a client believe the keyword lane works on a corpus that has no text to
+  index.
+
+  Everything downstream of `build_item/3` is shared with mode A: the same
+  classification, the same ONE `Ecto.Multi`, the same `(corpus_id, source_ref,
+  locator)` key, the same `source_complete` reconciliation and the same audit entry.
+  Only two things differ — `content_hash` ARRIVES instead of being computed, and
+  `embed_changed/3` makes no provider call because the vector arrived too.
+
+  `content_hash` in mode B is an OPAQUE IDEMPOTENCY TOKEN and is never treated as an
+  integrity proof. loopctl cannot verify that it corresponds to the vector, to the
+  file, or to anything at all — it holds no text to hash — so the client owns that
+  correspondence. What IS enforced is the vector's LENGTH against the corpus's pinned
+  `dim`, twice: here at the boundary (`{:vector_dimension_mismatch, index, got,
+  expected}`, which names both numbers) and again by the
+  `document_chunk_embeddings_dim_matches_vector` CHECK constraint. Nothing verifies
+  that the vector came from the declared model — that is not computable from a
+  vector, and a check that appeared to prove it while proving nothing would be worse
+  than saying so.
+
+  `snippet` defaults to NULL. A corpus whose `allow_snippets` is false — the mode B
+  DEFAULT — refuses any item carrying one (`{:snippets_not_allowed, index}`).
 
   ## One transaction, per-item step names
 
@@ -22,11 +51,20 @@ defmodule Loopctl.Corpus.Indexer do
   chunk to classify it `unchanged | inserted | replaced`. An unchanged batch writes
   no chunk row, spends no embedding token, and leaves `updated_at` alone.
 
-  `content_hash` covers the TEXT, so it decides the EMBEDDING. It does not decide the
-  WRITE: `snippet` and `ordinal` are cast from the client and are in the upsert's
-  replace list, so a chunk whose text held still while one of them moved is rewritten
-  (`replaced`) without re-embedding. Deciding both on the hash silently discarded a
-  corrected snippet and left no later re-index able to apply it.
+  In MODE A `content_hash` covers the TEXT the server embedded, so it decides the
+  EMBEDDING. It does not decide the WRITE: `snippet` and `ordinal` are cast from the
+  client and are in the upsert's replace list, so a chunk whose text held still while
+  one of them moved is rewritten (`replaced`) without re-embedding. Deciding both on
+  the hash silently discarded a corrected snippet and left no later re-index able to
+  apply it.
+
+  In MODE B the hash decides nothing about the vector: both arrive from the client and
+  loopctl cannot relate them. So every rewrite carries the submitted vector — a
+  metadata-only change is widened to a full rewrite — because reporting `replaced`
+  while discarding the vector that came with the replacement left search ranking the
+  chunk by the old one. `unchanged` still writes nothing, so ROTATING `content_hash` is
+  how a mode B client publishes a new vector for a chunk whose pointer and snippet did
+  not move.
 
   ## Pruning is reconciliation against a DECLARED chunk set, never inference
 
@@ -116,11 +154,14 @@ defmodule Loopctl.Corpus.Indexer do
 
   @type error ::
           :not_found
-          | :mode_mismatch
           | :audit_write_failed
           | {:batch_too_large, pos_integer()}
           | {:invalid_chunk, non_neg_integer(), String.t() | Ecto.Changeset.t()}
           | {:duplicate_chunk_key, {String.t(), term()}}
+          | {:text_not_accepted, non_neg_integer()}
+          | {:vector_dimension_mismatch, non_neg_integer(), non_neg_integer(), pos_integer()}
+          | {:vector_out_of_range, non_neg_integer(), non_neg_integer()}
+          | {:snippets_not_allowed, non_neg_integer()}
           | {:source_complete_not_carried, [term()]}
           | {:source_complete_invalid, term()}
           | {:source_manifest_too_large, String.t(), pos_integer()}
@@ -132,8 +173,10 @@ defmodule Loopctl.Corpus.Indexer do
   @doc """
   Indexes `chunks` into `corpus_id` (an id or a slug) for `tenant_id`.
 
-  Each chunk is `%{source_ref, locator, text, ordinal}` — `content_hash` is NOT
-  accepted from the client in mode A; it is computed here from the text.
+  In mode A each chunk is `%{source_ref, locator, text, ordinal}` — `content_hash`
+  is NOT accepted from the client; it is computed here from the text. In mode B each
+  chunk is `%{source_ref, locator, vector, content_hash, ordinal, snippet?}` — there
+  is no `text` parameter at all, and sending one is refused.
 
   `opts`:
 
@@ -156,7 +199,6 @@ defmodule Loopctl.Corpus.Indexer do
   def index_chunks(tenant_id, corpus_id, chunks, opts \\ [])
       when is_binary(tenant_id) and is_list(chunks) do
     with {:ok, corpus} <- Corpus.get_corpus(tenant_id, corpus_id),
-         :ok <- validate_mode(corpus),
          :ok <- validate_batch_size(chunks),
          {:ok, items} <- build_items(corpus, chunks),
          :ok <- Corpus.refute_duplicate_keys(Enum.map(items, &{&1.source_ref, &1.locator})),
@@ -168,9 +210,6 @@ defmodule Loopctl.Corpus.Indexer do
   end
 
   # --- validation ---
-
-  defp validate_mode(%CorpusRow{mode: :server_embedded}), do: :ok
-  defp validate_mode(%CorpusRow{}), do: {:error, :mode_mismatch}
 
   defp validate_batch_size(chunks) when length(chunks) > @max_batch_size,
     do: {:error, {:batch_too_large, @max_batch_size}}
@@ -187,7 +226,7 @@ defmodule Loopctl.Corpus.Indexer do
     |> Enum.reduce_while({:ok, []}, fn {attrs, index}, {:ok, acc} ->
       case build_item(corpus, attrs, index) do
         {:ok, item} -> {:cont, {:ok, [item | acc]}}
-        {:error, reason} -> {:halt, {:error, {:invalid_chunk, index, reason}}}
+        {:error, reason} -> {:halt, {:error, wrap_item_error(reason, index)}}
       end
     end)
     |> case do
@@ -196,7 +235,8 @@ defmodule Loopctl.Corpus.Indexer do
     end
   end
 
-  defp build_item(corpus, attrs, index) when is_map(attrs) do
+  defp build_item(%CorpusRow{mode: :server_embedded} = corpus, attrs, index)
+       when is_map(attrs) do
     attrs = stringify_keys(attrs)
 
     cond do
@@ -211,7 +251,76 @@ defmodule Loopctl.Corpus.Indexer do
     end
   end
 
+  # Mode B (US-43.3). The `text` refusal is FIRST and is checked on the KEY's presence,
+  # not on its value: a client that sends `text: ""` or `text: nil` to a corpus with no
+  # text lane has the same misunderstanding as one that sends a page of it, and answering
+  # 200 to either would let it believe the keyword lane works.
+  #
+  # Every other refusal here names what arrived, because the alternative — accepting the
+  # item and letting the CHECK constraint raise — is a raw Postgrex 500 the caller cannot
+  # act on.
+  defp build_item(%CorpusRow{mode: :client_embedded} = corpus, attrs, index)
+       when is_map(attrs) do
+    attrs = stringify_keys(attrs)
+    vector = Map.get(attrs, "vector")
+
+    cond do
+      Map.has_key?(attrs, "text") ->
+        {:error, {:text_not_accepted, index}}
+
+      not present?(Map.get(attrs, "source_ref")) ->
+        {:error, "source_ref is required"}
+
+      not present?(Map.get(attrs, "content_hash")) ->
+        {:error,
+         "content_hash is required — a client_embedded corpus sends no text, so loopctl " <>
+           "has nothing to hash and takes yours as an opaque idempotency token"}
+
+      not vector?(vector) ->
+        {:error,
+         "vector is required and must be a non-empty array of numbers — a " <>
+           "client_embedded corpus stores the vector you embedded locally"}
+
+      length(vector) != corpus.dim ->
+        {:error, {:vector_dimension_mismatch, index, length(vector), corpus.dim}}
+
+      out_of_range_index(vector) ->
+        {:error, {:vector_out_of_range, index, out_of_range_index(vector)}}
+
+      snippet_forbidden?(corpus, attrs) ->
+        {:error, {:snippets_not_allowed, index}}
+
+      true ->
+        client_item(corpus, attrs, vector, index)
+    end
+  end
+
   defp build_item(_corpus, _attrs, _index), do: {:error, "each chunk must be an object"}
+
+  # The dedicated mode B terms already carry their own index and are passed through
+  # whole; a plain message or a changeset is the generic per-item shape and is wrapped.
+  defp wrap_item_error(reason, index) when is_binary(reason), do: {:invalid_chunk, index, reason}
+
+  defp wrap_item_error(%Ecto.Changeset{} = changeset, index),
+    do: {:invalid_chunk, index, changeset}
+
+  defp wrap_item_error(reason, _index), do: reason
+
+  defp snippet_forbidden?(%CorpusRow{allow_snippets: true}, _attrs), do: false
+  defp snippet_forbidden?(_corpus, attrs), do: not is_nil(Map.get(attrs, "snippet"))
+
+  defp vector?(value) when is_list(value),
+    do: value != [] and Enum.all?(value, &is_number/1)
+
+  defp vector?(_value), do: false
+
+  # `Pgvector.Ecto.Vector`'s cast DISCARDS an element outside pgvector's float32 element
+  # range instead of erroring, so a 1536-element vector carrying one arrives at the
+  # changeset 1535 long and fails the dimension validator with numbers that describe
+  # nothing the caller sent — surfacing as an opaque 500. Refused here, at the same
+  # boundary and in the same shape as the length mismatch above.
+  defp out_of_range_index(vector),
+    do: DocumentChunkEmbedding.out_of_float32_range_index(vector)
 
   defp changeset_item(corpus, attrs, index) do
     text = Map.fetch!(attrs, "text")
@@ -235,6 +344,39 @@ defmodule Loopctl.Corpus.Indexer do
          snippet: chunk.snippet,
          ordinal: chunk.ordinal,
          content_hash: hash
+       }}
+    else
+      {:error, changeset}
+    end
+  end
+
+  # `text` is forced to nil rather than merely absent: the field is castable, and a
+  # `%DocumentChunk{}` reused across a re-index must not carry a value from anywhere.
+  # `vector` is dropped before the cast — it belongs to the EMBEDDING row, not the chunk.
+  defp client_item(corpus, attrs, vector, index) do
+    hash = Map.fetch!(attrs, "content_hash")
+
+    changeset =
+      DocumentChunk.changeset(
+        %DocumentChunk{tenant_id: corpus.tenant_id},
+        attrs
+        |> Map.drop(["vector"])
+        |> Map.merge(%{"corpus_id" => corpus.id, "content_hash" => hash, "text" => nil})
+      )
+
+    if changeset.valid? do
+      chunk = Ecto.Changeset.apply_changes(changeset)
+
+      {:ok,
+       %{
+         index: index,
+         source_ref: chunk.source_ref,
+         locator: chunk.locator,
+         text: nil,
+         snippet: chunk.snippet,
+         ordinal: chunk.ordinal,
+         content_hash: hash,
+         vector: vector
        }}
     else
       {:error, changeset}
@@ -339,7 +481,7 @@ defmodule Loopctl.Corpus.Indexer do
   defp classify(tenant_id, corpus, items) do
     existing = load_existing(tenant_id, corpus, Enum.map(items, & &1.source_ref))
 
-    {:ok, Enum.map(items, &classify_item(&1, existing))}
+    {:ok, Enum.map(items, &classify_item(&1, existing, corpus.mode))}
   end
 
   # TWO decisions, deliberately separate. `status` is what the caller is told; `rewrite`
@@ -352,14 +494,16 @@ defmodule Loopctl.Corpus.Indexer do
   # answered "unchanged" to a request that corrected a snippet or renumbered a chunk,
   # dropped the values, and left no later re-index able to apply them — the text hash
   # never moves again. A metadata-only change therefore rewrites the ROW (reported
-  # `replaced`, because the row was) and skips the embedding entirely.
-  defp classify_item(item, existing) do
+  # `replaced`, because the row was) and skips the embedding entirely — in MODE A, where
+  # the server computed the hash from the text it embedded, so hash-unchanged provably
+  # means vector-unchanged.
+  defp classify_item(item, existing, mode) do
     case Map.get(existing, {item.source_ref, Corpus.canonical_locator(item.locator)}) do
       nil ->
         Map.merge(item, %{status: :inserted, rewrite: :full, chunk_id: nil})
 
       %{id: id} = stored ->
-        {status, rewrite} = classify_change(stored, item)
+        {status, rewrite} = stored |> classify_change(item) |> widen_rewrite(mode)
         Map.merge(item, %{status: status, rewrite: rewrite, chunk_id: id})
     end
   end
@@ -372,6 +516,22 @@ defmodule Loopctl.Corpus.Indexer do
       true -> {:unchanged, :none}
     end
   end
+
+  # In mode B that implication does not hold: `content_hash` and `vector` are two
+  # INDEPENDENT client inputs (AC-43.3.2 makes the hash an opaque token loopctl cannot
+  # relate to anything), so a metadata rewrite that skipped the embedding step told the
+  # caller its item was `replaced` while discarding the vector that came with the
+  # replacement — search then ranked the chunk by the old one, with no error and no meta
+  # flag to read. An `ordinal` change alone reaches this, which is what a re-chunk or a
+  # re-paginate produces, so it needs no snippet and is reachable on the DEFAULT mode B
+  # corpus. Any rewrite therefore carries the submitted vector. It costs one extra upsert
+  # and no tokens: mode B makes no provider call.
+  #
+  # `:unchanged` is deliberately untouched — with hash, snippet and ordinal all identical,
+  # writing nothing is the documented idempotency contract, and rotating `content_hash`
+  # is how a client publishes a new vector for text it re-embedded.
+  defp widen_rewrite({:replaced, :metadata}, :client_embedded), do: {:replaced, :full}
+  defp widen_rewrite(classification, _mode), do: classification
 
   defp load_existing(tenant_id, corpus, source_refs) do
     refs = Enum.uniq(source_refs)
@@ -400,6 +560,14 @@ defmodule Loopctl.Corpus.Indexer do
   # slot), and vectors map back by the response's `index` field inside the client —
   # never by array position here. A partial response fails the whole batch. Only
   # changed items are sent, so a re-index of an unchanged corpus spends nothing.
+  # Mode B makes NO provider call: the vector arrived with the chunk, so there is no
+  # admission token, no `ShrinkLadder` run and nothing to truncate. A vector is attached
+  # only where the row is actually being rewritten, so an unchanged mode B re-index
+  # writes no embedding row for the same reason an unchanged mode A one does not.
+  defp embed_changed(_tenant_id, %CorpusRow{mode: :client_embedded}, items) do
+    {:ok, Enum.map(items, &attach_client_vector/1)}
+  end
+
   defp embed_changed(tenant_id, corpus, items) do
     targets = Enum.filter(items, &(&1.rewrite == :full))
 
@@ -409,6 +577,11 @@ defmodule Loopctl.Corpus.Indexer do
       run_embed(tenant_id, corpus, items, targets)
     end
   end
+
+  defp attach_client_vector(%{rewrite: :full} = item),
+    do: Map.merge(item, %{embedding: item.vector, truncated?: false})
+
+  defp attach_client_vector(item), do: Map.merge(item, %{embedding: nil, truncated?: false})
 
   defp run_embed(tenant_id, corpus, items, targets) do
     texts = Enum.map(targets, & &1.text)
@@ -534,7 +707,9 @@ defmodule Loopctl.Corpus.Indexer do
 
   # Metadata-only: the row is rewritten so the corrected snippet/ordinal land, and the
   # embedding step is SKIPPED — the text did not move, so the stored vector and its hash
-  # are still the right ones and there is nothing to re-embed.
+  # are still the right ones and there is nothing to re-embed. MODE A only: `widen_rewrite/2`
+  # turns this classification into `:full` on a client_embedded corpus, where the caller's
+  # vector arrived with the change and skipping it would strand a stale embedding.
   defp add_item(multi, tenant_id, corpus, %{rewrite: :metadata} = item) do
     Multi.run(multi, {:chunk, item.index}, fn repo, _changes ->
       upsert_chunk(repo, tenant_id, corpus, item)

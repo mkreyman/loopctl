@@ -49,6 +49,34 @@ defmodule Loopctl.Corpus.SearchTest do
     result
   end
 
+  # US-43.3. A mode B corpus never receives text: the caller sends the vector it produced
+  # locally, and the query arrives as a vector too.
+  defp mode_b_corpus!(tenant_id, attrs \\ %{}),
+    do: create_corpus!(tenant_id, Map.merge(%{mode: :client_embedded}, attrs))
+
+  defp vector_chunk(tenant_id, source_ref, page, dims, hash, attrs \\ %{}) do
+    Map.merge(
+      %{
+        "source_ref" => source_ref,
+        "locator" => %{"page" => page},
+        "vector" => client_vector(tenant_id, dims),
+        "content_hash" => hash,
+        "ordinal" => page
+      },
+      attrs
+    )
+  end
+
+  # Each tenant's vectors occupy its OWN contiguous block, so tenants stay well-separated
+  # points in the shared HNSW index and recall here is deterministic under `async: true`
+  # — the same discipline as the per-tenant mock embeddings above.
+  defp client_vector(tenant_id, dims) do
+    base = rem(:erlang.phash2(tenant_id), 1500)
+    hot = MapSet.new(dims, &(base + &1))
+
+    Enum.map(0..1535, fn i -> if MapSet.member?(hot, i), do: 1.0, else: 0.0 end)
+  end
+
   defp chunk(source_ref, page, text) do
     %{
       "source_ref" => source_ref,
@@ -99,10 +127,10 @@ defmodule Loopctl.Corpus.SearchTest do
       assert {:error, :not_found} = Search.search(other.id, corpus.id, "rendering provider")
     end
 
-    # The ingest verb guards mode explicitly; without the same clause here, searching a
-    # client_embedded corpus spent a provider embedding call on the tenant's own key and
-    # answered 200 with an empty set for an operation the corpus can never serve.
-    test "a client_embedded corpus is refused before any provider call" do
+    # Without this clause, searching a client_embedded corpus spent a provider embedding
+    # call on the tenant's own key and answered 200 with an empty set for an operation the
+    # corpus can never serve. TC-43.3.3: it is a NAMED refusal, not an empty result.
+    test "a query string against a client_embedded corpus is refused before any provider call" do
       tenant = fixture(:tenant)
       corpus = create_corpus!(tenant.id, %{mode: :client_embedded})
 
@@ -113,7 +141,9 @@ defmodule Loopctl.Corpus.SearchTest do
         {:ok, List.duplicate(0.01, 1536)}
       end)
 
-      assert {:error, :mode_mismatch} = Search.search(tenant.id, corpus.id, "taxonomy code")
+      assert {:error, :query_string_not_accepted} =
+               Search.search(tenant.id, corpus.id, "taxonomy code")
+
       assert :counters.get(calls, 1) == 0
     end
 
@@ -190,6 +220,27 @@ defmodule Loopctl.Corpus.SearchTest do
 
       assert meta.lanes == ["keyword"]
       assert meta.semantic_unavailable_reason == "dimension_mismatch"
+    end
+
+    # The semantic lane asked for ALONE and failing leaves nothing to fuse and no degraded
+    # answer. The raw provider reason must never escape: the FallbackController has no
+    # clause for one, so returning it verbatim answers 500 instead of a coded refusal.
+    test "a semantic-only request whose embedding fails returns a NAMED error" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+      index!(tenant.id, corpus, [chunk("a.pdf", 1, "rendering provider taxonomy code")])
+
+      stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _scope, _text, _opts ->
+        {:error, :no_api_key}
+      end)
+
+      assert {:error, {:semantic_lane_unavailable, "no_api_key"}} =
+               Search.search(tenant.id, corpus.id, "taxonomy", lanes: ["semantic"])
+
+      # The SAME failure with the keyword lane available is still a degradation, not an
+      # error — the behaviour the named term must not have changed.
+      assert {:ok, %{meta: %{lanes: ["keyword"]}}} =
+               Search.search(tenant.id, corpus.id, "taxonomy")
     end
 
     test "the semantic lane alone still answers when the query matches no keyword" do
@@ -333,6 +384,211 @@ defmodule Loopctl.Corpus.SearchTest do
 
       assert length(results) == 1
       refute Map.has_key?(meta, :semantic_under_filled)
+    end
+  end
+
+  # --- US-43.3: mode B retrieval ---
+
+  describe "search_vector/4 on a client_embedded corpus (US-43.3)" do
+    # TC-43.3.6 — a known neighbour, ranked. `near` shares the query's whole direction,
+    # `mid` half of it, `far` none.
+    test "ranks by descending similarity and names the semantic lane ALONE" do
+      tenant = fixture(:tenant)
+      corpus = mode_b_corpus!(tenant.id)
+
+      index!(tenant.id, corpus, [
+        vector_chunk(tenant.id, "spec.pdf", 1, 0..7, "hash-near"),
+        vector_chunk(tenant.id, "spec.pdf", 2, 0..15, "hash-mid"),
+        vector_chunk(tenant.id, "spec.pdf", 3, 8..15, "hash-far")
+      ])
+
+      {:ok, %{results: results, meta: meta}} =
+        Search.search_vector(tenant.id, corpus.id, client_vector(tenant.id, 0..7))
+
+      assert Enum.map(results, & &1.locator) == [
+               %{"page" => 1},
+               %{"page" => 2},
+               %{"page" => 3}
+             ]
+
+      scores = Enum.map(results, & &1.score)
+      assert scores == Enum.sort(scores, :desc)
+
+      # STATED, not discovered: mode B is semantic-only because there is no text lane.
+      assert meta.lanes == ["semantic"]
+      assert meta.search_mode == "semantic_only"
+      refute Map.has_key?(meta, :keyword_unavailable_reason)
+    end
+
+    # AC-43.3.7 — a mode B result carries the same pointer fields a mode A one does.
+    test "a result carries {source_ref, locator, score, corpus_id, chunk_id} and a null snippet" do
+      tenant = fixture(:tenant)
+      corpus = mode_b_corpus!(tenant.id)
+
+      index!(tenant.id, corpus, [vector_chunk(tenant.id, "spec.pdf", 47, 0..7, "hash-one")])
+
+      {:ok, %{results: [result], meta: meta}} =
+        Search.search_vector(tenant.id, corpus.id, client_vector(tenant.id, 0..7))
+
+      assert result.source_ref == "spec.pdf"
+      assert result.locator == %{"page" => 47}
+      assert result.corpus_id == corpus.id
+      assert is_binary(result.chunk_id)
+      assert is_number(result.score)
+      # NULL by default: allow_snippets is false for a mode B corpus that did not ask.
+      assert Map.has_key?(result, :snippet)
+      assert result.snippet == nil
+      assert meta.allow_snippets == false
+    end
+
+    test "a stored snippet IS returned when the corpus allows them" do
+      tenant = fixture(:tenant)
+      corpus = mode_b_corpus!(tenant.id, %{allow_snippets: true})
+
+      index!(tenant.id, corpus, [
+        vector_chunk(tenant.id, "spec.pdf", 1, 0..7, "hash-one", %{
+          "snippet" => "loop 2310B excerpt"
+        })
+      ])
+
+      {:ok, %{results: [result]}} =
+        Search.search_vector(tenant.id, corpus.id, client_vector(tenant.id, 0..7))
+
+      assert result.snippet == "loop 2310B excerpt"
+    end
+
+    # TC-43.3.4, read side.
+    test "a wrong-length query vector is refused at the boundary, naming both dimensions" do
+      tenant = fixture(:tenant)
+      corpus = mode_b_corpus!(tenant.id)
+
+      index!(tenant.id, corpus, [vector_chunk(tenant.id, "spec.pdf", 1, 0..7, "hash-one")])
+
+      assert {:error, {:query_vector_dimension_mismatch, 768, 1536}} =
+               Search.search_vector(tenant.id, corpus.id, List.duplicate(0.0, 768))
+
+      assert {:error, :invalid_query_vector} =
+               Search.search_vector(tenant.id, corpus.id, "not a vector")
+
+      assert {:error, :invalid_query_vector} = Search.search_vector(tenant.id, corpus.id, [])
+    end
+
+    # AC-43.3.5 — refused, never an empty set, because an agent reads an empty set as an
+    # empty corpus.
+    test "asking for the keyword lane on a mode B corpus is refused" do
+      tenant = fixture(:tenant)
+      corpus = mode_b_corpus!(tenant.id)
+
+      index!(tenant.id, corpus, [vector_chunk(tenant.id, "spec.pdf", 1, 0..7, "hash-one")])
+
+      assert {:error, :keyword_lane_unavailable} =
+               Search.search_vector(tenant.id, corpus.id, client_vector(tenant.id, 0..7),
+                 lanes: ["keyword"]
+               )
+
+      assert {:error, :keyword_lane_unavailable} =
+               Search.search_vector(tenant.id, corpus.id, client_vector(tenant.id, 0..7),
+                 lanes: ["keyword", "semantic"]
+               )
+
+      assert {:ok, %{results: [_result]}} =
+               Search.search_vector(tenant.id, corpus.id, client_vector(tenant.id, 0..7),
+                 lanes: ["semantic"]
+               )
+
+      assert {:error, {:invalid_lanes, ["graph"]}} =
+               Search.search_vector(tenant.id, corpus.id, client_vector(tenant.id, 0..7),
+                 lanes: ["graph"]
+               )
+    end
+
+    # pgvector's element type is float32, and Postgres RAISES on a larger value rather
+    # than returning an error — refused at the boundary, naming the element, the same way
+    # a length mismatch is.
+    test "an out-of-float32-range element in the query vector is refused at the boundary" do
+      tenant = fixture(:tenant)
+      corpus = mode_b_corpus!(tenant.id)
+
+      vector = List.replace_at(client_vector(tenant.id, 0..7), 3, 1.0e40)
+
+      assert {:error, {:query_vector_out_of_range, 3}} =
+               Search.search_vector(tenant.id, corpus.id, vector)
+    end
+
+    test "a query vector against a mode A corpus is refused by name" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      assert {:error, :query_vector_not_accepted} =
+               Search.search_vector(tenant.id, corpus.id, client_vector(tenant.id, 0..7))
+    end
+
+    test "a mode B corpus of another tenant is a 404, and its chunks never surface" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      corpus_a = mode_b_corpus!(tenant_a.id)
+      corpus_b = mode_b_corpus!(tenant_b.id)
+
+      index!(tenant_a.id, corpus_a, [vector_chunk(tenant_a.id, "a.pdf", 1, 0..7, "hash-a")])
+      index!(tenant_b.id, corpus_b, [vector_chunk(tenant_b.id, "b.pdf", 1, 0..7, "hash-b")])
+
+      assert {:error, :not_found} =
+               Search.search_vector(tenant_a.id, corpus_b.id, client_vector(tenant_b.id, 0..7))
+
+      # Searching its OWN corpus with tenant B's vector still reaches only tenant A's rows.
+      {:ok, %{results: results}} =
+        Search.search_vector(tenant_a.id, corpus_a.id, client_vector(tenant_b.id, 0..7))
+
+      for result <- results do
+        assert result.corpus_id == corpus_a.id
+        assert result.source_ref == "a.pdf"
+      end
+    end
+  end
+
+  # TC-43.3.8 — a caller branches on `meta`, never on which mode answered.
+  describe "mode A and mode B answer on ONE shape" do
+    test "the result and meta key sets are identical; only meta.lanes differs" do
+      tenant = fixture(:tenant)
+      mode_a = create_corpus!(tenant.id)
+      mode_b = mode_b_corpus!(tenant.id)
+
+      index!(tenant.id, mode_a, [chunk("a.pdf", 1, "rendering provider taxonomy code")])
+      index!(tenant.id, mode_b, [vector_chunk(tenant.id, "b.pdf", 1, 0..7, "hash-one")])
+
+      {:ok, %{results: [a_result], meta: a_meta}} =
+        Search.search(tenant.id, mode_a.id, "rendering provider")
+
+      {:ok, %{results: [b_result], meta: b_meta}} =
+        Search.search_vector(tenant.id, mode_b.id, client_vector(tenant.id, 0..7))
+
+      assert Map.keys(a_result) == Map.keys(b_result)
+      assert Map.keys(a_meta) == Map.keys(b_meta)
+
+      assert a_meta.lanes == ["keyword", "semantic"]
+      assert b_meta.lanes == ["semantic"]
+      assert a_meta.search_mode == "combined"
+      assert b_meta.search_mode == "semantic_only"
+
+      # Everything else about the envelope is the same number or the same basis.
+      assert a_meta.score_basis == b_meta.score_basis
+      assert a_meta.snippet_max_chars == b_meta.snippet_max_chars
+      assert a_meta.limit == b_meta.limit
+    end
+
+    # The mode A half of the lane contract: `lanes` is honoured there too, so a caller
+    # that names one is not silently given both.
+    test "a mode A corpus honours a lane restriction" do
+      tenant = fixture(:tenant)
+      corpus = create_corpus!(tenant.id)
+
+      index!(tenant.id, corpus, [chunk("a.pdf", 1, "rendering provider taxonomy code")])
+
+      {:ok, %{meta: meta}} =
+        Search.search(tenant.id, corpus.id, "rendering provider", lanes: ["keyword"])
+
+      assert meta.lanes == ["keyword"]
+      assert meta.search_mode == "keyword_only"
     end
   end
 end
