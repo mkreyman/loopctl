@@ -95,6 +95,13 @@ defmodule LoopctlWeb.CorpusController do
   @search_lanes Search.lanes()
   @float32_max DocumentChunkEmbedding.float32_max()
 
+  # The endpoint's `Plug.Parsers` cap, read from the module the parser itself reads. The
+  # item ceiling above is NOT the binding bound on a client_embedded batch — vectors are
+  # bytes, and the parser refuses the body before any guard here can name a ceiling — so
+  # the description publishes both bounds and the 413 (LoopctlWeb.ErrorJSON) names this
+  # one.
+  @max_body_bytes LoopctlWeb.RequestLimits.max_body_bytes()
+
   @rate_limit_window_ms 60_000
 
   # A generic 2xx envelope for the responses whose payload is documented in prose
@@ -310,7 +317,15 @@ defmodule LoopctlWeb.CorpusController do
   operation(:ingest,
     summary: "Index a batch of chunks",
     description:
-      "Accepts up to #{@max_batch_size} chunks. In a server_embedded corpus each chunk is " <>
+      "Accepts up to #{@max_batch_size} chunks, and a request body of at most " <>
+        "#{@max_body_bytes} bytes. BOTH bounds apply, and on a client_embedded corpus it " <>
+        "is the byte one that binds: a JSON-serialized vector costs roughly its dimension " <>
+        "times 20 bytes, so a full-size batch of 768-dimension vectors is already over the " <>
+        "cap. An over-size body is refused by the parser, before this action runs, as 413 " <>
+        "request_too_large naming the cap — split the batch; indexing is idempotent and " <>
+        "source_complete's manifest form exists so a document spanning several batches is " <>
+        "still reconcilable. An over-size ITEM COUNT is 422 batch_too_large. " <>
+        "In a server_embedded corpus each chunk is " <>
         "{source_ref, locator, text, ordinal} and content_hash is computed SERVER-SIDE from " <>
         "the text, not accepted from the client. In a client_embedded corpus each chunk is " <>
         "{source_ref, locator, vector, content_hash, ordinal, snippet?}: there is NO text " <>
@@ -326,7 +341,12 @@ defmodule LoopctlWeb.CorpusController do
         "which for a client_embedded corpus defaults to FALSE. Indexing is idempotent on (corpus_id, source_ref, locator): an " <>
         "unchanged batch writes nothing, spends no embedding tokens, and reports every item " <>
         "as unchanged; a chunk whose text is unchanged but whose snippet or ordinal moved is " <>
-        "reported replaced — the row is rewritten and no embedding is spent. source_complete " <>
+        "reported replaced — the row is rewritten and no embedding is spent. In a " <>
+        "client_embedded corpus the hash decides nothing about the vector (both are yours " <>
+        "and loopctl cannot relate them), so EVERY rewrite stores the vector that request " <>
+        "carried, and rotating content_hash is how you publish a new vector for a chunk " <>
+        "whose pointer, snippet and ordinal did not move — an unchanged item still writes " <>
+        "nothing. source_complete " <>
         "names the sources to RECONCILE, and each name declares that source's COMPLETE chunk " <>
         "set: a bare string means the set is what THIS request carries for it, while " <>
         "{source_ref, locators} declares the set explicitly so a document spanning several " <>
@@ -444,6 +464,9 @@ defmodule LoopctlWeb.CorpusController do
         {"Invalid batch — includes text_not_accepted, vector_dimension_mismatch, " <>
            "vector_out_of_range and snippets_not_allowed", "application/json",
          Schemas.ErrorResponse},
+      413 =>
+        {"Request body over the byte cap — refused by the parser before this action ran",
+         "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       500 =>
         {"Audit write failed — nothing was written", "application/json", Schemas.ErrorResponse},
@@ -521,7 +544,9 @@ defmodule LoopctlWeb.CorpusController do
                "A locally-produced query vector whose length equals the corpus dim and " <>
                  "whose elements are float32-representable (magnitude at most " <>
                  "#{@float32_max}). client_embedded corpora only — the server cannot " <>
-                 "embed for them. Send this OR query, never both."
+                 "embed for them. Send this OR query, never both. null and an ABSENT " <>
+                 "key mean absent; an EMPTY ARRAY is a malformed vector and is refused " <>
+                 "(422 invalid_query_vector) even when a query accompanies it."
            },
            lanes: %OpenApiSpex.Schema{
              type: :array,
@@ -618,6 +643,7 @@ defmodule LoopctlWeb.CorpusController do
     vector = Map.get(params, "query_vector")
 
     cond do
+      empty_vector?(vector) -> {:error, :invalid_query_vector}
       given?(query) and given?(vector) -> {:error, :ambiguous_query}
       given?(vector) -> Search.search_vector(tenant_id, id, vector, opts)
       true -> Search.search(tenant_id, id, query, opts)
@@ -628,6 +654,15 @@ defmodule LoopctlWeb.CorpusController do
   # null is: a client without omitempty sends `query: ""` alongside a real vector. An
   # empty ARRAY is present — it is a malformed vector, and `invalid_query_vector` says
   # more than routing it to the query lane would.
+  #
+  # That refusal is tested FIRST, before the ambiguity branch, because the branch order
+  # decided the outcome: with the ambiguity test first, `{query: "x", query_vector: []}`
+  # was refused as `ambiguous_query` with a message asserting "both arrived non-empty"
+  # about a field that is demonstrably empty, and the malformed-vector outcome this
+  # comment declares was unreachable whenever a query was present.
+  defp empty_vector?([]), do: true
+  defp empty_vector?(_value), do: false
+
   defp given?(nil), do: false
   defp given?(value) when is_binary(value), do: String.trim(value) != ""
   defp given?(_value), do: true
@@ -687,7 +722,9 @@ defmodule LoopctlWeb.CorpusController do
       conn,
       422,
       "invalid_query_vector",
-      "query_vector must be a non-empty array of numbers at this corpus's dim."
+      "query_vector must be a non-empty array of numbers at this corpus's dim. An empty " <>
+        "array is a MALFORMED vector, not an absent one: omit the field or send null if " <>
+        "you meant to search a server_embedded corpus with query."
     )
   end
 

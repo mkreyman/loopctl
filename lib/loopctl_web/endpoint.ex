@@ -97,10 +97,14 @@ defmodule LoopctlWeb.Endpoint do
   plug :clear_tenant_metadata
   plug Plug.Telemetry, event_prefix: [:phoenix, :endpoint]
 
+  # The byte cap lives in LoopctlWeb.RequestLimits because it is PUBLISHED as well as
+  # enforced: the corpus ingest description states it next to its item ceiling (a batch
+  # of client-supplied vectors runs out of bytes long before it runs out of items) and
+  # LoopctlWeb.ErrorJSON names it in the 413 body. One source, so they cannot drift.
   plug Plug.Parsers,
     parsers: [:urlencoded, :json],
     pass: ["*/*"],
-    length: 2_000_000,
+    length: LoopctlWeb.RequestLimits.max_body_bytes(),
     json_decoder: Phoenix.json_library()
 
   plug Plug.MethodOverride

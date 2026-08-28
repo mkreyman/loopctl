@@ -105,6 +105,21 @@ defmodule Loopctl.Corpus.IndexerTest do
     )
   end
 
+  # The stored VECTORS, not just their count — the only way to see whether a rewrite
+  # actually adopted the vector the request carried.
+  defp stored_vectors(corpus) do
+    AdminRepo.all(
+      from(e in DocumentChunkEmbedding,
+        join: c in DocumentChunk,
+        on: c.id == e.document_chunk_id,
+        where: c.corpus_id == ^corpus.id,
+        order_by: [asc: c.ordinal],
+        select: e.embedding
+      )
+    )
+    |> Enum.map(&Pgvector.to_list/1)
+  end
+
   defp index!(tenant_id, corpus, chunks, opts \\ []) do
     {:ok, result} =
       Indexer.index_chunks(
@@ -977,6 +992,50 @@ defmodule Loopctl.Corpus.IndexerTest do
       assert statuses(result) == [:replaced]
       assert [%{content_hash: "hash-two"}] = chunks_of(corpus)
       assert embedding_count(corpus) == 1
+      assert stored_vectors(corpus) == [client_vector(tenant.id, 8..15)]
+    end
+
+    # In mode A a metadata-only change skips the embedding step because the server
+    # computed the hash from the text it embedded, so hash-unchanged PROVES
+    # vector-unchanged. In mode B the hash and the vector are two independent client
+    # inputs and that implication is gone: the request was answered `replaced` while the
+    # vector it carried was dropped, and search went on ranking the chunk by the old one
+    # with no error and no meta flag to read. An `ordinal` move alone reaches this, so it
+    # needs no snippet and is reachable on the DEFAULT (allow_snippets false) corpus.
+    test "a metadata-only rewrite stores the vector that came with it" do
+      tenant = fixture(:tenant)
+      corpus = mode_b_corpus!(tenant.id)
+
+      index!(tenant.id, corpus, [vector_chunk(tenant.id, "spec.pdf", 1, 0..7, "hash-one")])
+      assert stored_vectors(corpus) == [client_vector(tenant.id, 0..7)]
+
+      moved =
+        tenant.id
+        |> vector_chunk("spec.pdf", 1, 8..15, "hash-one")
+        |> Map.put("ordinal", 7)
+
+      result = index!(tenant.id, corpus, [moved])
+
+      assert statuses(result) == [:replaced]
+      assert [%{ordinal: 7, content_hash: "hash-one"}] = chunks_of(corpus)
+      assert embedding_count(corpus) == 1
+      assert stored_vectors(corpus) == [client_vector(tenant.id, 8..15)]
+    end
+
+    # The other half of the same rule: with hash, snippet and ordinal all identical,
+    # writing nothing is the documented idempotency contract, so rotating `content_hash`
+    # is how a client publishes a new vector for a chunk that did not otherwise move.
+    test "an unchanged item does NOT adopt a newly submitted vector" do
+      tenant = fixture(:tenant)
+      corpus = mode_b_corpus!(tenant.id)
+
+      index!(tenant.id, corpus, [vector_chunk(tenant.id, "spec.pdf", 1, 0..7, "hash-one")])
+
+      result =
+        index!(tenant.id, corpus, [vector_chunk(tenant.id, "spec.pdf", 1, 8..15, "hash-one")])
+
+      assert statuses(result) == [:unchanged]
+      assert stored_vectors(corpus) == [client_vector(tenant.id, 0..7)]
     end
 
     test "source_complete prunes a mode B source exactly as it does a mode A one" do

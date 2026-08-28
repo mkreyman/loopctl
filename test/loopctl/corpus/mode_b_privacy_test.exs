@@ -60,8 +60,12 @@ defmodule Loopctl.Corpus.ModeBPrivacyTest do
     "lib/loopctl_web/controllers/corpus_controller.ex"
   ]
 
-  # Bindings that hold caller-supplied content at some point on that path.
-  @payload_bindings ~w(chunks attrs item items text snippet vector params body_params)
+  # Bindings that hold caller-supplied content at some point on that path. `chunk` is
+  # listed separately from `chunks` on purpose: the regex matches a WORD, so `\bchunks\b`
+  # never covers it, and `chunk` is the SINGULAR applied struct the mode B item builder
+  # binds — the one carrying the caller's snippet. `conn` covers the reach to
+  # `conn.body_params` by name rather than only through the `body_params` entry.
+  @payload_bindings ~w(chunk chunks attrs item items text snippet vector params body_params conn)
 
   defp keyed_tenant do
     tenant = fixture(:tenant)

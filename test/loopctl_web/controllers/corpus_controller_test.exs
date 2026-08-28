@@ -367,6 +367,53 @@ defmodule LoopctlWeb.CorpusControllerTest do
       assert body["error"]["message"] =~ Integer.to_string(Indexer.max_batch_size())
     end
 
+    # The ITEM ceiling is not the only bound, and on a client_embedded corpus it is not
+    # the binding one: a vector is bytes, and `Plug.Parsers` refuses an over-size body in
+    # the ENDPOINT — before this controller's plugs, so before the 422 that names the item
+    # ceiling can run. That refusal used to fall to the catch-all error view as an
+    # uncoded {"status": 413, "message": "Request Entity Too Large"} for a batch the
+    # published schema declared valid. It now carries a code and a remedy, and the byte
+    # cap it names is the one the parser enforces.
+    test "an over-size BODY under the item ceiling is a coded 413 naming the byte cap",
+         %{conn: conn} do
+      {tenant, raw_key} = keyed_tenant()
+      corpus = mode_b_corpus!(tenant.id)
+
+      # Schema-conforming: fewer items than the published ceiling, each a well-formed
+      # mode B chunk. Only the byte total is out of bounds.
+      chunks =
+        for page <- 1..180 do
+          %{
+            "source_ref" => "spec.pdf",
+            "locator" => %{"page" => page},
+            "vector" => Enum.map(0..1535, fn i -> i / 1_000_000_000 end),
+            "content_hash" => "client-hash-#{page}",
+            "ordinal" => page
+          }
+        end
+
+      raw = Jason.encode!(%{"chunks" => chunks})
+
+      assert length(chunks) <= Indexer.max_batch_size()
+      assert byte_size(raw) > LoopctlWeb.RequestLimits.max_body_bytes()
+
+      assert {413, _headers, body} =
+               assert_error_sent(413, fn ->
+                 conn
+                 |> auth(raw_key)
+                 |> put_req_header("content-type", "application/json")
+                 |> post(~p"/api/v1/corpora/#{corpus.id}/index", raw)
+               end)
+
+      decoded = Jason.decode!(body)
+      assert decoded["error"]["code"] == "request_too_large"
+
+      assert decoded["error"]["message"] =~
+               Integer.to_string(LoopctlWeb.RequestLimits.max_body_bytes())
+
+      assert decoded["error"]["message"] =~ "smaller requests"
+    end
+
     # The rate-limit plug runs BEFORE the action, and the bucket is charged once per
     # ITEM. Without the ceiling in the plug an over-size batch spent the tenant's whole
     # per-minute index budget one item at a time and came back as an opaque 429 — for a
@@ -796,6 +843,18 @@ defmodule LoopctlWeb.CorpusControllerTest do
       assert documented == Indexer.max_batch_size()
     end
 
+    # The item ceiling is only HALF the published bound: a mode B batch is refused on
+    # bytes long before it reaches 200 items, so the description states the byte cap too
+    # — and states the same number the parser enforces and the 413 body names.
+    test "the ingest description publishes the byte cap the parser actually enforces" do
+      spec = Loopctl.ApiSpec.spec()
+      description = spec.paths["/api/v1/corpora/{id}/index"].post.description
+
+      assert description =~ Integer.to_string(LoopctlWeb.RequestLimits.max_body_bytes())
+      assert description =~ "request_too_large"
+      assert spec.paths["/api/v1/corpora/{id}/index"].post.responses[413]
+    end
+
     test "the corpus endpoints are tagged, not untagged" do
       spec = Loopctl.ApiSpec.spec()
 
@@ -1062,6 +1121,43 @@ defmodule LoopctlWeb.CorpusControllerTest do
         |> json_response(422)
 
       assert body["error"]["code"] == "ambiguous_query"
+    end
+
+    # An EMPTY ARRAY is neither of the two serialization artifacts above: a client that
+    # emitted one built a vector and put nothing in it. It is refused as the malformed
+    # vector it is — and refused FIRST, before the ambiguity branch, which used to claim
+    # "both arrived non-empty" about a field that is demonstrably empty and told the
+    # caller to drop a field it effectively had not sent.
+    test "an EMPTY query_vector alongside a query is a malformed vector, not an ambiguity",
+         %{conn: conn} do
+      {tenant, raw_key} = keyed_tenant()
+      corpus = create_corpus!(tenant.id)
+
+      body =
+        conn
+        |> auth(raw_key)
+        |> post(~p"/api/v1/corpora/#{corpus.id}/search", %{
+          "query" => "taxonomy",
+          "query_vector" => []
+        })
+        |> json_response(422)
+
+      assert body["error"]["code"] == "invalid_query_vector"
+      assert body["error"]["message"] =~ "MALFORMED"
+      assert body["error"]["message"] =~ "omit the field or send null"
+    end
+
+    test "an EMPTY query_vector on its own is the same refusal", %{conn: conn} do
+      {tenant, raw_key} = keyed_tenant()
+      corpus = mode_b_corpus!(tenant.id)
+
+      body =
+        conn
+        |> auth(raw_key)
+        |> post(~p"/api/v1/corpora/#{corpus.id}/search", %{"query_vector" => []})
+        |> json_response(422)
+
+      assert body["error"]["code"] == "invalid_query_vector"
     end
 
     # The semantic lane asked for ALONE and failing leaves no degraded answer. The raw

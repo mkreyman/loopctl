@@ -51,11 +51,20 @@ defmodule Loopctl.Corpus.Indexer do
   chunk to classify it `unchanged | inserted | replaced`. An unchanged batch writes
   no chunk row, spends no embedding token, and leaves `updated_at` alone.
 
-  `content_hash` covers the TEXT, so it decides the EMBEDDING. It does not decide the
-  WRITE: `snippet` and `ordinal` are cast from the client and are in the upsert's
-  replace list, so a chunk whose text held still while one of them moved is rewritten
-  (`replaced`) without re-embedding. Deciding both on the hash silently discarded a
-  corrected snippet and left no later re-index able to apply it.
+  In MODE A `content_hash` covers the TEXT the server embedded, so it decides the
+  EMBEDDING. It does not decide the WRITE: `snippet` and `ordinal` are cast from the
+  client and are in the upsert's replace list, so a chunk whose text held still while
+  one of them moved is rewritten (`replaced`) without re-embedding. Deciding both on
+  the hash silently discarded a corrected snippet and left no later re-index able to
+  apply it.
+
+  In MODE B the hash decides nothing about the vector: both arrive from the client and
+  loopctl cannot relate them. So every rewrite carries the submitted vector — a
+  metadata-only change is widened to a full rewrite — because reporting `replaced`
+  while discarding the vector that came with the replacement left search ranking the
+  chunk by the old one. `unchanged` still writes nothing, so ROTATING `content_hash` is
+  how a mode B client publishes a new vector for a chunk whose pointer and snippet did
+  not move.
 
   ## Pruning is reconciliation against a DECLARED chunk set, never inference
 
@@ -472,7 +481,7 @@ defmodule Loopctl.Corpus.Indexer do
   defp classify(tenant_id, corpus, items) do
     existing = load_existing(tenant_id, corpus, Enum.map(items, & &1.source_ref))
 
-    {:ok, Enum.map(items, &classify_item(&1, existing))}
+    {:ok, Enum.map(items, &classify_item(&1, existing, corpus.mode))}
   end
 
   # TWO decisions, deliberately separate. `status` is what the caller is told; `rewrite`
@@ -485,14 +494,16 @@ defmodule Loopctl.Corpus.Indexer do
   # answered "unchanged" to a request that corrected a snippet or renumbered a chunk,
   # dropped the values, and left no later re-index able to apply them — the text hash
   # never moves again. A metadata-only change therefore rewrites the ROW (reported
-  # `replaced`, because the row was) and skips the embedding entirely.
-  defp classify_item(item, existing) do
+  # `replaced`, because the row was) and skips the embedding entirely — in MODE A, where
+  # the server computed the hash from the text it embedded, so hash-unchanged provably
+  # means vector-unchanged.
+  defp classify_item(item, existing, mode) do
     case Map.get(existing, {item.source_ref, Corpus.canonical_locator(item.locator)}) do
       nil ->
         Map.merge(item, %{status: :inserted, rewrite: :full, chunk_id: nil})
 
       %{id: id} = stored ->
-        {status, rewrite} = classify_change(stored, item)
+        {status, rewrite} = stored |> classify_change(item) |> widen_rewrite(mode)
         Map.merge(item, %{status: status, rewrite: rewrite, chunk_id: id})
     end
   end
@@ -505,6 +516,22 @@ defmodule Loopctl.Corpus.Indexer do
       true -> {:unchanged, :none}
     end
   end
+
+  # In mode B that implication does not hold: `content_hash` and `vector` are two
+  # INDEPENDENT client inputs (AC-43.3.2 makes the hash an opaque token loopctl cannot
+  # relate to anything), so a metadata rewrite that skipped the embedding step told the
+  # caller its item was `replaced` while discarding the vector that came with the
+  # replacement — search then ranked the chunk by the old one, with no error and no meta
+  # flag to read. An `ordinal` change alone reaches this, which is what a re-chunk or a
+  # re-paginate produces, so it needs no snippet and is reachable on the DEFAULT mode B
+  # corpus. Any rewrite therefore carries the submitted vector. It costs one extra upsert
+  # and no tokens: mode B makes no provider call.
+  #
+  # `:unchanged` is deliberately untouched — with hash, snippet and ordinal all identical,
+  # writing nothing is the documented idempotency contract, and rotating `content_hash`
+  # is how a client publishes a new vector for text it re-embedded.
+  defp widen_rewrite({:replaced, :metadata}, :client_embedded), do: {:replaced, :full}
+  defp widen_rewrite(classification, _mode), do: classification
 
   defp load_existing(tenant_id, corpus, source_refs) do
     refs = Enum.uniq(source_refs)
@@ -680,7 +707,9 @@ defmodule Loopctl.Corpus.Indexer do
 
   # Metadata-only: the row is rewritten so the corrected snippet/ordinal land, and the
   # embedding step is SKIPPED — the text did not move, so the stored vector and its hash
-  # are still the right ones and there is nothing to re-embed.
+  # are still the right ones and there is nothing to re-embed. MODE A only: `widen_rewrite/2`
+  # turns this classification into `:full` on a client_embedded corpus, where the caller's
+  # vector arrived with the change and skipping it would strand a stale embedding.
   defp add_item(multi, tenant_id, corpus, %{rewrite: :metadata} = item) do
     Multi.run(multi, {:chunk, item.index}, fn repo, _changes ->
       upsert_chunk(repo, tenant_id, corpus, item)

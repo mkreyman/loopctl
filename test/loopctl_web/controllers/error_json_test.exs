@@ -35,6 +35,19 @@ defmodule LoopctlWeb.ErrorJSONTest do
              %{error: %{status: 500, code: "db_error", message: "Internal server error"}}
   end
 
+  # US-43.3 (review): the parser's 413 used to fall to the catch-all below, which gives
+  # a reason phrase and nothing else — for a corpus batch the published schema declared
+  # valid. It now carries a code and a remedy, and names the SAME cap the parser
+  # enforces.
+  test "renders 413 with a code, a remedy and the enforced byte cap" do
+    body = LoopctlWeb.ErrorJSON.render("413.json", %{})
+
+    assert body.error.status == 413
+    assert body.error.code == "request_too_large"
+    assert body.error.message =~ Integer.to_string(LoopctlWeb.RequestLimits.max_body_bytes())
+    assert body.error.message =~ "smaller requests"
+  end
+
   test "renders arbitrary status code via the catch-all reason phrase" do
     # 502 has no explicit clause, so it exercises the catch-all reason_phrase/1.
     # (503/504 now have explicit US-27.3 clauses asserted in fallback tests.)
