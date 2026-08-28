@@ -1,0 +1,149 @@
+{
+  "id": "US-43.3",
+  "title": "Mode B — the server stores and ranks vectors it cannot read",
+  "epic": { "id": "epic_43", "name": "Corpus Tier" },
+  "priority": "high",
+  "phase": "core",
+  "background": "Mode A requires sending document text to loopctl. That is fine for a published companion guide and impossible for a Medicaid repo, a client codebase, or anything under NDA. Mode B closes that: the client runs a local embedding model — nomic-embed-text at 768 dimensions is already in Loopctl.Embeddings.Dimensions and 768 is already in the supported set (config/config.exs:38), so the storage and index paths exist — and sends {source_ref, locator, vector, content_hash}. document_chunks.text stays NULL. loopctl stores and ranks vectors whose content it has never seen. This is the capability that makes the tier worth building rather than a slower FAISS: the index is centralized and reachable from any machine, and the content never leaves the one machine that holds the files. It is also the answer to why not just commit a FAISS index, since a committed index still needs the query stack installed per machine and is unreachable from a box with no checkout.",
+  "story": {
+    "as_a": "an agent working in a repo whose documents cannot leave the machine",
+    "i_want_to": "send loopctl only vectors and file pointers, computed locally",
+    "so_that": "I get one centralized, cross-machine search surface over documents whose text loopctl never receives"
+  },
+  "rationale": "The privacy property has to be structural, not promised. Mode B is enforced by the schema (text is NULL and the ingest path has no parameter that would fill it) and by the corpus's immutable mode flag, so a caller cannot half-use it and the server cannot later be taught to read what it was never sent. The honest scoping matters as much as the capability: an optional snippet IS text the server sees, so the default is no snippet and a corpus can forbid them outright.",
+  "acceptance_criteria": [
+    {
+      "id": "AC-43.3.1",
+      "description": "A corpus created with mode client_embedded accepts index items of the shape {source_ref, locator, vector, content_hash, ordinal, snippet?} plus the same top-level source_complete list US-43.2 AC-43.2.3 defines, under the same bound, and has NO parameter that accepts chunk text. Submitting text to a mode B corpus is refused with a named error rather than silently ignored, because silently dropping it would let a client believe the keyword lane works.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.3.2",
+      "description": "content_hash is CLIENT-SUPPLIED in mode B (the server cannot compute it, having no text) and is required. It is treated as an opaque idempotency token, never as an integrity proof: loopctl states in the tool and OpenAPI descriptions that it cannot verify the hash corresponds to the vector or the file, and that the client owns that correspondence.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.3.3",
+      "description": "The submitted vector's length must equal the corpus's pinned dim; a mismatch is refused at the boundary with an error naming both numbers, before the CHECK constraint would raise a raw Postgrex error. This mirrors the read-path length check the article search path added for exactly this reason (a raw different vector dimensions 500 instead of a documented refusal).",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.3.4",
+      "description": "corpus_search on a mode B corpus accepts a CLIENT-SUPPLIED query vector instead of a query string, validated against the corpus dim the same way. Passing a query string to a mode B corpus is refused with an error that says the server cannot embed for this corpus and names what to send instead — not an empty result set, which an agent reads as an empty corpus.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.3.5",
+      "description": "The keyword lane is UNAVAILABLE on a mode B corpus and this is stated, not discovered: the search response's meta names the lanes that ran, the OpenAPI spec and the tool description say mode B is semantic-only and why (there is no text to index), and a keyword-only search request against a mode B corpus is refused rather than returning nothing.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.3.6",
+      "description": "snippet defaults to NULL in mode B. A corpus created with allow_snippets false refuses any item carrying a snippet, with an error stating the corpus forbids them. A corpus with allow_snippets true accepts an optional snippet bounded by the same module attribute US-43.2 established. The default for a mode B corpus created without specifying allow_snippets is FALSE — the privacy-preserving default, not the convenient one.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.3.7",
+      "description": "Search results from a mode B corpus carry {source_ref, locator, score, corpus_id, chunk_id} and a snippet only when one was stored. The result shape is otherwise IDENTICAL to mode A, so a caller branches on meta rather than on which mode answered — the same discipline the hybrid search contract holds between curated and retrieved provenance.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.3.8",
+      "description": "A test asserts the privacy property directly rather than trusting the shape: index a mode B corpus with distinctive text NEVER sent to the server, then assert that string appears nowhere in document_chunks, document_chunk_embeddings, the audit log rows written by the ingest, the request logs, or any search response.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.3.9",
+      "description": "Mode is immutable (US-43.1), so a mode A corpus can never become mode B or the reverse. A test asserts both directions are refused, and the error names delete-and-re-index as the supported path.",
+      "status": "pending"
+    },
+    {
+      "id": "AC-43.3.10",
+      "description": "CHANGELOG.md carries an operator-facing entry for mode B stating exactly what loopctl does and does not receive, since that is the property an operator is deciding to rely on when they point a regulated corpus at it.",
+      "status": "pending"
+    }
+  ],
+  "test_cases": [
+    {
+      "id": "TC-43.3.1",
+      "name": "the server never receives the text",
+      "type": "integration",
+      "preconditions": ["a mode B corpus", "a distinctive marker string held only client-side"],
+      "steps": ["index chunks whose vectors were computed from text containing the marker", "search and read every response field", "query all three tables and the audit rows"],
+      "expected_results": ["the marker appears nowhere in the database", "the marker appears in no response", "the marker appears in no log line"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-43.3.2",
+      "name": "text is refused, not ignored",
+      "type": "integration",
+      "preconditions": ["a mode B corpus"],
+      "steps": ["submit an index item carrying a text field"],
+      "expected_results": ["the request is refused with a named error", "no chunk is created", "the error explains that mode B corpora have no text lane"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-43.3.3",
+      "name": "a query string against a mode B corpus is refused, not empty",
+      "type": "integration",
+      "preconditions": ["a mode B corpus with indexed chunks"],
+      "steps": ["search with a query string"],
+      "expected_results": ["the response is an error naming what to send instead", "it is NOT an empty result set"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-43.3.4",
+      "name": "a wrong-length query vector is refused at the boundary",
+      "type": "integration",
+      "preconditions": ["a corpus pinned at 768"],
+      "steps": ["search with a 1536-length vector"],
+      "expected_results": ["a 4xx naming both dimensions", "no raw Postgrex error reaches the caller"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-43.3.5",
+      "name": "snippets are off by default and enforceable",
+      "type": "integration",
+      "preconditions": ["a mode B corpus created without specifying allow_snippets"],
+      "steps": ["read the stored corpus", "submit an item carrying a snippet"],
+      "expected_results": ["allow_snippets is false", "the item is refused with an error stating the corpus forbids snippets"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-43.3.6",
+      "name": "mode B search ranks correctly against a known neighbour",
+      "type": "integration",
+      "preconditions": ["a mode B corpus with vectors placed at known distances from a probe vector"],
+      "steps": ["search with the probe vector"],
+      "expected_results": ["results are ordered by descending similarity", "the nearest known neighbour ranks first", "meta names the semantic lane only"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-43.3.7",
+      "name": "mode is immutable in both directions",
+      "type": "unit",
+      "preconditions": ["one mode A corpus and one mode B corpus"],
+      "steps": ["attempt to change each to the other mode"],
+      "expected_results": ["both are refused", "the error names delete-and-re-index"],
+      "status": "pending"
+    },
+    {
+      "id": "TC-43.3.8",
+      "name": "mode A and mode B results have identical shape",
+      "type": "unit",
+      "preconditions": ["a search result from each mode"],
+      "steps": ["compare the key sets of the result objects and of meta"],
+      "expected_results": ["the key sets are identical", "only the values of meta.lanes differ"],
+      "status": "pending"
+    }
+  ],
+  "technical_notes": [
+    "Do not add a verification that the client's vector actually came from the declared model. It is not computable from a vector, and a check that appears to verify it while proving nothing is worse than the honest statement AC-43.3.2 requires. What IS enforceable is length against the corpus dim, and that is enforced twice: at the boundary and by the CHECK constraint.",
+    "AC-43.3.8's test is the story's real deliverable. Write it so it would FAIL if someone later added a convenience field that echoed a snippet or logged a request body. Verify it by mutation: temporarily echo the submitted payload into a log line and confirm the test catches it.",
+    "The refusals in AC-43.3.1, AC-43.3.4 and AC-43.3.5 all exist for one reason: an empty result set is read by an agent as an empty corpus. That is the exact failure mkreyman/home_care_billing#1385 documents — a documented tool returning empty is worse than no tool, because a session trusts the empty answer. Every mode mismatch must be an error with a remedy, never silence.",
+    "allow_snippets defaulting to FALSE for mode B is deliberate and will feel inconvenient during the first cutover, because a snippet makes results much more readable. That is the correct trade: the operator who wants snippets can create the corpus asking for them, and the one who forgets gets the safe behaviour.",
+    "There is no batching subtlety here that US-43.2 did not already solve — mode B reuses the same ONE-Ecto.Multi batch shape (AC-43.2.2) and the same (corpus_id, source_ref, locator) key. The only difference is that content_hash arrives rather than being computed."
+  ],
+  "dependencies": ["US-43.2"],
+  "estimated_tokens": 280000
+}
