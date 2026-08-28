@@ -54,9 +54,10 @@ defmodule Loopctl.DataCase do
   end
 
   # Tables carrying a pgvector HNSW index. Vacuuming these is what removes dead index
-  # entries from the graph; the two side tables are where the flake actually bit, and the
-  # two legacy ones carry indexes over the pre-cutover `embedding` columns.
-  @vector_tables ~w(article_embeddings memory_embeddings articles memories)
+  # entries from the graph; the article/memory side tables are where the flake actually
+  # bit, the two legacy ones carry indexes over the pre-cutover `embedding` columns, and
+  # `document_chunk_embeddings` (US-43.1) carries the corpus tier's per-dimension indexes.
+  @vector_tables ~w(article_embeddings memory_embeddings document_chunk_embeddings articles memories)
 
   @doc """
   Removes dead pgvector HNSW entries left in the shared index graph by rolled-back tests
