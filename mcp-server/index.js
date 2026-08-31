@@ -6748,6 +6748,19 @@ const TOOLS = [
       "distilled query per prompt and never see what came back, so they cannot reformulate " +
       "by construction. They stay in every other denominator here, precision included. " +
       "Read searches - searches_scored as n/a, never as zero.\n\n" +
+      "WHICH FOLLOW-THROUGH RATE TO QUOTE. Two are published over DIFFERENT populations, " +
+      "and picking the wrong one misstates agent behaviour by roughly 3.4x. " +
+      "search_follow_through is over EVERY query-bearing call, infrastructure INCLUDED — " +
+      "use it for total traffic through the retrieval path, and read it as BLENDED. " +
+      "scored_follow_through is over searches_scored (a session identity AND a channel " +
+      "that can react to a result), and IT is the rate to quote when asking whether AGENTS " +
+      "are consuming the KB. It is null when nothing was scoreable, never 0.0 — zero would " +
+      "assert agents searched and opened nothing, when the truth is this instrument could " +
+      "not see. Measured live for 2026-08-19..29: 10.8% blended against 38.0% scored, " +
+      "because 78% of that window's calls were infrastructure (1,234 recall-hook " +
+      "memory_recall at 3.3%, 486 smoke-test knowledge_search at 0%). Spelled out because " +
+      "leaving the division to the caller already produced one wrong published conclusion " +
+      "while both input columns were documented.\n\n" +
       "COMPARE ROWS ONLY WITHIN A metric_version. Every row carries the version of the " +
       "definition set that produced it. Three changes have already altered what a figure here " +
       "MEANS — searched went from search calls to surfaced results, infrastructure traffic " +

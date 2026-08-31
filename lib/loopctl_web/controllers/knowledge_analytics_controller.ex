@@ -392,6 +392,19 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
         "reformulate by construction. They remain in every other denominator on this " <>
         "surface, including precision. Read `searches - searches_scored` as n/a, never " <>
         "as zero.\n\n" <>
+        "WHICH FOLLOW-THROUGH RATE TO QUOTE. Two are published over DIFFERENT " <>
+        "populations, and picking the wrong one misstates agent behaviour by roughly " <>
+        "3.4x. `search_follow_through` is over EVERY query-bearing call, infrastructure " <>
+        "INCLUDED — use it to describe total traffic through the retrieval path, and " <>
+        "read it as BLENDED. `scored_follow_through` is over `searches_scored` (a " <>
+        "session identity AND a channel that can react to a result), and IT is the rate " <>
+        "to quote when the question is whether AGENTS are consuming the KB; it is `null` " <>
+        "when nothing was scoreable, never `0.0`, because zero would assert that agents " <>
+        "searched and opened nothing when the truth is that this instrument could not " <>
+        "see. Measured live for 2026-08-19..29: 10.8% blended against 38.0% scored, " <>
+        "because 78% of that window's calls were infrastructure. This is spelled out " <>
+        "because leaving the division to the caller already produced one wrong published " <>
+        "conclusion, with both input columns documented at the time.\n\n" <>
         "COMPARE ROWS ONLY WITHIN A `metric_version`. Every row carries the version of the " <>
         "definition set that produced it. Three changes have already altered what a figure " <>
         "here MEANS — `searched` went from search calls to surfaced results, infrastructure " <>

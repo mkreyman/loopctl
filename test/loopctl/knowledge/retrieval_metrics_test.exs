@@ -513,4 +513,125 @@ defmodule Loopctl.Knowledge.RetrievalMetricsTest do
       assert row.results_returned == 15
     end
   end
+
+  describe "scored_follow_through — the agent-clean rate" do
+    # One SEARCH CALL that is SCOREABLE: it carries a session identity and an entrypoint
+    # that is not one of the infrastructure channels, which is what puts it in
+    # `searches_scored`. Built through the same batch shape production writes.
+    defp scoreable_call(ctx, article_ids, time, opts \\ []) do
+      search_id = Keyword.get(opts, :search_id, Ecto.UUID.generate())
+      session_id = Keyword.get(opts, :session_id, Ecto.UUID.generate())
+
+      Enum.each(article_ids, fn article_id ->
+        fixture(:article_access_event, %{
+          tenant_id: ctx.tenant.id,
+          api_key_id: ctx.key.id,
+          article_id: article_id,
+          access_type: "search",
+          metadata: %{
+            "search_id" => search_id,
+            "session_id" => session_id,
+            "entrypoint" => "cli",
+            "results_returned" => length(article_ids),
+            "mode" => "combined"
+          },
+          accessed_at: at(time)
+        })
+      end)
+
+      search_id
+    end
+
+    test "is the SCORED ratio, and diverges from the blended rate when infrastructure searches",
+         ctx do
+      %{tenant: t, key: k, x: x, y: y} = ctx
+
+      # One agent search that follows through.
+      scoreable_call(ctx, [x.id], ~T[10:00:00])
+      event(t.id, k.id, x.id, "get", ~T[10:01:00])
+
+      # Four infrastructure searches (the recall hook's entrypoint) that never open
+      # anything — exactly the shape that dominated the live window.
+      for i <- 1..4 do
+        fixture(:article_access_event, %{
+          tenant_id: t.id,
+          api_key_id: k.id,
+          article_id: y.id,
+          access_type: "search",
+          metadata: %{
+            "search_id" => Ecto.UUID.generate(),
+            "session_id" => Ecto.UUID.generate(),
+            "entrypoint" => "hook",
+            "results_returned" => 1,
+            "mode" => "combined"
+          },
+          accessed_at: at(Time.add(~T[11:00:00], i * 60))
+        })
+      end
+
+      assert {:ok, _} = RetrievalMetrics.snapshot(t.id, @day, 1800)
+      %{data: [row]} = RetrievalMetrics.list_snapshots(t.id)
+
+      assert row.searches_scored == 1
+      assert row.searches_scored_with_follow_through == 1
+
+      assert row.scored_follow_through == 1.0,
+             "the scored rate must be computed over `searches_scored` alone — the agent " <>
+               "searched once and opened once"
+
+      assert row.search_follow_through < row.scored_follow_through,
+             "the blended rate must sit BELOW the scored rate when infrastructure is " <>
+               "present; if these are equal the infrastructure exclusion has stopped " <>
+               "working and the published rate is misstating agent behaviour again"
+    end
+
+    test "is nil, never 0.0, when nothing was scoreable", ctx do
+      %{tenant: t, key: k, y: y} = ctx
+
+      # Traffic exists, but none of it can be scored — no session identity at all.
+      search_call(t.id, k.id, [y.id], ~T[12:00:00])
+
+      assert {:ok, _} = RetrievalMetrics.snapshot(t.id, @day, 1800)
+      %{data: [row]} = RetrievalMetrics.list_snapshots(t.id)
+
+      assert row.searches_scored == 0
+
+      assert row.scored_follow_through == nil,
+             "0.0 asserts 'agents searched and opened nothing'; the truth here is 'this " <>
+               "instrument could not see'. Publishing an n/a as a number is the failure " <>
+               "#711 rescoped the disposition trio to avoid"
+    end
+
+    test "the PUBLISHED payload shape is pinned, like compute/3's", ctx do
+      %{tenant: t} = ctx
+      assert {:ok, _} = RetrievalMetrics.snapshot(t.id, @day, 1800)
+      %{data: [row]} = RetrievalMetrics.list_snapshots(t.id)
+
+      assert Enum.sort(Map.keys(row)) == [
+               :attributed_opens,
+               :cross_key_opens,
+               :day,
+               :direct_opens,
+               :followed_through,
+               :metric_version,
+               :precision,
+               :results_recorded,
+               :results_returned,
+               :scored_follow_through,
+               :search_follow_through,
+               :searched,
+               :searches,
+               :searches_quiet,
+               :searches_reformulated,
+               :searches_scored,
+               :searches_scored_with_follow_through,
+               :searches_with_follow_through,
+               :window_seconds
+             ],
+             "the shape of the PUBLISHED payload changed. compute/3's key set is pinned " <>
+               "separately; this pins what callers actually receive, which is where a " <>
+               "derived field like scored_follow_through lives and where its silent " <>
+               "removal would otherwise go unnoticed."
+    end
+  end
 end

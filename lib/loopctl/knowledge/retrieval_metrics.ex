@@ -151,6 +151,30 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   `@no_reformulation_entrypoints`). Report `searches - searches_scored` as unscoreable rather
   than inferring anything from it: it is an `n/a`, not a zero.
 
+  ## Which follow-through rate answers which question
+
+  Two are published, over DIFFERENT populations, and picking the wrong one misstates agent
+  behaviour by roughly 3.4x:
+
+    * `search_follow_through` — over EVERY query-bearing call, infrastructure included.
+      Use it to describe total traffic through the retrieval path. It is BLENDED, and on a
+      tenant whose automation searches on a schedule it is dominated by channels that
+      cannot follow through by construction.
+    * `scored_follow_through` — over `searches_scored`, the calls that carry a session
+      identity AND come from a channel that can react to a result. **This is the rate to
+      quote when the question is whether AGENTS are consuming the KB.** `nil` when nothing
+      was scoreable, never `0.0`.
+
+  Measured on the live tenant for 2026-08-19..29: 10.8% blended against 38.0% scored,
+  because 78% of the calls in that window were infrastructure — 1,234 recall-hook
+  `memory_recall` calls at 3.3% and 486 smoke-test `knowledge_search` calls at 0%. An
+  independent segmentation of `search_events` by `client_host` put agent follow-through at
+  36.7%, corroborating the scored rate within 1.3 points.
+
+  This distinction is documented rather than assumed because leaving it to the caller
+  already failed once: an audit of KB usage read the blended rate as agent behaviour and
+  published KB consumption as ~10% when it was ~37%.
+
   Both of those replaced proxies that were measuring something else. Scoring on `api_key_id`
   made the figure a function of search DENSITY — two shared keys, a 127-second median gap
   between searches on one of them, so "another search happened on this key" was ~always true
@@ -575,6 +599,8 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
       search_follow_through: s.search_follow_through,
       searches_scored: s.searches_scored,
       searches_scored_with_follow_through: s.searches_scored_with_follow_through,
+      scored_follow_through:
+        scored_follow_through(s.searches_scored_with_follow_through, s.searches_scored),
       searches_reformulated: s.searches_reformulated,
       searches_quiet: s.searches_quiet,
       attributed_opens: s.attributed_opens,
@@ -584,6 +610,39 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
       computed_at: s.computed_at
     }
   end
+
+  # THE RATE TO QUOTE when the question is "are AGENTS consuming the KB". Derived, never
+  # stored: it is a pure ratio of two persisted columns, so computing it on read makes it
+  # correct for historical rows without a migration or a backfill.
+  #
+  # Why it has to be surfaced at all, given both its inputs were already published: the
+  # prominent, first-named rate on this payload is `search_follow_through`, whose
+  # denominator is EVERY query-bearing call — including the two infrastructure channels
+  # that cannot follow through by construction (the injected recall hook and the
+  # session-start auto-query, excluded from the scored population by
+  # `@no_reformulation_entrypoints`). Measured on the live tenant for 2026-08-19..29:
+  # `search_follow_through` 10.8% against a scored rate of 38.0%, because 78% of the calls
+  # in that window were infrastructure. An independent segmentation of `search_events` by
+  # `client_host` put agent follow-through at 36.7% — two derivations, 1.3 points apart,
+  # and 3.4x away from the blended figure.
+  #
+  # Leaving the reader to divide the two columns themselves is not a neutral choice. It was
+  # tried, with both columns documented at length, and it produced a wrong published
+  # conclusion by the author of this comment: an audit that read the blended rate as agent
+  # behaviour and reported KB consumption as ~10% when it was ~37%. A metric that is
+  # correct only if the caller knows to recompute it is a metric that will be misquoted.
+  #
+  # `nil` — never `0.0` — when nothing was scoreable. Zero here would assert "agents
+  # searched and opened nothing", when the truth is "this instrument could not see", which
+  # is the exact `n/a`-as-a-number failure the disposition trio was rescoped to avoid
+  # (#711). Both `searches_scored: 0` days in the audit window were Sundays with no traffic
+  # at all.
+  defp scored_follow_through(_with_ft, scored) when is_nil(scored) or scored <= 0, do: nil
+
+  defp scored_follow_through(with_ft, scored) when is_integer(with_ft) and with_ft >= 0,
+    do: with_ft / scored
+
+  defp scored_follow_through(_with_ft, _scored), do: nil
 
   defp compute_dispositions(searched_q, window_seconds) do
     scoreable = reformulation_scoreable(searched_q)
@@ -933,6 +992,16 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
         }
       )
       |> AdminRepo.all()
+      # Derived in Elixir rather than in the `select` above: it is a ratio with a
+      # divide-by-zero case whose correct answer is `nil`, and SQL would need a CASE that
+      # then has to agree with `present_snapshot/1`'s. One helper, two call sites, no drift.
+      |> Enum.map(fn row ->
+        Map.put(
+          row,
+          :scored_follow_through,
+          scored_follow_through(row.searches_scored_with_follow_through, row.searches_scored)
+        )
+      end)
 
     %{data: data, meta: %{limit: limit, offset: offset, total_count: total_count}}
   end
