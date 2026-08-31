@@ -345,13 +345,14 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
         "shape of a legacy-heavy or browse-heavy day.\n\n" <>
         "CAVEATS — searches returning ZERO results and searches made without an api key " <>
         "are structurally unrecordable and appear in NO denominator, so every ratio here " <>
-        "is an upper bound. Both ratios also rise when a search simply returns FEWER " <>
+        "is an upper bound. Every ratio here also rises when a search simply returns FEWER " <>
         "results, with no better retrieval: never optimise them alone — read them with " <>
-        "the absolute `followed_through` and the volume fields. `search_follow_through` " <>
-        "carries two further biases pointing OPPOSITE ways: the recording cap hides opens " <>
-        "of results ranked beyond it (biases it DOWN on large pages), while one open " <>
-        "credits EVERY search in the window that surfaced that article, not just the " <>
-        "preceding one (biases it UP when an agent refines and re-searches).\n\n" <>
+        "the absolute `followed_through` and the volume fields. BOTH follow-through " <>
+        "rates carry two further biases pointing OPPOSITE ways: the recording cap hides " <>
+        "opens of results ranked beyond it (biases them DOWN on large pages), while one " <>
+        "open credits EVERY search in the window that surfaced that article, not just " <>
+        "the preceding one (biases them UP when an agent refines and re-searches, which " <>
+        "bites hardest on `scored_follow_through`).\n\n" <>
         "EXACT ATTRIBUTION (unit: READS, not surfaced results and not calls) — " <>
         "`attributed_opens` / `cross_key_opens` / `direct_opens` count READ rows by how " <>
         "their originating search was established server-side at write time. These are " <>
@@ -394,17 +395,23 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
         "as zero.\n\n" <>
         "WHICH FOLLOW-THROUGH RATE TO QUOTE. Two are published over DIFFERENT " <>
         "populations, and picking the wrong one misstates agent behaviour by roughly " <>
-        "3.4x. `search_follow_through` is over EVERY query-bearing call, infrastructure " <>
-        "INCLUDED — use it to describe total traffic through the retrieval path, and " <>
-        "read it as BLENDED. `scored_follow_through` is over `searches_scored` (a " <>
-        "session identity AND a channel that can react to a result), and IT is the rate " <>
-        "to quote when the question is whether AGENTS are consuming the KB; it is `null` " <>
-        "when nothing was scoreable, never `0.0`, because zero would assert that agents " <>
-        "searched and opened nothing when the truth is that this instrument could not " <>
-        "see. Measured live for 2026-08-19..29: 10.8% blended against 38.0% scored, " <>
-        "because 78% of that window's calls were infrastructure. This is spelled out " <>
-        "because leaving the division to the caller already produced one wrong published " <>
-        "conclusion, with both input columns documented at the time.\n\n" <>
+        "3.4x. `search_follow_through` is over every query-bearing call that SURVIVES the " <>
+        "infrastructure exclusion — `smoke`/`skill-eval` sit in NO denominator here, but " <>
+        "the recall hook and the session-start auto-query DO, and neither can follow " <>
+        "through by construction. Use it to describe total traffic through the retrieval " <>
+        "path, and read it as BLENDED. `scored_follow_through` is over `searches_scored` " <>
+        "(a session identity AND a channel that can react to a result), and IT is the " <>
+        "rate to quote when the question is whether AGENTS are consuming the KB; it is " <>
+        "`null` when nothing was scoreable, never `0.0`, because zero would assert that " <>
+        "agents searched and opened nothing when the truth is that this instrument could " <>
+        "not see. That nil-for-n/a is THIS field's alone: `search_follow_through` is " <>
+        "non-null and reports `0.0` on a day with no qualifying searches, which is an " <>
+        "n/a too — read it beside `searches`. Measured live for 2026-08-19..29: 10.8% " <>
+        "blended (185/1,708) against 38.0% scored, because 72% of that blended " <>
+        "denominator (1,234/1,708) was recall-hook traffic at 3.3%; the window's 486 " <>
+        "smoke-test calls are in neither figure. This is spelled out because leaving " <>
+        "the division to the caller already produced one wrong published conclusion, " <>
+        "with both input columns documented at the time.\n\n" <>
         "COMPARE ROWS ONLY WITHIN A `metric_version`. Every row carries the version of the " <>
         "definition set that produced it. Three changes have already altered what a figure " <>
         "here MEANS — `searched` went from search calls to surfaced results, infrastructure " <>

@@ -607,6 +607,12 @@ defmodule Loopctl.Knowledge.RetrievalMetricsTest do
       assert {:ok, _} = RetrievalMetrics.snapshot(t.id, @day, 1800)
       %{data: [row]} = RetrievalMetrics.list_snapshots(t.id)
 
+      assert RetrievalMetrics.metric_version() == 1,
+             "the version changed — update the pinned key set below. A field DERIVED ON " <>
+               "READ (like scored_follow_through) is exempt from the bump because it is " <>
+               "computed for every row served, historical ones included, so it draws no " <>
+               "boundary in the series; a STORED figure never is. See `@metric_version`."
+
       assert Enum.sort(Map.keys(row)) == [
                :attributed_opens,
                :cross_key_opens,

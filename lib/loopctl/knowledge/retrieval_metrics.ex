@@ -71,7 +71,12 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   invariant exists to prevent. `Loopctl.TelemetryEvents.knowledge_hybrid_provenance/0`
   is where hit/miss including empties is observable.
 
-  ## Two more biases on `search_follow_through` — they point OPPOSITE ways
+  ## Two more biases on BOTH follow-through rates — they point OPPOSITE ways
+
+  `search_follow_through` and `scored_follow_through` are derived from the same
+  `with_follow_through/2` correlation, so both carry these. The upward one bites HARDEST on
+  the scored rate, whose population is exactly the reformulation-capable channel that
+  refines and re-searches.
 
   1. The #{Loopctl.Knowledge.Analytics.max_recorded_search_results()}-row recording cap
      biases it DOWN. A call that returned more results than the cap still counts in
@@ -156,20 +161,25 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   Two are published, over DIFFERENT populations, and picking the wrong one misstates agent
   behaviour by roughly 3.4x:
 
-    * `search_follow_through` — over EVERY query-bearing call, infrastructure included.
-      Use it to describe total traffic through the retrieval path. It is BLENDED, and on a
-      tenant whose automation searches on a schedule it is dominated by channels that
-      cannot follow through by construction.
+    * `search_follow_through` — over every query-bearing call that SURVIVES the
+      infrastructure exclusion. `smoke`/`skill-eval` are in NO denominator here (#673); the
+      recall hook and the session-start auto-query ARE, because their traffic is real. Use
+      it to describe total traffic through the retrieval path. It is BLENDED, and on a
+      tenant whose automation searches on a schedule those two channels — which cannot
+      follow through by construction — dominate it.
     * `scored_follow_through` — over `searches_scored`, the calls that carry a session
       identity AND come from a channel that can react to a result. **This is the rate to
       quote when the question is whether AGENTS are consuming the KB.** `nil` when nothing
-      was scoreable, never `0.0`.
+      was scoreable, never `0.0`. That nil-for-`n/a` is THIS field's alone:
+      `search_follow_through` is a non-null column and reports `0.0` on a day with no
+      qualifying searches, which is an `n/a` too — read it beside `searches`.
 
-  Measured on the live tenant for 2026-08-19..29: 10.8% blended against 38.0% scored,
-  because 78% of the calls in that window were infrastructure — 1,234 recall-hook
-  `memory_recall` calls at 3.3% and 486 smoke-test `knowledge_search` calls at 0%. An
-  independent segmentation of `search_events` by `client_host` put agent follow-through at
-  36.7%, corroborating the scored rate within 1.3 points.
+  Measured on the live tenant for 2026-08-19..29: 10.8% blended (185/1,708) against 38.0%
+  scored, because 72% of the blended denominator (1,234/1,708) was the recall hook's
+  `memory_recall` traffic at 3.3%. That window's 486 smoke-test calls are in NEITHER figure
+  — `exclude_infra_traffic/1` had already dropped them. An independent segmentation of
+  `search_events` by `client_host` put agent follow-through at 36.7%, corroborating the
+  scored rate within 1.3 points.
 
   This distinction is documented rather than assumed because leaving it to the caller
   already failed once: an audit of KB usage read the blended rate as agent behaviour and
@@ -221,6 +231,12 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   # key set `compute/3` returns, so a SHAPE change cannot land without a bump. A change of
   # MEANING that keeps the same keys — #711 was exactly that — is not mechanically detectable,
   # so it is on you: if a reader would draw a different conclusion from the same number, bump.
+  #
+  # ONE EXEMPTION, and `scored_follow_through` is why it is written down: a field DERIVED ON
+  # READ from columns already published draws no boundary in the series, because
+  # `present_snapshot/1` computes it for every row this code serves, historical rows
+  # included. A bump would manufacture a v1/v2 split whose two sides mean the same thing.
+  # Adding, removing or redefining a STORED figure is never exempt.
   #
   #   v0  rows predating this column. Definitions unknown; do not compare them with v1+.
   #   v1  post-#711/#712/#713: disposition trio partitions `searches_scored`; no curated /
@@ -617,14 +633,15 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   #
   # Why it has to be surfaced at all, given both its inputs were already published: the
   # prominent, first-named rate on this payload is `search_follow_through`, whose
-  # denominator is EVERY query-bearing call — including the two infrastructure channels
-  # that cannot follow through by construction (the injected recall hook and the
-  # session-start auto-query, excluded from the scored population by
-  # `@no_reformulation_entrypoints`). Measured on the live tenant for 2026-08-19..29:
-  # `search_follow_through` 10.8% against a scored rate of 38.0%, because 78% of the calls
-  # in that window were infrastructure. An independent segmentation of `search_events` by
-  # `client_host` put agent follow-through at 36.7% — two derivations, 1.3 points apart,
-  # and 3.4x away from the blended figure.
+  # denominator is every query-bearing call the infrastructure exclusion leaves standing —
+  # `smoke`/`skill-eval` are already gone from it, but the injected recall hook and the
+  # session-start auto-query are NOT (they are real traffic, excluded from the scored
+  # population by `@no_reformulation_entrypoints` alone) and neither can follow through by
+  # construction. Measured on the live tenant for 2026-08-19..29: `search_follow_through`
+  # 10.8% (185/1,708) against a scored rate of 38.0%, because 72% of that blended
+  # denominator (1,234/1,708) was recall-hook traffic. An independent segmentation of
+  # `search_events` by `client_host` put agent follow-through at 36.7% — two derivations,
+  # 1.3 points apart, and 3.4x away from the blended figure.
   #
   # Leaving the reader to divide the two columns themselves is not a neutral choice. It was
   # tried, with both columns documented at length, and it produced a wrong published
