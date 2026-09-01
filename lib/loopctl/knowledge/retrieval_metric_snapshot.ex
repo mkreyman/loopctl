@@ -28,13 +28,30 @@ defmodule Loopctl.Knowledge.RetrievalMetricSnapshot do
   `searched`: they aggregate different row populations, and `results_returned <
   searched` is the normal shape of a legacy-heavy or browse-heavy day.
 
-  Both ratios are gameable in the same direction — returning fewer results raises them
-  with no better retrieval — so read them with the absolute `followed_through` and the
-  volume columns, never alone. `search_follow_through` additionally carries two biases
-  that point OPPOSITE ways: the recording cap hides opens of results ranked beyond it
-  (DOWN), and one open credits every search in the window that surfaced that article
-  (UP). Full derivation, those biases, and the two structural exclusions (zero-result and
-  keyless searches) are in `Loopctl.Knowledge.RetrievalMetrics`.
+  `precision` — and `precision` ALONE — is gameable by returning fewer results: its
+  denominator counts surfaced RESULTS, so a narrower page raises the ratio with no better
+  retrieval whatsoever. The two follow-through rates divide CALL counts, which a narrower
+  page does not shrink, so they do not move that way. Read `precision` with the absolute
+  `followed_through` and the volume columns, never alone.
+
+  BOTH follow-through rates carry two biases that point OPPOSITE ways: the recording cap
+  hides opens of results ranked beyond it (DOWN), and one open credits every search in the
+  window that surfaced that article (UP). They share `with_follow_through/2`, so neither is
+  exempt — and the upward bias bites hardest on the scored rate, whose denominator is the
+  smaller of the two. Full derivation, those biases, and the two structural exclusions
+  (zero-result and keyless searches) are in `Loopctl.Knowledge.RetrievalMetrics`.
+
+  ## `scored_follow_through` is served from this schema but is NOT a column here
+
+  The payloads built from this struct carry a third rate,
+  `searches_scored_with_follow_through / searches_scored`, derived on read rather than
+  stored — a pure ratio of two columns above, so computing it at presentation time makes
+  every historical row correct with no migration. **It is the rate to quote when the
+  question is whether AGENTS are consuming the KB**, because `search_follow_through`'s
+  denominator still includes the recall-hook and session-start channels, which cannot
+  follow through by construction. `nil`, never `0.0`, when nothing was scoreable. Adding
+  a column for it would be a mistake: two sources for one number is how the published
+  figure and the stored one drift.
 
   The `curated_*`/`retrieved_*` columns were dropped in #712. They could never report
   anything: nothing has ever set `curated_at`, and the buckets filtered a `mode` tag

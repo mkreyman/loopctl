@@ -45,7 +45,24 @@ defmodule LoopctlWeb.AdminKnowledgeStatsController do
         "the row makes the most interesting one invisible.\n\n" <>
         "Rows carry their own `metric_version` and these CAN DIFFER within one response: a " <>
         "tenant not re-snapshotted since a definition change still carries the older one. " <>
-        "Compare a column across tenants only where the versions match.",
+        "Compare a column across tenants only where the versions match.\n\n" <>
+        "WHICH FOLLOW-THROUGH RATE TO QUOTE — this surface publishes BOTH per tenant, and " <>
+        "it is the one where the wrong choice does the most damage, because comparing " <>
+        "tenants is exactly what it is for. `search_follow_through` is over every " <>
+        "query-bearing call that survives the infrastructure exclusion, which still " <>
+        "INCLUDES the recall hook and the session-start auto-query — channels that emit " <>
+        "one distilled query per prompt, never see what came back, and so cannot follow " <>
+        "through by construction. It is BLENDED: use it for total traffic, and NEVER quote " <>
+        "it as agent behaviour. `scored_follow_through` is over `searches_scored` (a " <>
+        "session identity AND a channel that can react to a result) and IS the " <>
+        "agent-behaviour rate. It is `null`, never `0.0`, when nothing was scoreable — " <>
+        "zero would assert that agents searched and opened nothing when the truth is that " <>
+        "the instrument could not see, so a null row is n/a and must be excluded from a " <>
+        "comparison rather than read as a floor. Measured live for 2026-08-19..29 on one " <>
+        "tenant: 10.8% blended against 38.0% scored, a 3.4x gap, because the recall hook " <>
+        "alone was 1,234 of that window's 1,708 calls. A tenant whose automation searches " <>
+        "on a schedule will look far worse than one whose does not, on the blended rate " <>
+        "alone, with no difference in how its agents behave.",
     parameters: [
       day: [
         in: :query,
