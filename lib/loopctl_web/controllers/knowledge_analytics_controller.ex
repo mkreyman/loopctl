@@ -345,9 +345,11 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
         "shape of a legacy-heavy or browse-heavy day.\n\n" <>
         "CAVEATS — searches returning ZERO results and searches made without an api key " <>
         "are structurally unrecordable and appear in NO denominator, so every ratio here " <>
-        "is an upper bound. Every ratio here also rises when a search simply returns FEWER " <>
-        "results, with no better retrieval: never optimise them alone — read them with " <>
-        "the absolute `followed_through` and the volume fields. BOTH follow-through " <>
+        "is an upper bound. `precision` ALONE also rises when a search simply returns " <>
+        "FEWER results, with no better retrieval — its denominator counts surfaced " <>
+        "RESULTS; the two call-level rates divide CALL counts, which a narrower page " <>
+        "does not shrink. Never optimise them alone — read them with the absolute " <>
+        "`followed_through` and the volume fields. BOTH follow-through " <>
         "rates carry two further biases pointing OPPOSITE ways: the recording cap hides " <>
         "opens of results ranked beyond it (biases them DOWN on large pages), while one " <>
         "open credits EVERY search in the window that surfaced that article, not just " <>

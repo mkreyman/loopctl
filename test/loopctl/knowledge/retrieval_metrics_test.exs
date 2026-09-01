@@ -542,7 +542,7 @@ defmodule Loopctl.Knowledge.RetrievalMetricsTest do
       search_id
     end
 
-    test "is the SCORED ratio, and diverges from the blended rate when infrastructure searches",
+    test "is the SCORED ratio, and diverges from the blended rate on unscoreable channels",
          ctx do
       %{tenant: t, key: k, x: x, y: y} = ctx
 
@@ -550,8 +550,10 @@ defmodule Loopctl.Knowledge.RetrievalMetricsTest do
       scoreable_call(ctx, [x.id], ~T[10:00:00])
       event(t.id, k.id, x.id, "get", ~T[10:01:00])
 
-      # Four infrastructure searches (the recall hook's entrypoint) that never open
-      # anything — exactly the shape that dominated the live window.
+      # Four recall-hook searches that never open anything — exactly the shape that
+      # dominated the live window. `hook` is in `@no_reformulation_entrypoints`, NOT in
+      # `@infra_entrypoints`: this traffic is real, so it stays in the blended denominator
+      # and is dropped only from the scored population.
       for i <- 1..4 do
         fixture(:article_access_event, %{
           tenant_id: t.id,
@@ -580,9 +582,10 @@ defmodule Loopctl.Knowledge.RetrievalMetricsTest do
                "searched once and opened once"
 
       assert row.search_follow_through < row.scored_follow_through,
-             "the blended rate must sit BELOW the scored rate when infrastructure is " <>
-               "present; if these are equal the infrastructure exclusion has stopped " <>
-               "working and the published rate is misstating agent behaviour again"
+             "the blended rate must sit BELOW the scored rate when unscoreable channels " <>
+               "are present; if these are equal the `@no_reformulation_entrypoints` " <>
+               "filter in `reformulation_scoreable/1` has stopped narrowing the scored " <>
+               "population and the published rate is misstating agent behaviour again"
     end
 
     test "is nil, never 0.0, when nothing was scoreable", ctx do
@@ -638,6 +641,20 @@ defmodule Loopctl.Knowledge.RetrievalMetricsTest do
                "separately; this pins what callers actually receive, which is where a " <>
                "derived field like scored_follow_through lives and where its silent " <>
                "removal would otherwise go unnoticed."
+    end
+
+    test "the SUPERADMIN breakdown publishes it too — the second published shape", ctx do
+      # `present_snapshot/1` is the OTHER served shape, and the metric_version exemption
+      # rests on every served row carrying the derived field. Drop it from this path only
+      # and the superadmin dashboard falls back to the blended rate with no version bump.
+      %{tenant: t} = ctx
+      assert {:ok, _} = RetrievalMetrics.snapshot(t.id, @day, 1800)
+      %{rows: rows} = RetrievalMetrics.tenant_breakdown(day: @day)
+
+      assert rows
+             |> Enum.find(&(&1.tenant_id == t.id))
+             |> Map.fetch!(:snapshot)
+             |> Map.has_key?(:scored_follow_through)
     end
   end
 end

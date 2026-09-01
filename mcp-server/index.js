@@ -6715,9 +6715,11 @@ const TOOLS = [
       "searched: different row populations, so results_returned < searched is normal on a " +
       "legacy-heavy or browse-heavy day.\n\n" +
       "Caveats: zero-result searches and keyless searches are structurally unrecordable and " +
-      "sit in NO denominator, so every ratio here is an upper bound; and every one rises if " +
-      "a search simply returns FEWER results, with no better retrieval. Never optimise one " +
-      "alone — read them with the absolute followed_through and the volume fields. BOTH " +
+      "sit in NO denominator, so every ratio here is an upper bound; and precision ALONE " +
+      "rises if a search simply returns FEWER results, with no better retrieval — its " +
+      "denominator counts surfaced RESULTS, while the two call-level rates divide CALL " +
+      "counts, which a narrower page does not shrink. Never optimise one alone — read them " +
+      "with the absolute followed_through and the volume fields. BOTH " +
       "follow-through rates carry two further biases pointing OPPOSITE ways: the 20-row " +
       "recording cap hides opens of results ranked beyond it (DOWN on large pages), while " +
       "one open credits EVERY search in the window that surfaced that article, not just the " +
