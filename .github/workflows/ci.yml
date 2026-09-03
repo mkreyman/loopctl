@@ -178,6 +178,51 @@ jobs:
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
+          install-hex: false
+          install-rebar: false
+
+      # hex.pm is a hard dependency of every setup-beam step: the action runs
+      # `mix local.hex` on EVERY job, its default mirror list holds a single
+      # entry (https://builds.hex.pm), and Mix gives up after 60 seconds. So one
+      # bad minute on hex.pm fails a run before a line of code is compiled:
+      #
+      #   ** (Mix) request timed out after 60000ms
+      #   Could not mix hex from any hex.pm mirror
+      #
+      # — which is exactly how a three-file docs change went red on 2026-09-02.
+      #
+      # setup-beam no longer installs either archive (install-hex /
+      # install-rebar above); this step does, with three attempts and a backoff
+      # between them. The download still happens on every job, and that is the
+      # point: what was missing was never the caching, it was the retry.
+      #
+      # DELIBERATELY NOT --if-missing, even though the self-hosted runners keep
+      # MIX_HOME between jobs and it would skip the download outright. `mix
+      # local.hex --if-missing` tests `Code.ensure_loaded?(Hex)` and nothing
+      # else -- no version, no checksum -- and `mix local.rebar --if-missing` is
+      # a bare File.exists?. This unconditional install is the ONLY thing that
+      # ever overwrites those files, so skipping it converts a per-job,
+      # TLS-verified, sha512-checked refresh into an artifact written once and
+      # trusted forever, on a host where every repo's jobs run as one uid and a
+      # cancelled job can leave a half-unpacked archive that satisfies the check
+      # exactly as well as a hostile one. Two seconds a job buys that back.
+      - name: Ensure hex and rebar
+        timeout-minutes: 5
+        run: |
+          for tool in hex rebar; do
+            installed=false
+            for attempt in 1 2 3; do
+              if mix local.$tool --force; then
+                installed=true
+                break
+              fi
+              [ "$attempt" = 3 ] || sleep $((attempt * 10))
+            done
+            if [ "$installed" != true ]; then
+              echo "mix local.$tool failed after 3 attempts" >&2
+              exit 1
+            fi
+          done
 
       - name: Install dependencies
         run: mix deps.get
@@ -322,6 +367,28 @@ jobs:
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
+          install-hex: false
+          install-rebar: false
+
+      # Same reason as the first job: setup-beam's hex install is a per-job
+      # hex.pm dependency, so install only what is missing, and retry.
+      - name: Ensure hex and rebar
+        timeout-minutes: 5
+        run: |
+          for tool in hex rebar; do
+            installed=false
+            for attempt in 1 2 3; do
+              if mix local.$tool --force; then
+                installed=true
+                break
+              fi
+              [ "$attempt" = 3 ] || sleep $((attempt * 10))
+            done
+            if [ "$installed" != true ]; then
+              echo "mix local.$tool failed after 3 attempts" >&2
+              exit 1
+            fi
+          done
 
       - name: Install dependencies
         run: mix deps.get
@@ -492,6 +559,28 @@ jobs:
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
+          install-hex: false
+          install-rebar: false
+
+      # Same reason as the first job: setup-beam's hex install is a per-job
+      # hex.pm dependency, so install only what is missing, and retry.
+      - name: Ensure hex and rebar
+        timeout-minutes: 5
+        run: |
+          for tool in hex rebar; do
+            installed=false
+            for attempt in 1 2 3; do
+              if mix local.$tool --force; then
+                installed=true
+                break
+              fi
+              [ "$attempt" = 3 ] || sleep $((attempt * 10))
+            done
+            if [ "$installed" != true ]; then
+              echo "mix local.$tool failed after 3 attempts" >&2
+              exit 1
+            fi
+          done
 
       - name: Install dependencies
         run: mix deps.get
@@ -677,6 +766,28 @@ jobs:
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
+          install-hex: false
+          install-rebar: false
+
+      # Same reason as the first job: setup-beam's hex install is a per-job
+      # hex.pm dependency, so install only what is missing, and retry.
+      - name: Ensure hex and rebar
+        timeout-minutes: 5
+        run: |
+          for tool in hex rebar; do
+            installed=false
+            for attempt in 1 2 3; do
+              if mix local.$tool --force; then
+                installed=true
+                break
+              fi
+              [ "$attempt" = 3 ] || sleep $((attempt * 10))
+            done
+            if [ "$installed" != true ]; then
+              echo "mix local.$tool failed after 3 attempts" >&2
+              exit 1
+            fi
+          done
 
       - name: Install dependencies
         run: mix deps.get
@@ -743,6 +854,28 @@ jobs:
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
+          install-hex: false
+          install-rebar: false
+
+      # Same reason as the first job: setup-beam's hex install is a per-job
+      # hex.pm dependency, so install only what is missing, and retry.
+      - name: Ensure hex and rebar
+        timeout-minutes: 5
+        run: |
+          for tool in hex rebar; do
+            installed=false
+            for attempt in 1 2 3; do
+              if mix local.$tool --force; then
+                installed=true
+                break
+              fi
+              [ "$attempt" = 3 ] || sleep $((attempt * 10))
+            done
+            if [ "$installed" != true ]; then
+              echo "mix local.$tool failed after 3 attempts" >&2
+              exit 1
+            fi
+          done
 
       - name: Cache Dialyzer PLT
         uses: actions/cache@v4
@@ -791,6 +924,28 @@ jobs:
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
+          install-hex: false
+          install-rebar: false
+
+      # Same reason as the first job: setup-beam's hex install is a per-job
+      # hex.pm dependency, so install only what is missing, and retry.
+      - name: Ensure hex and rebar
+        timeout-minutes: 5
+        run: |
+          for tool in hex rebar; do
+            installed=false
+            for attempt in 1 2 3; do
+              if mix local.$tool --force; then
+                installed=true
+                break
+              fi
+              [ "$attempt" = 3 ] || sleep $((attempt * 10))
+            done
+            if [ "$installed" != true ]; then
+              echo "mix local.$tool failed after 3 attempts" >&2
+              exit 1
+            fi
+          done
 
       - name: Restore dependencies cache
         uses: actions/cache@v4
@@ -907,6 +1062,28 @@ jobs:
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
+          install-hex: false
+          install-rebar: false
+
+      # Same reason as the first job: setup-beam's hex install is a per-job
+      # hex.pm dependency, so install only what is missing, and retry.
+      - name: Ensure hex and rebar
+        timeout-minutes: 5
+        run: |
+          for tool in hex rebar; do
+            installed=false
+            for attempt in 1 2 3; do
+              if mix local.$tool --force; then
+                installed=true
+                break
+              fi
+              [ "$attempt" = 3 ] || sleep $((attempt * 10))
+            done
+            if [ "$installed" != true ]; then
+              echo "mix local.$tool failed after 3 attempts" >&2
+              exit 1
+            fi
+          done
 
       - name: Restore dependencies cache
         uses: actions/cache@v4
@@ -1173,6 +1350,28 @@ jobs:
         with:
           elixir-version: ${{ env.ELIXIR_VERSION }}
           otp-version: ${{ env.OTP_VERSION }}
+          install-hex: false
+          install-rebar: false
+
+      # Same reason as the first job: setup-beam's hex install is a per-job
+      # hex.pm dependency, so install only what is missing, and retry.
+      - name: Ensure hex and rebar
+        timeout-minutes: 5
+        run: |
+          for tool in hex rebar; do
+            installed=false
+            for attempt in 1 2 3; do
+              if mix local.$tool --force; then
+                installed=true
+                break
+              fi
+              [ "$attempt" = 3 ] || sleep $((attempt * 10))
+            done
+            if [ "$installed" != true ]; then
+              echo "mix local.$tool failed after 3 attempts" >&2
+              exit 1
+            fi
+          done
 
       - name: Install dependencies
         run: mix deps.get
