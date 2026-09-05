@@ -150,6 +150,40 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **BREAKING: `POST /api/v1/knowledge/bulk-delete` no longer accepts `confirm`, and archiving
+  by `tag` is now a two-step flow (#779).** The `confirm` parameter was a model-visible
+  authorization argument: the same request that asked for the mutation also carried its own
+  approval, so nothing outside the caller ever saw the proposal, and an agent that decided to
+  archive every article carrying a tag also decided to confirm it. It is gone.
+
+  **What breaks.** A request carrying a `confirm` key is refused with `400` and
+  `error.code: "confirm_removed"` — deliberately refused rather than ignored, so a client that
+  believes it is passing a gate learns the gate moved instead of silently sweeping a set. A
+  `tag` call with neither `dry_run` nor a replay credential is refused with `400` and
+  `error.code: "dry_run_required"`. Both codes are stable and machine-readable; the other 400s
+  on this endpoint stay uncoded.
+
+  **The new flow for `tag`, the same one the hard delete already used.** POST with
+  `dry_run: true` to get `meta.would_affect` and a single-use, TTL-bounded `meta.token` frozen
+  over the previewed id-set, then POST the same `tag` with that `token` to archive exactly that
+  set. Rows that started matching the tag after the dry-run are never touched. A selector too
+  large to freeze gets `meta.oversized` and `meta.confirm_hash` instead, echoed back with the
+  same `tag`, and the server re-resolves and refuses on any drift.
+
+  **Archive and delete proposals are not interchangeable.** They are minted with distinct token
+  types, so an archive token replayed as a hard delete, or a delete token replayed as an
+  archive, is a `400` invalid-token — the blast-radius escalation the two-step flow exists to
+  prevent. Tokens remain single-use, TTL-bounded and tenant-scoped.
+
+  **Unchanged:** the `article_ids` and `source_type`+`source_id` selectors still archive
+  immediately with no token, because each names a set the caller already holds. The role gate
+  is still `user`. The response shape is unchanged, including the backward-compatible
+  `meta.counts`/`meta.results` block.
+
+  **Client action:** upgrade `loopctl-mcp-server`; its `knowledge_bulk_delete` tool no longer
+  declares `confirm`. A hand-rolled client must drop `confirm` from every bulk-delete call and
+  add the dry-run/replay round trip for `tag` archives.
+
 - **A draft is no longer held forever: the nightly pass now publishes held drafts, and
   the weekly draft-archiving sweep is parked (#765).** Before this, `status: :draft` had
   no automatic consumer at all — 113 articles were sitting in it on 2026-08-27, growing
