@@ -246,7 +246,10 @@ defmodule LoopctlWeb.ArticleController do
            type: :object,
            properties: %{
              data: %OpenApiSpex.Schema{type: :array},
-             meta: %OpenApiSpex.Schema{type: :object}
+             meta: %OpenApiSpex.Schema{
+               type: :object,
+               properties: %{outcome: LoopctlWeb.Outcome.schema()}
+             }
            }
          }},
       400 =>

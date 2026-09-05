@@ -4123,6 +4123,11 @@ defmodule Loopctl.ApiSpec.Schemas do
         meta: %Schema{
           type: :object,
           properties: %{
+            # The uniform tool-outcome envelope. `LoopctlWeb.Outcome` publishes the enum
+            # it can actually render, so the documented values and the emitted ones are
+            # one declaration. (`Loopctl.ApiSpec` already reaches into `LoopctlWeb` for
+            # the router; this is the same direction.)
+            outcome: LoopctlWeb.Outcome.schema(),
             total_count: %Schema{type: :integer},
             fallback: %Schema{type: :boolean},
             reason: %Schema{type: :string, nullable: true},
@@ -4277,6 +4282,10 @@ defmodule Loopctl.ApiSpec.Schemas do
         meta: %Schema{
           type: :object,
           properties: %{
+            # The uniform tool-outcome envelope, derived from the degradation keys below
+            # plus the MERGED `total_count`, so it describes the whole endpoint. The
+            # per-source `memory` envelope carries its own.
+            outcome: LoopctlWeb.Outcome.schema(),
             query: %Schema{type: :string},
             project_id: %Schema{type: :string, format: :uuid, nullable: true},
             total_count: %Schema{type: :integer},

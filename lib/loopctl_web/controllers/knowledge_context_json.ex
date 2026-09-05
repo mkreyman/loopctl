@@ -7,12 +7,19 @@ defmodule LoopctlWeb.KnowledgeContextJSON do
   """
 
   alias Loopctl.Llm.Remediation
+  alias LoopctlWeb.Outcome
 
-  @doc "Renders context results with full bodies and scores."
+  @doc """
+  Renders context results with full bodies and scores.
+
+  `meta.outcome` (`LoopctlWeb.Outcome`) classifies the response uniformly with every
+  other retrieval surface, so an empty context pack is distinguishable from one whose
+  underlying search fell back to keyword-only.
+  """
   def context(%{results: results, meta: meta}) do
     %{
       data: Enum.map(results, &render_result/1),
-      meta: render_meta(meta)
+      meta: meta |> render_meta() |> Outcome.put_for(results)
     }
   end
 

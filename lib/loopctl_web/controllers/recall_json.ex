@@ -30,7 +30,7 @@ defmodule LoopctlWeb.RecallJSON do
   `degraded_reason`, a bounded tag naming why a half degraded (or `null`).
   """
 
-  alias LoopctlWeb.{KnowledgeSearchJSON, MemoryJSON}
+  alias LoopctlWeb.{KnowledgeSearchJSON, MemoryJSON, Outcome}
 
   @doc """
   Renders the merged recall: `data` (merged, re-ranked), `memory` + `knowledge`
@@ -92,5 +92,13 @@ defmodule LoopctlWeb.RecallJSON do
       # (memory absolute cosine vs knowledge pool-normalized), NOT calibrated relevance.
       results_ranking: meta.results_ranking
     }
+    # The uniform tool-outcome classification (`LoopctlWeb.Outcome`), derived from the
+    # keys immediately above and the MERGED `total_count` — so it describes the whole
+    # endpoint, which is what a caller reading the top-level meta is asking about. It is
+    # deliberately the only place `outcome` is added on this response: the per-source
+    # `memory` envelope carries its own via `MemoryJSON.recall/1`, while the `knowledge`
+    # envelope's meta goes through the shared `KnowledgeSearchJSON.render_meta/1`
+    # whitelist, which is a meta-only projection with no result count to classify from.
+    |> Outcome.put(meta.total_count)
   end
 end

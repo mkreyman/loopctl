@@ -15,7 +15,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
-import { degradedSearchNotice } from "../lib/search-notices.js";
+import { degradedSearchNotice, outcomeOf, OUTCOMES } from "../lib/search-notices.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -89,4 +89,102 @@ test("WIRING: the notice is actually prepended to tool results", () => {
   const src = readFileSync(join(here, "..", "index.js"), "utf8");
   assert.match(src, /import \{ degradedSearchNotice \} from "\.\/lib\/search-notices\.js";/);
   assert.match(src, /llmRemediationNotice\(result\) \|\| degradedSearchNotice\(result\)/);
+});
+
+// ---------------------------------------------------------------------------
+// The uniform tool-outcome envelope. `meta.outcome` is one of
+// success | empty | degraded | fallback | error, so the notice no longer infers the
+// class from per-surface flag names — and the three classes that need a remedy get
+// three DIFFERENT remedies.
+// ---------------------------------------------------------------------------
+
+test("outcome: empty gets no notice — silence is what makes it distinct from degraded", () => {
+  // The distinction still reaches the agent: the rendered JSON carries
+  // meta.outcome: "empty", while a degraded one arrives under a shouting banner.
+  assert.equal(degradedSearchNotice({ data: [], meta: { outcome: "empty" } }), null);
+  assert.equal(degradedSearchNotice({ data: [{ id: 1 }], meta: { outcome: "success" } }), null);
+});
+
+test("outcome: degraded is worded to WAIT, not to retry immediately", () => {
+  // A shed serves no substitute lane, so an immediate retry goes back into the same
+  // closed gate. Wording it as a fallback would prescribe exactly that.
+  const notice = degradedSearchNotice({
+    data: [],
+    meta: { outcome: "degraded", reason: "heavy_read_overloaded" },
+  });
+
+  assert.match(notice, /^outcome: degraded/);
+  assert.match(notice, /NOT "NO RESULTS"/);
+  assert.match(notice, /heavy_read_overloaded/);
+  assert.match(notice, /WAIT/);
+});
+
+test("outcome: degraded WITH rows says the set may be short", () => {
+  const notice = degradedSearchNotice({
+    data: [{ id: 1 }],
+    meta: { outcome: "degraded", semantic_under_filled: true },
+  });
+
+  assert.match(notice, /^outcome: degraded/);
+  assert.match(notice, /PARTIAL RESULTS/);
+  assert.match(notice, /semantic_under_filled/, "an unnamed cause is much weaker advice");
+});
+
+test("outcome: fallback keeps the do-NOT-rephrase remedy and names its class", () => {
+  const notice = degradedSearchNotice({
+    data: [],
+    meta: { outcome: "fallback", fallback_reason: "embedding_timeout" },
+  });
+
+  assert.match(notice, /^outcome: fallback/);
+  assert.match(notice, /do NOT rephrase/i);
+  assert.match(notice, /RETRY THE SAME QUERY/);
+});
+
+test("outcome: error says the retrieval never ran, so the empty proves nothing", () => {
+  const notice = degradedSearchNotice({
+    data: [],
+    meta: { outcome: "error", degraded_reason: "invalid_weights" },
+  });
+
+  assert.match(notice, /^outcome: error/);
+  assert.match(notice, /DID NOT RUN/);
+  assert.match(notice, /invalid_weights/);
+  assert.doesNotMatch(notice, /RETRY THE SAME QUERY/, "rerunning a bad request repeats it");
+});
+
+test("the BYO-key case still defers, even when the envelope classifies it", () => {
+  assert.equal(
+    degradedSearchNotice({
+      data: [],
+      meta: { outcome: "fallback", fallback_reason: "no_embedding_key" },
+    }),
+    null,
+  );
+});
+
+test("an unrecognised outcome falls back to the flag heuristics, never to an invented class", () => {
+  // A value this client does not know means a server newer than it. Making up a notice
+  // for a class we cannot interpret is worse than the pre-envelope behaviour.
+  assert.equal(outcomeOf({ meta: { outcome: "provider_error" } }), null);
+
+  const notice = degradedSearchNotice({
+    data: [],
+    meta: { outcome: "provider_error", fallback: true, fallback_reason: "embedding_timeout" },
+  });
+
+  assert.match(notice, /^DEGRADED SEARCH/, "the historical, unprefixed wording");
+});
+
+test("a pre-envelope server still gets the #658 notice, with no outcome: claim on it", () => {
+  const notice = degradedSearchNotice({
+    data: [],
+    meta: { fallback: true, fallback_reason: "embedding_timeout" },
+  });
+
+  assert.doesNotMatch(notice, /^outcome:/);
+});
+
+test("the client vocabulary is exactly the five the server publishes", () => {
+  assert.deepEqual(OUTCOMES, ["success", "empty", "degraded", "fallback", "error"]);
 });

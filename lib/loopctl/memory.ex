@@ -113,6 +113,13 @@ defmodule Loopctl.Memory do
             "real subject_id (Memory.subject_id_for/1 always returns a UUID)."
   end
 
+  # The COMPLETE bounded tag set `degraded_knowledge_env/3` may emit — one per reason in
+  # `Knowledge.search_combined/3`'s hard-error contract. Declared once here because two
+  # things read it: the clause bodies of `knowledge_degraded_reason_tag/1` (generated from
+  # this list) and `LoopctlWeb.Outcome`, which renders `meta.outcome: "error"` for exactly
+  # this envelope.
+  @knowledge_degraded_reason_tags ~w(empty_query invalid_weights bad_request)
+
   @typedoc "The pinned result envelope every read path returns."
   @type result_envelope :: %{results: list(), meta: map()}
 
@@ -125,6 +132,18 @@ defmodule Loopctl.Memory do
   """
   @spec eval_subject_id() :: String.t()
   def eval_subject_id, do: @eval_subject_id
+
+  @doc """
+  The BOUNDED, non-sensitive tags the degraded knowledge half of `recall_context/2`
+  emits when the knowledge search could not run at all (as opposed to falling back to
+  keyword-only).
+
+  Published so `LoopctlWeb.Outcome` can classify that envelope as `outcome: "error"` —
+  the retrieval never ran and an empty envelope was served in its place — without
+  keeping a second copy of the set.
+  """
+  @spec knowledge_degraded_reason_tags() :: [String.t()]
+  def knowledge_degraded_reason_tags, do: @knowledge_degraded_reason_tags
 
   # ===========================================================================
   # Write path
@@ -1504,9 +1523,14 @@ defmodule Loopctl.Memory do
   # error contract of `search_combined/3` (dialyzer-verified) — with the controller now
   # rejecting blank AND over-length queries up front, `:empty_query`/`:bad_request` are
   # unreachable via `/recall`, but any of the contract's reasons is coerced to this set.
-  defp knowledge_degraded_reason_tag(:empty_query), do: "empty_query"
-  defp knowledge_degraded_reason_tag(:invalid_weights), do: "invalid_weights"
-  defp knowledge_degraded_reason_tag(:bad_request), do: "bad_request"
+  # The clauses are GENERATED from the list `knowledge_degraded_reason_tags/0` publishes,
+  # so the tags a caller classifies on and the tags this function can emit are one
+  # declaration. `LoopctlWeb.Outcome` reads that list to render `meta.outcome: "error"`
+  # for exactly this envelope — a copy of the set there would drift the moment a fourth
+  # reason joined the contract.
+  for tag <- @knowledge_degraded_reason_tags do
+    defp knowledge_degraded_reason_tag(unquote(String.to_atom(tag))), do: unquote(tag)
+  end
 
   # Emit the merged-recall degradation signal (telemetry + log) for ONE degraded half so
   # a silent partial failure of `/recall` is alertable. `reason`/`side` are BOUNDED tags;

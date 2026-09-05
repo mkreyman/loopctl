@@ -713,6 +713,39 @@ defmodule LoopctlWeb.CorpusControllerTest do
       assert body["meta"]["lanes"] == ["keyword", "semantic"]
     end
 
+    # The uniform tool-outcome envelope on the corpus tier. An agent must be able to tell
+    # a corpus that holds nothing from a lane that could not run WITHOUT knowing that
+    # `semantic_unavailable_reason` and `semantic_under_filled` are the two keys that
+    # mean "ask again" — that is what `meta.outcome` is for.
+    test "meta.outcome separates a real hit from a corpus that genuinely holds nothing",
+         %{conn: conn} do
+      {tenant, raw_key} = keyed_tenant()
+      corpus = create_corpus!(tenant.id)
+
+      empty =
+        conn
+        |> auth(raw_key)
+        |> post(~p"/api/v1/corpora/#{corpus.id}/search", %{"query" => "taxonomy code"})
+        |> json_response(200)
+
+      assert empty["data"] == []
+      assert empty["meta"]["outcome"] == "empty"
+
+      {:ok, _result} =
+        Indexer.index_chunks(tenant.id, corpus.id, [page_chunk(1, "taxonomy code")],
+          audit: [actor_type: "api_key"]
+        )
+
+      hit =
+        conn
+        |> auth(raw_key)
+        |> post(~p"/api/v1/corpora/#{corpus.id}/search", %{"query" => "taxonomy code"})
+        |> json_response(200)
+
+      assert length(hit["data"]) == 1
+      assert hit["meta"]["outcome"] == "success"
+    end
+
     # TC-43.3.3 at the HTTP boundary: an agent reads an empty 200 as an empty corpus, so
     # a query STRING against a mode B corpus is a coded 422 naming what to send instead.
     test "a query string against a client_embedded corpus is a coded 422, not an empty 200",

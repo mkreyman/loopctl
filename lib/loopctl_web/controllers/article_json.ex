@@ -29,12 +29,17 @@ defmodule LoopctlWeb.ArticleJSON do
   When `meta.include_body` is true the full `body` is included per row (the
   response is byte-budget bounded server-side); otherwise each row is a body-less
   summary so large enumeration pages stay small.
+
+  `meta.outcome` (`LoopctlWeb.Outcome`) carries the same uniform classification the
+  retrieval surfaces do. This is the LAG-FREE enumeration path the docs send agents to
+  for existence and dedup checks, so `"empty"` here is a load-bearing answer: it means
+  the row is genuinely absent, not that a ranker missed it.
   """
   def index(%{articles: articles, meta: meta}) do
     renderer =
       if Map.get(meta, :include_body, false), do: &article_data/1, else: &article_summary/1
 
-    %{data: Enum.map(articles, renderer), meta: meta}
+    %{data: Enum.map(articles, renderer), meta: LoopctlWeb.Outcome.put_for(meta, articles)}
   end
 
   @doc """

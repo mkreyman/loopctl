@@ -72,6 +72,7 @@ defmodule LoopctlWeb.CorpusController do
   alias Loopctl.RateLimiter.FailOpenLog
   alias Loopctl.Tenants
   alias LoopctlWeb.AuditContext
+  alias LoopctlWeb.Outcome
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -586,7 +587,10 @@ defmodule LoopctlWeb.CorpusController do
                  }
                }
              },
-             meta: %OpenApiSpex.Schema{type: :object}
+             meta: %OpenApiSpex.Schema{
+               type: :object,
+               properties: %{outcome: LoopctlWeb.Outcome.schema()}
+             }
            }
          }},
       401 => {"Unauthorized", "application/json", Schemas.ErrorResponse},
@@ -622,8 +626,15 @@ defmodule LoopctlWeb.CorpusController do
       |> Enum.reject(&is_nil(elem(&1, 1)))
 
     case run_search(tenant_id, id, params, opts) do
-      {:ok, result} -> json(conn, %{data: result.results, meta: result.meta})
-      {:error, reason} -> handle_search_error(conn, reason)
+      # `meta.outcome` (`LoopctlWeb.Outcome`) is the uniform classification the knowledge
+      # and memory surfaces carry. On this tier it is what tells a short lane from an
+      # empty corpus WITHOUT the caller having to know that `semantic_unavailable_reason`
+      # and `semantic_under_filled` are the two keys that mean "ask again".
+      {:ok, result} ->
+        json(conn, %{data: result.results, meta: Outcome.put_for(result.meta, result.results)})
+
+      {:error, reason} ->
+        handle_search_error(conn, reason)
     end
   end
 

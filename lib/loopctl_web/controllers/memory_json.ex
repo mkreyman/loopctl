@@ -11,13 +11,14 @@ defmodule LoopctlWeb.MemoryJSON do
   All read paths return the pinned envelope from `Loopctl.Memory`:
 
   - `recall/1` — `%{data: [%{memory, score}], meta: %{total_count, fallback,
-    reason, underfilled}}`. `score` is `null` on the ILIKE fallback path.
+    reason, underfilled, outcome}}`. `score` is `null` on the ILIKE fallback path.
   - `index/1` — `%{data: [memory], meta: %{total_count, limit, offset}}`.
   """
 
   alias Loopctl.Memory.Memory
   alias Loopctl.Memory.SessionMemory
   alias LoopctlWeb.ArticleJSON
+  alias LoopctlWeb.Outcome
 
   @doc "Renders a single (newly written) memory."
   def show(%{memory: memory}), do: %{data: memory_data(memory)}
@@ -49,9 +50,15 @@ defmodule LoopctlWeb.MemoryJSON do
   Renders a recall result: each entry pairs the memory with its similarity
   `score` (`null` on the fallback path), preserving `meta.fallback/reason/
   underfilled` from the context faithfully (no silent hard cap).
+
+  `meta.outcome` (`LoopctlWeb.Outcome`) classifies the envelope. The memory tier is
+  the surface where this matters most: a SHED read (`reason:
+  "heavy_read_overloaded"`) sets `fallback: true` while serving no substitute lane at
+  all, so an agent reading the flag alone would retry immediately into the same closed
+  gate. It is classified `"degraded"`, and an ILIKE text-match fallback `"fallback"`.
   """
   def recall(%{results: results, meta: meta}) do
-    %{data: Enum.map(results, &recall_entry/1), meta: meta}
+    %{data: Enum.map(results, &recall_entry/1), meta: Outcome.put_for(meta, results)}
   end
 
   defp recall_entry({memory, score}), do: %{memory: memory_data(memory), score: score}

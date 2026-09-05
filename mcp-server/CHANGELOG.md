@@ -5,6 +5,40 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.79.0 — 2026-09-05 (a tool result says whether it ran, not just what it found)
+
+### Added
+
+- **`meta.outcome` on every retrieval and list response**, and a notice that acts on it.
+  The server now classifies each read on the knowledge, memory and corpus surfaces as one
+  of `success` | `empty` | `degraded` | `fallback` | `error`, with precedence
+  `error > fallback > degraded > empty > success`. A zero-result response was ambiguous
+  before: the same `data: []` means "the corpus does not hold this" and "a lane was shed,
+  ask again", and measured session transcripts show agents reading every degraded empty as
+  the first one. The signals were already in `meta`, spread across `fallback`,
+  `fallback_reason`, `degraded`, `reason`, `semantic_unavailable_reason` and
+  `semantic_under_filled` with a different key name per surface. `outcome` is the one key
+  that means the same thing everywhere.
+
+  **Three classes get a leading banner, and they get different ones because the remedies
+  differ.** `fallback` says retry the SAME query and do not reword — different words
+  cannot fix a provider timeout. `degraded` says WAIT and then retry, because a shed
+  serves no substitute lane and an immediate retry goes back into the same closed gate.
+  `error` says the retrieval never ran, so the empty envelope proves nothing about what
+  the knowledge base holds. `empty` and `success` stay silent on purpose: a banner on
+  every ordinary zero-result search is noise, and noise teaches agents to ignore the
+  channel, which is the exact fate of the `meta` fields this replaces.
+
+  Covered: `knowledge_search` (both relevance and list modes), `knowledge_list`,
+  `knowledge_context`, `knowledge_hybrid_search`, `knowledge_progressive_index`,
+  `knowledge_heat_index`, `memory_recall`, `recall_context` and `corpus_search`. Write
+  tools carry no `outcome` — it answers "can I trust this empty result set", which is a
+  question only a read has.
+
+  An unrecognised `outcome` value means a server newer than this client, and the notice
+  falls back to the pre-envelope flag heuristics rather than inventing a class it cannot
+  interpret. A server that sends no `outcome` at all keeps the historical wording.
+
 ## 2.78.0 — 2026-08-28 (the corpus tier becomes reachable from an agent)
 
 ### Added
