@@ -15,6 +15,12 @@ defmodule LoopctlWeb.ArticleControllerTest do
     put_req_header(conn, "authorization", "Bearer #{raw_key}")
   end
 
+  defp capture(raw_key, attrs) do
+    build_conn()
+    |> auth_conn(raw_key)
+    |> post(~p"/api/v1/articles", attrs)
+  end
+
   # PR B2: the create render paths emit [:loopctl, :knowledge, :article_write], folded
   # into the ingestion_write_stats rollup by the boot-attached telemetry handler (which
   # runs in this request/test process, sharing its sandbox connection).
@@ -789,6 +795,256 @@ defmodule LoopctlWeb.ArticleControllerTest do
 
       body = json_response(conn, 422)
       assert body["error"]["details"]["idempotency_key"] != nil
+    end
+  end
+
+  # loopctl deliberately stays 200-deduplicated on a body mismatch rather than 409ing
+  # it: the fleet's harvest sourcers re-run with stable keys BY DESIGN, so a refusal
+  # would break every harvest. The cost is that a genuine edit vanishes silently, and
+  # these fields are what buys it back.
+  describe "POST /api/v1/articles dedup content drift" do
+    setup do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      %{tenant: tenant, raw_key: raw_key}
+    end
+
+    test "a re-capture with identical content reports no drift and adds no drift note", %{
+      raw_key: raw_key
+    } do
+      payload = %{
+        "title" => "Drift None",
+        "body" => "the captured body",
+        "category" => "reference",
+        "idempotency_key" => "drift-none"
+      }
+
+      json_response(capture(raw_key, payload), 201)
+
+      resp = json_response(capture(raw_key, payload), 200)
+
+      assert resp["deduplicated"] == true
+      assert resp["content_drift"] == false
+      assert resp["title_drift"] == false
+      # An unchanged re-run has nothing to act on; a drift note on EVERY dedup would
+      # train a sourcer to ignore the one that matters.
+      refute resp["note"] =~ "knowledge_update"
+    end
+
+    test "surrounding whitespace alone is not drift", %{raw_key: raw_key} do
+      json_response(
+        capture(raw_key, %{
+          "title" => "Drift Whitespace",
+          "body" => "same body",
+          "category" => "reference",
+          "idempotency_key" => "drift-ws"
+        }),
+        201
+      )
+
+      resp =
+        json_response(
+          capture(raw_key, %{
+            "title" => "  Drift Whitespace ",
+            "body" => "\n same body \n",
+            "category" => "reference",
+            "idempotency_key" => "drift-ws"
+          }),
+          200
+        )
+
+      assert resp["deduplicated"] == true
+      assert resp["content_drift"] == false
+      assert resp["title_drift"] == false
+    end
+
+    test "a changed body reports content_drift, leaves the stored article unchanged, and names the id to PATCH",
+         %{raw_key: raw_key} do
+      first =
+        json_response(
+          capture(raw_key, %{
+            "title" => "Drift Body",
+            "body" => "original body",
+            "category" => "reference",
+            "idempotency_key" => "drift-body"
+          }),
+          201
+        )
+
+      id = first["data"]["id"]
+
+      resp =
+        json_response(
+          capture(raw_key, %{
+            "title" => "Drift Body",
+            "body" => "a materially different body",
+            "category" => "reference",
+            "idempotency_key" => "drift-body"
+          }),
+          200
+        )
+
+      assert resp["deduplicated"] == true
+      assert resp["content_drift"] == true
+      assert resp["title_drift"] == false
+      assert resp["data"]["id"] == id
+      assert resp["note"] =~ "NOT changed"
+      assert resp["note"] =~ "knowledge_update"
+      assert resp["note"] =~ id
+
+      # The signal is a REPORT: nothing about the stored row moved.
+      reread =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/articles/#{id}")
+        |> json_response(200)
+
+      assert reread["data"]["body"] == "original body"
+      assert reread["data"]["title"] == "Drift Body"
+    end
+
+    test "a changed title reports title_drift", %{raw_key: raw_key} do
+      json_response(
+        capture(raw_key, %{
+          "title" => "Drift Title",
+          "body" => "identical body",
+          "category" => "reference",
+          "idempotency_key" => "drift-title"
+        }),
+        201
+      )
+
+      resp =
+        json_response(
+          capture(raw_key, %{
+            "title" => "Drift Title, revised",
+            "body" => "identical body",
+            "category" => "reference",
+            "idempotency_key" => "drift-title"
+          }),
+          200
+        )
+
+      assert resp["deduplicated"] == true
+      assert resp["title_drift"] == true
+      assert resp["content_drift"] == false
+      assert resp["note"] =~ "knowledge_update"
+    end
+
+    test "both fields drifting is reported together", %{raw_key: raw_key} do
+      json_response(
+        capture(raw_key, %{
+          "title" => "Drift Both",
+          "body" => "original",
+          "category" => "reference",
+          "idempotency_key" => "drift-both"
+        }),
+        201
+      )
+
+      resp =
+        json_response(
+          capture(raw_key, %{
+            "title" => "Drift Both, renamed",
+            "body" => "rewritten",
+            "category" => "reference",
+            "idempotency_key" => "drift-both"
+          }),
+          200
+        )
+
+      assert resp["content_drift"] == true
+      assert resp["title_drift"] == true
+    end
+
+    test "the TITLE-collision dedup branch also carries the fields, both false by construction",
+         %{raw_key: raw_key} do
+      payload = %{
+        "title" => "Drift Title Collision",
+        "body" => "identical body",
+        "category" => "reference"
+      }
+
+      json_response(capture(raw_key, payload), 201)
+
+      # No idempotency_key at all — this dedups on the active-title index, which
+      # REQUIRES an identical trimmed body, so neither flag can be true here. They are
+      # still emitted so a caller reads one uniform dedup shape.
+      resp = json_response(capture(raw_key, payload), 200)
+
+      assert resp["deduplicated"] == true
+      assert resp["content_drift"] == false
+      assert resp["title_drift"] == false
+      refute resp["note"] =~ "knowledge_update"
+    end
+
+    test "drift is computed per tenant: the same key in another tenant creates, and reports nothing",
+         %{raw_key: raw_key} do
+      other_tenant = fixture(:tenant)
+      {other_key, _} = fixture(:api_key, %{tenant_id: other_tenant.id, role: :agent})
+
+      json_response(
+        capture(raw_key, %{
+          "title" => "Drift Iso",
+          "body" => "tenant A body",
+          "category" => "reference",
+          "idempotency_key" => "drift-iso"
+        }),
+        201
+      )
+
+      # Tenant B reusing the same key with different content is a CREATE, not a dedup —
+      # so there is no drift to report and nothing about tenant A leaks into it.
+      resp =
+        json_response(
+          capture(other_key, %{
+            "title" => "Drift Iso",
+            "body" => "tenant B body",
+            "category" => "reference",
+            "idempotency_key" => "drift-iso"
+          }),
+          201
+        )
+
+      refute resp["deduplicated"]
+      refute Map.has_key?(resp, "content_drift")
+      assert resp["data"]["body"] == "tenant B body"
+    end
+
+    test "#163 unchanged: a key colliding with another agent's PRIVATE article yields no dedup and no drift flags",
+         %{tenant: tenant} do
+      owner = fixture(:agent, %{tenant_id: tenant.id})
+      {other_raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      private =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          status: :published,
+          title: "Private Drift Probe",
+          body: "PRIVATE BODY",
+          idempotency_key: "drift-private",
+          metadata: %{"visibility" => "private", "agent_id" => to_string(owner.id)}
+        })
+
+      # The two lookups that can reach dedup_response are visibility-scoped, so a key
+      # colliding with a row this agent cannot see never becomes a dedup. If it ever
+      # did, content_drift would turn a guessable key into a 1-bit oracle over a
+      # private article: submit a candidate body, read whether it matched.
+      resp =
+        capture(other_raw_key, %{
+          "title" => "Private Drift Probe",
+          "body" => "a guessed body",
+          "category" => "reference",
+          "idempotency_key" => "drift-private"
+        })
+        |> json_response(422)
+
+      refute resp["deduplicated"]
+      refute Map.has_key?(resp, "content_drift")
+      refute Map.has_key?(resp, "title_drift")
+      # No existence oracle: nothing about the invisible row surfaces.
+      refute inspect(resp) =~ private.id
+      refute inspect(resp) =~ "PRIVATE BODY"
     end
   end
 

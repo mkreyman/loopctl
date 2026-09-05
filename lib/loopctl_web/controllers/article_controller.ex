@@ -122,7 +122,10 @@ defmodule LoopctlWeb.ArticleController do
                  "the existing article (200, `deduplicated: true`, id only — not its " <>
                  "body) — regardless of the body sent, and ahead of the title-conflict " <>
                  "check; a changed title/body is NOT applied (PATCH /articles/:id to " <>
-                 "change it). Use a HIGH-ENTROPY value (e.g. a content hash): it is a " <>
+                 "change it). A body/title that differs is NOT refused — a re-running " <>
+                 "sourcer would break — but it IS reported: the response carries " <>
+                 "`content_drift` / `title_drift` and a `note` naming the id to PATCH. " <>
+                 "Use a HIGH-ENTROPY value (e.g. a content hash): it is a " <>
                  "per-tenant lookup key, not a secret. Distinct from source_type/" <>
                  "source_id, which identify a shared source. Set at create time only " <>
                  "(ignored by PATCH); applies to tenant-scoped articles."
@@ -157,8 +160,38 @@ defmodule LoopctlWeb.ArticleController do
            "exists — in which case a changed title/body is NOT applied), or, with " <>
            "`skip_low_novelty: true`, a high-overlap proposal DISCARDED with " <>
            "`skipped: true` and `data: null` (no article reference — read `gate` and " <>
-           "`note` for the near-neighbour). The `note` says which.", "application/json",
-         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+           "`note` for the near-neighbour). The `note` says which. Every " <>
+           "`deduplicated: true` response also carries `content_drift` and " <>
+           "`title_drift` (booleans, compared after trimming surrounding whitespace): " <>
+           "true means the payload you just sent DIFFERS from the stored article, " <>
+           "which was left unchanged — apply it with PATCH /articles/:id if the new " <>
+           "content is the intended one. Both are false on a title+body dedup by " <>
+           "construction.", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           additionalProperties: true,
+           properties: %{
+             deduplicated: %OpenApiSpex.Schema{
+               type: :boolean,
+               description:
+                 "true when an existing article was returned unchanged and nothing was created."
+             },
+             content_drift: %OpenApiSpex.Schema{
+               type: :boolean,
+               description:
+                 "Present on every `deduplicated: true` response. true means the BODY you " <>
+                   "submitted differs (after trimming surrounding whitespace) from the stored " <>
+                   "article, which was NOT changed. Server-derived, never caller-supplied."
+             },
+             title_drift: %OpenApiSpex.Schema{
+               type: :boolean,
+               description:
+                 "Present on every `deduplicated: true` response. true means the TITLE you " <>
+                   "submitted differs (after trimming) from the stored article, which was NOT " <>
+                   "changed."
+             }
+           }
+         }},
       409 =>
         {"Title taken by an article with different content", "application/json",
          Schemas.ErrorResponse},
@@ -1033,6 +1066,25 @@ defmodule LoopctlWeb.ArticleController do
   defp dedup_response(existing, attrs, draft?) do
     key = attrs["idempotency_key"] || attrs[:idempotency_key]
 
+    # CONTENT DRIFT (server-derived, never caller-supplied): did the payload we just
+    # DISCARDED actually differ from the row we are handing back? A dedup is a no-op,
+    # so without this a writer whose content moved believes the new text is stored.
+    # loopctl deliberately stays 200-deduplicated rather than 409ing a body mismatch —
+    # the fleet's harvest sourcers re-run with stable keys BY DESIGN, so a refusal would
+    # break every harvest — and signals the drift instead, leaving the caller to choose
+    # knowledge_update. On the title-collision branch both flags are false by
+    # construction (that branch requires an identical title AND an identical trimmed
+    # body); they are still emitted so the dedup shape is uniform.
+    #
+    # This adds NO existence/content oracle over #163. Both lookups that can reach
+    # here are already visibility-scoped —
+    # `Knowledge.get_article_by_idempotency_key/3` and `get_active_article_by_title/3`
+    # take the caller's `visibility_agent_id` — so a key or title colliding with
+    # ANOTHER agent's private article never produces a dedup at all (it falls through
+    # to a generic 422). Every article these flags describe is therefore one the
+    # caller may already read in full via GET /articles/:id.
+    drift = Knowledge.dedup_drift(existing, attrs)
+
     if is_binary(key) and existing.idempotency_key == key do
       %{
         data: %{
@@ -1041,21 +1093,40 @@ defmodule LoopctlWeb.ArticleController do
           idempotency_key: existing.idempotency_key
         },
         deduplicated: true,
-        note: idempotency_dedup_note(existing)
+        note: idempotency_dedup_note(existing, drift)
       }
     else
       %{article: existing}
       |> ArticleJSON.create()
       |> Map.put(:deduplicated, true)
-      |> Map.put(:note, dedup_note(existing, draft?))
+      |> Map.put(:note, dedup_note(existing, draft?) <> drift_note(existing, drift))
     end
+    |> Map.merge(drift)
   end
 
-  defp idempotency_dedup_note(existing) do
+  defp idempotency_dedup_note(existing, drift) do
     "An article with this idempotency_key already exists (id #{existing.id}) and was " <>
       "returned unchanged — your title/body were NOT applied (the idempotency_key is the " <>
-      "article's identity). To change the existing article, PATCH /articles/:id (role :agent)."
+      "article's identity). To change the existing article, PATCH /articles/:id (role :agent)." <>
+      drift_note(existing, drift)
   end
+
+  # Appended only when the discarded payload actually differed. Silence when both flags
+  # are false is the point: a re-run that sent identical content has nothing to act on,
+  # and a note on every dedup would train callers to ignore this one.
+  defp drift_note(_existing, %{content_drift: false, title_drift: false}), do: ""
+
+  defp drift_note(existing, drift) do
+    " Your submitted #{drifted_fields(drift)} " <>
+      "#{if drift.content_drift and drift.title_drift, do: "differ", else: "differs"} from the " <>
+      "stored article, which was NOT changed. If the content you just sent is the intended " <>
+      "one, apply it with knowledge_update on article #{existing.id} " <>
+      "(PATCH /articles/#{existing.id}) — re-sending this create will keep being a no-op."
+  end
+
+  defp drifted_fields(%{content_drift: true, title_drift: true}), do: "title and body"
+  defp drifted_fields(%{content_drift: true}), do: "body"
+  defp drifted_fields(%{title_drift: true}), do: "title"
 
   # Note for the deduplicated (no-op) case. The article already existed and was
   # returned unchanged, so nothing was created OR published in this call —

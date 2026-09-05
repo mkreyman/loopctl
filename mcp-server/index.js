@@ -5143,7 +5143,11 @@ const TOOLS = [
       "existing article with the same title AND an identical body (ignoring surrounding whitespace), the " +
       "server returns that existing article idempotently (HTTP 200) instead of a 422. A same-title create " +
       "with a DIFFERENT body returns 409 title_conflict — do not retry; choose a different title or PATCH " +
-      "the existing article.",
+      "the existing article. CONTENT DRIFT: a `deduplicated: true` response may carry " +
+      "`content_drift: true` / `title_drift: true`, meaning the payload you just sent DIFFERS from the " +
+      "stored article and was DISCARDED — act on it: if the new content is the intended one, apply it " +
+      "with knowledge_update on the returned `data.id`, because re-sending this create will keep being " +
+      "a no-op.",
     inputSchema: {
       type: "object",
       properties: {
@@ -5202,7 +5206,9 @@ const TOOLS = [
           description:
             "Optional: stable per-article key for idempotent capture (max 255). Re-creating " +
             "with the same key is a no-op that returns a reference to the existing article " +
-            "(deduplicated; id only, not its body) instead of a partial duplicate. Use a " +
+            "(deduplicated; id only, not its body) instead of a partial duplicate — a changed " +
+            "body is NOT applied and NOT refused, but IS reported as content_drift so a " +
+            "re-running sourcer keeps working while a genuine edit is not lost silently. Use a " +
             "HIGH-ENTROPY value (e.g. a content hash) — it is a per-tenant lookup key, not a " +
             "secret, so a guessable key lets another agent in your tenant probe which keys " +
             "exist. Distinct from source_type/source_id (which mark a shared source).",
