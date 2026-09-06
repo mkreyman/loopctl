@@ -207,6 +207,27 @@ defmodule LoopctlWeb.CorpusControllerTest do
   end
 
   describe "GET /api/v1/corpora and /:id and /:id/status" do
+    # The corpus list is the ROUTING call: an agent runs it to decide whether this tenant
+    # holds a corpus at all, before ever searching one. It shipped with no `meta` object at
+    # all, so an empty `data` array was the only thing a caller could read and an absent
+    # `outcome` was indistinguishable from a server too old to send one. Both values are
+    # pinned so a regression that hardcodes either is caught.
+    test "the list carries meta.outcome, empty when the tenant holds no corpus", %{conn: conn} do
+      {tenant, raw_key} = keyed_tenant()
+
+      empty = conn |> auth(raw_key) |> get(~p"/api/v1/corpora") |> json_response(200)
+
+      assert empty["data"] == []
+      assert empty["meta"]["outcome"] == "empty"
+
+      _corpus = create_corpus!(tenant.id)
+
+      listed = conn |> auth(raw_key) |> get(~p"/api/v1/corpora") |> json_response(200)
+
+      assert length(listed["data"]) == 1
+      assert listed["meta"]["outcome"] == "success"
+    end
+
     test "lists, shows and reports per-source status", %{conn: conn} do
       {tenant, raw_key} = keyed_tenant()
       corpus = create_corpus!(tenant.id)
@@ -711,6 +732,39 @@ defmodule LoopctlWeb.CorpusControllerTest do
       assert String.length(result["snippet"]) <= Search.max_snippet_chars()
       refute result["snippet"] == long
       assert body["meta"]["lanes"] == ["keyword", "semantic"]
+    end
+
+    # The uniform tool-outcome envelope on the corpus tier. An agent must be able to tell
+    # a corpus that holds nothing from a lane that could not run WITHOUT knowing that
+    # `semantic_unavailable_reason` and `semantic_under_filled` are the two keys that
+    # mean "ask again" — that is what `meta.outcome` is for.
+    test "meta.outcome separates a real hit from a corpus that genuinely holds nothing",
+         %{conn: conn} do
+      {tenant, raw_key} = keyed_tenant()
+      corpus = create_corpus!(tenant.id)
+
+      empty =
+        conn
+        |> auth(raw_key)
+        |> post(~p"/api/v1/corpora/#{corpus.id}/search", %{"query" => "taxonomy code"})
+        |> json_response(200)
+
+      assert empty["data"] == []
+      assert empty["meta"]["outcome"] == "empty"
+
+      {:ok, _result} =
+        Indexer.index_chunks(tenant.id, corpus.id, [page_chunk(1, "taxonomy code")],
+          audit: [actor_type: "api_key"]
+        )
+
+      hit =
+        conn
+        |> auth(raw_key)
+        |> post(~p"/api/v1/corpora/#{corpus.id}/search", %{"query" => "taxonomy code"})
+        |> json_response(200)
+
+      assert length(hit["data"]) == 1
+      assert hit["meta"]["outcome"] == "success"
     end
 
     # TC-43.3.3 at the HTTP boundary: an agent reads an empty 200 as an empty corpus, so

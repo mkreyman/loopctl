@@ -5,6 +5,61 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.85.0 — 2026-09-05 (a tool result says whether it ran, not just what it found)
+
+### Added
+
+- **`meta.outcome` on the retrieval responses**, and a notice that acts on it.
+  The server now classifies each read on the knowledge, memory and corpus surfaces as one
+  of `success` | `empty` | `degraded` | `fallback` | `error`, with precedence
+  `error > fallback > degraded > empty > success`. A zero-result response was ambiguous
+  before: the same `data: []` means "the corpus does not hold this" and "a lane was shed,
+  ask again", and measured session transcripts show agents reading every degraded empty as
+  the first one. The signals were already in `meta`, spread across `fallback`,
+  `fallback_reason`, `degraded`, `reason`, `semantic_unavailable_reason` and
+  `semantic_under_filled` with a different key name per surface. `outcome` is the one key
+  that means the same thing everywhere.
+
+  **Three classes get a leading banner, and they get different ones because the remedies
+  differ.** `fallback` says retry the SAME query and do not reword — different words
+  cannot fix a provider timeout. `degraded` says WAIT and then retry, because a shed
+  serves no substitute lane and an immediate retry goes back into the same closed gate —
+  except for the STANDING backend conditions no wait clears
+  (`ann_iterative_scan_unavailable`, `embedding_dimension_mismatch`), which get a remedy
+  that says so instead. `error` says the retrieval never ran,
+  so the empty envelope proves nothing about what the knowledge base holds. `empty` and
+  `success` stay silent on purpose: a banner on every ordinary zero-result search is
+  noise, and noise teaches agents to ignore the channel, which is the exact fate of the
+  `meta` fields this replaces.
+
+  `meta.outcome` is carried by EVERY read on these surfaces: the retrieval tools
+  (`knowledge_search` in both relevance and list modes, `knowledge_context`,
+  `knowledge_hybrid_search`, `knowledge_progressive_index`, `knowledge_heat_index`,
+  `memory_recall`, `recall_context`, `corpus_search`), the enumerations
+  (`knowledge_list`, `knowledge_index`, `memory_list`, `corpus_list`), the review queues
+  (`GET /knowledge/drafts`, `GET /knowledge/conflicts`) and the suggested-links read.
+  Write tools carry none — it answers "can I trust this empty result set", which is a
+  question only a read has.
+
+  **The catalog endpoints were excluded in the first draft of this and should not have
+  been.** They disclose no degradation of their own, so their `outcome` is only ever
+  `empty` or `success` — true of the VALUE and irrelevant to the KEY. A client cannot see
+  a per-endpoint opt-out: an absent `outcome` means "this endpoint declined to classify"
+  and "this server predates the envelope" at once, and this client's own `outcomeOf`
+  collapses both to `null`. Absence now has exactly one meaning: an old server.
+
+  **The banner fires on every read that can report a degradation.** The first draft
+  printed it on `knowledge_search`, `knowledge_hybrid_search` and `knowledge_context`
+  only, and left six handlers ending at a bare `toContent` — so on the MEMORY surface,
+  the one this README calls out as where outcome matters most, a shed read still looked
+  exactly like an empty scope. `knowledge_list`, `knowledge_progressive_index`,
+  `knowledge_heat_index`, `memory_recall`, `recall_context` and `corpus_search` now
+  print it too.
+
+  An unrecognised `outcome` value means a server newer than this client, and the notice
+  falls back to the pre-envelope flag heuristics rather than inventing a class it cannot
+  interpret. A server that sends no `outcome` at all keeps the historical wording.
+
 ## 2.80.0 — 2026-09-05 (a destructive tool stops carrying its own approval)
 
 ### Changed

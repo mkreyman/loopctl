@@ -80,6 +80,7 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
              meta: %OpenApiSpex.Schema{
                type: :object,
                properties: %{
+                 outcome: LoopctlWeb.Outcome.schema(),
                  top_k: %OpenApiSpex.Schema{type: :integer},
                  candidate_count: %OpenApiSpex.Schema{type: :integer},
                  truncated: %OpenApiSpex.Schema{type: :boolean}
@@ -190,7 +191,10 @@ defmodule LoopctlWeb.KnowledgeProgressiveController do
            type: :object,
            properties: %{
              data: %OpenApiSpex.Schema{type: :array, items: %OpenApiSpex.Schema{type: :object}},
-             meta: %OpenApiSpex.Schema{type: :object}
+             meta: %OpenApiSpex.Schema{
+               type: :object,
+               properties: %{outcome: LoopctlWeb.Outcome.schema()}
+             }
            }
          }},
       400 => {"Invalid parameter", "application/json", Schemas.ErrorResponse},

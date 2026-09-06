@@ -49,6 +49,7 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   alias LoopctlWeb.AuditContext
   alias LoopctlWeb.Helpers.Pagination
   alias LoopctlWeb.Helpers.Visibility
+  alias LoopctlWeb.Outcome
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -290,7 +291,10 @@ defmodule LoopctlWeb.ArticleWorkflowController do
            type: :object,
            properties: %{
              data: %OpenApiSpex.Schema{type: :array},
-             meta: %OpenApiSpex.Schema{type: :object}
+             meta: %OpenApiSpex.Schema{
+               type: :object,
+               properties: %{outcome: LoopctlWeb.Outcome.schema()}
+             }
            }
          }},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
@@ -330,7 +334,10 @@ defmodule LoopctlWeb.ArticleWorkflowController do
            type: :object,
            properties: %{
              data: %OpenApiSpex.Schema{type: :array},
-             meta: %OpenApiSpex.Schema{type: :object}
+             meta: %OpenApiSpex.Schema{
+               type: :object,
+               properties: %{outcome: LoopctlWeb.Outcome.schema()}
+             }
            }
          }},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
@@ -1026,7 +1033,7 @@ defmodule LoopctlWeb.ArticleWorkflowController do
 
       json(conn, %{
         data: Enum.map(result.data, &ArticleJSON.article_data/1),
-        meta: result.meta
+        meta: Outcome.put_for(result.meta, result.data)
       })
     end
   end
@@ -1049,7 +1056,7 @@ defmodule LoopctlWeb.ArticleWorkflowController do
 
       result = Knowledge.list_potential_conflicts(tenant_id, opts)
 
-      json(conn, result)
+      json(conn, %{result | meta: Outcome.put_for(result.meta, result.data)})
     end
   end
 

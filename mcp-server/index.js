@@ -1590,7 +1590,10 @@ async function knowledgeProgressiveIndex({ topic, query, category, limit }) {
     null,
     process.env.LOOPCTL_AGENT_KEY,
   );
-  return toContent(result);
+  // A topic browse is a RETRIEVAL: it runs the same ranked pool, so it can come back
+  // short or keyword-only. Without the banner a shed index reads as "the KB has no
+  // articles on this topic", which is the exact misread meta.outcome exists to end.
+  return withRemediationNotice(result);
 }
 
 async function knowledgeHeatIndex({ category, limit, since }) {
@@ -1605,7 +1608,9 @@ async function knowledgeHeatIndex({ category, limit, since }) {
     null,
     process.env.LOOPCTL_AGENT_KEY,
   );
-  return toContent(result);
+  // The query-free route, reached for precisely when the query-shaped ones came back
+  // empty — so an unannounced degradation here strands the agent with no route left.
+  return withRemediationNotice(result);
 }
 
 async function knowledgeProgressiveDrill({ article_id, body_max_bytes, body_offset }) {
@@ -1661,7 +1666,9 @@ async function knowledgeList({
     null,
     process.env.LOOPCTL_AGENT_KEY,
   );
-  return toContent(result);
+  // Enumeration, not ranking — but a short page still under-reports the set, and an
+  // agent enumerating to decide something absent is the caller least able to tell.
+  return withRemediationNotice(result);
 }
 
 async function knowledgeGet({
@@ -1837,9 +1844,11 @@ async function memoryRecall({ query, limit, include_superseded }) {
     process.env.LOOPCTL_AGENT_KEY,
   );
   // Surface meta (fallback/reason/total_count/underfilled) so the caller can tell
-  // a degraded recall from a genuinely empty scope (AC-28.4.4) — toContent already
-  // preserves the full result (data + meta), we just keep this call explicit.
-  return toContent(result);
+  // a degraded recall from a genuinely empty scope (AC-28.4.4). meta alone was not
+  // enough: agents do not read it, which is the whole finding behind the banner. On
+  // the MEMORY surface a shed read otherwise looks identical to an empty scope, and
+  // "I have never been told this" is the most consequential thing to get wrong here.
+  return withRemediationNotice(result);
 }
 
 async function recallContext({ query, project_id, limit }) {
@@ -1858,8 +1867,11 @@ async function recallContext({ query, project_id, limit }) {
     process.env.LOOPCTL_AGENT_KEY,
   );
   // Surface both per-source metas (memory fallback/underfilled + knowledge degraded)
-  // so the caller can tell a degraded recall from a genuinely empty scope.
-  return toContent(result);
+  // so the caller can tell a degraded recall from a genuinely empty scope. The merged
+  // meta can carry ONE half's failure beside the other half's rows, which the server
+  // classifies "degraded" — a banner is the only place a caller sees that the pack it
+  // is about to act on is a half.
+  return withRemediationNotice(result);
 }
 
 async function memoryList({ limit, offset, include_superseded, all_subjects }) {
@@ -3076,8 +3088,10 @@ async function corpusSearch({ corpus_id, query, query_vector, lanes, limit }) {
     process.env.LOOPCTL_AGENT_KEY,
   );
   // Pointers + snippets only — the caller's next step is to open the file at
-  // source_ref/locator. Nothing here is auto-injected into a recall pack.
-  return toContent(result);
+  // source_ref/locator. Nothing here is auto-injected into a recall pack, so a
+  // degradation nobody announces is never noticed downstream either: this banner is
+  // the only disclosure a corpus read gets.
+  return withRemediationNotice(result);
 }
 
 async function corpusStatus({ corpus_id, limit, offset }) {
