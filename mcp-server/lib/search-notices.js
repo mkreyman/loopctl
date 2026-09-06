@@ -16,15 +16,17 @@
  * The remedy the agent needs is the opposite of the obvious one: do NOT rephrase. Different
  * words cannot fix a provider timeout. Retry the SAME query.
  *
- * WHAT `meta.outcome` ADDS. Every retrieval and list response on the knowledge, memory and
- * corpus surfaces now carries one of `success | empty | degraded | fallback | error`, so the
- * notice no longer has to infer the class from a handful of per-surface flag names. Three
- * classes get a notice, and they get DIFFERENT ones because the remedies differ:
+ * WHAT `meta.outcome` ADDS. The knowledge, memory and corpus RETRIEVAL responses (plus the
+ * `knowledge_list` enumeration path) now carry one of `success | empty | degraded |
+ * fallback | error`, so the notice no longer has to infer the class from a handful of
+ * per-surface flag names. Three classes get a notice, and they get DIFFERENT ones because
+ * the remedies differ:
  *
  *   - `fallback` — the semantic lane died, keyword-only was served. Retry the SAME query.
  *   - `degraded` — a half was shed or capacity-limited. WAIT, then retry. Retrying at once
  *     goes straight back into the same closed gate, which is why this is not worded as a
- *     fallback.
+ *     fallback. One cause is STANDING rather than transient (`ann_iterative_scan_unavailable`)
+ *     and gets a remedy that does not prescribe a wait no wait can clear.
  *   - `error`    — the retrieval never ran; the empty envelope is a placeholder and says
  *     NOTHING about what the corpus holds.
  *
@@ -104,7 +106,30 @@ function fallbackNotice(reason, count) {
   );
 }
 
+/**
+ * A degradation that WAITING cannot clear, so the notice must not prescribe a wait.
+ *
+ * `ann_iterative_scan: "unavailable"` means the deployed pgvector ran the vector read
+ * without the iterative scan the operator enabled, and the tenant filter was applied
+ * after a single index batch — so the page may be short. The conclusive cause (pgvector
+ * < 0.8, or the extension absent) stands until the extension is upgraded; retrying
+ * re-runs the identical starved scan and burns a heavy read for nothing.
+ */
+const STANDING_REASON = "ann_iterative_scan_unavailable";
+
 function degradedNotice(reason, count) {
+  if (reason === STANDING_REASON) {
+    const scope = count === 0 ? `THIS IS NOT "NO RESULTS"` : `PARTIAL RESULTS`;
+
+    return (
+      `outcome: degraded — ${scope}. The vector read ran without pgvector's iterative ` +
+      `scan (${reason}), so it may have returned FEWER rows than match and its absences ` +
+      `prove nothing. Retrying re-runs the same scan and does NOT clear this — it is a ` +
+      `standing backend condition an operator has to fix. Use what you got, widen the ` +
+      `filters, or reach for a non-vector route (knowledge_list, knowledge_heat_index).`
+    );
+  }
+
   if (count === 0) {
     return (
       `outcome: degraded — THIS IS NOT "NO RESULTS". A half of this retrieval was shed or ` +

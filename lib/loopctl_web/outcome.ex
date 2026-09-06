@@ -1,7 +1,9 @@
 defmodule LoopctlWeb.Outcome do
   @moduledoc """
-  ONE derivation of `meta.outcome` — the uniform tool-outcome envelope every
-  retrieval and list response on the knowledge, memory and corpus surfaces carries.
+  ONE derivation of `meta.outcome` — the uniform tool-outcome envelope the knowledge,
+  memory and corpus RETRIEVAL responses carry, plus the `knowledge_list` enumeration
+  path. The catalog/list endpoints that disclose no degradation of their own
+  (`knowledge_index`, `memory_list`, `corpus_list`, drafts, conflicts) do NOT carry it.
 
   The idea is borrowed from MemoRizz v0.8.0 (RichmondAlake), whose every tool
   execution returns a content-free outcome so an agent never has to parse prose to
@@ -25,9 +27,9 @@ defmodule LoopctlWeb.Outcome do
 
   | outcome | what happened | what the caller should do |
   |---|---|---|
-  | `"success"` | ran fully, returned rows | use them |
-  | `"empty"` | ran fully, matched nothing | a real miss — re-route or accept it |
-  | `"degraded"` | a half was shed or capacity-limited | this set may be SHORT; wait, then retry |
+  | `"success"` | ran fully; this page carries rows, or an earlier one did | use them |
+  | `"empty"` | ran fully and the whole matched set is empty | a real miss — re-route or accept it |
+  | `"degraded"` | a half was shed, capacity-limited or scan-starved | this set may be SHORT; wait, then retry — except an `ann_iterative_scan` gap, which only an operator clears |
   | `"fallback"` | the semantic lane was unavailable, keyword-only was served | retry the SAME query, never reword |
   | `"error"` | the retrieval could not run; an empty envelope was served in its place | fix the request, then retry |
 
@@ -37,13 +39,19 @@ defmodule LoopctlWeb.Outcome do
   once (a degraded response usually also has zero results), and the strongest wins.
 
   There is exactly ONE deviation from that order, and it is deliberate: a CAPACITY
-  SHED (reason `heavy_read_overloaded`) is classified `"degraded"` BEFORE the
-  `fallback` flag is consulted. It has to be, because the memory tier's shed envelope
-  sets `fallback: true` while serving no substitute lane at all. The flag names the
-  transport; the REASON names the remedy, and capacity's remedy is to WAIT, which is
-  not the remedy for a broken embedding lane. An agent that reads a shed as
-  `"fallback"` retries immediately into the same closed gate. Every other degradation
-  signal is consulted AFTER `fallback`, exactly as the order above says.
+  SHED (reason `heavy_read_overloaded`) that served NO SUBSTITUTE LANE is classified
+  `"degraded"` BEFORE the `fallback` flag is consulted. It has to be, because the memory
+  tier's shed envelope sets `fallback: true` while serving nothing at all. The flag names
+  the transport; the REASON names the remedy, and capacity's remedy is to WAIT, which is
+  not the remedy for a broken embedding lane. An agent that reads a shed as `"fallback"`
+  retries immediately into the same closed gate.
+
+  The "served no substitute lane" half is load-bearing: the KNOWLEDGE tier sheds the
+  semantic lane under the same tag and DOES serve keyword-only (`search_mode:
+  "keyword_only"`), and that response's remedy is the fallback one — retry the same query,
+  never reword, because the keyword lane ANDs its terms. Classifying it `"degraded"` cost
+  it exactly that sentence. Every other degradation signal is consulted AFTER `fallback`,
+  exactly as the order above says.
 
   ## Write paths get nothing
 
@@ -61,6 +69,12 @@ defmodule LoopctlWeb.Outcome do
   # producers are string literals too (`Loopctl.Memory.overloaded_memory_env/2`,
   # `Knowledge.reason_to_tag/1`); there is no shared constant to read it from.
   @capacity_reason "heavy_read_overloaded"
+
+  # The memory tier's "the read did not run and nothing was served in its place" tags,
+  # read from the module that PRODUCES them. They arrive under `:reason` (and, on the
+  # merged `/recall` meta, `:degraded_reason`) rather than the knowledge tier's
+  # `:fallback_reason`, so they are matched on their own keys — see `request_error?/1`.
+  @memory_unavailable_reasons Loopctl.Memory.memory_unavailable_reason_tags()
 
   @outcomes ~w(success empty degraded fallback error)
 
@@ -104,7 +118,7 @@ defmodule LoopctlWeb.Outcome do
       capacity_shed?(meta) -> "degraded"
       lane_fallback?(meta) -> "fallback"
       short_lane?(meta) -> "degraded"
-      count == 0 -> "empty"
+      matched_nothing?(meta, count) -> "empty"
       true -> "success"
     end
   end
@@ -138,16 +152,23 @@ defmodule LoopctlWeb.Outcome do
   # embedding/capacity vocabulary that does not overlap this one today; matching
   # against them anyway would make a future tag collision silently reclassify a served
   # half as a request that never ran.
+  #
+  # The MEMORY tier's own unrunnable envelope is matched here too, on ITS keys: it sets
+  # `fallback: true` with zero rows and no text-match lane, so reading the flag alone
+  # classified a persistent configuration fault as `"fallback"` and told the agent to
+  # retry the identical query forever.
   defp request_error?(meta) do
-    [meta[:fallback_reason], meta[:degraded_reason]]
-    |> Enum.filter(&is_binary/1)
-    |> Enum.any?(&(&1 in @request_error_reasons))
+    Enum.any?([meta[:fallback_reason], meta[:degraded_reason]], &(&1 in @request_error_reasons)) or
+      Enum.any?([meta[:reason], meta[:degraded_reason]], &(&1 in @memory_unavailable_reasons))
   end
 
   # Capacity, not correctness — and the ONE signal read ahead of `fallback` (see the
-  # moduledoc's precedence note). A shed heavy read serves no substitute lane, so the
-  # remedy is to WAIT, not to retry a different ranking.
-  defp capacity_shed?(meta), do: @capacity_reason in reasons(meta)
+  # moduledoc's precedence note). A shed that served no substitute lane leaves the caller
+  # nothing, so the remedy is to WAIT rather than to retry a different ranking. A shed the
+  # KNOWLEDGE tier answered with keyword-only is NOT this case: it declares the lane it
+  # served under `search_mode`, and its remedy is the fallback one.
+  defp capacity_shed?(meta),
+    do: @capacity_reason in reasons(meta) and meta[:search_mode] != "keyword_only"
 
   # The documented fallback: semantic ranking was unavailable and a keyword/text-match
   # lane was served in its place. `fallback` is the knowledge/memory flag; `degraded` is
@@ -189,6 +210,16 @@ defmodule LoopctlWeb.Outcome do
     ]
     |> Enum.filter(&is_binary/1)
   end
+
+  # A REAL miss: no rows, and not merely a page walked past the end. `count` is the PAGE,
+  # not the matched set, and on the offset-paginated surfaces an empty page over a
+  # non-empty set told an agent doing an existence check the row is absent while
+  # `total_count` beside it said otherwise. `offset` is the discriminator rather than
+  # `total_count`, because in relevance mode `total_count` counts a pool
+  # (`total_count_scope`) and not the matches.
+  defp matched_nothing?(meta, count), do: count == 0 and not past_end?(meta)
+
+  defp past_end?(meta), do: is_integer(meta[:offset]) and meta[:offset] > 0
 
   defp present?(value), do: is_binary(value) and value != ""
 end

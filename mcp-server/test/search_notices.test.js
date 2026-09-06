@@ -185,6 +185,30 @@ test("a pre-envelope server still gets the #658 notice, with no outcome: claim o
   assert.doesNotMatch(notice, /^outcome:/);
 });
 
-test("the client vocabulary is exactly the five the server publishes", () => {
-  assert.deepEqual(OUTCOMES, ["success", "empty", "degraded", "fallback", "error"]);
+test("the client vocabulary is exactly what the SERVER publishes", () => {
+  // Asserting the list against a hardcoded copy of itself could only go red when someone
+  // edited OUTCOMES — the one change they would also update the test for. Read the
+  // server's own declaration instead, so a sixth value added there fails HERE, where
+  // outcomeOf() would otherwise silently return null and drop the notice.
+  const src = readFileSync(join(here, "..", "..", "lib", "loopctl_web", "outcome.ex"), "utf8");
+  const declared = src.match(/@outcomes ~w\(([^)]+)\)/);
+
+  assert.ok(declared, "LoopctlWeb.Outcome must declare @outcomes ~w(...)");
+  assert.deepEqual(OUTCOMES, declared[1].trim().split(/\s+/));
+});
+
+test("a standing pgvector condition is not told to wait for what a wait cannot clear", () => {
+  // ann_iterative_scan "unavailable" stands until the extension is upgraded. Prescribing
+  // "wait a few seconds, then retry" loops the agent forever on a heavy vector read.
+  for (const count of [0, 5]) {
+    const notice = degradedSearchNotice({
+      data: Array.from({ length: count }, (_, i) => ({ id: i })),
+      meta: { outcome: "degraded", ann_iterative_scan: "unavailable" },
+    });
+
+    assert.match(notice, /^outcome: degraded/);
+    assert.match(notice, /ann_iterative_scan_unavailable/, "the cause must be named");
+    assert.match(notice, /does NOT clear this/);
+    assert.doesNotMatch(notice, /[Ww]ait a few seconds/);
+  }
 });

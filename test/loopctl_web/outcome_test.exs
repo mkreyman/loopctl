@@ -40,6 +40,31 @@ defmodule LoopctlWeb.OutcomeTest do
       assert Outcome.derive(%{}, 0) == "empty"
       assert Outcome.derive(%{}, 1) == "success"
     end
+
+    test "a page walked PAST THE END is success, never empty - exhaustion is not absence" do
+      # `count` is the PAGE. On the offset-paginated surfaces an empty page over a
+      # non-empty set said "the row is genuinely absent" to an agent doing an existence
+      # check, while `total_count` in the same meta said it is not.
+      assert Outcome.derive(%{total_count: 42, limit: 10, offset: 90}, 0) == "success"
+
+      assert Outcome.derive(%{total_count: 5, limit: 20, offset: 100, include_body: false}, 0) ==
+               "success"
+
+      # Offset zero is a real miss and stays one.
+      assert Outcome.derive(%{total_count: 0, limit: 10, offset: 0}, 0) == "empty"
+    end
+
+    test "an exhausted page never masks a degradation" do
+      meta = %{
+        total_count: 42,
+        limit: 10,
+        offset: 90,
+        fallback: true,
+        fallback_reason: "embedding_timeout"
+      }
+
+      assert Outcome.derive(meta, 0) == "fallback"
+    end
   end
 
   describe "derive/2 — fallback" do
@@ -123,6 +148,22 @@ defmodule LoopctlWeb.OutcomeTest do
       meta = %{lanes: ["semantic"], keyword_unavailable_reason: "heavy_read_overloaded"}
       assert Outcome.derive(meta, 3) == "degraded"
     end
+
+    test "a KNOWLEDGE shed that DID serve keyword-only is a fallback, not a shed" do
+      # The precedence deviation is bounded by "served no substitute lane". The knowledge
+      # tier sheds the semantic lane under the SAME tag and answers with keyword-only, and
+      # that response needs the fallback remedy - retry the same query, never reword,
+      # because the keyword lane ANDs its terms. Classifying it degraded cost it exactly
+      # that sentence.
+      meta = %{
+        fallback: true,
+        fallback_reason: "heavy_read_overloaded",
+        search_mode: "keyword_only"
+      }
+
+      assert Outcome.derive(meta, 3) == "fallback"
+      assert Outcome.derive(meta, 0) == "fallback"
+    end
   end
 
   describe "derive/2 — error" do
@@ -137,6 +178,22 @@ defmodule LoopctlWeb.OutcomeTest do
 
     test "the contract is non-empty, so the loop above is never vacuous" do
       refute Loopctl.Memory.knowledge_degraded_reason_tags() == []
+    end
+
+    test "the memory envelope that could not run at all is an error, not a fallback" do
+      # `Loopctl.Memory.unavailable_memory_env/3` verbatim: zero rows, `fallback: true`,
+      # and NO substitute lane. Read as a fallback it told the agent to retry the same
+      # query forever against a persistent configuration fault only an operator clears.
+      for tag <- Loopctl.Memory.memory_unavailable_reason_tags() do
+        meta = %{total_count: 0, fallback: true, reason: tag, underfilled: true}
+        assert Outcome.derive(meta, 0) == "error"
+
+        assert Outcome.derive(%{degraded: true, degraded_reason: tag}, 0) == "error"
+      end
+    end
+
+    test "the memory unavailable set is non-empty, so the loop above is never vacuous" do
+      refute Loopctl.Memory.memory_unavailable_reason_tags() == []
     end
 
     test "an error tag arriving on a LANE key is not a request error" do

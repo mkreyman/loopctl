@@ -1,12 +1,14 @@
 defmodule LoopctlWeb.OutcomeSurfacesTest do
   @moduledoc """
-  Every retrieval and list VIEW on the knowledge, memory and corpus surfaces renders
-  `meta.outcome`.
+  The retrieval VIEWS that carry `meta.outcome` render it.
 
   The unit tests in `LoopctlWeb.OutcomeTest` prove the classification; these prove it
-  is actually WIRED, which is the failure a shared helper invites — one view is added
-  later and quietly ships without the key, and the uniformity the envelope exists for
-  is gone with no test failing.
+  is actually WIRED on each view listed below, which is the failure a shared helper
+  invites — a view is changed later and quietly stops rendering the key.
+
+  The table is HAND-MAINTAINED, so it cannot catch a NEW surface that ships without the
+  key; the guarantee it gives is over the surfaces the docs name (`mcp-server/README.md`),
+  and the catalog endpoints that carry no `outcome` are absent on purpose.
   """
   use LoopctlWeb.ConnCase, async: true
 

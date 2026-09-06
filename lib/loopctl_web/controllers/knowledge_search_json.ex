@@ -55,9 +55,9 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
   - `byte_truncated` — whether the page was shortened by the serialized-body byte
     budget (US-27.10). Only ever `true` when `include_body` is `true`.
   - `outcome` — the uniform tool-outcome envelope (`LoopctlWeb.Outcome`). A keyset
-    page discloses no degradation, so it is only ever `"empty"` or `"success"` —
-    which is exactly the value of having the key here: an empty page on this path
-    is ALWAYS a real exhaustion, and the caller learns that without a special case.
+    page discloses no degradation and carries no `offset`, so it is only ever
+    `"empty"` or `"success"` — and because the walk always keeps at least one row
+    while rows remain, `"empty"` on this path is a genuinely empty filtered set.
 
   When `include_body: true`, the CONTEXT (`Loopctl.Knowledge.list_keyset/2`) has
   already trimmed the page to `full_content_byte_budget/0` and recomputed

@@ -33,7 +33,8 @@ defmodule LoopctlWeb.ArticleJSON do
   `meta.outcome` (`LoopctlWeb.Outcome`) carries the same uniform classification the
   retrieval surfaces do. This is the LAG-FREE enumeration path the docs send agents to
   for existence and dedup checks, so `"empty"` here is a load-bearing answer: it means
-  the row is genuinely absent, not that a ranker missed it.
+  the filtered set is genuinely empty, not that a ranker missed it. A page walked past
+  the end of a non-empty set is `"success"`, never `"empty"` — exhaustion is not absence.
   """
   def index(%{articles: articles, meta: meta}) do
     renderer =

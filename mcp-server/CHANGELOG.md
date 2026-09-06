@@ -9,7 +9,7 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Added
 
-- **`meta.outcome` on every retrieval and list response**, and a notice that acts on it.
+- **`meta.outcome` on the retrieval responses**, and a notice that acts on it.
   The server now classifies each read on the knowledge, memory and corpus surfaces as one
   of `success` | `empty` | `degraded` | `fallback` | `error`, with precedence
   `error > fallback > degraded > empty > success`. A zero-result response was ambiguous
@@ -23,17 +23,23 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   **Three classes get a leading banner, and they get different ones because the remedies
   differ.** `fallback` says retry the SAME query and do not reword — different words
   cannot fix a provider timeout. `degraded` says WAIT and then retry, because a shed
-  serves no substitute lane and an immediate retry goes back into the same closed gate.
-  `error` says the retrieval never ran, so the empty envelope proves nothing about what
-  the knowledge base holds. `empty` and `success` stay silent on purpose: a banner on
-  every ordinary zero-result search is noise, and noise teaches agents to ignore the
-  channel, which is the exact fate of the `meta` fields this replaces.
+  serves no substitute lane and an immediate retry goes back into the same closed gate —
+  except for `ann_iterative_scan_unavailable`, a STANDING backend condition no wait
+  clears, which gets a remedy that says so instead. `error` says the retrieval never ran,
+  so the empty envelope proves nothing about what the knowledge base holds. `empty` and
+  `success` stay silent on purpose: a banner on every ordinary zero-result search is
+  noise, and noise teaches agents to ignore the channel, which is the exact fate of the
+  `meta` fields this replaces.
 
-  Covered: `knowledge_search` (both relevance and list modes), `knowledge_list`,
-  `knowledge_context`, `knowledge_hybrid_search`, `knowledge_progressive_index`,
-  `knowledge_heat_index`, `memory_recall`, `recall_context` and `corpus_search`. Write
-  tools carry no `outcome` — it answers "can I trust this empty result set", which is a
-  question only a read has.
+  `meta.outcome` is carried by: `knowledge_search` (both relevance and list modes),
+  `knowledge_list`, `knowledge_context`, `knowledge_hybrid_search`,
+  `knowledge_progressive_index`, `knowledge_heat_index`, `memory_recall`,
+  `recall_context` and `corpus_search`. The BANNER is printed by `knowledge_search`,
+  `knowledge_hybrid_search` and `knowledge_context` only; on the rest the value is in
+  `meta` and a client must read it. The catalog endpoints (`knowledge_index`,
+  `memory_list`, `corpus_list`) disclose no degradation of their own and carry no
+  `outcome`, and neither do write tools — it answers "can I trust this empty result
+  set", which is a question only a read has.
 
   An unrecognised `outcome` value means a server newer than this client, and the notice
   falls back to the pre-envelope flag heuristics rather than inventing a class it cannot

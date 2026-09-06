@@ -144,6 +144,18 @@ defmodule Loopctl.Memory do
   @knowledge_degraded_reason_tags Enum.map(@knowledge_degraded_reasons, &Atom.to_string/1) ++
                                     [@knowledge_degraded_fallback_tag]
 
+  # The `meta.reason` tags the MEMORY half publishes when its read DID NOT RUN — zero
+  # rows and NO substitute lane served in place of the ranking asked for. That is the
+  # line, not the `fallback: true` flag: the ILIKE text-match fallback sets the same flag
+  # and DID serve a lane, so its remedy is "retry the same query" while these need an
+  # operator. `@memory_capacity_reason` is the shed (`overloaded_memory_env/2`, remedy:
+  # wait); `@memory_unavailable_reasons` are `unavailable_memory_env/3`'s configuration
+  # faults, which never self-heal.
+  @memory_capacity_reason "heavy_read_overloaded"
+  @memory_dimension_mismatch_reason "embedding_dimension_mismatch"
+  @memory_unavailable_reasons [@memory_dimension_mismatch_reason]
+  @memory_unrun_reasons [@memory_capacity_reason | @memory_unavailable_reasons]
+
   @typedoc "The pinned result envelope every read path returns."
   @type result_envelope :: %{results: list(), meta: map()}
 
@@ -172,6 +184,19 @@ defmodule Loopctl.Memory do
   """
   @spec knowledge_degraded_reason_tags() :: [String.t()]
   def knowledge_degraded_reason_tags, do: @knowledge_degraded_reason_tags
+
+  @doc """
+  The `meta.reason` tags a memory recall publishes when the read COULD NOT RUN and no
+  substitute lane was served — a configuration fault, not a fallback.
+
+  Published so `LoopctlWeb.Outcome` classifies that envelope as `outcome: "error"`
+  rather than `"fallback"`: it sets `fallback: true` while serving nothing, and an
+  agent reading the flag alone retries the identical query into a condition that only
+  an operator can clear. The capacity shed is deliberately NOT here — waiting does
+  clear that one, so it stays `"degraded"`.
+  """
+  @spec memory_unavailable_reason_tags() :: [String.t()]
+  def memory_unavailable_reason_tags, do: @memory_unavailable_reasons
 
   # ===========================================================================
   # Write path
@@ -812,7 +837,9 @@ defmodule Loopctl.Memory do
         Embeddings.legacy_dimension()
       end
 
-    if actual == expected, do: :ok, else: {:error, "embedding_dimension_mismatch"}
+    if actual == expected,
+      do: :ok,
+      else: {:error, @memory_dimension_mismatch_reason}
   end
 
   defp unavailable_memory_env(tenant_id, k, reason) do
@@ -915,14 +942,14 @@ defmodule Loopctl.Memory do
   # contract (like the embedding-fallback tags), so callers can tell the memory side is
   # empty by capacity, not by scope.
   defp overloaded_memory_env(tenant_id, k) do
-    emit_recall_degraded(tenant_id, "memory", "heavy_read_overloaded")
+    emit_recall_degraded(tenant_id, "memory", @memory_capacity_reason)
 
     %{
       results: [],
       meta: %{
         total_count: 0,
         fallback: true,
-        reason: "heavy_read_overloaded",
+        reason: @memory_capacity_reason,
         underfilled: k > 0
       }
     }
@@ -1383,7 +1410,7 @@ defmodule Loopctl.Memory do
           total_count: non_neg_integer(),    # length(results) after the merged cap
           memory_count: non_neg_integer(),   # memory rows BEFORE the merged cap
           knowledge_count: non_neg_integer(),# knowledge rows BEFORE the merged cap
-          degraded?: boolean(),              # knowledge errored/fell back OR memory shed
+          degraded?: boolean(),              # knowledge errored/fell back OR memory did not run
           degraded_reason: String.t() | nil, # bounded tag naming why (nil when healthy)
           results_ranking: String.t()        # "heuristic_cross_source" (see KNOWN BIAS)
         }
@@ -1600,16 +1627,28 @@ defmodule Loopctl.Memory do
 
   defp knowledge_degraded?(%{meta: meta}), do: Map.get(meta, :degraded?, false) == true
 
-  # The memory half is "degraded" for the merged `degraded?`/`degraded_reason` ONLY when
-  # its heavy read was SHED by the per-tenant cap (empty by capacity). An ordinary
-  # embedding-unavailable ILIKE fallback is NOT counted here — that path degrades BOTH
-  # halves and is already reflected via the knowledge side's keyword-only fallback.
-  defp memory_degraded?(%{meta: meta}), do: Map.get(meta, :reason) == "heavy_read_overloaded"
+  # The memory half is "degraded" for the merged `degraded?`/`degraded_reason` when its
+  # read DID NOT RUN — shed by the per-tenant cap, or refused by a configuration fault
+  # (`@memory_unrun_reasons`). An ordinary embedding-unavailable ILIKE fallback is NOT
+  # counted here — that path SERVED a text-match lane, and it degrades BOTH halves, so it
+  # is already reflected via the knowledge side's keyword-only fallback. Reading only the
+  # shed left every other unrunnable memory envelope invisible in the merged meta, so
+  # `/recall` rendered `outcome: "empty"` for a half that never executed.
+  defp memory_degraded?(%{meta: meta}), do: Map.get(meta, :reason) in @memory_unrun_reasons
 
-  # A BOUNDED, non-sensitive tag naming why the merged recall degraded, or `nil`. Reports
-  # the knowledge side first (it drives the documented `degraded?`), then memory.
+  defp memory_shed?(%{meta: meta}), do: Map.get(meta, :reason) == @memory_capacity_reason
+
+  # A BOUNDED, non-sensitive tag naming why the merged recall degraded, or `nil`. A memory
+  # CAPACITY SHED is reported first, ahead of the knowledge side: it is the one tag whose
+  # remedy is to WAIT, and reporting the knowledge tag over it dropped the shed entirely,
+  # so `LoopctlWeb.Outcome` saw a lane fallback and told the agent to retry immediately
+  # into the still-closed gate. Otherwise knowledge first (it drives the documented
+  # `degraded?`), then memory.
   defp merged_degraded_reason(memory_env, knowledge_env) do
     cond do
+      memory_shed?(memory_env) ->
+        memory_env.meta[:reason]
+
       knowledge_degraded?(knowledge_env) ->
         knowledge_env.meta[:fallback_reason] || "knowledge_degraded"
 
