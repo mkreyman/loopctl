@@ -660,6 +660,10 @@ defmodule LoopctlWeb.Router do
         KnowledgeAnalyticsController,
         :retrieval_metrics
 
+    get "/knowledge/analytics/search-coverage",
+        KnowledgeAnalyticsController,
+        :search_coverage
+
     get "/knowledge/curation-log", KnowledgeAnalyticsController, :curation_log
 
     get "/knowledge/analytics/agents/:agent_id",

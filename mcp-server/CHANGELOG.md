@@ -5,6 +5,50 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.88.0 — 2026-09-06 (say which telemetry columns are actually being filled)
+
+### Added
+
+- **`knowledge_search_coverage`** — which DECLARED columns of `search_events` are actually
+  being filled, per search surface, over a bounded window
+  (`GET /api/v1/knowledge/analytics/search-coverage`, orchestrator+).
+
+  **Why it exists.** `search_events` shipped correct and nearly blind: 2 of its first 133
+  rows carried any `client_*` context, and that was discoverable only by an audit nobody
+  was scheduled to run. A declared coverage PROFILE per `tool` names the columns a
+  correctly-instrumented caller is expected to supply, so a surface emitting NOTHING reads
+  as `rows: 0` — which no audit over existing rows can produce. Prior art: MemoRizz v0.8.0
+  declares the evidence stages a task type must emit and reports the missing stage rather
+  than leaving an audit to find it.
+
+  **What it cannot prove.** That a PRESENT column is a CORRECT one. One MCP process serves
+  a session and every agent it dispatches, with an environment frozen at spawn, so it
+  labels every search `main`; such a row is 100% covered here and still wrong about the
+  only thing `client_kind` exists to say. It also cannot see a search path that records no
+  row at all.
+
+  **Populations, not one denominator.** Each column names the rows that COULD have carried
+  it: `all`, `ran` (excludes `outcome=rejected`, which has no `mode_used`/`duration_ms` by
+  construction), and `agent` (rows carrying `client_kind` or `client_session_id`, i.e. rows
+  that really came through the MCP client). `share_missing` is `null`, never `0.0`, on an
+  empty population.
+
+  **Required vs enrichable.** `required` is fillable at record time, so a miss is a defect.
+  `enrichable` (`client_model`, `client_effort`, `agent_id`) is what no client can send;
+  `mix loopctl.enrich_search_events` fills it offline on a schedule, so a window ending near
+  now measures the enrichment's lag — read a recent enrichable share as a floor.
+
+  **Unprofiled.** Every `tool` with rows and no profile is listed (a `null` tool included),
+  and `rows_total` covers the whole window, so a new surface cannot be silently dropped
+  from the accounting.
+
+### Changed
+
+- **`knowledge_retrieval_metrics`** description now points at `knowledge_search_coverage` as
+  its companion. Every ratio there divides `search_events` / `article_access_events`
+  columns, so a NULL column shrinks a denominator instead of reporting itself — check
+  coverage before reading a figure there as agent behaviour rather than instrumentation.
+
 ## 2.87.0 — 2026-09-06 (recall explains its own selection, and you can say what you used)
 
 ### Added

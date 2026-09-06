@@ -2504,6 +2504,18 @@ async function knowledgeRetrievalMetrics({ limit, offset } = {}) {
   return toContent(result);
 }
 
+async function knowledgeSearchCoverage({ days, to } = {}) {
+  const params = new URLSearchParams();
+  if (days != null) params.set("days", String(days));
+  if (to) params.set("to", to);
+  const qs = params.toString();
+  const path = qs
+    ? `/api/v1/knowledge/analytics/search-coverage?${qs}`
+    : "/api/v1/knowledge/analytics/search-coverage";
+  const result = await apiCall("GET", path, null, process.env.LOOPCTL_ORCH_KEY);
+  return toContent(result);
+}
+
 async function knowledgeCurationLog({ kind, since, limit, offset } = {}) {
   const params = new URLSearchParams();
   if (kind) params.set("kind", kind);
@@ -6935,6 +6947,11 @@ const TOOLS = [
       "within a window). A proxy for whether retrieval is improving — watch it trend up as " +
       "the corpus is de-duplicated, better navigated (MOCs), and conflict-resolved. Most " +
       "recent day first. Requires orchestrator role.\n\n" +
+      "Every ratio here divides columns of search_events / article_access_events, so a " +
+      "NULL column silently shrinks a denominator rather than reporting itself. " +
+      "knowledge_search_coverage is the companion that says which of those columns are " +
+      "actually being filled, per surface — check it before treating a figure here as " +
+      "a measurement of agent behaviour rather than of instrumentation.\n\n" +
       // The cap is enforced by Loopctl.Knowledge.Analytics.max_recorded_search_results/0
       // (Elixir); this JS string cannot interpolate it, so change both together.
       "Denominators (#582): precision = followed_through / searched, and `searched` counts " +
@@ -7028,6 +7045,69 @@ const TOOLS = [
           type: "integer",
           description: "Days to skip. Default 0.",
           minimum: 0,
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "knowledge_search_coverage",
+    description:
+      "Report which DECLARED columns of search_events are actually being filled, per search " +
+      "surface, over a bounded window. Requires orchestrator role.\n\n" +
+      "WHY IT EXISTS: search_events shipped correct and nearly blind — 2 of its first 133 " +
+      "rows carried any client_* context, and that was discoverable only by an audit nobody " +
+      "was scheduled to run. A declared coverage PROFILE per tool names the columns a " +
+      "correctly-instrumented caller is expected to supply, so a surface emitting NOTHING " +
+      "shows up as rows: 0, which no audit over existing rows can produce. Prior art: " +
+      "MemoRizz v0.8.0 declares the evidence stages a task type must emit and reports the " +
+      "missing stage instead of leaving it to an audit.\n\n" +
+      "WHAT IT CANNOT PROVE: that a PRESENT column is a CORRECT one. client_kind is the " +
+      "worked example — one MCP process serves a session and every agent it dispatches with " +
+      "an environment frozen at spawn, so it labels every search 'main'. Such a row is 100% " +
+      "covered here and still wrong about the only thing that column exists to say; the " +
+      "offline enrichment is what refines it. It also cannot see a search path that records " +
+      "NO row at all.\n\n" +
+      "POPULATIONS, NOT ONE DENOMINATOR: each column names the rows that COULD have carried " +
+      "it, reported as scope/population beside every count. 'all' is every row; 'ran' " +
+      "excludes outcome=rejected (a rejected call never ran, so it has no mode_used and no " +
+      "duration_ms by construction); 'agent' is rows carrying client_kind or " +
+      "client_session_id, i.e. rows that really came through the MCP client — the recall " +
+      "hook and smoke tests call the API directly and can never supply client_*, so scoring " +
+      "them would measure loopctl's own automation. share_missing is null, never 0.0, on an " +
+      "empty population.\n\n" +
+      "CLIENT_CONTEXT: the 'agent' denominator is built from two of the columns it scores, " +
+      "so a client that sends NOTHING empties it and every client_* line then reads a clean " +
+      "0/0. Each profile therefore also carries client_context, scored over 'all', whose " +
+      "missing is the rows that carried NO client context at all — that is where a fleet gone " +
+      "blind reports itself. A high share on memory_recall is the recall hook and expected; a " +
+      "high share on knowledge_search is not.\n\n" +
+      "REQUIRED vs ENRICHABLE: required is what a client or the server can fill at record " +
+      "time, so a miss is a defect. enrichable (client_model, client_effort, agent_id) is " +
+      "what no client can send — the first two do not exist in the MCP server's spawn " +
+      "environment and are filled offline by mix loopctl.enrich_search_events, and agent_id " +
+      "is server-derived from a key that may own no agent. That enrichment runs on a " +
+      "schedule, so a window ending near now measures its LAG: read a recent enrichable " +
+      "share as a floor.\n\n" +
+      "UNPROFILED: every tool value with rows and no declared profile is listed with its row " +
+      "count, null included. rows_total counts the whole window, so rows_total minus the sum " +
+      "of profile rows is exactly the unprofiled traffic — a new surface cannot be silently " +
+      "dropped from the accounting.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        days: {
+          type: "integer",
+          description: "Window length in days back from `to` (default 30, max 366). Clamped, never rejected.",
+          minimum: 1,
+          maximum: 366,
+        },
+        to: {
+          type: "string",
+          description:
+            "ISO8601 date or datetime, exclusive upper bound. Default now. A bare date is " +
+            "read at 00:00:00Z. The window is [from, to). Rejected with 400 when it cannot " +
+            "be parsed — never silently replaced with now.",
         },
       },
       required: [],
@@ -8224,6 +8304,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "knowledge_retrieval_metrics":
       return await knowledgeRetrievalMetrics(args);
+
+    case "knowledge_search_coverage":
+      return await knowledgeSearchCoverage(args);
 
     case "knowledge_analytics_top":
       return await knowledgeAnalyticsTop(args);

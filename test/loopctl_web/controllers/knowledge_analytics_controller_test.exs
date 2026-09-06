@@ -6,6 +6,7 @@ defmodule LoopctlWeb.KnowledgeAnalyticsControllerTest do
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.KbCuration
   alias Loopctl.Knowledge.RetrievalMetrics
+  alias Loopctl.Knowledge.SearchEventCoverage
 
   defp auth_conn(conn, raw_key) do
     put_req_header(conn, "authorization", "Bearer #{raw_key}")
@@ -712,6 +713,39 @@ defmodule LoopctlWeb.KnowledgeAnalyticsControllerTest do
   end
 
   describe "GET /api/v1/knowledge/curation-log" do
+    test "an unparseable or non-string `since` is a 400, never a 500 or a silent full feed", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant, %{settings: %{"kb_curation_log" => true}})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      # Plug parses `?since[]=x` into a LIST, which matched none of parse_since/1's clauses:
+      # a FunctionClauseError that action_fallback cannot catch, so a 500. Answering 200 is
+      # not the fix either — `maybe_put/3` DROPS the filter, so the caller gets the most
+      # recent page presented as the window it asked for. Reject, don't ignore.
+      for query <- ["since[]=2026-08-20", "since=last-week"] do
+        conn =
+          conn
+          |> auth_conn(raw_key)
+          |> get("/api/v1/knowledge/curation-log?#{query}")
+
+        assert json_response(conn, 400)
+      end
+    end
+
+    test "a parseable `since` still filters", %{conn: conn} do
+      tenant = fixture(:tenant, %{settings: %{"kb_curation_log" => true}})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      :ok = KbCuration.record(tenant.id, "dismiss", "not a conflict")
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/curation-log?since=2026-01-01")
+
+      assert json_response(conn, 200)["meta"]["total_count"] == 1
+    end
+
     test "orchestrator reads the curation feed (filterable by kind)", %{conn: conn} do
       tenant = fixture(:tenant, %{settings: %{"kb_curation_log" => true}})
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
@@ -818,6 +852,141 @@ defmodule LoopctlWeb.KnowledgeAnalyticsControllerTest do
         |> get(~p"/api/v1/knowledge/analytics/retrieval-metrics")
 
       assert json_response(conn, 403)
+    end
+  end
+
+  describe "GET /api/v1/knowledge/analytics/search-coverage" do
+    test "orchestrator gets a profile per surface plus the unprofiled bucket", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      at = DateTime.add(DateTime.utc_now(), -3600, :second)
+
+      fixture(:search_event, %{
+        tenant_id: tenant.id,
+        inserted_at: at,
+        tool: "knowledge_search",
+        query: "q",
+        mode_used: "combined",
+        duration_ms: 5,
+        client_session_id: "sess-1",
+        client_host: "minis",
+        client_repo: "loopctl",
+        client_entrypoint: "mcp",
+        client_version: "1.0.0",
+        client_kind: "main"
+      })
+
+      fixture(:search_event, %{tenant_id: tenant.id, inserted_at: at, tool: "corpus_search"})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/analytics/search-coverage")
+
+      body = json_response(conn, 200)
+
+      assert body["rows_total"] == 2
+      assert Enum.map(body["profiles"], & &1["tool"]) == SearchEventCoverage.profiled_tools()
+      assert body["unprofiled"] == [%{"tool" => "corpus_search", "rows" => 1}]
+
+      searched = Enum.find(body["profiles"], &(&1["tool"] == "knowledge_search"))
+      assert searched["rows"] == 1
+      assert searched["populations"]["agent"] == 1
+      assert searched["required"]["client_repo"]["missing"] == 0
+      # Enrichable is reported APART from required — a miss there is not a client defect.
+      refute Map.has_key?(searched["required"], "client_model")
+      assert searched["enrichable"]["client_model"]["missing"] == 1
+    end
+
+    test "a pre-history window is answered all-zero, never a 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      before = DateTime.add(SearchEventCoverage.history_starts(), -86_400, :second)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/analytics/search-coverage?to=#{DateTime.to_iso8601(before)}")
+
+      body = json_response(conn, 200)
+      assert body["rows_total"] == 0
+      assert body["unprofiled"] == []
+    end
+
+    test "an absurd days value is clamped, never rejected", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/analytics/search-coverage?days=99999")
+
+      assert json_response(conn, 200)["rows_total"] == 0
+    end
+
+    test "an unparseable or non-string `to` is a 400, never a 500 or a silent now()", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      # A list-valued param reached parse_since/1, which had no catch-all clause: a
+      # FunctionClauseError that action_fallback cannot catch, so a 500 on a well-formed
+      # request. And an unparseable string used to be swapped for now(), answering a
+      # different window than the operator asked about.
+      for query <- ["to[]=2026-09-01T00:00:00Z", "to=yesterday"] do
+        conn =
+          conn
+          |> auth_conn(raw_key)
+          |> get("/api/v1/knowledge/analytics/search-coverage?#{query}")
+
+        assert json_response(conn, 400)
+      end
+    end
+
+    test "a date-only `to` is honoured at 00:00:00Z, not replaced with now", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/analytics/search-coverage?to=2026-08-20&days=1")
+
+      body = json_response(conn, 200)
+      assert body["window"]["to"] =~ "2026-08-20T00:00:00"
+    end
+
+    test "agent role is rejected (orchestrator+ required)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/analytics/search-coverage")
+
+      assert json_response(conn, 403)
+    end
+
+    test "tenant isolation: another tenant's rows are never counted", %{conn: conn} do
+      a = fixture(:tenant)
+      b = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: a.id, role: :orchestrator})
+      at = DateTime.add(DateTime.utc_now(), -3600, :second)
+
+      fixture(:search_event, %{tenant_id: b.id, inserted_at: at, tool: "knowledge_search"})
+      fixture(:search_event, %{tenant_id: b.id, inserted_at: at, tool: "corpus_search"})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/analytics/search-coverage")
+
+      body = json_response(conn, 200)
+      assert body["rows_total"] == 0
+      assert body["unprofiled"] == []
     end
   end
 end

@@ -24,6 +24,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Knowledge.IngestionAnomaly
   alias Loopctl.Knowledge.IngestionWriteStats
   alias Loopctl.Knowledge.RetrievalEval.GoldenSet, as: RetrievalGoldenSet
+  alias Loopctl.Knowledge.SearchEvent
   alias Loopctl.Llm.SettingsCache
   alias Loopctl.Llm.TenantLlmSettings
   alias Loopctl.Llm.UsageEvent, as: LlmUsageEvent
@@ -290,6 +291,23 @@ defmodule Loopctl.Fixtures do
       %{
         relationship_type: :relates_to,
         metadata: %{}
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  def build(:search_event, attrs) do
+    seq = System.unique_integer([:positive])
+
+    Map.merge(
+      %{
+        query: "coverage query #{seq}",
+        tool: "knowledge_search",
+        mode_requested: "combined",
+        mode_used: "combined",
+        result_count: 3,
+        duration_ms: 42,
+        outcome: "ok"
       },
       Enum.into(attrs, %{})
     )
@@ -1003,6 +1021,46 @@ defmodule Loopctl.Fixtures do
     # here — deliberately the only place that does, so production code has no such path.
     changeset
     |> Ecto.Changeset.change(Map.take(attrs, [:origin_search_id, :origin_attribution]))
+    |> AdminRepo.insert!()
+  end
+
+  def fixture(:search_event, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    {tenant_id, attrs} =
+      case Map.get(attrs, :tenant_id) do
+        nil ->
+          tenant = fixture(:tenant)
+          {tenant.id, Map.put(attrs, :tenant_id, tenant.id)}
+
+        tid ->
+          {tid, attrs}
+      end
+
+    {api_key_id, attrs} =
+      case Map.fetch(attrs, :api_key_id) do
+        # `:api_key_id` is a DECLARED-required column of every coverage profile, so a
+        # fixture that always auto-created one could never seed the miss. An explicit nil
+        # is honoured; only an ABSENT key auto-creates.
+        {:ok, id} ->
+          {id, attrs}
+
+        :error ->
+          {_raw, api_key} = fixture(:api_key, %{tenant_id: tenant_id, role: :agent})
+          {api_key.id, Map.put(attrs, :api_key_id, api_key.id)}
+      end
+
+    data = build(:search_event, Map.delete(attrs, :tenant_id))
+
+    changeset =
+      %SearchEvent{tenant_id: tenant_id}
+      |> SearchEvent.changeset(Map.put(data, :api_key_id, api_key_id))
+
+    # `inserted_at` is set by `timestamps/1` and is therefore not castable, but a coverage
+    # report is a WINDOW over it — a test that cannot place a row in time cannot test the
+    # window at all. Seeded past the changeset here, deliberately the only place that does.
+    changeset
+    |> Ecto.Changeset.change(Map.take(attrs, [:inserted_at]))
     |> AdminRepo.insert!()
   end
 
