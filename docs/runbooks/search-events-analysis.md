@@ -54,6 +54,50 @@ across the whole transcript tree (measured: 96% of distinct queries are). `clien
 the client sent is a session-level assertion rather than an observation. Re-running is safe
 and idempotent either way.
 
+## 0b. Ask what is actually being FILLED, before you read a single number
+
+Every figure in this runbook divides one `search_events` column by another, so a column that
+is NULL shrinks a denominator instead of reporting itself. That is not hypothetical here:
+this table shipped correct and nearly blind, with **2 of its first 133 rows carrying any
+`client_*` context at all**, and nothing said so — it was found by an audit that happened to
+be run, not by anything that was scheduled.
+
+`knowledge_search_coverage` (`GET /api/v1/knowledge/analytics/search-coverage`,
+orchestrator+) answers it in one call. It declares, per `tool`, the columns a
+correctly-instrumented caller is expected to supply and reports how many rows are missing
+each one:
+
+```bash
+# via the MCP tool
+knowledge_search_coverage(days: 30)
+```
+
+Read it in this order:
+
+1. **`unprofiled`** — a `tool` with rows and no declared profile. A new surface appeared and
+   nothing in the registry knows about it; add a profile in
+   `Loopctl.Knowledge.SearchEventCoverage` before trusting a per-surface figure.
+2. **A profile with `rows: 0`** — a surface that emitted NOTHING in the window. This is the
+   finding no audit over existing rows can produce, and the shape of the original defect.
+3. **`required` misses** — a client or the server could have filled it, so a miss is a
+   defect to fix at the emitting site.
+4. **`enrichable` misses** (`client_model`, `client_effort`, `agent_id`) — no client can send
+   these. `mix loopctl.enrich_search_events` (step 0 above) fills the first two, so a high
+   miss here usually means the enrichment has not been run on some machine, not that the
+   client is broken. Because it runs on a schedule, a window ending near now measures its
+   LAG: read a recent enrichable share as a floor.
+
+Each column names the POPULATION it is scored over, so a structural absence does not read as
+a defect: `ran` excludes `outcome=rejected` (a rejected call never ran, so it has no
+`mode_used` and no `duration_ms`), and `agent` is only the rows that really came through the
+MCP client — the recall hook and `scripts/smoke.sh` call the API directly and can never
+carry `client_*`. `share_missing` is `null`, never `0.0`, on an empty population.
+
+**What it cannot tell you:** whether a PRESENT column is a CORRECT one. An un-enriched
+`client_kind` is 100% covered here and still says `main` for every search a subagent made —
+which is exactly why step 0 comes first. It also cannot see a search path that writes no row
+at all; `unprofiled` only catches a tool that DID write.
+
 ## 1. Run the canonical queries
 
 They live in the `Loopctl.Knowledge.SearchEvent` moduledoc, beside the schema they read,

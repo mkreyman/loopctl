@@ -6,6 +6,7 @@ defmodule LoopctlWeb.KnowledgeAnalyticsControllerTest do
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.KbCuration
   alias Loopctl.Knowledge.RetrievalMetrics
+  alias Loopctl.Knowledge.SearchEventCoverage
 
   defp auth_conn(conn, raw_key) do
     put_req_header(conn, "authorization", "Bearer #{raw_key}")
@@ -818,6 +819,108 @@ defmodule LoopctlWeb.KnowledgeAnalyticsControllerTest do
         |> get(~p"/api/v1/knowledge/analytics/retrieval-metrics")
 
       assert json_response(conn, 403)
+    end
+  end
+
+  describe "GET /api/v1/knowledge/analytics/search-coverage" do
+    test "orchestrator gets a profile per surface plus the unprofiled bucket", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      at = DateTime.add(DateTime.utc_now(), -3600, :second)
+
+      fixture(:search_event, %{
+        tenant_id: tenant.id,
+        inserted_at: at,
+        tool: "knowledge_search",
+        query: "q",
+        mode_used: "combined",
+        duration_ms: 5,
+        client_session_id: "sess-1",
+        client_host: "minis",
+        client_repo: "loopctl",
+        client_entrypoint: "mcp",
+        client_version: "1.0.0",
+        client_kind: "main"
+      })
+
+      fixture(:search_event, %{tenant_id: tenant.id, inserted_at: at, tool: "corpus_search"})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/analytics/search-coverage")
+
+      body = json_response(conn, 200)
+
+      assert body["rows_total"] == 2
+      assert Enum.map(body["profiles"], & &1["tool"]) == SearchEventCoverage.profiled_tools()
+      assert body["unprofiled"] == [%{"tool" => "corpus_search", "rows" => 1}]
+
+      searched = Enum.find(body["profiles"], &(&1["tool"] == "knowledge_search"))
+      assert searched["rows"] == 1
+      assert searched["populations"]["agent"] == 1
+      assert searched["required"]["client_repo"]["missing"] == 0
+      # Enrichable is reported APART from required — a miss there is not a client defect.
+      refute Map.has_key?(searched["required"], "client_model")
+      assert searched["enrichable"]["client_model"]["missing"] == 1
+    end
+
+    test "a pre-history window is answered all-zero, never a 500", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      before = DateTime.add(SearchEventCoverage.history_starts(), -86_400, :second)
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/analytics/search-coverage?to=#{DateTime.to_iso8601(before)}")
+
+      body = json_response(conn, 200)
+      assert body["rows_total"] == 0
+      assert body["unprofiled"] == []
+    end
+
+    test "an absurd days value is clamped, never rejected", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/analytics/search-coverage?days=99999")
+
+      assert json_response(conn, 200)["rows_total"] == 0
+    end
+
+    test "agent role is rejected (orchestrator+ required)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/analytics/search-coverage")
+
+      assert json_response(conn, 403)
+    end
+
+    test "tenant isolation: another tenant's rows are never counted", %{conn: conn} do
+      a = fixture(:tenant)
+      b = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: a.id, role: :orchestrator})
+      at = DateTime.add(DateTime.utc_now(), -3600, :second)
+
+      fixture(:search_event, %{tenant_id: b.id, inserted_at: at, tool: "knowledge_search"})
+      fixture(:search_event, %{tenant_id: b.id, inserted_at: at, tool: "corpus_search"})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/analytics/search-coverage")
+
+      body = json_response(conn, 200)
+      assert body["rows_total"] == 0
+      assert body["unprofiled"] == []
     end
   end
 end

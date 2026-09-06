@@ -10,6 +10,7 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
   - `GET /api/v1/knowledge/analytics/agents/:agent_id` -- per-agent usage
   - `GET /api/v1/knowledge/analytics/projects/:id/usage` -- per-project rollup
   - `GET /api/v1/knowledge/analytics/unused-articles` -- unused published articles
+  - `GET /api/v1/knowledge/analytics/search-coverage` -- declared `search_events` coverage
   """
 
   use LoopctlWeb, :controller
@@ -20,6 +21,7 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
   alias Loopctl.Knowledge.Analytics
   alias Loopctl.Knowledge.KbCuration
   alias Loopctl.Knowledge.RetrievalMetrics
+  alias Loopctl.Knowledge.SearchEventCoverage
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -455,6 +457,75 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
     json(conn, RetrievalMetrics.list_snapshots(tenant_id, opts))
   end
 
+  operation(:search_coverage,
+    summary: "Declared telemetry coverage for search_events",
+    description:
+      "Which DECLARED columns of `search_events` are actually being filled, per search " <>
+        "surface, over a bounded window. A coverage PROFILE per `tool` names the columns a " <>
+        "correctly-instrumented caller is expected to supply; this reports how many rows " <>
+        "are missing each one. Role: orchestrator+.\n\n" <>
+        "WHY A DECLARATION AND NOT A QUERY — `search_events` shipped correct and nearly " <>
+        "blind: 2 of its first 133 rows carried any `client_*` context, discoverable only " <>
+        "by an audit nobody was scheduled to run. A declared profile reports a surface that " <>
+        "emits NOTHING (`rows: 0`), which no audit over existing rows can do.\n\n" <>
+        "WHAT IT CANNOT PROVE — that a PRESENT column is a CORRECT one. `client_kind` is " <>
+        "the worked example: one MCP process serves a session and every agent it " <>
+        "dispatches with an environment frozen at spawn, so it labels every search `main`. " <>
+        "Such a row is 100% covered here and still wrong about the only thing that column " <>
+        "exists to say. It also cannot see a search path that records NO row at all; the " <>
+        "`unprofiled` bucket is the nearest guard, and it only catches a tool that DID " <>
+        "write.\n\n" <>
+        "POPULATIONS, NOT ONE DENOMINATOR — each column names the rows that COULD have " <>
+        "carried it, reported as `scope`/`population` beside every count. `all` is every " <>
+        "row; `ran` excludes `outcome=rejected` (a rejected call never ran, so it has no " <>
+        "`mode_used` and no `duration_ms` by construction); `agent` is rows carrying a " <>
+        "`client_kind` or `client_session_id`, i.e. rows that really came through the MCP " <>
+        "client — the recall hook and smoke tests call the API directly and can never " <>
+        "supply `client_*`, so scoring them would measure loopctl's own automation. " <>
+        "`share_missing` is `null`, never `0.0`, on an empty population.\n\n" <>
+        "REQUIRED vs ENRICHABLE — `required` is what a client or the server can fill at " <>
+        "record time, so a miss is a defect. `enrichable` (`client_model`, `client_effort`, " <>
+        "`agent_id`) is what no client can send: the first two do not exist in the MCP " <>
+        "server's spawn environment and are filled offline by " <>
+        "`mix loopctl.enrich_search_events`, and `agent_id` is server-derived from a key " <>
+        "that may own no agent. Enrichment runs on a schedule, so a window ending near now " <>
+        "measures its LAG — read a recent enrichable share as a floor.\n\n" <>
+        "UNPROFILED — every `tool` value with rows and no declared profile is listed with " <>
+        "its row count, `null` included. `rows_total` counts the whole window, so " <>
+        "`rows_total` minus the sum of profile `rows` is exactly the unprofiled traffic; a " <>
+        "new surface cannot be silently dropped from the accounting.",
+    parameters: [
+      days: [
+        in: :query,
+        type: :integer,
+        description:
+          "Window length in days back from `to` (default 30, max #{SearchEventCoverage.max_window_days()}). " <>
+            "Clamped, never rejected.",
+        required: false
+      ],
+      to: [
+        in: :query,
+        type: :string,
+        description: "ISO8601 exclusive upper bound (default now). The window is [from, to).",
+        required: false
+      ]
+    ],
+    responses: %{
+      200 =>
+        {"Search event coverage", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  @doc "GET /api/v1/knowledge/analytics/search-coverage"
+  def search_coverage(conn, params) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+    {from, to} = coverage_window(params)
+
+    json(conn, SearchEventCoverage.report(tenant_id, from, to))
+  end
+
   operation(:curation_log,
     summary: "KB curation adjustment log",
     description:
@@ -606,6 +677,30 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
 
   defp put_int(opts, key, value, default, min_value, max_value) do
     Keyword.put(opts, key, parse_int(value, default) |> max(min_value) |> min(max_value))
+  end
+
+  # CLAMPED here, so `SearchEventCoverage.report/3`'s ArgumentError stays a programming
+  # error rather than a 500 a caller can trigger with a query string. `from` is floored at
+  # `history_starts/0`: a window opening before the table existed is not a smaller sample.
+  defp coverage_window(params) do
+    to =
+      case parse_since(params["to"]) do
+        %DateTime{} = dt -> dt
+        _ -> DateTime.utc_now()
+      end
+
+    days = parse_int(params["days"], 30) |> max(1) |> min(SearchEventCoverage.max_window_days())
+    from = DateTime.add(to, -days * 86_400, :second)
+    floor_at = SearchEventCoverage.history_starts()
+
+    from = if DateTime.compare(from, floor_at) == :lt, do: floor_at, else: from
+
+    # A `to` at or before the floor would leave an empty/inverted window. Report the first
+    # instant instead of raising: an operator asking about pre-history gets an honest
+    # all-zero window, not a 500.
+    to = if DateTime.compare(to, from) != :gt, do: DateTime.add(from, 1, :second), else: to
+
+    {from, to}
   end
 
   defp parse_int(nil, default), do: default
