@@ -196,6 +196,16 @@ defmodule LoopctlWeb.OutcomeTest do
       refute Loopctl.Memory.memory_unavailable_reason_tags() == []
     end
 
+    test "a request-error tag beside REAL ROWS is a partial read, not a dead request" do
+      # On the merged /recall the tag names ONE half. "error" tells the caller the empty
+      # envelope says nothing about the corpus - said over seven memory rows the other
+      # half returned, it makes the agent discard them and ask again.
+      meta = %{degraded: true, degraded_reason: "bad_request", total_count: 7, memory_count: 7}
+
+      assert Outcome.derive(meta, 7) == "degraded"
+      assert Outcome.derive(%{meta | total_count: 0, memory_count: 0}, 0) == "error"
+    end
+
     test "an error tag arriving on a LANE key is not a request error" do
       # The corpus and memory lanes draw from an embedding/capacity vocabulary that does
       # not overlap the request-error contract. Only the two contract-bearing keys are

@@ -37,6 +37,9 @@ defmodule LoopctlWeb.Outcome do
 
   `error > fallback > degraded > empty > success`. Several causes can be present at
   once (a degraded response usually also has zero results), and the strongest wins.
+  `"error"` additionally requires ZERO rows, because it claims an empty envelope was
+  served in the retrieval's place: on `/recall` the tag names one HALF, and beside rows
+  the other half returned it is a partial read (`"degraded"`), not a dead request.
 
   There is exactly ONE deviation from that order, and it is deliberate: a CAPACITY
   SHED (reason `heavy_read_overloaded`) that served NO SUBSTITUTE LANE is classified
@@ -114,7 +117,7 @@ defmodule LoopctlWeb.Outcome do
   @spec derive(map(), non_neg_integer()) :: String.t()
   def derive(meta, count) when is_map(meta) and is_integer(count) and count >= 0 do
     cond do
-      request_error?(meta) -> "error"
+      unrunnable?(meta) -> unrunnable_outcome(count)
       capacity_shed?(meta) -> "degraded"
       lane_fallback?(meta) -> "fallback"
       short_lane?(meta) -> "degraded"
@@ -157,10 +160,17 @@ defmodule LoopctlWeb.Outcome do
   # `fallback: true` with zero rows and no text-match lane, so reading the flag alone
   # classified a persistent configuration fault as `"fallback"` and told the agent to
   # retry the identical query forever.
-  defp request_error?(meta) do
+  defp unrunnable?(meta) do
     Enum.any?([meta[:fallback_reason], meta[:degraded_reason]], &(&1 in @request_error_reasons)) or
       Enum.any?([meta[:reason], meta[:degraded_reason]], &(&1 in @memory_unavailable_reasons))
   end
+
+  # `"error"` says an EMPTY envelope was served in place of the retrieval. On the merged
+  # `/recall` the tag names ONE HALF, so the same tag can arrive beside real rows the other
+  # half returned — and a caller told "THE RETRIEVAL DID NOT RUN" discards them. Rows
+  # present, that is a partial read, which is what `"degraded"` means.
+  defp unrunnable_outcome(0), do: "error"
+  defp unrunnable_outcome(_count), do: "degraded"
 
   # Capacity, not correctness — and the ONE signal read ahead of `fallback` (see the
   # moduledoc's precedence note). A shed that served no substitute lane leaves the caller
