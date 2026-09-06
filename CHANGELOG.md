@@ -37,6 +37,111 @@ All notable changes to loopctl are documented here.
   near-duplicate verdict, where drift is true by construction); the flags also ride the `:deduplicated` write-telemetry metadata, but the
   `ingestion_write_stats` rollup does not break them out.
 
+- **The third funnel stage — `POST /api/v1/recall/:recall_id/referenced` (agent role).**
+  loopctl recorded which articles a search SURFACED and which of those an agent then
+  OPENED, but never whether an opened article was actually USED. That last stage is the
+  one the follow-through deficit is about: surfaced-to-opened converts at 1.67%, and
+  nothing said what happened after an open.
+
+  Hand back the `meta.recall_id` from a `POST /api/v1/recall` response together with the
+  article ids you referenced. The server writes `article_access_events` rows of a new
+  access type, `referenced`, stamping `origin_search_id` from the verified recall id and
+  the recording key from the conn — nothing about the identity is caller-supplied.
+
+  **`422 not_surfaced` is all-or-nothing.** Only ids THAT recall surfaced, in the caller's
+  own tenant, are accepted; any other id fails the whole call and NOTHING is written. A
+  partial write would mix a truth with a rejection under one id and leave the caller
+  unable to say which. The lookup is tenant-scoped and offers no existence oracle: an
+  unknown recall id and another tenant's recall id both simply surfaced nothing and take
+  the same 422 rather than a 404. The other refusals are `422 invalid_recall_id`,
+  `422 invalid_article_ids` and `422 too_many_article_ids` above 50 ids per call. Retries
+  are safe — the log is immutable so a repeat writes another row, but the metric counts
+  DISTINCT `(recall, article)` pairs, so posting twice cannot move a published figure.
+
+  A `referenced` row is in NO read set: not the heat index, not the read counters, not
+  `total_events` on `GET /api/v1/knowledge/articles/:id/stats`. It is the one access type
+  a CLIENT asserts about itself, and a ranking that consumed a self-report could be gamed
+  by one. It stays visible under its own key in the by-type breakdown, which is a label
+  rather than a total, so that breakdown may sum higher than `total_events`.
+
+  **Two migrations, no manual step and no downtime.**
+  `20260905120100_add_referenced_to_retrieval_snapshots` adds one integer column with a
+  `0` default to `retrieval_metric_snapshots`, a small table; historical rows report a
+  genuine zero because the endpoint did not exist. The snapshot `metric_version` goes
+  1 to 2 to mark that boundary. `reference_rate` is NOT a column — it is
+  `referenced / searched`, derived at read time, so no backfill is needed.
+
+  `20260905120200_add_article_access_events_search_id_index` builds a partial index on
+  `article_access_events` `(tenant_id, (metadata->>'search_id')) WHERE access_type =
+  'search'`, which is the lookup the new endpoint runs synchronously on a request path.
+  **Plan for deploy DURATION on this one.** `article_access_events` is the largest table
+  in a busy tenant — impressions outnumber reads about 50:1 — and the index is built
+  `CONCURRENTLY`, which is slower than an ordinary build and scans the table twice. It
+  carries both `@disable_ddl_transaction` and `@disable_migration_lock`, so it runs
+  outside a transaction and **does not hold the migration advisory lock** while it
+  builds: concurrent writes to `article_access_events` are never blocked, and a rolling
+  deploy's other nodes are not serialised behind it. It is `create_if_not_exists` with
+  explicit `up`/`down`, so an interrupted build leaves an INVALID index that the next run
+  steps over instead of tripping on.
+
+  The daily `RetrievalMetricsWorker` cron now also re-snapshots the day BEFORE its target,
+  because a reference is bucketed by the day the article was SURFACED: a recall at 17:00
+  whose reference arrives the next morning belongs to a snapshot already written. The
+  lookback is one day and the re-run is a full idempotent upsert, so it changes nothing
+  operationally beyond one extra snapshot computation per tenant per run.
+
+- **Reversible retrieval suppression for articles — `POST /api/v1/articles/:id/suppress`
+  and `/unsuppress` (agent role).** loopctl had two ways to retract an article and neither
+  was the one an unattended writer needs. `archive` is TERMINAL: `:archived` has no outbound
+  transition and there is no unarchive call, so the only way back is a `user`-role PATCH
+  carrying an explicit status. `unpublish` is undoable but means "this is a draft", which is
+  a claim about editorial state rather than about retrieval. Suppression is the third thing:
+  it says nothing about status and everything about whether anything retrieves the article.
+
+  **What it does.** A suppressed article keeps `status: published`, its body, its embedding
+  and its links, and it stays resolvable by id through `GET /api/v1/articles/:id` and
+  `knowledge_get` — which is what makes the act inspectable and undoable. It is excluded from
+  keyword/semantic/combined search, `hybrid_search`, `/knowledge/context`, the knowledge half
+  of `/api/v1/recall`, `/knowledge/progressive_index`, `/knowledge/heat_index`, suggested
+  links, `/knowledge/graph`, `/knowledge/walk`, the novelty priors, the auto-linker's
+  candidate pool, source-hub membership and the nightly consolidation scans.
+
+  **A `reason` is required** and is recorded on the row alongside the actor, both returned in
+  the article payload as `suppression_reason` / `suppressed_by` / `suppressed_at`.
+  Re-suppressing an already-suppressed article is an idempotent no-op that PRESERVES the
+  original actor and reason; unsuppressing an unsuppressed one is a no-op with no audit
+  event. Both directions write to the append-only audit log (`article.suppressed` /
+  `article.unsuppressed`, also available as webhook event types) and to the per-tenant
+  `kb_curation_log` when enabled. Visibility-scoped like `archive`: an agent can only
+  suppress an article it can see.
+
+  **Migration `20260905120000_add_retrieval_suppression_to_articles`** adds three nullable
+  columns (`suppressed_at`, `suppressed_by` varchar 200, `suppression_reason` varchar 500)
+  and one partial index, built CONCURRENTLY (`@disable_ddl_transaction`) so it cannot block
+  writes to `articles`. All three columns are nullable with no default, so the ALTER is
+  catalog-only on PG11+ — no table rewrite, no manual step, no downtime. RLS is unchanged:
+  `articles` already has row-level security enabled and the policy is on the ROW, so the new
+  columns inherit it.
+
+  **Export behaviour changed:** a suppressed article is still exported by the buffered
+  `?format=json` OKF bundle and by the streamed `.tar.gz`, and in the OKF frontmatter it now
+  carries `loopctl_suppressed_at` / `loopctl_suppressed_by` / `loopctl_suppression_reason`.
+  The Obsidian vault format does not yet render those three keys. IMPORT does not restore the tombstone, for the same reason it does not
+  restore `loopctl_status`: every imported concept is created as a draft, and a bundle is
+  advisory about lifecycle.
+
+  **Discovery:** `GET /api/v1/knowledge/index?suppressed=only` lists what there is to undo —
+  across every status, since suppression is not status-scoped and a suppressed draft would
+  otherwise be listed nowhere — and `suppressed_at`/`suppressed_by`/`suppression_reason` are
+  now projectable `fields` there, so an operator sees who suppressed what and why without a
+  read per row. `GET /api/v1/articles` excludes suppressed articles by default, matching that
+  index, EXCEPT on an `idempotency_key` lookup: that filter is an identity check on a
+  unique-indexed key the caller already holds, and it is what decides whether to create, so
+  hiding the row there would report "never captured" about the exact article the next create
+  silently dedups against.
+
+  MCP tools: `knowledge_suppress`, `knowledge_unsuppress`.
+
 - **Corpus mode B (`client_embedded`) — loopctl stores and ranks vectors it cannot read
   (US-43.3).** A corpus created with `mode: "client_embedded"` is indexed and searched
   without loopctl ever receiving the document text. **This is the property an operator
@@ -179,7 +284,83 @@ All notable changes to loopctl are documented here.
      count, not one page per tenant. The per-tenant anomaly rows and webhooks are
      unchanged.
 
+- **`meta.outcome` on every read of the knowledge, memory and corpus surfaces.** One
+  additive `meta` key classifying the response as `success` | `empty` | `degraded` |
+  `fallback` | `error`, with precedence `error > fallback > degraded > empty > success`.
+  It replaces having to know which per-surface flag names a degradation: the same event
+  was previously spread across `fallback`, `fallback_reason`, `degraded`, `reason`,
+  `semantic_unavailable_reason`, `semantic_under_filled` and `ann_iterative_scan`, with a
+  different key per endpoint, and a zero-result response could not be told apart from a
+  shed one.
+
+  Carried by the retrieval reads (`/knowledge/search`, `/knowledge/context`,
+  `/knowledge/hybrid_search`, `/knowledge/progressive_index`, `/knowledge/heat_index`,
+  `/memory/recall`, `/recall`, `/corpora/:id/search`), the enumerations (`/articles`,
+  `/knowledge/index`, `/memory`, `/corpora`), the review queues (`/knowledge/drafts`,
+  `/knowledge/conflicts`) and `/knowledge/articles/:id/suggested_links`. Write endpoints
+  carry none.
+
+  Two of those are worth an operator's attention. `GET /api/v1/corpora` previously
+  returned NO `meta` object at all and now returns one — additive, but a client that
+  asserted on the exact response key set will see the new key. And
+  `/knowledge/articles/:id/suggested_links` is the second producer of the
+  `ann_iterative_scan: "unavailable"` disclosure: an under-returned candidate list there
+  now renders `outcome: "degraded"` instead of arriving indistinguishable from a complete
+  short list.
+
+  On a catalog or a queue the value is only ever `empty` or `success` — those endpoints
+  disclose no degradation of their own — but the key is present, so an ABSENT `outcome`
+  means one thing only: a server older than this release.
+
 ### Changed
+
+- **BREAKING: `POST /api/v1/knowledge/bulk-delete` no longer accepts `confirm`, and archiving
+  by `tag` is now a two-step flow (#779).** The `confirm` parameter was a model-visible
+  authorization argument: the same request that asked for the mutation also carried its own
+  approval, so nothing outside the caller ever saw the proposal, and an agent that decided to
+  archive every article carrying a tag also decided to confirm it. It is gone.
+
+  **What breaks.** A request carrying a `confirm` key is refused with `400` and
+  `error.code: "confirm_removed"` — deliberately refused rather than ignored, so a client that
+  believes it is passing a gate learns the gate moved instead of silently sweeping a set. A
+  `tag` call with neither `dry_run` nor a replay credential is refused with `400` and
+  `error.code: "dry_run_required"`. Both codes are stable and machine-readable; the other 400s
+  on this endpoint stay uncoded.
+
+  **The new flow for `tag`, the same one the hard delete already used.** POST with
+  `dry_run: true` to get `meta.would_affect` and a single-use, TTL-bounded `meta.token` frozen
+  over the previewed id-set, then POST the same `tag` with that `token` to archive exactly that
+  set. Rows that started matching the tag after the dry-run are never touched. A selector too
+  large to freeze gets `meta.oversized` and `meta.confirm_hash` instead, echoed back with the
+  same `tag`, and the server re-resolves and refuses on any drift. A `tag` that currently
+  matches nothing needs no proposal: it stays a `200` no-op with `affected: 0`.
+
+  **Archive and delete proposals are not interchangeable, at any set size.** Within the frozen
+  bound they are minted with distinct token types, so an archive token replayed as a hard
+  delete, or a delete token replayed as an archive, is a `400`. Over the bound there is no
+  token and the credential is `meta.confirm_hash`, which is keyed on the OP as well as the
+  id-set — otherwise both flows hash the same rows to the same value and an archive preview
+  authorizes an irreversible purge. That is the blast-radius escalation the two-step flow
+  exists to prevent. A token is bound to its SELECTOR as well, on the hard delete exactly as
+  on the tag archive: one minted for `tag: a` is refused on a call naming `tag: b` rather than
+  silently purging `a` while the response reports success for `b`. So a hard delete replays
+  the same selector it previewed, not the token alone. Tokens remain single-use, TTL-bounded
+  and tenant-scoped. A selector that currently matches nothing needs no proposal on either
+  path — it is a `200` no-op with `affected: 0`, and it still writes its audit event.
+
+  **Deploy note:** both credential formats changed shape, so a proposal minted by the previous
+  release is refused after the deploy — a token as an invalid token, an oversized
+  `confirm_hash` as a mismatch. Nothing is mis-executed (both refusals are fail-closed), and
+  the window closes on its own within one token TTL. Re-run the dry-run.
+
+  **Unchanged:** the `article_ids` and `source_type`+`source_id` selectors still archive
+  immediately with no token, because each names a set the caller already holds. The role gate
+  is still `user`. The response shape is unchanged, including the backward-compatible
+  `meta.counts`/`meta.results` block.
+
+  **Client action:** upgrade `loopctl-mcp-server`; its `knowledge_bulk_delete` tool no longer
+  declares `confirm`. A hand-rolled client must drop `confirm` from every bulk-delete call and
+  add the dry-run/replay round trip for `tag` archives.
 
 - **A draft is no longer held forever: the nightly pass now publishes held drafts, and
   the weekly draft-archiving sweep is parked (#765).** Before this, `status: :draft` had

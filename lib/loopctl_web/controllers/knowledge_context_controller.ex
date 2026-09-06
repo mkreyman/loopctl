@@ -115,6 +115,7 @@ defmodule LoopctlWeb.KnowledgeContextController do
              meta: %OpenApiSpex.Schema{
                type: :object,
                properties: %{
+                 outcome: LoopctlWeb.Outcome.schema(),
                  total_count: %OpenApiSpex.Schema{type: :integer},
                  limit: %OpenApiSpex.Schema{type: :integer},
                  fallback: %OpenApiSpex.Schema{

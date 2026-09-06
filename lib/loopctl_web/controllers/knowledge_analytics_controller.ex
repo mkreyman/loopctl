@@ -10,6 +10,7 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
   - `GET /api/v1/knowledge/analytics/agents/:agent_id` -- per-agent usage
   - `GET /api/v1/knowledge/analytics/projects/:id/usage` -- per-project rollup
   - `GET /api/v1/knowledge/analytics/unused-articles` -- unused published articles
+  - `GET /api/v1/knowledge/analytics/search-coverage` -- declared `search_events` coverage
   """
 
   use LoopctlWeb, :controller
@@ -20,6 +21,7 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
   alias Loopctl.Knowledge.Analytics
   alias Loopctl.Knowledge.KbCuration
   alias Loopctl.Knowledge.RetrievalMetrics
+  alias Loopctl.Knowledge.SearchEventCoverage
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -355,6 +357,19 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
         "open credits EVERY search in the window that surfaced that article, not just " <>
         "the preceding one (biases them UP when an agent refines and re-searches, which " <>
         "bites hardest on `scored_follow_through`).\n\n" <>
+        "THE THIRD STAGE (unit: DISTINCT (recall, article) REFERENCES) — `referenced` " <>
+        "counts the articles a client asserted it USED, via " <>
+        "`POST /recall/{recall_id}/referenced`, and `reference_rate` divides it by " <>
+        "`searched` — the SAME denominator as `precision`, so it carries every one of " <>
+        "that field's caveats. It is `null`, never 0.0, on a day that surfaced nothing. " <>
+        "This is the ONLY figure here derived from a client ASSERTION rather than a " <>
+        "delivery the server observed: the assertion is bounded (only an article that " <>
+        "recall actually surfaced under that id, in the caller's own tenant, is " <>
+        "accepted) but the bound is on WHICH articles, not on whether the claim is " <>
+        "true. Read it as self-reported usage. Repeats cannot inflate it — the counter " <>
+        "dedupes on (recall, article) — and no ranking consumes it: `referenced` rows " <>
+        "are in no read set, are excluded from the heat index, and never enter " <>
+        "`followed_through`, `precision` or the per-article read counts.\n\n" <>
         "EXACT ATTRIBUTION (unit: READS, not surfaced results and not calls) — " <>
         "`attributed_opens` / `cross_key_opens` / `direct_opens` count READ rows by how " <>
         "their originating search was established server-side at write time. These are " <>
@@ -455,6 +470,95 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
     json(conn, RetrievalMetrics.list_snapshots(tenant_id, opts))
   end
 
+  operation(:search_coverage,
+    summary: "Declared telemetry coverage for search_events",
+    description:
+      "Which DECLARED columns of `search_events` are actually being filled, per search " <>
+        "surface, over a bounded window. A coverage PROFILE per `tool` names the columns a " <>
+        "correctly-instrumented caller is expected to supply; this reports how many rows " <>
+        "are missing each one. Role: orchestrator+.\n\n" <>
+        "WHY A DECLARATION AND NOT A QUERY — `search_events` shipped correct and nearly " <>
+        "blind: 2 of its first 133 rows carried any `client_*` context, discoverable only " <>
+        "by an audit nobody was scheduled to run. A declared profile reports a surface that " <>
+        "emits NOTHING (`rows: 0`), which no audit over existing rows can do.\n\n" <>
+        "WHAT IT CANNOT PROVE — that a PRESENT column is a CORRECT one. `client_kind` is " <>
+        "the worked example: one MCP process serves a session and every agent it " <>
+        "dispatches with an environment frozen at spawn, so it labels every search `main`. " <>
+        "Such a row is 100% covered here and still wrong about the only thing that column " <>
+        "exists to say. It also cannot see a search path that records NO row at all; the " <>
+        "`unprofiled` bucket is the nearest guard, and it only catches a tool that DID " <>
+        "write.\n\n" <>
+        "POPULATIONS, NOT ONE DENOMINATOR — each column names the rows that COULD have " <>
+        "carried it, reported as `scope`/`population` beside every count. `all` is every " <>
+        "row; `ran` excludes `outcome=rejected` (a rejected call never ran, so it has no " <>
+        "`mode_used` and no `duration_ms` by construction); `agent` is rows carrying a " <>
+        "`client_kind` or `client_session_id`, i.e. rows that really came through the MCP " <>
+        "client — the recall hook and smoke tests call the API directly and can never " <>
+        "supply `client_*`, so scoring them would measure loopctl's own automation. " <>
+        "`share_missing` is `null`, never `0.0`, on an empty population.\n\n" <>
+        "CLIENT_CONTEXT — the `agent` denominator is built from two of the columns it " <>
+        "scores, so a client that sends NOTHING empties it and leaves every `client_*` " <>
+        "line reading a clean 0/0. Each profile therefore also carries `client_context`, " <>
+        "scored over `all`, whose `missing` is the rows that carried NO client context at " <>
+        "all — that is where a fleet gone blind reports itself. A high share on " <>
+        "`memory_recall` is the recall hook and expected; a high share on " <>
+        "`knowledge_search` is not.\n\n" <>
+        "REQUIRED vs ENRICHABLE — `required` is what a client or the server can fill at " <>
+        "record time, so a miss is a defect. `enrichable` (`client_model`, `client_effort`, " <>
+        "`agent_id`) is what no client can send: the first two do not exist in the MCP " <>
+        "server's spawn environment and are filled offline by " <>
+        "`mix loopctl.enrich_search_events`, and `agent_id` is server-derived from a key " <>
+        "that may own no agent. Enrichment runs on a schedule, so a window ending near now " <>
+        "measures its LAG — read a recent enrichable share as a floor.\n\n" <>
+        "UNPROFILED — every `tool` value with rows and no declared profile is listed with " <>
+        "its row count, `null` included. `rows_total` counts the whole window, so " <>
+        "`rows_total` minus the sum of profile `rows` is exactly the unprofiled traffic; a " <>
+        "new surface cannot be silently dropped from the accounting.",
+    parameters: [
+      days: [
+        in: :query,
+        type: :integer,
+        description:
+          "Window length in days back from `to` (default 30, max #{SearchEventCoverage.max_window_days()}). " <>
+            "Clamped, never rejected.",
+        required: false
+      ],
+      to: [
+        in: :query,
+        type: :string,
+        description:
+          "ISO8601 date or datetime, exclusive upper bound (default now). A bare date is " <>
+            "read at 00:00:00Z. The window is [from, to). REJECTED with 400 when it cannot " <>
+            "be parsed — never silently replaced with now.",
+        required: false
+      ]
+    ],
+    responses: %{
+      200 =>
+        {"Search event coverage", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      400 => {"Invalid to", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      503 =>
+        {"Database unavailable — retryable; see Retry-After header", "application/json",
+         Schemas.ErrorResponse},
+      504 =>
+        {"Database statement timeout (code db_statement_timeout) — the coverage scan " <>
+           "exceeded its statement timeout; narrow `days`", "application/json",
+         Schemas.ErrorResponse}
+    }
+  )
+
+  @doc "GET /api/v1/knowledge/analytics/search-coverage"
+  def search_coverage(conn, params) do
+    with :ok <- validate_to(params["to"]) do
+      tenant_id = conn.assigns.current_api_key.tenant_id
+      {from, to} = coverage_window(params)
+
+      json(conn, SearchEventCoverage.report(tenant_id, from, to))
+    end
+  end
+
   operation(:curation_log,
     summary: "KB curation adjustment log",
     description:
@@ -495,22 +599,25 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
       200 =>
         {"Curation log", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      400 => {"Invalid since", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
   @doc "GET /api/v1/knowledge/curation-log"
   def curation_log(conn, params) do
-    tenant_id = conn.assigns.current_api_key.tenant_id
+    with :ok <- validate_since(params["since"]) do
+      tenant_id = conn.assigns.current_api_key.tenant_id
 
-    opts =
-      []
-      |> put_limit(params["limit"], 50, 500)
-      |> put_offset(params["offset"])
-      |> maybe_put(:kind, params["kind"])
-      |> maybe_put(:since, parse_since(params["since"]))
+      opts =
+        []
+        |> put_limit(params["limit"], 50, 500)
+        |> put_offset(params["offset"])
+        |> maybe_put(:kind, params["kind"])
+        |> maybe_put(:since, parse_since(params["since"]))
 
-    json(conn, KbCuration.list(tenant_id, opts))
+      json(conn, KbCuration.list(tenant_id, opts))
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -541,6 +648,11 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
         end
     end
   end
+
+  # Plug parses `?since[]=x` into a LIST and `?since[a]=x` into a MAP, so without this the
+  # clauses above raise FunctionClauseError on a well-formed request and `action_fallback`,
+  # which only handles RETURNED errors, lets it out as a 500.
+  defp parse_since(_), do: nil
 
   # Offset enables paging the ranking past the first page — never rejected, so a
   # caller can enumerate to completeness (the rankings are access-count aggregates,
@@ -580,6 +692,34 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
   defp validate_access_type(_value),
     do: {:error, :bad_request, "Invalid access_type: expected a string"}
 
+  # REJECT an unparseable `to` rather than substituting `now`, for the reason above: the
+  # window silently became "the last N days ending now" while the operator believed they had
+  # asked about a historical week, and `window` in the body was the only thing that said so.
+  # Reject-don't-ignore, the rule this controller already applies to `access_type`: a
+  # PRESENT-but-unparseable bound is a 400, never a silent fall back to the default window.
+  # `since` runs the same clauses as `to` because the wrong answer is worse there —
+  # `maybe_put/3` DROPS the key, so the caller gets the most recent page presented as the
+  # window it asked for, rather than an error.
+  defp validate_to(value), do: validate_bound("to", value)
+  defp validate_since(value), do: validate_bound("since", value)
+
+  defp validate_bound(_name, nil), do: :ok
+  defp validate_bound(_name, ""), do: :ok
+
+  defp validate_bound(name, value) when is_binary(value) do
+    case parse_since(value) do
+      nil ->
+        {:error, :bad_request,
+         "Invalid #{name} #{inspect(value)}. Expected an ISO8601 date or datetime."}
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp validate_bound(name, _value),
+    do: {:error, :bad_request, "Invalid #{name}: expected a string"}
+
   defp put_project_id(opts, nil), do: opts
   defp put_project_id(opts, ""), do: opts
 
@@ -606,6 +746,34 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
 
   defp put_int(opts, key, value, default, min_value, max_value) do
     Keyword.put(opts, key, parse_int(value, default) |> max(min_value) |> min(max_value))
+  end
+
+  # CLAMPED here, so `SearchEventCoverage.report/3`'s ArgumentError stays a programming
+  # error rather than a 500 a caller can trigger with a query string. `from` is floored at
+  # `history_starts/0`: a window opening before the table existed is not a smaller sample.
+  defp coverage_window(params) do
+    to =
+      case parse_since(params["to"]) do
+        %DateTime{} = dt -> dt
+        # `parse_since/1` accepts a bare ISO8601 DATE, which is a reasonable thing to send
+        # at an "exclusive upper bound". Read it at the start of that UTC day rather than
+        # letting the catch-all below answer for `now` instead.
+        %Date{} = d -> DateTime.new!(d, ~T[00:00:00.000000], "Etc/UTC")
+        _ -> DateTime.utc_now()
+      end
+
+    days = parse_int(params["days"], 30) |> max(1) |> min(SearchEventCoverage.max_window_days())
+    from = DateTime.add(to, -days * 86_400, :second)
+    floor_at = SearchEventCoverage.history_starts()
+
+    from = if DateTime.compare(from, floor_at) == :lt, do: floor_at, else: from
+
+    # A `to` at or before the floor would leave an empty/inverted window. Report the first
+    # instant instead of raising: an operator asking about pre-history gets an honest
+    # all-zero window, not a 500.
+    to = if DateTime.compare(to, from) != :gt, do: DateTime.add(from, 1, :second), else: to
+
+    {from, to}
   end
 
   defp parse_int(nil, default), do: default

@@ -36,6 +36,7 @@ defmodule LoopctlWeb.ArticleController do
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.IdempotencyTag
+  alias Loopctl.Knowledge.Suppression
   alias Loopctl.TelemetryEvents
   alias LoopctlWeb.ArticleJSON
   alias LoopctlWeb.AuditContext
@@ -235,9 +236,15 @@ defmodule LoopctlWeb.ArticleController do
       "Lists articles with optional filters and pagination. " <>
         "When called via GET /projects/:project_id/articles, project_id is set from path. " <>
         "Unlike search (which ranks and returns **published** articles only and lags writes " <>
-        "while embeddings index), this is the **lag-free, all-status** read of the DB of " <>
+        "while embeddings index), this is the **lag-free, every-status** read of the DB of " <>
         "record — use it for dedup/idempotency/repair (\"does an article with this tag/" <>
-        "source/idempotency_key exist?\"). `meta.total_count` is the exact filtered count. " <>
+        "source/idempotency_key exist?\"). It spans every `status`, but NOT every row: " <>
+        "retrieval-suppressed articles are EXCLUDED by default, so a repair pass that must " <>
+        "see the whole table has to pass `suppressed=include` (or `only`). The one " <>
+        "exception is an `idempotency_key` lookup, which includes them unless you say " <>
+        "otherwise — an identity check that missed a suppressed row would mint a duplicate " <>
+        "of an article that already exists. `meta.total_count` is the exact filtered count, " <>
+        "and it counts the same set the rows come from, so it moves with `suppressed` too. " <>
         "**Returns a body-less summary by default** (safe to enumerate up to limit=1000); pass " <>
         "`include_body=true` to also return `body`, which bounds the page by a ~5 MB " <>
         "serialized-body budget and adds `meta.next_offset`/`meta.has_more`/`meta.byte_truncated` " <>
@@ -293,6 +300,20 @@ defmodule LoopctlWeb.ArticleController do
           "Include full article body (default false). When true the page is bounded by a " <>
             "~5 MB serialized-body budget and may return fewer than `limit` rows; continue via " <>
             "`meta.next_offset` while `meta.has_more` is true."
+      ],
+      suppressed: [
+        in: :query,
+        type: :string,
+        description:
+          "How to treat RETRIEVAL-SUPPRESSED articles: `exclude` (default), `include`, or " <>
+            "`only`. `only` is the discovery path — it lists exactly what there is to undo " <>
+            "via POST /api/v1/articles/:id/unsuppress, across every status rather than " <>
+            "published only. An unrecognised value resolves to `exclude`: a typo must never " <>
+            "put a suppressed article back on a listing. Omitting the parameter keeps the " <>
+            "per-filter default, which is `exclude` everywhere except an `idempotency_key` " <>
+            "lookup. The default body-less rows do NOT carry the three `suppressed_*` " <>
+            "fields — pair this with `include_body=true`, or read GET /articles/:id, to see " <>
+            "who suppressed what and why."
       ]
     ],
     responses: %{
@@ -302,7 +323,10 @@ defmodule LoopctlWeb.ArticleController do
            type: :object,
            properties: %{
              data: %OpenApiSpex.Schema{type: :array},
-             meta: %OpenApiSpex.Schema{type: :object}
+             meta: %OpenApiSpex.Schema{
+               type: :object,
+               properties: %{outcome: LoopctlWeb.Outcome.schema()}
+             }
            }
          }},
       400 =>
@@ -921,6 +945,14 @@ defmodule LoopctlWeb.ArticleController do
         |> maybe_add_opt(:idempotency_key, string_param(params["idempotency_key"]))
         |> maybe_add_opt(:limit, effective_limit)
         |> maybe_add_opt(:offset, parse_int(params["offset"]))
+        # `maybe_add_opt`, NOT the unconditional `Keyword.put` GET /knowledge/index uses:
+        # this endpoint also filters by `idempotency_key`, and `article_suppression_mode/1`
+        # defaults THAT lookup to `:include` (an identity check that silently missed a
+        # suppressed row would mint a duplicate). Putting a parsed `:exclude` on every
+        # request would overwrite that default, so an absent param must leave the opt off
+        # and let the context decide. A PRESENT but unrecognised value still resolves to
+        # `:exclude` — a typo must never put a suppressed article back on a listing.
+        |> maybe_add_opt(:suppressed, parse_suppressed(params["suppressed"]))
         # Body-less summary by default; opt into full bodies (byte-budget bounded)
         # with ?include_body=true.
         |> Keyword.put(:include_body, params["include_body"] == "true")
@@ -1287,6 +1319,14 @@ defmodule LoopctlWeb.ArticleController do
 
   defp maybe_merge_project_id(attrs, nil), do: attrs
   defp maybe_merge_project_id(attrs, project_id), do: Map.put(attrs, "project_id", project_id)
+
+  # Absent (or a non-string form like `?suppressed[]=x`) yields nil, so `maybe_add_opt/3`
+  # leaves the opt off entirely and the context default stands. Anything else goes through
+  # `Suppression.parse_mode/1`, which fails closed to `:exclude`.
+  defp parse_suppressed(value) when is_binary(value) and value != "",
+    do: Suppression.parse_mode(value)
+
+  defp parse_suppressed(_), do: nil
 
   defp maybe_add_opt(opts, _key, nil), do: opts
   defp maybe_add_opt(opts, _key, []), do: opts

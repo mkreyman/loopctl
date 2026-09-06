@@ -50,7 +50,7 @@ defmodule Loopctl.Knowledge.Analytics do
 
   # Must stay identical to `ArticleAccessEvent`'s `@access_types` — see the note there for why
   # `"drill"` exists and why the two allowlists move together (#569).
-  @valid_access_types ~w(search get context index drill)
+  @valid_access_types ~w(search get context index drill referenced)
 
   # A READ is a body actually delivered to an agent. `search` and `index` are IMPRESSIONS —
   # rows the RANKER produced, one per surfaced result — and they outnumber reads ~50:1 here.
@@ -70,6 +70,13 @@ defmodule Loopctl.Knowledge.Analytics do
   # EXCLUDED from the heat index (`Knowledge.@heat_read_access_types`), and that divergence is
   # intended — heat asks "was this a deliberate vote", this asks "was a body delivered". Do
   # not unify the two lists.
+  #
+  # `referenced` is NOT a read and must never join this list. Every other type here is the
+  # server observing a body it delivered; `referenced` is a CLIENT asserting that it used one
+  # (`record_referenced/5`). Counting an assertion as a delivery would let a caller inflate
+  # its own article's read counts, per-project and per-agent usage, and the "unused articles"
+  # report — the same self-inflation `@heat_read_access_types` exists to prevent, one table
+  # over.
   @read_access_types ~w(get context drill)
 
   # The access types that mean "a body was DELIVERED to the agent" — the ones worth
@@ -77,6 +84,14 @@ defmodule Loopctl.Knowledge.Analytics do
   # follow-through, INCLUDING `drill`: #569 split drill out of the heat index so that index
   # could not rank on reads it caused itself, but "was this read produced by a search" is a
   # different question and a drill delivers a body like any other read.
+  #
+  # `referenced` is absent for a different reason from the impressions: its origin is not
+  # RESOLVED at all. The caller names the recall, the server verifies the article was
+  # surfaced under it, and `origin_search_id` is stamped from that verified id — so there is
+  # nothing for `resolve_origins/5` to look up, and `origin_attribution` stays NULL because
+  # its vocabulary (`same_key`/`cross_key`/`none`) describes how a lookup ESTABLISHED an
+  # origin. Leaving it NULL is also what keeps `attributed_opens`/`direct_opens` counting
+  # reads only.
   @attributable_access_types ~w(get context drill)
 
   # How far back a read looks for the search that surfaced it. Fixed at WRITE time, which is
@@ -246,6 +261,11 @@ defmodule Loopctl.Knowledge.Analytics do
 
   The optional `context` map attributes all rows in the batch to the
   same project and/or story. Cross-tenant values are silently dropped.
+
+  Returns `:ok`. The one exception is a caller that asked for a SYNCHRONOUS write
+  (`context.sync?`, the merged recall): it publishes the id these rows carry, so a failed
+  batch is reported as `{:error, :recording_failed}` rather than swallowed. The async path
+  stays fire-and-forget.
   """
   @spec record_search_access(
           Ecto.UUID.t(),
@@ -254,7 +274,7 @@ defmodule Loopctl.Knowledge.Analytics do
           String.t() | nil,
           metadata(),
           context()
-        ) :: :ok
+        ) :: :ok | {:error, :recording_failed}
   def record_search_access(
         tenant_id,
         article_ids,
@@ -291,7 +311,6 @@ defmodule Loopctl.Knowledge.Analytics do
       end)
 
     do_record_async(items, tenant_id, api_key_id, "search", context)
-    :ok
   end
 
   def record_search_access(_tenant_id, _ids, _api_key_id, _query, _metadata, _context), do: :ok
@@ -336,6 +355,160 @@ defmodule Loopctl.Knowledge.Analytics do
 
   def record_context_access(_tenant_id, _ids, _api_key_id, _metadata, _context), do: :ok
 
+  @doc """
+  Records that a caller USED articles a recall surfaced — the third funnel stage.
+
+  Surfaced → opened → REFERENCED. The first two are observations: the server wrote the
+  surfacing rows and delivered the bodies. This one is an ASSERTION by the client, because
+  nothing on the server can see which of the articles it handed over actually ended up in
+  an answer. That is precisely the stage the KB has never been able to measure — measured
+  surfaced-to-opened follow-through is 1.67%, and whether an opened article was USED was
+  not recorded at all.
+
+  Because it is an assertion, it is bounded rather than trusted:
+
+    * `recall_id` is matched against `article_access_events` rows in the CALLER'S OWN
+      tenant. There is no cross-tenant read and no existence oracle — an unknown id simply
+      surfaces nothing, so every requested article comes back `not_surfaced`.
+    * ONLY articles that recall actually surfaced under that `recall_id` are accepted. Any
+      other id fails the whole call with `{:error, :not_surfaced, ids}`; nothing is written.
+      This is all-or-nothing on purpose: a partial write would record a truth mixed with a
+      rejection under one id and leave the caller unable to say which.
+    * `api_key_id` is the CALLER'S key, stamped server-side, never taken from params.
+    * `origin_search_id` is stamped from the VERIFIED `recall_id`, and `origin_attribution`
+      stays NULL — see `@attributable_access_types` for why an asserted origin does not
+      belong in that vocabulary.
+
+  Writes SYNCHRONOUSLY, unlike every other recorder here, because the caller is told how
+  many rows were recorded and a fire-and-forget count would be a guess.
+
+  Repeat calls for the same `(recall_id, article_id)` write another row rather than
+  erroring. `RetrievalMetrics` counts DISTINCT `(origin_search_id, article_id)` pairs, so a
+  client that posts twice cannot inflate the metric; the duplicate rows are kept because
+  `article_access_events` is an immutable event log, not a state table.
+
+  ## Returns
+
+    * `{:ok, %{recall_id: id, article_ids: [...], recorded: n}}`
+    * `{:error, :not_surfaced, [ids]}` — the ids this recall did not surface
+    * `{:error, :lookup_failed}` — the admission check itself could not run (logged). NOT
+      folded into `not_surfaced`: that would blame the caller for a DB fault.
+    * `{:error, :recording_failed}` — the insert itself failed (logged)
+  """
+  @spec record_referenced(
+          Ecto.UUID.t(),
+          Ecto.UUID.t(),
+          [Ecto.UUID.t()],
+          Ecto.UUID.t(),
+          context()
+        ) ::
+          {:ok, map()}
+          | {:error, :not_surfaced, [String.t()]}
+          | {:error, :lookup_failed | :recording_failed}
+  def record_referenced(tenant_id, recall_id, article_ids, api_key_id, context \\ %{})
+
+  def record_referenced(tenant_id, recall_id, article_ids, api_key_id, context)
+      when is_binary(tenant_id) and is_binary(recall_id) and is_list(article_ids) and
+             is_binary(api_key_id) do
+    requested = article_ids |> Enum.filter(&is_binary/1) |> Enum.uniq()
+
+    with {:ok, ids} <- surfaced_article_ids(tenant_id, recall_id),
+         surfaced = MapSet.new(ids),
+         [] <- Enum.reject(requested, &MapSet.member?(surfaced, &1)) do
+      insert_referenced(tenant_id, recall_id, requested, api_key_id, context)
+    else
+      {:error, :lookup_failed} -> {:error, :lookup_failed}
+      missing when is_list(missing) -> {:error, :not_surfaced, missing}
+    end
+  end
+
+  def record_referenced(_tenant_id, _recall_id, _article_ids, _api_key_id, _context),
+    do: {:error, :recording_failed}
+
+  @doc """
+  The set of article ids a given recall/search SURFACED, within one tenant.
+
+  The surfacing rows are the `access_type: "search"` rows carrying that id in
+  `metadata->>'search_id'` — the id `search_combined/3` publishes as `meta.search_id` and
+  the merged recall publishes as `meta.recall_id`. Public because it is the whole
+  admission check for `record_referenced/5` and a test that cannot see it cannot pin it.
+
+  Returns `{:ok, list}` — a plain LIST, not a `MapSet`, because a spec naming an opaque
+  type a function builds itself is a dialyzer contract violation and the caller wraps it
+  in a set anyway.
+
+  A DB failure is `{:error, :lookup_failed}`, never an empty list. The recorders around
+  here are fire-and-forget and rescue to a no-op, but this one is a caller-visible
+  ADMISSION CHECK: an empty list means "this recall surfaced nothing", so folding a
+  statement timeout into it would answer `422 not_surfaced` — a false statement about the
+  caller's own ids — instead of a retryable fault.
+  """
+  @spec surfaced_article_ids(Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, [String.t()]} | {:error, :lookup_failed}
+  def surfaced_article_ids(tenant_id, recall_id)
+      when is_binary(tenant_id) and is_binary(recall_id) do
+    ids =
+      from(e in ArticleAccessEvent,
+        where: e.tenant_id == ^tenant_id,
+        where: e.access_type == "search",
+        where: fragment("?->>'search_id'", e.metadata) == ^recall_id,
+        distinct: true,
+        select: e.article_id
+      )
+      |> AdminRepo.all()
+
+    {:ok, ids}
+  rescue
+    error ->
+      Logger.warning("Knowledge.Analytics surfaced lookup failed: #{Exception.message(error)}")
+      {:error, :lookup_failed}
+  end
+
+  def surfaced_article_ids(_tenant_id, _recall_id), do: {:ok, []}
+
+  # The write half. Deliberately NOT `do_record_sync/5`: that path resolves the origin by
+  # lookup, and `referenced` is not an attributable type there, so it would land every row
+  # with a NULL `origin_search_id` — losing the only thing that ties the reference back to
+  # the recall that produced it.
+  defp insert_referenced(_tenant_id, recall_id, [], _api_key_id, _context),
+    do: {:ok, %{recall_id: recall_id, article_ids: [], recorded: 0}}
+
+  defp insert_referenced(tenant_id, recall_id, article_ids, api_key_id, context) do
+    {project_id, story_id} = resolve_attribution(tenant_id, api_key_id, context)
+    now = DateTime.utc_now()
+
+    rows =
+      Enum.map(article_ids, fn article_id ->
+        %{
+          id: Ecto.UUID.generate(),
+          tenant_id: tenant_id,
+          article_id: article_id,
+          api_key_id: api_key_id,
+          project_id: project_id,
+          story_id: story_id,
+          access_type: "referenced",
+          metadata: %{"recall_id" => recall_id},
+          accessed_at: now,
+          # Stamped from the VERIFIED recall id — the article was proven surfaced under it
+          # above. `origin_attribution` stays NULL: its three values describe how a
+          # server-side LOOKUP established an origin, and this one was asserted and checked.
+          origin_search_id: recall_id,
+          origin_attribution: nil
+        }
+      end)
+
+    {count, _} = AdminRepo.insert_all(ArticleAccessEvent, rows)
+    {:ok, %{recall_id: recall_id, article_ids: article_ids, recorded: count}}
+  rescue
+    error ->
+      # Unlike the fire-and-forget recorders, this one REPORTS the failure: the caller is
+      # being told how many rows were written, and answering 200 for zero rows would be a
+      # lie of exactly the kind rule 3 forbids.
+      Logger.warning("Knowledge.Analytics referenced insert failed: #{Exception.message(error)}")
+
+      {:error, :recording_failed}
+  end
+
   # ---------------------------------------------------------------------------
   # Per-article stats
   # ---------------------------------------------------------------------------
@@ -347,13 +520,16 @@ defmodule Loopctl.Knowledge.Analytics do
 
   A map with:
 
-  - `:total_events` -- total event count, impressions included
+  - `:total_events` -- total OBSERVED event count, impressions included. The
+    client-asserted `referenced` rows are NOT counted here; they stay visible under
+    their own key in `accesses_by_type`, so the breakdown may sum higher than the total
   - `:total_reads` -- events that delivered a body (`get`/`context`/`drill`)
-  - `:unique_keys` -- distinct `api_key_id` count. NOT an agent count: v2 mints one
-    ephemeral key per dispatch, so one agent dispatched N times is N keys
-  - `:last_accessed_at` -- most recent `accessed_at` (or nil)
-  - `:accesses_by_type` -- `%{"search" => N, "get" => N, ...}`
-  - `:recent_accesses` -- last 10 events as plain maps
+  - `:unique_keys` -- distinct `api_key_id` count over the same OBSERVED rows. NOT an
+    agent count: v2 mints one ephemeral key per dispatch, so one agent dispatched N
+    times is N keys
+  - `:last_accessed_at` -- most recent OBSERVED `accessed_at` (or nil)
+  - `:accesses_by_type` -- `%{"search" => N, "get" => N, ...}`, `referenced` included
+  - `:recent_accesses` -- last 10 OBSERVED events as plain maps
   """
   @spec get_article_stats(Ecto.UUID.t(), Ecto.UUID.t()) :: map()
   def get_article_stats(tenant_id, article_id) do
@@ -362,19 +538,25 @@ defmodule Loopctl.Knowledge.Analytics do
         where: e.tenant_id == ^tenant_id and e.article_id == ^article_id
       )
 
-    total_events = AdminRepo.aggregate(base, :count, :id)
+    # Every delivery signal on this payload reads `observed` — total, unique keys, last
+    # access and the recent sample alike — so a client posting the same reference in a
+    # loop moves none of them. `accesses_by_type` keeps `base`: it is a labelled
+    # breakdown, not a total, so the assertion stays VISIBLE there under its own key.
+    observed = exclude_asserted(base)
+
+    total_events = AdminRepo.aggregate(observed, :count, :id)
 
     total_reads =
       from(e in base, where: e.access_type in @read_access_types)
       |> AdminRepo.aggregate(:count, :id)
 
     unique_keys =
-      from(e in base, select: count(e.api_key_id, :distinct))
+      from(e in observed, select: count(e.api_key_id, :distinct))
       |> AdminRepo.one()
       |> Kernel.||(0)
 
     last_accessed_at =
-      from(e in base, select: max(e.accessed_at))
+      from(e in observed, select: max(e.accessed_at))
       |> AdminRepo.one()
 
     accesses_by_type =
@@ -383,7 +565,7 @@ defmodule Loopctl.Knowledge.Analytics do
       |> Map.new()
 
     recent_accesses =
-      from(e in base,
+      from(e in observed,
         order_by: [desc: e.accessed_at],
         limit: 10,
         select: %{
@@ -795,14 +977,16 @@ defmodule Loopctl.Knowledge.Analytics do
         where: e.accessed_at >= ^since
       )
 
-    total_events = AdminRepo.aggregate(base, :count, :id)
+    observed = exclude_asserted(base)
+
+    total_events = AdminRepo.aggregate(observed, :count, :id)
 
     total_reads =
       from(e in base, where: e.access_type in @read_access_types)
       |> AdminRepo.aggregate(:count, :id)
 
     unique_articles =
-      from(e in base, select: count(e.article_id, :distinct))
+      from(e in observed, select: count(e.article_id, :distinct))
       |> AdminRepo.one()
       |> Kernel.||(0)
 
@@ -907,19 +1091,21 @@ defmodule Loopctl.Knowledge.Analytics do
         where: e.accessed_at >= ^since
       )
 
-    total_events = AdminRepo.aggregate(base, :count, :id)
+    observed = exclude_asserted(base)
+
+    total_events = AdminRepo.aggregate(observed, :count, :id)
 
     total_reads =
       from(e in base, where: e.access_type in @read_access_types)
       |> AdminRepo.aggregate(:count, :id)
 
     unique_articles =
-      from(e in base, select: count(e.article_id, :distinct))
+      from(e in observed, select: count(e.article_id, :distinct))
       |> AdminRepo.one()
       |> Kernel.||(0)
 
     unique_api_keys =
-      from(e in base, select: count(e.api_key_id, :distinct))
+      from(e in observed, select: count(e.api_key_id, :distinct))
       |> AdminRepo.one()
       |> Kernel.||(0)
 
@@ -1174,7 +1360,13 @@ defmodule Loopctl.Knowledge.Analytics do
   defp do_record_async([], _tenant_id, _api_key_id, _access_type, _context), do: :ok
 
   defp do_record_async(items, tenant_id, api_key_id, access_type, context) do
-    case Application.get_env(:loopctl, :analytics_recording_mode, :async) do
+    # `context[:sync?]` (internal, set only by a server-side call site — never reachable
+    # from a request body) forces the write onto the request path. The merged recall sets
+    # it because it PUBLISHES the id these rows carry and a caller may hand it straight
+    # back to `POST /recall/:recall_id/referenced`: off the request path the surfacing rows
+    # have not committed yet, so an immediate reference reads an empty surfaced set and is
+    # refused as `not_surfaced` with nothing written.
+    case recording_mode(context) do
       :sync ->
         do_record_sync(items, tenant_id, api_key_id, access_type, context)
 
@@ -1193,6 +1385,23 @@ defmodule Loopctl.Knowledge.Analytics do
       )
 
       :ok
+  end
+
+  defp recording_mode(context),
+    do:
+      resolve_recording_mode(
+        context,
+        Application.get_env(:loopctl, :analytics_recording_mode, :async)
+      )
+
+  @doc false
+  # The `sync?` contract as a PURE function, public only so it can be pinned by a test that
+  # does not depend on the ambient mode: `config/test.exs` forces `:analytics_recording_mode`
+  # to `:sync` for the whole test env, so a test driving the request path passes whether or
+  # not `sync?` is honoured — an inert guard of exactly the shape the repo has been bitten by.
+  @spec resolve_recording_mode(map(), :sync | :async) :: :sync | :async
+  def resolve_recording_mode(context, configured) when is_map(context) do
+    if Map.get(context, :sync?, false), do: :sync, else: configured
   end
 
   @doc false
@@ -1239,17 +1448,19 @@ defmodule Loopctl.Knowledge.Analytics do
     end
   rescue
     error ->
-      # Broad rescue so analytics failures never propagate to the read
-      # caller. Logged at :warning so operators can see dropped events in
-      # production; callers still see :ok. Malformed UUIDs in the
-      # attribution context are caught earlier in validate_project/2 and
-      # validate_story/2 and never reach this rescue.
+      # Broad rescue so analytics failures never propagate to the read caller as a crash.
+      # Logged at :warning so operators can see dropped events in production. The RESULT is
+      # reported rather than swallowed: on the `sync?` path the caller PUBLISHES the id
+      # these rows carry, so a dropped batch means a recall whose `recall_id` can never be
+      # referenced, and it has to be able to say so. The async task discards this.
+      # Malformed UUIDs in the attribution context are caught earlier in validate_project/2
+      # and validate_story/2 and never reach this rescue.
       Logger.warning(
         "Knowledge.Analytics record failed (event dropped): " <>
           Exception.message(error)
       )
 
-      :ok
+      {:error, :recording_failed}
   end
 
   # ---------------------------------------------------------------------------
@@ -1541,14 +1752,27 @@ defmodule Loopctl.Knowledge.Analytics do
     from([event: e] in query, where: e.access_type in @read_access_types)
   end
 
-  # The explicit escape hatch for "I really do want impressions counted too".
-  defp maybe_filter_access_type(query, "all"), do: query
+  # The explicit escape hatch for "I really do want impressions counted too". Impressions,
+  # not assertions: `referenced` stays out, because "all" feeds `access_count`/`unique_keys`
+  # on the rankings an operator reads as delivery, and a client that posts the same
+  # reference in a loop would otherwise rank its own article first. Ask for it by name to
+  # see it.
+  defp maybe_filter_access_type(query, "all"), do: exclude_asserted_event(query)
 
   defp maybe_filter_access_type(query, type) when type in @valid_access_types do
     from([event: e] in query, where: e.access_type == ^type)
   end
 
-  defp maybe_filter_access_type(query, _), do: query
+  defp maybe_filter_access_type(query, _), do: exclude_asserted_event(query)
+
+  # `referenced` is a CLIENT ASSERTION (`record_referenced/5`), never an event the server
+  # observed, so every counter an operator reads as delivery excludes it — per-article,
+  # per-project, per-agent and the rankings alike. Missing one surface reintroduces the
+  # whole defect there, which is why this is one helper rather than a repeated predicate.
+  defp exclude_asserted(query), do: from(e in query, where: e.access_type != "referenced")
+
+  defp exclude_asserted_event(query),
+    do: from([event: e] in query, where: e.access_type != "referenced")
 
   defp maybe_filter_project(query, nil), do: query
 

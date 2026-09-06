@@ -614,7 +614,7 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       assert AdminRepo.get!(Article, superseded.id).status == :superseded
     end
 
-    test "supplying more than one selector is rejected (no silent confirm bypass)", %{conn: conn} do
+    test "supplying more than one selector is rejected", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
       a = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["dupe"]})
@@ -624,8 +624,7 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
         |> auth_conn(raw_key)
         |> post(~p"/api/v1/knowledge/bulk-delete", %{
           "article_ids" => [a.id],
-          "tag" => "dupe",
-          "confirm" => true
+          "tag" => "dupe"
         })
         |> json_response(400)
 
@@ -728,30 +727,417 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       assert AdminRepo.get!(Article, web.id).status == :published
     end
 
-    test "archive by tag requires confirm: true", %{conn: conn} do
+    test "archive by tag is a two-step proposal flow: dry-run mints a token, replay archives it",
+         %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
       tagged = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["dupe"]})
 
-      # Without confirm → 400, nothing archived.
+      # Step 0: neither dry_run nor a replay credential → 400 dry_run_required.
       refused =
         conn
         |> auth_conn(raw_key)
         |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "dupe"})
         |> json_response(400)
 
-      assert refused["error"]["message"] =~ "confirm"
+      assert refused["error"]["code"] == "dry_run_required"
+      assert refused["error"]["message"] =~ "dry_run"
       assert AdminRepo.get!(Article, tagged.id).status == :published
 
-      # With confirm → archived.
+      # Step 1: dry-run mints the proposal and mutates nothing.
+      dry =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "dupe", "dry_run" => true})
+        |> json_response(200)
+
+      assert dry["data"]["would_affect"] == 1
+      assert dry["meta"]["op"] == "archive"
+      token = dry["meta"]["token"]
+      assert is_binary(token)
+      assert AdminRepo.get!(Article, tagged.id).status == :published
+
+      # Step 2: replay archives exactly the frozen set.
       ok =
         build_conn()
         |> auth_conn(raw_key)
-        |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "dupe", "confirm" => true})
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "dupe", "token" => token})
         |> json_response(200)
 
       assert ok["data"]["affected"] == 1
+      assert ok["meta"]["op"] == "archive"
+      assert ok["meta"]["set_based"] == true
       assert AdminRepo.get!(Article, tagged.id).status == :archived
+    end
+
+    test "a tag archive token freezes the id-set: rows that start matching after the dry-run are untouched",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      previewed = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["frz"]})
+
+      token =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "frz", "dry_run" => true})
+        |> json_response(200)
+        |> get_in(["meta", "token"])
+
+      # TOCTOU: a NEW matching article appears between the preview and the replay.
+      latecomer = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["frz"]})
+
+      body =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "frz", "token" => token})
+        |> json_response(200)
+
+      assert body["data"]["affected"] == 1
+      assert AdminRepo.get!(Article, previewed.id).status == :archived
+      assert AdminRepo.get!(Article, latecomer.id).status == :published
+    end
+
+    test "a tag archive token is single-use: the replay cannot be replayed", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["once"]})
+
+      token =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "once", "dry_run" => true})
+        |> json_response(200)
+        |> get_in(["meta", "token"])
+
+      build_conn()
+      |> auth_conn(raw_key)
+      |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "once", "token" => token})
+      |> json_response(200)
+
+      body =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "once", "token" => token})
+        |> json_response(400)
+
+      assert body["error"]["message"] =~ "token"
+    end
+
+    test "a HARD-delete token cannot be replayed as a soft tag archive", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      a = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["xtype1"]})
+
+      hard_token =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{
+          "tag" => "xtype1",
+          "dry_run" => true,
+          "hard" => true
+        })
+        |> json_response(200)
+        |> get_in(["meta", "token"])
+
+      assert is_binary(hard_token)
+
+      body =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "xtype1", "token" => hard_token})
+        |> json_response(400)
+
+      assert body["error"]["message"] =~ "token"
+      # Nothing archived, and the delete token was NOT consumed by the refusal.
+      assert AdminRepo.get!(Article, a.id).status == :published
+    end
+
+    test "a soft tag-archive token cannot be replayed as a hard delete", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      a = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["xtype2"]})
+
+      soft_token =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "xtype2", "dry_run" => true})
+        |> json_response(200)
+        |> get_in(["meta", "token"])
+
+      assert is_binary(soft_token)
+
+      body =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"hard" => true, "token" => soft_token})
+        |> json_response(400)
+
+      assert body["error"]["message"] =~ "token"
+      # The row survives: the escalation from a reversible-shaped proposal to an
+      # irreversible delete is exactly what the token type prevents.
+      assert AdminRepo.get!(Article, a.id).status == :published
+    end
+
+    test "a tag-archive token minted in tenant A cannot be spent in tenant B", %{conn: conn} do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      {key_a, _} = fixture(:api_key, %{tenant_id: tenant_a.id, role: :user})
+      {key_b, _} = fixture(:api_key, %{tenant_id: tenant_b.id, role: :user})
+
+      a_article = fixture(:article, %{tenant_id: tenant_a.id, status: :published, tags: ["iso"]})
+      b_article = fixture(:article, %{tenant_id: tenant_b.id, status: :published, tags: ["iso"]})
+
+      token =
+        conn
+        |> auth_conn(key_a)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "iso", "dry_run" => true})
+        |> json_response(200)
+        |> get_in(["meta", "token"])
+
+      body =
+        build_conn()
+        |> auth_conn(key_b)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "iso", "token" => token})
+        |> json_response(400)
+
+      assert body["error"]["message"] =~ "token"
+      assert AdminRepo.get!(Article, a_article.id).status == :published
+      assert AdminRepo.get!(Article, b_article.id).status == :published
+
+      # And the token still works for the tenant that minted it.
+      ok =
+        build_conn()
+        |> auth_conn(key_a)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "iso", "token" => token})
+        |> json_response(200)
+
+      assert ok["data"]["affected"] == 1
+      assert AdminRepo.get!(Article, a_article.id).status == :archived
+      assert AdminRepo.get!(Article, b_article.id).status == :published
+    end
+
+    test "a request carrying `confirm` is refused with code confirm_removed, never ignored", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      tagged = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["gone"]})
+      by_id = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      # The old call shape (tag + confirm: true) is refused, not honoured.
+      refused =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "gone", "confirm" => true})
+        |> json_response(400)
+
+      assert refused["error"]["code"] == "confirm_removed"
+      assert refused["error"]["message"] =~ "dry_run"
+      assert AdminRepo.get!(Article, tagged.id).status == :published
+
+      # `confirm: false` is refused too — the key's PRESENCE is what is refused, so a
+      # stale client cannot discover the parameter is inert by watching it be ignored.
+      false_refused =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "gone", "confirm" => false})
+        |> json_response(400)
+
+      assert false_refused["error"]["code"] == "confirm_removed"
+
+      # It also refuses a selector that would otherwise have succeeded outright,
+      # so the removal cannot be missed by a client that only archives by id.
+      ids_refused =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{
+          "article_ids" => [by_id.id],
+          "confirm" => true
+        })
+        |> json_response(400)
+
+      assert ids_refused["error"]["code"] == "confirm_removed"
+      assert AdminRepo.get!(Article, by_id.id).status == :published
+    end
+
+    # config/test.exs sets :bulk_delete_frozen_max to 3, so >3 matches is oversized.
+    test "oversized tag archive: dry-run returns no token + confirm_hash; re-confirm archives",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      ids =
+        for _ <- 1..4 do
+          fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["bigsoft"]}).id
+        end
+
+      dry =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "bigsoft", "dry_run" => true})
+        |> json_response(200)
+
+      assert dry["data"]["would_affect"] == 4
+      assert dry["meta"]["token"] == nil
+      assert dry["meta"]["oversized"] == true
+      assert is_binary(dry["meta"]["confirm_hash"])
+      Enum.each(ids, fn id -> assert AdminRepo.get!(Article, id).status == :published end)
+
+      body =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{
+          "tag" => "bigsoft",
+          "confirm_hash" => dry["meta"]["confirm_hash"]
+        })
+        |> json_response(200)
+
+      assert body["data"]["affected"] == 4
+      Enum.each(ids, fn id -> assert AdminRepo.get!(Article, id).status == :archived end)
+    end
+
+    test "oversized tag archive refuses on drift (confirm_hash mismatch)", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      ids =
+        for _ <- 1..4 do
+          fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["softdrift"]}).id
+        end
+
+      dry =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "softdrift", "dry_run" => true})
+        |> json_response(200)
+
+      # A new matching row appears after the preview: the live set no longer hashes
+      # to what the caller was shown, so the replay must archive NOTHING.
+      latecomer =
+        fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["softdrift"]})
+
+      body =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{
+          "tag" => "softdrift",
+          "confirm_hash" => dry["meta"]["confirm_hash"]
+        })
+        |> json_response(400)
+
+      assert body["error"]["message"] =~ "drift"
+      Enum.each(ids, fn id -> assert AdminRepo.get!(Article, id).status == :published end)
+      assert AdminRepo.get!(Article, latecomer.id).status == :published
+    end
+
+    test "an oversized ARCHIVE proposal is not spendable as a hard delete, or the reverse", %{
+      conn: conn
+    } do
+      # Over the frozen-token bound there is no token to type, so the confirm_hash IS
+      # the credential. Keyed on the id-set alone it is the SAME value for both ops,
+      # and a caller who previewed a reversible-shaped archive could purge the set.
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      ids =
+        for _ <- 1..4 do
+          fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["escal"]}).id
+        end
+
+      soft_hash =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "escal", "dry_run" => true})
+        |> json_response(200)
+        |> get_in(["meta", "confirm_hash"])
+
+      escalated =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{
+          "tag" => "escal",
+          "hard" => true,
+          "confirm_hash" => soft_hash
+        })
+        |> json_response(400)
+
+      assert escalated["error"]["message"] =~ "drift"
+      Enum.each(ids, fn id -> assert AdminRepo.get(Article, id) end)
+
+      hard_hash =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{
+          "tag" => "escal",
+          "dry_run" => true,
+          "hard" => true
+        })
+        |> json_response(200)
+        |> get_in(["meta", "confirm_hash"])
+
+      refute hard_hash == soft_hash
+
+      # The reverse direction: a delete proposal must not terminally archive the set.
+      build_conn()
+      |> auth_conn(raw_key)
+      |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "escal", "confirm_hash" => hard_hash})
+      |> json_response(400)
+
+      Enum.each(ids, fn id -> assert AdminRepo.get!(Article, id).status == :published end)
+    end
+
+    test "a tag archive token is refused on a request naming a different tag", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      alpha = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["alpha"]})
+      beta = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["beta"]})
+
+      token =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "alpha", "dry_run" => true})
+        |> json_response(200)
+        |> get_in(["meta", "token"])
+
+      # Otherwise alpha's frozen set is archived while the caller is told it archived
+      # beta — on a terminal status with no unarchive path.
+      build_conn()
+      |> auth_conn(raw_key)
+      |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "beta", "token" => token})
+      |> json_response(400)
+
+      assert AdminRepo.get!(Article, alpha.id).status == :published
+      assert AdminRepo.get!(Article, beta.id).status == :published
+    end
+
+    test "a tag matching nothing is a 200 no-op, not an unsatisfiable 400", %{conn: conn} do
+      # The dry-run mints no proposal over an empty set, so requiring one here left the
+      # zero-match case with no reachable success path — its 400 told the caller to
+      # replay a token the server refuses to mint.
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "nosuchtag"})
+        |> json_response(200)
+
+      assert body["data"]["affected"] == 0
+      assert body["meta"]["op"] == "archive"
+      assert AdminRepo.aggregate(BulkDeleteToken, :count, :id) == 0
+
+      # The no-op still writes the audit row every other archive selector writes,
+      # so a client sweeping a hundred tags leaves a record of the ninety-nine
+      # that matched nothing.
+      audit =
+        from(a in AuditLog,
+          where: a.tenant_id == ^tenant.id and a.action == "article.bulk_archived"
+        )
+        |> AdminRepo.one!()
+
+      assert audit.metadata["affected_count"] == 0
+      assert audit.metadata["selector"]["tag"] == "nosuchtag"
     end
 
     test "an ambiguous/empty selector returns 400", %{conn: conn} do
@@ -809,7 +1195,6 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
         |> auth_conn(raw_key)
         |> post(~p"/api/v1/knowledge/bulk-delete", %{
           "tag" => "hd",
-          "confirm" => true,
           "dry_run" => true,
           "hard" => true
         })
@@ -825,12 +1210,16 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       assert AdminRepo.get!(Article, a2.id).status == :published
     end
 
-    test "soft (non-hard) dry_run previews would_affect, mints NO token, op=archive (#BUG2)", %{
+    test "soft (non-hard) dry_run over an ids selector mints NO token, op=archive (#BUG2)", %{
       conn: conn
     } do
       # A dry-run of the DEFAULT soft/archive call (no hard: true) must NOT mint a
       # delete-scoped token the archive will never use, and must be self-describing
       # via meta.op. (Previously dry_run unconditionally previewed :delete.)
+      #
+      # #779 narrowed this to the ids/source selectors: those name a set the caller
+      # already holds, so `would_affect` is the whole preview and there is nothing to
+      # freeze. The TAG selector now mints a soft-tag proposal — asserted separately.
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
       a1 = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["softdry"]})
@@ -839,8 +1228,7 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
         conn
         |> auth_conn(raw_key)
         |> post(~p"/api/v1/knowledge/bulk-delete", %{
-          "tag" => "softdry",
-          "confirm" => true,
+          "article_ids" => [a1.id],
           "dry_run" => true
         })
         |> json_response(200)
@@ -848,11 +1236,37 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       assert body["data"]["would_affect"] == 1
       assert body["meta"]["dry_run"] == true
       assert body["meta"]["op"] == "archive"
-      # No delete token minted for the soft path.
+      # No token minted for the ids/source archive path.
       assert body["meta"]["token"] == nil
       assert AdminRepo.aggregate(BulkDeleteToken, :count, :id) == 0
 
       # Nothing mutated.
+      assert AdminRepo.get!(Article, a1.id).status == :published
+    end
+
+    test "soft dry_run over a TAG selector mints a soft-tag proposal, not a delete token (#779)",
+         %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      a1 = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["softdry2"]})
+      a1_id = a1.id
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "softdry2", "dry_run" => true})
+        |> json_response(200)
+
+      assert body["data"]["would_affect"] == 1
+      assert body["meta"]["op"] == "archive"
+      assert is_binary(body["meta"]["token"])
+
+      # Exactly one token row, and it is typed for the SOFT path — a "frozen_token"
+      # here would be spendable as an irreversible delete of the same set.
+      assert [%BulkDeleteToken{type: "soft_tag_token:" <> _digest, article_ids: [^a1_id]}] =
+               AdminRepo.all(BulkDeleteToken)
+
+      # Nothing mutated by the preview.
       assert AdminRepo.get!(Article, a1.id).status == :published
     end
 
@@ -867,7 +1281,6 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
         |> auth_conn(raw_key)
         |> post(~p"/api/v1/knowledge/bulk-delete", %{
           "tag" => "hd2",
-          "confirm" => true,
           "dry_run" => true,
           "hard" => true
         })
@@ -880,7 +1293,11 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       body =
         build_conn()
         |> auth_conn(raw_key)
-        |> post(~p"/api/v1/knowledge/bulk-delete", %{"hard" => true, "token" => token})
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{
+          "hard" => true,
+          "tag" => "hd2",
+          "token" => token
+        })
         |> json_response(200)
 
       assert body["data"]["affected"] == 2
@@ -902,7 +1319,6 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
         |> auth_conn(raw_key)
         |> post(~p"/api/v1/knowledge/bulk-delete", %{
           "tag" => "hd3",
-          "confirm" => true,
           "dry_run" => true,
           "hard" => true
         })
@@ -912,17 +1328,76 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       # first use succeeds
       build_conn()
       |> auth_conn(raw_key)
-      |> post(~p"/api/v1/knowledge/bulk-delete", %{"hard" => true, "token" => token})
+      |> post(~p"/api/v1/knowledge/bulk-delete", %{
+        "hard" => true,
+        "tag" => "hd3",
+        "token" => token
+      })
       |> json_response(200)
 
       # second use refused
       body =
         build_conn()
         |> auth_conn(raw_key)
-        |> post(~p"/api/v1/knowledge/bulk-delete", %{"hard" => true, "token" => token})
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{
+          "hard" => true,
+          "tag" => "hd3",
+          "token" => token
+        })
         |> json_response(400)
 
       assert body["error"]["message"] =~ "token"
+    end
+
+    test "a hard-delete token is refused on a request naming a DIFFERENT tag", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      alpha = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["halpha"]})
+      beta = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["hbeta"]})
+
+      token =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{
+          "tag" => "halpha",
+          "dry_run" => true,
+          "hard" => true
+        })
+        |> json_response(200)
+        |> get_in(["meta", "token"])
+
+      body =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{
+          "hard" => true,
+          "tag" => "hbeta",
+          "token" => token
+        })
+        |> json_response(400)
+
+      assert body["error"]["message"] =~ "token"
+      # NEITHER set was destroyed: not the one the caller named, and not the one
+      # the token froze.
+      assert AdminRepo.get(Article, alpha.id)
+      assert AdminRepo.get(Article, beta.id)
+    end
+
+    test "a zero-match hard delete is a 200 no-op, not an unsatisfiable 400", %{conn: conn} do
+      # The dry-run mints no proposal over an empty set, so demanding one here made
+      # the zero-match case unsatisfiable — a client sweeping a list of tags
+      # hard-errored on every already-clean one.
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"hard" => true, "tag" => "no-such-tag"})
+        |> json_response(200)
+
+      assert body["data"]["affected"] == 0
+      assert body["meta"]["op"] == "delete"
     end
 
     test "hard delete without a token or confirm_hash is refused (400)", %{conn: conn} do
@@ -935,8 +1410,7 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
         |> auth_conn(raw_key)
         |> post(~p"/api/v1/knowledge/bulk-delete", %{
           "hard" => true,
-          "tag" => "hd4",
-          "confirm" => true
+          "tag" => "hd4"
         })
         |> json_response(400)
 
@@ -974,7 +1448,6 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
         |> auth_conn(raw_key)
         |> post(~p"/api/v1/knowledge/bulk-delete", %{
           "tag" => "over",
-          "confirm" => true,
           "dry_run" => true,
           "hard" => true
         })
@@ -992,7 +1465,6 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
         |> post(~p"/api/v1/knowledge/bulk-delete", %{
           "hard" => true,
           "tag" => "over",
-          "confirm" => true,
           "confirm_hash" => dry["meta"]["confirm_hash"]
         })
         |> json_response(200)
@@ -1015,7 +1487,6 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
         |> auth_conn(raw_key)
         |> post(~p"/api/v1/knowledge/bulk-delete", %{
           "tag" => "drift",
-          "confirm" => true,
           "dry_run" => true,
           "hard" => true
         })
@@ -1030,7 +1501,6 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
         |> post(~p"/api/v1/knowledge/bulk-delete", %{
           "hard" => true,
           "tag" => "drift",
-          "confirm" => true,
           "confirm_hash" => dry["meta"]["confirm_hash"]
         })
         |> json_response(400)
@@ -1077,7 +1547,6 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
         |> auth_conn(raw_key)
         |> post(~p"/api/v1/knowledge/bulk-delete", %{
           "tag" => "abort",
-          "confirm" => true,
           "dry_run" => true,
           "hard" => true
         })
@@ -1094,7 +1563,6 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
         |> post(~p"/api/v1/knowledge/bulk-delete", %{
           "hard" => true,
           "tag" => "abort",
-          "confirm" => true,
           "confirm_hash" => confirm_hash
         })
 
@@ -1111,6 +1579,29 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
   # --- TC-21.3.5: Drafts listing excludes published, includes source info ---
 
   describe "GET /api/v1/knowledge/drafts" do
+    # The review queues are reads, and a read that reports no rows has to say WHICH kind
+    # of no-rows it is. A queue with nothing in it is a state an operator acts on, so an
+    # absent classification here is the same ambiguity `meta.outcome` closes everywhere
+    # else — and a client cannot tell an endpoint that opted out from an old server.
+    test "carries meta.outcome, and it tracks the page rather than a literal", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      empty =
+        conn |> auth_conn(raw_key) |> get(~p"/api/v1/knowledge/drafts") |> json_response(200)
+
+      assert empty["data"] == []
+      assert empty["meta"]["outcome"] == "empty"
+
+      _draft = fixture(:article, %{tenant_id: tenant.id, status: :draft, title: "A Draft"})
+
+      listed =
+        conn |> auth_conn(raw_key) |> get(~p"/api/v1/knowledge/drafts") |> json_response(200)
+
+      assert length(listed["data"]) == 1
+      assert listed["meta"]["outcome"] == "success"
+    end
+
     test "lists only draft articles with source info", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
@@ -1329,6 +1820,18 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       assert [pair] = body["data"]
       assert pair["similarity"] == 0.97
       assert length(pair["articles"]) == 2
+      assert body["meta"]["outcome"] == "success"
+    end
+
+    test "an empty conflict queue is classified empty, not left unclassified", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      body =
+        conn |> auth_conn(raw_key) |> get(~p"/api/v1/knowledge/conflicts") |> json_response(200)
+
+      assert body["data"] == []
+      assert body["meta"]["outcome"] == "empty"
     end
   end
 

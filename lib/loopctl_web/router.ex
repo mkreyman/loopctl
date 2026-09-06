@@ -523,6 +523,11 @@ defmodule LoopctlWeb.Router do
     # MemoryController scope-from-key + project-partition helpers.
     post "/recall", MemoryController, :context
 
+    # The third funnel stage (surfaced -> opened -> REFERENCED). A client hands back the
+    # `meta.recall_id` it was given and names the articles it actually used. Only ids that
+    # recall surfaced under that id, in the caller's own tenant, are accepted.
+    post "/recall/:recall_id/referenced", MemoryController, :referenced
+
     # Context Retriever (Epic 30, US-30.4) — entity-definition CRUD + the
     # model-invoked query surface. Literal /retrieve/tools MUST precede the
     # parameterized /retrieve/:entity so it is not captured as an :entity.
@@ -551,6 +556,10 @@ defmodule LoopctlWeb.Router do
     post "/articles/:id/publish", ArticleWorkflowController, :publish
     post "/articles/:id/unpublish", ArticleWorkflowController, :unpublish
     post "/articles/:id/archive", ArticleWorkflowController, :archive
+    # The reversible retrieval tombstone. Declared beside archive because they are the same
+    # kind of act with opposite reversibility, which is the distinction #605/#606 draws.
+    post "/articles/:id/suppress", ArticleWorkflowController, :suppress
+    post "/articles/:id/unsuppress", ArticleWorkflowController, :unsuppress
     resources "/articles", ArticleController, except: [:new, :edit]
 
     # Knowledge bulk-publish, bulk-delete, and drafts queue
@@ -650,6 +659,10 @@ defmodule LoopctlWeb.Router do
     get "/knowledge/analytics/retrieval-metrics",
         KnowledgeAnalyticsController,
         :retrieval_metrics
+
+    get "/knowledge/analytics/search-coverage",
+        KnowledgeAnalyticsController,
+        :search_coverage
 
     get "/knowledge/curation-log", KnowledgeAnalyticsController, :curation_log
 

@@ -304,7 +304,10 @@ defmodule Loopctl.HeavyRead.TenantGateTest do
       consolidation: :heavy,
       # US-43.2: heavy — a pgvector ANN read like its semantic siblings, over-fetching
       # further because `corpus_id` is a post-ANN residual.
-      corpus_search: :heavy
+      corpus_search: :heavy,
+      # Review round 2: heavy — a GROUP BY over `search_events`, an append-only table whose
+      # growth rate is the whole point of the coverage report, over windows up to a year.
+      search_event_coverage: :heavy
     }
 
     test "every @heavy_endpoints atom is a known HeavyRead endpoint (no orphan/typo)" do

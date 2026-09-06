@@ -79,6 +79,14 @@ defmodule Loopctl.Knowledge.RetrievalMetricSnapshot do
     field :search_follow_through, :float, default: 0.0
     field :results_returned, :integer, default: 0
 
+    # Unit: DISTINCT (recall, article) REFERENCES — the third funnel stage. A `referenced`
+    # row is a CLIENT asserting it used an article recall surfaced, never a delivery the
+    # server observed, which is why it is in no read set and why the counter dedupes: a
+    # client that posts the same reference twice must not move the number. `reference_rate`
+    # is derived on read from this and `searched`, never stored (see `precision`'s siblings
+    # and `scored_follow_through` for why).
+    field :referenced, :integer, default: 0
+
     # Unit: READS (get/context/drill rows), NOT surfaced results and NOT search calls.
     # `followed_through` above counts SURFACED RESULTS that were later opened, so it is not
     # comparable with these three — the naming keeps the units legible.
@@ -116,6 +124,7 @@ defmodule Loopctl.Knowledge.RetrievalMetricSnapshot do
     :searches_with_follow_through,
     :search_follow_through,
     :results_returned,
+    :referenced,
     :attributed_opens,
     :cross_key_opens,
     :direct_opens,

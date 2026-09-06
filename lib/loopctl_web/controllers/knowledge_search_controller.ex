@@ -192,6 +192,7 @@ defmodule LoopctlWeb.KnowledgeSearchController do
                    "(`cursor`) instead returns the self-describing cursor contract: " <>
                    "next_cursor, has_more, limit, count, include_body.",
                properties: %{
+                 outcome: LoopctlWeb.Outcome.schema(),
                  total_count: %OpenApiSpex.Schema{type: :integer},
                  total_count_scope: %OpenApiSpex.Schema{
                    type: :string,
@@ -437,7 +438,11 @@ defmodule LoopctlWeb.KnowledgeSearchController do
       mode_used: mode,
       degraded?: true,
       fallback_reason: "embedding_unavailable",
-      result_count: 0
+      result_count: 0,
+      # A degraded row is NOT rejected, so it sits inside the coverage report's `:ran`
+      # population and a null here reads as a client instrumentation gap during a provider
+      # outage. The attempt did run; time it like every other one.
+      duration_ms: shaped_duration_ms(opts)
     })
   end
 

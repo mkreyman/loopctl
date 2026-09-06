@@ -29,12 +29,18 @@ defmodule LoopctlWeb.ArticleJSON do
   When `meta.include_body` is true the full `body` is included per row (the
   response is byte-budget bounded server-side); otherwise each row is a body-less
   summary so large enumeration pages stay small.
+
+  `meta.outcome` (`LoopctlWeb.Outcome`) carries the same uniform classification the
+  retrieval surfaces do. This is the LAG-FREE enumeration path the docs send agents to
+  for existence and dedup checks, so `"empty"` here is a load-bearing answer: it means
+  the filtered set is genuinely empty, not that a ranker missed it. A page walked past
+  the end of a non-empty set is `"success"`, never `"empty"` — exhaustion is not absence.
   """
   def index(%{articles: articles, meta: meta}) do
     renderer =
       if Map.get(meta, :include_body, false), do: &article_data/1, else: &article_summary/1
 
-    %{data: Enum.map(articles, renderer), meta: meta}
+    %{data: Enum.map(articles, renderer), meta: LoopctlWeb.Outcome.put_for(meta, articles)}
   end
 
   @doc """
@@ -182,6 +188,14 @@ defmodule LoopctlWeb.ArticleJSON do
       # undo. `null` on every article no machine has retitled — which is nearly all of them,
       # so the enumeration path does not pay for it.
       previous_title: article.previous_title,
+      # The reversible retrieval tombstone, on the FULL read for the same reason
+      # `previous_title` is: a suppression nobody can read is not inspectable, and the by-id
+      # read is deliberately the ONE surface a suppressed article still answers on. All three
+      # are `null` on every article nobody has suppressed, which is nearly all of them, so
+      # the enumeration path does not pay for them.
+      suppressed_at: article.suppressed_at,
+      suppressed_by: article.suppressed_by,
+      suppression_reason: article.suppression_reason,
       body: article.body,
       category: article.category,
       status: article.status,

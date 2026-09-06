@@ -189,6 +189,7 @@ defmodule Loopctl.HeavyRead.TenantGate do
     heat_index
     consolidation
     corpus_search
+    search_event_coverage
   )a
 
   # --- Client API ---
