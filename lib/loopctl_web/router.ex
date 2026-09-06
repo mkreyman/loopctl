@@ -551,6 +551,10 @@ defmodule LoopctlWeb.Router do
     post "/articles/:id/publish", ArticleWorkflowController, :publish
     post "/articles/:id/unpublish", ArticleWorkflowController, :unpublish
     post "/articles/:id/archive", ArticleWorkflowController, :archive
+    # The reversible retrieval tombstone. Declared beside archive because they are the same
+    # kind of act with opposite reversibility, which is the distinction #605/#606 draws.
+    post "/articles/:id/suppress", ArticleWorkflowController, :suppress
+    post "/articles/:id/unsuppress", ArticleWorkflowController, :unsuppress
     resources "/articles", ArticleController, except: [:new, :edit]
 
     # Knowledge bulk-publish, bulk-delete, and drafts queue

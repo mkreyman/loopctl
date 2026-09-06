@@ -182,6 +182,14 @@ defmodule LoopctlWeb.ArticleJSON do
       # undo. `null` on every article no machine has retitled — which is nearly all of them,
       # so the enumeration path does not pay for it.
       previous_title: article.previous_title,
+      # The reversible retrieval tombstone, on the FULL read for the same reason
+      # `previous_title` is: a suppression nobody can read is not inspectable, and the by-id
+      # read is deliberately the ONE surface a suppressed article still answers on. All three
+      # are `null` on every article nobody has suppressed, which is nearly all of them, so
+      # the enumeration path does not pay for them.
+      suppressed_at: article.suppressed_at,
+      suppressed_by: article.suppressed_by,
+      suppression_reason: article.suppression_reason,
       body: article.body,
       category: article.category,
       status: article.status,

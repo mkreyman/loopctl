@@ -745,6 +745,11 @@ defmodule Loopctl.Knowledge.DraftConsumer do
       where: a.tenant_id == ^tenant_id,
       where: a.id == ^neighbour_id,
       where: a.status == :published,
+      # The retrieval tombstone. This is the same rule the auto-linker's own candidate
+      # queries now carry (`pair_candidates_*` in `Loopctl.Knowledge`): a suppressed article
+      # must not become half of a NEW edge. Nothing retrieves it, so an edge into it is a
+      # dead end the graph then has to be told about again on unsuppress.
+      where: is_nil(a.suppressed_at),
       where:
         fragment("COALESCE(?->>'visibility', 'shared') NOT IN ('private','owner')", a.metadata),
       select: %{project_id: a.project_id}

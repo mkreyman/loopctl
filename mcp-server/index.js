@@ -2000,6 +2000,29 @@ async function knowledgeArchive({ article_id }) {
   return toContent(result);
 }
 
+// The REVERSIBLE retrieval tombstone. Agent-role KB curation like archive, but it is the
+// one member of that family that undoes: nothing is destroyed and nothing is rebuilt, so
+// knowledge_unsuppress restores the article to every read path immediately.
+async function knowledgeSuppress({ article_id, reason }) {
+  const result = await apiCall(
+    "POST",
+    `/api/v1/articles/${article_id}/suppress`,
+    { reason },
+    process.env.LOOPCTL_AGENT_KEY
+  );
+  return toContent(result);
+}
+
+async function knowledgeUnsuppress({ article_id }) {
+  const result = await apiCall(
+    "POST",
+    `/api/v1/articles/${article_id}/unsuppress`,
+    null,
+    process.env.LOOPCTL_AGENT_KEY
+  );
+  return toContent(result);
+}
+
 // #331: soft-delete (archive) is agent-role KB curation, same as knowledge_archive.
 async function knowledgeDelete({ article_id }) {
   const result = await apiCall(
@@ -5660,6 +5683,69 @@ const TOOLS = [
     },
   },
   {
+    name: "knowledge_suppress",
+    description:
+      "Take an article OUT OF RETRIEVAL without changing its status — reversibly. This is " +
+      "the tool to reach for when an article is wrong, superseded, noisy or no longer " +
+      "wanted in results, but you might want it back. The article stays `published`, keeps " +
+      "its body, embedding and links, and is STILL readable by id with knowledge_get " +
+      "(which renders suppressed_at / suppressed_by / suppression_reason) — that is what " +
+      "makes the act inspectable and undoable. It disappears from knowledge_search, " +
+      "knowledge_hybrid_search, knowledge_context, /recall, knowledge_progressive_index, " +
+      "knowledge_heat_index, suggested links, knowledge_graph, knowledge_walk, the novelty " +
+      "priors and the nightly consolidation scans. " +
+      "Undo with knowledge_unsuppress; nothing was destroyed, so nothing is rebuilt. " +
+      "Choose between the three retraction verbs by what you need afterwards: " +
+      "knowledge_suppress (undoable, status untouched, the article is simply not retrieved), " +
+      "knowledge_unpublish (undoable, but it says the article is a DRAFT — an editorial " +
+      "claim), knowledge_archive/knowledge_delete (NOT undoable by any call you can make: " +
+      "`:archived` is terminal). " +
+      "A reason is REQUIRED — a tombstone that does not record why is not inspectable. " +
+      "Re-suppressing an already-suppressed article is an idempotent no-op that KEEPS the " +
+      "original actor and reason; to change a recorded reason, unsuppress and suppress " +
+      "again, which records both acts. " +
+      "Agent role. Visibility-scoped: you can only suppress an article you can see, so " +
+      "another agent's private/owner memory returns 404.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        article_id: {
+          type: "string",
+          description: "The UUID of the article to take out of retrieval.",
+        },
+        reason: {
+          type: "string",
+          description:
+            "Why this article should stop being retrieved. Required and non-blank; " +
+            "bounded at 500 characters. Recorded on the row and in the audit log, and " +
+            "returned by knowledge_get, so write it for whoever decides later whether to " +
+            "undo this.",
+        },
+      },
+      required: ["article_id", "reason"],
+    },
+  },
+  {
+    name: "knowledge_unsuppress",
+    description:
+      "Lift a retrieval suppression: the inverse of knowledge_suppress. Clears the " +
+      "tombstone and restores the article to search, context, /recall, the indexes, the " +
+      "graph and the link surfaces immediately — nothing has to be re-embedded or " +
+      "re-linked, because suppression never touched any of it. Unsuppressing an article " +
+      "that is not suppressed is a harmless no-op. Agent role, visibility-scoped. " +
+      "This does NOT undo knowledge_archive or knowledge_delete, which are terminal.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        article_id: {
+          type: "string",
+          description: "The UUID of the article to restore to retrieval.",
+        },
+      },
+      required: ["article_id"],
+    },
+  },
+  {
     name: "knowledge_delete",
     description:
       "Delete an article. Under the hood this performs the same soft-delete (archive) " +
@@ -7891,6 +7977,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "knowledge_archive":
       return await knowledgeArchive(args);
+
+    case "knowledge_suppress":
+      return await knowledgeSuppress(args);
+
+    case "knowledge_unsuppress":
+      return await knowledgeUnsuppress(args);
 
     case "knowledge_delete":
       return await knowledgeDelete(args);

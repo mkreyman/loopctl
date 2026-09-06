@@ -97,6 +97,12 @@ defmodule Loopctl.Knowledge.StreamingExport.OKFFormat do
       "loopctl_status" => to_string(article.status)
     }
 
+    # The tombstone keys come from `OKF.suppression_frontmatter/1` rather than being
+    # rebuilt here: this streamed `.tar.gz` is the DEFAULT backup path, and a bundle that
+    # carried the suppression only on the buffered `?format=json` path would lose it on the
+    # one an operator actually restores from.
+    base = Map.merge(base, OKF.suppression_frontmatter(article))
+
     extra
     |> Map.merge(base)
     |> maybe_mark_truncated(truncated?)

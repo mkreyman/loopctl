@@ -109,6 +109,23 @@ defmodule Loopctl.Knowledge.Article do
     # could hold its own draft out of the drain for as long as it liked.
     field :staged_draft_at, :utc_datetime_usec
 
+    # REVERSIBLE retrieval tombstone (the memorizz "forgetting is a tombstone" primitive).
+    # `suppressed_at` is the whole predicate every read path checks; the other two record
+    # WHO and WHY so the act is inspectable and undoable. A suppressed article keeps its
+    # status, its embedding, its links and its body — suppression is a claim about
+    # RETRIEVABILITY, not about editorial state, which is exactly what `:archived`
+    # (terminal) and `unpublish` ("this is a draft") could not say (#605/#606, #608).
+    #
+    # NEVER add any of the three to a `cast` list. `metadata` is cast and whole-map-REPLACED
+    # by `PATCH /api/v1/knowledge/:id`, so a caller that could write these could un-suppress
+    # an article with no audit event and no actor. They are written ONLY by
+    # `suppression_changeset/2`, reached only from `Loopctl.Knowledge.suppress_article/3`
+    # and `unsuppress_article/2` — the same isolation `curated_at`, `previous_title` and
+    # `staged_draft_at` above already have, for the same reason.
+    field :suppressed_at, :utc_datetime_usec
+    field :suppressed_by, :string
+    field :suppression_reason, :string
+
     field :embedding, Pgvector.Ecto.Vector, load_in_query: false
     # Virtual boolean projection of `not is_nil(embedding)` — lets the bulk-embedding
     # path (US-37.4) null-check presence WITHOUT transferring the 1536-dim vector for
@@ -150,6 +167,13 @@ defmodule Loopctl.Knowledge.Article do
   ]
 
   @max_idempotency_key_length 255
+
+  # Bounds on the retrieval tombstone's two descriptive fields. Mirrored by the columns'
+  # varchar sizes (migration 20260905120000) so the changeset 422 and the DB bound cannot
+  # drift; 500 matches `Loopctl.Knowledge.KbCuration`'s `@max_summary`, since the same
+  # sentence lands in both places.
+  @max_suppression_reason_length 500
+  @max_suppressed_by_length 200
 
   # Agent-memory conventions in `metadata` (validated only when `agent_id` is
   # present — a curated reference article without an agent_id is unaffected).
@@ -497,6 +521,51 @@ defmodule Loopctl.Knowledge.Article do
   def curation_changeset(article, %DateTime{} = curated_at, curated_by) do
     change(article, %{curated_at: curated_at, curated_by: curated_by})
   end
+
+  @doc """
+  Changeset for the REVERSIBLE retrieval tombstone — the only writer of `suppressed_at`,
+  `suppressed_by` and `suppression_reason`.
+
+  None of the three is castable anywhere, here included: they are `change/2`d from values
+  the CONTEXT derives (the clock, the server-resolved actor label, the caller's reason
+  after validation), never from request params. Reached only through
+  `Loopctl.Knowledge.suppress_article/3` and `Loopctl.Knowledge.unsuppress_article/2`.
+
+  Pass `nil` to LIFT the suppression, which clears all three together. Keeping a stale
+  `suppressed_by`/`suppression_reason` on a live article would read as a tombstone to
+  anyone inspecting the row while every retrieval surface returned it — the two halves must
+  never disagree.
+
+  Lengths are validated here AND bounded at the column (varchar 200 / 500): the changeset
+  gives a caller a 422 naming the field, the column is what holds if a future writer forgets.
+
+  ## Returns
+
+  An `Ecto.Changeset` carrying only the tombstone fields.
+  """
+  @spec suppression_changeset(%__MODULE__{}, map() | nil) :: Ecto.Changeset.t()
+  def suppression_changeset(article, nil) do
+    change(article, %{suppressed_at: nil, suppressed_by: nil, suppression_reason: nil})
+  end
+
+  def suppression_changeset(article, %{} = attrs) do
+    article
+    |> change(%{
+      suppressed_at: Map.fetch!(attrs, :suppressed_at),
+      suppressed_by: Map.get(attrs, :suppressed_by),
+      suppression_reason: Map.get(attrs, :suppression_reason)
+    })
+    |> validate_length(:suppressed_by, max: @max_suppressed_by_length)
+    |> validate_length(:suppression_reason, max: @max_suppression_reason_length)
+  end
+
+  @doc "Max bytes of a `suppression_reason`, mirrored by the column's varchar bound."
+  @spec max_suppression_reason_length() :: pos_integer()
+  def max_suppression_reason_length, do: @max_suppression_reason_length
+
+  @doc "Max bytes of a `suppressed_by` actor label, mirrored by the column's varchar bound."
+  @spec max_suppressed_by_length() :: pos_integer()
+  def max_suppressed_by_length, do: @max_suppressed_by_length
 
   # US-31.1 poisoning defense: any in-place edit that changes the article's
   # title, body, or status invalidates a previously-set governed curated marker,

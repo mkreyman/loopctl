@@ -114,6 +114,11 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
                {:post, "/api/v1/articles/:id/publish"},
                {:post, "/api/v1/articles/:id/unpublish"},
                {:post, "/api/v1/articles/:id/archive"},
+               # The reversible retrieval tombstone — the SAME KB-tier curation surface as
+               # `archive` above and strictly weaker than it, since it changes no status,
+               # destroys nothing and undoes in one call.
+               {:post, "/api/v1/articles/:id/suppress"},
+               {:post, "/api/v1/articles/:id/unsuppress"},
                {:post, "/api/v1/knowledge/bulk-publish"},
                {:post, "/api/v1/knowledge/bulk-unpublish"},
                {:post, "/api/v1/knowledge/bulk-delete"},

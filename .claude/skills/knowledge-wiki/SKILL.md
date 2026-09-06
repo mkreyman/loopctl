@@ -72,7 +72,19 @@ exactly the pollution the separate tables prevent.
    `@valid_transitions` has no `{:archived, _}` and there is no unarchive function, so the only way
    back is a `user+` PATCH with an explicit status. Nothing is destroyed and everything is audited,
    which is what earns agent role; nothing automated restores it, which is why an unattended writer
-   must reach for `unpublish` (`{:published, :draft}`, undone by `publish`) instead. The `:user` set
+   must reach for `unpublish` (`{:published, :draft}`, undone by `publish`) instead — or now for
+   `suppress`, the REVERSIBLE retrieval tombstone (`knowledge_suppress`/`knowledge_unsuppress`,
+   `POST /api/v1/articles/:id/suppress`, `Knowledge.suppress_article/3`, agent role). Suppression
+   sets `articles.suppressed_at` plus a required reason and an actor, leaves `status`, body,
+   embedding and links untouched, keeps the article resolvable BY ID (`get_article/3`,
+   `knowledge_get`) so the act is inspectable, and excludes it from every ranked read path through
+   the one predicate in `Loopctl.Knowledge.Suppression`. **When you add a read path, that predicate
+   is not optional and not your judgement call:** `test/loopctl/knowledge/suppression_guard_test.exs`
+   scans `lib/` for published-status filter sites and fails on any that neither applies it nor is
+   named in `Suppression.exempt_sites/0` with a category and a reason. Pick between the three
+   retraction verbs by what you need AFTERWARDS — suppress (undoable, silent about status),
+   unpublish (undoable, but asserts the article is a draft), archive (not undoable by any agent
+   call). The `:user` set
    is single-article `unpublish` plus ALL the SET-BASED bulk ops — `bulk_publish`, `bulk_unpublish`
    and the ENTIRE `bulk_delete` action, soft path included (`article_workflow_controller.ex:37-39`).
    **Both criteria matter**: set-based blast radius (one call mutates an unbounded set) AND
@@ -124,7 +136,7 @@ exactly the pollution the separate tables prevent.
    `{drift_signal, member_id}` — a group scored under the other signal's normalized key finds
    nothing and withholds (fail-closed).
 5. **Heat must not rank on a signal heat produces** — `Knowledge.heat_index/2`
-   (`knowledge.ex:10931`; the counted set is `@heat_read_access_types`, `:10801`). The heat index is the one retrieval route that
+   (`knowledge.ex:11268`; the counted set is `@heat_read_access_types`, `:11138`). The heat index is the one retrieval route that
    takes NO query, so its misses are uncorrelated with embedding similarity — which is worth nothing
    if its ordering is something a caller or the route itself generates. It has been violated FOUR
    times, each differently — and once by a FIX for one of the others — so treat any new input to

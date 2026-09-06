@@ -215,6 +215,10 @@ defmodule Loopctl.Knowledge.StructuralLinks do
       from(a in Article,
         where: a.tenant_id == ^tenant_id,
         where: a.status == :published,
+        # A suppressed article is not a hub MEMBER: the hub exists to navigate to it, and
+        # every other retrieval surface has stopped returning it. Excluding it here also
+        # keeps `member_count` honest, since that number is what names the hub.
+        where: is_nil(a.suppressed_at),
         where: is_nil(a.metadata["hub_kind"]),
         order_by: [asc: a.id],
         limit: ^batch,

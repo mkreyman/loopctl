@@ -5,6 +5,33 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.79.0 — 2026-09-05 (a retraction you can take back)
+
+### Added
+
+- **`knowledge_suppress` / `knowledge_unsuppress`** — a REVERSIBLE retrieval tombstone.
+  Until now the two ways to retract an article were `knowledge_archive` (terminal:
+  `:archived` has no outbound transition and no unarchive call, so only a user-role PATCH
+  restores it) and `knowledge_unpublish` (undoable, but it asserts the article is a DRAFT,
+  which is a claim about editorial state rather than about retrieval). Suppression is the
+  third thing: it says nothing about status and everything about whether anything retrieves
+  the article.
+
+  A suppressed article keeps `status: published`, its body, its embedding and its links, and
+  stays readable by id with `knowledge_get`, which renders `suppressed_at`, `suppressed_by`
+  and `suppression_reason` — that is what makes the act inspectable and undoable. It is
+  excluded from `knowledge_search`, `knowledge_hybrid_search`, `knowledge_context`,
+  `/recall`, `knowledge_progressive_index`, `knowledge_heat_index`, suggested links,
+  `knowledge_graph`, `knowledge_walk`, the novelty priors and the nightly consolidation
+  scans.
+
+  A `reason` is REQUIRED and bounded at 500 characters: a tombstone that does not record why
+  is not inspectable. Re-suppressing an already-suppressed article is an idempotent no-op
+  that KEEPS the original actor and reason — to change a recorded reason, unsuppress and
+  suppress again, which records both acts. Both directions write to the append-only audit
+  log. Agent role and visibility-scoped, like `knowledge_archive`: another agent's
+  private/owner memory is a 404.
+
 ## 2.78.0 — 2026-08-28 (the corpus tier becomes reachable from an agent)
 
 ### Added

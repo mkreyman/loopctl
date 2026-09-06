@@ -44,6 +44,8 @@ defmodule Loopctl.Webhooks.Webhook do
     article.updated
     article.archived
     article.superseded
+    article.suppressed
+    article.unsuppressed
     article_link.created
     article_link.deleted
     knowledge.ingestion_anomaly_detected

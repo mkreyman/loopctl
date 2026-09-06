@@ -10,7 +10,8 @@ defmodule LoopctlWeb.KnowledgeIndexController do
   `tags`, `offset`, and `limit` query params with deterministic pagination over
   the filtered set (up to 1000 articles per page). A `fields` projection
   (default `id,title,category`) keeps the payload small — request `tags`,
-  `status`, or `updated_at` explicitly when needed.
+  `status`, or `updated_at` explicitly when needed. `suppressed=only` lists the
+  retrieval-suppressed set, which is how an operator finds what there is to undo.
   """
 
   use LoopctlWeb, :controller
@@ -20,6 +21,7 @@ defmodule LoopctlWeb.KnowledgeIndexController do
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleCursor
+  alias Loopctl.Knowledge.Suppression
   alias LoopctlWeb.Helpers.Pagination
   alias LoopctlWeb.Helpers.TagMatch
   alias LoopctlWeb.Helpers.Visibility
@@ -119,6 +121,18 @@ defmodule LoopctlWeb.KnowledgeIndexController do
           "Comma-separated projection (id, title, category, tags, status, updated_at). " <>
             "Default id,title,category. `id` and `category` are always included " <>
             "(category is the grouping key). Returns 400 for unknown fields.",
+        required: false
+      ],
+      suppressed: [
+        in: :query,
+        type: :string,
+        description:
+          "How to treat RETRIEVAL-SUPPRESSED articles: `exclude` (default), `include`, or " <>
+            "`only`. `only` is the discovery path — it lists exactly what there is to undo " <>
+            "with POST /api/v1/articles/:id/unsuppress, which is what makes the suppression " <>
+            "reversible in practice rather than only in principle. An unrecognised value " <>
+            "resolves to `exclude`: a typo must never put a suppressed article back on a " <>
+            "listing. Honored on BOTH the offset and the keyset path.",
         required: false
       ],
       cursor: [
@@ -289,6 +303,11 @@ defmodule LoopctlWeb.KnowledgeIndexController do
         |> maybe_put(:source_id, parse_source_id(params["source_id"]))
         |> maybe_put(:limit, parse_int(params["limit"]))
         |> maybe_put(:offset, parse_int(params["offset"]))
+        # Always set, never `maybe_put`: `Suppression.parse_mode/1` resolves every
+        # unrecognised value — including a missing param and a `?suppressed[]=` array form —
+        # to `:exclude`, so passing it explicitly is how the default becomes visible in the
+        # opts rather than implicit in a Keyword.get default two modules away.
+        |> Keyword.put(:suppressed, Suppression.parse_mode(params["suppressed"]))
 
       {:ok, opts}
     end

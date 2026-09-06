@@ -71,6 +71,7 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.Knowledge.OKF
   alias Loopctl.Knowledge.RankingPriors
   alias Loopctl.Knowledge.Reranker
+  alias Loopctl.Knowledge.Suppression
   alias Loopctl.Knowledge.VectorSearch
   alias Loopctl.Llm.ProviderError
   alias Loopctl.LocalGuc
@@ -1459,6 +1460,11 @@ defmodule Loopctl.Knowledge do
         where: a.status == :published
       )
 
+    # The index is the ONE surface that takes a `:suppressed` mode from the caller, and it
+    # is what makes suppression reversible in practice: `:only` lists what there is to undo.
+    # It still defaults to `:exclude`, so an ordinary browse is unchanged.
+    base = Suppression.filter(base, Keyword.get(opts, :suppressed, :exclude))
+
     base = scope_project_or_global(base, project_id)
 
     base =
@@ -1631,6 +1637,11 @@ defmodule Loopctl.Knowledge do
         where: a.tenant_id == ^tenant_id,
         where: a.status == :published
       )
+
+    # Same `:suppressed` mode as `list_index/2` — this is its cursor half, and a mode the
+    # offset path honours but the cursor path ignored would page a caller into rows the
+    # first page told it were not there.
+    base = Suppression.filter(base, Keyword.get(opts, :suppressed, :exclude))
 
     base = scope_project_or_global(base, project_id)
 
@@ -2622,6 +2633,12 @@ defmodule Loopctl.Knowledge do
   defp apply_search_filters(query, status, opts) do
     query
     |> maybe_filter_by_status(status)
+    # The retrieval tombstone, applied HERE because this is where the keyword lane, the
+    # semantic count, the semantic pool hydration, the combined lanes, `list_filtered/2`
+    # and `keyset_query/2` all converge. Default `:exclude`: a new caller of this helper
+    # gets the safe behaviour without knowing suppression exists, and every deliberate
+    # `:include`/`:only` is one greppable opt (see `Loopctl.Knowledge.Suppression`).
+    |> Suppression.filter(Keyword.get(opts, :suppressed, :exclude))
     |> apply_project_scope(
       Keyword.get(opts, :project_id),
       Keyword.get(opts, :project_scope, :strict)
@@ -3621,6 +3638,11 @@ defmodule Loopctl.Knowledge do
     from(a in Article,
       as: :article,
       where: a.status == :published,
+      # A suppressed article is not an answer, curated or otherwise. Without this a
+      # suppression would be silently overridden on the ONE lane that outranks retrieval:
+      # the hybrid resolver returns a curated source with `provenance: :curated` and a
+      # caller is told to trust it over its own defaults.
+      where: is_nil(a.suppressed_at),
       where: not is_nil(a.curated_at),
       where: ^scope_filter,
       # AC-31.1.4: never surface an article that is in an OPEN potential_conflict.
@@ -3826,6 +3848,10 @@ defmodule Loopctl.Knowledge do
       from(o in Article,
         where: o.tenant_id == ^tenant_id,
         where: o.status == :published,
+        # A suppressed tenant article must not out-rank a system canonical it can no
+        # longer answer with — tenant-owns-topic precedence would otherwise hide the
+        # canon behind a row nothing returns.
+        where: is_nil(o.suppressed_at),
         where: not is_nil(o.curated_at),
         where: fragment("lower(btrim(?)) = lower(btrim(?))", o.title, parent_as(:article).title),
         select: 1
@@ -3983,6 +4009,283 @@ defmodule Loopctl.Knowledge do
           | {:error, Ecto.Changeset.t()}
   def archive_article_workflow(tenant_id, article_id, opts \\ []) do
     transition_article(tenant_id, article_id, :archived, "article.archived", opts)
+  end
+
+  # --- Reversible retrieval suppression (the tombstone primitive) ---
+
+  @doc """
+  Suppresses an article from RETRIEVAL, reversibly.
+
+  This is loopctl's tombstone: the article keeps its `:published` status, its body, its
+  embedding and its links; it stays resolvable by id through `get_article/3` (and so through
+  `knowledge_get`); and it disappears from every ranked read path — keyword/semantic/combined
+  search, hybrid resolution, `get_context/3`, the knowledge half of
+  `Loopctl.Memory.recall_context/2`, the progressive and heat indexes, suggested links, graph
+  traversal, the random walk, the novelty priors, and the nightly consolidation scans. The one
+  predicate every one of those paths checks is `articles.suppressed_at`; see
+  `Loopctl.Knowledge.Suppression` for the composable filter and the drift guard that binds
+  the read paths to it.
+
+  ## Why this is not `archive_article_workflow/3` or `unpublish_article/3`
+
+  `:archived` is TERMINAL — `Article`'s `@valid_transitions` carries no `{:archived, _}`
+  entry and there is no unarchive function, so the only way back is a `user+` PATCH carrying
+  an explicit status (#605/#606). `unpublish` IS undoable, which is why the nightly
+  consolidation pass reaches for it (#608), but it means "this is a draft": an editorial
+  claim about the article, not a claim about whether anything should retrieve it. Suppression
+  is the missing third thing — it says nothing about status and everything about retrieval,
+  and `unsuppress_article/2` puts the article back exactly as it was.
+
+  Because it is non-destructive AND audited AND genuinely reversible, this is agent-role
+  curation under the #331 carve-out, and it is visibility-scoped like `archive`: an agent may
+  only suppress an article it can see, so another agent's `private`/`owner` memory is a 404.
+
+  ## A reason is REQUIRED
+
+  A tombstone that does not record WHY is a row nobody can later judge. A blank or missing
+  reason is `{:error, :unprocessable_entity, message}`, not a silent nil — the whole value of
+  the primitive over a status change is that the act is inspectable.
+
+  ## Idempotent, and the first tombstone wins
+
+  Suppressing an already-suppressed article is a no-op that returns the row unchanged: it does
+  NOT overwrite `suppressed_by`/`suppression_reason` and writes no second audit event. The
+  tombstone records who FIRST took the article out of retrieval; letting a later caller rewrite
+  that would erase the only record of the original act. To change a recorded reason, unsuppress
+  and suppress again — two audited events, which is what actually happened.
+
+  ## Parameters
+
+  - `tenant_id` -- the tenant UUID
+  - `article_id` -- the article UUID
+  - `opts` -- `:reason` (REQUIRED, non-blank, bounded to
+    `Loopctl.Knowledge.Article.max_suppression_reason_length/0`), plus the usual
+    `:actor_id`, `:actor_label`, `:actor_type` and `:visibility_agent_id`
+
+  ## Returns
+
+  - `{:ok, %Article{}}` on success, and on an idempotent re-suppress
+  - `{:error, :not_found}` if absent, another tenant's, or invisible to the caller
+  - `{:error, :unprocessable_entity, message}` if the reason is missing or blank
+  - `{:error, %Ecto.Changeset{}}` on a write failure
+  """
+  @spec suppress_article(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, Article.t()}
+          | {:error, :not_found}
+          | {:error, :unprocessable_entity, String.t()}
+          | {:error, Ecto.Changeset.t()}
+  def suppress_article(tenant_id, article_id, opts \\ []) do
+    case normalize_suppression_reason(Keyword.get(opts, :reason)) do
+      {:ok, reason} ->
+        at = Keyword.get(opts, :at) || DateTime.utc_now()
+        by = suppression_actor(opts)
+
+        run_suppression(tenant_id, article_id, opts, fn
+          %Article{suppressed_at: %DateTime{}} = article ->
+            {:noop, article}
+
+          %Article{} = article ->
+            {:write,
+             %{
+               changeset:
+                 Article.suppression_changeset(article, %{
+                   suppressed_at: at,
+                   suppressed_by: by,
+                   suppression_reason: reason
+                 }),
+               action: "article.suppressed",
+               old_state: %{"suppressed_at" => nil, "status" => to_string(article.status)},
+               new_state: %{
+                 "suppressed_at" => DateTime.to_iso8601(at),
+                 "suppressed_by" => by,
+                 "suppression_reason" => reason,
+                 "status" => to_string(article.status)
+               },
+               summary: "suppressed from retrieval: #{reason}"
+             }}
+        end)
+
+      {:error, message} ->
+        {:error, :unprocessable_entity, message}
+    end
+  end
+
+  @doc """
+  Lifts a retrieval suppression, restoring the article to every read path it was removed from.
+
+  The inverse of `suppress_article/3`, and the property that separates suppression from
+  `:archived`: nothing has to be reconstructed, because nothing was destroyed. The article's
+  status, body, embedding and links were never touched, so the row is retrievable again as
+  soon as the tombstone clears.
+
+  All THREE tombstone fields clear together. Keeping a stale `suppressed_by`/`suppression_reason`
+  on a live article would read as a tombstone to anyone inspecting the row while every
+  retrieval surface returned it, and the two halves must never disagree.
+
+  Unsuppressing an article that is not suppressed is an idempotent no-op returning the row
+  unchanged, with no audit event: there was no act to record.
+
+  Same agent-role visibility scope as `suppress_article/3` — an agent can only lift a
+  suppression on an article it can see.
+
+  ## Returns
+
+  - `{:ok, %Article{}}` on success, and on the idempotent no-op
+  - `{:error, :not_found}` if absent, another tenant's, or invisible to the caller
+  - `{:error, %Ecto.Changeset{}}` on a write failure
+  """
+  @spec unsuppress_article(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, Article.t()} | {:error, :not_found} | {:error, Ecto.Changeset.t()}
+  def unsuppress_article(tenant_id, article_id, opts \\ []) do
+    run_suppression(tenant_id, article_id, opts, fn
+      %Article{suppressed_at: nil} = article ->
+        {:noop, article}
+
+      %Article{} = article ->
+        {:write,
+         %{
+           changeset: Article.suppression_changeset(article, nil),
+           action: "article.unsuppressed",
+           old_state: %{
+             "suppressed_at" => DateTime.to_iso8601(article.suppressed_at),
+             "suppressed_by" => article.suppressed_by,
+             "suppression_reason" => article.suppression_reason,
+             "status" => to_string(article.status)
+           },
+           new_state: %{"suppressed_at" => nil, "status" => to_string(article.status)},
+           summary:
+             "restored to retrieval" <>
+               if(article.suppression_reason,
+                 do: " (was: #{article.suppression_reason})",
+                 else: ""
+               )
+         }}
+    end)
+  end
+
+  # A reason is the half of the tombstone that a status change could never carry, so it is
+  # validated up front rather than left to the changeset: the caller gets a 422 naming the
+  # field before a transaction is opened. Trimmed here so trailing whitespace cannot satisfy
+  # "non-blank", and length-checked here AND in `Article.suppression_changeset/2` AND at the
+  # column, so a future writer that skips this function still cannot exceed the bound.
+  defp normalize_suppression_reason(reason) when is_binary(reason) do
+    trimmed = String.trim(reason)
+    max = Article.max_suppression_reason_length()
+
+    cond do
+      trimmed == "" ->
+        {:error, "reason must not be blank"}
+
+      String.length(trimmed) > max ->
+        {:error, "reason must be at most #{max} characters"}
+
+      true ->
+        {:ok, trimmed}
+    end
+  end
+
+  defp normalize_suppression_reason(_reason) do
+    {:error, "reason is required: a suppression that does not record why is not inspectable"}
+  end
+
+  # The shared transaction for BOTH directions. `decide` receives the row locked FOR UPDATE
+  # and answers either `:noop` or a `:write` carrying its changeset, audit action, both audit
+  # states and a curation-log summary. One helper rather than two so the lock, the visibility
+  # scope and the audit shape cannot drift between suppress and unsuppress — the pair has to
+  # stay symmetric for the primitive to be reversible.
+  #
+  # A `:noop` ABORTS the transaction (`{:error, {:noop, article}}`) rather than threading a
+  # skip flag through the later steps. Neither `Audit.log_in_multi/3` nor
+  # `EventGenerator.generate_events/3` has a "record nothing" shape — both `Map.fetch!` their
+  # params — so a conditional write would have to fabricate an audit row for an act that never
+  # happened. Rolling back a transaction that read one row and wrote none costs nothing and is
+  # the honest encoding: nothing happened, so nothing is recorded.
+  defp run_suppression(tenant_id, article_id, opts, decide) do
+    actor_id = Keyword.get(opts, :actor_id)
+    actor_label = Keyword.get(opts, :actor_label)
+    actor_type = Keyword.get(opts, :actor_type, "api_key")
+
+    multi =
+      Multi.new()
+      |> Multi.run(:fetch, fn _repo, _changes ->
+        # Fetch-and-lock INSIDE the transaction, exactly as `transition_article/5` does: two
+        # concurrent suppressions of the same row would otherwise both read "not suppressed"
+        # and the second would overwrite the first actor's tombstone.
+        #
+        # Visibility scope (#163/#331): an agent may only suppress an article it can see;
+        # another agent's private/owner memory resolves to :not_found, matching the reads.
+        query =
+          from(a in Article,
+            where: a.id == ^article_id and a.tenant_id == ^tenant_id,
+            lock: "FOR UPDATE"
+          )
+          |> maybe_filter_by_visibility(Keyword.get(opts, :visibility_agent_id))
+
+        case AdminRepo.one(query) do
+          nil -> {:error, :not_found}
+          article -> decide.(article) |> wrap_suppression_decision()
+        end
+      end)
+      |> Multi.update(:article, fn %{fetch: %{changeset: changeset}} -> changeset end)
+      |> Audit.log_in_multi(:audit, fn %{fetch: plan, article: updated} ->
+        %{
+          tenant_id: tenant_id,
+          entity_type: "article",
+          entity_id: updated.id,
+          action: plan.action,
+          actor_type: actor_type,
+          actor_id: actor_id,
+          actor_label: actor_label,
+          old_state: plan.old_state,
+          new_state: plan.new_state
+        }
+      end)
+      |> EventGenerator.generate_events(:webhook_events, fn %{fetch: plan, article: updated} ->
+        %{
+          tenant_id: tenant_id,
+          event_type: plan.action,
+          project_id: updated.project_id,
+          payload: article_event_payload(updated)
+        }
+      end)
+
+    case AdminRepo.transaction(multi) do
+      {:ok, %{fetch: plan, article: updated}} ->
+        # AFTER the commit, for the same reason the conflict verdicts log after theirs:
+        # `KbCuration.record/4` is fire-and-forget and reads the tenant's toggle, and a feed
+        # line must never be able to roll back the suppression it describes.
+        log_suppression_curation(tenant_id, plan.action, plan.summary, updated, actor_label)
+        {:ok, updated}
+
+      {:error, :fetch, {:noop, article}, _} ->
+        {:ok, article}
+
+      {:error, :fetch, :not_found, _} ->
+        {:error, :not_found}
+
+      {:error, :article, changeset, _} ->
+        {:error, changeset}
+    end
+  end
+
+  # `Multi.run/3` reads `{:error, _}` as "abort", which is exactly what a no-op wants, and
+  # `{:ok, plan}` as "carry this forward".
+  defp wrap_suppression_decision({:noop, article}), do: {:error, {:noop, article}}
+  defp wrap_suppression_decision({:write, plan}), do: {:ok, plan}
+
+  defp log_suppression_curation(tenant_id, action, summary, article, actor_label) do
+    kind = if action == "article.suppressed", do: "suppress", else: "unsuppress"
+
+    KbCuration.record(tenant_id, kind, summary, refs: [article.id], actor: actor_label)
+  end
+
+  # The actor recorded ON THE ROW. The audit log already carries the full actor triple; this
+  # is the one-line label a reader of the article itself sees, so it falls back to the id
+  # rather than to nil — "who suppressed this" must always have an answer.
+  defp suppression_actor(opts) do
+    label = Keyword.get(opts, :actor_label) || Keyword.get(opts, :actor_id) || "unknown"
+
+    label |> to_string() |> String.slice(0, Article.max_suppressed_by_length())
   end
 
   # Drafts are published in batches of this size; a request with more ids than
@@ -6527,6 +6830,9 @@ defmodule Loopctl.Knowledge do
       else
         from(a in Article,
           where: a.tenant_id == ^tenant_id and a.id == ^article_id and a.status == :published,
+          # suggest_links is a retrieval surface: a suppressed anchor yields :not_found
+          # rather than a neighbour list computed from a vector nothing returns.
+          where: is_nil(a.suppressed_at),
           select: %{embedding: a.embedding}
         )
         |> maybe_filter_by_visibility(vis)
@@ -6548,6 +6854,9 @@ defmodule Loopctl.Knowledge do
         ae.article_id == a.id and ae.tenant_id == ^tenant_id and ae.dim == ^dimension and
           ae.live_denorm,
       where: a.tenant_id == ^tenant_id and a.id == ^article_id and a.status == :published,
+      # Same anchor rule as the legacy path — the two must agree or the cutover flag
+      # would decide whether a suppressed article can seed suggestions.
+      where: is_nil(a.suppressed_at),
       select: %{embedding: ae.embedding}
     )
     |> maybe_filter_by_visibility(vis)
@@ -7041,7 +7350,10 @@ defmodule Loopctl.Knowledge do
   defp article_published?(tenant_id, article_id, vis) do
     valid_uuid?(article_id) and
       from(a in Article,
-        where: a.tenant_id == ^tenant_id and a.id == ^article_id and a.status == :published
+        where: a.tenant_id == ^tenant_id and a.id == ^article_id and a.status == :published,
+        # The graph entry gate: traversal from a suppressed root is a retrieval path
+        # into it by another name.
+        where: is_nil(a.suppressed_at)
       )
       |> maybe_filter_by_visibility(vis)
       |> AdminRepo.exists?()
@@ -7149,6 +7461,9 @@ defmodule Loopctl.Knowledge do
   defp fetch_graph_nodes(tenant_id, node_ids, depth_map) do
     from(a in Article,
       where: a.tenant_id == ^tenant_id and a.id in ^node_ids and a.status == :published,
+      # Graph NEIGHBOURS, not just the root: a suppressed article reached two hops out
+      # is still returned to the caller.
+      where: is_nil(a.suppressed_at),
       select: %{id: a.id, title: a.title, category: a.category}
     )
     |> AdminRepo.all()
@@ -7302,6 +7617,9 @@ defmodule Loopctl.Knowledge do
       on: a.id == ae.article_id and a.tenant_id == ^tenant_id,
       where: ae.tenant_id == ^tenant_id and ae.dim == ^dimension and ae.live_denorm,
       where: a.status == :published,
+      # Distant-pair candidates feed suggest-links and the conflict queue, both
+      # retrieval-shaped: a suppressed article must not become half of a proposed link.
+      where: is_nil(a.suppressed_at),
       order_by: a.id,
       limit: ^pair_candidate_cap(bridge?),
       select: %{
@@ -7318,6 +7636,8 @@ defmodule Loopctl.Knowledge do
   defp pair_candidates_legacy_query(tenant_id, bridge?, vis) do
     from(a in Article,
       where: a.tenant_id == ^tenant_id and a.status == :published and not is_nil(a.embedding),
+      # Same rule as the side-table branch above — the cutover flag must not decide it.
+      where: is_nil(a.suppressed_at),
       order_by: a.id,
       limit: ^pair_candidate_cap(bridge?),
       select: %{
@@ -7513,6 +7833,8 @@ defmodule Loopctl.Knowledge do
     if valid_uuid?(article_id) do
       from(a in Article,
         where: a.tenant_id == ^tenant_id and a.id == ^article_id and a.status == :published,
+        # The random walk's node read — both the walk's seed and every step it lands on.
+        where: is_nil(a.suppressed_at),
         select: %{id: a.id, title: a.title, category: a.category}
       )
       |> maybe_filter_by_visibility(vis)
@@ -7530,6 +7852,7 @@ defmodule Loopctl.Knowledge do
       join: n in Article,
       on:
         n.tenant_id == ^tenant_id and n.status == :published and
+          is_nil(n.suppressed_at) and
           n.id ==
             fragment(
               "CASE WHEN ? = ? THEN ? ELSE ? END",
@@ -7655,7 +7978,11 @@ defmodule Loopctl.Knowledge do
       from(a in Article,
         where:
           a.tenant_id == ^tenant_id and a.status == :published and not is_nil(a.embedding) and
-            fragment("? && ?", a.tags, ^[prior_tag])
+            fragment("? && ?", a.tags, ^[prior_tag]),
+        # A suppressed article is not a prior: it must not hold down a new idea's
+        # novelty score, and the count that disambiguates that score must be over the
+        # same population as the distance below.
+        where: is_nil(a.suppressed_at)
       )
       |> maybe_filter_by_visibility(vis)
       |> AdminRepo.aggregate(:count, timeout: 15_000)
@@ -7810,6 +8137,8 @@ defmodule Loopctl.Knowledge do
       where:
         a.tenant_id == ^tenant_id and a.status == :published and not is_nil(a.embedding) and
           fragment("? && ?", a.tags, ^[prior_tag]),
+      # Same prior population as the count above and the side-table id set below.
+      where: is_nil(a.suppressed_at),
       select: fragment("MIN(? <=> ?::vector)", a.embedding, ^target)
     )
     |> maybe_filter_by_visibility(vis)
@@ -7842,6 +8171,8 @@ defmodule Loopctl.Knowledge do
       where:
         a.tenant_id == ^tenant_id and a.status == :published and
           fragment("? && ?", a.tags, ^[prior_tag]),
+      # The side-table branch's half of the same prior population.
+      where: is_nil(a.suppressed_at),
       select: a.id
     )
     |> maybe_filter_by_visibility(vis)
@@ -10055,6 +10386,10 @@ defmodule Loopctl.Knowledge do
     query =
       from(a in Article,
         where: a.tenant_id == ^tenant_id and a.id in ^ranked_ids and a.status == ^status,
+        # The RRF graph lane. It takes a parametrized status rather than a literal
+        # `:published`, so the drift guard's scan does not see it — this predicate is
+        # here by hand, and `carriers/0`'s scope-limit note says so.
+        where: is_nil(a.suppressed_at),
         select: %{
           id: a.id,
           tenant_id: a.tenant_id,
@@ -11169,6 +11504,10 @@ defmodule Loopctl.Knowledge do
       # pasted into a cached prefix, which is the same failure #567/#569/#572 each fixed
       # once: heat must not rank on a signal heat's own plumbing produces.
       where: fragment("coalesce(? ->> 'hub_kind', '') <> 'source'", a.metadata),
+      # The heat index is the one retrieval route that takes no query, so a suppressed
+      # article omitted from every OTHER surface would still be pasted into a cached
+      # prefix from here — the widest-reach leak of the set.
+      where: is_nil(a.suppressed_at),
       select: a.id
     )
     |> heat_filter_category(category)
@@ -11437,6 +11776,10 @@ defmodule Loopctl.Knowledge do
         where: a.id in ^ids,
         where: a.tenant_id == ^tenant_id or a.scope == :system,
         where: a.status == :published,
+        # The stub projection re-filters the ranked ids, so it must carry the same
+        # predicate as `heat_article_ids/3` or a row that survives here is served with
+        # a heat the ranking never gave it.
+        where: is_nil(a.suppressed_at),
         select: %{
           id: a.id,
           title: a.title,
@@ -12729,7 +13072,11 @@ defmodule Loopctl.Knowledge do
     from(a in Article,
       as: :article,
       where: a.tenant_id == ^tenant_id,
-      where: a.status == :published
+      where: a.status == :published,
+      # A suppressed article is not an orphan, a coverage gap or a stale entry — it is
+      # a row somebody deliberately took out of retrieval, and reporting it as a defect
+      # would send an operator to "fix" the suppression.
+      where: is_nil(a.suppressed_at)
     )
   end
 
@@ -12738,7 +13085,9 @@ defmodule Loopctl.Knowledge do
       from(a in Article,
         as: :article,
         where: a.tenant_id == ^tenant_id,
-        where: a.status == :published
+        where: a.status == :published,
+        # Same rule as the tenant-wide clause above.
+        where: is_nil(a.suppressed_at)
       )
 
     # Defense in depth: a non-UUID project_id would raise Ecto.Query.CastError on
@@ -12848,10 +13197,17 @@ defmodule Loopctl.Knowledge do
       from(al in ArticleLink,
         where: al.tenant_id == ^tenant_id,
         where: al.relationship_type == :contradicts,
+        # Both sides carry the tombstone predicate inline: the article is neither the
+        # first nor the last binding here, so `Suppression.exclude/1` cannot reach it.
+        # A contradiction whose either half is suppressed is not a live contradiction.
         join: src in Article,
-        on: src.id == al.source_article_id and src.status == :published,
+        on:
+          src.id == al.source_article_id and src.status == :published and
+            is_nil(src.suppressed_at),
         join: tgt in Article,
-        on: tgt.id == al.target_article_id and tgt.status == :published,
+        on:
+          tgt.id == al.target_article_id and tgt.status == :published and
+            is_nil(tgt.suppressed_at),
         select: %{
           link_id: al.id,
           source_article_id: al.source_article_id,
