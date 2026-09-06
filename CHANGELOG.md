@@ -22,14 +22,19 @@ All notable changes to loopctl are documented here.
   that is the only place a broken extraction can surface. And `title_drift` is FALSE when the
   submitted title matches the article's `previous_title`, because the nightly
   `:generic_title` consolidation moved the stored side — reporting it would have a compliant
-  sourcer PATCH the placeholder title back every night.
+  sourcer PATCH the placeholder title back every night. That suppression ends by itself once
+  a human curates the title: an ordinary title PATCH CLEARS `previous_title`, the column no
+  caller can write (nothing behavioural reads the erasable `metadata` marker beside it).
 
   The response `note` tells you to READ the stored article before overwriting it: drift is
   symmetric and only one of the two sides is yours. The gate's near-duplicate branch gets
-  its OWN note — the row it hands back is a near-NEIGHBOUR matched by similarity, so the
-  remedy there is merge-or-`force: true`, never "apply your payload to this id". The
+  its OWN note — the row it hands back was matched by SIMILARITY with no self-exclusion, so
+  it may be another author's article or your own earlier capture: PATCH it only if it is
+  your own prior capture, otherwise merge into it or re-send under a DIFFERENT title with
+  `force: true` (the same title answers `409 title_conflict`). The
   durable server-side trace of a drifted discard is a `Logger` warning naming the tenant
-  and article id; the flags also ride the `:deduplicated` write-telemetry metadata, but the
+  and article id, emitted on the idempotency and title-collision dedups (never on the gate's
+  near-duplicate verdict, where drift is true by construction); the flags also ride the `:deduplicated` write-telemetry metadata, but the
   `ingestion_write_stats` rollup does not break them out.
 
 - **Corpus mode B (`client_embedded`) — loopctl stores and ranks vectors it cannot read

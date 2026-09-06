@@ -451,8 +451,8 @@ defmodule Loopctl.KnowledgeTest do
                  category: :reference
                })
 
-      # The marker is what `Loopctl.Knowledge.Consolidation.write_title/4` stamps; the
-      # suppression below is scoped to it, so it must be part of the retitle here too.
+      # The marker `Loopctl.Knowledge.Consolidation.write_title/4` stamps is advisory and
+      # erasable, so the suppression must NOT be scoped to it — only to `previous_title`.
       assert {:ok, retitled} =
                Knowledge.retitle_article(tenant.id, article.id, %{
                  title: "Notes on the drift signal",
@@ -477,15 +477,33 @@ defmodule Loopctl.KnowledgeTest do
                  "body" => "the captured body"
                })
 
-      # `previous_title` is never cleared, so the suppression has to STOP once a human
-      # curates the title — otherwise the sourcer is told "in sync" about a title the
-      # article does not have, which is the silent discard this signal exists to end.
-      assert {:ok, curated} =
+      # An ordinary metadata PATCH replaces the whole map and drops the advisory marker.
+      # The suppression must survive it: keying on the marker re-armed the retitle-undo
+      # loop after any unrelated metadata write.
+      assert {:ok, patched} =
                Knowledge.update_article(tenant.id, retitled.id, %{
+                 metadata: %{"visibility" => "shared"}
+               })
+
+      refute Map.has_key?(patched.metadata, "consolidation_title_generated")
+      assert patched.previous_title == "Notes"
+
+      assert %{content_drift: false, title_drift: false} =
+               Knowledge.dedup_drift(patched, %{
+                 "title" => "Notes",
+                 "body" => "the captured body"
+               })
+
+      # The suppression has to STOP once a human curates the title — otherwise the sourcer
+      # is told "in sync" about a title the article does not have, which is the silent
+      # discard this signal exists to end. An ordinary title edit CLEARS the undo record,
+      # which is the non-castable column that carries the condition.
+      assert {:ok, curated} =
+               Knowledge.update_article(tenant.id, patched.id, %{
                  title: "Drift signal, curated by a human"
                })
 
-      assert curated.previous_title == "Notes"
+      assert curated.previous_title == nil
 
       assert %{title_drift: true} =
                Knowledge.dedup_drift(curated, %{

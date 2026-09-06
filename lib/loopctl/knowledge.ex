@@ -902,13 +902,12 @@ defmodule Loopctl.Knowledge do
   stored", which is the one answer that guarantees nobody looks.
 
   `title_drift` is suppressed when the submitted title matches the article's
-  `previous_title` AND the stored title is still the machine-generated one
-  (`metadata["consolidation_title_generated"]`, see `retitle_article/4`): the stored side
-  moved, deliberately, by the nightly `:generic_title` consolidation retitle — the CALLER
-  has not drifted, and reporting it as caller-side drift told a compliant sourcer to PATCH
-  the placeholder title back every night, undoing the retitle in a loop. Both halves are
-  required because `previous_title` is never cleared: once a human curates the title, the
-  suppression would otherwise keep answering "in sync" about a title nobody stores.
+  `previous_title`: the stored side moved, deliberately, by the nightly `:generic_title`
+  consolidation retitle — the CALLER has not drifted, and reporting it as caller-side drift
+  told a compliant sourcer to PATCH the placeholder title back every night, undoing the
+  retitle in a loop. The suppression ends by itself once a human curates that title, because
+  `Article.update_changeset/2` CLEARS `previous_title` on an ordinary title edit. That is a
+  column no caller can cast, which is why the condition is not read out of `metadata`.
 
   Returns `%{content_drift: boolean(), title_drift: boolean()}`. This REPORTS, it never
   decides — nothing in the create path branches on it.
@@ -937,24 +936,20 @@ defmodule Loopctl.Knowledge do
 
   # A machine retitle is not caller drift — but ONLY while the machine's title is still the
   # stored one. `previous_title` is written by `Article.retitle_changeset/2` (the nightly
-  # `:generic_title` consolidation) and is never cleared, so on its own the suppression
-  # outlives the condition that justifies it: a human curating the title afterwards would
-  # still be told its old capture matches a title the article no longer has. The
-  # `consolidation_title_generated` marker records what that pass wrote, so requiring it to
-  # still EQUAL `existing.title` scopes the suppression to the un-curated case. Losing the
-  # marker degrades to REPORTING drift, never to hiding it.
+  # `:generic_title` consolidation) and CLEARED by `Article.update_changeset/2` on any
+  # ordinary title edit, so a non-null value means exactly "the machine's title is what is
+  # stored" and the suppression cannot outlive a human's curation of that title. It is a
+  # column castable from nowhere, deliberately: the marker this once read
+  # (`metadata["consolidation_title_generated"]`) is erased by any metadata-replacing PATCH,
+  # which silently re-armed the retitle-undo loop, and is caller-writable, which let a writer
+  # re-arm the suppression the curation had just turned off.
   defp title_drifted?(existing, {:present, incoming} = value) when is_binary(incoming) do
-    if machine_titled?(existing) and trimmed_equal?(existing.previous_title, incoming),
+    if trimmed_equal?(existing.previous_title, incoming),
       do: false,
       else: drifted?(existing.title, value)
   end
 
   defp title_drifted?(existing, value), do: drifted?(existing.title, value)
-
-  defp machine_titled?(%Article{metadata: metadata, title: title}) when is_map(metadata),
-    do: trimmed_equal?(Map.get(metadata, "consolidation_title_generated"), title)
-
-  defp machine_titled?(_existing), do: false
 
   # Key absent => no claim of drift (see dedup_drift/2).
   defp drifted?(_stored, :absent), do: false

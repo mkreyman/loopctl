@@ -173,9 +173,11 @@ defmodule LoopctlWeb.ArticleController do
            "machine-retitled since your last capture — so GET /articles/:id before " <>
            "overwriting it, then PATCH /articles/:id if that row is YOUR OWN prior " <>
            "capture and your version is still the intended one. On `gate.verdict: " <>
-           "duplicate` it is NOT: the row is a near-NEIGHBOUR matched by similarity, so " <>
-           "drift is true by construction there and the remedy is to merge into it or " <>
-           "re-send with `force: true`, never to PATCH your payload onto it. Both are " <>
+           "duplicate` the row is a near-NEIGHBOUR matched by similarity — which may be " <>
+           "another author's article or your own earlier capture, since the match has no " <>
+           "self-exclusion — so drift is true by construction there and the remedy is to " <>
+           "merge into it, or re-send under a DIFFERENT title with `force: true` (the same " <>
+           "title answers 409 title_conflict). Both are " <>
            "false on a title+body dedup by construction. The " <>
            "`skipped: true` shape carries NEITHER field: nothing was stored for this " <>
            "payload, so there is no row it could have drifted from (the discard is " <>
@@ -206,10 +208,10 @@ defmodule LoopctlWeb.ArticleController do
                  "Present on every `deduplicated: true` response. true means the TITLE you " <>
                    "submitted differs (after trimming) from the stored article, which was NOT " <>
                    "changed. Deliberately FALSE when your title matches the article's " <>
-                   "`previous_title` AND the stored title is still the machine-generated one " <>
-                   "— the nightly consolidation retitled it, so the stored side moved and " <>
-                   "re-applying yours would only undo that every night. Once a human curates " <>
-                   "that title the suppression stops and drift is reported again."
+                   "`previous_title` — the nightly consolidation retitled it, so the stored " <>
+                   "side moved and re-applying yours would only undo that every night. Once " <>
+                   "a human edits that title the undo record is cleared, so the suppression " <>
+                   "stops and drift is reported again."
              }
            }
          }},
@@ -339,8 +341,10 @@ defmodule LoopctlWeb.ArticleController do
         "**`previous_title` (#765).** Non-null only on an article the nightly consolidation " <>
         "pass retitled from its own content, where it carries the placeholder title that " <>
         "was replaced. It is the UNDO record for that unattended write, so it is a column " <>
-        "rather than a `metadata` key and a PATCH cannot erase it; restore it by PATCHing " <>
-        "`title` back. Read-only — it is not accepted on create or update.",
+        "rather than a `metadata` key and no metadata PATCH can erase it; restore it by " <>
+        "PATCHing `title` back. Editing `title` to anything else CLEARS it — a title someone " <>
+        "chose deliberately has no machine retitle left to undo. Read-only — it is not " <>
+        "accepted on create or update.",
     parameters: [
       id: [
         in: :path,
@@ -1226,19 +1230,24 @@ defmodule LoopctlWeb.ArticleController do
   end
 
   # The novelty gate's `:duplicate` branch hands back a near-NEIGHBOUR, so `drift_note/2`
-  # is wrong there in both directions: its remedy names that id as the thing to PATCH your
-  # payload onto — an unattended sourcer following it destroys a third party's (possibly
-  # human-curated) body — and its closing "re-sending will keep being a no-op" contradicts
-  # the same note's `force: true` offer, since this gate is score-based, not key-based.
+  # is wrong there: its remedy names that id as the thing to PATCH your payload onto — an
+  # unattended sourcer following it destroys a third party's (possibly human-curated) body —
+  # and its closing "re-sending will keep being a no-op" contradicts the same note's
+  # `force: true` offer, since this gate is score-based, not key-based. The opposite claim is
+  # wrong too: `VectorSearch.nearest/4` has no self-exclusion, so the row it matched may well
+  # be the CALLER's own earlier capture. Undecidable, so the note says read-then-decide, and
+  # names the 409 the `force: true` remedy hits when the neighbour holds the same title.
   defp neighbor_drift_note(_existing, %{content_drift: false, title_drift: false}), do: ""
 
   defp neighbor_drift_note(existing, drift) do
     " Your submitted #{drifted_fields(drift)} " <>
       "#{if drift.content_drift and drift.title_drift, do: "differ", else: "differs"} from " <>
-      "that article — expected, since it was matched by SIMILARITY and is not a copy of " <>
-      "your capture. Do NOT apply this payload to it: READ article #{existing.id} " <>
-      "(GET /articles/#{existing.id}) first, then either merge your material into it or " <>
-      "re-send with `force: true` to create a separate article."
+      "that article — expected, since it was matched by SIMILARITY. It MAY be an article " <>
+      "you did not write, or it may be your own earlier capture, so READ article " <>
+      "#{existing.id} (GET /articles/#{existing.id}) first: apply this payload with " <>
+      "knowledge_update (PATCH /articles/#{existing.id}) ONLY if that row is your own prior " <>
+      "capture, otherwise merge your material into it, or re-send under a DIFFERENT title " <>
+      "with `force: true` (the same title answers 409 title_conflict)."
   end
 
   defp drifted_fields(%{content_drift: true, title_drift: true}), do: "title and body"

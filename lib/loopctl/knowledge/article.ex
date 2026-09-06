@@ -266,6 +266,7 @@ defmodule Loopctl.Knowledge.Article do
     |> validate_metadata()
     |> validate_agent_metadata()
     |> clear_curated_marker_on_content_change()
+    |> clear_previous_title_on_title_change()
     |> foreign_key_constraint(:project_id)
     |> unique_constraint(:title,
       name: :articles_tenant_title_active_idx,
@@ -295,10 +296,15 @@ defmodule Loopctl.Knowledge.Article do
   1. **It stamps `:previous_title`** — the durable undo record. What licenses
      `Loopctl.Knowledge.Consolidation` to retitle a placeholder without a human is that the
      write is reversible, so the record of what to restore must outlive an ordinary caller
-     `PATCH`. It is a COLUMN and is not castable anywhere; this function is its only writer.
+     `PATCH`. It is a COLUMN and is not castable anywhere; this function is its only writer,
+     and `update_changeset/2` clears it when a human edits the title — the undo target is
+     gone once someone deliberately chose another one, and a non-null value is therefore the
+     durable "the machine's title is still the stored one" signal `dedup_drift/2` reads.
      The `consolidation_title_generated` MARKER stays on `metadata` deliberately — that one
      is advisory (it answers "is this title ours to replace"), and losing it fails SAFE, by
-     declining a future retitle rather than by performing an unrecorded one.
+     declining a future retitle rather than by performing an unrecorded one. Nothing
+     behavioural may hang off it: `metadata` is cast as a whole map, so one ordinary PATCH
+     erases it.
 
   2. **It regenerates `:slug`** — `maybe_generate_slug/1` fires only when the slug is absent,
      so `update_changeset/2` leaves a retitled article on the slug derived from its old
@@ -338,6 +344,20 @@ defmodule Loopctl.Knowledge.Article do
       put_change(changeset, :staged_draft_at, DateTime.utc_now())
     else
       changeset
+    end
+  end
+
+  # An ordinary title edit RETIRES the undo record: `previous_title` names what the nightly
+  # `:generic_title` retitle replaced, and once a human has deliberately chosen a different
+  # title there is nothing left to restore. It is also what makes `Knowledge.dedup_drift/2`'s
+  # title-drift suppression correct: a non-null `previous_title` means the MACHINE's title is
+  # the one stored, and that fact must not be readable from — or forgeable through — the
+  # caller-castable `metadata` map. Same shape as the curated-marker clearing above.
+  # `retitle_changeset/2` re-stamps it AFTER this runs, so the consolidation path is unaffected.
+  defp clear_previous_title_on_title_change(changeset) do
+    case get_change(changeset, :title) do
+      nil -> changeset
+      _changed -> put_change(changeset, :previous_title, nil)
     end
   end
 

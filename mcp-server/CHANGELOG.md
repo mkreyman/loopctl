@@ -10,13 +10,15 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ### Changed
 
 - **`knowledge_create` describes `content_drift` / `title_drift`.** A `deduplicated: true`
-  response from loopctl 2.89.0+ carries both booleans; an older server omits them, so an
-  ABSENT key means unknown, never false. True means the payload you just sent differed from
-  the RETURNED article and was discarded. Which side moved is not decidable from your end —
-  read the returned article first, and use `knowledge_update` on it only when that row is
-  your own prior capture. When `gate.verdict` is `duplicate` it is not: the row is a
-  near-NEIGHBOUR matched by similarity, so merge into it or re-send with `force: true`,
-  never PATCH your payload onto it.
+  response carries both booleans on a loopctl that supports them; an older one omits them, so
+  an ABSENT key means unknown, never false — the keys' presence is the capability signal (the
+  server publishes no version to compare against; 2.89.0 is THIS npm package). True means the
+  payload you just sent differed from the RETURNED article and was discarded. Which side moved
+  is not decidable from your end — read the returned article first, and use `knowledge_update`
+  on it only when that row is your own prior capture. When `gate.verdict` is `duplicate` the
+  row was matched by similarity with no self-exclusion, so it may be an article you did not
+  write or your own earlier capture: merge into it, or re-send under a DIFFERENT title with
+  `force: true` (the same title answers 409 title_conflict).
 
 ## 2.78.0 — 2026-08-28 (the corpus tier becomes reachable from an agent)
 

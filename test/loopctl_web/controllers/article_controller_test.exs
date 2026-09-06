@@ -1058,11 +1058,15 @@ defmodule LoopctlWeb.ArticleControllerTest do
       assert resp["title_drift"] == true
       assert resp["note"] =~ "near-duplicate"
       assert resp["note"] =~ "READ article #{canonical.id}"
-      # The row is a near-NEIGHBOUR the caller never wrote, so the note must NOT hand an
-      # unattended sourcer an overwrite verb aimed at it, and must not call the create a
-      # permanent no-op when the same note has just offered `force: true`.
-      refute resp["note"] =~ "knowledge_update"
-      refute resp["note"] =~ "PATCH /articles/#{canonical.id}"
+      # The row was matched by SIMILARITY and `VectorSearch.nearest/4` has no
+      # self-exclusion, so the note may assert NEITHER side: an unconditional overwrite verb
+      # destroys a stranger's article, and an unconditional "you did not write this" sends a
+      # sourcer that re-captured its OWN page off to create a second copy. Any update verb
+      # here must therefore carry its condition, and the `force: true` remedy must name the
+      # 409 a same-title re-send takes. It must also not call the create a permanent no-op
+      # when the same note has just offered `force: true`.
+      assert resp["note"] =~ "ONLY if that row is your own prior capture"
+      assert resp["note"] =~ "title_conflict"
       refute resp["note"] =~ "no-op"
       assert resp["note"] =~ "force: true"
     end

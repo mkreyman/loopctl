@@ -5144,15 +5144,18 @@ const TOOLS = [
       "server returns that existing article idempotently (HTTP 200) instead of a 422. A same-title create " +
       "with a DIFFERENT body returns 409 title_conflict — do not retry; choose a different title or PATCH " +
       "the existing article. CONTENT DRIFT: a `deduplicated: true` response carries " +
-      "`content_drift` / `title_drift` when the server supports them (a loopctl older than 2.89.0 " +
-      "omits the keys — treat ABSENT as unknown, never as false); true means the payload you just " +
+      "`content_drift` / `title_drift` when the server supports them (an older loopctl omits the " +
+      "keys — treat ABSENT as unknown, never as false; presence of the keys IS the capability " +
+      "signal, there is no server version to compare against); true means the payload you just " +
       "sent DIFFERS from the returned article and was DISCARDED. Which SIDE moved is not decidable " +
       "from your end — you may have edited, or the stored article may have been curated by someone " +
       "else or machine-retitled since your last capture — so READ the returned article first " +
       "(knowledge_get on `data.id`). Only THEN, and only if the returned row is your own prior " +
       "capture, apply your version with knowledge_update. When the response also carries " +
-      "`gate.verdict: \"duplicate\"` the returned row is a near-NEIGHBOUR you did NOT write: never " +
-      "PATCH your payload onto it — merge into it, or re-send with force: true. Sending `body` as " +
+      "`gate.verdict: \"duplicate\"` the returned row was matched by SIMILARITY with no " +
+      "self-exclusion, so it may be an article you did not write OR your own earlier capture: read " +
+      "it, PATCH only your own prior capture, else merge into it or re-send under a DIFFERENT " +
+      "title with force: true (the same title answers 409 title_conflict). Sending `body` as " +
       "null or a non-string also reports content_drift: the dedup short-circuits before validation, " +
       "so that is how a broken extraction surfaces instead of reading as in-sync.",
     inputSchema: {
