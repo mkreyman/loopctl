@@ -17,27 +17,18 @@ defmodule Loopctl.Net.PinnedHostHeaderTest do
 
   alias Loopctl.Net.UrlGuard
 
-  # Generous on purpose: see the comment in observed_host/3.
-  @receive_timeout 30_000
+  # One deadline for EVERY leg - socket read, pool checkout, connect. Widening
+  # only the read moves the flake; and a Finch pool-checkout timeout RAISES
+  # rather than returning {:error, _}, escaping the case in observed_host/3.
+  @request_deadline 30_000
+  # Must outlast all three legs, or a hung request dies as ExUnit.TimeoutError.
+  @moduletag timeout: 4 * @request_deadline
 
   @ipv4_loopback {127, 0, 0, 1}
   @ipv6_loopback {0, 0, 0, 0, 0, 0, 0, 1}
 
-  setup context do
-    # Skip IPv6 tests on systems without IPv6 loopback bindability
-    if context[:requires_ipv6] do
-      case :gen_udp.open(0, [:inet6, {:ip, @ipv6_loopback}]) do
-        {:ok, socket} ->
-          :gen_udp.close(socket)
-          :ok
-
-        {:error, _reason} ->
-          {:skip, "IPv6 loopback not available on this system"}
-      end
-    else
-      :ok
-    end
-  end
+  # No in-file IPv6 probe: test_helper.exs excludes :requires_ipv6 after its own
+  # :gen_tcp.listen probe, and a setup returning {:skip, _} goes RED, not skipped.
 
   test "IPv4-pinned request sends the original hostname as Host" do
     port = start_echo_server(@ipv4_loopback, :echo_v4)
@@ -69,24 +60,26 @@ defmodule Loopctl.Net.PinnedHostHeaderTest do
       ip: ip
     }
 
+    pinned_opts = UrlGuard.pinned_request_opts(pinned)
+
     req_opts =
-      UrlGuard.pinned_request_opts(pinned)
-      |> Keyword.merge(
+      Keyword.merge(pinned_opts,
         method: :get,
         retry: false,
         redirect: false,
-        receive_timeout: @receive_timeout
+        pool_timeout: @request_deadline,
+        receive_timeout: @request_deadline,
+        # Keyword.put, not a fresh list: the guard's hostname: is under test.
+        connect_options: Keyword.put(pinned_opts[:connect_options], :timeout, @request_deadline)
       )
 
-    # This is the ONE test in the suite whose verdict depends on a real socket
-    # completing inside a deadline, so the deadline is generous and a transport
-    # failure says so in words. A 2s budget flaked the commit gate once at load
-    # 36.9 on a 16-thread box and passed on the retry at load 37.9; hammering the
-    # same round-trip 400x under deliberate scheduler starvation reproduced it at
-    # 16/400, every one a Req.TransportError with reason :timeout. Nothing about
-    # the Host header is timing-dependent, so a slow loopback response is box
-    # weather, not a defect - but a bare match on {:ok, _} reported it as an
-    # unexplained MatchError, which is what cost the diagnosis.
+    # The verdict depends on a real socket completing inside a deadline. A 2s
+    # budget flaked the commit gate at load 36.9 on a 16-thread box; hammering
+    # the round-trip 400x under deliberate scheduler starvation reproduced it
+    # 16/400, every one a Req.TransportError reason :timeout - box weather, not
+    # a defect, but a bare match reported it as an unexplained MatchError.
+    # inspect/1, not Exception.message/1: it keeps the error MODULE, and cannot
+    # itself raise on a non-exception term.
     case Req.request(req_opts) do
       {:ok, %Req.Response{status: 200, body: body}} ->
         body
@@ -95,7 +88,7 @@ defmodule Loopctl.Net.PinnedHostHeaderTest do
         flunk("echo server answered #{status}, expected 200")
 
       {:error, error} ->
-        flunk("pinned request never completed: #{Exception.message(error)}")
+        flunk("pinned request never completed: #{inspect(error)}")
     end
   end
 
