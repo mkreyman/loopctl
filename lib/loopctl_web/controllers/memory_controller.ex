@@ -75,11 +75,12 @@ defmodule LoopctlWeb.MemoryController do
   @max_context_query_length 500
 
   # The cap on how many article ids one `POST /recall/:recall_id/referenced` call may
-  # record, and it is the merged recall's own maximum page size: a caller cannot have
-  # referenced more articles than one recall could have handed it. Published in the
-  # endpoint's OpenAPI description from THIS attribute so the documented limit and the
-  # enforced one cannot drift.
-  @max_referenced_article_ids 50
+  # record. READ from the merged recall's own maximum page size rather than restated as a
+  # second 50: a caller cannot have referenced more articles than one recall could have
+  # handed it, and two constants chosen separately cannot be reviewed against each other.
+  # Published in the endpoint's OpenAPI description from THIS attribute too, so the
+  # documented limit and the enforced one cannot drift either.
+  @max_referenced_article_ids Memory.max_context_limit()
 
   operation(:create,
     summary: "Remember (write a memory)",
@@ -203,7 +204,9 @@ defmodule LoopctlWeb.MemoryController do
         "`selected_count`, `tokens_selected`, `tokens_candidates` and " <>
         "`tokens_saved_vs_candidates`. The merged order is DETERMINISTIC — score DESC, " <>
         "then source (`knowledge` before `memory`), then id ASC — so an unchanged corpus " <>
-        "renders byte-identically between turns and a prompt cache survives. " <>
+        "renders a byte-identical `data` ARRAY between turns. Cache that array, not the " <>
+        "whole envelope: `meta.recall_id` is minted per call, so two identical recalls " <>
+        "differ in `meta` by construction. " <>
         "`meta.recall_id` is ALSO the `search_id` recorded on the knowledge half's " <>
         "surfacing rows; hand it back to `POST /recall/{recall_id}/referenced` to record " <>
         "which of those articles you actually used.",
@@ -587,25 +590,38 @@ defmodule LoopctlWeb.MemoryController do
       {:error, :not_surfaced, missing} ->
         not_surfaced(conn, missing)
 
-      {:error, :recording_failed} ->
-        conn
-        |> put_status(:internal_server_error)
-        |> json(%{
-          error: %{
-            status: 500,
-            code: "recording_failed",
-            message:
-              "The reference rows could not be recorded. Nothing was written; retry the " <>
-                "same call."
-          }
-        })
+      # A DB fault in the admission check is a 500, never folded into `not_surfaced`: an
+      # empty surfaced set and an unreadable one look identical, and answering 422 would
+      # blame the caller's own valid ids for an outage.
+      {:error, reason} when reason in [:lookup_failed, :recording_failed] ->
+        recording_failed(conn)
     end
   end
 
-  defp parse_recall_id(value) when is_binary(value) do
-    trimmed = String.trim(value)
+  defp recording_failed(conn) do
+    conn
+    |> put_status(:internal_server_error)
+    |> json(%{
+      error: %{
+        status: 500,
+        code: "recording_failed",
+        message:
+          "The reference rows could not be recorded. Nothing was written. Retry once; a " <>
+            "repeated failure means the recall or one of its articles is no longer " <>
+            "available, and retrying will not change that."
+      }
+    })
+  end
 
-    if canonical_uuid?(trimmed), do: {:ok, trimmed}, else: {:error, :invalid_recall_id}
+  # `cast_project_uuid/1`, not a bare regex + trim: the regex admits `[0-9a-fA-F]`, so an
+  # UPPERCASE UUID passes and is then compared verbatim against the lowercase form Ecto
+  # stores and `metadata->>'search_id'` carries — matching nothing, so a genuinely
+  # surfaced article comes back 422 `not_surfaced`. `Ecto.UUID.cast/1` canonicalises.
+  defp parse_recall_id(value) when is_binary(value) do
+    case cast_project_uuid(String.trim(value)) do
+      {:ok, uuid} -> {:ok, uuid}
+      :error -> {:error, :invalid_recall_id}
+    end
   end
 
   defp parse_recall_id(_), do: {:error, :invalid_recall_id}
@@ -615,17 +631,24 @@ defmodule LoopctlWeb.MemoryController do
   # success), and the funnel stage this endpoint exists to measure would silently not be
   # measured.
   defp parse_article_ids(ids) when is_list(ids) and ids != [] do
-    cond do
-      length(ids) > @max_referenced_article_ids -> {:error, :too_many_article_ids}
-      Enum.all?(ids, &article_id?/1) -> {:ok, Enum.map(ids, &String.trim/1)}
-      true -> {:error, :invalid_article_ids}
-    end
+    if length(ids) > @max_referenced_article_ids,
+      do: {:error, :too_many_article_ids},
+      else: cast_article_ids(ids)
   end
 
   defp parse_article_ids(_), do: {:error, :invalid_article_ids}
 
-  defp article_id?(value) when is_binary(value), do: canonical_uuid?(String.trim(value))
-  defp article_id?(_), do: false
+  # Canonicalised, not merely trimmed — same reason as `parse_recall_id/1` above.
+  defp cast_article_ids(ids) do
+    cast = Enum.map(ids, &article_id/1)
+
+    if Enum.any?(cast, &(&1 == :error)),
+      do: {:error, :invalid_article_ids},
+      else: {:ok, Enum.map(cast, fn {:ok, uuid} -> uuid end)}
+  end
+
+  defp article_id(value) when is_binary(value), do: cast_project_uuid(String.trim(value))
+  defp article_id(_), do: :error
 
   # The offending ids are echoed back because they are the CALLER'S OWN ids — it sent them
   # — so naming them leaks nothing and is the difference between a fixable error and a

@@ -1867,12 +1867,24 @@ async function recallReferenced({ recall_id, article_ids, project_id }) {
   // article id was surfaced by THAT recall before recording anything, so a wrong id fails
   // the whole call rather than recording a half-truth. The recording key is derived
   // server-side from this key — nothing about the identity is sent.
+  //
+  // Path-injection guard, the same `UUID_RE` check knowledgeAgentUsage runs. `format:
+  // "uuid"` in the input schema is advisory — MCP does not enforce it — so a model that
+  // hallucinates or mis-copies an id containing `/` or `..` would otherwise have it
+  // spliced raw into the path, where URL normalisation sends the POST somewhere other
+  // than the endpoint this tool describes.
+  if (typeof recall_id !== "string" || !UUID_RE.test(recall_id.trim())) {
+    throw new Error(
+      "recall_id must be the meta.recall_id UUID from a recall_context response.",
+    );
+  }
+
   const payload = { article_ids };
   if (project_id) payload.project_id = project_id;
 
   const result = await apiCall(
     "POST",
-    `/api/v1/recall/${recall_id}/referenced`,
+    `/api/v1/recall/${encodeURIComponent(recall_id.trim())}/referenced`,
     payload,
     process.env.LOOPCTL_AGENT_KEY,
   );
@@ -5435,7 +5447,9 @@ const TOOLS = [
       "`selected_count`, `tokens_selected`, `tokens_candidates` and " +
       "`tokens_saved_vs_candidates`, so you can explain your own context assembly. The " +
       "merged order is deterministic (score DESC, then source, then id), so an unchanged " +
-      "corpus renders byte-identically between turns. KEEP `meta.recall_id`: after you " +
+      "corpus renders a byte-identical `data` array between turns — cache that array, not " +
+      "the whole response, since `meta.recall_id` is new on every call. KEEP " +
+      "`meta.recall_id`: after you " +
       "answer, pass it to recall_referenced with the ids you actually used — that is the " +
       "third funnel stage and nothing else records it.",
     inputSchema: {
@@ -5488,8 +5502,8 @@ const TOOLS = [
           type: "array",
           items: { type: "string", format: "uuid" },
           description:
-            "The ids you actually used, from that recall's `data`. Non-empty, at most 50, " +
-            "every one an id that recall surfaced.",
+            "The ids you actually used, from that recall's `data`. Non-empty, at most one " +
+            "recall page's worth, every one an id that recall surfaced.",
         },
         project_id: {
           type: "string",

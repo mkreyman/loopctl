@@ -1245,13 +1245,23 @@ describe("recall_referenced: registered, routed, and scope-free", () => {
     // surfaced the article — a body-supplied id would still be checked, but the path
     // form is what makes the resource identity explicit in the URL.
     assert.ok(
-      INDEX_SRC.includes("`/api/v1/recall/${recall_id}/referenced`"),
-      "handler must POST to /api/v1/recall/:recall_id/referenced",
+      INDEX_SRC.includes(
+        "`/api/v1/recall/${encodeURIComponent(recall_id.trim())}/referenced`",
+      ),
+      "handler must POST to /api/v1/recall/:recall_id/referenced, id ENCODED",
     );
 
     const handler = INDEX_SRC.slice(
       INDEX_SRC.indexOf("async function recallReferenced("),
       INDEX_SRC.indexOf("async function memoryList("),
+    );
+
+    // `format: "uuid"` is advisory and MCP does not enforce it, so a hallucinated id
+    // carrying `/` or `..` would be spliced raw into the path and URL normalisation would
+    // send the POST somewhere other than the endpoint this tool describes.
+    assert.ok(
+      handler.includes("UUID_RE.test(recall_id.trim())"),
+      "the recall id must be validated as a UUID before it reaches the URL",
     );
 
     assert.ok(handler.includes('"POST"'), "must be a POST");

@@ -3097,7 +3097,7 @@ defmodule Loopctl.Knowledge do
           results
           |> Enum.map(fn r -> r[:id] || Map.get(r, :id) end)
           |> Enum.reject(&is_nil/1)
-          |> Enum.take(Analytics.max_recorded_search_results())
+          |> recorded_article_ids(opts)
 
         Analytics.record_search_access(
           tenant_id,
@@ -3107,9 +3107,38 @@ defmodule Loopctl.Knowledge do
           search_access_meta(mode, results, opts),
           # search_id rides the INTERNAL context, not the metadata map — metadata is
           # caller-supplied and a forged id would collapse the `searches` denominator (#582).
-          Map.put(attribution_context(opts), :search_id, search_id)
+          search_access_context(opts, search_id)
         )
     end
+  end
+
+  # The merged recall sets `:_recall_surfacing` (internal, never reachable from a request
+  # body) because it PUBLISHES the id these rows carry as `meta.recall_id` and a caller
+  # hands it straight back to `POST /recall/:recall_id/referenced`. Two things follow, and
+  # both are wrong without it:
+  #
+  #   * EVERY result the recall publishes needs a row, not just the first
+  #     `Analytics.max_recorded_search_results/0`, or an article the caller was SHOWN is
+  #     refused as `not_surfaced` — and that check is all-or-nothing, so one such id
+  #     discards the whole batch. The batch stays bounded by the recall's own clamped
+  #     `limit` (`Loopctl.Memory.max_context_limit/0`).
+  #   * the rows must be COMMITTED before the response returns (`sync?`), or a caller that
+  #     references immediately races the recorder task and is refused the same way.
+  #
+  # Every other call site keeps the cap and the fire-and-forget write: it publishes no id,
+  # so nothing can be handed back.
+  defp recall_surfacing?(opts), do: Keyword.get(opts, :_recall_surfacing, false) == true
+
+  defp recorded_article_ids(ids, opts) do
+    if recall_surfacing?(opts),
+      do: ids,
+      else: Enum.take(ids, Analytics.max_recorded_search_results())
+  end
+
+  defp search_access_context(opts, search_id) do
+    base = opts |> attribution_context() |> Map.put(:search_id, search_id)
+
+    if recall_surfacing?(opts), do: Map.put(base, :sync?, true), else: base
   end
 
   # Extracted rather than inlined at both call sites: it is one branch, and inlining it in
@@ -9211,11 +9240,15 @@ defmodule Loopctl.Knowledge do
 
   `meta.search_id` is the id of THIS call, and it is the SAME id written to
   `article_access_events.metadata->>'search_id'` on every row this call's surfacing
-  batch records — so a caller holding the response can name the search that produced
-  it. It is present on the degraded keyword-only path too. It is still never accepted
-  FROM a caller (#582): the internal `:_search_id` opt is set only by another server-side
-  call site, and the merged recall (`Loopctl.Memory.recall_context/2`) uses it so its
-  `meta.recall_id` and this id are one value rather than two that have to be joined.
+  batch records. It is present on the degraded keyword-only path too. It is still never
+  accepted FROM a caller (#582): the internal `:_search_id` opt is set only by another
+  server-side call site, and the merged recall (`Loopctl.Memory.recall_context/2`) uses it
+  so its `meta.recall_id` and this id are one value rather than two that have to be joined.
+
+  It is an INTERNAL contract, not a published one: `KnowledgeSearchJSON.render_meta/1` is
+  a closed whitelist that does not carry `:search_id`, so no `/knowledge/search` caller
+  receives it. The merged recall envelope is the only surface that renders it, as
+  `meta.recall_id`.
   """
   @spec search_combined(Ecto.UUID.t(), String.t(), keyword()) ::
           {:ok, %{results: [map()], meta: map()}}
@@ -9415,9 +9448,9 @@ defmodule Loopctl.Knowledge do
            fallback: true,
            search_mode: "keyword_only",
            fallback_reason: fallback_reason,
-           # Published on the DEGRADED path too: a caller that has to correlate a response
-           # with the rows it wrote must be able to do so on the path where retrieval went
-           # wrong, which is the path it most wants to correlate.
+           # Carried on the DEGRADED path too so the meta has one shape on both paths. It
+           # is internal either way — `KnowledgeSearchJSON.render_meta/1` whitelists it
+           # out; the merged recall republishes the same value as `meta.recall_id`.
            search_id: Keyword.get(opts, :_search_id),
            total_count: kw.meta.total_count,
            limit: paginated.limit,

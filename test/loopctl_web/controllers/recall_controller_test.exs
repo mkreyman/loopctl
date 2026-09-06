@@ -389,23 +389,48 @@ defmodule LoopctlWeb.RecallControllerTest do
       recall_id = body["meta"]["recall_id"]
       assert is_binary(recall_id)
 
-      # Recording is async off the request path; wait for the surfacing rows to land.
-      surfaced =
-        Enum.reduce_while(1..50, [], fn _i, _acc ->
-          ids = Analytics.surfaced_article_ids(tenant.id, recall_id)
-
-          if article.id in ids do
-            {:halt, ids}
-          else
-            Process.sleep(20)
-            {:cont, ids}
-          end
-        end)
+      # No polling: the recall path writes its surfacing rows SYNCHRONOUSLY, precisely so
+      # a client that references immediately after the response cannot race the recorder
+      # and be told `not_surfaced`. A sleep-and-retry here would hide that regression.
+      {:ok, surfaced} = Analytics.surfaced_article_ids(tenant.id, recall_id)
 
       assert article.id in surfaced,
              "the recall published a recall_id that names no surfacing rows"
 
       assert key.id
+    end
+
+    test "EVERY knowledge id the recall publishes has a surfacing row, past the search cap" do
+      # The recording cap is 20 per search call, but a recall may publish up to its own
+      # page size. Anything past rank 20 without a surfacing row is an id the caller was
+      # SHOWN and cannot reference — and `/referenced` is all-or-nothing, so one such id
+      # discards the whole batch.
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant.id)
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      cap = Analytics.max_recorded_search_results()
+      for i <- 1..(cap + 4), do: published_article(tenant.id, "reshipment guide #{i}")
+
+      body =
+        base_conn()
+        |> auth(raw)
+        |> post(~p"/api/v1/recall", %{"query" => "reshipments", "limit" => cap + 4})
+        |> json_response(200)
+
+      published =
+        body["data"]
+        |> Enum.filter(&(&1["source"] == "knowledge"))
+        |> Enum.map(& &1["article"]["id"])
+
+      assert length(published) > cap,
+             "the recall returned at most the cap, so this check proves nothing"
+
+      {:ok, surfaced} = Analytics.surfaced_article_ids(tenant.id, body["meta"]["recall_id"])
+
+      assert published -- surfaced == [],
+             "the recall published knowledge ids with no surfacing row: they would be " <>
+               "refused as not_surfaced"
     end
 
     test "an identity-less key is refused with a deterministic 422 (subject_id_unresolvable)" do

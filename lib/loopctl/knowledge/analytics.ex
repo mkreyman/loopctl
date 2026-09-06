@@ -387,6 +387,8 @@ defmodule Loopctl.Knowledge.Analytics do
 
     * `{:ok, %{recall_id: id, article_ids: [...], recorded: n}}`
     * `{:error, :not_surfaced, [ids]}` — the ids this recall did not surface
+    * `{:error, :lookup_failed}` — the admission check itself could not run (logged). NOT
+      folded into `not_surfaced`: that would blame the caller for a DB fault.
     * `{:error, :recording_failed}` — the insert itself failed (logged)
   """
   @spec record_referenced(
@@ -396,18 +398,23 @@ defmodule Loopctl.Knowledge.Analytics do
           Ecto.UUID.t(),
           context()
         ) ::
-          {:ok, map()} | {:error, :not_surfaced, [String.t()]} | {:error, :recording_failed}
+          {:ok, map()}
+          | {:error, :not_surfaced, [String.t()]}
+          | {:error, :lookup_failed | :recording_failed}
   def record_referenced(tenant_id, recall_id, article_ids, api_key_id, context \\ %{})
 
   def record_referenced(tenant_id, recall_id, article_ids, api_key_id, context)
       when is_binary(tenant_id) and is_binary(recall_id) and is_list(article_ids) and
              is_binary(api_key_id) do
     requested = article_ids |> Enum.filter(&is_binary/1) |> Enum.uniq()
-    surfaced = MapSet.new(surfaced_article_ids(tenant_id, recall_id))
 
-    case Enum.reject(requested, &MapSet.member?(surfaced, &1)) do
-      [] -> insert_referenced(tenant_id, recall_id, requested, api_key_id, context)
-      missing -> {:error, :not_surfaced, missing}
+    with {:ok, ids} <- surfaced_article_ids(tenant_id, recall_id),
+         surfaced = MapSet.new(ids),
+         [] <- Enum.reject(requested, &MapSet.member?(surfaced, &1)) do
+      insert_referenced(tenant_id, recall_id, requested, api_key_id, context)
+    else
+      {:error, :lookup_failed} -> {:error, :lookup_failed}
+      missing when is_list(missing) -> {:error, :not_surfaced, missing}
     end
   end
 
@@ -422,27 +429,38 @@ defmodule Loopctl.Knowledge.Analytics do
   the merged recall publishes as `meta.recall_id`. Public because it is the whole
   admission check for `record_referenced/5` and a test that cannot see it cannot pin it.
 
-  Returns a plain LIST, not a `MapSet` — a spec naming an opaque type a function builds
-  itself is a dialyzer contract violation, and the caller wraps it in a set anyway.
+  Returns `{:ok, list}` — a plain LIST, not a `MapSet`, because a spec naming an opaque
+  type a function builds itself is a dialyzer contract violation and the caller wraps it
+  in a set anyway.
+
+  A DB failure is `{:error, :lookup_failed}`, never an empty list. The recorders around
+  here are fire-and-forget and rescue to a no-op, but this one is a caller-visible
+  ADMISSION CHECK: an empty list means "this recall surfaced nothing", so folding a
+  statement timeout into it would answer `422 not_surfaced` — a false statement about the
+  caller's own ids — instead of a retryable fault.
   """
-  @spec surfaced_article_ids(Ecto.UUID.t(), Ecto.UUID.t()) :: [String.t()]
+  @spec surfaced_article_ids(Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, [String.t()]} | {:error, :lookup_failed}
   def surfaced_article_ids(tenant_id, recall_id)
       when is_binary(tenant_id) and is_binary(recall_id) do
-    from(e in ArticleAccessEvent,
-      where: e.tenant_id == ^tenant_id,
-      where: e.access_type == "search",
-      where: fragment("?->>'search_id'", e.metadata) == ^recall_id,
-      distinct: true,
-      select: e.article_id
-    )
-    |> AdminRepo.all()
+    ids =
+      from(e in ArticleAccessEvent,
+        where: e.tenant_id == ^tenant_id,
+        where: e.access_type == "search",
+        where: fragment("?->>'search_id'", e.metadata) == ^recall_id,
+        distinct: true,
+        select: e.article_id
+      )
+      |> AdminRepo.all()
+
+    {:ok, ids}
   rescue
     error ->
       Logger.warning("Knowledge.Analytics surfaced lookup failed: #{Exception.message(error)}")
-      []
+      {:error, :lookup_failed}
   end
 
-  def surfaced_article_ids(_tenant_id, _recall_id), do: []
+  def surfaced_article_ids(_tenant_id, _recall_id), do: {:ok, []}
 
   # The write half. Deliberately NOT `do_record_sync/5`: that path resolves the origin by
   # lookup, and `referenced` is not an attributable type there, so it would land every row
@@ -513,14 +531,21 @@ defmodule Loopctl.Knowledge.Analytics do
         where: e.tenant_id == ^tenant_id and e.article_id == ^article_id
       )
 
-    total_events = AdminRepo.aggregate(base, :count, :id)
+    # `referenced` is a CLIENT ASSERTION, not an event the server observed, so it is
+    # excluded from every counter an operator reads as delivery — `total_events` and
+    # `unique_keys` included, or an agent could inflate both for its own article by
+    # posting the same reference in a loop. It stays visible under its own label in
+    # `accesses_by_type`, which is a breakdown rather than a total.
+    observed = from(e in base, where: e.access_type != "referenced")
+
+    total_events = AdminRepo.aggregate(observed, :count, :id)
 
     total_reads =
       from(e in base, where: e.access_type in @read_access_types)
       |> AdminRepo.aggregate(:count, :id)
 
     unique_keys =
-      from(e in base, select: count(e.api_key_id, :distinct))
+      from(e in observed, select: count(e.api_key_id, :distinct))
       |> AdminRepo.one()
       |> Kernel.||(0)
 
@@ -1325,7 +1350,13 @@ defmodule Loopctl.Knowledge.Analytics do
   defp do_record_async([], _tenant_id, _api_key_id, _access_type, _context), do: :ok
 
   defp do_record_async(items, tenant_id, api_key_id, access_type, context) do
-    case Application.get_env(:loopctl, :analytics_recording_mode, :async) do
+    # `context[:sync?]` (internal, set only by a server-side call site — never reachable
+    # from a request body) forces the write onto the request path. The merged recall sets
+    # it because it PUBLISHES the id these rows carry and a caller may hand it straight
+    # back to `POST /recall/:recall_id/referenced`: off the request path the surfacing rows
+    # have not committed yet, so an immediate reference reads an empty surfaced set and is
+    # refused as `not_surfaced` with nothing written.
+    case recording_mode(context) do
       :sync ->
         do_record_sync(items, tenant_id, api_key_id, access_type, context)
 
@@ -1344,6 +1375,14 @@ defmodule Loopctl.Knowledge.Analytics do
       )
 
       :ok
+  end
+
+  defp recording_mode(context) do
+    if Map.get(context, :sync?, false) do
+      :sync
+    else
+      Application.get_env(:loopctl, :analytics_recording_mode, :async)
+    end
   end
 
   @doc false

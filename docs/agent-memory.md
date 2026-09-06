@@ -281,10 +281,11 @@ before the merged cap), `selected_count`, `tokens_selected`, `tokens_candidates`
 and `tokens_saved_vs_candidates`.
 
 The merged order is **deterministic** — score DESC, then source (`knowledge`
-before `memory`), then id ASC — so an unchanged corpus renders byte-identically
-between turns and a client's prompt cache survives. Same discipline as the heat
-index snapping its default window to a UTC day boundary for byte-identical
-refreshes.
+before `memory`), then id ASC — so an unchanged corpus renders a byte-identical
+`data` array between turns. Cache THAT array, not the whole envelope:
+`meta.recall_id` is minted per call, so two identical recalls always differ in
+`meta`. Same discipline as the heat index snapping its default window to a UTC
+day boundary for byte-identical refreshes.
 
 #### `meta.recall_id` and the third funnel stage
 

@@ -94,6 +94,17 @@ defmodule Loopctl.Memory do
   @default_context_limit 10
   @max_context_limit 50
 
+  @doc """
+  The merged recall's maximum page size.
+
+  Public so the sites that MUST agree with it read one number: `MemoryController`'s cap on
+  how many article ids one `POST /recall/:recall_id/referenced` call may carry (a caller
+  cannot have referenced more articles than one recall could hand it) and that endpoint's
+  OpenAPI description. Same discipline as `Analytics.max_recorded_search_results/0`.
+  """
+  @spec max_context_limit() :: pos_integer()
+  def max_context_limit, do: @max_context_limit
+
   # The reserved subject_id the promotion-quality eval (US-29.5) seeds its synthetic
   # labeled sessions under. It lives HERE — the shared memory context — so the eval, the
   # cross-tenant auto-promotion sweep, and the durable-promotion write path all reference
@@ -1375,10 +1386,14 @@ defmodule Loopctl.Memory do
   ## The merged order is DETERMINISTIC
 
   Score DESC, then the source tag ascending (`knowledge` before `memory`), then `id` ASC —
-  a total order, so an unchanged corpus renders a byte-identical block between turns and a
-  client's prompt cache survives. Score alone left cross-source ties to the order two lists
-  happened to be concatenated in. Same discipline as `Knowledge.heat_index/2` snapping its
-  default window to a UTC day boundary so a refresh is byte-identical.
+  a total order, so an unchanged corpus renders a byte-identical `results` LIST between
+  turns. Score alone left cross-source ties to the order two lists happened to be
+  concatenated in. Same discipline as `Knowledge.heat_index/2` snapping its default window
+  to a UTC day boundary so a refresh is byte-identical.
+
+  The determinism is scoped to `results`, and a client caching a prompt prefix must cache
+  THAT and not the whole envelope: `meta.recall_id` is minted per call, so the response as
+  a whole differs between two identical recalls by construction.
 
   ## `meta.recall_id`
 
@@ -1547,6 +1562,10 @@ defmodule Loopctl.Memory do
       # The recall and its knowledge half share ONE id (see `recall_context/2`), so the
       # `recall_id` in this response is the `search_id` on the surfacing rows.
       |> Keyword.put(:_search_id, recall_id)
+      # This id is PUBLISHED and handed back to `POST /recall/:recall_id/referenced`, so
+      # the knowledge half's surfacing rows must cover every result it returns and must be
+      # committed before this response is — see `Knowledge.recall_surfacing?/1`.
+      |> Keyword.put(:_recall_surfacing, true)
       |> maybe_put_opt(:agent_id, opt(opts, :agent_id, nil))
       |> maybe_put_opt(:_client_context, opt(opts, :_client_context, nil))
       # Reuse the embedding generated ONCE in `recall_context/2` so the knowledge half
@@ -1592,8 +1611,9 @@ defmodule Loopctl.Memory do
         fallback: true,
         fallback_reason: tag,
         # Carried even though this half returned nothing and recorded nothing: the id is
-        # the recall's identity, not the knowledge search's, and a caller must be able to
-        # read one from every response shape.
+        # the recall's identity, not the knowledge search's, so the meta has one shape on
+        # both paths. The value a CLIENT reads is the top-level `meta.recall_id` —
+        # `KnowledgeSearchJSON.render_meta/1` whitelists this copy out.
         search_id: recall_id
       }
     }

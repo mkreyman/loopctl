@@ -91,6 +91,31 @@ defmodule LoopctlWeb.RecallReferencedControllerTest do
       assert row.api_key_id == key.id
     end
 
+    test "an UPPERCASE recall_id and article id are canonicalised, not refused" do
+      # The format gate admits `[0-9a-fA-F]`, and .NET/Java UUID formatters emit uppercase.
+      # Trimming alone left the value compared verbatim against the lowercase form Ecto
+      # stores and `metadata->>'search_id'` carries, so a genuinely surfaced article came
+      # back 422 not_surfaced — a false statement about the caller's own ids.
+      tenant = fixture(:tenant)
+      {raw, key, _agent} = agent_key(tenant.id)
+      a = article(tenant.id)
+      recall_id = surfaced(tenant.id, key.id, [a], Ecto.UUID.generate())
+
+      body =
+        base_conn()
+        |> auth(raw)
+        |> post(~p"/api/v1/recall/#{String.upcase(recall_id)}/referenced", %{
+          "article_ids" => [String.upcase(a.id)]
+        })
+        |> json_response(200)
+
+      assert body["data"]["recall_id"] == recall_id
+      assert body["data"]["article_ids"] == [a.id]
+      assert [row] = referenced_rows(tenant.id)
+      assert row.article_id == a.id
+      assert row.origin_search_id == recall_id
+    end
+
     test "an id the recall did not surface fails the WHOLE call and writes nothing" do
       tenant = fixture(:tenant)
       {raw, key, _agent} = agent_key(tenant.id)
@@ -240,8 +265,19 @@ defmodule LoopctlWeb.RecallReferencedControllerTest do
       refute Enum.any?(later.results, &(&1.id == a.id)),
              "an asserted reference put an article into the heat ranking"
 
-      assert Knowledge.Analytics.get_article_stats(tenant.id, a.id).total_reads == 0,
+      stats = Knowledge.Analytics.get_article_stats(tenant.id, a.id)
+
+      assert stats.total_reads == 0,
              "a reference counted as a READ; it is an assertion, not a delivery"
+
+      # `total_events` and `unique_keys` are the two counters an operator reads as
+      # delivery. Neither excluded `referenced` at first, so an agent could inflate both
+      # for its own article — and add itself to "distinct readers" — by looping this call.
+      assert stats.total_events == 1, "a reference entered total_events"
+      assert stats.unique_keys == 1, "a reference added a phantom reader to unique_keys"
+
+      # It stays visible under its own label, which is a breakdown rather than a total.
+      assert stats.accesses_by_type["referenced"] == 1
     end
 
     test "repeating a call records another row but cannot move the metric" do

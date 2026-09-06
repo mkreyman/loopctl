@@ -39,8 +39,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   tokenizer count. Do not treat them as a billing number.
 
   The merged order is deterministic (score DESC, then source, then id), so an unchanged corpus
-  renders byte-identically between turns — which is what lets the pack sit in a cached prefix
-  without busting the cache on every call.
+  renders a byte-identical `data` array between turns — which is what lets the pack sit in a
+  cached prefix without busting the cache on every call. Cache the array, not the response:
+  `meta.recall_id` is minted per call.
 
   `meta.recall_id` is ALSO the `search_id` stamped on the knowledge half's surfacing rows, one
   value rather than two that have to be joined, which is what makes it directly usable as the

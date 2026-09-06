@@ -450,6 +450,33 @@ defmodule Loopctl.Knowledge.RetrievalMetricsTest do
       assert RetrievalMetrics.compute(t.id, @day, 1800).referenced == 2
     end
 
+    test "a reference is bucketed by its SURFACING day, not by when it was posted", ctx do
+      # Numerator and denominator must describe ONE population. Bucketing on the reference
+      # row's own timestamp put a 23:59 recall referenced at 00:01 into a day whose
+      # `searched` never counted it — and let a client replaying old recall ids drive
+      # `reference_rate` above 1.0 on a quiet day.
+      %{tenant: t, key: k, x: x} = ctx
+      search_id = search_call(t.id, k.id, [x.id], ~T[23:59:00])
+
+      fixture(:article_access_event, %{
+        tenant_id: t.id,
+        api_key_id: k.id,
+        article_id: x.id,
+        access_type: "referenced",
+        metadata: %{"recall_id" => search_id},
+        origin_search_id: search_id,
+        accessed_at: DateTime.add(at(~T[23:59:00]), 120, :second)
+      })
+
+      today = RetrievalMetrics.compute(t.id, @day, 1800)
+      tomorrow = RetrievalMetrics.compute(t.id, Date.add(@day, 1), 1800)
+
+      assert today.referenced == 1, "the reference belongs to the day its recall surfaced"
+      assert today.reference_rate == 1.0
+      assert tomorrow.referenced == 0
+      assert is_nil(tomorrow.reference_rate)
+    end
+
     test "reference_rate is nil, never 0.0, on a day that surfaced nothing", ctx do
       %{tenant: t} = ctx
       m = RetrievalMetrics.compute(t.id, @day, 1800)

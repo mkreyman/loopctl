@@ -65,15 +65,20 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   /api/v1/recall/:recall_id/referenced` records it, and two figures report it:
 
   - `referenced` — DISTINCT `(origin_search_id, article_id)` pairs a client asserted it
-    used on that day. Deduped on purpose: re-posting the same reference writes another
-    immutable event row but must not move the metric.
+    used, bucketed by the day of the SURFACING SEARCH rather than by when the reference
+    was posted, so it counts the same population `searched` does. Deduped on purpose:
+    re-posting the same reference writes another immutable event row but must not move the
+    metric. A reference posted days later therefore moves the day it belongs to, which is
+    why these snapshots are recomputable rather than append-only.
   - `reference_rate` — `referenced / searched`, the same denominator `precision` divides
     and therefore carrying every one of its caveats: it is a rate over RECORDED SURFACED
     RESULTS capped at #{Loopctl.Knowledge.Analytics.max_recorded_search_results()} per
-    call, it rises when a search returns fewer results, and the two structural exclusions
-    below bias it UP. `nil`, never `0.0`, when nothing was surfaced — a day with no
-    searches is an `n/a`, and `precision`'s `0.0` on that day is a non-null-column
-    artefact this field is not obliged to repeat.
+    call — except on the merged recall, which records every result it publishes so that
+    each one can be referenced — it rises when a search returns fewer results, and the two
+    structural exclusions below bias it UP. Bounded by 1.0 by construction: the numerator
+    is a subset of the surfacing rows the denominator counts. `nil`, never `0.0`, when
+    nothing was surfaced — a day with no searches is an `n/a`, and `precision`'s `0.0` on
+    that day is a non-null-column artefact this field is not obliged to repeat.
 
   **This is the one figure here derived from a CLIENT ASSERTION.** Everything else counts
   rows the server wrote about deliveries it made; a `referenced` row is a caller saying it
@@ -403,7 +408,10 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   `searched` (and its self-describing twin `results_recorded`) is a count of RECORDED
   SURFACED RESULTS — capped at the first
   #{Loopctl.Knowledge.Analytics.max_recorded_search_results()} per call, so `precision`
-  is precision@that-cap; `searches` is a count of QUERY-BEARING search CALLS (enumeration
+  is precision@that-cap. The merged recall (`POST /recall`) is the one exception: it
+  publishes the id these rows carry and a client hands it back to `/referenced`, so it
+  records EVERY result it returns rather than leaving some of them unreferenceable.
+  `searches` is a count of QUERY-BEARING search CALLS (enumeration
   pages and pre-#582 rows carry no call identity and are excluded — the filter is per
   ROW, so a mixed day reports a partial figure, not `0`). See the moduledoc for why both
   are reported, for the cap's opposite-signed effects on `search_follow_through`, and for
@@ -517,12 +525,34 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   # The infra exclusions are the same two every other counter here applies, and for the same
   # reason: a reference whose SURFACING search came from `smoke`/`skill-eval` describes a
   # different population from the one `searched` counts.
+  #
+  # A pair is bucketed by the day of its SURFACING SEARCH, never by when the reference was
+  # POSTED. `searched` counts surfacing rows inside the day, so bucketing the numerator on
+  # the reference row's own `accessed_at` would divide two populations that need not
+  # overlap: a recall at 23:59 referenced at 00:01 lands in a day whose `searched` never
+  # counted it, and a client replaying old recall ids could push `reference_rate` far above
+  # 1.0 on a quiet day. Correlating on the surfacing row instead makes the numerator a
+  # SUBSET of the denominator, so the rate is bounded by 1.0 by construction — at the cost
+  # that a late reference moves an already-computed day, which is why the snapshot is
+  # recomputable rather than append-only.
   defp compute_referenced(tenant_id, day_start, day_end) do
     from(r in ArticleAccessEvent,
+      as: :r,
       where: r.tenant_id == ^tenant_id,
       where: r.access_type == "referenced",
-      where: r.accessed_at >= ^day_start and r.accessed_at < ^day_end,
       where: not is_nil(r.origin_search_id),
+      where:
+        exists(
+          from(s in ArticleAccessEvent,
+            where:
+              s.tenant_id == parent_as(:r).tenant_id and
+                s.access_type == "search" and
+                s.article_id == parent_as(:r).article_id and
+                s.accessed_at >= ^day_start and s.accessed_at < ^day_end and
+                fragment("(?->>'search_id')::uuid", s.metadata) ==
+                  parent_as(:r).origin_search_id
+          )
+        ),
       distinct: [r.origin_search_id, r.article_id],
       # A map, not a tuple: a subquery must select a source, a field or a map.
       select: %{origin_search_id: r.origin_search_id, article_id: r.article_id}
@@ -535,8 +565,10 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
 
   # `referenced / searched` — deliberately the SAME denominator as `precision`, so it
   # inherits every caveat that one carries: recorded surfaced results capped at
-  # #{Loopctl.Knowledge.Analytics.max_recorded_search_results()} per call, gameable by
-  # returning fewer results, and biased UP by the two structural exclusions.
+  # #{Loopctl.Knowledge.Analytics.max_recorded_search_results()} per call (the merged
+  # recall excepted), gameable by returning fewer results, and biased UP by the two
+  # structural exclusions. It needs no clamp: `compute_referenced/3` correlates each pair
+  # to a surfacing row inside the SAME day, so the numerator cannot exceed the denominator.
   #
   # `nil` rather than `0.0` on an empty denominator, following `scored_follow_through`: a day
   # on which nothing was surfaced cannot have a usage rate, and publishing `0.0` would assert

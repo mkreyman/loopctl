@@ -4343,7 +4343,9 @@ defmodule Loopctl.ApiSpec.Schemas do
                 "This recall's id, and the SAME id recorded as `search_id` on the " <>
                   "knowledge half's surfacing rows — one value, not two to join. Hand it " <>
                   "back to `POST /recall/{recall_id}/referenced` to record which of the " <>
-                  "surfaced articles you actually used."
+                  "surfaced articles you actually used. Minted per call, so it is the one " <>
+                  "field that differs between two otherwise identical recalls — cache " <>
+                  "`data`, not the envelope."
             },
             candidates_considered: %Schema{
               type: :object,
@@ -4395,9 +4397,13 @@ defmodule Loopctl.ApiSpec.Schemas do
           type: :array,
           items: %Schema{type: :string, format: :uuid},
           description:
-            "The articles you actually used, from the `data` of the recall identified by " <>
-              "`recall_id`. Non-empty, at most 50 ids, every one a UUID. An id that " <>
-              "recall did not surface fails the WHOLE call with 422 `not_surfaced`."
+            "The articles you actually used — any article the recall identified by " <>
+              "`recall_id` SURFACED, which is its `data` plus anything its knowledge half " <>
+              "surfaced under that id but the merged cap did not hand you. Non-empty, " <>
+              "every one a UUID, and no more than the merged recall's own maximum page " <>
+              "size — the endpoint description states that number, from the attribute " <>
+              "that enforces it, so this text cannot drift from it. An id that recall did " <>
+              "not surface fails the WHOLE call with 422 `not_surfaced`."
         },
         project_id: %Schema{
           type: :string,
