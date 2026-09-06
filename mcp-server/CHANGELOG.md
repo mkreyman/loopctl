@@ -24,8 +24,9 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   differ.** `fallback` says retry the SAME query and do not reword — different words
   cannot fix a provider timeout. `degraded` says WAIT and then retry, because a shed
   serves no substitute lane and an immediate retry goes back into the same closed gate —
-  except for `ann_iterative_scan_unavailable`, a STANDING backend condition no wait
-  clears, which gets a remedy that says so instead. `error` says the retrieval never ran,
+  except for the STANDING backend conditions no wait clears
+  (`ann_iterative_scan_unavailable`, `embedding_dimension_mismatch`), which get a remedy
+  that says so instead. `error` says the retrieval never ran,
   so the empty envelope proves nothing about what the knowledge base holds. `empty` and
   `success` stay silent on purpose: a banner on every ordinary zero-result search is
   noise, and noise teaches agents to ignore the channel, which is the exact fate of the

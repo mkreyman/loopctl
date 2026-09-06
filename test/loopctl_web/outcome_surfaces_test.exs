@@ -7,8 +7,13 @@ defmodule LoopctlWeb.OutcomeSurfacesTest do
   invites — a view is changed later and quietly stops rendering the key.
 
   The table is HAND-MAINTAINED, so it cannot catch a NEW surface that ships without the
-  key; the guarantee it gives is over the surfaces the docs name (`mcp-server/README.md`),
-  and the catalog endpoints that carry no `outcome` are absent on purpose.
+  key; the guarantee it gives is over the VIEW-rendered surfaces the docs name
+  (`mcp-server/README.md`), and the catalog endpoints that carry no `outcome` are absent
+  on purpose. `corpus_search` is the one documented retrieval surface missing here for a
+  reason that is not an omission: it renders `outcome` in `LoopctlWeb.CorpusController`
+  rather than a view module, so its wiring is proved at the HTTP boundary instead —
+  `test/loopctl_web/controllers/corpus_controller_test.exs`, "meta.outcome separates a
+  real hit from a corpus that genuinely holds nothing".
   """
   use LoopctlWeb.ConnCase, async: true
 
@@ -112,6 +117,7 @@ defmodule LoopctlWeb.OutcomeSurfacesTest do
         knowledge_count: 0,
         degraded?: false,
         degraded_reason: nil,
+        search_mode: nil,
         results_ranking: "heuristic_cross_source"
       }
     }
@@ -212,5 +218,25 @@ defmodule LoopctlWeb.OutcomeSurfacesTest do
 
     assert rendered.meta.outcome == "degraded"
     assert rendered.memory.meta.outcome == "degraded"
+  end
+
+  test "the merged recall keeps a shed that served keyword-only a fallback" do
+    # The knowledge half sheds under the SAME tag and answers keyword-only, whose remedy
+    # is the opposite one. The rendered meta republishes the lane the reported half
+    # served, so the two are still distinguishable after the merge.
+    envelope = recall_envelope()
+
+    rendered =
+      RecallJSON.context(%{
+        envelope
+        | meta:
+            envelope.meta
+            |> Map.put(:degraded?, true)
+            |> Map.put(:degraded_reason, "heavy_read_overloaded")
+            |> Map.put(:search_mode, "keyword_only")
+      })
+
+    assert rendered.meta.search_mode == "keyword_only"
+    assert rendered.meta.outcome == "fallback"
   end
 end

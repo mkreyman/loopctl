@@ -209,6 +209,83 @@ defmodule Loopctl.MemoryRecallContextTest do
     end
   end
 
+  describe "merged_degradation/2 — one tag, ordered by remedy" do
+    # Both halves can degrade at once and the merged meta carries ONE tag, so whichever
+    # is reported is the only remedy the caller ever sees. Each case below is a pair that
+    # co-occurs in practice, asserted with what `LoopctlWeb.Outcome` makes of it.
+    test "a knowledge half that never RAN outranks a memory shed" do
+      # The shed's remedy is to wait; no wait fixes a request the caller must change.
+      assert {"bad_request", nil} =
+               Memory.merged_degradation(memory_shed_env(), knowledge_unrunnable_env())
+    end
+
+    test "a memory configuration fault outranks a knowledge keyword-only fallback" do
+      # Both are caused by an embedding change, so co-occurrence is the expected case.
+      # Reported the other way round the agent retries a half only an operator restores.
+      {reason, lane} =
+        Memory.merged_degradation(
+          memory_unavailable_env(),
+          knowledge_fallback_env("embedding_timeout", "keyword_only")
+        )
+
+      assert {"embedding_dimension_mismatch", nil} == {reason, lane}
+      assert merged_outcome(reason, lane, 0) == "error"
+    end
+
+    test "a memory shed outranks a knowledge keyword-only fallback" do
+      assert {"heavy_read_overloaded", nil} =
+               Memory.merged_degradation(
+                 memory_shed_env(),
+                 knowledge_fallback_env("embedding_timeout", "keyword_only")
+               )
+    end
+
+    test "a knowledge shed that DID serve keyword-only reports the lane it served" do
+      # The SAME tag as the memory shed, and the opposite remedy. The lane is what tells
+      # them apart on the merged meta, which carries no per-half envelope to read.
+      {reason, lane} =
+        Memory.merged_degradation(
+          healthy_env(),
+          knowledge_fallback_env("heavy_read_overloaded", "keyword_only")
+        )
+
+      assert {"heavy_read_overloaded", "keyword_only"} == {reason, lane}
+      assert merged_outcome(reason, lane, 3) == "fallback"
+    end
+
+    test "two healthy halves report nothing" do
+      assert {nil, nil} = Memory.merged_degradation(healthy_env(), healthy_env())
+    end
+  end
+
+  # The merged meta as `RecallJSON` renders it, reduced to the keys `Outcome` reads.
+  defp merged_outcome(reason, lane, count),
+    do: Outcome.derive(%{degraded: true, degraded_reason: reason, search_mode: lane}, count)
+
+  defp envelope(meta), do: %{results: [], meta: meta}
+
+  defp memory_shed_env,
+    do: envelope(%{total_count: 0, fallback: true, reason: "heavy_read_overloaded"})
+
+  defp memory_unavailable_env,
+    do: envelope(%{total_count: 0, fallback: true, reason: "embedding_dimension_mismatch"})
+
+  defp healthy_env, do: envelope(%{total_count: 0, degraded?: false})
+
+  defp knowledge_fallback_env(reason, mode),
+    do:
+      envelope(%{
+        total_count: 0,
+        degraded?: true,
+        fallback: true,
+        fallback_reason: reason,
+        search_mode: mode
+      })
+
+  defp knowledge_unrunnable_env,
+    do:
+      envelope(%{total_count: 0, degraded?: true, fallback: true, fallback_reason: "bad_request"})
+
   describe "recall_context/2 - overall merged limit" do
     test "clamps the merged, re-ranked list to `limit`", ctx do
       for i <- 1..4, do: mem(ctx.scope, ctx.project.id, "reshipment memory #{i}")

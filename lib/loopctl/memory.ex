@@ -1412,6 +1412,7 @@ defmodule Loopctl.Memory do
           knowledge_count: non_neg_integer(),# knowledge rows BEFORE the merged cap
           degraded?: boolean(),              # knowledge errored/fell back OR memory did not run
           degraded_reason: String.t() | nil, # bounded tag naming why (nil when healthy)
+          search_mode: String.t() | nil,     # lane the reported half served (nil = none)
           results_ranking: String.t()        # "heuristic_cross_source" (see KNOWN BIAS)
         }
       }
@@ -1474,6 +1475,8 @@ defmodule Loopctl.Memory do
       |> Enum.sort_by(&(&1.score || 0.0), :desc)
       |> Enum.take(limit)
 
+    {degraded_reason, degraded_lane} = merged_degradation(memory_env, knowledge_env)
+
     %{
       results: merged,
       memory: memory_env,
@@ -1489,9 +1492,13 @@ defmodule Loopctl.Memory do
         degraded?: knowledge_degraded?(knowledge_env) or memory_degraded?(memory_env),
         # A BOUNDED, non-sensitive tag naming WHY the merged recall degraded (or `nil`
         # when it did not), so a caller can distinguish a scope-empty half from a
-        # fault-empty one without parsing the per-source envelopes. Knowledge degradation
-        # is reported first (it drives the documented `degraded?`), then memory.
-        degraded_reason: merged_degraded_reason(memory_env, knowledge_env),
+        # fault-empty one without parsing the per-source envelopes. Ordered by REMEDY —
+        # see `merged_degradation/2` — because the merged meta carries only one tag.
+        degraded_reason: degraded_reason,
+        # The lane the REPORTED half actually served (`"keyword_only"`), or `nil` when it
+        # served nothing at all. That is the difference between "wait" and "retry the same
+        # query", and both arrive under the same `heavy_read_overloaded` tag.
+        search_mode: degraded_lane,
         # The merged `results` order sorts memory's ABSOLUTE cosine similarity against
         # knowledge's POOL-NORMALIZED final_score — a heuristic, not a calibrated
         # cross-source ranking (knowledge is biased upward; see the moduledoc). Surface
@@ -1638,27 +1645,53 @@ defmodule Loopctl.Memory do
 
   defp memory_shed?(%{meta: meta}), do: Map.get(meta, :reason) == @memory_capacity_reason
 
-  # A BOUNDED, non-sensitive tag naming why the merged recall degraded, or `nil`. A memory
-  # CAPACITY SHED is reported first, ahead of the knowledge side: it is the one tag whose
-  # remedy is to WAIT, and reporting the knowledge tag over it dropped the shed entirely,
-  # so `LoopctlWeb.Outcome` saw a lane fallback and told the agent to retry immediately
-  # into the still-closed gate. Otherwise knowledge first (it drives the documented
-  # `degraded?`), then memory.
-  defp merged_degraded_reason(memory_env, knowledge_env) do
+  defp memory_unavailable?(%{meta: meta}),
+    do: Map.get(meta, :reason) in @memory_unavailable_reasons
+
+  # The knowledge half's read DID NOT RUN (as opposed to falling back to keyword-only):
+  # `degraded_knowledge_env/3` served an empty envelope and tagged it with one of the
+  # hard-error tags.
+  defp knowledge_unrunnable?(%{meta: meta}),
+    do: Map.get(meta, :fallback_reason) in @knowledge_degraded_reason_tags
+
+  # ONE bounded, non-sensitive tag naming why the merged recall degraded, paired with the
+  # lane the reported half actually SERVED (`nil` when it served nothing). Both halves can
+  # degrade at once and the merged meta carries a single tag, so the order is by REMEDY,
+  # strongest first — reporting a weaker one drops the stronger one's remedy entirely:
+  #
+  #   1. knowledge did not run       -> fix the request (`outcome: "error"`)
+  #   2. memory config fault         -> only an operator clears it (`"error"`)
+  #   3. memory shed by the cap      -> WAIT, then retry (`"degraded"`)
+  #   4. knowledge keyword-only      -> retry the SAME query, never reword (`"fallback"`)
+  #
+  # 3 above 4 is the case that was wrong first: the knowledge tag hid the shed, and
+  # `LoopctlWeb.Outcome` told the agent to retry immediately into the still-closed gate.
+  # 1 and 2 above 3 is its mirror — a shed hid a request the agent must FIX, and a
+  # configuration fault no wait can clear.
+  #
+  # The lane is what keeps a knowledge shed that DID serve keyword-only (case 4, same
+  # `heavy_read_overloaded` tag) classifying as the fallback it is: without it the merged
+  # meta was indistinguishable from case 3 and prescribed a wait for a lane that ran.
+  #
+  # Public-but-`@doc false` so the ORDER is directly testable: reaching case 1 or 2 through
+  # `recall_context/2` needs both halves to fail at once, which no fixture can arrange.
+  @doc false
+  @spec merged_degradation(result_envelope(), result_envelope()) ::
+          {String.t() | nil, String.t() | nil}
+  def merged_degradation(memory_env, knowledge_env) do
     cond do
-      memory_shed?(memory_env) ->
-        memory_env.meta[:reason]
-
-      knowledge_degraded?(knowledge_env) ->
-        knowledge_env.meta[:fallback_reason] || "knowledge_degraded"
-
-      memory_degraded?(memory_env) ->
-        memory_env.meta[:reason]
-
-      true ->
-        nil
+      knowledge_unrunnable?(knowledge_env) -> {knowledge_reason(knowledge_env), nil}
+      memory_unavailable?(memory_env) -> {memory_env.meta[:reason], nil}
+      memory_shed?(memory_env) -> {memory_env.meta[:reason], nil}
+      knowledge_degraded?(knowledge_env) -> {knowledge_reason(knowledge_env), lane(knowledge_env)}
+      true -> {nil, nil}
     end
   end
+
+  defp knowledge_reason(%{meta: meta}),
+    do: Map.get(meta, :fallback_reason) || "knowledge_degraded"
+
+  defp lane(%{meta: meta}), do: Map.get(meta, :search_mode)
 
   # Knowledge ranking score for the CROSS-SOURCE merge — the ABSOLUTE per-row relevance
   # (`Knowledge.absolute_result_score/1`: raw cosine `:similarity_score`, else a bounded

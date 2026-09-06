@@ -25,8 +25,8 @@
  *   - `fallback` — the semantic lane died, keyword-only was served. Retry the SAME query.
  *   - `degraded` — a half was shed or capacity-limited. WAIT, then retry. Retrying at once
  *     goes straight back into the same closed gate, which is why this is not worded as a
- *     fallback. One cause is STANDING rather than transient (`ann_iterative_scan_unavailable`)
- *     and gets a remedy that does not prescribe a wait no wait can clear.
+ *     fallback. Some causes are STANDING rather than transient (`STANDING_REASONS`) and
+ *     get a remedy that does not prescribe a wait no wait can clear.
  *   - `error`    — the retrieval never ran; the empty envelope is a placeholder and says
  *     NOTHING about what the corpus holds.
  *
@@ -107,26 +107,35 @@ function fallbackNotice(reason, count) {
 }
 
 /**
- * A degradation that WAITING cannot clear, so the notice must not prescribe a wait.
+ * Degradations that WAITING cannot clear, so the notice must not prescribe a wait.
  *
- * `ann_iterative_scan: "unavailable"` means the deployed pgvector ran the vector read
- * without the iterative scan the operator enabled, and the tenant filter was applied
- * after a single index batch — so the page may be short. The conclusive cause (pgvector
- * < 0.8, or the extension absent) stands until the extension is upgraded; retrying
- * re-runs the identical starved scan and burns a heavy read for nothing.
+ * `ann_iterative_scan_unavailable` — the deployed pgvector ran the vector read without
+ * the iterative scan the operator enabled, and the tenant filter was applied after a
+ * single index batch, so the page may be short. The conclusive cause (pgvector < 0.8,
+ * or the extension absent) stands until the extension is upgraded.
+ *
+ * `embedding_dimension_mismatch` — the memory half's active embedding dimension does not
+ * match the stored one, so that half did not run at all. Beside rows from the other half
+ * the server classifies it `degraded` (a partial read, not a dead request), which is
+ * right — but only an operator can restore the half.
+ *
+ * Both re-run identically on retry and burn a heavy read for nothing.
  */
-const STANDING_REASON = "ann_iterative_scan_unavailable";
+const STANDING_REASONS = new Set([
+  "ann_iterative_scan_unavailable",
+  "embedding_dimension_mismatch",
+]);
 
 function degradedNotice(reason, count) {
-  if (reason === STANDING_REASON) {
+  if (STANDING_REASONS.has(reason)) {
     const scope = count === 0 ? `THIS IS NOT "NO RESULTS"` : `PARTIAL RESULTS`;
 
     return (
-      `outcome: degraded — ${scope}. The vector read ran without pgvector's iterative ` +
-      `scan (${reason}), so it may have returned FEWER rows than match and its absences ` +
-      `prove nothing. Retrying re-runs the same scan and does NOT clear this — it is a ` +
-      `standing backend condition an operator has to fix. Use what you got, widen the ` +
-      `filters, or reach for a non-vector route (knowledge_list, knowledge_heat_index).`
+      `outcome: degraded — ${scope}. A half of this retrieval ran short or not at all ` +
+      `(${reason}), so it may have returned FEWER rows than match and its absences ` +
+      `prove nothing. Retrying re-runs the identical read and does NOT clear this — it ` +
+      `is a standing backend condition an operator has to fix. Use what you got, widen ` +
+      `the filters, or reach for a non-vector route (knowledge_list, knowledge_heat_index).`
     );
   }
 

@@ -197,18 +197,29 @@ test("the client vocabulary is exactly what the SERVER publishes", () => {
   assert.deepEqual(OUTCOMES, declared[1].trim().split(/\s+/));
 });
 
-test("a standing pgvector condition is not told to wait for what a wait cannot clear", () => {
-  // ann_iterative_scan "unavailable" stands until the extension is upgraded. Prescribing
-  // "wait a few seconds, then retry" loops the agent forever on a heavy vector read.
-  for (const count of [0, 5]) {
-    const notice = degradedSearchNotice({
-      data: Array.from({ length: count }, (_, i) => ({ id: i })),
-      meta: { outcome: "degraded", ann_iterative_scan: "unavailable" },
-    });
+test("a standing condition is not told to wait for what a wait cannot clear", () => {
+  // Both of these stand until an operator acts: ann_iterative_scan "unavailable" until
+  // the extension is upgraded, embedding_dimension_mismatch until the dimension is
+  // reconciled. Prescribing "wait a few seconds, then retry" loops the agent forever on
+  // a heavy read. The mismatch reaches the client as "degraded" rather than "error"
+  // precisely when the OTHER half returned rows, which is when the loop is cheapest to
+  // start and hardest to notice.
+  const standing = [
+    { ann_iterative_scan: "unavailable", cause: "ann_iterative_scan_unavailable" },
+    { degraded_reason: "embedding_dimension_mismatch", cause: "embedding_dimension_mismatch" },
+  ];
 
-    assert.match(notice, /^outcome: degraded/);
-    assert.match(notice, /ann_iterative_scan_unavailable/, "the cause must be named");
-    assert.match(notice, /does NOT clear this/);
-    assert.doesNotMatch(notice, /[Ww]ait a few seconds/);
+  for (const { cause, ...meta } of standing) {
+    for (const count of [0, 5]) {
+      const notice = degradedSearchNotice({
+        data: Array.from({ length: count }, (_, i) => ({ id: i })),
+        meta: { outcome: "degraded", ...meta },
+      });
+
+      assert.match(notice, /^outcome: degraded/);
+      assert.match(notice, new RegExp(cause), "the cause must be named");
+      assert.match(notice, /does NOT clear this/);
+      assert.doesNotMatch(notice, /[Ww]ait a few seconds/);
+    }
   }
 });

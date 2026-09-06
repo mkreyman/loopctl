@@ -54,6 +54,19 @@ defmodule LoopctlWeb.OutcomeTest do
       assert Outcome.derive(%{total_count: 0, limit: 10, offset: 0}, 0) == "empty"
     end
 
+    test "an offset over a set that matched NOTHING is still a real miss" do
+      # The mirror of the case above, and the way over-correcting it reads: a stale
+      # cursor or a re-narrowed filter carries `offset > 0` over a set of zero. No
+      # earlier page carried rows, so "success" would tell an existence check the
+      # opposite of the truth. `total_count == 0` bounds the matched set on every
+      # surface - a pool of zero holds no matches either.
+      assert Outcome.derive(%{total_count: 0, limit: 10, offset: 10}, 0) == "empty"
+      assert Outcome.derive(%{total_count: 0, limit: 20, offset: 20}, 0) == "empty"
+
+      # An ABSENT total_count (the hybrid meta only maybe_puts it) stays exhaustion.
+      assert Outcome.derive(%{limit: 10, offset: 10}, 0) == "success"
+    end
+
     test "an exhausted page never masks a degradation" do
       meta = %{
         total_count: 42,
@@ -120,8 +133,18 @@ defmodule LoopctlWeb.OutcomeTest do
     end
 
     test "a shed reported through the merged /recall degraded_reason" do
-      meta = %{degraded: true, degraded_reason: "heavy_read_overloaded", total_count: 2}
+      # The merged meta republishes the reported half's lane, so the two sheds that share
+      # this tag stay distinguishable here exactly as they are on /knowledge/search: a
+      # half that served nothing is `search_mode: nil` and needs a WAIT.
+      meta = %{
+        degraded: true,
+        degraded_reason: "heavy_read_overloaded",
+        search_mode: nil,
+        total_count: 2
+      }
+
       assert Outcome.derive(meta, 2) == "degraded"
+      assert Outcome.derive(%{meta | search_mode: "keyword_only"}, 2) == "fallback"
     end
 
     test "a corpus semantic lane that ran but could not reach the whole corpus" do

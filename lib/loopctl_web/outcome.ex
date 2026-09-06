@@ -29,7 +29,7 @@ defmodule LoopctlWeb.Outcome do
   |---|---|---|
   | `"success"` | ran fully; this page carries rows, or an earlier one did | use them |
   | `"empty"` | ran fully and the whole matched set is empty | a real miss — re-route or accept it |
-  | `"degraded"` | a half was shed, capacity-limited or scan-starved | this set may be SHORT; wait, then retry — except an `ann_iterative_scan` gap, which only an operator clears |
+  | `"degraded"` | a half was shed, capacity-limited or scan-starved | this set may be SHORT; wait, then retry — except a STANDING gap (`ann_iterative_scan_unavailable`, `embedding_dimension_mismatch`), which only an operator clears |
   | `"fallback"` | the semantic lane was unavailable, keyword-only was served | retry the SAME query, never reword |
   | `"error"` | the retrieval could not run; an empty envelope was served in its place | fix the request, then retry |
 
@@ -52,7 +52,9 @@ defmodule LoopctlWeb.Outcome do
   The "served no substitute lane" half is load-bearing: the KNOWLEDGE tier sheds under the
   same tag and DOES serve keyword-only (`search_mode: "keyword_only"`), whose remedy is the
   fallback one — retry the same query, never reword, because the keyword lane ANDs its
-  terms. Every other signal is consulted AFTER `fallback`, exactly as the order says.
+  terms. The merged `/recall` meta republishes that `search_mode` for the half whose tag it
+  reports (`nil` when that half served nothing), so the same event classifies the same way
+  there. Every other signal is consulted AFTER `fallback`, exactly as the order says.
 
   ## Write paths get nothing
 
@@ -220,11 +222,18 @@ defmodule LoopctlWeb.Outcome do
 
   # A REAL miss: no rows, and not merely a page walked past the end. `count` is the PAGE,
   # so an empty page over a non-empty set told an agent doing an existence check the row is
-  # absent while `total_count` beside it said otherwise. `offset` is the discriminator, not
-  # `total_count`, which in relevance mode counts a pool (`total_count_scope`).
+  # absent while `total_count` beside it said otherwise.
+  #
+  # `offset > 0` is the discriminator, MINUS the one case it gets wrong: a NONZERO
+  # `total_count` cannot bound the matched set (in relevance mode it counts a pool,
+  # `total_count_scope`), but a `total_count` of EXACTLY 0 can — nothing matched, so no
+  # earlier page carried rows either and this is a genuine miss however deep the offset.
+  # An ABSENT `total_count` (the hybrid meta only `maybe_put`s it) stays exhaustion, which
+  # is the safe read: it claims a set exists rather than claiming absence.
   defp matched_nothing?(meta, count), do: count == 0 and not past_end?(meta)
 
-  defp past_end?(meta), do: is_integer(meta[:offset]) and meta[:offset] > 0
+  defp past_end?(meta),
+    do: is_integer(meta[:offset]) and meta[:offset] > 0 and meta[:total_count] != 0
 
   defp present?(value), do: is_binary(value) and value != ""
 end

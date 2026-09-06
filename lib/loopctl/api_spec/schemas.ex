@@ -4305,7 +4305,18 @@ defmodule Loopctl.ApiSpec.Schemas do
                 "Bounded, non-sensitive tag naming WHY the merged recall degraded " <>
                   "(e.g. `heavy_read_overloaded`, `no_embedding_key`, `invalid_weights`), " <>
                   "or `null` when healthy. Lets a caller tell a scope-empty half from a " <>
-                  "fault-empty one without parsing the per-source envelopes."
+                  "fault-empty one without parsing the per-source envelopes. Reported by " <>
+                  "REMEDY when both halves degrade: a half that could not run outranks " <>
+                  "a shed, which outranks a keyword-only fallback."
+            },
+            search_mode: %Schema{
+              type: :string,
+              nullable: true,
+              description:
+                "The lane the half named by `degraded_reason` actually SERVED " <>
+                  "(`keyword_only`), or `null` when it served nothing. A capacity shed " <>
+                  "that answered keyword-only and one that answered nothing carry the " <>
+                  "same tag and opposite remedies; this is what separates them."
             },
             results_ranking: %Schema{
               type: :string,

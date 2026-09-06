@@ -88,6 +88,12 @@ defmodule LoopctlWeb.RecallJSON do
       # A bounded, non-sensitive tag naming WHY the merged recall degraded (or `null`),
       # so a caller can distinguish a scope-empty half from a fault-empty one.
       degraded_reason: meta.degraded_reason,
+      # The lane the REPORTED half served in place of the ranking asked for
+      # (`"keyword_only"`), or `null` when it served nothing. Without it a knowledge shed
+      # that DID answer keyword-only was indistinguishable from a memory shed that
+      # answered nothing — same tag, opposite remedies — and `Outcome` prescribed a wait
+      # for a lane that had already run.
+      search_mode: meta.search_mode,
       # Stable tag warning that the merged `data` order is a cross-source heuristic
       # (memory absolute cosine vs knowledge pool-normalized), NOT calibrated relevance.
       results_ranking: meta.results_ranking
