@@ -17,9 +17,12 @@ defmodule Loopctl.MemoryRecallContextTest do
 
   setup :verify_on_exit!
 
+  import ExUnit.CaptureLog
+
   alias Loopctl.Knowledge
   alias Loopctl.Memory
   alias Loopctl.Memory.Scope
+  alias LoopctlWeb.Outcome
 
   defp article(tenant_id, project_id, title) do
     art =
@@ -160,6 +163,43 @@ defmodule Loopctl.MemoryRecallContextTest do
       # Memory side survived.
       assert MapSet.member?(memory_ids(result.memory), project_mem.id)
       assert Enum.all?(result.results, &(&1.source == :memory))
+    end
+
+    test "an error reason outside the mapped contract still renders the degraded envelope",
+         ctx do
+      # `Knowledge.search_combined/3` is specced to return `{:error, atom(), String.t()}`,
+      # so its error contract can grow past the three reasons the tag clauses map. A
+      # fourth reason must degrade `/recall` exactly like the mapped ones, never raise
+      # `FunctionClauseError` on the way to building the envelope.
+      log =
+        capture_log(fn ->
+          env = Memory.degraded_knowledge_env(ctx.tenant.id, :a_reason_nobody_mapped_yet, 10)
+
+          assert env.results == []
+          assert env.meta.total_count == 0
+          assert env.meta.limit == 10
+          assert env.meta.degraded? == true
+          assert env.meta.fallback == true
+
+          # The tag is generic and BOUNDED — the unmapped atom never reaches the client
+          # meta — and it is one `LoopctlWeb.Outcome` already classifies, so the caller
+          # still reads "the retrieval could not run" rather than a plain empty result.
+          assert env.meta.fallback_reason == "request_error"
+          assert env.meta.fallback_reason in Memory.knowledge_degraded_reason_tags()
+          assert Outcome.derive(env.meta, length(env.results)) == "error"
+        end)
+
+      # The reason itself is logged, so the first unmapped one is visible to an operator.
+      assert log =~ "a_reason_nobody_mapped_yet"
+    end
+
+    test "every mapped reason renders a tag the outcome classifier calls an error", ctx do
+      for reason <- [:empty_query, :invalid_weights, :bad_request] do
+        env = Memory.degraded_knowledge_env(ctx.tenant.id, reason, 5)
+
+        assert env.meta.fallback_reason == Atom.to_string(reason)
+        assert Outcome.derive(env.meta, 0) == "error"
+      end
     end
   end
 

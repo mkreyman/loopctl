@@ -125,9 +125,24 @@ defmodule Loopctl.Memory do
   #
   # Declared once because two things read the tags: the clause bodies of
   # `knowledge_degraded_reason_tag/1` (generated from the atoms) and `LoopctlWeb.Outcome`,
-  # which renders `meta.outcome: "error"` for exactly this envelope.
+  # which renders `meta.outcome: "error"` for exactly this envelope. The published list
+  # is the set of tags that function can EMIT, so it carries the generic fallback tag
+  # below as well as the three mapped ones — otherwise an unmapped reason would render
+  # a tag `Outcome` does not classify, and a request that never ran would read as an
+  # ordinary empty result.
   @knowledge_degraded_reasons [:empty_query, :invalid_weights, :bad_request]
-  @knowledge_degraded_reason_tags Enum.map(@knowledge_degraded_reasons, &Atom.to_string/1)
+
+  # The tag EVERY OTHER hard error renders as. `search_combined/3`'s spec ends in
+  # `{:error, atom(), String.t()}` — an UNBOUNDED atom — while the three reasons above
+  # are only the ones it can return today. Without a total mapping, the fourth reason
+  # added there would raise `FunctionClauseError` inside `degraded_knowledge_env/3` and
+  # take `/recall` down, which is precisely the fail-open-into-a-crash this envelope
+  # exists to prevent. Generic on purpose: the unmapped atom is internal detail and is
+  # logged, never placed in the client-facing `meta`.
+  @knowledge_degraded_fallback_tag "request_error"
+
+  @knowledge_degraded_reason_tags Enum.map(@knowledge_degraded_reasons, &Atom.to_string/1) ++
+                                    [@knowledge_degraded_fallback_tag]
 
   @typedoc "The pinned result envelope every read path returns."
   @type result_envelope :: %{results: list(), meta: map()}
@@ -150,6 +165,10 @@ defmodule Loopctl.Memory do
   Published so `LoopctlWeb.Outcome` can classify that envelope as `outcome: "error"` —
   the retrieval never ran and an empty envelope was served in its place — without
   keeping a second copy of the set.
+
+  Includes the generic `"request_error"` tag any UNMAPPED error reason renders as, so
+  a reason added to `Knowledge.search_combined/3` classifies correctly on the day it
+  is added rather than on the day someone remembers to widen this list.
   """
   @spec knowledge_degraded_reason_tags() :: [String.t()]
   def knowledge_degraded_reason_tags, do: @knowledge_degraded_reason_tags
@@ -1510,7 +1529,13 @@ defmodule Loopctl.Memory do
   # non-sensitive `fallback_reason` tag — the raw internal reason atom is NEVER placed
   # in the client-facing meta (it lives only in telemetry/logs), so `/recall` no longer
   # leaks an internal atom the equivalent `/knowledge/search` would have stripped.
-  defp degraded_knowledge_env(tenant_id, reason, limit) do
+  # Public-but-`@doc false` so the unmapped-reason path above is testable: an unmapped
+  # atom cannot be produced through `recall_context/2` today (the three mapped reasons
+  # are the whole of what `search_combined/3` returns), so the only way to prove this
+  # envelope still renders for a fourth one is to call it directly.
+  @doc false
+  @spec degraded_knowledge_env(Ecto.UUID.t(), atom(), non_neg_integer()) :: result_envelope()
+  def degraded_knowledge_env(tenant_id, reason, limit) do
     tag = knowledge_degraded_reason_tag(reason)
     emit_recall_degraded(tenant_id, "knowledge", tag)
 
@@ -1540,6 +1565,20 @@ defmodule Loopctl.Memory do
   # joined the contract.
   for reason <- @knowledge_degraded_reasons do
     defp knowledge_degraded_reason_tag(unquote(reason)), do: unquote(Atom.to_string(reason))
+  end
+
+  # Any reason the contract may grow. The clauses above are exhaustive over what
+  # `search_combined/3` returns TODAY, so this one is unreachable today too — it exists
+  # so that adding a reason there degrades `/recall` instead of crashing it, and the
+  # unmapped atom is logged (never rendered) so the gap is visible to an operator the
+  # first time it happens.
+  defp knowledge_degraded_reason_tag(reason) do
+    Logger.warning(
+      "memory.recall_context knowledge error reason is unmapped, tagging it generically " <>
+        "reason=#{inspect(reason)} tag=#{@knowledge_degraded_fallback_tag}"
+    )
+
+    @knowledge_degraded_fallback_tag
   end
 
   # Emit the merged-recall degradation signal (telemetry + log) for ONE degraded half so
