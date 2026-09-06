@@ -5,7 +5,7 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
-## 2.82.0 — 2026-09-05 (recall explains its own selection, and you can say what you used)
+## 2.87.0 — 2026-09-06 (recall explains its own selection, and you can say what you used)
 
 ### Added
 
@@ -46,6 +46,138 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   `meta.recall_id` is ALSO the `search_id` stamped on the knowledge half's surfacing rows, one
   value rather than two that have to be joined, which is what makes it directly usable as the
   `recall_referenced` argument. Keep it.
+
+## 2.86.0 — 2026-09-06 (a retraction you can take back)
+
+### Added
+
+- **`knowledge_suppress` / `knowledge_unsuppress`** — a REVERSIBLE retrieval tombstone.
+  Until now the two ways to retract an article were `knowledge_archive` (terminal:
+  `:archived` has no outbound transition and no unarchive call, so only a user-role PATCH
+  restores it) and `knowledge_unpublish` (undoable, but it asserts the article is a DRAFT,
+  which is a claim about editorial state rather than about retrieval). Suppression is the
+  third thing: it says nothing about status and everything about whether anything retrieves
+  the article.
+
+  A suppressed article keeps `status: published`, its body, its embedding and its links, and
+  stays readable by id with `knowledge_get`, which renders `suppressed_at`, `suppressed_by`
+  and `suppression_reason` — that is what makes the act inspectable and undoable. It is
+  excluded from `knowledge_search`, `knowledge_hybrid_search`, `knowledge_context`,
+  `/recall`, `knowledge_progressive_index`, `knowledge_heat_index`, suggested links,
+  `knowledge_graph`, `knowledge_walk`, the novelty priors and the nightly consolidation
+  scans.
+
+  A `reason` is REQUIRED and bounded at 500 characters: a tombstone that does not record why
+  is not inspectable. Re-suppressing an already-suppressed article is an idempotent no-op
+  that KEEPS the original actor and reason — to change a recorded reason, unsuppress and
+  suppress again, which records both acts. Both directions write to the append-only audit
+  log. Agent role and visibility-scoped, like `knowledge_archive`: another agent's
+  private/owner memory is a 404.
+
+  `knowledge_index` gains a `suppressed` argument (`exclude` / `include` / `only`) plus
+  `suppressed_at`, `suppressed_by` and `suppression_reason` as projectable `fields`, so
+  `suppressed: "only"` answers who suppressed what and why in one call instead of a
+  `knowledge_get` per row. `knowledge_list` now excludes suppressed articles by default,
+  matching `knowledge_index` — except on an `idempotency_key` filter, which is an existence
+  check on a key you already hold and still sees a suppressed row.
+
+## 2.85.0 — 2026-09-05 (a tool result says whether it ran, not just what it found)
+
+### Added
+
+- **`meta.outcome` on the retrieval responses**, and a notice that acts on it.
+  The server now classifies each read on the knowledge, memory and corpus surfaces as one
+  of `success` | `empty` | `degraded` | `fallback` | `error`, with precedence
+  `error > fallback > degraded > empty > success`. A zero-result response was ambiguous
+  before: the same `data: []` means "the corpus does not hold this" and "a lane was shed,
+  ask again", and measured session transcripts show agents reading every degraded empty as
+  the first one. The signals were already in `meta`, spread across `fallback`,
+  `fallback_reason`, `degraded`, `reason`, `semantic_unavailable_reason` and
+  `semantic_under_filled` with a different key name per surface. `outcome` is the one key
+  that means the same thing everywhere.
+
+  **Three classes get a leading banner, and they get different ones because the remedies
+  differ.** `fallback` says retry the SAME query and do not reword — different words
+  cannot fix a provider timeout. `degraded` says WAIT and then retry, because a shed
+  serves no substitute lane and an immediate retry goes back into the same closed gate —
+  except for the STANDING backend conditions no wait clears
+  (`ann_iterative_scan_unavailable`, `embedding_dimension_mismatch`), which get a remedy
+  that says so instead. `error` says the retrieval never ran,
+  so the empty envelope proves nothing about what the knowledge base holds. `empty` and
+  `success` stay silent on purpose: a banner on every ordinary zero-result search is
+  noise, and noise teaches agents to ignore the channel, which is the exact fate of the
+  `meta` fields this replaces.
+
+  `meta.outcome` is carried by EVERY read on these surfaces: the retrieval tools
+  (`knowledge_search` in both relevance and list modes, `knowledge_context`,
+  `knowledge_hybrid_search`, `knowledge_progressive_index`, `knowledge_heat_index`,
+  `memory_recall`, `recall_context`, `corpus_search`), the enumerations
+  (`knowledge_list`, `knowledge_index`, `memory_list`, `corpus_list`), the review queues
+  (`GET /knowledge/drafts`, `GET /knowledge/conflicts`) and the suggested-links read.
+  Write tools carry none — it answers "can I trust this empty result set", which is a
+  question only a read has.
+
+  **The catalog endpoints were excluded in the first draft of this and should not have
+  been.** They disclose no degradation of their own, so their `outcome` is only ever
+  `empty` or `success` — true of the VALUE and irrelevant to the KEY. A client cannot see
+  a per-endpoint opt-out: an absent `outcome` means "this endpoint declined to classify"
+  and "this server predates the envelope" at once, and this client's own `outcomeOf`
+  collapses both to `null`. Absence now has exactly one meaning: an old server.
+
+  **The banner fires on every read that can report a degradation.** The first draft
+  printed it on `knowledge_search`, `knowledge_hybrid_search` and `knowledge_context`
+  only, and left six handlers ending at a bare `toContent` — so on the MEMORY surface,
+  the one this README calls out as where outcome matters most, a shed read still looked
+  exactly like an empty scope. `knowledge_list`, `knowledge_progressive_index`,
+  `knowledge_heat_index`, `memory_recall`, `recall_context` and `corpus_search` now
+  print it too.
+
+  An unrecognised `outcome` value means a server newer than this client, and the notice
+  falls back to the pre-envelope flag heuristics rather than inventing a class it cannot
+  interpret. A server that sends no `outcome` at all keeps the historical wording.
+
+## 2.80.0 — 2026-09-05 (a destructive tool stops carrying its own approval)
+
+### Changed
+
+- **BREAKING: `knowledge_bulk_delete` no longer declares a `confirm` argument, and the
+  `tag` selector is two-step even for the soft archive (#779).** `confirm` was
+  authorization the model wrote for itself: the same call that asked for the mutation
+  also carried its own approval, so nothing outside the caller ever saw the proposal, and
+  an agent that decided to archive every article carrying a tag also decided to confirm
+  it. The parameter is gone from the tool schema and from the request body this server
+  sends. A request that still carries a `confirm` key is refused by the API with `400`
+  and `error.code: "confirm_removed"` — refused rather than ignored, so a stale client
+  learns the gate moved instead of believing it passed one.
+
+- **The `tag` archive now uses the frozen-token flow the hard delete already used.** Call
+  with `dry_run: true` to get `meta.would_affect` and a single-use, TTL-bounded
+  `meta.token` frozen over the previewed id-set, then call again with the same `tag` plus
+  that token to archive exactly that set — rows that started matching after the preview
+  are never swept. A `tag` call with neither `dry_run` nor a `token` is `400` with
+  `error.code: "dry_run_required"`. A selector too large to freeze gets `meta.oversized`
+  and `meta.confirm_hash` instead; echo the hash back with the same selector and the
+  server re-resolves and refuses on any drift. The archive and delete flows mint
+  DIFFERENT token types, and the oversized `confirm_hash` is keyed on the op, so an
+  archive proposal is not spendable as a delete or the reverse at any set size. Every token
+  is bound to its SELECTOR too — the hard delete as much as the tag archive — so replaying
+  one under a different `tag` is a `400`, not a silent sweep of the tag it was minted for,
+  and a hard delete replays the same selector it previewed rather than the token alone. A
+  selector that matches nothing needs no token — it stays a `200` no-op on either path.
+  A proposal minted by an earlier server release is refused after the API deploy (a
+  fail-closed `400`); re-run the dry-run.
+
+- **Unchanged:** `article_ids` and `source_type` + `source_id` still archive immediately
+  with no token, because each names a set the caller already holds. The role gate is
+  still `LOOPCTL_USER_KEY`. The response shape, including `meta.counts`/`meta.results`,
+  is the same.
+
+### Notes
+
+- The design invariant this enforces — no loopctl MCP tool takes a `confirm`, `approved`
+  or `yes` argument, and a set-based destructive action returns a server-minted proposal
+  the caller replays — is now written down in `README.md` so the next destructive tool
+  inherits it rather than re-deriving it.
 
 ## 2.78.0 — 2026-08-28 (the corpus tier becomes reachable from an agent)
 

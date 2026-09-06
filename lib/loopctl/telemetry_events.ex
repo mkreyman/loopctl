@@ -362,9 +362,12 @@ defmodule Loopctl.TelemetryEvents do
 
     * `measurements`: `%{count: 1}` — a pure increment.
     * `metadata`: `%{tenant_id, side, reason}` where `side` is `"memory"` | `"knowledge"`
-      (a BOUNDED 2-value tag) and `reason` is a BOUNDED, sanitized tag
-      (`"heavy_read_overloaded"` | `"empty_query"` | `"invalid_weights"` |
-      `"bad_request"` | `"knowledge_error"`).
+      (a BOUNDED 2-value tag) and `reason` is a BOUNDED, sanitized tag: the memory side
+      emits `"heavy_read_overloaded"`, and the knowledge side emits one of
+      `Loopctl.Memory.knowledge_degraded_reason_tags/0` — the mapped reasons plus the
+      generic `"request_error"` that any UNMAPPED error reason renders as. Named by
+      pointer rather than copied, so a reason added to the contract cannot drift out of
+      this list (it previously named a `"knowledge_error"` nothing emits).
   """
   def recall_context_degraded, do: [:loopctl, :memory, :recall_context, :degraded]
 

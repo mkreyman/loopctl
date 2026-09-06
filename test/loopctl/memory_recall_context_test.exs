@@ -17,9 +17,12 @@ defmodule Loopctl.MemoryRecallContextTest do
 
   setup :verify_on_exit!
 
+  import ExUnit.CaptureLog
+
   alias Loopctl.Knowledge
   alias Loopctl.Memory
   alias Loopctl.Memory.Scope
+  alias LoopctlWeb.Outcome
 
   defp article(tenant_id, project_id, title) do
     art =
@@ -161,7 +164,154 @@ defmodule Loopctl.MemoryRecallContextTest do
       assert MapSet.member?(memory_ids(result.memory), project_mem.id)
       assert Enum.all?(result.results, &(&1.source == :memory))
     end
+
+    test "an error reason outside the mapped contract still renders the degraded envelope",
+         ctx do
+      # Proven able to go red, by deleting the fallback clause under it:
+      #   bin/mutate.sh lib/loopctl/memory.ex --old-file <the clause> --delete \
+      #     -- mix test test/loopctl/memory_recall_context_test.exs
+      # exit 0 — the check failed under the mutation (FunctionClauseError on
+      # `knowledge_degraded_reason_tag/1`) and passed without it.
+      #
+      # `Knowledge.search_combined/3` is specced to return `{:error, atom(), String.t()}`,
+      # so its error contract can grow past the three reasons the tag clauses map. A
+      # fourth reason must degrade `/recall` exactly like the mapped ones, never raise
+      # `FunctionClauseError` on the way to building the envelope.
+      log =
+        capture_log(fn ->
+          env = Memory.degraded_knowledge_env(ctx.tenant.id, :a_reason_nobody_mapped_yet, 10)
+
+          assert env.results == []
+          assert env.meta.total_count == 0
+          assert env.meta.limit == 10
+          assert env.meta.degraded? == true
+          assert env.meta.fallback == true
+
+          # The tag is generic and BOUNDED — the unmapped atom never reaches the client
+          # meta — and it is one `LoopctlWeb.Outcome` already classifies, so the caller
+          # still reads "the retrieval could not run" rather than a plain empty result.
+          assert env.meta.fallback_reason == "request_error"
+          assert env.meta.fallback_reason in Memory.knowledge_degraded_reason_tags()
+          assert Outcome.derive(env.meta, length(env.results)) == "error"
+        end)
+
+      # The reason itself is logged, so the first unmapped one is visible to an operator.
+      assert log =~ "a_reason_nobody_mapped_yet"
+    end
+
+    test "every mapped reason renders a tag the outcome classifier calls an error", ctx do
+      for reason <- [:empty_query, :invalid_weights, :bad_request] do
+        env = Memory.degraded_knowledge_env(ctx.tenant.id, reason, 5)
+
+        assert env.meta.fallback_reason == Atom.to_string(reason)
+        assert Outcome.derive(env.meta, 0) == "error"
+      end
+    end
   end
+
+  describe "merged_degradation/2 — one tag, ordered by remedy" do
+    # Both halves can degrade at once and the merged meta carries ONE tag, so whichever
+    # is reported is the only remedy the caller ever sees. Each case below is a pair that
+    # co-occurs in practice, asserted with what `LoopctlWeb.Outcome` makes of it.
+    test "a knowledge half that never RAN outranks a memory shed" do
+      # The shed's remedy is to wait; no wait fixes a request the caller must change.
+      assert {"bad_request", nil} =
+               Memory.merged_degradation(memory_shed_env(), knowledge_unrunnable_env())
+    end
+
+    test "a memory configuration fault outranks a knowledge keyword-only fallback" do
+      # Both are caused by an embedding change, so co-occurrence is the expected case.
+      # Reported the other way round the agent retries a half only an operator restores.
+      {reason, lane} =
+        Memory.merged_degradation(
+          memory_unavailable_env(),
+          knowledge_fallback_env("embedding_timeout", "keyword_only")
+        )
+
+      assert {"embedding_dimension_mismatch", nil} == {reason, lane}
+      assert merged_outcome(reason, lane, 0) == "error"
+    end
+
+    test "a memory shed outranks a knowledge keyword-only fallback" do
+      assert {"heavy_read_overloaded", nil} =
+               Memory.merged_degradation(
+                 memory_shed_env(),
+                 knowledge_fallback_env("embedding_timeout", "keyword_only")
+               )
+    end
+
+    test "a knowledge shed that DID serve keyword-only reports the lane it served" do
+      # The SAME tag as the memory shed, and the opposite remedy. The lane is what tells
+      # them apart on the merged meta, which carries no per-half envelope to read.
+      {reason, lane} =
+        Memory.merged_degradation(
+          healthy_env(),
+          knowledge_fallback_env("heavy_read_overloaded", "keyword_only")
+        )
+
+      assert {"heavy_read_overloaded", "keyword_only"} == {reason, lane}
+      assert merged_outcome(reason, lane, 3) == "fallback"
+    end
+
+    test "two healthy halves report nothing" do
+      assert {nil, nil} = Memory.merged_degradation(healthy_env(), healthy_env())
+    end
+
+    # The ledger arm is the one reason that is NOT about the results: both halves
+    # answered, but the surfacing rows were not written, so the `recall_id` this response
+    # publishes names no rows and `/referenced` refuses every id under it. Reported LAST
+    # for exactly that reason — a degraded half carries a remedy for the results the
+    # caller is holding, which outranks a remedy for a follow-up call it may never make.
+    test "a failed surfacing ledger is reported when both halves are healthy" do
+      assert {"recall_ledger_unavailable", nil} =
+               Memory.merged_degradation(
+                 healthy_env(),
+                 healthy_env(),
+                 {:error, :recording_failed}
+               )
+    end
+
+    test "a degraded half outranks a failed ledger" do
+      assert {"heavy_read_overloaded", nil} =
+               Memory.merged_degradation(
+                 memory_shed_env(),
+                 healthy_env(),
+                 {:error, :recording_failed}
+               )
+    end
+
+    test "a written ledger adds no tag" do
+      assert {nil, nil} = Memory.merged_degradation(healthy_env(), healthy_env(), :ok)
+    end
+  end
+
+  # The merged meta as `RecallJSON` renders it, reduced to the keys `Outcome` reads.
+  defp merged_outcome(reason, lane, count),
+    do: Outcome.derive(%{degraded: true, degraded_reason: reason, search_mode: lane}, count)
+
+  defp envelope(meta), do: %{results: [], meta: meta}
+
+  defp memory_shed_env,
+    do: envelope(%{total_count: 0, fallback: true, reason: "heavy_read_overloaded"})
+
+  defp memory_unavailable_env,
+    do: envelope(%{total_count: 0, fallback: true, reason: "embedding_dimension_mismatch"})
+
+  defp healthy_env, do: envelope(%{total_count: 0, degraded?: false})
+
+  defp knowledge_fallback_env(reason, mode),
+    do:
+      envelope(%{
+        total_count: 0,
+        degraded?: true,
+        fallback: true,
+        fallback_reason: reason,
+        search_mode: mode
+      })
+
+  defp knowledge_unrunnable_env,
+    do:
+      envelope(%{total_count: 0, degraded?: true, fallback: true, fallback_reason: "bad_request"})
 
   describe "recall_context/2 - overall merged limit" do
     test "clamps the merged, re-ranked list to `limit`", ctx do

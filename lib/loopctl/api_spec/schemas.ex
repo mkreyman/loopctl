@@ -4079,7 +4079,11 @@ defmodule Loopctl.ApiSpec.Schemas do
 
     OpenApiSpex.schema(%{
       title: "MemoryListResponse",
-      description: "A paginated list of memories.",
+      description:
+        "A paginated list of memories. `meta.outcome` carries the uniform tool-outcome " <>
+          "classification; enumeration discloses no degradation of its own, so it is " <>
+          "`empty` or `success` here — present so a caller never has to know which reads " <>
+          "publish it.",
       type: :object,
       properties: %{
         data: %Schema{type: :array, items: Memory},
@@ -4088,7 +4092,8 @@ defmodule Loopctl.ApiSpec.Schemas do
           properties: %{
             total_count: %Schema{type: :integer},
             limit: %Schema{type: :integer},
-            offset: %Schema{type: :integer}
+            offset: %Schema{type: :integer},
+            outcome: LoopctlWeb.Outcome.schema()
           }
         }
       }
@@ -4123,6 +4128,11 @@ defmodule Loopctl.ApiSpec.Schemas do
         meta: %Schema{
           type: :object,
           properties: %{
+            # The uniform tool-outcome envelope. `LoopctlWeb.Outcome` publishes the enum
+            # it can actually render, so the documented values and the emitted ones are
+            # one declaration. (`Loopctl.ApiSpec` already reaches into `LoopctlWeb` for
+            # the router; this is the same direction.)
+            outcome: LoopctlWeb.Outcome.schema(),
             total_count: %Schema{type: :integer},
             fallback: %Schema{type: :boolean},
             reason: %Schema{type: :string, nullable: true},
@@ -4308,6 +4318,10 @@ defmodule Loopctl.ApiSpec.Schemas do
         meta: %Schema{
           type: :object,
           properties: %{
+            # The uniform tool-outcome envelope, derived from the degradation keys below
+            # plus the MERGED `total_count`, so it describes the whole endpoint. The
+            # per-source `memory` envelope carries its own.
+            outcome: LoopctlWeb.Outcome.schema(),
             query: %Schema{type: :string},
             project_id: %Schema{type: :string, format: :uuid, nullable: true},
             total_count: %Schema{type: :integer},
@@ -4327,11 +4341,23 @@ defmodule Loopctl.ApiSpec.Schemas do
                 "Bounded, non-sensitive tag naming WHY the merged recall degraded " <>
                   "(e.g. `heavy_read_overloaded`, `no_embedding_key`, `invalid_weights`), " <>
                   "or `null` when healthy. Lets a caller tell a scope-empty half from a " <>
-                  "fault-empty one without parsing the per-source envelopes. " <>
-                  "`recall_ledger_unavailable` is the one that is not about the results: " <>
-                  "both halves answered, but the surfacing rows could not be written, so " <>
+                  "fault-empty one without parsing the per-source envelopes. Reported by " <>
+                  "REMEDY when both halves degrade: a half that could not run outranks " <>
+                  "a shed, which outranks a keyword-only fallback. " <>
+                  "`recall_ledger_unavailable` is the one that is not about the results, " <>
+                  "and so is reported only when both halves are healthy: they answered, " <>
+                  "but the surfacing rows could not be written, so " <>
                   "`POST /recall/{recall_id}/referenced` will refuse every id under this " <>
                   "`recall_id`."
+            },
+            search_mode: %Schema{
+              type: :string,
+              nullable: true,
+              description:
+                "The lane the half named by `degraded_reason` actually SERVED " <>
+                  "(`keyword_only`), or `null` when it served nothing. A capacity shed " <>
+                  "that answered keyword-only and one that answered nothing carry the " <>
+                  "same tag and opposite remedies; this is what separates them."
             },
             results_ranking: %Schema{
               type: :string,

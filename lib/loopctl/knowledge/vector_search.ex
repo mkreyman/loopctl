@@ -143,6 +143,7 @@ defmodule Loopctl.Knowledge.VectorSearch do
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleEmbedding
   alias Loopctl.Knowledge.ArticleLink
+  alias Loopctl.Knowledge.Suppression
 
   @typedoc "A nearest-neighbour candidate row."
   @type candidate :: %{
@@ -518,6 +519,14 @@ defmodule Loopctl.Knowledge.VectorSearch do
       Article
       |> index_safe_knn_base(tenant_id, target, pool)
       |> maybe_filter_by_status(status)
+      # The retrieval tombstone, on the inner ANN alongside `status` and for the same
+      # reason: it is an index-safe equality-shaped residual (an `IS NULL` on a scalar
+      # column), it costs no join and no distance term, and the suppressed set is a tiny
+      # fraction of the corpus so it cannot meaningfully starve the pool. UNCONDITIONAL,
+      # unlike `maybe_filter_by_status/2` — a `status: nil` caller asking for every
+      # status is still asking a RETRIEVAL question, and this module has no consumer
+      # that wants suppressed rows back.
+      |> Suppression.exclude()
       |> maybe_exclude_self(exclude_id)
       |> maybe_filter_by_visibility(vis)
 
@@ -571,6 +580,10 @@ defmodule Loopctl.Knowledge.VectorSearch do
       limit: ^pool
     )
     |> maybe_filter_by_status_on_article(status)
+    # Same predicate as the legacy branch, on the OUTER join where this path's status
+    # and visibility filters already live — the cutover flag must never decide whether a
+    # suppressed article can be retrieved.
+    |> Suppression.exclude_last()
     |> maybe_exclude_self_on_article(exclude_id)
     |> maybe_filter_by_visibility_on_article(vis)
     |> dimension_pool_select(Keyword.get(opts, :select, :knn))

@@ -1337,7 +1337,7 @@ async function setTokenBudget({ scope_type, scope_id, budget_millicents, alert_t
 
 // --- Knowledge Wiki Tools (agent key) ---
 
-async function knowledgeIndex({ project_id, story_id, category, tags, match, offset, limit, fields }) {
+async function knowledgeIndex({ project_id, story_id, category, tags, match, offset, limit, fields, suppressed }) {
   if (project_id && !UUID_RE.test(project_id)) {
     return {
       content: [{ type: "text", text: "Error: project_id must be a canonical UUID (8-4-4-4-12 hex)." }],
@@ -1355,6 +1355,7 @@ async function knowledgeIndex({ project_id, story_id, category, tags, match, off
   if (offset != null) params.set("offset", String(offset));
   if (limit != null) params.set("limit", String(limit));
   if (fields) params.set("fields", Array.isArray(fields) ? fields.join(",") : fields);
+  if (suppressed) params.set("suppressed", suppressed);
   const qs = params.toString();
   const path = qs ? `${basePath}?${qs}` : basePath;
   const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
@@ -1590,7 +1591,10 @@ async function knowledgeProgressiveIndex({ topic, query, category, limit }) {
     null,
     process.env.LOOPCTL_AGENT_KEY,
   );
-  return toContent(result);
+  // A topic browse is a RETRIEVAL: it runs the same ranked pool, so it can come back
+  // short or keyword-only. Without the banner a shed index reads as "the KB has no
+  // articles on this topic", which is the exact misread meta.outcome exists to end.
+  return withRemediationNotice(result);
 }
 
 async function knowledgeHeatIndex({ category, limit, since }) {
@@ -1605,7 +1609,9 @@ async function knowledgeHeatIndex({ category, limit, since }) {
     null,
     process.env.LOOPCTL_AGENT_KEY,
   );
-  return toContent(result);
+  // The query-free route, reached for precisely when the query-shaped ones came back
+  // empty — so an unannounced degradation here strands the agent with no route left.
+  return withRemediationNotice(result);
 }
 
 async function knowledgeProgressiveDrill({ article_id, body_max_bytes, body_offset }) {
@@ -1639,6 +1645,7 @@ async function knowledgeList({
   limit,
   offset,
   include_body,
+  suppressed,
 }) {
   const params = new URLSearchParams();
   if (project_id) params.set("project_id", project_id);
@@ -1654,6 +1661,11 @@ async function knowledgeList({
   // Body-less summary by default (safe to enumerate large pages); opt into full
   // bodies (byte-budget bounded server-side) with include_body: true.
   if (include_body === true) params.set("include_body", "true");
+  // Sent only when the caller asked. The server's default is per-filter — exclude
+  // everywhere except an idempotency_key lookup, which includes suppressed rows so an
+  // identity check cannot mint a duplicate — and sending a computed "exclude" on every
+  // call would overwrite that.
+  if (suppressed) params.set("suppressed", suppressed);
 
   const result = await apiCall(
     "GET",
@@ -1661,7 +1673,9 @@ async function knowledgeList({
     null,
     process.env.LOOPCTL_AGENT_KEY,
   );
-  return toContent(result);
+  // Enumeration, not ranking — but a short page still under-reports the set, and an
+  // agent enumerating to decide something absent is the caller least able to tell.
+  return withRemediationNotice(result);
 }
 
 async function knowledgeGet({
@@ -1837,9 +1851,11 @@ async function memoryRecall({ query, limit, include_superseded }) {
     process.env.LOOPCTL_AGENT_KEY,
   );
   // Surface meta (fallback/reason/total_count/underfilled) so the caller can tell
-  // a degraded recall from a genuinely empty scope (AC-28.4.4) — toContent already
-  // preserves the full result (data + meta), we just keep this call explicit.
-  return toContent(result);
+  // a degraded recall from a genuinely empty scope (AC-28.4.4). meta alone was not
+  // enough: agents do not read it, which is the whole finding behind the banner. On
+  // the MEMORY surface a shed read otherwise looks identical to an empty scope, and
+  // "I have never been told this" is the most consequential thing to get wrong here.
+  return withRemediationNotice(result);
 }
 
 async function recallContext({ query, project_id, limit }) {
@@ -1858,8 +1874,11 @@ async function recallContext({ query, project_id, limit }) {
     process.env.LOOPCTL_AGENT_KEY,
   );
   // Surface both per-source metas (memory fallback/underfilled + knowledge degraded)
-  // so the caller can tell a degraded recall from a genuinely empty scope.
-  return toContent(result);
+  // so the caller can tell a degraded recall from a genuinely empty scope. The merged
+  // meta can carry ONE half's failure beside the other half's rows, which the server
+  // classifies "degraded" — a banner is the only place a caller sees that the pack it
+  // is about to act on is a half.
+  return withRemediationNotice(result);
 }
 
 async function recallReferenced({ recall_id, article_ids, project_id }) {
@@ -2029,6 +2048,29 @@ async function knowledgeArchive({ article_id }) {
   return toContent(result);
 }
 
+// The REVERSIBLE retrieval tombstone. Agent-role KB curation like archive, but it is the
+// one member of that family that undoes: nothing is destroyed and nothing is rebuilt, so
+// knowledge_unsuppress restores the article to every read path immediately.
+async function knowledgeSuppress({ article_id, reason }) {
+  const result = await apiCall(
+    "POST",
+    `/api/v1/articles/${article_id}/suppress`,
+    { reason },
+    process.env.LOOPCTL_AGENT_KEY
+  );
+  return toContent(result);
+}
+
+async function knowledgeUnsuppress({ article_id }) {
+  const result = await apiCall(
+    "POST",
+    `/api/v1/articles/${article_id}/unsuppress`,
+    null,
+    process.env.LOOPCTL_AGENT_KEY
+  );
+  return toContent(result);
+}
+
 // #331: soft-delete (archive) is agent-role KB curation, same as knowledge_archive.
 async function knowledgeDelete({ article_id }) {
   const result = await apiCall(
@@ -2040,12 +2082,16 @@ async function knowledgeDelete({ article_id }) {
   return toContent(result);
 }
 
+// There is deliberately NO `confirm` parameter here (#779). A destructive action
+// returns a server-minted proposal the caller REPLAYS; it never takes its own
+// authorization as an argument the model can fill in. The server refuses a request
+// carrying a `confirm` key with 400 confirm_removed rather than ignoring it, so a
+// stale client learns the gate moved instead of believing it passed one.
 async function knowledgeBulkDelete({
   article_ids,
   source_type,
   source_id,
   tag,
-  confirm,
   dry_run,
   hard,
   token,
@@ -2056,11 +2102,12 @@ async function knowledgeBulkDelete({
   if (source_type) payload.source_type = source_type;
   if (source_id) payload.source_id = source_id;
   if (tag) payload.tag = tag;
-  if (confirm) payload.confirm = confirm;
-  // US-27.12: dry-run preview + irreversible hard delete via a single-use frozen
-  // token. dry_run=true mutates nothing (returns meta.would_affect; for the hard
-  // path a single-use meta.token); hard=true + token performs the FK-correct
-  // IRREVERSIBLE delete over the frozen id-set. Oversized selectors echo
+  // US-27.12 / #779: dry-run preview + a single-use frozen token, on BOTH the
+  // irreversible hard delete (any selector) and the soft ARCHIVE of a `tag`
+  // selector. dry_run=true mutates nothing (returns meta.would_affect plus
+  // meta.token); replaying that token performs the op over the FROZEN id-set.
+  // The two flows mint DIFFERENT token types, so an archive proposal is not
+  // spendable as a delete or the reverse. Oversized selectors echo
   // meta.confirm_hash for re-confirm-on-drift instead of a token.
   if (dry_run) payload.dry_run = true;
   if (hard) payload.hard = true;
@@ -3100,8 +3147,10 @@ async function corpusSearch({ corpus_id, query, query_vector, lanes, limit }) {
     process.env.LOOPCTL_AGENT_KEY,
   );
   // Pointers + snippets only — the caller's next step is to open the file at
-  // source_ref/locator. Nothing here is auto-injected into a recall pack.
-  return toContent(result);
+  // source_ref/locator. Nothing here is auto-injected into a recall pack, so a
+  // degradation nobody announces is never noticed downstream either: this banner is
+  // the only disclosure a corpus read gets.
+  return withRemediationNotice(result);
 }
 
 async function corpusStatus({ corpus_id, limit, offset }) {
@@ -4380,10 +4429,29 @@ const TOOLS = [
           type: "array",
           items: {
             type: "string",
-            enum: ["id", "title", "category", "tags", "status", "updated_at"],
+            enum: [
+              "id",
+              "title",
+              "category",
+              "tags",
+              "status",
+              "updated_at",
+              "suppressed_at",
+              "suppressed_by",
+              "suppression_reason",
+            ],
           },
           description:
-            "Optional: projection of article fields to return. Default: id, title, category. `id` is always included.",
+            "Optional: projection of article fields to return. Default: id, title, category. `id` is always included. " +
+            "Pair suppressed='only' with fields=suppressed_by,suppression_reason to see who suppressed what and why without a per-row read.",
+        },
+        suppressed: {
+          type: "string",
+          enum: ["exclude", "include", "only"],
+          description:
+            "Optional: how to treat RETRIEVAL-SUPPRESSED articles — 'exclude' (default), 'include', or " +
+            "'only'. 'only' is the discovery path: it lists exactly what there is to undo with " +
+            "knowledge_unsuppress, across every status. An unrecognised value resolves to 'exclude'.",
         },
       },
       required: [],
@@ -4406,7 +4474,11 @@ const TOOLS = [
       "`meta.total_count` (exact) to answer \"does an article for X already exist?\" reliably " +
       "right after a write — `idempotency_key` is a FILTER only and is never returned in a " +
       "row, so you check a key you already hold rather than reading back the keys other " +
-      "callers chose. Paginate via offset/limit.",
+      "callers chose. Suppressed articles are EXCLUDED here (matching knowledge_index) except " +
+      "on an `idempotency_key` filter, which is an identity check on a key you already hold " +
+      "and still sees them — so the existence check stays true about the row a create would " +
+      "dedup against. Pass `suppressed: 'include'` when a repair pass must see the whole " +
+      "table, or `'only'` to list what there is to undo. Paginate via offset/limit.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4465,6 +4537,17 @@ const TOOLS = [
             "then bounded by a ~5 MB serialized-body budget (it may return fewer than `limit` " +
             "rows); continue via meta.next_offset while meta.has_more is true. Leave false to " +
             "enumerate metadata cheaply at scale.",
+        },
+        suppressed: {
+          type: "string",
+          enum: ["exclude", "include", "only"],
+          description:
+            "Optional: how to treat RETRIEVAL-SUPPRESSED articles — 'exclude' (the default on " +
+            "every filter but idempotency_key), 'include', or 'only'. Pass 'include' when a " +
+            "repair or audit pass must see the whole table, and 'only' to list exactly what " +
+            "there is to undo with knowledge_unsuppress. Omit it to keep the per-filter " +
+            "default. The body-less rows do NOT carry the three suppressed_* fields — pair " +
+            "with include_body: true, or read knowledge_get, to see who suppressed what and why.",
         },
       },
       required: [],
@@ -5742,6 +5825,69 @@ const TOOLS = [
     },
   },
   {
+    name: "knowledge_suppress",
+    description:
+      "Take an article OUT OF RETRIEVAL without changing its status — reversibly. This is " +
+      "the tool to reach for when an article is wrong, superseded, noisy or no longer " +
+      "wanted in results, but you might want it back. The article stays `published`, keeps " +
+      "its body, embedding and links, and is STILL readable by id with knowledge_get " +
+      "(which renders suppressed_at / suppressed_by / suppression_reason) — that is what " +
+      "makes the act inspectable and undoable. It disappears from knowledge_search, " +
+      "knowledge_hybrid_search, knowledge_context, /recall, knowledge_progressive_index, " +
+      "knowledge_heat_index, suggested links, knowledge_graph, knowledge_walk, the novelty " +
+      "priors and the nightly consolidation scans. " +
+      "Undo with knowledge_unsuppress; nothing was destroyed, so nothing is rebuilt. " +
+      "Choose between the three retraction verbs by what you need afterwards: " +
+      "knowledge_suppress (undoable, status untouched, the article is simply not retrieved), " +
+      "knowledge_unpublish (undoable, but it says the article is a DRAFT — an editorial " +
+      "claim), knowledge_archive/knowledge_delete (NOT undoable by any call you can make: " +
+      "`:archived` is terminal). " +
+      "A reason is REQUIRED — a tombstone that does not record why is not inspectable. " +
+      "Re-suppressing an already-suppressed article is an idempotent no-op that KEEPS the " +
+      "original actor and reason; to change a recorded reason, unsuppress and suppress " +
+      "again, which records both acts. " +
+      "Agent role. Visibility-scoped: you can only suppress an article you can see, so " +
+      "another agent's private/owner memory returns 404.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        article_id: {
+          type: "string",
+          description: "The UUID of the article to take out of retrieval.",
+        },
+        reason: {
+          type: "string",
+          description:
+            "Why this article should stop being retrieved. Required and non-blank; " +
+            "bounded at 500 characters. Recorded on the row and in the audit log, and " +
+            "returned by knowledge_get, so write it for whoever decides later whether to " +
+            "undo this.",
+        },
+      },
+      required: ["article_id", "reason"],
+    },
+  },
+  {
+    name: "knowledge_unsuppress",
+    description:
+      "Lift a retrieval suppression: the inverse of knowledge_suppress. Clears the " +
+      "tombstone and restores the article to search, context, /recall, the indexes, the " +
+      "graph and the link surfaces immediately — nothing has to be re-embedded or " +
+      "re-linked, because suppression never touched any of it. Unsuppressing an article " +
+      "that is not suppressed is a harmless no-op. Agent role, visibility-scoped. " +
+      "This does NOT undo knowledge_archive or knowledge_delete, which are terminal.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        article_id: {
+          type: "string",
+          description: "The UUID of the article to restore to retrieval.",
+        },
+      },
+      required: ["article_id"],
+    },
+  },
+  {
     name: "knowledge_delete",
     description:
       "Delete an article. Under the hood this performs the same soft-delete (archive) " +
@@ -5771,15 +5917,25 @@ const TOOLS = [
       "of articles by selector. " +
       "REQUIRES LOOPCTL_USER_KEY (user role — orchestrator is NOT sufficient). Provide EXACTLY ONE " +
       "selector: article_ids (explicit list), source_type + source_id (every active article from " +
-      "that source), or tag + confirm:true (every active article carrying the tag — high blast " +
-      "radius, so confirm:true is required). " +
+      "that source), or tag (every active article carrying the tag — high blast radius). " +
+      "THERE IS NO confirm PARAMETER. Sending one is 400 confirm_removed, never ignored. A " +
+      "high-blast-radius call is authorized by REPLAYING a server-minted proposal, never by a " +
+      "flag in the same request that asks for the mutation. " +
       "DEFAULT (soft archive): rows move to archived, never dropped; set-based + idempotent; " +
-      "meta.count = archived, meta.counts/meta.results give the breakdown. " +
-      "DRY-RUN: dry_run:true mutates NOTHING and returns meta.would_affect (and, for hard, a " +
-      "single-use meta.token / for oversized selectors a meta.confirm_hash). " +
-      "HARD DELETE (irreversible): first dry_run with hard:true to get a token, then call again " +
-      "with hard:true + that token to FK-correctly delete the FROZEN id-set (links removed first, " +
-      "access events cascade). The token is single-use and TTL-bounded. Bounded to 5000 per call.",
+      "meta.count = archived, meta.counts/meta.results give the breakdown. article_ids and " +
+      "source archive immediately; the tag selector is TWO-STEP. " +
+      "TWO-STEP (tag archive, and every hard delete): call with dry_run:true to get " +
+      "meta.would_affect and a single-use, TTL-bounded meta.token frozen over the previewed " +
+      "id-set, then call again with the SAME selector plus that token. The op runs over the " +
+      "FROZEN set, so rows that started matching after the preview are never touched. A call " +
+      "with neither dry_run nor token is 400 (dry_run_required on the tag archive) UNLESS the " +
+      "selector matches nothing, which stays a 200 no-op on either path. The token is TYPED by " +
+      "op AND by selector: an archive token is not spendable as a delete or the reverse, and a " +
+      "token minted for one tag is 400 on a call naming another — sweeping a list of tags " +
+      "needs its own dry-run per tag. Oversized selectors (over the frozen bound) get " +
+      "meta.oversized + " +
+      "meta.confirm_hash instead of a token; echo the hash back with the same selector and the " +
+      "server refuses on any drift. Bounded to 5000 per call.",
     inputSchema: {
       type: "object",
       properties: {
@@ -5799,17 +5955,15 @@ const TOOLS = [
         tag: {
           type: "string",
           description:
-            "Every active article carrying this tag (selector 3). Requires confirm:true.",
-        },
-        confirm: {
-          type: "boolean",
-          description: "Required (true) when selecting by tag — guards the high blast radius.",
+            "Every active article carrying this tag (selector 3). Two-step even for the soft " +
+            "archive: dry_run:true for a meta.token, then replay it. There is no confirm flag.",
         },
         dry_run: {
           type: "boolean",
           description:
-            "Preview only — mutate nothing. Returns meta.would_affect; with hard:true also a " +
-            "single-use meta.token (or meta.confirm_hash for oversized selectors).",
+            "Preview only — mutate nothing. Returns meta.would_affect, plus the single-use " +
+            "meta.token for a hard delete or a tag archive (or meta.confirm_hash for oversized " +
+            "selectors).",
         },
         hard: {
           type: "boolean",
@@ -5821,14 +5975,17 @@ const TOOLS = [
         token: {
           type: "string",
           description:
-            "The single-use frozen-set token from a `dry_run:true, hard:true` preview. Required " +
-            "for the hard delete.",
+            "The single-use frozen-set token from a dry_run preview. Required for a hard delete " +
+            "and for a tag archive, and replayed with the SAME selector. Typed by op AND by " +
+            "selector: an archive token is not spendable as a delete, and a token minted for " +
+            "one tag is refused on a call naming another.",
         },
         confirm_hash: {
           type: "string",
           description:
-            "For an oversized hard-delete selector (no token): the meta.confirm_hash from the " +
-            "dry-run, echoed back to re-confirm the id-set hasn't drifted.",
+            "For an oversized selector (no token was minted): the meta.confirm_hash from the " +
+            "dry-run, echoed back to re-confirm the id-set hasn't drifted. Applies to an " +
+            "oversized hard delete and an oversized tag archive.",
         },
       },
       required: [],
@@ -7975,6 +8132,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "knowledge_archive":
       return await knowledgeArchive(args);
+
+    case "knowledge_suppress":
+      return await knowledgeSuppress(args);
+
+    case "knowledge_unsuppress":
+      return await knowledgeUnsuppress(args);
 
     case "knowledge_delete":
       return await knowledgeDelete(args);

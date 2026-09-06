@@ -5,7 +5,14 @@ defmodule LoopctlWeb.KnowledgeProgressiveJSON do
   Stubs are compact by design: id/title/category/summary only, never a body — the
   body is fetched on demand via the drill endpoint. `category` is stringified for
   a stable wire shape.
+
+  Both index shapes carry `meta.outcome` (`LoopctlWeb.Outcome`). Neither discloses a
+  degradation of its own, so the value is `"empty"` or `"success"` — the point being
+  that an agent gets the SAME key here as on search, and an empty index needs no
+  special-casing to be read as a genuine one.
   """
+
+  alias LoopctlWeb.Outcome
 
   @doc """
   Renders the HEAT index (#554).
@@ -22,17 +29,19 @@ defmodule LoopctlWeb.KnowledgeProgressiveJSON do
   def heat_index(%{results: results, meta: meta}) do
     %{
       data: Enum.map(results, &render_heat_stub/1),
-      meta: %{
-        top_k: meta.top_k,
-        returned: meta.returned,
-        unresolved: meta.unresolved,
-        truncated: meta.truncated,
-        char_budget: meta.char_budget,
-        chars: meta.chars,
-        heat_window: meta.heat_window,
-        counted_access_types: meta.counted_access_types,
-        drill: meta.drill
-      }
+      meta:
+        %{
+          top_k: meta.top_k,
+          returned: meta.returned,
+          unresolved: meta.unresolved,
+          truncated: meta.truncated,
+          char_budget: meta.char_budget,
+          chars: meta.chars,
+          heat_window: meta.heat_window,
+          counted_access_types: meta.counted_access_types,
+          drill: meta.drill
+        }
+        |> Outcome.put_for(results)
     }
   end
 
@@ -50,11 +59,13 @@ defmodule LoopctlWeb.KnowledgeProgressiveJSON do
   def index(%{stubs: stubs, meta: meta}) do
     %{
       data: Enum.map(stubs, &render_stub/1),
-      meta: %{
-        top_k: meta.top_k,
-        candidate_count: meta.candidate_count,
-        truncated: meta.truncated
-      }
+      meta:
+        %{
+          top_k: meta.top_k,
+          candidate_count: meta.candidate_count,
+          truncated: meta.truncated
+        }
+        |> Outcome.put_for(stubs)
     }
   end
 

@@ -527,14 +527,20 @@ defmodule Loopctl.Workers.ArticleLinkingWorker do
         on: ae.article_id == a.id and ae.tenant_id == ^tenant_id and ae.dim == ^dimension,
         where: a.tenant_id == ^tenant_id,
         where: a.id != ^article.id,
-        where: a.status == :published
+        where: a.status == :published,
+        # Count the pool the kNN actually searches. `VectorSearch.nearest/4` excludes
+        # suppressed articles unconditionally, so counting them here would drive the
+        # over-limit operator warning off a population no lookup can return.
+        where: is_nil(a.suppressed_at)
       )
     else
       from(a in Article,
         where: a.tenant_id == ^tenant_id,
         where: a.id != ^article.id,
         where: not is_nil(a.embedding),
-        where: a.status == :published
+        where: a.status == :published,
+        # Same pool as the side-table branch; the cutover flag must not change the count.
+        where: is_nil(a.suppressed_at)
       )
     end
   end
