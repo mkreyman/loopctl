@@ -1489,13 +1489,20 @@ defmodule Loopctl.Knowledge do
     # Deterministic ordering so offset/limit reaches every article exactly once.
     results =
       base
+      # The three tombstone columns are projected unconditionally so `suppressed=only` — the
+      # discovery path the whole undo story leans on — can render WHY and BY WHOM without an
+      # extra GET per row. They are null on nearly every article, so an ordinary browse pays
+      # almost nothing, and the JSON view still emits only the requested `fields`.
       |> select([a], %{
         id: a.id,
         title: a.title,
         category: a.category,
         tags: a.tags,
         status: a.status,
-        updated_at: a.updated_at
+        updated_at: a.updated_at,
+        suppressed_at: a.suppressed_at,
+        suppressed_by: a.suppressed_by,
+        suppression_reason: a.suppression_reason
       })
       |> order_by([a], asc: a.category, desc: a.updated_at, asc: a.id)
       |> limit(^limit)
@@ -1659,7 +1666,10 @@ defmodule Loopctl.Knowledge do
       tags: a.tags,
       status: a.status,
       updated_at: a.updated_at,
-      inserted_at: a.inserted_at
+      inserted_at: a.inserted_at,
+      suppressed_at: a.suppressed_at,
+      suppressed_by: a.suppressed_by,
+      suppression_reason: a.suppression_reason
     })
     |> order_by([a], asc: a.inserted_at, asc: a.id)
     |> limit(^limit)
@@ -2115,6 +2125,10 @@ defmodule Loopctl.Knowledge do
         end)
         # Visibility (#163): never surface a linked article the caller can't see.
         |> Enum.filter(&visible_to_caller?(&1, vis))
+        # A suppressed neighbour is not a neighbour a retrieval surface may name. The
+        # preload carries whole rows rather than a status-filtered query, so the predicate
+        # is applied in Elixir here rather than in the query above.
+        |> Enum.reject(&Suppression.suppressed?/1)
         |> Enum.uniq_by(& &1.id)
         |> Enum.take(5)
         |> Enum.map(fn article ->
@@ -4168,6 +4182,10 @@ defmodule Loopctl.Knowledge do
   # field before a transaction is opened. Trimmed here so trailing whitespace cannot satisfy
   # "non-blank", and length-checked here AND in `Article.suppression_changeset/2` AND at the
   # column, so a future writer that skips this function still cannot exceed the bound.
+  #
+  # Counted in CODEPOINTS, not graphemes: `varchar(n)` counts codepoints, so a
+  # grapheme-bounded check fails OPEN — 400 ZWJ emoji are 400 graphemes and 2000 codepoints,
+  # which clears every Elixir bound and then raises 22001 out of the transaction as a 500.
   defp normalize_suppression_reason(reason) when is_binary(reason) do
     trimmed = String.trim(reason)
     max = Article.max_suppression_reason_length()
@@ -4176,7 +4194,7 @@ defmodule Loopctl.Knowledge do
       trimmed == "" ->
         {:error, "reason must not be blank"}
 
-      String.length(trimmed) > max ->
+      codepoint_length(trimmed) > max ->
         {:error, "reason must be at most #{max} characters"}
 
       true ->
@@ -4285,8 +4303,17 @@ defmodule Loopctl.Knowledge do
   defp suppression_actor(opts) do
     label = Keyword.get(opts, :actor_label) || Keyword.get(opts, :actor_id) || "unknown"
 
-    label |> to_string() |> String.slice(0, Article.max_suppressed_by_length())
+    # Truncated in CODEPOINTS for the same reason the reason is bounded in them: the column
+    # is a varchar, and `String.slice/3` counts graphemes, so a multibyte label could slice
+    # to 200 graphemes and still overflow varchar(200).
+    label
+    |> to_string()
+    |> String.to_charlist()
+    |> Enum.take(Article.max_suppressed_by_length())
+    |> List.to_string()
   end
+
+  defp codepoint_length(binary), do: binary |> String.to_charlist() |> length()
 
   # Drafts are published in batches of this size; a request with more ids than
   # this is auto-chunked server-side rather than rejected.
@@ -5064,7 +5091,11 @@ defmodule Loopctl.Knowledge do
         select: a.id,
         limit: ^(@bulk_publish_max + 1)
       )
-      |> apply_article_filters(opts)
+      # A destructive SELECTOR, not a retrieval path: an operator archiving or deleting a
+      # whole tag must not be silently handed a short set because someone suppressed part
+      # of it. Suppression hides a row from READS; it does not exempt it from a bulk op the
+      # operator aimed at its tag.
+      |> apply_article_filters(Keyword.put(opts, :suppressed, :include))
       |> AdminRepo.all()
 
     if length(ids) > @bulk_publish_max, do: {:error, :too_many}, else: {:ok, ids}
@@ -7377,11 +7408,18 @@ defmodule Loopctl.Knowledge do
     # Bidirectional recursive walk with a path-array cycle guard and per-node neighbor cap
     # to bound fan-out, capped at @max_graph_nodes. Raw SQL because Ecto has no native
     # recursive-CTE builder. LATERAL limits neighbors per node to prevent unbounded explosion.
+    #
+    # `a.suppressed_at IS NULL` is on BOTH arms, not left to the hydration in
+    # fetch_graph_nodes/3: filtering after the walk still lets suppressed rows spend the
+    # $4 node budget and the per-node $5 cap, so a hub with many suppressed neighbours comes
+    # back near-empty and `truncated: true` while live neighbours exist. It is also a
+    # traversal gate — bridging THROUGH a suppressed article is a retrieval path into it.
     node_sql = """
     WITH RECURSIVE graph AS (
       SELECT a.id AS node_id, ARRAY[a.id] AS path, 0 AS depth
       FROM articles a
-      WHERE a.id = $1 AND a.tenant_id = $2 AND a.status = 'published'#{vis_clause}
+      WHERE a.id = $1 AND a.tenant_id = $2 AND a.status = 'published'
+        AND a.suppressed_at IS NULL#{vis_clause}
 
       UNION ALL
 
@@ -7401,7 +7439,8 @@ defmodule Loopctl.Knowledge do
       ) l ON true
       JOIN articles a ON a.id = CASE WHEN l.source_article_id = g.node_id
                                      THEN l.target_article_id ELSE l.source_article_id END
-        AND a.tenant_id = $2 AND a.status = 'published'#{vis_clause}
+        AND a.tenant_id = $2 AND a.status = 'published'
+        AND a.suppressed_at IS NULL#{vis_clause}
       WHERE g.depth < $3
         AND NOT (CASE WHEN l.source_article_id = g.node_id
                       THEN l.target_article_id ELSE l.source_article_id END = ANY(g.path))
@@ -7719,9 +7758,11 @@ defmodule Loopctl.Knowledge do
 
   # Bridge filter: keep only pairs connected within ≤2 hops in the link graph —
   # directly linked, or sharing a common neighbor (the #149 "bridgeable" notion).
-  # The shared neighbor must be a distinct *published* article, consistent with
-  # random_walk's published-only neighbors — a pair doesn't bridge through an
-  # archived/draft middle. All node/link references are tenant-scoped.
+  # The shared neighbor must be a distinct *published*, non-suppressed article, consistent
+  # with random_walk's neighbors — a pair doesn't bridge through an archived/draft middle,
+  # and it doesn't bridge through one a caller asked the system to forget either: the
+  # suggestion would then be computed from a row no read path returns. All node/link
+  # references are tenant-scoped.
   defp maybe_filter_bridge_path(query, false, _vis), do: query
 
   # Higher roles (vis nil): bridge through any published middle node.
@@ -7738,7 +7779,7 @@ defmodule Loopctl.Knowledge do
         a.id
       ) or
         fragment(
-          "EXISTS (SELECT 1 FROM articles m JOIN article_links la ON la.tenant_id = ? AND ((la.source_article_id = ? AND la.target_article_id = m.id) OR (la.target_article_id = ? AND la.source_article_id = m.id)) JOIN article_links lb ON lb.tenant_id = ? AND ((lb.source_article_id = ? AND lb.target_article_id = m.id) OR (lb.target_article_id = ? AND lb.source_article_id = m.id)) WHERE m.tenant_id = ? AND m.status = 'published' AND m.id <> ? AND m.id <> ?)",
+          "EXISTS (SELECT 1 FROM articles m JOIN article_links la ON la.tenant_id = ? AND ((la.source_article_id = ? AND la.target_article_id = m.id) OR (la.target_article_id = ? AND la.source_article_id = m.id)) JOIN article_links lb ON lb.tenant_id = ? AND ((lb.source_article_id = ? AND lb.target_article_id = m.id) OR (lb.target_article_id = ? AND lb.source_article_id = m.id)) WHERE m.tenant_id = ? AND m.status = 'published' AND m.suppressed_at IS NULL AND m.id <> ? AND m.id <> ?)",
           a.tenant_id,
           a.id,
           a.id,
@@ -7767,7 +7808,7 @@ defmodule Loopctl.Knowledge do
         a.id
       ) or
         fragment(
-          "EXISTS (SELECT 1 FROM articles m JOIN article_links la ON la.tenant_id = ? AND ((la.source_article_id = ? AND la.target_article_id = m.id) OR (la.target_article_id = ? AND la.source_article_id = m.id)) JOIN article_links lb ON lb.tenant_id = ? AND ((lb.source_article_id = ? AND lb.target_article_id = m.id) OR (lb.target_article_id = ? AND lb.source_article_id = m.id)) WHERE m.tenant_id = ? AND m.status = 'published' AND (COALESCE(m.metadata->>'visibility', 'shared') NOT IN ('private','owner') OR m.metadata->>'agent_id' = ?) AND m.id <> ? AND m.id <> ?)",
+          "EXISTS (SELECT 1 FROM articles m JOIN article_links la ON la.tenant_id = ? AND ((la.source_article_id = ? AND la.target_article_id = m.id) OR (la.target_article_id = ? AND la.source_article_id = m.id)) JOIN article_links lb ON lb.tenant_id = ? AND ((lb.source_article_id = ? AND lb.target_article_id = m.id) OR (lb.target_article_id = ? AND lb.source_article_id = m.id)) WHERE m.tenant_id = ? AND m.status = 'published' AND m.suppressed_at IS NULL AND (COALESCE(m.metadata->>'visibility', 'shared') NOT IN ('private','owner') OR m.metadata->>'agent_id' = ?) AND m.id <> ? AND m.id <> ?)",
           a.tenant_id,
           a.id,
           a.id,
@@ -8390,8 +8431,16 @@ defmodule Loopctl.Knowledge do
     end
   end
 
+  # The shared filter chain for list_articles/2, count_articles/2, tag_facets/2 and
+  # list_archivable_ids/2. Its status is PARAMETRIZED, so the drift guard's literal
+  # `.status == :published` scan cannot see it — this is the third such retrieval path and
+  # it is pinned by its own named assertion in suppression_guard_test.exs. Suppressed rows
+  # are excluded by DEFAULT here: GET /api/v1/articles enumerates the same corpus as
+  # GET /knowledge/index, and two enumerations of one corpus must not disagree about what
+  # is in it. A caller that needs them passes `suppressed: :include`.
   defp apply_article_filters(query, opts) do
     query
+    |> Suppression.filter(Keyword.get(opts, :suppressed, :exclude))
     |> maybe_filter_by_project_id(Keyword.get(opts, :project_id))
     |> maybe_filter_by_category(Keyword.get(opts, :category))
     |> maybe_filter_by_status(Keyword.get(opts, :status))

@@ -433,12 +433,20 @@ defmodule Loopctl.Knowledge.StructuralLinks do
     )
   end
 
+  # A SUPPRESSED article is not adoptable. Adoption is a different population from
+  # minted_hub/2 — it keys off the `hub` TAG, so the agent-authored hubs it finds carry no
+  # idempotency_key and the two lookups do NOT return the same row. Adopting a suppressed
+  # one would centre the source group's navigational star on an article no read path
+  # returns, and would suppress minting the replacement that would have fixed it. Skipping
+  # it here mints a fresh hub instead, which is the same answer as if the suppressed one
+  # had never been written.
   defp existing_source_hub(tenant_id, source) do
     HeavyRead.one(
       tenant_id,
       from(a in Article,
         where: a.tenant_id == ^tenant_id,
         where: a.status == :published,
+        where: is_nil(a.suppressed_at),
         where: ^source in a.tags,
         where: "hub" in a.tags,
         order_by: [asc: a.inserted_at, asc: a.id],

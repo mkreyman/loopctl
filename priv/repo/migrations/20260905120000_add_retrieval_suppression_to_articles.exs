@@ -5,19 +5,12 @@ defmodule Loopctl.Repo.Migrations.AddRetrievalSuppressionToArticles do
 
   ## Why a new marker rather than an existing status
 
-  `:archived` is TERMINAL — `Loopctl.Knowledge.Article`'s `@valid_transitions` carries no
-  `{:archived, _}` entry and there is no unarchive function, so the only way back is a
-  `user+` PATCH with an explicit status (#605/#606). Nothing is destroyed and the act is
-  audited, which is what earns it agent role; nothing AUTOMATED restores it, which is a
-  different property and the one an unattended writer depends on. That is why the nightly
-  consolidation pass had to reach for `unpublish` as a stand-in when it retracts a confirmed
-  duplicate (#608) — `unpublish` is undoable, but it means "this is a draft", which is a
-  claim about the article's editorial state rather than about its retrievability.
-
-  Suppression is the missing primitive: it says nothing about status and everything about
-  retrieval. A suppressed article keeps its status, its embedding, its links and its body;
-  it is excluded from every ranked/retrieval surface and stays resolvable by id so the
-  suppression is inspectable and undoable.
+  `:archived` is TERMINAL (#605/#606) and `unpublish` claims the article is a DRAFT, which is
+  an editorial statement rather than a retrieval one — so neither says what an unattended
+  writer needs to say. Suppression says nothing about status and everything about retrieval:
+  the article keeps its status, embedding, links and body, leaves every ranked surface, and
+  stays resolvable by id so the act is inspectable and undoable. Full reasoning, and the
+  read paths it binds, live in `Loopctl.Knowledge.Suppression`.
 
   ## The three columns
 
@@ -56,32 +49,56 @@ defmodule Loopctl.Repo.Migrations.AddRetrievalSuppressionToArticles do
   commoner `IS NULL` half: that predicate matches nearly every row, so an index on it would
   be corpus-sized and no planner would choose it over the existing scans.
 
+  Built CONCURRENTLY, the convention 20260827121000 set for this exact table: a plain
+  `CREATE INDEX` SHARE-locks `articles` and blocks every write for the build. That costs the
+  two `@disable_*` attributes, so the ALTER and the CREATE are separate transactions and both
+  are written convergently — and `IF NOT EXISTS` alone is not enough, since an interrupted
+  concurrent build leaves an INVALID index that satisfies it, which is what `stale?/0` drops.
+
   All three columns are nullable with no default, so the ALTER is catalog-only on PG11+ —
   no table rewrite on a corpus of ~86k articles.
   """
 
   use Ecto.Migration
 
+  @disable_ddl_transaction true
+  @disable_migration_lock true
+
+  @name "articles_tenant_suppressed_idx"
+
+  @create "CREATE INDEX CONCURRENTLY IF NOT EXISTS articles_tenant_suppressed_idx " <>
+            "ON articles (tenant_id, suppressed_at) WHERE suppressed_at IS NOT NULL"
+
   def up do
     alter table(:articles) do
-      add :suppressed_at, :utc_datetime_usec
-      add :suppressed_by, :string, size: 200
-      add :suppression_reason, :string, size: 500
+      add_if_not_exists :suppressed_at, :utc_datetime_usec
+      add_if_not_exists :suppressed_by, :string, size: 200
+      add_if_not_exists :suppression_reason, :string, size: 500
     end
 
-    create index(:articles, [:tenant_id, :suppressed_at],
-             where: "suppressed_at IS NOT NULL",
-             name: :articles_tenant_suppressed_idx
-           )
+    if stale?(), do: execute("DROP INDEX CONCURRENTLY IF EXISTS #{@name}")
+    execute(@create)
   end
 
   def down do
-    drop index(:articles, [:tenant_id, :suppressed_at], name: :articles_tenant_suppressed_idx)
+    execute("DROP INDEX CONCURRENTLY IF EXISTS #{@name}")
 
     alter table(:articles) do
-      remove :suppression_reason
-      remove :suppressed_by
-      remove :suppressed_at
+      remove_if_exists :suppression_reason, :string
+      remove_if_exists :suppressed_by, :string
+      remove_if_exists :suppressed_at, :utc_datetime_usec
+    end
+  end
+
+  # Stale = INVALID or ambiguous. Absent is NOT stale: the CREATE lays it down.
+  @stale_sql "SELECT x.indisvalid FROM pg_class c JOIN pg_index x ON x.indexrelid = c.oid " <>
+               "JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relname = $1 " <>
+               "AND c.relkind = 'i' AND n.nspname = 'public'"
+
+  defp stale? do
+    case repo().query!(@stale_sql, [@name]).rows do
+      [[true]] -> false
+      rows -> rows != []
     end
   end
 end

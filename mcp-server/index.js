@@ -4374,10 +4374,21 @@ const TOOLS = [
           type: "array",
           items: {
             type: "string",
-            enum: ["id", "title", "category", "tags", "status", "updated_at"],
+            enum: [
+              "id",
+              "title",
+              "category",
+              "tags",
+              "status",
+              "updated_at",
+              "suppressed_at",
+              "suppressed_by",
+              "suppression_reason",
+            ],
           },
           description:
-            "Optional: projection of article fields to return. Default: id, title, category. `id` is always included.",
+            "Optional: projection of article fields to return. Default: id, title, category. `id` is always included. " +
+            "Pair suppressed='only' with fields=suppressed_by,suppression_reason to see who suppressed what and why without a per-row read.",
         },
       },
       required: [],

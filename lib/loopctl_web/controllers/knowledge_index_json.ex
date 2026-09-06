@@ -89,4 +89,7 @@ defmodule LoopctlWeb.KnowledgeIndexJSON do
   defp field_value(article, "tags"), do: article.tags
   defp field_value(article, "status"), do: to_string(article.status)
   defp field_value(article, "updated_at"), do: article.updated_at
+  defp field_value(article, "suppressed_at"), do: article.suppressed_at
+  defp field_value(article, "suppressed_by"), do: article.suppressed_by
+  defp field_value(article, "suppression_reason"), do: article.suppression_reason
 end

@@ -80,6 +80,37 @@ defmodule LoopctlWeb.ArticleSuppressionControllerTest do
       assert AdminRepo.get!(Article, article.id).suppressed_at == nil
     end
 
+    test "a multibyte reason over the COLUMN bound is a 422, not a 500", %{conn: conn} do
+      # 400 decomposed graphemes = 800 codepoints. varchar(500) counts codepoints, so a
+      # grapheme-based length check clears every Elixir bound and lets Postgres raise 22001
+      # out of the transaction — a 500 on a caller mistake the contract answers with a 422.
+      {_tenant, raw_key, article} = setup_tenant(:agent)
+      reason = String.duplicate("e" <> <<0x0301::utf8>>, 400)
+
+      assert String.length(reason) < 500
+
+      conn
+      |> auth_conn(raw_key)
+      |> post(~p"/api/v1/articles/#{article.id}/suppress", %{"reason" => reason})
+      |> json_response(422)
+
+      assert AdminRepo.get!(Article, article.id).suppressed_at == nil
+    end
+
+    test "a multibyte actor label does not overflow its column", %{conn: conn} do
+      # The label is server-derived and sliced to the column bound; slicing in GRAPHEMES
+      # could keep more codepoints than varchar(200) holds.
+      {_tenant, raw_key, article} = setup_tenant(:agent)
+
+      conn
+      |> auth_conn(raw_key)
+      |> post(~p"/api/v1/articles/#{article.id}/suppress", %{"reason" => "held"})
+      |> json_response(200)
+
+      by = AdminRepo.get!(Article, article.id).suppressed_by
+      assert length(String.to_charlist(by)) <= 200
+    end
+
     test "returns 404 for another tenant's article", %{conn: conn} do
       {_tenant, raw_key, _article} = setup_tenant(:agent)
       other = fixture(:tenant)

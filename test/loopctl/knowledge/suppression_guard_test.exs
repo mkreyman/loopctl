@@ -13,9 +13,9 @@ defmodule Loopctl.Knowledge.SuppressionGuardTest do
 
   It matches the LITERAL `<binding>.status == :published` form, which is how a new read path
   is written. It is BLIND to a parametrized status (`a.status == ^status`,
-  `maybe_filter_by_status/2`), so the two retrieval paths that take their status from the
-  caller are pinned by their own named assertions below rather than by the scan. It is also
-  blind to a filter site introduced through a macro. Read "do not relax this test" as "this
+  `maybe_filter_by_status/2`) and to raw SQL, so the paths that take their status from the
+  caller or spell it as a string are pinned by their own named assertions below rather than
+  by the scan. It is also blind to a filter site introduced through a macro. Read "do not relax this test" as "this
   floor is lower than it looks — raise it, never lower it".
 
   The scan itself is asserted NON-EMPTY and above a floor, because a classifier that matches
@@ -64,6 +64,15 @@ defmodule Loopctl.Knowledge.SuppressionGuardTest do
   end
 
   describe "coverage" do
+    test "coverage is judged on code — not on a comment, and not on filter(_, :include)" do
+      # A deleted predicate whose explanation survives must NOT keep the guard green, and
+      # `:include` RETURNS suppressed rows, so a call that hardcodes it is not coverage.
+      refute covered?("  # Suppression.exclude/1 belongs here; is_nil(a.suppressed_at) went.")
+      refute covered?("Suppression.filter(query, :include)")
+      assert covered?("|> Suppression.exclude()")
+      assert covered?("Suppression.filter(base, Keyword.get(opts, :suppressed, :exclude))")
+    end
+
     test "every published-status filter site either applies the predicate or is exempt" do
       uncovered =
         sites_by_key()
@@ -144,6 +153,29 @@ defmodule Loopctl.Knowledge.SuppressionGuardTest do
                "converge. Without the predicate here, every one of them leaks."
     end
 
+    test "the shared article-filter chain applies the predicate" do
+      body = function_body!("lib/loopctl/knowledge.ex", "apply_article_filters")
+
+      assert covered?(body),
+             "apply_article_filters/2 is the enumeration chain behind GET /api/v1/articles, " <>
+               "count_articles/2 and tag_facets/2. Without the predicate here that endpoint " <>
+               "disagrees with GET /knowledge/index about what is in the corpus."
+    end
+
+    test "the raw-SQL graph traversal and bridge filter carry the predicate" do
+      # Comments stripped for the same reason covered?/1 strips them: the paragraph
+      # explaining the predicate sits above it and would count as one of the two.
+      source = strip_comment_lines(File.read!("lib/loopctl/knowledge.ex"))
+
+      assert length(Regex.scan(~r/a\.suppressed_at IS NULL/, source)) >= 2,
+             "the recursive graph CTE must carry the predicate on BOTH arms — filtering " <>
+               "only at hydration lets suppressed rows spend the node budget."
+
+      assert length(Regex.scan(~r/m\.suppressed_at IS NULL/, source)) >= 2,
+             "both bridge fragments must exclude a suppressed middle node, or a pair is " <>
+               "reported bridgeable through an article the tenant asked us to forget."
+    end
+
     test "the RRF graph lane hydrates through the predicate" do
       body = function_body!("lib/loopctl/knowledge.ex", "fetch_graph_lane_articles")
 
@@ -155,7 +187,22 @@ defmodule Loopctl.Knowledge.SuppressionGuardTest do
 
   # --- the scanner ---
 
-  defp covered?(body), do: Enum.any?(Suppression.predicate_markers(), &Regex.match?(&1, body))
+  # Coverage is judged on CODE, never on prose. `body_has_filter_site?/1` already refuses to
+  # DETECT a site on a comment line; judging coverage on raw source was the other half of the
+  # same mistake, and it is the half that fails open — a predicate deleted while the comment
+  # explaining it survives would keep reporting the site as covered while the leak shipped.
+  defp covered?(body) do
+    code = strip_comment_lines(body)
+
+    Enum.any?(Suppression.predicate_markers(), &Regex.match?(&1, code))
+  end
+
+  defp strip_comment_lines(body) do
+    body
+    |> String.split("\n")
+    |> Enum.reject(&Regex.match?(~r/^\s*#/, &1))
+    |> Enum.join("\n")
+  end
 
   defp sites_by_key do
     scan_sites()

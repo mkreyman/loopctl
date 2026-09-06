@@ -24,6 +24,8 @@ defmodule Loopctl.Knowledge.SuppressionTest do
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.OKF
+  alias Loopctl.Knowledge.StreamingExport.OKFFormat
+  alias Loopctl.StreamingExportHelper
 
   setup :verify_on_exit!
 
@@ -383,6 +385,65 @@ defmodule Loopctl.Knowledge.SuppressionTest do
       refute MapSet.member?(ids(nodes), gone.id)
     end
 
+    test "the traversal itself skips it, not just the hydration", ctx do
+      %{tenant: tenant, kept: kept, gone: gone} = ctx
+      # The traversal is raw SQL, invisible to the drift guard's scan. Filtering only at
+      # hydration would still let a suppressed node reach a neighbour BEYOND it.
+      beyond = published(tenant.id, %{title: "Widget calibration beyond"})
+
+      for {src, tgt} <- [{kept.id, gone.id}, {gone.id, beyond.id}] do
+        fixture(:article_link, %{
+          tenant_id: tenant.id,
+          source_article_id: src,
+          target_article_id: tgt,
+          relationship_type: :relates_to
+        })
+      end
+
+      {:ok, %{nodes: nodes}} = Knowledge.graph_traversal(tenant.id, kept.id, depth: 3)
+
+      refute MapSet.member?(ids(nodes), gone.id)
+
+      refute MapSet.member?(ids(nodes), beyond.id),
+             "the traversal bridged THROUGH a suppressed node — the predicate is missing " <>
+               "from the recursive CTE, not just from the hydration."
+    end
+
+    test "the article enumeration endpoint, which parametrizes its status", ctx do
+      %{tenant: tenant, kept: kept, gone: gone} = ctx
+      # GET /api/v1/articles enumerates the same corpus as GET /knowledge/index; two
+      # enumerations of one corpus must not disagree about what is in it.
+      %{data: listed} = Knowledge.list_articles(tenant.id, limit: 100)
+
+      assert MapSet.member?(ids(listed), kept.id)
+      refute MapSet.member?(ids(listed), gone.id)
+
+      assert Knowledge.count_articles(tenant.id) ==
+               Knowledge.count_articles(tenant.id, suppressed: :include) - 1
+    end
+
+    test "a suppressed neighbour is not named in a context result's linked_articles", ctx do
+      %{tenant: tenant, kept: kept, gone: gone} = ctx
+
+      fixture(:article_link, %{
+        tenant_id: tenant.id,
+        source_article_id: kept.id,
+        target_article_id: gone.id,
+        relationship_type: :relates_to
+      })
+
+      {:ok, %{results: results}} = Knowledge.get_context(tenant.id, "widget calibration")
+
+      linked =
+        results
+        |> Enum.flat_map(&Map.get(&1, :linked_articles, []))
+        |> MapSet.new(& &1.id)
+
+      refute MapSet.member?(linked, gone.id),
+             "the id and title of a suppressed article leaked through a neighbour's " <>
+               "linked_articles."
+    end
+
     test "suggest_links refuses a suppressed anchor", %{tenant: tenant, gone: gone} do
       assert {:error, :not_found} = Knowledge.suggest_links(tenant.id, gone.id)
     end
@@ -467,6 +528,26 @@ defmodule Loopctl.Knowledge.SuppressionTest do
       # had ever taken it out of retrieval.
       assert {_path, contents} = concept
       assert contents =~ "loopctl_suppressed_at"
+      assert contents =~ "loopctl_suppression_reason"
+      assert contents =~ "retention figure is wrong"
+    end
+
+    test "the STREAMED .tar.gz carries the same tombstone as the buffered bundle" do
+      # The streamed path is the DEFAULT export and builds rows from an explicit projection,
+      # not from %Article{}. A column missing from that select makes
+      # OKF.suppression_frontmatter/1 hit its catch-all and emit nothing — silently.
+      tenant = fixture(:tenant)
+      article = published(tenant.id, %{title: "Streamed while suppressed"})
+      suppress!(tenant.id, article, reason: "retention figure is wrong")
+
+      {:ok, targz} = StreamingExportHelper.to_targz_binary(tenant.id, OKFFormat)
+      {:ok, files} = StreamingExportHelper.extract(targz)
+
+      {_path, contents} =
+        Enum.find(files, fn {path, _body} -> path =~ "streamed-while-suppressed" end)
+
+      assert contents =~ "loopctl_suppressed_at"
+      assert contents =~ "loopctl_suppressed_by"
       assert contents =~ "loopctl_suppression_reason"
       assert contents =~ "retention figure is wrong"
     end

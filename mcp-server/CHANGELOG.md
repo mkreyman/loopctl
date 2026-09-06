@@ -32,6 +32,11 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   log. Agent role and visibility-scoped, like `knowledge_archive`: another agent's
   private/owner memory is a 404.
 
+  `knowledge_index` gains `suppressed_at`, `suppressed_by` and `suppression_reason` as
+  projectable `fields`, so `suppressed: "only"` answers who suppressed what and why in one
+  call instead of a `knowledge_get` per row. `knowledge_list` now excludes suppressed
+  articles by default, matching `knowledge_index`.
+
 ## 2.78.0 — 2026-08-28 (the corpus tier becomes reachable from an agent)
 
 ### Added

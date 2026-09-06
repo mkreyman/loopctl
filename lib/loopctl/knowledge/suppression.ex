@@ -36,11 +36,12 @@ defmodule Loopctl.Knowledge.Suppression do
 
   It matches the LITERAL `<binding>.status == :published` form, because that is the form a
   new read path is written in. It is blind to a PARAMETRIZED status (`a.status == ^status`,
-  `maybe_filter_by_status/2`), so the two retrieval paths that take their status from the
-  caller — `Loopctl.Knowledge.VectorSearch`'s two ANN branches, and the RRF graph lane's
-  hydration in `Loopctl.Knowledge` — are pinned by their own named assertions in that same
-  test rather than by the scan. If you add a third parametrized-status retrieval path, add
-  the assertion; the scan will not catch it for you.
+  `maybe_filter_by_status/2`) and to raw SQL, so the paths that take their status from the
+  caller or write it as a string — `Loopctl.Knowledge.VectorSearch`'s two ANN branches, the
+  RRF graph lane's hydration, `apply_search_filters/3`, `apply_article_filters/2`, and the
+  recursive graph CTE and bridge fragments — are pinned by their own named assertions in
+  that same test rather than by the scan. If you add another one, add the assertion with
+  it; the scan will not catch it for you.
 
   ## Binding position
 
@@ -123,12 +124,22 @@ defmodule Loopctl.Knowledge.Suppression do
   write the predicate against `src`, `tgt`, `n`, `o` or `a2`, and a marker list that named
   bindings one by one would go stale the first time someone renamed one — silently, by
   reporting a covered site as uncovered and inviting the next person to exempt it.
+
+  `filter/2` counts only when the mode is not the LITERAL `:include`: that arm returns
+  suppressed rows, so matching it would let a call that deliberately opens the surface back
+  up read as coverage. A mode read from an opt still counts, because `:exclude` is its
+  default and a caller-supplied mode is the point of the surfaces that take one.
+
+  These are matched against source with COMMENT LINES STRIPPED. This feature's explanations
+  are written as `#` comments right next to the predicates, so a substring match over raw
+  source would let a site be covered by its own prose — the failure loopctl has shipped once
+  already, and the reason `body_has_filter_site?/1` strips comments on the detection side too.
   """
   @spec predicate_markers() :: [Regex.t()]
   def predicate_markers do
     [
       ~r/Suppression\.exclude/,
-      ~r/Suppression\.filter/,
+      ~r/Suppression\.filter\((?![^()]*:include[^()]*\))/,
       ~r/is_nil\([a-z_][a-zA-Z0-9_]*\.suppressed_at\)/,
       ~r/suppressed_at IS NULL/
     ]
@@ -198,14 +209,6 @@ defmodule Loopctl.Knowledge.Suppression do
       "lib/loopctl/knowledge/analytics.ex:list_unused_articles" =>
         "maintenance — a corpus MEASUREMENT, not a read path. Excluding suppressed rows " <>
           "would hide them from the operator report that explains why reads dropped.",
-      "lib/loopctl/knowledge/structural_links.ex:existing_source_hub" =>
-        "maintenance — a hub-REUSE lookup on a write path, and it changes nothing: " <>
-          "minted_hub/2 already resolves the same hub by idempotency_key BEFORE this " <>
-          "runs (structural_links.ex, the case at line 329 precedes the one at 337), and " <>
-          "on a miss create_hub/4 resolves it again through create_article/3's " <>
-          "{:ok, :deduplicated, hub} shape. Adding the predicate would cost a query and " <>
-          "return the same row. The hub's MEMBERS are excluded, in fetch_page/4.",
-
       # --- system-scope ---
       "lib/loopctl/knowledge.ex:list_system_articles" =>
         "system-scope — system canonicals have a NULL tenant_id, and suppress_article/3 is " <>

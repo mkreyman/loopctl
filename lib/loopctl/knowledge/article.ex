@@ -168,10 +168,13 @@ defmodule Loopctl.Knowledge.Article do
 
   @max_idempotency_key_length 255
 
-  # Bounds on the retrieval tombstone's two descriptive fields. Mirrored by the columns'
-  # varchar sizes (migration 20260905120000) so the changeset 422 and the DB bound cannot
-  # drift; 500 matches `Loopctl.Knowledge.KbCuration`'s `@max_summary`, since the same
-  # sentence lands in both places.
+  # Bounds on the retrieval tombstone's two descriptive fields, counted in CODEPOINTS —
+  # the unit `varchar(n)` enforces. Graphemes are the wrong unit here and fail OPEN: one
+  # ZWJ emoji or an NFD accent is several codepoints, so a grapheme-bounded reason clears
+  # every Elixir check and then takes a 22001 out of Postgres as a 500 instead of a 422.
+  # Mirrored by the columns' varchar sizes (migration 20260905120000) so the changeset 422
+  # and the DB bound cannot drift; 500 matches `Loopctl.Knowledge.KbCuration`'s
+  # `@max_summary`, since the same sentence lands in both places.
   @max_suppression_reason_length 500
   @max_suppressed_by_length 200
 
@@ -538,6 +541,7 @@ defmodule Loopctl.Knowledge.Article do
 
   Lengths are validated here AND bounded at the column (varchar 200 / 500): the changeset
   gives a caller a 422 naming the field, the column is what holds if a future writer forgets.
+  Both counts are in CODEPOINTS, the unit `varchar(n)` enforces — see `@max_suppression_reason_length`.
 
   ## Returns
 
@@ -555,15 +559,18 @@ defmodule Loopctl.Knowledge.Article do
       suppressed_by: Map.get(attrs, :suppressed_by),
       suppression_reason: Map.get(attrs, :suppression_reason)
     })
-    |> validate_length(:suppressed_by, max: @max_suppressed_by_length)
-    |> validate_length(:suppression_reason, max: @max_suppression_reason_length)
+    |> validate_length(:suppressed_by, max: @max_suppressed_by_length, count: :codepoints)
+    |> validate_length(:suppression_reason,
+      max: @max_suppression_reason_length,
+      count: :codepoints
+    )
   end
 
-  @doc "Max bytes of a `suppression_reason`, mirrored by the column's varchar bound."
+  @doc "Max CODEPOINTS of a `suppression_reason`, the unit the column's varchar bound counts."
   @spec max_suppression_reason_length() :: pos_integer()
   def max_suppression_reason_length, do: @max_suppression_reason_length
 
-  @doc "Max bytes of a `suppressed_by` actor label, mirrored by the column's varchar bound."
+  @doc "Max CODEPOINTS of a `suppressed_by` actor label, the unit the column's varchar counts."
   @spec max_suppressed_by_length() :: pos_integer()
   def max_suppressed_by_length, do: @max_suppressed_by_length
 

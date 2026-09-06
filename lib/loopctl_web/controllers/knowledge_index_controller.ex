@@ -41,7 +41,7 @@ defmodule LoopctlWeb.KnowledgeIndexController do
   #   3. the MCP `knowledge_index` tool's `fields` enum in mcp-server/index.js —
   #      a SEPARATELY-RELEASED npm package with no compile-time coupling here, so
   #      an added field must be shipped to both.
-  @valid_fields ~w(id title category tags status updated_at)
+  @valid_fields ~w(id title category tags status updated_at suppressed_at suppressed_by suppression_reason)
   @default_fields ~w(id title category)
 
   operation(:index,

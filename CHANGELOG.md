@@ -33,7 +33,8 @@ All notable changes to loopctl are documented here.
 
   **Migration `20260905120000_add_retrieval_suppression_to_articles`** adds three nullable
   columns (`suppressed_at`, `suppressed_by` varchar 200, `suppression_reason` varchar 500)
-  and one partial index. All three are nullable with no default, so the ALTER is
+  and one partial index, built CONCURRENTLY (`@disable_ddl_transaction`) so it cannot block
+  writes to `articles`. All three columns are nullable with no default, so the ALTER is
   catalog-only on PG11+ — no table rewrite, no manual step, no downtime. RLS is unchanged:
   `articles` already has row-level security enabled and the policy is on the ROW, so the new
   columns inherit it.
@@ -44,6 +45,11 @@ All notable changes to loopctl are documented here.
   frontmatter. IMPORT does not restore the tombstone, for the same reason it does not
   restore `loopctl_status`: every imported concept is created as a draft, and a bundle is
   advisory about lifecycle.
+
+  **Discovery:** `GET /api/v1/knowledge/index?suppressed=only` lists what there is to undo,
+  and `suppressed_at`/`suppressed_by`/`suppression_reason` are now projectable `fields` there,
+  so an operator sees who suppressed what and why without a read per row. `GET
+  /api/v1/articles` excludes suppressed articles by default, matching that index.
 
   MCP tools: `knowledge_suppress`, `knowledge_unsuppress`.
 
