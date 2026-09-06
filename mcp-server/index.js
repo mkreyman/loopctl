@@ -5143,11 +5143,15 @@ const TOOLS = [
       "existing article with the same title AND an identical body (ignoring surrounding whitespace), the " +
       "server returns that existing article idempotently (HTTP 200) instead of a 422. A same-title create " +
       "with a DIFFERENT body returns 409 title_conflict — do not retry; choose a different title or PATCH " +
-      "the existing article. CONTENT DRIFT: a `deduplicated: true` response may carry " +
-      "`content_drift: true` / `title_drift: true`, meaning the payload you just sent DIFFERS from the " +
-      "stored article and was DISCARDED — act on it: if the new content is the intended one, apply it " +
-      "with knowledge_update on the returned `data.id`, because re-sending this create will keep being " +
-      "a no-op.",
+      "the existing article. CONTENT DRIFT: every `deduplicated: true` response carries " +
+      "`content_drift` / `title_drift`; true means the payload you just sent DIFFERS from the stored " +
+      "article and was DISCARDED. Which SIDE moved is not decidable from your end — you may have " +
+      "edited, or the stored article may have been curated by someone else or machine-retitled since " +
+      "your last capture — so READ the stored article first (knowledge_get on the returned " +
+      "`data.id`). Only if your version is still the intended one, apply it with knowledge_update, " +
+      "because re-sending this create will keep being a no-op. Sending `body` as null or a non-string " +
+      "also reports content_drift: the dedup short-circuits before validation, so that is how a broken " +
+      "extraction surfaces instead of reading as in-sync.",
     inputSchema: {
       type: "object",
       properties: {
@@ -5208,7 +5212,8 @@ const TOOLS = [
             "with the same key is a no-op that returns a reference to the existing article " +
             "(deduplicated; id only, not its body) instead of a partial duplicate — a changed " +
             "body is NOT applied and NOT refused, but IS reported as content_drift so a " +
-            "re-running sourcer keeps working while a genuine edit is not lost silently. Use a " +
+            "re-running sourcer keeps working while a genuine edit is not lost silently (read the " +
+            "stored article before overwriting it — the other side may have moved). Use a " +
             "HIGH-ENTROPY value (e.g. a content hash) — it is a per-tenant lookup key, not a " +
             "secret, so a guessable key lets another agent in your tenant probe which keys " +
             "exist. Distinct from source_type/source_id (which mark a shared source).",

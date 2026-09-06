@@ -393,7 +393,7 @@ defmodule Loopctl.KnowledgeTest do
                })
     end
 
-    test "an absent or non-binary incoming value is never reported as drift" do
+    test "an ABSENT key is never reported as drift" do
       %{tenant: tenant} = setup_tenant()
 
       assert {:ok, article} =
@@ -409,8 +409,70 @@ defmodule Loopctl.KnowledgeTest do
       assert %{content_drift: false, title_drift: false} =
                Knowledge.dedup_drift(article, %{"idempotency_key" => "k"})
 
+      # Absent on the ATOM-keyed side too, so a non-HTTP caller reads the same answer.
       assert %{content_drift: false, title_drift: false} =
-               Knowledge.dedup_drift(article, %{"title" => 42, "body" => nil})
+               Knowledge.dedup_drift(article, %{idempotency_key: "k"})
+    end
+
+    test "a key that is PRESENT but not a string is drift, not 'in sync'" do
+      %{tenant: tenant} = setup_tenant()
+
+      assert {:ok, article} =
+               Knowledge.create_article(tenant.id, %{
+                 title: "Drift Broken Extraction",
+                 body: "body",
+                 category: :reference
+               })
+
+      # `"body" => nil` is what a sourcer sends when its extraction breaks. The
+      # idempotency fast path short-circuits BEFORE Article.create_changeset/2, so this
+      # payload never sees the 422 it would have taken on first capture — answering it
+      # `content_drift: false` told a broken writer its text matched what is stored.
+      assert %{content_drift: true, title_drift: false} =
+               Knowledge.dedup_drift(article, %{
+                 "title" => "Drift Broken Extraction",
+                 "body" => nil
+               })
+
+      assert %{content_drift: true, title_drift: true} =
+               Knowledge.dedup_drift(article, %{"title" => 42, "body" => %{"oops" => true}})
+
+      # ABSENT and PRESENT-but-nil are the distinction, so they must not agree.
+      assert %{content_drift: false} = Knowledge.dedup_drift(article, %{"title" => "x"})
+    end
+
+    test "a title the nightly consolidation retitled is not reported as caller drift" do
+      %{tenant: tenant} = setup_tenant()
+
+      assert {:ok, article} =
+               Knowledge.create_article(tenant.id, %{
+                 title: "Notes",
+                 body: "the captured body",
+                 category: :reference
+               })
+
+      assert {:ok, retitled} =
+               Knowledge.retitle_article(tenant.id, article.id, %{
+                 title: "Notes on the drift signal"
+               })
+
+      assert retitled.previous_title == "Notes"
+
+      # The sourcer keeps sending "Notes" — its side never moved. Reporting title_drift
+      # here had a compliant writer PATCH the placeholder back every night, undoing
+      # the :generic_title retitle in a loop.
+      assert %{content_drift: false, title_drift: false} =
+               Knowledge.dedup_drift(retitled, %{
+                 "title" => "Notes",
+                 "body" => "the captured body"
+               })
+
+      # A title that is neither the current one nor the replaced one still drifts.
+      assert %{title_drift: true} =
+               Knowledge.dedup_drift(retitled, %{
+                 "title" => "Something else entirely",
+                 "body" => "the captured body"
+               })
     end
 
     test "atom-keyed attrs are read the same as string-keyed ones" do

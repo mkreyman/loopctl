@@ -892,8 +892,20 @@ defmodule Loopctl.Knowledge do
   normalization `same_content?/2` uses to decide a title collision is a retry, so a
   cosmetic reindent never reads as drift.
 
-  A non-binary or absent incoming value is NOT drift: a caller that sent no body cannot
-  be said to have sent a different one.
+  An ABSENT key is not drift: a caller that sent no body cannot be said to have sent a
+  different one. A key that is PRESENT but carries something that is not a string IS
+  drift, and the distinction is the whole point of reading it with `Map.has_key?/2`
+  rather than `attrs[:body]`. The idempotency fast path short-circuits BEFORE
+  `Article.create_changeset/2` ever runs, so a `"body" => nil` payload — the shape a
+  sourcer produces when its extraction breaks — is never validated. Collapsing that into
+  "no drift" answered a broken extraction with an affirmative "this matches what is
+  stored", which is the one answer that guarantees nobody looks.
+
+  `title_drift` is suppressed when the submitted title matches the article's
+  `previous_title` (see `retitle_article/4`): the stored side moved, deliberately, by the
+  nightly `:generic_title` consolidation retitle — the CALLER has not drifted, and
+  reporting it as caller-side drift told a compliant sourcer to PATCH the placeholder
+  title back every night, undoing the retitle in a loop.
 
   Returns `%{content_drift: boolean(), title_drift: boolean()}`. This REPORTS, it never
   decides — nothing in the create path branches on it.
@@ -904,16 +916,42 @@ defmodule Loopctl.Knowledge do
         }
   def dedup_drift(%Article{} = existing, attrs) when is_map(attrs) do
     %{
-      content_drift: drifted?(existing.body, attrs[:body] || attrs["body"]),
-      title_drift: drifted?(existing.title, attrs[:title] || attrs["title"])
+      content_drift: drifted?(existing.body, incoming(attrs, :body, "body")),
+      title_drift: title_drifted?(existing, incoming(attrs, :title, "title"))
     }
   end
 
-  # Absent/non-binary incoming value => no claim of drift (see dedup_drift/2).
-  defp drifted?(stored, incoming) when is_binary(stored) and is_binary(incoming),
+  # `:absent` vs `{:present, value}` — a caller that omitted the key and a caller that
+  # sent garbage under it are different callers, and only the second one has a problem.
+  # Atom keys first for non-HTTP callers; request params are string-keyed.
+  defp incoming(attrs, atom_key, string_key) do
+    cond do
+      Map.has_key?(attrs, atom_key) -> {:present, Map.get(attrs, atom_key)}
+      Map.has_key?(attrs, string_key) -> {:present, Map.get(attrs, string_key)}
+      true -> :absent
+    end
+  end
+
+  # A machine retitle is not caller drift. `previous_title` is written only by
+  # `Article.retitle_changeset/2` (the nightly `:generic_title` consolidation), and it
+  # holds exactly the title the sourcer is still sending.
+  defp title_drifted?(existing, {:present, incoming} = value) when is_binary(incoming) do
+    if trimmed_equal?(existing.previous_title, incoming),
+      do: false,
+      else: drifted?(existing.title, value)
+  end
+
+  defp title_drifted?(existing, value), do: drifted?(existing.title, value)
+
+  # Key absent => no claim of drift (see dedup_drift/2).
+  defp drifted?(_stored, :absent), do: false
+
+  defp drifted?(stored, {:present, incoming}) when is_binary(stored) and is_binary(incoming),
     do: not trimmed_equal?(stored, incoming)
 
-  defp drifted?(_stored, _incoming), do: false
+  # PRESENT and not a string — a nil/number/map under a key the caller did send. Reported
+  # as drift so a broken extraction surfaces instead of reading as "in sync".
+  defp drifted?(_stored, {:present, _not_a_string}), do: true
 
   # The ONE whitespace-normalization rule shared by the dedup decision
   # (same_content?/2) and the drift signal (dedup_drift/2), so the two can never

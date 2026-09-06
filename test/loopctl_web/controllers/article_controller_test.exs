@@ -1011,6 +1011,209 @@ defmodule LoopctlWeb.ArticleControllerTest do
       assert resp["data"]["body"] == "tenant B body"
     end
 
+    # THE DEFAULT CREATE PATH. Every other test in this describe reaches dedup through
+    # the idempotency key or the title index, which the gate answers before it ever
+    # scores novelty — and DataCase stubs the assessor to `:novel`, so the gate's OWN
+    # `:duplicate` verdict took the drift-free render on every existing test. It is the
+    # branch a caller hits without asking for anything, and it shipped emitting
+    # `deduplicated: true` with no drift fields at all.
+    test "the novelty gate's :duplicate verdict carries the drift fields and the drift note",
+         %{tenant: tenant, raw_key: raw_key} do
+      import Mox
+
+      canonical =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "Canonical Drift Target",
+          body: "the canonical body",
+          status: :published
+        })
+
+      expect(Loopctl.MockProposalAssessor, :assess, fn _t, _a, _o ->
+        %{
+          verdict: :duplicate,
+          score: 0.97,
+          neighbors: [
+            %{id: canonical.id, title: canonical.title, similarity_score: 0.97}
+          ]
+        }
+      end)
+
+      resp =
+        json_response(
+          capture(raw_key, %{
+            "title" => "Canonical Drift Target reworded",
+            "body" => "a different body saying the same thing",
+            "category" => "finding"
+          }),
+          200
+        )
+
+      assert resp["deduplicated"] == true
+      assert resp["gate"]["verdict"] == "duplicate"
+      assert resp["data"]["id"] == canonical.id
+      # A JS caller reading `res.content_drift` must not get `undefined` here and read
+      # the falsy value as "your payload matches what is stored".
+      assert resp["content_drift"] == true
+      assert resp["title_drift"] == true
+      assert resp["note"] =~ "near-duplicate"
+      assert resp["note"] =~ "NOT changed"
+      assert resp["note"] =~ "READ article #{canonical.id}"
+    end
+
+    test "the :duplicate verdict reports no drift when the payload matches the canonical",
+         %{tenant: tenant, raw_key: raw_key} do
+      import Mox
+
+      canonical =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "Identical Canonical",
+          body: "identical body",
+          status: :published
+        })
+
+      expect(Loopctl.MockProposalAssessor, :assess, fn _t, _a, _o ->
+        %{
+          verdict: :duplicate,
+          score: 0.99,
+          neighbors: [%{id: canonical.id, title: canonical.title, similarity_score: 0.99}]
+        }
+      end)
+
+      resp =
+        json_response(
+          capture(raw_key, %{
+            "title" => "Identical Canonical",
+            "body" => "  identical body\n",
+            "category" => "finding"
+          }),
+          200
+        )
+
+      assert resp["content_drift"] == false
+      assert resp["title_drift"] == false
+      refute resp["note"] =~ "knowledge_update"
+    end
+
+    # Drift is SYMMETRIC and the caller cannot tell which side moved, so the remedy must
+    # not be one-directional: an unattended sourcer told only to knowledge_update will
+    # overwrite a human's curation with its last extraction.
+    test "the drift note says READ before it says update", %{raw_key: raw_key} do
+      json_response(
+        capture(raw_key, %{
+          "title" => "Two Sided",
+          "body" => "original",
+          "category" => "reference",
+          "idempotency_key" => "drift-two-sided"
+        }),
+        201
+      )
+
+      resp =
+        json_response(
+          capture(raw_key, %{
+            "title" => "Two Sided",
+            "body" => "rewritten",
+            "category" => "reference",
+            "idempotency_key" => "drift-two-sided"
+          }),
+          200
+        )
+
+      note = resp["note"]
+      assert note =~ "curated or machine-retitled"
+      assert note =~ "before overwriting"
+      # The read instruction has to come FIRST, or an agent skimming for a verb finds
+      # the overwrite one and stops.
+      assert :binary.match(note, "READ article") < :binary.match(note, "knowledge_update")
+    end
+
+    # The idempotency fast path short-circuits before Article.create_changeset/2, so this
+    # payload never takes the 422 it would have taken on a first capture.
+    test "a null body on a re-capture reports content_drift instead of reading as in sync",
+         %{raw_key: raw_key} do
+      json_response(
+        capture(raw_key, %{
+          "title" => "Broken Extraction",
+          "body" => "the body that was captured",
+          "category" => "reference",
+          "idempotency_key" => "drift-broken"
+        }),
+        201
+      )
+
+      resp =
+        json_response(
+          capture(raw_key, %{
+            "title" => "Broken Extraction",
+            "body" => nil,
+            "category" => "reference",
+            "idempotency_key" => "drift-broken"
+          }),
+          200
+        )
+
+      assert resp["deduplicated"] == true
+      assert resp["content_drift"] == true
+      assert resp["title_drift"] == false
+      assert resp["note"] =~ "READ article"
+    end
+
+    # A drifted discard and a clean re-run are the same 200 on the wire, so without a
+    # server-side signal a fleet-wide silent discard is countable only from a client
+    # report.
+    test "a drifted discard is logged with the tenant and article id", %{
+      tenant: tenant,
+      raw_key: raw_key
+    } do
+      first =
+        json_response(
+          capture(raw_key, %{
+            "title" => "Logged Drift",
+            "body" => "original",
+            "category" => "reference",
+            "idempotency_key" => "drift-logged"
+          }),
+          201
+        )
+
+      id = first["data"]["id"]
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          json_response(
+            capture(raw_key, %{
+              "title" => "Logged Drift",
+              "body" => "rewritten",
+              "category" => "reference",
+              "idempotency_key" => "drift-logged"
+            }),
+            200
+          )
+        end)
+
+      assert log =~ "deduplicated with drift"
+      assert log =~ tenant.id
+      assert log =~ id
+
+      # A clean re-run must stay silent, or the one line that matters is buried.
+      quiet =
+        ExUnit.CaptureLog.capture_log(fn ->
+          json_response(
+            capture(raw_key, %{
+              "title" => "Logged Drift",
+              "body" => "original",
+              "category" => "reference",
+              "idempotency_key" => "drift-logged"
+            }),
+            200
+          )
+        end)
+
+      refute quiet =~ "deduplicated with drift"
+    end
+
     test "#163 unchanged: a key colliding with another agent's PRIVATE article yields no dedup and no drift flags",
          %{tenant: tenant} do
       owner = fixture(:agent, %{tenant_id: tenant.id})
