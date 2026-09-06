@@ -6,6 +6,59 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **The third funnel stage — `POST /api/v1/recall/:recall_id/referenced` (agent role).**
+  loopctl recorded which articles a search SURFACED and which of those an agent then
+  OPENED, but never whether an opened article was actually USED. That last stage is the
+  one the follow-through deficit is about: surfaced-to-opened converts at 1.67%, and
+  nothing said what happened after an open.
+
+  Hand back the `meta.recall_id` from a `POST /api/v1/recall` response together with the
+  article ids you referenced. The server writes `article_access_events` rows of a new
+  access type, `referenced`, stamping `origin_search_id` from the verified recall id and
+  the recording key from the conn — nothing about the identity is caller-supplied.
+
+  **`422 not_surfaced` is all-or-nothing.** Only ids THAT recall surfaced, in the caller's
+  own tenant, are accepted; any other id fails the whole call and NOTHING is written. A
+  partial write would mix a truth with a rejection under one id and leave the caller
+  unable to say which. The lookup is tenant-scoped and offers no existence oracle: an
+  unknown recall id and another tenant's recall id both simply surfaced nothing and take
+  the same 422 rather than a 404. The other refusals are `422 invalid_recall_id`,
+  `422 invalid_article_ids` and `422 too_many_article_ids` above 50 ids per call. Retries
+  are safe — the log is immutable so a repeat writes another row, but the metric counts
+  DISTINCT `(recall, article)` pairs, so posting twice cannot move a published figure.
+
+  A `referenced` row is in NO read set: not the heat index, not the read counters, not
+  `total_events` on `GET /api/v1/knowledge/articles/:id/stats`. It is the one access type
+  a CLIENT asserts about itself, and a ranking that consumed a self-report could be gamed
+  by one. It stays visible under its own key in the by-type breakdown, which is a label
+  rather than a total, so that breakdown may sum higher than `total_events`.
+
+  **Two migrations, no manual step and no downtime.**
+  `20260905120100_add_referenced_to_retrieval_snapshots` adds one integer column with a
+  `0` default to `retrieval_metric_snapshots`, a small table; historical rows report a
+  genuine zero because the endpoint did not exist. The snapshot `metric_version` goes
+  1 to 2 to mark that boundary. `reference_rate` is NOT a column — it is
+  `referenced / searched`, derived at read time, so no backfill is needed.
+
+  `20260905120200_add_article_access_events_search_id_index` builds a partial index on
+  `article_access_events` `(tenant_id, (metadata->>'search_id')) WHERE access_type =
+  'search'`, which is the lookup the new endpoint runs synchronously on a request path.
+  **Plan for deploy DURATION on this one.** `article_access_events` is the largest table
+  in a busy tenant — impressions outnumber reads about 50:1 — and the index is built
+  `CONCURRENTLY`, which is slower than an ordinary build and scans the table twice. It
+  carries both `@disable_ddl_transaction` and `@disable_migration_lock`, so it runs
+  outside a transaction and **does not hold the migration advisory lock** while it
+  builds: concurrent writes to `article_access_events` are never blocked, and a rolling
+  deploy's other nodes are not serialised behind it. It is `create_if_not_exists` with
+  explicit `up`/`down`, so an interrupted build leaves an INVALID index that the next run
+  steps over instead of tripping on.
+
+  The daily `RetrievalMetricsWorker` cron now also re-snapshots the day BEFORE its target,
+  because a reference is bucketed by the day the article was SURFACED: a recall at 17:00
+  whose reference arrives the next morning belongs to a snapshot already written. The
+  lookback is one day and the re-run is a full idempotent upsert, so it changes nothing
+  operationally beyond one extra snapshot computation per tenant per run.
+
 - **Reversible retrieval suppression for articles — `POST /api/v1/articles/:id/suppress`
   and `/unsuppress` (agent role).** loopctl had two ways to retract an article and neither
   was the one an unattended writer needs. `archive` is TERMINAL: `:archived` has no outbound
