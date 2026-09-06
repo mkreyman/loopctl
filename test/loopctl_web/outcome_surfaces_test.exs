@@ -148,7 +148,17 @@ defmodule LoopctlWeb.OutcomeSurfacesTest do
         degraded?: false,
         degraded_reason: nil,
         search_mode: nil,
-        results_ranking: "heuristic_cross_source"
+        results_ranking: "heuristic_cross_source",
+        # The selection ledger is published on EVERY `recall_context/2` response, so this
+        # stand-in carries it too. `RecallJSON.ledger_meta/1` reads the keys strictly
+        # rather than defaulting them: a recall that published no `recall_id` would be a
+        # bug, and a default would render it as a healthy response.
+        recall_id: Ecto.UUID.generate(),
+        candidates_considered: %{memory: 0, knowledge: 0, total: 0},
+        selected_count: 0,
+        tokens_selected: 0,
+        tokens_candidates: 0,
+        tokens_saved_vs_candidates: 0
       }
     }
   end

@@ -238,7 +238,8 @@ calling `/memory/recall` and `/knowledge/search` separately.
 |---------|--|
 | Context | `Loopctl.Memory.recall_context/2` |
 | HTTP | `POST /api/v1/recall` `{query, project_id?, limit?}` |
-| MCP | `recall_context` |
+| HTTP | `POST /api/v1/recall/:recall_id/referenced` `{article_ids, project_id?}` |
+| MCP | `recall_context`, `recall_referenced` |
 
 - The knowledge half is the **combined SEARCH** (article *summaries* —
   `{id, title, category, tags, score, snippet}`), **not** the deep-read
@@ -258,6 +259,64 @@ calling `/memory/recall` and `/knowledge/search` separately.
   the *other* side is still returned with `meta.degraded?: true` (and
   `meta.degraded_reason` naming why). Agent-role keys are forced to **published**
   articles and their own/`shared` memories (#163).
+
+#### The selection ledger
+
+Borrowed from MemoRizz's per-turn `EvidencePack` (KB
+`80a063e9-22b4-4469-9f1e-3be499a3fc2c`), which records candidates, supplied items
+and referenced sources with rank, score and a token budget. The point is that a
+client can **explain its own context assembly** instead of inferring it from the
+list it happened to get.
+
+Per merged `data` item:
+
+| Field | |
+|-------|--|
+| `rank` | 1-based position in the MERGED list, not the per-source rank |
+| `selection_reason` | knowledge: `keyword`, `semantic`, `keyword+semantic`, `keyword_fallback`, `unscored`; memory: `semantic`, `ilike_fallback` |
+| `tokens_estimate` | bytes/4 of the text a client would paste — an **estimate**, never a tokenizer count |
+
+In `meta`: `recall_id`, `candidates_considered` (`{memory, knowledge, total}`
+before the merged cap), `selected_count`, `tokens_selected`, `tokens_candidates`
+and `tokens_saved_vs_candidates`.
+
+The merged order is **deterministic** — score DESC, then source (`knowledge`
+before `memory`), then id ASC — so an unchanged corpus renders a byte-identical
+`data` array between turns. Cache THAT array, not the whole envelope:
+`meta.recall_id` is minted per call, so two identical recalls always differ in
+`meta`. Same discipline as the heat index snapping its default window to a UTC
+day boundary for byte-identical refreshes.
+
+#### `meta.recall_id` and the third funnel stage
+
+`recall_id` is ONE id for the whole recall, and it is the `search_id` stamped on
+the knowledge half's surfacing rows in `article_access_events` — not a second id
+that has to be joined to the first. Hand it back:
+
+    POST /api/v1/recall/:recall_id/referenced   {"article_ids": [...]}
+
+That records `access_type: "referenced"` rows with `origin_search_id =
+recall_id` — the stage nothing measured before. Surfaced and opened were both
+observations; this one is a **client assertion**, so it is bounded rather than
+trusted:
+
+- only articles that recall **actually surfaced** under that `recall_id`, in the
+  caller's own tenant, are accepted — in `data`, that is the `article.id` of the
+  items whose `source` is `knowledge`. A `memory` item's `id` is a memory, not an
+  article, and is not referenceable. Any other id fails the WHOLE call with `422`
+  `not_surfaced` and nothing is written. An unknown or foreign `recall_id`
+  surfaced nothing, so it takes the same 422 — there is no cross-tenant existence
+  oracle;
+- the recording key is the caller's, stamped server-side;
+- at most 50 ids per call (`invalid_recall_id` / `invalid_article_ids` /
+  `too_many_article_ids` are the other 422s);
+- repeats are safe: `RetrievalMetrics` counts DISTINCT `(recall_id, article_id)`
+  pairs, so posting twice cannot move `referenced` / `reference_rate`.
+
+**A `referenced` row is in NO read set** — not `Analytics.@read_access_types`,
+not `@attributable_access_types`, not `Knowledge.@heat_read_access_types`, not
+`LiveRetrievalMetrics`' chosen reads. Heat and precision must never rank on a
+signal a client asserts about itself.
 
 ---
 

@@ -1881,6 +1881,35 @@ async function recallContext({ query, project_id, limit }) {
   return withRemediationNotice(result);
 }
 
+async function recallReferenced({ recall_id, article_ids, project_id }) {
+  // The third funnel stage. recall_id is a PATH segment: the server verifies that every
+  // article id was surfaced by THAT recall before recording anything, so a wrong id fails
+  // the whole call rather than recording a half-truth. The recording key is derived
+  // server-side from this key — nothing about the identity is sent.
+  //
+  // Path-injection guard, the same `UUID_RE` check knowledgeAgentUsage runs. `format:
+  // "uuid"` in the input schema is advisory — MCP does not enforce it — so a model that
+  // hallucinates or mis-copies an id containing `/` or `..` would otherwise have it
+  // spliced raw into the path, where URL normalisation sends the POST somewhere other
+  // than the endpoint this tool describes.
+  if (typeof recall_id !== "string" || !UUID_RE.test(recall_id.trim())) {
+    throw new Error(
+      "recall_id must be the meta.recall_id UUID from a recall_context response.",
+    );
+  }
+
+  const payload = { article_ids };
+  if (project_id) payload.project_id = project_id;
+
+  const result = await apiCall(
+    "POST",
+    `/api/v1/recall/${encodeURIComponent(recall_id.trim())}/referenced`,
+    payload,
+    process.env.LOOPCTL_AGENT_KEY,
+  );
+  return toContent(result);
+}
+
 async function memoryList({ limit, offset, include_superseded, all_subjects }) {
   // all_subjects is superadmin-only server-side; a non-superadmin key sending
   // this is ignored (falls back to its own subject) rather than erroring — the
@@ -5493,7 +5522,19 @@ const TOOLS = [
       "meta.degraded is true — never a hard failure. Each envelope's " +
       "`meta.ann_iterative_scan` discloses whether THAT half's vector read ran with " +
       "pgvector's iterative scan (`unavailable` ⇒ possibly incomplete); the two halves " +
-      "are resolved independently and may differ.",
+      "are resolved independently and may differ. SELECTION LEDGER: every merged item " +
+      "also carries `rank` (its position in THIS list), `selection_reason` (which lane " +
+      "put it there — keyword|semantic|keyword+semantic|keyword_fallback for knowledge, " +
+      "semantic|ilike_fallback for memory) and `tokens_estimate` (bytes/4 — an estimate, " +
+      "not a tokenizer count), and `meta` carries `recall_id`, `candidates_considered`, " +
+      "`selected_count`, `tokens_selected`, `tokens_candidates` and " +
+      "`tokens_saved_vs_candidates`, so you can explain your own context assembly. The " +
+      "merged order is deterministic (score DESC, then source, then id), so an unchanged " +
+      "corpus renders a byte-identical `data` array between turns — cache that array, not " +
+      "the whole response, since `meta.recall_id` is new on every call. KEEP " +
+      "`meta.recall_id`: after you " +
+      "answer, pass it to recall_referenced with the ids you actually used — that is the " +
+      "third funnel stage and nothing else records it.",
     inputSchema: {
       type: "object",
       properties: {
@@ -5515,6 +5556,47 @@ const TOOLS = [
         },
       },
       required: ["query"],
+    },
+  },
+  {
+    name: "recall_referenced",
+    description:
+      "Record which of the articles a recall SURFACED you actually USED in your answer — " +
+      "the third funnel stage (surfaced → opened → referenced). Pass the `meta.recall_id` " +
+      "from a recall_context response plus the article ids you referenced. This is the " +
+      "only signal that distinguishes 'the KB answered the question' from 'the KB was " +
+      "searched'; surfaced-to-opened follow-through is measured at 1.67% and what " +
+      "happened after an open was never recorded at all. Cheap and safe to call: only " +
+      "ids that THIS recall surfaced, in your own tenant, are accepted (anything else is " +
+      "a 422 not_surfaced and NOTHING is written), your key is stamped server-side, and " +
+      "repeating a call cannot inflate the metric — it counts distinct (recall, article) " +
+      "pairs. These rows are deliberately NOT reads: they never feed the heat index or " +
+      "any ranking, because a ranking that consumed a self-report could be gamed by one. " +
+      "Call it once, after you have written your answer.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        recall_id: {
+          type: "string",
+          format: "uuid",
+          description: "The `meta.recall_id` of the recall_context call that surfaced these articles.",
+        },
+        article_ids: {
+          type: "array",
+          items: { type: "string", format: "uuid" },
+          description:
+            "The ids you actually used, from that recall's `data`: the `article.id` of " +
+            "each item whose `source` is `knowledge`. A `memory` item's id is NOT an " +
+            "article and is not referenceable — including one fails the whole call. " +
+            "Non-empty, at most one recall page's worth.",
+        },
+        project_id: {
+          type: "string",
+          format: "uuid",
+          description: "Optional: attribution only, the same project scope you recalled under.",
+        },
+      },
+      required: ["recall_id", "article_ids"],
     },
   },
   {
@@ -8020,6 +8102,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return await memoryRecall(args);
     case "recall_context":
       return await recallContext(args);
+    case "recall_referenced":
+      return await recallReferenced(args);
 
     case "memory_list":
       return await memoryList(args);

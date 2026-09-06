@@ -256,6 +256,33 @@ defmodule Loopctl.MemoryRecallContextTest do
     test "two healthy halves report nothing" do
       assert {nil, nil} = Memory.merged_degradation(healthy_env(), healthy_env())
     end
+
+    # The ledger arm is the one reason that is NOT about the results: both halves
+    # answered, but the surfacing rows were not written, so the `recall_id` this response
+    # publishes names no rows and `/referenced` refuses every id under it. Reported LAST
+    # for exactly that reason — a degraded half carries a remedy for the results the
+    # caller is holding, which outranks a remedy for a follow-up call it may never make.
+    test "a failed surfacing ledger is reported when both halves are healthy" do
+      assert {"recall_ledger_unavailable", nil} =
+               Memory.merged_degradation(
+                 healthy_env(),
+                 healthy_env(),
+                 {:error, :recording_failed}
+               )
+    end
+
+    test "a degraded half outranks a failed ledger" do
+      assert {"heavy_read_overloaded", nil} =
+               Memory.merged_degradation(
+                 memory_shed_env(),
+                 healthy_env(),
+                 {:error, :recording_failed}
+               )
+    end
+
+    test "a written ledger adds no tag" do
+      assert {nil, nil} = Memory.merged_degradation(healthy_env(), healthy_env(), :ok)
+    end
   end
 
   # The merged meta as `RecallJSON` renders it, reduced to the keys `Outcome` reads.

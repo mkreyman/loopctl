@@ -5,6 +5,48 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.87.0 — 2026-09-06 (recall explains its own selection, and you can say what you used)
+
+### Added
+
+- **`recall_referenced`** — record which of the articles a recall SURFACED you actually USED.
+  This is the third funnel stage (surfaced -> opened -> referenced) and the only one nothing
+  else records: surfaced-to-opened follow-through is measured at 1.67%, and what happened
+  AFTER an open was never captured at all, so "the KB answered the question" and "the KB was
+  searched" were indistinguishable in every metric we had.
+
+  Pass the `meta.recall_id` from a `recall_context` response plus the ids you referenced, once,
+  after you have written your answer. Only ids THAT recall surfaced, in your own tenant, are
+  accepted — anything else is a `422 not_surfaced` and NOTHING is written, so a wrong id fails
+  the whole call rather than recording a half-truth. At most 50 ids per call, and the recording
+  key is derived server-side from your own key, so nothing about the identity is sent.
+
+  **These rows are deliberately NOT reads.** They never feed the heat index or any ranking, and
+  repeats cannot inflate the metric (it counts distinct `(recall, article)` pairs). A ranking
+  that consumed a self-report could be gamed by one, which is the same reason the heat index
+  refuses to rank on a signal heat itself produces.
+
+- **The selection ledger on `recall_context`** — the response now explains its own context
+  assembly instead of handing over an unattributed list. Every merged item carries `rank` (its
+  1-based position in THIS merged list, not the per-source rank), `selection_reason` naming the
+  lane that put it there (`keyword`, `semantic`, `keyword+semantic`, `keyword_fallback` for
+  knowledge; `semantic`, `ilike_fallback` for memory) and `tokens_estimate`. `meta` carries
+  `recall_id`, `candidates_considered`, `selected_count`, `tokens_selected`, `tokens_candidates`
+  and `tokens_saved_vs_candidates` — so you can see what the merged cap did NOT hand you, and
+  `tokens_saved_vs_candidates` is zero when the cap bound nothing.
+
+  The token figures are ESTIMATES by construction (bytes/4 of the rendered text), never a
+  tokenizer count. Do not treat them as a billing number.
+
+  The merged order is deterministic (score DESC, then source, then id), so an unchanged corpus
+  renders a byte-identical `data` array between turns — which is what lets the pack sit in a
+  cached prefix without busting the cache on every call. Cache the array, not the response:
+  `meta.recall_id` is minted per call.
+
+  `meta.recall_id` is ALSO the `search_id` stamped on the knowledge half's surfacing rows, one
+  value rather than two that have to be joined, which is what makes it directly usable as the
+  `recall_referenced` argument. Keep it.
+
 ## 2.86.0 — 2026-09-06 (a retraction you can take back)
 
 ### Added

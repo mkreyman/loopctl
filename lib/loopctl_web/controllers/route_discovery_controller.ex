@@ -687,7 +687,9 @@ defmodule LoopctlWeb.RouteDiscoveryController do
         method: "GET",
         path: "/api/v1/knowledge/articles/:id/stats",
         description:
-          "Per-article usage stats: total_events (impressions included), total_reads, " <>
+          "Per-article usage stats: total_events (OBSERVED events, impressions " <>
+            "included, client-asserted referenced rows EXCLUDED — the by-type breakdown " <>
+            "still shows them under their own key, so it may sum higher), total_reads, " <>
             "unique_keys (distinct API KEYS, not agents — one key is minted per dispatch), " <>
             "by-type breakdown, recent events."
       },
