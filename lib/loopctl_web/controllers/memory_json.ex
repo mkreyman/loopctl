@@ -12,7 +12,7 @@ defmodule LoopctlWeb.MemoryJSON do
 
   - `recall/1` — `%{data: [%{memory, score}], meta: %{total_count, fallback,
     reason, underfilled, outcome}}`. `score` is `null` on the ILIKE fallback path.
-  - `index/1` — `%{data: [memory], meta: %{total_count, limit, offset}}`.
+  - `index/1` — `%{data: [memory], meta: %{total_count, limit, offset, outcome}}`.
   """
 
   alias Loopctl.Memory.Memory
@@ -41,9 +41,16 @@ defmodule LoopctlWeb.MemoryJSON do
     }
   end
 
-  @doc "Renders a paginated list of memories with `meta.total_count/limit/offset`."
+  @doc """
+  Renders a paginated list of memories with `meta.total_count/limit/offset`.
+
+  Carries `meta.outcome` for the same reason the catalog reads do: enumeration
+  discloses no degradation of its own, so the value is only ever `empty` or `success`,
+  but a client that must remember WHICH reads publish `outcome` cannot tell an
+  endpoint that opted out from a server too old to send it.
+  """
   def index(%{results: results, meta: meta}) do
-    %{data: Enum.map(results, &memory_data/1), meta: meta}
+    %{data: Enum.map(results, &memory_data/1), meta: Outcome.put_for(meta, results)}
   end
 
   @doc """

@@ -40,6 +40,17 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
 
   defp ids(body), do: Enum.map(body["data"], & &1["id"])
 
+  # Re-derives `meta.outcome` from the rendered meta MINUS the key itself, so the
+  # assertion is against the classifier's verdict on this exact response rather than
+  # against a literal the controller could be hardcoding.
+  defp derived_outcome(body) do
+    {_rendered, rest} = Map.pop(body["meta"], "outcome")
+
+    rest
+    |> Map.new(fn {key, value} -> {String.to_existing_atom(key), value} end)
+    |> LoopctlWeb.Outcome.derive(length(body["data"]))
+  end
+
   describe "suggestion query shape (#168 + #172 RED→GREEN structural guard)" do
     # Neither production 500 reproduces in the test DB: #168 (re-interpolating a stored
     # %Pgvector{}) encodes fine locally, and #172 (a full-corpus scan + sort) only times
@@ -172,6 +183,37 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksControllerTest do
       body = suggest(conn, key, target.id)
 
       assert body["meta"]["ann_iterative_scan"] in ["applied", "unavailable"]
+    end
+
+    test "meta.outcome classifies the read, and is derived rather than hardcoded",
+         %{conn: conn} do
+      # This endpoint is the OTHER producer of `ann_iterative_scan: "unavailable"`, and
+      # until now that disclosure travelled under a key no client reads — an under-returned
+      # candidate list arrived looking exactly like a complete short one.
+      #
+      # The value is pinned two ways because a hardcoded literal would satisfy only the
+      # first: once against the two counts (`empty` with no candidates, `success` with
+      # one), and once against `Outcome.derive/2` re-run over the REST of the rendered
+      # meta. The second is what binds the degraded branch: `config/test.exs` pins
+      # iterative scan ON, so `unavailable` only appears when a live probe fails closed,
+      # and asserting on it directly would be a test that usually asserts nothing.
+      {tenant, key} = setup_tenant_key()
+      target = embedded(tenant.id, "TargetOutcome", [1.0])
+
+      alone = suggest(conn, key, target.id)
+      assert alone["data"] == []
+      assert alone["meta"]["outcome"] == derived_outcome(alone)
+
+      _cand = embedded(tenant.id, "CandOutcome", [1.0])
+
+      with_candidate = suggest(conn, key, target.id)
+      assert length(with_candidate["data"]) == 1
+      assert with_candidate["meta"]["outcome"] == derived_outcome(with_candidate)
+
+      # And the two counts really do classify differently, so `derived_outcome/1` is not
+      # comparing a constant against itself.
+      assert alone["meta"]["outcome"] == "empty"
+      assert with_candidate["meta"]["outcome"] == "success"
     end
 
     test "returns candidates ranked by similarity, highest first, excluding below-threshold",

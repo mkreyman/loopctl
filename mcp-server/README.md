@@ -268,13 +268,15 @@ Epic 39 Repo Coordination Bus — a lightweight, tenant-isolated channel for age
 | A search came back empty/thin, or you don't yet know what to ask | `knowledge_heat_index` (no query at all) |
 | Enumerate / dedup / repair, or "does X exist?" (full fields, lag-free, all-status) | `knowledge_list` |
 
-**Read `meta.outcome` before you believe an empty result.** The knowledge, memory and
-corpus RETRIEVAL responses — `knowledge_search`, `knowledge_list`, `knowledge_context`,
-`knowledge_hybrid_search`, `knowledge_progressive_index`, `knowledge_heat_index`,
-`memory_recall`, `recall_context`, `corpus_search` — carry one of `success` | `empty` |
-`degraded` | `fallback` | `error`, so you never have to know which per-surface flag names a
-degradation. The catalog endpoints that disclose no degradation of their own
-(`knowledge_index`, `memory_list`, `corpus_list`) do not carry it:
+**Read `meta.outcome` before you believe an empty result.** EVERY read on the knowledge,
+memory and corpus surfaces carries one of `success` | `empty` | `degraded` | `fallback` |
+`error`, so you never have to know which per-surface flag names a degradation — the
+retrieval tools (`knowledge_search`, `knowledge_context`, `knowledge_hybrid_search`,
+`knowledge_progressive_index`, `knowledge_heat_index`, `memory_recall`, `recall_context`,
+`corpus_search`), the enumerations (`knowledge_list`, `knowledge_index`, `memory_list`,
+`corpus_list`) and the review queues. On a catalog the value is only ever `empty` or
+`success` — it discloses no degradation of its own — but the KEY is there, so an ABSENT
+`outcome` means one thing and one thing only: a server older than this envelope.
 
 | `meta.outcome` | what happened | what to do |
 |---|---|---|
@@ -287,9 +289,10 @@ degradation. The catalog endpoints that disclose no degradation of their own
 Precedence is `error > fallback > degraded > empty > success`, so a degradation is never
 hidden behind a zero count. On `knowledge_search`, `knowledge_hybrid_search` and
 `knowledge_context` the MCP server also prints a leading banner for the three classes that
-need a remedy; `empty` and `success` are silent by design, and on every OTHER tool above
-the value is in `meta` only — read it, do not wait for a banner. Write tools carry no
-`outcome`. A page walked past the end of a non-empty set is `success`, not `empty`:
+need a remedy; `empty` and `success` are silent by design. Since 2.85.0 the banner also
+fires on `knowledge_list`, `knowledge_progressive_index`, `knowledge_heat_index`,
+`memory_recall`, `recall_context` and `corpus_search`, so every read that can report a
+degradation now announces one. Write tools carry no `outcome`. A page walked past the end of a non-empty set is `success`, not `empty`:
 exhausting a paginated walk is not the same as the row being absent.
 
 | Tool | Description |

@@ -27,6 +27,115 @@ defmodule LoopctlWeb.OutcomeTest do
     end
   end
 
+  describe "a rendered outcome is a documented one" do
+    # The doc-hygiene rule in CLAUDE.md: a changed API constraint goes in the endpoint's
+    # `operation/2` spec, not only in the controller. Nothing flags a render that ships
+    # with no matching schema entry, and the failure is silent for exactly the audience
+    # that cannot read this source tree — so it is bound here instead of remembered.
+    #
+    # Rendering happens in a `*_json.ex` view or in the controller itself; documenting
+    # happens in the controller's `operation/2` or in a shared `Loopctl.ApiSpec.Schemas`
+    # module it names. So the unit is the SURFACE, and the check is: every module that
+    # renders has a documenter, resolved by name.
+    #
+    # The bound this does NOT give, stated so nobody reads more into a green: it is
+    # per-MODULE, not per-ACTION. A view rendering two actions is satisfied by one of them
+    # being documented, and the mapping is hand-written, so a renderer added with no entry
+    # fails loudly (the `unmapped` assertion) while a SECOND action on a mapped module
+    # does not. What it does catch is the whole silent class — a render shipped with no
+    # OpenAPI meta property anywhere.
+    @renderers_to_documenters %{
+      "article_json.ex" => ["article_controller.ex"],
+      "knowledge_context_json.ex" => ["knowledge_context_controller.ex"],
+      "knowledge_hybrid_search_json.ex" => ["knowledge_hybrid_search_controller.ex"],
+      "knowledge_index_json.ex" => ["knowledge_index_controller.ex"],
+      "knowledge_progressive_json.ex" => ["knowledge_progressive_controller.ex"],
+      "knowledge_search_json.ex" => ["knowledge_search_controller.ex"],
+      "memory_json.ex" => ["memory_controller.ex", "../../loopctl/api_spec/schemas.ex"],
+      "recall_json.ex" => ["memory_controller.ex", "../../loopctl/api_spec/schemas.ex"],
+      "article_workflow_controller.ex" => ["article_workflow_controller.ex"],
+      "corpus_controller.ex" => ["corpus_controller.ex"],
+      "knowledge_suggest_links_controller.ex" => ["knowledge_suggest_links_controller.ex"]
+    }
+
+    @controllers_dir "lib/loopctl_web/controllers"
+
+    # The PER-ACTION half of the guard, which the per-module scan below cannot give: it
+    # reads the BUILT OpenAPI document and looks at the exact 200 `meta` object a client
+    # would generate a type from. Each entry is one endpoint that renders `meta.outcome`,
+    # so a schema shared by two actions no longer satisfies both by satisfying one.
+    @documented_endpoints [
+      {"/api/v1/knowledge/search", :get},
+      {"/api/v1/knowledge/context", :get},
+      {"/api/v1/knowledge/hybrid_search", :post},
+      {"/api/v1/knowledge/progressive_index", :get},
+      {"/api/v1/knowledge/heat_index", :get},
+      {"/api/v1/knowledge/index", :get},
+      {"/api/v1/articles", :get},
+      {"/api/v1/knowledge/drafts", :get},
+      {"/api/v1/knowledge/conflicts", :get},
+      {"/api/v1/knowledge/articles/{id}/suggested_links", :get},
+      {"/api/v1/memory", :get},
+      {"/api/v1/memory/recall", :post},
+      {"/api/v1/recall", :post},
+      {"/api/v1/corpora", :get},
+      {"/api/v1/corpora/{id}/search", :post}
+    ]
+
+    test "each endpoint that renders meta.outcome documents it in its own 200 meta object" do
+      spec = Loopctl.ApiSpec.spec()
+
+      for {path, verb} <- @documented_endpoints do
+        item = spec.paths[path]
+        assert item, "no such path in the spec: #{path} (renamed? then rename it here too)"
+
+        operation = Map.get(item, verb)
+        assert operation, "#{verb} #{path} is not in the spec"
+
+        meta = meta_schema(spec, operation)
+
+        assert meta, "#{verb} #{path} documents no 200 meta object"
+
+        assert Map.has_key?(meta.properties || %{}, :outcome),
+               "#{verb} #{path} renders meta.outcome but does not document it"
+
+        assert meta.properties.outcome.enum == Outcome.values(),
+               "#{verb} #{path} documents an outcome enum that is not the published one"
+      end
+    end
+
+    test "every module that renders meta.outcome has a mapped documenter that declares it" do
+      rendering =
+        @controllers_dir
+        |> Path.join("*.ex")
+        |> Path.wildcard()
+        |> Enum.filter(&(&1 |> File.read!() |> String.contains?("Outcome.put")))
+        |> Enum.map(&Path.basename/1)
+        |> Enum.sort()
+
+      assert rendering != [], "the scan matched no renderers — the guard would be vacuous"
+
+      unmapped = rendering -- Map.keys(@renderers_to_documenters)
+
+      assert unmapped == [],
+             "these modules render meta.outcome with no documenter mapped: " <>
+               "#{inspect(unmapped)}. Add the OpenAPI meta property, then map it here."
+
+      for renderer <- rendering do
+        documenters = @renderers_to_documenters[renderer]
+
+        assert Enum.any?(documenters, fn documenter ->
+                 @controllers_dir
+                 |> Path.join(documenter)
+                 |> File.read!()
+                 |> String.contains?("Outcome.schema()")
+               end),
+               "#{renderer} renders meta.outcome but none of #{inspect(documenters)} " <>
+                 "documents it"
+      end
+    end
+  end
+
   describe "derive/2 — the healthy pair" do
     test "rows and no degradation is success" do
       assert Outcome.derive(%{total_count: 3, limit: 10, offset: 0}, 3) == "success"
@@ -290,4 +399,31 @@ defmodule LoopctlWeb.OutcomeTest do
                "fallback"
     end
   end
+
+  # Resolves the 200 response's `meta` property, following a component `$ref` — a shared
+  # response schema (MemoryListResponse, MemoryRecallResponse) reaches the document as a
+  # reference, and reading `.properties` off one silently returns nil.
+  #
+  # The component key is looked up as the STRING the `$ref` already carries. An earlier
+  # draft went through `String.to_existing_atom/1` and passed or raised depending on
+  # whether the schema module happened to be loaded yet — a guard that is green by load
+  # order is worse than no guard.
+  defp meta_schema(spec, operation) do
+    schema =
+      operation.responses[200].content["application/json"].schema
+      |> resolve_ref(spec)
+
+    case schema.properties[:meta] do
+      nil -> nil
+      meta -> resolve_ref(meta, spec)
+    end
+  end
+
+  defp resolve_ref(%OpenApiSpex.Reference{"$ref": ref}, spec) do
+    name = ref |> String.split("/") |> List.last()
+
+    Map.get(spec.components.schemas, name)
+  end
+
+  defp resolve_ref(schema, _spec), do: schema
 end

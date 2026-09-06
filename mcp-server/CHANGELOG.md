@@ -32,15 +32,29 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   noise, and noise teaches agents to ignore the channel, which is the exact fate of the
   `meta` fields this replaces.
 
-  `meta.outcome` is carried by: `knowledge_search` (both relevance and list modes),
-  `knowledge_list`, `knowledge_context`, `knowledge_hybrid_search`,
-  `knowledge_progressive_index`, `knowledge_heat_index`, `memory_recall`,
-  `recall_context` and `corpus_search`. The BANNER is printed by `knowledge_search`,
-  `knowledge_hybrid_search` and `knowledge_context` only; on the rest the value is in
-  `meta` and a client must read it. The catalog endpoints (`knowledge_index`,
-  `memory_list`, `corpus_list`) disclose no degradation of their own and carry no
-  `outcome`, and neither do write tools — it answers "can I trust this empty result
-  set", which is a question only a read has.
+  `meta.outcome` is carried by EVERY read on these surfaces: the retrieval tools
+  (`knowledge_search` in both relevance and list modes, `knowledge_context`,
+  `knowledge_hybrid_search`, `knowledge_progressive_index`, `knowledge_heat_index`,
+  `memory_recall`, `recall_context`, `corpus_search`), the enumerations
+  (`knowledge_list`, `knowledge_index`, `memory_list`, `corpus_list`), the review queues
+  (`GET /knowledge/drafts`, `GET /knowledge/conflicts`) and the suggested-links read.
+  Write tools carry none — it answers "can I trust this empty result set", which is a
+  question only a read has.
+
+  **The catalog endpoints were excluded in the first draft of this and should not have
+  been.** They disclose no degradation of their own, so their `outcome` is only ever
+  `empty` or `success` — true of the VALUE and irrelevant to the KEY. A client cannot see
+  a per-endpoint opt-out: an absent `outcome` means "this endpoint declined to classify"
+  and "this server predates the envelope" at once, and this client's own `outcomeOf`
+  collapses both to `null`. Absence now has exactly one meaning: an old server.
+
+  **The banner fires on every read that can report a degradation.** The first draft
+  printed it on `knowledge_search`, `knowledge_hybrid_search` and `knowledge_context`
+  only, and left six handlers ending at a bare `toContent` — so on the MEMORY surface,
+  the one this README calls out as where outcome matters most, a shed read still looked
+  exactly like an empty scope. `knowledge_list`, `knowledge_progressive_index`,
+  `knowledge_heat_index`, `memory_recall`, `recall_context` and `corpus_search` now
+  print it too.
 
   An unrecognised `outcome` value means a server newer than this client, and the notice
   falls back to the pre-envelope flag heuristics rather than inventing a class it cannot

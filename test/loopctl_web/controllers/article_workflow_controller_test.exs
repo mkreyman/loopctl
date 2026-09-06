@@ -1579,6 +1579,29 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
   # --- TC-21.3.5: Drafts listing excludes published, includes source info ---
 
   describe "GET /api/v1/knowledge/drafts" do
+    # The review queues are reads, and a read that reports no rows has to say WHICH kind
+    # of no-rows it is. A queue with nothing in it is a state an operator acts on, so an
+    # absent classification here is the same ambiguity `meta.outcome` closes everywhere
+    # else — and a client cannot tell an endpoint that opted out from an old server.
+    test "carries meta.outcome, and it tracks the page rather than a literal", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      empty =
+        conn |> auth_conn(raw_key) |> get(~p"/api/v1/knowledge/drafts") |> json_response(200)
+
+      assert empty["data"] == []
+      assert empty["meta"]["outcome"] == "empty"
+
+      _draft = fixture(:article, %{tenant_id: tenant.id, status: :draft, title: "A Draft"})
+
+      listed =
+        conn |> auth_conn(raw_key) |> get(~p"/api/v1/knowledge/drafts") |> json_response(200)
+
+      assert length(listed["data"]) == 1
+      assert listed["meta"]["outcome"] == "success"
+    end
+
     test "lists only draft articles with source info", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
@@ -1797,6 +1820,18 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       assert [pair] = body["data"]
       assert pair["similarity"] == 0.97
       assert length(pair["articles"]) == 2
+      assert body["meta"]["outcome"] == "success"
+    end
+
+    test "an empty conflict queue is classified empty, not left unclassified", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+
+      body =
+        conn |> auth_conn(raw_key) |> get(~p"/api/v1/knowledge/conflicts") |> json_response(200)
+
+      assert body["data"] == []
+      assert body["meta"]["outcome"] == "empty"
     end
   end
 

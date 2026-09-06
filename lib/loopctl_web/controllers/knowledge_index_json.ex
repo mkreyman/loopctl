@@ -7,7 +7,15 @@ defmodule LoopctlWeb.KnowledgeIndexJSON do
   produced and validated by `LoopctlWeb.KnowledgeIndexController`; only those
   fields are emitted per article, which keeps the payload small for large
   catalogs.
+
+  Both pages carry `meta.outcome` (`LoopctlWeb.Outcome`). A catalog discloses no
+  degradation of its own, so the value here is only ever `success` or `empty` — but
+  it is PRESENT, and that is the point: a client that has to remember which reads
+  publish `outcome` cannot tell an endpoint that deliberately omits it from a server
+  too old to send it, and reads both as "no classification available".
   """
+
+  alias LoopctlWeb.Outcome
 
   @doc """
   Renders the knowledge index with articles grouped by category.
@@ -21,18 +29,22 @@ defmodule LoopctlWeb.KnowledgeIndexJSON do
         Map.new(grouped, fn {category, articles} ->
           {category, Enum.map(articles, &project(&1, fields))}
         end),
-      meta: %{
-        total_count: meta.total_count,
-        categories: meta.categories,
-        offset: meta.offset,
-        limit: meta.limit,
-        truncated: meta.truncated,
-        # `has_more` is a synonym for `truncated` (more rows beyond this page).
-        has_more: meta.truncated,
-        # Echo the applied projection so a consumer can tell a projected-out
-        # field from a genuinely absent value.
-        fields: fields
-      }
+      meta:
+        Outcome.put(
+          %{
+            total_count: meta.total_count,
+            categories: meta.categories,
+            offset: meta.offset,
+            limit: meta.limit,
+            truncated: meta.truncated,
+            # `has_more` is a synonym for `truncated` (more rows beyond this page).
+            has_more: meta.truncated,
+            # Echo the applied projection so a consumer can tell a projected-out
+            # field from a genuinely absent value.
+            fields: fields
+          },
+          page_count(grouped)
+        )
     }
   end
 
@@ -66,17 +78,30 @@ defmodule LoopctlWeb.KnowledgeIndexJSON do
         Map.new(grouped, fn {category, articles} ->
           {category, Enum.map(articles, &project(&1, fields))}
         end),
-      meta: %{
-        # The cursor walk is drift-free precisely BECAUSE it carries no total_count
-        # to drift; `next_cursor: null` is the exhaustion signal.
-        next_cursor: next_cursor,
-        has_more: has_more,
-        limit: limit,
-        count: length(results),
-        fields: fields,
-        search_mode: "index_keyset"
-      }
+      meta:
+        Outcome.put(
+          %{
+            # The cursor walk is drift-free precisely BECAUSE it carries no total_count
+            # to drift; `next_cursor: null` is the exhaustion signal.
+            next_cursor: next_cursor,
+            has_more: has_more,
+            limit: limit,
+            count: length(results),
+            fields: fields,
+            search_mode: "index_keyset"
+          },
+          length(results)
+        )
     }
+  end
+
+  # `data` is a map of category => articles, so the page's row count is the sum across
+  # groups rather than `map_size/1`, which would count CATEGORIES. No test can tell the
+  # two apart through `outcome`: it reads only zero vs non-zero, and the grouping is built
+  # from the rows themselves so a group is never empty. Written as the sum anyway because
+  # this is the ROW count by name, and the next reader of it will not have that context.
+  defp page_count(grouped) do
+    Enum.reduce(grouped, 0, fn {_category, articles}, acc -> acc + length(articles) end)
   end
 
   defp project(article, fields) do

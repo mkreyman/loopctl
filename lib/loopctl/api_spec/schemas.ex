@@ -4079,7 +4079,11 @@ defmodule Loopctl.ApiSpec.Schemas do
 
     OpenApiSpex.schema(%{
       title: "MemoryListResponse",
-      description: "A paginated list of memories.",
+      description:
+        "A paginated list of memories. `meta.outcome` carries the uniform tool-outcome " <>
+          "classification; enumeration discloses no degradation of its own, so it is " <>
+          "`empty` or `success` here — present so a caller never has to know which reads " <>
+          "publish it.",
       type: :object,
       properties: %{
         data: %Schema{type: :array, items: Memory},
@@ -4088,7 +4092,8 @@ defmodule Loopctl.ApiSpec.Schemas do
           properties: %{
             total_count: %Schema{type: :integer},
             limit: %Schema{type: :integer},
-            offset: %Schema{type: :integer}
+            offset: %Schema{type: :integer},
+            outcome: LoopctlWeb.Outcome.schema()
           }
         }
       }

@@ -207,6 +207,27 @@ defmodule LoopctlWeb.CorpusControllerTest do
   end
 
   describe "GET /api/v1/corpora and /:id and /:id/status" do
+    # The corpus list is the ROUTING call: an agent runs it to decide whether this tenant
+    # holds a corpus at all, before ever searching one. It shipped with no `meta` object at
+    # all, so an empty `data` array was the only thing a caller could read and an absent
+    # `outcome` was indistinguishable from a server too old to send one. Both values are
+    # pinned so a regression that hardcodes either is caught.
+    test "the list carries meta.outcome, empty when the tenant holds no corpus", %{conn: conn} do
+      {tenant, raw_key} = keyed_tenant()
+
+      empty = conn |> auth(raw_key) |> get(~p"/api/v1/corpora") |> json_response(200)
+
+      assert empty["data"] == []
+      assert empty["meta"]["outcome"] == "empty"
+
+      _corpus = create_corpus!(tenant.id)
+
+      listed = conn |> auth(raw_key) |> get(~p"/api/v1/corpora") |> json_response(200)
+
+      assert length(listed["data"]) == 1
+      assert listed["meta"]["outcome"] == "success"
+    end
+
     test "lists, shows and reports per-source status", %{conn: conn} do
       {tenant, raw_key} = keyed_tenant()
       corpus = create_corpus!(tenant.id)

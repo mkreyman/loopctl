@@ -8,18 +8,23 @@ defmodule LoopctlWeb.OutcomeSurfacesTest do
 
   The table is HAND-MAINTAINED, so it cannot catch a NEW surface that ships without the
   key; the guarantee it gives is over the VIEW-rendered surfaces the docs name
-  (`mcp-server/README.md`), and the catalog endpoints that carry no `outcome` are absent
-  on purpose. `corpus_search` is the one documented retrieval surface missing here for a
-  reason that is not an omission: it renders `outcome` in `LoopctlWeb.CorpusController`
-  rather than a view module, so its wiring is proved at the HTTP boundary instead —
-  `test/loopctl_web/controllers/corpus_controller_test.exs`, "meta.outcome separates a
-  real hit from a corpus that genuinely holds nothing".
+  (`mcp-server/README.md`). The catalog endpoints are IN the table now: they were once
+  excluded because they disclose no degradation of their own, which is true of the value
+  and irrelevant to the key — a client reads an absent `outcome` as "no classification
+  available" and cannot tell a deliberate opt-out from an old server.
+
+  The surfaces that render `outcome` in a CONTROLLER rather than a view module are proved
+  at the HTTP boundary instead, in their own controller tests: `corpus_search` and the
+  corpus list (`corpus_controller_test.exs`), the suggested-links read
+  (`knowledge_suggest_links_controller_test.exs`), and drafts/conflicts
+  (`article_workflow_controller_test.exs`).
   """
   use LoopctlWeb.ConnCase, async: true
 
   alias LoopctlWeb.ArticleJSON
   alias LoopctlWeb.KnowledgeContextJSON
   alias LoopctlWeb.KnowledgeHybridSearchJSON
+  alias LoopctlWeb.KnowledgeIndexJSON
   alias LoopctlWeb.KnowledgeProgressiveJSON
   alias LoopctlWeb.KnowledgeSearchJSON
   alias LoopctlWeb.MemoryJSON
@@ -90,6 +95,31 @@ defmodule LoopctlWeb.OutcomeSurfacesTest do
          })
        end},
       {"article index (knowledge list)", fn -> ArticleJSON.index(%{articles: [], meta: %{}}) end},
+      {"knowledge index (offset)",
+       fn ->
+         KnowledgeIndexJSON.index(
+           %{
+             articles: %{},
+             meta: %{
+               total_count: 0,
+               categories: %{},
+               offset: 0,
+               limit: 1000,
+               truncated: false
+             }
+           },
+           ["id", "title", "category"]
+         )
+       end},
+      {"knowledge index (keyset)",
+       fn ->
+         KnowledgeIndexJSON.keyset(
+           %{results: [], next_cursor: nil, has_more: false, limit: 1000},
+           ["id", "title", "category"]
+         )
+       end},
+      {"memory list",
+       fn -> MemoryJSON.index(%{results: [], meta: %{total_count: 0, limit: 20, offset: 0}}) end},
       {"memory recall",
        fn ->
          MemoryJSON.recall(%{
@@ -135,6 +165,71 @@ defmodule LoopctlWeb.OutcomeSurfacesTest do
       assert meta.outcome == "empty",
              "#{label} classified a healthy zero-result render as #{meta.outcome}"
     end
+  end
+
+  test "a catalog page holding rows is success, counted across category groups" do
+    # The table above renders every surface EMPTY, so on its own it cannot tell
+    # `Outcome.put(meta, count)` from `Outcome.put(meta, 0)` — both classify `"empty"`,
+    # and a wiring that always passed zero would pass it. This is the other half: a page
+    # that HOLDS rows must classify `"success"`.
+    #
+    # What this does NOT bind, said plainly: the knowledge index counts rows across
+    # category groups rather than counting the groups, and `outcome` reads only zero vs
+    # non-zero, so no assertion here can separate the two.
+    article = fn title, category ->
+      %{id: Ecto.UUID.generate(), title: title, category: category, tags: [], status: :published}
+    end
+
+    rendered =
+      KnowledgeIndexJSON.index(
+        %{
+          articles: %{
+            "pattern" => [article.("One", :pattern), article.("Two", :pattern)],
+            "finding" => [article.("Three", :finding), article.("Four", :finding)]
+          },
+          meta: %{
+            total_count: 4,
+            categories: %{"pattern" => 2, "finding" => 2},
+            offset: 0,
+            limit: 1000,
+            truncated: false
+          }
+        },
+        ["id", "title", "category"]
+      )
+
+    assert rendered.meta.outcome == "success"
+
+    keyset =
+      KnowledgeIndexJSON.keyset(
+        %{
+          results: [
+            %{
+              id: Ecto.UUID.generate(),
+              title: "One",
+              category: :pattern,
+              tags: [],
+              status: :published
+            }
+          ],
+          next_cursor: nil,
+          has_more: false,
+          limit: 1000
+        },
+        ["id", "title", "category"]
+      )
+
+    assert keyset.meta.outcome == "success"
+
+    tenant = fixture(:tenant)
+
+    memory =
+      MemoryJSON.index(%{
+        results: [fixture(:memory, %{tenant_id: tenant.id})],
+        meta: %{total_count: 1, limit: 20, offset: 0}
+      })
+
+    assert memory.meta.outcome == "success"
   end
 
   test "a degraded half is classified as such on every surface that can disclose one" do

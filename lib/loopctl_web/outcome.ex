@@ -1,9 +1,18 @@
 defmodule LoopctlWeb.Outcome do
   @moduledoc """
-  ONE derivation of `meta.outcome` — the uniform tool-outcome envelope the knowledge,
-  memory and corpus RETRIEVAL responses carry, plus the `knowledge_list` enumeration
-  path. The catalog/list endpoints that disclose no degradation of their own
-  (`knowledge_index`, `memory_list`, `corpus_list`, drafts, conflicts) do NOT carry it.
+  ONE derivation of `meta.outcome` — the uniform tool-outcome envelope EVERY read on the
+  knowledge, memory and corpus surfaces carries: the retrieval responses, the enumeration
+  paths (`knowledge_list`, `knowledge_index`, `memory_list`, `corpus_list`), the review
+  queues (drafts, conflicts) and the link-suggestion read.
+
+  The catalog and queue endpoints were once excluded on the ground that they disclose no
+  degradation of their own, so their `outcome` can only ever be `"empty"` or `"success"`.
+  That is still true of the VALUE and it was the wrong call about the KEY. A client cannot
+  read a per-endpoint opt-out: an absent `outcome` means "this endpoint declined to
+  classify" and "this server predates the envelope" at the same time, and the client has
+  no way to tell them apart — `mcp-server`'s `outcomeOf` collapses both to `null` and
+  falls back to the pre-envelope flag heuristics. Uniformity is the whole product here, so
+  the key is present on every read and absence has exactly one meaning: an old server.
 
   The idea is borrowed from MemoRizz v0.8.0 (RichmondAlake), whose every tool
   execution returns a content-free outcome so an agent never has to parse prose to

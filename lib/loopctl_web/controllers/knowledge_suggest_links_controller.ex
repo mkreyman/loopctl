@@ -16,6 +16,7 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
   alias Loopctl.ExitClass
   alias Loopctl.Knowledge
   alias LoopctlWeb.Helpers.Visibility
+  alias LoopctlWeb.Outcome
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -46,7 +47,9 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
         "under-fill is expected for densely-linked hubs. `meta.ann_iterative_scan` " <>
         "separately discloses whether the vector read ran with pgvector's " <>
         "`hnsw.iterative_scan`: `unavailable` means results may be incomplete for a " <>
-        "reason `recall_truncated` does NOT cover. Role: agent+.",
+        "reason `recall_truncated` does NOT cover. `meta.outcome` carries the uniform " <>
+        "tool-outcome classification: an `unavailable` scan renders as `degraded`, so a " <>
+        "short list is not read as a complete one. Role: agent+.",
     parameters: [
       id: [in: :path, type: :string, description: "Article UUID"],
       limit: [in: :query, type: :integer, description: "Max candidates (default 5)"],
@@ -98,7 +101,8 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
                    description:
                      "Present ONLY alongside `ann_iterative_scan: \"unavailable\"`: a " <>
                        "non-sensitive explanation of the degraded vector read."
-                 }
+                 },
+                 outcome: LoopctlWeb.Outcome.schema()
                }
              }
            }
@@ -132,7 +136,7 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
       # densely-linked hub whose nearest pool was filled but cut below `limit` by
       # the already-linked anti-join / threshold — `recall_truncated: true`) from a
       # genuinely-empty one. `recall_truncated`/`pool_exhausted` are the same flag.
-      json(conn, %{data: suggestions, meta: render_meta(meta)})
+      json(conn, %{data: suggestions, meta: render_meta(meta, suggestions)})
     else
       {:error, :invalid_threshold} ->
         {:error, :bad_request, "threshold must be a number between 0 and 1"}
@@ -217,7 +221,14 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
   # otherwise silently drop a disclosure the context computed. Absent on the
   # no-embedding short-circuit (no vector read), and the `_reason` key only alongside
   # `unavailable` — so take, never fetch.
-  defp render_meta(meta) do
+  #
+  # `meta.outcome` (`LoopctlWeb.Outcome`) closes the same gap one key wider. This endpoint
+  # is the OTHER producer of the `ann_iterative_scan: "unavailable"` disclosure, and the
+  # only signal it had was a flag under a name no client reads: an under-returned candidate
+  # list came back as a plain short list, indistinguishable from an article that genuinely
+  # has no unlinked neighbours. `Outcome` classifies that as `"degraded"` under the same
+  # key every other retrieval response uses, so a caller needs no per-endpoint rule.
+  defp render_meta(meta, suggestions) do
     %{
       requested: meta.requested,
       returned: meta.returned,
@@ -225,6 +236,7 @@ defmodule LoopctlWeb.KnowledgeSuggestLinksController do
       pool_exhausted: meta.pool_exhausted
     }
     |> Map.merge(Map.take(meta, [:ann_iterative_scan, :ann_iterative_scan_reason]))
+    |> Outcome.put_for(suggestions)
   end
 
   # Absent → nil (context applies the default). A present value must parse to a

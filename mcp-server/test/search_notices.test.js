@@ -223,3 +223,48 @@ test("a standing condition is not told to wait for what a wait cannot clear", ()
     }
   }
 });
+
+test("every retrieval tool that carries meta.outcome also PRINTS the banner", () => {
+  // The finding this closes: the server classified nine retrieval responses and the
+  // client acted on three of them. On the six below the handler ended at a bare
+  // `toContent(result)`, so `outcome: "degraded"` rode into the JSON and nothing read
+  // it — a shed memory recall still looked exactly like an empty scope, which is the
+  // one misread the whole envelope exists to end.
+  //
+  // Anchored to index.js's SOURCE rather than to a re-implementation of the handlers,
+  // because the handlers are not exported: a copy in this file would assert only about
+  // the copy. Each handler's body is sliced out and required to end in the wrapper.
+  const src = readFileSync(join(here, "..", "index.js"), "utf8");
+
+  const handlers = [
+    "knowledgeSearch",
+    "knowledgeHybridSearch",
+    "knowledgeContext",
+    "knowledgeProgressiveIndex",
+    "knowledgeHeatIndex",
+    "knowledgeList",
+    "memoryRecall",
+    "recallContext",
+    "corpusSearch",
+  ];
+
+  for (const name of handlers) {
+    const start = src.indexOf(`async function ${name}(`);
+    assert.notEqual(start, -1, `${name} must exist in index.js`);
+    const end = src.indexOf("\n}\n", start);
+    assert.notEqual(end, -1, `${name} must have a closing brace`);
+    const body = src.slice(start, end);
+
+    assert.match(
+      body,
+      /return withRemediationNotice\(result\);/,
+      `${name} must return through withRemediationNotice — a bare toContent drops the ` +
+        `outcome banner and the degradation is silent at the client`,
+    );
+    assert.doesNotMatch(
+      body,
+      /return toContent\(result\);/,
+      `${name} must not also have a bare toContent return path`,
+    );
+  }
+});
