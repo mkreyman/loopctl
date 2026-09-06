@@ -17,6 +17,9 @@ defmodule Loopctl.Net.PinnedHostHeaderTest do
 
   alias Loopctl.Net.UrlGuard
 
+  # Generous on purpose: see the comment in observed_host/3.
+  @receive_timeout 30_000
+
   @ipv4_loopback {127, 0, 0, 1}
   @ipv6_loopback {0, 0, 0, 0, 0, 0, 0, 1}
 
@@ -68,10 +71,32 @@ defmodule Loopctl.Net.PinnedHostHeaderTest do
 
     req_opts =
       UrlGuard.pinned_request_opts(pinned)
-      |> Keyword.merge(method: :get, retry: false, redirect: false, receive_timeout: 2_000)
+      |> Keyword.merge(
+        method: :get,
+        retry: false,
+        redirect: false,
+        receive_timeout: @receive_timeout
+      )
 
-    {:ok, %Req.Response{status: 200, body: body}} = Req.request(req_opts)
-    body
+    # This is the ONE test in the suite whose verdict depends on a real socket
+    # completing inside a deadline, so the deadline is generous and a transport
+    # failure says so in words. A 2s budget flaked the commit gate once at load
+    # 36.9 on a 16-thread box and passed on the retry at load 37.9; hammering the
+    # same round-trip 400x under deliberate scheduler starvation reproduced it at
+    # 16/400, every one a Req.TransportError with reason :timeout. Nothing about
+    # the Host header is timing-dependent, so a slow loopback response is box
+    # weather, not a defect - but a bare match on {:ok, _} reported it as an
+    # unexplained MatchError, which is what cost the diagnosis.
+    case Req.request(req_opts) do
+      {:ok, %Req.Response{status: 200, body: body}} ->
+        body
+
+      {:ok, %Req.Response{status: status}} ->
+        flunk("echo server answered #{status}, expected 200")
+
+      {:error, error} ->
+        flunk("pinned request never completed: #{Exception.message(error)}")
+    end
   end
 
   defp start_echo_server(ip, id) do
