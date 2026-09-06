@@ -17,18 +17,24 @@ defmodule Loopctl.Net.PinnedHostHeaderTest do
 
   alias Loopctl.Net.UrlGuard
 
-  # One deadline for EVERY leg - socket read, pool checkout, connect. Widening
-  # only the read moves the flake; and a Finch pool-checkout timeout RAISES
-  # rather than returning {:error, _}, escaping the case in observed_host/3.
+  # One deadline for the two legs Req can set: pool checkout (Finch defaults to
+  # 5s) and each socket read (15s). Connect is NOT one of them - Req/Mint
+  # already default it to 30_000, and overriding it changes the md5 Req names
+  # its Finch pool from, diverging this test's pool from the production one.
   @request_deadline 30_000
-  # Must outlast all three legs, or a hung request dies as ExUnit.TimeoutError.
-  @moduletag timeout: 4 * @request_deadline
+
+  # The ONLY total bound: receive_timeout is per-CHUNK and Req forwards just
+  # :receive_timeout/:pool_timeout to Finch, so Finch's :request_timeout stays
+  # :infinity. A backstop, not a derived worst case - it only has to outlast one
+  # leg so the flunk diagnostics print instead of an ExUnit.TimeoutError.
+  @suite_deadline 4 * @request_deadline
+  if @suite_deadline <= @request_deadline,
+    do: raise("@suite_deadline must outlast one leg's @request_deadline")
+
+  @moduletag timeout: @suite_deadline
 
   @ipv4_loopback {127, 0, 0, 1}
   @ipv6_loopback {0, 0, 0, 0, 0, 0, 0, 1}
-
-  # No in-file IPv6 probe: test_helper.exs excludes :requires_ipv6 after its own
-  # :gen_tcp.listen probe, and a setup returning {:skip, _} goes RED, not skipped.
 
   test "IPv4-pinned request sends the original hostname as Host" do
     port = start_echo_server(@ipv4_loopback, :echo_v4)
@@ -68,9 +74,7 @@ defmodule Loopctl.Net.PinnedHostHeaderTest do
         retry: false,
         redirect: false,
         pool_timeout: @request_deadline,
-        receive_timeout: @request_deadline,
-        # Keyword.put, not a fresh list: the guard's hostname: is under test.
-        connect_options: Keyword.put(pinned_opts[:connect_options], :timeout, @request_deadline)
+        receive_timeout: @request_deadline
       )
 
     # The verdict depends on a real socket completing inside a deadline. A 2s
@@ -80,20 +84,37 @@ defmodule Loopctl.Net.PinnedHostHeaderTest do
     # a defect, but a bare match reported it as an unexplained MatchError.
     # inspect/1, not Exception.message/1: it keeps the error MODULE, and cannot
     # itself raise on a non-exception term.
-    case Req.request(req_opts) do
-      {:ok, %Req.Response{status: 200, body: body}} ->
-        body
+    # A pool-checkout timeout does NOT return {:error, _}: Finch reraises a bare
+    # RuntimeError (deps/finch/lib/finch/http1/pool.ex), so rescue it into the
+    # same diagnostic instead of letting it escape as an unexplained raise.
+    try do
+      case Req.request(req_opts) do
+        {:ok, %Req.Response{status: 200, body: body}} ->
+          body
 
-      {:ok, %Req.Response{status: status}} ->
-        flunk("echo server answered #{status}, expected 200")
+        {:ok, %Req.Response{status: status}} ->
+          flunk("echo server answered #{status}, expected 200")
 
-      {:error, error} ->
-        flunk("pinned request never completed: #{inspect(error)}")
+        {:error, error} ->
+          flunk("pinned request never completed: #{inspect(error)}")
+      end
+    rescue
+      error in RuntimeError ->
+        flunk("pinned request never completed: " <> Exception.message(error))
     end
   end
 
   defp start_echo_server(ip, id) do
     transport_options = [ip: ip] ++ if(tuple_size(ip) == 8, do: [:inet6], else: [])
+
+    # Bind once ourselves: start_supervised! reports a failed bind as an opaque
+    # :eaddrnotavail child-start exit. test_helper.exs excludes :requires_ipv6
+    # after its own probe, but --include/--only OVERRIDE that exclude, and a
+    # setup returning {:skip, _} raises - so this is the only guard left.
+    case :gen_tcp.listen(0, [{:active, false} | transport_options]) do
+      {:ok, probe} -> :gen_tcp.close(probe)
+      {:error, reason} -> flunk("cannot bind #{:inet.ntoa(ip)}: #{:inet.format_error(reason)}")
+    end
 
     pid =
       start_supervised!(
