@@ -195,7 +195,83 @@ All notable changes to loopctl are documented here.
      count, not one page per tenant. The per-tenant anomaly rows and webhooks are
      unchanged.
 
+- **`meta.outcome` on every read of the knowledge, memory and corpus surfaces.** One
+  additive `meta` key classifying the response as `success` | `empty` | `degraded` |
+  `fallback` | `error`, with precedence `error > fallback > degraded > empty > success`.
+  It replaces having to know which per-surface flag names a degradation: the same event
+  was previously spread across `fallback`, `fallback_reason`, `degraded`, `reason`,
+  `semantic_unavailable_reason`, `semantic_under_filled` and `ann_iterative_scan`, with a
+  different key per endpoint, and a zero-result response could not be told apart from a
+  shed one.
+
+  Carried by the retrieval reads (`/knowledge/search`, `/knowledge/context`,
+  `/knowledge/hybrid_search`, `/knowledge/progressive_index`, `/knowledge/heat_index`,
+  `/memory/recall`, `/recall`, `/corpora/:id/search`), the enumerations (`/articles`,
+  `/knowledge/index`, `/memory`, `/corpora`), the review queues (`/knowledge/drafts`,
+  `/knowledge/conflicts`) and `/knowledge/articles/:id/suggested_links`. Write endpoints
+  carry none.
+
+  Two of those are worth an operator's attention. `GET /api/v1/corpora` previously
+  returned NO `meta` object at all and now returns one — additive, but a client that
+  asserted on the exact response key set will see the new key. And
+  `/knowledge/articles/:id/suggested_links` is the second producer of the
+  `ann_iterative_scan: "unavailable"` disclosure: an under-returned candidate list there
+  now renders `outcome: "degraded"` instead of arriving indistinguishable from a complete
+  short list.
+
+  On a catalog or a queue the value is only ever `empty` or `success` — those endpoints
+  disclose no degradation of their own — but the key is present, so an ABSENT `outcome`
+  means one thing only: a server older than this release.
+
 ### Changed
+
+- **BREAKING: `POST /api/v1/knowledge/bulk-delete` no longer accepts `confirm`, and archiving
+  by `tag` is now a two-step flow (#779).** The `confirm` parameter was a model-visible
+  authorization argument: the same request that asked for the mutation also carried its own
+  approval, so nothing outside the caller ever saw the proposal, and an agent that decided to
+  archive every article carrying a tag also decided to confirm it. It is gone.
+
+  **What breaks.** A request carrying a `confirm` key is refused with `400` and
+  `error.code: "confirm_removed"` — deliberately refused rather than ignored, so a client that
+  believes it is passing a gate learns the gate moved instead of silently sweeping a set. A
+  `tag` call with neither `dry_run` nor a replay credential is refused with `400` and
+  `error.code: "dry_run_required"`. Both codes are stable and machine-readable; the other 400s
+  on this endpoint stay uncoded.
+
+  **The new flow for `tag`, the same one the hard delete already used.** POST with
+  `dry_run: true` to get `meta.would_affect` and a single-use, TTL-bounded `meta.token` frozen
+  over the previewed id-set, then POST the same `tag` with that `token` to archive exactly that
+  set. Rows that started matching the tag after the dry-run are never touched. A selector too
+  large to freeze gets `meta.oversized` and `meta.confirm_hash` instead, echoed back with the
+  same `tag`, and the server re-resolves and refuses on any drift. A `tag` that currently
+  matches nothing needs no proposal: it stays a `200` no-op with `affected: 0`.
+
+  **Archive and delete proposals are not interchangeable, at any set size.** Within the frozen
+  bound they are minted with distinct token types, so an archive token replayed as a hard
+  delete, or a delete token replayed as an archive, is a `400`. Over the bound there is no
+  token and the credential is `meta.confirm_hash`, which is keyed on the OP as well as the
+  id-set — otherwise both flows hash the same rows to the same value and an archive preview
+  authorizes an irreversible purge. That is the blast-radius escalation the two-step flow
+  exists to prevent. A token is bound to its SELECTOR as well, on the hard delete exactly as
+  on the tag archive: one minted for `tag: a` is refused on a call naming `tag: b` rather than
+  silently purging `a` while the response reports success for `b`. So a hard delete replays
+  the same selector it previewed, not the token alone. Tokens remain single-use, TTL-bounded
+  and tenant-scoped. A selector that currently matches nothing needs no proposal on either
+  path — it is a `200` no-op with `affected: 0`, and it still writes its audit event.
+
+  **Deploy note:** both credential formats changed shape, so a proposal minted by the previous
+  release is refused after the deploy — a token as an invalid token, an oversized
+  `confirm_hash` as a mismatch. Nothing is mis-executed (both refusals are fail-closed), and
+  the window closes on its own within one token TTL. Re-run the dry-run.
+
+  **Unchanged:** the `article_ids` and `source_type`+`source_id` selectors still archive
+  immediately with no token, because each names a set the caller already holds. The role gate
+  is still `user`. The response shape is unchanged, including the backward-compatible
+  `meta.counts`/`meta.results` block.
+
+  **Client action:** upgrade `loopctl-mcp-server`; its `knowledge_bulk_delete` tool no longer
+  declares `confirm`. A hand-rolled client must drop `confirm` from every bulk-delete call and
+  add the dry-run/replay round trip for `tag` archives.
 
 - **A draft is no longer held forever: the nightly pass now publishes held drafts, and
   the weekly draft-archiving sweep is parked (#765).** Before this, `status: :draft` had

@@ -86,12 +86,26 @@ exactly the pollution the separate tables prevent.
    unpublish (undoable, but asserts the article is a draft), archive (not undoable by any agent
    call). The `:user` set
    is single-article `unpublish` plus ALL the SET-BASED bulk ops — `bulk_publish`, `bulk_unpublish`
-   and the ENTIRE `bulk_delete` action, soft path included (`article_workflow_controller.ex:37-39`).
+   and the ENTIRE `bulk_delete` action, soft path included (`article_workflow_controller.ex:59-61`).
    **Both criteria matter**: set-based blast radius (one call mutates an unbounded set) AND
    irreversibility (`bulk_delete` carries a hard-delete path) — see the controller `@moduledoc`
-   (`:9-18`). Single-article ops are agent-role precisely BECAUSE nothing they do destroys a row, so
+   (`:13-21`). Single-article ops are agent-role precisely BECAUSE nothing they do destroys a row, so
    never drop that property when reasoning about a new op.
-   `drafts`/`publish` are `:orchestrator` (`:33`).
+   `drafts`/`publish` are `:orchestrator` (`:55`).
+   **`bulk_delete` takes no model-visible `confirm` argument, on either path (#779).** A `confirm`
+   flag is authorization the caller writes for itself: the same request that asks for the mutation
+   carries its own approval, so nothing outside the caller ever sees the proposal. Both
+   high-blast-radius paths — the irreversible HARD delete over any selector, and the SOFT archive of
+   a `tag` selector — return a server-minted proposal the caller REPLAYS instead: a `dry_run` freezes
+   the id-set into a single-use, TTL-bounded, tenant-scoped, TYPED `BulkDeleteToken`, and the run
+   executes exactly that frozen set. The type is what stops an archive proposal being replayed as a
+   delete, or the reverse, and on BOTH ops it carries a keyed digest of the SELECTOR so a token is not
+   spendable on a set the caller never named; over the frozen bound, where there is no token, the
+   `confirm_hash` is keyed on the OP for the same reason. A request carrying `confirm` is `400 confirm_removed`, refused rather than
+   ignored; a `tag` call with neither `dry_run` nor a replay credential is `400 dry_run_required`
+   (a selector matching nothing needs no proposal — it stays a `200` no-op on either path).
+   The `article_ids` and `source` archives are unchanged — each names a set the caller already holds.
+   When adding a destructive op here, mint a proposal; never add a confirm flag.
    Agent edits are visibility-scoped: an agent can only touch an article it can see. (See `chain-of-custody`.)
    **Recording a verdict is agent-role; AUTHORIZING the unattended RETIREMENT is not.** The
    conflict PAIR is manufacturable — the queue is fed by a mechanical similarity threshold — so

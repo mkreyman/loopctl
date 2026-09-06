@@ -58,7 +58,10 @@ defmodule LoopctlWeb.KnowledgeIndexController do
         "ordering over the filtered set. `meta.categories` reports per-category " <>
         "counts within the caller's visible articles. Use `fields` to control the projection " <>
         "(default id,title,category; request tags/status/updated_at explicitly) to keep " <>
-        "the payload small. Role: agent+.",
+        "the payload small. `meta.outcome` carries the uniform tool-outcome " <>
+        "classification; a catalog discloses no degradation of its own, so it is " <>
+        "`empty` or `success` here — present so a caller never has to know which " <>
+        "reads publish it. Role: agent+.",
     parameters: [
       project_id: [
         in: :path,
@@ -175,7 +178,8 @@ defmodule LoopctlWeb.KnowledgeIndexController do
                  fields: %OpenApiSpex.Schema{
                    type: :array,
                    items: %OpenApiSpex.Schema{type: :string}
-                 }
+                 },
+                 outcome: LoopctlWeb.Outcome.schema()
                }
              }
            }

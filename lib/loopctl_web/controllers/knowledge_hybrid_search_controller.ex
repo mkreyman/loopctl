@@ -112,6 +112,7 @@ defmodule LoopctlWeb.KnowledgeHybridSearchController do
              meta: %OpenApiSpex.Schema{
                type: :object,
                properties: %{
+                 outcome: LoopctlWeb.Outcome.schema(),
                  provenance: %OpenApiSpex.Schema{
                    type: :string,
                    enum: ["curated", "retrieved"],

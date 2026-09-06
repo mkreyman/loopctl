@@ -14,16 +14,26 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
   """
 
   alias Loopctl.Llm.Remediation
+  alias LoopctlWeb.Outcome
 
   # One constant, shared with the backfill that PRODUCES snippets, so the produced length
   # and the enforced length cannot drift.
   @max_snippet_length Loopctl.Knowledge.max_snippet_length()
 
-  @doc "Renders search results with unified score field and truncated snippets."
+  @doc """
+  Renders search results with unified score field and truncated snippets.
+
+  `meta.outcome` classifies the whole response (`LoopctlWeb.Outcome`), so a caller
+  can tell a healthy empty result set from a keyword-only fallback or a shed read
+  without reading five different degradation keys.
+  """
   def search(%{results: results, meta: meta}, mode) do
     %{
       data: Enum.map(results, &render_result(&1, mode)),
-      meta: render_meta(meta)
+      # `outcome` is derived from the WHITELISTED meta, not the raw context meta, so the
+      # classification can only read keys the caller also receives — no verdict an agent
+      # cannot re-derive from what it was sent.
+      meta: meta |> render_meta() |> Outcome.put_for(results)
     }
   end
 
@@ -44,6 +54,10 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
   - `include_body` — whether each row carries the article `body` (US-27.10).
   - `byte_truncated` — whether the page was shortened by the serialized-body byte
     budget (US-27.10). Only ever `true` when `include_body` is `true`.
+  - `outcome` — the uniform tool-outcome envelope (`LoopctlWeb.Outcome`). A keyset
+    page discloses no degradation and carries no `offset`, so it is only ever
+    `"empty"` or `"success"` — and because the walk always keeps at least one row
+    while rows remain, `"empty"` on this path is a genuinely empty filtered set.
 
   When `include_body: true`, the CONTEXT (`Loopctl.Knowledge.list_keyset/2`) has
   already trimmed the page to `full_content_byte_budget/0` and recomputed
@@ -64,17 +78,19 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
       }) do
     %{
       data: Enum.map(results, &render_list_row(&1, include_body)),
-      meta: %{
-        # The cursor walk is drift-free precisely BECAUSE it carries no
-        # total_count to drift; `next_cursor: null` is the exhaustion signal.
-        next_cursor: next_cursor,
-        has_more: has_more,
-        limit: limit,
-        count: length(results),
-        include_body: include_body,
-        byte_truncated: byte_truncated,
-        search_mode: "list_keyset"
-      }
+      meta:
+        %{
+          # The cursor walk is drift-free precisely BECAUSE it carries no
+          # total_count to drift; `next_cursor: null` is the exhaustion signal.
+          next_cursor: next_cursor,
+          has_more: has_more,
+          limit: limit,
+          count: length(results),
+          include_body: include_body,
+          byte_truncated: byte_truncated,
+          search_mode: "list_keyset"
+        }
+        |> Outcome.put_for(results)
     }
   end
 

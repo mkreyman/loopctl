@@ -1590,7 +1590,10 @@ async function knowledgeProgressiveIndex({ topic, query, category, limit }) {
     null,
     process.env.LOOPCTL_AGENT_KEY,
   );
-  return toContent(result);
+  // A topic browse is a RETRIEVAL: it runs the same ranked pool, so it can come back
+  // short or keyword-only. Without the banner a shed index reads as "the KB has no
+  // articles on this topic", which is the exact misread meta.outcome exists to end.
+  return withRemediationNotice(result);
 }
 
 async function knowledgeHeatIndex({ category, limit, since }) {
@@ -1605,7 +1608,9 @@ async function knowledgeHeatIndex({ category, limit, since }) {
     null,
     process.env.LOOPCTL_AGENT_KEY,
   );
-  return toContent(result);
+  // The query-free route, reached for precisely when the query-shaped ones came back
+  // empty — so an unannounced degradation here strands the agent with no route left.
+  return withRemediationNotice(result);
 }
 
 async function knowledgeProgressiveDrill({ article_id, body_max_bytes, body_offset }) {
@@ -1661,7 +1666,9 @@ async function knowledgeList({
     null,
     process.env.LOOPCTL_AGENT_KEY,
   );
-  return toContent(result);
+  // Enumeration, not ranking — but a short page still under-reports the set, and an
+  // agent enumerating to decide something absent is the caller least able to tell.
+  return withRemediationNotice(result);
 }
 
 async function knowledgeGet({
@@ -1837,9 +1844,11 @@ async function memoryRecall({ query, limit, include_superseded }) {
     process.env.LOOPCTL_AGENT_KEY,
   );
   // Surface meta (fallback/reason/total_count/underfilled) so the caller can tell
-  // a degraded recall from a genuinely empty scope (AC-28.4.4) — toContent already
-  // preserves the full result (data + meta), we just keep this call explicit.
-  return toContent(result);
+  // a degraded recall from a genuinely empty scope (AC-28.4.4). meta alone was not
+  // enough: agents do not read it, which is the whole finding behind the banner. On
+  // the MEMORY surface a shed read otherwise looks identical to an empty scope, and
+  // "I have never been told this" is the most consequential thing to get wrong here.
+  return withRemediationNotice(result);
 }
 
 async function recallContext({ query, project_id, limit }) {
@@ -1858,8 +1867,11 @@ async function recallContext({ query, project_id, limit }) {
     process.env.LOOPCTL_AGENT_KEY,
   );
   // Surface both per-source metas (memory fallback/underfilled + knowledge degraded)
-  // so the caller can tell a degraded recall from a genuinely empty scope.
-  return toContent(result);
+  // so the caller can tell a degraded recall from a genuinely empty scope. The merged
+  // meta can carry ONE half's failure beside the other half's rows, which the server
+  // classifies "degraded" — a banner is the only place a caller sees that the pack it
+  // is about to act on is a half.
+  return withRemediationNotice(result);
 }
 
 async function memoryList({ limit, offset, include_superseded, all_subjects }) {
@@ -2034,12 +2046,16 @@ async function knowledgeDelete({ article_id }) {
   return toContent(result);
 }
 
+// There is deliberately NO `confirm` parameter here (#779). A destructive action
+// returns a server-minted proposal the caller REPLAYS; it never takes its own
+// authorization as an argument the model can fill in. The server refuses a request
+// carrying a `confirm` key with 400 confirm_removed rather than ignoring it, so a
+// stale client learns the gate moved instead of believing it passed one.
 async function knowledgeBulkDelete({
   article_ids,
   source_type,
   source_id,
   tag,
-  confirm,
   dry_run,
   hard,
   token,
@@ -2050,11 +2066,12 @@ async function knowledgeBulkDelete({
   if (source_type) payload.source_type = source_type;
   if (source_id) payload.source_id = source_id;
   if (tag) payload.tag = tag;
-  if (confirm) payload.confirm = confirm;
-  // US-27.12: dry-run preview + irreversible hard delete via a single-use frozen
-  // token. dry_run=true mutates nothing (returns meta.would_affect; for the hard
-  // path a single-use meta.token); hard=true + token performs the FK-correct
-  // IRREVERSIBLE delete over the frozen id-set. Oversized selectors echo
+  // US-27.12 / #779: dry-run preview + a single-use frozen token, on BOTH the
+  // irreversible hard delete (any selector) and the soft ARCHIVE of a `tag`
+  // selector. dry_run=true mutates nothing (returns meta.would_affect plus
+  // meta.token); replaying that token performs the op over the FROZEN id-set.
+  // The two flows mint DIFFERENT token types, so an archive proposal is not
+  // spendable as a delete or the reverse. Oversized selectors echo
   // meta.confirm_hash for re-confirm-on-drift instead of a token.
   if (dry_run) payload.dry_run = true;
   if (hard) payload.hard = true;
@@ -3094,8 +3111,10 @@ async function corpusSearch({ corpus_id, query, query_vector, lanes, limit }) {
     process.env.LOOPCTL_AGENT_KEY,
   );
   // Pointers + snippets only — the caller's next step is to open the file at
-  // source_ref/locator. Nothing here is auto-injected into a recall pack.
-  return toContent(result);
+  // source_ref/locator. Nothing here is auto-injected into a recall pack, so a
+  // degradation nobody announces is never noticed downstream either: this banner is
+  // the only disclosure a corpus read gets.
+  return withRemediationNotice(result);
 }
 
 async function corpusStatus({ corpus_id, limit, offset }) {
@@ -5786,15 +5805,25 @@ const TOOLS = [
       "of articles by selector. " +
       "REQUIRES LOOPCTL_USER_KEY (user role — orchestrator is NOT sufficient). Provide EXACTLY ONE " +
       "selector: article_ids (explicit list), source_type + source_id (every active article from " +
-      "that source), or tag + confirm:true (every active article carrying the tag — high blast " +
-      "radius, so confirm:true is required). " +
+      "that source), or tag (every active article carrying the tag — high blast radius). " +
+      "THERE IS NO confirm PARAMETER. Sending one is 400 confirm_removed, never ignored. A " +
+      "high-blast-radius call is authorized by REPLAYING a server-minted proposal, never by a " +
+      "flag in the same request that asks for the mutation. " +
       "DEFAULT (soft archive): rows move to archived, never dropped; set-based + idempotent; " +
-      "meta.count = archived, meta.counts/meta.results give the breakdown. " +
-      "DRY-RUN: dry_run:true mutates NOTHING and returns meta.would_affect (and, for hard, a " +
-      "single-use meta.token / for oversized selectors a meta.confirm_hash). " +
-      "HARD DELETE (irreversible): first dry_run with hard:true to get a token, then call again " +
-      "with hard:true + that token to FK-correctly delete the FROZEN id-set (links removed first, " +
-      "access events cascade). The token is single-use and TTL-bounded. Bounded to 5000 per call.",
+      "meta.count = archived, meta.counts/meta.results give the breakdown. article_ids and " +
+      "source archive immediately; the tag selector is TWO-STEP. " +
+      "TWO-STEP (tag archive, and every hard delete): call with dry_run:true to get " +
+      "meta.would_affect and a single-use, TTL-bounded meta.token frozen over the previewed " +
+      "id-set, then call again with the SAME selector plus that token. The op runs over the " +
+      "FROZEN set, so rows that started matching after the preview are never touched. A call " +
+      "with neither dry_run nor token is 400 (dry_run_required on the tag archive) UNLESS the " +
+      "selector matches nothing, which stays a 200 no-op on either path. The token is TYPED by " +
+      "op AND by selector: an archive token is not spendable as a delete or the reverse, and a " +
+      "token minted for one tag is 400 on a call naming another — sweeping a list of tags " +
+      "needs its own dry-run per tag. Oversized selectors (over the frozen bound) get " +
+      "meta.oversized + " +
+      "meta.confirm_hash instead of a token; echo the hash back with the same selector and the " +
+      "server refuses on any drift. Bounded to 5000 per call.",
     inputSchema: {
       type: "object",
       properties: {
@@ -5814,17 +5843,15 @@ const TOOLS = [
         tag: {
           type: "string",
           description:
-            "Every active article carrying this tag (selector 3). Requires confirm:true.",
-        },
-        confirm: {
-          type: "boolean",
-          description: "Required (true) when selecting by tag — guards the high blast radius.",
+            "Every active article carrying this tag (selector 3). Two-step even for the soft " +
+            "archive: dry_run:true for a meta.token, then replay it. There is no confirm flag.",
         },
         dry_run: {
           type: "boolean",
           description:
-            "Preview only — mutate nothing. Returns meta.would_affect; with hard:true also a " +
-            "single-use meta.token (or meta.confirm_hash for oversized selectors).",
+            "Preview only — mutate nothing. Returns meta.would_affect, plus the single-use " +
+            "meta.token for a hard delete or a tag archive (or meta.confirm_hash for oversized " +
+            "selectors).",
         },
         hard: {
           type: "boolean",
@@ -5836,14 +5863,17 @@ const TOOLS = [
         token: {
           type: "string",
           description:
-            "The single-use frozen-set token from a `dry_run:true, hard:true` preview. Required " +
-            "for the hard delete.",
+            "The single-use frozen-set token from a dry_run preview. Required for a hard delete " +
+            "and for a tag archive, and replayed with the SAME selector. Typed by op AND by " +
+            "selector: an archive token is not spendable as a delete, and a token minted for " +
+            "one tag is refused on a call naming another.",
         },
         confirm_hash: {
           type: "string",
           description:
-            "For an oversized hard-delete selector (no token): the meta.confirm_hash from the " +
-            "dry-run, echoed back to re-confirm the id-set hasn't drifted.",
+            "For an oversized selector (no token was minted): the meta.confirm_hash from the " +
+            "dry-run, echoed back to re-confirm the id-set hasn't drifted. Applies to an " +
+            "oversized hard delete and an oversized tag archive.",
         },
       },
       required: [],

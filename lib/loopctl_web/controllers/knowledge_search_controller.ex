@@ -192,6 +192,7 @@ defmodule LoopctlWeb.KnowledgeSearchController do
                    "(`cursor`) instead returns the self-describing cursor contract: " <>
                    "next_cursor, has_more, limit, count, include_body.",
                properties: %{
+                 outcome: LoopctlWeb.Outcome.schema(),
                  total_count: %OpenApiSpex.Schema{type: :integer},
                  total_count_scope: %OpenApiSpex.Schema{
                    type: :string,
