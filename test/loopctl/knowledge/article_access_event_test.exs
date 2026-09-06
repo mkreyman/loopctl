@@ -75,7 +75,25 @@ defmodule Loopctl.Knowledge.ArticleAccessEventTest do
 
   describe "access_types/0" do
     test "returns all supported types" do
-      assert ArticleAccessEvent.access_types() == ~w(search get context index drill)
+      assert ArticleAccessEvent.access_types() == ~w(search get context index drill referenced)
+    end
+
+    test "`referenced` is in NO read set — a client assertion must never rank anything" do
+      # `referenced` is the one access type a CLIENT asserts about itself. Every other type
+      # here is the server recording something it delivered. Admitting it to a read set would
+      # let an agent inflate its own article's reads, its heat, and precision, which is the
+      # self-inflation failure #567/#569 rebuilt the heat index around — one table over.
+      assert "referenced" in ArticleAccessEvent.access_types(),
+             "the assertions below are vacuous if the type does not exist"
+
+      refute "referenced" in Analytics.read_access_types()
+      refute "referenced" in Analytics.attributable_access_types()
+
+      metrics = File.read!("lib/loopctl/knowledge.ex")
+      assert metrics =~ "@heat_read_access_types ~w(get)"
+
+      live = File.read!("lib/loopctl/knowledge/live_retrieval_metrics.ex")
+      assert live =~ ~s(@chosen_read_types ["get", "drill"])
     end
 
     test "#569: the schema allowlist and the Analytics write guard do not drift" do

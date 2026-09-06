@@ -8,6 +8,8 @@ defmodule LoopctlWeb.MemoryController do
   - `POST   /api/v1/memory/promote` — trigger session→long-term promotion (US-29.3)
   - `GET    /api/v1/memory`         — list (limit/offset + total_count meta)
   - `DELETE /api/v1/memory/:id`     — forget
+  - `POST   /api/v1/recall/:recall_id/referenced` — record which of the articles that
+    recall SURFACED the caller actually used (the third funnel stage).
   - `POST   /api/v1/recall`         — MERGED recall: one round-trip returning the
     re-ranked `global ∪ active-project` union of long-term memory AND knowledge
     (`Loopctl.Memory.recall_context/2`, #411 Gap 2). Reuses the same key-derived
@@ -46,6 +48,7 @@ defmodule LoopctlWeb.MemoryController do
   use OpenApiSpex.ControllerSpecs
 
   alias Loopctl.ApiSpec.Schemas
+  alias Loopctl.Knowledge.Analytics
   alias Loopctl.Memory
   alias Loopctl.Memory.Scope
   alias LoopctlWeb.AuditContext
@@ -70,6 +73,13 @@ defmodule LoopctlWeb.MemoryController do
   # over-length query at the boundary (BEFORE the shared embedding call) exactly as the
   # standalone `/knowledge/search` does — never half-degrading to a memory-only 200.
   @max_context_query_length 500
+
+  # The cap on how many article ids one `POST /recall/:recall_id/referenced` call may
+  # record, and it is the merged recall's own maximum page size: a caller cannot have
+  # referenced more articles than one recall could have handed it. Published in the
+  # endpoint's OpenAPI description from THIS attribute so the documented limit and the
+  # enforced one cannot drift.
+  @max_referenced_article_ids 50
 
   operation(:create,
     summary: "Remember (write a memory)",
@@ -181,7 +191,22 @@ defmodule LoopctlWeb.MemoryController do
         "the per-tenant cap, the OTHER side is still returned and `meta.degraded?` is " <>
         "true (`meta.degraded_reason` names why) — never a 500 and never a whole-endpoint " <>
         "429 from one shed pool. Agent role " <>
-        "is forced to published articles and its own/`shared` memories (#163).",
+        "is forced to published articles and its own/`shared` memories (#163). " <>
+        "SELECTION LEDGER: every merged `data` item also carries `rank` (1-based " <>
+        "POST-merge position), `selection_reason` (a bounded tag naming the lane that " <>
+        "put it there — knowledge: `keyword`, `semantic`, `keyword+semantic`, " <>
+        "`keyword_fallback`, `unscored`; memory: `semantic`, `ilike_fallback`) and " <>
+        "`tokens_estimate` (bytes/4 of the text a client would paste — an ESTIMATE, " <>
+        "never a tokenizer count; size a hard context budget with your own model's " <>
+        "tokenizer). `meta` carries the call-level accounting: `recall_id`, " <>
+        "`candidates_considered` (`{memory, knowledge, total}` before the merged cap), " <>
+        "`selected_count`, `tokens_selected`, `tokens_candidates` and " <>
+        "`tokens_saved_vs_candidates`. The merged order is DETERMINISTIC — score DESC, " <>
+        "then source (`knowledge` before `memory`), then id ASC — so an unchanged corpus " <>
+        "renders byte-identically between turns and a prompt cache survives. " <>
+        "`meta.recall_id` is ALSO the `search_id` recorded on the knowledge half's " <>
+        "surfacing rows; hand it back to `POST /recall/{recall_id}/referenced` to record " <>
+        "which of those articles you actually used.",
     request_body: {"Recall params", "application/json", Schemas.RecallContextRequest},
     responses: %{
       200 => {"Merged recall results", "application/json", Schemas.RecallContextResponse},
@@ -189,6 +214,50 @@ defmodule LoopctlWeb.MemoryController do
         {"Subject unresolvable, non-string/blank/over-length query, or invalid project_id",
          "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      503 => {"Tenant custody halted", "application/json", Schemas.ErrorResponse}
+    }
+  )
+
+  operation(:referenced,
+    summary: "Record which recalled articles were actually used",
+    description:
+      "Records the THIRD funnel stage — surfaced, opened, REFERENCED. Pass the " <>
+        "`meta.recall_id` from a `POST /recall` response in the path and the ids of the " <>
+        "articles you actually used in `article_ids`. Everything else is derived " <>
+        "server-side: the recording key is YOUR key, and each row is stamped with the " <>
+        "verified `recall_id` as its origin. ONLY articles that recall actually surfaced " <>
+        "under that `recall_id`, in your own tenant, are accepted — any other id fails " <>
+        "the WHOLE call with 422 `not_surfaced` (listing the offending ids) and nothing " <>
+        "is written, so a partial success can never be mistaken for a full one. An " <>
+        "unknown or foreign `recall_id` surfaced nothing, so it takes the same 422 " <>
+        "rather than a 404: there is no cross-tenant existence oracle here. A malformed " <>
+        "`recall_id` is 422 `invalid_recall_id`; a missing/non-list/empty `article_ids`, " <>
+        "or an entry that is not a UUID, is 422 `invalid_article_ids`; more than " <>
+        "#{@max_referenced_article_ids} ids is 422 `too_many_article_ids` (that is the " <>
+        "merged recall's own maximum page size — you cannot have used more articles than " <>
+        "one recall could hand you). Re-posting the same id records another event row; " <>
+        "the retrieval metrics count DISTINCT `(recall_id, article_id)` pairs, so " <>
+        "repeating a call cannot inflate them. These rows are deliberately NOT reads: " <>
+        "they are excluded from the heat index, from the retrieval read sets, and from " <>
+        "per-article/per-agent read counts, because heat must never rank on a signal a " <>
+        "client asserts about itself. Subject to the full :authenticated chain (custody " <>
+        "halt, witness header, rate limiting).",
+    parameters: [
+      recall_id: [
+        in: :path,
+        type: :string,
+        description: "The `meta.recall_id` of the recall that surfaced these articles."
+      ]
+    ],
+    request_body: {"Referenced params", "application/json", Schemas.RecallReferencedRequest},
+    responses: %{
+      200 => {"References recorded", "application/json", Schemas.RecallReferencedResponse},
+      422 =>
+        {"not_surfaced, invalid_recall_id, invalid_article_ids, too_many_article_ids, or subject unresolvable",
+         "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      500 =>
+        {"The reference rows could not be recorded", "application/json", Schemas.ErrorResponse},
       503 => {"Tenant custody halted", "application/json", Schemas.ErrorResponse}
     }
   )
@@ -468,6 +537,142 @@ defmodule LoopctlWeb.MemoryController do
       {:too_long, true} -> {:error, :query_too_long}
       _ -> {:error, :invalid_query}
     end
+  end
+
+  @doc "POST /api/v1/recall/:recall_id/referenced"
+  def referenced(conn, params) do
+    case parse_project_id(params["project_id"]) do
+      {:ok, project_id} -> referenced_with_project(conn, params, project_id)
+      :error -> invalid_project_id(conn)
+    end
+  end
+
+  defp referenced_with_project(conn, params, project_id) do
+    with_scope(conn, project_id, fn scope ->
+      with {:ok, recall_id} <- parse_recall_id(params["recall_id"]),
+           {:ok, article_ids} <- parse_article_ids(params["article_ids"]) do
+        record_referenced(conn, scope, recall_id, article_ids)
+      else
+        {:error, code} -> referenced_error(conn, code)
+      end
+    end)
+  end
+
+  # The api_key_id is read off the CONN, never off the params: this is the identity the
+  # reference is attributed to, and a caller-supplied one would let any agent record
+  # references as another. Same rule `search_id` follows on the recording side (#582).
+  defp record_referenced(conn, scope, recall_id, article_ids) do
+    api_key = conn.assigns.current_api_key
+
+    case Analytics.record_referenced(
+           scope.tenant_id,
+           recall_id,
+           article_ids,
+           api_key.id,
+           # Attribution only. `Analytics.resolve_attribution/3` validates it against the
+           # caller's own tenant and silently drops a foreign value, so the same optional
+           # `project_id` the recall itself took carries the reference rows into the
+           # per-project reporting rather than leaving them unattributed.
+           %{project_id: scope.project_id}
+         ) do
+      {:ok, result} ->
+        json(conn, %{
+          data: %{
+            recall_id: result.recall_id,
+            article_ids: result.article_ids,
+            recorded: result.recorded
+          }
+        })
+
+      {:error, :not_surfaced, missing} ->
+        not_surfaced(conn, missing)
+
+      {:error, :recording_failed} ->
+        conn
+        |> put_status(:internal_server_error)
+        |> json(%{
+          error: %{
+            status: 500,
+            code: "recording_failed",
+            message:
+              "The reference rows could not be recorded. Nothing was written; retry the " <>
+                "same call."
+          }
+        })
+    end
+  end
+
+  defp parse_recall_id(value) when is_binary(value) do
+    trimmed = String.trim(value)
+
+    if canonical_uuid?(trimmed), do: {:ok, trimmed}, else: {:error, :invalid_recall_id}
+  end
+
+  defp parse_recall_id(_), do: {:error, :invalid_recall_id}
+
+  # A missing, non-list or EMPTY `article_ids` is refused rather than treated as a no-op
+  # 200: an empty reference list is a caller bug (it recorded nothing and would read as a
+  # success), and the funnel stage this endpoint exists to measure would silently not be
+  # measured.
+  defp parse_article_ids(ids) when is_list(ids) and ids != [] do
+    cond do
+      length(ids) > @max_referenced_article_ids -> {:error, :too_many_article_ids}
+      Enum.all?(ids, &article_id?/1) -> {:ok, Enum.map(ids, &String.trim/1)}
+      true -> {:error, :invalid_article_ids}
+    end
+  end
+
+  defp parse_article_ids(_), do: {:error, :invalid_article_ids}
+
+  defp article_id?(value) when is_binary(value), do: canonical_uuid?(String.trim(value))
+  defp article_id?(_), do: false
+
+  # The offending ids are echoed back because they are the CALLER'S OWN ids — it sent them
+  # — so naming them leaks nothing and is the difference between a fixable error and a
+  # guess. It never reveals whether an id exists, only that this recall did not surface it.
+  defp not_surfaced(conn, missing) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        code: "not_surfaced",
+        message:
+          "These article ids were not surfaced by this recall, so no reference was " <>
+            "recorded for any of them: #{Enum.join(missing, ", ")}.",
+        details: %{article_ids: missing}
+      }
+    })
+  end
+
+  defp referenced_error(conn, :invalid_recall_id) do
+    referenced_422(
+      conn,
+      "invalid_recall_id",
+      "The `recall_id` path segment must be the `meta.recall_id` UUID from a recall response."
+    )
+  end
+
+  defp referenced_error(conn, :too_many_article_ids) do
+    referenced_422(
+      conn,
+      "too_many_article_ids",
+      "At most #{@max_referenced_article_ids} article ids may be referenced in one call."
+    )
+  end
+
+  defp referenced_error(conn, :invalid_article_ids) do
+    referenced_422(
+      conn,
+      "invalid_article_ids",
+      "`article_ids` must be a non-empty list of article UUIDs."
+    )
+  end
+
+  defp referenced_422(conn, code, message) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{error: %{status: 422, code: code, message: message}})
   end
 
   # Knowledge-side read scoping for the merged recall, mirroring

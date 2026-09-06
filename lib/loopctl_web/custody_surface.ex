@@ -31,7 +31,8 @@ defmodule LoopctlWeb.CustodySurface do
     * **Dispatch minting** — `POST /dispatches`. A dispatch mints an ephemeral
       key carrying custody lineage; issuing new custody authority mid-halt would
       let the chain advance around the freeze.
-    * **Agent-memory writes** — every mutating `/memory` route plus `POST /recall`
+    * **Agent-memory writes** — every mutating `/memory` route plus `POST /recall` and
+      everything under it (`/recall/:recall_id/referenced`)
       (AC-28.3.3: a custody-halted key cannot write memory). Recall is NOT the
       read its verb suggests: `Memory.recall/2` bumps `recall_count` /
       `last_recalled_at` on the rows it returns, the hotness signal the graduation
@@ -131,6 +132,10 @@ defmodule LoopctlWeb.CustodySurface do
   defp custody_path?(["projects", _id, "import"]), do: true
   defp custody_path?(["dispatches"]), do: true
   defp custody_path?(["memory" | _rest]), do: true
-  defp custody_path?(["recall"]), do: true
+  # `recall` and everything under it: the merged recall itself, and
+  # `POST /recall/:recall_id/referenced`, which writes an analytics row. A halt suspends
+  # every mutating MemoryController route, and the tail match is what keeps a route added
+  # under this prefix later from escaping it silently.
+  defp custody_path?(["recall" | _rest]), do: true
   defp custody_path?(_), do: false
 end

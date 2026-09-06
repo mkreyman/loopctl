@@ -124,7 +124,7 @@ exactly the pollution the separate tables prevent.
    `{drift_signal, member_id}` — a group scored under the other signal's normalized key finds
    nothing and withholds (fail-closed).
 5. **Heat must not rank on a signal heat produces** — `Knowledge.heat_index/2`
-   (`knowledge.ex:10931`; the counted set is `@heat_read_access_types`, `:10801`). The heat index is the one retrieval route that
+   (`knowledge.ex:10970`; the counted set is `@heat_read_access_types`, `:10840`). The heat index is the one retrieval route that
    takes NO query, so its misses are uncorrelated with embedding similarity — which is worth nothing
    if its ordering is something a caller or the route itself generates. It has been violated FOUR
    times, each differently — and once by a FIX for one of the others — so treat any new input to

@@ -50,7 +50,7 @@ defmodule Loopctl.Knowledge.Analytics do
 
   # Must stay identical to `ArticleAccessEvent`'s `@access_types` — see the note there for why
   # `"drill"` exists and why the two allowlists move together (#569).
-  @valid_access_types ~w(search get context index drill)
+  @valid_access_types ~w(search get context index drill referenced)
 
   # A READ is a body actually delivered to an agent. `search` and `index` are IMPRESSIONS —
   # rows the RANKER produced, one per surfaced result — and they outnumber reads ~50:1 here.
@@ -70,6 +70,13 @@ defmodule Loopctl.Knowledge.Analytics do
   # EXCLUDED from the heat index (`Knowledge.@heat_read_access_types`), and that divergence is
   # intended — heat asks "was this a deliberate vote", this asks "was a body delivered". Do
   # not unify the two lists.
+  #
+  # `referenced` is NOT a read and must never join this list. Every other type here is the
+  # server observing a body it delivered; `referenced` is a CLIENT asserting that it used one
+  # (`record_referenced/5`). Counting an assertion as a delivery would let a caller inflate
+  # its own article's read counts, per-project and per-agent usage, and the "unused articles"
+  # report — the same self-inflation `@heat_read_access_types` exists to prevent, one table
+  # over.
   @read_access_types ~w(get context drill)
 
   # The access types that mean "a body was DELIVERED to the agent" — the ones worth
@@ -77,6 +84,14 @@ defmodule Loopctl.Knowledge.Analytics do
   # follow-through, INCLUDING `drill`: #569 split drill out of the heat index so that index
   # could not rank on reads it caused itself, but "was this read produced by a search" is a
   # different question and a drill delivers a body like any other read.
+  #
+  # `referenced` is absent for a different reason from the impressions: its origin is not
+  # RESOLVED at all. The caller names the recall, the server verifies the article was
+  # surfaced under it, and `origin_search_id` is stamped from that verified id — so there is
+  # nothing for `resolve_origins/5` to look up, and `origin_attribution` stays NULL because
+  # its vocabulary (`same_key`/`cross_key`/`none`) describes how a lookup ESTABLISHED an
+  # origin. Leaving it NULL is also what keeps `attributed_opens`/`direct_opens` counting
+  # reads only.
   @attributable_access_types ~w(get context drill)
 
   # How far back a read looks for the search that surfaced it. Fixed at WRITE time, which is
@@ -335,6 +350,142 @@ defmodule Loopctl.Knowledge.Analytics do
   end
 
   def record_context_access(_tenant_id, _ids, _api_key_id, _metadata, _context), do: :ok
+
+  @doc """
+  Records that a caller USED articles a recall surfaced — the third funnel stage.
+
+  Surfaced → opened → REFERENCED. The first two are observations: the server wrote the
+  surfacing rows and delivered the bodies. This one is an ASSERTION by the client, because
+  nothing on the server can see which of the articles it handed over actually ended up in
+  an answer. That is precisely the stage the KB has never been able to measure — measured
+  surfaced-to-opened follow-through is 1.67%, and whether an opened article was USED was
+  not recorded at all.
+
+  Because it is an assertion, it is bounded rather than trusted:
+
+    * `recall_id` is matched against `article_access_events` rows in the CALLER'S OWN
+      tenant. There is no cross-tenant read and no existence oracle — an unknown id simply
+      surfaces nothing, so every requested article comes back `not_surfaced`.
+    * ONLY articles that recall actually surfaced under that `recall_id` are accepted. Any
+      other id fails the whole call with `{:error, :not_surfaced, ids}`; nothing is written.
+      This is all-or-nothing on purpose: a partial write would record a truth mixed with a
+      rejection under one id and leave the caller unable to say which.
+    * `api_key_id` is the CALLER'S key, stamped server-side, never taken from params.
+    * `origin_search_id` is stamped from the VERIFIED `recall_id`, and `origin_attribution`
+      stays NULL — see `@attributable_access_types` for why an asserted origin does not
+      belong in that vocabulary.
+
+  Writes SYNCHRONOUSLY, unlike every other recorder here, because the caller is told how
+  many rows were recorded and a fire-and-forget count would be a guess.
+
+  Repeat calls for the same `(recall_id, article_id)` write another row rather than
+  erroring. `RetrievalMetrics` counts DISTINCT `(origin_search_id, article_id)` pairs, so a
+  client that posts twice cannot inflate the metric; the duplicate rows are kept because
+  `article_access_events` is an immutable event log, not a state table.
+
+  ## Returns
+
+    * `{:ok, %{recall_id: id, article_ids: [...], recorded: n}}`
+    * `{:error, :not_surfaced, [ids]}` — the ids this recall did not surface
+    * `{:error, :recording_failed}` — the insert itself failed (logged)
+  """
+  @spec record_referenced(
+          Ecto.UUID.t(),
+          Ecto.UUID.t(),
+          [Ecto.UUID.t()],
+          Ecto.UUID.t(),
+          context()
+        ) ::
+          {:ok, map()} | {:error, :not_surfaced, [String.t()]} | {:error, :recording_failed}
+  def record_referenced(tenant_id, recall_id, article_ids, api_key_id, context \\ %{})
+
+  def record_referenced(tenant_id, recall_id, article_ids, api_key_id, context)
+      when is_binary(tenant_id) and is_binary(recall_id) and is_list(article_ids) and
+             is_binary(api_key_id) do
+    requested = article_ids |> Enum.filter(&is_binary/1) |> Enum.uniq()
+    surfaced = MapSet.new(surfaced_article_ids(tenant_id, recall_id))
+
+    case Enum.reject(requested, &MapSet.member?(surfaced, &1)) do
+      [] -> insert_referenced(tenant_id, recall_id, requested, api_key_id, context)
+      missing -> {:error, :not_surfaced, missing}
+    end
+  end
+
+  def record_referenced(_tenant_id, _recall_id, _article_ids, _api_key_id, _context),
+    do: {:error, :recording_failed}
+
+  @doc """
+  The set of article ids a given recall/search SURFACED, within one tenant.
+
+  The surfacing rows are the `access_type: "search"` rows carrying that id in
+  `metadata->>'search_id'` — the id `search_combined/3` publishes as `meta.search_id` and
+  the merged recall publishes as `meta.recall_id`. Public because it is the whole
+  admission check for `record_referenced/5` and a test that cannot see it cannot pin it.
+
+  Returns a plain LIST, not a `MapSet` — a spec naming an opaque type a function builds
+  itself is a dialyzer contract violation, and the caller wraps it in a set anyway.
+  """
+  @spec surfaced_article_ids(Ecto.UUID.t(), Ecto.UUID.t()) :: [String.t()]
+  def surfaced_article_ids(tenant_id, recall_id)
+      when is_binary(tenant_id) and is_binary(recall_id) do
+    from(e in ArticleAccessEvent,
+      where: e.tenant_id == ^tenant_id,
+      where: e.access_type == "search",
+      where: fragment("?->>'search_id'", e.metadata) == ^recall_id,
+      distinct: true,
+      select: e.article_id
+    )
+    |> AdminRepo.all()
+  rescue
+    error ->
+      Logger.warning("Knowledge.Analytics surfaced lookup failed: #{Exception.message(error)}")
+      []
+  end
+
+  def surfaced_article_ids(_tenant_id, _recall_id), do: []
+
+  # The write half. Deliberately NOT `do_record_sync/5`: that path resolves the origin by
+  # lookup, and `referenced` is not an attributable type there, so it would land every row
+  # with a NULL `origin_search_id` — losing the only thing that ties the reference back to
+  # the recall that produced it.
+  defp insert_referenced(_tenant_id, recall_id, [], _api_key_id, _context),
+    do: {:ok, %{recall_id: recall_id, article_ids: [], recorded: 0}}
+
+  defp insert_referenced(tenant_id, recall_id, article_ids, api_key_id, context) do
+    {project_id, story_id} = resolve_attribution(tenant_id, api_key_id, context)
+    now = DateTime.utc_now()
+
+    rows =
+      Enum.map(article_ids, fn article_id ->
+        %{
+          id: Ecto.UUID.generate(),
+          tenant_id: tenant_id,
+          article_id: article_id,
+          api_key_id: api_key_id,
+          project_id: project_id,
+          story_id: story_id,
+          access_type: "referenced",
+          metadata: %{"recall_id" => recall_id},
+          accessed_at: now,
+          # Stamped from the VERIFIED recall id — the article was proven surfaced under it
+          # above. `origin_attribution` stays NULL: its three values describe how a
+          # server-side LOOKUP established an origin, and this one was asserted and checked.
+          origin_search_id: recall_id,
+          origin_attribution: nil
+        }
+      end)
+
+    {count, _} = AdminRepo.insert_all(ArticleAccessEvent, rows)
+    {:ok, %{recall_id: recall_id, article_ids: article_ids, recorded: count}}
+  rescue
+    error ->
+      # Unlike the fire-and-forget recorders, this one REPORTS the failure: the caller is
+      # being told how many rows were written, and answering 200 for zero rows would be a
+      # lie of exactly the kind rule 3 forbids.
+      Logger.warning("Knowledge.Analytics referenced insert failed: #{Exception.message(error)}")
+
+      {:error, :recording_failed}
+  end
 
   # ---------------------------------------------------------------------------
   # Per-article stats

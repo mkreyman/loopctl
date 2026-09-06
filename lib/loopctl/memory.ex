@@ -1325,9 +1325,13 @@ defmodule Loopctl.Memory do
 
       %{
         results: [
-          %{source: :memory, score: float, memory: %Memory{}}
-          | %{source: :knowledge, score: float, article: map()}
-        ],                                   # merged, sorted score DESC, capped at limit
+          %{source: :memory, score: float, memory: %Memory{},
+            rank: pos_integer(), selection_reason: String.t(),
+            tokens_estimate: non_neg_integer()}
+          | %{source: :knowledge, score: float, article: map(),
+              rank: pos_integer(), selection_reason: String.t(),
+              tokens_estimate: non_neg_integer()}
+        ],                                   # merged, deterministically ordered, capped
         memory: <the recall/2 envelope, unchanged>,
         knowledge: <the search_combined envelope (results + meta), or a degraded stub>,
         meta: %{
@@ -1336,11 +1340,54 @@ defmodule Loopctl.Memory do
           total_count: non_neg_integer(),    # length(results) after the merged cap
           memory_count: non_neg_integer(),   # memory rows BEFORE the merged cap
           knowledge_count: non_neg_integer(),# knowledge rows BEFORE the merged cap
+          recall_id: String.t(),             # this recall's id (see the ledger below)
+          candidates_considered: %{memory: n, knowledge: n, total: n},
+          selected_count: non_neg_integer(),
+          tokens_selected: non_neg_integer(),
+          tokens_candidates: non_neg_integer(),
+          tokens_saved_vs_candidates: non_neg_integer(),
           degraded?: boolean(),              # knowledge errored/fell back OR memory shed
           degraded_reason: String.t() | nil, # bounded tag naming why (nil when healthy)
           results_ranking: String.t()        # "heuristic_cross_source" (see KNOWN BIAS)
         }
       }
+
+  ## The selection ledger
+
+  Every merged item carries `rank` (1-based, POST-merge), `selection_reason` and
+  `tokens_estimate`, and the meta carries the call-level accounting above. The point is
+  that a client can EXPLAIN its own context assembly — what was considered, what was
+  supplied, and what that cost — instead of inferring it from the list it happened to get.
+  Borrowed from MemoRizz's per-turn EvidencePack (KB `80a063e9`), which records candidates,
+  supplied items and referenced sources with rank, score and a token budget.
+
+    * `selection_reason` is a BOUNDED tag. Knowledge: `"keyword"`, `"semantic"`,
+      `"keyword+semantic"` (both lanes returned the row — `fuse_rrf/2` unions their raw
+      fields, so the lanes are readable off the result), `"keyword_fallback"` (the whole
+      call degraded to keyword-only), or `"unscored"`. Memory: `"semantic"` or
+      `"ilike_fallback"`, read from the envelope rather than from a per-row nil score.
+    * `tokens_estimate` is BYTES / 4, rounded up, over the text a client would paste (a
+      memory's text; an article's snippet, or its title when there is no snippet). It is an
+      estimate by construction — see `estimate_tokens/1`.
+    * `tokens_saved_vs_candidates` is what the merged cap did not hand you. With
+      `tokens_candidates` it says whether the cap is doing anything at all.
+
+  ## The merged order is DETERMINISTIC
+
+  Score DESC, then the source tag ascending (`knowledge` before `memory`), then `id` ASC —
+  a total order, so an unchanged corpus renders a byte-identical block between turns and a
+  client's prompt cache survives. Score alone left cross-source ties to the order two lists
+  happened to be concatenated in. Same discipline as `Knowledge.heat_index/2` snapping its
+  default window to a UTC day boundary so a refresh is byte-identical.
+
+  ## `meta.recall_id`
+
+  ONE id for the whole recall, and it is the `search_id` recorded on the knowledge half's
+  surfacing rows in `article_access_events` — not a second id that would have to be joined
+  to the first. `POST /api/v1/recall/:recall_id/referenced` takes it back to record which
+  of those surfaced articles the caller actually USED
+  (`Knowledge.Analytics.record_referenced/5`), which is the third stage — candidates,
+  supplied, REFERENCED — that nothing here measured before.
 
   NB the `:article` on a `:knowledge` merged item is the `search_combined/3` result map
   (article summary — id/title/category/tags/snippet + scores), the same shape the
@@ -1357,6 +1404,14 @@ defmodule Loopctl.Memory do
   def recall_context(%Scope{} = scope, opts \\ []) do
     query = to_string(opt(opts, :query, ""))
     limit = clamp_context_limit(opt(opts, :limit, @default_context_limit))
+
+    # ONE id for the whole recall, threaded into the knowledge half as its
+    # `search_combined/3` `search_id` so the id this response publishes is the id the
+    # surfacing rows in `article_access_events` carry. The memory half writes no
+    # `search_events`/surfacing row of its own today; if it ever does, it MUST reuse this
+    # id rather than mint a second one — two ids for one recall is exactly what makes
+    # `POST /recall/:recall_id/referenced` unable to say what was surfaced.
+    recall_id = Ecto.UUID.generate()
 
     # Generate the query embedding ONCE and thread it into BOTH halves. This
     # single-round-trip endpoint otherwise made TWO uncached outbound provider calls
@@ -1381,24 +1436,47 @@ defmodule Loopctl.Memory do
     memory_env =
       recall(scope, query: query, limit: limit, embedding: embedding_result, on_overload: :tag)
 
-    knowledge_env = knowledge_recall(scope, query, limit, opts, embedding_result)
+    knowledge_env = knowledge_recall(scope, query, limit, opts, embedding_result, recall_id)
+
+    memory_reason = memory_selection_reason(memory_env)
 
     memory_items =
       Enum.map(memory_env.results, fn {memory, score} ->
-        %{source: :memory, score: score, memory: memory}
+        %{
+          source: :memory,
+          score: score,
+          memory: memory,
+          selection_reason: memory_reason,
+          tokens_estimate: estimate_tokens(memory_text(memory))
+        }
       end)
+
+    knowledge_degraded = knowledge_degraded?(knowledge_env)
 
     knowledge_items =
       Enum.map(knowledge_env.results, fn result ->
-        %{source: :knowledge, score: knowledge_score(result), article: result}
+        %{
+          source: :knowledge,
+          score: knowledge_score(result),
+          article: result,
+          selection_reason: knowledge_selection_reason(result, knowledge_degraded),
+          tokens_estimate: estimate_tokens(knowledge_text(result))
+        }
       end)
 
+    candidates = memory_items ++ knowledge_items
+
     merged =
-      (memory_items ++ knowledge_items)
-      # `score` can be nil on the memory ILIKE fallback path — rank it as 0.0 without
-      # mutating the per-source envelope (which preserves the honest nil).
-      |> Enum.sort_by(&(&1.score || 0.0), :desc)
+      candidates
+      |> Enum.sort_by(&merge_order_key/1)
       |> Enum.take(limit)
+      # 1-based POST-MERGE rank. It is deliberately not the per-source rank: what a client
+      # pastes is this list, in this order, so the position that matters is the position here.
+      |> Enum.with_index(1)
+      |> Enum.map(fn {item, rank} -> Map.put(item, :rank, rank) end)
+
+    tokens_selected = sum_tokens(merged)
+    tokens_candidates = sum_tokens(candidates)
 
     %{
       results: merged,
@@ -1410,6 +1488,21 @@ defmodule Loopctl.Memory do
         total_count: length(merged),
         memory_count: length(memory_items),
         knowledge_count: length(knowledge_items),
+        # --- Selection ledger (borrowed from MemoRizz's EvidencePack, KB 80a063e9) ------
+        # What was CONSIDERED, what was SUPPLIED, and what that cost — so a client can
+        # explain its own context assembly instead of inferring it from the list it got.
+        recall_id: recall_id,
+        candidates_considered: %{
+          memory: length(memory_items),
+          knowledge: length(knowledge_items),
+          total: length(candidates)
+        },
+        selected_count: length(merged),
+        tokens_selected: tokens_selected,
+        tokens_candidates: tokens_candidates,
+        # Never negative: the selected set is a subset of the candidates, so this is the
+        # budget the merged cap saved. Clamped anyway rather than trusted.
+        tokens_saved_vs_candidates: max(tokens_candidates - tokens_selected, 0),
         # `degraded?` is true when EITHER half degraded: the knowledge side errored/fell
         # back to keyword-only, OR the memory heavy-read pool was shed (empty by capacity).
         degraded?: knowledge_degraded?(knowledge_env) or memory_degraded?(memory_env),
@@ -1432,7 +1525,7 @@ defmodule Loopctl.Memory do
   # `%{results: [...], meta: %{...}}` envelope. On ANY error (empty query, invalid
   # weights, bad_request) the knowledge side degrades to empty results tagged
   # `degraded?: true` — the merged call never propagates a knowledge fault as a crash.
-  defp knowledge_recall(scope, query, limit, opts, embedding_result) do
+  defp knowledge_recall(scope, query, limit, opts, embedding_result, recall_id) do
     kopts =
       [
         project_id: scope.project_id,
@@ -1451,6 +1544,9 @@ defmodule Loopctl.Memory do
       # them apart — and `agent_id` / `duration_ms` were NULL on every one of them.
       |> Keyword.put(:_tool, "memory_recall")
       |> Keyword.put(:_started_at, System.monotonic_time(:millisecond))
+      # The recall and its knowledge half share ONE id (see `recall_context/2`), so the
+      # `recall_id` in this response is the `search_id` on the surfacing rows.
+      |> Keyword.put(:_search_id, recall_id)
       |> maybe_put_opt(:agent_id, opt(opts, :agent_id, nil))
       |> maybe_put_opt(:_client_context, opt(opts, :_client_context, nil))
       # Reuse the embedding generated ONCE in `recall_context/2` so the knowledge half
@@ -1464,10 +1560,10 @@ defmodule Loopctl.Memory do
         %{results: results, meta: Map.put(meta, :degraded?, Map.get(meta, :fallback, false))}
 
       {:error, reason} ->
-        degraded_knowledge_env(scope.tenant_id, reason, limit)
+        degraded_knowledge_env(scope.tenant_id, reason, limit, recall_id)
 
       {:error, reason, _message} ->
-        degraded_knowledge_env(scope.tenant_id, reason, limit)
+        degraded_knowledge_env(scope.tenant_id, reason, limit, recall_id)
     end
   end
 
@@ -1482,7 +1578,7 @@ defmodule Loopctl.Memory do
   # non-sensitive `fallback_reason` tag — the raw internal reason atom is NEVER placed
   # in the client-facing meta (it lives only in telemetry/logs), so `/recall` no longer
   # leaks an internal atom the equivalent `/knowledge/search` would have stripped.
-  defp degraded_knowledge_env(tenant_id, reason, limit) do
+  defp degraded_knowledge_env(tenant_id, reason, limit, recall_id) do
     tag = knowledge_degraded_reason_tag(reason)
     emit_recall_degraded(tenant_id, "knowledge", tag)
 
@@ -1494,7 +1590,11 @@ defmodule Loopctl.Memory do
         offset: 0,
         degraded?: true,
         fallback: true,
-        fallback_reason: tag
+        fallback_reason: tag,
+        # Carried even though this half returned nothing and recorded nothing: the id is
+        # the recall's identity, not the knowledge search's, and a caller must be able to
+        # read one from every response shape.
+        search_id: recall_id
       }
     }
   end
@@ -1567,6 +1667,89 @@ defmodule Loopctl.Memory do
     do: Knowledge.absolute_result_score(result) * RankingPriors.demotion_factor(result)
 
   defp knowledge_score(_), do: 0.0
+
+  # --- Selection ledger helpers (#411 Gap 2 follow-up; KB 80a063e9) -------------------
+  #
+  # The ledger answers "why is this row here, where did it land, and what does it cost" —
+  # the three questions a client otherwise has to guess at when it decides what to paste
+  # into a prompt. All three are DERIVED from what the two halves already returned: nothing
+  # here re-runs a search, re-embeds, or reads the database.
+
+  # A TOTAL, DETERMINISTIC order over the merged list: score DESC, then the source tag
+  # ASCENDING (`knowledge` before `memory` — alphabetical, so the rule is readable off the
+  # value itself), then `id` ASC. Score alone leaves cross-source ties to be broken by the
+  # concatenation order of two lists, so an unchanged corpus could render a different block
+  # between turns and bust a client's prompt cache for no informational gain. Same
+  # discipline as `heat_index/2` snapping its default window to a UTC day boundary so a
+  # refresh is byte-identical, and as `fuse_rrf/2` breaking its RRF ties on `id`.
+  #
+  # `score` is nil on the memory ILIKE fallback path; it ranks as 0.0 here WITHOUT mutating
+  # the per-source envelope, which keeps the honest nil.
+  defp merge_order_key(%{source: source} = item),
+    do: {-(item.score || 0.0), Atom.to_string(source), item_id(item)}
+
+  defp item_id(%{source: :memory, memory: memory}), do: to_string(Map.get(memory, :id) || "")
+
+  # `Map.get/2`, never `article[:id]`: a combined-search result may arrive as a STRUCT and
+  # Access is undefined on structs — the same trap `record_search_attempt/7` already
+  # rescues around at the recording site.
+  defp item_id(%{source: :knowledge, article: article}),
+    do: to_string(Map.get(article, :id) || "")
+
+  # WHICH LANE ACTUALLY MATCHED, read off the fields the fused result already carries: the
+  # keyword lane contributes `:relevance_score` and the semantic lane `:similarity_score`,
+  # and `fuse_rrf/2` UNIONS the raw fields of a doc that both lanes returned. A whole-search
+  # keyword-only degrade is its own tag rather than "keyword", because the two mean opposite
+  # things about the corpus: one is a document the keyword lane genuinely won, the other is
+  # every document on a call where the semantic lane was unavailable.
+  defp knowledge_selection_reason(_result, true), do: "keyword_fallback"
+
+  defp knowledge_selection_reason(result, _degraded) when is_map(result) do
+    case {number?(Map.get(result, :relevance_score)), number?(Map.get(result, :similarity_score))} do
+      {true, true} -> "keyword+semantic"
+      {true, false} -> "keyword"
+      {false, true} -> "semantic"
+      {false, false} -> "unscored"
+    end
+  end
+
+  defp knowledge_selection_reason(_result, _degraded), do: "unscored"
+
+  # The memory half has two paths and no per-row mixture: either the query embedded and
+  # every row is a cosine neighbour, or it did not and every row is an ILIKE text match.
+  # So the reason is read from the ENVELOPE, not from a per-row nil score, which a
+  # legitimately-zero similarity would also produce.
+  #
+  # ONE clause, no catch-all: `recall/2` returns this envelope on every path, degraded
+  # included, so a fallback clause here would be dead code that dialyzer flags — and a
+  # silent "semantic" default for a shape that cannot occur is worse than a crash for a
+  # shape that would mean the envelope changed.
+  defp memory_selection_reason(%{meta: meta}) do
+    if Map.get(meta, :fallback, false), do: "ilike_fallback", else: "semantic"
+  end
+
+  defp number?(value), do: is_number(value)
+
+  # What a client would actually PASTE for this row: the memory's text, or the article's
+  # snippet (its title when the snippet is absent — a snippet-less knowledge row still
+  # costs the title it renders).
+  defp memory_text(memory), do: Map.get(memory, :text) || Map.get(memory, :content) || ""
+
+  defp knowledge_text(result) when is_map(result),
+    do: Map.get(result, :snippet) || Map.get(result, :title) || ""
+
+  defp knowledge_text(_), do: ""
+
+  # An ESTIMATE, and labelled one everywhere it is published: bytes / 4, rounded up, the
+  # standard rough token ratio for English text. It is deliberately NOT a tokenizer call —
+  # the true count is model-specific, this runs per row on a request path, and the figure
+  # exists to compare "what I took" against "what I could have taken", where a consistent
+  # bias cancels. Do not tighten it into a promise: a caller sizing a hard context budget
+  # must count with its own model's tokenizer.
+  defp estimate_tokens(text) when is_binary(text), do: div(byte_size(text) + 3, 4)
+  defp estimate_tokens(_), do: 0
+
+  defp sum_tokens(items), do: Enum.reduce(items, 0, &(&1.tokens_estimate + &2))
 
   defp clamp_context_limit(limit),
     do: limit |> to_int(@default_context_limit) |> max(1) |> min(@max_context_limit)

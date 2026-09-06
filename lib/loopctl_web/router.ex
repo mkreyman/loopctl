@@ -523,6 +523,11 @@ defmodule LoopctlWeb.Router do
     # MemoryController scope-from-key + project-partition helpers.
     post "/recall", MemoryController, :context
 
+    # The third funnel stage (surfaced -> opened -> REFERENCED). A client hands back the
+    # `meta.recall_id` it was given and names the articles it actually used. Only ids that
+    # recall surfaced under that id, in the caller's own tenant, are accepted.
+    post "/recall/:recall_id/referenced", MemoryController, :referenced
+
     # Context Retriever (Epic 30, US-30.4) — entity-definition CRUD + the
     # model-invoked query surface. Literal /retrieve/tools MUST precede the
     # parameterized /retrieve/:entity so it is not captured as an :entity.

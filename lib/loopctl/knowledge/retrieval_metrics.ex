@@ -57,6 +57,34 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   a day whose rows are mostly legacy or enumeration. Compare `results_returned` against
   the rows the COUNTED calls wrote, never against the day-wide `searched`.
 
+  ## The third stage: `referenced` / `reference_rate`
+
+  `precision` measures surfaced to OPENED. It cannot see the stage after that — whether an
+  opened article was actually USED — and that is the stage the follow-through deficit is
+  about (surfaced-to-opened conversion measured at 1.67%). `POST
+  /api/v1/recall/:recall_id/referenced` records it, and two figures report it:
+
+  - `referenced` — DISTINCT `(origin_search_id, article_id)` pairs a client asserted it
+    used on that day. Deduped on purpose: re-posting the same reference writes another
+    immutable event row but must not move the metric.
+  - `reference_rate` — `referenced / searched`, the same denominator `precision` divides
+    and therefore carrying every one of its caveats: it is a rate over RECORDED SURFACED
+    RESULTS capped at #{Loopctl.Knowledge.Analytics.max_recorded_search_results()} per
+    call, it rises when a search returns fewer results, and the two structural exclusions
+    below bias it UP. `nil`, never `0.0`, when nothing was surfaced — a day with no
+    searches is an `n/a`, and `precision`'s `0.0` on that day is a non-null-column
+    artefact this field is not obliged to repeat.
+
+  **This is the one figure here derived from a CLIENT ASSERTION.** Everything else counts
+  rows the server wrote about deliveries it made; a `referenced` row is a caller saying it
+  used something. It is bounded rather than trusted — only an article that recall actually
+  surfaced under that `recall_id`, in the caller's own tenant, is accepted — but the bound
+  is on WHICH articles, not on whether the claim is true. So read `reference_rate` as
+  self-reported usage, and never let a RANKING consume it: `referenced` is deliberately
+  absent from `@heat_read_access_types`, from `Analytics.@read_access_types`, from
+  `@attributable_access_types` and from `LiveRetrievalMetrics`' chosen reads, because a
+  ranking that consumed it would let an agent promote its own article by asserting it.
+
   ## Two structural exclusions — precision is an UPPER BOUND
 
   `article_access_events.article_id` is NOT NULL and every row needs an `api_key_id`, so
@@ -242,7 +270,13 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   #   v1  post-#711/#712/#713: disposition trio partitions `searches_scored`; no curated /
   #       retrieved provenance breakdown; reads and impressions separated on the analytics
   #       surfaces.
-  @metric_version 1
+  #   v2  adds the third funnel stage: `referenced` (a stored count of DISTINCT
+  #       (recall, article) client-asserted references) and the derived `reference_rate`.
+  #       Every v1 and v0 row reads `referenced = 0` because the endpoint that records it
+  #       did not exist — a true zero, not an `n/a`, but a reader comparing
+  #       `reference_rate` across the boundary is still comparing a stage that could not be
+  #       recorded with one that can.
+  @metric_version 2
 
   @doc """
   The definition-set version stamped on snapshots written by this code. See `@metric_version`.
@@ -359,7 +393,8 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   @doc """
   Compute precision for a single `day` (a `Date`) and follow-through `window_seconds`.
 
-  Returns `%{searched, results_recorded, followed_through, precision, searches,
+  Returns `%{searched, results_recorded, followed_through, precision, referenced,
+  reference_rate, searches,
   searches_with_follow_through, search_follow_through, results_returned, day,
   window_seconds, attributed_opens,
   cross_key_opens, direct_opens, searches_scored, searches_scored_with_follow_through,
@@ -416,6 +451,7 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
     call = compute_call_level(searched_q, window_seconds)
     opens = compute_open_attribution(tenant_id, day_start, day_end)
     dispositions = compute_dispositions(searched_q, window_seconds)
+    referenced = compute_referenced(tenant_id, day_start, day_end)
 
     %{
       day: day,
@@ -424,6 +460,8 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
       results_recorded: searched,
       followed_through: followed,
       precision: precision,
+      referenced: referenced,
+      reference_rate: reference_rate(referenced, searched),
       searches: call.searches,
       searches_with_follow_through: call.searches_with_follow_through,
       search_follow_through: call.search_follow_through,
@@ -463,6 +501,50 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   # before #582 that carries no `search_id` (the article WAS surfaced, so calling it `none`
   # would be false, and there is no id to attribute to), and a `drill` with no surfacing row
   # (the progressive index writes none, so `none` would name the index's own opposite).
+  # THE THIRD FUNNEL STAGE, and the only figure on this payload derived from something a
+  # client SAID rather than something the server observed.
+  #
+  # DISTINCT `(origin_search_id, article_id)`, never a raw row count. `article_access_events`
+  # is an immutable log, so a client that posts the same reference twice writes two rows;
+  # counting rows would let a repeat call move a published metric, which is the self-inflation
+  # failure the heat index already had to be rebuilt around (#567/#569). The dedupe is what
+  # makes the endpoint safe to retry.
+  #
+  # `origin_search_id` is non-null on every row this stage writes (it is stamped from the
+  # verified recall id), so the NOT NULL predicate costs nothing today and stops a future
+  # unattributed row from collapsing the whole day into one phantom pair.
+  #
+  # The infra exclusions are the same two every other counter here applies, and for the same
+  # reason: a reference whose SURFACING search came from `smoke`/`skill-eval` describes a
+  # different population from the one `searched` counts.
+  defp compute_referenced(tenant_id, day_start, day_end) do
+    from(r in ArticleAccessEvent,
+      where: r.tenant_id == ^tenant_id,
+      where: r.access_type == "referenced",
+      where: r.accessed_at >= ^day_start and r.accessed_at < ^day_end,
+      where: not is_nil(r.origin_search_id),
+      distinct: [r.origin_search_id, r.article_id],
+      # A map, not a tuple: a subquery must select a source, a field or a map.
+      select: %{origin_search_id: r.origin_search_id, article_id: r.article_id}
+    )
+    |> exclude_infra_traffic()
+    |> exclude_infra_origins(tenant_id, day_start, day_end)
+    |> subquery()
+    |> AdminRepo.aggregate(:count)
+  end
+
+  # `referenced / searched` — deliberately the SAME denominator as `precision`, so it
+  # inherits every caveat that one carries: recorded surfaced results capped at
+  # #{Loopctl.Knowledge.Analytics.max_recorded_search_results()} per call, gameable by
+  # returning fewer results, and biased UP by the two structural exclusions.
+  #
+  # `nil` rather than `0.0` on an empty denominator, following `scored_follow_through`: a day
+  # on which nothing was surfaced cannot have a usage rate, and publishing `0.0` would assert
+  # "surfaced and never used". `precision` reports `0.0` there only because it is a non-null
+  # column; a derived field is not obliged to repeat that.
+  defp reference_rate(_referenced, searched) when is_nil(searched) or searched <= 0, do: nil
+  defp reference_rate(referenced, searched), do: referenced / searched
+
   defp compute_open_attribution(tenant_id, day_start, day_end) do
     rows =
       from(o in ArticleAccessEvent,
@@ -613,6 +695,10 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
       searches: s.searches,
       searches_with_follow_through: s.searches_with_follow_through,
       search_follow_through: s.search_follow_through,
+      referenced: s.referenced,
+      # Derived, never stored — a pure ratio of two columns on this row, so it is correct
+      # for historical rows with no backfill.
+      reference_rate: reference_rate(s.referenced, s.searched),
       searches_scored: s.searches_scored,
       searches_scored_with_follow_through: s.searches_scored_with_follow_through,
       scored_follow_through:
@@ -904,6 +990,7 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
       searches_with_follow_through: m.searches_with_follow_through,
       search_follow_through: m.search_follow_through,
       results_returned: m.results_returned,
+      referenced: m.referenced,
       attributed_opens: m.attributed_opens,
       cross_key_opens: m.cross_key_opens,
       direct_opens: m.direct_opens,
@@ -928,6 +1015,7 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
            :searches_with_follow_through,
            :search_follow_through,
            :results_returned,
+           :referenced,
            :attributed_opens,
            :cross_key_opens,
            :direct_opens,
@@ -978,6 +1066,11 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
           search_follow_through: s.search_follow_through,
           results_returned: s.results_returned,
 
+          # Unit: DISTINCT (recall, article) REFERENCES — the third funnel stage, and the
+          # only figure here derived from a client ASSERTION rather than a delivery the
+          # server observed. `reference_rate` is attached below.
+          referenced: s.referenced,
+
           # Unit: READS. NOT comparable with `followed_through`, which counts surfaced
           # RESULTS that were later opened. `cross_key_opens` is the injected recall hook's
           # population — it searches under one key and the session reads under another, so
@@ -1013,11 +1106,12 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
       # divide-by-zero case whose correct answer is `nil`, and SQL would need a CASE that
       # then has to agree with `present_snapshot/1`'s. One helper, two call sites, no drift.
       |> Enum.map(fn row ->
-        Map.put(
-          row,
+        row
+        |> Map.put(
           :scored_follow_through,
           scored_follow_through(row.searches_scored_with_follow_through, row.searches_scored)
         )
+        |> Map.put(:reference_rate, reference_rate(row.referenced, row.searched))
       end)
 
     %{data: data, meta: %{limit: limit, offset: offset, total_count: total_count}}

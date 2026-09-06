@@ -6,10 +6,13 @@ defmodule LoopctlWeb.RecallControllerTest do
   """
   use LoopctlWeb.ConnCase, async: true
 
+  import Ecto.Query
+
   setup :verify_on_exit!
 
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.Analytics
   alias LoopctlWeb.MemoryController
 
   defp auth(conn, raw_key), do: put_req_header(conn, "authorization", "Bearer #{raw_key}")
@@ -219,6 +222,190 @@ defmodule LoopctlWeb.RecallControllerTest do
 
       assert body["error"]["code"] == "invalid_project_id"
       assert body["error"]["status"] == 422
+    end
+
+    test "every merged item carries the selection ledger and meta carries the accounting" do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant.id)
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      base_conn()
+      |> auth(raw)
+      |> post(~p"/api/v1/memory", %{"tier" => "long_term", "text" => "prefers reshipments"})
+      |> json_response(201)
+
+      _article = published_article(tenant.id, "reshipment guide")
+
+      body =
+        base_conn()
+        |> auth(raw)
+        |> post(~p"/api/v1/recall", %{"query" => "reshipments"})
+        |> json_response(200)
+
+      %{"data" => data, "meta" => meta} = body
+      assert data != [], "the ledger assertions below are vacuous on an empty merge"
+
+      # `rank` is the position in THIS list, so it is 1..n with no gaps regardless of what
+      # each half ranked internally.
+      assert Enum.map(data, & &1["rank"]) == Enum.to_list(1..length(data))
+
+      valid_reasons =
+        ~w(keyword semantic keyword+semantic keyword_fallback unscored ilike_fallback)
+
+      for item <- data do
+        assert item["selection_reason"] in valid_reasons
+        assert is_integer(item["tokens_estimate"]) and item["tokens_estimate"] >= 0
+      end
+
+      # A memory row's reason comes from the ENVELOPE (which path ran), never from a
+      # per-row nil score, which a legitimately-zero similarity would also produce.
+      memory_item = Enum.find(data, &(&1["source"] == "memory"))
+      assert memory_item["selection_reason"] in ~w(semantic ilike_fallback)
+
+      assert meta["recall_id"] =~
+               ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/
+
+      assert meta["selected_count"] == length(data)
+      assert meta["candidates_considered"]["total"] >= meta["selected_count"]
+
+      assert meta["candidates_considered"]["memory"] +
+               meta["candidates_considered"]["knowledge"] ==
+               meta["candidates_considered"]["total"]
+
+      assert meta["tokens_selected"] == Enum.sum(Enum.map(data, & &1["tokens_estimate"]))
+      assert meta["tokens_candidates"] >= meta["tokens_selected"]
+
+      assert meta["tokens_saved_vs_candidates"] ==
+               meta["tokens_candidates"] - meta["tokens_selected"]
+    end
+
+    test "an unchanged corpus renders BYTE-IDENTICALLY between two recalls" do
+      # The merged order is a total one (score DESC, then source, then id), so a client's
+      # prompt cache survives a repeated turn. Score alone left cross-source ties to the
+      # order two lists happened to be concatenated in. `recall_id` is per-call by design,
+      # so it is excluded from the comparison — everything else must match to the byte.
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant.id)
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      base_conn()
+      |> auth(raw)
+      |> post(~p"/api/v1/memory", %{"tier" => "long_term", "text" => "prefers reshipments"})
+      |> json_response(201)
+
+      for title <- ["reshipment guide", "reshipment policy", "reshipment ledger"] do
+        published_article(tenant.id, title)
+      end
+
+      render = fn ->
+        base_conn()
+        |> auth(raw)
+        |> post(~p"/api/v1/recall", %{"query" => "reshipments"})
+        |> json_response(200)
+        |> Map.get("data")
+        |> Jason.encode!()
+      end
+
+      first = render.()
+      assert first != "[]", "an empty merge would make this determinism check vacuous"
+      assert first == render.()
+    end
+
+    test "TIED rows are broken deterministically by id, not by arrival order" do
+      # The byte-identity test above cannot see a MISSING tie-break while every score
+      # differs, and a cross-source tie is hard to arrange on purpose. The memory ILIKE
+      # fallback makes one for free: every row on that path has a null score, which the
+      # merge ranks as 0.0, so all three tie and the ordering falls through to the
+      # tie-break.
+      #
+      # The arrival order is PINNED rather than left to chance. `recall_fallback/6` orders
+      # `[desc: inserted_at, desc: id]`, so flattening the three timestamps to one instant
+      # makes recall hand the merge exactly `id DESC` — the reverse of what the tie-break
+      # must produce. Without that, arrival order is by insertion time and lands in id-
+      # ascending order 1 run in 6 by luck, which is a guard that reports "fine" on a
+      # sixth of the regressions it exists to catch (verified by mutation: with the
+      # tie-break removed this test failed on 4 fixed seeds and passed on one random one).
+      tenant = fixture(:tenant)
+      {raw, _key, agent} = agent_key(tenant.id)
+
+      memories =
+        for text <- ["reshipments alpha", "reshipments beta", "reshipments gamma"] do
+          fixture(:memory, %{
+            tenant_id: tenant.id,
+            subject_id: to_string(agent.id),
+            text: text
+          })
+        end
+
+      pinned = ~N[2026-01-01 00:00:00]
+
+      {3, _} =
+        from(m in Loopctl.Memory.Memory, where: m.id in ^Enum.map(memories, & &1.id))
+        |> Loopctl.AdminRepo.update_all(set: [inserted_at: pinned])
+
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _tenant_id, _text ->
+        {:error, :no_api_key}
+      end)
+
+      data =
+        base_conn()
+        |> auth(raw)
+        |> post(~p"/api/v1/recall", %{"query" => "reshipments"})
+        |> json_response(200)
+        |> Map.get("data")
+
+      memory_items = Enum.filter(data, &(&1["source"] == "memory"))
+      assert length(memory_items) == 3, "the tie-break check is vacuous with fewer than 2 rows"
+
+      ids = Enum.map(memory_items, & &1["memory"]["id"])
+
+      refute ids == Enum.sort(ids, :desc),
+             "recall did not hand the merge a descending order, so this check proves nothing"
+
+      assert ids == Enum.sort(ids), "tied rows were not ordered by id"
+
+      # And the reason is read from the ENVELOPE (which path ran), not from the nil score.
+      assert Enum.all?(memory_items, &(&1["selection_reason"] == "ilike_fallback"))
+
+      assert Enum.all?(memory_items, &is_nil(&1["score"])),
+             "the per-source envelope must keep the honest nil; only the ORDER treats it as 0.0"
+    end
+
+    test "meta.recall_id IS the search_id on the surfacing rows (one id, not two)" do
+      # The whole point of publishing it: `POST /recall/:recall_id/referenced` checks what
+      # a recall surfaced by looking up rows carrying this id. A second, unrelated id would
+      # make that check impossible to satisfy.
+      tenant = fixture(:tenant)
+      {raw, key, _agent} = agent_key(tenant.id)
+      Knowledge.reset_circuit_breaker(tenant.id)
+      article = published_article(tenant.id, "reshipment guide")
+
+      body =
+        base_conn()
+        |> auth(raw)
+        |> post(~p"/api/v1/recall", %{"query" => "reshipments"})
+        |> json_response(200)
+
+      recall_id = body["meta"]["recall_id"]
+      assert is_binary(recall_id)
+
+      # Recording is async off the request path; wait for the surfacing rows to land.
+      surfaced =
+        Enum.reduce_while(1..50, [], fn _i, _acc ->
+          ids = Analytics.surfaced_article_ids(tenant.id, recall_id)
+
+          if article.id in ids do
+            {:halt, ids}
+          else
+            Process.sleep(20)
+            {:cont, ids}
+          end
+        end)
+
+      assert article.id in surfaced,
+             "the recall published a recall_id that names no surfacing rows"
+
+      assert key.id
     end
 
     test "an identity-less key is refused with a deterministic 422 (subject_id_unresolvable)" do

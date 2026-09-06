@@ -4238,6 +4238,37 @@ defmodule Loopctl.ApiSpec.Schemas do
                   "Present on `source: knowledge` items — the combined-search summary " <>
                     "(id/title/category/tags/score + truncated snippet), the same " <>
                     "whitelisted shape `/knowledge/search` returns."
+              },
+              rank: %Schema{
+                type: :integer,
+                description:
+                  "1-based position in THIS merged list (not the per-source rank). The " <>
+                    "order is deterministic: score DESC, then source (`knowledge` before " <>
+                    "`memory`), then id ASC."
+              },
+              selection_reason: %Schema{
+                type: :string,
+                enum: [
+                  "keyword",
+                  "semantic",
+                  "keyword+semantic",
+                  "keyword_fallback",
+                  "unscored",
+                  "ilike_fallback"
+                ],
+                description:
+                  "Bounded tag naming the lane that put this row here. Knowledge: " <>
+                    "`keyword`, `semantic`, `keyword+semantic`, `keyword_fallback` (the " <>
+                    "whole call degraded to keyword-only) or `unscored`. Memory: " <>
+                    "`semantic` or `ilike_fallback`."
+              },
+              tokens_estimate: %Schema{
+                type: :integer,
+                description:
+                  "Rough token cost of the text a client would paste for this row " <>
+                    "(bytes/4 of the memory text, or the article snippet, or its title). " <>
+                    "An ESTIMATE, never a tokenizer count — size a hard context budget " <>
+                    "with your own model's tokenizer."
               }
             }
           }
@@ -4304,7 +4335,102 @@ defmodule Loopctl.ApiSpec.Schemas do
                 "Stable tag (`heuristic_cross_source`) warning that the merged `data` " <>
                   "order mixes memory's absolute cosine with knowledge's pool-normalized " <>
                   "score and is NOT a calibrated cross-source ranking."
+            },
+            recall_id: %Schema{
+              type: :string,
+              format: :uuid,
+              description:
+                "This recall's id, and the SAME id recorded as `search_id` on the " <>
+                  "knowledge half's surfacing rows — one value, not two to join. Hand it " <>
+                  "back to `POST /recall/{recall_id}/referenced` to record which of the " <>
+                  "surfaced articles you actually used."
+            },
+            candidates_considered: %Schema{
+              type: :object,
+              description:
+                "How many rows each half produced BEFORE the merged cap, and their total.",
+              properties: %{
+                memory: %Schema{type: :integer},
+                knowledge: %Schema{type: :integer},
+                total: %Schema{type: :integer}
+              }
+            },
+            selected_count: %Schema{
+              type: :integer,
+              description: "How many candidates survived the merged cap (== `data` length)."
+            },
+            tokens_selected: %Schema{
+              type: :integer,
+              description: "Summed `tokens_estimate` over the SELECTED items. An estimate."
+            },
+            tokens_candidates: %Schema{
+              type: :integer,
+              description: "Summed `tokens_estimate` over ALL candidates. An estimate."
+            },
+            tokens_saved_vs_candidates: %Schema{
+              type: :integer,
+              description:
+                "`tokens_candidates - tokens_selected` — what the merged cap did not hand " <>
+                  "you. Zero means the cap bound nothing."
             }
+          }
+        }
+      }
+    })
+  end
+
+  defmodule RecallReferencedRequest do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "RecallReferencedRequest",
+      description:
+        "Params for POST /recall/{recall_id}/referenced. The recording key is derived " <>
+          "from the API key and is never read from the body.",
+      type: :object,
+      required: [:article_ids],
+      properties: %{
+        article_ids: %Schema{
+          type: :array,
+          items: %Schema{type: :string, format: :uuid},
+          description:
+            "The articles you actually used, from the `data` of the recall identified by " <>
+              "`recall_id`. Non-empty, at most 50 ids, every one a UUID. An id that " <>
+              "recall did not surface fails the WHOLE call with 422 `not_surfaced`."
+        },
+        project_id: %Schema{
+          type: :string,
+          format: :uuid,
+          nullable: true,
+          description:
+            "Optional attribution (a PARTITION key, not an isolation boundary). A " <>
+              "foreign or unknown value is dropped rather than persisted; a malformed " <>
+              "one is a 422 invalid_project_id."
+        }
+      }
+    })
+  end
+
+  defmodule RecallReferencedResponse do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(%{
+      title: "RecallReferencedResponse",
+      description:
+        "Confirmation that the references were recorded. `recorded` is the number of " <>
+          "event rows written — re-posting the same ids writes more rows, but the " <>
+          "retrieval metrics count DISTINCT (recall_id, article_id) pairs, so a repeat " <>
+          "cannot inflate them.",
+      type: :object,
+      properties: %{
+        data: %Schema{
+          type: :object,
+          properties: %{
+            recall_id: %Schema{type: :string, format: :uuid},
+            article_ids: %Schema{type: :array, items: %Schema{type: :string, format: :uuid}},
+            recorded: %Schema{type: :integer}
           }
         }
       }

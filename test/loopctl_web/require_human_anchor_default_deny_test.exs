@@ -177,6 +177,15 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
                # same KB-tier agent surface + (tenant, subject) key-derived scope as
                # /memory/recall. Not a mutation.
                {:post, "/api/v1/recall"},
+               # The reference-recording half of the same surface. It writes an
+               # analytics row about a recall the caller just made, over the same
+               # KB-tier agent surface and the same key-derived scope, and it grants
+               # nothing: the row is in no read set, feeds no ranking, and every id it
+               # names must already have been surfaced to this tenant. An agent-rooted
+               # tenant is the intended caller of recall, so gating the measurement of
+               # recall behind a human anchor would leave the tier that uses it the one
+               # tier that cannot report on it.
+               {:post, "/api/v1/recall/:recall_id/referenced"},
 
                # Context Retriever (Epic 30, US-30.4) — `POST /retrieve/:entity` is a
                # POST-shaped READ (a governed filter/search over the tenant's OWN

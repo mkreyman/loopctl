@@ -3071,7 +3071,12 @@ defmodule Loopctl.Knowledge do
     results = results || []
     api_key_id = Keyword.get(opts, :api_key_id)
     skip? = Keyword.get(opts, :_skip_record_access, false)
-    search_id = Ecto.UUID.generate()
+    # The call site MAY thread its own id (`:_search_id`, internal — never reachable from a
+    # request body, same rule as the `context`-borne id in `Analytics.record_search_access/6`).
+    # `search_combined/3` does, so the id it publishes as `meta.search_id` is the SAME id the
+    # surfacing rows carry; the merged recall reuses that as its `recall_id`. Absent, one is
+    # minted here exactly as before.
+    search_id = resolve_search_id(opts)
 
     unless skip? or is_nil(api_key_id) do
       record_search_attempt(tenant_id, search_id, api_key_id, query_string, results, mode, opts)
@@ -3104,6 +3109,15 @@ defmodule Loopctl.Knowledge do
           # caller-supplied and a forged id would collapse the `searches` denominator (#582).
           Map.put(attribution_context(opts), :search_id, search_id)
         )
+    end
+  end
+
+  # Extracted rather than inlined at both call sites: it is one branch, and inlining it in
+  # `maybe_record_search_access/5` puts that function over the cyclomatic-complexity limit.
+  defp resolve_search_id(opts) do
+    case Keyword.get(opts, :_search_id) do
+      id when is_binary(id) -> id
+      _ -> Ecto.UUID.generate()
     end
   end
 
@@ -9194,6 +9208,14 @@ defmodule Loopctl.Knowledge do
   - `{:ok, %{results: [map()], meta: map()}}` on success
   - `{:error, :invalid_weights}` when weights don't sum to 1.0
   - `{:error, :empty_query}` when query is empty
+
+  `meta.search_id` is the id of THIS call, and it is the SAME id written to
+  `article_access_events.metadata->>'search_id'` on every row this call's surfacing
+  batch records — so a caller holding the response can name the search that produced
+  it. It is present on the degraded keyword-only path too. It is still never accepted
+  FROM a caller (#582): the internal `:_search_id` opt is set only by another server-side
+  call site, and the merged recall (`Loopctl.Memory.recall_context/2`) uses it so its
+  `meta.recall_id` and this id are one value rather than two that have to be joined.
   """
   @spec search_combined(Ecto.UUID.t(), String.t(), keyword()) ::
           {:ok, %{results: [map()], meta: map()}}
@@ -9238,6 +9260,16 @@ defmodule Loopctl.Knowledge do
   end
 
   defp do_combined_search(tenant_id, query_string, keyword_weight, semantic_weight, opts) do
+    # ONE id per combined search call, minted here (or adopted from an internal
+    # `:_search_id` the merged recall threads in) so that the id RECORDED on this call's
+    # surfacing rows is the id RETURNED to the caller in `meta.search_id`. Before this the
+    # id existed only inside `maybe_record_search_access/5`, so a caller holding a response
+    # had no way to name the search that produced it — which is what `POST
+    # /api/v1/recall/:recall_id/referenced` needs in order to check that an article it is
+    # asked to record really was surfaced.
+    search_id = resolve_search_id(opts)
+    opts = Keyword.put(opts, :_search_id, search_id)
+
     # Use wide limits for sub-searches to get comprehensive score pools — at
     # least the relevance cap, so the merged/paginated result can satisfy a
     # request up to `max_relevance_page_size`. Suppress sub-search access
@@ -9321,7 +9353,8 @@ defmodule Loopctl.Knowledge do
             {:ok,
              %{
                merged
-               | results: Reranker.maybe_rerank(tenant_id, query_string, with_snippets, opts)
+               | results: Reranker.maybe_rerank(tenant_id, query_string, with_snippets, opts),
+                 meta: Map.put(merged.meta, :search_id, search_id)
              }}
 
           # US-41.1: `:semantic_recall_unavailable` joins `:heavy_read_overloaded`
@@ -9382,6 +9415,10 @@ defmodule Loopctl.Knowledge do
            fallback: true,
            search_mode: "keyword_only",
            fallback_reason: fallback_reason,
+           # Published on the DEGRADED path too: a caller that has to correlate a response
+           # with the rows it wrote must be able to do so on the path where retrieval went
+           # wrong, which is the path it most wants to correlate.
+           search_id: Keyword.get(opts, :_search_id),
            total_count: kw.meta.total_count,
            limit: paginated.limit,
            offset: paginated.offset

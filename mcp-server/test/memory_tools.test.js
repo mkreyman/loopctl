@@ -1223,3 +1223,71 @@ describe("TC-29.4.2: ListTools includes memory_promote alongside all pre-existin
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// recall_referenced — the third funnel stage (surfaced -> opened -> referenced)
+// ---------------------------------------------------------------------------
+describe("recall_referenced: registered, routed, and scope-free", () => {
+  test("the tool is registered and dispatched", () => {
+    assert.ok(
+      INDEX_SRC.includes(`name: "recall_referenced",`),
+      "TOOLS array must have a recall_referenced entry",
+    );
+
+    assert.ok(
+      INDEX_SRC.includes(`case "recall_referenced":`),
+      "the dispatch switch must route recall_referenced",
+    );
+  });
+
+  test("it POSTs the recall id as a PATH segment under the agent key", () => {
+    // The id is a path segment because the server verifies, per id, that this recall
+    // surfaced the article — a body-supplied id would still be checked, but the path
+    // form is what makes the resource identity explicit in the URL.
+    assert.ok(
+      INDEX_SRC.includes("`/api/v1/recall/${recall_id}/referenced`"),
+      "handler must POST to /api/v1/recall/:recall_id/referenced",
+    );
+
+    const handler = INDEX_SRC.slice(
+      INDEX_SRC.indexOf("async function recallReferenced("),
+      INDEX_SRC.indexOf("async function memoryList("),
+    );
+
+    assert.ok(handler.includes('"POST"'), "must be a POST");
+    assert.ok(
+      handler.includes("process.env.LOOPCTL_AGENT_KEY"),
+      "must use the agent key — the recording identity is derived from it server-side",
+    );
+  });
+
+  test("its inputSchema cannot express a scope or an identity", () => {
+    // Same rule as every memory tool: tenant/subject/api key are key-derived, and a
+    // schema that could express them would be a smuggling surface.
+    const start = INDEX_SRC.indexOf(`name: "recall_referenced",`);
+    const schema = INDEX_SRC.slice(start, INDEX_SRC.indexOf("name: \"memory_list\",", start));
+
+    for (const forbidden of ["tenant_id", "subject_id", "api_key_id", "agent_id"]) {
+      assert.ok(
+        !schema.includes(forbidden),
+        `recall_referenced's schema must not accept ${forbidden}`,
+      );
+    }
+
+    assert.ok(schema.includes("recall_id"), "the schema must take recall_id");
+    assert.ok(schema.includes("article_ids"), "the schema must take article_ids");
+  });
+
+  test("recall_context tells the agent to keep the recall_id for it", () => {
+    // A tool nobody knows to call measures nothing. The recall description is the only
+    // place an agent learns that the id it just received has a second use.
+    const start = INDEX_SRC.indexOf(`name: "recall_context",`);
+    const entry = INDEX_SRC.slice(start, INDEX_SRC.indexOf(`name: "recall_referenced",`));
+
+    assert.ok(entry.includes("recall_id"), "recall_context must document meta.recall_id");
+    assert.ok(
+      entry.includes("recall_referenced"),
+      "recall_context must point at recall_referenced",
+    );
+  });
+});
