@@ -49,12 +49,10 @@ defmodule LoopctlWeb.Outcome do
   not the remedy for a broken embedding lane. An agent that reads a shed as `"fallback"`
   retries immediately into the same closed gate.
 
-  The "served no substitute lane" half is load-bearing: the KNOWLEDGE tier sheds the
-  semantic lane under the same tag and DOES serve keyword-only (`search_mode:
-  "keyword_only"`), and that response's remedy is the fallback one — retry the same query,
-  never reword, because the keyword lane ANDs its terms. Classifying it `"degraded"` cost
-  it exactly that sentence. Every other degradation signal is consulted AFTER `fallback`,
-  exactly as the order above says.
+  The "served no substitute lane" half is load-bearing: the KNOWLEDGE tier sheds under the
+  same tag and DOES serve keyword-only (`search_mode: "keyword_only"`), whose remedy is the
+  fallback one — retry the same query, never reword, because the keyword lane ANDs its
+  terms. Every other signal is consulted AFTER `fallback`, exactly as the order says.
 
   ## Write paths get nothing
 
@@ -73,10 +71,9 @@ defmodule LoopctlWeb.Outcome do
   # `Knowledge.reason_to_tag/1`); there is no shared constant to read it from.
   @capacity_reason "heavy_read_overloaded"
 
-  # The memory tier's "the read did not run and nothing was served in its place" tags,
-  # read from the module that PRODUCES them. They arrive under `:reason` (and, on the
-  # merged `/recall` meta, `:degraded_reason`) rather than the knowledge tier's
-  # `:fallback_reason`, so they are matched on their own keys — see `request_error?/1`.
+  # The memory tier's "the read did not run and nothing was served in its place" tags, read
+  # from the module that PRODUCES them. They arrive under `:reason` (and, on the merged
+  # `/recall` meta, `:degraded_reason`), never the knowledge tier's `:fallback_reason`.
   @memory_unavailable_reasons Loopctl.Memory.memory_unavailable_reason_tags()
 
   @outcomes ~w(success empty degraded fallback error)
@@ -222,11 +219,9 @@ defmodule LoopctlWeb.Outcome do
   end
 
   # A REAL miss: no rows, and not merely a page walked past the end. `count` is the PAGE,
-  # not the matched set, and on the offset-paginated surfaces an empty page over a
-  # non-empty set told an agent doing an existence check the row is absent while
-  # `total_count` beside it said otherwise. `offset` is the discriminator rather than
-  # `total_count`, because in relevance mode `total_count` counts a pool
-  # (`total_count_scope`) and not the matches.
+  # so an empty page over a non-empty set told an agent doing an existence check the row is
+  # absent while `total_count` beside it said otherwise. `offset` is the discriminator, not
+  # `total_count`, which in relevance mode counts a pool (`total_count_scope`).
   defp matched_nothing?(meta, count), do: count == 0 and not past_end?(meta)
 
   defp past_end?(meta), do: is_integer(meta[:offset]) and meta[:offset] > 0
