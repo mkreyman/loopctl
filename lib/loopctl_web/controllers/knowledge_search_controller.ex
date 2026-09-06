@@ -437,7 +437,11 @@ defmodule LoopctlWeb.KnowledgeSearchController do
       mode_used: mode,
       degraded?: true,
       fallback_reason: "embedding_unavailable",
-      result_count: 0
+      result_count: 0,
+      # A degraded row is NOT rejected, so it sits inside the coverage report's `:ran`
+      # population and a null here reads as a client instrumentation gap during a provider
+      # outage. The attempt did run; time it like every other one.
+      duration_ms: shaped_duration_ms(opts)
     })
   end
 

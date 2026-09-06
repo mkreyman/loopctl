@@ -43,6 +43,20 @@ defmodule Loopctl.Knowledge.SearchEventCoverageTest do
     fixture(:search_event, Map.merge(base, attrs))
   end
 
+  # The recall-hook / smoke-test / stale-MCP shape: no client context whatsoever.
+  defp blind do
+    %{
+      client_session_id: nil,
+      client_kind: nil,
+      client_host: nil,
+      client_repo: nil,
+      client_entrypoint: nil,
+      client_version: nil,
+      client_model: nil,
+      client_effort: nil
+    }
+  end
+
   defp report(tenant_id), do: Coverage.report(tenant_id, @from, @to)
 
   defp profile(report, tool), do: Enum.find(report.profiles, &(&1.tool == tool))
@@ -107,6 +121,32 @@ defmodule Loopctl.Knowledge.SearchEventCoverageTest do
     end
   end
 
+  describe "the select" do
+    test "each column's count comes from that column and no other" do
+      columns = Coverage.columns()
+      refute Enum.empty?(columns)
+
+      # The registry test pins a select KEY to its column by string, which catches a
+      # copy-pasted @columns row. It cannot catch a copy-paste INSIDE the select, where the
+      # key is right and the column referenced is another one's — a well-formed swap that
+      # reports a confident wrong number. Blanking one column at a time is what does.
+      for {column, _spec} <- columns do
+        tenant = fixture(:tenant)
+        covered(tenant.id, %{column => nil})
+
+        searched = profile(report(tenant.id), "knowledge_search")
+        stats = Map.merge(searched.required, searched.enrichable)
+
+        assert stats[column].missing == 1,
+               "blanking #{column} was not counted against #{column}"
+
+        for {other, s} <- stats, other != column do
+          assert s.missing == 0, "blanking #{column} was counted against #{other}"
+        end
+      end
+    end
+  end
+
   describe "report/3 window" do
     test "refuses an empty, inverted or pre-history window rather than reporting zeros" do
       tenant = fixture(:tenant)
@@ -149,6 +189,7 @@ defmodule Loopctl.Knowledge.SearchEventCoverageTest do
       # nil, never 0.0: zero would assert every row carried the column when there were none.
       assert quiet.required[:query].share_missing == nil
       assert quiet.required[:query].population == 0
+      assert quiet.client_context.share_missing == nil
     end
 
     test "a fully covered row reports no missing column anywhere" do
@@ -213,18 +254,9 @@ defmodule Loopctl.Knowledge.SearchEventCoverageTest do
 
     test "a non-agent row is outside the agent population, so client_* is not scored" do
       tenant = fixture(:tenant)
-      # No client_kind and no client_session_id: the recall hook / smoke-test shape, which
-      # can never carry client context. Scoring it would measure loopctl's own automation.
-      covered(tenant.id, %{
-        client_session_id: nil,
-        client_kind: nil,
-        client_host: nil,
-        client_repo: nil,
-        client_entrypoint: nil,
-        client_version: nil,
-        client_model: nil,
-        client_effort: nil
-      })
+      # No client_kind and no client_session_id, so scoring the client columns here would
+      # measure loopctl's own automation rather than client coverage.
+      covered(tenant.id, blind())
 
       searched = profile(report(tenant.id), "knowledge_search")
 
@@ -237,11 +269,36 @@ defmodule Loopctl.Knowledge.SearchEventCoverageTest do
       assert searched.required[:query].population == 1
     end
 
-    test "a rejected row is outside the :ran population, so mode_used is not a defect" do
+    test "a row carrying no client context at all is reported as a client_context miss" do
       tenant = fixture(:tenant)
 
+      covered(tenant.id)
+      for _ <- 1..3, do: covered(tenant.id, blind())
+
+      searched = profile(report(tenant.id), "knowledge_search")
+
+      # The :agent denominator is BUILT from the columns it scores, so the blind rows leave
+      # it and every client_* line reads a clean 0/0. Without a figure over :all, a fleet
+      # that stopped sending the header certifies itself fully covered — the 2-of-133 shape.
+      assert searched.required[:client_host].missing == 0
+      assert searched.required[:client_host].population == 1
+
+      assert searched.client_context == %{
+               scope: :all,
+               population: 4,
+               missing: 3,
+               share_missing: 0.75
+             }
+    end
+
+    test "a rejected row is outside the :ran population, so it is not a defect" do
+      tenant = fixture(:tenant)
+
+      # The rejection recorder also writes query: "" by construction — a missing query IS
+      # most rejections — so scoring :query over :all billed ~8% of all searches as a defect.
       covered(tenant.id, %{
         outcome: "rejected",
+        query: "",
         mode_used: nil,
         duration_ms: nil,
         result_count: 0
@@ -254,6 +311,8 @@ defmodule Loopctl.Knowledge.SearchEventCoverageTest do
       assert searched.required[:mode_used].missing == 0
       assert searched.required[:mode_used].share_missing == nil
       assert searched.required[:duration_ms].missing == 0
+      assert searched.required[:query].missing == 0
+      assert searched.required[:query].share_missing == nil
     end
 
     test "knowledge_list drops query, because a browse page has none by construction" do

@@ -483,6 +483,13 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
         "client — the recall hook and smoke tests call the API directly and can never " <>
         "supply `client_*`, so scoring them would measure loopctl's own automation. " <>
         "`share_missing` is `null`, never `0.0`, on an empty population.\n\n" <>
+        "CLIENT_CONTEXT — the `agent` denominator is built from two of the columns it " <>
+        "scores, so a client that sends NOTHING empties it and leaves every `client_*` " <>
+        "line reading a clean 0/0. Each profile therefore also carries `client_context`, " <>
+        "scored over `all`, whose `missing` is the rows that carried NO client context at " <>
+        "all — that is where a fleet gone blind reports itself. A high share on " <>
+        "`memory_recall` is the recall hook and expected; a high share on " <>
+        "`knowledge_search` is not.\n\n" <>
         "REQUIRED vs ENRICHABLE — `required` is what a client or the server can fill at " <>
         "record time, so a miss is a defect. `enrichable` (`client_model`, `client_effort`, " <>
         "`agent_id`) is what no client can send: the first two do not exist in the MCP " <>
@@ -506,7 +513,10 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
       to: [
         in: :query,
         type: :string,
-        description: "ISO8601 exclusive upper bound (default now). The window is [from, to).",
+        description:
+          "ISO8601 date or datetime, exclusive upper bound (default now). A bare date is " <>
+            "read at 00:00:00Z. The window is [from, to). REJECTED with 400 when it cannot " <>
+            "be parsed — never silently replaced with now.",
         required: false
       ]
     ],
@@ -514,16 +524,19 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
       200 =>
         {"Search event coverage", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      400 => {"Invalid to", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
   @doc "GET /api/v1/knowledge/analytics/search-coverage"
   def search_coverage(conn, params) do
-    tenant_id = conn.assigns.current_api_key.tenant_id
-    {from, to} = coverage_window(params)
+    with :ok <- validate_to(params["to"]) do
+      tenant_id = conn.assigns.current_api_key.tenant_id
+      {from, to} = coverage_window(params)
 
-    json(conn, SearchEventCoverage.report(tenant_id, from, to))
+      json(conn, SearchEventCoverage.report(tenant_id, from, to))
+    end
   end
 
   operation(:curation_log,
@@ -613,6 +626,11 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
     end
   end
 
+  # Plug parses `?since[]=x` into a LIST and `?since[a]=x` into a MAP, so without this the
+  # clauses above raise FunctionClauseError on a well-formed request and `action_fallback`,
+  # which only handles RETURNED errors, lets it out as a 500.
+  defp parse_since(_), do: nil
+
   # Offset enables paging the ranking past the first page — never rejected, so a
   # caller can enumerate to completeness (the rankings are access-count aggregates,
   # not vector scans, so deep offset is cheap).
@@ -651,6 +669,25 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
   defp validate_access_type(_value),
     do: {:error, :bad_request, "Invalid access_type: expected a string"}
 
+  # REJECT an unparseable `to` rather than substituting `now`, for the reason above: the
+  # window silently became "the last N days ending now" while the operator believed they had
+  # asked about a historical week, and `window` in the body was the only thing that said so.
+  defp validate_to(nil), do: :ok
+  defp validate_to(""), do: :ok
+
+  defp validate_to(value) when is_binary(value) do
+    case parse_since(value) do
+      nil ->
+        {:error, :bad_request,
+         "Invalid to #{inspect(value)}. Expected an ISO8601 date or datetime."}
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp validate_to(_value), do: {:error, :bad_request, "Invalid to: expected a string"}
+
   defp put_project_id(opts, nil), do: opts
   defp put_project_id(opts, ""), do: opts
 
@@ -686,6 +723,10 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
     to =
       case parse_since(params["to"]) do
         %DateTime{} = dt -> dt
+        # `parse_since/1` accepts a bare ISO8601 DATE, which is a reasonable thing to send
+        # at an "exclusive upper bound". Read it at the start of that UTC day rather than
+        # letting the catch-all below answer for `now` instead.
+        %Date{} = d -> DateTime.new!(d, ~T[00:00:00.000000], "Etc/UTC")
         _ -> DateTime.utc_now()
       end
 

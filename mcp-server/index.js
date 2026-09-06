@@ -6837,6 +6837,12 @@ const TOOLS = [
       "hook and smoke tests call the API directly and can never supply client_*, so scoring " +
       "them would measure loopctl's own automation. share_missing is null, never 0.0, on an " +
       "empty population.\n\n" +
+      "CLIENT_CONTEXT: the 'agent' denominator is built from two of the columns it scores, " +
+      "so a client that sends NOTHING empties it and every client_* line then reads a clean " +
+      "0/0. Each profile therefore also carries client_context, scored over 'all', whose " +
+      "missing is the rows that carried NO client context at all — that is where a fleet gone " +
+      "blind reports itself. A high share on memory_recall is the recall hook and expected; a " +
+      "high share on knowledge_search is not.\n\n" +
       "REQUIRED vs ENRICHABLE: required is what a client or the server can fill at record " +
       "time, so a miss is a defect. enrichable (client_model, client_effort, agent_id) is " +
       "what no client can send — the first two do not exist in the MCP server's spawn " +
@@ -6859,7 +6865,10 @@ const TOOLS = [
         },
         to: {
           type: "string",
-          description: "ISO8601 exclusive upper bound. Default now. The window is [from, to).",
+          description:
+            "ISO8601 date or datetime, exclusive upper bound. Default now. A bare date is " +
+            "read at 00:00:00Z. The window is [from, to). Rejected with 400 when it cannot " +
+            "be parsed — never silently replaced with now.",
         },
       },
       required: [],

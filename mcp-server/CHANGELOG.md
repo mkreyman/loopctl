@@ -5,7 +5,7 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
-## 2.83.0 — 2026-09-05 (say which telemetry columns are actually being filled)
+## 2.87.0 — 2026-09-06 (say which telemetry columns are actually being filled)
 
 ### Added
 

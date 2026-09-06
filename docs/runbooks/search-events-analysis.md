@@ -89,9 +89,17 @@ Read it in this order:
 
 Each column names the POPULATION it is scored over, so a structural absence does not read as
 a defect: `ran` excludes `outcome=rejected` (a rejected call never ran, so it has no
-`mode_used` and no `duration_ms`), and `agent` is only the rows that really came through the
-MCP client — the recall hook and `scripts/smoke.sh` call the API directly and can never
-carry `client_*`. `share_missing` is `null`, never `0.0`, on an empty population.
+`mode_used`, no `duration_ms` and no `query`), and `agent` is only the rows that really came
+through the MCP client — the recall hook and `scripts/smoke.sh` call the API directly and can
+never carry `client_*`. `share_missing` is `null`, never `0.0`, on an empty population.
+
+**Read `client_context` before any `client_*` line.** The `agent` denominator is built from
+two of the columns it scores, so a client that sends NOTHING empties it and every `client_*`
+line then reads a clean `0/0` — the 2-of-133 shape above would have reported as fully
+covered. `client_context` is that same count over `all`: its `missing` is the rows that
+carried no client context at all. A high share on `memory_recall` is the recall hook and
+expected; a high share on `knowledge_search` means the fleet went blind, and the remedy is a
+client restart (step 0's caching note), not a query change.
 
 **What it cannot tell you:** whether a PRESENT column is a CORRECT one. An un-enriched
 `client_kind` is 100% covered here and still says `main` for every search a subagent made —

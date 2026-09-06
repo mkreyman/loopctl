@@ -54,14 +54,24 @@ defmodule Loopctl.Knowledge.SearchEventCoverage do
   is how a structural absence reads as a defect:
 
     * `:all` — every row for the tool.
-    * `:ran` — `outcome != "rejected"`. A rejected call never ran, so it has no `mode_used`
-      and no `duration_ms` by construction (`LoopctlWeb.KnowledgeSearchController`'s
-      rejection recorder sets neither). Scoring those against `:all` would report a
+    * `:ran` — `outcome != "rejected"`. A rejected call never ran, so it has no `mode_used`,
+      no `duration_ms` and (for most rejections) no `query` by construction
+      (`LoopctlWeb.KnowledgeSearchController`'s rejection recorder sets neither of the first
+      two and writes `""` for the third). Scoring those against `:all` would report a
       permanent miss for the rows this table exists to make visible.
     * `:agent` — the row carries a `client_kind` or a `client_session_id`, i.e. it really
       came through the MCP client. The recall hook and `scripts/smoke.sh` call the API
       directly and can never supply `client_*` context, so measuring the client columns
       over `:all` measures the share of loopctl's own automation, not client coverage.
+
+  That last denominator is SELF-SELECTING on the property it scores, and left alone it is
+  the one way this report could certify a blind fleet: a client that sends NOTHING leaves
+  `:agent` empty, so every `client_*` line reads `0/0` and reports no miss — which is the
+  2-of-133 shape above exactly. So every profile also carries a `client_context` figure,
+  scored over `:all`, whose `missing` is the rows that carried NO client context at all.
+  It sits beside `required` rather than inside it because the direct-API callers
+  legitimately have none: on `memory_recall` a high share is the recall hook, on
+  `knowledge_search` it is the fleet having gone blind.
 
   ## Required vs enrichable
 
@@ -107,14 +117,24 @@ defmodule Loopctl.Knowledge.SearchEventCoverage do
   # no join, and the honest limit on this surface is the table's own life.
   @max_window_days 366
 
-  @baseline_required ~w(query tool mode_used result_count duration_ms api_key_id)a
+  # `tool` and `result_count` are deliberately ABSENT, because neither could ever report a
+  # miss. `coverage_query/3` groups BY `tool`, so inside a profiled group that column is the
+  # profile's own non-blank literal and a blank-tool row lands in `unprofiled` instead; and
+  # `result_count` is `NOT NULL DEFAULT 0`
+  # (`priv/repo/migrations/20260812000000_create_search_events.exs`), so an `IS NULL` test
+  # cannot match. A line that reads a measured 0.0 and can never be anything else is worse
+  # than no line: it spends the reader's trust on a check that is not running.
+  @baseline_required ~w(query mode_used duration_ms api_key_id)a
   @agent_required ~w(client_host client_repo client_entrypoint client_version client_kind)a
   @enrichable ~w(client_model client_effort agent_id)a
 
   # Every column this report can speak about: its POPULATION (above), how "missing" is
   # tested, and the KEY its count arrives under from `coverage_query/3`'s select. Text
-  # columns treat blank as missing — a `client_repo` of "" is not coverage, and `query` is
-  # written as "" by the enumeration lanes. Validated against
+  # columns treat blank as missing — a `client_repo` of "" is not coverage. `query` is
+  # scored over `:ran` for the same reason `mode_used` is: the rejection recorder writes
+  # `""` by construction (a missing query IS most rejections), so scoring it over `:all`
+  # billed the surface working as designed as a client defect, at ~8% of all searches.
+  # Validated against
   # `SearchEvent.__schema__(:fields)` by `search_event_coverage_test.exs`, so renaming a
   # column breaks the BUILD rather than silently emptying a line of the report.
   #
@@ -127,10 +147,8 @@ defmodule Loopctl.Knowledge.SearchEventCoverage do
   # pins each key to its column by STRING, so a copy-pasted row cannot point a column at
   # another column's count.
   @columns %{
-    query: {:all, :text, :query_missing},
-    tool: {:all, :text, :tool_missing},
+    query: {:ran, :text, :query_missing},
     mode_used: {:ran, :text, :mode_used_missing},
-    result_count: {:all, :value, :result_count_missing},
     duration_ms: {:ran, :value, :duration_ms_missing},
     api_key_id: {:all, :value, :api_key_id_missing},
     client_host: {:agent, :text, :client_host_missing},
@@ -206,6 +224,7 @@ defmodule Loopctl.Knowledge.SearchEventCoverage do
           tool: String.t(),
           rows: non_neg_integer(),
           populations: %{all: non_neg_integer(), ran: non_neg_integer(), agent: non_neg_integer()},
+          client_context: column_report(),
           required: %{atom() => column_report()},
           enrichable: %{atom() => column_report()}
         }
@@ -318,15 +337,18 @@ defmodule Loopctl.Knowledge.SearchEventCoverage do
             e.client_kind,
             e.client_session_id
           ),
-        query_missing: fragment("count(*) FILTER (WHERE coalesce(btrim(?), '') = '')", e.query),
-        tool_missing: fragment("count(*) FILTER (WHERE coalesce(btrim(?), '') = '')", e.tool),
+        query_missing:
+          fragment(
+            "count(*) FILTER (WHERE ? IS DISTINCT FROM 'rejected' AND coalesce(btrim(?), '') = '')",
+            e.outcome,
+            e.query
+          ),
         mode_used_missing:
           fragment(
             "count(*) FILTER (WHERE ? IS DISTINCT FROM 'rejected' AND coalesce(btrim(?), '') = '')",
             e.outcome,
             e.mode_used
           ),
-        result_count_missing: fragment("count(*) FILTER (WHERE ? IS NULL)", e.result_count),
         duration_ms_missing:
           fragment(
             "count(*) FILTER (WHERE ? IS DISTINCT FROM 'rejected' AND ? IS NULL)",
@@ -399,6 +421,7 @@ defmodule Loopctl.Knowledge.SearchEventCoverage do
       tool: profile.tool,
       rows: 0,
       populations: empty,
+      client_context: client_context_report(empty),
       required: Map.new(profile.required, &{&1, empty_column(&1)}),
       enrichable: Map.new(profile.enrichable, &{&1, empty_column(&1)})
     }
@@ -411,9 +434,20 @@ defmodule Loopctl.Knowledge.SearchEventCoverage do
       tool: profile.tool,
       rows: row.rows,
       populations: populations,
+      client_context: client_context_report(populations),
       required: Map.new(profile.required, &{&1, report_column(&1, row, populations)}),
       enrichable: Map.new(profile.enrichable, &{&1, report_column(&1, row, populations)})
     }
+  end
+
+  # The `:agent` denominator is built out of two of the columns it scores, so a row with NO
+  # client context leaves both the numerator and the denominator and every `client_*` line
+  # reads a clean `0/0`. This is the same count over `:all`, where that row IS the miss —
+  # without it a fleet that stopped sending the header reports itself fully covered, which
+  # is the one wrong answer this module cannot give.
+  defp client_context_report(%{all: all, agent: agent}) do
+    missing = all - agent
+    %{scope: :all, population: all, missing: missing, share_missing: share(missing, all)}
   end
 
   defp empty_column(column) do

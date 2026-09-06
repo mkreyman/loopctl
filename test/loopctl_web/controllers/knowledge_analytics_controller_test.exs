@@ -713,6 +713,21 @@ defmodule LoopctlWeb.KnowledgeAnalyticsControllerTest do
   end
 
   describe "GET /api/v1/knowledge/curation-log" do
+    test "a list-valued `since` is ignored, never a 500", %{conn: conn} do
+      tenant = fixture(:tenant, %{settings: %{"kb_curation_log" => true}})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      # Plug parses `?since[]=x` into a LIST, which matched none of parse_since/1's clauses:
+      # a FunctionClauseError that action_fallback cannot catch, so a 500 on a well-formed
+      # request. The catch-all clause makes it an ignored filter instead.
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get("/api/v1/knowledge/curation-log?since[]=2026-08-20")
+
+      assert json_response(conn, 200)
+    end
+
     test "orchestrator reads the curation feed (filterable by kind)", %{conn: conn} do
       tenant = fixture(:tenant, %{settings: %{"kb_curation_log" => true}})
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
@@ -890,6 +905,39 @@ defmodule LoopctlWeb.KnowledgeAnalyticsControllerTest do
         |> get(~p"/api/v1/knowledge/analytics/search-coverage?days=99999")
 
       assert json_response(conn, 200)["rows_total"] == 0
+    end
+
+    test "an unparseable or non-string `to` is a 400, never a 500 or a silent now()", %{
+      conn: conn
+    } do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      # A list-valued param reached parse_since/1, which had no catch-all clause: a
+      # FunctionClauseError that action_fallback cannot catch, so a 500 on a well-formed
+      # request. And an unparseable string used to be swapped for now(), answering a
+      # different window than the operator asked about.
+      for query <- ["to[]=2026-09-01T00:00:00Z", "to=yesterday"] do
+        conn =
+          conn
+          |> auth_conn(raw_key)
+          |> get("/api/v1/knowledge/analytics/search-coverage?#{query}")
+
+        assert json_response(conn, 400)
+      end
+    end
+
+    test "a date-only `to` is honoured at 00:00:00Z, not replaced with now", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      conn =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/knowledge/analytics/search-coverage?to=2026-08-20&days=1")
+
+      body = json_response(conn, 200)
+      assert body["window"]["to"] =~ "2026-08-20T00:00:00"
     end
 
     test "agent role is rejected (orchestrator+ required)", %{conn: conn} do
