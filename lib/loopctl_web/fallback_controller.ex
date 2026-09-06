@@ -630,6 +630,17 @@ defmodule LoopctlWeb.FallbackController do
     })
   end
 
+  # A 400 that carries a machine-readable `code` because the remedy differs per cause
+  # (#779: `confirm_removed` vs `dry_run_required` on the bulk-delete surface). MUST
+  # precede the `{:error, refusal, %{code:, message:}}` clause below, which would
+  # otherwise match this same shape and answer 422.
+  def call(conn, {:error, :bad_request, %{code: code, message: message}})
+      when is_binary(code) and is_binary(message) do
+    conn
+    |> put_status(:bad_request)
+    |> json(%{error: %{status: 400, code: code, message: message}})
+  end
+
   # US-41.3 (AC-41.3.3): a chat-endpoint write refused by the credential rule or by
   # the config-time probe. The details map is built by `Loopctl.Llm.ChatProbe` and
   # is SECRET-FREE: it echoes the endpoint URL (the tenant's own declared host) and
