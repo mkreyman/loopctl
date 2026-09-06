@@ -857,8 +857,10 @@ Full descriptions live in [`mcp-server/README.md`](mcp-server/README.md); summar
 | `knowledge_publish` | Publish an existing draft article | orchestrator |
 | `knowledge_bulk_publish` | Publish drafts, partial-success (per-id results, idempotent, no 100-cap) | user |
 | `knowledge_unpublish` | Revert a published article back to draft | user |
-| `knowledge_archive` | Soft-delete an article (retained for audit) | user |
-| `knowledge_delete` | Alias for archive (DELETE verb archives) | user |
+| `knowledge_archive` | Soft-delete an article (retained for audit) — TERMINAL, not undoable by any agent call | agent |
+| `knowledge_delete` | Alias for archive (DELETE verb archives) | agent |
+| `knowledge_suppress` | Take an article out of RETRIEVAL, reversibly, without changing its status; still readable by id. Requires a `reason` | agent |
+| `knowledge_unsuppress` | Lift a retrieval suppression, restoring the article to every read path | agent |
 | `knowledge_bulk_delete` | Bulk soft-delete (archive), partial-success — by id-list, source, or tag+confirm | user |
 | `knowledge_drafts` | List draft (unpublished) articles | orchestrator |
 | `knowledge_lint` | Lint check for stale or low-coverage articles | orchestrator |

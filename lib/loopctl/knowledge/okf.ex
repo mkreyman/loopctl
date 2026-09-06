@@ -91,7 +91,8 @@ defmodule Loopctl.Knowledge.OKF do
   # foreign frontmatter forever. The dead `loopctl_links` key (never produced) is
   # dropped.
   @reserved_fm_keys ~w(type title description resource tags timestamp
-                       loopctl_id loopctl_category loopctl_status loopctl_links_truncated)
+                       loopctl_id loopctl_category loopctl_status loopctl_links_truncated
+                       loopctl_suppressed_at loopctl_suppressed_by loopctl_suppression_reason)
 
   @related_marker "<!-- okf:related -->"
 
@@ -255,11 +256,46 @@ defmodule Loopctl.Knowledge.OKF do
       "loopctl_status" => to_string(article.status)
     }
 
+    # A suppressed article is EXPORTED, tombstone and all. Export is a BACKUP surface, not a
+    # retrieval one: a bundle that silently dropped every suppressed row would be lossier
+    # than the corpus it came from, and a bundle that kept the row while dropping the
+    # tombstone would restore as an ordinary live article with no record that anyone had
+    # ever taken it out of retrieval. So the three fields ship as frontmatter.
+    #
+    # IMPORT does NOT restore the tombstone, and that is deliberate rather than missing:
+    # `status_for/1` already pins every imported concept to `:draft` regardless of the
+    # bundle's `loopctl_status`, on the argument that a bundle is ADVISORY about lifecycle
+    # and a forged one must not drive it. A tombstone is lifecycle. An imported draft is not
+    # retrievable anyway, so nothing leaks either way; what the export buys is that a human
+    # reading the bundle can see the suppression and reapply it deliberately.
+    base = Map.merge(base, suppression_frontmatter(article))
+
     # Preserve foreign/unknown keys captured on import, lowest precedence.
     extra
     |> Map.merge(base)
     |> reject_empty()
   end
+
+  @doc """
+  The retrieval-tombstone frontmatter keys for an article, or an empty map when it carries
+  no tombstone.
+
+  Public because the STREAMED bundle
+  (`Loopctl.Knowledge.StreamingExport.OKFFormat`) builds its own frontmatter map and the
+  two must emit byte-identical keys — a bundle that carried the tombstone only on the
+  buffered `?format=json` path would drop it on the default `.tar.gz` backup, which is the
+  path an operator actually restores from.
+  """
+  @spec suppression_frontmatter(map()) :: %{optional(String.t()) => String.t()}
+  def suppression_frontmatter(%{suppressed_at: %DateTime{} = at} = article) do
+    %{
+      "loopctl_suppressed_at" => DateTime.to_iso8601(at),
+      "loopctl_suppressed_by" => article.suppressed_by,
+      "loopctl_suppression_reason" => article.suppression_reason
+    }
+  end
+
+  def suppression_frontmatter(_article), do: %{}
 
   # Body verbatim, plus a marked `# Related` section encoding the relates_to graph.
   defp concept_body(article, paths) do

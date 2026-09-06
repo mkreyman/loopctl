@@ -126,6 +126,10 @@ defmodule Loopctl.Knowledge.RetrievalMetricsTest do
                results_recorded: 0,
                followed_through: 0,
                precision: 0.0,
+               referenced: 0,
+               # nil, not 0.0: a day that surfaced nothing has no usage RATE. `precision`
+               # reports 0.0 beside it only because it is a non-null column.
+               reference_rate: nil,
                searches: 0,
                searches_with_follow_through: 0,
                search_follow_through: 0.0,
@@ -396,6 +400,128 @@ defmodule Loopctl.Knowledge.RetrievalMetricsTest do
     end
   end
 
+  describe "referenced / reference_rate (the third funnel stage)" do
+    defp referenced_event(tenant_id, api_key_id, article_id, search_id, time) do
+      fixture(:article_access_event, %{
+        tenant_id: tenant_id,
+        api_key_id: api_key_id,
+        article_id: article_id,
+        access_type: "referenced",
+        metadata: %{"recall_id" => search_id},
+        origin_search_id: search_id,
+        accessed_at: at(time)
+      })
+    end
+
+    test "counts referenced articles and divides by the same denominator as precision", ctx do
+      %{tenant: t, key: k, x: x, y: y} = ctx
+      search_id = search_call(t.id, k.id, [x.id, y.id], ~T[12:00:00])
+      referenced_event(t.id, k.id, x.id, search_id, ~T[12:05:00])
+
+      m = RetrievalMetrics.compute(t.id, @day, 1800)
+
+      assert m.searched == 2
+      assert m.referenced == 1
+      assert m.reference_rate == 0.5
+    end
+
+    test "repeats cannot inflate it — the count is DISTINCT (recall, article)", ctx do
+      # The endpoint is safe to retry, and `article_access_events` is an immutable log, so a
+      # repeat writes another row. Counting rows would let a client move a published metric
+      # by posting twice, which is the whole reason this counter dedupes.
+      %{tenant: t, key: k, x: x} = ctx
+      search_id = search_call(t.id, k.id, [x.id], ~T[12:00:00])
+      referenced_event(t.id, k.id, x.id, search_id, ~T[12:05:00])
+      referenced_event(t.id, k.id, x.id, search_id, ~T[12:06:00])
+      referenced_event(t.id, k.id, x.id, search_id, ~T[12:07:00])
+
+      assert RetrievalMetrics.compute(t.id, @day, 1800).referenced == 1
+    end
+
+    test "two different recalls referencing the same article count twice", ctx do
+      # The dedupe is on the PAIR, not on the article: the same article being useful to two
+      # separate recalls is two data points, and collapsing them would under-report usage.
+      %{tenant: t, key: k, x: x} = ctx
+      first = search_call(t.id, k.id, [x.id], ~T[12:00:00])
+      second = search_call(t.id, k.id, [x.id], ~T[13:00:00])
+      referenced_event(t.id, k.id, x.id, first, ~T[12:05:00])
+      referenced_event(t.id, k.id, x.id, second, ~T[13:05:00])
+
+      assert RetrievalMetrics.compute(t.id, @day, 1800).referenced == 2
+    end
+
+    test "a reference is bucketed by its SURFACING day, not by when it was posted", ctx do
+      # Numerator and denominator must describe ONE population. Bucketing on the reference
+      # row's own timestamp put a 23:59 recall referenced at 00:01 into a day whose
+      # `searched` never counted it — and let a client replaying old recall ids drive
+      # `reference_rate` above 1.0 on a quiet day.
+      %{tenant: t, key: k, x: x} = ctx
+      search_id = search_call(t.id, k.id, [x.id], ~T[23:59:00])
+
+      fixture(:article_access_event, %{
+        tenant_id: t.id,
+        api_key_id: k.id,
+        article_id: x.id,
+        access_type: "referenced",
+        metadata: %{"recall_id" => search_id},
+        origin_search_id: search_id,
+        accessed_at: DateTime.add(at(~T[23:59:00]), 120, :second)
+      })
+
+      today = RetrievalMetrics.compute(t.id, @day, 1800)
+      tomorrow = RetrievalMetrics.compute(t.id, Date.add(@day, 1), 1800)
+
+      assert today.referenced == 1, "the reference belongs to the day its recall surfaced"
+      assert today.reference_rate == 1.0
+      assert tomorrow.referenced == 0
+      assert is_nil(tomorrow.reference_rate)
+    end
+
+    test "reference_rate is nil, never 0.0, on a day that surfaced nothing", ctx do
+      %{tenant: t} = ctx
+      m = RetrievalMetrics.compute(t.id, @day, 1800)
+
+      assert m.referenced == 0
+
+      assert is_nil(m.reference_rate),
+             "a day with no surfaced results has no usage RATE; 0.0 would assert " <>
+               "'surfaced and never used'"
+    end
+
+    test "a reference is not a read: it changes no other figure", ctx do
+      # This is the guard that matters. `referenced` is the only client-ASSERTED signal on
+      # this surface, so if it leaked into a read set an agent could raise its own article's
+      # precision, follow-through and open attribution by claiming to have used it.
+      %{tenant: t, key: k, x: x} = ctx
+      search_id = search_call(t.id, k.id, [x.id], ~T[12:00:00])
+      before = RetrievalMetrics.compute(t.id, @day, 1800)
+
+      referenced_event(t.id, k.id, x.id, search_id, ~T[12:05:00])
+      later = RetrievalMetrics.compute(t.id, @day, 1800)
+
+      assert before.followed_through == 0
+      assert later.followed_through == 0
+      assert later.precision == before.precision
+      assert later.searched == before.searched
+      assert later.attributed_opens == before.attributed_opens
+      assert later.direct_opens == before.direct_opens
+      assert later.referenced == 1, "the mutation is inert unless the reference was recorded"
+    end
+
+    test "snapshot stores it and list_snapshots derives the rate", ctx do
+      %{tenant: t, key: k, x: x, y: y} = ctx
+      search_id = search_call(t.id, k.id, [x.id, y.id], ~T[12:00:00])
+      referenced_event(t.id, k.id, x.id, search_id, ~T[12:05:00])
+
+      assert {:ok, snap} = RetrievalMetrics.snapshot(t.id, @day, 1800)
+      assert snap.referenced == 1
+
+      %{data: [row]} = RetrievalMetrics.list_snapshots(t.id)
+      assert row.referenced == 1
+      assert row.reference_rate == 0.5
+    end
+  end
+
   describe "metric_version" do
     # This is the mechanical half of the bump discipline. It CANNOT see a change of MEANING
     # that keeps the same keys (#711 was exactly that, and is why the rule is written down at
@@ -409,7 +535,7 @@ defmodule Loopctl.Knowledge.RetrievalMetricsTest do
         |> Map.keys()
         |> Enum.sort()
 
-      assert RetrievalMetrics.metric_version() == 1,
+      assert RetrievalMetrics.metric_version() == 2,
              "the version changed — update the pinned key set below and RE-SNAPSHOT the " <>
                "affected days, or the series silently carries two definitions"
 
@@ -420,6 +546,8 @@ defmodule Loopctl.Knowledge.RetrievalMetricsTest do
                :direct_opens,
                :followed_through,
                :precision,
+               :reference_rate,
+               :referenced,
                :results_recorded,
                :results_returned,
                :search_follow_through,
@@ -610,7 +738,7 @@ defmodule Loopctl.Knowledge.RetrievalMetricsTest do
       assert {:ok, _} = RetrievalMetrics.snapshot(t.id, @day, 1800)
       %{data: [row]} = RetrievalMetrics.list_snapshots(t.id)
 
-      assert RetrievalMetrics.metric_version() == 1,
+      assert RetrievalMetrics.metric_version() == 2,
              "the version changed — update the pinned key set below. A field DERIVED ON " <>
                "READ (like scored_follow_through) is exempt from the bump because it is " <>
                "computed for every row served, historical ones included, so it draws no " <>
@@ -624,6 +752,8 @@ defmodule Loopctl.Knowledge.RetrievalMetricsTest do
                :followed_through,
                :metric_version,
                :precision,
+               :reference_rate,
+               :referenced,
                :results_recorded,
                :results_returned,
                :scored_follow_through,

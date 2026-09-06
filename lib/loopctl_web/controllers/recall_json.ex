@@ -22,6 +22,20 @@ defmodule LoopctlWeb.RecallJSON do
   function's `@doc`); `meta.results_ranking` carries the `"heuristic_cross_source"`
   tag so consumers can detect this programmatically.
 
+  ## The selection ledger
+
+  Every merged `data` item additionally carries `rank` (1-based, POST-merge),
+  `selection_reason` (a bounded tag naming which lane put the row here) and
+  `tokens_estimate`, and the top-level `meta` carries the call-level accounting
+  (`recall_id`, `candidates_considered`, `selected_count`, `tokens_selected`,
+  `tokens_candidates`, `tokens_saved_vs_candidates`). All of it is built by
+  `Loopctl.Memory.recall_context/2` — see that function's `@doc` for what each field
+  means and why `tokens_estimate` is an estimate. This module only renders it.
+
+  The ledger lives in its OWN builder (`ledger_meta/1`, merged into `meta` by `context/1`)
+  rather than inside `meta_json/1`, so two independent additions to this payload do not
+  collide in one function body.
+
   The knowledge envelope's `meta` is ALSO projected — through
   `KnowledgeSearchJSON.render_meta/1`, the same whitelist the standalone knowledge
   endpoints use — so both results AND meta match that shape. The raw context meta's
@@ -30,7 +44,7 @@ defmodule LoopctlWeb.RecallJSON do
   `degraded_reason`, a bounded tag naming why a half degraded (or `null`).
   """
 
-  alias LoopctlWeb.{KnowledgeSearchJSON, MemoryJSON}
+  alias LoopctlWeb.{KnowledgeSearchJSON, MemoryJSON, Outcome}
 
   @doc """
   Renders the merged recall: `data` (merged, re-ranked), `memory` + `knowledge`
@@ -44,7 +58,9 @@ defmodule LoopctlWeb.RecallJSON do
         data: Enum.map(knowledge.results, &knowledge_summary/1),
         meta: knowledge_meta(knowledge.meta)
       },
-      meta: meta_json(meta)
+      # `meta_json/1` renders the ORIGINAL merged-recall meta; `ledger_meta/1` renders the
+      # selection ledger. Kept as two builders merged here on purpose — see the moduledoc.
+      meta: Map.merge(meta_json(meta), ledger_meta(meta))
     }
   end
 
@@ -61,12 +77,26 @@ defmodule LoopctlWeb.RecallJSON do
     |> Map.put(:degraded, Map.get(meta, :degraded?, false))
   end
 
-  defp merged_item(%{source: :memory, score: score, memory: memory}) do
+  defp merged_item(%{source: :memory, score: score, memory: memory} = item) do
     %{source: "memory", score: score, memory: MemoryJSON.memory_data(memory)}
+    |> Map.merge(ledger_item(item))
   end
 
-  defp merged_item(%{source: :knowledge, score: score, article: article}) do
+  defp merged_item(%{source: :knowledge, score: score, article: article} = item) do
     %{source: "knowledge", score: score, article: knowledge_summary(article)}
+    |> Map.merge(ledger_item(item))
+  end
+
+  # The per-item half of the selection ledger. `rank` is the position in THIS merged list
+  # (not the per-source rank), `selection_reason` names the lane that put the row here, and
+  # `tokens_estimate` is bytes/4 of the text a client would paste — an estimate by
+  # construction, never a tokenizer count.
+  defp ledger_item(item) do
+    %{
+      rank: item.rank,
+      selection_reason: item.selection_reason,
+      tokens_estimate: item.tokens_estimate
+    }
   end
 
   # Project a raw `search_combined/3` result map through the canonical combined-search
@@ -88,9 +118,44 @@ defmodule LoopctlWeb.RecallJSON do
       # A bounded, non-sensitive tag naming WHY the merged recall degraded (or `null`),
       # so a caller can distinguish a scope-empty half from a fault-empty one.
       degraded_reason: meta.degraded_reason,
+      # The lane the REPORTED half served in place of the ranking asked for
+      # (`"keyword_only"`), or `null` when it served nothing. Without it a knowledge shed
+      # that DID answer keyword-only was indistinguishable from a memory shed that
+      # answered nothing — same tag, opposite remedies — and `Outcome` prescribed a wait
+      # for a lane that had already run.
+      search_mode: meta.search_mode,
       # Stable tag warning that the merged `data` order is a cross-source heuristic
       # (memory absolute cosine vs knowledge pool-normalized), NOT calibrated relevance.
       results_ranking: meta.results_ranking
+    }
+    # The uniform tool-outcome classification (`LoopctlWeb.Outcome`), derived from the
+    # keys immediately above and the MERGED `total_count` — so it describes the whole
+    # endpoint, which is what a caller reading the top-level meta is asking about. It is
+    # deliberately the only place `outcome` is added on this response: the per-source
+    # `memory` envelope carries its own via `MemoryJSON.recall/1`, while the `knowledge`
+    # envelope's meta goes through the shared `KnowledgeSearchJSON.render_meta/1`
+    # whitelist, which is a meta-only projection with no result count to classify from.
+    |> Outcome.put(meta.total_count)
+  end
+
+  # The call-level half of the selection ledger, merged into `meta` by `context/1`.
+  #
+  # `recall_id` is the id of this recall AND the `search_id` stamped on the knowledge half's
+  # surfacing rows in `article_access_events` — one value, not two that have to be joined —
+  # so a client can hand it straight back to `POST /api/v1/recall/:recall_id/referenced` to
+  # record which of the surfaced articles it actually used.
+  #
+  # The token figures are ESTIMATES (bytes/4 of the rendered text), published so a caller can
+  # see what the merged cap did NOT hand it: `tokens_saved_vs_candidates` is zero when the cap
+  # bound nothing.
+  defp ledger_meta(meta) do
+    %{
+      recall_id: meta.recall_id,
+      candidates_considered: meta.candidates_considered,
+      selected_count: meta.selected_count,
+      tokens_selected: meta.tokens_selected,
+      tokens_candidates: meta.tokens_candidates,
+      tokens_saved_vs_candidates: meta.tokens_saved_vs_candidates
     }
   end
 end

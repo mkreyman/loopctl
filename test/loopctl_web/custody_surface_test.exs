@@ -137,6 +137,13 @@ defmodule LoopctlWeb.CustodySurfaceTest do
       assert CustodySurface.custody_operation?(conn_for(:post, "/api/v1/memory/recall"))
       assert CustodySurface.custody_operation?(conn_for(:post, "/api/v1/recall"))
 
+      # And everything UNDER /recall, which is why the clause matches a tail rather than
+      # the bare segment: `POST /recall/:recall_id/referenced` writes an analytics row, and
+      # a route added under this prefix later must not escape the halt silently.
+      assert CustodySurface.custody_operation?(
+               conn_for(:post, "/api/v1/recall/#{Ecto.UUID.generate()}/referenced")
+             )
+
       # The oversight read stays open.
       refute CustodySurface.custody_operation?(conn_for(:get, "/api/v1/memory"))
     end

@@ -72,14 +72,40 @@ exactly the pollution the separate tables prevent.
    `@valid_transitions` has no `{:archived, _}` and there is no unarchive function, so the only way
    back is a `user+` PATCH with an explicit status. Nothing is destroyed and everything is audited,
    which is what earns agent role; nothing automated restores it, which is why an unattended writer
-   must reach for `unpublish` (`{:published, :draft}`, undone by `publish`) instead. The `:user` set
+   must reach for `unpublish` (`{:published, :draft}`, undone by `publish`) instead — or now for
+   `suppress`, the REVERSIBLE retrieval tombstone (`knowledge_suppress`/`knowledge_unsuppress`,
+   `POST /api/v1/articles/:id/suppress`, `Knowledge.suppress_article/3`, agent role). Suppression
+   sets `articles.suppressed_at` plus a required reason and an actor, leaves `status`, body,
+   embedding and links untouched, keeps the article resolvable BY ID (`get_article/3`,
+   `knowledge_get`) so the act is inspectable, and excludes it from every ranked read path through
+   the one predicate in `Loopctl.Knowledge.Suppression`. **When you add a read path, that predicate
+   is not optional and not your judgement call:** `test/loopctl/knowledge/suppression_guard_test.exs`
+   scans `lib/` for published-status filter sites and fails on any that neither applies it nor is
+   named in `Suppression.exempt_sites/0` with a category and a reason. Pick between the three
+   retraction verbs by what you need AFTERWARDS — suppress (undoable, silent about status),
+   unpublish (undoable, but asserts the article is a draft), archive (not undoable by any agent
+   call). The `:user` set
    is single-article `unpublish` plus ALL the SET-BASED bulk ops — `bulk_publish`, `bulk_unpublish`
-   and the ENTIRE `bulk_delete` action, soft path included (`article_workflow_controller.ex:37-39`).
+   and the ENTIRE `bulk_delete` action, soft path included (`article_workflow_controller.ex:59-61`).
    **Both criteria matter**: set-based blast radius (one call mutates an unbounded set) AND
    irreversibility (`bulk_delete` carries a hard-delete path) — see the controller `@moduledoc`
-   (`:9-18`). Single-article ops are agent-role precisely BECAUSE nothing they do destroys a row, so
+   (`:13-21`). Single-article ops are agent-role precisely BECAUSE nothing they do destroys a row, so
    never drop that property when reasoning about a new op.
-   `drafts`/`publish` are `:orchestrator` (`:33`).
+   `drafts`/`publish` are `:orchestrator` (`:55`).
+   **`bulk_delete` takes no model-visible `confirm` argument, on either path (#779).** A `confirm`
+   flag is authorization the caller writes for itself: the same request that asks for the mutation
+   carries its own approval, so nothing outside the caller ever sees the proposal. Both
+   high-blast-radius paths — the irreversible HARD delete over any selector, and the SOFT archive of
+   a `tag` selector — return a server-minted proposal the caller REPLAYS instead: a `dry_run` freezes
+   the id-set into a single-use, TTL-bounded, tenant-scoped, TYPED `BulkDeleteToken`, and the run
+   executes exactly that frozen set. The type is what stops an archive proposal being replayed as a
+   delete, or the reverse, and on BOTH ops it carries a keyed digest of the SELECTOR so a token is not
+   spendable on a set the caller never named; over the frozen bound, where there is no token, the
+   `confirm_hash` is keyed on the OP for the same reason. A request carrying `confirm` is `400 confirm_removed`, refused rather than
+   ignored; a `tag` call with neither `dry_run` nor a replay credential is `400 dry_run_required`
+   (a selector matching nothing needs no proposal — it stays a `200` no-op on either path).
+   The `article_ids` and `source` archives are unchanged — each names a set the caller already holds.
+   When adding a destructive op here, mint a proposal; never add a confirm flag.
    Agent edits are visibility-scoped: an agent can only touch an article it can see. (See `chain-of-custody`.)
    **Recording a verdict is agent-role; AUTHORIZING the unattended RETIREMENT is not.** The
    conflict PAIR is manufacturable — the queue is fed by a mechanical similarity threshold — so
@@ -124,7 +150,7 @@ exactly the pollution the separate tables prevent.
    `{drift_signal, member_id}` — a group scored under the other signal's normalized key finds
    nothing and withholds (fail-closed).
 5. **Heat must not rank on a signal heat produces** — `Knowledge.heat_index/2`
-   (`knowledge.ex:10931`; the counted set is `@heat_read_access_types`, `:10801`). The heat index is the one retrieval route that
+   (`knowledge.ex:11477`; the counted set is `@heat_read_access_types`, `:11347`). The heat index is the one retrieval route that
    takes NO query, so its misses are uncorrelated with embedding similarity — which is worth nothing
    if its ordering is something a caller or the route itself generates. It has been violated FOUR
    times, each differently — and once by a FIX for one of the others — so treat any new input to

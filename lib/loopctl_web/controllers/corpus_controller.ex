@@ -72,6 +72,7 @@ defmodule LoopctlWeb.CorpusController do
   alias Loopctl.RateLimiter.FailOpenLog
   alias Loopctl.Tenants
   alias LoopctlWeb.AuditContext
+  alias LoopctlWeb.Outcome
 
   action_fallback LoopctlWeb.FallbackController
 
@@ -185,14 +186,31 @@ defmodule LoopctlWeb.CorpusController do
 
   operation(:index,
     summary: "List document corpora",
-    description: "Lists this tenant's corpora, newest first. Role: agent+.",
+    description:
+      "Lists this tenant's corpora, newest first. `meta.outcome` carries the uniform " <>
+        "tool-outcome classification; a catalog discloses no degradation of its own, so " <>
+        "it is `empty` or `success` here. It is present anyway because this is the FIRST " <>
+        "call a caller makes on the corpus tier, and an empty list is exactly what it " <>
+        "must not misread as \"this tenant has no corpus\" when the read never ran. " <>
+        "Role: agent+.",
     parameters: [
       project_id: [in: :query, type: :string, description: "Restrict to one project scope."],
       limit: [in: :query, type: :integer, description: "Page size (clamped)."],
       offset: [in: :query, type: :integer, description: "Rows to skip."]
     ],
     responses: %{
-      200 => {"Corpora", "application/json", @ok_object},
+      200 =>
+        {"Corpora", "application/json",
+         %OpenApiSpex.Schema{
+           type: :object,
+           properties: %{
+             data: %OpenApiSpex.Schema{type: :array},
+             meta: %OpenApiSpex.Schema{
+               type: :object,
+               properties: %{outcome: LoopctlWeb.Outcome.schema()}
+             }
+           }
+         }},
       401 => {"Unauthorized", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
@@ -210,7 +228,15 @@ defmodule LoopctlWeb.CorpusController do
       ]
       |> Enum.reject(fn {_key, value} -> is_nil(value) end)
 
-    json(conn, %{data: Enum.map(Corpus.list_corpora(tenant_id, opts), &render_corpus/1)})
+    corpora = Enum.map(Corpus.list_corpora(tenant_id, opts), &render_corpus/1)
+
+    # This list previously carried no `meta` at all, which made an empty array the only
+    # thing a caller could read — and `corpus_list` is the routing call an agent makes
+    # BEFORE deciding the corpus tier holds nothing for it. `meta.outcome` is `empty` or
+    # `success` here (a catalog sheds no lane of its own); what it buys is that absence
+    # of the key now means an OLD SERVER rather than "this endpoint opted out", which is
+    # the ambiguity a per-endpoint opt-out created.
+    json(conn, %{data: corpora, meta: Outcome.put_for(%{}, corpora)})
   end
 
   operation(:show,
@@ -586,7 +612,10 @@ defmodule LoopctlWeb.CorpusController do
                  }
                }
              },
-             meta: %OpenApiSpex.Schema{type: :object}
+             meta: %OpenApiSpex.Schema{
+               type: :object,
+               properties: %{outcome: LoopctlWeb.Outcome.schema()}
+             }
            }
          }},
       401 => {"Unauthorized", "application/json", Schemas.ErrorResponse},
@@ -622,8 +651,15 @@ defmodule LoopctlWeb.CorpusController do
       |> Enum.reject(&is_nil(elem(&1, 1)))
 
     case run_search(tenant_id, id, params, opts) do
-      {:ok, result} -> json(conn, %{data: result.results, meta: result.meta})
-      {:error, reason} -> handle_search_error(conn, reason)
+      # `meta.outcome` (`LoopctlWeb.Outcome`) is the uniform classification the knowledge
+      # and memory surfaces carry. On this tier it is what tells a short lane from an
+      # empty corpus WITHOUT the caller having to know that `semantic_unavailable_reason`
+      # and `semantic_under_filled` are the two keys that mean "ask again".
+      {:ok, result} ->
+        json(conn, %{data: result.results, meta: Outcome.put_for(result.meta, result.results)})
+
+      {:error, reason} ->
+        handle_search_error(conn, reason)
     end
   end
 

@@ -5,6 +5,8 @@ defmodule LoopctlWeb.RouteDiscoveryControllerTest do
 
   use LoopctlWeb.ConnCase, async: true
 
+  alias Loopctl.Knowledge.Analytics
+
   setup :verify_on_exit!
 
   defp auth_conn(conn, raw_key) do
@@ -189,6 +191,50 @@ defmodule LoopctlWeb.RouteDiscoveryControllerTest do
       assert epic_stories_route != nil
       assert epic_stories_route["description"] =~ "page_size"
       assert epic_stories_route["description"] =~ "limit"
+    end
+
+    test "the article-stats description matches what total_events actually counts",
+         %{conn: conn} do
+      # The route index is the FIRST thing an agent reads about an endpoint, so a
+      # description that overstates a counter re-tells the exact lie the counter was
+      # changed to stop telling: `referenced` is client-asserted, and a self-asserted
+      # signal must not read as delivery. Asserted together with the behaviour, so the
+      # text can only be right while it describes what `get_article_stats/2` does.
+      tenant = fixture(:tenant)
+      {raw_key, key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      article = fixture(:article, %{tenant_id: tenant.id, status: :published})
+
+      for access_type <- ["search", "referenced"] do
+        fixture(:article_access_event, %{
+          tenant_id: tenant.id,
+          api_key_id: key.id,
+          article_id: article.id,
+          access_type: access_type
+        })
+      end
+
+      stats = Analytics.get_article_stats(tenant.id, article.id)
+
+      assert stats.total_events == 1,
+             "the impression counts and the client assertion does not"
+
+      assert stats.accesses_by_type["referenced"] == 1,
+             "the assertion stays visible under its own key"
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> get(~p"/api/v1/routes")
+        |> json_response(200)
+
+      stats_route =
+        Enum.find(body["routes"], fn r ->
+          r["path"] == "/api/v1/knowledge/articles/:id/stats" && r["method"] == "GET"
+        end)
+
+      assert stats_route != nil
+      assert stats_route["description"] =~ "impressions"
+      assert stats_route["description"] =~ ~r/referenced rows EXCLUDED/
     end
 
     test "requires authentication", %{conn: conn} do

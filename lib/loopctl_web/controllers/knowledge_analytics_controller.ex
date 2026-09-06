@@ -357,6 +357,19 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
         "open credits EVERY search in the window that surfaced that article, not just " <>
         "the preceding one (biases them UP when an agent refines and re-searches, which " <>
         "bites hardest on `scored_follow_through`).\n\n" <>
+        "THE THIRD STAGE (unit: DISTINCT (recall, article) REFERENCES) — `referenced` " <>
+        "counts the articles a client asserted it USED, via " <>
+        "`POST /recall/{recall_id}/referenced`, and `reference_rate` divides it by " <>
+        "`searched` — the SAME denominator as `precision`, so it carries every one of " <>
+        "that field's caveats. It is `null`, never 0.0, on a day that surfaced nothing. " <>
+        "This is the ONLY figure here derived from a client ASSERTION rather than a " <>
+        "delivery the server observed: the assertion is bounded (only an article that " <>
+        "recall actually surfaced under that id, in the caller's own tenant, is " <>
+        "accepted) but the bound is on WHICH articles, not on whether the claim is " <>
+        "true. Read it as self-reported usage. Repeats cannot inflate it — the counter " <>
+        "dedupes on (recall, article) — and no ranking consumes it: `referenced` rows " <>
+        "are in no read set, are excluded from the heat index, and never enter " <>
+        "`followed_through`, `precision` or the per-article read counts.\n\n" <>
         "EXACT ATTRIBUTION (unit: READS, not surfaced results and not calls) — " <>
         "`attributed_opens` / `cross_key_opens` / `direct_opens` count READ rows by how " <>
         "their originating search was established server-side at write time. These are " <>

@@ -17,14 +17,23 @@ defmodule LoopctlWeb.KnowledgeHybridSearchJSON do
   """
 
   alias Loopctl.Llm.Remediation
+  alias LoopctlWeb.Outcome
 
   @max_snippet_length 300
 
-  @doc "Renders hybrid results (unified score + snippet) with provenance-bearing meta."
+  @doc """
+  Renders hybrid results (unified score + snippet) with provenance-bearing meta.
+
+  `meta.outcome` (`LoopctlWeb.Outcome`) answers a DIFFERENT question from
+  `meta.provenance`: provenance says WHICH source answered, outcome says whether the
+  retrieval that produced it ran healthily. A `"retrieved"` provenance on a
+  `"fallback"` outcome is the case worth branching on — nothing curated won because
+  semantic ranking never ran.
+  """
   def hybrid_search(%{results: results, meta: meta}) do
     %{
       data: Enum.map(results, &render_result/1),
-      meta: render_meta(meta)
+      meta: meta |> render_meta() |> Outcome.put_for(results)
     }
   end
 

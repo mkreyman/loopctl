@@ -16,6 +16,14 @@ defmodule Loopctl.Knowledge.ArticleAccessEvent do
   - `"drill"` -- ANY article's body read via `knowledge_progressive_drill`, tenant-owned
     and system canonical alike (#572); a body read like `"get"`, split out only so the
     heat ranking cannot count the reads it caused itself (#569)
+  - `"referenced"` -- the caller ASSERTS, via `POST /api/v1/recall/:recall_id/referenced`,
+    that it used this article in the answer it produced. This is the only access type that
+    is not an observation of a delivery: nothing on the server saw a body go out, a client
+    said it used one. It is accepted only for an article that recall actually surfaced under
+    that `recall_id` (checked server-side), and it is deliberately in NO read set — not
+    `Analytics.@read_access_types`, not `@attributable_access_types`, not
+    `Knowledge.@heat_read_access_types`, not `LiveRetrievalMetrics.@chosen_read_types`.
+    Heat and precision must never rank on a signal a client asserts about itself.
 
   ## Fields
 
@@ -64,7 +72,15 @@ defmodule Loopctl.Knowledge.ArticleAccessEvent do
   # write — it covers only callers that construct a changeset directly. There is no DB CHECK
   # either. The drift test binding the two lists still earns its keep (a value in only one is
   # silently unwritable or silently unvalidated), but do not read this list as a gate.
-  @access_types ~w(search get context index drill)
+  #
+  # `"referenced"` is the third stage of the funnel — surfaced, opened, USED — and is the one
+  # type a CLIENT asserts rather than the server observing. It is admitted here because the
+  # assertion is bounded server-side (only an article that recall surfaced under the given
+  # `recall_id`, in the caller's own tenant, is accepted) and because the stage was otherwise
+  # unmeasurable: surfaced-to-opened follow-through is 1.67% and nothing recorded whether an
+  # opened article was ever used. Keep it OUT of every read set — see the access-type list in
+  # the moduledoc for the four it must stay out of.
+  @access_types ~w(search get context index drill referenced)
 
   # HOW an `origin_search_id` was established. Recorded rather than inferred at read time so
   # a consumer never mistakes an inference for an observation — `cross_key` is the injected

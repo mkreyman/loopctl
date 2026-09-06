@@ -311,7 +311,14 @@ defmodule Loopctl.Knowledge.StreamingExport do
         source_type: a.source_type,
         metadata: a.metadata,
         inserted_at: a.inserted_at,
-        updated_at: a.updated_at
+        updated_at: a.updated_at,
+        # The retrieval tombstone. Projected because this streamed bundle is the DEFAULT
+        # backup, and `OKF.suppression_frontmatter/1` reads these three off the row: absent
+        # here, it silently emits nothing and the restored corpus carries no record that
+        # anyone ever took the article out of retrieval.
+        suppressed_at: a.suppressed_at,
+        suppressed_by: a.suppressed_by,
+        suppression_reason: a.suppression_reason
       })
       |> limit(^(page_size + 1))
 
@@ -555,7 +562,10 @@ defmodule Loopctl.Knowledge.StreamingExport do
       source_type: Map.get(row, :source_type),
       metadata: Map.get(row, :metadata) || %{},
       inserted_at: row.inserted_at,
-      updated_at: row.updated_at
+      updated_at: row.updated_at,
+      suppressed_at: Map.get(row, :suppressed_at),
+      suppressed_by: Map.get(row, :suppressed_by),
+      suppression_reason: Map.get(row, :suppression_reason)
     }
   end
 end

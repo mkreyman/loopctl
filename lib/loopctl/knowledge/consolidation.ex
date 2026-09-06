@@ -127,6 +127,7 @@ defmodule Loopctl.Knowledge.Consolidation do
   alias Loopctl.Knowledge.ConsolidationProposal
   alias Loopctl.Knowledge.ConsolidationReport
   alias Loopctl.Knowledge.ContentExtractorRouter
+  alias Loopctl.Knowledge.Suppression
   alias Loopctl.Llm
   alias Loopctl.SystemConfig
   alias Loopctl.Workers.BatchArticleEmbeddingWorker
@@ -800,6 +801,9 @@ defmodule Loopctl.Knowledge.Consolidation do
         where: a.tenant_id == ^tenant_id,
         where: a.id in ^proposal.article_ids,
         where: a.status == :published,
+        # The apply-time live re-check. An article suppressed between the scan and the
+        # apply must drop out of the group here, exactly as an archived one does.
+        where: is_nil(a.suppressed_at),
         select: %{
           id: a.id,
           body_len: fragment("length(coalesce(?, ''))", a.body),
@@ -1481,6 +1485,9 @@ defmodule Loopctl.Knowledge.Consolidation do
         where: a.tenant_id == ^tenant_id,
         where: a.id in ^proposal.article_ids,
         where: a.status == :published,
+        # Same apply-time liveness rule as `apply_duplicate_group/4`: never retitle an
+        # article somebody has taken out of retrieval.
+        where: is_nil(a.suppressed_at),
         select: %{
           id: a.id,
           title: a.title,
@@ -1872,6 +1879,12 @@ defmodule Loopctl.Knowledge.Consolidation do
   defp published_base(tenant_id) do
     from(a in Article, where: a.tenant_id == ^tenant_id, where: a.status == :published)
     |> shared_only()
+    # A suppressed article is out of scope for the whole nightly pass, on the same
+    # reasoning as `shared_only/1` directly above: it is not a duplicate to retract, not a
+    # placeholder to retitle, and not evidence, because nothing retrieves it. Composed
+    # here so every scan inherits it; the three sites that do not start from this base
+    # carry it inline for the reason the comment below gives.
+    |> Suppression.exclude()
   end
 
   @doc false
@@ -2264,6 +2277,7 @@ defmodule Loopctl.Knowledge.Consolidation do
       join: a2 in Article,
       on:
         a2.tenant_id == ^tenant_id and a2.status == :published and a1.id < a2.id and
+          is_nil(a2.suppressed_at) and
           shared_visibility(a2.metadata) and
           fragment(unquote(@title_key_sql <> " = " <> @title_key_sql), a1.title, a2.title),
       where: a1.id in ^ids and a2.id in ^ids
@@ -2279,6 +2293,7 @@ defmodule Loopctl.Knowledge.Consolidation do
       join: a2 in Article,
       on:
         a2.tenant_id == ^tenant_id and a2.status == :published and a1.id < a2.id and
+          is_nil(a2.suppressed_at) and
           shared_visibility(a2.metadata) and
           not is_nil(a2.idempotency_key) and
           fragment(
@@ -2659,6 +2674,10 @@ defmodule Loopctl.Knowledge.Consolidation do
     from(a in Article,
       where: a.tenant_id == ^tenant_id,
       where: a.status == :published,
+      # Read-time evidence liveness: never serve an excerpt of an article that is no
+      # longer retrievable, for the reason the comment above `evidence_map/2` gives
+      # about archived rows.
+      where: is_nil(a.suppressed_at),
       where: a.id in ^ids,
       select: %{
         id: a.id,
