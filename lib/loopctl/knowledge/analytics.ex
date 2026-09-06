@@ -261,6 +261,11 @@ defmodule Loopctl.Knowledge.Analytics do
 
   The optional `context` map attributes all rows in the batch to the
   same project and/or story. Cross-tenant values are silently dropped.
+
+  Returns `:ok`. The one exception is a caller that asked for a SYNCHRONOUS write
+  (`context.sync?`, the merged recall): it publishes the id these rows carry, so a failed
+  batch is reported as `{:error, :recording_failed}` rather than swallowed. The async path
+  stays fire-and-forget.
   """
   @spec record_search_access(
           Ecto.UUID.t(),
@@ -269,7 +274,7 @@ defmodule Loopctl.Knowledge.Analytics do
           String.t() | nil,
           metadata(),
           context()
-        ) :: :ok
+        ) :: :ok | {:error, :recording_failed}
   def record_search_access(
         tenant_id,
         article_ids,
@@ -306,7 +311,6 @@ defmodule Loopctl.Knowledge.Analytics do
       end)
 
     do_record_async(items, tenant_id, api_key_id, "search", context)
-    :ok
   end
 
   def record_search_access(_tenant_id, _ids, _api_key_id, _query, _metadata, _context), do: :ok
@@ -516,13 +520,16 @@ defmodule Loopctl.Knowledge.Analytics do
 
   A map with:
 
-  - `:total_events` -- total event count, impressions included
+  - `:total_events` -- total OBSERVED event count, impressions included. The
+    client-asserted `referenced` rows are NOT counted here; they stay visible under
+    their own key in `accesses_by_type`, so the breakdown may sum higher than the total
   - `:total_reads` -- events that delivered a body (`get`/`context`/`drill`)
-  - `:unique_keys` -- distinct `api_key_id` count. NOT an agent count: v2 mints one
-    ephemeral key per dispatch, so one agent dispatched N times is N keys
-  - `:last_accessed_at` -- most recent `accessed_at` (or nil)
-  - `:accesses_by_type` -- `%{"search" => N, "get" => N, ...}`
-  - `:recent_accesses` -- last 10 events as plain maps
+  - `:unique_keys` -- distinct `api_key_id` count over the same OBSERVED rows. NOT an
+    agent count: v2 mints one ephemeral key per dispatch, so one agent dispatched N
+    times is N keys
+  - `:last_accessed_at` -- most recent OBSERVED `accessed_at` (or nil)
+  - `:accesses_by_type` -- `%{"search" => N, "get" => N, ...}`, `referenced` included
+  - `:recent_accesses` -- last 10 OBSERVED events as plain maps
   """
   @spec get_article_stats(Ecto.UUID.t(), Ecto.UUID.t()) :: map()
   def get_article_stats(tenant_id, article_id) do
@@ -531,12 +538,11 @@ defmodule Loopctl.Knowledge.Analytics do
         where: e.tenant_id == ^tenant_id and e.article_id == ^article_id
       )
 
-    # `referenced` is a CLIENT ASSERTION, not an event the server observed, so it is
-    # excluded from every counter an operator reads as delivery — `total_events` and
-    # `unique_keys` included, or an agent could inflate both for its own article by
-    # posting the same reference in a loop. It stays visible under its own label in
-    # `accesses_by_type`, which is a breakdown rather than a total.
-    observed = from(e in base, where: e.access_type != "referenced")
+    # Every delivery signal on this payload reads `observed` — total, unique keys, last
+    # access and the recent sample alike — so a client posting the same reference in a
+    # loop moves none of them. `accesses_by_type` keeps `base`: it is a labelled
+    # breakdown, not a total, so the assertion stays VISIBLE there under its own key.
+    observed = exclude_asserted(base)
 
     total_events = AdminRepo.aggregate(observed, :count, :id)
 
@@ -550,7 +556,7 @@ defmodule Loopctl.Knowledge.Analytics do
       |> Kernel.||(0)
 
     last_accessed_at =
-      from(e in base, select: max(e.accessed_at))
+      from(e in observed, select: max(e.accessed_at))
       |> AdminRepo.one()
 
     accesses_by_type =
@@ -559,7 +565,7 @@ defmodule Loopctl.Knowledge.Analytics do
       |> Map.new()
 
     recent_accesses =
-      from(e in base,
+      from(e in observed,
         order_by: [desc: e.accessed_at],
         limit: 10,
         select: %{
@@ -971,14 +977,16 @@ defmodule Loopctl.Knowledge.Analytics do
         where: e.accessed_at >= ^since
       )
 
-    total_events = AdminRepo.aggregate(base, :count, :id)
+    observed = exclude_asserted(base)
+
+    total_events = AdminRepo.aggregate(observed, :count, :id)
 
     total_reads =
       from(e in base, where: e.access_type in @read_access_types)
       |> AdminRepo.aggregate(:count, :id)
 
     unique_articles =
-      from(e in base, select: count(e.article_id, :distinct))
+      from(e in observed, select: count(e.article_id, :distinct))
       |> AdminRepo.one()
       |> Kernel.||(0)
 
@@ -1083,19 +1091,21 @@ defmodule Loopctl.Knowledge.Analytics do
         where: e.accessed_at >= ^since
       )
 
-    total_events = AdminRepo.aggregate(base, :count, :id)
+    observed = exclude_asserted(base)
+
+    total_events = AdminRepo.aggregate(observed, :count, :id)
 
     total_reads =
       from(e in base, where: e.access_type in @read_access_types)
       |> AdminRepo.aggregate(:count, :id)
 
     unique_articles =
-      from(e in base, select: count(e.article_id, :distinct))
+      from(e in observed, select: count(e.article_id, :distinct))
       |> AdminRepo.one()
       |> Kernel.||(0)
 
     unique_api_keys =
-      from(e in base, select: count(e.api_key_id, :distinct))
+      from(e in observed, select: count(e.api_key_id, :distinct))
       |> AdminRepo.one()
       |> Kernel.||(0)
 
@@ -1377,12 +1387,21 @@ defmodule Loopctl.Knowledge.Analytics do
       :ok
   end
 
-  defp recording_mode(context) do
-    if Map.get(context, :sync?, false) do
-      :sync
-    else
-      Application.get_env(:loopctl, :analytics_recording_mode, :async)
-    end
+  defp recording_mode(context),
+    do:
+      resolve_recording_mode(
+        context,
+        Application.get_env(:loopctl, :analytics_recording_mode, :async)
+      )
+
+  @doc false
+  # The `sync?` contract as a PURE function, public only so it can be pinned by a test that
+  # does not depend on the ambient mode: `config/test.exs` forces `:analytics_recording_mode`
+  # to `:sync` for the whole test env, so a test driving the request path passes whether or
+  # not `sync?` is honoured — an inert guard of exactly the shape the repo has been bitten by.
+  @spec resolve_recording_mode(map(), :sync | :async) :: :sync | :async
+  def resolve_recording_mode(context, configured) when is_map(context) do
+    if Map.get(context, :sync?, false), do: :sync, else: configured
   end
 
   @doc false
@@ -1429,17 +1448,19 @@ defmodule Loopctl.Knowledge.Analytics do
     end
   rescue
     error ->
-      # Broad rescue so analytics failures never propagate to the read
-      # caller. Logged at :warning so operators can see dropped events in
-      # production; callers still see :ok. Malformed UUIDs in the
-      # attribution context are caught earlier in validate_project/2 and
-      # validate_story/2 and never reach this rescue.
+      # Broad rescue so analytics failures never propagate to the read caller as a crash.
+      # Logged at :warning so operators can see dropped events in production. The RESULT is
+      # reported rather than swallowed: on the `sync?` path the caller PUBLISHES the id
+      # these rows carry, so a dropped batch means a recall whose `recall_id` can never be
+      # referenced, and it has to be able to say so. The async task discards this.
+      # Malformed UUIDs in the attribution context are caught earlier in validate_project/2
+      # and validate_story/2 and never reach this rescue.
       Logger.warning(
         "Knowledge.Analytics record failed (event dropped): " <>
           Exception.message(error)
       )
 
-      :ok
+      {:error, :recording_failed}
   end
 
   # ---------------------------------------------------------------------------
@@ -1731,14 +1752,27 @@ defmodule Loopctl.Knowledge.Analytics do
     from([event: e] in query, where: e.access_type in @read_access_types)
   end
 
-  # The explicit escape hatch for "I really do want impressions counted too".
-  defp maybe_filter_access_type(query, "all"), do: query
+  # The explicit escape hatch for "I really do want impressions counted too". Impressions,
+  # not assertions: `referenced` stays out, because "all" feeds `access_count`/`unique_keys`
+  # on the rankings an operator reads as delivery, and a client that posts the same
+  # reference in a loop would otherwise rank its own article first. Ask for it by name to
+  # see it.
+  defp maybe_filter_access_type(query, "all"), do: exclude_asserted_event(query)
 
   defp maybe_filter_access_type(query, type) when type in @valid_access_types do
     from([event: e] in query, where: e.access_type == ^type)
   end
 
-  defp maybe_filter_access_type(query, _), do: query
+  defp maybe_filter_access_type(query, _), do: exclude_asserted_event(query)
+
+  # `referenced` is a CLIENT ASSERTION (`record_referenced/5`), never an event the server
+  # observed, so every counter an operator reads as delivery excludes it — per-article,
+  # per-project, per-agent and the rankings alike. Missing one surface reintroduces the
+  # whole defect there, which is why this is one helper rather than a repeated predicate.
+  defp exclude_asserted(query), do: from(e in query, where: e.access_type != "referenced")
+
+  defp exclude_asserted_event(query),
+    do: from([event: e] in query, where: e.access_type != "referenced")
 
   defp maybe_filter_project(query, nil), do: query
 

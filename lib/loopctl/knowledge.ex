@@ -3082,41 +3082,49 @@ defmodule Loopctl.Knowledge do
       record_search_attempt(tenant_id, search_id, api_key_id, query_string, results, mode, opts)
     end
 
-    cond do
-      skip? ->
-        :ok
+    if skip_result_rows?(opts, results, api_key_id) do
+      :ok
+    else
+      article_ids =
+        results
+        |> Enum.map(fn r -> r[:id] || Map.get(r, :id) end)
+        |> Enum.reject(&is_nil/1)
+        |> Enum.take(Analytics.max_recorded_search_results())
 
-      results == [] ->
-        :ok
+      Analytics.record_search_access(
+        tenant_id,
+        article_ids,
+        api_key_id,
+        query_string,
+        search_access_meta(mode, results, opts),
+        # search_id rides the INTERNAL context, not the metadata map — metadata is
+        # caller-supplied and a forged id would collapse the `searches` denominator (#582).
+        search_access_context(opts, search_id)
+      )
 
-      is_nil(api_key_id) ->
-        :ok
-
-      true ->
-        article_ids =
-          results
-          |> Enum.map(fn r -> r[:id] || Map.get(r, :id) end)
-          |> Enum.reject(&is_nil/1)
-          |> recorded_article_ids(opts)
-
-        Analytics.record_search_access(
-          tenant_id,
-          article_ids,
-          api_key_id,
-          query_string,
-          search_access_meta(mode, results, opts),
-          # search_id rides the INTERNAL context, not the metadata map — metadata is
-          # caller-supplied and a forged id would collapse the `searches` denominator (#582).
-          search_access_context(opts, search_id)
-        )
+      :ok
     end
+  end
+
+  # The four ways there is nothing to write here. `recall_surfacing?/1` is the one that is
+  # not an absence: the merged recall writes its OWN surfacing rows AFTER its merge (see
+  # below), so this half must not write them twice. The one-per-ATTEMPT row above is still
+  # ours on that path.
+  defp skip_result_rows?(opts, results, api_key_id) do
+    Keyword.get(opts, :_skip_record_access, false) or recall_surfacing?(opts) or
+      results == [] or is_nil(api_key_id)
   end
 
   # The merged recall sets `:_recall_surfacing` (internal, never reachable from a request
   # body) because it PUBLISHES the id these rows carry as `meta.recall_id` and a caller
-  # hands it straight back to `POST /recall/:recall_id/referenced`. Two things follow, and
-  # both are wrong without it:
+  # hands it straight back to `POST /recall/:recall_id/referenced`. Three things follow,
+  # and all three are wrong without it:
   #
+  #   * the surfacing rows are written by the RECALL, after its merge, not here — only the
+  #     merged list knows which knowledge results the merged cap actually published.
+  #     Recording every result this half RETURNED wrote rows for articles the caller was
+  #     never shown, inflating the `searched` denominator (so `precision` and
+  #     `reference_rate` read low) and admitting those ids to `/referenced`.
   #   * EVERY result the recall publishes needs a row, not just the first
   #     `Analytics.max_recorded_search_results/0`, or an article the caller was SHOWN is
   #     refused as `not_surfaced` — and that check is all-or-nothing, so one such id
@@ -3129,10 +3137,29 @@ defmodule Loopctl.Knowledge do
   # so nothing can be handed back.
   defp recall_surfacing?(opts), do: Keyword.get(opts, :_recall_surfacing, false) == true
 
-  defp recorded_article_ids(ids, opts) do
-    if recall_surfacing?(opts),
-      do: ids,
-      else: Enum.take(ids, Analytics.max_recorded_search_results())
+  @doc false
+  # The merged recall's surfacing rows. Called by `Loopctl.Memory.recall_context/2` with the
+  # SAME opts its knowledge half ran under (so the id, the attribution and the client
+  # entrypoint are identical) but with the PUBLISHED knowledge ids. Returns `:ok` or
+  # `{:error, :recording_failed}`: the write is synchronous precisely because the recall is
+  # about to publish `meta.recall_id`, so a failure has to be reportable rather than logged.
+  @spec record_recall_surfacing(Ecto.UUID.t(), [Ecto.UUID.t()], String.t(), keyword()) ::
+          :ok | {:error, :recording_failed}
+  def record_recall_surfacing(tenant_id, article_ids, query_string, opts) do
+    api_key_id = Keyword.get(opts, :api_key_id)
+
+    if is_binary(api_key_id) and article_ids != [] do
+      Analytics.record_search_access(
+        tenant_id,
+        article_ids,
+        api_key_id,
+        query_string,
+        search_access_meta("combined", article_ids, opts),
+        search_access_context(opts, resolve_search_id(opts))
+      )
+    else
+      :ok
+    end
   end
 
   defp search_access_context(opts, search_id) do
@@ -13263,6 +13290,9 @@ defmodule Loopctl.Knowledge do
 
   @doc """
   Records fire-and-forget search access for a list of article ids.
+
+  `{:error, :recording_failed}` only where the write actually ran synchronously (the
+  `:analytics_recording_mode` env); the fire-and-forget path is always `:ok`.
   """
   @spec record_search_access(
           Ecto.UUID.t(),
@@ -13270,7 +13300,7 @@ defmodule Loopctl.Knowledge do
           Ecto.UUID.t() | nil,
           String.t() | nil,
           map()
-        ) :: :ok
+        ) :: :ok | {:error, :recording_failed}
   def record_search_access(tenant_id, article_ids, api_key_id, query, metadata \\ %{}) do
     Analytics.record_search_access(tenant_id, article_ids, api_key_id, query, metadata)
   end

@@ -1451,7 +1451,8 @@ defmodule Loopctl.Memory do
     memory_env =
       recall(scope, query: query, limit: limit, embedding: embedding_result, on_overload: :tag)
 
-    knowledge_env = knowledge_recall(scope, query, limit, opts, embedding_result, recall_id)
+    {knowledge_env, kopts} =
+      knowledge_recall(scope, query, limit, opts, embedding_result, recall_id)
 
     memory_reason = memory_selection_reason(memory_env)
 
@@ -1490,6 +1491,14 @@ defmodule Loopctl.Memory do
       |> Enum.with_index(1)
       |> Enum.map(fn {item, rank} -> Map.put(item, :rank, rank) end)
 
+    # The surfacing ledger is written HERE, not inside the knowledge half, and only for the
+    # knowledge ids this merge actually PUBLISHED: `meta.recall_id` names these rows and
+    # `POST /recall/:recall_id/referenced` admits exactly them, so a row for a result the
+    # cap dropped would both inflate the `searched` denominator and admit an id the caller
+    # was never shown. Synchronous — a caller may reference the instant this response lands.
+    ledger =
+      Knowledge.record_recall_surfacing(scope.tenant_id, published_ids(merged), query, kopts)
+
     tokens_selected = sum_tokens(merged)
     tokens_candidates = sum_tokens(candidates)
 
@@ -1520,12 +1529,17 @@ defmodule Loopctl.Memory do
         tokens_saved_vs_candidates: max(tokens_candidates - tokens_selected, 0),
         # `degraded?` is true when EITHER half degraded: the knowledge side errored/fell
         # back to keyword-only, OR the memory heavy-read pool was shed (empty by capacity).
-        degraded?: knowledge_degraded?(knowledge_env) or memory_degraded?(memory_env),
+        # A failed ledger write counts: the response still carries a `recall_id`, but
+        # `/referenced` will refuse every id under it, so a caller has to be told rather
+        # than left to read the refusal as a bad id of its own.
+        degraded?:
+          knowledge_degraded?(knowledge_env) or memory_degraded?(memory_env) or
+            ledger != :ok,
         # A BOUNDED, non-sensitive tag naming WHY the merged recall degraded (or `nil`
         # when it did not), so a caller can distinguish a scope-empty half from a
         # fault-empty one without parsing the per-source envelopes. Knowledge degradation
         # is reported first (it drives the documented `degraded?`), then memory.
-        degraded_reason: merged_degraded_reason(memory_env, knowledge_env),
+        degraded_reason: merged_degraded_reason(memory_env, knowledge_env, ledger),
         # The merged `results` order sorts memory's ABSOLUTE cosine similarity against
         # knowledge's POOL-NORMALIZED final_score — a heuristic, not a calibrated
         # cross-source ranking (knowledge is biased upward; see the moduledoc). Surface
@@ -1572,18 +1586,23 @@ defmodule Loopctl.Memory do
       # does not make a second provider call for the identical query (#411 Gap 2).
       |> maybe_put_opt(:embedding, embedding_result)
 
-    case Knowledge.search_combined(scope.tenant_id, query, kopts) do
-      {:ok, %{results: results, meta: meta}} ->
-        # A keyword-only fallback (embedding unavailable) sets meta.fallback; carry
-        # that forward as degraded? so the merged meta reflects a degraded knowledge side.
-        %{results: results, meta: Map.put(meta, :degraded?, Map.get(meta, :fallback, false))}
+    env =
+      case Knowledge.search_combined(scope.tenant_id, query, kopts) do
+        {:ok, %{results: results, meta: meta}} ->
+          # A keyword-only fallback (embedding unavailable) sets meta.fallback; carry
+          # that forward as degraded? so the merged meta reflects a degraded knowledge side.
+          %{results: results, meta: Map.put(meta, :degraded?, Map.get(meta, :fallback, false))}
 
-      {:error, reason} ->
-        degraded_knowledge_env(scope.tenant_id, reason, limit, recall_id)
+        {:error, reason} ->
+          degraded_knowledge_env(scope.tenant_id, reason, limit, recall_id)
 
-      {:error, reason, _message} ->
-        degraded_knowledge_env(scope.tenant_id, reason, limit, recall_id)
-    end
+        {:error, reason, _message} ->
+          degraded_knowledge_env(scope.tenant_id, reason, limit, recall_id)
+      end
+
+    # `kopts` rides back out because the surfacing rows are written after the MERGE and
+    # must carry the identical id, attribution and client entrypoint this half ran under.
+    {env, kopts}
   end
 
   # The uniform empty/degraded knowledge envelope used when `search_combined/3` returns
@@ -1655,7 +1674,7 @@ defmodule Loopctl.Memory do
 
   # A BOUNDED, non-sensitive tag naming why the merged recall degraded, or `nil`. Reports
   # the knowledge side first (it drives the documented `degraded?`), then memory.
-  defp merged_degraded_reason(memory_env, knowledge_env) do
+  defp merged_degraded_reason(memory_env, knowledge_env, ledger) do
     cond do
       knowledge_degraded?(knowledge_env) ->
         knowledge_env.meta[:fallback_reason] || "knowledge_degraded"
@@ -1663,9 +1682,23 @@ defmodule Loopctl.Memory do
       memory_degraded?(memory_env) ->
         memory_env.meta[:reason]
 
+      # Reported last: both halves answered, but the recall_id this response publishes
+      # names no surfacing rows, so every `/referenced` post under it is refused.
+      ledger != :ok ->
+        "recall_ledger_unavailable"
+
       true ->
         nil
     end
+  end
+
+  # The knowledge ids the merge PUBLISHED, in published order — the exact set
+  # `Knowledge.record_recall_surfacing/4` writes rows for.
+  defp published_ids(merged) do
+    merged
+    |> Enum.filter(&(&1.source == :knowledge))
+    |> Enum.map(fn item -> Map.get(item.article, :id) end)
+    |> Enum.reject(&is_nil/1)
   end
 
   # Knowledge ranking score for the CROSS-SOURCE merge — the ABSOLUTE per-row relevance

@@ -4327,7 +4327,11 @@ defmodule Loopctl.ApiSpec.Schemas do
                 "Bounded, non-sensitive tag naming WHY the merged recall degraded " <>
                   "(e.g. `heavy_read_overloaded`, `no_embedding_key`, `invalid_weights`), " <>
                   "or `null` when healthy. Lets a caller tell a scope-empty half from a " <>
-                  "fault-empty one without parsing the per-source envelopes."
+                  "fault-empty one without parsing the per-source envelopes. " <>
+                  "`recall_ledger_unavailable` is the one that is not about the results: " <>
+                  "both halves answered, but the surfacing rows could not be written, so " <>
+                  "`POST /recall/{recall_id}/referenced` will refuse every id under this " <>
+                  "`recall_id`."
             },
             results_ranking: %Schema{
               type: :string,
@@ -4397,13 +4401,14 @@ defmodule Loopctl.ApiSpec.Schemas do
           type: :array,
           items: %Schema{type: :string, format: :uuid},
           description:
-            "The articles you actually used — any article the recall identified by " <>
-              "`recall_id` SURFACED, which is its `data` plus anything its knowledge half " <>
-              "surfaced under that id but the merged cap did not hand you. Non-empty, " <>
-              "every one a UUID, and no more than the merged recall's own maximum page " <>
-              "size — the endpoint description states that number, from the attribute " <>
-              "that enforces it, so this text cannot drift from it. An id that recall did " <>
-              "not surface fails the WHOLE call with 422 `not_surfaced`."
+            "The articles you actually used, taken from that recall's `data`: the " <>
+              "`article.id` of each item whose `source` is `knowledge`. ONLY those are " <>
+              "referenceable — a `memory` item's `id` is a memory, not an article, and " <>
+              "sending one fails the WHOLE call (the check is all-or-nothing), as does " <>
+              "any id that recall did not surface: 422 `not_surfaced`, naming the ids. " <>
+              "Non-empty, every one a UUID, and no more than the merged recall's own " <>
+              "maximum page size — the endpoint description states that number, from the " <>
+              "attribute that enforces it, so this text cannot drift from it."
         },
         project_id: %Schema{
           type: :string,

@@ -5502,8 +5502,10 @@ const TOOLS = [
           type: "array",
           items: { type: "string", format: "uuid" },
           description:
-            "The ids you actually used, from that recall's `data`. Non-empty, at most one " +
-            "recall page's worth, every one an id that recall surfaced.",
+            "The ids you actually used, from that recall's `data`: the `article.id` of " +
+            "each item whose `source` is `knowledge`. A `memory` item's id is NOT an " +
+            "article and is not referenceable — including one fails the whole call. " +
+            "Non-empty, at most one recall page's worth.",
         },
         project_id: {
           type: "string",

@@ -532,14 +532,26 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
   # overlap: a recall at 23:59 referenced at 00:01 lands in a day whose `searched` never
   # counted it, and a client replaying old recall ids could push `reference_rate` far above
   # 1.0 on a quiet day. Correlating on the surfacing row instead makes the numerator a
-  # SUBSET of the denominator, so the rate is bounded by 1.0 by construction — at the cost
-  # that a late reference moves an already-computed day, which is why the snapshot is
-  # recomputable rather than append-only.
+  # SUBSET of the denominator, so the rate is bounded by 1.0 by construction.
+  #
+  # The COST is real and is not hedged away here: the daily worker computes one day, the
+  # previous one, so a reference posted after that day's snapshot was written is not in it.
+  # `snapshot/3` upserts, so re-running the worker with an explicit `"day"` arg recomputes
+  # the day exactly — but NOTHING does that on a schedule, so the published `referenced` and
+  # `reference_rate` under-report cross-day references until someone re-runs the day.
+  #
+  # The reference row carries a LOWER bound and no upper one: a reference cannot precede the
+  # surfacing row it is correlated to, so `>= day_start` excludes nothing while keeping the
+  # scan off every reference the tenant has ever written. The join compares the metadata key
+  # as TEXT rather than casting it to `uuid` — the cast would be applied to every same-day
+  # search row, so one malformed value would raise out of the whole snapshot, and the text
+  # form is also what `article_access_events_search_id_idx` indexes.
   defp compute_referenced(tenant_id, day_start, day_end) do
     from(r in ArticleAccessEvent,
       as: :r,
       where: r.tenant_id == ^tenant_id,
       where: r.access_type == "referenced",
+      where: r.accessed_at >= ^day_start,
       where: not is_nil(r.origin_search_id),
       where:
         exists(
@@ -549,8 +561,8 @@ defmodule Loopctl.Knowledge.RetrievalMetrics do
                 s.access_type == "search" and
                 s.article_id == parent_as(:r).article_id and
                 s.accessed_at >= ^day_start and s.accessed_at < ^day_end and
-                fragment("(?->>'search_id')::uuid", s.metadata) ==
-                  parent_as(:r).origin_search_id
+                fragment("?->>'search_id'", s.metadata) ==
+                  fragment("?::text", parent_as(:r).origin_search_id)
           )
         ),
       distinct: [r.origin_search_id, r.article_id],

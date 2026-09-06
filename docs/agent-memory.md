@@ -301,7 +301,9 @@ observations; this one is a **client assertion**, so it is bounded rather than
 trusted:
 
 - only articles that recall **actually surfaced** under that `recall_id`, in the
-  caller's own tenant, are accepted. Any other id fails the WHOLE call with `422`
+  caller's own tenant, are accepted — in `data`, that is the `article.id` of the
+  items whose `source` is `knowledge`. A `memory` item's `id` is a memory, not an
+  article, and is not referenceable. Any other id fails the WHOLE call with `422`
   `not_surfaced` and nothing is written. An unknown or foreign `recall_id`
   surfaced nothing, so it takes the same 422 — there is no cross-tenant existence
   oracle;

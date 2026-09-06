@@ -392,12 +392,25 @@ defmodule LoopctlWeb.RecallControllerTest do
       # No polling: the recall path writes its surfacing rows SYNCHRONOUSLY, precisely so
       # a client that references immediately after the response cannot race the recorder
       # and be told `not_surfaced`. A sleep-and-retry here would hide that regression.
+      # This assertion alone does NOT pin the sync flag — config/test.exs forces
+      # `:analytics_recording_mode` to `:sync` for the whole env, so it passes either way.
+      # The flag's own contract is pinned by the next test.
       {:ok, surfaced} = Analytics.surfaced_article_ids(tenant.id, recall_id)
 
       assert article.id in surfaced,
              "the recall published a recall_id that names no surfacing rows"
 
       assert key.id
+    end
+
+    test "the recall's sync? flag forces a synchronous write even when the env says async" do
+      # The guard the test above cannot be: it takes the ambient mode out of the picture by
+      # passing it in, so deleting the `sync?` leg of `Analytics.resolve_recording_mode/2`
+      # fails HERE rather than passing green under the test env's `:sync` default.
+      assert Analytics.resolve_recording_mode(%{sync?: true}, :async) == :sync
+      assert Analytics.resolve_recording_mode(%{}, :async) == :async
+      assert Analytics.resolve_recording_mode(%{sync?: false}, :async) == :async
+      assert Analytics.resolve_recording_mode(%{}, :sync) == :sync
     end
 
     test "EVERY knowledge id the recall publishes has a surfacing row, past the search cap" do
@@ -431,6 +444,12 @@ defmodule LoopctlWeb.RecallControllerTest do
       assert published -- surfaced == [],
              "the recall published knowledge ids with no surfacing row: they would be " <>
                "refused as not_surfaced"
+
+      # And no MORE than that: the rows are written from the merged list, so a knowledge
+      # result the merged cap dropped gets none. A superset would inflate the `searched`
+      # denominator and admit an id to /referenced that the caller was never shown.
+      assert surfaced -- published == [],
+             "the recall surfaced rows for knowledge ids it never published"
     end
 
     test "an identity-less key is refused with a deterministic 422 (subject_id_unresolvable)" do

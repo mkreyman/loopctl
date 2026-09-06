@@ -260,7 +260,9 @@ defmodule LoopctlWeb.MemoryController do
          "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       500 =>
-        {"The reference rows could not be recorded", "application/json", Schemas.ErrorResponse},
+        {"`lookup_failed` (the surfacing check could not run — transient, retry) or " <>
+           "`recording_failed` (the insert failed). Nothing is written either way.",
+         "application/json", Schemas.ErrorResponse},
       503 => {"Tenant custody halted", "application/json", Schemas.ErrorResponse}
     }
   )
@@ -592,10 +594,30 @@ defmodule LoopctlWeb.MemoryController do
 
       # A DB fault in the admission check is a 500, never folded into `not_surfaced`: an
       # empty surfaced set and an unreadable one look identical, and answering 422 would
-      # blame the caller's own valid ids for an outage.
-      {:error, reason} when reason in [:lookup_failed, :recording_failed] ->
+      # blame the caller's own valid ids for an outage. The two 500s keep SEPARATE codes
+      # and separate advice: the lookup one is a transient fault where retrying is exactly
+      # the remedy, the insert one is where a deleted article makes a retry pointless.
+      # Collapsing them told a caller not to retry the one case that a retry fixes.
+      {:error, :lookup_failed} ->
+        lookup_failed(conn)
+
+      {:error, :recording_failed} ->
         recording_failed(conn)
     end
+  end
+
+  defp lookup_failed(conn) do
+    conn
+    |> put_status(:internal_server_error)
+    |> json(%{
+      error: %{
+        status: 500,
+        code: "lookup_failed",
+        message:
+          "The check of what this recall surfaced could not run, so nothing was written. " <>
+            "This is a transient database fault, not a statement about your ids — retry."
+      }
+    })
   end
 
   defp recording_failed(conn) do
@@ -607,8 +629,8 @@ defmodule LoopctlWeb.MemoryController do
         code: "recording_failed",
         message:
           "The reference rows could not be recorded. Nothing was written. Retry once; a " <>
-            "repeated failure means the recall or one of its articles is no longer " <>
-            "available, and retrying will not change that."
+            "repeated failure means one of these articles is no longer available, and " <>
+            "retrying will not change that."
       }
     })
   end
