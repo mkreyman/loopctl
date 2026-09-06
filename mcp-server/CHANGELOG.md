@@ -5,7 +5,7 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
-## 2.81.0 — 2026-09-05 (a tool result says whether it ran, not just what it found)
+## 2.85.0 — 2026-09-05 (a tool result says whether it ran, not just what it found)
 
 ### Added
 
@@ -45,6 +45,49 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   An unrecognised `outcome` value means a server newer than this client, and the notice
   falls back to the pre-envelope flag heuristics rather than inventing a class it cannot
   interpret. A server that sends no `outcome` at all keeps the historical wording.
+
+## 2.80.0 — 2026-09-05 (a destructive tool stops carrying its own approval)
+
+### Changed
+
+- **BREAKING: `knowledge_bulk_delete` no longer declares a `confirm` argument, and the
+  `tag` selector is two-step even for the soft archive (#779).** `confirm` was
+  authorization the model wrote for itself: the same call that asked for the mutation
+  also carried its own approval, so nothing outside the caller ever saw the proposal, and
+  an agent that decided to archive every article carrying a tag also decided to confirm
+  it. The parameter is gone from the tool schema and from the request body this server
+  sends. A request that still carries a `confirm` key is refused by the API with `400`
+  and `error.code: "confirm_removed"` — refused rather than ignored, so a stale client
+  learns the gate moved instead of believing it passed one.
+
+- **The `tag` archive now uses the frozen-token flow the hard delete already used.** Call
+  with `dry_run: true` to get `meta.would_affect` and a single-use, TTL-bounded
+  `meta.token` frozen over the previewed id-set, then call again with the same `tag` plus
+  that token to archive exactly that set — rows that started matching after the preview
+  are never swept. A `tag` call with neither `dry_run` nor a `token` is `400` with
+  `error.code: "dry_run_required"`. A selector too large to freeze gets `meta.oversized`
+  and `meta.confirm_hash` instead; echo the hash back with the same selector and the
+  server re-resolves and refuses on any drift. The archive and delete flows mint
+  DIFFERENT token types, and the oversized `confirm_hash` is keyed on the op, so an
+  archive proposal is not spendable as a delete or the reverse at any set size. Every token
+  is bound to its SELECTOR too — the hard delete as much as the tag archive — so replaying
+  one under a different `tag` is a `400`, not a silent sweep of the tag it was minted for,
+  and a hard delete replays the same selector it previewed rather than the token alone. A
+  selector that matches nothing needs no token — it stays a `200` no-op on either path.
+  A proposal minted by an earlier server release is refused after the API deploy (a
+  fail-closed `400`); re-run the dry-run.
+
+- **Unchanged:** `article_ids` and `source_type` + `source_id` still archive immediately
+  with no token, because each names a set the caller already holds. The role gate is
+  still `LOOPCTL_USER_KEY`. The response shape, including `meta.counts`/`meta.results`,
+  is the same.
+
+### Notes
+
+- The design invariant this enforces — no loopctl MCP tool takes a `confirm`, `approved`
+  or `yes` argument, and a set-based destructive action returns a server-minted proposal
+  the caller replays — is now written down in `README.md` so the next destructive tool
+  inherits it rather than re-deriving it.
 
 ## 2.78.0 — 2026-08-28 (the corpus tier becomes reachable from an agent)
 
