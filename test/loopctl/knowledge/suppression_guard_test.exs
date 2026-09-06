@@ -68,7 +68,11 @@ defmodule Loopctl.Knowledge.SuppressionGuardTest do
       # A deleted predicate whose explanation survives must NOT keep the guard green, and
       # `:include` RETURNS suppressed rows, so a call that hardcodes it is not coverage.
       refute covered?("  # Suppression.exclude/1 belongs here; is_nil(a.suppressed_at) went.")
+      refute covered?("where(q, [a], a.status == :published) # is_nil(a.suppressed_at) went")
       refute covered?("Suppression.filter(query, :include)")
+      # A nested call hides `:include` from any paren-bounded lookahead, and this is the
+      # shape a surface that deliberately opens itself is written in.
+      refute covered?("|> Suppression.filter(Keyword.get(opts, :suppressed, :include))")
       assert covered?("|> Suppression.exclude()")
       assert covered?("Suppression.filter(base, Keyword.get(opts, :suppressed, :exclude))")
     end
@@ -176,6 +180,20 @@ defmodule Loopctl.Knowledge.SuppressionGuardTest do
                "reported bridgeable through an article the tenant asked us to forget."
     end
 
+    test "the two link-hydration paths drop a suppressed NEIGHBOUR" do
+      for {name, why} <- [
+            {"drop_suppressed_links",
+             "get_article/3 and progressive_drill/3 preload whole link rows, so a suppressed " <>
+               "neighbour is named by id and title unless this rejects it"},
+            {"suppressed_far_side?",
+             "GET /articles/:id/links hydrates both sides of every link, so a suppressed " <>
+               "far side is named there unless this rejects it"}
+          ] do
+        assert function_body!("lib/loopctl/knowledge.ex", name) =~ "Suppression.suppressed?",
+               "#{name}/_ no longer applies the predicate: #{why}."
+      end
+    end
+
     test "the RRF graph lane hydrates through the predicate" do
       body = function_body!("lib/loopctl/knowledge.ex", "fetch_graph_lane_articles")
 
@@ -197,11 +215,15 @@ defmodule Loopctl.Knowledge.SuppressionGuardTest do
     Enum.any?(Suppression.predicate_markers(), &Regex.match?(&1, code))
   end
 
+  # Strips a TRAILING comment as well as a whole-line one: a line-anchored stripper leaves
+  # `where(...) # is_nil(a.suppressed_at) used to be here` counted as code, which is the same
+  # prose-counts-as-code failure one comment lower. `#{` is interpolation, not a comment, and
+  # `?#` is a char literal, so neither opens one.
   defp strip_comment_lines(body) do
     body
     |> String.split("\n")
     |> Enum.reject(&Regex.match?(~r/^\s*#/, &1))
-    |> Enum.join("\n")
+    |> Enum.map_join("\n", &Regex.replace(~r/(?<!\?)#(?!\{).*$/, &1, ""))
   end
 
   defp sites_by_key do

@@ -333,6 +333,7 @@ defmodule Loopctl.Knowledge.StructuralLinks do
     case minted_hub(tenant_id, key) do
       {:error, _reason} = shed -> shed
       nil -> adopt_or_create_hub(tenant_id, source, key, member_count)
+      %Article{suppressed_at: %DateTime{}} -> {:error, :hub_suppressed}
       hub -> {:ok, maybe_retitle(tenant_id, hub, source, member_count), :resolved}
     end
   end
@@ -357,6 +358,14 @@ defmodule Loopctl.Knowledge.StructuralLinks do
       else: hub
   end
 
+  # A SUPPRESSED hub is shed for the same reason `existing_source_hub/2` skips one: retitling
+  # it and edging every member to it centres the source group's navigational star on an
+  # article no read path returns. The shed is checked HERE rather than in the query because
+  # this lookup keys off the hub's unique `idempotency_key` — filtering the row out would
+  # only send us to `create_hub/4`, whose insert dedups straight back onto the same row. So
+  # the source is skipped this run (a logged hub failure, no edges written), and unsuppress
+  # restores it.
+  #
   # A hub that does not carry this source's own tag is NOT this source's hub — the #724
   # shape, where a row answering our idempotency_key belongs to somebody else. Renaming it
   # to our name destroys another source's title, re-embeds it, and repeats every week.
@@ -550,10 +559,23 @@ defmodule Loopctl.Knowledge.StructuralLinks do
     # unique digest, so a collision on it — by key or by title — is this source's own hub,
     # not another's; `attributed?/2` still re-checks the tag before any edge is written.
     case Knowledge.create_article(tenant_id, attrs, @actor) do
-      {:ok, %Article{} = hub} -> {:ok, hub, :created}
-      {:ok, :deduplicated, %Article{} = hub} -> {:ok, hub, :resolved}
-      {:error, :duplicate_title, %Article{} = hub} -> {:ok, hub, :resolved}
-      {:error, reason} -> {:error, reason}
+      {:ok, %Article{} = hub} ->
+        {:ok, hub, :created}
+
+      {:ok, :deduplicated, %Article{suppressed_at: %DateTime{}}} ->
+        {:error, :hub_suppressed}
+
+      {:ok, :deduplicated, %Article{} = hub} ->
+        {:ok, hub, :resolved}
+
+      {:error, :duplicate_title, %Article{suppressed_at: %DateTime{}}} ->
+        {:error, :hub_suppressed}
+
+      {:error, :duplicate_title, %Article{} = hub} ->
+        {:ok, hub, :resolved}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 

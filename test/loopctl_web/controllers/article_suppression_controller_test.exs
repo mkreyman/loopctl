@@ -97,15 +97,19 @@ defmodule LoopctlWeb.ArticleSuppressionControllerTest do
       assert AdminRepo.get!(Article, article.id).suppressed_at == nil
     end
 
-    test "a multibyte actor label does not overflow its column", %{conn: conn} do
-      # The label is server-derived and sliced to the column bound; slicing in GRAPHEMES
-      # could keep more codepoints than varchar(200) holds.
-      {_tenant, raw_key, article} = setup_tenant(:agent)
+    test "a multibyte actor label is truncated in CODEPOINTS, not graphemes", %{conn: _conn} do
+      # The controller's label is short ASCII, so driving this through HTTP asserts nothing:
+      # a grapheme slice passes it unchanged and the test stays green on the bug. Call the
+      # context with a label that is UNDER the bound in graphemes and OVER it in codepoints
+      # — the one shape varchar(200) rejects.
+      {tenant, _raw_key, article} = setup_tenant(:agent)
+      label = String.duplicate("e" <> <<0x0301::utf8>>, 110)
 
-      conn
-      |> auth_conn(raw_key)
-      |> post(~p"/api/v1/articles/#{article.id}/suppress", %{"reason" => "held"})
-      |> json_response(200)
+      assert String.length(label) < 200
+      assert length(String.to_charlist(label)) > 200
+
+      {:ok, _} =
+        Knowledge.suppress_article(tenant.id, article.id, reason: "held", actor_label: label)
 
       by = AdminRepo.get!(Article, article.id).suppressed_by
       assert length(String.to_charlist(by)) <= 200

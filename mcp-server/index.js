@@ -1337,7 +1337,7 @@ async function setTokenBudget({ scope_type, scope_id, budget_millicents, alert_t
 
 // --- Knowledge Wiki Tools (agent key) ---
 
-async function knowledgeIndex({ project_id, story_id, category, tags, match, offset, limit, fields }) {
+async function knowledgeIndex({ project_id, story_id, category, tags, match, offset, limit, fields, suppressed }) {
   if (project_id && !UUID_RE.test(project_id)) {
     return {
       content: [{ type: "text", text: "Error: project_id must be a canonical UUID (8-4-4-4-12 hex)." }],
@@ -1355,6 +1355,7 @@ async function knowledgeIndex({ project_id, story_id, category, tags, match, off
   if (offset != null) params.set("offset", String(offset));
   if (limit != null) params.set("limit", String(limit));
   if (fields) params.set("fields", Array.isArray(fields) ? fields.join(",") : fields);
+  if (suppressed) params.set("suppressed", suppressed);
   const qs = params.toString();
   const path = qs ? `${basePath}?${qs}` : basePath;
   const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
@@ -4409,6 +4410,14 @@ const TOOLS = [
             "Optional: projection of article fields to return. Default: id, title, category. `id` is always included. " +
             "Pair suppressed='only' with fields=suppressed_by,suppression_reason to see who suppressed what and why without a per-row read.",
         },
+        suppressed: {
+          type: "string",
+          enum: ["exclude", "include", "only"],
+          description:
+            "Optional: how to treat RETRIEVAL-SUPPRESSED articles — 'exclude' (default), 'include', or " +
+            "'only'. 'only' is the discovery path: it lists exactly what there is to undo with " +
+            "knowledge_unsuppress, across every status. An unrecognised value resolves to 'exclude'.",
+        },
       },
       required: [],
     },
@@ -4430,7 +4439,10 @@ const TOOLS = [
       "`meta.total_count` (exact) to answer \"does an article for X already exist?\" reliably " +
       "right after a write — `idempotency_key` is a FILTER only and is never returned in a " +
       "row, so you check a key you already hold rather than reading back the keys other " +
-      "callers chose. Paginate via offset/limit.",
+      "callers chose. Suppressed articles are EXCLUDED here (matching knowledge_index) except " +
+      "on an `idempotency_key` filter, which is an identity check on a key you already hold " +
+      "and still sees them — so the existence check stays true about the row a create would " +
+      "dedup against. Paginate via offset/limit.",
     inputSchema: {
       type: "object",
       properties: {

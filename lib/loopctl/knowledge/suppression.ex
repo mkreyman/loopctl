@@ -125,10 +125,13 @@ defmodule Loopctl.Knowledge.Suppression do
   bindings one by one would go stale the first time someone renamed one — silently, by
   reporting a covered site as uncovered and inviting the next person to exempt it.
 
-  `filter/2` counts only when the mode is not the LITERAL `:include`: that arm returns
-  suppressed rows, so matching it would let a call that deliberately opens the surface back
-  up read as coverage. A mode read from an opt still counts, because `:exclude` is its
-  default and a caller-supplied mode is the point of the surfaces that take one.
+  `filter/2` counts only when NO `:include` appears anywhere else on its line: that arm
+  returns suppressed rows, so matching it would let a call that deliberately opens the
+  surface back up read as coverage. The lookahead runs to end-of-LINE rather than to the
+  closing paren, because a paren-bounded one cannot see past a nested call — and
+  `Suppression.filter(q, Keyword.get(opts, :suppressed, :include))` is exactly that shape.
+  A mode read from an opt still counts when its default is `:exclude`, which is the point of
+  the surfaces that take one.
 
   These are matched against source with COMMENT LINES STRIPPED. This feature's explanations
   are written as `#` comments right next to the predicates, so a substring match over raw
@@ -139,7 +142,7 @@ defmodule Loopctl.Knowledge.Suppression do
   def predicate_markers do
     [
       ~r/Suppression\.exclude/,
-      ~r/Suppression\.filter\((?![^()]*:include[^()]*\))/,
+      ~r/Suppression\.filter\((?![^\n]*:include)/,
       ~r/is_nil\([a-z_][a-zA-Z0-9_]*\.suppressed_at\)/,
       ~r/suppressed_at IS NULL/
     ]

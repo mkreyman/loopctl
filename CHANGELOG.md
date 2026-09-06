@@ -39,17 +39,22 @@ All notable changes to loopctl are documented here.
   `articles` already has row-level security enabled and the policy is on the ROW, so the new
   columns inherit it.
 
-  **Export behaviour changed:** a suppressed article is still exported by both the buffered
-  `?format=json` OKF bundle and the streamed `.tar.gz`, now carrying
-  `loopctl_suppressed_at` / `loopctl_suppressed_by` / `loopctl_suppression_reason` in its
-  frontmatter. IMPORT does not restore the tombstone, for the same reason it does not
+  **Export behaviour changed:** a suppressed article is still exported by the buffered
+  `?format=json` OKF bundle and by the streamed `.tar.gz`, and in the OKF frontmatter it now
+  carries `loopctl_suppressed_at` / `loopctl_suppressed_by` / `loopctl_suppression_reason`.
+  The Obsidian vault format does not yet render those three keys. IMPORT does not restore the tombstone, for the same reason it does not
   restore `loopctl_status`: every imported concept is created as a draft, and a bundle is
   advisory about lifecycle.
 
-  **Discovery:** `GET /api/v1/knowledge/index?suppressed=only` lists what there is to undo,
-  and `suppressed_at`/`suppressed_by`/`suppression_reason` are now projectable `fields` there,
-  so an operator sees who suppressed what and why without a read per row. `GET
-  /api/v1/articles` excludes suppressed articles by default, matching that index.
+  **Discovery:** `GET /api/v1/knowledge/index?suppressed=only` lists what there is to undo —
+  across every status, since suppression is not status-scoped and a suppressed draft would
+  otherwise be listed nowhere — and `suppressed_at`/`suppressed_by`/`suppression_reason` are
+  now projectable `fields` there, so an operator sees who suppressed what and why without a
+  read per row. `GET /api/v1/articles` excludes suppressed articles by default, matching that
+  index, EXCEPT on an `idempotency_key` lookup: that filter is an identity check on a
+  unique-indexed key the caller already holds, and it is what decides whether to create, so
+  hiding the row there would report "never captured" about the exact article the next create
+  silently dedups against.
 
   MCP tools: `knowledge_suppress`, `knowledge_unsuppress`.
 

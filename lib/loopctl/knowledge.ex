@@ -1057,6 +1057,7 @@ defmodule Loopctl.Knowledge do
           incoming_links: :source_article
         )
         |> filter_visible_links(vis)
+        |> drop_suppressed_links()
         |> drop_resolved_conflict_links(tenant_id)
 
       # `:access_type` defaults to `"get"` — this function is shared by `get_article/3` and
@@ -1107,6 +1108,22 @@ defmodule Loopctl.Knowledge do
 
   defp link_side_visible?(%Article{} = far_side, vis), do: visible_to_caller?(far_side, vis)
   defp link_side_visible?(_not_loaded, _vis), do: false
+
+  # A suppressed NEIGHBOUR is not a neighbour a retrieval surface may name — the same rule
+  # `batch_linked_refs/3` applies to knowledge_context. The article itself stays resolvable
+  # by id (that exemption is what makes a suppression inspectable), so only the FAR side is
+  # judged; links arrive as preloaded whole rows, so the predicate runs in Elixir. Applied
+  # unconditionally: `filter_visible_links/2` is a no-op for a non-agent caller, and
+  # suppression is not a visibility rule.
+  defp drop_suppressed_links(article) do
+    %{
+      article
+      | outgoing_links:
+          Enum.reject(article.outgoing_links, &Suppression.suppressed?(&1.target_article)),
+        incoming_links:
+          Enum.reject(article.incoming_links, &Suppression.suppressed?(&1.source_article))
+    }
+  end
 
   # Route-the-findings (#4): a `:potential_conflict` link whose pair already has a
   # resolution (dismissed/superseded/etc.) is no longer an OPEN conflict — drop it from
@@ -1454,16 +1471,20 @@ defmodule Loopctl.Knowledge do
     limit = opts |> Keyword.get(:limit, @max_page_size) |> max(1) |> min(@max_page_size)
     offset = opts |> Keyword.get(:offset, 0) |> max(0)
 
-    base =
-      from(a in Article,
-        where: a.tenant_id == ^tenant_id,
-        where: a.status == :published
-      )
+    mode = Keyword.get(opts, :suppressed, :exclude)
+
+    base = from(a in Article, where: a.tenant_id == ^tenant_id)
+
+    # `:only` is the DISCOVERY path, and suppression is not status-scoped: suppress_article/3
+    # takes no view of status, so a suppressed DRAFT would be listed nowhere at all and the
+    # undo needs an id from somewhere. Every other mode keeps the published catalog this
+    # endpoint has always been.
+    base = if mode == :only, do: base, else: where(base, [a], a.status == :published)
 
     # The index is the ONE surface that takes a `:suppressed` mode from the caller, and it
     # is what makes suppression reversible in practice: `:only` lists what there is to undo.
     # It still defaults to `:exclude`, so an ordinary browse is unchanged.
-    base = Suppression.filter(base, Keyword.get(opts, :suppressed, :exclude))
+    base = Suppression.filter(base, mode)
 
     base = scope_project_or_global(base, project_id)
 
@@ -4194,6 +4215,9 @@ defmodule Loopctl.Knowledge do
       trimmed == "" ->
         {:error, "reason must not be blank"}
 
+      not String.valid?(trimmed) ->
+        {:error, "reason must be valid UTF-8"}
+
       codepoint_length(trimmed) > max ->
         {:error, "reason must be at most #{max} characters"}
 
@@ -4308,12 +4332,25 @@ defmodule Loopctl.Knowledge do
     # to 200 graphemes and still overflow varchar(200).
     label
     |> to_string()
-    |> String.to_charlist()
-    |> Enum.take(Article.max_suppressed_by_length())
-    |> List.to_string()
+    |> take_codepoints(Article.max_suppressed_by_length())
   end
 
-  defp codepoint_length(binary), do: binary |> String.to_charlist() |> length()
+  # Both helpers walk the binary rather than building a charlist. `String.to_charlist/1`
+  # materializes ONE CONS CELL PER CODEPOINT before anything is rejected — a 2 MB reason
+  # (the Plug.Parsers body cap) cost ~16 MB of heap per request — and it RAISES on invalid
+  # UTF-8, which the reason path now answers with a 422 above instead of a 500.
+  defp codepoint_length(binary), do: codepoint_length(binary, 0)
+  defp codepoint_length(<<>>, acc), do: acc
+  defp codepoint_length(<<_::utf8, rest::binary>>, acc), do: codepoint_length(rest, acc + 1)
+  defp codepoint_length(<<_, rest::binary>>, acc), do: codepoint_length(rest, acc + 1)
+
+  # Truncation stops AT the bound, so a long label costs the output, not the input.
+  defp take_codepoints(binary, max), do: take_codepoints(binary, max, [])
+
+  defp take_codepoints(<<cp::utf8, rest::binary>>, max, acc) when max > 0,
+    do: take_codepoints(rest, max - 1, [acc, <<cp::utf8>>])
+
+  defp take_codepoints(_rest, _max, acc), do: IO.iodata_to_binary(acc)
 
   # Drafts are published in batches of this size; a request with more ids than
   # this is auto-chunked server-side rather than rejected.
@@ -6675,6 +6712,19 @@ defmodule Loopctl.Knowledge do
     # Visibility (#163): drop links whose far-side article the caller can't see, so
     # the link list can't leak another agent's private memory id/title.
     |> filter_links_by_visibility(vis)
+    # ...and the same for a SUPPRESSED far side, which this surface would otherwise name by
+    # id and title. Only the far side is judged, so a suppressed article inspected by id
+    # still lists its own links.
+    |> Enum.reject(&suppressed_far_side?(&1, article_id))
+  end
+
+  defp suppressed_far_side?(link, article_id) do
+    far =
+      if link.source_article_id == article_id,
+        do: link.target_article,
+        else: link.source_article
+
+    Suppression.suppressed?(far)
   end
 
   defp filter_links_by_visibility(links, nil), do: links
@@ -8438,9 +8488,17 @@ defmodule Loopctl.Knowledge do
   # are excluded by DEFAULT here: GET /api/v1/articles enumerates the same corpus as
   # GET /knowledge/index, and two enumerations of one corpus must not disagree about what
   # is in it. A caller that needs them passes `suppressed: :include`.
+  #
+  # Except on an IDENTITY lookup. `idempotency_key` is a unique-indexed key the caller
+  # already holds, and filtering by it is the documented existence check that decides
+  # whether to create. Hiding a suppressed row from it answers "never captured" about the
+  # exact row `create_article/3` then dedups against — `get_article_by_idempotency_key/3`
+  # is deliberately unfiltered — so the caller's body is silently discarded. An identity
+  # lookup is not an enumeration, so it defaults to `:include`; every other filter is an
+  # enumeration and keeps `:exclude`.
   defp apply_article_filters(query, opts) do
     query
-    |> Suppression.filter(Keyword.get(opts, :suppressed, :exclude))
+    |> Suppression.filter(article_suppression_mode(opts))
     |> maybe_filter_by_project_id(Keyword.get(opts, :project_id))
     |> maybe_filter_by_category(Keyword.get(opts, :category))
     |> maybe_filter_by_status(Keyword.get(opts, :status))
@@ -8449,6 +8507,11 @@ defmodule Loopctl.Knowledge do
     |> maybe_filter_by_source_id(Keyword.get(opts, :source_id))
     |> maybe_filter_by_idempotency_key(Keyword.get(opts, :idempotency_key))
     |> maybe_filter_by_visibility(Keyword.get(opts, :visibility_agent_id))
+  end
+
+  defp article_suppression_mode(opts) do
+    identity_lookup? = not is_nil(Keyword.get(opts, :idempotency_key))
+    Keyword.get(opts, :suppressed, if(identity_lookup?, do: :include, else: :exclude))
   end
 
   # Visibility enforcement (#163): when `:visibility_agent_id` is set (the caller is

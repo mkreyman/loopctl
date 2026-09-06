@@ -10,8 +10,10 @@ defmodule LoopctlWeb.KnowledgeIndexController do
   `tags`, `offset`, and `limit` query params with deterministic pagination over
   the filtered set (up to 1000 articles per page). A `fields` projection
   (default `id,title,category`) keeps the payload small — request `tags`,
-  `status`, or `updated_at` explicitly when needed. `suppressed=only` lists the
-  retrieval-suppressed set, which is how an operator finds what there is to undo.
+  `status`, `updated_at` or the three `suppressed_*` columns explicitly when
+  needed. `suppressed=only` lists the retrieval-suppressed set (across every
+  status, since suppression is not status-scoped), which is how an operator
+  finds what there is to undo.
   """
 
   use LoopctlWeb, :controller
@@ -40,7 +42,10 @@ defmodule LoopctlWeb.KnowledgeIndexController do
   #   2. `LoopctlWeb.KnowledgeIndexJSON.field_value/2` — one clause per field,
   #   3. the MCP `knowledge_index` tool's `fields` enum in mcp-server/index.js —
   #      a SEPARATELY-RELEASED npm package with no compile-time coupling here, so
-  #      an added field must be shipped to both.
+  #      an added field must be shipped to both,
+  #   4. the `fields` parameter description in `operation(:index, ...)` below —
+  #      the OpenAPI document is what a generated client offers, so a field
+  #      missing there is a field no such client can ask for.
   @valid_fields ~w(id title category tags status updated_at suppressed_at suppressed_by suppression_reason)
   @default_fields ~w(id title category)
 
@@ -121,9 +126,12 @@ defmodule LoopctlWeb.KnowledgeIndexController do
         in: :query,
         type: :string,
         description:
-          "Comma-separated projection (id, title, category, tags, status, updated_at). " <>
+          "Comma-separated projection (id, title, category, tags, status, updated_at, " <>
+            "suppressed_at, suppressed_by, suppression_reason). " <>
             "Default id,title,category. `id` and `category` are always included " <>
-            "(category is the grouping key). Returns 400 for unknown fields.",
+            "(category is the grouping key). Returns 400 for unknown fields. " <>
+            "Pair `suppressed=only` with suppressed_by,suppression_reason to see who " <>
+            "suppressed what and why without a read per row.",
         required: false
       ],
       suppressed: [
@@ -131,7 +139,8 @@ defmodule LoopctlWeb.KnowledgeIndexController do
         type: :string,
         description:
           "How to treat RETRIEVAL-SUPPRESSED articles: `exclude` (default), `include`, or " <>
-            "`only`. `only` is the discovery path — it lists exactly what there is to undo " <>
+            "`only`. `only` is the discovery path — it lists exactly what there is to undo, " <>
+            "across every status rather than published only, " <>
             "with POST /api/v1/articles/:id/unsuppress, which is what makes the suppression " <>
             "reversible in practice rather than only in principle. An unrecognised value " <>
             "resolves to `exclude`: a typo must never put a suppressed article back on a " <>

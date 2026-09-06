@@ -32,10 +32,12 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   log. Agent role and visibility-scoped, like `knowledge_archive`: another agent's
   private/owner memory is a 404.
 
-  `knowledge_index` gains `suppressed_at`, `suppressed_by` and `suppression_reason` as
-  projectable `fields`, so `suppressed: "only"` answers who suppressed what and why in one
-  call instead of a `knowledge_get` per row. `knowledge_list` now excludes suppressed
-  articles by default, matching `knowledge_index`.
+  `knowledge_index` gains a `suppressed` argument (`exclude` / `include` / `only`) plus
+  `suppressed_at`, `suppressed_by` and `suppression_reason` as projectable `fields`, so
+  `suppressed: "only"` answers who suppressed what and why in one call instead of a
+  `knowledge_get` per row. `knowledge_list` now excludes suppressed articles by default,
+  matching `knowledge_index` — except on an `idempotency_key` filter, which is an existence
+  check on a key you already hold and still sees a suppressed row.
 
 ## 2.85.0 — 2026-09-05 (a tool result says whether it ran, not just what it found)
 

@@ -91,6 +91,24 @@ describe("knowledge_suppress / knowledge_unsuppress", () => {
     assert.ok(block.includes("LOOPCTL_AGENT_KEY"), "agent role, per the #331 carve-out");
   });
 
+  test("knowledge_index DECLARES and FORWARDS the suppressed mode its description promises", () => {
+    // The description tells an agent to pair suppressed='only' with the two tombstone
+    // fields. An argument that is declared nowhere is dropped silently by the SDK and the
+    // server applies the default — a page of live articles reading as "nothing suppressed".
+    const block = toolDefinitionSource("knowledge_index");
+    assert.match(block, /suppressed: \{/, "the suppressed parameter is declared");
+    assert.match(block, /enum: \["exclude", "include", "only"\]/, "its three modes are declared");
+
+    const idx = indexSource.indexOf("async function knowledgeIndex");
+    assert.ok(idx > 0, "knowledgeIndex is defined");
+    const handler = indexSource.slice(idx, idx + 1400);
+    assert.match(handler, /\{[^}]*\bsuppressed\b[^}]*\}/, "the handler destructures it");
+    assert.ok(
+      handler.includes('params.set("suppressed", suppressed)'),
+      "the handler puts it on the query string"
+    );
+  });
+
   test("unsuppress calls POST /unsuppress with no body on the AGENT key", () => {
     const idx = indexSource.indexOf("async function knowledgeUnsuppress");
     assert.ok(idx > 0, "knowledgeUnsuppress is defined");

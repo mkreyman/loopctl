@@ -444,6 +444,46 @@ defmodule Loopctl.Knowledge.SuppressionTest do
                "linked_articles."
     end
 
+    test "the by-id read does not name it as a NEIGHBOUR of a live article", ctx do
+      %{tenant: tenant, kept: kept, gone: gone} = ctx
+
+      fixture(:article_link, %{
+        tenant_id: tenant.id,
+        source_article_id: kept.id,
+        target_article_id: gone.id,
+        relationship_type: :relates_to
+      })
+
+      {:ok, article} = Knowledge.get_article(tenant.id, kept.id)
+
+      refute Enum.any?(article.outgoing_links, &(&1.target_article_id == gone.id)),
+             "knowledge_get named a suppressed neighbour by id and title. The by-id " <>
+               "exemption covers resolving the SUPPRESSED article itself, not naming it " <>
+               "as a neighbour of a live one."
+    end
+
+    test "the links listing does not name it as a far side", ctx do
+      %{tenant: tenant, kept: kept, gone: gone} = ctx
+
+      fixture(:article_link, %{
+        tenant_id: tenant.id,
+        source_article_id: kept.id,
+        target_article_id: gone.id,
+        relationship_type: :relates_to
+      })
+
+      far_ids =
+        tenant.id
+        |> Knowledge.list_links_for_article(kept.id)
+        |> MapSet.new(& &1.target_article_id)
+
+      refute MapSet.member?(far_ids, gone.id),
+             "GET /articles/:id/links named a suppressed far side by id and title."
+
+      # ...and the suppressed article's OWN links still list, or the undo has no context.
+      assert tenant.id |> Knowledge.list_links_for_article(gone.id) |> length() == 1
+    end
+
     test "suggest_links refuses a suppressed anchor", %{tenant: tenant, gone: gone} do
       assert {:error, :not_found} = Knowledge.suggest_links(tenant.id, gone.id)
     end
@@ -505,10 +545,66 @@ defmodule Loopctl.Knowledge.SuppressionTest do
       assert MapSet.member?(listed, kept.id)
     end
 
+    test ":only reaches a suppressed article of ANY status", %{tenant: tenant} do
+      # suppress_article/3 takes no view of status, so a suppressed DRAFT would be listed
+      # nowhere at all — and the undo needs an id from somewhere.
+      draft = fixture(:article, %{tenant_id: tenant.id, status: :draft})
+      suppressed_draft = suppress!(tenant.id, draft)
+
+      assert MapSet.member?(index_ids(tenant.id, suppressed: :only), suppressed_draft.id)
+    end
+
     test "an unrecognised mode fails CLOSED to :exclude", %{tenant: tenant, gone: gone} do
       # A typo in an opt must never open a suppressed article back onto a retrieval surface.
       refute MapSet.member?(index_ids(tenant.id, suppressed: :inclde), gone.id)
       refute MapSet.member?(index_ids(tenant.id, suppressed: nil), gone.id)
+    end
+  end
+
+  describe "an IDENTITY lookup still sees it — the existence check create/3 dedups against" do
+    test "list_articles by idempotency_key finds a suppressed row, and every other filter does not" do
+      tenant = fixture(:tenant)
+      key = "idem-suppressed-#{System.unique_integer([:positive])}"
+
+      article =
+        published(tenant.id, %{idempotency_key: key, tags: ["book-probe"]})
+        |> then(&suppress!(tenant.id, &1))
+
+      %{meta: %{total_count: by_key}} = Knowledge.list_articles(tenant.id, idempotency_key: key)
+      %{meta: %{total_count: by_tag}} = Knowledge.list_articles(tenant.id, tags: ["book-probe"])
+
+      assert by_key == 1,
+             "the documented existence check reported \"never captured\" about the exact " <>
+               "row create_article/3 dedups against — the caller's body is then discarded."
+
+      assert by_tag == 0, "an ENUMERATION still excludes suppressed rows"
+
+      # And the create it guards really would swallow a fresh body.
+      assert {:ok, :deduplicated, %Article{id: same}} =
+               Knowledge.create_article(tenant.id, %{
+                 title: "A different article entirely",
+                 body: "A different body entirely, long enough to be a real article body.",
+                 category: :pattern,
+                 idempotency_key: key
+               })
+
+      assert same == article.id
+    end
+  end
+
+  describe "a malformed reason is refused, never raised" do
+    test "invalid UTF-8 is an error tuple, not a charlist conversion error" do
+      # No HTTP parser carries these bytes this far — Plug's urlencoded parser raises
+      # BadEncodingError and Jason rejects them — but the length check must not be the thing
+      # that decides, because `String.to_charlist/1` RAISES here and a raise out of a
+      # context function is a 500 where the contract says 422.
+      tenant = fixture(:tenant)
+      article = published(tenant.id)
+
+      assert {:error, :unprocessable_entity, "reason must be valid UTF-8"} =
+               Knowledge.suppress_article(tenant.id, article.id, reason: <<0xED, 0xA0, 0x80>>)
+
+      assert AdminRepo.get!(Article, article.id).suppressed_at == nil
     end
   end
 
