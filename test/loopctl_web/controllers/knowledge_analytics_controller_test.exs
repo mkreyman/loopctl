@@ -713,19 +713,37 @@ defmodule LoopctlWeb.KnowledgeAnalyticsControllerTest do
   end
 
   describe "GET /api/v1/knowledge/curation-log" do
-    test "a list-valued `since` is ignored, never a 500", %{conn: conn} do
+    test "an unparseable or non-string `since` is a 400, never a 500 or a silent full feed", %{
+      conn: conn
+    } do
       tenant = fixture(:tenant, %{settings: %{"kb_curation_log" => true}})
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
 
       # Plug parses `?since[]=x` into a LIST, which matched none of parse_since/1's clauses:
-      # a FunctionClauseError that action_fallback cannot catch, so a 500 on a well-formed
-      # request. The catch-all clause makes it an ignored filter instead.
+      # a FunctionClauseError that action_fallback cannot catch, so a 500. Answering 200 is
+      # not the fix either — `maybe_put/3` DROPS the filter, so the caller gets the most
+      # recent page presented as the window it asked for. Reject, don't ignore.
+      for query <- ["since[]=2026-08-20", "since=last-week"] do
+        conn =
+          conn
+          |> auth_conn(raw_key)
+          |> get("/api/v1/knowledge/curation-log?#{query}")
+
+        assert json_response(conn, 400)
+      end
+    end
+
+    test "a parseable `since` still filters", %{conn: conn} do
+      tenant = fixture(:tenant, %{settings: %{"kb_curation_log" => true}})
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+      :ok = KbCuration.record(tenant.id, "dismiss", "not a conflict")
+
       conn =
         conn
         |> auth_conn(raw_key)
-        |> get("/api/v1/knowledge/curation-log?since[]=2026-08-20")
+        |> get(~p"/api/v1/knowledge/curation-log?since=2026-01-01")
 
-      assert json_response(conn, 200)
+      assert json_response(conn, 200)["meta"]["total_count"] == 1
     end
 
     test "orchestrator reads the curation feed (filterable by kind)", %{conn: conn} do

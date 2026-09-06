@@ -525,7 +525,14 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
         {"Search event coverage", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
       400 => {"Invalid to", "application/json", Schemas.ErrorResponse},
-      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      503 =>
+        {"Database unavailable — retryable; see Retry-After header", "application/json",
+         Schemas.ErrorResponse},
+      504 =>
+        {"Database statement timeout (code db_statement_timeout) — the coverage scan " <>
+           "exceeded its statement timeout; narrow `days`", "application/json",
+         Schemas.ErrorResponse}
     }
   )
 
@@ -579,22 +586,25 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
       200 =>
         {"Curation log", "application/json",
          %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      400 => {"Invalid since", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
   @doc "GET /api/v1/knowledge/curation-log"
   def curation_log(conn, params) do
-    tenant_id = conn.assigns.current_api_key.tenant_id
+    with :ok <- validate_since(params["since"]) do
+      tenant_id = conn.assigns.current_api_key.tenant_id
 
-    opts =
-      []
-      |> put_limit(params["limit"], 50, 500)
-      |> put_offset(params["offset"])
-      |> maybe_put(:kind, params["kind"])
-      |> maybe_put(:since, parse_since(params["since"]))
+      opts =
+        []
+        |> put_limit(params["limit"], 50, 500)
+        |> put_offset(params["offset"])
+        |> maybe_put(:kind, params["kind"])
+        |> maybe_put(:since, parse_since(params["since"]))
 
-    json(conn, KbCuration.list(tenant_id, opts))
+      json(conn, KbCuration.list(tenant_id, opts))
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -672,21 +682,30 @@ defmodule LoopctlWeb.KnowledgeAnalyticsController do
   # REJECT an unparseable `to` rather than substituting `now`, for the reason above: the
   # window silently became "the last N days ending now" while the operator believed they had
   # asked about a historical week, and `window` in the body was the only thing that said so.
-  defp validate_to(nil), do: :ok
-  defp validate_to(""), do: :ok
+  # Reject-don't-ignore, the rule this controller already applies to `access_type`: a
+  # PRESENT-but-unparseable bound is a 400, never a silent fall back to the default window.
+  # `since` runs the same clauses as `to` because the wrong answer is worse there —
+  # `maybe_put/3` DROPS the key, so the caller gets the most recent page presented as the
+  # window it asked for, rather than an error.
+  defp validate_to(value), do: validate_bound("to", value)
+  defp validate_since(value), do: validate_bound("since", value)
 
-  defp validate_to(value) when is_binary(value) do
+  defp validate_bound(_name, nil), do: :ok
+  defp validate_bound(_name, ""), do: :ok
+
+  defp validate_bound(name, value) when is_binary(value) do
     case parse_since(value) do
       nil ->
         {:error, :bad_request,
-         "Invalid to #{inspect(value)}. Expected an ISO8601 date or datetime."}
+         "Invalid #{name} #{inspect(value)}. Expected an ISO8601 date or datetime."}
 
       _ ->
         :ok
     end
   end
 
-  defp validate_to(_value), do: {:error, :bad_request, "Invalid to: expected a string"}
+  defp validate_bound(name, _value),
+    do: {:error, :bad_request, "Invalid #{name}: expected a string"}
 
   defp put_project_id(opts, nil), do: opts
   defp put_project_id(opts, ""), do: opts

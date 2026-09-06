@@ -10,6 +10,8 @@ defmodule Loopctl.Knowledge.SearchEventCoverageTest do
 
   setup :verify_on_exit!
 
+  alias Loopctl.HeavyRead
+  alias Loopctl.HeavyRead.TenantGate
   alias Loopctl.Knowledge.SearchEvent
   alias Loopctl.Knowledge.SearchEventCoverage, as: Coverage
 
@@ -144,6 +146,27 @@ defmodule Loopctl.Knowledge.SearchEventCoverageTest do
           assert s.missing == 0, "blanking #{column} was counted against #{other}"
         end
       end
+    end
+  end
+
+  describe "read_opts/0" do
+    test "the SERVER statement_timeout stays under the CLIENT backstop, so the server cancel fires" do
+      opts = Coverage.read_opts()
+
+      # DBConnection's client deadline is the smaller of the two. Above it, the SET LOCAL can
+      # never fire and the read aborts as a connection error mapped to 503 db_unavailable +
+      # Retry-After, instead of the 504 db_statement_timeout that names the remedy.
+      assert opts[:statement_timeout] < opts[:timeout]
+
+      # ...and still above the 10s pool default it was raised over, or the raise bought
+      # nothing.
+      assert opts[:statement_timeout] > HeavyRead.opts(:enumeration)[:statement_timeout]
+    end
+
+    test "the read is a REGISTERED heavy endpoint, so it is weighted and attributable" do
+      assert Coverage.read_opts()[:telemetry_options][:endpoint] == :search_event_coverage
+      assert :search_event_coverage in HeavyRead.known_endpoints()
+      assert TenantGate.weight_for(:search_event_coverage) == TenantGate.heavy_weight()
     end
   end
 

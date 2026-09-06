@@ -221,7 +221,11 @@ defmodule Loopctl.HeavyRead do
   other ANN read), and `:graph_lane` (the
   #470 opt-in graph-neighbor lane of `search_combined/3`: a bounded, index-backed
   `ArticleLink` seed-set read plus a bounded neighbor-article fetch — classified HEAVY by
-  the gate since it fans a preload across up to `@graph_lane_link_limit` link rows).
+  the gate since it fans a preload across up to `@graph_lane_link_limit` link rows), and
+  `:search_event_coverage` (the declared-telemetry coverage report's single GROUP BY over
+  `search_events` for one tenant and window — classified HEAVY by the gate, like
+  `:heat_index`, since its cost tracks an append-only event table whose growth is the whole
+  point of the surface).
   """
   # US-38.4: the pgvector-ANN (kNN) endpoints whose reads run an index-ordered
   # `ORDER BY (embedding cosine-distance $const) LIMIT k` scan against the HNSW index and are
@@ -453,6 +457,7 @@ defmodule Loopctl.HeavyRead do
     heat_index
     consolidation
     corpus_search
+    search_event_coverage
   )a
 
   @doc """

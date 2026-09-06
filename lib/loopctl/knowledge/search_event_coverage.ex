@@ -117,14 +117,9 @@ defmodule Loopctl.Knowledge.SearchEventCoverage do
   # no join, and the honest limit on this surface is the table's own life.
   @max_window_days 366
 
-  # The pool default is 10s, and `@max_window_days` lets a caller ask for a scan of a YEAR
-  # of this tenant's rows. The query is a grouped count with no join, so 10s is very likely
-  # enough today — but "likely enough" against a table whose growth rate is the whole point
-  # of the feature is the wrong bet to leave implicit: the failure is a Postgres CANCEL
-  # re-raised as a 500, on a read-only analytics route documented to answer 200 or 429, at
-  # exactly the moment an operator is investigating an incident. The window ceiling is what
-  # bounds the work; this bounds how long it may take to do it.
-  @statement_timeout_ms 30_000
+  # How far BELOW `HeavyRead.opts/1`'s client backstop this read's server bound sits — see
+  # `read_opts/0`, which derives the bound rather than writing it as a literal.
+  @client_headroom_ms 3_000
 
   # `tool` and `result_count` are deliberately ABSENT, because neither could ever report a
   # miss. `coverage_query/3` groups BY `tool`, so inside a profiled group that column is the
@@ -267,6 +262,35 @@ defmodule Loopctl.Knowledge.SearchEventCoverage do
   def max_window_days, do: @max_window_days
 
   @doc """
+  Heavy-read options for the one coverage scan (public so the ordering below is testable).
+
+  Built through `HeavyRead.opts/1`, the single source of truth for the heavy-read opts
+  shape — and the registration that makes this read's gate WEIGHT and its slow-query
+  ATTRIBUTION a deliberate decision rather than a default. `:search_event_coverage` is
+  weighted HEAVY, on the same reasoning as `:heat_index` and `:consolidation`: a GROUP BY
+  over an append-only event table whose growth rate is the whole point of the feature.
+  Hand-building the opts instead would admit a year-wide scan at LIGHT weight and print an
+  empty `endpoint=` in the slow-query log, in the incident the report exists to serve.
+
+  `@max_window_days` lets a caller ask for a YEAR of this tenant's rows, so the SERVER
+  bound is raised over the 10s pool default — but DERIVED from `opts/1`'s own CLIENT
+  backstop and kept `@client_headroom_ms` below it, never written as a larger literal. The
+  client deadline is the smaller of the two: a server bound above it can never fire, and
+  the read aborts as a `DBConnection.ConnectionError` mapped to `503 db_unavailable` +
+  Retry-After — untrue, since retrying reproduces it — instead of the `504
+  db_statement_timeout` that names the remedy (narrow `days`) and that
+  `Telemetry.ScaleAlerts` keys `db_statement_timeout_rate` on.
+  `Knowledge.LinkPruning` pairs the same two from the other side, where it owns the client
+  deadline as well.
+  """
+  @spec read_opts() :: keyword()
+  def read_opts do
+    opts = HeavyRead.opts(:search_event_coverage)
+
+    Keyword.put(opts, :statement_timeout, Keyword.fetch!(opts, :timeout) - @client_headroom_ms)
+  end
+
+  @doc """
   Coverage over `[from, to)` for `tenant_id`.
 
   Returns `rows_total`, one entry per declared profile (including profiles with no rows),
@@ -286,7 +310,7 @@ defmodule Loopctl.Knowledge.SearchEventCoverage do
     rows =
       tenant_id
       |> coverage_query(from, to)
-      |> then(&HeavyRead.all(tenant_id, &1, statement_timeout: @statement_timeout_ms))
+      |> then(&HeavyRead.all(tenant_id, &1, read_opts()))
 
     by_tool = Map.new(rows, &{&1.tool, &1})
 
@@ -328,8 +352,8 @@ defmodule Loopctl.Knowledge.SearchEventCoverage do
 
   # ONE grouped count for the whole report, not one per profile: every profile needs the
   # same columns over the same window, and the `(tenant_id, inserted_at)` index serves the
-  # scan once. `report/3` passes `@statement_timeout_ms` rather than taking the pool default
-  # — see there for why a year-wide window should not ride on it.
+  # scan once. `report/3` passes `read_opts/0` rather than taking the pool default — see
+  # there for why a year-wide window should not ride on it.
   #
   # Each aggregate is written out rather than generated, so it is greppable; the registry
   # and this select are bound by `report_column/3`'s `Map.fetch!`, which raises if a
