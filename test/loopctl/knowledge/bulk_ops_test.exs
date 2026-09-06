@@ -578,10 +578,13 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
 
       assert Enum.sort(frozen) == Enum.sort([a1.id, a2.id])
 
-      # The row is typed for the SOFT path. A "frozen_token" here would be spendable
-      # as an irreversible delete of the same set.
-      assert %BulkDeleteToken{type: "soft_tag_token", used_at: nil, article_ids: ids} =
+      # The row is typed for the SOFT path, and the type carries a keyed digest of
+      # the TAG. A "frozen_token" here would be spendable as an irreversible delete
+      # of the same set; an untagged type would be spendable on another tag.
+      assert %BulkDeleteToken{type: "soft_tag_token:" <> digest, used_at: nil, article_ids: ids} =
                AdminRepo.get!(BulkDeleteToken, token_id)
+
+      assert byte_size(digest) == 32
 
       assert Enum.sort(ids) == Enum.sort([a1.id, a2.id])
 
@@ -601,7 +604,7 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
       latecomer = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["stf"]})
 
       assert {:ok, %{affected: 1, resolved_count: 1}} =
-               BulkOps.archive_with_token(tenant.id, token_id, audit_opts())
+               BulkOps.archive_with_token(tenant.id, token_id, {:tag, "stf"}, audit_opts())
 
       assert reload_status(previewed.id) == :archived
       assert reload_status(latecomer.id) == :published
@@ -611,7 +614,7 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
       refute is_nil(used_at)
 
       assert {:error, :invalid_token} =
-               BulkOps.archive_with_token(tenant.id, token_id, audit_opts())
+               BulkOps.archive_with_token(tenant.id, token_id, {:tag, "stf"}, audit_opts())
 
       # Exactly one bulk-archive audit event for the one spend.
       assert [_one] = bulk_audits(tenant.id, "article.bulk_archived")
@@ -625,7 +628,7 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
                BulkOps.preview(tenant.id, :delete, {:tag, "mix1"}, audit_opts())
 
       assert {:error, :invalid_token} =
-               BulkOps.archive_with_token(tenant.id, hard_token, audit_opts())
+               BulkOps.archive_with_token(tenant.id, hard_token, {:tag, "mix1"}, audit_opts())
 
       # Nothing archived, and the refusal did not consume the delete token — it is
       # still spendable on the path it was minted for.
@@ -654,9 +657,35 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
 
       # And it still works on its own path.
       assert {:ok, %{affected: 1}} =
-               BulkOps.archive_with_token(tenant.id, soft_token, audit_opts())
+               BulkOps.archive_with_token(tenant.id, soft_token, {:tag, "mix2"}, audit_opts())
 
       assert reload_status(art.id) == :archived
+    end
+
+    test "a soft_tag_token minted for tag A is NOT spendable on a request naming tag B" do
+      tenant = fixture(:tenant)
+      alpha = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["alpha"]})
+      beta = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["beta"]})
+
+      assert {:ok, %{token: token_id}} =
+               BulkOps.preview(tenant.id, :archive, {:tag, "alpha"}, audit_opts())
+
+      # Otherwise this archives alpha's frozen set and answers OK to a caller that
+      # asked for beta — on a status nothing automated can undo.
+      assert {:error, :invalid_token} =
+               BulkOps.archive_with_token(tenant.id, token_id, {:tag, "beta"}, audit_opts())
+
+      assert reload_status(alpha.id) == :published
+      assert reload_status(beta.id) == :published
+
+      # Unconsumed by the mismatched attempt, and the audit names the tag.
+      assert {:ok, %{affected: 1}} =
+               BulkOps.archive_with_token(tenant.id, token_id, {:tag, "alpha"}, audit_opts())
+
+      assert reload_status(alpha.id) == :archived
+
+      assert [%{metadata: %{"selector" => %{"type" => "tag", "tag" => "alpha"}}}] =
+               bulk_audits(tenant.id, "article.bulk_archived")
     end
 
     test "a soft_tag_token minted in tenant A cannot be spent in tenant B" do
@@ -669,14 +698,14 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
                BulkOps.preview(tenant_a.id, :archive, {:tag, "iso"}, audit_opts())
 
       assert {:error, :invalid_token} =
-               BulkOps.archive_with_token(tenant_b.id, token_id, audit_opts())
+               BulkOps.archive_with_token(tenant_b.id, token_id, {:tag, "iso"}, audit_opts())
 
       assert reload_status(a_art.id) == :published
       assert reload_status(b_art.id) == :published
 
       # Unconsumed by the foreign attempt, so the owning tenant can still spend it.
       assert {:ok, %{affected: 1}} =
-               BulkOps.archive_with_token(tenant_a.id, token_id, audit_opts())
+               BulkOps.archive_with_token(tenant_a.id, token_id, {:tag, "iso"}, audit_opts())
 
       assert reload_status(a_art.id) == :archived
       assert reload_status(b_art.id) == :published
@@ -695,12 +724,13 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
       |> AdminRepo.update_all(set: [expires_at: past])
 
       assert {:error, :invalid_token} =
-               BulkOps.archive_with_token(tenant.id, token_id, audit_opts())
+               BulkOps.archive_with_token(tenant.id, token_id, {:tag, "stexp"}, audit_opts())
 
       assert {:error, :invalid_token} =
-               BulkOps.archive_with_token(tenant.id, "not-a-uuid", audit_opts())
+               BulkOps.archive_with_token(tenant.id, "not-a-uuid", {:tag, "stexp"}, audit_opts())
 
-      assert {:error, :invalid_token} = BulkOps.archive_with_token(tenant.id, nil, audit_opts())
+      assert {:error, :invalid_token} =
+               BulkOps.archive_with_token(tenant.id, nil, {:tag, "stexp"}, audit_opts())
 
       assert reload_status(art.id) == :published
     end
@@ -718,7 +748,7 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
       |> AdminRepo.update_all(set: [status: :superseded])
 
       assert {:ok, %{affected: 1, resolved_count: 2}} =
-               BulkOps.archive_with_token(tenant.id, token_id, audit_opts())
+               BulkOps.archive_with_token(tenant.id, token_id, {:tag, "dr"}, audit_opts())
 
       assert reload_status(stays.id) == :archived
       assert reload_status(drifts.id) == :superseded
@@ -758,7 +788,12 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
       foreign = fixture(:article, %{tenant_id: fixture(:tenant).id, status: :published})
 
       assert {:ok, %{affected: 1, resolved_count: 3}} =
-               BulkOps.archive_frozen(tenant.id, [a1.id, a2.id, foreign.id], audit_opts())
+               BulkOps.archive_frozen(
+                 tenant.id,
+                 [a1.id, a2.id, foreign.id],
+                 {:ids, []},
+                 audit_opts()
+               )
 
       assert reload_status(a1.id) == :archived
       assert reload_status(a2.id) == :archived
@@ -767,18 +802,24 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
     end
   end
 
-  describe "confirm_hash/2" do
-    test "is order-independent and tenant-specific" do
+  describe "confirm_hash/3" do
+    test "is order-independent, tenant-specific and OP-specific" do
       tenant_a = fixture(:tenant)
       tenant_b = fixture(:tenant)
       id1 = Ecto.UUID.generate()
       id2 = Ecto.UUID.generate()
 
-      assert BulkOps.confirm_hash(tenant_a.id, [id1, id2]) ==
-               BulkOps.confirm_hash(tenant_a.id, [id2, id1])
+      assert BulkOps.confirm_hash(tenant_a.id, :delete, [id1, id2]) ==
+               BulkOps.confirm_hash(tenant_a.id, :delete, [id2, id1])
 
-      refute BulkOps.confirm_hash(tenant_a.id, [id1, id2]) ==
-               BulkOps.confirm_hash(tenant_b.id, [id1, id2])
+      refute BulkOps.confirm_hash(tenant_a.id, :delete, [id1, id2]) ==
+               BulkOps.confirm_hash(tenant_b.id, :delete, [id1, id2])
+
+      # Over the frozen-token bound the hash IS the credential, so it must carry the
+      # op: keyed on the id-set alone, an ARCHIVE preview authorizes a HARD delete of
+      # exactly those rows.
+      refute BulkOps.confirm_hash(tenant_a.id, :archive, [id1, id2]) ==
+               BulkOps.confirm_hash(tenant_a.id, :delete, [id1, id2])
     end
   end
 

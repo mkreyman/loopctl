@@ -1030,6 +1030,104 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       assert AdminRepo.get!(Article, latecomer.id).status == :published
     end
 
+    test "an oversized ARCHIVE proposal is not spendable as a hard delete, or the reverse", %{
+      conn: conn
+    } do
+      # Over the frozen-token bound there is no token to type, so the confirm_hash IS
+      # the credential. Keyed on the id-set alone it is the SAME value for both ops,
+      # and a caller who previewed a reversible-shaped archive could purge the set.
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      ids =
+        for _ <- 1..4 do
+          fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["escal"]}).id
+        end
+
+      soft_hash =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "escal", "dry_run" => true})
+        |> json_response(200)
+        |> get_in(["meta", "confirm_hash"])
+
+      escalated =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{
+          "tag" => "escal",
+          "hard" => true,
+          "confirm_hash" => soft_hash
+        })
+        |> json_response(400)
+
+      assert escalated["error"]["message"] =~ "drift"
+      Enum.each(ids, fn id -> assert AdminRepo.get(Article, id) end)
+
+      hard_hash =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{
+          "tag" => "escal",
+          "dry_run" => true,
+          "hard" => true
+        })
+        |> json_response(200)
+        |> get_in(["meta", "confirm_hash"])
+
+      refute hard_hash == soft_hash
+
+      # The reverse direction: a delete proposal must not terminally archive the set.
+      build_conn()
+      |> auth_conn(raw_key)
+      |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "escal", "confirm_hash" => hard_hash})
+      |> json_response(400)
+
+      Enum.each(ids, fn id -> assert AdminRepo.get!(Article, id).status == :published end)
+    end
+
+    test "a tag archive token is refused on a request naming a different tag", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      alpha = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["alpha"]})
+      beta = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["beta"]})
+
+      token =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "alpha", "dry_run" => true})
+        |> json_response(200)
+        |> get_in(["meta", "token"])
+
+      # Otherwise alpha's frozen set is archived while the caller is told it archived
+      # beta — on a terminal status with no unarchive path.
+      build_conn()
+      |> auth_conn(raw_key)
+      |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "beta", "token" => token})
+      |> json_response(400)
+
+      assert AdminRepo.get!(Article, alpha.id).status == :published
+      assert AdminRepo.get!(Article, beta.id).status == :published
+    end
+
+    test "a tag matching nothing is a 200 no-op, not an unsatisfiable 400", %{conn: conn} do
+      # The dry-run mints no proposal over an empty set, so requiring one here left the
+      # zero-match case with no reachable success path — its 400 told the caller to
+      # replay a token the server refuses to mint.
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"tag" => "nosuchtag"})
+        |> json_response(200)
+
+      assert body["data"]["affected"] == 0
+      assert body["meta"]["op"] == "archive"
+      assert AdminRepo.aggregate(BulkDeleteToken, :count, :id) == 0
+    end
+
     test "an ambiguous/empty selector returns 400", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
@@ -1153,7 +1251,7 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
 
       # Exactly one token row, and it is typed for the SOFT path — a "frozen_token"
       # here would be spendable as an irreversible delete of the same set.
-      assert [%BulkDeleteToken{type: "soft_tag_token", article_ids: [^a1_id]}] =
+      assert [%BulkDeleteToken{type: "soft_tag_token:" <> _digest, article_ids: [^a1_id]}] =
                AdminRepo.all(BulkDeleteToken)
 
       # Nothing mutated by the preview.

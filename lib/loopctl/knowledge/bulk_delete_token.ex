@@ -34,14 +34,19 @@ defmodule Loopctl.Knowledge.BulkDeleteToken do
 
   - `id`          -- binary UUID primary key; the bearer secret
   - `tenant_id`   -- FK to tenants (set programmatically, never cast)
-  - `type`        -- WHICH op this proposal authorizes, and the reason a proposal for
-    one op can never be replayed as another: `"frozen_token"` (frozen-set HARD
-    delete) / `"reconfirm_nonce"` (its oversized replay blocker), and
-    `"soft_tag_token"` (frozen-set SOFT archive of a `tag` selector, #779) /
-    `"soft_reconfirm_nonce"` (its oversized form). Every consume query in
-    `Loopctl.Knowledge.BulkOps` filters on this column; without that predicate a
-    consume reads "any unused token row in this tenant" and an archive proposal
-    becomes spendable as an irreversible delete of the same set.
+  - `type`        -- WHAT this proposal authorizes, and the reason a proposal for one
+    op can never be replayed as another: `"frozen_token"` (frozen-set HARD delete) /
+    `"reconfirm_nonce"` (its oversized marker), and
+    `"soft_tag_token:<keyed tag digest>"` (frozen-set SOFT archive of a `tag`
+    selector, #779) / `"soft_reconfirm_nonce"` (its oversized marker). Every TOKEN
+    consume query in `Loopctl.Knowledge.BulkOps` filters on this column; without
+    that predicate a consume reads "any unused token row in this tenant" and an
+    archive proposal becomes spendable as an irreversible delete of the same set.
+    The tag digest carries that separation one level further: a token minted for
+    tag A does not match a replay naming tag B. The two `*_nonce` types are
+    MARKERS, not credentials — the oversized path is guarded by the op-keyed
+    `BulkOps.confirm_hash/3` against a live re-resolve, and only
+    `BulkOps.delete_with_reconfirm/5` ever consumes a nonce row.
   - `article_ids` -- the frozen, size-bounded id-set the delete will operate on
   - `expires_at`  -- TTL boundary; a token past this is refused
   - `used_at`     -- single-use stamp; non-nil ⇒ already consumed, refused

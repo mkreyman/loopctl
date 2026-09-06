@@ -27,8 +27,11 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   `error.code: "dry_run_required"`. A selector too large to freeze gets `meta.oversized`
   and `meta.confirm_hash` instead; echo the hash back with the same selector and the
   server re-resolves and refuses on any drift. The archive and delete flows mint
-  DIFFERENT token types, so an archive proposal is not spendable as a delete or the
-  reverse.
+  DIFFERENT token types, and the oversized `confirm_hash` is keyed on the op, so an
+  archive proposal is not spendable as a delete or the reverse at any set size. A tag
+  archive token is bound to its tag too: replaying it under a different `tag` is a
+  `400`, not a silent sweep of the tag it was minted for. A `tag` that matches nothing
+  needs no token — it stays a `200` no-op.
 
 - **Unchanged:** `article_ids` and `source_type` + `source_id` still archive immediately
   with no token, because each names a set the caller already holds. The role gate is

@@ -189,8 +189,8 @@ defmodule LoopctlWeb.ArticleWorkflowController do
         "delete path AND for the `tag` archive path it also returns `meta.token` (a single-use, " <>
         "TTL-bounded frozen-set token) when N is within the bound, or `meta.oversized: true` + " <>
         "`meta.confirm_hash` for the re-confirm-on-drift path over the bound. The two flows mint " <>
-        "DIFFERENT token types: an archive proposal is not spendable as a delete, or the " <>
-        "reverse (`400 invalid token`).\n\n" <>
+        "DIFFERENT token types AND op-keyed hashes: an archive proposal is not spendable as a " <>
+        "delete, or the reverse, at any set size (`400`).\n\n" <>
         "**`hard: true`** — irreversible HARD delete (FK-correct: article_links pre-deleted both " <>
         "directions, access-events cascade). Requires a `token` from a prior dry-run, OR (for an " <>
         "oversized selector) the original selector plus the dry-run `confirm_hash` (refused on " <>
@@ -227,13 +227,16 @@ defmodule LoopctlWeb.ArticleWorkflowController do
              format: :uuid,
              description:
                "Frozen-set token from a prior dry_run. Required for a hard delete and for a " <>
-                 "tag archive. Typed: an archive token is not spendable as a delete."
+                 "tag archive (unless the tag currently matches nothing, which is a 200 no-op). " <>
+                 "Typed: an archive token is not spendable as a delete, and a tag archive " <>
+                 "token is not spendable on a different tag."
            },
            confirm_hash: %OpenApiSpex.Schema{
              type: :string,
              description:
                "Echoed from an oversized dry_run; re-confirm-on-drift for an oversized hard " <>
-                 "delete or tag archive."
+                 "delete or tag archive. Keyed on the OP, so an archive hash cannot authorize " <>
+                 "a delete."
            }
          }
        }},
@@ -251,7 +254,8 @@ defmodule LoopctlWeb.ArticleWorkflowController do
       400 =>
         {"Bad request. Carries a machine-readable `code` where the remedy differs: " <>
            "`confirm_removed` (the request sent a `confirm` key, which no longer exists) and " <>
-           "`dry_run_required` (a tag call with neither `dry_run` nor `token`/`confirm_hash`). " <>
+           "`dry_run_required` (a tag call with neither `dry_run` nor `token`/`confirm_hash`, " <>
+           "where the tag actually matches rows — a zero-match tag is a 200 no-op). " <>
            "Uncoded 400s: no/ambiguous selector, empty match, over cap, invalid or expired " <>
            "token, drifted selector.", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
@@ -679,12 +683,28 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   defp bulk_archive_tag(conn, tenant_id, selector, params, audit_opts) do
     cond do
       is_binary(params["token"]) ->
-        bulk_archive_with_token(conn, tenant_id, params["token"], audit_opts)
+        bulk_archive_with_token(conn, tenant_id, params["token"], selector, audit_opts)
 
       is_binary(params["confirm_hash"]) ->
         bulk_archive_reconfirm(conn, tenant_id, selector, params["confirm_hash"], audit_opts)
 
       true ->
+        bulk_archive_unproposed(conn, tenant_id, selector)
+    end
+  end
+
+  # A tag that currently matches NOTHING is an idempotent no-op, not a gate to pass.
+  # The dry-run deliberately mints no proposal over an empty set, so demanding one
+  # here made the zero-match case UNSATISFIABLE: its own 400 told the caller to
+  # replay a token the server refuses to mint, and a client sweeping a list of tags
+  # hard-errored on every already-clean one. Anything that DOES match still needs
+  # the proposal.
+  defp bulk_archive_unproposed(conn, tenant_id, selector) do
+    case BulkOps.resolve_selector(tenant_id, selector) do
+      {:ok, []} ->
+        archive_response(conn, 0, 0)
+
+      {:ok, _ids} ->
         {:error, :bad_request,
          %{
            code: "dry_run_required",
@@ -694,18 +714,25 @@ defmodule LoopctlWeb.ArticleWorkflowController do
                "frozen id-set, then POST the same `tag` with that `token`. An oversized " <>
                "selector gets `meta.confirm_hash` instead; echo it back with the same `tag`."
          }}
+
+      {:error, :too_many} ->
+        {:error, :bad_request, "Selector matches too many articles; narrow it."}
+
+      other ->
+        other
     end
   end
 
-  defp bulk_archive_with_token(conn, tenant_id, token, audit_opts) do
-    case BulkOps.archive_with_token(tenant_id, token, audit_opts) do
+  defp bulk_archive_with_token(conn, tenant_id, token, selector, audit_opts) do
+    case BulkOps.archive_with_token(tenant_id, token, selector, audit_opts) do
       {:ok, %{affected: affected, resolved_count: resolved}} ->
         archive_response(conn, affected, resolved)
 
       {:error, :invalid_token} ->
         {:error, :bad_request,
-         "Invalid, expired, already-used, or wrong-type archive token. An archive token is " <>
-           "NOT a delete token. Re-run the dry-run to mint a fresh one."}
+         "Invalid, expired, already-used, wrong-tag, or wrong-type archive token. An archive " <>
+           "token is NOT a delete token, and a token minted for one tag is not spendable on " <>
+           "another. Re-run the dry-run to mint a fresh one."}
 
       other ->
         other
@@ -717,9 +744,9 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   # on any drift — so a replay can never sweep rows the caller never previewed.
   defp bulk_archive_reconfirm(conn, tenant_id, selector, confirm_hash, audit_opts) do
     with {:ok, ids} <- BulkOps.resolve_selector(tenant_id, selector),
-         ^confirm_hash <- BulkOps.confirm_hash(tenant_id, ids),
+         ^confirm_hash <- BulkOps.confirm_hash(tenant_id, :archive, ids),
          {:ok, %{affected: affected, resolved_count: resolved}} <-
-           BulkOps.archive_frozen(tenant_id, ids, audit_opts) do
+           BulkOps.archive_frozen(tenant_id, ids, selector, audit_opts) do
       archive_response(conn, affected, resolved)
     else
       {:error, :too_many} ->
@@ -782,7 +809,10 @@ defmodule LoopctlWeb.ArticleWorkflowController do
         %{dry_run: true, op: to_string(op)}
         |> maybe_put(:token, preview[:token])
         |> maybe_put(:oversized, preview[:oversized])
-        |> maybe_put(:confirm_hash, oversized_confirm_hash(tenant_id, preview))
+        # Echo the hash the PREVIEW computed rather than recomputing one here: the
+        # hash is keyed on the op, and recomputing it at the response boundary is
+        # how the two would drift back into one interchangeable value.
+        |> maybe_put(:confirm_hash, preview[:confirm_hash])
 
       json(conn, %{data: %{would_affect: preview.would_affect}, meta: meta})
     else
@@ -849,7 +879,7 @@ defmodule LoopctlWeb.ArticleWorkflowController do
     with true <- is_binary(confirm_hash) || :missing_confirm_hash,
          {:ok, selector} <- bulk_delete_selector(params),
          {:ok, ids} <- BulkOps.resolve_delete_selector(tenant_id, selector),
-         ^confirm_hash <- BulkOps.confirm_hash(tenant_id, ids),
+         ^confirm_hash <- BulkOps.confirm_hash(tenant_id, :delete, ids),
          {:ok, %{affected: affected}} <- BulkOps.delete(tenant_id, ids, audit_opts) do
       json(conn, %{
         data: %{affected: affected},
@@ -928,14 +958,6 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   defp tag_selector(%{"tag" => tag}) when is_binary(tag), do: {:ok, {:tag, tag}}
 
   defp tag_selector(_), do: {:error, :bad_request, "tag must be a string."}
-
-  defp oversized_confirm_hash(tenant_id, %{oversized: true, frozen_ids: ids}) when is_list(ids) do
-    # frozen_ids is internal to preview; recompute the hash the client echoes back
-    # on the oversized re-confirm path. (We expose only its hash, not the id-set.)
-    BulkOps.confirm_hash(tenant_id, ids)
-  end
-
-  defp oversized_confirm_hash(_tenant_id, _preview), do: nil
 
   defp maybe_put(map, _key, nil), do: map
   defp maybe_put(map, key, value), do: Map.put(map, key, value)

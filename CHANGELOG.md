@@ -168,12 +168,18 @@ All notable changes to loopctl are documented here.
   over the previewed id-set, then POST the same `tag` with that `token` to archive exactly that
   set. Rows that started matching the tag after the dry-run are never touched. A selector too
   large to freeze gets `meta.oversized` and `meta.confirm_hash` instead, echoed back with the
-  same `tag`, and the server re-resolves and refuses on any drift.
+  same `tag`, and the server re-resolves and refuses on any drift. A `tag` that currently
+  matches nothing needs no proposal: it stays a `200` no-op with `affected: 0`.
 
-  **Archive and delete proposals are not interchangeable.** They are minted with distinct token
-  types, so an archive token replayed as a hard delete, or a delete token replayed as an
-  archive, is a `400` invalid-token — the blast-radius escalation the two-step flow exists to
-  prevent. Tokens remain single-use, TTL-bounded and tenant-scoped.
+  **Archive and delete proposals are not interchangeable, at any set size.** Within the frozen
+  bound they are minted with distinct token types, so an archive token replayed as a hard
+  delete, or a delete token replayed as an archive, is a `400`. Over the bound there is no
+  token and the credential is `meta.confirm_hash`, which is keyed on the OP as well as the
+  id-set — otherwise both flows hash the same rows to the same value and an archive preview
+  authorizes an irreversible purge. That is the blast-radius escalation the two-step flow
+  exists to prevent. A tag archive token is bound to its TAG as well, so one minted for
+  `tag: a` is refused on a call naming `tag: b` rather than silently sweeping `a`. Tokens
+  remain single-use, TTL-bounded and tenant-scoped.
 
   **Unchanged:** the `article_ids` and `source_type`+`source_id` selectors still archive
   immediately with no token, because each names a set the caller already holds. The role gate
