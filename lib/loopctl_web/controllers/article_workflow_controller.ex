@@ -184,7 +184,7 @@ defmodule LoopctlWeb.ArticleWorkflowController do
         "meta: {op: \"archive\", set_based: true, affected: N}}`. `article_ids` and `source` " <>
         "archive immediately. The `tag` selector is TWO-STEP: `dry_run: true` first for a " <>
         "`meta.token`, then `tag` + that `token` to archive exactly the frozen id-set. A `tag` " <>
-        "call with neither is `400 dry_run_required`.\n\n" <>
+        "call with neither is `400 dry_run_required` (a zero-match tag is a `200` no-op).\n\n" <>
         "**`dry_run: true`** — previews `{would_affect: N}` and mutates nothing. For the " <>
         "delete path AND for the `tag` archive path it also returns `meta.token` (a single-use, " <>
         "TTL-bounded frozen-set token) when N is within the bound, or `meta.oversized: true` + " <>
@@ -192,9 +192,10 @@ defmodule LoopctlWeb.ArticleWorkflowController do
         "DIFFERENT token types AND op-keyed hashes: an archive proposal is not spendable as a " <>
         "delete, or the reverse, at any set size (`400`).\n\n" <>
         "**`hard: true`** — irreversible HARD delete (FK-correct: article_links pre-deleted both " <>
-        "directions, access-events cascade). Requires a `token` from a prior dry-run, OR (for an " <>
-        "oversized selector) the original selector plus the dry-run `confirm_hash` (refused on " <>
-        "drift). Role: user+ (all destructive ops).",
+        "directions, access-events cascade). Requires the SAME selector plus a `token` from a " <>
+        "prior dry-run, OR (for an oversized selector) that selector plus the dry-run " <>
+        "`confirm_hash` (refused on drift). A zero-match selector needs neither and is a `200` " <>
+        "no-op. Role: user+ (all destructive ops).",
     request_body:
       {"Bulk delete selector", "application/json",
        %OpenApiSpex.Schema{
@@ -227,9 +228,9 @@ defmodule LoopctlWeb.ArticleWorkflowController do
              format: :uuid,
              description:
                "Frozen-set token from a prior dry_run. Required for a hard delete and for a " <>
-                 "tag archive (unless the tag currently matches nothing, which is a 200 no-op). " <>
-                 "Typed: an archive token is not spendable as a delete, and a tag archive " <>
-                 "token is not spendable on a different tag."
+                 "tag archive (unless the selector currently matches nothing, which is a 200 " <>
+                 "no-op). Typed by op AND by selector: an archive token is not spendable as a " <>
+                 "delete, and no token is spendable on a selector it was not minted for."
            },
            confirm_hash: %OpenApiSpex.Schema{
              type: :string,
@@ -689,7 +690,7 @@ defmodule LoopctlWeb.ArticleWorkflowController do
         bulk_archive_reconfirm(conn, tenant_id, selector, params["confirm_hash"], audit_opts)
 
       true ->
-        bulk_archive_unproposed(conn, tenant_id, selector)
+        bulk_archive_unproposed(conn, tenant_id, selector, audit_opts)
     end
   end
 
@@ -699,10 +700,14 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   # replay a token the server refuses to mint, and a client sweeping a list of tags
   # hard-errored on every already-clean one. Anything that DOES match still needs
   # the proposal.
-  defp bulk_archive_unproposed(conn, tenant_id, selector) do
+  defp bulk_archive_unproposed(conn, tenant_id, selector, audit_opts) do
     case BulkOps.resolve_selector(tenant_id, selector) do
+      # Runs the empty set through BulkOps so the no-op still writes the
+      # `article.bulk_archived` audit row every other archive selector writes —
+      # otherwise a client sweeping a hundred tags leaves no record of the
+      # ninety-nine that matched nothing.
       {:ok, []} ->
-        archive_response(conn, 0, 0)
+        archive_result(conn, BulkOps.archive_frozen(tenant_id, [], selector, audit_opts))
 
       {:ok, _ids} ->
         {:error, :bad_request,
@@ -725,8 +730,8 @@ defmodule LoopctlWeb.ArticleWorkflowController do
 
   defp bulk_archive_with_token(conn, tenant_id, token, selector, audit_opts) do
     case BulkOps.archive_with_token(tenant_id, token, selector, audit_opts) do
-      {:ok, %{affected: affected, resolved_count: resolved}} ->
-        archive_response(conn, affected, resolved)
+      {:ok, _} = ok ->
+        archive_result(conn, ok)
 
       {:error, :invalid_token} ->
         {:error, :bad_request,
@@ -757,12 +762,18 @@ defmodule LoopctlWeb.ArticleWorkflowController do
 
       mismatch when is_binary(mismatch) ->
         {:error, :bad_request,
-         "Selector drifted since the dry-run (confirm_hash mismatch). Re-run the dry-run."}
+         "Selector drifted since the dry-run, or the hash predates the running release " <>
+           "(confirm_hash mismatch). Re-run the dry-run."}
 
       other_error ->
         other_error
     end
   end
+
+  defp archive_result(conn, {:ok, %{affected: affected, resolved_count: resolved}}),
+    do: archive_response(conn, affected, resolved)
+
+  defp archive_result(_conn, other), do: other
 
   defp archive_response(conn, affected, resolved) do
     json(conn, %{
@@ -829,26 +840,56 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   # original selector plus the `confirm_hash` echoed from the dry-run — re-resolved
   # and refused on drift.
   defp bulk_delete_hard(conn, tenant_id, params, audit_opts) do
-    case params["token"] do
-      token when is_binary(token) ->
-        bulk_delete_with_token(conn, tenant_id, token, audit_opts)
+    with {:ok, selector} <- bulk_delete_selector(params) do
+      cond do
+        is_binary(params["token"]) ->
+          bulk_delete_with_token(conn, tenant_id, params["token"], selector, audit_opts)
 
-      _ ->
-        bulk_delete_reconfirm(conn, tenant_id, params, audit_opts)
+        is_binary(params["confirm_hash"]) ->
+          bulk_delete_reconfirm(conn, tenant_id, selector, params["confirm_hash"], audit_opts)
+
+        true ->
+          bulk_delete_unproposed(conn, tenant_id, selector, audit_opts)
+      end
     end
   end
 
-  defp bulk_delete_with_token(conn, tenant_id, token, audit_opts) do
-    case BulkOps.delete_with_token(tenant_id, token, audit_opts) do
+  # The token is spendable ONLY on the selector it was minted for: the consume query
+  # is typed by a keyed digest of that selector, so a token minted over tag A named
+  # on a request for tag B is refused instead of irreversibly purging A's frozen set
+  # while the response reports success for B.
+  defp bulk_delete_with_token(conn, tenant_id, token, selector, audit_opts) do
+    case BulkOps.delete_with_token(tenant_id, token, selector, audit_opts) do
       {:ok, %{affected: affected}} ->
-        json(conn, %{
-          data: %{affected: affected},
-          meta: %{op: "delete", set_based: true, affected: affected}
-        })
+        delete_response(conn, affected)
 
       {:error, :invalid_token} ->
         {:error, :bad_request,
-         "Invalid, expired, or already-used delete token. Re-run the dry-run to mint a fresh one."}
+         "Invalid, expired, already-used, wrong-selector, or wrong-type delete token. A token " <>
+           "minted for one selector is not spendable on another, and an archive token is not a " <>
+           "delete token. Re-run the dry-run to mint a fresh one."}
+
+      other ->
+        other
+    end
+  end
+
+  # A selector matching NOTHING is an idempotent no-op here too. The dry-run mints no
+  # proposal over an empty set, so demanding one made the zero-match case
+  # unsatisfiable: its 400 told the caller to replay a token the server refuses to
+  # mint. Anything that DOES match still needs the proposal.
+  defp bulk_delete_unproposed(conn, tenant_id, selector, audit_opts) do
+    case BulkOps.resolve_delete_selector(tenant_id, selector) do
+      {:ok, []} ->
+        delete_result(conn, BulkOps.delete(tenant_id, [], audit_opts, selector))
+
+      {:ok, _ids} ->
+        {:error, :bad_request,
+         "Hard delete requires a `token` (from a dry-run) or, for an oversized selector, " <>
+           "the original selector plus the `confirm_hash` echoed by the dry-run."}
+
+      {:error, :too_many} ->
+        {:error, :bad_request, "Selector matches too many articles; narrow it."}
 
       other ->
         other
@@ -873,24 +914,12 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   # harmless. So "not single-use" does not mean "replayable into damage": the drift
   # check, not a nonce, is the guarantee. (The minted reconfirm nonce is a
   # belt-and-suspenders replay marker; the load-bearing protection is the hash.)
-  defp bulk_delete_reconfirm(conn, tenant_id, params, audit_opts) do
-    confirm_hash = params["confirm_hash"]
-
-    with true <- is_binary(confirm_hash) || :missing_confirm_hash,
-         {:ok, selector} <- bulk_delete_selector(params),
-         {:ok, ids} <- BulkOps.resolve_delete_selector(tenant_id, selector),
+  defp bulk_delete_reconfirm(conn, tenant_id, selector, confirm_hash, audit_opts) do
+    with {:ok, ids} <- BulkOps.resolve_delete_selector(tenant_id, selector),
          ^confirm_hash <- BulkOps.confirm_hash(tenant_id, :delete, ids),
-         {:ok, %{affected: affected}} <- BulkOps.delete(tenant_id, ids, audit_opts) do
-      json(conn, %{
-        data: %{affected: affected},
-        meta: %{op: "delete", set_based: true, affected: affected}
-      })
+         {:ok, %{affected: affected}} <- BulkOps.delete(tenant_id, ids, audit_opts, selector) do
+      delete_response(conn, affected)
     else
-      :missing_confirm_hash ->
-        {:error, :bad_request,
-         "Hard delete requires a `token` (from a dry-run) or, for an oversized selector, " <>
-           "the original selector plus the `confirm_hash` echoed by the dry-run."}
-
       {:error, :too_many} ->
         {:error, :bad_request, "Selector matches too many articles; narrow it."}
 
@@ -900,12 +929,23 @@ defmodule LoopctlWeb.ArticleWorkflowController do
       # Hash mismatch (drift): when ^confirm_hash fails, the computed hash is the mismatch value
       mismatch when is_binary(mismatch) ->
         {:error, :bad_request,
-         "Selector drifted since the dry-run (confirm_hash mismatch). Re-run the dry-run."}
+         "Selector drifted since the dry-run, or the hash predates the running release " <>
+           "(confirm_hash mismatch). Re-run the dry-run."}
 
       # Any other error (unexpected shapes, not drift) surfaces as-is
       other_error ->
         other_error
     end
+  end
+
+  defp delete_result(conn, {:ok, %{affected: affected}}), do: delete_response(conn, affected)
+  defp delete_result(_conn, other), do: other
+
+  defp delete_response(conn, affected) do
+    json(conn, %{
+      data: %{affected: affected},
+      meta: %{op: "delete", set_based: true, affected: affected}
+    })
   end
 
   # Translate the wire params into a BulkOps selector tuple. EXACTLY ONE selector

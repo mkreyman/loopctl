@@ -5704,10 +5704,13 @@ const TOOLS = [
       "TWO-STEP (tag archive, and every hard delete): call with dry_run:true to get " +
       "meta.would_affect and a single-use, TTL-bounded meta.token frozen over the previewed " +
       "id-set, then call again with the SAME selector plus that token. The op runs over the " +
-      "FROZEN set, so rows that started matching after the preview are never touched. A tag " +
-      "call with neither dry_run nor token is 400 dry_run_required. The archive and delete " +
-      "flows mint DIFFERENT token types: an archive token is not spendable as a delete, or the " +
-      "reverse. Oversized selectors (over the frozen bound) get meta.oversized + " +
+      "FROZEN set, so rows that started matching after the preview are never touched. A call " +
+      "with neither dry_run nor token is 400 (dry_run_required on the tag archive) UNLESS the " +
+      "selector matches nothing, which stays a 200 no-op on either path. The token is TYPED by " +
+      "op AND by selector: an archive token is not spendable as a delete or the reverse, and a " +
+      "token minted for one tag is 400 on a call naming another — sweeping a list of tags " +
+      "needs its own dry-run per tag. Oversized selectors (over the frozen bound) get " +
+      "meta.oversized + " +
       "meta.confirm_hash instead of a token; echo the hash back with the same selector and the " +
       "server refuses on any drift. Bounded to 5000 per call.",
     inputSchema: {
@@ -5750,7 +5753,9 @@ const TOOLS = [
           type: "string",
           description:
             "The single-use frozen-set token from a dry_run preview. Required for a hard delete " +
-            "and for a tag archive. Typed: an archive token is not spendable as a delete.",
+            "and for a tag archive, and replayed with the SAME selector. Typed by op AND by " +
+            "selector: an archive token is not spendable as a delete, and a token minted for " +
+            "one tag is refused on a call naming another.",
         },
         confirm_hash: {
           type: "string",

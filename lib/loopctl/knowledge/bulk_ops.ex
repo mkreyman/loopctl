@@ -38,7 +38,7 @@ defmodule Loopctl.Knowledge.BulkOps do
   - `unpublish/3` — `:published` → `:draft`. Genuinely reversible: `{:draft, :published}`
     is a valid transition, so `publish/3` restores it. This is the primitive to reach for
     when something automated needs to retract an article.
-  - `delete/3` / `delete_with_token/3` — irreversible HARD delete. FK-correct:
+  - `delete/4` / `delete_with_token/4` — irreversible HARD delete. FK-correct:
     `article_links` (both directions, tenant-scoped) are deleted FIRST in the
     same transaction or the `:restrict` FK aborts; `article_access_events`
     cascade automatically (`on_delete: :delete_all`).
@@ -112,10 +112,10 @@ defmodule Loopctl.Knowledge.BulkOps do
   TWO ops mint a proposal, and each has its OWN token type so one can never be
   replayed as the other:
 
-  - `:delete` (any selector) — `"frozen_token"`, spent by `delete_with_token/3`;
-    oversized selectors get a `"reconfirm_nonce"`.
-  - `:archive` with a `{:tag, _}` selector — `"soft_tag_token:<tag digest>"`, spent
-    by `archive_with_token/4`; oversized selectors get a `"soft_reconfirm_nonce"`.
+  - `:delete` (any selector) — `"frozen_token:<selector digest>"`, spent by
+    `delete_with_token/4`; oversized selectors get a `"reconfirm_nonce"`.
+  - `:archive` with a `{:tag, _}` selector — `"soft_tag_token:<selector digest>"`,
+    spent by `archive_with_token/4`; oversized get a `"soft_reconfirm_nonce"`.
     This replaced a model-visible `confirm: true` argument on the tag archive
     path (#779): a destructive action must return a proposal the caller replays,
     never take its own authorization as an argument the model can fill in.
@@ -160,10 +160,9 @@ defmodule Loopctl.Knowledge.BulkOps do
   @reconfirm_nonce_type "reconfirm_nonce"
   @soft_reconfirm_nonce_type "soft_reconfirm_nonce"
 
-  # A proposal spec: `{op, token type, oversized nonce type}`. The op travels with
+  # A proposal spec is `{op, token type, oversized nonce type}`. The op travels with
   # it because the OVERSIZED branch has no token row to type — its credential is
   # `confirm_hash/3`, which must be keyed on the op for the same reason.
-  @delete_proposal {:delete, @frozen_token_type, @reconfirm_nonce_type}
 
   @type source_sel :: %{source_id: Ecto.UUID.t(), source_type: String.t() | nil}
   @type selector ::
@@ -225,14 +224,14 @@ defmodule Loopctl.Knowledge.BulkOps do
   caller asked us to operate on. Treat `r` as the size of the requested set, not a
   delete count.
   """
-  @spec delete(Ecto.UUID.t(), [Ecto.UUID.t()], audit_opts()) ::
+  @spec delete(Ecto.UUID.t(), [Ecto.UUID.t()], audit_opts(), selector() | nil) ::
           {:ok, %{affected: non_neg_integer(), resolved_count: non_neg_integer()}}
           | {:error, term()}
-  def delete(tenant_id, frozen_ids, audit_opts) do
+  def delete(tenant_id, frozen_ids, audit_opts, selector \\ nil) do
     ids = sanitize_ids(frozen_ids)
 
     tenant_id
-    |> delete_multi(ids, %{ids: ids}, audit_opts)
+    |> delete_multi(ids, frozen_summary(selector, nil, ids), audit_opts)
     |> run_multi(length(ids))
   end
 
@@ -265,7 +264,11 @@ defmodule Loopctl.Knowledge.BulkOps do
 
   def preview(tenant_id, :delete, selector, _audit_opts) do
     with {:ok, ids} <- resolve_delete_selector(tenant_id, selector) do
-      mint_proposal(tenant_id, Enum.sort(ids), @delete_proposal)
+      mint_proposal(
+        tenant_id,
+        Enum.sort(ids),
+        {:delete, token_type(tenant_id, @frozen_token_type, selector), @reconfirm_nonce_type}
+      )
     end
   end
 
@@ -273,11 +276,12 @@ defmodule Loopctl.Knowledge.BulkOps do
   # a set the caller never enumerated — so its ARCHIVE preview mints a proposal on
   # exactly the flow the hard delete already uses (#779). `{:ids, _}` and
   # `{:source, _}` name a set the caller already holds and are unchanged.
-  defp preview_soft_result(tenant_id, :archive, {:tag, tag}, sorted) do
+  defp preview_soft_result(tenant_id, :archive, {:tag, _} = selector, sorted) do
     mint_proposal(
       tenant_id,
       sorted,
-      {:archive, soft_tag_token_type(tenant_id, tag), @soft_reconfirm_nonce_type}
+      {:archive, token_type(tenant_id, @soft_tag_token_type, selector),
+       @soft_reconfirm_nonce_type}
     )
   end
 
@@ -318,20 +322,35 @@ defmodule Loopctl.Knowledge.BulkOps do
     end
   end
 
-  # The soft-tag token's type carries a keyed digest of the TAG as well as the op,
-  # so the consume query matches only when the replay names the SAME tag. Without
-  # it a token minted for tag A spends on a request naming tag B: the frozen set is
-  # what gets archived, so the caller is answered 200 while a set it never named
-  # became TERMINALLY archived — and the audit record would name the wrong tag.
-  defp soft_tag_token_type(tenant_id, tag) do
+  # A token type carries a keyed digest of the SELECTOR as well as the op, so the
+  # consume matches only when the replay names the SAME selector. Without it a token
+  # minted for tag A spends on a request naming tag B: the FROZEN set is what runs, so
+  # the caller is answered 200 while a set it never named was TERMINALLY archived — or,
+  # on the hard path, IRREVERSIBLY destroyed. BOTH ops derive their type here, so the
+  # irreversible one can never be the lax one.
+  defp token_type(tenant_id, base, selector) do
+    message = base <> ":" <> canonical_selector(selector)
+
     digest =
       :hmac
-      |> :crypto.mac(:sha256, confirm_secret(tenant_id), @soft_tag_token_type <> ":" <> tag)
+      |> :crypto.mac(:sha256, confirm_secret(tenant_id), message)
       |> Base.encode16(case: :lower)
       |> binary_part(0, 32)
 
-    @soft_tag_token_type <> ":" <> digest
+    base <> ":" <> digest
   end
+
+  # Canonical rendering of a selector — order- and duplicate-insensitive for an id
+  # list — so a replay naming the same selector always digests identically.
+  defp canonical_selector({:tag, tag}), do: "tag:" <> tag
+
+  defp canonical_selector({:ids, ids}),
+    do: "ids:" <> (ids |> sanitize_ids() |> Enum.sort() |> Enum.join(","))
+
+  defp canonical_selector({:source, %{source_id: id} = sel}),
+    do: "source:#{Map.get(sel, :source_type)}:#{id}"
+
+  defp canonical_selector(other), do: "other:" <> inspect(other)
 
   @doc """
   Consume a frozen-set token and run the HARD delete over its FROZEN ids.
@@ -345,21 +364,23 @@ defmodule Loopctl.Knowledge.BulkOps do
   frozen ids. All-or-nothing — a failure anywhere rolls back the token
   consumption too.
   """
-  @spec delete_with_token(Ecto.UUID.t(), Ecto.UUID.t(), audit_opts()) ::
+  @spec delete_with_token(Ecto.UUID.t(), Ecto.UUID.t(), selector(), audit_opts()) ::
           {:ok, %{affected: non_neg_integer(), resolved_count: non_neg_integer()}}
           | {:error, :invalid_token}
           | {:error, term()}
-  def delete_with_token(tenant_id, token_id, audit_opts) when is_binary(token_id) do
+  def delete_with_token(tenant_id, token_id, selector, audit_opts)
+      when is_binary(token_id) and is_tuple(selector) do
     if valid_uuid?(token_id) do
       tenant_id
-      |> delete_with_token_multi(token_id, audit_opts)
+      |> delete_with_token_multi(token_id, selector, audit_opts)
       |> run_multi()
     else
       {:error, :invalid_token}
     end
   end
 
-  def delete_with_token(_tenant_id, _token_id, _audit_opts), do: {:error, :invalid_token}
+  def delete_with_token(_tenant_id, _token_id, _selector, _audit_opts),
+    do: {:error, :invalid_token}
 
   @doc """
   Mint a single-use nonce for the oversized reconfirm path.
@@ -428,13 +449,13 @@ defmodule Loopctl.Knowledge.BulkOps do
   @doc """
   Consume a soft-tag proposal token and ARCHIVE its FROZEN ids.
 
-  The exact mirror of `delete_with_token/3` on the non-destructive path: ONE
+  The exact mirror of `delete_with_token/4` on the non-destructive path: ONE
   guarded `update_all` stamps `used_at` only when the row is unused, unexpired,
   in-tenant AND of the type minted for THIS `{:tag, tag}` selector, returning the
   frozen ids from the same statement; anything else is `{:error, :invalid_token}`.
 
   The `type` predicate is load-bearing, not hygiene. Without it this function would
-  happily spend a `"frozen_token"` (and `delete_with_token/3` a `"soft_tag_token"`),
+  happily spend a `"frozen_token"` (and `delete_with_token/4` a `"soft_tag_token"`),
   so a caller who previewed an archive could replay that proposal into an
   irreversible delete of the same set — the blast-radius escalation the two-step
   flow exists to prevent. The TAG digest inside that type is the second half: a
@@ -673,21 +694,21 @@ defmodule Loopctl.Knowledge.BulkOps do
     |> append_delete_steps(tenant_id, ids, selector_summary, audit_opts)
   end
 
-  # Token path: the consume is the ATOMIC GATE. A single guarded `update_all`
-  # stamps `used_at` ONLY when the token is unused, unexpired, and in-tenant —
-  # and the query's `select: t.article_ids` hands back the FROZEN id-set from the
-  # SAME statement's RETURNING, so there is NO separate unlocked read of
-  # `used_at` for a racing caller to slip past. `:assert_consumed` then refuses
-  # unless exactly one row was stamped (the loser of a double-spend race sees 0
-  # rows → invalid). All in ONE transaction so a later delete failure
-  # un-consumes the token.
-  defp delete_with_token_multi(tenant_id, token_id, audit_opts) do
+  # Token path: the consume is the ATOMIC GATE. A single guarded `update_all` stamps
+  # `used_at` ONLY when the token is unused, unexpired, in-tenant AND of the type
+  # minted for THIS selector, and the query's `select: t.article_ids` hands back the
+  # FROZEN id-set from the SAME statement's RETURNING — no separate unlocked read of
+  # `used_at` for a racing caller to slip past. `:assert_consumed` refuses unless
+  # exactly one row was stamped (the loser of a double-spend race sees 0 rows). All
+  # in ONE transaction so a later delete failure un-consumes the token.
+  defp delete_with_token_multi(tenant_id, token_id, selector, audit_opts) do
     now = DateTime.utc_now()
+    expected_type = token_type(tenant_id, @frozen_token_type, selector)
 
     consume_query =
       from(t in BulkDeleteToken,
         where:
-          t.id == ^token_id and t.tenant_id == ^tenant_id and t.type == ^@frozen_token_type and
+          t.id == ^token_id and t.tenant_id == ^tenant_id and t.type == ^expected_type and
             is_nil(t.used_at) and t.expires_at > ^now,
         select: t.article_ids
       )
@@ -705,20 +726,20 @@ defmodule Loopctl.Knowledge.BulkOps do
         Multi.new(),
         tenant_id,
         article_ids,
-        %{token: token_id, ids: article_ids},
+        frozen_summary(selector, token_id, article_ids),
         audit_opts
       )
     end)
   end
 
-  # Soft-tag token path: the same atomic consume as the delete token path, but
-  # filtered to `"soft_tag_token"` and followed by the ARCHIVE steps. `:resolved_count`
-  # carries the FROZEN set size out of the transaction so the response can report
-  # `requested` honestly (a frozen id that drifted out of `archivable` since the
-  # dry-run counts toward the requested set, not toward `affected`).
-  defp archive_with_token_multi(tenant_id, token_id, {:tag, tag} = selector, audit_opts) do
+  # Soft-tag token path: the same atomic, selector-typed consume as the delete token
+  # path, followed by the ARCHIVE steps. `:resolved_count` carries the FROZEN set size
+  # out of the transaction so the response reports `requested` honestly (a frozen id
+  # that drifted out of `archivable` since the dry-run counts toward the requested set,
+  # not toward `affected`).
+  defp archive_with_token_multi(tenant_id, token_id, {:tag, _} = selector, audit_opts) do
     now = DateTime.utc_now()
-    expected_type = soft_tag_token_type(tenant_id, tag)
+    expected_type = token_type(tenant_id, @soft_tag_token_type, selector)
 
     consume_query =
       from(t in BulkDeleteToken,
@@ -938,17 +959,14 @@ defmodule Loopctl.Knowledge.BulkOps do
   defp summarize_selector({:source, source_id}),
     do: %{"type" => "source", "source_id" => source_id}
 
-  # Token-path delete: record the FROZEN id COUNT alongside the token id. The
-  # token id alone is a weak forensic record of an IRREVERSIBLE delete; the
-  # frozen count is the load-bearing "how many rows did this token authorize"
-  # detail. We record the count (not the full id list) to keep audit metadata
-  # bounded — the frozen set can be up to bulk_delete_frozen_max ids.
-  # Frozen-set ARCHIVE: keep the TAG the caller asked for alongside the token id.
-  # The token id is not a durable pointer (the hourly cleanup worker reaps the row
-  # once it expires), and `:archived` is terminal — so a bare token+count leaves an
+  # Frozen-set run: keep the TAG the caller asked for alongside the token id, and
+  # the frozen id COUNT (not the id list — the set can be up to
+  # bulk_delete_frozen_max ids). The token id is not a durable pointer (the hourly
+  # cleanup worker reaps the row once it expires), `:archived` is terminal, and a
+  # hard delete leaves no row to inspect at all — so a bare token+count leaves an
   # operator unable to answer "which tag was swept?" about a mutation nothing
-  # automated undoes. The tag is trustworthy here because the consume query only
-  # matched a token minted for THAT tag.
+  # undoes. The tag is trustworthy here because the consume query only matched a
+  # token minted for THAT selector.
   defp summarize_selector(%{tag: tag, ids: ids} = summary),
     do:
       %{"type" => "tag", "tag" => tag, "count" => length(ids)}

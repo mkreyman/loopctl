@@ -1126,6 +1126,18 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       assert body["data"]["affected"] == 0
       assert body["meta"]["op"] == "archive"
       assert AdminRepo.aggregate(BulkDeleteToken, :count, :id) == 0
+
+      # The no-op still writes the audit row every other archive selector writes,
+      # so a client sweeping a hundred tags leaves a record of the ninety-nine
+      # that matched nothing.
+      audit =
+        from(a in AuditLog,
+          where: a.tenant_id == ^tenant.id and a.action == "article.bulk_archived"
+        )
+        |> AdminRepo.one!()
+
+      assert audit.metadata["affected_count"] == 0
+      assert audit.metadata["selector"]["tag"] == "nosuchtag"
     end
 
     test "an ambiguous/empty selector returns 400", %{conn: conn} do
@@ -1281,7 +1293,11 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       body =
         build_conn()
         |> auth_conn(raw_key)
-        |> post(~p"/api/v1/knowledge/bulk-delete", %{"hard" => true, "token" => token})
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{
+          "hard" => true,
+          "tag" => "hd2",
+          "token" => token
+        })
         |> json_response(200)
 
       assert body["data"]["affected"] == 2
@@ -1312,17 +1328,76 @@ defmodule LoopctlWeb.ArticleWorkflowControllerTest do
       # first use succeeds
       build_conn()
       |> auth_conn(raw_key)
-      |> post(~p"/api/v1/knowledge/bulk-delete", %{"hard" => true, "token" => token})
+      |> post(~p"/api/v1/knowledge/bulk-delete", %{
+        "hard" => true,
+        "tag" => "hd3",
+        "token" => token
+      })
       |> json_response(200)
 
       # second use refused
       body =
         build_conn()
         |> auth_conn(raw_key)
-        |> post(~p"/api/v1/knowledge/bulk-delete", %{"hard" => true, "token" => token})
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{
+          "hard" => true,
+          "tag" => "hd3",
+          "token" => token
+        })
         |> json_response(400)
 
       assert body["error"]["message"] =~ "token"
+    end
+
+    test "a hard-delete token is refused on a request naming a DIFFERENT tag", %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      alpha = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["halpha"]})
+      beta = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["hbeta"]})
+
+      token =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{
+          "tag" => "halpha",
+          "dry_run" => true,
+          "hard" => true
+        })
+        |> json_response(200)
+        |> get_in(["meta", "token"])
+
+      body =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{
+          "hard" => true,
+          "tag" => "hbeta",
+          "token" => token
+        })
+        |> json_response(400)
+
+      assert body["error"]["message"] =~ "token"
+      # NEITHER set was destroyed: not the one the caller named, and not the one
+      # the token froze.
+      assert AdminRepo.get(Article, alpha.id)
+      assert AdminRepo.get(Article, beta.id)
+    end
+
+    test "a zero-match hard delete is a 200 no-op, not an unsatisfiable 400", %{conn: conn} do
+      # The dry-run mints no proposal over an empty set, so demanding one here made
+      # the zero-match case unsatisfiable — a client sweeping a list of tags
+      # hard-errored on every already-clean one.
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/knowledge/bulk-delete", %{"hard" => true, "tag" => "no-such-tag"})
+        |> json_response(200)
+
+      assert body["data"]["affected"] == 0
+      assert body["meta"]["op"] == "delete"
     end
 
     test "hard delete without a token or confirm_hash is refused (400)", %{conn: conn} do

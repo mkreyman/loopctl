@@ -87,11 +87,11 @@ exactly the pollution the separate tables prevent.
    a `tag` selector — return a server-minted proposal the caller REPLAYS instead: a `dry_run` freezes
    the id-set into a single-use, TTL-bounded, tenant-scoped, TYPED `BulkDeleteToken`, and the run
    executes exactly that frozen set. The type is what stops an archive proposal being replayed as a
-   delete, or the reverse, and it carries a keyed digest of the TAG so a token is not spendable on a
-   different one; over the frozen bound, where there is no token, the `confirm_hash` is keyed on the
-   OP for the same reason. A request carrying `confirm` is `400 confirm_removed`, refused rather than
+   delete, or the reverse, and on BOTH ops it carries a keyed digest of the SELECTOR so a token is not
+   spendable on a set the caller never named; over the frozen bound, where there is no token, the
+   `confirm_hash` is keyed on the OP for the same reason. A request carrying `confirm` is `400 confirm_removed`, refused rather than
    ignored; a `tag` call with neither `dry_run` nor a replay credential is `400 dry_run_required`
-   (a tag matching nothing needs no proposal — it stays a `200` no-op).
+   (a selector matching nothing needs no proposal — it stays a `200` no-op on either path).
    The `article_ids` and `source` archives are unchanged — each names a set the caller already holds.
    When adding a destructive op here, mint a proposal; never add a confirm flag.
    Agent edits are visibility-scoped: an agent can only touch an article it can see. (See `chain-of-custody`.)

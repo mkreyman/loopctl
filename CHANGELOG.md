@@ -177,9 +177,17 @@ All notable changes to loopctl are documented here.
   token and the credential is `meta.confirm_hash`, which is keyed on the OP as well as the
   id-set — otherwise both flows hash the same rows to the same value and an archive preview
   authorizes an irreversible purge. That is the blast-radius escalation the two-step flow
-  exists to prevent. A tag archive token is bound to its TAG as well, so one minted for
-  `tag: a` is refused on a call naming `tag: b` rather than silently sweeping `a`. Tokens
-  remain single-use, TTL-bounded and tenant-scoped.
+  exists to prevent. A token is bound to its SELECTOR as well, on the hard delete exactly as
+  on the tag archive: one minted for `tag: a` is refused on a call naming `tag: b` rather than
+  silently purging `a` while the response reports success for `b`. So a hard delete replays
+  the same selector it previewed, not the token alone. Tokens remain single-use, TTL-bounded
+  and tenant-scoped. A selector that currently matches nothing needs no proposal on either
+  path — it is a `200` no-op with `affected: 0`, and it still writes its audit event.
+
+  **Deploy note:** both credential formats changed shape, so a proposal minted by the previous
+  release is refused after the deploy — a token as an invalid token, an oversized
+  `confirm_hash` as a mismatch. Nothing is mis-executed (both refusals are fail-closed), and
+  the window closes on its own within one token TTL. Re-run the dry-run.
 
   **Unchanged:** the `article_ids` and `source_type`+`source_id` selectors still archive
   immediately with no token, because each names a set the caller already holds. The role gate

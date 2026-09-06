@@ -87,7 +87,12 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
       # skipped and the entry this call pushed is never popped by it — the case the
       # `after` cleanup exists for. It must still not over-pop.
       assert {:error, :invalid_token} =
-               BulkOps.delete_with_token(tenant.id, Ecto.UUID.generate(), audit_opts())
+               BulkOps.delete_with_token(
+                 tenant.id,
+                 Ecto.UUID.generate(),
+                 {:tag, "gone"},
+                 audit_opts()
+               )
 
       assert owned_names() == ["statement_timeout"],
              "a failed bulk op must release exactly its own entry, no more and no fewer"
@@ -371,7 +376,7 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
 
       # The tokened delete affects the FROZEN 2, not 3.
       assert {:ok, %{affected: 2}} =
-               BulkOps.delete_with_token(tenant.id, token_id, audit_opts())
+               BulkOps.delete_with_token(tenant.id, token_id, {:tag, "frz"}, audit_opts())
 
       refute AdminRepo.get(Article, a1.id)
       refute AdminRepo.get(Article, a2.id)
@@ -379,10 +384,11 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
       assert AdminRepo.get(Article, a3.id)
     end
 
-    test "tokened delete audit records the FROZEN id count (forensic record of the irreversible op)" do
-      # The delete audit for the token path must record how many ids the token
-      # FROZE — not just the token id — so the immutable record of an IRREVERSIBLE
-      # delete carries the blast size. selector.count == the frozen set size.
+    test "tokened delete audit records the SELECTOR and the FROZEN id count" do
+      # The delete audit for the token path must record what the caller asked for
+      # AND how many ids the token FROZE. The token id alone is not a durable
+      # pointer — the cleanup worker reaps the row hourly and the articles are
+      # gone — so the tag is the only surviving answer to "what was purged?".
       tenant = fixture(:tenant)
       fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["audctf"]})
       fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["audctf"]})
@@ -391,16 +397,40 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
                BulkOps.preview(tenant.id, :delete, {:tag, "audctf"}, audit_opts())
 
       assert {:ok, %{affected: 2}} =
-               BulkOps.delete_with_token(tenant.id, token_id, audit_opts())
+               BulkOps.delete_with_token(tenant.id, token_id, {:tag, "audctf"}, audit_opts())
 
       audits = bulk_audits(tenant.id, "article.bulk_deleted")
       assert length(audits) == 1
       selector = hd(audits).metadata["selector"]
-      assert selector["type"] == "token"
+      assert selector["type"] == "tag"
+      assert selector["tag"] == "audctf"
       assert selector["token"] == token_id
       # The frozen count (2) is recorded — the load-bearing forensic detail.
       assert selector["count"] == 2
       assert hd(audits).metadata["affected_count"] == 2
+    end
+
+    test "a delete token minted for tag A is NOT spendable on a request naming tag B" do
+      # The IRREVERSIBLE half of the selector binding: without it the frozen set is
+      # what runs, so A's rows are destroyed while the caller is answered 200 for a
+      # purge of B — and B's rows survive untouched.
+      tenant = fixture(:tenant)
+      alpha = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["dalpha"]})
+      beta = fixture(:article, %{tenant_id: tenant.id, status: :published, tags: ["dbeta"]})
+
+      assert {:ok, %{token: token_id}} =
+               BulkOps.preview(tenant.id, :delete, {:tag, "dalpha"}, audit_opts())
+
+      assert {:error, :invalid_token} =
+               BulkOps.delete_with_token(tenant.id, token_id, {:tag, "dbeta"}, audit_opts())
+
+      assert AdminRepo.get(Article, alpha.id)
+      assert AdminRepo.get(Article, beta.id)
+      assert %BulkDeleteToken{used_at: nil} = AdminRepo.get!(BulkDeleteToken, token_id)
+
+      # Still spendable on the selector it was minted for.
+      assert {:ok, %{affected: 1}} =
+               BulkOps.delete_with_token(tenant.id, token_id, {:tag, "dalpha"}, audit_opts())
     end
 
     test "token is single-use: the SECOND consumption is REFUSED (not silently affected:0)" do
@@ -412,7 +442,7 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
 
       # The frozen set had ONE article; the first run deletes it.
       assert {:ok, %{affected: 1}} =
-               BulkOps.delete_with_token(tenant.id, token_id, audit_opts())
+               BulkOps.delete_with_token(tenant.id, token_id, {:tag, "twice"}, audit_opts())
 
       refute AdminRepo.get(Article, survivor.id)
 
@@ -420,7 +450,7 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
       # The atomic consume gate (is_nil(used_at) in the guarded update_all) is what
       # makes a double-spend impossible even under concurrency.
       assert {:error, :invalid_token} =
-               BulkOps.delete_with_token(tenant.id, token_id, audit_opts())
+               BulkOps.delete_with_token(tenant.id, token_id, {:tag, "twice"}, audit_opts())
     end
 
     test "double-spend race semantics: a concurrent second consume of a used token is refused" do
@@ -441,7 +471,7 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
 
       # The losing consumer's guarded update matches 0 rows → refused, article intact.
       assert {:error, :invalid_token} =
-               BulkOps.delete_with_token(tenant.id, token_id, audit_opts())
+               BulkOps.delete_with_token(tenant.id, token_id, {:tag, "race"}, audit_opts())
 
       assert AdminRepo.get(Article, art.id)
     end
@@ -456,7 +486,7 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
 
       # tenant_b cannot consume tenant_a's token
       assert {:error, :invalid_token} =
-               BulkOps.delete_with_token(tenant_b.id, token_id, audit_opts())
+               BulkOps.delete_with_token(tenant_b.id, token_id, {:tag, "xt"}, audit_opts())
 
       # and tenant_a's article is untouched
       assert AdminRepo.get(Article, art.id)
@@ -476,7 +506,7 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
       |> AdminRepo.update_all(set: [expires_at: past])
 
       assert {:error, :invalid_token} =
-               BulkOps.delete_with_token(tenant.id, token_id, audit_opts())
+               BulkOps.delete_with_token(tenant.id, token_id, {:tag, "exp"}, audit_opts())
 
       assert AdminRepo.get(Article, art.id)
     end
@@ -497,7 +527,7 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
       |> AdminRepo.update_all(set: [expires_at: boundary])
 
       assert {:error, :invalid_token} =
-               BulkOps.delete_with_token(tenant.id, token_id, audit_opts())
+               BulkOps.delete_with_token(tenant.id, token_id, {:tag, "bnd"}, audit_opts())
 
       assert AdminRepo.get(Article, art.id)
     end
@@ -636,7 +666,7 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
       assert %BulkDeleteToken{used_at: nil} = AdminRepo.get!(BulkDeleteToken, hard_token)
 
       assert {:ok, %{affected: 1}} =
-               BulkOps.delete_with_token(tenant.id, hard_token, audit_opts())
+               BulkOps.delete_with_token(tenant.id, hard_token, {:tag, "mix1"}, audit_opts())
     end
 
     test "a soft_tag_token is NOT spendable as a hard delete" do
@@ -647,7 +677,7 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
                BulkOps.preview(tenant.id, :archive, {:tag, "mix2"}, audit_opts())
 
       assert {:error, :invalid_token} =
-               BulkOps.delete_with_token(tenant.id, soft_token, audit_opts())
+               BulkOps.delete_with_token(tenant.id, soft_token, {:tag, "mix2"}, audit_opts())
 
       # The row SURVIVES: escalating a reversible-shaped proposal into an
       # irreversible delete of the same set is what the type predicate prevents.
@@ -983,7 +1013,7 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
 
       # And the tokened delete PURGES the archived row.
       assert {:ok, %{affected: 1}} =
-               BulkOps.delete_with_token(tenant.id, token_id, audit_opts())
+               BulkOps.delete_with_token(tenant.id, token_id, {:ids, [article.id]}, audit_opts())
 
       refute AdminRepo.get(Article, article.id)
     end
@@ -1025,7 +1055,7 @@ defmodule Loopctl.Knowledge.BulkOpsTest do
                BulkOps.preview(tenant.id, :delete, {:ids, [active.id]}, audit_opts())
 
       assert {:ok, %{affected: 1}} =
-               BulkOps.delete_with_token(tenant.id, token_id, audit_opts())
+               BulkOps.delete_with_token(tenant.id, token_id, {:ids, [active.id]}, audit_opts())
 
       refute AdminRepo.get(Article, active.id)
     end
