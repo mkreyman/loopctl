@@ -7,7 +7,7 @@ All notable changes to loopctl are documented here.
 ### Added
 
 - **A deduplicated create now says whether it threw your payload away
-  (`loopctl-mcp-server` 2.84.0).** `POST /api/v1/articles` answers a duplicate with
+  (`loopctl-mcp-server` 2.89.0).** `POST /api/v1/articles` answers a duplicate with
   `200 deduplicated: true` and keeps the stored row unchanged — deliberately, because the
   fleet's harvest sourcers re-run against stable `idempotency_key`s and a `409` would break
   every harvest. The cost was that a genuine edit vanished with no signal. Every
@@ -25,9 +25,12 @@ All notable changes to loopctl are documented here.
   sourcer PATCH the placeholder title back every night.
 
   The response `note` tells you to READ the stored article before overwriting it: drift is
-  symmetric and only one of the two sides is yours. A drifted discard is also countable
-  server-side, as `content_drift` metadata on the existing `:deduplicated` write telemetry
-  outcome plus a `Logger` warning naming the tenant and article id.
+  symmetric and only one of the two sides is yours. The gate's near-duplicate branch gets
+  its OWN note — the row it hands back is a near-NEIGHBOUR matched by similarity, so the
+  remedy there is merge-or-`force: true`, never "apply your payload to this id". The
+  durable server-side trace of a drifted discard is a `Logger` warning naming the tenant
+  and article id; the flags also ride the `:deduplicated` write-telemetry metadata, but the
+  `ingestion_write_stats` rollup does not break them out.
 
 - **Corpus mode B (`client_embedded`) — loopctl stores and ranks vectors it cannot read
   (US-43.3).** A corpus created with `mode: "client_embedded"` is indexed and searched

@@ -168,11 +168,15 @@ defmodule LoopctlWeb.ArticleController do
            "(booleans, compared after trimming surrounding whitespace) — the " <>
            "idempotency-key dedup, the title-collision dedup and the novelty gate's " <>
            "near-duplicate verdict alike: true means the payload you just sent DIFFERS " <>
-           "from the stored article, which was left unchanged. Which SIDE moved is not " <>
+           "from the RETURNED article, which was left unchanged. Which SIDE moved is not " <>
            "decidable from the payload — the stored article may have been curated or " <>
            "machine-retitled since your last capture — so GET /articles/:id before " <>
-           "overwriting it, then PATCH /articles/:id if your version is still the " <>
-           "intended one. Both are false on a title+body dedup by construction. The " <>
+           "overwriting it, then PATCH /articles/:id if that row is YOUR OWN prior " <>
+           "capture and your version is still the intended one. On `gate.verdict: " <>
+           "duplicate` it is NOT: the row is a near-NEIGHBOUR matched by similarity, so " <>
+           "drift is true by construction there and the remedy is to merge into it or " <>
+           "re-send with `force: true`, never to PATCH your payload onto it. Both are " <>
+           "false on a title+body dedup by construction. The " <>
            "`skipped: true` shape carries NEITHER field: nothing was stored for this " <>
            "payload, so there is no row it could have drifted from (the discard is " <>
            "already explicit in `skipped: true` / `data: null`, and `gate.nearest` " <>
@@ -202,8 +206,10 @@ defmodule LoopctlWeb.ArticleController do
                  "Present on every `deduplicated: true` response. true means the TITLE you " <>
                    "submitted differs (after trimming) from the stored article, which was NOT " <>
                    "changed. Deliberately FALSE when your title matches the article's " <>
-                   "`previous_title` — the nightly consolidation retitled it, so the stored " <>
-                   "side moved and re-applying yours would only undo that every night."
+                   "`previous_title` AND the stored title is still the machine-generated one " <>
+                   "— the nightly consolidation retitled it, so the stored side moved and " <>
+                   "re-applying yours would only undo that every night. Once a human curates " <>
+                   "that title the suppression stops and drift is reported again."
              }
            }
          }},
@@ -682,13 +688,20 @@ defmodule LoopctlWeb.ArticleController do
     # This is the DEFAULT create path (only `force: true` bypasses the gate), and it is a
     # `deduplicated: true` response, so it carries the same drift fields the idempotency
     # and title-collision dedups carry — a client reading `content_drift` must never get
-    # `undefined` here and read the falsy value as "in sync". On this branch the returned
-    # row is a near-NEIGHBOUR rather than the caller's own prior capture, so drift is
-    # usually true and the note's read-before-overwrite half is the operative one.
+    # `undefined` here and read the falsy value as "in sync".
+    #
+    # But the row here is a near-NEIGHBOUR the gate matched by SIMILARITY, not the caller's
+    # own prior capture, so the flags mean something WEAKER: "not byte-identical to a
+    # different article", which is true of nearly every gated near-duplicate. Two things
+    # follow, and both are the reason this branch does not reuse the dedup wording:
+    # `neighbor_drift_note/2` replaces `drift_note/2`, whose remedy (PATCH your payload
+    # onto this id) would have an unattended sourcer overwrite a stranger's curated
+    # article; and neither the `Logger` warning nor the telemetry drift metadata fires,
+    # because a signal that is true by construction on the default path buries the
+    # idempotency-path discard it exists to surface.
     drift = Knowledge.dedup_drift(existing, attrs)
 
-    emit_write_telemetry(conn, attrs, :deduplicated, drift)
-    log_drifted_discard(conn, existing, drift)
+    emit_write_telemetry(conn, attrs, :deduplicated)
 
     conn
     |> put_status(:ok)
@@ -699,9 +712,9 @@ defmodule LoopctlWeb.ArticleController do
         gate: gate_meta(:duplicate, assessment),
         note:
           "A near-duplicate already exists (id #{existing.id}, similarity " <>
-            "#{format_score(assessment.score)}). Nothing was created — read or update " <>
-            "the existing article instead, or pass `force: true` to create anyway." <>
-            drift_note(existing, drift)
+            "#{format_score(assessment.score)}). Nothing was created — read or merge into " <>
+            "the existing article, or pass `force: true` to create anyway." <>
+            neighbor_drift_note(existing, drift)
       }
       |> Map.merge(drift)
     )
@@ -804,14 +817,16 @@ defmodule LoopctlWeb.ArticleController do
   # `drift` is the dedup drift map, or nil on the outcomes that have none.
   #
   # A drifted dedup and an identical re-capture are the SAME outcome on the wire (both
-  # 200 `deduplicated: true`), so without this a fleet-wide silent discard — a sourcer
-  # whose content moved, or whose extraction broke, re-running against a stable key —
-  # is countable only from a client report. It rides as METADATA on the existing
-  # `:deduplicated` outcome rather than as a new `:deduplicated_drifted` one on purpose:
-  # `IngestionWriteStats.column_for/1` SKIPS an unmapped outcome, so a fresh atom would
-  # have dropped every drifted dedup out of the rollup it is meant to make visible.
-  # The Logger warning is what makes it findable without a rollup query at all; it names
-  # the tenant and the article so an operator can go read the row that was kept.
+  # 200 `deduplicated: true`), so a fleet-wide silent discard — a sourcer whose content
+  # moved, or whose extraction broke, re-running against a stable key — needs a
+  # server-side trace. The DURABLE one is the `Logger` warning in `log_drifted_discard/3`,
+  # which names the tenant and the article so an operator can go read the row that was
+  # kept. The flags below ride as METADATA on the existing `:deduplicated` outcome for any
+  # handler that attaches — but the `ingestion_write_stats` rollup does NOT break them
+  # out today, so do not read a drift count out of it. A new `:deduplicated_drifted`
+  # OUTCOME would be worse than useless: `IngestionWriteStats.column_for/1` SKIPS an
+  # unmapped outcome, so a fresh atom would drop every drifted dedup out of the rollup
+  # entirely.
   defp emit_write_telemetry(conn, attrs, outcome, drift) do
     tenant_id = conn.assigns.current_api_key.tenant_id
 
@@ -1208,6 +1223,22 @@ defmodule LoopctlWeb.ArticleController do
       "your version is still the intended one, apply it with knowledge_update on article " <>
       "#{existing.id} (PATCH /articles/#{existing.id}) — re-sending this create will keep " <>
       "being a no-op."
+  end
+
+  # The novelty gate's `:duplicate` branch hands back a near-NEIGHBOUR, so `drift_note/2`
+  # is wrong there in both directions: its remedy names that id as the thing to PATCH your
+  # payload onto — an unattended sourcer following it destroys a third party's (possibly
+  # human-curated) body — and its closing "re-sending will keep being a no-op" contradicts
+  # the same note's `force: true` offer, since this gate is score-based, not key-based.
+  defp neighbor_drift_note(_existing, %{content_drift: false, title_drift: false}), do: ""
+
+  defp neighbor_drift_note(existing, drift) do
+    " Your submitted #{drifted_fields(drift)} " <>
+      "#{if drift.content_drift and drift.title_drift, do: "differ", else: "differs"} from " <>
+      "that article — expected, since it was matched by SIMILARITY and is not a copy of " <>
+      "your capture. Do NOT apply this payload to it: READ article #{existing.id} " <>
+      "(GET /articles/#{existing.id}) first, then either merge your material into it or " <>
+      "re-send with `force: true` to create a separate article."
   end
 
   defp drifted_fields(%{content_drift: true, title_drift: true}), do: "title and body"

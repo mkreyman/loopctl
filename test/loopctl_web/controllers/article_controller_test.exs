@@ -1057,8 +1057,53 @@ defmodule LoopctlWeb.ArticleControllerTest do
       assert resp["content_drift"] == true
       assert resp["title_drift"] == true
       assert resp["note"] =~ "near-duplicate"
-      assert resp["note"] =~ "NOT changed"
       assert resp["note"] =~ "READ article #{canonical.id}"
+      # The row is a near-NEIGHBOUR the caller never wrote, so the note must NOT hand an
+      # unattended sourcer an overwrite verb aimed at it, and must not call the create a
+      # permanent no-op when the same note has just offered `force: true`.
+      refute resp["note"] =~ "knowledge_update"
+      refute resp["note"] =~ "PATCH /articles/#{canonical.id}"
+      refute resp["note"] =~ "no-op"
+      assert resp["note"] =~ "force: true"
+    end
+
+    # Drift is true by construction against a similarity-matched neighbour, so warning on
+    # it would bury the idempotency-path discard the warning exists to surface.
+    test "the :duplicate verdict does not log a drifted discard", %{
+      tenant: tenant,
+      raw_key: raw_key
+    } do
+      import Mox
+
+      canonical =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "Quiet Canonical",
+          body: "the canonical body",
+          status: :published
+        })
+
+      expect(Loopctl.MockProposalAssessor, :assess, fn _t, _a, _o ->
+        %{
+          verdict: :duplicate,
+          score: 0.98,
+          neighbors: [%{id: canonical.id, title: canonical.title, similarity_score: 0.98}]
+        }
+      end)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          json_response(
+            capture(raw_key, %{
+              "title" => "Quiet Canonical reworded",
+              "body" => "a different body saying the same thing",
+              "category" => "finding"
+            }),
+            200
+          )
+        end)
+
+      refute log =~ "deduplicated with drift"
     end
 
     test "the :duplicate verdict reports no drift when the payload matches the canonical",
@@ -1125,8 +1170,13 @@ defmodule LoopctlWeb.ArticleControllerTest do
       assert note =~ "curated or machine-retitled"
       assert note =~ "before overwriting"
       # The read instruction has to come FIRST, or an agent skimming for a verb finds
-      # the overwrite one and stops.
-      assert :binary.match(note, "READ article") < :binary.match(note, "knowledge_update")
+      # the overwrite one and stops. Bind BOTH matches: `:binary.match/2` answers a missing
+      # needle with the ATOM `:nomatch`, which sorts below every tuple, so comparing the
+      # raw returns would stay true after the READ half was deleted — the exact regression
+      # this asserts against.
+      assert {read_pos, _} = :binary.match(note, "READ article")
+      assert {update_pos, _} = :binary.match(note, "knowledge_update")
+      assert read_pos < update_pos
     end
 
     # The idempotency fast path short-circuits before Article.create_changeset/2, so this

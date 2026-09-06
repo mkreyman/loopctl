@@ -5,6 +5,19 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.89.0 — 2026-09-06 (a deduplicated create says whether it threw your payload away)
+
+### Changed
+
+- **`knowledge_create` describes `content_drift` / `title_drift`.** A `deduplicated: true`
+  response from loopctl 2.89.0+ carries both booleans; an older server omits them, so an
+  ABSENT key means unknown, never false. True means the payload you just sent differed from
+  the RETURNED article and was discarded. Which side moved is not decidable from your end —
+  read the returned article first, and use `knowledge_update` on it only when that row is
+  your own prior capture. When `gate.verdict` is `duplicate` it is not: the row is a
+  near-NEIGHBOUR matched by similarity, so merge into it or re-send with `force: true`,
+  never PATCH your payload onto it.
+
 ## 2.78.0 — 2026-08-28 (the corpus tier becomes reachable from an agent)
 
 ### Added

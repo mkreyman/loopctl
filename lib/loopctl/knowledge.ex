@@ -902,10 +902,13 @@ defmodule Loopctl.Knowledge do
   stored", which is the one answer that guarantees nobody looks.
 
   `title_drift` is suppressed when the submitted title matches the article's
-  `previous_title` (see `retitle_article/4`): the stored side moved, deliberately, by the
-  nightly `:generic_title` consolidation retitle — the CALLER has not drifted, and
-  reporting it as caller-side drift told a compliant sourcer to PATCH the placeholder
-  title back every night, undoing the retitle in a loop.
+  `previous_title` AND the stored title is still the machine-generated one
+  (`metadata["consolidation_title_generated"]`, see `retitle_article/4`): the stored side
+  moved, deliberately, by the nightly `:generic_title` consolidation retitle — the CALLER
+  has not drifted, and reporting it as caller-side drift told a compliant sourcer to PATCH
+  the placeholder title back every night, undoing the retitle in a loop. Both halves are
+  required because `previous_title` is never cleared: once a human curates the title, the
+  suppression would otherwise keep answering "in sync" about a title nobody stores.
 
   Returns `%{content_drift: boolean(), title_drift: boolean()}`. This REPORTS, it never
   decides — nothing in the create path branches on it.
@@ -932,16 +935,26 @@ defmodule Loopctl.Knowledge do
     end
   end
 
-  # A machine retitle is not caller drift. `previous_title` is written only by
-  # `Article.retitle_changeset/2` (the nightly `:generic_title` consolidation), and it
-  # holds exactly the title the sourcer is still sending.
+  # A machine retitle is not caller drift — but ONLY while the machine's title is still the
+  # stored one. `previous_title` is written by `Article.retitle_changeset/2` (the nightly
+  # `:generic_title` consolidation) and is never cleared, so on its own the suppression
+  # outlives the condition that justifies it: a human curating the title afterwards would
+  # still be told its old capture matches a title the article no longer has. The
+  # `consolidation_title_generated` marker records what that pass wrote, so requiring it to
+  # still EQUAL `existing.title` scopes the suppression to the un-curated case. Losing the
+  # marker degrades to REPORTING drift, never to hiding it.
   defp title_drifted?(existing, {:present, incoming} = value) when is_binary(incoming) do
-    if trimmed_equal?(existing.previous_title, incoming),
+    if machine_titled?(existing) and trimmed_equal?(existing.previous_title, incoming),
       do: false,
       else: drifted?(existing.title, value)
   end
 
   defp title_drifted?(existing, value), do: drifted?(existing.title, value)
+
+  defp machine_titled?(%Article{metadata: metadata, title: title}) when is_map(metadata),
+    do: trimmed_equal?(Map.get(metadata, "consolidation_title_generated"), title)
+
+  defp machine_titled?(_existing), do: false
 
   # Key absent => no claim of drift (see dedup_drift/2).
   defp drifted?(_stored, :absent), do: false

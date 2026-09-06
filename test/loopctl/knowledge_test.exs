@@ -451,9 +451,12 @@ defmodule Loopctl.KnowledgeTest do
                  category: :reference
                })
 
+      # The marker is what `Loopctl.Knowledge.Consolidation.write_title/4` stamps; the
+      # suppression below is scoped to it, so it must be part of the retitle here too.
       assert {:ok, retitled} =
                Knowledge.retitle_article(tenant.id, article.id, %{
-                 title: "Notes on the drift signal"
+                 title: "Notes on the drift signal",
+                 metadata: %{"consolidation_title_generated" => "Notes on the drift signal"}
                })
 
       assert retitled.previous_title == "Notes"
@@ -471,6 +474,22 @@ defmodule Loopctl.KnowledgeTest do
       assert %{title_drift: true} =
                Knowledge.dedup_drift(retitled, %{
                  "title" => "Something else entirely",
+                 "body" => "the captured body"
+               })
+
+      # `previous_title` is never cleared, so the suppression has to STOP once a human
+      # curates the title — otherwise the sourcer is told "in sync" about a title the
+      # article does not have, which is the silent discard this signal exists to end.
+      assert {:ok, curated} =
+               Knowledge.update_article(tenant.id, retitled.id, %{
+                 title: "Drift signal, curated by a human"
+               })
+
+      assert curated.previous_title == "Notes"
+
+      assert %{title_drift: true} =
+               Knowledge.dedup_drift(curated, %{
+                 "title" => "Notes",
                  "body" => "the captured body"
                })
     end
