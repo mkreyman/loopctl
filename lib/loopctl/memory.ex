@@ -113,12 +113,21 @@ defmodule Loopctl.Memory do
             "real subject_id (Memory.subject_id_for/1 always returns a UUID)."
   end
 
-  # The COMPLETE bounded tag set `degraded_knowledge_env/3` may emit — one per reason in
-  # `Knowledge.search_combined/3`'s hard-error contract. Declared once here because two
-  # things read it: the clause bodies of `knowledge_degraded_reason_tag/1` (generated from
-  # this list) and `LoopctlWeb.Outcome`, which renders `meta.outcome: "error"` for exactly
-  # this envelope.
-  @knowledge_degraded_reason_tags ~w(empty_query invalid_weights bad_request)
+  # The COMPLETE bounded set `degraded_knowledge_env/3` may emit — one per reason in
+  # `Knowledge.search_combined/3`'s hard-error contract. Declared as the ATOMS that
+  # contract returns, with the wire TAGS derived from them at compile time. That
+  # direction is the honest one: the atoms are the error contract and the strings are
+  # only its rendering, so the conversion is `Atom.to_string/1`. Declaring the strings
+  # and converting back with `String.to_atom/1` also tripped Sobelow's DOS.StringToAtom
+  # — correct about the call, wrong about the risk here (a compile-time constant no
+  # input reaches), and inverting the declaration removes the call rather than
+  # suppressing the finding.
+  #
+  # Declared once because two things read the tags: the clause bodies of
+  # `knowledge_degraded_reason_tag/1` (generated from the atoms) and `LoopctlWeb.Outcome`,
+  # which renders `meta.outcome: "error"` for exactly this envelope.
+  @knowledge_degraded_reasons [:empty_query, :invalid_weights, :bad_request]
+  @knowledge_degraded_reason_tags Enum.map(@knowledge_degraded_reasons, &Atom.to_string/1)
 
   @typedoc "The pinned result envelope every read path returns."
   @type result_envelope :: %{results: list(), meta: map()}
@@ -1523,13 +1532,14 @@ defmodule Loopctl.Memory do
   # error contract of `search_combined/3` (dialyzer-verified) — with the controller now
   # rejecting blank AND over-length queries up front, `:empty_query`/`:bad_request` are
   # unreachable via `/recall`, but any of the contract's reasons is coerced to this set.
-  # The clauses are GENERATED from the list `knowledge_degraded_reason_tags/0` publishes,
-  # so the tags a caller classifies on and the tags this function can emit are one
-  # declaration. `LoopctlWeb.Outcome` reads that list to render `meta.outcome: "error"`
-  # for exactly this envelope — a copy of the set there would drift the moment a fourth
-  # reason joined the contract.
-  for tag <- @knowledge_degraded_reason_tags do
-    defp knowledge_degraded_reason_tag(unquote(String.to_atom(tag))), do: unquote(tag)
+  # The clauses are GENERATED from `@knowledge_degraded_reasons`, whose rendered strings
+  # are exactly what `knowledge_degraded_reason_tags/0` publishes, so the tags a caller
+  # classifies on and the tags this function can emit are one declaration.
+  # `LoopctlWeb.Outcome` reads that list to render `meta.outcome: "error"` for exactly
+  # this envelope — a copy of the set there would drift the moment a fourth reason
+  # joined the contract.
+  for reason <- @knowledge_degraded_reasons do
+    defp knowledge_degraded_reason_tag(unquote(reason)), do: unquote(Atom.to_string(reason))
   end
 
   # Emit the merged-recall degradation signal (telemetry + log) for ONE degraded half so
