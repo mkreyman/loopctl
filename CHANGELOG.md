@@ -7,7 +7,7 @@ All notable changes to loopctl are documented here.
 ### Added
 
 - **A deduplicated create now says whether it threw your payload away
-  (`loopctl-mcp-server` 2.83.0).** `POST /api/v1/articles` answers a duplicate with
+  (`loopctl-mcp-server` 2.84.0).** `POST /api/v1/articles` answers a duplicate with
   `200 deduplicated: true` and keeps the stored row unchanged — deliberately, because the
   fleet's harvest sourcers re-run against stable `idempotency_key`s and a `409` would break
   every harvest. The cost was that a genuine edit vanished with no signal. Every
