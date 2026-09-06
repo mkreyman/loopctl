@@ -117,6 +117,15 @@ defmodule Loopctl.Knowledge.SearchEventCoverage do
   # no join, and the honest limit on this surface is the table's own life.
   @max_window_days 366
 
+  # The pool default is 10s, and `@max_window_days` lets a caller ask for a scan of a YEAR
+  # of this tenant's rows. The query is a grouped count with no join, so 10s is very likely
+  # enough today — but "likely enough" against a table whose growth rate is the whole point
+  # of the feature is the wrong bet to leave implicit: the failure is a Postgres CANCEL
+  # re-raised as a 500, on a read-only analytics route documented to answer 200 or 429, at
+  # exactly the moment an operator is investigating an incident. The window ceiling is what
+  # bounds the work; this bounds how long it may take to do it.
+  @statement_timeout_ms 30_000
+
   # `tool` and `result_count` are deliberately ABSENT, because neither could ever report a
   # miss. `coverage_query/3` groups BY `tool`, so inside a profiled group that column is the
   # profile's own non-blank literal and a blank-tool row lands in `unprofiled` instead; and
@@ -274,7 +283,10 @@ defmodule Loopctl.Knowledge.SearchEventCoverage do
   def report(tenant_id, %DateTime{} = from, %DateTime{} = to) when is_binary(tenant_id) do
     measurable_window!(from, to)
 
-    rows = tenant_id |> coverage_query(from, to) |> then(&HeavyRead.all(tenant_id, &1))
+    rows =
+      tenant_id
+      |> coverage_query(from, to)
+      |> then(&HeavyRead.all(tenant_id, &1, statement_timeout: @statement_timeout_ms))
 
     by_tool = Map.new(rows, &{&1.tool, &1})
 
@@ -315,9 +327,9 @@ defmodule Loopctl.Knowledge.SearchEventCoverage do
   # ---------------------------------------------------------------------------
 
   # ONE grouped count for the whole report, not one per profile: every profile needs the
-  # same 14 columns over the same window, and the `(tenant_id, inserted_at)` index serves
-  # the scan once. No `heavy_read_statement_timeout_overrides` entry — this is a grouped
-  # aggregate with no join and no vector work, so the 10s default is not tight.
+  # same columns over the same window, and the `(tenant_id, inserted_at)` index serves the
+  # scan once. `report/3` passes `@statement_timeout_ms` rather than taking the pool default
+  # — see there for why a year-wide window should not ride on it.
   #
   # Each aggregate is written out rather than generated, so it is greppable; the registry
   # and this select are bound by `report_column/3`'s `Map.fetch!`, which raises if a
