@@ -1337,7 +1337,7 @@ async function setTokenBudget({ scope_type, scope_id, budget_millicents, alert_t
 
 // --- Knowledge Wiki Tools (agent key) ---
 
-async function knowledgeIndex({ project_id, story_id, category, tags, match, offset, limit, fields }) {
+async function knowledgeIndex({ project_id, story_id, category, tags, match, offset, limit, fields, suppressed }) {
   if (project_id && !UUID_RE.test(project_id)) {
     return {
       content: [{ type: "text", text: "Error: project_id must be a canonical UUID (8-4-4-4-12 hex)." }],
@@ -1355,6 +1355,7 @@ async function knowledgeIndex({ project_id, story_id, category, tags, match, off
   if (offset != null) params.set("offset", String(offset));
   if (limit != null) params.set("limit", String(limit));
   if (fields) params.set("fields", Array.isArray(fields) ? fields.join(",") : fields);
+  if (suppressed) params.set("suppressed", suppressed);
   const qs = params.toString();
   const path = qs ? `${basePath}?${qs}` : basePath;
   const result = await apiCall("GET", path, null, process.env.LOOPCTL_AGENT_KEY);
@@ -1644,6 +1645,7 @@ async function knowledgeList({
   limit,
   offset,
   include_body,
+  suppressed,
 }) {
   const params = new URLSearchParams();
   if (project_id) params.set("project_id", project_id);
@@ -1659,6 +1661,11 @@ async function knowledgeList({
   // Body-less summary by default (safe to enumerate large pages); opt into full
   // bodies (byte-budget bounded server-side) with include_body: true.
   if (include_body === true) params.set("include_body", "true");
+  // Sent only when the caller asked. The server's default is per-filter — exclude
+  // everywhere except an idempotency_key lookup, which includes suppressed rows so an
+  // identity check cannot mint a duplicate — and sending a computed "exclude" on every
+  // call would overwrite that.
+  if (suppressed) params.set("suppressed", suppressed);
 
   const result = await apiCall(
     "GET",
@@ -2006,6 +2013,29 @@ async function knowledgeArchive({ article_id }) {
   const result = await apiCall(
     "POST",
     `/api/v1/articles/${article_id}/archive`,
+    null,
+    process.env.LOOPCTL_AGENT_KEY
+  );
+  return toContent(result);
+}
+
+// The REVERSIBLE retrieval tombstone. Agent-role KB curation like archive, but it is the
+// one member of that family that undoes: nothing is destroyed and nothing is rebuilt, so
+// knowledge_unsuppress restores the article to every read path immediately.
+async function knowledgeSuppress({ article_id, reason }) {
+  const result = await apiCall(
+    "POST",
+    `/api/v1/articles/${article_id}/suppress`,
+    { reason },
+    process.env.LOOPCTL_AGENT_KEY
+  );
+  return toContent(result);
+}
+
+async function knowledgeUnsuppress({ article_id }) {
+  const result = await apiCall(
+    "POST",
+    `/api/v1/articles/${article_id}/unsuppress`,
     null,
     process.env.LOOPCTL_AGENT_KEY
   );
@@ -4370,10 +4400,29 @@ const TOOLS = [
           type: "array",
           items: {
             type: "string",
-            enum: ["id", "title", "category", "tags", "status", "updated_at"],
+            enum: [
+              "id",
+              "title",
+              "category",
+              "tags",
+              "status",
+              "updated_at",
+              "suppressed_at",
+              "suppressed_by",
+              "suppression_reason",
+            ],
           },
           description:
-            "Optional: projection of article fields to return. Default: id, title, category. `id` is always included.",
+            "Optional: projection of article fields to return. Default: id, title, category. `id` is always included. " +
+            "Pair suppressed='only' with fields=suppressed_by,suppression_reason to see who suppressed what and why without a per-row read.",
+        },
+        suppressed: {
+          type: "string",
+          enum: ["exclude", "include", "only"],
+          description:
+            "Optional: how to treat RETRIEVAL-SUPPRESSED articles — 'exclude' (default), 'include', or " +
+            "'only'. 'only' is the discovery path: it lists exactly what there is to undo with " +
+            "knowledge_unsuppress, across every status. An unrecognised value resolves to 'exclude'.",
         },
       },
       required: [],
@@ -4396,7 +4445,11 @@ const TOOLS = [
       "`meta.total_count` (exact) to answer \"does an article for X already exist?\" reliably " +
       "right after a write — `idempotency_key` is a FILTER only and is never returned in a " +
       "row, so you check a key you already hold rather than reading back the keys other " +
-      "callers chose. Paginate via offset/limit.",
+      "callers chose. Suppressed articles are EXCLUDED here (matching knowledge_index) except " +
+      "on an `idempotency_key` filter, which is an identity check on a key you already hold " +
+      "and still sees them — so the existence check stays true about the row a create would " +
+      "dedup against. Pass `suppressed: 'include'` when a repair pass must see the whole " +
+      "table, or `'only'` to list what there is to undo. Paginate via offset/limit.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4455,6 +4508,17 @@ const TOOLS = [
             "then bounded by a ~5 MB serialized-body budget (it may return fewer than `limit` " +
             "rows); continue via meta.next_offset while meta.has_more is true. Leave false to " +
             "enumerate metadata cheaply at scale.",
+        },
+        suppressed: {
+          type: "string",
+          enum: ["exclude", "include", "only"],
+          description:
+            "Optional: how to treat RETRIEVAL-SUPPRESSED articles — 'exclude' (the default on " +
+            "every filter but idempotency_key), 'include', or 'only'. Pass 'include' when a " +
+            "repair or audit pass must see the whole table, and 'only' to list exactly what " +
+            "there is to undo with knowledge_unsuppress. Omit it to keep the per-filter " +
+            "default. The body-less rows do NOT carry the three suppressed_* fields — pair " +
+            "with include_body: true, or read knowledge_get, to see who suppressed what and why.",
         },
       },
       required: [],
@@ -5673,6 +5737,69 @@ const TOOLS = [
         article_id: {
           type: "string",
           description: "The UUID of the article to archive.",
+        },
+      },
+      required: ["article_id"],
+    },
+  },
+  {
+    name: "knowledge_suppress",
+    description:
+      "Take an article OUT OF RETRIEVAL without changing its status — reversibly. This is " +
+      "the tool to reach for when an article is wrong, superseded, noisy or no longer " +
+      "wanted in results, but you might want it back. The article stays `published`, keeps " +
+      "its body, embedding and links, and is STILL readable by id with knowledge_get " +
+      "(which renders suppressed_at / suppressed_by / suppression_reason) — that is what " +
+      "makes the act inspectable and undoable. It disappears from knowledge_search, " +
+      "knowledge_hybrid_search, knowledge_context, /recall, knowledge_progressive_index, " +
+      "knowledge_heat_index, suggested links, knowledge_graph, knowledge_walk, the novelty " +
+      "priors and the nightly consolidation scans. " +
+      "Undo with knowledge_unsuppress; nothing was destroyed, so nothing is rebuilt. " +
+      "Choose between the three retraction verbs by what you need afterwards: " +
+      "knowledge_suppress (undoable, status untouched, the article is simply not retrieved), " +
+      "knowledge_unpublish (undoable, but it says the article is a DRAFT — an editorial " +
+      "claim), knowledge_archive/knowledge_delete (NOT undoable by any call you can make: " +
+      "`:archived` is terminal). " +
+      "A reason is REQUIRED — a tombstone that does not record why is not inspectable. " +
+      "Re-suppressing an already-suppressed article is an idempotent no-op that KEEPS the " +
+      "original actor and reason; to change a recorded reason, unsuppress and suppress " +
+      "again, which records both acts. " +
+      "Agent role. Visibility-scoped: you can only suppress an article you can see, so " +
+      "another agent's private/owner memory returns 404.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        article_id: {
+          type: "string",
+          description: "The UUID of the article to take out of retrieval.",
+        },
+        reason: {
+          type: "string",
+          description:
+            "Why this article should stop being retrieved. Required and non-blank; " +
+            "bounded at 500 characters. Recorded on the row and in the audit log, and " +
+            "returned by knowledge_get, so write it for whoever decides later whether to " +
+            "undo this.",
+        },
+      },
+      required: ["article_id", "reason"],
+    },
+  },
+  {
+    name: "knowledge_unsuppress",
+    description:
+      "Lift a retrieval suppression: the inverse of knowledge_suppress. Clears the " +
+      "tombstone and restores the article to search, context, /recall, the indexes, the " +
+      "graph and the link surfaces immediately — nothing has to be re-embedded or " +
+      "re-linked, because suppression never touched any of it. Unsuppressing an article " +
+      "that is not suppressed is a harmless no-op. Agent role, visibility-scoped. " +
+      "This does NOT undo knowledge_archive or knowledge_delete, which are terminal.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        article_id: {
+          type: "string",
+          description: "The UUID of the article to restore to retrieval.",
         },
       },
       required: ["article_id"],
@@ -7921,6 +8048,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "knowledge_archive":
       return await knowledgeArchive(args);
+
+    case "knowledge_suppress":
+      return await knowledgeSuppress(args);
+
+    case "knowledge_unsuppress":
+      return await knowledgeUnsuppress(args);
 
     case "knowledge_delete":
       return await knowledgeDelete(args);

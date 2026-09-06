@@ -6,6 +6,58 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Reversible retrieval suppression for articles — `POST /api/v1/articles/:id/suppress`
+  and `/unsuppress` (agent role).** loopctl had two ways to retract an article and neither
+  was the one an unattended writer needs. `archive` is TERMINAL: `:archived` has no outbound
+  transition and there is no unarchive call, so the only way back is a `user`-role PATCH
+  carrying an explicit status. `unpublish` is undoable but means "this is a draft", which is
+  a claim about editorial state rather than about retrieval. Suppression is the third thing:
+  it says nothing about status and everything about whether anything retrieves the article.
+
+  **What it does.** A suppressed article keeps `status: published`, its body, its embedding
+  and its links, and it stays resolvable by id through `GET /api/v1/articles/:id` and
+  `knowledge_get` — which is what makes the act inspectable and undoable. It is excluded from
+  keyword/semantic/combined search, `hybrid_search`, `/knowledge/context`, the knowledge half
+  of `/api/v1/recall`, `/knowledge/progressive_index`, `/knowledge/heat_index`, suggested
+  links, `/knowledge/graph`, `/knowledge/walk`, the novelty priors, the auto-linker's
+  candidate pool, source-hub membership and the nightly consolidation scans.
+
+  **A `reason` is required** and is recorded on the row alongside the actor, both returned in
+  the article payload as `suppression_reason` / `suppressed_by` / `suppressed_at`.
+  Re-suppressing an already-suppressed article is an idempotent no-op that PRESERVES the
+  original actor and reason; unsuppressing an unsuppressed one is a no-op with no audit
+  event. Both directions write to the append-only audit log (`article.suppressed` /
+  `article.unsuppressed`, also available as webhook event types) and to the per-tenant
+  `kb_curation_log` when enabled. Visibility-scoped like `archive`: an agent can only
+  suppress an article it can see.
+
+  **Migration `20260905120000_add_retrieval_suppression_to_articles`** adds three nullable
+  columns (`suppressed_at`, `suppressed_by` varchar 200, `suppression_reason` varchar 500)
+  and one partial index, built CONCURRENTLY (`@disable_ddl_transaction`) so it cannot block
+  writes to `articles`. All three columns are nullable with no default, so the ALTER is
+  catalog-only on PG11+ — no table rewrite, no manual step, no downtime. RLS is unchanged:
+  `articles` already has row-level security enabled and the policy is on the ROW, so the new
+  columns inherit it.
+
+  **Export behaviour changed:** a suppressed article is still exported by the buffered
+  `?format=json` OKF bundle and by the streamed `.tar.gz`, and in the OKF frontmatter it now
+  carries `loopctl_suppressed_at` / `loopctl_suppressed_by` / `loopctl_suppression_reason`.
+  The Obsidian vault format does not yet render those three keys. IMPORT does not restore the tombstone, for the same reason it does not
+  restore `loopctl_status`: every imported concept is created as a draft, and a bundle is
+  advisory about lifecycle.
+
+  **Discovery:** `GET /api/v1/knowledge/index?suppressed=only` lists what there is to undo —
+  across every status, since suppression is not status-scoped and a suppressed draft would
+  otherwise be listed nowhere — and `suppressed_at`/`suppressed_by`/`suppression_reason` are
+  now projectable `fields` there, so an operator sees who suppressed what and why without a
+  read per row. `GET /api/v1/articles` excludes suppressed articles by default, matching that
+  index, EXCEPT on an `idempotency_key` lookup: that filter is an identity check on a
+  unique-indexed key the caller already holds, and it is what decides whether to create, so
+  hiding the row there would report "never captured" about the exact article the next create
+  silently dedups against.
+
+  MCP tools: `knowledge_suppress`, `knowledge_unsuppress`.
+
 - **Corpus mode B (`client_embedded`) — loopctl stores and ranks vectors it cannot read
   (US-43.3).** A corpus created with `mode: "client_embedded"` is indexed and searched
   without loopctl ever receiving the document text. **This is the property an operator

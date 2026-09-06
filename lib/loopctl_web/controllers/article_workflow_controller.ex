@@ -5,6 +5,8 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   - `POST /api/v1/articles/:id/publish` -- publish a draft article (orchestrator+)
   - `POST /api/v1/articles/:id/unpublish` -- unpublish a published article (user+)
   - `POST /api/v1/articles/:id/archive` -- archive an article (agent+)
+  - `POST /api/v1/articles/:id/suppress` -- take an article out of retrieval, reversibly (agent+)
+  - `POST /api/v1/articles/:id/unsuppress` -- put it back (agent+)
   - `POST /api/v1/knowledge/bulk-publish` -- bulk publish drafts (user+)
   - `POST /api/v1/knowledge/bulk-delete` -- bulk archive/soft-delete (user+)
   - `GET /api/v1/knowledge/drafts` -- list draft articles (orchestrator+)
@@ -16,7 +18,8 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   link; merge produces a DRAFT). Non-destructive is not reversible: `:archived` is
   TERMINAL (no `{:archived, _}` transition, no unarchive function), so the only way
   back is a `user+` PATCH — an unattended writer that needs an undo must use
-  `unpublish` (#605/#606). The SET-BASED bulk ops (`bulk_delete`, incl. the
+  `unpublish` (#605/#606), or now `suppress`, which is the reversible retrieval
+  tombstone that pair was standing in for. The SET-BASED bulk ops (`bulk_delete`, incl. the
   irreversible HARD-delete path, `bulk_publish`, `bulk_unpublish`) stay
   `user`-gated: high blast radius AND irreversible.
 
@@ -44,6 +47,7 @@ defmodule LoopctlWeb.ArticleWorkflowController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Dispatches
   alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.BulkOps
   alias LoopctlWeb.ArticleJSON
   alias LoopctlWeb.AuditContext
@@ -61,12 +65,20 @@ defmodule LoopctlWeb.ArticleWorkflowController do
        [role: :user]
        when action in [:unpublish, :bulk_publish, :bulk_unpublish, :bulk_delete]
 
-  # Single-article archive and conflict resolution are agent+ KB curation (#331):
-  # non-destructive + audited (NOT reversible — `:archived` is terminal).
-  # archive is visibility-scoped in-action.
+  # Single-article archive, suppression and conflict resolution are agent+ KB curation
+  # (#331). `suppress`/`unsuppress` are the one pair in this group that is also genuinely
+  # REVERSIBLE — the property the #605/#606 paragraph says archive lacks — so if anything in
+  # this list belongs at agent role, it does. All are visibility-scoped in-action.
   plug LoopctlWeb.Plugs.RequireRole,
        [role: :agent]
-       when action in [:archive, :conflicts, :resolve_conflict, :assert_conflict]
+       when action in [
+              :archive,
+              :suppress,
+              :unsuppress,
+              :conflicts,
+              :resolve_conflict,
+              :assert_conflict
+            ]
 
   tags(["Knowledge Wiki"])
 
@@ -536,6 +548,68 @@ defmodule LoopctlWeb.ArticleWorkflowController do
     }
   )
 
+  operation(:suppress,
+    summary: "Suppress article from retrieval (reversible)",
+    description:
+      "Takes an article OUT OF RETRIEVAL without changing its status. The article stays " <>
+        "`published`, keeps its body, embedding and links, and stays resolvable by id via " <>
+        "`GET /api/v1/articles/:id` — but it is excluded from keyword/semantic/combined " <>
+        "search, hybrid resolution, `/knowledge/context`, `/recall`, the progressive and " <>
+        "heat indexes, suggested links, the knowledge graph, the random walk and the " <>
+        "nightly consolidation scans. Reverse it with `/unsuppress`; nothing is destroyed, " <>
+        "so nothing has to be rebuilt. Distinct from `archive` (terminal) and `unpublish` " <>
+        "(claims the article is a draft). A `reason` is REQUIRED: a tombstone that does not " <>
+        "record why is not inspectable. Re-suppressing an already-suppressed article is an " <>
+        "idempotent no-op that preserves the ORIGINAL actor and reason. Role: agent+, and " <>
+        "visibility-scoped — an agent can only suppress an article it can see. The response " <>
+        "carries `suppressed_at`, `suppressed_by` and `suppression_reason`.",
+    parameters: [id: [in: :path, type: :string, description: "Article UUID"]],
+    request_body:
+      {"Suppression reason", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         required: [:reason],
+         properties: %{
+           reason: %OpenApiSpex.Schema{
+             type: :string,
+             minLength: 1,
+             maxLength: Article.max_suppression_reason_length(),
+             description:
+               "Why this article should stop being retrieved. Required and non-blank; " <>
+                 "bounded at #{Article.max_suppression_reason_length()} characters, which " <>
+                 "is also the column bound."
+           }
+         }
+       }},
+    responses: %{
+      200 =>
+        {"Suppressed article", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      404 =>
+        {"Not found, or not visible to this agent", "application/json", Schemas.ErrorResponse},
+      422 => {"Missing, blank or over-long reason", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  operation(:unsuppress,
+    summary: "Lift a retrieval suppression",
+    description:
+      "The inverse of `/suppress`. Clears all three tombstone fields together and restores " <>
+        "the article to every read path it was removed from — immediately, because nothing " <>
+        "was destroyed. Unsuppressing an article that is not suppressed is an idempotent " <>
+        "no-op with no audit event. Role: agent+, visibility-scoped.",
+    parameters: [id: [in: :path, type: :string, description: "Article UUID"]],
+    responses: %{
+      200 =>
+        {"Restored article", "application/json",
+         %OpenApiSpex.Schema{type: :object, additionalProperties: true}},
+      404 =>
+        {"Not found, or not visible to this agent", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
   # --- Actions ---
 
   @doc "POST /api/v1/articles/:id/publish"
@@ -567,6 +641,30 @@ defmodule LoopctlWeb.ArticleWorkflowController do
 
     with {:ok, article} <-
            Knowledge.archive_article_workflow(tenant_id, article_id, opts) do
+      json(conn, ArticleJSON.update(%{article: article}))
+    end
+  end
+
+  @doc "POST /api/v1/articles/:id/suppress"
+  def suppress(conn, %{"id" => article_id} = params) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+
+    # Same visibility scope as archive: an agent may only suppress an article it can see.
+    opts =
+      AuditContext.from_conn(conn) ++
+        Visibility.scope_opts(conn) ++ [reason: params["reason"]]
+
+    with {:ok, article} <- Knowledge.suppress_article(tenant_id, article_id, opts) do
+      json(conn, ArticleJSON.update(%{article: article}))
+    end
+  end
+
+  @doc "POST /api/v1/articles/:id/unsuppress"
+  def unsuppress(conn, %{"id" => article_id}) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+    opts = AuditContext.from_conn(conn) ++ Visibility.scope_opts(conn)
+
+    with {:ok, article} <- Knowledge.unsuppress_article(tenant_id, article_id, opts) do
       json(conn, ArticleJSON.update(%{article: article}))
     end
   end
