@@ -1645,6 +1645,7 @@ async function knowledgeList({
   limit,
   offset,
   include_body,
+  suppressed,
 }) {
   const params = new URLSearchParams();
   if (project_id) params.set("project_id", project_id);
@@ -1660,6 +1661,11 @@ async function knowledgeList({
   // Body-less summary by default (safe to enumerate large pages); opt into full
   // bodies (byte-budget bounded server-side) with include_body: true.
   if (include_body === true) params.set("include_body", "true");
+  // Sent only when the caller asked. The server's default is per-filter — exclude
+  // everywhere except an idempotency_key lookup, which includes suppressed rows so an
+  // identity check cannot mint a duplicate — and sending a computed "exclude" on every
+  // call would overwrite that.
+  if (suppressed) params.set("suppressed", suppressed);
 
   const result = await apiCall(
     "GET",
@@ -4442,7 +4448,8 @@ const TOOLS = [
       "callers chose. Suppressed articles are EXCLUDED here (matching knowledge_index) except " +
       "on an `idempotency_key` filter, which is an identity check on a key you already hold " +
       "and still sees them — so the existence check stays true about the row a create would " +
-      "dedup against. Paginate via offset/limit.",
+      "dedup against. Pass `suppressed: 'include'` when a repair pass must see the whole " +
+      "table, or `'only'` to list what there is to undo. Paginate via offset/limit.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4501,6 +4508,17 @@ const TOOLS = [
             "then bounded by a ~5 MB serialized-body budget (it may return fewer than `limit` " +
             "rows); continue via meta.next_offset while meta.has_more is true. Leave false to " +
             "enumerate metadata cheaply at scale.",
+        },
+        suppressed: {
+          type: "string",
+          enum: ["exclude", "include", "only"],
+          description:
+            "Optional: how to treat RETRIEVAL-SUPPRESSED articles — 'exclude' (the default on " +
+            "every filter but idempotency_key), 'include', or 'only'. Pass 'include' when a " +
+            "repair or audit pass must see the whole table, and 'only' to list exactly what " +
+            "there is to undo with knowledge_unsuppress. Omit it to keep the per-filter " +
+            "default. The body-less rows do NOT carry the three suppressed_* fields — pair " +
+            "with include_body: true, or read knowledge_get, to see who suppressed what and why.",
         },
       },
       required: [],

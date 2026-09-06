@@ -262,6 +262,119 @@ defmodule LoopctlWeb.ArticleSuppressionControllerTest do
     end
   end
 
+  describe "GET /api/v1/articles?suppressed=... — the enumeration path" do
+    setup %{conn: conn} do
+      tenant = fixture(:tenant)
+      {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: nil})
+      kept = fixture(:article, %{tenant_id: tenant.id, status: :published})
+      gone = fixture(:article, %{tenant_id: tenant.id, status: :published})
+      {:ok, _} = Knowledge.suppress_article(tenant.id, gone.id, reason: "listed for undo")
+
+      %{conn: auth_conn(conn, raw_key), tenant: tenant, kept: kept, gone: gone}
+    end
+
+    defp article_ids(conn, query) do
+      conn
+      |> get(~p"/api/v1/articles?#{query}")
+      |> json_response(200)
+      |> Map.fetch!("data")
+      |> Enum.map(& &1["id"])
+      |> MapSet.new()
+    end
+
+    test "the default listing excludes it", %{conn: conn, kept: kept, gone: gone} do
+      listed = article_ids(conn, %{})
+
+      assert MapSet.member?(listed, kept.id)
+      refute MapSet.member?(listed, gone.id)
+    end
+
+    test "suppressed=only lists exactly the undo set", %{conn: conn, kept: kept, gone: gone} do
+      # Without this param the endpoint had no opt-in at all, so the rows it excludes by
+      # default were unreachable from the surface the docs send a repair pass to.
+      listed = article_ids(conn, %{"suppressed" => "only"})
+
+      assert MapSet.member?(listed, gone.id)
+      refute MapSet.member?(listed, kept.id)
+    end
+
+    test "suppressed=include lists both", %{conn: conn, kept: kept, gone: gone} do
+      listed = article_ids(conn, %{"suppressed" => "include"})
+
+      assert MapSet.member?(listed, gone.id)
+      assert MapSet.member?(listed, kept.id)
+    end
+
+    test "meta.total_count counts the same set the rows come from", %{conn: conn, gone: gone} do
+      body =
+        conn
+        |> get(~p"/api/v1/articles?#{%{"suppressed" => "only"}}")
+        |> json_response(200)
+
+      assert body["meta"]["total_count"] == 1
+      assert [%{"id" => id}] = body["data"]
+      assert id == gone.id
+    end
+
+    test "an unrecognised value fails CLOSED to exclude", %{conn: conn, gone: gone} do
+      # A typo in a query param must never put a suppressed article back on a listing.
+      refute MapSet.member?(article_ids(conn, %{"suppressed" => "onlyy"}), gone.id)
+    end
+
+    test "an absent param leaves the idempotency_key identity lookup seeing suppressed rows",
+         %{conn: conn, tenant: tenant} do
+      # The reason the controller passes this opt CONDITIONALLY. An identity check that
+      # silently missed a suppressed row would report "not captured" and mint a duplicate of
+      # an article that already exists, so `article_suppression_mode/1` defaults THAT filter
+      # to :include — and an unconditional parsed :exclude on every request would erase it.
+      key = "capture-#{System.unique_integer([:positive])}"
+
+      captured =
+        fixture(:article, %{tenant_id: tenant.id, status: :published, idempotency_key: key})
+
+      {:ok, _} = Knowledge.suppress_article(tenant.id, captured.id, reason: "wrong figure")
+
+      body =
+        conn
+        |> get(~p"/api/v1/articles?#{%{"idempotency_key" => key}}")
+        |> json_response(200)
+
+      assert body["meta"]["total_count"] == 1
+    end
+
+    test "suppressed=exclude still overrides the identity-lookup default",
+         %{conn: conn, tenant: tenant} do
+      # The opt is honored when the caller DOES send it, on the identity filter too.
+      key = "capture-#{System.unique_integer([:positive])}"
+
+      captured =
+        fixture(:article, %{tenant_id: tenant.id, status: :published, idempotency_key: key})
+
+      {:ok, _} = Knowledge.suppress_article(tenant.id, captured.id, reason: "wrong figure")
+
+      body =
+        conn
+        |> get(~p"/api/v1/articles?#{%{"idempotency_key" => key, "suppressed" => "exclude"}}")
+        |> json_response(200)
+
+      assert body["meta"]["total_count"] == 0
+    end
+
+    test "include_body=true renders the three tombstone fields", %{conn: conn, gone: gone} do
+      # The body-less summary projection carries none of them, so this is the documented way
+      # to see who suppressed what and why without a read per row.
+      body =
+        conn
+        |> get(~p"/api/v1/articles?#{%{"suppressed" => "only", "include_body" => "true"}}")
+        |> json_response(200)
+
+      assert [row] = body["data"]
+      assert row["id"] == gone.id
+      assert row["suppression_reason"] == "listed for undo"
+      assert is_binary(row["suppressed_at"])
+    end
+  end
+
   describe "the suppressed article is still readable by id over HTTP" do
     test "GET /api/v1/articles/:id returns it with the tombstone rendered", %{conn: conn} do
       {tenant, raw_key, article} = setup_tenant(:agent)

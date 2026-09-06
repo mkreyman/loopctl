@@ -192,7 +192,10 @@ defmodule Loopctl.Knowledge.Suppression do
       "lib/loopctl/knowledge/streaming_export/okf_format.ex:related_links" =>
         "backup — link serialization inside the streamed OKF bundle.",
       "lib/loopctl/knowledge/streaming_export/obsidian_format.ex:build_related_section" =>
-        "backup — link serialization inside the streamed Obsidian vault.",
+        "backup — link serialization inside the streamed Obsidian vault. The note itself " <>
+          "ships the tombstone: `build_frontmatter/2` renders it through " <>
+          "`suppression_yaml/1`, which reads `OKF.suppression_frontmatter/1` so the vault " <>
+          "and the OKF bundle name the three fields identically.",
 
       # --- maintenance ---
       "lib/loopctl/knowledge.ex:maybe_enqueue_embedding" =>

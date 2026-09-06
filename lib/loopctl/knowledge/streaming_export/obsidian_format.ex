@@ -17,6 +17,7 @@ defmodule Loopctl.Knowledge.StreamingExport.ObsidianFormat do
   @behaviour Loopctl.Knowledge.StreamingExport.Format
 
   alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.OKF
 
   @impl true
   def index_position, do: :prelude
@@ -83,11 +84,34 @@ defmodule Loopctl.Knowledge.StreamingExport.ObsidianFormat do
     ---
     title: "#{escape_yaml_string(article.title)}"
     category: #{article.category}#{tags_yaml}
-    status: #{article.status}#{source_type_yaml}#{truncated_yaml}
+    status: #{article.status}#{source_type_yaml}#{truncated_yaml}#{suppression_yaml(article)}
     created_at: "#{DateTime.to_iso8601(article.inserted_at)}"
     updated_at: "#{DateTime.to_iso8601(article.updated_at)}"
     ---
     """
+  end
+
+  # The retrieval tombstone, rendered from `OKF.suppression_frontmatter/1` so this vault and
+  # the OKF bundle name the three fields identically and cannot drift apart.
+  #
+  # Without it the vault shipped a suppressed article as an ordinary live note, which made
+  # the "backup" category in `Loopctl.Knowledge.Suppression.exempt_sites/0` FALSE for this
+  # format: that category's whole justification is that a suppressed article ships WITH its
+  # tombstone, so a restore is neither lossy about the row nor silent about the suppression.
+  # An exemption the code does not honour is worse than none, because the drift guard reads
+  # it as covered.
+  #
+  # Values are quoted and escaped because `suppressed_by` and `suppression_reason` are free
+  # actor/operator text (200/500 codepoints), and an unescaped quote or newline in either
+  # would break the whole frontmatter block rather than one field. Nil/empty values are
+  # dropped for the same reason `OKF.reject_empty/1` drops them: a `key: ""` line asserts a
+  # value that was never recorded.
+  defp suppression_yaml(article) do
+    article
+    |> OKF.suppression_frontmatter()
+    |> Enum.reject(fn {_key, value} -> value in [nil, ""] end)
+    |> Enum.sort()
+    |> Enum.map_join("", fn {key, value} -> "\n#{key}: \"#{escape_yaml_string(value)}\"" end)
   end
 
   # Build the `## Related Articles` section from the BOUNDED link list the core
@@ -121,9 +145,16 @@ defmodule Loopctl.Knowledge.StreamingExport.ObsidianFormat do
     header <> body <> "\n"
   end
 
+  # Escapes a value for a DOUBLE-QUOTED YAML scalar. Newlines are escaped, not passed
+  # through: a raw one inside the quotes ends the scalar mid-value and corrupts every
+  # frontmatter key after it, and both the title and the suppression reason are free text
+  # that can carry one.
   defp escape_yaml_string(str) do
     str
     |> String.replace("\\", "\\\\")
     |> String.replace("\"", "\\\"")
+    |> String.replace("\r\n", "\\n")
+    |> String.replace("\n", "\\n")
+    |> String.replace("\r", "\\r")
   end
 end

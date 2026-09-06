@@ -24,6 +24,7 @@ defmodule Loopctl.Knowledge.SuppressionTest do
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.OKF
+  alias Loopctl.Knowledge.StreamingExport.ObsidianFormat
   alias Loopctl.Knowledge.StreamingExport.OKFFormat
   alias Loopctl.StreamingExportHelper
 
@@ -656,6 +657,66 @@ defmodule Loopctl.Knowledge.SuppressionTest do
       {_path, contents} = Enum.find(files, fn {path, _b} -> path =~ "exported-while-live" end)
 
       refute contents =~ "loopctl_suppressed"
+    end
+  end
+
+  describe "the streamed Obsidian vault is a BACKUP surface too" do
+    # The vault is the OTHER format the same streamed export can emit, and `exempt_sites/0`
+    # exempts it under the SAME "backup" category — whose whole justification is that a
+    # suppressed article ships WITH its three tombstone fields. Until it did, that exemption
+    # was false and the drift guard read the format as covered anyway.
+    defp obsidian_note!(tenant_id, slug_fragment) do
+      {:ok, targz} = StreamingExportHelper.to_targz_binary(tenant_id, ObsidianFormat)
+      {:ok, files} = StreamingExportHelper.extract(targz)
+
+      {_path, contents} = Enum.find(files, fn {path, _b} -> path =~ slug_fragment end)
+      contents
+    end
+
+    test "a suppressed note carries all three tombstone fields in its frontmatter" do
+      tenant = fixture(:tenant)
+      article = published(tenant.id, %{title: "Vaulted while suppressed"})
+      suppress!(tenant.id, article, reason: "retention figure is wrong")
+
+      contents = obsidian_note!(tenant.id, "vaulted-while-suppressed")
+
+      # The SAME key names the OKF bundle uses, because both read
+      # `OKF.suppression_frontmatter/1` — a vault that spelled them differently would restore
+      # into a corpus the OKF importer cannot recognise as suppressed.
+      assert contents =~ "loopctl_suppressed_at:"
+      assert contents =~ "loopctl_suppressed_by:"
+      assert contents =~ ~s(loopctl_suppression_reason: "retention figure is wrong")
+
+      # Inside the frontmatter block, not appended after the body: a key below the closing
+      # `---` is prose to every YAML reader.
+      [_before, frontmatter | _] = String.split(contents, "---\n")
+      assert frontmatter =~ "loopctl_suppressed_at:"
+    end
+
+    test "a live note carries none of the three keys" do
+      tenant = fixture(:tenant)
+      published(tenant.id, %{title: "Vaulted while live"})
+
+      refute obsidian_note!(tenant.id, "vaulted-while-live") =~ "loopctl_suppressed"
+    end
+
+    test "a reason carrying a quote or a newline does not break the frontmatter" do
+      # `suppression_reason` is free operator text up to 500 codepoints. An unescaped quote
+      # or newline inside the double-quoted scalar corrupts every key after it, so the
+      # damage is to the whole block rather than to one field.
+      tenant = fixture(:tenant)
+      article = published(tenant.id, %{title: "Vaulted with a hostile reason"})
+      suppress!(tenant.id, article, reason: ~s(says "6 years"\nsuperseded_by: attacker))
+
+      contents = obsidian_note!(tenant.id, "vaulted-with-a-hostile-reason")
+
+      [_before, frontmatter | _] = String.split(contents, "---\n")
+      assert frontmatter =~ ~S(\"6 years\")
+      assert frontmatter =~ "\\nsuperseded_by"
+      refute frontmatter =~ "\nsuperseded_by: attacker"
+      # The keys written after the reason are still keys, which is what the escaping buys.
+      assert frontmatter =~ "created_at:"
+      assert frontmatter =~ "updated_at:"
     end
   end
 
