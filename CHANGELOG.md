@@ -6,6 +6,37 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **A deduplicated create now says whether it threw your payload away
+  (`loopctl-mcp-server` 2.89.0).** `POST /api/v1/articles` answers a duplicate with
+  `200 deduplicated: true` and keeps the stored row unchanged — deliberately, because the
+  fleet's harvest sourcers re-run against stable `idempotency_key`s and a `409` would break
+  every harvest. The cost was that a genuine edit vanished with no signal. Every
+  `deduplicated: true` response now carries `content_drift` and `title_drift` (booleans,
+  compared after trimming surrounding whitespace): the idempotency-key branch, the
+  title-collision branch, and the novelty gate's near-duplicate verdict, which is the
+  DEFAULT create path. `skipped: true` responses carry neither — nothing was stored for that
+  payload, so there is no row it could have drifted from.
+
+  Two asymmetries an unattended writer depends on. Omitting `body` is not drift, but sending
+  it as `null` or a non-string IS: the dedup short-circuits before changeset validation, so
+  that is the only place a broken extraction can surface. And `title_drift` is FALSE when the
+  submitted title matches the article's `previous_title`, because the nightly
+  `:generic_title` consolidation moved the stored side — reporting it would have a compliant
+  sourcer PATCH the placeholder title back every night. That suppression ends by itself once
+  a human curates the title: an ordinary title PATCH CLEARS `previous_title`, the column no
+  caller can write (nothing behavioural reads the erasable `metadata` marker beside it).
+
+  The response `note` tells you to READ the stored article before overwriting it: drift is
+  symmetric and only one of the two sides is yours. The gate's near-duplicate branch gets
+  its OWN note — the row it hands back was matched by SIMILARITY with no self-exclusion, so
+  it may be another author's article or your own earlier capture: PATCH it only if it is
+  your own prior capture, otherwise merge into it or re-send under a DIFFERENT title with
+  `force: true` (the same title answers `409 title_conflict`). The
+  durable server-side trace of a drifted discard is a `Logger` warning naming the tenant
+  and article id, emitted on the idempotency and title-collision dedups (never on the gate's
+  near-duplicate verdict, where drift is true by construction); the flags also ride the `:deduplicated` write-telemetry metadata, but the
+  `ingestion_write_stats` rollup does not break them out.
+
 - **The third funnel stage — `POST /api/v1/recall/:recall_id/referenced` (agent role).**
   loopctl recorded which articles a search SURFACED and which of those an agent then
   OPENED, but never whether an opened article was actually USED. That last stage is the

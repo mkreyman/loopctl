@@ -388,7 +388,13 @@ defmodule Loopctl.TelemetryEvents do
   ## Payload (id/atom only — never article content)
 
     * `measurements`: `%{count: 1}` — a pure increment.
-    * `metadata`: `%{tenant_id, source_type, outcome}` where `source_type` is the
+    * `metadata`: `%{tenant_id, source_type, outcome, content_drift, title_drift}` where
+      `content_drift`/`title_drift` are `Knowledge.dedup_drift/2`'s booleans on the
+      idempotency-key and title-collision `:deduplicated` renders and `false` on every
+      other outcome (including the novelty gate's near-duplicate, where the row is a
+      near-NEIGHBOUR and the flags would be true by construction). NOTHING reads them
+      today — `Loopctl.Telemetry.IngestionWriteStats` takes only tenant/source_type/
+      outcome — so a new handler must not expect a rollup column; `source_type` is the
       article's advisory source_type NORMALIZED against `Article.known_source_types/0`
       (any non-allowlisted value — including all rejected-write garbage — folds to
       `nil`, i.e. the unstamped bucket, so rollup cardinality stays bounded), and

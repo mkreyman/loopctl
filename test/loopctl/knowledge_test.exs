@@ -337,6 +337,223 @@ defmodule Loopctl.KnowledgeTest do
     end
   end
 
+  # A dedup DISCARDS the incoming payload by design (a re-running harvest sourcer
+  # depends on that no-op), so the only way a caller learns its edit went nowhere is
+  # this signal. It REPORTS; it never changes what create_article/3 does.
+  describe "dedup_drift/2" do
+    test "identical content after trimming is not drift" do
+      %{tenant: tenant} = setup_tenant()
+
+      assert {:ok, article} =
+               Knowledge.create_article(tenant.id, %{
+                 title: "Drift Base",
+                 body: "the stored body",
+                 category: :reference
+               })
+
+      # Exact match, and a cosmetically-reindented match, both read as no drift —
+      # the same normalization the dedup DECISION uses (same_content?/2), so a
+      # reformat never spuriously tells a sourcer its content moved.
+      assert %{content_drift: false, title_drift: false} =
+               Knowledge.dedup_drift(article, %{
+                 "title" => "Drift Base",
+                 "body" => "the stored body"
+               })
+
+      assert %{content_drift: false, title_drift: false} =
+               Knowledge.dedup_drift(article, %{
+                 "title" => "  Drift Base  ",
+                 "body" => "\n  the stored body\n"
+               })
+    end
+
+    test "a changed body is content drift, a changed title is title drift, independently" do
+      %{tenant: tenant} = setup_tenant()
+
+      assert {:ok, article} =
+               Knowledge.create_article(tenant.id, %{
+                 title: "Drift Fields",
+                 body: "original",
+                 category: :reference
+               })
+
+      assert %{content_drift: true, title_drift: false} =
+               Knowledge.dedup_drift(article, %{"title" => "Drift Fields", "body" => "moved on"})
+
+      assert %{content_drift: false, title_drift: true} =
+               Knowledge.dedup_drift(article, %{
+                 "title" => "Drift Fields v2",
+                 "body" => "original"
+               })
+
+      assert %{content_drift: true, title_drift: true} =
+               Knowledge.dedup_drift(article, %{
+                 "title" => "Drift Fields v2",
+                 "body" => "moved on"
+               })
+    end
+
+    test "an ABSENT key is never reported as drift" do
+      %{tenant: tenant} = setup_tenant()
+
+      assert {:ok, article} =
+               Knowledge.create_article(tenant.id, %{
+                 title: "Drift Absent",
+                 body: "body",
+                 category: :reference
+               })
+
+      # A caller that sent no body cannot be said to have sent a DIFFERENT one —
+      # claiming drift here would tell a key-only re-capture to go PATCH content it
+      # never submitted.
+      assert %{content_drift: false, title_drift: false} =
+               Knowledge.dedup_drift(article, %{"idempotency_key" => "k"})
+
+      # Absent on the ATOM-keyed side too, so a non-HTTP caller reads the same answer.
+      assert %{content_drift: false, title_drift: false} =
+               Knowledge.dedup_drift(article, %{idempotency_key: "k"})
+    end
+
+    test "a key that is PRESENT but not a string is drift, not 'in sync'" do
+      %{tenant: tenant} = setup_tenant()
+
+      assert {:ok, article} =
+               Knowledge.create_article(tenant.id, %{
+                 title: "Drift Broken Extraction",
+                 body: "body",
+                 category: :reference
+               })
+
+      # `"body" => nil` is what a sourcer sends when its extraction breaks. The
+      # idempotency fast path short-circuits BEFORE Article.create_changeset/2, so this
+      # payload never sees the 422 it would have taken on first capture — answering it
+      # `content_drift: false` told a broken writer its text matched what is stored.
+      assert %{content_drift: true, title_drift: false} =
+               Knowledge.dedup_drift(article, %{
+                 "title" => "Drift Broken Extraction",
+                 "body" => nil
+               })
+
+      assert %{content_drift: true, title_drift: true} =
+               Knowledge.dedup_drift(article, %{"title" => 42, "body" => %{"oops" => true}})
+
+      # ABSENT and PRESENT-but-nil are the distinction, so they must not agree.
+      assert %{content_drift: false} = Knowledge.dedup_drift(article, %{"title" => "x"})
+    end
+
+    test "a title the nightly consolidation retitled is not reported as caller drift" do
+      %{tenant: tenant} = setup_tenant()
+
+      assert {:ok, article} =
+               Knowledge.create_article(tenant.id, %{
+                 title: "Notes",
+                 body: "the captured body",
+                 category: :reference
+               })
+
+      # The marker `Loopctl.Knowledge.Consolidation.write_title/4` stamps is advisory and
+      # erasable, so the suppression must NOT be scoped to it — only to `previous_title`.
+      assert {:ok, retitled} =
+               Knowledge.retitle_article(tenant.id, article.id, %{
+                 title: "Notes on the drift signal",
+                 metadata: %{"consolidation_title_generated" => "Notes on the drift signal"}
+               })
+
+      assert retitled.previous_title == "Notes"
+
+      # The sourcer keeps sending "Notes" — its side never moved. Reporting title_drift
+      # here had a compliant writer PATCH the placeholder back every night, undoing
+      # the :generic_title retitle in a loop.
+      assert %{content_drift: false, title_drift: false} =
+               Knowledge.dedup_drift(retitled, %{
+                 "title" => "Notes",
+                 "body" => "the captured body"
+               })
+
+      # A title that is neither the current one nor the replaced one still drifts.
+      assert %{title_drift: true} =
+               Knowledge.dedup_drift(retitled, %{
+                 "title" => "Something else entirely",
+                 "body" => "the captured body"
+               })
+
+      # An ordinary metadata PATCH replaces the whole map and drops the advisory marker.
+      # The suppression must survive it: keying on the marker re-armed the retitle-undo
+      # loop after any unrelated metadata write.
+      assert {:ok, patched} =
+               Knowledge.update_article(tenant.id, retitled.id, %{
+                 metadata: %{"visibility" => "shared"}
+               })
+
+      refute Map.has_key?(patched.metadata, "consolidation_title_generated")
+      assert patched.previous_title == "Notes"
+
+      assert %{content_drift: false, title_drift: false} =
+               Knowledge.dedup_drift(patched, %{
+                 "title" => "Notes",
+                 "body" => "the captured body"
+               })
+
+      # The suppression has to STOP once a human curates the title — otherwise the sourcer
+      # is told "in sync" about a title the article does not have, which is the silent
+      # discard this signal exists to end. An ordinary title edit CLEARS the undo record,
+      # which is the non-castable column that carries the condition.
+      assert {:ok, curated} =
+               Knowledge.update_article(tenant.id, patched.id, %{
+                 title: "Drift signal, curated by a human"
+               })
+
+      assert curated.previous_title == nil
+
+      assert %{title_drift: true} =
+               Knowledge.dedup_drift(curated, %{
+                 "title" => "Notes",
+                 "body" => "the captured body"
+               })
+    end
+
+    test "atom-keyed attrs are read the same as string-keyed ones" do
+      %{tenant: tenant} = setup_tenant()
+
+      assert {:ok, article} =
+               Knowledge.create_article(tenant.id, %{
+                 title: "Drift Atoms",
+                 body: "original",
+                 category: :reference
+               })
+
+      assert %{content_drift: true, title_drift: false} =
+               Knowledge.dedup_drift(article, %{title: "Drift Atoms", body: "changed"})
+    end
+
+    test "the drift signal does not change the dedup outcome: the stored row is untouched" do
+      %{tenant: tenant} = setup_tenant()
+
+      assert {:ok, first} =
+               Knowledge.create_article(tenant.id, %{
+                 title: "Drift Inert",
+                 body: "original body",
+                 category: :reference,
+                 idempotency_key: "drift-k"
+               })
+
+      attrs = %{
+        title: "Drift Inert renamed",
+        body: "changed body",
+        category: :reference,
+        idempotency_key: "drift-k"
+      }
+
+      assert {:ok, :deduplicated, second} = Knowledge.create_article(tenant.id, attrs)
+      assert second.id == first.id
+      assert second.body == "original body"
+      assert second.title == "Drift Inert"
+
+      # The SAME attrs that were discarded are what the caller is told about.
+      assert %{content_drift: true, title_drift: true} = Knowledge.dedup_drift(second, attrs)
+    end
+  end
+
   describe "create_article/3 title-conflict recovery respects visibility scope" do
     # The duplicate-title recovery SELECT runs via AdminRepo (BYPASSRLS), so the
     # caller's visibility scope must be applied in the query — otherwise a title

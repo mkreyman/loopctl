@@ -301,7 +301,10 @@ defmodule Loopctl.Knowledge do
     200 not 201). Two triggers:
       1. **idempotency_key** matches an existing article — returned **regardless
          of body** (the key is the identity), taking precedence over the title
-         check; a changed title/body is NOT applied.
+         check; a changed title/body is NOT applied. Call `dedup_drift/2` with the
+         same attrs to learn whether the discarded payload actually DIFFERED, and
+         tell the caller — a silent no-op on changed content is how a writer comes
+         to believe the new text is stored.
       2. a concurrent/retried create collided on the **active title** AND the
          incoming body is identical after trimming leading/trailing whitespace.
   - `{:error, :duplicate_title, %Article{}}` when the active title is taken by an
@@ -873,12 +876,99 @@ defmodule Loopctl.Knowledge do
   # Same content == same (whitespace-normalized) body. Derived server-side from
   # the actual content, so a caller cannot forge a match to alias/read back a
   # different article, and two genuinely-different bodies never silently merge.
-  defp same_content?(existing, attrs) do
-    incoming = attrs[:body] || attrs["body"]
+  defp same_content?(existing, attrs),
+    do: trimmed_equal?(existing.body, attrs[:body] || attrs["body"])
 
-    is_binary(incoming) and is_binary(existing.body) and
-      String.trim(incoming) == String.trim(existing.body)
+  @doc """
+  Compare the payload a caller just submitted against the article a dedup handed back.
+
+  A dedup is a NO-OP: the stored row is returned unchanged and the incoming title/body
+  are discarded. That is intended for the fleet's harvest sourcers, which re-run with
+  stable `idempotency_key`s by design and would break if a body change were refused
+  (409). But a caller whose content genuinely MOVED has no way to notice, so it silently
+  believes the new text is stored. This is the signal that closes that gap: the API
+  echoes it on the dedup response so the caller can decide to `update_article/4` instead.
+
+  Both flags compare after trimming leading/trailing whitespace — the SAME
+  normalization `same_content?/2` uses to decide a title collision is a retry, so a
+  cosmetic reindent never reads as drift.
+
+  An ABSENT key is not drift: a caller that sent no body cannot be said to have sent a
+  different one. A key that is PRESENT but carries something that is not a string IS
+  drift, and the distinction is the whole point of reading it with `Map.has_key?/2`
+  rather than `attrs[:body]`. The idempotency fast path short-circuits BEFORE
+  `Article.create_changeset/2` ever runs, so a `"body" => nil` payload — the shape a
+  sourcer produces when its extraction breaks — is never validated. Collapsing that into
+  "no drift" answered a broken extraction with an affirmative "this matches what is
+  stored", which is the one answer that guarantees nobody looks.
+
+  `title_drift` is suppressed when the submitted title matches the article's
+  `previous_title`: the stored side moved, deliberately, by the nightly `:generic_title`
+  consolidation retitle — the CALLER has not drifted, and reporting it as caller-side drift
+  told a compliant sourcer to PATCH the placeholder title back every night, undoing the
+  retitle in a loop. The suppression ends by itself once a human curates that title, because
+  `Article.update_changeset/2` CLEARS `previous_title` on an ordinary title edit. That is a
+  column no caller can cast, which is why the condition is not read out of `metadata`.
+
+  Returns `%{content_drift: boolean(), title_drift: boolean()}`. This REPORTS, it never
+  decides — nothing in the create path branches on it.
+  """
+  @spec dedup_drift(Article.t(), map()) :: %{
+          content_drift: boolean(),
+          title_drift: boolean()
+        }
+  def dedup_drift(%Article{} = existing, attrs) when is_map(attrs) do
+    %{
+      content_drift: drifted?(existing.body, incoming(attrs, :body, "body")),
+      title_drift: title_drifted?(existing, incoming(attrs, :title, "title"))
+    }
   end
+
+  # `:absent` vs `{:present, value}` — a caller that omitted the key and a caller that
+  # sent garbage under it are different callers, and only the second one has a problem.
+  # Atom keys first for non-HTTP callers; request params are string-keyed.
+  defp incoming(attrs, atom_key, string_key) do
+    cond do
+      Map.has_key?(attrs, atom_key) -> {:present, Map.get(attrs, atom_key)}
+      Map.has_key?(attrs, string_key) -> {:present, Map.get(attrs, string_key)}
+      true -> :absent
+    end
+  end
+
+  # A machine retitle is not caller drift — but ONLY while the machine's title is still the
+  # stored one. `previous_title` is written by `Article.retitle_changeset/2` (the nightly
+  # `:generic_title` consolidation) and CLEARED by `Article.update_changeset/2` on any
+  # ordinary title edit, so a non-null value means exactly "the machine's title is what is
+  # stored" and the suppression cannot outlive a human's curation of that title. It is a
+  # column castable from nowhere, deliberately: the marker this once read
+  # (`metadata["consolidation_title_generated"]`) is erased by any metadata-replacing PATCH,
+  # which silently re-armed the retitle-undo loop, and is caller-writable, which let a writer
+  # re-arm the suppression the curation had just turned off.
+  defp title_drifted?(existing, {:present, incoming} = value) when is_binary(incoming) do
+    if trimmed_equal?(existing.previous_title, incoming),
+      do: false,
+      else: drifted?(existing.title, value)
+  end
+
+  defp title_drifted?(existing, value), do: drifted?(existing.title, value)
+
+  # Key absent => no claim of drift (see dedup_drift/2).
+  defp drifted?(_stored, :absent), do: false
+
+  defp drifted?(stored, {:present, incoming}) when is_binary(stored) and is_binary(incoming),
+    do: not trimmed_equal?(stored, incoming)
+
+  # PRESENT and not a string — a nil/number/map under a key the caller did send. Reported
+  # as drift so a broken extraction surfaces instead of reading as "in sync".
+  defp drifted?(_stored, {:present, _not_a_string}), do: true
+
+  # The ONE whitespace-normalization rule shared by the dedup decision
+  # (same_content?/2) and the drift signal (dedup_drift/2), so the two can never
+  # disagree about whether a payload matches the stored row.
+  defp trimmed_equal?(a, b) when is_binary(a) and is_binary(b),
+    do: String.trim(a) == String.trim(b)
+
+  defp trimmed_equal?(_a, _b), do: false
 
   @doc """
   Retrieves a single article by ID, scoped to the tenant.
