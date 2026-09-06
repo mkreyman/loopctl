@@ -61,6 +61,10 @@ defmodule Loopctl.Knowledge.SearchEventCoverageTest do
     test "every profile column is declared in the column registry" do
       declared = Coverage.columns() |> Map.keys() |> MapSet.new()
 
+      # An empty registry would make every loop in this describe block assert NOTHING and
+      # still report green. Each test anchors its own iteration source for that reason.
+      refute Enum.empty?(Coverage.profiles())
+
       for profile <- Coverage.profiles() do
         used = MapSet.new(profile.required ++ profile.enrichable)
         assert MapSet.size(used) > 0
@@ -71,6 +75,8 @@ defmodule Loopctl.Knowledge.SearchEventCoverageTest do
     end
 
     test "required and enrichable never overlap within a profile" do
+      refute Enum.empty?(Coverage.profiles())
+
       for profile <- Coverage.profiles() do
         assert MapSet.disjoint?(MapSet.new(profile.required), MapSet.new(profile.enrichable)),
                "#{profile.tool} declares a column as both required and enrichable"
@@ -78,9 +84,19 @@ defmodule Loopctl.Knowledge.SearchEventCoverageTest do
     end
 
     test "every declared column names one of the three populations" do
-      for {column, {scope, test}} <- Coverage.columns() do
+      columns = Coverage.columns()
+      assert map_size(columns) > 0
+
+      for {column, {scope, test, select_key}} <- columns do
         assert scope in Coverage.scopes(), "#{column} has unknown scope #{inspect(scope)}"
         assert test in [:text, :value], "#{column} has unknown missing-test #{inspect(test)}"
+
+        # The select key is a LITERAL in the registry rather than interpolated at call time,
+        # which trades a runtime atom build for a copy-paste hazard: a row pointing at
+        # ANOTHER column's count is well-formed and reports a confident wrong number. Pinned
+        # by STRING, so the check itself constructs no atom either.
+        assert Atom.to_string(select_key) == Atom.to_string(column) <> "_missing",
+               "#{column} declares select key #{inspect(select_key)}"
       end
     end
 
@@ -144,7 +160,17 @@ defmodule Loopctl.Knowledge.SearchEventCoverageTest do
       assert searched.rows == 1
       assert searched.populations == %{all: 1, ran: 1, agent: 1}
 
-      for {column, stats} <- Map.merge(searched.required, searched.enrichable) do
+      declared = Enum.find(Coverage.profiles(), &(&1.tool == "knowledge_search"))
+      columns = Map.merge(searched.required, searched.enrichable)
+
+      # PIN THE SET THE LOOP ITERATES, against the REGISTRY rather than against itself. A
+      # bare `for` over an empty map asserts nothing and still reports green — verified
+      # inert with `bin/mutate.sh` (report the columns as `%{}` and this test passed) before
+      # this assertion existed. Comparing to the declaration catches that, because the
+      # declaration is the thing the report is supposed to be derived FROM.
+      assert MapSet.new(Map.keys(columns)) == MapSet.new(declared.required ++ declared.enrichable)
+
+      for {column, stats} <- columns do
         assert stats.missing == 0, "#{column} counted missing on a fully covered row"
         assert stats.share_missing == +0.0
       end
@@ -177,6 +203,11 @@ defmodule Loopctl.Knowledge.SearchEventCoverageTest do
       refute Map.has_key?(searched.required, :client_model)
       assert searched.enrichable[:client_model].missing == 1
       assert searched.enrichable[:client_effort].share_missing == 1.0
+
+      # `Enum.all?` on an EMPTY map is `true`, so pin the set first or the line below is a
+      # green that means nothing. Same defect, same fix as the fully-covered test above.
+      declared = Enum.find(Coverage.profiles(), &(&1.tool == "knowledge_search"))
+      assert MapSet.new(Map.keys(searched.required)) == MapSet.new(declared.required)
       assert Enum.all?(searched.required, fn {_c, s} -> s.missing == 0 end)
     end
 

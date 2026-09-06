@@ -111,26 +111,36 @@ defmodule Loopctl.Knowledge.SearchEventCoverage do
   @agent_required ~w(client_host client_repo client_entrypoint client_version client_kind)a
   @enrichable ~w(client_model client_effort agent_id)a
 
-  # Every column this report can speak about: its POPULATION (above) and how "missing" is
-  # tested. Text columns treat blank as missing — a `client_repo` of "" is not coverage,
-  # and `query` is written as "" by the enumeration lanes. Validated against
+  # Every column this report can speak about: its POPULATION (above), how "missing" is
+  # tested, and the KEY its count arrives under from `coverage_query/3`'s select. Text
+  # columns treat blank as missing — a `client_repo` of "" is not coverage, and `query` is
+  # written as "" by the enumeration lanes. Validated against
   # `SearchEvent.__schema__(:fields)` by `search_event_coverage_test.exs`, so renaming a
   # column breaks the BUILD rather than silently emptying a line of the report.
+  #
+  # The select key is a LITERAL atom rather than `:"#{column}_missing"` built at call time,
+  # for the reason `Loopctl.Config`'s retired-key labels are literal too: the set was already
+  # bounded — these keys are compile-time `~w()a` literals and no caller supplies one — but
+  # "bounded because of where it came from" is an argument every reader has to re-derive, and
+  # Sobelow's DOS.BinToAtom check cannot see it at all. A literal table makes it structural,
+  # and it puts the select key beside the aggregate it names. `search_event_coverage_test.exs`
+  # pins each key to its column by STRING, so a copy-pasted row cannot point a column at
+  # another column's count.
   @columns %{
-    query: {:all, :text},
-    tool: {:all, :text},
-    mode_used: {:ran, :text},
-    result_count: {:all, :value},
-    duration_ms: {:ran, :value},
-    api_key_id: {:all, :value},
-    client_host: {:agent, :text},
-    client_repo: {:agent, :text},
-    client_entrypoint: {:agent, :text},
-    client_version: {:agent, :text},
-    client_kind: {:agent, :text},
-    client_model: {:agent, :text},
-    client_effort: {:agent, :text},
-    agent_id: {:all, :value}
+    query: {:all, :text, :query_missing},
+    tool: {:all, :text, :tool_missing},
+    mode_used: {:ran, :text, :mode_used_missing},
+    result_count: {:all, :value, :result_count_missing},
+    duration_ms: {:ran, :value, :duration_ms_missing},
+    api_key_id: {:all, :value, :api_key_id_missing},
+    client_host: {:agent, :text, :client_host_missing},
+    client_repo: {:agent, :text, :client_repo_missing},
+    client_entrypoint: {:agent, :text, :client_entrypoint_missing},
+    client_version: {:agent, :text, :client_version_missing},
+    client_kind: {:agent, :text, :client_kind_missing},
+    client_model: {:agent, :text, :client_model_missing},
+    client_effort: {:agent, :text, :client_effort_missing},
+    agent_id: {:all, :value, :agent_id_missing}
   }
 
   # The registry. Keyed by the `tool` column, and every value here is WRITTEN by a named
@@ -208,8 +218,12 @@ defmodule Loopctl.Knowledge.SearchEventCoverage do
   @spec profiled_tools() :: [String.t()]
   def profiled_tools, do: Enum.map(@profiles, & &1.tool)
 
-  @doc "Every column the registry can report on, mapped to `{population, missing_test}`."
-  @spec columns() :: %{atom() => {:all | :ran | :agent, :text | :value}}
+  @doc """
+  Every column the registry can report on, mapped to `{population, missing_test, select_key}`.
+
+  `select_key` is the key `coverage_query/3`'s select puts that column's count under.
+  """
+  @spec columns() :: %{atom() => {:all | :ran | :agent, :text | :value, atom()}}
   def columns, do: @columns
 
   @doc "The three populations a declared column can be measured over."
@@ -403,7 +417,7 @@ defmodule Loopctl.Knowledge.SearchEventCoverage do
   end
 
   defp empty_column(column) do
-    {scope, _test} = Map.fetch!(@columns, column)
+    {scope, _test, _select_key} = Map.fetch!(@columns, column)
     %{scope: scope, population: 0, missing: 0, share_missing: nil}
   end
 
@@ -412,9 +426,9 @@ defmodule Loopctl.Knowledge.SearchEventCoverage do
   # confident zero — a coverage report that under-reports its own gaps is the one failure
   # this module cannot be allowed to have.
   defp report_column(column, row, populations) do
-    {scope, _test} = Map.fetch!(@columns, column)
+    {scope, _test, select_key} = Map.fetch!(@columns, column)
     population = Map.fetch!(populations, scope)
-    missing = Map.fetch!(row, :"#{column}_missing")
+    missing = Map.fetch!(row, select_key)
 
     %{
       scope: scope,
