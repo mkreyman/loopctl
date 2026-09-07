@@ -37,13 +37,46 @@ defmodule Loopctl.KnowledgeLintTest do
 
       Loopctl.AdminRepo.update_all(
         from(a in Loopctl.Knowledge.Article, where: a.id == ^article.id),
-        set: [updated_at: past]
+        set: [updated_at: past, content_changed_at: past]
       )
 
       {:ok, result} = Knowledge.lint(tenant.id)
 
       assert length(result.stale_articles) == 1
       [stale] = result.stale_articles
+      assert stale.article_id == article.id
+      assert stale.days_since_update >= 200
+    end
+
+    test "stale_articles still reports an old article that a re-embed touched today" do
+      # The #791 defect, at the lint surface: `update_embedding/4` bumps `updated_at`
+      # without changing a word, so a bulk re-embed used to mark the whole corpus fresh
+      # and empty this report for `stale_days` afterwards. Staleness reads
+      # `content_changed_at` now, so a re-embed cannot hide an unrevised article.
+      tenant = fixture(:tenant)
+
+      article =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "Re-embedded but unrevised",
+          category: :pattern,
+          status: :published
+        })
+
+      content_age = DateTime.utc_now() |> DateTime.add(-200 * 86_400, :second)
+
+      import Ecto.Query
+
+      # Content last changed 200 days ago; the ROW was written just now, which is exactly
+      # the state a re-embed leaves behind.
+      Loopctl.AdminRepo.update_all(
+        from(a in Loopctl.Knowledge.Article, where: a.id == ^article.id),
+        set: [content_changed_at: content_age, updated_at: DateTime.utc_now()]
+      )
+
+      {:ok, result} = Knowledge.lint(tenant.id)
+
+      assert [stale] = result.stale_articles
       assert stale.article_id == article.id
       assert stale.days_since_update >= 200
     end
@@ -66,7 +99,7 @@ defmodule Loopctl.KnowledgeLintTest do
 
       Loopctl.AdminRepo.update_all(
         from(a in Loopctl.Knowledge.Article, where: a.id == ^article.id),
-        set: [updated_at: past]
+        set: [updated_at: past, content_changed_at: past]
       )
 
       # Default 90 days: not stale
@@ -402,7 +435,7 @@ defmodule Loopctl.KnowledgeLintTest do
 
         Loopctl.AdminRepo.update_all(
           from(a in Loopctl.Knowledge.Article, where: a.id == ^article.id),
-          set: [updated_at: past]
+          set: [updated_at: past, content_changed_at: past]
         )
       end
 

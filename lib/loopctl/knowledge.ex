@@ -13422,18 +13422,32 @@ defmodule Loopctl.Knowledge do
     end
   end
 
+  # Staleness is measured on CONTENT-CHANGE time, not last-mutation time (#791) — the same
+  # field and the same nil-fallback `RankingPriors.recency_timestamp/1` uses on the ranking
+  # path, expressed in SQL because this one runs in the database.
+  #
+  # `updated_at` alone made this report blind in exactly the case it exists for: a re-embed,
+  # a content-hash refresh, a link write or a suppression flip bumps the row without changing
+  # a word of the document, so one bulk re-embed marks the whole corpus freshly updated and
+  # the staleness lint then reports nothing for `stale_days` afterwards. An operator reading
+  # an empty report cannot tell that from a corpus with nothing stale in it.
+  #
+  # This DOES change what an operator sees, deliberately: "stale" now means the text has not
+  # been revisited, which is the question the report's own suggested_action ("review and
+  # update or archive") asks. An article re-embedded yesterday whose body last changed two
+  # years ago is stale, and used not to be reported.
   defp find_stale_articles(base, stale_days) do
     cutoff = DateTime.utc_now() |> DateTime.add(-stale_days * 86_400, :second)
 
     query =
       from(a in base,
-        where: a.updated_at < ^cutoff,
+        where: coalesce(a.content_changed_at, a.updated_at) < ^cutoff,
         select: %{
           id: a.id,
           title: a.title,
-          updated_at: a.updated_at
+          updated_at: coalesce(a.content_changed_at, a.updated_at)
         },
-        order_by: [asc: a.updated_at]
+        order_by: [asc: coalesce(a.content_changed_at, a.updated_at)]
       )
 
     now = DateTime.utc_now()
