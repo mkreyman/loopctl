@@ -121,6 +121,11 @@ defmodule Loopctl.Application do
       # `WHERE last_recalled_at < cutoff` stays the source of truth). Node-local
       # pure ETS owner; survives the transient recall/task process that wrote to it.
       Loopctl.Memory.RecallBumpCache,
+      # #792: owns the public ETS table holding which article ids a recall SESSION has
+      # already been shown, so the merged recall can drop a repeat BEFORE selection and
+      # refill the freed slot from the over-fetched pool. Node-local and lossy by design —
+      # a miss costs one redundant row, which is the pre-#792 behaviour.
+      Loopctl.Memory.RecallHistoryCache,
       # #411 Gap 3: BOUNDED supervisor for the fire-and-forget recall-count bump
       # tasks. `max_children` caps the fan-out so a burst of healthy recalls cannot
       # spawn an unbounded set of background writes that starve the write pool —

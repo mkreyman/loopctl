@@ -35,8 +35,28 @@ defmodule LoopctlWeb.RecallControllerTest do
         body: "reshipment policy for #{title}"
       })
 
-    {:ok, updated} = Knowledge.update_embedding(tenant_id, art.id, List.duplicate(0.1, 1536))
+    {:ok, updated} = Knowledge.update_embedding(tenant_id, art.id, distinct_embedding())
     updated
+  end
+
+  # Every article here used to share the IDENTICAL `[0.1] * 1536` vector, which is cosine
+  # 1.0 between any two — so once #792's near-duplicate removal landed, a corpus of 24
+  # published articles collapsed to one row and tests about the SURFACING LEDGER started
+  # failing on redundancy they had accidentally manufactured. Each article now gets a
+  # vector still close to the others (they must all match one query) but distinguishable:
+  # a shared 0.1 base with a 2.1 spike at its own index, cosine ~0.80 between any two,
+  # comfortably under the 0.95 threshold. A test that WANTS a collision builds it.
+  defp distinct_embedding do
+    # A PROCESS-LOCAL counter, not `System.unique_integer/1`: that counter has a large,
+    # scheduler-dependent stride, so `rem(unique_integer, 1536)` collided on 12 of 24
+    # articles here and half the corpus vanished as near-duplicates. Each test runs in its
+    # own process, so 0, 1, 2, ... is collision-free within a test and independent across.
+    index = rem(Process.get(:diversity_spike_index, 0), 1536)
+    Process.put(:diversity_spike_index, index + 1)
+
+    0.1
+    |> List.duplicate(1536)
+    |> List.replace_at(index, 2.1)
   end
 
   describe "POST /api/v1/recall (merged memory ∪ knowledge)" do
@@ -208,6 +228,76 @@ defmodule LoopctlWeb.RecallControllerTest do
 
       assert body["error"]["code"] == "invalid_query"
       assert body["error"]["status"] == 422
+    end
+
+    test "meta.diversity is published so the effect of #792 is measurable, not assumed" do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant.id)
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      _article = published_article(tenant.id, "reshipment diversity guide")
+
+      body =
+        base_conn()
+        |> auth(raw)
+        |> post(~p"/api/v1/recall", %{"query" => "reshipment"})
+        |> json_response(200)
+
+      diversity = body["meta"]["diversity"]
+
+      assert diversity["enabled"] == true
+      assert is_number(diversity["lambda"])
+      assert is_number(diversity["near_dup_threshold"])
+
+      for key <- ~w(candidates selected dropped_already_seen dropped_exact_duplicates
+                    dropped_near_duplicates vectors_available) do
+        assert is_integer(diversity[key]), "meta.diversity.#{key} must be reported"
+      end
+    end
+
+    test "an accepted session_id is carried into the recall without changing the shape" do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant.id)
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      _article = published_article(tenant.id, "reshipment session guide")
+
+      params = %{"query" => "reshipment", "session_id" => "sess-#{System.unique_integer()}"}
+
+      body = base_conn() |> auth(raw) |> post(~p"/api/v1/recall", params) |> json_response(200)
+
+      assert is_list(body["data"])
+      assert body["meta"]["diversity"]["dropped_already_seen"] == 0
+    end
+
+    test "a blank session_id disables containment rather than sharing an anonymous bucket" do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant.id)
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      body =
+        base_conn()
+        |> auth(raw)
+        |> post(~p"/api/v1/recall", %{"query" => "reshipment", "session_id" => "   "})
+        |> json_response(200)
+
+      assert body["meta"]["diversity"]["dropped_already_seen"] == 0
+    end
+
+    test "a non-string or over-length session_id is a 422, never a silent truncation" do
+      tenant = fixture(:tenant)
+      {raw, _key, _agent} = agent_key(tenant.id)
+
+      for bad <- [%{"nested" => "object"}, String.duplicate("s", 201)] do
+        body =
+          base_conn()
+          |> auth(raw)
+          |> post(~p"/api/v1/recall", %{"query" => "reshipment", "session_id" => bad})
+          |> json_response(422)
+
+        assert body["error"]["code"] == "invalid_session_id"
+        assert body["error"]["status"] == 422
+      end
     end
 
     test "a malformed project_id is rejected with a deterministic 422 invalid_project_id" do

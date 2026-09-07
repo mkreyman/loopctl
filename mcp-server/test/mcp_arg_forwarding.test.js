@@ -777,14 +777,25 @@ describe("#411 gap2: recall_context wiring", () => {
     );
   });
 
-  test("recallContext POSTs /api/v1/recall with query/project_id/limit on the agent key", () => {
+  test("recallContext POSTs /api/v1/recall with query/project_id/limit/session_id on the agent key", () => {
     assert.match(
       INDEX_SRC,
-      /async function recallContext\(\{ query, project_id, limit \}\) \{[\s\S]*?"POST",\s*\n\s*"\/api\/v1\/recall",[\s\S]*?LOOPCTL_AGENT_KEY/,
+      /async function recallContext\(\{ query, project_id, limit, session_id \}\) \{[\s\S]*?"POST",\s*\n\s*"\/api\/v1\/recall",[\s\S]*?LOOPCTL_AGENT_KEY/,
       "recallContext must POST /api/v1/recall on the agent key",
     );
     assert.match(INDEX_SRC, /const payload = \{ query \};\s*\n\s*if \(project_id\) payload\.project_id = project_id;/);
     assert.match(INDEX_SRC, /if \(limit != null\) payload\.limit = limit;/);
+    // #792: the containment-in-history key must be FORWARDED, not silently dropped — a
+    // session token the server never receives suppresses nothing.
+    assert.match(INDEX_SRC, /if \(session_id\) payload\.session_id = session_id;/);
+  });
+
+  test("the recall_context tool declares session_id so an agent can actually pass one", () => {
+    assert.match(
+      INDEX_SRC,
+      /name: "recall_context",[\s\S]*?session_id: \{[\s\S]*?required: \["query"\],/,
+      "recall_context must expose session_id in its inputSchema",
+    );
   });
 
   test("the recall_context dispatch case calls recallContext(args)", () => {

@@ -697,6 +697,42 @@ config :loopctl, :memory_recall_bump_cooldown_seconds, 3600
 # similarity (`max(0.0, 1.0 - distance)`) bumps recall_count.
 config :loopctl, :memory_recall_bump_min_score, 0.6
 
+# --- Recall diversity selection (#792) -------------------------------------------------
+# `POST /api/v1/recall` becomes a three-row block in every session. Before this, the
+# candidate set was ranked and truncated and never checked for redundancy, so two
+# near-copies could spend two of those three slots. Every knob below is also overridable
+# PER CALL through `Loopctl.Memory.recall_context/2` opts (`:diversity_lambda` and
+# friends) — that is the config-DI seam tests use instead of `Application.put_env`.
+#
+# The master switch. Off, `Loopctl.Knowledge.Diversity.select/4` is a plain truncation and
+# `meta.diversity.enabled` says so.
+config :loopctl, :recall_diversity_enabled, true
+
+# The MMR relevance weight, in [0,1]: `lambda * relevance - (1 - lambda) * similarity`.
+# Weighted toward relevance because diversity is a CORRECTION on a ranked list, not a
+# co-equal objective. 1.0 is pure relevance and reproduces the pre-#792 selection exactly.
+config :loopctl, :recall_diversity_lambda, 0.7
+
+# Cosine at or above which a candidate is a duplicate of something ALREADY SELECTED (never
+# of the query). Above 1.0 disables the stage, since cosine cannot reach it.
+config :loopctl, :recall_diversity_near_dup_threshold, 0.95
+
+# How many times `limit` the knowledge half fetches, so a drop can be REFILLED rather than
+# merely leaving a hole — the one thing a client-side filter cannot do.
+config :loopctl, :recall_diversity_over_fetch, 3
+
+# Ceiling on that over-fetch. Every candidate above `limit` costs a vector on the wire
+# (~6 KB at 1536 dimensions), so this bounds what one recall pulls through the small admin
+# pool. It caps the over-fetch only: a caller asking for `limit` rows always gets at least
+# `limit` candidates.
+config :loopctl, :recall_diversity_max_pool, 30
+
+# How long a shown article suppresses itself for one recall `session_id`
+# (`Loopctl.Memory.RecallHistoryCache`). Sized to a working session: past it, re-surfacing
+# something the agent saw hours ago is a reminder rather than a redundancy. Node-local and
+# lost on restart — a miss costs one redundant row, never a wrong result.
+config :loopctl, :recall_history_ttl_seconds, 7_200
+
 # Max concurrent in-flight recall-count bump tasks per node
 # (`Loopctl.Memory.RecallBumpTaskSupervisor` max_children). Bounds the fan-out of the
 # fire-and-forget async bump so a recall burst cannot spawn unbounded background writes

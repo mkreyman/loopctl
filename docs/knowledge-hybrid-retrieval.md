@@ -125,6 +125,7 @@ limit, offset) merged with exactly:
 | `provenance` | `:curated` \| `:retrieved` |
 | `confidence` | The WINNING candidate's absolute score for its OWN provenance class. `0.0` when there are no results, or `:retrieved` won with no genuine non-curated competitor. **Never** a rejected candidate's score from the OTHER class (`:retrieved`'s confidence is never a below-threshold curated score). |
 | `curated_article_id` | The winning curated article's id when `provenance == :curated` (guaranteed present AND first in `results`); `nil` on `:retrieved`. |
+| `diversity` | What redundancy removal did to THIS page (#792) — the same block `POST /api/v1/recall` publishes. See below. |
 
 **Both branches return the identical map-key set** — on `results` (per-item keys
 are identical by construction; `:curated` reorders the same ranked pool rather
@@ -132,6 +133,34 @@ than re-filtering it) and on `meta`. A caller reads `meta.provenance` and
 `meta.curated_article_id`; it never needs to know which subsystem (curated lookup
 vs `search_combined/3`) actually produced the answer. This is the literal fix for
 #305's "no caller-side RAG-or-curated branching."
+
+### Diversity selection on the page (#792)
+
+The page is passed through `Loopctl.Knowledge.Diversity.select/4` — exact
+content-hash dedup, near-duplicate removal at cosine >= 0.95 measured against the
+ALREADY-SELECTED set, then maximal-marginal-relevance selection over the
+survivors — so two near-copies cannot occupy two slots of a short answer. The
+counts land in `meta.diversity`. The full pipeline, its knobs and its rationale
+are documented once, in [`agent-memory.md`](agent-memory.md) under "Diversity
+selection on the knowledge half".
+
+Two constraints are specific to this function and must not be dropped:
+
+- **Only at `offset: 0`.** Selection re-chooses from the whole pool, so "page 2
+  of a diversified list" has no meaning that survives page 1 changing. A paged
+  request gets the untouched ranked pool and `meta.diversity.enabled: false` —
+  present and false rather than absent, so a caller can tell "off" from "found
+  nothing".
+- **The curated winner is PINNED.** `hoist_to_front/2` exists so a caller
+  branching on `meta.provenance == :curated` can trust `List.first(results)`;
+  letting MMR demote or drop it would silently revoke that guarantee. It is
+  passed to the selector as `:preselected`, so it still SUPPRESSES near-copies of
+  itself — which prepending it afterwards would not.
+
+The vector fetch is bounded to the window the page can draw on
+(`limit x over_fetch`), never the `@max_relevance_page_size` pool the provenance
+decision reasons over: the decision needs the wide pool, diversity does not, and
+each pool member costs a vector read.
 
 ### Degradation honesty
 

@@ -4203,6 +4203,22 @@ defmodule Loopctl.ApiSpec.Schemas do
             "Optional project scope (a UUID PARTITION key, NOT an isolation boundary). " <>
               "Present → both sides return the merged global ∪ that-project set; " <>
               "absent/blank → global-only. A malformed value is a 422 invalid_project_id."
+        },
+        session_id: %Schema{
+          type: :string,
+          nullable: true,
+          description:
+            "Optional opaque, client-chosen session token (max 200 bytes), used ONLY as " <>
+              "the containment-in-history key (#792): an article already shown to this " <>
+              "`(tenant, session)` is dropped before selection and the freed slot is " <>
+              "REFILLED from the over-fetched pool. NOT an isolation boundary — history " <>
+              "is keyed on `(tenant_id, session_id, article_id)`, so a token another " <>
+              "tenant happens to pick can never reach yours. Node-local and best-effort: " <>
+              "a miss re-surfaces the article, which is the behaviour without it. " <>
+              "Absent/blank disables containment for that call rather than sharing one " <>
+              "bucket with other callers. A non-string or over-length value is a 422 " <>
+              "`invalid_session_id` — never a silent truncation, since a truncated token " <>
+              "collides with every other token sharing its prefix."
         }
       }
     })
@@ -4380,11 +4396,71 @@ defmodule Loopctl.ApiSpec.Schemas do
             candidates_considered: %Schema{
               type: :object,
               description:
-                "How many rows each half produced BEFORE the merged cap, and their total.",
+                "How many rows each half produced BEFORE the merged cap, and their total. " <>
+                  "`knowledge` is the OVER-FETCHED diversity pool (`limit` x over-fetch, " <>
+                  "bounded), not the post-selection set — the difference between it and " <>
+                  "`knowledge_count` is what `diversity` accounts for.",
               properties: %{
                 memory: %Schema{type: :integer},
                 knowledge: %Schema{type: :integer},
                 total: %Schema{type: :integer}
+              }
+            },
+            diversity: %Schema{
+              type: :object,
+              description:
+                "What redundancy removal did to the knowledge half (#792), so the effect " <>
+                  "is measurable rather than assumed. Every `dropped_*` count is a " <>
+                  "candidate that would have been returned before, and each freed slot " <>
+                  "was REFILLED from the over-fetched pool. Selection never decides the " <>
+                  "render order — `data` is still the deterministic sort.",
+              properties: %{
+                enabled: %Schema{
+                  type: :boolean,
+                  description:
+                    "False when selection did not run (disabled by config or per call); " <>
+                      "every count is then 0 and the page is the plain ranked truncation."
+                },
+                lambda: %Schema{
+                  type: :number,
+                  format: :float,
+                  description:
+                    "The MMR relevance weight actually applied, in [0,1]. 1.0 is pure " <>
+                      "relevance and reproduces the pre-#792 selection exactly."
+                },
+                near_dup_threshold: %Schema{
+                  type: :number,
+                  format: :float,
+                  description:
+                    "Cosine at or above which a candidate counts as a duplicate of " <>
+                      "something ALREADY SELECTED (never of the query). Above 1.0 the " <>
+                      "stage is off, since cosine cannot reach it."
+                },
+                candidates: %Schema{
+                  type: :integer,
+                  description: "Knowledge candidates the selection had to choose from."
+                },
+                selected: %Schema{type: :integer, description: "How many it kept."},
+                dropped_already_seen: %Schema{
+                  type: :integer,
+                  description: "Dropped because this `session_id` was already shown them."
+                },
+                dropped_exact_duplicates: %Schema{
+                  type: :integer,
+                  description: "Dropped as an exact content-hash duplicate of a survivor."
+                },
+                dropped_near_duplicates: %Schema{
+                  type: :integer,
+                  description:
+                    "Dropped as a near-duplicate of an already-selected article — the " <>
+                      "count #792 exists to make visible."
+                },
+                vectors_available: %Schema{
+                  type: :integer,
+                  description:
+                    "Candidates whose embedding could be loaded. A candidate without one " <>
+                      "is never dropped as a duplicate: unmeasurable is not similar."
+                }
               }
             },
             selected_count: %Schema{

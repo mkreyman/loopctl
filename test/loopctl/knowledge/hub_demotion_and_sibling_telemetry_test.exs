@@ -108,7 +108,12 @@ defmodule Loopctl.Knowledge.HubDemotionAndSiblingTelemetryTest do
         project_id: nil
       }
 
-      result = Memory.recall_context(scope, query: marker, limit: 20)
+      # `diversity_enabled: false` for THIS call only (#792). The identical embeddings
+      # above are cosine 1.0, so near-duplicate removal would legitimately drop one of the
+      # two rows — and this test needs BOTH scored to compare the demotion at all. The
+      # property under test is the hub SCORE, not which rows survive selection.
+      result =
+        Memory.recall_context(scope, query: marker, limit: 20, diversity_enabled: false)
 
       scores =
         result.results

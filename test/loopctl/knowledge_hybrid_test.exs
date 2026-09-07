@@ -652,4 +652,127 @@ defmodule Loopctl.KnowledgeHybridTest do
              ) == 1
     end
   end
+
+  # --- #792: diversity selection on the hybrid page --------------------------------
+
+  describe "hybrid_search/3 - diversity selection (#792)" do
+    test "two near-duplicates yield one of them PLUS the next distinct candidate" do
+      tenant = fixture(:tenant)
+      Knowledge.reset_circuit_breaker(tenant.id)
+      query = "clustered topic query"
+
+      twin_a =
+        fixture(:article, %{tenant_id: tenant.id, title: "Twin A", status: :published})
+        |> then(&set_embedding(tenant.id, &1, direction_a()))
+
+      twin_b =
+        fixture(:article, %{tenant_id: tenant.id, title: "Twin B", status: :published})
+        |> then(&set_embedding(tenant.id, &1, direction_a()))
+
+      distinct =
+        fixture(:article, %{tenant_id: tenant.id, title: "Distinct", status: :published})
+        |> then(&set_embedding(tenant.id, &1, direction_medium()))
+
+      stub_embeddings_by_query(%{query => direction_a()})
+      opts = [keyword_weight: 0, semantic_weight: 1, limit: 2]
+
+      # NON-VACUITY: with selection off, the twins occupy BOTH slots. Without this the
+      # assertion below could pass on a pool that was never clustered.
+      assert {:ok, %{results: baseline}} =
+               Knowledge.hybrid_search(tenant.id, query, [diversity_enabled: false] ++ opts)
+
+      assert Enum.map(baseline, & &1.id) |> Enum.sort() == Enum.sort([twin_a.id, twin_b.id])
+
+      assert {:ok, %{results: results, meta: meta}} =
+               Knowledge.hybrid_search(tenant.id, query, opts)
+
+      ids = Enum.map(results, & &1.id)
+
+      assert length(ids) == 2
+      assert distinct.id in ids
+      assert Enum.count(ids, &(&1 in [twin_a.id, twin_b.id])) == 1
+      assert meta.diversity.dropped_near_duplicates >= 1
+      assert meta.diversity.enabled == true
+    end
+
+    test "the curated winner stays FIRST under a diversity-heavy lambda" do
+      tenant = fixture(:tenant)
+      Knowledge.reset_circuit_breaker(tenant.id)
+      query = "what is the refund policy?"
+
+      answering =
+        tenant.id
+        |> curated_article(%{title: "Refund Policy Answer"})
+        |> then(&set_embedding(tenant.id, &1, direction_a()))
+
+      for i <- 1..2 do
+        fixture(:article, %{tenant_id: tenant.id, title: "Other #{i}", status: :published})
+        |> then(&set_embedding(tenant.id, &1, direction_medium()))
+      end
+
+      stub_embeddings_by_query(%{query => direction_a()})
+
+      assert {:ok, %{results: results, meta: meta}} =
+               Knowledge.hybrid_search(tenant.id, query,
+                 keyword_weight: 0,
+                 semantic_weight: 1,
+                 limit: 2,
+                 # Weighting DIVERSITY over relevance is the adversarial setting: it is
+                 # exactly where an unpinned curated winner would be displaced or reordered.
+                 diversity_lambda: 0.1
+               )
+
+      assert meta.provenance == :curated
+      # The whole contract of `meta.provenance == :curated` is that `List.first(results)`
+      # IS the governed answer. Selection is not entitled to overrule that, which is why
+      # the curated id is passed to the selector as `:preselected` rather than left to
+      # compete (see `Diversity.select/4`'s pinning tests for the suppression semantics).
+      assert List.first(results).id == answering.id
+      assert meta.curated_article_id == answering.id
+      assert length(results) == 2
+      assert meta.diversity.enabled == true
+    end
+
+    test "a paged request (offset > 0) is left untouched and says so" do
+      tenant = fixture(:tenant)
+      Knowledge.reset_circuit_breaker(tenant.id)
+      query = "paged clustered query"
+
+      for i <- 1..3 do
+        fixture(:article, %{tenant_id: tenant.id, title: "Paged #{i}", status: :published})
+        |> then(&set_embedding(tenant.id, &1, direction_a()))
+      end
+
+      stub_embeddings_by_query(%{query => direction_a()})
+
+      assert {:ok, %{meta: meta}} =
+               Knowledge.hybrid_search(tenant.id, query,
+                 keyword_weight: 0,
+                 semantic_weight: 1,
+                 limit: 2,
+                 offset: 1
+               )
+
+      # Selection re-chooses from the whole pool, so "page 2 of a diversified list" has no
+      # meaning that survives page 1 changing. The block reports `enabled: false` rather
+      # than being absent, so a paged caller can tell "off" from "found nothing".
+      assert meta.diversity.enabled == false
+      assert meta.diversity.dropped_near_duplicates == 0
+    end
+
+    test "an empty pool still publishes a well-formed diversity block" do
+      tenant = fixture(:tenant)
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      assert {:ok, %{results: [], meta: meta}} =
+               Knowledge.hybrid_search(tenant.id, "nothing matches this at all",
+                 keyword_weight: 0,
+                 semantic_weight: 1
+               )
+
+      assert meta.diversity.enabled == false
+      assert meta.diversity.candidates == 0
+      assert meta.diversity.selected == 0
+    end
+  end
 end

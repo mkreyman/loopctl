@@ -66,6 +66,7 @@ defmodule Loopctl.Knowledge do
   alias Loopctl.Knowledge.ArticleEmbedding
   alias Loopctl.Knowledge.ArticleLink
   alias Loopctl.Knowledge.ConflictResolution
+  alias Loopctl.Knowledge.Diversity
   alias Loopctl.Knowledge.EmbeddingConcurrency
   alias Loopctl.Knowledge.KbCuration
   alias Loopctl.Knowledge.OKF
@@ -1321,6 +1322,90 @@ defmodule Loopctl.Knowledge do
 
     AdminRepo.all(query)
   end
+
+  @doc """
+  Batch vector + fingerprint fetch for diversity selection (#792).
+
+  Returns `%{article_id => %{embedding: [float()] | nil, content_hash: String.t() | nil}}`
+  for the ids that resolve; an id that does not resolve is simply absent, and
+  `Loopctl.Knowledge.Diversity` treats an absent vector as unmeasurable rather than as
+  dissimilar.
+
+  Scoped by the SAME disjunctive predicate every read path on this corpus uses —
+  `a.tenant_id == ^tenant_id or a.scope == :system` — because a recall pool legitimately
+  contains published system canonicals, whose `articles.tenant_id` is NULL. No status or
+  visibility filter: the ids arrive from a search that already applied both, and
+  re-filtering here could only differ from that search, never improve on it.
+
+  `AdminRepo`, not `HeavyRead`: this is a bounded `id IN (<= max_pool)` projection, and a
+  system-scoped row's NULL `articles.tenant_id` cannot satisfy the heavy-read guard's
+  required conjunctive tenant predicate (the same reason `hydrate_semantic_pool/6` stays
+  on `AdminRepo`).
+
+  Behind the US-41.1 cutover flag the vector comes from the dimension-tagged side table at
+  the tenant's active dimension; `update_embedding/5` never writes `articles.embedding` for
+  a non-1536 tenant, so reading the legacy column there would report every article
+  unembedded and silently disable diversity for that whole tenant.
+
+  Best-effort by contract: any failure yields `%{}`, which disables the similarity stages
+  for that call. Diversity is a correction on a ranked list — it must never be able to
+  sink a recall.
+  """
+  @spec diversity_vectors(Ecto.UUID.t(), [Ecto.UUID.t()]) :: %{
+          optional(String.t()) => %{embedding: [float()] | nil, content_hash: String.t() | nil}
+        }
+  def diversity_vectors(tenant_id, article_ids)
+
+  def diversity_vectors(_tenant_id, []), do: %{}
+
+  def diversity_vectors(tenant_id, article_ids)
+      when is_binary(tenant_id) and is_list(article_ids) do
+    ids = Enum.filter(article_ids, &valid_uuid?/1)
+
+    if ids == [] do
+      %{}
+    else
+      tenant_id
+      |> diversity_vectors_query(ids)
+      |> AdminRepo.all()
+      |> Map.new(fn row ->
+        {row.id, %{embedding: to_vector_list(row.embedding), content_hash: row.content_hash}}
+      end)
+    end
+  rescue
+    error ->
+      Logger.warning(
+        "Knowledge.diversity_vectors failed for tenant=#{tenant_id}: #{Exception.message(error)}"
+      )
+
+      %{}
+  end
+
+  defp diversity_vectors_query(tenant_id, ids) do
+    if Embeddings.side_table_reads_enabled?() do
+      dimension = Embeddings.active_dimension(tenant_id)
+
+      from(a in Article,
+        left_join: ae in ArticleEmbedding,
+        on:
+          ae.article_id == a.id and ae.tenant_id == ^tenant_id and ae.dim == ^dimension and
+            ae.live_denorm,
+        where: a.id in ^ids,
+        where: a.tenant_id == ^tenant_id or a.scope == :system,
+        select: %{id: a.id, embedding: ae.embedding, content_hash: ae.embedding_content_hash}
+      )
+    else
+      from(a in Article,
+        where: a.id in ^ids,
+        where: a.tenant_id == ^tenant_id or a.scope == :system,
+        select: %{id: a.id, embedding: a.embedding, content_hash: a.embedding_content_hash}
+      )
+    end
+  end
+
+  defp to_vector_list(%Pgvector{} = vector), do: Pgvector.to_list(vector)
+  defp to_vector_list(list) when is_list(list) and list != [], do: list
+  defp to_vector_list(_), do: nil
 
   @doc """
   Lists articles for a tenant with optional filtering and pagination.
@@ -10954,7 +11039,17 @@ defmodule Loopctl.Knowledge do
       confidence = decision.confidence
       curated_article_id = decision.curated_article_id
 
-      page = paginate_results(ordered_pool, limit: requested_limit, offset: requested_offset)
+      {diversified_pool, diversity_stats} =
+        diversify_hybrid_pool(
+          tenant_id,
+          ordered_pool,
+          requested_limit,
+          requested_offset,
+          curated_article_id,
+          opts
+        )
+
+      page = paginate_results(diversified_pool, limit: requested_limit, offset: requested_offset)
 
       maybe_record_search_access(
         tenant_id,
@@ -10982,11 +11077,89 @@ defmodule Loopctl.Knowledge do
              # ranked pool's own ordering places it outside `results` — the actionable
              # pointer this finding required alongside the hoist above.
              curated_article_id: curated_article_id,
+             # What redundancy removal did to THIS page (#792). Same shape
+             # `POST /api/v1/recall` publishes, so one reader parses both.
+             diversity: diversity_stats,
              limit: page.limit,
              offset: page.offset
            })
        }}
     end
+  end
+
+  # #792 on the hybrid path. Shares `Loopctl.Knowledge.Diversity` with the merged recall —
+  # same pipeline, same knobs, same `meta.diversity` shape — with two constraints of its
+  # own:
+  #
+  #   * **Only at offset 0.** Diversity selection is not a stable page function: it
+  #     re-chooses from the whole pool, so "page 2 of a diversified list" has no meaning
+  #     that survives the first page changing. A paged caller gets the untouched ranked
+  #     pool and a `enabled: false` stats block saying so.
+  #   * **The curated winner is PINNED.** `hoist_to_front/2` exists so that a caller
+  #     branching on `meta.provenance == :curated` can trust `List.first(results)`;
+  #     letting MMR demote or drop it would silently revoke that guarantee. Pinned, it
+  #     still SUPPRESSES near-copies of itself, which is the behaviour that matters.
+  #
+  # The vector fetch is bounded to the window this page could draw on, never the full
+  # `@max_relevance_page_size` pool the provenance decision reasons over: the decision
+  # needs 200 candidates, and diversity needs `limit x over_fetch` of them.
+  defp diversify_hybrid_pool(_tenant_id, [], _limit, _offset, _curated_id, opts),
+    do: {[], disabled_diversity_stats([], 0, opts)}
+
+  defp diversify_hybrid_pool(tenant_id, pool, limit, offset, curated_id, opts) do
+    config = Diversity.config(opts)
+
+    if config.enabled? and offset == 0 do
+      run_hybrid_diversity(tenant_id, pool, limit, curated_id, config)
+    else
+      {pool, disabled_diversity_stats(pool, limit, opts)}
+    end
+  end
+
+  defp run_hybrid_diversity(tenant_id, pool, limit, curated_id, config) do
+    window = Enum.take(pool, Diversity.pool_size(limit, config))
+    positions = window |> Enum.map(& &1.id) |> Enum.with_index() |> Map.new()
+    vectors = diversity_vectors(tenant_id, Map.keys(positions))
+
+    pinned = if curated_id && Map.has_key?(positions, curated_id), do: [curated_id], else: []
+
+    {selected, stats} =
+      window
+      |> Enum.map(&hybrid_diversity_candidate(&1, vectors))
+      |> Diversity.select(limit, config, preselected: pinned)
+
+    # MMR chose WHAT is in the page; the POOL's own ranking chooses the order, with the
+    # curated winner still first. Selecting and then re-sorting is what lets #792 and the
+    # deterministic-ordering requirement hold at the same time.
+    ordered =
+      selected
+      |> Enum.map(& &1.result)
+      |> Enum.sort_by(fn result ->
+        {result.id != curated_id, Map.get(positions, result.id, 0)}
+      end)
+
+    {ordered ++ Enum.drop(pool, length(window)), stats}
+  end
+
+  defp hybrid_diversity_candidate(result, vectors) do
+    vector = Map.get(vectors, result.id, %{})
+
+    %{
+      id: result.id,
+      score: absolute_result_score(result),
+      embedding: Map.get(vector, :embedding),
+      content_hash: Map.get(vector, :content_hash),
+      result: result
+    }
+  end
+
+  # The uniform `meta.diversity` block for a call that did NOT run the pipeline (disabled,
+  # or a paged request). Built by the selector itself rather than hand-written, so the two
+  # shapes cannot drift.
+  defp disabled_diversity_stats(pool, limit, opts) do
+    config = %{Diversity.config(opts) | enabled?: false}
+    {_selected, stats} = Diversity.select(pool, max(limit, 1), config)
+    stats
   end
 
   # Moves the winning curated candidate to the FRONT of the pool (stable order for

@@ -82,6 +82,12 @@ defmodule LoopctlWeb.MemoryController do
   # documented limit and the enforced one cannot drift either.
   @max_referenced_article_ids Memory.max_context_limit()
 
+  # Byte cap on the optional recall `session_id` (#792). Bounded because the token is an
+  # ETS key held for the session TTL and is entirely client-chosen, so an unbounded string
+  # is an unbounded per-entry allocation. Published in the endpoint's OpenAPI description
+  # from THIS attribute, so the documented cap and the enforced one cannot drift.
+  @max_session_id_bytes 200
+
   operation(:create,
     summary: "Remember (write a memory)",
     description:
@@ -209,13 +215,34 @@ defmodule LoopctlWeb.MemoryController do
         "differ in `meta` by construction. " <>
         "`meta.recall_id` is ALSO the `search_id` recorded on the knowledge half's " <>
         "surfacing rows; hand it back to `POST /recall/{recall_id}/referenced` to record " <>
-        "which of those articles you actually used.",
+        "which of those articles you actually used. " <>
+        "DIVERSITY SELECTION (#792): the knowledge half is OVER-FETCHED and then reduced " <>
+        "to the page you see, so two near-copies cannot spend two of your slots. In " <>
+        "order: an article already shown to this `session_id` is dropped; candidates " <>
+        "sharing an embedding content hash collapse to the highest-ranked one; a " <>
+        "candidate whose cosine similarity to an ALREADY-SELECTED article reaches the " <>
+        "near-duplicate threshold is dropped; and what remains is chosen by maximal " <>
+        "marginal relevance. Every drop is REFILLED from the over-fetched pool rather " <>
+        "than left as an empty slot, and `meta.diversity` reports each count so the " <>
+        "effect is measurable. Selection decides WHAT is returned, never the ORDER: the " <>
+        "deterministic sort above still applies, so the `data` array stays byte-identical " <>
+        "between turns for an unchanged corpus. `meta.candidates_considered.knowledge` is " <>
+        "the OVER-FETCHED pool; `meta.knowledge_count` is what survived. " <>
+        "`session_id` is an OPTIONAL, opaque, client-chosen token scoped to your tenant " <>
+        "and used ONLY as the containment-in-history key — it is never an isolation " <>
+        "boundary, it is node-local and best-effort (a miss simply re-surfaces an " <>
+        "article, which is the pre-#792 behaviour), and omitting it disables containment " <>
+        "for that call rather than sharing one bucket with other callers. A non-string " <>
+        "or over-#{@max_session_id_bytes}-byte `session_id` is a 422 " <>
+        "(`invalid_session_id`) rather than a silent truncation, because a truncated " <>
+        "token collides with every other token sharing its prefix and would suppress " <>
+        "articles this session never saw.",
     request_body: {"Recall params", "application/json", Schemas.RecallContextRequest},
     responses: %{
       200 => {"Merged recall results", "application/json", Schemas.RecallContextResponse},
       422 =>
-        {"Subject unresolvable, non-string/blank/over-length query, or invalid project_id",
-         "application/json", Schemas.ErrorResponse},
+        {"Subject unresolvable, non-string/blank/over-length query, invalid session_id, " <>
+           "or invalid project_id", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       503 => {"Tenant custody halted", "application/json", Schemas.ErrorResponse}
     }
@@ -501,22 +528,42 @@ defmodule LoopctlWeb.MemoryController do
 
   defp context_with_project(conn, params, project_id) do
     with_scope(conn, project_id, fn scope ->
-      case coerce_context_query(params["query"]) do
-        {:ok, query} ->
-          opts =
-            [query: query, limit: params["limit"]]
-            |> Keyword.merge(knowledge_scope_opts(conn))
+      with {:ok, query} <- coerce_context_query(params["query"]),
+           {:ok, session_id} <- coerce_session_id(params["session_id"]) do
+        opts =
+          [query: query, limit: params["limit"], session_id: session_id]
+          |> Keyword.merge(knowledge_scope_opts(conn))
 
-          json(conn, RecallJSON.context(Memory.recall_context(scope, opts)))
-
-        {:error, :query_too_long} ->
-          query_too_long(conn)
-
-        {:error, :invalid_query} ->
-          invalid_query(conn)
+        json(conn, RecallJSON.context(Memory.recall_context(scope, opts)))
+      else
+        {:error, :query_too_long} -> query_too_long(conn)
+        {:error, :invalid_query} -> invalid_query(conn)
+        {:error, :invalid_session_id} -> invalid_session_id(conn)
       end
     end)
   end
+
+  # The optional recall SESSION token (#792), used only as the containment-in-history key:
+  # an article this session was already shown is dropped BEFORE selection so the freed slot
+  # is refilled from the over-fetched pool, which is the one thing the claude-config hook's
+  # client-side filter cannot do.
+  #
+  # Absent or blank means no containment, NOT a shared bucket — an anonymous caller must not
+  # inherit another anonymous caller's history. Over-length is a 422 rather than a silent
+  # truncation: a truncated token collides with every other token sharing its prefix, which
+  # would suppress articles the session never saw. It is never an isolation key on its own —
+  # `Loopctl.Memory.RecallHistoryCache` keys on `(tenant_id, session_id, article_id)`.
+  defp coerce_session_id(nil), do: {:ok, nil}
+
+  defp coerce_session_id(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> {:ok, nil}
+      trimmed when byte_size(trimmed) > @max_session_id_bytes -> {:error, :invalid_session_id}
+      trimmed -> {:ok, trimmed}
+    end
+  end
+
+  defp coerce_session_id(_value), do: {:error, :invalid_session_id}
 
   # Coerce + trim the merged-recall query ONCE at the boundary, treating blank/
   # whitespace-only AND over-length uniformly across both halves. The knowledge half
@@ -1124,6 +1171,20 @@ defmodule LoopctlWeb.MemoryController do
         status: 422,
         code: "query_too_long",
         message: "The `query` must be at most #{@max_context_query_length} characters."
+      }
+    })
+  end
+
+  defp invalid_session_id(conn) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        code: "invalid_session_id",
+        message:
+          "The `session_id` must be a string of at most #{@max_session_id_bytes} bytes. " <>
+            "Omit it to disable containment-in-history for this call."
       }
     })
   end

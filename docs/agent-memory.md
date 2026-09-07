@@ -237,7 +237,7 @@ calling `/memory/recall` and `/knowledge/search` separately.
 | Surface | |
 |---------|--|
 | Context | `Loopctl.Memory.recall_context/2` |
-| HTTP | `POST /api/v1/recall` `{query, project_id?, limit?}` |
+| HTTP | `POST /api/v1/recall` `{query, project_id?, limit?, session_id?}` |
 | HTTP | `POST /api/v1/recall/:recall_id/referenced` `{article_ids, project_id?}` |
 | MCP | `recall_context`, `recall_referenced` |
 
@@ -317,6 +317,72 @@ trusted:
 not `@attributable_access_types`, not `Knowledge.@heat_read_access_types`, not
 `LiveRetrievalMetrics`' chosen reads. Heat and precision must never rank on a
 signal a client asserts about itself.
+
+### Diversity selection on the knowledge half (#792)
+
+This endpoint becomes the `SECOND-BRAIN HITS` block in every claude-config
+session: three rows out of a five-row request. Before #792 the candidate set was
+ranked and truncated and never checked for redundancy, so on a topically
+clustered corpus two near-copies could occupy two of the three slots a session
+ever sees and the third relevant-but-dissimilar article never rendered.
+*Similarity proposes; it does not dispose.*
+
+The knowledge half is now **over-fetched** (`limit x over_fetch`, bounded by
+`:recall_diversity_max_pool`) and then reduced to `limit` by
+`Loopctl.Knowledge.Diversity.select/4`, in this order:
+
+1. **Containment in history** — an article already shown to this `session_id`
+   is dropped. Kept server-side in `Loopctl.Memory.RecallHistoryCache`, and that
+   is the whole reason it moved off the client: a client-side filter can only
+   DROP the row, while the server can refill the freed slot.
+2. **Exact-fingerprint dedup** — candidates sharing an `embedding_content_hash`
+   collapse to the highest-ranked one. A `nil` hash is not a fingerprint.
+3. **Near-duplicate removal** — a candidate whose cosine similarity to an
+   ALREADY-SELECTED article reaches `:recall_diversity_near_dup_threshold`
+   (0.95) is dropped. Measured against the selected set, never against the
+   query: two articles can both be highly relevant and still be one fact twice.
+4. **MMR** — what remains is chosen by
+   `lambda * relevance - (1 - lambda) * max_similarity_to_selected`, with lambda
+   weighted toward relevance (0.7). At `lambda: 1.0` the stage is exactly the
+   pre-#792 top-N.
+
+Four properties are load-bearing:
+
+- **Every drop is REFILLED**, never left as a hole — that is what the
+  over-fetch buys, and it is the acceptance criterion #792 names first.
+- **Selection decides WHAT, never the ORDER.** The merged list is still sorted
+  deterministically (score DESC, source, id ASC), so an unchanged corpus renders
+  a byte-identical `data` array between turns. MMR is not allowed to reshuffle a
+  cache-friendly block.
+- **A candidate whose vector cannot be loaded is never dropped.** Unmeasurable
+  is not similar; a missing embedding must cost recall nothing.
+- **`meta.diversity` reports every count** (`dropped_near_duplicates`,
+  `dropped_exact_duplicates`, `dropped_already_seen`, `candidates`, `selected`,
+  `vectors_available`, plus the `lambda`/`near_dup_threshold` actually applied),
+  so the effect is measurable rather than assumed.
+  `meta.candidates_considered.knowledge` is the over-fetched pool;
+  `meta.knowledge_count` is what survived.
+
+`session_id` is optional, opaque and client-chosen. It is **not** an isolation
+boundary — the shown-set is keyed `(tenant_id, session_id, article_id)`, so a
+token another tenant picks can never reach yours — and it is node-local and
+best-effort: a miss simply re-surfaces an article, which is the pre-#792
+behaviour. Omitting it disables containment for that call rather than sharing
+one bucket between anonymous callers. A non-string or over-200-byte value is a
+`422 invalid_session_id`, never a silent truncation (a truncated token collides
+with every other token sharing its prefix).
+
+Every knob is application config (`:recall_diversity_*`,
+`:recall_history_ttl_seconds` in `config/config.exs`) and is overridable per
+call through `recall_context/2` opts (`:diversity_enabled`,
+`:diversity_lambda`, `:diversity_near_dup_threshold`, `:diversity_over_fetch`,
+`:diversity_max_pool`) — the config-DI seam tests use instead of
+`Application.put_env`. `Knowledge.hybrid_search/3` shares the same selector and
+publishes the same `meta.diversity` block, with two differences of its own: it
+runs only at `offset: 0` (selection re-chooses from the whole pool, so a
+diversified page 2 has no stable meaning), and the curated winner is PINNED so
+`meta.provenance == :curated` still guarantees `List.first(results)` is the
+governed answer.
 
 ---
 

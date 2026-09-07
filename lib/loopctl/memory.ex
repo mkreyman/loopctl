@@ -59,6 +59,7 @@ defmodule Loopctl.Memory do
   alias Loopctl.HeavyRead
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.Diversity
   alias Loopctl.Knowledge.IdempotencyTag
   alias Loopctl.Knowledge.RankingPriors
   alias Loopctl.Knowledge.VectorSearch
@@ -67,6 +68,7 @@ defmodule Loopctl.Memory do
   alias Loopctl.Memory.MemoryEmbedding
   alias Loopctl.Memory.PromotionTelemetry
   alias Loopctl.Memory.RecallBumpCache
+  alias Loopctl.Memory.RecallHistoryCache
   alias Loopctl.Memory.Scope
   alias Loopctl.Memory.SessionMemory
   alias Loopctl.Memory.SessionPromotion
@@ -1495,6 +1497,14 @@ defmodule Loopctl.Memory do
     query = to_string(opt(opts, :query, ""))
     limit = clamp_context_limit(opt(opts, :limit, @default_context_limit))
 
+    # #792. The knowledge half is fetched at `pool_size/2` (limit x over_fetch, bounded)
+    # rather than at `limit`, because refill needs somewhere to refill FROM: dropping a
+    # near-duplicate out of a set fetched at exactly `limit` leaves `limit - 1` rows, which
+    # is all the client-side filter in the claude-config hook can already achieve.
+    diversity_opts = Diversity.config(opts)
+    session_id = session_opt(opts)
+    knowledge_pool = Diversity.pool_size(limit, diversity_opts)
+
     # ONE id for the whole recall, threaded into the knowledge half as its
     # `search_combined/3` `search_id` so the id this response publishes is the id the
     # surfacing rows in `article_access_events` carry. The memory half writes no
@@ -1527,7 +1537,7 @@ defmodule Loopctl.Memory do
       recall(scope, query: query, limit: limit, embedding: embedding_result, on_overload: :tag)
 
     {knowledge_env, kopts} =
-      knowledge_recall(scope, query, limit, opts, embedding_result, recall_id)
+      knowledge_recall(scope, query, knowledge_pool, opts, embedding_result, recall_id)
 
     memory_reason = memory_selection_reason(memory_env)
 
@@ -1544,7 +1554,7 @@ defmodule Loopctl.Memory do
 
     knowledge_degraded = knowledge_degraded?(knowledge_env)
 
-    knowledge_items =
+    knowledge_candidates =
       Enum.map(knowledge_env.results, fn result ->
         %{
           source: :knowledge,
@@ -1555,10 +1565,21 @@ defmodule Loopctl.Memory do
         }
       end)
 
-    candidates = memory_items ++ knowledge_items
+    # #792. Redundancy removal + MMR runs on the knowledge half only: memory rows are the
+    # caller's OWN prior statements, where two similar rows are two things the agent said
+    # and collapsing them is data loss, not de-duplication.
+    {knowledge_items, diversity_stats} =
+      diversify_knowledge(scope, knowledge_candidates, limit, diversity_opts, session_id)
+
+    # The per-source envelope publishes what the merge could actually draw on, not the
+    # over-fetched pool — a caller re-ranking from it must not see rows the server already
+    # ruled out as duplicates of ones it did show.
+    knowledge_env = %{knowledge_env | results: Enum.map(knowledge_items, & &1.article)}
+
+    candidates = memory_items ++ knowledge_candidates
 
     merged =
-      candidates
+      (memory_items ++ knowledge_items)
       |> Enum.sort_by(&merge_order_key/1)
       |> Enum.take(limit)
       # 1-based POST-MERGE rank. It is deliberately not the per-source rank: what a client
@@ -1571,8 +1592,14 @@ defmodule Loopctl.Memory do
     # `POST /recall/:recall_id/referenced` admits exactly them, so a row for a result the
     # cap dropped would both inflate the `searched` denominator and admit an id the caller
     # was never shown. Synchronous — a caller may reference the instant this response lands.
-    ledger =
-      Knowledge.record_recall_surfacing(scope.tenant_id, published_ids(merged), query, kopts)
+    published = published_ids(merged)
+
+    ledger = Knowledge.record_recall_surfacing(scope.tenant_id, published, query, kopts)
+
+    # Containment-in-history is recorded for what the merge PUBLISHED, never for the
+    # candidate pool: marking a candidate the cap dropped would suppress an article this
+    # session was never shown.
+    RecallHistoryCache.mark_shown(scope.tenant_id, session_id, published)
 
     tokens_selected = sum_tokens(merged)
     tokens_candidates = sum_tokens(candidates)
@@ -1595,9 +1622,16 @@ defmodule Loopctl.Memory do
         recall_id: recall_id,
         candidates_considered: %{
           memory: length(memory_items),
-          knowledge: length(knowledge_items),
+          # The OVER-FETCHED knowledge pool, not the post-diversity set: "considered" is
+          # what the selection actually had to choose from, and the difference between this
+          # and `knowledge_count` is exactly what `meta.diversity` accounts for.
+          knowledge: length(knowledge_candidates),
           total: length(candidates)
         },
+        # --- Diversity selection (#792) ------------------------------------------------
+        # What redundancy removal DID, so the effect is measurable rather than assumed:
+        # every `dropped_*` counter is a candidate that would have been returned before.
+        diversity: diversity_stats,
         selected_count: length(merged),
         tokens_selected: tokens_selected,
         tokens_candidates: tokens_candidates,
@@ -1847,6 +1881,70 @@ defmodule Loopctl.Memory do
     case merged_degradation(memory_env, knowledge_env) do
       {nil, nil} when ledger != :ok -> {"recall_ledger_unavailable", nil}
       reported -> reported
+    end
+  end
+
+  # --- Diversity selection over the knowledge half (#792) ----------------------------
+  #
+  # Similarity PROPOSES, it does not DISPOSE. The ranked pool is passed through exact
+  # fingerprint dedup, containment-in-history, near-duplicate removal at cosine
+  # `near_dup_threshold` against the ALREADY-SELECTED set, and MMR — see
+  # `Loopctl.Knowledge.Diversity` for the pipeline and for why a candidate we cannot
+  # measure is never dropped.
+  #
+  # The returned list is re-sorted by `merge_order_key/1` and NOT left in MMR pick order:
+  # MMR decides WHAT is in the set, never what order it renders in, so the merged block
+  # stays byte-identical between turns for an unchanged corpus (the cache-friendly
+  # ordering requirement this would otherwise fight with).
+  defp diversify_knowledge(scope, candidates, limit, diversity_opts, session_id) do
+    ids = Enum.map(candidates, &knowledge_candidate_id/1)
+
+    vectors =
+      if diversity_opts.enabled?, do: Knowledge.diversity_vectors(scope.tenant_id, ids), else: %{}
+
+    exclude = RecallHistoryCache.shown_ids(scope.tenant_id, session_id, ids)
+
+    {selected, stats} =
+      candidates
+      |> Enum.map(&to_diversity_candidate(&1, vectors))
+      |> Diversity.select(limit, diversity_opts, exclude_ids: exclude)
+      |> then(fn {selected, stats} -> {Enum.map(selected, & &1.item), stats} end)
+
+    {Enum.sort_by(selected, &merge_order_key/1), stats}
+  end
+
+  # `Diversity` works on a flat `%{id, score, embedding, content_hash}` shape and carries
+  # the merged item through untouched under `:item`, so the selector never has to know what
+  # a recall item looks like and the recall never has to reconstruct one from an id.
+  defp to_diversity_candidate(candidate, vectors) do
+    id = knowledge_candidate_id(candidate)
+    vector = Map.get(vectors, id, %{})
+
+    %{
+      id: id,
+      score: candidate.score,
+      embedding: Map.get(vector, :embedding),
+      content_hash: Map.get(vector, :content_hash),
+      item: candidate
+    }
+  end
+
+  defp knowledge_candidate_id(%{article: article}), do: to_string(Map.get(article, :id) || "")
+
+  # The recall SESSION token, used only as a containment-in-history key. Opaque and
+  # client-chosen, so it is never a scope on its own — `RecallHistoryCache` keys on
+  # `(tenant_id, session_id, article_id)`, and a blank or non-binary value disables
+  # containment rather than sharing one bucket between every anonymous caller.
+  defp session_opt(opts) do
+    case opt(opts, :session_id, nil) do
+      value when is_binary(value) ->
+        case String.trim(value) do
+          "" -> nil
+          trimmed -> trimmed
+        end
+
+      _ ->
+        nil
     end
   end
 
