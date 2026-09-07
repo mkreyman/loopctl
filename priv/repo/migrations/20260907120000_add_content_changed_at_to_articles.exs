@@ -28,34 +28,44 @@ defmodule Loopctl.Repo.Migrations.AddContentChangedAtToArticles do
   columns: `metadata` is cast and whole-map-REPLACED by
   `PATCH /api/v1/knowledge/:id`, so one ordinary request would erase it.
 
-  ## Ordering matters — add nullable, backfill, THEN set the default
+  ## Ordering matters — add nullable, THEN set the default
 
   A `DEFAULT now()` is VOLATILE, so adding the column with that default already
   attached would rewrite the table and stamp every existing row with the migration's
   own clock — which is precisely the corpus-wide flattening this column exists to
-  prevent, performed by the fix itself. So: catalog-only ALTER first, backfill from
-  `inserted_at`, and only then attach the default for future inserts. `SET DEFAULT`
-  on an existing column touches no existing row.
+  prevent, performed by the fix itself. So: catalog-only ALTER first, and only then
+  attach the default for future inserts. `SET DEFAULT` on an existing column touches
+  no existing row, so this migration rewrites nothing.
 
-  ## The backfill: `inserted_at`, and why that is the honest choice
+  ## No backfill — the nil-fallback IS the backfill
 
-  Nothing recorded authored time before this migration, and there is no body-revision
-  trail to reconstruct it from. `inserted_at` is the best available evidence and it is
-  CONSERVATIVE in the safe direction: `inserted_at <= updated_at` always holds, so a
-  row can only be made to look OLDER than it looks today, never newer. The failure
-  this issue is about is documents looking falsely NEW.
+  Nothing recorded authored time before this migration and there is no body-revision
+  trail to reconstruct it from, so every whole-corpus guess is wrong in one direction:
+  `inserted_at` understates every article edited after creation (and would flip each of
+  them into the staleness lint at deploy, whose suggested_action is "review and update
+  or archive"), while `updated_at` bakes in the exact re-embed flattening this column
+  exists to undo. Both are also a whole-table UPDATE run inside the ADD COLUMN's ACCESS
+  EXCLUSIVE transaction: ~86k rows, each re-running the STORED generated `search_vector`
+  over the full body, writing entries into 19 indexes, and leaving a dead
+  `articles_embedding_hnsw_idx` element behind — and an HNSW scan SKIPS dead elements,
+  so live rows go UNREACHABLE to the semantic lane until a VACUUM on a QUIET database.
+  Long enough, too, to risk Fly's 5-minute default `release_command` timeout.
 
-  It is not exact — an article whose body was genuinely edited after creation is
-  understated by the gap — but the alternative, leaving the column null and falling
-  back to `updated_at`, keeps the whole corpus on the field the re-embed poisons.
-  The nil-fallback in `RankingPriors.recency_timestamp/1` stays regardless, so a row
-  this backfill misses behaves exactly as it does today.
+  So legacy rows stay NULL and `RankingPriors.recency_timestamp/1` — and the SQL
+  `coalesce` the staleness lint uses — resolves them to `updated_at`, exactly as today.
+  The deploy therefore changes no existing row's ranking or lint verdict at all; the
+  column diverges from `updated_at` only as real body edits stamp it. That also makes
+  the nil-fallback the LIVE path for the whole pre-#791 corpus rather than a claim about
+  rows that do not exist.
 
   ## No index
 
-  The prior READS this column out of the lane projections and never filters or orders
-  by it, so an index would serve no query shape. Adding one on a ~86k-row table for a
-  column no predicate mentions is cost with no reader.
+  The prior reads this column out of the lane projections. The staleness lint does
+  filter and order on it, but on `coalesce(content_changed_at, updated_at)` — a
+  non-sargable expression no plain b-tree index can serve — and `articles.updated_at`,
+  which that same scan filtered on before, carries no index either, so the plan class is
+  unchanged. An expression index is the only shape that would help, and it has no reader
+  yet.
 
   ## RLS
 
@@ -72,12 +82,8 @@ defmodule Loopctl.Repo.Migrations.AddContentChangedAtToArticles do
       add_if_not_exists :content_changed_at, :utc_datetime_usec
     end
 
-    # One statement over the whole table. `inserted_at` is NOT NULL, so this leaves no
-    # row null and the `IS NULL` guard makes a re-run a no-op.
-    execute(
-      "UPDATE articles SET content_changed_at = inserted_at WHERE content_changed_at IS NULL"
-    )
-
+    # No backfill: see the moduledoc. Existing rows stay NULL and resolve to
+    # `updated_at` through the nil-fallback, so the deploy is behaviour-neutral.
     execute("ALTER TABLE articles ALTER COLUMN content_changed_at SET DEFAULT now()")
   end
 

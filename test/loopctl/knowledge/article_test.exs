@@ -787,16 +787,13 @@ defmodule Loopctl.Knowledge.ArticleTest do
       # at maximum freshness. Same isolation as previous_title / staged_draft_at.
       forged = %{content_changed_at: ~U[2030-01-01 00:00:00.000000Z]}
 
-      assert Article.create_changeset(
-               %Article{},
-               Map.merge(forged, %{
-                 title: "Forged",
-                 body: "Forged body",
-                 category: :finding
-               })
-             )
-             |> get_change(:content_changed_at)
-             |> DateTime.compare(~U[2030-01-01 00:00:00.000000Z]) == :lt
+      # The create case OMITS `:body` on purpose. With a body the stamp put_changes over
+      # whatever cast produced, so the assertion holds under ANY cast list and reports a
+      # green that means nothing; with no body change the stamp never fires, and what
+      # survives is exactly what `cast/3` let through. That is what makes this half
+      # falsifiable — adding `:content_changed_at` to @cast_fields turns it red.
+      assert Article.create_changeset(%Article{}, Map.merge(forged, %{title: "Forged"}))
+             |> get_change(:content_changed_at) == nil
 
       assert Article.update_changeset(stored(), forged) |> get_change(:content_changed_at) == nil
     end

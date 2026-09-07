@@ -74,7 +74,13 @@ defmodule LoopctlWeb.KnowledgeLintController do
            properties: %{
              data: %OpenApiSpex.Schema{
                type: :object,
-               description: "Lint findings grouped by issue type"
+               description:
+                 "Lint findings grouped by issue type. In stale_articles, last_updated " <>
+                   "and days_since_update are measured on CONTENT-change time " <>
+                   "(content_changed_at, falling back to updated_at), NOT on the row's " <>
+                   "last write, so an article re-embedded today can legitimately report " <>
+                   "a last_updated older than the updated_at returned by " <>
+                   "GET /knowledge/:id. The names are kept for backward compatibility."
              },
              summary: %OpenApiSpex.Schema{
                type: :object,

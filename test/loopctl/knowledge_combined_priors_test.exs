@@ -294,22 +294,24 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
       assert Enum.all?(results, &(&1.tenant_id == tenant_a.id))
     end
 
-    test "content_changed_at is tenant-scoped: aging tenant B's content cannot reach tenant A" do
+    test "the recency prior orders tenant A's own rows and never pools tenant B's" do
       tenant_a = fixture(:tenant)
       tenant_b = fixture(:tenant)
 
-      a = create_article(tenant_a.id, %{title: "Tenant A aged note", body: @body})
-      b = create_article(tenant_b.id, %{title: "Tenant B fresh note", body: @body})
+      # A near-tie INSIDE tenant A, so the assertion below is decided by the recency prior
+      # (the aged RRF-favoured row must lose its id tiebreak) and not by the tenant
+      # predicate alone — which is all the isolation test above can distinguish.
+      {smaller, larger} = near_tie_pair(tenant_a.id)
+      set_age(tenant_a.id, smaller.id, 400)
+      set_age(tenant_a.id, larger.id, 0)
 
-      # Tenant A's article is ANCIENT and tenant B's is brand new, so if the recency prior
-      # pooled across tenants at all, B would be the top hit for A's query.
-      set_age(tenant_a.id, a.id, 400)
+      b = create_article(tenant_b.id, %{title: "Tenant B fresh note", body: @body})
       set_age(tenant_b.id, b.id, 0)
 
       expect_query_embedding()
       results = search(tenant_a.id, now: @now, recency_weight: 0.3)
 
-      assert ids(results) == [a.id]
+      assert ids(results) == [larger.id, smaller.id]
       refute b.id in ids(results)
     end
   end

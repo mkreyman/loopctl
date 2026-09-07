@@ -1615,7 +1615,13 @@ defmodule Loopctl.Knowledge do
         suppressed_by: a.suppressed_by,
         suppression_reason: a.suppression_reason
       })
-      |> order_by([a], asc: a.category, desc: a.updated_at, asc: a.id)
+      # Freshest-first within a category is a RECENCY purpose, so it reads authored age
+      # (#791) rather than `updated_at`, which a re-embed or a suppression flip bumps.
+      |> order_by([a],
+        asc: a.category,
+        desc: coalesce(a.content_changed_at, a.updated_at),
+        asc: a.id
+      )
       |> limit(^limit)
       |> offset(^offset)
       |> AdminRepo.all()
@@ -2425,8 +2431,9 @@ defmodule Loopctl.Knowledge do
   This is the query-less companion to `search_keyword/3`: it returns the same
   result shape (`%{results: [...], meta: %{total_count, limit, offset}}`) but
   performs no `tsquery` matching, has no relevance score or snippet, and orders
-  deterministically by `updated_at` descending then `id` ascending so
-  `offset`/`limit` pagination reaches every matching article exactly once.
+  deterministically by authored age descending (`coalesce(content_changed_at,
+  updated_at)` — the recency field, #791, not the one a re-embed bumps) then `id`
+  ascending so `offset`/`limit` pagination reaches every matching article exactly once.
 
   ## Parameters
 
@@ -2472,7 +2479,10 @@ defmodule Loopctl.Knowledge do
         inserted_at: a.inserted_at,
         updated_at: a.updated_at
       })
-      |> order_by([a], desc: a.updated_at, asc: a.id)
+      # Recency order is AUTHORED age (#791): this endpoint documents itself as
+      # "ordered by recency", and on `updated_at` a bulk re-embed reordered the whole
+      # listing into embedding-write order.
+      |> order_by([a], desc: coalesce(a.content_changed_at, a.updated_at), asc: a.id)
       |> limit(^limit)
       |> offset(^offset)
 
@@ -3854,8 +3864,16 @@ defmodule Loopctl.Knowledge do
       # AC-31.1.4: never surface an article that is in an OPEN potential_conflict.
       where: not exists(open_conflict_subquery(tenant_id)),
       # Tenant-own-first: tenant rows (tenant_id NOT NULL, so `IS NULL` = false)
-      # sort before system canonicals (tenant_id NULL, `IS NULL` = true), then freshest.
-      order_by: [asc: fragment("? IS NULL", a.tenant_id), desc: a.updated_at, asc: a.id]
+      # sort before system canonicals (tenant_id NULL, `IS NULL` = true), then freshest —
+      # freshest by AUTHORED age (#791), the same `coalesce` the priors resolve. This
+      # ordering is not cosmetic: `maybe_limit_curated/2` truncates on it, so on the ONE
+      # lane that outranks retrieval a bulk re-embed would otherwise pick which curated
+      # article is the governed answer.
+      order_by: [
+        asc: fragment("? IS NULL", a.tenant_id),
+        desc: coalesce(a.content_changed_at, a.updated_at),
+        asc: a.id
+      ]
     )
   end
 
@@ -13321,7 +13339,13 @@ defmodule Loopctl.Knowledge do
     # Base query for published articles scoped to tenant (+ optional project)
     base = published_base_query(tenant_id, project_id)
 
-    stale = find_stale_articles(base, stale_days)
+    # Stale is the one category whose predicate widens under #791 — "the body has not been
+    # revised in N days" only ever grows on a corpus that is being re-embedded rather than
+    # rewritten — so it counts in SQL and fetches only the page, instead of materialising
+    # the whole matching set into the BEAM the way `Enum.take/2` below does. The nightly
+    # worker on the one tenant with a real corpus has already died of a pool timeout inside
+    # this lint once (see `find_orphan_articles/3`).
+    {stale, stale_total} = find_stale_articles(base, stale_days, max_per_category)
     orphans = find_orphan_articles(base, tenant_id, project_id)
     contradictions = find_contradiction_clusters(tenant_id, project_id)
     gaps = find_coverage_gaps(base, min_coverage)
@@ -13331,7 +13355,7 @@ defmodule Loopctl.Knowledge do
 
     # Capture totals BEFORE capping so callers know the true size.
     total_per_category = %{
-      stale_articles: length(stale),
+      stale_articles: stale_total,
       orphan_articles: length(orphans),
       contradiction_clusters: length(contradictions),
       coverage_gaps: length(gaps),
@@ -13339,14 +13363,15 @@ defmodule Loopctl.Knowledge do
     }
 
     truncated = %{
-      stale_articles: length(stale) > max_per_category,
+      stale_articles: stale_total > max_per_category,
       orphan_articles: length(orphans) > max_per_category,
       contradiction_clusters: length(contradictions) > max_per_category,
       coverage_gaps: length(gaps) > max_per_category,
       broken_sources: length(broken) > max_per_category
     }
 
-    stale_capped = Enum.take(stale, max_per_category)
+    # Already capped in SQL — the LIMIT is the cap for this one category.
+    stale_capped = stale
     orphans_capped = Enum.take(orphans, max_per_category)
     contradictions_capped = Enum.take(contradictions, max_per_category)
     gaps_capped = Enum.take(gaps, max_per_category)
@@ -13436,35 +13461,54 @@ defmodule Loopctl.Knowledge do
   # been revisited, which is the question the report's own suggested_action ("review and
   # update or archive") asks. An article re-embedded yesterday whose body last changed two
   # years ago is stale, and used not to be reported.
-  defp find_stale_articles(base, stale_days) do
+  #
+  # The migration deliberately backfills NOTHING, so every pre-#791 row coalesces to
+  # `updated_at` and its verdict here is identical to what it was; the report diverges only
+  # as real body edits stamp the column. The response keeps the names `last_updated` /
+  # `days_since_update` (renaming them breaks every existing reader), so their changed
+  # meaning is stated in the endpoint's `operation/2` response description — an article can
+  # now legitimately report a `last_updated` OLDER than its own `updated_at`.
+  #
+  # Returns `{page, total}`: `total` is counted in SQL so the summary stays exact, and only
+  # `cap` rows are ever materialised. The other four categories still cap in memory, which
+  # is safe because their sets are bounded by structure (orphans, categories, sources)
+  # rather than by "how long since anyone rewrote this".
+  defp find_stale_articles(base, stale_days, cap) do
     cutoff = DateTime.utc_now() |> DateTime.add(-stale_days * 86_400, :second)
 
+    stale = from(a in base, where: coalesce(a.content_changed_at, a.updated_at) < ^cutoff)
+
+    total = AdminRepo.one(from(a in stale, select: count(a.id)))
+
     query =
-      from(a in base,
-        where: coalesce(a.content_changed_at, a.updated_at) < ^cutoff,
+      from(a in stale,
         select: %{
           id: a.id,
           title: a.title,
-          updated_at: coalesce(a.content_changed_at, a.updated_at)
+          content_changed_at: coalesce(a.content_changed_at, a.updated_at)
         },
-        order_by: [asc: coalesce(a.content_changed_at, a.updated_at)]
+        order_by: [asc: coalesce(a.content_changed_at, a.updated_at)],
+        limit: ^cap
       )
 
     now = DateTime.utc_now()
 
-    AdminRepo.all(query)
-    |> Enum.map(fn article ->
-      days_since = DateTime.diff(now, article.updated_at, :day)
+    page =
+      AdminRepo.all(query)
+      |> Enum.map(fn article ->
+        days_since = DateTime.diff(now, article.content_changed_at, :day)
 
-      %{
-        article_id: article.id,
-        title: article.title,
-        last_updated: article.updated_at,
-        days_since_update: days_since,
-        severity: "warning",
-        suggested_action: "Review and update or archive this article"
-      }
-    end)
+        %{
+          article_id: article.id,
+          title: article.title,
+          last_updated: article.content_changed_at,
+          days_since_update: days_since,
+          severity: "warning",
+          suggested_action: "Review and update or archive this article"
+        }
+      end)
+
+    {page, total}
   end
 
   # An orphan is an article that appears in NO link, in either direction.
