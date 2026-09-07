@@ -128,7 +128,7 @@ defmodule Loopctl.Knowledge.Article do
 
     # AUTHORED age for the recency prior (#791) — when this article's BODY last changed,
     # as distinct from `updated_at`, which any write to the row bumps. Stamped on insert
-    # by `create_changeset/2` (and by the column's `DEFAULT now()` for the `insert_all`
+    # by `create_changeset/2` (and by the column's UTC clock DEFAULT for the `insert_all`
     # paths, which bypass changesets) and advanced by `stamp_content_changed_at/1` in
     # `update_changeset/2` ONLY when `:body` actually changes. A re-embed, a
     # content-hash refresh, a link write, a suppression flip, a curation mark and the
@@ -137,8 +137,9 @@ defmodule Loopctl.Knowledge.Article do
     # re-embed used to flatten recency corpus-wide.
     #
     # Read via `Loopctl.Knowledge.RankingPriors.recency_timestamp/1`, which falls back to
-    # `updated_at` when this is nil, so a row the backfill could not reach behaves as it
-    # did before.
+    # `updated_at` when this is nil. The migration backfills every pre-#791 row from its
+    # `updated_at`, so that fallback is a safety net (a lane whose select omits the column,
+    # a row a bounded backfill did not reach), not the live path.
     #
     # NEVER add this to a `cast` list. It is a live RANKING INPUT, so a caller that could
     # write it could pin its own article at maximum freshness indefinitely — the same

@@ -382,12 +382,16 @@ Three things hold it together, and each has been mutation-verified:
   so a lane whose select omits the column does not crash — it silently ranks its lane-ONLY
   candidates on the poisoned field. Guarded, alongside `idempotency_key`, by the `@ranking_lanes`
   source scan in `test/loopctl/knowledge/ranking_priors_test.exs`.
-- **The nil-fallback is permanent, and it is the LIVE path for the whole pre-#791 corpus.** The
-  migration backfills nothing on purpose: every guess (`inserted_at` ages every edited article
-  and floods the staleness lint; `updated_at` bakes in the flattening) is a whole-table UPDATE
-  under ACCESS EXCLUSIVE that churns the HNSW index. Legacy rows stay NULL and resolve to
-  `updated_at`, so the deploy changes no row's ranking, and the column diverges only as real
-  body edits stamp it.
+- **The legacy corpus is BACKFILLED, and the nil-fallback is only a safety net.** Seeding
+  `content_changed_at := updated_at` freezes each pre-#791 row's apparent age into a field no
+  later write moves; leaving it NULL would keep `coalesce(content_changed_at, updated_at)`
+  reading the poisoned field forever, so the next bulk re-embed — or any `update_all` that
+  stamps `updated_at`, e.g. `BulkOps`' status transitions — would still flatten the whole
+  corpus. (`inserted_at` is the wrong seed the other way: it ages every edited article and
+  floods the staleness lint.) It runs OUTSIDE the ADD COLUMN transaction in bounded batches,
+  because one whole-table UPDATE under ACCESS EXCLUSIVE churns the HNSW index and can outrun
+  the `release_command` budget. What still resolves through the fallback is a lane whose select
+  omits the column, or a row the bounded loop did not reach.
 
 The golden-question eval cannot catch a regression here either: `RetrievalEval` seeds
 `content_changed_at` equal to `updated_at`, so both fields agree by construction and the metrics

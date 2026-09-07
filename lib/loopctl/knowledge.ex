@@ -1516,9 +1516,11 @@ defmodule Loopctl.Knowledge do
 
   The index includes only metadata fields (no body, embedding, or metadata)
   and groups the current page of results by category. Within the full filtered
-  set, articles are ordered deterministically by `category` ascending,
-  `updated_at` descending, then `id` ascending — so `offset`/`limit`
-  pagination reaches every article without skipping or repeating.
+  set, articles are ordered deterministically by `category` ascending, authored age
+  (`coalesce(content_changed_at, updated_at)`, #791 — not the field a re-embed bumps)
+  descending, then `id` ascending — so `offset`/`limit` pagination reaches every
+  article without skipping or repeating. Note the rows still EMIT `updated_at`, which
+  is therefore not the key they are sorted on.
 
   Unlike a relevance search, this endpoint honors `category`/`tags` filters
   and real pagination. `meta.categories` reports the per-category counts over
@@ -13346,7 +13348,7 @@ defmodule Loopctl.Knowledge do
     # worker on the one tenant with a real corpus has already died of a pool timeout inside
     # this lint once (see `find_orphan_articles/3`).
     {stale, stale_total} = find_stale_articles(base, stale_days, max_per_category)
-    orphans = find_orphan_articles(base, tenant_id, project_id)
+    {orphans, orphans_total} = find_orphan_articles(base, tenant_id, project_id, max_per_category)
     contradictions = find_contradiction_clusters(tenant_id, project_id)
     gaps = find_coverage_gaps(base, min_coverage)
     broken = find_broken_sources(base)
@@ -13356,7 +13358,7 @@ defmodule Loopctl.Knowledge do
     # Capture totals BEFORE capping so callers know the true size.
     total_per_category = %{
       stale_articles: stale_total,
-      orphan_articles: length(orphans),
+      orphan_articles: orphans_total,
       contradiction_clusters: length(contradictions),
       coverage_gaps: length(gaps),
       broken_sources: length(broken)
@@ -13364,15 +13366,15 @@ defmodule Loopctl.Knowledge do
 
     truncated = %{
       stale_articles: stale_total > max_per_category,
-      orphan_articles: length(orphans) > max_per_category,
+      orphan_articles: orphans_total > max_per_category,
       contradiction_clusters: length(contradictions) > max_per_category,
       coverage_gaps: length(gaps) > max_per_category,
       broken_sources: length(broken) > max_per_category
     }
 
-    # Already capped in SQL — the LIMIT is the cap for this one category.
+    # Already capped in SQL — the LIMIT is the cap for these two categories.
     stale_capped = stale
-    orphans_capped = Enum.take(orphans, max_per_category)
+    orphans_capped = orphans
     contradictions_capped = Enum.take(contradictions, max_per_category)
     gaps_capped = Enum.take(gaps, max_per_category)
     broken_capped = Enum.take(broken, max_per_category)
@@ -13384,12 +13386,16 @@ defmodule Loopctl.Knowledge do
         total_per_category.contradiction_clusters + total_per_category.coverage_gaps +
         total_per_category.broken_sources
 
-    all_issues = stale ++ orphans ++ contradictions ++ gaps ++ broken
-
+    # `stale` and `orphans` are SQL-capped PAGES, so counting the lists would make this
+    # histogram disagree with `total_issues` sitting beside it in the same summary map
+    # whenever either set exceeds `max_per_category`. Their findings all carry one severity
+    # apiece ("warning" / "info"), so their TRUE totals are added in directly.
     issues_by_severity =
-      all_issues
+      (contradictions ++ gaps ++ broken)
       |> Enum.group_by(& &1.severity)
       |> Map.new(fn {severity, items} -> {severity, length(items)} end)
+      |> add_severity_count("warning", stale_total)
+      |> add_severity_count("info", orphans_total)
 
     summary = %{
       total_articles: total_articles,
@@ -13470,9 +13476,11 @@ defmodule Loopctl.Knowledge do
   # now legitimately report a `last_updated` OLDER than its own `updated_at`.
   #
   # Returns `{page, total}`: `total` is counted in SQL so the summary stays exact, and only
-  # `cap` rows are ever materialised. The other four categories still cap in memory, which
-  # is safe because their sets are bounded by structure (orphans, categories, sources)
-  # rather than by "how long since anyone rewrote this".
+  # `cap` rows are ever materialised. `find_orphan_articles/4` has the same shape for the
+  # same reason — an orphan is any published article in no link, so on a bulk-harvested
+  # corpus that is MOST of the corpus, not a structurally small set. The remaining three
+  # still cap in memory: contradictions are bounded by `:contradicts` links, coverage gaps
+  # by the category enum, and broken sources by the distinct source list.
   defp find_stale_articles(base, stale_days, cap) do
     cutoff = DateTime.utc_now() |> DateTime.add(-stale_days * 86_400, :second)
 
@@ -13511,6 +13519,14 @@ defmodule Loopctl.Knowledge do
     {page, total}
   end
 
+  # Folds a SQL-counted category total into the severity histogram. Every finding in a
+  # SQL-capped category carries the same severity, so the total can be added as one number
+  # instead of counting a list that is only a page.
+  defp add_severity_count(counts, _severity, 0), do: counts
+
+  defp add_severity_count(counts, severity, total),
+    do: Map.update(counts, severity, total, &(&1 + total))
+
   # An orphan is an article that appears in NO link, in either direction.
   #
   # Expressed as two correlated `not exists` rather than `id not in subquery(...)` (#574).
@@ -13531,8 +13547,14 @@ defmodule Loopctl.Knowledge do
   # No index would have rescued the old shape: one tenant owns 100% of `article_links`, so
   # the `tenant_id` predicate those subqueries filtered on is entirely non-selective. The
   # SHAPE was the defect.
-  defp find_orphan_articles(base, tenant_id, _project_id) do
-    query =
+  #
+  # Bounded in SQL for the reason the incident above makes concrete: the orphan set is
+  # bounded by the CORPUS, not by structure — on a bulk-harvested corpus most published
+  # articles carry no link — so fetching it whole and `Enum.take`ing 50 is the same
+  # unbounded materialisation that killed the nightly run. Returns `{page, total}`; the
+  # count runs in SQL so the summary total stays exact.
+  defp find_orphan_articles(base, tenant_id, _project_id, cap) do
+    unlinked =
       from(a in base,
         where:
           not exists(
@@ -13549,25 +13571,33 @@ defmodule Loopctl.Knowledge do
               where: l.target_article_id == parent_as(:article).id,
               select: 1
             )
-          ),
+          )
+      )
+
+    total = AdminRepo.one(from(a in unlinked, select: count(a.id)))
+
+    page =
+      from(a in unlinked,
         select: %{
           id: a.id,
           title: a.title,
           category: a.category
         },
-        order_by: [asc: a.title]
+        order_by: [asc: a.title],
+        limit: ^cap
       )
+      |> AdminRepo.all()
+      |> Enum.map(fn article ->
+        %{
+          article_id: article.id,
+          title: article.title,
+          category: to_string(article.category),
+          severity: "info",
+          suggested_action: "Consider linking to related articles or reviewing for relevance"
+        }
+      end)
 
-    AdminRepo.all(query)
-    |> Enum.map(fn article ->
-      %{
-        article_id: article.id,
-        title: article.title,
-        category: to_string(article.category),
-        severity: "info",
-        suggested_action: "Consider linking to related articles or reviewing for relevance"
-      }
-    end)
+    {page, total}
   end
 
   defp find_contradiction_clusters(tenant_id, project_id) do

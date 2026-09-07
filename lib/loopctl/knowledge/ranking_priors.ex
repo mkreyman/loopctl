@@ -22,8 +22,9 @@ defmodule Loopctl.Knowledge.RankingPriors do
       > `recency_timestamp/1`, which `knowledge_context` calls too, so the two surfaces
       > cannot drift), and never make `:content_changed_at` castable — a ranking input a
       > caller can write is a caller who can pin its own article at maximum freshness.
-      > The nil-fallback is deliberate and permanent: a row the #791 backfill could not
-      > reach must behave exactly as it did before, not lose its recency prior entirely.
+      > The nil-fallback is deliberate and permanent: a lane that omits the column, or a
+      > row the bounded #791 backfill did not reach, must behave exactly as it did before
+      > rather than lose its recency prior entirely.
     * **Category authority** — a bounded prior derived from `category` ALONE, centered on
       1.0 and clamped to a narrow band, so it re-ranks NEAR-TIES
       (which post-#470 Reciprocal Rank Fusion produces by construction) rather than
@@ -229,9 +230,11 @@ defmodule Loopctl.Knowledge.RankingPriors do
   on it let one bulk re-embed reset the apparent freshness of the whole corpus at once.
 
   Returns nil only when BOTH are absent, which `recency_factor/3` already treats as a
-  no-op. The `updated_at` fallback is permanent: a pre-#791 row whose `content_changed_at`
-  the backfill could not establish behaves exactly as it did before rather than losing its
-  prior. Takes a MAP (a result map or an `%Article{}`) rather than the two timestamps,
+  no-op. The `updated_at` fallback is permanent, but it is a safety net rather than the
+  live path: the migration seeds `content_changed_at` from `updated_at` for every pre-#791
+  row, so what still resolves through it is a lane whose select omits the column, or a row
+  a bounded backfill did not reach — either behaves exactly as it did before rather than
+  losing its prior. Takes a MAP (a result map or an `%Article{}`) rather than the two timestamps,
   because a lane whose select omits the field must fail OPEN to `updated_at` and not raise.
   """
   @spec recency_timestamp(map()) :: DateTime.t() | nil
