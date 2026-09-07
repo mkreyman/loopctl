@@ -1145,7 +1145,17 @@ defmodule Loopctl.Workers.ContentIngestionWorker do
     changeset
     |> Ecto.Changeset.apply_changes()
     |> Map.take(@insert_all_fields)
-    |> Map.merge(%{id: Ecto.UUID.generate(), inserted_at: now, updated_at: now})
+    # `content_changed_at` is stamped explicitly rather than left to the column's
+    # `DEFAULT now()` so all three timestamps on an ingested row agree exactly, the way
+    # `inserted_at`/`updated_at` already do. It is not in `@insert_all_fields` because
+    # it is not a `cast` field -- `create_changeset/2` put_changes it, and `Map.take/2`
+    # above would otherwise drop it (#791).
+    |> Map.merge(%{
+      id: Ecto.UUID.generate(),
+      inserted_at: now,
+      updated_at: now,
+      content_changed_at: now
+    })
   end
 
   defp persist_rows([], _ctx), do: {:ok, 0}

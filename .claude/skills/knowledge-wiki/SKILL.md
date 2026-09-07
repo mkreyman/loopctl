@@ -181,7 +181,7 @@ exactly the pollution the separate tables prevent.
    `{drift_signal, member_id}` — a group scored under the other signal's normalized key finds
    nothing and withholds (fail-closed).
 5. **Heat must not rank on a signal heat produces** — `Knowledge.heat_index/2`
-   (`knowledge.ex:11567`; the counted set is `@heat_read_access_types`, `:11437`). The heat index is the one retrieval route that
+   (`knowledge.ex:11589`; the counted set is `@heat_read_access_types`, `:11459`). The heat index is the one retrieval route that
    takes NO query, so its misses are uncorrelated with embedding similarity — which is worth nothing
    if its ordering is something a caller or the route itself generates. It has been violated FOUR
    times, each differently — and once by a FIX for one of the others — so treat any new input to
@@ -361,6 +361,33 @@ near-vacuous for this class of change — the unit guard is the real one.
 **What would overturn this:** the owner saying so, or a conversion measurement that is
 rank-stratified, uses a discriminator verified against the CURRENT corpus, and still shows a
 durable gap. Reads-per-article is not that measurement.
+
+## Recency ranks AUTHORED age, never last-mutation time (#791)
+
+`RankingPriors.recency_decay/2` measures from `RankingPriors.recency_timestamp/1` —
+`articles.content_changed_at`, falling back to `updated_at` only when that is null. Never read
+`:updated_at` for a recency purpose: it is bumped by ANY write to the row (a re-embed /
+content-hash refresh via `Knowledge.update_embedding/4`, a link write, a suppression flip), so
+ranking on it meant one bulk re-embed reset the apparent freshness of the whole corpus at once
+— silently, since nothing reported it.
+
+Three things hold it together, and each has been mutation-verified:
+
+- **`:content_changed_at` is castable from NOWHERE.** It advances only in
+  `Article.stamp_content_changed_at/1`, on a real `:body` change. A ranking input a caller can
+  write is a caller who can pin its own article at maximum freshness — the same rule that moved
+  the MOC-hub signal off `tags`. A title edit, a status flip, a curation mark and the nightly
+  `:generic_title` retitle all leave it alone.
+- **Every ranking-fed lane must PROJECT it.** `recency_timestamp/1` fails open to `updated_at`,
+  so a lane whose select omits the column does not crash — it silently ranks its lane-ONLY
+  candidates on the poisoned field. Guarded, alongside `idempotency_key`, by the `@ranking_lanes`
+  source scan in `test/loopctl/knowledge/ranking_priors_test.exs`.
+- **The nil-fallback is permanent.** A pre-#791 row the backfill could not establish an authored
+  date for must behave exactly as it did before, not lose its prior.
+
+The golden-question eval cannot catch a regression here either: `RetrievalEval` seeds
+`content_changed_at` equal to `updated_at`, so both fields agree by construction and the metrics
+move by `+0.000` whichever one the prior reads. The unit and integration guards are the real ones.
 
 ## Ranking changes are gated by the golden-question eval (#469)
 

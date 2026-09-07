@@ -2126,8 +2126,13 @@ defmodule Loopctl.Knowledge do
         |> Enum.map(fn article ->
           relevance = find_relevance_score(search.results, article.id)
           # Single source of truth for the exp(-age_days/30) decay — shared with the #471
-          # search_combined priors (RankingPriors.recency_decay/2).
-          recency_score = RankingPriors.recency_decay(article.updated_at, now)
+          # search_combined priors (RankingPriors.recency_decay/2) — and for the FIELD it
+          # measures from (RankingPriors.recency_timestamp/1, #791): authored age
+          # (`content_changed_at`), falling back to `updated_at` only when that is null.
+          # Reading `article.updated_at` here would put this surface back on the field a
+          # re-embed bumps while search stayed on the right one.
+          recency_score =
+            RankingPriors.recency_decay(RankingPriors.recency_timestamp(article), now)
 
           # Demote MOC hubs and dead doctrine HERE too (#654 follow-up). This surface
           # re-ranks on its own `combined_score` and never sees `search_combined`'s fused
@@ -2341,6 +2346,12 @@ defmodule Loopctl.Knowledge do
               idempotency_key: a.idempotency_key,
               inserted_at: a.inserted_at,
               updated_at: a.updated_at,
+              # The recency prior's field (#791). RankingPriors.recency_timestamp/1 falls
+              # back to `updated_at`, so a lane that omits this does not crash -- it
+              # silently ranks its lane-ONLY candidates on last-MUTATION time while every
+              # other lane uses authored age, which is the invisible half-fix the
+              # idempotency_key note above describes.
+              content_changed_at: a.content_changed_at,
               relevance_score:
                 fragment(
                   "ts_rank_cd(search_vector, websearch_to_tsquery(?::text::regconfig, ?))",
@@ -9428,7 +9439,11 @@ defmodule Loopctl.Knowledge do
           # made the WHOLE semantic lane hub-blind once side-table reads are on.
           idempotency_key: a.idempotency_key,
           inserted_at: a.inserted_at,
-          updated_at: a.updated_at
+          updated_at: a.updated_at,
+          # The recency prior's field (#791) -- same lane-shape contract as
+          # idempotency_key above: omit it and this lane alone ranks on last-mutation
+          # time, with nothing raising to say so.
+          content_changed_at: a.content_changed_at
         }
       )
       |> apply_search_filters(status, opts)
@@ -9638,6 +9653,10 @@ defmodule Loopctl.Knowledge do
         idempotency_key: c.idempotency_key,
         inserted_at: c.inserted_at,
         updated_at: c.updated_at,
+        # The recency prior's field (#791). Same inner/outer projection contract as
+        # idempotency_key: the inner pool_select(:semantic) must project it for this
+        # outer select to read it.
+        content_changed_at: c.content_changed_at,
         similarity_score: c.similarity_score
       }
     )
@@ -10709,7 +10728,10 @@ defmodule Loopctl.Knowledge do
           status: a.status,
           tags: a.tags,
           inserted_at: a.inserted_at,
-          updated_at: a.updated_at
+          updated_at: a.updated_at,
+          # The recency prior's field (#791) -- a live ranking input on this lane exactly
+          # as idempotency_key is, and lost the same silent way if omitted.
+          content_changed_at: a.content_changed_at
         }
       )
 

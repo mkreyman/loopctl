@@ -717,6 +717,91 @@ defmodule Loopctl.Knowledge.ArticleTest do
     end
   end
 
+  describe "content_changed_at (#791 — authored age for the recency prior)" do
+    defp stored(attrs \\ %{}) do
+      Map.merge(
+        %{
+          title: "Stored",
+          body: "Stored body",
+          category: :pattern,
+          status: :published,
+          content_changed_at: ~U[2026-01-01 00:00:00.000000Z]
+        },
+        attrs
+      )
+      |> then(&struct(Article, &1))
+    end
+
+    test "create_changeset stamps it" do
+      cs =
+        Article.create_changeset(%Article{}, %{
+          title: "Fresh",
+          body: "Fresh body",
+          category: :finding
+        })
+
+      assert %DateTime{} = get_change(cs, :content_changed_at)
+    end
+
+    test "a body edit advances it" do
+      cs = Article.update_changeset(stored(), %{body: "Rewritten body"})
+
+      assert %DateTime{} = advanced = get_change(cs, :content_changed_at)
+      assert DateTime.compare(advanced, ~U[2026-01-01 00:00:00.000000Z]) == :gt
+    end
+
+    test "re-submitting the SAME body does not advance it" do
+      # Ecto has already decided nothing changed; re-authoring is what the field records.
+      cs = Article.update_changeset(stored(), %{body: "Stored body"})
+
+      assert get_change(cs, :content_changed_at) == nil
+    end
+
+    test "a title, status, tag, category or metadata edit does not advance it" do
+      for attrs <- [
+            %{title: "Renamed"},
+            %{status: :draft},
+            %{tags: ["fresh"]},
+            %{category: :decision},
+            %{metadata: %{"note" => "x"}}
+          ] do
+        cs = Article.update_changeset(stored(), attrs)
+
+        assert get_change(cs, :content_changed_at) == nil,
+               "#{inspect(attrs)} advanced content_changed_at -- only a BODY change may"
+      end
+    end
+
+    test "the nightly generic-title retitle does not advance it" do
+      # An unattended MACHINE title fix is not authorship. If it counted, the consolidation
+      # pass would refresh the recency of every placeholder-titled article in the corpus.
+      cs =
+        Article.retitle_changeset(stored(%{title: "Untitled abc123"}), %{title: "A real title"})
+
+      assert get_change(cs, :title) == "A real title"
+      assert get_change(cs, :content_changed_at) == nil
+    end
+
+    test "it is castable from nowhere" do
+      # A live ranking input a caller could write is a caller who can pin its own article
+      # at maximum freshness. Same isolation as previous_title / staged_draft_at.
+      forged = %{content_changed_at: ~U[2030-01-01 00:00:00.000000Z]}
+
+      assert Article.create_changeset(
+               %Article{},
+               Map.merge(forged, %{
+                 title: "Forged",
+                 body: "Forged body",
+                 category: :finding
+               })
+             )
+             |> get_change(:content_changed_at)
+             |> DateTime.compare(~U[2030-01-01 00:00:00.000000Z]) == :lt
+
+      assert Article.update_changeset(stored(), forged) |> get_change(:content_changed_at) == nil
+    end
+  end
+
   describe "schema associations" do
     test "declares outgoing_links association" do
       assoc = Article.__schema__(:association, :outgoing_links)

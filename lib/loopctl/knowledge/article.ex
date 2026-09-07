@@ -126,6 +126,28 @@ defmodule Loopctl.Knowledge.Article do
     field :suppressed_by, :string
     field :suppression_reason, :string
 
+    # AUTHORED age for the recency prior (#791) — when this article's BODY last changed,
+    # as distinct from `updated_at`, which any write to the row bumps. Stamped on insert
+    # by `create_changeset/2` (and by the column's `DEFAULT now()` for the `insert_all`
+    # paths, which bypass changesets) and advanced by `stamp_content_changed_at/1` in
+    # `update_changeset/2` ONLY when `:body` actually changes. A re-embed, a
+    # content-hash refresh, a link write, a suppression flip, a curation mark and the
+    # nightly `:generic_title` retitle all leave it alone — none of them changes what the
+    # document SAYS, and `updated_at` moving on all of them is exactly why a bulk
+    # re-embed used to flatten recency corpus-wide.
+    #
+    # Read via `Loopctl.Knowledge.RankingPriors.recency_timestamp/1`, which falls back to
+    # `updated_at` when this is nil, so a row the backfill could not reach behaves as it
+    # did before.
+    #
+    # NEVER add this to a `cast` list. It is a live RANKING INPUT, so a caller that could
+    # write it could pin its own article at maximum freshness indefinitely — the same
+    # "a ranking prior must not read a caller-writable field" rule that moved the MOC-hub
+    # signal off `tags` and onto `idempotency_key`. A COLUMN and not `metadata` for the
+    # reason the four fields above are columns: `metadata` is cast and whole-map-replaced
+    # by PATCH.
+    field :content_changed_at, :utc_datetime_usec
+
     field :embedding, Pgvector.Ecto.Vector, load_in_query: false
     # Virtual boolean projection of `not is_nil(embedding)` — lets the bulk-embedding
     # path (US-37.4) null-check presence WITHOUT transferring the 1536-dim vector for
@@ -235,6 +257,7 @@ defmodule Loopctl.Knowledge.Article do
     |> validate_metadata()
     |> validate_agent_metadata()
     |> maybe_generate_slug()
+    |> stamp_content_changed_at()
     |> foreign_key_constraint(:project_id)
     |> unique_constraint(:title,
       name: :articles_tenant_title_active_idx,
@@ -294,6 +317,7 @@ defmodule Loopctl.Knowledge.Article do
     |> validate_agent_metadata()
     |> clear_curated_marker_on_content_change()
     |> clear_previous_title_on_title_change()
+    |> stamp_content_changed_at()
     |> foreign_key_constraint(:project_id)
     |> unique_constraint(:title,
       name: :articles_tenant_title_active_idx,
@@ -385,6 +409,29 @@ defmodule Loopctl.Knowledge.Article do
     case get_change(changeset, :title) do
       nil -> changeset
       _changed -> put_change(changeset, :previous_title, nil)
+    end
+  end
+
+  # Advances `content_changed_at` when — and only when — the BODY actually changes (#791).
+  #
+  # `get_change/2` returns nil for a write that submits the SAME body, so re-sending an
+  # unchanged body does not refresh authored age either; Ecto has already decided nothing
+  # changed. On `create_changeset/2` `:body` is required, so this always fires there.
+  #
+  # Deliberately keyed on `:body` ALONE, unlike `clear_curated_marker_on_content_change/1`
+  # above, which also watches `:title` and `:status`. That one asks "is the curator's
+  # approval still about this content"; this one asks "when was this content authored",
+  # and a retitle or a publish/unpublish does not re-author a body. In particular the
+  # nightly `:generic_title` retitle (`retitle_changeset/2`, which routes through this
+  # function) is a MACHINE title fix — treating it as authorship would let an unattended
+  # worker refresh the recency of every placeholder-titled article in the corpus.
+  #
+  # `:content_changed_at` is in no `cast` list, so this `put_change/3` — never caller
+  # input — is the only way it moves through a changeset.
+  defp stamp_content_changed_at(changeset) do
+    case get_change(changeset, :body) do
+      nil -> changeset
+      _changed -> put_change(changeset, :content_changed_at, DateTime.utc_now())
     end
   end
 
