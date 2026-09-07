@@ -207,11 +207,19 @@ defmodule Loopctl.Coordination.ChannelClaim do
   # echoes to every peer session in the tenant, exactly like `ChannelPost`'s
   # `session_id`/`host` — so they get the same write-time credential gate. The scan is
   # bounded by the byte caps validated above, so no separate slice cap is needed here.
-  # `ref` is deliberately NOT scanned: it is a pre-existing field with live rows, and a
-  # write-time rejection there would refuse a claim on a ref whose matching POST (whose
-  # `key` IS scanned) already exists.
+  # `ref` IS scanned, for the same reason `ChannelPost`'s `key` is (it is in that schema's
+  # `@scanned_text_fields`): a ref is a free caller-supplied string that this tenant's whole
+  # channel can read back off `channel_claims`, so a credential pasted into one is exposed
+  # exactly as a credential in a post key would be.
+  #
+  # The objection this replaces was that rejecting a ref could refuse a claim whose matching
+  # POST already exists. It cannot: a post carrying a credential-shaped `key` is itself
+  # refused at write time by that same scan, so the post this would strand can never have
+  # been created. And a claim ALREADY in the table is untouched — `done/6` and `release/6`
+  # build a bare `Ecto.Changeset.change/2` and never run these validations, so an existing
+  # row stays completable.
   defp validate_no_secrets(changeset) do
-    Enum.reduce([:claimed_by_session, :claimed_by_host], changeset, &reject_secret/2)
+    Enum.reduce([:ref, :claimed_by_session, :claimed_by_host], changeset, &reject_secret/2)
   end
 
   defp reject_secret(field, changeset) do

@@ -683,6 +683,21 @@ defmodule Loopctl.CoordinationClaimTest do
       refute cs.valid?
       assert %{claimed_by_session: _} = errors_on(cs)
     end
+
+    test "a credential in the ref itself is refused, exactly as one in a post key is" do
+      # `ref` is caller-supplied free text that GET /channel/claims echoes to every peer
+      # session in the tenant, so it carries the same exposure `ChannelPost`'s `key` does —
+      # and `key` is in that schema's @scanned_text_fields. A claim ALREADY in the table is
+      # unaffected: done/6 and release/6 build a bare Ecto.Changeset.change/2 and never run
+      # this validation, so no live row is stranded by adding the scan.
+      cs =
+        discriminator_changeset(%{
+          ref: "handoff:sk-ant-api03-" <> String.duplicate("a", 40)
+        })
+
+      refute cs.valid?
+      assert %{ref: _} = errors_on(cs)
+    end
   end
 
   defp discriminator_changeset(attrs) do
