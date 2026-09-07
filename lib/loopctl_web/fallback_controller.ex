@@ -167,6 +167,27 @@ defmodule LoopctlWeb.FallbackController do
     })
   end
 
+  # Issue #779. The caller IS the claim's agent in the owning tenant and project — the
+  # owner fetch already proved that — but the row was stamped by a DIFFERENT session.
+  # This guard is ADVISORY: it stops a peer session accidentally ending work someone
+  # else is doing (the `release` in KB 07f5e839 deleted a live claim), and it stops
+  # nothing a caller intends, because `force: true` clears it and `session_id` is
+  # client-supplied. The message names the override, because a session that crashed and
+  # relaunched carries a NEW session id and must be able to finish its own work without
+  # waiting out the lease.
+  def call(conn, {:error, :claim_session_mismatch}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "claim_session_mismatch",
+        message:
+          "This claim was made by a DIFFERENT session on your agent key. Check GET /api/v1/channel/claims?ref=... — claimed_by_session and claimed_by_host say whose it is. If a peer session is still working it, leave it alone. If it is your own work from a session that has since restarted, retry with force: true."
+      }
+    })
+  end
+
   def call(conn, {:error, {:invalid_transition, ctx}}) do
     current_agent = ctx |> Map.get(:current_agent_status) |> to_string()
     current_verified = ctx |> Map.get(:current_verified_status) |> to_string()

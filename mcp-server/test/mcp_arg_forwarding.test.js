@@ -377,6 +377,103 @@ describe("US-40.B1: channel_claim / channel_release / channel_done wiring", () =
     );
   });
 
+  // Issue #779: claimant_agent_id cannot tell two sessions apart when the whole fleet
+  // authenticates as one agent, so the proxy stamps the per-session discriminator on
+  // every claim write and sends it on the read. These are the four call sites; a
+  // missing one puts the fleet straight back in the incident.
+  test("channelClaim stamps the per-session discriminator and the host (#779)", () => {
+    const src = functionSource("channelClaim");
+    assert.match(
+      src,
+      /payload\.session_id = CHANNEL_SESSION_ID;/,
+      "channelClaim must stamp CHANNEL_SESSION_ID on the claim",
+    );
+    assert.match(
+      src,
+      /payload\.host = os\.hostname\(\);/,
+      "channelClaim must stamp the host on the claim",
+    );
+  });
+
+  test("channelClaims sends session_id so the server can answer same_session (#779)", () => {
+    assert.match(
+      functionSource("channelClaims"),
+      /params\.set\("session_id", CHANNEL_SESSION_ID\);/,
+      "channelClaims must send CHANNEL_SESSION_ID so rows carry same_session",
+    );
+  });
+
+  test("channelDone and channelRelease send session_id and forward force (#779)", () => {
+    for (const fn of ["channelDone", "channelRelease"]) {
+      const src = functionSource(fn);
+      assert.match(
+        src,
+        /session_id: CHANNEL_SESSION_ID/,
+        `${fn} must send CHANNEL_SESSION_ID so the server can refuse a peer session's claim`,
+      );
+      assert.match(
+        src,
+        /if \(force\) payload\.force = true;/,
+        `${fn} must forward force so a restarted session can finish its own work`,
+      );
+    }
+  });
+
+  test("channel_claim tells the agent to read already_held before starting work (#779)", () => {
+    const claimTool = INDEX_SRC.slice(INDEX_SRC.indexOf('name: "channel_claim",'));
+    const description = claimTool.slice(0, claimTool.indexOf("inputSchema"));
+    assert.match(
+      description,
+      /already_held/,
+      "channel_claim must name the already_held marker",
+    );
+    assert.match(
+      description,
+      /same_session/,
+      "channel_claim must name same_session, the server's own ownership comparison",
+    );
+  });
+
+  test("channel_done and channel_release document the session refusal AND that it is advisory (#779)", () => {
+    for (const tool of ["channel_done", "channel_release"]) {
+      const start = INDEX_SRC.indexOf(`name: "${tool}",`);
+      assert.ok(start > -1, `${tool} must be declared`);
+      const description = INDEX_SRC.slice(start, INDEX_SRC.indexOf("inputSchema", start));
+      assert.match(
+        description,
+        /claim_session_mismatch/,
+        `${tool} must name the 409 it can now return`,
+      );
+      // The warning must NOT read as an authorization boundary: session_id is
+      // client-supplied and force clears the refusal, so a tool description that
+      // promises isolation is worse than none.
+      assert.match(
+        description,
+        /ADVISORY/,
+        `${tool} must say the session refusal is advisory, not authorization`,
+      );
+      assert.match(description, /force/, `${tool} must name the force override`);
+    }
+  });
+
+  test("channel_claims no longer says two sessions can done/release each other's claims (#779)", () => {
+    // A warning that outlives its defect is itself a defect: the guard now refuses
+    // that call, so the old sentence would send an agent looking for a hazard the
+    // server just closed — and hide the same_session field that replaced it.
+    const start = INDEX_SRC.indexOf('name: "channel_claims",');
+    const description = INDEX_SRC.slice(start, INDEX_SRC.indexOf("inputSchema", start));
+    assert.doesNotMatch(
+      description,
+      /can channel_done or channel_release each other's claims/,
+      "channel_claims must not still promise the unguarded cross-session release",
+    );
+    assert.match(
+      description,
+      /same_session/,
+      "channel_claims must document the same_session flag that replaced it",
+    );
+  });
+
   test("the claim dispatch cases call the right functions", () => {
     assert.match(
       INDEX_SRC,

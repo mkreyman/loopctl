@@ -25,8 +25,28 @@ defmodule Loopctl.Coordination.ChannelClaim do
   `tenant_id`, `project_id`, `claimant_agent_id`, `claimed_at`, and
   `lease_expires_at` are set programmatically on the struct in `Loopctl.Coordination`
   — NEVER via `cast/3` (mirroring `ChannelPost`). `claimant_agent_id` is the verified
-  key identity, so a caller can never claim as another agent. Only `ref` (and,
-  derived server-side, the lease) is caller-influenced.
+  key identity, so a caller can never claim as another agent. `ref`, `claimed_by_session`
+  and `claimed_by_host` (and, derived server-side, the lease) are the caller-influenced
+  fields.
+
+  ## The session discriminator is ADVISORY (issue #779)
+
+  `claimed_by_session` and `claimed_by_host` are the SAME CLASS as
+  `ChannelPost`'s `session_id`/`host` and `to_host`/`to_capability`: optional,
+  client-supplied, informational and SPOOFABLE. They exist because
+  `claimant_agent_id` cannot tell two sessions apart on a fleet where every session
+  authenticates as one agent — so a peer's live claim reads back as the caller's own
+  (KB `8d9156ca`), and `release` deletes it (KB `07f5e839`).
+
+  They are read for exactly two things: REPORTING ownership (`already_held`,
+  `same_session`), and refusing an ACCIDENTAL cross-session `done`/`release`, which a
+  caller may always override with `force`. They are NEVER an authorization boundary —
+  a spoofed session id can neither steal a claim nor free one that
+  `(tenant, project, claimant_agent_id, ref)` does not already admit the caller to.
+  Tenant + project membership + the claimant agent stay the enforced boundary.
+
+  NULL means UNDISCRIMINABLE, not "no session": a pre-#779 row, or a client that sends
+  none, falls back to the agent-scoped behaviour rather than being locked out.
 
   ## Isolation
 
@@ -38,12 +58,19 @@ defmodule Loopctl.Coordination.ChannelClaim do
 
   use Loopctl.Schema
 
+  alias Loopctl.Security.SecretDenylist
+
   @type t :: %__MODULE__{}
 
   # A ref names an out-of-band unit of work ("handoff:repo#812"), not a row. Bound
   # its byte length like ChannelPost's other free text fields so it cannot be an
   # index-bloat / amplification vector.
   @ref_max_length 512
+
+  # Advisory session/host discriminator bounds — the SAME caps `ChannelPost` uses for
+  # its `session_id`/`host`, because these carry the same values from the same proxy.
+  @session_max_length 200
+  @host_max_length 255
 
   @derive {Jason.Encoder,
            only: [
@@ -55,6 +82,8 @@ defmodule Loopctl.Coordination.ChannelClaim do
              :claimed_at,
              :lease_expires_at,
              :done_at,
+             :claimed_by_session,
+             :claimed_by_host,
              :inserted_at,
              :updated_at
            ]}
@@ -68,20 +97,31 @@ defmodule Loopctl.Coordination.ChannelClaim do
     field :lease_expires_at, :utc_datetime_usec
     field :done_at, :utc_datetime_usec
 
+    # Advisory, client-supplied, spoofable — see the moduledoc. Never authorization.
+    field :claimed_by_session, :string
+    field :claimed_by_host, :string
+
     timestamps()
   end
 
   @doc """
   Changeset for creating a claim.
 
-  Casts ONLY `:ref` (the caller-supplied anchor); `tenant_id`, `project_id`,
+  Casts `:ref` (the caller-supplied anchor) and the two ADVISORY discriminator
+  fields `:claimed_by_session` / `:claimed_by_host`; `tenant_id`, `project_id`,
   `claimant_agent_id`, `claimed_at`, and `lease_expires_at` are set programmatically
   on the struct by the context and are validated here for presence only — they are
   never castable (mirrors `ChannelPost.create_changeset/2`'s trust boundary).
 
   A blank (`""`/whitespace-only) `ref` is normalised to `nil` so `validate_required`
   rejects it (an empty anchor must never occupy the `(tenant, project, ref)` slot).
-  Enforces the `ref` byte cap. Declares the `channel_claims_ref_uidx`
+  Enforces the `ref` byte cap, the discriminator byte caps
+  (`claimed_by_session` <= #{@session_max_length} bytes, `claimed_by_host` <=
+  #{@host_max_length} bytes), rejects NUL bytes in all three (Postgres cannot store
+  one in `text`, so the guard turns a raw 500 into a 422), and runs the shared secret
+  denylist over the two discriminator fields — they are echoed to every peer session
+  reading `GET /channel/claims`, so a credential stuffed into either must be refused
+  rather than published onto the shared bus. Declares the `channel_claims_ref_uidx`
   `unique_constraint` (matching the DB index name) so a concurrent duplicate claim
   surfaces as `{:error, changeset}` — which the context maps to
   `{:error, :already_claimed}` (409) — rather than a raw `Ecto.ConstraintError`
@@ -90,8 +130,8 @@ defmodule Loopctl.Coordination.ChannelClaim do
   @spec create_changeset(t(), map()) :: Ecto.Changeset.t()
   def create_changeset(claim, attrs) do
     claim
-    |> cast(attrs, [:ref])
-    |> normalize_blank_ref()
+    |> cast(attrs, [:ref, :claimed_by_session, :claimed_by_host])
+    |> normalize_blank([:ref, :claimed_by_session, :claimed_by_host])
     |> validate_required([
       :tenant_id,
       :project_id,
@@ -101,7 +141,10 @@ defmodule Loopctl.Coordination.ChannelClaim do
       :lease_expires_at
     ])
     |> validate_length(:ref, max: @ref_max_length, count: :bytes)
+    |> validate_length(:claimed_by_session, max: @session_max_length, count: :bytes)
+    |> validate_length(:claimed_by_host, max: @host_max_length, count: :bytes)
     |> validate_no_null_bytes()
+    |> validate_no_secrets()
     |> foreign_key_constraint(:tenant_id)
     |> foreign_key_constraint(:project_id)
     |> foreign_key_constraint(:claimant_agent_id)
@@ -115,12 +158,26 @@ defmodule Loopctl.Coordination.ChannelClaim do
   @spec ref_max_length() :: pos_integer()
   def ref_max_length, do: @ref_max_length
 
-  # A blank/whitespace ref means "no anchor" — normalise to nil so validate_required
-  # rejects it rather than reserving the slot with an empty string.
-  defp normalize_blank_ref(changeset) do
-    case get_change(changeset, :ref) do
+  @doc "Maximum allowed `claimed_by_session` length in bytes."
+  @spec session_max_length() :: pos_integer()
+  def session_max_length, do: @session_max_length
+
+  @doc "Maximum allowed `claimed_by_host` length in bytes."
+  @spec host_max_length() :: pos_integer()
+  def host_max_length, do: @host_max_length
+
+  # A blank/whitespace value means "absent" — normalise to nil. For `ref` that makes
+  # `validate_required` reject it rather than reserving the slot with an empty string;
+  # for the two discriminators it means UNDISCRIMINABLE rather than a session literally
+  # named `""`, which would otherwise match no live session and lock done/release out.
+  defp normalize_blank(changeset, fields) do
+    Enum.reduce(fields, changeset, &blank_change_to_nil/2)
+  end
+
+  defp blank_change_to_nil(field, changeset) do
+    case get_change(changeset, field) do
       value when is_binary(value) ->
-        if String.trim(value) == "", do: put_change(changeset, :ref, nil), else: changeset
+        if String.trim(value) == "", do: put_change(changeset, field, nil), else: changeset
 
       _ ->
         changeset
@@ -131,16 +188,37 @@ defmodule Loopctl.Coordination.ChannelClaim do
   # insert. JSON permits it and Elixir strings accept it, so reject it in the
   # changeset — the caller learns it did not land as a 422.
   defp validate_no_null_bytes(changeset) do
-    case get_field(changeset, :ref) do
+    Enum.reduce([:ref, :claimed_by_session, :claimed_by_host], changeset, &reject_null_bytes/2)
+  end
+
+  defp reject_null_bytes(field, changeset) do
+    case get_field(changeset, field) do
       value when is_binary(value) ->
-        if String.contains?(value, <<0>>) do
-          add_error(changeset, :ref, "must not contain NUL bytes")
-        else
-          changeset
-        end
+        if String.contains?(value, <<0>>),
+          do: add_error(changeset, field, "must not contain NUL bytes"),
+          else: changeset
 
       _ ->
         changeset
+    end
+  end
+
+  # The two discriminators are client-supplied free text that `GET /channel/claims`
+  # echoes to every peer session in the tenant, exactly like `ChannelPost`'s
+  # `session_id`/`host` — so they get the same write-time credential gate. The scan is
+  # bounded by the byte caps validated above, so no separate slice cap is needed here.
+  # `ref` is deliberately NOT scanned: it is a pre-existing field with live rows, and a
+  # write-time rejection there would refuse a claim on a ref whose matching POST (whose
+  # `key` IS scanned) already exists.
+  defp validate_no_secrets(changeset) do
+    Enum.reduce([:claimed_by_session, :claimed_by_host], changeset, &reject_secret/2)
+  end
+
+  defp reject_secret(field, changeset) do
+    if changeset |> get_field(field) |> SecretDenylist.contains_secret?() do
+      add_error(changeset, field, "must not contain a credential")
+    else
+      changeset
     end
   end
 end

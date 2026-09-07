@@ -152,6 +152,259 @@ defmodule LoopctlWeb.ChannelClaimControllerTest do
     end
   end
 
+  describe "the session discriminator over HTTP (issue #779)" do
+    test "a fresh claim is 201 created; the SAME session re-claiming is 200 already_held with the ORIGINAL claimed_at" do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = member_agent_key(tenant, project)
+
+      first =
+        raw
+        |> post_json(@claim_path, %{
+          project_id: project.id,
+          ref: "handoff:repo#488",
+          session_id: "session-minis",
+          host: "minis"
+        })
+        |> json_response(201)
+
+      assert first["created"] == true
+      assert first["already_held"] == false
+      assert first["same_session"] == true
+      assert first["claim"]["claimed_by_session"] == "session-minis"
+      assert first["claim"]["claimed_by_host"] == "minis"
+
+      again =
+        raw
+        |> post_json(@claim_path, %{
+          project_id: project.id,
+          ref: "handoff:repo#488",
+          session_id: "session-minis"
+        })
+        |> json_response(200)
+
+      assert again["created"] == false
+      assert again["already_held"] == true
+      assert again["same_session"] == true
+      assert again["claim"]["claimed_at"] == first["claim"]["claimed_at"]
+    end
+
+    # THE INCIDENT, end to end (KB b447b16b): one agent key, two machines.
+    test "a PEER SESSION's re-claim is 200 already_held with same_session false and the peer's stamp" do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = member_agent_key(tenant, project)
+
+      first =
+        raw
+        |> post_json(@claim_path, %{
+          project_id: project.id,
+          ref: "handoff:repo#488",
+          session_id: "session-minis",
+          host: "minis"
+        })
+        |> json_response(201)
+
+      peer =
+        raw
+        |> post_json(@claim_path, %{
+          project_id: project.id,
+          ref: "handoff:repo#488",
+          session_id: "session-mac-mini",
+          host: "mac-mini"
+        })
+        |> json_response(200)
+
+      assert peer["already_held"] == true
+      assert peer["created"] == false
+      assert peer["same_session"] == false
+      assert peer["claim"]["claimed_by_session"] == "session-minis"
+      assert peer["claim"]["claimed_by_host"] == "minis"
+      assert peer["claim"]["claimed_at"] == first["claim"]["claimed_at"]
+    end
+
+    test "done and release from a PEER SESSION are 409 claim_session_mismatch and change nothing" do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = member_agent_key(tenant, project)
+
+      assert raw
+             |> post_json(@claim_path, %{
+               project_id: project.id,
+               ref: "r",
+               session_id: "session-a"
+             })
+             |> json_response(201)
+
+      for path <- [@done_path, @release_path] do
+        body =
+          raw
+          |> post_json(path, %{project_id: project.id, ref: "r", session_id: "session-b"})
+          |> json_response(409)
+
+        assert body["error"]["code"] == "claim_session_mismatch"
+      end
+
+      # Still open, still there — the release did not delete the peer's live claim.
+      assert [%{"done" => false, "claimed_by_session" => "session-a"}] =
+               raw
+               |> get_json(@claim_path, %{project_id: project.id, ref: "r"})
+               |> json_response(200)
+               |> Map.fetch!("claims")
+    end
+
+    test "force: true lets a restarted session finish its own work in one call" do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = member_agent_key(tenant, project)
+
+      assert raw
+             |> post_json(@claim_path, %{
+               project_id: project.id,
+               ref: "r",
+               session_id: "session-before-crash"
+             })
+             |> json_response(201)
+
+      body =
+        raw
+        |> post_json(@done_path, %{
+          project_id: project.id,
+          ref: "r",
+          session_id: "session-after-relaunch",
+          force: true
+        })
+        |> json_response(200)
+
+      assert body["claim"]["done_at"]
+    end
+
+    test "force is only the boolean true or the string 'true' — 'false' does NOT bypass the guard" do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = member_agent_key(tenant, project)
+
+      assert raw
+             |> post_json(@claim_path, %{
+               project_id: project.id,
+               ref: "r",
+               session_id: "session-a"
+             })
+             |> json_response(201)
+
+      for force <- ["false", "0", "no"] do
+        body =
+          raw
+          |> post_json(@done_path, %{
+            project_id: project.id,
+            ref: "r",
+            session_id: "session-b",
+            force: force
+          })
+          |> json_response(409)
+
+        assert body["error"]["code"] == "claim_session_mismatch"
+      end
+    end
+
+    test "a cross-tenant claim still 404s — the session 409 is never an existence oracle" do
+      tenant_a = fixture(:tenant, %{trust_tier: :agent_rooted})
+      project_a = fixture(:project, %{tenant_id: tenant_a.id})
+      {raw_a, _k, _a} = member_agent_key(tenant_a, project_a)
+
+      tenant_b = fixture(:tenant, %{trust_tier: :agent_rooted})
+      project_b = fixture(:project, %{tenant_id: tenant_b.id})
+      {raw_b, _k2, _b} = member_agent_key(tenant_b, project_b)
+
+      assert raw_b
+             |> post_json(@claim_path, %{
+               project_id: project_b.id,
+               ref: "handoff:shared#1",
+               session_id: "session-b"
+             })
+             |> json_response(201)
+
+      assert raw_a
+             |> post_json(@release_path, %{
+               project_id: project_b.id,
+               ref: "handoff:shared#1",
+               session_id: "session-b"
+             })
+             |> json_response(404)
+    end
+
+    test "releasing an already-DONE claim is 409 already_claimed, not a 500" do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = member_agent_key(tenant, project)
+
+      assert raw
+             |> post_json(@claim_path, %{
+               project_id: project.id,
+               ref: "r",
+               session_id: "session-a"
+             })
+             |> json_response(201)
+
+      assert raw
+             |> post_json(@done_path, %{project_id: project.id, ref: "r", session_id: "session-a"})
+             |> json_response(200)
+
+      body =
+        raw
+        |> post_json(@release_path, %{
+          project_id: project.id,
+          ref: "r",
+          session_id: "session-a"
+        })
+        |> json_response(409)
+
+      assert body["error"]["code"] == "already_claimed"
+    end
+
+    test "the read reports same_session, and null when either side is unstamped" do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = member_agent_key(tenant, project)
+
+      assert raw
+             |> post_json(@claim_path, %{
+               project_id: project.id,
+               ref: "r",
+               session_id: "session-a",
+               host: "minis"
+             })
+             |> json_response(201)
+
+      assert [%{"same_session" => true, "claimed_by_host" => "minis"}] =
+               raw
+               |> get_json(@claim_path, %{
+                 project_id: project.id,
+                 ref: "r",
+                 session_id: "session-a"
+               })
+               |> json_response(200)
+               |> Map.fetch!("claims")
+
+      assert [%{"same_session" => false}] =
+               raw
+               |> get_json(@claim_path, %{
+                 project_id: project.id,
+                 ref: "r",
+                 session_id: "session-b"
+               })
+               |> json_response(200)
+               |> Map.fetch!("claims")
+
+      # No session on the request: UNDISCRIMINABLE, reported as null rather than false.
+      assert [%{"same_session" => nil}] =
+               raw
+               |> get_json(@claim_path, %{project_id: project.id, ref: "r"})
+               |> json_response(200)
+               |> Map.fetch!("claims")
+    end
+  end
+
   describe "agent identity requirement" do
     test "a key with no agent identity -> 403 agent_identity_required" do
       tenant = fixture(:tenant, %{trust_tier: :agent_rooted})

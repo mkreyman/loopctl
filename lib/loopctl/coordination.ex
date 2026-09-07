@@ -1556,6 +1556,9 @@ defmodule Loopctl.Coordination do
       (default-deny) when absent.
     * `:lease_seconds` — the claim's lease length; clamped to
       `[1, #{@max_lease_seconds}]`, default `#{@default_lease_seconds}`.
+    * `:session_id` / `:host` — the ADVISORY, client-supplied, SPOOFABLE session and
+      host discriminator stamped on the row (issue #779). Never authorization; see
+      `ChannelClaim`'s moduledoc.
     * `:audit` — the actor-context keyword list from
       `LoopctlWeb.AuditContext.from_conn/1`, written into the audit entry.
 
@@ -1576,16 +1579,26 @@ defmodule Loopctl.Coordination do
   The insert and its audit entry run in ONE `AdminRepo.transaction` (Multi),
   mirroring `run_post/3`, so a claim is never recorded without an accountable trail.
 
-  ## Idempotent owner re-claim
+  ## Idempotent owner re-claim — and why it is a THREE-tuple (issue #779)
 
   INSERT-to-claim is exactly-once, but the OWNER re-claiming its OWN still-active
-  (`done_at IS NULL`) ref is IDEMPOTENT — it returns `{:ok, existing}`, not a 409.
+  (`done_at IS NULL`) ref is IDEMPOTENT — it returns the existing row, not a 409.
   This closes a dropped-handoff window: if the winning insert commits but the caller
   never sees the 201 (a lost HTTP response / MCP timeout), the retry must NOT be told
   "another agent owns this, move on" — the caller IS the owner and would otherwise
   abandon a handoff it holds until the lease expires. A genuine racing loser (a peer
   owns the slot), and the owner re-claiming its OWN already-DONE claim, still get
   `{:error, :already_claimed}`.
+
+  A fresh claim returns `{:ok, claim}`; an idempotent re-claim returns
+  `{:ok, existing, :already_held}`. The marker is the whole point: on a fleet where
+  every session authenticates as ONE agent, "owner" is coarser than "the session
+  calling", so the idempotent branch is ALSO what a peer session's live claim comes
+  back as. Before #779 both branches were a bare `{:ok, claim}` and two machines each
+  read "one claim — mine" and shipped duplicate PRs (KB `b447b16b`). The existing row
+  carries its ORIGINAL `claimed_at` and `claimed_by_session`, so a caller can see the
+  claim is minutes old and belongs to another session. The marker is a distinct TUPLE
+  rather than a field so no caller can miss it by not looking.
 
   ## The 409 is split by CAUSE (#707 follow-up)
 
@@ -1606,7 +1619,8 @@ defmodule Loopctl.Coordination do
     * `:claim_budget_exhausted` — the caller is at `max_concurrent_open_claims/0`. A
       limit on the CALLER, saying nothing about the ref, which may well be free.
 
-  Returns `{:ok, %ChannelClaim{}}` (fresh claim OR idempotent owner re-claim),
+  Returns `{:ok, %ChannelClaim{}}` (a FRESH claim),
+  `{:ok, %ChannelClaim{}, :already_held}` (an idempotent owner re-claim),
   one of the four 409 reasons above,
   `{:error, :not_found}` (missing/cross-tenant/cross-project),
   `{:error, :agent_not_found}` (foreign-tenant server-stamped agent), or
@@ -1614,6 +1628,7 @@ defmodule Loopctl.Coordination do
   """
   @spec claim(Ecto.UUID.t(), Ecto.UUID.t(), term(), term(), keyword()) ::
           {:ok, ChannelClaim.t()}
+          | {:ok, ChannelClaim.t(), :already_held}
           | {:error, :already_claimed}
           | {:error, :claim_lease_expired}
           | {:error, :ref_superseded}
@@ -1636,7 +1651,11 @@ defmodule Loopctl.Coordination do
         claimed_at: now,
         lease_expires_at: DateTime.add(now, lease_seconds, :second)
       }
-      |> ChannelClaim.create_changeset(%{ref: ref})
+      |> ChannelClaim.create_changeset(%{
+        ref: ref,
+        claimed_by_session: Keyword.get(opts, :session_id),
+        claimed_by_host: Keyword.get(opts, :host)
+      })
 
     with {:ok, _project} <- Projects.get_project(tenant_id, project_id),
          {:ok, _agent} <- agent_owned(tenant_id, agent_id),
@@ -1665,16 +1684,37 @@ defmodule Loopctl.Coordination do
 
   The update and its audit entry run in ONE `AdminRepo.transaction` (Multi).
 
-  Returns `{:ok, %ChannelClaim{}}` (the updated claim), `{:error, :not_found}`, or
+  ## The session guard (issue #779)
+
+  `opts` may carry `:session_id` (the caller's ADVISORY discriminator) and
+  `:force`. A claim stamped with a DIFFERENT `claimed_by_session` is refused with
+  `{:error, :claim_session_mismatch}` unless `force: true` — see
+  `check_claim_session/3` for what that does and, more importantly, does not enforce.
+
+  Returns `{:ok, %ChannelClaim{}}` (the updated claim), `{:error, :not_found}`,
+  `{:error, :claim_session_mismatch}`, or
   `{:error, %Ecto.Changeset{}}` (the `:audit` Multi step's changeset insert failed —
   see `run_claim_lifecycle/7`).
   """
-  @spec done(Ecto.UUID.t(), Ecto.UUID.t(), term(), term(), keyword()) ::
-          {:ok, ChannelClaim.t()} | {:error, :not_found} | {:error, Ecto.Changeset.t()}
-  def done(tenant_id, agent_id, project_id, ref, audit \\ []) do
+  @spec done(Ecto.UUID.t(), Ecto.UUID.t(), term(), term(), keyword(), keyword()) ::
+          {:ok, ChannelClaim.t()}
+          | {:error, :not_found}
+          | {:error, :claim_session_mismatch}
+          | {:error, Ecto.Changeset.t()}
+  def done(tenant_id, agent_id, project_id, ref, audit \\ [], opts \\ []) do
     now = DateTime.utc_now()
 
-    case fetch_owned_claim(tenant_id, agent_id, project_id, ref) do
+    with %ChannelClaim{} = owned <- fetch_owned_claim(tenant_id, agent_id, project_id, ref),
+         :ok <- check_claim_session(owned, opts) do
+      finish_done(tenant_id, project_id, agent_id, owned, now, audit)
+    else
+      nil -> {:error, :not_found}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp finish_done(tenant_id, project_id, agent_id, claim, now, audit) do
+    case claim do
       %ChannelClaim{lease_expires_at: lease, done_at: nil} = claim ->
         if DateTime.compare(lease, now) == :gt do
           changeset = Ecto.Changeset.change(claim, done_at: now)
@@ -1689,9 +1729,6 @@ defmodule Loopctl.Coordination do
         # Already done — idempotent or a race. Treat as not_found to avoid leaking
         # claim state.
         {:error, :not_found}
-
-      nil ->
-        {:error, :not_found}
     end
   end
 
@@ -1705,18 +1742,37 @@ defmodule Loopctl.Coordination do
   `:role` needed). The delete and its audit entry run in ONE
   `AdminRepo.transaction` (Multi).
 
+  ## The session guard (issue #779)
+
+  Same as `done/6`: `opts` may carry `:session_id` and `:force`, and a claim stamped
+  with a DIFFERENT session is `{:error, :claim_session_mismatch}` unless forced. This
+  is the half that mattered most — an unguarded `release` DELETES a peer session's
+  live claim and the bus reopens a handoff someone is actively working (KB `07f5e839`).
+
   Returns `{:ok, %ChannelClaim{}}` (the deleted claim), `{:error, :not_found}`,
-  `{:error, :already_claimed}` (the claim is already DONE — terminal), or
+  `{:error, :already_claimed}` (the claim is already DONE — terminal),
+  `{:error, :claim_session_mismatch}`, or
   `{:error, %Ecto.Changeset{}}` (the `:audit` Multi step's changeset insert failed —
   see `run_claim_lifecycle/7`).
   """
-  @spec release(Ecto.UUID.t(), Ecto.UUID.t(), term(), term(), keyword()) ::
+  @spec release(Ecto.UUID.t(), Ecto.UUID.t(), term(), term(), keyword(), keyword()) ::
           {:ok, ChannelClaim.t()}
           | {:error, :not_found}
           | {:error, :already_claimed}
+          | {:error, :claim_session_mismatch}
           | {:error, Ecto.Changeset.t()}
-  def release(tenant_id, agent_id, project_id, ref, audit \\ []) do
-    case fetch_owned_claim(tenant_id, agent_id, project_id, ref) do
+  def release(tenant_id, agent_id, project_id, ref, audit \\ [], opts \\ []) do
+    with %ChannelClaim{} = owned <- fetch_owned_claim(tenant_id, agent_id, project_id, ref),
+         :ok <- check_claim_session(owned, opts) do
+      finish_release(tenant_id, project_id, agent_id, owned, audit)
+    else
+      nil -> {:error, :not_found}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp finish_release(tenant_id, project_id, agent_id, claim, audit) do
+    case claim do
       %ChannelClaim{done_at: nil} = claim ->
         run_claim_lifecycle(
           tenant_id,
@@ -1730,11 +1786,62 @@ defmodule Loopctl.Coordination do
 
       %ChannelClaim{} ->
         {:error, :already_claimed}
-
-      nil ->
-        {:error, :not_found}
     end
   end
+
+  @doc """
+  Is this caller's session allowed to end the claim it already owns AS AN AGENT?
+
+  The guard `done/6` and `release/6` run after the owner fetch has already proved the
+  caller is the claim's `claimant_agent_id` in this tenant and project (issue #779).
+
+  ## What it enforces, and what it deliberately does not
+
+  `claimed_by_session` is ADVISORY and SPOOFABLE — the same class as
+  `channel_posts.to_host`. This guard therefore stops an ACCIDENT, never an attack:
+  a session that wants past it may pass `force: true`, and one that wants to lie may
+  send the peer's session id. It buys nothing against a hostile caller AND IS NOT
+  MEANT TO — tenant + project membership + `claimant_agent_id` are the real boundary,
+  and every one of them has already been checked before this runs. What it buys is the
+  recorded failure: a peer session calling `release` to tidy up a probe deleted a live
+  claim with no signal to either party (KB `07f5e839`).
+
+  It is also why the refusal must stay CHEAP to clear. KB `9c3e14a1` warns against
+  tightening claim ownership to a session dimension, because a session that crashes and
+  relaunches gets a NEW session id and would be locked out of completing its own work
+  for the rest of a 24h lease. `force: true` is that warning's answer: the restarted
+  session pays one extra call and an explicit intent, instead of waiting out the lease.
+
+  Order of the three clauses is the whole contract:
+
+    * a claim with NO stamped session is UNDISCRIMINABLE (a pre-#779 row, a curl
+      caller, an older MCP server) and passes — never lock out a claim the server
+      cannot reason about;
+    * `force: true` passes, deliberately and auditably;
+    * an equal session passes; anything else — including a caller that sent NO session
+      against a row that HAS one — is `{:error, :claim_session_mismatch}`. Absent is
+      treated as different because the alternative is that any client which simply
+      omits the field walks straight past the guard, which is the pre-#779 behaviour
+      wearing a new field.
+  """
+  @spec check_claim_session(ChannelClaim.t(), keyword()) ::
+          :ok | {:error, :claim_session_mismatch}
+  def check_claim_session(claim, opts) do
+    check_claim_session(claim, Keyword.get(opts, :session_id), Keyword.get(opts, :force, false))
+  end
+
+  @doc "Arity-3 form of `check_claim_session/2` — the raw (claim, session, force) decision."
+  @spec check_claim_session(ChannelClaim.t(), term(), term()) ::
+          :ok | {:error, :claim_session_mismatch}
+  def check_claim_session(%ChannelClaim{claimed_by_session: nil}, _session, _force), do: :ok
+  def check_claim_session(%ChannelClaim{}, _session, true), do: :ok
+
+  def check_claim_session(%ChannelClaim{claimed_by_session: stamped}, session, _force)
+      when is_binary(stamped) and is_binary(session) and stamped == session,
+      do: :ok
+
+  def check_claim_session(%ChannelClaim{}, _session, _force),
+    do: {:error, :claim_session_mismatch}
 
   @doc """
   The channel's UNSWEPT claim rows — the NON-DESTRUCTIVE way to ask "is this ref
@@ -1747,11 +1854,15 @@ defmodule Loopctl.Coordination do
   taken. That probe is destructive on a shared-agent fleet. `claim/5` is IDEMPOTENT
   for the owning AGENT, and every session on this fleet authenticates as the same
   `agent_id`, so a probe issued while a PEER SESSION holds the ref returns that peer's
-  claim as if it were the prober's own — and the release that tidies the probe up
-  DELETES IT. The peer keeps working a handoff the bus has already reopened, and a
-  second machine picks it up. That is not hypothetical: it is what #707 recorded.
+  claim as if it were the prober's own — and the release that tidied the probe up
+  DELETED IT. The peer kept working a handoff the bus had already reopened, and a
+  second machine picked it up. That is not hypothetical: it is what #707 recorded.
 
-  So: read with this, never by claiming.
+  Two of those three steps are now guarded (#779): the idempotent return is marked
+  `:already_held` and carries the holder's `claimed_by_session`, and `release/6` refuses
+  a claim stamped by another session unless forced. Neither makes the probe correct. The
+  claim is still a WRITE — it takes the ref when it is free, spends the caller's claim
+  budget, and its guards are advisory. So: read with this, never by claiming.
 
   ## The predicate is the CLAIM-side one: does a row still hold the slot
 
@@ -2009,7 +2120,10 @@ defmodule Loopctl.Coordination do
       %ChannelClaim{claimant_agent_id: ^agent_id, done_at: nil, lease_expires_at: lease} =
           existing ->
         if DateTime.compare(lease, now) == :gt do
-          {:ok, existing}
+          # NOT a bare {:ok, _}: this branch is ALSO what a peer session's live claim
+          # comes back as when the fleet shares one agent_id, so the caller must be
+          # told it did not create this row (#779).
+          {:ok, existing, :already_held}
         else
           {:error, :claim_lease_expired}
         end

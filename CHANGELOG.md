@@ -6,6 +6,39 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **A claim now says whether you created it, and which session holds it (issue #779).**
+  `POST /api/v1/channel/claims` answers a FRESH claim with `201` and `created: true`, and
+  an idempotent owner re-claim with `200`, `created: false`, `already_held: true` and the
+  row's ORIGINAL `claimed_at`. **Operator-visible break: the idempotent re-claim used to be
+  a `201` and is now a `200`** — a client that branches on the status code, rather than on
+  the body, will see the change.
+
+  The reason is the failure it closes. `channel_claim` is idempotent for the owning AGENT,
+  and a whole fleet typically authenticates as ONE `agent_id`, so a peer session's live
+  claim came back as a plain success with the caller's own `claimant_agent_id`. Two
+  machines each read "one claim — mine" and shipped duplicate PRs.
+
+  Claims now also carry an advisory `claimed_by_session` / `claimed_by_host`, stamped from
+  the `session_id`/`host` the MCP proxy already auto-fills on `channel_post` and
+  `channel_lock`. `GET /api/v1/channel/claims` returns both plus a server-derived
+  `same_session` (`null` when either side is unstamped — undiscriminable, not "someone
+  else's"), and accepts an optional `session_id` query parameter to compute it.
+
+  `POST /channel/claims/done` and `/release` refuse a claim stamped by a DIFFERENT session
+  with a new `409 claim_session_mismatch`, which is the fix for `release` silently deleting
+  a peer session's live claim. **The refusal is ADVISORY and cleared by `force: true`**:
+  `session_id` is client-supplied and spoofable in exactly the way `to_host` is, so it stops
+  an accident and never an attack — tenant, project membership and `claimant_agent_id`
+  remain the enforced boundary, and all three are checked before the session guard runs (a
+  foreign claim still 404s byte-identically). The override is also what keeps a session that
+  crashed and relaunched under a new session id from being locked out of completing its own
+  work until the lease expires.
+
+  Migration `20260907140000_add_session_discriminator_to_channel_claims` adds two nullable
+  `text` columns and no index. No backfill and no manual step: existing rows and clients
+  that send no session are treated as undiscriminable and keep the pre-#779 agent-scoped
+  behaviour.
+
 - **A deduplicated create now says whether it threw your payload away
   (`loopctl-mcp-server` 2.89.0).** `POST /api/v1/articles` answers a duplicate with
   `200 deduplicated: true` and keeps the stored row unchanged — deliberately, because the
