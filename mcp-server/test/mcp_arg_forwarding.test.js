@@ -413,8 +413,40 @@ describe("US-40.B1: channel_claim / channel_release / channel_done wiring", () =
       );
       assert.match(
         src,
-        /if \(force\) payload\.force = true;/,
+        /if \(force === true \|\| force === "true"\) payload\.force = true;/,
         `${fn} must forward force so a restarted session can finish its own work`,
+      );
+      // The dispatch does no inputSchema type validation, so a model emitting the
+      // string "false" reaches this line verbatim. A truthy test turns it into
+      // force: true and deletes the peer's live claim the server just refused to —
+      // the string cases the server is tested against would be unreachable.
+      assert.doesNotMatch(
+        src,
+        /if \(force\) payload\.force = true;/,
+        `${fn} must not coerce a truthy non-true force (e.g. the string "false") to true`,
+      );
+    }
+  });
+
+  test("only the boolean true and the string 'true' set force on the wire (#779)", () => {
+    // Behavioural, on the SHIPPED predicate: lifted verbatim out of index.js by the
+    // same slice the assertions above pin, so it cannot drift from what runs.
+    const line = functionSource("channelDone").match(
+      /if \((force === .*?)\) payload\.force = true;/,
+    );
+    assert.ok(line, "channelDone must carry a force predicate");
+    // eslint-disable-next-line no-new-func
+    const accepts = new Function("force", `return !!(${line[1]});`);
+
+    for (const value of [true, "true"]) {
+      assert.equal(accepts(value), true, `force ${JSON.stringify(value)} must set force`);
+    }
+
+    for (const value of ["false", "0", "no", false, undefined, null, 1, "TRUE"]) {
+      assert.equal(
+        accepts(value),
+        false,
+        `force ${JSON.stringify(value)} must NOT set force on the wire`,
       );
     }
   });

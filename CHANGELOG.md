@@ -32,7 +32,14 @@ All notable changes to loopctl are documented here.
   remain the enforced boundary, and all three are checked before the session guard runs (a
   foreign claim still 404s byte-identically). The override is also what keeps a session that
   crashed and relaunched under a new session id from being locked out of completing its own
-  work until the lease expires.
+  work until the lease expires. The guard applies ONLY to a claim that is still live: a DONE
+  or lease-expired row answers exactly as it did before (`404 not_found` /
+  `409 already_claimed`), because nobody is working it and `force` cannot clear a terminal
+  state. Every `done`/`release` audit entry now records `caller_session`,
+  `claimed_by_session` and `forced`, so a forced cross-session end is no longer
+  indistinguishable from the owner ending its own work, and a refusal, a forced override or
+  a pass on an unstamped row emits `[:loopctl, :coordination, :claim_session_guard]` with
+  the outcome — the refusal writes no audit row, so telemetry is the only signal there.
 
   Migration `20260907140000_add_session_discriminator_to_channel_claims` adds two nullable
   `text` columns and no index. No backfill and no manual step: existing rows and clients

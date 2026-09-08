@@ -14,6 +14,7 @@ defmodule Loopctl.CoordinationClaimTest do
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Coordination
   alias Loopctl.Coordination.ChannelClaim
+  alias Loopctl.Security.SecretDenylist
 
   # Make an agent a writable member of a project (US-40.D3 gate): assign it a story.
   defp make_member(tenant, project, agent_id) do
@@ -35,6 +36,24 @@ defmodule Loopctl.CoordinationClaimTest do
     agent_id = fixture(:agent, %{tenant_id: tenant.id}).id
     make_member(tenant, project, agent_id)
     %{tenant: tenant, project: project, agent_id: agent_id}
+  end
+
+  defp claim_audit_metadata(tenant_id, entity_id) do
+    AdminRepo.all(
+      from(a in AuditLog,
+        where: a.tenant_id == ^tenant_id and a.entity_type == "channel_claim",
+        where: a.entity_id == ^entity_id,
+        order_by: [asc: a.inserted_at],
+        select: a.metadata
+      )
+    )
+  end
+
+  # Age a live claim past its lease without waiting one out.
+  defp expire_claim(claim) do
+    claim
+    |> Ecto.Changeset.change(lease_expires_at: DateTime.add(DateTime.utc_now(), -60, :second))
+    |> AdminRepo.update!()
   end
 
   defp claim_audit_actions(tenant_id, entity_id) do
@@ -528,6 +547,124 @@ defmodule Loopctl.CoordinationClaimTest do
       assert done.done_at
     end
 
+    # The guard's whole value is the RECORDED failure — a forced override used to write
+    # an audit entry byte-identical to the owner ending its own work, so KB 07f5e839's
+    # incident stayed unattributable after the row was deleted.
+    test "a FORCED cross-session release is recorded as forced; a self-release is not" do
+      %{tenant: tenant, project: project, agent_id: agent} = setup_member()
+
+      for {ref, caller, opts, forced} <- [
+            {"forced", "session-b", [force: true], true},
+            {"own", "session-a", [], false}
+          ] do
+        assert {:ok, claim} =
+                 Coordination.claim(tenant.id, agent, project.id, ref,
+                   role: :agent,
+                   session_id: "session-a",
+                   audit: audit()
+                 )
+
+        # Passed in the AUDIT position on purpose: `audit` and `opts` are adjacent
+        # optional keyword lists, so a call written this way used to disable the guard
+        # AND write the two keys into the entry as actor context. They are routed by
+        # KEY now, so this shape must behave exactly like the arity-6 one.
+        assert {:ok, _} =
+                 Coordination.release(
+                   tenant.id,
+                   agent,
+                   project.id,
+                   ref,
+                   audit() ++ [session_id: caller] ++ opts
+                 )
+
+        assert [_claimed, released] = claim_audit_metadata(tenant.id, claim.id)
+        assert released["forced"] == forced
+        assert released["caller_session"] == caller
+        assert released["claimed_by_session"] == "session-a"
+      end
+    end
+
+    # A refusal writes NO audit row at all, so telemetry is the only way an operator
+    # sees a session probing its peers' claims.
+    test "the refusal fires the claim_session_guard telemetry, so it is not silent" do
+      %{tenant: tenant, project: project, agent_id: agent} = setup_member()
+      test_pid = self()
+      handler_id = "claim-session-guard-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :coordination, :claim_session_guard],
+        fn _event, measurements, meta, _cfg ->
+          if meta[:tenant_id] == tenant.id, do: send(test_pid, {:guard, measurements, meta})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      assert {:ok, _} =
+               Coordination.claim(tenant.id, agent, project.id, "r",
+                 role: :agent,
+                 session_id: "session-a",
+                 audit: audit()
+               )
+
+      assert {:error, :claim_session_mismatch} =
+               Coordination.release(tenant.id, agent, project.id, "r", audit(),
+                 session_id: "session-b"
+               )
+
+      assert_received {:guard, %{count: 1}, %{outcome: :mismatch}}
+
+      assert {:ok, _} =
+               Coordination.release(tenant.id, agent, project.id, "r", audit(),
+                 session_id: "session-b",
+                 force: true
+               )
+
+      assert_received {:guard, %{count: 1}, %{outcome: :forced}}
+    end
+
+    # A DONE or lease-expired row is nobody's live work. Guarding it answered a dead
+    # claim with a 409 telling the caller to retry with force — which cannot clear a
+    # terminal state — and made a DONE claim distinguishable from a nonexistent one.
+    test "a DONE or EXPIRED claim is decided BEFORE the guard, so it answers as it did" do
+      %{tenant: tenant, project: project, agent_id: agent} = setup_member()
+      peer = [session_id: "session-b"]
+
+      for ref <- ["done", "expired"] do
+        assert {:ok, claim} =
+                 Coordination.claim(tenant.id, agent, project.id, ref,
+                   role: :agent,
+                   session_id: "session-a",
+                   audit: audit()
+                 )
+
+        if ref == "done" do
+          assert {:ok, _} =
+                   Coordination.done(tenant.id, agent, project.id, ref, audit(),
+                     session_id: "session-a"
+                   )
+
+          # Terminal: not_found (the deliberate masking) and already_claimed, NOT a 409
+          # telling a caller to retry with a force that cannot clear a terminal state.
+          assert {:error, :not_found} =
+                   Coordination.done(tenant.id, agent, project.id, ref, audit(), peer)
+
+          assert {:error, :already_claimed} =
+                   Coordination.release(tenant.id, agent, project.id, ref, audit(), peer)
+        else
+          # Dead lease: nobody is working it, so any session may free the slot early.
+          expire_claim(claim)
+
+          assert {:ok, _} =
+                   Coordination.release(tenant.id, agent, project.id, ref, audit(), peer)
+
+          assert is_nil(AdminRepo.get(ChannelClaim, claim.id))
+        end
+      end
+    end
+
     test "a claim with NO stamped session is UNDISCRIMINABLE and stays agent-scoped" do
       # Pre-#779 rows, curl callers and older MCP servers write no session. Refusing
       # them would lock a live claim out of its own completion for the whole lease.
@@ -684,19 +821,22 @@ defmodule Loopctl.CoordinationClaimTest do
       assert %{claimed_by_session: _} = errors_on(cs)
     end
 
-    test "a credential in the ref itself is refused, exactly as one in a post key is" do
-      # `ref` is caller-supplied free text that GET /channel/claims echoes to every peer
-      # session in the tenant, so it carries the same exposure `ChannelPost`'s `key` does —
-      # and `key` is in that schema's @scanned_text_fields. A claim ALREADY in the table is
-      # unaffected: done/6 and release/6 build a bare Ecto.Changeset.change/2 and never run
-      # this validation, so no live row is stranded by adding the scan.
-      cs =
-        discriminator_changeset(%{
-          ref: "handoff:sk-ant-api03-" <> String.duplicate("a", 40)
-        })
+    test "a branch-shaped ref is NOT refused by the credential scan" do
+      # The denylist's prefixed shapes need only a word boundary, and `-` is not a word
+      # character, so scanning `ref` refused ordinary anchors with NO way to clear it:
+      # the ref could then never be claimed, and a pre-existing row whose ref tripped
+      # the scan lost its idempotent owner re-claim (claim/5 applies this changeset
+      # BEFORE the collision is resolved) — the dropped-handoff window that branch
+      # exists to close. The exposure is covered where the instructions live:
+      # `ChannelPost.key` is scanned, so a credential-shaped ref cannot be published.
+      cs = discriminator_changeset(%{ref: "handoff:feature/task-sk-integration_with_stripe_v2"})
 
-      refute cs.valid?
-      assert %{ref: _} = errors_on(cs)
+      assert cs.valid?
+
+      assert SecretDenylist.contains_secret?(
+               "handoff:feature/task-sk-integration_with_stripe_v2"
+             ),
+             "this ref must actually trip the denylist, or the test proves nothing"
     end
   end
 

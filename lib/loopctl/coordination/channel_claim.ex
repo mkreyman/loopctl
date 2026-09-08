@@ -192,7 +192,7 @@ defmodule Loopctl.Coordination.ChannelClaim do
   end
 
   defp reject_null_bytes(field, changeset) do
-    case get_field(changeset, field) do
+    case changeset |> get_field(field) |> scan_slice() do
       value when is_binary(value) ->
         if String.contains?(value, <<0>>),
           do: add_error(changeset, field, "must not contain NUL bytes"),
@@ -205,28 +205,40 @@ defmodule Loopctl.Coordination.ChannelClaim do
 
   # The two discriminators are client-supplied free text that `GET /channel/claims`
   # echoes to every peer session in the tenant, exactly like `ChannelPost`'s
-  # `session_id`/`host` — so they get the same write-time credential gate. The scan is
-  # bounded by the byte caps validated above, so no separate slice cap is needed here.
-  # `ref` IS scanned, for the same reason `ChannelPost`'s `key` is (it is in that schema's
-  # `@scanned_text_fields`): a ref is a free caller-supplied string that this tenant's whole
-  # channel can read back off `channel_claims`, so a credential pasted into one is exposed
-  # exactly as a credential in a post key would be.
+  # `session_id`/`host` — so they get the same write-time credential gate. They are
+  # proxy-generated (a session uuid, a hostname), so a denylist hit there is a real
+  # credential, never a name that merely looks like one.
   #
-  # The objection this replaces was that rejecting a ref could refuse a claim whose matching
-  # POST already exists. It cannot: a post carrying a credential-shaped `key` is itself
-  # refused at write time by that same scan, so the post this would strand can never have
-  # been created. And a claim ALREADY in the table is untouched — `done/6` and `release/6`
-  # build a bare `Ecto.Changeset.change/2` and never run these validations, so an existing
-  # row stays completable.
+  # `ref` is deliberately NOT scanned. The denylist's prefixed shapes need only a word
+  # boundary, so an ordinary branch-shaped anchor — `handoff:feature/task-sk-integration_
+  # with_stripe_v2` matches the `sk-` pattern — would be refused with NO way to clear it:
+  # the ref can then never be claimed, and a pre-existing row whose ref now trips the
+  # scan loses the idempotent owner re-claim (`claim/5` applies this changeset BEFORE the
+  # collision is resolved), which is the dropped-handoff window that branch exists to
+  # close. The exposure it would have covered is already covered where the ref's
+  # instructions actually live: `ChannelPost.key` is scanned, so a credential-shaped ref
+  # cannot be published with a handoff.
   defp validate_no_secrets(changeset) do
-    Enum.reduce([:ref, :claimed_by_session, :claimed_by_host], changeset, &reject_secret/2)
+    Enum.reduce([:claimed_by_session, :claimed_by_host], changeset, &reject_secret/2)
   end
 
   defp reject_secret(field, changeset) do
-    if changeset |> get_field(field) |> SecretDenylist.contains_secret?() do
+    if changeset |> get_field(field) |> scan_slice() |> SecretDenylist.contains_secret?() do
       add_error(changeset, field, "must not contain a credential")
     else
       changeset
     end
   end
+
+  # Cap the bytes handed to the scanners, mirroring `ChannelPost.scan_slice/1`:
+  # `validate_length/3` records an error but does NOT drop the change, so `get_field/2`
+  # still returns the full body-sized value and an oversized field would otherwise walk
+  # every regex on input the changeset is about to reject anyway. The cap is the LARGEST
+  # of the three field caps, so no value that can actually land is ever truncated.
+  @scan_byte_cap @ref_max_length
+
+  defp scan_slice(value) when is_binary(value) and byte_size(value) > @scan_byte_cap,
+    do: binary_part(value, 0, @scan_byte_cap)
+
+  defp scan_slice(value), do: value
 end

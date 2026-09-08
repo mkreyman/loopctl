@@ -305,6 +305,21 @@ defmodule LoopctlWeb.ChannelClaimControllerTest do
 
         assert body["error"]["code"] == "claim_session_mismatch"
       end
+
+      # The POSITIVE half of the title, which nothing else covers: a form/query client
+      # sends the STRING "true", and without this clause it silently loses its override
+      # and gets a 409 it cannot clear.
+      body =
+        raw
+        |> post_json(@done_path, %{
+          project_id: project.id,
+          ref: "r",
+          session_id: "session-b",
+          force: "true"
+        })
+        |> json_response(200)
+
+      assert body["claim"]["done_at"]
     end
 
     test "a cross-tenant claim still 404s — the session 409 is never an existence oracle" do

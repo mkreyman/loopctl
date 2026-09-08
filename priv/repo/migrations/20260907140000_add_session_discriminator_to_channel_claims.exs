@@ -16,7 +16,12 @@ defmodule Loopctl.Repo.Migrations.AddSessionDiscriminatorToChannelClaims do
   #
   # Nullable with no backfill: every claim written before this migration, and every
   # claim from a client that sends no session (curl, an older MCP server), carries
-  # NULL and is treated as UNDISCRIMINABLE — the pre-#779 agent-scoped behaviour.
+  # NULL and is treated as UNDISCRIMINABLE — the pre-#779 agent-scoped behaviour. So
+  # the guard buys nothing for a claim live at deploy time, for up to one full 24h
+  # lease. There is no correct value to backfill; the residual window is made
+  # OBSERVABLE instead — a guard that passes on a NULL stamp logs and fires
+  # `[:loopctl, :coordination, :claim_session_guard]` with `outcome: :undiscriminable`,
+  # so the shrinking fraction can be watched rather than assumed.
   #
   # No index: neither column is ever a query predicate. They are read off a row the
   # `(tenant_id, project_id, claimant_agent_id, ref)` owner fetch already found, and
