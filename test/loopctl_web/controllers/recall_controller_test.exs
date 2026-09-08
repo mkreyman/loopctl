@@ -100,13 +100,20 @@ defmodule LoopctlWeb.RecallControllerTest do
       # meta and the merged meta a caller reads first. Its input — the article's recorded
       # usage — appears nowhere in the rows, so without this a session that saw a
       # well-used note outrank a fresher one had nothing in the payload to explain it.
-      # Asserted against the LITERAL expected weight, not against
+      # Asserted against the LITERAL shipped weight, not against
       # `Application.get_env(:loopctl, :knowledge_importance_strength)`: re-reading the same
-      # key the code reads makes the check agree with itself, so it stays green with both
-      # sides at 0.0 -- exactly the "present but always 0.0 explains nothing" case it is
-      # here to exclude.
-      assert know_meta["importance_strength"] == 0.1
-      assert know_meta["importance_strength"] > 0.0
+      # key the code reads makes the check agree with itself and stays green whatever the
+      # config says.
+      #
+      # 0.0 is the SHIPPED state, not an absent feature: the prior's carve-out from the
+      # 2026-08-21 owner decision is unratified, so `:knowledge_importance_prior_enabled`
+      # defaults to false (config/config.exs) and this endpoint therefore reports a weight of
+      # zero until Mark rules. Flipping that key to true is what makes this 0.1, and the
+      # "a non-zero configured weight reaches the meta" property is pinned where it can be
+      # exercised without config: `KnowledgeCombinedPriorsTest`, "the fused path reports the
+      # effective strength" (0.25 through opts).
+      assert know_meta["importance_strength"] == 0.0
+      assert Map.has_key?(know_meta, "importance_strength")
 
       assert meta["importance_strength"] == know_meta["importance_strength"]
 

@@ -349,6 +349,11 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     # touches no proposal, publishes nothing, and cannot fail the run (it is fail-soft
     # inside, and reports a gate rather than raising).
     #
+    # It runs whether or not the PRIOR that reads the column is enabled — it ships disabled
+    # pending the owner ruling recorded in CLAUDE.md's 2026-08-21 section — because the
+    # collection is one bounded aggregate per tenant per night and having 90 days of history
+    # already stamped is what makes ratification a config flip rather than a 90-day wait.
+    #
     # AFTER the two applying steps deliberately: an article those steps unpublished keeps
     # whatever usage it earned, and its rank is settled by the status filter rather than by
     # a prior, so nothing here needs to know about them. Running it BEFORE them would only
@@ -1776,8 +1781,10 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         # questions, and reading the wrong one is how a healthy night gets diagnosed as a
         # dead corpus:
         #
-        #   * `measured` — how many articles the window found a read for. This is the USAGE
-        #     number.
+        #   * `measured` — how many of THIS TENANT'S OWN articles the window found a read
+        #     for. This is the USAGE number. It saturates at the per-run article cap, and
+        #     `truncated` is what says the window held more; it does not count reads of the
+        #     shared canon, which the write predicate cannot reach either.
         #   * `stamped` — how many rows the write actually CHANGED. `set_count/2` restricts
         #     the update to values that MOVED (`IS DISTINCT FROM`), so a corpus read on the
         #     same days as last night reports `measured > 0` with `stamped: 0`. That is a

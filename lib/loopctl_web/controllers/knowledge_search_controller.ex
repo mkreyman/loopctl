@@ -321,11 +321,12 @@ defmodule LoopctlWeb.KnowledgeSearchController do
                        "recorded usage gets exactly 1.0 and is never scored down, though " <>
                        "promoting a used article does move an unused one down the ORDER " <>
                        "relative to it, by at most the 1.1 ceiling. `0.0` means importance " <>
-                       "played no part in this ordering — the prior is disabled, its " <>
-                       "strength is configured to zero, or this pool contained an article " <>
-                       "whose usage cannot be measured (a shared system canonical), which " <>
-                       "turns the prior off for the whole pool rather than ranking a " <>
-                       "measured article against an unmeasurable one."
+                       "played no part in this ordering — the prior is disabled (which is " <>
+                       "the shipped default) or its strength is configured to zero. An " <>
+                       "article whose usage cannot be measured (a shared system canonical) " <>
+                       "is scored at the pool's median measured factor, so it neither wins " <>
+                       "nor loses a near-tie against a typical measured article; that does " <>
+                       "not change this weight."
                  },
                  remediation: %OpenApiSpex.Schema{
                    type: :object,

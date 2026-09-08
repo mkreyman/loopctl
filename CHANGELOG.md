@@ -24,9 +24,19 @@ All notable changes to loopctl are documented here.
   **What it can and cannot do.** The prior is ONE-SIDED: an article with no recorded usage
   gets a factor of exactly 1.0 and is never pushed down, so nothing is demoted for being
   unread. The ceiling of 1.1 means it re-ranks near-ties and cannot flip a cross-lane
-  relevance winner. Turn it off with `config :loopctl, :knowledge_importance_prior_enabled,
-  false`, or change its magnitude with `:knowledge_importance_strength` (default 0.1); a
-  strength of 0 reproduces the pre-#790 ordering exactly.
+  relevance winner.
+
+  **It SHIPS DISABLED — `config :loopctl, :knowledge_importance_prior_enabled` defaults to
+  `false`, so ranking is byte-identical to pre-#790 until an operator turns it on.** The
+  carve-out it needs from the 2026-08-21 "ranking must never key on HOW a document got in"
+  decision is recorded in CLAUDE.md as not owner-ratified, and a ranking change may not
+  ratify itself. Turn it on with that key set to `true`; change its magnitude with
+  `:knowledge_importance_strength` (default 0.1); a strength of 0 is an exact no-op too. The
+  nightly stamp writes `read_day_count` either way, so enabling it later reads real history.
+
+  A candidate the stamp could not have measured — a shared system canonical, whose
+  `tenant_id` is NULL — is scored at the pool's MEDIAN measured factor rather than at the
+  floor, so one tenant's usage never pushes the shared canon down a page.
 
   **API.** `meta.importance_strength` is new on `GET /api/v1/knowledge/search` (relevance
   modes), `POST /api/v1/knowledge/hybrid_search` and `POST /api/v1/recall` (on both the

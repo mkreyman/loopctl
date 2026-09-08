@@ -55,11 +55,18 @@ defmodule Loopctl.Knowledge.RankingPriors do
       > the ~96% of this corpus that is bulk-harvested and read less. Never give this factor
       > a reachable sub-1.0 branch. Demotion is `demotion_factor/1`'s job and belongs to
       > deliberate editorial acts, never to a usage count.
-      > The prior also applies ONLY to a pool every candidate of which the nightly stamp
-      > could have measured (`pool_importance_strength/2`). A system canonical is
-      > structurally unmeasurable — its `read_day_count` is one column on a row several
-      > tenants read — so a mixed pool would rank a counted class against an uncounted one on
-      > one number, which is the #569/#572 defect with the direction reversed.
+      > A candidate the nightly stamp could NOT have measured is scored at the pool's MEDIAN
+      > measured factor (`pool_importance_default_factor/4`), never at the floor. A system
+      > canonical is structurally unmeasurable — its `read_day_count` is one column on a row
+      > several tenants read — and reading that NULL as "read on zero days" would rank a
+      > counted class against an uncounted one on one number, which is the #569/#572 defect
+      > with the direction reversed. Placing it at the measured median is the neutral
+      > treatment: it neither wins nor loses a near-tie against a TYPICAL measured row, and
+      > the measured rows' order among themselves is unchanged by whether it is in the pool
+      > at all. Do NOT "fix" this by turning the prior off for the whole pool — the canon is
+      > the bulk of this corpus, so that disables the prior product-wide and makes it depend
+      > on which LANE happened to serve (the keyword lane cannot contain a canonical, the
+      > side-table semantic lane can), i.e. on an embedding outage.
 
   > #### The `:superseded` demotion is DEFENSIVE on the default path {: .info}
   >
@@ -434,17 +441,18 @@ defmodule Loopctl.Knowledge.RankingPriors do
 
   Fails CLOSED, unlike every other reader in this module: a result map with no `:tenant_id`
   key at all is treated as unmeasurable. A lane that forgets to project `tenant_id` therefore
-  forfeits the importance prior for its pool (a lost boost, the same currency every other
-  lane-shape mistake here is paid in) instead of silently ranking an unmeasurable row as if
-  it had been measured at zero.
+  scores its rows at the pool's measured MEDIAN (a lost boost for a heavily-read row, the
+  same currency every other lane-shape mistake here is paid in) instead of silently ranking
+  an unmeasurable row as if it had been measured at zero.
   """
   @spec usage_measurable?(map()) :: boolean()
   def usage_measurable?(%{} = result), do: not is_nil(Map.get(result, :tenant_id))
   def usage_measurable?(_), do: false
 
   @doc """
-  The importance strength that may be applied to a POOL: `strength` when every candidate is
-  `usage_measurable?/1`, and exactly `0.0` otherwise.
+  The importance factor to give a candidate the nightly stamp could NOT have measured: the
+  MEDIAN `importance_factor/4` of the pool's measurable candidates, and exactly `1.0` when
+  the pool has none (and whenever `strength` is 0, where every factor is 1.0 already).
 
   This is the pool-level half of the prior and it is not optional. `importance_factor/4` is
   per-row, and a per-row factor cannot express "this row's usage is UNKNOWN": an unmeasurable
@@ -455,15 +463,44 @@ defmodule Loopctl.Knowledge.RankingPriors do
   one number), and it would be reintroduced here with the direction reversed — against the
   shared canon, which is where the harvested material lives.
 
-  Turning the prior OFF for such a pool is the only remedy available to a pure function: it
-  cannot measure the canonical, and giving it any invented value would be a weight keyed on
-  how the document got into the corpus, which the 2026-08-21 owner decision forbids outright.
-  The real fix is to make canonicals MEASURABLE per tenant, at which point every candidate is
-  measurable and this gate stops firing on its own.
+  The MEDIAN is the neutral imputation for a missing measurement, and it is neutral in the
+  sense that matters here: an unmeasurable row is placed at the centre of the measured
+  population, so it beats the below-median rows and loses to the above-median ones exactly as
+  a typical measured row would, and the measured rows keep their order among themselves
+  whether or not it is in the pool. That is NOT a weight keyed on how the document got into
+  the corpus — it is the same value any median-usage tenant row would receive, and it moves
+  with the pool rather than with the row's origin. It stays >= 1.0, so the one-sided-upward
+  guarantee is intact.
+
+  What this deliberately is NOT is a pool-wide switch (`strength` for an all-measurable pool,
+  `0.0` otherwise). That was the round-1 shape and it had two defects the median has not: the
+  shared canon is the bulk of this corpus, so ONE canonical anywhere in a ~200-row fused
+  candidate set disabled the prior for a page that never contained it; and the keyword lane
+  cannot contain a canonical while the side-table semantic lane can, so the prior applied on
+  the DEGRADED keyword-only response and not on the healthy one — ranking that depends on an
+  embedding outage. The real fix remains making canonicals MEASURABLE per tenant (a
+  per-(tenant, article) usage row), at which point there is nothing left to impute.
   """
-  @spec pool_importance_strength([map()], float()) :: float()
-  def pool_importance_strength(results, strength) when is_list(results) do
-    if Enum.all?(results, &usage_measurable?/1), do: strength, else: 0.0
+  @spec pool_importance_default_factor([map()], float(), float(), float()) :: float()
+  def pool_importance_default_factor(results, strength, floor, ceiling) when is_list(results) do
+    results
+    |> Enum.filter(&usage_measurable?/1)
+    |> Enum.map(&importance_factor(&1, strength, floor, ceiling))
+    |> median()
+  end
+
+  defp median([]), do: 1.0
+
+  defp median(factors) do
+    sorted = Enum.sort(factors)
+    n = length(sorted)
+    mid = div(n, 2)
+
+    if rem(n, 2) == 1 do
+      Enum.at(sorted, mid)
+    else
+      (Enum.at(sorted, mid - 1) + Enum.at(sorted, mid)) / 2.0
+    end
   end
 
   @doc """
@@ -576,6 +613,13 @@ defmodule Loopctl.Knowledge.RankingPriors do
   silently ranking on a stale or absent column, and `Loopctl.Knowledge`'s
   `ranking_prior_opts/1` is the single place the live value is resolved, so removing it
   there is a wiring break a test can see.
+
+  `:importance_default_factor` is the pool-level half (`pool_importance_default_factor/4`):
+  when it is PRESENT, a candidate that is not `usage_measurable?/1` takes that factor instead
+  of its own (absent) usage. When it is ABSENT this function is exactly per-row, which is why
+  the option is `fetch`ed rather than defaulted — a caller ranking one row at a time has no
+  pool to impute from, and inventing 1.0 for it there would be the floor-reading defect the
+  imputation exists to avoid.
   """
   @spec multiplier(map(), keyword()) :: float()
   def multiplier(result, opts) do
@@ -589,7 +633,15 @@ defmodule Loopctl.Knowledge.RankingPriors do
     recency = recency_factor(recency_timestamp(result), now, recency_weight)
     authority = if authority?, do: authority_factor(result, strength, floor, ceiling), else: 1.0
 
-    importance =
+    importance = importance_component(result, opts)
+
+    hub? = Keyword.get(opts, :hub_demotion?, true)
+
+    recency * authority * importance * demotion_factor(result, hub_demotion?: hub?)
+  end
+
+  defp importance_component(result, opts) do
+    factor =
       importance_factor(
         result,
         Keyword.get(opts, :importance_strength, 0.0),
@@ -597,9 +649,10 @@ defmodule Loopctl.Knowledge.RankingPriors do
         Keyword.get(opts, :importance_ceiling, 1.1)
       )
 
-    hub? = Keyword.get(opts, :hub_demotion?, true)
-
-    recency * authority * importance * demotion_factor(result, hub_demotion?: hub?)
+    case Keyword.fetch(opts, :importance_default_factor) do
+      {:ok, default} -> if usage_measurable?(result), do: factor, else: default
+      :error -> factor
+    end
   end
 
   defp category_authority(nil), do: @default_category_authority

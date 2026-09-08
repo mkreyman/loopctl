@@ -29,10 +29,11 @@ defmodule Loopctl.Knowledge.Importance do
       the loop runs, so sustained use outranks a burst.
     * NOT distinct readers. `heat_counts_query/5` records why in its own comment: "under a
       fleet sharing one key EVERY article ties at 1". Readership is near-flat here; days
-      still carry signal. Readership is not IGNORED, though — see the solo-reader cap below.
-      Days defeat a same-day loop and NOT a daily one, so a single key running one
-      `knowledge_get` a day would otherwise walk to the ceiling on its own; the cap is what
-      stops that, and it is why the aggregate still joins `api_keys`.
+      still carry signal. Readership is not IGNORED, though — it BOUNDS the count rather than
+      being the count: an article's days are capped at `solo_reader_day_cap/0` per distinct
+      principal. Days defeat a same-day loop and NOT a daily one, so a single key running one
+      `knowledge_get` a day would otherwise walk to the ceiling on its own; that cap is what
+      stops it, and it is why the aggregate still joins `api_keys`.
     * NOT drills. `knowledge_progressive_drill` records its own uncounted access type, so
       being SHOWN by an index cannot produce the rank that showed it. This module inherits
       that exclusion by reading `Knowledge.heat_read_access_types/0` rather than restating
@@ -56,12 +57,14 @@ defmodule Loopctl.Knowledge.Importance do
   ranking defect on its own and is NOT fixed here: a pool that mixes tenant rows (measured)
   with canonicals (structurally unmeasurable) would be ranked on a number that means
   different things per row — the counted-vs-uncounted asymmetry #569/#572 each fixed once,
-  with the direction reversed. It is fixed on the READ side instead, by
-  `RankingPriors.pool_importance_strength/2`: a fused pool containing any row this stamp
-  could not have reached gets an importance strength of exactly 0.0, so the prior applies
-  only where every candidate was measurable. Restore the prior for canonicals by making them
-  MEASURABLE per tenant (a per-(tenant, article) usage row), never by stamping the shared
-  column and never by dropping that pool gate.
+  with the direction reversed. It is handled on the READ side instead, by
+  `RankingPriors.pool_importance_default_factor/4`: a candidate this stamp could not have
+  reached is scored at the MEDIAN factor of the pool's measured candidates, so it is placed
+  at the centre of the population it is being ranked against rather than at its floor. Fix it
+  properly by making canonicals MEASURABLE per tenant (a per-(tenant, article) usage row),
+  never by stamping the shared column, and never by turning the prior off for the whole pool
+  — the canon is the bulk of this corpus, so that is a product-wide disablement wearing a
+  narrow gate's clothes.
 
   ## Isolation
 
@@ -111,39 +114,57 @@ defmodule Loopctl.Knowledge.Importance do
   # exactly neutral.
   #
   # It does NOT self-correct on the next run, and do not read it as if it did: the ordering
-  # (`desc: days, asc: article_id`) is deterministic, so the SAME tail falls off every night
-  # for as long as the tenant stays over the cap. An article genuinely read on one or two
-  # days in the window is then permanently neutral rather than briefly so. The cost is a lost
-  # boost and never a demotion; the remedy is raising this number, which is what
-  # `log_truncation/2` says.
+  # (the capped count desc, raw days, then id) is deterministic, so the SAME tail falls off
+  # every night for as long as the tenant stays over the cap. An article genuinely read on one
+  # or two days in the window is then permanently neutral rather than briefly so. The cost is
+  # a lost boost and never a demotion; the remedy is raising this number, which is what
+  # `log_truncation/3` says.
   @max_stamped_articles 10_000
 
-  # The most distinct days ONE principal can contribute to an article's count.
+  # The most distinct days ONE principal can contribute to an article's count. The article's
+  # ceiling is this number TIMES its distinct principals — `least(days, cap * readers)` — so
+  # the cap scales with readership instead of switching off.
   #
   # Distinct days defeat the same-day `knowledge_get` loop #567 was filed for and do NOT
   # defeat a DAILY one: a single key running one read a day walks to the saturation point on
   # its own, and this prior feeds every ranked read path in the tenant rather than one
   # advisory browse list. So a principal — `coalesce(k.agent_id, e.api_key_id)`, the same
   # reader identity `heat_counts_query/5` counts, agent-first because v2 mints a key per
-  # dispatch — is capped here, and only an article read by MORE THAN ONE principal can pass
-  # the cap.
+  # dispatch — buys at most this many days.
+  #
+  # PROPORTIONAL and not a binary "readers > 1 lifts the cap", which is what this was first
+  # written as and is defeated by one extra read: v2 mints a key per dispatch and a caller
+  # can mint a child dispatch inside its own subtree, so a second principal costs a loop
+  # nothing, and the documented MCP config already ships two keys. Under `cap * readers` that
+  # second key buys 10 days rather than 30, a sixth is needed to reach saturation, and the
+  # cost of gaming scales linearly with identities instead of being paid once. It also stops
+  # the inversion the binary form had: a single-key fleet (the shape `heat_counts_query/5`'s
+  # own comment describes) was the ONLY deployment that kept a cap at all.
   #
   # 5 rather than a rounder number: `importance_signal/1` puts 5 days at `log(6)/log(31)` =
   # 0.52, so one principal acting alone can reach just over HALF the band and no more, while
-  # the 1-3-day population the curve is shaped for is untouched. A single-agent tenant
-  # therefore keeps a working prior at a compressed top, which is the trade this bound is
-  # making deliberately.
+  # the 1-3-day population the curve is shaped for is untouched. A single-key tenant
+  # therefore keeps a working prior at a compressed top — 1 through 5 days still order
+  # normally and everything above 5 ties — which is the trade this bound makes deliberately.
   @solo_reader_day_cap 5
 
   @typedoc """
   The per-run tally. `gate` is `:open` on a run that read the events table.
 
   `measured` and `stamped` answer DIFFERENT questions and neither substitutes for the other.
-  `measured` is how many articles the window found a read for — the usage number. `stamped`
-  is how many rows the write actually CHANGED, which `set_count/2`'s `IS DISTINCT FROM`
+  `measured` is how many of this tenant's OWN articles this run measured a read for and will
+  therefore write — the usage number, and never more than the run's article cap. `stamped` is
+  how many rows the write actually CHANGED, which `set_count/2`'s `IS DISTINCT FROM`
   predicate deliberately restricts to values that moved, so a steady-state night over an
   actively-read corpus reports `measured > 0` with `stamped: 0`. Reading `stamped` as "how
   much was read" turns exactly that healthy night into a corpus nobody opened.
+
+  `measured` SATURATES at the cap, and `truncated` is what says so: on a truncated run the
+  window found MORE read articles than this number and `measured` is the cap, not the count.
+  Size a cap raise from the fact of truncation, never from this field — a run cannot report a
+  total it deliberately stopped counting (`limit: cap + 1`). Reads of a SYSTEM CANONICAL are
+  excluded from it, because the write predicate cannot reach that row either; the two numbers
+  are drawn from the same population on purpose.
   """
   @type tally :: %{
           measured: non_neg_integer(),
@@ -164,10 +185,18 @@ defmodule Loopctl.Knowledge.Importance do
       per call makes two runs incomparable, while a caller's explicit value is a per-call
       value already.
     * `:now` — the clock, for deterministic tests.
-    * `:max_articles` — the per-run article cap (default: `max_stamped_articles/0`). A LIMIT,
-      like `:since` is a window: it bounds this run's work and nothing else. It exists so the
-      truncation branch is reachable without seeding #{@max_stamped_articles} read articles,
-      and so an operator running the stamp by hand on a degraded box can bound it.
+    * `:max_articles` — the per-run article cap (default: `max_stamped_articles/0`). It
+      exists so the truncation branch is reachable without seeding #{@max_stamped_articles}
+      read articles, and so an operator running the stamp by hand on a degraded box can bound
+      it.
+
+      It does NOT bound only the run's work, and an operator has to know that before using
+      it: the kept set is also what the CLEAR statement spares, so a bounded run sets
+      `read_day_count` to NULL on every article of this tenant that it did not keep. On a
+      tenant with 5,000 read articles, `max_articles: 100` clears the other 4,900 to neutral.
+      Nothing is destroyed and nothing is demoted below neutral — the next unbounded run
+      rebuilds all of it — but the tenant ranks without a usage signal until then. Pass a
+      bound only when a full run is what you are trying to avoid.
   """
   @spec stamp(Ecto.UUID.t(), keyword()) :: tally()
   def stamp(tenant_id, opts \\ []) when is_binary(tenant_id) do
@@ -217,33 +246,46 @@ defmodule Loopctl.Knowledge.Importance do
     :exit, reason -> scan_failed(tenant_id, "exit:" <> ExitTag.tag(reason))
   end
 
-  # Aggregate over the EVENTS, joined to `api_keys` ONLY to resolve the reader identity the
-  # solo cap needs — no join to `articles`, so no article column enters the group key and the
-  # read stays on the events index. The article-side scoping happens on the WRITE, where the
-  # `tenant_id` predicate has to be anyway. The join is LEFT and its own `tenant_id` equality
-  # is conjunctive, the shape `HeavyRead.guard!/2` requires and the one `heat_counts_query/5`
-  # already runs through this gate: a key this tenant cannot see falls back to the key id
-  # rather than dropping the event.
+  # Aggregate over the EVENTS, with two joins and no article column in the group key or the
+  # select, so the read stays on the events index:
+  #
+  #   * `api_keys`, LEFT, ONLY to resolve the reader identity the per-principal cap needs. A
+  #     key this tenant cannot see falls back to the key id rather than dropping the event.
+  #   * `articles`, INNER, ONLY to drop events naming a row the WRITE could never stamp. An
+  #     event carries the READING tenant's `tenant_id` and the read article's id, so a tenant
+  #     reading the shared canon produces events for rows whose own `tenant_id` is NULL.
+  #     Without this join those rows consumed slots in the per-run cap that stampable rows
+  #     needed, and inflated `measured` by a number no `stamped` could ever match — an
+  #     operator reading the audit event saw a permanent unexplained gap and would diagnose
+  #     failed writes that never happened. This is the SAME predicate the two write
+  #     statements carry, so `measured` now counts exactly the rows a write can reach.
+  #
+  # Both joins' `tenant_id` equalities are conjunctive, the shape `HeavyRead.guard!/2`
+  # requires and the one `heat_counts_query/5` already runs through this gate.
   #
   # The day is cut in UTC EXPLICITLY, exactly as `heat_counts_query/5` does it: a bare
   # `::date` cast resolves in the connection's `TimeZone` GUC, so on a backend whose session
   # timezone is not UTC this would count days on a boundary the UTC-snapped window does not
   # use — the same value measured against two different calendars.
   #
-  # `least(days, CASE WHEN readers > 1 THEN days ELSE @solo_reader_day_cap END)` is the whole
-  # of the cap: with two or more distinct readers the count is the plain distinct-day count,
-  # and with one it cannot pass the cap. The signal stays DISTINCT DAYS in both branches —
-  # this never sums reader-days, which would let three readers on one day outscore one reader
-  # on three.
+  # `least(days, @solo_reader_day_cap * readers)` is the whole of the cap: each distinct
+  # principal buys at most the cap in days, and the value can never exceed the article's
+  # actual distinct-day count. The signal stays DISTINCT DAYS — `least` only ever lowers the
+  # day count, so this never sums reader-days, which would let three readers on one day
+  # outscore one reader on three.
   #
-  # Ordered by the RAW day count desc then id, so a run that hits the cap keeps the most-read
-  # articles (and keeps doing so deterministically between runs) rather than ordering on a
-  # capped value that ties every solo-read article at the cap.
+  # Ordered by the CAPPED value desc, raw days as the tiebreak, then id: the kept set has to
+  # be selected by the number the ranking actually reads, or a run at the cap drops an article
+  # with the higher final signal in favour of one whose raw count is inflated by a single
+  # principal. Raw days second keeps the order deterministic between runs where the capped
+  # values tie.
   defp read_days_query(tenant_id, since, cap) do
     counted =
       from(e in ArticleAccessEvent,
         left_join: k in ApiKey,
         on: k.id == e.api_key_id and k.tenant_id == ^tenant_id,
+        inner_join: a in Article,
+        on: a.id == e.article_id and a.tenant_id == ^tenant_id,
         where: e.tenant_id == ^tenant_id,
         where: e.access_type in ^Knowledge.heat_read_access_types(),
         where: e.accessed_at >= ^since,
@@ -256,18 +298,15 @@ defmodule Loopctl.Knowledge.Importance do
       )
 
     from(c in subquery(counted),
-      order_by: [desc: c.days, asc: c.article_id],
+      order_by: [
+        desc: fragment("least(?, ? * ?)", c.days, ^@solo_reader_day_cap, c.readers),
+        desc: c.days,
+        asc: c.article_id
+      ],
       limit: ^(cap + 1),
       select: %{
         article_id: c.article_id,
-        read_days:
-          fragment(
-            "least(?, CASE WHEN ? > 1 THEN ? ELSE ? END)",
-            c.days,
-            c.readers,
-            c.days,
-            ^@solo_reader_day_cap
-          )
+        read_days: fragment("least(?, ? * ?)", c.days, ^@solo_reader_day_cap, c.readers)
       }
     )
   end
@@ -444,12 +483,20 @@ defmodule Loopctl.Knowledge.Importance do
 
   defp log_truncation(_tenant_id, false, _cap), do: :ok
 
+  # Names the SOURCE of the effective cap, not `@max_stamped_articles` unconditionally: on an
+  # operator's `max_articles:` run the module attribute was not in force, so telling them to
+  # raise it is a remedy for a run they did not make.
   defp log_truncation(tenant_id, true, cap) do
+    source =
+      if cap == @max_stamped_articles,
+        do: "raise @max_stamped_articles if this is steady state",
+        else: "this run passed :max_articles, so the bound is the caller's, not the module's"
+
     Logger.warning(
       "Knowledge.Importance: tenant=#{tenant_id} read more than #{cap} " <>
         "distinct articles in the window; the least-used tail is cleared to neutral rather " <>
-        "than stamped, and it is the SAME tail every night until the cap is raised. Raise " <>
-        "@max_stamped_articles if this is steady state."
+        "than stamped, and it is the SAME tail every night until the cap is raised (" <>
+        source <> ")."
     )
   end
 end

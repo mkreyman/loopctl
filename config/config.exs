@@ -1174,7 +1174,20 @@ config :loopctl, :knowledge_hub_demotion_enabled, true
 # 1.1, matching the authority band. Strength 0.1 (double authority's) because usage is a
 # scarcer, more deliberate signal than a category label, and because the log curve puts a
 # typical 1-3-day article at 0.2-0.4 of it. A strength of 0 is an EXACT no-op.
-config :loopctl, :knowledge_importance_prior_enabled, true
+#
+# SHIPS DISABLED, and that is a governance state rather than a tuning choice. The
+# 2026-08-21 owner decision governs what may move ranking here, and the carve-out this prior
+# needs is recorded in CLAUDE.md as NOT RATIFIED BY THE OWNER: the prior does move unread
+# material down the ORDER relative to promoted material, which is the direction that decision
+# worries about, bounded by the 1.1 ceiling. Shipping it on would be citing a paragraph its
+# own author wrote as the owner's permission. Flip this one line to `true` once Mark rules,
+# and record the ruling attributably in that CLAUDE.md section.
+#
+# The nightly stamp runs REGARDLESS of this toggle, deliberately: it costs one bounded
+# aggregate per tenant per night, `read_day_count` is read by nothing else, and collecting it
+# now means ratification is a config flip against 90 days of history rather than a 90-day
+# wait. Turn the collection off by removing the step in `KnowledgeLintWorker`, not here.
+config :loopctl, :knowledge_importance_prior_enabled, false
 config :loopctl, :knowledge_importance_strength, 0.1
 
 # DI: WebAuthn adapter — defaults to Wax (overridden in test env)

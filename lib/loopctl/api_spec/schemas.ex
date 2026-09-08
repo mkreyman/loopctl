@@ -4378,10 +4378,11 @@ defmodule Loopctl.ApiSpec.Schemas do
                   "One-sided in SCORE: an article with no recorded usage gets exactly 1.0 " <>
                   "and is never scored down, though promoting a used article does move an " <>
                   "unused one down the ORDER relative to it, by at most the 1.1 ceiling. " <>
-                  "`0.0` means importance played no part — disabled, configured to zero, " <>
-                  "or the pool held an article whose usage cannot be measured (a shared " <>
-                  "system canonical), which turns the prior off for the whole pool. " <>
-                  "`null` only when the knowledge half produced no meta at all."
+                  "`0.0` means importance played no part — disabled, which is the shipped " <>
+                  "default, or configured to zero. An article whose usage cannot be " <>
+                  "measured (a shared system canonical) is scored at the pool's median " <>
+                  "measured factor rather than at the floor, which does not change this " <>
+                  "weight. `null` only when the knowledge half produced no meta at all."
             },
             recall_id: %Schema{
               type: :string,

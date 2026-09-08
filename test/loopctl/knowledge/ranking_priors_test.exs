@@ -29,6 +29,34 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
     )
   end
 
+  # The importance band search_combined/3 uses (knowledge.ex @importance_floor/ceiling): the
+  # floor is EXACTLY 1.0, unlike the authority band above.
+  @importance_floor 1.0
+  @importance_ceiling 1.1
+
+  # The opts a POOL produces: the per-row options plus the imputed factor an unmeasurable
+  # candidate takes, exactly as Knowledge.ranking_prior_opts/2 builds them.
+  defp pool_opts(pool, strength \\ 0.1) do
+    [
+      now: @now,
+      recency_weight: 0.0,
+      authority?: false,
+      strength: 0.0,
+      floor: @floor,
+      ceiling: @ceiling,
+      importance_strength: strength,
+      importance_floor: @importance_floor,
+      importance_ceiling: @importance_ceiling,
+      importance_default_factor:
+        RankingPriors.pool_importance_default_factor(
+          pool,
+          strength,
+          @importance_floor,
+          @importance_ceiling
+        )
+    ]
+  end
+
   describe "recency_decay/2 (single source of truth, shared with knowledge_context)" do
     test "is 1.0 for a doc updated exactly now" do
       assert RankingPriors.recency_decay(@now, @now) == 1.0
@@ -549,18 +577,20 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
     end
 
     # #790 review: `tenant_id` is not decoration on these lanes, it is the MEASURABILITY
-    # discriminator. `pool_importance_strength/2` fails CLOSED on a result with no
-    # `:tenant_id` key, so a lane that stops projecting it turns the importance prior off for
-    # every pool that lane contributes to -- silently, and product-wide rather than for one
-    # candidate. Same anchoring as the three guards above, opposite failure direction.
+    # discriminator. `usage_measurable?/1` fails CLOSED on a result with no `:tenant_id` key,
+    # so a lane that stops projecting it has EVERY one of its rows imputed at the pool median
+    # -- silently, and for every candidate that lane contributes rather than for the one row
+    # that is genuinely unmeasurable. Same anchoring as the three guards above, opposite
+    # failure direction.
     test "every lane select projects tenant_id" do
       for {path, head} <- @ranking_lanes do
         assert_lane_projects(
           path,
           head,
           "tenant_id:",
-          "RankingPriors.pool_importance_strength/2 fails CLOSED without it, so a pool " <>
-            "this lane contributes to loses the importance prior entirely"
+          "RankingPriors.usage_measurable?/1 fails CLOSED without it, so every row this " <>
+            "lane contributes is imputed at the pool median instead of ranking on its own " <>
+            "measured usage"
         )
       end
     end
@@ -753,39 +783,115 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
     end
 
     test "a row with NO tenant_id key at all fails CLOSED" do
-      # A lane that forgets to project `tenant_id` forfeits the prior for its pool rather
-      # than having its unmeasurable rows read as zero usage.
+      # A lane that forgets to project `tenant_id` has its rows imputed at the pool median
+      # rather than read as zero usage — a lost boost for a heavily-read row, never a rank
+      # taken from an unmeasurable one on a number it was never measured on.
       refute RankingPriors.usage_measurable?(%{id: "x", read_day_count: 30})
       refute RankingPriors.usage_measurable?(nil)
     end
 
-    test "an all-tenant pool keeps the configured strength" do
-      assert RankingPriors.pool_importance_strength([@tenant_row, @tenant_row], 0.1) == 0.1
-      assert RankingPriors.pool_importance_strength([], 0.1) == 0.1
+    test "the default factor is the MEDIAN of the pool's measured factors" do
+      unread = %{id: "u", tenant_id: Ecto.UUID.generate(), read_day_count: nil}
+      middling = %{id: "m", tenant_id: Ecto.UUID.generate(), read_day_count: 5}
+
+      expected =
+        RankingPriors.importance_factor(middling, 0.1, @importance_floor, @importance_ceiling)
+
+      assert RankingPriors.pool_importance_default_factor(
+               [@tenant_row, middling, unread],
+               0.1,
+               @importance_floor,
+               @importance_ceiling
+             ) == expected
+
+      # Strictly between the pool's extremes, which is the whole point of imputing it.
+      assert expected >
+               RankingPriors.importance_factor(
+                 unread,
+                 0.1,
+                 @importance_floor,
+                 @importance_ceiling
+               )
+
+      assert expected <
+               RankingPriors.importance_factor(
+                 @tenant_row,
+                 0.1,
+                 @importance_floor,
+                 @importance_ceiling
+               )
     end
 
-    test "ONE canonical in the pool turns the prior off for the WHOLE pool" do
-      assert RankingPriors.pool_importance_strength([@tenant_row, @canonical], 0.1) == 0.0
+    test "a pool with NO measurable row, and a zero strength, both give exactly 1.0" do
+      assert RankingPriors.pool_importance_default_factor(
+               [],
+               0.1,
+               @importance_floor,
+               @importance_ceiling
+             ) == 1.0
+
+      assert RankingPriors.pool_importance_default_factor(
+               [@canonical],
+               0.1,
+               @importance_floor,
+               @importance_ceiling
+             ) == 1.0
+
+      assert RankingPriors.pool_importance_default_factor(
+               [@tenant_row],
+               0.0,
+               @importance_floor,
+               @importance_ceiling
+             ) == 1.0
     end
 
-    test "with the pool strength the used tenant row no longer outranks the canonical" do
-      # The defect, end to end: at equal fused relevance a heavily-read tenant note beat a
-      # canonical nobody could measure. With the gate the pair is ordered by relevance again.
+    test "ONE canonical does NOT disable the prior for the rest of the pool" do
+      # The round-1 shape returned 0.0 for any pool holding an unmeasurable row, which on
+      # this corpus (the shared canon is the bulk of it) disabled the prior product-wide and
+      # made it depend on which lane served. The measured rows must keep their factors.
       pool = [@tenant_row, @canonical]
-      strength = RankingPriors.pool_importance_strength(pool, 0.1)
 
-      opts = [
-        now: @now,
-        recency_weight: 0.0,
-        authority?: false,
-        strength: 0.0,
-        floor: @floor,
-        ceiling: @ceiling,
-        importance_strength: strength
-      ]
+      assert RankingPriors.pool_importance_default_factor(
+               pool,
+               0.1,
+               @importance_floor,
+               @importance_ceiling
+             ) > 1.0
 
-      assert RankingPriors.multiplier(@tenant_row, opts) ==
+      assert RankingPriors.multiplier(@tenant_row, pool_opts(pool)) >
+               RankingPriors.multiplier(
+                 %{id: "u", tenant_id: Ecto.UUID.generate(), read_day_count: nil},
+                 pool_opts(pool)
+               )
+    end
+
+    test "the canonical is scored at the median: it beats an unread row and loses to a used one" do
+      # The defect this replaced: at equal fused relevance a heavily-read tenant note beat a
+      # canonical nobody could measure, because the canonical's NULL read as zero usage. It
+      # now sits at the centre of the measured population instead of at its floor.
+      unread = %{id: "u", tenant_id: Ecto.UUID.generate(), read_day_count: nil}
+      pool = [@tenant_row, unread, @canonical]
+      opts = pool_opts(pool)
+
+      assert RankingPriors.multiplier(@tenant_row, opts) >
                RankingPriors.multiplier(@canonical, opts)
+
+      assert RankingPriors.multiplier(@canonical, opts) >
+               RankingPriors.multiplier(unread, opts)
+    end
+
+    test "the measured rows' order is the SAME whether or not the canonical is in the pool" do
+      # The lane-dependence guard: the keyword lane can never hold a canonical and the
+      # side-table semantic lane can, so anything that let pool membership move a measured
+      # row's factor made the ordering depend on an embedding outage.
+      unread = %{id: "u", tenant_id: Ecto.UUID.generate(), read_day_count: nil}
+      without = pool_opts([@tenant_row, unread])
+      with_canonical = pool_opts([@tenant_row, unread, @canonical])
+
+      for row <- [@tenant_row, unread] do
+        assert RankingPriors.multiplier(row, without) ==
+                 RankingPriors.multiplier(row, with_canonical)
+      end
     end
   end
 

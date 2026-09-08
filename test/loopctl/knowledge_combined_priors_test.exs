@@ -104,6 +104,8 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
 
   defp ids(results), do: Enum.map(results, & &1.id)
 
+  defp score_of(results, id), do: Enum.find(results, &(&1.id == id)).final_score
+
   defp search(tenant_id, opts) do
     assert {:ok, %{results: results}} =
              Knowledge.search_combined(tenant_id, "sprocket calibration telemetry", opts)
@@ -196,6 +198,7 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
           now: @now,
           recency_weight: 0.3,
           authority_prior: true,
+          importance_prior: true,
           importance_strength: 0.1
         )
 
@@ -232,6 +235,9 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
           now: @now,
           recency_weight: 0.0,
           authority_prior: false,
+          # The toggle is ON so this isolates the STRENGTH being zero -- the prior ships
+          # disabled, and without this the equality below would hold for the wrong reason.
+          importance_prior: true,
           importance_strength: 0.0
         )
 
@@ -247,6 +253,7 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
           now: @now,
           recency_weight: 0.0,
           authority_prior: false,
+          importance_prior: true,
           importance_strength: 0.1
         )
 
@@ -284,6 +291,7 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
           now: @now,
           recency_weight: 0.0,
           authority_prior: false,
+          importance_prior: true,
           importance_strength: 0.1
         )
 
@@ -316,6 +324,7 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
           now: @now,
           recency_weight: 0.0,
           authority_prior: false,
+          importance_prior: true,
           importance_strength: 0.1
         )
 
@@ -348,6 +357,7 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
           now: @now,
           recency_weight: 0.0,
           authority_prior: false,
+          importance_prior: true,
           importance_strength: 0.1
         )
 
@@ -371,6 +381,7 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
       assert {:ok, %{meta: meta}} =
                Knowledge.search_combined(tenant.id, "sprocket calibration telemetry",
                  now: @now,
+                 importance_prior: true,
                  importance_strength: 0.25
                )
 
@@ -395,13 +406,16 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
     end
   end
 
-  describe "#790 review: a pool holding an UNMEASURABLE row turns the prior off" do
-    test "one system canonical in the fused pool drops importance_strength to 0.0" do
+  describe "#790 review: an UNMEASURABLE row is imputed, never a pool-wide switch" do
+    test "one system canonical in the fused pool does NOT disable the prior" do
       # A canonical's `read_day_count` is permanently NULL -- the nightly stamp's write
       # predicate is `a.tenant_id == ^tenant_id` and a canonical's `tenant_id` is NULL -- so
-      # NULL there means NOT MEASURED, not "read on zero days". Ranking the tenant's measured
-      # rows against it on one number is the #569/#572 counted-vs-uncounted defect with the
-      # direction reversed, and the shared canon is where the harvested material lives.
+      # NULL there means NOT MEASURED, not "read on zero days". It is imputed at the pool's
+      # median measured factor, per row. What must NOT happen is the round-1 shape: turning
+      # the prior off for the WHOLE pool, which on this corpus (the shared canon is the bulk
+      # of it) is a product-wide disablement, decided by a candidate at fused rank 180 the
+      # caller never sees, and applied to the healthy response while the DEGRADED
+      # keyword-only one -- whose lane cannot hold a canonical -- kept ranking on usage.
       tenant = fixture(:tenant)
       mine = create_article(tenant.id, %{title: "Measured note", body: @body})
       set_read_days(tenant.id, mine.id, 60)
@@ -436,18 +450,38 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
       assert {:ok, %{results: results, meta: meta}} =
                Knowledge.search_combined(tenant.id, "sprocket calibration telemetry",
                  now: @now,
+                 importance_prior: true,
                  importance_strength: 0.1
                )
 
       # Precondition, not decoration: with the canonical outside the pool this proves nothing.
       assert canonical.id in ids(results)
 
-      assert meta.importance_strength == 0.0
+      # The weight the response advertises is the configured one, and the ordering used it:
+      # `ranking_prior_meta/2` and `ranking_prior_opts/2` read the same value.
+      assert meta.importance_strength == 0.1
+      assert mine.id in ids(results)
+
+      # And the imputation is WIRED, not just implemented: the same search with the prior
+      # off scores the canonical strictly lower, so `ranking_prior_opts/2` really is handing
+      # the pool's median factor to the re-rank. Without that hand-off the canonical would
+      # be multiplied by 1.0 in both runs and these two numbers would be equal -- which is
+      # exactly the round-1 behaviour, and it is what this comparison exists to catch.
+      expect_query_embedding()
+
+      assert {:ok, %{results: off}} =
+               Knowledge.search_combined(tenant.id, "sprocket calibration telemetry",
+                 now: @now,
+                 importance_prior: false
+               )
+
+      assert score_of(results, canonical.id) > score_of(off, canonical.id)
     end
 
     test "the tenant's own pool keeps the configured strength" do
-      # The positive control for the gate above -- without it, a gate that fired on EVERY
-      # pool would pass the assertion and disable the prior product-wide.
+      # The positive control: the weight a response advertises must not move with pool
+      # membership, or a caller comparing two responses to the same query sees it change
+      # because an embedding lane was unavailable.
       tenant = fixture(:tenant)
       mine = create_article(tenant.id, %{title: "Measured note", body: @body})
       set_read_days(tenant.id, mine.id, 60)
@@ -457,6 +491,7 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
       assert {:ok, %{meta: meta}} =
                Knowledge.search_combined(tenant.id, "sprocket calibration telemetry",
                  now: @now,
+                 importance_prior: true,
                  importance_strength: 0.1
                )
 
@@ -485,6 +520,7 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
           now: @now,
           recency_weight: 0.0,
           authority_prior: false,
+          importance_prior: true,
           importance_strength: 0.1
         )
 

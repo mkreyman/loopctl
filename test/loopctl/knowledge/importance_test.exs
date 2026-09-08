@@ -311,7 +311,27 @@ defmodule Loopctl.Knowledge.ImportanceTest do
       assert read_days(solo.id) == cap
     end
 
-    test "TWO principals pass the cap, and the count stays DISTINCT DAYS (never reader-days)" do
+    test "a SECOND principal raises the ceiling proportionally -- it does not remove it" do
+      # The defect the proportional form fixes: with a binary `CASE WHEN readers > 1 THEN
+      # days` the cap was lifted ENTIRELY by one extra read, and a second principal is cheap
+      # (v2 mints a key per dispatch, a caller may mint a child dispatch inside its own
+      # subtree, and the documented MCP config already ships two keys). Under
+      # `least(days, cap * readers)` the loop above buys 2 * cap and needs a sixth identity
+      # to reach the saturation point, so gaming costs scale with identities.
+      tenant = fixture(:tenant)
+      gamed = article(tenant.id)
+      loop = agent_key(tenant.id)
+      other = agent_key(tenant.id)
+
+      cap = Importance.solo_reader_day_cap()
+      for day <- 1..(4 * cap), do: read(tenant.id, gamed.id, day, api_key_id: loop)
+      read(tenant.id, gamed.id, 1, api_key_id: other)
+
+      assert %{gate: :open} = stamp(tenant.id)
+      assert read_days(gamed.id) == 2 * cap
+    end
+
+    test "TWO principals pass the SOLO cap, and the count stays DISTINCT DAYS (never reader-days)" do
       tenant = fixture(:tenant)
       shared = article(tenant.id)
       same_day = article(tenant.id)
@@ -332,8 +352,38 @@ defmodule Loopctl.Knowledge.ImportanceTest do
       end
 
       assert %{gate: :open} = stamp(tenant.id)
+      # cap + 3 is under the two-principal ceiling of 2 * cap, so the plain distinct-day
+      # count stands: the cap bounds a count, it never becomes one.
       assert read_days(shared.id) == cap + 3
       assert read_days(same_day.id) == 1
+    end
+
+    test "reads of a SYSTEM CANONICAL are measured by nobody -- the write cannot reach them" do
+      # An access event carries the READING tenant's tenant_id and the read article's id, so
+      # a tenant reading the shared canon produces events naming rows whose own tenant_id is
+      # NULL. The two write statements are `a.tenant_id == ^tenant_id`, so those rows can
+      # never be stamped: counting them would inflate `measured` past anything `stamped`
+      # could match and would spend per-run cap slots on rows no write can reach.
+      tenant = fixture(:tenant)
+      mine = article(tenant.id)
+
+      {:ok, canonical} =
+        Knowledge.create_article(tenant.id, %{
+          title: "Shared canon note",
+          body: "canon body for the importance stamp",
+          category: :reference,
+          scope: :system,
+          status: :published
+        })
+
+      assert is_nil(canonical.tenant_id)
+
+      read(tenant.id, mine.id, 1)
+      for day <- 1..3, do: read(tenant.id, canonical.id, day)
+
+      assert %{measured: 1, stamped: 1, gate: :open} = stamp(tenant.id)
+      assert read_days(mine.id) == 1
+      assert read_days(canonical.id) == nil
     end
   end
 
@@ -358,6 +408,28 @@ defmodule Loopctl.Knowledge.ImportanceTest do
       assert read_days(warm.id) == 2
       # The tail is cleared to neutral rather than stamped -- a lost boost, never a demotion.
       assert read_days(cold.id) == nil
+    end
+
+    test "the kept set is chosen by the CAPPED count, not the raw one" do
+      # The selection criterion has to be the number the ranking reads. Ordering on raw days
+      # kept a solo-read article whose 4 * cap days stamp as cap, and cleared a genuinely
+      # multi-read one whose smaller raw count survives the cap intact -- the gamed row keeps
+      # a boost while the used one is set back to neutral.
+      tenant = fixture(:tenant)
+      solo = article(tenant.id)
+      shared = article(tenant.id)
+
+      cap = Importance.solo_reader_day_cap()
+      loop = agent_key(tenant.id)
+      for day <- 1..(4 * cap), do: read(tenant.id, solo.id, day, api_key_id: loop)
+      # cap + 1 distinct days across cap + 1 distinct principals: the cap cannot bite.
+      for day <- 1..(cap + 1), do: read(tenant.id, shared.id, day)
+
+      assert %{truncated: true, gate: :open} =
+               Importance.stamp(tenant.id, now: @now, max_articles: 1)
+
+      assert read_days(shared.id) == cap + 1
+      assert read_days(solo.id) == nil
     end
 
     test "an uncapped run over the same corpus is NOT truncated" do
