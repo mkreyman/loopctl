@@ -135,7 +135,16 @@ defmodule LoopctlWeb.KnowledgeHybridSearchController do
                  search_mode: %OpenApiSpex.Schema{type: :string},
                  total_count: %OpenApiSpex.Schema{type: :integer},
                  fallback: %OpenApiSpex.Schema{type: :boolean},
-                 fallback_reason: %OpenApiSpex.Schema{type: :string}
+                 fallback_reason: %OpenApiSpex.Schema{type: :string},
+                 importance_strength: %OpenApiSpex.Schema{
+                   type: :number,
+                   description:
+                     "The magnitude of the USAGE (importance) prior in force on this " <>
+                       "response (#790), so an ordering that usage produced can be " <>
+                       "explained. One-sided: an article with no recorded usage gets a " <>
+                       "factor of exactly 1.0 and is never pushed down. `0.0` means " <>
+                       "importance played no part."
+                 }
                }
              }
            }

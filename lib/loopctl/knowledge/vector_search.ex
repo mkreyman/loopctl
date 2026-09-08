@@ -688,6 +688,9 @@ defmodule Loopctl.Knowledge.VectorSearch do
       # `updated_at`, so omitting it does not crash -- it silently ranks this lane on
       # last-MUTATION time, which a re-embed bumps.
       content_changed_at: a.content_changed_at,
+      # The importance prior's field (#790), on the same fail-open terms: omit it and this
+      # lane alone forfeits the usage boost, with nothing raising to say so.
+      read_day_count: a.read_day_count,
       metadata: a.metadata,
       inserted_at: a.inserted_at,
       updated_at: a.updated_at,
@@ -991,6 +994,8 @@ defmodule Loopctl.Knowledge.VectorSearch do
       idempotency_key: a.idempotency_key,
       # The recency prior's field (#791), on the same terms as idempotency_key above.
       content_changed_at: a.content_changed_at,
+      # The importance prior's field (#790), likewise.
+      read_day_count: a.read_day_count,
       metadata: a.metadata,
       inserted_at: a.inserted_at,
       updated_at: a.updated_at,

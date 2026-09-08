@@ -96,6 +96,17 @@ defmodule LoopctlWeb.RecallControllerTest do
       # don't read it as calibrated relevance.
       assert meta["results_ranking"] == "heuristic_cross_source"
 
+      # The importance prior's weight in force (#790), on BOTH the knowledge envelope's
+      # meta and the merged meta a caller reads first. Its input — the article's recorded
+      # usage — appears nowhere in the rows, so without this a session that saw a
+      # well-used note outrank a fresher one had nothing in the payload to explain it.
+      # Asserted as the CONFIGURED default rather than "is a number": a key that is
+      # present but always 0.0 explains nothing and would pass the weaker check.
+      assert know_meta["importance_strength"] ==
+               Application.get_env(:loopctl, :knowledge_importance_strength)
+
+      assert meta["importance_strength"] == know_meta["importance_strength"]
+
       # Knowledge items are the whitelisted combined-search SUMMARY — never the raw
       # result map's internal scoring fields, status, tenant_id, project_id, timestamps.
       know_item = Enum.find(know_data, &(&1["id"] == article.id))

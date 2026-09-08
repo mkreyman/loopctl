@@ -181,7 +181,7 @@ exactly the pollution the separate tables prevent.
    `{drift_signal, member_id}` — a group scored under the other signal's normalized key finds
    nothing and withholds (fail-closed).
 5. **Heat must not rank on a signal heat produces** — `Knowledge.heat_index/2`
-   (`knowledge.ex:11607`; the counted set is `@heat_read_access_types`, `:11477`). The heat index is the one retrieval route that
+   (`knowledge.ex:11684`; the counted set is `@heat_read_access_types`, `:11554`). The heat index is the one retrieval route that
    takes NO query, so its misses are uncorrelated with embedding similarity — which is worth nothing
    if its ordering is something a caller or the route itself generates. It has been violated FOUR
    times, each differently — and once by a FIX for one of the others — so treat any new input to
@@ -396,6 +396,49 @@ Three things hold it together, and each has been mutation-verified:
 The golden-question eval cannot catch a regression here either: `RetrievalEval` seeds
 `content_changed_at` equal to `updated_at`, so both fields agree by construction and the metrics
 move by `+0.000` whichever one the prior reads. The unit and integration guards are the real ones.
+
+## Importance ranks USAGE, and only upward (#790)
+
+`RankingPriors.importance_factor/4` multiplies a fused score by
+`clamp(1 + strength * importance_signal(read_days), 1.0, 1.1)`, where `read_days` is
+`articles.read_day_count` — the distinct days the article was opened inside the last
+`Knowledge.heat_default_window_days/0`. Usage is the authority on importance, which
+`heat_index/2` had asserted since #554 while heat never reached ranking.
+
+Four properties hold it together, and each is mutation-verified:
+
+- **It is ONE-SIDED UPWARD, and that is what makes it compatible with the 2026-08-21 owner
+  decision above.** An article with no recorded usage gets a factor of EXACTLY 1.0 — it ranks
+  precisely where it did before the prior existed. A two-sided usage prior reaches that
+  decision's own stated failure by another road: bulk-harvested material is ~96% of the corpus
+  and is read less, so demoting on usage would bury exactly the material the owner said he
+  wants surfaced, and demoted material stays unread. Never give this factor a reachable
+  sub-1.0 branch; demotion belongs to `demotion_factor/1` and to deliberate editorial acts.
+- **The signal is distinct read DAYS.** Not raw reads (the #567/#569/#572 pinning defect — a
+  `knowledge_get` loop inflates a count and cannot inflate a day) and not distinct READERS
+  (`heat_counts_query/5`: "under a fleet sharing one key EVERY article ties at 1"). Drills and
+  search impressions stay uncounted because `Loopctl.Knowledge.Importance` reads
+  `Knowledge.heat_read_access_types/0` rather than restating the list — a second, wider copy
+  of that list is how three of the four heat regressions happened.
+- **It is a STORED COLUMN because heat is not available DB-free.** `heat_index/2` is a
+  `HeavyRead` aggregate plus an `AdminRepo` projection under a pool bound; `RankingPriors` is
+  pure and `merge_results/5` must stay DB-free. So the value is stamped nightly by
+  `Importance.stamp/2` inside the `KnowledgeLintWorker` pass (Day 5-II: stamp at consolidation
+  time, never per write, and never by LLM-scoring an article), written with `update_all` so it
+  moves neither `updated_at` nor `content_changed_at`, and projected onto every ranking lane —
+  guarded by the same `@ranking_lanes` source scan `content_changed_at` uses, and castable from
+  nowhere for the same reason.
+- **The CEILING is what bounds it against relevance, not the strength.** A cross-lane RRF
+  consensus winner scores ~2x a single-lane hit, so importance could only flip one at a ceiling
+  of 2.0. At 1.1 it breaks ties and nothing more; that bound has its own test.
+
+A tenant's stamp never touches a SYSTEM CANONICAL (NULL `tenant_id`): one column on a row
+several tenants read must not have one tenant's usage decide its rank for the others.
+
+The golden-question eval cannot catch a regression here: `RetrievalEval` seeds no
+`article_access_events`, so every golden doc's `read_day_count` is NULL and the factor is 1.0
+on every candidate — the metrics move by `+0.000` by construction. The unit, integration and
+stamp tests are the real guards.
 
 ## Ranking changes are gated by the golden-question eval (#469)
 

@@ -391,6 +391,41 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
     end
   end
 
+  describe "the importance usage stamp runs in the nightly pass (#790)" do
+    test "a read article is stamped, and the audit event records the tally" do
+      # The WIRING, not the arithmetic (that is
+      # test/loopctl/knowledge/importance_test.exs). Loopctl.Knowledge.Importance.stamp/2
+      # writes the ranking prior's only input, so a pass that stopped calling it would
+      # freeze every article's importance at whatever it was the night the call was
+      # dropped — silently, since a frozen value ranks exactly like a live one.
+      tenant = fixture(:tenant)
+      article = published_article_with_embedding(tenant.id, similar_embedding())
+
+      fixture(:article_access_event, %{
+        tenant_id: tenant.id,
+        article_id: article.id,
+        access_type: "get",
+        accessed_at: DateTime.add(DateTime.utc_now(), -86_400, :second)
+      })
+
+      assert :ok = KnowledgeLintWorker.perform(%Oban.Job{args: %{"tenant_id" => tenant.id}})
+
+      stamped =
+        AdminRepo.one(
+          from(a in Loopctl.Knowledge.Article,
+            where: a.id == ^article.id,
+            select: a.read_day_count
+          )
+        )
+
+      assert stamped == 1
+
+      assert [entry] = lint_audit_entries(tenant.id)
+      assert entry.new_state["importance_stamped"] == 1
+      assert entry.new_state["importance_gate"] == "open"
+    end
+  end
+
   describe "conflict promotion (#4 existing-corpus backstop)" do
     defp relates_link(tenant_id, src_id, tgt_id, score) do
       %ArticleLink{tenant_id: tenant_id}

@@ -1625,7 +1625,14 @@ defmodule Loopctl.Memory do
         # knowledge's POOL-NORMALIZED final_score — a heuristic, not a calibrated
         # cross-source ranking (knowledge is biased upward; see the moduledoc). Surface
         # a stable tag so consumers don't mistake the order for calibrated relevance.
-        results_ranking: "heuristic_cross_source"
+        results_ranking: "heuristic_cross_source",
+        # The importance prior's weight in force on the KNOWLEDGE half (#790), republished
+        # at the top level because this is the meta a session reads. It describes the
+        # ranking of the knowledge results only — the merged order above is the
+        # cross-source heuristic and no prior touches it — and it is taken from the
+        # knowledge envelope rather than re-resolved here, so there is one origin for the
+        # number. `nil` when the knowledge half degraded before it ranked anything.
+        importance_strength: Map.get(knowledge_env.meta, :importance_strength)
       }
     }
   end

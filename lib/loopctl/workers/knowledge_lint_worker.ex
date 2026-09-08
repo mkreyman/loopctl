@@ -175,6 +175,7 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
   alias Loopctl.Knowledge.ConflictResolution
   alias Loopctl.Knowledge.Consolidation
   alias Loopctl.Knowledge.DraftConsumer
+  alias Loopctl.Knowledge.Importance
   alias Loopctl.Knowledge.LinkPruning
   alias Loopctl.Oban.FairShare
   alias Loopctl.SystemConfig
@@ -341,6 +342,19 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     retitled =
       apply_generic_titles(tenant_id, consolidation, retitle_budget_remaining(started_at))
 
+    # The usage stamp for the importance ranking prior (#790). It runs in this pass and not
+    # on a scheduler of its own for the Day 5-II reason the prior exists on: importance is
+    # stamped while the nightly pass is already over this corpus, never per write. It reads
+    # `article_access_events` and writes one column on `articles` with `update_all` -- it
+    # touches no proposal, publishes nothing, and cannot fail the run (it is fail-soft
+    # inside, and reports a gate rather than raising).
+    #
+    # AFTER the two applying steps deliberately: an article those steps unpublished keeps
+    # whatever usage it earned, and its rank is settled by the status filter rather than by
+    # a prior, so nothing here needs to know about them. Running it BEFORE them would only
+    # mean stamping rows the same run then retitles.
+    stamped = Importance.stamp(tenant_id)
+
     resolutions_applied = execute_resolutions(tenant_id)
     # The judge runs AFTER promotion so a pair flagged tonight is also judged tonight and
     # never spends a night suppressing its two articles, and LAST of all the steps because it
@@ -360,7 +374,8 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
       resolutions_applied: resolutions_applied,
       consolidation: consolidation,
       applied: applied,
-      retitled: retitled
+      retitled: retitled,
+      importance: stamped
     })
 
     Logger.info(
@@ -398,6 +413,8 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         "generic_titles_failed=#{retitled.failed} " <>
         "generic_title_budget_exhausted=#{retitled.budget_exhausted} " <>
         "generic_title_gate=#{retitled.gate} " <>
+        "importance_stamped=#{stamped.stamped} importance_cleared=#{stamped.cleared} " <>
+        "importance_truncated=#{stamped.truncated} importance_gate=#{stamped.gate} " <>
         consolidation_log(consolidation)
     )
 
@@ -1693,7 +1710,8 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
          resolutions_applied: resolutions_applied,
          consolidation: consolidation,
          applied: applied,
-         retitled: retitled
+         retitled: retitled,
+         importance: importance
        }) do
     Audit.create_log_entry(tenant_id, %{
       entity_type: "knowledge_lint",
@@ -1752,7 +1770,17 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         "links_pruned" => pruned.pruned,
         "links_prunable_remaining" => pruned.remaining,
         "resolutions_applied" => resolutions_applied,
-        "consolidation" => consolidation_state(consolidation, applied, retitled)
+        "consolidation" => consolidation_state(consolidation, applied, retitled),
+        # The importance stamp (#790). `stamped` and `cleared` are recorded separately
+        # because they answer different questions: `stamped` is how much of the corpus was
+        # read at all in the window, `cleared` is how much stopped being read. A night with
+        # both at 0 and `gate: "open"` is a genuinely quiet corpus; the gate is what tells
+        # that apart from a shed or failed step, which is the same reading every other step
+        # here carries its gate for.
+        "importance_stamped" => importance.stamped,
+        "importance_cleared" => importance.cleared,
+        "importance_truncated" => importance.truncated,
+        "importance_gate" => to_string(importance.gate)
       }
     })
   rescue

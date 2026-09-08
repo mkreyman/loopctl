@@ -104,6 +104,10 @@ defmodule LoopctlWeb.KnowledgeHybridSearchJSON do
     # Absent for transient/provider fallbacks (a key IS configured there).
     |> maybe_put(:remediation, Remediation.for_fallback_reason(meta[:fallback_reason]))
     |> maybe_put(:semantic_result_count, meta[:semantic_result_count])
+    # The importance prior's weight in force (#790), mirroring knowledge_search: the usage
+    # input is invisible in the rows, so without this a caller cannot tell that usage moved
+    # anything. `0.0` means it did not.
+    |> maybe_put(:importance_strength, meta[:importance_strength])
     |> maybe_put_fallback(meta[:fallback])
   end
 

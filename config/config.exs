@@ -1144,6 +1144,36 @@ config :loopctl, :knowledge_authority_strength, 0.05
 # is demoted regardless — that one is not a matter of taste.
 config :loopctl, :knowledge_hub_demotion_enabled, true
 
+# Importance prior (#790): toggle + magnitude. The factor is
+# `clamp(1 + strength * log1p(read_day_count)/log1p(30), 1.0, 1.1)`.
+#
+# It keys on USAGE — `articles.read_day_count`, the distinct days an article was actually
+# opened, stamped nightly by Loopctl.Knowledge.Importance from `article_access_events`. Usage
+# is the authority on importance (heat_index/2 has said so since #554), and until now heat
+# never reached ranking: a note nothing had opened in eleven months ranked level with one four
+# sessions opened last week.
+#
+# DISTINCT DAYS, never raw reads (a `knowledge_get` loop inflates a count and cannot inflate a
+# day) and never distinct READERS (near-flat here — under a fleet sharing one key every article
+# ties at 1). Drills stay uncounted. That is the #567/#569/#572 rule: ranking must not key on a
+# signal the ranking itself produces.
+#
+# ONE-SIDED UPWARD, and this is the load-bearing property rather than a tuning choice: an
+# article with no recorded usage gets EXACTLY 1.0 and ranks precisely where it ranked before
+# this prior existed. A two-sided usage prior would reach the closed loop the 2026-08-21 owner
+# decision forbids by a different road — bulk-harvested material is ~96% of the corpus and is
+# read less, so demoting on usage would systematically bury exactly the material Mark said he
+# wants surfaced ("we would never learn anything new and unexpectedly useful"). Demotion here
+# belongs solely to deliberate editorial acts (verdict-kill / :superseded).
+#
+# The CEILING is what bounds the prior against relevance: a cross-lane RRF consensus winner
+# scores ~2x a single-lane hit, so importance could only flip one at a ceiling >= 2.0. It is
+# 1.1, matching the authority band. Strength 0.1 (double authority's) because usage is a
+# scarcer, more deliberate signal than a category label, and because the log curve puts a
+# typical 1-3-day article at 0.2-0.4 of it. A strength of 0 is an EXACT no-op.
+config :loopctl, :knowledge_importance_prior_enabled, true
+config :loopctl, :knowledge_importance_strength, 0.1
+
 # DI: WebAuthn adapter — defaults to Wax (overridden in test env)
 config :loopctl, :webauthn_adapter, Loopctl.WebAuthn.Wax
 
