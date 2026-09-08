@@ -825,24 +825,25 @@ defmodule LoopctlWeb.RouteDiscoveryController do
         method: "GET",
         path: "/api/v1/channel/claims",
         description:
-          "ACTIVE handoff claims — the NON-DESTRUCTIVE way to ask whether a ref is taken (#707). Read this instead of probing by claiming: claim is idempotent for the owning AGENT, so on a fleet sharing one agent_id a probe returns a PEER SESSION's claim and the release that tidies it up DELETES it. MCP tool: channel_claims"
+          "ACTIVE handoff claims — the NON-DESTRUCTIVE way to ask whether a ref is taken (#707). Read this instead of probing by claiming: claim is idempotent for the owning AGENT, so on a fleet sharing one agent_id a probe returns a PEER SESSION's claim. Each row carries claimed_by_session, claimed_by_host and, when you pass your own session_id, a derived same_session — the ownership answer claimant_agent_id cannot give (#779). MCP tool: channel_claims"
       },
       %{
         method: "POST",
         path: "/api/v1/channel/claims",
         description:
-          "Claim a handoff ref for EXACTLY ONE agent (INSERT-to-claim). The 409 is split by cause — branch on error.code: already_claimed (move on), claim_lease_expired (retry THIS ref shortly), ref_superseded (claim the successor), claim_budget_exhausted (a limit on you, not the ref). MCP tool: channel_claim"
+          "Claim a handoff ref for EXACTLY ONE agent (INSERT-to-claim). 201 created: true is a fresh claim; 200 already_held: true is the idempotent re-claim, carrying the ORIGINAL claimed_at plus claimed_by_session/host and same_session, so a peer session's live claim cannot read as your own (#779). The 409 is split by cause — branch on error.code: already_claimed (move on), claim_lease_expired (retry THIS ref shortly), ref_superseded (claim the successor), claim_budget_exhausted (a limit on you, not the ref). MCP tool: channel_claim"
       },
       %{
         method: "POST",
         path: "/api/v1/channel/claims/done",
-        description: "Mark your own claim done (terminal). MCP tool: channel_done"
+        description:
+          "Mark your own claim done (terminal). A claim stamped by a DIFFERENT session on your agent key is 409 claim_session_mismatch — advisory, cleared by force: true (#779). MCP tool: channel_done"
       },
       %{
         method: "POST",
         path: "/api/v1/channel/claims/release",
         description:
-          "Release your own OPEN claim so the ref reopens. Scoped to your AGENT, not your session — two sessions on one key can release each other's. MCP tool: channel_release"
+          "Release your own OPEN claim so the ref reopens. Scoped to your AGENT; on top of that a claim stamped by a DIFFERENT session is refused with 409 claim_session_mismatch, so this no longer deletes a peer session's live claim by accident. ADVISORY, not authorization: force: true clears it and session_id is client-supplied (#779). MCP tool: channel_release"
       },
       %{
         method: "GET",

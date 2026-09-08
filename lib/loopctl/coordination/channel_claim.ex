@@ -25,8 +25,28 @@ defmodule Loopctl.Coordination.ChannelClaim do
   `tenant_id`, `project_id`, `claimant_agent_id`, `claimed_at`, and
   `lease_expires_at` are set programmatically on the struct in `Loopctl.Coordination`
   — NEVER via `cast/3` (mirroring `ChannelPost`). `claimant_agent_id` is the verified
-  key identity, so a caller can never claim as another agent. Only `ref` (and,
-  derived server-side, the lease) is caller-influenced.
+  key identity, so a caller can never claim as another agent. `ref`, `claimed_by_session`
+  and `claimed_by_host` (and, derived server-side, the lease) are the caller-influenced
+  fields.
+
+  ## The session discriminator is ADVISORY (issue #779)
+
+  `claimed_by_session` and `claimed_by_host` are the SAME CLASS as
+  `ChannelPost`'s `session_id`/`host` and `to_host`/`to_capability`: optional,
+  client-supplied, informational and SPOOFABLE. They exist because
+  `claimant_agent_id` cannot tell two sessions apart on a fleet where every session
+  authenticates as one agent — so a peer's live claim reads back as the caller's own
+  (KB `8d9156ca`), and `release` deletes it (KB `07f5e839`).
+
+  They are read for exactly two things: REPORTING ownership (`already_held`,
+  `same_session`), and refusing an ACCIDENTAL cross-session `done`/`release`, which a
+  caller may always override with `force`. They are NEVER an authorization boundary —
+  a spoofed session id can neither steal a claim nor free one that
+  `(tenant, project, claimant_agent_id, ref)` does not already admit the caller to.
+  Tenant + project membership + the claimant agent stay the enforced boundary.
+
+  NULL means UNDISCRIMINABLE, not "no session": a pre-#779 row, or a client that sends
+  none, falls back to the agent-scoped behaviour rather than being locked out.
 
   ## Isolation
 
@@ -38,12 +58,23 @@ defmodule Loopctl.Coordination.ChannelClaim do
 
   use Loopctl.Schema
 
+  require Logger
+
+  alias Loopctl.Security.SecretDenylist
+
+  @secret_error_message "must not contain a credential"
+
   @type t :: %__MODULE__{}
 
   # A ref names an out-of-band unit of work ("handoff:repo#812"), not a row. Bound
   # its byte length like ChannelPost's other free text fields so it cannot be an
   # index-bloat / amplification vector.
   @ref_max_length 512
+
+  # Advisory session/host discriminator bounds — the SAME caps `ChannelPost` uses for
+  # its `session_id`/`host`, because these carry the same values from the same proxy.
+  @session_max_length 200
+  @host_max_length 255
 
   @derive {Jason.Encoder,
            only: [
@@ -55,6 +86,8 @@ defmodule Loopctl.Coordination.ChannelClaim do
              :claimed_at,
              :lease_expires_at,
              :done_at,
+             :claimed_by_session,
+             :claimed_by_host,
              :inserted_at,
              :updated_at
            ]}
@@ -68,20 +101,32 @@ defmodule Loopctl.Coordination.ChannelClaim do
     field :lease_expires_at, :utc_datetime_usec
     field :done_at, :utc_datetime_usec
 
+    # Advisory, client-supplied, spoofable — see the moduledoc. Never authorization.
+    field :claimed_by_session, :string
+    field :claimed_by_host, :string
+
     timestamps()
   end
 
   @doc """
   Changeset for creating a claim.
 
-  Casts ONLY `:ref` (the caller-supplied anchor); `tenant_id`, `project_id`,
+  Casts `:ref` (the caller-supplied anchor) and the two ADVISORY discriminator
+  fields `:claimed_by_session` / `:claimed_by_host`; `tenant_id`, `project_id`,
   `claimant_agent_id`, `claimed_at`, and `lease_expires_at` are set programmatically
   on the struct by the context and are validated here for presence only — they are
   never castable (mirrors `ChannelPost.create_changeset/2`'s trust boundary).
 
   A blank (`""`/whitespace-only) `ref` is normalised to `nil` so `validate_required`
   rejects it (an empty anchor must never occupy the `(tenant, project, ref)` slot).
-  Enforces the `ref` byte cap. Declares the `channel_claims_ref_uidx`
+  Enforces the `ref` byte cap, the discriminator byte caps
+  (`claimed_by_session` <= #{@session_max_length} bytes, `claimed_by_host` <=
+  #{@host_max_length} bytes), rejects the two byte sequences the sinks cannot
+  store — a NUL byte and a non-UTF-8 binary — in all three (both are otherwise a raw 500
+  from Postgres or Jason, so the guard turns them into a 422), and runs the shared secret
+  denylist over the two discriminator fields — they are echoed to every peer session
+  reading `GET /channel/claims`, so a credential stuffed into either must be refused
+  rather than published onto the shared bus. Declares the `channel_claims_ref_uidx`
   `unique_constraint` (matching the DB index name) so a concurrent duplicate claim
   surfaces as `{:error, changeset}` — which the context maps to
   `{:error, :already_claimed}` (409) — rather than a raw `Ecto.ConstraintError`
@@ -90,8 +135,11 @@ defmodule Loopctl.Coordination.ChannelClaim do
   @spec create_changeset(t(), map()) :: Ecto.Changeset.t()
   def create_changeset(claim, attrs) do
     claim
-    |> cast(attrs, [:ref])
-    |> normalize_blank_ref()
+    |> cast(attrs, [:ref, :claimed_by_session, :claimed_by_host])
+    |> validate_length(:ref, max: @ref_max_length, count: :bytes)
+    |> validate_length(:claimed_by_session, max: @session_max_length, count: :bytes)
+    |> validate_length(:claimed_by_host, max: @host_max_length, count: :bytes)
+    |> normalize_blank([:ref, :claimed_by_session, :claimed_by_host])
     |> validate_required([
       :tenant_id,
       :project_id,
@@ -100,8 +148,10 @@ defmodule Loopctl.Coordination.ChannelClaim do
       :claimed_at,
       :lease_expires_at
     ])
-    |> validate_length(:ref, max: @ref_max_length, count: :bytes)
-    |> validate_no_null_bytes()
+    |> reject_unstorable(:ref)
+    |> reject_unstorable(:claimed_by_host)
+    |> reject_secret(:claimed_by_host)
+    |> validate_session_discriminator()
     |> foreign_key_constraint(:tenant_id)
     |> foreign_key_constraint(:project_id)
     |> foreign_key_constraint(:claimant_agent_id)
@@ -115,32 +165,187 @@ defmodule Loopctl.Coordination.ChannelClaim do
   @spec ref_max_length() :: pos_integer()
   def ref_max_length, do: @ref_max_length
 
-  # A blank/whitespace ref means "no anchor" — normalise to nil so validate_required
-  # rejects it rather than reserving the slot with an empty string.
-  defp normalize_blank_ref(changeset) do
-    case get_change(changeset, :ref) do
+  @doc "Maximum allowed `claimed_by_session` length in bytes."
+  @spec session_max_length() :: pos_integer()
+  def session_max_length, do: @session_max_length
+
+  @doc "Maximum allowed `claimed_by_host` length in bytes."
+  @spec host_max_length() :: pos_integer()
+  def host_max_length, do: @host_max_length
+
+  @doc """
+  Validates the CALLER-supplied `session_id` that `done`/`release` compare against a
+  row's stamp, under the SAME rules `create_changeset/2` applies to
+  `claimed_by_session` — literally the same, via `validate_session_discriminator/1`,
+  so the two paths cannot drift.
+
+  Those paths build no claim changeset — they update or delete an existing row — so the
+  caller's value used to reach the audit entry's `metadata` (a **jsonb** column, which
+  is STRICTER than the `text` the claim path writes: Postgres refuses the `\\u0000`
+  escape Jason produces for a NUL byte and the request 500s) with no cap, no NUL check
+  and no credential scan. One endpoint over from a 422, the same string was persisted
+  verbatim into the append-only audit log. Same rules, same field, both paths.
+
+  Returns a changeset — `valid?` decides, and the CALLER must use the changeset's
+  NORMALISED `:claimed_by_session` rather than its own raw input: a whitespace-only
+  value normalises to `nil` (UNDISCRIMINABLE) here, and `done`/`release` writing the raw
+  string instead is how a whitespace payload reached the audit log uncapped.
+
+  `nil` (the client sent none) is valid — an absent session is UNDISCRIMINABLE, which
+  the guard handles. A non-binary (a JSON number, a map, `session_id[]=a` from a form
+  client) is rejected here by the `:string` cast, so no such value ever reaches the
+  guard or the audit map.
+
+  The changeset is built on a struct carrying the caller's `tenant_id` / `project_id` /
+  `claimant_agent_id` so `emit_secret_blocked_events/1` can attribute a denylist hit
+  exactly as it does on the claim path.
+  """
+  @spec caller_session_changeset(map(), term()) :: Ecto.Changeset.t()
+  def caller_session_changeset(scope, session) do
+    %__MODULE__{}
+    |> struct(scope)
+    |> cast(%{claimed_by_session: session}, [:claimed_by_session])
+    |> validate_length(:claimed_by_session, max: @session_max_length, count: :bytes)
+    |> normalize_blank([:claimed_by_session])
+    |> validate_session_discriminator()
+  end
+
+  # The `claimed_by_session` rules, declared ONCE and run by BOTH paths. They used to be
+  # two independent pipelines twenty lines apart: a fourth rule added to one of them
+  # (`reject_unstorable/2`'s UTF-8 half is exactly that) applied to `claim/5` and silently
+  # not to `done`/`release`, reopening the parity gap #779 was written to close.
+  #
+  # The byte cap runs BEFORE `normalize_blank/2` at both call sites, and that ordering is
+  # load-bearing: `normalize_blank/2` rewrites a whitespace-only change to `nil`, so with
+  # the cap after it a whitespace-only value of ANY size — up to
+  # `LoopctlWeb.RequestLimits.max_body_bytes/0` — was `valid?` with no error, and
+  # `done`/`release` then wrote that raw string into the append-only audit log's jsonb
+  # metadata and printed it as one log line. Cap the RAW value, then normalise.
+  defp validate_session_discriminator(changeset) do
+    changeset
+    |> reject_unstorable(:claimed_by_session)
+    |> reject_secret(:claimed_by_session)
+  end
+
+  # A blank/whitespace value means "absent" — normalise to nil. For `ref` that makes
+  # `validate_required` reject it rather than reserving the slot with an empty string;
+  # for the two discriminators it means UNDISCRIMINABLE rather than a session literally
+  # named `""`, which would otherwise match no live session and lock done/release out.
+  defp normalize_blank(changeset, fields) do
+    Enum.reduce(fields, changeset, &blank_change_to_nil/2)
+  end
+
+  defp blank_change_to_nil(field, changeset) do
+    case get_change(changeset, field) do
       value when is_binary(value) ->
-        if String.trim(value) == "", do: put_change(changeset, :ref, nil), else: changeset
+        if String.trim(value) == "", do: put_change(changeset, field, nil), else: changeset
 
       _ ->
         changeset
     end
   end
 
-  # Postgres `text` cannot store a NUL byte and raises a raw Postgrex.Error (500) at
-  # insert. JSON permits it and Elixir strings accept it, so reject it in the
-  # changeset — the caller learns it did not land as a 422.
-  defp validate_no_null_bytes(changeset) do
-    case get_field(changeset, :ref) do
+  # The two byte sequences the SINKS refuse, rejected here so the caller gets a 422
+  # instead of a raw 500.
+  #
+  #   * a NUL byte — Postgres `text` cannot store one and raises a Postgrex.Error at
+  #     insert, and jsonb additionally refuses the `\\u0000` escape Jason emits for it.
+  #   * a binary that is not valid UTF-8 — the SIBLING case, and the one that was
+  #     missed: every guard here is byte-oriented, so `<<"sess-", 0xFF>>` (reachable
+  #     through the endpoint's `:urlencoded` parser, which URL-decodes to a raw binary
+  #     with no encoding check) passed all of them and then raised
+  #     `Jason.EncodeError "invalid byte 0xFF"` on the audit metadata and Postgres
+  #     SQLSTATE 22021 on the `text` column. `Loopctl.Coordination.utf8_prefix/2`
+  #     already exists in this codebase for the same reason.
+  defp reject_unstorable(changeset, field) do
+    case changeset |> get_field(field) |> scan_slice() do
       value when is_binary(value) ->
-        if String.contains?(value, <<0>>) do
-          add_error(changeset, :ref, "must not contain NUL bytes")
-        else
-          changeset
+        cond do
+          String.contains?(value, <<0>>) ->
+            add_error(changeset, field, "must not contain NUL bytes")
+
+          not String.valid?(value) ->
+            add_error(changeset, field, "must be valid UTF-8")
+
+          true ->
+            changeset
         end
 
       _ ->
         changeset
     end
+  end
+
+  # The two discriminators are client-supplied free text that `GET /channel/claims`
+  # echoes to every peer session in the tenant, exactly like `ChannelPost`'s
+  # `session_id`/`host` — so they get the same write-time credential gate. They are
+  # proxy-generated (a session uuid, a hostname), so a denylist hit there is a real
+  # credential, never a name that merely looks like one.
+  #
+  # `ref` is deliberately NOT scanned. The denylist's prefixed shapes need only a word
+  # boundary, so an ordinary branch-shaped anchor — `handoff:feature/task-sk-integration_
+  # with_stripe_v2` matches the `sk-` pattern — would be refused with NO way to clear it:
+  # the ref can then never be claimed, and a pre-existing row whose ref now trips the
+  # scan loses the idempotent owner re-claim (`claim/5` applies this changeset BEFORE the
+  # collision is resolved), which is the dropped-handoff window that branch exists to
+  # close. What that leaves uncovered is stated rather than papered over: a claim needs
+  # NO matching post (`claim/5` takes any ref), so a credential-shaped ref on a postless
+  # claim IS stored and echoed by `GET /channel/claims` unscanned. `ChannelPost.key` is
+  # scanned, so such a ref can never be published together with its INSTRUCTIONS — the
+  # bare claim row is the accepted residual, taken deliberately because the alternative
+  # is an unclearable refusal that strands the handoff the claim exists to hand off.
+  defp reject_secret(changeset, field) do
+    if changeset |> get_field(field) |> scan_slice() |> SecretDenylist.contains_secret?() do
+      add_error(changeset, field, @secret_error_message)
+    else
+      changeset
+    end
+  end
+
+  # Cap the bytes handed to the scanners, mirroring `ChannelPost.scan_slice/1`:
+  # `validate_length/3` records an error but does NOT drop the change, so `get_field/2`
+  # still returns the full body-sized value and an oversized field would otherwise walk
+  # every regex on input the changeset is about to reject anyway. The cap is the LARGEST
+  # of the three field caps, so no value that can actually land is ever truncated.
+  @scan_byte_cap @ref_max_length
+
+  defp scan_slice(value) when is_binary(value) and byte_size(value) > @scan_byte_cap,
+    do: binary_part(value, 0, @scan_byte_cap)
+
+  defp scan_slice(value), do: value
+
+  @doc """
+  Emits the SHARED `[:loopctl, :coordination, :secret_blocked]` signal for each field a
+  REJECTED changeset flagged as carrying a credential — the same one `ChannelPost` fires,
+  so the coordination plane's credential-attempt counter covers the claim path too rather
+  than silently under-reporting it.
+
+  Fired by `Loopctl.Coordination.claim/5` where the write is actually rejected, never from
+  the (pure) changeset builder, which would re-count on every rebuild or preview.
+  """
+  @spec emit_secret_blocked_events(Ecto.Changeset.t()) :: :ok
+  def emit_secret_blocked_events(%Ecto.Changeset{} = changeset) do
+    for {field, {msg, _opts}} <- changeset.errors, msg == @secret_error_message do
+      metadata = %{
+        tenant_id: get_field(changeset, :tenant_id),
+        project_id: get_field(changeset, :project_id),
+        agent_id: get_field(changeset, :claimant_agent_id),
+        field: field
+      }
+
+      :telemetry.execute([:loopctl, :coordination, :secret_blocked], %{count: 1}, metadata)
+
+      # `inspect/1`, not raw interpolation: on `done`/`release` this fires BEFORE any
+      # project lookup (deliberately — `validate_caller_session/4` runs first so it can be
+      # no existence oracle), so `project_id` is whatever the caller sent. Interpolated
+      # raw, a newline in it forged a whole extra log record.
+      Logger.warning(
+        "coordination denylist hit: blocked claim #{inspect(field)} carrying a credential shape " <>
+          "(tenant=#{inspect(metadata.tenant_id)} project=#{inspect(metadata.project_id)} " <>
+          "agent=#{inspect(metadata.agent_id)})"
+      )
+    end
+
+    :ok
   end
 end
