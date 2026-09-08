@@ -46,13 +46,13 @@ All notable changes to loopctl are documented here.
   unread. The ceiling of 1.1 means it re-ranks near-ties and cannot flip a cross-lane
   relevance winner.
 
-  **It SHIPS DISABLED — `config :loopctl, :knowledge_importance_prior_enabled` defaults to
-  `false`, so ranking is byte-identical to pre-#790 until an operator turns it on.** The
-  carve-out it needs from the 2026-08-21 "ranking must never key on HOW a document got in"
-  decision is recorded in CLAUDE.md as not owner-ratified, and a ranking change may not
-  ratify itself. Turn it on with that key set to `true`; change its magnitude with
-  `:knowledge_importance_strength` (default 0.1); a strength of 0 is an exact no-op too. The
-  nightly stamp writes `read_day_count` either way, so enabling it later reads real history.
+  **It shipped DISABLED in this release and was ENABLED on 2026-09-08** by the owner ruling
+  recorded in CLAUDE.md, in the separate entry above. It shipped off because the carve-out it
+  needs from the 2026-08-21 "ranking must never key on HOW a document got in" decision was
+  not owner-ratified, and a ranking change may not ratify itself. Turn it off again with
+  `config :loopctl, :knowledge_importance_prior_enabled` set to `false`; change its magnitude
+  with `:knowledge_importance_strength` (default 0.1); a strength of 0 is an exact no-op too.
+  The nightly stamp writes `read_day_count` either way, so a revert loses no history.
 
   A candidate the stamp could not have measured — a shared system canonical, whose
   `tenant_id` is NULL — is scored at exactly 1.0, the same as any article with no recorded

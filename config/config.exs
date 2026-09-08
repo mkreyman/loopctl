@@ -1235,12 +1235,26 @@ config :loopctl, :knowledge_hub_demotion_enabled, true
 # decision's concern by a route that decision does not name. The 1.1 ceiling bounds it to
 # ~9% of relative position and nothing is ever scored down.
 #
-# THE PRE-FLIP BASELINE, so the monitoring has something to compare against. Seven days to
-# 2026-09-07, prior off throughout: precision (results opened / results surfaced) mean 0.023,
-# `search_follow_through` mean 0.117, `scored_follow_through` mean 0.339
-# (`knowledge_retrieval_metrics`). The number that decides this is rank-stratified
-# surfaced-to-opened conversion for HARVESTED material specifically — the measure the
-# 2026-08-21 decision named and that has still never been taken.
+# THE PRE-FLIP BASELINE, so the monitoring has something to compare against. From
+# `knowledge_retrieval_metrics`, 2026-09-05..07 with the prior off throughout, as AGGREGATES
+# over the window rather than a mean of daily ratios (a mean over-weights a quiet day):
+#
+#   precision (results opened / results surfaced)   74/2688  = 0.0275
+#   search_follow_through (searches that led to an open)  68/470 = 0.1447
+#   scored_follow_through                                 68/205 = 0.3317
+#
+# THREE days and not seven, and that constraint is not a rounding choice. Every row carries a
+# `metric_version` and the analytics surface says outright to COMPARE ROWS ONLY WITHIN ONE:
+# the definition set moved to v2 on 2026-09-05, so 09-01..09-04 are v1 and averaging across
+# the boundary produces a figure that silently is not comparable to the v2-only measurement
+# it will be checked against later. The first cut of this comment did exactly that. Whoever
+# takes the follow-up must filter to `metric_version: 2` as well, or the comparison is
+# meaningless in the same way and in the same direction.
+#
+# The sample is small, so treat a single day's move as noise. The number that actually
+# DECIDES this is rank-stratified surfaced-to-opened conversion for HARVESTED material
+# specifically — the measure the 2026-08-21 decision named, and that has still never been
+# taken.
 #
 # REVERTING IS THIS ONE LINE. If harvested-material conversion falls after this ships, that
 # is the overturn condition CLAUDE.md already states, and it is not a close call.
