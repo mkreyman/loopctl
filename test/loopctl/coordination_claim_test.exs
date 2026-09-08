@@ -727,7 +727,11 @@ defmodule Loopctl.CoordinationClaimTest do
                  ]),
                "#{call} must refuse #{inspect(binary_part(bad, 0, min(20, byte_size(bad))))}"
 
-        assert %{claimed_by_session: _} = errors_on(cs)
+        # Keyed on the PARAMETER the caller sent. done/release take `session_id` and write
+        # no `claimed_by_session` column, so naming the column told the caller a field it
+        # never sent was invalid.
+        assert %{session_id: _} = errors_on(cs)
+        refute Map.has_key?(errors_on(cs), :claimed_by_session)
       end
 
       # Nothing was written: the row is intact, and the audit log carries only the claim.
@@ -735,6 +739,125 @@ defmodule Loopctl.CoordinationClaimTest do
       refute is_nil(row)
       assert is_nil(row.done_at)
       assert claim_audit_actions(tenant.id, claim.id) == ["claimed"]
+    end
+
+    # The root cause #779 names first is "an unbounded value was an unbounded write into a
+    # table that is never pruned". A whitespace-only session_id is UNDISCRIMINABLE and
+    # never reaches a validation error — `cast/3`'s default `:empty_values` drops it as
+    # empty before the byte cap or any scanner runs — so the ONLY thing keeping a
+    # 2MB-of-spaces payload out of the append-only audit log and out of the guard's log
+    # line is done/release using the changeset's NORMALISED value instead of the caller's
+    # raw input. Pin that, because a revert to `Keyword.get(opts, :session_id)` reads fine.
+    test "#779: an oversized whitespace-only session_id never lands in the audit entry" do
+      %{tenant: tenant, project: project, agent_id: agent} = setup_member()
+
+      assert {:ok, claim} =
+               Coordination.claim(tenant.id, agent, project.id, "r",
+                 role: :agent,
+                 session_id: "session-a",
+                 audit: audit()
+               )
+
+      blanks = String.duplicate(" ", 10 * ChannelClaim.session_max_length())
+
+      assert {:ok, _} =
+               Coordination.done(tenant.id, agent, project.id, "r", audit(),
+                 session_id: blanks,
+                 force: true
+               )
+
+      assert [_claimed, done_metadata] = claim_audit_metadata(tenant.id, claim.id)
+      assert done_metadata["caller_session"] == nil
+      refute done_metadata["caller_session"] == blanks
+    end
+
+    # Every guard on this value is byte-oriented, so an invalid-UTF-8 binary — reachable
+    # through the endpoint's :urlencoded parser, which URL-decodes with no encoding check
+    # — passed all of them and then raised Jason.EncodeError on the audit metadata (jsonb)
+    # and Postgres SQLSTATE 22021 on the `text` column. The sibling of the NUL byte.
+    test "#779: an invalid-UTF-8 session_id is a 422 on done/release, never a raw 500" do
+      %{tenant: tenant, project: project, agent_id: agent} = setup_member()
+
+      assert {:ok, _} =
+               Coordination.claim(tenant.id, agent, project.id, "r",
+                 role: :agent,
+                 session_id: "session-a",
+                 audit: audit()
+               )
+
+      bad = <<"sess-", 0xFF>>
+      refute String.valid?(bad)
+
+      for call <- [:done, :release] do
+        assert {:error, %Ecto.Changeset{} = cs} =
+                 apply(Coordination, call, [
+                   tenant.id,
+                   agent,
+                   project.id,
+                   "r",
+                   audit(),
+                   [session_id: bad, force: true]
+                 ]),
+               "#{call} must refuse an invalid-UTF-8 session_id"
+
+        assert %{session_id: _} = errors_on(cs)
+      end
+    end
+
+    # The value the guard compares, logs and persists must be the one the validation
+    # approved, not the caller's raw input — otherwise the normalisation the claim path
+    # applies (blank means UNDISCRIMINABLE) silently does not apply here.
+    test "#779: a blank session_id on done is normalised to nil in the audit entry" do
+      %{tenant: tenant, project: project, agent_id: agent} = setup_member()
+
+      assert {:ok, claim} =
+               Coordination.claim(tenant.id, agent, project.id, "r",
+                 role: :agent,
+                 session_id: "session-a",
+                 audit: audit()
+               )
+
+      assert {:ok, _} =
+               Coordination.done(tenant.id, agent, project.id, "r", audit(),
+                 session_id: "   ",
+                 force: true
+               )
+
+      assert [_claimed, done_metadata] = claim_audit_metadata(tenant.id, claim.id)
+      assert done_metadata["caller_session"] == nil
+    end
+
+    # validate_caller_session/4 runs BEFORE any project lookup — deliberately, so it is no
+    # existence oracle — which put the caller's RAW project_id into the shared
+    # secret_blocked telemetry metadata and its operator log line. Unchecked, that both
+    # attributed credential attempts to projects the caller has nothing to do with and let
+    # a newline forge a whole extra log record.
+    test "#779: a non-UUID project_id never reaches the secret_blocked signal" do
+      %{tenant: tenant, agent_id: agent} = setup_member()
+      test_pid = self()
+      handler_id = "done-project-id-cast-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :coordination, :secret_blocked],
+        fn _event, _measurements, meta, _cfg ->
+          if meta[:tenant_id] == tenant.id, do: send(test_pid, {:blocked, meta})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      injected = "evil\n\n[error] FORGED LINE injected"
+
+      assert {:error, %Ecto.Changeset{}} =
+               Coordination.done(tenant.id, agent, injected, "r", audit(),
+                 session_id: "sk-ant-api03-" <> String.duplicate("a", 40)
+               )
+
+      assert_received {:blocked, meta}
+      assert meta[:project_id] == nil
+      refute meta[:project_id] == injected
     end
 
     test "#779: a credential-shaped session_id on done fires the shared secret_blocked signal" do
@@ -976,6 +1099,31 @@ defmodule Loopctl.CoordinationClaimTest do
 
       refute cs.valid?
       assert %{claimed_by_session: _} = errors_on(cs)
+    end
+
+    test "#779: an invalid-UTF-8 ref/session/host is refused, not left to raise at insert" do
+      # Postgres `text` raises SQLSTATE 22021 for a non-UTF-8 binary exactly as it does
+      # for a NUL byte — the same class, the same 500, one guard.
+      bad = <<"x", 0xFF>>
+      refute String.valid?(bad)
+
+      for {field, attrs} <- [
+            {:ref, %{ref: bad}},
+            {:claimed_by_session, %{ref: "r", claimed_by_session: bad}},
+            {:claimed_by_host, %{ref: "r", claimed_by_host: bad}}
+          ] do
+        cs = discriminator_changeset(attrs)
+        refute cs.valid?, "#{field} must refuse an invalid-UTF-8 value"
+        assert Map.has_key?(errors_on(cs), field)
+      end
+    end
+
+    test "#779: a whitespace-only value of ANY size normalises to nil, never to a stored string" do
+      long_blanks = String.duplicate(" ", 10 * ChannelClaim.session_max_length())
+      cs = discriminator_changeset(%{ref: "r", claimed_by_session: long_blanks})
+
+      assert cs.valid?
+      assert Ecto.Changeset.get_field(cs, :claimed_by_session) == nil
     end
 
     test "a branch-shaped ref is NOT refused by the credential scan" do

@@ -221,6 +221,14 @@ describe("#39.4: channel_post / channel_recent wiring", () => {
       /const CHANNEL_SESSION_ID = process\.env\.CLAUDE_SESSION_ID \|\| crypto\.randomUUID\(\);/,
       "must define CHANNEL_SESSION_ID as CLAUDE_SESSION_ID with a randomUUID fallback",
     );
+    // The POST path keeps the process-lifetime fallback on purpose. The CLAIM and LOCK
+    // paths do NOT (#779) — they compare their stamp again later — so assert the two are
+    // genuinely distinct constants rather than one name for both.
+    assert.doesNotMatch(
+      INDEX_SRC,
+      /const CLAIM_SESSION_ID = CHANNEL_SESSION_ID/,
+      "the claim/lock discriminator must not collapse back onto the post one",
+    );
     assert.match(
       functionSource("channelPostRaw"),
       /payload\.session_id = CHANNEL_SESSION_ID;/,
@@ -395,24 +403,32 @@ describe("US-40.B1: channel_claim / channel_release / channel_done wiring", () =
     );
   });
 
-  // #779 review round 1: the claim discriminator's lifetime must be the SESSION, not
-  // this PROCESS. Measured on minis 2026-09-08, 3 of 5 running loopctl MCP processes
-  // carried no CLAUDE_SESSION_ID, so the fallback is the common case — and a uuid
-  // re-minted on every npx respawn made the server read this session's OWN live claims
-  // as a peer's, 409 claim_session_mismatch on its own work for the rest of a lease.
-  test("the claim discriminator's fallback is DURABLE, not per-process (#779)", () => {
+  // #779: the claim discriminator's lifetime must be the SESSION, not this PROCESS — a
+  // uuid re-minted on every npx respawn made the server read this session's OWN live
+  // claims as a peer's, 409 claim_session_mismatch on its own work for the rest of a
+  // lease. Review round 1 answered that with an inline (host, cwd) temp file; round 2
+  // moved the whole resolution into lib/claim-session.js, because the file needed the
+  // CWE-59 symlink/ownership discipline lib/witness-sth.js already applies to its own
+  // predictable temp path — and because the ENV markers Claude Code always exports
+  // answer this without a file at all, without merging two concurrent sessions onto one
+  // id. The behaviour of that module is tested in test/claim_session.test.js; this
+  // asserts only the WIRING, which is what a revert would take out.
+  test("the claim discriminator is resolved through the shared module, never per-process (#779)", () => {
     assert.match(
       INDEX_SRC,
-      /const CLAIM_SESSION_ID =\s*process\.env\.CLAUDE_SESSION_ID \|\| durableClaimSessionId\(\);/,
-      "CLAIM_SESSION_ID must fall back to durableClaimSessionId(), never crypto.randomUUID()",
+      /import \{ resolveClaimSessionId \} from "\.\/lib\/claim-session\.js";/,
+      "index.js must import the shared claim-session resolver",
     );
-
-    const start = INDEX_SRC.indexOf("function durableClaimSessionId(");
-    assert.notEqual(start, -1, "index.js must define durableClaimSessionId");
-    const src = INDEX_SRC.slice(start, INDEX_SRC.indexOf("const CLAIM_SESSION_ID", start));
-    // The NAME being durable is worth nothing; these two lines are what makes it so.
-    assert.match(src, /readFileSync\(file, "utf8"\)/, "must re-read the persisted id");
-    assert.match(src, /writeFileSync\(file, minted/, "must persist a freshly minted id");
+    assert.match(
+      INDEX_SRC,
+      /const CLAIM_SESSION_ID = resolveClaimSessionId\(\{/,
+      "CLAIM_SESSION_ID must come from resolveClaimSessionId(), never crypto.randomUUID()",
+    );
+    assert.doesNotMatch(
+      INDEX_SRC,
+      /const CLAIM_SESSION_ID = [^\n]*crypto\.randomUUID/,
+      "CLAIM_SESSION_ID must never be a bare per-process uuid",
+    );
   });
 
   test("channelClaims sends session_id so the server can answer same_session (#779)", () => {
@@ -672,14 +688,20 @@ describe("US-40.4: channel_lock / channel_unlock / channel_locks wiring", () => 
   test("host/session_id stay PROXY-supplied on the lock path (never caller args)", () => {
     // session_id is what makes a lock refreshable in place and releasable by
     // slot; a caller-supplied one would let a client address another session's slot.
+    //
+    // WHICH proxy-supplied id (#779) is asserted in test/claim_session.test.js: a lock's
+    // ownership is resolved AGAIN later, by the (tenant, project, agent, session, key)
+    // slot, so it belongs to the CLAIM family and not to the one-shot post family. This
+    // test pins that both stay proxy-supplied; it deliberately no longer names the
+    // constant, so the two files cannot contradict each other on that point.
     assert.match(
-      INDEX_SRC,
-      /async function channelLock\([\s\S]*?payload\.host = os\.hostname\(\);[\s\S]*?payload\.session_id = CHANNEL_SESSION_ID;/,
+      functionSource("channelLock"),
+      /payload\.host = os\.hostname\(\);[\s\S]*?payload\.session_id = [A-Z_]*SESSION_ID;/,
       "channelLock must auto-fill host and session_id",
     );
     assert.match(
-      INDEX_SRC,
-      /async function channelUnlock\([\s\S]*?payload\.session_id = CHANNEL_SESSION_ID;/,
+      functionSource("channelUnlock"),
+      /payload\.session_id = [A-Z_]*SESSION_ID;/,
       "channelUnlock must auto-fill session_id",
     );
     // Neither tool schema may expose host/session_id as caller inputs.

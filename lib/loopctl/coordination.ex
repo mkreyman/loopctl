@@ -1692,10 +1692,12 @@ defmodule Loopctl.Coordination do
   `check_claim_session/3` for what that does and, more importantly, does not enforce.
 
   The caller's `:session_id` is validated FIRST, against the same rules the claim path
-  applies to `claimed_by_session` (200-byte cap, no NUL byte, no credential shape,
-  string-typed): it is echoed into the guard's log line and persisted into the
-  append-only audit entry's jsonb metadata, so an invalid value is
-  `{:error, %Ecto.Changeset{}}` (422) rather than an unbounded write or a raw 500.
+  applies to `claimed_by_session` (200-byte cap on the RAW value, no NUL byte, valid
+  UTF-8, no credential shape, string-typed): it is echoed into the guard's log line and
+  persisted into the append-only audit entry's jsonb metadata, so an invalid value is
+  `{:error, %Ecto.Changeset{}}` (422, keyed on `:session_id` — the parameter the caller
+  sent) rather than an unbounded write or a raw 500. The NORMALISED value is what the
+  guard, the log and the audit entry then use.
 
   Returns `{:ok, %ChannelClaim{}}` (the updated claim), `{:error, :not_found}`,
   `{:error, :claim_session_mismatch}`, or
@@ -1711,7 +1713,7 @@ defmodule Loopctl.Coordination do
     {audit, opts} = split_claim_opts(audit, opts)
     now = DateTime.utc_now()
 
-    with :ok <- validate_caller_session(tenant_id, project_id, agent_id, opts),
+    with {:ok, opts} <- validate_caller_session(tenant_id, project_id, agent_id, opts),
          %ChannelClaim{} = owned <- fetch_owned_claim(tenant_id, agent_id, project_id, ref) do
       finish_done(tenant_id, project_id, agent_id, owned, now, audit, opts)
     else
@@ -1769,8 +1771,8 @@ defmodule Loopctl.Coordination do
   `07f5e839`). A claim whose LEASE HAS EXPIRED is not guarded: nobody is working it,
   the sweeper is about to reap it, and refusing there told the caller to leave alone a
   ref that is already free. The caller's `:session_id` is validated exactly as in
-  `done/6` (cap, NUL, credential denylist) before any row is touched — 422, not a 500
-  or an unbounded audit write.
+  `done/6` (cap on the raw value, NUL, UTF-8, credential denylist) before any row is
+  touched — 422, not a 500 or an unbounded audit write.
 
   Returns `{:ok, %ChannelClaim{}}` (the deleted claim), `{:error, :not_found}`,
   `{:error, :already_claimed}` (the claim is already DONE — terminal),
@@ -1787,7 +1789,7 @@ defmodule Loopctl.Coordination do
   def release(tenant_id, agent_id, project_id, ref, audit \\ [], opts \\ []) do
     {audit, opts} = split_claim_opts(audit, opts)
 
-    with :ok <- validate_caller_session(tenant_id, project_id, agent_id, opts),
+    with {:ok, opts} <- validate_caller_session(tenant_id, project_id, agent_id, opts),
          %ChannelClaim{} = owned <- fetch_owned_claim(tenant_id, agent_id, project_id, ref) do
       finish_release(tenant_id, project_id, agent_id, owned, audit, opts)
     else
@@ -1935,25 +1937,60 @@ defmodule Loopctl.Coordination do
   # The caller's `session_id` is client-supplied free text on a surface any agent key can
   # call, and `done`/`release` build no claim changeset — so without this it reached the
   # audit log's jsonb `metadata` (and the guard's log line) uncapped, unscanned and with
-  # a NUL byte still in it, where the claim path answers 422 for all three. jsonb is the
-  # STRICTER sink: Postgres refuses the escape Jason emits for a NUL byte, so one was a
-  # raw 500. Validated BEFORE the owner fetch: it is a fault in the caller's own input,
+  # a NUL byte or an invalid-UTF-8 binary still in it, where the claim path answers 422
+  # for every one of those. jsonb is the STRICTER sink: Postgres refuses the escape Jason
+  # emits for a NUL byte, and Jason itself refuses a non-UTF-8 binary, so both were a raw
+  # 500. Validated BEFORE the owner fetch: it is a fault in the caller's own input,
   # decidable without touching a row, so it can be no existence oracle.
   defp validate_caller_session(tenant_id, project_id, agent_id, opts) do
     changeset =
       ChannelClaim.caller_session_changeset(
-        %{tenant_id: tenant_id, project_id: project_id, claimant_agent_id: agent_id},
+        %{
+          tenant_id: tenant_id,
+          # The caller's RAW `project_id` — it has not been looked up yet, because this
+          # gate runs first so it can be no existence oracle. It reaches the shared
+          # `secret_blocked` telemetry metadata and its log line, so cast it: unchecked,
+          # a caller could tag the coordination plane's credential-attempt counter with a
+          # project that does not exist or belongs to someone else.
+          project_id: castable_uuid(project_id),
+          claimant_agent_id: agent_id
+        },
         Keyword.get(opts, :session_id)
       )
 
     if changeset.valid? do
-      :ok
+      # The NORMALISED value, not the caller's raw input: a whitespace-only session_id is
+      # UNDISCRIMINABLE (nil) exactly as it is on the claim path, and the guard, the log
+      # line and the audit entry must all see the same value the validation approved.
+      {:ok,
+       Keyword.put(opts, :session_id, Ecto.Changeset.get_field(changeset, :claimed_by_session))}
     else
       # Same shared counter the claim path raises, for the same reason: a credential
       # attempt this gate refuses must not be missing from the coordination plane's
       # dashboard just because it arrived one endpoint over.
       ChannelClaim.emit_secret_blocked_events(changeset)
-      {:error, %{changeset | action: :update}}
+      {:error, %{changeset | action: :update, errors: rename_session_errors(changeset.errors)}}
+    end
+  end
+
+  # `done`/`release` take a `session_id` parameter and write no `claimed_by_session`
+  # column, so a 422 keyed on the column name named a field the caller never sent and
+  # could not correct. The changeset is built on the schema field (that is what
+  # `emit_secret_blocked_events/1` attributes and what the claim path stores); the
+  # rendered error is keyed on the parameter the caller actually supplied.
+  defp rename_session_errors(errors) do
+    Enum.map(errors, fn
+      {:claimed_by_session, error} -> {:session_id, error}
+      other -> other
+    end)
+  end
+
+  # A non-UUID project_id is not an error here (the owner fetch answers 404 for it, with
+  # no oracle); it simply must not be echoed into telemetry or a log line.
+  defp castable_uuid(value) do
+    case Ecto.UUID.cast(value) do
+      {:ok, uuid} -> uuid
+      :error -> nil
     end
   end
 
@@ -1965,8 +2002,8 @@ defmodule Loopctl.Coordination do
   # which is otherwise silent for a whole lease. An ordinary match stays silent.
   #
   # The ref is deliberately NOT logged: it is caller-supplied free text with no cap and
-  # no credential scan (see `ChannelClaim.validate_no_secrets/1` for why the ref cannot
-  # have one). `caller_session` IS logged because it is the one caller-supplied value
+  # no credential scan (see the comment above `ChannelClaim.reject_secret/2` for why the
+  # ref cannot have one). `caller_session` IS logged because it is the one caller-supplied value
   # here that `validate_caller_session/4` has already capped, NUL-checked and
   # denylist-scanned — that validation is what makes this line safe, so do not log
   # anything else without it.

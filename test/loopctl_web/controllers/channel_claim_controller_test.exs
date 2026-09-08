@@ -362,16 +362,51 @@ defmodule LoopctlWeb.ChannelClaimControllerTest do
              |> json_response(201)
 
       for path <- [@done_path, @release_path] do
+        body =
+          raw
+          |> post_json(path, %{
+            project_id: project.id,
+            ref: "r",
+            session_id: "x" <> <<0>> <> "y"
+          })
+          |> json_response(422)
+
+        # Keyed on the parameter the caller SENT. done/release write no
+        # `claimed_by_session` column, so naming it told the client a field it does not
+        # have is invalid — unmappable back to its own request.
+        assert Map.has_key?(body["error"]["details"], "session_id")
+        refute Map.has_key?(body["error"]["details"], "claimed_by_session")
+      end
+
+      # And the claim survived both refusals.
+      assert raw
+             |> post_json(@done_path, %{project_id: project.id, ref: "r"})
+             |> json_response(200)
+    end
+
+    test "#779: an invalid-UTF-8 session_id on done/release is a 422, never a raw 500" do
+      # The sibling of the NUL byte, reachable through the endpoint's :urlencoded parser
+      # (it URL-decodes to a raw binary with no encoding check). Every guard on this value
+      # is byte-oriented, so it passed all of them and then raised Jason.EncodeError on
+      # the audit metadata jsonb / Postgres 22021 on the claim path's text column.
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = member_agent_key(tenant, project)
+
+      assert raw
+             |> post_json(@claim_path, %{project_id: project.id, ref: "r"})
+             |> json_response(201)
+
+      for path <- [@done_path, @release_path] do
         assert raw
                |> post_json(path, %{
                  project_id: project.id,
                  ref: "r",
-                 session_id: "x" <> <<0>> <> "y"
+                 session_id: <<"sess-", 0xFF>>
                })
                |> json_response(422)
       end
 
-      # And the claim survived both refusals.
       assert raw
              |> post_json(@done_path, %{project_id: project.id, ref: "r"})
              |> json_response(200)

@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url";
 import path, { dirname, join } from "node:path";
 import { applyArgAliases } from "./lib/arg-aliases.js";
 import { clientContextHeader } from "./lib/client-context.js";
+import { resolveClaimSessionId } from "./lib/claim-session.js";
 import { degradedSearchNotice } from "./lib/search-notices.js";
 import {
   projectsPath,
@@ -498,51 +499,30 @@ async function restoreKbScope({ project_id }) {
 // already exist?) rather than on same_session (was it this session?).
 const CHANNEL_SESSION_ID = process.env.CLAUDE_SESSION_ID || crypto.randomUUID();
 
-// #779: the CLAIM paths need a discriminator whose lifetime is the SESSION, not this
-// PROCESS. A claim is long-lived (a lease is up to 24h) and its stamp is compared again
-// on channel_done / channel_release, so a per-process id turns every npx respawn or
-// /mcp reconnect into a 409 claim_session_mismatch on this session's OWN live work —
-// recoverable only by discovering force: true, and otherwise held for the rest of the
-// lease. That is not the exotic path: measured on minis 2026-09-08, 3 of 5 running
-// loopctl MCP processes carried NO CLAUDE_SESSION_ID, so the fallback IS the common
-// case. (The post path keeps the process-lifetime fallback above: US-454 pins it, and a
-// post is a one-shot write with nothing to compare later.)
+// #779: the CLAIM and LOCK paths need a discriminator whose lifetime is the SESSION, not
+// this PROCESS — both compare the stamp again later (done/release; the lock refresh and
+// release resolve by the (tenant, project, agent, session, key) slot), so a
+// process-lifetime uuid turns every npx respawn or /mcp reconnect into a 409 on this
+// session's OWN live work. The post path above keeps the process-lifetime fallback:
+// US-454 pins it, and a post is a one-shot write with nothing to compare later.
 //
-// So persist the fallback, keyed by (host, launch cwd) — Claude Code launches the proxy
-// in the session's project root, and a worktree session therefore gets its own id,
-// while a respawned proxy in the SAME session re-reads the same one. Two sessions
-// sharing one directory collide and read same_session: true about each other, which is
-// exactly the pre-#779 behaviour rather than a new failure; two MACHINES — the incident
-// this feature exists for (KB b447b16b) — never collide.
-//
-// Never throws. An unreadable/unwritable temp dir degrades to a process-lifetime uuid,
-// i.e. today's behaviour.
-function durableClaimSessionId() {
-  const key = crypto
-    .createHash("sha256")
-    .update(`${os.hostname()}\n${process.cwd()}`)
-    .digest("hex")
-    .slice(0, 32);
-  const file = path.join(os.tmpdir(), `loopctl-mcp-claim-session-${key}.id`);
-
-  try {
-    const existing = readFileSync(file, "utf8").trim();
-    if (existing) return existing;
-  } catch {
-    // Not minted yet (or unreadable) — mint below.
-  }
-
-  const minted = crypto.randomUUID();
-  try {
-    writeFileSync(file, minted, { mode: 0o600 });
-  } catch {
-    // Keep the in-memory id; the next process mints its own, which is the status quo.
-  }
-  return minted;
-}
-
-const CLAIM_SESSION_ID =
-  process.env.CLAUDE_SESSION_ID || durableClaimSessionId();
+// The resolution order, the symlink/uid/shape guards on the last-resort temp file, and
+// WHY a wrong MERGE of two sessions is far worse than a wrong SPLIT all live in
+// lib/claim-session.js — the same shape as lib/witness-sth.js, and testable against an
+// injected fs.
+const CLAIM_SESSION_ID = resolveClaimSessionId({
+  env: process.env,
+  fs: { readFileSync, writeFileSync, renameSync, lstatSync, unlinkSync },
+  getuid: typeof process.getuid === "function" ? () => process.getuid() : undefined,
+  randomUUID: () => crypto.randomUUID(),
+  randomBytes: (n) => crypto.randomBytes(n),
+  pid: process.pid,
+  tmpdir: os.tmpdir(),
+  hostname: os.hostname(),
+  cwd: process.cwd(),
+  createHash: (alg) => crypto.createHash(alg),
+  join: path.join,
+});
 
 async function channelPostRaw({
   project_id,
@@ -794,7 +774,13 @@ async function channelLock({ project_id, target, ttl_seconds, note }) {
   if (ttl_seconds) payload.ttl_seconds = ttl_seconds;
   if (note) payload.body = note;
   payload.host = os.hostname();
-  payload.session_id = CHANNEL_SESSION_ID;
+  // #779: the CLAIM discriminator, not the post one. A lock's ownership is resolved
+  // again later — fetch_owned_lock/5 matches on (tenant, project, agent, session, key)
+  // for BOTH the in-place refresh and the release — so it is the claim shape, not the
+  // one-shot post shape. With the process-lifetime id an npx respawn mid-lease 404'd
+  // channel_unlock on the session's OWN lock and made channel_lock create a SECOND row
+  // instead of refreshing, stranding a stale hint for the rest of the TTL (up to 3600s).
+  payload.session_id = CLAIM_SESSION_ID;
   const result = await apiCall(
     "POST",
     "/api/v1/channel/locks",
@@ -811,7 +797,9 @@ async function channelUnlock({ project_id, target }) {
   // byte-identical 404 (no existence oracle). A lock ALSO self-expires on its short
   // TTL, so forgetting to unlock can never strand a file.
   const payload = { project_id, target };
-  payload.session_id = CHANNEL_SESSION_ID;
+  // #779: the CLAIM discriminator — the release resolves the slot by session id, so it
+  // must be the same value channelLock stamped, across a respawn. See channelLock.
+  payload.session_id = CLAIM_SESSION_ID;
   const result = await apiCall(
     "POST",
     "/api/v1/channel/locks/release",

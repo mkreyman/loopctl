@@ -42,11 +42,27 @@ All notable changes to loopctl are documented here.
   the outcome — the refusal writes no audit row, so telemetry is the only signal there.
 
   The caller's `session_id` on `done`/`release` is held to the SAME rules the claim path
-  applies to `claimed_by_session` — a string, at most 200 bytes, no NUL byte, no credential
-  shape — because it is echoed into the guard's log line and persisted into the append-only
-  audit entry's `metadata`. A violation is a `422` (a NUL byte was previously a raw `500`
-  from the jsonb write, and an oversized value an unbounded audit row), and a credential
-  shape also raises `[:loopctl, :coordination, :secret_blocked]`.
+  applies to `claimed_by_session` — a string, at most 200 bytes, no NUL byte, valid UTF-8,
+  no credential shape — because it is echoed into the guard's log line and persisted into
+  the append-only audit entry's `metadata`. A violation is a `422` whose `details` are
+  keyed on `session_id`, the parameter you sent (a NUL byte and a non-UTF-8 binary were
+  both previously a raw `500` from the jsonb write, and an oversized value an unbounded
+  audit row), and a credential shape also raises
+  `[:loopctl, :coordination, :secret_blocked]`. A whitespace-only `session_id` of any size
+  is UNDISCRIMINABLE, exactly as on the claim path: it is recorded as `null`, never as the
+  string you sent.
+
+  **MCP proxy (`loopctl-mcp-server`).** The claim and lock tools now resolve their session
+  id from `CLAUDE_CODE_SESSION_ID` first, then `CLAUDE_SESSION_ID`, and only then from a
+  `(host, cwd)`-keyed file under the temp dir. The specific marker is preferred because
+  `CLAUDE_SESSION_ID` is INHERITED by a headless subsession, so two concurrent sessions in
+  one directory would otherwise stamp one value — and a shared stamp lets a peer's
+  `channel_release` delete live work with no `409`. `channel_lock`/`channel_unlock` moved
+  onto the same id as the claims: the server resolves a lock's refresh and release by the
+  `(tenant, project, agent, session, key)` slot, so a process-lifetime id stranded a
+  session's own lock for the rest of its TTL after an npx respawn. The temp file is
+  read behind an `lstat` symlink/ownership refusal and a uuid shape check, and written
+  with `O_EXCL` plus a rename, matching the STH cache's existing discipline.
 
   Migration `20260907140000_add_session_discriminator_to_channel_claims` adds two nullable
   `text` columns and no index. No backfill and no manual step: existing rows and clients
