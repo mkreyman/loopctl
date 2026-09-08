@@ -161,11 +161,18 @@ defmodule Loopctl.Knowledge.Article do
     # "under a fleet sharing one key EVERY article ties at 1", so readership is near-flat on
     # this tenant while days still carry signal.
     #
-    # nil and 0 are the SAME state — never measured, or measured as unread — and both make
-    # `RankingPriors.importance_factor/4` return exactly 1.0. That exact floor is what keeps
-    # the prior one-sided: an unread article ranks exactly where it ranked before this
-    # column existed. See the note above `@kill_tag` in `RankingPriors` for why a prior that
-    # DEMOTES unread material is a closed loop and is not allowed here.
+    # nil and 0 are the SAME state for a TENANT row — never measured, or measured as unread —
+    # and both make `RankingPriors.importance_factor/4` return exactly 1.0. That exact floor
+    # is what keeps the prior one-sided: an unread article's SCORE is exactly what it was
+    # before this column existed (its POSITION relative to a used article is not — see the
+    # moduledoc admonition in `RankingPriors`). See the note above `@kill_tag` there for why
+    # a prior that DEMOTES unread material is a closed loop and is not allowed here.
+    #
+    # On a SYSTEM canonical nil means something else again — NOT MEASURED, and unmeasurable,
+    # since `Importance`'s write predicate is `a.tenant_id == ^tenant_id` and a canonical's
+    # `tenant_id` is NULL. The column cannot tell the two apart, which is why the pool gate
+    # (`RankingPriors.pool_importance_strength/2`) turns the prior off for any pool holding
+    # one rather than reading its NULL as zero usage.
     #
     # NEVER add this to a `cast` list. It is a live RANKING INPUT, so a caller that could
     # write it could pin its own article at maximum importance forever — the same rule that

@@ -1155,13 +1155,16 @@ config :loopctl, :knowledge_hub_demotion_enabled, true
 #
 # DISTINCT DAYS, never raw reads (a `knowledge_get` loop inflates a count and cannot inflate a
 # day) and never distinct READERS (near-flat here — under a fleet sharing one key every article
-# ties at 1). Drills stay uncounted. That is the #567/#569/#572 rule: ranking must not key on a
+# ties at 1), though ONE principal's contribution is capped at 5 days so a daily read loop
+# cannot walk a key's own note to the ceiling alone. Drills stay uncounted. That is the #567/#569/#572 rule: ranking must not key on a
 # signal the ranking itself produces.
 #
-# ONE-SIDED UPWARD, and this is the load-bearing property rather than a tuning choice: an
-# article with no recorded usage gets EXACTLY 1.0 and ranks precisely where it ranked before
-# this prior existed. A two-sided usage prior would reach the closed loop the 2026-08-21 owner
-# decision forbids by a different road — bulk-harvested material is ~96% of the corpus and is
+# ONE-SIDED UPWARD IN SCORE, and this is the load-bearing property rather than a tuning choice:
+# an article with no recorded usage gets EXACTLY 1.0 and is never scored below where it was
+# before this prior existed. Not rank-neutral, though — promoting a used article moves an unread
+# one DOWN THE LIST relative to it, bounded by the ceiling; RankingPriors' moduledoc admonition
+# states that precisely. A two-sided usage prior would drop that bound and reach the closed loop
+# the 2026-08-21 owner decision forbids by a different road — bulk-harvested material is ~96% of the corpus and is
 # read less, so demoting on usage would systematically bury exactly the material Mark said he
 # wants surfaced ("we would never learn anything new and unexpectedly useful"). Demotion here
 # belongs solely to deliberate editorial acts (verdict-kill / :superseded).

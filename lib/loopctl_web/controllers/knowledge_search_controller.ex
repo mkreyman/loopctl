@@ -317,9 +317,15 @@ defmodule LoopctlWeb.KnowledgeSearchController do
                        "explained. The factor is " <>
                        "`clamp(1 + strength * log1p(read_days)/log1p(30), 1.0, 1.1)`, where " <>
                        "`read_days` is the distinct days the article was opened inside the " <>
-                       "nightly stamp's window. It is ONE-SIDED: an article with no recorded " <>
-                       "usage gets exactly 1.0 and is never pushed down. `0.0` means " <>
-                       "importance played no part in this ordering."
+                       "nightly stamp's window. It is one-sided in SCORE: an article with no " <>
+                       "recorded usage gets exactly 1.0 and is never scored down, though " <>
+                       "promoting a used article does move an unused one down the ORDER " <>
+                       "relative to it, by at most the 1.1 ceiling. `0.0` means importance " <>
+                       "played no part in this ordering — the prior is disabled, its " <>
+                       "strength is configured to zero, or this pool contained an article " <>
+                       "whose usage cannot be measured (a shared system canonical), which " <>
+                       "turns the prior off for the whole pool rather than ranking a " <>
+                       "measured article against an unmeasurable one."
                  },
                  remediation: %OpenApiSpex.Schema{
                    type: :object,

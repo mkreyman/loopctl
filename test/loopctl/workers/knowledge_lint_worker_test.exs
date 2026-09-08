@@ -421,6 +421,10 @@ defmodule Loopctl.Workers.KnowledgeLintWorkerTest do
       assert stamped == 1
 
       assert [entry] = lint_audit_entries(tenant.id)
+      # `measured` and `stamped` are recorded separately BECAUSE they diverge: `stamped` is a
+      # write delta and goes to 0 on a steady-state night over an actively-read corpus, so an
+      # operator reading it as "how much was read" diagnoses that night as a dead corpus.
+      assert entry.new_state["importance_measured"] == 1
       assert entry.new_state["importance_stamped"] == 1
       assert entry.new_state["importance_gate"] == "open"
     end

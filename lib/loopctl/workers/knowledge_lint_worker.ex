@@ -413,7 +413,8 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         "generic_titles_failed=#{retitled.failed} " <>
         "generic_title_budget_exhausted=#{retitled.budget_exhausted} " <>
         "generic_title_gate=#{retitled.gate} " <>
-        "importance_stamped=#{stamped.stamped} importance_cleared=#{stamped.cleared} " <>
+        "importance_measured=#{stamped.measured} importance_stamped=#{stamped.stamped} " <>
+        "importance_cleared=#{stamped.cleared} " <>
         "importance_truncated=#{stamped.truncated} importance_gate=#{stamped.gate} " <>
         consolidation_log(consolidation)
     )
@@ -1771,12 +1772,22 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
         "links_prunable_remaining" => pruned.remaining,
         "resolutions_applied" => resolutions_applied,
         "consolidation" => consolidation_state(consolidation, applied, retitled),
-        # The importance stamp (#790). `stamped` and `cleared` are recorded separately
-        # because they answer different questions: `stamped` is how much of the corpus was
-        # read at all in the window, `cleared` is how much stopped being read. A night with
-        # both at 0 and `gate: "open"` is a genuinely quiet corpus; the gate is what tells
-        # that apart from a shed or failed step, which is the same reading every other step
-        # here carries its gate for.
+        # The importance stamp (#790). THREE numbers because they answer three different
+        # questions, and reading the wrong one is how a healthy night gets diagnosed as a
+        # dead corpus:
+        #
+        #   * `measured` — how many articles the window found a read for. This is the USAGE
+        #     number.
+        #   * `stamped` — how many rows the write actually CHANGED. `set_count/2` restricts
+        #     the update to values that MOVED (`IS DISTINCT FROM`), so a corpus read on the
+        #     same days as last night reports `measured > 0` with `stamped: 0`. That is a
+        #     steady state, not silence.
+        #   * `cleared` — how many rows stopped being read and were returned to neutral.
+        #
+        # A genuinely quiet corpus is `measured: 0`, not `stamped: 0`. The gate tells all of
+        # those apart from a shed or failed step, and on `write_failed` the counts are what
+        # COMMITTED before the failure rather than zero.
+        "importance_measured" => importance.measured,
         "importance_stamped" => importance.stamped,
         "importance_cleared" => importance.cleared,
         "importance_truncated" => importance.truncated,

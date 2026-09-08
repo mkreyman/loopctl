@@ -395,6 +395,75 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
     end
   end
 
+  describe "#790 review: a pool holding an UNMEASURABLE row turns the prior off" do
+    test "one system canonical in the fused pool drops importance_strength to 0.0" do
+      # A canonical's `read_day_count` is permanently NULL -- the nightly stamp's write
+      # predicate is `a.tenant_id == ^tenant_id` and a canonical's `tenant_id` is NULL -- so
+      # NULL there means NOT MEASURED, not "read on zero days". Ranking the tenant's measured
+      # rows against it on one number is the #569/#572 counted-vs-uncounted defect with the
+      # direction reversed, and the shared canon is where the harvested material lives.
+      tenant = fixture(:tenant)
+      mine = create_article(tenant.id, %{title: "Measured note", body: @body})
+      set_read_days(tenant.id, mine.id, 60)
+
+      {:ok, canonical} =
+        Knowledge.create_article(tenant.id, %{
+          title: "Shared canon note",
+          body: @body,
+          category: :reference,
+          scope: :system,
+          status: :published
+        })
+
+      assert is_nil(canonical.tenant_id)
+      # A canonical reaches a tenant's fused pool ONLY through the side-table path
+      # (`hydrate_semantic_pool/6`, `tenant_id == ^tenant_id or scope == :system`) -- the
+      # legacy-column semantic lane is strictly `tenant_id == ^tenant_id`. So: turn side-table
+      # reads on through the existing DI seam and materialize the tenant's own vector row for
+      # the shared article, which is exactly what AC-41.1.7 does on demand in production.
+      stub(Loopctl.MockEmbeddingReadPath, :side_table_reads_enabled?, fn -> true end)
+
+      AdminRepo.insert!(%Loopctl.Knowledge.ArticleEmbedding{
+        tenant_id: tenant.id,
+        article_id: canonical.id,
+        dim: 1536,
+        embedding: Pgvector.new(query_vector()),
+        live_denorm: true
+      })
+
+      expect_query_embedding()
+
+      assert {:ok, %{results: results, meta: meta}} =
+               Knowledge.search_combined(tenant.id, "sprocket calibration telemetry",
+                 now: @now,
+                 importance_strength: 0.1
+               )
+
+      # Precondition, not decoration: with the canonical outside the pool this proves nothing.
+      assert canonical.id in ids(results)
+
+      assert meta.importance_strength == 0.0
+    end
+
+    test "the tenant's own pool keeps the configured strength" do
+      # The positive control for the gate above -- without it, a gate that fired on EVERY
+      # pool would pass the assertion and disable the prior product-wide.
+      tenant = fixture(:tenant)
+      mine = create_article(tenant.id, %{title: "Measured note", body: @body})
+      set_read_days(tenant.id, mine.id, 60)
+
+      expect_query_embedding()
+
+      assert {:ok, %{meta: meta}} =
+               Knowledge.search_combined(tenant.id, "sprocket calibration telemetry",
+                 now: @now,
+                 importance_strength: 0.1
+               )
+
+      assert meta.importance_strength == 0.1
+    end
+  end
+
   describe "#790 tenant isolation" do
     test "the importance prior orders tenant A's own rows and never pools tenant B's" do
       tenant_a = fixture(:tenant)

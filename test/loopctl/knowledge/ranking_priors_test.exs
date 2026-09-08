@@ -216,16 +216,53 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
     end
 
     test "the bounded priors cannot flip a materially stronger (2x) relevance winner" do
-      # Worst case FOR the strong doc: it is the least-favored by the priors (old + idea),
-      # the weak doc is the most-favored (fresh + decision). A 2x fused-score lead must
-      # still survive — this is the "break ties, do not dominate strong relevance" invariant.
+      # Worst case FOR the strong doc: it is the least-favored by the priors (old + idea +
+      # unread), the weak doc is the most-favored (fresh + decision + SATURATED USAGE). A 2x
+      # fused-score lead must still survive — this is the "break ties, do not dominate strong
+      # relevance" invariant, and the reason the weak doc carries `read_day_count` is that
+      # #790 added a third band: without it this guard stopped describing the
+      # maximally-favoured document the moment importance shipped, and could not see the
+      # composed spread move.
       strong = %{category: :idea, updated_at: days_ago(400), tags: [], status: :published}
-      weak = %{category: :decision, updated_at: @now, tags: [], status: :published}
+
+      weak = %{
+        category: :decision,
+        updated_at: @now,
+        tags: [],
+        status: :published,
+        read_day_count: 100_000
+      }
 
       strong_base = 0.016_393
       weak_base = strong_base / 2.0
 
-      assert strong_base * mult(strong, []) > weak_base * mult(weak, [])
+      assert strong_base * mult(strong, []) > weak_base * mult(weak, importance_strength: 0.1)
+    end
+
+    test "the COMPOSED worst-case spread is 1.65 and stays under the 2x consensus gap" do
+      # The number the moduledoc names, asserted rather than described. Least-favoured is
+      # recency 0.700 (age >> tau at w = 0.3) * authority 1.0 (unknown category) * importance
+      # 1.0 (unread); most-favoured is recency 1.0 * authority 1.05 * importance 1.1. If a
+      # future change widens any of the three bands past a composed 2.0, importance stops
+      # breaking ties and starts overriding a cross-lane consensus winner.
+      least =
+        mult(%{category: nil, updated_at: days_ago(10_000), tags: [], status: :published}, [])
+
+      most =
+        mult(
+          %{
+            category: :decision,
+            updated_at: @now,
+            tags: [],
+            status: :published,
+            read_day_count: 100_000
+          },
+          importance_strength: 0.1
+        )
+
+      assert_in_delta least, 0.700, 1.0e-3
+      assert_in_delta most, 1.155, 1.0e-3
+      assert most / least < 2.0
     end
 
     test "a verdict-kill doc is demoted below a clean near-tie even when fresher" do
@@ -510,6 +547,23 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
         )
       end
     end
+
+    # #790 review: `tenant_id` is not decoration on these lanes, it is the MEASURABILITY
+    # discriminator. `pool_importance_strength/2` fails CLOSED on a result with no
+    # `:tenant_id` key, so a lane that stops projecting it turns the importance prior off for
+    # every pool that lane contributes to -- silently, and product-wide rather than for one
+    # candidate. Same anchoring as the three guards above, opposite failure direction.
+    test "every lane select projects tenant_id" do
+      for {path, head} <- @ranking_lanes do
+        assert_lane_projects(
+          path,
+          head,
+          "tenant_id:",
+          "RankingPriors.pool_importance_strength/2 fails CLOSED without it, so a pool " <>
+            "this lane contributes to loses the importance prior entirely"
+        )
+      end
+    end
   end
 
   describe "read_day_count/1 (#790 -- the usage signal, fail-open)" do
@@ -573,7 +627,7 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
     end
   end
 
-  describe "importance_factor/4 (#790 -- bounded and ONE-SIDED UPWARD)" do
+  describe "importance_factor/4 (#790 -- bounded and one-sided upward IN SCORE)" do
     @importance_ceiling 1.1
     @strength 0.1
 
@@ -587,9 +641,11 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
     end
 
     test "an article with NO recorded usage gets EXACTLY 1.0" do
-      # Not approximately. This is the whole compatibility claim with the 2026-08-21 owner
-      # decision: an unread note ranks precisely where it ranked before this prior existed,
-      # so nothing can be demoted for being unread and the closed loop cannot form.
+      # Not approximately. An unread note is SCORED precisely where it was scored before this
+      # prior existed, so nothing is demoted for being unread. It is not rank-neutral -- a
+      # used competitor still passes it -- but the shift is bounded by the ceiling and
+      # nothing is pushed below its own starting score, which is what stops the closed loop
+      # the 2026-08-21 owner decision names.
       assert importance(nil) === 1.0
       assert importance(0) === 1.0
       assert RankingPriors.importance_factor(%{}, @strength, 1.0, @importance_ceiling) === 1.0
@@ -679,6 +735,57 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
         )
 
       assert tie * used > tie * unread
+    end
+  end
+
+  describe "the importance prior applies only to a MEASURABLE pool (#790 review)" do
+    # A system canonical's `read_day_count` is permanently NULL because the nightly stamp
+    # writes `where a.tenant_id == ^tenant_id` and its `tenant_id` is NULL. NULL there means
+    # NOT MEASURED, not "read on zero days", and the column cannot tell the two apart -- so a
+    # mixed pool would rank a counted class against an uncounted one on one number, the
+    # #569/#572 defect with the direction reversed.
+    @tenant_row %{id: "t", tenant_id: Ecto.UUID.generate(), read_day_count: 30}
+    @canonical %{id: "c", tenant_id: nil, read_day_count: nil}
+
+    test "a tenant-owned row is measurable and a system canonical is not" do
+      assert RankingPriors.usage_measurable?(@tenant_row)
+      refute RankingPriors.usage_measurable?(@canonical)
+    end
+
+    test "a row with NO tenant_id key at all fails CLOSED" do
+      # A lane that forgets to project `tenant_id` forfeits the prior for its pool rather
+      # than having its unmeasurable rows read as zero usage.
+      refute RankingPriors.usage_measurable?(%{id: "x", read_day_count: 30})
+      refute RankingPriors.usage_measurable?(nil)
+    end
+
+    test "an all-tenant pool keeps the configured strength" do
+      assert RankingPriors.pool_importance_strength([@tenant_row, @tenant_row], 0.1) == 0.1
+      assert RankingPriors.pool_importance_strength([], 0.1) == 0.1
+    end
+
+    test "ONE canonical in the pool turns the prior off for the WHOLE pool" do
+      assert RankingPriors.pool_importance_strength([@tenant_row, @canonical], 0.1) == 0.0
+    end
+
+    test "with the pool strength the used tenant row no longer outranks the canonical" do
+      # The defect, end to end: at equal fused relevance a heavily-read tenant note beat a
+      # canonical nobody could measure. With the gate the pair is ordered by relevance again.
+      pool = [@tenant_row, @canonical]
+      strength = RankingPriors.pool_importance_strength(pool, 0.1)
+
+      opts = [
+        now: @now,
+        recency_weight: 0.0,
+        authority?: false,
+        strength: 0.0,
+        floor: @floor,
+        ceiling: @ceiling,
+        importance_strength: strength
+      ]
+
+      assert RankingPriors.multiplier(@tenant_row, opts) ==
+               RankingPriors.multiplier(@canonical, opts)
     end
   end
 

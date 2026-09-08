@@ -29,7 +29,10 @@ defmodule Loopctl.Knowledge.Importance do
       the loop runs, so sustained use outranks a burst.
     * NOT distinct readers. `heat_counts_query/5` records why in its own comment: "under a
       fleet sharing one key EVERY article ties at 1". Readership is near-flat here; days
-      still carry signal.
+      still carry signal. Readership is not IGNORED, though — see the solo-reader cap below.
+      Days defeat a same-day loop and NOT a daily one, so a single key running one
+      `knowledge_get` a day would otherwise walk to the ceiling on its own; the cap is what
+      stops that, and it is why the aggregate still joins `api_keys`.
     * NOT drills. `knowledge_progressive_drill` records its own uncounted access type, so
       being SHOWN by an index cannot produce the rank that showed it. This module inherits
       that exclusion by reading `Knowledge.heat_read_access_types/0` rather than restating
@@ -47,8 +50,18 @@ defmodule Loopctl.Knowledge.Importance do
   It never stamps a SYSTEM CANONICAL. Both statements carry `a.tenant_id == ^tenant_id`, and
   a canonical's `tenant_id` is NULL, so it is excluded structurally rather than by
   convention: `read_day_count` is one column on a row several tenants read, and no single
-  tenant's usage may decide a shared row's rank for the others. A canonical therefore stays
-  NULL, which is exactly neutral.
+  tenant's usage may decide a shared row's rank for the others.
+
+  A canonical therefore stays NULL, and NULL is neutral in SCORE but not in RANK. That is a
+  ranking defect on its own and is NOT fixed here: a pool that mixes tenant rows (measured)
+  with canonicals (structurally unmeasurable) would be ranked on a number that means
+  different things per row — the counted-vs-uncounted asymmetry #569/#572 each fixed once,
+  with the direction reversed. It is fixed on the READ side instead, by
+  `RankingPriors.pool_importance_strength/2`: a fused pool containing any row this stamp
+  could not have reached gets an importance strength of exactly 0.0, so the prior applies
+  only where every candidate was measurable. Restore the prior for canonicals by making them
+  MEASURABLE per tenant (a per-(tenant, article) usage row), never by stamping the shared
+  column and never by dropping that pool gate.
 
   ## Isolation
 
@@ -73,6 +86,7 @@ defmodule Loopctl.Knowledge.Importance do
   require Logger
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Auth.ApiKey
   alias Loopctl.ExitTag
   alias Loopctl.HeavyRead
   alias Loopctl.Knowledge
@@ -94,11 +108,45 @@ defmodule Loopctl.Knowledge.Importance do
   # single `NOT IN (<measured ids>)`, which cannot be chunked (each chunk would clear the
   # rows another chunk measured). Truncation keeps the MOST-read articles, so what a
   # truncated run clears is the tail — one-sided-safe, since clearing sets a row back to
-  # exactly neutral, and self-correcting on the next run.
+  # exactly neutral.
+  #
+  # It does NOT self-correct on the next run, and do not read it as if it did: the ordering
+  # (`desc: days, asc: article_id`) is deterministic, so the SAME tail falls off every night
+  # for as long as the tenant stays over the cap. An article genuinely read on one or two
+  # days in the window is then permanently neutral rather than briefly so. The cost is a lost
+  # boost and never a demotion; the remedy is raising this number, which is what
+  # `log_truncation/2` says.
   @max_stamped_articles 10_000
 
-  @typedoc "The per-run tally. `gate` is `:open` on a run that read the events table."
+  # The most distinct days ONE principal can contribute to an article's count.
+  #
+  # Distinct days defeat the same-day `knowledge_get` loop #567 was filed for and do NOT
+  # defeat a DAILY one: a single key running one read a day walks to the saturation point on
+  # its own, and this prior feeds every ranked read path in the tenant rather than one
+  # advisory browse list. So a principal — `coalesce(k.agent_id, e.api_key_id)`, the same
+  # reader identity `heat_counts_query/5` counts, agent-first because v2 mints a key per
+  # dispatch — is capped here, and only an article read by MORE THAN ONE principal can pass
+  # the cap.
+  #
+  # 5 rather than a rounder number: `importance_signal/1` puts 5 days at `log(6)/log(31)` =
+  # 0.52, so one principal acting alone can reach just over HALF the band and no more, while
+  # the 1-3-day population the curve is shaped for is untouched. A single-agent tenant
+  # therefore keeps a working prior at a compressed top, which is the trade this bound is
+  # making deliberately.
+  @solo_reader_day_cap 5
+
+  @typedoc """
+  The per-run tally. `gate` is `:open` on a run that read the events table.
+
+  `measured` and `stamped` answer DIFFERENT questions and neither substitutes for the other.
+  `measured` is how many articles the window found a read for — the usage number. `stamped`
+  is how many rows the write actually CHANGED, which `set_count/2`'s `IS DISTINCT FROM`
+  predicate deliberately restricts to values that moved, so a steady-state night over an
+  actively-read corpus reports `measured > 0` with `stamped: 0`. Reading `stamped` as "how
+  much was read" turns exactly that healthy night into a corpus nobody opened.
+  """
   @type tally :: %{
+          measured: non_neg_integer(),
           stamped: non_neg_integer(),
           cleared: non_neg_integer(),
           truncated: boolean(),
@@ -116,13 +164,18 @@ defmodule Loopctl.Knowledge.Importance do
       per call makes two runs incomparable, while a caller's explicit value is a per-call
       value already.
     * `:now` — the clock, for deterministic tests.
+    * `:max_articles` — the per-run article cap (default: `max_stamped_articles/0`). A LIMIT,
+      like `:since` is a window: it bounds this run's work and nothing else. It exists so the
+      truncation branch is reachable without seeding #{@max_stamped_articles} read articles,
+      and so an operator running the stamp by hand on a degraded box can bound it.
   """
   @spec stamp(Ecto.UUID.t(), keyword()) :: tally()
   def stamp(tenant_id, opts \\ []) when is_binary(tenant_id) do
     since = window_start(opts)
+    cap = article_cap(opts)
 
-    case measure(tenant_id, since) do
-      {:ok, measured} -> write(tenant_id, measured)
+    case measure(tenant_id, since, cap) do
+      {:ok, measured} -> write(tenant_id, measured, cap)
       {:error, gate} -> tally(gate)
     end
   end
@@ -140,10 +193,19 @@ defmodule Loopctl.Knowledge.Importance do
   @spec max_stamped_articles() :: pos_integer()
   def max_stamped_articles, do: @max_stamped_articles
 
+  @doc """
+  The most distinct days ONE principal can contribute to an article's count.
+
+  Public for the same single-source reason as `window_days/0` — the tests assert the bound
+  rather than a copy of the number.
+  """
+  @spec solo_reader_day_cap() :: pos_integer()
+  def solo_reader_day_cap, do: @solo_reader_day_cap
+
   # --- measurement -----------------------------------------------------------
 
-  defp measure(tenant_id, since) do
-    query = read_days_query(tenant_id, since)
+  defp measure(tenant_id, since, cap) do
+    query = read_days_query(tenant_id, since, cap)
 
     case HeavyRead.all(tenant_id, query, heavy_opts()) do
       {:error, :heavy_read_overloaded} -> {:error, :heavy_read_overloaded}
@@ -155,51 +217,110 @@ defmodule Loopctl.Knowledge.Importance do
     :exit, reason -> scan_failed(tenant_id, "exit:" <> ExitTag.tag(reason))
   end
 
-  # Aggregate over the EVENTS alone — no join to `articles`, so no article column enters the
-  # group key and the read stays on the events index. The article-side scoping happens on the
-  # WRITE, where the `tenant_id` predicate has to be anyway.
+  # Aggregate over the EVENTS, joined to `api_keys` ONLY to resolve the reader identity the
+  # solo cap needs — no join to `articles`, so no article column enters the group key and the
+  # read stays on the events index. The article-side scoping happens on the WRITE, where the
+  # `tenant_id` predicate has to be anyway. The join is LEFT and its own `tenant_id` equality
+  # is conjunctive, the shape `HeavyRead.guard!/2` requires and the one `heat_counts_query/5`
+  # already runs through this gate: a key this tenant cannot see falls back to the key id
+  # rather than dropping the event.
   #
   # The day is cut in UTC EXPLICITLY, exactly as `heat_counts_query/5` does it: a bare
   # `::date` cast resolves in the connection's `TimeZone` GUC, so on a backend whose session
   # timezone is not UTC this would count days on a boundary the UTC-snapped window does not
   # use — the same value measured against two different calendars.
   #
-  # Ordered by count desc then id, so a run that hits the cap keeps the most-used articles
-  # and keeps doing so deterministically between runs.
-  defp read_days_query(tenant_id, since) do
-    from(e in ArticleAccessEvent,
-      where: e.tenant_id == ^tenant_id,
-      where: e.access_type in ^Knowledge.heat_read_access_types(),
-      where: e.accessed_at >= ^since,
-      group_by: e.article_id,
-      order_by: [
-        desc: count(fragment("((? at time zone 'UTC'))::date", e.accessed_at), :distinct),
-        asc: e.article_id
-      ],
-      limit: ^(@max_stamped_articles + 1),
+  # `least(days, CASE WHEN readers > 1 THEN days ELSE @solo_reader_day_cap END)` is the whole
+  # of the cap: with two or more distinct readers the count is the plain distinct-day count,
+  # and with one it cannot pass the cap. The signal stays DISTINCT DAYS in both branches —
+  # this never sums reader-days, which would let three readers on one day outscore one reader
+  # on three.
+  #
+  # Ordered by the RAW day count desc then id, so a run that hits the cap keeps the most-read
+  # articles (and keeps doing so deterministically between runs) rather than ordering on a
+  # capped value that ties every solo-read article at the cap.
+  defp read_days_query(tenant_id, since, cap) do
+    counted =
+      from(e in ArticleAccessEvent,
+        left_join: k in ApiKey,
+        on: k.id == e.api_key_id and k.tenant_id == ^tenant_id,
+        where: e.tenant_id == ^tenant_id,
+        where: e.access_type in ^Knowledge.heat_read_access_types(),
+        where: e.accessed_at >= ^since,
+        group_by: e.article_id,
+        select: %{
+          article_id: e.article_id,
+          days: count(fragment("((? at time zone 'UTC'))::date", e.accessed_at), :distinct),
+          readers: count(fragment("coalesce(?, ?)", k.agent_id, e.api_key_id), :distinct)
+        }
+      )
+
+    from(c in subquery(counted),
+      order_by: [desc: c.days, asc: c.article_id],
+      limit: ^(cap + 1),
       select: %{
-        article_id: e.article_id,
-        read_days: count(fragment("((? at time zone 'UTC'))::date", e.accessed_at), :distinct)
+        article_id: c.article_id,
+        read_days:
+          fragment(
+            "least(?, CASE WHEN ? > 1 THEN ? ELSE ? END)",
+            c.days,
+            c.readers,
+            c.days,
+            ^@solo_reader_day_cap
+          )
       }
     )
   end
 
   # --- writes ----------------------------------------------------------------
 
-  defp write(tenant_id, measured) do
-    truncated = length(measured) > @max_stamped_articles
-    kept = Enum.take(measured, @max_stamped_articles)
+  # The statements are NOT one transaction (by design — see `write_failed/2`), so a failure
+  # part-way through leaves rows written. The tally therefore ACCUMULATES: it carries the
+  # counts of the statements that committed and flips only the gate, because reporting
+  # `stamped: 0` alongside a log line that says the corpus may be partially stamped is an
+  # audit record that contradicts itself and the database.
+  defp write(tenant_id, measured, cap) do
+    truncated = length(measured) > cap
+    kept = Enum.take(measured, cap)
 
-    log_truncation(tenant_id, truncated)
+    log_truncation(tenant_id, truncated, cap)
 
-    stamped = Enum.sum(Enum.map(group_by_days(kept), &set_count(tenant_id, &1)))
-    cleared = clear_absent(tenant_id, Enum.map(kept, & &1.article_id))
+    acc = %{tally(:open) | truncated: truncated, measured: length(kept)}
 
-    %{tally(:open) | stamped: stamped, cleared: cleared, truncated: truncated}
+    case set_counts(tenant_id, group_by_days(kept), acc) do
+      {:ok, acc} -> clear_step(tenant_id, Enum.map(kept, & &1.article_id), acc)
+      {:error, acc} -> acc
+    end
+  end
+
+  defp set_counts(tenant_id, groups, acc) do
+    Enum.reduce_while(groups, {:ok, acc}, &set_one(tenant_id, &1, &2))
+  end
+
+  defp set_one(tenant_id, group, {:ok, acc}) do
+    case guarded(tenant_id, fn -> set_count(tenant_id, group) end) do
+      {:ok, written} -> {:cont, {:ok, %{acc | stamped: acc.stamped + written}}}
+      :error -> {:halt, {:error, %{acc | gate: :write_failed}}}
+    end
+  end
+
+  defp clear_step(tenant_id, ids, acc) do
+    case guarded(tenant_id, fn -> clear_absent(tenant_id, ids) end) do
+      {:ok, cleared} -> %{acc | cleared: cleared}
+      :error -> %{acc | gate: :write_failed}
+    end
+  end
+
+  defp guarded(tenant_id, fun) do
+    {:ok, fun.()}
   rescue
-    e -> write_failed(tenant_id, ExitTag.tag(e))
+    e ->
+      write_failed(tenant_id, ExitTag.tag(e))
+      :error
   catch
-    :exit, reason -> write_failed(tenant_id, "exit:" <> ExitTag.tag(reason))
+    :exit, reason ->
+      write_failed(tenant_id, "exit:" <> ExitTag.tag(reason))
+      :error
   end
 
   # One statement per DISTINCT day-count rather than one per article: the count is bounded by
@@ -291,7 +412,14 @@ defmodule Loopctl.Knowledge.Importance do
   end
 
   defp tally(gate) do
-    %{stamped: 0, cleared: 0, truncated: false, gate: gate}
+    %{measured: 0, stamped: 0, cleared: 0, truncated: false, gate: gate}
+  end
+
+  defp article_cap(opts) do
+    case Keyword.get(opts, :max_articles) do
+      cap when is_integer(cap) and cap > 0 -> cap
+      _ -> @max_stamped_articles
+    end
   end
 
   defp scan_failed(tenant_id, tag) do
@@ -307,19 +435,21 @@ defmodule Loopctl.Knowledge.Importance do
     Logger.error(
       "Knowledge.Importance: tenant=#{tenant_id} usage stamp write failed (#{tag}); " <>
         "the corpus may be PARTIALLY stamped this run (the set and clear statements are " <>
-        "not one transaction). Both are idempotent, so the next run reconciles it."
+        "not one transaction). Both are idempotent, so the next run reconciles it. The " <>
+        "tally's counts are what committed before the failure, not zero."
     )
 
-    tally(:write_failed)
+    :ok
   end
 
-  defp log_truncation(_tenant_id, false), do: :ok
+  defp log_truncation(_tenant_id, false, _cap), do: :ok
 
-  defp log_truncation(tenant_id, true) do
+  defp log_truncation(tenant_id, true, cap) do
     Logger.warning(
-      "Knowledge.Importance: tenant=#{tenant_id} read more than #{@max_stamped_articles} " <>
+      "Knowledge.Importance: tenant=#{tenant_id} read more than #{cap} " <>
         "distinct articles in the window; the least-used tail is cleared to neutral rather " <>
-        "than stamped. Raise @max_stamped_articles if this is steady state."
+        "than stamped, and it is the SAME tail every night until the cap is raised. Raise " <>
+        "@max_stamped_articles if this is steady state."
     )
   end
 end

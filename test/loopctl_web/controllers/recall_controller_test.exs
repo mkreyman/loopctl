@@ -100,10 +100,13 @@ defmodule LoopctlWeb.RecallControllerTest do
       # meta and the merged meta a caller reads first. Its input — the article's recorded
       # usage — appears nowhere in the rows, so without this a session that saw a
       # well-used note outrank a fresher one had nothing in the payload to explain it.
-      # Asserted as the CONFIGURED default rather than "is a number": a key that is
-      # present but always 0.0 explains nothing and would pass the weaker check.
-      assert know_meta["importance_strength"] ==
-               Application.get_env(:loopctl, :knowledge_importance_strength)
+      # Asserted against the LITERAL expected weight, not against
+      # `Application.get_env(:loopctl, :knowledge_importance_strength)`: re-reading the same
+      # key the code reads makes the check agree with itself, so it stays green with both
+      # sides at 0.0 -- exactly the "present but always 0.0 explains nothing" case it is
+      # here to exclude.
+      assert know_meta["importance_strength"] == 0.1
+      assert know_meta["importance_strength"] > 0.0
 
       assert meta["importance_strength"] == know_meta["importance_strength"]
 

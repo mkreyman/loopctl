@@ -25,12 +25,29 @@ defmodule Loopctl.Knowledge.ImportanceTest do
       |> DateTime.add(-days_ago * 86_400, :second)
       |> then(&Keyword.get(opts, :at, &1))
 
-    fixture(:article_access_event, %{
+    # `api_key_id` is deliberately settable: the fixture MINTS A FRESH KEY per event when it
+    # is absent, so an unqualified `read/3` is a different principal every time. The
+    # solo-reader cap only fires when one principal is doing all the reading, which a test
+    # has to pin explicitly.
+    attrs = %{
       tenant_id: tenant_id,
       article_id: article_id,
       access_type: Keyword.get(opts, :access_type, "get"),
       accessed_at: at
-    })
+    }
+
+    attrs =
+      case Keyword.get(opts, :api_key_id) do
+        nil -> attrs
+        key_id -> Map.put(attrs, :api_key_id, key_id)
+      end
+
+    fixture(:article_access_event, attrs)
+  end
+
+  defp agent_key(tenant_id) do
+    {_raw, key} = fixture(:api_key, %{tenant_id: tenant_id, role: :agent})
+    key.id
   end
 
   defp stamp(tenant_id), do: Importance.stamp(tenant_id, now: @now)
@@ -277,13 +294,103 @@ defmodule Loopctl.Knowledge.ImportanceTest do
     end
   end
 
+  describe "the solo-reader day cap" do
+    test "ONE principal cannot walk an article past the cap, however many days it reads on" do
+      # The gaming path days alone do not close: a day counts once however long a same-day
+      # loop runs, but one `knowledge_get` a DAY for a month is a one-line cron. This prior
+      # feeds every ranked read path in the tenant, so a single key must not be able to pin
+      # its own note at the top of everyone else's answers.
+      tenant = fixture(:tenant)
+      solo = article(tenant.id)
+      key = agent_key(tenant.id)
+
+      cap = Importance.solo_reader_day_cap()
+      for day <- 1..(cap + 10), do: read(tenant.id, solo.id, day, api_key_id: key)
+
+      assert %{gate: :open} = stamp(tenant.id)
+      assert read_days(solo.id) == cap
+    end
+
+    test "TWO principals pass the cap, and the count stays DISTINCT DAYS (never reader-days)" do
+      tenant = fixture(:tenant)
+      shared = article(tenant.id)
+      same_day = article(tenant.id)
+      one = agent_key(tenant.id)
+      two = agent_key(tenant.id)
+
+      cap = Importance.solo_reader_day_cap()
+
+      # Read on cap+3 distinct days, split across two keys: the cap does not apply.
+      for day <- 1..(cap + 3) do
+        key = if rem(day, 2) == 0, do: one, else: two
+        read(tenant.id, shared.id, day, api_key_id: key)
+      end
+
+      # Three principals, ONE day. Summing reader-days would score this 3; it must score 1.
+      for key <- [one, two, agent_key(tenant.id)] do
+        read(tenant.id, same_day.id, 1, api_key_id: key)
+      end
+
+      assert %{gate: :open} = stamp(tenant.id)
+      assert read_days(shared.id) == cap + 3
+      assert read_days(same_day.id) == 1
+    end
+  end
+
+  describe "the per-run article cap" do
+    test "a run over the cap keeps the MOST-read articles, clears the tail, and says so" do
+      # The truncation branch, which is otherwise unreachable without seeding
+      # `max_stamped_articles/0` read articles. `:max_articles` is a LIMIT, exactly as
+      # `:since` is a window.
+      tenant = fixture(:tenant)
+      hot = article(tenant.id)
+      warm = article(tenant.id)
+      cold = article(tenant.id)
+
+      for day <- 1..3, do: read(tenant.id, hot.id, day)
+      for day <- 1..2, do: read(tenant.id, warm.id, day)
+      read(tenant.id, cold.id, 1)
+
+      assert %{measured: 2, stamped: 2, truncated: true, gate: :open} =
+               Importance.stamp(tenant.id, now: @now, max_articles: 2)
+
+      assert read_days(hot.id) == 3
+      assert read_days(warm.id) == 2
+      # The tail is cleared to neutral rather than stamped -- a lost boost, never a demotion.
+      assert read_days(cold.id) == nil
+    end
+
+    test "an uncapped run over the same corpus is NOT truncated" do
+      # The negative control: without it the assertion above could pass on a `truncated` that
+      # is always true.
+      tenant = fixture(:tenant)
+      a = article(tenant.id)
+      read(tenant.id, a.id, 1)
+
+      assert %{truncated: false} = stamp(tenant.id)
+    end
+  end
+
   describe "the tally" do
     test "reports gate :open and both counts on a normal run" do
       tenant = fixture(:tenant)
       a = article(tenant.id)
       read(tenant.id, a.id, 1)
 
-      assert %{stamped: 1, cleared: 0, truncated: false, gate: :open} = stamp(tenant.id)
+      assert %{measured: 1, stamped: 1, cleared: 0, truncated: false, gate: :open} =
+               stamp(tenant.id)
+    end
+
+    test "a steady-state night reports measured > 0 with stamped == 0" do
+      # `stamped` is a WRITE DELTA (`IS DISTINCT FROM` skips unchanged rows) and `measured`
+      # is the usage number. Reading `stamped` as "how much was read" turns an actively-read
+      # corpus into a quiet one in the audit event, which is what `measured` exists to stop.
+      tenant = fixture(:tenant)
+      a = article(tenant.id)
+      read(tenant.id, a.id, 1)
+
+      assert %{measured: 1, stamped: 1} = stamp(tenant.id)
+      assert %{measured: 1, stamped: 0, cleared: 0, gate: :open} = stamp(tenant.id)
     end
   end
 end

@@ -10071,7 +10071,7 @@ defmodule Loopctl.Knowledge do
          # this path CAN apply include importance (it needs no embedding), so a response
          # that omitted the weight would leave a caller unable to explain an ordering the
          # prior actually produced.
-         |> Map.merge(ranking_prior_meta(opts))
+         |> Map.merge(ranking_prior_meta(opts, reranked))
          |> Map.merge(degraded_contract_meta(tenant_id, fallback_reason))
      }}
   end
@@ -10249,6 +10249,11 @@ defmodule Loopctl.Knowledge do
       # a DB-free fusion function. Provenance priors were removed 2026-08-21.
       |> apply_ranking_priors_fused(opts)
 
+    # Captured from the list the priors were APPLIED to, before `apply_curated_provenance/2`
+    # can rebind `sorted` with a different membership: the advertised weight and the weight
+    # the re-rank used must be derived from the same pool or the disclosure is a guess.
+    importance_meta = ranking_prior_meta(opts, sorted)
+
     # #31 follow-up: the curated-vs-retrieved decision runs HERE, on the default path,
     # rather than only inside `hybrid_search/3`. It is a re-rank of this same fused pool —
     # not a different search — so exposing it as a separate tool asked every agent to know,
@@ -10299,7 +10304,7 @@ defmodule Loopctl.Knowledge do
          # The importance weight in force on THIS response (#790). Merged rather than
          # inlined so the degraded keyword-only path can carry the identical key from the
          # identical helper — the meta has one shape on both paths, as `search_id` does.
-         |> Map.merge(ranking_prior_meta(opts))
+         |> Map.merge(importance_meta)
          # Carried forward for the SAME reason as `pool_capped` above: combined is the
          # DEFAULT mode, so a degraded vector read that is disclosed only on `mode=semantic`
          # is undisclosed on the path almost every caller uses. Absent unless the semantic
@@ -10424,15 +10429,18 @@ defmodule Loopctl.Knowledge do
   @authority_ceiling 1.1
 
   # Bounds for the importance factor band (#790). The FLOOR is exactly 1.0 and is the
-  # one-sided guarantee made structural: an article with no recorded usage must rank exactly
-  # where it ranked before this prior existed, never below. A sub-1.0 floor here would let a
-  # future curve demote unread material, which is the closed loop the note above `@kill_tag`
-  # in `RankingPriors` forbids.
+  # one-sided guarantee made structural: an article with no recorded usage must be SCORED
+  # exactly where it was scored before this prior existed, never below. (Scored, not ranked —
+  # promoting a used article does move an unread one down the ordered list relative to it;
+  # the moduledoc admonition in `RankingPriors` states that precisely and says what bounds
+  # it.) A sub-1.0 floor here would let a future curve demote unread material outright, which
+  # is the closed loop the note above `@kill_tag` in `RankingPriors` forbids.
   #
   # The CEILING is what bounds the prior against relevance rather than against the floor:
-  # post-#470 a cross-lane consensus winner scores ~2x a single-lane hit, so importance could
-  # only flip one at a ceiling of 2.0 or more. 1.1 matches the authority band, which is
-  # already proved unable to flip such a winner.
+  # post-#470 a cross-lane consensus winner scores ~2x a single-lane hit, so importance ALONE
+  # could only flip one at a ceiling of 2.0 or more. 1.1 matches the authority band. Composed
+  # with recency and authority the worst-case spread is 1.65 (0.700 to 1.155), still under
+  # 2x — re-derive that composed number, not just this one, before widening any band.
   @importance_floor 1.0
   @importance_ceiling 1.1
 
@@ -10443,7 +10451,7 @@ defmodule Loopctl.Knowledge do
   # adjusted; the raw `:relevance_score`/`:similarity_score` the hybrid resolver reads are
   # left untouched.
   defp apply_ranking_priors_fused(results, opts) do
-    prior_opts = ranking_prior_opts(opts)
+    prior_opts = ranking_prior_opts(opts, results)
 
     results
     |> Enum.map(fn r ->
@@ -10458,13 +10466,28 @@ defmodule Loopctl.Knowledge do
   # preserves the keyword lane's own `id ASC` tiebreak (its DB order is
   # `ts_rank_cd DESC, id ASC`), so with priors disabled the ordering is unchanged.
   defp apply_ranking_priors_fallback(results, opts) do
-    prior_opts = ranking_prior_opts(opts)
+    prior_opts = ranking_prior_opts(opts, results)
 
     results
     |> Enum.sort_by(& &1.id, :asc)
     |> Enum.sort_by(
       fn r -> (Map.get(r, :relevance_score) || 0.0) * RankingPriors.multiplier(r, prior_opts) end,
       :desc
+    )
+  end
+
+  # The pool the priors are about to be applied to decides the importance strength, so the
+  # opts cannot be built from `opts` alone (#790 review). `RankingPriors.multiplier/2` is
+  # per-ROW and a per-row factor cannot say "this row's usage is UNKNOWN", which is exactly
+  # what a system canonical's permanently-NULL `read_day_count` is: the nightly stamp's write
+  # predicate is `a.tenant_id == ^tenant_id` and a canonical's `tenant_id` is NULL. Ranking a
+  # measured class against an unmeasurable one on one number is the #569/#572 defect with the
+  # direction reversed, so a mixed pool gets strength 0.0 instead.
+  defp ranking_prior_opts(opts, results) do
+    Keyword.put(
+      ranking_prior_opts(opts),
+      :importance_strength,
+      effective_importance_strength(opts, results)
     )
   end
 
@@ -10511,9 +10534,18 @@ defmodule Loopctl.Knowledge do
   # one whose input (`articles.read_day_count`) is invisible to the caller, since the result
   # rows carry no usage field and nothing else in the payload hints that usage was consulted.
   # `0.0` means importance played no part — the toggle is off, the strength is configured to
-  # zero, or this call passed its own override.
-  defp ranking_prior_meta(opts) do
-    %{importance_strength: importance_strength_opt(opts)}
+  # zero, this call passed its own override, or the POOL held a candidate the nightly stamp
+  # could not have measured (see `effective_importance_strength/2` below).
+  defp ranking_prior_meta(opts, results) do
+    %{importance_strength: effective_importance_strength(opts, results)}
+  end
+
+  # The strength ACTUALLY applied to this pool: the configured value, or 0.0 when the pool
+  # holds a candidate the nightly stamp could not have measured. The meta reads the same
+  # function the re-rank does, so a response can never advertise a weight the ordering did
+  # not use.
+  defp effective_importance_strength(opts, results) do
+    RankingPriors.pool_importance_strength(results, importance_strength_opt(opts))
   end
 
   defp recency_weight_opt(opts) do

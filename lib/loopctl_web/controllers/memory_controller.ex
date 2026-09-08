@@ -209,7 +209,11 @@ defmodule LoopctlWeb.MemoryController do
         "differ in `meta` by construction. " <>
         "`meta.recall_id` is ALSO the `search_id` recorded on the knowledge half's " <>
         "surfacing rows; hand it back to `POST /recall/{recall_id}/referenced` to record " <>
-        "which of those articles you actually used.",
+        "which of those articles you actually used. " <>
+        "`meta.importance_strength` (#790) states the magnitude of the USAGE prior in " <>
+        "force on the knowledge half, so an ordering that usage produced can be " <>
+        "explained — its input (the distinct days an article was opened) appears on no " <>
+        "row. `0.0` means it played no part.",
     request_body: {"Recall params", "application/json", Schemas.RecallContextRequest},
     responses: %{
       200 => {"Merged recall results", "application/json", Schemas.RecallContextResponse},

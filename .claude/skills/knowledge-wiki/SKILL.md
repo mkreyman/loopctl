@@ -181,7 +181,7 @@ exactly the pollution the separate tables prevent.
    `{drift_signal, member_id}` — a group scored under the other signal's normalized key finds
    nothing and withholds (fail-closed).
 5. **Heat must not rank on a signal heat produces** — `Knowledge.heat_index/2`
-   (`knowledge.ex:11684`; the counted set is `@heat_read_access_types`, `:11554`). The heat index is the one retrieval route that
+   (`knowledge.ex:11716`; the counted set is `@heat_read_access_types`, `:11586`). The heat index is the one retrieval route that
    takes NO query, so its misses are uncorrelated with embedding similarity — which is worth nothing
    if its ordering is something a caller or the route itself generates. It has been violated FOUR
    times, each differently — and once by a FIX for one of the others — so treat any new input to
@@ -407,16 +407,23 @@ move by `+0.000` whichever one the prior reads. The unit and integration guards 
 
 Four properties hold it together, and each is mutation-verified:
 
-- **It is ONE-SIDED UPWARD, and that is what makes it compatible with the 2026-08-21 owner
-  decision above.** An article with no recorded usage gets a factor of EXACTLY 1.0 — it ranks
-  precisely where it did before the prior existed. A two-sided usage prior reaches that
-  decision's own stated failure by another road: bulk-harvested material is ~96% of the corpus
-  and is read less, so demoting on usage would bury exactly the material the owner said he
-  wants surfaced, and demoted material stays unread. Never give this factor a reachable
-  sub-1.0 branch; demotion belongs to `demotion_factor/1` and to deliberate editorial acts.
-- **The signal is distinct read DAYS.** Not raw reads (the #567/#569/#572 pinning defect — a
-  `knowledge_get` loop inflates a count and cannot inflate a day) and not distinct READERS
-  (`heat_counts_query/5`: "under a fleet sharing one key EVERY article ties at 1"). Drills and
+- **It is one-sided upward IN SCORE, which is not the same as rank-neutral.** An article with
+  no recorded usage gets a factor of EXACTLY 1.0, so its SCORE is untouched. Its POSITION is
+  not: ranking is ordinal, so promoting a used article moves an unread one down the list
+  relative to it, and unread bulk-harvested material is the population at the floor. What
+  bounds that is the 1.1 ceiling and the fact that nothing is ever scored down — a two-sided
+  prior would drop both and reach the 2026-08-21 decision's own stated failure by another
+  road, burying ~96% of the corpus, which then stays unread. Never give this factor a
+  reachable sub-1.0 branch; demotion belongs to `demotion_factor/1` and to deliberate
+  editorial acts. The carve-out in CLAUDE.md's 2026-08-21 section is NOT owner-ratified and
+  says so — do not cite it as permission.
+- **The signal is distinct read DAYS, with a per-principal cap.** Not raw reads (the
+  #567/#569/#572 pinning defect — a `knowledge_get` loop inflates a count and cannot inflate a
+  day) and not distinct READERS (`heat_counts_query/5`: "under a fleet sharing one key EVERY
+  article ties at 1"). Days defeat a same-day loop and NOT a daily one, so ONE principal
+  (`coalesce(agent_id, api_key_id)`) contributes at most `Importance.solo_reader_day_cap/0`
+  days — just over half the band — and only an article read by two or more principals can pass
+  it. Drills and
   search impressions stay uncounted because `Loopctl.Knowledge.Importance` reads
   `Knowledge.heat_read_access_types/0` rather than restating the list — a second, wider copy
   of that list is how three of the four heat regressions happened.
@@ -433,7 +440,13 @@ Four properties hold it together, and each is mutation-verified:
   of 2.0. At 1.1 it breaks ties and nothing more; that bound has its own test.
 
 A tenant's stamp never touches a SYSTEM CANONICAL (NULL `tenant_id`): one column on a row
-several tenants read must not have one tenant's usage decide its rank for the others.
+several tenants read must not have one tenant's usage decide its rank for the others. A
+canonical's `read_day_count` is therefore permanently NULL, which means NOT MEASURED rather
+than read on zero days — and the column cannot tell those apart. So the prior is turned OFF for
+any pool holding one (`RankingPriors.pool_importance_strength/2`, reported as
+`meta.importance_strength: 0.0`): ranking a measured class against an unmeasurable one on a
+single number is the #569/#572 defect with the direction reversed. Restore the prior for
+canonicals by making them measurable PER TENANT, never by stamping the shared column.
 
 The golden-question eval cannot catch a regression here: `RetrievalEval` seeds no
 `article_access_events`, so every golden doc's `read_day_count` is NULL and the factor is 1.0

@@ -36,17 +36,30 @@ defmodule Loopctl.Knowledge.RankingPriors do
       (#790). Usage is the authority on importance, which `heat_index/2` has asserted since
       #554 while heat never reached ranking, so a note nothing had opened in eleven months
       ranked level with one four sessions opened last week.
-      > #### The importance prior is ONE-SIDED UPWARD, and that is not a tuning choice {: .info}
-      > `importance_factor/4` returns EXACTLY 1.0 for an article with no recorded usage. An
-      > unread note therefore ranks exactly where it ranked before the prior existed; the
-      > prior can only ever promote a demonstrably-used note among near-ties. A TWO-sided
-      > usage prior — one that pushed unread material below neutral — would reach the closed
-      > loop the note above `@kill_tag` forbids by a different route: demoted material stays
-      > unread, and the resulting ratio is then cited as proof it deserved demotion.
-      > Bulk-harvested material is ~96% of this corpus and is read less, so a two-sided prior
-      > would systematically demote precisely the material the owner said he wants surfaced.
-      > Never give this factor a reachable sub-1.0 branch. Demotion is `demotion_factor/1`'s
-      > job and belongs to deliberate editorial acts, never to a usage count.
+      > #### The importance prior is one-sided upward IN SCORE, and that is not the same as rank-neutral {: .info}
+      > `importance_factor/4` returns EXACTLY 1.0 for an article with no recorded usage, so
+      > an unread article's SCORE is untouched — the factor has no reachable sub-1.0 branch
+      > and never subtracts. Say that precisely, because the obvious stronger claim is FALSE:
+      > ranking is ORDINAL, so multiplying a used article by up to the ceiling while an
+      > unread one stays at 1.0 does move the unread one DOWN THE LIST relative to it. In any
+      > pool that contains at least one used article — the only pool where the prior does
+      > anything at all — unread material can lose a position it previously held. "It ranks
+      > exactly where it ranked before" is true of the number and false of the ordering; do
+      > not restate it in the stronger form.
+      > What the one-sidedness DOES buy is the bound the 2026-08-21 owner decision needs: the
+      > shift is capped at the ceiling (1.1, i.e. ~9% of relative position), it is applied to
+      > the USED article rather than subtracted from the unread one, and no article is ever
+      > scored below where it started. A TWO-sided usage prior would drop that bound and
+      > reach the closed loop the note above `@kill_tag` forbids — demoted material stays
+      > unread, and the resulting ratio is then cited as proof it deserved demotion — over
+      > the ~96% of this corpus that is bulk-harvested and read less. Never give this factor
+      > a reachable sub-1.0 branch. Demotion is `demotion_factor/1`'s job and belongs to
+      > deliberate editorial acts, never to a usage count.
+      > The prior also applies ONLY to a pool every candidate of which the nightly stamp
+      > could have measured (`pool_importance_strength/2`). A system canonical is
+      > structurally unmeasurable — its `read_day_count` is one column on a row several
+      > tenants read — so a mixed pool would rank a counted class against an uncounted one on
+      > one number, which is the #569/#572 defect with the direction reversed.
 
   > #### The `:superseded` demotion is DEFENSIVE on the default path {: .info}
   >
@@ -77,13 +90,24 @@ defmodule Loopctl.Knowledge.RankingPriors do
   The importance factor carries the SAME guarantee by the same arithmetic, and it is the
   reason the ceiling is a ceiling rather than a scale. Its reachable range is
   `[1.0, 1 + strength]` (the normalized signal tops out at 1.0), clamped to the caller's
-  `ceiling` — 1.1 at the `@importance_ceiling` `Loopctl.Knowledge` passes. A doc with
-  cross-lane consensus scores ~2x a single-lane hit, and the most importance can do to that
-  pair is multiply the loser by at most the ceiling while the winner keeps a factor of at
-  least 1.0 — so the flip needs `ceiling >= 2`. At 1.1 it is not close, and
-  `test/loopctl/knowledge/ranking_priors_test.exs` proves it rather than asserting it. Raise
-  the ceiling past 2.0 and importance stops breaking ties and starts overriding relevance;
-  that is the number to watch, not the strength.
+  `ceiling` — 1.1 at the `@importance_ceiling` `Loopctl.Knowledge` passes. Taken ALONE, the
+  most importance can do to a consensus/single-lane pair is multiply the loser by at most the
+  ceiling while the winner keeps a factor of at least 1.0, so a flip needs `ceiling >= 2`.
+
+  Read that bound COMPOSED, though, because that is how it is applied. The multiplier is
+  `recency * authority * importance * demotion`, and the winner does NOT keep 1.0 once
+  recency and authority are in: the least-favoured document reaches 0.700 (recency 1 - w at
+  w = 0.3, authority 1.0 for an unknown category) while the most-favoured reaches 1.155
+  (1.0 * 1.05 * 1.1). The composed spread is therefore 1.65, up from the 1.50 this prior
+  inherited — still under the 2x a cross-lane consensus winner scores, so that pair is
+  still safe, but a pair separated by 1.50-1.65x (a both-lane rank-15 hit against a
+  single-lane rank-1 hit, say) CAN now flip where it could not before. That is the prior
+  breaking a near-tie, which is its job; it is stated here because "cannot flip a 2x winner"
+  is the only claim the arithmetic supports, and the composed number is the one to re-derive
+  before raising any of the three bands. `test/loopctl/knowledge/ranking_priors_test.exs`
+  proves the composed worst case with a maximally-favoured weak document rather than
+  asserting it. Raise the ceiling past 2.0 and importance stops breaking ties and starts
+  overriding relevance; that is the number to watch, not the strength.
 
   This module is intentionally PURE (no DB, no clock of its own — `now` is passed in) so it
   can be applied inside `Loopctl.Knowledge.merge_results/5` (which must stay DB-free) and
@@ -194,15 +218,22 @@ defmodule Loopctl.Knowledge.RankingPriors do
   #   * FORM, not origin — the MOC-hub demotion below. A navigation stub is not an answer
   #     whoever generated it;
   #   * the ONE-SIDED USAGE prior (`importance_factor/4`, #790), which promotes a document
-  #     readers keep returning to and NEVER demotes one nobody has opened. Read the owner's
-  #     reasoning above rather than only his rule before concluding it contradicts this: what
-  #     he rejected is a weight that decides, on a document's origin, that it is worth less —
-  #     a closed loop, since demoted material stays unread and its own read ratio is then
-  #     cited as proof. A prior with an exact floor of 1.0 for zero usage cannot close that
-  #     loop: unread material ranks exactly where it does today, so the harvest is never
-  #     pushed down, only genuinely-used material is pulled up among ties, and "the decision
-  #     of what knowledge to use" still happens on the receiving side. Make this factor
-  #     two-sided and it becomes the very thing that was removed;
+  #     readers keep returning to and NEVER SUBTRACTS from one nobody has opened. Read the
+  #     owner's reasoning above rather than only his rule: what he rejected is a weight that
+  #     decides, on a document's ORIGIN, that it is worth less — a closed loop, since demoted
+  #     material stays unread and its own read ratio is then cited as proof. This prior keys
+  #     on usage, not on how a document got in, and its floor of exactly 1.0 for zero usage
+  #     means no article's score is ever reduced.
+  #     Be exact about what that does and does not buy, because the tempting stronger claim
+  #     is false: ranking is ordinal, so promoting the used article DOES move an unread one
+  #     down the list relative to it, and unread bulk-harvested material is the population
+  #     that mostly sits at the floor. What bounds it is the CEILING — the relative shift is
+  #     at most ~9%, it cannot flip a 2x cross-lane consensus winner, and nothing is scored
+  #     below where it started, so a document is never buried and cannot become unreadable
+  #     enough to feed its own demotion. That is a bounded near-tie effect, not the closed
+  #     loop; a two-sided factor would be the closed loop, and is forbidden. If this bound
+  #     ever stops holding — a ceiling raised toward 2.0, or a curve that can go negative —
+  #     this entry no longer applies and the prior has to be re-argued with the owner;
   #   * `@category_authority` above, KEPT by explicit owner decision on the same date: it
   #     keys on an editorial classification, not on how a document was ingested.
   #
@@ -393,15 +424,59 @@ defmodule Loopctl.Knowledge.RankingPriors do
   def importance_signal(_days), do: 0.0
 
   @doc """
+  Whether this result is a row the nightly usage stamp COULD have measured.
+
+  True exactly when the result carries a non-nil `:tenant_id` — the same predicate
+  `Loopctl.Knowledge.Importance`'s two `update_all` statements carry
+  (`a.tenant_id == ^tenant_id`). A system canonical's `tenant_id` is NULL, so its
+  `read_day_count` is permanently NULL: not "read on zero days" but NOT MEASURED, and the two
+  are indistinguishable in the column.
+
+  Fails CLOSED, unlike every other reader in this module: a result map with no `:tenant_id`
+  key at all is treated as unmeasurable. A lane that forgets to project `tenant_id` therefore
+  forfeits the importance prior for its pool (a lost boost, the same currency every other
+  lane-shape mistake here is paid in) instead of silently ranking an unmeasurable row as if
+  it had been measured at zero.
+  """
+  @spec usage_measurable?(map()) :: boolean()
+  def usage_measurable?(%{} = result), do: not is_nil(Map.get(result, :tenant_id))
+  def usage_measurable?(_), do: false
+
+  @doc """
+  The importance strength that may be applied to a POOL: `strength` when every candidate is
+  `usage_measurable?/1`, and exactly `0.0` otherwise.
+
+  This is the pool-level half of the prior and it is not optional. `importance_factor/4` is
+  per-row, and a per-row factor cannot express "this row's usage is UNKNOWN": an unmeasurable
+  row reads as zero usage and therefore as the floor, so a heavily-read system canonical
+  would rank BELOW a barely-read tenant note on a number that means different things per row.
+  That is the counted-vs-uncounted asymmetry #569 and #572 each fixed once for the heat index
+  (CLAUDE.md states it as a rule: ranking must never rank counted and uncounted read paths on
+  one number), and it would be reintroduced here with the direction reversed — against the
+  shared canon, which is where the harvested material lives.
+
+  Turning the prior OFF for such a pool is the only remedy available to a pure function: it
+  cannot measure the canonical, and giving it any invented value would be a weight keyed on
+  how the document got into the corpus, which the 2026-08-21 owner decision forbids outright.
+  The real fix is to make canonicals MEASURABLE per tenant, at which point every candidate is
+  measurable and this gate stops firing on its own.
+  """
+  @spec pool_importance_strength([map()], float()) :: float()
+  def pool_importance_strength(results, strength) when is_list(results) do
+    if Enum.all?(results, &usage_measurable?/1), do: strength, else: 0.0
+  end
+
+  @doc """
   The bounded importance FACTOR for a result map: `1 + strength * importance_signal(days)`,
   clamped to `[floor, ceiling]`. A `strength` of 0 makes importance a no-op (factor 1.0), so
   the pre-#790 ordering is reproducible exactly.
 
-  ONE-SIDED UPWARD BY CONSTRUCTION, and this is the load-bearing property rather than a
-  side effect of the current constants: the signal is >= 0 and `strength` is >= 0, so the
-  factor is always >= 1.0 and an article with no recorded usage gets EXACTLY 1.0 — not
-  approximately, not 1.0 minus an epsilon. It ranks precisely where it ranked before the
-  prior existed. The `floor` is therefore unreachable today and is kept anyway, as the
+  ONE-SIDED UPWARD IN SCORE BY CONSTRUCTION, and this is the load-bearing property rather
+  than a side effect of the current constants: the signal is >= 0 and `strength` is >= 0, so
+  the factor is always >= 1.0 and an article with no recorded usage gets EXACTLY 1.0 — not
+  approximately, not 1.0 minus an epsilon. Its SCORE is what is untouched; its POSITION in a
+  list that also contains a used article is not, because ranking is ordinal (see the
+  moduledoc admonition). The `floor` is therefore unreachable today and is kept anyway, as the
   structural statement of that guarantee: a future change to the curve that could go
   negative hits the clamp instead of the ranking. See the moduledoc admonition, and the note
   above `@kill_tag`, for why a downward usage prior is not an option here.
