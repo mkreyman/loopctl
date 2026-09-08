@@ -130,6 +130,14 @@ defmodule LoopctlWeb.KnowledgeHybridSearchController do
                    description:
                      "The winning curated article id when provenance=curated, else null."
                  },
+                 diversity: %OpenApiSpex.Schema{
+                   type: :object,
+                   description:
+                     "What redundancy removal did to the ranked pool this page slices " <>
+                       "(#792): the lambda and near-duplicate threshold in force, and how " <>
+                       "many candidates were dropped as exact or near duplicates. Absent " <>
+                       "when no selection ran. The same block POST /api/v1/recall publishes."
+                 },
                  limit: %OpenApiSpex.Schema{type: :integer},
                  offset: %OpenApiSpex.Schema{type: :integer},
                  search_mode: %OpenApiSpex.Schema{type: :string},

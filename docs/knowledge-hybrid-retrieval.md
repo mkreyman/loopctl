@@ -125,6 +125,7 @@ limit, offset) merged with exactly:
 | `provenance` | `:curated` \| `:retrieved` |
 | `confidence` | The WINNING candidate's absolute score for its OWN provenance class. `0.0` when there are no results, or `:retrieved` won with no genuine non-curated competitor. **Never** a rejected candidate's score from the OTHER class (`:retrieved`'s confidence is never a below-threshold curated score). |
 | `curated_article_id` | The winning curated article's id when `provenance == :curated` (guaranteed present AND first in `results`); `nil` on `:retrieved`. |
+| `diversity` | What redundancy removal did to the ranked POOL this page is a slice of (#792) — the same block `POST /api/v1/recall` publishes, where the pool IS the page. At a large `offset` the counters therefore describe rows this page does not contain. See below. |
 
 **Both branches return the identical map-key set** — on `results` (per-item keys
 are identical by construction; `:curated` reorders the same ranked pool rather
@@ -132,6 +133,50 @@ than re-filtering it) and on `meta`. A caller reads `meta.provenance` and
 `meta.curated_article_id`; it never needs to know which subsystem (curated lookup
 vs `search_combined/3`) actually produced the answer. This is the literal fix for
 #305's "no caller-side RAG-or-curated branching."
+
+### Diversity selection on the page (#792)
+
+The page is passed through `Loopctl.Knowledge.Diversity.select/4` — exact
+content-hash dedup, near-duplicate removal at cosine >= 0.95 measured against the
+ALREADY-SELECTED set, then maximal-marginal-relevance selection over the
+survivors — so two near-copies cannot occupy two slots of a short answer. The
+counts land in `meta.diversity`. The full pipeline, its knobs and its rationale
+are documented once, in [`agent-memory.md`](agent-memory.md) under "Diversity
+selection on the knowledge half".
+
+Three constraints are specific to this function and must not be dropped:
+
+- **It reorders the pool; it never shortens it.** Selection is applied to the
+  head of the ranked pool; what it did not pick is DEMOTED behind the pool tail
+  the selection never looked at, and nothing is discarded — so the union of the
+  pages of one query is still a PARTITION of the pool. Running it only at
+  `offset: 0`, and discarding the unselected window, made page 1 (drawn from pool
+  positions 0..29) and page 2 (raw positions 10..19) overlap: a paging client got
+  rows twice and never saw the ones MMR skipped. The rejected rows go behind the
+  tail rather than directly behind the selection because splicing them in first
+  refilled the very page they were rejected from with the near-copies MMR had
+  just dropped, whenever the selection came back shorter than `limit`.
+- **It runs identically at every offset**, and is NOT skipped once the requested
+  offset lands past the window. That is what makes the diversified pool a stable
+  function of the query rather than of the page, which is the property "page 2 of
+  a diversified list" needs in order to mean anything; the partition is a
+  property of the whole reordered list, so a page that skipped the reorder would
+  be a slice of a different list. The cost of running it on a deep page is one
+  bounded vector fetch over the window, never the pool.
+- **The curated winner is PINNED.** `hoist_to_front/2` exists so a caller
+  branching on `meta.provenance == :curated` can trust `List.first(results)`;
+  letting MMR demote or drop it would silently revoke that guarantee. It is
+  passed to the selector as `:preselected`, so it still SUPPRESSES near-copies of
+  itself — which prepending it afterwards would not.
+
+The vector fetch is bounded to the window the page can draw on
+(`limit x over_fetch`, itself capped at `:recall_diversity_max_pool`), never the
+`@max_relevance_page_size` pool the provenance decision reasons over: the
+decision needs the wide pool, diversity does not, and each pool member costs a
+vector read. The cap can be tighter here than on the recall half — where the pool
+IS the fetch, so capping below `limit` would cost rows — because a short window
+here costs nothing: the page still fills from the tail the selection left
+behind.
 
 ### Degradation honesty
 

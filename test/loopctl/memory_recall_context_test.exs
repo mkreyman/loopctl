@@ -34,8 +34,29 @@ defmodule Loopctl.MemoryRecallContextTest do
         body: "reshipment policy notes for #{title}"
       })
 
-    {:ok, updated} = Knowledge.update_embedding(tenant_id, art.id, List.duplicate(0.1, 1536))
+    {:ok, updated} = Knowledge.update_embedding(tenant_id, art.id, distinct_embedding())
     updated
+  end
+
+  # Every article here used to be embedded at the IDENTICAL `[0.1] * 1536`, which is
+  # cosine 1.0 between any two of them — so once #792's near-duplicate removal landed, a
+  # test about SCOPE merging started failing on redundancy it had accidentally
+  # manufactured. Each article now gets a vector that is still close to the others (they
+  # must all match one query) but distinguishable: a shared 0.1 base with a 2.0 spike at
+  # its own index, which is cosine ~0.80 between any two, comfortably under the 0.95
+  # threshold. Tests that want to exercise the duplicate path build the collision
+  # deliberately.
+  defp distinct_embedding do
+    # A PROCESS-LOCAL counter, not `System.unique_integer/1`: that counter has a large,
+    # scheduler-dependent stride, so `rem(unique_integer, 1536)` collided on 12 of 24
+    # articles here and half the corpus vanished as near-duplicates. Each test runs in its
+    # own process, so 0, 1, 2, ... is collision-free within a test and independent across.
+    index = rem(Process.get(:diversity_spike_index, 0), 1536)
+    Process.put(:diversity_spike_index, index + 1)
+
+    0.1
+    |> List.duplicate(1536)
+    |> List.replace_at(index, 2.1)
   end
 
   defp mem(scope, project_id, text) do
@@ -357,6 +378,286 @@ defmodule Loopctl.MemoryRecallContextTest do
       scores = Enum.map(result.results, & &1.score)
       assert scores == Enum.sort(scores, :desc)
       assert result.meta.results_ranking == "heuristic_cross_source"
+    end
+  end
+
+  describe "recall_context/2 - diversity selection (#792)" do
+    # A shared 0.1 base with a 2.1 spike at ONE index. Two articles built on the same index
+    # are cosine 1.0 (identical vectors); two on different indexes are ~0.80, comfortably
+    # under the 0.95 threshold. Every collision here is therefore constructed on purpose —
+    # nothing depends on the fixture defaults happening to collide.
+    defp spiked(index) do
+      0.1 |> List.duplicate(1536) |> List.replace_at(index, 2.1)
+    end
+
+    defp embedded_article(tenant_id, title, vector, content_hash \\ nil) do
+      art =
+        fixture(:article, %{
+          tenant_id: tenant_id,
+          project_id: nil,
+          status: :published,
+          title: title,
+          body: "#{title} body text"
+        })
+
+      {:ok, _} = Knowledge.update_embedding(tenant_id, art.id, vector, content_hash)
+      art
+    end
+
+    defp knowledge_result_ids(result) do
+      result.results
+      |> Enum.filter(&(&1.source == :knowledge))
+      |> Enum.map(& &1.article.id)
+    end
+
+    test "two near-duplicates yield ONE of them PLUS the next distinct candidate", ctx do
+      marker = "neardup#{System.unique_integer([:positive])}"
+
+      # The QUERY embeds to the twins' own vector, so the semantic lane ranks both of them
+      # above the distinct article — the topically-clustered corpus this feature exists for,
+      # built deliberately rather than hoped for. The baseline below PROVES the clustering.
+      Mox.stub(Loopctl.MockEmbeddingClient, :generate_embedding, fn _t, _text ->
+        {:ok, spiked(1)}
+      end)
+
+      # BOTH lanes have to favour the twins, not just one: `search_combined/3` fuses
+      # keyword and semantic ranks with RRF, and a distinct article that wins the keyword
+      # lane can out-fuse a twin that only wins the semantic one. So the twins carry the
+      # marker three times as well as owning the query's exact vector.
+      twin_a =
+        embedded_article(ctx.tenant.id, "#{marker} #{marker} #{marker} alpha", spiked(1))
+
+      twin_b = embedded_article(ctx.tenant.id, "#{marker} #{marker} #{marker} beta", spiked(1))
+      distinct = embedded_article(ctx.tenant.id, "#{marker} gamma", spiked(900))
+
+      # NON-VACUITY, and the whole reason this baseline is in the test rather than assumed:
+      # if the twins did NOT already occupy both slots, the assertion below would pass
+      # without diversity having done anything at all.
+      baseline =
+        Memory.recall_context(ctx.scope, query: marker, limit: 2, diversity_enabled: false)
+
+      assert Enum.sort(knowledge_result_ids(baseline)) == Enum.sort([twin_a.id, twin_b.id]),
+             "the corpus must actually be clustered at the top, or the refill is untested"
+
+      result = Memory.recall_context(ctx.scope, query: marker, limit: 2)
+      ids = knowledge_result_ids(result)
+
+      # THE REFILL. Removing a near-duplicate is only half the fix: without the refill this
+      # is a one-row answer and the second slot — one of the three a session ever sees — is
+      # simply wasted. Assert BOTH that a twin went AND that `distinct` took the freed slot.
+      assert length(ids) == 2
+      assert distinct.id in ids
+      assert Enum.count(ids, &(&1 in [twin_a.id, twin_b.id])) == 1
+      assert result.meta.diversity.dropped_near_duplicates >= 1
+      assert result.meta.diversity.enabled == true
+    end
+
+    test "the freed slot is refilled from the OVER-FETCHED pool, not from the page", ctx do
+      # `candidates_considered.knowledge` must exceed the returned count, or there was
+      # nothing to refill FROM and the previous test passed by accident of pool size.
+      marker = "overfetch#{System.unique_integer([:positive])}"
+
+      for i <- 1..4, do: embedded_article(ctx.tenant.id, "#{marker} a#{i}", spiked(i * 7))
+
+      result = Memory.recall_context(ctx.scope, query: marker, limit: 2)
+
+      assert result.meta.candidates_considered.knowledge > length(knowledge_result_ids(result))
+      assert result.meta.diversity.candidates == result.meta.candidates_considered.knowledge
+    end
+
+    test "an exact content-hash duplicate collapses to one row", ctx do
+      marker = "exactdup#{System.unique_integer([:positive])}"
+      hash = "sha-#{System.unique_integer([:positive])}"
+
+      a = embedded_article(ctx.tenant.id, "#{marker} one", spiked(11), hash)
+      b = embedded_article(ctx.tenant.id, "#{marker} two", spiked(500), hash)
+      c = embedded_article(ctx.tenant.id, "#{marker} three", spiked(1200), "other-#{hash}")
+
+      result = Memory.recall_context(ctx.scope, query: marker, limit: 3)
+      ids = knowledge_result_ids(result)
+
+      assert c.id in ids
+      assert Enum.count(ids, &(&1 in [a.id, b.id])) == 1
+      assert result.meta.diversity.dropped_exact_duplicates == 1
+    end
+
+    test "containment-in-history: a second recall in the same session skips what it showed",
+         ctx do
+      marker = "history#{System.unique_integer([:positive])}"
+      session = "sess-#{System.unique_integer([:positive])}"
+
+      for i <- 1..3, do: embedded_article(ctx.tenant.id, "#{marker} a#{i}", spiked(i * 13))
+
+      first = Memory.recall_context(ctx.scope, query: marker, limit: 1, session_id: session)
+      first_ids = knowledge_result_ids(first)
+      assert length(first_ids) == 1
+
+      second = Memory.recall_context(ctx.scope, query: marker, limit: 1, session_id: session)
+      second_ids = knowledge_result_ids(second)
+
+      assert length(second_ids) == 1
+      assert second_ids != first_ids
+      assert second.meta.diversity.dropped_already_seen >= 1
+    end
+
+    test "a session that has exhausted the pool still gets rows, not an empty half", ctx do
+      marker = "exhaust#{System.unique_integer([:positive])}"
+      session = "sess-#{System.unique_integer([:positive])}"
+
+      for i <- 1..2, do: embedded_article(ctx.tenant.id, "#{marker} a#{i}", spiked(i * 37))
+
+      # Recall the same topic until every matching article is in this session's history.
+      for _ <- 1..3 do
+        Memory.recall_context(ctx.scope, query: marker, limit: 2, session_id: session)
+      end
+
+      final = Memory.recall_context(ctx.scope, query: marker, limit: 2, session_id: session)
+
+      # WITHOUT the containment floor this is an EMPTY knowledge half for the whole TTL,
+      # and the agent reads that as "the KB has nothing on this" while the articles it
+      # asked for still exist. A repeat is a worse answer than a fresh one; it is a far
+      # better answer than nothing.
+      assert knowledge_result_ids(final) != []
+      assert final.meta.diversity.readmitted_already_seen > 0
+    end
+
+    test "containment is per-tenant: another tenant's identical session token is inert", ctx do
+      marker = "histiso#{System.unique_integer([:positive])}"
+      session = "sess-#{System.unique_integer([:positive])}"
+
+      other_tenant = fixture(:tenant)
+      Knowledge.reset_circuit_breaker(other_tenant.id)
+
+      mine = embedded_article(ctx.tenant.id, "#{marker} mine", spiked(21))
+      theirs = embedded_article(other_tenant.id, "#{marker} theirs", spiked(21))
+
+      other_scope = %Scope{
+        tenant_id: other_tenant.id,
+        subject_id: "subject-#{System.unique_integer([:positive])}",
+        project_id: nil
+      }
+
+      first = Memory.recall_context(ctx.scope, query: marker, limit: 1, session_id: session)
+      assert knowledge_result_ids(first) == [mine.id]
+
+      # The SAME session token under a different tenant. `session_id` is client-chosen, so a
+      # collision is trivially forgeable; `tenant_id` being in the history key is what makes
+      # it harmless.
+      other = Memory.recall_context(other_scope, query: marker, limit: 1, session_id: session)
+
+      assert knowledge_result_ids(other) == [theirs.id]
+      assert other.meta.diversity.dropped_already_seen == 0
+    end
+
+    test "no session_id means no containment — a repeat recall returns the same row", ctx do
+      marker = "nosession#{System.unique_integer([:positive])}"
+
+      for i <- 1..3, do: embedded_article(ctx.tenant.id, "#{marker} a#{i}", spiked(i * 17))
+
+      first = Memory.recall_context(ctx.scope, query: marker, limit: 1)
+      second = Memory.recall_context(ctx.scope, query: marker, limit: 1)
+
+      assert knowledge_result_ids(first) == knowledge_result_ids(second)
+      assert first.meta.diversity.dropped_already_seen == 0
+    end
+
+    test "lambda 1.0 with the dedup stages off reproduces the pre-#792 selection exactly",
+         ctx do
+      marker = "lambda#{System.unique_integer([:positive])}"
+
+      for i <- 1..4, do: embedded_article(ctx.tenant.id, "#{marker} a#{i}", spiked(i * 23))
+
+      off = Memory.recall_context(ctx.scope, query: marker, limit: 3, diversity_enabled: false)
+
+      pure =
+        Memory.recall_context(ctx.scope,
+          query: marker,
+          limit: 3,
+          diversity_lambda: 1.0,
+          diversity_near_dup_threshold: 2.0
+        )
+
+      assert knowledge_result_ids(pure) == knowledge_result_ids(off)
+      assert Enum.map(pure.results, & &1.score) == Enum.map(off.results, & &1.score)
+      assert pure.meta.diversity.lambda == 1.0
+      assert off.meta.diversity.enabled == false
+    end
+
+    test "selection does not decide render order — the merged list is still score DESC", ctx do
+      marker = "order#{System.unique_integer([:positive])}"
+
+      for i <- 1..4, do: embedded_article(ctx.tenant.id, "#{marker} a#{i}", spiked(i * 29))
+
+      result = Memory.recall_context(ctx.scope, query: marker, limit: 3, diversity_lambda: 0.3)
+
+      scores = Enum.map(result.results, & &1.score)
+      assert scores == Enum.sort(scores, :desc)
+      assert Enum.map(result.results, & &1.rank) == Enum.to_list(1..length(result.results))
+    end
+
+    test "the knowledge envelope publishes the SELECTED set, never the over-fetched pool",
+         ctx do
+      marker = "envelope#{System.unique_integer([:positive])}"
+
+      for i <- 1..5, do: embedded_article(ctx.tenant.id, "#{marker} a#{i}", spiked(i * 31))
+
+      result = Memory.recall_context(ctx.scope, query: marker, limit: 2)
+
+      assert length(result.knowledge.results) <= 2
+      assert result.meta.knowledge_count == length(result.knowledge.results)
+      assert result.meta.candidates_considered.knowledge >= result.meta.knowledge_count
+      # The envelope's own meta must describe the envelope's own data: `meta.limit` is the
+      # limit the CALLER asked for, never the internal over-fetch. A client paging on
+      # `offset + meta.limit` would otherwise skip `pool - limit` articles per page.
+      assert result.knowledge.meta.limit == 2
+    end
+
+    test "search_events records what the CALLER asked for and got, not the over-fetched pool",
+         ctx do
+      {_raw, key} = fixture(:api_key, %{tenant_id: ctx.tenant.id, role: :agent})
+      marker = "sevent#{System.unique_integer([:positive])}"
+
+      for i <- 1..5, do: embedded_article(ctx.tenant.id, "#{marker} a#{i}", spiked(i * 43))
+
+      result =
+        Memory.recall_context(ctx.scope, query: marker, limit: 1, api_key_id: key.id)
+
+      [event] =
+        Loopctl.AdminRepo.all(
+          from(e in Loopctl.Knowledge.SearchEvent, where: e.tenant_id == ^ctx.tenant.id)
+        )
+
+      assert event.tool == "memory_recall"
+      # The knowledge half RUNS at `limit x over_fetch` so drops can be refilled — but the
+      # two columns that describe the CALLER's side of the exchange must not inherit that.
+      # `limit_requested` answers "did callers ask for more than we return", and
+      # `result_count` is what this surface handed back; the over-fetch is an internal
+      # detail that would read as a 3x inflation in every figure built on either.
+      assert result.meta.candidates_considered.knowledge > 1
+      assert event.limit_requested == 1
+      assert event.result_count == 1
+    end
+
+    test "an unembedded article is never dropped as a duplicate", ctx do
+      marker = "unembedded#{System.unique_integer([:positive])}"
+
+      twin_a = embedded_article(ctx.tenant.id, "#{marker} alpha", spiked(41))
+      twin_b = embedded_article(ctx.tenant.id, "#{marker} beta", spiked(41))
+
+      bare =
+        fixture(:article, %{
+          tenant_id: ctx.tenant.id,
+          project_id: nil,
+          status: :published,
+          title: "#{marker} bare",
+          body: "#{marker} bare body text"
+        })
+
+      result = Memory.recall_context(ctx.scope, query: marker, limit: 3)
+      ids = knowledge_result_ids(result)
+
+      assert bare.id in ids
+      assert Enum.count(ids, &(&1 in [twin_a.id, twin_b.id])) == 1
     end
   end
 end

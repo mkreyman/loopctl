@@ -159,7 +159,12 @@ defmodule LoopctlWeb.RecallJSON do
       selected_count: meta.selected_count,
       tokens_selected: meta.tokens_selected,
       tokens_candidates: meta.tokens_candidates,
-      tokens_saved_vs_candidates: meta.tokens_saved_vs_candidates
+      tokens_saved_vs_candidates: meta.tokens_saved_vs_candidates,
+      # #792. Rendered whole rather than key-by-key: the block is built by
+      # `Loopctl.Knowledge.Diversity` and is the SAME shape `knowledge_hybrid_search`
+      # publishes, so a client parses one thing and a new counter cannot be silently
+      # dropped here while the selector reports it.
+      diversity: Map.get(meta, :diversity)
     }
   end
 end

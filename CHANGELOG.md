@@ -75,6 +75,69 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **A claim now says whether you created it, and which session holds it (issue #779).**
+  `POST /api/v1/channel/claims` answers a FRESH claim with `201` and `created: true`, and
+  an idempotent owner re-claim with `200`, `created: false`, `already_held: true` and the
+  row's ORIGINAL `claimed_at`. **Operator-visible break: the idempotent re-claim used to be
+  a `201` and is now a `200`** — a client that branches on the status code, rather than on
+  the body, will see the change.
+
+  The reason is the failure it closes. `channel_claim` is idempotent for the owning AGENT,
+  and a whole fleet typically authenticates as ONE `agent_id`, so a peer session's live
+  claim came back as a plain success with the caller's own `claimant_agent_id`. Two
+  machines each read "one claim — mine" and shipped duplicate PRs.
+
+  Claims now also carry an advisory `claimed_by_session` / `claimed_by_host`, stamped from
+  the `session_id`/`host` the MCP proxy already auto-fills on `channel_post` and
+  `channel_lock`. `GET /api/v1/channel/claims` returns both plus a server-derived
+  `same_session` (`null` when either side is unstamped — undiscriminable, not "someone
+  else's"), and accepts an optional `session_id` query parameter to compute it.
+
+  `POST /channel/claims/done` and `/release` refuse a claim stamped by a DIFFERENT session
+  with a new `409 claim_session_mismatch`, which is the fix for `release` silently deleting
+  a peer session's live claim. **The refusal is ADVISORY and cleared by `force: true`**:
+  `session_id` is client-supplied and spoofable in exactly the way `to_host` is, so it stops
+  an accident and never an attack — tenant, project membership and `claimant_agent_id`
+  remain the enforced boundary, and all three are checked before the session guard runs (a
+  foreign claim still 404s byte-identically). The override is also what keeps a session that
+  crashed and relaunched under a new session id from being locked out of completing its own
+  work until the lease expires. The guard applies ONLY to a claim that is still live: a DONE
+  or lease-expired row answers exactly as it did before (`404 not_found` /
+  `409 already_claimed`), because nobody is working it and `force` cannot clear a terminal
+  state. Every `done`/`release` audit entry now records `caller_session`,
+  `claimed_by_session` and `forced`, so a forced cross-session end is no longer
+  indistinguishable from the owner ending its own work, and a refusal, a forced override or
+  a pass on an unstamped row emits `[:loopctl, :coordination, :claim_session_guard]` with
+  the outcome — the refusal writes no audit row, so telemetry is the only signal there.
+
+  The caller's `session_id` on `done`/`release` is held to the SAME rules the claim path
+  applies to `claimed_by_session` — a string, at most 200 bytes, no NUL byte, valid UTF-8,
+  no credential shape — because it is echoed into the guard's log line and persisted into
+  the append-only audit entry's `metadata`. A violation is a `422` whose `details` are
+  keyed on `session_id`, the parameter you sent (a NUL byte and a non-UTF-8 binary were
+  both previously a raw `500` from the jsonb write, and an oversized value an unbounded
+  audit row), and a credential shape also raises
+  `[:loopctl, :coordination, :secret_blocked]`. A whitespace-only `session_id` of any size
+  is UNDISCRIMINABLE, exactly as on the claim path: it is recorded as `null`, never as the
+  string you sent.
+
+  **MCP proxy (`loopctl-mcp-server`).** The claim and lock tools now resolve their session
+  id from `CLAUDE_CODE_SESSION_ID` first, then `CLAUDE_SESSION_ID`, and only then from a
+  `(host, cwd)`-keyed file under the temp dir. The specific marker is preferred because
+  `CLAUDE_SESSION_ID` is INHERITED by a headless subsession, so two concurrent sessions in
+  one directory would otherwise stamp one value — and a shared stamp lets a peer's
+  `channel_release` delete live work with no `409`. `channel_lock`/`channel_unlock` moved
+  onto the same id as the claims: the server resolves a lock's refresh and release by the
+  `(tenant, project, agent, session, key)` slot, so a process-lifetime id stranded a
+  session's own lock for the rest of its TTL after an npx respawn. The temp file is
+  read behind an `lstat` symlink/ownership refusal and a uuid shape check, and written
+  with `O_EXCL` plus a rename, matching the STH cache's existing discipline.
+
+  Migration `20260907140000_add_session_discriminator_to_channel_claims` adds two nullable
+  `text` columns and no index. No backfill and no manual step: existing rows and clients
+  that send no session are treated as undiscriminable and keep the pre-#779 agent-scoped
+  behaviour.
+
 - **A deduplicated create now says whether it threw your payload away
   (`loopctl-mcp-server` 2.89.0).** `POST /api/v1/articles` answers a duplicate with
   `200 deduplicated: true` and keeps the stored row unchanged — deliberately, because the

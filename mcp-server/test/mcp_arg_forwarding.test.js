@@ -221,6 +221,14 @@ describe("#39.4: channel_post / channel_recent wiring", () => {
       /const CHANNEL_SESSION_ID = process\.env\.CLAUDE_SESSION_ID \|\| crypto\.randomUUID\(\);/,
       "must define CHANNEL_SESSION_ID as CLAUDE_SESSION_ID with a randomUUID fallback",
     );
+    // The POST path keeps the process-lifetime fallback on purpose. The CLAIM and LOCK
+    // paths do NOT (#779) — they compare their stamp again later — so assert the two are
+    // genuinely distinct constants rather than one name for both.
+    assert.doesNotMatch(
+      INDEX_SRC,
+      /const CLAIM_SESSION_ID = CHANNEL_SESSION_ID/,
+      "the claim/lock discriminator must not collapse back onto the post one",
+    );
     assert.match(
       functionSource("channelPostRaw"),
       /payload\.session_id = CHANNEL_SESSION_ID;/,
@@ -377,6 +385,163 @@ describe("US-40.B1: channel_claim / channel_release / channel_done wiring", () =
     );
   });
 
+  // Issue #779: claimant_agent_id cannot tell two sessions apart when the whole fleet
+  // authenticates as one agent, so the proxy stamps the per-session discriminator on
+  // every claim write and sends it on the read. These are the four call sites; a
+  // missing one puts the fleet straight back in the incident.
+  test("channelClaim stamps the per-session discriminator and the host (#779)", () => {
+    const src = functionSource("channelClaim");
+    assert.match(
+      src,
+      /payload\.session_id = CLAIM_SESSION_ID;/,
+      "channelClaim must stamp CLAIM_SESSION_ID on the claim",
+    );
+    assert.match(
+      src,
+      /payload\.host = os\.hostname\(\);/,
+      "channelClaim must stamp the host on the claim",
+    );
+  });
+
+  // #779: the claim discriminator's lifetime must be the SESSION, not this PROCESS — a
+  // uuid re-minted on every npx respawn made the server read this session's OWN live
+  // claims as a peer's, 409 claim_session_mismatch on its own work for the rest of a
+  // lease. Review round 1 answered that with an inline (host, cwd) temp file; round 2
+  // moved the whole resolution into lib/claim-session.js, because the file needed the
+  // CWE-59 symlink/ownership discipline lib/witness-sth.js already applies to its own
+  // predictable temp path — and because the ENV markers Claude Code always exports
+  // answer this without a file at all, without merging two concurrent sessions onto one
+  // id. The behaviour of that module is tested in test/claim_session.test.js; this
+  // asserts only the WIRING, which is what a revert would take out.
+  test("the claim discriminator is resolved through the shared module, never per-process (#779)", () => {
+    assert.match(
+      INDEX_SRC,
+      /import \{ resolveClaimSessionId \} from "\.\/lib\/claim-session\.js";/,
+      "index.js must import the shared claim-session resolver",
+    );
+    assert.match(
+      INDEX_SRC,
+      /const CLAIM_SESSION_ID = resolveClaimSessionId\(\{/,
+      "CLAIM_SESSION_ID must come from resolveClaimSessionId(), never crypto.randomUUID()",
+    );
+    assert.doesNotMatch(
+      INDEX_SRC,
+      /const CLAIM_SESSION_ID = [^\n]*crypto\.randomUUID/,
+      "CLAIM_SESSION_ID must never be a bare per-process uuid",
+    );
+  });
+
+  test("channelClaims sends session_id so the server can answer same_session (#779)", () => {
+    assert.match(
+      functionSource("channelClaims"),
+      /params\.set\("session_id", CLAIM_SESSION_ID\);/,
+      "channelClaims must send CLAIM_SESSION_ID so rows carry same_session",
+    );
+  });
+
+  test("channelDone and channelRelease send session_id and forward force (#779)", () => {
+    for (const fn of ["channelDone", "channelRelease"]) {
+      const src = functionSource(fn);
+      assert.match(
+        src,
+        /session_id: CLAIM_SESSION_ID/,
+        `${fn} must send CLAIM_SESSION_ID so the server can refuse a peer session's claim`,
+      );
+      assert.match(
+        src,
+        /if \(force === true \|\| force === "true"\) payload\.force = true;/,
+        `${fn} must forward force so a restarted session can finish its own work`,
+      );
+      // The dispatch does no inputSchema type validation, so a model emitting the
+      // string "false" reaches this line verbatim. A truthy test turns it into
+      // force: true and deletes the peer's live claim the server just refused to —
+      // the string cases the server is tested against would be unreachable.
+      assert.doesNotMatch(
+        src,
+        /if \(force\) payload\.force = true;/,
+        `${fn} must not coerce a truthy non-true force (e.g. the string "false") to true`,
+      );
+    }
+  });
+
+  test("only the boolean true and the string 'true' set force on the wire (#779)", () => {
+    // Behavioural, on the SHIPPED predicate: lifted verbatim out of index.js by the
+    // same slice the assertions above pin, so it cannot drift from what runs.
+    const line = functionSource("channelDone").match(
+      /if \((force === .*?)\) payload\.force = true;/,
+    );
+    assert.ok(line, "channelDone must carry a force predicate");
+    // eslint-disable-next-line no-new-func
+    const accepts = new Function("force", `return !!(${line[1]});`);
+
+    for (const value of [true, "true"]) {
+      assert.equal(accepts(value), true, `force ${JSON.stringify(value)} must set force`);
+    }
+
+    for (const value of ["false", "0", "no", false, undefined, null, 1, "TRUE"]) {
+      assert.equal(
+        accepts(value),
+        false,
+        `force ${JSON.stringify(value)} must NOT set force on the wire`,
+      );
+    }
+  });
+
+  test("channel_claim tells the agent to read already_held before starting work (#779)", () => {
+    const claimTool = INDEX_SRC.slice(INDEX_SRC.indexOf('name: "channel_claim",'));
+    const description = claimTool.slice(0, claimTool.indexOf("inputSchema"));
+    assert.match(
+      description,
+      /already_held/,
+      "channel_claim must name the already_held marker",
+    );
+    assert.match(
+      description,
+      /same_session/,
+      "channel_claim must name same_session, the server's own ownership comparison",
+    );
+  });
+
+  test("channel_done and channel_release document the session refusal AND that it is advisory (#779)", () => {
+    for (const tool of ["channel_done", "channel_release"]) {
+      const start = INDEX_SRC.indexOf(`name: "${tool}",`);
+      assert.ok(start > -1, `${tool} must be declared`);
+      const description = INDEX_SRC.slice(start, INDEX_SRC.indexOf("inputSchema", start));
+      assert.match(
+        description,
+        /claim_session_mismatch/,
+        `${tool} must name the 409 it can now return`,
+      );
+      // The warning must NOT read as an authorization boundary: session_id is
+      // client-supplied and force clears the refusal, so a tool description that
+      // promises isolation is worse than none.
+      assert.match(
+        description,
+        /ADVISORY/,
+        `${tool} must say the session refusal is advisory, not authorization`,
+      );
+      assert.match(description, /force/, `${tool} must name the force override`);
+    }
+  });
+
+  test("channel_claims no longer says two sessions can done/release each other's claims (#779)", () => {
+    // A warning that outlives its defect is itself a defect: the guard now refuses
+    // that call, so the old sentence would send an agent looking for a hazard the
+    // server just closed — and hide the same_session field that replaced it.
+    const start = INDEX_SRC.indexOf('name: "channel_claims",');
+    const description = INDEX_SRC.slice(start, INDEX_SRC.indexOf("inputSchema", start));
+    assert.doesNotMatch(
+      description,
+      /can channel_done or channel_release each other's claims/,
+      "channel_claims must not still promise the unguarded cross-session release",
+    );
+    assert.match(
+      description,
+      /same_session/,
+      "channel_claims must document the same_session flag that replaced it",
+    );
+  });
+
   test("the claim dispatch cases call the right functions", () => {
     assert.match(
       INDEX_SRC,
@@ -523,14 +688,20 @@ describe("US-40.4: channel_lock / channel_unlock / channel_locks wiring", () => 
   test("host/session_id stay PROXY-supplied on the lock path (never caller args)", () => {
     // session_id is what makes a lock refreshable in place and releasable by
     // slot; a caller-supplied one would let a client address another session's slot.
+    //
+    // WHICH proxy-supplied id (#779) is asserted in test/claim_session.test.js: a lock's
+    // ownership is resolved AGAIN later, by the (tenant, project, agent, session, key)
+    // slot, so it belongs to the CLAIM family and not to the one-shot post family. This
+    // test pins that both stay proxy-supplied; it deliberately no longer names the
+    // constant, so the two files cannot contradict each other on that point.
     assert.match(
-      INDEX_SRC,
-      /async function channelLock\([\s\S]*?payload\.host = os\.hostname\(\);[\s\S]*?payload\.session_id = CHANNEL_SESSION_ID;/,
+      functionSource("channelLock"),
+      /payload\.host = os\.hostname\(\);[\s\S]*?payload\.session_id = [A-Z_]*SESSION_ID;/,
       "channelLock must auto-fill host and session_id",
     );
     assert.match(
-      INDEX_SRC,
-      /async function channelUnlock\([\s\S]*?payload\.session_id = CHANNEL_SESSION_ID;/,
+      functionSource("channelUnlock"),
+      /payload\.session_id = [A-Z_]*SESSION_ID;/,
       "channelUnlock must auto-fill session_id",
     );
     // Neither tool schema may expose host/session_id as caller inputs.
@@ -777,14 +948,25 @@ describe("#411 gap2: recall_context wiring", () => {
     );
   });
 
-  test("recallContext POSTs /api/v1/recall with query/project_id/limit on the agent key", () => {
+  test("recallContext POSTs /api/v1/recall with query/project_id/limit/session_id on the agent key", () => {
     assert.match(
       INDEX_SRC,
-      /async function recallContext\(\{ query, project_id, limit \}\) \{[\s\S]*?"POST",\s*\n\s*"\/api\/v1\/recall",[\s\S]*?LOOPCTL_AGENT_KEY/,
+      /async function recallContext\(\{ query, project_id, limit, session_id \}\) \{[\s\S]*?"POST",\s*\n\s*"\/api\/v1\/recall",[\s\S]*?LOOPCTL_AGENT_KEY/,
       "recallContext must POST /api/v1/recall on the agent key",
     );
     assert.match(INDEX_SRC, /const payload = \{ query \};\s*\n\s*if \(project_id\) payload\.project_id = project_id;/);
     assert.match(INDEX_SRC, /if \(limit != null\) payload\.limit = limit;/);
+    // #792: the containment-in-history key must be FORWARDED, not silently dropped — a
+    // session token the server never receives suppresses nothing.
+    assert.match(INDEX_SRC, /if \(session_id\) payload\.session_id = session_id;/);
+  });
+
+  test("the recall_context tool declares session_id so an agent can actually pass one", () => {
+    assert.match(
+      INDEX_SRC,
+      /name: "recall_context",[\s\S]*?session_id: \{[\s\S]*?required: \["query"\],/,
+      "recall_context must expose session_id in its inputSchema",
+    );
   });
 
   test("the recall_context dispatch case calls recallContext(args)", () => {
