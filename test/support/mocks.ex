@@ -51,6 +51,18 @@ Mox.defmock(Loopctl.MockArticleSimilaritySearch,
   for: Loopctl.Knowledge.SimilaritySearchBehaviour
 )
 
+# #790: the importance usage stamp's two injected collaborators. The nightly stamp is
+# FAIL-SOFT and reports how a run ended on the tally's `gate` field; three of the four gate
+# values are failures that a healthy sandbox connection cannot produce. These seams let the
+# gate tests hand `Importance.stamp/2` each failure shape directly. The DataCase default
+# stubs DELEGATE to the real `Loopctl.Knowledge.UsageScan` / `Loopctl.Knowledge.UsageStampWriter`,
+# so every other test runs the real aggregate and the real writes unchanged.
+Mox.defmock(Loopctl.MockKnowledgeUsageScan, for: Loopctl.Knowledge.UsageScanBehaviour)
+
+Mox.defmock(Loopctl.MockKnowledgeUsageStampWriter,
+  for: Loopctl.Knowledge.UsageStampWriterBehaviour
+)
+
 # US-27.15: webhook delivery DI. ScaleAlerts and the webhook worker share the
 # `:webhook_delivery` key. In :test it resolves to this mock; the DataCase default stub
 # delegates to Loopctl.Webhooks.ReqDelivery so the existing Req.Test-stub-based webhook

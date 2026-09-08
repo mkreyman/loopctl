@@ -5,6 +5,7 @@ defmodule Loopctl.Knowledge.ImportanceTest do
   setup :verify_on_exit!
 
   import Ecto.Query
+  import ExUnit.CaptureLog
 
   alias Loopctl.AdminRepo
   alias Loopctl.Knowledge
@@ -463,6 +464,159 @@ defmodule Loopctl.Knowledge.ImportanceTest do
 
       assert %{measured: 1, stamped: 1} = stamp(tenant.id)
       assert %{measured: 1, stamped: 0, cleared: 0, gate: :open} = stamp(tenant.id)
+    end
+  end
+
+  describe "the three FAILURE gates" do
+    # `stamp/2` never raises — it classifies. Each of these gate values is the ONLY signal
+    # the nightly pass records for a failure shape, and none of them can be produced by a
+    # healthy sandboxed connection, so each is asserted through the module's own DI seams
+    # (`Loopctl.Knowledge.UsageScanBehaviour` / `...UsageStampWriterBehaviour`). Without
+    # these the classification was logged, audited, and proved wired up by nothing.
+
+    test "a SHED heavy read reports :heavy_read_overloaded and keeps last night's values" do
+      # The shed is the one failure that is not an error: the TenantGate refused the read
+      # because the tenant is over its cost cap. Reporting it as its own gate rather than as
+      # a clean run matters BECAUSE the clean run's other half is destructive — an empty
+      # measurement means "nobody read anything", which `clear_step/3` acts on by setting the
+      # whole tenant's corpus back to neutral. So the assertion that nothing was CLEARED is
+      # the point of this test, not a decoration on the gate value.
+      tenant = fixture(:tenant)
+      a = article(tenant.id)
+      read(tenant.id, a.id, 1)
+
+      assert %{stamped: 1, gate: :open} = stamp(tenant.id)
+      assert read_days(a.id) == 1
+
+      Mox.expect(Loopctl.MockKnowledgeUsageScan, :all, fn _tenant_id, _query, _opts ->
+        {:error, :heavy_read_overloaded}
+      end)
+
+      assert %{
+               measured: 0,
+               stamped: 0,
+               cleared: 0,
+               truncated: false,
+               gate: :heavy_read_overloaded
+             } =
+               stamp(tenant.id)
+
+      assert read_days(a.id) == 1
+    end
+
+    test "a RAISING heavy read reports :scan_failed and keeps last night's values" do
+      tenant = fixture(:tenant)
+      a = article(tenant.id)
+      read(tenant.id, a.id, 1)
+
+      assert %{stamped: 1, gate: :open} = stamp(tenant.id)
+
+      Mox.expect(Loopctl.MockKnowledgeUsageScan, :all, fn _tenant_id, _query, _opts ->
+        raise "the aggregate blew up"
+      end)
+
+      log =
+        capture_log(fn ->
+          assert %{measured: 0, stamped: 0, cleared: 0, gate: :scan_failed} = stamp(tenant.id)
+        end)
+
+      # The tag is the EXCEPTION MODULE, never its message: a Postgrex/DBConnection struct's
+      # message carries the backend host, database and role into the log stream.
+      assert log =~ "usage scan failed (RuntimeError)"
+      refute log =~ "the aggregate blew up"
+      assert read_days(a.id) == 1
+    end
+
+    test "an EXITING heavy read reports :scan_failed, tagged apart from a raise" do
+      # A wedged or unstarted pool is reported by DBConnection as a non-local EXIT, not as an
+      # exception, so `measure/3` needs BOTH a rescue and a catch. This test exists to keep
+      # the catch clause honest: it asserts the `exit:` prefix, which is the only thing
+      # distinguishing this run's log from the raising one's.
+      tenant = fixture(:tenant)
+      a = article(tenant.id)
+      read(tenant.id, a.id, 1)
+
+      assert %{stamped: 1, gate: :open} = stamp(tenant.id)
+
+      Mox.expect(Loopctl.MockKnowledgeUsageScan, :all, fn _tenant_id, _query, _opts ->
+        exit({:noproc, {DBConnection, :execute, []}})
+      end)
+
+      log =
+        capture_log(fn ->
+          assert %{measured: 0, stamped: 0, cleared: 0, gate: :scan_failed} = stamp(tenant.id)
+        end)
+
+      assert log =~ "usage scan failed (exit:noproc)"
+      assert read_days(a.id) == 1
+    end
+
+    test "a failing SET statement reports :write_failed and skips the clear" do
+      # `set_one/3` HALTS the reduce, so the clear never runs — which is why the tally has to
+      # carry `measured` rather than reporting zeros: the corpus is left PARTIALLY stamped and
+      # a tally of zeros would contradict the database it just wrote to.
+      tenant = fixture(:tenant)
+      stale = article(tenant.id)
+      fresh = article(tenant.id)
+
+      read(tenant.id, stale.id, 1)
+      read(tenant.id, fresh.id, 1)
+      read(tenant.id, fresh.id, 2)
+
+      assert %{stamped: 2, gate: :open} = stamp(tenant.id)
+      assert read_days(stale.id) == 1
+      assert read_days(fresh.id) == 2
+
+      # A THIRD read day for `fresh`, so tonight's SET has an actual delta to write. Without
+      # it the statement is a no-op (`IS DISTINCT FROM` skips unchanged rows) and a run that
+      # bypassed the guard entirely would still report `stamped: 0`.
+      read(tenant.id, fresh.id, 3)
+
+      Mox.expect(Loopctl.MockKnowledgeUsageStampWriter, :update_all, fn _queryable, _updates ->
+        raise "the set statement blew up"
+      end)
+
+      # `max_articles: 1` keeps only `fresh` (more read days), so `stale` is exactly what a
+      # clear WOULD null — the negative control for "skips the clear".
+      log =
+        capture_log(fn ->
+          assert %{measured: 1, stamped: 0, cleared: 0, gate: :write_failed} =
+                   Importance.stamp(tenant.id, now: @now, max_articles: 1)
+        end)
+
+      assert log =~ "usage stamp write failed (RuntimeError)"
+      # The clear was never reached, so the row it would have nulled keeps its value; and the
+      # SET never committed, so `fresh` still carries last night's 2 rather than tonight's 3.
+      assert read_days(stale.id) == 1
+      assert read_days(fresh.id) == 2
+    end
+
+    test "a failing CLEAR statement reports :write_failed and keeps what the SET committed" do
+      # The other route to the same gate, and the one that proves the tally ACCUMULATES: every
+      # SET committed, so `stamped` must report them even though the run ended failed.
+      tenant = fixture(:tenant)
+      a = article(tenant.id)
+      read(tenant.id, a.id, 1)
+
+      real = Loopctl.Knowledge.UsageStampWriter
+
+      # One day-group => exactly one SET, then the CLEAR. Expectations are consumed in order.
+      Mox.expect(Loopctl.MockKnowledgeUsageStampWriter, :update_all, fn queryable, updates ->
+        real.update_all(queryable, updates)
+      end)
+
+      Mox.expect(Loopctl.MockKnowledgeUsageStampWriter, :update_all, fn _queryable, _updates ->
+        exit({:noproc, {DBConnection, :execute, []}})
+      end)
+
+      log =
+        capture_log(fn ->
+          assert %{measured: 1, stamped: 1, cleared: 0, gate: :write_failed} = stamp(tenant.id)
+        end)
+
+      assert log =~ "usage stamp write failed (exit:noproc)"
+      # The SET is what committed, and the tally's counts are what committed.
+      assert read_days(a.id) == 1
     end
   end
 end

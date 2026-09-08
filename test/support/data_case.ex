@@ -23,6 +23,8 @@ defmodule Loopctl.DataCase do
   alias Loopctl.Embeddings.SystemConfigReadPath
   alias Loopctl.Knowledge.StreamingExport.NoopBodyProbe
   alias Loopctl.Knowledge.StructuralLinks
+  alias Loopctl.Knowledge.UsageScan
+  alias Loopctl.Knowledge.UsageStampWriter
   alias Loopctl.Oban.FairShare
   alias Loopctl.Telemetry.ScaleAlerts
   alias Loopctl.Telemetry.ScaleMetrics
@@ -473,6 +475,19 @@ defmodule Loopctl.DataCase do
                                                                _k,
                                                                _opts ->
       []
+    end)
+
+    # #790: the importance usage stamp's seams default to the REAL modules, so the nightly
+    # stamp runs its genuine heavy-read aggregate and its genuine AdminRepo writes in every
+    # test that touches it (importance_test.exs's arithmetic, the lint worker's wiring test).
+    # Only the gate tests override these with `Mox.expect/3` to return an overload tag, to
+    # raise, or to exit — the three failure shapes a healthy sandbox connection cannot make.
+    Mox.stub(Loopctl.MockKnowledgeUsageScan, :all, fn tenant_id, queryable, opts ->
+      UsageScan.all(tenant_id, queryable, opts)
+    end)
+
+    Mox.stub(Loopctl.MockKnowledgeUsageStampWriter, :update_all, fn queryable, updates ->
+      UsageStampWriter.update_all(queryable, updates)
     end)
 
     # SSRF egress guard (ie-02 / worker-01): default-resolve any bare hostname to a

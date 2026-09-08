@@ -89,13 +89,14 @@ defmodule Loopctl.Knowledge.Importance do
 
   require Logger
 
-  alias Loopctl.AdminRepo
   alias Loopctl.Auth.ApiKey
   alias Loopctl.ExitTag
   alias Loopctl.HeavyRead
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleAccessEvent
+  alias Loopctl.Knowledge.UsageScan
+  alias Loopctl.Knowledge.UsageStampWriter
 
   # Shares the heat index's default lookback so "used recently" means one thing across the
   # product. A caller may narrow or widen it with `:since`; there is no separate config key,
@@ -237,7 +238,7 @@ defmodule Loopctl.Knowledge.Importance do
   defp measure(tenant_id, since, cap) do
     query = read_days_query(tenant_id, since, cap)
 
-    case HeavyRead.all(tenant_id, query, heavy_opts()) do
+    case usage_scan().all(tenant_id, query, heavy_opts()) do
       {:error, :heavy_read_overloaded} -> {:error, :heavy_read_overloaded}
       rows when is_list(rows) -> {:ok, rows}
     end
@@ -378,7 +379,7 @@ defmodule Loopctl.Knowledge.Importance do
   # Skipping unchanged rows keeps a steady-state night's write set to what actually moved.
   defp set_count(tenant_id, {days, ids}) do
     {count, _} =
-      AdminRepo.update_all(
+      writer().update_all(
         from(a in Article,
           where: a.tenant_id == ^tenant_id,
           where: a.id in ^ids,
@@ -399,7 +400,7 @@ defmodule Loopctl.Knowledge.Importance do
   # keep a boost they no longer earn.
   defp clear_absent(tenant_id, []) do
     {count, _} =
-      AdminRepo.update_all(
+      writer().update_all(
         from(a in Article,
           where: a.tenant_id == ^tenant_id,
           where: not is_nil(a.read_day_count)
@@ -412,7 +413,7 @@ defmodule Loopctl.Knowledge.Importance do
 
   defp clear_absent(tenant_id, ids) do
     {count, _} =
-      AdminRepo.update_all(
+      writer().update_all(
         from(a in Article,
           where: a.tenant_id == ^tenant_id,
           where: not is_nil(a.read_day_count),
@@ -439,6 +440,20 @@ defmodule Loopctl.Knowledge.Importance do
     |> DateTime.new!(~T[00:00:00], "Etc/UTC")
     |> DateTime.add(-@window_days, :day)
   end
+
+  # --- injected collaborators (config DI) ------------------------------------
+
+  # The aggregate and the two write statements are resolved through behaviours so the tally's
+  # three FAILURE gates are assertable. Under `mix test` both resolve to a Mox mock whose
+  # DataCase default stub delegates straight back to the module named as the default here, so
+  # the suite runs the real read and the real writes and only the gate tests override them.
+  # See `Loopctl.Knowledge.UsageScanBehaviour` / `Loopctl.Knowledge.UsageStampWriterBehaviour`
+  # for why a fail-soft classification that nothing can provoke is a classification nothing
+  # proves is wired up.
+  defp usage_scan, do: Application.get_env(:loopctl, :knowledge_usage_scan, UsageScan)
+
+  defp writer,
+    do: Application.get_env(:loopctl, :knowledge_usage_stamp_writer, UsageStampWriter)
 
   # --- tallies and logging ---------------------------------------------------
 
