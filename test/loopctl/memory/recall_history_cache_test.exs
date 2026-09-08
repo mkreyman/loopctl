@@ -58,9 +58,13 @@ defmodule Loopctl.Memory.RecallHistoryCacheTest do
              ["shared-id"]
   end
 
-  test "max_entries/0 is a positive integer and survives a nonsense config value" do
+  test "max_entries/0 is a ceiling far above what real session traffic reaches" do
+    # A safety valve only, not a working limit: one recall contributes at most `limit` ids,
+    # so a ceiling this high is thousands of live sessions. Asserting merely "a positive
+    # integer" could not fail — the fallback is a positive module attribute — and would
+    # still have passed with the ceiling set low enough to disable containment node-wide.
     assert is_integer(RecallHistoryCache.max_entries())
-    assert RecallHistoryCache.max_entries() > 0
+    assert RecallHistoryCache.max_entries() >= 10_000
   end
 
   test "the entry ceiling: at the cap there is no room, and a missing table is never room" do

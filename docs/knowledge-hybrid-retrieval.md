@@ -125,7 +125,7 @@ limit, offset) merged with exactly:
 | `provenance` | `:curated` \| `:retrieved` |
 | `confidence` | The WINNING candidate's absolute score for its OWN provenance class. `0.0` when there are no results, or `:retrieved` won with no genuine non-curated competitor. **Never** a rejected candidate's score from the OTHER class (`:retrieved`'s confidence is never a below-threshold curated score). |
 | `curated_article_id` | The winning curated article's id when `provenance == :curated` (guaranteed present AND first in `results`); `nil` on `:retrieved`. |
-| `diversity` | What redundancy removal did to THIS page (#792) — the same block `POST /api/v1/recall` publishes. See below. |
+| `diversity` | What redundancy removal did to the ranked POOL this page is a slice of (#792) — the same block `POST /api/v1/recall` publishes, where the pool IS the page. At a large `offset` the counters therefore describe rows this page does not contain. See below. |
 
 **Both branches return the identical map-key set** — on `results` (per-item keys
 are identical by construction; `:curated` reorders the same ranked pool rather
@@ -147,15 +147,22 @@ selection on the knowledge half".
 Three constraints are specific to this function and must not be dropped:
 
 - **It reorders the pool; it never shortens it.** Selection is applied to the
-  head of the ranked pool and everything it did not pick stays, in pool order,
-  directly behind it — so the union of the pages of one query is still a
-  PARTITION of the pool. Running it only at `offset: 0`, and discarding the
-  unselected window, made page 1 (drawn from pool positions 0..29) and page 2
-  (raw positions 10..19) overlap: a paging client got rows twice and never saw
-  the ones MMR skipped.
-- **It runs identically at every offset.** That is what makes the diversified
-  pool a stable function of the query rather than of the page, which is the
-  property "page 2 of a diversified list" needs in order to mean anything.
+  head of the ranked pool; what it did not pick is DEMOTED behind the pool tail
+  the selection never looked at, and nothing is discarded — so the union of the
+  pages of one query is still a PARTITION of the pool. Running it only at
+  `offset: 0`, and discarding the unselected window, made page 1 (drawn from pool
+  positions 0..29) and page 2 (raw positions 10..19) overlap: a paging client got
+  rows twice and never saw the ones MMR skipped. The rejected rows go behind the
+  tail rather than directly behind the selection because splicing them in first
+  refilled the very page they were rejected from with the near-copies MMR had
+  just dropped, whenever the selection came back shorter than `limit`.
+- **It runs identically at every offset**, and is NOT skipped once the requested
+  offset lands past the window. That is what makes the diversified pool a stable
+  function of the query rather than of the page, which is the property "page 2 of
+  a diversified list" needs in order to mean anything; the partition is a
+  property of the whole reordered list, so a page that skipped the reorder would
+  be a slice of a different list. The cost of running it on a deep page is one
+  bounded vector fetch over the window, never the pool.
 - **The curated winner is PINNED.** `hoist_to_front/2` exists so a caller
   branching on `meta.provenance == :curated` can trust `List.first(results)`;
   letting MMR demote or drop it would silently revoke that guarantee. It is

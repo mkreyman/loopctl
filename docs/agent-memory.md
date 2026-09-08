@@ -390,10 +390,12 @@ call through `recall_context/2` opts (`:diversity_enabled`,
 `:diversity_max_pool`) — the config-DI seam tests use instead of
 `Application.put_env`. `Knowledge.hybrid_search/3` shares the same selector and
 publishes the same `meta.diversity` block, with two differences of its own: it
-REORDERS the ranked pool rather than reducing it (everything the selection did
-not pick stays directly behind it, so paging one query still partitions the
-pool), and the curated winner is PINNED so `meta.provenance == :curated` still
-guarantees `List.first(results)` is the governed answer.
+REORDERS the ranked pool rather than reducing it (what the selection did not pick
+is demoted behind the pool tail it never looked at, so paging one query still
+partitions the pool, and the counters describe that POOL rather than the slice a
+paged caller receives), and the curated winner is PINNED so
+`meta.provenance == :curated` still guarantees `List.first(results)` is the
+governed answer.
 
 ---
 

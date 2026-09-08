@@ -265,20 +265,14 @@ defmodule Loopctl.Knowledge.Diversity do
 
     {unseen, already_seen} = partition_seen(rest, exclude)
 
+    pinned_items = Enum.map(pinned_candidates, &prepare/1)
+
     # THE CONTAINMENT FLOOR. Suppressing a repeat is only correct while a distinct
     # candidate can take the freed slot; once the shown-set has swallowed the pool the
     # alternative is an EMPTY knowledge half, which a caller reads as "the KB has nothing
     # on this" while the articles it wanted still exist.
-    {readmitted, dropped_seen} =
-      readmit_for_shortfall(already_seen, limit - length(pinned_candidates) - length(unseen))
-
-    {kept_exact, dropped_exact} =
-      dedup_by_fingerprint(unseen ++ readmitted, fingerprints(pinned_candidates))
-
-    pinned_items = Enum.map(pinned_candidates, &prepare/1)
-    pool = Enum.map(kept_exact, &prepare/1)
-
-    {selected, dropped_near} = mmr(pool, limit, opts, pinned_items)
+    {selected, pool, dropped_exact, dropped_near, readmitted, dropped_seen} =
+      fill_to_limit(unseen, [], already_seen, pinned_candidates, pinned_items, limit, opts)
 
     {Enum.map(selected, & &1.candidate),
      %{
@@ -299,7 +293,7 @@ defmodule Loopctl.Knowledge.Diversity do
   # public API reached through `Knowledge.hybrid_search/3`, where the pre-#792 path
   # clamped such a limit in `paginate_results/2` instead of crashing.
   def select(candidates, _limit, opts, _extra) when is_list(candidates),
-    do: {[], no_drop_stats(candidates, [], opts, false)}
+    do: {[], no_drop_stats(candidates, [], opts, Map.get(opts, :enabled?, false))}
 
   @doc """
   Cosine similarity of two equal-length vectors, `0.0` when either is absent, empty,
@@ -347,6 +341,47 @@ defmodule Loopctl.Knowledge.Diversity do
     do: Enum.split(already_seen, shortfall)
 
   defp readmit_for_shortfall(already_seen, _shortfall), do: {[], already_seen}
+
+  # The shortfall is measured AFTER the drop stages and the refill RE-RUNS them, because a
+  # re-admitted repeat can itself lose the fingerprint collapse or the near-duplicate check.
+  # Sizing it once, before those stages, from the raw unseen count (which is what this did
+  # until the #792 review's second round) left the page short of `limit` with re-admittable
+  # repeats still in hand — the exact outcome the floor exists to prevent, and the one the
+  # moduledoc promises cannot happen. Repeats stay APPENDED behind the unseen candidates, so
+  # they are only ever the lowest-ranked members of the pool. Each pass consumes at least one
+  # row from `dropped_seen`, so the recursion is bounded by the shown-set and terminates.
+  defp fill_to_limit(
+         unseen,
+         readmitted,
+         dropped_seen,
+         pinned_candidates,
+         pinned_items,
+         limit,
+         opts
+       ) do
+    {kept_exact, dropped_exact} =
+      dedup_by_fingerprint(unseen ++ readmitted, fingerprints(pinned_candidates))
+
+    pool = Enum.map(kept_exact, &prepare/1)
+
+    {selected, dropped_near} = mmr(pool, limit, opts, pinned_items)
+
+    case readmit_for_shortfall(dropped_seen, limit - length(selected)) do
+      {[], _still_dropped} ->
+        {selected, pool, dropped_exact, dropped_near, readmitted, dropped_seen}
+
+      {more, still_dropped} ->
+        fill_to_limit(
+          unseen,
+          readmitted ++ more,
+          still_dropped,
+          pinned_candidates,
+          pinned_items,
+          limit,
+          opts
+        )
+    end
+  end
 
   # --- Stage 2: exact fingerprint --------------------------------------------------
 
@@ -414,9 +449,22 @@ defmodule Loopctl.Knowledge.Diversity do
     prepared
     |> Enum.with_index()
     |> Enum.map(&index_item/1)
-    |> Enum.map(fn item -> {item, max_similarity(item, pinned_items)} end)
+    |> Enum.map(fn item -> {item, seed_similarity(item, pinned_items)} end)
     |> mmr_loop(seeded, limit, opts, 0)
   end
+
+  # With no pins the selected set is EMPTY, and the max similarity against an empty set is
+  # not `0.0` — it is undefined. Seeding the running max with `0.0` put a hard FLOOR under
+  # it, so an anti-correlated candidate (cosine below zero, which provider embeddings do
+  # produce) lost the diversity bonus MMR exists to give it and a DIFFERENT article was
+  # selected than the pre-#792 per-iteration `max` over the selected set would have picked.
+  # `:no_selection` carries "nothing selected yet" instead, and reads as `0.0` only in the
+  # two places where the empty-set case genuinely behaved that way before.
+  defp seed_similarity(_item, []), do: :no_selection
+  defp seed_similarity(item, pinned_items), do: max_similarity(item, pinned_items)
+
+  defp running_max(:no_selection, sim), do: sim
+  defp running_max(current, sim), do: max(current, sim)
 
   defp index_item({item, index}), do: Map.put(item, :index, index)
 
@@ -439,7 +487,7 @@ defmodule Loopctl.Knowledge.Diversity do
         rest =
           for {item, sim} <- survivors,
               item.index != winner.index,
-              do: {item, max(sim, similarity(item, winner))}
+              do: {item, running_max(sim, similarity(item, winner))}
 
         mmr_loop(rest, [winner | selected], limit, opts, dropped + length(near_dups))
     end
@@ -449,6 +497,8 @@ defmodule Loopctl.Knowledge.Diversity do
   # scores exactly 0.0, so without it a threshold of 0 would classify every unmeasurable
   # candidate as a duplicate of the first pick — the one thing this module promises never
   # to do. `config/1` already refuses a non-positive threshold; this is the second lock.
+  defp near_duplicate?({_item, :no_selection}, _opts), do: false
+
   defp near_duplicate?({_item, sim}, %{near_dup_threshold: threshold}),
     do: sim > 0.0 and sim >= threshold
 
@@ -456,14 +506,19 @@ defmodule Loopctl.Knowledge.Diversity do
   # is `0.0` for any finite similarity, and `score - 0.0 == score` to the bit — that exact
   # identity is what makes λ = 1.0 reproduce the pre-#792 selection rather than merely
   # approximate it.
+  defp mmr_score(item, :no_selection, opts), do: mmr_score(item, 0.0, opts)
+
   defp mmr_score(item, max_sim, %{lambda: lambda}),
     do: lambda * item.score - (1.0 - lambda) * max_sim
 
-  defp max_similarity(_item, []), do: 0.0
-
+  # NON-EMPTY by construction: `seed_similarity/2` intercepts the empty selected set and
+  # answers `:no_selection` (an empty set has no maximum, and calling it 0.0 is the floor
+  # this module now refuses to put under the running max), so the `Enum.max/2` fallback
+  # below is unreachable rather than load-bearing. An unmeasurable candidate still answers
+  # 0.0 — unmeasurable is neutral, never dissimilar.
   defp max_similarity(%{vector: nil}, _selected), do: 0.0
 
-  defp max_similarity(item, selected) do
+  defp max_similarity(item, [_ | _] = selected) do
     selected
     |> Enum.map(&similarity(item, &1))
     |> Enum.max(fn -> 0.0 end)

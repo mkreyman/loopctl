@@ -33,15 +33,20 @@ defmodule Loopctl.Memory.RecallHistoryCache do
   not a table — the cost of a miss is one redundant row, and the cost of a table would be a
   write on every recall.
 
-  Entries expire after `ttl_seconds/0` and a periodic sweep evicts them. TTL alone bounds
-  only an HONEST client, though: `session_id` is client-chosen, so a caller looping recalls
-  under a fresh token each time inserts entries that nothing evicts for a whole window. So
-  the table also carries a HARD ceiling (`max_entries/0`): at the ceiling a write first
-  tries the sweep, and if the table is still full it is SKIPPED. Losing containment is the
-  documented cost of a miss; unbounded ETS growth on every node is not.
+  Entries expire after `ttl_seconds/0` and the owner's periodic sweep evicts them. TTL alone
+  bounds only an HONEST client, though: `session_id` is client-chosen, so a caller looping
+  recalls under a fresh token each time inserts entries that nothing evicts for a whole
+  window. So the table also carries a HARD ceiling (`max_entries/0`): at the ceiling the
+  write is simply SKIPPED. Losing containment is the documented cost of a miss; unbounded
+  ETS growth on every node is not. The ceiling costs the CALLER one `:ets.info/2` read and
+  nothing else — reclamation is the owner's sweep, because the entries that reach the
+  ceiling are unexpired by construction, so sweeping at the boundary put a full-table scan
+  on every request for the whole window and freed nothing.
   """
 
   use GenServer
+
+  require Logger
 
   @table :loopctl_recall_shown_articles
   @sweep_interval_ms :timer.minutes(5)
@@ -139,9 +144,9 @@ defmodule Loopctl.Memory.RecallHistoryCache do
   Hard ceiling on live entries (config `:recall_history_max_entries`, default
   #{@default_max_entries}).
 
-  Reached, `mark_shown/4` sweeps and then declines to write. Declining costs containment
-  for that call — the documented, harmless outcome of a cache miss — where growing past it
-  costs the node's memory.
+  Reached, `mark_shown/4` declines to write (the periodic sweep reclaims; the caller never
+  scans). Declining costs containment for that call — the documented, harmless outcome of a
+  cache miss — where growing past it costs the node's memory.
   """
   @spec max_entries() :: pos_integer()
   def max_entries do
@@ -180,6 +185,7 @@ defmodule Loopctl.Memory.RecallHistoryCache do
   @impl true
   def handle_info(:sweep, state) do
     sweep_expired()
+    warn_if_full()
     schedule_sweep()
     {:noreply, state}
   end
@@ -206,22 +212,17 @@ defmodule Loopctl.Memory.RecallHistoryCache do
 
   defp shown?(_scope_key, _id, _now), do: false
 
-  # The ceiling is checked BEFORE the write and pays for a sweep only at the boundary, so
-  # the common path stays one `:ets.info/2` read. A missing table answers `:undefined`
-  # rather than an integer, which the last clause reads as "no room" — the same no-op the
-  # caller's `rescue` produced when the insert itself raised.
+  # The ceiling is checked BEFORE the write, and the check is ONE `:ets.info/2` read on
+  # every path — the request process never sweeps. It used to: at the ceiling it ran
+  # `sweep_expired/0` inline, and the entries that reach the ceiling are by construction
+  # UNEXPIRED, so that full-table `:ets.select_delete` freed nothing, declined the write
+  # anyway, and then repeated on the very next recall for the whole TTL window (~71 ms per
+  # request over 200k entries, on every tenant's recall on the node). Reclamation belongs to
+  # the owner's 5-minute sweep, which is already scheduled and already does exactly this.
+  # A missing table answers `:undefined` rather than an integer, which `room_for?/2` reads
+  # as "no room" — the same no-op the caller's `rescue` produced when the insert raised.
   defp room_to_write? do
-    cap = max_entries()
-    size = :ets.info(@table, :size)
-
-    if room_for?(size, cap) do
-      true
-    else
-      # Only at the boundary is a sweep worth paying for; if the table is still full
-      # afterwards the write is skipped.
-      if is_integer(size), do: sweep_expired()
-      room_for?(:ets.info(@table, :size), cap)
-    end
+    room_for?(:ets.info(@table, :size), max_entries())
   end
 
   @doc false
@@ -232,6 +233,24 @@ defmodule Loopctl.Memory.RecallHistoryCache do
   @spec room_for?(term(), pos_integer()) :: boolean()
   def room_for?(size, cap) when is_integer(size) and is_integer(cap), do: size < cap
   def room_for?(_size, _cap), do: false
+
+  # A table still at its ceiling AFTER a sweep means containment is off node-wide until
+  # entries expire, and a silent degradation is the one an operator cannot act on. Logged
+  # here — once per sweep interval, on the owner — never from the request path, where it
+  # would fire on every recall.
+  defp warn_if_full do
+    cap = max_entries()
+    size = :ets.info(@table, :size)
+
+    if room_for?(size, cap) do
+      :ok
+    else
+      Logger.warning(
+        "RecallHistoryCache at capacity (#{inspect(size)}/#{cap}) after sweep: " <>
+          "recall containment is disabled on this node until entries expire"
+      )
+    end
+  end
 
   defp schedule_sweep, do: Process.send_after(self(), :sweep, @sweep_interval_ms)
 

@@ -195,6 +195,54 @@ defmodule Loopctl.Knowledge.DiversityTest do
       assert stats.dropped_already_seen == 1
     end
 
+    test "the floor covers a shortfall the DEDUP stages opened, not just containment's" do
+      # The floor used to size itself from the raw unseen count, BEFORE the fingerprint
+      # collapse and before MMR. Any unseen candidate the later stages dropped therefore
+      # opened a slot the floor had already declined to refill, and the caller got exactly
+      # the short page the floor exists to prevent — with re-admittable repeats still in
+      # hand. Here the two unseen candidates share one content hash and collapse to one.
+      candidates = [
+        candidate("seen-1", 0.99, embedding: @a),
+        candidate("seen-2", 0.98, embedding: @b),
+        candidate("fresh", 0.97, embedding: @c, content_hash: "same"),
+        candidate("fresh-twin", 0.96, embedding: @c, content_hash: "same")
+      ]
+
+      {selected, stats} =
+        Diversity.select(candidates, 3, Diversity.config(diversity_lambda: 1.0),
+          exclude_ids: ["seen-1", "seen-2"]
+        )
+
+      assert length(selected) == 3
+      assert ids(selected) == ["seen-1", "seen-2", "fresh"]
+      assert stats.selected == 3
+      assert stats.readmitted_already_seen == 2
+      assert stats.dropped_already_seen == 0
+      assert stats.dropped_exact_duplicates == 1
+    end
+
+    test "the floor covers a shortfall the NEAR-DUPLICATE stage opened" do
+      candidates = [
+        candidate("seen-1", 0.99, embedding: @b),
+        candidate("fresh", 0.98, embedding: @a),
+        candidate("fresh-twin", 0.97, embedding: @a_twin)
+      ]
+
+      {selected, stats} =
+        Diversity.select(candidates, 2, Diversity.config(diversity_lambda: 1.0),
+          exclude_ids: ["seen-1"]
+        )
+
+      # `fresh-twin` is a near-copy of `fresh` and is dropped, so the unseen half can only
+      # ever fill ONE of the two slots. Sizing the shortfall before that stage (`limit 2 -
+      # 0 pinned - 2 unseen == 0`) re-admitted nothing and returned a one-row page with a
+      # usable repeat still in hand; the slot is now refilled by the highest-ranked repeat.
+      assert ids(selected) == ["seen-1", "fresh"]
+      assert stats.selected == 2
+      assert stats.readmitted_already_seen == 1
+      assert stats.dropped_already_seen == 0
+    end
+
     test "an empty exclude set changes nothing" do
       candidates = [candidate("a", 0.9, embedding: @a), candidate("b", 0.8, embedding: @b)]
 
@@ -243,6 +291,23 @@ defmodule Loopctl.Knowledge.DiversityTest do
       {selected, _stats} = Diversity.select(candidates, 2, opts)
 
       assert ids(selected) == ["third-but-strong", "middle"]
+    end
+
+    test "an ANTI-CORRELATED candidate keeps its diversity bonus — the running max is not floored" do
+      # The running max seeded at 0.0 put a hard FLOOR under the diversity term, so a
+      # candidate whose cosine to the selected set is NEGATIVE scored as merely
+      # uncorrelated. `opposite` is the most dissimilar row in the pool and must win the
+      # second slot over an equally-relevant orthogonal one.
+      candidates = [
+        candidate("top", 1.0, embedding: [1.0, 0.0]),
+        candidate("orthogonal", 0.5, embedding: [0.0, 1.0]),
+        candidate("opposite", 0.5, embedding: [-1.0, 0.0])
+      ]
+
+      opts = Diversity.config(diversity_lambda: 0.7, diversity_near_dup_threshold: 2.0)
+      {selected, _stats} = Diversity.select(candidates, 2, opts)
+
+      assert ids(selected) == ["top", "opposite"]
     end
 
     test "a lambda below 1.0 DOES reorder the same set — the 1.0 case is not vacuous" do
@@ -415,6 +480,23 @@ defmodule Loopctl.Knowledge.DiversityTest do
         assert selected == []
         assert stats.selected == 0
       end
+    end
+
+    test "a non-positive limit selects nothing but does NOT report the selector as disabled" do
+      # `meta.diversity.enabled` is the documented way to tell "selection is switched off"
+      # from "selection ran and kept nothing". Hard-coding it false here made an ENABLED
+      # selector describe itself as off whenever a caller handed it a bad limit.
+      opts = Diversity.config(diversity_lambda: 1.0)
+      {selected, stats} = Diversity.select([candidate("a", 0.9, embedding: @a)], 0, opts)
+
+      assert selected == []
+      assert stats.enabled == true
+      assert stats.selected == 0
+
+      {[], off_stats} =
+        Diversity.select([candidate("a", 0.9, embedding: @a)], 0, %{opts | enabled?: false})
+
+      assert off_stats.enabled == false
     end
 
     test "a non-numeric score ranks as 0.0 without crashing the loop" do

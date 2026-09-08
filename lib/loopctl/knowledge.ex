@@ -1354,9 +1354,10 @@ defmodule Loopctl.Knowledge do
   a non-1536 tenant, so reading the legacy column there would report every article
   unembedded and silently disable diversity for that whole tenant.
 
-  Best-effort by contract: any failure yields `%{}`, which disables the similarity stages
-  for that call. Diversity is a correction on a ranked list — it must never be able to
-  sink a recall.
+  Best-effort by contract: any failure — and a heavy-read SHED — yields `%{}`, which
+  disables the similarity stages for that call and spends nothing further on either pool.
+  Diversity is a correction on a ranked list — it must never be able to sink a recall, and
+  least of all by routing a shed onto the small admin pool.
   """
   @spec diversity_vectors(Ecto.UUID.t(), [Ecto.UUID.t()]) :: %{
           optional(String.t()) => %{embedding: [float()] | nil, content_hash: String.t() | nil}
@@ -1372,16 +1373,7 @@ defmodule Loopctl.Knowledge do
     if ids == [] do
       %{}
     else
-      tenant_rows = tenant_diversity_rows(tenant_id, ids)
-      resolved = MapSet.new(tenant_rows, & &1.id)
-
-      system_rows =
-        tenant_id
-        |> system_diversity_rows(Enum.reject(ids, &MapSet.member?(resolved, &1)))
-
-      Map.new(tenant_rows ++ system_rows, fn row ->
-        {row.id, %{embedding: to_vector_list(row.embedding), content_hash: row.content_hash}}
-      end)
+      resolve_diversity_rows(tenant_id, ids, tenant_diversity_rows(tenant_id, ids))
     end
   rescue
     error ->
@@ -1392,10 +1384,29 @@ defmodule Loopctl.Knowledge do
       %{}
   end
 
+  # A SHED is NOT "the tenant resolved nothing". Reading it that way handed the WHOLE id set
+  # to `system_diversity_rows/2`, i.e. to AdminRepo's three connections, at precisely the
+  # moment the database is already overloaded — inverting the split this function exists for.
+  # `backfill_snippets/2` returns on its own `:shed` for the same reason; this is the missing
+  # half of that pattern (#792 review round 2).
+  defp resolve_diversity_rows(_tenant_id, _ids, :shed), do: %{}
+
+  defp resolve_diversity_rows(tenant_id, ids, tenant_rows) do
+    resolved = MapSet.new(tenant_rows, & &1.id)
+
+    system_rows =
+      system_diversity_rows(tenant_id, Enum.reject(ids, &MapSet.member?(resolved, &1)))
+
+    Map.new(tenant_rows ++ system_rows, fn row ->
+      {row.id, %{embedding: to_vector_list(row.embedding), content_hash: row.content_hash}}
+    end)
+  end
+
   # The tenant's OWN articles, on the heavy-read pool. Conjunctive `a.tenant_id ==
   # ^tenant_id` (plus the side table's own conjunctive tenant equality on the join) is what
-  # `HeavyRead.guard!/2` requires; a shed returns no rows, which disables the similarity
-  # stages for this call exactly as a failed fetch does.
+  # `HeavyRead.guard!/2` requires. A shed answers the DISTINGUISHED `:shed`, never `[]`:
+  # the caller must be able to tell "the tenant owns none of these ids" (fall back to
+  # AdminRepo for the canonicals) from "the heavy pool refused" (spend nothing at all).
   defp tenant_diversity_rows(tenant_id, ids) do
     query =
       tenant_id
@@ -1404,7 +1415,7 @@ defmodule Loopctl.Knowledge do
 
     case HeavyRead.all(tenant_id, query, semantic_heavy_read_opts()) do
       rows when is_list(rows) -> rows
-      _shed -> []
+      _shed -> :shed
     end
   end
 
@@ -11177,8 +11188,11 @@ defmodule Loopctl.Knowledge do
              # ranked pool's own ordering places it outside `results` — the actionable
              # pointer this finding required alongside the hoist above.
              curated_article_id: curated_article_id,
-             # What redundancy removal did to THIS page (#792). Same shape
-             # `POST /api/v1/recall` publishes, so one reader parses both.
+             # What redundancy removal did to the ranked POOL this page is a slice of
+             # (#792) — not to the returned rows: the selection runs over the head of the
+             # pool at every offset, so at a large `:offset` the counters describe rows the
+             # page does not contain. Same shape `POST /api/v1/recall` publishes (where the
+             # pool IS the page), so one reader parses both.
              diversity: diversity_stats,
              limit: page.limit,
              offset: page.offset
@@ -11192,14 +11206,16 @@ defmodule Loopctl.Knowledge do
   # own:
   #
   #   * **It REORDERS the pool, it never shortens it.** The selection is applied to the
-  #     HEAD of the ranked pool and everything it did not pick is kept, in pool order,
-  #     immediately behind it. That is what keeps pagination a PARTITION: this used to run
-  #     only at `offset == 0` and to DISCARD the unselected window, so page 1 (diversified,
-  #     drawing from pool positions 0..29) and page 2 (the raw pool, positions 10..19)
-  #     overlapped — a client paging one query got rows twice and never saw the ones MMR
-  #     skipped. Running it identically at every offset also makes the diversified pool a
-  #     stable function of the query, which is what "page 2 of a diversified list" needs in
-  #     order to mean anything.
+  #     HEAD of the ranked pool; what it did not pick is DEMOTED behind the pool tail it
+  #     never looked at, and nothing is discarded. That is what keeps pagination a
+  #     PARTITION: this used to run only at `offset == 0` and to DISCARD the unselected
+  #     window, so page 1 (diversified, drawing from pool positions 0..29) and page 2 (the
+  #     raw pool, positions 10..19) overlapped — a client paging one query got rows twice
+  #     and never saw the ones MMR skipped. Running it identically at every offset also
+  #     makes the diversified pool a stable function of the query, which is what "page 2 of
+  #     a diversified list" needs in order to mean anything — and is why the selection is
+  #     NOT skipped at a high offset even though its own picks land outside that page: the
+  #     partition is a property of the whole reordered list, not of one slice of it.
   #   * **The curated winner is PINNED.** `hoist_to_front/2` exists so that a caller
   #     branching on `meta.provenance == :curated` can trust `List.first(results)`;
   #     letting MMR demote or drop it would silently revoke that guarantee. Pinned, it
@@ -11247,7 +11263,15 @@ defmodule Loopctl.Knowledge do
     chosen = MapSet.new(ordered, & &1.id)
     deferred = Enum.reject(window, &MapSet.member?(chosen, &1.id))
 
-    {ordered ++ deferred ++ Enum.drop(pool, window_size), stats}
+    # The rows the selector REJECTED go behind the pool tail it never looked at, not
+    # directly behind the selection. Splicing them in first (which is what round 1 did)
+    # topped the page up with exactly the near-copies MMR had just rejected whenever the
+    # selection came back shorter than `limit` — guaranteed for every `limit >= max_pool`,
+    # since the window is capped there while the pool runs to `@max_relevance_page_size`.
+    # That is #792's own acceptance criterion failing on the hybrid surface. Demoted rather
+    # than discarded, so the whole list is still a PERMUTATION of the pool and paging it
+    # stays a partition.
+    {ordered ++ Enum.drop(pool, window_size) ++ deferred, stats}
   end
 
   # `:score` is the candidate's POSITION in the fused pool, normalized to (0, 1] — NOT
