@@ -104,7 +104,7 @@ defmodule LoopctlWeb.KnowledgeLintControllerTest do
 
       Loopctl.AdminRepo.update_all(
         from(a in Loopctl.Knowledge.Article, where: a.id == ^article.id),
-        set: [updated_at: past]
+        set: [updated_at: past, content_changed_at: past]
       )
 
       conn =
@@ -143,7 +143,7 @@ defmodule LoopctlWeb.KnowledgeLintControllerTest do
 
       Loopctl.AdminRepo.update_all(
         from(a in Loopctl.Knowledge.Article, where: a.id == ^article.id),
-        set: [updated_at: past]
+        set: [updated_at: past, content_changed_at: past]
       )
 
       # Default stale_days=90 → not stale
@@ -649,7 +649,7 @@ defmodule LoopctlWeb.KnowledgeLintControllerTest do
 
         Loopctl.AdminRepo.update_all(
           from(a in Loopctl.Knowledge.Article, where: a.id == ^article.id),
-          set: [updated_at: past]
+          set: [updated_at: past, content_changed_at: past]
         )
       end
 
@@ -689,7 +689,7 @@ defmodule LoopctlWeb.KnowledgeLintControllerTest do
 
       Loopctl.AdminRepo.update_all(
         from(a in Loopctl.Knowledge.Article, where: a.id == ^article.id),
-        set: [updated_at: past]
+        set: [updated_at: past, content_changed_at: past]
       )
 
       conn =

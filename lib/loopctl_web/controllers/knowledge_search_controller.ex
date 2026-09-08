@@ -141,7 +141,9 @@ defmodule LoopctlWeb.KnowledgeSearchController do
             "To use cursor pagination, pass an empty string (`cursor=`) on the FIRST request " <>
             "to opt into the keyset path (which orders by `inserted_at ASC, id ASC`); then " <>
             "follow `meta.next_cursor` verbatim on subsequent requests. Omitting the `cursor` " <>
-            "parameter entirely uses the legacy offset path (orders by `updated_at DESC`), " <>
+            "parameter entirely uses the legacy offset path, which orders by authored age " <>
+            "— `coalesce(content_changed_at, updated_at) DESC` (#791), so a re-embed does " <>
+            "not move a row — and " <>
             "which does not emit `next_cursor`. Do not mix the two paths mid-enumeration, " <>
             "as the sort order differs. The cursor is integrity-protected and tenant-bound — " <>
             "a tampered/forged cursor is rejected with 400. Not valid with `q` (relevance " <>

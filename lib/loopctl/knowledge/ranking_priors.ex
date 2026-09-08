@@ -9,16 +9,22 @@ defmodule Loopctl.Knowledge.RankingPriors do
       (`recency_decay/2` is the single source of truth for both). Applied as a BOUNDED
       factor `1 - w + w * decay` on the score, so a stale document is nudged down but a
       brand-new one is never lifted above a document with materially stronger relevance.
-      > #### "Recency" is LAST-MUTATION time, not authored time {: .warning}
-      > `age_days` is measured from `updated_at`, and `updated_at` is bumped by ANY write
-      > that changes the row — including a re-embed / content-hash refresh
-      > (`Loopctl.Knowledge.update_embedding/4`). A model migration or a bulk re-embedding
-      > backfill therefore resets a years-old note's apparent freshness to "now" and, if run
-      > across the whole corpus, globally FLATTENS the recency signal. This is inherited
-      > verbatim from `knowledge_context` (#471's AC mandates reusing that exact field +
-      > decay as the single source of truth), but #471 now surfaces it on the PRIMARY search
-      > path. If you run a mass re-embed, expect ranking to shift until authored-age drift
-      > re-accumulates; there is no separate authored/source timestamp to fall back to.
+      > #### "Recency" is AUTHORED age, and the field it reads is not negotiable {: .info}
+      > `age_days` is measured from `recency_timestamp/1` — `content_changed_at`, falling
+      > back to `updated_at` only when that is null. `updated_at` is bumped by ANY write
+      > that touches the row (a re-embed / content-hash refresh via
+      > `Loopctl.Knowledge.update_embedding/4`, a link write, a suppression flip), so
+      > ranking on it meant a model migration or a bulk re-embedding backfill reset a
+      > years-old note's apparent freshness to "now" and, run across the whole corpus,
+      > globally FLATTENED the signal — silently, since nothing reported it (#791).
+      > `content_changed_at` advances only when an article's BODY changes. Two things
+      > follow for anyone editing this: never reach for `updated_at` directly here (use
+      > `recency_timestamp/1`, which `knowledge_context` calls too, so the two surfaces
+      > cannot drift), and never make `:content_changed_at` castable — a ranking input a
+      > caller can write is a caller who can pin its own article at maximum freshness.
+      > The nil-fallback is deliberate and permanent: a lane that omits the column, or a
+      > row the bounded #791 backfill did not reach, must behave exactly as it did before
+      > rather than lose its recency prior entirely.
     * **Category authority** — a bounded prior derived from `category` ALONE, centered on
       1.0 and clamped to a narrow band, so it re-ranks NEAR-TIES
       (which post-#470 Reciprocal Rank Fusion produces by construction) rather than
@@ -210,30 +216,65 @@ defmodule Loopctl.Knowledge.RankingPriors do
   @moc_key_prefix "moc:"
 
   @doc """
-  The recency decay `exp(-age_days / 30)` for a document last updated at `updated_at`,
-  measured against `now`. Range `(0, 1]` (1.0 for a doc updated exactly now). This is the
-  SINGLE SOURCE OF TRUTH for the decay — `knowledge_context` calls it too.
+  The timestamp a recency prior must measure age from: `content_changed_at` when the row
+  carries one, else `updated_at` (#791).
 
-  `updated_at` is LAST-MUTATION time, so a re-embed / content-hash refresh resets a note's
-  apparent freshness (see the module doc's warning). There is no authored-time fallback.
+  This is the SINGLE SOURCE OF TRUTH for the FIELD, exactly as `recency_decay/2` is for
+  the curve — `knowledge_context` and the fused search priors both call it, so a change
+  here cannot move one surface and leave the other behind. Never read `:updated_at`
+  directly for a recency purpose.
+
+  Why the two are not interchangeable: `updated_at` is bumped by any write to the row,
+  including a re-embed / content-hash refresh (`Loopctl.Knowledge.update_embedding/4`), a
+  link write and a suppression flip — none of which changes what the document says. Ranking
+  on it let one bulk re-embed reset the apparent freshness of the whole corpus at once.
+
+  Returns nil only when BOTH are absent, which `recency_factor/3` already treats as a
+  no-op. The `updated_at` fallback is permanent, but it is a safety net rather than the
+  live path: the migration seeds `content_changed_at` from `updated_at` for every pre-#791
+  row, so what still resolves through it is a lane whose select omits the column, or a row
+  a bounded backfill did not reach — either behaves exactly as it did before rather than
+  losing its prior. Takes a MAP (a result map or an `%Article{}`) rather than the two timestamps,
+  because a lane whose select omits the field must fail OPEN to `updated_at` and not raise.
+  """
+  @spec recency_timestamp(map()) :: DateTime.t() | nil
+  def recency_timestamp(%{} = result) do
+    Map.get(result, :content_changed_at) || Map.get(result, :updated_at)
+  end
+
+  def recency_timestamp(_), do: nil
+
+  @doc """
+  The recency decay `exp(-age_days / 30)` for a document whose content last changed at
+  `content_changed_at`, measured against `now`. Range `(0, 1]` (1.0 for content authored
+  exactly now). This is the SINGLE SOURCE OF TRUTH for the decay — `knowledge_context`
+  calls it too.
+
+  Resolve the timestamp with `recency_timestamp/1` rather than reading a field off the row
+  yourself: the point of #791 is that `updated_at` is last-MUTATION time and a re-embed
+  moves it.
   """
   @spec recency_decay(DateTime.t(), DateTime.t()) :: float()
-  def recency_decay(updated_at, now) do
-    age_days = DateTime.diff(now, updated_at, :second) / 86_400.0
+  def recency_decay(content_changed_at, now) do
+    age_days = DateTime.diff(now, content_changed_at, :second) / 86_400.0
     :math.exp(-age_days / @decay_tau_days)
   end
 
   @doc """
   The bounded recency FACTOR to multiply a fused score by: `1 - w + w * decay`, in
-  `[1 - w, 1]`. A `recency_weight` of 0 (or a nil `updated_at`) makes recency a no-op
+  `[1 - w, 1]`. A `recency_weight` of 0 (or a nil timestamp) makes recency a no-op
   (factor 1.0), so the fused ordering is preserved exactly.
+
+  Takes the timestamp `recency_timestamp/1` resolved, not a raw `updated_at`.
   """
   @spec recency_factor(DateTime.t() | nil, DateTime.t(), float()) :: float()
-  def recency_factor(_updated_at, _now, recency_weight) when recency_weight <= 0.0, do: 1.0
+  def recency_factor(_content_changed_at, _now, recency_weight) when recency_weight <= 0.0,
+    do: 1.0
+
   def recency_factor(nil, _now, _recency_weight), do: 1.0
 
-  def recency_factor(updated_at, now, recency_weight) do
-    1.0 - recency_weight + recency_weight * recency_decay(updated_at, now)
+  def recency_factor(content_changed_at, now, recency_weight) do
+    1.0 - recency_weight + recency_weight * recency_decay(content_changed_at, now)
   end
 
   @doc """
@@ -344,7 +385,7 @@ defmodule Loopctl.Knowledge.RankingPriors do
     floor = Keyword.fetch!(opts, :floor)
     ceiling = Keyword.fetch!(opts, :ceiling)
 
-    recency = recency_factor(Map.get(result, :updated_at), now, recency_weight)
+    recency = recency_factor(recency_timestamp(result), now, recency_weight)
     authority = if authority?, do: authority_factor(result, strength, floor, ceiling), else: 1.0
 
     hub? = Keyword.get(opts, :hub_demotion?, true)

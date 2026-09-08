@@ -4,6 +4,31 @@ All notable changes to loopctl are documented here.
 
 ## [Unreleased] — 2026-08-21 — The provenance harvest runs on a cadence
 
+### Changed
+
+- **The recency prior and the staleness lint now measure AUTHORED age, and migration
+  `20260907120000` backfills the whole corpus (#791).** `articles.content_changed_at` is a
+  new nullable column stamped on insert and advanced only when the BODY changes; a re-embed,
+  a content-hash refresh, a link write or a suppression flip no longer make a years-old note
+  look fresh. Ranking, `knowledge_context`, the curated-source tiebreak, list and index
+  enumeration, and `GET /api/v1/knowledge/lint` all read
+  `coalesce(content_changed_at, updated_at)` now.
+
+  **Deploy note.** The migration is `@disable_ddl_transaction true` and backfills from
+  `updated_at` in 5,000-row batches OUTSIDE the schema change, so it holds no long lock — but
+  on the ~86k-article tenant the `release_command` takes noticeably longer than a
+  catalog-only migration. It is RESUMABLE: each batch only touches rows still `NULL`, so a
+  run cut short by a deploy timeout is continued, not repeated, by the next one. A row the
+  bounded loop never reaches stays `NULL` and falls back to `updated_at`, which is the
+  pre-#791 behaviour.
+
+  **Operator-visible semantics.** `GET /api/v1/knowledge/lint` keeps the field names
+  `last_updated` and `days_since_update`, and both now carry content-change time. An article
+  re-embedded yesterday whose body last changed two years ago is reported stale and was not
+  before, so the first lint run after this deploy will show entries that look new. The
+  legacy offset ordering on the search and index endpoints changed sort key for the same
+  reason; the rows still emit `updated_at`, which is therefore no longer the sort key.
+
 ### Added
 
 - **A deduplicated create now says whether it threw your payload away

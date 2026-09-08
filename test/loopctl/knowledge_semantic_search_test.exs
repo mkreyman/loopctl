@@ -2230,7 +2230,13 @@ defmodule Loopctl.KnowledgeSemanticSearchTest do
 
       Loopctl.AdminRepo.update_all(
         from(a in Knowledge.Article, where: a.id == ^relevant_old.id),
-        set: [updated_at: ninety_days_ago]
+        # BOTH fields, or this guard is vacuous (#791). Recency reads
+        # coalesce(content_changed_at, updated_at) now, and create_changeset stamps
+        # content_changed_at at insert — so ageing updated_at alone leaves the article
+        # maximally FRESH to the ranker and the test's stated premise, a 90-day-old
+        # article, no longer holds. It would still pass, having stopped testing that
+        # relevance beats recency.
+        set: [updated_at: ninety_days_ago, content_changed_at: ninety_days_ago]
       )
 
       # See the note above: pin the query vector to THIS process's axis so the
