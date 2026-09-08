@@ -252,6 +252,12 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
     # mode. `0` with no `fallback` = "embed worked but recall is broken" — distinct
     # from a keyword_only fallback.
     |> maybe_put(:semantic_result_count, meta[:semantic_result_count])
+    # The importance prior's weight in force on this response (#790). It is here because
+    # its INPUT is invisible: the result rows carry no usage field, so a caller that saw a
+    # well-used note beat a fresher one had nothing in the payload to explain it. `0.0`
+    # says importance played no part. Whitelisted explicitly, like the provenance trio
+    # above — this is a chosen key, not a pass-through.
+    |> maybe_put(:importance_strength, meta[:importance_strength])
     # US-41.4 (AC-41.4.7): the degraded response is EXPLICITLY LABELLED and never a
     # bare empty list. `degraded` says the semantic tier was unavailable,
     # `offending_endpoint` NAMES the endpoint the refusal/failure was about (an agent

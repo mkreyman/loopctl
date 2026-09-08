@@ -6,6 +6,50 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **Ranking now includes a USAGE (importance) prior, and the nightly pass writes its input
+  (#790).** Migration `20260908120000` adds `articles.read_day_count`, a nullable integer
+  holding the distinct days an article was opened inside the last 90. It is stamped once a
+  night by the existing `KnowledgeLintWorker` run, from `article_access_events` — the same
+  rows the heat index aggregates, drills and search impressions excluded — and never by any
+  caller: the column is in no changeset cast list. Combined and hybrid search, and the
+  knowledge half of `/api/v1/recall`, multiply a candidate's fused score by
+  `clamp(1 + strength * log1p(read_days)/log1p(30), 1.0, 1.1)`.
+
+  **Deploy note.** The migration is a catalog-only `ADD COLUMN` with no default and no
+  backfill — it rewrites no rows and takes no long lock, unlike `20260907120000`. NULL is
+  exactly the pre-change behaviour (factor 1.0), so ranking does not move at deploy time; it
+  starts moving after the first nightly pass, which now also writes one column on the
+  articles a tenant actually read in the window.
+
+  **What it can and cannot do.** The prior is ONE-SIDED: an article with no recorded usage
+  gets a factor of exactly 1.0 and is never pushed down, so nothing is demoted for being
+  unread. The ceiling of 1.1 means it re-ranks near-ties and cannot flip a cross-lane
+  relevance winner.
+
+  **It SHIPS DISABLED — `config :loopctl, :knowledge_importance_prior_enabled` defaults to
+  `false`, so ranking is byte-identical to pre-#790 until an operator turns it on.** The
+  carve-out it needs from the 2026-08-21 "ranking must never key on HOW a document got in"
+  decision is recorded in CLAUDE.md as not owner-ratified, and a ranking change may not
+  ratify itself. Turn it on with that key set to `true`; change its magnitude with
+  `:knowledge_importance_strength` (default 0.1); a strength of 0 is an exact no-op too. The
+  nightly stamp writes `read_day_count` either way, so enabling it later reads real history.
+
+  A candidate the stamp could not have measured — a shared system canonical, whose
+  `tenant_id` is NULL — is scored at exactly 1.0, the same as any article with no recorded
+  usage. Scope is not an input: because the stamp's write predicate is tenant-scoped,
+  "unmeasurable" and "system canonical" are the same set, so any other value would separate
+  two zero-usage articles by how the document got into the corpus. The cost, stated plainly:
+  a heavily-read canonical is not boosted either, and at equal relevance it loses a near-tie
+  to a used tenant article. That is a data gap, not a ranking weight, and the fix is
+  per-(tenant, article) usage rows.
+
+  **API.** `meta.importance_strength` is new on `GET /api/v1/knowledge/search` (relevance
+  modes), `POST /api/v1/knowledge/hybrid_search` and `POST /api/v1/recall` (on both the
+  merged meta and the knowledge envelope's), stating the weight in force so a session can
+  explain an ordering usage produced. `0.0` means it played no part. The nightly audit event
+  `knowledge.lint_completed` gains `importance_stamped`, `importance_cleared`,
+  `importance_truncated` and `importance_gate`.
+
 - **The recency prior and the staleness lint now measure AUTHORED age, and migration
   `20260907120000` backfills the whole corpus (#791).** `articles.content_changed_at` is a
   new nullable column stamped on insert and advanced only when the BODY changes; a re-embed,

@@ -118,6 +118,10 @@ defmodule LoopctlWeb.RecallJSON do
       # A bounded, non-sensitive tag naming WHY the merged recall degraded (or `null`),
       # so a caller can distinguish a scope-empty half from a fault-empty one.
       degraded_reason: meta.degraded_reason,
+      # The importance prior's weight in force on the knowledge half (#790) — the same
+      # value `knowledge.meta` carries, republished here because this is the meta a caller
+      # reads first. `null` when the knowledge half degraded before ranking.
+      importance_strength: Map.get(meta, :importance_strength),
       # The lane the REPORTED half served in place of the ranking asked for
       # (`"keyword_only"`), or `null` when it served nothing. Without it a knowledge shed
       # that DID answer keyword-only was indistinguishable from a memory shed that

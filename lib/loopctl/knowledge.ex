@@ -2494,6 +2494,11 @@ defmodule Loopctl.Knowledge do
               # other lane uses authored age, which is the invisible half-fix the
               # idempotency_key note above describes.
               content_changed_at: a.content_changed_at,
+              # The importance prior's field (#790). Same fail-open contract as the two
+              # signals above: RankingPriors.read_day_count/1 reads 0 for a missing key, so
+              # a lane that omits this does not crash -- it silently forfeits the usage
+              # boost for its lane-ONLY candidates while every other lane applies it.
+              read_day_count: a.read_day_count,
               relevance_score:
                 fragment(
                   "ts_rank_cd(search_vector, websearch_to_tsquery(?::text::regconfig, ?))",
@@ -9612,7 +9617,11 @@ defmodule Loopctl.Knowledge do
           # The recency prior's field (#791) -- same lane-shape contract as
           # idempotency_key above: omit it and this lane alone ranks on last-mutation
           # time, with nothing raising to say so.
-          content_changed_at: a.content_changed_at
+          content_changed_at: a.content_changed_at,
+          # The importance prior's field (#790). Same contract once more:
+          # RankingPriors.read_day_count/1 reads 0 for a missing key, so omitting it here
+          # makes the WHOLE semantic lane importance-blind once side-table reads are on.
+          read_day_count: a.read_day_count
         }
       )
       |> apply_search_filters(status, opts)
@@ -9826,6 +9835,9 @@ defmodule Loopctl.Knowledge do
         # idempotency_key: the inner pool_select(:semantic) must project it for this
         # outer select to read it.
         content_changed_at: c.content_changed_at,
+        # The importance prior's field (#790), same inner/outer contract again: the inner
+        # pool_select(:semantic) must project it for this outer select to read it.
+        read_day_count: c.read_day_count,
         similarity_score: c.similarity_score
       }
     )
@@ -10204,6 +10216,11 @@ defmodule Loopctl.Knowledge do
            limit: paginated.limit,
            offset: paginated.offset
          })
+         # Carried on the DEGRADED path too, for the same reason `search_id` is: the priors
+         # this path CAN apply include importance (it needs no embedding), so a response
+         # that omitted the weight would leave a caller unable to explain an ordering the
+         # prior actually produced.
+         |> Map.merge(ranking_prior_meta(opts))
          |> Map.merge(degraded_contract_meta(tenant_id, fallback_reason))
      }}
   end
@@ -10428,6 +10445,10 @@ defmodule Loopctl.Knowledge do
            # lane NEVER inflates this — it stays the semantic lane's own row count.
            semantic_result_count: length(semantic_result.results)
          }
+         # The importance weight in force on THIS response (#790). Merged rather than
+         # inlined so the degraded keyword-only path can carry the identical key from the
+         # identical helper — the meta has one shape on both paths, as `search_id` does.
+         |> Map.merge(ranking_prior_meta(opts))
          # Carried forward for the SAME reason as `pool_capped` above: combined is the
          # DEFAULT mode, so a degraded vector read that is disclosed only on `mode=semantic`
          # is undisclosed on the path almost every caller uses. Absent unless the semantic
@@ -10551,6 +10572,22 @@ defmodule Loopctl.Knowledge do
   @authority_floor 0.9
   @authority_ceiling 1.1
 
+  # Bounds for the importance factor band (#790). The FLOOR is exactly 1.0 and is the
+  # one-sided guarantee made structural: an article with no recorded usage must be SCORED
+  # exactly where it was scored before this prior existed, never below. (Scored, not ranked —
+  # promoting a used article does move an unread one down the ordered list relative to it;
+  # the moduledoc admonition in `RankingPriors` states that precisely and says what bounds
+  # it.) A sub-1.0 floor here would let a future curve demote unread material outright, which
+  # is the closed loop the note above `@kill_tag` in `RankingPriors` forbids.
+  #
+  # The CEILING is what bounds the prior against relevance rather than against the floor:
+  # post-#470 a cross-lane consensus winner scores ~2x a single-lane hit, so importance ALONE
+  # could only flip one at a ceiling of 2.0 or more. 1.1 matches the authority band. Composed
+  # with recency and authority the worst-case spread is 1.65 (0.700 to 1.155), still under
+  # 2x — re-derive that composed number, not just this one, before widening any band.
+  @importance_floor 1.0
+  @importance_ceiling 1.1
+
   # Re-rank the FUSED list: multiply each candidate's fused `:final_score` by its prior
   # multiplier, then re-sort by `{final_score, id}` desc — the SAME deterministic tiebreak
   # fuse_rrf/fuse_min_max use, so with priors disabled (multiplier 1.0) the ordering is
@@ -10590,8 +10627,53 @@ defmodule Loopctl.Knowledge do
       authority?: authority_prior_enabled?(opts),
       strength: authority_strength_opt(opts),
       floor: @authority_floor,
-      ceiling: @authority_ceiling
+      ceiling: @authority_ceiling,
+      importance_strength: importance_strength_opt(opts),
+      importance_floor: @importance_floor,
+      importance_ceiling: @importance_ceiling
     ]
+  end
+
+  # The importance prior's EFFECTIVE magnitude — 0.0 whenever the toggle is off, so one
+  # number answers "did importance move anything on this query" and the meta below can state
+  # it without a second flag. `RankingPriors.multiplier/2` treats 0.0 as an exact no-op.
+  defp importance_strength_opt(opts) do
+    if importance_prior_enabled?(opts), do: importance_strength_value(opts), else: 0.0
+  end
+
+  defp importance_prior_enabled?(opts) do
+    Keyword.get(
+      opts,
+      :importance_prior,
+      # Defaults to FALSE here as well as in config/config.exs, and the two must stay in
+      # step: the prior's carve-out from the 2026-08-21 owner decision is unratified, so a
+      # build whose config never set the key must not turn it on by accident.
+      Application.get_env(:loopctl, :knowledge_importance_prior_enabled, false)
+    )
+  end
+
+  defp importance_strength_value(opts) do
+    opts
+    |> Keyword.get(
+      :importance_strength,
+      Application.get_env(:loopctl, :knowledge_importance_strength, 0.1)
+    )
+    |> max(0.0)
+  end
+
+  # What the priors are actually DOING on this response, carried in meta so a session can
+  # tell why something ranked (#790 AC). Only the importance strength is stated: it is the
+  # one whose input (`articles.read_day_count`) is invisible to the caller, since the result
+  # rows carry no usage field and nothing else in the payload hints that usage was consulted.
+  # `0.0` means importance played no part — the toggle is off (which is the SHIPPED default
+  # until the trade is ratified; see `config/config.exs`), the strength is configured to zero,
+  # or this call passed its own override. It is the same value `ranking_prior_opts/2` hands
+  # the re-rank, so a response can never advertise a weight the ordering did not use, and it
+  # does NOT depend on which candidates happened to land in the pool — a caller comparing two
+  # responses to the same query must not see the weight move because an embedding lane was
+  # unavailable.
+  defp ranking_prior_meta(opts) do
+    %{importance_strength: importance_strength_opt(opts)}
   end
 
   defp recency_weight_opt(opts) do
@@ -10900,7 +10982,11 @@ defmodule Loopctl.Knowledge do
           updated_at: a.updated_at,
           # The recency prior's field (#791) -- a live ranking input on this lane exactly
           # as idempotency_key is, and lost the same silent way if omitted.
-          content_changed_at: a.content_changed_at
+          content_changed_at: a.content_changed_at,
+          # The importance prior's field (#790). A one-hop neighbour is by definition a
+          # lane-ONLY candidate, so this is the lane where a dropped ranking column is
+          # least likely to be masked by another lane's copy of the same row.
+          read_day_count: a.read_day_count
         }
       )
 
@@ -11963,6 +12049,17 @@ defmodule Loopctl.Knowledge do
        }
      }}
   end
+
+  @doc """
+  The access types that count as a CALLER-CHOSEN body read.
+
+  Single source of truth for every consumer of "was this article actually opened" — the heat
+  index here, and `Loopctl.Knowledge.Importance`, which stamps the ranking prior's usage
+  column from the same set. They MUST agree: a second, wider list somewhere else is how a
+  drill or a search impression re-enters a ranking, which is the whole of #563/#569/#572.
+  """
+  @spec heat_read_access_types() :: [String.t()]
+  def heat_read_access_types, do: @heat_read_access_types
 
   @doc "The default heat window, in days. Single source for the API description (#554)."
   @spec heat_default_window_days() :: pos_integer()

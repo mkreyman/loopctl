@@ -29,6 +29,28 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
     )
   end
 
+  # The importance band search_combined/3 uses (knowledge.ex @importance_floor/ceiling): the
+  # floor is EXACTLY 1.0, unlike the authority band above.
+  @importance_floor 1.0
+  @importance_ceiling 1.1
+
+  # The per-row options, at a non-zero importance strength. There is no pool-level option
+  # any more: importance is exactly per-ROW (#790 head audit), so a pool cannot change what
+  # any candidate in it scores.
+  defp pool_opts(_pool, strength \\ 0.1) do
+    [
+      now: @now,
+      recency_weight: 0.0,
+      authority?: false,
+      strength: 0.0,
+      floor: @floor,
+      ceiling: @ceiling,
+      importance_strength: strength,
+      importance_floor: @importance_floor,
+      importance_ceiling: @importance_ceiling
+    ]
+  end
+
   describe "recency_decay/2 (single source of truth, shared with knowledge_context)" do
     test "is 1.0 for a doc updated exactly now" do
       assert RankingPriors.recency_decay(@now, @now) == 1.0
@@ -216,16 +238,53 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
     end
 
     test "the bounded priors cannot flip a materially stronger (2x) relevance winner" do
-      # Worst case FOR the strong doc: it is the least-favored by the priors (old + idea),
-      # the weak doc is the most-favored (fresh + decision). A 2x fused-score lead must
-      # still survive — this is the "break ties, do not dominate strong relevance" invariant.
+      # Worst case FOR the strong doc: it is the least-favored by the priors (old + idea +
+      # unread), the weak doc is the most-favored (fresh + decision + SATURATED USAGE). A 2x
+      # fused-score lead must still survive — this is the "break ties, do not dominate strong
+      # relevance" invariant, and the reason the weak doc carries `read_day_count` is that
+      # #790 added a third band: without it this guard stopped describing the
+      # maximally-favoured document the moment importance shipped, and could not see the
+      # composed spread move.
       strong = %{category: :idea, updated_at: days_ago(400), tags: [], status: :published}
-      weak = %{category: :decision, updated_at: @now, tags: [], status: :published}
+
+      weak = %{
+        category: :decision,
+        updated_at: @now,
+        tags: [],
+        status: :published,
+        read_day_count: 100_000
+      }
 
       strong_base = 0.016_393
       weak_base = strong_base / 2.0
 
-      assert strong_base * mult(strong, []) > weak_base * mult(weak, [])
+      assert strong_base * mult(strong, []) > weak_base * mult(weak, importance_strength: 0.1)
+    end
+
+    test "the COMPOSED worst-case spread is 1.65 and stays under the 2x consensus gap" do
+      # The number the moduledoc names, asserted rather than described. Least-favoured is
+      # recency 0.700 (age >> tau at w = 0.3) * authority 1.0 (unknown category) * importance
+      # 1.0 (unread); most-favoured is recency 1.0 * authority 1.05 * importance 1.1. If a
+      # future change widens any of the three bands past a composed 2.0, importance stops
+      # breaking ties and starts overriding a cross-lane consensus winner.
+      least =
+        mult(%{category: nil, updated_at: days_ago(10_000), tags: [], status: :published}, [])
+
+      most =
+        mult(
+          %{
+            category: :decision,
+            updated_at: @now,
+            tags: [],
+            status: :published,
+            read_day_count: 100_000
+          },
+          importance_strength: 0.1
+        )
+
+      assert_in_delta least, 0.700, 1.0e-3
+      assert_in_delta most, 1.155, 1.0e-3
+      assert most / least < 2.0
     end
 
     test "a verdict-kill doc is demoted below a clean near-tie even when fresher" do
@@ -492,6 +551,332 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
             "re-embed makes it look brand new"
         )
       end
+    end
+
+    # #790: `read_day_count/1` fails open at 0 for exactly the same reason the two guards
+    # above exist -- a lane that drops the column does not crash, it silently forfeits the
+    # usage boost for its lane-ONLY candidates while every other lane applies it, so the
+    # same article ranks differently depending on which lane found it. Same anchoring,
+    # same invisibility, therefore the same guard.
+    test "every lane select projects read_day_count" do
+      for {path, head} <- @ranking_lanes do
+        assert_lane_projects(
+          path,
+          head,
+          "read_day_count:",
+          "RankingPriors.read_day_count/1 reads 0 for a missing key, so a document seen " <>
+            "ONLY on this lane loses its importance prior with nothing raising to say so"
+        )
+      end
+    end
+
+    # #790 review: `tenant_id` is not decoration on these lanes, it is the MEASURABILITY
+    # discriminator. `usage_measurable?/1` fails CLOSED on a result with no `:tenant_id` key,
+    # so a lane that stops projecting it has EVERY one of its rows imputed at the pool median
+    # -- silently, and for every candidate that lane contributes rather than for the one row
+    # that is genuinely unmeasurable. Same anchoring as the three guards above, opposite
+    # failure direction.
+    test "every lane select projects tenant_id" do
+      for {path, head} <- @ranking_lanes do
+        assert_lane_projects(
+          path,
+          head,
+          "tenant_id:",
+          "RankingPriors.usage_measurable?/1 fails CLOSED without it, so every row this " <>
+            "lane contributes is imputed at the pool median instead of ranking on its own " <>
+            "measured usage"
+        )
+      end
+    end
+  end
+
+  describe "read_day_count/1 (#790 -- the usage signal, fail-open)" do
+    test "reads a positive integer count" do
+      assert RankingPriors.read_day_count(%{read_day_count: 7}) == 7
+    end
+
+    test "a nil column, a missing key, a zero and a NEGATIVE value all read as 0" do
+      # Fail OPEN, like moc_hub?/1 and recency_timestamp/1: a lane whose projection is
+      # missing the column must lose the BOOST, never raise mid-search and never demote.
+      # The negative clamp is load-bearing rather than defensive: importance_signal/1 takes
+      # log(1 + d), which is -inf at d == -1, so one corrupt row would otherwise poison a
+      # whole result set's ordering instead of losing one boost.
+      for result <- [
+            %{read_day_count: nil},
+            %{},
+            %{read_day_count: 0},
+            %{read_day_count: -1},
+            %{read_day_count: -1000},
+            %{read_day_count: "3"}
+          ] do
+        assert RankingPriors.read_day_count(result) == 0,
+               "#{inspect(result)} did not read as unmeasured"
+      end
+
+      assert RankingPriors.read_day_count(nil) == 0
+    end
+  end
+
+  describe "importance_signal/1 (#790 -- normalized usage in [0, 1])" do
+    test "is EXACTLY 0.0 at zero days -- the floor the one-sided guarantee rests on" do
+      assert RankingPriors.importance_signal(0) === 0.0
+      assert RankingPriors.importance_signal(-5) === 0.0
+    end
+
+    test "is strictly increasing in read days, and never exceeds 1.0" do
+      values = Enum.map(0..120, &RankingPriors.importance_signal/1)
+
+      assert Enum.all?(values, &(&1 >= 0.0 and &1 <= 1.0))
+
+      # Strictly increasing up to saturation. Checked over the range that actually occurs
+      # (a 90-day window can produce at most 90 days), not just at two sample points.
+      for d <- 0..29 do
+        assert RankingPriors.importance_signal(d) < RankingPriors.importance_signal(d + 1),
+               "the curve flattened at #{d}, below the saturation point"
+      end
+    end
+
+    test "saturates at 1.0 at the saturation point and stays there" do
+      assert_in_delta RankingPriors.importance_signal(30), 1.0, 1.0e-12
+      assert RankingPriors.importance_signal(90) == 1.0
+      assert RankingPriors.importance_signal(10_000) == 1.0
+    end
+
+    test "resolves the low end, which is where the live data sits" do
+      # Almost every article read at all is read on 1-3 distinct days in a 90-day window.
+      # A linear ramp to 30 would put that whole population under 0.1 and make the prior
+      # inert exactly where it has to discriminate; the log curve does not.
+      assert RankingPriors.importance_signal(1) > 0.15
+      assert RankingPriors.importance_signal(3) > 0.35
+    end
+  end
+
+  describe "importance_factor/4 (#790 -- bounded and one-sided upward IN SCORE)" do
+    @importance_ceiling 1.1
+    @strength 0.1
+
+    defp importance(days, strength \\ @strength) do
+      RankingPriors.importance_factor(
+        %{read_day_count: days},
+        strength,
+        1.0,
+        @importance_ceiling
+      )
+    end
+
+    test "an article with NO recorded usage gets EXACTLY 1.0" do
+      # Not approximately. An unread note is SCORED precisely where it was scored before this
+      # prior existed, so nothing is demoted for being unread. It is not rank-neutral -- a
+      # used competitor still passes it -- but the shift is bounded by the ceiling and
+      # nothing is pushed below its own starting score, which is what stops the closed loop
+      # the 2026-08-21 owner decision names.
+      assert importance(nil) === 1.0
+      assert importance(0) === 1.0
+      assert RankingPriors.importance_factor(%{}, @strength, 1.0, @importance_ceiling) === 1.0
+    end
+
+    test "a zero strength is an exact no-op at every usage level" do
+      for days <- [nil, 0, 1, 5, 30, 400] do
+        assert importance(days, 0.0) === 1.0
+      end
+    end
+
+    test "NEVER returns a factor below 1.0, for any usage value" do
+      # The one-sided invariant, asserted over the whole reachable domain rather than at a
+      # sample. A sub-1.0 branch here is the two-sided prior the moduledoc forbids.
+      for days <- [nil, -10, 0, 1, 2, 5, 30, 90, 1_000] do
+        assert importance(days) >= 1.0, "usage #{inspect(days)} demoted an article"
+      end
+    end
+
+    test "a used article scores strictly above an unread one, and more use scores higher" do
+      assert importance(1) > importance(0)
+      assert importance(10) > importance(1)
+      assert importance(30) > importance(10)
+    end
+
+    test "the reachable range is [1.0, 1 + strength], under the ceiling" do
+      assert importance(10_000) <= 1.0 + @strength + 1.0e-12
+      assert importance(10_000) <= @importance_ceiling
+    end
+
+    test "the ceiling clamps a misconfigured strength" do
+      # The ceiling, not the strength, is what bounds this prior against relevance -- so it
+      # has to hold when someone raises the strength without reading the moduledoc.
+      assert importance(30, 5.0) == @importance_ceiling
+    end
+  end
+
+  describe "#790 the importance prior BREAKS TIES and cannot dominate relevance" do
+    # The same guarantee the moduledoc makes for authority, proved for importance. Post-#470
+    # a fused score is `sum_lane weight/(k + rank)`: a doc with cross-lane CONSENSUS scores
+    # ~2x a doc that tops a single lane. The prior is bounded so it can reorder that pair
+    # only if its ceiling reaches 2.0.
+    @rrf_k 60
+    @lane_weight 0.5
+
+    defp rrf(lanes), do: Enum.sum(Enum.map(lanes, fn rank -> @lane_weight / (@rrf_k + rank) end))
+
+    test "a 2x cross-lane consensus winner survives a maximally-used single-lane rival" do
+      consensus = rrf([1, 1])
+      single_lane = rrf([1])
+
+      # Precondition, not decoration: without the 2x gap this test proves nothing.
+      assert_in_delta consensus / single_lane, 2.0, 1.0e-9
+
+      # Worst case in BOTH directions at once: the winner is unread (factor exactly 1.0)
+      # and the rival is saturated at the ceiling.
+      winner = mult(%{category: nil, updated_at: @now, tags: [], status: :published}, [])
+
+      rival =
+        mult(
+          %{
+            category: nil,
+            updated_at: @now,
+            tags: [],
+            status: :published,
+            read_day_count: 100_000
+          },
+          importance_strength: 0.1
+        )
+
+      assert consensus * winner > single_lane * rival,
+             "importance flipped a cross-lane consensus winner -- it is dominating " <>
+               "relevance rather than breaking ties"
+    end
+
+    test "but it DOES flip an exact tie, so the prior is not inert" do
+      # The positive control for the bound above: a guarantee that a prior cannot flip a 2x
+      # winner is worthless if the prior cannot flip anything at all.
+      tie = rrf([1])
+
+      unread = mult(%{category: nil, updated_at: @now, tags: [], status: :published}, [])
+
+      used =
+        mult(
+          %{category: nil, updated_at: @now, tags: [], status: :published, read_day_count: 5},
+          importance_strength: 0.1
+        )
+
+      assert tie * used > tie * unread
+    end
+  end
+
+  describe "an UNMEASURABLE row is scored at 1.0, never imputed (#790 head audit)" do
+    @tenant_row %{id: "t", tenant_id: Ecto.UUID.generate(), read_day_count: 30}
+    @canonical %{id: "c", tenant_id: nil, read_day_count: nil}
+
+    test "two articles with ZERO recorded usage score the same, whatever their scope" do
+      # THE defect this block replaces. A system canonical is structurally unmeasurable —
+      # `read_day_count` is one column on a row several tenants read, and the nightly
+      # stamp's write predicate is tenant-scoped — so "unmeasurable" and "system canonical"
+      # name the SAME set. Imputing anything other than the unread value therefore separates
+      # two zero-usage articles by how the document got into the corpus, which is what the
+      # note above `@kill_tag` forbids. The median imputation this replaces gave the
+      # canonical 1.0362 against the unread tenant row's 1.0 at strength 0.1.
+      unread = %{id: "u", tenant_id: Ecto.UUID.generate(), read_day_count: nil}
+      opts = pool_opts([@tenant_row, unread, @canonical])
+
+      assert RankingPriors.multiplier(@canonical, opts) ==
+               RankingPriors.multiplier(unread, opts)
+
+      assert RankingPriors.multiplier(@canonical, opts) == 1.0
+    end
+
+    test "a row with NO tenant_id key at all is also exactly 1.0" do
+      # Nothing reads scope any more, so a lane that omits `tenant_id` cannot change a score.
+      opts = pool_opts([])
+      assert RankingPriors.multiplier(%{id: "x", read_day_count: nil}, opts) == 1.0
+    end
+
+    test "a USED row still beats both, which is the prior doing its job" do
+      unread = %{id: "u", tenant_id: Ecto.UUID.generate(), read_day_count: nil}
+      opts = pool_opts([@tenant_row, unread, @canonical])
+
+      assert RankingPriors.multiplier(@tenant_row, opts) >
+               RankingPriors.multiplier(@canonical, opts)
+    end
+
+    test "the pool cannot move any row's factor — importance is per-ROW" do
+      # The lane-dependence guard, kept from the block this replaces: the keyword lane can
+      # never hold a canonical and the side-table semantic lane can, so anything that let
+      # pool membership move a row's factor made ordering depend on an embedding outage.
+      # With the imputation gone this holds by construction rather than by arithmetic.
+      unread = %{id: "u", tenant_id: Ecto.UUID.generate(), read_day_count: nil}
+      without = pool_opts([@tenant_row, unread])
+      with_canonical = pool_opts([@tenant_row, unread, @canonical])
+
+      for row <- [@tenant_row, unread] do
+        assert RankingPriors.multiplier(row, without) ==
+                 RankingPriors.multiplier(row, with_canonical)
+      end
+    end
+
+    test "the factor reads USAGE and never scope — a canonical with a count is boosted" do
+      # The property that makes this legal, asserted directly: scope is not an input. A
+      # canonical carrying a recorded count gets exactly what a tenant row with that count
+      # gets. Re-introduce any scope test and this goes red.
+      count = 30
+      read_canonical = %{id: "rc", tenant_id: nil, read_day_count: count}
+      tenant_same = %{id: "ts", tenant_id: Ecto.UUID.generate(), read_day_count: count}
+      opts = pool_opts([read_canonical, tenant_same])
+
+      assert RankingPriors.multiplier(read_canonical, opts) ==
+               RankingPriors.multiplier(tenant_same, opts)
+
+      assert RankingPriors.multiplier(read_canonical, opts) > 1.0
+    end
+
+    test "the accepted cost: in practice a canonical has no count, so it sits at 1.0" do
+      # The canon has no per-tenant usage to read (one column, several tenants, a
+      # tenant-scoped stamp), so a canonical is unread as far as this prior can tell and
+      # loses a near-tie to a used tenant row. That is a DATA gap, not a ranking weight, and
+      # the fix is to make canonicals measurable per tenant — never to impute a value.
+      assert RankingPriors.multiplier(@canonical, pool_opts([@canonical])) == 1.0
+    end
+  end
+
+  describe "multiplier/2 with importance (#790)" do
+    test "is an exact no-op when the strength option is absent" do
+      # The default is 0.0 rather than the configured value, so a caller that forgets to
+      # thread the option loses a boost instead of silently ranking on a column it never
+      # asked for. Loopctl.Knowledge.ranking_prior_opts/1 is the ONE place the live value
+      # is resolved.
+      heavily_used = %{category: :finding, updated_at: @now, tags: [], read_day_count: 90}
+      unread = %{category: :finding, updated_at: @now, tags: [], read_day_count: nil}
+
+      assert mult(heavily_used, []) == mult(unread, [])
+    end
+
+    test "folds the importance factor in when the strength IS threaded" do
+      heavily_used = %{category: :finding, updated_at: @now, tags: [], read_day_count: 90}
+      unread = %{category: :finding, updated_at: @now, tags: [], read_day_count: nil}
+
+      assert mult(heavily_used, importance_strength: 0.1) >
+               mult(unread, importance_strength: 0.1)
+
+      # And it composes MULTIPLICATIVELY with the other priors rather than replacing them:
+      # the used article's multiplier is its unread multiplier times its importance factor.
+      assert_in_delta mult(heavily_used, importance_strength: 0.1),
+                      mult(unread, importance_strength: 0.1) *
+                        RankingPriors.importance_factor(heavily_used, 0.1, 1.0, 1.1),
+                      1.0e-12
+    end
+
+    test "a dead-doctrine demotion still beats any amount of usage" do
+      # Usage promotes; it must never rescue material a human killed. A verdict-killed
+      # article at maximum usage stays below a clean unread one.
+      killed = %{
+        category: :finding,
+        updated_at: @now,
+        tags: ["verdict-kill"],
+        status: :published,
+        read_day_count: 10_000
+      }
+
+      live = %{category: :finding, updated_at: @now, tags: [], status: :published}
+
+      assert mult(killed, importance_strength: 0.1) < mult(live, importance_strength: 0.1)
     end
   end
 

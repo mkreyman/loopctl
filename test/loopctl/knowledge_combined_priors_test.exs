@@ -56,6 +56,20 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
     :ok
   end
 
+  # The usage signal the importance prior reads (#790). Set directly, exactly as the age and
+  # category helpers above do: the column is in no cast list and is written only by the
+  # nightly `Loopctl.Knowledge.Importance` stamp, so there is no API through which a test
+  # (or a caller) could set it.
+  defp set_read_days(tenant_id, id, days) do
+    {1, _} =
+      AdminRepo.update_all(
+        from(a in Article, where: a.tenant_id == ^tenant_id and a.id == ^id),
+        set: [read_day_count: days]
+      )
+
+    :ok
+  end
+
   defp set_tags(tenant_id, id, tags) do
     {1, _} =
       AdminRepo.update_all(
@@ -89,6 +103,8 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
   end
 
   defp ids(results), do: Enum.map(results, & &1.id)
+
+  defp score_of(results, id), do: Enum.find(results, &(&1.id == id)).final_score
 
   defp search(tenant_id, opts) do
     assert {:ok, %{results: results}} =
@@ -166,13 +182,358 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
       set_age(tenant.id, larger.id, 0)
 
       expect_query_embedding()
-      priors_off = search(tenant.id, now: @now, recency_weight: 0.0, authority_prior: false)
+
+      priors_off =
+        search(tenant.id,
+          now: @now,
+          recency_weight: 0.0,
+          authority_prior: false,
+          importance_prior: false
+        )
 
       expect_query_embedding()
-      priors_on = search(tenant.id, now: @now, recency_weight: 0.3, authority_prior: true)
+
+      priors_on =
+        search(tenant.id,
+          now: @now,
+          recency_weight: 0.3,
+          authority_prior: true,
+          importance_prior: true,
+          importance_strength: 0.1
+        )
 
       assert ids(priors_on) == ids(priors_off)
       assert ids(priors_on) == [smaller.id, larger.id]
+    end
+
+    test "an importance weight of 0 reproduces the priors-off ordering EXACTLY (#790)" do
+      # The #471 property, extended to the third prior rather than replaced: with the weight
+      # at 0 the ordering must be byte-for-byte what it was before the prior existed, even
+      # when the two documents differ in the one input the prior reads.
+      tenant = fixture(:tenant)
+      {smaller, larger} = near_tie_pair(tenant.id)
+      set_age(tenant.id, smaller.id, 0)
+      set_age(tenant.id, larger.id, 0)
+
+      # The RRF-DISADVANTAGED doc is the heavily-used one, so a live prior WOULD move it.
+      set_read_days(tenant.id, larger.id, 90)
+
+      expect_query_embedding()
+
+      priors_off =
+        search(tenant.id,
+          now: @now,
+          recency_weight: 0.0,
+          authority_prior: false,
+          importance_prior: false
+        )
+
+      expect_query_embedding()
+
+      zero_weight =
+        search(tenant.id,
+          now: @now,
+          recency_weight: 0.0,
+          authority_prior: false,
+          # The toggle is ON so this isolates the STRENGTH being zero -- the prior ships
+          # disabled, and without this the equality below would hold for the wrong reason.
+          importance_prior: true,
+          importance_strength: 0.0
+        )
+
+      assert ids(zero_weight) == ids(priors_off)
+      assert ids(zero_weight) == [smaller.id, larger.id]
+
+      # Positive control: the SAME corpus reorders once the weight is live, so the equality
+      # above is the weight being zero and not the usage being unreadable.
+      expect_query_embedding()
+
+      live =
+        search(tenant.id,
+          now: @now,
+          recency_weight: 0.0,
+          authority_prior: false,
+          importance_prior: true,
+          importance_strength: 0.1
+        )
+
+      assert ids(live) == [larger.id, smaller.id]
+    end
+  end
+
+  describe "#790 importance prior (fused path)" do
+    test "a heavily-used article re-ranks above an unread near-tie the id tiebreak favours" do
+      tenant = fixture(:tenant)
+      {smaller, larger} = near_tie_pair(tenant.id)
+      set_age(tenant.id, smaller.id, 0)
+      set_age(tenant.id, larger.id, 0)
+
+      # The USED doc is the RRF-disadvantaged larger id, so only the importance prior can
+      # move it to the top -- a flip here cannot be a fluke of id ordering.
+      set_read_days(tenant.id, larger.id, 30)
+
+      expect_query_embedding()
+
+      neutral =
+        search(tenant.id,
+          now: @now,
+          recency_weight: 0.0,
+          authority_prior: false,
+          importance_prior: false
+        )
+
+      assert ids(neutral) == [smaller.id, larger.id]
+
+      expect_query_embedding()
+
+      with_importance =
+        search(tenant.id,
+          now: @now,
+          recency_weight: 0.0,
+          authority_prior: false,
+          importance_prior: true,
+          importance_strength: 0.1
+        )
+
+      assert ids(with_importance) == [larger.id, smaller.id]
+    end
+
+    test "an UNREAD article is never pushed below where it ranks with the prior off" do
+      # The one-sided guarantee at the fused level. Both documents are unread, so the prior
+      # must be inert -- if it could demote on absent usage, the 2026-08-21 closed loop is
+      # back and ~96% of this corpus is on the wrong side of it.
+      tenant = fixture(:tenant)
+      {smaller, larger} = near_tie_pair(tenant.id)
+      set_age(tenant.id, smaller.id, 0)
+      set_age(tenant.id, larger.id, 0)
+
+      expect_query_embedding()
+
+      off =
+        search(tenant.id,
+          now: @now,
+          recency_weight: 0.0,
+          authority_prior: false,
+          importance_prior: false
+        )
+
+      expect_query_embedding()
+
+      on =
+        search(tenant.id,
+          now: @now,
+          recency_weight: 0.0,
+          authority_prior: false,
+          importance_prior: true,
+          importance_strength: 0.1
+        )
+
+      assert ids(on) == ids(off)
+    end
+
+    test "usage cannot flip a cross-lane consensus winner" do
+      # The bound, at the fused level rather than in the factor arithmetic. `both` is found
+      # by the keyword AND semantic lanes; `keyword_only` has no embedding, so it scores one
+      # lane. Maximum usage on the single-lane doc must not be enough.
+      tenant = fixture(:tenant)
+
+      both =
+        create_article(tenant.id, %{title: "Consensus alpha note", body: @body})
+
+      keyword_only =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          status: :published,
+          title: "Single lane beta note",
+          body: @body
+        })
+
+      set_read_days(tenant.id, keyword_only.id, 10_000)
+
+      expect_query_embedding()
+
+      results =
+        search(tenant.id,
+          now: @now,
+          recency_weight: 0.0,
+          authority_prior: false,
+          importance_prior: true,
+          importance_strength: 0.1
+        )
+
+      # Precondition: both documents are actually in the pool, or "the winner won" is vacuous.
+      assert both.id in ids(results)
+      assert keyword_only.id in ids(results)
+
+      assert List.first(ids(results)) == both.id,
+             "importance flipped a cross-lane consensus winner -- it is dominating " <>
+               "relevance rather than breaking ties"
+    end
+  end
+
+  describe "#790 meta states the importance weight in force" do
+    test "the fused path reports the effective strength" do
+      tenant = fixture(:tenant)
+      create_article(tenant.id, %{title: "Meta note", body: @body})
+
+      expect_query_embedding()
+
+      assert {:ok, %{meta: meta}} =
+               Knowledge.search_combined(tenant.id, "sprocket calibration telemetry",
+                 now: @now,
+                 importance_prior: true,
+                 importance_strength: 0.25
+               )
+
+      assert meta.importance_strength == 0.25
+    end
+
+    test "a disabled prior reports 0.0, not an absent key" do
+      # `0.0` is the answer to "why did this rank" when importance played no part. An ABSENT
+      # key reads as "this build has no importance prior", which is a different claim.
+      tenant = fixture(:tenant)
+      create_article(tenant.id, %{title: "Meta note", body: @body})
+
+      expect_query_embedding()
+
+      assert {:ok, %{meta: meta}} =
+               Knowledge.search_combined(tenant.id, "sprocket calibration telemetry",
+                 now: @now,
+                 importance_prior: false
+               )
+
+      assert meta.importance_strength == 0.0
+    end
+  end
+
+  describe "#790 head audit: an UNMEASURABLE row scores 1.0, and does not disable the pool" do
+    test "one system canonical in the fused pool does NOT disable the prior" do
+      # Two things must hold at once, and the second is what the head audit added.
+      #
+      # A canonical's `read_day_count` is permanently NULL -- the nightly stamp's write
+      # predicate is `a.tenant_id == ^tenant_id` and a canonical's `tenant_id` is NULL -- so
+      # NULL there means NOT MEASURED rather than "read on zero days". What must NOT happen
+      # is the round-1 shape: turning the prior off for the WHOLE pool, which on this corpus
+      # (the shared canon is the bulk of it) is a product-wide disablement decided by a
+      # candidate at fused rank 180 the caller never sees, applied to the healthy response
+      # while the DEGRADED keyword-only one -- whose lane cannot hold a canonical -- kept
+      # ranking on usage. The measured tenant row below is what proves that did not happen.
+      #
+      # But the canonical itself is scored at exactly 1.0, NOT imputed to the pool median.
+      # "Unmeasurable" and "system canonical" are the same set, so any other value separates
+      # two zero-usage articles by scope -- the term the 2026-08-21 owner decision forbids.
+      tenant = fixture(:tenant)
+      mine = create_article(tenant.id, %{title: "Measured note", body: @body})
+      set_read_days(tenant.id, mine.id, 60)
+
+      {:ok, canonical} =
+        Knowledge.create_article(tenant.id, %{
+          title: "Shared canon note",
+          body: @body,
+          category: :reference,
+          scope: :system,
+          status: :published
+        })
+
+      assert is_nil(canonical.tenant_id)
+      # A canonical reaches a tenant's fused pool ONLY through the side-table path
+      # (`hydrate_semantic_pool/6`, `tenant_id == ^tenant_id or scope == :system`) -- the
+      # legacy-column semantic lane is strictly `tenant_id == ^tenant_id`. So: turn side-table
+      # reads on through the existing DI seam and materialize the tenant's own vector row for
+      # the shared article, which is exactly what AC-41.1.7 does on demand in production.
+      stub(Loopctl.MockEmbeddingReadPath, :side_table_reads_enabled?, fn -> true end)
+
+      AdminRepo.insert!(%Loopctl.Knowledge.ArticleEmbedding{
+        tenant_id: tenant.id,
+        article_id: canonical.id,
+        dim: 1536,
+        embedding: Pgvector.new(query_vector()),
+        live_denorm: true
+      })
+
+      expect_query_embedding()
+
+      assert {:ok, %{results: results, meta: meta}} =
+               Knowledge.search_combined(tenant.id, "sprocket calibration telemetry",
+                 now: @now,
+                 importance_prior: true,
+                 importance_strength: 0.1
+               )
+
+      # Precondition, not decoration: with the canonical outside the pool this proves nothing.
+      assert canonical.id in ids(results)
+
+      # The weight the response advertises is the configured one, and the ordering used it:
+      # `ranking_prior_meta/2` and `ranking_prior_opts/2` read the same value.
+      assert meta.importance_strength == 0.1
+      assert mine.id in ids(results)
+
+      # The canonical is UNTOUCHED by the prior: prior on and prior off give it the same
+      # score, because an unmeasurable row is multiplied by exactly 1.0. Before the head
+      # audit this asserted the opposite -- that the canonical scored strictly HIGHER with
+      # the prior on, which is the imputation reading scope.
+      #
+      # The MEASURED row is what proves the prior is still wired for the rest of the pool:
+      # it scores strictly higher with the prior on, in the same pool, in the same run.
+      expect_query_embedding()
+
+      assert {:ok, %{results: off}} =
+               Knowledge.search_combined(tenant.id, "sprocket calibration telemetry",
+                 now: @now,
+                 importance_prior: false
+               )
+
+      assert score_of(results, canonical.id) == score_of(off, canonical.id)
+      assert score_of(results, mine.id) > score_of(off, mine.id)
+    end
+
+    test "the tenant's own pool keeps the configured strength" do
+      # The positive control: the weight a response advertises must not move with pool
+      # membership, or a caller comparing two responses to the same query sees it change
+      # because an embedding lane was unavailable.
+      tenant = fixture(:tenant)
+      mine = create_article(tenant.id, %{title: "Measured note", body: @body})
+      set_read_days(tenant.id, mine.id, 60)
+
+      expect_query_embedding()
+
+      assert {:ok, %{meta: meta}} =
+               Knowledge.search_combined(tenant.id, "sprocket calibration telemetry",
+                 now: @now,
+                 importance_prior: true,
+                 importance_strength: 0.1
+               )
+
+      assert meta.importance_strength == 0.1
+    end
+  end
+
+  describe "#790 tenant isolation" do
+    test "the importance prior orders tenant A's own rows and never pools tenant B's" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+
+      mine = create_article(tenant_a.id, %{title: "Mine importance note", body: @body})
+
+      theirs =
+        create_article(tenant_b.id, %{title: "Theirs importance note", body: @body})
+
+      # Tenant B's article is the heavily-used one. If usage ever leaked across the tenant
+      # boundary it would be the top result here.
+      set_read_days(tenant_b.id, theirs.id, 90)
+
+      expect_query_embedding()
+
+      results =
+        search(tenant_a.id,
+          now: @now,
+          recency_weight: 0.0,
+          authority_prior: false,
+          importance_prior: true,
+          importance_strength: 0.1
+        )
+
+      assert ids(results) == [mine.id]
     end
   end
 

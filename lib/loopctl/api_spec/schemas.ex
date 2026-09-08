@@ -4382,6 +4382,25 @@ defmodule Loopctl.ApiSpec.Schemas do
                   "order mixes memory's absolute cosine with knowledge's pool-normalized " <>
                   "score and is NOT a calibrated cross-source ranking."
             },
+            importance_strength: %Schema{
+              type: :number,
+              nullable: true,
+              description:
+                "The magnitude of the USAGE (importance) prior in force on the KNOWLEDGE " <>
+                  "half of this pack (#790), so an ordering that usage produced can be " <>
+                  "explained — the input (`read_day_count`, the distinct days an article " <>
+                  "was opened inside the nightly stamp's window) appears on no row. The " <>
+                  "factor is `clamp(1 + strength * log1p(read_days)/log1p(30), 1.0, 1.1)`. " <>
+                  "One-sided in SCORE: an article with no recorded usage gets exactly 1.0 " <>
+                  "and is never scored down, though promoting a used article does move an " <>
+                  "unused one down the ORDER relative to it, by at most the 1.1 ceiling. " <>
+                  "`0.0` means importance played no part — disabled, which is the shipped " <>
+                  "default, or configured to zero. An article whose usage cannot be " <>
+                  "measured (a shared system canonical) is scored at exactly 1.0 like any " <>
+                  "unused article — scope is not an input to this factor, which does not " <>
+                  "change this weight. `null` only when the knowledge half produced no " <>
+                  "meta at all."
+            },
             recall_id: %Schema{
               type: :string,
               format: :uuid,

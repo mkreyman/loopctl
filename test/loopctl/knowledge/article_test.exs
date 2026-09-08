@@ -799,6 +799,44 @@ defmodule Loopctl.Knowledge.ArticleTest do
     end
   end
 
+  describe "read_day_count (#790 — the usage signal for the importance prior)" do
+    test "it is castable from nowhere" do
+      # A live ranking input a caller could write is a caller who can pin its own article at
+      # maximum IMPORTANCE forever — the same isolation content_changed_at, previous_title
+      # and staged_draft_at have, and the reason this is a column rather than a metadata key
+      # (metadata is cast and whole-map-replaced by PATCH).
+      #
+      # There is no stamping step on any changeset to mask this — the column is written only
+      # by Loopctl.Knowledge.Importance with update_all — so what survives here is exactly
+      # what `cast/3` let through, and adding `:read_day_count` to @cast_fields turns both
+      # halves red.
+      forged = %{read_day_count: 9_999}
+
+      assert Article.create_changeset(
+               %Article{},
+               Map.merge(forged, %{title: "Forged", body: "b"})
+             )
+             |> get_change(:read_day_count) == nil
+
+      assert Article.update_changeset(stored(), forged) |> get_change(:read_day_count) == nil
+    end
+
+    test "no ordinary edit touches it" do
+      for attrs <- [
+            %{title: "Renamed"},
+            %{body: "Rewritten body"},
+            %{status: :draft},
+            %{tags: ["fresh"]},
+            %{metadata: %{"note" => "x"}}
+          ] do
+        cs = Article.update_changeset(stored(), attrs)
+
+        assert get_change(cs, :read_day_count) == nil,
+               "#{inspect(attrs)} touched read_day_count -- only the nightly stamp may"
+      end
+    end
+  end
+
   describe "schema associations" do
     test "declares outgoing_links association" do
       assoc = Article.__schema__(:association, :outgoing_links)

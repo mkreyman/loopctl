@@ -149,6 +149,40 @@ defmodule Loopctl.Knowledge.Article do
     # by PATCH.
     field :content_changed_at, :utc_datetime_usec
 
+    # USAGE for the importance prior (#790): the number of DISTINCT UTC DAYS on which this
+    # article received a caller-chosen body read (`Knowledge.heat_read_access_types/0`)
+    # inside the stamping window. Written ONLY by `Loopctl.Knowledge.Importance.stamp/2`,
+    # from the nightly pass, with `update_all` — so the stamp does NOT bump `updated_at`, and
+    # `content_changed_at` is untouched either way, because being read is not being edited.
+    #
+    # DISTINCT DAYS and not raw reads, for the reason #567/#569/#572 each re-learned: a raw
+    # count is the counter a `knowledge_get` loop inflates, and a day counts once however
+    # long the loop runs. Not distinct READERS either — `heat_counts_query/5` records that
+    # "under a fleet sharing one key EVERY article ties at 1", so readership is near-flat on
+    # this tenant while days still carry signal.
+    #
+    # nil and 0 are the SAME state for a TENANT row — never measured, or measured as unread —
+    # and both make `RankingPriors.importance_factor/4` return exactly 1.0. That exact floor
+    # is what keeps the prior one-sided: an unread article's SCORE is exactly what it was
+    # before this column existed (its POSITION relative to a used article is not — see the
+    # moduledoc admonition in `RankingPriors`). See the note above `@kill_tag` there for why
+    # a prior that DEMOTES unread material is a closed loop and is not allowed here.
+    #
+    # On a SYSTEM canonical nil means something else again — NOT MEASURED, and unmeasurable,
+    # since `Importance`'s write predicate is `a.tenant_id == ^tenant_id` and a canonical's
+    # `tenant_id` is NULL. The column cannot tell the two apart, and the ranking side does
+    # NOT try to: a canonical scores exactly 1.0, the same as any article with no recorded
+    # usage. Imputing anything else would separate two zero-usage articles by scope, since
+    # "unmeasurable" and "system canonical" name the same set here.
+    #
+    # NEVER add this to a `cast` list. It is a live RANKING INPUT, so a caller that could
+    # write it could pin its own article at maximum importance forever — the same rule that
+    # moved the MOC-hub signal off `tags` onto `idempotency_key` and keeps
+    # `content_changed_at` above out of every cast. A COLUMN and not `metadata` for the
+    # reason the fields above are columns: `metadata` is cast and whole-map-replaced by
+    # PATCH, so one ordinary request could both erase and forge this.
+    field :read_day_count, :integer
+
     field :embedding, Pgvector.Ecto.Vector, load_in_query: false
     # Virtual boolean projection of `not is_nil(embedding)` — lets the bulk-embedding
     # path (US-37.4) null-check presence WITHOUT transferring the 1536-dim vector for

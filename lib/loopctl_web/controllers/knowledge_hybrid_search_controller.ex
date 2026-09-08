@@ -143,7 +143,21 @@ defmodule LoopctlWeb.KnowledgeHybridSearchController do
                  search_mode: %OpenApiSpex.Schema{type: :string},
                  total_count: %OpenApiSpex.Schema{type: :integer},
                  fallback: %OpenApiSpex.Schema{type: :boolean},
-                 fallback_reason: %OpenApiSpex.Schema{type: :string}
+                 fallback_reason: %OpenApiSpex.Schema{type: :string},
+                 importance_strength: %OpenApiSpex.Schema{
+                   type: :number,
+                   description:
+                     "The magnitude of the USAGE (importance) prior in force on this " <>
+                       "response (#790), so an ordering that usage produced can be " <>
+                       "explained. One-sided in SCORE: an article with no recorded usage " <>
+                       "gets a factor of exactly 1.0 and is never scored down, though " <>
+                       "promoting a used article does move an unused one down the ORDER " <>
+                       "relative to it, by at most the 1.1 ceiling. `0.0` means importance " <>
+                       "played no part — disabled, which is the shipped default, or " <>
+                       "configured to zero. An article whose usage cannot be measured (a " <>
+                       "shared system canonical) is scored at the pool's median measured " <>
+                       "factor rather than at the floor, which does not change this weight."
+                 }
                }
              }
            }

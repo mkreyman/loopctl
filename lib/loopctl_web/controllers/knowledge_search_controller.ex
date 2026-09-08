@@ -309,6 +309,24 @@ defmodule LoopctlWeb.KnowledgeSearchController do
                        "no `fallback` means the embedding SUCCEEDED but ranking returned nothing " <>
                        "(a recall problem) — distinct from a keyword_only fallback."
                  },
+                 importance_strength: %OpenApiSpex.Schema{
+                   type: :number,
+                   description:
+                     "Relevance modes (#790): the magnitude of the USAGE (importance) prior " <>
+                       "in force on this response, so an ordering that usage produced can be " <>
+                       "explained. The factor is " <>
+                       "`clamp(1 + strength * log1p(read_days)/log1p(30), 1.0, 1.1)`, where " <>
+                       "`read_days` is the distinct days the article was opened inside the " <>
+                       "nightly stamp's window. It is one-sided in SCORE: an article with no " <>
+                       "recorded usage gets exactly 1.0 and is never scored down, though " <>
+                       "promoting a used article does move an unused one down the ORDER " <>
+                       "relative to it, by at most the 1.1 ceiling. `0.0` means importance " <>
+                       "played no part in this ordering — the prior is disabled (which is " <>
+                       "the shipped default) or its strength is configured to zero. An " <>
+                       "article whose usage cannot be measured (a shared system canonical) " <>
+                       "is scored at exactly 1.0 like any unused article — scope is not an " <>
+                       "input to this factor; that does not change this weight."
+                 },
                  remediation: %OpenApiSpex.Schema{
                    type: :object,
                    description:

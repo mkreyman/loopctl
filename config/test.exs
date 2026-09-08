@@ -735,6 +735,16 @@ config :loopctl, :batch_item_validation_timeout_ms, 2_000
 # Mox expectations. The real VectorSearch.nearest path keeps a dedicated integration test.
 config :loopctl, :article_similarity_search, Loopctl.MockArticleSimilaritySearch
 
+# #790: DI for the importance usage stamp's heavy read and its two write statements, so the
+# tally's three FAILURE gates (:heavy_read_overloaded, :scan_failed, :write_failed) are
+# assertable. Provoking them for real is not available: the shed needs the TenantGate's
+# Application.get_env cost cap moved (which the test conventions forbid), and neither a raise
+# nor an exit nor a failed write can be produced from a healthy sandboxed connection. The
+# DataCase default stubs delegate to the real modules, so every OTHER test runs the real
+# aggregate over real event rows and writes real columns — only the gate tests override.
+config :loopctl, :knowledge_usage_scan, Loopctl.MockKnowledgeUsageScan
+config :loopctl, :knowledge_usage_stamp_writer, Loopctl.MockKnowledgeUsageStampWriter
+
 # US-36.4: a small corpus-count sample rate so the sampling assertions can pick a
 # deterministically sampled/unsampled article by id hash, and a tiny insert chunk size so
 # a handful of links exercises the multi-chunk insert_all path without thousands of rows.
