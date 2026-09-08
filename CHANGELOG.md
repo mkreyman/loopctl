@@ -6,6 +6,26 @@ All notable changes to loopctl are documented here.
 
 ### Changed
 
+- **The usage-based importance prior is now ENABLED (#790).**
+  `:knowledge_importance_prior_enabled` flips from `false` to `true`, so ranking on
+  `GET /api/v1/knowledge/search` (relevance modes), `POST /api/v1/knowledge/hybrid_search`
+  and `POST /api/v1/recall` now includes a bounded, one-sided-upward factor derived from how
+  many DISTINCT DAYS an article was opened inside the nightly window. `meta.importance_strength`
+  reports `0.1` instead of `0.0`, which is how a caller can tell the ordering changed.
+
+  **Ordering will move.** An article with no recorded usage still scores exactly 1.0 and is
+  never scored down, but ranking is ordinal, so promoting a used article moves an unused one
+  down relative to it — bounded by the 1.1 ceiling, at most about 9% of relative position,
+  and never enough to flip a cross-lane consensus winner.
+
+  **It arms at the next nightly run, not at deploy.** `read_day_count` is stamped by
+  `KnowledgeLintWorker` at 04:00 UTC; until that run the column is NULL corpus-wide and every
+  factor is 1.0, so the deploy itself changes no ordering.
+
+  **Reverting is this one line**, and the nightly stamp keeps collecting `read_day_count`
+  either way, so turning it off loses no history.
+
+
 - **Ranking now includes a USAGE (importance) prior, and the nightly pass writes its input
   (#790).** Migration `20260908120000` adds `articles.read_day_count`, a nullable integer
   holding the distinct days an article was opened inside the last 90. It is stamped once a
@@ -26,13 +46,13 @@ All notable changes to loopctl are documented here.
   unread. The ceiling of 1.1 means it re-ranks near-ties and cannot flip a cross-lane
   relevance winner.
 
-  **It SHIPS DISABLED — `config :loopctl, :knowledge_importance_prior_enabled` defaults to
-  `false`, so ranking is byte-identical to pre-#790 until an operator turns it on.** The
-  carve-out it needs from the 2026-08-21 "ranking must never key on HOW a document got in"
-  decision is recorded in CLAUDE.md as not owner-ratified, and a ranking change may not
-  ratify itself. Turn it on with that key set to `true`; change its magnitude with
-  `:knowledge_importance_strength` (default 0.1); a strength of 0 is an exact no-op too. The
-  nightly stamp writes `read_day_count` either way, so enabling it later reads real history.
+  **It shipped DISABLED in this release and was ENABLED on 2026-09-08** by the owner ruling
+  recorded in CLAUDE.md, in the separate entry above. It shipped off because the carve-out it
+  needs from the 2026-08-21 "ranking must never key on HOW a document got in" decision was
+  not owner-ratified, and a ranking change may not ratify itself. Turn it off again with
+  `config :loopctl, :knowledge_importance_prior_enabled` set to `false`; change its magnitude
+  with `:knowledge_importance_strength` (default 0.1); a strength of 0 is an exact no-op too.
+  The nightly stamp writes `read_day_count` either way, so a revert loses no history.
 
   A candidate the stamp could not have measured — a shared system canonical, whose
   `tenant_id` is NULL — is scored at exactly 1.0, the same as any article with no recorded

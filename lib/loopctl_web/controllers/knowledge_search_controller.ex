@@ -321,8 +321,9 @@ defmodule LoopctlWeb.KnowledgeSearchController do
                        "recorded usage gets exactly 1.0 and is never scored down, though " <>
                        "promoting a used article does move an unused one down the ORDER " <>
                        "relative to it, by at most the 1.1 ceiling. `0.0` means importance " <>
-                       "played no part in this ordering — the prior is disabled (which is " <>
-                       "the shipped default) or its strength is configured to zero. An " <>
+                       "played no part in this ordering — the prior is disabled or its " <>
+                       "strength is configured to zero. It is ENABLED by default since " <>
+                       "2026-09-08, so the usual weight is the configured one. An " <>
                        "article whose usage cannot be measured (a shared system canonical) " <>
                        "is scored at exactly 1.0 like any unused article — scope is not an " <>
                        "input to this factor; that does not change this weight."

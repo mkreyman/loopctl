@@ -349,10 +349,11 @@ defmodule Loopctl.Workers.KnowledgeLintWorker do
     # touches no proposal, publishes nothing, and cannot fail the run (it is fail-soft
     # inside, and reports a gate rather than raising).
     #
-    # It runs whether or not the PRIOR that reads the column is enabled — it ships disabled
-    # pending the owner ruling recorded in CLAUDE.md's 2026-08-21 section — because the
-    # collection is one bounded aggregate per tenant per night and having 90 days of history
-    # already stamped is what makes ratification a config flip rather than a 90-day wait.
+    # It runs whether or not the PRIOR that reads the column is enabled. That independence
+    # was what made ratification a config flip against real history rather than a 90-day
+    # wait (the owner ruled on 2026-09-08, recorded in CLAUDE.md's 2026-08-21 section), and
+    # it is what keeps a revert cheap now: turning the prior back off loses no history,
+    # because this step keeps stamping. Turn the COLLECTION off here, not at the toggle.
     #
     # AFTER the two applying steps deliberately: an article those steps unpublished keeps
     # whatever usage it earned, and its rank is settled by the status filter rather than by
