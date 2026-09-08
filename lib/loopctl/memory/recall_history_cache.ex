@@ -185,9 +185,13 @@ defmodule Loopctl.Memory.RecallHistoryCache do
   @impl true
   def handle_info(:sweep, state) do
     sweep_expired()
-    warn_if_full()
+    capacity = warn_if_full()
     schedule_sweep()
-    {:noreply, state}
+    # The verdict is kept on the state so the CALL is observable. It carries the SIZE and
+    # CAP it actually read, not just a pass/fail: with a healthy table a stubbed-out check
+    # and the real one both say "fine", so a bare verdict could not tell them apart and the
+    # guard stayed reachable only in principle — the state the #792 head audit flagged.
+    {:noreply, Map.put(state, :last_capacity_check, capacity)}
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
@@ -238,17 +242,29 @@ defmodule Loopctl.Memory.RecallHistoryCache do
   # entries expire, and a silent degradation is the one an operator cannot act on. Logged
   # here — once per sweep interval, on the owner — never from the request path, where it
   # would fire on every recall.
-  defp warn_if_full do
-    cap = max_entries()
-    size = :ets.info(@table, :size)
+  defp warn_if_full, do: warn_if_full(:ets.info(@table, :size), max_entries())
 
+  @doc false
+  # Split arity-2 and public for exactly the reason `room_for?/2` is: this is the ONLY
+  # thing that makes a node-wide containment failure observable, and the ceiling is
+  # 200_000 rows, so a test that had to REACH it would never be written. Returns the
+  # message it logged rather than `:ok` so a test can assert the branch, the direction of
+  # the comparison, and the text — none of which the arity-0 form could prove.
+  @spec warn_if_full(term(), pos_integer()) :: %{
+          size: term(),
+          cap: pos_integer(),
+          warned: boolean()
+        }
+  def warn_if_full(size, cap) do
     if room_for?(size, cap) do
-      :ok
+      %{size: size, cap: cap, warned: false}
     else
       Logger.warning(
         "RecallHistoryCache at capacity (#{inspect(size)}/#{cap}) after sweep: " <>
           "recall containment is disabled on this node until entries expire"
       )
+
+      %{size: size, cap: cap, warned: true}
     end
   end
 

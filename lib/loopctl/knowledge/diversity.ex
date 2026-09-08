@@ -272,7 +272,7 @@ defmodule Loopctl.Knowledge.Diversity do
     # alternative is an EMPTY knowledge half, which a caller reads as "the KB has nothing
     # on this" while the articles it wanted still exist.
     {selected, pool, dropped_exact, dropped_near, readmitted, dropped_seen} =
-      fill_to_limit(unseen, [], already_seen, pinned_candidates, pinned_items, limit, opts)
+      fill_to_limit(unseen, already_seen, pinned_candidates, pinned_items, limit, opts)
 
     {Enum.map(selected, & &1.candidate),
      %{
@@ -334,51 +334,92 @@ defmodule Loopctl.Knowledge.Diversity do
     end
   end
 
-  # The floor. `shortfall` is how many slots containment would leave unfilled; the
-  # highest-ranked repeats come back to cover exactly that many and no more, so a session
-  # with a healthy pool still never sees a repeat.
+  # The floor. `shortfall` is how many slots the page is still missing; that many of the
+  # highest-ranked repeats come back per pass. It can take MORE than one pass, because a
+  # readmitted repeat may itself lose the fingerprint collapse or the near-duplicate check,
+  # so the total readmitted may exceed the first shortfall — what it may never do is exceed
+  # what is needed to reach `limit`.
   defp readmit_for_shortfall(already_seen, shortfall) when shortfall > 0,
     do: Enum.split(already_seen, shortfall)
 
   defp readmit_for_shortfall(already_seen, _shortfall), do: {[], already_seen}
 
-  # The shortfall is measured AFTER the drop stages and the refill RE-RUNS them, because a
-  # re-admitted repeat can itself lose the fingerprint collapse or the near-duplicate check.
-  # Sizing it once, before those stages, from the raw unseen count (which is what this did
-  # until the #792 review's second round) left the page short of `limit` with re-admittable
-  # repeats still in hand — the exact outcome the floor exists to prevent, and the one the
-  # moduledoc promises cannot happen. Repeats stay APPENDED behind the unseen candidates, so
-  # they are only ever the lowest-ranked members of the pool. Each pass consumes at least one
-  # row from `dropped_seen`, so the recursion is bounded by the shown-set and terminates.
-  defp fill_to_limit(
-         unseen,
-         readmitted,
-         dropped_seen,
-         pinned_candidates,
-         pinned_items,
-         limit,
-         opts
-       ) do
+  # TWO PASSES, and the ORDER is the guarantee.
+  #
+  # Pass 1 runs the drop stages and MMR over the UNSEEN candidates alone. Pass 2 tops the
+  # page up from the shown-set, one shortfall at a time, with pass 1's selection FIXED and
+  # handed to `mmr/4` as the seed — so a repeat is measured against the fresh rows already
+  # chosen and can only ever land behind them.
+  #
+  # Both halves used to share ONE MMR pool, and that is the defect this replaces. Round 2 of
+  # the #792 review introduced it to fix a real bug: sizing the readmission once, before the
+  # drop stages, left the page short of `limit` when a readmitted repeat then lost the
+  # fingerprint or near-duplicate check. The fix worked and cost more than it bought, because
+  # `mmr_loop/5` picks by SCORE and not by list position — so a repeat scoring above the
+  # unseen rows was picked FIRST and then dropped them as its own near-duplicates. Measured
+  # on the compiled tree at lambda 1.0, threshold 0.95, all vectors [1.0, 0.0]: one excluded
+  # candidate at 0.9 against unseen at 0.5 and 0.4, limit 2, returned the repeat ALONE where
+  # the sizing it replaced returned the fresh row. At scale it was worse — four excluded rows
+  # at 0.99..0.96 against three unseen, limit 3, returned one repeat and evicted every fresh
+  # article. A comment claiming repeats "stay APPENDED behind the unseen candidates" cannot
+  # make list position load-bearing; running them in a later pass can, and does.
+  #
+  # Looping the top-up keeps round 2's bug fix. Each pass consumes at least one row from
+  # `dropped_seen`, so it is bounded by the shown-set and terminates.
+  defp fill_to_limit(unseen, dropped_seen, pinned_candidates, pinned_items, limit, opts) do
     {kept_exact, dropped_exact} =
-      dedup_by_fingerprint(unseen ++ readmitted, fingerprints(pinned_candidates))
+      dedup_by_fingerprint(unseen, fingerprints(pinned_candidates))
 
     pool = Enum.map(kept_exact, &prepare/1)
 
     {selected, dropped_near} = mmr(pool, limit, opts, pinned_items)
 
-    case readmit_for_shortfall(dropped_seen, limit - length(selected)) do
+    acc = %{
+      pool: pool,
+      dropped_exact: dropped_exact,
+      dropped_near: dropped_near,
+      readmitted: [],
+      dropped_seen: dropped_seen
+    }
+
+    ctx = %{pinned_candidates: pinned_candidates, limit: limit, opts: opts}
+
+    top_up_from_seen(selected, acc, ctx)
+  end
+
+  # `acc` and `ctx` are maps rather than nine positional arguments: the loop threads five
+  # accumulators through three constants, and credo's arity ceiling is the right call here.
+  defp top_up_from_seen(selected, acc, ctx) do
+    case readmit_for_shortfall(acc.dropped_seen, ctx.limit - length(selected)) do
       {[], _still_dropped} ->
-        {selected, pool, dropped_exact, dropped_near, readmitted, dropped_seen}
+        {selected, acc.pool, acc.dropped_exact, acc.dropped_near, acc.readmitted,
+         acc.dropped_seen}
 
       {more, still_dropped} ->
-        fill_to_limit(
-          unseen,
-          readmitted ++ more,
-          still_dropped,
-          pinned_candidates,
-          pinned_items,
-          limit,
-          opts
+        # The suppression set is the pins PLUS everything already selected, so a repeat
+        # carrying a fresh row's fingerprint is collapsed rather than shown beside it.
+        seen_fingerprints =
+          fingerprints(ctx.pinned_candidates ++ Enum.map(selected, & &1.candidate))
+
+        {kept_exact, extra_exact} = dedup_by_fingerprint(more, seen_fingerprints)
+
+        extra_pool = Enum.map(kept_exact, &prepare/1)
+
+        # `selected` seeds the pass, so `mmr/4` returns it unchanged at the front and only
+        # appends. `limit` is unchanged for the same reason: it counts the seed.
+        {selected_now, extra_near} = mmr(extra_pool, ctx.limit, ctx.opts, selected)
+
+        top_up_from_seen(
+          selected_now,
+          %{
+            acc
+            | pool: acc.pool ++ extra_pool,
+              dropped_exact: acc.dropped_exact + extra_exact,
+              dropped_near: acc.dropped_near + extra_near,
+              readmitted: acc.readmitted ++ more,
+              dropped_seen: still_dropped
+          },
+          ctx
         )
     end
   end

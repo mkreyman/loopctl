@@ -109,6 +109,64 @@ defmodule Loopctl.Memory.RecallHistoryCacheTest do
     assert RecallHistoryCache.ttl_seconds() > 0
   end
 
+  describe "capacity warning (#792 head audit)" do
+    # `warn_if_full/2` is the ONLY thing that makes a node-wide containment failure
+    # observable after the inline sweep was removed from the write path, and it shipped
+    # with no test at all — nothing proved the branch was reachable, that the comparison
+    # was read in the right direction, or that the message ever fired.
+
+    test "warns, and says what is wrong, when the table is AT its ceiling" do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert %{size: 10, cap: 10, warned: true} = RecallHistoryCache.warn_if_full(10, 10)
+        end)
+
+      assert log =~ "RecallHistoryCache at capacity (10/10)"
+      assert log =~ "containment is disabled on this node"
+    end
+
+    test "is silent with one slot to spare — the comparison is strict, not inclusive" do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert %{size: 9, cap: 10, warned: false} = RecallHistoryCache.warn_if_full(9, 10)
+        end)
+
+      refute log =~ "RecallHistoryCache at capacity"
+    end
+
+    test "an OVER-full table warns too, so a shrunk cap is not silently ignored" do
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert %{warned: true} = RecallHistoryCache.warn_if_full(11, 10)
+      end)
+    end
+
+    test "a table whose owner has not booted is NOT room, and warns" do
+      # `:ets.info/2` answers `:undefined` for a missing table. Treating that as room
+      # would let the insert raise and the caller's rescue turn it into the same silent
+      # no-op this warning exists to end.
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert %{warned: true} = RecallHistoryCache.warn_if_full(:undefined, 10)
+      end)
+    end
+
+    test "the sweep actually calls it — the wiring, not just the decision" do
+      # The live table is far below the 200_000 ceiling, so the VERDICT here is :ok. What
+      # this pins is that :sweep reaches the check at all, which it can only do because the
+      # handler records the verdict on its state. Asserting the log alone could not: with
+      # the call deleted the handler still returned {:noreply, state} and the whole file
+      # stayed green, which is exactly the "reachable only in principle" state the audit
+      # flagged.
+      assert {:noreply, state} = RecallHistoryCache.handle_info(:sweep, %{table: :ignored})
+
+      # The CAP it recorded is the configured ceiling and the SIZE is the table's real
+      # count — neither of which a stubbed-out check could produce, which is what makes
+      # deleting the call detectable at all.
+      assert %{warned: false, cap: cap, size: size} = state.last_capacity_check
+      assert cap == RecallHistoryCache.max_entries()
+      assert is_integer(size)
+    end
+  end
+
   test "marking is idempotent — a repeat does not create a second entry", ctx do
     :ok = RecallHistoryCache.mark_shown(ctx.tenant, ctx.subject, ctx.session, ["a"])
     :ok = RecallHistoryCache.mark_shown(ctx.tenant, ctx.subject, ctx.session, ["a"])

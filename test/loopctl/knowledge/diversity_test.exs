@@ -189,8 +189,11 @@ defmodule Loopctl.Knowledge.DiversityTest do
         )
 
       # One slot could not be filled from the unseen pool, so exactly ONE repeat returns —
-      # and it is the highest-ranked one.
-      assert ids(selected) == ["seen-1", "fresh"]
+      # and it is the highest-ranked one. It comes back BEHIND the fresh row even though it
+      # outscores it 0.99 to 0.97: repeats are chosen in a second pass, seeded with the
+      # first pass's picks, which is the whole of what "the floor never costs a fresh row"
+      # means. Asserting the reverse is what let a repeat evict fresh articles.
+      assert ids(selected) == ["fresh", "seen-1"]
       assert stats.readmitted_already_seen == 1
       assert stats.dropped_already_seen == 1
     end
@@ -214,11 +217,41 @@ defmodule Loopctl.Knowledge.DiversityTest do
         )
 
       assert length(selected) == 3
-      assert ids(selected) == ["seen-1", "seen-2", "fresh"]
+      # Fresh first, both repeats behind it, though each outscores it.
+      assert ids(selected) == ["fresh", "seen-1", "seen-2"]
       assert stats.selected == 3
       assert stats.readmitted_already_seen == 2
       assert stats.dropped_already_seen == 0
       assert stats.dropped_exact_duplicates == 1
+    end
+
+    test "a repeat that OUTRANKS the unseen rows can never evict them" do
+      # The regression the #792 review's head audit measured. Round 2 put the repeats and
+      # the unseen rows in ONE MMR pool so a readmitted repeat could still be dropped by the
+      # later stages. But `mmr_loop/5` picks by SCORE, not by list position, so the repeat —
+      # scoring above every fresh row — was picked FIRST and then dropped all of them as its
+      # own near-duplicates. The page came back as a single repeat where the sizing it
+      # replaced had returned the fresh row.
+      #
+      # All three vectors are identical, so every candidate is a near-duplicate of whatever
+      # is chosen first; that is what makes WHICH ONE IS CHOSEN FIRST the whole of the test.
+      candidates = [
+        candidate("seen-1", 0.9, embedding: @a),
+        candidate("fresh-1", 0.5, embedding: @a),
+        candidate("fresh-2", 0.4, embedding: @a)
+      ]
+
+      {selected, stats} =
+        Diversity.select(candidates, 2, Diversity.config(diversity_lambda: 1.0),
+          exclude_ids: ["seen-1"]
+        )
+
+      # The fresh row wins the FIRST slot despite scoring 0.4 lower — that is the whole
+      # assertion. `seen-1` is then readmitted for the slot the near-duplicate stage left
+      # open and is itself rejected by that same stage, so it is counted as an attempt and
+      # never displaces a fresh row. Before the fix this returned ["seen-1"].
+      assert ids(selected) == ["fresh-1"]
+      assert stats.readmitted_already_seen == 1
     end
 
     test "the floor covers a shortfall the NEAR-DUPLICATE stage opened" do
@@ -236,8 +269,9 @@ defmodule Loopctl.Knowledge.DiversityTest do
       # `fresh-twin` is a near-copy of `fresh` and is dropped, so the unseen half can only
       # ever fill ONE of the two slots. Sizing the shortfall before that stage (`limit 2 -
       # 0 pinned - 2 unseen == 0`) re-admitted nothing and returned a one-row page with a
-      # usable repeat still in hand; the slot is now refilled by the highest-ranked repeat.
-      assert ids(selected) == ["seen-1", "fresh"]
+      # usable repeat still in hand; the slot is now refilled by the highest-ranked repeat,
+      # appended behind the fresh row rather than ahead of it.
+      assert ids(selected) == ["fresh", "seen-1"]
       assert stats.selected == 2
       assert stats.readmitted_already_seen == 1
       assert stats.dropped_already_seen == 0
