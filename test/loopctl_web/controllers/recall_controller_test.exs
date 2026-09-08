@@ -108,13 +108,21 @@ defmodule LoopctlWeb.RecallControllerTest do
       # 0.0 is the SHIPPED state, not an absent feature: the prior's carve-out from the
       # 2026-08-21 owner decision is unratified, so `:knowledge_importance_prior_enabled`
       # defaults to false (config/config.exs) and this endpoint therefore reports a weight of
-      # zero until Mark rules. Flipping that key to true is what makes this 0.1, and the
-      # "a non-zero configured weight reaches the meta" property is pinned where it can be
-      # exercised without config: `KnowledgeCombinedPriorsTest`, "the fused path reports the
-      # effective strength" (0.25 through opts).
+      # zero until Mark rules. Flipping that key to true is what makes this 0.1.
       assert know_meta["importance_strength"] == 0.0
-      assert Map.has_key?(know_meta, "importance_strength")
 
+      # The MERGE. `Map.has_key?` on the MERGED meta is the load-bearing half: a merge that
+      # dropped the key leaves `meta["importance_strength"]` nil, and nil == 0.0 is false, so
+      # the equality below does go red on an omission. What it cannot distinguish while the
+      # shipped weight is 0.0 is a merge that copies some OTHER source's zero — a narrow
+      # residue, stated rather than papered over, and it closes by itself when the prior is
+      # ratified and the weight stops being zero.
+      #
+      # No other test covers this endpoint's merge. `KnowledgeCombinedPriorsTest` is not that
+      # cover: it asserts `Knowledge.search_combined/3`'s own meta and never reaches the
+      # controller. (Only some knowledge-envelope keys are merged — `search_mode` is not —
+      # so a non-constant key is not available to pin it with.)
+      assert Map.has_key?(meta, "importance_strength")
       assert meta["importance_strength"] == know_meta["importance_strength"]
 
       # Knowledge items are the whitelisted combined-search SUMMARY — never the raw

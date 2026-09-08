@@ -170,10 +170,10 @@ defmodule Loopctl.Knowledge.Article do
     #
     # On a SYSTEM canonical nil means something else again — NOT MEASURED, and unmeasurable,
     # since `Importance`'s write predicate is `a.tenant_id == ^tenant_id` and a canonical's
-    # `tenant_id` is NULL. The column cannot tell the two apart, which is why a canonical is
-    # scored at the pool's MEDIAN measured factor
-    # (`RankingPriors.pool_importance_default_factor/4`) rather than having its NULL read as
-    # zero usage, which would put it at the floor of a class it was never measured against.
+    # `tenant_id` is NULL. The column cannot tell the two apart, and the ranking side does
+    # NOT try to: a canonical scores exactly 1.0, the same as any article with no recorded
+    # usage. Imputing anything else would separate two zero-usage articles by scope, since
+    # "unmeasurable" and "system canonical" name the same set here.
     #
     # NEVER add this to a `cast` list. It is a live RANKING INPUT, so a caller that could
     # write it could pin its own article at maximum importance forever — the same rule that

@@ -10446,7 +10446,7 @@ defmodule Loopctl.Knowledge do
   # adjusted; the raw `:relevance_score`/`:similarity_score` the hybrid resolver reads are
   # left untouched.
   defp apply_ranking_priors_fused(results, opts) do
-    prior_opts = ranking_prior_opts(opts, results)
+    prior_opts = ranking_prior_opts(opts)
 
     results
     |> Enum.map(fn r ->
@@ -10461,43 +10461,13 @@ defmodule Loopctl.Knowledge do
   # preserves the keyword lane's own `id ASC` tiebreak (its DB order is
   # `ts_rank_cd DESC, id ASC`), so with priors disabled the ordering is unchanged.
   defp apply_ranking_priors_fallback(results, opts) do
-    prior_opts = ranking_prior_opts(opts, results)
+    prior_opts = ranking_prior_opts(opts)
 
     results
     |> Enum.sort_by(& &1.id, :asc)
     |> Enum.sort_by(
       fn r -> (Map.get(r, :relevance_score) || 0.0) * RankingPriors.multiplier(r, prior_opts) end,
       :desc
-    )
-  end
-
-  # The pool the priors are about to be applied to supplies ONE extra option, so the opts
-  # cannot be built from `opts` alone (#790 review). `RankingPriors.multiplier/2` is per-ROW
-  # and a per-row factor cannot say "this row's usage is UNKNOWN", which is exactly what a
-  # system canonical's permanently-NULL `read_day_count` is: the nightly stamp's write
-  # predicate is `a.tenant_id == ^tenant_id` and a canonical's `tenant_id` is NULL. Ranking a
-  # measured class against an unmeasurable one on one number is the #569/#572 defect with the
-  # direction reversed, so an unmeasurable candidate takes the pool's MEDIAN measured factor
-  # (`pool_importance_default_factor/4`) rather than the floor.
-  #
-  # It is per-ROW imputation and not a pool-wide switch, deliberately: this pool is the FULL
-  # pre-pagination fused candidate set (~200 rows), the shared canon is the bulk of this
-  # corpus, and the keyword lane cannot hold a canonical while the side-table semantic lane
-  # can — so an all-or-nothing gate would disable the prior for pages that never contained a
-  # canonical, and would leave it applying on the DEGRADED keyword-only response while the
-  # healthy one withheld it.
-  defp ranking_prior_opts(opts, results) do
-    base = ranking_prior_opts(opts)
-
-    Keyword.put(
-      base,
-      :importance_default_factor,
-      RankingPriors.pool_importance_default_factor(
-        results,
-        Keyword.fetch!(base, :importance_strength),
-        @importance_floor,
-        @importance_ceiling
-      )
     )
   end
 

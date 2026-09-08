@@ -406,16 +406,22 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
     end
   end
 
-  describe "#790 review: an UNMEASURABLE row is imputed, never a pool-wide switch" do
+  describe "#790 head audit: an UNMEASURABLE row scores 1.0, and does not disable the pool" do
     test "one system canonical in the fused pool does NOT disable the prior" do
+      # Two things must hold at once, and the second is what the head audit added.
+      #
       # A canonical's `read_day_count` is permanently NULL -- the nightly stamp's write
       # predicate is `a.tenant_id == ^tenant_id` and a canonical's `tenant_id` is NULL -- so
-      # NULL there means NOT MEASURED, not "read on zero days". It is imputed at the pool's
-      # median measured factor, per row. What must NOT happen is the round-1 shape: turning
-      # the prior off for the WHOLE pool, which on this corpus (the shared canon is the bulk
-      # of it) is a product-wide disablement, decided by a candidate at fused rank 180 the
-      # caller never sees, and applied to the healthy response while the DEGRADED
-      # keyword-only one -- whose lane cannot hold a canonical -- kept ranking on usage.
+      # NULL there means NOT MEASURED rather than "read on zero days". What must NOT happen
+      # is the round-1 shape: turning the prior off for the WHOLE pool, which on this corpus
+      # (the shared canon is the bulk of it) is a product-wide disablement decided by a
+      # candidate at fused rank 180 the caller never sees, applied to the healthy response
+      # while the DEGRADED keyword-only one -- whose lane cannot hold a canonical -- kept
+      # ranking on usage. The measured tenant row below is what proves that did not happen.
+      #
+      # But the canonical itself is scored at exactly 1.0, NOT imputed to the pool median.
+      # "Unmeasurable" and "system canonical" are the same set, so any other value separates
+      # two zero-usage articles by scope -- the term the 2026-08-21 owner decision forbids.
       tenant = fixture(:tenant)
       mine = create_article(tenant.id, %{title: "Measured note", body: @body})
       set_read_days(tenant.id, mine.id, 60)
@@ -462,11 +468,13 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
       assert meta.importance_strength == 0.1
       assert mine.id in ids(results)
 
-      # And the imputation is WIRED, not just implemented: the same search with the prior
-      # off scores the canonical strictly lower, so `ranking_prior_opts/2` really is handing
-      # the pool's median factor to the re-rank. Without that hand-off the canonical would
-      # be multiplied by 1.0 in both runs and these two numbers would be equal -- which is
-      # exactly the round-1 behaviour, and it is what this comparison exists to catch.
+      # The canonical is UNTOUCHED by the prior: prior on and prior off give it the same
+      # score, because an unmeasurable row is multiplied by exactly 1.0. Before the head
+      # audit this asserted the opposite -- that the canonical scored strictly HIGHER with
+      # the prior on, which is the imputation reading scope.
+      #
+      # The MEASURED row is what proves the prior is still wired for the rest of the pool:
+      # it scores strictly higher with the prior on, in the same pool, in the same run.
       expect_query_embedding()
 
       assert {:ok, %{results: off}} =
@@ -475,7 +483,8 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
                  importance_prior: false
                )
 
-      assert score_of(results, canonical.id) > score_of(off, canonical.id)
+      assert score_of(results, canonical.id) == score_of(off, canonical.id)
+      assert score_of(results, mine.id) > score_of(off, mine.id)
     end
 
     test "the tenant's own pool keeps the configured strength" do

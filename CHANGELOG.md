@@ -35,8 +35,13 @@ All notable changes to loopctl are documented here.
   nightly stamp writes `read_day_count` either way, so enabling it later reads real history.
 
   A candidate the stamp could not have measured — a shared system canonical, whose
-  `tenant_id` is NULL — is scored at the pool's MEDIAN measured factor rather than at the
-  floor, so one tenant's usage never pushes the shared canon down a page.
+  `tenant_id` is NULL — is scored at exactly 1.0, the same as any article with no recorded
+  usage. Scope is not an input: because the stamp's write predicate is tenant-scoped,
+  "unmeasurable" and "system canonical" are the same set, so any other value would separate
+  two zero-usage articles by how the document got into the corpus. The cost, stated plainly:
+  a heavily-read canonical is not boosted either, and at equal relevance it loses a near-tie
+  to a used tenant article. That is a data gap, not a ranking weight, and the fix is
+  per-(tenant, article) usage rows.
 
   **API.** `meta.importance_strength` is new on `GET /api/v1/knowledge/search` (relevance
   modes), `POST /api/v1/knowledge/hybrid_search` and `POST /api/v1/recall` (on both the

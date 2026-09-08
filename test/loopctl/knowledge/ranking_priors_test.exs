@@ -34,9 +34,10 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
   @importance_floor 1.0
   @importance_ceiling 1.1
 
-  # The opts a POOL produces: the per-row options plus the imputed factor an unmeasurable
-  # candidate takes, exactly as Knowledge.ranking_prior_opts/2 builds them.
-  defp pool_opts(pool, strength \\ 0.1) do
+  # The per-row options, at a non-zero importance strength. There is no pool-level option
+  # any more: importance is exactly per-ROW (#790 head audit), so a pool cannot change what
+  # any candidate in it scores.
+  defp pool_opts(_pool, strength \\ 0.1) do
     [
       now: @now,
       recency_weight: 0.0,
@@ -46,14 +47,7 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
       ceiling: @ceiling,
       importance_strength: strength,
       importance_floor: @importance_floor,
-      importance_ceiling: @importance_ceiling,
-      importance_default_factor:
-        RankingPriors.pool_importance_default_factor(
-          pool,
-          strength,
-          @importance_floor,
-          @importance_ceiling
-        )
+      importance_ceiling: @importance_ceiling
     ]
   end
 
@@ -768,122 +762,46 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
     end
   end
 
-  describe "the importance prior applies only to a MEASURABLE pool (#790 review)" do
-    # A system canonical's `read_day_count` is permanently NULL because the nightly stamp
-    # writes `where a.tenant_id == ^tenant_id` and its `tenant_id` is NULL. NULL there means
-    # NOT MEASURED, not "read on zero days", and the column cannot tell the two apart -- so a
-    # mixed pool would rank a counted class against an uncounted one on one number, the
-    # #569/#572 defect with the direction reversed.
+  describe "an UNMEASURABLE row is scored at 1.0, never imputed (#790 head audit)" do
     @tenant_row %{id: "t", tenant_id: Ecto.UUID.generate(), read_day_count: 30}
     @canonical %{id: "c", tenant_id: nil, read_day_count: nil}
 
-    test "a tenant-owned row is measurable and a system canonical is not" do
-      assert RankingPriors.usage_measurable?(@tenant_row)
-      refute RankingPriors.usage_measurable?(@canonical)
-    end
-
-    test "a row with NO tenant_id key at all fails CLOSED" do
-      # A lane that forgets to project `tenant_id` has its rows imputed at the pool median
-      # rather than read as zero usage — a lost boost for a heavily-read row, never a rank
-      # taken from an unmeasurable one on a number it was never measured on.
-      refute RankingPriors.usage_measurable?(%{id: "x", read_day_count: 30})
-      refute RankingPriors.usage_measurable?(nil)
-    end
-
-    test "the default factor is the MEDIAN of the pool's measured factors" do
+    test "two articles with ZERO recorded usage score the same, whatever their scope" do
+      # THE defect this block replaces. A system canonical is structurally unmeasurable —
+      # `read_day_count` is one column on a row several tenants read, and the nightly
+      # stamp's write predicate is tenant-scoped — so "unmeasurable" and "system canonical"
+      # name the SAME set. Imputing anything other than the unread value therefore separates
+      # two zero-usage articles by how the document got into the corpus, which is what the
+      # note above `@kill_tag` forbids. The median imputation this replaces gave the
+      # canonical 1.0362 against the unread tenant row's 1.0 at strength 0.1.
       unread = %{id: "u", tenant_id: Ecto.UUID.generate(), read_day_count: nil}
-      middling = %{id: "m", tenant_id: Ecto.UUID.generate(), read_day_count: 5}
+      opts = pool_opts([@tenant_row, unread, @canonical])
 
-      expected =
-        RankingPriors.importance_factor(middling, 0.1, @importance_floor, @importance_ceiling)
+      assert RankingPriors.multiplier(@canonical, opts) ==
+               RankingPriors.multiplier(unread, opts)
 
-      assert RankingPriors.pool_importance_default_factor(
-               [@tenant_row, middling, unread],
-               0.1,
-               @importance_floor,
-               @importance_ceiling
-             ) == expected
-
-      # Strictly between the pool's extremes, which is the whole point of imputing it.
-      assert expected >
-               RankingPriors.importance_factor(
-                 unread,
-                 0.1,
-                 @importance_floor,
-                 @importance_ceiling
-               )
-
-      assert expected <
-               RankingPriors.importance_factor(
-                 @tenant_row,
-                 0.1,
-                 @importance_floor,
-                 @importance_ceiling
-               )
+      assert RankingPriors.multiplier(@canonical, opts) == 1.0
     end
 
-    test "a pool with NO measurable row, and a zero strength, both give exactly 1.0" do
-      assert RankingPriors.pool_importance_default_factor(
-               [],
-               0.1,
-               @importance_floor,
-               @importance_ceiling
-             ) == 1.0
-
-      assert RankingPriors.pool_importance_default_factor(
-               [@canonical],
-               0.1,
-               @importance_floor,
-               @importance_ceiling
-             ) == 1.0
-
-      assert RankingPriors.pool_importance_default_factor(
-               [@tenant_row],
-               0.0,
-               @importance_floor,
-               @importance_ceiling
-             ) == 1.0
+    test "a row with NO tenant_id key at all is also exactly 1.0" do
+      # Nothing reads scope any more, so a lane that omits `tenant_id` cannot change a score.
+      opts = pool_opts([])
+      assert RankingPriors.multiplier(%{id: "x", read_day_count: nil}, opts) == 1.0
     end
 
-    test "ONE canonical does NOT disable the prior for the rest of the pool" do
-      # The round-1 shape returned 0.0 for any pool holding an unmeasurable row, which on
-      # this corpus (the shared canon is the bulk of it) disabled the prior product-wide and
-      # made it depend on which lane served. The measured rows must keep their factors.
-      pool = [@tenant_row, @canonical]
-
-      assert RankingPriors.pool_importance_default_factor(
-               pool,
-               0.1,
-               @importance_floor,
-               @importance_ceiling
-             ) > 1.0
-
-      assert RankingPriors.multiplier(@tenant_row, pool_opts(pool)) >
-               RankingPriors.multiplier(
-                 %{id: "u", tenant_id: Ecto.UUID.generate(), read_day_count: nil},
-                 pool_opts(pool)
-               )
-    end
-
-    test "the canonical is scored at the median: it beats an unread row and loses to a used one" do
-      # The defect this replaced: at equal fused relevance a heavily-read tenant note beat a
-      # canonical nobody could measure, because the canonical's NULL read as zero usage. It
-      # now sits at the centre of the measured population instead of at its floor.
+    test "a USED row still beats both, which is the prior doing its job" do
       unread = %{id: "u", tenant_id: Ecto.UUID.generate(), read_day_count: nil}
-      pool = [@tenant_row, unread, @canonical]
-      opts = pool_opts(pool)
+      opts = pool_opts([@tenant_row, unread, @canonical])
 
       assert RankingPriors.multiplier(@tenant_row, opts) >
                RankingPriors.multiplier(@canonical, opts)
-
-      assert RankingPriors.multiplier(@canonical, opts) >
-               RankingPriors.multiplier(unread, opts)
     end
 
-    test "the measured rows' order is the SAME whether or not the canonical is in the pool" do
-      # The lane-dependence guard: the keyword lane can never hold a canonical and the
-      # side-table semantic lane can, so anything that let pool membership move a measured
-      # row's factor made the ordering depend on an embedding outage.
+    test "the pool cannot move any row's factor — importance is per-ROW" do
+      # The lane-dependence guard, kept from the block this replaces: the keyword lane can
+      # never hold a canonical and the side-table semantic lane can, so anything that let
+      # pool membership move a row's factor made ordering depend on an embedding outage.
+      # With the imputation gone this holds by construction rather than by arithmetic.
       unread = %{id: "u", tenant_id: Ecto.UUID.generate(), read_day_count: nil}
       without = pool_opts([@tenant_row, unread])
       with_canonical = pool_opts([@tenant_row, unread, @canonical])
@@ -892,6 +810,29 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
         assert RankingPriors.multiplier(row, without) ==
                  RankingPriors.multiplier(row, with_canonical)
       end
+    end
+
+    test "the factor reads USAGE and never scope — a canonical with a count is boosted" do
+      # The property that makes this legal, asserted directly: scope is not an input. A
+      # canonical carrying a recorded count gets exactly what a tenant row with that count
+      # gets. Re-introduce any scope test and this goes red.
+      count = 30
+      read_canonical = %{id: "rc", tenant_id: nil, read_day_count: count}
+      tenant_same = %{id: "ts", tenant_id: Ecto.UUID.generate(), read_day_count: count}
+      opts = pool_opts([read_canonical, tenant_same])
+
+      assert RankingPriors.multiplier(read_canonical, opts) ==
+               RankingPriors.multiplier(tenant_same, opts)
+
+      assert RankingPriors.multiplier(read_canonical, opts) > 1.0
+    end
+
+    test "the accepted cost: in practice a canonical has no count, so it sits at 1.0" do
+      # The canon has no per-tenant usage to read (one column, several tenants, a
+      # tenant-scoped stamp), so a canonical is unread as far as this prior can tell and
+      # loses a near-tie to a used tenant row. That is a DATA gap, not a ranking weight, and
+      # the fix is to make canonicals measurable per tenant — never to impute a value.
+      assert RankingPriors.multiplier(@canonical, pool_opts([@canonical])) == 1.0
     end
   end
 

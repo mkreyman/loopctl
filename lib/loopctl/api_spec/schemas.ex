@@ -4380,9 +4380,10 @@ defmodule Loopctl.ApiSpec.Schemas do
                   "unused one down the ORDER relative to it, by at most the 1.1 ceiling. " <>
                   "`0.0` means importance played no part — disabled, which is the shipped " <>
                   "default, or configured to zero. An article whose usage cannot be " <>
-                  "measured (a shared system canonical) is scored at the pool's median " <>
-                  "measured factor rather than at the floor, which does not change this " <>
-                  "weight. `null` only when the knowledge half produced no meta at all."
+                  "measured (a shared system canonical) is scored at exactly 1.0 like any " <>
+                  "unused article — scope is not an input to this factor, which does not " <>
+                  "change this weight. `null` only when the knowledge half produced no " <>
+                  "meta at all."
             },
             recall_id: %Schema{
               type: :string,

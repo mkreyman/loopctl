@@ -324,9 +324,8 @@ defmodule LoopctlWeb.KnowledgeSearchController do
                        "played no part in this ordering — the prior is disabled (which is " <>
                        "the shipped default) or its strength is configured to zero. An " <>
                        "article whose usage cannot be measured (a shared system canonical) " <>
-                       "is scored at the pool's median measured factor, so it neither wins " <>
-                       "nor loses a near-tie against a typical measured article; that does " <>
-                       "not change this weight."
+                       "is scored at exactly 1.0 like any unused article — scope is not an " <>
+                       "input to this factor; that does not change this weight."
                  },
                  remediation: %OpenApiSpex.Schema{
                    type: :object,

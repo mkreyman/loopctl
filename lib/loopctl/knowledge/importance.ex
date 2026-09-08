@@ -54,17 +54,18 @@ defmodule Loopctl.Knowledge.Importance do
   tenant's usage may decide a shared row's rank for the others.
 
   A canonical therefore stays NULL, and NULL is neutral in SCORE but not in RANK. That is a
-  ranking defect on its own and is NOT fixed here: a pool that mixes tenant rows (measured)
-  with canonicals (structurally unmeasurable) would be ranked on a number that means
-  different things per row — the counted-vs-uncounted asymmetry #569/#572 each fixed once,
-  with the direction reversed. It is handled on the READ side instead, by
-  `RankingPriors.pool_importance_default_factor/4`: a candidate this stamp could not have
-  reached is scored at the MEDIAN factor of the pool's measured candidates, so it is placed
-  at the centre of the population it is being ranked against rather than at its floor. Fix it
-  properly by making canonicals MEASURABLE per tenant (a per-(tenant, article) usage row),
-  never by stamping the shared column, and never by turning the prior off for the whole pool
-  — the canon is the bulk of this corpus, so that is a product-wide disablement wearing a
-  narrow gate's clothes.
+  ranking defect on its own and is NOT fixed here, and it is deliberately not fixed on the
+  READ side either. The read side scores a canonical at exactly 1.0, like any article with no
+  recorded usage, because "unmeasurable" and "system canonical" are the SAME set — the stamp's
+  write predicate is what defines both — so any other value separates two zero-usage articles
+  by how the document got into the corpus, which the note above `RankingPriors`'s `@kill_tag`
+  forbids. A median imputation was tried and removed for exactly that: measured at strength
+  0.1 it gave an unread canonical 1.0362 against an unread tenant row's 1.0.
+
+  The residue is that a heavily-read canonical cannot be boosted either, so at equal relevance
+  it loses a near-tie to a used tenant row. Fix that by making canonicals MEASURABLE per
+  tenant (a per-(tenant, article) usage row) — never by stamping the shared column, never by
+  imputing a value on the read side, and never by turning the prior off for the whole pool.
 
   ## Isolation
 
