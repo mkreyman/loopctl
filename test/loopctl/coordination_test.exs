@@ -1972,7 +1972,10 @@ defmodule Loopctl.CoordinationTest do
       # owner is an idempotent owner re-claim (returns the same claim), never a
       # second open claim. A genuine peer racer would get {:error, :already_claimed}.
       assert {:ok, claim1} = Coordination.claim(tenant.id, agent_id, project.id, ref)
-      assert {:ok, claim2} = Coordination.claim(tenant.id, agent_id, project.id, ref)
+
+      assert {:ok, claim2, :already_held} =
+               Coordination.claim(tenant.id, agent_id, project.id, ref)
+
       assert claim2.id == claim1.id
 
       # Exactly one pointer post and exactly one open claim survived the double-fire.

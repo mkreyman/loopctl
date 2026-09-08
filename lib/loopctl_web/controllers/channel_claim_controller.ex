@@ -8,8 +8,11 @@ defmodule LoopctlWeb.ChannelClaimController do
     unique index wins (201); every concurrent loser gets a distinct
     `409 already_claimed` so it learns another agent owns the ref and moves on.
   - `POST /api/v1/channel/claims/done` — agent+, mark the caller's OWN claim done.
+    Refuses a claim stamped with a different session (`409 claim_session_mismatch`)
+    unless `force: true`.
   - `POST /api/v1/channel/claims/release` — agent+, DELETE the caller's OWN claim so
-    the ref reopens for the next racer.
+    the ref reopens for the next racer. Same session refusal — this is the path that
+    used to silently delete a peer session's live claim.
   - `GET /api/v1/channel/claims` — agent+, the channel's UNSWEPT claims, so a session
     can see "this ref is taken, by this agent, until this time" WITHOUT writing.
 
@@ -19,10 +22,14 @@ defmodule LoopctlWeb.ChannelClaimController do
   returns the existing claim rather than a 409. Combined with a fleet whose sessions
   all authenticate as ONE `agent_id` — which is this deployment's actual shape — that
   makes "claim it and see what happens" a destructive probe. A probe issued while a
-  PEER SESSION holds the ref hands back that peer's claim as though it were the
-  prober's own, and the `release` that tidies the probe up DELETES it. The peer keeps
-  working a handoff the bus has already reopened, and a second machine picks it up.
+  PEER SESSION held the ref handed back that peer's claim as though it were the
+  prober's own, and the `release` that tidied the probe up DELETED it. The peer kept
+  working a handoff the bus had already reopened, and a second machine picked it up.
   #707 recorded exactly that sequence.
+
+  #779 marks the idempotent return `already_held` and refuses that `release` — but the
+  probe is still a WRITE that takes a free ref and spends the caller's claim budget,
+  and both guards are advisory. Read; do not claim to find out.
 
   `GET /channel/claims` exists so nobody has to. It answers the same question a `409`
   does and writes nothing.
@@ -30,14 +37,28 @@ defmodule LoopctlWeb.ChannelClaimController do
   ## What the owner scope actually enforces
 
   `done` and `release` are scoped to `(tenant_id, project_id, claimant_agent_id, ref)`.
-  `tenant_id` and `claimant_agent_id` are server-stamped and are real trust boundaries;
-  **there is no session dimension**, so two sessions sharing one agent key are NOT
-  isolated from each other — either can `done` or `release` the other's claim, and the
-  server cannot tell them apart. The enforced guarantee is "scoped to your AGENT, not
-  to your session" — the same posture `ChannelLockController` documents for soft-locks
-  and `DELETE /channel/posts/:id` uses for posts. Do not cite it as per-session
-  isolation. The abandoned-lease sweep, not the release path, is what protects a claim
-  whose session died.
+  `tenant_id` and `claimant_agent_id` are server-stamped and are the real trust
+  boundaries. **The session dimension on top of them is ADVISORY** (issue #779): a
+  claim stamped with a different `claimed_by_session` is refused with
+  `409 claim_session_mismatch`, which stops the ACCIDENT that KB `07f5e839` recorded —
+  a peer session's `release` deleting a live claim — and stops nothing else. A caller
+  may clear it with `force: true`, and a caller that wants to lie may send the peer's
+  session id, because `session_id` is client-supplied and spoofable in exactly the way
+  `to_host` is. Never cite it as an authorization boundary, and never make it one:
+  tenant + project membership + the claimant agent are what is enforced.
+
+  The override is not a loophole, it is the requirement. A session that crashes and
+  relaunches gets a NEW session id; without `force` it could not complete its own work
+  until the lease ran out, which is the failure KB `9c3e14a1` warns a session-scoped
+  ownership model would cause. One explicit extra call is the price instead.
+
+  ## Idempotent re-claim now says so (issue #779)
+
+  `create` answers a FRESH claim with `201` and `created: true`, and an idempotent
+  owner re-claim with `200`, `created: false`, `already_held: true` and the row's
+  ORIGINAL `claimed_at`. Under a shared `agent_id` the idempotent branch is also what a
+  PEER SESSION's live claim comes back as — two machines each read a bare success as
+  "one claim, mine" and shipped duplicate PRs (KB `b447b16b`).
 
   ## The READ is tenant-scoped, not membership-gated
 
@@ -64,6 +85,13 @@ defmodule LoopctlWeb.ChannelClaimController do
   error the `FallbackController` renders as one shared shape — no existence oracle.
   `claim` maps a missing/cross-tenant/cross-project project to a 422; `done`/
   `release` map a non-owner/cross-tenant/cross-project/missing claim to a 404.
+
+  `409 claim_session_mismatch` adds NO oracle: it is reachable only AFTER the
+  `(tenant_id, project_id, claimant_agent_id, ref)` owner fetch has matched a row, so
+  the caller is already the claimant agent in the owning tenant and project — and
+  `GET /channel/claims` would have shown it that same row anyway. A foreign,
+  cross-tenant or nonexistent claim still 404s byte-identically, before the session
+  guard runs.
   """
 
   use LoopctlWeb, :controller
@@ -141,18 +169,45 @@ defmodule LoopctlWeb.ChannelClaimController do
   POST /api/v1/channel/claims
 
   INSERT-to-claim a handoff `ref`. Requires agent+ role and an agent identity.
+
+  `201 created: true` is a FRESH claim. `200 already_held: true` is the idempotent
+  owner re-claim — the row already existed, its `claimed_at` is the ORIGINAL one, and
+  under a shared `agent_id` it may be a PEER SESSION's live claim. Optional
+  `session_id`/`host` stamp the advisory discriminator; `same_session` in the response
+  compares the row's stamp against the one you sent (`null` when either is absent).
   """
   def create(conn, params) do
     with_agent(conn, fn tenant_id, agent_id, role ->
       case Coordination.claim(tenant_id, agent_id, params["project_id"], params["ref"],
              role: role,
              lease_seconds: params["lease_seconds"],
+             session_id: params["session_id"],
+             host: params["host"],
              audit: AuditContext.from_conn(conn)
            ) do
         {:ok, claim} ->
           conn
           |> put_status(:created)
-          |> json(%{claim: claim})
+          |> json(%{
+            claim: claim,
+            created: true,
+            already_held: false,
+            same_session: same_session(claim, params["session_id"])
+          })
+
+        # The row already existed and belongs to this AGENT — which on a fleet sharing
+        # one agent_id includes a PEER SESSION's live claim. 200, not 201, because
+        # nothing was created, and `already_held` says so in the body for a caller that
+        # branches on the payload rather than the status (#779).
+        {:ok, claim, :already_held} ->
+          conn
+          |> put_status(:ok)
+          |> json(%{
+            claim: claim,
+            created: false,
+            already_held: true,
+            same_session: same_session(claim, params["session_id"])
+          })
 
         {:error, :already_claimed} ->
           # The loser of the INSERT-to-claim race. A DISTINCT 409 (via the
@@ -194,6 +249,14 @@ defmodule LoopctlWeb.ChannelClaimController do
 
   Marks the caller's OWN claim on `ref` done. A non-owner / cross-tenant /
   cross-project / missing claim returns a byte-identical 404 (no oracle).
+
+  Optional `session_id` (advisory, #779) and `force`. `session_id` is held to the SAME
+  rules the claim path applies to `claimed_by_session` — a string, at most
+  `ChannelClaim.session_max_length/0` bytes BEFORE any whitespace normalisation, no NUL
+  byte, valid UTF-8, no credential shape — because it is logged and written into the
+  append-only audit entry: a violation is a `422` whose `details` are keyed on
+  `session_id` (the parameter you sent), and a credential shape also raises
+  `[:loopctl, :coordination, :secret_blocked]`.
   """
   def done(conn, params) do
     with_agent(conn, fn tenant_id, agent_id, _role ->
@@ -202,10 +265,13 @@ defmodule LoopctlWeb.ChannelClaimController do
              agent_id,
              params["project_id"],
              params["ref"],
-             AuditContext.from_conn(conn)
+             AuditContext.from_conn(conn),
+             session_id: params["session_id"],
+             force: truthy?(params["force"])
            ) do
         {:ok, claim} -> json(conn, %{claim: claim})
         {:error, :not_found} -> {:error, :not_found}
+        {:error, :claim_session_mismatch} -> {:error, :claim_session_mismatch}
         {:error, %Ecto.Changeset{} = changeset} -> {:error, changeset}
       end
     end)
@@ -215,7 +281,9 @@ defmodule LoopctlWeb.ChannelClaimController do
   POST /api/v1/channel/claims/release
 
   DELETES the caller's OWN claim on `ref` so it reopens for the next racer. Same
-  oracle-safe 404 as `done` for a non-owner / cross-tenant / missing claim.
+  oracle-safe 404 as `done` for a non-owner / cross-tenant / missing claim, and the
+  same `422` on a `session_id` that is over the cap, carries a NUL byte, is not valid
+  UTF-8, or looks like a credential.
   """
   def release(conn, params) do
     with_agent(conn, fn tenant_id, agent_id, _role ->
@@ -224,10 +292,14 @@ defmodule LoopctlWeb.ChannelClaimController do
              agent_id,
              params["project_id"],
              params["ref"],
-             AuditContext.from_conn(conn)
+             AuditContext.from_conn(conn),
+             session_id: params["session_id"],
+             force: truthy?(params["force"])
            ) do
         {:ok, claim} -> json(conn, %{claim: claim})
         {:error, :not_found} -> {:error, :not_found}
+        {:error, :already_claimed} -> {:error, :already_claimed}
+        {:error, :claim_session_mismatch} -> {:error, :claim_session_mismatch}
         {:error, %Ecto.Changeset{} = changeset} -> {:error, changeset}
       end
     end)
@@ -236,7 +308,7 @@ defmodule LoopctlWeb.ChannelClaimController do
   @doc """
   The channel's unswept claims — a read, so nobody has to probe by claiming (#707).
 
-  `GET /api/v1/channel/claims?project_id=<uuid>[&ref=<anchor>][&limit=<n>]`
+  `GET /api/v1/channel/claims?project_id=<uuid>[&ref=<anchor>][&limit=<n>][&session_id=<id>]`
 
   A ref is listed while a row HOLDS its `(tenant, project, ref)` slot: DONE, still within
   its lease, or expired and not yet swept. So an empty `claims` array means no row holds
@@ -255,6 +327,14 @@ defmodule LoopctlWeb.ChannelClaimController do
   no-oracle posture as `GET /channel/locks`. A MISSING or non-UUID `project_id`, and a
   malformed `ref`, are 422 instead: both are client faults decidable without touching a
   row, and answering either with an empty page would tell the caller the ref is free.
+
+  Each row carries the advisory `claimed_by_session` / `claimed_by_host` (#779) and,
+  when you pass your own `session_id`, a server-derived `same_session`. That is the
+  answer to "is this claim mine" that `claimant_agent_id` cannot give on a fleet
+  sharing one agent key — `null` means undiscriminable (one side is unstamped), not
+  "someone else's". `session_id` is advisory here exactly as it is on the write paths:
+  it changes what you are TOLD, never what you are allowed to do, and this read is
+  tenant-scoped either way.
 
   DONE rows are ordered LAST, so a truncated page drops finished rows before it drops
   one that still holds a ref — but `meta.overflow: true` still invalidates an
@@ -308,7 +388,7 @@ defmodule LoopctlWeb.ChannelClaimController do
     now = DateTime.utc_now()
 
     json(conn, %{
-      claims: Enum.map(claims, &claim_json(&1, now)),
+      claims: Enum.map(claims, &claim_json(&1, now, params["session_id"])),
       meta: %{
         count: length(claims),
         limit: limit,
@@ -322,7 +402,7 @@ defmodule LoopctlWeb.ChannelClaimController do
   # struct). Projected explicitly anyway so a future column added to the schema is not
   # silently published by a LIST read, which is a much wider audience than the
   # single-row write responses.
-  defp claim_json(claim, now) do
+  defp claim_json(claim, now, caller_session) do
     %{
       id: claim.id,
       ref: claim.ref,
@@ -330,6 +410,15 @@ defmodule LoopctlWeb.ChannelClaimController do
       claimed_at: claim.claimed_at,
       lease_expires_at: claim.lease_expires_at,
       done_at: claim.done_at,
+      # The ADVISORY session/host discriminator (#779). `claimant_agent_id` cannot tell
+      # two sessions apart when the fleet shares one agent key, which is exactly when a
+      # reader most needs to know whose claim this is. Spoofable — a hint, never proof.
+      claimed_by_session: claim.claimed_by_session,
+      claimed_by_host: claim.claimed_by_host,
+      # Server-derived so the reader does not have to know its own session id to answer
+      # "is this mine". `null` when either side is unstamped, i.e. UNDISCRIMINABLE —
+      # never `false`, which would read as "definitely a peer's".
+      same_session: same_session(claim, caller_session),
       # Derived so a caller never has to re-implement the lifecycle predicates and get
       # them subtly different from the ones the server enforces. `done` (terminal) or a
       # future lease is what EXCLUDES the handoff; `expired` is the row that no longer
@@ -340,6 +429,23 @@ defmodule LoopctlWeb.ChannelClaimController do
       expired: is_nil(claim.done_at) and DateTime.compare(claim.lease_expires_at, now) != :gt
     }
   end
+
+  # `true` only when BOTH sides carry a session and they match; `false` only when both
+  # carry one and they differ; `nil` when either is absent. Three-valued on purpose: a
+  # pre-#779 row and a caller that sent no session are UNKNOWN, and collapsing unknown
+  # into `false` would tell a session its own claim belongs to someone else.
+  defp same_session(%ChannelClaim{claimed_by_session: stamped}, caller)
+       when is_binary(stamped) and is_binary(caller),
+       do: stamped == caller
+
+  defp same_session(_claim, _caller), do: nil
+
+  # `force` arrives as JSON `true` or, from a form/query client, the string "true".
+  # NOTHING else is truthy — in particular not "false", which `if params["force"]`
+  # would have accepted as a bypass of the whole session guard.
+  defp truthy?(true), do: true
+  defp truthy?("true"), do: true
+  defp truthy?(_), do: false
 
   # A claim always requires an attributed agent identity (channel_claims
   # .claimant_agent_id is NOT NULL). A key with no agent identity gets a 403 before
