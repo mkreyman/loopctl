@@ -11,6 +11,7 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
   alias Loopctl.AdminRepo
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Article
+  alias Loopctl.Knowledge.RankingPriors
 
   @now ~U[2026-07-21 00:00:00Z]
 
@@ -37,7 +38,9 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
     {1, _} =
       AdminRepo.update_all(
         from(a in Article, where: a.tenant_id == ^tenant_id and a.id == ^id),
-        set: [updated_at: ts, inserted_at: ts]
+        # `content_changed_at` is what the recency prior actually reads (#791);
+        # `updated_at`/`inserted_at` are aged with it so the row is coherent.
+        set: [updated_at: ts, inserted_at: ts, content_changed_at: ts]
       )
 
     :ok
@@ -289,6 +292,99 @@ defmodule Loopctl.KnowledgeCombinedPriorsTest do
 
       assert length(results) == 1
       assert Enum.all?(results, &(&1.tenant_id == tenant_a.id))
+    end
+
+    test "the recency prior orders tenant A's own rows and never pools tenant B's" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+
+      # A near-tie INSIDE tenant A, so the assertion below is decided by the recency prior
+      # (the aged RRF-favoured row must lose its id tiebreak) and not by the tenant
+      # predicate alone — which is all the isolation test above can distinguish.
+      {smaller, larger} = near_tie_pair(tenant_a.id)
+      set_age(tenant_a.id, smaller.id, 400)
+      set_age(tenant_a.id, larger.id, 0)
+
+      b = create_article(tenant_b.id, %{title: "Tenant B fresh note", body: @body})
+      set_age(tenant_b.id, b.id, 0)
+
+      expect_query_embedding()
+      results = search(tenant_a.id, now: @now, recency_weight: 0.3)
+
+      assert ids(results) == [larger.id, smaller.id]
+      refute b.id in ids(results)
+    end
+  end
+
+  describe "#791 recency measures AUTHORED age, so a re-embed cannot refresh a document" do
+    test "a re-embed does not move the recency factor" do
+      tenant = fixture(:tenant)
+      article = create_article(tenant.id, %{title: "Authored age note", body: @body})
+
+      # Age the CONTENT by 400 days. Without this the factor is ~1.0 on either field and
+      # the equality below would hold vacuously — the aging is what gives it something to
+      # be wrong about.
+      set_age(tenant.id, article.id, 400)
+      before = AdminRepo.get!(Article, article.id)
+
+      factor_before =
+        RankingPriors.recency_factor(RankingPriors.recency_timestamp(before), @now, 0.3)
+
+      {:ok, _} = Knowledge.update_embedding(tenant.id, article.id, query_vector())
+
+      reloaded = AdminRepo.get!(Article, article.id)
+
+      # Precondition, not decoration: the re-embed must genuinely have bumped `updated_at`,
+      # or this test proves nothing about the field the prior stopped reading.
+      assert DateTime.compare(reloaded.updated_at, before.updated_at) == :gt
+      assert reloaded.content_changed_at == before.content_changed_at
+
+      factor_after =
+        RankingPriors.recency_factor(RankingPriors.recency_timestamp(reloaded), @now, 0.3)
+
+      assert factor_after == factor_before
+
+      # Positive control: had the prior stayed on `updated_at`, the re-embed WOULD have
+      # moved it — by a lot. This is the defect #791 closes, measured.
+      on_updated_at = RankingPriors.recency_factor(reloaded.updated_at, @now, 0.3)
+      refute_in_delta on_updated_at, factor_before, 0.1
+    end
+
+    test "a re-embed of the stale doc does not flip the fused order back" do
+      tenant = fixture(:tenant)
+      {smaller, larger} = near_tie_pair(tenant.id)
+
+      # The STALE doc is the one the id tiebreak favours, so recency is the only thing
+      # holding the fresh doc on top — exactly the ordering a re-embed used to undo.
+      set_age(tenant.id, smaller.id, 400)
+      set_age(tenant.id, larger.id, 0)
+
+      expect_query_embedding()
+      assert ids(search(tenant.id, now: @now, recency_weight: 0.3)) == [larger.id, smaller.id]
+
+      {:ok, _} = Knowledge.update_embedding(tenant.id, smaller.id, query_vector())
+
+      expect_query_embedding()
+      assert ids(search(tenant.id, now: @now, recency_weight: 0.3)) == [larger.id, smaller.id]
+    end
+
+    test "a null content_changed_at falls back to updated_at, exactly as before #791" do
+      tenant = fixture(:tenant)
+      {smaller, larger} = near_tie_pair(tenant.id)
+
+      set_age(tenant.id, smaller.id, 400)
+      set_age(tenant.id, larger.id, 0)
+
+      # A row the backfill could not establish an authored date for. It must keep the
+      # pre-#791 behaviour — ranked on `updated_at` — never lose its recency prior.
+      {1, _} =
+        AdminRepo.update_all(
+          from(a in Article, where: a.tenant_id == ^tenant.id and a.id == ^smaller.id),
+          set: [content_changed_at: nil]
+        )
+
+      expect_query_embedding()
+      assert ids(search(tenant.id, now: @now, recency_weight: 0.3)) == [larger.id, smaller.id]
     end
   end
 end

@@ -44,7 +44,10 @@ defmodule LoopctlWeb.KnowledgeLintController do
         in: :query,
         type: :integer,
         description:
-          "Number of days without update before an article is considered stale (default 90)",
+          "Number of days without a CONTENT change before an article is considered stale " <>
+            "(default 90). Measured on content_changed_at with a fallback to updated_at, so a " <>
+            "re-embed, a content-hash refresh, a link write or a suppression flip does not " <>
+            "reset an article's age here.",
         required: false
       ],
       min_coverage: [
@@ -71,7 +74,13 @@ defmodule LoopctlWeb.KnowledgeLintController do
            properties: %{
              data: %OpenApiSpex.Schema{
                type: :object,
-               description: "Lint findings grouped by issue type"
+               description:
+                 "Lint findings grouped by issue type. In stale_articles, last_updated " <>
+                   "and days_since_update are measured on CONTENT-change time " <>
+                   "(content_changed_at, falling back to updated_at), NOT on the row's " <>
+                   "last write, so an article re-embedded today can legitimately report " <>
+                   "a last_updated older than the updated_at returned by " <>
+                   "GET /knowledge/:id. The names are kept for backward compatibility."
              },
              summary: %OpenApiSpex.Schema{
                type: :object,

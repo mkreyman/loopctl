@@ -604,7 +604,12 @@ defmodule Loopctl.Knowledge.RetrievalEval do
           metadata: %{"retrieval_eval" => true, "doc_id" => doc.doc_id},
           embedding: Pgvector.new(embedding_for_doc(doc)),
           inserted_at: ts,
-          updated_at: ts
+          updated_at: ts,
+          # The recency prior reads `content_changed_at` (#791), so a doc seeded with an
+          # `age_days` must carry the AGED value here too. Leaving it to the column's
+          # `DEFAULT now()` would make every seeded doc equally fresh and silently
+          # disable the recency axis of the golden-question eval.
+          content_changed_at: ts
         }
       end)
 

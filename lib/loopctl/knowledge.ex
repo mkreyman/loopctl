@@ -1516,9 +1516,11 @@ defmodule Loopctl.Knowledge do
 
   The index includes only metadata fields (no body, embedding, or metadata)
   and groups the current page of results by category. Within the full filtered
-  set, articles are ordered deterministically by `category` ascending,
-  `updated_at` descending, then `id` ascending — so `offset`/`limit`
-  pagination reaches every article without skipping or repeating.
+  set, articles are ordered deterministically by `category` ascending, authored age
+  (`coalesce(content_changed_at, updated_at)`, #791 — not the field a re-embed bumps)
+  descending, then `id` ascending — so `offset`/`limit` pagination reaches every
+  article without skipping or repeating. Note the rows still EMIT `updated_at`, which
+  is therefore not the key they are sorted on.
 
   Unlike a relevance search, this endpoint honors `category`/`tags` filters
   and real pagination. `meta.categories` reports the per-category counts over
@@ -1615,7 +1617,13 @@ defmodule Loopctl.Knowledge do
         suppressed_by: a.suppressed_by,
         suppression_reason: a.suppression_reason
       })
-      |> order_by([a], asc: a.category, desc: a.updated_at, asc: a.id)
+      # Freshest-first within a category is a RECENCY purpose, so it reads authored age
+      # (#791) rather than `updated_at`, which a re-embed or a suppression flip bumps.
+      |> order_by([a],
+        asc: a.category,
+        desc: coalesce(a.content_changed_at, a.updated_at),
+        asc: a.id
+      )
       |> limit(^limit)
       |> offset(^offset)
       |> AdminRepo.all()
@@ -2126,8 +2134,13 @@ defmodule Loopctl.Knowledge do
         |> Enum.map(fn article ->
           relevance = find_relevance_score(search.results, article.id)
           # Single source of truth for the exp(-age_days/30) decay — shared with the #471
-          # search_combined priors (RankingPriors.recency_decay/2).
-          recency_score = RankingPriors.recency_decay(article.updated_at, now)
+          # search_combined priors (RankingPriors.recency_decay/2) — and for the FIELD it
+          # measures from (RankingPriors.recency_timestamp/1, #791): authored age
+          # (`content_changed_at`), falling back to `updated_at` only when that is null.
+          # Reading `article.updated_at` here would put this surface back on the field a
+          # re-embed bumps while search stayed on the right one.
+          recency_score =
+            RankingPriors.recency_decay(RankingPriors.recency_timestamp(article), now)
 
           # Demote MOC hubs and dead doctrine HERE too (#654 follow-up). This surface
           # re-ranks on its own `combined_score` and never sees `search_combined`'s fused
@@ -2341,6 +2354,12 @@ defmodule Loopctl.Knowledge do
               idempotency_key: a.idempotency_key,
               inserted_at: a.inserted_at,
               updated_at: a.updated_at,
+              # The recency prior's field (#791). RankingPriors.recency_timestamp/1 falls
+              # back to `updated_at`, so a lane that omits this does not crash -- it
+              # silently ranks its lane-ONLY candidates on last-MUTATION time while every
+              # other lane uses authored age, which is the invisible half-fix the
+              # idempotency_key note above describes.
+              content_changed_at: a.content_changed_at,
               relevance_score:
                 fragment(
                   "ts_rank_cd(search_vector, websearch_to_tsquery(?::text::regconfig, ?))",
@@ -2414,8 +2433,9 @@ defmodule Loopctl.Knowledge do
   This is the query-less companion to `search_keyword/3`: it returns the same
   result shape (`%{results: [...], meta: %{total_count, limit, offset}}`) but
   performs no `tsquery` matching, has no relevance score or snippet, and orders
-  deterministically by `updated_at` descending then `id` ascending so
-  `offset`/`limit` pagination reaches every matching article exactly once.
+  deterministically by authored age descending (`coalesce(content_changed_at,
+  updated_at)` — the recency field, #791, not the one a re-embed bumps) then `id`
+  ascending so `offset`/`limit` pagination reaches every matching article exactly once.
 
   ## Parameters
 
@@ -2461,7 +2481,10 @@ defmodule Loopctl.Knowledge do
         inserted_at: a.inserted_at,
         updated_at: a.updated_at
       })
-      |> order_by([a], desc: a.updated_at, asc: a.id)
+      # Recency order is AUTHORED age (#791): this endpoint documents itself as
+      # "ordered by recency", and on `updated_at` a bulk re-embed reordered the whole
+      # listing into embedding-write order.
+      |> order_by([a], desc: coalesce(a.content_changed_at, a.updated_at), asc: a.id)
       |> limit(^limit)
       |> offset(^offset)
 
@@ -3843,8 +3866,16 @@ defmodule Loopctl.Knowledge do
       # AC-31.1.4: never surface an article that is in an OPEN potential_conflict.
       where: not exists(open_conflict_subquery(tenant_id)),
       # Tenant-own-first: tenant rows (tenant_id NOT NULL, so `IS NULL` = false)
-      # sort before system canonicals (tenant_id NULL, `IS NULL` = true), then freshest.
-      order_by: [asc: fragment("? IS NULL", a.tenant_id), desc: a.updated_at, asc: a.id]
+      # sort before system canonicals (tenant_id NULL, `IS NULL` = true), then freshest —
+      # freshest by AUTHORED age (#791), the same `coalesce` the priors resolve. This
+      # ordering is not cosmetic: `maybe_limit_curated/2` truncates on it, so on the ONE
+      # lane that outranks retrieval a bulk re-embed would otherwise pick which curated
+      # article is the governed answer.
+      order_by: [
+        asc: fragment("? IS NULL", a.tenant_id),
+        desc: coalesce(a.content_changed_at, a.updated_at),
+        asc: a.id
+      ]
     )
   end
 
@@ -9428,7 +9459,11 @@ defmodule Loopctl.Knowledge do
           # made the WHOLE semantic lane hub-blind once side-table reads are on.
           idempotency_key: a.idempotency_key,
           inserted_at: a.inserted_at,
-          updated_at: a.updated_at
+          updated_at: a.updated_at,
+          # The recency prior's field (#791) -- same lane-shape contract as
+          # idempotency_key above: omit it and this lane alone ranks on last-mutation
+          # time, with nothing raising to say so.
+          content_changed_at: a.content_changed_at
         }
       )
       |> apply_search_filters(status, opts)
@@ -9638,6 +9673,10 @@ defmodule Loopctl.Knowledge do
         idempotency_key: c.idempotency_key,
         inserted_at: c.inserted_at,
         updated_at: c.updated_at,
+        # The recency prior's field (#791). Same inner/outer projection contract as
+        # idempotency_key: the inner pool_select(:semantic) must project it for this
+        # outer select to read it.
+        content_changed_at: c.content_changed_at,
         similarity_score: c.similarity_score
       }
     )
@@ -10709,7 +10748,10 @@ defmodule Loopctl.Knowledge do
           status: a.status,
           tags: a.tags,
           inserted_at: a.inserted_at,
-          updated_at: a.updated_at
+          updated_at: a.updated_at,
+          # The recency prior's field (#791) -- a live ranking input on this lane exactly
+          # as idempotency_key is, and lost the same silent way if omitted.
+          content_changed_at: a.content_changed_at
         }
       )
 
@@ -13299,8 +13341,14 @@ defmodule Loopctl.Knowledge do
     # Base query for published articles scoped to tenant (+ optional project)
     base = published_base_query(tenant_id, project_id)
 
-    stale = find_stale_articles(base, stale_days)
-    orphans = find_orphan_articles(base, tenant_id, project_id)
+    # Stale is the one category whose predicate widens under #791 — "the body has not been
+    # revised in N days" only ever grows on a corpus that is being re-embedded rather than
+    # rewritten — so it counts in SQL and fetches only the page, instead of materialising
+    # the whole matching set into the BEAM the way `Enum.take/2` below does. The nightly
+    # worker on the one tenant with a real corpus has already died of a pool timeout inside
+    # this lint once (see `find_orphan_articles/3`).
+    {stale, stale_total} = find_stale_articles(base, stale_days, max_per_category)
+    {orphans, orphans_total} = find_orphan_articles(base, tenant_id, project_id, max_per_category)
     contradictions = find_contradiction_clusters(tenant_id, project_id)
     gaps = find_coverage_gaps(base, min_coverage)
     broken = find_broken_sources(base)
@@ -13309,23 +13357,24 @@ defmodule Loopctl.Knowledge do
 
     # Capture totals BEFORE capping so callers know the true size.
     total_per_category = %{
-      stale_articles: length(stale),
-      orphan_articles: length(orphans),
+      stale_articles: stale_total,
+      orphan_articles: orphans_total,
       contradiction_clusters: length(contradictions),
       coverage_gaps: length(gaps),
       broken_sources: length(broken)
     }
 
     truncated = %{
-      stale_articles: length(stale) > max_per_category,
-      orphan_articles: length(orphans) > max_per_category,
+      stale_articles: stale_total > max_per_category,
+      orphan_articles: orphans_total > max_per_category,
       contradiction_clusters: length(contradictions) > max_per_category,
       coverage_gaps: length(gaps) > max_per_category,
       broken_sources: length(broken) > max_per_category
     }
 
-    stale_capped = Enum.take(stale, max_per_category)
-    orphans_capped = Enum.take(orphans, max_per_category)
+    # Already capped in SQL — the LIMIT is the cap for these two categories.
+    stale_capped = stale
+    orphans_capped = orphans
     contradictions_capped = Enum.take(contradictions, max_per_category)
     gaps_capped = Enum.take(gaps, max_per_category)
     broken_capped = Enum.take(broken, max_per_category)
@@ -13337,12 +13386,16 @@ defmodule Loopctl.Knowledge do
         total_per_category.contradiction_clusters + total_per_category.coverage_gaps +
         total_per_category.broken_sources
 
-    all_issues = stale ++ orphans ++ contradictions ++ gaps ++ broken
-
+    # `stale` and `orphans` are SQL-capped PAGES, so counting the lists would make this
+    # histogram disagree with `total_issues` sitting beside it in the same summary map
+    # whenever either set exceeds `max_per_category`. Their findings all carry one severity
+    # apiece ("warning" / "info"), so their TRUE totals are added in directly.
     issues_by_severity =
-      all_issues
+      (contradictions ++ gaps ++ broken)
       |> Enum.group_by(& &1.severity)
       |> Map.new(fn {severity, items} -> {severity, length(items)} end)
+      |> add_severity_count("warning", stale_total)
+      |> add_severity_count("info", orphans_total)
 
     summary = %{
       total_articles: total_articles,
@@ -13400,36 +13453,79 @@ defmodule Loopctl.Knowledge do
     end
   end
 
-  defp find_stale_articles(base, stale_days) do
+  # Staleness is measured on CONTENT-CHANGE time, not last-mutation time (#791) — the same
+  # field and the same nil-fallback `RankingPriors.recency_timestamp/1` uses on the ranking
+  # path, expressed in SQL because this one runs in the database.
+  #
+  # `updated_at` alone made this report blind in exactly the case it exists for: a re-embed,
+  # a content-hash refresh, a link write or a suppression flip bumps the row without changing
+  # a word of the document, so one bulk re-embed marks the whole corpus freshly updated and
+  # the staleness lint then reports nothing for `stale_days` afterwards. An operator reading
+  # an empty report cannot tell that from a corpus with nothing stale in it.
+  #
+  # This DOES change what an operator sees, deliberately: "stale" now means the text has not
+  # been revisited, which is the question the report's own suggested_action ("review and
+  # update or archive") asks. An article re-embedded yesterday whose body last changed two
+  # years ago is stale, and used not to be reported.
+  #
+  # The migration deliberately backfills NOTHING, so every pre-#791 row coalesces to
+  # `updated_at` and its verdict here is identical to what it was; the report diverges only
+  # as real body edits stamp the column. The response keeps the names `last_updated` /
+  # `days_since_update` (renaming them breaks every existing reader), so their changed
+  # meaning is stated in the endpoint's `operation/2` response description — an article can
+  # now legitimately report a `last_updated` OLDER than its own `updated_at`.
+  #
+  # Returns `{page, total}`: `total` is counted in SQL so the summary stays exact, and only
+  # `cap` rows are ever materialised. `find_orphan_articles/4` has the same shape for the
+  # same reason — an orphan is any published article in no link, so on a bulk-harvested
+  # corpus that is MOST of the corpus, not a structurally small set. The remaining three
+  # still cap in memory: contradictions are bounded by `:contradicts` links, coverage gaps
+  # by the category enum, and broken sources by the distinct source list.
+  defp find_stale_articles(base, stale_days, cap) do
     cutoff = DateTime.utc_now() |> DateTime.add(-stale_days * 86_400, :second)
 
+    stale = from(a in base, where: coalesce(a.content_changed_at, a.updated_at) < ^cutoff)
+
+    total = AdminRepo.one(from(a in stale, select: count(a.id)))
+
     query =
-      from(a in base,
-        where: a.updated_at < ^cutoff,
+      from(a in stale,
         select: %{
           id: a.id,
           title: a.title,
-          updated_at: a.updated_at
+          content_changed_at: coalesce(a.content_changed_at, a.updated_at)
         },
-        order_by: [asc: a.updated_at]
+        order_by: [asc: coalesce(a.content_changed_at, a.updated_at)],
+        limit: ^cap
       )
 
     now = DateTime.utc_now()
 
-    AdminRepo.all(query)
-    |> Enum.map(fn article ->
-      days_since = DateTime.diff(now, article.updated_at, :day)
+    page =
+      AdminRepo.all(query)
+      |> Enum.map(fn article ->
+        days_since = DateTime.diff(now, article.content_changed_at, :day)
 
-      %{
-        article_id: article.id,
-        title: article.title,
-        last_updated: article.updated_at,
-        days_since_update: days_since,
-        severity: "warning",
-        suggested_action: "Review and update or archive this article"
-      }
-    end)
+        %{
+          article_id: article.id,
+          title: article.title,
+          last_updated: article.content_changed_at,
+          days_since_update: days_since,
+          severity: "warning",
+          suggested_action: "Review and update or archive this article"
+        }
+      end)
+
+    {page, total}
   end
+
+  # Folds a SQL-counted category total into the severity histogram. Every finding in a
+  # SQL-capped category carries the same severity, so the total can be added as one number
+  # instead of counting a list that is only a page.
+  defp add_severity_count(counts, _severity, 0), do: counts
+
+  defp add_severity_count(counts, severity, total),
+    do: Map.update(counts, severity, total, &(&1 + total))
 
   # An orphan is an article that appears in NO link, in either direction.
   #
@@ -13451,8 +13547,14 @@ defmodule Loopctl.Knowledge do
   # No index would have rescued the old shape: one tenant owns 100% of `article_links`, so
   # the `tenant_id` predicate those subqueries filtered on is entirely non-selective. The
   # SHAPE was the defect.
-  defp find_orphan_articles(base, tenant_id, _project_id) do
-    query =
+  #
+  # Bounded in SQL for the reason the incident above makes concrete: the orphan set is
+  # bounded by the CORPUS, not by structure — on a bulk-harvested corpus most published
+  # articles carry no link — so fetching it whole and `Enum.take`ing 50 is the same
+  # unbounded materialisation that killed the nightly run. Returns `{page, total}`; the
+  # count runs in SQL so the summary total stays exact.
+  defp find_orphan_articles(base, tenant_id, _project_id, cap) do
+    unlinked =
       from(a in base,
         where:
           not exists(
@@ -13469,25 +13571,33 @@ defmodule Loopctl.Knowledge do
               where: l.target_article_id == parent_as(:article).id,
               select: 1
             )
-          ),
+          )
+      )
+
+    total = AdminRepo.one(from(a in unlinked, select: count(a.id)))
+
+    page =
+      from(a in unlinked,
         select: %{
           id: a.id,
           title: a.title,
           category: a.category
         },
-        order_by: [asc: a.title]
+        order_by: [asc: a.title],
+        limit: ^cap
       )
+      |> AdminRepo.all()
+      |> Enum.map(fn article ->
+        %{
+          article_id: article.id,
+          title: article.title,
+          category: to_string(article.category),
+          severity: "info",
+          suggested_action: "Consider linking to related articles or reviewing for relevance"
+        }
+      end)
 
-    AdminRepo.all(query)
-    |> Enum.map(fn article ->
-      %{
-        article_id: article.id,
-        title: article.title,
-        category: to_string(article.category),
-        severity: "info",
-        suggested_action: "Consider linking to related articles or reviewing for relevance"
-      }
-    end)
+    {page, total}
   end
 
   defp find_contradiction_clusters(tenant_id, project_id) do

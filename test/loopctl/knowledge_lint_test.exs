@@ -37,13 +37,46 @@ defmodule Loopctl.KnowledgeLintTest do
 
       Loopctl.AdminRepo.update_all(
         from(a in Loopctl.Knowledge.Article, where: a.id == ^article.id),
-        set: [updated_at: past]
+        set: [updated_at: past, content_changed_at: past]
       )
 
       {:ok, result} = Knowledge.lint(tenant.id)
 
       assert length(result.stale_articles) == 1
       [stale] = result.stale_articles
+      assert stale.article_id == article.id
+      assert stale.days_since_update >= 200
+    end
+
+    test "stale_articles still reports an old article that a re-embed touched today" do
+      # The #791 defect, at the lint surface: `update_embedding/4` bumps `updated_at`
+      # without changing a word, so a bulk re-embed used to mark the whole corpus fresh
+      # and empty this report for `stale_days` afterwards. Staleness reads
+      # `content_changed_at` now, so a re-embed cannot hide an unrevised article.
+      tenant = fixture(:tenant)
+
+      article =
+        fixture(:article, %{
+          tenant_id: tenant.id,
+          title: "Re-embedded but unrevised",
+          category: :pattern,
+          status: :published
+        })
+
+      content_age = DateTime.utc_now() |> DateTime.add(-200 * 86_400, :second)
+
+      import Ecto.Query
+
+      # Content last changed 200 days ago; the ROW was written just now, which is exactly
+      # the state a re-embed leaves behind.
+      Loopctl.AdminRepo.update_all(
+        from(a in Loopctl.Knowledge.Article, where: a.id == ^article.id),
+        set: [content_changed_at: content_age, updated_at: DateTime.utc_now()]
+      )
+
+      {:ok, result} = Knowledge.lint(tenant.id)
+
+      assert [stale] = result.stale_articles
       assert stale.article_id == article.id
       assert stale.days_since_update >= 200
     end
@@ -66,7 +99,7 @@ defmodule Loopctl.KnowledgeLintTest do
 
       Loopctl.AdminRepo.update_all(
         from(a in Loopctl.Knowledge.Article, where: a.id == ^article.id),
-        set: [updated_at: past]
+        set: [updated_at: past, content_changed_at: past]
       )
 
       # Default 90 days: not stale
@@ -402,7 +435,7 @@ defmodule Loopctl.KnowledgeLintTest do
 
         Loopctl.AdminRepo.update_all(
           from(a in Loopctl.Knowledge.Article, where: a.id == ^article.id),
-          set: [updated_at: past]
+          set: [updated_at: past, content_changed_at: past]
         )
       end
 
@@ -420,6 +453,65 @@ defmodule Loopctl.KnowledgeLintTest do
       # No items in these categories -> not truncated
       assert result.summary.truncated.contradiction_clusters == false
       assert result.summary.truncated.broken_sources == false
+    end
+
+    test "issues_by_severity counts the TRUE totals, not the capped pages" do
+      # The two SQL-capped categories return a PAGE, so counting their lists made the
+      # histogram disagree with `total_issues` in the same summary map: 5 stale + 5 orphan
+      # articles under a cap of 2 reported warning => 2 and info => 9 against a
+      # total_issues of 14. An operator sizing the backlog off the histogram then sees at
+      # most `max_per_category` no matter how large the real backlog is.
+      tenant = fixture(:tenant)
+      past = DateTime.utc_now() |> DateTime.add(-200 * 86_400, :second)
+
+      import Ecto.Query
+
+      for i <- 1..5 do
+        article =
+          fixture(:article, %{
+            tenant_id: tenant.id,
+            title: "Backlog #{i}",
+            category: :pattern,
+            status: :published
+          })
+
+        Loopctl.AdminRepo.update_all(
+          from(a in Loopctl.Knowledge.Article, where: a.id == ^article.id),
+          set: [updated_at: past, content_changed_at: past]
+        )
+      end
+
+      {:ok, result} = Knowledge.lint(tenant.id, max_per_category: 2)
+
+      severity = result.summary.issues_by_severity
+
+      # Every stale finding carries "warning" and every orphan "info", so both true totals
+      # must be present even though only 2 of each were returned.
+      assert length(result.stale_articles) == 2
+      assert severity["warning"] == 5
+      assert severity["info"] >= 5
+
+      assert Enum.sum(Map.values(severity)) == result.summary.total_issues,
+             "the severity histogram must sum to total_issues, got #{inspect(severity)} " <>
+               "against #{result.summary.total_issues}"
+    end
+
+    test "the orphan scan is bounded in SQL, not fetched whole and Enum.take'd" do
+      # Same class of defect as #574 above and on the same query: an orphan is any published
+      # article in no link, so the set is bounded by the CORPUS, not by structure — on the
+      # bulk-harvested tenant that is most of it. Fetching it whole to keep 50 rows is the
+      # unbounded materialisation that took the nightly lint out. Anchored to the code
+      # because a tiny test corpus cannot exhibit the exhaustion; both directions asserted.
+      source = File.read!("lib/loopctl/knowledge.ex")
+
+      [_ | _] = orphan_fn = Regex.run(~r/defp find_orphan_articles.*?\n  end\n/s, source)
+      body = hd(orphan_fn)
+
+      assert body =~ "limit: ^cap", "the orphan page must be LIMITed in SQL"
+      assert body =~ "select: count(a.id)", "the true total must be counted in SQL"
+
+      refute body =~ "Enum.take",
+             "capping in memory means the whole orphan set was already materialised"
     end
 
     test "max_per_category does not truncate when count is below the cap" do

@@ -53,14 +53,15 @@ defmodule Loopctl.KnowledgeContextTest do
           tags: ["decay"]
         })
 
-      # Set article updated_at to 30 days ago
+      # Age the article's CONTENT by 30 days. `content_changed_at` is the field the
+      # recency decay reads (#791); `updated_at` moves with it so the row stays coherent.
       thirty_days_ago = DateTime.add(DateTime.utc_now(), -30 * 86_400, :second)
 
       import Ecto.Query
 
       Loopctl.AdminRepo.update_all(
         from(a in Knowledge.Article, where: a.id == ^article.id),
-        set: [updated_at: thirty_days_ago]
+        set: [updated_at: thirty_days_ago, content_changed_at: thirty_days_ago]
       )
 
       {:ok, result} = Knowledge.get_context(tenant.id, "exponential decay")

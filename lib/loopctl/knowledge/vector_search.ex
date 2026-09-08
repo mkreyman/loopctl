@@ -684,6 +684,10 @@ defmodule Loopctl.Knowledge.VectorSearch do
       # The MOC-hub demotion signal (#654 follow-up) — RankingPriors fails open without
       # it, so the semantic lane would keep ranking hubs undemoted while keyword did not.
       idempotency_key: a.idempotency_key,
+      # The recency prior's field (#791). RankingPriors.recency_timestamp/1 falls back to
+      # `updated_at`, so omitting it does not crash -- it silently ranks this lane on
+      # last-MUTATION time, which a re-embed bumps.
+      content_changed_at: a.content_changed_at,
       metadata: a.metadata,
       inserted_at: a.inserted_at,
       updated_at: a.updated_at,
@@ -985,6 +989,8 @@ defmodule Loopctl.Knowledge.VectorSearch do
       source_type: a.source_type,
       # idempotency_key feeds the MOC-hub demotion in the same place (#654 follow-up).
       idempotency_key: a.idempotency_key,
+      # The recency prior's field (#791), on the same terms as idempotency_key above.
+      content_changed_at: a.content_changed_at,
       metadata: a.metadata,
       inserted_at: a.inserted_at,
       updated_at: a.updated_at,

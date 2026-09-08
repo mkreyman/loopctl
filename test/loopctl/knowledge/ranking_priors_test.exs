@@ -49,6 +49,47 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
     end
   end
 
+  describe "recency_timestamp/1 (#791 — authored age, not last-mutation time)" do
+    test "prefers content_changed_at over updated_at" do
+      authored = days_ago(90)
+
+      assert RankingPriors.recency_timestamp(%{content_changed_at: authored, updated_at: @now}) ==
+               authored
+    end
+
+    test "falls back to updated_at when content_changed_at is nil" do
+      # The permanent pre-#791 path: a row the backfill could not establish an authored
+      # date for must behave exactly as it did before, never lose its prior.
+      assert RankingPriors.recency_timestamp(%{content_changed_at: nil, updated_at: @now}) == @now
+    end
+
+    test "falls back to updated_at when the lane select omits the field entirely" do
+      # Fails OPEN, like the MOC-hub signal: a lane whose projection is missing the column
+      # must rank on last-mutation time, never raise mid-search.
+      assert RankingPriors.recency_timestamp(%{updated_at: @now}) == @now
+    end
+
+    test "is nil when neither field is present" do
+      assert RankingPriors.recency_timestamp(%{}) == nil
+      assert RankingPriors.recency_timestamp(nil) == nil
+    end
+
+    test "multiplier/2 measures recency from content_changed_at, so a bumped updated_at is inert" do
+      # THE #791 INVARIANT at the prior level: two result maps whose ONLY difference is
+      # `updated_at` — what a re-embed moves — must score identically.
+      authored = days_ago(120)
+
+      as_reembedded = %{content_changed_at: authored, updated_at: @now}
+      as_untouched = %{content_changed_at: authored, updated_at: authored}
+
+      assert mult(as_reembedded, []) == mult(as_untouched, [])
+
+      # Positive control: the prior is not simply inert here. An article whose CONTENT is
+      # fresh scores strictly higher than one whose content is 120 days old.
+      assert mult(%{content_changed_at: @now, updated_at: @now}, []) > mult(as_untouched, [])
+    end
+  end
+
   describe "recency_factor/3 (bounded, applied as a multiplier)" do
     test "a zero weight makes recency a no-op regardless of age" do
       assert RankingPriors.recency_factor(days_ago(999), @now, 0.0) == 1.0
@@ -425,24 +466,55 @@ defmodule Loopctl.Knowledge.RankingPriorsTest do
 
     test "every lane select projects idempotency_key" do
       for {path, head} <- @ranking_lanes do
-        source = File.read!(path)
-
-        # Positive control: a renamed or moved lane fails LOUDLY here instead of passing
-        # vacuously on a substring that no longer exists.
-        assert String.contains?(source, head),
-               "#{path}: lane head moved, re-anchor this guard -- #{head}"
-
-        body =
-          source
-          |> String.split(head, parts: 2)
-          |> List.last()
-          |> String.split(~r/\n  end\n/, parts: 2)
-          |> hd()
-
-        assert String.contains?(body, "idempotency_key:"),
-               "#{path}: #{head} does not project idempotency_key -- RankingPriors fails " <>
-                 "open, so a MOC hub seen ONLY on this lane keeps its full fused score"
+        assert_lane_projects(
+          path,
+          head,
+          "idempotency_key:",
+          "RankingPriors fails open, so a MOC hub seen ONLY on this lane keeps its full " <>
+            "fused score"
+        )
       end
     end
+
+    # #791: `recency_timestamp/1` fails open to `updated_at` for exactly the same reason
+    # `moc_hub?/1` fails open on a missing key — so a lane that drops this column does not
+    # crash, it silently ranks its lane-ONLY candidates on last-MUTATION time, which is the
+    # field a re-embed bumps and the whole defect #791 closes. Same anchoring, same
+    # invisibility, therefore the same guard.
+    test "every lane select projects content_changed_at" do
+      for {path, head} <- @ranking_lanes do
+        assert_lane_projects(
+          path,
+          head,
+          "content_changed_at:",
+          "RankingPriors.recency_timestamp/1 falls back to updated_at, so a document " <>
+            "seen ONLY on this lane goes back to ranking on last-mutation time -- a " <>
+            "re-embed makes it look brand new"
+        )
+      end
+    end
+  end
+
+  # Reads the SELECT SOURCE of one ranking lane and asserts it projects `field`.
+  # Source-anchored rather than behavioural on purpose: fusion unions the lane maps, so a
+  # candidate ANOTHER lane also returned still carries the key and no query-level test can
+  # see the gap. Only lane-ONLY candidates lose the signal.
+  defp assert_lane_projects(path, head, field, why) do
+    source = File.read!(path)
+
+    # Positive control: a renamed or moved lane fails LOUDLY here instead of passing
+    # vacuously on a substring that no longer exists.
+    assert String.contains?(source, head),
+           "#{path}: lane head moved, re-anchor this guard -- #{head}"
+
+    body =
+      source
+      |> String.split(head, parts: 2)
+      |> List.last()
+      |> String.split(~r/\n  end\n/, parts: 2)
+      |> hd()
+
+    assert String.contains?(body, field),
+           "#{path}: #{head} does not project #{field} -- #{why}"
   end
 end

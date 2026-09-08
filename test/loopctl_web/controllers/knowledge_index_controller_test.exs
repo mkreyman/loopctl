@@ -317,7 +317,7 @@ defmodule LoopctlWeb.KnowledgeIndexControllerTest do
   end
 
   describe "sorting within category" do
-    test "articles are sorted by updated_at desc within each category", %{conn: conn} do
+    test "articles are sorted by authored age desc, not by updated_at", %{conn: conn} do
       tenant = fixture(:tenant)
       {raw_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
 
@@ -344,14 +344,23 @@ defmodule LoopctlWeb.KnowledgeIndexControllerTest do
 
       import Ecto.Query
 
+      # The two fields point in OPPOSITE directions on purpose (#791). Setting them
+      # together, or setting only updated_at, cannot distinguish the sort key from
+      # creation order — fixture/2 routes through create_changeset, which stamps
+      # content_changed_at at insert, so the rows already come out in the asserted
+      # order and the assertion holds whichever column the query sorts on.
+      #
+      # "Older Pattern" is the one whose CONTENT is older but whose ROW was written
+      # most recently, which is exactly what a re-embed leaves behind. Under the old
+      # `desc: updated_at` it sorted FIRST; under authored age it must sort last.
       Loopctl.AdminRepo.update_all(
         from(a in Loopctl.Knowledge.Article, where: a.id == ^older.id),
-        set: [updated_at: one_hour_ago]
+        set: [content_changed_at: one_hour_ago, updated_at: now]
       )
 
       Loopctl.AdminRepo.update_all(
         from(a in Loopctl.Knowledge.Article, where: a.id == ^newer.id),
-        set: [updated_at: now]
+        set: [content_changed_at: now, updated_at: one_hour_ago]
       )
 
       conn =
