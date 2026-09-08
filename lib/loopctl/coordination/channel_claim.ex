@@ -58,7 +58,11 @@ defmodule Loopctl.Coordination.ChannelClaim do
 
   use Loopctl.Schema
 
+  require Logger
+
   alias Loopctl.Security.SecretDenylist
+
+  @secret_error_message "must not contain a credential"
 
   @type t :: %__MODULE__{}
 
@@ -224,7 +228,7 @@ defmodule Loopctl.Coordination.ChannelClaim do
 
   defp reject_secret(field, changeset) do
     if changeset |> get_field(field) |> scan_slice() |> SecretDenylist.contains_secret?() do
-      add_error(changeset, field, "must not contain a credential")
+      add_error(changeset, field, @secret_error_message)
     else
       changeset
     end
@@ -241,4 +245,34 @@ defmodule Loopctl.Coordination.ChannelClaim do
     do: binary_part(value, 0, @scan_byte_cap)
 
   defp scan_slice(value), do: value
+
+  @doc """
+  Emits the SHARED `[:loopctl, :coordination, :secret_blocked]` signal for each field a
+  REJECTED changeset flagged as carrying a credential — the same one `ChannelPost` fires,
+  so the coordination plane's credential-attempt counter covers the claim path too rather
+  than silently under-reporting it.
+
+  Fired by `Loopctl.Coordination.claim/5` where the write is actually rejected, never from
+  the (pure) changeset builder, which would re-count on every rebuild or preview.
+  """
+  @spec emit_secret_blocked_events(Ecto.Changeset.t()) :: :ok
+  def emit_secret_blocked_events(%Ecto.Changeset{} = changeset) do
+    for {field, {msg, _opts}} <- changeset.errors, msg == @secret_error_message do
+      metadata = %{
+        tenant_id: get_field(changeset, :tenant_id),
+        project_id: get_field(changeset, :project_id),
+        agent_id: get_field(changeset, :claimant_agent_id),
+        field: field
+      }
+
+      :telemetry.execute([:loopctl, :coordination, :secret_blocked], %{count: 1}, metadata)
+
+      Logger.warning(
+        "coordination denylist hit: blocked claim #{field} carrying a credential shape " <>
+          "(tenant=#{metadata.tenant_id} project=#{metadata.project_id} agent=#{metadata.agent_id})"
+      )
+    end
+
+    :ok
+  end
 end

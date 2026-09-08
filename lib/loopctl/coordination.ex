@@ -1664,7 +1664,7 @@ defmodule Loopctl.Coordination do
          # `text` column: a NUL byte is valid UTF-8 that Postgres refuses (22021), so
          # `verify_ref_not_superseded/3` below would raise a 500 instead of returning
          # the 422 this changeset already carries.
-         {:ok, %ChannelClaim{ref: ref}} <- Ecto.Changeset.apply_action(changeset, :insert),
+         {:ok, %ChannelClaim{ref: ref}} <- apply_claim_changeset(changeset),
          :ok <- verify_ref_not_superseded(tenant_id, project_id, ref),
          :ok <- verify_agent_claim_budget(tenant_id, project_id, agent_id) do
       run_claim(tenant_id, project_id, agent_id, changeset, audit)
@@ -1875,6 +1875,21 @@ defmodule Loopctl.Coordination do
 
   def check_claim_session(%ChannelClaim{}, _session, _force),
     do: {:error, :claim_session_mismatch}
+
+  # Fire the "credential blocked" signal once, where the write is actually rejected —
+  # mirrors `tap_secret_blocked/1` on the post path, and keeps the emission out of the
+  # (pure) changeset builder so it cannot double-count on a rebuild or a preview. Without
+  # it the coordination plane's credential-attempt counter silently skipped this gate.
+  defp apply_claim_changeset(changeset) do
+    case Ecto.Changeset.apply_action(changeset, :insert) do
+      {:error, %Ecto.Changeset{} = rejected} = result ->
+        ChannelClaim.emit_secret_blocked_events(rejected)
+        result
+
+      result ->
+        result
+    end
+  end
 
   # `audit` and `opts` are ADJACENT optional keyword lists, so a call written
   # `done(t, a, p, r, session_id: sid, force: true)` compiles, silently disables the
