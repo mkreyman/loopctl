@@ -1218,19 +1218,38 @@ config :loopctl, :knowledge_hub_demotion_enabled, true
 # scarcer, more deliberate signal than a category label, and because the log curve puts a
 # typical 1-3-day article at 0.2-0.4 of it. A strength of 0 is an EXACT no-op.
 #
-# SHIPS DISABLED, and that is a governance state rather than a tuning choice. The
-# 2026-08-21 owner decision governs what may move ranking here, and the carve-out this prior
-# needs is recorded in CLAUDE.md as NOT RATIFIED BY THE OWNER: the prior does move unread
-# material down the ORDER relative to promoted material, which is the direction that decision
-# worries about, bounded by the 1.1 ceiling. Shipping it on would be citing a paragraph its
-# own author wrote as the owner's permission. Flip this one line to `true` once Mark rules,
-# and record the ruling attributably in that CLAUDE.md section.
+# ENABLED 2026-09-08 BY OWNER RULING, on monitoring rather than on evidence, and that
+# distinction is the reason this comment is long. Mark, asked for the call after being given
+# the recommendation NOT to flip it: "ship on your judgement call and we'll continue to
+# monitor". The ruling is recorded attributably in CLAUDE.md's "Ranking must never key on HOW
+# a document got in" section, which is where it governs from.
+#
+# WHAT IS STILL NOT KNOWN, so nobody later mistakes this for a measured result. The
+# golden-question eval passes at +0.000 on every aggregate and is VACUOUS for this prior by
+# construction: `RetrievalEval` seeds no `article_access_events`, so every golden doc's
+# `read_day_count` is NULL and the factor is 1.0 on every candidate. No measurement says this
+# improves retrieval. What is known is the mechanism by which it could hurt: the prior is
+# one-sided in SCORE but ranking is ORDINAL, so promoting a used article moves an unread one
+# down relative to it, unread bulk-harvested material is the population at the floor, and
+# reads correlate with origin — which is how a usage prior arrives at the 2026-08-21
+# decision's concern by a route that decision does not name. The 1.1 ceiling bounds it to
+# ~9% of relative position and nothing is ever scored down.
+#
+# THE PRE-FLIP BASELINE, so the monitoring has something to compare against. Seven days to
+# 2026-09-07, prior off throughout: precision (results opened / results surfaced) mean 0.023,
+# `search_follow_through` mean 0.117, `scored_follow_through` mean 0.339
+# (`knowledge_retrieval_metrics`). The number that decides this is rank-stratified
+# surfaced-to-opened conversion for HARVESTED material specifically — the measure the
+# 2026-08-21 decision named and that has still never been taken.
+#
+# REVERTING IS THIS ONE LINE. If harvested-material conversion falls after this ships, that
+# is the overturn condition CLAUDE.md already states, and it is not a close call.
 #
 # The nightly stamp runs REGARDLESS of this toggle, deliberately: it costs one bounded
 # aggregate per tenant per night, `read_day_count` is read by nothing else, and collecting it
 # now means ratification is a config flip against 90 days of history rather than a 90-day
 # wait. Turn the collection off by removing the step in `KnowledgeLintWorker`, not here.
-config :loopctl, :knowledge_importance_prior_enabled, false
+config :loopctl, :knowledge_importance_prior_enabled, true
 config :loopctl, :knowledge_importance_strength, 0.1
 
 # DI: WebAuthn adapter — defaults to Wax (overridden in test env)
