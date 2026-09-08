@@ -348,6 +348,35 @@ defmodule LoopctlWeb.ChannelClaimControllerTest do
              |> json_response(404)
     end
 
+    test "#779: a NUL byte in session_id on done/release is a 422, never a 500" do
+      # The claim path already answered 422 for this; done/release wrote the raw value
+      # into the audit entry's jsonb metadata, where Postgres refuses the escape Jason
+      # emits for a NUL byte (22P05) and the request 500'd. The trigger needs no
+      # stamped claim: an UNDISCRIMINABLE row passes the guard and reaches the audit.
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {raw, _key, _agent} = member_agent_key(tenant, project)
+
+      assert raw
+             |> post_json(@claim_path, %{project_id: project.id, ref: "r"})
+             |> json_response(201)
+
+      for path <- [@done_path, @release_path] do
+        assert raw
+               |> post_json(path, %{
+                 project_id: project.id,
+                 ref: "r",
+                 session_id: "x" <> <<0>> <> "y"
+               })
+               |> json_response(422)
+      end
+
+      # And the claim survived both refusals.
+      assert raw
+             |> post_json(@done_path, %{project_id: project.id, ref: "r"})
+             |> json_response(200)
+    end
+
     test "releasing an already-DONE claim is 409 already_claimed, not a 500" do
       tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
       project = fixture(:project, %{tenant_id: tenant.id})

@@ -41,6 +41,13 @@ All notable changes to loopctl are documented here.
   a pass on an unstamped row emits `[:loopctl, :coordination, :claim_session_guard]` with
   the outcome — the refusal writes no audit row, so telemetry is the only signal there.
 
+  The caller's `session_id` on `done`/`release` is held to the SAME rules the claim path
+  applies to `claimed_by_session` — a string, at most 200 bytes, no NUL byte, no credential
+  shape — because it is echoed into the guard's log line and persisted into the append-only
+  audit entry's `metadata`. A violation is a `422` (a NUL byte was previously a raw `500`
+  from the jsonb write, and an oversized value an unbounded audit row), and a credential
+  shape also raises `[:loopctl, :coordination, :secret_blocked]`.
+
   Migration `20260907140000_add_session_discriminator_to_channel_claims` adds two nullable
   `text` columns and no index. No backfill and no manual step: existing rows and clients
   that send no session are treated as undiscriminable and keep the pre-#779 agent-scoped

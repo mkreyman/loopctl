@@ -170,6 +170,40 @@ defmodule Loopctl.Coordination.ChannelClaim do
   @spec host_max_length() :: pos_integer()
   def host_max_length, do: @host_max_length
 
+  @doc """
+  Validates the CALLER-supplied `session_id` that `done`/`release` compare against a
+  row's stamp, under the SAME rules `create_changeset/2` applies to
+  `claimed_by_session`.
+
+  Those paths build no claim changeset — they update or delete an existing row — so the
+  caller's value used to reach the audit entry's `metadata` (a **jsonb** column, which
+  is STRICTER than the `text` the claim path writes: Postgres refuses the `\\u0000`
+  escape Jason produces for a NUL byte and the request 500s) with no cap, no NUL check
+  and no credential scan. One endpoint over from a 422, the same string was persisted
+  verbatim into the append-only audit log. Same three rules, same field, both paths.
+
+  `nil` (the client sent none) is valid — an absent session is UNDISCRIMINABLE, which
+  the guard handles. A non-binary (a JSON number, a map, `session_id[]=a` from a form
+  client) is rejected here by the `:string` cast, so no such value ever reaches the
+  guard or the audit map.
+
+  The changeset is built on a struct carrying the caller's `tenant_id` / `project_id` /
+  `claimant_agent_id` so `emit_secret_blocked_events/1` can attribute a denylist hit
+  exactly as it does on the claim path. Returns a changeset — `valid?` decides.
+  """
+  @spec caller_session_changeset(map(), term()) :: Ecto.Changeset.t()
+  def caller_session_changeset(scope, session) do
+    cast_changeset =
+      %__MODULE__{}
+      |> struct(scope)
+      |> cast(%{claimed_by_session: session}, [:claimed_by_session])
+      |> normalize_blank([:claimed_by_session])
+      |> validate_length(:claimed_by_session, max: @session_max_length, count: :bytes)
+
+    null_checked = reject_null_bytes(:claimed_by_session, cast_changeset)
+    reject_secret(:claimed_by_session, null_checked)
+  end
+
   # A blank/whitespace value means "absent" — normalise to nil. For `ref` that makes
   # `validate_required` reject it rather than reserving the slot with an empty string;
   # for the two discriminators it means UNDISCRIMINABLE rather than a session literally
@@ -219,9 +253,12 @@ defmodule Loopctl.Coordination.ChannelClaim do
   # the ref can then never be claimed, and a pre-existing row whose ref now trips the
   # scan loses the idempotent owner re-claim (`claim/5` applies this changeset BEFORE the
   # collision is resolved), which is the dropped-handoff window that branch exists to
-  # close. The exposure it would have covered is already covered where the ref's
-  # instructions actually live: `ChannelPost.key` is scanned, so a credential-shaped ref
-  # cannot be published with a handoff.
+  # close. What that leaves uncovered is stated rather than papered over: a claim needs
+  # NO matching post (`claim/5` takes any ref), so a credential-shaped ref on a postless
+  # claim IS stored and echoed by `GET /channel/claims` unscanned. `ChannelPost.key` is
+  # scanned, so such a ref can never be published together with its INSTRUCTIONS — the
+  # bare claim row is the accepted residual, taken deliberately because the alternative
+  # is an unclearable refusal that strands the handoff the claim exists to hand off.
   defp validate_no_secrets(changeset) do
     Enum.reduce([:claimed_by_session, :claimed_by_host], changeset, &reject_secret/2)
   end

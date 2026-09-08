@@ -1691,6 +1691,12 @@ defmodule Loopctl.Coordination do
   `{:error, :claim_session_mismatch}` unless `force: true` — see
   `check_claim_session/3` for what that does and, more importantly, does not enforce.
 
+  The caller's `:session_id` is validated FIRST, against the same rules the claim path
+  applies to `claimed_by_session` (200-byte cap, no NUL byte, no credential shape,
+  string-typed): it is echoed into the guard's log line and persisted into the
+  append-only audit entry's jsonb metadata, so an invalid value is
+  `{:error, %Ecto.Changeset{}}` (422) rather than an unbounded write or a raw 500.
+
   Returns `{:ok, %ChannelClaim{}}` (the updated claim), `{:error, :not_found}`,
   `{:error, :claim_session_mismatch}`, or
   `{:error, %Ecto.Changeset{}}` (the `:audit` Multi step's changeset insert failed —
@@ -1705,12 +1711,12 @@ defmodule Loopctl.Coordination do
     {audit, opts} = split_claim_opts(audit, opts)
     now = DateTime.utc_now()
 
-    case fetch_owned_claim(tenant_id, agent_id, project_id, ref) do
-      %ChannelClaim{} = owned ->
-        finish_done(tenant_id, project_id, agent_id, owned, now, audit, opts)
-
-      nil ->
-        {:error, :not_found}
+    with :ok <- validate_caller_session(tenant_id, project_id, agent_id, opts),
+         %ChannelClaim{} = owned <- fetch_owned_claim(tenant_id, agent_id, project_id, ref) do
+      finish_done(tenant_id, project_id, agent_id, owned, now, audit, opts)
+    else
+      nil -> {:error, :not_found}
+      {:error, %Ecto.Changeset{}} = invalid -> invalid
     end
   end
 
@@ -1729,7 +1735,8 @@ defmodule Loopctl.Coordination do
             :update,
             Ecto.Changeset.change(claim, done_at: now),
             "done",
-            session_audit(audit, claim, opts)
+            # The lease was just proved live, so the guard DID run here.
+            session_audit(audit, claim, opts, true)
           )
         else
           {:error, reason} -> {:error, reason}
@@ -1761,7 +1768,9 @@ defmodule Loopctl.Coordination do
   session's live claim and the bus reopens a handoff someone is actively working (KB
   `07f5e839`). A claim whose LEASE HAS EXPIRED is not guarded: nobody is working it,
   the sweeper is about to reap it, and refusing there told the caller to leave alone a
-  ref that is already free.
+  ref that is already free. The caller's `:session_id` is validated exactly as in
+  `done/6` (cap, NUL, credential denylist) before any row is touched — 422, not a 500
+  or an unbounded audit write.
 
   Returns `{:ok, %ChannelClaim{}}` (the deleted claim), `{:error, :not_found}`,
   `{:error, :already_claimed}` (the claim is already DONE — terminal),
@@ -1778,19 +1787,25 @@ defmodule Loopctl.Coordination do
   def release(tenant_id, agent_id, project_id, ref, audit \\ [], opts \\ []) do
     {audit, opts} = split_claim_opts(audit, opts)
 
-    case fetch_owned_claim(tenant_id, agent_id, project_id, ref) do
-      %ChannelClaim{} = owned ->
-        finish_release(tenant_id, project_id, agent_id, owned, audit, opts)
-
-      nil ->
-        {:error, :not_found}
+    with :ok <- validate_caller_session(tenant_id, project_id, agent_id, opts),
+         %ChannelClaim{} = owned <- fetch_owned_claim(tenant_id, agent_id, project_id, ref) do
+      finish_release(tenant_id, project_id, agent_id, owned, audit, opts)
+    else
+      nil -> {:error, :not_found}
+      {:error, %Ecto.Changeset{}} = invalid -> invalid
     end
   end
 
   defp finish_release(tenant_id, project_id, agent_id, claim, audit, opts) do
     case claim do
       %ChannelClaim{done_at: nil} = claim ->
-        with :ok <- guard_live_claim_session(tenant_id, project_id, agent_id, claim, opts) do
+        # The session dimension is meaningful only while a claim is LIVE, and whether
+        # the guard RAN is what the audit entry's `forced` has to be derived from —
+        # `force: true` on an expired lease cleared nothing, because nothing refused.
+        guarded? = claim_lease_live?(claim)
+
+        with :ok <-
+               maybe_guard_claim_session(guarded?, tenant_id, project_id, agent_id, claim, opts) do
           run_claim_lifecycle(
             tenant_id,
             project_id,
@@ -1798,7 +1813,7 @@ defmodule Loopctl.Coordination do
             :delete,
             claim,
             "released",
-            session_audit(audit, claim, opts)
+            session_audit(audit, claim, opts, guarded?)
           )
         end
 
@@ -1902,14 +1917,43 @@ defmodule Loopctl.Coordination do
     {audit, Keyword.merge(misplaced, opts)}
   end
 
-  # The session dimension is meaningful only while a claim is LIVE. An expired lease
-  # holds no work — the sweeper is about to reap it — so refusing a peer session there
-  # told the caller "leave it alone, someone is working it" about a claim nobody holds.
-  defp guard_live_claim_session(tenant_id, project_id, agent_id, claim, opts) do
-    if DateTime.compare(claim.lease_expires_at, DateTime.utc_now()) == :gt do
-      guard_claim_session(tenant_id, project_id, agent_id, claim, opts)
-    else
+  # An expired lease holds no work — the sweeper is about to reap it — so refusing a
+  # peer session there told the caller "leave it alone, someone is working it" about a
+  # claim nobody holds. The decision is taken by the CALLER (`finish_release/6`) so the
+  # same boolean can be handed to `session_audit/4`: an audit row claiming `forced` for
+  # a guard that never ran is a false positive in the one signal this change adds.
+  defp claim_lease_live?(claim) do
+    DateTime.compare(claim.lease_expires_at, DateTime.utc_now()) == :gt
+  end
+
+  defp maybe_guard_claim_session(false, _tenant_id, _project_id, _agent_id, _claim, _opts),
+    do: :ok
+
+  defp maybe_guard_claim_session(true, tenant_id, project_id, agent_id, claim, opts),
+    do: guard_claim_session(tenant_id, project_id, agent_id, claim, opts)
+
+  # The caller's `session_id` is client-supplied free text on a surface any agent key can
+  # call, and `done`/`release` build no claim changeset — so without this it reached the
+  # audit log's jsonb `metadata` (and the guard's log line) uncapped, unscanned and with
+  # a NUL byte still in it, where the claim path answers 422 for all three. jsonb is the
+  # STRICTER sink: Postgres refuses the escape Jason emits for a NUL byte, so one was a
+  # raw 500. Validated BEFORE the owner fetch: it is a fault in the caller's own input,
+  # decidable without touching a row, so it can be no existence oracle.
+  defp validate_caller_session(tenant_id, project_id, agent_id, opts) do
+    changeset =
+      ChannelClaim.caller_session_changeset(
+        %{tenant_id: tenant_id, project_id: project_id, claimant_agent_id: agent_id},
+        Keyword.get(opts, :session_id)
+      )
+
+    if changeset.valid? do
       :ok
+    else
+      # Same shared counter the claim path raises, for the same reason: a credential
+      # attempt this gate refuses must not be missing from the coordination plane's
+      # dashboard just because it arrived one endpoint over.
+      ChannelClaim.emit_secret_blocked_events(changeset)
+      {:error, %{changeset | action: :update}}
     end
   end
 
@@ -1920,7 +1964,12 @@ defmodule Loopctl.Coordination do
   # residual pre-#779 window — every claim live at deploy time, every curl caller —
   # which is otherwise silent for a whole lease. An ordinary match stays silent.
   #
-  # The ref is deliberately NOT logged: it is caller-supplied free text.
+  # The ref is deliberately NOT logged: it is caller-supplied free text with no cap and
+  # no credential scan (see `ChannelClaim.validate_no_secrets/1` for why the ref cannot
+  # have one). `caller_session` IS logged because it is the one caller-supplied value
+  # here that `validate_caller_session/4` has already capped, NUL-checked and
+  # denylist-scanned — that validation is what makes this line safe, so do not log
+  # anything else without it.
   defp guard_claim_session(tenant_id, project_id, agent_id, claim, opts) do
     session = Keyword.get(opts, :session_id)
     result = check_claim_session(claim, opts)
@@ -1954,9 +2003,18 @@ defmodule Loopctl.Coordination do
   defp claim_session_log_level(:undiscriminable), do: :info
   defp claim_session_log_level(_outcome), do: :warning
 
-  defp claim_session_outcome(%ChannelClaim{claimed_by_session: nil}, session, _result)
-       when is_binary(session),
-       do: :undiscriminable
+  # An UNSTAMPED row is undiscriminable whatever the caller sent — including nothing at
+  # all. Keying this on the caller's value made the rollout metric blind to the exact
+  # population the migration says it exists to count ("every claim live at deploy time,
+  # every curl caller ... made OBSERVABLE instead"): a curl caller sends no session, so
+  # the pair (nil, nil) fell through to `:match` and the residual window stayed silent
+  # while an operator read zero as "the unstamped population is gone". It also mislabelled
+  # a NON-BINARY caller value as `:forced` (nil != 12345 in the third clause), reporting a
+  # cross-session override that never happened — `validate_caller_session/4` now refuses
+  # such a value with a 422 before the guard ever sees it, and this clause no longer
+  # depends on that.
+  defp claim_session_outcome(%ChannelClaim{claimed_by_session: nil}, _session, _result),
+    do: :undiscriminable
 
   defp claim_session_outcome(_claim, _session, {:error, :claim_session_mismatch}), do: :mismatch
 
@@ -1971,14 +2029,14 @@ defmodule Loopctl.Coordination do
   # `claimed_by_session` evidence of who actually held it goes with it. Every done and
   # release records the caller's session, the row's stamp, and whether force cleared a
   # mismatch.
-  defp session_audit(audit, claim, opts) do
+  defp session_audit(audit, claim, opts, guarded?) do
     metadata =
       audit
       |> Keyword.get(:metadata, %{})
       |> Map.merge(%{
         "caller_session" => Keyword.get(opts, :session_id),
         "claimed_by_session" => claim.claimed_by_session,
-        "forced" => forced_override?(claim, opts)
+        "forced" => forced_override?(claim, opts, guarded?)
       })
 
     Keyword.put(audit, :metadata, metadata)
@@ -1986,8 +2044,15 @@ defmodule Loopctl.Coordination do
 
   # True only when `force: true` actually CLEARED a mismatch — not when it was passed
   # redundantly by a caller whose session already matched, and not when the guard was
-  # skipped because the lease had expired.
-  defp forced_override?(claim, opts) do
+  # skipped because the lease had expired. `guarded?` is that second half, and it has to
+  # be PASSED IN: this function re-runs the pure session comparison and cannot see the
+  # lease decision `finish_release/6` took, so deriving it here recorded `forced: true`
+  # for an expired-lease release where nothing refused, no guard telemetry fired and no
+  # warning was logged — a false positive in the one signal the audit fields exist to
+  # give (KB 07f5e839's incident class).
+  defp forced_override?(_claim, _opts, false), do: false
+
+  defp forced_override?(claim, opts, true) do
     Keyword.get(opts, :force, false) == true and
       check_claim_session(claim, Keyword.put(opts, :force, false)) ==
         {:error, :claim_session_mismatch}

@@ -249,6 +249,12 @@ defmodule LoopctlWeb.ChannelClaimController do
 
   Marks the caller's OWN claim on `ref` done. A non-owner / cross-tenant /
   cross-project / missing claim returns a byte-identical 404 (no oracle).
+
+  Optional `session_id` (advisory, #779) and `force`. `session_id` is held to the SAME
+  rules the claim path applies to `claimed_by_session` — a string, at most
+  `ChannelClaim.session_max_length/0` bytes, no NUL byte, no credential shape — because
+  it is logged and written into the append-only audit entry: a violation is a `422`,
+  and a credential shape also raises `[:loopctl, :coordination, :secret_blocked]`.
   """
   def done(conn, params) do
     with_agent(conn, fn tenant_id, agent_id, _role ->
@@ -273,7 +279,9 @@ defmodule LoopctlWeb.ChannelClaimController do
   POST /api/v1/channel/claims/release
 
   DELETES the caller's OWN claim on `ref` so it reopens for the next racer. Same
-  oracle-safe 404 as `done` for a non-owner / cross-tenant / missing claim.
+  oracle-safe 404 as `done` for a non-owner / cross-tenant / missing claim, and the
+  same `422` on a `session_id` that is over the cap, carries a NUL byte or looks like a
+  credential.
   """
   def release(conn, params) do
     with_agent(conn, fn tenant_id, agent_id, _role ->

@@ -498,6 +498,52 @@ async function restoreKbScope({ project_id }) {
 // already exist?) rather than on same_session (was it this session?).
 const CHANNEL_SESSION_ID = process.env.CLAUDE_SESSION_ID || crypto.randomUUID();
 
+// #779: the CLAIM paths need a discriminator whose lifetime is the SESSION, not this
+// PROCESS. A claim is long-lived (a lease is up to 24h) and its stamp is compared again
+// on channel_done / channel_release, so a per-process id turns every npx respawn or
+// /mcp reconnect into a 409 claim_session_mismatch on this session's OWN live work —
+// recoverable only by discovering force: true, and otherwise held for the rest of the
+// lease. That is not the exotic path: measured on minis 2026-09-08, 3 of 5 running
+// loopctl MCP processes carried NO CLAUDE_SESSION_ID, so the fallback IS the common
+// case. (The post path keeps the process-lifetime fallback above: US-454 pins it, and a
+// post is a one-shot write with nothing to compare later.)
+//
+// So persist the fallback, keyed by (host, launch cwd) — Claude Code launches the proxy
+// in the session's project root, and a worktree session therefore gets its own id,
+// while a respawned proxy in the SAME session re-reads the same one. Two sessions
+// sharing one directory collide and read same_session: true about each other, which is
+// exactly the pre-#779 behaviour rather than a new failure; two MACHINES — the incident
+// this feature exists for (KB b447b16b) — never collide.
+//
+// Never throws. An unreadable/unwritable temp dir degrades to a process-lifetime uuid,
+// i.e. today's behaviour.
+function durableClaimSessionId() {
+  const key = crypto
+    .createHash("sha256")
+    .update(`${os.hostname()}\n${process.cwd()}`)
+    .digest("hex")
+    .slice(0, 32);
+  const file = path.join(os.tmpdir(), `loopctl-mcp-claim-session-${key}.id`);
+
+  try {
+    const existing = readFileSync(file, "utf8").trim();
+    if (existing) return existing;
+  } catch {
+    // Not minted yet (or unreadable) — mint below.
+  }
+
+  const minted = crypto.randomUUID();
+  try {
+    writeFileSync(file, minted, { mode: 0o600 });
+  } catch {
+    // Keep the in-memory id; the next process mints its own, which is the status quo.
+  }
+  return minted;
+}
+
+const CLAIM_SESSION_ID =
+  process.env.CLAUDE_SESSION_ID || durableClaimSessionId();
+
 async function channelPostRaw({
   project_id,
   body,
@@ -657,7 +703,7 @@ async function channelClaim({ project_id, ref, lease_seconds }) {
   // session's live claim as a plain success and two machines do the same work.
   const payload = { project_id, ref };
   if (lease_seconds) payload.lease_seconds = lease_seconds;
-  payload.session_id = CHANNEL_SESSION_ID;
+  payload.session_id = CLAIM_SESSION_ID;
   payload.host = os.hostname();
   const result = await apiCall(
     "POST",
@@ -684,7 +730,7 @@ async function channelClaims({ project_id, ref, limit }) {
   // Proxy-filled (#779): the server compares it against each row's stamp and answers
   // same_session, so the agent never has to know its own session id to tell whether a
   // listed claim is its own.
-  params.set("session_id", CHANNEL_SESSION_ID);
+  params.set("session_id", CLAIM_SESSION_ID);
   const result = await apiCall(
     "GET",
     `/api/v1/channel/claims?${params}`,
@@ -707,7 +753,7 @@ async function channelRelease({ project_id, ref, force }) {
   // truthy?/1 accepts. `if (force)` sent force: true for "false"/"0"/"no", which a
   // model routinely emits and nothing in the dispatch type-checks — the guard the
   // server tests against those exact strings was defeated on the real client path.
-  const payload = { project_id, ref, session_id: CHANNEL_SESSION_ID };
+  const payload = { project_id, ref, session_id: CLAIM_SESSION_ID };
   if (force === true || force === "true") payload.force = true;
   const result = await apiCall(
     "POST",
@@ -725,7 +771,7 @@ async function channelDone({ project_id, ref, force }) {
   // session_id, 409 claim_session_mismatch on a peer session's claim, force to override.
   // Strict, not truthy — see channelRelease: a string "false" must not become
   // force: true and clear the server's session guard.
-  const payload = { project_id, ref, session_id: CHANNEL_SESSION_ID };
+  const payload = { project_id, ref, session_id: CLAIM_SESSION_ID };
   if (force === true || force === "true") payload.force = true;
   const result = await apiCall(
     "POST",

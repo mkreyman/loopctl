@@ -695,6 +695,163 @@ defmodule Loopctl.CoordinationClaimTest do
                Coordination.release(tenant.id, agent, project.id, "r", audit())
     end
 
+    # The claim path caps, NUL-checks and denylist-scans `claimed_by_session` because it
+    # is client-supplied free text. done/release take the SAME field from the SAME
+    # clients, build no claim changeset, and route it into the guard's log line and the
+    # APPEND-ONLY audit entry's jsonb metadata — a stricter sink than the `text` column,
+    # since Postgres refuses the escape Jason emits for a NUL byte and the request 500s.
+    test "#779: a NUL / over-length / credential-shaped session_id on done or release is a 422" do
+      %{tenant: tenant, project: project, agent_id: agent} = setup_member()
+
+      assert {:ok, claim} =
+               Coordination.claim(tenant.id, agent, project.id, "r",
+                 role: :agent,
+                 session_id: "session-a",
+                 audit: audit()
+               )
+
+      for bad <- [
+            "x" <> <<0>> <> "y",
+            String.duplicate("s", ChannelClaim.session_max_length() + 1),
+            "sk-ant-api03-" <> String.duplicate("a", 40)
+          ],
+          call <- [:done, :release] do
+        assert {:error, %Ecto.Changeset{} = cs} =
+                 apply(Coordination, call, [
+                   tenant.id,
+                   agent,
+                   project.id,
+                   "r",
+                   audit(),
+                   [session_id: bad, force: true]
+                 ]),
+               "#{call} must refuse #{inspect(binary_part(bad, 0, min(20, byte_size(bad))))}"
+
+        assert %{claimed_by_session: _} = errors_on(cs)
+      end
+
+      # Nothing was written: the row is intact, and the audit log carries only the claim.
+      row = AdminRepo.get(ChannelClaim, claim.id)
+      refute is_nil(row)
+      assert is_nil(row.done_at)
+      assert claim_audit_actions(tenant.id, claim.id) == ["claimed"]
+    end
+
+    test "#779: a credential-shaped session_id on done fires the shared secret_blocked signal" do
+      %{tenant: tenant, project: project, agent_id: agent} = setup_member()
+      test_pid = self()
+      handler_id = "done-secret-blocked-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :coordination, :secret_blocked],
+        fn _event, measurements, meta, _cfg ->
+          if meta[:tenant_id] == tenant.id, do: send(test_pid, {:blocked, measurements, meta})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      assert {:ok, _} =
+               Coordination.claim(tenant.id, agent, project.id, "r",
+                 role: :agent,
+                 session_id: "session-a",
+                 audit: audit()
+               )
+
+      assert {:error, %Ecto.Changeset{}} =
+               Coordination.done(tenant.id, agent, project.id, "r", audit(),
+                 session_id: "sk-ant-api03-" <> String.duplicate("a", 40)
+               )
+
+      assert_received {:blocked, %{count: 1}, %{field: :claimed_by_session}}
+    end
+
+    test "#779: a NON-STRING session_id is refused, not reported as a forced override" do
+      # A JSON number or object reached the guard, where `nil != 12345` labelled an
+      # UNSTAMPED row `:forced` — a fabricated cross-session override in the very
+      # counter an operator alerts on.
+      %{tenant: tenant, project: project, agent_id: agent} = setup_member()
+      test_pid = self()
+      handler_id = "non-string-session-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :coordination, :claim_session_guard],
+        fn _event, _m, meta, _cfg ->
+          if meta[:tenant_id] == tenant.id, do: send(test_pid, {:guard, meta})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      assert {:ok, _} =
+               Coordination.claim(tenant.id, agent, project.id, "r", role: :agent, audit: audit())
+
+      assert {:error, %Ecto.Changeset{}} =
+               Coordination.done(tenant.id, agent, project.id, "r", audit(),
+                 session_id: %{"a" => 1}
+               )
+
+      refute_received {:guard, %{outcome: :forced}}
+    end
+
+    test "#779: an UNSTAMPED claim is :undiscriminable even when the caller sends no session" do
+      # The migration says the residual pre-#779 population — "every claim live at
+      # deploy time, every curl caller" — is "made OBSERVABLE instead". A curl caller
+      # sends NO session, so keying the outcome on the caller's value made the metric
+      # blind to exactly the callers it counts, and an operator read zero as "gone".
+      %{tenant: tenant, project: project, agent_id: agent} = setup_member()
+      test_pid = self()
+      handler_id = "undiscriminable-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler_id,
+        [:loopctl, :coordination, :claim_session_guard],
+        fn _event, _m, meta, _cfg ->
+          if meta[:tenant_id] == tenant.id, do: send(test_pid, {:guard, meta})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      assert {:ok, _} =
+               Coordination.claim(tenant.id, agent, project.id, "r", role: :agent, audit: audit())
+
+      assert {:ok, _} = Coordination.done(tenant.id, agent, project.id, "r", audit())
+
+      assert_received {:guard, %{outcome: :undiscriminable}}
+    end
+
+    test "#779: an EXPIRED-lease release is never recorded as a forced override" do
+      # The guard does not run on a dead lease — no telemetry, no warning — so `force`
+      # cleared nothing. Recording it as forced puts a false positive in the one signal
+      # these audit fields exist to give (KB 07f5e839's incident class).
+      %{tenant: tenant, project: project, agent_id: agent} = setup_member()
+
+      assert {:ok, claim} =
+               Coordination.claim(tenant.id, agent, project.id, "r",
+                 role: :agent,
+                 session_id: "session-a",
+                 audit: audit()
+               )
+
+      expire_claim(claim)
+
+      assert {:ok, _} =
+               Coordination.release(tenant.id, agent, project.id, "r", audit(),
+                 session_id: "session-b",
+                 force: true
+               )
+
+      assert [_claimed, released] = claim_audit_metadata(tenant.id, claim.id)
+      assert released["forced"] == false
+      assert released["caller_session"] == "session-b"
+    end
+
     test "a NON-OWNER agent still gets a byte-identical not_found, never the session 409" do
       # The session guard must never become an existence oracle: it runs only AFTER the
       # (tenant, project, claimant_agent_id, ref) owner fetch has already matched.
@@ -827,8 +984,10 @@ defmodule Loopctl.CoordinationClaimTest do
       # the ref could then never be claimed, and a pre-existing row whose ref tripped
       # the scan lost its idempotent owner re-claim (claim/5 applies this changeset
       # BEFORE the collision is resolved) — the dropped-handoff window that branch
-      # exists to close. The exposure is covered where the instructions live:
-      # `ChannelPost.key` is scanned, so a credential-shaped ref cannot be published.
+      # exists to close. The residual is accepted, not covered: a claim needs no post,
+      # so a credential-shaped ref on a postless claim IS stored unscanned. What
+      # `ChannelPost.key`'s scan buys is only that it can never be published together
+      # with its instructions.
       cs = discriminator_changeset(%{ref: "handoff:feature/task-sk-integration_with_stripe_v2"})
 
       assert cs.valid?

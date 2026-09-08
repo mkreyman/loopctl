@@ -385,8 +385,8 @@ describe("US-40.B1: channel_claim / channel_release / channel_done wiring", () =
     const src = functionSource("channelClaim");
     assert.match(
       src,
-      /payload\.session_id = CHANNEL_SESSION_ID;/,
-      "channelClaim must stamp CHANNEL_SESSION_ID on the claim",
+      /payload\.session_id = CLAIM_SESSION_ID;/,
+      "channelClaim must stamp CLAIM_SESSION_ID on the claim",
     );
     assert.match(
       src,
@@ -395,11 +395,31 @@ describe("US-40.B1: channel_claim / channel_release / channel_done wiring", () =
     );
   });
 
+  // #779 review round 1: the claim discriminator's lifetime must be the SESSION, not
+  // this PROCESS. Measured on minis 2026-09-08, 3 of 5 running loopctl MCP processes
+  // carried no CLAUDE_SESSION_ID, so the fallback is the common case — and a uuid
+  // re-minted on every npx respawn made the server read this session's OWN live claims
+  // as a peer's, 409 claim_session_mismatch on its own work for the rest of a lease.
+  test("the claim discriminator's fallback is DURABLE, not per-process (#779)", () => {
+    assert.match(
+      INDEX_SRC,
+      /const CLAIM_SESSION_ID =\s*process\.env\.CLAUDE_SESSION_ID \|\| durableClaimSessionId\(\);/,
+      "CLAIM_SESSION_ID must fall back to durableClaimSessionId(), never crypto.randomUUID()",
+    );
+
+    const start = INDEX_SRC.indexOf("function durableClaimSessionId(");
+    assert.notEqual(start, -1, "index.js must define durableClaimSessionId");
+    const src = INDEX_SRC.slice(start, INDEX_SRC.indexOf("const CLAIM_SESSION_ID", start));
+    // The NAME being durable is worth nothing; these two lines are what makes it so.
+    assert.match(src, /readFileSync\(file, "utf8"\)/, "must re-read the persisted id");
+    assert.match(src, /writeFileSync\(file, minted/, "must persist a freshly minted id");
+  });
+
   test("channelClaims sends session_id so the server can answer same_session (#779)", () => {
     assert.match(
       functionSource("channelClaims"),
-      /params\.set\("session_id", CHANNEL_SESSION_ID\);/,
-      "channelClaims must send CHANNEL_SESSION_ID so rows carry same_session",
+      /params\.set\("session_id", CLAIM_SESSION_ID\);/,
+      "channelClaims must send CLAIM_SESSION_ID so rows carry same_session",
     );
   });
 
@@ -408,8 +428,8 @@ describe("US-40.B1: channel_claim / channel_release / channel_done wiring", () =
       const src = functionSource(fn);
       assert.match(
         src,
-        /session_id: CHANNEL_SESSION_ID/,
-        `${fn} must send CHANNEL_SESSION_ID so the server can refuse a peer session's claim`,
+        /session_id: CLAIM_SESSION_ID/,
+        `${fn} must send CLAIM_SESSION_ID so the server can refuse a peer session's claim`,
       );
       assert.match(
         src,
