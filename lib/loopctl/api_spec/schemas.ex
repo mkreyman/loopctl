@@ -4445,6 +4445,15 @@ defmodule Loopctl.ApiSpec.Schemas do
                   type: :integer,
                   description: "Dropped because this `session_id` was already shown them."
                 },
+                readmitted_already_seen: %Schema{
+                  type: :integer,
+                  description:
+                    "Already-shown articles RE-ADMITTED because containment would " <>
+                      "otherwise have left the page short: suppression may never cost a " <>
+                      "slot it cannot refill, since an empty knowledge half reads as " <>
+                      "\"the KB has nothing on this\". Non-zero means this session has " <>
+                      "exhausted the matching pool for that query."
+                },
                 dropped_exact_duplicates: %Schema{
                   type: :integer,
                   description: "Dropped as an exact content-hash duplicate of a survivor."
@@ -4473,7 +4482,11 @@ defmodule Loopctl.ApiSpec.Schemas do
             },
             tokens_candidates: %Schema{
               type: :integer,
-              description: "Summed `tokens_estimate` over ALL candidates. An estimate."
+              description:
+                "Summed `tokens_estimate` over every candidate the MERGED CAP could have " <>
+                  "handed you. An estimate. Not the over-fetched diversity pool: rows the " <>
+                  "server had already ruled out as duplicates of ones it did show were " <>
+                  "never on offer, and counting them would inflate the saving below."
             },
             tokens_saved_vs_candidates: %Schema{
               type: :integer,

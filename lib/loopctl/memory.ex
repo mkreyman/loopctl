@@ -1537,7 +1537,7 @@ defmodule Loopctl.Memory do
       recall(scope, query: query, limit: limit, embedding: embedding_result, on_overload: :tag)
 
     {knowledge_env, kopts} =
-      knowledge_recall(scope, query, knowledge_pool, opts, embedding_result, recall_id)
+      knowledge_recall(scope, query, knowledge_pool, limit, opts, embedding_result, recall_id)
 
     memory_reason = memory_selection_reason(memory_env)
 
@@ -1576,10 +1576,17 @@ defmodule Loopctl.Memory do
     # ruled out as duplicates of ones it did show.
     knowledge_env = %{knowledge_env | results: Enum.map(knowledge_items, & &1.article)}
 
+    # TWO lists, deliberately. `candidates` is what the SELECTION had to choose from (the
+    # over-fetched pool), and it is what `candidates_considered` reports. `merge_eligible`
+    # is what the MERGED CAP could actually have handed you, and it is what the token
+    # figures are computed over: `tokens_saved_vs_candidates` is documented as the budget
+    # the cap saved, and counting rows the server had already ruled out as duplicates of
+    # ones it did show would inflate that saving by the whole over-fetch.
     candidates = memory_items ++ knowledge_candidates
+    merge_eligible = memory_items ++ knowledge_items
 
     merged =
-      (memory_items ++ knowledge_items)
+      merge_eligible
       |> Enum.sort_by(&merge_order_key/1)
       |> Enum.take(limit)
       # 1-based POST-MERGE rank. It is deliberately not the per-source rank: what a client
@@ -1598,11 +1605,15 @@ defmodule Loopctl.Memory do
 
     # Containment-in-history is recorded for what the merge PUBLISHED, never for the
     # candidate pool: marking a candidate the cap dropped would suppress an article this
-    # session was never shown.
-    RecallHistoryCache.mark_shown(scope.tenant_id, session_id, published)
+    # session was never shown. Only while selection is ON — the master switch has to turn
+    # the ETS growth off too, or a disabled feature still writes an entry per row per
+    # recall for the whole TTL.
+    if diversity_opts.enabled? do
+      RecallHistoryCache.mark_shown(scope.tenant_id, scope.subject_id, session_id, published)
+    end
 
     tokens_selected = sum_tokens(merged)
-    tokens_candidates = sum_tokens(candidates)
+    tokens_candidates = sum_tokens(merge_eligible)
 
     {degraded_reason, degraded_lane} = merged_degradation(memory_env, knowledge_env, ledger)
 
@@ -1669,13 +1680,23 @@ defmodule Loopctl.Memory do
   # `%{results: [...], meta: %{...}}` envelope. On ANY error (empty query, invalid
   # weights, bad_request) the knowledge side degrades to empty results tagged
   # `degraded?: true` — the merged call never propagates a knowledge fault as a crash.
-  defp knowledge_recall(scope, query, limit, opts, embedding_result, recall_id) do
+  # `pool` is the OVER-FETCHED candidate count the search actually runs at;
+  # `requested_limit` is what the caller asked for and the only number the RESPONSE may
+  # describe itself with. Both are needed here: the first sizes the read, the second is
+  # what the envelope meta and the `search_events` row publish (#792).
+  defp knowledge_recall(scope, query, pool, requested_limit, opts, embedding_result, recall_id) do
     kopts =
       [
         project_id: scope.project_id,
         project_scope: :with_global,
-        limit: limit
+        limit: pool
       ]
+      # `:limit` on this path is the OVER-FETCHED diversity pool, not what the caller asked
+      # for and not what it will be handed (#792). Both `search_events` columns that
+      # describe the caller's side of the exchange therefore have to be told the real
+      # number, or every asked-vs-returned figure for the recall surface reads ~3x high.
+      |> Keyword.put(:_limit_requested, requested_limit)
+      |> Keyword.put(:_result_cap, requested_limit)
       |> maybe_put_opt(:status, opt(opts, :status, nil))
       |> maybe_put_opt(:visibility_agent_id, opt(opts, :visibility_agent_id, nil))
       # Thread the read-attribution key so `search_combined/3` records knowledge-access
@@ -1706,13 +1727,21 @@ defmodule Loopctl.Memory do
         {:ok, %{results: results, meta: meta}} ->
           # A keyword-only fallback (embedding unavailable) sets meta.fallback; carry
           # that forward as degraded? so the merged meta reflects a degraded knowledge side.
-          %{results: results, meta: Map.put(meta, :degraded?, Map.get(meta, :fallback, false))}
+          # `meta.limit` is restored to the CALLER's limit: the search ran at the
+          # over-fetched pool size, but an envelope whose `meta.limit` describes an
+          # internal pool tells a paging client to skip `pool - limit` rows per page.
+          meta =
+            meta
+            |> Map.put(:degraded?, Map.get(meta, :fallback, false))
+            |> Map.put(:limit, requested_limit)
+
+          %{results: results, meta: meta}
 
         {:error, reason} ->
-          degraded_knowledge_env(scope.tenant_id, reason, limit, recall_id)
+          degraded_knowledge_env(scope.tenant_id, reason, requested_limit, recall_id)
 
         {:error, reason, _message} ->
-          degraded_knowledge_env(scope.tenant_id, reason, limit, recall_id)
+          degraded_knowledge_env(scope.tenant_id, reason, requested_limit, recall_id)
       end
 
     # `kopts` rides back out because the surfacing rows are written after the MERGE and
@@ -1902,7 +1931,7 @@ defmodule Loopctl.Memory do
     vectors =
       if diversity_opts.enabled?, do: Knowledge.diversity_vectors(scope.tenant_id, ids), else: %{}
 
-    exclude = RecallHistoryCache.shown_ids(scope.tenant_id, session_id, ids)
+    exclude = RecallHistoryCache.shown_ids(scope.tenant_id, scope.subject_id, session_id, ids)
 
     {selected, stats} =
       candidates
@@ -1933,8 +1962,10 @@ defmodule Loopctl.Memory do
 
   # The recall SESSION token, used only as a containment-in-history key. Opaque and
   # client-chosen, so it is never a scope on its own — `RecallHistoryCache` keys on
-  # `(tenant_id, session_id, article_id)`, and a blank or non-binary value disables
-  # containment rather than sharing one bucket between every anonymous caller.
+  # `(tenant_id, subject_id, session_id, article_id)`, both server-derived halves included,
+  # so a token another principal in the tenant picks (or guesses) can never suppress rows
+  # from THIS caller's recall. A blank or non-binary value disables containment rather than
+  # sharing one bucket between every anonymous caller.
   defp session_opt(opts) do
     case opt(opts, :session_id, nil) do
       value when is_binary(value) ->

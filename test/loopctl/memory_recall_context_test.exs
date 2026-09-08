@@ -500,6 +500,27 @@ defmodule Loopctl.MemoryRecallContextTest do
       assert second.meta.diversity.dropped_already_seen >= 1
     end
 
+    test "a session that has exhausted the pool still gets rows, not an empty half", ctx do
+      marker = "exhaust#{System.unique_integer([:positive])}"
+      session = "sess-#{System.unique_integer([:positive])}"
+
+      for i <- 1..2, do: embedded_article(ctx.tenant.id, "#{marker} a#{i}", spiked(i * 37))
+
+      # Recall the same topic until every matching article is in this session's history.
+      for _ <- 1..3 do
+        Memory.recall_context(ctx.scope, query: marker, limit: 2, session_id: session)
+      end
+
+      final = Memory.recall_context(ctx.scope, query: marker, limit: 2, session_id: session)
+
+      # WITHOUT the containment floor this is an EMPTY knowledge half for the whole TTL,
+      # and the agent reads that as "the KB has nothing on this" while the articles it
+      # asked for still exist. A repeat is a worse answer than a fresh one; it is a far
+      # better answer than nothing.
+      assert knowledge_result_ids(final) != []
+      assert final.meta.diversity.readmitted_already_seen > 0
+    end
+
     test "containment is per-tenant: another tenant's identical session token is inert", ctx do
       marker = "histiso#{System.unique_integer([:positive])}"
       session = "sess-#{System.unique_integer([:positive])}"
@@ -585,6 +606,36 @@ defmodule Loopctl.MemoryRecallContextTest do
       assert length(result.knowledge.results) <= 2
       assert result.meta.knowledge_count == length(result.knowledge.results)
       assert result.meta.candidates_considered.knowledge >= result.meta.knowledge_count
+      # The envelope's own meta must describe the envelope's own data: `meta.limit` is the
+      # limit the CALLER asked for, never the internal over-fetch. A client paging on
+      # `offset + meta.limit` would otherwise skip `pool - limit` articles per page.
+      assert result.knowledge.meta.limit == 2
+    end
+
+    test "search_events records what the CALLER asked for and got, not the over-fetched pool",
+         ctx do
+      {_raw, key} = fixture(:api_key, %{tenant_id: ctx.tenant.id, role: :agent})
+      marker = "sevent#{System.unique_integer([:positive])}"
+
+      for i <- 1..5, do: embedded_article(ctx.tenant.id, "#{marker} a#{i}", spiked(i * 43))
+
+      result =
+        Memory.recall_context(ctx.scope, query: marker, limit: 1, api_key_id: key.id)
+
+      [event] =
+        Loopctl.AdminRepo.all(
+          from(e in Loopctl.Knowledge.SearchEvent, where: e.tenant_id == ^ctx.tenant.id)
+        )
+
+      assert event.tool == "memory_recall"
+      # The knowledge half RUNS at `limit x over_fetch` so drops can be refilled — but the
+      # two columns that describe the CALLER's side of the exchange must not inherit that.
+      # `limit_requested` answers "did callers ask for more than we return", and
+      # `result_count` is what this surface handed back; the over-fetch is an internal
+      # detail that would read as a 3x inflation in every figure built on either.
+      assert result.meta.candidates_considered.knowledge > 1
+      assert event.limit_requested == 1
+      assert event.result_count == 1
     end
 
     test "an unembedded article is never dropped as a duplicate", ctx do

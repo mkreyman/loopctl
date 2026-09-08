@@ -1867,7 +1867,8 @@ async function recallContext({ query, project_id, limit, session_id }) {
   if (project_id) payload.project_id = project_id;
   if (limit != null) payload.limit = limit;
   // #792: the containment-in-history key. Opaque and client-chosen; the server keys its
-  // shown-set on (tenant, session, article), so it is never an isolation boundary.
+  // shown-set on (tenant, subject, session, article) — both server-derived halves of the
+  // memory scope ahead of the token — so it is never an isolation boundary.
   if (session_id) payload.session_id = session_id;
 
   const result = await apiCall(
@@ -5598,9 +5599,12 @@ const TOOLS = [
             "Optional: an opaque token for THIS session (max 200 bytes). Pass the same " +
             "value on every recall in a session and the server skips articles it already " +
             "showed you, refilling the freed slot with the next distinct candidate — " +
-            "which a client-side filter cannot do. Not an isolation boundary (history is " +
-            "keyed on tenant + session + article) and best-effort: a miss just " +
-            "re-surfaces an article. Omit it to disable containment for that call.",
+            "which a client-side filter cannot do. It can never starve you: once a " +
+            "session has exhausted the matching pool the highest-ranked repeats come " +
+            "back, so an empty knowledge half always means the corpus, never the " +
+            "suppression. Not an isolation boundary (history is keyed on tenant + " +
+            "subject + session + article) and best-effort: a miss just re-surfaces an " +
+            "article. Omit it to disable containment for that call.",
         },
       },
       required: ["query"],

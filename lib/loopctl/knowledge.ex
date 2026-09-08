@@ -1331,16 +1331,23 @@ defmodule Loopctl.Knowledge do
   `Loopctl.Knowledge.Diversity` treats an absent vector as unmeasurable rather than as
   dissimilar.
 
-  Scoped by the SAME disjunctive predicate every read path on this corpus uses —
+  Covers the SAME population every read path on this corpus does —
   `a.tenant_id == ^tenant_id or a.scope == :system` — because a recall pool legitimately
-  contains published system canonicals, whose `articles.tenant_id` is NULL. No status or
-  visibility filter: the ids arrive from a search that already applied both, and
-  re-filtering here could only differ from that search, never improve on it.
+  contains published system canonicals, whose `articles.tenant_id` is NULL. It reaches that
+  population as TWO conjunctive reads rather than one disjunctive query, for the pool
+  reason below. No status or visibility filter: the ids arrive from a search that already
+  applied both, and re-filtering here could only differ from that search, never improve on
+  it.
 
-  `AdminRepo`, not `HeavyRead`: this is a bounded `id IN (<= max_pool)` projection, and a
-  system-scoped row's NULL `articles.tenant_id` cannot satisfy the heavy-read guard's
-  required conjunctive tenant predicate (the same reason `hydrate_semantic_pool/6` stays
-  on `AdminRepo`).
+  Split across the two pools exactly like `backfill_snippets/2`'s
+  `tenant_lead_rows/2` + `system_lead_rows/1`, and for the same reason: this runs on the
+  PUBLIC search and recall paths, and `AdminRepo`'s pool is three connections
+  (`config/runtime.exs`) that every authenticated request already needs for
+  `ValidateWitnessHeader`. So the tenant's own articles — all of them, on a tenant with no
+  canonicals — are read through `Loopctl.HeavyRead`, which has its own pool and SHEDS under
+  load (the correct degradation for a best-effort correction), and only the ids that read
+  did not resolve, i.e. the system canonicals whose NULL `articles.tenant_id` can never
+  satisfy the heavy-read guard's conjunctive tenant predicate, fall back to `AdminRepo`.
 
   Behind the US-41.1 cutover flag the vector comes from the dimension-tagged side table at
   the tenant's active dimension; `update_embedding/5` never writes `articles.embedding` for
@@ -1365,10 +1372,14 @@ defmodule Loopctl.Knowledge do
     if ids == [] do
       %{}
     else
-      tenant_id
-      |> diversity_vectors_query(ids)
-      |> AdminRepo.all()
-      |> Map.new(fn row ->
+      tenant_rows = tenant_diversity_rows(tenant_id, ids)
+      resolved = MapSet.new(tenant_rows, & &1.id)
+
+      system_rows =
+        tenant_id
+        |> system_diversity_rows(Enum.reject(ids, &MapSet.member?(resolved, &1)))
+
+      Map.new(tenant_rows ++ system_rows, fn row ->
         {row.id, %{embedding: to_vector_list(row.embedding), content_hash: row.content_hash}}
       end)
     end
@@ -1381,6 +1392,35 @@ defmodule Loopctl.Knowledge do
       %{}
   end
 
+  # The tenant's OWN articles, on the heavy-read pool. Conjunctive `a.tenant_id ==
+  # ^tenant_id` (plus the side table's own conjunctive tenant equality on the join) is what
+  # `HeavyRead.guard!/2` requires; a shed returns no rows, which disables the similarity
+  # stages for this call exactly as a failed fetch does.
+  defp tenant_diversity_rows(tenant_id, ids) do
+    query =
+      tenant_id
+      |> diversity_vectors_query(ids)
+      |> where([a], a.tenant_id == ^tenant_id)
+
+    case HeavyRead.all(tenant_id, query, semantic_heavy_read_opts()) do
+      rows when is_list(rows) -> rows
+      _shed -> []
+    end
+  end
+
+  # Only the leftovers: published system canonicals, whose `articles.tenant_id` is NULL and
+  # which therefore cannot be read through the tenant-guarded pool. Bounded by whatever the
+  # tenant-scoped read above did not already resolve, so a page with no canonical spends
+  # nothing on the small admin pool.
+  defp system_diversity_rows(_tenant_id, []), do: []
+
+  defp system_diversity_rows(tenant_id, ids) do
+    tenant_id
+    |> diversity_vectors_query(ids)
+    |> where([a], a.scope == :system)
+    |> AdminRepo.all()
+  end
+
   defp diversity_vectors_query(tenant_id, ids) do
     if Embeddings.side_table_reads_enabled?() do
       dimension = Embeddings.active_dimension(tenant_id)
@@ -1391,13 +1431,11 @@ defmodule Loopctl.Knowledge do
           ae.article_id == a.id and ae.tenant_id == ^tenant_id and ae.dim == ^dimension and
             ae.live_denorm,
         where: a.id in ^ids,
-        where: a.tenant_id == ^tenant_id or a.scope == :system,
         select: %{id: a.id, embedding: ae.embedding, content_hash: ae.embedding_content_hash}
       )
     else
       from(a in Article,
         where: a.id in ^ids,
-        where: a.tenant_id == ^tenant_id or a.scope == :system,
         select: %{id: a.id, embedding: a.embedding, content_hash: a.embedding_content_hash}
       )
     end
@@ -2974,7 +3012,7 @@ defmodule Loopctl.Knowledge do
       total_count: Keyword.get(opts, :_total_count),
       top_result_id: top_result_id(top),
       top_result_score: top_result_score(top),
-      result_count: length(results),
+      result_count: recorded_result_count(results, opts),
       duration_ms: search_duration_ms(opts),
       ann_iterative_scan: Keyword.get(opts, :_ann_iterative_scan),
       degraded?: Keyword.get(opts, :_degraded, false),
@@ -2985,6 +3023,21 @@ defmodule Loopctl.Knowledge do
     # request header must not be able to overwrite `agent_id`, `tool` or `outcome`. The
     # controller's whitelist makes a collision impossible TODAY — this makes it structural.
     Map.merge(client_context_attrs(opts), attrs)
+  end
+
+  # The rows the CALLING SURFACE could hand back, which stops being `length(results)` the
+  # moment a caller OVER-FETCHES internally: the merged recall (#792) reads `limit x
+  # over_fetch` candidates and then reduces them to `limit`, so an uncapped count would
+  # claim a `memory_recall` row returned three times what the caller was shown, and every
+  # zero-result / asked-vs-returned figure built on this column would read that. Capping at
+  # the caller's own limit restores the pre-over-fetch value EXACTLY: a search run at limit
+  # L returns `min(corpus_matches, L)`, which is `min(length(pool_results), L)` for any pool
+  # at or above L.
+  defp recorded_result_count(results, opts) do
+    case Keyword.get(opts, :_result_cap) do
+      cap when is_integer(cap) and cap > 0 -> min(length(results), cap)
+      _ -> length(results)
+    end
   end
 
   # Read with `Map.get/2`, never `top[:key]`: Access is undefined on structs, so the Access
@@ -11048,8 +11101,14 @@ defmodule Loopctl.Knowledge do
           | {:error, :empty_query}
           | {:error, atom(), String.t()}
   def hybrid_search(tenant_id, query_string, opts \\ []) when is_binary(tenant_id) do
-    requested_limit = Keyword.get(opts, :limit, 10)
-    requested_offset = Keyword.get(opts, :offset, 0)
+    # Clamped HERE, not left to `paginate_results/2` at the end. Until #792 the raw value
+    # only ever reached that function, which clamps it; now it also sizes the diversity
+    # window, whose cost is quadratic in the number of candidates it walks. An unclamped
+    # `limit: 1000` (the controller clamps to `max_page_size/0`, which is 1000, not to the
+    # 100-row relevance cap) therefore bought a caller ~6.6 SECONDS of single-threaded
+    # cosine arithmetic on the request process for one request.
+    requested_limit = opts |> Keyword.get(:limit, 10) |> max(1) |> min(@max_relevance_page_size)
+    requested_offset = opts |> Keyword.get(:offset, 0) |> max(0)
 
     # Force the INNER search over the full ranked pool (offset 0, the same cap
     # `search_combined/3`'s own sub-searches already use) so the provenance decision
@@ -11086,7 +11145,6 @@ defmodule Loopctl.Knowledge do
           tenant_id,
           ordered_pool,
           requested_limit,
-          requested_offset,
           curated_article_id,
           opts
         )
@@ -11130,28 +11188,33 @@ defmodule Loopctl.Knowledge do
   end
 
   # #792 on the hybrid path. Shares `Loopctl.Knowledge.Diversity` with the merged recall —
-  # same pipeline, same knobs, same `meta.diversity` shape — with two constraints of its
+  # same pipeline, same knobs, same `meta.diversity` shape — with three constraints of its
   # own:
   #
-  #   * **Only at offset 0.** Diversity selection is not a stable page function: it
-  #     re-chooses from the whole pool, so "page 2 of a diversified list" has no meaning
-  #     that survives the first page changing. A paged caller gets the untouched ranked
-  #     pool and a `enabled: false` stats block saying so.
+  #   * **It REORDERS the pool, it never shortens it.** The selection is applied to the
+  #     HEAD of the ranked pool and everything it did not pick is kept, in pool order,
+  #     immediately behind it. That is what keeps pagination a PARTITION: this used to run
+  #     only at `offset == 0` and to DISCARD the unselected window, so page 1 (diversified,
+  #     drawing from pool positions 0..29) and page 2 (the raw pool, positions 10..19)
+  #     overlapped — a client paging one query got rows twice and never saw the ones MMR
+  #     skipped. Running it identically at every offset also makes the diversified pool a
+  #     stable function of the query, which is what "page 2 of a diversified list" needs in
+  #     order to mean anything.
   #   * **The curated winner is PINNED.** `hoist_to_front/2` exists so that a caller
   #     branching on `meta.provenance == :curated` can trust `List.first(results)`;
   #     letting MMR demote or drop it would silently revoke that guarantee. Pinned, it
   #     still SUPPRESSES near-copies of itself, which is the behaviour that matters.
-  #
-  # The vector fetch is bounded to the window this page could draw on, never the full
-  # `@max_relevance_page_size` pool the provenance decision reasons over: the decision
-  # needs 200 candidates, and diversity needs `limit x over_fetch` of them.
-  defp diversify_hybrid_pool(_tenant_id, [], _limit, _offset, _curated_id, opts),
+  #   * **The window is capped at `:max_pool`.** MMR walks its window quadratically, and
+  #     unlike the recall half — where the pool IS the fetch, so a cap below `limit` would
+  #     cost rows — a short window here costs nothing: the page still fills from the tail
+  #     the selection left behind.
+  defp diversify_hybrid_pool(_tenant_id, [], _limit, _curated_id, opts),
     do: {[], disabled_diversity_stats([], 0, opts)}
 
-  defp diversify_hybrid_pool(tenant_id, pool, limit, offset, curated_id, opts) do
+  defp diversify_hybrid_pool(tenant_id, pool, limit, curated_id, opts) do
     config = Diversity.config(opts)
 
-    if config.enabled? and offset == 0 do
+    if config.enabled? do
       run_hybrid_diversity(tenant_id, pool, limit, curated_id, config)
     else
       {pool, disabled_diversity_stats(pool, limit, opts)}
@@ -11159,7 +11222,8 @@ defmodule Loopctl.Knowledge do
   end
 
   defp run_hybrid_diversity(tenant_id, pool, limit, curated_id, config) do
-    window = Enum.take(pool, Diversity.pool_size(limit, config))
+    window = Enum.take(pool, min(Diversity.pool_size(limit, config), config.max_pool))
+    window_size = length(window)
     positions = window |> Enum.map(& &1.id) |> Enum.with_index() |> Map.new()
     vectors = diversity_vectors(tenant_id, Map.keys(positions))
 
@@ -11167,7 +11231,7 @@ defmodule Loopctl.Knowledge do
 
     {selected, stats} =
       window
-      |> Enum.map(&hybrid_diversity_candidate(&1, vectors))
+      |> Enum.map(&hybrid_diversity_candidate(&1, vectors, positions, window_size))
       |> Diversity.select(limit, config, preselected: pinned)
 
     # MMR chose WHAT is in the page; the POOL's own ranking chooses the order, with the
@@ -11180,15 +11244,26 @@ defmodule Loopctl.Knowledge do
         {result.id != curated_id, Map.get(positions, result.id, 0)}
       end)
 
-    {ordered ++ Enum.drop(pool, length(window)), stats}
+    chosen = MapSet.new(ordered, & &1.id)
+    deferred = Enum.reject(window, &MapSet.member?(chosen, &1.id))
+
+    {ordered ++ deferred ++ Enum.drop(pool, window_size), stats}
   end
 
-  defp hybrid_diversity_candidate(result, vectors) do
+  # `:score` is the candidate's POSITION in the fused pool, normalized to (0, 1] — NOT
+  # `absolute_result_score/1`. The pool is ordered by the RRF `final_score` (#470), while
+  # the absolute score is raw cosine for a semantic row and `raw/(raw+1)` of `ts_rank_cd`
+  # for a keyword one: two INCOMPARABLE scales, whose interchangeable use was the defect
+  # US-31.2 fixed. Selecting on them would have re-chosen the page against the ranking the
+  # caller was given, and would have broken `Diversity`'s documented `lambda: 1.0`
+  # identity, which holds only when `:score` descends with the caller's own order.
+  defp hybrid_diversity_candidate(result, vectors, positions, window_size) do
     vector = Map.get(vectors, result.id, %{})
+    rank = Map.get(positions, result.id, window_size)
 
     %{
       id: result.id,
-      score: absolute_result_score(result),
+      score: 1.0 - rank / max(window_size, 1),
       embedding: Map.get(vector, :embedding),
       content_hash: Map.get(vector, :content_hash),
       result: result

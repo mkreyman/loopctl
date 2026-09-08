@@ -144,13 +144,18 @@ counts land in `meta.diversity`. The full pipeline, its knobs and its rationale
 are documented once, in [`agent-memory.md`](agent-memory.md) under "Diversity
 selection on the knowledge half".
 
-Two constraints are specific to this function and must not be dropped:
+Three constraints are specific to this function and must not be dropped:
 
-- **Only at `offset: 0`.** Selection re-chooses from the whole pool, so "page 2
-  of a diversified list" has no meaning that survives page 1 changing. A paged
-  request gets the untouched ranked pool and `meta.diversity.enabled: false` —
-  present and false rather than absent, so a caller can tell "off" from "found
-  nothing".
+- **It reorders the pool; it never shortens it.** Selection is applied to the
+  head of the ranked pool and everything it did not pick stays, in pool order,
+  directly behind it — so the union of the pages of one query is still a
+  PARTITION of the pool. Running it only at `offset: 0`, and discarding the
+  unselected window, made page 1 (drawn from pool positions 0..29) and page 2
+  (raw positions 10..19) overlap: a paging client got rows twice and never saw
+  the ones MMR skipped.
+- **It runs identically at every offset.** That is what makes the diversified
+  pool a stable function of the query rather than of the page, which is the
+  property "page 2 of a diversified list" needs in order to mean anything.
 - **The curated winner is PINNED.** `hoist_to_front/2` exists so a caller
   branching on `meta.provenance == :curated` can trust `List.first(results)`;
   letting MMR demote or drop it would silently revoke that guarantee. It is
@@ -158,9 +163,13 @@ Two constraints are specific to this function and must not be dropped:
   itself — which prepending it afterwards would not.
 
 The vector fetch is bounded to the window the page can draw on
-(`limit x over_fetch`), never the `@max_relevance_page_size` pool the provenance
-decision reasons over: the decision needs the wide pool, diversity does not, and
-each pool member costs a vector read.
+(`limit x over_fetch`, itself capped at `:recall_diversity_max_pool`), never the
+`@max_relevance_page_size` pool the provenance decision reasons over: the
+decision needs the wide pool, diversity does not, and each pool member costs a
+vector read. The cap can be tighter here than on the recall half — where the pool
+IS the fetch, so capping below `limit` would cost rows — because a short window
+here costs nothing: the page still fills from the tail the selection left
+behind.
 
 ### Degradation honesty
 

@@ -733,31 +733,102 @@ defmodule Loopctl.KnowledgeHybridTest do
       assert meta.diversity.enabled == true
     end
 
-    test "a paged request (offset > 0) is left untouched and says so" do
+    test "paging one query still PARTITIONS the pool — no row on two pages, none lost" do
       tenant = fixture(:tenant)
       Knowledge.reset_circuit_breaker(tenant.id)
       query = "paged clustered query"
 
-      for i <- 1..3 do
-        fixture(:article, %{tenant_id: tenant.id, title: "Paged #{i}", status: :published})
-        |> then(&set_embedding(tenant.id, &1, direction_a()))
-      end
+      published =
+        for i <- 1..4 do
+          fixture(:article, %{tenant_id: tenant.id, title: "Paged #{i}", status: :published})
+          |> then(&set_embedding(tenant.id, &1, direction_a()))
+        end
 
       stub_embeddings_by_query(%{query => direction_a()})
+      opts = [keyword_weight: 0, semantic_weight: 1, limit: 2]
+
+      assert {:ok, %{results: page_1, meta: meta_1}} =
+               Knowledge.hybrid_search(tenant.id, query, opts ++ [offset: 0])
+
+      assert {:ok, %{results: page_2}} =
+               Knowledge.hybrid_search(tenant.id, query, opts ++ [offset: 2])
+
+      ids_1 = Enum.map(page_1, & &1.id)
+      ids_2 = Enum.map(page_2, & &1.id)
+
+      # Selection REORDERS the pool, it never shortens it: everything it did not pick stays
+      # directly behind what it did. Applied only at offset 0 — and discarding the
+      # unselected window — page 1 drew from pool positions 0..29 while page 2 returned raw
+      # positions 2..3, so a client paging one query got rows twice and never saw the ones
+      # MMR skipped.
+      assert ids_1 -- ids_2 == ids_1, "pages 1 and 2 must not overlap"
+      assert Enum.sort(ids_1 ++ ids_2) == Enum.sort(Enum.map(published, & &1.id))
+      # And the block is REAL at a non-zero offset now, not a hard-coded `enabled: false`.
+      assert meta_1.diversity.enabled == true
+    end
+
+    test "a non-positive or oversized limit is clamped, never a FunctionClauseError" do
+      tenant = fixture(:tenant)
+      Knowledge.reset_circuit_breaker(tenant.id)
+      query = "clamped limit query"
+
+      fixture(:article, %{tenant_id: tenant.id, title: "Clamped", status: :published})
+      |> then(&set_embedding(tenant.id, &1, direction_a()))
+
+      stub_embeddings_by_query(%{query => direction_a()})
+
+      # `:limit` used to be clamped only by `paginate_results/2`, at the very END; now it
+      # also sizes the diversity window, whose cost is quadratic in the candidates it
+      # walks. So it is clamped on the way IN: 0 must not reach a `limit > 0` guard, and
+      # 1000 (what the controller's own clamp permits) must not buy a caller the whole
+      # 100-row pool's worth of 1536-dimension cosine arithmetic.
+      assert {:ok, %{results: _}} =
+               Knowledge.hybrid_search(tenant.id, query,
+                 keyword_weight: 0,
+                 semantic_weight: 1,
+                 limit: 0
+               )
 
       assert {:ok, %{meta: meta}} =
                Knowledge.hybrid_search(tenant.id, query,
                  keyword_weight: 0,
                  semantic_weight: 1,
-                 limit: 2,
-                 offset: 1
+                 limit: 1000
                )
 
-      # Selection re-chooses from the whole pool, so "page 2 of a diversified list" has no
-      # meaning that survives page 1 changing. The block reports `enabled: false` rather
-      # than being absent, so a paged caller can tell "off" from "found nothing".
-      assert meta.diversity.enabled == false
-      assert meta.diversity.dropped_near_duplicates == 0
+      assert meta.limit <= Knowledge.max_relevance_page_size()
+    end
+
+    test "the selection WINDOW is capped, and the page still fills from the tail behind it" do
+      tenant = fixture(:tenant)
+      Knowledge.reset_circuit_breaker(tenant.id)
+      query = "windowed query"
+
+      published =
+        for i <- 1..4 do
+          fixture(:article, %{tenant_id: tenant.id, title: "Window #{i}", status: :published})
+          |> then(&set_embedding(tenant.id, &1, direction_a()))
+        end
+
+      stub_embeddings_by_query(%{query => direction_a()})
+
+      assert {:ok, %{results: results, meta: meta}} =
+               Knowledge.hybrid_search(tenant.id, query,
+                 keyword_weight: 0,
+                 semantic_weight: 1,
+                 limit: 4,
+                 # MMR walks its window quadratically, so the window is capped rather than
+                 # left to follow `limit`. Unlike the recall half — where the pool IS the
+                 # fetch, so a cap below `limit` would cost rows — a short window here
+                 # costs nothing.
+                 diversity_max_pool: 2
+               )
+
+      assert meta.diversity.candidates == 2
+      # ...and the page is STILL full: the two the window never looked at follow the ones
+      # it selected, in pool order.
+      assert length(results) == 4
+      assert Enum.sort(Enum.map(results, & &1.id)) == Enum.sort(Enum.map(published, & &1.id))
     end
 
     test "an empty pool still publishes a well-formed diversity block" do

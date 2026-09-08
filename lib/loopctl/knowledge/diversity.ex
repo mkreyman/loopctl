@@ -18,7 +18,11 @@ defmodule Loopctl.Knowledge.Diversity do
     1. **Containment in history** — an id in `:exclude_ids` was already shown to this
        session and is dropped. Server-side, so the slot it frees is REFILLED from the
        over-fetched pool rather than merely dropped (which is all a client-side filter
-       can do).
+       can do). It has a FLOOR: containment may never cost a slot it cannot refill, so
+       when the shown-set has swallowed the pool the highest-ranked repeats are re-admitted
+       (counted as `readmitted_already_seen`) rather than returning a short or empty page.
+       An empty knowledge half is read as "the KB has nothing on this", which is a worse
+       answer than a repeat.
     2. **Exact-fingerprint dedup** — candidates sharing a `:content_hash` collapse to the
        highest-ranked one. A `nil` hash is never a fingerprint: unfingerprinted rows are
        all distinct from each other and from everything else.
@@ -37,10 +41,15 @@ defmodule Loopctl.Knowledge.Diversity do
 
   At `lambda: 1.0` the MMR term is `1.0 * score - 0.0 * max_sim`, which is `score` to the
   bit (`x - 0.0 == x` for every finite float), and ties resolve to the earlier input
-  position. So the MMR stage degenerates to "take them in the order you were given" —
-  the pre-#792 behaviour — and `t:stats/0` reports zero drops. The dedup stages are
-  INDEPENDENT knobs: pass a `:near_dup_threshold` above `1.0` to disable them too and the
-  whole function is `Enum.take(candidates, limit)`.
+  position. So the MMR stage degenerates to "take the highest `:score`, ties to the earlier
+  position", and because the caller supplies candidates IN RELEVANCE ORDER — `:score`
+  descending on the caller's own ranking scale — that is "take them in the order you were
+  given", the pre-#792 behaviour, with `t:stats/0` reporting zero drops. THE PRECONDITION IS
+  LOAD-BEARING: a caller that ranks the list on one scale and fills `:score` from another
+  gets a page MMR re-chose even at λ = 1.0, which is why `Knowledge.hybrid_search/3` scores
+  its candidates from their POSITION in the fused pool rather than from a per-lane absolute
+  score. The dedup stages are INDEPENDENT knobs: pass a `:near_dup_threshold` above `1.0` to
+  disable them too and the whole function is `Enum.take(candidates, limit)`.
 
   ## Ordering is NOT this module's job
 
@@ -89,6 +98,7 @@ defmodule Loopctl.Knowledge.Diversity do
           candidates: non_neg_integer(),
           selected: non_neg_integer(),
           dropped_already_seen: non_neg_integer(),
+          readmitted_already_seen: non_neg_integer(),
           dropped_exact_duplicates: non_neg_integer(),
           dropped_near_duplicates: non_neg_integer(),
           vectors_available: non_neg_integer()
@@ -136,7 +146,10 @@ defmodule Loopctl.Knowledge.Diversity do
       clamped to `[0.0, 1.0]`. `1.0` is pure relevance.
     * `:recall_diversity_near_dup_threshold` (default `#{@default_near_dup_threshold}`) —
       cosine at or above which a candidate is a duplicate of something already selected.
-      A value above `1.0` disables the stage (cosine cannot exceed 1.0).
+      A value above `1.0` disables the stage (cosine cannot exceed 1.0). It must be
+      STRICTLY POSITIVE: `0` is in `[0.0, 1.0]` and would classify every candidate —
+      including every UNMEASURABLE one, whose similarity is `0.0` by definition — as a
+      duplicate, so one config typo would return nothing for every query on the node.
     * `:recall_diversity_over_fetch` (default `#{@default_over_fetch}`) — how many times
       `limit` to fetch so drops can be refilled.
     * `:recall_diversity_max_pool` (default `#{@default_max_pool}`) — hard ceiling on the
@@ -150,7 +163,14 @@ defmodule Loopctl.Knowledge.Diversity do
     %{
       enabled?: bool_opt(overrides, :diversity_enabled, :recall_diversity_enabled, true),
       lambda:
-        unit_opt(overrides, :diversity_lambda, :recall_diversity_lambda, @default_lambda, 1.0),
+        unit_opt(
+          overrides,
+          :diversity_lambda,
+          :recall_diversity_lambda,
+          @default_lambda,
+          1.0,
+          :non_negative
+        ),
       near_dup_threshold:
         unit_opt(
           overrides,
@@ -159,7 +179,11 @@ defmodule Loopctl.Knowledge.Diversity do
           @default_near_dup_threshold,
           # Deliberately above 1.0: the documented way to DISABLE the stage is a threshold
           # cosine cannot reach, so the clamp must admit it.
-          2.0
+          2.0,
+          # ...and STRICTLY positive at the bottom: `0` would make every candidate a
+          # duplicate of the first pick, including the unmeasurable ones the module
+          # promises never to drop. A typo must not be able to empty retrieval.
+          :positive
         ),
       over_fetch:
         pos_int_opt(
@@ -182,13 +206,19 @@ defmodule Loopctl.Knowledge.Diversity do
   already is. Each pool member above `limit` costs a vector read, which is what the cap
   is buying.
   """
-  @spec pool_size(pos_integer(), opts()) :: pos_integer()
+  @spec pool_size(integer(), opts()) :: pos_integer()
   def pool_size(limit, %{enabled?: false}) when is_integer(limit) and limit > 0, do: limit
 
   def pool_size(limit, %{over_fetch: over_fetch, max_pool: max_pool})
       when is_integer(limit) and limit > 0 do
     limit |> Kernel.*(over_fetch) |> min(max_pool) |> max(limit)
   end
+
+  # A non-positive or non-integer limit is a caller bug, not a crash: `hybrid_search/3`
+  # used to hand `limit: 0` straight through to `paginate_results/2`, which clamped it with
+  # `max(1)`, so a FunctionClauseError here would be a NEW 500 on a public context function.
+  # One row is the smallest pool that can answer at all.
+  def pool_size(_limit, opts), do: pool_size(1, opts)
 
   @doc """
   Selects at most `limit` candidates from `candidates` (supplied IN RELEVANCE ORDER).
@@ -199,7 +229,9 @@ defmodule Loopctl.Knowledge.Diversity do
 
   ## Options
 
-    * `:exclude_ids` — a `MapSet` (or list) of ids already shown to this session.
+    * `:exclude_ids` — a `MapSet` (or list) of ids already shown to this session. Dropped
+      only while something remains to refill the slot with: see the containment FLOOR in
+      the moduledoc, and `stats.readmitted_already_seen` for when it bound.
     * `:preselected` — ids that are PINNED into the selected set before the loop starts.
       They count against `limit`, they are returned at the FRONT in the order given, and
       — the reason this exists rather than a caller prepending them afterwards — the
@@ -208,40 +240,43 @@ defmodule Loopctl.Knowledge.Diversity do
       way: a caller branching on `meta.provenance` must be able to trust
       `List.first(results)`, and MMR is not entitled to overrule a governed answer.
   """
-  @spec select([candidate()], pos_integer(), opts(), keyword()) :: {[candidate()], stats()}
+  @spec select([candidate()], integer(), opts(), keyword()) :: {[candidate()], stats()}
   def select(candidates, limit, opts, extra \\ [])
 
-  def select(candidates, limit, %{enabled?: false} = opts, _extra) when is_list(candidates) do
+  def select(candidates, limit, %{enabled?: false} = opts, _extra)
+      when is_list(candidates) and is_integer(limit) and limit > 0 do
     selected = Enum.take(candidates, limit)
 
-    {selected,
-     %{
-       enabled: false,
-       lambda: opts.lambda,
-       near_dup_threshold: opts.near_dup_threshold,
-       candidates: length(candidates),
-       selected: length(selected),
-       dropped_already_seen: 0,
-       dropped_exact_duplicates: 0,
-       dropped_near_duplicates: 0,
-       vectors_available: 0
-     }}
+    {selected, no_drop_stats(candidates, selected, opts, false)}
   end
 
-  def select(candidates, limit, opts, extra) when is_list(candidates) and limit > 0 do
+  def select(candidates, limit, opts, extra)
+      when is_list(candidates) and is_integer(limit) and limit > 0 do
     exclude = to_id_set(Keyword.get(extra, :exclude_ids, []))
     pinned = to_id_set(Keyword.get(extra, :preselected, []))
 
-    {kept_history, dropped_already_seen} = reject_seen(candidates, exclude)
-    {kept_exact, dropped_exact} = dedup_by_fingerprint(kept_history)
+    # A pinned candidate skips EVERY drop stage: it is split out here, at the top, before
+    # containment and before the fingerprint collapse. Splitting it out after those two
+    # (as this did until the #792 review) let a pinned article be dropped as the
+    # lower-ranked member of its own content-hash group while `meta.provenance ==
+    # :curated` and `meta.curated_article_id` still named it — the guarantee
+    # `Knowledge.hybrid_search/3`'s hoist exists to provide, silently revoked.
+    {pinned_candidates, rest} = Enum.split_with(candidates, &MapSet.member?(pinned, &1.id))
 
-    # A pinned candidate skips the drop stages by construction — it is split out BEFORE
-    # them — so pinning is a decision the caller has already made and this module does not
-    # get to revisit.
-    {pinned_items, pool} =
-      kept_exact
-      |> Enum.map(&prepare/1)
-      |> Enum.split_with(&MapSet.member?(pinned, &1.id))
+    {unseen, already_seen} = partition_seen(rest, exclude)
+
+    # THE CONTAINMENT FLOOR. Suppressing a repeat is only correct while a distinct
+    # candidate can take the freed slot; once the shown-set has swallowed the pool the
+    # alternative is an EMPTY knowledge half, which a caller reads as "the KB has nothing
+    # on this" while the articles it wanted still exist.
+    {readmitted, dropped_seen} =
+      readmit_for_shortfall(already_seen, limit - length(pinned_candidates) - length(unseen))
+
+    {kept_exact, dropped_exact} =
+      dedup_by_fingerprint(unseen ++ readmitted, fingerprints(pinned_candidates))
+
+    pinned_items = Enum.map(pinned_candidates, &prepare/1)
+    pool = Enum.map(kept_exact, &prepare/1)
 
     {selected, dropped_near} = mmr(pool, limit, opts, pinned_items)
 
@@ -252,12 +287,19 @@ defmodule Loopctl.Knowledge.Diversity do
        near_dup_threshold: opts.near_dup_threshold,
        candidates: length(candidates),
        selected: length(selected),
-       dropped_already_seen: dropped_already_seen,
+       dropped_already_seen: length(dropped_seen),
+       readmitted_already_seen: length(readmitted),
        dropped_exact_duplicates: dropped_exact,
        dropped_near_duplicates: dropped_near,
        vectors_available: Enum.count(pinned_items ++ pool, &(&1.vector != nil))
      }}
   end
+
+  # A non-positive or non-integer limit selects nothing rather than raising: this is a
+  # public API reached through `Knowledge.hybrid_search/3`, where the pre-#792 path
+  # clamped such a limit in `paginate_results/2` instead of crashing.
+  def select(candidates, _limit, opts, _extra) when is_list(candidates),
+    do: {[], no_drop_stats(candidates, [], opts, false)}
 
   @doc """
   Cosine similarity of two equal-length vectors, `0.0` when either is absent, empty,
@@ -271,28 +313,57 @@ defmodule Loopctl.Knowledge.Diversity do
   def cosine(a, b) when is_list(a) and is_list(b), do: cosine_with_norms(a, norm(a), b, norm(b))
   def cosine(_a, _b), do: 0.0
 
+  # --- Stage 0: the uniform "nothing was dropped" stats block -----------------------
+
+  defp no_drop_stats(candidates, selected, opts, enabled?) do
+    %{
+      enabled: enabled?,
+      lambda: opts.lambda,
+      near_dup_threshold: opts.near_dup_threshold,
+      candidates: length(candidates),
+      selected: length(selected),
+      dropped_already_seen: 0,
+      readmitted_already_seen: 0,
+      dropped_exact_duplicates: 0,
+      dropped_near_duplicates: 0,
+      vectors_available: 0
+    }
+  end
+
   # --- Stage 1: containment in history ---------------------------------------------
 
-  defp reject_seen(candidates, exclude) do
+  defp partition_seen(candidates, exclude) do
     if MapSet.size(exclude) == 0 do
-      {candidates, 0}
+      {candidates, []}
     else
-      kept = Enum.reject(candidates, &MapSet.member?(exclude, &1.id))
-      {kept, length(candidates) - length(kept)}
+      Enum.split_with(candidates, fn candidate -> not MapSet.member?(exclude, candidate.id) end)
     end
   end
+
+  # The floor. `shortfall` is how many slots containment would leave unfilled; the
+  # highest-ranked repeats come back to cover exactly that many and no more, so a session
+  # with a healthy pool still never sees a repeat.
+  defp readmit_for_shortfall(already_seen, shortfall) when shortfall > 0,
+    do: Enum.split(already_seen, shortfall)
+
+  defp readmit_for_shortfall(already_seen, _shortfall), do: {[], already_seen}
 
   # --- Stage 2: exact fingerprint --------------------------------------------------
 
   # `nil`/blank hashes are NOT a fingerprint group: an unembedded article and a
   # never-hashed one are not duplicates of each other, and collapsing them would delete
   # rows on the strength of a missing field. Highest-ranked member of a group wins because
-  # `candidates` arrives in relevance order.
-  defp dedup_by_fingerprint(candidates) do
+  # `candidates` arrives in relevance order — and the PINNED candidates' fingerprints seed
+  # `seen`, so a pin still wins its own group even though it never passes through here.
+  defp dedup_by_fingerprint(candidates, seen) do
     {kept, _seen, dropped} =
-      Enum.reduce(candidates, {[], MapSet.new(), 0}, &take_first_of_fingerprint/2)
+      Enum.reduce(candidates, {[], seen, 0}, &take_first_of_fingerprint/2)
 
     {Enum.reverse(kept), dropped}
+  end
+
+  defp fingerprints(candidates) do
+    candidates |> Enum.map(&fingerprint/1) |> Enum.reject(&is_nil/1) |> MapSet.new()
   end
 
   defp take_first_of_fingerprint(candidate, {kept, seen, dropped}) do
@@ -335,9 +406,15 @@ defmodule Loopctl.Knowledge.Diversity do
     # of the result in the order the caller gave them.
     seeded = pinned_items |> Enum.with_index() |> Enum.map(&index_item/1) |> Enum.reverse()
 
+    # Each candidate carries its RUNNING max similarity against the selected set, seeded
+    # against the pins. The loop then only ever compares against the item it just picked,
+    # which is what keeps the whole selection O(pool) cosines per pick instead of
+    # O(pool x selected): at the 50-candidate recall maximum that is the difference between
+    # ~1.3k and ~21k 1536-dimension cosines on the request process.
     prepared
     |> Enum.with_index()
     |> Enum.map(&index_item/1)
+    |> Enum.map(fn item -> {item, max_similarity(item, pinned_items)} end)
     |> mmr_loop(seeded, limit, opts, 0)
   end
 
@@ -348,26 +425,32 @@ defmodule Loopctl.Knowledge.Diversity do
   defp mmr_loop(_remaining, selected, limit, _opts, dropped) when length(selected) >= limit,
     do: {Enum.reverse(selected), dropped}
 
-  defp mmr_loop(remaining, selected, limit, opts, dropped) do
-    scored = Enum.map(remaining, fn item -> {item, max_similarity(item, selected)} end)
-
-    {near_dups, survivors} =
-      Enum.split_with(scored, fn {_item, sim} -> sim >= opts.near_dup_threshold end)
+  defp mmr_loop(scored, selected, limit, opts, dropped) do
+    {near_dups, survivors} = Enum.split_with(scored, &near_duplicate?(&1, opts))
 
     case survivors do
       [] ->
         {Enum.reverse(selected), dropped + length(near_dups)}
 
       _ ->
-        best =
+        {winner, _sim} =
           Enum.min_by(survivors, fn {item, sim} -> {-mmr_score(item, sim, opts), item.index} end)
 
-        {winner, _sim} = best
-        rest = for {item, _sim} <- survivors, item.index != winner.index, do: item
+        rest =
+          for {item, sim} <- survivors,
+              item.index != winner.index,
+              do: {item, max(sim, similarity(item, winner))}
 
         mmr_loop(rest, [winner | selected], limit, opts, dropped + length(near_dups))
     end
   end
+
+  # `sim > 0.0` is the invariant, not an optimization: a candidate with no loadable vector
+  # scores exactly 0.0, so without it a threshold of 0 would classify every unmeasurable
+  # candidate as a duplicate of the first pick — the one thing this module promises never
+  # to do. `config/1` already refuses a non-positive threshold; this is the second lock.
+  defp near_duplicate?({_item, sim}, %{near_dup_threshold: threshold}),
+    do: sim > 0.0 and sim >= threshold
 
   # `λ · relevance − (1 − λ) · max_sim`. At λ = 1.0 the second term is `0.0 * sim`, which
   # is `0.0` for any finite similarity, and `score - 0.0 == score` to the bit — that exact
@@ -382,11 +465,12 @@ defmodule Loopctl.Knowledge.Diversity do
 
   defp max_similarity(item, selected) do
     selected
-    |> Enum.map(fn chosen ->
-      cosine_with_norms(item.vector, item.norm, chosen.vector, chosen.norm)
-    end)
+    |> Enum.map(&similarity(item, &1))
     |> Enum.max(fn -> 0.0 end)
   end
+
+  defp similarity(item, chosen),
+    do: cosine_with_norms(item.vector, item.norm, chosen.vector, chosen.norm)
 
   # --- Vector math -----------------------------------------------------------------
 
@@ -401,7 +485,13 @@ defmodule Loopctl.Knowledge.Diversity do
 
   defp cosine_with_norms(_a, _norm_a, _b, _norm_b), do: 0.0
 
-  defp dot(a, b), do: a |> Enum.zip(b) |> Enum.reduce(0.0, fn {x, y}, acc -> acc + x * y end)
+  # Hand-rolled rather than `Enum.zip/2 |> Enum.reduce/3`: zip allocates a 2-tuple PER
+  # DIMENSION, so at 1536 dimensions it was ~1536 garbage tuples per cosine and the single
+  # dominant cost of the whole selection.
+  defp dot(a, b), do: dot(a, b, 0.0)
+
+  defp dot([x | xs], [y | ys], acc), do: dot(xs, ys, acc + x * y)
+  defp dot(_a, _b, acc), do: acc
 
   defp norm(vector), do: vector |> Enum.reduce(0.0, fn x, acc -> acc + x * x end) |> :math.sqrt()
 
@@ -439,17 +529,24 @@ defmodule Loopctl.Knowledge.Diversity do
     end
   end
 
-  defp unit_opt(overrides, override_key, config_key, default, ceiling) do
+  defp unit_opt(overrides, override_key, config_key, default, ceiling, floor) do
     case fetch_override(overrides, override_key) do
-      {:ok, value} -> clamp_unit(value, default, ceiling)
-      :error -> clamp_unit(Application.get_env(:loopctl, config_key, default), default, ceiling)
+      {:ok, value} ->
+        clamp_unit(value, default, ceiling, floor)
+
+      :error ->
+        clamp_unit(Application.get_env(:loopctl, config_key, default), default, ceiling, floor)
     end
   end
 
-  defp clamp_unit(value, _default, ceiling) when is_number(value) and value >= 0,
-    do: value |> min(ceiling) |> Kernel.*(1.0)
+  defp clamp_unit(value, default, ceiling, floor) when is_number(value) do
+    if above_floor?(value, floor), do: value |> min(ceiling) |> Kernel.*(1.0), else: default * 1.0
+  end
 
-  defp clamp_unit(_value, default, _ceiling), do: default * 1.0
+  defp clamp_unit(_value, default, _ceiling, _floor), do: default * 1.0
+
+  defp above_floor?(value, :positive), do: value > 0
+  defp above_floor?(value, :non_negative), do: value >= 0
 
   defp pos_int_opt(overrides, override_key, config_key, default) do
     case fetch_override(overrides, override_key) do

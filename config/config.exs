@@ -727,6 +727,13 @@ config :loopctl, :recall_diversity_over_fetch, 3
 # `limit` candidates.
 config :loopctl, :recall_diversity_max_pool, 30
 
+# Hard ceiling on live entries in that node-local shown-set. `session_id` is client-chosen,
+# so the TTL above bounds only an honest client: a caller minting a fresh token per request
+# leaves entries nothing evicts for a whole window. At the ceiling a write sweeps and then
+# declines — losing containment, which costs one redundant row, rather than the node's
+# memory.
+config :loopctl, :recall_history_max_entries, 200_000
+
 # How long a shown article suppresses itself for one recall `session_id`
 # (`Loopctl.Memory.RecallHistoryCache`). Sized to a working session: past it, re-surfacing
 # something the agent saw hours ago is a reminder rather than a redundancy. Node-local and

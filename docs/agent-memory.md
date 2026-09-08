@@ -334,7 +334,11 @@ The knowledge half is now **over-fetched** (`limit x over_fetch`, bounded by
 1. **Containment in history** — an article already shown to this `session_id`
    is dropped. Kept server-side in `Loopctl.Memory.RecallHistoryCache`, and that
    is the whole reason it moved off the client: a client-side filter can only
-   DROP the row, while the server can refill the freed slot.
+   DROP the row, while the server can refill the freed slot. It has a FLOOR:
+   suppression may never cost a slot it cannot refill, so a session that has
+   exhausted the matching pool gets its highest-ranked repeats back
+   (`meta.diversity.readmitted_already_seen`) rather than an empty knowledge
+   half it would read as "the KB has nothing on this".
 2. **Exact-fingerprint dedup** — candidates sharing an `embedding_content_hash`
    collapse to the highest-ranked one. A `nil` hash is not a fingerprint.
 3. **Near-duplicate removal** — a candidate whose cosine similarity to an
@@ -357,16 +361,23 @@ Four properties are load-bearing:
 - **A candidate whose vector cannot be loaded is never dropped.** Unmeasurable
   is not similar; a missing embedding must cost recall nothing.
 - **`meta.diversity` reports every count** (`dropped_near_duplicates`,
-  `dropped_exact_duplicates`, `dropped_already_seen`, `candidates`, `selected`,
-  `vectors_available`, plus the `lambda`/`near_dup_threshold` actually applied),
-  so the effect is measurable rather than assumed.
+  `dropped_exact_duplicates`, `dropped_already_seen`,
+  `readmitted_already_seen`, `candidates`, `selected`, `vectors_available`, plus
+  the `lambda`/`near_dup_threshold` actually applied), so the effect is
+  measurable rather than assumed.
   `meta.candidates_considered.knowledge` is the over-fetched pool;
-  `meta.knowledge_count` is what survived.
+  `meta.knowledge_count` is what survived. The TOKEN figures
+  (`tokens_candidates`, `tokens_saved_vs_candidates`) are NOT over that pool:
+  they count what the merged cap could actually have handed you, since a row the
+  server had already ruled out as a duplicate was never on offer. `knowledge.meta.limit`
+  likewise stays the limit you asked for, not the internal over-fetch.
 
 `session_id` is optional, opaque and client-chosen. It is **not** an isolation
-boundary — the shown-set is keyed `(tenant_id, session_id, article_id)`, so a
-token another tenant picks can never reach yours — and it is node-local and
-best-effort: a miss simply re-surfaces an article, which is the pre-#792
+boundary — the shown-set is keyed
+`(tenant_id, subject_id, session_id, article_id)`, both server-derived halves of
+your memory scope ahead of the token, so a token another tenant OR another agent
+in your tenant picks can never suppress rows from your recall — and it is
+node-local, capacity-bounded and best-effort: a miss simply re-surfaces an article, which is the pre-#792
 behaviour. Omitting it disables containment for that call rather than sharing
 one bucket between anonymous callers. A non-string or over-200-byte value is a
 `422 invalid_session_id`, never a silent truncation (a truncated token collides
@@ -379,10 +390,10 @@ call through `recall_context/2` opts (`:diversity_enabled`,
 `:diversity_max_pool`) — the config-DI seam tests use instead of
 `Application.put_env`. `Knowledge.hybrid_search/3` shares the same selector and
 publishes the same `meta.diversity` block, with two differences of its own: it
-runs only at `offset: 0` (selection re-chooses from the whole pool, so a
-diversified page 2 has no stable meaning), and the curated winner is PINNED so
-`meta.provenance == :curated` still guarantees `List.first(results)` is the
-governed answer.
+REORDERS the ranked pool rather than reducing it (everything the selection did
+not pick stays directly behind it, so paging one query still partitions the
+pool), and the curated winner is PINNED so `meta.provenance == :curated` still
+guarantees `List.first(results)` is the governed answer.
 
 ---
 

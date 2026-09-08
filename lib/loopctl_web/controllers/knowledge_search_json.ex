@@ -248,11 +248,6 @@ defmodule LoopctlWeb.KnowledgeSearchJSON do
     |> maybe_put(:provenance, meta[:provenance])
     |> maybe_put(:confidence, meta[:confidence])
     |> maybe_put(:curated_article_id, meta[:curated_article_id])
-    # `diversity` (#792): what redundancy removal did to THIS page — the same block
-    # `POST /api/v1/recall` publishes. Whitelisted explicitly like the three keys above,
-    # not passed through: it is a fixed map of booleans, floats and counts built by
-    # `Loopctl.Knowledge.Diversity`, and it carries no internal atom.
-    |> maybe_put(:diversity, meta[:diversity])
     # `semantic_result_count` (#297): rows the semantic half contributed in combined
     # mode. `0` with no `fallback` = "embed worked but recall is broken" — distinct
     # from a keyword_only fallback.
