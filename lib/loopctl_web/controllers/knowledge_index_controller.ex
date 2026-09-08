@@ -156,7 +156,9 @@ defmodule LoopctlWeb.KnowledgeIndexController do
             "request to opt into the keyset path (which orders by `inserted_at ASC, " <>
             "id ASC`); then follow `meta.next_cursor` verbatim on subsequent requests. " <>
             "Omitting the `cursor` parameter entirely uses the legacy offset path " <>
-            "(orders by `category, updated_at DESC, id`), which does not emit " <>
+            "(orders by `category, coalesce(content_changed_at, updated_at) DESC, id` — " <>
+            "authored age, #791, so a re-embed does not move a row; note the rows still " <>
+            "emit `updated_at`, which is therefore NOT the sort key), which does not emit " <>
             "`next_cursor`. Do not mix the two paths mid-enumeration, as the sort order " <>
             "differs. The keyset path honors the same category/tags/source filters and " <>
             "is the drift-free way to walk a tag or a source to exhaustion under " <>

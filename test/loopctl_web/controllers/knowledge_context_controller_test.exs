@@ -33,14 +33,15 @@ defmodule LoopctlWeb.KnowledgeContextControllerTest do
           tags: ["ecto", "queries"]
         })
 
-      # Make old_article appear stale by updating its updated_at to 90 days ago
+      # Make old_article stale: age its CONTENT by 90 days. `content_changed_at` is what
+      # the recency decay reads (#791); `updated_at` moves with it for coherence.
       ninety_days_ago = DateTime.add(DateTime.utc_now(), -90 * 86_400, :second)
 
       import Ecto.Query
 
       Loopctl.AdminRepo.update_all(
         from(a in Loopctl.Knowledge.Article, where: a.id == ^old_article.id),
-        set: [updated_at: ninety_days_ago]
+        set: [updated_at: ninety_days_ago, content_changed_at: ninety_days_ago]
       )
 
       conn =
@@ -172,7 +173,7 @@ defmodule LoopctlWeb.KnowledgeContextControllerTest do
 
       Loopctl.AdminRepo.update_all(
         from(a in Loopctl.Knowledge.Article, where: a.id == ^old_article.id),
-        set: [updated_at: sixty_days_ago]
+        set: [updated_at: sixty_days_ago, content_changed_at: sixty_days_ago]
       )
 
       # Request with high recency_weight (0.9) -- should strongly favor fresh articles

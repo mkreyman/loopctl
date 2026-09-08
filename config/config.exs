@@ -1140,6 +1140,10 @@ config :loopctl, :knowledge_reranker, Loopctl.Knowledge.Reranker.Noop
 # Recency uses the SAME exp(-age_days/30) decay as knowledge_context — single source of
 # truth Loopctl.Knowledge.RankingPriors.recency_decay/2 — applied as the BOUNDED factor
 # `1 - w + w*decay` on the fused score. Default weight 0.3 matches knowledge_context.
+# The AGE it decays is authored age, not last-mutation time: the field is resolved by
+# RankingPriors.recency_timestamp/1 (`articles.content_changed_at`, falling back to
+# `updated_at` when null). #791 — ranking on `updated_at` meant one bulk re-embed reset
+# the apparent freshness of the whole corpus at once, with nothing reporting it.
 config :loopctl, :knowledge_recency_weight, 0.3
 # Category-authority prior: toggle + magnitude. The factor is
 # `clamp(1 + strength * category_weight, 0.9, 1.1)`.
