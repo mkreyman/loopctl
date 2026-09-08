@@ -91,6 +91,12 @@ defmodule LoopctlWeb.KnowledgeHybridSearchJSON do
       limit: meta[:limit],
       offset: meta[:offset]
     }
+    # `diversity` (#792). `hybrid_search/3` has always PUT this in its meta
+    # (`knowledge.ex`, the `diversity: diversity_stats` key) and this renderer dropped it,
+    # so the endpoint's own reference doc declared a field the wire never carried. Emitted
+    # through `maybe_put/3` like every other optional key, so a response that ran no
+    # selection is byte-identical to before.
+    |> maybe_put(:diversity, meta[:diversity])
     |> maybe_put(:total_count, meta[:total_count])
     |> maybe_put(:total_count_scope, meta[:total_count_scope])
     |> maybe_put(:search_mode, meta[:search_mode])

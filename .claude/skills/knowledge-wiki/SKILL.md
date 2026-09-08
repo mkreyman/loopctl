@@ -180,8 +180,24 @@ exactly the pollution the separate tables prevent.
    age is the one input a later writer cannot manufacture. Scoring is keyed by
    `{drift_signal, member_id}` — a group scored under the other signal's normalized key finds
    nothing and withholds (fail-closed).
+5b. **Selection decides WHAT is returned; the deterministic sort decides the ORDER** —
+   `Loopctl.Knowledge.Diversity.select/4` (#792), shared by `Memory.recall_context/2` and
+   `Knowledge.hybrid_search/3`. Exact content-hash dedup, containment-in-history,
+   near-duplicate removal at cosine >= 0.95 against the ALREADY-SELECTED set (never against the
+   query), then MMR. Four rules that must move together: every drop is REFILLED from an
+   OVER-FETCHED pool rather than leaving a hole, and a drop that CANNOT be refilled is not
+   taken at all (containment re-admits its highest-ranked repeats rather than returning an
+   empty half a caller reads as "the KB has nothing"); a candidate whose vector cannot be
+   loaded is never dropped, because unmeasurable is not similar; MMR must never be allowed to
+   set the render order, or the cache-friendly byte-identical block it feeds is gone; and a
+   PINNED candidate is split out ahead of every drop stage, or a curated answer can vanish from
+   a page whose `meta.provenance` still names it. `lambda: 1.0` reproduces the pre-#792
+   selection exactly — but only for a caller whose `:score` descends with its OWN ranking, so
+   rank the candidates on the scale you ordered them by, never on a per-lane absolute score.
+   Full pipeline: `docs/agent-memory.md`, "Diversity selection on the knowledge half".
+
 5. **Heat must not rank on a signal heat produces** — `Knowledge.heat_index/2`
-   (`knowledge.ex:11607`; the counted set is `@heat_read_access_types`, `:11477`). The heat index is the one retrieval route that
+   (`knowledge.ex:11881`; the counted set is `@heat_read_access_types`, `:11751`). The heat index is the one retrieval route that
    takes NO query, so its misses are uncorrelated with embedding similarity — which is worth nothing
    if its ordering is something a caller or the route itself generates. It has been violated FOUR
    times, each differently — and once by a FIX for one of the others — so treat any new input to
@@ -296,6 +312,13 @@ what another does, work out which question you are asking:
 | `articles.idempotency_key` | "is THIS EXACT ARTICLE already here?" | per ARTICLE, per-tenant unique, opt-in |
 | `idem-<family>-<digest>` tag | "have I captured THIS SOURCE?" | per SOURCE CAPTURE, shared by every note of it |
 | the novelty gate | "is this near-duplicate of something we hold?" | semantic, no identity needed |
+| `Knowledge.Diversity` (#792) | "are two of these the SAME ANSWER to this query?" | per RETRIEVAL PAGE, writes nothing |
+
+The fourth is the odd one out and the confusion is worth naming: the first three decide what
+enters the CORPUS, `Diversity` decides what enters one ANSWER. It never writes, never archives
+and never suppresses — the duplicates it drops stay published and will be returned by the next
+query that does not put them side by side. So "the novelty gate should have caught this" is not
+a reply to a redundant recall page, and vice versa.
 
 **Never backfill the column from the tag.** The tag is shared by every atomic note of one
 capture — measured 2026-08-22 on the hosted corpus at **15.1 articles per capture** — so a raw

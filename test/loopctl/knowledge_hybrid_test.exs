@@ -12,7 +12,9 @@ defmodule Loopctl.KnowledgeHybridTest do
   setup :verify_on_exit!
 
   alias Loopctl.AdminRepo
+  alias Loopctl.HeavyRead.TenantGate
   alias Loopctl.Knowledge
+  alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleAccessEvent
 
   # Two orthogonal "directions" + a midpoint, mirroring knowledge_semantic_search_test.exs:
@@ -651,5 +653,310 @@ defmodule Loopctl.KnowledgeHybridTest do
                :id
              ) == 1
     end
+  end
+
+  # --- #792: diversity selection on the hybrid page --------------------------------
+
+  describe "hybrid_search/3 - diversity selection (#792)" do
+    test "two near-duplicates yield one of them PLUS the next distinct candidate" do
+      tenant = fixture(:tenant)
+      Knowledge.reset_circuit_breaker(tenant.id)
+      query = "clustered topic query"
+
+      twin_a =
+        fixture(:article, %{tenant_id: tenant.id, title: "Twin A", status: :published})
+        |> then(&set_embedding(tenant.id, &1, direction_a()))
+
+      twin_b =
+        fixture(:article, %{tenant_id: tenant.id, title: "Twin B", status: :published})
+        |> then(&set_embedding(tenant.id, &1, direction_a()))
+
+      distinct =
+        fixture(:article, %{tenant_id: tenant.id, title: "Distinct", status: :published})
+        |> then(&set_embedding(tenant.id, &1, direction_medium()))
+
+      stub_embeddings_by_query(%{query => direction_a()})
+      opts = [keyword_weight: 0, semantic_weight: 1, limit: 2]
+
+      # NON-VACUITY: with selection off, the twins occupy BOTH slots. Without this the
+      # assertion below could pass on a pool that was never clustered.
+      assert {:ok, %{results: baseline}} =
+               Knowledge.hybrid_search(tenant.id, query, [diversity_enabled: false] ++ opts)
+
+      assert Enum.map(baseline, & &1.id) |> Enum.sort() == Enum.sort([twin_a.id, twin_b.id])
+
+      assert {:ok, %{results: results, meta: meta}} =
+               Knowledge.hybrid_search(tenant.id, query, opts)
+
+      ids = Enum.map(results, & &1.id)
+
+      assert length(ids) == 2
+      assert distinct.id in ids
+      assert Enum.count(ids, &(&1 in [twin_a.id, twin_b.id])) == 1
+      assert meta.diversity.dropped_near_duplicates >= 1
+      assert meta.diversity.enabled == true
+    end
+
+    test "the curated winner stays FIRST under a diversity-heavy lambda" do
+      tenant = fixture(:tenant)
+      Knowledge.reset_circuit_breaker(tenant.id)
+      query = "what is the refund policy?"
+
+      answering =
+        tenant.id
+        |> curated_article(%{title: "Refund Policy Answer"})
+        |> then(&set_embedding(tenant.id, &1, direction_a()))
+
+      for i <- 1..2 do
+        fixture(:article, %{tenant_id: tenant.id, title: "Other #{i}", status: :published})
+        |> then(&set_embedding(tenant.id, &1, direction_medium()))
+      end
+
+      stub_embeddings_by_query(%{query => direction_a()})
+
+      assert {:ok, %{results: results, meta: meta}} =
+               Knowledge.hybrid_search(tenant.id, query,
+                 keyword_weight: 0,
+                 semantic_weight: 1,
+                 limit: 2,
+                 # Weighting DIVERSITY over relevance is the adversarial setting: it is
+                 # exactly where an unpinned curated winner would be displaced or reordered.
+                 diversity_lambda: 0.1
+               )
+
+      assert meta.provenance == :curated
+      # The whole contract of `meta.provenance == :curated` is that `List.first(results)`
+      # IS the governed answer. Selection is not entitled to overrule that, which is why
+      # the curated id is passed to the selector as `:preselected` rather than left to
+      # compete (see `Diversity.select/4`'s pinning tests for the suppression semantics).
+      assert List.first(results).id == answering.id
+      assert meta.curated_article_id == answering.id
+      assert length(results) == 2
+      assert meta.diversity.enabled == true
+    end
+
+    test "paging one query still PARTITIONS the pool — no row on two pages, none lost" do
+      tenant = fixture(:tenant)
+      Knowledge.reset_circuit_breaker(tenant.id)
+      query = "paged clustered query"
+
+      published =
+        for i <- 1..4 do
+          fixture(:article, %{tenant_id: tenant.id, title: "Paged #{i}", status: :published})
+          |> then(&set_embedding(tenant.id, &1, direction_a()))
+        end
+
+      stub_embeddings_by_query(%{query => direction_a()})
+      opts = [keyword_weight: 0, semantic_weight: 1, limit: 2]
+
+      assert {:ok, %{results: page_1, meta: meta_1}} =
+               Knowledge.hybrid_search(tenant.id, query, opts ++ [offset: 0])
+
+      assert {:ok, %{results: page_2}} =
+               Knowledge.hybrid_search(tenant.id, query, opts ++ [offset: 2])
+
+      ids_1 = Enum.map(page_1, & &1.id)
+      ids_2 = Enum.map(page_2, & &1.id)
+
+      # Selection REORDERS the pool, it never shortens it: everything it did not pick stays
+      # directly behind what it did. Applied only at offset 0 — and discarding the
+      # unselected window — page 1 drew from pool positions 0..29 while page 2 returned raw
+      # positions 2..3, so a client paging one query got rows twice and never saw the ones
+      # MMR skipped.
+      assert ids_1 -- ids_2 == ids_1, "pages 1 and 2 must not overlap"
+      assert Enum.sort(ids_1 ++ ids_2) == Enum.sort(Enum.map(published, & &1.id))
+      # And the block is REAL at a non-zero offset now, not a hard-coded `enabled: false`.
+      assert meta_1.diversity.enabled == true
+    end
+
+    test "a non-positive or oversized limit is clamped, never a FunctionClauseError" do
+      tenant = fixture(:tenant)
+      Knowledge.reset_circuit_breaker(tenant.id)
+      query = "clamped limit query"
+
+      for i <- 1..3 do
+        fixture(:article, %{tenant_id: tenant.id, title: "Clamped #{i}", status: :published})
+        |> then(&set_embedding(tenant.id, &1, direction_a()))
+      end
+
+      stub_embeddings_by_query(%{query => direction_a()})
+      base = [keyword_weight: 0, semantic_weight: 1]
+
+      assert {:ok, %{results: [top | _]}} =
+               Knowledge.hybrid_search(tenant.id, query, base ++ [limit: 1])
+
+      # `:limit` used to be clamped only by `paginate_results/2`, at the very END; now it
+      # also sizes the diversity window, whose cost is quadratic in the candidates it
+      # walks. So it is clamped on the way IN: 0 must not reach a `limit > 0` guard, and
+      # 1000 (what the controller's own clamp permits) must not buy a caller the whole
+      # 100-row pool's worth of 1536-dimension cosine arithmetic.
+      #
+      # `limit: 0` must behave as `limit: 1` — SAME first row. Unclamped it reaches
+      # `Diversity.select/4`'s non-positive clause, which selects NOTHING, so the whole
+      # window is demoted behind the pool tail and the caller's one row is the second-ranked
+      # article instead of the first. Asserting only that the call does not raise could not
+      # see that, and the mutation record for the clamp said so (exit 1).
+      assert {:ok, %{results: [zero_top | _] = zero_results, meta: zero_meta}} =
+               Knowledge.hybrid_search(tenant.id, query, base ++ [limit: 0])
+
+      assert zero_top.id == top.id
+      assert length(zero_results) == 1
+      # ...and the published block DESCRIBES that page. Unclamped, `limit: 0` reaches
+      # `Diversity.select/4`'s non-positive clause, which selects nothing and reports
+      # `selected: 0` while `paginate_results/2` still hands the caller a row — a
+      # meta block about a selection that never ran.
+      assert zero_meta.diversity.selected == length(zero_results)
+
+      assert {:ok, %{meta: meta}} =
+               Knowledge.hybrid_search(tenant.id, query, base ++ [limit: 1000])
+
+      assert meta.limit == Knowledge.max_relevance_page_size()
+    end
+
+    test "a rejected near-duplicate is DEMOTED behind the pool tail, not back onto its page" do
+      tenant = fixture(:tenant)
+      Knowledge.reset_circuit_breaker(tenant.id)
+      query = "demoted duplicate query"
+
+      for i <- 1..4 do
+        fixture(:article, %{tenant_id: tenant.id, title: "Demoted #{i}", status: :published})
+        |> then(&set_embedding(tenant.id, &1, direction_a()))
+      end
+
+      stub_embeddings_by_query(%{query => direction_a()})
+      base = [keyword_weight: 0, semantic_weight: 1]
+
+      assert {:ok, %{results: raw}} =
+               Knowledge.hybrid_search(
+                 tenant.id,
+                 query,
+                 base ++ [limit: 4, diversity_enabled: false]
+               )
+
+      pool_ids = Enum.map(raw, & &1.id)
+      assert length(pool_ids) == 4
+
+      # A window of 2 over four identical-direction articles: the selector keeps the first
+      # and rejects the second as a near-copy. Splicing the rejected row in DIRECTLY behind
+      # the selection refilled the very page it was rejected from with that duplicate, while
+      # two distinct pool members sat unused behind it — #792's own acceptance criterion
+      # failing on the hybrid surface.
+      assert {:ok, %{results: results, meta: meta}} =
+               Knowledge.hybrid_search(
+                 tenant.id,
+                 query,
+                 base ++ [limit: 3, diversity_max_pool: 2]
+               )
+
+      assert meta.diversity.dropped_near_duplicates == 1
+      assert meta.diversity.selected == 1
+
+      assert Enum.map(results, & &1.id) ==
+               [Enum.at(pool_ids, 0), Enum.at(pool_ids, 2), Enum.at(pool_ids, 3)]
+
+      # ...and nothing is LOST: the rejected row is still reachable, at the very back.
+      assert {:ok, %{results: all}} =
+               Knowledge.hybrid_search(
+                 tenant.id,
+                 query,
+                 base ++ [limit: 4, diversity_max_pool: 2]
+               )
+
+      assert List.last(all).id == Enum.at(pool_ids, 1)
+    end
+
+    test "the selection WINDOW is capped, and the page still fills from the tail behind it" do
+      tenant = fixture(:tenant)
+      Knowledge.reset_circuit_breaker(tenant.id)
+      query = "windowed query"
+
+      published =
+        for i <- 1..4 do
+          fixture(:article, %{tenant_id: tenant.id, title: "Window #{i}", status: :published})
+          |> then(&set_embedding(tenant.id, &1, direction_a()))
+        end
+
+      stub_embeddings_by_query(%{query => direction_a()})
+
+      assert {:ok, %{results: results, meta: meta}} =
+               Knowledge.hybrid_search(tenant.id, query,
+                 keyword_weight: 0,
+                 semantic_weight: 1,
+                 limit: 4,
+                 # MMR walks its window quadratically, so the window is capped rather than
+                 # left to follow `limit`. Unlike the recall half — where the pool IS the
+                 # fetch, so a cap below `limit` would cost rows — a short window here
+                 # costs nothing.
+                 diversity_max_pool: 2
+               )
+
+      assert meta.diversity.candidates == 2
+      # ...and the page is STILL full: the two the window never looked at follow the ones
+      # it selected, in pool order.
+      assert length(results) == 4
+      assert Enum.sort(Enum.map(results, & &1.id)) == Enum.sort(Enum.map(published, & &1.id))
+    end
+
+    test "a heavy-read SHED spends nothing on the small admin pool" do
+      tenant = fixture(:tenant)
+      own = fixture(:article, %{tenant_id: tenant.id, status: :published})
+      canonical = system_article()
+
+      # Saturate this tenant's heavy-read slice exactly, so the very next heavy read is
+      # shed (the technique heavy_read_test.exs uses; no global config mutation).
+      cap = TenantGate.cap()
+      assert TenantGate.acquire(tenant.id, cap, cap) == :ok
+
+      try do
+        # A shed must yield NOTHING. Read as "the tenant resolved no rows" it handed the
+        # WHOLE id set — the system canonical included — to `AdminRepo`'s three
+        # connections, i.e. it added an admin-pool query to every recall and every hybrid
+        # search at exactly the moment the database is already overloaded, which is the
+        # inversion the two-pool split exists to prevent.
+        assert Knowledge.diversity_vectors(tenant.id, [own.id, canonical.id]) == %{}
+      after
+        TenantGate.release(tenant.id, cap)
+      end
+    end
+
+    test "an empty pool still publishes a well-formed diversity block" do
+      tenant = fixture(:tenant)
+      Knowledge.reset_circuit_breaker(tenant.id)
+
+      assert {:ok, %{results: [], meta: meta}} =
+               Knowledge.hybrid_search(tenant.id, "nothing matches this at all",
+                 keyword_weight: 0,
+                 semantic_weight: 1
+               )
+
+      assert meta.diversity.enabled == false
+      assert meta.diversity.candidates == 0
+      assert meta.diversity.selected == 0
+    end
+  end
+
+  # A SYSTEM-scoped article: `tenant_id IS NULL`, `scope: :system` — the one class of row
+  # `diversity_vectors/2` reaches through `AdminRepo` rather than the heavy-read pool.
+  defp system_article do
+    now = DateTime.utc_now()
+    id = Ecto.UUID.generate()
+
+    AdminRepo.insert_all(Article, [
+      %{
+        id: id,
+        tenant_id: nil,
+        title: "System canonical #{System.unique_integer([:positive])}",
+        body: "shared operator content",
+        category: :reference,
+        status: :published,
+        scope: :system,
+        tags: [],
+        metadata: %{},
+        inserted_at: now,
+        updated_at: now
+      }
+    ])
+
+    AdminRepo.get!(Article, id)
   end
 end

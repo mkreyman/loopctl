@@ -1928,7 +1928,7 @@ async function memoryRecall({ query, limit, include_superseded }) {
   return withRemediationNotice(result);
 }
 
-async function recallContext({ query, project_id, limit }) {
+async function recallContext({ query, project_id, limit, session_id }) {
   // Merged recall (#411 Gap 2): ONE round-trip returning the re-ranked
   // global ∪ active-project union of long-term MEMORY and KNOWLEDGE. Scope
   // (tenant_id/subject_id) is derived server-side from the agent key; project_id is
@@ -1936,6 +1936,10 @@ async function recallContext({ query, project_id, limit }) {
   const payload = { query };
   if (project_id) payload.project_id = project_id;
   if (limit != null) payload.limit = limit;
+  // #792: the containment-in-history key. Opaque and client-chosen; the server keys its
+  // shown-set on (tenant, subject, session, article) — both server-derived halves of the
+  // memory scope ahead of the token — so it is never an isolation boundary.
+  if (session_id) payload.session_id = session_id;
 
   const result = await apiCall(
     "POST",
@@ -5643,7 +5647,13 @@ const TOOLS = [
       "the whole response, since `meta.recall_id` is new on every call. KEEP " +
       "`meta.recall_id`: after you " +
       "answer, pass it to recall_referenced with the ids you actually used — that is the " +
-      "third funnel stage and nothing else records it.",
+      "third funnel stage and nothing else records it. DIVERSITY (#792): the knowledge " +
+      "half is over-fetched and then reduced, so two near-copies cannot spend two of your " +
+      "slots — an article already shown to this `session_id` is skipped, exact " +
+      "content-hash duplicates collapse, a candidate too similar to one already selected " +
+      "is dropped, and every freed slot is REFILLED rather than left empty. " +
+      "`meta.diversity` reports each count. Selection changes WHAT you get, never the " +
+      "order, so the deterministic `data` array above still holds.",
     inputSchema: {
       type: "object",
       properties: {
@@ -5662,6 +5672,19 @@ const TOOLS = [
           type: "integer",
           description:
             "Optional: overall merged page size, clamped to [1, 50] (default 10).",
+        },
+        session_id: {
+          type: "string",
+          description:
+            "Optional: an opaque token for THIS session (max 200 bytes). Pass the same " +
+            "value on every recall in a session and the server skips articles it already " +
+            "showed you, refilling the freed slot with the next distinct candidate — " +
+            "which a client-side filter cannot do. It can never starve you: once a " +
+            "session has exhausted the matching pool the highest-ranked repeats come " +
+            "back, so an empty knowledge half always means the corpus, never the " +
+            "suppression. Not an isolation boundary (history is keyed on tenant + " +
+            "subject + session + article) and best-effort: a miss just re-surfaces an " +
+            "article. Omit it to disable containment for that call.",
         },
       },
       required: ["query"],
