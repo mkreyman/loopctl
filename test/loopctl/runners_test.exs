@@ -131,6 +131,20 @@ defmodule Loopctl.RunnersTest do
              )
     end
 
+    test "after a key revoke through api_keys, still audits once and tells the live channel" do
+      {_raw, runner} = fixture(:runner, %{})
+      {:ok, key} = Auth.get_api_key(runner.tenant_id, runner.api_key_id)
+      {:ok, _} = Auth.revoke_api_key(key)
+      :ok = Phoenix.PubSub.subscribe(Loopctl.PubSub, Runners.revocation_topic(runner.id))
+
+      assert {:ok, %Runner{revoked_at: %DateTime{}}} =
+               Runners.revoke_runner(runner.tenant_id, runner.id)
+
+      assert_receive :runner_revoked
+      {:ok, _} = Runners.revoke_runner(runner.tenant_id, runner.id)
+      assert revocation_entries(runner) == 1
+    end
+
     test "is idempotent" do
       {_raw, runner} = fixture(:runner, %{})
       {:ok, first} = Runners.revoke_runner(runner.tenant_id, runner.id)
@@ -173,6 +187,13 @@ defmodule Loopctl.RunnersTest do
       refute Runners.runner_key?(runner.tenant_id, plain.id)
       refute Runners.runner_key?(fixture(:tenant).id, runner.api_key_id)
     end
+  end
+
+  defp revocation_entries(runner) do
+    AdminRepo.aggregate(
+      from(e in Entry, where: e.action == "runner_revoked" and e.entity_id == ^runner.id),
+      :count
+    )
   end
 
   describe "authorized?/2" do

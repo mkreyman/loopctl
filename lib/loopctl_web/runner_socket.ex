@@ -41,7 +41,10 @@ defmodule LoopctlWeb.RunnerSocket do
   @throttle_window_ms 60_000
   @throttle_max_per_ip 3_000
 
-  channel "runners", LoopctlWeb.RunnerChannel
+  # One topic PER RUNNER, `runner:<runner_id>`. Phoenix subscribes a channel to its join
+  # topic, so a shared literal topic would carry any broadcast on it to every tenant's
+  # machines — and a `dispatch` is a prompt executed as that machine's user.
+  channel "runner:*", LoopctlWeb.RunnerChannel
 
   @doc "The header a runner presents its credential in."
   @spec token_header() :: String.t()

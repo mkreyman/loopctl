@@ -26,9 +26,9 @@ defmodule Loopctl.Runners do
   ## Pool
 
   `Loopctl.Runners.Presence` tracks each joined runner under a TENANT-SCOPED topic,
-  `pool_topic/1`. The design names the topic `"runners"`; that is the topic a runner
-  JOINS, but the Presence set is kept per tenant so one tenant's machines are never
-  visible to another. `pool/1` is the read.
+  `pool_topic/1`, so one tenant's machines are never visible to another. A runner JOINS
+  its own topic, `runner:<runner_id>` (the design's single `"runners"` topic would carry
+  a broadcast to every tenant's machines). `pool/1` is the read.
 
   Presence is a liveness hint, never a scheduler: it has no compare-and-set, so capacity
   must be reserved in Postgres when dispatch arrives (design §7). And it converges only
@@ -41,6 +41,7 @@ defmodule Loopctl.Runners do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain
+  alias Loopctl.AuditChain.Entry, as: AuditEntry
   alias Loopctl.Auth
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Runners.Presence
@@ -151,45 +152,39 @@ defmodule Loopctl.Runners do
   Revokes a runner: its row and its API key in one transaction, then busts the key
   cache and tells the live channel, which disconnects its socket.
 
-  Idempotent: revoking an already-revoked runner returns it unchanged.
+  The row is locked inside the transaction, so concurrent revokes serialize and exactly
+  one writes `revoked_at` and the `runner_revoked` audit entry. A runner whose row the
+  `runners_revoke_with_api_key` trigger already revoked (its key was revoked through
+  `/api/v1/api_keys`) still gets its audit entry, once, and its live socket is still told
+  — so calling this after a key revoke is never a silent no-op. Idempotent otherwise.
   """
   @spec revoke_runner(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, Runner.t()} | {:error, :not_found | term()}
   def revoke_runner(tenant_id, runner_id, opts \\ []) when is_binary(tenant_id) do
-    case get_runner(tenant_id, runner_id) do
-      {:ok, %Runner{revoked_at: nil} = runner} -> do_revoke(tenant_id, runner, opts)
-      {:ok, %Runner{} = already_revoked} -> {:ok, already_revoked}
-      error -> error
+    with {:ok, id} <- cast_id(runner_id) do
+      do_revoke(tenant_id, id, opts)
     end
   end
 
-  defp do_revoke(tenant_id, runner, opts) do
+  defp cast_id(runner_id) do
+    case Ecto.UUID.cast(runner_id) do
+      {:ok, id} -> {:ok, id}
+      :error -> {:error, :not_found}
+    end
+  end
+
+  defp do_revoke(tenant_id, runner_id, opts) do
     now = DateTime.utc_now()
 
     multi =
       Multi.new()
-      |> Multi.update(:runner, Runner.revoke_changeset(runner, now))
-      |> Multi.run(:revoke_key, fn _repo, _ ->
-        # Select the hash back from the revoke itself so the post-commit cache bust
-        # needs no second AdminRepo round-trip (the dispatch-revoke pattern).
-        {_count, key_hashes} =
-          from(k in ApiKey,
-            where: k.id == ^runner.api_key_id and k.tenant_id == ^tenant_id,
-            where: is_nil(k.revoked_at),
-            select: k.key_hash
-          )
-          |> AdminRepo.update_all(set: [revoked_at: now])
-
-        {:ok, key_hashes}
+      |> Multi.run(:locked, fn _repo, _ -> lock_runner(tenant_id, runner_id) end)
+      |> Multi.run(:runner, fn _repo, %{locked: runner} -> mark_revoked(runner, now) end)
+      |> Multi.run(:revoke_key, fn _repo, %{runner: runner} ->
+        revoke_runner_key(tenant_id, runner, now)
       end)
-      |> Multi.run(:audit, fn _repo, _ ->
-        AuditChain.append(tenant_id, %{
-          action: "runner_revoked",
-          actor_lineage: Keyword.get(opts, :actor_lineage, []),
-          entity_type: "runner",
-          entity_id: runner.id,
-          payload: %{"name" => runner.name, "api_key_id" => runner.api_key_id}
-        })
+      |> Multi.run(:audit, fn _repo, %{runner: runner} ->
+        audit_revocation_once(tenant_id, runner, opts)
       end)
 
     case AdminRepo.transaction(multi) do
@@ -203,6 +198,63 @@ defmodule Loopctl.Runners do
       {:error, _step, reason, _} ->
         {:error, reason}
     end
+  end
+
+  defp lock_runner(tenant_id, runner_id) do
+    query =
+      from r in Runner,
+        where: r.id == ^runner_id and r.tenant_id == ^tenant_id,
+        lock: "FOR UPDATE"
+
+    case AdminRepo.one(query) do
+      nil -> {:error, :not_found}
+      runner -> {:ok, runner}
+    end
+  end
+
+  # An already-revoked row (the api key trigger got there first) passes through, so
+  # its audit entry and its live-channel notice still happen.
+  defp mark_revoked(%Runner{revoked_at: nil} = runner, now),
+    do: AdminRepo.update(Runner.revoke_changeset(runner, now))
+
+  defp mark_revoked(%Runner{} = runner, _now), do: {:ok, runner}
+
+  # Selects the hash back from the revoke itself so the post-commit cache bust needs no
+  # second AdminRepo round-trip (the dispatch-revoke pattern). A no-op when the key was
+  # revoked first.
+  defp revoke_runner_key(tenant_id, runner, now) do
+    {_count, key_hashes} =
+      from(k in ApiKey,
+        where: k.id == ^runner.api_key_id and k.tenant_id == ^tenant_id,
+        where: is_nil(k.revoked_at),
+        select: k.key_hash
+      )
+      |> AdminRepo.update_all(set: [revoked_at: now])
+
+    {:ok, key_hashes}
+  end
+
+  # Under the row lock, so two callers cannot both find no entry and both write one.
+  defp audit_revocation_once(tenant_id, runner, opts) do
+    if revocation_audited?(tenant_id, runner.id) do
+      {:ok, :already_audited}
+    else
+      AuditChain.append(tenant_id, %{
+        action: "runner_revoked",
+        actor_lineage: Keyword.get(opts, :actor_lineage, []),
+        entity_type: "runner",
+        entity_id: runner.id,
+        payload: %{"name" => runner.name, "api_key_id" => runner.api_key_id}
+      })
+    end
+  end
+
+  defp revocation_audited?(tenant_id, runner_id) do
+    AdminRepo.exists?(
+      from e in AuditEntry,
+        where: e.tenant_id == ^tenant_id and e.action == "runner_revoked",
+        where: e.entity_type == "runner" and e.entity_id == ^runner_id
+    )
   end
 
   @doc "Whether `api_key_id` is the credential of a runner (active or revoked)."

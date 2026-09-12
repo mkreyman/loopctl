@@ -308,7 +308,7 @@
       "trace_event": "RunnerTraceEvent"
     },
     "socket_path": "/runner/socket/websocket",
-    "topic": "runners"
+    "topic": "runner:{runner_id}"
   },
   "x-contract-version": "1.0.0"
 }

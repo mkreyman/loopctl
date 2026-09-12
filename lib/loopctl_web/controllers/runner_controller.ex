@@ -51,8 +51,8 @@ defmodule LoopctlWeb.RunnerController do
     description:
       "Enrolls a dev machine as a runner and returns its credential ONCE, as `token`. The " <>
         "runner presents it in the `x-loopctl-runner-token` header when it connects to " <>
-        "`/runner/socket/websocket`, and joins the `runners` topic under exactly this " <>
-        "`name`. The wire contract is `priv/runner_contract/v1.json`. Requires user role; " <>
+        "`/runner/socket/websocket`, and joins the topic `runner:<runner.id>` declaring " <>
+        "exactly this `name`. The wire contract is `priv/runner_contract/v1.json`. Requires user role; " <>
         "a caller whose key was minted by a dispatch is refused with 403 " <>
         "`api_key_mint_forbidden`. 422 when the name is malformed, already used by an " <>
         "active runner, or the tenant is at its API key limit.",

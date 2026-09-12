@@ -40,8 +40,10 @@ defmodule LoopctlWeb.RunnerChannelTest do
   defp connect_runner(token), do: connect(RunnerSocket, %{}, connect_info: connect_info(token))
 
   # Joins and waits for the channel to process :after_join (the Presence track).
+  defp topic(socket), do: "runner:" <> socket.assigns.runner.id
+
   defp join_pool(socket, machine) do
-    {:ok, reply, channel} = subscribe_and_join(socket, "runners", join_payload(machine))
+    {:ok, reply, channel} = subscribe_and_join(socket, topic(socket), join_payload(machine))
     _ = :sys.get_state(channel.channel_pid)
     {reply, channel}
   end
@@ -156,9 +158,52 @@ defmodule LoopctlWeb.RunnerChannelTest do
       {:ok, _} = Auth.revoke_api_key(key)
 
       assert {:error, %{reason: "not_authorized"}} =
-               subscribe_and_join(socket, "runners", join_payload("minis"))
+               subscribe_and_join(socket, topic(socket), join_payload("minis"))
 
       refute in_pool?(runner.tenant_id, "minis")
+    end
+
+    test "refuses a join on another runner's topic" do
+      {raw, _runner} = fixture(:runner, %{name: "minis"})
+      {_raw_other, other} = fixture(:runner, %{name: "blockit"})
+      {:ok, socket} = connect_runner(raw)
+
+      assert {:error, %{reason: "forbidden_topic"}} =
+               subscribe_and_join(socket, "runner:" <> other.id, join_payload("blockit"))
+
+      refute in_pool?(other.tenant_id, "blockit")
+    end
+
+    test "a refused unauthorized join also disconnects the socket" do
+      {raw, runner} = fixture(:runner, %{name: "minis"})
+      {:ok, socket} = connect_runner(raw)
+      @endpoint.subscribe(RunnerSocket.socket_id(runner.id))
+
+      {:ok, key} = Auth.get_api_key(runner.tenant_id, runner.api_key_id)
+      {:ok, _} = Auth.revoke_api_key(key)
+
+      assert {:error, %{reason: "not_authorized"}} =
+               subscribe_and_join(socket, topic(socket), join_payload("minis"))
+
+      assert_receive %Phoenix.Socket.Broadcast{event: "disconnect"}
+    end
+
+    test "joins are budgeted per runner BEFORE the authorization read" do
+      {raw, runner} = fixture(:runner, %{name: "minis"})
+      {:ok, socket} = connect_runner(raw)
+      join_bucket = "runner_join:" <> runner.id
+
+      Mox.stub(Loopctl.MockRateLimiter, :check_rate, fn
+        ^join_bucket, _window, limit -> {:deny, limit}
+        _bucket, _window, _limit -> {:allow, 1}
+      end)
+
+      # Revoked too: if the read ran first, the refusal would say not_authorized.
+      {:ok, key} = Auth.get_api_key(runner.tenant_id, runner.api_key_id)
+      {:ok, _} = Auth.revoke_api_key(key)
+
+      assert {:error, %{reason: "rate_limited"}} =
+               subscribe_and_join(socket, topic(socket), join_payload("minis"))
     end
 
     test "refuses a join under a machine name other than the enrolled one" do
@@ -166,7 +211,7 @@ defmodule LoopctlWeb.RunnerChannelTest do
       {:ok, socket} = connect_runner(raw)
 
       assert {:error, %{reason: "machine_mismatch", declared: "mac-mini"}} =
-               subscribe_and_join(socket, "runners", join_payload("mac-mini"))
+               subscribe_and_join(socket, topic(socket), join_payload("mac-mini"))
 
       refute in_pool?(runner.tenant_id, "mac-mini")
       refute in_pool?(runner.tenant_id, "minis")
@@ -179,7 +224,7 @@ defmodule LoopctlWeb.RunnerChannelTest do
       assert {:error, %{reason: "unsupported_contract_version", sent: "2.0.0"}} =
                subscribe_and_join(
                  socket,
-                 "runners",
+                 topic(socket),
                  join_payload("minis", %{"contract_version" => "2.0.0"})
                )
     end
@@ -189,7 +234,11 @@ defmodule LoopctlWeb.RunnerChannelTest do
       {:ok, socket} = connect_runner(raw)
 
       assert {:error, %{reason: "invalid_payload", details: details}} =
-               subscribe_and_join(socket, "runners", Map.delete(join_payload("minis"), "cores"))
+               subscribe_and_join(
+                 socket,
+                 topic(socket),
+                 Map.delete(join_payload("minis"), "cores")
+               )
 
       assert Enum.any?(details, &String.contains?(&1, "cores"))
     end

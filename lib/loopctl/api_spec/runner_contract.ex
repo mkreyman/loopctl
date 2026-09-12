@@ -15,13 +15,14 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   - socket: `wss://<host>/runner/socket/websocket?vsn=2.0.0`
   - credential: header `x-loopctl-runner-token: <raw runner key>`. Never a query
     parameter — a URL is logged by every proxy on the path.
-  - topic: `"runners"`, joined with a `RunnerJoin` payload.
+  - topic: `"runner:<runner_id>"` — the id returned by `POST /api/v1/runners` — joined
+    with a `RunnerJoin` payload. A runner may join only its own topic.
 
   ## Messages
 
   | direction | event | schema |
   |---|---|---|
-  | runner -> control | `phx_join` on `"runners"` | `RunnerJoin` |
+  | runner -> control | `phx_join` on `"runner:<runner_id>"` | `RunnerJoin` |
   | runner -> control | `"status"` | `RunnerStatus` |
   | control -> runner | `"dispatch"` | `RunnerDispatch` (declared; emitted from #803) |
   | runner -> control | trace upload | `RunnerTraceEvent` (declared; shipped from #803) |
@@ -314,7 +315,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
       "x-connection" => %{
         "socket_path" => "/runner/socket/websocket",
         "credential_header" => "x-loopctl-runner-token",
-        "topic" => "runners",
+        "topic" => "runner:{runner_id}",
         "events" => %{
           "join" => "RunnerJoin",
           "status" => "RunnerStatus",

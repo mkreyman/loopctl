@@ -1,6 +1,7 @@
 defmodule LoopctlWeb.RunnerChannel do
   @moduledoc """
-  The `"runners"` channel: a runner joins it to enter its tenant's pool (issue #801).
+  The runner channel: a runner joins its own topic, `"runner:<runner_id>"`, to enter its
+  tenant's pool (issue #801). A join on any other runner's topic is refused.
 
   The socket authenticated the credential at connect (`LoopctlWeb.RunnerSocket`). Every
   join re-reads `Runners.authorized?/2`, validates the payload against `Loopctl.ApiSpec.RunnerContract.RunnerJoin`,
@@ -40,16 +41,19 @@ defmodule LoopctlWeb.RunnerChannel do
 
   @recheck_interval_ms 30_000
   @min_status_interval_ms 1_000
+  @join_window_ms 60_000
+  @max_joins 30
 
   @impl true
-  def join("runners", payload, socket) do
-    %{runner: runner, tenant_id: tenant_id} = socket.assigns
+  def join("runner:" <> runner_id, payload, %{assigns: %{runner: %{id: runner_id}}} = socket) do
+    %{runner: runner} = socket.assigns
 
     # Subscribe BEFORE the authorization read: a revoke committing between the two is
     # then either seen by the read or delivered to this process, never lost.
     :ok = Phoenix.PubSub.subscribe(Loopctl.PubSub, Runners.revocation_topic(runner.id))
 
-    with :ok <- still_authorized(tenant_id, runner),
+    with :ok <- join_rate_ok(runner),
+         :ok <- still_authorized(socket),
          {:ok, meta} <- RunnerContract.cast_join(payload),
          :ok <- enrolled_machine(meta, runner) do
       send(self(), :after_join)
@@ -63,6 +67,7 @@ defmodule LoopctlWeb.RunnerChannel do
     end
   end
 
+  def join("runner:" <> _other, _payload, _socket), do: {:error, %{reason: "forbidden_topic"}}
   def join(_topic, _payload, _socket), do: {:error, %{reason: "unknown_topic"}}
 
   @impl true
@@ -128,8 +133,26 @@ defmodule LoopctlWeb.RunnerChannel do
   # The socket authenticated once, at connect. A join can come much later — a runner can
   # leave and rejoin on the same connection — so every join re-reads authorization, or a
   # revoked runner could re-enter the pool faster than the periodic recheck fires.
-  defp still_authorized(tenant_id, runner) do
-    if Runners.authorized?(tenant_id, runner.id), do: :ok, else: {:error, :not_authorized}
+  #
+  # A refusal also DISCONNECTS the socket: an unauthorized runner has no use for the
+  # connection it still holds, and every further join would be another read.
+  defp still_authorized(%{assigns: %{runner: runner, tenant_id: tenant_id}}) do
+    if Runners.authorized?(tenant_id, runner.id) do
+      :ok
+    else
+      LoopctlWeb.Endpoint.broadcast(RunnerSocket.socket_id(runner.id), "disconnect", %{})
+      {:error, :not_authorized}
+    end
+  end
+
+  # Every join costs an authorization read on AdminRepo and a Presence leave/join
+  # broadcast, and each rejoin starts a fresh channel process whose status interval has
+  # never fired. So joins are budgeted per runner, before any of that, on the shared
+  # limiter (fail-CLOSED: a limiter fault refuses the join and the runner retries).
+  defp join_rate_ok(runner) do
+    if Loopctl.RateLimiter.gate_ok?("runner_join:" <> runner.id, @join_window_ms, @max_joins),
+      do: :ok,
+      else: {:error, :join_rate_limited}
   end
 
   defp enrolled_machine(%{machine: machine}, %{name: machine}), do: :ok
@@ -163,6 +186,9 @@ defmodule LoopctlWeb.RunnerChannel do
   end
 
   defp join_error(:not_authorized), do: %{reason: "not_authorized"}
+
+  defp join_error(:join_rate_limited),
+    do: %{reason: "rate_limited", max_joins: @max_joins, window_ms: @join_window_ms}
 
   defp join_error({:invalid, messages}), do: %{reason: "invalid_payload", details: messages}
 
