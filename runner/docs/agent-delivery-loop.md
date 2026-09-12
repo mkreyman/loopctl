@@ -1,9 +1,11 @@
 # Agent Delivery Loop
 
-**Status:** design, v2. Not implemented.
-**v2 supersedes the bootstrap version entirely** — a four-lens review on 2026-09-12 falsified
-several load-bearing parts of v1. Where v1 and this disagree, this wins. The per-issue comments
-on loopctl#800-805 and loopctl-runner#1 carry the evidence.
+**Status:** design. Not implemented.
+
+This is the single current description of the loop. Git history is the record of how it got
+here; the comments on loopctl#800-805 and loopctl-runner#1 carry the evidence behind individual
+decisions. Where this and any issue comment disagree, this wins — fix the document rather than
+adding a note to it.
 
 ## 1. What this is for
 
@@ -112,8 +114,9 @@ see §9.
 
 ## 5. Two gates
 
-v1 used one word, "escalation", for two different things and produced a **54% escalation rate**.
-They are separate.
+These are two different gates. Collapsing them into one "escalation" concept produces a **54%
+escalation rate**, measured on 80 first-parent commits — the outcome the calibration exists to
+prevent.
 
 ### Gate A — "Mark decides." Request-shaped. Rare.
 
@@ -166,8 +169,8 @@ production data from outside `priv/repo/migrations/`).
 
 ### Both gates run twice
 
-v1 ran the predicate once, at triage, over the trio's **predicted** touch list, and then claimed
-a PR was "by construction" safe. Nothing binds the implementing session to that prediction.
+A single evaluation at triage runs over the trio's **predicted** touch list, and nothing binds
+the implementing session to that prediction — so a gate that runs only there certifies a guess.
 
 Run at triage over the predicted touches to decide whether to dispatch at all. Run again as a
 **merge precondition** over the real `gh pr diff --name-only` plus the real diffstat, including
@@ -223,9 +226,9 @@ not xps13 (4 threads, 8 GB soldered). Placement prefers a warm `_build`, then fr
 lowest `in_flight` — with free disk as a precondition.
 
 **The runner validates every dispatch against a local allow-list** (repos, branch prefixes, wall
-clock, token budget) and refuses by default. v1 reasoned only about a compromised machine
-reaching the control plane; the design actually opens the other direction, where a dispatch is an
-arbitrary prompt executed as the user with that machine's credentials.
+clock, token budget) and refuses by default. The obvious threat is a compromised machine reaching
+the control plane; the direction this design actually opens is the reverse, where a dispatch is
+an arbitrary prompt executed as the user with that machine's credentials.
 
 ## 8. Unattended sessions
 
@@ -233,10 +236,10 @@ arbitrary prompt executed as the user with that machine's credentials.
 `AskUserQuestion` from the tool list and cancels MCP elicitations — making the wrong thing
 impossible rather than costly. Requires 2.1.259+. Add `--max-turns` as the hard stop.
 
-v1 proposed a `PreToolUse` deny hook instead. That is one rung down and retryable: the retry
+Do not reach for a `PreToolUse` deny hook instead. That is one rung down and retryable: the retry
 control lives on `PermissionDenied`, which does not fire for `PreToolUse` denials, so nothing
-bounds an unattended session re-asking. And v1's "or allow it with `additionalContext` injected"
-branch is strictly wrong — `allow` means the tool *runs*, which is the hang it exists to prevent.
+bounds an unattended session re-asking. And never pair it with `permissionDecision: "allow"` plus
+`additionalContext` — `allow` means the tool *runs*, which is the hang the flag exists to prevent.
 
 Keep a hook only for what the flag cannot do: emitting the **escalation** signal when the model
 wanted to ask. Register it on `PermissionDenied`. Default that path to escalate, not deny — a
@@ -249,10 +252,10 @@ matcher as `gate-ask-user-question.sh` — two hooks denying the same call with 
 instructions is worse than either. The runner passes `LOOP_MODE=1 LOOP_STORY_FILE=...` in the
 environment, which hooks inherit.
 
-**Parking detection**: v1 used "no writes under `subagents/` in N minutes". Measured on mac-mini:
-**0 of 1,543 project directories** contain one, because that directory exists only when a session
-dispatches subagents — so it reports every healthy solo session as parked from second zero. Use
-instead, ORed: bytes on the Port's stdout (strongest, needs no filesystem); mtime on
+**Parking detection.** Do not use "no writes under `subagents/` in N minutes" — measured on
+mac-mini, **0 of 1,543 project directories** contain one, because that directory exists only when
+a session dispatches subagents, so it reports every healthy solo session as parked from second
+zero. Use instead, ORed: bytes on the Port's stdout (strongest, needs no filesystem); mtime on
 `~/.claude/projects/<slug>/<sessionId>.jsonl`; and `claude agents --json`. Keep `subagents/` only
 as a suppressor meaning "legitimately waiting on a panel".
 
@@ -275,8 +278,8 @@ variable that gate exits 0 on.
 
 ## 9. Merge, and what Larisa sees
 
-`required_approving_review_count` is **0** on both `master` and `staging` of home_care_billing.
-So "merge on passed reviews" in v1 meant agent-written code reviewed by agents and merged by
+`required_approving_review_count` is **0** on both `master` and `staging` of home_care_billing,
+so "merge on passed reviews" would mean agent-written code reviewed by agents and merged by
 agents, with no human anywhere. **Raise it to 1 on the loop's target branches** and have the loop
 request review for anything Gate B does not clear — branch protection is server-side and an agent
 cannot talk around it.
@@ -315,7 +318,7 @@ She is notified **when a change is deployed**, never of work in progress — no 
 no "an agent picked this up". Work-in-progress notifications invite intervention in a loop
 designed to run without it, and an abandoned PR reads as a broken promise.
 
-Three shipped behaviours contradict v1 and must be handled:
+Three already-shipped behaviours work against that and must be handled:
 
 - **Closing the GitHub issue emails her that a fix shipped.** The webhook auto-resolves the
   ticket with `resolution_notes: "Our team has shipped a fix for this issue."` on *any* close
@@ -388,9 +391,9 @@ escalate.
   going public later is deleting a directory.
 - **claude-config** — the loop-mode launch flags and any `PermissionDenied` hook.
 
-*(v1 also claimed loopctl's `ci.yml` uses a path-probe job and recorded it as settled. It does
-not; there is no paths-filter and `test` carries no path condition. The repo-split conclusion
-stands on the one-app-one-release argument alone.)*
+*(Note for anyone re-examining the split: loopctl's `ci.yml` has no paths-filter and no
+path-probe job, and `test` carries no path condition, so CI coupling is not an argument either
+way. The split stands on one-app-one-release alone.)*
 
 ## 14. Packaging
 
