@@ -2,8 +2,8 @@ defmodule LoopctlWeb.RunnerChannel do
   @moduledoc """
   The `"runners"` channel: a runner joins it to enter its tenant's pool (issue #801).
 
-  The socket has already authenticated the credential (`LoopctlWeb.RunnerSocket`). The
-  join validates the payload against `Loopctl.ApiSpec.RunnerContract.RunnerJoin`,
+  The socket authenticated the credential at connect (`LoopctlWeb.RunnerSocket`). Every
+  join re-reads `Runners.authorized?/2`, validates the payload against `Loopctl.ApiSpec.RunnerContract.RunnerJoin`,
   refuses a declared machine name that is not the enrolled one, and tracks the runner
   in `Loopctl.Runners.Presence` under the tenant-scoped `Runners.pool_topic/1`.
 
@@ -43,8 +43,15 @@ defmodule LoopctlWeb.RunnerChannel do
 
   @impl true
   def join("runners", payload, socket) do
-    with {:ok, meta} <- RunnerContract.cast_join(payload),
-         :ok <- enrolled_machine(meta, socket.assigns.runner) do
+    %{runner: runner, tenant_id: tenant_id} = socket.assigns
+
+    # Subscribe BEFORE the authorization read: a revoke committing between the two is
+    # then either seen by the read or delivered to this process, never lost.
+    :ok = Phoenix.PubSub.subscribe(Loopctl.PubSub, Runners.revocation_topic(runner.id))
+
+    with :ok <- still_authorized(tenant_id, runner),
+         {:ok, meta} <- RunnerContract.cast_join(payload),
+         :ok <- enrolled_machine(meta, runner) do
       send(self(), :after_join)
 
       {:ok, %{contract_version: RunnerContract.version()},
@@ -61,8 +68,6 @@ defmodule LoopctlWeb.RunnerChannel do
   @impl true
   def handle_info(:after_join, socket) do
     %{runner: runner, tenant_id: tenant_id, meta: meta} = socket.assigns
-
-    :ok = Phoenix.PubSub.subscribe(Loopctl.PubSub, Runners.revocation_topic(runner.id))
 
     {:ok, _ref} =
       Presence.track(
@@ -120,6 +125,13 @@ defmodule LoopctlWeb.RunnerChannel do
   def handle_in(_event, _payload, socket),
     do: {:reply, {:error, %{reason: "unknown_event"}}, socket}
 
+  # The socket authenticated once, at connect. A join can come much later — a runner can
+  # leave and rejoin on the same connection — so every join re-reads authorization, or a
+  # revoked runner could re-enter the pool faster than the periodic recheck fires.
+  defp still_authorized(tenant_id, runner) do
+    if Runners.authorized?(tenant_id, runner.id), do: :ok, else: {:error, :not_authorized}
+  end
+
   defp enrolled_machine(%{machine: machine}, %{name: machine}), do: :ok
 
   defp enrolled_machine(%{machine: declared}, _runner),
@@ -149,6 +161,8 @@ defmodule LoopctlWeb.RunnerChannel do
 
     {:stop, {:shutdown, reason}, socket}
   end
+
+  defp join_error(:not_authorized), do: %{reason: "not_authorized"}
 
   defp join_error({:invalid, messages}), do: %{reason: "invalid_payload", details: messages}
 

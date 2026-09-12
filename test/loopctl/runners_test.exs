@@ -144,6 +144,37 @@ defmodule Loopctl.RunnersTest do
     end
   end
 
+  describe "the runner row follows its key" do
+    test "revoking the key through the api_keys route revokes the runner, freeing its name" do
+      tenant = fixture(:tenant)
+      {_raw, runner} = fixture(:runner, %{tenant_id: tenant.id, name: "minis"})
+      {:ok, key} = Auth.get_api_key(tenant.id, runner.api_key_id)
+      {:ok, _} = Auth.revoke_api_key(key)
+
+      assert %Runner{revoked_at: %DateTime{}} = AdminRepo.get!(Runner, runner.id)
+      assert Runners.list_runners(tenant.id) == []
+      assert {:ok, _} = Runners.enroll_runner(tenant.id, %{name: "minis"})
+    end
+
+    test "revoking an unrelated key leaves every runner active" do
+      tenant = fixture(:tenant)
+      {_raw, runner} = fixture(:runner, %{tenant_id: tenant.id})
+      {_raw_key, other} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent})
+      {:ok, _} = Auth.revoke_api_key(other)
+
+      assert is_nil(AdminRepo.get!(Runner, runner.id).revoked_at)
+    end
+
+    test "runner_key?/2 names a runner's key and nothing else, per tenant" do
+      {_raw, runner} = fixture(:runner, %{})
+      {_raw_key, plain} = fixture(:api_key, %{tenant_id: runner.tenant_id, role: :agent})
+
+      assert Runners.runner_key?(runner.tenant_id, runner.api_key_id)
+      refute Runners.runner_key?(runner.tenant_id, plain.id)
+      refute Runners.runner_key?(fixture(:tenant).id, runner.api_key_id)
+    end
+  end
+
   describe "authorized?/2" do
     test "is true for an active runner" do
       {_raw, runner} = fixture(:runner, %{})

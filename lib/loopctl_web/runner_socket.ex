@@ -13,8 +13,10 @@ defmodule LoopctlWeb.RunnerSocket do
   carry security weight, through the same functions:
 
   - `AuthPathThrottle`'s per-IP, fail-CLOSED ceiling (`Loopctl.RateLimiter.gate_ok?/3`,
-    same `auth_ip:` bucket), counted BEFORE the key is resolved, so a flood of bad
-    tokens cannot turn into unbounded `api_keys` lookups on the AdminRepo pool;
+    same `auth_ip:` bucket and config), counted BEFORE the key is resolved, so a flood
+    of bad tokens cannot turn into unbounded `api_keys` lookups on the AdminRepo pool.
+    The IP is the one `LoopctlWeb.RunnerClientIp` resolved from `fly-client-ip` ahead
+    of socket dispatch — the plug pipeline has not run yet at this point;
   - `ResolveApiKey`'s resolution (`Auth.verify_api_key/1`: revocation cache, expiry)
     and its refusal of a non-active tenant, via `Loopctl.Runners.authenticate/1`;
   - plus the runner-specific rule: the key must be bound to an active runner row.
@@ -107,12 +109,20 @@ defmodule LoopctlWeb.RunnerSocket do
   defp positive_int(value, _default) when is_integer(value) and value > 0, do: value
   defp positive_int(_value, default), do: default
 
+  # The address `LoopctlWeb.RunnerClientIp` stamped from `fly-client-ip` before dispatch,
+  # never a header the client chose. Without one (off-Fly, no forwarding header) the TCP
+  # peer is the client; a proxy peer resolves as unresolved and skips the gate.
   defp client_ip(connect_info) do
-    forwarded = RemoteIp.from(Map.get(connect_info, :x_headers, []))
+    stamped =
+      for {name, value} <- Map.get(connect_info, :x_headers, []),
+          name == LoopctlWeb.RunnerClientIp.header(),
+          {:ok, addr} <- [:inet.parse_address(String.to_charlist(value))],
+          do: addr
 
-    case {forwarded, Map.get(connect_info, :peer_data)} do
-      {nil, %{address: address}} -> address
-      {forwarded, _} -> forwarded
+    case {stamped, Map.get(connect_info, :peer_data)} do
+      {[addr | _], _} -> addr
+      {[], %{address: address}} -> address
+      {[], _} -> nil
     end
   end
 end

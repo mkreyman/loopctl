@@ -18,7 +18,10 @@ defmodule Loopctl.Runners do
   Revocation is central (`revoke_runner/3`): it revokes the key and the row in one
   transaction, busts the key cache after commit, and notifies the live channel, which
   disconnects its socket. A key revoked by any other route (`DELETE /api/v1/api_keys/:id`,
-  expiry, tenant suspension) is caught by the channel's periodic `authorized?/2` recheck.
+  expiry, tenant suspension) is caught by the channel's periodic `authorized?/2` recheck
+  and by the same read on every join. A database trigger revokes the runner row with its
+  key, so the registry never lists a machine whose credential is gone, and a runner's key
+  cannot be rotated through `/api/v1/api_keys`: rotation is revoke plus re-enroll.
 
   ## Pool
 
@@ -200,6 +203,14 @@ defmodule Loopctl.Runners do
       {:error, _step, reason, _} ->
         {:error, reason}
     end
+  end
+
+  @doc "Whether `api_key_id` is the credential of a runner (active or revoked)."
+  @spec runner_key?(Ecto.UUID.t(), Ecto.UUID.t()) :: boolean()
+  def runner_key?(tenant_id, api_key_id) when is_binary(tenant_id) and is_binary(api_key_id) do
+    AdminRepo.exists?(
+      from r in Runner, where: r.tenant_id == ^tenant_id and r.api_key_id == ^api_key_id
+    )
   end
 
   @doc """

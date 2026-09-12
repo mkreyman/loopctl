@@ -51,6 +51,18 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       refute Enum.any?(Map.keys(join), &is_binary/1)
     end
 
+    test "drops undeclared keys inside nested objects too" do
+      sample = Map.put(@sample, "padding", String.duplicate("x", 1_000))
+
+      assert {:ok, join} = RunnerContract.cast_join(Map.put(@join, "sample", sample))
+
+      assert Map.keys(join.sample) |> Enum.sort() ==
+               [:free_disk_mb, :free_ram_mb, :loadavg_1m, :sampled_at]
+
+      assert {:ok, status} = RunnerContract.cast_status(%{"sample" => sample})
+      refute Enum.any?(Map.keys(status.sample), &is_binary/1)
+    end
+
     test "accepts any minor or patch of the spoken major" do
       assert {:ok, _} = RunnerContract.cast_join(%{@join | "contract_version" => "1.9.3"})
     end

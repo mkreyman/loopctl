@@ -93,6 +93,22 @@ defmodule LoopctlWeb.RunnerControllerTest do
     end
   end
 
+  describe "POST /api/v1/api_keys/:id/rotate on a runner's key" do
+    test "422, and the runner keeps its one working key", %{conn: conn} do
+      ctx = operator_ctx()
+      {raw, runner} = fixture(:runner, %{tenant_id: ctx.tenant.id})
+
+      body =
+        conn
+        |> auth(ctx.operator_key)
+        |> post(~p"/api/v1/api_keys/#{runner.api_key_id}/rotate", %{})
+        |> json_response(422)
+
+      assert body["error"]["message"] =~ "belongs to a runner"
+      assert {:ok, _} = Runners.authenticate(raw)
+    end
+  end
+
   describe "GET /api/v1/runners" do
     test "lists active runners, and revoked ones on request", %{conn: conn} do
       ctx = operator_ctx()

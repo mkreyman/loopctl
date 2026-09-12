@@ -257,7 +257,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   def cast_join(payload) do
     with {:ok, cast} <- cast(payload, RunnerJoin.schema()),
          :ok <- supported_version(cast.contract_version) do
-      {:ok, Map.take(cast, Map.keys(RunnerJoin.schema().properties))}
+      {:ok, known_fields(cast, RunnerJoin.schema())}
     end
   end
 
@@ -265,12 +265,22 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   @spec cast_status(term()) :: {:ok, map()} | {:error, term()}
   def cast_status(payload) do
     with {:ok, cast} <- cast(payload, RunnerStatus.schema()) do
-      case Map.take(cast, Map.keys(RunnerStatus.schema().properties)) do
+      case known_fields(cast, RunnerStatus.schema()) do
         empty when map_size(empty) == 0 -> {:error, {:invalid, ["no known status field"]}}
         known -> {:ok, known}
       end
     end
   end
+
+  # OpenApiSpex keeps undeclared keys on an object, at every depth. Drop them at every
+  # depth too, so nothing the contract does not declare reaches Presence.
+  defp known_fields(map, %Schema{type: :object, properties: props}) when is_map(map) do
+    for {key, sub} <- props, Map.has_key?(map, key), into: %{} do
+      {key, known_fields(Map.fetch!(map, key), sub)}
+    end
+  end
+
+  defp known_fields(value, _schema), do: value
 
   defp cast(payload, schema) when is_map(payload) do
     case OpenApiSpex.Cast.cast(schema, payload) do

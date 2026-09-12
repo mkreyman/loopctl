@@ -141,6 +141,26 @@ defmodule LoopctlWeb.RunnerChannelTest do
       assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end)
     end
 
+    test "re-reads authorization on every join, so a revoked runner cannot rejoin" do
+      {raw, runner} = fixture(:runner, %{name: "minis"})
+      {:ok, socket} = connect_runner(raw)
+      {_reply, channel} = join_pool(socket, "minis")
+
+      Process.unlink(channel.channel_pid)
+      ref = leave(channel)
+      assert_reply ref, :ok
+      assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end)
+
+      # Revoked through the api_keys route: no broadcast reaches the unjoined socket.
+      {:ok, key} = Auth.get_api_key(runner.tenant_id, runner.api_key_id)
+      {:ok, _} = Auth.revoke_api_key(key)
+
+      assert {:error, %{reason: "not_authorized"}} =
+               subscribe_and_join(socket, "runners", join_payload("minis"))
+
+      refute in_pool?(runner.tenant_id, "minis")
+    end
+
     test "refuses a join under a machine name other than the enrolled one" do
       {raw, runner} = fixture(:runner, %{name: "minis"})
       {:ok, socket} = connect_runner(raw)

@@ -2,6 +2,10 @@ defmodule LoopctlWeb.Endpoint do
   require Logger
   use Phoenix.Endpoint, otp_app: :loopctl
 
+  # Issue #801: must be registered AFTER `use Phoenix.Endpoint`, so it wraps the endpoint's
+  # `call/2` and stamps the trusted client IP before socket dispatch. See the module.
+  @before_compile LoopctlWeb.RunnerClientIp
+
   # The session is stored in the cookie. It is BOTH signed (tamper-proof) and now
   # ENCRYPTED (`encryption_salt`, a value distinct from `signing_salt`) so the
   # signup-flow payload it carries — the client IP handed to `SignupLive` through
