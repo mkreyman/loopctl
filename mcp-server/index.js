@@ -43,6 +43,7 @@ import {
   GENERATED_TOOL_PREFIX,
 } from "./lib/generated-tools.js";
 import { createHandoff } from "./lib/handoff.js";
+import { readPayloadFile } from "./lib/payload-path.js";
 
 // Single source of truth for the server version: the package.json this file
 // ships with (npm always includes package.json in the published tarball).
@@ -967,13 +968,7 @@ async function importStories({ project_id, payload, payload_path, merge }) {
 
 // Reads JSON payload from either an inline object or an absolute file path.
 // Returns the object on success, or an { error, body } shape on failure.
-//
-// Security: `payload_path` is read with the MCP process's filesystem
-// privileges. Because agents can set this argument via prompt injection,
-// we validate aggressively:
-//   * require absolute path
-//   * reject /proc, /dev, /sys (pseudo-filesystems that could DoS or leak)
-//   * stat first and cap at 5 MiB (server also enforces a body size limit)
+// The file path is validated in lib/payload-path.js (see its security notes).
 async function resolvePayload(inline, payloadPath) {
   if (inline && typeof inline === "object") return inline;
   if (!payloadPath) {
@@ -983,53 +978,7 @@ async function resolvePayload(inline, payloadPath) {
       body: "Must provide either `payload` (object) or `payload_path` (absolute JSON file path).",
     };
   }
-
-  const nodePath = await import("node:path");
-  if (!nodePath.isAbsolute(payloadPath)) {
-    return {
-      error: true,
-      status: 0,
-      body: `payload_path must be absolute (got '${payloadPath}').`,
-    };
-  }
-
-  const blockedPrefixes = ["/proc/", "/dev/", "/sys/", "/proc", "/dev", "/sys"];
-  if (blockedPrefixes.some((p) => payloadPath === p.replace(/\/$/, "") || payloadPath.startsWith(p))) {
-    return {
-      error: true,
-      status: 0,
-      body: `payload_path refused: '${payloadPath}' targets a pseudo-filesystem path.`,
-    };
-  }
-
-  const MAX_PAYLOAD_BYTES = 5 * 1024 * 1024;
-  const fs = await import("node:fs/promises");
-
-  try {
-    const stat = await fs.stat(payloadPath);
-    if (!stat.isFile()) {
-      return {
-        error: true,
-        status: 0,
-        body: `payload_path '${payloadPath}' is not a regular file.`,
-      };
-    }
-    if (stat.size > MAX_PAYLOAD_BYTES) {
-      return {
-        error: true,
-        status: 0,
-        body: `payload_path '${payloadPath}' is ${stat.size} bytes, exceeds max ${MAX_PAYLOAD_BYTES}.`,
-      };
-    }
-    const raw = await fs.readFile(payloadPath, "utf8");
-    return JSON.parse(raw);
-  } catch (err) {
-    return {
-      error: true,
-      status: 0,
-      body: `Could not read payload_path '${payloadPath}': ${err.message}`,
-    };
-  }
+  return readPayloadFile(payloadPath);
 }
 
 // --- Story Tools ---
@@ -3927,7 +3876,7 @@ const TOOLS = [
         payload_path: {
           type: "string",
           description:
-            "Absolute path to a JSON file with the import payload. Avoids inline size limits for large epics. Ignored if `payload` is also passed.",
+            "Absolute path to a .json file holding the import payload (an object with an `epics` array). Avoids inline size limits for large epics. Ignored if `payload` is also passed.",
         },
         merge: {
           type: "boolean",

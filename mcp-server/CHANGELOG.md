@@ -5,6 +5,21 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.91.1 — 2026-09-12 (payload_path no longer discloses or uploads files that are not a payload)
+
+### Security
+
+- **`import_stories` `payload_path` could disclose file content.** A path to a non-JSON file
+  (for example `/etc/passwd`) made `JSON.parse` throw, and the error was returned verbatim —
+  V8's SyntaxError quotes the start of the file. A valid JSON file that was not an import
+  payload (a credentials file) was POSTed to the import endpoint. Reported by Artyom Lobanov
+  (@Morendais). `payload_path` now:
+  - must end in `.json`, checked on the path and on its realpath, so a `.json` symlink cannot
+    point at another file or into `/proc`, `/dev` or `/sys`;
+  - reports a parse failure as "is not valid JSON" and an fs failure by its error code only,
+    never the underlying message;
+  - must hold an object with an `epics` array, or it is refused before anything is sent.
+
 ## 2.89.0 — 2026-09-06 (a deduplicated create says whether it threw your payload away)
 
 ### Changed
