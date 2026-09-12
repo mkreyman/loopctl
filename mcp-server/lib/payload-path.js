@@ -1,8 +1,10 @@
 // Reads an import_stories payload from an absolute file path.
 //
 // Security: `payload_path` is read with the MCP process's filesystem privileges and an
-// agent can set it via prompt injection, so a hostile path must learn NOTHING about a file
-// that is not an import payload, and such a file must never be uploaded:
+// agent can set it via prompt injection, so no file CONTENT is ever returned, and a file
+// that is not an import payload is never uploaded. The refusals still say which check
+// failed (missing, not a file, too large, not JSON, wrong shape) for a .json path; that
+// is metadata an agent needs to fix its own call, not content:
 //   * require an absolute path ending in .json, checked on the path AND on its realpath,
 //     so a symlink named x.json cannot point at /etc/passwd or /proc
 //   * reject /proc, /dev, /sys (pseudo-filesystems that could DoS or leak)
@@ -69,7 +71,7 @@ export async function readPayloadFile(payloadPath, { fs = defaultFs } = {}) {
     }
     if (stat.size > MAX_PAYLOAD_BYTES) {
       return refuse(
-        `payload_path '${payloadPath}' is ${stat.size} bytes, exceeds max ${MAX_PAYLOAD_BYTES}.`,
+        `payload_path '${payloadPath}' exceeds max ${MAX_PAYLOAD_BYTES} bytes.`,
       );
     }
     raw = await fs.readFile(realPath, "utf8");

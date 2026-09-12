@@ -33,7 +33,7 @@ before(() => {
   writeFileSync(at("creds.json"), JSON.stringify({ token: "SECRET-MARKER" }));
   writeFileSync(at("array.json"), JSON.stringify([{ epics: [] }]));
   symlinkSync(at("passwd"), at("link-to-passwd.json"));
-  symlinkSync("/proc/self/environ", at("link-to-proc.json"));
+  symlinkSync("/dev/null", at("link-to-dev.json"));
   mkdirSync(at("dir.json"));
 });
 
@@ -89,8 +89,8 @@ describe("payload_path never discloses or uploads a non-payload file", () => {
     assert.match(result.body, /must be a \.json file/);
   });
 
-  test("a .json symlink into /proc is refused as a pseudo-filesystem", async () => {
-    const result = await readPayloadFile(at("link-to-proc.json"));
+  test("a .json symlink into /dev is refused as a pseudo-filesystem", async () => {
+    const result = await readPayloadFile(at("link-to-dev.json"));
     assertRefusedWithoutLeak(result);
     assert.match(result.body, /pseudo-filesystem/);
   });
