@@ -1,6 +1,6 @@
 # Agent Delivery Loop
 
-**Status:** design. Not implemented.
+**Status:** design. Build order step 1a (§12) is implemented in this repo; nothing else is.
 
 This is the single current description of the loop. Git history is the record of how it got
 here; the comments on loopctl#800-805 and loopctl-runner#1 carry the evidence behind individual
@@ -50,6 +50,21 @@ second topic on the same one.
 `set_tenant`, `require_auth`, `require_role`, `check_custody_halt`, `resolve_api_key`,
 `rate_limiter`, `validate_witness_header`. `join/3` resolves api key and tenant through the same
 functions; every `handle_in` calls a context function that owns its transaction and sets the GUC.
+The one plug that cannot be reused as written is client-IP resolution: Phoenix dispatches a socket
+before any endpoint plug runs, so loopctl stamps `fly-client-ip` ahead of socket dispatch instead.
+
+**Enrollment and credential** (shipped in loopctl#801, PR #806). A runner is enrolled with
+`POST /api/v1/runners {name}` — user role, human-anchored tenant, unlineaged key — which creates a
+`runners` row and an `api_keys` row bound to it; the token is shown once. The runner presents it
+in the `x-loopctl-runner-token` header on the websocket upgrade to `/runner/socket/websocket`,
+never as a query parameter. Rotating that key through `/api_keys` is refused; rotate by
+`DELETE /api/v1/runners/:id` and re-enrolling.
+
+**Contract.** The wire contract is JSON Schema, `priv/runner_contract/v1.json` in mkreyman/loopctl
+(`contract_version` 1.0.0), vendored into this repo rather than re-typed. The join payload must
+declare `machine` exactly equal to the enrolled name. Joins are budgeted at 30 per minute per
+runner, a join refused as `not_authorized` disconnects the socket, status updates are at least
+1s apart, and unknown fields are dropped at every depth.
 
 ## 3. Stage machine
 
@@ -201,9 +216,13 @@ That is why story claims are a Postgres transaction.
 
 ## 7. The machine pool
 
-`Phoenix.Presence` on the runner channel, topic `"runners"`, carrying cores, memory, repos,
-`max_sessions`, `in_flight`, `draining`. Tracking dies with the socket, so a crashed runner
-leaves the pool with no sweeper.
+Each runner joins its **own** topic, `runner:<runner_id>` (the id `POST /api/v1/runners`
+returned); a join on another runner's topic is refused with `forbidden_topic`. Not a shared
+`"runners"` topic: loopctl is multi-tenant, and a shared join topic delivers every broadcast —
+including a dispatch — to every tenant's machines. Liveness is a **tenant-scoped** Presence set,
+`runners:<tenant_id>`, carrying cores, memory, repos, `max_sessions`, `in_flight`, `draining`;
+runners never receive the pool. Tracking dies with the socket, so a crashed runner leaves the pool
+with no sweeper.
 
 **Presence is a liveness hint, not a scheduler.** It is an eventually-consistent CRDT with no
 compare-and-set, so two story processes both read `in_flight: 0` and both dispatch to the same
@@ -236,6 +255,12 @@ an arbitrary prompt executed as the user with that machine's credentials.
 `AskUserQuestion` from the tool list and cancels MCP elicitations — making the wrong thing
 impossible rather than costly. Requires 2.1.259+. Add `--max-turns` as the hard stop.
 
+**The same flag denies every tool call auto mode would have prompted for.** Measured on 2.1.270:
+a Bash call running a repository script, and a `python3 -c`, were both denied with "non-interactive
+session without an approval surface". An unattended session can only run what is pre-allowed, so
+a story names its tool rules (`"allowed_tools": ["Bash(mix test:*)"]`), the runner refuses any
+rule not in its own configured allow-list, and passes the rest as `--allowedTools`.
+
 Do not reach for a `PreToolUse` deny hook instead. That is one rung down and retryable: the retry
 control lives on `PermissionDenied`, which does not fire for `PreToolUse` denials, so nothing
 bounds an unattended session re-asking. And never pair it with `permissionDecision: "allow"` plus
@@ -264,9 +289,18 @@ silently outranks the claude.ai login; that incident cost ~USD 300 and reported 
 rather than an auth error. The canary enforcing it only sees claude-config's own files, so this
 repo needs its own copy or a release that refuses to build on a direct invocation.
 
-**Closing a Port does not kill a process tree.** Use `setsid` plus `kill -TERM -<pgid>` on both
-platforms; MuonTrap's containment is cgroup-based and two of three machines are macOS. Reap
-orphans at runner boot, since teardown only runs on the happy path.
+**Closing a Port does not kill a process tree, and neither does a process-group kill.** The
+launcher is a session leader, but measured on 2.1.270 the Bash tool runs every command in a *new
+session*, and the MCP servers are separate trees: a group TERM works only because the CLI cleans
+up its children on TERM, and a group KILL leaves them running, reparented to init. What reaches
+them is the environment — every descendant inherits the `LOOP_SESSION_ID=<uuid>` the runner sets
+(measured, MCP servers and detached tool shells included). End a session by signalling the group
+**and** every process whose environment carries the marker, TERM then KILL; the marker is also a
+pid-reuse-proof identity for the boot-time reaper. MuonTrap's cgroup containment would do it on
+one of three machines. A watchdog in the launcher ends the session when the Port's pipe closes,
+which covers a runner killed with `kill -9`; reap orphans at runner boot behind it. (On OTP 28 /
+Linux a Port child is already a session leader, so a bare `setsid(2)` fails with EPERM — check
+leadership rather than assume it.)
 
 **The session's cwd must be the worktree** — `block-foreign-repo-write.sh` keys on
 `git rev-parse --git-common-dir`, so `--add-dir` from elsewhere blocks every write.

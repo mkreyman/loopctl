@@ -1,0 +1,393 @@
+defmodule LoopctlRunner.Session do
+  @moduledoc """
+  One `claude -p` session, wrapped — never supervised directly (design §2).
+
+  Owns the Port, which spawns `priv/bin/session-launcher.sh`, which execs claude-config's
+  `claude-headless.sh`, which execs the CLI. Every way this session ends — clean exit,
+  wall-clock budget, parked, runner shutdown — ends the launcher's process group AND every
+  process carrying this session's `LOOP_SESSION_ID` marker, because the CLI's Bash tool
+  detaches its commands into new sessions (see `LoopctlRunner.ProcessGroup`).
+
+  Unattended flags (design §8): `--permission-mode auto --permission-prompts none` removes
+  `AskUserQuestion` from the tool list, which makes waiting on a human impossible rather
+  than costly, and `--max-turns` is the hard stop. Not `--bare`, which would strip the
+  hooks, agents and MCP servers the loop depends on.
+  """
+
+  use GenServer
+
+  alias LoopctlRunner.{
+    Config,
+    Liveness,
+    ProcessGroup,
+    RunState,
+    Story,
+    StreamEvents,
+    Trace,
+    Worktree
+  }
+
+  # A line longer than this is cut and recorded as unparsed rather than buffered forever.
+  @max_line 16_777_216
+  @verify_group_after_ms 500
+
+  @type result :: %{
+          session_id: String.t(),
+          os_pid: pos_integer(),
+          exit_status: non_neg_integer(),
+          reason: :exited | :wall_clock_exceeded | :parked | :not_group_leader,
+          duration_ms: non_neg_integer()
+        }
+
+  @doc """
+  Runs the session to completion and returns its result.
+
+  Options: `:config`, `:story`, `:worktree`, `:run_dir`, `:trace`, `:parent` (the run's
+  trace seq), and optionally `:session_id` and `:env` (extra `{name, value}` pairs).
+  """
+  @spec run(keyword()) :: result()
+  def run(opts) do
+    pid =
+      case GenServer.start(__MODULE__, Keyword.put(opts, :waiter, self())) do
+        {:ok, pid} -> pid
+        {:error, reason} -> exit({:session_start_failed, reason})
+      end
+
+    ref = Process.monitor(pid)
+
+    receive do
+      {:session_result, ^pid, result} ->
+        Process.demonitor(ref, [:flush])
+        result
+
+      {:DOWN, ^ref, :process, ^pid, reason} ->
+        exit({:session_crashed, reason})
+    end
+  end
+
+  @spec launcher_script() :: String.t()
+  def launcher_script, do: Application.app_dir(:loopctl_runner, "priv/bin/session-launcher.sh")
+
+  @doc "The argv handed to claude-headless.sh."
+  @spec claude_args(Story.t(), String.t()) :: [String.t()]
+  def claude_args(%Story{} = story, session_id) do
+    # -p is a flag, not an option taking a value: the prompt is positional, so a prompt
+    # starting with "-" (a markdown list, front matter) would parse as an option.
+    [
+      "-p",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+      "--session-id",
+      session_id,
+      "--permission-mode",
+      "auto",
+      "--permission-prompts",
+      "none",
+      "--max-turns",
+      Integer.to_string(story.max_turns)
+    ] ++
+      if(story.model, do: ["--model", story.model], else: []) ++
+      Enum.flat_map(story.allowed_tools, &["--allowedTools", &1]) ++
+      ["--", story.prompt]
+  end
+
+  @impl true
+  def init(opts) do
+    Process.flag(:trap_exit, true)
+    %Config{} = config = Keyword.fetch!(opts, :config)
+    %Story{} = story = Keyword.fetch!(opts, :story)
+    trace = Keyword.fetch!(opts, :trace)
+    run_dir = Keyword.fetch!(opts, :run_dir)
+    worktree = Keyword.fetch!(opts, :worktree)
+    session_id = Keyword.get_lazy(opts, :session_id, &uuid4/0)
+
+    stderr_log = Path.join(run_dir, "stderr.log")
+    {:ok, stdout_io} = File.open(Path.join(run_dir, "stdout.ndjson"), [:append, :binary])
+    RunState.update(run_dir, %{session_id: session_id, status: "running"})
+
+    port =
+      Port.open({:spawn_executable, launcher_script()}, [
+        :binary,
+        :exit_status,
+        cd: worktree,
+        args: [stderr_log, config.claude_launcher | claude_args(story, session_id)],
+        env: port_env(run_dir, session_id, config.kill_grace_s, Keyword.get(opts, :env, []))
+      ])
+
+    {:os_pid, os_pid} = Port.info(port, :os_pid)
+    RunState.update(run_dir, %{pgid: os_pid})
+    now = now_ms()
+
+    session_seq =
+      Trace.emit(trace, "session.started", Keyword.fetch!(opts, :parent), %{
+        "session_id" => session_id,
+        "os_pid" => os_pid,
+        "cwd" => worktree,
+        "launcher" => config.claude_launcher,
+        "max_turns" => story.max_turns,
+        "wall_clock_s" => story.wall_clock_s,
+        "model" => story.model
+      })
+
+    Process.send_after(self(), :wall_clock, story.wall_clock_s * 1000)
+    Process.send_after(self(), :verify_group, @verify_group_after_ms)
+    schedule_tick(config)
+
+    {:ok,
+     %{
+       config: config,
+       story: story,
+       trace: trace,
+       waiter: Keyword.fetch!(opts, :waiter),
+       port: port,
+       os_pid: os_pid,
+       session_id: session_id,
+       session_seq: session_seq,
+       stream: StreamEvents.new(session_seq),
+       stdout_io: stdout_io,
+       partial: "",
+       started_ms: now,
+       last_stdout_ms: now,
+       reason: nil
+     }}
+  end
+
+  defp port_env(run_dir, session_id, kill_grace_s, extra) do
+    base = [
+      {"LOOP_MODE", "1"},
+      {"LOOP_RUN_DIR", run_dir},
+      {"LOOP_STORY_FILE", Path.join(run_dir, "story.json")},
+      {"LOOP_SESSION_ID", session_id},
+      {"LOOP_KILL_GRACE_S", Integer.to_string(kill_grace_s)}
+    ]
+
+    unset = ["ANTHROPIC_API_KEY" | Worktree.repo_locating_env()]
+
+    Enum.map(base ++ extra, fn {k, v} -> {to_charlist(k), to_charlist(v)} end) ++
+      Enum.map(unset, &{to_charlist(&1), false})
+  end
+
+  @impl true
+  # Raw chunks, split here. The Port's own {:line, N} mode delivers a trailing
+  # unterminated chunk AFTER {:exit_status, _} (measured, OTP 28), which loses the
+  # CLI's final result line whenever it lacks a newline.
+  def handle_info({port, {:data, chunk}}, %{port: port} = state) do
+    [rest | complete] = [state.partial, chunk] |> IO.iodata_to_binary() |> split_lines()
+    state = Enum.reduce(Enum.reverse(complete), state, &handle_line/2)
+    state = %{state | partial: rest, last_stdout_ms: now_ms()}
+
+    if byte_size(rest) > @max_line,
+      do: {:noreply, flush_partial(state)},
+      else: {:noreply, state}
+  end
+
+  def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
+    state = flush_partial(state)
+    reason = exit_reason(state.reason, status)
+    stragglers = reap_stragglers(state)
+
+    Trace.emit(state.trace, "session.exited", state.session_seq, %{
+      "exit_status" => status,
+      "reason" => Atom.to_string(reason),
+      "duration_ms" => now_ms() - state.started_ms,
+      "stragglers" => stragglers
+    })
+
+    result = %{
+      session_id: state.session_id,
+      os_pid: state.os_pid,
+      exit_status: status,
+      reason: reason,
+      duration_ms: now_ms() - state.started_ms
+    }
+
+    send(state.waiter, {:session_result, self(), result})
+    {:stop, :normal, %{state | port: nil}}
+  end
+
+  def handle_info(:verify_group, %{port: nil} = state), do: {:noreply, state}
+
+  def handle_info(:verify_group, state) do
+    leader? = ProcessGroup.leader?(state.os_pid)
+
+    Trace.emit(state.trace, "session.process_group", state.session_seq, %{
+      "pgid" => state.os_pid,
+      "leader" => leader?
+    })
+
+    # Without leadership the group kill would miss the tree, so the session is not
+    # allowed to run on as though teardown could work.
+    if leader? or ProcessGroup.command(state.os_pid) == nil,
+      do: {:noreply, state},
+      else: {:noreply, stop_session(state, :not_group_leader, %{"pgid" => state.os_pid})}
+  end
+
+  def handle_info(:wall_clock, %{port: nil} = state), do: {:noreply, state}
+
+  def handle_info(:wall_clock, %{reason: reason} = state) when reason != nil,
+    do: {:noreply, state}
+
+  def handle_info(:wall_clock, state) do
+    data = %{"wall_clock_s" => state.story.wall_clock_s}
+    {:noreply, stop_session(state, :wall_clock_exceeded, data)}
+  end
+
+  def handle_info(:liveness_tick, %{port: nil} = state), do: {:noreply, state}
+
+  def handle_info(:liveness_tick, %{reason: reason} = state) when reason != nil,
+    do: {:noreply, state}
+
+  def handle_info(:liveness_tick, state) do
+    state =
+      case observe(state) do
+        {:parked, evidence} -> stop_session(state, :parked, evidence)
+        _ -> state
+      end
+
+    schedule_tick(state.config)
+    {:noreply, state}
+  end
+
+  def handle_info({:EXIT, _from, _reason}, state), do: {:noreply, state}
+
+  # Anything else — a late message from a closed probe Port, a stray timer — must not
+  # crash the monitor: terminate/2 would kill a healthy session.
+  def handle_info(message, state) do
+    Trace.emit(state.trace, "session.unexpected_message", state.session_seq, %{
+      "message" => inspect(message, limit: 5)
+    })
+
+    {:noreply, state}
+  end
+
+  @impl true
+  def terminate(_reason, %{port: port} = state) when port != nil do
+    ProcessGroup.terminate(state.os_pid, grace_ms(state), marker(state))
+  end
+
+  def terminate(_reason, _state), do: :ok
+
+  defp observe(state) do
+    config = state.config
+    window_ms = config.park_after_s * 1000
+    now = now_ms()
+    files = Liveness.file_signals(config.claude_projects_dir, state.session_id)
+
+    obs = %{
+      now_ms: now,
+      last_stdout_ms: state.last_stdout_ms,
+      transcript_mtime_ms: files.transcript_mtime_ms,
+      subagents_mtime_ms: files.subagents_mtime_ms,
+      agent_status: :unknown
+    }
+
+    # The agents probe spawns a CLI, so it runs only once the cheap signals are quiet.
+    case Liveness.evaluate(obs, window_ms) do
+      {:active, _} = verdict ->
+        verdict
+
+      _ ->
+        status =
+          Liveness.agent_status(
+            config.claude_launcher,
+            state.session_id,
+            config.agents_probe_timeout_s * 1000
+          )
+
+        verdict =
+          %{obs | agent_status: status}
+          |> Liveness.evaluate(window_ms)
+          |> unless_port_spoke(state.port)
+
+        Trace.emit(state.trace, "session.liveness", state.session_seq, verdict_data(verdict))
+        verdict
+    end
+  end
+
+  # The probe blocks this process for up to its timeout, so `obs` is stale by the time
+  # it returns: the CLI may have printed its result and exited meanwhile, which also
+  # makes `claude agents` report it absent. Output queued in the mailbox is activity.
+  defp unless_port_spoke({:parked, _} = verdict, port) do
+    {:messages, messages} = Process.info(self(), :messages)
+
+    if Enum.any?(messages, &match?({^port, _}, &1)),
+      do: {:active, [:stdout]},
+      else: verdict
+  end
+
+  defp unless_port_spoke(verdict, _port), do: verdict
+
+  @doc """
+  Why a session ended, given the stop already under way (if any) and the exit status.
+
+  A CLI that exits 0 exited on its own, even if a park stop had begun: that stop's TERM
+  would have ended the launcher with 143.
+  """
+  @spec exit_reason(atom() | nil, non_neg_integer()) :: atom()
+  def exit_reason(:parked, 0), do: :exited
+  def exit_reason(nil, _status), do: :exited
+  def exit_reason(reason, _status), do: reason
+
+  defp verdict_data({:parked, evidence}), do: Map.put(evidence, "verdict", "parked")
+
+  defp verdict_data({kind, signals}),
+    do: %{"verdict" => Atom.to_string(kind), "signals" => Enum.map(signals, &Atom.to_string/1)}
+
+  defp stop_session(state, reason, data) do
+    Trace.emit(state.trace, "session.#{reason}", state.session_seq, data)
+    outcome = ProcessGroup.terminate(state.os_pid, grace_ms(state), marker(state))
+
+    Trace.emit(state.trace, "session.terminated", state.session_seq, %{
+      "reason" => Atom.to_string(reason),
+      "outcome" => inspect(outcome)
+    })
+
+    %{state | reason: reason}
+  end
+
+  # The CLI can exit while children it detached from the group live on; the marker
+  # still finds them.
+  defp reap_stragglers(state) do
+    case ProcessGroup.terminate(state.os_pid, grace_ms(state), marker(state)) do
+      :already_gone -> "none"
+      outcome -> inspect(outcome)
+    end
+  end
+
+  defp grace_ms(state), do: state.config.kill_grace_s * 1000
+  defp marker(state), do: ProcessGroup.marker(state.session_id)
+
+  # Returns [remainder | complete lines, newest first].
+  defp split_lines(buffer) do
+    buffer
+    |> String.split("\n")
+    |> Enum.reverse()
+  end
+
+  defp handle_line(line, state) do
+    :ok = IO.binwrite(state.stdout_io, [line, "\n"])
+    emit = fn type, parent, data -> Trace.emit(state.trace, type, parent, data) end
+    %{state | stream: StreamEvents.handle_line(line, state.stream, emit)}
+  end
+
+  defp flush_partial(%{partial: ""} = state), do: state
+  defp flush_partial(state), do: %{handle_line(state.partial, state) | partial: ""}
+
+  defp schedule_tick(config),
+    do: Process.send_after(self(), :liveness_tick, config.liveness_interval_s * 1000)
+
+  defp now_ms, do: System.system_time(:millisecond)
+
+  @doc false
+  @spec uuid4() :: String.t()
+  def uuid4 do
+    <<a::48, _::4, b::12, _::2, c::62>> = :crypto.strong_rand_bytes(16)
+
+    <<a::48, 4::4, b::12, 2::2, c::62>>
+    |> Base.encode16(case: :lower)
+    |> then(fn <<p1::binary-8, p2::binary-4, p3::binary-4, p4::binary-4, p5::binary-12>> ->
+      Enum.join([p1, p2, p3, p4, p5], "-")
+    end)
+  end
+end

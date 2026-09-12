@@ -1,0 +1,13 @@
+/_build/
+/cover/
+/deps/
+/doc/
+/tmp/
+erl_crash.dump
+*.ez
+loopctl_runner-*.tar
+/priv/plts/
+
+# Machine topology never lives in the repo: the real runner config is
+# ~/.config/loopctl-runner/runner.json. Only the example is tracked.
+/config/runner.json

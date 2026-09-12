@@ -1,0 +1,10 @@
+{
+  "id": "hand-filed-1",
+  "repo": "home_care_billing",
+  "base": "master",
+  "branch": "loop/hand-filed-1",
+  "prompt": "Read mix.exs and report the Elixir version it requires. Do not edit, commit, push or open a PR.",
+  "wall_clock_s": 900,
+  "max_turns": 20,
+  "model": "haiku"
+}

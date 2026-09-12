@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# A stand-in for the Claude Code CLI, reached through the REAL claude-headless.sh by
+# putting this directory first on PATH. Behaviour is chosen by environment:
+#
+#   FAKE_STATE_DIR     where it records what it saw (required)
+#   FAKE_CLAUDE_MODE   stream | hang | exit_leaving_child
+#   FAKE_EXIT          exit code for stream mode (default 0)
+#   FAKE_AGENTS        busy | idle | fail — what `claude agents --json` reports
+
+set -u
+state=${FAKE_STATE_DIR:?FAKE_STATE_DIR required}
+
+if [ "${1:-}" = "agents" ]; then
+    case "${FAKE_AGENTS:-busy}" in
+        fail) echo "agents probe exploded" >&2; exit 3 ;;
+        slow_absent) sleep 2; echo '[]'; exit 0 ;;
+        hang) sleep 30; exit 0 ;;
+    esac
+    sid=$(cat "$state/session_id" 2>/dev/null || echo none)
+    status=${FAKE_AGENTS:-busy}
+    printf '[{"pid":1,"kind":"interactive","sessionId":"%s","status":"%s"}]\n' "$sid" "$status"
+    exit 0
+fi
+
+sid=none
+prev=
+for arg in "$@"; do
+    [ "$prev" = "--session-id" ] && sid=$arg
+    prev=$arg
+done
+printf '%s' "$sid" > "$state/session_id"
+printf '%s' "$PPID" > "$state/launcher_pid"
+here=$(realpath .)
+printf '%s\n' "$here" > "$state/cwd"
+# Names only for the key, never values: a failing assertion prints this file, and the
+# real environment carries credentials.
+env | sed -n 's/^\(ANTHROPIC_API_KEY\|GIT_[A-Z_]*\)=.*/\1 PRESENT/p; /^LOOP_[A-Z_]*=/p' > "$state/env"
+printf '%s\n' "$@" > "$state/argv"
+
+# What Claude Code's Bash tool does with every command (measured on 2.1.270): a NEW
+# session, so neither the launcher's group signal nor a parent walk reaches it once
+# its parent is gone. Only the inherited LOOP_SESSION_ID marker does.
+detach() {
+    perl -MPOSIX -e 'POSIX::setsid(); exec "sleep", "1001"' >/dev/null 2>&1 &
+    local pid=$!
+    while ! [ "$(ps -o sid= -p "$pid" | tr -d ' ')" = "$pid" ]; do :; done
+    # Published only once detached: tests wait on this file, then signal the group.
+    printf '%s' "$pid" > "$state/detached_pid.tmp" && mv "$state/detached_pid.tmp" "$state/detached_pid"
+}
+
+init='{"type":"system","subtype":"init","session_id":"'"$sid"'","model":"fake","cwd":"'"$here"'","permissionMode":"auto"}'
+
+case "${FAKE_CLAUDE_MODE:-stream}" in
+    stream)
+        echo "$init"
+        echo '{"type":"assistant","parent_tool_use_id":null,"session_id":"'"$sid"'","message":{"content":[{"type":"text","text":"dispatching"},{"type":"tool_use","id":"toolu_A","name":"Agent","input":{}}]}}'
+        echo '{"type":"assistant","parent_tool_use_id":"toolu_A","session_id":"'"$sid"'","message":{"content":[{"type":"tool_use","id":"toolu_B","name":"Read","input":{}}]}}'
+        echo '{"type":"user","parent_tool_use_id":"toolu_B","session_id":"'"$sid"'","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_B"}]}}'
+        echo '{"type":"user","parent_tool_use_id":null,"session_id":"'"$sid"'","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_A"}]}}'
+        echo "this line is not json"
+        printf '%s' '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"session_id":"'"$sid"'"}'
+        exit "${FAKE_EXIT:-0}"
+        ;;
+    quiet_then_result)
+        # Silent past the park window, then finishes WHILE the runner's agents probe runs.
+        echo "$init"
+        sleep 2.5
+        echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"'"$sid"'"}'
+        exit 0
+        ;;
+    delete_run_dir)
+        # Pulls the run directory out from under the runner: its next state write raises.
+        echo "$init"
+        rm -rf "$LOOP_RUN_DIR"
+        exit 0
+        ;;
+    write_file)
+        # Leaves uncommitted work in the worktree.
+        echo "$init"
+        echo "draft" > wip.txt
+        exit 0
+        ;;
+    lock_worktree)
+        # A worktree git refuses to remove: teardown must record the failure.
+        echo "$init"
+        git worktree lock "$here" >/dev/null 2>&1
+        exit 0
+        ;;
+    hang)
+        echo "$init"
+        sleep 1000 >/dev/null 2>&1 &
+        printf '%s' "$!" > "$state/grandchild_pid"
+        detach
+        wait
+        ;;
+    exit_leaving_child)
+        echo "$init"
+        # Inherits stdout on purpose: a straggler holding the Port's pipe.
+        sleep 1000 &
+        printf '%s' "$!" > "$state/grandchild_pid"
+        detach
+        exit 0
+        ;;
+esac

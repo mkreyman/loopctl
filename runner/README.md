@@ -12,8 +12,22 @@ BEAM cluster. See `docs/agent-delivery-loop.md` section 2 for why.
 
 ## Status
 
-Design only. No implementation yet. Start at section 12, "Build order", step 1 — one runner,
-one machine, one hand-filed story, **merging nothing**.
+Build order step **1a** is implemented: a Mix task, no Phoenix and no network. Step 1b (the
+channel client and `Phoenix.Presence`) waits on loopctl#801.
+
+```bash
+mkdir -p ~/.config/loopctl-runner
+cp config/runner.example.json ~/.config/loopctl-runner/runner.json   # then edit repos
+mix loopctl.run config/story.example.json      # or `-` to read the story from stdin
+mix loopctl.tree ~/.local/state/loopctl-runner/runs/<run_id>
+mix loopctl.reap                               # also runs before every loopctl.run
+```
+
+`loopctl.run` creates `<repo>/.claude/worktrees/loop-<story id>` from a local base ref, runs
+`claude -p` in it through a Port, writes `trace.ndjson`, `stdout.ndjson`, `stderr.log` and
+`state.json` under the run directory, stops the session on its wall-clock budget or when it
+is parked, and removes the worktree. It prints one JSON summary line and exits 0 on success,
+1 on a failed session, 2 on a refusal.
 
 ## Why this repo is private, and what would make it public
 
