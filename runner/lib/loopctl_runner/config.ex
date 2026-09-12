@@ -25,7 +25,8 @@ defmodule LoopctlRunner.Config do
     park_after_s: 600,
     liveness_interval_s: 30,
     kill_grace_s: 10,
-    agents_probe_timeout_s: 20
+    agents_probe_timeout_s: 20,
+    tree_poll_s: 1
   ]
 
   @type t :: %__MODULE__{
@@ -40,7 +41,8 @@ defmodule LoopctlRunner.Config do
           park_after_s: pos_integer(),
           liveness_interval_s: pos_integer(),
           kill_grace_s: pos_integer(),
-          agents_probe_timeout_s: pos_integer()
+          agents_probe_timeout_s: pos_integer(),
+          tree_poll_s: pos_integer()
         }
 
   @positive_ints [
@@ -49,7 +51,8 @@ defmodule LoopctlRunner.Config do
     :park_after_s,
     :liveness_interval_s,
     :kill_grace_s,
-    :agents_probe_timeout_s
+    :agents_probe_timeout_s,
+    :tree_poll_s
   ]
 
   @launcher_basename "claude-headless.sh"

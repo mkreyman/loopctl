@@ -104,7 +104,8 @@ defmodule LoopctlRunner.Session do
 
     stderr_log = Path.join(run_dir, "stderr.log")
     {:ok, stdout_io} = File.open(Path.join(run_dir, "stdout.ndjson"), [:append, :binary])
-    RunState.update(run_dir, %{session_id: session_id, status: "running"})
+    tree_file = Path.join(run_dir, "stderr.log.tree")
+    RunState.update(run_dir, %{session_id: session_id, tree_file: tree_file, status: "running"})
 
     port =
       Port.open({:spawn_executable, launcher_script()}, [
@@ -112,11 +113,12 @@ defmodule LoopctlRunner.Session do
         :exit_status,
         cd: worktree,
         args: [stderr_log, config.claude_launcher | claude_args(story, session_id)],
-        env: port_env(run_dir, session_id, config.kill_grace_s, Keyword.get(opts, :env, []))
+        env: port_env(run_dir, session_id, config, Keyword.get(opts, :env, []))
       ])
 
     {:os_pid, os_pid} = Port.info(port, :os_pid)
-    RunState.update(run_dir, %{pgid: os_pid})
+    leader_start = ProcessGroup.start_time(os_pid)
+    RunState.update(run_dir, %{pgid: os_pid, leader_start: leader_start})
     now = now_ms()
 
     session_seq =
@@ -143,6 +145,8 @@ defmodule LoopctlRunner.Session do
        port: port,
        os_pid: os_pid,
        session_id: session_id,
+       tree_file: tree_file,
+       leader_start: leader_start,
        session_seq: session_seq,
        stream: StreamEvents.new(session_seq),
        stdout_io: stdout_io,
@@ -153,13 +157,15 @@ defmodule LoopctlRunner.Session do
      }}
   end
 
-  defp port_env(run_dir, session_id, kill_grace_s, extra) do
+  defp port_env(run_dir, session_id, config, extra) do
     base = [
       {"LOOP_MODE", "1"},
       {"LOOP_RUN_DIR", run_dir},
       {"LOOP_STORY_FILE", Path.join(run_dir, "story.json")},
       {"LOOP_SESSION_ID", session_id},
-      {"LOOP_KILL_GRACE_S", Integer.to_string(kill_grace_s)}
+      {"LOOP_KILL_GRACE_S", Integer.to_string(config.kill_grace_s)},
+      {"LOOP_TREE_POLL_S", Integer.to_string(config.tree_poll_s)},
+      {"LOOP_TREE_FILE", Path.join(run_dir, "stderr.log.tree")}
     ]
 
     unset = ["ANTHROPIC_API_KEY" | Worktree.repo_locating_env()]
@@ -263,7 +269,7 @@ defmodule LoopctlRunner.Session do
 
   @impl true
   def terminate(_reason, %{port: port} = state) when port != nil do
-    ProcessGroup.terminate(state.os_pid, grace_ms(state), marker(state))
+    ProcessGroup.terminate(state.os_pid, grace_ms(state), kill_opts(state))
   end
 
   def terminate(_reason, _state), do: :ok
@@ -336,7 +342,7 @@ defmodule LoopctlRunner.Session do
 
   defp stop_session(state, reason, data) do
     Trace.emit(state.trace, "session.#{reason}", state.session_seq, data)
-    outcome = ProcessGroup.terminate(state.os_pid, grace_ms(state), marker(state))
+    outcome = ProcessGroup.terminate(state.os_pid, grace_ms(state), kill_opts(state))
 
     Trace.emit(state.trace, "session.terminated", state.session_seq, %{
       "reason" => Atom.to_string(reason),
@@ -349,14 +355,20 @@ defmodule LoopctlRunner.Session do
   # The CLI can exit while children it detached from the group live on; the marker
   # still finds them.
   defp reap_stragglers(state) do
-    case ProcessGroup.terminate(state.os_pid, grace_ms(state), marker(state)) do
+    case ProcessGroup.terminate(state.os_pid, grace_ms(state), kill_opts(state)) do
       :already_gone -> "none"
       outcome -> inspect(outcome)
     end
   end
 
   defp grace_ms(state), do: state.config.kill_grace_s * 1000
-  defp marker(state), do: ProcessGroup.marker(state.session_id)
+
+  defp kill_opts(state),
+    do: [
+      marker: ProcessGroup.marker(state.session_id),
+      tree_file: state.tree_file,
+      leader_start: state.leader_start
+    ]
 
   # Returns [remainder | complete lines, newest first].
   defp split_lines(buffer) do

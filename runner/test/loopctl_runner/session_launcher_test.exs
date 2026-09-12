@@ -24,7 +24,11 @@ defmodule LoopctlRunner.SessionLauncherTest do
             :binary,
             :exit_status,
             args: [Path.join(state, "stderr.log"), headless_launcher(), "-p", "x"],
-            env: [{~c"LOOP_SESSION_ID", to_charlist(session_id)}, {~c"LOOP_KILL_GRACE_S", ~c"1"}]
+            env: [
+              {~c"LOOP_SESSION_ID", to_charlist(session_id)},
+              {~c"LOOP_KILL_GRACE_S", ~c"1"},
+              {~c"LOOP_TREE_POLL_S", ~c"1"}
+            ]
           ])
 
         {:os_pid, os_pid} = Port.info(port, :os_pid)
@@ -34,29 +38,37 @@ defmodule LoopctlRunner.SessionLauncherTest do
 
     assert_receive {:os_pid, os_pid}, 2_000
     :ok = wait_until(fn -> File.exists?(Path.join(state, "detached_pid")) end)
+    detached = read_int!(Path.join(state, "detached_pid"))
+    :ok = wait_until(fn -> recorded?(tree_file(state), detached) end)
     {owner, os_pid}
   end
+
+  defp tree_file(state), do: Path.join(state, "stderr.log.tree")
 
   defp pids(state),
     do: Enum.map(~w(grandchild_pid detached_pid), &read_int!(Path.join(state, &1)))
 
-  test "the launcher leads its own process group, and a group signal alone misses detached children",
+  test "the launcher leads its own process group, and only the tree file finds an orphaned detached child",
        ctx do
     {owner, os_pid} = spawn_owner(ctx)
     assert ProcessGroup.leader?(os_pid)
     assert read_int!(Path.join(ctx.state, "launcher_pid")) == os_pid
     [grandchild, detached] = pids(ctx.state)
-    assert detached in ProcessGroup.marked(ctx.marker)
+    assert detached in ProcessGroup.recorded(tree_file(ctx.state))
 
-    # Without the marker: the group dies, the Bash-tool-shaped child does not.
-    assert ProcessGroup.terminate(os_pid, 2_000) == :terminated
+    # A bare group KILL — no descendant walk, no marker, no tree: the group dies, the
+    # Bash-tool-shaped child does not, and its parent is gone so nothing links it back.
+    {_, 0} = System.cmd("kill", ["-KILL", "--", "-#{os_pid}"])
+    :ok = wait_until(fn -> not ProcessGroup.alive?(os_pid) end)
     refute os_pid_alive?(grandchild)
     assert os_pid_alive?(detached)
+    assert ProcessGroup.descendants(os_pid) == []
 
     # With it, the survivor is found and ended.
-    assert ProcessGroup.terminate(nil, 2_000, ctx.marker) == :terminated
+    # The tree file alone, no marker: the only mechanism macOS has for this child.
+    assert ProcessGroup.terminate(nil, 2_000, tree_file: tree_file(ctx.state)) == :terminated
     refute os_pid_alive?(detached)
-    assert ProcessGroup.marked(ctx.marker) == []
+    assert ProcessGroup.recorded(tree_file(ctx.state)) == []
     Process.exit(owner, :kill)
   end
 
@@ -69,8 +81,8 @@ defmodule LoopctlRunner.SessionLauncherTest do
     # launcher's stdin watchdog is left to act.
     Process.exit(owner, :kill)
 
-    assert :ok = wait_until(fn -> ProcessGroup.marked(ctx.marker) == [] end, 8_000)
-    refute ProcessGroup.alive?(os_pid)
+    assert :ok = wait_until(fn -> not os_pid_alive?(detached) end, 8_000)
+    assert :ok = wait_until(fn -> not ProcessGroup.alive?(os_pid) end, 8_000)
     refute os_pid_alive?(grandchild)
     refute os_pid_alive?(detached)
   end
@@ -158,6 +170,105 @@ defmodule LoopctlRunner.SessionLauncherTest do
     assert Session.exit_reason(:parked, 143) == :parked
     assert Session.exit_reason(nil, 7) == :exited
     assert Session.exit_reason(:wall_clock_exceeded, 0) == :wall_clock_exceeded
+  end
+
+  test "a detached command naming the launcher script is still ended when the owner dies", ctx do
+    System.put_env("FAKE_CLAUDE_MODE", "hang_named")
+    test = self()
+
+    owner =
+      spawn(fn ->
+        port =
+          Port.open({:spawn_executable, Session.launcher_script()}, [
+            :binary,
+            :exit_status,
+            args: [Path.join(ctx.state, "stderr.log"), headless_launcher(), "-p", "x"],
+            env: [
+              {~c"LOOP_SESSION_ID", to_charlist(ctx.session_id)},
+              {~c"LOOP_KILL_GRACE_S", ~c"1"},
+              {~c"LOOP_TREE_POLL_S", ~c"1"}
+            ]
+          ])
+
+        send(test, {:os_pid, Port.info(port, :os_pid)})
+        Process.sleep(:infinity)
+      end)
+
+    assert_receive {:os_pid, {:os_pid, _}}, 2_000
+    :ok = wait_until(fn -> File.exists?(Path.join(ctx.state, "named_pid")) end)
+    named = read_int!(Path.join(ctx.state, "named_pid"))
+    :ok = wait_until(fn -> recorded?(tree_file(ctx.state), named) end)
+    assert ProcessGroup.command(named) =~ "session-launcher.sh"
+
+    Process.exit(owner, :kill)
+    assert :ok = wait_until(fn -> not os_pid_alive?(named) end, 8_000)
+  end
+
+  test "recorded/1 matches start times whatever ps's day padding" do
+    {out, 0} = System.cmd("/bin/sh", ["-c", "sleep 30 >/dev/null 2>&1 & echo $!"])
+    pid = String.to_integer(String.trim(out))
+    on_exit(fn -> System.cmd("kill", ["#{pid}"]) end)
+    {lstart, 0} = System.cmd("ps", ["-o", "lstart=", "-p", "#{pid}"])
+    file = Path.join(tmp_dir!("padding"), "tree")
+
+    # Padded the way ps pads a one-digit day, and collapsed the way awk writes it.
+    padded = lstart |> String.trim() |> String.replace(" ", "  ")
+    File.write!(file, "#{pid} #{padded}\n")
+    assert pid in ProcessGroup.recorded(file)
+
+    collapsed = lstart |> String.split() |> Enum.join(" ")
+    File.write!(file, "#{pid} #{collapsed}\n")
+    assert pid in ProcessGroup.recorded(file)
+  end
+
+  test "terminate never walks the children of a pid that is not a live group" do
+    # A non-leader parent with a child: what a recycled launcher pid could turn out to be.
+    marker_file = Path.join(tmp_dir!("recycled"), "parent_pid")
+
+    port =
+      Port.open({:spawn_executable, "/bin/sh"}, [
+        :binary,
+        args: ["-c", "sh -c 'echo $$ > #{marker_file}; sleep 30; :' & sleep 30 & wait"]
+      ])
+
+    # Captured now: by on_exit the test process is gone and so is the Port.
+    {:os_pid, leader} = Port.info(port, :os_pid)
+    on_exit(fn -> System.cmd("kill", ["-KILL", "--", "-#{leader}"]) end)
+
+    :ok = wait_until(fn -> File.exists?(marker_file) end)
+    stranger = read_int!(marker_file)
+    :ok = wait_until(fn -> ProcessGroup.descendants(stranger) != [] end)
+    [child] = ProcessGroup.descendants(stranger)
+    refute ProcessGroup.leader?(stranger)
+    refute ProcessGroup.alive?(stranger)
+
+    assert ProcessGroup.terminate(stranger, 300) == :already_gone
+    assert os_pid_alive?(stranger)
+    assert os_pid_alive?(child)
+  end
+
+  test "terminate leaves alone a group whose leader pid was recycled into a stranger" do
+    # A stranger leading its own group, under the pid a dead launcher once had.
+    {out, 0} =
+      System.cmd("/bin/sh", [
+        "-c",
+        ~s|perl -MPOSIX -e 'POSIX::setsid(); exec "sleep", "30"' >/dev/null 2>&1 & echo $!|
+      ])
+
+    stranger = String.to_integer(String.trim(out))
+    on_exit(fn -> System.cmd("kill", ["-KILL", "#{stranger}"]) end)
+    :ok = wait_until(fn -> ProcessGroup.leader?(stranger) end)
+
+    assert ProcessGroup.terminate(stranger, 300, leader_start: "Thu Jan 1 00:00:00 1970") ==
+             :already_gone
+
+    assert os_pid_alive?(stranger)
+
+    # With its real start time it is ours, and it is ended.
+    assert ProcessGroup.terminate(stranger, 2_000,
+             leader_start: ProcessGroup.start_time(stranger)
+           ) ==
+             :terminated
   end
 
   test "marked/1 matches whole environment entries only" do

@@ -52,7 +52,8 @@ defmodule LoopctlRunner.TestSupport do
         "park_after_s" => 1,
         "liveness_interval_s" => 1,
         "kill_grace_s" => 2,
-        "agents_probe_timeout_s" => 5
+        "agents_probe_timeout_s" => 5,
+        "tree_poll_s" => 1
       },
       overrides
     )
@@ -111,6 +112,14 @@ defmodule LoopctlRunner.TestSupport do
   defp sleep_then_wait(fun, deadline) do
     Process.sleep(50)
     do_wait(fun, deadline)
+  end
+
+  @doc "True once the launcher's tree file records `pid`."
+  def recorded?(tree_file, pid) do
+    case File.read(tree_file) do
+      {:ok, raw} -> raw |> String.split("\n") |> Enum.any?(&String.starts_with?(&1, "#{pid} "))
+      _ -> false
+    end
   end
 
   def read_int!(path), do: path |> File.read!() |> String.trim() |> String.to_integer()

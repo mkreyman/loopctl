@@ -50,7 +50,7 @@ defmodule LoopctlRunner.Reaper do
   defp owner_alive?(state), do: Owner.alive?(state)
 
   defp reap_run(run_dir, %{"status" => status} = state, grace_ms) when status in @in_flight do
-    group = reap_group(state["pgid"], state["session_id"], grace_ms)
+    group = reap_group(state, grace_ms)
     worktree = reap_worktree(run_dir, state, &Worktree.remove_if_clean/4)
     record(run_dir, state, group, worktree)
     RunState.update(run_dir, %{status: "reaped"})
@@ -78,11 +78,14 @@ defmodule LoopctlRunner.Reaper do
   # The session marker is an identity pids cannot counterfeit by being reused, so marked
   # processes are always ended. The group is signalled only while its leader is still
   # our launcher.
-  defp reap_group(pgid, session_id, grace_ms) do
+  defp reap_group(state, grace_ms) do
+    pgid = state["pgid"]
+    session_id = state["session_id"]
     marker = if is_binary(session_id), do: ProcessGroup.marker(session_id)
     group_ours? = is_integer(pgid) and ProcessGroup.alive?(pgid) and launcher?(pgid)
+    opts = [marker: marker, tree_file: state["tree_file"], leader_start: state["leader_start"]]
 
-    outcome = ProcessGroup.terminate(if(group_ours?, do: pgid), grace_ms, marker)
+    outcome = ProcessGroup.terminate(if(group_ours?, do: pgid), grace_ms, opts)
 
     cond do
       outcome != :already_gone ->

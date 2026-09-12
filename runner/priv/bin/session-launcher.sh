@@ -6,14 +6,25 @@
 # It exists because spawning the CLI straight from a Port goes wrong three ways (design §8):
 #
 # 1. CLOSING A PORT DOES NOT KILL A PROCESS TREE, AND NEITHER DOES A GROUP KILL. This
-#    script makes itself a session leader so the CLI shares its process group. On
-#    OTP 28 / Linux the Port child already is one (measured: pid = pgid = sid), where a
-#    bare setsid(2) fails with EPERM, so leadership is CHECKED and perl's POSIX::setsid is
-#    used only when it is missing (perl ships on Linux and macOS; macOS has no setsid(1)).
-#    But the group is not the whole tree: Claude Code's Bash tool runs each command in a
-#    NEW session, and a group KILL leaves it running, reparented to init (measured on
-#    2.1.270). Every descendant does inherit LOOP_SESSION_ID, so kill_session signals the
-#    group AND every process whose environment carries that marker.
+#    script makes itself a session leader so the CLI shares its process group. A Port
+#    child already is one on OTP 28 (measured on Linux and macOS), where a bare setsid(2)
+#    fails with EPERM, so leadership is CHECKED and perl's POSIX::setsid is used only when
+#    it is missing. But the group is not the whole tree: Claude Code's Bash tool runs each
+#    command in a NEW session, and a group KILL leaves it running, reparented to init.
+#    Three things reach it, and kill_session uses all three:
+#      - the group itself;
+#      - the LOOP_SESSION_ID marker every descendant inherits — visible to `ps` for every
+#        process on Linux, but on macOS only for non-Apple binaries (node, beam), since
+#        `ps -E` cannot read a platform binary's environment (measured, macOS on arm64);
+#      - the TREE FILE: while the CLI runs, a recorder snapshots this launcher's
+#        descendants every LOOP_TREE_POLL_S seconds as "pid start-time", so a process
+#        orphaned later is still known. A recorded pid is signalled only if its start
+#        time still matches, so a recycled pid is never hit.
+#    KNOWN BOUND, macOS only: a process orphaned before any snapshot sees it — a
+#    `nohup ... &` from a wrapper shell that exits within the poll interval — is an Apple
+#    binary the marker cannot see and a pid no snapshot recorded. Nothing here reaches it.
+#    Closing that needs OS process tracking (an EndpointSecurity client, which needs an
+#    entitlement and root), not a shell. On Linux the marker covers it.
 #
 # 2. THE BEAM CAN DIE WITHOUT RUNNING TEARDOWN. A kill -9 of the runner, an aborted break
 #    menu, an OOM: none reaches Elixir code. What always happens is that the Port's pipe
@@ -24,6 +35,8 @@
 #    never waits on input the Port will not send, and stderr goes to a file, so stdout
 #    stays pure stream-json.
 #
+# Portable to macOS's /bin/bash 3.2: no $BASHPID, no associative arrays, no GNU-only flags.
+#
 # Exit code: the CLI's own, or 128+signal when it was killed.
 
 set -u
@@ -33,9 +46,10 @@ headless=${2:?claude-headless.sh path required}
 shift 2
 : "${LOOP_SESSION_ID:?LOOP_SESSION_ID required}"
 grace=${LOOP_KILL_GRACE_S:-5}
+poll=${LOOP_TREE_POLL_S:-1}
+tree_file=${LOOP_TREE_FILE:-$stderr_log.tree}
 launcher=$$
 marker="LOOP_SESSION_ID=$LOOP_SESSION_ID"
-ps_snapshot="$stderr_log.ps"
 
 pgid=$(ps -o pgid= -p $$ | tr -d ' ')
 if [ "$pgid" != "$$" ]; then
@@ -49,19 +63,63 @@ if [ "$pgid" != "$$" ]; then
 fi
 unset LOOPCTL_LAUNCHER_SETSID
 
-# Signals every process carrying the marker, then the group. The caller ($BASHPID) and
-# the ps it spawns are excluded; ps output goes to a file and is read without a subshell,
-# because a command substitution would fork a copy of this shell that also matches.
-# The group comes last: for KILL it includes the caller.
+# One row per process: pid, ppid, pgid, the five-word start time, then command and (where
+# ps can read it) environment.
+case "$(uname -s)" in
+    Darwin) ps_args="-A -E -ww -o pid=,ppid=,pgid=,lstart=,command=" ;;
+    *) ps_args="axeww -o pid=,ppid=,pgid=,lstart=,command=" ;;
+esac
+
+snapshot() {
+    # shellcheck disable=SC2086
+    ps $ps_args > "$1" 2>/dev/null
+}
+
+# Descendants of the launcher, and marked processes, as "pid start-time" lines.
+AWK_RECORD='
+{ pid = $1; parent[pid] = $2; start[pid] = $4 " " $5 " " $6 " " $7 " " $8; row[pid] = " " $0 " " }
+END {
+    inset[root] = 1
+    changed = 1
+    while (changed) {
+        changed = 0
+        for (p in parent) if (!(p in inset) && (parent[p] in inset)) { inset[p] = 1; changed = 1 }
+    }
+    for (p in inset) if (p != root) print p, start[p]
+    for (p in row) if (!(p in inset) && index(row[p], " " marker " ")) print p, start[p]
+}'
+
+# Recorded pids whose start time still matches, minus everything still in this launcher's
+# own group: the group signal, sent last, ends those, and signalling the watchdog's own
+# `sleep` by pid would cut its grace period short. Excluded by group, never by name — a
+# detached command that merely mentions this script must still be ended.
+AWK_LIVE='
+FNR == NR { recorded[$1] = $2 " " $3 " " $4 " " $5 " " $6; next }
+{
+    start = $4 " " $5 " " $6 " " $7 " " $8
+    if (($1 in recorded) && recorded[$1] == start && $3 != group) print $1
+}'
+
+# Silent on failure: the run directory can disappear under a dying run, and a recorder
+# that cannot write simply records nothing more.
+record_tree() {
+    local snap="$tree_file.snap.$1"
+    {
+        snapshot "$snap" &&
+            { [ -f "$tree_file" ] && cat "$tree_file"; awk -v root="$launcher" -v marker="$marker" "$AWK_RECORD" "$snap"; } \
+                | sort -u > "$tree_file.tmp.$1" && mv "$tree_file.tmp.$1" "$tree_file"
+        rm -f "$snap"
+    } 2>/dev/null
+}
+
+# Signals every recorded or marked process still alive, then the group. $1 is a signal,
+# $2 a tag unique to the caller so concurrent callers never share temp files.
 kill_session() {
-    local sig=$1 self=$BASHPID pid ppid rest targets=""
-    ps axeww -o pid=,ppid=,command= > "$ps_snapshot" 2>/dev/null
-    while read -r pid ppid rest; do
-        [ "$pid" = "$self" ] && continue
-        [ "$ppid" = "$self" ] && continue
-        case " $rest " in *" $marker "*) targets="$targets $pid" ;; esac
-    done < "$ps_snapshot"
-    rm -f "$ps_snapshot"
+    local sig=$1 tag=$2 targets snap
+    record_tree "$tag"
+    snap="$tree_file.live.$tag"
+    targets=$({ snapshot "$snap" && awk -v group="$launcher" "$AWK_LIVE" "$tree_file" "$snap"; } 2>/dev/null)
+    rm -f "$snap" 2>/dev/null
     # shellcheck disable=SC2086
     [ -n "$targets" ] && kill "-$sig" $targets 2>/dev/null
     kill "-$sig" -- "-$launcher" 2>/dev/null
@@ -75,12 +133,21 @@ exec 3<&0
 child=$!
 
 (
+    exec 3<&-
+    while kill -0 "$child" 2>/dev/null; do
+        record_tree recorder
+        sleep "$poll"
+    done
+) &
+recorder=$!
+
+(
     while IFS= read -r _ <&3; do :; done
     # Only now deaf to TERM: the group signal it is about to send includes itself.
     trap '' TERM
-    kill_session TERM
+    kill_session TERM watchdog
     sleep "$grace"
-    kill_session KILL
+    kill_session KILL watchdog
 ) &
 watchdog=$!
 exec 3<&-
@@ -91,7 +158,7 @@ code=$?
 # The CLI is gone. Anything it left behind — a detached Bash-tool command, an MCP server —
 # would hold the Port's stdout open or simply outlive the run. TERM it all before
 # reporting, without taking this script with it; the runner escalates to KILL.
-{ kill -KILL "$watchdog" && wait "$watchdog"; } 2>/dev/null
+{ kill -KILL "$watchdog" "$recorder" && wait "$watchdog" "$recorder"; } 2>/dev/null
 trap '' TERM
-kill_session TERM
+kill_session TERM exit
 exit "$code"

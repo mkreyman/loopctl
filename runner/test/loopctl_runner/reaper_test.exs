@@ -36,13 +36,15 @@ defmodule LoopctlRunner.ReaperTest do
     mkfifo #{fifo}
     sleep 1000 > #{fifo} 2>/dev/null &
     echo $! > #{state}/holder_pid
-    LOOP_SESSION_ID=#{session_id} #{Session.launcher_script()} #{state}/stderr.log #{headless_launcher()} -p x < #{fifo} >/dev/null 2>&1 &
+    LOOP_SESSION_ID=#{session_id} LOOP_TREE_POLL_S=1 #{Session.launcher_script()} #{state}/stderr.log #{headless_launcher()} -p x < #{fifo} >/dev/null 2>&1 &
     """
 
     {_, 0} = System.cmd("/bin/sh", ["-c", script])
     holder = Path.join(state, "holder_pid")
     on_exit(fn -> System.cmd("kill", ["-KILL", holder |> File.read!() |> String.trim()]) end)
     :ok = wait_until(fn -> File.exists?(Path.join(state, "detached_pid")) end)
+    detached = read_int!(Path.join(state, "detached_pid"))
+    :ok = wait_until(fn -> recorded?(Path.join(state, "stderr.log.tree"), detached) end)
     read_int!(Path.join(state, "launcher_pid"))
   end
 
@@ -71,6 +73,7 @@ defmodule LoopctlRunner.ReaperTest do
       beam_os_pid: dead_pid(),
       pgid: pgid,
       session_id: session_id,
+      tree_file: Path.join(ctx.state, "stderr.log.tree"),
       repo_path: ctx.repo,
       worktree: %{path: path, branch: "loop/s1", base: "master", status: "creating"}
     })
@@ -79,7 +82,7 @@ defmodule LoopctlRunner.ReaperTest do
     refute ProcessGroup.alive?(pgid)
     refute os_pid_alive?(read_int!(Path.join(ctx.state, "grandchild_pid")))
     refute os_pid_alive?(read_int!(Path.join(ctx.state, "detached_pid")))
-    assert ProcessGroup.marked(ProcessGroup.marker(session_id)) == []
+    assert ProcessGroup.recorded(Path.join(ctx.state, "stderr.log.tree")) == []
     refute File.dir?(path)
     assert {:ok, %{"status" => "reaped"}} = RunState.read(run_dir)
 
@@ -132,7 +135,8 @@ defmodule LoopctlRunner.ReaperTest do
       status: "running",
       beam_os_pid: dead_pid(),
       pgid: pgid,
-      session_id: session_id
+      session_id: session_id,
+      tree_file: Path.join(ctx.state, "stderr.log.tree")
     })
 
     assert [%{process_group: ":terminated"}] = Reaper.reap(ctx.runs, 2_000)

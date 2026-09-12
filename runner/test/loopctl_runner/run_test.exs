@@ -60,9 +60,12 @@ defmodule LoopctlRunner.RunTest do
     assert result.status == "succeeded"
     assert result.session.exit_status == 0
 
-    # The session's cwd IS the worktree (design §8).
+    # The session's cwd IS the worktree (design §8). Compared resolved: on macOS the temp
+    # dir lives under /var, a symlink to /private/var.
     worktree = Path.join([root, "repo", ".claude/worktrees/loop-s1"])
-    assert File.read!(Path.join(state, "cwd")) |> String.trim() == worktree
+    {real_root, 0} = System.cmd("realpath", [root])
+    real_worktree = Path.join([String.trim(real_root), "repo", ".claude/worktrees/loop-s1"])
+    assert File.read!(Path.join(state, "cwd")) |> String.trim() == real_worktree
 
     # Launched through claude-headless.sh, in loop mode, with the key stripped.
     env = File.read!(Path.join(state, "env"))
@@ -339,6 +342,20 @@ defmodule LoopctlRunner.RunTest do
 
     assert WorktreeLock.live_holder(config.runs_dir, worktree) == nil
     assert :ok = WorktreeLock.acquire(config.runs_dir, worktree, "next")
+  end
+
+  test "a detached child that ignores TERM is killed by the runner's escalation", %{
+    root: root,
+    state: state
+  } do
+    result = run!(root, state, [{"FAKE_CLAUDE_MODE", "exit_leaving_stubborn_child"}])
+
+    assert result.status == "succeeded"
+    stubborn = read_int!(Path.join(state, "stubborn_pid"))
+    refute os_pid_alive?(stubborn)
+
+    assert [%{"data" => %{"stragglers" => ":killed"}}] =
+             Enum.filter(events!(result), &(&1["type"] == "session.exited"))
   end
 
   test "a worktree failure is recorded and nothing is started", %{root: root, state: state} do

@@ -24,7 +24,8 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
   anywhere in `lib/`, `priv/` or `config/`.
 - **A session is an OS process tree, not a BEAM process, and not just a process group.** Closing
   a Port kills nothing, and Claude Code's Bash tool detaches every command into a new session.
-  End a session with `LoopctlRunner.ProcessGroup.terminate/3` and its `LOOP_SESSION_ID` marker.
+  End a session with `LoopctlRunner.ProcessGroup.terminate/3`, passing its `LOOP_SESSION_ID`
+  marker and its launcher tree file: on macOS the marker is invisible for Apple binaries.
   `priv/bin/session-launcher.sh` does the same when the Port's pipe closes; `LoopctlRunner.Reaper`
   is the boot-time backstop.
 - **Unattended sessions can only run pre-allowed tools.** `--permission-prompts none` denies

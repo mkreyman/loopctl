@@ -12,5 +12,6 @@
   "park_after_s": 600,
   "liveness_interval_s": 30,
   "kill_grace_s": 10,
+  "tree_poll_s": 1,
   "agents_probe_timeout_s": 20
 }

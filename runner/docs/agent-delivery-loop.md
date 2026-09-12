@@ -294,9 +294,15 @@ launcher is a session leader, but measured on 2.1.270 the Bash tool runs every c
 session*, and the MCP servers are separate trees: a group TERM works only because the CLI cleans
 up its children on TERM, and a group KILL leaves them running, reparented to init. What reaches
 them is the environment — every descendant inherits the `LOOP_SESSION_ID=<uuid>` the runner sets
-(measured, MCP servers and detached tool shells included). End a session by signalling the group
-**and** every process whose environment carries the marker, TERM then KILL; the marker is also a
-pid-reuse-proof identity for the boot-time reaper. MuonTrap's cgroup containment would do it on
+(measured, MCP servers and detached tool shells included) — but only on Linux: macOS `ps` cannot
+read the environment of Apple platform binaries (`bash`, `sleep`, `perl`), only of `node` and
+`beam`. So the launcher also records its descendant tree as pid plus start time every second
+while the CLI runs. End a session by signalling the group, its current descendants, every
+process carrying the marker, and every recorded pid whose start time still matches, TERM then
+KILL. Known bound on macOS: a platform-binary process orphaned before any snapshot sees it (a
+`nohup … &` from a wrapper shell that exits within the poll interval) is reached by nothing here;
+closing that needs OS process tracking — an EndpointSecurity client, which needs an entitlement
+and root — not a shell. On Linux the marker covers it. MuonTrap's cgroup containment would do it on
 one of three machines. A watchdog in the launcher ends the session when the Port's pipe closes,
 which covers a runner killed with `kill -9`; reap orphans at runner boot behind it. (On OTP 28 /
 Linux a Port child is already a session leader, so a bare `setsid(2)` fails with EPERM — check

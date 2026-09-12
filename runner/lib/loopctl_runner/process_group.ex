@@ -55,21 +55,29 @@ defmodule LoopctlRunner.ProcessGroup do
   @doc """
   Pids of this user's processes whose environment carries `marker`.
 
-  `ps axeww` prints each command followed by its environment on both procps and BSD ps.
+  On Linux `ps` prints every process's environment. On macOS it can only read the
+  environment of non-Apple binaries (node, beam), so a detached `/bin/bash` or `sleep` is
+  invisible here and must be found through the launcher's tree file (`recorded/1`).
   The `ps` this spawns cannot match: the BEAM's own environment has no marker.
   """
   @spec marked(String.t() | nil) :: [pos_integer()]
   def marked(nil), do: []
 
   def marked(marker) do
-    {out, _} = System.cmd("ps", ["axeww", "-o", "pid=,command="], stderr_to_stdout: true)
     own = String.to_integer(System.pid())
 
-    for line <- String.split(out, "\n", trim: true),
+    for line <- ps_rows(env_ps_args()),
         marked_line?(line, marker),
         {pid, _} <- [Integer.parse(String.trim_leading(line))],
         pid != own,
         do: pid
+  end
+
+  defp env_ps_args do
+    case :os.type() do
+      {:unix, :darwin} -> ["-A", "-E", "-ww", "-o", "pid=,command="]
+      _ -> ["axeww", "-o", "pid=,command="]
+    end
   end
 
   # A whole environment entry, not a prefix of a longer value.
@@ -78,38 +86,148 @@ defmodule LoopctlRunner.ProcessGroup do
   end
 
   @doc """
-  TERM the group and every marked process, wait up to `grace_ms`, then KILL and wait again.
-
-  `pgid` may be nil to end only the marked processes, for a group that is no longer ours.
+  Pids from the launcher's tree file ("pid start-time" lines) that are still the same
+  process: a recorded pid whose start time no longer matches has been reused.
   """
-  @spec terminate(pos_integer() | nil, non_neg_integer(), String.t() | nil) :: outcome()
-  def terminate(pgid, grace_ms, marker \\ nil) do
-    if gone?(pgid, marker) do
-      :already_gone
-    else
-      signal_all(pgid, marker, "TERM")
-      await_gone(pgid, marker, grace_ms, :terminated) || kill(pgid, marker, grace_ms)
+  @spec recorded(String.t() | nil) :: [pos_integer()]
+  def recorded(nil), do: []
+
+  def recorded(tree_file) do
+    case File.read(tree_file) do
+      {:ok, raw} ->
+        starts = start_times()
+
+        for line <- String.split(raw, "\n", trim: true),
+            [pid_s, start] <- [String.split(line, " ", parts: 2)],
+            {pid, ""} <- [Integer.parse(pid_s)],
+            Map.get(starts, pid) == squeeze(start),
+            do: pid
+
+      {:error, _} ->
+        []
     end
   end
 
-  defp kill(pgid, marker, grace_ms) do
-    signal_all(pgid, marker, "KILL")
-    await_gone(pgid, marker, grace_ms, :killed) || {:error, :survived}
+  # `ps lstart` pads a one-digit day with a second space ("Tue Sep  8"); the launcher's awk
+  # collapses it. Compared raw, every recorded pid mismatched on days 1-9.
+  defp squeeze(start), do: start |> String.split() |> Enum.join(" ")
+
+  @doc "Current descendants of `root`, walked by parent pid."
+  @spec descendants(pos_integer() | nil) :: [pos_integer()]
+  def descendants(nil), do: []
+
+  def descendants(root) do
+    parents =
+      for line <- ps_rows(["-A", "-o", "pid=,ppid="]),
+          [pid_s, ppid_s] <- [String.split(line)],
+          do: {String.to_integer(pid_s), String.to_integer(ppid_s)}
+
+    walk(parents, MapSet.new([root])) |> MapSet.delete(root) |> MapSet.to_list()
   end
 
-  defp signal_all(pgid, marker, signal) do
+  defp walk(parents, set) do
+    grown =
+      Enum.reduce(parents, set, fn {pid, ppid}, acc ->
+        if MapSet.member?(acc, ppid), do: MapSet.put(acc, pid), else: acc
+      end)
+
+    if MapSet.size(grown) == MapSet.size(set), do: set, else: walk(parents, grown)
+  end
+
+  defp start_times do
+    for line <- ps_rows(["-A", "-o", "pid=,lstart="]),
+        [pid_s, start] <- [String.split(String.trim_leading(line), " ", parts: 2)],
+        into: %{},
+        do: {String.to_integer(pid_s), squeeze(start)}
+  end
+
+  defp ps_rows(args) do
+    {out, _} = System.cmd("ps", args, stderr_to_stdout: true)
+    String.split(out, "\n", trim: true)
+  end
+
+  @type opts :: [
+          marker: String.t() | nil,
+          tree_file: String.t() | nil,
+          leader_start: String.t() | nil
+        ]
+
+  @doc "The start time of `pid` as `ps lstart` prints it, whitespace-normalised, or nil."
+  @spec start_time(pos_integer()) :: String.t() | nil
+  def start_time(pid) when is_integer(pid) and pid > 1 do
+    case System.cmd("ps", ["-o", "lstart=", "-p", "#{pid}"], stderr_to_stdout: true) do
+      {out, 0} -> squeeze(out)
+      _ -> nil
+    end
+  end
+
+  # Whether `pgid` still names OUR group. A live group whose id is our launcher's pid is
+  # ours unless a process with that pid is alive and started at a different time: then the
+  # launcher died, its group emptied, and the pid was recycled into a stranger's group
+  # leader. With the leader dead, the group id is held by our own stragglers — the kernel
+  # does not reuse a pid while it is a live process group id. Without a recorded start
+  # time only the group's liveness can be checked.
+  defp ours?(nil, _leader_start), do: false
+  defp ours?(_pgid, nil), do: true
+
+  defp ours?(pgid, leader_start) do
+    case start_time(pgid) do
+      nil -> true
+      ^leader_start -> true
+      _other -> false
+    end
+  end
+
+  @doc """
+  TERM the group and every process belonging to the session, wait up to `grace_ms`, then
+  KILL and wait again.
+
+  A session's processes are its group, its current descendants, the processes carrying
+  `:marker`, and the still-live pids in `:tree_file`. `pgid` may be nil to end only the
+  latter, for a group that is no longer ours; with `:leader_start` (the launcher's start
+  time) a `pgid` recycled into someone else's group is treated as nil.
+  """
+  @spec terminate(pos_integer() | nil, non_neg_integer(), opts()) :: outcome()
+  def terminate(pgid, grace_ms, opts \\ []) do
+    pgid = if ours?(pgid, opts[:leader_start]), do: pgid
+
+    if gone?(pgid, opts) do
+      :already_gone
+    else
+      signal_all(pgid, opts, "TERM")
+      await_gone(pgid, opts, grace_ms, :terminated) || kill(pgid, opts, grace_ms)
+    end
+  end
+
+  defp kill(pgid, opts, grace_ms) do
+    signal_all(pgid, opts, "KILL")
+    await_gone(pgid, opts, grace_ms, :killed) || {:error, :survived}
+  end
+
+  # The parent walk only while the group lives: a live group id cannot be a recycled pid,
+  # but once the group is gone `pgid` may name an unrelated process with children of its own.
+  defp members(pgid, opts) do
+    walk_from = if pgid != nil and alive?(pgid), do: pgid
+
+    (marked(opts[:marker]) ++ recorded(opts[:tree_file]) ++ descendants(walk_from))
+    |> Enum.uniq()
+    |> Enum.reject(&(&1 == pgid))
+  end
+
+  defp signal_all(pgid, opts, signal) do
     targets =
-      Enum.map(marked(marker), &Integer.to_string/1) ++ if(pgid, do: ["-#{pgid}"], else: [])
+      Enum.map(members(pgid, opts), &Integer.to_string/1) ++
+        if(pgid, do: ["-#{pgid}"], else: [])
 
     if targets != [],
       do: System.cmd("kill", ["-#{signal}", "--" | targets], stderr_to_stdout: true)
   end
 
-  defp gone?(pgid, marker), do: not (pgid != nil and alive?(pgid)) and marked(marker) == []
+  defp gone?(pgid, opts), do: not (pgid != nil and alive?(pgid)) and members(pgid, opts) == []
 
-  defp await_gone(pgid, marker, remaining_ms, outcome) do
+  defp await_gone(pgid, opts, remaining_ms, outcome) do
     cond do
-      gone?(pgid, marker) ->
+      gone?(pgid, opts) ->
         outcome
 
       remaining_ms <= 0 ->
@@ -117,7 +235,7 @@ defmodule LoopctlRunner.ProcessGroup do
 
       true ->
         Process.sleep(@poll_ms)
-        await_gone(pgid, marker, remaining_ms - @poll_ms, outcome)
+        await_gone(pgid, opts, remaining_ms - @poll_ms, outcome)
     end
   end
 

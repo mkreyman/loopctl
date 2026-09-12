@@ -34,7 +34,7 @@ here=$(realpath .)
 printf '%s\n' "$here" > "$state/cwd"
 # Names only for the key, never values: a failing assertion prints this file, and the
 # real environment carries credentials.
-env | sed -n 's/^\(ANTHROPIC_API_KEY\|GIT_[A-Z_]*\)=.*/\1 PRESENT/p; /^LOOP_[A-Z_]*=/p' > "$state/env"
+env | awk -F= '$1 == "ANTHROPIC_API_KEY" || $1 ~ /^GIT_/ { print $1 " PRESENT"; next } $1 ~ /^LOOP_[A-Z_]*$/' > "$state/env"
 printf '%s\n' "$@" > "$state/argv"
 
 # What Claude Code's Bash tool does with every command (measured on 2.1.270): a NEW
@@ -43,7 +43,8 @@ printf '%s\n' "$@" > "$state/argv"
 detach() {
     perl -MPOSIX -e 'POSIX::setsid(); exec "sleep", "1001"' >/dev/null 2>&1 &
     local pid=$!
-    while ! [ "$(ps -o sid= -p "$pid" | tr -d ' ')" = "$pid" ]; do :; done
+    # setsid makes it a group leader; `ps -o sid` is Linux-only, pgid is portable.
+    while ! [ "$(ps -o pgid= -p "$pid" | tr -d ' ')" = "$pid" ]; do :; done
     # Published only once detached: tests wait on this file, then signal the group.
     printf '%s' "$pid" > "$state/detached_pid.tmp" && mv "$state/detached_pid.tmp" "$state/detached_pid"
 }
@@ -93,12 +94,36 @@ case "${FAKE_CLAUDE_MODE:-stream}" in
         detach
         wait
         ;;
+    hang_named)
+        # A detached command whose own command line mentions the launcher's name: it must
+        # still be ended, so nothing may exclude processes by name.
+        echo "$init"
+        # Loops, so killing its current `sleep` does not end it: only a signal to it does.
+        perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' sh -c 'while :; do sleep 1; done' session-launcher.sh >/dev/null 2>&1 &
+        pid=$!
+        while ! [ "$(ps -o pgid= -p "$pid" | tr -d ' ')" = "$pid" ]; do :; done
+        printf '%s' "$pid" > "$state/named_pid.tmp" && mv "$state/named_pid.tmp" "$state/named_pid"
+        wait
+        ;;
+    exit_leaving_stubborn_child)
+        # A detached child that ignores TERM: the launcher's exit cleanup cannot end it, so
+        # the runner's KILL escalation has to find it — on macOS only through the tree file.
+        echo "$init"
+        perl -MPOSIX -e '$SIG{TERM} = "IGNORE"; POSIX::setsid(); exec "sleep", "1002"' >/dev/null 2>&1 &
+        pid=$!
+        while ! [ "$(ps -o pgid= -p "$pid" | tr -d ' ')" = "$pid" ]; do :; done
+        printf '%s' "$pid" > "$state/stubborn_pid.tmp" && mv "$state/stubborn_pid.tmp" "$state/stubborn_pid"
+        sleep 2
+        exit 0
+        ;;
     exit_leaving_child)
         echo "$init"
         # Inherits stdout on purpose: a straggler holding the Port's pipe.
         sleep 1000 &
         printf '%s' "$!" > "$state/grandchild_pid"
         detach
+        # Live long enough for the launcher's tree recorder to see the detached child.
+        sleep 2
         exit 0
         ;;
 esac
