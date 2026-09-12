@@ -81,7 +81,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     OpenApiSpex.schema(
       %{
         title: "RunnerJoin",
-        description: "The payload a runner joins the `runners` topic with.",
+        description: "The payload a runner joins its own `runner:<runner_id>` topic with.",
         type: :object,
         required: [
           :contract_version,

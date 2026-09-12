@@ -152,7 +152,9 @@ defmodule Loopctl.Runners do
   Revokes a runner: its row and its API key in one transaction, then busts the key
   cache and tells the live channel, which disconnects its socket.
 
-  The row is locked inside the transaction, so concurrent revokes serialize and exactly
+  The key row and then the runner row are locked inside the transaction — the order the
+  api_keys revoke path takes them in, so the two paths cannot deadlock — and concurrent
+  revokes serialize and exactly
   one writes `revoked_at` and the `runner_revoked` audit entry. A runner whose row the
   `runners_revoke_with_api_key` trigger already revoked (its key was revoked through
   `/api/v1/api_keys`) still gets its audit entry, once, and its live socket is still told
@@ -200,15 +202,29 @@ defmodule Loopctl.Runners do
     end
   end
 
+  # Locks the api key BEFORE the runner row. `DELETE /api/v1/api_keys/:id` takes them in
+  # that order (the key row, then the `runners_revoke_with_api_key` trigger's update of the
+  # runner row), so the opposite order here would let the two revoke paths deadlock. The
+  # unlocked pre-read only learns `api_key_id`, which never changes after enrollment.
   defp lock_runner(tenant_id, runner_id) do
-    query =
-      from r in Runner,
-        where: r.id == ^runner_id and r.tenant_id == ^tenant_id,
-        lock: "FOR UPDATE"
-
-    case AdminRepo.one(query) do
+    with %Runner{api_key_id: key_id} <-
+           AdminRepo.get_by(Runner, id: runner_id, tenant_id: tenant_id),
+         _key_id <-
+           AdminRepo.one(
+             from k in ApiKey,
+               where: k.id == ^key_id and k.tenant_id == ^tenant_id,
+               lock: "FOR UPDATE",
+               select: k.id
+           ),
+         %Runner{} = runner <-
+           AdminRepo.one(
+             from r in Runner,
+               where: r.id == ^runner_id and r.tenant_id == ^tenant_id,
+               lock: "FOR UPDATE"
+           ) do
+      {:ok, runner}
+    else
       nil -> {:error, :not_found}
-      runner -> {:ok, runner}
     end
   end
 

@@ -67,7 +67,7 @@
       "type": "object"
     },
     "RunnerJoin": {
-      "description": "The payload a runner joins the `runners` topic with.",
+      "description": "The payload a runner joins its own `runner:<runner_id>` topic with.",
       "properties": {
         "contract_version": {
           "description": "The contract version the runner was built against (semver).",
