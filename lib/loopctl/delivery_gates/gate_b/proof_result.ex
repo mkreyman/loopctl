@@ -1,6 +1,6 @@
 defmodule Loopctl.DeliveryGates.GateB.ProofResult do
   @moduledoc """
-  The judgement of a change's effect proof (`Loopctl.DeliveryGates.GateB.judge_proof/3`).
+  The judgement of a change's effect proof (`Loopctl.DeliveryGates.GateB.judge_proof/4`).
 
   - `verdict` — `:pass` or `:fail`
   - `failures` — every reason it failed, all of them rather than the first

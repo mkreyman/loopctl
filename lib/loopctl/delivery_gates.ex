@@ -28,7 +28,9 @@ defmodule Loopctl.DeliveryGates do
   ## Both run twice
 
   At triage, over the trio's predicted touches, to decide whether to dispatch. Again as a
-  merge precondition, over the real `gh pr diff --name-only` and diffstat. Nothing binds an
+  merge precondition, over the real diff from `git diff --name-status -M -z base...head` —
+  every added, modified and DELETED path, plus both names of every rename — and the real
+  diffstat. Never `gh pr diff --name-only`: it prints only a rename's new name. Nothing binds an
   implementing session to its story's prediction, so only the second run gates a merge.
 
   ## Fail closed

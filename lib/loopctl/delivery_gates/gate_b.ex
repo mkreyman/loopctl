@@ -12,23 +12,31 @@ defmodule Loopctl.DeliveryGates.GateB do
     evaluate at all: no or bad configuration, an unknown repository, a stale trigger, missing
     or malformed input. Also any escalation an agent signalled
   - `:prove_effect` — an effect path was touched. The change must prove its effect with
-    `judge_proof/3` before it merges
+    `judge_proof/4` before it merges
   - `:clear` — none of the above
 
   ## Run twice
 
   `evaluate(:triage, ...)` runs over the story's PREDICTED touches and decides only whether
-  to dispatch. `evaluate(:merge, ...)` runs over the real `gh pr diff --name-only` plus the
-  real diffstat, applies the size bound, and is the one that gates. Only the `:merge` result
+  to dispatch. `evaluate(:merge, ...)` runs over the real diff — every added, modified and
+  DELETED path (a deletion under a guarded path is a change to it), plus both names of every
+  rename — and the real diffstat, applies the size bound, and is the one that gates. Only the `:merge` result
   carries `merge_precondition?: true`.
 
   ## Input
 
       %{repo: "owner/repo",
-        files: [String.t()],               # predicted touches at :triage, real diff at :merge
+        files: [String.t()],               # predicted touches at :triage; at :merge every
+                                           # added, modified, deleted and renamed-to path
+        renames: [{old, new}],             # required at :merge (may be []), optional at :triage
         repo_files: [String.t()],          # the target repo's `git ls-files`
         diffstat: %{files: n, changed_lines: n},   # required at :merge, ignored at :triage
         agent_escalations: [term()]}       # optional
+
+  Derive `files` and `renames` together from `git diff --name-status -M -z base...head`
+  (or the REST `files[].previous_filename`), NOT from `gh pr diff --name-only`: that prints
+  only the new name of a rename, and its parser misreads a path containing " b/". Pass
+  unquoted paths (`-z` or `-c core.quotePath=false`); a quoted one escalates.
 
   ## Agents may only ADD an escalation
 
@@ -121,18 +129,61 @@ defmodule Loopctl.DeliveryGates.GateB do
          :ok <- input_map(input),
          {:ok, repo_triggers} <- repo_triggers(triggers, Map.get(input, :repo)) do
       files = Map.get(input, :files)
+      {rename_reasons, renamed_from} = renames(phase, input)
+      touched = touched(files, renamed_from)
 
       reasons =
         stale_trigger_reasons(repo_triggers, Map.get(input, :repo_files)) ++
           file_reasons(files) ++
-          human_path_reasons(repo_triggers, files) ++
+          rename_reasons ++
+          human_path_reasons(repo_triggers, touched) ++
           limit_reasons(phase, repo_triggers, files, Map.get(input, :diffstat))
 
-      {reasons, matches(repo_triggers.effect_paths, files)}
+      {reasons, matches(repo_triggers.effect_paths, touched)}
     else
       {:escalate, reason} -> {[reason], []}
     end
   end
+
+  # The paths a trigger is matched against: `files` (added, modified, deleted and renamed-to
+  # paths) plus the OLD name of every rename. `gh pr diff --name-only` prints only the new name, so a file
+  # moved OUT of a guarded path would otherwise read as touching nothing guarded.
+  defp touched(files, renamed_from) when is_list(files), do: Enum.uniq(files ++ renamed_from)
+  defp touched(_files, renamed_from), do: renamed_from
+
+  # At :merge the caller must state the renames, even as `[]`: an absent list is
+  # indistinguishable from a caller that never asked git for them. At :triage a prediction
+  # has no renames to state, so absence adds nothing there.
+  defp renames(phase, input) do
+    case {phase, Map.fetch(input, :renames)} do
+      {:merge, :error} -> {[:missing_renames], []}
+      {:triage, :error} -> {[], []}
+      {_phase, {:ok, renames}} -> rename_pairs(renames, Map.get(input, :files))
+    end
+  end
+
+  # A rename's NEW name must also be in `files`. The two lists have to come from one diff of
+  # one range; a caller that built them from different commands or refs would otherwise pass
+  # renames computed against the wrong range, and miss the real old name of a moved file.
+  defp rename_pairs(renames, files) when is_list(renames) do
+    if Enum.all?(renames, &rename_pair?/1) do
+      listed = if is_list(files), do: files, else: []
+      olds = Enum.map(renames, &elem(&1, 0))
+
+      reasons =
+        for({old, _new} <- renames, not valid_path?(old), do: {:invalid_path, old}) ++
+          for {_old, new} <- renames, new not in listed, do: {:rename_not_in_files, new}
+
+      {reasons, olds}
+    else
+      {[{:invalid_renames, renames}], []}
+    end
+  end
+
+  defp rename_pairs(renames, _files), do: {[{:invalid_renames, renames}], []}
+
+  defp rename_pair?({old, new}) when is_binary(old) and is_binary(new), do: true
+  defp rename_pair?(_pair), do: false
 
   defp phase(phase) when phase in @phases, do: :ok
   defp phase(phase), do: {:escalate, {:invalid_phase, phase}}
@@ -212,8 +263,6 @@ defmodule Loopctl.DeliveryGates.GateB do
   defp matches(globs, files) when is_list(files) do
     for file <- files, glob <- globs, Glob.match?(glob, file), do: {file, glob.source}
   end
-
-  defp matches(_globs, _files), do: []
 
   # A path as git prints it UNQUOTED: relative, no empty, `.` or `..` segment. Anything else
   # cannot be trusted to match the way the configuration author read it. That includes git's

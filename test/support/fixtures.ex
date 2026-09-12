@@ -700,6 +700,7 @@ defmodule Loopctl.Fixtures do
       %{
         repo: "acme/claims-app",
         files: ["lib/app/accounts/user.ex"],
+        renames: [],
         repo_files: [
           "README.md",
           "config/runtime.exs",

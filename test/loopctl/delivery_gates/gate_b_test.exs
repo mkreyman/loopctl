@@ -140,6 +140,76 @@ defmodule Loopctl.DeliveryGates.GateBTest do
     end
   end
 
+  describe "renames: both sides are matched" do
+    test "moving a file OUT of a human path escalates, though its new name is unguarded" do
+      result =
+        evaluate(:merge, %{
+          files: ["lib/app/backfill_rates.ex"],
+          renames: [{"lib/app/data_migrations/backfill_rates.ex", "lib/app/backfill_rates.ex"}]
+        })
+
+      assert result.outcome == :human
+
+      assert {:human_path, "lib/app/data_migrations/backfill_rates.ex",
+              "lib/**/data_migrations/**"} in result.reasons
+    end
+
+    test "moving a file out of an effect path needs the proof" do
+      result =
+        evaluate(:merge, %{
+          files: ["archive/2026.csv"],
+          renames: [{"priv/rates/2026.csv", "archive/2026.csv"}]
+        })
+
+      assert result.outcome == :prove_effect
+      assert {"priv/rates/2026.csv", "priv/rates/**"} in result.effect_matches
+    end
+
+    test "an unstated rename list at :merge escalates; at :triage it adds nothing" do
+      merge = GateB.evaluate(:merge, Map.delete(input(), :renames), triggers())
+      assert merge.outcome == :human
+      assert :missing_renames in merge.reasons
+
+      assert %Result{outcome: :clear} =
+               GateB.evaluate(:triage, Map.delete(input(), :renames), triggers())
+    end
+
+    test "a malformed rename list, or an invalid old path, escalates" do
+      for bad <- [nil, "a->b", [{"a"}], [{:a, "b"}], [["a", "b"]]] do
+        result = evaluate(:merge, %{renames: bad})
+        assert result.outcome == :human
+        assert {:invalid_renames, bad} in result.reasons
+      end
+
+      result =
+        evaluate(:merge, %{
+          files: ["x.csv"],
+          renames: [{~S("priv/rates/a\303\261o.csv"), "x.csv"}]
+        })
+
+      assert result.outcome == :human
+      assert Enum.any?(result.reasons, &match?({:invalid_path, _}, &1))
+    end
+  end
+
+  describe "renames and files come from one diff" do
+    test "a rename whose new name is missing from files escalates" do
+      result =
+        evaluate(:merge, %{
+          files: ["lib/app/accounts/user.ex"],
+          renames: [{"lib/app/old_name.ex", "lib/app/new_name.ex"}]
+        })
+
+      assert result.outcome == :human
+      assert {:rename_not_in_files, "lib/app/new_name.ex"} in result.reasons
+    end
+
+    test "a deleted guarded path listed in files escalates" do
+      result = evaluate(:merge, %{files: ["lib/app/data_migrations/backfill_rates.ex"]})
+      assert result.outcome == :human
+    end
+  end
+
   describe "size limits apply at :merge only" do
     test "exactly at the limits is within them" do
       files = for n <- 1..12, do: "lib/app/accounts/f#{n}.ex"
