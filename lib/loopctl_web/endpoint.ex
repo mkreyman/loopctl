@@ -53,6 +53,15 @@ defmodule LoopctlWeb.Endpoint do
     websocket: [connect_info: [session: @session_options], max_frame_size: 64_000],
     longpoll: [connect_info: [session: @session_options]]
 
+  # Issue #801: the runner socket. Runners are non-browser clients that dial OUT to
+  # loopctl; they are never BEAM cluster peers. The credential arrives in the
+  # `x-loopctl-runner-token` header (hence `:x_headers`), never in the URL. No longpoll:
+  # a runner holds one long-lived websocket, and a second transport is a second surface
+  # for nothing. The frame cap matches `/live` — no runner message is near 64 KB.
+  socket "/runner/socket", LoopctlWeb.RunnerSocket,
+    websocket: [connect_info: [:peer_data, :x_headers], max_frame_size: 64_000],
+    longpoll: false
+
   # Serve at "/" the static files from "priv/static" directory.
   #
   # When code reloading is disabled (e.g., in production),

@@ -1,0 +1,314 @@
+{
+  "$defs": {
+    "RunnerDispatch": {
+      "description": "Control pushes `dispatch` to start a session. The runner validates it against its LOCAL allow-list (repos, branch prefixes, wall clock, token budget) and refuses by default: a dispatch is a prompt executed as the machine's user. Declared in contract v1; emitted from #803.",
+      "properties": {
+        "base_branch": {
+          "maxLength": 255,
+          "minLength": 1,
+          "type": "string"
+        },
+        "branch": {
+          "maxLength": 255,
+          "minLength": 1,
+          "type": "string"
+        },
+        "claim_epoch": {
+          "description": "Echoed on every runner-to-control message about this dispatch. Bumped on reclaim, so a resurrected session's writes are rejected.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dispatch_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "triage",
+            "implement"
+          ],
+          "type": "string"
+        },
+        "max_turns": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "repo": {
+          "pattern": "^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$",
+          "type": "string"
+        },
+        "story_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "token_budget": {
+          "minimum": 1,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "wall_clock_seconds": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "dispatch_id",
+        "story_id",
+        "kind",
+        "repo",
+        "base_branch",
+        "branch",
+        "claim_epoch",
+        "wall_clock_seconds",
+        "max_turns"
+      ],
+      "type": "object"
+    },
+    "RunnerJoin": {
+      "description": "The payload a runner joins the `runners` topic with.",
+      "properties": {
+        "contract_version": {
+          "description": "The contract version the runner was built against (semver).",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+          "type": "string"
+        },
+        "cores": {
+          "maximum": 1024,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "draining": {
+          "description": "True when the runner accepts no new dispatches.",
+          "type": "boolean"
+        },
+        "in_flight": {
+          "description": "Sessions running now, as the runner counts them. A hint: capacity is reserved in Postgres, never read off Presence.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "machine": {
+          "description": "The machine name the runner was enrolled under. Must match exactly.",
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,62}$",
+          "type": "string"
+        },
+        "max_sessions": {
+          "description": "Concurrent sessions this machine accepts. Advisory; see in_flight.",
+          "maximum": 64,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "memory_mb": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "repos": {
+          "description": "GitHub `owner/repo` checkouts this runner can work in.",
+          "items": {
+            "pattern": "^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$",
+            "type": "string"
+          },
+          "maxItems": 50,
+          "type": "array"
+        },
+        "sample": {
+          "description": "A self-measured health sample. Connected is not able-to-build: a wedged machine still answers heartbeats, so the control plane treats a stale sample as a breached threshold.",
+          "properties": {
+            "free_disk_mb": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "free_ram_mb": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "last_build_at": {
+              "description": "When this machine last completed a build successfully.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "loadavg_1m": {
+              "minimum": 0,
+              "type": "number"
+            },
+            "sampled_at": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sampled_at",
+            "loadavg_1m",
+            "free_ram_mb",
+            "free_disk_mb"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "contract_version",
+        "machine",
+        "cores",
+        "memory_mb",
+        "repos",
+        "max_sessions",
+        "in_flight",
+        "draining"
+      ],
+      "type": "object"
+    },
+    "RunnerSample": {
+      "description": "A self-measured health sample. Connected is not able-to-build: a wedged machine still answers heartbeats, so the control plane treats a stale sample as a breached threshold.",
+      "properties": {
+        "free_disk_mb": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "free_ram_mb": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "last_build_at": {
+          "description": "When this machine last completed a build successfully.",
+          "format": "date-time",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "loadavg_1m": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "sampled_at": {
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sampled_at",
+        "loadavg_1m",
+        "free_ram_mb",
+        "free_disk_mb"
+      ],
+      "type": "object"
+    },
+    "RunnerStatus": {
+      "description": "A runner's periodic update, pushed as the `status` event. Any subset of the fields; at least one.",
+      "minProperties": 1,
+      "properties": {
+        "draining": {
+          "type": "boolean"
+        },
+        "in_flight": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sample": {
+          "description": "A self-measured health sample. Connected is not able-to-build: a wedged machine still answers heartbeats, so the control plane treats a stale sample as a breached threshold.",
+          "properties": {
+            "free_disk_mb": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "free_ram_mb": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "last_build_at": {
+              "description": "When this machine last completed a build successfully.",
+              "format": "date-time",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "loadavg_1m": {
+              "minimum": 0,
+              "type": "number"
+            },
+            "sampled_at": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sampled_at",
+            "loadavg_1m",
+            "free_ram_mb",
+            "free_disk_mb"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
+    "RunnerTraceEvent": {
+      "description": "One line of a run's NDJSON trace. The on-disk file is the source of truth: the runner ships `(run_id, seq)`, the server ACKs the last contiguous seq and dedups on the pair, and the runner resumes from that offset on rejoin. `parent` is REQUIRED on every event (null only for the root) so the agent tree can be rebuilt by query.",
+      "properties": {
+        "data": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "event_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "parent": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "seq": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ts": {
+          "format": "date-time",
+          "type": "string"
+        },
+        "type": {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "seq",
+        "event_id",
+        "parent",
+        "ts",
+        "type"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://loopctl.com/runner_contract/v1.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "loopctl runner contract",
+  "x-connection": {
+    "credential_header": "x-loopctl-runner-token",
+    "events": {
+      "dispatch": "RunnerDispatch",
+      "join": "RunnerJoin",
+      "status": "RunnerStatus",
+      "trace_event": "RunnerTraceEvent"
+    },
+    "socket_path": "/runner/socket/websocket",
+    "topic": "runners"
+  },
+  "x-contract-version": "1.0.0"
+}
