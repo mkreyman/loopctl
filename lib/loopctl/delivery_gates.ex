@@ -16,11 +16,11 @@ defmodule Loopctl.DeliveryGates do
   recorded and never gates. Its rate is reported with `gate_a_rate/1`; a rate resembling the
   collapsed predicate's is a design failure, not a tuning question.
 
-  ## Gate B — "a human confirms" (`gate_b/3`, `judge_proof/3`)
+  ## Gate B — "a human confirms" (`gate_b/3`, `judge_proof/4`)
 
   Effect-shaped. Asks whether the change can cause an irreversible external effect, from the
   paths it touches and the size of the diff. An effect path means the change proves its
-  effect against a fixed fixture set (`judge_proof/3`): the output must change exactly
+  effect against a fixed fixture set (`judge_proof/4`): the output must change exactly
   where intended and nowhere else, and the fixtures must cover every code the repository
   uses. A human path, the size bound, or any failure to evaluate means a human confirms. A
   failed proof routes to Gate A.
@@ -63,6 +63,6 @@ defmodule Loopctl.DeliveryGates do
   @doc "See `Loopctl.DeliveryGates.GateB.evaluate/3`."
   defdelegate gate_b(phase, input, triggers), to: GateB, as: :evaluate
 
-  @doc "See `Loopctl.DeliveryGates.GateB.judge_proof/3`."
-  defdelegate judge_proof(intent, fixture_results, coverage), to: GateB
+  @doc "See `Loopctl.DeliveryGates.GateB.judge_proof/4`."
+  defdelegate judge_proof(intent, fixture_set, fixture_results, coverage), to: GateB
 end

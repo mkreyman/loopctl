@@ -13,17 +13,25 @@ defmodule Loopctl.DeliveryGates.JudgeProofTest do
   describe "passes" do
     test "when exactly the intended fixtures changed" do
       results = %{"f-rate" => :changed, "f-mod" => :changed, "f-other" => :unchanged}
-      assert pass?(GateB.judge_proof({:changes, ["f-rate", "f-mod"]}, results, @covered))
+
+      assert pass?(
+               GateB.judge_proof(
+                 {:changes, ["f-rate", "f-mod"]},
+                 Map.keys(results),
+                 results,
+                 @covered
+               )
+             )
     end
 
     test "when no output change was intended and none happened" do
       results = %{"f-rate" => :unchanged, "f-other" => :unchanged}
-      assert pass?(GateB.judge_proof(:no_output_change, results, @covered))
+      assert pass?(GateB.judge_proof(:no_output_change, Map.keys(results), results, @covered))
     end
 
     test "through the facade" do
       assert pass?(
-               DeliveryGates.judge_proof({:changes, ["a"]}, %{"a" => :changed}, %{
+               DeliveryGates.judge_proof({:changes, ["a"]}, ["a"], %{"a" => :changed}, %{
                  required: ["X"],
                  covered: ["X"]
                })
@@ -39,21 +47,21 @@ defmodule Loopctl.DeliveryGates.JudgeProofTest do
                verdict: :fail,
                route: :gate_a,
                failures: [{:intended_fixture_unchanged, ["f-rate"]}]
-             } = GateB.judge_proof({:changes, ["f-rate"]}, results, @covered)
+             } = GateB.judge_proof({:changes, ["f-rate"]}, Map.keys(results), results, @covered)
     end
 
     test "one of several intended fixtures did not change" do
       results = %{"f-a" => :changed, "f-b" => :unchanged}
 
       assert %ProofResult{verdict: :fail, failures: [{:intended_fixture_unchanged, ["f-b"]}]} =
-               GateB.judge_proof({:changes, ["f-a", "f-b"]}, results, @covered)
+               GateB.judge_proof({:changes, ["f-a", "f-b"]}, Map.keys(results), results, @covered)
     end
 
     test "an intended fixture that did not run" do
       results = %{"f-other" => :unchanged}
 
-      assert %ProofResult{verdict: :fail, failures: [{:intended_fixture_not_run, ["f-rate"]}]} =
-               GateB.judge_proof({:changes, ["f-rate"]}, results, @covered)
+      assert %ProofResult{verdict: :fail, failures: [{:fixture_not_run, ["f-rate"]}]} =
+               GateB.judge_proof({:changes, ["f-rate"]}, ["f-rate", "f-other"], results, @covered)
     end
   end
 
@@ -65,14 +73,14 @@ defmodule Loopctl.DeliveryGates.JudgeProofTest do
                verdict: :fail,
                route: :gate_a,
                failures: [{:unintended_fixture_changed, ["f-other"]}]
-             } = GateB.judge_proof({:changes, ["f-rate"]}, results, @covered)
+             } = GateB.judge_proof({:changes, ["f-rate"]}, Map.keys(results), results, @covered)
     end
 
     test "any change when no output change was intended" do
       results = %{"f-rate" => :unchanged, "f-other" => :changed}
 
       assert %ProofResult{verdict: :fail, failures: [{:unintended_fixture_changed, ["f-other"]}]} =
-               GateB.judge_proof(:no_output_change, results, @covered)
+               GateB.judge_proof(:no_output_change, Map.keys(results), results, @covered)
     end
 
     test "both halves at once are both reported" do
@@ -84,7 +92,60 @@ defmodule Loopctl.DeliveryGates.JudgeProofTest do
                  {:intended_fixture_unchanged, ["f-rate"]},
                  {:unintended_fixture_changed, ["f-other"]}
                ]
-             } = GateB.judge_proof({:changes, ["f-rate"]}, results, @covered)
+             } = GateB.judge_proof({:changes, ["f-rate"]}, Map.keys(results), results, @covered)
+    end
+  end
+
+  describe "nowhere else means the whole fixed set" do
+    test "a fixture in the set with no result fails, even when every reported one is as intended" do
+      results = %{"f-rate" => :changed}
+
+      assert %ProofResult{
+               verdict: :fail,
+               route: :gate_a,
+               failures: [{:fixture_not_run, ["f-mod", "f-other"]}]
+             } =
+               GateB.judge_proof(
+                 {:changes, ["f-rate"]},
+                 ["f-rate", "f-mod", "f-other"],
+                 results,
+                 @covered
+               )
+    end
+
+    test "no output change over a partial report of a larger set fails" do
+      set = Enum.map(1..50, &"f#{&1}")
+
+      assert %ProofResult{verdict: :fail, failures: [{:fixture_not_run, not_run}]} =
+               GateB.judge_proof(:no_output_change, set, %{"f1" => :unchanged}, @covered)
+
+      assert length(not_run) == 49
+    end
+
+    test "a result for a fixture outside the set fails" do
+      results = %{"f-rate" => :changed, "f-stray" => :unchanged}
+
+      assert %ProofResult{verdict: :fail, failures: [{:unexpected_fixture, ["f-stray"]}]} =
+               GateB.judge_proof({:changes, ["f-rate"]}, ["f-rate"], results, @covered)
+    end
+
+    test "an intended fixture that is not in the set fails" do
+      assert %ProofResult{verdict: :fail, failures: failures} =
+               GateB.judge_proof(
+                 {:changes, ["f-new"]},
+                 ["f-rate"],
+                 %{"f-rate" => :unchanged},
+                 @covered
+               )
+
+      assert {:intended_fixture_not_in_set, ["f-new"]} in failures
+    end
+
+    test "an empty, missing or non-string fixture set fails" do
+      for bad <- [[], nil, "f", [:f]] do
+        assert %ProofResult{verdict: :fail, failures: [{:invalid_fixture_set, ^bad}]} =
+                 GateB.judge_proof(:no_output_change, bad, %{"f" => :unchanged}, @covered)
+      end
     end
   end
 
@@ -97,14 +158,14 @@ defmodule Loopctl.DeliveryGates.JudgeProofTest do
                route: :gate_a,
                failures: [{:uncovered_codes, ["H0038", "HX"]}]
              } =
-               GateB.judge_proof(:no_output_change, %{"f" => :unchanged}, coverage)
+               GateB.judge_proof(:no_output_change, ["f"], %{"f" => :unchanged}, coverage)
     end
 
     test "fails even when the fixture diff is exactly as intended" do
       coverage = %{required: ["NEW1"], covered: []}
 
       assert %ProofResult{verdict: :fail, failures: [{:uncovered_codes, ["NEW1"]}]} =
-               GateB.judge_proof({:changes, ["f"]}, %{"f" => :changed}, coverage)
+               GateB.judge_proof({:changes, ["f"]}, ["f"], %{"f" => :changed}, coverage)
     end
 
     test "malformed or empty coverage fails" do
@@ -116,7 +177,7 @@ defmodule Loopctl.DeliveryGates.JudgeProofTest do
             %{required: "X", covered: ["X"]}
           ] do
         assert %ProofResult{verdict: :fail, failures: [{:invalid_coverage, ^bad}]} =
-                 GateB.judge_proof(:no_output_change, %{"f" => :unchanged}, bad)
+                 GateB.judge_proof(:no_output_change, ["f"], %{"f" => :unchanged}, bad)
       end
     end
   end
@@ -132,7 +193,7 @@ defmodule Loopctl.DeliveryGates.JudgeProofTest do
             {:no_output_change}
           ] do
         assert %ProofResult{verdict: :fail, route: :gate_a, failures: [{:invalid_intent, ^bad}]} =
-                 GateB.judge_proof(bad, %{"f" => :changed}, @covered)
+                 GateB.judge_proof(bad, ["f"], %{"f" => :changed}, @covered)
       end
     end
 
@@ -146,7 +207,7 @@ defmodule Loopctl.DeliveryGates.JudgeProofTest do
             %{f: :changed}
           ] do
         assert %ProofResult{verdict: :fail, failures: [{:invalid_fixture_results, ^bad}]} =
-                 GateB.judge_proof(:no_output_change, bad, @covered)
+                 GateB.judge_proof(:no_output_change, ["f"], bad, @covered)
       end
     end
   end

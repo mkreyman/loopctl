@@ -106,6 +106,8 @@ defmodule Loopctl.DeliveryGates.GateBTest do
             "./lib/app.ex",
             "lib/../lib/app_web/router.ex",
             "lib//x.ex",
+            ~S("priv/rates/tarifa_a\303\261o.csv"),
+            ~S(lib/app/payments/r\303\251sum\303\251.ex),
             "",
             nil
           ] do

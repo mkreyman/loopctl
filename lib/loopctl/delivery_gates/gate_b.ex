@@ -88,21 +88,27 @@ defmodule Loopctl.DeliveryGates.GateB do
   baseline.
 
   - `intent` — `{:changes, [fixture_id, ...]}` (non-empty) or `:no_output_change`
-  - `fixture_results` — `%{fixture_id => :changed | :unchanged}`, non-empty
+  - `fixture_set` — the ids of the FIXED fixture set, non-empty: every fixture the baseline
+    holds. Without it "empty everywhere else" could only be checked over the fixtures that
+    happened to report, and a fixture that silently did not run would hide its own change.
+  - `fixture_results` — `%{fixture_id => :changed | :unchanged}`, one entry per fixture in
+    the set and none outside it
   - `coverage` — `%{required: [code, ...], covered: [code, ...]}`: the service codes,
     modifiers and programs present in the repository, and those the fixtures exercise
 
   It passes only when the set of changed fixtures EQUALS the intended set — both halves. An
-  intended fixture that did not change (or did not run) fails, because "nothing changed" is
-  not a pass for a change meant to alter output; an unintended fixture that changed fails.
+  intended fixture that did not change fails, because "nothing changed" is not a pass for a
+  change meant to alter output; an unintended fixture that changed fails. A fixture in the
+  set with no result, a result for a fixture outside the set, and an intended fixture that is
+  not in the set all fail.
   Every required code must be covered, because a golden-file oracle only sees changes to
   what the fixtures exercise and a path no fixture reaches regresses silently.
 
   A failure routes to Gate A.
   """
-  @spec judge_proof(term(), term(), term()) :: ProofResult.t()
-  def judge_proof(intent, fixture_results, coverage) do
-    case intent_failures(intent, fixture_results) ++ coverage_failures(coverage) do
+  @spec judge_proof(term(), term(), term(), term()) :: ProofResult.t()
+  def judge_proof(intent, fixture_set, fixture_results, coverage) do
+    case intent_failures(intent, fixture_set, fixture_results) ++ coverage_failures(coverage) do
       [] -> %ProofResult{verdict: :pass, failures: [], route: nil}
       failures -> %ProofResult{verdict: :fail, failures: failures, route: :gate_a}
     end
@@ -209,10 +215,15 @@ defmodule Loopctl.DeliveryGates.GateB do
 
   defp matches(_globs, _files), do: []
 
-  # A path git would print: relative, no empty, `.` or `..` segment. Anything else cannot be
-  # trusted to match the way the configuration author read it.
+  # A path as git prints it UNQUOTED: relative, no empty, `.` or `..` segment. Anything else
+  # cannot be trusted to match the way the configuration author read it. That includes git's
+  # own quoted form: under the default `core.quotePath`, a name with non-ASCII or special
+  # bytes comes back as `"priv/rates/tarifa_a\303\261o.csv"`, and the leading quote means no
+  # anchored pattern ever matches it — a change to that file would read as touching nothing.
+  # Callers should pass `-z` or `-c core.quotePath=false`; a quoted path escalates.
   defp valid_path?(path) when is_binary(path) and path != "" do
-    String.valid?(path) and not String.contains?(path, <<0>>) and
+    String.valid?(path) and not String.contains?(path, [<<0>>, "\""]) and
+      not String.contains?(path, "\\") and
       path |> String.split("/") |> Enum.all?(&(&1 not in ["", ".", ".."]))
   end
 
@@ -232,22 +243,35 @@ defmodule Loopctl.DeliveryGates.GateB do
 
   # -- judge_proof ------------------------------------------------------------------------
 
-  defp intent_failures(intent, fixture_results) do
+  defp intent_failures(intent, fixture_set, fixture_results) do
     with {:ok, intended} <- intended_fixtures(intent),
+         {:ok, set} <- fixture_set(fixture_set),
          {:ok, results} <- fixture_results(fixture_results) do
-      not_run = Enum.reject(intended, &Map.has_key?(results, &1))
+      outside_set = Enum.reject(intended, &(&1 in set))
+      not_run = Enum.reject(set, &Map.has_key?(results, &1))
+      unexpected = results |> Map.keys() |> Enum.reject(&(&1 in set))
       unchanged = Enum.filter(intended, &(Map.get(results, &1) == :unchanged))
 
       unintended =
         for {id, :changed} <- results, id not in intended, do: id
 
-      failure(:intended_fixture_not_run, not_run) ++
+      failure(:intended_fixture_not_in_set, outside_set) ++
+        failure(:fixture_not_run, not_run) ++
+        failure(:unexpected_fixture, unexpected) ++
         failure(:intended_fixture_unchanged, unchanged) ++
         failure(:unintended_fixture_changed, unintended)
     else
       {:error, failure} -> [failure]
     end
   end
+
+  defp fixture_set([_ | _] = ids) do
+    if Enum.all?(ids, &is_binary/1),
+      do: {:ok, Enum.uniq(ids)},
+      else: {:error, {:invalid_fixture_set, ids}}
+  end
+
+  defp fixture_set(ids), do: {:error, {:invalid_fixture_set, ids}}
 
   defp intended_fixtures({:changes, [_ | _] = ids} = intent) do
     if Enum.all?(ids, &is_binary/1),
