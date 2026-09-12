@@ -1716,6 +1716,25 @@ defmodule Loopctl.Fixtures do
     end
   end
 
+  # An enrolled runner (issue #801). Returns `{raw_token, runner}` so a test can connect
+  # the runner socket with the token. Auto-creates the tenant when none is given.
+  def fixture(:runner, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    tenant_id =
+      case Map.get(attrs, :tenant_id) do
+        nil -> fixture(:tenant).id
+        tid -> tid
+      end
+
+    name = Map.get(attrs, :name, "runner-#{System.unique_integer([:positive])}")
+
+    {:ok, %{runner: runner, raw_key: raw_key}} =
+      Loopctl.Runners.enroll_runner(tenant_id, %{name: name})
+
+    {raw_key, runner}
+  end
+
   def fixture(:api_key, attrs) do
     attrs = Enum.into(attrs, %{})
     role = Map.get(attrs, :role, :user)

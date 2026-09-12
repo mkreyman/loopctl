@@ -103,6 +103,10 @@ defmodule Loopctl.Tenants.TierCapabilities do
     {:dispatch, :human_anchored,
      "Minting per-dispatch ephemeral keys and lineage paths (L4). Reading your own " <>
        "dispatches stays open."},
+    {:runner_pool, :human_anchored,
+     "Enrolling and revoking agent delivery loop runners (#801): a runner is a machine " <>
+       "that executes dispatched sessions, so admitting one is an execution root. Listing " <>
+       "enrolled runners stays open."},
     {:token_budgets, :human_anchored,
      "RECORDING token usage (POST /api/v1/token-usage — the per-dispatch usage report " <>
        "agents emit at end of work), correcting/deleting usage records, token budgets, " <>
@@ -153,6 +157,7 @@ defmodule Loopctl.Tenants.TierCapabilities do
       "LoopctlWeb.TenantController"
     ],
     dispatch: ["LoopctlWeb.DispatchController"],
+    runner_pool: ["LoopctlWeb.RunnerController"],
     token_budgets: [
       "LoopctlWeb.TokenBudgetController",
       "LoopctlWeb.TokenUsageController",

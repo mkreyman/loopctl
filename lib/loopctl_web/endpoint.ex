@@ -2,6 +2,10 @@ defmodule LoopctlWeb.Endpoint do
   require Logger
   use Phoenix.Endpoint, otp_app: :loopctl
 
+  # Issue #801: must be registered AFTER `use Phoenix.Endpoint`, so it wraps the endpoint's
+  # `call/2` and stamps the trusted client IP before socket dispatch. See the module.
+  @before_compile LoopctlWeb.RunnerClientIp
+
   # The session is stored in the cookie. It is BOTH signed (tamper-proof) and now
   # ENCRYPTED (`encryption_salt`, a value distinct from `signing_salt`) so the
   # signup-flow payload it carries — the client IP handed to `SignupLive` through
@@ -52,6 +56,15 @@ defmodule LoopctlWeb.Endpoint do
   socket "/live", Phoenix.LiveView.Socket,
     websocket: [connect_info: [session: @session_options], max_frame_size: 64_000],
     longpoll: [connect_info: [session: @session_options]]
+
+  # Issue #801: the runner socket. Runners are non-browser clients that dial OUT to
+  # loopctl; they are never BEAM cluster peers. The credential arrives in the
+  # `x-loopctl-runner-token` header (hence `:x_headers`), never in the URL. No longpoll:
+  # a runner holds one long-lived websocket, and a second transport is a second surface
+  # for nothing. The frame cap matches `/live` — no runner message is near 64 KB.
+  socket "/runner/socket", LoopctlWeb.RunnerSocket,
+    websocket: [connect_info: [:peer_data, :x_headers], max_frame_size: 64_000],
+    longpoll: false
 
   # Serve at "/" the static files from "priv/static" directory.
   #

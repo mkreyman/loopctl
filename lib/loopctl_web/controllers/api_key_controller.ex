@@ -80,6 +80,7 @@ defmodule LoopctlWeb.ApiKeyController do
     summary: "Rotate API key",
     description:
       "Creates a new key with the same name/role and sets a grace period on the old key. " <>
+        "A runner's key cannot be rotated here (422): revoke and re-enroll the runner. " <>
         "Like `create`, this mints a raw key that belongs to no dispatch lineage, so a " <>
         "caller whose own key carries a lineage is refused with 403 " <>
         "`api_key_mint_forbidden`.",
@@ -166,6 +167,7 @@ defmodule LoopctlWeb.ApiKeyController do
 
     with {:ok, old_key} <- Auth.get_api_key(tenant.id, key_id),
          :ok <- validate_not_revoked(old_key),
+         :ok <- validate_not_runner_key(tenant.id, old_key),
          {:ok, {raw_key, new_key, updated_old}} <- do_rotate_key(tenant, old_key, grace_hours) do
       conn
       |> put_status(:created)
@@ -218,6 +220,19 @@ defmodule LoopctlWeb.ApiKeyController do
     # the HTTP-scoped changeset here so the context layer refuses a superadmin key
     # on every path regardless of how `role` was derived.
     Auth.generate_api_key(attrs, changeset: :http)
+  end
+
+  # Issue #801: a runner row binds exactly ONE key. Rotation would mint a replacement no
+  # runner row names (refused at the runner socket) and put the bound key on an expiry, so
+  # the machine would drop out of the pool when the grace period ended with nothing saying
+  # why. A runner is rotated by revoking it and enrolling it again.
+  defp validate_not_runner_key(tenant_id, api_key) do
+    if Loopctl.Runners.runner_key?(tenant_id, api_key.id),
+      do:
+        {:error, :unprocessable_entity,
+         "This key belongs to a runner. Rotate it with DELETE /api/v1/runners/:id and " <>
+           "POST /api/v1/runners."},
+      else: :ok
   end
 
   defp do_rotate_key(tenant, old_key, grace_hours) do

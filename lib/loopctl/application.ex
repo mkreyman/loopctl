@@ -76,6 +76,9 @@ defmodule Loopctl.Application do
       Loopctl.SystemConfig.CachePrimer,
       {DNSCluster, query: Application.get_env(:loopctl, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Loopctl.PubSub},
+      # Issue #801: the runner pool. Its tracker needs PubSub and must be up before
+      # the Endpoint accepts a runner socket.
+      Loopctl.Runners.Presence,
       # Bridges tenant audit-key cache invalidations BETWEEN nodes. The ETS table
       # itself is created above by `TenantKeys.init_cache/0`; this child only
       # subscribes to the invalidate topic, so it needs PubSub and nothing else.

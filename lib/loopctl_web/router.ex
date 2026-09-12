@@ -329,6 +329,9 @@ defmodule LoopctlWeb.Router do
     resources "/api_keys", ApiKeyController, only: [:create, :index, :delete]
     post "/api_keys/:id/rotate", ApiKeyController, :rotate
 
+    # Issue #801 — runner enrollment for the agent delivery loop
+    resources "/runners", RunnerController, only: [:create, :index, :delete]
+
     # Audit log
     get "/audit", AuditController, :index
 
