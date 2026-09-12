@@ -673,6 +673,63 @@ defmodule Loopctl.Fixtures do
     )
   end
 
+  # Delivery gates (#802). SYNTHETIC trigger data only: loopctl is public and the real
+  # target repositories' trigger lists are configuration, never source.
+
+  # The decoded trigger configuration document, string keys, one repository.
+  # `Jason.encode!/1` it and pin its SHA-256 to feed `Triggers.parse/2`.
+  def build(:delivery_gates_config, attrs) do
+    Map.merge(
+      %{
+        "version" => 1,
+        "repos" => %{
+          "acme/claims-app" => %{
+            "effect_paths" => ["priv/rates/**", "lib/app/payments/**", "config/runtime.exs"],
+            "human_paths" => ["lib/app_web/router.ex", "lib/**/data_migrations/**"],
+            "limits" => %{"max_files" => 12, "max_changed_lines" => 1000}
+          }
+        }
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  # A Gate B input for the repository above that touches nothing guarded.
+  def build(:gate_b_input, attrs) do
+    Map.merge(
+      %{
+        repo: "acme/claims-app",
+        files: ["lib/app/accounts/user.ex"],
+        renames: [],
+        repo_files: [
+          "README.md",
+          "config/runtime.exs",
+          "lib/app/accounts/user.ex",
+          "lib/app/data_migrations/backfill_rates.ex",
+          "lib/app/payments/submit.ex",
+          "lib/app_web/router.ex",
+          "priv/rates/2026.csv"
+        ],
+        diffstat: %{files: 1, changed_lines: 10}
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
+  # One triage agent's output, as the trio contract emits it: an uncontested story.
+  def build(:trio_output, attrs) do
+    Map.merge(
+      %{
+        "verdict" => "story",
+        "story" => %{"title" => "Fix the monthly total rounding"},
+        "escalation_reasons" => [],
+        "contradicts" => [],
+        "confidence" => 0.8
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
   @doc """
   Inserts a record into the database, auto-creating any required dependencies.
   Returns the inserted struct.
