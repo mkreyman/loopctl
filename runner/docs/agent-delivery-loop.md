@@ -1,436 +1,412 @@
-# Agent Delivery Loop — first draft
+# Agent Delivery Loop
 
-**Status:** draft for review. Not implemented.
-**Date:** 2026-09-12
-**Origin:** Chris McCord's "The *Next* agent loop" slide (ElixirConf US 2026) plus Mark's
-additions. The slide itself is a six-stage cycle — Build, Test, Benchmark, Release, Monitor,
-Fix, with "Prod is the artifact" in the middle — and carries no issue queue, claiming or
-dispatch. Everything in this document about detection, triage and dispatch is our design, not
-his.
-
----
+**Status:** design, v2. Not implemented.
+**v2 supersedes the bootstrap version entirely** — a four-lens review on 2026-09-12 falsified
+several load-bearing parts of v1. Where v1 and this disagree, this wins. The per-issue comments
+on loopctl#800-805 and loopctl-runner#1 carry the evidence.
 
 ## 1. What this is for
 
-Larisa reports a problem through the AI chat already running inside HomeCareBilling. That chat
-already files a GitHub issue and a support row in our database. Today the work then waits for
-Mark. This loop closes the gap: the issue is triaged by agents, becomes a story, is implemented
-on an available dev machine, reviewed, and merged when the reviews and the pipeline both pass.
+Larisa Frenkel, AVA's office manager, reports problems through the AI chat already inside
+HomeCareBilling. That chat files a GitHub issue and a support row. Today the work waits for
+Mark. This loop triages the issue with agents, implements it on a dev machine, and merges it
+when the gates pass.
 
-Mark is involved only when the request seriously contradicts the app as it exists, or demands a
-drastic change. Otherwise, never.
+Mark is involved only when the *request* contradicts something or is a drastic change.
+Otherwise, never.
 
-**Non-goal:** replacing Mark's judgement on product direction. The loop implements what is
-asked; it does not decide what should be asked for.
+**What Larisa can see matters for the design:** tenant-facing routes include `/billing`,
+`/billing/denials`, `/batches`, `/remittances`. She cannot see claim-generation code but she sees
+its output, so a substantial class of tickets are symptoms of claim output. **A ticket's wording
+therefore says nothing about where its fix will land** — "the monthly total is wrong" may be a
+billing-calculation fix, "this claim was denied" may be a UI validation fix. Risk is classified
+from the diff, never from the report.
 
 ## 2. Three planes
 
-| plane | where it runs | what it owns |
+| plane | where | owns |
 |---|---|---|
-| **Control** | loopctl on Fly | issues, triage, stories, claims, dispatch records, machine registry, audit |
-| **Runner** | a Phoenix node on each dev machine | local resources, worktrees, session lifecycle, liveness |
-| **Session** | a `claude -p` OS process in a worktree | the actual code change |
+| **Control** | loopctl on Fly | issues, triage queue, stories, claims, gates, machine registry, audit |
+| **Runner** | a Phoenix app on each dev machine | local resources, worktrees, session lifecycle, liveness |
+| **Session** | a `claude -p` process in a worktree | triage, and separately implementation |
 
-### Transport between control and runner: an authenticated Phoenix Channel, NOT a BEAM cluster
+A Claude Code session is an OS process with a unix socket, never a BEAM process. Everything here
+wraps it; nothing supervises it directly.
 
-An earlier revision of this document assumed the runners would cluster with loopctl over
-distributed Erlang so that `Group` could hold the machine pool. **That was wrong and is
-reversed here.** Clustering would put a dev laptop inside the production BEAM cluster, where
-`:erpc` reaches everything and a compromised machine is a compromised control plane — against a
-multi-tenant app holding customer data, and reachable from home networks behind NAT that would
-need Fly WireGuard to join at all.
+### Transport: an authenticated Phoenix Channel, not a BEAM cluster
 
-The runner is a **client**: it connects outbound to loopctl over an authenticated Phoenix
-Channel and speaks a versioned message contract. Consequences:
+The runner connects **outbound** as a client. It does not join loopctl's cluster: a dev laptop
+inside the production cluster means `:erpc` reaches everything, and home machines behind NAT
+would need Fly WireGuard to join at all.
 
-- **Presence replaces `Group` for the availability pool.** `Phoenix.Presence` on the runner
-  channel gives exactly the property we wanted — registration dies with the socket, so a
-  runner that crashes, reboots or loses its network leaves the pool with no TTL sweeper and no
-  stale row — without any clustering. `Group` stays a good library; it is simply solving a
-  problem we no longer have.
-- The blast radius of a compromised dev machine is one channel token, revocable centrally.
-- `SocketDist` is irrelevant here (it separates lanes *within* a BEAM cluster). If trace
-  streaming ever competes with control traffic, the answer is a second channel topic.
-- `reverse_it` stays relevant only if Larisa is ever given a live preview of a branch, which
-  section 9 says she is not.
+Consequences: `Phoenix.Presence` replaces `Group` for liveness; `SocketDist` is irrelevant (it
+separates lanes *within* a cluster); trace contention is answered by a second socket, not a
+second topic on the same one.
 
-The single most important fact in this design: **a Claude Code session is an OS process with a
-unix socket, not a BEAM process.** It cannot be a `pid` in the cluster, cannot be supervised by
-OTP directly, and cannot be linked to. The runner node owns it through a Port and observes it
-through its on-disk registry (`~/.claude/sessions/<pid>.json`) and transcript
-(`~/.claude/projects/<slug>/<sessionId>.jsonl`). Every piece of OTP machinery here wraps the
-session; none of it *is* the session.
-
-```mermaid
-flowchart TD
-  Larisa["Larisa — AI chat in HomeCareBilling"] -->|files| GH["GitHub issue + support row"]
-  GH -->|webhook| CP["loopctl control plane"]
-  CP --> TRIAGE["Triage trio: BA + architect + senior engineer"]
-  TRIAGE -->|story| Q["implementation queue"]
-  TRIAGE -->|escalation predicate fires| MARK["Mark"]
-  Q -->|"Postgres claim: UPDATE ... WHERE claimed_by IS NULL RETURNING"| DS["DurableServer per story"]
-  DS -->|"Presence.list('runners')"| POOL["availability pool"]
-  POOL --> R["runner node on a dev machine"]
-  R -->|Port| SESS["claude -p in a git worktree"]
-  SESS -->|PR| GH
-  GH -->|"reviews passed + CI green"| MERGE["auto-merge"]
-  MERGE --> DEPLOY["deploy + post-deploy verify"]
-  DEPLOY -->|status| Larisa
-```
-
-In words: Larisa's chat files a GitHub issue and a support row. A GitHub **webhook** — not a
-poller — reaches the loopctl **control plane**, which runs the **triage trio**. The trio either
-emits a **story** into the implementation queue, or fires the **escalation predicate** and stops
-at Mark. A story is claimed out of the queue by a **Postgres transaction**, which starts a
-**DurableServer** for that story. The DurableServer picks a **runner node** out of the
-availability pool published by **Phoenix Presence**, and the runner starts a **`claude -p`
-session** in a git worktree through a Port. The session opens a **PR**. When reviews pass and CI
-is green the PR **auto-merges**, deploys, and is verified — and only then does the outcome reach
-Larisa.
+**The channel must not bypass loopctl's security pipeline.** Tenancy is RLS driven by
+`SET LOCAL app.current_tenant_id` per request (`lib/loopctl/repo.ex:63,147-156`), with plugs for
+`set_tenant`, `require_auth`, `require_role`, `check_custody_halt`, `resolve_api_key`,
+`rate_limiter`, `validate_witness_header`. `join/3` resolves api key and tenant through the same
+functions; every `handle_in` calls a context function that owns its transaction and sets the GUC.
 
 ## 3. Stage machine
 
-One `DurableServer` per story, keyed `story/<id>`, state persisted to object storage (Tigris) or
-EKV. It survives a loopctl deploy, a runner crash and a machine reboot — which is the whole
-reason it is a DurableServer and not a GenServer or an Oban job.
+**Postgres owns the state.** loopctl's `stories` table already is a state machine
+(`agent_status` / `verified_status` with check constraints). A `DurableServer` per story is a
+cache that reloads from Postgres on resume — not a second source of truth, because the audit
+chain is the custody-bearing record and nothing transacts across both stores.
 
 ```
 detected -> triaged -> queued -> claimed -> worktree -> implementing
          -> reviewing -> pr_open -> ci -> merged -> deployed -> verified -> done
-                                                 \-> escalated (terminal until Mark acts)
-                                                 \-> failed (terminal, with reason)
 ```
 
-Every transition is an append to the story's audit chain. `escalated` and `failed` are terminal
-for the loop and are the only two states that page a human.
+Failure edges are part of the machine, not exceptions to it: CI red → implementing; review
+findings → implementing; merge conflict or base moved → implementing; post-deploy verification
+failing → escalated; budget exceeded → failed; runner lost → queued. `escalated` has an explicit
+transition for Mark acting.
 
-## 4. The triage trio
+**Every stage is idempotent on replay.** A restored process re-enters its stage and would re-run
+the side effect — a second worktree, a second PR, a second deploy. Each stage writes the identity
+of its side effect (worktree path, PR number, merge SHA, release id) *before* acting and checks
+for it on entry. Without this, durability turns one crash into duplicate outward actions.
 
-Three agents that already exist in `claude-config`, dispatched in ONE message so they run
-concurrently, each reading the issue, the support row, the repo and the KB:
+Note the ordering: the PR opens on the first green commit, **before** review, so CI and review
+run concurrently.
 
-| agent | question it answers |
-|---|---|
-| `business-analyst` | What is actually being asked? Acceptance criteria, test cases, what "done" means. |
-| `elixir-systems-architect` | Does this fit the current architecture? What does it touch? |
-| senior engineer (the `/code-review` senior lens) | Is this implementable as scoped, and what breaks? |
+## 4. Triage
 
-They **create** the story and **quickly review** it — one pass, not a loop. Output is a single
-story document plus a structured verdict:
+Three agents — `business-analyst`, `elixir-systems-architect`, and a senior-engineer lens —
+dispatched concurrently in one message. They create and review the story in **one pass**.
+Disagreement does not trigger another pass; it escalates.
+
+**Triage runs as a `claude -p` session on a runner, not inside loopctl.** The agents are Claude
+Code definitions in `~/.claude/agents/`; loopctl is an Elixir release on Fly with no Claude Code,
+no `~/.claude` and no checkout. loopctl holds the queue, the gates and the state, and dispatches
+triage the same way it dispatches implementation.
+
+The triage session queries the database directly, the way anyone on that machine does — dev
+machines already have full access. One correctness note: production mixes real agency billing
+with demo and test rows, discriminated only by `batches.original_filename`.
+
+Output contract:
 
 ```json
 {
   "verdict": "story" | "escalate" | "reject",
   "story": { "title": "...", "acceptance_criteria": [...], "test_cases": [...],
-             "touches": ["lib/...", "priv/repo/migrations/..."] },
+             "touches": ["lib/..."], "domain_reference": "docs/domain/....md | N/A — <reason>" },
   "escalation_reasons": [...],
   "contradicts": [{"kind": "story"|"kb"|"code", "ref": "...", "why": "..."}],
   "confidence": 0.0
 }
 ```
 
-`reject` exists for the genuinely non-actionable — a duplicate, or a request that is already
-implemented. It replies to Larisa in the chat and closes the issue, and it does not reach Mark.
+This contract does not exist yet. Neither agent definition emits a verdict, a confidence or any
+JSON, neither has `Write` in its `tools:` line, and `--json-schema` constrains a run's final
+result rather than a subagent's return. The contract has to be added to the agent bodies as a
+required final fenced block, with the dispatching session re-emitting the merged object.
 
-**Bound it: one triage pass.** A trio that disagrees does not iterate — disagreement is itself an
-escalation signal (see below). This is the same rule as the review-round ceiling, for the same
-reason: each extra pass has fresh material to find problems in and cannot converge by
-construction.
+`reject` exists for the genuinely non-actionable. **It must not close the GitHub issue naively** —
+see §9.
 
-## 5. The escalation predicate
+## 5. Two gates
 
-This is the highest-risk component in the design. With the trio clearing triage and the merge
-gated only on reviews plus pipeline, this predicate is the only thing between a misread bug
-report and a merged change to Medicaid billing. It is therefore **mechanical first, judgement
-second**: any one of the hard triggers escalates regardless of what the agents think, and the
-agents can only ever add escalations, never remove one.
+v1 used one word, "escalation", for two different things and produced a **54% escalation rate**.
+They are separate.
 
-**Hard triggers — path and content based, no model judgement:**
+### Gate A — "Mark decides." Request-shaped. Rare.
 
-- a file under `priv/repo/migrations/` is touched
-- anything under an auth, session, permission or credential path
-- a change to billing-code mapping, rate tables, or claim generation (the 837P path)
-- a change to PHI handling, retention, or export
-- a new external egress destination, or a new dependency in `mix.exs`
-- a change to a payer-facing artifact format
-- the diff exceeds **12 files or 1,000 changed lines** (see the calibration below)
-- `mix.lock` changes for anything other than a patch bump
+- the request **contradicts** an existing story, KB decision, or documented behaviour
+- it **inverts or removes** behaviour a previous story deliberately added
+- it is a workflow change rather than a defect fix
+- the trio's `verdict` field disagrees across the three agents
 
-**Soft triggers — the agents' own signals:**
+**No file paths belong in Gate A.** An uncontested defect in the claims path is not something
+Mark needs to decide. Gate A's rate is measured and reported; a rate resembling 54% is a design
+failure, not a tuning question.
 
-- the trio's verdicts disagree with each other
-- `contradicts` is non-empty against an existing story, KB decision, or documented behaviour
-- the request would remove or invert behaviour a previous story deliberately added
-- Larisa's request implies a workflow change rather than a defect fix
+Do not gate on self-reported `confidence` — three independently-prompted agents disagreeing is a
+comparison between separate judgements and a far better signal. Record it, rank on it, log the
+soft triggers for a fortnight before any of them gate anything.
 
-### Calibrating the diff-size trigger against real history
+### Gate B — "a human confirms." Effect-shaped. Mechanical.
 
-Measured on `home_care_billing`, 80 first-parent commits, 2026-09-12:
+Fires when a change can cause an **irreversible external effect**: a claim submitted, money
+moved, an EVV record sent, a payer artifact emitted. A revert does not un-submit an 837P.
 
-| | median | p75 | p90 | max |
-|---|---|---|---|---|
-| files changed | 8 | 17 | 37 | 183 |
-| lines changed | 722 | 1,913 | 4,596 | 38,698 |
+Gate B does not mean Mark reads a diff. The change proves its effect:
 
-The draft's placeholder of 15 files / 400 lines would have escalated **more than half of all
-changes** on the line count alone, since the median change is already 722 lines — precisely the
-"constantly needing Mark" outcome the design is meant to avoid. **12 files / 1,000 lines** sits
-above the median and below p75: an ordinary change passes, a bundle-sized one escalates.
+1. deploy the branch to staging;
+2. regenerate 837P output from a **fixed fixture set**;
+3. the diff must be **non-empty exactly where the change intended, and empty everywhere else** —
+   both halves, because "nothing changed" is not a pass for a change meant to alter billing;
+4. clean result merges with no human. Anything else routes to Gate A.
 
-One honest limit on that number: these are first-parent commits on master, i.e. merges of
-staging PRs that bundle several changes each, so the distribution is an upper bound rather than
-the distribution of single-issue fixes. A Larisa-sized bug fix sits well below the median, which
-means the trigger has more headroom than the table suggests. Re-measure against the first fifty
-loop-authored PRs and tighten it then — with real data instead of a guess in either direction.
+Known limits, written in rather than discovered later: a golden-file oracle only detects changes
+*to the golden*, so an untested path regresses silently; and a validator passing is not
+correctness — a lenient one hid a spec violation in every claim file for eight months. **Fixture
+coverage over service codes, modifiers and programs is itself an asserted test** that fails when
+a new code appears without a fixture.
 
-**On `confidence`: do not gate on it.** Mark's instruction was not to set it prohibitively high;
-the stronger answer is that a self-reported scalar is the weakest signal on the list and should
-not be a trigger at all. Three independently-prompted agents *disagreeing* is a comparison
-between separate judgements and is a far better escalation signal than any one of them rating
-itself. So `confidence` is recorded on the story and used for ranking and post-hoc analysis, and
-**disagreement is what escalates**.
+Paths that feed Gate B, read literally off the repo and asserted by a test that fails when one
+stops existing: `priv/fee_schedules/**` (rate tables are CSV data, not code — a one-line edit is
+a Medicaid rate change), `lib/home_care_billing/claims/**`, `lib/home_care_billing/edi/**`,
+`work_orders/billing_codes.ex`, `payroll.ex`, `lib/mix/tasks/**` (24 tasks, several of which
+rewrite fee schedules), `config/runtime.exs`, and anything loaded via `:code.priv_dir`.
 
-If a numeric gate is wanted later, the way to earn it is to log for a fortnight what a
-threshold of 0.5 *would* have escalated without acting on it, then set the number from that
-record. Picking one now would be inventing a constant and then trusting it.
+Note `lib/home_care_billing/billing/` is **Stripe SaaS billing**, not the Medicaid path, and
+`lib/home_care_billing/authorizations/` is **prior authorization**, not authZ. Globbing on the
+words is wrong in both directions.
 
-Everything else proceeds without Mark. **The predicate is a pure function over the issue, the
-trio's output and the proposed touch list, and it must have its own test suite with recorded
-real cases** — otherwise it degrades silently into whatever the model felt like that day.
+Human-gated outright, because they have no claim-output signature to prove: router pipelines
+(`:require_tenant_admin` / `:require_tenant_member` are the real access control),
+`lib/home_care_billing_web/plugs/*auth*`, and `lib/**/data_migrations/**` (12 modules that mutate
+production data from outside `priv/repo/migrations/`).
 
-The predicate is falsifiable by construction: run it against a mutated input that should escalate
-and assert it does (`bin/mutate.sh` is the existing harness for exactly this).
+### Both gates run twice
 
-## 6. Claiming: Postgres, not the registry
+v1 ran the predicate once, at triage, over the trio's **predicted** touch list, and then claimed
+a PR was "by construction" safe. Nothing binds the implementing session to that prediction.
 
-A story is claimed by a single SQL statement in loopctl's existing database:
+Run at triage over the predicted touches to decide whether to dispatch at all. Run again as a
+**merge precondition** over the real `gh pr diff --name-only` plus the real diffstat, including
+the 12-file / 1,000-line bound. The second run is the one that gates.
 
-```sql
-UPDATE stories
-   SET claimed_by = $1, claimed_at = now(), state = 'claimed'
- WHERE id = $2 AND claimed_by IS NULL
-RETURNING id;
-```
+**Fail closed.** Trigger data lives in configuration; a missing, empty or misparsed config must
+escalate unconditionally, not yield an empty trigger set that merges everything. That is a test
+and a `bin/mutate.sh` case.
 
-Zero rows means someone else won. This is mutual exclusion; a convergent registry is not.
+**"Agents may only add an escalation, never remove one" is a wiring property**, not a rule agents
+follow: the gates compute their own triggers and OR them with the agents' signals, never reading
+an agent's negative.
 
-**Do not use `Group` for the claim.** Its README leads with "Eventually Consistent": during a
-partition two nodes can hold the same unique key until `resolve_registry_conflict` ranks the
-claims, picks a winner and terminates the loser. That is correct behaviour for presence and
-wrong for a work claim.
+## 6. Claiming
 
-This also fixes a defect the fleet already has: today every session authenticates as one
-`agent_id`, and `channel_claim` is idempotent for the owning agent, so a second session claiming
-an already-claimed ref gets the existing claim back as though it had won. Two sessions have
-already built the same issue in parallel because of it.
+Extend `Progress.claim_story/3` (`lib/loopctl/progress.ex:155`). Do **not** open a second write
+path to `stories`: `claimed_by` does not exist in that schema, and the existing function does the
+audit-chain append, the webhook event, the `start_cap` mint deliberately inside the transaction,
+the dependency check, the `lifecycle_entered_at` anti-launder marker and the dispatch lineage.
+
+Add what it lacks: `claimed_until`, renewal from the runner, a reclaimer worker modelled on
+`Dispatch.expires_at` + `RevokeExpiredDispatchesWorker`, and a **`claim_epoch`** bumped on
+reclaim and echoed on every runner→control message so a resurrected zombie's writes are rejected.
+
+The existing channel-claim mechanism is not exclusive on this fleet — every session
+authenticates as one `agent_id`, so a second claimant gets the first claim back idempotently.
+That is why story claims are a Postgres transaction.
 
 ## 7. The machine pool
 
-`Phoenix.Presence` on the runner channel. On join the runner tracks itself:
+`Phoenix.Presence` on the runner channel, topic `"runners"`, carrying cores, memory, repos,
+`max_sessions`, `in_flight`, `draining`. Tracking dies with the socket, so a crashed runner
+leaves the pool with no sweeper.
 
-```elixir
-Presence.track(socket, "runners", node_name, %{
-  cores: System.schedulers_online(),
-  memory_mb: ...,
-  repos: ["home_care_billing", "loopctl", "claude-config"],
-  max_sessions: 2,
-  in_flight: 0,
-  draining: false
-})
-```
+**Presence is a liveness hint, not a scheduler.** It is an eventually-consistent CRDT with no
+compare-and-set, so two story processes both read `in_flight: 0` and both dispatch to the same
+runner. Reserve capacity in Postgres —
+`UPDATE runners SET in_flight = in_flight + 1 WHERE name = $1 AND in_flight < max_sessions
+RETURNING` — and have the runner refuse an over-budget dispatch anyway.
 
-Leaving the pool deliberately is `draining: true`, then leaving the channel once in-flight
-sessions finish. Leaving it accidentally is the socket closing, which Presence already handles.
+**Presence also does not converge on loopctl as deployed.** `cluster_readiness.ex` states loopctl
+runs single-node; `DNS_CLUSTER_QUERY` is unset so `DNSCluster` is `:ignore`; `fly.toml` has
+`auto_start_machines = true`. The moment Fly starts a second machine, a runner tracked on node A
+is invisible on node B — permanently. Either set `DNS_CLUSTER_QUERY`, pin the machine count, or
+keep the pool in Postgres. **Decide this before step 5 of the build order.**
 
-**Enrolled machines, decided 2026-09-12: minis, mac-mini, blockit.** Three genuine dev boxes.
-Explicitly not enrolled:
+**"Connected" is not "able to build."** A wedged machine answers heartbeats while the box
+thrashes. Publish a periodic self-measured sample — loadavg, free RAM, free disk, time of last
+successful build — and treat a stale sample as a breached threshold. Absence is a negative.
 
-- **beelink** — dedicated GitHub Actions CI host. Mark may add it later, but not now; it
-  currently runs loopctl's `self-hosted` CI jobs and giving it dev work would contend with the
-  gate it already serves.
-- **xps13** — 4 threads and 8 GB of soldered RAM. Too weak for a build; would be the slowest
-  path in any placement decision that picked it.
-- **nuc** — not a dev machine.
+Enrolled: **minis, mac-mini, blockit.** Not beelink (dedicated CI host; may be added later) and
+not xps13 (4 threads, 8 GB soldered). Placement prefers a warm `_build`, then free capacity, then
+lowest `in_flight` — with free disk as a precondition.
 
-Placement: prefer a runner that already has the repo cloned with a warm `_build`, then most free
-capacity, then lowest `in_flight`. `durable_server`'s capacity-aware and sticky placement
-implements this natively on the control-plane side and should be used rather than
-reimplemented — it is placing the *orchestrator* process, and the runner choice rides on its
-metadata.
+**The runner validates every dispatch against a local allow-list** (repos, branch prefixes, wall
+clock, token budget) and refuses by default. v1 reasoned only about a compromised machine
+reaching the control plane; the design actually opens the other direction, where a dispatch is an
+arbitrary prompt executed as the user with that machine's credentials.
 
-## 8. Sessions must never ask a question
+## 8. Unattended sessions
 
-Measured, not assumed (KB `f9e9222c-3451-4a72-821d-bb4bf8688c66`): **a peer message can never
-answer a blocking question.** An open `AskUserQuestion` is mid-turn, and an inbound message
-queues behind the human. No orchestrator can clear a prompt off a screen. A session that asks
-blocks until a person arrives, which defeats the entire loop.
+**Launch with `--permission-mode auto --permission-prompts none`.** That flag *removes*
+`AskUserQuestion` from the tool list and cancels MCP elicitations — making the wrong thing
+impossible rather than costly. Requires 2.1.259+. Add `--max-turns` as the hard stop.
 
-So the loop does not answer questions remotely — it prevents them:
+v1 proposed a `PreToolUse` deny hook instead. That is one rung down and retryable: the retry
+control lives on `PermissionDenied`, which does not fire for `PreToolUse` denials, so nothing
+bounds an unattended session re-asking. And v1's "or allow it with `additionalContext` injected"
+branch is strictly wrong — `allow` means the tool *runs*, which is the hang it exists to prevent.
 
-- A `PreToolUse` hook on `AskUserQuestion` runs in every loop session. It sees the full
-  `tool_input` and either denies with feedback the model reads as its tool result, or allows it
-  with `hookSpecificOutput.additionalContext` injected. `claude-config`'s existing
-  `gate-ask-user-question.sh` is the same shape and is the starting point.
-- In loop mode the hook's default is **deny with the story's acceptance criteria injected** — the
-  answer is almost always already in the story the trio wrote.
-- A question the hook genuinely cannot answer becomes an `escalated` transition on the
-  DurableServer, not a blocked session. The session is stopped, the worktree preserved, and the
-  question surfaces to Mark with its context.
+Keep a hook only for what the flag cannot do: emitting the **escalation** signal when the model
+wanted to ask. Register it on `PermissionDenied`. Default that path to escalate, not deny — a
+stateless hook cannot judge "can this be answered" over free text, and denying by default means
+the session silently guesses. Log every suppressed question into the trace so "the answer is
+already in the story" becomes measurable.
 
-Two related traps from the same finding: `CronCreate` dies with its session and cloud routines
-cannot see local sockets, so **the detector must be a daemon, not a scheduled Claude task** — the
-runner node and the control plane are those daemons. And "waiting on a workflow" and "waiting on
-a human" look identical from a transcript tail, so liveness requires positive evidence — no
-writes under that session's `subagents/` directory in N minutes — never merely a quiet log.
+If a hook is used, it is **one script branching on `LOOP_MODE`**, not a sibling on the same
+matcher as `gate-ask-user-question.sh` — two hooks denying the same call with contradictory
+instructions is worse than either. The runner passes `LOOP_MODE=1 LOOP_STORY_FILE=...` in the
+environment, which hooks inherit.
 
-## 9. Merge
+**Parking detection**: v1 used "no writes under `subagents/` in N minutes". Measured on mac-mini:
+**0 of 1,543 project directories** contain one, because that directory exists only when a session
+dispatches subagents — so it reports every healthy solo session as parked from second zero. Use
+instead, ORed: bytes on the Port's stdout (strongest, needs no filesystem); mtime on
+`~/.claude/projects/<slug>/<sessionId>.jsonl`; and `claude agents --json`. Keep `subagents/` only
+as a suppressor meaning "legitimately waiting on a panel".
 
-Per Mark's instruction: merge is gated on passed reviews and the pipeline, and does not wait for
-him.
+**Exec `bin/claude-headless.sh`, never `claude`.** `ANTHROPIC_API_KEY` in the environment
+silently outranks the claude.ai login; that incident cost ~USD 300 and reported a usage limit
+rather than an auth error. The canary enforcing it only sees claude-config's own files, so this
+repo needs its own copy or a release that refuses to build on a direct invocation.
 
-1. Session opens the PR on its first green commit, ready for review, not draft.
-2. The review gate runs — `/code-review high #<PR>`, bounded at two rounds for code, three as
-   the ceiling. A round-three review still finding material defects is evidence about the story,
-   not a reason for round four: that path escalates.
-3. All confirmed findings are fixed in the same PR. No deferrals.
-4. `bin/wait-for-checks.sh` blocks on required checks. Exit 0 merges; anything else does not.
-5. `gh pr merge --squash --delete-branch`.
-6. Deploy, then a post-deploy verification step.
+**Closing a Port does not kill a process tree.** Use `setsid` plus `kill -TERM -<pgid>` on both
+platforms; MuonTrap's containment is cgroup-based and two of three machines are macOS. Reap
+orphans at runner boot, since teardown only runs on the happy path.
 
-**What Larisa sees, decided 2026-09-12: the outcome only.** She is notified in the chat she
-filed from when a change is *deployed*, and never of work in progress — no PR link, no branch,
-no review status, no "an agent has picked this up". Two reasons this is the right cut and not
-just a preference: work-in-progress notifications invite her to intervene in a loop designed to
-run without intervention, and a PR that is later abandoned or superseded would surface to her as
-a broken promise. The states that reach her are `deployed` (with what changed, in her words not
-ours) and `escalated`/`failed` — and those two reach *Mark*, who decides what she is told.
+**The session's cwd must be the worktree** — `block-foreign-repo-write.sh` keys on
+`git rev-parse --git-common-dir`, so `--add-dir` from elsewhere blocks every write.
 
-Post-deploy verification must confirm the deploy shipped the right commit. A `workflow_run`
-deploy ships the TRIGGERING run's commit, not the commit GitHub attributes the deploy to
-(KB `3670a0de-1261-4213-a459-f6336048e025`), so the verification step compares the deployed
-release's SHA against the merge commit rather than trusting the Actions UI.
+**Not `--bare`** (it would strip the hooks, agents, MCP servers and CLAUDE.md the loop depends
+on), which means every guard hook loads — including `gate-unmerged-pr.sh`, which blocks exactly
+the "merging nothing" end state build-order step 1 prescribes. The runner sets a loop-mode
+variable that gate exits 0 on.
 
-The escalation predicate has already run before any of this, so a PR reaching step 5 is by
-construction not touching migrations, auth, billing codes or PHI.
+## 9. Merge, and what Larisa sees
 
-## 10. Observability
+`required_approving_review_count` is **0** on both `master` and `staging` of home_care_billing.
+So "merge on passed reviews" in v1 meant agent-written code reviewed by agents and merged by
+agents, with no human anywhere. **Raise it to 1 on the loop's target branches** and have the loop
+request review for anything Gate B does not clear — branch protection is server-side and an agent
+cannot talk around it.
 
-Steal Chris Ertel's trace format: **one NDJSON event stream per run, every event carrying a
-`parent` field**, so the agent tree is reconstructable afterwards. Our audit logs today are
-per-session text with no parent link, which is why attributing a subagent's action needs
-`bin/who-did-it.sh` instead of a query.
+`on: pull_request` runs the workflow file **from the PR's own head**, so a loop PR can edit the
+CI that judges it. Required contexts must come from a workflow the PR under test cannot modify.
 
-The runner streams that file back to the control plane over the same channel connection. If
-trace volume ever starves control messages, the fix is a **second channel topic** with its own
-backpressure, not `SocketDist` — that library separates lanes *within* a BEAM cluster, and per
-section 2 there is no cluster here. Do not reach for it before the contention is measured.
+**The domain gate is a required check and no issue assigns it.** `governance_gate.ex` plus
+`.github/workflows/domain-gate.yml` require every PR touching `lib/home_care_billing*` to name a
+`docs/domain/*.md` artifact or an auditable `N/A — <reason>`. Without `domain_reference` in the
+trio's verdict, **every loop PR stalls**.
 
-## 11. What exists already
+**CI is a capacity-1 resource.** `test`, lint, security, dialyzer and scale-test all run on
+`[self-hosted, beelink]` — the box excluded from the pool. Six concurrent implementations feed
+one CI machine, so throughput is bounded by CI, not dev capacity. Model it as capacity-1 so
+stories queue at the `ci` stage.
 
-Do not rebuild these:
+**Admission control**: three machines at `max_sessions: 2` is six concurrent sessions each
+dispatching review panels, all against one Anthropic account, and the account rate limit is what
+bites on parallel work. A control-plane token bucket over total in-flight sessions, checked
+before a story is claimed.
 
-- **loopctl**: `dispatches` (with `revoke_expired_dispatches_worker`), `agents`, `coordination`,
-  `capabilities`, `custody`, `audit_chain`, `cluster_readiness`, `health_check`, and the story
-  lifecycle with contract/claim/start/report/verify.
-- **claude-config**: the delivery loop, the review gate and its round counter, worktree
-  workflow, `bin/wait-for-checks.sh`, `bin/delete-merged-branch.sh`, `bin/mutate.sh`,
-  `gate-ask-user-question.sh`, `block-subagent-git.sh` and the grant sentinel, the `business-analyst`
-  and `elixir-systems-architect` agents, the fleet nudger.
-- **HomeCareBilling**: the AI chat that files the GitHub issue and the support row.
+**Exclude loopctl and claude-config from auto-merge.** loopctl deploys on every push to master
+and *is* the control plane, so a story changing it restarts the node holding its own
+DurableServer; claude-config is read every turn by every session on six machines. Target repos
+are product repos only — the loop must not edit the guards that constrain it.
 
-Genuinely new: the runner node, the triage trio orchestration, the escalation predicate, the
-DurableServer stage machine, and the `Group`-backed machine pool.
+**The only independent reviewer must not be CI.** loopctl's founding thesis is that agents
+self-approve, which is why stories carry `verified_status`, `verifier_dispatch_id` and
+`verifier_needed`. Reuse it: merge requires `verified_status = :verified` set by a verifier
+dispatch with a **different lineage**.
+
+### Larisa's side
+
+She is notified **when a change is deployed**, never of work in progress — no PR link, no branch,
+no "an agent picked this up". Work-in-progress notifications invite intervention in a loop
+designed to run without it, and an abandoned PR reads as a broken promise.
+
+Three shipped behaviours contradict v1 and must be handled:
+
+- **Closing the GitHub issue emails her that a fix shipped.** The webhook auto-resolves the
+  ticket with `resolution_notes: "Our team has shipped a fix for this issue."` on *any* close
+  (`github_controller.ex:115`, `ticket_notifier.ex:413`). A `reject` verdict would tell her a fix
+  shipped for something nobody built. The loop sets `resolution_notes` per verdict before
+  closing, or closes with a label the webhook skips.
+- **The resolution email is on a 15-minute timer from merge, not from deploy.**
+  `support_ticket_resolved_email_worker.ex`'s own moduledoc says deploys longer than that window
+  race it. The post-deploy verification emits the resolution; delete the timer.
+- **Post-deploy verification compares the deployed SHA to the merge commit.** A `workflow_run`
+  deploy ships the *triggering* run's commit, not the one GitHub attributes it to.
+
+## 10. Reporter text is untrusted
+
+`github_issue_worker.ex:217` interpolates `ticket.description`, tenant name, page URL and client
+`user_agent` verbatim into the issue body that triage and then an implementer read. `/demo-request`
+is public and self-provisions a tenant, so that text is not only Larisa's.
+
+Reporter-supplied text is **data, never instruction**, at every hop, fenced and labelled as
+untrusted. **The implementer never sees raw reporter text** — its input is the story the trio
+wrote. That is the strongest control available and it falls out of the architecture already
+chosen. An injection attempt escalates and is recorded rather than being silently filtered.
+
+Between her observation and the acceptance criteria there are already three model paraphrases and
+no human confirmation: the ticket tool is exempt from the confirm-before-write gate, the
+conversation excerpt replaces every user turn with `"[User message]"` for PHI reasons, and the
+issue worker paraphrases again. **Show her the filed description and let her correct it** — one
+round trip removes three layers of telephone.
+
+## 11. Observability
+
+One NDJSON event stream per run, every event carrying a `parent` field so the agent tree is
+reconstructable. Our audit logs today are per-session text with no parent link, which is why
+attribution needs `bin/who-did-it.sh` instead of a query.
+
+The on-disk file is the source of truth. Ship `(run_id, seq)`, have the server ACK the last
+contiguous seq, resume from that offset on rejoin, dedup on the pair — Phoenix replays nothing,
+and a rejoin happens on every rolling deploy. Better still, upload the trace to object storage
+from the runner and send a pointer plus the small structured events.
+
+Stage and trace events go on their own non-chained table. The audit chain takes
+`SELECT ... FOR UPDATE` on the tenant's latest entry inside the caller's transaction, with a
+gapless `chain_position` trigger, so putting every stage transition on it serialises every
+concurrent story on one row. Keep the chain for custody-critical transitions: claim, merge,
+escalate.
 
 ## 12. Build order
 
-Each step is independently useful and independently revertable.
+1. **One runner, one machine, one hand-filed story, merging nothing.** No cluster, no registry,
+   no triage, no network — a Mix task that creates a worktree, runs `claude -p` through a Port,
+   emits the trace, detects parking, tears down. Proves the four mechanisms.
+2. **Gate B's claim-output harness**, offline, against real past changes. Measure its false
+   negatives before it gates anything.
+3. **Gate A**, log-only, against real past tickets. Measure its rate.
+4. **The trio** — output contract in the agent bodies first — emitting stories behind a manual
+   approve.
+5. **`Progress.claim_story` extension plus the stage machine.** Now a story survives a restart.
+6. **Presence pool, second runner, real placement.** Resolve the single-node question first.
+7. **Auto-merge**, last, once 2 and 3 have a track record.
 
-1. **One runner node, one machine, one hand-filed story, merging nothing.** Proves Port
-   supervision, the NDJSON trace, the liveness signal and the question-suppression hook. No
-   cluster, no registry, no triage.
-2. **The escalation predicate, with its test suite**, run offline against real past issues from
-   the support table. Measure its false-negative rate before it gates anything.
-3. **The triage trio**, emitting stories into the queue behind a manual approve.
-4. **Postgres claiming plus the DurableServer stage machine.** Now a story survives a restart.
-5. **Presence-backed machine pool**, second runner, real placement.
-6. **Auto-merge**, last, once steps 2 and 5 have run long enough to have a track record.
+## 13. Repo layout
 
-## 13. Repo placement — decided: the runner gets its own private repo
+- **loopctl** (public) — control plane, gates, queue, state, and the versioned runner contract
+  alongside `api_spec/schemas.ex`. Trigger *data* lives in configuration, not in source: the list
+  is a map of which paths skip human review.
+- **loopctl-runner** (private) — this repo. Its own repo because loopctl is a single Mix app with
+  one release, so runner code would be loaded in the BEAM of a multi-tenant production app, and
+  its deps would enter loopctl's `mix.lock` and `hex.audit` surface. Private because it encodes
+  fleet topology and channel-token handling. Keep topology and trigger lists in configuration and
+  going public later is deleting a directory.
+- **claude-config** — the loop-mode launch flags and any `PermissionDenied` hook.
 
-The question was whether the runner could live in the loopctl repo. It can, and it should not.
-The evidence, read off loopctl on 2026-09-12:
+*(v1 also claimed loopctl's `ci.yml` uses a path-probe job and recorded it as settled. It does
+not; there is no paths-filter and `test` carries no path condition. The repo-split conclusion
+stands on the one-app-one-release argument alone.)*
 
-**The blocking reason — one app, one release.** `mix.exs` declares `app: :loopctl`; this is a
-single Mix project, not an umbrella. Its `releases/0` builds exactly one release. Runner modules
-in that project are compiled into the artifact that ships to Fly, so code whose entire purpose is
-to spawn shells, drive git worktrees and exec `claude -p` would be *present in the BEAM* of a
-multi-tenant production app holding customer data. Not merely callable — loaded. That is the
-wrong direction for a repo that already carries an egress guard and a `mix hex.audit` gate with
-individually-justified advisory acknowledgements.
+## 14. Packaging
 
-**The compounding reason — dependency surface.** The runner needs process supervision
-(MuonTrap or erlexec), filesystem watching and `:os_mon`; loopctl's server needs none of them.
-Every one would enter loopctl's `mix.lock` and therefore its supply-chain obligations, its
-`hex.audit` surface, and its advisory-acknowledgement list.
+`mix release` built on each target machine — all three have a full asdf toolchain and BEAM
+releases are not portable across OS or arch. Not Burrito (its value is machines *without* a
+toolchain). `systemd --user` on Linux, launchd `LaunchAgent` on macOS, user-scoped in both cases
+because the runner must reach `~/.claude`, `~/workspace`, asdf shims and GitHub credentials.
 
-**The reason that is NOT a blocker, recorded so nobody re-litigates it.** CI coupling is already
-solved in that repo: `ci.yml` deliberately carries no workflow-level `paths:` filter and instead
-runs a cheap path-probe job that `test` keys off, so a runner directory could have had its own
-path-filtered job. The residual cost — the `[self-hosted, beelink]` jobs cancelling in-flight on
-every push to a now-busier repo — is real but secondary.
-
-**What DOES belong in loopctl** is the contract, not the client: the channel message schema, the
-registration payload, the stage-machine transitions and the trace event schema. loopctl already
-has `api_spec/schemas.ex` and an OpenAPI spec, and already publishes client-side artifacts
-(a CLI and an MCP server with an npm publish workflow), so a versioned runner contract follows
-existing precedent rather than inventing a pattern.
-
-The runner repo is **private**: it holds fleet topology, machine capabilities and the token
-handling for a channel that can cause code to be written and merged.
-
-## 14. Packaging and supervision — decided: `mix release`, built on each machine, no Burrito
-
-The enrolled machines are minis (Linux), mac-mini (macOS) and blockit (macOS) — two platforms,
-three machines, and **every one already carries a full asdf Elixir toolchain**. That fact settles
-it:
-
-- **`mix release`, built on the target machine.** BEAM releases bundle ERTS and are not portable
-  across OS or architecture, so a release has to be produced per platform anyway. Building where
-  it runs turns that constraint into a non-issue and needs no cross-compilation.
-- **Not Burrito.** Burrito's value is shipping to machines *without* a toolchain. All three of
-  ours have one, so it buys nothing and costs a cross-compilation setup.
-- **Not `mix run`.** A dev loop for a service supervised across reboots is the wrong shape, and
-  it couples the runner's uptime to whatever the shell environment happens to be that day.
-
-Supervision, per platform:
-
-- **Linux (minis): `systemd --user`.** A user unit, not a system one — the runner must run as
-  `mkreyman` to reach `~/.claude`, `~/workspace`, the asdf shims and the machine's own SSH and
-  GitHub credentials.
-- **macOS (mac-mini, blockit): a launchd `LaunchAgent`** in `~/Library/LaunchAgents`, with
-  `KeepAlive` and `RunAtLoad`, for the same reason.
-
-Two traps worth writing down before anyone hits them:
-
-- **`ExecStart=.../bin/<app> foreground` does not exist in Elixir Releases.** That is Distillery's
-  command; using it produces `ERROR: Unknown command foreground` and a systemd restart loop
-  (KB `aaa06643-0b09-4f66-aa11-dcd9ddf16bfa`). Use `start`.
-- **Do not copy `DynamicUser=true` from the standard hardened BEAM unit file**
-  (KB `097c713d-8a66-416e-bbda-071a0a0bd656`). That directive gives the service an ephemeral
-  user with a private tmp and a read-only system, which is correct for a network service and
-  fatal here — the runner's entire job is reaching the real user's home, repos and credentials.
-  The rest of that unit is worth taking: `PrivateDevices=true`, `ERL_CRASH_DUMP_SECONDS=0` (BEAM
-  crash dumps on a machine holding PHI-adjacent checkouts are a disclosure risk), and a
-  `WatchdogSec`. Prefer `Type=exec` over `Type=notify` unless the runner is wired to send
-  `READY=1`.
-- In daemon mode a release writes stdout and stderr to `tmp/log/erlang.log.1` under the release
-  root, not to the journal (KB `21752a93-eab7-4806-a38d-c64066359d58`).
-
-Installation rides on the existing `claude-config-sync` path — the fleet already has a
-convention for pulling to every machine and regenerating per-machine state, and the runner is
-one more thing that pull does.
+Three traps: `ExecStart=.../bin/<app> foreground` is Distillery and yields a systemd restart loop
+— use `start`; do **not** copy `DynamicUser=true` from the standard hardened BEAM unit (it gives
+an ephemeral user and read-only system, fatal here) though `PrivateDevices=true` and
+`ERL_CRASH_DUMP_SECONDS=0` are worth keeping; a release in daemon mode logs to
+`tmp/log/erlang.log.1`, not journald.
 
 ## 15. Still open
 
-Nothing blocking. The two items previously listed here — the diff-size trigger and the
-packaging choice — are decided above, in sections 5 and 14 respectively.
+- Whether loopctl runs single-node or clusters — decides whether Presence is viable at all (§7).
+- Raising `required_approving_review_count` to 1 on the target branches (§9) — Mark's call.
+- Gate A's measured rate and Gate B's false-negative rate, from steps 2 and 3.
