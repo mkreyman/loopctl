@@ -181,32 +181,42 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
 
   defp deployments(_repo, body, _since), do: {:error, {:unreadable_deployments, shape(body)}}
 
-  # Two ways the answer can be INCOMPLETE, and both are refusals rather than short lists.
+  # Two ways the answer can be INCOMPLETE, and neither is a refusal HERE.
   #
   # A page that never reached a record older than `since` may be hiding the deployment that
-  # carries the merge — the forge applied its page size before this filter did. And more
-  # survivors than this adapter will resolve is the same problem one layer along.
+  # carries the merge — the forge applied its page size before this filter did — and more
+  # survivors than this adapter resolves states for is the same problem one layer along.
   #
-  # Neither is transient, so both escalate with the reason named; reporting either as
-  # "nothing carries it" is a confident false escalation instead of an honest one.
+  # Refusing on either at THIS point discarded a definitive answer. The verifier resolves
+  # containment over the NEWEST records, and a carrying success there settles the verdict
+  # whatever is hidden below it; refusing first meant a shipped story escalated on its first
+  # sweep, naming the cap rather than anything about the story — and permanently, because
+  # `since` is pinned to the merge so deployments only accumulate. A delayed sweep (a
+  # backlog at `deployed`, a worker restart, a run of forge faults) hit it every time.
+  #
+  # So incompleteness travels as a FACT beside the newest records, and only the ABSENCE of a
+  # carrying success lets the verifier turn it into an escalation.
   defp bounded(kept, entries, since, repo) do
-    cond do
-      # Truncation FIRST: when the page is full it is the more accurate diagnosis, and a
-      # full page is also over the survivor cap, so the other clause would mask it.
-      truncated?(kept, entries, since) ->
-        {:error, {:deployment_page_exhausted, @deployment_page, since}}
+    # Truncation FIRST: when the page is full it is the more accurate diagnosis, and a full
+    # page is also over the survivor cap, so the other test would mask it.
+    incomplete =
+      cond do
+        truncated?(kept, entries) -> {:deployment_page_exhausted, @deployment_page, since}
+        length(kept) > @max_deployments_since -> too_many(kept)
+        true -> nil
+      end
 
-      length(kept) > @max_deployments_since ->
-        {:error, {:too_many_deployments_since_merge, length(kept), @max_deployments_since}}
-
-      true ->
-        resolve_states(kept, repo)
+    with {:ok, resolved} <- kept |> Enum.take(@max_deployments_since) |> resolve_states(repo) do
+      {:ok, %{deployments: resolved, incomplete: incomplete}}
     end
   end
 
+  defp too_many(kept),
+    do: {:too_many_deployments_since_merge, length(kept), @max_deployments_since}
+
   # The page was FULL and every record on it survived the filter, so there may be more.
   # A page that reached an older record, or a short page, is the whole truth.
-  defp truncated?(kept, entries, _since),
+  defp truncated?(kept, entries),
     do: length(entries) >= @deployment_page and length(kept) == length(entries)
 
   # The list is newest first, so the FIRST record older than `since` ends it: nothing below
@@ -262,9 +272,17 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
     end
   end
 
+  # EVERY element is validated, not just the head. Reading a PAGE of statuses is what made
+  # this reachable: a non-map element (a proxy body, a partial response) reached
+  # `Access.fetch/2` inside the scan and raised a `FunctionClauseError`, which propagates out
+  # of the sweep, kills the run for every remaining candidate and burns an Oban attempt.
   defp deployment_facts([%{"state" => latest} | _rest] = statuses) when is_binary(latest) do
-    with {:ok, state} <- map_state(latest) do
-      {:ok, %{state: state, succeeded?: Enum.any?(statuses, &(&1["state"] == "success"))}}
+    if Enum.all?(statuses, &match?(%{"state" => s} when is_binary(s), &1)) do
+      with {:ok, state} <- map_state(latest) do
+        {:ok, %{state: state, succeeded?: Enum.any?(statuses, &(&1["state"] == "success"))}}
+      end
+    else
+      {:error, {:unreadable_deployment_statuses, shape(statuses)}}
     end
   end
 

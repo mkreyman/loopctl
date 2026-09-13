@@ -129,21 +129,30 @@ defmodule Loopctl.Delivery.PullRequestSource do
   @doc "Every file the repository holds at `ref`."
   @callback repo_files(repo(), String.t()) :: {:ok, [String.t()]} | {:error, term()}
 
+  @typedoc """
+  A page of deployments, NEWEST FIRST, and whether it is the whole truth.
+
+  `incomplete` is `nil` when it is, and otherwise the reason it is not: the forge applies
+  its page size BEFORE the time filter, so a page whose oldest record is still newer than
+  `since` may be hiding a deployment, and a survivor count past what the implementation
+  resolves states for is the same problem one layer along.
+
+  **Incompleteness is a FACT here, never a refusal.** A caller resolves containment over
+  the newest records first, and a carrying success there is definitive whatever is hidden
+  below it; refusing at this layer discarded that answer and escalated a shipped story.
+  Only the ABSENCE of a definitive answer may turn `incomplete` into an escalation.
+  """
+  @type deployment_page :: %{deployments: [deployment()], incomplete: term() | nil}
+
   @doc """
   The recent deployments of `environment` created at or after `since`, NEWEST FIRST.
 
-  `{:ok, []}` is the ordinary early answer and a FACT, not a failure. See the moduledoc for
-  why this is a page filtered by time rather than the newest record.
-
-  **An incomplete answer is an ERROR, never a short list.** The forge applies its page size
-  BEFORE this filter does, so a page whose oldest record is still newer than `since` may be
-  hiding the deployment that carries the merge — and a short list there is
-  indistinguishable from "nothing carries it", which ends in a confident false escalation.
-  That case, and a survivor count past what the implementation will resolve states for,
-  are both refusals naming themselves.
+  An empty `deployments` list is the ordinary early answer and a FACT, not a failure. See
+  the moduledoc for why this is a page filtered by time rather than the newest record, and
+  `t:deployment_page/0` for why an incomplete page is data rather than an error.
   """
   @callback deployments_since(repo(), String.t(), DateTime.t()) ::
-              {:ok, [deployment()]} | {:error, term()}
+              {:ok, deployment_page()} | {:error, term()}
 
   @doc """
   Whether `sha` is reachable from `ref` — identical to it, or an ancestor of it.

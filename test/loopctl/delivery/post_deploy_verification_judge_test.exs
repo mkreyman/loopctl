@@ -66,6 +66,20 @@ defmodule Loopctl.Delivery.PostDeployVerificationJudgeTest do
       assert result.deployed_sha == @deployed
     end
 
+    test "a deployment that reported success and THEN failed has NOT shipped" do
+      # `succeeded?` read before the settled-failure set verified this: statuses of
+      # `[error, success]` give a latest state of `:error` with the flag true. That is a
+      # two-phase deploy whose smoke test failed, and it is also what a rollback job writes
+      # onto the original record. The flag is scoped to the case it was introduced for.
+      for state <- [:failure, :error] do
+        result =
+          judge(deployments: [deployment(state: state, succeeded?: true, contains: true)])
+
+        assert %Result{decision: :failed, reasons: reasons} = result
+        assert {:deploy_not_successful, state, @deployed, @merge} in reasons
+      end
+    end
+
     test "an INACTIVE deployment that once succeeded still shipped" do
       # GitHub writes `inactive` onto an earlier deployment the moment a newer one succeeds
       # (`auto_inactive`, on any environment not flagged `production_environment` — and the
@@ -231,6 +245,39 @@ defmodule Loopctl.Delivery.PostDeployVerificationJudgeTest do
     end
   end
 
+  describe "an INCOMPLETE page" do
+    test "does NOT stop a carrying success from verifying" do
+      # Refusing on incompleteness before judging containment discarded a definitive answer:
+      # a shipped story escalated on its first sweep naming the cap, and permanently, since
+      # `since` is pinned to the merge and deployments only accumulate.
+      result =
+        judge(
+          deployments:
+            page([deployment(contains: true)], {:too_many_deployments_since_merge, 9, 5})
+        )
+
+      assert %Result{decision: :verified, reasons: []} = result
+    end
+
+    test "escalates only in the ABSENCE of one, naming what was incomplete" do
+      reason = {:deployment_page_exhausted, 30, @merged_at}
+
+      result = judge(deployments: page([deployment(state: :success, contains: false)], reason))
+
+      assert %Result{decision: :failed, reasons: reasons} = result
+      assert {:deployments_incomplete, reason} in reasons
+    end
+
+    test "turns an in-flight WAIT into an escalation, because the wait may never end" do
+      reason = {:too_many_deployments_since_merge, 9, 5}
+
+      result = judge(deployments: page([deployment(state: :pending, contains: false)], reason))
+
+      assert %Result{decision: :failed, reasons: reasons} = result
+      assert {:deployments_incomplete, reason} in reasons
+    end
+  end
+
   describe "fails closed" do
     test "a story with no recorded merge_sha" do
       result = judge(merge_sha: nil, deployments: [])
@@ -281,6 +328,13 @@ defmodule Loopctl.Delivery.PostDeployVerificationJudgeTest do
       assert %Result{decision: :failed, reasons: reasons} = result
       assert {:deployments_unavailable, {:missing_fact, :yes}} in reasons
     end
+
+    test "a PAGE of an unexpected shape is a failure too" do
+      result = judge(deployments: {:ok, [%{id: 1}]})
+
+      assert %Result{decision: :failed, reasons: reasons} = result
+      assert {:deployments_unavailable, {:missing_fact, {:list, 1}}} in reasons
+    end
   end
 
   test "the transitions and the bounds are named by the module, not restated by callers" do
@@ -313,13 +367,18 @@ defmodule Loopctl.Delivery.PostDeployVerificationJudgeTest do
     })
   end
 
-  defp wrap(deployments) when is_list(deployments), do: {:ok, deployments}
+  defp wrap(deployments) when is_list(deployments),
+    do: {:ok, %{deployments: deployments, incomplete: nil}}
+
   defp wrap(other), do: other
 
   # `succeeded?` defaults from the state the way the adapter derives it — `success` now, or
   # anything that once was — and is set explicitly for the case that matters: an `:inactive`
   # deployment that DID ship, which is what GitHub leaves behind whenever a newer deploy
   # succeeds.
+  defp page(deployments, incomplete),
+    do: {:ok, %{deployments: deployments, incomplete: incomplete}}
+
   defp deployment(opts) do
     state = Keyword.get(opts, :state, :success)
 

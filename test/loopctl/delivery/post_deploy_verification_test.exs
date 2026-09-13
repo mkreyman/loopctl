@@ -73,15 +73,18 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
         assert %DateTime{} = since
 
         {:ok,
-         [
-           %{
-             id: 91,
-             sha: @merge,
-             state: :success,
-             succeeded?: true,
-             created_at: DateTime.utc_now()
-           }
-         ]}
+         %{
+           deployments: [
+             %{
+               id: 91,
+               sha: @merge,
+               state: :success,
+               succeeded?: true,
+               created_at: DateTime.utc_now()
+             }
+           ],
+           incomplete: nil
+         }}
       end)
 
       assert {:ok, %Result{decision: :verified} = result} = evaluate(ctx)
@@ -101,7 +104,7 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
 
       Mox.stub(MockPullRequestSource, :deployments_since, fn _repo, _env, since ->
         send(test, {:since, since})
-        {:ok, []}
+        {:ok, %{deployments: [], incomplete: nil}}
       end)
 
       assert {:ok, %Result{decision: :unresolved}} = evaluate(ctx)
@@ -109,6 +112,15 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
 
       slack = DateTime.diff(merged_at, since, :second)
       assert slack == PostDeployVerification.clock_tolerance_seconds()
+    end
+
+    test "the result's merged_at is the MERGE, not the tolerated query window", ctx do
+      # The tolerance belongs to the query. Folding it into the fact made every escalation
+      # reason and telemetry consumer read a time two minutes before the merge happened.
+      stub_deployments([])
+
+      assert {:ok, %Result{merged_at: merged_at}} = evaluate(ctx)
+      assert merged_at == merge_event_at(ctx)
     end
 
     test "the containment call is SKIPPED when the deployed commit is the merge itself", ctx do
@@ -447,6 +459,44 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
              "the consequence of a missing repository is not a second fault: #{inspect(reasons)}"
     end
 
+    test "an INCOMPLETE page does not stop a carrying success from verifying", ctx do
+      # Refusing on incompleteness before judging containment discarded a definitive answer:
+      # a shipped story escalated on its first sweep naming the cap, and permanently — since
+      # is pinned to the merge, so deployments only accumulate and it never verifies.
+      stub_deployments(
+        [
+          %{
+            id: 91,
+            sha: @merge,
+            state: :success,
+            succeeded?: true,
+            created_at: DateTime.utc_now()
+          }
+        ],
+        {:too_many_deployments_since_merge, 9, 5}
+      )
+
+      assert {:ok, %Result{decision: :verified}} = enforce(ctx)
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :verified
+    end
+
+    test "an INCOMPLETE page escalates only when nothing carries the merge", ctx do
+      reason = {:deployment_page_exhausted, 30, DateTime.utc_now()}
+      stub_deployments([], reason)
+
+      assert {:ok, %Result{decision: :failed, reasons: reasons}} = enforce(ctx)
+      assert {:deployments_incomplete, reason} in reasons
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :escalated
+    end
+
+    test "a deployment that reported success and THEN failed has NOT shipped", ctx do
+      stub_deployment(state: :error, succeeded?: true)
+
+      assert {:ok, %Result{decision: :failed, reasons: reasons}} = enforce(ctx)
+      assert {:deploy_not_successful, :error, @deployed, @merge} in reasons
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :escalated
+    end
+
     test "a repeated sweep does not verify twice", ctx do
       stub_deployment(sha: @merge)
 
@@ -510,15 +560,18 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
           end)
 
         {:ok,
-         [
-           %{
-             id: 91,
-             sha: @merge,
-             state: :success,
-             succeeded?: true,
-             created_at: DateTime.utc_now()
-           }
-         ]}
+         %{
+           deployments: [
+             %{
+               id: 91,
+               sha: @merge,
+               state: :success,
+               succeeded?: true,
+               created_at: DateTime.utc_now()
+             }
+           ],
+           incomplete: nil
+         }}
       end)
 
       assert {:ok, %Result{decision: :verified, reasons: reasons}} = enforce(ctx)
@@ -713,9 +766,9 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
     end)
   end
 
-  defp stub_deployments(deployments) do
+  defp stub_deployments(deployments, incomplete \\ nil) do
     Mox.stub(MockPullRequestSource, :deployments_since, fn _repo, _env, %DateTime{} ->
-      {:ok, deployments}
+      {:ok, %{deployments: deployments, incomplete: incomplete}}
     end)
   end
 

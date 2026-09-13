@@ -352,7 +352,9 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
         end
       end)
 
-      assert {:ok, [deployment]} = Source.deployments_since(@repo, "production", @since)
+      assert {:ok, %{deployments: [deployment], incomplete: nil}} =
+               Source.deployments_since(@repo, "production", @since)
+
       assert deployment.id == 501
       assert deployment.sha == @head
       assert deployment.state == :success
@@ -366,7 +368,9 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
       # reads it. The latest state and "did it ever ship" are different questions.
       stub(&deployment_route(&1, [%{"state" => "inactive"}, %{"state" => "success"}]))
 
-      assert {:ok, [deployment]} = Source.deployments_since(@repo, "production", @since)
+      assert {:ok, %{deployments: [deployment], incomplete: nil}} =
+               Source.deployments_since(@repo, "production", @since)
+
       assert deployment.state == :inactive
       assert deployment.succeeded?
     end
@@ -374,7 +378,9 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
     test "a deployment deactivated having NEVER succeeded is not marked as shipped" do
       stub(&deployment_route(&1, [%{"state" => "inactive"}, %{"state" => "in_progress"}]))
 
-      assert {:ok, [deployment]} = Source.deployments_since(@repo, "production", @since)
+      assert {:ok, %{deployments: [deployment], incomplete: nil}} =
+               Source.deployments_since(@repo, "production", @since)
+
       assert deployment.state == :inactive
       refute deployment.succeeded?
     end
@@ -389,10 +395,21 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
           %{"id" => i, "sha" => @head, "created_at" => "2026-09-13T12:05:00Z"}
         end
 
-      stub(fn conn -> json(conn, entries) end)
+      stub(fn conn ->
+        case conn.request_path do
+          "/repos/acme/widgets/deployments" -> json(conn, entries)
+          _statuses -> json(conn, [%{"state" => "success"}])
+        end
+      end)
 
-      assert {:error, {:deployment_page_exhausted, 30, @since}} =
+      # Incompleteness is DATA, not a refusal: the caller resolves containment over the
+      # newest records first, and a carrying success there is definitive whatever is hidden
+      # below. Refusing here discarded that answer and escalated a shipped story.
+      assert {:ok, %{deployments: deployments, incomplete: incomplete}} =
                Source.deployments_since(@repo, "production", @since)
+
+      assert incomplete == {:deployment_page_exhausted, 30, @since}
+      assert length(deployments) == 5
     end
 
     test "more survivors than it will resolve is refused, not truncated" do
@@ -402,10 +419,19 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
         end ++
           [%{"id" => 99, "sha" => @merge_base, "created_at" => "2026-09-13T10:00:00Z"}]
 
-      stub(fn conn -> json(conn, entries) end)
+      stub(fn conn ->
+        case conn.request_path do
+          "/repos/acme/widgets/deployments" -> json(conn, entries)
+          _statuses -> json(conn, [%{"state" => "success"}])
+        end
+      end)
 
-      assert {:error, {:too_many_deployments_since_merge, 6, 5}} =
+      assert {:ok, %{deployments: deployments, incomplete: incomplete}} =
                Source.deployments_since(@repo, "production", @since)
+
+      assert incomplete == {:too_many_deployments_since_merge, 6, 5}
+      # The NEWEST are the ones kept, so a carrying success among them still decides.
+      assert Enum.map(deployments, & &1.id) == [1, 2, 3, 4, 5]
     end
 
     test "STOPS at the first deployment older than `since`, and pays for no status call" do
@@ -425,7 +451,8 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
         end
       end)
 
-      assert {:ok, []} = Source.deployments_since(@repo, "production", @since)
+      assert {:ok, %{deployments: [], incomplete: nil}} =
+               Source.deployments_since(@repo, "production", @since)
     end
 
     test "keeps the newer ones and drops the rest at the first older one" do
@@ -445,7 +472,8 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
         end
       end)
 
-      assert {:ok, [%{id: 9}]} = Source.deployments_since(@repo, "production", @since)
+      assert {:ok, %{deployments: [%{id: 9}]}} =
+               Source.deployments_since(@repo, "production", @since)
     end
 
     test "an environment with no deployments is a FACT, not a failure" do
@@ -454,7 +482,8 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
       # has not started" belongs to neither.
       stub(fn conn -> json(conn, []) end)
 
-      assert {:ok, []} = Source.deployments_since(@repo, "staging", @since)
+      assert {:ok, %{deployments: [], incomplete: nil}} =
+               Source.deployments_since(@repo, "staging", @since)
     end
 
     for {state, mapped} <- [
@@ -468,7 +497,7 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
       test "a #{state} status maps to #{inspect(mapped)}" do
         stub(&deployment_route(&1, [%{"state" => unquote(state)}]))
 
-        assert {:ok, [%{state: unquote(mapped)}]} =
+        assert {:ok, %{deployments: [%{state: unquote(mapped)}]}} =
                  Source.deployments_since(@repo, "production", @since)
       end
     end
@@ -476,13 +505,32 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
     test "a deployment with NO status has not settled, which is not a failure" do
       stub(&deployment_route(&1, []))
 
-      assert {:ok, [%{state: :pending}]} = Source.deployments_since(@repo, "production", @since)
+      assert {:ok, %{deployments: [%{state: :pending}]}} =
+               Source.deployments_since(@repo, "production", @since)
     end
 
     test "a state this module does not map is refused, never approximated to success" do
       stub(&deployment_route(&1, [%{"state" => "abandoned"}]))
 
       assert {:error, {:unrecognised_deployment_state, "abandoned"}} =
+               Source.deployments_since(@repo, "production", @since)
+    end
+
+    test "a non-map STATUS element is refused, not raised through the sweep" do
+      # Reading a PAGE of statuses made this reachable: a proxy body or a partial response
+      # put a non-map in the list, `Access.fetch/2` raised a FunctionClauseError inside the
+      # scan, and that propagated out of the sweep — killing the run for every remaining
+      # candidate and burning an Oban attempt.
+      stub(&deployment_route(&1, [%{"state" => "success"}, "not a map"]))
+
+      assert {:error, {:unreadable_deployment_statuses, _shape}} =
+               Source.deployments_since(@repo, "production", @since)
+    end
+
+    test "a status element with no state is refused too" do
+      stub(&deployment_route(&1, [%{"state" => "success"}, %{"description" => "hi"}]))
+
+      assert {:error, {:unreadable_deployment_statuses, _shape}} =
                Source.deployments_since(@repo, "production", @since)
     end
 
@@ -510,7 +558,8 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
         json(conn, [])
       end)
 
-      assert {:ok, []} = Source.deployments_since(@repo, "production (fly)", @since)
+      assert {:ok, %{deployments: [], incomplete: nil}} =
+               Source.deployments_since(@repo, "production (fly)", @since)
     end
 
     test "an ampersand cannot smuggle a second query parameter" do
@@ -519,7 +568,8 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
         json(conn, [])
       end)
 
-      assert {:ok, []} = Source.deployments_since(@repo, "prod&per_page=100", @since)
+      assert {:ok, %{deployments: [], incomplete: nil}} =
+               Source.deployments_since(@repo, "prod&per_page=100", @since)
     end
 
     test "an empty name, a control character and a non-string are refused" do

@@ -42,10 +42,28 @@ defmodule Loopctl.Repo.Migrations.AddPostDeployUnresolvedToStoryStages do
            )
   end
 
+  # The rollback DESTROYS HISTORY, and it is gated on an operator saying so.
+  #
+  # The old event-name allow-list cannot come back while rows carry the new name, so the
+  # rollback has to delete them. But `story_stage_events` is the complete, append-only
+  # record of a story's stage row: the COLUMN this migration adds is rebuilt by the next
+  # sweep, and the EVENTS are not — rolling back and reapplying loses when each story
+  # stopped being verifiable, which is exactly what an operator investigating a stuck
+  # delivery would go looking for.
+  #
+  # So the deletion is opt-in. `POST_DEPLOY_ROLLBACK_DELETES_EVENTS=1` performs it; anything
+  # else refuses with a message naming what would go.
+  @opt_in "POST_DEPLOY_ROLLBACK_DELETES_EVENTS"
+
   def down do
-    # The rows the UP migration made legal go before the old allow-list comes back, or the
-    # rollback aborts on any database where the verifier has run once. The count they
-    # record is rebuilt by the next sweep.
+    unless System.get_env(@opt_in) == "1" do
+      raise """
+      Refusing to roll back: this would DELETE every `post_deploy_unresolved` row from       story_stage_events, which is the append-only record of when each story stopped being       verifiable. The column it also drops is rebuilt by the next sweep; those events are       not, and reapplying the migration does not bring them back.
+
+      Re-run with #{@opt_in}=1 to delete them and roll back.
+      """
+    end
+
     execute "DELETE FROM story_stage_events WHERE event = 'post_deploy_unresolved'"
 
     drop constraint(:story_stage_events, :story_stage_events_event)

@@ -192,15 +192,19 @@ defmodule Loopctl.Delivery.PostDeployVerification do
 
   @typedoc """
   Each deployment carries the containment answer alongside its own facts: `contains` is
-  `true` when the forge confirmed this deployment reaches the merge, `false` when it does
-  not, and `:not_asked` when the walk stopped before needing to ask.
+  `true` when the forge confirmed this deployment reaches the merge and `false` otherwise —
+  INCLUDING the ones the walk stopped before asking about, which it marks `false` rather
+  than leaving a third value. That is not a convenience: `decide_deployments/4` filters on
+  truthiness, so any third value would read as a CARRIER and turn a decidable verdict into
+  an indefinite wait or a false escalation.
   """
   @type judged_deployment :: %{
           id: integer(),
           sha: String.t(),
           state: atom(),
+          succeeded?: boolean(),
           created_at: DateTime.t(),
-          contains: boolean() | :not_asked
+          contains: boolean()
         }
 
   @type facts :: %{
@@ -208,7 +212,9 @@ defmodule Loopctl.Delivery.PostDeployVerification do
           required(:environment) => String.t(),
           required(:merge_sha) => String.t() | nil,
           required(:merged_at) => fact(DateTime.t()),
-          required(:deployments) => fact([judged_deployment()]) | :not_attempted
+          required(:deployments) =>
+            fact(%{deployments: [judged_deployment()], incomplete: term() | nil})
+            | :not_attempted
         }
 
   @type error :: :not_found | :no_stage | :wrong_stage
@@ -375,15 +381,48 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   # what reaches here is one that was deactivated having never shipped.
   @settled_failure [:failure, :error, :inactive]
 
+  # WHAT COUNTS AS SHIPPED, and the scope is the whole point.
+  #
+  # `succeeded?` alone is wrong: a deployment whose statuses are `[error, success]` — a
+  # two-phase deploy whose smoke test failed, and also what a rollback job writes onto the
+  # original record — reports `succeeded?` true with a latest state of `:error`, and reading
+  # the flag before `@settled_failure` VERIFIED it.
+  #
+  # The flag was introduced for exactly one case: GitHub writing `inactive` over a
+  # deployment that shipped, as soon as a newer one succeeds. So it is consulted only where
+  # that case lives — a latest state of `:inactive` — and `:failure` and `:error` still
+  # reach `@settled_failure` however the history began.
+  defp shipped?(%{state: :success}), do: true
+  defp shipped?(%{state: :inactive, succeeded?: succeeded?}), do: succeeded?
+  defp shipped?(_deployment), do: false
+
   # Everything the forge could say has been established by here. What is left is the
   # question, in the order a reader would ask it: do we know what had to ship, and does any
   # deployment that could have carried it say it did.
   defp decide(result, facts) do
     case Map.get(facts, :merge_sha) do
       nil -> failed(result, [:merge_sha_not_recorded])
-      merge_sha -> decide_deployments(result, facts, merge_sha, value(facts, :deployments))
+      merge_sha -> decide_page(result, facts, merge_sha, value(facts, :deployments))
     end
   end
+
+  # A carrying SUCCESS is definitive whatever the page could not show, so containment is
+  # judged FIRST and `incomplete` is only ever consulted in its absence. The other order
+  # discarded a definitive answer: a shipped story escalated on its first sweep naming the
+  # cap, and permanently, because `since` is pinned to the merge and deployments only
+  # accumulate.
+  defp decide_page(result, facts, merge_sha, %{deployments: deployments, incomplete: incomplete}) do
+    decided = decide_deployments(result, facts, merge_sha, deployments)
+
+    case {decided, incomplete} do
+      {%Result{decision: :verified}, _any} -> decided
+      {_undecided, nil} -> decided
+      {_undecided, reason} -> failed(decided, [{:deployments_incomplete, reason}])
+    end
+  end
+
+  defp decide_page(result, _facts, _merge_sha, other),
+    do: failed(result, [{:deployments_unavailable, {:missing_fact, shape(other)}}])
 
   # NO deployment created since the merge. The deploy job has not made its record yet, which
   # is the ORDINARY state of a story that reached `deployed` seconds ago: a queued workflow
@@ -407,7 +446,7 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   defp decide_deployments(result, _facts, merge_sha, deployments) do
     carrying = Enum.filter(deployments, & &1.contains)
 
-    case Enum.find(carrying, & &1.succeeded?) do
+    case Enum.find(carrying, &shipped?/1) do
       %{} = shipped -> verified(result, shipped)
       nil -> not_shipped(result, merge_sha, carrying, deployments)
     end
@@ -561,7 +600,7 @@ defmodule Loopctl.Delivery.PostDeployVerification do
     |> Enum.filter(&(&1.event == "transitioned" and &1.to_stage == "merged"))
     |> List.last()
     |> case do
-      %{inserted_at: at} -> {:ok, DateTime.add(at, -@clock_tolerance_seconds, :second)}
+      %{inserted_at: at} -> {:ok, at}
       nil -> {:error, :no_merge_event}
     end
   end
@@ -581,9 +620,21 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   # common early path the list is empty and there are none.
   defp deployments({:ok, repo}, environment, {:ok, merged_at}, merge_sha)
        when is_binary(merge_sha) do
-    case source().deployments_since(repo, environment, merged_at) do
-      {:ok, deployments} -> annotate(repo, merge_sha, deployments)
-      {:error, reason} -> {:error, reason}
+    # The tolerance is subtracted HERE, building the query, and nowhere else. Folding it
+    # into the fact made `Result.merged_at` two minutes earlier than the merge it documents,
+    # so every escalation reason and telemetry consumer read a time that never happened.
+    since = DateTime.add(merged_at, -@clock_tolerance_seconds, :second)
+
+    case source().deployments_since(repo, environment, since) do
+      {:ok, %{deployments: deployments} = page} ->
+        with {:ok, annotated} <- annotate(repo, merge_sha, deployments),
+             do: {:ok, %{page | deployments: annotated}}
+
+      {:ok, other} ->
+        {:error, {:unreadable_deployment_page, shape(other)}}
+
+      {:error, reason} ->
+        {:error, reason}
     end
   end
 
