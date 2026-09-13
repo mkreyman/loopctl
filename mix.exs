@@ -232,7 +232,15 @@ defmodule Loopctl.MixProject do
         # CI Retrieval Eval job instead — the only job that sets MIX_ENV=dev, and so the
         # only one where the task exists.
         "dialyzer",
-        "test"
+        # `--warnings-as-errors` here as well as in CI, and the local copy is the one that
+        # matters: it covers warnings from LOADING the test suite, and the one it exists
+        # for is "redefining module X (current version defined in memory)" — two test files
+        # with one module name, which the parallel compiler resolves EITHER as a hard
+        # CompileError OR as that warning plus a green suite that ran only one of the two
+        # files' tests. #824 shipped the second kind to master. Catching it at the commit
+        # hook means it never reaches CI. Measured zero load-time warnings when this was
+        # added. Bound to `Loopctl.CiWarningsAsErrorsTest`.
+        "test --warnings-as-errors"
       ]
     ]
   end

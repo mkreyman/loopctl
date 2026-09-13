@@ -1,5 +1,34 @@
 defmodule LoopctlWeb.FallbackControllerTest do
+  @moduledoc """
+  Every clause of `LoopctlWeb.FallbackController`.
+
+  **One module, and it has to be one.** #824 added a second file,
+  `test/loopctl_web/fallback_controller_test.exs`, defining this same module name — which
+  this file has held since #289. Its tests are the two catch-all describes at the bottom of
+  this file now, and the stray file is gone; `test/loopctl_web/controllers/` is where a
+  controller test goes here.
+
+  **What that duplicate actually did, because it is worth recognising again.** Elixir's
+  parallel compiler has two outcomes for one module name in two files, and WHICH ONE you
+  get is a race decided by how the test files interleave across compile workers:
+
+  - both in flight at once — `cannot define module ... because it is currently being
+    defined`, a hard CompileError. Deterministic when those are the only two files loaded
+    (measured 8/8 locally, and still 8/8 under `ELIXIR_ERL_OPTIONS="+S 1"`).
+  - one finishing before the other starts — `warning: redefining module ... (current
+    version defined in memory)`, and the suite goes GREEN having run only one of the two
+    files' tests.
+
+  So the green branch is the dangerous one: master's CI run for #824 emitted exactly that
+  warning and reported 9936 tests, 0 failures, while the same tree could not compile its
+  test suite locally. A duplicate module name does not reliably fail — it reliably makes
+  the suite lie about what it ran. `mix test --warnings-as-errors` is what turns that
+  warning into a failure.
+  """
+
   use LoopctlWeb.ConnCase, async: true
+
+  import ExUnit.CaptureLog
 
   setup :verify_on_exit!
 
@@ -505,6 +534,118 @@ defmodule LoopctlWeb.FallbackControllerTest do
     test "sqlstate/1 surfaces the numeric pg_code, never nil for Postgrex" do
       assert DBError.sqlstate(pg_error(:query_canceled, "57014")) == "57014"
       assert DBError.sqlstate(%DBConnection.ConnectionError{message: "x"}) == nil
+    end
+  end
+
+  # The last clause of `LoopctlWeb.FallbackController` (#824 round 1, finding 1).
+  #
+  # Every other clause is covered where its endpoint is, which is the right place: a mapping
+  # matters as the status a real request gets. The CATCH-ALL cannot be tested that way by
+  # construction — it only fires for an atom no clause names, so any endpoint test that
+  # reached it would be a test of the missing clause instead. It is called DIRECTLY here,
+  # which is why these two describes do not go through `call_fallback/2`.
+  #
+  # What it exists for: before it, an `{:error, atom}` with no clause raised
+  # `FunctionClauseError` inside the controller. That reached the client as a 500
+  # indistinguishable from a crash and reached the operator as a stack trace naming this
+  # module rather than the atom. #824 shipped four reachable atoms with no clause and
+  # nothing failed until a request hit one.
+  describe "the catch-all" do
+    test "answers 500 for an atom no clause names, and logs the atom", %{conn: conn} do
+      log =
+        capture_log(fn ->
+          conn = FallbackController.call(conn, {:error, :a_reason_no_clause_names})
+
+          assert %{"error" => error} = json_response(conn, 500)
+          assert error["code"] == "internal_error"
+
+          # The atom is a context's INTERNAL vocabulary, not a public error code: it goes to
+          # the log so an operator can add a clause, and never to the client, who cannot act
+          # on it and should not learn it.
+          refute error["message"] =~ "a_reason_no_clause_names"
+          refute error["code"] =~ "a_reason_no_clause_names"
+        end)
+
+      assert log =~ "no clause for :a_reason_no_clause_names"
+      assert log =~ "[error]"
+    end
+
+    test "does not swallow the shapes that have their own rendering", %{conn: conn} do
+      # It matches an ATOM only. A changeset, an `{:error, reason, message}` triple and the
+      # named atoms all keep their own status — which is what stops the catch-all from
+      # absorbing a new refusal shape that should have failed loudly.
+      changeset =
+        %Loopctl.WorkBreakdown.Story{}
+        |> Ecto.Changeset.change()
+        |> Ecto.Changeset.add_error(:title, "is required")
+
+      assert json_response(FallbackController.call(conn, {:error, changeset}), 422)
+
+      assert json_response(
+               FallbackController.call(build_conn(), {:error, :bad_request, "say why"}),
+               400
+             )
+
+      assert json_response(FallbackController.call(build_conn(), {:error, :not_found}), 404)
+      assert json_response(FallbackController.call(build_conn(), {:error, :forbidden}), 403)
+    end
+  end
+
+  describe "the delivery stage machine's vocabulary (#803)" do
+    test "the request faults render 422 with their own code" do
+      for {fault, status} <- [
+            {:reason_required, 422},
+            {:invalid_reason, 422},
+            {:invalid_event_data, 422},
+            {:invalid_effect, 422},
+            {:missing_required_effect, 422},
+            {:wrong_stage, 422},
+            {:effect_conflict, 422},
+            {:human_required, 422}
+          ] do
+        body = json_response(FallbackController.call(build_conn(), {:error, fault}), status)
+        assert body["error"]["code"] == Atom.to_string(fault)
+        assert body["error"]["message"] != ""
+      end
+    end
+
+    test "a bare invalid_transition is 409, distinct from the lifecycle's tagged one" do
+      bare =
+        json_response(FallbackController.call(build_conn(), {:error, :invalid_transition}), 409)
+
+      assert bare["error"]["code"] == "invalid_transition"
+
+      # The story lifecycle's carries the statuses it would have moved between; the stage
+      # machine's is bare because its table is a fixed triple. Both are 409 and they are
+      # different clauses — a regression that collapsed one into the other would lose the
+      # context the tagged one carries, which is the whole reason it has a shape of its own.
+      tagged =
+        json_response(
+          FallbackController.call(
+            build_conn(),
+            {:error,
+             {:invalid_transition,
+              %{
+                current_agent_status: :pending,
+                current_verified_status: :unverified,
+                attempted_action: "verify"
+              }}}
+          ),
+          409
+        )
+
+      assert tagged["error"]["message"] =~ "pending"
+      refute tagged == bare
+    end
+
+    test "audit_chain_append_failed is a 500, because nobody can retry their way out of it" do
+      body =
+        json_response(
+          FallbackController.call(build_conn(), {:error, :audit_chain_append_failed}),
+          500
+        )
+
+      assert body["error"]["code"] == "audit_chain_append_failed"
     end
   end
 end

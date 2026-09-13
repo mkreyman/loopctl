@@ -455,8 +455,17 @@ jobs:
       # No DATABASE_URL: config/runtime.exs reads it only under
       # `if config_env() == :prod`, so in MIX_ENV=test it was dead config that looked
       # like it selected the database. config/test.exs selects it, from MIX_TEST_PARTITION.
+      # `--warnings-as-errors` covers warnings from LOADING the test suite, and the one it
+      # is here for is "redefining module X (current version defined in memory)". Two test
+      # files with one module name have two outcomes under the parallel compiler, decided
+      # by whether they are in flight at once: a hard CompileError, or that warning plus a
+      # GREEN suite that ran only one of the two files' tests. #824 hit the second — this
+      # job reported 9936 tests, 0 failures on a tree that would not compile locally — so
+      # the failure mode is not a red build, it is a suite that lies about what it ran.
+      # Measured zero load-time warnings when this was added, warm and on a forced rebuild.
+      # Bound to `Loopctl.CiWarningsAsErrorsTest`.
       - name: Run tests
-        run: mix test
+        run: mix test --warnings-as-errors
 
       # The cross-context journeys (test/e2e/*) are @moduletag :e2e and excluded
       # from the default `mix test` above (keeps it fast). Run them here in the
@@ -464,7 +473,7 @@ jobs:
       # `needs: [test]`) — otherwise the regression net never fires in CI.
       # `--only e2e` overrides the default exclude and won't pull :scale/:pgbouncer.
       - name: Run e2e journey tests
-        run: mix test --only e2e
+        run: mix test --only e2e --warnings-as-errors
         env:
           DATABASE_URL: ecto://postgres:postgres@localhost/loopctl_test
 

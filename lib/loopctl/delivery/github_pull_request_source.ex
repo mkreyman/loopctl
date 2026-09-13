@@ -11,6 +11,19 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
 
   and one `GET /repos/:repo/git/trees/:ref?recursive=1` per `repo_files/2` call.
 
+  Post-deploy verification (#803 §9) adds three more, each bounded the same way:
+
+  4. `GET /repos/:repo/deployments?environment=:env&per_page=…` — a small page
+     (`@deployment_page`) of the environment's newest deployments, each `sha` the commit the
+     DEPLOYING JOB recorded. Never a workflow run's `head_sha`: a `workflow_run` deploy ships the
+     triggering run's commit while the API attributes the run to the branch head at creation
+     time, so the two diverge whenever two merges land minutes apart
+  5. `GET /repos/:repo/deployments/:id/statuses?per_page=1` — one per deployment that
+     SURVIVES the `since` filter, and none at all on the common early sweep where the deploy
+     has not been created yet
+  6. `GET /repos/:repo/compare/:sha...:ref` — whether a commit is reachable from another,
+     which is what makes a story merged BEHIND the deployed head still count as shipped
+
   ## Slow connections, and the ceiling a caller sees
 
   Every request carries a 2s connect timeout and a 5s receive timeout, and `retry: false`
@@ -72,6 +85,35 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
 
   @repo_name ~r{\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z}
   @ref ~r{\A[A-Za-z0-9_./-]+\z}
+  @control ~r/[\x00-\x1f\x7f]/
+
+  # How many of an environment's newest deployments one call reads, BEFORE the `since`
+  # filter. Deep enough that reaching a record older than the merge is the ordinary outcome:
+  # the forge applies this size first, so a page whose oldest record is still newer than
+  # `since` is one that may be HIDING the deployment that carries the merge, and that is
+  # refused rather than reported as a short list (a short list there is indistinguishable
+  # from "nothing carries it" and ends in a confident false escalation).
+  #
+  # The list call is one request whatever this is; the cost is in the SURVIVORS, each of
+  # which needs a status request and then a containment request from the verifier. So the
+  # page is generous and the survivor count is what is capped.
+  @deployment_page 30
+
+  # How many deployments since the merge this will resolve states for. Past it the answer is
+  # a refusal, not a truncated list, for the same reason as above.
+  #
+  # Five bounds the worst case at 11 requests for one story — one list, five statuses, and
+  # the verifier's five containment calls — which at the 2s/5s timeouts is the ~77s the
+  # sweep's wall-clock budget is sized against. More than five deployments landing on one
+  # environment inside a story's verification window is an environment nobody can judge a
+  # single merge against from here, and a human should look.
+  @max_deployments_since 5
+
+  # Statuses read per deployment. More than one because `state` (the latest) and
+  # `succeeded?` (did `success` EVER appear) are different questions, and it is the second
+  # that says whether the commit shipped — GitHub writes `inactive` over a perfectly good
+  # deployment as soon as a newer one succeeds. Same request either way.
+  @status_page 20
 
   @impl true
   def pull_request(repo, number) when is_integer(number) and number > 0 do
@@ -92,6 +134,198 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
       tree(body, ref)
     end
   end
+
+  @impl true
+  def deployments_since(repo, environment, %DateTime{} = since) do
+    with {:ok, repo} <- repo_name(repo),
+         {:ok, environment} <- environment(environment),
+         path = "/deployments?environment=#{environment}&per_page=#{@deployment_page}",
+         {:ok, body} <- get(repo, path) do
+      deployments(repo, body, since)
+    end
+  end
+
+  def deployments_since(_repo, _environment, since), do: {:error, {:invalid_since, shape(since)}}
+
+  @doc "The most deployments since a merge this adapter will judge. See `@max_deployments_since`."
+  @spec max_deployments_since() :: pos_integer()
+  def max_deployments_since, do: @max_deployments_since
+
+  @impl true
+  def contains?(repo, sha, ref) do
+    with {:ok, repo} <- repo_name(repo),
+         {:ok, sha} <- ref(sha),
+         {:ok, ref} <- ref(ref),
+         {:ok, body} <- get(repo, "/compare/#{sha}...#{ref}") do
+      containment(body)
+    end
+  end
+
+  # GitHub lists deployments newest first. The `since` filter is applied BEFORE any status
+  # call, so the common early sweep — the deploy job has not created its record yet — costs
+  # exactly one request and returns `{:ok, []}`.
+  #
+  # An empty list is a FACT, not a failure. Calling it an error would put it in the
+  # transient/permanent classification, where "my deploy has not started" belongs to
+  # neither: it is not going to clear on a retry of a broken call, and it is not a contract
+  # change. The verifier waits on it, bounded by its own in-flight count.
+  defp deployments(repo, entries, since) when is_list(entries) do
+    entries
+    |> Enum.map(&deployment_record/1)
+    |> Enum.reduce_while({:ok, []}, &keep_since(&1, &2, since))
+    |> case do
+      {:ok, kept} -> kept |> Enum.reverse() |> bounded(entries, since, repo)
+      error -> error
+    end
+  end
+
+  defp deployments(_repo, body, _since), do: {:error, {:unreadable_deployments, shape(body)}}
+
+  # Two ways the answer can be INCOMPLETE, and neither is a refusal HERE.
+  #
+  # A page that never reached a record older than `since` may be hiding the deployment that
+  # carries the merge — the forge applied its page size before this filter did — and more
+  # survivors than this adapter resolves states for is the same problem one layer along.
+  #
+  # Refusing on either at THIS point discarded a definitive answer. The verifier resolves
+  # containment over the NEWEST records, and a carrying success there settles the verdict
+  # whatever is hidden below it; refusing first meant a shipped story escalated on its first
+  # sweep, naming the cap rather than anything about the story — and permanently, because
+  # `since` is pinned to the merge so deployments only accumulate. A delayed sweep (a
+  # backlog at `deployed`, a worker restart, a run of forge faults) hit it every time.
+  #
+  # So incompleteness travels as a FACT beside the newest records, and only the ABSENCE of a
+  # carrying success lets the verifier turn it into an escalation.
+  defp bounded(kept, entries, since, repo) do
+    # Truncation FIRST: when the page is full it is the more accurate diagnosis, and a full
+    # page is also over the survivor cap, so the other test would mask it.
+    incomplete =
+      cond do
+        truncated?(kept, entries) -> {:deployment_page_exhausted, @deployment_page, since}
+        length(kept) > @max_deployments_since -> too_many(kept)
+        true -> nil
+      end
+
+    with {:ok, resolved} <- kept |> Enum.take(@max_deployments_since) |> resolve_states(repo) do
+      {:ok, %{deployments: resolved, incomplete: incomplete}}
+    end
+  end
+
+  defp too_many(kept),
+    do: {:too_many_deployments_since_merge, length(kept), @max_deployments_since}
+
+  # The page was FULL and every record on it survived the filter, so there may be more.
+  # A page that reached an older record, or a short page, is the whole truth.
+  defp truncated?(kept, entries),
+    do: length(entries) >= @deployment_page and length(kept) == length(entries)
+
+  # The list is newest first, so the FIRST record older than `since` ends it: nothing below
+  # it can be newer, and every one of them would cost a status call to learn nothing.
+  defp keep_since({:error, _reason} = error, _acc, _since), do: {:halt, error}
+
+  defp keep_since({:ok, %{created_at: created_at} = record}, {:ok, acc}, since) do
+    if DateTime.compare(created_at, since) == :lt,
+      do: {:halt, {:ok, acc}},
+      else: {:cont, {:ok, [record | acc]}}
+  end
+
+  defp deployment_record(%{"id" => id, "sha" => sha, "created_at" => created_at})
+       when is_integer(id) and is_binary(sha) and is_binary(created_at) do
+    case DateTime.from_iso8601(created_at) do
+      {:ok, at, _offset} -> {:ok, %{id: id, sha: sha, created_at: at}}
+      {:error, reason} -> {:error, {:unreadable_deployment_created_at, reason}}
+    end
+  end
+
+  defp deployment_record(entry), do: {:error, {:unreadable_deployments, shape(entry)}}
+
+  defp resolve_states(records, repo) do
+    Enum.reduce_while(records, {:ok, []}, fn record, {:ok, acc} ->
+      case deployment_state(repo, record.id) do
+        {:ok, facts} -> {:cont, {:ok, [Map.merge(record, facts) | acc]}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, resolved} -> {:ok, Enum.reverse(resolved)}
+      error -> error
+    end
+  end
+
+  # TWO facts from one request, because they answer different questions.
+  #
+  # `state` is the LATEST status. A deployment with none yet has not settled, which is the
+  # same answer to a verifier as `queued`/`pending`/`in_progress`: ask again. An
+  # unrecognised state is NOT approximated — a state we have not thought about is not
+  # evidence that a deploy succeeded.
+  #
+  # `succeeded?` is whether `success` appears anywhere in the history. That is the one that
+  # says the commit SHIPPED: GitHub writes `inactive` over an earlier deployment as soon as
+  # a newer one succeeds, so a deployment that shipped is routinely `inactive` by the time
+  # a sweep reads it, and judging on `state` alone escalated those.
+  defp deployment_state(repo, id) do
+    case get(repo, "/deployments/#{id}/statuses?per_page=#{@status_page}") do
+      {:ok, []} -> {:ok, %{state: :pending, succeeded?: false}}
+      {:ok, [_ | _] = statuses} -> deployment_facts(statuses)
+      {:ok, body} -> {:error, {:unreadable_deployment_statuses, shape(body)}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  # EVERY element is validated, not just the head. Reading a PAGE of statuses is what made
+  # this reachable: a non-map element (a proxy body, a partial response) reached
+  # `Access.fetch/2` inside the scan and raised a `FunctionClauseError`, which propagates out
+  # of the sweep, kills the run for every remaining candidate and burns an Oban attempt.
+  defp deployment_facts([%{"state" => latest} | _rest] = statuses) when is_binary(latest) do
+    if Enum.all?(statuses, &match?(%{"state" => s} when is_binary(s), &1)) do
+      with {:ok, state} <- map_state(latest) do
+        {:ok, %{state: state, succeeded?: Enum.any?(statuses, &(&1["state"] == "success"))}}
+      end
+    else
+      {:error, {:unreadable_deployment_statuses, shape(statuses)}}
+    end
+  end
+
+  defp deployment_facts(statuses),
+    do: {:error, {:unreadable_deployment_statuses, shape(statuses)}}
+
+  defp map_state("success"), do: {:ok, :success}
+  defp map_state("failure"), do: {:ok, :failure}
+  defp map_state("error"), do: {:ok, :error}
+  defp map_state("inactive"), do: {:ok, :inactive}
+  defp map_state(state) when state in ~w(queued pending in_progress), do: {:ok, :pending}
+  defp map_state(state), do: {:error, {:unrecognised_deployment_state, printable(state)}}
+
+  # `status` describes the HEAD relative to the BASE, and the call is
+  # `compare/<sha>...<ref>` — so `identical` is the same commit and `ahead` means `ref` is
+  # ahead of `sha`, i.e. `sha` is an ancestor of it. `behind` and `diverged` both mean the
+  # commit is NOT in what `ref` names.
+  defp containment(%{"status" => status}) when status in ~w(identical ahead), do: {:ok, true}
+  defp containment(%{"status" => status}) when status in ~w(behind diverged), do: {:ok, false}
+
+  defp containment(%{"status" => status}) when is_binary(status),
+    do: {:error, {:unrecognised_compare_status, printable(status)}}
+
+  defp containment(body), do: {:error, {:unreadable_compare, shape(body)}}
+
+  # An environment name goes in a QUERY PARAMETER, so it is ENCODED, not pattern-matched.
+  #
+  # It was validated against `@ref` and that was wrong in the direction that costs the most:
+  # GitHub environment names legally contain spaces (and much else), so a repository whose
+  # environment is called "production (fly)" made every waiting story escalate on a
+  # PERMANENT `invalid_environment` — an operator setting a correct value and being told it
+  # is malformed. `URI.encode_www_form/1` handles `&`, `?`, `#`, spaces and the rest, so
+  # nothing here can add a parameter of its own or address another resource.
+  #
+  # What is still refused is what encoding cannot make safe: a NUL or a control character,
+  # which is not a name anyone configured on purpose, and anything that is not a string.
+  defp environment(name) when is_binary(name) do
+    if String.valid?(name) and name != "" and not Regex.match?(@control, name),
+      do: {:ok, URI.encode_www_form(name)},
+      else: {:error, {:invalid_environment, printable(name)}}
+  end
+
+  defp environment(name), do: {:error, {:invalid_environment, shape(name)}}
 
   # A MERGED pull request is answered without reading its diff or its merge base: the
   # outward effect has already happened, so there is nothing left to gate, and the caller's

@@ -2087,21 +2087,32 @@ defmodule Loopctl.Fixtures do
   # walking the machine there. `:repo` picks the sandbox connection the story lives on:
   # `Loopctl.Repo` (default, with `fixture(:stage_story)`) or `Loopctl.AdminRepo` (with
   # `fixture(:story)`, for the claim reclaimer, which runs on AdminRepo).
+  #
+  # `:merged_at` (a DateTime) additionally writes the `transitioned -> merged` stage EVENT
+  # the machine would have written on the way. Post-deploy verification reads it to learn
+  # when the merge was recorded — a deployment created before that cannot carry it — so a
+  # row placed at `deployed` by hand needs the event too, or the verifier correctly fails
+  # closed on a story whose history does not say when it merged.
   def fixture(:story_stage, attrs) do
     attrs = Enum.into(attrs, %{})
     repo = Map.get(attrs, :repo, Loopctl.Repo)
     tenant_id = Map.fetch!(attrs, :tenant_id)
+    merged_at = Map.get(attrs, :merged_at)
 
     row =
       struct!(
         StoryStage,
         attrs
-        |> Map.drop([:repo])
+        |> Map.drop([:repo, :merged_at])
         |> Map.put_new(:stage, :detected)
         |> Map.put_new(:claim_epoch, 0)
       )
 
-    insert = fn -> repo.insert!(row) end
+    insert = fn ->
+      inserted = repo.insert!(row)
+      if merged_at, do: insert_merged_event(repo, inserted, merged_at)
+      inserted
+    end
 
     if repo == Loopctl.Repo do
       {:ok, row} = Loopctl.Repo.with_tenant(tenant_id, insert)
@@ -2568,6 +2579,26 @@ defmodule Loopctl.Fixtures do
 
   defp ensure_scope_entity(attrs, _unknown, _tenant_id) do
     {Ecto.UUID.generate(), attrs}
+  end
+
+  defp insert_merged_event(repo, %StoryStage{} = row, merged_at) do
+    repo.insert_all(Loopctl.Delivery.StageEvent, [
+      %{
+        id: Ecto.UUID.generate(),
+        tenant_id: row.tenant_id,
+        story_stage_id: row.id,
+        story_id: row.story_id,
+        event: "transitioned",
+        from_stage: "ci",
+        to_stage: "merged",
+        edge: "forward",
+        claim_epoch: row.claim_epoch,
+        lock_version: row.lock_version,
+        actor_label: "fixture",
+        data: %{},
+        inserted_at: merged_at
+      }
+    ])
   end
 
   @doc "Deletes every tenant `fixture(:committed_runner | :committed_tenant)` committed."

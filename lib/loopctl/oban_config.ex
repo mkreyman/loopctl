@@ -625,6 +625,17 @@ defmodule Loopctl.ObanConfig do
            # Every minute: a leaked slot refuses admissions for the whole tenant. Bounded per
            # run. Keep in sync with the crontab assertion in oban_plugins_config_test.exs.
            {"* * * * *", Loopctl.Workers.HealRunnerCapacityWorker},
+           # #803 §9: decides verified-or-escalated for stories waiting at `deployed`. The
+           # session has already ended there, so nothing else will ask. Every two minutes
+           # rather than every minute: the deploy it waits on takes minutes, so a tighter
+           # cadence buys latency nobody perceives and spends an hourly rate limit doing it.
+           # A candidate costs two or three bounded GitHub calls in the ordinary case and up
+           # to ELEVEN at the adapter's own bound (one deployment list, five statuses, five
+           # containment calls) — 110 requests for a full batch, which is also where the
+           # worker's ~77s-per-candidate worst case and its wall-clock budget come from.
+           # Bounded per run. Keep in sync with the crontab assertion in
+           # oban_plugins_config_test.exs.
+           {"*/2 * * * *", Loopctl.Workers.PostDeployVerificationWorker},
            {"* * * * *", Loopctl.Workers.SystemConfigRefreshWorker},
            # US-41.1 (review): the STANDING embedding-side-table reconciliation pass —
            # sweeps the dual-write crash window (legacy row without its dim-1536 mirror)

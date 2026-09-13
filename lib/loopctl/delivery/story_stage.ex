@@ -15,6 +15,11 @@ defmodule Loopctl.Delivery.StoryStage do
     evaluations at one head that produced NO verdict because the forge was transiently
     unavailable (#803). The gate escalates once it passes its bound, so a fault that never
     clears cannot retry for ever with nobody told.
+  - `post_deploy_unresolved` — `%{"merge_sha" => sha, "count" => n}`, the same backstop for
+    post-deploy verification (#803 §9): consecutive sweeps at one merge that reached no
+    verdict, because the forge was transiently unavailable or the deploy had not settled.
+    MERGE-keyed rather than head-keyed, so it is cleared with `merge_sha`
+    (`Loopctl.Delivery.StageMachine.merge_keyed/0`) and not with the head.
   - `attempts` — how many times each failure edge has been taken, keyed by edge name.
   - `escalation_reason` — why the story last escalated (required while `escalated`).
   - `lock_version` — incremented by every write, so an observer can tell two reads of the
@@ -53,6 +58,7 @@ defmodule Loopctl.Delivery.StoryStage do
     field :release_id, :string
     field :merge_gate_allowed_sha, :string
     field :merge_gate_unevaluated, :map
+    field :post_deploy_unresolved, :map
     field :attempts, :map, default: %{}
     field :escalation_reason, :string
     field :lock_version, :integer, default: 0

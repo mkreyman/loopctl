@@ -15,6 +15,7 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
   @repo "acme/widgets"
   @head String.duplicate("a", 40)
   @merge_base String.duplicate("b", 40)
+  @since ~U[2026-09-13 12:00:00Z]
 
   setup do
     Req.Test.set_req_test_from_context(%{async: true})
@@ -333,9 +334,320 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
     end
   end
 
+  describe "deployments_since/3 — the DEPLOYMENT, never a workflow run" do
+    test "reads a page of the environment's deployments and each one's latest state" do
+      # Design §9: the deployment's own `sha` is what the deploying job recorded. The
+      # workflow run's head is what GitHub ATTRIBUTED, and the two diverge whenever two
+      # merges land minutes apart.
+      stub(fn conn ->
+        case {conn.request_path, conn.query_string} do
+          {"/repos/acme/widgets/deployments", "environment=production&per_page=30"} ->
+            json(conn, [%{"id" => 501, "sha" => @head, "created_at" => "2026-09-13T12:05:00Z"}])
+
+          {"/repos/acme/widgets/deployments/501/statuses", "per_page=20"} ->
+            json(conn, [%{"state" => "success"}])
+
+          other ->
+            flunk("unexpected request: #{inspect(other)}")
+        end
+      end)
+
+      assert {:ok, %{deployments: [deployment], incomplete: nil}} =
+               Source.deployments_since(@repo, "production", @since)
+
+      assert deployment.id == 501
+      assert deployment.sha == @head
+      assert deployment.state == :success
+      assert deployment.succeeded?
+      assert deployment.created_at == ~U[2026-09-13 12:05:00Z]
+    end
+
+    test "succeeded? reads the status HISTORY, so an auto-inactivated deploy still shipped" do
+      # GitHub writes `inactive` onto an earlier deployment as soon as a newer one succeeds,
+      # so a deployment that shipped perfectly well is routinely `inactive` when a sweep
+      # reads it. The latest state and "did it ever ship" are different questions.
+      stub(&deployment_route(&1, [%{"state" => "inactive"}, %{"state" => "success"}]))
+
+      assert {:ok, %{deployments: [deployment], incomplete: nil}} =
+               Source.deployments_since(@repo, "production", @since)
+
+      assert deployment.state == :inactive
+      assert deployment.succeeded?
+    end
+
+    test "a deployment deactivated having NEVER succeeded is not marked as shipped" do
+      stub(&deployment_route(&1, [%{"state" => "inactive"}, %{"state" => "in_progress"}]))
+
+      assert {:ok, %{deployments: [deployment], incomplete: nil}} =
+               Source.deployments_since(@repo, "production", @since)
+
+      assert deployment.state == :inactive
+      refute deployment.succeeded?
+    end
+
+    test "a FULL page whose oldest record is still newer than `since` is REFUSED" do
+      # The forge applies its page size BEFORE this filter, so a full page that never
+      # reached an older record may be hiding the deployment that carries the merge — and a
+      # short list there is indistinguishable from "nothing carries it", which ends in a
+      # confident false escalation at the long bound.
+      entries =
+        for i <- 1..30 do
+          %{"id" => i, "sha" => @head, "created_at" => "2026-09-13T12:05:00Z"}
+        end
+
+      stub(fn conn ->
+        case conn.request_path do
+          "/repos/acme/widgets/deployments" -> json(conn, entries)
+          _statuses -> json(conn, [%{"state" => "success"}])
+        end
+      end)
+
+      # Incompleteness is DATA, not a refusal: the caller resolves containment over the
+      # newest records first, and a carrying success there is definitive whatever is hidden
+      # below. Refusing here discarded that answer and escalated a shipped story.
+      assert {:ok, %{deployments: deployments, incomplete: incomplete}} =
+               Source.deployments_since(@repo, "production", @since)
+
+      assert incomplete == {:deployment_page_exhausted, 30, @since}
+      assert length(deployments) == 5
+    end
+
+    test "more survivors than it will resolve is refused, not truncated" do
+      entries =
+        for i <- 1..6 do
+          %{"id" => i, "sha" => @head, "created_at" => "2026-09-13T12:05:00Z"}
+        end ++
+          [%{"id" => 99, "sha" => @merge_base, "created_at" => "2026-09-13T10:00:00Z"}]
+
+      stub(fn conn ->
+        case conn.request_path do
+          "/repos/acme/widgets/deployments" -> json(conn, entries)
+          _statuses -> json(conn, [%{"state" => "success"}])
+        end
+      end)
+
+      assert {:ok, %{deployments: deployments, incomplete: incomplete}} =
+               Source.deployments_since(@repo, "production", @since)
+
+      assert incomplete == {:too_many_deployments_since_merge, 6, 5}
+      # The NEWEST are the ones kept, so a carrying success among them still decides.
+      assert Enum.map(deployments, & &1.id) == [1, 2, 3, 4, 5]
+    end
+
+    test "STOPS at the first deployment older than `since`, and pays for no status call" do
+      # This is the whole point of the filter: a deployment created before the merge cannot
+      # carry it, and on the common early sweep there is nothing to resolve at all — one
+      # request, no status calls.
+      stub(fn conn ->
+        case conn.request_path do
+          "/repos/acme/widgets/deployments" ->
+            json(conn, [
+              %{"id" => 9, "sha" => @head, "created_at" => "2026-09-13T11:00:00Z"},
+              %{"id" => 8, "sha" => @merge_base, "created_at" => "2026-09-13T10:00:00Z"}
+            ])
+
+          other ->
+            flunk("must not resolve the state of a deployment that predates the merge: #{other}")
+        end
+      end)
+
+      assert {:ok, %{deployments: [], incomplete: nil}} =
+               Source.deployments_since(@repo, "production", @since)
+    end
+
+    test "keeps the newer ones and drops the rest at the first older one" do
+      stub(fn conn ->
+        case conn.request_path do
+          "/repos/acme/widgets/deployments" ->
+            json(conn, [
+              %{"id" => 9, "sha" => @head, "created_at" => "2026-09-13T12:30:00Z"},
+              %{"id" => 8, "sha" => @merge_base, "created_at" => "2026-09-13T11:00:00Z"}
+            ])
+
+          "/repos/acme/widgets/deployments/9/statuses" ->
+            json(conn, [%{"state" => "success"}])
+
+          other ->
+            flunk("unexpected request path: #{other}")
+        end
+      end)
+
+      assert {:ok, %{deployments: [%{id: 9}]}} =
+               Source.deployments_since(@repo, "production", @since)
+    end
+
+    test "an environment with no deployments is a FACT, not a failure" do
+      # The verifier waits on it — the deploy job has not created its record — and calling
+      # it an error would put it in the transient/permanent classification, where "my deploy
+      # has not started" belongs to neither.
+      stub(fn conn -> json(conn, []) end)
+
+      assert {:ok, %{deployments: [], incomplete: nil}} =
+               Source.deployments_since(@repo, "staging", @since)
+    end
+
+    for {state, mapped} <- [
+          {"failure", :failure},
+          {"error", :error},
+          {"inactive", :inactive},
+          {"queued", :pending},
+          {"pending", :pending},
+          {"in_progress", :pending}
+        ] do
+      test "a #{state} status maps to #{inspect(mapped)}" do
+        stub(&deployment_route(&1, [%{"state" => unquote(state)}]))
+
+        assert {:ok, %{deployments: [%{state: unquote(mapped)}]}} =
+                 Source.deployments_since(@repo, "production", @since)
+      end
+    end
+
+    test "a deployment with NO status has not settled, which is not a failure" do
+      stub(&deployment_route(&1, []))
+
+      assert {:ok, %{deployments: [%{state: :pending}]}} =
+               Source.deployments_since(@repo, "production", @since)
+    end
+
+    test "a state this module does not map is refused, never approximated to success" do
+      stub(&deployment_route(&1, [%{"state" => "abandoned"}]))
+
+      assert {:error, {:unrecognised_deployment_state, "abandoned"}} =
+               Source.deployments_since(@repo, "production", @since)
+    end
+
+    test "a non-map STATUS element is refused, not raised through the sweep" do
+      # Reading a PAGE of statuses made this reachable: a proxy body or a partial response
+      # put a non-map in the list, `Access.fetch/2` raised a FunctionClauseError inside the
+      # scan, and that propagated out of the sweep — killing the run for every remaining
+      # candidate and burning an Oban attempt.
+      stub(&deployment_route(&1, [%{"state" => "success"}, "not a map"]))
+
+      assert {:error, {:unreadable_deployment_statuses, _shape}} =
+               Source.deployments_since(@repo, "production", @since)
+    end
+
+    test "a status element with no state is refused too" do
+      stub(&deployment_route(&1, [%{"state" => "success"}, %{"description" => "hi"}]))
+
+      assert {:error, {:unreadable_deployment_statuses, _shape}} =
+               Source.deployments_since(@repo, "production", @since)
+    end
+
+    test "a deployment list this module cannot read is refused" do
+      stub(fn conn -> json(conn, %{"message" => "Not Found"}) end)
+
+      assert {:error, {:unreadable_deployments, {:map, ["message"]}}} =
+               Source.deployments_since(@repo, "production", @since)
+    end
+
+    test "a timestamp that will not parse is refused rather than assumed" do
+      stub(fn conn ->
+        json(conn, [%{"id" => 1, "sha" => @head, "created_at" => "the other day"}])
+      end)
+
+      assert {:error, {:unreadable_deployment_created_at, _reason}} =
+               Source.deployments_since(@repo, "production", @since)
+    end
+
+    test "an environment name with SPACES is legal and is ENCODED, not refused" do
+      # GitHub environment names allow spaces. Pattern-matching them against the ref shape
+      # made a correct configured value a PERMANENT fault that escalated every waiting story.
+      stub(fn conn ->
+        assert conn.query_string == "environment=production+%28fly%29&per_page=30"
+        json(conn, [])
+      end)
+
+      assert {:ok, %{deployments: [], incomplete: nil}} =
+               Source.deployments_since(@repo, "production (fly)", @since)
+    end
+
+    test "an ampersand cannot smuggle a second query parameter" do
+      stub(fn conn ->
+        assert conn.query_string == "environment=prod%26per_page%3D100&per_page=30"
+        json(conn, [])
+      end)
+
+      assert {:ok, %{deployments: [], incomplete: nil}} =
+               Source.deployments_since(@repo, "prod&per_page=100", @since)
+    end
+
+    test "an empty name, a control character and a non-string are refused" do
+      stub(fn conn -> flunk("must not reach the forge: #{conn.request_path}") end)
+
+      assert {:error, {:invalid_environment, ""}} = Source.deployments_since(@repo, "", @since)
+
+      assert {:error, {:invalid_environment, _}} =
+               Source.deployments_since(@repo, "prod\nstaging", @since)
+
+      assert {:error, {:invalid_environment, nil}} = Source.deployments_since(@repo, nil, @since)
+    end
+
+    test "a `since` that is not a DateTime is refused before the forge is reached" do
+      stub(fn conn -> flunk("must not reach the forge: #{conn.request_path}") end)
+
+      assert {:error, {:invalid_since, :unreadable}} =
+               Source.deployments_since(@repo, "production", "yesterday")
+    end
+  end
+
+  describe "contains?/3 — containment, which is why verification is not sha equality" do
+    for {status, contained} <- [
+          {"identical", true},
+          {"ahead", true},
+          {"behind", false},
+          {"diverged", false}
+        ] do
+      test "a #{status} comparison means contained=#{contained}" do
+        # `compare/<sha>...<ref>` describes the HEAD relative to the BASE, so `ahead` is
+        # `ref` ahead of `sha` — i.e. `sha` is an ancestor of it, and the merge shipped.
+        stub(fn conn ->
+          assert conn.request_path == "/repos/acme/widgets/compare/#{@head}...#{@merge_base}"
+          json(conn, %{"status" => unquote(status)})
+        end)
+
+        assert {:ok, unquote(contained)} = Source.contains?(@repo, @head, @merge_base)
+      end
+    end
+
+    test "a status this module does not recognise is refused" do
+      stub(fn conn -> json(conn, %{"status" => "sideways"}) end)
+
+      assert {:error, {:unrecognised_compare_status, "sideways"}} =
+               Source.contains?(@repo, @head, @merge_base)
+    end
+
+    test "a body with no status is refused, never read as containment" do
+      stub(fn conn -> json(conn, %{"commits" => []}) end)
+
+      assert {:error, {:unreadable_compare, {:map, ["commits"]}}} =
+               Source.contains?(@repo, @head, @merge_base)
+    end
+
+    test "both refs are validated: either one is spliced into the URL path" do
+      stub(fn conn -> flunk("must not reach the forge: #{conn.request_path}") end)
+
+      assert {:error, {:invalid_ref, "a?b"}} = Source.contains?(@repo, "a?b", @merge_base)
+      assert {:error, {:invalid_ref, "a#b"}} = Source.contains?(@repo, @head, "a#b")
+    end
+  end
+
   # -- helpers ---------------------------------------------------------------------------
 
   defp stub(fun), do: Req.Test.stub(Source, fun)
+
+  defp deployment_route(conn, statuses) do
+    case conn.request_path do
+      "/repos/acme/widgets/deployments" ->
+        json(conn, [%{"id" => 501, "sha" => @head, "created_at" => "2026-09-13T12:05:00Z"}])
+
+      "/repos/acme/widgets/deployments/501/statuses" ->
+        json(conn, statuses)
+
+      other ->
+        flunk("unexpected request path: #{other}")
+    end
+  end
 
   defp route(conn, opts) do
     case conn.request_path do
