@@ -1,6 +1,8 @@
 defmodule Loopctl.ApiSpec.RunnerContractTest do
   use ExUnit.Case, async: true
 
+  import Loopctl.Fixtures
+
   alias Loopctl.ApiSpec.RunnerContract
 
   @join %{
@@ -107,6 +109,69 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     test "refuses a non-object" do
       assert {:error, {:invalid, _}} = RunnerContract.cast_join("minis")
       assert {:error, {:invalid, _}} = RunnerContract.cast_join(nil)
+    end
+  end
+
+  describe "cast_dispatch/1" do
+    test "accepts a valid dispatch and returns declared fields only, with atom keys" do
+      payload = build(:runner_dispatch, %{"token_budget" => 200_000})
+
+      assert {:ok, dispatch} = RunnerContract.cast_dispatch(payload)
+      assert dispatch.kind == "implement"
+      assert dispatch.claim_epoch == 0
+      assert dispatch.token_budget == 200_000
+      refute Enum.any?(Map.keys(dispatch), &is_binary/1)
+    end
+
+    test "drops undeclared keys, including ones that look internal" do
+      payload =
+        build(:runner_dispatch, %{"tenant_id" => Ecto.UUID.generate(), "prompt" => "rm -rf ~"})
+
+      assert {:ok, dispatch} = RunnerContract.cast_dispatch(payload)
+
+      assert Map.keys(dispatch) |> Enum.sort() ==
+               Enum.sort([
+                 :base_branch,
+                 :branch,
+                 :claim_epoch,
+                 :dispatch_id,
+                 :kind,
+                 :max_turns,
+                 :repo,
+                 :story_id,
+                 :wall_clock_seconds
+               ])
+    end
+
+    test "refuses every missing required field" do
+      payload = build(:runner_dispatch)
+
+      for field <- Map.keys(payload) do
+        assert {:error, {:invalid, _}} = RunnerContract.cast_dispatch(Map.delete(payload, field)),
+               "expected missing #{field} to be refused"
+      end
+    end
+
+    test "refuses out-of-bound values" do
+      for {field, value} <- [
+            {"kind", "shell"},
+            {"repo", "not-a-repo"},
+            {"dispatch_id", "not-a-uuid"},
+            {"claim_epoch", -1},
+            {"wall_clock_seconds", 0},
+            {"max_turns", 0},
+            {"branch", ""},
+            {"token_budget", 0}
+          ] do
+        assert {:error, {:invalid, _}} =
+                 RunnerContract.cast_dispatch(Map.put(build(:runner_dispatch), field, value)),
+               "expected #{field}=#{inspect(value)} to be refused"
+      end
+    end
+
+    test "refuses a non-object" do
+      assert {:error, {:invalid, _}} = RunnerContract.cast_dispatch(nil)
+      assert {:error, {:invalid, _}} = RunnerContract.cast_dispatch([build(:runner_dispatch)])
     end
   end
 

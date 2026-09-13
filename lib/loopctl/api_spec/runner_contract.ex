@@ -4,7 +4,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   A runner is a dev machine that connects outbound over `LoopctlWeb.RunnerSocket`. This
   module is the ONE declaration of every message on that connection. The same schemas
-  VALIDATE inbound messages (`cast_join/1`, `cast_status/1`) and are EXPORTED as JSON
+  VALIDATE messages in both directions (`cast_join/1`, `cast_status/1` inbound,
+  `cast_dispatch/1` outbound) and are EXPORTED as JSON
   Schema to `priv/runner_contract/v<major>.json` (`mix loopctl.runner_contract`), which
   `mkreyman/loopctl-runner` vendors. A test fails when the checked-in export drifts from
   these declarations, so the file a runner builds against is always the file loopctl
@@ -24,7 +25,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   |---|---|---|
   | runner -> control | `phx_join` on `"runner:<runner_id>"` | `RunnerJoin` |
   | runner -> control | `"status"` | `RunnerStatus` |
-  | control -> runner | `"dispatch"` | `RunnerDispatch` (declared; emitted from #803) |
+  | control -> runner | `"dispatch"` | `RunnerDispatch` (pushed only by `Loopctl.Runners.dispatch/3`) |
   | runner -> control | trace upload | `RunnerTraceEvent` (declared; shipped from #803) |
 
   ## Versioning
@@ -270,6 +271,21 @@ defmodule Loopctl.ApiSpec.RunnerContract do
         empty when map_size(empty) == 0 -> {:error, {:invalid, ["no known status field"]}}
         known -> {:ok, known}
       end
+    end
+  end
+
+  @doc """
+  Validates an outbound `dispatch` payload before it is pushed to a runner. Returns the
+  declared fields only, with atom keys, or `{:error, {:invalid, messages}}`.
+
+  Outbound is validated too, because the runner refuses by default and a push it cannot
+  parse is a dispatch silently lost — and because nothing the contract does not declare
+  may reach a machine that executes the payload as its user.
+  """
+  @spec cast_dispatch(term()) :: {:ok, map()} | {:error, term()}
+  def cast_dispatch(payload) do
+    with {:ok, cast} <- cast(payload, RunnerDispatch.schema()) do
+      {:ok, known_fields(cast, RunnerDispatch.schema())}
     end
   end
 

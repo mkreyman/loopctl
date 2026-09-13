@@ -28,15 +28,19 @@ defmodule Loopctl.DeliveryGates.GateB do
       %{repo: "owner/repo",
         files: [String.t()],               # predicted touches at :triage; at :merge every
                                            # added, modified, deleted and renamed-to path
+                                           # (or DiffNames.merge_input/2's error marker)
         renames: [{old, new}],             # required at :merge (may be []), optional at :triage
         repo_files: [String.t()],          # the target repo's `git ls-files`
         diffstat: %{files: n, changed_lines: n},   # required at :merge, ignored at :triage
         agent_escalations: [term()]}       # optional
 
-  Derive `files` and `renames` together from `git diff --name-status -M -z base...head`
-  (or the REST `files[].previous_filename`), NOT from `gh pr diff --name-only`: that prints
-  only the new name of a rename, and its parser misreads a path containing " b/". Pass
-  unquoted paths (`-z` or `-c core.quotePath=false`); a quoted one escalates.
+  At `:merge`, build `files` and `renames` with `Loopctl.DeliveryGates.DiffNames`: `parse/1`
+  over the output of `git diff --name-status -M -z base...head`, then `merge_input/2`, which
+  turns a diff that did not parse into `files: {:error, {:unreadable_diff, reason}}` — a
+  `:human` result naming the reason. NOT `gh pr diff --name-only`: that prints only the new
+  name of a rename, and its parser misreads a path containing " b/". A caller building the
+  lists by other means (the REST `files[].previous_filename`) must pass unquoted paths; a
+  quoted one escalates.
 
   ## Agents may only ADD an escalation
 
@@ -228,6 +232,9 @@ defmodule Loopctl.DeliveryGates.GateB do
   end
 
   defp file_reasons([]), do: [:no_files]
+
+  # `DiffNames.merge_input/2` over a diff that did not parse.
+  defp file_reasons({:error, {:unreadable_diff, _reason} = reason}), do: [reason]
   defp file_reasons(_files), do: [:missing_files]
 
   defp human_path_reasons(repo_triggers, files) do

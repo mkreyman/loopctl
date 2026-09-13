@@ -58,6 +58,20 @@ if System.get_env("SECRETS_ADAPTER") == "local_file" do
   config :loopctl, :secrets_file, System.get_env("SECRETS_FILE") || "/data/loopctl/secrets.json"
 end
 
+# #803 prerequisite: Gate B's trigger document (the map of which paths skip human review,
+# kept out of the public source tree) and the SHA-256 the operator pinned for it. Copied
+# VERBATIM — no trim, no parse — because the checksum is over the exact bytes, and parsing
+# belongs to `Loopctl.DeliveryGates.Config.triggers/0`, which returns an error for an unset,
+# empty or mismatched pair rather than an empty trigger set. Unset in any environment means
+# every delivery-loop change escalates to a human; that is the intended fail-closed default.
+# Skipped under :test so the suite reads config/test.exs's synthetic pair and never a
+# developer's shell.
+if config_env() != :test do
+  config :loopctl, Loopctl.DeliveryGates.Config,
+    document: System.get_env("DELIVERY_GATES_CONFIG"),
+    sha256: System.get_env("DELIVERY_GATES_CONFIG_SHA256")
+end
+
 # #492: per-deployment Postgres text-search config (regconfig) for keyword FTS. UNSET
 # is "english" — byte-for-byte unchanged for the hosted instance. A non-English
 # self-host sets FTS_REGCONFIG (e.g. "russian", "simple") so the STORED search_vectors

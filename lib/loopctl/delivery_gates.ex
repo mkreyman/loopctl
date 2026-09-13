@@ -30,12 +30,15 @@ defmodule Loopctl.DeliveryGates do
   At triage, over the trio's predicted touches, to decide whether to dispatch. Again as a
   merge precondition, over the real diff from `git diff --name-status -M -z base...head` —
   every added, modified and DELETED path, plus both names of every rename — and the real
-  diffstat. Never `gh pr diff --name-only`: it prints only a rename's new name. Nothing binds an
+  diffstat. `Loopctl.DeliveryGates.DiffNames` is how that input is built: `parse/1` over the
+  command's output, then `merge_input/2`, under which a diff that does not parse escalates.
+  Never `gh pr diff --name-only`: it prints only a rename's new name. Nothing binds an
   implementing session to its story's prediction, so only the second run gates a merge.
 
   ## Fail closed
 
-  Gate B's trigger data is configuration, never source (`parse_triggers/2`). A missing,
+  Gate B's trigger data is configuration, never source (`parse_triggers/2`), loaded from the
+  environment by `Loopctl.DeliveryGates.Config.triggers/0`. A missing,
   empty, misparsed or checksum-mismatched document is an error, never an empty trigger set,
   and every gate evaluation handed anything but a valid parse escalates unconditionally,
   naming why. So do an unknown repository, a configured pattern that no longer matches any
@@ -49,6 +52,8 @@ defmodule Loopctl.DeliveryGates do
   is that any one agent escalating, contradicting, or disagreeing is enough.
   """
 
+  alias Loopctl.DeliveryGates.Config
+  alias Loopctl.DeliveryGates.DiffNames
   alias Loopctl.DeliveryGates.GateA
   alias Loopctl.DeliveryGates.GateB
   alias Loopctl.DeliveryGates.Triggers
@@ -64,6 +69,15 @@ defmodule Loopctl.DeliveryGates do
 
   @doc "See `Loopctl.DeliveryGates.GateB.evaluate/3`."
   defdelegate gate_b(phase, input, triggers), to: GateB, as: :evaluate
+
+  @doc "See `Loopctl.DeliveryGates.Config.triggers/0`."
+  defdelegate load_triggers(), to: Config, as: :triggers
+
+  @doc "See `Loopctl.DeliveryGates.DiffNames.parse/1`."
+  defdelegate parse_diff_names(output), to: DiffNames, as: :parse
+
+  @doc "See `Loopctl.DeliveryGates.DiffNames.merge_input/2`."
+  defdelegate merge_input(parsed, input), to: DiffNames
 
   @doc "See `Loopctl.DeliveryGates.GateB.judge_proof/4`."
   defdelegate judge_proof(intent, fixture_set, fixture_results, coverage), to: GateB

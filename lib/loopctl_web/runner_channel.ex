@@ -23,6 +23,16 @@ defmodule LoopctlWeb.RunnerChannel do
     key revoked through `DELETE /api/v1/api_keys/:id`, an expired key and a suspended
     tenant. That is the upper bound on how long such a revocation takes to bite.
 
+  ## Dispatch
+
+  The channel subscribes to `Runners.dispatch_topic/1` at join and pushes each dispatch
+  addressed to it as the `"dispatch"` event on its own topic. `Runners.dispatch/3` is the only
+  sender and has already validated the payload and refused a halted tenant, an unauthorized
+  runner and a runner not in the pool. The channel re-reads the custody halt immediately
+  before the push anyway, and drops the dispatch when it is set: that is the read nearest the
+  push, and it closes the window between the sender's check and delivery. A runner cannot
+  send `"dispatch"` itself; inbound it is an unknown event.
+
   ## Status
 
   `"status"` updates the runner's Presence meta (`RunnerStatus`). Updates closer
@@ -51,6 +61,7 @@ defmodule LoopctlWeb.RunnerChannel do
     # Subscribe BEFORE the authorization read: a revoke committing between the two is
     # then either seen by the read or delivered to this process, never lost.
     :ok = Phoenix.PubSub.subscribe(Loopctl.PubSub, Runners.revocation_topic(runner.id))
+    :ok = Phoenix.PubSub.subscribe(Loopctl.PubSub, Runners.dispatch_topic(runner.id))
 
     with :ok <- join_rate_ok(runner),
          :ok <- still_authorized(socket),
@@ -87,6 +98,24 @@ defmodule LoopctlWeb.RunnerChannel do
   end
 
   def handle_info(:runner_revoked, socket), do: disconnect(socket, :runner_revoked)
+
+  # The check nearest the push. `Runners.dispatch/3` refused a halted tenant already, but a
+  # halt can land between that read and this message, and a dispatch is custody progress.
+  # Re-read fresh, from THIS channel's own tenant, and drop the dispatch if halted.
+  def handle_info({:runner_dispatch, dispatch}, socket) do
+    %{runner: runner, tenant_id: tenant_id} = socket.assigns
+
+    if Runners.custody_halted?(tenant_id) do
+      Logger.warning(
+        "runner #{runner.id} dispatch #{dispatch.dispatch_id} dropped: tenant custody halted"
+      )
+
+      {:noreply, socket}
+    else
+      push(socket, "dispatch", dispatch)
+      {:noreply, socket}
+    end
+  end
 
   def handle_info(:recheck, socket) do
     %{runner: runner, tenant_id: tenant_id} = socket.assigns

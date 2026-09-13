@@ -34,18 +34,27 @@ defmodule Loopctl.Runners do
   must be reserved in Postgres when dispatch arrives (design §7). And it converges only
   across a CLUSTER — on a second, unclustered machine a runner tracked on node A is
   invisible on node B. `Loopctl.ClusterReadiness` warns when that happens.
+
+  ## Dispatch
+
+  `dispatch/3` is the one path by which a dispatch reaches a runner. It validates the
+  payload against the contract and refuses a halted tenant, an unauthorized runner and a
+  runner not in the pool before anything is sent; the channel re-reads the halt again right
+  before the push. Placement, capacity reservation and claiming are the caller's (#803).
   """
 
   import Ecto.Query
 
   alias Ecto.Multi
   alias Loopctl.AdminRepo
+  alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.AuditChain
   alias Loopctl.AuditChain.Entry, as: AuditEntry
   alias Loopctl.Auth
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Runners.Presence
   alias Loopctl.Runners.Runner
+  alias Loopctl.Tenants
   alias Loopctl.Tenants.Tenant
 
   @doc "The tenant-scoped Presence topic a runner is tracked under."
@@ -55,6 +64,14 @@ defmodule Loopctl.Runners do
   @doc "The PubSub topic a runner's live channel listens on for its own revocation."
   @spec revocation_topic(Ecto.UUID.t()) :: String.t()
   def revocation_topic(runner_id) when is_binary(runner_id), do: "runner_revocation:" <> runner_id
+
+  @doc """
+  The PubSub topic a runner's live channel listens on for dispatches addressed to it. Per
+  runner, like `revocation_topic/1`: the channel turns a message here into a push on its
+  own `runner:<runner_id>` topic, and no other process is subscribed.
+  """
+  @spec dispatch_topic(Ecto.UUID.t()) :: String.t()
+  def dispatch_topic(runner_id) when is_binary(runner_id), do: "runner_dispatch:" <> runner_id
 
   @doc """
   The joined runners of a tenant, as `Phoenix.Presence.list/1` returns them: a map of
@@ -271,6 +288,101 @@ defmodule Loopctl.Runners do
         where: e.tenant_id == ^tenant_id and e.action == "runner_revoked",
         where: e.entity_type == "runner" and e.entity_id == ^runner_id
     )
+  end
+
+  @doc """
+  Sends a dispatch to one connected runner. The ONLY path by which a dispatch reaches a
+  runner socket. It places nothing, reserves no capacity and claims no story — it is the
+  last hop, and it refuses, in this order:
+
+  1. `{:error, {:invalid, messages}}` — the payload does not match the contract's
+     `RunnerDispatch` (`RunnerContract.cast_dispatch/1`). Undeclared keys, at any depth, are
+     dropped rather than refused, and never sent.
+  2. `{:error, :tenant_halted}` — the tenant's custody operations are halted
+     (`Tenants.custody_halted?/1`), read fresh from the database on this call. A dispatch
+     starts an implementing session, which is custody progress, the thing a halt suspends.
+  3. `{:error, :not_authorized}` — `authorized?/2` is false: no such runner in THIS tenant,
+     a malformed id, or a row, key or tenant no longer valid. This is what keeps one tenant
+     from addressing another's runner by id.
+  4. `{:error, :runner_not_connected}` — the runner is not in the tenant's pool (`pool/1`).
+  5. `{:error, :runner_ambiguous}` — more than one live socket holds the runner's
+     credential. A dispatch is a prompt executed as the machine's user; with two sockets
+     there is no telling which is the enrolled machine, and both would receive it.
+
+  Then it broadcasts on `dispatch_topic/1`, and the runner's channel pushes the `"dispatch"`
+  event on the runner's own `runner:<runner_id>` topic, never a shared or tenant topic.
+
+  `:ok` means handed to the runner's channel, not executed: the channel re-reads the halt
+  immediately before the push (a halt landing between this check and that one drops the
+  dispatch there), and a channel that died in between receives nothing. Acknowledgement
+  belongs to the dispatch protocol (#803), which bumps `claim_epoch` on reclaim.
+  """
+  @spec dispatch(term(), term(), term()) ::
+          :ok
+          | {:error,
+             {:invalid, [String.t()]}
+             | :tenant_halted
+             | :not_authorized
+             | :runner_not_connected
+             | :runner_ambiguous}
+  def dispatch(tenant_id, runner_id, payload) do
+    with {:ok, dispatch} <- RunnerContract.cast_dispatch(payload),
+         {:ok, tenant_id, runner_id} <- cast_ids(tenant_id, runner_id),
+         :ok <- not_halted(tenant_id),
+         :ok <- runner_authorized(tenant_id, runner_id),
+         :ok <- single_live_socket(tenant_id, runner_id) do
+      Phoenix.PubSub.broadcast(
+        Loopctl.PubSub,
+        dispatch_topic(runner_id),
+        {:runner_dispatch, dispatch}
+      )
+    end
+  end
+
+  @doc """
+  Whether a tenant's custody operations are halted, read FRESH from the database — never
+  from a tenant struct loaded earlier. An unknown tenant is not halted; it has no runner
+  `authorized?/2` accepts, so a dispatch to it is refused at the next step.
+  """
+  @spec custody_halted?(Ecto.UUID.t()) :: boolean()
+  def custody_halted?(tenant_id) when is_binary(tenant_id) do
+    case Tenants.get_tenant(tenant_id) do
+      {:ok, tenant} -> Tenants.custody_halted?(tenant)
+      {:error, :not_found} -> false
+    end
+  end
+
+  # A malformed id addresses no runner. Cast before any read, which would raise on it.
+  defp cast_ids(tenant_id, runner_id) do
+    with {:ok, tenant_id} <- Ecto.UUID.cast(tenant_id),
+         {:ok, runner_id} <- Ecto.UUID.cast(runner_id) do
+      {:ok, tenant_id, runner_id}
+    else
+      :error -> {:error, :not_authorized}
+    end
+  end
+
+  defp not_halted(tenant_id) do
+    if custody_halted?(tenant_id), do: {:error, :tenant_halted}, else: :ok
+  end
+
+  defp runner_authorized(tenant_id, runner_id) do
+    if authorized?(tenant_id, runner_id), do: :ok, else: {:error, :not_authorized}
+  end
+
+  # The pool is keyed by machine name; the id is on each live socket's meta. Read from the
+  # TENANT's pool only, so a runner connected under another tenant is never found here.
+  defp single_live_socket(tenant_id, runner_id) do
+    metas =
+      for {_name, %{metas: metas}} <- pool(tenant_id),
+          %{runner_id: ^runner_id} = meta <- metas,
+          do: meta
+
+    case metas do
+      [] -> {:error, :runner_not_connected}
+      [_one] -> :ok
+      [_ | _] -> {:error, :runner_ambiguous}
+    end
   end
 
   @doc "Whether `api_key_id` is the credential of a runner (active or revoked)."

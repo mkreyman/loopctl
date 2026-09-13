@@ -176,6 +176,22 @@ during an incident with `fly secrets set … && fly apps restart` — no deploy.
 |----------------|---------|-------------|
 | `GITHUB_TOKEN` | -       | Bearer token for the CI status/test-result lookups that back independent story verification. Optional: unset, the calls go out unauthenticated, which works for PUBLIC repos until GitHub's 60-requests/hour/IP anonymous limit bites — after that verification reports a `github_api_error` rather than a real CI verdict. Required for a private repo, where unauthenticated lookups 404. Needs only read access to checks. A blank value is treated as unset (it is trimmed), so a templated-but-empty secret degrades to the anonymous path rather than sending an empty bearer that GitHub 401s |
 
+#### Agent delivery loop: Gate B triggers
+
+Gate B (`Loopctl.DeliveryGates`) decides from these which paths a delivery-loop change may
+merge through without a human. Set both as SECRETS, together, in one command — the document
+is a map of which paths skip human review and does not belong in `fly.toml` or the public
+source tree. `fly secrets set` accepts the multi-line JSON from a file with
+`DELIVERY_GATES_CONFIG="$(cat triggers.json)"`; compute the checksum over the SAME bytes
+(`sha256sum triggers.json`). The document shape is in the `Loopctl.DeliveryGates.Triggers`
+moduledoc. Inline only: Fly documents no per-secret size limit, and the binding ceiling is
+Linux's 128 KiB per environment string, against a few kilobytes per repository.
+
+| Variable                        | Default | Description |
+|---------------------------------|---------|-------------|
+| `DELIVERY_GATES_CONFIG`         | unset   | The Gate B trigger JSON document, inline. Read verbatim at call time (restart to apply; no deploy). **Unset, empty, not valid JSON, or not the documented shape: every delivery-loop change escalates to a human.** That is the intended fail-closed behaviour, never a silently empty trigger set, so a wrong value costs human confirmations rather than unguarded merges. A pattern that no longer matches any file in its repository escalates too, naming the pattern |
+| `DELIVERY_GATES_CONFIG_SHA256`  | unset   | Hex SHA-256 (64 characters, either case) of the EXACT bytes of `DELIVERY_GATES_CONFIG`. Verified before the document is decoded, so an unpinned edit is never interpreted. **Unset, malformed, or computed over different bytes (a trailing newline counts): every delivery-loop change escalates to a human**, by design. Update it in the same `fly secrets set` as the document, or the rolling restart runs a window with a mismatched pair |
+
 #### CLI client (`loopctl` command, not the server)
 
 Read by `Loopctl.CLI.Config` through an injected `&System.get_env/1`, so each overrides the
