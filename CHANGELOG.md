@@ -4,6 +4,32 @@ All notable changes to loopctl are documented here.
 
 ## [Unreleased] — 2026-08-21 — The provenance harvest runs on a cadence
 
+### Added
+
+- **Story claims get a lease, renewal, a reclaimer and an epoch fence (#803).** Migration
+  `20260913100000` adds `stories.claimed_until` (nullable) and `stories.claim_epoch` (integer, not
+  null, default 0), plus a partial index built `CONCURRENTLY`. The ADD COLUMNs are catalog-only and
+  rewrite no rows; the migration runs outside a DDL transaction for the concurrent index.
+
+  - `POST /api/v1/stories/:id/claim` (and bulk claim) now sets `claimed_until` to now plus the lease
+    and increments `claim_epoch`; both are returned on the story.
+  - **New endpoint** `POST /api/v1/stories/:id/renew-claim` (`exact_role: :agent`, human-anchored,
+    custody surface) with body `{"claim_epoch": <int>}`. Refusals: `400` missing or malformed
+    epoch, `422 not_claimed`, `409 stale_claim_epoch`, `409 not_claimant`.
+  - `POST /stories/:id/start` and `/report` accept an OPTIONAL `claim_epoch`; a stale one is
+    `409 stale_claim_epoch`, a malformed one `400`. Omitted, they behave exactly as before.
+  - New cron `ReclaimExpiredClaimsWorker` (every 5 minutes) releases a claim whose lease has run
+    out back to `pending`, bumps the epoch, stamps `lifecycle_entered_at`, writes a
+    `claim_lease_expired` audit entry and emits `story.force_unclaimed` with
+    `reason: "claim_lease_expired"`. Every other release (unclaim, force-unclaim, reject
+    auto-reset) now bumps the epoch too.
+  - New env var `STORY_CLAIM_LEASE_SECONDS` (default `86400`).
+
+  **Deploy note.** Claims that exist at deploy time have `claimed_until` NULL and are never
+  reclaimed — nothing renews them. They keep today's behaviour until released or renewed.
+  **A client that holds a claim longer than the lease must now renew it**, or its story is
+  released under it; the MCP server has no renew tool yet.
+
 ### Changed
 
 - **The usage-based importance prior is now ENABLED (#790).**

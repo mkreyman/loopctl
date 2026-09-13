@@ -341,6 +341,7 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
     {:post, "/api/v1/stories/:id/request-review"} => :agent,
     {:post, "/api/v1/stories/:id/report"} => :agent,
     {:post, "/api/v1/stories/:id/unclaim"} => :agent,
+    {:post, "/api/v1/stories/:id/renew-claim"} => :agent,
     {:post, "/api/v1/stories/:id/report-done"} => :agent,
     {:post, "/api/v1/stories/:id/start-work"} => :agent,
     {:post, "/api/v1/stories/:id/recover-cap"} => :agent,

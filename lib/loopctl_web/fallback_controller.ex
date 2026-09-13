@@ -24,6 +24,9 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :ambiguous_resolution}` -> 409 (a fuzzy identifier matched >1 active project)
   - `{:error, :must_contract_first}` -> 409 (claim before contracting)
   - `{:error, :must_claim_first}` -> 409 (start before claiming)
+  - `{:error, :stale_claim_epoch}` -> 409 (#803: the presented `claim_epoch` is not the story's current one — the caller's claim has ended)
+  - `{:error, :not_claimant}` -> 409 (#803: renew-claim by a caller that is not the story's assigned agent)
+  - `{:error, :not_claimed}` -> 422 (#803: renew-claim on a story that is not assigned or implementing)
   - `{:error, :self_verify_blocked}` -> 409 (same agent implemented and tries to verify)
   - `{:error, :self_report_blocked}` -> 409 (implementer tries to report their own work)
   - `{:error, :self_review_blocked}` -> 409 (implementer tries to review their own work)
@@ -231,6 +234,51 @@ defmodule LoopctlWeb.FallbackController do
           "Contract mismatch: expected ac_count #{expected} but got #{provided}. " <>
             "Story has #{expected} acceptance criteria.",
         context: %{expected_ac_count: expected, provided_ac_count: provided}
+      }
+    })
+  end
+
+  def call(conn, {:error, :stale_claim_epoch}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "stale_claim_epoch",
+        message:
+          "The claim_epoch you presented is not this story's current epoch, so the claim " <>
+            "it came from has ended — its lease expired and it was reclaimed, it was " <>
+            "released, or the story was claimed again. Stop working this claim; read the " <>
+            "story and claim it afresh if it is still available.",
+        remediation: %{learn_more: "https://loopctl.com/wiki/agent-pattern"}
+      }
+    })
+  end
+
+  def call(conn, {:error, :not_claimant}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "not_claimant",
+        message:
+          "Only the story's assigned agent can renew its claim, and your key's agent is " <>
+            "not it."
+      }
+    })
+  end
+
+  def call(conn, {:error, :not_claimed}) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        code: "not_claimed",
+        message:
+          "This story is not held by a claim (it is not assigned or implementing), so " <>
+            "there is no lease to renew. Claim it with POST /stories/:id/claim."
       }
     })
   end

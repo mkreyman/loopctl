@@ -176,6 +176,12 @@ during an incident with `fly secrets set … && fly apps restart` — no deploy.
 |----------------|---------|-------------|
 | `GITHUB_TOKEN` | -       | Bearer token for the CI status/test-result lookups that back independent story verification. Optional: unset, the calls go out unauthenticated, which works for PUBLIC repos until GitHub's 60-requests/hour/IP anonymous limit bites — after that verification reports a `github_api_error` rather than a real CI verdict. Required for a private repo, where unauthenticated lookups 404. Needs only read access to checks. A blank value is treated as unset (it is trimmed), so a templated-but-empty secret degrades to the anonymous path rather than sending an empty bearer that GitHub 401s |
 
+#### Story claim lease
+
+| Variable                    | Default | Description |
+|-----------------------------|---------|-------------|
+| `STORY_CLAIM_LEASE_SECONDS` | `86400` | How long a story claim lives without a renewal (`POST /api/v1/stories/:id/renew-claim`). Past it, `ReclaimExpiredClaimsWorker` (every 5 minutes) releases the story back to `pending` and bumps its `claim_epoch`. Positive integer seconds; unset, blank or malformed leaves the 24h default rather than failing boot. **Too SHORT releases stories agents are still working** — the duplicate-work race a claim exists to prevent, and it fires on long HEALTHY sessions, not on crashed ones. Too long only delays reopening a story whose session is already gone. Bias long, and have claimants renew well inside the window. Applies to leases granted or renewed after a restart; existing `claimed_until` values are not rewritten |
+
 #### Agent delivery loop: Gate B triggers
 
 Gate B (`Loopctl.DeliveryGates`) decides from these which paths a delivery-loop change may

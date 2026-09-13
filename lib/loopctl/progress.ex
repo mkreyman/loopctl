@@ -138,6 +138,14 @@ defmodule Loopctl.Progress do
   Transitions agent_status from `contracted` to `assigned`.
   Uses pessimistic locking (SELECT FOR UPDATE) to prevent race conditions.
 
+  The claim carries a LEASE and a FENCE (#803): `claimed_until` is set to now plus
+  `claim_lease_seconds/0`, and `claim_epoch` is incremented, both inside the same
+  transaction as the transition. The claimant keeps the claim by calling
+  `renew_claim/3` before the lease runs out; otherwise
+  `Loopctl.Workers.ReclaimExpiredClaimsWorker` releases it (`reclaim_expired_claim/3`).
+  The returned story carries both, and the claimant echoes `claim_epoch` on later
+  calls so a message from a claim that has since ended is refused.
+
   ## Parameters
 
   - `tenant_id` -- the tenant UUID
@@ -175,11 +183,15 @@ defmodule Loopctl.Progress do
         now = DateTime.utc_now()
         dispatch_id = Keyword.get(opts, :dispatch_id)
 
-        changes = %{
-          agent_status: :assigned,
-          assigned_agent_id: agent_id,
-          assigned_at: now
-        }
+        changes =
+          Map.merge(
+            %{
+              agent_status: :assigned,
+              assigned_agent_id: agent_id,
+              assigned_at: now
+            },
+            claim_lease_change(story, now)
+          )
 
         # US-26.2.2 AC-3: record implementer's dispatch at claim time
         changes =
@@ -221,7 +233,9 @@ defmodule Loopctl.Progress do
           new_state: %{
             "agent_status" => to_string(updated.agent_status),
             "assigned_agent_id" => agent_id,
-            "agent_id" => agent_id
+            "agent_id" => agent_id,
+            "claimed_until" => DateTime.to_iso8601(updated.claimed_until),
+            "claim_epoch" => updated.claim_epoch
           }
         }
       end)
@@ -741,6 +755,9 @@ defmodule Loopctl.Progress do
   - `{:error, :not_found}` if story not found in tenant
   - `{:error, :invalid_transition}` if not in assigned state
   - `{:error, :not_assigned_agent}` if calling agent is not the assigned agent
+  - `{:error, :stale_claim_epoch}` if `:claim_epoch` is given and is not the story's
+    current epoch — the caller's claim has ended (#803). Omitting it skips the check,
+    which is what every client written before the fence does.
   """
   @spec start_story(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, Story.t()} | {:error, atom() | {:invalid_transition, map()}}
@@ -757,7 +774,8 @@ defmodule Loopctl.Progress do
         lock_story(tenant_id, story_id)
       end)
       |> Multi.run(:validate, fn _repo, %{lock: story} ->
-        with :ok <- validate_transition_ctx(story, :implementing, "start"),
+        with :ok <- validate_optional_claim_epoch(story, Keyword.get(opts, :claim_epoch)),
+             :ok <- validate_transition_ctx(story, :implementing, "start"),
              :ok <- validate_assigned_agent(story, agent_id) do
           {:ok, story}
         end
@@ -913,6 +931,8 @@ defmodule Loopctl.Progress do
   - `{:error, :unresolvable_dispatch_lineage}` if the story's declared implementer
     dispatch cannot be resolved (e.g. a cross-tenant id) — a lineage-integrity
     failure that fails closed (LCP-1 §7.5)
+  - `{:error, :stale_claim_epoch}` if `:claim_epoch` is given and is not the story's
+    current epoch (#803); omitting it skips the check
   - `{:error, %Ecto.Changeset{}}` if artifact validation fails
   """
   @spec report_story(Ecto.UUID.t(), Ecto.UUID.t(), keyword(), map() | nil) ::
@@ -943,7 +963,8 @@ defmodule Loopctl.Progress do
         lock_story(tenant_id, story_id)
       end)
       |> Multi.run(:validate, fn _repo, %{lock: story} ->
-        with :ok <- validate_transition_ctx(story, :reported_done, "report"),
+        with :ok <- validate_optional_claim_epoch(story, Keyword.get(opts, :claim_epoch)),
+             :ok <- validate_transition_ctx(story, :reported_done, "report"),
              :ok <-
                validate_not_self_report(
                  story,
@@ -1151,18 +1172,7 @@ defmodule Loopctl.Progress do
       end)
       |> Multi.run(:story, fn _repo, %{lock: story} ->
         story
-        |> Ecto.Changeset.change(%{
-          agent_status: :pending,
-          assigned_agent_id: nil,
-          assigned_at: nil,
-          reported_done_at: nil,
-          reported_by_agent_id: nil,
-          # Durable record that this story WAS worked — the dispatch markers being
-          # cleared right here is exactly what backfill would otherwise read as
-          # "never dispatched". A COLUMN no changeset casts, so a PATCH cannot
-          # erase it. See guard_no_lifecycle_history/2.
-          lifecycle_entered_at: lifecycle_stamp(story)
-        })
+        |> Ecto.Changeset.change(release_claim_changes(story))
         |> AdminRepo.update()
       end)
       |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
@@ -1206,6 +1216,307 @@ defmodule Loopctl.Progress do
       {:error, :story, changeset, _} -> {:error, changeset}
     end
   end
+
+  # --- Claim lease and fence (#803) ---
+
+  # A claim held by a session that crashed after its UPDATE used to hold the story
+  # forever: nothing released it. The lease is the releaser's trigger and the epoch is
+  # what makes the release stick against a session that comes back.
+  #
+  # The default is LONG on purpose. A lease keyed on wall time fires on long HEALTHY
+  # work, not just on abandoned work, and the two errors are not symmetric: a lease
+  # too short releases a story an agent is still implementing (duplicate work — the
+  # thing a claim exists to prevent), while a lease too long only delays reopening a
+  # story whose session is already gone. KB 1531d275 measured the first on the
+  # coordination bus's handoff claims. A claimant renews well inside the window.
+  @default_claim_lease_seconds 86_400
+
+  # The statuses in which a story is HELD by its claimant. `reported_done` is not one:
+  # once reported, the work is in custody review and a lapsed lease must not reset it.
+  @claimed_statuses [:assigned, :implementing]
+
+  @doc """
+  The claim lease length in seconds: `:story_claim_lease_seconds`, set from
+  `STORY_CLAIM_LEASE_SECONDS`, default #{@default_claim_lease_seconds} (24 hours).
+  A value that is not a positive integer falls back to the default.
+  """
+  @spec claim_lease_seconds() :: pos_integer()
+  def claim_lease_seconds do
+    case Application.get_env(:loopctl, :story_claim_lease_seconds) do
+      seconds when is_integer(seconds) and seconds > 0 -> seconds
+      _ -> @default_claim_lease_seconds
+    end
+  end
+
+  @doc """
+  The lease-and-epoch change a CLAIM writes: a fresh lease from `now` and the next epoch.
+
+  Public because `Loopctl.BulkOperations.bulk_claim/4` claims too and must write the
+  identical change.
+  """
+  @spec claim_lease_change(Story.t(), DateTime.t()) :: map()
+  def claim_lease_change(%Story{claim_epoch: epoch}, %DateTime{} = now) do
+    %{
+      claimed_until: DateTime.add(now, claim_lease_seconds(), :second),
+      claim_epoch: epoch + 1
+    }
+  end
+
+  @doc """
+  The change every RELEASE writes: no lease, and the next epoch.
+
+  The bump is what fences the released claimant. Were a release to leave the epoch
+  alone, a session still holding it would pass `check_claim_epoch/3` on a story it no
+  longer holds, all the way until somebody claimed it again. Public because
+  `Loopctl.BulkOperations` releases too (bulk reject's auto-reset).
+  """
+  @spec claim_release_change(Story.t()) :: map()
+  def claim_release_change(%Story{claim_epoch: epoch}),
+    do: %{claimed_until: nil, claim_epoch: epoch + 1}
+
+  # The one release shape shared by unclaim, force-unclaim and the lease reclaimer.
+  defp release_claim_changes(story) do
+    Map.merge(
+      %{
+        agent_status: :pending,
+        assigned_agent_id: nil,
+        assigned_at: nil,
+        reported_done_at: nil,
+        reported_by_agent_id: nil,
+        # Durable record that this story WAS worked — the dispatch markers being
+        # cleared right here is exactly what backfill would otherwise read as
+        # "never dispatched". A COLUMN no changeset casts, so a PATCH cannot
+        # erase it. See guard_no_lifecycle_history/2.
+        lifecycle_entered_at: lifecycle_stamp(story)
+      },
+      claim_release_change(story)
+    )
+  end
+
+  @doc """
+  Renews the caller's claim: extends `claimed_until` to now plus `claim_lease_seconds/0`.
+
+  The new lease runs from NOW, not from the old `claimed_until`, so renewing often
+  cannot bank an unbounded lease. Renewing a claim made before leases existed (NULL
+  `claimed_until`) gives it one, and from then on the reclaimer can release it.
+
+  ## Options
+
+  - `:agent_id` -- the caller's agent (must be the story's assigned agent)
+  - `:claim_epoch` -- the epoch the caller was given by its claim
+  - `:actor_id`, `:actor_label` -- audit attribution
+
+  ## Returns
+
+  - `{:ok, %Story{}}` on success
+  - `{:error, :not_found}` if the story is not in the tenant
+  - `{:error, :not_claimed}` if the story is not `assigned` or `implementing`
+  - `{:error, :stale_claim_epoch}` if the presented epoch is not the current one —
+    the caller's claim ended (released, reclaimed, or claimed again)
+  - `{:error, :not_claimant}` if the caller is not the story's assigned agent
+  """
+  @spec renew_claim(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, Story.t()}
+          | {:error, :not_found | :not_claimed | :stale_claim_epoch | :not_claimant}
+          | {:error, Ecto.Changeset.t()}
+  def renew_claim(tenant_id, story_id, opts \\ []) do
+    agent_id = Keyword.get(opts, :agent_id)
+    epoch = Keyword.get(opts, :claim_epoch)
+
+    multi =
+      Multi.new()
+      |> Multi.run(:lock, fn _repo, _changes ->
+        lock_story(tenant_id, story_id)
+      end)
+      |> Multi.run(:validate, fn _repo, %{lock: story} ->
+        # Epoch before identity: a session whose claim ended learns THAT, which is the
+        # one fact it can act on, even when a peer now holds the story.
+        with :ok <- validate_claimed(story),
+             :ok <- validate_claim_epoch(story, epoch),
+             :ok <- validate_claimant(story, agent_id) do
+          {:ok, story}
+        end
+      end)
+      |> Multi.run(:story, fn _repo, %{lock: story} ->
+        story
+        |> Ecto.Changeset.change(%{
+          claimed_until: DateTime.add(DateTime.utc_now(), claim_lease_seconds(), :second)
+        })
+        |> AdminRepo.update()
+      end)
+      |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
+        %{
+          tenant_id: tenant_id,
+          entity_type: "story",
+          entity_id: updated.id,
+          action: "claim_renewed",
+          actor_type: "api_key",
+          actor_id: Keyword.get(opts, :actor_id),
+          actor_label: Keyword.get(opts, :actor_label),
+          old_state: %{"claimed_until" => iso8601_or_nil(old.claimed_until)},
+          new_state: %{
+            "claimed_until" => DateTime.to_iso8601(updated.claimed_until),
+            "claim_epoch" => updated.claim_epoch,
+            "agent_id" => agent_id
+          }
+        }
+      end)
+
+    case AdminRepo.transaction(multi) do
+      {:ok, %{story: updated}} -> {:ok, updated}
+      {:error, :lock, reason, _} -> {:error, reason}
+      {:error, :validate, reason, _} -> {:error, reason}
+      {:error, :story, changeset, _} -> {:error, changeset}
+    end
+  end
+
+  @doc """
+  The claim fence: `:ok` when `epoch` is the story's current `claim_epoch`.
+
+  For the runner channel (#803) to require on every runner-to-control message about a
+  story. Every claim and every release bumps the epoch, so equality means no release
+  has happened since the sender's claim — a session resurrected after its claim was
+  reclaimed (or released and re-claimed) presents an older epoch and is refused.
+
+  The epoch is a FENCE against a stale sender, not a credential: it is readable on the
+  story, and the identity checks on each operation still apply.
+  """
+  @spec check_claim_epoch(Ecto.UUID.t(), Ecto.UUID.t(), integer()) ::
+          :ok | {:error, :stale_claim_epoch | :not_found}
+  def check_claim_epoch(tenant_id, story_id, epoch) do
+    current =
+      from(s in Story,
+        where: s.id == ^story_id and s.tenant_id == ^tenant_id,
+        select: s.claim_epoch
+      )
+      |> AdminRepo.one()
+
+    case current do
+      nil -> {:error, :not_found}
+      ^epoch -> :ok
+      _other -> {:error, :stale_claim_epoch}
+    end
+  end
+
+  @doc """
+  Releases a claim whose lease has run out. Called by
+  `Loopctl.Workers.ReclaimExpiredClaimsWorker` with the `claim_epoch` it read.
+
+  Everything is re-checked under the story's row lock, so the sweep's read is only a
+  candidate list: a claim RENEWED since that read (its `claimed_until` moved into the
+  future), released or re-claimed (its epoch moved), or reported done (it left the
+  claimed statuses) is left alone with `{:error, :claim_not_expired}`. That also makes
+  two concurrent sweeps safe: the second one locks after the first commits, reads
+  `:pending`, and skips.
+
+  The release is force-unclaim's: back to `:pending`, assignment cleared,
+  `lifecycle_entered_at` stamped (so the backfill launder guard keeps refusing the
+  story), lease cleared and epoch bumped. Recorded as a `claim_lease_expired` audit
+  entry by the system actor, and announced as `story.force_unclaimed` with
+  `reason: "claim_lease_expired"`.
+
+  A story with NO lease (`claimed_until` NULL — claimed before leases existed, and
+  never renewed since) is never reclaimed: nothing renews those claims, so a lease
+  applied retroactively would release in-flight work.
+  """
+  @spec reclaim_expired_claim(Ecto.UUID.t(), Ecto.UUID.t(), non_neg_integer()) ::
+          {:ok, Story.t()} | {:error, :not_found | :claim_not_expired | Ecto.Changeset.t()}
+  def reclaim_expired_claim(tenant_id, story_id, expected_epoch) do
+    now = DateTime.utc_now()
+
+    multi =
+      Multi.new()
+      |> Multi.run(:lock, fn _repo, _changes ->
+        lock_story(tenant_id, story_id)
+      end)
+      |> Multi.run(:validate, fn _repo, %{lock: story} ->
+        if lease_expired?(story, expected_epoch, now),
+          do: {:ok, story},
+          else: {:error, :claim_not_expired}
+      end)
+      |> Multi.run(:story, fn _repo, %{lock: story} ->
+        story
+        |> Ecto.Changeset.change(release_claim_changes(story))
+        |> AdminRepo.update()
+      end)
+      |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
+        %{
+          tenant_id: tenant_id,
+          entity_type: "story",
+          entity_id: updated.id,
+          action: "claim_lease_expired",
+          actor_type: "system",
+          actor_id: nil,
+          actor_label: "worker:reclaim_expired_claims",
+          old_state: %{
+            "agent_status" => to_string(old.agent_status),
+            "assigned_agent_id" => old.assigned_agent_id,
+            "claimed_until" => iso8601_or_nil(old.claimed_until),
+            "claim_epoch" => old.claim_epoch
+          },
+          new_state: %{"agent_status" => "pending", "claim_epoch" => updated.claim_epoch}
+        }
+      end)
+      |> EventGenerator.generate_events(:webhook_events, fn %{story: updated, lock: old} ->
+        %{
+          tenant_id: tenant_id,
+          event_type: "story.force_unclaimed",
+          project_id: updated.project_id,
+          payload: %{
+            "event" => "story.force_unclaimed",
+            "reason" => "claim_lease_expired",
+            "story_id" => updated.id,
+            "project_id" => updated.project_id,
+            "epic_id" => updated.epic_id,
+            "old_status" => to_string(old.agent_status),
+            "new_status" => "pending",
+            "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
+          }
+        }
+      end)
+
+    case AdminRepo.transaction(multi) do
+      {:ok, %{story: updated}} -> {:ok, updated}
+      {:error, :lock, reason, _} -> {:error, reason}
+      {:error, :validate, reason, _} -> {:error, reason}
+      {:error, :story, changeset, _} -> {:error, changeset}
+    end
+  end
+
+  # Every clause is load-bearing and re-read under the lock: the status (a reported or
+  # released story is not a held claim), a lease that exists at all (NULL is never
+  # reclaimed), a lease still in the past (a renewal between the sweep's read and this
+  # lock moved it), and the epoch the sweep read (a release plus a re-claim in that
+  # window started a DIFFERENT claim, whose lease is not the one that expired).
+  defp lease_expired?(
+         %Story{agent_status: status, claimed_until: %DateTime{} = until, claim_epoch: epoch},
+         expected_epoch,
+         now
+       )
+       when status in @claimed_statuses do
+    epoch == expected_epoch and DateTime.compare(until, now) == :lt
+  end
+
+  defp lease_expired?(_story, _expected_epoch, _now), do: false
+
+  defp validate_claimed(%Story{agent_status: status}) when status in @claimed_statuses, do: :ok
+  defp validate_claimed(_story), do: {:error, :not_claimed}
+
+  defp validate_claim_epoch(%Story{claim_epoch: epoch}, epoch) when is_integer(epoch), do: :ok
+  defp validate_claim_epoch(_story, _presented), do: {:error, :stale_claim_epoch}
+
+  # start/report accept the epoch OPTIONALLY: absent, they behave exactly as they did
+  # before the fence, so existing MCP clients keep working. The delivery-loop runner
+  # path will send it on every call, and that path is where it becomes mandatory.
+  defp validate_optional_claim_epoch(_story, nil), do: :ok
+  defp validate_optional_claim_epoch(story, epoch), do: validate_claim_epoch(story, epoch)
+
+  defp validate_claimant(_story, nil), do: {:error, :not_claimant}
+  defp validate_claimant(%Story{assigned_agent_id: agent_id}, agent_id), do: :ok
+  defp validate_claimant(_story, _agent_id), do: {:error, :not_claimant}
+
+  defp iso8601_or_nil(nil), do: nil
+  defp iso8601_or_nil(%DateTime{} = at), do: DateTime.to_iso8601(at)
 
   # --- Review Records ---
 
@@ -2231,16 +2542,7 @@ defmodule Loopctl.Progress do
           retro_stamp_lifecycle(story)
         else
           story
-          |> Ecto.Changeset.change(%{
-            agent_status: :pending,
-            assigned_agent_id: nil,
-            assigned_at: nil,
-            reported_done_at: nil,
-            reported_by_agent_id: nil,
-            # See unclaim_story/3: the durable half of the anti-launder guard, stamped
-            # at the moment the erasable dispatch markers are erased.
-            lifecycle_entered_at: lifecycle_stamp(story)
-          })
+          |> Ecto.Changeset.change(release_claim_changes(story))
           |> AdminRepo.update()
         end
       end)
@@ -2714,16 +3016,16 @@ defmodule Loopctl.Progress do
         # The THIRD site that clears assigned_agent_id on a worked story. Only
         # `:story_rejected` in guard_backfillable/2 masks it today; stamp the durable
         # marker here too so the backfill guard never depends on that coincidence — but
-        # only when there was a marker to clear (see lifecycle_stamp_change/1).
-        Map.merge(
-          %{
-            agent_status: :pending,
-            assigned_agent_id: nil,
-            assigned_at: nil,
-            reported_done_at: nil
-          },
-          lifecycle_stamp_change(story)
-        )
+        # only when there was a marker to clear (see lifecycle_stamp_change/1). The
+        # epoch is bumped for the same reason every release bumps it (#803).
+        %{
+          agent_status: :pending,
+          assigned_agent_id: nil,
+          assigned_at: nil,
+          reported_done_at: nil
+        }
+        |> Map.merge(lifecycle_stamp_change(story))
+        |> Map.merge(claim_release_change(story))
       )
 
     with {:ok, reset_story} <- AdminRepo.update(changeset),

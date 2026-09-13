@@ -371,6 +371,7 @@ defmodule LoopctlWeb.Router do
     post "/stories/:id/request-review", StoryStatusController, :request_review
     post "/stories/:id/report", StoryStatusController, :report
     post "/stories/:id/unclaim", StoryStatusController, :unclaim
+    post "/stories/:id/renew-claim", StoryStatusController, :renew_claim
     # Discoverability aliases — same actions, alternate URL patterns agents tend to guess
     post "/stories/:id/report-done", StoryStatusController, :report
     post "/stories/:id/start-work", StoryStatusController, :start

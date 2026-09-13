@@ -158,5 +158,37 @@ defmodule Loopctl.Progress.ClaimLockTest do
     assert reloaded.agent_status == :assigned
     assert reloaded.assigned_agent_id == won.assigned_agent_id
     assert won.assigned_agent_id in [agent_a.id, agent_b.id]
+
+    # #803: the epoch is incremented ONCE — by the winner, under the lock. A loser that
+    # had also incremented would leave 2, and a claimant holding 1 would be fenced out of
+    # its own claim.
+    assert reloaded.claim_epoch == 1
+    assert won.claim_epoch == 1
+  end
+
+  test "concurrent reclaim of one expired lease: exactly one release, one epoch bump" do
+    %{tenant: tenant, story: story, agent_a: agent_a} = contracted_story_with_two_agents()
+    {:ok, claimed} = Progress.claim_story(tenant.id, story.id, agent_id: agent_a.id)
+
+    {1, _} =
+      from(s in Story, where: s.id == ^story.id)
+      |> AdminRepo.update_all(
+        set: [claimed_until: DateTime.add(DateTime.utc_now(), -60, :second)]
+      )
+
+    # Both sweeps read the same candidate (same epoch) before either locks — the shape
+    # two overlapping cron runs, or two nodes, produce.
+    reclaim = fn ->
+      Task.async(fn ->
+        :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+        Progress.reclaim_expired_claim(tenant.id, story.id, claimed.claim_epoch)
+      end)
+    end
+
+    results = [reclaim.(), reclaim.()] |> Enum.map(&Task.await(&1, 5_000))
+
+    assert Enum.count(results, &match?({:ok, %Story{agent_status: :pending}}, &1)) == 1
+    assert Enum.count(results, &match?({:error, :claim_not_expired}, &1)) == 1
+    assert AdminRepo.get!(Story, story.id).claim_epoch == claimed.claim_epoch + 1
   end
 end

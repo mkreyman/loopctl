@@ -53,6 +53,8 @@ defmodule Loopctl.WorkBreakdown.Story do
              :verifier_dispatch_id,
              :verifier_needed,
              :lifecycle_entered_at,
+             :claimed_until,
+             :claim_epoch,
              :inserted_at,
              :updated_at
            ]}
@@ -96,6 +98,16 @@ defmodule Loopctl.WorkBreakdown.Story do
     # `Progress` writes it, via `Ecto.Changeset.change/2` on the struct. Never add
     # it to a `cast` list.
     field :lifecycle_entered_at, :utc_datetime_usec
+
+    # #803: the claim's lease and its fence. `claimed_until` is when the claim may be
+    # released by `Loopctl.Workers.ReclaimExpiredClaimsWorker` (NULL = no lease, which
+    # the reclaimer ignores — every claim made before the lease existed). `claim_epoch`
+    # is bumped by every claim and every release, so a message carrying an older epoch
+    # is from a claim that has ended. Same rule as `lifecycle_entered_at`: only
+    # `Progress` writes them, never a `cast` list — a PATCH that could set the epoch
+    # could re-arm a zombie, and one that could set the lease could pin a claim forever.
+    field :claimed_until, :utc_datetime_usec
+    field :claim_epoch, :integer, default: 0
 
     # Issue #621: the capability minted by the lifecycle transition that returned
     # this struct — the credential the caller needs for its NEXT custody op

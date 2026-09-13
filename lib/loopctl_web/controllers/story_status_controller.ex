@@ -10,6 +10,7 @@ defmodule LoopctlWeb.StoryStatusController do
   - POST /stories/:id/report -- report done (implementing -> reported_done)
     (chain-of-custody: caller must be a DIFFERENT agent from the implementer)
   - POST /stories/:id/unclaim -- release story (any -> pending)
+  - POST /stories/:id/renew-claim -- extend the claim's lease (#803)
   """
 
   use LoopctlWeb, :controller
@@ -34,6 +35,12 @@ defmodule LoopctlWeb.StoryStatusController do
                    (is_tuple(reason) and tuple_size(reason) == 2 and
                       elem(reason, 0) == :cap_rejected)
 
+  # #803: refusals start/report forward unchanged. Folded into guards for the same
+  # complexity reason as the one above.
+  defguardp is_forwarded_start_error(reason)
+            when is_capability_error(reason) or
+                   reason in [:stale_claim_epoch, :must_contract_first, :must_claim_first]
+
   plug LoopctlWeb.Plugs.RequireRole,
        [exact_role: [:agent, :orchestrator]] when action in [:contract]
 
@@ -45,11 +52,31 @@ defmodule LoopctlWeb.StoryStatusController do
   plug LoopctlWeb.Plugs.RequireSignedClaim, [gate: "report"] when action in [:report]
 
   plug LoopctlWeb.Plugs.RequireRole,
-       [exact_role: :agent] when action in [:claim, :start, :request_review, :unclaim]
+       [exact_role: :agent]
+       when action in [:claim, :start, :request_review, :unclaim, :renew_claim]
 
   # US-26.7.1 — work-breakdown surface requires a human-anchored tenant.
   plug LoopctlWeb.Plugs.RequireHumanAnchor
-       when action in [:contract, :claim, :start, :report, :request_review, :unclaim]
+       when action in [
+              :contract,
+              :claim,
+              :start,
+              :report,
+              :request_review,
+              :unclaim,
+              :renew_claim
+            ]
+
+  # The request-body shape of `claim_epoch`, shared by start, report and renew-claim.
+  @claim_epoch_schema %OpenApiSpex.Schema{
+    type: :integer,
+    minimum: 0,
+    description:
+      "The `claim_epoch` the story's claim returned (#803). Optional on start and report: " <>
+        "absent, no fence check runs (every client written before the fence); present and " <>
+        "not the story's current epoch, the call is refused with 409 `stale_claim_epoch`. " <>
+        "The delivery-loop runner sends it on every call, and that path makes it mandatory."
+  }
 
   tags(["Progress"])
 
@@ -83,7 +110,12 @@ defmodule LoopctlWeb.StoryStatusController do
         "or a rotation whose new private half is not deployed yet — is 503 " <>
         "`capability_mint_failed` with `retry-after`; an audit key that is ABSENT or " <>
         "CORRUPT is 503 `capability_key_unavailable` with none, because only an operator " <>
-        "can clear it.",
+        "can clear it. The claim carries a LEASE and a FENCE: the returned story's " <>
+        "`claimed_until` is when the claim may be released if not renewed " <>
+        "(POST /stories/:id/renew-claim; default lease 24 hours, `STORY_CLAIM_LEASE_SECONDS`), " <>
+        "and `claim_epoch` is incremented by this claim and by every release. Keep the " <>
+        "epoch: renew-claim requires it, and start/report refuse a stale one with " <>
+        "409 `stale_claim_epoch`.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     responses: %{
       200 => {"Story claimed", "application/json", Schemas.StoryStatusResponse},
@@ -121,7 +153,8 @@ defmodule LoopctlWeb.StoryStatusController do
              description:
                "The start_cap `cap_id` issued to this caller's dispatch lineage. Accepted " <>
                  "as `cap_id` as well. Single-use, story-bound, lineage-bound, expiring."
-           }
+           },
+           claim_epoch: @claim_epoch_schema
          }
        }},
     responses: %{
@@ -130,7 +163,10 @@ defmodule LoopctlWeb.StoryStatusController do
         {"Not assigned agent, or missing/rejected capability", "application/json",
          Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      409 => {"Invalid transition", "application/json", Schemas.ErrorResponse},
+      400 =>
+        {"claim_epoch is not a non-negative integer", "application/json", Schemas.ErrorResponse},
+      409 =>
+        {"Invalid transition, or stale_claim_epoch", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
       503 =>
         {"The tenant's audit signing key is unavailable, so the capability could not be " <>
@@ -217,15 +253,19 @@ defmodule LoopctlWeb.StoryStatusController do
                  description: "Optional session identifier"
                }
              }
-           }
+           },
+           claim_epoch: @claim_epoch_schema
          }
        }},
     responses: %{
       200 => {"Story reported done", "application/json", Schemas.StoryStatusResponse},
       403 => {"Missing or rejected capability", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      400 =>
+        {"claim_epoch is not a non-negative integer", "application/json", Schemas.ErrorResponse},
       409 =>
-        {"Invalid transition or self-report blocked", "application/json", Schemas.ErrorResponse},
+        {"Invalid transition, self-report blocked, or stale_claim_epoch", "application/json",
+         Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -239,6 +279,38 @@ defmodule LoopctlWeb.StoryStatusController do
       403 => {"Not assigned agent", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 => {"Invalid transition", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  operation(:renew_claim,
+    summary: "Renew story claim",
+    description:
+      "The story's assigned agent extends its claim's lease: `claimed_until` becomes now " <>
+        "plus the lease length (default 24 hours, `STORY_CLAIM_LEASE_SECONDS`) — measured " <>
+        "from NOW, so renewing often never banks a longer lease. A claim not renewed " <>
+        "before `claimed_until` is released back to `pending` by the reclaimer, which " <>
+        "bumps `claim_epoch`. The caller must present the `claim_epoch` its claim returned. " <>
+        "Refusals: 400 when `claim_epoch` is missing or not a non-negative integer; " <>
+        "422 `not_claimed` when the story is not assigned or implementing; " <>
+        "409 `stale_claim_epoch` when the epoch is not current (the claim has ended — " <>
+        "stop working it); 409 `not_claimant` when the caller is not the assigned agent. " <>
+        "A claim made before leases existed has no `claimed_until` and is never reclaimed; " <>
+        "renewing it gives it a lease.",
+    parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
+    request_body:
+      {"Renew params", "application/json",
+       %OpenApiSpex.Schema{
+         type: :object,
+         required: [:claim_epoch],
+         properties: %{claim_epoch: @claim_epoch_schema}
+       }},
+    responses: %{
+      200 => {"Claim renewed", "application/json", Schemas.StoryStatusResponse},
+      400 => {"claim_epoch missing or malformed", "application/json", Schemas.ErrorResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      409 => {"stale_claim_epoch or not_claimant", "application/json", Schemas.ErrorResponse},
+      422 => {"not_claimed", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -351,6 +423,12 @@ defmodule LoopctlWeb.StoryStatusController do
       |> Keyword.merge(custody_identity(api_key))
       |> Keyword.put(:cap_id, capability_param(params))
 
+    with {:ok, opts} <- put_claim_epoch(opts, params) do
+      do_start(conn, tenant_id, story_id, opts)
+    end
+  end
+
+  defp do_start(conn, tenant_id, story_id, opts) do
     case Progress.start_story(tenant_id, story_id, opts) do
       {:ok, story} ->
         role = conn.assigns.current_api_key.role
@@ -363,15 +441,10 @@ defmodule LoopctlWeb.StoryStatusController do
       # or rejected token raised CaseClauseError and surfaced as a 500 instead of
       # the documented 403 — the failure mode was indistinguishable from a crash.
       # FallbackController already renders both (fallback_controller.ex:259, :272);
-      # they just have to reach it.
-      {:error, reason} when is_capability_error(reason) ->
+      # they just have to reach it. The #803 fence and the ordering refusals take
+      # the same single branch.
+      {:error, reason} when is_forwarded_start_error(reason) ->
         {:error, reason}
-
-      {:error, :must_contract_first} ->
-        {:error, :must_contract_first}
-
-      {:error, :must_claim_first} ->
-        {:error, :must_claim_first}
 
       {:error, {:invalid_transition, _ctx} = err} ->
         {:error, err}
@@ -422,10 +495,15 @@ defmodule LoopctlWeb.StoryStatusController do
     api_key = conn.assigns.current_api_key
     tenant_id = api_key.tenant_id
 
-    if is_nil(api_key.agent_id) do
-      {:error, :unprocessable_entity, "Agent ID required for chain-of-custody"}
-    else
-      do_report(conn, tenant_id, api_key, story_id, params)
+    cond do
+      is_nil(api_key.agent_id) ->
+        {:error, :unprocessable_entity, "Agent ID required for chain-of-custody"}
+
+      invalid_claim_epoch?(params) ->
+        claim_epoch_error()
+
+      true ->
+        do_report(conn, tenant_id, api_key, story_id, params)
     end
   end
 
@@ -447,6 +525,7 @@ defmodule LoopctlWeb.StoryStatusController do
       # still resolved server-side so the reporter's dispatch is recorded.
       |> Keyword.merge(custody_identity(api_key))
       |> maybe_add_token_usage(params)
+      |> Keyword.put(:claim_epoch, params["claim_epoch"])
 
     artifact_params = extract_artifact_params(params)
 
@@ -466,7 +545,9 @@ defmodule LoopctlWeb.StoryStatusController do
       when reason in [
              :self_report_blocked,
              :unresolvable_dispatch_lineage,
-             :missing_assigned_agent
+             :missing_assigned_agent,
+             # #803: the reporter presented an epoch from a claim that has ended.
+             :stale_claim_epoch
            ] ->
         {:error, reason}
 
@@ -517,7 +598,54 @@ defmodule LoopctlWeb.StoryStatusController do
     end
   end
 
+  @doc """
+  POST /api/v1/stories/:id/renew-claim
+
+  The assigned agent extends its claim's lease, presenting the claim_epoch its claim
+  returned (#803).
+  """
+  def renew_claim(conn, %{"id" => story_id} = params) do
+    api_key = conn.assigns.current_api_key
+
+    opts =
+      AuditContext.from_conn(conn)
+      |> Keyword.merge(agent_id: api_key.agent_id)
+
+    with {:ok, epoch} when is_integer(epoch) <- claim_epoch_param(params, :required),
+         {:ok, story} <-
+           Progress.renew_claim(
+             api_key.tenant_id,
+             story_id,
+             Keyword.put(opts, :claim_epoch, epoch)
+           ) do
+      json(conn, %{story: story, next_actions: StateMachine.next_actions(story, api_key.role)})
+    end
+  end
+
   # --- Private helpers ---
+
+  # `:optional` (start/report): absent is fine. `:required` (renew-claim): absent is a 400.
+  # A JSON integer only — a numeric string is refused rather than coerced, so a client
+  # never learns to send the epoch in a shape the runner channel will not accept.
+  defp claim_epoch_param(params, mode) do
+    case {Map.get(params, "claim_epoch"), mode} do
+      {nil, :optional} -> {:ok, nil}
+      {epoch, _mode} when is_integer(epoch) and epoch >= 0 -> {:ok, epoch}
+      _ -> claim_epoch_error()
+    end
+  end
+
+  defp invalid_claim_epoch?(params),
+    do: match?({:error, _, _}, claim_epoch_param(params, :optional))
+
+  defp put_claim_epoch(opts, params) do
+    with {:ok, epoch} <- claim_epoch_param(params, :optional) do
+      {:ok, Keyword.put(opts, :claim_epoch, epoch)}
+    end
+  end
+
+  defp claim_epoch_error,
+    do: {:error, :bad_request, "claim_epoch must be a non-negative integer"}
 
   defp extract_artifact_params(%{"artifact" => artifact}) when is_map(artifact) do
     %{
