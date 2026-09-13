@@ -29,9 +29,9 @@ defmodule Loopctl.Runners.Capacity do
 
   All of a tenant's runners share one Anthropic account, and the account's rate limit is
   what bites on parallel work, so the tenant's TOTAL in-flight sessions are capped as well
-  (`limit/0`). `admit/2` sums the active runners' `in_flight` under a transaction-scoped
-  advisory lock keyed on the tenant, so two admissions in one tenant serialize and the
-  second sees the first's reservation. Chosen over a per-tenant counter row with its own
+  (`limit/0`). `admit/2` sums the active runners' `in_flight` under the transaction-scoped
+  advisory lock keyed on the tenant that the caller takes FIRST (`lock_admission!/2`), so two
+  admissions in one tenant serialize and the second sees the first's reservation. Chosen over a per-tenant counter row with its own
   compare-and-set because that would be a SECOND counter of the same facts, able to drift
   from the per-runner ones and needing a heal of its own; the sum is over a handful of
   rows. The lock is taken only by admissions, never by a release, which can only lower the
@@ -79,18 +79,29 @@ defmodule Loopctl.Runners.Capacity do
   runners only, and `reserve/3` refuses a revoked one — while the rows themselves are
   released by the next heal.
 
-  ## Lock order — story, then dispatch row, then runner row
+  ## Lock order — one order for the whole fleet
 
-  ONE order, everywhere, including `Loopctl.Runners.DispatchLedger` and any caller that
-  releases a slot inside its own transaction: **the story row first (the claim fence), then
-  the `runner_dispatches` row, then the admission advisory lock, then the `runners` row.**
-  Two of these paths used to take the first two in opposite orders — `record_sent/3` fenced
-  the story then locked the dispatch row, `record_reply/3` and `record_trace/3` locked the
-  dispatch row then fenced the story — which with a concurrent claim or release (holding
-  the story `FOR UPDATE`) closed a three-transaction cycle and deadlocked in ~1 s, well
-  inside `lock_timeout_ms/0`, so the timeout never saw it. `heal/3` takes dispatch rows then
-  the runner row and never a story lock; its recount holds the runner row and only READS
-  dispatch rows.
+  Every transaction in loopctl that touches more than one of these takes them in THIS order,
+  and never in another:
+
+      capacity advisory lock (this module, `admission_lock_namespace/0`)
+        -> story row (the claim fence)
+        -> runner_dispatches / story_stages row
+        -> chain advisory lock (issue #821, its own namespace)
+        -> audit-chain head
+
+  and the `runners` row last of all, which only this module writes. **Take the capacity lock
+  FIRST in any transaction that also touches a story or the chain, never after** — a
+  transaction holding a story and then asking for it closes a cycle with every dispatch,
+  which takes it before anything else (`Loopctl.Runners.DispatchLedger.record_sent/3`).
+
+  Two paths used to break this. `record_reply/3` and `record_trace/3` locked the dispatch row
+  before fencing the story, which with a concurrent claim release (holding the story
+  `FOR UPDATE`) deadlocked in ~1 s — well inside `lock_timeout_ms/0`, so the timeout never
+  saw it. And `admit_and_reserve/3` took the advisory lock AFTER the story fence, which
+  cycles the same way against a caller that follows the order above. `heal/3` takes dispatch
+  rows then the runner row and never a story or advisory lock; its recount holds the runner
+  row and only READS dispatch rows.
 
   Every transaction here that can queue behind another sets `lock_timeout`
   (`lock_timeout_ms/0`). A dispatcher behind a stuck admission gets `:capacity_busy` rather
@@ -184,18 +195,17 @@ defmodule Loopctl.Runners.Capacity do
   def retryable?(_error), do: false
 
   @doc """
-  Admission then reservation for `record`, in the caller's transaction: serializes the
-  tenant's admissions, refuses when its active runners already hold `limit/0` slots, then
-  takes a slot on the dispatch's runner and stamps the row with it.
+  Admission then reservation for `record`, in the caller's transaction: refuses when the
+  tenant's active runners already hold `limit/0` slots, then takes a slot on the dispatch's
+  runner and stamps the row with it.
 
-  The dispatch row must already be locked by the caller (the lock order above).
+  The caller must already hold the tenant's admission lock (`lock_admission!/2`, taken FIRST
+  in the transaction — the lock order above) and the dispatch row.
   """
   @spec admit_and_reserve(Ecto.Repo.t(), DispatchRecord.t(), DateTime.t()) ::
           {:ok, DispatchRecord.t()}
           | {:error, :admission_limit_reached | :runner_at_capacity}
   def admit_and_reserve(repo \\ Repo, %DispatchRecord{} = record, now \\ DateTime.utc_now()) do
-    lock_admission!(repo, record.tenant_id)
-
     with :ok <- admit(repo, record.tenant_id),
          {:ok, _in_flight} <- reserve(repo, record.tenant_id, record.runner_id) do
       {:ok, stamp_reservation(repo, record, now)}
@@ -414,9 +424,34 @@ defmodule Loopctl.Runners.Capacity do
     |> repo.update_all([])
   end
 
-  defp lock_admission!(repo, tenant_id) do
+  @doc """
+  Serializes a tenant's admissions for the rest of the caller's transaction, on a
+  transaction-scoped advisory lock that releases on commit or rollback with no unlock path
+  to forget.
+
+  **The FIRST lock of any transaction that admits** — before the story fence, the dispatch
+  row and the chain (the lock order above). Taken after a story lock it cycles with every
+  dispatch.
+  """
+  @spec lock_admission!(Ecto.Repo.t(), Ecto.UUID.t()) :: :ok
+  def lock_admission!(repo \\ Repo, tenant_id) do
     {:ok, <<key::signed-integer-32, _rest::binary>>} = Ecto.UUID.dump(tenant_id)
     repo.query!("SELECT pg_advisory_xact_lock($1, $2)", [@admission_lock_ns, key])
     :ok
+  end
+
+  @doc "The advisory-lock namespace admissions serialize on. Public so a test can stage it."
+  @spec admission_lock_namespace() :: pos_integer()
+  def admission_lock_namespace, do: @admission_lock_ns
+
+  @doc """
+  The STABLE signed int4 advisory-lock key for a tenant — the UUID's first four bytes, never
+  `:erlang.phash2/1`, whose hashing is not guaranteed stable across OTP releases: during a
+  rolling deploy two nodes must agree on the key or they do not serialize at all.
+  """
+  @spec admission_lock_key(Ecto.UUID.t()) :: integer()
+  def admission_lock_key(tenant_id) do
+    {:ok, <<key::signed-integer-32, _rest::binary>>} = Ecto.UUID.dump(tenant_id)
+    key
   end
 end

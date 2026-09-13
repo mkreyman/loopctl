@@ -265,10 +265,7 @@ defmodule Loopctl.Runners.CapacityTest do
         Task.async(fn ->
           unboxed(fn ->
             Repo.transaction(fn ->
-              Repo.query!("SELECT pg_advisory_xact_lock($1, $2)", [
-                0x4105_0803,
-                admission_key(runner.tenant_id)
-              ])
+              hold_admission_lock!(runner.tenant_id)
 
               send(parent, :locked)
 
@@ -293,9 +290,11 @@ defmodule Loopctl.Runners.CapacityTest do
     end
   end
 
-  defp admission_key(tenant_id) do
-    {:ok, <<key::signed-integer-32, _::binary>>} = Ecto.UUID.dump(tenant_id)
-    key
+  defp hold_admission_lock!(tenant_id) do
+    Repo.query!("SELECT pg_advisory_xact_lock($1, $2)", [
+      Capacity.admission_lock_namespace(),
+      Capacity.admission_lock_key(tenant_id)
+    ])
   end
 
   describe "admission control" do
@@ -569,6 +568,51 @@ defmodule Loopctl.Runners.CapacityTest do
     # cycle and Postgres breaks it with a deadlock error in about a second, well inside
     # `lock_timeout`. Fencing the story FIRST leaves `reply` holding nothing while it waits,
     # and both finish.
+    # The capacity lock is the FIRST lock of the fleet order, so any transaction that holds
+    # it may go on to lock a story. A dispatch that took the story FIRST and asked for the
+    # lock afterwards — the old order — cycles with exactly that caller.
+    test "a dispatch racing a caller that holds the admission lock and then a story never deadlocks" do
+      runner = runner(%{max_sessions: 3})
+      story = story(runner.tenant_id)
+      d = dispatch(runner.tenant_id, %{"story_id" => story.id})
+
+      test = self()
+      waiting = waiting_locks()
+
+      admitter =
+        Task.async(fn ->
+          unboxed(fn ->
+            Repo.with_tenant(runner.tenant_id, fn ->
+              hold_admission_lock!(runner.tenant_id)
+              send(test, :holding_lock)
+              assert_receive_in_task(:take_story)
+
+              Repo.one!(
+                from s in Story,
+                  where: s.id == ^story.id,
+                  lock: "FOR UPDATE",
+                  select: s.claim_epoch
+              )
+
+              :took_story
+            end)
+          end)
+        end)
+
+      assert_receive :holding_lock, 5_000
+
+      sender = Task.async(fn -> send_dispatch(runner, d) end)
+
+      # Blocked on the admission lock under the fixed order, holding no story; blocked on it
+      # while HOLDING the story's share lock under the old one.
+      await_waiting_locks(waiting + 1)
+      send(admitter.pid, :take_story)
+
+      assert {:ok, :took_story} = Task.await(admitter, 30_000)
+      assert {:ok, %DispatchRecord{status: "sent"}} = Task.await(sender, 30_000)
+      assert in_flight(runner) == 1
+    end
+
     test "a reply racing a claim release never deadlocks" do
       runner = runner(%{max_sessions: 3})
       story = story(runner.tenant_id)

@@ -24,13 +24,18 @@ defmodule Loopctl.Runners.DispatchLedger do
 
   ## Lock order
 
-  Every path here takes the STORY row (the claim fence, `FOR SHARE`) before the
-  `runner_dispatches` row (`FOR UPDATE`), and the `runners` row last — the one order
-  `Loopctl.Runners.Capacity` documents. `record_reply/3` and `record_trace/3` used to take the
-  first two the other way round, which closed a cycle with a concurrent claim or release
-  holding the story `FOR UPDATE` and deadlocked. They now resolve the row's story from an
-  UNLOCKED pre-read (`story_id` never changes after the row is written), fence the story, and
-  only then lock the row.
+  The fleet-wide order, which `Loopctl.Runners.Capacity` states in full:
+
+      capacity advisory lock -> story row -> runner_dispatches / story_stages row
+        -> chain advisory lock -> audit-chain head
+
+  So `record_sent/3` takes the tenant's admission lock as the FIRST thing in its transaction —
+  before the claim fence, not with the reservation at the end — and `record_reply/3` and
+  `record_trace/3` fence the story before locking the dispatch row. Both used to be the other
+  way round, and each closed a cycle with a caller holding a story `FOR UPDATE`. The reply and
+  trace paths resolve the row's story from an UNLOCKED pre-read (`story_id` never changes
+  after the row is written) so the fence can come first; the fence itself is then decided on
+  the row read under its lock.
 
   `record_reply/3` applies a runner's `dispatch_reply` under a row lock. The row must belong
   to the CALLING runner in the calling tenant (otherwise `:unknown_dispatch` — another
@@ -120,10 +125,14 @@ defmodule Loopctl.Runners.DispatchLedger do
     }
 
     in_tenant(tenant_id, fn ->
-      # Every wait below — the story share lock, the admission lock, the runner row — is
+      # Every wait below — the admission lock, the story share lock, the runner row — is
       # bounded, so a stuck transaction elsewhere costs a dispatcher `:capacity_busy`, never
       # an open transaction waiting indefinitely.
-      Capacity.set_lock_timeout!()
+      Capacity.set_lock_timeout!(Repo)
+
+      # FIRST, before the story fence: the fleet lock order. Held to the end of the
+      # transaction, it is what makes the tenant's admissions serialize.
+      Capacity.lock_admission!(Repo, tenant_id)
 
       # Nothing is sent for a claim that has already moved on: the dispatch must carry the
       # story's CURRENT epoch, read under a share lock so a release cannot commit between
