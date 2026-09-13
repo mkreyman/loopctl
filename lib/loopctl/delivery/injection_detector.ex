@@ -49,14 +49,19 @@ defmodule Loopctl.Delivery.InjectionDetector do
 
   ## User-agent prose score
 
-  `user_agent_prose_score/1` counts WORDS — tokens of two or more letters, a trailing
-  `,.;:!?` allowed — that are not user-agent vocabulary (`Mozilla`, `KHTML`, `like`,
-  `Gecko`, `Mobile`, `Android`, ...). Tokens with a digit or a `/` (`Chrome/140.0.0.0`,
-  `SM-S918B`, `x86_64`) are never words. A lowercase-initial word scores 2 and any other
-  word 1, because prose is lowercase and device model names (`Redmi Note 12 Pro`) are not.
+  `user_agent_prose_score/1` counts WORDS. Each whitespace token loses the punctuation and
+  symbols around it (quotes, brackets, a trailing comma), then splits on `_`, `-` and
+  apostrophes, so `"approve"`, `approve_this`, `pull-request` and `don't` all still count.
+  A part is a word when it is two or more letters and not user-agent vocabulary (`Mozilla`,
+  `KHTML`, `like`, `Gecko`, `Mobile`, `Android`, `CPU`, `AOSP`, `MIUI`, ...). A token with a
+  digit or a `/` (`Chrome/140.0.0.0`, `SM-S918B`, `x86_64`) or shaped like a locale (`en-US`)
+  is never a word. A lowercase-initial word, or an ALL-CAPS word of three or more letters,
+  scores 2; any other word 1, because prose is lowercase, shouted instructions are
+  capitals, and device model names (`Redmi Note 12 Pro`) are Title-case.
   The score is the larger of the words outside parenthesised comments and the words in the
   busiest `;`- or `,`-separated part of any one comment. It fires at
-  `user_agent_prose_threshold/0` (12): six lowercase words, or twelve capitalised ones.
+  `user_agent_prose_threshold/0` (12): six lowercase or ALL-CAPS words, or twelve Title-case
+  ones.
 
   The MARGIN is asserted, not hoped for: every recorded real user agent in
   `test/support/intake_fixtures/real_user_agents.json` — desktop Chrome, Firefox, Safari and
@@ -161,14 +166,25 @@ defmodule Loopctl.Delivery.InjectionDetector do
 
   @max_user_agent_bytes 512
   @ua_comment ~r/\(([^()]*)\)/u
-  @ua_word ~r/\A(\p{L}{2,})[,.;:!?]?\z/u
   @ua_prose_threshold 12
+
+  # Punctuation and symbols around a token (quotes, brackets, a trailing comma) are not what
+  # decides whether it is a word.
+  @ua_edge_punctuation ~r/\A[\p{P}\p{S}]+|[\p{P}\p{S}]+\z/u
+  # A digit or a slash marks a product token, a version or a model number: never prose.
+  @ua_not_prose ~r/[\p{N}\/]/u
+  # A locale such as `en-US` or `zh_cn` is platform data, not two words.
+  @ua_locale ~r/\A[a-z]{2}[-_][a-z]{2}\z/iu
+  # Words joined to dodge a whitespace split: `approve_this`, `pull-request`, `don't`.
+  @ua_joiners ~r/[_\-'\x{2019}]/u
+  @ua_word ~r/\A\p{L}{2,}\z/u
 
   # Words real user agents carry outside product tokens or in their platform comments. They
   # are not prose, so they score nothing. Compared lowercased.
   @ua_vocabulary ~w(mozilla compatible khtml like gecko mobile safari chrome version linux
                     android windows nt win macintosh intel mac os cpu iphone ipad ipod touch
-                    wv samsung ubuntu fedora cros build tablet x11)
+                    wv samsung ubuntu fedora cros build tablet x11 aosp miui emui huawei
+                    xiaomi oppo vivo zte htc lg sony nokia)
 
   @doc "The signal names this module can produce."
   @spec signals() :: [atom()]
@@ -333,16 +349,27 @@ defmodule Loopctl.Delivery.InjectionDetector do
   end
 
   defp token_score(token) do
-    case Regex.run(@ua_word, token, capture: :all_but_first) do
-      [word] ->
-        cond do
-          String.downcase(word) in @ua_vocabulary -> 0
-          Regex.match?(~r/\A\p{Ll}/u, word) -> 2
-          true -> 1
-        end
+    core = String.replace(token, @ua_edge_punctuation, "")
 
-      nil ->
-        0
+    if Regex.match?(@ua_not_prose, core) or Regex.match?(@ua_locale, core) do
+      0
+    else
+      core
+      |> String.split(@ua_joiners, trim: true)
+      |> Enum.map(&part_score/1)
+      |> Enum.sum()
+    end
+  end
+
+  # Lowercase and ALL-CAPS words are how prose and shouted instructions are written; a
+  # Title-case word is how a device model is (`Redmi Note 12 Pro`), so it scores less.
+  defp part_score(part) do
+    cond do
+      not Regex.match?(@ua_word, part) -> 0
+      String.downcase(part) in @ua_vocabulary -> 0
+      Regex.match?(~r/\A\p{Ll}/u, part) -> 2
+      String.length(part) >= 3 and part == String.upcase(part) -> 2
+      true -> 1
     end
   end
 end

@@ -112,8 +112,6 @@ defmodule Loopctl.Intake.TicketFacts do
     end
   end
 
-  # The footer id is only ever kept as confirmation of a ref. With no ref there is nothing
-  # to check it against, so a footer line alone, typed or duplicated, is not a fact.
   # Outermost first, so a double-backtick span is not mistaken for a single one.
   @wrappers [{"``", "``"}, {"`", "`"}, {"\"", "\""}, {"'", "'"}]
 
@@ -132,6 +130,8 @@ defmodule Loopctl.Intake.TicketFacts do
     end)
   end
 
+  # The footer id is only ever kept as confirmation of a ref. With no ref there is nothing
+  # to check it against, so a footer line alone, typed or duplicated, is not a fact.
   defp reconcile(nil, _footer_id), do: {nil, nil, nil}
   defp reconcile(ref, nil), do: {ref, nil, nil}
 
