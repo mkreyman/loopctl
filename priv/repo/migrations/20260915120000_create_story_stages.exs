@@ -114,7 +114,7 @@ defmodule Loopctl.Repo.Migrations.CreateStoryStages do
     create index(:story_stage_events, [:story_stage_id])
 
     create constraint(:story_stage_events, :story_stage_events_event,
-             check: "event IN ('opened', 'transitioned', 'effect_recorded')"
+             check: "event IN ('opened', 'transitioned', 'effect_recorded', 'rebound')"
            )
 
     enable_rls(:story_stage_events)

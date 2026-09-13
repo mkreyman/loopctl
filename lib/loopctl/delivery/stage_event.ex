@@ -6,6 +6,8 @@ defmodule Loopctl.Delivery.StageEvent do
 
   - `opened` — the row was created (at `detected`).
   - `transitioned` — `from_stage -> to_stage` over `edge`; `data` carries the reason, if any.
+  - `rebound` — a claim release moved the row to the story's new `claim_epoch` without
+    changing its stage (`Loopctl.Delivery.Stages.follow_release/5`).
   - `effect_recorded` — a side-effect identity was set for the first time; `data` carries
     its name and value, so an identity a later edge clears is still on record here.
 

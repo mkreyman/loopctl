@@ -20,7 +20,7 @@ defmodule Loopctl.Delivery.Stages do
   A runner cut off from the control plane cannot advance anything — every write is a
   transaction here — and while it is gone its claim lease runs out. The reclaimer releases
   the claim, bumps `stories.claim_epoch`, and moves an in-flight row back to `queued` in
-  the same transaction (`requeue_lost_runner/3`). When the runner comes back, every write
+  the same transaction (`follow_release/5`, which every claim release calls). When the runner comes back, every write
   it attempts presents the OLD epoch and is refused `:stale_claim_epoch`: the zombie is
   fenced by the epoch, not by noticing it is a zombie. Two loopctl nodes are not a
   partition of the state at all: both write the one row, and the compare-and-set lets
@@ -65,7 +65,7 @@ defmodule Loopctl.Delivery.Stages do
 
   `Loopctl.Repo` inside `Repo.with_tenant/2`, with an explicit `tenant_id` predicate on
   every query as well. Never `AdminRepo` — its pool is three connections — except
-  `requeue_lost_runner/3`, which is a step of the reclaimer's existing `AdminRepo`
+  `follow_release/5`, which is a step of a claim release's existing `AdminRepo`
   transaction and takes no connection of its own. Like every `with_tenant/2` caller, none
   of the other functions may be called inside a `Repo` transaction.
   """
@@ -190,8 +190,8 @@ defmodule Loopctl.Delivery.Stages do
 
   Refused before touching the database:
 
-  - `:invalid_transition` — not in the table, or `:runner_lost` (taken only by the
-    reclaimer, `requeue_lost_runner/3`)
+  - `:invalid_transition` — not in the table, or a release edge (`:runner_lost`,
+    `:claim_released`), which only the releasing transaction takes (`follow_release/5`)
   - `:human_required` — `:human_resolution` from anything but a human principal: a role of
     at least `:user` holding a key no dispatch minted (`actor_lineage` empty). The same
     positive operator test the lineage ceiling uses; a dispatch-minted `:user` key is an
@@ -372,60 +372,104 @@ defmodule Loopctl.Delivery.Stages do
   defp event_value(value), do: to_string(value)
 
   @doc """
-  The `:runner_lost` edge, for `Loopctl.Progress.reclaim_expired_claim/3`: moves the
-  story's stage row from an in-flight stage (`StageMachine.in_flight_stages/0`) to
-  `queued`, binds it to `new_epoch` (the epoch the release just wrote), counts the edge in
-  `attempts`, and clears the identities the lost runner held. A row in any other stage, or
-  no row, is left alone (`{:ok, nil}`).
+  Makes a story's stage row follow a claim RELEASE, inside the releasing transaction.
+  Every path that bumps `stories.claim_epoch` by releasing a claim calls it:
 
-  Runs on `AdminRepo` INSIDE the reclaimer's transaction, which already holds the story's
-  row lock: the requeue commits with the release or not at all, so no sweep, crash or
-  partition can leave a released claim with a row still in flight. Raises outside an
-  `AdminRepo` transaction. The explicit `tenant_id` predicate is the only isolation here.
+  - `:runner_lost` — `Loopctl.Progress.reclaim_expired_claim/3` (the lease ran out)
+  - `:claim_released` — `Loopctl.Progress.unclaim_story/3`,
+    `Loopctl.Progress.force_unclaim_story/3`, the reject auto-reset in `Loopctl.Progress`,
+    and `Loopctl.BulkOperations`' bulk-reject auto-reset. A separate edge so `runner_lost`
+    in `attempts` counts only runners that actually disappeared.
+
+  What happens to the row:
+
+  - in flight (`StageMachine.in_flight_stages/0`) — back to `queued` over `edge`, bound to
+    `new_epoch`, the edge counted in `attempts`, and the identities the released holder
+    held cleared (`StageMachine.clears/3`). Recorded as `transitioned`.
+  - any other stage except `done` and `failed` — the stage stays and the row is rebound to
+    `new_epoch`, recorded as `rebound`. The effect a merged or deployed story already had
+    cannot be taken back by a release, and a queued, triage-stage or escalated row is not
+    held by the released claim; rebinding keeps every one of them advanceable. Left behind
+    the story's epoch, it would be refused on every advance with nothing able to move it.
+  - `done`, `failed`, or no row — untouched, `{:ok, nil}`.
+
+  The holder of the released claim is fenced either way: it still presents the OLD epoch,
+  and `advance/4` and `record_effect/5` refuse that before they look at the row.
+
+  Runs on `AdminRepo` inside the caller's transaction, which already holds the story's row
+  lock (the order every writer here takes: story, then stage row), so the release and the
+  row commit together or not at all. It takes no connection of its own. Raises outside an
+  `AdminRepo` transaction; the explicit `tenant_id` predicate is the only isolation here.
+  Also correct on a story already at `pending` (`force_unclaim_story/3`'s idempotent
+  branch passes the current epoch), which is how an operator recovers a row stranded by a
+  release that predates this function.
+
+  ## Options
+
+  - `:actor_label` — recorded on the event
   """
-  @spec requeue_lost_runner(Ecto.UUID.t(), Ecto.UUID.t(), non_neg_integer()) ::
-          {:ok, StoryStage.t() | nil}
-  def requeue_lost_runner(tenant_id, story_id, new_epoch) do
+  @spec follow_release(
+          Ecto.UUID.t(),
+          Ecto.UUID.t(),
+          non_neg_integer(),
+          :runner_lost | :claim_released,
+          keyword()
+        ) :: {:ok, StoryStage.t() | nil}
+  def follow_release(tenant_id, story_id, new_epoch, edge, opts \\ [])
+      when edge in [:runner_lost, :claim_released] do
     unless AdminRepo.in_transaction?(),
-      do: raise(ArgumentError, "requeue_lost_runner/3 runs inside the reclaim transaction")
-
-    in_flight = StageMachine.in_flight_stages()
+      do: raise(ArgumentError, "follow_release/5 runs inside the releasing transaction")
 
     row =
       from(s in StoryStage,
         where: s.tenant_id == ^tenant_id and s.story_id == ^story_id,
-        where: s.stage in ^in_flight,
+        where: s.stage not in [:done, :failed],
         lock: "FOR UPDATE"
       )
       |> AdminRepo.one()
 
-    case row do
-      nil ->
-        {:ok, nil}
-
-      %StoryStage{stage: from} ->
-        true = StageMachine.allowed?(from, :queued, :runner_lost)
-
-        {1, [updated]} =
-          from(s in StoryStage,
-            where: s.id == ^row.id and s.tenant_id == ^tenant_id,
-            select: s
-          )
-          |> transition_update(from, :queued, :runner_lost, claim_epoch: new_epoch)
-          |> AdminRepo.update_all([])
-
-        insert_event(
-          AdminRepo,
-          updated,
-          "transitioned",
-          from,
-          :runner_lost,
-          "worker:reclaim_expired_claims",
-          %{"released_claim_epoch" => row.claim_epoch}
-        )
-
-        {:ok, updated}
+    cond do
+      is_nil(row) -> {:ok, nil}
+      row.stage in StageMachine.in_flight_stages() -> requeue(row, new_epoch, edge, opts)
+      true -> rebind(row, new_epoch, opts)
     end
+  end
+
+  defp requeue(%StoryStage{stage: from} = row, new_epoch, edge, opts) do
+    true = StageMachine.allowed?(from, :queued, edge)
+
+    {1, [updated]} =
+      from(s in StoryStage, where: s.id == ^row.id and s.tenant_id == ^row.tenant_id, select: s)
+      |> transition_update(from, :queued, edge, claim_epoch: new_epoch)
+      |> AdminRepo.update_all([])
+
+    insert_event(AdminRepo, updated, "transitioned", from, edge, opts[:actor_label], %{
+      "released_claim_epoch" => row.claim_epoch
+    })
+
+    {:ok, updated}
+  end
+
+  # A row already at the new epoch (an idempotent force-unclaim) is left exactly as it is.
+  defp rebind(%StoryStage{claim_epoch: epoch}, epoch, _opts), do: {:ok, nil}
+
+  defp rebind(%StoryStage{} = row, new_epoch, opts) do
+    {1, [updated]} =
+      from(s in StoryStage,
+        where: s.id == ^row.id and s.tenant_id == ^row.tenant_id,
+        select: s,
+        update: [
+          set: [claim_epoch: ^new_epoch, updated_at: ^DateTime.utc_now()],
+          inc: [lock_version: 1]
+        ]
+      )
+      |> AdminRepo.update_all([])
+
+    insert_event(AdminRepo, updated, "rebound", nil, nil, opts[:actor_label], %{
+      "released_claim_epoch" => row.claim_epoch
+    })
+
+    {:ok, updated}
   end
 
   # --- transition mechanics -------------------------------------------------------------
@@ -458,7 +502,8 @@ defmodule Loopctl.Delivery.Stages do
     end
   end
 
-  defp allowed_for_caller(_from, _to, :runner_lost), do: {:error, :invalid_transition}
+  defp allowed_for_caller(_from, _to, edge) when edge in [:runner_lost, :claim_released],
+    do: {:error, :invalid_transition}
 
   defp allowed_for_caller(from, to, edge) do
     if StageMachine.allowed?(from, to, edge), do: :ok, else: {:error, :invalid_transition}

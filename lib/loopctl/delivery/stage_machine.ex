@@ -28,6 +28,9 @@ defmodule Loopctl.Delivery.StageMachine do
   - `:runner_lost` — an in-flight stage -> queued. Taken by the claim reclaimer
     (`Loopctl.Progress.reclaim_expired_claim/3`), never asked for by a runner: a runner
     that could report itself lost is not lost.
+  - `:claim_released` — an in-flight stage -> queued, when the claim is released by
+    unclaim, force-unclaim or a reject auto-reset. Also never asked for by a caller; see
+    `Loopctl.Delivery.Stages.follow_release/5`.
   - `:human_resolution` — escalated -> queued | done | failed, and ONLY for a human
     principal (see `Loopctl.Delivery.Stages.advance/4`).
 
@@ -55,7 +58,9 @@ defmodule Loopctl.Delivery.StageMachine do
                        from not in @terminal,
                        do: {from, :failed, :budget_exceeded}
 
-  @runner_lost for from <- @in_flight, do: {from, :queued, :runner_lost}
+  @released for from <- @in_flight,
+                edge <- [:runner_lost, :claim_released],
+                do: {from, :queued, edge}
 
   @human_resolution for to <- [:queued, :done, :failed], do: {:escalated, to, :human_resolution}
 
@@ -66,7 +71,7 @@ defmodule Loopctl.Delivery.StageMachine do
                    {:pr_open, :implementing, :base_moved},
                    {:ci, :implementing, :base_moved},
                    {:deployed, :escalated, :verification_failed}
-                 ] ++ @budget_exceeded ++ @runner_lost ++ @human_resolution
+                 ] ++ @budget_exceeded ++ @released ++ @human_resolution
 
   # The custody-critical transitions, and the only ones written to the audit chain (design
   # §11): a claim, a merge, an escalation, and a human acting on one. The chain serialises
@@ -90,10 +95,11 @@ defmodule Loopctl.Delivery.StageMachine do
   # Identities that stop describing the story when an edge is taken, cleared by that edge.
   # Nothing is lost: every value was written to `story_stage_events` when it was recorded.
   # A lost runner's worktree is on a machine
-  # nobody holds any more and its head may never have been pushed; the branch and the PR
+  # nobody holds any more and its head may never have been pushed (a released claim's, the
+  # same); the branch and the PR
   # live on GitHub and the next runner reuses them. Going back to implementing makes a new
   # head. A human re-queue starts over from nothing.
-  @runner_lost_clears [:runner_id, :worktree_path, :head_sha]
+  @released_clears [:runner_id, :worktree_path, :head_sha]
 
   @type stage ::
           :detected
@@ -120,6 +126,7 @@ defmodule Loopctl.Delivery.StageMachine do
           | :verification_failed
           | :budget_exceeded
           | :runner_lost
+          | :claim_released
           | :human_resolution
 
   @type effect ::
@@ -141,7 +148,7 @@ defmodule Loopctl.Delivery.StageMachine do
   @spec transitions() :: [transition()]
   def transitions, do: @transitions
 
-  @doc "The stages a runner holds the story in — the sources of `:runner_lost`."
+  @doc "The stages a claim holds the story in — the sources of the release edges."
   @spec in_flight_stages() :: [stage()]
   def in_flight_stages, do: @in_flight
 
@@ -178,7 +185,9 @@ defmodule Loopctl.Delivery.StageMachine do
 
   @doc "The identities a transition clears."
   @spec clears(stage(), stage(), edge()) :: [effect()]
-  def clears(_from, :queued, :runner_lost), do: @runner_lost_clears
+  def clears(_from, :queued, edge) when edge in [:runner_lost, :claim_released],
+    do: @released_clears
+
   def clears(:escalated, :queued, :human_resolution), do: Map.keys(@effect_stages)
   def clears(_from, :implementing, edge) when edge != :forward, do: [:head_sha]
   def clears(_from, _to, _edge), do: []

@@ -112,8 +112,8 @@ defmodule Loopctl.Delivery.StagesTest do
 
         result = Stages.advance(story.tenant_id, story.id, {from, to, edge}, opts)
 
-        if edge == :runner_lost do
-          # Only the reclaimer takes it.
+        if edge in [:runner_lost, :claim_released] do
+          # Only a releasing transaction takes these (follow_release/5).
           assert {:error, :invalid_transition} = result, inspect({from, to, edge})
         else
           assert {:ok, %StoryStage{stage: ^to} = moved} = result, inspect({from, to, edge})
@@ -456,94 +456,196 @@ defmodule Loopctl.Delivery.StagesTest do
     end
   end
 
-  describe "runner lost (the claim reclaimer)" do
-    # On AdminRepo: the reclaimer's connection.
-    defp expired_claim_with_stage(stage, row_attrs) do
+  describe "claim releases (follow_release/5)" do
+    # On AdminRepo: every release path's connection.
+    defp claimed_with_stage(stage, row_attrs \\ %{}, story_attrs \\ %{}) do
       tenant = fixture(:tenant)
-      agent = fixture(:agent, %{tenant_id: tenant.id})
-      story = fixture(:story, %{tenant_id: tenant.id, agent_status: :contracted})
-      {:ok, claimed} = Progress.claim_story(tenant.id, story.id, agent_id: agent.id)
+      agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
 
-      {1, _} =
-        from(s in Story, where: s.id == ^story.id)
-        |> AdminRepo.update_all(set: [claimed_until: DateTime.add(DateTime.utc_now(), -60)])
+      story =
+        fixture(
+          :story,
+          Map.merge(%{tenant_id: tenant.id, agent_status: :contracted}, story_attrs)
+        )
+
+      {:ok, claimed} = Progress.claim_story(tenant.id, story.id, agent_id: agent.id)
 
       row =
         fixture(
           :story_stage,
-          Map.merge(
-            %{
-              repo: AdminRepo,
-              tenant_id: tenant.id,
-              story_id: story.id,
-              stage: stage,
-              claim_epoch: claimed.claim_epoch
-            },
-            row_attrs
-          )
+          %{
+            repo: AdminRepo,
+            tenant_id: tenant.id,
+            story_id: story.id,
+            stage: stage,
+            claim_epoch: claimed.claim_epoch
+          }
+          |> Map.merge(escalation(stage))
+          |> Map.merge(row_attrs)
         )
 
-      {claimed, row}
+      %{tenant_id: tenant.id, agent: agent, story: claimed, row: row}
     end
 
-    test "a reclaimed claim moves its in-flight stage row to queued in the same transaction" do
-      {claimed, row} =
-        expired_claim_with_stage(:implementing, %{
-          worktree_path: "/w",
-          head_sha: @sha_a,
-          branch: "feature/z",
-          pr_number: 12,
-          attempts: %{"ci_red" => 1}
-        })
+    defp expire_lease(story) do
+      {1, _} =
+        from(s in Story, where: s.id == ^story.id)
+        |> AdminRepo.update_all(set: [claimed_until: DateTime.add(DateTime.utc_now(), -60)])
+    end
 
+    defp report_done(story) do
+      {1, _} =
+        from(s in Story, where: s.id == ^story.id)
+        |> AdminRepo.update_all(
+          set: [agent_status: :reported_done, reported_done_at: DateTime.utc_now()]
+        )
+    end
+
+    defp orchestrator(tenant_id),
+      do: fixture(:agent, %{tenant_id: tenant_id, agent_type: :orchestrator})
+
+    # Every path that releases a claim, as its production caller runs it. Each returns the
+    # edge it is recorded under.
+    defp release(:reclaim, %{story: story}) do
+      expire_lease(story)
       assert :ok = ReclaimExpiredClaimsWorker.perform(%Oban.Job{args: %{}})
-
-      story = AdminRepo.get!(Story, claimed.id)
-      assert story.claim_epoch == claimed.claim_epoch + 1
-
-      requeued = AdminRepo.get!(StoryStage, row.id)
-      assert requeued.stage == :queued
-      assert requeued.claim_epoch == story.claim_epoch
-      assert requeued.attempts == %{"ci_red" => 1, "runner_lost" => 1}
-      assert requeued.lock_version == row.lock_version + 1
-      assert {requeued.worktree_path, requeued.head_sha} == {nil, nil}
-      assert {requeued.branch, requeued.pr_number} == {"feature/z", 12}
-
-      assert [%StageEvent{from_stage: "implementing", to_stage: "queued", edge: "runner_lost"}] =
-               AdminRepo.all(from e in StageEvent, where: e.story_stage_id == ^row.id)
+      :runner_lost
     end
 
-    test "every in-flight stage is requeued; merged and later are left alone" do
-      for stage <- StageMachine.stages() do
-        {_claimed, row} = expired_claim_with_stage(stage, escalation(stage))
-        {:ok, _} = Progress.reclaim_expired_claim(row.tenant_id, row.story_id, row.claim_epoch)
-        after_reclaim = AdminRepo.get!(StoryStage, row.id)
+    defp release(:unclaim, %{tenant_id: t, story: story, agent: agent}) do
+      {:ok, _} = Progress.unclaim_story(t, story.id, agent_id: agent.id)
+      :claim_released
+    end
 
-        if stage in StageMachine.in_flight_stages() do
-          assert after_reclaim.stage == :queued, inspect(stage)
-        else
-          assert after_reclaim.stage == stage, inspect(stage)
-          assert after_reclaim.lock_version == row.lock_version, inspect(stage)
+    defp release(:force_unclaim, %{tenant_id: t, story: story}) do
+      {:ok, _} = Progress.force_unclaim_story(t, story.id)
+      :claim_released
+    end
+
+    defp release(:reject, %{tenant_id: t, story: story}) do
+      report_done(story)
+
+      {:ok, %Story{agent_status: :pending}} =
+        Progress.reject_story(t, story.id, %{"reason" => "Missing tests"},
+          orchestrator_agent_id: orchestrator(t).id
+        )
+
+      :claim_released
+    end
+
+    defp release(:bulk_reject, %{tenant_id: t, story: story}) do
+      report_done(story)
+
+      {:ok, [%{status: "success"}]} =
+        Loopctl.BulkOperations.bulk_reject(
+          t,
+          [%{"story_id" => story.id, "reason" => "Missing tests"}],
+          orchestrator(t).id,
+          verifier_lineage: []
+        )
+
+      :claim_released
+    end
+
+    @release_paths [:reclaim, :unclaim, :force_unclaim, :reject, :bulk_reject]
+
+    for path <- @release_paths do
+      test "#{path}: the in-flight stage row goes back to queued in the same transaction" do
+        ctx =
+          claimed_with_stage(:implementing, %{
+            worktree_path: "/w",
+            head_sha: @sha_a,
+            branch: "feature/z",
+            pr_number: 12,
+            attempts: %{"ci_red" => 1}
+          })
+
+        edge = release(unquote(path), ctx)
+
+        story = AdminRepo.get!(Story, ctx.story.id)
+        assert story.claim_epoch > ctx.story.claim_epoch
+
+        requeued = AdminRepo.get!(StoryStage, ctx.row.id)
+        assert requeued.stage == :queued
+        assert requeued.claim_epoch == story.claim_epoch
+        assert requeued.attempts == %{"ci_red" => 1, Atom.to_string(edge) => 1}
+        assert requeued.lock_version == ctx.row.lock_version + 1
+        assert {requeued.worktree_path, requeued.head_sha} == {nil, nil}
+        assert {requeued.branch, requeued.pr_number} == {"feature/z", 12}
+
+        edge_name = Atom.to_string(edge)
+
+        assert [%StageEvent{from_stage: "implementing", to_stage: "queued", edge: ^edge_name}] =
+                 AdminRepo.all(from e in StageEvent, where: e.story_stage_id == ^ctx.row.id)
+      end
+    end
+
+    test "every stage: in flight is requeued, done and failed untouched, the rest rebound" do
+      for stage <- StageMachine.stages() do
+        ctx = claimed_with_stage(stage)
+        expire_lease(ctx.story)
+
+        {:ok, released} =
+          Progress.reclaim_expired_claim(ctx.tenant_id, ctx.story.id, ctx.story.claim_epoch)
+
+        after_release = AdminRepo.get!(StoryStage, ctx.row.id)
+
+        cond do
+          stage in StageMachine.in_flight_stages() ->
+            assert {after_release.stage, after_release.claim_epoch} ==
+                     {:queued, released.claim_epoch},
+                   inspect(stage)
+
+          stage in [:done, :failed] ->
+            assert after_release == ctx.row, inspect(stage)
+
+          true ->
+            assert {after_release.stage, after_release.claim_epoch, after_release.attempts} ==
+                     {stage, released.claim_epoch, %{}},
+                   inspect(stage)
+
+            assert [%StageEvent{event: "rebound"}] =
+                     AdminRepo.all(from e in StageEvent, where: e.story_stage_id == ^ctx.row.id)
         end
       end
     end
 
-    test "a reclaim that refuses (lease renewed) leaves the stage row in flight" do
-      {claimed, row} = expired_claim_with_stage(:ci, %{})
+    test "force-unclaim of an already-pending story rebinds a row a release left behind" do
+      tenant = fixture(:tenant)
+      story = fixture(:story, %{tenant_id: tenant.id})
 
       {1, _} =
-        from(s in Story, where: s.id == ^claimed.id)
-        |> AdminRepo.update_all(set: [claimed_until: DateTime.add(DateTime.utc_now(), 600)])
+        from(s in Story, where: s.id == ^story.id) |> AdminRepo.update_all(set: [claim_epoch: 3])
 
-      assert {:error, :claim_not_expired} =
-               Progress.reclaim_expired_claim(row.tenant_id, row.story_id, row.claim_epoch)
+      row =
+        fixture(:story_stage, %{
+          repo: AdminRepo,
+          tenant_id: tenant.id,
+          story_id: story.id,
+          stage: :merged,
+          claim_epoch: 2
+        })
 
-      assert AdminRepo.get!(StoryStage, row.id).stage == :ci
+      {:ok, %Story{claim_epoch: 3}} = Progress.force_unclaim_story(tenant.id, story.id)
+      assert %StoryStage{stage: :merged, claim_epoch: 3} = AdminRepo.get!(StoryStage, row.id)
+
+      # Again: already at the story's epoch, nothing to write.
+      {:ok, _} = Progress.force_unclaim_story(tenant.id, story.id)
+      assert AdminRepo.get!(StoryStage, row.id).lock_version == row.lock_version + 1
     end
 
-    test "requeue_lost_runner/3 refuses to run outside the reclaim transaction" do
+    test "a reclaim that refuses (lease renewed) leaves the stage row in flight" do
+      ctx = claimed_with_stage(:ci)
+
+      assert {:error, :claim_not_expired} =
+               Progress.reclaim_expired_claim(ctx.tenant_id, ctx.story.id, ctx.story.claim_epoch)
+
+      assert AdminRepo.get!(StoryStage, ctx.row.id).stage == :ci
+    end
+
+    test "follow_release/5 refuses to run outside a releasing transaction" do
       assert_raise ArgumentError, fn ->
-        Stages.requeue_lost_runner(Ecto.UUID.generate(), Ecto.UUID.generate(), 1)
+        Stages.follow_release(Ecto.UUID.generate(), Ecto.UUID.generate(), 1, :claim_released)
       end
     end
   end

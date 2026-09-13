@@ -1177,6 +1177,12 @@ defmodule Loopctl.Progress do
         |> Ecto.Changeset.change(release_claim_changes(story))
         |> AdminRepo.update()
       end)
+      # #803: the stage row follows the release in this transaction (see follow_release/5).
+      |> Multi.run(:stage, fn _repo, %{story: updated} ->
+        Stages.follow_release(tenant_id, updated.id, updated.claim_epoch, :claim_released,
+          actor_label: actor_label
+        )
+      end)
       |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
         %{
           tenant_id: tenant_id,
@@ -1482,7 +1488,7 @@ defmodule Loopctl.Progress do
   story), lease cleared and epoch bumped. Recorded as a `claim_lease_expired` audit
   entry by the system actor, and announced as `story.force_unclaimed` with
   `reason: "claim_lease_expired"`. A delivery stage row in flight is moved back to
-  `queued` in the same transaction (`Loopctl.Delivery.Stages.requeue_lost_runner/3`).
+  `queued` in the same transaction (`Loopctl.Delivery.Stages.follow_release/5`).
 
   A story with NO lease (`claimed_until` NULL — claimed before leases existed, and
   never renewed since) is never reclaimed: nothing renews those claims, so a lease
@@ -1528,11 +1534,13 @@ defmodule Loopctl.Progress do
         |> Ecto.Changeset.change(release_claim_changes(story))
         |> AdminRepo.update()
       end)
-      # #803: the claimant is gone, so its delivery stage row goes back to `queued` in THIS
-      # transaction — the release and the requeue commit together or not at all. A row left
-      # in flight after the release would sit behind the new epoch, refused on every advance.
+      # #803: the claimant is gone, so its delivery stage row follows the release in THIS
+      # transaction — the two commit together or not at all. A row left behind the new epoch
+      # would be refused on every advance with nothing able to move it.
       |> Multi.run(:stage, fn _repo, %{story: updated} ->
-        Stages.requeue_lost_runner(tenant_id, updated.id, updated.claim_epoch)
+        Stages.follow_release(tenant_id, updated.id, updated.claim_epoch, :runner_lost,
+          actor_label: "worker:reclaim_expired_claims"
+        )
       end)
       |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
         %{
@@ -2718,6 +2726,14 @@ defmodule Loopctl.Progress do
           |> AdminRepo.update()
         end
       end)
+      # #803: the stage row follows the release in this transaction. On the idempotent
+      # :pending branch the epoch did not move, and this rebinds a row a release left behind
+      # before follow_release/5 existed — the same operator remedy as the retro-stamp above.
+      |> Multi.run(:stage, fn _repo, %{story: updated} ->
+        Stages.follow_release(tenant_id, updated.id, updated.claim_epoch, :claim_released,
+          actor_label: actor_label
+        )
+      end)
       |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
         %{
           tenant_id: tenant_id,
@@ -3201,6 +3217,15 @@ defmodule Loopctl.Progress do
       )
 
     with {:ok, reset_story} <- AdminRepo.update(changeset),
+         # #803: the stage row follows the release inside the reject's transaction.
+         {:ok, _stage} <-
+           Stages.follow_release(
+             tenant_id,
+             reset_story.id,
+             reset_story.claim_epoch,
+             :claim_released,
+             actor_label: "system:auto_reset"
+           ),
          {:ok, _audit} <-
            Audit.create_log_entry(tenant_id, %{
              entity_type: "story",

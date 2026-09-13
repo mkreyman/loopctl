@@ -22,8 +22,8 @@ defmodule Loopctl.Delivery.StoryStage do
 
   Read and written through `Loopctl.Delivery.Stages` on the RLS-enforced `Loopctl.Repo`
   with an explicit `tenant_id` predicate as well. The one exception is the runner-lost
-  requeue, which runs inside the claim reclaimer's `AdminRepo` transaction — see
-  `Loopctl.Delivery.Stages.requeue_lost_runner/3`.
+  release hook, which runs inside each claim release's `AdminRepo` transaction — see
+  `Loopctl.Delivery.Stages.follow_release/5`.
   """
 
   use Loopctl.Schema
