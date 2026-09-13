@@ -29,7 +29,14 @@ defmodule Loopctl.Intake.TicketFacts do
   - `ticket_kind` — `bug` or `feature`, from the title's `[Bug] ` / `[Feature] ` prefix.
 
   `page_url` and `user_agent` are returned for the injection detector and never stored:
-  both are client-supplied, so they are exactly where a payload hides.
+  both are client-supplied, so they are exactly where a payload hides. Each is trimmed and
+  loses ONE pair of delimiters wrapping the whole value — an inline code span (one or two
+  backticks) or matching double or single quotes — because a producer formatting the issue
+  may wrap them, and a wrapper is formatting, not content. Only the outermost pair goes: a
+  backtick left inside a user agent still reaches the detector, which flags it.
+
+  The `Tenant` line is not a fact and is not read here at all (HomeCareBilling writes the
+  tenant name in a code span). It is still part of the body the detector scans.
 
   ## The reporter can type the format
 
@@ -74,6 +81,8 @@ defmodule Loopctl.Intake.TicketFacts do
     {footer_id, footer_spoof} = single(@footer_line, body, "footer")
     {page_url, page_spoof} = single(@page_line, body, "page")
     {user_agent, browser_spoof} = single(@browser_line, body, "browser")
+    page_url = unwrap(page_url)
+    user_agent = unwrap(user_agent)
 
     {ref, ticket_id, mismatch} = reconcile(ref, footer_id)
 
@@ -105,6 +114,24 @@ defmodule Loopctl.Intake.TicketFacts do
 
   # The footer id is only ever kept as confirmation of a ref. With no ref there is nothing
   # to check it against, so a footer line alone, typed or duplicated, is not a fact.
+  # Outermost first, so a double-backtick span is not mistaken for a single one.
+  @wrappers [{"``", "``"}, {"`", "`"}, {"\"", "\""}, {"'", "'"}]
+
+  defp unwrap(nil), do: nil
+
+  defp unwrap(value) do
+    trimmed = String.trim(value)
+
+    Enum.find_value(@wrappers, trimmed, fn {open, close} ->
+      if byte_size(trimmed) > byte_size(open) + byte_size(close) and
+           String.starts_with?(trimmed, open) and String.ends_with?(trimmed, close) do
+        trimmed
+        |> binary_part(byte_size(open), byte_size(trimmed) - byte_size(open) - byte_size(close))
+        |> String.trim()
+      end
+    end)
+  end
+
   defp reconcile(nil, _footer_id), do: {nil, nil, nil}
   defp reconcile(ref, nil), do: {ref, nil, nil}
 

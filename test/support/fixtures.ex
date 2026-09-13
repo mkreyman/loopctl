@@ -782,6 +782,12 @@ defmodule Loopctl.Fixtures do
     "test/support/intake_fixtures/hostile_samples.json" |> File.read!() |> Jason.decode!()
   end
 
+  # Recorded real user agents, keyed by browser and platform (#804). Every one must score at
+  # most half the user_agent_prose threshold.
+  def build(:intake_real_user_agents, _attrs) do
+    "test/support/intake_fixtures/real_user_agents.json" |> File.read!() |> Jason.decode!()
+  end
+
   # A benign HomeCareBilling support ticket, in the issue format its worker files.
   def build(:intake_benign_ticket_body, _attrs) do
     File.read!("test/support/intake_fixtures/benign_ticket_body.md")

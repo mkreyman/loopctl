@@ -33,8 +33,8 @@ defmodule Loopctl.Delivery.InjectionDetector do
     decoded path or query matches another signal or carries a dozen words of prose, or a
     markdown image whose URL has a query string (an exfiltration beacon).
   - `user_agent_prose` — a browser user agent that is not user-agent shaped: over 512
-    bytes, carrying another signal, more than three bare words outside its product tokens,
-    or six consecutive words inside a comment.
+    bytes, carrying another signal, containing a backtick, or reaching the prose score
+    threshold (see "User-agent prose score" below).
 
   Field-independent signals come from `scan/1`. `user_agent_prose` comes from
   `scan_user_agent/2`, because only the caller knows which text is a user agent.
@@ -46,6 +46,28 @@ defmodule Loopctl.Delivery.InjectionDetector do
   letters fold to ASCII) with hidden characters both removed and replaced by a space, so
   `ig<U+200B>nore` and `ignore<U+200B>previous` both still match. `hidden_characters` and
   `hidden_markup` run over the raw text.
+
+  ## User-agent prose score
+
+  `user_agent_prose_score/1` counts WORDS — tokens of two or more letters, a trailing
+  `,.;:!?` allowed — that are not user-agent vocabulary (`Mozilla`, `KHTML`, `like`,
+  `Gecko`, `Mobile`, `Android`, ...). Tokens with a digit or a `/` (`Chrome/140.0.0.0`,
+  `SM-S918B`, `x86_64`) are never words. A lowercase-initial word scores 2 and any other
+  word 1, because prose is lowercase and device model names (`Redmi Note 12 Pro`) are not.
+  The score is the larger of the words outside parenthesised comments and the words in the
+  busiest `;`- or `,`-separated part of any one comment. It fires at
+  `user_agent_prose_threshold/0` (12): six lowercase words, or twelve capitalised ones.
+
+  The MARGIN is asserted, not hoped for: every recorded real user agent in
+  `test/support/intake_fixtures/real_user_agents.json` — desktop Chrome, Firefox, Safari and
+  Edge, iOS Safari and Chrome, Samsung Internet, Android Chrome and WebView, crawlers and
+  curl — must score at most HALF the threshold, so a producer's next format change does not
+  flip a real browser over it. The one-token-under cliff this replaced (a Samsung UA wrapped
+  in a code span scored 3 against a flag at 4) is what that test exists to prevent.
+
+  A backtick anywhere in a user agent fires on its own: no browser sends one, and
+  `Loopctl.Intake.TicketFacts` has already removed a code span wrapping the whole value,
+  so one that remains is inside it.
 
   ## Limits, written in rather than discovered later
 
@@ -139,7 +161,14 @@ defmodule Loopctl.Delivery.InjectionDetector do
 
   @max_user_agent_bytes 512
   @ua_comment ~r/\(([^()]*)\)/u
-  @ua_product ~r/\A[A-Za-z0-9._+-]+(?:\/[A-Za-z0-9._+-]+)?\z/u
+  @ua_word ~r/\A(\p{L}{2,})[,.;:!?]?\z/u
+  @ua_prose_threshold 12
+
+  # Words real user agents carry outside product tokens or in their platform comments. They
+  # are not prose, so they score nothing. Compared lowercased.
+  @ua_vocabulary ~w(mozilla compatible khtml like gecko mobile safari chrome version linux
+                    android windows nt win macintosh intel mac os cpu iphone ipad ipod touch
+                    wv samsung ubuntu fedora cros build tablet x11)
 
   @doc "The signal names this module can produce."
   @spec signals() :: [atom()]
@@ -270,35 +299,50 @@ defmodule Loopctl.Delivery.InjectionDetector do
 
   defp user_agent_prose?(user_agent, generic_signals) do
     byte_size(user_agent) > @max_user_agent_bytes or generic_signals != [] or
-      bare_words_outside_comments?(user_agent) or sentence_in_comment?(user_agent)
+      String.contains?(user_agent, "`") or
+      user_agent_prose_score(user_agent) >= @ua_prose_threshold
   end
 
-  # Outside parenthesised comments a user agent is product tokens (`Chrome/128.0.0.0`),
-  # occasionally a bare one (`Mobile`). More than three bare words is prose.
-  defp bare_words_outside_comments?(user_agent) do
-    user_agent
-    |> String.replace(@ua_comment, " ")
+  @doc "The `user_agent_prose_score/1` at which `user_agent_prose` fires."
+  @spec user_agent_prose_threshold() :: pos_integer()
+  def user_agent_prose_threshold, do: @ua_prose_threshold
+
+  @doc """
+  How prose-like a user agent is. See "User-agent prose score" in the moduledoc: the larger
+  of the weighted words outside comments and in the busiest part of one comment.
+  """
+  @spec user_agent_prose_score(String.t()) :: non_neg_integer()
+  def user_agent_prose_score(user_agent) when is_binary(user_agent) do
+    outside = user_agent |> String.replace(@ua_comment, " ") |> word_score()
+
+    inside =
+      @ua_comment
+      |> Regex.scan(user_agent, capture: :all_but_first)
+      |> Enum.flat_map(fn [comment] -> String.split(comment, [";", ","]) end)
+      |> Enum.map(&word_score/1)
+      |> Enum.max(fn -> 0 end)
+
+    max(outside, inside)
+  end
+
+  defp word_score(text) do
+    text
     |> String.split(~r/\s+/u, trim: true)
-    |> Enum.reject(&(Regex.match?(@ua_product, &1) and String.contains?(&1, "/")))
-    |> length()
-    |> Kernel.>(3)
+    |> Enum.map(&token_score/1)
+    |> Enum.sum()
   end
 
-  # Inside a comment, each `;`-separated part is a short platform description
-  # (`Intel Mac OS X 10_15_7`). Six consecutive words of letters is a sentence.
-  defp sentence_in_comment?(user_agent) do
-    @ua_comment
-    |> Regex.scan(user_agent, capture: :all_but_first)
-    |> Enum.flat_map(fn [comment] -> String.split(comment, [";", ","]) end)
-    |> Enum.any?(&(longest_word_run(&1) >= 6))
-  end
+  defp token_score(token) do
+    case Regex.run(@ua_word, token, capture: :all_but_first) do
+      [word] ->
+        cond do
+          String.downcase(word) in @ua_vocabulary -> 0
+          Regex.match?(~r/\A\p{Ll}/u, word) -> 2
+          true -> 1
+        end
 
-  defp longest_word_run(part) do
-    part
-    |> String.split(~r/\s+/u, trim: true)
-    |> Enum.chunk_by(&Regex.match?(~r/\A\p{L}+\z/u, &1))
-    |> Enum.filter(fn [word | _] -> Regex.match?(~r/\A\p{L}+\z/u, word) end)
-    |> Enum.map(&length/1)
-    |> Enum.max(fn -> 0 end)
+      nil ->
+        0
+    end
   end
 end
