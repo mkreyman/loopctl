@@ -928,3 +928,13 @@ config :loopctl, Loopctl.DeliveryGates.Config,
   document:
     ~s({"version":1,"repos":{"acme/widgets":{"effect_paths":["priv/rates/**"],"human_paths":["lib/widgets_web/router.ex"],"limits":{"max_files":12,"max_changed_lines":1000}}}}),
   sha256: "2f3c86e749445d6820a406d7e3dc2127f452179b4c7f31e565a5c2d01bcc27a2"
+
+# #803: the merge precondition's pull-request source. A Mox mock, so no test reaches
+# GitHub; the DataCase default stub answers `{:error, :not_stubbed}`, which is the
+# fail-closed shape — a test that forgets to set an expectation gets an ESCALATION, never
+# a merge.
+config :loopctl, :delivery_pull_request_source, Loopctl.MockPullRequestSource
+
+# The GitHub adapter's own tests bypass the mock above and exercise the real module against
+# `Req.Test` bytes, so its response mapping is covered rather than only its interface.
+config :loopctl, :delivery_github_req_plug, {Req.Test, Loopctl.Delivery.GitHubPullRequestSource}

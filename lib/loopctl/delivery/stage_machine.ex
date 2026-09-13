@@ -243,7 +243,16 @@ defmodule Loopctl.Delivery.StageMachine do
     # instead: a resuming runner ASKS GitHub whether that head is already merged and adopts
     # the answer, rather than merging again and recording a second sha.
     merge_sha: [:merged],
-    release_id: [:deployed]
+    release_id: [:deployed],
+    # Not an effect the loop performs — the record that one was AUTHORISED (#803, review
+    # round 1). `Loopctl.Delivery.MergePrecondition` writes the head sha it allowed, at
+    # `ci`, so an already-merged pull request whose head carries no allow is escalated as
+    # an ungated merge rather than reported clean. It is here rather than in a table of its
+    # own because it is bound to the head like every other identity, and because
+    # `record_effect/5`'s idempotence is exactly the semantics an allow needs: the same
+    # head twice is the same allow, and a DIFFERENT head is `:effect_conflict` rather than
+    # a silent re-grant.
+    merge_gate_allowed_sha: [:ci]
   }
 
   # Identities that stop describing the story when an edge is taken, cleared by that edge.
@@ -253,10 +262,41 @@ defmodule Loopctl.Delivery.StageMachine do
   # same); the branch and the PR
   # live on GitHub and the next runner reuses them. Going back to implementing makes a new
   # head. A human re-queue starts over from nothing.
-  @released_clears [:runner_id, :worktree_path, :head_sha]
+  # Everything BOUND TO THE HEAD, cleared wherever `head_sha` is. An allow is granted for a
+  # head, and the merge gate's unevaluated count is kept per head, so either one left behind
+  # would speak for a head that no longer exists: the allow would authorise an unjudged
+  # commit, and the count would escalate a fresh head on its predecessor's blips.
+  # `head_keyed/0` is what the drift guard reads, so a new head-bound field cannot be added
+  # to one clause and forgotten in the others.
+  @head_keyed [:head_sha, :merge_gate_allowed_sha, :merge_gate_unevaluated]
 
-  # Every identity except `runner_id`: see `reportable_effects/0`.
-  @reportable_effects @effect_stages |> Map.keys() |> Kernel.--([:runner_id]) |> Enum.sort()
+  @released_clears [:runner_id, :worktree_path] ++ @head_keyed
+
+  # Identities CONTROL writes, which a runner may therefore never carry on a `stage` message.
+  # A LIST, not a single name, and that is the whole point: this was `-- [:runner_id]` when
+  # `runner_id` was the only one, and #823 merging added `merge_gate_allowed_sha` to
+  # `@effect_stages` — which silently made the MERGE GATE'S OWN ALLOW a reportable effect. A
+  # runner reporting `pr_open -> ci` could then have carried the allow for its own head and
+  # pre-authorised the gate that is supposed to judge it (#824, resolving the #823 merge).
+  #
+  # Neither is a thing a session does:
+  #
+  # - `runner_id` — written by the transition into `claimed`, which a runner may not report.
+  #   Letting one name it would let it attribute a story to another machine.
+  # - `merge_gate_allowed_sha` — written by `Loopctl.Delivery.MergePrecondition` at `ci`. It
+  #   is the RECORD OF A VERDICT, and the same rule that keeps `:merge_gate` off the wire
+  #   keeps its allow off too: a session may not report the outcome of a check it does not
+  #   perform, and here it would not merely report it but GRANT it.
+  #
+  # Anything the gate writes in future goes here as well. The test in
+  # `runner_contract_test.exs` binds this list to the wire schema in both directions, so a new
+  # effect that belongs on neither side goes red rather than reaching a runner.
+  @control_written_effects [:runner_id, :merge_gate_allowed_sha]
+
+  @reportable_effects @effect_stages
+                      |> Map.keys()
+                      |> Kernel.--(@control_written_effects)
+                      |> Enum.sort()
 
   @type stage ::
           :detected
@@ -298,6 +338,7 @@ defmodule Loopctl.Delivery.StageMachine do
           | :pr_number
           | :merge_sha
           | :release_id
+          | :merge_gate_allowed_sha
 
   # `merge_sha` is written ONLY as part of the transition into `merged`, both ways round:
   # it is REQUIRED there (an entry asserting a merge must name it) and it is refused to
@@ -454,22 +495,38 @@ defmodule Loopctl.Delivery.StageMachine do
   def chained?(from, to, edge),
     do: to in @chained_targets or from == :escalated or edge in @chained_edges
 
+  @doc """
+  The columns BOUND TO THE HEAD: cleared together, everywhere `head_sha` is cleared.
+
+  Not all of them are side-effect identities — `merge_gate_unevaluated` is a counter, which
+  `record_effect/5` cannot hold — so this is a separate list, and the drift guard in
+  `stage_machine_test.exs` is what keeps a new one from being added to a single clause.
+  """
+  @spec head_keyed() :: [atom()]
+  def head_keyed, do: @head_keyed
+
   @doc "Every side-effect identity column."
   @spec effects() :: [effect()]
   def effects, do: Map.keys(@effect_stages)
 
   @doc """
-  The identities a RUNNER may carry on a `stage` message, and the ones echoed back to it: every
-  effect except `runner_id`.
+  The identities a RUNNER may carry on a `stage` message, and the ones echoed back to it:
+  every effect except those CONTROL writes (`control_written_effects/0`).
 
-  Which machine holds a story is CONTROL's to record — it is written by the transition into
-  `claimed`, which a runner may not report — so letting one name a `runner_id` would let it
-  attribute a story to another machine. One declaration here, so the contract's `RunnerStage`
-  properties, the `stage` ack and the `effect_conflict` refusal all name the same set;
-  `runner_contract_test.exs` asserts the schema against it.
+  One declaration, so the contract's `RunnerStage` properties, the `stage` ack and the
+  `effect_conflict` refusal all name the same set; `runner_contract_test.exs` asserts the
+  schema against it in both directions. Read the comment above `@control_written_effects` for
+  what is held back and why — and for the case that turned it from one name into a list.
   """
   @spec reportable_effects() :: [effect()]
   def reportable_effects, do: @reportable_effects
+
+  @doc """
+  The identities CONTROL writes, which a runner may never carry. See the comment above
+  `@control_written_effects`; anything the merge gate writes in future belongs here.
+  """
+  @spec control_written_effects() :: [effect()]
+  def control_written_effects, do: @control_written_effects
 
   @doc """
   True for an identity that only a TRANSITION may write (`Loopctl.Delivery.Stages.advance/4`'s
@@ -494,10 +551,18 @@ defmodule Loopctl.Delivery.StageMachine do
   def clears(_from, :queued, edge) when edge in [:runner_lost, :claim_released],
     do: @released_clears
 
-  def clears(:escalated, :queued, :human_resolution), do: Map.keys(@effect_stages)
+  # A human re-queue starts over from nothing, so it clears the head-keyed fields too —
+  # `merge_gate_unevaluated` is not an effect, so `Map.keys(@effect_stages)` does not
+  # include it, and leaving the count standing would escalate the resolved story again on
+  # the first blip at the same commit.
+  def clears(:escalated, :queued, :human_resolution),
+    do: Enum.uniq(Map.keys(@effect_stages) ++ @head_keyed)
+
   # A refused merge never happened, so the identity recorded for it goes with the head.
-  def clears(:merged, :implementing, :merge_refused), do: [:head_sha, :merge_sha]
-  def clears(_from, :implementing, edge) when edge != :forward, do: [:head_sha]
+  def clears(:merged, :implementing, :merge_refused), do: [:merge_sha | @head_keyed]
+
+  def clears(_from, :implementing, edge) when edge != :forward, do: @head_keyed
+
   def clears(_from, _to, _edge), do: []
 
   @doc """

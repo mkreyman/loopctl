@@ -96,7 +96,8 @@ defmodule Loopctl.Tenants.TierCapabilities do
        "and bulk IMPORT. Reading projects/epics/stories stays open, and so does bulk " <>
        "EXPORT — it reads what you already own."},
     {:chain_of_custody, :human_anchored,
-     "Story lifecycle WRITES (claim/start/report/review-complete/verify), bulk lifecycle " <>
+     "Story lifecycle WRITES (claim/start/report/review-complete/verify), the delivery " <>
+       "loop's merge precondition (whose refusal escalates the story), bulk lifecycle " <>
        "operations, artifact reports, capability-token recovery, and registering the " <>
        "LCP-1 §9.2 custody owner key (root of trust). Reading story status, history and " <>
        "artifact reports stays open."},
@@ -159,6 +160,10 @@ defmodule Loopctl.Tenants.TierCapabilities do
       "LoopctlWeb.ArtifactReportController",
       "LoopctlWeb.BulkOperationsController",
       "LoopctlWeb.CapRecoveryController",
+      # #803 — the merge precondition decides whether a story's work may merge, and
+      # a refusal escalates it. Same surface as verify: it reads `verified_status`
+      # and the verifier's lineage, and it is the last gate before an outward effect.
+      "LoopctlWeb.MergePreconditionController",
       # LCP-1 §9.2 — TenantController mounts RequireHumanAnchor on
       # :register_owner_key (the custody owner key is the root of trust).
       "LoopctlWeb.TenantController"
