@@ -36,6 +36,8 @@ printf '%s\n' "$here" > "$state/cwd"
 # real environment carries credentials.
 env | awk -F= '$1 == "ANTHROPIC_API_KEY" || $1 ~ /^GIT_/ { print $1 " PRESENT"; next } $1 ~ /^LOOP_[A-Z_]*$/' > "$state/env"
 printf '%s\n' "$@" > "$state/argv"
+# claude-config's loop mode needs LOOP_STORY_FILE to be a regular, fresh file when hooks run.
+if [ -f "${LOOP_STORY_FILE:-}" ]; then echo regular > "$state/story_file"; else echo missing > "$state/story_file"; fi
 
 # What Claude Code's Bash tool does with every command (measured on 2.1.270): a NEW
 # session, so neither the launcher's group signal nor a parent walk reaches it once
@@ -67,6 +69,26 @@ case "${FAKE_CLAUDE_MODE:-stream}" in
         echo "$init"
         sleep 2.5
         echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"session_id":"'"$sid"'"}'
+        exit 0
+        ;;
+    escalate_and_continue)
+        echo "$init"
+        "$LOOP_ESCALATE" <<'ESCALATION'
+Should the billing total include voided visits? It changes $5 or $10 per `visit` — a business call.
+ESCALATION
+        # Keeps working after asking: the runner must stop it.
+        sleep 1000 >/dev/null 2>&1 &
+        wait
+        ;;
+    escalate_later_and_exit)
+        echo "$init"
+        sleep 1
+        "$LOOP_ESCALATE" "Escalated while a park stop was under way"
+        exit 0
+        ;;
+    escalate_and_exit)
+        echo "$init"
+        "$LOOP_ESCALATE" "The story contradicts an existing KB decision."
         exit 0
         ;;
     delete_run_dir)

@@ -36,6 +36,9 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
   bumps the contract, copy the file again; do not edit it here.
 - **The daemon starts only under `LOOPCTL_RUNNER_DAEMON=1`**, so `mix loopctl.run` never joins
   the pool.
+- **A loop session asks for a human by running `priv/bin/loop-escalate`**, the one command the
+  runner always pre-allows. No hook can observe a question a headless session wanted to ask, so
+  escalation must stay a command it calls; the run ends `escalated`.
 - **Unattended sessions can only run pre-allowed tools.** `--permission-prompts none` denies
   anything auto mode would have prompted for; a story's `allowed_tools` must each appear in the
   runner config's `allowed_tools`.

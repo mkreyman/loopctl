@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# loop-escalate — the one way an unattended loop session asks a human to decide something.
+#
+#   /abs/path/loop-escalate <<'ESCALATION'
+#   <the decision a human must make, and why>
+#   ESCALATION
+#
+# The reason is read from stdin through a QUOTED heredoc, so the shell expands nothing in it:
+# given as a double-quoted argument, "$5 or $10?" would be recorded as " or ?", and a
+# backtick would run a command. Arguments are still accepted when stdin is empty.
+#
+# A headless `claude -p` session has no AskUserQuestion at all, and nothing fires when the
+# model wanted to ask: no tool call is attempted, so no hook sees it (measured, KB 16d4ff67).
+# Escalation therefore has to be something the session CALLS. The runner pre-allows exactly
+# this script's absolute path, names it in the session's appended system prompt, and watches
+# the file it writes: an escalation stops the session and the run ends `escalated`.
+#
+# Writes one JSON line to $LOOP_RUN_DIR/escalations.ndjson. The reason is the session's own
+# words, recorded as data; it is capped so a runaway session cannot fill the disk.
+
+set -u
+
+: "${LOOP_RUN_DIR:?loop-escalate only works inside a loop session}"
+
+if [ ! -t 0 ]; then
+    reason=$(cat)
+else
+    reason=""
+fi
+[ -n "${reason//[[:space:]]/}" ] || reason="$*"
+if [ -z "${reason//[[:space:]]/}" ]; then
+    echo "usage: loop-escalate <<'ESCALATION' ... ESCALATION  (the decision a human must make, and why)" >&2
+    exit 2
+fi
+
+umask 077
+# Decoded as UTF-8 and cut at 4000 CHARACTERS: cutting bytes can split a character, and the
+# resulting line is not valid JSON, so the one text a human needs would be lost.
+perl -MJSON::PP -MEncode=decode -MPOSIX=strftime -e '
+    my $reason = substr(decode("UTF-8", $ARGV[0]), 0, 4000);
+    print JSON::PP->new->utf8->canonical->encode({
+        ts => strftime("%Y-%m-%dT%H:%M:%SZ", gmtime),
+        session_id => ($ENV{LOOP_SESSION_ID} // ""),
+        reason => $reason,
+    }), "\n";
+' "$reason" >> "$LOOP_RUN_DIR/escalations.ndjson" || { echo "could not record the escalation" >&2; exit 1; }
+
+echo "Escalation recorded; a human will decide. Stop working now: make no further changes and end your turn."

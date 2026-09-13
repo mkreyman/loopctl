@@ -75,6 +75,10 @@ defmodule LoopctlRunner.RunTest do
     assert argv =~ "--permission-prompts\nnone\n"
     assert argv =~ "--session-id\n#{result.session.session_id}\n"
     assert argv =~ "--allowedTools\nRead\n"
+    assert argv =~ "--allowedTools\nBash(#{LoopctlRunner.Session.escalate_script()}:*)\n"
+    assert argv =~ "--append-system-prompt\n"
+    assert argv =~ LoopctlRunner.Session.escalate_script()
+    assert File.read!(Path.join(state, "story_file")) == "regular\n"
     assert String.ends_with?(argv, "--\n- do the thing\n")
     refute argv =~ "--bare"
 
@@ -387,6 +391,85 @@ defmodule LoopctlRunner.RunTest do
 
     assert [%{"data" => %{"stragglers" => ":killed"}}] =
              Enum.filter(events!(result), &(&1["type"] == "session.exited"))
+  end
+
+  test "a session that escalates and keeps working is stopped, and the run ends escalated", %{
+    root: root,
+    state: state
+  } do
+    result =
+      run!(
+        root,
+        state,
+        [{"FAKE_CLAUDE_MODE", "escalate_and_continue"}, {"FAKE_AGENTS", "busy"}],
+        %{
+          "wall_clock_s" => 30
+        }
+      )
+
+    assert result.status == "escalated"
+    assert result.session.duration_ms < 15_000
+
+    events = events!(result)
+
+    # Literal: nothing in the heredoc was expanded, and UTF-8 survived.
+    assert [
+             %{
+               "data" => %{
+                 "reason" =>
+                   "Should the billing total include voided visits? It changes $5 or $10 per `visit` — a business call."
+               }
+             }
+           ] = Enum.filter(events, &(&1["type"] == "session.escalation_requested"))
+
+    assert "session.escalated" in types(events)
+  end
+
+  test "the escalation script cuts long UTF-8 reasons at characters, keeping valid JSON", %{
+    root: root
+  } do
+    run_dir = Path.join(root, "esc-run")
+    File.mkdir_p!(run_dir)
+    reason = String.duplicate("a", 3999) <> "—tail"
+
+    {_, 0} =
+      System.cmd("/bin/sh", ["-c", ~s|printf '%s' "$REASON" \| "$SCRIPT"|],
+        env: [
+          {"LOOP_RUN_DIR", run_dir},
+          {"LOOP_SESSION_ID", "s"},
+          {"REASON", reason},
+          {"SCRIPT", LoopctlRunner.Session.escalate_script()}
+        ],
+        stderr_to_stdout: true
+      )
+
+    line = run_dir |> Path.join("escalations.ndjson") |> File.read!() |> String.trim()
+    assert {:ok, %{"reason" => recorded}} = JSON.decode(line)
+    assert String.length(recorded) == 4000
+    assert String.ends_with?(recorded, "—")
+  end
+
+  test "a session that escalates and exits 0 still ends escalated, not succeeded", %{
+    root: root,
+    state: state
+  } do
+    result = run!(root, state, [{"FAKE_CLAUDE_MODE", "escalate_and_exit"}])
+
+    assert result.status == "escalated"
+    assert result.session.exit_status == 0
+
+    assert [%{"data" => %{"reason" => "The story contradicts an existing KB decision."}}] =
+             Enum.filter(events!(result), &(&1["type"] == "session.escalation_requested"))
+
+    assert {:ok, [line]} =
+             result.run_dir
+             |> Path.join("escalations.ndjson")
+             |> File.read!()
+             |> String.split("\n", trim: true)
+             |> then(&{:ok, &1})
+
+    assert {:ok, %{"session_id" => sid}} = JSON.decode(line)
+    assert sid == result.session.session_id
   end
 
   test "a worktree failure is recorded and nothing is started", %{root: root, state: state} do

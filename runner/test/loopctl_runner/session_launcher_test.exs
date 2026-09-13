@@ -165,6 +165,31 @@ defmodule LoopctlRunner.SessionLauncherTest do
     assert micros < 4_000_000
   end
 
+  test "an escalation recorded while a park stop is under way makes the session escalated", ctx do
+    System.put_env("FAKE_CLAUDE_MODE", "escalate_later_and_exit")
+    root = tmp_dir!("park-escalate")
+    config = config!(root, %{"liveness_interval_s" => 60})
+    {:ok, story} = LoopctlRunner.Story.from_map(story_map(), config)
+    run_dir = Path.join(root, "run")
+    File.mkdir_p!(run_dir)
+    {:ok, trace} = LoopctlRunner.Trace.start_link(Path.join(run_dir, "trace.ndjson"), "pe")
+
+    {:ok, pid} =
+      GenServer.start(Session,
+        config: config,
+        story: story,
+        worktree: ctx.state,
+        run_dir: run_dir,
+        trace: trace,
+        parent: nil,
+        waiter: self()
+      )
+
+    :sys.replace_state(pid, &Map.put(&1, :reason, :parked))
+
+    assert_receive {:session_result, ^pid, %{reason: :escalated, exit_status: 0}}, 15_000
+  end
+
   test "exit_reason/2: a CLI that exits 0 during a park stop exited on its own" do
     assert Session.exit_reason(:parked, 0) == :exited
     assert Session.exit_reason(:parked, 143) == :parked

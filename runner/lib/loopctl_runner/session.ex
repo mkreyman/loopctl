@@ -35,7 +35,7 @@ defmodule LoopctlRunner.Session do
           session_id: String.t(),
           os_pid: pos_integer(),
           exit_status: non_neg_integer(),
-          reason: :exited | :wall_clock_exceeded | :parked | :not_group_leader,
+          reason: :exited | :wall_clock_exceeded | :parked | :not_group_leader | :escalated,
           duration_ms: non_neg_integer()
         }
 
@@ -68,6 +68,34 @@ defmodule LoopctlRunner.Session do
   @spec launcher_script() :: String.t()
   def launcher_script, do: Application.app_dir(:loopctl_runner, "priv/bin/session-launcher.sh")
 
+  @escalation_check_ms 2_000
+
+  @doc "The absolute path of the escalation command a session is allowed to run."
+  @spec escalate_script() :: String.t()
+  def escalate_script, do: Application.app_dir(:loopctl_runner, "priv/bin/loop-escalate")
+
+  @doc """
+  Appended to the session's system prompt: how to ask for a human, since it cannot ask.
+
+  A headless session has no AskUserQuestion and no hook observes a question it wanted to ask
+  (KB 16d4ff67), so escalation is a command it calls: exactly one absolute path, pre-allowed.
+  """
+  @spec escalation_prompt() :: String.t()
+  def escalation_prompt do
+    """
+    You are running unattended: nobody can answer a question, and guessing on a decision that \
+    belongs to a human is worse than stopping. If you need a human to decide something — the \
+    request is ambiguous, contradicts existing behaviour, removes behaviour someone added \
+    deliberately, or needs a business call — run this command with the Bash tool, keeping the \
+    quoted heredoc exactly as shown so nothing in your text is expanded, then stop working and \
+    end your turn:
+
+        #{escalate_script()} <<'ESCALATION'
+        <the decision a human must make, and why>
+        ESCALATION
+    """
+  end
+
   @doc "The argv handed to claude-headless.sh."
   @spec claude_args(Story.t(), String.t()) :: [String.t()]
   def claude_args(%Story{} = story, session_id) do
@@ -89,6 +117,8 @@ defmodule LoopctlRunner.Session do
     ] ++
       if(story.model, do: ["--model", story.model], else: []) ++
       Enum.flat_map(story.allowed_tools, &["--allowedTools", &1]) ++
+      ["--allowedTools", "Bash(#{escalate_script()}:*)"] ++
+      ["--append-system-prompt", escalation_prompt()] ++
       ["--", story.prompt]
   end
 
@@ -134,6 +164,7 @@ defmodule LoopctlRunner.Session do
 
     Process.send_after(self(), :wall_clock, story.wall_clock_s * 1000)
     Process.send_after(self(), :verify_group, @verify_group_after_ms)
+    Process.send_after(self(), :check_escalation, @escalation_check_ms)
     schedule_tick(config)
 
     {:ok,
@@ -151,6 +182,8 @@ defmodule LoopctlRunner.Session do
        stream: StreamEvents.new(session_seq),
        stdout_io: stdout_io,
        partial: "",
+       escalation_file: Path.join(run_dir, "escalations.ndjson"),
+       escalations_seen: 0,
        started_ms: now,
        last_stdout_ms: now,
        reason: nil
@@ -159,6 +192,7 @@ defmodule LoopctlRunner.Session do
 
   defp port_env(run_dir, session_id, config, extra) do
     base = [
+      {"LOOP_ESCALATE", escalate_script()},
       {"LOOP_MODE", "1"},
       {"LOOP_RUN_DIR", run_dir},
       {"LOOP_STORY_FILE", Path.join(run_dir, "story.json")},
@@ -189,7 +223,7 @@ defmodule LoopctlRunner.Session do
   end
 
   def handle_info({port, {:exit_status, status}}, %{port: port} = state) do
-    state = flush_partial(state)
+    state = state |> flush_partial() |> record_escalations()
     reason = exit_reason(state.reason, status)
     stragglers = reap_stragglers(state)
 
@@ -237,6 +271,24 @@ defmodule LoopctlRunner.Session do
   def handle_info(:wall_clock, state) do
     data = %{"wall_clock_s" => state.story.wall_clock_s}
     {:noreply, stop_session(state, :wall_clock_exceeded, data)}
+  end
+
+  def handle_info(:check_escalation, %{port: nil} = state), do: {:noreply, state}
+
+  def handle_info(:check_escalation, %{reason: reason} = state) when reason != nil,
+    do: {:noreply, state}
+
+  # A session that escalated has handed the decision to a human; it is stopped even if it
+  # keeps working, so nothing it does after asking can pre-empt the answer.
+  def handle_info(:check_escalation, state) do
+    case record_escalations(state) do
+      %{reason: :escalated} = state ->
+        {:noreply, stop_session(%{state | reason: nil}, :escalated, %{"stopped_by" => "runner"})}
+
+      state ->
+        Process.send_after(self(), :check_escalation, @escalation_check_ms)
+        {:noreply, state}
+    end
   end
 
   def handle_info(:liveness_tick, %{port: nil} = state), do: {:noreply, state}
@@ -323,6 +375,44 @@ defmodule LoopctlRunner.Session do
   end
 
   defp unless_port_spoke(verdict, _port), do: verdict
+
+  # Emits a trace event per escalation line not yet seen, and marks the session escalated.
+  defp record_escalations(state) do
+    lines =
+      case File.read(state.escalation_file) do
+        {:ok, raw} -> String.split(raw, "\n", trim: true)
+        {:error, _} -> []
+      end
+
+    new = Enum.drop(lines, state.escalations_seen)
+
+    Enum.each(new, fn line ->
+      Trace.emit(
+        state.trace,
+        "session.escalation_requested",
+        state.session_seq,
+        escalation_data(line)
+      )
+    end)
+
+    state = %{state | escalations_seen: length(lines)}
+
+    # An escalation outranks a park or wall-clock stop already under way: the session asked
+    # for a human, and that is what the run must report.
+    if new != [] and state.reason in [nil, :parked, :wall_clock_exceeded],
+      do: %{state | reason: :escalated},
+      else: state
+  end
+
+  defp escalation_data(line) do
+    case JSON.decode(line) do
+      {:ok, %{"reason" => reason} = record} when is_binary(reason) ->
+        %{"reason" => String.slice(reason, 0, 4000), "ts" => record["ts"]}
+
+      _ ->
+        %{"reason" => nil, "unparseable_bytes" => byte_size(line)}
+    end
+  end
 
   @doc """
   Why a session ended, given the stop already under way (if any) and the exit status.

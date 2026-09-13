@@ -267,16 +267,26 @@ control lives on `PermissionDenied`, which does not fire for `PreToolUse` denial
 bounds an unattended session re-asking. And never pair it with `permissionDecision: "allow"` plus
 `additionalContext` — `allow` means the tool *runs*, which is the hang the flag exists to prevent.
 
-Keep a hook only for what the flag cannot do: emitting the **escalation** signal when the model
-wanted to ask. Register it on `PermissionDenied`. Default that path to escalate, not deny — a
-stateless hook cannot judge "can this be answered" over free text, and denying by default means
-the session silently guesses. Log every suppressed question into the trace so "the answer is
-already in the story" becomes measurable.
+**Escalation is a command the session calls, not a hook watching for a question.** A headless
+`claude -p` has no `AskUserQuestion` at all, with or without the flag, and nothing fires when the
+model wanted to ask: no tool call is attempted, so neither `PreToolUse` nor `PermissionDenied`
+sees anything (measured on 2.1.270, KB `16d4ff67`). The runner therefore:
 
-If a hook is used, it is **one script branching on `LOOP_MODE`**, not a sibling on the same
-matcher as `gate-ask-user-question.sh` — two hooks denying the same call with contradictory
-instructions is worse than either. The runner passes `LOOP_MODE=1 LOOP_STORY_FILE=...` in the
-environment, which hooks inherit.
+- ships `priv/bin/loop-escalate` and pre-allows exactly that absolute path
+  (`--allowedTools "Bash(<path>:*)"`, verified to run under `--permission-prompts none`);
+- tells the session through `--append-system-prompt` to run it, with the decision and the reason,
+  and stop, whenever a request is ambiguous, contradicts existing behaviour, removes deliberate
+  behaviour, or needs a business call;
+- watches the run's `escalations.ndjson` every two seconds and at exit. Each line becomes a
+  `session.escalation_requested` trace event carrying the session's words as data, the session is
+  stopped if it keeps working, and the run ends `escalated` even when the CLI exits 0.
+
+The escalation text is session-authored and untrusted, like reporter text (§10): it is recorded,
+capped, and never executed.
+
+The runner passes `LOOP_MODE=1` and `LOOP_STORY_FILE` (a regular file written just before the
+session starts) in the environment, which hooks inherit. claude-config's loop mode keys on both,
+and on the story file's freshness, to stand `gate-unmerged-pr` down for loop sessions.
 
 **Parking detection.** Do not use "no writes under `subagents/` in N minutes" — measured on
 mac-mini, **0 of 1,543 project directories** contain one, because that directory exists only when
