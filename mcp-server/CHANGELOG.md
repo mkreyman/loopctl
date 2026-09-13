@@ -5,6 +5,17 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.92.0 — 2026-09-12 (runner tools: enroll writes the token to a 0600 file, never the transcript)
+
+### Added
+
+- **`runner_enroll`, `runner_list`, `runner_revoke`, `runner_pool`** (issue #809), all on
+  `LOOPCTL_USER_KEY`. `runner_enroll` writes the runner's credential to the required
+  `token_file` (created exclusively, mode 0600, parent directories 0700) and returns only the
+  runner row and the path; an existing `token_file` is refused before anything is enrolled,
+  and a write that fails after enrollment revokes the runner. `runner_pool` reads the new
+  `GET /api/v1/runners/pool`, which needs a loopctl server that has it.
+
 ## 2.91.1 — 2026-09-12 (payload_path no longer discloses or uploads files that are not a payload)
 
 ### Security

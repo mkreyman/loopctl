@@ -44,6 +44,7 @@ import {
 } from "./lib/generated-tools.js";
 import { createHandoff } from "./lib/handoff.js";
 import { readPayloadFile } from "./lib/payload-path.js";
+import { enrollRunner, listRunners, revokeRunner, runnerPool } from "./lib/runners.js";
 
 // Single source of truth for the server version: the package.json this file
 // ships with (npm always includes package.json in the published tarball).
@@ -3095,6 +3096,34 @@ async function revokeAuthenticator({ tenant_id, authenticator_id, webauthn_asser
     { exactKey: true },
   );
   return toContent(result);
+}
+
+// Issue #809: runner tools. All four take the EXACT user-role key: a runner credential
+// is minted by a user key on a human-anchored tenant, and a global LOOPCTL_API_KEY must
+// never stand in for it. The logic, including how runner_enroll keeps the token out of
+// the tool result, lives in lib/runners.js.
+function runnerDeps() {
+  const userKey = process.env.LOOPCTL_USER_KEY;
+  return {
+    userKey,
+    apiCall: (method, path, body) => apiCall(method, path, body, userKey, { exactKey: true }),
+  };
+}
+
+async function runnerEnroll(args) {
+  return toContent(await enrollRunner(args, runnerDeps()));
+}
+
+async function runnerList(args) {
+  return toContent(await listRunners(args, runnerDeps()));
+}
+
+async function runnerRevoke(args) {
+  return toContent(await revokeRunner(args, runnerDeps()));
+}
+
+async function runnerPoolRead(args) {
+  return toContent(await runnerPool(args, runnerDeps()));
 }
 
 // US-26: Signed Tree Head retrieval
@@ -7392,6 +7421,78 @@ const TOOLS = [
     },
   },
 
+  // Issue #809: runner enrollment and the Presence pool (user key)
+  {
+    name: "runner_enroll",
+    description:
+      "Enroll this dev machine as a runner of the agent delivery loop (POST /api/v1/runners). " +
+      "The runner's credential is written to `token_file` with mode 0600 and is NEVER returned: " +
+      "whoever holds it can join as this machine and receive its dispatches, and a tool result " +
+      "lands in the transcript. The result is only `{ runner: {id, name, inserted_at}, token_file }`. " +
+      "The file is created exclusively (O_EXCL): an existing path is refused before anything is " +
+      "enrolled, never overwritten. Missing parent directories are created with mode 0700. If the " +
+      "token cannot be written after enrollment, the runner is revoked before the error returns. " +
+      "runner_revoke is the undo for an enrollment. Requires LOOPCTL_USER_KEY (user role) on a " +
+      "human-anchored tenant; errors pass through with their code (422 name malformed or taken, " +
+      "403 custody_tier_required or api_key_mint_forbidden).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          description: "The machine name the runner will declare when it joins, e.g. `minis`.",
+        },
+        token_file: {
+          type: "string",
+          description:
+            "Absolute path, or one starting with ~/, for the token file. Must not exist yet.",
+        },
+      },
+      required: ["name", "token_file"],
+    },
+  },
+  {
+    name: "runner_list",
+    description:
+      "List the tenant's enrolled runners (GET /api/v1/runners): id, name, revoked_at, inserted_at. " +
+      "Enrollment only, never tokens; whether a runner is CONNECTED is runner_pool. " +
+      "Requires LOOPCTL_USER_KEY (user role).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        include_revoked: {
+          type: "boolean",
+          description: "Include revoked runners. Default false.",
+        },
+      },
+    },
+  },
+  {
+    name: "runner_revoke",
+    description:
+      "Revoke a runner (DELETE /api/v1/runners/:id): its credential stops authenticating and its " +
+      "live socket is disconnected, which removes it from runner_pool. This is the undo for " +
+      "runner_enroll. Idempotent. Requires LOOPCTL_USER_KEY (user role) on a human-anchored tenant.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "The runner UUID (from runner_enroll or runner_list)." },
+      },
+      required: ["id"],
+    },
+  },
+  {
+    name: "runner_pool",
+    description:
+      "The tenant's CONNECTED runners, read from Presence (GET /api/v1/runners/pool): per machine " +
+      "name, runner_id, joined_at, in_flight, draining, max_sessions, the latest health sample, " +
+      "and live_sockets. live_sockets above 1 means more than one process holds that runner's " +
+      "credential. A killed runner disappears once its socket closes. Presence converges only " +
+      "within a cluster, so on an unclustered multi-node deployment a runner on another node is " +
+      "absent. Requires LOOPCTL_USER_KEY (user role).",
+    inputSchema: { type: "object", properties: {} },
+  },
+
   // LCP-1 §9 signed-profile tools
   {
     name: "register_custody_owner_key",
@@ -8395,6 +8496,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "dispatch":
       return await createDispatch(args);
+
+    case "runner_enroll":
+      return await runnerEnroll(args);
+
+    case "runner_list":
+      return await runnerList(args);
+
+    case "runner_revoke":
+      return await runnerRevoke(args);
+
+    case "runner_pool":
+      return await runnerPoolRead(args);
 
     case "register_custody_owner_key":
       return await registerCustodyOwnerKey(args);

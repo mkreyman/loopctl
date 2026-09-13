@@ -2,6 +2,7 @@ defmodule LoopctlWeb.RunnerControllerTest do
   use LoopctlWeb.ConnCase, async: true
 
   alias Loopctl.Runners
+  alias Loopctl.Runners.Presence
 
   setup :verify_on_exit!
 
@@ -151,6 +152,148 @@ defmodule LoopctlWeb.RunnerControllerTest do
              |> json_response(404)
 
       assert {:ok, _} = Runners.authenticate(raw_other)
+    end
+  end
+
+  describe "GET /api/v1/runners/pool" do
+    # Tracks a runner in its tenant's pool the way RunnerChannel does, against a stand-in
+    # process: the entry lives exactly as long as that process.
+    defp track_runner(runner, overrides \\ %{}) do
+      pid = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
+
+      meta =
+        Map.merge(
+          %{
+            contract_version: "1.0",
+            machine: runner.name,
+            cores: 16,
+            memory_mb: 28_000,
+            repos: ["mkreyman/loopctl"],
+            max_sessions: 2,
+            in_flight: 1,
+            draining: false,
+            joined_at: DateTime.utc_now(),
+            runner_id: runner.id
+          },
+          overrides
+        )
+
+      {:ok, _ref} = Presence.track(pid, Runners.pool_topic(runner.tenant_id), runner.name, meta)
+      pid
+    end
+
+    test "returns a connected runner with its meta and latest sample", %{conn: conn} do
+      ctx = operator_ctx()
+      {_raw, runner} = fixture(:runner, %{tenant_id: ctx.tenant.id, name: "minis"})
+
+      sample = %{
+        sampled_at: "2026-09-12T10:00:00Z",
+        loadavg_1m: 0.5,
+        free_ram_mb: 12_000,
+        free_disk_mb: 400_000
+      }
+
+      track_runner(runner, %{sample: sample})
+
+      assert %{"runners" => [entry]} =
+               conn
+               |> auth(ctx.operator_key)
+               |> get(~p"/api/v1/runners/pool")
+               |> json_response(200)
+
+      assert entry["machine"] == "minis"
+      assert entry["runner_id"] == runner.id
+      assert entry["in_flight"] == 1
+      assert entry["draining"] == false
+      assert entry["max_sessions"] == 2
+      assert entry["live_sockets"] == 1
+      assert {:ok, _, _} = DateTime.from_iso8601(entry["joined_at"])
+      assert entry["sample"]["free_ram_mb"] == 12_000
+    end
+
+    test "is empty when no runner is connected, and a sample is null until reported",
+         %{conn: conn} do
+      ctx = operator_ctx()
+      authed = auth(conn, ctx.operator_key)
+      {_raw, runner} = fixture(:runner, %{tenant_id: ctx.tenant.id, name: "blockit"})
+
+      assert json_response(get(authed, ~p"/api/v1/runners/pool"), 200) == %{"runners" => []}
+
+      track_runner(runner)
+
+      assert %{"runners" => [%{"machine" => "blockit", "sample" => nil}]} =
+               json_response(get(authed, ~p"/api/v1/runners/pool"), 200)
+    end
+
+    test "surfaces two live sockets on one credential and shows the newest", %{conn: conn} do
+      ctx = operator_ctx()
+      {_raw, runner} = fixture(:runner, %{tenant_id: ctx.tenant.id, name: "mac-mini"})
+
+      track_runner(runner, %{joined_at: ~U[2026-09-12 09:00:00Z], in_flight: 0})
+      track_runner(runner, %{joined_at: ~U[2026-09-12 10:00:00Z], in_flight: 2})
+
+      assert %{"runners" => [entry]} =
+               conn
+               |> auth(ctx.operator_key)
+               |> get(~p"/api/v1/runners/pool")
+               |> json_response(200)
+
+      assert entry["live_sockets"] == 2
+      assert entry["in_flight"] == 2
+      assert entry["joined_at"] == "2026-09-12T10:00:00Z"
+    end
+
+    test "is tenant-scoped: another tenant's key sees none of this tenant's runners" do
+      ctx_a = operator_ctx()
+      ctx_b = operator_ctx()
+      {_raw, runner_a} = fixture(:runner, %{tenant_id: ctx_a.tenant.id, name: "minis"})
+      {_raw, runner_b} = fixture(:runner, %{tenant_id: ctx_b.tenant.id, name: "nuc"})
+      track_runner(runner_a)
+      track_runner(runner_b)
+
+      machines = fn raw_key ->
+        build_conn()
+        |> auth(raw_key)
+        |> get(~p"/api/v1/runners/pool")
+        |> json_response(200)
+        |> Map.fetch!("runners")
+        |> Enum.map(& &1["machine"])
+      end
+
+      assert machines.(ctx_a.operator_key) == ["minis"]
+      assert machines.(ctx_b.operator_key) == ["nuc"]
+    end
+
+    test "403 for orchestrator and agent keys", %{conn: conn} do
+      ctx = operator_ctx()
+      {_raw, runner} = fixture(:runner, %{tenant_id: ctx.tenant.id, name: "minis"})
+      track_runner(runner)
+
+      for role <- [:orchestrator, :agent] do
+        {raw, _} = fixture(:api_key, %{tenant_id: ctx.tenant.id, role: role})
+
+        body =
+          conn
+          |> auth(raw)
+          |> get(~p"/api/v1/runners/pool")
+          |> json_response(403)
+
+        refute Map.has_key?(body, "runners")
+      end
+    end
+
+    test "is a read, so an agent-rooted tenant's user key may call it", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      assert json_response(get(auth(conn, raw), ~p"/api/v1/runners/pool"), 200) ==
+               %{"runners" => []}
+    end
+
+    test "resolves to the pool action, not a runner id" do
+      assert %{plug: LoopctlWeb.RunnerController, plug_opts: :pool} =
+               Phoenix.Router.route_info(LoopctlWeb.Router, "GET", "/api/v1/runners/pool", "")
     end
   end
 end

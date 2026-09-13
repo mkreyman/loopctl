@@ -4,6 +4,17 @@ All notable changes to loopctl are documented here.
 
 ## [Unreleased] — 2026-08-21 — The provenance harvest runs on a cadence
 
+### Added
+
+- **`GET /api/v1/runners/pool` (#809).** The caller's tenant's CONNECTED runners, read from
+  Presence: per machine name, `runner_id`, `joined_at`, `in_flight`, `draining`,
+  `max_sessions`, the latest health `sample`, and `live_sockets` (above 1 means more than one
+  process holds that runner's credential). User role; a read, so not human-anchor gated.
+  Presence converges only within a cluster: on more than one unclustered node, a runner
+  connected to another node is absent. The MCP tools `runner_enroll`, `runner_list`,
+  `runner_revoke` and `runner_pool` (loopctl-mcp-server 2.92.0) use it and the existing
+  `/api/v1/runners` routes; `runner_pool` needs a server carrying this endpoint.
+
 ### Changed
 
 - **The usage-based importance prior is now ENABLED (#790).**
