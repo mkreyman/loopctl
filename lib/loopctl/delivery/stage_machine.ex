@@ -270,6 +270,14 @@ defmodule Loopctl.Delivery.StageMachine do
   # to one clause and forgotten in the others.
   @head_keyed [:head_sha, :merge_gate_allowed_sha, :merge_gate_unevaluated]
 
+  # Everything BOUND TO THE MERGE, cleared wherever `merge_sha` is. The same rule as
+  # `@head_keyed` one identity along: post-deploy verification's unresolved count is kept
+  # per MERGE (a sweep asks "is THIS merge deployed?"), so a count left behind after the
+  # merge was retracted would escalate the next merge on its predecessor's blips.
+  # `merge_keyed/0` is what the drift guard reads, so a new merge-bound field cannot be
+  # added to one clause and forgotten in the others.
+  @merge_keyed [:merge_sha, :post_deploy_unresolved]
+
   @released_clears [:runner_id, :worktree_path] ++ @head_keyed
 
   # Identities CONTROL writes, which a runner may therefore never carry on a `stage` message.
@@ -505,6 +513,16 @@ defmodule Loopctl.Delivery.StageMachine do
   @spec head_keyed() :: [atom()]
   def head_keyed, do: @head_keyed
 
+  @doc """
+  The columns BOUND TO THE MERGE: cleared together, everywhere `merge_sha` is.
+
+  `post_deploy_unresolved` is a counter, which `record_effect/5` cannot hold, so this is a
+  separate list from `effects/0` for the same reason `head_keyed/0` is; the drift guard in
+  `stage_machine_test.exs` keeps a new one from being added to a single clause.
+  """
+  @spec merge_keyed() :: [atom()]
+  def merge_keyed, do: @merge_keyed
+
   @doc "Every side-effect identity column."
   @spec effects() :: [effect()]
   def effects, do: Map.keys(@effect_stages)
@@ -551,15 +569,16 @@ defmodule Loopctl.Delivery.StageMachine do
   def clears(_from, :queued, edge) when edge in [:runner_lost, :claim_released],
     do: @released_clears
 
-  # A human re-queue starts over from nothing, so it clears the head-keyed fields too —
-  # `merge_gate_unevaluated` is not an effect, so `Map.keys(@effect_stages)` does not
-  # include it, and leaving the count standing would escalate the resolved story again on
-  # the first blip at the same commit.
+  # A human re-queue starts over from nothing, so it clears the head-keyed and merge-keyed
+  # fields too — neither counter is an effect, so `Map.keys(@effect_stages)` does not
+  # include them, and leaving one standing would escalate the resolved story again on the
+  # first blip at the same commit.
   def clears(:escalated, :queued, :human_resolution),
-    do: Enum.uniq(Map.keys(@effect_stages) ++ @head_keyed)
+    do: Enum.uniq(Map.keys(@effect_stages) ++ @head_keyed ++ @merge_keyed)
 
-  # A refused merge never happened, so the identity recorded for it goes with the head.
-  def clears(:merged, :implementing, :merge_refused), do: [:merge_sha | @head_keyed]
+  # A refused merge never happened, so the identity recorded for it goes with the head —
+  # and so does everything keyed to that merge.
+  def clears(:merged, :implementing, :merge_refused), do: @merge_keyed ++ @head_keyed
 
   def clears(_from, :implementing, edge) when edge != :forward, do: @head_keyed
 

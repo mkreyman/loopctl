@@ -268,7 +268,25 @@ defmodule Loopctl.Delivery.StageMachineTest do
 
   test "a refused merge clears the identity it never realised, and the head with it" do
     assert Enum.sort(StageMachine.clears(:merged, :implementing, :merge_refused)) ==
-             Enum.sort([:merge_sha | StageMachine.head_keyed()])
+             Enum.sort(StageMachine.merge_keyed() ++ StageMachine.head_keyed())
+  end
+
+  # The merge-keyed twin of the head-keyed guard below, added with post-deploy
+  # verification's unresolved count (#803 §9). It is kept per MERGE, so one left behind
+  # after the merge was retracted would escalate the NEXT merge on its predecessor's blips.
+  test "EVERY merge-keyed field is cleared wherever merge_sha is, on every transition" do
+    merge_keyed = MapSet.new(StageMachine.merge_keyed())
+    assert :merge_sha in merge_keyed
+
+    for {from, to, edge} <- StageMachine.transitions() do
+      cleared = MapSet.new(StageMachine.clears(from, to, edge))
+
+      if :merge_sha in cleared do
+        assert MapSet.subset?(merge_keyed, cleared),
+               "#{from} -> #{to} (#{edge}) clears merge_sha but not " <>
+                 inspect(MapSet.to_list(MapSet.difference(merge_keyed, cleared)))
+      end
+    end
   end
 
   # The drift guard (#803 review rounds 1-3). Three fields are bound to the head — the head
@@ -294,6 +312,7 @@ defmodule Loopctl.Delivery.StageMachineTest do
     cleared = MapSet.new(StageMachine.clears(:escalated, :queued, :human_resolution))
 
     assert MapSet.subset?(MapSet.new(StageMachine.head_keyed()), cleared)
+    assert MapSet.subset?(MapSet.new(StageMachine.merge_keyed()), cleared)
     assert MapSet.subset?(MapSet.new(StageMachine.effects()), cleared)
   end
 

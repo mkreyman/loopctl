@@ -333,9 +333,139 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
     end
   end
 
+  describe "latest_deployment/2 — the DEPLOYMENT, never a workflow run" do
+    test "reads the newest deployment of the environment and its latest state" do
+      # Design §9: the deployment's own `sha` is what the deploying job recorded. The
+      # workflow run's head is what GitHub ATTRIBUTED, and the two diverge whenever two
+      # merges land minutes apart.
+      stub(fn conn ->
+        case {conn.request_path, conn.query_string} do
+          {"/repos/acme/widgets/deployments", "environment=production&per_page=1"} ->
+            json(conn, [%{"id" => 501, "sha" => @head}])
+
+          {"/repos/acme/widgets/deployments/501/statuses", "per_page=1"} ->
+            json(conn, [%{"state" => "success"}])
+
+          other ->
+            flunk("unexpected request: #{inspect(other)}")
+        end
+      end)
+
+      assert {:ok, %{id: 501, sha: @head, state: :success}} =
+               Source.latest_deployment(@repo, "production")
+    end
+
+    test "an environment with no deployments is a FACT, not a failure" do
+      # The verifier fails closed on it — it cannot tell what is running — but calling it an
+      # error would put it in the transient/permanent classification, where it does not
+      # belong: it is not going to clear on a retry, and it is not a contract change either.
+      stub(fn conn -> json(conn, []) end)
+
+      assert {:ok, nil} = Source.latest_deployment(@repo, "staging")
+    end
+
+    for {state, mapped} <- [
+          {"failure", :failure},
+          {"error", :error},
+          {"inactive", :inactive},
+          {"queued", :pending},
+          {"pending", :pending},
+          {"in_progress", :pending}
+        ] do
+      test "a #{state} status maps to #{inspect(mapped)}" do
+        stub(&deployment_route(&1, [%{"state" => unquote(state)}]))
+
+        assert {:ok, %{state: unquote(mapped)}} = Source.latest_deployment(@repo, "production")
+      end
+    end
+
+    test "a deployment with NO status has not settled, which is not a failure" do
+      stub(&deployment_route(&1, []))
+
+      assert {:ok, %{state: :pending}} = Source.latest_deployment(@repo, "production")
+    end
+
+    test "a state this module does not map is refused, never approximated to success" do
+      stub(&deployment_route(&1, [%{"state" => "abandoned"}]))
+
+      assert {:error, {:unrecognised_deployment_state, "abandoned"}} =
+               Source.latest_deployment(@repo, "production")
+    end
+
+    test "a deployment list this module cannot read is refused" do
+      stub(fn conn -> json(conn, %{"message" => "Not Found"}) end)
+
+      assert {:error, {:unreadable_deployments, {:map, ["message"]}}} =
+               Source.latest_deployment(@repo, "production")
+    end
+
+    test "an environment name that could change the request is refused before it is sent" do
+      # It is spliced into a QUERY parameter, so the same rule as a ref: nothing that could
+      # add a parameter of its own or address a different resource.
+      stub(fn conn -> flunk("must not reach the forge: #{conn.request_path}") end)
+
+      assert {:error, {:invalid_environment, "prod&per_page=100"}} =
+               Source.latest_deployment(@repo, "prod&per_page=100")
+
+      assert {:error, {:invalid_environment, nil}} = Source.latest_deployment(@repo, nil)
+
+      assert {:error, {:invalid_environment, :unreadable}} =
+               Source.latest_deployment(@repo, 42.0)
+    end
+  end
+
+  describe "contains?/3 — containment, which is why verification is not sha equality" do
+    for {status, contained} <- [
+          {"identical", true},
+          {"ahead", true},
+          {"behind", false},
+          {"diverged", false}
+        ] do
+      test "a #{status} comparison means contained=#{contained}" do
+        # `compare/<sha>...<ref>` describes the HEAD relative to the BASE, so `ahead` is
+        # `ref` ahead of `sha` — i.e. `sha` is an ancestor of it, and the merge shipped.
+        stub(fn conn ->
+          assert conn.request_path == "/repos/acme/widgets/compare/#{@head}...#{@merge_base}"
+          json(conn, %{"status" => unquote(status)})
+        end)
+
+        assert {:ok, unquote(contained)} = Source.contains?(@repo, @head, @merge_base)
+      end
+    end
+
+    test "a status this module does not recognise is refused" do
+      stub(fn conn -> json(conn, %{"status" => "sideways"}) end)
+
+      assert {:error, {:unrecognised_compare_status, "sideways"}} =
+               Source.contains?(@repo, @head, @merge_base)
+    end
+
+    test "a body with no status is refused, never read as containment" do
+      stub(fn conn -> json(conn, %{"commits" => []}) end)
+
+      assert {:error, {:unreadable_compare, {:map, ["commits"]}}} =
+               Source.contains?(@repo, @head, @merge_base)
+    end
+
+    test "both refs are validated: either one is spliced into the URL path" do
+      stub(fn conn -> flunk("must not reach the forge: #{conn.request_path}") end)
+
+      assert {:error, {:invalid_ref, "a?b"}} = Source.contains?(@repo, "a?b", @merge_base)
+      assert {:error, {:invalid_ref, "a#b"}} = Source.contains?(@repo, @head, "a#b")
+    end
+  end
+
   # -- helpers ---------------------------------------------------------------------------
 
   defp stub(fun), do: Req.Test.stub(Source, fun)
+
+  defp deployment_route(conn, statuses) do
+    case conn.request_path do
+      "/repos/acme/widgets/deployments" -> json(conn, [%{"id" => 501, "sha" => @head}])
+      "/repos/acme/widgets/deployments/501/statuses" -> json(conn, statuses)
+      other -> flunk("unexpected request path: #{other}")
+    end
+  end
 
   defp route(conn, opts) do
     case conn.request_path do

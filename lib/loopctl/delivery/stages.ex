@@ -447,6 +447,34 @@ defmodule Loopctl.Delivery.Stages do
     end
   end
 
+  # The two NO-VERDICT counters, as data, so one implementation serves both and a third
+  # cannot arrive with its own copy of the arithmetic (#803 §9).
+  #
+  # Each belongs to ONE gate at ONE stage, keyed to the identity that gate is about:
+  #
+  # - `:merge_gate` — the merge precondition at `ci`, keyed to `head_sha`. Head-keyed, so
+  #   every edge that clears the head clears it (`StageMachine.head_keyed/0`).
+  # - `:post_deploy` — post-deploy verification at `deployed`, keyed to `merge_sha`.
+  #   Merge-keyed instead (`StageMachine.merge_keyed/0`), because a sweep asks whether THIS
+  #   merge is deployed and a retracted merge takes its count with it.
+  #
+  # They are separate COLUMNS rather than two keys of one map: clearing a verdict at one
+  # gate must not clear the other's count, and the two are cleared by different edges.
+  @counters %{
+    merge_gate: %{
+      column: :merge_gate_unevaluated,
+      key: "head_sha",
+      stage: :ci,
+      event: "merge_gate_unevaluated"
+    },
+    post_deploy: %{
+      column: :post_deploy_unresolved,
+      key: "merge_sha",
+      stage: :deployed,
+      event: "post_deploy_unresolved"
+    }
+  }
+
   @doc """
   Counts a merge-gate evaluation at `head_sha` that produced NO verdict (#803), and returns
   the CONSECUTIVE count at that head.
@@ -472,8 +500,40 @@ defmodule Loopctl.Delivery.Stages do
   """
   @spec note_unevaluated(Ecto.UUID.t(), Ecto.UUID.t(), String.t() | nil, keyword()) ::
           {:ok, pos_integer()} | {:error, :not_found | :stale_claim_epoch | :wrong_stage | :busy}
-  def note_unevaluated(tenant_id, story_id, head_sha, opts) do
+  def note_unevaluated(tenant_id, story_id, head_sha, opts),
+    do: note_counter(:merge_gate, tenant_id, story_id, head_sha, opts)
+
+  @doc """
+  Counts a post-deploy verification sweep at `merge_sha` that reached NO verdict (#803 §9),
+  and returns the CONSECUTIVE count at that merge.
+
+  The same backstop `note_unevaluated/4` gives the merge gate, for the other control-side
+  gate. `Loopctl.Delivery.PostDeployVerification` answers `:unresolved` and transitions
+  nothing when the forge is transiently unavailable or the deploy has not settled, on
+  purpose: one blip, or one deploy still running, must not park a story on a human, and
+  `escalated` is human-only. A fault that never clears would then answer that way for ever
+  with nobody told, so the verifier escalates once this count passes its bound.
+
+  Keyed to the MERGE, not the head: the question a sweep asks is whether THIS merge is
+  running in the target deployment. The count resets when `merge_sha` differs from the one
+  it was last kept for, and every edge that clears `merge_sha` clears it
+  (`StageMachine.merge_keyed/0`).
+
+  Fenced by the claim epoch like every other write here, and refused off `deployed` — no
+  other stage runs this gate.
+
+  ## Options
+
+  - `:claim_epoch` (required), `:actor_label`
+  """
+  @spec note_post_deploy_unresolved(Ecto.UUID.t(), Ecto.UUID.t(), String.t() | nil, keyword()) ::
+          {:ok, pos_integer()} | {:error, :not_found | :stale_claim_epoch | :wrong_stage | :busy}
+  def note_post_deploy_unresolved(tenant_id, story_id, merge_sha, opts),
+    do: note_counter(:post_deploy, tenant_id, story_id, merge_sha, opts)
+
+  defp note_counter(name, tenant_id, story_id, key_sha, opts) do
     epoch = Keyword.fetch!(opts, :claim_epoch)
+    counter = Map.fetch!(@counters, name)
 
     in_tenant(tenant_id, fn ->
       story = share_lock_story(tenant_id, story_id)
@@ -481,30 +541,30 @@ defmodule Loopctl.Delivery.Stages do
 
       case lock_row(tenant_id, story_id) do
         nil -> Repo.rollback(:not_found)
-        row -> {count_unevaluated(row, story, head_sha, opts), nil}
+        row -> {count_unresolved(counter, row, story, key_sha, opts), nil}
       end
     end)
   end
 
-  defp count_unevaluated(row, story, head_sha, opts) do
+  defp count_unresolved(counter, row, story, key_sha, opts) do
     if row.claim_epoch != story.claim_epoch, do: Repo.rollback(:stale_claim_epoch)
-    if row.stage != :ci, do: Repo.rollback(:wrong_stage)
+    if row.stage != counter.stage, do: Repo.rollback(:wrong_stage)
 
-    count = next_unevaluated_count(row.merge_gate_unevaluated, head_sha)
-    value = %{"head_sha" => head_sha, "count" => count}
+    count = next_unresolved_count(Map.fetch!(row, counter.column), counter.key, key_sha)
+    value = %{counter.key => key_sha, "count" => count}
 
     {1, [row]} =
       from(s in StoryStage,
         where: s.id == ^row.id and s.tenant_id == ^row.tenant_id,
         select: s,
         update: [
-          set: [merge_gate_unevaluated: ^value, updated_at: ^DateTime.utc_now()],
+          set: ^[{counter.column, value}, {:updated_at, DateTime.utc_now()}],
           inc: [lock_version: 1]
         ]
       )
       |> Repo.update_all([])
 
-    insert_event(Repo, row, "merge_gate_unevaluated", nil, nil, opts[:actor_label], value)
+    insert_event(Repo, row, counter.event, nil, nil, opts[:actor_label], value)
     count
   end
 
@@ -524,8 +584,26 @@ defmodule Loopctl.Delivery.Stages do
   """
   @spec clear_unevaluated(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, :cleared | :nothing_to_clear} | {:error, :not_found | :stale_claim_epoch | :busy}
-  def clear_unevaluated(tenant_id, story_id, opts) do
+  def clear_unevaluated(tenant_id, story_id, opts),
+    do: clear_counter(:merge_gate, tenant_id, story_id, opts)
+
+  @doc """
+  Clears the consecutive post-deploy-unresolved count after a sweep that DID reach a
+  verdict. `note_post_deploy_unresolved/4`'s other half; see `clear_unevaluated/3` for the
+  shape and for why a no-op writes nothing.
+
+  ## Options
+
+  - `:claim_epoch` (required), `:actor_label`
+  """
+  @spec clear_post_deploy_unresolved(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, :cleared | :nothing_to_clear} | {:error, :not_found | :stale_claim_epoch | :busy}
+  def clear_post_deploy_unresolved(tenant_id, story_id, opts),
+    do: clear_counter(:post_deploy, tenant_id, story_id, opts)
+
+  defp clear_counter(name, tenant_id, story_id, opts) do
     epoch = Keyword.fetch!(opts, :claim_epoch)
+    counter = Map.fetch!(@counters, name)
 
     in_tenant(tenant_id, fn ->
       story = share_lock_story(tenant_id, story_id)
@@ -533,34 +611,42 @@ defmodule Loopctl.Delivery.Stages do
 
       case lock_row(tenant_id, story_id) do
         nil -> Repo.rollback(:not_found)
-        %StoryStage{merge_gate_unevaluated: nil} -> {:nothing_to_clear, nil}
-        row -> {do_clear_unevaluated(row, opts), nil}
+        row -> {maybe_clear_counter(counter, row, opts), nil}
       end
     end)
   end
 
-  defp do_clear_unevaluated(row, opts) do
+  defp maybe_clear_counter(counter, row, opts) do
+    case Map.fetch!(row, counter.column) do
+      nil -> :nothing_to_clear
+      previous -> do_clear_counter(counter, row, previous, opts)
+    end
+  end
+
+  defp do_clear_counter(counter, row, previous, opts) do
     {1, [row]} =
       from(s in StoryStage,
         where: s.id == ^row.id and s.tenant_id == ^row.tenant_id,
         select: s,
         update: [
-          set: [merge_gate_unevaluated: nil, updated_at: ^DateTime.utc_now()],
+          set: ^[{counter.column, nil}, {:updated_at, DateTime.utc_now()}],
           inc: [lock_version: 1]
         ]
       )
       |> Repo.update_all([])
 
-    data = %{"cleared" => row.merge_gate_unevaluated}
-    insert_event(Repo, row, "merge_gate_unevaluated", nil, nil, opts[:actor_label], data)
+    insert_event(Repo, row, counter.event, nil, nil, opts[:actor_label], %{"cleared" => previous})
     :cleared
   end
 
-  defp next_unevaluated_count(%{"head_sha" => head, "count" => count}, head)
-       when is_integer(count) and count >= 0,
-       do: count + 1
+  # `is_map_key` as well as the value comparison: a stored map with no key at all is
+  # malformed, not "a count at nil", and must restart rather than be incremented.
+  defp next_unresolved_count(%{"count" => count} = previous, key, key_sha)
+       when is_integer(count) and count >= 0 and is_map_key(previous, key) do
+    if Map.fetch!(previous, key) == key_sha, do: count + 1, else: 1
+  end
 
-  defp next_unevaluated_count(_previous, _head_sha), do: 1
+  defp next_unresolved_count(_previous, _key, _key_sha), do: 1
 
   @doc """
   Records the identity of a side effect on the story's stage row, idempotently.

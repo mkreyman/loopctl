@@ -1,6 +1,15 @@
-defmodule LoopctlWeb.FallbackControllerTest do
+defmodule LoopctlWeb.FallbackControllerCatchAllTest do
   @moduledoc """
   The last clause of `LoopctlWeb.FallbackController` (#824 round 1, finding 1).
+
+  **The module name is `...CatchAllTest`, not `...Test`, and it has to be.**
+  `test/loopctl_web/controllers/fallback_controller_test.exs` has defined
+  `LoopctlWeb.FallbackControllerTest` since #289, so #824 landing this file under that same
+  name made the whole test suite uncompilable on master — and therefore every `mix
+  precommit`, on every branch, until it was renamed. Both files are kept where they are:
+  that one covers the clauses through their endpoints, this one calls the catch-all
+  directly because no endpoint can reach it. If they are ever merged, the `controllers/`
+  path is the repo's convention and this file is the one that goes.
 
   Every other clause is covered where its endpoint is, which is the right place: a mapping
   matters as the status a real request gets. The CATCH-ALL cannot be tested that way by

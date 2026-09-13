@@ -72,6 +72,18 @@ if config_env() != :test do
     sha256: System.get_env("DELIVERY_GATES_CONFIG_SHA256")
 end
 
+# #803 §9: the GitHub deployment ENVIRONMENT whose newest deployment post-deploy
+# verification compares against a story's merge commit
+# (`Loopctl.Delivery.PostDeployVerification.environment/0`). One name fleet-wide; a wrong
+# one is not a silent pass, because an environment with no deployments cannot be verified
+# and the story escalates. Skipped under :test so the suite reads config/test.exs and never
+# a developer's shell.
+if config_env() != :test do
+  config :loopctl,
+         :delivery_deploy_environment,
+         System.get_env("DELIVERY_DEPLOY_ENVIRONMENT") || "production"
+end
+
 # #492: per-deployment Postgres text-search config (regconfig) for keyword FTS. UNSET
 # is "english" — byte-for-byte unchanged for the hosted instance. A non-English
 # self-host sets FTS_REGCONFIG (e.g. "russian", "simple") so the STORED search_vectors

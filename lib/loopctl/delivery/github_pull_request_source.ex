@@ -11,6 +11,17 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
 
   and one `GET /repos/:repo/git/trees/:ref?recursive=1` per `repo_files/2` call.
 
+  Post-deploy verification (#803 §9) adds three more, each bounded the same way:
+
+  4. `GET /repos/:repo/deployments?environment=:env&per_page=1` — the newest deployment of
+     the environment, whose `sha` is the commit the DEPLOYING JOB recorded. Never a
+     workflow run's `head_sha`: a `workflow_run` deploy ships the triggering run's commit
+     while the API attributes the run to the branch head at creation time, so the two
+     diverge whenever two merges land minutes apart
+  5. `GET /repos/:repo/deployments/:id/statuses?per_page=1` — its latest state
+  6. `GET /repos/:repo/compare/:sha...:ref` — whether a commit is reachable from another,
+     which is what makes a story merged BEHIND the deployed head still count as shipped
+
   ## Slow connections, and the ceiling a caller sees
 
   Every request carries a 2s connect timeout and a 5s receive timeout, and `retry: false`
@@ -92,6 +103,80 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
       tree(body, ref)
     end
   end
+
+  @impl true
+  def latest_deployment(repo, environment) do
+    with {:ok, repo} <- repo_name(repo),
+         {:ok, environment} <- environment(environment),
+         {:ok, body} <- get(repo, "/deployments?environment=#{environment}&per_page=1") do
+      newest_deployment(repo, body)
+    end
+  end
+
+  @impl true
+  def contains?(repo, sha, ref) do
+    with {:ok, repo} <- repo_name(repo),
+         {:ok, sha} <- ref(sha),
+         {:ok, ref} <- ref(ref),
+         {:ok, body} <- get(repo, "/compare/#{sha}...#{ref}") do
+      containment(body)
+    end
+  end
+
+  # GitHub lists deployments newest first, and `per_page=1` is the newest one. An EMPTY list
+  # is a fact, not a failure: the environment has never been deployed, or is named
+  # differently. The verifier fails closed on it — it cannot tell what is running — but it
+  # is reported as `nil` rather than as an error, because calling it an error would put it
+  # in the transient/permanent classification where it does not belong.
+  defp newest_deployment(_repo, []), do: {:ok, nil}
+
+  defp newest_deployment(repo, [%{"id" => id, "sha" => sha} | _rest])
+       when is_integer(id) and is_binary(sha) do
+    with {:ok, state} <- deployment_state(repo, id) do
+      {:ok, %{id: id, sha: sha, state: state}}
+    end
+  end
+
+  defp newest_deployment(_repo, body), do: {:error, {:unreadable_deployments, shape(body)}}
+
+  # A deployment with NO status yet has not settled, which is the same answer to a verifier
+  # as `queued`/`pending`/`in_progress`: ask again. An unrecognised state is NOT approximated
+  # — a state we have not thought about is not evidence that a deploy succeeded.
+  defp deployment_state(repo, id) do
+    case get(repo, "/deployments/#{id}/statuses?per_page=1") do
+      {:ok, []} -> {:ok, :pending}
+      {:ok, [%{"state" => state} | _rest]} when is_binary(state) -> map_state(state)
+      {:ok, body} -> {:error, {:unreadable_deployment_statuses, shape(body)}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp map_state("success"), do: {:ok, :success}
+  defp map_state("failure"), do: {:ok, :failure}
+  defp map_state("error"), do: {:ok, :error}
+  defp map_state("inactive"), do: {:ok, :inactive}
+  defp map_state(state) when state in ~w(queued pending in_progress), do: {:ok, :pending}
+  defp map_state(state), do: {:error, {:unrecognised_deployment_state, printable(state)}}
+
+  # `status` describes the HEAD relative to the BASE, and the call is
+  # `compare/<sha>...<ref>` — so `identical` is the same commit and `ahead` means `ref` is
+  # ahead of `sha`, i.e. `sha` is an ancestor of it. `behind` and `diverged` both mean the
+  # commit is NOT in what `ref` names.
+  defp containment(%{"status" => status}) when status in ~w(identical ahead), do: {:ok, true}
+  defp containment(%{"status" => status}) when status in ~w(behind diverged), do: {:ok, false}
+
+  defp containment(%{"status" => status}) when is_binary(status),
+    do: {:error, {:unrecognised_compare_status, printable(status)}}
+
+  defp containment(body), do: {:error, {:unreadable_compare, shape(body)}}
+
+  # An environment name is spliced into a QUERY parameter, so the same rule as a ref:
+  # nothing that could change which resource is addressed or add a parameter of its own.
+  defp environment(name) when is_binary(name) do
+    if Regex.match?(@ref, name), do: {:ok, name}, else: {:error, {:invalid_environment, name}}
+  end
+
+  defp environment(name), do: {:error, {:invalid_environment, shape(name)}}
 
   # A MERGED pull request is answered without reading its diff or its merge base: the
   # outward effect has already happened, so there is nothing left to gate, and the caller's

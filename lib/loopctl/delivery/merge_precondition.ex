@@ -699,12 +699,22 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   defp repo_files(_repo, _pull_request, _key, _recorded), do: {:error, :not_attempted}
 
-  # The repository is NEVER taken from the caller. Gate B's trigger list is keyed by
-  # repository, so a caller that could name one could name a DIFFERENT configured
-  # repository and be judged against the wrong trigger list. It is resolved from the
-  # story's project through its GitHub intake source, and a project with no source, or with
-  # more than one, refuses rather than guessing.
-  defp repo_for_story(%{tenant_id: tenant_id, project_id: project_id}) do
+  @doc """
+  The repository a story's work belongs to, resolved from its project's GitHub intake
+  source.
+
+  **NEVER taken from the caller**, which is why it is a function and not a parameter. Gate
+  B's trigger list is keyed by repository, so a caller that could name one could name a
+  DIFFERENT configured repository and be judged against the wrong trigger list — and the
+  same reasoning binds `Loopctl.Delivery.PostDeployVerification`, which would otherwise be
+  told which repository's deployments to believe. A project with no source, or with more
+  than one, refuses rather than guessing.
+
+  Public so both gates resolve a repository the same way; a second copy of this is a second
+  answer to "which repo is this story's", and the two would drift.
+  """
+  @spec repo_for_story(map()) :: fact(String.t())
+  def repo_for_story(%{tenant_id: tenant_id, project_id: project_id}) do
     tenant_id
     |> Intake.list_sources()
     |> Enum.filter(&(&1.project_id == project_id))

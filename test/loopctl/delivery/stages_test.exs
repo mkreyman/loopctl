@@ -444,6 +444,106 @@ defmodule Loopctl.Delivery.StagesTest do
     end
   end
 
+  describe "note_post_deploy_unresolved/4" do
+    test "counts consecutive sweeps at ONE merge, and resets when the merge differs" do
+      {story, _row} = at_stage(:deployed)
+      opts = [claim_epoch: story.claim_epoch]
+
+      assert {:ok, 1} =
+               Stages.note_post_deploy_unresolved(story.tenant_id, story.id, @sha_a, opts)
+
+      assert {:ok, 2} =
+               Stages.note_post_deploy_unresolved(story.tenant_id, story.id, @sha_a, opts)
+
+      assert {:ok, 1} =
+               Stages.note_post_deploy_unresolved(story.tenant_id, story.id, @sha_b, opts)
+
+      row = Stages.get(story.tenant_id, story.id)
+      assert row.post_deploy_unresolved == %{"merge_sha" => @sha_b, "count" => 1}
+      # And it does NOT share a column with the merge gate's count.
+      assert is_nil(row.merge_gate_unevaluated)
+    end
+
+    test "leaves an event under its own name" do
+      {story, _row} = at_stage(:deployed)
+
+      assert {:ok, 1} =
+               Stages.note_post_deploy_unresolved(story.tenant_id, story.id, @sha_a,
+                 claim_epoch: story.claim_epoch,
+                 actor_label: "test"
+               )
+
+      assert [%StageEvent{event: "post_deploy_unresolved", data: data, actor_label: "test"}] =
+               story.tenant_id
+               |> Stages.list_events(story.id)
+               |> Enum.filter(&(&1.event == "post_deploy_unresolved"))
+
+      assert data == %{"merge_sha" => @sha_a, "count" => 1}
+    end
+
+    test "clear_post_deploy_unresolved/3 removes the count, no-op with nothing to clear" do
+      {story, _row} = at_stage(:deployed)
+      opts = [claim_epoch: story.claim_epoch]
+
+      assert {:ok, :nothing_to_clear} =
+               Stages.clear_post_deploy_unresolved(story.tenant_id, story.id, opts)
+
+      assert {:ok, 1} =
+               Stages.note_post_deploy_unresolved(story.tenant_id, story.id, @sha_a, opts)
+
+      assert {:ok, :cleared} =
+               Stages.clear_post_deploy_unresolved(story.tenant_id, story.id, opts)
+
+      assert is_nil(Stages.get(story.tenant_id, story.id).post_deploy_unresolved)
+    end
+
+    test "the two counters are independent — clearing one leaves the other" do
+      # They are separate COLUMNS precisely so a verdict at one gate cannot reset the
+      # other's backstop. Walked through `ci` and on to `deployed` so both are set at once.
+      {story, _row} = at_stage(:ci)
+      opts = [claim_epoch: story.claim_epoch]
+
+      assert {:ok, 1} = Stages.note_unevaluated(story.tenant_id, story.id, @sha_a, opts)
+
+      {:ok, _} =
+        Stages.advance(story.tenant_id, story.id, {:ci, :merged},
+          claim_epoch: story.claim_epoch,
+          actor_lineage: [],
+          effects: [merge_sha: @sha_b]
+        )
+
+      {:ok, _} = Stages.advance(story.tenant_id, story.id, {:merged, :deployed}, opts)
+
+      assert {:ok, 1} =
+               Stages.note_post_deploy_unresolved(story.tenant_id, story.id, @sha_b, opts)
+
+      assert {:ok, :cleared} =
+               Stages.clear_post_deploy_unresolved(story.tenant_id, story.id, opts)
+
+      row = Stages.get(story.tenant_id, story.id)
+      assert is_nil(row.post_deploy_unresolved)
+      assert row.merge_gate_unevaluated == %{"head_sha" => @sha_a, "count" => 1}
+    end
+
+    test "is refused off the deployed stage — no other stage runs this gate" do
+      {story, _row} = at_stage(:ci)
+
+      assert {:error, :wrong_stage} =
+               Stages.note_post_deploy_unresolved(story.tenant_id, story.id, @sha_a,
+                 claim_epoch: story.claim_epoch
+               )
+    end
+
+    test "is fenced by the claim epoch like every other write here" do
+      {story, _row} = at_stage(:deployed)
+
+      assert {:error, :stale_claim_epoch} =
+               Stages.note_post_deploy_unresolved(story.tenant_id, story.id, @sha_a,
+                 claim_epoch: story.claim_epoch + 7
+               )
+    end
+  end
+
   describe "record_effect/5" do
     @values %{
       worktree_path: "/home/runner/workspace/app/.claude/worktrees/us-1",
@@ -1185,7 +1285,10 @@ defmodule Loopctl.Delivery.StagesTest do
                "merge_sha" => merge_sha,
                "head_sha" => @sha_a,
                "merge_gate_allowed_sha" => nil,
-               "merge_gate_unevaluated" => nil
+               "merge_gate_unevaluated" => nil,
+               # Merge-keyed alongside `merge_sha` (#803 §9): post-deploy verification's
+               # unresolved count is kept per MERGE, so a retracted merge takes it too.
+               "post_deploy_unresolved" => nil
              }
 
       # And the next attempt can record its own head again.

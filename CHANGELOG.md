@@ -6,6 +6,40 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Post-deploy verification, and the verdict-to-resolution mapping (#803 §9, #805).** A
+  story that reached `deployed` used to have exactly one way out — a human escalating it.
+  `Loopctl.Workers.PostDeployVerificationWorker` now sweeps those stories every two minutes
+  and writes the verdict: the story's recorded merge commit against the commit the target
+  environment's newest GitHub DEPLOYMENT names. Contained (identical, or an ancestor —
+  merges queue, and a story shipped inside a later merge's deploy has shipped) takes
+  `deployed -> verified`; not contained, a failed or rolled-back deployment, an environment
+  with no deployment at all, and a story with no recorded merge commit each escalate on
+  `verification_failed`, with BOTH shas named in the reason.
+
+  **It reads the deployment, never a workflow run.** A `workflow_run` deploy checks out the
+  TRIGGERING run's commit while the API attributes the deploy run to whatever the branch
+  head was when the run was created, so two merges minutes apart give a run attributed to
+  the second that shipped the first — with every surface reporting success. Known bound:
+  this is only as good as the sha the deploy job wrote on its deployment record.
+
+  **A transient forge fault, or a deploy still in flight, decides nothing.** Both leave the
+  story at `deployed` for the next sweep, on the same classification and the same
+  consecutive-fault bound the merge gate uses, so no condition waits for ever with nobody
+  told. A rate-limited forge halts the rest of the run rather than spending the window.
+
+  **New env var `DELIVERY_DEPLOY_ENVIRONMENT`** (default `production`) — see
+  `deploy/FLY_SECRETS.md`. `GITHUB_TOKEN` now also needs `deployments: read`; without it
+  the reads 404, which escalates rather than passing. **New migration** adding
+  `story_stages.post_deploy_unresolved` and one event name — no manual step, no backfill.
+
+  **Nothing tells a reporter a fix shipped before this runs.** `Loopctl.Delivery.Resolution`
+  is the verdict-to-resolution contract: `:shipped` (deploy-VERIFIED only) closes the issue
+  with `loopctl:resolution-shipped`, `:not_actionable` closes it with
+  `loopctl:resolution-not-actionable` and its own text, and `:escalated` closes nothing. A
+  reporting system that auto-resolves on any issue close must select its text by these
+  labels instead — otherwise a rejected request reaches the reporter as a shipped fix she
+  will then go looking for.
+
 - **The merge precondition: both delivery gates run a second time, over the real pull
   request (#803).** `POST /api/v1/stories/:id/merge-precondition` (exact role `orchestrator`
   or `user`, human-anchored tenant) runs Gate A and Gate B over the diff that actually

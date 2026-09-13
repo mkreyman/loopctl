@@ -209,6 +209,41 @@ defmodule Loopctl.ObanPluginsConfigTest do
     end
   end
 
+  describe "PostDeployVerificationWorker crontab entry" do
+    setup do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+
+      {Oban.Plugins.Cron, cron_opts} =
+        Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      entry =
+        Enum.find(cron_opts[:crontab], fn
+          {_schedule, Loopctl.Workers.PostDeployVerificationWorker} -> true
+          {_schedule, Loopctl.Workers.PostDeployVerificationWorker, _opts} -> true
+          _ -> false
+        end)
+
+      %{entry: entry}
+    end
+
+    test "the PostDeployVerificationWorker entry exists in the crontab", %{entry: entry} do
+      assert entry,
+             "expected a PostDeployVerificationWorker crontab entry — #803 §9. Without one " <>
+               "nothing in lib/ writes {deployed, verified} or {deployed, escalated, " <>
+               "verification_failed}, and every delivered story WAITS at `deployed` with a " <>
+               "human escalation as its only way out. The session has already ended there, " <>
+               "so no caller will ask on its behalf."
+    end
+
+    test "it runs every two minutes and takes no all_tenants fan-out", %{entry: entry} do
+      # Fleet-wide in ONE job (the candidate read is on AdminRepo across tenants), so there
+      # is no per-tenant child to fan out to — and the cadence is a latency knob on a deploy
+      # measured in minutes, paid for in bounded GitHub calls per candidate.
+      assert elem(entry, 0) == "*/2 * * * *"
+      assert tuple_size(entry) == 2
+    end
+  end
+
   describe "#249: inert KB crons are PARKED by default" do
     setup do
       plugins = Application.get_env(:loopctl, Oban)[:plugins]

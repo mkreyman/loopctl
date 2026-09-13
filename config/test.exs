@@ -938,3 +938,8 @@ config :loopctl, :delivery_pull_request_source, Loopctl.MockPullRequestSource
 # The GitHub adapter's own tests bypass the mock above and exercise the real module against
 # `Req.Test` bytes, so its response mapping is covered rather than only its interface.
 config :loopctl, :delivery_github_req_plug, {Req.Test, Loopctl.Delivery.GitHubPullRequestSource}
+
+# #803 §9: the deployment environment post-deploy verification reads. Pinned here rather
+# than left to the runtime default so the suite never depends on a developer's shell, and
+# so a test can assert the name that reached the forge call.
+config :loopctl, :delivery_deploy_environment, "production"

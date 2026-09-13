@@ -181,6 +181,12 @@ during an incident with `fly secrets set … && fly apps restart` — no deploy.
 |----------------|---------|-------------|
 | `GITHUB_TOKEN` | -       | Bearer token for the CI status/test-result lookups that back independent story verification, AND (#803) for the merge precondition's reads of a pull request's state, diffstat, changed names and file tree. Optional: unset, the calls go out unauthenticated, which works for PUBLIC repos until GitHub's 60-requests/hour/IP anonymous limit bites — after that verification reports a `github_api_error` rather than a real CI verdict, and the merge precondition answers `unevaluated` (HTTP 503) rather than merging anything — an exhausted quota is transient, so the loop RETRIES rather than escalating, and only escalates once the same story has been unevaluable at one head several times running. Either way nothing merges without the token. Required for a private repo, where unauthenticated lookups 404. Needs only read access to checks, pull requests and contents. A blank value is treated as unset (it is trimmed), so a templated-but-empty secret degrades to the anonymous path rather than sending an empty bearer that GitHub 401s |
 
+#### Post-deploy verification (#803 §9)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DELIVERY_DEPLOY_ENVIRONMENT` | `production` | The GitHub deployment ENVIRONMENT whose newest deployment is compared against a delivered story's merge commit. loopctl reads the deployment record's own `sha` — written by the deploying job — never a workflow run's head, because a `workflow_run` deploy ships the TRIGGERING run's commit while the API attributes the run to the branch head at creation time. One name applies to every repository in the fleet. **A wrong name is not a silent pass**: an environment with no deployments cannot be verified, so every story waiting at `deployed` escalates to a human with `no_deployment` rather than being marked verified. Set it to whatever the target repository's deploy workflow names its environment (`gh api repos/:owner/:repo/deployments --jq '.[].environment' | sort -u` lists them). The token in `GITHUB_TOKEN` needs `deployments: read` on the repository for this; without it the reads 404, which is NOT transient and escalates |
+
 #### Story claim lease
 
 | Variable                    | Default | Description |

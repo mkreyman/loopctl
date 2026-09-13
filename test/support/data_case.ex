@@ -225,6 +225,18 @@ defmodule Loopctl.DataCase do
       {:error, :not_stubbed}
     end)
 
+    # #803 §9: the post-deploy half of the same source, on the same fail-closed default.
+    # `{:error, :not_stubbed}` is NOT transient, so a test that reaches the forge without
+    # saying so escalates the story rather than verifying it — the same direction the merge
+    # precondition's default fails in.
+    Mox.stub(Loopctl.MockPullRequestSource, :latest_deployment, fn _repo, _environment ->
+      {:error, :not_stubbed}
+    end)
+
+    Mox.stub(Loopctl.MockPullRequestSource, :contains?, fn _repo, _sha, _ref ->
+      {:error, :not_stubbed}
+    end)
+
     # Shape MUST match `Loopctl.HealthCheck.Default.check/0`. It notably carries NO
     # `version` key: #461 item 5 removed the app version from this response on purpose,
     # because /health is the highest-frequency unauthenticated probe and there is no
