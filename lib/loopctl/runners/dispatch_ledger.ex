@@ -27,8 +27,16 @@ defmodule Loopctl.Runners.DispatchLedger do
   The fleet-wide order, which `Loopctl.Runners.Capacity` states in full:
 
       capacity advisory lock (0x41050803) -> story row
-        -> runner_dispatches / story_stages row -> chain advisory lock (0x4105A1D7)
-        -> audit-chain head -> runners row
+        -> runner_dispatches / story_stages row -> runners row
+        -> chain advisory lock (0x4105A1D7) -> audit-chain head
+
+  **The chain append is always LAST** (corrected in the #824 review — this copy, and
+  `Capacity`'s, put the `runners` row after the chain, while every writer in the fleet takes
+  it before: `Loopctl.Runners.revoke_runner/3` and the session-end slot release in
+  `Loopctl.Delivery.Stages`. Nothing takes the chain first and a `runners` row second, so the
+  table moved rather than the code.) Nothing in THIS module appends to the chain at all — a
+  reply is the runner's own report about its machine, not a custody transition — so the part
+  of the order it follows ends at the `runners` row.
 
   So `record_sent/3` takes the tenant's admission lock as the FIRST thing in its transaction —
   before the claim fence, not with the reservation at the end — and `record_reply/3` and
