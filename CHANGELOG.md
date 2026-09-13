@@ -164,10 +164,18 @@ All notable changes to loopctl are documented here.
   may send 20 batches a second — and AdminRepo's small pool is read on every authenticated
   request, so it must not queue behind it.
 
-  **`dispatch/3` has two new refusals.** `{:error, :dispatch_id_conflict}` when the ledger
-  already holds that `dispatch_id` for a different runner, story, `claim_epoch` or kind, and
-  `{:error, :dispatch_already_replied}` when the runner already answered it. Re-dispatching
-  an unanswered `dispatch_id` re-sends it without a second row.
+  **`dispatch/3` has three new refusals.** `{:error, :stale_claim_epoch}` when the dispatch's
+  `claim_epoch` is not the story's current `stories.claim_epoch` (or the story does not
+  exist), `{:error, :dispatch_id_conflict}` when the ledger already holds that `dispatch_id`
+  for a different runner, story, `claim_epoch` or kind, and `{:error, :dispatch_already_replied}`
+  when the runner already answered it. Re-dispatching an unanswered `dispatch_id` re-sends it
+  without a second row.
+
+  **Replies and trace are fenced on the story's claim epoch (#810's `stories.claim_epoch`).**
+  In the transaction that locks the ledger row, the story's current epoch is read under a
+  share lock; once a claim is released or reclaimed, a `dispatch_reply` or `trace` about a
+  dispatch of the old claim is `stale_claim_epoch` and its ledger row is marked `superseded`.
+  `runner_dispatches` also carries an index on `(tenant_id, story_id)`.
 
   **Trace has no retention yet.** `runner_trace_events` grows until a prune worker is added
   to `oban_config.ex`; the table cascades from its `runner_dispatches` row, so pruning old

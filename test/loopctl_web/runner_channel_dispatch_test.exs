@@ -84,6 +84,15 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
   defp in_pool?(tenant_id, name), do: Map.has_key?(Runners.pool(tenant_id), name)
 
+  # A dispatch payload for a real story at the dispatch's epoch, on the RLS connection the
+  # ledger's claim fence reads.
+  defp dispatch_payload(tenant_id, attrs \\ %{}) do
+    attrs = Map.new(attrs)
+    epoch = Map.get(attrs, "claim_epoch", 0)
+    story = fixture(:ledger_story, %{tenant_id: tenant_id, claim_epoch: epoch})
+    build(:runner_dispatch, Map.put(attrs, "story_id", story.id))
+  end
+
   describe "dispatch" do
     setup do
       {raw, runner} = fixture(:committed_runner, %{name: "minis"})
@@ -93,7 +102,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
     end
 
     defp dispatch_to(runner, attrs \\ %{}),
-      do: Runners.dispatch(runner.tenant_id, runner.id, build(:runner_dispatch, attrs))
+      do: Runners.dispatch(runner.tenant_id, runner.id, dispatch_payload(runner.tenant_id, attrs))
 
     test "arrives on the runner's own topic, and on no other runner's", %{runner: runner} do
       {raw_b, runner_b} =
@@ -102,7 +111,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       {:ok, socket_b} = connect_runner(raw_b)
       {_reply, _channel_b} = join_pool(socket_b, "blockit")
 
-      payload = build(:runner_dispatch)
+      payload = dispatch_payload(runner.tenant_id)
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
 
       topic = "runner:" <> runner.id
@@ -285,7 +294,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
     test "is recorded in the ledger as sent, and a re-send of the same id adds no row",
          %{runner: runner} do
-      payload = build(:runner_dispatch, %{"claim_epoch" => 4})
+      payload = dispatch_payload(runner.tenant_id, %{"claim_epoch" => 4})
 
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
       assert_push "dispatch", _, @reply_timeout
@@ -302,19 +311,30 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
     test "a dispatch_id whose ledger row disagrees is refused before anything is pushed",
          %{runner: runner} do
-      payload = build(:runner_dispatch)
+      payload = dispatch_payload(runner.tenant_id)
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
       assert_push "dispatch", _, @reply_timeout
 
       assert {:error, :dispatch_id_conflict} =
-               Runners.dispatch(runner.tenant_id, runner.id, %{payload | "claim_epoch" => 1})
+               Runners.dispatch(runner.tenant_id, runner.id, %{payload | "kind" => "triage"})
 
       refute_push "dispatch", _
     end
 
+    test "a dispatch whose epoch is not the story's current one is refused and nothing is pushed",
+         %{runner: runner} do
+      payload = dispatch_payload(runner.tenant_id, %{"claim_epoch" => 3})
+
+      assert {:error, :stale_claim_epoch} =
+               Runners.dispatch(runner.tenant_id, runner.id, %{payload | "claim_epoch" => 2})
+
+      refute_push "dispatch", _
+      assert DispatchLedger.get_record(runner.tenant_id, payload["dispatch_id"]) == nil
+    end
+
     test "a dispatch the runner already answered is not pushed again",
          %{runner: runner, channel: channel} do
-      payload = build(:runner_dispatch)
+      payload = dispatch_payload(runner.tenant_id)
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
       assert_push "dispatch", _, @reply_timeout
 
@@ -351,7 +371,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
                Runners.dispatch(tenant_b.id, runner.id, build(:runner_dispatch))
 
       # Tenant B's own runner, joined under the same machine name, is still reachable by B.
-      assert :ok = Runners.dispatch(tenant_b.id, runner_b.id, build(:runner_dispatch))
+      assert :ok = Runners.dispatch(tenant_b.id, runner_b.id, dispatch_payload(tenant_b.id))
       topic = "runner:" <> runner.id
       topic_b = "runner:" <> runner_b.id
       assert_receive %Phoenix.Socket.Message{topic: ^topic_b, event: "dispatch"}, @reply_timeout
@@ -428,7 +448,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       {raw, runner} = fixture(:committed_runner, %{name: "minis"})
       {:ok, socket} = connect_runner(raw)
       {_reply, channel} = join_pool(socket, "minis")
-      dispatch = build(:runner_dispatch, %{"claim_epoch" => 2})
+      dispatch = dispatch_payload(runner.tenant_id, %{"claim_epoch" => 2})
       :ok = Runners.dispatch(runner.tenant_id, runner.id, dispatch)
       assert_push "dispatch", _, @reply_timeout
       %{runner: runner, channel: channel, dispatch: dispatch}
@@ -484,7 +504,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
       {:ok, socket_b} = connect_runner(raw_b)
       {_reply, _channel_b} = join_pool(socket_b, "blockit")
-      theirs = build(:runner_dispatch)
+      theirs = dispatch_payload(runner.tenant_id)
       :ok = Runners.dispatch(runner.tenant_id, runner_b.id, theirs)
 
       ref = push(channel, "dispatch_reply", accept(theirs))
@@ -497,7 +517,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       {raw_b, runner_b} = fixture(:committed_runner, %{name: "minis", tenant_id: tenant_b.id})
       {:ok, socket_b} = connect_runner(raw_b)
       {_reply, _channel_b} = join_pool(socket_b, "minis")
-      theirs = build(:runner_dispatch)
+      theirs = dispatch_payload(tenant_b.id)
       :ok = Runners.dispatch(tenant_b.id, runner_b.id, theirs)
 
       ref = push(channel, "dispatch_reply", accept(theirs))
@@ -512,7 +532,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
     test "replies to several dispatches back to back are all applied, and each dispatch's trace is accepted",
          %{runner: runner, channel: channel, dispatch: first} do
-      second = build(:runner_dispatch, %{"claim_epoch" => 2})
+      second = dispatch_payload(runner.tenant_id, %{"claim_epoch" => 2})
       :ok = Runners.dispatch(runner.tenant_id, runner.id, second)
       assert_push "dispatch", _, @reply_timeout
 
@@ -594,7 +614,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       {raw, runner} = fixture(:committed_runner, %{name: "minis"})
       {:ok, socket} = connect_runner(raw)
       {_reply, channel} = join_pool(socket, "minis")
-      dispatch = build(:runner_dispatch)
+      dispatch = dispatch_payload(runner.tenant_id)
       :ok = Runners.dispatch(runner.tenant_id, runner.id, dispatch)
       assert_push "dispatch", _, @reply_timeout
       ref = push(channel, "dispatch_reply", accept(dispatch))
@@ -809,7 +829,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       {raw, runner} = fixture(:committed_runner, %{name: "minis"})
       {:ok, socket} = connect_runner(raw)
       {_reply, channel} = join_pool(socket, "minis")
-      dispatch = build(:runner_dispatch)
+      dispatch = dispatch_payload(runner.tenant_id)
       :ok = Runners.dispatch(runner.tenant_id, runner.id, dispatch)
       assert_push "dispatch", _, @reply_timeout
       %{runner: runner, channel: channel, dispatch: dispatch}

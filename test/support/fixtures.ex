@@ -1919,6 +1919,36 @@ defmodule Loopctl.Fixtures do
     end)
   end
 
+  # A story (with its project and epic) on the RLS `Loopctl.Repo` connection, at a given
+  # `claim_epoch`, for the dispatch ledger's claim fence (#803). The ledger reads
+  # `stories.claim_epoch` on `Repo` inside its own transaction, and `Repo` and `AdminRepo`
+  # hold separate sandbox transactions, so a story made by `fixture(:story)` (AdminRepo) is
+  # invisible to it. `tenant_id` must be visible to `Repo` (a committed tenant).
+  def fixture(:ledger_story, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+
+    {:ok, story} =
+      Loopctl.Repo.with_tenant(tenant_id, fn ->
+        project =
+          %Project{tenant_id: tenant_id, kind: :work}
+          |> Project.create_changeset(build(:project, %{}))
+          |> Loopctl.Repo.insert!()
+
+        epic =
+          %Epic{tenant_id: tenant_id, project_id: project.id}
+          |> Epic.create_changeset(build(:epic, %{}))
+          |> Loopctl.Repo.insert!()
+
+        %Story{tenant_id: tenant_id, project_id: project.id, epic_id: epic.id}
+        |> Story.create_changeset(build(:story, %{}))
+        |> Ecto.Changeset.change(claim_epoch: Map.get(attrs, :claim_epoch, 0))
+        |> Loopctl.Repo.insert!()
+      end)
+
+    story
+  end
+
   def fixture(:committed_tenant, _attrs) do
     seq = System.unique_integer([:positive])
 

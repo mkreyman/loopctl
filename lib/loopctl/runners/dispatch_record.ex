@@ -14,8 +14,9 @@ defmodule Loopctl.Runners.DispatchRecord do
     (a halt, a second socket), and re-dispatching the same `dispatch_id` re-sends it.
   - `accepted` / `refused` — the runner's reply. Terminal for the reply; a refusal carries a
     `reason` (`RunnerContract.refusal_reasons/0`).
-  - `superseded` — the claim this dispatch served was reclaimed. Written by the reclaim path,
-    never by the runner.
+  - `superseded` — the claim this dispatch served has ended: the story's `claim_epoch` moved
+    past this row's. Written by `Loopctl.Runners.DispatchLedger` when a reply or trace about
+    the row finds that, never by the runner; a `refused` row is left refused.
 
   ## Trust boundary
 

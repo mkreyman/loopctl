@@ -9,12 +9,15 @@ defmodule Loopctl.Runners.DispatchLedger do
   (design §3). A re-dispatch is refused when that row names a different runner, story, epoch
   or kind (`:dispatch_id_conflict`) or has already been answered
   (`:dispatch_already_replied`); otherwise it is the retry of a push the channel may have
-  dropped, and is sent again.
+  dropped, and is sent again. Nothing is recorded or sent when the dispatch's `claim_epoch`
+  is not the story's current one (`:stale_claim_epoch`).
 
   `record_reply/3` applies a runner's `dispatch_reply` under a row lock. The row must belong
   to the CALLING runner in the calling tenant (otherwise `:unknown_dispatch` — another
   runner's dispatch is indistinguishable from none), the reply's `claim_epoch` must equal
-  the dispatched one (`:stale_claim_epoch`), and the row must still be `sent`. A repeat of
+  the dispatched one AND the story's current `claim_epoch` (`:stale_claim_epoch`), and the
+  row must still be `sent`. When the story's epoch has moved past the row's — the claim was
+  released or reclaimed — the row is marked `superseded` in the same transaction. A repeat of
   the reply already recorded is `:ok`; a different one is `:already_replied`.
 
   No audit-chain entry is written for a reply. The chain is kept for custody transitions
@@ -56,13 +59,15 @@ defmodule Loopctl.Runners.DispatchLedger do
   alias Loopctl.Repo
   alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Runners.TraceEvent
+  alias Loopctl.WorkBreakdown.Story
 
   @doc """
   Records a validated dispatch as `sent`, or finds the row an earlier dispatch of the same
   `dispatch_id` wrote. See the moduledoc for the refusals.
   """
   @spec record_sent(Ecto.UUID.t(), Ecto.UUID.t(), map()) ::
-          {:ok, DispatchRecord.t()} | {:error, :dispatch_id_conflict | :dispatch_already_replied}
+          {:ok, DispatchRecord.t()}
+          | {:error, :stale_claim_epoch | :dispatch_id_conflict | :dispatch_already_replied}
   def record_sent(tenant_id, runner_id, dispatch) do
     now = DateTime.utc_now()
 
@@ -81,6 +86,12 @@ defmodule Loopctl.Runners.DispatchLedger do
     }
 
     in_tenant(tenant_id, fn ->
+      # Nothing is sent for a claim that has already moved on: the dispatch must carry the
+      # story's CURRENT epoch, read under a share lock so a release cannot commit between
+      # this read and the row it gates.
+      if current_claim_epoch(tenant_id, dispatch.story_id) != dispatch.claim_epoch,
+        do: Repo.rollback(:stale_claim_epoch)
+
       Repo.insert_all(DispatchRecord, [row],
         on_conflict: :nothing,
         conflict_target: [:tenant_id, :dispatch_id]
@@ -131,13 +142,13 @@ defmodule Loopctl.Runners.DispatchLedger do
 
     runner_write(tenant_id, runner_id, context, fn ->
       with {:ok, record} <- lock_held(tenant_id, runner_id, reply.dispatch_id),
+           :ok <- story_fence(record),
            :ok <- epoch_matches(record, reply.claim_epoch),
            {:ok, record} <- apply_reply(record, reply) do
         record
-      else
-        {:error, reason} -> Repo.rollback(reason)
       end
     end)
+    |> flatten()
   end
 
   defp apply_reply(%DispatchRecord{status: "sent"} = record, reply) do
@@ -175,16 +186,26 @@ defmodule Loopctl.Runners.DispatchLedger do
 
     runner_write(tenant_id, runner_id, context, fn ->
       with {:ok, record} <- lock_held(tenant_id, runner_id, batch.dispatch_id),
+           :ok <- story_fence(record),
            :ok <- epoch_matches(record, batch.claim_epoch),
            :ok <- accepted(record),
            {:ok, record} <- bind_run(record, batch.run_id) do
         insert_events(record, batch.events)
         advance_cursor(record)
       else
-        {:error, reason} -> Repo.rollback(reason)
+        # Follows a failed statement, which aborted the transaction.
+        {:error, :run_mismatch} -> Repo.rollback(:run_mismatch)
+        {:error, reason} -> {:error, reason}
       end
     end)
+    |> flatten()
   end
+
+  # A refusal is RETURNED from the transaction, not rolled back, so a `superseded` write
+  # made on the way to it commits. The one refusal that follows a failed statement
+  # (`bind_run/2`'s unique violation, which aborts the transaction) rolls back instead.
+  defp flatten({:ok, {:error, reason}}), do: {:error, reason}
+  defp flatten(result), do: result
 
   @doc """
   The stored contiguous `acked_seq` of a run `runner_id` holds, or -1 — also for a run it
@@ -273,6 +294,42 @@ defmodule Loopctl.Runners.DispatchLedger do
       nil -> {:error, :unknown_dispatch}
       record -> {:ok, record}
     end
+  end
+
+  # The fence against a zombie runner (issue #803). The authoritative epoch is the story's
+  # (`stories.claim_epoch`, bumped by every claim and every release — `Progress`), not the
+  # epoch this row recorded when it was sent. Read under a share lock in the transaction that
+  # holds the row lock. When the story has moved past the row, the claim this dispatch
+  # served is over: the row is marked `superseded` — so it stops reading as a live dispatch —
+  # and every message about it is `stale_claim_epoch`. A story that no longer exists is
+  # treated the same way.
+  defp story_fence(%DispatchRecord{} = record) do
+    if current_claim_epoch(record.tenant_id, record.story_id) == record.claim_epoch do
+      :ok
+    else
+      supersede(record)
+      {:error, :stale_claim_epoch}
+    end
+  end
+
+  defp current_claim_epoch(tenant_id, story_id) do
+    Repo.one(
+      from s in Story,
+        where: s.id == ^story_id and s.tenant_id == ^tenant_id,
+        lock: "FOR SHARE",
+        select: s.claim_epoch
+    )
+  end
+
+  # Only a live row: a refused one is already terminal, and its reason must stay.
+  defp supersede(%DispatchRecord{} = record) do
+    Repo.update_all(
+      from(r in DispatchRecord,
+        where: r.id == ^record.id and r.tenant_id == ^record.tenant_id,
+        where: r.status in ["sent", "accepted"]
+      ),
+      set: [status: "superseded", updated_at: DateTime.utc_now()]
+    )
   end
 
   # A superseded dispatch's claim was reclaimed, so every epoch it carries is stale.

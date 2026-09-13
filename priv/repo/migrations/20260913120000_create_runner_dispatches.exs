@@ -51,6 +51,10 @@ defmodule Loopctl.Repo.Migrations.CreateRunnerDispatches do
 
     create index(:runner_dispatches, [:tenant_id, :runner_id])
 
+    # Story to dispatch is the incident path ("what was sent for this story, to whom, at which
+    # epoch"), and the reclaim fence reads by story.
+    create index(:runner_dispatches, [:tenant_id, :story_id])
+
     create constraint(:runner_dispatches, :runner_dispatches_status,
              check: "status IN ('sent', 'accepted', 'refused', 'superseded')"
            )

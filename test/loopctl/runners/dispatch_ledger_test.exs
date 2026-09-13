@@ -46,8 +46,35 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
     result
   end
 
+  # A dispatch payload for a real story at the dispatch's epoch, on the connection the
+  # ledger's claim fence reads (unless the caller names a story).
+  defp dispatch_payload(tenant_id, attrs \\ %{}) do
+    attrs = Map.new(attrs)
+
+    story_id =
+      Map.get_lazy(attrs, "story_id", fn ->
+        fixture(:ledger_story, %{
+          tenant_id: tenant_id,
+          claim_epoch: Map.get(attrs, "claim_epoch", 0)
+        }).id
+      end)
+
+    build(:runner_dispatch, Map.put(attrs, "story_id", story_id))
+  end
+
+  # A release of the story's claim, as every release path in `Progress` writes it.
+  defp release_claim(tenant_id, story_id) do
+    as_tenant(tenant_id, fn ->
+      story = Repo.get!(Loopctl.WorkBreakdown.Story, story_id)
+
+      story
+      |> Ecto.Changeset.change(Loopctl.Progress.claim_release_change(story))
+      |> Repo.update!()
+    end)
+  end
+
   defp sent(runner, attrs \\ %{}) do
-    {:ok, dispatch} = RunnerContract.cast_dispatch(build(:runner_dispatch, attrs))
+    {:ok, dispatch} = RunnerContract.cast_dispatch(dispatch_payload(runner.tenant_id, attrs))
     {:ok, record} = DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch)
     record
   end
@@ -117,7 +144,7 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
 
     test "the same dispatch_id twice finds the first row instead of writing a second",
          %{runner: runner} do
-      payload = build(:runner_dispatch)
+      payload = dispatch_payload(runner.tenant_id)
       {:ok, dispatch} = RunnerContract.cast_dispatch(payload)
 
       assert {:ok, first} = DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch)
@@ -147,10 +174,13 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
       {:ok, same} = RunnerContract.cast_dispatch(base)
       assert {:ok, _} = DispatchLedger.record_sent(runner.tenant_id, runner.id, same)
 
+      # Each differing identity passes the claim fence (a real story at the presented epoch),
+      # so the refusal is the ledger's identity check, not the fence.
+      other_story = fixture(:ledger_story, %{tenant_id: runner.tenant_id})
+
       for {who, attrs} <- [
-            {runner, %{"claim_epoch" => 1}},
             {runner, %{"kind" => "triage"}},
-            {runner, %{"story_id" => Ecto.UUID.generate()}},
+            {runner, %{"story_id" => other_story.id}},
             {other, %{}}
           ] do
         {:ok, dispatch} = RunnerContract.cast_dispatch(Map.merge(base, attrs))
@@ -158,6 +188,14 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
         assert {:error, :dispatch_id_conflict} =
                  DispatchLedger.record_sent(who.tenant_id, who.id, dispatch)
       end
+
+      # A different epoch on the SAME story: once the story has moved to it, that too is a
+      # different identity for this dispatch_id.
+      release_claim(runner.tenant_id, record.story_id)
+      {:ok, next_epoch} = RunnerContract.cast_dispatch(Map.put(base, "claim_epoch", 1))
+
+      assert {:error, :dispatch_id_conflict} =
+               DispatchLedger.record_sent(runner.tenant_id, runner.id, next_epoch)
     end
 
     test "refuses to re-send a dispatch the runner already answered", %{runner: runner} do
@@ -182,7 +220,7 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
 
       {:ok, dispatch} =
         RunnerContract.cast_dispatch(
-          build(:runner_dispatch, %{"dispatch_id" => record.dispatch_id})
+          dispatch_payload(tenant_b.id, %{"dispatch_id" => record.dispatch_id})
         )
 
       assert {:ok, record_b} = DispatchLedger.record_sent(tenant_b.id, runner_b.id, dispatch)
@@ -443,6 +481,78 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
     end
   end
 
+  describe "the claim fence" do
+    test "after the story's claim is released, a trace and a reply are stale and the row reads superseded",
+         %{runner: runner} do
+      # Claim (epoch 1), dispatch at that epoch, the runner accepts and ships a batch.
+      story = fixture(:ledger_story, %{tenant_id: runner.tenant_id, claim_epoch: 1})
+      record = accepted(runner, %{"story_id" => story.id, "claim_epoch" => 1})
+      run_id = Ecto.UUID.generate()
+      assert {:ok, 0} = trace(runner, record, run_id, [0])
+
+      # The claim is reclaimed: the story moves to epoch 2. The zombie still presents 1.
+      release_claim(runner.tenant_id, story.id)
+
+      assert {:error, :stale_claim_epoch} = trace(runner, record, run_id, [1])
+
+      assert DispatchLedger.get_record(runner.tenant_id, record.dispatch_id).status ==
+               "superseded"
+
+      assert {:error, :stale_claim_epoch} = reply(runner, record)
+      assert stored_seqs(runner.tenant_id, run_id) == [0]
+    end
+
+    test "a sent row whose story moved on is superseded by the reply, and nothing is applied",
+         %{runner: runner} do
+      record = sent(runner)
+      release_claim(runner.tenant_id, record.story_id)
+
+      assert {:error, :stale_claim_epoch} = reply(runner, record)
+
+      assert %{status: "superseded", replied_at: nil} =
+               DispatchLedger.get_record(runner.tenant_id, record.dispatch_id)
+    end
+
+    test "a refused row stays refused when its story moves on", %{runner: runner} do
+      record = sent(runner)
+      {:ok, _} = reply(runner, record, %{"decision" => "refused", "reason" => "draining"})
+      release_claim(runner.tenant_id, record.story_id)
+
+      assert {:error, :stale_claim_epoch} = reply(runner, record)
+
+      assert %{status: "refused", reason: "draining"} =
+               DispatchLedger.get_record(runner.tenant_id, record.dispatch_id)
+    end
+
+    test "nothing is recorded for a dispatch whose epoch is not the story's, or whose story does not exist",
+         %{runner: runner} do
+      story = fixture(:ledger_story, %{tenant_id: runner.tenant_id, claim_epoch: 3})
+
+      for payload <- [
+            build(:runner_dispatch, %{"story_id" => story.id, "claim_epoch" => 2}),
+            build(:runner_dispatch, %{"claim_epoch" => 0})
+          ] do
+        {:ok, dispatch} = RunnerContract.cast_dispatch(payload)
+
+        assert {:error, :stale_claim_epoch} =
+                 DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch)
+
+        assert DispatchLedger.get_record(runner.tenant_id, dispatch.dispatch_id) == nil
+      end
+    end
+
+    test "another tenant's story is not a story for this tenant's dispatch", %{runner: runner} do
+      tenant_b = fixture(:committed_tenant, %{})
+      theirs = fixture(:ledger_story, %{tenant_id: tenant_b.id})
+
+      {:ok, dispatch} =
+        RunnerContract.cast_dispatch(build(:runner_dispatch, %{"story_id" => theirs.id}))
+
+      assert {:error, :stale_claim_epoch} =
+               DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch)
+    end
+  end
+
   describe "values a runner can send" do
     test "an uppercase run_id is one run across batches", %{runner: runner} do
       record = accepted(runner)
@@ -456,10 +566,12 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
 
     test "an uppercase story_id or dispatch_id is sendable, and a re-send finds the same row",
          %{runner: runner} do
+      story = fixture(:ledger_story, %{tenant_id: runner.tenant_id})
+
       payload =
         build(:runner_dispatch, %{
           "dispatch_id" => String.upcase(Ecto.UUID.generate()),
-          "story_id" => String.upcase(Ecto.UUID.generate())
+          "story_id" => String.upcase(story.id)
         })
 
       {:ok, dispatch} = RunnerContract.cast_dispatch(payload)
@@ -599,7 +711,7 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
     end
 
     test "record_sent/3 is not a runner write: a database error there raises", %{runner: runner} do
-      {:ok, dispatch} = RunnerContract.cast_dispatch(build(:runner_dispatch))
+      {:ok, dispatch} = RunnerContract.cast_dispatch(dispatch_payload(runner.tenant_id))
 
       # Server-side input the contract cannot produce; Postgres refuses the NUL in `kind`.
       assert_raise Postgrex.Error, fn ->

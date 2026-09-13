@@ -316,6 +316,8 @@ defmodule Loopctl.Runners do
      for a different runner, story, `claim_epoch` or kind.
   7. `{:error, :dispatch_already_replied}` — the runner already accepted or refused this
      `dispatch_id`; sending it again would start a second session.
+  8. `{:error, :stale_claim_epoch}` — the dispatch's `claim_epoch` is not the story's current
+     one (or the story does not exist): the claim it was built for has already ended.
 
   Then it writes the dispatch's ledger row as `sent` (`DispatchLedger.record_sent/3`) — or
   finds the one an earlier call with the same `dispatch_id` wrote, so a retry never creates a
@@ -346,7 +348,8 @@ defmodule Loopctl.Runners do
              | :runner_not_connected
              | :runner_ambiguous
              | :dispatch_id_conflict
-             | :dispatch_already_replied}
+             | :dispatch_already_replied
+             | :stale_claim_epoch}
   def dispatch(tenant_id, runner_id, payload) do
     with {:ok, dispatch} <- RunnerContract.cast_dispatch(payload),
          {:ok, tenant_id, runner_id} <- cast_ids(tenant_id, runner_id),
