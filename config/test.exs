@@ -357,6 +357,10 @@ config :loopctl, Oban, testing: :inline
 # leaves this unset (defaults true) so the tree child subscribes normally.
 config :loopctl, :sth_enqueuer_subscribe, false
 
+# A conflict loser and a standby racing a vanished holder retry on this interval; short
+# here so the leadership tests do not sleep through production's 200 ms.
+config :loopctl, :sth_enqueuer_leadership_retry_ms, 20
+
 # Initialize plugs at runtime for faster test compilation
 config :phoenix, :plug_init_mode, :runtime
 
@@ -403,6 +407,10 @@ config :phoenix,
 
 # DI: Use mock health checker in tests
 config :loopctl, :health_checker, Loopctl.MockHealthChecker
+
+# The clustering DNS evidence (Loopctl.ClusterReadiness.running_peers/2). Nothing in the
+# test env configures DNS_CLUSTER_QUERY, so only tests that call running_peers/2 reach it.
+config :loopctl, :cluster_dns_resolver, Loopctl.MockClusterDnsResolver
 
 # US-32.4: scale-alerts config-guard DI (Loopctl.HealthCheck.Default's degraded-branch
 # coverage). Default stub in DataCase delegates to the real config_status/0.

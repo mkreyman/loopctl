@@ -55,8 +55,10 @@ kill_timeout = 90
   # CLUSTER_PEERS_MAY_SUSPEND follows [http_service] below: with auto_stop_machines
   # suspending down to min_machines_running (1), the second machine is usually suspended,
   # so fewer peers than EXPECTED_APP_NODES - 1 is normal and Loopctl.ClusterReadiness
-  # reports it as `peers_may_be_suspended`, not the `expected_peers_missing` alarm. Delete
-  # it if every machine is ever kept running, and the alarm comes back. The count itself is
+  # reports it as `peers_may_be_suspended`, not the `expected_peers_missing` alarm — but only
+  # while `loopctl.internal` (which lists started machines only) lists no other machine that
+  # is not connected; a running peer that failed to join still alarms. Delete it if every
+  # machine is ever kept running, and the alarm comes back for suspension too. The count itself is
   # always on `loopctl.cluster.peers.connected`. test/loopctl/fly_toml_test.exs holds this
   # line to the [http_service] settings.
   DNS_CLUSTER_QUERY = "loopctl.internal"

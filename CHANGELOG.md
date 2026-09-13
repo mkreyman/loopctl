@@ -18,7 +18,9 @@ All notable changes to loopctl are documented here.
   `DNS_CLUSTER_QUERY = "loopctl.internal"`, `EXPECTED_APP_NODES = "2"` (the machines that
   can run, which the DB connection budget needs) and `CLUSTER_PEERS_MAY_SUSPEND = "true"`:
   with `auto_stop_machines` the second machine is usually suspended, so a missing peer reads
-  `peers_may_be_suspended` instead of the `expected_peers_missing` alarm.
+  `peers_may_be_suspended` instead of the `expected_peers_missing` alarm — only while
+  `loopctl.internal`, which lists started machines only, lists no other machine this node
+  is not connected to. Two running machines that fail to connect still alarm.
 
   **No secret to set, no deploy ordering.** The release carries its own cookie, and the node
   basename carries the release, so only machines of one release cluster. **Before deploying,

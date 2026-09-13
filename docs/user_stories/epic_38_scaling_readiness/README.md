@@ -91,7 +91,9 @@ is one of:
 - `:expected_peers_missing` — configured + `EXPECTED_APP_NODES > 1` but too few peers.
 - `:peers_may_be_suspended` — the same, on a deployment that set
   `CLUSTER_PEERS_MAY_SUSPEND=true` because `auto_stop_machines` normally suspends a peer
-  (production). Not an alarm and no boot WARN. There the connected count to watch is the
+  (production), AND the `DNS_CLUSTER_QUERY` lookup lists no other machine this node is not
+  connected to. Not an alarm and no boot WARN. A listed-but-unconnected machine, or a failed
+  lookup, is `:expected_peers_missing` regardless of the switch. There the connected count to watch is the
   untagged `loopctl.cluster.peers.connected` gauge, with every machine started.
 - `:clustering_expected_dns_unconfigured` — `EXPECTED_APP_NODES` explicitly raised
   ABOVE the default (`> 2`) but `DNS_CLUSTER_QUERY` UNSET. This is the "count bumped

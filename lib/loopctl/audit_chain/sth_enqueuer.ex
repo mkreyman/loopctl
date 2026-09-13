@@ -59,10 +59,19 @@ defmodule Loopctl.AuditChain.SthEnqueuer do
 
   When the nodes connect (or the split heals) `:global` finds the name registered twice
   and calls the resolver passed to `register_name/3`: `:global.random_notify_name/3`
-  keeps one holder and sends `{:global_name_conflict, name}` to the other. That leader
-  unsubscribes from the firehose and becomes a standby monitoring the survivor. Without a
+  keeps one holder and sends `{:global_name_conflict, name}` to the other. Without a
   resolver `:global` KILLS one of the two, which a supervisor restarts — the same end
   state, bought with a crash report on every boot of a clustered fleet.
+
+  The notice arrives BEFORE this node's name table is updated: `global.erl` calls the
+  resolver while exchanging names and applies the result afterwards, in a cast to the name
+  server. So for a moment `:global.whereis_name/1` still answers this process. The loser
+  therefore never consults the table in the handler: it unsubscribes, drops leadership
+  and schedules `:retry_leadership`. A retry registers only when the name is free, monitors
+  the holder when it is another process, and waits another interval while the table still
+  names this process. If the table still names it after `@max_conflict_retries`
+  intervals, the exchange never completed (the connection dropped mid-exchange), the name
+  is still this process's on every node that can see it, and it leads again.
 
   ## Mode / test seam — explicit `:name` opt yields a plain LOCAL standalone
 
@@ -140,6 +149,10 @@ defmodule Loopctl.AuditChain.SthEnqueuer do
   # to monitor). Config-driven per the DI rules; kept short — this only covers a
   # narrow transient window, steady state is monitor-driven.
   @default_leadership_retry_ms 200
+
+  # How many retry intervals a conflict loser waits for the name table to stop naming it
+  # before concluding the exchange never completed (see "Two leaders").
+  @max_conflict_retries 25
 
   # --- Client API ---
 
@@ -248,7 +261,8 @@ defmodule Loopctl.AuditChain.SthEnqueuer do
       leadership_key: leadership_key || __MODULE__,
       subscribe?: subscribe?,
       role: :starting,
-      leader_ref: nil
+      leader_ref: nil,
+      conflict_retries: 0
     }
 
     # Negotiate leadership in handle_continue to keep init lightweight (cluster
@@ -290,28 +304,26 @@ defmodule Loopctl.AuditChain.SthEnqueuer do
   # standby singleton — otherwise a stale timer is a no-op.
   @impl true
   def handle_info(:retry_leadership, %{mode: :singleton, role: :standby} = state) do
-    {:noreply, try_become_leader(state)}
+    {:noreply, retry_leadership(state)}
   end
 
   def handle_info(:retry_leadership, state), do: {:noreply, state}
 
   # `:global` found this name registered on both sides of a (re)connection and kept the
-  # other holder (see "Two leaders" in the moduledoc). Stop draining and stand by.
+  # other holder (see "Two leaders" in the moduledoc). The name table has NOT been updated
+  # yet, so it is not read here: stop draining, stand by, and let the retry find the holder.
   @impl true
   def handle_info({:global_name_conflict, key}, %{leadership_key: key} = state) do
     if state.role == :leader and state.subscribe?, do: ChainPubSub.unsubscribe_firehose()
+    if state.leader_ref, do: Process.demonitor(state.leader_ref, [:flush])
 
     Logger.info(
       "SthEnqueuer: another node holds cluster-singleton leadership after a (re)connection; " <>
         "standing by (#{inspect(key)})"
     )
 
-    state = become_standby(%{state | role: :standby, leader_ref: nil})
-
-    # Only if the name came back to this process after all (nothing else to monitor).
-    if state.role == :leader and state.subscribe?, do: ChainPubSub.subscribe_firehose()
-
-    {:noreply, state}
+    Process.send_after(self(), :retry_leadership, leadership_retry_ms())
+    {:noreply, %{state | role: :standby, leader_ref: nil, conflict_retries: 0}}
   end
 
   @impl true
@@ -394,6 +406,36 @@ defmodule Loopctl.AuditChain.SthEnqueuer do
 
       :no ->
         become_standby(state)
+    end
+  end
+
+  # A standby's retry. Registers only when the name is free; a holder that is another
+  # process is monitored; a table that still names THIS process is a conflict whose result
+  # has not been applied yet, so wait (bounded — see "Two leaders").
+  defp retry_leadership(state) do
+    holder = :global.whereis_name(state.leadership_key)
+
+    cond do
+      holder == :undefined ->
+        try_become_leader(%{state | conflict_retries: 0})
+
+      holder != self() ->
+        ref = Process.monitor(holder)
+        %{state | role: :standby, leader_ref: ref, conflict_retries: 0}
+
+      state.conflict_retries < @max_conflict_retries ->
+        Process.send_after(self(), :retry_leadership, leadership_retry_ms())
+        %{state | conflict_retries: state.conflict_retries + 1}
+
+      true ->
+        if state.subscribe?, do: ChainPubSub.subscribe_firehose()
+
+        Logger.info(
+          "SthEnqueuer: the name is still this process's after a conflict notice; the " <>
+            "exchange did not complete, resuming leadership (#{inspect(state.leadership_key)})"
+        )
+
+        %{state | role: :leader, leader_ref: nil, conflict_retries: 0}
     end
   end
 

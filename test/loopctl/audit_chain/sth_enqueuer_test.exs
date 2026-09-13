@@ -467,51 +467,109 @@ defmodule Loopctl.AuditChain.SthEnqueuerTest do
       assert enqueued_tid == tenant.id
     end
 
-    test "two leaders meeting: the one :global did not keep stops draining and monitors the survivor" do
-      # Two nodes boot unconnected (or heal from a netsplit) each holding the name. When
-      # they connect, :global keeps one holder and — through the resolver the enqueuer
-      # registers with — sends {:global_name_conflict, key} to the other. Reproduced on one
-      # node: a leader that is subscribed, the name moved to another process (the state
-      # :global leaves behind), then the notice.
+    test "a conflict notice delivered while the table still names the loser: it stands down, then monitors the survivor" do
+      # The order global.erl uses: the resolver sends {:global_name_conflict, key} DURING the
+      # name exchange, and the name table is updated afterwards. So the notice arrives while
+      # :global.whereis_name/1 still answers the loser.
       key = :"sth_conflict_#{System.unique_integer([:positive])}"
       topic = Loopctl.AuditChain.PubSub.firehose_topic()
-
-      loser =
-        start_supervised!(
-          Supervisor.child_spec({SthEnqueuer, [leadership_key: key, subscribe: true]},
-            id: :sth_conflict_loser,
-            restart: :temporary
-          )
-        )
+      loser = start_singleton(key, :sth_conflict_loser)
 
       assert :sys.get_state(loser).role == :leader
       assert loser in subscribers(topic)
 
+      send(loser, {:global_name_conflict, key})
+      state = :sys.get_state(loser)
+
+      assert :global.whereis_name(key) == loser
+      assert state.role == :standby
+      assert state.leader_ref == nil
+      refute loser in subscribers(topic)
+
+      # A retry while the table still names the loser changes nothing.
+      Process.sleep(SthEnqueuer.leadership_retry_ms() * 3)
+      assert :sys.get_state(loser).role == :standby
+      refute loser in subscribers(topic)
+
+      # Then the table is updated to the survivor, as the name server's cast would.
       survivor = spawn(fn -> Process.sleep(:infinity) end)
       on_exit(fn -> Process.exit(survivor, :kill) end)
       :global.unregister_name(key)
       :yes = :global.register_name(key, survivor)
 
-      send(loser, {:global_name_conflict, key})
-      state = :sys.get_state(loser)
-
-      assert state.role == :standby
-      assert is_reference(state.leader_ref)
+      assert eventually(fn -> monitors?(loser, survivor) end)
+      assert :sys.get_state(loser).role == :standby
       refute loser in subscribers(topic)
-      assert Process.alive?(loser)
 
       # And it still fails over: the survivor dies, the ex-leader takes the name back.
       Process.exit(survivor, :kill)
       assert eventually(fn -> :global.whereis_name(key) == loser end)
-      assert :sys.get_state(loser).role == :leader
+      assert eventually(fn -> :sys.get_state(loser).role == :leader end)
       assert loser in subscribers(topic)
     end
 
-    test "leadership is registered with a resolver, so :global never kills a duplicate leader" do
-      # Without a resolver :global's default on a name clash is to KILL one holder. The
-      # resolver is what turns the clash into the message handled above.
-      source = File.read!("lib/loopctl/audit_chain/sth_enqueuer.ex")
-      assert source =~ "&:global.random_notify_name/3"
+    test "a conflict notice whose exchange never completes: the loser leads again once the wait is spent" do
+      # The connection dropped before the name table was updated, so the name is still the
+      # loser's everywhere it can be seen. Nobody else drains; it must resume.
+      key = :"sth_conflict_stale_#{System.unique_integer([:positive])}"
+      topic = Loopctl.AuditChain.PubSub.firehose_topic()
+      loser = start_singleton(key, :sth_conflict_stale)
+      assert :sys.get_state(loser).role == :leader
+
+      send(loser, {:global_name_conflict, key})
+      assert :sys.get_state(loser).role == :standby
+
+      assert eventually(fn -> :sys.get_state(loser).role == :leader end, 200, 25)
+      assert :global.whereis_name(key) == loser
+      assert loser in subscribers(topic)
+    end
+
+    @tag timeout: 60_000
+    test "two nodes that each boot as leader and then connect end with exactly one leader" do
+      # Two real BEAM nodes (:peer), each running a subscribed singleton under the same key,
+      # registered while unconnected, then connected — the boot and netsplit-heal case, with
+      # :global's own resolver and table update in their real order.
+      key = :"sth_peer_#{System.unique_integer([:positive])}"
+      topic = Loopctl.AuditChain.PubSub.firehose_topic()
+
+      [{a, a_pid}, {b, b_pid}] =
+        for name <- [:sth_peer_a, :sth_peer_b] do
+          peer = start_peer(name)
+          {peer, start_peer_singleton(peer, key)}
+        end
+
+      assert peer_role(a, a_pid) == :leader
+      assert peer_role(b, b_pid) == :leader
+
+      assert :peer.call(a, Node, :connect, [:peer.call(b, Kernel, :node, [])])
+
+      assert eventually(
+               fn ->
+                 roles = Enum.sort([peer_role(a, a_pid), peer_role(b, b_pid)])
+                 holder = :peer.call(a, :global, :whereis_name, [key])
+
+                 roles == [:leader, :standby] and
+                   holder == :peer.call(b, :global, :whereis_name, [key])
+               end,
+               200,
+               25
+             )
+
+      holder = :peer.call(a, :global, :whereis_name, [key])
+      assert holder in [a_pid, b_pid]
+      {standby_peer, standby_pid} = if holder == a_pid, do: {b, b_pid}, else: {a, a_pid}
+
+      # Both processes are alive (no resolver would have killed one), the holder alone
+      # drains, and the standby monitors it.
+      assert :peer.call(a, Process, :alive?, [a_pid])
+      assert :peer.call(b, Process, :alive?, [b_pid])
+      assert eventually(fn -> peer_subscribers(standby_peer, topic) == [] end, 200, 25)
+
+      assert eventually(
+               fn -> {:process, holder} in peer_monitors(standby_peer, standby_pid) end,
+               200,
+               25
+             )
     end
 
     test "TC-38.3.1: the app-boot instance holds the cluster-global {:global, SthEnqueuer} leadership" do
@@ -550,6 +608,77 @@ defmodule Loopctl.AuditChain.SthEnqueuerTest do
   # Poll a predicate until true or a bounded deadline — assert outcome CLASS, not
   # exact timing (the async-suite flake lesson): failover is asynchronous (:global
   # de-register + monitor :DOWN + re-register), so we wait for the end state.
+  defp start_singleton(key, id) do
+    start_supervised!(
+      Supervisor.child_spec({SthEnqueuer, [leadership_key: key, subscribe: true]},
+        id: id,
+        restart: :temporary
+      )
+    )
+  end
+
+  defp monitors?(pid, target) do
+    {:monitors, monitors} = Process.info(pid, :monitors)
+    {:process, target} in monitors
+  end
+
+  # A distributed peer node carrying this build's code, controlled over stdio (this test
+  # node itself is not distributed). Long names on 127.0.0.1 need no DNS.
+  defp start_peer(name) do
+    paths = Enum.flat_map(:code.get_path(), &[~c"-pa", &1])
+    unique = :"#{name}_#{System.unique_integer([:positive])}"
+
+    {:ok, peer, _node} =
+      :peer.start_link(%{
+        name: unique,
+        host: ~c"127.0.0.1",
+        longnames: true,
+        connection: :standard_io,
+        args: paths
+      })
+
+    # Linked to the test process, so it usually stops with it before on_exit runs.
+    on_exit(fn ->
+      try do
+        :peer.stop(peer)
+      catch
+        :exit, _ -> :ok
+      end
+    end)
+
+    for app <- [:elixir, :logger, :phoenix_pubsub] do
+      {:ok, _} = :peer.call(peer, :application, :ensure_all_started, [app])
+    end
+
+    # Under kernel_sup: a process linked to the short-lived :peer.call caller would die with it.
+    {:ok, _} =
+      :peer.call(peer, :supervisor, :start_child, [
+        :kernel_sup,
+        Phoenix.PubSub.child_spec(name: Loopctl.PubSub)
+      ])
+
+    peer
+  end
+
+  defp start_peer_singleton(peer, key) do
+    spec =
+      Supervisor.child_spec({SthEnqueuer, [leadership_key: key, subscribe: true]}, id: :sth_peer)
+
+    {:ok, pid} = :peer.call(peer, :supervisor, :start_child, [:kernel_sup, spec])
+    pid
+  end
+
+  defp peer_role(peer, pid), do: :peer.call(peer, :sys, :get_state, [pid]).role
+
+  defp peer_subscribers(peer, topic) do
+    for {pid, _} <- :peer.call(peer, Registry, :lookup, [Loopctl.PubSub, topic]), do: pid
+  end
+
+  defp peer_monitors(peer, pid) do
+    {:monitors, monitors} = :peer.call(peer, Process, :info, [pid, :monitors])
+    monitors
+  end
+
   defp subscribers(topic) do
     for {pid, _value} <- Registry.lookup(Loopctl.PubSub, topic), do: pid
   end
