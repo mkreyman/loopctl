@@ -8,6 +8,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
   alias Loopctl.ApiSpec.RunnerContract.RunnerDispatchReply
   alias Loopctl.ApiSpec.RunnerContract.RunnerTraceBatch
   alias Loopctl.ApiSpec.RunnerContract.RunnerTraceEvent
+  alias Loopctl.Delivery.StageMachine
 
   @join %{
     "contract_version" => "1.0.0",
@@ -45,17 +46,18 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       assert "claim_epoch" in defs["RunnerDispatch"]["required"]
     end
 
-    test "is contract 1.1.0 and names the 1.1 events, replies, errors and limits" do
+    test "is the current contract version and names its events, replies, errors and limits" do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.3.0"
-      assert schema["x-contract-version"] == "1.3.0"
+      assert RunnerContract.version() == "1.4.0"
+      assert schema["x-contract-version"] == "1.4.0"
 
       assert %{
                "dispatch_reply" => "RunnerDispatchReply",
                "trace" => "RunnerTraceBatch",
-               "trace_cursor" => "RunnerTraceCursor"
+               "trace_cursor" => "RunnerTraceCursor",
+               "stage" => "RunnerStageReport"
              } = connection["events"]
 
       assert connection["replies"] == %{
@@ -73,6 +75,16 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       assert connection["limits"]["trace_max_event_bytes"] == RunnerTraceEvent.max_bytes()
       assert connection["limits"]["frame_envelope_bytes"] == RunnerContract.frame_envelope_bytes()
       assert connection["limits"]["dispatch_reply_burst"] == RunnerContract.dispatch_reply_burst()
+      assert connection["limits"]["stage_burst"] == RunnerContract.stage_burst()
+
+      # #803: the stage transition table is published so a runner can refuse an impossible
+      # transition locally. It is DERIVED from the server's machine — asserted here against
+      # `StageMachine.runner_transitions/0` rather than against a copy, so an edge added to
+      # the machine reaches the wire without anyone remembering to widen a list.
+      assert connection["stage_transitions"] ==
+               Enum.map(StageMachine.runner_transitions(), fn {from, to, edge} ->
+                 %{"from" => to_string(from), "to" => to_string(to), "edge" => to_string(edge)}
+               end)
 
       assert connection["limits"]["min_interval_ms"] ==
                Map.new(

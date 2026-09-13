@@ -25,8 +25,11 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :must_contract_first}` -> 409 (claim before contracting)
   - `{:error, :must_claim_first}` -> 409 (start before claiming)
   - `{:error, :stale_claim_epoch}` -> 409 (#803: the presented `claim_epoch` is not the story's current one — the caller's claim has ended)
-  - `{:error, :not_claimant}` -> 409 (#803: renew-claim by a caller that is not the story's assigned agent)
+  - `{:error, :not_claimant}` -> 409 (#803: renew-claim or escalate by a caller that is not the story's assigned agent)
   - `{:error, :not_claimed}` -> 422 (#803: renew-claim on a story that is not assigned or implementing)
+  - `{:error, :stale_stage}` -> 409 (#803: the delivery stage row is not where the caller believed; the CLAIM is still good, unlike `stale_claim_epoch`)
+  - `{:error, :unknown_story_stage}` -> 404 (#803: the story has no `story_stages` row, so it is not in the delivery loop)
+  - `{:error, :busy}` -> 503 with `Retry-After` (#803: a delivery-stage write gave up waiting on a lock; nothing was written)
   - `{:error, :self_verify_blocked}` -> 409 (same agent implemented and tries to verify)
   - `{:error, :self_report_blocked}` -> 409 (implementer tries to report their own work)
   - `{:error, :self_review_blocked}` -> 409 (implementer tries to review their own work)
@@ -59,6 +62,7 @@ defmodule LoopctlWeb.FallbackController do
   alias Loopctl.ApiSpec.Messages
   alias Loopctl.Custody.ViolationMonitor
   alias Loopctl.Llm.Remediation
+  alias Loopctl.Runners.Capacity
   alias LoopctlWeb.DBError
   alias LoopctlWeb.DBErrorLogger
 
@@ -255,6 +259,60 @@ defmodule LoopctlWeb.FallbackController do
     })
   end
 
+  # #803: the delivery stage row is not where the caller believed it was, so its
+  # compare-and-set matched nothing. Distinct from `stale_claim_epoch` on purpose — the claim
+  # is fine and the caller should keep working; only its picture of the stage is out of date.
+  def call(conn, {:error, :stale_stage}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "stale_stage",
+        message:
+          "This story's delivery stage is not the one this call assumed, so nothing was " <>
+            "written. Your claim is still good: re-read the story's stage and send the " <>
+            "transition that applies to where it actually is."
+      }
+    })
+  end
+
+  # #803: a story with no `story_stages` row at all. It is a control-plane state, not
+  # something the caller can clear by retrying or by giving up its claim, which is why it is
+  # a 404 naming the stage row rather than the story.
+  def call(conn, {:error, :unknown_story_stage}) do
+    conn
+    |> put_status(:not_found)
+    |> json(%{
+      error: %{
+        status: 404,
+        code: "unknown_story_stage",
+        message:
+          "This story has no delivery stage row, so it is not in the delivery loop. " <>
+            "Nothing was written."
+      }
+    })
+  end
+
+  # #803: a lock a delivery-stage write could not get inside its bounded wait, or a deadlock
+  # Postgres broke by choosing it. NOTHING was written and the request is fine, so it is
+  # retryable — with a `retry-after` LONGER than the wait that just ran out, because retrying
+  # at exactly that wait puts the caller back in the same queue with no backoff.
+  def call(conn, {:error, :busy}) do
+    conn
+    |> maybe_put_retry_after(div(Capacity.busy_retry_ms(), 1000) + 1)
+    |> put_status(:service_unavailable)
+    |> json(%{
+      error: %{
+        status: 503,
+        code: "busy",
+        message:
+          "The delivery stage row was locked by another writer and this call gave up " <>
+            "waiting. Nothing was written; retry after the retry-after interval."
+      }
+    })
+  end
+
   def call(conn, {:error, :not_claimant}) do
     conn
     |> put_status(:conflict)
@@ -263,8 +321,8 @@ defmodule LoopctlWeb.FallbackController do
         status: 409,
         code: "not_claimant",
         message:
-          "Only the story's assigned agent can renew its claim, and your key's agent is " <>
-            "not it."
+          "Only the story's assigned agent can do this, and your key's agent is not it. " <>
+            "Renewing a claim and escalating a story are both the claimant's."
       }
     })
   end

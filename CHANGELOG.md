@@ -6,6 +6,31 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **A runner reports its delivery stage, and a session can escalate to a human (#803).**
+  Two new ways into the per-story delivery stage machine, both landing on
+  `Loopctl.Delivery.Stages.advance/4`, which stays the only writer of `story_stages`.
+
+  **Runner contract 1.4.0** adds a runner-to-control `stage` message
+  (`priv/runner_contract/v1.json`, vendored by `mkreyman/loopctl-runner`). It carries the
+  dispatch, its `claim_epoch`, the `from` and `to` stages, the edge and the identities the
+  transition produced, and is fenced on the claim epoch exactly as `dispatch_reply` and
+  `trace` are. It is metered by a new `stage_burst` bucket (12, refilled one per 250 ms), and
+  the transition table a runner may report is published at
+  `x-connection.stage_transitions`. Two new refusal codes, `stale_stage` and
+  `unknown_story_stage`, because neither existing code carries their remedy. **Reporting a
+  transition into `done`, `failed` or `escalated` releases the session's runner slot in the
+  same transaction**, which #822 had no signal for — until now such a slot waited out the
+  heal sweep.
+
+  **New endpoint `POST /api/v1/stories/:id/escalate`** (agent role, `exact_role`, human-anchored
+  tenant): the story's CLAIMING agent parks it at the `escalated` stage and stops, presenting
+  the `claim_epoch` its claim returned and a reason. This is the affordance an unattended
+  session has instead of a question. It is idempotent under the same epoch. The endpoint is
+  `exact_role: :agent` deliberately — the human key that RESOLVES an escalation must not be
+  able to raise one.
+
+  No new environment variable and no migration.
+
 - **Runner capacity is reserved in Postgres, and a tenant's total is admission-controlled
   (#803).** `Loopctl.Runners.dispatch/3` now takes a slot on the runner in the same
   transaction that records the dispatch, and refuses `:runner_at_capacity` past the runner's

@@ -28,6 +28,14 @@ defmodule Loopctl.Delivery.StageMachine do
     (design §4), including the disagreement that escalates by construction
   - `:merge_gate` — ci -> escalated, the merge-precondition gate refusing (design §5:
     a clean result merges with no human, anything else routes to Gate A)
+  - `:session_escalated` — any IN-FLIGHT stage -> escalated, the unattended session asking
+    for Mark (design §8, "Escalation is a command the session calls"). The one escalation
+    edge a session may take itself, and the only one available from the stages a runner
+    holds: `:triage_escalate`, `:merge_gate` and `:verification_failed` are each a
+    control-side verdict about a specific gate. Taken two ways, both of which end at this
+    one edge so the chain entry is identical either way — `POST /stories/:id/escalate` from
+    the claiming agent's own key, and a runner's `stage` message reporting what it read out
+    of the run's `escalations.ndjson`.
   - `:merge_refused` — merged -> implementing, when the merge did not hold: a conflict, a
     branch protection rule, a required check. It needs a reason, it clears `merge_sha`
     along with the head, and it is CHAINED — the entry into `merged` is a custody fact, so
@@ -73,6 +81,9 @@ defmodule Loopctl.Delivery.StageMachine do
 
   @human_resolution for to <- [:queued, :done, :failed], do: {:escalated, to, :human_resolution}
 
+  # The session's own escalation, from every stage a runner holds it in.
+  @session_escalated for from <- @in_flight, do: {from, :escalated, :session_escalated}
+
   @transitions @forward ++
                  [
                    {:ci, :implementing, :ci_red},
@@ -83,7 +94,29 @@ defmodule Loopctl.Delivery.StageMachine do
                    {:triaged, :escalated, :triage_escalate},
                    {:ci, :escalated, :merge_gate},
                    {:merged, :implementing, :merge_refused}
-                 ] ++ @budget_exceeded ++ @released ++ @human_resolution
+                 ] ++ @budget_exceeded ++ @released ++ @human_resolution ++ @session_escalated
+
+  # The part of the machine a RUNNER may report over the channel. Derived from
+  # `@transitions`, so an edge added above is reportable or not by these rules rather than by
+  # a second list somebody has to remember to extend. See `runner_transitions/0`.
+  @runner_source_stages @in_flight ++ [:merged, :deployed, :verified]
+  @runner_forbidden_edges [:runner_lost, :claim_released, :human_resolution]
+
+  # The SOURCE filter is also what keeps `claimed` out as a destination: `queued` is the only
+  # stage anything enters `claimed` from, and `queued` is not a source. A separate
+  # `to != :claimed` clause was here and is gone — `bin/mutate.sh` returned exit 1 on it,
+  # which is the tool saying no test can tell whether it is there. `stage_machine_test.exs`
+  # asserts the property directly instead, so widening the source list to include `queued`
+  # goes red rather than quietly handing a runner the transition that writes `runner_id` and
+  # the claim's chain entry.
+  @runner_transitions for {from, to, edge} <- @transitions,
+                          from in @runner_source_stages,
+                          edge not in @runner_forbidden_edges,
+                          do: {from, to, edge}
+
+  @runner_from_stages @runner_transitions |> Enum.map(&elem(&1, 0)) |> Enum.uniq()
+  @runner_to_stages @runner_transitions |> Enum.map(&elem(&1, 1)) |> Enum.uniq()
+  @runner_edges @runner_transitions |> Enum.map(&elem(&1, 2)) |> Enum.uniq()
 
   # The custody-critical transitions, and the only ones written to the audit chain (design
   # §11): a claim, a merge, an escalation, a human acting on one — and the RETRACTION of a
@@ -155,6 +188,7 @@ defmodule Loopctl.Delivery.StageMachine do
           | :runner_lost
           | :claim_released
           | :human_resolution
+          | :session_escalated
 
   @type effect ::
           :runner_id
@@ -198,6 +232,59 @@ defmodule Loopctl.Delivery.StageMachine do
   @doc "True for the edges only a human principal may take."
   @spec human_only?(edge()) :: boolean()
   def human_only?(edge), do: edge == :human_resolution
+
+  @doc """
+  The transitions a RUNNER may report over the channel (`stage`, contract 1.4.0), derived
+  from `transitions/0` so the wire enum and the machine cannot drift.
+
+  A runner may report only the part of the machine its own session drives, so three classes
+  are held back and each for its own reason:
+
+  - anything OUT OF a stage no session holds (`detected`, `triaged`, `queued`, `escalated`).
+    Those are control's — triage and the human resolution — and a session that has been
+    escalated away from is precisely the one that must not move the row back.
+  - anything INTO `claimed`. That transition writes `runner_id` and a chain entry, and it is
+    control's `advance(queued -> claimed)` alongside the claim itself; a runner reporting it
+    would be naming its own machine as the story's holder.
+  - `:runner_lost` and `:claim_released` (a runner that can report itself lost is not lost,
+    and a release is the releasing transaction's — `Loopctl.Delivery.Stages.follow_release/5`)
+    and `:human_resolution`, which is Mark's.
+
+  `from` is on the wire and is part of the compare-and-set: a runner states the stage it
+  believed the story was at, and a row that has moved refuses it rather than taking a
+  transition from somewhere else.
+  """
+  @spec runner_transitions() :: [transition()]
+  def runner_transitions, do: @runner_transitions
+
+  @doc "True when `{from, to, edge}` is one a runner may report."
+  @spec runner_reportable?(stage(), stage(), edge()) :: boolean()
+  def runner_reportable?(from, to, edge), do: {from, to, edge} in @runner_transitions
+
+  @doc "Every stage that appears as the SOURCE of a runner-reportable transition."
+  @spec runner_from_stages() :: [stage()]
+  def runner_from_stages, do: @runner_from_stages
+
+  @doc "Every stage that appears as the TARGET of a runner-reportable transition."
+  @spec runner_to_stages() :: [stage()]
+  def runner_to_stages, do: @runner_to_stages
+
+  @doc "Every edge a runner-reportable transition can carry."
+  @spec runner_edges() :: [edge()]
+  def runner_edges, do: @runner_edges
+
+  @doc """
+  True when arriving at `to` ENDS the session that was working the story, so the runner slot
+  it held goes back (`Loopctl.Runners.DispatchLedger.release_slot_in/4`).
+
+  DERIVED from the destination stage, never asserted by the caller. A message that could say
+  "my session is over" while it ran would let a runner free a slot it is still using, and the
+  admission ceiling it feeds is what keeps six concurrent sessions off one Anthropic account
+  (design §9). `done`, `failed` and `escalated` are exactly the stages no session continues
+  from: `escalated` waits on Mark, and the other two are terminal.
+  """
+  @spec ends_session?(stage()) :: boolean()
+  def ends_session?(to), do: to in @terminal
 
   @doc "True for an edge counted in `attempts` — every edge except `:forward`."
   @spec counted?(edge()) :: boolean()

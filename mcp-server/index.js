@@ -46,6 +46,7 @@ import { createHandoff } from "./lib/handoff.js";
 import { readPayloadFile } from "./lib/payload-path.js";
 import { enrollRunner, listRunners, revokeRunner, runnerPool } from "./lib/runners.js";
 import { claimLeaseNotice, renewStoryClaim as renewStoryClaimRequest } from "./lib/claim-lease.js";
+import { escalateStory as escalateStoryRequest, escalationNotice } from "./lib/escalation.js";
 
 // Single source of truth for the server version: the package.json this file
 // ships with (npm always includes package.json in the published tarball).
@@ -1149,6 +1150,15 @@ function withClaimLeaseNotice(result) {
 
 async function renewStoryClaim(args) {
   return withClaimLeaseNotice(await renewStoryClaimRequest(args, { apiCall }));
+}
+
+// #803: escalation leads with a STOP line. A session that escalates and keeps working is
+// the failure the affordance exists to prevent, and the JSON body alone does not say so.
+async function escalateStory(args) {
+  const result = await escalateStoryRequest(args, { apiCall });
+  const notice = escalationNotice(result);
+  if (!notice) return toContent(result);
+  return { content: [{ type: "text", text: notice }, ...toContent(result).content] };
 }
 
 async function startStory({ story_id, capability }) {
@@ -4083,6 +4093,54 @@ const TOOLS = [
         },
       },
       required: ["story_id", "claim_epoch"],
+    },
+  },
+  {
+    name: "escalate_story",
+    description:
+      "Park a story you hold for a HUMAN to decide, and stop (POST /api/v1/stories/:id/escalate). " +
+      "This is what you call instead of asking a question: an unattended session has no way to " +
+      "ask, so escalating is the affordance. Use it when the request contradicts an existing " +
+      "story, KB decision or documented behaviour; when it inverts or removes behaviour a " +
+      "previous story deliberately added; when it is a workflow change rather than a defect fix; " +
+      "or when it needs a business call. Do NOT use it for an ordinary blocker you can work " +
+      "through. It is ONE-WAY from your side: only a human moves the story off `escalated`, so " +
+      "after a success, stop working the story and report that you escalated and why. Uses the " +
+      "AGENT key, the same key as claim_story; an orchestrator or user key is 403'd on purpose. " +
+      "IDEMPOTENT: repeating it under the same claim_epoch returns the same stage row and writes " +
+      "nothing twice. Refusals pass through: 409 stale_claim_epoch (the claim has ENDED, stop " +
+      "working it), 409 not_claimant (your key's agent is not the story's), 404 " +
+      "unknown_story_stage (the story is not in the delivery loop), 400 for a missing or " +
+      "malformed claim_epoch or reason.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        story_id: {
+          type: "string",
+          description: "The UUID of the story you hold.",
+        },
+        claim_epoch: {
+          type: "integer",
+          minimum: 0,
+          description: "The claim_epoch your claim_story result returned.",
+        },
+        reason: {
+          type: "string",
+          minLength: 1,
+          maxLength: 4000,
+          description:
+            "What a human has to decide, in your own words. Recorded verbatim, capped at 4000 " +
+            "characters, and treated as untrusted data everywhere it is read.",
+        },
+        payload: {
+          type: "object",
+          additionalProperties: true,
+          description:
+            "Optional structured detail — the story or KB article it contradicts, the two " +
+            "options you are between. Recorded on the stage event; at most 8000 bytes encoded.",
+        },
+      },
+      required: ["story_id", "claim_epoch", "reason"],
     },
   },
   {
@@ -8290,6 +8348,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "renew_story_claim":
       return await renewStoryClaim(args);
+    case "escalate_story":
+      return await escalateStory(args);
 
     case "start_story":
       return await startStory(args);

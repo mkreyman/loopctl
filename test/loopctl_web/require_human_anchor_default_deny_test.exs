@@ -342,6 +342,11 @@ defmodule LoopctlWeb.RequireHumanAnchorDefaultDenyTest do
     {:post, "/api/v1/stories/:id/report"} => :agent,
     {:post, "/api/v1/stories/:id/unclaim"} => :agent,
     {:post, "/api/v1/stories/:id/renew-claim"} => :agent,
+    # #803. `exact_role: :agent` like its siblings above, and for a reason of its own: the
+    # human key that RESOLVES an escalation must not be able to raise one. Probed with the
+    # agent key so this test sees the TIER gate rather than the role gate — the two are
+    # independent, and it is the tier one that is under test here.
+    {:post, "/api/v1/stories/:id/escalate"} => :agent,
     {:post, "/api/v1/stories/:id/report-done"} => :agent,
     {:post, "/api/v1/stories/:id/start-work"} => :agent,
     {:post, "/api/v1/stories/:id/recover-cap"} => :agent,

@@ -391,6 +391,9 @@ defmodule LoopctlWeb.Router do
     post "/stories/:id/report", StoryStatusController, :report
     post "/stories/:id/unclaim", StoryStatusController, :unclaim
     post "/stories/:id/renew-claim", StoryStatusController, :renew_claim
+    # #803: the claiming agent parks the story for a human. exact_role: :agent, so the human
+    # key that RESOLVES an escalation cannot raise one.
+    post "/stories/:id/escalate", StoryEscalationController, :escalate
     # Discoverability aliases — same actions, alternate URL patterns agents tend to guess
     post "/stories/:id/report-done", StoryStatusController, :report
     post "/stories/:id/start-work", StoryStatusController, :start

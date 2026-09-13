@@ -30,8 +30,30 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | runner -> control | `"dispatch_reply"` | `RunnerDispatchReply` (since 1.1.0) | empty | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `stale_claim_epoch`, `already_replied` |
   | runner -> control | `"trace"` | `RunnerTraceBatch` of `RunnerTraceEvent` (since 1.1.0) | `RunnerTraceAck` | `rate_limited`, `invalid_payload`, `batch_too_large`, `event_data_too_large`, `unknown_dispatch`, `stale_claim_epoch`, `dispatch_not_accepted`, `run_mismatch` |
   | runner -> control | `"trace_cursor"` | `RunnerTraceCursor` (since 1.1.0) | `RunnerTraceAck` | `rate_limited`, `invalid_payload` |
+  | runner -> control | `"stage"` | `RunnerStageReport` (since 1.4.0) | `{stage, claim_epoch, lock_version, attempts}` | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `dispatch_not_accepted`, `stale_claim_epoch`, `stale_stage`, `unknown_story_stage` |
   | control -> runner | `"disconnecting"` | `RunnerDisconnecting` (since 1.2.0) | — | — |
   | (1.3.0) a dispatch's `wall_clock_seconds` is bounded: `RunnerDispatch.max_wall_clock_seconds/0` | | | | |
+
+  ## Stage reporting (since 1.4.0)
+
+  A runner reports each delivery-stage transition its session made with `stage`. **Postgres
+  owns the stage; the message is a request.** The server compare-and-sets `from` -> `to` on
+  the story's `story_stages` row in one transaction, fenced on `claim_epoch` exactly as
+  `dispatch_reply` and `trace` are, and answers with the row's new stage, epoch,
+  `lock_version` and `attempts`. The transition table is published at
+  `x-connection.stage_transitions`, derived from the server's own machine.
+
+  A runner may report only the part of the machine its session drives: nothing out of a
+  stage no session holds, nothing into `claimed`, and never `runner_lost`, `claim_released`
+  or `human_resolution`. Arriving at `done`, `failed` or `escalated` ends the session and the
+  runner's slot goes back in the same transaction — the server decides that from the
+  destination stage, so no message can free a slot while its session runs.
+
+  Every `stage` message is safe to REPLAY. One whose first copy committed finds the row
+  already at `to` under the same epoch and is answered `ok` with that row, so a re-send after
+  a lost acknowledgement — which happens on every rolling deploy — never transitions twice.
+  A message for a row that has moved somewhere ELSE is `stale_stage`: re-read the story and
+  send the transition that applies.
   | runner -> control | any other event | — | — | `unknown_event` (since 1.2.0; every time, never `rate_limited`) |
 
   ## Server-initiated disconnects (since 1.2.0)
@@ -112,9 +134,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   require OpenApiSpex
 
+  alias Loopctl.Delivery.StageMachine
   alias OpenApiSpex.Schema
 
-  @version "1.3.0"
+  @version "1.4.0"
   @major 1
 
   defmodule ByteRule do
@@ -467,6 +490,135 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     )
   end
 
+  defmodule RunnerStage do
+    @moduledoc false
+    require OpenApiSpex
+
+    alias Loopctl.Delivery.StageMachine
+
+    # The wire enums are DERIVED from the stage machine (`StageMachine.runner_transitions/0`),
+    # so the contract cannot declare a stage or an edge the machine does not have, and an edge
+    # added to the machine is on the wire the moment it is reportable. The individual enums
+    # bound each field; `RunnerContract.cast_stage/1` checks the TRIPLE, which is the real
+    # rule — `{ci, escalated, ci_red}` passes three separate enums and is not a transition.
+    @from_stages Enum.map(StageMachine.runner_from_stages(), &Atom.to_string/1)
+    @to_stages Enum.map(StageMachine.runner_to_stages(), &Atom.to_string/1)
+    @edges Enum.map(StageMachine.runner_edges(), &Atom.to_string/1)
+
+    # `Loopctl.Delivery.Stages`' own bound, which is the `story_stages_text_bounds` CHECK's.
+    # Codepoints, matching `char_length`, not graphemes.
+    @max_reason_length 4_000
+
+    @doc "The stages a runner may report a transition OUT of."
+    @spec from_stages() :: [String.t()]
+    def from_stages, do: @from_stages
+
+    @doc "The stages a runner may report a transition INTO."
+    @spec to_stages() :: [String.t()]
+    def to_stages, do: @to_stages
+
+    @doc "The edges a runner may report."
+    @spec edges() :: [String.t()]
+    def edges, do: @edges
+
+    @doc "The longest escalation reason or note a stage message may carry."
+    @spec max_reason_length() :: pos_integer()
+    def max_reason_length, do: @max_reason_length
+
+    OpenApiSpex.schema(
+      %{
+        title: "RunnerStageEffects",
+        description:
+          "The identities a transition produced, recorded on the story's stage row before " <>
+            "the effect is repeated. Each is writable only by the stage that produces it, " <>
+            "and only once: the same value again is accepted (a replay finds what its " <>
+            "first run recorded), a different one is refused. `merge_sha` is the one that " <>
+            "cannot be written before its effect, because the merge commit does not exist " <>
+            "until GitHub makes it, so it is REQUIRED on the transition into `merged` and " <>
+            "accepted nowhere else. `runner_id` is deliberately absent: which machine holds " <>
+            "a story is control's to record, not a runner's to assert.",
+        type: :object,
+        properties: %{
+          worktree_path: %Schema{type: :string, minLength: 1, maxLength: 4096},
+          branch: %Schema{type: :string, minLength: 1, maxLength: 255},
+          head_sha: %Schema{type: :string, pattern: "^[0-9a-f]{40}([0-9a-f]{24})?$"},
+          merge_sha: %Schema{type: :string, pattern: "^[0-9a-f]{40}([0-9a-f]{24})?$"},
+          pr_number: %Schema{type: :integer, minimum: 1},
+          release_id: %Schema{type: :string, minLength: 1, maxLength: 255}
+        }
+      },
+      struct?: false
+    )
+  end
+
+  defmodule RunnerStageReport do
+    @moduledoc false
+    require OpenApiSpex
+
+    alias Loopctl.ApiSpec.RunnerContract.RunnerStage
+
+    OpenApiSpex.schema(
+      %{
+        title: "RunnerStageReport",
+        description:
+          "One delivery-stage transition a runner's session made, pushed as the `stage` " <>
+            "event (since 1.4.0). It is a REQUEST, never authority: Postgres owns the " <>
+            "stage, and the server compare-and-sets `from` -> `to` on the story's row " <>
+            "inside one transaction. `from` is on the wire for that reason — a row that " <>
+            "has moved refuses the message with `stale_stage` rather than taking a " <>
+            "transition from wherever it happens to be. `claim_epoch` is the fence: it " <>
+            "must be the dispatch's AND the story's current epoch, so a session whose " <>
+            "claim was reclaimed writes nothing. A REPLAY is safe — a message whose first " <>
+            "copy committed finds the row already at `to` and is answered `ok` with the " <>
+            "row, so a re-send after a lost acknowledgement never transitions twice. " <>
+            "Arriving at `done`, `failed` or `escalated` also gives the runner slot back, " <>
+            "in the same transaction; the server decides that from the stage, so nothing " <>
+            "here can free a slot whose session is still running.",
+        type: :object,
+        required: [:dispatch_id, :claim_epoch, :from, :to],
+        properties: %{
+          dispatch_id: %Schema{
+            type: :string,
+            format: :uuid,
+            description:
+              "The ACCEPTED dispatch whose session made this transition. It names the " <>
+                "story; a story id is never taken from the wire."
+          },
+          claim_epoch: %Schema{
+            type: :integer,
+            minimum: 0,
+            description: "The `claim_epoch` of the dispatch, echoed."
+          },
+          from: %Schema{
+            type: :string,
+            enum: RunnerStage.from_stages(),
+            description: "The stage the runner believed the story was at."
+          },
+          to: %Schema{type: :string, enum: RunnerStage.to_stages()},
+          edge: %Schema{
+            type: :string,
+            enum: RunnerStage.edges(),
+            description:
+              "Which transition, when `from` -> `to` has more than one. Defaults to " <>
+                "`forward`. Every edge but `forward` counts in the story's `attempts`."
+          },
+          reason: %Schema{
+            type: :string,
+            minLength: 1,
+            maxLength: RunnerStage.max_reason_length(),
+            description:
+              "REQUIRED entering `escalated` and on `merge_refused`, a free note " <>
+                "otherwise. Session-authored and therefore untrusted: it is recorded and " <>
+                "capped, never executed, and fenced as untrusted data wherever it reaches " <>
+                "a prompt. At most #{RunnerStage.max_reason_length()} codepoints."
+          },
+          effects: RunnerStage.schema()
+        }
+      },
+      struct?: false
+    )
+  end
+
   defmodule RunnerTraceBatch do
     @moduledoc false
     require OpenApiSpex
@@ -592,7 +744,9 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     RunnerTraceBatch,
     RunnerTraceCursor,
     RunnerTraceAck,
-    RunnerDisconnecting
+    RunnerDisconnecting,
+    RunnerStage,
+    RunnerStageReport
   ]
 
   # The stable `reason` codes each runner-to-control event can be refused with. Exported, so
@@ -605,6 +759,23 @@ defmodule Loopctl.ApiSpec.RunnerContract do
       ~w(rate_limited invalid_payload batch_too_large event_data_too_large unknown_dispatch
          stale_claim_epoch dispatch_not_accepted run_mismatch),
     "trace_cursor" => ~w(rate_limited invalid_payload),
+    # Since 1.4.0. Two codes are NEW because nothing already published carries their remedy,
+    # and a runner that cannot tell them apart does the wrong thing:
+    #
+    # - `stale_stage` — the row is not at `from`. The message is well formed and the claim is
+    #   fine, so `invalid_payload` (stop sending this) and `stale_claim_epoch` (stop working
+    #   the story) are both actively wrong. Re-read the story's stage and send the transition
+    #   that actually applies.
+    # - `unknown_story_stage` — the dispatch's story has no stage row at all, which is a
+    #   control-plane state the runner cannot fix by resending or by giving up the claim.
+    #   `unknown_dispatch` would name the wrong object: the dispatch is known.
+    #
+    # Everything the stage machine refuses on the MESSAGE's own content — a transition that
+    # is not in the table, a missing escalation reason, a malformed or wrong-stage effect —
+    # is `invalid_payload` with details, because resending it unchanged cannot help.
+    "stage" =>
+      ~w(rate_limited invalid_payload unknown_dispatch dispatch_not_accepted stale_claim_epoch
+         stale_stage unknown_story_stage),
     # Since 1.2.0. `join` is the `phx_join` reply; `unknown_event` answers any event this
     # map does not name, every time.
     "join" => ~w(rate_limited not_authorized invalid_payload unsupported_contract_version
@@ -613,7 +784,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   }
 
   # The runner-to-control events `LoopctlWeb.RunnerChannel.handle_in/3` acts on.
-  @inbound_events ~w(status dispatch_reply trace trace_cursor)
+  @inbound_events ~w(status dispatch_reply trace trace_cursor stage)
 
   # The minimum spacing, per channel, between two acted-on messages of one event. A message
   # inside it is refused with `rate_limited` and `min_interval_ms`. Each event has its OWN
@@ -628,6 +799,15 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   # `dispatch_reply` is a bucket rather than a floor: a runner handed several dispatches at
   # once answers them back to back, and a single per-runner gap refused the second answer.
   @dispatch_reply_burst %{"capacity" => 8, "refill_interval_ms" => 250}
+
+  # `stage` is a bucket for the same reason, and a bigger one. A machine at `max_sessions: 2`
+  # runs two stories at once, each walking a thirteen-stage line, and a runner that has been
+  # offline through a rolling deploy ships every transition it buffered the moment it
+  # rejoins. A per-channel FLOOR would refuse the second story's message because the first
+  # story's had just landed. Each message is a database transaction and some of them append
+  # to the tenant's audit chain, so it is metered; the bucket lets a burst through and then
+  # paces it.
+  @stage_burst %{"capacity" => 12, "refill_interval_ms" => 250}
 
   # What the Phoenix V2 frame around a `trace` payload can cost under `ByteRule`:
   # [join_ref, ref, "runner:<uuid>", "trace", payload] with 20-digit refs is under 600.
@@ -654,6 +834,13 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   """
   @spec dispatch_reply_burst() :: %{String.t() => pos_integer()}
   def dispatch_reply_burst, do: @dispatch_reply_burst
+
+  @doc """
+  The `stage` bucket: `capacity` transitions back to back, refilled one per
+  `refill_interval_ms`. The channel enforces it and the export publishes it.
+  """
+  @spec stage_burst() :: %{String.t() => pos_integer()}
+  def stage_burst, do: @stage_burst
 
   @doc "The allowance for the V2 frame around a `trace` payload, under the byte rule."
   @spec frame_envelope_bytes() :: pos_integer()
@@ -827,6 +1014,62 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     end
   end
 
+  @doc """
+  Validates a `stage` payload (since 1.4.0). Returns the declared fields only, with the
+  stage and edge as ATOMS — `%{dispatch_id:, claim_epoch:, from:, to:, edge:, reason:,
+  effects:}` — or `{:error, {:invalid, messages}}`.
+
+  `edge` defaults to `:forward`. Beyond the schema it checks the two cross-field rules JSON
+  Schema cannot state:
+
+  - the TRIPLE is a transition a runner may report
+    (`Loopctl.Delivery.StageMachine.runner_reportable?/3`). Three independent enums admit
+    combinations the machine has no edge for, and refusing them here means a nonsense
+    transition never opens a database transaction.
+  - a reason is present where the machine requires one (entering `escalated`, and
+    `merge_refused`). `Loopctl.Delivery.Stages` refuses it too — this is the copy that
+    answers the runner before the write, not the enforcement.
+
+  The stage and edge atoms are `String.to_existing_atom/1` over the machine's own lists,
+  reached only after the enum has matched, so no wire value ever creates an atom.
+  """
+  @spec cast_stage(term()) :: {:ok, map()} | {:error, term()}
+  def cast_stage(payload) do
+    with :ok <- values_ok(payload),
+         {:ok, cast} <- cast(payload, RunnerStageReport.schema()) do
+      stage =
+        cast
+        |> known_fields(RunnerStageReport.schema())
+        |> Map.put_new(:edge, "forward")
+        |> then(
+          &%{&1 | from: stage_atom(&1.from), to: stage_atom(&1.to), edge: stage_atom(&1.edge)}
+        )
+
+      case stage_shape_errors(stage) do
+        [] -> {:ok, stage}
+        errors -> {:error, {:invalid, errors}}
+      end
+    end
+  end
+
+  defp stage_atom(name), do: String.to_existing_atom(name)
+
+  defp stage_shape_errors(%{from: from, to: to, edge: edge} = stage) do
+    transition_errors(from, to, edge) ++ reason_errors(to, edge, stage)
+  end
+
+  defp transition_errors(from, to, edge) do
+    if StageMachine.runner_reportable?(from, to, edge),
+      do: [],
+      else: ["#{from} -> #{to} over #{edge} is not a transition a runner may report"]
+  end
+
+  defp reason_errors(to, edge, stage) do
+    if StageMachine.reason_required?(to, edge) and not Map.has_key?(stage, :reason),
+      do: ["reason is required entering #{to} over #{edge}"],
+      else: []
+  end
+
   @doc "Validates a `trace_cursor` payload. Returns `{:ok, %{run_id: run_id}}`."
   @spec cast_trace_cursor(term()) :: {:ok, map()} | {:error, term()}
   def cast_trace_cursor(payload) do
@@ -937,7 +1180,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           "trace" => "RunnerTraceBatch",
           "trace_cursor" => "RunnerTraceCursor",
           "trace_event" => "RunnerTraceEvent",
-          "disconnecting" => "RunnerDisconnecting"
+          "disconnecting" => "RunnerDisconnecting",
+          "stage" => "RunnerStageReport"
         },
         "replies" => %{
           "trace" => "RunnerTraceAck",
@@ -954,8 +1198,17 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           "refusal_max_detail_length" => RunnerDispatchReply.max_detail_length(),
           "trace_max_seq" => @max_seq,
           "min_interval_ms" => @min_interval_ms,
-          "dispatch_reply_burst" => @dispatch_reply_burst
-        }
+          "dispatch_reply_burst" => @dispatch_reply_burst,
+          "stage_burst" => @stage_burst,
+          "stage_max_reason_length" => RunnerStage.max_reason_length()
+        },
+        # The transition table a `stage` message is checked against, published so a runner
+        # can refuse an impossible transition locally instead of learning it from a refusal.
+        # Derived from `Loopctl.Delivery.StageMachine`, which is what the server enforces.
+        "stage_transitions" =>
+          Enum.map(StageMachine.runner_transitions(), fn {from, to, edge} ->
+            %{"from" => to_string(from), "to" => to_string(to), "edge" => to_string(edge)}
+          end)
       },
       "$defs" => defs
     }

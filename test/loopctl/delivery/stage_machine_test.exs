@@ -53,6 +53,66 @@ defmodule Loopctl.Delivery.StageMachineTest do
     refute Enum.any?(sources, &(&1 in [:merged, :deployed, :verified]))
   end
 
+  test "session_escalated leaves from every in-flight stage and no other" do
+    sources = for {from, :escalated, :session_escalated} <- StageMachine.transitions(), do: from
+    assert Enum.sort(sources) == Enum.sort(StageMachine.in_flight_stages())
+
+    # Not from `merged` on: the outward effect has happened and no session holds the story.
+    refute Enum.any?(sources, &(&1 in [:merged, :deployed, :verified]))
+    # And not from `triaged`, which has its own verdict edge with its own meaning.
+    refute :triaged in sources
+  end
+
+  test "the runner-reportable subset holds back exactly what a runner must not report" do
+    reportable = StageMachine.runner_transitions()
+
+    # Nothing out of a stage no session holds, so an escalated story cannot be moved back by
+    # the session that was escalated away from.
+    for {from, _to, _edge} <- reportable do
+      refute from in [:detected, :triaged, :queued, :escalated, :done, :failed]
+    end
+
+    # Nothing INTO `claimed` — that transition writes `runner_id` and a chain entry, and it
+    # is control's, alongside the claim itself.
+    refute Enum.any?(reportable, &match?({_, :claimed, _}, &1))
+
+    # And never the three edges another principal owns.
+    for edge <- [:runner_lost, :claim_released, :human_resolution] do
+      refute Enum.any?(reportable, &match?({_, _, ^edge}, &1))
+    end
+
+    # What is left is a real subset of the machine, not a second table.
+    assert reportable -- StageMachine.transitions() == []
+    assert {:implementing, :reviewing, :forward} in reportable
+    assert {:ci, :merged, :forward} in reportable
+    assert {:implementing, :escalated, :session_escalated} in reportable
+    assert StageMachine.runner_reportable?(:ci, :implementing, :ci_red)
+    refute StageMachine.runner_reportable?(:queued, :claimed, :forward)
+  end
+
+  test "the published from/to/edge lists are the reportable table's own projections" do
+    reportable = StageMachine.runner_transitions()
+
+    assert Enum.sort(StageMachine.runner_from_stages()) ==
+             reportable |> Enum.map(&elem(&1, 0)) |> Enum.uniq() |> Enum.sort()
+
+    assert Enum.sort(StageMachine.runner_to_stages()) ==
+             reportable |> Enum.map(&elem(&1, 1)) |> Enum.uniq() |> Enum.sort()
+
+    assert Enum.sort(StageMachine.runner_edges()) ==
+             reportable |> Enum.map(&elem(&1, 2)) |> Enum.uniq() |> Enum.sort()
+  end
+
+  test "ends_session? is exactly the terminal stages, and no live one" do
+    for stage <- StageMachine.stages() do
+      assert StageMachine.ends_session?(stage) == stage in StageMachine.terminal_stages()
+    end
+
+    assert StageMachine.ends_session?(:escalated)
+    refute StageMachine.ends_session?(:merged)
+    refute StageMachine.ends_session?(:verified)
+  end
+
   test "the merge identity is writable only at merged, where the sha exists" do
     # A merge commit does not exist until GitHub merges, so a sha written at `ci` would be
     # one the caller never obtained. Replay safety comes from pr_number + head_sha instead.

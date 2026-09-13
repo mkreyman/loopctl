@@ -57,6 +57,26 @@ defmodule LoopctlWeb.RunnerChannel do
   start custody progress; these record what a runner already did, and a halted tenant must
   still be able to record that.
 
+  ## Stage reporting (contract 1.4.0, #803)
+
+  `"stage"` (`RunnerStageReport`) is the transition a runner's session made. It is cast by
+  the contract, metered by its own bucket (`RunnerContract.stage_burst/0` — a bucket rather
+  than a floor because a machine at `max_sessions: 2` walks two stories at once and a
+  rejoining runner ships everything it buffered), and applied by
+  `Loopctl.Delivery.RunnerStages.apply/3`, which resolves the runner's ACCEPTED dispatch to
+  its story and then calls `Loopctl.Delivery.Stages.advance/4`. That function is the only
+  writer of `story_stages`; the channel opens no second path to it, and the story is never
+  taken off the wire.
+
+  The reply is the row as it now stands (`stage`, `claim_epoch`, `lock_version`, `attempts`),
+  including on a REPLAY — a message whose first copy committed is answered `ok` rather than
+  `stale_stage`, so a re-send after a rolling deploy costs nothing and tells the runner where
+  the story is. Arriving at a terminal stage also gives the session's runner slot back, in
+  the transition's own transaction (`DispatchLedger.release_slot_in/4`).
+
+  Like the three above it, `stage` does not check the custody halt: it records a transition
+  a session already made.
+
   ## What an operator can see (issue #815)
 
   - The channel process carries `runner_id`, `runner_name`, `tenant_id`, `node` and
@@ -79,6 +99,7 @@ defmodule LoopctlWeb.RunnerChannel do
   require Logger
 
   alias Loopctl.ApiSpec.RunnerContract
+  alias Loopctl.Delivery.RunnerStages
   alias Loopctl.LogValue
   alias Loopctl.Runners
   alias Loopctl.Runners.Capacity
@@ -93,6 +114,8 @@ defmodule LoopctlWeb.RunnerChannel do
   @min_status_interval_ms RunnerContract.min_interval_ms("status")
   @reply_capacity RunnerContract.dispatch_reply_burst() |> Map.fetch!("capacity")
   @reply_refill_ms RunnerContract.dispatch_reply_burst() |> Map.fetch!("refill_interval_ms")
+  @stage_capacity RunnerContract.stage_burst() |> Map.fetch!("capacity")
+  @stage_refill_ms RunnerContract.stage_burst() |> Map.fetch!("refill_interval_ms")
   @min_trace_interval_ms RunnerContract.min_interval_ms("trace")
   @min_cursor_interval_ms RunnerContract.min_interval_ms("trace_cursor")
   # How often an unknown event is LOGGED. It is answered `unknown_event` and counted in
@@ -129,6 +152,7 @@ defmodule LoopctlWeb.RunnerChannel do
        |> assign(:meta, Map.put(meta, :joined_at, DateTime.utc_now()))
        |> assign(:last_status_at, :never)
        |> assign(:reply_bucket, :full)
+       |> assign(:stage_bucket, :full)
        |> assign(:last_trace_at, :never)
        |> assign(:last_cursor_at, :never)
        |> assign(:last_unknown_at, :never)
@@ -298,6 +322,29 @@ defmodule LoopctlWeb.RunnerChannel do
     end
   end
 
+  # The stage a runner's session reached (contract 1.4.0, #803). Fenced on `claim_epoch`
+  # exactly as `dispatch_reply` and `trace` are, and applied through
+  # `Loopctl.Delivery.Stages.advance/4` — the ONE writer of `story_stages` — so the channel
+  # never opens a second write path to the delivery state.
+  defp handle_message("stage", payload, socket) do
+    now = System.monotonic_time(:millisecond)
+    %{runner: runner, tenant_id: tenant_id} = socket.assigns
+
+    with {:ok, stage} <- RunnerContract.cast_stage(payload),
+         {:ok, bucket} <-
+           ReplyBucket.take(socket.assigns.stage_bucket, now, @stage_capacity, @stage_refill_ms) do
+      socket = assign(socket, :stage_bucket, bucket)
+
+      case RunnerStages.apply(tenant_id, runner.id, stage) do
+        {:ok, row} -> {:reply, {:ok, stage_ack(row)}, socket}
+        {:error, reason} -> refuse(socket, "stage", message_error(reason))
+      end
+    else
+      {:error, :rate_limited} -> rate_limited(socket, "stage", @stage_refill_ms)
+      {:error, reason} -> refuse(socket, "stage", message_error(reason))
+    end
+  end
+
   defp handle_message("trace", payload, socket) do
     now = System.monotonic_time(:millisecond)
     %{runner: runner, tenant_id: tenant_id} = socket.assigns
@@ -375,6 +422,18 @@ defmodule LoopctlWeb.RunnerChannel do
   defp terminate_level(:shutdown), do: :info
   defp terminate_level({:shutdown, _}), do: :info
   defp terminate_level(_crash), do: :warning
+
+  # A stage row as it now stands. A runner whose acknowledgement was lost re-sends and gets
+  # this back from the replay path, so where the story actually is never needs a second
+  # endpoint.
+  defp stage_ack(row) do
+    %{
+      stage: Atom.to_string(row.stage),
+      claim_epoch: row.claim_epoch,
+      lock_version: row.lock_version,
+      attempts: row.attempts
+    }
+  end
 
   defp rate_limited(socket, event, min_interval_ms),
     do: refuse(socket, event, %{reason: "rate_limited", min_interval_ms: min_interval_ms})
@@ -673,7 +732,14 @@ defmodule LoopctlWeb.RunnerChannel do
               :stale_claim_epoch,
               :already_replied,
               :dispatch_not_accepted,
-              :run_mismatch
+              :run_mismatch,
+              # Contract 1.4.0, `stage` only. Both are refusals of the CONTROL PLANE's state
+              # rather than of the message, which is why neither is `invalid_payload`: a
+              # `stale_stage` runner re-reads the story and sends what applies, and an
+              # `unknown_story_stage` one has hit a control-plane condition it cannot clear
+              # by resending or by giving up its claim.
+              :stale_stage,
+              :unknown_story_stage
             ],
        do: %{reason: Atom.to_string(reason)}
 
@@ -687,7 +753,10 @@ defmodule LoopctlWeb.RunnerChannel do
   # interval is LONGER than the wait that just ran out (`Capacity.busy_retry_ms/0`): retrying
   # after exactly that wait puts the runner back in the same queue with no backoff, so it
   # spends about half its time blocked on a lock.
-  defp message_error(:capacity_busy),
+  # `:capacity_busy` is the ledger's name for it and `:busy` is `Loopctl.Delivery.Stages`'
+  # name for the same thing — a lock this write could not get in time, or a deadlock Postgres
+  # broke by choosing it. Nothing was written either way.
+  defp message_error(reason) when reason in [:capacity_busy, :busy],
     do: %{reason: "rate_limited", min_interval_ms: Capacity.busy_retry_ms()}
 
   defp message_error(reason), do: join_error(reason)

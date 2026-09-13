@@ -151,6 +151,9 @@ defmodule Loopctl.Tenants.TierCapabilities do
     ],
     chain_of_custody: [
       "LoopctlWeb.StoryStatusController",
+      # #803 — the claiming agent's escalation to a human, a delivery-stage transition on a
+      # story, so the same surface and the same anchor as every other story lifecycle call.
+      "LoopctlWeb.StoryEscalationController",
       "LoopctlWeb.StoryVerificationController",
       "LoopctlWeb.ReviewRecordController",
       "LoopctlWeb.ArtifactReportController",

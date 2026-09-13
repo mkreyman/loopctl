@@ -85,9 +85,15 @@ defmodule Loopctl.Delivery.Stages do
     LONG-HELD STORY LOCK — a claim release, a reclaim sweep, a transition that is waiting
     on something — not a capacity shortage. Look at what is holding the story row before
     raising a tenant's cap.
-  - **When the session-end wiring lands, `release_slot_in/4` runs BEFORE
-    `AuditChain.append`, never after**: it takes the dispatch row and the `runners` row,
-    both of which sit after the chain in this order.
+  - **The session-end release (`:session_dispatch`) runs BEFORE `AuditChain.append`, never
+    after.** It takes the `runner_dispatches` row and then the `runners` row, and the chain
+    lock sits between them in the order above, so releasing first is what keeps the chain
+    lock the LAST thing this transaction acquires. Appending first would have it held while
+    waiting on the `runners` row — and `Loopctl.Runners.Capacity` and
+    `Loopctl.Runners.DispatchLedger` reach that row without ever touching the chain, so
+    nothing takes the pair the other way and no cycle exists. Committing together is the
+    other half: a release that landed while its transition rolled back would free the slot
+    of a session the story does not know ended.
 
   Only ACQUIRED locks are ordered; the tenant-scoped `runners` SELECT in `record_effect/5`
   takes none. Taking any pair the other way round can deadlock; `lock_timeout` turns that
@@ -121,8 +127,10 @@ defmodule Loopctl.Delivery.Stages do
   alias Loopctl.Delivery.StageEvent
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.StoryStage
+  alias Loopctl.Delivery.Untrusted
   alias Loopctl.LocalGuc
   alias Loopctl.Repo
+  alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.Runner
   alias Loopctl.WorkBreakdown.Story
 
@@ -139,6 +147,12 @@ defmodule Loopctl.Delivery.Stages do
   # The `story_stages_text_bounds` CHECK on `escalation_reason`.
   @max_reason_chars 4_000
 
+  # The encoded size of the caller-supplied `:event_data` a transition may carry into
+  # `story_stage_events.data`. Counted on the JSON actually stored, so the bound is exact
+  # rather than an estimate. It exists because that column is jsonb with no CHECK: an
+  # unbounded structured payload from a session is a write amplifier on the event stream.
+  @max_event_data_bytes 8_000
+
   @type advance_error ::
           :invalid_transition
           | :human_required
@@ -154,6 +168,7 @@ defmodule Loopctl.Delivery.Stages do
           | :wrong_stage
           | :effect_conflict
           | :audit_chain_append_failed
+          | :invalid_event_data
           | :busy
 
   @type effect_error ::
@@ -220,6 +235,34 @@ defmodule Loopctl.Delivery.Stages do
     row
   end
 
+  @doc """
+  A story's current `claim_epoch`, or nil when the tenant has no such story. On the RLS
+  `Loopctl.Repo`, so a caller already reading `story_stages` here needs no second repo.
+
+  The AUTHORITY on whether a caller's claim is still live. A stage ROW's `claim_epoch` is not
+  that authority and must never be used as one: it is what the row was last WRITTEN under,
+  and while every release rebinds it (`follow_release/5`), reading the row to decide whether
+  the row is current is circular. Every caller that resolves a REPLAY — "is the row already
+  where this message wanted it?" — checks this first, or a zombie presenting the epoch its
+  own stale row still carries would be answered `ok`.
+
+  `Loopctl.Progress.current_claim_epoch/2` answers the same question on `AdminRepo`, whose
+  pool is three connections; this is the delivery loop's copy and the one a hot path uses.
+  """
+  @spec current_claim_epoch(Ecto.UUID.t(), Ecto.UUID.t()) :: non_neg_integer() | nil
+  def current_claim_epoch(tenant_id, story_id) do
+    {:ok, epoch} =
+      Repo.with_tenant(tenant_id, fn ->
+        Repo.one(
+          from s in Story,
+            where: s.id == ^story_id and s.tenant_id == ^tenant_id,
+            select: s.claim_epoch
+        )
+      end)
+
+    epoch
+  end
+
   @doc "A story's stage events, oldest first."
   @spec list_events(Ecto.UUID.t(), Ecto.UUID.t()) :: [StageEvent.t()]
   def list_events(tenant_id, story_id) do
@@ -282,7 +325,22 @@ defmodule Loopctl.Delivery.Stages do
     transition's entry names the effect it asserts. Same rules as `record_effect/5`
     (validated first, idempotent on the same value, `:effect_conflict` on a different one),
     and the destination stage is what `StageMachine.effect_stages/1` is checked against.
-  - `:reason` — the escalation reason (required into `escalated`), or a note
+  - `:reason` — the escalation reason (required into `escalated`), or a note. UNTRUSTED
+    session-authored text: stored verbatim so an operator reads what was actually written,
+    capped at #{@max_reason_chars} codepoints, never executed, and rendered through
+    `escalation_block/1` by anything that puts it in a prompt.
+  - `:event_data` — a JSON-encodable map recorded under `"payload"` on this transition's
+    `story_stage_events` row, for a caller with structure to record alongside the reason.
+    At most #{@max_event_data_bytes} bytes encoded, no NUL, else `:invalid_event_data`. It
+    NEVER reaches `story_stages` and never reaches the chain entry.
+  - `:session_dispatch` — `{dispatch_id, slot_generation}` of the runner dispatch whose
+    session is driving this story. The slot is released in THIS transaction, before the
+    chain append, if and ONLY if `StageMachine.ends_session?/1` holds for the destination —
+    derived from the stage, never from the caller, so no message can free a slot its session
+    is still using. Idempotent by generation: a replay releases nothing a second time
+    (`Loopctl.Runners.Capacity.release/4`). A dispatch row that has gone missing is LOGGED
+    and the transition still commits — the heal sweep bounds an unreleased slot within a
+    minute, while a rollback would strand the story at a stage nothing can move it off.
   - `:actor_label`, `:actor_role`, `:actor_lineage` — attribution; role and lineage are
     SERVER-resolved by the caller from the authenticating key, never taken from a request
   """
@@ -303,6 +361,7 @@ defmodule Loopctl.Delivery.Stages do
          :ok <- lineage_declared(from, to, edge, opts),
          :ok <- human_gate(edge, opts),
          :ok <- reason_given(to, edge, reason),
+         :ok <- event_data_ok(opts),
          {:ok, effects} <- validate_effects(opts),
          :ok <- required_effects_present(to, effects) do
       in_tenant(tenant_id, fn ->
@@ -329,14 +388,42 @@ defmodule Loopctl.Delivery.Stages do
     previous = lock_row(tenant_id, story_id)
 
     row = compare_and_set(tenant_id, story, transition, reason)
-    insert_event(Repo, row, "transitioned", from, edge, opts[:actor_label], note(reason))
+    insert_event(Repo, row, "transitioned", from, edge, opts[:actor_label], note(reason, opts))
 
     # BEFORE the chain entry is built, in this same transaction: the entry has to NAME the
     # effect the transition asserts. `ci -> merged` carrying the sha GitHub just returned is
     # the case that forces it — recorded afterwards, the `story_stage_merged` entry says a
     # merge happened and identifies nothing.
     row = put_effects(row, effects, opts)
+    release_session_slot(row, to, opts)
     {row, maybe_chain(row, previous, transition, reason, opts)}
+  end
+
+  # The session's runner slot, given back in the transition that ends the session — never in
+  # a second commit afterwards, which a node dying in between would lose to the heal sweep's
+  # bound. BEFORE the chain append: see the moduledoc's lock order.
+  #
+  # `ends_session?/1` is read off the DESTINATION STAGE, so the decision is the machine's and
+  # not the caller's; a caller that passes `:session_dispatch` on a live transition releases
+  # nothing.
+  defp release_session_slot(row, to, opts) do
+    with {dispatch_id, generation} when is_binary(dispatch_id) and is_integer(generation) <-
+           Keyword.get(opts, :session_dispatch),
+         true <- StageMachine.ends_session?(to) do
+      case DispatchLedger.release_slot_in(Repo, row.tenant_id, dispatch_id, generation) do
+        {:ok, _outcome} ->
+          :ok
+
+        {:error, :unknown_dispatch} ->
+          Logger.warning(
+            "story stage ended a session whose dispatch row is gone; the slot waits for the " <>
+              "heal sweep: tenant_id=#{row.tenant_id} story_id=#{row.story_id} " <>
+              "dispatch_id=#{dispatch_id} to=#{to}"
+          )
+      end
+    else
+      _not_a_session_end -> :ok
+    end
   end
 
   defp lock_row(tenant_id, story_id) do
@@ -721,8 +808,63 @@ defmodule Loopctl.Delivery.Stages do
 
   defp present?(reason), do: is_binary(reason) and String.trim(reason) != ""
 
-  defp note(nil), do: %{}
-  defp note(reason), do: %{"reason" => reason}
+  # The caller's structured payload, bounded on the JSON that is actually stored. Refused
+  # BEFORE the transaction, like every other value: a jsonb Postgres will not take (a NUL in
+  # a key or a value) raises 23514/22021 after the transition is already decided, and that
+  # class is not retryable, so the escalation would be lost to a 500.
+  defp event_data_ok(opts) do
+    case Keyword.get(opts, :event_data) do
+      nil -> :ok
+      data when is_map(data) -> encoded_data_ok(data)
+      _other -> {:error, :invalid_event_data}
+    end
+  end
+
+  defp encoded_data_ok(data) do
+    case Jason.encode(data) do
+      {:ok, json} ->
+        if byte_size(json) <= @max_event_data_bytes and not String.contains?(json, "\\u0000"),
+          do: :ok,
+          else: {:error, :invalid_event_data}
+
+      {:error, _reason} ->
+        {:error, :invalid_event_data}
+    end
+  rescue
+    # A term Jason has no encoder for (a struct, a PID, a tuple) raises rather than
+    # answering, and a bad argument must not reach the caller as a 500.
+    _error -> {:error, :invalid_event_data}
+  end
+
+  # The transition event's `data`. The caller's payload is namespaced under `"payload"` so it
+  # can never shadow a key this module writes.
+  defp note(reason, opts) do
+    %{}
+    |> then(fn data -> if is_nil(reason), do: data, else: Map.put(data, "reason", reason) end)
+    |> then(fn data ->
+      case Keyword.get(opts, :event_data) do
+        nil -> data
+        payload -> Map.put(data, "payload", payload)
+      end
+    end)
+  end
+
+  @doc """
+  A story stage's `escalation_reason` rendered as a fenced UNTRUSTED DATA block
+  (`Loopctl.Delivery.Untrusted`), or `nil` when the row carries none.
+
+  The reason is written by an unattended session — `POST /stories/:id/escalate`, or a line
+  the runner read out of `escalations.ndjson` — so it is reporter-shaped text under design
+  §8 and §10: recorded and capped, never executed. **Any prompt that carries an escalation
+  reason renders it through this and nothing else.** The JSON an operator or a dashboard
+  reads gets the raw value, because a fence there would hide what was actually written; the
+  fence exists for the one hop where the text lands in front of a model.
+  """
+  @spec escalation_block(StoryStage.t()) :: String.t() | nil
+  def escalation_block(%StoryStage{escalation_reason: nil}), do: nil
+
+  def escalation_block(%StoryStage{escalation_reason: reason}),
+    do: Untrusted.render("escalation_reason", reason)
 
   defp maybe_chain(row, previous, {from, to, edge}, reason, opts) do
     if StageMachine.chained?(from, to, edge) do

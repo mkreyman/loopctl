@@ -411,6 +411,49 @@ defmodule Loopctl.Runners.DispatchLedger do
   end
 
   @doc """
+  The session a runner is running under `dispatch_id`: `{:ok, %{story_id:, claim_epoch:,
+  slot_generation:}}` for an ACCEPTED dispatch this runner holds in this tenant.
+
+  For the `stage` path (#803, contract 1.4.0), which needs the story the dispatch is for and
+  the slot generation to release when the session ends. It is a READ and takes no lock: the
+  three values it returns are all final from the dispatch's acceptance onward — `story_id`
+  is written with the row and never changed, an accepted dispatch is never re-sent so its
+  `slot_generation` cannot advance, and `claim_epoch` is the row's, which nothing rewrites.
+  The authoritative fence is still the STORY's epoch, taken under a share lock inside
+  `Loopctl.Delivery.Stages.advance/4`'s own transaction; this one only refuses a message
+  whose epoch does not even match the dispatch it names, before that transaction is opened.
+
+  `:unknown_dispatch` for a row another runner or another tenant holds, exactly as for one
+  that does not exist. `:dispatch_not_accepted` for a row still `sent`, `refused` or
+  `superseded`: no session is running, so there is no transition to report.
+  """
+  @spec accepted_session(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, %{story_id: Ecto.UUID.t(), claim_epoch: integer(), slot_generation: integer()}}
+          | {:error, :unknown_dispatch | :dispatch_not_accepted}
+  def accepted_session(tenant_id, runner_id, dispatch_id) do
+    {:ok, result} =
+      in_tenant(tenant_id, fn ->
+        Repo.one(
+          from r in DispatchRecord,
+            where: r.tenant_id == ^tenant_id and r.runner_id == ^runner_id,
+            where: r.dispatch_id == ^dispatch_id,
+            select: %{
+              status: r.status,
+              story_id: r.story_id,
+              claim_epoch: r.claim_epoch,
+              slot_generation: r.slot_generation
+            }
+        )
+      end)
+
+    case result do
+      nil -> {:error, :unknown_dispatch}
+      %{status: "accepted"} = row -> {:ok, Map.delete(row, :status)}
+      %{} -> {:error, :dispatch_not_accepted}
+    end
+  end
+
+  @doc """
   Applies a validated `dispatch_reply` from `runner_id`. See the moduledoc for the rules.
   """
   @spec record_reply(Ecto.UUID.t(), Ecto.UUID.t(), map()) ::
