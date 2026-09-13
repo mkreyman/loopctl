@@ -473,18 +473,23 @@ defmodule Loopctl.Runners do
          :ok <- not_halted(tenant_id),
          :ok <- runner_authorized(tenant_id, runner_id),
          :ok <- single_live_socket(tenant_id, runner_id),
-         {:ok, record} <- DispatchLedger.record_sent(tenant_id, runner_id, dispatch) do
-      broadcast_dispatch(tenant_id, runner_id, dispatch, record.slot_generation)
+         {:ok, _record} <- DispatchLedger.record_sent(tenant_id, runner_id, dispatch) do
+      broadcast_dispatch(tenant_id, runner_id, dispatch)
     end
   end
 
-  # The message carries the SLOT the dispatch holds, so a channel that drops it instead of
-  # pushing hands exactly that slot back and never a later one.
-  defp broadcast_dispatch(tenant_id, runner_id, dispatch, generation) do
+  # The two-element message every deployed node understands. A node of the PREVIOUS release
+  # has no clause for a three-element one and crashes on it, dropping the dispatch, so the
+  # slot the dispatch carries is NOT put on the wire during a rolling deploy: the channel
+  # resolves it from the ledger row when it drops one
+  # (`DispatchLedger.release_undelivered_slot/2`), which is also what keeps a drop off a
+  # running session's slot. The channel already accepts both shapes, so a later release can
+  # move the slot onto the message with no window of its own.
+  defp broadcast_dispatch(tenant_id, runner_id, dispatch) do
     case Phoenix.PubSub.broadcast(
            Loopctl.PubSub,
            dispatch_topic(runner_id),
-           {:runner_dispatch, dispatch, generation}
+           {:runner_dispatch, dispatch}
          ) do
       :ok ->
         :ok
@@ -492,7 +497,7 @@ defmodule Loopctl.Runners do
       # The only failure after the slot is committed. Nothing was handed to any channel, so
       # the slot goes back; a re-send of the same `dispatch_id` takes a fresh one.
       {:error, _reason} = error ->
-        {:ok, _} = DispatchLedger.release_slot(tenant_id, dispatch.dispatch_id, generation)
+        {:ok, _} = DispatchLedger.release_undelivered_slot(tenant_id, dispatch.dispatch_id)
         error
     end
   end

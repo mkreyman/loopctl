@@ -84,16 +84,23 @@ defmodule Loopctl.Runners.Capacity do
   Every transaction in loopctl that touches more than one of these takes them in THIS order,
   and never in another:
 
-      capacity advisory lock (this module, `admission_lock_namespace/0`)
-        -> story row (the claim fence)
+      capacity advisory lock (0x41050803)
+        -> story row
         -> runner_dispatches / story_stages row
-        -> chain advisory lock (issue #821, its own namespace)
+        -> chain advisory lock (0x4105A1D7)
         -> audit-chain head
+        -> runners row
 
-  and the `runners` row last of all, which only this module writes. **Take the capacity lock
-  FIRST in any transaction that also touches a story or the chain, never after** — a
-  transaction holding a story and then asking for it closes a cycle with every dispatch,
-  which takes it before anything else (`Loopctl.Runners.DispatchLedger.record_sent/3`).
+  **Take the capacity lock FIRST in any transaction that also touches a story or the chain,
+  never after** — a transaction holding a story and then asking for it closes a cycle with
+  every dispatch, which takes it before anything else
+  (`Loopctl.Runners.DispatchLedger.record_sent/3`).
+
+  **What an operator sees because the capacity lock is first:** a claim release sitting on a
+  story makes every dispatch in that tenant queue behind it, and past `lock_timeout_ms/0`
+  each falls out as `:capacity_busy` with nothing reserved. That is the deliberate trade —
+  a bounded queue and a retryable refusal instead of a deadlock — and a burst of
+  `:capacity_busy` in one tenant means a long-held story lock, not a capacity shortage.
 
   Two paths used to break this. `record_reply/3` and `record_trace/3` locked the dispatch row
   before fencing the story, which with a concurrent claim release (holding the story

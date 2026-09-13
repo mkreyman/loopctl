@@ -33,6 +33,14 @@ All notable changes to loopctl are documented here.
   2.93.0 carries both: `runner_enroll` takes `max_sessions`, and `runner_pool` names the
   new fields.
 
+  **Two changes an operator watching runners will see.** A reply or trace whose database
+  write cannot get a lock in five seconds is now answered `rate_limited` with that interval,
+  so the runner sends it again — it used to crash the channel, after which the runner rejoined
+  and re-sent forever. And `pushed_at` is stamped BEFORE the dispatch is pushed, so a stamp
+  that fails means the runner never got it: capacity reads that column, and a push it did not
+  record would have taken the session's slot away two minutes later. A burst of
+  `:capacity_busy` in one tenant means a long-held story lock, not a capacity shortage.
+
   **Runner contract 1.3.0 (minor).** A dispatch's `wall_clock_seconds` is now bounded at a
   day (`RunnerDispatch.max_wall_clock_seconds/0`): loopctl stores it and presumes a slot free
   past it plus a grace, and an unbounded value overflowed the column it is stored in. A

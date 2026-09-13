@@ -81,6 +81,7 @@ defmodule LoopctlWeb.RunnerChannel do
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.LogValue
   alias Loopctl.Runners
+  alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.Presence
   alias LoopctlWeb.RunnerChannel.MinInterval
@@ -183,36 +184,16 @@ defmodule LoopctlWeb.RunnerChannel do
   #   runner; every other receiver drops it.
   # - a halt can land between that read and this message, and a dispatch is custody
   #   progress. Re-read fresh, from THIS channel's own tenant.
+  # TWO shapes, on purpose (issue #803). This release SENDS the two-element one, which every
+  # deployed node already understands: a node of the PREVIOUS release has no clause for a
+  # three-element message and would crash on it mid-rolling-deploy, dropping the dispatch. The
+  # three-element clause is here so the NEXT release can start sending it with no window of
+  # its own. Keep both until that release has shipped.
   def handle_info({:runner_dispatch, dispatch}, socket),
-    do: handle_info({:runner_dispatch, dispatch, nil}, socket)
+    do: dispatch_to_socket(dispatch, socket)
 
-  def handle_info({:runner_dispatch, dispatch, slot_generation}, socket) do
-    correlation = [
-      dispatch_id: dispatch.dispatch_id,
-      story_id: dispatch.story_id,
-      claim_epoch: dispatch.claim_epoch
-    ]
-
-    with_correlation(correlation, fn ->
-      cond do
-        not sole_live_socket?(socket) ->
-          drop_dispatch(
-            socket,
-            dispatch,
-            slot_generation,
-            "not the only live socket for this runner"
-          )
-
-        Runners.custody_halted?(socket.assigns.tenant_id) ->
-          drop_dispatch(socket, dispatch, slot_generation, "tenant custody halted")
-
-        true ->
-          push(socket, "dispatch", dispatch)
-          DispatchLedger.mark_pushed(socket.assigns.tenant_id, dispatch.dispatch_id)
-          {:noreply, socket}
-      end
-    end)
-  end
+  def handle_info({:runner_dispatch, dispatch, _slot_generation}, socket),
+    do: dispatch_to_socket(dispatch, socket)
 
   def handle_info(:recheck, socket) do
     %{runner: runner, tenant_id: tenant_id} = socket.assigns
@@ -223,6 +204,20 @@ defmodule LoopctlWeb.RunnerChannel do
     else
       disconnect(socket, :no_longer_authorized)
     end
+  end
+
+  # Nothing else. A message shape this release does not know — a NEWER node's, mid-rolling
+  # deploy — must not crash the channel: that drops whatever it carried and takes the runner's
+  # socket down with it. Logged once per interval, like an unknown event.
+  def handle_info(message, socket) do
+    tag = if is_tuple(message) and tuple_size(message) > 0, do: elem(message, 0), else: message
+
+    Logger.warning(
+      "runner #{socket.assigns.runner.id} ignored an unknown channel message: " <>
+        "tag=#{inspect(tag)} tenant_id=#{socket.assigns.tenant_id}"
+    )
+
+    {:noreply, socket}
   end
 
   @impl true
@@ -504,27 +499,26 @@ defmodule LoopctlWeb.RunnerChannel do
   defp sole_live_socket?(_socket), do: false
 
   # A dropped dispatch reaches no session, so its capacity slot goes back at once rather than
-  # waiting for the heal sweep's bound. The release names the slot the broadcast carried, so
-  # it can never free a later reservation of the same dispatch; a message with no slot (a
-  # direct broadcast, as tests make) releases nothing. A failure here is logged and swallowed
-  # — the drop has already happened, and the sweep still bounds the slot — for the same
-  # reason `mark_pushed/2` swallows one: a raise would take down the runner's socket.
-  defp drop_dispatch(socket, dispatch, slot_generation, why) do
+  # waiting for the heal sweep's bound. `release_undelivered_slot/2` frees the slot the row
+  # holds ONLY while nothing has been delivered under it, so a drop by a second socket cannot
+  # take the slot of a session already running on an earlier push of the same dispatch. A
+  # failure here is logged and swallowed — the drop has already happened, and the sweep still
+  # bounds the slot — for the same reason `mark_pushed/2` swallows one: a raise would take
+  # down the runner's socket.
+  defp drop_dispatch(socket, dispatch, why) do
     Logger.warning(
       "runner #{socket.assigns.runner.id} dispatch #{dispatch.dispatch_id} dropped: #{why} " <>
         "tenant_id=#{socket.assigns.tenant_id} story_id=#{dispatch.story_id} " <>
         "claim_epoch=#{dispatch.claim_epoch}"
     )
 
-    release_dropped_slot(socket.assigns.tenant_id, dispatch, slot_generation)
+    release_dropped_slot(socket.assigns.tenant_id, dispatch)
 
     {:noreply, socket}
   end
 
-  defp release_dropped_slot(_tenant_id, _dispatch, nil), do: :ok
-
-  defp release_dropped_slot(tenant_id, dispatch, slot_generation) do
-    DispatchLedger.release_slot(tenant_id, dispatch.dispatch_id, slot_generation)
+  defp release_dropped_slot(tenant_id, dispatch) do
+    DispatchLedger.release_undelivered_slot(tenant_id, dispatch.dispatch_id)
     :ok
   rescue
     error in [DBConnection.ConnectionError, Postgrex.Error] ->
@@ -534,6 +528,34 @@ defmodule LoopctlWeb.RunnerChannel do
       )
 
       :error
+  end
+
+  defp dispatch_to_socket(dispatch, socket) do
+    correlation = [
+      dispatch_id: dispatch.dispatch_id,
+      story_id: dispatch.story_id,
+      claim_epoch: dispatch.claim_epoch
+    ]
+
+    with_correlation(correlation, fn ->
+      cond do
+        not sole_live_socket?(socket) ->
+          drop_dispatch(socket, dispatch, "not the only live socket for this runner")
+
+        Runners.custody_halted?(socket.assigns.tenant_id) ->
+          drop_dispatch(socket, dispatch, "tenant custody halted")
+
+        # Stamped BEFORE the push, and the push happens only if the stamp landed: capacity
+        # reads that column, and a push it does not record loses its slot two minutes later
+        # under a running session (`DispatchLedger.mark_pushed/2`).
+        DispatchLedger.mark_pushed(socket.assigns.tenant_id, dispatch.dispatch_id) == :error ->
+          drop_dispatch(socket, dispatch, "the push could not be recorded")
+
+        true ->
+          push(socket, "dispatch", dispatch)
+          {:noreply, socket}
+      end
+    end)
   end
 
   defp schedule_recheck, do: Process.send_after(self(), :recheck, @recheck_interval_ms)
@@ -606,6 +628,12 @@ defmodule LoopctlWeb.RunnerChannel do
   # A value the contract let through and Postgres still refused (DispatchLedger's backstop).
   defp message_error(:rejected_by_database),
     do: %{reason: "invalid_payload", details: ["a value was refused by the database"]}
+
+  # A lock this write could not get in time, or a deadlock Postgres broke by choosing it
+  # (`Loopctl.Runners.Capacity.retryable?/1`). Nothing was written and the message is fine, so
+  # the runner is told to SEND IT AGAIN — never `invalid_payload`, which tells it to stop.
+  defp message_error(:capacity_busy),
+    do: %{reason: "rate_limited", min_interval_ms: Capacity.lock_timeout_ms()}
 
   defp message_error(reason), do: join_error(reason)
 end

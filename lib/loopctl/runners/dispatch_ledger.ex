@@ -26,8 +26,9 @@ defmodule Loopctl.Runners.DispatchLedger do
 
   The fleet-wide order, which `Loopctl.Runners.Capacity` states in full:
 
-      capacity advisory lock -> story row -> runner_dispatches / story_stages row
-        -> chain advisory lock -> audit-chain head
+      capacity advisory lock (0x41050803) -> story row
+        -> runner_dispatches / story_stages row -> chain advisory lock (0x4105A1D7)
+        -> audit-chain head -> runners row
 
   So `record_sent/3` takes the tenant's admission lock as the FIRST thing in its transaction —
   before the claim fence, not with the reservation at the end — and `record_reply/3` and
@@ -62,6 +63,16 @@ defmodule Loopctl.Runners.DispatchLedger do
   `{:error, :rejected_by_database}`, logged with its SQLSTATE and identifiers (never its
   values) and counted as the `[:loopctl, :runners, :ledger_rejected_by_database]` telemetry
   event.
+
+  A reply or trace that could not get a LOCK is a different answer: every transaction here
+  bounds its waits (`Capacity.lock_timeout_ms/0`) and answers `{:error, :capacity_busy}` on a
+  timeout or a broken deadlock, which the channel turns into `rate_limited` with that
+  interval. Both halves matter. Unbounded, a reply queued behind a claim release held a pool
+  connection for as long as that transaction ran; and reraising crashed the channel holding
+  the runner's socket, after which the runner rejoined and re-sent the same message — the
+  unending loop the `rejected_by_database` backstop exists to prevent. `rejected_by_database`
+  is the wrong answer for a transient fault, too: it reaches the runner as `invalid_payload`,
+  which tells it to STOP resending.
 
   Neither replies nor trace are refused on a custody halt: a halt stops new custody
   progress, and a halted tenant must still be able to record what already happened.
@@ -157,10 +168,17 @@ defmodule Loopctl.Runners.DispatchLedger do
         )
 
       cond do
-        not same_dispatch?(record, runner_id, dispatch) -> Repo.rollback(:dispatch_id_conflict)
-        record.status != "sent" -> Repo.rollback(:dispatch_already_replied)
-        not is_nil(record.released_at) -> take_slot(record)
-        true -> record
+        not same_dispatch?(record, runner_id, dispatch) ->
+          Repo.rollback(:dispatch_id_conflict)
+
+        record.status != "sent" ->
+          Repo.rollback(:dispatch_already_replied)
+
+        not is_nil(record.released_at) ->
+          record |> refresh_wall_clock(dispatch, now) |> take_slot()
+
+        true ->
+          refresh_wall_clock(record, dispatch, now)
       end
     end)
   rescue
@@ -179,22 +197,54 @@ defmodule Loopctl.Runners.DispatchLedger do
     end
   end
 
+  # A re-send may carry a DIFFERENT wall clock — it is not part of the dispatch's identity
+  # (`same_dispatch?/3`), and the runner will run the session for the clock it was last sent.
+  # The stored one bounds the slot in `Capacity.heal/3`, so it has to be the one in flight:
+  # left at the first send's value, a re-send with a longer clock has its slot reclaimed
+  # under a running session.
+  defp refresh_wall_clock(%DispatchRecord{} = record, dispatch, now) do
+    if record.wall_clock_seconds == dispatch.wall_clock_seconds do
+      record
+    else
+      {1, _} =
+        from(d in DispatchRecord,
+          where: d.id == ^record.id and d.tenant_id == ^record.tenant_id
+        )
+        |> Repo.update_all(
+          set: [wall_clock_seconds: dispatch.wall_clock_seconds, updated_at: now]
+        )
+
+      %{record | wall_clock_seconds: dispatch.wall_clock_seconds}
+    end
+  end
+
   defp same_dispatch?(record, runner_id, dispatch) do
     record.runner_id == runner_id and record.story_id == dispatch.story_id and
       record.claim_epoch == dispatch.claim_epoch and record.kind == dispatch.kind
   end
 
   @doc """
-  Stamps `pushed_at` on a dispatch the runner's channel has just pushed to its socket
-  (issue #815). The latest push wins, so a re-sent dispatch records when it last left.
+  Stamps `pushed_at` on a dispatch the runner's channel is ABOUT TO push (issue #815, and
+  #803's capacity bound). The latest push wins, so a re-sent dispatch records when it last
+  left.
 
-  Observability, not custody: the push has already happened, so a database fault here is
-  logged and swallowed rather than crashing the channel that holds the runner's socket.
+  Stamped BEFORE the push, and the channel pushes only on `:ok`. Capacity now reads this
+  column: a reservation whose dispatch was never pushed under it is released after a short
+  bound (`Loopctl.Runners.Capacity`), so a stamp that failed AFTER the push would take a
+  running session's slot away two minutes later. Written first, a failure means the runner
+  never got the dispatch, which is exactly what the missing stamp then says. A database fault
+  is still logged and swallowed rather than crashing the channel that holds the socket — the
+  channel drops the dispatch instead, and the slot goes back.
   """
   @spec mark_pushed(Ecto.UUID.t(), Ecto.UUID.t()) :: :ok | :error
   def mark_pushed(tenant_id, dispatch_id) do
     {:ok, _} =
       in_tenant(tenant_id, fn ->
+        # Bounded: this runs in the channel process, which holds the runner's socket, and the
+        # push waits on it. Past the timeout the dispatch is dropped and re-dispatched, which
+        # is cheaper than a socket that stops answering.
+        Capacity.set_lock_timeout!(Repo)
+
         Repo.update_all(
           from(r in DispatchRecord,
             where: r.tenant_id == ^tenant_id and r.dispatch_id == ^dispatch_id
@@ -246,15 +296,72 @@ defmodule Loopctl.Runners.DispatchLedger do
   (`Loopctl.Runners.Capacity`), which is the whole reason the in-transaction form exists.
   """
   @spec release_slot(Ecto.UUID.t(), Ecto.UUID.t(), integer()) ::
-          {:ok, :released | :already_released} | {:error, :unknown_dispatch}
+          {:ok, :released | :already_released}
+          | {:error, :unknown_dispatch | :capacity_busy}
   def release_slot(tenant_id, dispatch_id, generation) when is_integer(generation) do
     in_tenant(tenant_id, fn ->
+      Capacity.set_lock_timeout!(Repo)
+
       case release_slot_in(Repo, tenant_id, dispatch_id, generation) do
         {:ok, outcome} -> outcome
         {:error, reason} -> Repo.rollback(reason)
       end
     end)
+  rescue
+    error in Postgrex.Error ->
+      if Capacity.retryable?(error),
+        do: {:error, :capacity_busy},
+        else: reraise(error, __STACKTRACE__)
   end
+
+  @doc """
+  Releases the slot of a dispatch that was NEVER DELIVERED under its current reservation —
+  `sent`, and either never pushed or last pushed under an earlier one. For the channel that
+  DROPS a dispatch instead of pushing it, and for a broadcast that failed.
+
+  It names no generation on purpose: the caller of this one knows only that a delivery did
+  not happen, and the row itself says which slot that was. The undelivered predicate is what
+  keeps it off a RUNNING session's slot — a re-send of a dispatch that already holds a pushed
+  slot, dropped by a second socket, matches nothing and releases nothing.
+  """
+  @spec release_undelivered_slot(Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, :released | :already_released} | {:error, :unknown_dispatch | :capacity_busy}
+  def release_undelivered_slot(tenant_id, dispatch_id) do
+    in_tenant(tenant_id, fn ->
+      Capacity.set_lock_timeout!(Repo)
+
+      query =
+        from r in DispatchRecord,
+          where: r.tenant_id == ^tenant_id and r.dispatch_id == ^dispatch_id,
+          lock: "FOR UPDATE"
+
+      case Repo.one(query) do
+        nil -> Repo.rollback(:unknown_dispatch)
+        record -> release_if_undelivered(record)
+      end
+    end)
+  rescue
+    error in Postgrex.Error ->
+      if Capacity.retryable?(error),
+        do: {:error, :capacity_busy},
+        else: reraise(error, __STACKTRACE__)
+  end
+
+  defp release_if_undelivered(%DispatchRecord{} = record) do
+    if undelivered?(record),
+      do: Capacity.release(Repo, record, record.slot_generation),
+      else: :already_released
+  end
+
+  # `sent` and never pushed under the slot it holds now. A reply of any kind, or a push made
+  # under this reservation, means a session may be running on it.
+  defp undelivered?(%DispatchRecord{status: "sent", released_at: nil} = record) do
+    is_nil(record.pushed_at) or
+      (not is_nil(record.reserved_at) and
+         DateTime.compare(record.pushed_at, record.reserved_at) == :lt)
+  end
+
+  defp undelivered?(%DispatchRecord{}), do: false
 
   @doc """
   `release_slot/3` inside the CALLER's transaction, on the caller's repo — the form for a
@@ -292,7 +399,11 @@ defmodule Loopctl.Runners.DispatchLedger do
   @spec record_reply(Ecto.UUID.t(), Ecto.UUID.t(), map()) ::
           {:ok, DispatchRecord.t()}
           | {:error,
-             :unknown_dispatch | :stale_claim_epoch | :already_replied | :rejected_by_database}
+             :unknown_dispatch
+             | :stale_claim_epoch
+             | :already_replied
+             | :rejected_by_database
+             | :capacity_busy}
   def record_reply(tenant_id, runner_id, reply) do
     context = %{operation: :record_reply, dispatch_id: reply.dispatch_id, run_id: nil}
 
@@ -344,7 +455,8 @@ defmodule Loopctl.Runners.DispatchLedger do
              | :stale_claim_epoch
              | :dispatch_not_accepted
              | :run_mismatch
-             | :rejected_by_database}
+             | :rejected_by_database
+             | :capacity_busy}
   def record_trace(tenant_id, runner_id, batch) do
     context = %{operation: :record_trace, dispatch_id: batch.dispatch_id, run_id: batch.run_id}
 
@@ -403,15 +515,45 @@ defmodule Loopctl.Runners.DispatchLedger do
   # cases first; this is the backstop, so reaching it is logged and counted — a run whose
   # `acked_seq` stops advancing must leave an operator a signal. Any other error raises.
   defp runner_write(tenant_id, runner_id, context, fun) do
-    in_tenant(tenant_id, fun)
+    in_tenant(tenant_id, fn ->
+      Capacity.set_lock_timeout!(Repo)
+      fun.()
+    end)
   rescue
     error in Postgrex.Error ->
-      if data_exception?(error) do
-        report_rejection(error, tenant_id, runner_id, context)
-        {:error, :rejected_by_database}
-      else
-        reraise(error, __STACKTRACE__)
+      cond do
+        Capacity.retryable?(error) ->
+          report_busy(error, tenant_id, runner_id, context)
+          {:error, :capacity_busy}
+
+        data_exception?(error) ->
+          report_rejection(error, tenant_id, runner_id, context)
+          {:error, :rejected_by_database}
+
+        true ->
+          reraise(error, __STACKTRACE__)
       end
+  end
+
+  # A lock this write could not get inside `Capacity.lock_timeout_ms/0`, or a deadlock
+  # Postgres broke by choosing it. Nothing was written; the runner is told to send it again.
+  defp report_busy(%Postgrex.Error{postgres: postgres}, tenant_id, runner_id, context) do
+    metadata = %{
+      operation: context.operation,
+      sqlstate: postgres[:pg_code],
+      tenant_id: tenant_id,
+      runner_id: runner_id,
+      dispatch_id: context.dispatch_id,
+      run_id: context.run_id
+    }
+
+    Logger.warning(
+      "runner ledger write could not get a lock: operation=#{metadata.operation} " <>
+        "sqlstate=#{metadata.sqlstate} tenant_id=#{tenant_id} runner_id=#{runner_id} " <>
+        "dispatch_id=#{metadata.dispatch_id} run_id=#{inspect(metadata.run_id)}"
+    )
+
+    :telemetry.execute([:loopctl, :runners, :ledger_lock_unavailable], %{count: 1}, metadata)
   end
 
   defp data_exception?(%Postgrex.Error{postgres: %{pg_code: "22" <> _}}), do: true

@@ -468,6 +468,162 @@ defmodule Loopctl.Runners.CapacityTest do
     end)
   end
 
+  describe "a lock wait on a runner message" do
+    # The reply and trace paths run inside the channel process that holds the runner's
+    # socket. Unbounded they hold a pool connection for as long as the blocker runs; raised
+    # they crash the channel, and the runner re-sends the same message on rejoin forever.
+    test "a reply blocked behind a claim release is capacity_busy, not a wait and not a raise" do
+      runner = runner(%{max_sessions: 3})
+      story = story(runner.tenant_id)
+      d = dispatch(runner.tenant_id, %{"story_id" => story.id})
+      {:ok, _} = send_dispatch(runner, d)
+
+      test = self()
+
+      blocker =
+        Task.async(fn ->
+          unboxed(fn ->
+            Repo.with_tenant(runner.tenant_id, fn ->
+              Repo.one!(
+                from s in Story,
+                  where: s.id == ^story.id,
+                  lock: "FOR UPDATE",
+                  select: s.claim_epoch
+              )
+
+              send(test, :blocking)
+              assert_receive_in_task(:finish)
+              :done
+            end)
+          end)
+        end)
+
+      assert_receive :blocking, 5_000
+      started = System.monotonic_time(:millisecond)
+
+      assert reply(runner, d, %{}) == {:error, :capacity_busy}
+      elapsed = System.monotonic_time(:millisecond) - started
+      assert elapsed >= Capacity.lock_timeout_ms() - 100
+      assert elapsed < Capacity.lock_timeout_ms() * 3
+
+      send(blocker.pid, :finish)
+      assert {:ok, :done} = Task.await(blocker, 30_000)
+
+      # Nothing was recorded, so the runner's re-send is applied normally.
+      assert {:ok, %DispatchRecord{status: "accepted"}} = reply(runner, d, %{})
+    end
+
+    test "a release blocked behind a row lock is capacity_busy" do
+      runner = runner(%{max_sessions: 3})
+      d = dispatch(runner.tenant_id)
+      {:ok, _} = send_dispatch(runner, d)
+      slot = generation(runner, d.dispatch_id)
+
+      test = self()
+
+      blocker =
+        Task.async(fn ->
+          unboxed(fn ->
+            Repo.with_tenant(runner.tenant_id, fn ->
+              Repo.one!(
+                from x in DispatchRecord,
+                  where: x.tenant_id == ^runner.tenant_id and x.dispatch_id == ^d.dispatch_id,
+                  lock: "FOR UPDATE",
+                  select: x.id
+              )
+
+              send(test, :blocking)
+              assert_receive_in_task(:finish)
+              :done
+            end)
+          end)
+        end)
+
+      assert_receive :blocking, 5_000
+
+      assert release(runner, d.dispatch_id, slot) == {:error, :capacity_busy}
+
+      send(blocker.pid, :finish)
+      assert {:ok, :done} = Task.await(blocker, 30_000)
+      assert in_flight(runner) == 1
+    end
+  end
+
+  describe "release_undelivered_slot/2" do
+    test "releases a reservation nothing was delivered under" do
+      runner = runner(%{max_sessions: 3})
+      d = dispatch(runner.tenant_id)
+      {:ok, _} = send_dispatch(runner, d)
+
+      assert unboxed(fn ->
+               DispatchLedger.release_undelivered_slot(runner.tenant_id, d.dispatch_id)
+             end) == {:ok, :released}
+
+      assert in_flight(runner) == 0
+    end
+
+    test "leaves the slot of a dispatch that WAS pushed under this reservation" do
+      runner = runner(%{max_sessions: 3})
+      d = dispatch(runner.tenant_id)
+      {:ok, _} = send_dispatch(runner, d)
+      force_dispatch(runner, d.dispatch_id, pushed_at: DateTime.utc_now())
+
+      # The drop of a re-send by a second socket must not take the slot of the session the
+      # first push started.
+      assert unboxed(fn ->
+               DispatchLedger.release_undelivered_slot(runner.tenant_id, d.dispatch_id)
+             end) == {:ok, :already_released}
+
+      assert in_flight(runner) == 1
+    end
+
+    test "leaves the slot of a dispatch the runner has replied to" do
+      runner = runner(%{max_sessions: 3})
+      d = dispatch(runner.tenant_id)
+      {:ok, _} = send_dispatch(runner, d)
+      {:ok, _} = reply(runner, d, %{})
+
+      assert unboxed(fn ->
+               DispatchLedger.release_undelivered_slot(runner.tenant_id, d.dispatch_id)
+             end) == {:ok, :already_released}
+
+      assert in_flight(runner) == 1
+    end
+
+    test "another tenant cannot release by id" do
+      runner = runner(%{max_sessions: 3})
+      other = runner(%{max_sessions: 3})
+      d = dispatch(runner.tenant_id)
+      {:ok, _} = send_dispatch(runner, d)
+
+      assert unboxed(fn ->
+               DispatchLedger.release_undelivered_slot(other.tenant_id, d.dispatch_id)
+             end) == {:error, :unknown_dispatch}
+
+      assert in_flight(runner) == 1
+    end
+  end
+
+  describe "a re-send's wall clock" do
+    test "replaces the stored one, so heal bounds the slot by the clock in flight" do
+      runner = runner(%{max_sessions: 3})
+      short = dispatch(runner.tenant_id, %{"wall_clock_seconds" => 600})
+      {:ok, _} = send_dispatch(runner, short)
+      assert record(runner, short.dispatch_id).wall_clock_seconds == 600
+
+      longer = %{short | wall_clock_seconds: 3_600}
+      {:ok, _} = send_dispatch(runner, longer)
+      assert record(runner, longer.dispatch_id).wall_clock_seconds == 3_600
+
+      # Old enough to have run out under the FIRST clock, not under the one in flight.
+      grace = Capacity.release_grace_seconds()
+      pushed = DateTime.add(DateTime.utc_now(), -(600 + grace + 60))
+      force_dispatch(runner, short.dispatch_id, pushed_at: pushed, reserved_at: pushed)
+
+      assert heal(runner) == {:ok, %{released: 0, in_flight: 1}}
+    end
+  end
+
   describe "retryable?/1" do
     # What a caller answers `:capacity_busy` on. A deadlock is as transient as a lock
     # timeout and just as pointless to raise: the transaction is already gone, and the
@@ -604,7 +760,10 @@ defmodule Loopctl.Runners.CapacityTest do
       sender = Task.async(fn -> send_dispatch(runner, d) end)
 
       # Blocked on the admission lock under the fixed order, holding no story; blocked on it
-      # while HOLDING the story's share lock under the old one.
+      # while HOLDING the story's share lock under the old one. (A FOR SHARE request DOES
+      # queue behind a FOR UPDATE holder, and a FOR SHARE holder blocks a later FOR UPDATE
+      # requester — the cycle is broken by the single global order, not by any compatibility
+      # between the two modes.)
       await_waiting_locks(waiting + 1)
       send(admitter.pid, :take_story)
 
