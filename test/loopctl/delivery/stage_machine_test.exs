@@ -29,6 +29,8 @@ defmodule Loopctl.Delivery.StageMachineTest do
           {:reviewing, :implementing, :review_findings},
           {:ci, :implementing, :base_moved},
           {:deployed, :escalated, :verification_failed},
+          {:triaged, :escalated, :triage_escalate},
+          {:ci, :escalated, :merge_gate},
           {:implementing, :failed, :budget_exceeded},
           {:implementing, :queued, :runner_lost}
         ] do

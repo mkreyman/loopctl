@@ -24,6 +24,10 @@ defmodule Loopctl.Delivery.StageMachine do
   - `:review_findings` — reviewing -> implementing
   - `:base_moved` — merge conflict or base moved: pr_open | ci -> implementing
   - `:verification_failed` — post-deploy verification failing: deployed -> escalated
+  - `:triage_escalate` — triaged -> escalated, the triage trio's `escalate` verdict
+    (design §4), including the disagreement that escalates by construction
+  - `:merge_gate` — ci -> escalated, the merge-precondition gate refusing (design §5:
+    a clean result merges with no human, anything else routes to Gate A)
   - `:budget_exceeded` — any live stage -> failed
   - `:runner_lost` — an in-flight stage -> queued. Taken by the claim reclaimer
     (`Loopctl.Progress.reclaim_expired_claim/3`), never asked for by a runner: a runner
@@ -70,7 +74,9 @@ defmodule Loopctl.Delivery.StageMachine do
                    {:reviewing, :implementing, :review_findings},
                    {:pr_open, :implementing, :base_moved},
                    {:ci, :implementing, :base_moved},
-                   {:deployed, :escalated, :verification_failed}
+                   {:deployed, :escalated, :verification_failed},
+                   {:triaged, :escalated, :triage_escalate},
+                   {:ci, :escalated, :merge_gate}
                  ] ++ @budget_exceeded ++ @released ++ @human_resolution
 
   # The custody-critical transitions, and the only ones written to the audit chain (design
@@ -124,6 +130,8 @@ defmodule Loopctl.Delivery.StageMachine do
           | :review_findings
           | :base_moved
           | :verification_failed
+          | :triage_escalate
+          | :merge_gate
           | :budget_exceeded
           | :runner_lost
           | :claim_released

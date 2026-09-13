@@ -420,19 +420,56 @@ defmodule Loopctl.Delivery.Stages do
     unless AdminRepo.in_transaction?(),
       do: raise(ArgumentError, "follow_release/5 runs inside the releasing transaction")
 
-    row =
-      from(s in StoryStage,
-        where: s.tenant_id == ^tenant_id and s.story_id == ^story_id,
-        where: s.stage not in [:done, :failed],
-        lock: "FOR UPDATE"
-      )
-      |> AdminRepo.one()
+    row = live_row(tenant_id, story_id)
 
     cond do
       is_nil(row) -> {:ok, nil}
       row.stage in StageMachine.in_flight_stages() -> requeue(row, new_epoch, edge, opts)
       true -> rebind(row, new_epoch, opts)
     end
+  end
+
+  @doc """
+  Makes a story's stage row follow a CLAIM, inside the claiming transaction
+  (`Loopctl.Progress.claim_story/3` and `Loopctl.BulkOperations`' bulk claim).
+
+  A claim bumps `stories.claim_epoch` exactly as a release does, so a row left at the old
+  epoch would be refused on every advance with nothing able to move it — a story claimed
+  by hand while its row is still at `detected` or `triaged` got stuck there. The row keeps
+  its STAGE and takes the new epoch (a `rebound` event); `done` and `failed`, or no row,
+  are untouched.
+
+  It never moves a row INTO `claimed`: that transition is the loop's own
+  `advance(queued -> claimed)`, which is where the claimed row's chain entry and its
+  `runner_id` come from. Rebinding first is what lets that advance present the new epoch
+  and match.
+
+  Same repo, transaction and lock rules as `follow_release/5`.
+
+  ## Options
+
+  - `:actor_label` — recorded on the event
+  """
+  @spec follow_claim(Ecto.UUID.t(), Ecto.UUID.t(), non_neg_integer(), keyword()) ::
+          {:ok, StoryStage.t() | nil}
+  def follow_claim(tenant_id, story_id, new_epoch, opts \\ []) do
+    unless AdminRepo.in_transaction?(),
+      do: raise(ArgumentError, "follow_claim/4 runs inside the claiming transaction")
+
+    case live_row(tenant_id, story_id) do
+      nil -> {:ok, nil}
+      row -> rebind(row, new_epoch, opts)
+    end
+  end
+
+  # Every row a claim or a release may touch: `done` and `failed` are finished with.
+  defp live_row(tenant_id, story_id) do
+    from(s in StoryStage,
+      where: s.tenant_id == ^tenant_id and s.story_id == ^story_id,
+      where: s.stage not in [:done, :failed],
+      lock: "FOR UPDATE"
+    )
+    |> AdminRepo.one()
   end
 
   defp requeue(%StoryStage{stage: from} = row, new_epoch, edge, opts) do

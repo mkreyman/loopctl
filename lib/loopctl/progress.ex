@@ -218,6 +218,13 @@ defmodule Loopctl.Progress do
       # is that a secret-store blip fails the claim rather than half-completing it
       # — which is the correct trade for an operation whose whole output is a
       # credential.
+      # #803: a claim bumps the epoch too, so the stage row follows it in THIS transaction.
+      # Its stage does not change — the loop's own advance(queued -> claimed) does that —
+      # but a row left at the old epoch (a story claimed while still at `detected` or
+      # `triaged`) would be refused on every advance with nothing able to move it.
+      |> Multi.run(:stage, fn _repo, %{story: updated} ->
+        Stages.follow_claim(tenant_id, updated.id, updated.claim_epoch, actor_label: actor_label)
+      end)
       |> Multi.run(:mint_cap, fn _repo, %{story: updated} ->
         mint_cap(tenant_id, "start_cap", updated.id, Keyword.get(opts, :lineage, []))
       end)

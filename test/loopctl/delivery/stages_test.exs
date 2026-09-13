@@ -650,6 +650,61 @@ defmodule Loopctl.Delivery.StagesTest do
     end
   end
 
+  describe "claims (follow_claim/4)" do
+    # A claim bumps the epoch as a release does, so the row has to follow it or a story
+    # claimed before triage finished can never be advanced again.
+    defp contracted_story_with_stage(stage) do
+      tenant = fixture(:tenant)
+      agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+      story = fixture(:story, %{tenant_id: tenant.id, agent_status: :contracted})
+
+      row =
+        fixture(:story_stage, %{
+          repo: AdminRepo,
+          tenant_id: tenant.id,
+          story_id: story.id,
+          stage: stage,
+          claim_epoch: story.claim_epoch
+        })
+
+      %{tenant_id: tenant.id, agent: agent, story: story, row: row}
+    end
+
+    for stage <- [:detected, :triaged, :queued] do
+      test "a hand-claimed story at #{stage} keeps its stage and takes the claim's epoch" do
+        %{tenant_id: t, agent: agent, story: story, row: row} =
+          contracted_story_with_stage(unquote(stage))
+
+        {:ok, claimed} = Progress.claim_story(t, story.id, agent_id: agent.id)
+        assert claimed.claim_epoch == story.claim_epoch + 1
+
+        rebound = AdminRepo.get!(StoryStage, row.id)
+        assert rebound.stage == unquote(stage)
+        assert rebound.claim_epoch == claimed.claim_epoch
+        assert rebound.attempts == %{}
+
+        assert [%StageEvent{event: "rebound"}] =
+                 AdminRepo.all(from e in StageEvent, where: e.story_stage_id == ^row.id)
+      end
+    end
+
+    test "a bulk claim rebinds the row the same way" do
+      %{tenant_id: t, agent: agent, story: story, row: row} = contracted_story_with_stage(:queued)
+
+      {:ok, [%{status: "success"}]} =
+        Loopctl.BulkOperations.bulk_claim(t, [story.id], agent.id)
+
+      claimed = AdminRepo.get!(Story, story.id)
+      assert AdminRepo.get!(StoryStage, row.id).claim_epoch == claimed.claim_epoch
+    end
+
+    test "follow_claim/4 refuses to run outside the claiming transaction" do
+      assert_raise ArgumentError, fn ->
+        Stages.follow_claim(Ecto.UUID.generate(), Ecto.UUID.generate(), 1)
+      end
+    end
+  end
+
   defp escalation(:escalated), do: %{escalation_reason: "why"}
   defp escalation(_stage), do: %{}
 

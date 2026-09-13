@@ -32,6 +32,12 @@ defmodule Loopctl.Delivery.StagesLockTest do
   end
 
   setup do
+    # This module is on ExUnit.Case, so it gets none of DataCase's stubs, and
+    # `Progress.claim_story/3` mints a capability through MockSecrets. Global mode because
+    # the claim runs in a Task; safe here since the module is async: false.
+    Mox.set_mox_global()
+    Mox.stub(Loopctl.MockSecrets, :get, fn _name -> {:error, :not_found} end)
+
     # `fixture(:committed_tenant)` runs its own unboxed AdminRepo checkout, so it goes first.
     tenant = fixture(:committed_tenant, %{})
     :ok = Sandbox.checkout(Repo, sandbox: false)
@@ -135,6 +141,33 @@ defmodule Loopctl.Delivery.StagesLockTest do
 
     assert {:error, :stale_claim_epoch} = Task.await(advancer, 5_000)
     assert AdminRepo.get!(StoryStage, row.id).stage == :implementing
+  end
+
+  test "a row rebound by a claim is advanceable again under the claim's epoch", %{
+    tenant: tenant,
+    story: story
+  } do
+    # Committed on both connections, so the RLS repo `Stages.advance/4` uses and the
+    # AdminRepo `claim_story/3` uses see the same rows — the end-to-end shape the
+    # sandboxed test in `stages_test.exs` cannot reach.
+    fixture(:story_stage, %{
+      tenant_id: tenant.id,
+      story_id: story.id,
+      stage: :triaged,
+      claim_epoch: 1
+    })
+
+    agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+
+    {1, _} =
+      from(s in Story, where: s.id == ^story.id)
+      |> AdminRepo.update_all(set: [agent_status: :contracted])
+
+    {:ok, claimed} = Progress.claim_story(tenant.id, story.id, agent_id: agent.id)
+    assert claimed.claim_epoch == 2
+
+    assert {:ok, %StoryStage{stage: :queued}} =
+             Stages.advance(tenant.id, story.id, {:triaged, :queued}, claim_epoch: 2)
   end
 
   test "a zombie runner is fenced after the reclaimer requeues its story", %{story: story} do
