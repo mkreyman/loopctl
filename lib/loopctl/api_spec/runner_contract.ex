@@ -4,7 +4,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   A runner is a dev machine that connects outbound over `LoopctlWeb.RunnerSocket`. This
   module is the ONE declaration of every message on that connection. The same schemas
-  VALIDATE messages in both directions (`cast_join/1`, `cast_status/1` inbound,
+  VALIDATE messages in both directions (`cast_join/1`, `cast_status/1`,
+  `cast_dispatch_reply/1`, `cast_trace_batch/1`, `cast_trace_cursor/1` inbound,
   `cast_dispatch/1` outbound) and are EXPORTED as JSON
   Schema to `priv/runner_contract/v<major>.json` (`mix loopctl.runner_contract`), which
   `mkreyman/loopctl-runner` vendors. A test fails when the checked-in export drifts from
@@ -21,12 +22,33 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   ## Messages
 
-  | direction | event | schema |
-  |---|---|---|
-  | runner -> control | `phx_join` on `"runner:<runner_id>"` | `RunnerJoin` |
-  | runner -> control | `"status"` | `RunnerStatus` |
-  | control -> runner | `"dispatch"` | `RunnerDispatch` (pushed only by `Loopctl.Runners.dispatch/3`) |
-  | runner -> control | trace upload | `RunnerTraceEvent` (declared; shipped from #803) |
+  | direction | event | schema | ok reply | error `reason`s |
+  |---|---|---|---|---|
+  | runner -> control | `phx_join` on `"runner:<runner_id>"` | `RunnerJoin` | `{contract_version}` | see `LoopctlWeb.RunnerChannel` |
+  | runner -> control | `"status"` | `RunnerStatus` | empty | `rate_limited`, `invalid_payload` |
+  | control -> runner | `"dispatch"` | `RunnerDispatch` (pushed only by `Loopctl.Runners.dispatch/3`) | — | — |
+  | runner -> control | `"dispatch_reply"` | `RunnerDispatchReply` (since 1.1.0) | empty | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `stale_claim_epoch`, `already_replied` |
+  | runner -> control | `"trace"` | `RunnerTraceBatch` of `RunnerTraceEvent` (since 1.1.0) | `RunnerTraceAck` | `rate_limited`, `invalid_payload`, `batch_too_large`, `event_data_too_large`, `unknown_dispatch`, `stale_claim_epoch`, `dispatch_not_accepted`, `run_mismatch` |
+  | runner -> control | `"trace_cursor"` | `RunnerTraceCursor` (since 1.1.0) | `RunnerTraceAck` | `rate_limited`, `invalid_payload` |
+
+  ## Dispatch replies
+
+  A runner answers every `dispatch` it validated with one `dispatch_reply`. The first reply
+  moves the ledger row out of `sent`; an IDENTICAL second reply is `ok` (so a reply whose
+  acknowledgement was lost can be re-sent), and a DIFFERENT one is `already_replied`. A
+  reply for a dispatch this runner was not sent — including another runner's or another
+  tenant's — is `unknown_dispatch`, and one whose `claim_epoch` is not the dispatched one is
+  `stale_claim_epoch`.
+
+  ## Trace
+
+  The runner's on-disk NDJSON file is the source of truth. It ships events in batches of at
+  most `RunnerTraceBatch.max_events/0`, each with at most
+  `RunnerTraceEvent.max_data_bytes/0` of JSON `data`; the server stores `(run_id, seq)` once
+  and replies `acked_seq`, the highest seq such that EVERY seq from 0 to it is stored. The
+  runner resumes from `acked_seq + 1` — on a rejoin it asks `trace_cursor` first, because
+  Phoenix replays nothing and a rejoin happens on every rolling deploy. The first batch of a
+  run binds its `run_id` to the dispatch; a run belongs to one accepted dispatch.
 
   ## Versioning
 
@@ -40,7 +62,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   alias OpenApiSpex.Schema
 
-  @version "1.0.0"
+  @version "1.1.0"
   @major 1
 
   defmodule RunnerSample do
@@ -215,6 +237,14 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     @moduledoc false
     require OpenApiSpex
 
+    # Bytes of the event's `data` as JSON. Referenced by the schema's description and by
+    # `RunnerContract.cast_trace_batch/1`, which enforces it.
+    @max_data_bytes 2_048
+
+    @doc "The largest `data` object, in bytes of JSON, an event may carry."
+    @spec max_data_bytes() :: pos_integer()
+    def max_data_bytes, do: @max_data_bytes
+
     OpenApiSpex.schema(
       %{
         title: "RunnerTraceEvent",
@@ -223,7 +253,9 @@ defmodule Loopctl.ApiSpec.RunnerContract do
             "the runner ships `(run_id, seq)`, the server ACKs the last contiguous seq and " <>
             "dedups on the pair, and the runner resumes from that offset on rejoin. " <>
             "`parent` is REQUIRED on every event (null only for the root) so the agent " <>
-            "tree can be rebuilt by query.",
+            "tree can be rebuilt by query. `data` is at most #{@max_data_bytes} bytes of " <>
+            "JSON (refused with `event_data_too_large`); larger payloads belong in object " <>
+            "storage, referenced from `data`.",
         type: :object,
         required: [:run_id, :seq, :event_id, :parent, :ts, :type],
         properties: %{
@@ -240,11 +272,158 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     )
   end
 
-  @schemas [RunnerJoin, RunnerStatus, RunnerSample, RunnerDispatch, RunnerTraceEvent]
+  defmodule RunnerDispatchReply do
+    @moduledoc false
+    require OpenApiSpex
+
+    @refusal_reasons ~w(dispatches_disabled draining at_capacity insufficient_disk
+                        repo_not_allowed branch_not_allowed wall_clock_exceeds_limit
+                        max_turns_exceeds_limit token_budget_exceeds_limit other)
+    @max_detail_length 500
+
+    @doc "Every refusal reason a runner may give."
+    @spec refusal_reasons() :: [String.t()]
+    def refusal_reasons, do: @refusal_reasons
+
+    @doc "The longest `detail` a refusal may carry."
+    @spec max_detail_length() :: pos_integer()
+    def max_detail_length, do: @max_detail_length
+
+    OpenApiSpex.schema(
+      %{
+        title: "RunnerDispatchReply",
+        description:
+          "The runner's answer to one `dispatch`, pushed as the `dispatch_reply` event. " <>
+            "`reason` is REQUIRED when `decision` is `refused` and forbidden when it is " <>
+            "`accepted`; `detail` is required when `reason` is `other` and allowed only on a " <>
+            "refusal. The server applies the first reply, answers an identical repeat `ok`, " <>
+            "and refuses a different one with `already_replied`.",
+        type: :object,
+        required: [:dispatch_id, :claim_epoch, :decision],
+        properties: %{
+          dispatch_id: %Schema{type: :string, format: :uuid},
+          claim_epoch: %Schema{
+            type: :integer,
+            minimum: 0,
+            description: "The `claim_epoch` of the dispatch being answered, echoed."
+          },
+          decision: %Schema{type: :string, enum: ["accepted", "refused"]},
+          reason: %Schema{type: :string, enum: @refusal_reasons},
+          detail: %Schema{type: :string, minLength: 1, maxLength: @max_detail_length}
+        }
+      },
+      struct?: false
+    )
+  end
+
+  defmodule RunnerTraceBatch do
+    @moduledoc false
+    require OpenApiSpex
+
+    alias Loopctl.ApiSpec.RunnerContract.RunnerTraceEvent
+
+    # Referenced by `maxItems` below and enforced by `RunnerContract.cast_trace_batch/1`.
+    # A worst-case batch (every string at its maxLength, `data` at its cap) stays well inside
+    # the runner socket's 64 KB frame cap; a test holds that.
+    @max_events 20
+
+    @doc "The most events one `trace` batch may carry."
+    @spec max_events() :: pos_integer()
+    def max_events, do: @max_events
+
+    OpenApiSpex.schema(
+      %{
+        title: "RunnerTraceBatch",
+        description:
+          "A batch of one run's trace events, pushed as the `trace` event. Every event's " <>
+            "`run_id` must equal the batch's. At most #{@max_events} events (refused with " <>
+            "`batch_too_large`). The run must belong to an ACCEPTED dispatch this runner " <>
+            "holds, at the dispatched `claim_epoch`; the first batch binds `run_id` to " <>
+            "`dispatch_id`. Replied with `RunnerTraceAck`.",
+        type: :object,
+        required: [:run_id, :dispatch_id, :claim_epoch, :events],
+        properties: %{
+          run_id: %Schema{type: :string, format: :uuid},
+          dispatch_id: %Schema{type: :string, format: :uuid},
+          claim_epoch: %Schema{type: :integer, minimum: 0},
+          events: %Schema{type: :array, maxItems: @max_events, items: RunnerTraceEvent.schema()}
+        }
+      },
+      struct?: false
+    )
+  end
+
+  defmodule RunnerTraceCursor do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(
+      %{
+        title: "RunnerTraceCursor",
+        description:
+          "Asks where a run's stored trace ends, pushed as the `trace_cursor` event before " <>
+            "resuming a shipment. Replied with `RunnerTraceAck`; a run this runner has not " <>
+            "shipped (or does not hold) answers -1.",
+        type: :object,
+        required: [:run_id],
+        properties: %{run_id: %Schema{type: :string, format: :uuid}}
+      },
+      struct?: false
+    )
+  end
+
+  defmodule RunnerTraceAck do
+    @moduledoc false
+    require OpenApiSpex
+
+    OpenApiSpex.schema(
+      %{
+        title: "RunnerTraceAck",
+        description:
+          "The reply to `trace` and `trace_cursor`: the highest seq such that every seq " <>
+            "from 0 to it is stored, or -1 when seq 0 is not. Resume from `acked_seq + 1`.",
+        type: :object,
+        required: [:acked_seq],
+        properties: %{acked_seq: %Schema{type: :integer, minimum: -1}}
+      },
+      struct?: false
+    )
+  end
+
+  @schemas [
+    RunnerJoin,
+    RunnerStatus,
+    RunnerSample,
+    RunnerDispatch,
+    RunnerDispatchReply,
+    RunnerTraceEvent,
+    RunnerTraceBatch,
+    RunnerTraceCursor,
+    RunnerTraceAck
+  ]
+
+  # The stable `reason` codes each runner-to-control event can be refused with. Exported, so
+  # a runner can switch on them without reading this source.
+  @error_reasons %{
+    "status" => ~w(rate_limited invalid_payload),
+    "dispatch_reply" =>
+      ~w(rate_limited invalid_payload unknown_dispatch stale_claim_epoch already_replied),
+    "trace" =>
+      ~w(rate_limited invalid_payload batch_too_large event_data_too_large unknown_dispatch
+         stale_claim_epoch dispatch_not_accepted run_mismatch),
+    "trace_cursor" => ~w(rate_limited invalid_payload)
+  }
+
+  # Postgres `bigint`, the column `seq` is stored in.
+  @max_seq 9_223_372_036_854_775_807
 
   @doc "The contract version loopctl speaks (semver)."
   @spec version() :: String.t()
   def version, do: @version
+
+  @doc "The stable error `reason` codes, per runner-to-control event."
+  @spec error_reasons() :: %{String.t() => [String.t()]}
+  def error_reasons, do: @error_reasons
 
   @doc "The schema modules the contract declares."
   @spec schema_modules() :: [module()]
@@ -289,13 +468,103 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     end
   end
 
+  @doc """
+  Validates a `dispatch_reply` payload. Returns the declared fields only, with atom keys, or
+  `{:error, {:invalid, messages}}` — including for the cross-field rules JSON Schema cannot
+  state: `reason` iff refused, `detail` only on a refusal and required with `other`.
+  """
+  @spec cast_dispatch_reply(term()) :: {:ok, map()} | {:error, term()}
+  def cast_dispatch_reply(payload) do
+    with {:ok, cast} <- cast(payload, RunnerDispatchReply.schema()) do
+      reply = known_fields(cast, RunnerDispatchReply.schema())
+
+      case reply_shape_errors(reply) do
+        [] -> {:ok, reply}
+        errors -> {:error, {:invalid, errors}}
+      end
+    end
+  end
+
+  defp reply_shape_errors(%{decision: "accepted"} = reply) do
+    for key <- [:reason, :detail],
+        Map.has_key?(reply, key),
+        do: "#{key} is only allowed when decision is refused"
+  end
+
+  defp reply_shape_errors(%{decision: "refused", reason: "other"} = reply) do
+    if Map.has_key?(reply, :detail), do: [], else: ["detail is required when reason is other"]
+  end
+
+  defp reply_shape_errors(%{decision: "refused", reason: _}), do: []
+  defp reply_shape_errors(%{decision: "refused"}), do: ["reason is required when refused"]
+
+  @doc """
+  Validates a `trace` batch. Returns the declared fields only, with atom keys, or
+  `{:error, reason}` where reason is `{:batch_too_large, max}`,
+  `{:event_data_too_large, seq, max}` or `{:invalid, messages}`.
+
+  The batch size is checked BEFORE the schema cast, so an oversize batch costs no per-event
+  casting and gets its own reason a runner can act on by splitting.
+  """
+  @spec cast_trace_batch(term()) :: {:ok, map()} | {:error, term()}
+  def cast_trace_batch(payload) do
+    with :ok <- batch_size_ok(payload),
+         {:ok, cast} <- cast(payload, RunnerTraceBatch.schema()) do
+      batch = known_fields(cast, RunnerTraceBatch.schema())
+
+      with :ok <- events_ok(batch) do
+        {:ok, batch}
+      end
+    end
+  end
+
+  defp batch_size_ok(%{"events" => events}) when is_list(events) do
+    max = RunnerTraceBatch.max_events()
+    if length(events) > max, do: {:error, {:batch_too_large, max}}, else: :ok
+  end
+
+  defp batch_size_ok(_payload), do: :ok
+
+  defp events_ok(%{run_id: run_id, events: events}) do
+    max = RunnerTraceEvent.max_data_bytes()
+
+    Enum.reduce_while(events, :ok, fn event, :ok ->
+      cond do
+        event.run_id != run_id ->
+          {:halt, {:error, {:invalid, ["event #{event.seq}: run_id differs from the batch"]}}}
+
+        event.seq > @max_seq ->
+          {:halt, {:error, {:invalid, ["event seq #{event.seq} exceeds #{@max_seq}"]}}}
+
+        byte_size(Jason.encode!(Map.get(event, :data, %{}))) > max ->
+          {:halt, {:error, {:event_data_too_large, event.seq, max}}}
+
+        true ->
+          {:cont, :ok}
+      end
+    end)
+  end
+
+  @doc "Validates a `trace_cursor` payload. Returns `{:ok, %{run_id: run_id}}`."
+  @spec cast_trace_cursor(term()) :: {:ok, map()} | {:error, term()}
+  def cast_trace_cursor(payload) do
+    with {:ok, cast} <- cast(payload, RunnerTraceCursor.schema()) do
+      {:ok, known_fields(cast, RunnerTraceCursor.schema())}
+    end
+  end
+
   # OpenApiSpex keeps undeclared keys on an object, at every depth. Drop them at every
   # depth too, so nothing the contract does not declare reaches Presence.
-  defp known_fields(map, %Schema{type: :object, properties: props}) when is_map(map) do
+  # An object that declares no properties (`RunnerTraceEvent.data`) is free-form by design.
+  defp known_fields(map, %Schema{type: :object, properties: props})
+       when is_map(map) and is_map(props) do
     for {key, sub} <- props, Map.has_key?(map, key), into: %{} do
       {key, known_fields(Map.fetch!(map, key), sub)}
     end
   end
+
+  defp known_fields(list, %Schema{type: :array, items: %Schema{} = items}) when is_list(list),
+    do: Enum.map(list, &known_fields(&1, items))
 
   defp known_fields(value, _schema), do: value
 
@@ -336,7 +605,20 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           "join" => "RunnerJoin",
           "status" => "RunnerStatus",
           "dispatch" => "RunnerDispatch",
+          "dispatch_reply" => "RunnerDispatchReply",
+          "trace" => "RunnerTraceBatch",
+          "trace_cursor" => "RunnerTraceCursor",
           "trace_event" => "RunnerTraceEvent"
+        },
+        "replies" => %{
+          "trace" => "RunnerTraceAck",
+          "trace_cursor" => "RunnerTraceAck"
+        },
+        "errors" => @error_reasons,
+        "limits" => %{
+          "trace_max_events" => RunnerTraceBatch.max_events(),
+          "trace_max_event_data_bytes" => RunnerTraceEvent.max_data_bytes(),
+          "refusal_max_detail_length" => RunnerDispatchReply.max_detail_length()
         }
       },
       "$defs" => defs

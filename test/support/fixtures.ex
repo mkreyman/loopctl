@@ -713,6 +713,44 @@ defmodule Loopctl.Fixtures do
     )
   end
 
+  # One event of a run's trace satisfying RunnerTraceEvent, string-keyed as the runner ships
+  # it. Pass "run_id" and "seq"; the rest defaults.
+  def build(:runner_trace_event, attrs) do
+    attrs = Enum.into(attrs, %{})
+    seq = Map.get(attrs, "seq", 0)
+
+    Map.merge(
+      %{
+        "run_id" => Ecto.UUID.generate(),
+        "seq" => seq,
+        "event_id" => "evt-#{seq}",
+        "parent" => if(seq == 0, do: nil, else: "evt-0"),
+        "ts" => "2026-09-12T20:36:46.485Z",
+        "type" => "claude.tool_use",
+        "data" => %{"tool" => "Read"}
+      },
+      attrs
+    )
+  end
+
+  # A `trace` batch for `run_id` carrying one event per seq in `seqs`.
+  def build(:runner_trace_batch, attrs) do
+    attrs = Enum.into(attrs, %{})
+    run_id = Map.get(attrs, "run_id", Ecto.UUID.generate())
+    seqs = Map.get(attrs, :seqs, [0])
+
+    Map.merge(
+      %{
+        "run_id" => run_id,
+        "dispatch_id" => Ecto.UUID.generate(),
+        "claim_epoch" => 0,
+        "events" =>
+          Enum.map(seqs, &build(:runner_trace_event, %{"run_id" => run_id, "seq" => &1}))
+      },
+      Map.delete(attrs, :seqs)
+    )
+  end
+
   # A Gate B input for the repository above that touches nothing guarded.
   def build(:gate_b_input, attrs) do
     Map.merge(

@@ -41,6 +41,19 @@ defmodule LoopctlWeb.RunnerChannel do
   `"status"` updates the runner's Presence meta (`RunnerStatus`). Updates closer
   together than `@min_status_interval_ms` are refused with `rate_limited`, because each
   one is a Presence diff broadcast across the PubSub.
+
+  ## Dispatch replies and trace (contract 1.1.0, #803)
+
+  `"dispatch_reply"` (`RunnerDispatchReply`), `"trace"` (`RunnerTraceBatch`) and
+  `"trace_cursor"` (`RunnerTraceCursor`) are validated against the contract and applied by
+  `Loopctl.Runners.DispatchLedger`, always as THIS socket's runner in THIS socket's tenant —
+  a runner can answer, and ship a trace for, only a dispatch it was sent. Each has its own
+  minimum interval, refused with `rate_limited` and the interval, because each one is a
+  database transaction.
+
+  None of them checks the custody halt. The halt guards control-to-runner pushes, which
+  start custody progress; these record what a runner already did, and a halted tenant must
+  still be able to record that.
   """
 
   use LoopctlWeb, :channel
@@ -49,11 +62,14 @@ defmodule LoopctlWeb.RunnerChannel do
 
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Runners
+  alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.Presence
   alias LoopctlWeb.RunnerSocket
 
   @recheck_interval_ms 30_000
   @min_status_interval_ms 1_000
+  @min_reply_interval_ms 250
+  @min_trace_interval_ms 50
   @join_window_ms 60_000
   @max_joins 30
 
@@ -75,6 +91,8 @@ defmodule LoopctlWeb.RunnerChannel do
        socket
        |> assign(:meta, Map.put(meta, :joined_at, DateTime.utc_now()))
        |> assign(:last_status_at, :never)
+       |> assign(:last_reply_at, :never)
+       |> assign(:last_trace_at, :never)
        |> assign(:presence_ref, nil)}
     else
       {:error, reason} -> {:error, join_error(reason)}
@@ -145,7 +163,7 @@ defmodule LoopctlWeb.RunnerChannel do
   def handle_in("status", payload, socket) do
     now = System.monotonic_time(:millisecond)
 
-    with :ok <- status_interval_ok(socket.assigns.last_status_at, now),
+    with :ok <- interval_ok(socket.assigns.last_status_at, now, @min_status_interval_ms),
          {:ok, status} <- RunnerContract.cast_status(payload) do
       %{runner: runner, tenant_id: tenant_id, meta: meta} = socket.assigns
       meta = Map.merge(meta, status)
@@ -174,8 +192,62 @@ defmodule LoopctlWeb.RunnerChannel do
     end
   end
 
+  def handle_in("dispatch_reply", payload, socket) do
+    now = System.monotonic_time(:millisecond)
+    %{runner: runner, tenant_id: tenant_id} = socket.assigns
+
+    with :ok <- interval_ok(socket.assigns.last_reply_at, now, @min_reply_interval_ms),
+         {:ok, reply} <- RunnerContract.cast_dispatch_reply(payload),
+         {:ok, _record} <- DispatchLedger.record_reply(tenant_id, runner.id, reply) do
+      {:reply, :ok, assign(socket, :last_reply_at, now)}
+    else
+      {:error, :rate_limited} ->
+        rate_limited(socket, @min_reply_interval_ms)
+
+      {:error, reason} ->
+        {:reply, {:error, message_error(reason)}, assign(socket, :last_reply_at, now)}
+    end
+  end
+
+  def handle_in("trace", payload, socket) do
+    now = System.monotonic_time(:millisecond)
+    %{runner: runner, tenant_id: tenant_id} = socket.assigns
+
+    with :ok <- interval_ok(socket.assigns.last_trace_at, now, @min_trace_interval_ms),
+         {:ok, batch} <- RunnerContract.cast_trace_batch(payload),
+         {:ok, acked_seq} <- DispatchLedger.record_trace(tenant_id, runner.id, batch) do
+      {:reply, {:ok, %{acked_seq: acked_seq}}, assign(socket, :last_trace_at, now)}
+    else
+      {:error, :rate_limited} ->
+        rate_limited(socket, @min_trace_interval_ms)
+
+      {:error, reason} ->
+        {:reply, {:error, message_error(reason)}, assign(socket, :last_trace_at, now)}
+    end
+  end
+
+  def handle_in("trace_cursor", payload, socket) do
+    now = System.monotonic_time(:millisecond)
+    %{runner: runner, tenant_id: tenant_id} = socket.assigns
+
+    with :ok <- interval_ok(socket.assigns.last_trace_at, now, @min_trace_interval_ms),
+         {:ok, %{run_id: run_id}} <- RunnerContract.cast_trace_cursor(payload) do
+      acked_seq = DispatchLedger.trace_cursor(tenant_id, runner.id, run_id)
+      {:reply, {:ok, %{acked_seq: acked_seq}}, assign(socket, :last_trace_at, now)}
+    else
+      {:error, :rate_limited} ->
+        rate_limited(socket, @min_trace_interval_ms)
+
+      {:error, reason} ->
+        {:reply, {:error, message_error(reason)}, assign(socket, :last_trace_at, now)}
+    end
+  end
+
   def handle_in(_event, _payload, socket),
     do: {:reply, {:error, %{reason: "unknown_event"}}, socket}
+
+  defp rate_limited(socket, min_interval_ms),
+    do: {:reply, {:error, %{reason: "rate_limited", min_interval_ms: min_interval_ms}}, socket}
 
   # The socket authenticated once, at connect. A join can come much later — a runner can
   # leave and rejoin on the same connection — so every join re-reads authorization, or a
@@ -209,10 +281,9 @@ defmodule LoopctlWeb.RunnerChannel do
 
   # `:never` rather than 0: monotonic time is negative on a fresh VM, so a 0 sentinel
   # would refuse the first update.
-  defp status_interval_ok(:never, _now), do: :ok
-
-  defp status_interval_ok(last, now) when now - last >= @min_status_interval_ms, do: :ok
-  defp status_interval_ok(_last, _now), do: {:error, :rate_limited}
+  defp interval_ok(:never, _now, _min_ms), do: :ok
+  defp interval_ok(last, now, min_ms) when now - last >= min_ms, do: :ok
+  defp interval_ok(_last, _now, _min_ms), do: {:error, :rate_limited}
 
   defp presence_meta(meta, runner), do: Map.put(meta, :runner_id, runner.id)
 
@@ -261,4 +332,22 @@ defmodule LoopctlWeb.RunnerChannel do
 
   defp join_error({:machine_mismatch, declared}),
     do: %{reason: "machine_mismatch", declared: declared}
+
+  # The stable codes of `RunnerContract.error_reasons/0`.
+  defp message_error({:batch_too_large, max}), do: %{reason: "batch_too_large", max_events: max}
+
+  defp message_error({:event_data_too_large, seq, max}),
+    do: %{reason: "event_data_too_large", seq: seq, max_data_bytes: max}
+
+  defp message_error(reason)
+       when reason in [
+              :unknown_dispatch,
+              :stale_claim_epoch,
+              :already_replied,
+              :dispatch_not_accepted,
+              :run_mismatch
+            ],
+       do: %{reason: Atom.to_string(reason)}
+
+  defp message_error(reason), do: join_error(reason)
 end

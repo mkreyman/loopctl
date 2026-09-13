@@ -4,6 +4,9 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
   import Loopctl.Fixtures
 
   alias Loopctl.ApiSpec.RunnerContract
+  alias Loopctl.ApiSpec.RunnerContract.RunnerDispatchReply
+  alias Loopctl.ApiSpec.RunnerContract.RunnerTraceBatch
+  alias Loopctl.ApiSpec.RunnerContract.RunnerTraceEvent
 
   @join %{
     "contract_version" => "1.0.0",
@@ -40,6 +43,106 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       assert defs["RunnerTraceEvent"]["properties"]["parent"]["type"] == ["string", "null"]
       assert "claim_epoch" in defs["RunnerDispatch"]["required"]
     end
+
+    test "is contract 1.1.0 and names the 1.1 events, replies, errors and limits" do
+      schema = RunnerContract.json_schema()
+      connection = schema["x-connection"]
+
+      assert RunnerContract.version() == "1.1.0"
+      assert schema["x-contract-version"] == "1.1.0"
+
+      assert %{
+               "dispatch_reply" => "RunnerDispatchReply",
+               "trace" => "RunnerTraceBatch",
+               "trace_cursor" => "RunnerTraceCursor"
+             } = connection["events"]
+
+      assert connection["replies"] == %{
+               "trace" => "RunnerTraceAck",
+               "trace_cursor" => "RunnerTraceAck"
+             }
+
+      assert connection["errors"] == RunnerContract.error_reasons()
+
+      assert connection["limits"]["trace_max_events"] == RunnerTraceBatch.max_events()
+
+      assert connection["limits"]["trace_max_event_data_bytes"] ==
+               RunnerTraceEvent.max_data_bytes()
+
+      assert schema["$defs"]["RunnerTraceBatch"]["properties"]["events"]["maxItems"] ==
+               RunnerTraceBatch.max_events()
+    end
+
+    test "uses only the JSON Schema keywords the runner's vendored validator implements" do
+      # mkreyman/loopctl-runner's LoopctlRunner.Contract FAILS a definition carrying a keyword
+      # it does not know, so a new keyword here breaks every runner validating that message.
+      known =
+        ~w(type required properties minimum maximum minLength maxLength pattern enum items
+           maxItems minProperties description format additionalProperties)
+
+      for {title, definition} <- RunnerContract.json_schema()["$defs"] do
+        assert unknown_keywords(definition, known) == [], "#{title} uses an unknown keyword"
+      end
+    end
+
+    test "a worst-case trace batch fits inside the runner socket's frame cap" do
+      {_path, _socket, opts} =
+        Enum.find(LoopctlWeb.Endpoint.__sockets__(), &match?({"/runner/socket", _, _}, &1))
+
+      frame_cap = opts |> Keyword.fetch!(:websocket) |> Keyword.fetch!(:max_frame_size)
+      run_id = Ecto.UUID.generate()
+      data_bytes = RunnerTraceEvent.max_data_bytes()
+      # {"k":"<padding>"} is 8 bytes of framing around the padding.
+      data = %{"k" => String.duplicate("x", data_bytes - 8)}
+      assert byte_size(Jason.encode!(data)) == data_bytes
+
+      event = %{
+        "run_id" => run_id,
+        "seq" => 9_223_372_036_854_775_807,
+        "event_id" => String.duplicate("e", 128),
+        "parent" => String.duplicate("p", 128),
+        "ts" => "2026-09-12T20:36:46.485123+00:00",
+        "type" => String.duplicate("t", 64),
+        "data" => data
+      }
+
+      batch = %{
+        "run_id" => run_id,
+        "dispatch_id" => Ecto.UUID.generate(),
+        "claim_epoch" => 9_223_372_036_854_775_807,
+        "events" => List.duplicate(event, RunnerTraceBatch.max_events())
+      }
+
+      assert {:ok, _} = RunnerContract.cast_trace_batch(batch)
+
+      # The V2 serializer's frame: [join_ref, ref, topic, event, payload].
+      frame =
+        Jason.encode!([
+          "1",
+          "999999",
+          "runner:" <> Ecto.UUID.generate(),
+          "trace",
+          batch
+        ])
+
+      assert byte_size(frame) < frame_cap
+    end
+  end
+
+  defp unknown_keywords(%{} = schema, known) do
+    own = Map.keys(schema) -- known
+
+    nested =
+      Enum.flat_map(
+        Map.get(schema, "properties", %{}),
+        fn {_k, sub} -> unknown_keywords(sub, known) end
+      ) ++
+        case schema["items"] do
+          %{} = items -> unknown_keywords(items, known)
+          nil -> []
+        end
+
+    own ++ nested
   end
 
   describe "cast_join/1" do
@@ -185,6 +288,153 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     test "refuses a status carrying no declared field" do
       assert {:error, {:invalid, _}} = RunnerContract.cast_status(%{})
       assert {:error, {:invalid, _}} = RunnerContract.cast_status(%{"machine" => "mac-mini"})
+    end
+  end
+
+  describe "cast_join/1 across minor versions" do
+    test "a runner built against 1.0.0 still joins a 1.1.0 server" do
+      assert {:ok, %{contract_version: "1.0.0"}} = RunnerContract.cast_join(@join)
+    end
+  end
+
+  describe "cast_dispatch_reply/1" do
+    @reply %{
+      "dispatch_id" => "7a0d3b0e-5c3e-4f5a-9d0e-2b8f3a1c4d5e",
+      "claim_epoch" => 2,
+      "decision" => "accepted"
+    }
+
+    test "accepts an accepted reply and a refusal with a reason, declared fields only" do
+      assert {:ok, reply} = RunnerContract.cast_dispatch_reply(Map.put(@reply, "extra", 1))
+      assert reply == %{dispatch_id: @reply["dispatch_id"], claim_epoch: 2, decision: "accepted"}
+
+      for reason <- RunnerDispatchReply.refusal_reasons() -- ["other"] do
+        assert {:ok, %{reason: ^reason}} =
+                 RunnerContract.cast_dispatch_reply(
+                   Map.merge(@reply, %{"decision" => "refused", "reason" => reason})
+                 )
+      end
+
+      assert {:ok, %{detail: "quota"}} =
+               RunnerContract.cast_dispatch_reply(
+                 Map.merge(@reply, %{
+                   "decision" => "refused",
+                   "reason" => "other",
+                   "detail" => "quota"
+                 })
+               )
+    end
+
+    test "refuses the cross-field shapes JSON Schema cannot state" do
+      for payload <- [
+            Map.put(@reply, "decision", "refused"),
+            Map.merge(@reply, %{"decision" => "refused", "reason" => "other"}),
+            Map.put(@reply, "reason", "draining"),
+            Map.put(@reply, "detail", "why")
+          ] do
+        assert {:error, {:invalid, [_ | _]}} = RunnerContract.cast_dispatch_reply(payload),
+               "expected #{inspect(payload)} to be refused"
+      end
+    end
+
+    test "refuses missing fields, an unknown decision or reason, and an overlong detail" do
+      for field <- Map.keys(@reply) do
+        assert {:error, {:invalid, _}} =
+                 RunnerContract.cast_dispatch_reply(Map.delete(@reply, field))
+      end
+
+      too_long = String.duplicate("x", RunnerDispatchReply.max_detail_length() + 1)
+
+      for {field, value} <- [
+            {"decision", "maybe"},
+            {"reason", "bored"},
+            {"claim_epoch", -1},
+            {"dispatch_id", "nope"},
+            {"detail", too_long}
+          ] do
+        payload =
+          Map.merge(@reply, %{"decision" => "refused", "reason" => "other", "detail" => "d"})
+
+        assert {:error, {:invalid, _}} =
+                 RunnerContract.cast_dispatch_reply(Map.put(payload, field, value)),
+               "expected #{field}=#{inspect(value)} to be refused"
+      end
+
+      assert {:error, {:invalid, _}} = RunnerContract.cast_dispatch_reply(nil)
+    end
+  end
+
+  describe "cast_trace_batch/1" do
+    test "accepts a batch and casts events, keeping free-form data" do
+      batch = build(:runner_trace_batch, %{:seqs => [0, 1], "extra" => true})
+
+      assert {:ok, cast} = RunnerContract.cast_trace_batch(batch)
+      refute Map.has_key?(cast, :extra)
+
+      assert [%{seq: 0, parent: nil, ts: %DateTime{}, data: %{"tool" => "Read"}}, %{seq: 1}] =
+               cast.events
+    end
+
+    test "refuses more events than max_events, before casting any" do
+      max = RunnerTraceBatch.max_events()
+
+      assert {:ok, _} =
+               RunnerContract.cast_trace_batch(
+                 build(:runner_trace_batch, %{seqs: Enum.to_list(1..max)})
+               )
+
+      oversize = build(:runner_trace_batch, %{seqs: Enum.to_list(0..max)})
+      assert {:error, {:batch_too_large, ^max}} = RunnerContract.cast_trace_batch(oversize)
+    end
+
+    test "refuses an event whose data exceeds max_data_bytes, naming its seq" do
+      max = RunnerTraceEvent.max_data_bytes()
+      batch = build(:runner_trace_batch, %{seqs: [0, 1]})
+      fits = %{"k" => String.duplicate("x", max - 8)}
+      over = %{"k" => String.duplicate("x", max - 7)}
+
+      at_cap = put_in(batch, ["events", Access.at(1), "data"], fits)
+      assert {:ok, _} = RunnerContract.cast_trace_batch(at_cap)
+
+      over_cap = put_in(batch, ["events", Access.at(1), "data"], over)
+
+      assert {:error, {:event_data_too_large, 1, ^max}} =
+               RunnerContract.cast_trace_batch(over_cap)
+    end
+
+    test "refuses an event of another run, a seq beyond bigint, and malformed events" do
+      batch = build(:runner_trace_batch, %{seqs: [0]})
+
+      for event_change <- [
+            %{"run_id" => Ecto.UUID.generate()},
+            %{"seq" => 9_223_372_036_854_775_808},
+            %{"seq" => -1},
+            %{"parent" => ""},
+            %{"ts" => "yesterday"}
+          ] do
+        payload = update_in(batch, ["events", Access.at(0)], &Map.merge(&1, event_change))
+
+        assert {:error, {:invalid, _}} = RunnerContract.cast_trace_batch(payload),
+               "expected #{inspect(event_change)} to be refused"
+      end
+
+      for field <- ["run_id", "dispatch_id", "claim_epoch", "events"] do
+        assert {:error, {:invalid, _}} = RunnerContract.cast_trace_batch(Map.delete(batch, field))
+      end
+
+      assert {:error, {:invalid, _}} =
+               RunnerContract.cast_trace_batch(
+                 update_in(batch, ["events", Access.at(0)], &Map.delete(&1, "parent"))
+               )
+    end
+  end
+
+  describe "cast_trace_cursor/1" do
+    test "accepts a run id and refuses anything else" do
+      run_id = Ecto.UUID.generate()
+      assert {:ok, %{run_id: ^run_id}} = RunnerContract.cast_trace_cursor(%{"run_id" => run_id})
+      assert {:error, {:invalid, _}} = RunnerContract.cast_trace_cursor(%{"run_id" => "x"})
+      assert {:error, {:invalid, _}} = RunnerContract.cast_trace_cursor(%{})
     end
   end
 end

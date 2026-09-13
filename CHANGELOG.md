@@ -95,6 +95,27 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Runner contract 1.1.0: dispatch replies, a dispatch ledger and trace intake (#803).**
+  Migrations `20260913120000` and `20260913120100` create `runner_dispatches` (one row per
+  `dispatch_id` per tenant, written by `Loopctl.Runners.dispatch/3` BEFORE it broadcasts) and
+  `runner_trace_events` (unique on `(tenant_id, run_id, seq)`). Both are new, empty tables
+  with RLS enabled: no backfill, no lock on an existing table, safe to deploy ahead of any
+  runner using them. The runner channel accepts three new runner-to-control events —
+  `dispatch_reply`, `trace` and `trace_cursor` — and `priv/runner_contract/v1.json` is
+  regenerated at `x-contract-version` 1.1.0, now also carrying each event's stable error
+  `reason` codes and the trace limits (`x-connection.errors`, `x-connection.limits`: at most
+  20 events per batch, 2,048 bytes of JSON `data` per event). The bump is minor: a runner
+  built against 1.0.0 still joins, and nothing it sends changed.
+
+  **`dispatch/3` has two new refusals.** `{:error, :dispatch_id_conflict}` when the ledger
+  already holds that `dispatch_id` for a different runner, story, `claim_epoch` or kind, and
+  `{:error, :dispatch_already_replied}` when the runner already answered it. Re-dispatching
+  an unanswered `dispatch_id` re-sends it without a second row.
+
+  **Trace has no retention yet.** `runner_trace_events` grows until a prune worker is added
+  to `oban_config.ex`; the table cascades from its `runner_dispatches` row, so pruning old
+  ledger rows prunes their trace.
+
 - **Two new secrets for the agent delivery loop's Gate B: `DELIVERY_GATES_CONFIG` and
   `DELIVERY_GATES_CONFIG_SHA256` (#803 prerequisites).** The first is the trigger JSON
   document, inline; the second is the hex SHA-256 of its exact bytes. Both default to unset,

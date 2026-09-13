@@ -1,0 +1,405 @@
+defmodule Loopctl.Runners.DispatchLedgerTest do
+  @moduledoc """
+  Issue #803: the dispatch ledger and trace intake — a dispatch's identity is written once,
+  a reply applies once and only from the runner it was sent to at the dispatched epoch, and
+  a trace is stored once per `(run_id, seq)` with a contiguous ack computed in SQL.
+  """
+
+  use Loopctl.DataCase, async: true
+
+  import Ecto.Query
+
+  alias Loopctl.AdminRepo
+  alias Loopctl.ApiSpec.RunnerContract
+  alias Loopctl.AuditChain.Entry
+  alias Loopctl.Runners.DispatchLedger
+  alias Loopctl.Runners.TraceEvent
+
+  setup :verify_on_exit!
+
+  setup do
+    {_raw, runner} = fixture(:runner, %{name: "minis"})
+    %{runner: runner}
+  end
+
+  defp sent(runner, attrs \\ %{}) do
+    {:ok, dispatch} = RunnerContract.cast_dispatch(build(:runner_dispatch, attrs))
+    {:ok, record} = DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch)
+    record
+  end
+
+  defp reply(runner, record, attrs \\ %{}) do
+    payload =
+      Map.merge(
+        %{
+          "dispatch_id" => record.dispatch_id,
+          "claim_epoch" => record.claim_epoch,
+          "decision" => "accepted"
+        },
+        attrs
+      )
+
+    {:ok, reply} = RunnerContract.cast_dispatch_reply(payload)
+    DispatchLedger.record_reply(runner.tenant_id, runner.id, reply)
+  end
+
+  defp accepted(runner, attrs \\ %{}) do
+    record = sent(runner, attrs)
+    {:ok, record} = reply(runner, record)
+    record
+  end
+
+  defp trace(runner, record, run_id, seqs, attrs \\ %{}) do
+    payload =
+      build(
+        :runner_trace_batch,
+        Map.merge(
+          %{
+            :seqs => seqs,
+            "run_id" => run_id,
+            "dispatch_id" => record.dispatch_id,
+            "claim_epoch" => record.claim_epoch
+          },
+          attrs
+        )
+      )
+
+    {:ok, batch} = RunnerContract.cast_trace_batch(payload)
+    DispatchLedger.record_trace(runner.tenant_id, runner.id, batch)
+  end
+
+  defp stored_seqs(tenant_id, run_id) do
+    AdminRepo.all(
+      from e in TraceEvent,
+        where: e.tenant_id == ^tenant_id and e.run_id == ^run_id,
+        order_by: e.seq,
+        select: e.seq
+    )
+  end
+
+  describe "record_sent/3" do
+    test "writes one `sent` row carrying the dispatch's identity", %{runner: runner} do
+      record = sent(runner, %{"claim_epoch" => 3, "kind" => "triage"})
+
+      assert record.status == "sent"
+      assert record.runner_id == runner.id
+      assert record.claim_epoch == 3
+      assert record.kind == "triage"
+      assert record.trace_acked_seq == -1
+      assert DispatchLedger.get_record(runner.tenant_id, record.dispatch_id).id == record.id
+    end
+
+    test "the same dispatch_id twice finds the first row instead of writing a second",
+         %{runner: runner} do
+      payload = build(:runner_dispatch)
+      {:ok, dispatch} = RunnerContract.cast_dispatch(payload)
+
+      assert {:ok, first} = DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch)
+      assert {:ok, again} = DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch)
+      assert again.id == first.id
+
+      assert 1 ==
+               AdminRepo.aggregate(
+                 from(r in Loopctl.Runners.DispatchRecord,
+                   where: r.dispatch_id == ^dispatch.dispatch_id
+                 ),
+                 :count
+               )
+    end
+
+    test "refuses a dispatch_id already recorded with a different identity", %{runner: runner} do
+      {_raw, other} = fixture(:runner, %{name: "blockit", tenant_id: runner.tenant_id})
+      record = sent(runner)
+
+      base =
+        build(:runner_dispatch, %{
+          "dispatch_id" => record.dispatch_id,
+          "story_id" => record.story_id
+        })
+
+      # The unchanged identity is accepted, so each refusal below is its one differing field.
+      {:ok, same} = RunnerContract.cast_dispatch(base)
+      assert {:ok, _} = DispatchLedger.record_sent(runner.tenant_id, runner.id, same)
+
+      for {who, attrs} <- [
+            {runner, %{"claim_epoch" => 1}},
+            {runner, %{"kind" => "triage"}},
+            {runner, %{"story_id" => Ecto.UUID.generate()}},
+            {other, %{}}
+          ] do
+        {:ok, dispatch} = RunnerContract.cast_dispatch(Map.merge(base, attrs))
+
+        assert {:error, :dispatch_id_conflict} =
+                 DispatchLedger.record_sent(who.tenant_id, who.id, dispatch)
+      end
+    end
+
+    test "refuses to re-send a dispatch the runner already answered", %{runner: runner} do
+      record = accepted(runner)
+
+      {:ok, dispatch} =
+        RunnerContract.cast_dispatch(
+          build(:runner_dispatch, %{
+            "dispatch_id" => record.dispatch_id,
+            "story_id" => record.story_id
+          })
+        )
+
+      assert {:error, :dispatch_already_replied} =
+               DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch)
+    end
+
+    test "the same dispatch_id in another tenant is a separate row", %{runner: runner} do
+      record = sent(runner)
+      tenant_b = fixture(:tenant)
+      {_raw, runner_b} = fixture(:runner, %{name: "minis", tenant_id: tenant_b.id})
+
+      {:ok, dispatch} =
+        RunnerContract.cast_dispatch(
+          build(:runner_dispatch, %{"dispatch_id" => record.dispatch_id})
+        )
+
+      assert {:ok, record_b} = DispatchLedger.record_sent(tenant_b.id, runner_b.id, dispatch)
+      assert record_b.id != record.id
+      assert DispatchLedger.get_record(tenant_b.id, record.dispatch_id).id == record_b.id
+      assert DispatchLedger.get_record(runner.tenant_id, record.dispatch_id).id == record.id
+    end
+  end
+
+  describe "record_reply/3" do
+    test "accepted moves the row out of sent and writes no audit-chain entry",
+         %{runner: runner} do
+      record = sent(runner)
+
+      audit_count = fn ->
+        AdminRepo.aggregate(from(e in Entry, where: e.tenant_id == ^runner.tenant_id), :count)
+      end
+
+      before = audit_count.()
+      assert before > 0, "the enrollment entry must exist, or this count proves nothing"
+
+      assert {:ok, updated} = reply(runner, record)
+      assert updated.status == "accepted"
+      assert updated.replied_at
+      assert is_nil(updated.reason)
+
+      assert audit_count.() == before
+    end
+
+    test "refused records the reason and detail", %{runner: runner} do
+      record = sent(runner)
+
+      assert {:ok, updated} =
+               reply(runner, record, %{
+                 "decision" => "refused",
+                 "reason" => "other",
+                 "detail" => "disk quota"
+               })
+
+      assert updated.status == "refused"
+      assert updated.reason == "other"
+      assert updated.reason_detail == "disk quota"
+    end
+
+    test "an identical repeat is ok and a different second reply is refused",
+         %{runner: runner} do
+      record = sent(runner)
+      refusal = %{"decision" => "refused", "reason" => "draining"}
+
+      assert {:ok, _} = reply(runner, record, refusal)
+      assert {:ok, again} = reply(runner, record, refusal)
+      assert again.status == "refused"
+
+      assert {:error, :already_replied} = reply(runner, record)
+
+      assert {:error, :already_replied} =
+               reply(runner, record, %{refusal | "reason" => "at_capacity"})
+
+      assert DispatchLedger.get_record(runner.tenant_id, record.dispatch_id).reason == "draining"
+    end
+
+    test "a reply for another runner's dispatch is unknown and changes nothing",
+         %{runner: runner} do
+      {_raw, other} = fixture(:runner, %{name: "blockit", tenant_id: runner.tenant_id})
+      record = sent(other)
+
+      assert {:error, :unknown_dispatch} = reply(runner, record)
+      assert DispatchLedger.get_record(runner.tenant_id, record.dispatch_id).status == "sent"
+    end
+
+    test "a reply for another tenant's dispatch is unknown and changes nothing",
+         %{runner: runner} do
+      tenant_b = fixture(:tenant)
+      {_raw, runner_b} = fixture(:runner, %{name: "minis", tenant_id: tenant_b.id})
+      record_b = sent(runner_b)
+
+      assert {:error, :unknown_dispatch} = reply(runner, record_b)
+      assert DispatchLedger.get_record(tenant_b.id, record_b.dispatch_id).status == "sent"
+    end
+
+    test "a reply for a dispatch that was never sent is unknown", %{runner: runner} do
+      record = %{dispatch_id: Ecto.UUID.generate(), claim_epoch: 0}
+      assert {:error, :unknown_dispatch} = reply(runner, record)
+    end
+
+    test "a reply at another claim_epoch is stale and changes nothing", %{runner: runner} do
+      record = sent(runner, %{"claim_epoch" => 2})
+
+      assert {:error, :stale_claim_epoch} = reply(runner, record, %{"claim_epoch" => 1})
+      assert {:error, :stale_claim_epoch} = reply(runner, record, %{"claim_epoch" => 3})
+      assert DispatchLedger.get_record(runner.tenant_id, record.dispatch_id).status == "sent"
+    end
+  end
+
+  describe "record_trace/3" do
+    setup %{runner: runner} do
+      %{record: accepted(runner), run_id: Ecto.UUID.generate()}
+    end
+
+    test "stores a batch and acks its last seq", %{runner: runner, record: record, run_id: run_id} do
+      assert {:ok, 2} = trace(runner, record, run_id, [0, 1, 2])
+      assert stored_seqs(runner.tenant_id, run_id) == [0, 1, 2]
+
+      [event | _] =
+        AdminRepo.all(from e in TraceEvent, where: e.run_id == ^run_id, order_by: e.seq)
+
+      assert event.tenant_id == runner.tenant_id
+      assert event.runner_dispatch_id == record.id
+      assert event.event_id == "evt-0"
+      assert is_nil(event.parent)
+      assert event.data == %{"tool" => "Read"}
+    end
+
+    test "a batch sent twice is stored once", %{runner: runner, record: record, run_id: run_id} do
+      assert {:ok, 1} = trace(runner, record, run_id, [0, 1])
+      assert {:ok, 1} = trace(runner, record, run_id, [0, 1])
+      assert stored_seqs(runner.tenant_id, run_id) == [0, 1]
+    end
+
+    test "a re-sent seq with different content keeps the first copy",
+         %{runner: runner, record: record, run_id: run_id} do
+      assert {:ok, 0} = trace(runner, record, run_id, [0])
+
+      resent =
+        build(:runner_trace_batch, %{
+          :seqs => [0],
+          "run_id" => run_id,
+          "dispatch_id" => record.dispatch_id,
+          "claim_epoch" => record.claim_epoch
+        })
+        |> put_in(["events", Access.at(0), "data"], %{"tool" => "Write"})
+
+      {:ok, batch} = RunnerContract.cast_trace_batch(resent)
+      assert {:ok, 0} = DispatchLedger.record_trace(runner.tenant_id, runner.id, batch)
+
+      assert [%TraceEvent{data: %{"tool" => "Read"}}] =
+               AdminRepo.all(from e in TraceEvent, where: e.run_id == ^run_id)
+    end
+
+    test "the ack is the end of the contiguous seqs from 0, and moves when the gap fills",
+         %{runner: runner, record: record, run_id: run_id} do
+      assert {:ok, 1} = trace(runner, record, run_id, [0, 1, 3])
+      assert DispatchLedger.trace_cursor(runner.tenant_id, runner.id, run_id) == 1
+
+      assert {:ok, 3} = trace(runner, record, run_id, [2])
+      assert DispatchLedger.trace_cursor(runner.tenant_id, runner.id, run_id) == 3
+
+      assert {:ok, 3} = trace(runner, record, run_id, [5, 6])
+      assert {:ok, 6} = trace(runner, record, run_id, [4])
+    end
+
+    test "nothing is acked while seq 0 is missing", %{
+      runner: runner,
+      record: record,
+      run_id: run_id
+    } do
+      assert {:ok, -1} = trace(runner, record, run_id, [1, 2])
+      assert {:ok, 2} = trace(runner, record, run_id, [0])
+    end
+
+    test "a batch for a run of an unknown dispatch is refused", %{runner: runner, run_id: run_id} do
+      unknown = %{dispatch_id: Ecto.UUID.generate(), claim_epoch: 0}
+      assert {:error, :unknown_dispatch} = trace(runner, unknown, run_id, [0])
+      assert stored_seqs(runner.tenant_id, run_id) == []
+    end
+
+    test "a batch at another claim_epoch is refused", %{
+      runner: runner,
+      record: record,
+      run_id: run_id
+    } do
+      assert {:error, :stale_claim_epoch} =
+               trace(runner, record, run_id, [0], %{"claim_epoch" => record.claim_epoch + 1})
+
+      assert stored_seqs(runner.tenant_id, run_id) == []
+    end
+
+    test "a batch for a dispatch not accepted is refused", %{runner: runner, run_id: run_id} do
+      pending = sent(runner)
+      assert {:error, :dispatch_not_accepted} = trace(runner, pending, run_id, [0])
+
+      refused = sent(runner)
+      {:ok, _} = reply(runner, refused, %{"decision" => "refused", "reason" => "draining"})
+      assert {:error, :dispatch_not_accepted} = trace(runner, refused, run_id, [0])
+      assert stored_seqs(runner.tenant_id, run_id) == []
+    end
+
+    test "a batch for another runner's dispatch is refused", %{runner: runner, run_id: run_id} do
+      {_raw, other} = fixture(:runner, %{name: "blockit", tenant_id: runner.tenant_id})
+      theirs = accepted(other)
+
+      assert {:error, :unknown_dispatch} = trace(runner, theirs, run_id, [0])
+      assert stored_seqs(runner.tenant_id, run_id) == []
+    end
+
+    test "the first batch binds the run; another run for the dispatch, or the run for another dispatch, is refused",
+         %{runner: runner, record: record, run_id: run_id} do
+      assert {:ok, 0} = trace(runner, record, run_id, [0])
+      assert DispatchLedger.get_record(runner.tenant_id, record.dispatch_id).run_id == run_id
+
+      assert {:error, :run_mismatch} = trace(runner, record, Ecto.UUID.generate(), [0])
+
+      second = accepted(runner)
+      assert {:error, :run_mismatch} = trace(runner, second, run_id, [1])
+      assert stored_seqs(runner.tenant_id, run_id) == [0]
+    end
+
+    test "another tenant's trace for the same run_id is isolated", %{
+      runner: runner,
+      record: record,
+      run_id: run_id
+    } do
+      tenant_b = fixture(:tenant)
+      {_raw, runner_b} = fixture(:runner, %{name: "minis", tenant_id: tenant_b.id})
+      record_b = accepted(runner_b)
+
+      assert {:ok, 1} = trace(runner, record, run_id, [0, 1])
+      assert {:ok, 0} = trace(runner_b, record_b, run_id, [0])
+
+      assert stored_seqs(runner.tenant_id, run_id) == [0, 1]
+      assert stored_seqs(tenant_b.id, run_id) == [0]
+      assert DispatchLedger.trace_cursor(tenant_b.id, runner_b.id, run_id) == 0
+      assert DispatchLedger.trace_cursor(tenant_b.id, runner.id, run_id) == -1
+    end
+  end
+
+  describe "trace_cursor/3" do
+    test "is -1 before anything is stored, then the acked seq", %{runner: runner} do
+      record = accepted(runner)
+      run_id = Ecto.UUID.generate()
+
+      assert DispatchLedger.trace_cursor(runner.tenant_id, runner.id, run_id) == -1
+      assert {:ok, 4} = trace(runner, record, run_id, [0, 1, 2, 3, 4])
+      assert DispatchLedger.trace_cursor(runner.tenant_id, runner.id, run_id) == 4
+    end
+
+    test "answers -1 for a run another runner holds", %{runner: runner} do
+      {_raw, other} = fixture(:runner, %{name: "blockit", tenant_id: runner.tenant_id})
+      theirs = accepted(other)
+      run_id = Ecto.UUID.generate()
+      assert {:ok, 0} = trace(other, theirs, run_id, [0])
+
+      assert DispatchLedger.trace_cursor(runner.tenant_id, runner.id, run_id) == -1
+    end
+  end
+end

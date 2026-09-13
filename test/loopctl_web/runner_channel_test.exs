@@ -8,13 +8,21 @@ defmodule LoopctlWeb.RunnerChannelTest do
   use LoopctlWeb.ChannelCase, async: true
 
   alias Loopctl.ApiSpec.RunnerContract
+  alias Loopctl.ApiSpec.RunnerContract.RunnerTraceBatch
+  alias Loopctl.ApiSpec.RunnerContract.RunnerTraceEvent
   alias Loopctl.Auth
   alias Loopctl.Runners
+  alias Loopctl.Runners.DispatchLedger
+  alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Runners.Presence
   alias Loopctl.Tenants
   alias LoopctlWeb.RunnerSocket
 
   setup :verify_on_exit!
+
+  # The dispatch, reply and trace tests below each wait on a database transaction in the
+  # channel process; the 100ms default is too tight for that under a loaded full suite.
+  @reply_timeout 2_000
 
   defp connect_info(token) do
     %{
@@ -217,6 +225,20 @@ defmodule LoopctlWeb.RunnerChannelTest do
 
       refute in_pool?(runner.tenant_id, "mac-mini")
       refute in_pool?(runner.tenant_id, "minis")
+    end
+
+    test "a runner built against contract 1.0.0 still joins the 1.1.0 server" do
+      {raw, runner} = fixture(:runner, %{name: "minis"})
+      {:ok, socket} = connect_runner(raw)
+
+      assert {:ok, %{contract_version: "1.1.0"}, _channel} =
+               subscribe_and_join(
+                 socket,
+                 topic(socket),
+                 join_payload("minis", %{"contract_version" => "1.0.0"})
+               )
+
+      assert eventually(fn -> in_pool?(runner.tenant_id, "minis") end)
     end
 
     test "refuses a contract major version the server does not speak" do
@@ -504,6 +526,50 @@ defmodule LoopctlWeb.RunnerChannelTest do
       assert_push "dispatch", _
     end
 
+    test "is recorded in the ledger as sent, and a re-send of the same id adds no row",
+         %{runner: runner} do
+      payload = build(:runner_dispatch, %{"claim_epoch" => 4})
+
+      assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
+      assert_push "dispatch", _, @reply_timeout
+
+      record = DispatchLedger.get_record(runner.tenant_id, payload["dispatch_id"])
+      assert %DispatchRecord{status: "sent", claim_epoch: 4} = record
+      assert record.runner_id == runner.id
+
+      # The retry of a push the channel may have dropped is sent again, onto the same row.
+      assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
+      assert_push "dispatch", _, @reply_timeout
+      assert DispatchLedger.get_record(runner.tenant_id, payload["dispatch_id"]).id == record.id
+    end
+
+    test "a dispatch_id whose ledger row disagrees is refused before anything is pushed",
+         %{runner: runner} do
+      payload = build(:runner_dispatch)
+      assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
+      assert_push "dispatch", _, @reply_timeout
+
+      assert {:error, :dispatch_id_conflict} =
+               Runners.dispatch(runner.tenant_id, runner.id, %{payload | "claim_epoch" => 1})
+
+      refute_push "dispatch", _
+    end
+
+    test "a dispatch the runner already answered is not pushed again",
+         %{runner: runner, channel: channel} do
+      payload = build(:runner_dispatch)
+      assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
+      assert_push "dispatch", _, @reply_timeout
+
+      ref = push(channel, "dispatch_reply", accept(payload))
+      assert_reply ref, :ok, _, @reply_timeout
+
+      assert {:error, :dispatch_already_replied} =
+               Runners.dispatch(runner.tenant_id, runner.id, payload)
+
+      refute_push "dispatch", _
+    end
+
     test "a malformed payload is refused and nothing is pushed", %{runner: runner} do
       assert {:error, {:invalid, details}} =
                Runners.dispatch(
@@ -549,6 +615,280 @@ defmodule LoopctlWeb.RunnerChannelTest do
 
       assert {:error, :not_authorized} =
                Runners.dispatch(runner.tenant_id, "not-a-uuid", build(:runner_dispatch))
+    end
+  end
+
+  # The minimum intervals are per channel process; a test that sends several messages in a
+  # row resets them rather than sleeping, so the rate-limit tests below are what cover them.
+  defp reset_intervals(channel) do
+    :sys.replace_state(channel.channel_pid, fn socket ->
+      %{socket | assigns: %{socket.assigns | last_reply_at: :never, last_trace_at: :never}}
+    end)
+  end
+
+  defp pin_interval(channel, key) do
+    :sys.replace_state(channel.channel_pid, fn socket ->
+      at = System.monotonic_time(:millisecond) + 60_000
+      %{socket | assigns: Map.put(socket.assigns, key, at)}
+    end)
+  end
+
+  defp accept(dispatch, attrs \\ %{}) do
+    Map.merge(
+      %{
+        "dispatch_id" => dispatch["dispatch_id"],
+        "claim_epoch" => dispatch["claim_epoch"],
+        "decision" => "accepted"
+      },
+      attrs
+    )
+  end
+
+  defp status_of(runner, dispatch),
+    do: DispatchLedger.get_record(runner.tenant_id, dispatch["dispatch_id"]).status
+
+  describe "dispatch_reply" do
+    setup do
+      {raw, runner} = fixture(:runner, %{name: "minis"})
+      {:ok, socket} = connect_runner(raw)
+      {_reply, channel} = join_pool(socket, "minis")
+      dispatch = build(:runner_dispatch, %{"claim_epoch" => 2})
+      :ok = Runners.dispatch(runner.tenant_id, runner.id, dispatch)
+      assert_push "dispatch", _, @reply_timeout
+      %{runner: runner, channel: channel, dispatch: dispatch}
+    end
+
+    test "accepted is recorded", %{runner: runner, channel: channel, dispatch: dispatch} do
+      ref = push(channel, "dispatch_reply", accept(dispatch))
+      assert_reply ref, :ok, _, @reply_timeout
+      assert status_of(runner, dispatch) == "accepted"
+    end
+
+    test "refused is recorded with its reason",
+         %{runner: runner, channel: channel, dispatch: dispatch} do
+      ref =
+        push(
+          channel,
+          "dispatch_reply",
+          accept(dispatch, %{"decision" => "refused", "reason" => "repo_not_allowed"})
+        )
+
+      assert_reply ref, :ok, _, @reply_timeout
+
+      assert %DispatchRecord{status: "refused", reason: "repo_not_allowed"} =
+               DispatchLedger.get_record(runner.tenant_id, dispatch["dispatch_id"])
+    end
+
+    test "an identical repeat is ok; a conflicting one is already_replied",
+         %{runner: runner, channel: channel, dispatch: dispatch} do
+      ref = push(channel, "dispatch_reply", accept(dispatch))
+      assert_reply ref, :ok, _, @reply_timeout
+
+      reset_intervals(channel)
+      ref = push(channel, "dispatch_reply", accept(dispatch))
+      assert_reply ref, :ok, _, @reply_timeout
+
+      reset_intervals(channel)
+      refusal = accept(dispatch, %{"decision" => "refused", "reason" => "draining"})
+      ref = push(channel, "dispatch_reply", refusal)
+      assert_reply ref, :error, %{reason: "already_replied"}, @reply_timeout
+      assert status_of(runner, dispatch) == "accepted"
+    end
+
+    test "a stale claim_epoch is refused",
+         %{runner: runner, channel: channel, dispatch: dispatch} do
+      ref = push(channel, "dispatch_reply", accept(dispatch, %{"claim_epoch" => 1}))
+      assert_reply ref, :error, %{reason: "stale_claim_epoch"}, @reply_timeout
+      assert status_of(runner, dispatch) == "sent"
+    end
+
+    test "another runner's dispatch is unknown", %{runner: runner, channel: channel} do
+      {raw_b, runner_b} = fixture(:runner, %{name: "blockit", tenant_id: runner.tenant_id})
+      {:ok, socket_b} = connect_runner(raw_b)
+      {_reply, _channel_b} = join_pool(socket_b, "blockit")
+      theirs = build(:runner_dispatch)
+      :ok = Runners.dispatch(runner.tenant_id, runner_b.id, theirs)
+
+      ref = push(channel, "dispatch_reply", accept(theirs))
+      assert_reply ref, :error, %{reason: "unknown_dispatch"}, @reply_timeout
+      assert status_of(runner_b, theirs) == "sent"
+    end
+
+    test "another tenant's dispatch is unknown", %{channel: channel} do
+      tenant_b = fixture(:tenant)
+      {raw_b, runner_b} = fixture(:runner, %{name: "minis", tenant_id: tenant_b.id})
+      {:ok, socket_b} = connect_runner(raw_b)
+      {_reply, _channel_b} = join_pool(socket_b, "minis")
+      theirs = build(:runner_dispatch)
+      :ok = Runners.dispatch(tenant_b.id, runner_b.id, theirs)
+
+      ref = push(channel, "dispatch_reply", accept(theirs))
+      assert_reply ref, :error, %{reason: "unknown_dispatch"}, @reply_timeout
+      assert status_of(runner_b, theirs) == "sent"
+    end
+
+    test "an invalid reply is refused", %{channel: channel, dispatch: dispatch} do
+      ref = push(channel, "dispatch_reply", accept(dispatch, %{"decision" => "refused"}))
+      assert_reply ref, :error, %{reason: "invalid_payload"}, @reply_timeout
+    end
+
+    test "a reply records its time, and a reply inside the minimum interval is refused",
+         %{runner: runner, channel: channel, dispatch: dispatch} do
+      ref = push(channel, "dispatch_reply", accept(dispatch))
+      assert_reply ref, :ok, _, @reply_timeout
+      assert is_integer(:sys.get_state(channel.channel_pid).assigns.last_reply_at)
+
+      # Pinned in the future, so the refusal does not depend on how long the first reply took.
+      pin_interval(channel, :last_reply_at)
+
+      ref =
+        push(
+          channel,
+          "dispatch_reply",
+          accept(dispatch, %{"decision" => "refused", "reason" => "draining"})
+        )
+
+      assert_reply ref, :error, %{reason: "rate_limited", min_interval_ms: ms}, @reply_timeout
+      assert ms > 0
+      assert status_of(runner, dispatch) == "accepted"
+    end
+
+    test "a halted tenant can still record a reply and its trace",
+         %{runner: runner, channel: channel, dispatch: dispatch} do
+      {:ok, _} = Tenants.halt_custody(runner.tenant_id)
+
+      ref = push(channel, "dispatch_reply", accept(dispatch))
+      assert_reply ref, :ok, _, @reply_timeout
+      assert status_of(runner, dispatch) == "accepted"
+
+      batch =
+        build(:runner_trace_batch, %{
+          :seqs => [0],
+          "dispatch_id" => dispatch["dispatch_id"],
+          "claim_epoch" => 2
+        })
+
+      ref = push(channel, "trace", batch)
+      assert_reply ref, :ok, %{acked_seq: 0}, @reply_timeout
+    end
+  end
+
+  describe "trace" do
+    setup do
+      {raw, runner} = fixture(:runner, %{name: "minis"})
+      {:ok, socket} = connect_runner(raw)
+      {_reply, channel} = join_pool(socket, "minis")
+      dispatch = build(:runner_dispatch)
+      :ok = Runners.dispatch(runner.tenant_id, runner.id, dispatch)
+      assert_push "dispatch", _, @reply_timeout
+      ref = push(channel, "dispatch_reply", accept(dispatch))
+      assert_reply ref, :ok, _, @reply_timeout
+      reset_intervals(channel)
+
+      %{runner: runner, channel: channel, dispatch: dispatch, run_id: Ecto.UUID.generate()}
+    end
+
+    defp batch(dispatch, run_id, seqs, attrs \\ %{}) do
+      build(
+        :runner_trace_batch,
+        Map.merge(
+          %{
+            :seqs => seqs,
+            "run_id" => run_id,
+            "dispatch_id" => dispatch["dispatch_id"],
+            "claim_epoch" => dispatch["claim_epoch"]
+          },
+          attrs
+        )
+      )
+    end
+
+    defp send_trace(channel, payload) do
+      reset_intervals(channel)
+      push(channel, "trace", payload)
+    end
+
+    test "stores a batch once, and acks the contiguous seqs",
+         %{channel: channel, dispatch: dispatch, run_id: run_id} do
+      ref = send_trace(channel, batch(dispatch, run_id, [0, 1, 3]))
+      assert_reply ref, :ok, %{acked_seq: 1}, @reply_timeout
+
+      ref = send_trace(channel, batch(dispatch, run_id, [0, 1, 3]))
+      assert_reply ref, :ok, %{acked_seq: 1}, @reply_timeout
+
+      ref = send_trace(channel, batch(dispatch, run_id, [2]))
+      assert_reply ref, :ok, %{acked_seq: 3}, @reply_timeout
+    end
+
+    test "trace_cursor is -1 before anything is stored, then the acked seq",
+         %{channel: channel, dispatch: dispatch, run_id: run_id} do
+      ref = push(channel, "trace_cursor", %{"run_id" => run_id})
+      assert_reply ref, :ok, %{acked_seq: -1}, @reply_timeout
+
+      ref = send_trace(channel, batch(dispatch, run_id, [0, 1, 2]))
+      assert_reply ref, :ok, %{acked_seq: 2}, @reply_timeout
+
+      reset_intervals(channel)
+      ref = push(channel, "trace_cursor", %{"run_id" => run_id})
+      assert_reply ref, :ok, %{acked_seq: 2}, @reply_timeout
+    end
+
+    test "a batch for an unknown dispatch, or at a wrong epoch, is refused",
+         %{channel: channel, dispatch: dispatch, run_id: run_id} do
+      unknown = %{dispatch | "dispatch_id" => Ecto.UUID.generate()}
+      ref = send_trace(channel, batch(unknown, run_id, [0]))
+      assert_reply ref, :error, %{reason: "unknown_dispatch"}, @reply_timeout
+
+      ref = send_trace(channel, batch(dispatch, run_id, [0], %{"claim_epoch" => 7}))
+      assert_reply ref, :error, %{reason: "stale_claim_epoch"}, @reply_timeout
+
+      reset_intervals(channel)
+      ref = push(channel, "trace_cursor", %{"run_id" => run_id})
+      assert_reply ref, :ok, %{acked_seq: -1}, @reply_timeout
+    end
+
+    test "a second run for the dispatch is refused",
+         %{channel: channel, dispatch: dispatch, run_id: run_id} do
+      ref = send_trace(channel, batch(dispatch, run_id, [0]))
+      assert_reply ref, :ok, %{acked_seq: 0}, @reply_timeout
+
+      ref = send_trace(channel, batch(dispatch, Ecto.UUID.generate(), [0]))
+      assert_reply ref, :error, %{reason: "run_mismatch"}, @reply_timeout
+    end
+
+    test "an oversize batch and an oversize event are refused with their limits",
+         %{channel: channel, dispatch: dispatch, run_id: run_id} do
+      max_events = RunnerTraceBatch.max_events()
+      ref = send_trace(channel, batch(dispatch, run_id, Enum.to_list(0..max_events)))
+
+      assert_reply ref,
+                   :error,
+                   %{reason: "batch_too_large", max_events: ^max_events},
+                   @reply_timeout
+
+      max_bytes = RunnerTraceEvent.max_data_bytes()
+      big = %{"k" => String.duplicate("x", max_bytes)}
+      oversize = put_in(batch(dispatch, run_id, [0]), ["events", Access.at(0), "data"], big)
+      ref = send_trace(channel, oversize)
+
+      assert_reply ref,
+                   :error,
+                   %{reason: "event_data_too_large", seq: 0, max_data_bytes: ^max_bytes},
+                   @reply_timeout
+    end
+
+    test "a batch records its time; a batch or cursor inside the minimum interval is refused",
+         %{runner: runner, channel: channel, dispatch: dispatch, run_id: run_id} do
+      ref = send_trace(channel, batch(dispatch, run_id, [0]))
+      assert_reply ref, :ok, %{acked_seq: 0}, @reply_timeout
+      assert is_integer(:sys.get_state(channel.channel_pid).assigns.last_trace_at)
+
+      pin_interval(channel, :last_trace_at)
+      ref = push(channel, "trace", batch(dispatch, run_id, [1]))
+      assert_reply ref, :error, %{reason: "rate_limited", min_interval_ms: _}, @reply_timeout
+      ref = push(channel, "trace_cursor", %{"run_id" => run_id})
+      assert_reply ref, :error, %{reason: "rate_limited"}, @reply_timeout
+      assert DispatchLedger.trace_cursor(runner.tenant_id, runner.id, run_id) == 0
     end
   end
 
