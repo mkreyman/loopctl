@@ -45,6 +45,7 @@ import {
 import { createHandoff } from "./lib/handoff.js";
 import { readPayloadFile } from "./lib/payload-path.js";
 import { enrollRunner, listRunners, revokeRunner, runnerPool } from "./lib/runners.js";
+import { claimLeaseNotice, renewStoryClaim as renewStoryClaimRequest } from "./lib/claim-lease.js";
 
 // Single source of truth for the server version: the package.json this file
 // ships with (npm always includes package.json in the published tarball).
@@ -1135,7 +1136,19 @@ async function claimStory({ story_id }) {
   );
   // The claim response carries the start_cap that POST /start will require.
   rememberCap(story_id, result && result.capability);
-  return toContent(result);
+  return withClaimLeaseNotice(result);
+}
+
+// #803/#810: a claim carries a lease and an epoch. Put both at the top of the result, when
+// the server returns them, so the agent keeps the epoch renew_story_claim needs.
+function withClaimLeaseNotice(result) {
+  const notice = claimLeaseNotice(result);
+  if (!notice) return toContent(result);
+  return { content: [{ type: "text", text: notice }, ...toContent(result).content] };
+}
+
+async function renewStoryClaim(args) {
+  return withClaimLeaseNotice(await renewStoryClaimRequest(args, { apiCall }));
 }
 
 async function startStory({ story_id, capability }) {
@@ -4031,7 +4044,10 @@ const TOOLS = [
     name: "claim_story",
     description:
       "Agent claims a contracted story. Uses pessimistic locking to prevent double-claims. " +
-      "Transitions contracted -> assigned. Uses the AGENT key.",
+      "Transitions contracted -> assigned. Uses the AGENT key. On a loopctl with claim leases " +
+      "the result leads with the claim's claim_epoch and claimed_until: keep the epoch, and " +
+      "renew with renew_story_claim before claimed_until (default lease 24 hours) or the story " +
+      "is released back to pending under you.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4041,6 +4057,32 @@ const TOOLS = [
         },
       },
       required: ["story_id"],
+    },
+  },
+  {
+    name: "renew_story_claim",
+    description:
+      "Renew your claim's lease (POST /api/v1/stories/:id/renew-claim): claimed_until becomes " +
+      "now plus the lease length, measured from NOW. Call it well inside the lease on any story " +
+      "you hold longer than it. Uses the AGENT key, the same key as claim_story. Refusals pass " +
+      "through: 400 claim_epoch missing or not a non-negative integer; 422 not_claimed (the " +
+      "story is not assigned or implementing); 409 stale_claim_epoch (the claim has ENDED: it " +
+      "expired and was reclaimed, released, or claimed again, so stop working it); 409 " +
+      "not_claimant (your key's agent is not the story's assigned agent).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        story_id: {
+          type: "string",
+          description: "The UUID of the story.",
+        },
+        claim_epoch: {
+          type: "integer",
+          minimum: 0,
+          description: "The claim_epoch your claim_story result returned.",
+        },
+      },
+      required: ["story_id", "claim_epoch"],
     },
   },
   {
@@ -8230,6 +8272,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "claim_story":
       return await claimStory(args);
+
+    case "renew_story_claim":
+      return await renewStoryClaim(args);
 
     case "start_story":
       return await startStory(args);

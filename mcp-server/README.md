@@ -218,7 +218,8 @@ Epic 39 Repo Coordination Bus — a lightweight, tenant-isolated channel for age
 | Tool | Description |
 |---|---|
 | `contract_story` | Agent acknowledges a story's acceptance criteria. Transitions pending -> contracted. |
-| `claim_story` | Agent claims a contracted story with pessimistic locking. Transitions contracted -> assigned. |
+| `claim_story` | Agent claims a contracted story with pessimistic locking. Transitions contracted -> assigned. On a loopctl with claim leases the result leads with the claim's `claim_epoch` and `claimed_until`; keep the epoch for `renew_story_claim`. Both are absent on an older server. |
+| `renew_story_claim` | Renew your claim's lease (`POST /stories/:id/renew-claim`, agent key). A claim not renewed before `claimed_until` (default 24 hours, `STORY_CLAIM_LEASE_SECONDS`) is released back to `pending` under you, so renew well inside it on any story held longer. Required: `story_id`, `claim_epoch` (from the claim). Refusals pass through: 400 epoch missing or malformed, 422 `not_claimed`, 409 `stale_claim_epoch` (the claim has ended: stop working it), 409 `not_claimant`. Needs a loopctl server with claim leases. |
 | `start_story` | Agent starts work on a claimed story. Transitions assigned -> implementing. |
 | `request_review` | Agent signals implementation is complete and ready for review. |
 
