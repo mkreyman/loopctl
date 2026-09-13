@@ -495,10 +495,29 @@ defmodule Loopctl.Runners do
         :ok
 
       # The only failure after the slot is committed. Nothing was handed to any channel, so
-      # the slot goes back; a re-send of the same `dispatch_id` takes a fresh one.
+      # the slot goes back; a re-send of the same `dispatch_id` takes a fresh one. The release
+      # can itself be refused (a lock it could not get), which is an outcome to LOG — matching
+      # only `{:ok, _}` here turned an orderly refusal into a MatchError inside the caller.
       {:error, _reason} = error ->
-        {:ok, _} = DispatchLedger.release_undelivered_slot(tenant_id, dispatch.dispatch_id)
+        release_after_failed_broadcast(tenant_id, dispatch.dispatch_id)
         error
+    end
+  end
+
+  defp release_after_failed_broadcast(tenant_id, dispatch_id) do
+    case DispatchLedger.record_drop(tenant_id, dispatch_id) do
+      {:ok, :released} ->
+        :ok
+
+      other ->
+        Logger.warning(
+          "runner dispatch slot not released after a failed broadcast: " <>
+            "tenant_id=#{tenant_id} dispatch_id=#{dispatch_id} outcome=#{inspect(other)}",
+          tenant_id: tenant_id,
+          dispatch_id: dispatch_id
+        )
+
+        :ok
     end
   end
 
@@ -512,10 +531,20 @@ defmodule Loopctl.Runners do
   through `dispatch/3`, which ties each slot to its ledger row.
   """
   @spec reserve_slot(Ecto.UUID.t(), Ecto.UUID.t()) ::
-          {:ok, pos_integer()} | {:error, :runner_at_capacity}
+          {:ok, pos_integer()} | {:error, :runner_at_capacity | :capacity_busy}
   def reserve_slot(tenant_id, runner_id) when is_binary(tenant_id) and is_binary(runner_id) do
-    Repo.with_tenant(tenant_id, fn -> Capacity.reserve(Repo, tenant_id, runner_id) end)
+    Repo.with_tenant(tenant_id, fn ->
+      # Bounded like every other capacity transaction: this one queues behind a heal or a
+      # release holding the same runner row.
+      Capacity.set_lock_timeout!(Repo)
+      Capacity.reserve(Repo, tenant_id, runner_id)
+    end)
     |> flatten()
+  rescue
+    error in Postgrex.Error ->
+      if Capacity.retryable?(error),
+        do: {:error, :capacity_busy},
+        else: reraise(error, __STACKTRACE__)
   end
 
   @doc """
@@ -528,9 +557,14 @@ defmodule Loopctl.Runners do
   session starts. A caller that already owns a transaction — a claim release, a stage
   transition — uses `DispatchLedger.release_slot_in/4` instead, so the release commits with
   the transition that decided it rather than after it.
+
+  `{:error, :capacity_busy}` means a lock this needed was not free within
+  `Capacity.lock_timeout_ms/0`: nothing was released and the call can be made again after
+  `Capacity.busy_retry_ms/0`. The slot stays bounded by the heal sweep meanwhile.
   """
   @spec release_slot(Ecto.UUID.t(), Ecto.UUID.t(), integer()) ::
-          {:ok, :released | :already_released} | {:error, :unknown_dispatch}
+          {:ok, :released | :already_released}
+          | {:error, :unknown_dispatch | :capacity_busy}
   def release_slot(tenant_id, dispatch_id, generation)
       when is_binary(tenant_id) and is_binary(dispatch_id) and is_integer(generation),
       do: DispatchLedger.release_slot(tenant_id, dispatch_id, generation)

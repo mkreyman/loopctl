@@ -19,12 +19,17 @@ defmodule Loopctl.Repo.Migrations.AddRunnerCapacity do
   # release replayed for an earlier slot can never free a later one. The invariant the heal
   # sweep restores is `runners.in_flight = count of this runner's unreleased dispatches`.
   #
-  # `reserved_at` and `wall_clock_seconds` give every unreleased slot an end. A slot whose
-  # dispatch was never pushed under this reservation (`pushed_at` NULL or older than
-  # `reserved_at`) is presumed undelivered after a short bound; one that was pushed or
-  # accepted ends with the runner's wall clock plus a grace, because the runner stops a
-  # session there whether or not anything reported it. The CHECK makes an unbounded
-  # reservation unrepresentable.
+  # `delivery` is the ONE decision about a reservation's fate, and both processes a broadcast
+  # wakes race for it under the row lock: the channel that pushes sets `pushed`, a channel
+  # that drops sets `dropped` and releases the slot, and whichever commits second respects
+  # what it finds. Without it the two ran as independent transactions in either order, and a
+  # dropping channel could free the slot of a session the pushing one then started.
+  #
+  # `reserved_at`, `delivery` and `wall_clock_seconds` give every unreleased slot an end: one
+  # never delivered under this reservation is presumed gone after a short bound; one PUSHED
+  # but never answered goes after a reply grace, since a runner answers every dispatch it
+  # took; and an accepted one ends with the runner's own wall clock plus a grace. The CHECK
+  # makes an unbounded reservation unrepresentable.
   #
   # Adding a NOT NULL column with a constant default rewrites no rows (PG 11+). The CHECKs
   # validate by scanning, which is cheap on these tables (a handful of runners, and a ledger
@@ -49,8 +54,13 @@ defmodule Loopctl.Repo.Migrations.AddRunnerCapacity do
       add :released_at, :utc_datetime_usec, null: true
       add :reserved_at, :utc_datetime_usec, null: true
       add :slot_generation, :bigint, null: false, default: 0
+      add :delivery, :text, null: true
       add :wall_clock_seconds, :integer, null: true
     end
+
+    create constraint(:runner_dispatches, :runner_dispatches_delivery,
+             check: "delivery IS NULL OR delivery IN ('pushed', 'dropped')"
+           )
 
     execute "UPDATE runner_dispatches SET released_at = now() WHERE released_at IS NULL"
 
@@ -83,9 +93,11 @@ defmodule Loopctl.Repo.Migrations.AddRunnerCapacity do
     drop constraint(:runner_dispatches, :runner_dispatches_unreleased_bounded)
     drop constraint(:runner_dispatches, :runner_dispatches_wall_clock_positive)
     drop constraint(:runner_dispatches, :runner_dispatches_slot_generation_nonneg)
+    drop constraint(:runner_dispatches, :runner_dispatches_delivery)
 
     alter table(:runner_dispatches) do
       remove :wall_clock_seconds
+      remove :delivery
       remove :slot_generation
       remove :reserved_at
       remove :released_at

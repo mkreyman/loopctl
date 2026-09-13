@@ -25,8 +25,13 @@ defmodule Loopctl.Runners.DispatchRecord do
   A dispatch recorded as `sent` holds one of its runner's slots (`Loopctl.Runners.Capacity`)
   until `released_at` is set. `slot_generation` names the slot currently or last held — a
   re-send of an undelivered dispatch takes a new one — and a release applies only to the
-  generation it names. `reserved_at` is when that slot was taken; `wall_clock_seconds` is
-  the dispatch's own wall clock. Together they give every unreleased slot an end.
+  generation it names. `reserved_at` is when that slot was taken.
+
+  `delivery` is the reservation's ONE decision, taken under the row lock by whichever of the
+  two processes a broadcast wakes gets there first: `"pushed"` (the dispatch went to a
+  socket) or `"dropped"` (a channel refused to push it and gave the slot back). It is reset
+  with every reservation, and `wall_clock_seconds` is refreshed when a push wins, so the
+  bound `Loopctl.Runners.Capacity` applies is always the clock the session is running under.
 
   ## Trust boundary
 
@@ -65,6 +70,7 @@ defmodule Loopctl.Runners.DispatchRecord do
     field :released_at, :utc_datetime_usec
     field :reserved_at, :utc_datetime_usec
     field :slot_generation, :integer, default: 0
+    field :delivery, :string
 
     timestamps()
   end

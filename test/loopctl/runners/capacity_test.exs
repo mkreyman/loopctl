@@ -152,6 +152,57 @@ defmodule Loopctl.Runners.CapacityTest do
 
   defp heal(runner), do: unboxed(fn -> Runners.heal_capacity(runner.tenant_id, runner.id) end)
 
+  # Runs the two halves of a delivery decision so they OVERLAP: the winner holds the row
+  # inside an open transaction, the loser is started against it and blocks on the row lock,
+  # then the winner commits. Returns {winner_result, loser_result}.
+  defp interleave(runner, dispatch, first) do
+    test = self()
+
+    winner =
+      Task.async(fn -> unboxed(fn -> hold_then_decide(runner, dispatch, first, test) end) end)
+
+    assert_receive :holding, 5_000
+    waiting = waiting_locks()
+    loser = Task.async(fn -> decide_delivery(runner, dispatch, other_half(first)) end)
+    await_waiting_locks(waiting + 1)
+    send(winner.pid, :go)
+
+    {:ok, winner_result} = Task.await(winner, 30_000)
+    {winner_result, Task.await(loser, 30_000)}
+  end
+
+  defp hold_then_decide(runner, dispatch, half, test) do
+    Repo.with_tenant(runner.tenant_id, fn ->
+      Repo.one!(
+        from x in DispatchRecord,
+          where: x.tenant_id == ^runner.tenant_id and x.dispatch_id == ^dispatch.dispatch_id,
+          lock: "FOR UPDATE",
+          select: x.id
+      )
+
+      send(test, :holding)
+      assert_receive_in_task(:go)
+      decide_delivery(runner, dispatch, half)
+    end)
+  end
+
+  defp other_half(:push), do: :drop
+  defp other_half(:drop), do: :push
+
+  # Inside a transaction the caller already owns (the winner) the decision is a plain call;
+  # the loser opens its own.
+  defp decide_delivery(runner, dispatch, :push) do
+    if Repo.in_transaction?(),
+      do: {:ok, DispatchLedger.decide_delivery_in(Repo, runner.tenant_id, dispatch, "pushed")},
+      else: unboxed(fn -> DispatchLedger.record_push(runner.tenant_id, dispatch) end)
+  end
+
+  defp decide_delivery(runner, dispatch, :drop) do
+    if Repo.in_transaction?(),
+      do: {:ok, DispatchLedger.decide_delivery_in(Repo, runner.tenant_id, dispatch, "dropped")},
+      else: unboxed(fn -> DispatchLedger.record_drop(runner.tenant_id, dispatch.dispatch_id) end)
+  end
+
   defp record(runner, dispatch_id),
     do: unboxed(fn -> DispatchLedger.get_record(runner.tenant_id, dispatch_id) end)
 
@@ -513,6 +564,38 @@ defmodule Loopctl.Runners.CapacityTest do
       assert {:ok, %DispatchRecord{status: "accepted"}} = reply(runner, d, %{})
     end
 
+    test "a reservation blocked behind the runner row is capacity_busy, not an unbounded wait" do
+      runner = runner(%{max_sessions: 3})
+      test = self()
+
+      blocker =
+        Task.async(fn ->
+          unboxed(fn ->
+            Repo.with_tenant(runner.tenant_id, fn ->
+              Repo.one!(
+                from r in Runner,
+                  where: r.id == ^runner.id,
+                  lock: "FOR UPDATE",
+                  select: r.in_flight
+              )
+
+              send(test, :blocking)
+              assert_receive_in_task(:finish)
+              :done
+            end)
+          end)
+        end)
+
+      assert_receive :blocking, 5_000
+
+      assert unboxed(fn -> Runners.reserve_slot(runner.tenant_id, runner.id) end) ==
+               {:error, :capacity_busy}
+
+      send(blocker.pid, :finish)
+      assert {:ok, :done} = Task.await(blocker, 30_000)
+      assert in_flight(runner) == 0
+    end
+
     test "a release blocked behind a row lock is capacity_busy" do
       runner = runner(%{max_sessions: 3})
       d = dispatch(runner.tenant_id)
@@ -549,78 +632,90 @@ defmodule Loopctl.Runners.CapacityTest do
     end
   end
 
-  describe "release_undelivered_slot/2" do
-    test "releases a reservation nothing was delivered under" do
-      runner = runner(%{max_sessions: 3})
-      d = dispatch(runner.tenant_id)
-      {:ok, _} = send_dispatch(runner, d)
+  describe "the delivery decision" do
+    test "a push and a drop of one broadcast: whichever commits first decides, both ways" do
+      for first <- [:drop, :push] do
+        runner = runner(%{max_sessions: 3})
+        d = dispatch(runner.tenant_id)
+        {:ok, _} = send_dispatch(runner, d)
 
-      assert unboxed(fn ->
-               DispatchLedger.release_undelivered_slot(runner.tenant_id, d.dispatch_id)
-             end) == {:ok, :released}
+        # The loser is started while the winner holds the row, so the two transactions really
+        # do overlap and Postgres orders them.
+        {winner, loser} = interleave(runner, d, first)
 
-      assert in_flight(runner) == 0
+        case first do
+          :drop ->
+            assert winner == {:ok, :released}
+            assert loser == {:ok, {:already, "dropped"}}
+            assert record(runner, d.dispatch_id).delivery == "dropped"
+            assert in_flight(runner) == 0
+
+          :push ->
+            assert winner == {:ok, :pushed}
+            assert loser == {:ok, {:already, "pushed"}}
+            assert record(runner, d.dispatch_id).delivery == "pushed"
+            # The session the push started still holds its slot.
+            assert in_flight(runner) == 1
+            refute record(runner, d.dispatch_id).released_at
+        end
+      end
     end
 
-    test "leaves the slot of a dispatch that WAS pushed under this reservation" do
+    test "a push refreshes the wall clock to the dispatch actually delivered" do
       runner = runner(%{max_sessions: 3})
-      d = dispatch(runner.tenant_id)
+      d = dispatch(runner.tenant_id, %{"wall_clock_seconds" => 600})
       {:ok, _} = send_dispatch(runner, d)
-      force_dispatch(runner, d.dispatch_id, pushed_at: DateTime.utc_now())
 
-      # The drop of a re-send by a second socket must not take the slot of the session the
-      # first push started.
-      assert unboxed(fn ->
-               DispatchLedger.release_undelivered_slot(runner.tenant_id, d.dispatch_id)
-             end) == {:ok, :already_released}
+      longer = %{d | wall_clock_seconds: 3_600}
 
-      assert in_flight(runner) == 1
+      assert unboxed(fn -> DispatchLedger.record_push(runner.tenant_id, longer) end) ==
+               {:ok, :pushed}
+
+      assert record(runner, d.dispatch_id).wall_clock_seconds == 3_600
     end
 
-    test "leaves the slot of a dispatch the runner has replied to" do
+    test "a DROPPED re-send does not move the bound of the session already running" do
       runner = runner(%{max_sessions: 3})
-      d = dispatch(runner.tenant_id)
+      d = dispatch(runner.tenant_id, %{"wall_clock_seconds" => 3_600})
       {:ok, _} = send_dispatch(runner, d)
+      assert unboxed(fn -> DispatchLedger.record_push(runner.tenant_id, d) end) == {:ok, :pushed}
       {:ok, _} = reply(runner, d, %{})
 
-      assert unboxed(fn ->
-               DispatchLedger.release_undelivered_slot(runner.tenant_id, d.dispatch_id)
-             end) == {:ok, :already_released}
+      # A dispatcher deriving the clock from what is left of the lease naturally sends a
+      # SHORTER one; dropped, it must not shrink the running session's bound.
+      shorter = %{d | wall_clock_seconds: 60}
 
+      assert unboxed(fn -> DispatchLedger.record_drop(runner.tenant_id, shorter.dispatch_id) end) ==
+               {:ok, {:already, "pushed"}}
+
+      assert record(runner, d.dispatch_id).wall_clock_seconds == 3_600
       assert in_flight(runner) == 1
     end
 
-    test "another tenant cannot release by id" do
+    test "another tenant cannot decide a dispatch by id" do
       runner = runner(%{max_sessions: 3})
       other = runner(%{max_sessions: 3})
       d = dispatch(runner.tenant_id)
       {:ok, _} = send_dispatch(runner, d)
 
-      assert unboxed(fn ->
-               DispatchLedger.release_undelivered_slot(other.tenant_id, d.dispatch_id)
-             end) == {:error, :unknown_dispatch}
+      assert unboxed(fn -> DispatchLedger.record_drop(other.tenant_id, d.dispatch_id) end) ==
+               {:error, :unknown_dispatch}
 
       assert in_flight(runner) == 1
     end
-  end
 
-  describe "a re-send's wall clock" do
-    test "replaces the stored one, so heal bounds the slot by the clock in flight" do
+    test "a new reservation clears the decision, so the re-send can be delivered" do
       runner = runner(%{max_sessions: 3})
-      short = dispatch(runner.tenant_id, %{"wall_clock_seconds" => 600})
-      {:ok, _} = send_dispatch(runner, short)
-      assert record(runner, short.dispatch_id).wall_clock_seconds == 600
+      d = dispatch(runner.tenant_id)
+      {:ok, _} = send_dispatch(runner, d)
 
-      longer = %{short | wall_clock_seconds: 3_600}
-      {:ok, _} = send_dispatch(runner, longer)
-      assert record(runner, longer.dispatch_id).wall_clock_seconds == 3_600
+      assert unboxed(fn -> DispatchLedger.record_drop(runner.tenant_id, d.dispatch_id) end) ==
+               {:ok, :released}
 
-      # Old enough to have run out under the FIRST clock, not under the one in flight.
-      grace = Capacity.release_grace_seconds()
-      pushed = DateTime.add(DateTime.utc_now(), -(600 + grace + 60))
-      force_dispatch(runner, short.dispatch_id, pushed_at: pushed, reserved_at: pushed)
+      {:ok, reserved} = send_dispatch(runner, d)
+      assert is_nil(reserved.delivery)
 
-      assert heal(runner) == {:ok, %{released: 0, in_flight: 1}}
+      assert unboxed(fn -> DispatchLedger.record_push(runner.tenant_id, d) end) == {:ok, :pushed}
     end
   end
 
@@ -890,14 +985,19 @@ defmodule Loopctl.Runners.CapacityTest do
       assert heal(runner) == {:ok, %{released: 1, in_flight: 0}}
     end
 
-    test "releases a session past its wall clock and grace, and keeps one inside it" do
+    test "releases an accepted session past its wall clock and grace, and keeps one inside it" do
       runner = runner(%{max_sessions: 3})
       expired = dispatch(runner.tenant_id, %{"wall_clock_seconds" => 600})
       live = dispatch(runner.tenant_id, %{"wall_clock_seconds" => 600})
-      {:ok, _} = send_dispatch(runner, expired)
-      {:ok, _} = send_dispatch(runner, live)
-      {:ok, _} = reply(runner, expired, %{})
-      {:ok, _} = reply(runner, live, %{})
+
+      for d <- [expired, live] do
+        {:ok, _} = send_dispatch(runner, d)
+
+        assert unboxed(fn -> DispatchLedger.record_push(runner.tenant_id, d) end) ==
+                 {:ok, :pushed}
+
+        {:ok, _} = reply(runner, d, %{})
+      end
 
       grace = Capacity.release_grace_seconds()
       now = DateTime.utc_now()
@@ -906,38 +1006,47 @@ defmodule Loopctl.Runners.CapacityTest do
         replied_at: DateTime.add(now, -(600 + grace + 60))
       )
 
-      # Reserved long ago but accepted recently: the clock runs from acceptance.
-      force_dispatch(runner, live.dispatch_id,
-        reserved_at: DateTime.add(now, -(600 + grace + 60)),
-        replied_at: DateTime.add(now, -(600 + grace - 60))
-      )
+      force_dispatch(runner, live.dispatch_id, replied_at: DateTime.add(now, -(600 + grace - 60)))
 
       assert heal(runner) == {:ok, %{released: 1, in_flight: 1}}
-
-      assert unboxed(fn -> DispatchLedger.get_record(runner.tenant_id, live.dispatch_id) end).released_at ==
-               nil
+      assert record(runner, live.dispatch_id).released_at == nil
     end
 
-    test "a pushed dispatch never replied to is timed from its push" do
+    test "releases a PUSHED dispatch the runner never answered, on the reply grace" do
       runner = runner(%{max_sessions: 3})
-      d = dispatch(runner.tenant_id, %{"wall_clock_seconds" => 600})
+      # A wall clock far longer than the reply grace: a push that did not land — a stamp whose
+      # commit ack was lost, a channel that died — must not pin the slot for a whole session.
+      d = dispatch(runner.tenant_id, %{"wall_clock_seconds" => 3_600})
       {:ok, _} = send_dispatch(runner, d)
+      assert unboxed(fn -> DispatchLedger.record_push(runner.tenant_id, d) end) == {:ok, :pushed}
 
-      grace = Capacity.release_grace_seconds()
+      reply_grace = Capacity.reply_grace_seconds()
       now = DateTime.utc_now()
-      old = DateTime.add(now, -(600 + grace + 60))
 
-      force_dispatch(runner, d.dispatch_id, reserved_at: old, pushed_at: now)
+      force_dispatch(runner, d.dispatch_id, pushed_at: DateTime.add(now, -(reply_grace - 30)))
       assert heal(runner) == {:ok, %{released: 0, in_flight: 1}}
 
-      force_dispatch(runner, d.dispatch_id, pushed_at: old)
+      force_dispatch(runner, d.dispatch_id, pushed_at: DateTime.add(now, -(reply_grace + 30)))
       assert heal(runner) == {:ok, %{released: 1, in_flight: 0}}
     end
 
-    test "an UNPUSHED reservation is released on the short bound, not the wall clock" do
+    test "a DELIVERED reservation is not released by the undelivered bound, however old" do
       runner = runner(%{max_sessions: 3})
-      # A wall clock far longer than the unpushed bound: a dispatch that never reached a
-      # socket must not hold its slot for the length of a session that never started.
+      d = dispatch(runner.tenant_id, %{"wall_clock_seconds" => 3_600})
+      {:ok, _} = send_dispatch(runner, d)
+      assert unboxed(fn -> DispatchLedger.record_push(runner.tenant_id, d) end) == {:ok, :pushed}
+      {:ok, _} = reply(runner, d, %{})
+
+      # Reserved long ago, pushed and answered: a session is running on this slot, and only
+      # its wall clock ends it.
+      old = DateTime.add(DateTime.utc_now(), -(Capacity.unpushed_grace_seconds() + 600))
+      force_dispatch(runner, d.dispatch_id, reserved_at: old, pushed_at: old)
+
+      assert heal(runner) == {:ok, %{released: 0, in_flight: 1}}
+    end
+
+    test "an UNDELIVERED reservation is released on the short bound, not the wall clock" do
+      runner = runner(%{max_sessions: 3})
       d = dispatch(runner.tenant_id, %{"wall_clock_seconds" => 3_600})
       {:ok, _} = send_dispatch(runner, d)
 
@@ -951,21 +1060,21 @@ defmodule Loopctl.Runners.CapacityTest do
       assert heal(runner) == {:ok, %{released: 1, in_flight: 0}}
     end
 
-    test "a push from an EARLIER reservation does not count as this one's" do
+    test "a decision from an EARLIER reservation does not count as this one's" do
       runner = runner(%{max_sessions: 3})
       d = dispatch(runner.tenant_id, %{"wall_clock_seconds" => 3_600})
       {:ok, _} = send_dispatch(runner, d)
+      assert unboxed(fn -> DispatchLedger.record_push(runner.tenant_id, d) end) == {:ok, :pushed}
+
+      # Released and re-sent: the new slot has never been delivered under, so the short bound
+      # applies to it even though the row was pushed under the previous one.
+      assert release(runner, d.dispatch_id) == {:ok, :released}
+      {:ok, _} = send_dispatch(runner, d)
 
       unpushed = Capacity.unpushed_grace_seconds()
-      now = DateTime.utc_now()
+      old = DateTime.add(DateTime.utc_now(), -(unpushed + 30))
+      force_dispatch(runner, d.dispatch_id, reserved_at: old, pushed_at: old)
 
-      # Pushed under the first reservation, then released and re-sent: the new slot has
-      # never been pushed under, so the short bound applies to it.
-      force_dispatch(runner, d.dispatch_id, pushed_at: DateTime.add(now, -(unpushed + 300)))
-      assert release(runner, d.dispatch_id) == {:ok, :released}
-      assert {:ok, _} = send_dispatch(runner, d)
-
-      force_dispatch(runner, d.dispatch_id, reserved_at: DateTime.add(now, -(unpushed + 30)))
       assert heal(runner) == {:ok, %{released: 1, in_flight: 0}}
     end
 

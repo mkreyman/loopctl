@@ -33,6 +33,15 @@ All notable changes to loopctl are documented here.
   2.93.0 carries both: `runner_enroll` takes `max_sessions`, and `runner_pool` names the
   new fields.
 
+  **A dispatch's delivery is decided once, under the row lock.** Every channel a broadcast
+  wakes competes for one `delivery` decision on the ledger row: the one that pushes sets
+  `pushed`, one that must drop it (a custody halt) sets `dropped` and gives the slot back in
+  the same transaction, and the loser respects what it finds. A channel that simply is not
+  the runner's only live socket takes no decision at all, since another socket may be the one
+  to push. The heal sweep bounds an undelivered reservation after two minutes, a PUSHED one
+  the runner never answered two minutes after the push, and an accepted one at the wall clock
+  of the dispatch that was actually delivered.
+
   **Two changes an operator watching runners will see.** A reply or trace whose database
   write cannot get a lock in five seconds is now answered `rate_limited` with that interval,
   so the runner sends it again — it used to crash the channel, after which the runner rejoined

@@ -61,15 +61,18 @@ defmodule Loopctl.Runners.Capacity do
   - its story is gone, or its `claim_epoch` moved past the dispatch's (the claim ended);
   - its runner is revoked — including by an api-key revoke, whose trigger revokes the runner
     row without passing through `Loopctl.Runners.revoke_runner/3`;
-  - it was never PUSHED under this reservation (`pushed_at` NULL or older than
-    `reserved_at`) and `unpushed_grace_seconds/0` has passed. A dispatch is broadcast to a
-    channel that pushes it within milliseconds or not at all, so an unpushed reservation is
-    an undelivered one — a runner that dropped its socket between the pool read and the
-    broadcast. Bounding it by the wall clock instead held a slot for the length of a session
-    that never started;
+  - it was never DELIVERED under this reservation (`delivery` is not `"pushed"`) and
+    `unpushed_grace_seconds/0` has passed. A dispatch reaches a socket within milliseconds of
+    its broadcast or not at all, so an undelivered reservation is one whose runner dropped
+    its socket between the pool read and the broadcast;
+  - it was PUSHED and never answered: `reply_grace_seconds/0` past the push with `replied_at`
+    still nil. A runner answers every dispatch it validated, so silence past that grace means
+    the push did not land (a stamp whose commit ack was lost, a channel that died between the
+    two) or the runner is gone. Bounded by the wall clock instead, a slot pinned by a push
+    that never happened waited out a whole session;
   - its wall clock has run out: the runner stops a session at `wall_clock_seconds`, so past
-    the later of its acceptance (or push) plus that plus `release_grace_seconds/0`, the
-    session is over whether or not anything said so.
+    its acceptance plus that plus `release_grace_seconds/0` the session is over whether or
+    not anything said so.
 
   Then it recomputes `in_flight` from the unreleased rows. That second step is what returns
   a slot taken with `Loopctl.Runners.reserve_slot/2` and never tied to a dispatch.
@@ -149,6 +152,7 @@ defmodule Loopctl.Runners.Capacity do
   @lock_timeout_ms 5_000
   @release_grace_seconds 300
   @unpushed_grace_seconds 120
+  @reply_grace_seconds 120
 
   # `pg_advisory_xact_lock` takes two int4s. The namespace isolates this lock class from
   # every other advisory lock keyed on a tenant (`Loopctl.Egress` uses 0x4105_0001).
@@ -175,11 +179,27 @@ defmodule Loopctl.Runners.Capacity do
   def release_grace_seconds, do: @release_grace_seconds
 
   @doc """
-  How long a reservation whose dispatch was never pushed under it is presumed still on its
+  How long a reservation whose dispatch was never delivered under it is presumed still on its
   way to a socket.
   """
   @spec unpushed_grace_seconds() :: pos_integer()
   def unpushed_grace_seconds, do: @unpushed_grace_seconds
+
+  @doc """
+  How long a PUSHED dispatch may go unanswered before its slot is presumed free. A runner
+  answers every dispatch it validated, so this bounds a push that never landed.
+  """
+  @spec reply_grace_seconds() :: pos_integer()
+  def reply_grace_seconds, do: @reply_grace_seconds
+
+  @doc """
+  How long a caller told `:capacity_busy` waits before sending the same message again.
+  Longer than `lock_timeout_ms/0` on purpose: retrying at exactly the wait that just ran out
+  puts the caller back in the same queue with no backoff, spending about half its time
+  blocked.
+  """
+  @spec busy_retry_ms() :: pos_integer()
+  def busy_retry_ms, do: 3 * @lock_timeout_ms
 
   @doc "Bounds every lock wait for the rest of the current transaction."
   @spec set_lock_timeout!(Ecto.Repo.t()) :: :ok
@@ -274,11 +294,13 @@ defmodule Loopctl.Runners.Capacity do
           released_at: nil,
           reserved_at: now,
           slot_generation: generation,
+          # A NEW slot has no delivery decision yet, whatever the last one ended as.
+          delivery: nil,
           updated_at: now
         ]
       )
 
-    %{record | released_at: nil, reserved_at: now, slot_generation: generation}
+    %{record | released_at: nil, reserved_at: now, slot_generation: generation, delivery: nil}
   end
 
   @doc """
@@ -326,6 +348,50 @@ defmodule Loopctl.Runners.Capacity do
     {:ok, %{released: released, in_flight: recount(tenant_id, runner_id)}}
   end
 
+  # Never DELIVERED under this reservation, and delivery had time to happen: a dispatch
+  # reaches a socket within milliseconds of its broadcast (`delivery` is the one decision,
+  # taken under the row lock) or not at all.
+  defmacrop undelivered_too_long(dispatch, now) do
+    quote do
+      (is_nil(unquote(dispatch).delivery) or unquote(dispatch).delivery != "pushed") and
+        fragment(
+          "? + make_interval(secs => ?) < ?",
+          unquote(dispatch).reserved_at,
+          type(^unquote(@unpushed_grace_seconds), :integer),
+          type(unquote(now), :utc_datetime_usec)
+        )
+    end
+  end
+
+  # Pushed and never answered. A runner answers every dispatch it validated, so silence past
+  # the grace means the push did not land or the runner is gone.
+  defmacrop unanswered_too_long(dispatch, now) do
+    quote do
+      unquote(dispatch).delivery == "pushed" and is_nil(unquote(dispatch).replied_at) and
+        fragment(
+          "? + make_interval(secs => ?) < ?",
+          coalesce(unquote(dispatch).pushed_at, unquote(dispatch).reserved_at),
+          type(^unquote(@reply_grace_seconds), :integer),
+          type(unquote(now), :utc_datetime_usec)
+        )
+    end
+  end
+
+  # An accepted session ends at the runner's own wall clock, refreshed on the push that
+  # delivered it, so this is always the clock the session is running under.
+  defmacrop wall_clock_over(dispatch, now) do
+    quote do
+      not is_nil(unquote(dispatch).replied_at) and
+        fragment(
+          "? + make_interval(secs => ? + ?) < ?",
+          unquote(dispatch).replied_at,
+          unquote(dispatch).wall_clock_seconds,
+          type(^unquote(@release_grace_seconds), :integer),
+          type(unquote(now), :utc_datetime_usec)
+        )
+    end
+  end
+
   @doc """
   Every unreleased reservation that can no longer be running, fleet-wide, as of `now`. The
   heal scopes it to one runner; `Loopctl.Workers.HealRunnerCapacityWorker` reads it whole to
@@ -357,24 +423,8 @@ defmodule Loopctl.Runners.Capacity do
       # the push this reservation made, else from the reservation itself.
       where:
         d.status in ["refused", "superseded"] or not exists(claim_current) or
-          not exists(runner_active) or
-          (d.status == "sent" and (is_nil(d.pushed_at) or d.pushed_at < d.reserved_at) and
-             fragment(
-               "? + make_interval(secs => ?) < ?",
-               d.reserved_at,
-               type(^@unpushed_grace_seconds, :integer),
-               type(^now, :utc_datetime_usec)
-             )) or
-          fragment(
-            "? + make_interval(secs => ? + ?) < ?",
-            coalesce(
-              d.replied_at,
-              fragment("GREATEST(?, ?)", d.reserved_at, coalesce(d.pushed_at, d.reserved_at))
-            ),
-            d.wall_clock_seconds,
-            type(^@release_grace_seconds, :integer),
-            type(^now, :utc_datetime_usec)
-          ),
+          not exists(runner_active) or undelivered_too_long(d, ^now) or
+          unanswered_too_long(d, ^now) or wall_clock_over(d, ^now),
       select: d.id
   end
 

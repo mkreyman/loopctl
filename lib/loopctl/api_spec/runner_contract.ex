@@ -61,6 +61,13 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   a runner can correct it and resend at once. A message inside its limit is refused with
   `rate_limited` and `min_interval_ms`; send it again after that long.
 
+  One case that rule does not cover: a message the server ACCEPTED but could not write,
+  because a database lock it needed was not free (loopctl #803). It comes back as
+  `rate_limited` with a `min_interval_ms` LONGER than that wait, and it has already spent its
+  trace floor or a `dispatch_reply` bucket token — it reached the database, which is what the
+  floors meter. A runner that keeps re-sending inside the interval it was given can therefore
+  run its reply bucket down while none of the replies is recorded; wait the interval out.
+
   ## Values
 
   Every UUID a runner sends is normalized to lowercase before it is compared or stored, so
