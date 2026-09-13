@@ -524,6 +524,107 @@ defmodule Loopctl.AuditChain.SthEnqueuerTest do
       assert loser in subscribers(topic)
     end
 
+    test "a loser that resumed after the wait stands down when the table later names the peer" do
+      # A slow exchange: the notice arrives, the wait runs out with the table still naming
+      # the loser, it leads again — and only then the table is updated.
+      key = :"sth_conflict_late_#{System.unique_integer([:positive])}"
+      topic = Loopctl.AuditChain.PubSub.firehose_topic()
+      loser = start_singleton(key, :sth_conflict_late)
+      assert :sys.get_state(loser).role == :leader
+
+      send(loser, {:global_name_conflict, key})
+      assert eventually(fn -> :sys.get_state(loser).role == :leader end, 200, 25)
+      assert loser in subscribers(topic)
+
+      survivor = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(survivor, :kill) end)
+      :global.unregister_name(key)
+      :yes = :global.register_name(key, survivor)
+
+      assert eventually(fn -> :sys.get_state(loser).role == :standby end, 200, 25)
+      refute loser in subscribers(topic)
+      assert monitors?(loser, survivor)
+    end
+
+    test "a leader whose name vanished from the table registers again" do
+      key = :"sth_vanished_#{System.unique_integer([:positive])}"
+      leader = start_singleton(key, :sth_vanished)
+      assert :sys.get_state(leader).role == :leader
+
+      :global.unregister_name(key)
+
+      assert eventually(fn -> :global.whereis_name(key) == leader end, 200, 25)
+      assert :sys.get_state(leader).role == :leader
+    end
+
+    test "repeated conflict notices keep one retry timer and, once the holder is known, one monitor" do
+      key = :"sth_conflict_flap_#{System.unique_integer([:positive])}"
+      loser = start_singleton(key, :sth_conflict_flap)
+      assert :sys.get_state(loser).role == :leader
+
+      send(loser, {:global_name_conflict, key})
+      {_ref, first_timer} = :sys.get_state(loser).retry_timer
+
+      for _ <- 1..5, do: send(loser, {:global_name_conflict, key})
+      {_ref, last_timer} = :sys.get_state(loser).retry_timer
+
+      # Every superseded timer was cancelled: only the newest is pending.
+      assert Process.read_timer(first_timer) == false
+      refute first_timer == last_timer
+
+      survivor = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(survivor, :kill) end)
+      :global.unregister_name(key)
+      :yes = :global.register_name(key, survivor)
+
+      assert eventually(fn -> monitors?(loser, survivor) end)
+      # Let any stray retry chain run out before counting.
+      Process.sleep(SthEnqueuer.leadership_retry_ms() * 5)
+      {:monitors, monitors} = Process.info(loser, :monitors)
+      assert Enum.count(monitors, &(&1 == {:process, survivor})) == 1
+    end
+
+    test "retry messages from superseded timers do not shorten a conflict loser's wait" do
+      key = :"sth_conflict_stale_msgs_#{System.unique_integer([:positive])}"
+      loser = start_singleton(key, :sth_conflict_stale_msgs)
+      assert :sys.get_state(loser).role == :leader
+
+      send(loser, {:global_name_conflict, key})
+      # Timers an earlier notice would have set, already fired into the mailbox.
+      for _ <- 1..40, do: send(loser, {:retry_leadership, make_ref()})
+
+      state = :sys.get_state(loser)
+      assert state.role == :standby
+      assert state.conflict_retries == 0
+    end
+
+    test "a standby whose holder lost the name while staying alive moves its one monitor to the new holder" do
+      key = :"sth_holder_moved_#{System.unique_integer([:positive])}"
+      first = spawn(fn -> Process.sleep(:infinity) end)
+      second = spawn(fn -> Process.sleep(:infinity) end)
+
+      on_exit(fn ->
+        Process.exit(first, :kill)
+        Process.exit(second, :kill)
+      end)
+
+      :yes = :global.register_name(key, first)
+      standby = start_singleton(key, :sth_holder_moved)
+      assert :sys.get_state(standby).role == :standby
+      assert monitors?(standby, first)
+
+      :global.unregister_name(key)
+      :yes = :global.register_name(key, second)
+
+      assert eventually(fn -> monitors?(standby, second) end, 200, 25)
+      refute monitors?(standby, first)
+      assert :sys.get_state(standby).leader_pid == second
+
+      # And the new holder's death is what it now fails over on.
+      Process.exit(second, :kill)
+      assert eventually(fn -> :global.whereis_name(key) == standby end, 200, 25)
+    end
+
     @tag timeout: 60_000
     test "two nodes that each boot as leader and then connect end with exactly one leader" do
       # Two real BEAM nodes (:peer), each running a subscribed singleton under the same key,

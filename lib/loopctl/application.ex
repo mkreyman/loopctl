@@ -263,8 +263,14 @@ defmodule Loopctl.Application do
     # running un-clustered (node-local PubSub) so a machine-count bump can't silently
     # run un-clustered. WARN + runbook, NEVER a crash — a single node always boots.
     # Prod only, rescue-wrapped, mirroring DbCapacity.warn_if_over_budget/0.
-    if Application.get_env(:loopctl, :env) == :prod,
-      do: Loopctl.ClusterReadiness.warn_if_expected_peers_missing()
+    # Off the boot path: it may make a (bounded) DNS lookup, and a boot check must not wait
+    # on a resolver.
+    if Application.get_env(:loopctl, :env) == :prod do
+      Task.Supervisor.start_child(
+        Loopctl.TaskSupervisor,
+        &Loopctl.ClusterReadiness.warn_if_expected_peers_missing/0
+      )
+    end
 
     :ok
   end

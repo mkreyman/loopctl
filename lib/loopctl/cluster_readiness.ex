@@ -61,7 +61,7 @@ defmodule Loopctl.ClusterReadiness do
       query currently lists is connected. There `EXPECTED_APP_NODES` is the machine count
       that CAN run (the DB connection budget needs that), not the count that is running.
       The switch alone never decides it: the query is resolved the way DNSCluster resolves
-      it (`running_peers/2`), and if it lists a machine other than this one that is not
+      it (`unconnected_running_peers/3`), and if it lists a machine other than this one that is not
       connected — both machines running, clustering broken — the status is
       `:expected_peers_missing` with its WARN, switch or not. A lookup that fails is not
       evidence either, and alarms. A deployment that always runs every machine leaves the
@@ -133,7 +133,11 @@ defmodule Loopctl.ClusterReadiness do
 
   Resolves the live inputs (`expected_app_nodes/0`, `Node.list/0`, the DNS-query
   config, `peers_may_suspend?/0`, and — only when it can change the answer — the DNS
-  evidence of `running_peers/2`) and delegates to the pure `readiness/5`.
+  evidence of `unconnected_running_peers/3`) and delegates to the pure `readiness/5`.
+
+  The lookup is bounded (`Loopctl.ClusterReadiness.InetResolver`: A and AAAA, 500 ms each),
+  because this runs in the 10 s telemetry poller alongside the Oban gauges and in the boot
+  check, and a dead resolver must cost at most about a second there.
   """
   @spec readiness() :: %{
           dns_cluster_query_configured: boolean(),
@@ -157,28 +161,40 @@ defmodule Loopctl.ClusterReadiness do
 
   # The DNS lookup is made only where it decides between suspended and missing.
   defp evidence(expected, peers, true, true) when length(peers) < expected - 1,
-    do: running_peers(Application.get_env(:loopctl, :dns_cluster_query), node())
+    do:
+      unconnected_running_peers(Application.get_env(:loopctl, :dns_cluster_query), node(), peers)
 
   defp evidence(_expected, _peers, _dns?, _may_suspend?), do: :unknown
 
   @doc """
-  How many machines OTHER than this node the clustering DNS query lists right now, resolved
-  the way DNSCluster resolves it, or `:unknown` when the lookup fails. This node's own
-  address (the host part of its node name) is not counted.
+  How many machines the clustering DNS query lists right now that this node is NOT connected
+  to, or `:unknown` when the lookup fails. Resolved the way DNSCluster resolves it; this
+  node's own address is not counted, and a listed address is connected when it is the host
+  of a node in `peers` (a Fly node is named `<basename>@<6PN address>`). Compared address by
+  address, not by count: with three machines a peer that is still connected but no longer
+  listed must not hide a listed one that never connected.
   """
-  @spec running_peers(String.t() | nil, node()) :: non_neg_integer() | :unknown
-  def running_peers(query, node) when is_binary(query) and query != "" do
-    own = own_address(node)
+  @spec unconnected_running_peers(String.t() | nil, node(), [node()]) ::
+          non_neg_integer() | :unknown
+  def unconnected_running_peers(query, node, peers)
+      when is_binary(query) and query != "" and is_list(peers) do
+    own = address_of(node)
+    connected = peers |> Enum.map(&address_of/1) |> MapSet.new()
 
     case resolver().lookup(query) do
-      {:ok, addresses} -> addresses |> Enum.reject(&(&1 == own)) |> length()
-      {:error, _reason} -> :unknown
+      {:ok, addresses} ->
+        addresses
+        |> Enum.reject(&(&1 == own or MapSet.member?(connected, &1)))
+        |> length()
+
+      {:error, _reason} ->
+        :unknown
     end
   end
 
-  def running_peers(_query, _node), do: :unknown
+  def unconnected_running_peers(_query, _node, _peers), do: :unknown
 
-  defp own_address(node) do
+  defp address_of(node) do
     with [_name, host] <- String.split(Atom.to_string(node), "@", parts: 2),
          {:ok, address} <- :inet.parse_address(String.to_charlist(host)) do
       address
@@ -227,8 +243,8 @@ defmodule Loopctl.ClusterReadiness do
 
   @doc """
   `readiness/3` for a deployment that has declared whether its peers may be suspended, with
-  the DNS evidence `running_peers` (`running_peers/2`: machines other than this one the
-  clustering query lists, or `:unknown`).
+  the DNS evidence `unconnected` (`unconnected_running_peers/3`: machines the clustering
+  query lists that this node is not connected to, or `:unknown`).
   """
   @spec readiness(pos_integer(), [node()], boolean(), boolean(), non_neg_integer() | :unknown) ::
           %{
@@ -242,7 +258,7 @@ defmodule Loopctl.ClusterReadiness do
               | :peers_may_be_suspended
               | :clustering_expected_dns_unconfigured
           }
-  def readiness(expected_nodes, peers, dns_configured?, may_suspend?, running_peers)
+  def readiness(expected_nodes, peers, dns_configured?, may_suspend?, unconnected)
       when is_integer(expected_nodes) and is_list(peers) and is_boolean(dns_configured?) and
              is_boolean(may_suspend?) do
     peer_count = length(peers)
@@ -256,17 +272,17 @@ defmodule Loopctl.ClusterReadiness do
           expected_nodes,
           peer_count,
           dns_configured?,
-          suspension_explains?(may_suspend?, peer_count, running_peers)
+          suspension_explains?(may_suspend?, unconnected)
         )
     }
   end
 
   # Fewer peers than expected is explained by suspension only on a deployment that allows it
   # AND when every machine the DNS query lists is connected. No evidence, no excuse.
-  defp suspension_explains?(true, peer_count, running_peers) when is_integer(running_peers),
-    do: peer_count >= running_peers
+  defp suspension_explains?(true, unconnected) when is_integer(unconnected),
+    do: unconnected == 0
 
-  defp suspension_explains?(_may_suspend?, _peer_count, _running_peers), do: false
+  defp suspension_explains?(_may_suspend?, _unconnected), do: false
 
   # <= 1 expected node => single-node / not required (clustering never applies).
   defp clustering_status(expected_nodes, _peer_count, _dns?, _suspended?)
@@ -294,7 +310,7 @@ defmodule Loopctl.ClusterReadiness do
   end
 
   # Configured. Fewer peers than expected alarms unless suspension explains every missing
-  # one (`suspension_explains?/3`): with `auto_stop_machines` a suspended peer is the normal
+  # one (`suspension_explains?/2`): with `auto_stop_machines` a suspended peer is the normal
   # state, and a standing alarm teaches everyone to ignore the gauge — but a running peer
   # that failed to connect is exactly what the alarm is for.
   defp clustering_status(expected_nodes, peer_count, true, suspended?) do
@@ -353,7 +369,7 @@ defmodule Loopctl.ClusterReadiness do
           non_neg_integer() | :unknown
         ) ::
           :ok
-  def boot_check(node, expected_nodes, peers, dns_configured?, may_suspend?, running_peers) do
+  def boot_check(node, expected_nodes, peers, dns_configured?, may_suspend?, unconnected) do
     warn_if_distribution_unroutable(node, dns_configured?)
 
     warn_if_expected_peers_missing(
@@ -361,7 +377,7 @@ defmodule Loopctl.ClusterReadiness do
       peers,
       dns_configured?,
       may_suspend?,
-      running_peers
+      unconnected
     )
   end
 
@@ -425,7 +441,7 @@ defmodule Loopctl.ClusterReadiness do
 
   @doc """
   `warn_if_expected_peers_missing/3`, for a deployment that has declared whether its peers
-  may be suspended, with the DNS evidence of `running_peers/2`.
+  may be suspended, with the DNS evidence of `unconnected_running_peers/3`.
   """
   @spec warn_if_expected_peers_missing(
           pos_integer(),
@@ -444,7 +460,7 @@ defmodule Loopctl.ClusterReadiness do
       when is_integer(expected_nodes) and is_list(peers) and is_boolean(dns_configured?) and
              is_boolean(may_suspend?) do
     peer_count = length(peers)
-    suspended? = suspension_explains?(may_suspend?, peer_count, running)
+    suspended? = suspension_explains?(may_suspend?, running)
     status = clustering_status(expected_nodes, peer_count, dns_configured?, suspended?)
 
     case status do

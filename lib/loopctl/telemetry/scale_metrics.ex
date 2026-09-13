@@ -1422,10 +1422,11 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   so neither a raise nor an exit/throw can let `telemetry_poller` permanently drop
   this MFA, and a failed cycle increments the poll-failure counter (metric 20,
   `poller="cluster_readiness"`) instead of freezing this gauge silently.
-  `ClusterReadiness.readiness/0` makes no inter-process call today (env reads,
-  `Node.list/0`, pure classification), so only its RAISE path is reachable — the
-  exit/throw half is the uniform guard, not a claim that a readiness process exists
-  to die. On a single node it reads `{status="single_node", count=0}`.
+  `ClusterReadiness.readiness/0` reads env, `Node.list/0` and, only when
+  `CLUSTER_PEERS_MAY_SUSPEND` is on and peers are short, a DNS lookup of `DNS_CLUSTER_QUERY`
+  bounded to about a second (`Loopctl.ClusterReadiness.InetResolver`), so a dead resolver
+  delays this poller's cycle by that much at most. A failed lookup reads as no evidence
+  and alarms; it does not raise. On a single node it reads `{status="single_node", count=0}`.
   """
   @spec poll_cluster_readiness() :: :ok
   def poll_cluster_readiness do

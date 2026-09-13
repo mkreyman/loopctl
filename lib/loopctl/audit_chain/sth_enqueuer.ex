@@ -67,11 +67,24 @@ defmodule Loopctl.AuditChain.SthEnqueuer do
   resolver while exchanging names and applies the result afterwards, in a cast to the name
   server. So for a moment `:global.whereis_name/1` still answers this process. The loser
   therefore never consults the table in the handler: it unsubscribes, drops leadership
-  and schedules `:retry_leadership`. A retry registers only when the name is free, monitors
-  the holder when it is another process, and waits another interval while the table still
-  names this process. If the table still names it after `@max_conflict_retries`
-  intervals, the exchange never completed (the connection dropped mid-exchange), the name
-  is still this process's on every node that can see it, and it leads again.
+  and schedules a retry. A retry registers only when the name is free, monitors the holder
+  when it is another process, and waits another interval while the table still names this
+  process. After `@max_conflict_retries` intervals still naming it, it leads again — on the
+  assumption that the exchange never completed.
+
+  That assumption is not trusted either, because a slow exchange (a throttled shared-CPU
+  boot) can outlast the wait and then update the table. So every singleton re-reads the
+  table every `leadership_check_ms/0` (`{:check_leadership, ref}`), leader and standby alike:
+  a table naming a process other than the one it expects makes it stand down (a leader) or
+  move its monitor there (a standby), and a table naming nobody makes it register. A leader
+  therefore holds the firehose only while `:global` names it, and a standby watches the
+  process `:global` names rather than one that lost the name while staying alive — give or
+  take one check interval, whatever path led there.
+
+  Timers and monitors are held one at a time: a new retry or check cancels the pending one
+  and carries a fresh reference, so a message from a superseded timer is ignored, and a new
+  monitor demonitors the one it replaces. A burst of conflict notices therefore never stacks
+  retry chains or leaks monitors.
 
   ## Mode / test seam — explicit `:name` opt yields a plain LOCAL standalone
 
@@ -150,6 +163,10 @@ defmodule Loopctl.AuditChain.SthEnqueuer do
   # narrow transient window, steady state is monitor-driven.
   @default_leadership_retry_ms 200
 
+  # How often a leader re-reads the name table to confirm `:global` still names it (see
+  # "Two leaders"). One ETS lookup per interval.
+  @default_leadership_check_ms 5_000
+
   # How many retry intervals a conflict loser waits for the name table to stop naming it
   # before concluding the exchange never completed (see "Two leaders").
   @max_conflict_retries 25
@@ -210,6 +227,12 @@ defmodule Loopctl.AuditChain.SthEnqueuer do
     |> Oban.insert()
   end
 
+  @doc "How often (ms) a leader confirms `:global` still names it, read from application config."
+  @spec leadership_check_ms() :: pos_integer()
+  def leadership_check_ms do
+    Application.get_env(:loopctl, :sth_enqueuer_leadership_check_ms, @default_leadership_check_ms)
+  end
+
   @doc """
   Fallback leadership-retry delay (ms), read at runtime from application config.
 
@@ -262,7 +285,10 @@ defmodule Loopctl.AuditChain.SthEnqueuer do
       subscribe?: subscribe?,
       role: :starting,
       leader_ref: nil,
-      conflict_retries: 0
+      leader_pid: nil,
+      conflict_retries: 0,
+      retry_timer: nil,
+      check_timer: nil
     }
 
     # Negotiate leadership in handle_continue to keep init lightweight (cluster
@@ -290,24 +316,40 @@ defmodule Loopctl.AuditChain.SthEnqueuer do
   # standby wins and becomes the new drainer (real failover, AC-38.3.1); the rest
   # re-monitor the new holder.
   @impl true
-  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{leader_ref: ref} = state) do
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, %{leader_ref: ref} = state)
+      when is_reference(ref) do
     Logger.info(
       "SthEnqueuer: observed leader down; attempting cluster-singleton takeover " <>
         "(#{inspect(state.leadership_key)})"
     )
 
-    {:noreply, try_become_leader(%{state | leader_ref: nil})}
+    {:noreply, try_become_leader(%{state | leader_ref: nil, leader_pid: nil})}
   end
 
   # Fallback retry for the narrow race where a standby lost the register but the
   # holder had already vanished (nothing to monitor). Only meaningful while still a
   # standby singleton — otherwise a stale timer is a no-op.
   @impl true
-  def handle_info(:retry_leadership, %{mode: :singleton, role: :standby} = state) do
-    {:noreply, retry_leadership(state)}
+  def handle_info(
+        {:retry_leadership, ref},
+        %{mode: :singleton, role: :standby, retry_timer: {ref, _timer}} = state
+      ) do
+    {:noreply, retry_leadership(%{state | retry_timer: nil})}
   end
 
-  def handle_info(:retry_leadership, state), do: {:noreply, state}
+  # A superseded retry, or one that fires after this process became leader.
+  def handle_info({:retry_leadership, _ref}, state), do: {:noreply, state}
+
+  # A leader confirming `:global` still names it, or a standby confirming it watches the
+  # process `:global` names (see "Two leaders").
+  def handle_info(
+        {:check_leadership, ref},
+        %{mode: :singleton, check_timer: {ref, _timer}} = state
+      ) do
+    {:noreply, check_leadership(%{state | check_timer: nil})}
+  end
+
+  def handle_info({:check_leadership, _ref}, state), do: {:noreply, state}
 
   # `:global` found this name registered on both sides of a (re)connection and kept the
   # other holder (see "Two leaders" in the moduledoc). The name table has NOT been updated
@@ -315,15 +357,19 @@ defmodule Loopctl.AuditChain.SthEnqueuer do
   @impl true
   def handle_info({:global_name_conflict, key}, %{leadership_key: key} = state) do
     if state.role == :leader and state.subscribe?, do: ChainPubSub.unsubscribe_firehose()
-    if state.leader_ref, do: Process.demonitor(state.leader_ref, [:flush])
 
     Logger.info(
       "SthEnqueuer: another node holds cluster-singleton leadership after a (re)connection; " <>
         "standing by (#{inspect(key)})"
     )
 
-    Process.send_after(self(), :retry_leadership, leadership_retry_ms())
-    {:noreply, %{state | role: :standby, leader_ref: nil, conflict_retries: 0}}
+    state =
+      %{state | role: :standby, conflict_retries: 0}
+      |> demonitor_leader()
+      |> cancel_check()
+      |> schedule_retry()
+
+    {:noreply, state}
   end
 
   @impl true
@@ -402,12 +448,104 @@ defmodule Loopctl.AuditChain.SthEnqueuer do
           "SthEnqueuer: acquired cluster-singleton leadership (#{inspect(state.leadership_key)})"
         )
 
-        %{state | role: :leader, leader_ref: nil}
+        lead(state)
 
       :no ->
         become_standby(state)
     end
   end
+
+  # The state of a leader: no monitor, no pending retry, a pending table check.
+  defp lead(state) do
+    %{state | role: :leader, conflict_retries: 0}
+    |> demonitor_leader()
+    |> cancel_retry()
+    |> schedule_check()
+  end
+
+  # A leader's periodic confirmation. Another holder: stand down and monitor it. No holder:
+  # register again. Still this process: check again later.
+  defp check_leadership(%{role: :standby} = state) do
+    case :global.whereis_name(state.leadership_key) do
+      holder when holder == state.leader_pid ->
+        schedule_check(state)
+
+      :undefined ->
+        try_become_leader(state)
+
+      # A conflict this process lost whose table update is still pending: the retry owns it.
+      holder when holder == self() ->
+        schedule_check(state)
+
+      holder ->
+        monitor_leader(state, holder)
+    end
+  end
+
+  defp check_leadership(state) do
+    case :global.whereis_name(state.leadership_key) do
+      holder when holder == self() ->
+        schedule_check(state)
+
+      :undefined ->
+        if state.subscribe?, do: ChainPubSub.unsubscribe_firehose()
+        try_become_leader(%{state | role: :standby})
+
+      holder ->
+        if state.subscribe?, do: ChainPubSub.unsubscribe_firehose()
+
+        Logger.info(
+          "SthEnqueuer: the name table names another holder; standing down " <>
+            "(#{inspect(state.leadership_key)})"
+        )
+
+        monitor_leader(%{state | role: :standby}, holder)
+    end
+  end
+
+  defp schedule_retry(state) do
+    state = cancel_retry(state)
+    ref = make_ref()
+    timer = Process.send_after(self(), {:retry_leadership, ref}, leadership_retry_ms())
+    %{state | retry_timer: {ref, timer}}
+  end
+
+  defp cancel_retry(%{retry_timer: {_ref, timer}} = state) do
+    Process.cancel_timer(timer)
+    %{state | retry_timer: nil}
+  end
+
+  defp cancel_retry(state), do: state
+
+  defp schedule_check(state) do
+    state = cancel_check(state)
+    ref = make_ref()
+    timer = Process.send_after(self(), {:check_leadership, ref}, leadership_check_ms())
+    %{state | check_timer: {ref, timer}}
+  end
+
+  defp cancel_check(%{check_timer: {_ref, timer}} = state) do
+    Process.cancel_timer(timer)
+    %{state | check_timer: nil}
+  end
+
+  defp cancel_check(state), do: state
+
+  # One monitor at a time: the one being replaced is removed, with any DOWN it already sent.
+  # A standby also re-checks the table on the check interval.
+  defp monitor_leader(state, holder) do
+    state = demonitor_leader(state)
+
+    %{state | leader_ref: Process.monitor(holder), leader_pid: holder, conflict_retries: 0}
+    |> schedule_check()
+  end
+
+  defp demonitor_leader(%{leader_ref: ref} = state) when is_reference(ref) do
+    Process.demonitor(ref, [:flush])
+    %{state | leader_ref: nil, leader_pid: nil}
+  end
+
+  defp demonitor_leader(state), do: state
 
   # A standby's retry. Registers only when the name is free; a holder that is another
   # process is monitored; a table that still names THIS process is a conflict whose result
@@ -420,22 +558,21 @@ defmodule Loopctl.AuditChain.SthEnqueuer do
         try_become_leader(%{state | conflict_retries: 0})
 
       holder != self() ->
-        ref = Process.monitor(holder)
-        %{state | role: :standby, leader_ref: ref, conflict_retries: 0}
+        monitor_leader(%{state | role: :standby}, holder)
 
       state.conflict_retries < @max_conflict_retries ->
-        Process.send_after(self(), :retry_leadership, leadership_retry_ms())
-        %{state | conflict_retries: state.conflict_retries + 1}
+        schedule_retry(%{state | conflict_retries: state.conflict_retries + 1})
 
       true ->
         if state.subscribe?, do: ChainPubSub.subscribe_firehose()
 
         Logger.info(
-          "SthEnqueuer: the name is still this process's after a conflict notice; the " <>
-            "exchange did not complete, resuming leadership (#{inspect(state.leadership_key)})"
+          "SthEnqueuer: the name is still this process's after a conflict notice; resuming " <>
+            "leadership, re-checked every #{leadership_check_ms()} ms " <>
+            "(#{inspect(state.leadership_key)})"
         )
 
-        %{state | role: :leader, leader_ref: nil, conflict_retries: 0}
+        lead(state)
     end
   end
 
@@ -445,15 +582,14 @@ defmodule Loopctl.AuditChain.SthEnqueuer do
   defp become_standby(state) do
     case :global.whereis_name(state.leadership_key) do
       :undefined ->
-        Process.send_after(self(), :retry_leadership, leadership_retry_ms())
-        %{state | role: :standby, leader_ref: nil}
+        schedule_retry(demonitor_leader(%{state | role: :standby}))
 
       leader_pid when leader_pid == self() ->
-        %{state | role: :leader, leader_ref: nil}
+        if state.role != :leader and state.subscribe?, do: ChainPubSub.subscribe_firehose()
+        lead(state)
 
       leader_pid ->
-        ref = Process.monitor(leader_pid)
-        %{state | role: :standby, leader_ref: ref}
+        monitor_leader(%{state | role: :standby}, leader_pid)
     end
   end
 end

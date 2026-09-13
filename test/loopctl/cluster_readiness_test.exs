@@ -93,42 +93,74 @@ defmodule Loopctl.ClusterReadinessTest do
     end
   end
 
-  describe "running_peers/2 (the DNS evidence, through the injected resolver)" do
+  describe "unconnected_running_peers/3 (the DNS evidence, through the injected resolver)" do
     setup :verify_on_exit!
 
     @own {64_938, 2, 28_853, 2683, 1761, 12_111, 3777, 2}
-    @other {64_938, 2, 28_853, 2683, 1852, 42_988, 24_983, 2}
+    @b {64_938, 2, 28_853, 2683, 1852, 42_988, 24_983, 2}
+    @c {64_938, 2, 28_853, 2683, 1900, 1, 2, 3}
     @node :"loopctl-01M2@fdaa:2:70b5:a7b:6e1:2f4f:ec1:2"
+    @b_node :"loopctl-01M2@fdaa:2:70b5:a7b:73c:a7ec:6197:2"
+    @c_node :"loopctl-01M2@fdaa:2:70b5:a7b:76c:1:2:3"
 
-    test "counts the machines the query lists other than this node" do
+    test "counts a listed machine this node is not connected to" do
       expect(Loopctl.MockClusterDnsResolver, :lookup, fn "loopctl.internal" ->
-        {:ok, [@own, @other]}
+        {:ok, [@own, @b]}
       end)
 
-      assert ClusterReadiness.running_peers("loopctl.internal", @node) == 1
+      assert ClusterReadiness.unconnected_running_peers("loopctl.internal", @node, []) == 1
+    end
+
+    test "a listed machine that is connected does not count" do
+      expect(Loopctl.MockClusterDnsResolver, :lookup, fn _ -> {:ok, [@own, @b]} end)
+      assert ClusterReadiness.unconnected_running_peers("loopctl.internal", @node, [@b_node]) == 0
     end
 
     test "is 0 when the query lists only this node (the other machine is suspended)" do
       expect(Loopctl.MockClusterDnsResolver, :lookup, fn _ -> {:ok, [@own]} end)
-      assert ClusterReadiness.running_peers("loopctl.internal", @node) == 0
+      assert ClusterReadiness.unconnected_running_peers("loopctl.internal", @node, []) == 0
+    end
+
+    test "three machines: a connected peer no longer listed does not hide a listed one that never connected" do
+      # B was just suspended but is still in Node.list; C runs and never connected. By count
+      # (1 peer vs 1 other listed) this looked explained; by address it is not.
+      expect(Loopctl.MockClusterDnsResolver, :lookup, fn _ -> {:ok, [@own, @c]} end)
+
+      unconnected =
+        ClusterReadiness.unconnected_running_peers("loopctl.internal", @node, [@b_node])
+
+      assert unconnected == 1
+
+      assert %{status: :expected_peers_missing} =
+               ClusterReadiness.readiness(3, [@b_node], true, true, unconnected)
+    end
+
+    test "three machines, both others listed and connected: nothing unconnected" do
+      expect(Loopctl.MockClusterDnsResolver, :lookup, fn _ -> {:ok, [@own, @b, @c]} end)
+
+      assert ClusterReadiness.unconnected_running_peers(
+               "loopctl.internal",
+               @node,
+               [@b_node, @c_node]
+             ) == 0
     end
 
     test "is :unknown when the lookup fails, and when there is no query" do
       expect(Loopctl.MockClusterDnsResolver, :lookup, fn _ -> {:error, :timeout} end)
-      assert ClusterReadiness.running_peers("loopctl.internal", @node) == :unknown
-      assert ClusterReadiness.running_peers(nil, @node) == :unknown
+      assert ClusterReadiness.unconnected_running_peers("loopctl.internal", @node, []) == :unknown
+      assert ClusterReadiness.unconnected_running_peers(nil, @node, []) == :unknown
     end
 
     test "end to end: both machines listed, none connected, switch on — the alarm and its WARN" do
-      expect(Loopctl.MockClusterDnsResolver, :lookup, fn _ -> {:ok, [@own, @other]} end)
-      running = ClusterReadiness.running_peers("loopctl.internal", @node)
+      expect(Loopctl.MockClusterDnsResolver, :lookup, fn _ -> {:ok, [@own, @b]} end)
+      unconnected = ClusterReadiness.unconnected_running_peers("loopctl.internal", @node, [])
 
       assert %{status: :expected_peers_missing} =
-               ClusterReadiness.readiness(2, [], true, true, running)
+               ClusterReadiness.readiness(2, [], true, true, unconnected)
 
       log =
         capture_log(fn ->
-          ClusterReadiness.warn_if_expected_peers_missing(2, [], true, true, running)
+          ClusterReadiness.warn_if_expected_peers_missing(2, [], true, true, unconnected)
         end)
 
       assert log =~ "UN-CLUSTERED"
