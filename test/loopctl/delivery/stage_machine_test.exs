@@ -53,10 +53,10 @@ defmodule Loopctl.Delivery.StageMachineTest do
     refute Enum.any?(sources, &(&1 in [:merged, :deployed, :verified]))
   end
 
-  test "the merge identity is writable at the stage that performs the merge" do
-    # Recording it only at `merged` left the merge with no replay identity.
-    assert :ci in StageMachine.effect_stages(:merge_sha)
-    assert :merged in StageMachine.effect_stages(:merge_sha)
+  test "the merge identity is writable only at merged, where the sha exists" do
+    # A merge commit does not exist until GitHub merges, so a sha written at `ci` would be
+    # one the caller never obtained. Replay safety comes from pr_number + head_sha instead.
+    assert StageMachine.effect_stages(:merge_sha) == [:merged]
   end
 
   test "a refused merge clears the identity it never realised" do
@@ -70,14 +70,18 @@ defmodule Loopctl.Delivery.StageMachineTest do
 
   test "the audit chain takes exactly claim, merge, escalate and the way out of escalation" do
     chained =
-      for {f, t, _e} <- StageMachine.transitions(), StageMachine.chained?(f, t), do: {f, t}
+      for {f, t, e} <- StageMachine.transitions(), StageMachine.chained?(f, t, e), do: {f, t, e}
 
-    assert Enum.all?(chained, fn {f, t} ->
-             t in [:claimed, :merged, :escalated] or f == :escalated
+    assert Enum.all?(chained, fn {f, t, e} ->
+             t in [:claimed, :merged, :escalated] or f == :escalated or e == :merge_refused
            end)
 
-    refute StageMachine.chained?(:implementing, :reviewing)
-    refute StageMachine.chained?(:ci, :implementing)
+    refute StageMachine.chained?(:implementing, :reviewing, :forward)
+    refute StageMachine.chained?(:ci, :implementing, :ci_red)
+
+    # A merge is a chained fact, so retracting it writes a counter-entry.
+    assert StageMachine.chained?(:merged, :implementing, :merge_refused)
+    assert StageMachine.reason_required?(:implementing, :merge_refused)
   end
 
   test "the migration's stage CHECK allows exactly StageMachine.stages/0" do

@@ -7,8 +7,9 @@ defmodule Loopctl.Delivery.StagesLockTest do
   process shares one checked-out connection, which serialises the transactions on its own
   (see `progress/claim_lock_test.exs`). So these tests use `sandbox: false` sessions,
   commit their rows under a `fixture(:committed_tenant)`, run `async: false`, and sweep the
-  committed tenants at module boundaries. Nothing here appends to the audit chain, whose
-  rows would block the tenant delete.
+  committed tenants at module boundaries. Two tests DO append to the audit chain (the
+  per-tenant chain lock is what they prove), and those rows would block the tenant delete —
+  `purge_chain/1` removes them at the end of every test.
   """
 
   use ExUnit.Case, async: false
@@ -70,15 +71,50 @@ defmodule Loopctl.Delivery.StagesLockTest do
   # are this module's own committed test data; the trigger is disabled for the one delete
   # and restored immediately. Safe because ExUnit runs `async: false` modules alone.
   defp purge_chain(tenant_id) do
-    :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+    with_chain_delete_trigger_disabled(fn ->
+      AdminRepo.query!("DELETE FROM audit_chain WHERE tenant_id = $1", [
+        Ecto.UUID.dump!(tenant_id)
+      ])
+    end)
+  end
 
-    AdminRepo.query!("ALTER TABLE audit_chain DISABLE TRIGGER audit_chain_prevent_delete_trigger")
+  # ONE transaction around all three statements: DDL is transactional in Postgres, so a
+  # failing DELETE rolls the DISABLE back with it. Run as three autocommitted statements,
+  # a failure in the middle leaves the audit chain's delete-blocking trigger OFF for the
+  # rest of the run — and permanently, in a database every branch on this box shares.
+  defp with_chain_delete_trigger_disabled(fun) do
+    # `on_exit` runs in its own process (which must check out), the tests run in this one
+    # (which already has).
+    case Sandbox.checkout(AdminRepo, sandbox: false) do
+      :ok -> :ok
+      {:already, :owner} -> :ok
+    end
 
-    AdminRepo.query!("DELETE FROM audit_chain WHERE tenant_id = $1", [
-      Ecto.UUID.dump!(tenant_id)
-    ])
+    {:ok, result} =
+      AdminRepo.transaction(fn ->
+        AdminRepo.query!(
+          "ALTER TABLE audit_chain DISABLE TRIGGER audit_chain_prevent_delete_trigger"
+        )
 
-    AdminRepo.query!("ALTER TABLE audit_chain ENABLE TRIGGER audit_chain_prevent_delete_trigger")
+        result = fun.()
+
+        AdminRepo.query!(
+          "ALTER TABLE audit_chain ENABLE TRIGGER audit_chain_prevent_delete_trigger"
+        )
+
+        result
+      end)
+
+    result
+  end
+
+  defp chain_delete_trigger_enabled? do
+    %{rows: [[tgenabled]]} =
+      AdminRepo.query!(
+        "SELECT tgenabled FROM pg_trigger WHERE tgname = 'audit_chain_prevent_delete_trigger'"
+      )
+
+    tgenabled == "O"
   end
 
   # Each `sandbox: false` task HOLDS a real connection of every repo it checks out for its
@@ -219,6 +255,18 @@ defmodule Loopctl.Delivery.StagesLockTest do
 
     assert {:ok, %StoryStage{stage: :queued}} =
              Stages.advance(tenant.id, story.id, {:triaged, :queued}, claim_epoch: 2)
+  end
+
+  test "the chain's delete-blocking trigger survives a failure while it is disabled" do
+    assert chain_delete_trigger_enabled?()
+
+    assert_raise RuntimeError, "boom", fn ->
+      with_chain_delete_trigger_disabled(fn -> raise "boom" end)
+    end
+
+    # Left off, every later delete of an audit-chain row in this shared database would
+    # silently succeed — including ones no test intended.
+    assert chain_delete_trigger_enabled?()
   end
 
   test "a chained transition waits on the tenant's chain lock", %{tenant: tenant, story: story} do

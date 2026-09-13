@@ -28,9 +28,11 @@ defmodule Loopctl.Delivery.StageMachine do
     (design §4), including the disagreement that escalates by construction
   - `:merge_gate` — ci -> escalated, the merge-precondition gate refusing (design §5:
     a clean result merges with no human, anything else routes to Gate A)
-  - `:merge_refused` — merged -> implementing, when the merge the stage was entered to
-    perform did not happen: a conflict, branch protection, a required check. It clears the
-    recorded `merge_sha` along with the head, because that identity was never realised
+  - `:merge_refused` — merged -> implementing, when the merge did not hold: a conflict, a
+    branch protection rule, a required check. It needs a reason, it clears `merge_sha`
+    along with the head, and it is CHAINED — the entry into `merged` is a custody fact, so
+    retracting it writes a counter-entry rather than leaving the chain saying the story
+    merged at a sha it did not
   - `:budget_exceeded` — any live stage -> failed
   - `:runner_lost` — an in-flight stage -> queued. Taken by the claim reclaimer
     (`Loopctl.Progress.reclaim_expired_claim/3`), never asked for by a runner: a runner
@@ -84,10 +86,13 @@ defmodule Loopctl.Delivery.StageMachine do
                  ] ++ @budget_exceeded ++ @released ++ @human_resolution
 
   # The custody-critical transitions, and the only ones written to the audit chain (design
-  # §11): a claim, a merge, an escalation, and a human acting on one. The chain serialises
+  # §11): a claim, a merge, an escalation, a human acting on one — and the RETRACTION of a
+  # merge, because the chain already carries the merge as a fact and a retraction that is
+  # not chained leaves it saying the story merged when it did not. The chain serialises
   # every writer in the tenant on its head row, so putting every stage change there would
   # serialise every concurrent story on that one row.
   @chained_targets [:claimed, :merged, :escalated]
+  @chained_edges [:merge_refused]
 
   # Side-effect identities, and the stages allowed to write each one. A replayed stage finds
   # the identity its first run wrote; a writer from a stage that does not produce the effect
@@ -98,13 +103,14 @@ defmodule Loopctl.Delivery.StageMachine do
     branch: [:worktree],
     head_sha: [:implementing, :reviewing, :pr_open, :ci],
     pr_number: [:pr_open],
-    # `merge_sha` is writable at `ci` — the stage that PERFORMS the merge — as well as at
-    # `merged`. Recording it only at `merged` made the merge the ONE effect with no replay
-    # identity: the runner would have had to merge first and record after, so a crash in
-    # between left nothing to find and the next attempt merged again. Record it at `ci`
-    # before calling GitHub, then transition; the `story_stage_merged` chain entry then
-    # carries the sha instead of nil.
-    merge_sha: [:ci, :merged],
+    # `merge_sha` is writable ONLY at `merged`, and only AFTER GitHub returns it. It is the
+    # one identity that cannot be written before its effect, because the merge commit does
+    # not exist until the merge happens: a value written at `ci` would be one the caller
+    # never obtained, and it would land verbatim in the `story_stage_merged` chain entry as
+    # if it were the merge. The merge's replay safety comes from `pr_number` + `head_sha`
+    # instead — a resuming runner ASKS GitHub whether that head is already merged and
+    # adopts the answer, rather than merging again and recording a second sha.
+    merge_sha: [:merged],
     release_id: [:deployed]
   }
 
@@ -189,10 +195,12 @@ defmodule Loopctl.Delivery.StageMachine do
 
   @doc """
   True when the transition is custody-critical and is appended to the audit chain: into
-  `claimed`, `merged` or `escalated`, or out of `escalated`.
+  `claimed`, `merged` or `escalated`, out of `escalated`, or the `:merge_refused`
+  retraction of a merge.
   """
-  @spec chained?(stage(), stage()) :: boolean()
-  def chained?(from, to), do: to in @chained_targets or from == :escalated
+  @spec chained?(stage(), stage(), edge()) :: boolean()
+  def chained?(from, to, edge),
+    do: to in @chained_targets or from == :escalated or edge in @chained_edges
 
   @doc "Every side-effect identity column."
   @spec effects() :: [effect()]
@@ -214,9 +222,10 @@ defmodule Loopctl.Delivery.StageMachine do
   def clears(_from, _to, _edge), do: []
 
   @doc """
-  True when the transition requires an `escalation_reason` — entering `escalated`. Enforced
-  by the `story_stages_escalation_reason` CHECK as well.
+  True when the transition requires a reason: entering `escalated` (the
+  `story_stages_escalation_reason` CHECK enforces that half as well), and retracting a
+  merge, whose chained counter-entry must say why the merge did not hold.
   """
-  @spec reason_required?(stage()) :: boolean()
-  def reason_required?(to), do: to == :escalated
+  @spec reason_required?(stage(), edge()) :: boolean()
+  def reason_required?(to, edge), do: to == :escalated or edge == :merge_refused
 end

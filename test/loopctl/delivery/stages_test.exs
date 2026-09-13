@@ -125,7 +125,7 @@ defmodule Loopctl.Delivery.StagesTest do
           assert moved.attempts == expected_attempts, inspect({from, to, edge})
 
           chained = chain_actions(story.tenant_id) != []
-          assert chained == StageMachine.chained?(from, to), inspect({from, to, edge})
+          assert chained == StageMachine.chained?(from, to, edge), inspect({from, to, edge})
         end
       end
     end
@@ -295,7 +295,36 @@ defmodule Loopctl.Delivery.StagesTest do
                  base ++ [reason: "log tail" <> <<0>>]
                )
 
-      assert {:ok, %StoryStage{escalation_reason: "smoke test failed"}} =
+      # The CHECK counts CODEPOINTS (char_length); a grapheme count does not. This family
+      # emoji is ONE grapheme and several codepoints, so at the boundary a grapheme-counting
+      # guard passed a value Postgres then refused as 23514 — losing the escalation.
+      family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"
+      assert String.length(family) == 1
+      family_codepoints = family |> String.to_charlist() |> length()
+
+      assert {:error, :invalid_reason} =
+               Stages.advance(
+                 story.tenant_id,
+                 story.id,
+                 transition,
+                 base ++ [reason: String.duplicate("x", 4000 - 1) <> family]
+               )
+
+      assert {:ok, %StoryStage{stage: :escalated}} =
+               Stages.advance(
+                 story.tenant_id,
+                 story.id,
+                 transition,
+                 base ++ [reason: String.duplicate("x", 4000 - family_codepoints) <> family]
+               )
+
+      # The accepted one above left the row at `escalated`, so the reason is read back.
+      assert String.ends_with?(
+               Stages.get(story.tenant_id, story.id).escalation_reason,
+               family
+             )
+
+      assert {:error, :stale_stage} =
                Stages.advance(
                  story.tenant_id,
                  story.id,
@@ -386,6 +415,32 @@ defmodule Loopctl.Delivery.StagesTest do
 
       assert {:error, :stale_claim_epoch} =
                Stages.record_effect(story.tenant_id, story.id, :head_sha, @sha_a, claim_epoch: 1)
+    end
+
+    test "a text identity is bounded in codepoints, like the CHECK, not in graphemes" do
+      {story, _} = at_stage(:worktree)
+      opts = [claim_epoch: story.claim_epoch]
+      family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"
+      assert String.length(family) == 1
+      codepoints = family |> String.to_charlist() |> length()
+
+      assert {:error, :invalid_effect} =
+               Stages.record_effect(
+                 story.tenant_id,
+                 story.id,
+                 :branch,
+                 String.duplicate("b", 255 - 1) <> family,
+                 opts
+               )
+
+      assert {:ok, %StoryStage{}} =
+               Stages.record_effect(
+                 story.tenant_id,
+                 story.id,
+                 :branch,
+                 String.duplicate("b", 255 - codepoints) <> family,
+                 opts
+               )
     end
 
     test "malformed values are refused before the database" do
@@ -739,11 +794,33 @@ defmodule Loopctl.Delivery.StagesTest do
 
   describe "database contention is retryable, everything else is not" do
     test "the retryable classes" do
-      for code <- ["55P03", "57014", "40P01", "40001", "P0001"] do
+      for code <- ["55P03", "57014", "40P01", "40001"] do
         assert Stages.retryable_error?(%Postgrex.Error{postgres: %{pg_code: code}}), code
       end
 
       assert Stages.retryable_error?(%DBConnection.ConnectionError{reason: :queue_timeout})
+    end
+
+    test "of the chain's own P0001 raises, only the position violation is transient" do
+      assert Stages.retryable_error?(%Postgrex.Error{
+               postgres: %{
+                 pg_code: "P0001",
+                 message: "audit_chain_position_violation: expected position 4, got 3"
+               }
+             })
+
+      # An L6 integrity signal: reported as :busy it would spin retries against a chain
+      # that is broken and will stay broken.
+      refute Stages.retryable_error?(%Postgrex.Error{
+               postgres: %{
+                 pg_code: "P0001",
+                 message: "audit_chain_hash_violation: prev_entry_hash does not match expected"
+               }
+             })
+
+      refute Stages.retryable_error?(%Postgrex.Error{
+               postgres: %{pg_code: "P0001", message: "cannot_modify_audit_chain"}
+             })
     end
 
     test "a fault in the transition is not retryable and must not be swallowed" do
@@ -824,17 +901,23 @@ defmodule Loopctl.Delivery.StagesTest do
   end
 
   describe "the merge identity" do
-    test "is recorded at ci, survives a replay, and reaches the chain entry" do
+    test "is recorded only at merged, after the merge, and a replay reuses it" do
       {story, _} = at_stage(:ci)
       opts = [claim_epoch: story.claim_epoch, actor_lineage: []]
       merge_sha = String.duplicate("9", 40)
 
-      # Written BEFORE the merge is performed, at the stage performing it.
+      # The sha does not exist before the merge, so `ci` cannot record one.
+      assert {:error, :wrong_stage} =
+               Stages.record_effect(story.tenant_id, story.id, :merge_sha, merge_sha, opts)
+
+      {:ok, _} = Stages.advance(story.tenant_id, story.id, {:ci, :merged}, opts)
+
       assert {:ok, %StoryStage{merge_sha: ^merge_sha}} =
                Stages.record_effect(story.tenant_id, story.id, :merge_sha, merge_sha, opts)
 
-      # The crash-and-replay: the runner comes back, finds its own sha, and does not merge
-      # a second time.
+      # The resuming runner asks GitHub whether its head is merged, gets the same sha back
+      # and records it again: idempotent, while a DIFFERENT sha is a conflict rather than a
+      # second merge quietly overwriting the first.
       assert {:ok, %StoryStage{merge_sha: ^merge_sha}} =
                Stages.record_effect(story.tenant_id, story.id, :merge_sha, merge_sha, opts)
 
@@ -846,21 +929,23 @@ defmodule Loopctl.Delivery.StagesTest do
                  String.duplicate("8", 40),
                  opts
                )
-
-      {:ok, _} = Stages.advance(story.tenant_id, story.id, {:ci, :merged}, opts)
-
-      assert [%Entry{action: "story_stage_merged", payload: %{"merge_sha" => ^merge_sha}}] =
-               as_tenant(story.tenant_id, fn -> Repo.all(Entry) end)
     end
 
-    test "a refused merge goes back to implementing and clears the identity" do
+    test "a refused merge is chained as a retraction, with its reason" do
       merge_sha = String.duplicate("7", 40)
       {story, row} = at_stage(:merged, merge_sha: merge_sha, head_sha: @sha_a, pr_number: 4)
+      retraction = {:merged, :implementing, :merge_refused}
+      base = [claim_epoch: story.claim_epoch, actor_lineage: []]
+
+      assert {:error, :reason_required} =
+               Stages.advance(story.tenant_id, story.id, retraction, base)
 
       assert {:ok, %StoryStage{stage: :implementing} = back} =
-               Stages.advance(story.tenant_id, story.id, {:merged, :implementing, :merge_refused},
-                 claim_epoch: story.claim_epoch,
-                 reason: "required check missing"
+               Stages.advance(
+                 story.tenant_id,
+                 story.id,
+                 retraction,
+                 base ++ [reason: "required check missing"]
                )
 
       assert {back.merge_sha, back.head_sha} == {nil, nil}
@@ -868,7 +953,16 @@ defmodule Loopctl.Delivery.StagesTest do
       assert back.attempts == %{"merge_refused" => 1}
       assert back.lock_version == row.lock_version + 1
 
-      # And the identity can be recorded again for the next attempt.
+      # The chain carried the merge as a fact; the retraction says it did not hold, and
+      # why. Unchained, the chain would say the story merged at that sha forever.
+      assert chain_actions(story.tenant_id) == ["story_stage_merge_retracted"]
+
+      assert [%Entry{payload: payload}] = as_tenant(story.tenant_id, fn -> Repo.all(Entry) end)
+      assert payload["reason"] == "required check missing"
+      # Which merge it retracts — the row's own merge_sha is nil by now, cleared by the edge.
+      assert payload["retracted"] == %{"merge_sha" => merge_sha, "head_sha" => @sha_a}
+
+      # And the next attempt can record its own head again.
       {:ok, _} =
         Stages.record_effect(story.tenant_id, story.id, :head_sha, @sha_b,
           claim_epoch: story.claim_epoch
