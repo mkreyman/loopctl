@@ -197,7 +197,8 @@
     "reviewer_pr820_096": "Mozilla/5.0 (Windows NT 6.1; WOW64; Trident/7.0; SLCC2; .NET CLR 2.0.50727; .NET CLR 3.5.30729; .NET CLR 3.0.30729; Media Center PC 6.0; .NET4.0C; .NET4.0E; InfoPath.3; Tablet PC 2.0; rv:11.0) like Gecko",
     "reviewer_pr820_097": "Mozilla/5.0 (compatible; MSIE 10.0; Windows NT 6.1; Trident/6.0; MASMJS; Zune 4.7)",
     "reviewer_pr820_098": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36 Config/94.2.3910.11",
-    "reviewer_pr820_099": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15 (Ecosia ios@9.0.0)"
+    "reviewer_pr820_099": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15 (Ecosia ios@9.0.0)",
+    "android_chrome_with_bot_url": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36 +https://www.example.com/bot"
   },
   "non_browser_clients": {
     "googlebot": "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
@@ -208,7 +209,6 @@
     "facebookexternalhit": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
     "discordbot": "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)",
     "skype_url_preview": "Mozilla/5.0 (Windows NT 6.1; WOW64) SkypeUriPreview Preview/0.5 skype-url-preview@microsoft.com",
-    "android_chrome_with_bot_url": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36 +https://www.example.com/bot",
     "crawler_with_email": "Foo/1.0 help@crawler.example.com",
     "claude_user": "Claude-User",
     "perplexity_user": "Perplexity-User",
