@@ -298,7 +298,7 @@
       "type": "object"
     },
     "RunnerStageReport": {
-      "description": "One delivery-stage transition a runner's session made, pushed as the `stage` event (since 1.4.0). It is a REQUEST, never authority: Postgres owns the stage, and the server compare-and-sets `from` -> `to` on the story's row inside one transaction. `from` is on the wire for that reason — a row that has moved refuses the message with `stale_stage` rather than taking a transition from wherever it happens to be. `claim_epoch` is the fence: it must be the dispatch's AND the story's current epoch, so a session whose claim was reclaimed writes nothing. A REPLAY is safe — a message whose first copy committed finds the row already at `to` and is answered `ok` with the row, so a re-send after a lost acknowledgement never transitions twice. Arriving at `done`, `failed` or `escalated` also gives the runner slot back, in the same transaction; the server decides that from the stage, so nothing here can free a slot whose session is still running.",
+      "description": "One delivery-stage transition a runner's session made, pushed as the `stage` event (since 1.4.0). It is a REQUEST, never authority: Postgres owns the stage, and the server compare-and-sets `from` -> `to` on the story's row inside one transaction. `from` is on the wire for that reason — a row that has moved refuses the message with `stale_stage` rather than taking a transition from wherever it happens to be. `claim_epoch` is the fence: it must be the dispatch's AND the story's current epoch, so a session whose claim was reclaimed writes nothing. A REPLAY is safe — a message whose first copy committed finds the row already at `to` and is answered `ok` with the row, so a re-send after a lost acknowledgement never transitions twice. Arriving at a terminal stage also gives the runner slot back, in the same transaction; the server decides that from the stage, so nothing here can free a slot whose session is still running. `escalated` is the only terminal a runner can reach: `verified` and `done` are control's verdicts, not a session's, so a story waits at `deployed`.",
       "properties": {
         "claim_epoch": {
           "description": "The `claim_epoch` of the dispatch, echoed.",
@@ -364,9 +364,7 @@
             "reviewing",
             "pr_open",
             "ci",
-            "merged",
-            "deployed",
-            "verified"
+            "merged"
           ],
           "type": "string"
         },
@@ -385,8 +383,6 @@
             "ci",
             "merged",
             "deployed",
-            "verified",
-            "done",
             "escalated"
           ],
           "type": "string"
@@ -612,7 +608,8 @@
         "invalid_payload",
         "unknown_dispatch",
         "stale_claim_epoch",
-        "already_replied"
+        "already_replied",
+        "internal_error"
       ],
       "join": [
         "rate_limited",
@@ -630,11 +627,14 @@
         "dispatch_not_accepted",
         "stale_claim_epoch",
         "stale_stage",
-        "unknown_story_stage"
+        "unknown_story_stage",
+        "effect_conflict",
+        "internal_error"
       ],
       "status": [
         "rate_limited",
-        "invalid_payload"
+        "invalid_payload",
+        "internal_error"
       ],
       "trace": [
         "rate_limited",
@@ -644,11 +644,13 @@
         "unknown_dispatch",
         "stale_claim_epoch",
         "dispatch_not_accepted",
-        "run_mismatch"
+        "run_mismatch",
+        "internal_error"
       ],
       "trace_cursor": [
         "rate_limited",
-        "invalid_payload"
+        "invalid_payload",
+        "internal_error"
       ],
       "unknown_event": [
         "unknown_event"
@@ -737,16 +739,6 @@
         "edge": "forward",
         "from": "merged",
         "to": "deployed"
-      },
-      {
-        "edge": "forward",
-        "from": "deployed",
-        "to": "verified"
-      },
-      {
-        "edge": "forward",
-        "from": "verified",
-        "to": "done"
       },
       {
         "edge": "ci_red",

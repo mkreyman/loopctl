@@ -65,6 +65,7 @@ defmodule LoopctlWeb.FallbackController do
   alias Ecto.Changeset
   alias Loopctl.ApiSpec.Messages
   alias Loopctl.Custody.ViolationMonitor
+  alias Loopctl.Delivery.StageMachine
   alias Loopctl.Llm.Remediation
   alias Loopctl.Runners.Capacity
   alias LoopctlWeb.DBError
@@ -274,9 +275,10 @@ defmodule LoopctlWeb.FallbackController do
         status: 409,
         code: "stale_stage",
         message:
-          "This story's delivery stage is not the one this call assumed, so nothing was " <>
-            "written. Your claim is still good: re-read the story's stage and send the " <>
-            "transition that applies to where it actually is."
+          "This story's delivery stage moved while this call was being made, twice, so " <>
+            "nothing was written. Your claim is still good — only your picture of the " <>
+            "stage is out of date, which usually means your own runner is advancing the " <>
+            "story at the same time. Re-read the story's stage and make the call again."
       }
     })
   end
@@ -938,7 +940,8 @@ defmodule LoopctlWeb.FallbackController do
     reason_required: "A reason is required for this transition.",
     invalid_reason:
       "The reason is empty, too long, or contains a character the database cannot store. " <>
-        "The bound is 4000 codepoints, which is what Postgres counts, not graphemes.",
+        "The bound is #{StageMachine.max_reason_length()} codepoints, which is what " <>
+        "Postgres counts, not graphemes.",
     invalid_event_data:
       "The structured payload is not a JSON object, is over 8000 bytes once encoded, or " <>
         "contains a NUL.",

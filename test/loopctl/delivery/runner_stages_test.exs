@@ -203,6 +203,63 @@ defmodule Loopctl.Delivery.RunnerStagesTest do
       assert length(transition_events(story.tenant_id, story.id)) == 1
     end
 
+    test "a replay naming a DIFFERENT identity is refused, not answered ok" do
+      # #824 round 2, finding 2. The merge is the case that forces it: `ci -> merged` with
+      # merge_sha A commits, the ack is lost, the runner retries and its retry names merge
+      # commit B. Answered `ok`, the row and the `story_stage_merged` chain entry keep A, B
+      # is dropped silently, and the CHAIN NAMES A MERGE THAT IS NOT THE BRANCH'S.
+      %{story: story, runner: runner, record: record} = session(:ci)
+      sha_a = String.duplicate("a", 40)
+      sha_b = String.duplicate("b", 40)
+
+      first =
+        message(record, %{from: :ci, to: :merged, effects: %{merge_sha: sha_a}})
+
+      assert {:ok, row} = RunnerStages.apply(story.tenant_id, runner.id, first)
+      assert row.merge_sha == sha_a
+
+      # The SAME value again is the real replay and is still fine.
+      assert {:ok, same} = RunnerStages.apply(story.tenant_id, runner.id, first)
+      assert same.merge_sha == sha_a
+
+      # A different one is not a replay at all.
+      assert {:error, :effect_conflict} =
+               RunnerStages.apply(
+                 story.tenant_id,
+                 runner.id,
+                 message(record, %{from: :ci, to: :merged, effects: %{merge_sha: sha_b}})
+               )
+
+      assert Stages.get(story.tenant_id, story.id).merge_sha == sha_a
+    end
+
+    test "a replay supplying an identity the row does not hold is refused" do
+      # The row is at the destination WITHOUT that identity, so this is a different message
+      # that happens to share a stage. Accepting it would attach an effect after the chain
+      # entry that should have named it.
+      %{story: story, runner: runner, record: record} = session(:implementing)
+
+      assert {:ok, _} =
+               RunnerStages.apply(
+                 story.tenant_id,
+                 runner.id,
+                 message(record, %{from: :implementing, to: :reviewing})
+               )
+
+      assert {:error, :effect_conflict} =
+               RunnerStages.apply(
+                 story.tenant_id,
+                 runner.id,
+                 message(record, %{
+                   from: :implementing,
+                   to: :reviewing,
+                   effects: %{head_sha: String.duplicate("c", 40)}
+                 })
+               )
+
+      assert is_nil(Stages.get(story.tenant_id, story.id).head_sha)
+    end
+
     test "a zombie whose claim was reclaimed writes nothing on a re-send" do
       %{story: story, runner: runner, record: record} = session(:implementing)
       msg = message(record, %{from: :implementing, to: :reviewing})

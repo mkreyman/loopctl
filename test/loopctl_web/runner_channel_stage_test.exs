@@ -248,6 +248,53 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
       assert Stages.get(runner.tenant_id, story.id).stage == :implementing
     end
 
+    test "the ack echoes the identities the row holds, so a replay can be reconciled", ctx do
+      # #824 round 2, finding 2. Without this a replay whose merge sha was dropped came back
+      # `ok` and the runner had no way to learn the server kept a different one.
+      %{channel: channel, dispatch_id: dispatch_id} = ctx
+      sha = String.duplicate("d", 40)
+
+      ref =
+        push(
+          channel,
+          "stage",
+          stage_message(dispatch_id, %{
+            "from" => "implementing",
+            "to" => "reviewing",
+            "effects" => %{"head_sha" => sha}
+          })
+        )
+
+      assert_reply ref, :ok, reply, @reply_timeout
+      assert reply.effects == %{head_sha: sha}
+
+      # Only what is SET: an absent key means nothing was recorded.
+      refute Map.has_key?(reply.effects, :merge_sha)
+    end
+
+    test "a replay naming a different identity is effect_conflict, not invalid_payload", ctx do
+      # Its own code deliberately: the remedy is to read the recorded value off the ack and
+      # reconcile, never to re-send, which is what `invalid_payload` would tell the runner.
+      %{channel: channel, dispatch_id: dispatch_id, runner: runner, story: story} = ctx
+
+      message = fn sha ->
+        stage_message(dispatch_id, %{
+          "from" => "implementing",
+          "to" => "reviewing",
+          "effects" => %{"head_sha" => sha}
+        })
+      end
+
+      ref = push(channel, "stage", message.(String.duplicate("a", 40)))
+      assert_reply ref, :ok, _, @reply_timeout
+
+      refill_bucket(channel)
+      ref = push(channel, "stage", message.(String.duplicate("b", 40)))
+      assert_reply ref, :error, %{reason: "effect_conflict"}, @reply_timeout
+
+      assert Stages.get(runner.tenant_id, story.id).head_sha == String.duplicate("a", 40)
+    end
+
     test "a replay is answered ok with the row, not stale_stage", ctx do
       %{channel: channel, dispatch_id: dispatch_id} = ctx
       message = stage_message(dispatch_id, %{"from" => "implementing", "to" => "reviewing"})

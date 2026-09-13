@@ -123,6 +123,48 @@ defmodule Loopctl.Delivery.StageMachineTest do
     end
   end
 
+  test "a runner cannot certify its OWN work: no path to verified or done" do
+    # #824 round 2, H1. The edge allowlist alone left `deployed -> verified -> done` on
+    # `:forward`, so a session could drive its own story to terminal SUCCESS with no
+    # control-side verification — while `verification_failed` was held back on the grounds
+    # that the check is control's. A session able to report a check passing but not failing
+    # is worse than one able to report neither: `RunnerStages` and `Escalations` are the only
+    # callers of `advance/4`, so the positive was the only outcome that could ever be written.
+    reportable = StageMachine.runner_transitions()
+
+    refute {:deployed, :verified, :forward} in reportable
+    refute {:verified, :done, :forward} in reportable
+    refute StageMachine.runner_reportable?(:deployed, :verified, :forward)
+    refute StageMachine.runner_reportable?(:verified, :done, :forward)
+
+    # Neither stage is a SOURCE at all, which is what makes the exclusion hold for any edge
+    # added out of them later rather than for these two triples.
+    refute :deployed in StageMachine.runner_source_stages()
+    refute :verified in StageMachine.runner_source_stages()
+
+    # And neither is reachable as a destination that a runner reports INTO.
+    refute :verified in StageMachine.runner_to_stages()
+    refute :done in StageMachine.runner_to_stages()
+
+    # The only terminal a runner can now reach is `escalated`, which STOPS the loop rather
+    # than completing it — the fail-safe direction.
+    terminal_reachable =
+      StageMachine.runner_to_stages() |> Enum.filter(&StageMachine.ends_session?/1)
+
+    assert terminal_reachable == [:escalated]
+
+    # The line is at the deploy, and the deploy itself stays reportable: it names a
+    # `release_id`, and `merged` names a `merge_sha`, both of which control can check.
+    # A story WAITS at `deployed` for control to decide verified-or-escalated.
+    assert {:ci, :merged, :forward} in reportable
+    assert {:merged, :deployed, :forward} in reportable
+    assert :deployed in StageMachine.runner_to_stages()
+
+    # Both of these are real transitions. The test is about who may report them.
+    assert {:deployed, :verified, :forward} in StageMachine.transitions()
+    assert {:verified, :done, :forward} in StageMachine.transitions()
+  end
+
   test "the reportable edge list is an ALLOWLIST, so a new edge is unreportable by default" do
     # The definition the doc, the wire enums and the published table all derive from. Written
     # as a blocklist it admitted three transitions nobody had thought to exclude; as an

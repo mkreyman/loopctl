@@ -77,6 +77,7 @@ defmodule Loopctl.Delivery.RunnerStages do
           | :stale_claim_epoch
           | :stale_stage
           | :unknown_story_stage
+          | :effect_conflict
           | :busy
           | {:invalid, [String.t()]}
 
@@ -155,11 +156,35 @@ defmodule Loopctl.Delivery.RunnerStages do
         {:error, :unknown_story_stage}
 
       %StoryStage{stage: ^to, claim_epoch: ^epoch} = row ->
-        release_on_replay(tenant_id, session, stage)
-        {:ok, row}
+        replayed_effects_agree(row, stage, tenant_id, session)
 
       %StoryStage{} ->
         {:error, :stale_stage}
+    end
+  end
+
+  # The replay is only a replay if it carries the SAME identities the first copy recorded.
+  #
+  # `Stages.record_effect/5` and `advance/4`'s `:effects` both hold the rule "the same value
+  # again is fine, a DIFFERENT value is `:effect_conflict`" — and the replay path went round
+  # both of them, because it answers off a read instead of a write (#824 round 2). The case
+  # that makes it matter is the merge: `ci -> merged` with `merge_sha` A commits, the ack is
+  # lost, the runner retries and its retry names merge commit B. Answered `ok`, the row and
+  # the `story_stage_merged` chain entry keep A, B is dropped silently, and the chain now
+  # NAMES A MERGE THAT IS NOT THE BRANCH'S — the one identity the entry exists to assert.
+  #
+  # A nil recorded value with a value supplied is a conflict too, not a late record: the row
+  # is at the destination without that identity, so this is a different message that happens
+  # to share a stage, and accepting it would let an effect be attached after the chain entry
+  # that should have named it.
+  defp replayed_effects_agree(row, stage, tenant_id, session) do
+    supplied = Map.get(stage, :effects, %{})
+
+    if Enum.all?(supplied, fn {effect, value} -> Map.get(row, effect) == value end) do
+      release_on_replay(tenant_id, session, stage)
+      {:ok, row}
+    else
+      {:error, :effect_conflict}
     end
   end
 
@@ -189,6 +214,12 @@ defmodule Loopctl.Delivery.RunnerStages do
   # not have, a missing or over-long reason, an effect the destination stage does not
   # produce, one already set to something else — is one class to the runner: resending it
   # unchanged cannot help. The atom is carried so the refusal names what was wrong.
+  # `:effect_conflict` is deliberately NOT here. The others say "your message is wrong, fix
+  # it"; that one says "the server already recorded a DIFFERENT identity for this transition",
+  # whose remedy is to read the recorded value and reconcile — never to re-send. Folding it
+  # into `invalid_payload` would tell a runner whose merge sha was dropped that its payload
+  # was malformed. It reaches the wire under its own code, and the ack carries the recorded
+  # identities so the runner can see what it is reconciling against.
   @message_faults [
     :invalid_transition,
     :human_required,
@@ -198,7 +229,6 @@ defmodule Loopctl.Delivery.RunnerStages do
     :missing_required_effect,
     :invalid_effect,
     :wrong_stage,
-    :effect_conflict,
     :not_claimed
   ]
 

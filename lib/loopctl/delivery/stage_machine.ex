@@ -67,6 +67,10 @@ defmodule Loopctl.Delivery.StageMachine do
 
   @terminal ~w(done failed escalated)a
 
+  # The `story_stages_text_bounds` CHECK on `escalation_reason`, in codepoints. See
+  # `max_reason_length/0` for why it lives here and nowhere else.
+  @max_reason_length 4_000
+
   @forward @main_line
            |> Enum.chunk_every(2, 1, :discard)
            |> Enum.map(fn [from, to] -> {from, to, :forward} end)
@@ -129,14 +133,45 @@ defmodule Loopctl.Delivery.StageMachine do
   #   park a story for good with no path back. A session that has run out of budget escalates
   #   instead; control decides whether that is `failed`.
   #
-  # The SOURCE filter is what keeps `claimed` out as a destination: `queued` is the only stage
-  # anything enters `claimed` from, and `queued` is not a source. A separate `to != :claimed`
-  # clause was here and is gone — `bin/mutate.sh` returned exit 1 on it, which is the tool
-  # saying no test can tell whether it is there. `stage_machine_test.exs` asserts the property
-  # directly instead, so widening the source list to include `queued` goes red rather than
-  # quietly handing a runner the transition that writes `runner_id` and the claim's chain
-  # entry. The same test asserts the three held-back edges by name.
-  @runner_source_stages @in_flight ++ [:merged, :deployed, :verified]
+  # THE SOURCE FILTER STOPS AT `merged`, and that is the other half of the rule (#824 round 2,
+  # H1). With `deployed` and `verified` as sources the edge allowlist admitted
+  # `deployed -> verified -> done` on `:forward`, so a session could drive its own story to
+  # terminal success with no control-side verification — while `verification_failed` was held
+  # back twelve lines above on the grounds that the check is CONTROL's. A session able to
+  # report a check passing but not failing is worse than one able to report neither: nothing
+  # else in `lib/` can write the negative (`RunnerStages` and `Escalations` are the only
+  # callers of `Loopctl.Delivery.Stages.advance/4`), so the positive was the only outcome that
+  # could ever be recorded.
+  #
+  # The line is at the DEPLOY because that is where the loop stops producing things control
+  # can check and starts producing verdicts:
+  #
+  # - `merged` carries `merge_sha`, REQUIRED on that transition, and control can ask GitHub
+  #   whether that sha is the merge commit. `deployed` carries `release_id`, likewise.
+  # - `verified` and `done` carry nothing. Each is a pure verdict, and `verified`'s is
+  #   specifically the sha comparison of design §9 that the session does not run.
+  #
+  # So: a runner may report what its own session did and control can independently check,
+  # plus its own escalation, which stops the loop rather than advancing it. A story therefore
+  # WAITS at `deployed` for control to decide verified-or-escalated, and no writer for that
+  # exists yet — an unimplemented control path, chosen deliberately over a session certifying
+  # itself.
+  #
+  # One residual asymmetry, named rather than hidden: `ci -> merged` is reportable while
+  # `ci -> escalated` over `:merge_gate` is not, so the merge gate's positive outcome is a
+  # runner's to report and its refusal is not. That is the checkability rule above and not an
+  # oversight — a merge NAMES a sha GitHub can confirm, the gate's refusal names nothing —
+  # but WHO PERFORMS THE MERGE is undecided in the design (§9 puts auto-merge last, and build
+  # order step 1 merges nothing). Revisit this line when that is settled.
+  #
+  # The SOURCE filter is also what keeps `claimed` out as a destination: `queued` is the only
+  # stage anything enters `claimed` from, and `queued` is not a source. A separate
+  # `to != :claimed` clause was here and is gone — `bin/mutate.sh` returned exit 1 on it,
+  # which is the tool saying no test can tell whether it is there. `stage_machine_test.exs`
+  # asserts the property directly instead, so widening the source list to include `queued`
+  # goes red rather than quietly handing a runner the transition that writes `runner_id` and
+  # the claim's chain entry. The same test asserts every held-back edge and stage by name.
+  @runner_source_stages @in_flight ++ [:merged]
 
   @runner_reportable_edges [
     :forward,
@@ -263,6 +298,24 @@ defmodule Loopctl.Delivery.StageMachine do
   @spec terminal_stages() :: [stage()]
   def terminal_stages, do: @terminal
 
+  @doc """
+  The longest `escalation_reason` or transition note, in CODEPOINTS — what Postgres
+  `char_length` counts, not graphemes.
+
+  THE one declaration of this bound (#824 round 2). It lived in four places plus prose, which
+  is what CLAUDE.md's doc-hygiene rule forbids: a limit that is both enforced and documented
+  references ONE attribute from every site. It is here, in the pure data module, because the
+  machine is what both the enforcement (`Loopctl.Delivery.Stages`) and the two wire
+  declarations (`Loopctl.ApiSpec.RunnerContract`,
+  `LoopctlWeb.StoryEscalationController`) already depend on — and because how long a
+  transition's reason may be is a fact about a transition.
+
+  It mirrors the `story_stages_text_bounds` CHECK. Change one and the other is wrong;
+  `Loopctl.Delivery.StagesTest` reads the constraint back from `pg_constraint`.
+  """
+  @spec max_reason_length() :: pos_integer()
+  def max_reason_length, do: @max_reason_length
+
   @doc "True when `{from, to, edge}` is in the table."
   @spec allowed?(stage(), stage(), edge()) :: boolean()
   def allowed?(from, to, edge), do: {from, to, edge} in @transitions
@@ -274,13 +327,20 @@ defmodule Loopctl.Delivery.StageMachine do
   @doc """
   The transitions a RUNNER may report over the channel (`stage`, contract 1.4.0).
 
-  **A runner may report what its own session OBSERVED ABOUT ITS OWN WORK, and nothing else.**
-  That one sentence is the definition; the set is derived from `transitions/0` by two filters
-  over `runner_source_stages/0` and `runner_reportable_edges/0`, so the wire enums, the
-  contract's published `x-connection.stage_transitions` table and this doc cannot drift from
-  each other or from the machine. Read the comment above `@runner_transitions` for what each
-  filter holds back and why; `runner_reportable_edges/0` is an ALLOWLIST, so an edge added to
-  the machine is unreportable until somebody decides it is a session's to report.
+  **A runner may report what its own session DID AND CONTROL CAN INDEPENDENTLY CHECK, plus
+  its own escalation. Never the outcome of a check it does not perform.** That is the
+  definition; the set is derived from `transitions/0` by two filters over
+  `runner_source_stages/0` and `runner_reportable_edges/0`, so the wire enums, the contract's
+  published `x-connection.stage_transitions` table and this doc cannot drift from each other
+  or from the machine.
+
+  Both filters are ALLOWLISTS, and each holds back one half of the rule. The EDGES exclude
+  the verdicts another principal reaches (`merge_gate`, `verification_failed`,
+  `budget_exceeded`). The SOURCES stop at `merged`, which is where the loop stops producing
+  things control can check — `merged` and `deployed` name a sha and a release id GitHub can
+  confirm, while `verified` and `done` name nothing and are pure verdicts. A story WAITS at
+  `deployed` for control. Read the comment above `@runner_transitions` for the case that
+  forced this and for the one residual asymmetry it leaves.
 
   `from` is on the wire and is part of the compare-and-set: a runner states the stage it
   believed the story was at, and a row that has moved refuses it rather than taking a

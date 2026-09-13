@@ -21,6 +21,7 @@ defmodule LoopctlWeb.StoryEscalationController do
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Delivery.Escalations
+  alias Loopctl.Delivery.StageMachine
   alias Loopctl.Dispatches
 
   action_fallback LoopctlWeb.FallbackController
@@ -28,9 +29,9 @@ defmodule LoopctlWeb.StoryEscalationController do
   plug LoopctlWeb.Plugs.RequireRole, [exact_role: :agent] when action in [:escalate]
   plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:escalate]
 
-  # `Loopctl.Delivery.Stages`' bound, which is the `story_stages_text_bounds` CHECK's, counted
-  # in CODEPOINTS the way Postgres counts it — see `codepoints/1`.
-  @max_reason_length 4_000
+  # Counted in CODEPOINTS the way Postgres counts it (see `codepoints/1`), and read from
+  # `Loopctl.Delivery.StageMachine`, the ONE place the bound is declared (#824 round 2).
+  @max_reason_length StageMachine.max_reason_length()
 
   tags(["Progress"])
 

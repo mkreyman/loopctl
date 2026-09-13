@@ -68,10 +68,11 @@ defmodule LoopctlWeb.RunnerChannel do
   writer of `story_stages`; the channel opens no second path to it, and the story is never
   taken off the wire.
 
-  The reply is the row as it now stands (`stage`, `claim_epoch`, `lock_version`, `attempts`),
-  including on a REPLAY — a message whose first copy committed is answered `ok` rather than
-  `stale_stage`, so a re-send after a rolling deploy costs nothing and tells the runner where
-  the story is. Arriving at a terminal stage also gives the session's runner slot back, in
+  The reply is the row as it now stands (`stage`, `claim_epoch`, `lock_version`, `attempts`
+  and the `effects` it holds), including on a REPLAY — a message whose first copy committed is
+  answered `ok` rather than `stale_stage`, so a re-send after a rolling deploy costs nothing
+  and tells the runner where the story is. A replay naming a DIFFERENT identity than the one
+  recorded is `effect_conflict`, and the ack's `effects` is what it reconciles against. Arriving at a terminal stage also gives the session's runner slot back, in
   the transition's own transaction (`DispatchLedger.release_slot_in/4`).
 
   Like the three above it, `stage` does not check the custody halt: it records a transition
@@ -102,10 +103,10 @@ defmodule LoopctlWeb.RunnerChannel do
   alias Loopctl.Delivery.RunnerStages
   alias Loopctl.LogValue
   alias Loopctl.Runners
-  alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.Presence
   alias LoopctlWeb.RunnerChannel.MinInterval
+  alias LoopctlWeb.RunnerChannel.Refusal
   alias LoopctlWeb.RunnerChannel.ReplyBucket
   alias LoopctlWeb.RunnerSocket
 
@@ -431,8 +432,22 @@ defmodule LoopctlWeb.RunnerChannel do
       stage: Atom.to_string(row.stage),
       claim_epoch: row.claim_epoch,
       lock_version: row.lock_version,
-      attempts: row.attempts
+      attempts: row.attempts,
+      effects: recorded_effects(row)
     }
+  end
+
+  # The identities the row actually holds, so a runner can RECONCILE (#824 round 2). Without
+  # them a replay whose merge sha was dropped came back `ok` and the runner had no way to
+  # learn the server kept a different sha; now the ack names it, and a replay carrying a
+  # conflicting one is refused with `effect_conflict` rather than silently accepted.
+  # Only the identities that are set: an absent key means nothing was recorded.
+  defp recorded_effects(row) do
+    for effect <- RunnerContract.RunnerStage.effect_names(),
+        value = Map.get(row, effect),
+        not is_nil(value),
+        into: %{},
+        do: {effect, value}
   end
 
   defp rate_limited(socket, event, min_interval_ms),
@@ -700,64 +715,11 @@ defmodule LoopctlWeb.RunnerChannel do
     )
   end
 
-  defp join_error(:not_authorized),
-    do: %{reason: "not_authorized", disconnecting: "join_refused_not_authorized"}
+  # The reason -> refusal mapping lives in `LoopctlWeb.RunnerChannel.Refusal`, out of this
+  # module and public, so its CATCH-ALL can be called by a test. Private here, the only way to
+  # reach a missing clause was to crash a socket (#824 round 2).
+  defp join_error(reason),
+    do: Refusal.for_join(reason, max_joins: @max_joins, window_ms: @join_window_ms)
 
-  defp join_error(:join_rate_limited),
-    do: %{reason: "rate_limited", max_joins: @max_joins, window_ms: @join_window_ms}
-
-  defp join_error({:invalid, messages}), do: %{reason: "invalid_payload", details: messages}
-
-  defp join_error({:unsupported_contract_version, sent, speaks}),
-    do: %{reason: "unsupported_contract_version", sent: sent, supported: speaks}
-
-  defp join_error({:machine_mismatch, declared}),
-    do: %{reason: "machine_mismatch", declared: declared}
-
-  # The stable codes of `RunnerContract.error_reasons/0`.
-  defp message_error({:batch_too_large, max_events, max_bytes}),
-    do: %{reason: "batch_too_large", max_events: max_events, max_bytes: max_bytes}
-
-  defp message_error({:event_data_too_large, seq, max_data_bytes, max_event_bytes}),
-    do: %{
-      reason: "event_data_too_large",
-      seq: seq,
-      max_data_bytes: max_data_bytes,
-      max_event_bytes: max_event_bytes
-    }
-
-  defp message_error(reason)
-       when reason in [
-              :unknown_dispatch,
-              :stale_claim_epoch,
-              :already_replied,
-              :dispatch_not_accepted,
-              :run_mismatch,
-              # Contract 1.4.0, `stage` only. Both are refusals of the CONTROL PLANE's state
-              # rather than of the message, which is why neither is `invalid_payload`: a
-              # `stale_stage` runner re-reads the story and sends what applies, and an
-              # `unknown_story_stage` one has hit a control-plane condition it cannot clear
-              # by resending or by giving up its claim.
-              :stale_stage,
-              :unknown_story_stage
-            ],
-       do: %{reason: Atom.to_string(reason)}
-
-  # A value the contract let through and Postgres still refused (DispatchLedger's backstop).
-  defp message_error(:rejected_by_database),
-    do: %{reason: "invalid_payload", details: ["a value was refused by the database"]}
-
-  # A lock this write could not get in time, or a deadlock Postgres broke by choosing it
-  # (`Loopctl.Runners.Capacity.retryable?/1`). Nothing was written and the message is fine, so
-  # the runner is told to SEND IT AGAIN — never `invalid_payload`, which tells it to stop. The
-  # interval is LONGER than the wait that just ran out (`Capacity.busy_retry_ms/0`): retrying
-  # after exactly that wait puts the runner back in the same queue with no backoff, so it
-  # spends about half its time blocked on a lock.
-  # `:capacity_busy` is the ledger's name for it and `:busy` is `Loopctl.Delivery.Stages`'
-  # name for the same thing — a lock this write could not get in time, or a deadlock Postgres
-  # broke by choosing it. Nothing was written either way.
-  defp message_error(reason) when reason in [:capacity_busy, :busy],
-    do: %{reason: "rate_limited", min_interval_ms: Capacity.busy_retry_ms()}
-
-  defp message_error(reason), do: join_error(reason)
+  defp message_error(reason), do: Refusal.for_message(reason)
 end

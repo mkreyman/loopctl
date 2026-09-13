@@ -17,17 +17,30 @@ All notable changes to loopctl are documented here.
   `trace` are. It is metered by a new `stage_burst` bucket (12, refilled one per 250 ms), and
   the transition table a runner may report is published at `x-connection.stage_transitions`.
 
-  **That table is what a session OBSERVED ABOUT ITS OWN WORK and nothing else.** The verdicts
-  another principal reaches are not reportable: the merge-precondition gate, post-deploy
-  verification, and a budget overrun — which would park a story in `failed`, the one stage
-  with no way out at all. Neither is anything into `claimed`. The `reason` bound is 4000
-  CODEPOINTS, which is what Postgres counts; the schema's `maxLength` is the same number
-  counted as graphemes and is therefore looser, so split by codepoints.
+  **That table is what a session DID AND CONTROL CAN INDEPENDENTLY CHECK, plus its own
+  escalation — never the outcome of a check it does not perform.** Two allowlists. The edges
+  exclude the verdicts another principal reaches: the merge-precondition gate, post-deploy
+  verification, and a budget overrun, which would park a story in `failed`, the one stage with
+  no way out at all. The sources stop at `merged`: `merged` and `deployed` name a sha and a
+  release id GitHub can confirm, while `verified` and `done` name nothing. **A story waits at
+  `deployed` for control, and a runner has no path to `verified` or `done`** — reporting the
+  deploy is the last thing a session does. Nothing into `claimed` is reportable either.
 
-  Two new refusal codes, `stale_stage` and `unknown_story_stage`, because neither existing
-  code carries their remedy. **Reporting a transition into a terminal stage releases the
-  session's runner slot in the same transaction**, which #822 had no signal for — until now
-  such a slot waited out the heal sweep.
+  The `reason` bound is 4000 CODEPOINTS, which is what Postgres counts; the schema's
+  `maxLength` is the same number counted as graphemes and is therefore looser, so split by
+  codepoints.
+
+  Three new refusal codes. `stale_stage` and `unknown_story_stage` because no existing code
+  carries their remedy, and `effect_conflict` because a REPLAY must carry the same identities
+  its first copy did: `ci -> merged` retried after a lost ack, naming a second merge commit,
+  would otherwise be answered `ok` while the row and the chain entry kept the first sha. The
+  ack now echoes the identities the row holds so a runner can reconcile. Every inbound event
+  also publishes `internal_error`, the server admitting a refusal reason it has no clause for
+  — which used to raise and take the whole socket down with every session on it.
+
+  **Reporting a transition into a terminal stage releases the session's runner slot in the
+  same transaction**, which #822 had no signal for — until now such a slot waited out the heal
+  sweep. In practice `escalated` is the only terminal a runner can reach.
 
   **New endpoint `POST /api/v1/stories/:id/escalate`** (agent role, `exact_role`, human-anchored
   tenant): the story's CLAIMING agent parks it at the `escalated` stage and stops, presenting

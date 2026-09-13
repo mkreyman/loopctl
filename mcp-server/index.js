@@ -4127,10 +4127,12 @@ const TOOLS = [
         reason: {
           type: "string",
           minLength: 1,
-          maxLength: 4000,
           description:
-            "What a human has to decide, in your own words. Recorded verbatim, capped at 4000 " +
-            "characters, and treated as untrusted data everywhere it is read.",
+            "What a human has to decide, in your own words. Recorded verbatim and treated as " +
+            "untrusted data everywhere it is read. The SERVER caps its length, in codepoints " +
+            "(what Postgres counts, not graphemes) — no bound is repeated here, because a " +
+            "number baked into a published npm package goes stale against the server that " +
+            "enforces it. Over the cap is a 400 naming the bound.",
         },
         payload: {
           type: "object",

@@ -30,7 +30,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | runner -> control | `"dispatch_reply"` | `RunnerDispatchReply` (since 1.1.0) | empty | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `stale_claim_epoch`, `already_replied` |
   | runner -> control | `"trace"` | `RunnerTraceBatch` of `RunnerTraceEvent` (since 1.1.0) | `RunnerTraceAck` | `rate_limited`, `invalid_payload`, `batch_too_large`, `event_data_too_large`, `unknown_dispatch`, `stale_claim_epoch`, `dispatch_not_accepted`, `run_mismatch` |
   | runner -> control | `"trace_cursor"` | `RunnerTraceCursor` (since 1.1.0) | `RunnerTraceAck` | `rate_limited`, `invalid_payload` |
-  | runner -> control | `"stage"` | `RunnerStageReport` (since 1.4.0) | `{stage, claim_epoch, lock_version, attempts}` | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `dispatch_not_accepted`, `stale_claim_epoch`, `stale_stage`, `unknown_story_stage` |
+  | runner -> control | `"stage"` | `RunnerStageReport` (since 1.4.0) | `{stage, claim_epoch, lock_version, attempts, effects}` | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `dispatch_not_accepted`, `stale_claim_epoch`, `stale_stage`, `unknown_story_stage`, `effect_conflict` |
+  | runner -> control | any other event | — | — | `unknown_event` (since 1.2.0; every time, never `rate_limited`) |
   | control -> runner | `"disconnecting"` | `RunnerDisconnecting` (since 1.2.0) | — | — |
   | (1.3.0) a dispatch's `wall_clock_seconds` is bounded: `RunnerDispatch.max_wall_clock_seconds/0` | | | | |
 
@@ -43,28 +44,43 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   `lock_version` and `attempts`. The transition table is published at
   `x-connection.stage_transitions`, derived from the server's own machine.
 
-  **A runner may report what its own session OBSERVED ABOUT ITS OWN WORK, and nothing else.**
-  The published table is that rule applied to the server's machine: transitions out of the
-  stages a session holds, over an ALLOWLIST of edges. Held back, and each for its own reason,
-  are the verdicts some OTHER principal reaches about the session — `merge_gate` (the
-  merge-precondition gate is control's), `verification_failed` (post-deploy verification
-  compares the deployed sha against the merge commit, which the session cannot see) and
-  `budget_exceeded` (`failed` is terminal with no way out at all, so a runner able to report
-  it could park a story for good — a session out of budget escalates instead and control
-  decides). Also held back: anything into `claimed`, and `runner_lost`, `claim_released` and
-  `human_resolution`.
+  **A runner may report what its own session DID AND CONTROL CAN INDEPENDENTLY CHECK, plus
+  its own escalation — never the outcome of a check it does not perform.** The published
+  table is that rule applied to the server's machine, by two allowlists.
+
+  The EDGES exclude the verdicts some other principal reaches about the session:
+  `merge_gate` (the merge-precondition gate is control's), `verification_failed` (post-deploy
+  verification compares the deployed sha against the merge commit, which the session cannot
+  see) and `budget_exceeded` (`failed` is terminal with no way out at all, so a runner able
+  to report it could park a story for good — a session out of budget escalates instead and
+  control decides). Also held back: anything into `claimed`, and `runner_lost`,
+  `claim_released` and `human_resolution`.
+
+  The SOURCES stop at `merged`, which is where the loop stops producing things control can
+  check and starts producing verdicts. `merged` carries a `merge_sha` and `deployed` a
+  `release_id`, both of which GitHub can confirm; `verified` and `done` carry nothing and are
+  pure verdicts. **A story therefore WAITS at `deployed` for control to decide
+  verified-or-escalated, and a runner has no path to `verified` or `done` at all.** Reporting
+  the deploy is the last thing a session does.
 
   Arriving at a terminal stage ends the session and the runner's slot goes back in the same
   transaction — the server decides that from the destination stage, so no message can free a
-  slot while its session runs. The terminal stages a runner can reach are `done` and
-  `escalated`; `failed` is not reportable at all.
+  slot while its session runs. The only terminal a runner can reach is `escalated`, which
+  STOPS the loop rather than completing it; `done` and `failed` are not reportable at all.
 
-  Every `stage` message is safe to REPLAY. One whose first copy committed finds the row
-  already at `to` under the same epoch and is answered `ok` with that row, so a re-send after
-  a lost acknowledgement — which happens on every rolling deploy — never transitions twice.
-  A message for a row that has moved somewhere ELSE is `stale_stage`: re-read the story and
-  send the transition that applies.
-  | runner -> control | any other event | — | — | `unknown_event` (since 1.2.0; every time, never `rate_limited`) |
+  Every `stage` message is safe to REPLAY, and the ack tells you what the server holds. One
+  whose first copy committed finds the row already at `to` under the same epoch and is
+  answered `ok` with that row, so a re-send after a lost acknowledgement — which happens on
+  every rolling deploy — never transitions twice. A message for a row that has moved somewhere
+  ELSE is `stale_stage`: re-read the story and send the transition that applies.
+
+  **A replay must carry the SAME identities its first copy did.** One that names a DIFFERENT
+  value for an identity already recorded is `effect_conflict`, never `ok`: the case that
+  forces it is `ci -> merged`, where a lost ack and a retry that produced a second merge
+  commit would otherwise leave the row and the `story_stage_merged` chain entry naming a
+  merge that is not the branch's. The ack's `effects` is what the row actually holds, so a
+  runner can see which value survived and reconcile against it. Do not re-send after an
+  `effect_conflict`.
 
   ## Server-initiated disconnects (since 1.2.0)
 
@@ -515,7 +531,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     @to_stages Enum.map(StageMachine.runner_to_stages(), &Atom.to_string/1)
     @edges Enum.map(StageMachine.runner_edges(), &Atom.to_string/1)
 
-    # `Loopctl.Delivery.Stages`' own bound, which is the `story_stages_text_bounds` CHECK's.
+    # The `story_stages_text_bounds` CHECK's bound, read from `StageMachine` — the ONE place
+    # it is declared (#824 round 2), rather than a fourth copy of the number.
     #
     # CODEPOINTS, matching Postgres `char_length`. The schema's `maxLength` below cannot
     # enforce that: OpenApiSpex counts it with `String.length/1`, which counts GRAPHEMES, and
@@ -523,11 +540,22 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     # — so a 4000-grapheme reason cast clean here and was refused by the CHECK afterwards,
     # which is not a retryable class. `RunnerContract.reason_length_errors/1` applies the
     # codepoint bound, and the `maxLength` stays as the published number a runner splits by.
-    @max_reason_length 4_000
+    @max_reason_length StageMachine.max_reason_length()
 
     @doc "The bound counted the way Postgres counts it."
     @spec codepoints(String.t()) :: non_neg_integer()
     def codepoints(value), do: value |> String.to_charlist() |> length()
+
+    @doc """
+    The effect identities a `stage` message may carry, which is also the set its ack echoes
+    back so a runner can reconcile a replay.
+
+    Read off the schema's OWN properties rather than restated, so the wire shape and the ack
+    cannot name different things. At runtime, not compile time: `schema/0` is defined by the
+    `OpenApiSpex.schema` macro below and a module attribute cannot call it.
+    """
+    @spec effect_names() :: [atom()]
+    def effect_names, do: schema().properties |> Map.keys() |> Enum.sort()
 
     @doc "The stages a runner may report a transition OUT of."
     @spec from_stages() :: [String.t()]
@@ -591,9 +619,11 @@ defmodule Loopctl.ApiSpec.RunnerContract do
             "claim was reclaimed writes nothing. A REPLAY is safe — a message whose first " <>
             "copy committed finds the row already at `to` and is answered `ok` with the " <>
             "row, so a re-send after a lost acknowledgement never transitions twice. " <>
-            "Arriving at `done`, `failed` or `escalated` also gives the runner slot back, " <>
-            "in the same transaction; the server decides that from the stage, so nothing " <>
-            "here can free a slot whose session is still running.",
+            "Arriving at a terminal stage also gives the runner slot back, in the same " <>
+            "transaction; the server decides that from the stage, so nothing here can free " <>
+            "a slot whose session is still running. `escalated` is the only terminal a " <>
+            "runner can reach: `verified` and `done` are control's verdicts, not a " <>
+            "session's, so a story waits at `deployed`.",
         type: :object,
         required: [:dispatch_id, :claim_epoch, :from, :to],
         properties: %{
@@ -774,14 +804,21 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   # The stable `reason` codes each runner-to-control event can be refused with. Exported, so
   # a runner can switch on them without reading this source.
+  #
+  # `internal_error` is on EVERY inbound event and is the server admitting a gap: a refusal
+  # reason no clause of `LoopctlWeb.RunnerChannel.message_error/1` names. It used to RAISE,
+  # which took the channel down and every in-flight session on that socket with it (#824
+  # round 2). It is not actionable — retrying is reasonable, the same message may well work
+  # once the gap is closed — and the underlying reason is logged server-side, never sent.
   @error_reasons %{
-    "status" => ~w(rate_limited invalid_payload),
+    "status" => ~w(rate_limited invalid_payload internal_error),
     "dispatch_reply" =>
-      ~w(rate_limited invalid_payload unknown_dispatch stale_claim_epoch already_replied),
+      ~w(rate_limited invalid_payload unknown_dispatch stale_claim_epoch already_replied
+         internal_error),
     "trace" =>
       ~w(rate_limited invalid_payload batch_too_large event_data_too_large unknown_dispatch
-         stale_claim_epoch dispatch_not_accepted run_mismatch),
-    "trace_cursor" => ~w(rate_limited invalid_payload),
+         stale_claim_epoch dispatch_not_accepted run_mismatch internal_error),
+    "trace_cursor" => ~w(rate_limited invalid_payload internal_error),
     # Since 1.4.0. Two codes are NEW because nothing already published carries their remedy,
     # and a runner that cannot tell them apart does the wrong thing:
     #
@@ -796,9 +833,13 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     # Everything the stage machine refuses on the MESSAGE's own content — a transition that
     # is not in the table, a missing escalation reason, a malformed or wrong-stage effect —
     # is `invalid_payload` with details, because resending it unchanged cannot help.
+    # - `effect_conflict` — the server already recorded a DIFFERENT identity for this
+    #   transition. Read the recorded values off the ack (`effects`) and reconcile; do NOT
+    #   re-send. `invalid_payload` would tell a runner whose merge sha was dropped that its
+    #   message was malformed, which is both wrong and the wrong remedy.
     "stage" =>
       ~w(rate_limited invalid_payload unknown_dispatch dispatch_not_accepted stale_claim_epoch
-         stale_stage unknown_story_stage),
+         stale_stage unknown_story_stage effect_conflict internal_error),
     # Since 1.2.0. `join` is the `phx_join` reply; `unknown_event` answers any event this
     # map does not name, every time.
     "join" => ~w(rate_limited not_authorized invalid_payload unsupported_contract_version

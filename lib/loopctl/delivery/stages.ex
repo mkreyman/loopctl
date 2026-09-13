@@ -151,8 +151,9 @@ defmodule Loopctl.Delivery.Stages do
 
   @max_pr_number 9_223_372_036_854_775_807
 
-  # The `story_stages_text_bounds` CHECK on `escalation_reason`.
-  @max_reason_chars 4_000
+  # The `story_stages_text_bounds` CHECK on `escalation_reason`, read from the ONE place it is
+  # declared (#824 round 2). It was a fourth copy of the number.
+  @max_reason_chars StageMachine.max_reason_length()
 
   # The encoded size of the caller-supplied `:event_data` a transition may carry into
   # `story_stage_events.data`. Counted on the JSON actually stored, so the bound is exact

@@ -165,7 +165,19 @@ defmodule Loopctl.Delivery.Escalations do
 
   defp unless_already_escalated(_row, _epoch), do: :continue
 
+  # The FIRST attempt, from the row `escalate/3` read. A `:stale_stage` here is recovered
+  # once; every other answer is the caller's.
   defp advance(tenant_id, story_id, row, opts) do
+    case attempt(tenant_id, story_id, row, opts) do
+      {:error, :stale_stage} -> after_stale_stage(tenant_id, story_id, opts)
+      result -> result
+    end
+  end
+
+  # One transition attempt and nothing else. Split out from `advance/4` so the retry below
+  # cannot re-enter the recovery: with the recovery inside the only attempt function, a story
+  # a runner keeps advancing would have recursed without bound.
+  defp attempt(tenant_id, story_id, row, opts) do
     transition = {row.stage, :escalated, :session_escalated}
 
     advance_opts = [
@@ -177,30 +189,40 @@ defmodule Loopctl.Delivery.Escalations do
       actor_lineage: Keyword.get(opts, :actor_lineage, [])
     ]
 
-    case Stages.advance(tenant_id, story_id, transition, advance_opts) do
-      {:ok, escalated} ->
-        {:ok, escalated}
-
-      # The row moved between `live_row/2` and the compare-and-set. Re-read: at `escalated`
-      # under this caller's epoch, a concurrent copy of this same request won and the answer
-      # is that row; anywhere else the caller's picture of the stage is genuinely out of date.
-      {:error, :stale_stage} ->
-        concurrent_escalation(tenant_id, story_id, Keyword.fetch!(opts, :claim_epoch))
-
-      {:error, reason} ->
-        {:error, reason}
-    end
+    Stages.advance(tenant_id, story_id, transition, advance_opts)
   end
 
-  defp concurrent_escalation(tenant_id, story_id, epoch) do
+  # A `:stale_stage` here is USUALLY not a caller error at all: the caller's own runner is
+  # advancing the story over the channel at the same time, so the row moved between the read
+  # and the compare-and-set. Escalating from the NEW stage is almost always just as valid —
+  # every in-flight stage has a `:session_escalated` edge — and returning 409 lost the
+  # escalation outright, because neither this context nor the MCP tool retries (#824 round 2).
+  #
+  # So: re-read, and if it is a concurrent copy of this same request, answer with its row;
+  # otherwise take the transition from where the story ACTUALLY is, ONCE.
+  #
+  # Once, and no more. The retry is bounded because the thing it races — a runner walking its
+  # own story forward — can keep going indefinitely, and an unbounded retry against it is a
+  # spin, not a fix. A second `:stale_stage` is returned, and by then it is worth telling the
+  # caller rather than trying again.
+  defp after_stale_stage(tenant_id, story_id, opts) do
+    epoch = Keyword.fetch!(opts, :claim_epoch)
+
     with {:ok, current} <- live_row(tenant_id, story_id),
-         {:already, escalated} <- unless_already_escalated(current, epoch) do
-      {:ok, escalated}
+         :continue <- unless_already_escalated(current, epoch) do
+      retry_from(tenant_id, story_id, current, opts)
     else
-      :continue -> {:error, :stale_stage}
+      {:already, escalated} -> {:ok, escalated}
       {:error, reason} -> {:error, reason}
     end
   end
+
+  # The retry, from the stage the re-read found, through `attempt/4` and NOT `advance/4` — so
+  # a second `:stale_stage` is returned rather than recovered again. `:invalid_transition`
+  # means the story has moved somewhere a session may not escalate from (past the merge), and
+  # that is the caller's answer rather than a third read.
+  defp retry_from(tenant_id, story_id, row, opts),
+    do: attempt(tenant_id, story_id, row, opts)
 
   @doc """
   The stages a session may escalate FROM — the ones a claim holds it in.
