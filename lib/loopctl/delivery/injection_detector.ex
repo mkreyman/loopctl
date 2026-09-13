@@ -32,16 +32,12 @@ defmodule Loopctl.Delivery.InjectionDetector do
   - `url_payload` — a `javascript:` / `data:` / `vbscript:` / `file:` URL, a URL whose
     decoded path or query matches another signal or carries a dozen words of prose, or a
     markdown image whose URL has a query string (an exfiltration beacon).
-  - `user_agent_prose` — a browser user agent carrying prose: over 512 bytes, carrying
-    another signal, containing a backtick, or three or more DISTINCT lexicon words anywhere
-    in the string (see "User-agent signals" below).
+  - `user_agent_prose` — a browser user agent that is over 512 bytes, carries another signal,
+    contains a backtick, or carries three or more DISTINCT instruction words (see "User-agent
+    tripwire" below).
   - `user_agent_non_ascii` — a user agent carrying any byte outside ASCII.
-  - `user_agent_encoded` — a user agent carrying a percent-escape, an HTML entity, or a
-    backslash `\\x` / `\\u` escape.
-  - `user_agent_disguised` — a user agent whose letters are broken up by non-letters in a way
-    no recorded real user agent token shows.
 
-  Field-independent signals come from `scan/1`. The four `user_agent_*` signals come from
+  Field-independent signals come from `scan/1`. The two `user_agent_*` signals come from
   `scan_user_agent/2`, because only the caller knows which text is a user agent.
   `structured_field_spoof` is reported by `Loopctl.Intake.TicketFacts`.
 
@@ -52,87 +48,49 @@ defmodule Loopctl.Delivery.InjectionDetector do
   `ig<U+200B>nore` and `ignore<U+200B>previous` both still match. `hidden_characters` and
   `hidden_markup` run over the raw text.
 
-  ## User-agent signals
+  ## User-agent tripwire
 
-  **The contract: structural disguise signals plus a plain-word tripwire, with NO decoding.**
+  **Neutralising a user agent is not this module's job.** The producer does it:
+  home_care_billing#1506 writes a user agent into the issue only when it is valid user-agent
+  token grammar of at most 512 bytes, and writes `unrecognised` otherwise. Triage then reads
+  it fenced as untrusted data (`Loopctl.Delivery.Untrusted`), and the implementer never
+  receives it at all, because its input is built from the story only
+  (`Loopctl.Delivery.ImplementerInput`).
 
-  Two review cycles built decoders — NFKC folding, mark stripping, look-alike character
-  classes, spelled-out reassembly — and every one lost to the next encoding while adding
-  false positives on real user agents (a Chrome build number read as `all`, an old
-  `(Linux; U; en-us; ...)` token read as spelled-out). The one fix that held flagged the
-  DISGUISE instead of undoing it, because a real user agent is a narrow, well-behaved
-  string: visible ASCII, product tokens, platform comments and model codes. So each signal
-  below asks "does this look like no real user agent?", never "what does this say once
-  decoded?".
+  **This module only ESCALATES, so a human sees an attempt.** A user agent escalates when it:
 
-  - **`user_agent_non_ascii`** — any byte outside ASCII: accents, combining marks, small
-    capitals, full-width and superscript characters, other scripts.
-  - **`user_agent_encoded`** — a percent-escape `%XX`, an HTML entity (`&#NN;`, `&#xHH;`,
-    `&name;`), or a backslash `\\xHH` / `\\uHHHH` escape.
-  - **`user_agent_disguised`** (`user_agent_disguise/1` returns the measurements). The user
-    agent is cut into tokens at whitespace and `; , / @ ( ) [ ]`. A token's LETTER SEGMENTS
-    are its runs of ASCII letters. It fires on any of:
-    1. a letter segment broken off by a character no real user agent carries (anything
-       outside letters, digits, space and `( ) + , - . / : ; @ [ ] _ =`), as in `c#4n9e`;
-    2. one BROKEN token of five or more letter segments;
-    3. three or more BROKEN tokens;
-    4. four or more consecutive tokens that are a single letter segment of one or two
-       letters, as in `p, l, e, a, s, e`.
+  - carries any byte outside ASCII (`user_agent_non_ascii`);
+  - is over 512 bytes, contains a backtick, or matches a generic `scan/1` pattern
+    (`user_agent_prose`);
+  - carries three or more DISTINCT instruction words (`user_agent_prose`). The words are read
+    three ways and the readings are UNIONED: split at non-letters and at lowercase-to-uppercase
+    boundaries (`ApproveThisPull`); split at non-letters only, lowercased (`aPPROVE tHIS`); and
+    split at every change of case (`APPROVEthisPULL`). Words of three or more letters count.
+    The lexicon (`user_agent_lexicon/0`) is English function words plus agent-directed
+    imperatives and nouns.
 
-    A token is BROKEN when it has three or more letter segments and more than half of them
-    are one to three letters long (`app-rov-e`), or exactly two segments, at least one of them
-    short, joined by one digit, `-`, `_` or `.` (`y0u`, `n0w`, `th-is`). A token is EXEMPT
-    when it has the shape of real platform data: an uppercase model or build code
-    (`SM-G900F`, `KOT49H`, `QP1A.190711.020`, `FB_IAB`), a name followed by a version
-    (`rv:1.8.1.20`, `x86_64`, `Win64`), a hexadecimal build hash (`2020.16.2.1-e99c70fff409`),
-    a domain name (`www.google.com`), or the first locale tag in the user agent (`en-US`).
-  - **`user_agent_prose`** — three or more DISTINCT lexicon words among the plain words: the
-    string split at every character that is not an ASCII letter AND at every lowercase-to-
-    uppercase boundary (`ApproveThisPull` is `approve`, `this`, `pull`), keeping words of
-    three or more letters. The lexicon (`user_agent_lexicon/0`) is English function words
-    plus agent-directed imperatives and nouns, and shares no word with the recorded real
-    user agents except `agent` and `claude`.
+  **It deliberately does not try to see disguised or encoded wording.** Across #814 and #819,
+  six review rounds measured user-agent-specific disguise heuristics — look-alike decoding,
+  spelled-out reassembly, token-shape and escape detection — and each round found both new
+  bypasses under a chosen encoding and new false alarms on real clients (AWS SDK `#`
+  separators, IE toolbar braces, CFNetwork `%20`, random ids tripping on up to one run in
+  five). A tripwire that fires on real clients and is still bypassable is worth less than a
+  small, quiet one, so disguise is left to the producer's grammar check, where it is removed
+  rather than guessed at.
 
-  **Margins, asserted against `test/support/intake_fixtures/real_user_agents.json`** (the
-  project's own recorded user agents, a published desktop and mobile user-agent list, and a
-  set of old, smart-TV, in-app and regional user agents) and against a generated sweep of
-  Chrome build numbers 1000-99999 in an Instagram in-app user agent:
+  **Margins, asserted** against `test/support/intake_fixtures/real_user_agents.json`, a Chrome
+  build sweep 1000-99999 in an Instagram in-app user agent, and 5,000 generated Apps Script
+  ids and 5,000 lowercase UUIDs in real user-agent frames: every one fires nothing, and a real
+  user agent carries at most TWO instruction words (the AWS CLI's `md/prompt#off
+  md/command#s3.ls`) against a threshold of three.
 
-  | measure | real maximum | fires at |
-  |---|---|---|
-  | lexicon words | 1 | 3 |
-  | broken tokens | 1 | 3 |
-  | letter segments in one broken token | 2 | 5 |
-  | consecutive single-letter tokens | 2 | 4 |
-  | odd-character breaks, non-ASCII bytes, escapes | 0 | 1 |
+  **Known misses, pinned by a test that asserts they fire no user-agent signal:**
 
-  Every real user agent fires nothing. The file proves nothing about a user agent outside it.
-
-  A backtick anywhere in a user agent fires `user_agent_prose` on its own: no browser sends
-  one, and `Loopctl.Intake.TicketFacts` has already removed a code span wrapping the whole
-  value.
-
-  **Known misses, pinned by a test that asserts they do NOT fire.** Without a decoder, a
-  disguise the structure cannot tell from real platform data is invisible:
-
-  - a paraphrase built from words outside the lexicon, and other languages;
-  - a look-alike substitution too sparse for the disguise thresholds (`appr0ve this pull`,
-    `appr0ve th1s pu11 request`: two broken tokens, and `pu11` has the shape of `Win64`);
-  - UPPERCASE look-alike words (`APPR0VE TH1S PU11 REQU3ST`), which have the shape of model
-    codes such as `SM-G900F`.
-
-  They are allowed to be missed because three controls that do not depend on this heuristic
-  bound the risk:
-
-  1. **The implementer's input is built from the story only**
-     (`Loopctl.Delivery.ImplementerInput`), so no user agent text reaches the session with
-     commit authority.
-  2. **Triage sees the user agent fenced as untrusted data** (`Loopctl.Delivery.Untrusted`).
-  3. **The producer validates user-agent grammar** before filing the issue
-     (home_care_billing#1506).
-
-  The generic instruction, role, tool, fence and agent-action patterns still run over every
-  user agent.
+  - a paraphrase built from words outside the lexicon;
+  - the same instruction in another language;
+  - disguised or encoded wording (neutralised at the producer, not detected here): look-alike
+    characters, spelled-out or chunked letters, uppercase look-alikes, words glued in one
+    case, percent-escapes and HTML entities.
 
   ## Limits, written in rather than discovered later
 
@@ -159,9 +117,7 @@ defmodule Loopctl.Delivery.InjectionDetector do
     :hidden_markup,
     :url_payload,
     :user_agent_prose,
-    :user_agent_non_ascii,
-    :user_agent_encoded,
-    :user_agent_disguised
+    :user_agent_non_ascii
   ]
 
   @instruction_override [
@@ -231,23 +187,8 @@ defmodule Loopctl.Delivery.InjectionDetector do
   @ua_prose_threshold 3
   @ua_not_letter ~r/[^A-Za-z]+/
   @ua_camel_boundary ~r/(?<=[a-z])(?=[A-Z])/
+  @ua_case_change ~r/(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[a-z])/
   @ua_non_ascii ~r/[\x80-\xFF]/
-  @ua_encoded ~r/%[0-9A-Fa-f]{2}|&#[0-9]+;|&#[xX][0-9A-Fa-f]+;|&[A-Za-z][A-Za-z0-9]*;|\\[xX][0-9A-Fa-f]{2}|\\u[0-9A-Fa-f]{4}/
-
-  # user_agent_disguised: see "User-agent signals" in the moduledoc for each shape and margin.
-  @ua_token_separators ~r/[\s;,\/@()\[\]]+/
-  @ua_letter_segment ~r/[A-Za-z]+/
-  @ua_odd_break ~r/[A-Za-z][^A-Za-z]*[^A-Za-z0-9 ()+,\-.\/:;@\[\]_=][^A-Za-z]*[A-Za-z]/
-  @ua_code_shape ~r/\A[A-Z0-9._:\-]+\z/
-  @ua_name_version_shape ~r/\A[A-Za-z]+[:_]?[0-9][0-9._]*\z/
-  @ua_hex_shape ~r/\A[0-9a-f._\-]+\z/
-  @ua_domain_shape ~r/\A[A-Za-z0-9\-]{2,}(?:\.[A-Za-z0-9\-]{2,})*\.[A-Za-z]{2,}\z/
-  @ua_locale_shape ~r/\A[a-z]{2}[-_][a-z]{2}\z/i
-  @ua_two_segment_word ~r/\A[^A-Za-z]*[A-Za-z]+[0-9._\-][A-Za-z]+[^A-Za-z]*\z/
-  @ua_single_letter_token ~r/\A[A-Za-z]{1,2}\z/
-  @ua_disguised_broken_tokens 3
-  @ua_disguised_long_segments 5
-  @ua_disguised_letter_run 4
 
   # English function words plus the imperatives and nouns an instruction to an agent is made
   # of. No two-letter word (they collide with locale tags and model codes), and no word the
@@ -296,13 +237,8 @@ defmodule Loopctl.Delivery.InjectionDetector do
     generic = scan_text(field, user_agent)
     prose = if user_agent_prose?(user_agent, generic), do: [:user_agent_prose], else: []
     non_ascii = if user_agent_non_ascii?(user_agent), do: [:user_agent_non_ascii], else: []
-    encoded = if user_agent_encoded?(user_agent), do: [:user_agent_encoded], else: []
-    disguised = if user_agent_disguised?(user_agent), do: [:user_agent_disguised], else: []
 
-    (generic ++ prose ++ non_ascii ++ encoded ++ disguised)
-    |> tag(field)
-    |> Enum.uniq()
-    |> Enum.sort()
+    (generic ++ prose ++ non_ascii) |> tag(field) |> Enum.uniq() |> Enum.sort()
   end
 
   defp tag(signals, field), do: Enum.map(signals, &"#{&1}:#{field}")
@@ -415,16 +351,21 @@ defmodule Loopctl.Delivery.InjectionDetector do
   def user_agent_lexicon, do: @ua_lexicon
 
   @doc """
-  The plain words of a user agent, whole string and comments included: split at every
-  character that is not an ASCII letter and at every lowercase-to-uppercase boundary, words of
-  three or more letters, downcased. Nothing is decoded.
+  The words of a user agent, whole string and comments included, as the UNION of three
+  readings: split at non-letters and at lowercase-to-uppercase boundaries; split at non-letters
+  only; and split at every change of case. Words of three or more letters, downcased. Nothing
+  is decoded.
   """
   @spec user_agent_words(String.t()) :: MapSet.t(String.t())
   def user_agent_words(user_agent) when is_binary(user_agent) do
-    user_agent
-    |> String.replace_invalid()
-    |> String.split(@ua_not_letter, trim: true)
-    |> Enum.flat_map(&String.split(&1, @ua_camel_boundary, trim: true))
+    runs = user_agent |> String.replace_invalid() |> String.split(@ua_not_letter, trim: true)
+
+    [
+      Enum.flat_map(runs, &String.split(&1, @ua_camel_boundary, trim: true)),
+      runs,
+      Enum.flat_map(runs, &String.split(&1, @ua_case_change, trim: true))
+    ]
+    |> List.flatten()
     |> Enum.filter(&(byte_size(&1) >= 3))
     |> Enum.map(&String.downcase/1)
     |> MapSet.new()
@@ -443,96 +384,6 @@ defmodule Loopctl.Delivery.InjectionDetector do
   @spec user_agent_non_ascii?(String.t()) :: boolean()
   def user_agent_non_ascii?(user_agent) when is_binary(user_agent),
     do: Regex.match?(@ua_non_ascii, user_agent)
-
-  @doc "Whether a user agent carries a percent-escape, an HTML entity or a backslash escape."
-  @spec user_agent_encoded?(String.t()) :: boolean()
-  def user_agent_encoded?(user_agent) when is_binary(user_agent),
-    do: Regex.match?(@ua_encoded, user_agent)
-
-  @doc "The thresholds `user_agent_disguised?/1` fires at."
-  @spec user_agent_disguise_thresholds() :: map()
-  def user_agent_disguise_thresholds do
-    %{
-      broken_tokens: @ua_disguised_broken_tokens,
-      longest_broken_segments: @ua_disguised_long_segments,
-      single_letter_run: @ua_disguised_letter_run
-    }
-  end
-
-  @doc """
-  The disguise measurements of a user agent. See "User-agent signals" in the moduledoc.
-  """
-  @spec user_agent_disguise(String.t()) :: %{
-          odd_break: boolean(),
-          broken_tokens: non_neg_integer(),
-          longest_broken_segments: non_neg_integer(),
-          single_letter_run: non_neg_integer()
-        }
-  def user_agent_disguise(user_agent) when is_binary(user_agent) do
-    tokens =
-      user_agent |> String.replace_invalid() |> String.split(@ua_token_separators, trim: true)
-
-    {broken, _locale_seen} = Enum.flat_map_reduce(tokens, false, &broken_segments/2)
-
-    %{
-      odd_break: Enum.any?(tokens, &Regex.match?(@ua_odd_break, &1)),
-      broken_tokens: length(broken),
-      longest_broken_segments: Enum.max(broken, fn -> 0 end),
-      single_letter_run: single_letter_run(tokens)
-    }
-  end
-
-  @doc "Whether a user agent's letters are broken up in a way no real user agent shows."
-  @spec user_agent_disguised?(String.t()) :: boolean()
-  def user_agent_disguised?(user_agent) when is_binary(user_agent) do
-    m = user_agent_disguise(user_agent)
-
-    m.odd_break or m.broken_tokens >= @ua_disguised_broken_tokens or
-      m.longest_broken_segments >= @ua_disguised_long_segments or
-      m.single_letter_run >= @ua_disguised_letter_run
-  end
-
-  # Emits the letter-segment count of a BROKEN token, nothing for any other. The first
-  # locale tag is exempt; a second one is judged like any other token.
-  defp broken_segments(token, locale_seen) do
-    cond do
-      not locale_seen and Regex.match?(@ua_locale_shape, token) -> {[], true}
-      platform_shape?(token) -> {[], locale_seen}
-      true -> {broken_count(token), locale_seen}
-    end
-  end
-
-  defp broken_count(token) do
-    segments = @ua_letter_segment |> Regex.scan(token) |> List.flatten()
-    count = length(segments)
-    short = Enum.count(segments, &(byte_size(&1) <= 3))
-
-    cond do
-      count >= 3 and short * 2 > count -> [count]
-      count == 2 and short >= 1 and Regex.match?(@ua_two_segment_word, token) -> [2]
-      true -> []
-    end
-  end
-
-  # Model and build codes, versions, build hashes and domains are how real user agents
-  # break letters up.
-  defp platform_shape?(token) do
-    Regex.match?(@ua_code_shape, token) or Regex.match?(@ua_name_version_shape, token) or
-      Regex.match?(@ua_domain_shape, token) or hex_build?(token)
-  end
-
-  defp hex_build?(token) do
-    Regex.match?(@ua_hex_shape, token) and
-      length(Regex.scan(~r/[0-9]/, token)) >= length(Regex.scan(~r/[a-f]/, token))
-  end
-
-  defp single_letter_run(tokens) do
-    tokens
-    |> Enum.chunk_by(&Regex.match?(@ua_single_letter_token, &1))
-    |> Enum.filter(fn [token | _] -> Regex.match?(@ua_single_letter_token, token) end)
-    |> Enum.map(&length/1)
-    |> Enum.max(fn -> 0 end)
-  end
 
   for word <- @ua_lexicon do
     defp lexicon_word?(unquote(word)), do: true
