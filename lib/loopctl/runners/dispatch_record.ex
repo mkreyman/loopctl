@@ -23,8 +23,9 @@ defmodule Loopctl.Runners.DispatchRecord do
 
   ## Isolation
 
-  `AdminRepo` plus an explicit `tenant_id` predicate in every query, the convention of
-  `Loopctl.Runners`. RLS is ENABLED on the table as defense-in-depth.
+  Read and written only through `Loopctl.Runners.DispatchLedger`, on the RLS-enforced
+  `Loopctl.Repo` inside `Repo.with_tenant/2`, with an explicit `tenant_id` predicate as
+  well. Never `AdminRepo` — see that module.
   """
 
   use Loopctl.Schema

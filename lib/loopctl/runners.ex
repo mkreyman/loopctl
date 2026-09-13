@@ -319,8 +319,11 @@ defmodule Loopctl.Runners do
 
   Then it writes the dispatch's ledger row as `sent` (`DispatchLedger.record_sent/3`) — or
   finds the one an earlier call with the same `dispatch_id` wrote, so a retry never creates a
-  second row — and only then broadcasts on `dispatch_topic/1`, and the runner's channel pushes the `"dispatch"`
-  event on the runner's own `runner:<runner_id>` topic, never a shared or tenant topic.
+  second row — and only then broadcasts on `dispatch_topic/1`. That write runs on the RLS
+  `Loopctl.Repo` in a transaction of its own, like the rest of the ledger, so this function
+  must not be called from inside a `Repo` transaction (`Repo.with_tenant/2` raises there).
+  The runner's channel then pushes the `"dispatch"` event on the runner's own
+  `runner:<runner_id>` topic, never a shared or tenant topic.
 
   `:ok` means handed to the runner's channel, not executed. The channel repeats two checks
   immediately before the push and drops the dispatch when either fails: the halt (a halt

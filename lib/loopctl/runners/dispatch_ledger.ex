@@ -33,15 +33,20 @@ defmodule Loopctl.Runners.DispatchLedger do
   Neither replies nor trace are refused on a custody halt: a halt stops new custody
   progress, and a halted tenant must still be able to record what already happened.
 
-  ## Isolation
+  ## Repo and isolation
 
-  `AdminRepo` with an explicit `tenant_id` AND `runner_id` predicate on every read, the
-  convention of `Loopctl.Runners`. RLS is enabled on both tables as defense-in-depth.
+  Every read and write runs on the RLS-enforced `Loopctl.Repo`, inside
+  `Repo.with_tenant/2`, and every query ALSO carries an explicit `tenant_id` (and, where
+  the caller is a runner, `runner_id`) predicate. Never `AdminRepo`: its pool is a handful
+  of connections that `ValidateWitnessHeader` reads on every authenticated request, and a
+  fleet of runners resuming their traces after a deploy would queue the whole API behind
+  them. `with_tenant/2` must own its transaction, so none of these functions may be called
+  from inside a `Repo` transaction — it raises there rather than leaking the tenant context.
   """
 
   import Ecto.Query
 
-  alias Loopctl.AdminRepo
+  alias Loopctl.Repo
   alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Runners.TraceEvent
 
@@ -68,22 +73,24 @@ defmodule Loopctl.Runners.DispatchLedger do
       updated_at: now
     }
 
-    AdminRepo.insert_all(DispatchRecord, [row],
-      on_conflict: :nothing,
-      conflict_target: [:tenant_id, :dispatch_id]
-    )
-
-    record =
-      AdminRepo.one!(
-        from r in DispatchRecord,
-          where: r.tenant_id == ^tenant_id and r.dispatch_id == ^dispatch.dispatch_id
+    in_tenant(tenant_id, fn ->
+      Repo.insert_all(DispatchRecord, [row],
+        on_conflict: :nothing,
+        conflict_target: [:tenant_id, :dispatch_id]
       )
 
-    cond do
-      not same_dispatch?(record, runner_id, dispatch) -> {:error, :dispatch_id_conflict}
-      record.status != "sent" -> {:error, :dispatch_already_replied}
-      true -> {:ok, record}
-    end
+      record =
+        Repo.one!(
+          from r in DispatchRecord,
+            where: r.tenant_id == ^tenant_id and r.dispatch_id == ^dispatch.dispatch_id
+        )
+
+      cond do
+        not same_dispatch?(record, runner_id, dispatch) -> Repo.rollback(:dispatch_id_conflict)
+        record.status != "sent" -> Repo.rollback(:dispatch_already_replied)
+        true -> record
+      end
+    end)
   end
 
   defp same_dispatch?(record, runner_id, dispatch) do
@@ -94,10 +101,15 @@ defmodule Loopctl.Runners.DispatchLedger do
   @doc "A tenant's ledger row for `dispatch_id`, or nil."
   @spec get_record(Ecto.UUID.t(), Ecto.UUID.t()) :: DispatchRecord.t() | nil
   def get_record(tenant_id, dispatch_id) do
-    AdminRepo.one(
-      from r in DispatchRecord,
-        where: r.tenant_id == ^tenant_id and r.dispatch_id == ^dispatch_id
-    )
+    {:ok, record} =
+      in_tenant(tenant_id, fn ->
+        Repo.one(
+          from r in DispatchRecord,
+            where: r.tenant_id == ^tenant_id and r.dispatch_id == ^dispatch_id
+        )
+      end)
+
+    record
   end
 
   @doc """
@@ -107,13 +119,13 @@ defmodule Loopctl.Runners.DispatchLedger do
           {:ok, DispatchRecord.t()}
           | {:error, :unknown_dispatch | :stale_claim_epoch | :already_replied}
   def record_reply(tenant_id, runner_id, reply) do
-    AdminRepo.transaction(fn ->
+    in_tenant(tenant_id, fn ->
       with {:ok, record} <- lock_held(tenant_id, runner_id, reply.dispatch_id),
            :ok <- epoch_matches(record, reply.claim_epoch),
            {:ok, record} <- apply_reply(record, reply) do
         record
       else
-        {:error, reason} -> AdminRepo.rollback(reason)
+        {:error, reason} -> Repo.rollback(reason)
       end
     end)
   end
@@ -126,7 +138,7 @@ defmodule Loopctl.Runners.DispatchLedger do
       reason_detail: Map.get(reply, :detail),
       replied_at: DateTime.utc_now()
     )
-    |> AdminRepo.update()
+    |> Repo.update()
   end
 
   defp apply_reply(%DispatchRecord{} = record, reply) do
@@ -145,7 +157,7 @@ defmodule Loopctl.Runners.DispatchLedger do
           | {:error,
              :unknown_dispatch | :stale_claim_epoch | :dispatch_not_accepted | :run_mismatch}
   def record_trace(tenant_id, runner_id, batch) do
-    AdminRepo.transaction(fn ->
+    in_tenant(tenant_id, fn ->
       with {:ok, record} <- lock_held(tenant_id, runner_id, batch.dispatch_id),
            :ok <- epoch_matches(record, batch.claim_epoch),
            :ok <- accepted(record),
@@ -153,7 +165,7 @@ defmodule Loopctl.Runners.DispatchLedger do
         insert_events(record, batch.events)
         advance_cursor(record)
       else
-        {:error, reason} -> AdminRepo.rollback(reason)
+        {:error, reason} -> Repo.rollback(reason)
       end
     end)
   end
@@ -164,12 +176,21 @@ defmodule Loopctl.Runners.DispatchLedger do
   """
   @spec trace_cursor(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t()) :: integer()
   def trace_cursor(tenant_id, runner_id, run_id) do
-    AdminRepo.one(
-      from r in DispatchRecord,
-        where: r.tenant_id == ^tenant_id and r.runner_id == ^runner_id and r.run_id == ^run_id,
-        select: r.trace_acked_seq
-    ) || -1
+    {:ok, acked} =
+      in_tenant(tenant_id, fn ->
+        Repo.one(
+          from r in DispatchRecord,
+            where: r.tenant_id == ^tenant_id and r.runner_id == ^runner_id,
+            where: r.run_id == ^run_id,
+            select: r.trace_acked_seq
+        )
+      end)
+
+    acked || -1
   end
+
+  # The one way this module reaches the database: an RLS transaction it owns.
+  defp in_tenant(tenant_id, fun), do: Repo.with_tenant(tenant_id, fun)
 
   # The ownership predicate: tenant AND runner. A row another runner holds is refused
   # exactly like a row that does not exist.
@@ -180,7 +201,7 @@ defmodule Loopctl.Runners.DispatchLedger do
         where: r.dispatch_id == ^dispatch_id,
         lock: "FOR UPDATE"
 
-    case AdminRepo.one(query) do
+    case Repo.one(query) do
       nil -> {:error, :unknown_dispatch}
       record -> {:ok, record}
     end
@@ -202,7 +223,7 @@ defmodule Loopctl.Runners.DispatchLedger do
     record
     |> Ecto.Changeset.change(run_id: run_id)
     |> Ecto.Changeset.unique_constraint(:run_id, name: :runner_dispatches_tenant_run_uidx)
-    |> AdminRepo.update()
+    |> Repo.update()
     |> case do
       {:ok, record} -> {:ok, record}
       {:error, _changeset} -> {:error, :run_mismatch}
@@ -232,7 +253,7 @@ defmodule Loopctl.Runners.DispatchLedger do
         }
       end)
 
-    AdminRepo.insert_all(TraceEvent, rows,
+    Repo.insert_all(TraceEvent, rows,
       on_conflict: :nothing,
       conflict_target: [:tenant_id, :run_id, :seq]
     )
@@ -249,7 +270,7 @@ defmodule Loopctl.Runners.DispatchLedger do
     next = acked + 1
 
     new_acked =
-      if AdminRepo.exists?(run_events(record) |> where([e], e.seq == ^next)) do
+      if Repo.exists?(run_events(record) |> where([e], e.seq == ^next)) do
         successor =
           from n in TraceEvent,
             where: n.tenant_id == parent_as(:event).tenant_id,
@@ -257,7 +278,7 @@ defmodule Loopctl.Runners.DispatchLedger do
             where: n.seq == parent_as(:event).seq + 1,
             select: 1
 
-        AdminRepo.one(
+        Repo.one(
           from e in run_events(record),
             where: e.seq >= ^next and not exists(successor),
             select: min(e.seq)
@@ -268,7 +289,7 @@ defmodule Loopctl.Runners.DispatchLedger do
 
     if new_acked != acked do
       {1, _} =
-        AdminRepo.update_all(
+        Repo.update_all(
           from(r in DispatchRecord,
             where: r.id == ^record.id and r.tenant_id == ^record.tenant_id
           ),

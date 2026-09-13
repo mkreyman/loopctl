@@ -103,9 +103,16 @@ All notable changes to loopctl are documented here.
   runner using them. The runner channel accepts three new runner-to-control events —
   `dispatch_reply`, `trace` and `trace_cursor` — and `priv/runner_contract/v1.json` is
   regenerated at `x-contract-version` 1.1.0, now also carrying each event's stable error
-  `reason` codes and the trace limits (`x-connection.errors`, `x-connection.limits`: at most
-  20 events per batch, 2,048 bytes of JSON `data` per event). The bump is minor: a runner
-  built against 1.0.0 still joins, and nothing it sends changed.
+  `reason` codes and its limits (`x-connection.errors`, `x-connection.limits`: at most 20
+  events per batch, 2,048 bytes of JSON `data` per event, and `min_interval_ms` — each
+  event's own rate floor per channel: `status` 1000, `dispatch_reply` 250, `trace` 50,
+  `trace_cursor` 50). The bump is minor: a runner built against 1.0.0 still joins, and
+  nothing it sends changed.
+
+  **Both tables are read and written on the RLS `Loopctl.Repo` pool (`POOL_SIZE`), never on
+  `AdminRepo`.** Trace intake is high-volume by design — a runner resuming after a deploy
+  may send 20 batches a second — and AdminRepo's small pool is read on every authenticated
+  request, so it must not queue behind it.
 
   **`dispatch/3` has two new refusals.** `{:error, :dispatch_id_conflict}` when the ledger
   already holds that `dispatch_id` for a different runner, story, `claim_epoch` or kind, and

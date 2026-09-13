@@ -31,6 +31,15 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | runner -> control | `"trace"` | `RunnerTraceBatch` of `RunnerTraceEvent` (since 1.1.0) | `RunnerTraceAck` | `rate_limited`, `invalid_payload`, `batch_too_large`, `event_data_too_large`, `unknown_dispatch`, `stale_claim_epoch`, `dispatch_not_accepted`, `run_mismatch` |
   | runner -> control | `"trace_cursor"` | `RunnerTraceCursor` (since 1.1.0) | `RunnerTraceAck` | `rate_limited`, `invalid_payload` |
 
+  ## Rate floors
+
+  Each runner-to-control event has its own minimum interval per channel, published as
+  `x-connection.limits.min_interval_ms` (`min_interval_ms/1`): `status` 1000 ms,
+  `dispatch_reply` 250 ms, `trace` 50 ms, `trace_cursor` 50 ms. They are independent — a
+  `trace` batch is not held back by a recent `status` or `trace_cursor` — so a rejoining
+  runner resumes its trace at up to 20 batches a second. A message inside its floor is
+  refused with `rate_limited` and `min_interval_ms`; send it again after that long.
+
   ## Dispatch replies
 
   A runner answers every `dispatch` it validated with one `dispatch_reply`. The first reply
@@ -414,12 +423,30 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     "trace_cursor" => ~w(rate_limited invalid_payload)
   }
 
+  # The minimum spacing, per channel, between two messages of one runner-to-control event.
+  # A message inside it is refused with `rate_limited` and `min_interval_ms`. Each event has
+  # its OWN floor: `trace` and `trace_cursor` do not share `status`'s, nor each other's.
+  # `LoopctlWeb.RunnerChannel` enforces exactly these values and the export publishes them.
+  @min_interval_ms %{
+    "status" => 1_000,
+    "dispatch_reply" => 250,
+    "trace" => 50,
+    "trace_cursor" => 50
+  }
+
   # Postgres `bigint`, the column `seq` is stored in.
   @max_seq 9_223_372_036_854_775_807
 
   @doc "The contract version loopctl speaks (semver)."
   @spec version() :: String.t()
   def version, do: @version
+
+  @doc """
+  The minimum interval, in milliseconds, between two messages of `event` on one channel.
+  The channel enforces it and the export publishes it (`x-connection.limits.min_interval_ms`).
+  """
+  @spec min_interval_ms(String.t()) :: pos_integer()
+  def min_interval_ms(event), do: Map.fetch!(@min_interval_ms, event)
 
   @doc "The stable error `reason` codes, per runner-to-control event."
   @spec error_reasons() :: %{String.t() => [String.t()]}
@@ -618,7 +645,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
         "limits" => %{
           "trace_max_events" => RunnerTraceBatch.max_events(),
           "trace_max_event_data_bytes" => RunnerTraceEvent.max_data_bytes(),
-          "refusal_max_detail_length" => RunnerDispatchReply.max_detail_length()
+          "refusal_max_detail_length" => RunnerDispatchReply.max_detail_length(),
+          "min_interval_ms" => @min_interval_ms
         }
       },
       "$defs" => defs

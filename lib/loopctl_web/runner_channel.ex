@@ -49,7 +49,8 @@ defmodule LoopctlWeb.RunnerChannel do
   `Loopctl.Runners.DispatchLedger`, always as THIS socket's runner in THIS socket's tenant —
   a runner can answer, and ship a trace for, only a dispatch it was sent. Each has its own
   minimum interval, refused with `rate_limited` and the interval, because each one is a
-  database transaction.
+  database transaction. The floors are `RunnerContract.min_interval_ms/1`, one per event and
+  independent of each other.
 
   None of them checks the custody halt. The halt guards control-to-runner pushes, which
   start custody progress; these record what a runner already did, and a halted tenant must
@@ -67,9 +68,11 @@ defmodule LoopctlWeb.RunnerChannel do
   alias LoopctlWeb.RunnerSocket
 
   @recheck_interval_ms 30_000
-  @min_status_interval_ms 1_000
-  @min_reply_interval_ms 250
-  @min_trace_interval_ms 50
+  # One source: the contract publishes these same values in its export.
+  @min_status_interval_ms RunnerContract.min_interval_ms("status")
+  @min_reply_interval_ms RunnerContract.min_interval_ms("dispatch_reply")
+  @min_trace_interval_ms RunnerContract.min_interval_ms("trace")
+  @min_cursor_interval_ms RunnerContract.min_interval_ms("trace_cursor")
   @join_window_ms 60_000
   @max_joins 30
 
@@ -93,6 +96,7 @@ defmodule LoopctlWeb.RunnerChannel do
        |> assign(:last_status_at, :never)
        |> assign(:last_reply_at, :never)
        |> assign(:last_trace_at, :never)
+       |> assign(:last_cursor_at, :never)
        |> assign(:presence_ref, nil)}
     else
       {:error, reason} -> {:error, join_error(reason)}
@@ -230,16 +234,16 @@ defmodule LoopctlWeb.RunnerChannel do
     now = System.monotonic_time(:millisecond)
     %{runner: runner, tenant_id: tenant_id} = socket.assigns
 
-    with :ok <- interval_ok(socket.assigns.last_trace_at, now, @min_trace_interval_ms),
+    with :ok <- interval_ok(socket.assigns.last_cursor_at, now, @min_cursor_interval_ms),
          {:ok, %{run_id: run_id}} <- RunnerContract.cast_trace_cursor(payload) do
       acked_seq = DispatchLedger.trace_cursor(tenant_id, runner.id, run_id)
-      {:reply, {:ok, %{acked_seq: acked_seq}}, assign(socket, :last_trace_at, now)}
+      {:reply, {:ok, %{acked_seq: acked_seq}}, assign(socket, :last_cursor_at, now)}
     else
       {:error, :rate_limited} ->
-        rate_limited(socket, @min_trace_interval_ms)
+        rate_limited(socket, @min_cursor_interval_ms)
 
       {:error, reason} ->
-        {:reply, {:error, message_error(reason)}, assign(socket, :last_trace_at, now)}
+        {:reply, {:error, message_error(reason)}, assign(socket, :last_cursor_at, now)}
     end
   end
 

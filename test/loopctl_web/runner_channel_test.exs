@@ -3,9 +3,18 @@ defmodule LoopctlWeb.RunnerChannelTest do
   Issue #801 acceptance: a runner joins with a valid token, appears in the pool, and
   vanishes when its process dies — with no sweeper involved — and an invalid or revoked
   token is refused.
+
+  ## Why `async: false`
+
+  A dispatch, a reply and a trace write the dispatch ledger on the RLS `Loopctl.Repo`, while
+  the socket authenticates its runner through `Loopctl.AdminRepo` — separate sandbox
+  connections that cannot see each other's uncommitted rows. The `dispatch`,
+  `dispatch_reply` and `trace` tests therefore use COMMITTED runners
+  (`fixture(:committed_runner)`), swept at module boundaries, which no concurrently running
+  test may see.
   """
 
-  use LoopctlWeb.ChannelCase, async: true
+  use LoopctlWeb.ChannelCase, async: false
 
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.ApiSpec.RunnerContract.RunnerTraceBatch
@@ -19,6 +28,12 @@ defmodule LoopctlWeb.RunnerChannelTest do
   alias LoopctlWeb.RunnerSocket
 
   setup :verify_on_exit!
+
+  setup_all do
+    sweep_committed_runner_tenants()
+    on_exit(&sweep_committed_runner_tenants/0)
+    :ok
+  end
 
   # The dispatch, reply and trace tests below each wait on a database transaction in the
   # channel process; the 100ms default is too tight for that under a loaded full suite.
@@ -348,7 +363,7 @@ defmodule LoopctlWeb.RunnerChannelTest do
 
   describe "dispatch" do
     setup do
-      {raw, runner} = fixture(:runner, %{name: "minis"})
+      {raw, runner} = fixture(:committed_runner, %{name: "minis"})
       {:ok, socket} = connect_runner(raw)
       {_reply, channel} = join_pool(socket, "minis")
       %{runner: runner, raw: raw, channel: channel}
@@ -358,7 +373,9 @@ defmodule LoopctlWeb.RunnerChannelTest do
       do: Runners.dispatch(runner.tenant_id, runner.id, build(:runner_dispatch, attrs))
 
     test "arrives on the runner's own topic, and on no other runner's", %{runner: runner} do
-      {raw_b, runner_b} = fixture(:runner, %{name: "blockit", tenant_id: runner.tenant_id})
+      {raw_b, runner_b} =
+        fixture(:committed_runner, %{name: "blockit", tenant_id: runner.tenant_id})
+
       {:ok, socket_b} = connect_runner(raw_b)
       {_reply, _channel_b} = join_pool(socket_b, "blockit")
 
@@ -407,7 +424,9 @@ defmodule LoopctlWeb.RunnerChannelTest do
     end
 
     test "the halt is checked before authorization and the pool", %{runner: runner} do
-      {_raw, offline} = fixture(:runner, %{name: "offline", tenant_id: runner.tenant_id})
+      {_raw, offline} =
+        fixture(:committed_runner, %{name: "offline", tenant_id: runner.tenant_id})
+
       {:ok, _} = Tenants.halt_custody(runner.tenant_id)
 
       assert {:error, :tenant_halted} = dispatch_to(offline)
@@ -443,7 +462,8 @@ defmodule LoopctlWeb.RunnerChannelTest do
     end
 
     test "a runner that is not connected is refused", %{runner: runner} do
-      {_raw, offline} = fixture(:runner, %{name: "offline", tenant_id: runner.tenant_id})
+      {_raw, offline} =
+        fixture(:committed_runner, %{name: "offline", tenant_id: runner.tenant_id})
 
       assert {:error, :runner_not_connected} = dispatch_to(offline)
       refute_push "dispatch", _
@@ -585,8 +605,8 @@ defmodule LoopctlWeb.RunnerChannelTest do
     end
 
     test "another tenant cannot reach this runner by id", %{runner: runner} do
-      tenant_b = fixture(:tenant)
-      {raw_b, runner_b} = fixture(:runner, %{name: "minis", tenant_id: tenant_b.id})
+      tenant_b = fixture(:committed_tenant, %{})
+      {raw_b, runner_b} = fixture(:committed_runner, %{name: "minis", tenant_id: tenant_b.id})
       {:ok, socket_b} = connect_runner(raw_b)
       {_reply, _channel_b} = join_pool(socket_b, "minis")
 
@@ -602,7 +622,7 @@ defmodule LoopctlWeb.RunnerChannelTest do
     end
 
     test "a halt on another tenant does not stop this one", %{runner: runner} do
-      tenant_b = fixture(:tenant)
+      tenant_b = fixture(:committed_tenant, %{})
       {:ok, _} = Tenants.halt_custody(tenant_b.id)
 
       assert :ok = dispatch_to(runner)
@@ -622,7 +642,14 @@ defmodule LoopctlWeb.RunnerChannelTest do
   # row resets them rather than sleeping, so the rate-limit tests below are what cover them.
   defp reset_intervals(channel) do
     :sys.replace_state(channel.channel_pid, fn socket ->
-      %{socket | assigns: %{socket.assigns | last_reply_at: :never, last_trace_at: :never}}
+      assigns = %{
+        socket.assigns
+        | last_reply_at: :never,
+          last_trace_at: :never,
+          last_cursor_at: :never
+      }
+
+      %{socket | assigns: assigns}
     end)
   end
 
@@ -649,7 +676,7 @@ defmodule LoopctlWeb.RunnerChannelTest do
 
   describe "dispatch_reply" do
     setup do
-      {raw, runner} = fixture(:runner, %{name: "minis"})
+      {raw, runner} = fixture(:committed_runner, %{name: "minis"})
       {:ok, socket} = connect_runner(raw)
       {_reply, channel} = join_pool(socket, "minis")
       dispatch = build(:runner_dispatch, %{"claim_epoch" => 2})
@@ -703,7 +730,9 @@ defmodule LoopctlWeb.RunnerChannelTest do
     end
 
     test "another runner's dispatch is unknown", %{runner: runner, channel: channel} do
-      {raw_b, runner_b} = fixture(:runner, %{name: "blockit", tenant_id: runner.tenant_id})
+      {raw_b, runner_b} =
+        fixture(:committed_runner, %{name: "blockit", tenant_id: runner.tenant_id})
+
       {:ok, socket_b} = connect_runner(raw_b)
       {_reply, _channel_b} = join_pool(socket_b, "blockit")
       theirs = build(:runner_dispatch)
@@ -715,8 +744,8 @@ defmodule LoopctlWeb.RunnerChannelTest do
     end
 
     test "another tenant's dispatch is unknown", %{channel: channel} do
-      tenant_b = fixture(:tenant)
-      {raw_b, runner_b} = fixture(:runner, %{name: "minis", tenant_id: tenant_b.id})
+      tenant_b = fixture(:committed_tenant, %{})
+      {raw_b, runner_b} = fixture(:committed_runner, %{name: "minis", tenant_id: tenant_b.id})
       {:ok, socket_b} = connect_runner(raw_b)
       {_reply, _channel_b} = join_pool(socket_b, "minis")
       theirs = build(:runner_dispatch)
@@ -775,7 +804,7 @@ defmodule LoopctlWeb.RunnerChannelTest do
 
   describe "trace" do
     setup do
-      {raw, runner} = fixture(:runner, %{name: "minis"})
+      {raw, runner} = fixture(:committed_runner, %{name: "minis"})
       {:ok, socket} = connect_runner(raw)
       {_reply, channel} = join_pool(socket, "minis")
       dispatch = build(:runner_dispatch)
@@ -877,7 +906,7 @@ defmodule LoopctlWeb.RunnerChannelTest do
                    @reply_timeout
     end
 
-    test "a batch records its time; a batch or cursor inside the minimum interval is refused",
+    test "a batch records its time; a batch or cursor inside its OWN minimum interval is refused",
          %{runner: runner, channel: channel, dispatch: dispatch, run_id: run_id} do
       ref = send_trace(channel, batch(dispatch, run_id, [0]))
       assert_reply ref, :ok, %{acked_seq: 0}, @reply_timeout
@@ -886,9 +915,91 @@ defmodule LoopctlWeb.RunnerChannelTest do
       pin_interval(channel, :last_trace_at)
       ref = push(channel, "trace", batch(dispatch, run_id, [1]))
       assert_reply ref, :error, %{reason: "rate_limited", min_interval_ms: _}, @reply_timeout
+
+      # trace_cursor has its own floor, so a held-back trace does not hold it back.
+      ref = push(channel, "trace_cursor", %{"run_id" => run_id})
+      assert_reply ref, :ok, %{acked_seq: 0}, @reply_timeout
+
+      pin_interval(channel, :last_cursor_at)
       ref = push(channel, "trace_cursor", %{"run_id" => run_id})
       assert_reply ref, :error, %{reason: "rate_limited"}, @reply_timeout
       assert DispatchLedger.trace_cursor(runner.tenant_id, runner.id, run_id) == 0
+    end
+  end
+
+  describe "the published rate floors" do
+    setup do
+      {raw, runner} = fixture(:committed_runner, %{name: "minis"})
+      {:ok, socket} = connect_runner(raw)
+      {_reply, channel} = join_pool(socket, "minis")
+      dispatch = build(:runner_dispatch)
+      :ok = Runners.dispatch(runner.tenant_id, runner.id, dispatch)
+      assert_push "dispatch", _, @reply_timeout
+      %{channel: channel, dispatch: dispatch}
+    end
+
+    # The message each event is exercised with, and the assign its floor is timed from.
+    defp floor_cases(dispatch) do
+      run_id = Ecto.UUID.generate()
+
+      [
+        {"status", :last_status_at, %{"in_flight" => 1}},
+        {"dispatch_reply", :last_reply_at,
+         %{
+           "dispatch_id" => dispatch["dispatch_id"],
+           "claim_epoch" => dispatch["claim_epoch"],
+           "decision" => "accepted"
+         }},
+        {"trace", :last_trace_at,
+         build(:runner_trace_batch, %{
+           :seqs => [],
+           "run_id" => run_id,
+           "dispatch_id" => dispatch["dispatch_id"],
+           "claim_epoch" => dispatch["claim_epoch"]
+         })},
+        {"trace_cursor", :last_cursor_at, %{"run_id" => run_id}}
+      ]
+    end
+
+    test "the export publishes every inbound event's floor, and the channel refuses with that value",
+         %{channel: channel, dispatch: dispatch} do
+      published = RunnerContract.json_schema()["x-connection"]["limits"]["min_interval_ms"]
+      events = for {event, _, _} <- floor_cases(dispatch), do: event
+      assert Enum.sort(Map.keys(published)) == Enum.sort(events)
+
+      for {event, assign, payload} <- floor_cases(dispatch) do
+        assert published[event] == RunnerContract.min_interval_ms(event)
+
+        pin_interval(channel, assign)
+        ref = push(channel, event, payload)
+
+        assert_reply ref,
+                     :error,
+                     %{reason: "rate_limited", min_interval_ms: refused_with},
+                     @reply_timeout
+
+        assert refused_with == published[event], "#{event} refuses with a different floor"
+      end
+    end
+
+    test "a message just past its published floor is accepted",
+         %{channel: channel, dispatch: dispatch} do
+      published = RunnerContract.json_schema()["x-connection"]["limits"]["min_interval_ms"]
+      ref = push(channel, "dispatch_reply", Enum.at(floor_cases(dispatch), 1) |> elem(2))
+      assert_reply ref, :ok, _, @reply_timeout
+
+      for {event, assign, payload} <- floor_cases(dispatch) do
+        # Timed exactly one millisecond past the published floor: an enforced floor longer
+        # than the published one refuses it.
+        :sys.replace_state(channel.channel_pid, fn socket ->
+          at = System.monotonic_time(:millisecond) - published[event] - 1
+          %{socket | assigns: Map.put(socket.assigns, assign, at)}
+        end)
+
+        ref = push(channel, event, payload)
+        assert_reply ref, status, reply, @reply_timeout
+        refute match?(%{reason: "rate_limited"}, reply), "#{event} (#{status}) was rate limited"
+      end
     end
   end
 

@@ -3,23 +3,47 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
   Issue #803: the dispatch ledger and trace intake — a dispatch's identity is written once,
   a reply applies once and only from the runner it was sent to at the dispatched epoch, and
   a trace is stored once per `(run_id, seq)` with a contiguous ack computed in SQL.
+
+  ## Why `async: false` and COMMITTED runners
+
+  The ledger runs on the RLS `Loopctl.Repo` (inside `Repo.with_tenant/2`), while tenants,
+  runner keys and runner rows are written through `Loopctl.AdminRepo`. The two are separate
+  sandbox connections that cannot see each other's uncommitted rows, and a ledger row's
+  foreign keys must see its tenant and runner — so those are committed
+  (`fixture(:committed_runner)`), swept at module boundaries, and no other test may run
+  meanwhile. Every read of a ledger or trace row here goes through `Repo.with_tenant/2`,
+  the path the code uses, so the RLS policy is exercised rather than bypassed.
   """
 
-  use Loopctl.DataCase, async: true
+  use Loopctl.DataCase, async: false
 
   import Ecto.Query
 
   alias Loopctl.AdminRepo
   alias Loopctl.ApiSpec.RunnerContract
+  alias Loopctl.AuditChain
   alias Loopctl.AuditChain.Entry
+  alias Loopctl.Repo
   alias Loopctl.Runners.DispatchLedger
+  alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Runners.TraceEvent
 
   setup :verify_on_exit!
 
+  setup_all do
+    sweep_committed_runner_tenants()
+    on_exit(&sweep_committed_runner_tenants/0)
+    :ok
+  end
+
   setup do
-    {_raw, runner} = fixture(:runner, %{name: "minis"})
+    {_raw, runner} = fixture(:committed_runner, %{name: "minis"})
     %{runner: runner}
+  end
+
+  defp as_tenant(tenant_id, fun) do
+    {:ok, result} = Repo.with_tenant(tenant_id, fun)
+    result
   end
 
   defp sent(runner, attrs \\ %{}) do
@@ -69,12 +93,14 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
   end
 
   defp stored_seqs(tenant_id, run_id) do
-    AdminRepo.all(
-      from e in TraceEvent,
-        where: e.tenant_id == ^tenant_id and e.run_id == ^run_id,
-        order_by: e.seq,
-        select: e.seq
-    )
+    as_tenant(tenant_id, fn ->
+      Repo.all(
+        from e in TraceEvent,
+          where: e.tenant_id == ^tenant_id and e.run_id == ^run_id,
+          order_by: e.seq,
+          select: e.seq
+      )
+    end)
   end
 
   describe "record_sent/3" do
@@ -99,16 +125,16 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
       assert again.id == first.id
 
       assert 1 ==
-               AdminRepo.aggregate(
-                 from(r in Loopctl.Runners.DispatchRecord,
-                   where: r.dispatch_id == ^dispatch.dispatch_id
-                 ),
-                 :count
-               )
+               as_tenant(runner.tenant_id, fn ->
+                 Repo.aggregate(
+                   from(r in DispatchRecord, where: r.dispatch_id == ^dispatch.dispatch_id),
+                   :count
+                 )
+               end)
     end
 
     test "refuses a dispatch_id already recorded with a different identity", %{runner: runner} do
-      {_raw, other} = fixture(:runner, %{name: "blockit", tenant_id: runner.tenant_id})
+      {_raw, other} = fixture(:committed_runner, %{name: "blockit", tenant_id: runner.tenant_id})
       record = sent(runner)
 
       base =
@@ -151,8 +177,8 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
 
     test "the same dispatch_id in another tenant is a separate row", %{runner: runner} do
       record = sent(runner)
-      tenant_b = fixture(:tenant)
-      {_raw, runner_b} = fixture(:runner, %{name: "minis", tenant_id: tenant_b.id})
+      tenant_b = fixture(:committed_tenant, %{})
+      {_raw, runner_b} = fixture(:committed_runner, %{name: "minis", tenant_id: tenant_b.id})
 
       {:ok, dispatch} =
         RunnerContract.cast_dispatch(
@@ -175,8 +201,18 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
         AdminRepo.aggregate(from(e in Entry, where: e.tenant_id == ^runner.tenant_id), :count)
       end
 
+      # One entry of its own, so an unchanged count is a count that could have moved.
+      {:ok, _} =
+        AuditChain.append(runner.tenant_id, %{
+          action: "runner_enrolled",
+          actor_lineage: [],
+          entity_type: "runner",
+          entity_id: runner.id,
+          payload: %{}
+        })
+
       before = audit_count.()
-      assert before > 0, "the enrollment entry must exist, or this count proves nothing"
+      assert before > 0, "the seeded entry must be counted, or this count proves nothing"
 
       assert {:ok, updated} = reply(runner, record)
       assert updated.status == "accepted"
@@ -220,7 +256,7 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
 
     test "a reply for another runner's dispatch is unknown and changes nothing",
          %{runner: runner} do
-      {_raw, other} = fixture(:runner, %{name: "blockit", tenant_id: runner.tenant_id})
+      {_raw, other} = fixture(:committed_runner, %{name: "blockit", tenant_id: runner.tenant_id})
       record = sent(other)
 
       assert {:error, :unknown_dispatch} = reply(runner, record)
@@ -229,8 +265,8 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
 
     test "a reply for another tenant's dispatch is unknown and changes nothing",
          %{runner: runner} do
-      tenant_b = fixture(:tenant)
-      {_raw, runner_b} = fixture(:runner, %{name: "minis", tenant_id: tenant_b.id})
+      tenant_b = fixture(:committed_tenant, %{})
+      {_raw, runner_b} = fixture(:committed_runner, %{name: "minis", tenant_id: tenant_b.id})
       record_b = sent(runner_b)
 
       assert {:error, :unknown_dispatch} = reply(runner, record_b)
@@ -261,7 +297,9 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
       assert stored_seqs(runner.tenant_id, run_id) == [0, 1, 2]
 
       [event | _] =
-        AdminRepo.all(from e in TraceEvent, where: e.run_id == ^run_id, order_by: e.seq)
+        as_tenant(runner.tenant_id, fn ->
+          Repo.all(from e in TraceEvent, where: e.run_id == ^run_id, order_by: e.seq)
+        end)
 
       assert event.tenant_id == runner.tenant_id
       assert event.runner_dispatch_id == record.id
@@ -293,7 +331,9 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
       assert {:ok, 0} = DispatchLedger.record_trace(runner.tenant_id, runner.id, batch)
 
       assert [%TraceEvent{data: %{"tool" => "Read"}}] =
-               AdminRepo.all(from e in TraceEvent, where: e.run_id == ^run_id)
+               as_tenant(runner.tenant_id, fn ->
+                 Repo.all(from e in TraceEvent, where: e.run_id == ^run_id)
+               end)
     end
 
     test "the ack is the end of the contiguous seqs from 0, and moves when the gap fills",
@@ -345,7 +385,7 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
     end
 
     test "a batch for another runner's dispatch is refused", %{runner: runner, run_id: run_id} do
-      {_raw, other} = fixture(:runner, %{name: "blockit", tenant_id: runner.tenant_id})
+      {_raw, other} = fixture(:committed_runner, %{name: "blockit", tenant_id: runner.tenant_id})
       theirs = accepted(other)
 
       assert {:error, :unknown_dispatch} = trace(runner, theirs, run_id, [0])
@@ -369,8 +409,8 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
       record: record,
       run_id: run_id
     } do
-      tenant_b = fixture(:tenant)
-      {_raw, runner_b} = fixture(:runner, %{name: "minis", tenant_id: tenant_b.id})
+      tenant_b = fixture(:committed_tenant, %{})
+      {_raw, runner_b} = fixture(:committed_runner, %{name: "minis", tenant_id: tenant_b.id})
       record_b = accepted(runner_b)
 
       assert {:ok, 1} = trace(runner, record, run_id, [0, 1])
@@ -394,12 +434,97 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
     end
 
     test "answers -1 for a run another runner holds", %{runner: runner} do
-      {_raw, other} = fixture(:runner, %{name: "blockit", tenant_id: runner.tenant_id})
+      {_raw, other} = fixture(:committed_runner, %{name: "blockit", tenant_id: runner.tenant_id})
       theirs = accepted(other)
       run_id = Ecto.UUID.generate()
       assert {:ok, 0} = trace(other, theirs, run_id, [0])
 
       assert DispatchLedger.trace_cursor(runner.tenant_id, runner.id, run_id) == -1
+    end
+  end
+
+  describe "the Repo path" do
+    test "every ledger and trace query runs on Loopctl.Repo inside an RLS context, none on AdminRepo",
+         %{runner: runner} do
+      handler = "dispatch-ledger-repo-#{System.unique_integer([:positive])}"
+      test_pid = self()
+
+      :telemetry.attach_many(
+        handler,
+        [[:loopctl, :repo, :query], [:loopctl, :admin_repo, :query]],
+        fn [:loopctl, repo, :query], _measurements, metadata, _config ->
+          if metadata[:source] in ["runner_dispatches", "runner_trace_events"] or
+               String.contains?(metadata[:query] || "", "app.current_tenant_id") do
+            send(test_pid, {:ledger_query, repo, metadata[:source], metadata[:params]})
+          end
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      record = accepted(runner)
+      run_id = Ecto.UUID.generate()
+      assert {:ok, 0} = trace(runner, record, run_id, [0])
+      assert DispatchLedger.trace_cursor(runner.tenant_id, runner.id, run_id) == 0
+      assert DispatchLedger.get_record(runner.tenant_id, record.dispatch_id)
+      :telemetry.detach(handler)
+
+      queries = collect_ledger_queries([])
+      sources = for {_repo, source, _params} <- queries, source, do: source
+
+      assert "runner_dispatches" in sources
+      assert "runner_trace_events" in sources
+
+      assert Enum.all?(queries, fn {repo, _, _} -> repo == :repo end),
+             "a ledger query ran on AdminRepo: #{inspect(queries)}"
+
+      assert Enum.any?(queries, fn {_repo, source, params} ->
+               is_nil(source) and runner.tenant_id in List.wrap(params)
+             end),
+             "no RLS context was set for the tenant on the Repo connection"
+    end
+
+    test "under RLS alone, one tenant's context reads none of another tenant's rows",
+         %{runner: runner} do
+      tenant_b = fixture(:committed_tenant, %{})
+      {_raw, runner_b} = fixture(:committed_runner, %{name: "minis", tenant_id: tenant_b.id})
+      run_a = Ecto.UUID.generate()
+      run_b = Ecto.UUID.generate()
+
+      record_a = accepted(runner)
+      record_b = accepted(runner_b)
+      assert {:ok, 0} = trace(runner, record_a, run_a, [0])
+      assert {:ok, 0} = trace(runner_b, record_b, run_b, [0])
+
+      # No tenant predicate in these queries: only the policy can filter them.
+      for {tenant_id, own_record, own_run} <- [
+            {runner.tenant_id, record_a, run_a},
+            {tenant_b.id, record_b, run_b}
+          ] do
+        assert [%DispatchRecord{id: id}] =
+                 as_tenant(tenant_id, fn -> Repo.all(DispatchRecord) end)
+
+        assert id == own_record.id
+
+        assert [%TraceEvent{run_id: ^own_run}] =
+                 as_tenant(tenant_id, fn -> Repo.all(TraceEvent) end)
+      end
+
+      # And the context functions refuse across tenants on the same path, in both
+      # directions (a stale RLS context left by the last read must not decide either).
+      assert DispatchLedger.get_record(tenant_b.id, record_a.dispatch_id) == nil
+      assert DispatchLedger.get_record(runner.tenant_id, record_b.dispatch_id) == nil
+      assert DispatchLedger.trace_cursor(tenant_b.id, runner_b.id, run_a) == -1
+    end
+  end
+
+  defp collect_ledger_queries(acc) do
+    receive do
+      {:ledger_query, repo, source, params} ->
+        collect_ledger_queries([{repo, source, params} | acc])
+    after
+      0 -> Enum.reverse(acc)
     end
   end
 end
