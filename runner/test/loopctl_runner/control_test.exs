@@ -206,8 +206,10 @@ defmodule LoopctlRunner.ControlTest do
   end
 
   test "the runner reports draining while it cannot accept dispatches", ctx do
-    {_pid, _ref} = start_control(ctx.config)
+    {pid, _ref} = start_control(ctx.config)
     assert_receive {:test_loopctl, {:join, _, %{"draining" => true}}}, 5_000
+    # info/1 shows what loopctl was told, not the unset set_draining flag.
+    assert %{draining: true, accepts_dispatches: false} = Control.info(pid)
   end
 
   test "once dispatches are accepted, the set_draining value is what loopctl sees", ctx do

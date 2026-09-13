@@ -341,7 +341,6 @@ defmodule LoopctlRunner.Control do
       Map.take(socket.assigns, [
         :joined,
         :joined_at,
-        :draining,
         :connect_attempts,
         :next_reconnect_ms,
         :last_refusal,
@@ -353,7 +352,19 @@ defmodule LoopctlRunner.Control do
         :topic
       ])
 
-    {:reply, Map.put(info, :status_push_pending, socket.assigns.status_pushes != []), socket}
+    a = socket.assigns
+
+    info =
+      Map.merge(info, %{
+        status_push_pending: a.status_pushes != [],
+        # The value this runner reports, which is not the set_draining/2 flag while no dispatch
+        # can be accepted. It is what the next status carries, not proof loopctl received it:
+        # runner_pool can lag it while a push is pending, rate-limited or lost with the socket.
+        draining: reported_draining(a.draining, a.accepts_dispatches),
+        accepts_dispatches: a.accepts_dispatches
+      })
+
+    {:reply, info, socket}
   end
 
   # A status that landed inside loopctl's 1s floor is sent again once the floor has passed,

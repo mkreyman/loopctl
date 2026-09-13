@@ -77,6 +77,8 @@ plane never reserves capacity on a machine that cannot start a session.
 
   It returns:
   - `joined` and `joined_at`;
+  - `draining` as this runner reports it (loopctl's `runner_pool` can lag it while a status push
+    is pending), and `accepts_dispatches`;
   - `last_disconnect`, `connect_attempts` and `next_reconnect_ms`;
   - `last_status_rtt_ms`, `last_status_acked_at` and `status_push_pending`;
   - `sample_error`, `last_refusal` and `token_failures`.
