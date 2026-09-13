@@ -36,6 +36,21 @@ defmodule Loopctl.AuditChain do
 
   @zero_hash :binary.copy(<<0>>, 32)
 
+  # The per-tenant chain lock (#803 review H1). `SELECT ... ORDER BY chain_position DESC
+  # LIMIT 1 FOR UPDATE` does NOT serialise appends: the blocked session re-reads under its
+  # own snapshot, does not see the row the other session just inserted, computes the SAME
+  # `chain_position + 1`, and `audit_chain_verify_invariants` raises P0001. A
+  # transaction-scoped ADVISORY lock, taken BEFORE the head read, is what makes two
+  # concurrent appends in one tenant queue instead of collide. Its own namespace, distinct
+  # from the runner-capacity lock (0x41050803, PR #822).
+  #
+  # LOCK ORDER, fleet-wide — take them in this order everywhere, never the reverse:
+  #
+  #     capacity advisory lock -> story FOR SHARE -> stage row -> CHAIN ADVISORY LOCK ->
+  #     chain head FOR UPDATE
+  #
+  @chain_lock_namespace 0x4105_A1D7
+
   @doc """
   Appends a new entry to a tenant's audit chain.
 
@@ -64,6 +79,9 @@ defmodule Loopctl.AuditChain do
 
     multi =
       Multi.new()
+      |> Multi.run(:lock_chain, fn _repo, _changes ->
+        lock_tenant_chain(AdminRepo, tenant_id)
+      end)
       |> Multi.run(:lock_and_read, fn _repo, _changes ->
         lock_and_read_previous(tenant_id)
       end)
@@ -92,7 +110,8 @@ defmodule Loopctl.AuditChain do
   be a second transaction on a second connection — not atomic, and a checkout from a pool
   of three).
 
-  Same construction and the same head-row lock as `append/2`. It does NOT broadcast: the
+  Same construction, the same per-tenant advisory lock and the same head-row lock as
+  `append/2`. It does NOT broadcast: the
   entry is not committed yet. The caller passes the returned entry to `announce_entry/1`
   after its transaction commits.
 
@@ -105,6 +124,7 @@ defmodule Loopctl.AuditChain do
     unless Loopctl.Repo.in_transaction?(),
       do: raise(ArgumentError, "append_in_tenant_transaction/2 needs a Loopctl.Repo transaction")
 
+    {:ok, :locked} = lock_tenant_chain(Loopctl.Repo, tenant_id)
     {:ok, {position, prev_hash}} = lock_and_read_previous(Loopctl.Repo, tenant_id)
     entry_attrs = build_entry_attrs(tenant_id, position, prev_hash, attrs, DateTime.utc_now())
 
@@ -112,6 +132,14 @@ defmodule Loopctl.AuditChain do
     |> Entry.changeset(entry_attrs)
     |> Loopctl.Repo.insert()
   end
+
+  @doc """
+  The advisory-lock namespace the per-tenant chain lock is taken in — distinct from every
+  other advisory lock in the fleet. Public so a test can take the SAME lock rather than
+  restating the number.
+  """
+  @spec chain_lock_namespace() :: pos_integer()
+  def chain_lock_namespace, do: @chain_lock_namespace
 
   @doc """
   Publishes a COMMITTED entry: the per-tenant broadcast (US-26.5.1) and the minimal
@@ -845,6 +873,18 @@ defmodule Loopctl.AuditChain do
   defp popcount(count), do: count |> heights_from_count() |> length()
 
   # --- Private ---
+
+  # Serialises this tenant's appends for the rest of the caller's transaction. Held per
+  # TENANT, so appends for other tenants are unaffected, and released at commit or rollback
+  # with no unlock to forget.
+  defp lock_tenant_chain(repo, tenant_id) do
+    repo.query!("SELECT pg_advisory_xact_lock($1::int, hashtext($2))", [
+      @chain_lock_namespace,
+      tenant_id
+    ])
+
+    {:ok, :locked}
+  end
 
   defp lock_and_read_previous(repo \\ AdminRepo, tenant_id) do
     # Lock the latest entry to serialize concurrent appends

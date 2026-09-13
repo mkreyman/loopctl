@@ -28,6 +28,9 @@ defmodule Loopctl.Delivery.StageMachine do
     (design §4), including the disagreement that escalates by construction
   - `:merge_gate` — ci -> escalated, the merge-precondition gate refusing (design §5:
     a clean result merges with no human, anything else routes to Gate A)
+  - `:merge_refused` — merged -> implementing, when the merge the stage was entered to
+    perform did not happen: a conflict, branch protection, a required check. It clears the
+    recorded `merge_sha` along with the head, because that identity was never realised
   - `:budget_exceeded` — any live stage -> failed
   - `:runner_lost` — an in-flight stage -> queued. Taken by the claim reclaimer
     (`Loopctl.Progress.reclaim_expired_claim/3`), never asked for by a runner: a runner
@@ -76,7 +79,8 @@ defmodule Loopctl.Delivery.StageMachine do
                    {:ci, :implementing, :base_moved},
                    {:deployed, :escalated, :verification_failed},
                    {:triaged, :escalated, :triage_escalate},
-                   {:ci, :escalated, :merge_gate}
+                   {:ci, :escalated, :merge_gate},
+                   {:merged, :implementing, :merge_refused}
                  ] ++ @budget_exceeded ++ @released ++ @human_resolution
 
   # The custody-critical transitions, and the only ones written to the audit chain (design
@@ -94,7 +98,13 @@ defmodule Loopctl.Delivery.StageMachine do
     branch: [:worktree],
     head_sha: [:implementing, :reviewing, :pr_open, :ci],
     pr_number: [:pr_open],
-    merge_sha: [:merged],
+    # `merge_sha` is writable at `ci` — the stage that PERFORMS the merge — as well as at
+    # `merged`. Recording it only at `merged` made the merge the ONE effect with no replay
+    # identity: the runner would have had to merge first and record after, so a crash in
+    # between left nothing to find and the next attempt merged again. Record it at `ci`
+    # before calling GitHub, then transition; the `story_stage_merged` chain entry then
+    # carries the sha instead of nil.
+    merge_sha: [:ci, :merged],
     release_id: [:deployed]
   }
 
@@ -132,6 +142,7 @@ defmodule Loopctl.Delivery.StageMachine do
           | :verification_failed
           | :triage_escalate
           | :merge_gate
+          | :merge_refused
           | :budget_exceeded
           | :runner_lost
           | :claim_released
@@ -197,6 +208,8 @@ defmodule Loopctl.Delivery.StageMachine do
     do: @released_clears
 
   def clears(:escalated, :queued, :human_resolution), do: Map.keys(@effect_stages)
+  # A refused merge never happened, so the identity recorded for it goes with the head.
+  def clears(:merged, :implementing, :merge_refused), do: [:head_sha, :merge_sha]
   def clears(_from, :implementing, edge) when edge != :forward, do: [:head_sha]
   def clears(_from, _to, _edge), do: []
 

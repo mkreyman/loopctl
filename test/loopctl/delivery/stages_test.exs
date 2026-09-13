@@ -217,7 +217,10 @@ defmodule Loopctl.Delivery.StagesTest do
       {pending, _} = at_stage(:queued, agent_status: :pending, claim_epoch: 4)
 
       assert {:error, :not_claimed} =
-               Stages.advance(pending.tenant_id, pending.id, {:queued, :claimed}, claim_epoch: 4)
+               Stages.advance(pending.tenant_id, pending.id, {:queued, :claimed},
+                 claim_epoch: 4,
+                 actor_lineage: []
+               )
 
       {story, _} = at_stage(:queued, claim_epoch: 5)
 
@@ -226,13 +229,16 @@ defmodule Loopctl.Delivery.StagesTest do
       end)
 
       assert {:ok, %StoryStage{stage: :claimed, claim_epoch: 5}} =
-               Stages.advance(story.tenant_id, story.id, {:queued, :claimed}, claim_epoch: 5)
+               Stages.advance(story.tenant_id, story.id, {:queued, :claimed},
+                 claim_epoch: 5,
+                 actor_lineage: []
+               )
     end
 
     test "human_resolution needs a human: a user role on a key no dispatch minted" do
       {story, _} = at_stage(:escalated)
       transition = {:escalated, :queued, :human_resolution}
-      base = [claim_epoch: story.claim_epoch]
+      base = [claim_epoch: story.claim_epoch, actor_lineage: []]
 
       assert {:error, :human_required} =
                Stages.advance(story.tenant_id, story.id, transition, base)
@@ -242,7 +248,7 @@ defmodule Loopctl.Delivery.StagesTest do
                  story.tenant_id,
                  story.id,
                  transition,
-                 base ++ [actor_role: :orchestrator, actor_lineage: []]
+                 base ++ [actor_role: :orchestrator]
                )
 
       assert {:error, :human_required} =
@@ -250,7 +256,7 @@ defmodule Loopctl.Delivery.StagesTest do
                  story.tenant_id,
                  story.id,
                  transition,
-                 base ++ [actor_role: :user, actor_lineage: [Ecto.UUID.generate()]]
+                 Keyword.merge(base, actor_role: :user, actor_lineage: [Ecto.UUID.generate()])
                )
 
       assert {:ok, %StoryStage{stage: :queued}} =
@@ -258,7 +264,7 @@ defmodule Loopctl.Delivery.StagesTest do
                  story.tenant_id,
                  story.id,
                  transition,
-                 base ++ [actor_role: :user, actor_lineage: []]
+                 base ++ [actor_role: :user]
                )
 
       assert chain_actions(story.tenant_id) == ["story_stage_escalation_resolved"]
@@ -267,17 +273,34 @@ defmodule Loopctl.Delivery.StagesTest do
     test "escalating needs a reason, and records it" do
       {story, _} = at_stage(:deployed)
       transition = {:deployed, :escalated, :verification_failed}
+      base = [claim_epoch: story.claim_epoch, actor_lineage: []]
 
       assert {:error, :reason_required} =
-               Stages.advance(story.tenant_id, story.id, transition,
-                 claim_epoch: story.claim_epoch,
-                 reason: "  "
+               Stages.advance(story.tenant_id, story.id, transition, base ++ [reason: "  "])
+
+      # A pasted CI log would be refused by the CHECK after the transition was decided.
+      assert {:error, :invalid_reason} =
+               Stages.advance(
+                 story.tenant_id,
+                 story.id,
+                 transition,
+                 base ++ [reason: String.duplicate("x", 4001)]
+               )
+
+      assert {:error, :invalid_reason} =
+               Stages.advance(
+                 story.tenant_id,
+                 story.id,
+                 transition,
+                 base ++ [reason: "log tail" <> <<0>>]
                )
 
       assert {:ok, %StoryStage{escalation_reason: "smoke test failed"}} =
-               Stages.advance(story.tenant_id, story.id, transition,
-                 claim_epoch: story.claim_epoch,
-                 reason: "smoke test failed"
+               Stages.advance(
+                 story.tenant_id,
+                 story.id,
+                 transition,
+                 base ++ [reason: "smoke test failed"]
                )
 
       assert chain_actions(story.tenant_id) == ["story_stage_escalated"]
@@ -407,7 +430,13 @@ defmodule Loopctl.Delivery.StagesTest do
       [:queued, :claimed, :worktree, :implementing, :reviewing, :pr_open, :ci, :merged, :deployed]
       |> Enum.chunk_every(2, 1, :discard)
       |> Enum.each(fn [from, to] ->
-        assert {:ok, _} = Stages.advance(story.tenant_id, story.id, {from, to}, opts)
+        assert {:ok, _} =
+                 Stages.advance(
+                   story.tenant_id,
+                   story.id,
+                   {from, to},
+                   opts ++ [actor_lineage: []]
+                 )
       end)
 
       assert chain_actions(story.tenant_id) == ["story_stage_claimed", "story_stage_merged"]
@@ -418,7 +447,10 @@ defmodule Loopctl.Delivery.StagesTest do
       {story, _} = at_stage(:ci)
 
       assert {:error, :stale_claim_epoch} =
-               Stages.advance(story.tenant_id, story.id, {:ci, :merged}, claim_epoch: 99)
+               Stages.advance(story.tenant_id, story.id, {:ci, :merged},
+                 claim_epoch: 99,
+                 actor_lineage: []
+               )
 
       assert chain_actions(story.tenant_id) == []
       assert Stages.list_events(story.tenant_id, story.id) == []
@@ -702,6 +734,169 @@ defmodule Loopctl.Delivery.StagesTest do
       assert_raise ArgumentError, fn ->
         Stages.follow_claim(Ecto.UUID.generate(), Ecto.UUID.generate(), 1)
       end
+    end
+  end
+
+  describe "database contention is retryable, everything else is not" do
+    test "the retryable classes" do
+      for code <- ["55P03", "57014", "40P01", "40001", "P0001"] do
+        assert Stages.retryable_error?(%Postgrex.Error{postgres: %{pg_code: code}}), code
+      end
+
+      assert Stages.retryable_error?(%DBConnection.ConnectionError{reason: :queue_timeout})
+    end
+
+    test "a fault in the transition is not retryable and must not be swallowed" do
+      # 23503 foreign_key_violation, 23514 check_violation, 22021 invalid text encoding:
+      # each says the WRITE was wrong, and answering :busy would invite an endless retry.
+      for code <- ["23503", "23514", "22021"] do
+        refute Stages.retryable_error?(%Postgrex.Error{postgres: %{pg_code: code}}), code
+      end
+    end
+  end
+
+  describe "custody attribution on a chained transition" do
+    test "a chained transition refuses a caller that did not state its lineage" do
+      {story, _} = at_stage(:queued)
+
+      assert {:error, :actor_lineage_required} =
+               Stages.advance(story.tenant_id, story.id, {:queued, :claimed},
+                 claim_epoch: story.claim_epoch
+               )
+
+      assert chain_actions(story.tenant_id) == []
+      assert Stages.get(story.tenant_id, story.id).stage == :queued
+    end
+
+    test "an unchained transition does not need one" do
+      {story, _} = at_stage(:implementing)
+
+      assert {:ok, %StoryStage{stage: :reviewing}} =
+               Stages.advance(story.tenant_id, story.id, {:implementing, :reviewing},
+                 claim_epoch: story.claim_epoch
+               )
+    end
+
+    test "a dispatch-minted user key is not the human, even omitting nothing else" do
+      {story, _} = at_stage(:escalated)
+      transition = {:escalated, :queued, :human_resolution}
+
+      # Absent lineage is refused BEFORE the human test — a dispatch-minted :user key that
+      # simply omits it must never pass as the operator.
+      assert {:error, :actor_lineage_required} =
+               Stages.advance(story.tenant_id, story.id, transition,
+                 claim_epoch: story.claim_epoch,
+                 actor_role: :user
+               )
+    end
+
+    test "a chain append the database refuses rolls the transition back" do
+      {story, _} = at_stage(:queued)
+
+      # A lineage `Entry.changeset/2` cannot cast. In production the lineage is resolved
+      # server-side and is always well formed; this is the one caller-reachable way to make
+      # the append return `{:error, changeset}`, and the point is that the TRANSITION does
+      # not commit when its custody entry cannot.
+      assert {:error, :audit_chain_append_failed} =
+               Stages.advance(story.tenant_id, story.id, {:queued, :claimed},
+                 claim_epoch: story.claim_epoch,
+                 actor_lineage: [%{"not" => "a string"}]
+               )
+
+      assert Stages.get(story.tenant_id, story.id).stage == :queued
+      assert Stages.list_events(story.tenant_id, story.id) == []
+      assert chain_actions(story.tenant_id) == []
+    end
+
+    test "the chain entry records the lineage the caller stated" do
+      {story, _} = at_stage(:queued)
+      lineage = [Ecto.UUID.generate(), Ecto.UUID.generate()]
+
+      {:ok, _} =
+        Stages.advance(story.tenant_id, story.id, {:queued, :claimed},
+          claim_epoch: story.claim_epoch,
+          actor_lineage: lineage
+        )
+
+      assert [%Entry{actor_lineage: ^lineage}] =
+               as_tenant(story.tenant_id, fn -> Repo.all(Entry) end)
+    end
+  end
+
+  describe "the merge identity" do
+    test "is recorded at ci, survives a replay, and reaches the chain entry" do
+      {story, _} = at_stage(:ci)
+      opts = [claim_epoch: story.claim_epoch, actor_lineage: []]
+      merge_sha = String.duplicate("9", 40)
+
+      # Written BEFORE the merge is performed, at the stage performing it.
+      assert {:ok, %StoryStage{merge_sha: ^merge_sha}} =
+               Stages.record_effect(story.tenant_id, story.id, :merge_sha, merge_sha, opts)
+
+      # The crash-and-replay: the runner comes back, finds its own sha, and does not merge
+      # a second time.
+      assert {:ok, %StoryStage{merge_sha: ^merge_sha}} =
+               Stages.record_effect(story.tenant_id, story.id, :merge_sha, merge_sha, opts)
+
+      assert {:error, :effect_conflict} =
+               Stages.record_effect(
+                 story.tenant_id,
+                 story.id,
+                 :merge_sha,
+                 String.duplicate("8", 40),
+                 opts
+               )
+
+      {:ok, _} = Stages.advance(story.tenant_id, story.id, {:ci, :merged}, opts)
+
+      assert [%Entry{action: "story_stage_merged", payload: %{"merge_sha" => ^merge_sha}}] =
+               as_tenant(story.tenant_id, fn -> Repo.all(Entry) end)
+    end
+
+    test "a refused merge goes back to implementing and clears the identity" do
+      merge_sha = String.duplicate("7", 40)
+      {story, row} = at_stage(:merged, merge_sha: merge_sha, head_sha: @sha_a, pr_number: 4)
+
+      assert {:ok, %StoryStage{stage: :implementing} = back} =
+               Stages.advance(story.tenant_id, story.id, {:merged, :implementing, :merge_refused},
+                 claim_epoch: story.claim_epoch,
+                 reason: "required check missing"
+               )
+
+      assert {back.merge_sha, back.head_sha} == {nil, nil}
+      assert back.pr_number == 4
+      assert back.attempts == %{"merge_refused" => 1}
+      assert back.lock_version == row.lock_version + 1
+
+      # And the identity can be recorded again for the next attempt.
+      {:ok, _} =
+        Stages.record_effect(story.tenant_id, story.id, :head_sha, @sha_b,
+          claim_epoch: story.claim_epoch
+        )
+    end
+  end
+
+  describe "runner_id is resolved in this tenant" do
+    test "another tenant's runner is refused, though the foreign key would accept it" do
+      {story, _} = at_stage(:claimed)
+      other = fixture(:stage_story, %{})
+      foreign_runner = fixture(:stage_runner, %{tenant_id: other.tenant_id})
+
+      assert {:error, :invalid_effect} =
+               Stages.record_effect(story.tenant_id, story.id, :runner_id, foreign_runner.id,
+                 claim_epoch: story.claim_epoch
+               )
+
+      assert Stages.get(story.tenant_id, story.id).runner_id == nil
+    end
+
+    test "a runner id that resolves to nothing is refused, not raised" do
+      {story, _} = at_stage(:claimed)
+
+      assert {:error, :invalid_effect} =
+               Stages.record_effect(story.tenant_id, story.id, :runner_id, Ecto.UUID.generate(),
+                 claim_epoch: story.claim_epoch
+               )
     end
   end
 

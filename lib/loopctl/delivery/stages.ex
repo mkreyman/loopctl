@@ -35,9 +35,12 @@ defmodule Loopctl.Delivery.Stages do
     `:stale_stage` — it does not happen twice. The caller reads `get/2` to learn where the
     row is; the row, not the caller's memory, is the truth.
   - `record_effect/5` records an identity once. The same value again is `{:ok, row}`, so a
-    replayed stage finds the worktree, PR or release its first run recorded and reuses it;
-    a DIFFERENT value for an identity already set is `:effect_conflict`, so a replay can
-    never record a second one. Record the identity BEFORE performing the effect.
+    replayed stage finds the worktree, PR, merge or release its first run recorded and
+    reuses it; a DIFFERENT value for an identity already set is `:effect_conflict`, so a
+    replay can never record a second one. Record the identity BEFORE performing the effect
+    — which is why `merge_sha` is writable at `ci`, the stage that performs the merge, and
+    not only at `merged`, and why a merge that is then REFUSED takes
+    `{merged, implementing, :merge_refused}`, clearing the identity it never realised.
   - `open/3` inserts `ON CONFLICT DO NOTHING` and returns the one row either way.
 
   ## Slow connections
@@ -49,10 +52,19 @@ defmodule Loopctl.Delivery.Stages do
 
   ## Locks and their order
 
-  Every writer takes the STORY row first and the stage row second: `FOR SHARE` on the story
-  here (so a claim release cannot commit between reading `claim_epoch` and the write it
-  fences), `FOR UPDATE` in `Loopctl.Progress.reclaim_expired_claim/3`. The audit-chain head
-  is always last. One order everywhere, so no two of them can deadlock.
+  ONE order, fleet-wide, and every writer follows it:
+
+      capacity advisory lock -> story FOR SHARE -> stage row -> chain advisory lock ->
+      chain head FOR UPDATE
+
+  Here that is: `FOR SHARE` on the story (so a claim release cannot commit between reading
+  `claim_epoch` and the write it fences), then the stage row, then — only for a chained
+  transition — the tenant's chain advisory lock and its head
+  (`Loopctl.AuditChain.append_in_tenant_transaction/2`). `Loopctl.Progress`' release paths
+  take the story `FOR UPDATE` first and the stage row second, the same way round. Taking
+  any pair in the other order can deadlock; `lock_timeout` turns that into
+  `{:error, :busy}` rather than a wait without end, and a deadlock Postgres does break is
+  classified retryable too.
 
   ## The audit chain
 
@@ -82,6 +94,7 @@ defmodule Loopctl.Delivery.Stages do
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.LocalGuc
   alias Loopctl.Repo
+  alias Loopctl.Runners.Runner
   alias Loopctl.WorkBreakdown.Story
 
   @lock_timeout "2000ms"
@@ -94,6 +107,9 @@ defmodule Loopctl.Delivery.Stages do
 
   @max_pr_number 9_223_372_036_854_775_807
 
+  # The `story_stages_text_bounds` CHECK on `escalation_reason`.
+  @max_reason_chars 4_000
+
   @type advance_error ::
           :invalid_transition
           | :human_required
@@ -102,6 +118,9 @@ defmodule Loopctl.Delivery.Stages do
           | :not_claimed
           | :stale_claim_epoch
           | :stale_stage
+          | :actor_lineage_required
+          | :invalid_reason
+          | :audit_chain_append_failed
           | :busy
 
   @type effect_error ::
@@ -232,6 +251,7 @@ defmodule Loopctl.Delivery.Stages do
     reason = Keyword.get(opts, :reason)
 
     with :ok <- allowed_for_caller(from, to, edge),
+         :ok <- lineage_declared(from, to, opts),
          :ok <- human_gate(edge, opts),
          :ok <- reason_given(to, reason) do
       in_tenant(tenant_id, fn ->
@@ -342,6 +362,7 @@ defmodule Loopctl.Delivery.Stages do
 
     cond do
       row.claim_epoch != story.claim_epoch -> Repo.rollback(:stale_claim_epoch)
+      not runner_resolvable?(effect, value, row.tenant_id) -> Repo.rollback(:invalid_effect)
       # A replay of the write that already landed, from any stage: nothing to do.
       current == value -> row
       row.stage not in StageMachine.effect_stages(effect) -> Repo.rollback(:wrong_stage)
@@ -367,6 +388,21 @@ defmodule Loopctl.Delivery.Stages do
     insert_event(Repo, row, "effect_recorded", nil, nil, opts[:actor_label], data)
     row
   end
+
+  # A foreign key does NOT scope a runner to the tenant: FK checks bypass RLS, so ANOTHER
+  # tenant's runner id satisfies `story_stages_runner_id_fkey` and would be recorded as this
+  # story's runner. A stale id is no better — it raises 23503 from the write, which is not a
+  # retryable class and would crash the caller. Both are `:invalid_effect`.
+  #
+  # This read runs inside `Repo.with_tenant/2`, so the RLS policy on `runners` is what
+  # ENFORCES the scoping; the explicit `tenant_id` predicate is this module's rule that
+  # every query carries one, and no test can tell the two apart (a mutation removing it
+  # stays green — deliberately kept as defence in depth, not as the enforcement).
+  defp runner_resolvable?(:runner_id, runner_id, tenant_id) do
+    Repo.exists?(from r in Runner, where: r.tenant_id == ^tenant_id and r.id == ^runner_id)
+  end
+
+  defp runner_resolvable?(_effect, _value, _tenant_id), do: true
 
   defp event_value(value) when is_integer(value), do: value
   defp event_value(value), do: to_string(value)
@@ -546,21 +582,43 @@ defmodule Loopctl.Delivery.Stages do
     if StageMachine.allowed?(from, to, edge), do: :ok, else: {:error, :invalid_transition}
   end
 
+  # A CHAINED transition writes a custody entry, and that entry records who made it. The
+  # caller's lineage is resolved SERVER-SIDE from its key, so an ABSENT `:actor_lineage` is
+  # a caller that never resolved one — not a caller that has none. There is no default, for
+  # the same reason `Progress`' custody gates give `caller_lineage` none: a defaulted `[]`
+  # makes "resolved, and empty" indistinguishable from "forgot to resolve", and here it
+  # would also hand the human-only edge to any dispatch-minted `:user` key that simply
+  # omitted the option. An explicit `[]` is an attested absence and is accepted.
+  defp lineage_declared(from, to, opts) do
+    if StageMachine.chained?(from, to) and not Keyword.has_key?(opts, :actor_lineage),
+      do: {:error, :actor_lineage_required},
+      else: :ok
+  end
+
   defp human_gate(edge, opts) do
     if StageMachine.human_only?(edge) and not human?(opts),
       do: {:error, :human_required},
       else: :ok
   end
 
+  # Every human-only edge is chained, so `lineage_declared/3` has already refused an absent
+  # lineage by the time this runs; `fetch!` keeps that true if a future edge is not.
   defp human?(opts) do
     Role.role_at_least?(Keyword.get(opts, :actor_role, :agent), :user) and
-      Keyword.get(opts, :actor_lineage, []) == []
+      Keyword.fetch!(opts, :actor_lineage) == []
   end
 
+  # A reason is REQUIRED entering `escalated` and bounded wherever it is given: it lands in
+  # `story_stages.escalation_reason` under the `story_stages_text_bounds` CHECK and in the
+  # event's jsonb, so a pasted CI log or a NUL byte would be refused by Postgres AFTER the
+  # transition was decided, losing the escalation.
   defp reason_given(to, reason) do
-    if StageMachine.reason_required?(to) and not present?(reason),
-      do: {:error, :reason_required},
-      else: :ok
+    cond do
+      StageMachine.reason_required?(to) and not present?(reason) -> {:error, :reason_required}
+      is_nil(reason) -> :ok
+      match?({:ok, _}, bounded_text(reason, @max_reason_chars)) -> :ok
+      true -> {:error, :invalid_reason}
+    end
   end
 
   defp present?(reason), do: is_binary(reason) and String.trim(reason) != ""
@@ -570,29 +628,44 @@ defmodule Loopctl.Delivery.Stages do
 
   defp maybe_chain(row, {from, to, edge}, reason, opts) do
     if StageMachine.chained?(from, to) do
-      {:ok, entry} =
-        AuditChain.append_in_tenant_transaction(row.tenant_id, %{
-          action: chain_action(from, to),
-          actor_lineage: Keyword.get(opts, :actor_lineage, []),
-          entity_type: "story",
-          entity_id: row.story_id,
-          payload: %{
-            "story_stage_id" => row.id,
-            "from" => Atom.to_string(from),
-            "to" => Atom.to_string(to),
-            "edge" => Atom.to_string(edge),
-            "claim_epoch" => row.claim_epoch,
-            "lock_version" => row.lock_version,
-            "reason" => reason,
-            "runner_id" => row.runner_id,
-            "pr_number" => row.pr_number,
-            "head_sha" => row.head_sha,
-            "merge_sha" => row.merge_sha
-          }
-        })
-
-      entry
+      row.tenant_id
+      |> AuditChain.append_in_tenant_transaction(%{
+        action: chain_action(from, to),
+        # Present by construction: `lineage_declared/3` refuses a chained transition whose
+        # caller did not state one, so this never records an unattributed custody entry.
+        actor_lineage: Keyword.fetch!(opts, :actor_lineage),
+        entity_type: "story",
+        entity_id: row.story_id,
+        payload: %{
+          "story_stage_id" => row.id,
+          "from" => Atom.to_string(from),
+          "to" => Atom.to_string(to),
+          "edge" => Atom.to_string(edge),
+          "claim_epoch" => row.claim_epoch,
+          "lock_version" => row.lock_version,
+          "reason" => reason,
+          "runner_id" => row.runner_id,
+          "pr_number" => row.pr_number,
+          "head_sha" => row.head_sha,
+          "merge_sha" => row.merge_sha
+        }
+      })
+      |> chained_entry(row, to)
     end
+  end
+
+  # The append's error contract. A custody transition whose chain entry did not land must
+  # not commit — a `MatchError` here would have crashed inside the transaction and answered
+  # the caller with a 500 instead of a reason it can act on.
+  defp chained_entry({:ok, entry}, _row, _to), do: entry
+
+  defp chained_entry({:error, reason}, row, to) do
+    Logger.error(
+      "story stage chain append refused, transition rolled back: tenant_id=#{row.tenant_id} " <>
+        "story_id=#{row.story_id} to=#{to} reason=#{inspect(reason)}"
+    )
+
+    Repo.rollback(:audit_chain_append_failed)
   end
 
   defp chain_action(:escalated, _to), do: "story_stage_escalation_resolved"
@@ -661,7 +734,7 @@ defmodule Loopctl.Delivery.Stages do
     end
   rescue
     error in [Postgrex.Error, DBConnection.ConnectionError] ->
-      if busy?(error) do
+      if retryable_error?(error) do
         Logger.warning(
           "story stage write gave up waiting: tenant_id=#{tenant_id} " <>
             "error=#{inspect(busy_code(error))}"
@@ -678,11 +751,29 @@ defmodule Loopctl.Delivery.Stages do
       end
   end
 
-  # 55P03 lock_not_available (lock_timeout), 57014 query_canceled (statement_timeout), or a
-  # connection that could not be checked out in time.
-  defp busy?(%Postgrex.Error{postgres: %{pg_code: code}}), do: code in ["55P03", "57014"]
-  defp busy?(%DBConnection.ConnectionError{}), do: true
-  defp busy?(_error), do: false
+  @doc """
+  Whether a database error is CONTENTION this caller can retry out of, rather than a fault
+  in the transition. `in_tenant/2` answers `{:error, :busy}` for these and reraises
+  everything else, so an unclassified error LOSES the transition — which is why the audit
+  chain's own `P0001` is classified even though its advisory lock makes it unreachable
+  from here.
+
+  Public only so the classes can be asserted directly; nothing outside this module and its
+  test should call it.
+  """
+  @spec retryable_error?(Exception.t()) :: boolean()
+  # Contention this caller can retry out of, none of which is a fault in the transition:
+  # 55P03 lock_not_available (lock_timeout), 57014 query_canceled (statement_timeout), 40P01
+  # deadlock_detected (one side is chosen and killed), 40001 serialization_failure, and
+  # P0001 — the audit chain's own triggers, which raise when a concurrent append took the
+  # position this one computed. The chain's per-tenant advisory lock makes that last one
+  # unreachable through this module; it is classified anyway, because an unclassified
+  # Postgrex.Error here reraises and LOSES the transition (#803 review H1).
+  def retryable_error?(%Postgrex.Error{postgres: %{pg_code: code}}),
+    do: code in ["55P03", "57014", "40P01", "40001", "P0001"]
+
+  def retryable_error?(%DBConnection.ConnectionError{}), do: true
+  def retryable_error?(_error), do: false
 
   defp busy_code(%Postgrex.Error{postgres: %{pg_code: code}}), do: code
   defp busy_code(%DBConnection.ConnectionError{reason: reason}), do: reason

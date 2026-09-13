@@ -31,6 +31,7 @@ defmodule Loopctl.Delivery.StageMachineTest do
           {:deployed, :escalated, :verification_failed},
           {:triaged, :escalated, :triage_escalate},
           {:ci, :escalated, :merge_gate},
+          {:merged, :implementing, :merge_refused},
           {:implementing, :failed, :budget_exceeded},
           {:implementing, :queued, :runner_lost}
         ] do
@@ -50,6 +51,16 @@ defmodule Loopctl.Delivery.StageMachineTest do
     sources = for {from, :queued, :runner_lost} <- StageMachine.transitions(), do: from
     assert Enum.sort(sources) == Enum.sort(StageMachine.in_flight_stages())
     refute Enum.any?(sources, &(&1 in [:merged, :deployed, :verified]))
+  end
+
+  test "the merge identity is writable at the stage that performs the merge" do
+    # Recording it only at `merged` left the merge with no replay identity.
+    assert :ci in StageMachine.effect_stages(:merge_sha)
+    assert :merged in StageMachine.effect_stages(:merge_sha)
+  end
+
+  test "a refused merge clears the identity it never realised" do
+    assert StageMachine.clears(:merged, :implementing, :merge_refused) == [:head_sha, :merge_sha]
   end
 
   test "every stage is reachable from detected" do

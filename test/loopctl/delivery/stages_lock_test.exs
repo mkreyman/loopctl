@@ -18,6 +18,8 @@ defmodule Loopctl.Delivery.StagesLockTest do
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
+  alias Loopctl.AuditChain
+  alias Loopctl.AuditChain.Entry
   alias Loopctl.Delivery.StageEvent
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
@@ -49,7 +51,25 @@ defmodule Loopctl.Delivery.StagesLockTest do
       from(s in Story, where: s.id == ^story.id)
       |> AdminRepo.update_all(set: [agent_status: :assigned])
 
+    on_exit(fn -> purge_chain(tenant.id) end)
+
     %{tenant: tenant, story: %{story | agent_status: :assigned}}
+  end
+
+  # `audit_chain` rows have a tenant FK with ON DELETE NOTHING and a delete-BLOCKING
+  # trigger, so a tenant that appended anything cannot be swept at module exit. These rows
+  # are this module's own committed test data; the trigger is disabled for the one delete
+  # and restored immediately. Safe because ExUnit runs `async: false` modules alone.
+  defp purge_chain(tenant_id) do
+    :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+
+    AdminRepo.query!("ALTER TABLE audit_chain DISABLE TRIGGER audit_chain_prevent_delete_trigger")
+
+    AdminRepo.query!("DELETE FROM audit_chain WHERE tenant_id = $1", [
+      Ecto.UUID.dump!(tenant_id)
+    ])
+
+    AdminRepo.query!("ALTER TABLE audit_chain ENABLE TRIGGER audit_chain_prevent_delete_trigger")
   end
 
   defp unboxed(fun) do
@@ -170,6 +190,149 @@ defmodule Loopctl.Delivery.StagesLockTest do
              Stages.advance(tenant.id, story.id, {:triaged, :queued}, claim_epoch: 2)
   end
 
+  test "a chained transition waits on the tenant's chain lock", %{tenant: tenant, story: story} do
+    # Without the advisory lock two appends in one tenant read the same head under their own
+    # snapshots, compute the same chain_position and the chain trigger raises on the second.
+    # Here the lock is HELD by another session, so the transition must block on it.
+    fixture(:story_stage, %{
+      tenant_id: tenant.id,
+      story_id: story.id,
+      stage: :queued,
+      claim_epoch: 1
+    })
+
+    parent = self()
+
+    holder =
+      unboxed(fn ->
+        AdminRepo.transaction(fn ->
+          AdminRepo.query!("SELECT pg_advisory_xact_lock($1::int, hashtext($2))", [
+            AuditChain.chain_lock_namespace(),
+            tenant.id
+          ])
+
+          send(parent, :holding)
+
+          receive do
+            :release -> :ok
+          end
+        end)
+      end)
+
+    assert_receive :holding, 2_000
+
+    advancer =
+      unboxed(fn ->
+        started = System.monotonic_time(:millisecond)
+
+        result =
+          Stages.advance(tenant.id, story.id, {:queued, :claimed},
+            claim_epoch: 1,
+            actor_lineage: []
+          )
+
+        {result, System.monotonic_time(:millisecond) - started}
+      end)
+
+    Process.sleep(300)
+    send(holder.pid, :release)
+    Task.await(holder, 5_000)
+
+    assert {{:ok, %StoryStage{stage: :claimed}}, elapsed_ms} = Task.await(advancer, 10_000)
+    assert elapsed_ms >= 250
+  end
+
+  test "two chained transitions in one tenant both commit, with gapless chain positions", %{
+    tenant: tenant,
+    story: first
+  } do
+    second = fixture(:ledger_story, %{tenant_id: tenant.id, claim_epoch: 1})
+
+    {2, _} =
+      from(s in Story, where: s.id in ^[first.id, second.id])
+      |> AdminRepo.update_all(set: [agent_status: :assigned])
+
+    for story <- [first, second] do
+      fixture(:story_stage, %{
+        tenant_id: tenant.id,
+        story_id: story.id,
+        stage: :queued,
+        claim_epoch: 1
+      })
+    end
+
+    parent = self()
+
+    tasks =
+      for story <- [first, second] do
+        unboxed(fn ->
+          send(parent, {:ready, self()})
+
+          receive do
+            :go -> :ok
+          end
+
+          Stages.advance(tenant.id, story.id, {:queued, :claimed},
+            claim_epoch: 1,
+            actor_lineage: []
+          )
+        end)
+      end
+
+    pids = for _ <- 1..2, do: receive(do: ({:ready, pid} -> pid))
+    Enum.each(pids, &send(&1, :go))
+    results = Task.await_many(tasks, 15_000)
+
+    assert Enum.all?(results, &match?({:ok, %StoryStage{stage: :claimed}}, &1)), inspect(results)
+
+    positions =
+      AdminRepo.all(
+        from e in Entry,
+          where: e.tenant_id == ^tenant.id,
+          order_by: [asc: e.chain_position],
+          select: e.chain_position
+      )
+
+    assert positions == [0, 1]
+  end
+
+  test "two AuditChain.append/2 calls in one tenant both commit, gapless", %{tenant: tenant} do
+    # The other append path (AdminRepo, no stage machine) takes the same per-tenant lock.
+    parent = self()
+
+    tasks =
+      for n <- 1..2 do
+        unboxed(fn ->
+          send(parent, {:ready, self()})
+
+          receive do
+            :go -> :ok
+          end
+
+          AuditChain.append(tenant.id, %{
+            action: "test_concurrent_append",
+            actor_lineage: [],
+            entity_type: "story",
+            entity_id: nil,
+            payload: %{"n" => n}
+          })
+        end)
+      end
+
+    pids = for _ <- 1..2, do: receive(do: ({:ready, pid} -> pid))
+    Enum.each(pids, &send(&1, :go))
+    results = Task.await_many(tasks, 15_000)
+
+    assert Enum.all?(results, &match?({:ok, %Entry{}}, &1)), inspect(results)
+
+    assert AdminRepo.all(
+             from e in Entry,
+               where: e.tenant_id == ^tenant.id,
+               order_by: [asc: e.chain_position],
+               select: e.chain_position
+           ) == [0, 1]
+  end
+
   test "a zombie runner is fenced after the reclaimer requeues its story", %{story: story} do
     row =
       fixture(:story_stage, %{
@@ -192,7 +355,10 @@ defmodule Loopctl.Delivery.StagesLockTest do
 
     # The runner that held epoch 1 comes back and tries to carry on.
     assert {:error, :stale_claim_epoch} =
-             Stages.advance(story.tenant_id, story.id, {:ci, :merged}, claim_epoch: 1)
+             Stages.advance(story.tenant_id, story.id, {:ci, :merged},
+               claim_epoch: 1,
+               actor_lineage: []
+             )
 
     assert {:error, :stale_claim_epoch} =
              Stages.record_effect(story.tenant_id, story.id, :pr_number, 7, claim_epoch: 1)
