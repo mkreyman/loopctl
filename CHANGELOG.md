@@ -15,7 +15,10 @@ All notable changes to loopctl are documented here.
   **`rel/env.sh.eex`** names the node `loopctl-<release>@$FLY_PRIVATE_IP` and exports
   `ERL_AFLAGS="-proto_dist inet6_tcp"` when `FLY_PRIVATE_IP` is set (Fly's private network
   is IPv6-only). Off Fly nothing changes. **`fly.toml` `[env]`** gains
-  `DNS_CLUSTER_QUERY = "loopctl.internal"` and `EXPECTED_APP_NODES = "2"`.
+  `DNS_CLUSTER_QUERY = "loopctl.internal"`, `EXPECTED_APP_NODES = "2"` (the machines that
+  can run, which the DB connection budget needs) and `CLUSTER_PEERS_MAY_SUSPEND = "true"`:
+  with `auto_stop_machines` the second machine is usually suspended, so a missing peer reads
+  `peers_may_be_suspended` instead of the `expected_peers_missing` alarm.
 
   **No secret to set, no deploy ordering.** The release carries its own cookie, and the node
   basename carries the release, so only machines of one release cluster. **Before deploying,
@@ -30,8 +33,9 @@ All notable changes to loopctl are documented here.
   enqueuer's cluster singleton resolves the duplicate leadership two nodes bring to a
   connection by standing one down instead of `:global` killing it; and
   `Loopctl.ClusterReadiness` warns at boot when `DNS_CLUSTER_QUERY` is set on a node no peer
-  could reach. **After the deploy, verify:** `loopctl.cluster.peers.count{status="clustered"}`
-  is 1 on both machines.
+  could reach. The new untagged `loopctl.cluster.peers.connected` gauge reports the connected
+  peer count with no judgement. **After the deploy, with both machines started, verify:**
+  `loopctl.cluster.peers.connected` is 1 on both machines.
 
 - **Runner control plane observability (#815).**
 

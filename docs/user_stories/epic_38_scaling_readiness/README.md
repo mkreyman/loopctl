@@ -89,6 +89,10 @@ is one of:
   intended to cluster", so it stays quiet.
 - `:clustered` — configured + expected peers connected.
 - `:expected_peers_missing` — configured + `EXPECTED_APP_NODES > 1` but too few peers.
+- `:peers_may_be_suspended` — the same, on a deployment that set
+  `CLUSTER_PEERS_MAY_SUSPEND=true` because `auto_stop_machines` normally suspends a peer
+  (production). Not an alarm and no boot WARN. There the connected count to watch is the
+  untagged `loopctl.cluster.peers.connected` gauge, with every machine started.
 - `:clustering_expected_dns_unconfigured` — `EXPECTED_APP_NODES` explicitly raised
   ABOVE the default (`> 2`) but `DNS_CLUSTER_QUERY` UNSET. This is the "count bumped
   but clustering forgotten" case: the node runs un-clustered and, unlike

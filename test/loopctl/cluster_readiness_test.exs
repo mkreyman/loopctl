@@ -20,6 +20,62 @@ defmodule Loopctl.ClusterReadinessTest do
 
   alias Loopctl.ClusterReadiness
 
+  describe "a deployment whose peers may be suspended" do
+    test "fewer peers than expected is :peers_may_be_suspended, not the alarm" do
+      assert %{status: :peers_may_be_suspended, peers: 0} =
+               ClusterReadiness.readiness(2, [], true, true)
+
+      assert %{status: :expected_peers_missing} = ClusterReadiness.readiness(2, [], true, false)
+    end
+
+    test "every other classification is unchanged by the switch" do
+      for {expected, peers, dns?} <- [
+            {2, [:peer@host], true},
+            {1, [], true},
+            {2, [], false},
+            {3, [], false}
+          ] do
+        assert ClusterReadiness.readiness(expected, peers, dns?, true).status ==
+                 ClusterReadiness.readiness(expected, peers, dns?, false).status
+      end
+    end
+
+    test "the boot check does not WARN about missing peers, but still WARNs about an unroutable node" do
+      quiet =
+        capture_log(fn ->
+          assert :ok == ClusterReadiness.boot_check(:"loopctl-x@fdaa::2", 2, [], true, true)
+        end)
+
+      refute quiet =~ "UN-CLUSTERED"
+
+      loud =
+        capture_log(fn ->
+          assert :ok == ClusterReadiness.boot_check(:"loopctl@127.0.0.1", 2, [], true, true)
+        end)
+
+      assert loud =~ "named on a loopback host"
+    end
+
+    test "CLUSTER_PEERS_MAY_SUSPEND is on only for exactly \"true\"" do
+      assert ClusterReadiness.parse_peers_may_suspend("true")
+
+      for value <- [nil, "", "false", "TRUE", "1", "yes"] do
+        refute ClusterReadiness.parse_peers_may_suspend(value), inspect(value)
+      end
+    end
+
+    test "peers_may_suspend?/0 is off where the config does not set it (test env)" do
+      refute ClusterReadiness.peers_may_suspend?()
+    end
+  end
+
+  describe "connected_peers/0" do
+    test "is the connected peer count, with no expectation attached" do
+      assert ClusterReadiness.connected_peers() == length(Node.list())
+      assert is_integer(ClusterReadiness.connected_peers())
+    end
+  end
+
   describe "distribution_routable?/1 and the unroutable-node WARN" do
     test "a node named after a routable address is reachable; loopback and undistributed are not" do
       assert ClusterReadiness.distribution_routable?(:"loopctl-01K4@fdaa:0:1:a7b:2b8:36e4:711e:2")
@@ -55,7 +111,7 @@ defmodule Loopctl.ClusterReadinessTest do
     test "the boot check runs the unroutable-node WARN as well as the peers WARN" do
       log =
         capture_log(fn ->
-          assert :ok == ClusterReadiness.boot_check(:"loopctl@127.0.0.1", 2, [], true)
+          assert :ok == ClusterReadiness.boot_check(:"loopctl@127.0.0.1", 2, [], true, false)
         end)
 
       assert log =~ "named on a loopback host"

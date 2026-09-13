@@ -773,9 +773,9 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
       #     `poll_cluster_readiness/0` (a periodic measurement wired into
       #     `LoopctlWeb.Telemetry.periodic_measurements/0`) from
       #     `Loopctl.ClusterReadiness.readiness/0`. The measurement is the connected
-      #     BEAM peer COUNT (`length(Node.list/0)`); the ONLY tag is the bounded 4-value
+      #     BEAM peer COUNT (`length(Node.list/0)`); the ONLY tag is the bounded 5-value
       #     `status` set (`:single_node`/`:clustered`/`:expected_peers_missing`/
-      #     `:clustering_expected_dns_unconfigured`) — NEVER
+      #     `:peers_may_be_suspended`/`:clustering_expected_dns_unconfigured`) — NEVER
       #     a node NAME or the DNS query string (both endpoints/ports are non-public,
       #     but the no-sensitive-data + bounded-cardinality contract AC-27.15.3 holds
       #     regardless). On a single node this reads `{status="single_node", count=0}`,
@@ -787,6 +787,19 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
           "Connected BEAM cluster peers (Node.list/0 length), by clustering-readiness status.",
         tags: [:status],
         tag_values: &cluster_peers_tags/1
+      ),
+
+      # 23b. Connected-peer reading. The SAME poll event as metric 23, with no status and no
+      #      threshold: how many BEAM peers this node is connected to, full stop. Metric 23
+      #      judges that count against the expected node count; this one only reports it,
+      #      so it never reads as an alarm when a machine is merely suspended
+      #      (`auto_stop_machines`). It is what the clustering verification asserts: `1` on
+      #      both machines while both run.
+      last_value("loopctl.cluster.peers.connected",
+        event_name: [:loopctl, :cluster, :peers],
+        measurement: :count,
+        description:
+          "Connected BEAM cluster peers (Node.list/0 length), with no readiness judgement."
       ),
 
       # 24. Egress-blocked counter (US-41.4, AC-41.4.6). The AGGREGATE blocked-rate
@@ -873,7 +886,7 @@ defmodule Loopctl.Telemetry.ScaleMetrics do
   @doc """
   `tag_values` for the clustering-readiness peer gauge (US-38.3). Emits ONLY the
   bounded `status` label (`:single_node`/`:clustered`/`:expected_peers_missing`/
-  `:clustering_expected_dns_unconfigured`) —
+  `:peers_may_be_suspended`/`:clustering_expected_dns_unconfigured`) —
   NEVER a node name or the DNS query string. Defaults a missing status to `"unknown"`
   so a direct `:telemetry.execute/3` with a partial map never raises or emits blank.
   """

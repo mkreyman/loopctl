@@ -55,6 +55,14 @@ defmodule Loopctl.ClusterReadiness do
       but fewer peers than expected are connected (e.g. running un-clustered after a
       count bump). This is the state the boot WARN and the runbook gate exist to
       surface BEFORE it becomes a silent split-brain.
+    * `:peers_may_be_suspended` — as `:expected_peers_missing`, but the deployment has
+      declared that its peers may be suspended (`CLUSTER_PEERS_MAY_SUSPEND=true`, set in
+      `fly.toml` next to `auto_stop_machines`). There `EXPECTED_APP_NODES` is the machine
+      count that CAN run (the DB connection budget needs that), not the count that is
+      running, so fewer peers is the normal state and never warns. A deployment that
+      always runs every machine leaves the switch unset and gets `:expected_peers_missing`
+      back. `connected_peers/0` (`loopctl.cluster.peers.connected`) still says how many
+      are connected.
     * `:clustering_expected_dns_unconfigured` — `EXPECTED_APP_NODES` explicitly raised
       ABOVE the single-node default (`> 2`) yet `DNS_CLUSTER_QUERY` is UNSET. An
       operator bumped the node count but forgot to wire clustering, so the node runs
@@ -99,6 +107,16 @@ defmodule Loopctl.ClusterReadiness do
   def peers, do: Node.list()
 
   @doc """
+  How many BEAM peers this node is connected to, with no judgement about how many there
+  should be. The readiness `status` compares the count with `EXPECTED_APP_NODES`; this
+  reading only reports it (the `loopctl.cluster.peers.connected` gauge), so a machine that
+  is merely suspended never reads as an alarm here. Clustering verification asserts it is
+  `1` on both machines while both run.
+  """
+  @spec connected_peers() :: non_neg_integer()
+  def connected_peers, do: length(peers())
+
+  @doc """
   The clustering-readiness signal as a BOUNDED, non-sensitive map:
 
       %{
@@ -106,11 +124,11 @@ defmodule Loopctl.ClusterReadiness do
         peers: non_neg_integer(),   # length(Node.list/0), never node names
         expected_nodes: pos_integer(),
         status: :single_node | :clustered | :expected_peers_missing
-                | :clustering_expected_dns_unconfigured
+                | :peers_may_be_suspended | :clustering_expected_dns_unconfigured
       }
 
   Resolves the live inputs (`expected_app_nodes/0`, `Node.list/0`, the DNS-query
-  config) and delegates to the pure `readiness/3`.
+  config, `peers_may_suspend?/0`) and delegates to the pure `readiness/4`.
   """
   @spec readiness() :: %{
           dns_cluster_query_configured: boolean(),
@@ -120,11 +138,32 @@ defmodule Loopctl.ClusterReadiness do
             :single_node
             | :clustered
             | :expected_peers_missing
+            | :peers_may_be_suspended
             | :clustering_expected_dns_unconfigured
         }
   def readiness do
-    readiness(DbCapacity.expected_app_nodes(), peers(), dns_cluster_query_configured?())
+    readiness(
+      DbCapacity.expected_app_nodes(),
+      peers(),
+      dns_cluster_query_configured?(),
+      peers_may_suspend?()
+    )
   end
+
+  @doc """
+  Whether this deployment's peers may be suspended (`CLUSTER_PEERS_MAY_SUSPEND`, read in
+  `config/runtime.exs` through `parse_peers_may_suspend/1`). Off by default.
+  """
+  @spec peers_may_suspend?() :: boolean()
+  def peers_may_suspend?,
+    do: Application.get_env(:loopctl, :cluster_peers_may_suspend, false) == true
+
+  @doc """
+  Parses a `CLUSTER_PEERS_MAY_SUSPEND` value: `"true"` is true, anything else (unset
+  included) is false, so a typo restores the alarm rather than silencing it.
+  """
+  @spec parse_peers_may_suspend(String.t() | nil) :: boolean()
+  def parse_peers_may_suspend(value), do: value == "true"
 
   @doc """
   Pure readiness classification from injected inputs — the seam tests drive directly
@@ -139,23 +178,41 @@ defmodule Loopctl.ClusterReadiness do
             :single_node
             | :clustered
             | :expected_peers_missing
+            | :peers_may_be_suspended
             | :clustering_expected_dns_unconfigured
         }
-  def readiness(expected_nodes, peers, dns_configured?)
-      when is_integer(expected_nodes) and is_list(peers) and is_boolean(dns_configured?) do
+  def readiness(expected_nodes, peers, dns_configured?),
+    do: readiness(expected_nodes, peers, dns_configured?, false)
+
+  @doc "`readiness/3` for a deployment that has declared whether its peers may be suspended."
+  @spec readiness(pos_integer(), [node()], boolean(), boolean()) :: %{
+          dns_cluster_query_configured: boolean(),
+          peers: non_neg_integer(),
+          expected_nodes: pos_integer(),
+          status:
+            :single_node
+            | :clustered
+            | :expected_peers_missing
+            | :peers_may_be_suspended
+            | :clustering_expected_dns_unconfigured
+        }
+  def readiness(expected_nodes, peers, dns_configured?, may_suspend?)
+      when is_integer(expected_nodes) and is_list(peers) and is_boolean(dns_configured?) and
+             is_boolean(may_suspend?) do
     peer_count = length(peers)
 
     %{
       dns_cluster_query_configured: dns_configured?,
       peers: peer_count,
       expected_nodes: expected_nodes,
-      status: clustering_status(expected_nodes, peer_count, dns_configured?)
+      status: clustering_status(expected_nodes, peer_count, dns_configured?, may_suspend?)
     }
   end
 
   # <= 1 expected node => single-node / not required (clustering never applies).
-  defp clustering_status(expected_nodes, _peer_count, _dns?) when expected_nodes <= 1,
-    do: :single_node
+  defp clustering_status(expected_nodes, _peer_count, _dns?, _may_suspend?)
+       when expected_nodes <= 1,
+       do: :single_node
 
   # Clustering NOT configured (DNS_CLUSTER_QUERY unset). Two sub-cases, split on the
   # single-node baseline so the signal is actionable WITHOUT crying wolf:
@@ -171,14 +228,21 @@ defmodule Loopctl.ClusterReadiness do
   #     to surface. This IS distinguishable, so it gets its own status
   #     (`:clustering_expected_dns_unconfigured`) and a boot WARN whose only guard is
   #     "set DNS_CLUSTER_QUERY first" (peers can never connect until it is set).
-  defp clustering_status(expected_nodes, _peer_count, false) do
+  defp clustering_status(expected_nodes, _peer_count, false, _may_suspend?) do
     if expected_nodes > @single_node_baseline,
       do: :clustering_expected_dns_unconfigured,
       else: :single_node
   end
 
-  defp clustering_status(expected_nodes, peer_count, true) do
-    if peer_count >= expected_nodes - 1, do: :clustered, else: :expected_peers_missing
+  # Configured. Fewer peers than expected alarms only where no machine may be suspended:
+  # with `auto_stop_machines` a missing peer is the normal state, and a standing alarm
+  # teaches everyone to ignore the gauge.
+  defp clustering_status(expected_nodes, peer_count, true, may_suspend?) do
+    cond do
+      peer_count >= expected_nodes - 1 -> :clustered
+      may_suspend? -> :peers_may_be_suspended
+      true -> :expected_peers_missing
+    end
   end
 
   @doc """
@@ -200,18 +264,24 @@ defmodule Loopctl.ClusterReadiness do
   """
   @spec warn_if_expected_peers_missing() :: :ok
   def warn_if_expected_peers_missing do
-    boot_check(node(), DbCapacity.expected_app_nodes(), peers(), dns_cluster_query_configured?())
+    boot_check(
+      node(),
+      DbCapacity.expected_app_nodes(),
+      peers(),
+      dns_cluster_query_configured?(),
+      peers_may_suspend?()
+    )
   end
 
   @doc """
   Both boot checks over injected inputs: the unroutable-node WARN
   (`warn_if_distribution_unroutable/2`), then the peers WARN
-  (`warn_if_expected_peers_missing/3`). Returns `:ok` and never raises.
+  (`warn_if_expected_peers_missing/4`). Returns `:ok` and never raises.
   """
-  @spec boot_check(node(), pos_integer(), [node()], boolean()) :: :ok
-  def boot_check(node, expected_nodes, peers, dns_configured?) do
+  @spec boot_check(node(), pos_integer(), [node()], boolean(), boolean()) :: :ok
+  def boot_check(node, expected_nodes, peers, dns_configured?, may_suspend?) do
     warn_if_distribution_unroutable(node, dns_configured?)
-    warn_if_expected_peers_missing(expected_nodes, peers, dns_configured?)
+    warn_if_expected_peers_missing(expected_nodes, peers, dns_configured?, may_suspend?)
   end
 
   @doc """
@@ -269,10 +339,16 @@ defmodule Loopctl.ClusterReadiness do
   on the gauge is the real alarm; a single boot WARN that clears is expected.
   """
   @spec warn_if_expected_peers_missing(pos_integer(), [node()], boolean()) :: :ok
-  def warn_if_expected_peers_missing(expected_nodes, peers, dns_configured?)
-      when is_integer(expected_nodes) and is_list(peers) and is_boolean(dns_configured?) do
+  def warn_if_expected_peers_missing(expected_nodes, peers, dns_configured?),
+    do: warn_if_expected_peers_missing(expected_nodes, peers, dns_configured?, false)
+
+  @doc "`warn_if_expected_peers_missing/3`, for a deployment whose peers may be suspended."
+  @spec warn_if_expected_peers_missing(pos_integer(), [node()], boolean(), boolean()) :: :ok
+  def warn_if_expected_peers_missing(expected_nodes, peers, dns_configured?, may_suspend?)
+      when is_integer(expected_nodes) and is_list(peers) and is_boolean(dns_configured?) and
+             is_boolean(may_suspend?) do
     peer_count = length(peers)
-    status = clustering_status(expected_nodes, peer_count, dns_configured?)
+    status = clustering_status(expected_nodes, peer_count, dns_configured?, may_suspend?)
 
     case status do
       :expected_peers_missing ->
