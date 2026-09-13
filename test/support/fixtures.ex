@@ -749,6 +749,44 @@ defmodule Loopctl.Fixtures do
     )
   end
 
+  # A GitHub `issues` webhook payload (issue #803), as GitHub sends it, trimmed to the keys
+  # intake reads plus the repository and sender objects. Pass `:repo`, `:action`, `:number`,
+  # `:title`, `:body`, `:labels`, `:login`, `:updated_at` to override.
+  def build(:github_issues_payload, attrs) do
+    attrs = Enum.into(attrs, %{})
+    repo = Map.get(attrs, :repo, "mkreyman/home_care_billing")
+    number = Map.get(attrs, :number, 42)
+    login = Map.get(attrs, :login, "hcb-support-bot")
+
+    %{
+      "action" => Map.get(attrs, :action, "opened"),
+      "issue" => %{
+        "id" => 3_000_000_000 + number,
+        "number" => number,
+        "html_url" => "https://github.com/#{repo}/issues/#{number}",
+        "state" => Map.get(attrs, :state, "open"),
+        "title" => Map.get(attrs, :title, "[Bug] AVA Home Care: Monthly total is wrong"),
+        "body" => Map.get(attrs, :body, build(:intake_benign_ticket_body)),
+        "labels" => Enum.map(Map.get(attrs, :labels, ["bug"]), &%{"name" => &1}),
+        "user" => %{"login" => login, "type" => "Bot"},
+        "updated_at" => Map.get(attrs, :updated_at, "2026-09-12T10:00:00Z")
+      },
+      "repository" => %{"id" => 7, "full_name" => repo, "private" => true},
+      "sender" => %{"login" => login}
+    }
+  end
+
+  # The recorded hostile inputs of issue #804: `%{"text" => %{signal => [sample]},
+  # "user_agent" => %{"user_agent_prose" => [...], "benign" => [...]}}`.
+  def build(:intake_hostile_samples, _attrs) do
+    "test/support/intake_fixtures/hostile_samples.json" |> File.read!() |> Jason.decode!()
+  end
+
+  # A benign HomeCareBilling support ticket, in the issue format its worker files.
+  def build(:intake_benign_ticket_body, _attrs) do
+    File.read!("test/support/intake_fixtures/benign_ticket_body.md")
+  end
+
   @doc """
   Inserts a record into the database, auto-creating any required dependencies.
   Returns the inserted struct.
@@ -1809,6 +1847,32 @@ defmodule Loopctl.Fixtures do
       Loopctl.Runners.enroll_runner(tenant_id, %{name: name})
 
     {raw_key, runner}
+  end
+
+  # A GitHub intake source (issue #803). Returns `{webhook_secret, source}` so a test can
+  # sign deliveries. Auto-creates the tenant and an active work project when not given.
+  def fixture(:intake_source, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    tenant_id =
+      case Map.get(attrs, :tenant_id) do
+        nil -> fixture(:tenant).id
+        tid -> tid
+      end
+
+    project_id =
+      case Map.get(attrs, :project_id) do
+        nil -> fixture(:project, %{tenant_id: tenant_id}).id
+        pid -> pid
+      end
+
+    {:ok, %{source: source, webhook_secret: secret}} =
+      Loopctl.Intake.create_source(tenant_id, %{
+        repo_full_name: Map.get(attrs, :repo_full_name, "mkreyman/home_care_billing"),
+        project_id: project_id
+      })
+
+    {secret, source}
   end
 
   def fixture(:api_key, attrs) do

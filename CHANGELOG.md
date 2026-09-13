@@ -95,6 +95,33 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **GitHub webhook intake for the agent delivery loop, with reporter text held as untrusted
+  data (#803, #804).** Migration `20260913110000` creates `intake_sources`,
+  `intake_records` and `intake_deliveries`, all new tables with RLS enabled; it rewrites no
+  existing rows and needs no manual step.
+
+  **A new PUBLIC, unauthenticated route: `POST /api/v1/intake/github/:source_id`.** It takes
+  no API key. It is authenticated by GitHub's `X-Hub-Signature-256` HMAC over the raw body,
+  under a per-source secret, and answers every failure (unknown or revoked source, suspended
+  tenant, missing or wrong signature, a payload for another repository) with the same
+  `401 invalid_signature`. Its body is capped at 1 MiB (`413 payload_too_large`), read ahead
+  of `Plug.Parsers` so the JSON is never decoded before the signature is checked, and it is
+  throttled per client IP, fail-closed, at 1,200 requests a minute
+  (`config :loopctl, LoopctlWeb.Plugs.GithubIntakeThrottle`). GitHub's deliveries share a
+  few egress addresses across every tenant, which is why that ceiling is high. A replayed
+  or redelivered `X-GitHub-Delivery` changes nothing and answers `200 duplicate`.
+
+  **Sources: `POST`, `GET` and `DELETE /api/v1/intake/sources`**, user role, writes behind
+  the human anchor (new `issue_intake` surface in the tier map), and creation behind the
+  lineage ceiling (`403 api_key_mint_forbidden`) because it mints a credential. The webhook
+  secret is generated server-side, **encrypted at rest** (Cloak AES-256-GCM, re-encrypted by
+  `mix loopctl.reencrypt_secrets` like every other encrypted column) and returned once.
+
+  Issue title, body, labels and author are stored only in `untrusted_*` columns, capped, and
+  never copied into a story. A deterministic injection detector escalates a record and
+  appends an `intake_escalated` audit chain entry naming the signals, never the text. Nothing
+  creates stories or dispatches triage yet.
+
 - **Two new secrets for the agent delivery loop's Gate B: `DELIVERY_GATES_CONFIG` and
   `DELIVERY_GATES_CONFIG_SHA256` (#803 prerequisites).** The first is the trigger JSON
   document, inline; the second is the hex SHA-256 of its exact bytes. Both default to unset,

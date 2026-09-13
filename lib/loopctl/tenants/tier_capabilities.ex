@@ -107,6 +107,10 @@ defmodule Loopctl.Tenants.TierCapabilities do
      "Enrolling and revoking agent delivery loop runners (#801): a runner is a machine " <>
        "that executes dispatched sessions, so admitting one is an execution root. Listing " <>
        "enrolled runners stays open."},
+    {:issue_intake, :human_anchored,
+     "Creating and revoking GitHub intake sources for the agent delivery loop (#803): a " <>
+       "source admits outside issue text into a work project's queue. Listing sources " <>
+       "stays open."},
     {:token_budgets, :human_anchored,
      "RECORDING token usage (POST /api/v1/token-usage — the per-dispatch usage report " <>
        "agents emit at end of work), correcting/deleting usage records, token budgets, " <>
@@ -158,6 +162,7 @@ defmodule Loopctl.Tenants.TierCapabilities do
     ],
     dispatch: ["LoopctlWeb.DispatchController"],
     runner_pool: ["LoopctlWeb.RunnerController"],
+    issue_intake: ["LoopctlWeb.IntakeSourceController"],
     token_budgets: [
       "LoopctlWeb.TokenBudgetController",
       "LoopctlWeb.TokenUsageController",
