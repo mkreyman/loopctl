@@ -36,6 +36,21 @@ defmodule Loopctl.AuditChain do
 
   @zero_hash :binary.copy(<<0>>, 32)
 
+  # The per-tenant chain lock (#803 review H1). `SELECT ... ORDER BY chain_position DESC
+  # LIMIT 1 FOR UPDATE` does NOT serialise appends: the blocked session re-reads under its
+  # own snapshot, does not see the row the other session just inserted, computes the SAME
+  # `chain_position + 1`, and `audit_chain_verify_invariants` raises P0001. A
+  # transaction-scoped ADVISORY lock, taken BEFORE the head read, is what makes two
+  # concurrent appends in one tenant queue instead of collide. Its own namespace, distinct
+  # from the runner-capacity lock (0x41050803, PR #822).
+  #
+  # LOCK ORDER, fleet-wide — take them in this order everywhere, never the reverse:
+  #
+  #     capacity advisory lock -> story FOR SHARE -> stage row -> CHAIN ADVISORY LOCK ->
+  #     chain head FOR UPDATE
+  #
+  @chain_lock_namespace 0x4105_A1D7
+
   @doc """
   Appends a new entry to a tenant's audit chain.
 
@@ -64,6 +79,9 @@ defmodule Loopctl.AuditChain do
 
     multi =
       Multi.new()
+      |> Multi.run(:lock_chain, fn _repo, _changes ->
+        lock_tenant_chain(AdminRepo, tenant_id)
+      end)
       |> Multi.run(:lock_and_read, fn _repo, _changes ->
         lock_and_read_previous(tenant_id)
       end)
@@ -77,20 +95,65 @@ defmodule Loopctl.AuditChain do
 
     case AdminRepo.transaction(multi) do
       {:ok, %{insert_entry: entry}} ->
-        # US-26.5.1: broadcast new entry to the tenant's per-tenant subscribers.
-        ChainPubSub.broadcast_entry(tenant_id, entry)
-        # US-35.2: ALSO broadcast a MINIMAL tenant-scoped notification to the
-        # fixed cross-tenant firehose so the supervised SthEnqueuer can
-        # activity-gate STH computation. Only entry.tenant_id crosses this shared
-        # topic (never the entry payload/actor_lineage). Additive and
-        # fire-and-forget — it never changes or gates the existing per-tenant
-        # broadcast, and a firehose delivery fault never affects the append.
-        ChainPubSub.broadcast_entry_firehose(entry)
+        announce_entry(entry)
         {:ok, entry}
 
       {:error, _step, reason, _changes} ->
         {:error, reason}
     end
+  end
+
+  @doc """
+  Appends an entry INSIDE the caller's `Loopctl.Repo.with_tenant/2` transaction for
+  `tenant_id`, so the entry commits or rolls back with the state change it records (issue
+  #803: the delivery stage machine runs on the RLS repo, and an append on `AdminRepo` would
+  be a second transaction on a second connection — not atomic, and a checkout from a pool
+  of three).
+
+  Same construction, the same per-tenant advisory lock and the same head-row lock as
+  `append/2`. It does NOT broadcast: the
+  entry is not committed yet. The caller passes the returned entry to `announce_entry/1`
+  after its transaction commits.
+
+  Raises when called outside a `Loopctl.Repo` transaction.
+  """
+  @spec append_in_tenant_transaction(Ecto.UUID.t(), map()) ::
+          {:ok, Entry.t()} | {:error, Ecto.Changeset.t()}
+  def append_in_tenant_transaction(tenant_id, attrs)
+      when is_binary(tenant_id) and is_map(attrs) do
+    unless Loopctl.Repo.in_transaction?(),
+      do: raise(ArgumentError, "append_in_tenant_transaction/2 needs a Loopctl.Repo transaction")
+
+    {:ok, :locked} = lock_tenant_chain(Loopctl.Repo, tenant_id)
+    {:ok, {position, prev_hash}} = lock_and_read_previous(Loopctl.Repo, tenant_id)
+    entry_attrs = build_entry_attrs(tenant_id, position, prev_hash, attrs, DateTime.utc_now())
+
+    %Entry{tenant_id: tenant_id}
+    |> Entry.changeset(entry_attrs)
+    |> Loopctl.Repo.insert()
+  end
+
+  @doc """
+  The advisory-lock namespace the per-tenant chain lock is taken in — distinct from every
+  other advisory lock in the fleet. Public so a test can take the SAME lock rather than
+  restating the number.
+  """
+  @spec chain_lock_namespace() :: pos_integer()
+  def chain_lock_namespace, do: @chain_lock_namespace
+
+  @doc """
+  Publishes a COMMITTED entry: the per-tenant broadcast (US-26.5.1) and the minimal
+  firehose notification the STH enqueuer activity-gates on (US-35.2). `append/2` calls it
+  itself; a caller of `append_in_tenant_transaction/2` calls it after commit.
+  """
+  @spec announce_entry(Entry.t()) :: :ok
+  def announce_entry(%Entry{} = entry) do
+    ChainPubSub.broadcast_entry(entry.tenant_id, entry)
+    # Only entry.tenant_id crosses this shared topic (never the entry payload or
+    # actor_lineage). Additive and fire-and-forget — a firehose delivery fault never
+    # affects the append.
+    ChainPubSub.broadcast_entry_firehose(entry)
+    :ok
   end
 
   @doc """
@@ -811,7 +874,19 @@ defmodule Loopctl.AuditChain do
 
   # --- Private ---
 
-  defp lock_and_read_previous(tenant_id) do
+  # Serialises this tenant's appends for the rest of the caller's transaction. Held per
+  # TENANT, so appends for other tenants are unaffected, and released at commit or rollback
+  # with no unlock to forget.
+  defp lock_tenant_chain(repo, tenant_id) do
+    repo.query!("SELECT pg_advisory_xact_lock($1::int, hashtext($2))", [
+      @chain_lock_namespace,
+      tenant_id
+    ])
+
+    {:ok, :locked}
+  end
+
+  defp lock_and_read_previous(repo \\ AdminRepo, tenant_id) do
     # Lock the latest entry to serialize concurrent appends
     case from(e in Entry,
            where: e.tenant_id == ^tenant_id,
@@ -819,7 +894,7 @@ defmodule Loopctl.AuditChain do
            limit: 1,
            lock: "FOR UPDATE"
          )
-         |> AdminRepo.one() do
+         |> repo.one() do
       nil ->
         # Genesis entry
         {:ok, {0, @zero_hash}}

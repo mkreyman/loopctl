@@ -21,6 +21,7 @@ defmodule Loopctl.BulkOperations do
   alias Loopctl.AdminRepo
   alias Loopctl.Artifacts.VerificationResult
   alias Loopctl.Audit
+  alias Loopctl.Delivery.Stages
   alias Loopctl.Dispatches
   alias Loopctl.Progress
   alias Loopctl.Webhooks.EventGenerator
@@ -526,7 +527,21 @@ defmodule Loopctl.BulkOperations do
       )
     )
     |> AdminRepo.update()
+    |> follow_claim()
   end
+
+  # #803: the stage row follows the claim's epoch inside bulk claim's transaction, like the
+  # single-story claim (Loopctl.Delivery.Stages.follow_claim/4).
+  defp follow_claim({:ok, claimed} = result) do
+    {:ok, _stage} =
+      Stages.follow_claim(claimed.tenant_id, claimed.id, claimed.claim_epoch,
+        actor_label: "bulk:claim"
+      )
+
+    result
+  end
+
+  defp follow_claim(error), do: error
 
   defp apply_verification(story) do
     now = DateTime.utc_now()
@@ -592,7 +607,21 @@ defmodule Loopctl.BulkOperations do
       |> Map.merge(Progress.claim_release_change(story))
     )
     |> AdminRepo.update()
+    |> follow_release()
   end
+
+  # #803: the stage row follows the release inside bulk reject's transaction, like the
+  # single-story auto-reset (Loopctl.Delivery.Stages.follow_release/5).
+  defp follow_release({:ok, reset} = result) do
+    {:ok, _stage} =
+      Stages.follow_release(reset.tenant_id, reset.id, reset.claim_epoch, :claim_released,
+        actor_label: "system:auto_reset"
+      )
+
+    result
+  end
+
+  defp follow_release(error), do: error
 
   # ===================================================================
   # Private: Verification/Rejection Result Records

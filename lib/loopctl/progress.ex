@@ -22,6 +22,7 @@ defmodule Loopctl.Progress do
   alias Loopctl.Audit
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Capabilities
+  alias Loopctl.Delivery.Stages
   alias Loopctl.Dispatches
   alias Loopctl.Tenants
   alias Loopctl.TokenUsage
@@ -217,6 +218,13 @@ defmodule Loopctl.Progress do
       # is that a secret-store blip fails the claim rather than half-completing it
       # — which is the correct trade for an operation whose whole output is a
       # credential.
+      # #803: a claim bumps the epoch too, so the stage row follows it in THIS transaction.
+      # Its stage does not change — the loop's own advance(queued -> claimed) does that —
+      # but a row left at the old epoch (a story claimed while still at `detected` or
+      # `triaged`) would be refused on every advance with nothing able to move it.
+      |> Multi.run(:stage, fn _repo, %{story: updated} ->
+        Stages.follow_claim(tenant_id, updated.id, updated.claim_epoch, actor_label: actor_label)
+      end)
       |> Multi.run(:mint_cap, fn _repo, %{story: updated} ->
         mint_cap(tenant_id, "start_cap", updated.id, Keyword.get(opts, :lineage, []))
       end)
@@ -1176,6 +1184,12 @@ defmodule Loopctl.Progress do
         |> Ecto.Changeset.change(release_claim_changes(story))
         |> AdminRepo.update()
       end)
+      # #803: the stage row follows the release in this transaction (see follow_release/5).
+      |> Multi.run(:stage, fn _repo, %{story: updated} ->
+        Stages.follow_release(tenant_id, updated.id, updated.claim_epoch, :claim_released,
+          actor_label: actor_label
+        )
+      end)
       |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
         %{
           tenant_id: tenant_id,
@@ -1480,7 +1494,8 @@ defmodule Loopctl.Progress do
   `lifecycle_entered_at` stamped (so the backfill launder guard keeps refusing the
   story), lease cleared and epoch bumped. Recorded as a `claim_lease_expired` audit
   entry by the system actor, and announced as `story.force_unclaimed` with
-  `reason: "claim_lease_expired"`.
+  `reason: "claim_lease_expired"`. A delivery stage row in flight is moved back to
+  `queued` in the same transaction (`Loopctl.Delivery.Stages.follow_release/5`).
 
   A story with NO lease (`claimed_until` NULL — claimed before leases existed, and
   never renewed since) is never reclaimed: nothing renews those claims, so a lease
@@ -1525,6 +1540,14 @@ defmodule Loopctl.Progress do
         story
         |> Ecto.Changeset.change(release_claim_changes(story))
         |> AdminRepo.update()
+      end)
+      # #803: the claimant is gone, so its delivery stage row follows the release in THIS
+      # transaction — the two commit together or not at all. A row left behind the new epoch
+      # would be refused on every advance with nothing able to move it.
+      |> Multi.run(:stage, fn _repo, %{story: updated} ->
+        Stages.follow_release(tenant_id, updated.id, updated.claim_epoch, :runner_lost,
+          actor_label: "worker:reclaim_expired_claims"
+        )
       end)
       |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
         %{
@@ -2710,6 +2733,14 @@ defmodule Loopctl.Progress do
           |> AdminRepo.update()
         end
       end)
+      # #803: the stage row follows the release in this transaction. On the idempotent
+      # :pending branch the epoch did not move, and this rebinds a row a release left behind
+      # before follow_release/5 existed — the same operator remedy as the retro-stamp above.
+      |> Multi.run(:stage, fn _repo, %{story: updated} ->
+        Stages.follow_release(tenant_id, updated.id, updated.claim_epoch, :claim_released,
+          actor_label: actor_label
+        )
+      end)
       |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
         %{
           tenant_id: tenant_id,
@@ -3193,6 +3224,15 @@ defmodule Loopctl.Progress do
       )
 
     with {:ok, reset_story} <- AdminRepo.update(changeset),
+         # #803: the stage row follows the release inside the reject's transaction.
+         {:ok, _stage} <-
+           Stages.follow_release(
+             tenant_id,
+             reset_story.id,
+             reset_story.claim_epoch,
+             :claim_released,
+             actor_label: "system:auto_reset"
+           ),
          {:ok, _audit} <-
            Audit.create_log_entry(tenant_id, %{
              entity_type: "story",

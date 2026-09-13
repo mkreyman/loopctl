@@ -17,8 +17,10 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Artifacts.VerificationResult
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Auth
+  alias Loopctl.Auth.ApiKey
   alias Loopctl.ContextRetriever.Entity
   alias Loopctl.Coordination.ChannelClaim
+  alias Loopctl.Delivery.StoryStage
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleAccessEvent
   alias Loopctl.Knowledge.ArticleLink
@@ -1970,6 +1972,92 @@ defmodule Loopctl.Fixtures do
       end)
 
     story
+  end
+
+  # A story for the delivery stage machine (#803), made ENTIRELY on the RLS `Loopctl.Repo`
+  # sandbox connection — its tenant included — so `Loopctl.Delivery.Stages`, which runs on
+  # `Repo`, sees it inside an async test's sandbox without committing anything. Pass
+  # `:tenant_id` to add a story to a tenant made by an earlier call. Accepts `:claim_epoch`
+  # and `:agent_status`.
+  def fixture(:stage_story, attrs) do
+    attrs = Enum.into(attrs, %{})
+
+    tenant_id =
+      Map.get_lazy(attrs, :tenant_id, fn ->
+        %Tenant{} |> Tenant.create_changeset(build(:tenant, %{})) |> Loopctl.Repo.insert!()
+      end)
+      |> case do
+        %Tenant{id: id} -> id
+        id -> id
+      end
+
+    story =
+      fixture(:ledger_story, %{tenant_id: tenant_id, claim_epoch: Map.get(attrs, :claim_epoch, 0)})
+
+    case Map.get(attrs, :agent_status) do
+      nil ->
+        story
+
+      status ->
+        {:ok, story} =
+          Loopctl.Repo.with_tenant(tenant_id, fn ->
+            story |> Ecto.Changeset.change(agent_status: status) |> Loopctl.Repo.update!()
+          end)
+
+        story
+    end
+  end
+
+  # A runner (and its key) on the RLS `Loopctl.Repo` sandbox connection, for a
+  # `story_stages.runner_id` written by `Loopctl.Delivery.Stages` in an async test (#803).
+  def fixture(:stage_runner, attrs) do
+    tenant_id = attrs |> Enum.into(%{}) |> Map.fetch!(:tenant_id)
+
+    {:ok, runner} =
+      Loopctl.Repo.with_tenant(tenant_id, fn ->
+        api_key =
+          %ApiKey{tenant_id: tenant_id}
+          |> ApiKey.create_changeset(%{name: "runner:stage", role: :agent})
+          |> Ecto.Changeset.put_change(:key_hash, Auth.hash_key(Ecto.UUID.generate()))
+          |> Ecto.Changeset.put_change(:key_prefix, "lc_stage")
+          |> Loopctl.Repo.insert!()
+
+        %Runner{tenant_id: tenant_id}
+        |> Runner.create_changeset(%{name: "runner-#{System.unique_integer([:positive])}"})
+        |> Ecto.Changeset.put_change(:api_key_id, api_key.id)
+        |> Loopctl.Repo.insert!()
+      end)
+
+    runner
+  end
+
+  # A delivery stage row inserted DIRECTLY at any stage (#803), bypassing
+  # `Loopctl.Delivery.Stages` so a test can start from `ci` or `implementing` without
+  # walking the machine there. `:repo` picks the sandbox connection the story lives on:
+  # `Loopctl.Repo` (default, with `fixture(:stage_story)`) or `Loopctl.AdminRepo` (with
+  # `fixture(:story)`, for the claim reclaimer, which runs on AdminRepo).
+  def fixture(:story_stage, attrs) do
+    attrs = Enum.into(attrs, %{})
+    repo = Map.get(attrs, :repo, Loopctl.Repo)
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+
+    row =
+      struct!(
+        StoryStage,
+        attrs
+        |> Map.drop([:repo])
+        |> Map.put_new(:stage, :detected)
+        |> Map.put_new(:claim_epoch, 0)
+      )
+
+    insert = fn -> repo.insert!(row) end
+
+    if repo == Loopctl.Repo do
+      {:ok, row} = Loopctl.Repo.with_tenant(tenant_id, insert)
+      row
+    else
+      insert.()
+    end
   end
 
   def fixture(:committed_tenant, _attrs) do
