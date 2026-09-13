@@ -179,7 +179,7 @@ during an incident with `fly secrets set … && fly apps restart` — no deploy.
 
 | Variable       | Default | Description |
 |----------------|---------|-------------|
-| `GITHUB_TOKEN` | -       | Bearer token for the CI status/test-result lookups that back independent story verification. Optional: unset, the calls go out unauthenticated, which works for PUBLIC repos until GitHub's 60-requests/hour/IP anonymous limit bites — after that verification reports a `github_api_error` rather than a real CI verdict. Required for a private repo, where unauthenticated lookups 404. Needs only read access to checks. A blank value is treated as unset (it is trimmed), so a templated-but-empty secret degrades to the anonymous path rather than sending an empty bearer that GitHub 401s |
+| `GITHUB_TOKEN` | -       | Bearer token for the CI status/test-result lookups that back independent story verification, AND (#803) for the merge precondition's reads of a pull request's state, diffstat, changed names and file tree. Optional: unset, the calls go out unauthenticated, which works for PUBLIC repos until GitHub's 60-requests/hour/IP anonymous limit bites — after that verification reports a `github_api_error` rather than a real CI verdict, and the merge precondition REFUSES every change (it fails closed, so an exhausted anonymous quota escalates the whole delivery loop to a human rather than merging anything). Required for a private repo, where unauthenticated lookups 404. Needs only read access to checks, pull requests and contents. A blank value is treated as unset (it is trimmed), so a templated-but-empty secret degrades to the anonymous path rather than sending an empty bearer that GitHub 401s |
 
 #### Story claim lease
 

@@ -410,6 +410,10 @@ defmodule LoopctlWeb.Router do
     get "/stories/:story_id/verifications", StoryVerificationController, :index
     post "/stories/:id/force-unclaim", StoryVerificationController, :force_unclaim
 
+    # #803: the merge precondition — both gates run a second time over the real pull
+    # request, plus the custody check. A refusal escalates before it answers.
+    post "/stories/:id/merge-precondition", MergePreconditionController, :create
+
     # Bulk epic verification (orchestrator convenience)
     post "/epics/:id/verify-all", StoryVerificationController, :verify_all
 

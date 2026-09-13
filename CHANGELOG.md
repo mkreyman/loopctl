@@ -6,6 +6,28 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **The merge precondition: both delivery gates run a second time, over the real pull
+  request (#803).** `POST /api/v1/stories/:id/merge-precondition` (exact role `orchestrator`
+  or `user`, human-anchored tenant) runs Gate A and Gate B over the diff that actually
+  exists rather than the triage trio's predicted touches, adds the design's hard bound of 12
+  files / 1,000 changed lines — applied ON TOP of the configured limits, so a trigger
+  document may tighten it and may not loosen it — and requires the story's
+  `verified_status` to be `verified`, set by a verifier dispatch whose lineage is separate
+  from the implementer's. Only an `allow` licenses a merge; a `refuse` has already escalated
+  the story on the `merge_gate` edge before it answers, and `already_merged` reports a merge
+  GitHub had already performed so a caller that crashed after merging adopts the sha instead
+  of merging twice.
+
+  **It fails closed.** A missing, empty or unparseable `DELIVERY_GATES_CONFIG`, an unknown
+  repository, a project with no GitHub intake source, an unreachable or rate-limited GitHub,
+  a truncated file list, a diff that does not parse, and a stale trigger at either the pull
+  request's head or its merge base all REFUSE. There is no failure that merges.
+
+  **`GITHUB_TOKEN` now gates merges as well as verification.** Unset, the calls are
+  anonymous and work for a public repository until GitHub's per-IP hourly limit bites —
+  after which every delivery-loop change escalates to a human. No new environment variable;
+  see the updated row in `deploy/FLY_SECRETS.md`.
+
 - **Runner capacity is reserved in Postgres, and a tenant's total is admission-controlled
   (#803).** `Loopctl.Runners.dispatch/3` now takes a slot on the runner in the same
   transaction that records the dispatch, and refuses `:runner_at_capacity` past the runner's
