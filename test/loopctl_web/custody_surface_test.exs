@@ -99,7 +99,7 @@ defmodule LoopctlWeb.CustodySurfaceTest do
 
       for op <- ~w(contract claim start request-review report unclaim report-done
                    start-work review-complete verify reject backfill force-unclaim
-                   recover-cap artifacts) do
+                   recover-cap artifacts renew-claim) do
         assert CustodySurface.custody_operation?(
                  conn_for(:post, "/api/v1/stories/#{story}/#{op}")
                ),

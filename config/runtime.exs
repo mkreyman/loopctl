@@ -137,6 +137,15 @@ if auth_throttle_opts != [] do
   config :loopctl, LoopctlWeb.Plugs.AuthPathThrottle, auth_throttle_opts
 end
 
+# #803: story claim lease length. Positive integer seconds; anything else leaves the
+# 24h default in Loopctl.Progress.claim_lease_seconds/0 in place. Bias LONG — a lease
+# that runs out on healthy long work releases a story its agent is still implementing.
+case System.get_env("STORY_CLAIM_LEASE_SECONDS") &&
+       Integer.parse(System.get_env("STORY_CLAIM_LEASE_SECONDS")) do
+  {seconds, ""} when seconds > 0 -> config :loopctl, :story_claim_lease_seconds, seconds
+  _ -> :ok
+end
+
 endpoint_http = [
   # Transport-layer DoS backstop. `websocket_options` is a BANDIT server-level
   # setting (the Phoenix `socket "/live", websocket: [...]` DSL rejects

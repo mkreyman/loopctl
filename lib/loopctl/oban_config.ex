@@ -616,6 +616,11 @@ defmodule Loopctl.ObanConfig do
            # Keep in sync with the crontab assertion in oban_plugins_config_test.exs.
            {"*/5 * * * *", Loopctl.Workers.CustodyPostureSweepWorker},
            {"* * * * *", Loopctl.Workers.RevokeExpiredDispatchesWorker},
+           # #803: releases story claims whose lease ran out. Every 5 minutes is plenty
+           # against a lease measured in hours; the lease, not this interval, is the
+           # knob. Bounded per run. Keep in sync with the crontab assertion in
+           # oban_plugins_config_test.exs.
+           {"*/5 * * * *", Loopctl.Workers.ReclaimExpiredClaimsWorker},
            {"* * * * *", Loopctl.Workers.SystemConfigRefreshWorker},
            # US-41.1 (review): the STANDING embedding-side-table reconciliation pass —
            # sweeps the dual-write crash window (legacy row without its dim-1536 mirror)
