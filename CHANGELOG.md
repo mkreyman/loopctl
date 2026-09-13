@@ -104,9 +104,11 @@ All notable changes to loopctl are documented here.
   `dispatch_reply`, `trace` and `trace_cursor` — and `priv/runner_contract/v1.json` is
   regenerated at `x-contract-version` 1.1.0, now also carrying each event's stable error
   `reason` codes and its limits (`x-connection.errors`, `x-connection.limits`: at most 20
-  events and 60,000 bytes per batch, 2,048 bytes of JSON `data` per event — both byte limits
-  counted with every character at its longest JSON escape, so a runner that splits by them
-  never sends a frame the 64 KB socket cap closes — `trace_max_seq`,
+  events and 60,000 bytes per batch, 12,000 per event and 6,000 of `data` per event, all
+  counted by one published encoder-independent byte rule (`json_byte_rule`: 6 bytes per
+  string character plus 12 per string, 32 per scalar, 2 per container and per member), so a
+  runner that splits by it never sends a frame the 64 KB socket cap closes; large payloads
+  belong in object storage — `trace_max_seq`,
   `min_interval_ms` — each event's own rate floor per channel: `status` 1000, `trace` 50,
   `trace_cursor` 50 — and `dispatch_reply_burst`, 8 replies refilled one per 250 ms). Only
   a valid message spends a limit. The bump is minor: a runner built against 1.0.0 still

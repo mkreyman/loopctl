@@ -50,7 +50,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   ## Values
 
   Every UUID a runner sends is normalized to lowercase before it is compared or stored, so
-  `ABCD...` and `abcd...` are the same id. `seq` must be below 2^63 - 1. No string —
+  `ABCD...` and `abcd...` are the same id. `seq` must be below 2^63 - 1, and no number in a
+  `trace` or `dispatch_reply` may have more digits than the byte rule allows. No string —
   including any key or value inside an event's `data` — may contain a NUL character
   (`\\u0000`), which Postgres cannot store; such a message is `invalid_payload`.
 
@@ -67,11 +68,14 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   The runner's on-disk NDJSON file is the source of truth. It ships events in batches of at
   most `RunnerTraceBatch.max_events/0` events and `RunnerTraceBatch.max_bytes/0` bytes, each
-  with at most `RunnerTraceEvent.max_data_bytes/0` of JSON `data`, both byte limits counted by
-  `json_bytes_upper_bound/1` (published as `x-connection.limits.trace_max_batch_bytes`). The
-  byte budget is what keeps a batch inside the socket's frame cap: a frame over it is closed
-  by the transport before loopctl sees it, so a runner must split by the budget, not by the
-  per-field character limits; the server stores `(run_id, seq)` once
+  event at most `RunnerTraceEvent.max_bytes/0` with at most `RunnerTraceEvent.max_data_bytes/0`
+  of `data`. Every byte limit is counted by ONE published rule (`ByteRule`, exported as
+  `x-connection.limits.json_byte_rule` with its text, and quoted in each schema's description):
+  six bytes per string character, a fixed width per scalar, a fixed cost per container and
+  member. It bounds the compact JSON of any conforming encoder, whatever that encoder escapes,
+  so a runner that splits by it never sends a frame the socket closes — the transport closes an
+  oversize frame before loopctl sees it. Large payloads belong in object storage, referenced
+  from `data`; the server stores `(run_id, seq)` once
   and replies `acked_seq`, the highest seq such that EVERY seq from 0 to it is stored. The
   runner resumes from `acked_seq + 1` — on a rejoin it asks `trace_cursor` first, because
   Phoenix replays nothing and a rejoin happens on every rolling deploy. The first batch of a
@@ -91,6 +95,71 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   @version "1.1.0"
   @major 1
+
+  defmodule ByteRule do
+    @moduledoc false
+
+    # ONE encoder-independent rule for the size of runner-supplied JSON (issue #803). It does
+    # not model any encoder's escaping: it charges every string character the most any
+    # conforming encoder can spend on it (a six-byte \\uXXXX; two of them for a character
+    # outside the BMP), and every scalar a fixed width. Go's encoding/json escapes < > &, .NET
+    # escapes more, a JSON library can escape everything — the bound holds for all of them.
+    # The constants are published in the contract export, the text in every schema that
+    # carries a byte limit, and a test evaluates the PUBLISHED constants against `bytes/1`.
+    @per_char 6
+    @per_string 12
+    @per_scalar 32
+    @per_container 2
+    @per_member 2
+    @max_number_digits 31
+
+    @doc "The rule's constants, as the export publishes them."
+    @spec constants() :: %{String.t() => pos_integer()}
+    def constants do
+      %{
+        "per_string_char" => @per_char,
+        "per_string" => @per_string,
+        "per_scalar" => @per_scalar,
+        "per_container" => @per_container,
+        "per_member" => @per_member,
+        "max_number_digits" => @max_number_digits
+      }
+    end
+
+    @doc "The rule as one sentence, published verbatim."
+    @spec text() :: String.t()
+    def text do
+      "Byte rule (compact JSON, any encoder): count #{@per_char} bytes for every character " <>
+        "of every string and object key (#{2 * @per_char} for a character outside the Basic " <>
+        "Multilingual Plane) plus #{@per_string} per string; #{@per_scalar} per number, true, " <>
+        "false or null; #{@per_container} per array or object; #{@per_member} per array " <>
+        "element or object member. A number may have at most #{@max_number_digits} digits."
+    end
+
+    @doc "The largest integer magnitude the rule's fixed scalar width covers."
+    @spec max_number_digits() :: pos_integer()
+    def max_number_digits, do: @max_number_digits
+
+    @doc "The size of `term` under the rule."
+    @spec bytes(term()) :: non_neg_integer()
+    def bytes(term) when is_binary(term), do: @per_char * utf16_units(term) + @per_string
+    def bytes(term) when is_number(term) or term in [true, false, nil], do: @per_scalar
+    def bytes(term) when is_atom(term), do: bytes(Atom.to_string(term))
+
+    def bytes(term) when is_list(term),
+      do: @per_container + Enum.sum_by(term, &(@per_member + bytes(&1)))
+
+    def bytes(term) when is_map(term),
+      do: @per_container + Enum.sum_by(term, fn {k, v} -> @per_member + bytes(k) + bytes(v) end)
+
+    # A character outside the BMP is two UTF-16 code units (a surrogate pair when escaped).
+    # A byte that is not UTF-8 (the socket's JSON decoder refuses those first) counts as one.
+    defp utf16_units(string), do: utf16_units(string, 0)
+    defp utf16_units(<<>>, n), do: n
+    defp utf16_units(<<c::utf8, rest::binary>>, n) when c > 0xFFFF, do: utf16_units(rest, n + 2)
+    defp utf16_units(<<_c::utf8, rest::binary>>, n), do: utf16_units(rest, n + 1)
+    defp utf16_units(<<_byte, rest::binary>>, n), do: utf16_units(rest, n + 1)
+  end
 
   defmodule RunnerSample do
     @moduledoc false
@@ -264,13 +333,22 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     @moduledoc false
     require OpenApiSpex
 
-    # Bytes of the event's `data` as JSON. Referenced by the schema's description and by
-    # `RunnerContract.cast_trace_batch/1`, which enforces it.
-    @max_data_bytes 2_048
+    alias Loopctl.ApiSpec.RunnerContract.ByteRule
 
-    @doc "The largest `data` object, in bytes of JSON, an event may carry."
+    # Both under `ByteRule`. Referenced by the description, the export and
+    # `RunnerContract.cast_trace_batch/1`. A schema-valid event with `data` at its cap and
+    # every string at its maxLength in astral characters stays under `@max_bytes`, and one
+    # such event always fits a batch, so splitting a batch can always make progress.
+    @max_data_bytes 6_000
+    @max_bytes 12_000
+
+    @doc "The largest `data` object an event may carry, under the byte rule."
     @spec max_data_bytes() :: pos_integer()
     def max_data_bytes, do: @max_data_bytes
+
+    @doc "The largest event, undeclared keys included, under the byte rule."
+    @spec max_bytes() :: pos_integer()
+    def max_bytes, do: @max_bytes
 
     OpenApiSpex.schema(
       %{
@@ -280,9 +358,11 @@ defmodule Loopctl.ApiSpec.RunnerContract do
             "the runner ships `(run_id, seq)`, the server ACKs the last contiguous seq and " <>
             "dedups on the pair, and the runner resumes from that offset on rejoin. " <>
             "`parent` is REQUIRED on every event (null only for the root) so the agent " <>
-            "tree can be rebuilt by query. `data` is at most #{@max_data_bytes} bytes of " <>
-            "JSON, counted like the batch budget (refused with `event_data_too_large`); " <>
-            "larger payloads belong in object storage, referenced from `data`.",
+            "tree can be rebuilt by query. `data` is at most #{@max_data_bytes} bytes and the " <>
+            "whole event at most #{@max_bytes}, both under the byte rule below; either excess " <>
+            "is refused with `event_data_too_large` naming the event's `seq`. Large payloads " <>
+            "(tool output, file contents) belong in object storage, referenced from `data`. " <>
+            ByteRule.text(),
         type: :object,
         required: [:run_id, :seq, :event_id, :parent, :ts, :type],
         properties: %{
@@ -347,24 +427,24 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     @moduledoc false
     require OpenApiSpex
 
+    alias Loopctl.ApiSpec.RunnerContract.ByteRule
     alias Loopctl.ApiSpec.RunnerContract.RunnerTraceEvent
 
     # Referenced by `maxItems` below and enforced by `RunnerContract.cast_trace_batch/1`.
     @max_events 20
 
-    # The byte budget of a whole batch, measured by `RunnerContract.json_bytes_upper_bound/1`
-    # (every character as the longest escape a JSON encoder may write). A string's maxLength
-    # counts CHARACTERS, and a control character escapes to six bytes, an astral one to
-    # twelve, so a batch inside every per-field limit could still exceed the runner socket's
-    # 64 KB frame, which Bandit closes before any of this code runs. This budget plus the
-    # V2 frame envelope stays under that cap; a test holds it for the worst case.
+    # The byte budget of a whole batch under `ByteRule`. A string's maxLength counts
+    # characters, not bytes, so only a byte budget keeps a frame inside the runner socket's
+    # 64 KB cap, which Bandit enforces by closing the socket before any of this code runs.
+    # This budget plus `RunnerContract.frame_envelope_bytes/0` stays under that cap; a test
+    # holds it against an encoder that escapes every character.
     @max_bytes 60_000
 
     @doc "The most events one `trace` batch may carry."
     @spec max_events() :: pos_integer()
     def max_events, do: @max_events
 
-    @doc "The byte budget of one `trace` batch, as `RunnerContract.json_bytes_upper_bound/1` counts it."
+    @doc "The byte budget of one `trace` batch, under the byte rule."
     @spec max_bytes() :: pos_integer()
     def max_bytes, do: @max_bytes
 
@@ -374,11 +454,12 @@ defmodule Loopctl.ApiSpec.RunnerContract do
         description:
           "A batch of one run's trace events, pushed as the `trace` event. Every event's " <>
             "`run_id` must equal the batch's. At most #{@max_events} events and at most " <>
-            "#{@max_bytes} bytes of JSON, counting every character at its longest escape " <>
-            "(control characters 6 bytes, other non-ASCII 6, astral 12); either excess is " <>
-            "refused with `batch_too_large`. The run must belong to an ACCEPTED dispatch this runner " <>
-            "holds, at the dispatched `claim_epoch`; the first batch binds `run_id` to " <>
-            "`dispatch_id`. Replied with `RunnerTraceAck`.",
+            "#{@max_bytes} bytes under the byte rule below; either excess is refused with " <>
+            "`batch_too_large`, so split the batch — except that a one-event batch over the " <>
+            "budget is refused with `event_data_too_large` naming its `seq`, since splitting " <>
+            "cannot help. The run must belong to an ACCEPTED dispatch this runner holds, at " <>
+            "the dispatched `claim_epoch`; the first batch binds `run_id` to `dispatch_id`. " <>
+            "Replied with `RunnerTraceAck`. " <> ByteRule.text(),
         type: :object,
         required: [:run_id, :dispatch_id, :claim_epoch, :events],
         properties: %{
@@ -467,6 +548,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   # once answers them back to back, and a single per-runner gap refused the second answer.
   @dispatch_reply_burst %{"capacity" => 8, "refill_interval_ms" => 250}
 
+  # What the Phoenix V2 frame around a `trace` payload can cost under `ByteRule`:
+  # [join_ref, ref, "runner:<uuid>", "trace", payload] with 20-digit refs is under 600.
+  @frame_envelope_bytes 1_000
+
   # One below Postgres `bigint`'s maximum: the contiguous-ack query probes `seq + 1`, which
   # must itself fit. The `runner_trace_events_seq` CHECK holds the same bound.
   @max_seq 9_223_372_036_854_775_806
@@ -488,6 +573,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   """
   @spec dispatch_reply_burst() :: %{String.t() => pos_integer()}
   def dispatch_reply_burst, do: @dispatch_reply_burst
+
+  @doc "The allowance for the V2 frame around a `trace` payload, under the byte rule."
+  @spec frame_envelope_bytes() :: pos_integer()
+  def frame_envelope_bytes, do: @frame_envelope_bytes
 
   @doc "The largest `seq` a trace event may carry."
   @spec max_seq() :: pos_integer()
@@ -547,9 +636,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   """
   @spec cast_dispatch_reply(term()) :: {:ok, map()} | {:error, term()}
   def cast_dispatch_reply(payload) do
-    with {:ok, cast} <- cast(payload, RunnerDispatchReply.schema()),
-         reply = known_fields(cast, RunnerDispatchReply.schema()),
-         :ok <- no_nul(reply) do
+    with :ok <- values_ok(payload),
+         {:ok, cast} <- cast(payload, RunnerDispatchReply.schema()) do
+      reply = known_fields(cast, RunnerDispatchReply.schema())
+
       case reply_shape_errors(reply) do
         [] -> {:ok, reply}
         errors -> {:error, {:invalid, errors}}
@@ -573,86 +663,55 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   @doc """
   Validates a `trace` batch. Returns the declared fields only, with atom keys, or
   `{:error, reason}` where reason is `{:batch_too_large, max_events, max_bytes}`,
-  `{:event_data_too_large, seq, max}` or `{:invalid, messages}`.
+  `{:event_data_too_large, seq, max_data_bytes, max_event_bytes}` or `{:invalid, messages}`.
 
-  The batch size is checked BEFORE the schema cast, so an oversize batch costs no per-event
-  casting and gets its own reason a runner can act on by splitting.
+  In order: every value is storable (no NUL, no number wider than the byte rule's scalar);
+  the event count; the schema; then each event's own limits, which win over the batch
+  budget; then the batch budget. A one-event batch over the budget is refused as
+  `event_data_too_large` for that event, because splitting it cannot help. Sizes are taken
+  under `ByteRule` on the payload AS SENT, undeclared keys included, since those were in
+  the frame.
   """
   @spec cast_trace_batch(term()) :: {:ok, map()} | {:error, term()}
   def cast_trace_batch(payload) do
-    with :ok <- batch_size_ok(payload),
-         {:ok, cast} <- cast(payload, RunnerTraceBatch.schema()) do
-      batch = known_fields(cast, RunnerTraceBatch.schema())
-
-      with :ok <- no_nul(batch),
-           :ok <- events_ok(batch) do
-        {:ok, batch}
-      end
+    with :ok <- values_ok(payload),
+         :ok <- event_count_ok(payload),
+         {:ok, cast} <- cast(payload, RunnerTraceBatch.schema()),
+         batch = known_fields(cast, RunnerTraceBatch.schema()),
+         :ok <- events_ok(batch, Map.fetch!(payload, "events")),
+         :ok <- batch_bytes_ok(batch, payload) do
+      {:ok, batch}
     end
   end
 
-  # Measured on the payload AS SENT, undeclared keys included, since those were in the frame.
-  defp batch_size_ok(payload) do
-    max_events = RunnerTraceBatch.max_events()
-    max_bytes = RunnerTraceBatch.max_bytes()
+  @doc """
+  The size of `term` under the published byte rule (`x-connection.limits.json_byte_rule`):
+  an upper bound on the compact JSON any conforming encoder writes for it.
+  """
+  @spec json_bytes_upper_bound(term()) :: non_neg_integer()
+  def json_bytes_upper_bound(term), do: ByteRule.bytes(term)
 
-    too_many? =
-      match?(%{"events" => events} when is_list(events) and length(events) > max_events, payload)
-
-    if too_many? or json_bytes_upper_bound(payload) > max_bytes,
-      do: {:error, {:batch_too_large, max_events, max_bytes}},
+  defp event_count_ok(%{"events" => events}) when is_list(events) do
+    if length(events) > RunnerTraceBatch.max_events(),
+      do: {:error, batch_too_large()},
       else: :ok
   end
 
-  @doc """
-  An upper bound on the bytes of `term` encoded as compact JSON by ANY standard encoder.
+  defp event_count_ok(_payload), do: :ok
 
-  Every character is counted at the longest form an encoder may write it in: a control
-  character or a non-ASCII BMP character as a six-byte `\\uXXXX`, an astral character as a
-  twelve-byte surrogate pair, `"`, `\\` and `/` as two bytes, and printable ASCII as one.
-  Floats count as 24 bytes. It is what the `trace` byte budget and the per-event `data` cap
-  are measured with, so a runner that splits its batches by the same rule can never send a
-  frame the socket closes.
-  """
-  @spec json_bytes_upper_bound(term()) :: non_neg_integer()
-  def json_bytes_upper_bound(term) when is_binary(term), do: 2 + string_bytes(term, 0)
-  def json_bytes_upper_bound(term) when is_integer(term), do: byte_size(Integer.to_string(term))
-  def json_bytes_upper_bound(term) when is_float(term), do: 24
-  def json_bytes_upper_bound(term) when term in [true, false, nil], do: 5
+  defp batch_too_large,
+    do: {:batch_too_large, RunnerTraceBatch.max_events(), RunnerTraceBatch.max_bytes()}
 
-  def json_bytes_upper_bound(term) when is_atom(term),
-    do: json_bytes_upper_bound(Atom.to_string(term))
+  defp event_too_large(seq),
+    do:
+      {:event_data_too_large, seq, RunnerTraceEvent.max_data_bytes(),
+       RunnerTraceEvent.max_bytes()}
 
-  def json_bytes_upper_bound(term) when is_list(term),
-    do: 2 + separators(length(term)) + Enum.sum_by(term, &json_bytes_upper_bound/1)
-
-  def json_bytes_upper_bound(term) when is_map(term) do
-    2 + separators(map_size(term)) +
-      Enum.sum_by(term, fn {k, v} -> json_bytes_upper_bound(k) + 1 + json_bytes_upper_bound(v) end)
-  end
-
-  defp separators(0), do: 0
-  defp separators(n), do: n - 1
-
-  defp string_bytes(<<>>, acc), do: acc
-
-  defp string_bytes(<<c::utf8, rest::binary>>, acc) when c in [?", ?\\, ?/],
-    do: string_bytes(rest, acc + 2)
-
-  defp string_bytes(<<c::utf8, rest::binary>>, acc) when c < 0x20, do: string_bytes(rest, acc + 6)
-  defp string_bytes(<<c::utf8, rest::binary>>, acc) when c < 0x7F, do: string_bytes(rest, acc + 1)
-
-  defp string_bytes(<<c::utf8, rest::binary>>, acc) when c < 0x10000,
-    do: string_bytes(rest, acc + 6)
-
-  defp string_bytes(<<_c::utf8, rest::binary>>, acc), do: string_bytes(rest, acc + 12)
-  # Not valid UTF-8 (the socket's JSON decoder refuses it first); count a byte at its escape.
-  defp string_bytes(<<_byte, rest::binary>>, acc), do: string_bytes(rest, acc + 6)
-
-  defp events_ok(%{run_id: run_id, events: events}) do
-    max = RunnerTraceEvent.max_data_bytes()
-
-    Enum.reduce_while(events, :ok, fn event, :ok ->
+  # `raw_events` are the events as sent, in the order the cast kept them.
+  defp events_ok(%{run_id: run_id, events: events}, raw_events) do
+    events
+    |> Enum.zip(raw_events)
+    |> Enum.reduce_while(:ok, fn {event, raw}, :ok ->
       cond do
         event.run_id != run_id ->
           {:halt, {:error, {:invalid, ["event #{event.seq}: run_id differs from the batch"]}}}
@@ -660,13 +719,24 @@ defmodule Loopctl.ApiSpec.RunnerContract do
         event.seq > @max_seq ->
           {:halt, {:error, {:invalid, ["event seq #{event.seq} exceeds #{@max_seq}"]}}}
 
-        json_bytes_upper_bound(Map.get(event, :data, %{})) > max ->
-          {:halt, {:error, {:event_data_too_large, event.seq, max}}}
+        ByteRule.bytes(Map.get(event, :data, %{})) > RunnerTraceEvent.max_data_bytes() ->
+          {:halt, {:error, event_too_large(event.seq)}}
+
+        ByteRule.bytes(raw) > RunnerTraceEvent.max_bytes() ->
+          {:halt, {:error, event_too_large(event.seq)}}
 
         true ->
           {:cont, :ok}
       end
     end)
+  end
+
+  defp batch_bytes_ok(%{events: events}, payload) do
+    cond do
+      ByteRule.bytes(payload) <= RunnerTraceBatch.max_bytes() -> :ok
+      match?([_], events) -> {:error, event_too_large(hd(events).seq)}
+      true -> {:error, batch_too_large()}
+    end
   end
 
   @doc "Validates a `trace_cursor` payload. Returns `{:ok, %{run_id: run_id}}`."
@@ -677,25 +747,42 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     end
   end
 
-  # Postgres refuses a NUL in `text` and in any jsonb string, and the error would escape the
-  # channel's handle_in on every resend of the same message. So a NUL anywhere a runner can
-  # put one — every string, and every key and value of a free-form `data` object, at any
-  # depth — is refused here, before anything is stored.
-  defp no_nul(value) do
-    if contains_nul?(value),
-      do: {:error, {:invalid, ["strings may not contain a NUL character"]}},
-      else: :ok
+  # Every value a runner sends must be storable and sizable, checked on the payload as sent:
+  #
+  # - no NUL in any string, key or value, at any depth. Postgres refuses one in `text` and in
+  #   any jsonb string, and the error would escape the channel's handle_in on every resend.
+  # - no integer wider than the byte rule's fixed scalar width, which is what lets a runner
+  #   count every number at one published size.
+  defp values_ok(value) do
+    cond do
+      contains_nul?(value) ->
+        {:error, {:invalid, ["strings may not contain a NUL character"]}}
+
+      too_wide_number?(value) ->
+        {:error, {:invalid, ["numbers may have at most #{ByteRule.max_number_digits()} digits"]}}
+
+      true ->
+        :ok
+    end
   end
 
   defp contains_nul?(value) when is_binary(value), do: String.contains?(value, <<0>>)
   defp contains_nul?(value) when is_list(value), do: Enum.any?(value, &contains_nul?/1)
 
-  defp contains_nul?(%DateTime{}), do: false
-
   defp contains_nul?(value) when is_map(value),
     do: Enum.any?(value, fn {k, v} -> contains_nul?(k) or contains_nul?(v) end)
 
   defp contains_nul?(_value), do: false
+
+  defp too_wide_number?(value) when is_integer(value),
+    do: abs(value) >= Integer.pow(10, ByteRule.max_number_digits())
+
+  defp too_wide_number?(value) when is_list(value), do: Enum.any?(value, &too_wide_number?/1)
+
+  defp too_wide_number?(value) when is_map(value),
+    do: Enum.any?(value, fn {_k, v} -> too_wide_number?(v) end)
+
+  defp too_wide_number?(_value), do: false
 
   # OpenApiSpex keeps undeclared keys on an object, at every depth. Drop them at every
   # depth too, so nothing the contract does not declare reaches Presence.
@@ -771,7 +858,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
         "limits" => %{
           "trace_max_events" => RunnerTraceBatch.max_events(),
           "trace_max_event_data_bytes" => RunnerTraceEvent.max_data_bytes(),
+          "trace_max_event_bytes" => RunnerTraceEvent.max_bytes(),
           "trace_max_batch_bytes" => RunnerTraceBatch.max_bytes(),
+          "frame_envelope_bytes" => @frame_envelope_bytes,
+          "json_byte_rule" => Map.put(ByteRule.constants(), "text", ByteRule.text()),
           "refusal_max_detail_length" => RunnerDispatchReply.max_detail_length(),
           "trace_max_seq" => @max_seq,
           "min_interval_ms" => @min_interval_ms,

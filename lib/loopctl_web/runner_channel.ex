@@ -342,8 +342,13 @@ defmodule LoopctlWeb.RunnerChannel do
   defp message_error({:batch_too_large, max_events, max_bytes}),
     do: %{reason: "batch_too_large", max_events: max_events, max_bytes: max_bytes}
 
-  defp message_error({:event_data_too_large, seq, max}),
-    do: %{reason: "event_data_too_large", seq: seq, max_data_bytes: max}
+  defp message_error({:event_data_too_large, seq, max_data_bytes, max_event_bytes}),
+    do: %{
+      reason: "event_data_too_large",
+      seq: seq,
+      max_data_bytes: max_data_bytes,
+      max_event_bytes: max_event_bytes
+    }
 
   defp message_error(reason)
        when reason in [

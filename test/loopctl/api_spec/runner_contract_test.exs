@@ -1,6 +1,7 @@
 defmodule Loopctl.ApiSpec.RunnerContractTest do
   use ExUnit.Case, async: true
 
+  import Bitwise
   import Loopctl.Fixtures
 
   alias Loopctl.ApiSpec.RunnerContract
@@ -66,6 +67,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
       assert connection["limits"]["trace_max_events"] == RunnerTraceBatch.max_events()
       assert connection["limits"]["trace_max_batch_bytes"] == RunnerTraceBatch.max_bytes()
+      assert connection["limits"]["trace_max_event_bytes"] == RunnerTraceEvent.max_bytes()
+      assert connection["limits"]["frame_envelope_bytes"] == RunnerContract.frame_envelope_bytes()
       assert connection["limits"]["dispatch_reply_burst"] == RunnerContract.dispatch_reply_burst()
 
       assert connection["limits"]["min_interval_ms"] ==
@@ -90,87 +93,286 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       end
     end
 
-    test "no batch the cast admits can exceed the runner socket's frame cap, whatever it escapes to" do
+    test "the published byte rule is the implemented one, on random payloads" do
+      rule = RunnerContract.json_schema()["x-connection"]["limits"]["json_byte_rule"]
+
+      # An independent evaluator of the PUBLISHED constants, written from the rule's text.
+      published = fn published, term ->
+        cond do
+          is_binary(term) ->
+            units = term |> String.to_charlist() |> Enum.sum_by(&if(&1 > 0xFFFF, do: 2, else: 1))
+            rule["per_string_char"] * units + rule["per_string"]
+
+          is_number(term) or term in [true, false, nil] ->
+            rule["per_scalar"]
+
+          is_list(term) ->
+            rule["per_container"] +
+              Enum.sum_by(term, &(rule["per_member"] + published.(published, &1)))
+
+          is_map(term) ->
+            rule["per_container"] +
+              Enum.sum_by(term, fn {k, v} ->
+                rule["per_member"] + published.(published, k) + published.(published, v)
+              end)
+        end
+      end
+
+      :rand.seed(:exsss, {803, 3, 13})
+
+      for _ <- 1..300 do
+        term = random_json(4)
+        assert published.(published, term) == RunnerContract.json_bytes_upper_bound(term)
+      end
+
+      # The text quotes the constants it is made of, and every byte-limited schema quotes it.
+      for {key, value} <- Map.delete(rule, "text"), key != "per_string" do
+        assert rule["text"] =~ Integer.to_string(value), "the rule text omits #{key}"
+      end
+
+      defs = RunnerContract.json_schema()["$defs"]
+      assert defs["RunnerTraceBatch"]["description"] =~ rule["text"]
+      assert defs["RunnerTraceEvent"]["description"] =~ rule["text"]
+    end
+
+    test "the byte rule on small values" do
+      assert RunnerContract.json_bytes_upper_bound("") == 12
+      assert RunnerContract.json_bytes_upper_bound("ab") == 24
+      assert RunnerContract.json_bytes_upper_bound(<<0x1F600::utf8>>) == 24
+      assert RunnerContract.json_bytes_upper_bound(123) == 32
+      # {"k":[1,true,null]}: object 2, member 2, key 18, array 2 + 3 * (2 + 32).
+      assert RunnerContract.json_bytes_upper_bound(%{"k" => [1, true, nil]}) == 126
+    end
+
+    test "the limits nest: a valid event fits an event, one event fits a batch, a batch fits a frame" do
       {_path, _socket, opts} =
         Enum.find(LoopctlWeb.Endpoint.__sockets__(), &match?({"/runner/socket", _, _}, &1))
 
       frame_cap = opts |> Keyword.fetch!(:websocket) |> Keyword.fetch!(:max_frame_size)
-      max_bytes = RunnerTraceBatch.max_bytes()
+      bigint_max = 9_223_372_036_854_775_807
 
-      # The costliest characters a runner can send: a control character escapes to six bytes,
-      # a non-ASCII BMP character to six under a \\u-escaping encoder, an astral one (4 bytes
-      # of UTF-8) to a twelve-byte surrogate pair. Every string at its maxLength in each.
-      costly = [<<1>>, <<0xE9::utf8>>, <<0x1F600::utf8>>, "x"]
+      # The largest schema-valid event: every string at its maxLength in astral characters,
+      # data at its cap.
+      worst = worst_event(Ecto.UUID.generate(), 0, <<0x1F600::utf8>>)
 
+      assert RunnerContract.json_bytes_upper_bound(worst["data"]) <=
+               RunnerTraceEvent.max_data_bytes()
+
+      assert RunnerContract.json_bytes_upper_bound(worst) <= RunnerTraceEvent.max_bytes()
+
+      one = one_event_batch(worst, bigint_max)
+      assert {:ok, _} = RunnerContract.cast_trace_batch(one)
+
+      # A batch of the largest event an event may be still fits the batch budget.
+      at_event_cap = Map.put(worst, "pad", "")
+
+      at_event_cap =
+        Map.put(
+          at_event_cap,
+          "pad",
+          String.duplicate(
+            "x",
+            div(
+              RunnerTraceEvent.max_bytes() - RunnerContract.json_bytes_upper_bound(at_event_cap),
+              6
+            )
+          )
+        )
+
+      assert RunnerContract.json_bytes_upper_bound(one_event_batch(at_event_cap, bigint_max)) <=
+               RunnerTraceBatch.max_bytes()
+
+      envelope = [
+        "18446744073709551615",
+        "18446744073709551615",
+        "runner:" <> Ecto.UUID.generate(),
+        "trace",
+        %{}
+      ]
+
+      assert RunnerContract.json_bytes_upper_bound(envelope) <=
+               RunnerContract.frame_envelope_bytes()
+
+      assert RunnerTraceBatch.max_bytes() + RunnerContract.frame_envelope_bytes() < frame_cap
+    end
+
+    test "an admitted worst-case batch fits the frame even from an encoder that escapes every character" do
+      {_path, _socket, opts} =
+        Enum.find(LoopctlWeb.Endpoint.__sockets__(), &match?({"/runner/socket", _, _}, &1))
+
+      frame_cap = opts |> Keyword.fetch!(:websocket) |> Keyword.fetch!(:max_frame_size)
+
+      # Go's encoding/json escapes < > &, .NET escapes more; this escapes EVERY character,
+      # which no real encoder exceeds.
       batches =
-        for char <- costly, count <- [1, 5, 10, RunnerTraceBatch.max_events()] do
+        for char <- [<<1>>, "<", "&", <<0xE9::utf8>>, <<0x1F600::utf8>>, "x"],
+            count <- [1, 2, 4, 5, 10, RunnerTraceBatch.max_events()] do
           run_id = Ecto.UUID.generate()
-          fill = fn n -> String.duplicate(char, n) end
-          data_chars = div(RunnerTraceEvent.max_data_bytes() - 8, 12)
-
-          events =
-            for seq <- 1..count do
-              %{
-                "run_id" => run_id,
-                "seq" => RunnerContract.max_seq() - seq,
-                "event_id" => fill.(128),
-                "parent" => fill.(128),
-                "ts" => "2026-09-12T20:36:46.485123+00:00",
-                "type" => fill.(64),
-                "data" => %{"k" => String.duplicate(<<0x1F600::utf8>>, data_chars)}
-              }
-            end
-
-          %{
-            "run_id" => run_id,
-            "dispatch_id" => Ecto.UUID.generate(),
-            "claim_epoch" => 9_223_372_036_854_775_807,
-            "events" => events
-          }
+          events = for seq <- 1..count, do: worst_event(run_id, seq, char)
+          one_event_batch(hd(events), 0) |> Map.put("events", events)
         end
 
       outcomes =
         for batch <- batches do
-          # The bound really is an upper bound for both escaping styles.
-          bound = RunnerContract.json_bytes_upper_bound(batch)
-          assert bound >= byte_size(Jason.encode!(batch))
-          assert bound >= byte_size(Jason.encode!(batch, escape: :unicode_safe))
+          frame = [
+            "18446744073709551615",
+            "18446744073709551615",
+            "runner:" <> Ecto.UUID.generate(),
+            "trace",
+            batch
+          ]
+
+          escaped = byte_size(escape_everything(frame))
+
+          assert RunnerContract.json_bytes_upper_bound(frame) >= escaped
 
           case RunnerContract.cast_trace_batch(batch) do
             {:ok, _} ->
-              # The V2 serializer's frame, [join_ref, ref, topic, event, payload], escaped the
-              # costliest way an encoder may.
-              frame = [
-                "4294967295",
-                "4294967295",
-                "runner:" <> Ecto.UUID.generate(),
-                "trace",
-                batch
-              ]
+              assert escaped < frame_cap
+              :admitted
 
-              assert byte_size(Jason.encode!(frame, escape: :unicode_safe)) < frame_cap
-              :ok
-
-            {:error, {:batch_too_large, _max_events, ^max_bytes}} ->
-              assert bound > max_bytes
+            {:error, {:batch_too_large, _, _}} ->
+              assert RunnerContract.json_bytes_upper_bound(batch) > RunnerTraceBatch.max_bytes()
               :refused
           end
         end
 
-      # Both branches ran, so neither assertion above is vacuous.
-      assert :ok in outcomes
+      assert :admitted in outcomes
       assert :refused in outcomes
     end
 
-    test "the byte bound counts every escape at its longest" do
-      assert RunnerContract.json_bytes_upper_bound("") == 2
-      assert RunnerContract.json_bytes_upper_bound("ab") == 4
-      assert RunnerContract.json_bytes_upper_bound(<<1>>) == 8
-      assert RunnerContract.json_bytes_upper_bound(<<0xE9::utf8>>) == 8
-      assert RunnerContract.json_bytes_upper_bound(<<0x1F600::utf8>>) == 14
-      assert RunnerContract.json_bytes_upper_bound(~s(a"b\\c/)) == 11
-      assert RunnerContract.json_bytes_upper_bound(%{"k" => [1, true, nil]}) == 21
+    test "a one-event batch over the budget is event_data_too_large naming its seq; a multi-event one is batch_too_large" do
+      run_id = Ecto.UUID.generate()
+      event = worst_event(run_id, 7, "x")
+      budget = RunnerTraceBatch.max_bytes()
+
+      # The event is inside its own limits; what pushes the batch over is sent beside it.
+      one = one_event_batch(event, 0) |> Map.put("padding", String.duplicate("x", div(budget, 6)))
+      assert RunnerContract.json_bytes_upper_bound(one) > budget
+      assert {:error, {:event_data_too_large, 7, _, _}} = RunnerContract.cast_trace_batch(one)
+
+      two = Map.put(one, "events", [event, %{event | "seq" => 8}])
+      assert {:error, {:batch_too_large, _, ^budget}} = RunnerContract.cast_trace_batch(two)
+
+      # An event over its OWN limit is named, in any batch.
+      fat =
+        Map.put(
+          %{event | "seq" => 9},
+          "padding",
+          String.duplicate("x", div(RunnerTraceEvent.max_bytes(), 6))
+        )
+
+      assert {:error, {:event_data_too_large, 9, _, _}} =
+               RunnerContract.cast_trace_batch(
+                 Map.put(one_event_batch(event, 0), "events", [event, fat])
+               )
     end
+
+    test "a number wider than the byte rule's scalar is invalid" do
+      digits =
+        RunnerContract.json_schema()["x-connection"]["limits"]["json_byte_rule"][
+          "max_number_digits"
+        ]
+
+      batch = build(:runner_trace_batch, %{seqs: [0]})
+      fits = String.duplicate("9", digits) |> String.to_integer()
+
+      ok = put_in(batch, ["events", Access.at(0), "data"], %{"n" => fits})
+      assert {:ok, _} = RunnerContract.cast_trace_batch(ok)
+
+      wide = put_in(batch, ["events", Access.at(0), "data"], %{"n" => [fits + 1]})
+      assert {:error, {:invalid, [message]}} = RunnerContract.cast_trace_batch(wide)
+      assert message =~ "digits"
+    end
+  end
+
+  # The largest schema-valid event made of `char`: every string at its maxLength, `data` a
+  # single string sized to the per-event data cap under the byte rule.
+  defp worst_event(run_id, seq, char) do
+    data_chars = div(RunnerTraceEvent.max_data_bytes() - 34, 6 * utf16_units(char))
+
+    %{
+      "run_id" => run_id,
+      "seq" => seq,
+      "event_id" => String.duplicate(char, 128),
+      "parent" => String.duplicate(char, 128),
+      "ts" => "2026-09-12T20:36:46.485123+00:00",
+      "type" => String.duplicate(char, 64),
+      "data" => %{"k" => String.duplicate(char, data_chars)}
+    }
+  end
+
+  defp utf16_units(<<c::utf8>>) when c > 0xFFFF, do: 2
+  defp utf16_units(_char), do: 1
+
+  defp one_event_batch(event, claim_epoch) do
+    %{
+      "run_id" => event["run_id"],
+      "dispatch_id" => Ecto.UUID.generate(),
+      "claim_epoch" => claim_epoch,
+      "events" => [event]
+    }
+  end
+
+  # Compact JSON with every string character written as \\uXXXX (a surrogate pair outside
+  # the BMP): more bytes than any real encoder spends.
+  defp escape_everything(term) when is_binary(term) do
+    body =
+      for <<c::utf8 <- term>>, into: "" do
+        if c > 0xFFFF do
+          v = c - 0x10000
+          hex4(0xD800 + (v >>> 10)) <> hex4(0xDC00 + (v &&& 0x3FF))
+        else
+          hex4(c)
+        end
+      end
+
+    ~s(") <> body <> ~s(")
+  end
+
+  defp escape_everything(term) when is_integer(term), do: Integer.to_string(term)
+  defp escape_everything(true), do: "true"
+  defp escape_everything(false), do: "false"
+  defp escape_everything(nil), do: "null"
+
+  defp escape_everything(term) when is_list(term),
+    do: "[" <> Enum.map_join(term, ",", &escape_everything/1) <> "]"
+
+  defp escape_everything(term) when is_map(term) do
+    "{" <>
+      Enum.map_join(term, ",", fn {k, v} ->
+        escape_everything(k) <> ":" <> escape_everything(v)
+      end) <>
+      "}"
+  end
+
+  defp hex4(n), do: "\\u" <> String.pad_leading(Integer.to_string(n, 16), 4, "0")
+
+  # A random JSON-shaped term, `depth` levels deep at most.
+  defp random_json(0), do: random_scalar()
+
+  defp random_json(depth) do
+    case :rand.uniform(4) do
+      1 -> random_scalar()
+      2 -> for _ <- 1..:rand.uniform(4), do: random_json(depth - 1)
+      _ -> Map.new(1..:rand.uniform(4), fn _ -> {random_string(), random_json(depth - 1)} end)
+    end
+  end
+
+  defp random_scalar do
+    Enum.random([
+      random_string(),
+      :rand.uniform(1_000_000) - 500_000,
+      :rand.uniform() * 1.0e6,
+      true,
+      false,
+      nil
+    ])
+  end
+
+  defp random_string do
+    alphabet = [?a, ?<, ?&, ?", ?\\, 1, 0xE9, 0x4E2D, 0x1F600]
+    for _ <- 1..:rand.uniform(8), into: "", do: <<Enum.random(alphabet)::utf8>>
   end
 
   defp unknown_keywords(%{} = schema, known) do
@@ -436,15 +638,19 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     test "refuses an event whose data exceeds max_data_bytes, naming its seq" do
       max = RunnerTraceEvent.max_data_bytes()
       batch = build(:runner_trace_batch, %{seqs: [0, 1]})
-      fits = %{"k" => String.duplicate("x", max - 8)}
-      over = %{"k" => String.duplicate("x", max - 7)}
+      # %{"k" => s} under the byte rule: container 2, member 2, key 6 + 12, value 6n + 12.
+      chars = div(max - 34, 6)
+      fits = %{"k" => String.duplicate("x", chars)}
+      over = %{"k" => String.duplicate("x", chars + 1)}
+      assert RunnerContract.json_bytes_upper_bound(fits) <= max
+      assert RunnerContract.json_bytes_upper_bound(over) > max
 
       at_cap = put_in(batch, ["events", Access.at(1), "data"], fits)
       assert {:ok, _} = RunnerContract.cast_trace_batch(at_cap)
 
       over_cap = put_in(batch, ["events", Access.at(1), "data"], over)
 
-      assert {:error, {:event_data_too_large, 1, ^max}} =
+      assert {:error, {:event_data_too_large, 1, ^max, _max_event}} =
                RunnerContract.cast_trace_batch(over_cap)
     end
 
