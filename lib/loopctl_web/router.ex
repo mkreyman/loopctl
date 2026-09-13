@@ -344,6 +344,8 @@ defmodule LoopctlWeb.Router do
     post "/api_keys/:id/rotate", ApiKeyController, :rotate
 
     # Issue #801 — runner enrollment for the agent delivery loop
+    # Issue #809 — the Presence pool read (before resources so "pool" is not captured as an :id).
+    get "/runners/pool", RunnerController, :pool
     resources "/runners", RunnerController, only: [:create, :index, :delete]
 
     # Issue #803 — GitHub intake sources for the agent delivery loop

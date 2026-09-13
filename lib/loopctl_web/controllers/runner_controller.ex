@@ -1,6 +1,7 @@
 defmodule LoopctlWeb.RunnerController do
   @moduledoc """
-  Enroll, list and revoke the runners of the agent delivery loop (issue #801).
+  Enroll, list and revoke the runners of the agent delivery loop (issue #801), and read
+  the tenant's connected pool (issue #809).
 
   All actions require `user` role, and the writes require a human-anchored tenant
   (`RequireHumanAnchor`, surface `:runner_pool`): a runner executes dispatched sessions
@@ -120,6 +121,65 @@ defmodule LoopctlWeb.RunnerController do
     }
   )
 
+  operation(:pool,
+    summary: "The tenant's runner pool",
+    description:
+      "The runners of the caller's tenant that are CONNECTED right now, read from Presence " <>
+        "(`Loopctl.Runners.pool/1`), sorted by machine name. Each entry is the most recently " <>
+        "joined socket tracked under that machine name; `live_sockets` counts every socket " <>
+        "tracked under it, so a value above 1 means more than one process is holding the " <>
+        "runner's credential. `sample` is the latest health sample that socket reported, or " <>
+        "null before its first status update. Requires user role. Presence is a liveness " <>
+        "hint, not a scheduler, and it converges only within a CLUSTER: on a deployment with " <>
+        "more than one unclustered node, a runner connected to another node is absent here.",
+    responses: %{
+      200 =>
+        {"Runner pool", "application/json",
+         %Schema{
+           type: :object,
+           required: [:runners],
+           properties: %{
+             runners: %Schema{
+               type: :array,
+               items: %Schema{
+                 type: :object,
+                 required: [
+                   :machine,
+                   :runner_id,
+                   :joined_at,
+                   :in_flight,
+                   :draining,
+                   :max_sessions,
+                   :sample,
+                   :live_sockets
+                 ],
+                 properties: %{
+                   machine: %Schema{type: :string, description: "The enrolled machine name."},
+                   runner_id: %Schema{type: :string, format: :uuid},
+                   joined_at: %Schema{type: :string, format: :"date-time"},
+                   in_flight: %Schema{type: :integer, minimum: 0, nullable: true},
+                   draining: %Schema{type: :boolean, nullable: true},
+                   max_sessions: %Schema{type: :integer, minimum: 0, nullable: true},
+                   sample: %Schema{
+                     type: :object,
+                     nullable: true,
+                     description: "The latest self-measured health sample (runner contract)."
+                   },
+                   live_sockets: %Schema{
+                     type: :integer,
+                     minimum: 1,
+                     description: "Live sockets tracked under this machine name."
+                   }
+                 }
+               }
+             }
+           }
+         }},
+      403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
   @doc "POST /api/v1/runners"
   def create(conn, params) do
     tenant = conn.assigns.current_tenant
@@ -152,6 +212,38 @@ defmodule LoopctlWeb.RunnerController do
       json(conn, %{runner: runner})
     end
   end
+
+  @doc "GET /api/v1/runners/pool"
+  def pool(conn, _params) do
+    tenant = conn.assigns.current_tenant
+
+    runners =
+      tenant.id
+      |> Runners.pool()
+      |> Enum.map(&pool_entry/1)
+      |> Enum.sort_by(& &1.machine)
+
+    json(conn, %{runners: runners})
+  end
+
+  defp pool_entry({machine, %{metas: metas}}) do
+    meta = Enum.max_by(metas, &Map.get(&1, :joined_at), &joined_no_later?/2)
+
+    %{
+      machine: machine,
+      runner_id: Map.get(meta, :runner_id),
+      joined_at: Map.get(meta, :joined_at),
+      in_flight: Map.get(meta, :in_flight),
+      draining: Map.get(meta, :draining),
+      max_sessions: Map.get(meta, :max_sessions),
+      sample: Map.get(meta, :sample),
+      live_sockets: length(metas)
+    }
+  end
+
+  defp joined_no_later?(%DateTime{} = a, %DateTime{} = b), do: DateTime.compare(a, b) != :lt
+  defp joined_no_later?(_a, nil), do: true
+  defp joined_no_later?(nil, _b), do: false
 
   defp validate_key_limit(tenant) do
     max_keys = Tenants.get_tenant_settings(tenant, "max_api_keys", 100)

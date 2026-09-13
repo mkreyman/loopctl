@@ -6,6 +6,15 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **`GET /api/v1/runners/pool` (#809).** The caller's tenant's CONNECTED runners, read from
+  Presence: per machine name, `runner_id`, `joined_at`, `in_flight`, `draining`,
+  `max_sessions`, the latest health `sample`, and `live_sockets` (above 1 means more than one
+  process holds that runner's credential). User role; a read, so not human-anchor gated.
+  Presence converges only within a cluster: on more than one unclustered node, a runner
+  connected to another node is absent. The MCP tools `runner_enroll`, `runner_list`,
+  `runner_revoke` and `runner_pool` (loopctl-mcp-server 2.92.0) use it and the existing
+  `/api/v1/runners` routes; `runner_pool` needs a server carrying this endpoint.
+
 - **Story claims get a lease, renewal, a reclaimer and an epoch fence (#803).** Migration
   `20260913100000` adds `stories.claimed_until` (nullable) and `stories.claim_epoch` (integer, not
   null, default 0), plus a partial index built `CONCURRENTLY`. The ADD COLUMNs are catalog-only and
@@ -35,7 +44,7 @@ All notable changes to loopctl are documented here.
   **Deploy note.** Claims that exist at deploy time have `claimed_until` NULL and are never
   reclaimed — nothing renews them. They keep today's behaviour until released or renewed.
   **A client that holds a claim longer than the lease must now renew it**, or its story is
-  released under it; the MCP server has no renew tool yet.
+  released under it. MCP clients renew with `renew_story_claim` (loopctl-mcp-server 2.92.0).
 
 ### Changed
 

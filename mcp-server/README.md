@@ -70,7 +70,7 @@ Or if installed locally:
 | `LOOPCTL_API_KEY` | Global API key override (if set, always used) | -- |
 | `LOOPCTL_ORCH_KEY` | Orchestrator role API key (verify, reject, review, import) | -- |
 | `LOOPCTL_AGENT_KEY` | Agent role API key (contract, claim, start, request-review) | -- |
-| `LOOPCTL_USER_KEY` | User role API key (minted at signup). Required for **first-time BYO LLM key provisioning** (`set_llm_config` / `llm_config` — see [First-time setup](#first-time-setup--provision-your-byo-llm-keys)) and for destructive admin tools like `knowledge_bulk_publish`. | -- |
+| `LOOPCTL_USER_KEY` | User role API key (minted at signup). Required for **first-time BYO LLM key provisioning** (`set_llm_config` / `llm_config` — see [First-time setup](#first-time-setup--provision-your-byo-llm-keys)) and for destructive admin tools like `knowledge_bulk_publish`, and for the [runner tools](#runner-tools-user-key). | -- |
 | `LOOPCTL_STH_STATE_PATH` | Absolute path for the witness-protocol STH cache file (see [Witness protocol](#witness-protocol-sth)). Optional. | per-(server + key) file under the OS temp dir |
 
 Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_KEY`.
@@ -218,7 +218,8 @@ Epic 39 Repo Coordination Bus — a lightweight, tenant-isolated channel for age
 | Tool | Description |
 |---|---|
 | `contract_story` | Agent acknowledges a story's acceptance criteria. Transitions pending -> contracted. |
-| `claim_story` | Agent claims a contracted story with pessimistic locking. Transitions contracted -> assigned. |
+| `claim_story` | Agent claims a contracted story with pessimistic locking. Transitions contracted -> assigned. On a loopctl with claim leases the result leads with the claim's `claim_epoch` and `claimed_until`; keep the epoch for `renew_story_claim`. Both are absent on an older server. |
+| `renew_story_claim` | Renew your claim's lease (`POST /stories/:id/renew-claim`, agent key). A claim not renewed before `claimed_until` (default 24 hours, `STORY_CLAIM_LEASE_SECONDS`) is released back to `pending` under you, so renew well inside it on any story held longer. Required: `story_id`, `claim_epoch` (from the claim). Refusals pass through: 400 epoch missing or malformed, 422 `not_claimed`, 409 `stale_claim_epoch` (the claim has ended: stop working it), 409 `not_claimant`. Needs a loopctl server with claim leases. |
 | `start_story` | Agent starts work on a claimed story. Transitions assigned -> implementing. |
 | `request_review` | Agent signals implementation is complete and ready for review. |
 
@@ -463,6 +464,17 @@ key (`LOOPCTL_AGENT_KEY`), resolved server-side — you never pass a tenant. A
 through the same authenticated + witness/STH path as every static read tool. If the
 `/retrieve/tools` fetch fails, listing degrades to the static tools (never errors).
 The generated-tool count per tenant is bounded by the per-tenant entity cap.
+
+### Runner Tools (user key)
+
+Enroll the dev machines that run the agent delivery loop, and see which are connected (issue #809). All four require `LOOPCTL_USER_KEY`; enroll and revoke also require a human-anchored tenant.
+
+| Tool | Description |
+|---|---|
+| `runner_enroll` | Enroll this machine as a runner (`POST /api/v1/runners`). Required: `name` (the machine name the runner declares when it joins) and `token_file` (absolute, or starting with `~/`). The credential is written to `token_file` with mode 0600 and is **never returned**: the result is only `{ runner: {id, name, inserted_at}, token_file }`, because a tool result lands in the transcript and the token lets its holder join as that machine. The file is created exclusively, so an existing path (or a symlink there) is refused before anything is enrolled; missing parent directories are created 0700. If the token cannot be written after enrollment, the runner is revoked before the error returns. Only a 4xx is treated as a refusal: any other failure (timeout, 5xx, a 2xx that did not parse) may have enrolled the runner, so its response body is never echoed, the runner is revoked when the response proves its id, and otherwise the error points at `runner_list` and `runner_revoke`. 422 (name malformed or taken) and 403 (`custody_tier_required`, `api_key_mint_forbidden`) pass through with their code. |
+| `runner_list` | List enrolled runners (`GET /api/v1/runners`). Optional: `include_revoked`. Enrollment only; connection state is `runner_pool`. |
+| `runner_revoke` | Revoke a runner (`DELETE /api/v1/runners/:id`): its credential stops authenticating and its live socket is disconnected. The undo for `runner_enroll`. Idempotent. Required: `id`. |
+| `runner_pool` | The tenant's connected runners from Presence (`GET /api/v1/runners/pool`): per machine name, `runner_id`, `joined_at`, `in_flight`, `draining`, `max_sessions`, the latest `sample`, and `live_sockets` (above 1 means more than one process holds the credential). Presence converges only within a cluster. |
 
 ### Dispatch & Chain of Custody (v2) Tools
 
