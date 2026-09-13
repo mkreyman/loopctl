@@ -20,15 +20,30 @@ defmodule Loopctl.Runners.DispatchRecord do
     past this row's. Written by `Loopctl.Runners.DispatchLedger` when a reply or trace about
     the row finds that, never by the runner; a `refused` row is left refused.
 
+  ## Capacity
+
+  A dispatch recorded as `sent` holds one of its runner's slots (`Loopctl.Runners.Capacity`)
+  until `released_at` is set. `slot_generation` names the slot currently or last held — a
+  re-send of an undelivered dispatch takes a new one — and a release applies only to the
+  generation it names. `reserved_at` is when that slot was taken.
+
+  `delivery` is the reservation's ONE decision, taken under the row lock by whichever of the
+  two processes a broadcast wakes gets there first: `"pushed"` (the dispatch went to a
+  socket) or `"dropped"` (a channel refused to push it and gave the slot back). It is reset
+  with every reservation, and `wall_clock_seconds` is refreshed when a push wins, so the
+  bound `Loopctl.Runners.Capacity` applies is always the clock the session is running under.
+
   ## Trust boundary
 
   Every field is set programmatically in `Loopctl.Runners`; there is no caller changeset.
 
   ## Isolation
 
-  Read and written only through `Loopctl.Runners.DispatchLedger`, on the RLS-enforced
-  `Loopctl.Repo` inside `Repo.with_tenant/2`, with an explicit `tenant_id` predicate as
-  well. Never `AdminRepo` — see that module.
+  Written only through `Loopctl.Runners.DispatchLedger` and `Loopctl.Runners.Capacity` (which
+  sets `released_at`), on the RLS-enforced `Loopctl.Repo` inside `Repo.with_tenant/2`, with an
+  explicit `tenant_id` predicate as well. Never written through `AdminRepo` — see
+  `DispatchLedger`; `Loopctl.Workers.HealRunnerCapacityWorker` only reads a bounded candidate
+  list there.
   """
 
   use Loopctl.Schema
@@ -51,6 +66,11 @@ defmodule Loopctl.Runners.DispatchRecord do
     field :pushed_at, :utc_datetime_usec
     field :run_id, :binary_id
     field :trace_acked_seq, :integer, default: -1
+    field :wall_clock_seconds, :integer
+    field :released_at, :utc_datetime_usec
+    field :reserved_at, :utc_datetime_usec
+    field :slot_generation, :integer, default: 0
+    field :delivery, :string
 
     timestamps()
   end

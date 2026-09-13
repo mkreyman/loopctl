@@ -31,7 +31,7 @@ defmodule Loopctl.Runners do
   a broadcast to every tenant's machines). `pool/1` is the read.
 
   Presence is a liveness hint, never a scheduler: it has no compare-and-set, so capacity
-  must be reserved in Postgres when dispatch arrives (design §7). And it converges only
+  is reserved in Postgres when dispatch arrives (design §7, `Loopctl.Runners.Capacity`). And it converges only
   across a CLUSTER — on a second, unclustered machine a runner tracked on node A is
   invisible on node B. `Loopctl.ClusterReadiness` warns when that happens.
 
@@ -42,8 +42,9 @@ defmodule Loopctl.Runners do
   runner without exactly one live socket before anything is sent; the channel repeats the
   halt and single-socket checks right before the push. Every dispatch is recorded in the
   dispatch ledger (`Loopctl.Runners.DispatchLedger`) before it is broadcast, and the runner's
-  `dispatch_reply` and trace land there. Placement, capacity reservation and claiming are the
-  caller's (#803).
+  `dispatch_reply` and trace land there. Recording it takes a capacity slot on the runner and
+  counts it against the tenant's admission limit, in the same transaction
+  (`Loopctl.Runners.Capacity`). Placement and claiming are the caller's (#803).
 
   ## Across the cluster
 
@@ -79,8 +80,12 @@ defmodule Loopctl.Runners do
     `:already_replied`; the first trace batch binds one `run_id` to the dispatch and any
     other run is `:run_mismatch`. So a duplicate push can start a second process, but only
     one accepted reply and one trace stream are ever recorded against the claim.
+  - **Two nodes racing for the last slot.** Both run the same conditional UPDATE on the
+    runner row; Postgres serializes them and exactly one gets a row back. Admission is a
+    transaction-scoped advisory lock, so it too is held by Postgres, not by either node.
   - **Retries.** Nothing here retries a broadcast. A dispatch re-sent with the same
-    `dispatch_id` finds its ledger row and is pushed again (see `DispatchLedger`).
+    `dispatch_id` finds its ledger row and is pushed again (see `DispatchLedger`), without
+    taking a second slot.
   - **Slow links.** Distribution declares a silent peer down after the default
     `net_ticktime` (45-75 s); Presence drops a silent replica after 30 s (above).
   """
@@ -97,6 +102,8 @@ defmodule Loopctl.Runners do
   alias Loopctl.Auth
   alias Loopctl.Auth.ApiKey
   alias Loopctl.LogValue
+  alias Loopctl.Repo
+  alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.Presence
   alias Loopctl.Runners.Runner
@@ -137,7 +144,8 @@ defmodule Loopctl.Runners do
 
   @doc """
   Enrolls a machine as a runner: mints its `:agent` API key and binds it to `name` in
-  one transaction, and records the enrollment on the audit chain.
+  one transaction, and records the enrollment on the audit chain. `max_sessions` (1..64,
+  default `Runner.default_max_sessions/0`) is how many slots loopctl will reserve on it.
 
   Returns `{:ok, %{runner: runner, raw_key: raw_key}}`. The raw key is returned once
   and never stored.
@@ -150,8 +158,14 @@ defmodule Loopctl.Runners do
           {:ok, %{runner: Runner.t(), raw_key: String.t()}}
           | {:error, Ecto.Changeset.t() | term()}
   def enroll_runner(tenant_id, attrs, opts \\ []) when is_binary(tenant_id) do
-    name = Map.get(attrs, :name) || Map.get(attrs, "name")
-    changeset = Runner.create_changeset(%Runner{tenant_id: tenant_id}, %{name: name})
+    fields =
+      for key <- [:name, :max_sessions],
+          value = Map.get(attrs, key) || Map.get(attrs, Atom.to_string(key)),
+          not is_nil(value),
+          into: %{},
+          do: {key, value}
+
+    changeset = Runner.create_changeset(%Runner{tenant_id: tenant_id}, fields)
 
     if changeset.valid? do
       do_enroll(tenant_id, changeset, opts)
@@ -179,7 +193,11 @@ defmodule Loopctl.Runners do
           actor_lineage: Keyword.get(opts, :actor_lineage, []),
           entity_type: "runner",
           entity_id: runner.id,
-          payload: %{"name" => runner.name, "api_key_id" => api_key.id}
+          payload: %{
+            "name" => runner.name,
+            "api_key_id" => api_key.id,
+            "max_sessions" => runner.max_sessions
+          }
         })
       end)
 
@@ -346,8 +364,8 @@ defmodule Loopctl.Runners do
 
   @doc """
   Sends a dispatch to one connected runner. The ONLY path by which a dispatch reaches a
-  runner socket. It places nothing, reserves no capacity and claims no story — it is the
-  last hop, and it refuses, in this order:
+  runner socket. It places nothing and claims no story — the caller names the runner — but
+  it does reserve the capacity the dispatch uses. It refuses, in this order:
 
   1. `{:error, {:invalid, messages}}` — the payload does not match the contract's
      `RunnerDispatch` (`RunnerContract.cast_dispatch/1`). Undeclared keys, at any depth, are
@@ -368,6 +386,16 @@ defmodule Loopctl.Runners do
      `dispatch_id`; sending it again would start a second session.
   8. `{:error, :stale_claim_epoch}` — the dispatch's `claim_epoch` is not the story's current
      one (or the story does not exist): the claim it was built for has already ended.
+  9. `{:error, :admission_limit_reached}` — the tenant's runners already hold
+     `Capacity.limit/0` slots between them. All of a tenant's sessions run on one Anthropic
+     account, and its rate limit is what bites.
+  10. `{:error, :runner_at_capacity}` — this runner already holds `max_sessions` slots (or
+      was revoked since step 3).
+  11. `{:error, :capacity_busy}` — a lock the reservation waits on was not granted within
+      `Capacity.lock_timeout_ms/0`. Nothing was recorded or reserved; retry.
+
+  Steps 6-11 run in ONE transaction: the ledger row and its slot commit together or not at
+  all, and a re-send of a `dispatch_id` whose row still holds its slot takes no second one.
 
   Then it writes the dispatch's ledger row as `sent` (`DispatchLedger.record_sent/3`) — or
   finds the one an earlier call with the same `dispatch_id` wrote, so a retry never creates a
@@ -399,7 +427,10 @@ defmodule Loopctl.Runners do
              | :runner_ambiguous
              | :dispatch_id_conflict
              | :dispatch_already_replied
-             | :stale_claim_epoch}
+             | :stale_claim_epoch
+             | :admission_limit_reached
+             | :runner_at_capacity
+             | :capacity_busy}
   def dispatch(tenant_id, runner_id, payload) do
     case do_dispatch(tenant_id, runner_id, payload) do
       :ok ->
@@ -443,12 +474,152 @@ defmodule Loopctl.Runners do
          :ok <- runner_authorized(tenant_id, runner_id),
          :ok <- single_live_socket(tenant_id, runner_id),
          {:ok, _record} <- DispatchLedger.record_sent(tenant_id, runner_id, dispatch) do
-      Phoenix.PubSub.broadcast(
-        Loopctl.PubSub,
-        dispatch_topic(runner_id),
-        {:runner_dispatch, dispatch}
-      )
+      broadcast_dispatch(tenant_id, runner_id, dispatch)
     end
+  end
+
+  # The two-element message every deployed node understands. A node of the PREVIOUS release
+  # has no clause for a three-element one and crashes on it, dropping the dispatch, so the
+  # slot the dispatch carries is NOT put on the wire during a rolling deploy: the channel
+  # resolves it from the ledger row when it drops one
+  # (`DispatchLedger.release_undelivered_slot/2`), which is also what keeps a drop off a
+  # running session's slot. The channel already accepts both shapes, so a later release can
+  # move the slot onto the message with no window of its own.
+  defp broadcast_dispatch(tenant_id, runner_id, dispatch) do
+    case Phoenix.PubSub.broadcast(
+           Loopctl.PubSub,
+           dispatch_topic(runner_id),
+           {:runner_dispatch, dispatch}
+         ) do
+      :ok ->
+        :ok
+
+      # The only failure after the slot is committed. Nothing was handed to any channel, so
+      # the slot goes back; a re-send of the same `dispatch_id` takes a fresh one. The release
+      # can itself be refused (a lock it could not get), which is an outcome to LOG — matching
+      # only `{:ok, _}` here turned an orderly refusal into a MatchError inside the caller.
+      {:error, _reason} = error ->
+        release_after_failed_broadcast(tenant_id, dispatch.dispatch_id)
+        error
+    end
+  end
+
+  defp release_after_failed_broadcast(tenant_id, dispatch_id) do
+    case DispatchLedger.record_drop(tenant_id, dispatch_id) do
+      {:ok, :released} ->
+        :ok
+
+      other ->
+        Logger.warning(
+          "runner dispatch slot not released after a failed broadcast: " <>
+            "tenant_id=#{tenant_id} dispatch_id=#{dispatch_id} outcome=#{inspect(other)}",
+          tenant_id: tenant_id,
+          dispatch_id: dispatch_id
+        )
+
+        :ok
+    end
+  end
+
+  @doc """
+  Takes one capacity slot on an active runner that has one free: a single conditional
+  UPDATE (`Capacity.reserve/2`), in its own transaction. Returns the runner's new
+  `in_flight`.
+
+  The primitive, not the dispatch path: a slot taken here belongs to no dispatch, so the
+  heal sweep (`heal_capacity/2`) gives it back, and it does not pass admission. Dispatch
+  through `dispatch/3`, which ties each slot to its ledger row.
+  """
+  @spec reserve_slot(Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, pos_integer()} | {:error, :runner_at_capacity | :capacity_busy}
+  def reserve_slot(tenant_id, runner_id) when is_binary(tenant_id) and is_binary(runner_id) do
+    Repo.with_tenant(tenant_id, fn ->
+      # Bounded like every other capacity transaction: this one queues behind a heal or a
+      # release holding the same runner row.
+      Capacity.set_lock_timeout!(Repo)
+      Capacity.reserve(Repo, tenant_id, runner_id)
+    end)
+    |> flatten()
+  rescue
+    error in Postgrex.Error ->
+      if Capacity.retryable?(error),
+        do: {:error, :capacity_busy},
+        else: reraise(error, __STACKTRACE__)
+  end
+
+  @doc """
+  Releases the slot GENERATION a dispatch holds, exactly once
+  (`DispatchLedger.release_slot/3`), in a transaction of its own. Call it when a dispatch's
+  session ends; a replay, or a generation the row no longer holds, returns
+  `{:ok, :already_released}` and changes nothing.
+
+  Read the generation from `DispatchLedger.get_record/2` (`slot_generation`) when the
+  session starts. A caller that already owns a transaction — a claim release, a stage
+  transition — uses `DispatchLedger.release_slot_in/4` instead, so the release commits with
+  the transition that decided it rather than after it.
+
+  `{:error, :capacity_busy}` means a lock this needed was not free within
+  `Capacity.lock_timeout_ms/0`: nothing was released and the call can be made again after
+  `Capacity.busy_retry_ms/0`. The slot stays bounded by the heal sweep meanwhile.
+  """
+  @spec release_slot(Ecto.UUID.t(), Ecto.UUID.t(), integer()) ::
+          {:ok, :released | :already_released}
+          | {:error, :unknown_dispatch | :capacity_busy}
+  def release_slot(tenant_id, dispatch_id, generation)
+      when is_binary(tenant_id) and is_binary(dispatch_id) and is_integer(generation),
+      do: DispatchLedger.release_slot(tenant_id, dispatch_id, generation)
+
+  @doc """
+  Whether the tenant is under its admission limit right now, for a caller deciding whether
+  to CLAIM a story it would then dispatch. A read, not a reservation: two callers can both
+  be told `:ok`, and `dispatch/3` is where the limit is enforced under a lock.
+  """
+  @spec admission(Ecto.UUID.t()) ::
+          {:ok, %{in_flight: non_neg_integer(), limit: pos_integer()}}
+          | {:error, :admission_limit_reached}
+  def admission(tenant_id) when is_binary(tenant_id) do
+    {:ok, in_flight} =
+      Repo.with_tenant(tenant_id, fn -> Capacity.tenant_in_flight(Repo, tenant_id) end)
+
+    limit = Capacity.limit()
+
+    if in_flight < limit,
+      do: {:ok, %{in_flight: in_flight, limit: limit}},
+      else: {:error, :admission_limit_reached}
+  end
+
+  @doc """
+  Releases every reservation of a runner that can no longer be running and recomputes its
+  `in_flight` from the rest (`Capacity.heal/3`). Idempotent.
+  """
+  @spec heal_capacity(Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, %{released: non_neg_integer(), in_flight: non_neg_integer() | nil}}
+  def heal_capacity(tenant_id, runner_id) when is_binary(tenant_id) and is_binary(runner_id) do
+    Repo.with_tenant(tenant_id, fn ->
+      Capacity.set_lock_timeout!(Repo)
+      Capacity.heal(tenant_id, runner_id)
+    end)
+    |> flatten()
+  end
+
+  defp flatten({:ok, {:ok, _} = ok}), do: ok
+  defp flatten({:ok, {:error, _} = error}), do: error
+  defp flatten({:error, _} = error), do: error
+
+  @doc """
+  The capacity of a tenant's active runners as Postgres holds it — the authoritative values,
+  not the ones runners report in Presence: runner id to `%{in_flight, max_sessions}`.
+  """
+  @spec capacity(Ecto.UUID.t()) :: %{
+          Ecto.UUID.t() => %{in_flight: non_neg_integer(), max_sessions: pos_integer()}
+        }
+  def capacity(tenant_id) when is_binary(tenant_id) do
+    from(r in Runner,
+      where: r.tenant_id == ^tenant_id and is_nil(r.revoked_at),
+      select: {r.id, %{in_flight: r.in_flight, max_sessions: r.max_sessions}}
+    )
+    |> AdminRepo.all()
+    |> Map.new()
   end
 
   @doc """

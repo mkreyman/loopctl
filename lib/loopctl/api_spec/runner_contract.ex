@@ -31,6 +31,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | runner -> control | `"trace"` | `RunnerTraceBatch` of `RunnerTraceEvent` (since 1.1.0) | `RunnerTraceAck` | `rate_limited`, `invalid_payload`, `batch_too_large`, `event_data_too_large`, `unknown_dispatch`, `stale_claim_epoch`, `dispatch_not_accepted`, `run_mismatch` |
   | runner -> control | `"trace_cursor"` | `RunnerTraceCursor` (since 1.1.0) | `RunnerTraceAck` | `rate_limited`, `invalid_payload` |
   | control -> runner | `"disconnecting"` | `RunnerDisconnecting` (since 1.2.0) | — | — |
+  | (1.3.0) a dispatch's `wall_clock_seconds` is bounded: `RunnerDispatch.max_wall_clock_seconds/0` | | | | |
   | runner -> control | any other event | — | — | `unknown_event` (since 1.2.0; every time, never `rate_limited`) |
 
   ## Server-initiated disconnects (since 1.2.0)
@@ -59,6 +60,13 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   `batch_too_large`, `event_data_too_large`) neither starts a floor nor spends a reply, so
   a runner can correct it and resend at once. A message inside its limit is refused with
   `rate_limited` and `min_interval_ms`; send it again after that long.
+
+  One case that rule does not cover: a message the server ACCEPTED but could not write,
+  because a database lock it needed was not free (loopctl #803). It comes back as
+  `rate_limited` with a `min_interval_ms` LONGER than that wait, and it has already spent its
+  trace floor or a `dispatch_reply` bucket token — it reached the database, which is what the
+  floors meter. A runner that keeps re-sending inside the interval it was given can therefore
+  run its reply bucket down while none of the replies is recorded; wait the interval out.
 
   ## Values
 
@@ -106,7 +114,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   alias OpenApiSpex.Schema
 
-  @version "1.2.0"
+  @version "1.3.0"
   @major 1
 
   defmodule ByteRule do
@@ -251,7 +259,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
             type: :integer,
             minimum: 0,
             maximum: 64,
-            description: "Concurrent sessions this machine accepts. Advisory; see in_flight."
+            description:
+              "Concurrent sessions this machine accepts; it refuses past them with " <>
+                "`at_capacity`. Advisory to loopctl, which reserves against the max_sessions " <>
+                "the runner was ENROLLED with, never this value."
           },
           in_flight: %Schema{
             type: :integer,
@@ -299,6 +310,19 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     @moduledoc false
     require OpenApiSpex
 
+    # A session's wall clock, bounded (since 1.3.0). The runner stops a session there, and
+    # loopctl stores the value and presumes a slot free past it plus a grace
+    # (`Loopctl.Runners.Capacity`), so an unbounded one both outlives any real session and
+    # overflows the `runner_dispatches.wall_clock_seconds` integer column — a raise out of
+    # `Loopctl.Runners.dispatch/3` rather than the `invalid_payload` an out-of-range value
+    # deserves. A day is the story claim lease's own default (`STORY_CLAIM_LEASE_SECONDS`):
+    # past it the claim would be reclaimed under the session anyway.
+    @max_wall_clock_seconds 86_400
+
+    @doc "The longest wall clock a dispatch may give a session."
+    @spec max_wall_clock_seconds() :: pos_integer()
+    def max_wall_clock_seconds, do: @max_wall_clock_seconds
+
     OpenApiSpex.schema(
       %{
         title: "RunnerDispatch",
@@ -333,7 +357,14 @@ defmodule Loopctl.ApiSpec.RunnerContract do
               "Echoed on every runner-to-control message about this dispatch. Bumped on " <>
                 "reclaim, so a resurrected session's writes are rejected."
           },
-          wall_clock_seconds: %Schema{type: :integer, minimum: 1},
+          wall_clock_seconds: %Schema{
+            type: :integer,
+            minimum: 1,
+            maximum: @max_wall_clock_seconds,
+            description:
+              "How long the runner lets the session run before stopping it. At most " <>
+                "#{@max_wall_clock_seconds} (a day) since contract 1.3.0."
+          },
           max_turns: %Schema{type: :integer, minimum: 1},
           token_budget: %Schema{type: :integer, minimum: 1, nullable: true}
         }

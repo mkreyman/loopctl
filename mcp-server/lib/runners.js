@@ -65,12 +65,18 @@ export function expandHome(p, homedir = os.homedir()) {
 }
 
 /**
- * `POST /api/v1/runners {name}`, with the returned token written to `token_file` and
- * never returned. Resolves to `{ runner: {id, name, inserted_at}, token_file }` or an
+ * `POST /api/v1/runners {name, max_sessions?}`, with the returned token written to
+ * `token_file` and never returned. Resolves to
+ * `{ runner: {id, name, max_sessions, inserted_at}, token_file }` or an
  * `{ error: true, status, body }` shape. It never throws.
+ *
+ * `max_sessions` is how many dispatches loopctl will keep in flight on this machine at
+ * once (loopctl #803). It is sent ONLY when given, so the server's own default applies
+ * otherwise, and the server refuses one out of range with a 422 that passes straight
+ * through — this does not second-guess the bound.
  */
 export async function enrollRunner(
-  { name, token_file } = {},
+  { name, token_file, max_sessions } = {},
   { userKey, apiCall, fs = defaultFs, homedir = os.homedir() } = {},
 ) {
   if (!userKey) return refuse(MISSING_USER_KEY);
@@ -115,7 +121,8 @@ export async function enrollRunner(
 
   let result;
   try {
-    result = await apiCall("POST", RUNNERS_PATH, { name });
+    const body = max_sessions === undefined ? { name } : { name, max_sessions };
+    result = await apiCall("POST", RUNNERS_PATH, body);
   } catch {
     result = { error: true, status: 0, body: "Enrollment request failed." };
   }
@@ -153,8 +160,15 @@ export async function enrollRunner(
     );
   }
 
+  // `max_sessions` only when the server sent one, so a server without loopctl #803 returns
+  // exactly the shape it always did rather than a key that is always undefined.
   return {
-    runner: { id: runner.id, name: runner.name, inserted_at: runner.inserted_at },
+    runner: {
+      id: runner.id,
+      name: runner.name,
+      ...(runner.max_sessions === undefined ? {} : { max_sessions: runner.max_sessions }),
+      inserted_at: runner.inserted_at,
+    },
     token_file: tokenPath,
   };
 }

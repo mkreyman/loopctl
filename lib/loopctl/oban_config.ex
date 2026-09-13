@@ -621,6 +621,10 @@ defmodule Loopctl.ObanConfig do
            # knob. Bounded per run. Keep in sync with the crontab assertion in
            # oban_plugins_config_test.exs.
            {"*/5 * * * *", Loopctl.Workers.ReclaimExpiredClaimsWorker},
+           # #803: gives back runner capacity slots whose dispatch can no longer be running.
+           # Every minute: a leaked slot refuses admissions for the whole tenant. Bounded per
+           # run. Keep in sync with the crontab assertion in oban_plugins_config_test.exs.
+           {"* * * * *", Loopctl.Workers.HealRunnerCapacityWorker},
            {"* * * * *", Loopctl.Workers.SystemConfigRefreshWorker},
            # US-41.1 (review): the STANDING embedding-side-table reconciliation pass —
            # sweeps the dual-write crash window (legacy row without its dim-1536 mirror)

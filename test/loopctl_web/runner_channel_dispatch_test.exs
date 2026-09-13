@@ -23,11 +23,16 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
   use LoopctlWeb.ChannelCase, async: false
 
+  import Ecto.Query
+  import ExUnit.CaptureLog
+
+  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.ApiSpec.RunnerContract.RunnerTraceBatch
   alias Loopctl.ApiSpec.RunnerContract.RunnerTraceEvent
   alias Loopctl.Auth
   alias Loopctl.Runners
+  alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Runners.Presence
@@ -83,6 +88,17 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
   end
 
   defp in_pool?(tenant_id, name), do: Map.has_key?(Runners.pool(tenant_id), name)
+
+  # A dispatch RECORDED in the ledger, as `Runners.dispatch/3` records one before it
+  # broadcasts. Tests that broadcast by hand need it: the channel takes the delivery decision
+  # on the row, so a dispatch with no row is never pushed.
+  defp recorded_dispatch(runner, attrs \\ %{}) do
+    {:ok, dispatch} =
+      RunnerContract.cast_dispatch(dispatch_payload(runner.tenant_id, Map.new(attrs)))
+
+    {:ok, _record} = DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch)
+    dispatch
+  end
 
   # A dispatch payload for a real story at the dispatch's epoch, on the RLS connection the
   # ledger's claim fence reads.
@@ -169,19 +185,31 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
     @tag :capture_log
     test "a halt landing after the sender's check is caught by the channel before the push",
          %{runner: runner, channel: channel} do
-      {:ok, dispatch} = RunnerContract.cast_dispatch(build(:runner_dispatch))
       topic = Runners.dispatch_topic(runner.id)
 
+      # The control first: with no halt this very path pushes.
+      pushable = recorded_dispatch(runner)
+      Phoenix.PubSub.broadcast(Loopctl.PubSub, topic, {:runner_dispatch, pushable})
+      assert_push "dispatch", %{dispatch_id: pushed_id}, @reply_timeout
+      assert pushed_id == pushable.dispatch_id
+
+      # Then the same shape of message with a halt in place, which the channel catches
+      # between the sender's check and the push. (Cleared afterwards it would be pushed
+      # again; the halt is left in place because clearing it extends every live claim lease,
+      # which blocks on the story rows this test's own transaction holds.)
+      halted = recorded_dispatch(runner)
       {:ok, _} = Tenants.halt_custody(runner.tenant_id)
-      Phoenix.PubSub.broadcast(Loopctl.PubSub, topic, {:runner_dispatch, dispatch})
+      Phoenix.PubSub.broadcast(Loopctl.PubSub, topic, {:runner_dispatch, halted})
       _ = :sys.get_state(channel.channel_pid)
       refute_push "dispatch", _
 
-      # The same message once the halt is cleared is pushed, so the refusal above was the halt.
-      {:ok, _} = Tenants.clear_custody_halt(runner.tenant_id)
-      Phoenix.PubSub.broadcast(Loopctl.PubSub, topic, {:runner_dispatch, dispatch})
-      assert_push "dispatch", %{dispatch_id: dispatch_id}, @reply_timeout
-      assert dispatch_id == dispatch.dispatch_id
+      # A halt is final for that dispatch, so its slot went back.
+      assert eventually(
+               fn ->
+                 DispatchLedger.get_record(runner.tenant_id, halted.dispatch_id).released_at
+               end,
+               @reply_timeout
+             )
     end
 
     test "an unauthorized runner still in the pool is refused", %{runner: runner} do
@@ -245,7 +273,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
     @tag :capture_log
     test "a live meta the sender did not see stops the push", %{runner: runner} do
-      {:ok, dispatch} = RunnerContract.cast_dispatch(build(:runner_dispatch))
+      dispatch = recorded_dispatch(runner)
       topic = Runners.dispatch_topic(runner.id)
 
       # A second live socket for this runner, as another node's Presence would report it.
@@ -307,6 +335,157 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
       assert_push "dispatch", _, @reply_timeout
       assert DispatchLedger.get_record(runner.tenant_id, payload["dispatch_id"]).id == record.id
+    end
+
+    test "a runner at max_sessions is refused before anything is recorded or pushed; a re-send is not",
+         %{runner: runner} do
+      # The setup runner is enrolled with the default of two slots.
+      first = dispatch_payload(runner.tenant_id)
+
+      for payload <- [first, dispatch_payload(runner.tenant_id)] do
+        assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
+        assert_push "dispatch", _, @reply_timeout
+      end
+
+      third = dispatch_payload(runner.tenant_id)
+      assert {:error, :runner_at_capacity} = Runners.dispatch(runner.tenant_id, runner.id, third)
+      refute_push "dispatch", _
+      assert is_nil(DispatchLedger.get_record(runner.tenant_id, third["dispatch_id"]))
+
+      # The retry of a dispatch that already holds its slot needs no new one.
+      assert :ok = Runners.dispatch(runner.tenant_id, runner.id, first)
+      assert_push "dispatch", _, @reply_timeout
+    end
+
+    test "the tenant's admission limit refuses a runner that still has free slots",
+         %{runner: runner} do
+      {raw_b, runner_b} =
+        fixture(:committed_runner, %{
+          name: "blockit",
+          tenant_id: runner.tenant_id,
+          max_sessions: 8
+        })
+
+      {:ok, socket_b} = connect_runner(raw_b)
+      {_reply, _channel_b} = join_pool(socket_b, "blockit")
+
+      for _ <- 1..Capacity.limit() do
+        assert :ok =
+                 Runners.dispatch(
+                   runner.tenant_id,
+                   runner_b.id,
+                   dispatch_payload(runner.tenant_id)
+                 )
+      end
+
+      over = dispatch_payload(runner.tenant_id)
+
+      assert {:error, :admission_limit_reached} =
+               Runners.dispatch(runner.tenant_id, runner_b.id, over)
+
+      assert is_nil(DispatchLedger.get_record(runner.tenant_id, over["dispatch_id"]))
+    end
+
+    test "is broadcast in the shape every deployed node understands", %{runner: runner} do
+      # A node of the PREVIOUS release has no clause for a three-element message and crashes
+      # on it, dropping the dispatch. This release therefore keeps sending the two-element
+      # one; the channel accepts both so a later release can move.
+      Phoenix.PubSub.subscribe(Loopctl.PubSub, Runners.dispatch_topic(runner.id))
+      payload = dispatch_payload(runner.tenant_id)
+
+      assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
+
+      assert_receive {:runner_dispatch, broadcast}, @reply_timeout
+      assert broadcast.dispatch_id == payload["dispatch_id"]
+      refute_received {:runner_dispatch, _, _}
+    end
+
+    test "a three-element message from a newer node is pushed like any other",
+         %{runner: runner} do
+      dispatch = recorded_dispatch(runner)
+
+      Phoenix.PubSub.broadcast(
+        Loopctl.PubSub,
+        Runners.dispatch_topic(runner.id),
+        {:runner_dispatch, dispatch, 7}
+      )
+
+      assert_push "dispatch", pushed, @reply_timeout
+      assert pushed.dispatch_id == dispatch.dispatch_id
+    end
+
+    test "a message shape the channel does not know is ignored, logged once, and the socket lives",
+         %{runner: runner, channel: channel} do
+      log =
+        capture_log(fn ->
+          # The rolling-deploy case arrives at dispatch rate on every channel, so the log is
+          # gated even though every message is ignored.
+          for _ <- 1..5 do
+            send(channel.channel_pid, {:runner_dispatch_v3, %{}, %{}, %{}})
+            _ = :sys.get_state(channel.channel_pid)
+          end
+        end)
+
+      assert [_one] = Regex.scan(~r/ignored an unknown channel message/, log)
+      assert Process.alive?(channel.channel_pid)
+
+      # And the channel still serves its runner.
+      assert :ok = dispatch_to(runner)
+      assert_push "dispatch", _, @reply_timeout
+    end
+
+    test "a dispatch the channel DROPS before any push gives its slot back at once",
+         %{runner: runner, channel: channel} do
+      payload = dispatch_payload(runner.tenant_id)
+      {:ok, dispatch} = RunnerContract.cast_dispatch(payload)
+      assert {:ok, record} = DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch)
+      refute record.released_at
+      refute record.pushed_at
+
+      # Delivered to the channel with a halt in place: it drops it instead of pushing, so the
+      # slot is holding no session and goes back.
+      {:ok, _} = Tenants.halt_custody(runner.tenant_id)
+
+      Phoenix.PubSub.broadcast(
+        Loopctl.PubSub,
+        Runners.dispatch_topic(runner.id),
+        {:runner_dispatch, dispatch}
+      )
+
+      _ = :sys.get_state(channel.channel_pid)
+      refute_push "dispatch", _
+
+      assert eventually(
+               fn ->
+                 DispatchLedger.get_record(runner.tenant_id, payload["dispatch_id"]).released_at
+               end,
+               @reply_timeout
+             )
+    end
+
+    test "a dispatch DROPPED after an earlier push keeps the running session's slot",
+         %{runner: runner, channel: channel} do
+      payload = dispatch_payload(runner.tenant_id)
+      assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
+      assert_push "dispatch", _, @reply_timeout
+
+      record = DispatchLedger.get_record(runner.tenant_id, payload["dispatch_id"])
+      assert record.pushed_at
+      {:ok, dispatch} = RunnerContract.cast_dispatch(payload)
+
+      # The retry of a dispatch whose slot is already in use, dropped: the session started by
+      # the first push still holds that slot.
+      {:ok, _} = Tenants.halt_custody(runner.tenant_id)
+
+      Phoenix.PubSub.broadcast(
+        Loopctl.PubSub,
+        Runners.dispatch_topic(runner.id),
+        {:runner_dispatch, dispatch}
+      )
+
+      _ = :sys.get_state(channel.channel_pid)
+      refute_push "dispatch", _
+      refute DispatchLedger.get_record(runner.tenant_id, payload["dispatch_id"]).released_at
     end
 
     test "a dispatch_id whose ledger row disagrees is refused before anything is pushed",
@@ -442,6 +621,168 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
   defp status_of(runner, dispatch),
     do: DispatchLedger.get_record(runner.tenant_id, dispatch["dispatch_id"]).status
+
+  # A row every connection can see, and a transaction of its own to lock it from — the only
+  # way to make the channel's own writes WAIT on something inside a test.
+  defp committed(fun), do: Sandbox.unboxed_run(Loopctl.Repo, fun)
+
+  defp committed_dispatch(runner) do
+    committed(fn ->
+      story = fixture(:ledger_story, %{tenant_id: runner.tenant_id, claim_epoch: 0})
+      payload = build(:runner_dispatch, %{"story_id" => story.id})
+      {:ok, dispatch} = RunnerContract.cast_dispatch(payload)
+      {:ok, _record} = DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch)
+      %{story: story, payload: payload, dispatch: dispatch}
+    end)
+  end
+
+  # Holds `lock_query` in a committed transaction until `finish/1` is called, so a channel
+  # write that needs the same row runs into its lock_timeout for real.
+  defp hold_lock(tenant_id, lock_query) do
+    test = self()
+
+    task =
+      Task.async(fn -> committed(fn -> hold_until_finished(tenant_id, lock_query, test) end) end)
+
+    assert_receive :holding, 5_000
+    task
+  end
+
+  defp hold_until_finished(tenant_id, lock_query, test) do
+    Loopctl.Repo.with_tenant(tenant_id, fn ->
+      Loopctl.Repo.one!(lock_query)
+      send(test, :holding)
+      await_finish()
+    end)
+  end
+
+  defp await_finish do
+    receive do
+      :finish -> :ok
+    after
+      30_000 -> :timeout
+    end
+  end
+
+  defp finish(task) do
+    send(task.pid, :finish)
+    Task.await(task, 30_000)
+  end
+
+  describe "a database lock the channel cannot get" do
+    setup do
+      {raw, runner} = fixture(:committed_runner, %{name: "minis", max_sessions: 4})
+      {:ok, socket} = connect_runner(raw)
+      {_reply, channel} = join_pool(socket, "minis")
+      %{runner: runner, channel: channel}
+    end
+
+    @lock_timeout_reply 15_000
+
+    test "a reply blocked behind a claim release is answered rate_limited, and the channel lives",
+         %{runner: runner, channel: channel} do
+      %{story: story, dispatch: dispatch} = committed_dispatch(runner)
+      _ = story
+
+      blocker =
+        hold_lock(
+          runner.tenant_id,
+          from(s in Loopctl.WorkBreakdown.Story,
+            where: s.id == ^story.id,
+            lock: "FOR UPDATE",
+            select: s.claim_epoch
+          )
+        )
+
+      ref =
+        push(channel, "dispatch_reply", %{
+          "dispatch_id" => dispatch.dispatch_id,
+          "claim_epoch" => 0,
+          "decision" => "accepted"
+        })
+
+      # Never invalid_payload: the message is fine and the runner must send it AGAIN.
+      assert_reply ref,
+                   :error,
+                   %{reason: "rate_limited", min_interval_ms: interval},
+                   @lock_timeout_reply
+
+      # Longer than the wait that just ran out, so the retry is not straight back into the
+      # same queue.
+      assert interval == Capacity.busy_retry_ms()
+      assert interval > Capacity.lock_timeout_ms()
+      assert Process.alive?(channel.channel_pid)
+      assert finish(blocker) == {:ok, :ok}
+
+      assert DispatchLedger.get_record(runner.tenant_id, dispatch.dispatch_id).status == "sent"
+    end
+
+    test "a drop whose decision cannot be recorded logs and keeps the channel alive",
+         %{runner: runner, channel: channel} do
+      %{dispatch: dispatch} = committed_dispatch(runner)
+      {:ok, _} = Tenants.halt_custody(runner.tenant_id)
+
+      blocker =
+        hold_lock(
+          runner.tenant_id,
+          from(d in DispatchRecord,
+            where: d.tenant_id == ^runner.tenant_id and d.dispatch_id == ^dispatch.dispatch_id,
+            lock: "FOR UPDATE",
+            select: d.id
+          )
+        )
+
+      log =
+        capture_log(fn ->
+          Phoenix.PubSub.broadcast(
+            Loopctl.PubSub,
+            Runners.dispatch_topic(runner.id),
+            {:runner_dispatch, dispatch}
+          )
+
+          # The drop's own decision runs into the lock timeout. An orderly refusal, not a
+          # crash: the slot is left to the sweep's undelivered grace.
+          refute_push "dispatch", _, Capacity.lock_timeout_ms() + 3_000
+        end)
+
+      assert log =~ "not delivered"
+      assert log =~ "capacity_busy"
+      assert Process.alive?(channel.channel_pid)
+      assert finish(blocker) == {:ok, :ok}
+    end
+
+    test "a push whose stamp cannot be written is dropped, not pushed unrecorded",
+         %{runner: runner, channel: channel} do
+      %{dispatch: dispatch} = committed_dispatch(runner)
+
+      blocker =
+        hold_lock(
+          runner.tenant_id,
+          from(d in DispatchRecord,
+            where: d.tenant_id == ^runner.tenant_id and d.dispatch_id == ^dispatch.dispatch_id,
+            lock: "FOR UPDATE",
+            select: d.id
+          )
+        )
+
+      Phoenix.PubSub.broadcast(
+        Loopctl.PubSub,
+        Runners.dispatch_topic(runner.id),
+        {:runner_dispatch, dispatch}
+      )
+
+      # The stamp runs into its lock_timeout, so the dispatch is NOT pushed: a push the
+      # ledger does not record would lose its slot to the heal sweep mid-session.
+      # Long enough for the stamp's lock_timeout to expire, short enough that the blocker's
+      # own connection checkout (15 s) does not.
+      refute_push "dispatch", _, Capacity.lock_timeout_ms() + 3_000
+      assert Process.alive?(channel.channel_pid)
+      assert finish(blocker) == {:ok, :ok}
+
+      record = DispatchLedger.get_record(runner.tenant_id, dispatch.dispatch_id)
+      refute record.pushed_at
+    end
+  end
 
   describe "dispatch_reply" do
     setup do

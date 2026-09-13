@@ -6,6 +6,57 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Runner capacity is reserved in Postgres, and a tenant's total is admission-controlled
+  (#803).** `Loopctl.Runners.dispatch/3` now takes a slot on the runner in the same
+  transaction that records the dispatch, and refuses `:runner_at_capacity` past the runner's
+  `max_sessions` and `:admission_limit_reached` past the tenant's total, so two dispatchers
+  (on either node) can no longer both use a runner's last slot. A slot is given back when the
+  runner refuses the dispatch, when its claim is superseded, on `Runners.release_slot/2`, and
+  otherwise by the new every-minute `HealRunnerCapacityWorker` once the claim ends, the
+  runner is revoked, or the dispatch's wall clock plus five minutes has passed.
+
+  **New env var `RUNNER_MAX_IN_FLIGHT_SESSIONS`** (default `6`): the most sessions one tenant
+  may have in flight across all its runners — every session shares one Anthropic account.
+  See `deploy/FLY_SECRETS.md`.
+
+  **Migration, no manual step:** `runners` gains `max_sessions` (default 2, 1..64) and
+  `in_flight`; `runner_dispatches` gains `released_at` and `wall_clock_seconds`, and rows
+  recorded before it are marked released (they never took a slot). **An already-enrolled
+  runner gets `max_sessions` 2**; one that should carry a different number is re-enrolled
+  (revoke, then `POST /api/v1/runners` with `max_sessions`).
+
+  **`POST /api/v1/runners` takes an optional `max_sessions`**, and runner rows now carry
+  `max_sessions` and `in_flight`. **`GET /api/v1/runners/pool` changes meaning:** its
+  `in_flight` and `max_sessions` are now the Postgres values dispatch reserves against (null
+  only for a runner revoked while its socket drains), and what the runner itself reported
+  moved to the new `reported_in_flight` and `reported_max_sessions`. `loopctl-mcp-server`
+  2.93.0 carries both: `runner_enroll` takes `max_sessions`, and `runner_pool` names the
+  new fields.
+
+  **A dispatch's delivery is decided once, under the row lock.** Every channel a broadcast
+  wakes competes for one `delivery` decision on the ledger row: the one that pushes sets
+  `pushed`, one that must drop it (a custody halt) sets `dropped` and gives the slot back in
+  the same transaction, and the loser respects what it finds. A channel that simply is not
+  the runner's only live socket takes no decision at all, since another socket may be the one
+  to push. The heal sweep bounds an undelivered reservation after two minutes, a PUSHED one
+  the runner never answered two minutes after the push, and an accepted one at the wall clock
+  of the dispatch that was actually delivered.
+
+  **Two changes an operator watching runners will see.** A reply or trace whose database
+  write cannot get a lock in five seconds is now answered `rate_limited` with that interval,
+  so the runner sends it again — it used to crash the channel, after which the runner rejoined
+  and re-sent forever. And `pushed_at` is stamped BEFORE the dispatch is pushed, so a stamp
+  that fails means the runner never got it: capacity reads that column, and a push it did not
+  record would have taken the session's slot away two minutes later. A burst of
+  `:capacity_busy` in one tenant means a long-held story lock, not a capacity shortage.
+
+  **Runner contract 1.3.0 (minor).** A dispatch's `wall_clock_seconds` is now bounded at a
+  day (`RunnerDispatch.max_wall_clock_seconds/0`): loopctl stores it and presumes a slot free
+  past it plus a grace, and an unbounded value overflowed the column it is stored in. A
+  larger one is refused as an invalid payload before anything is recorded. Runners need no
+  change — they already send a session-sized wall clock — and `priv/runner_contract/v1.json`
+  is regenerated.
+
 - **The production machines form one BEAM cluster.** Until now both Fly machines booted as
   `loopctl@127.0.0.1` with IPv4 distribution and no `DNS_CLUSTER_QUERY`, so each was an
   island: PubSub (runner dispatch delivery, revocation, cache invalidation) and the runner

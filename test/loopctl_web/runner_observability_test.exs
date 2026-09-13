@@ -15,10 +15,13 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
 
   use LoopctlWeb.ChannelCase, async: false
 
+  import Ecto.Query
   import ExUnit.CaptureLog
 
+  alias Loopctl.AdminRepo
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Auth
+  alias Loopctl.Auth.ApiKey
   alias Loopctl.Runners
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Tenants
@@ -170,8 +173,13 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
       _ = :sys.get_state(channel.channel_pid)
       refute Map.has_key?(process_metadata(channel.channel_pid), :story_id)
 
-      {:ok, key} = Auth.get_api_key(runner.tenant_id, runner.api_key_id)
-      {:ok, _} = Auth.revoke_api_key(key)
+      # EXPIRED rather than revoked: a revoke's trigger updates the runner row, which the
+      # dispatch's capacity reservation holds locked in this test's still-open `Repo` sandbox
+      # transaction, so a revoke from the `AdminRepo` connection would wait for the test to
+      # end. An expired key fails the same `authorized?/2` recheck.
+      {1, _} =
+        from(k in ApiKey, where: k.id == ^runner.api_key_id)
+        |> AdminRepo.update_all(set: [expires_at: DateTime.add(DateTime.utc_now(), -60, :second)])
 
       log =
         capture_log([level: :info], fn ->

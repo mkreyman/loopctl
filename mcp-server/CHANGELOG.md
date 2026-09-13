@@ -5,6 +5,23 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.93.0 — 2026-09-13 (runner capacity: enroll with max_sessions, pool reports Postgres)
+
+### Added
+
+- **`runner_enroll` takes an optional `max_sessions`** (1..64, loopctl #803): how many
+  dispatches loopctl keeps in flight on that machine at once. Sent only when given, so an
+  older server and an omitted value both keep the server's default; a value out of range comes
+  back as the server's own 422.
+
+### Changed
+
+- **`runner_pool`'s `in_flight` and `max_sessions` are now the CAPACITY loopctl holds in
+  Postgres** — the slots a dispatch reserves against — and are null only for a runner revoked
+  while its socket drains. What the runner itself reported moved to `reported_in_flight` and
+  `reported_max_sessions`. Needs a loopctl server carrying #803; an older one returns the
+  runner-reported values in the original fields and omits the new ones.
+
 ## 2.92.1 — 2026-09-12 (runner_pool names the node and machine)
 
 ### Changed

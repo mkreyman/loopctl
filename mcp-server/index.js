@@ -7492,6 +7492,14 @@ const TOOLS = [
           description:
             "Absolute path, or one starting with ~/, for the token file. Must not exist yet.",
         },
+        max_sessions: {
+          type: "integer",
+          minimum: 1,
+          maximum: 64,
+          description:
+            "How many dispatches loopctl keeps in flight on this machine at once (default 2). " +
+            "The tenant's total across all its runners is capped separately by the server.",
+        },
       },
       required: ["name", "token_file"],
     },
@@ -7530,8 +7538,11 @@ const TOOLS = [
     name: "runner_pool",
     description:
       "The tenant's CONNECTED runners, read from Presence (GET /api/v1/runners/pool): per machine " +
-      "name, runner_id, joined_at, in_flight, draining, max_sessions, the latest health sample, " +
-      "live_sockets, and the node and machine_id (Fly Machine) holding the socket. live_sockets " +
+      "name, runner_id, joined_at, draining, the latest health sample, live_sockets, and the node " +
+      "and machine_id (Fly Machine) holding the socket. in_flight and max_sessions are the " +
+      "CAPACITY loopctl holds in Postgres — the slots dispatch reserves against — and are null " +
+      "only for a runner revoked while its socket drains; reported_in_flight and " +
+      "reported_max_sessions are what the runner itself last reported, a hint. live_sockets " +
       "above 1 means more than one process holds that runner's credential. A killed runner " +
       "disappears once its socket closes. Presence converges only " +
       "within a cluster, so on an unclustered multi-node deployment a runner on another node is " +

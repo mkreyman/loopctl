@@ -37,7 +37,10 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
   end
 
   setup do
-    {_raw, runner} = fixture(:committed_runner, %{name: "minis"})
+    # Room for every dispatch a test here sends: capacity is tested in
+    # `Loopctl.Runners.CapacityTest`, and a slot limit would only cap how many rows a test can
+    # write.
+    {_raw, runner} = fixture(:committed_runner, %{name: "minis", max_sessions: 64})
     %{runner: runner}
   end
 

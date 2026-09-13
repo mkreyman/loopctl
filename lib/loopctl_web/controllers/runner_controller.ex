@@ -37,10 +37,21 @@ defmodule LoopctlWeb.RunnerController do
 
   @runner_schema %Schema{
     type: :object,
-    required: [:id, :name, :revoked_at, :inserted_at],
+    required: [:id, :name, :max_sessions, :in_flight, :revoked_at, :inserted_at],
     properties: %{
       id: %Schema{type: :string, format: :uuid},
       name: %Schema{type: :string, pattern: Runner.name_format().source},
+      max_sessions: %Schema{
+        type: :integer,
+        minimum: Runner.max_sessions_range().first,
+        maximum: Runner.max_sessions_range().last,
+        description: "The most capacity slots loopctl reserves on this machine at once."
+      },
+      in_flight: %Schema{
+        type: :integer,
+        minimum: 0,
+        description: "Slots reserved on this machine now (authoritative; Postgres)."
+      },
       revoked_at: %Schema{type: :string, format: :"date-time", nullable: true},
       inserted_at: %Schema{type: :string, format: :"date-time"},
       updated_at: %Schema{type: :string, format: :"date-time"}
@@ -53,10 +64,12 @@ defmodule LoopctlWeb.RunnerController do
       "Enrolls a dev machine as a runner and returns its credential ONCE, as `token`. The " <>
         "runner presents it in the `x-loopctl-runner-token` header when it connects to " <>
         "`/runner/socket/websocket`, and joins the topic `runner:<runner.id>` declaring " <>
-        "exactly this `name`. The wire contract is `priv/runner_contract/v1.json`. Requires user role; " <>
+        "exactly this `name`. The wire contract is `priv/runner_contract/v1.json`. " <>
+        "`max_sessions` (default #{Runner.default_max_sessions()}) is how many dispatches " <>
+        "loopctl will have in flight on this machine at once. Requires user role; " <>
         "a caller whose key was minted by a dispatch is refused with 403 " <>
         "`api_key_mint_forbidden`. 422 when the name is malformed, already used by an " <>
-        "active runner, or the tenant is at its API key limit.",
+        "active runner, `max_sessions` is out of range, or the tenant is at its API key limit.",
     request_body:
       {"Runner", "application/json",
        %Schema{
@@ -67,6 +80,15 @@ defmodule LoopctlWeb.RunnerController do
              type: :string,
              pattern: Runner.name_format().source,
              description: "The machine name, e.g. `minis`."
+           },
+           max_sessions: %Schema{
+             type: :integer,
+             minimum: Runner.max_sessions_range().first,
+             maximum: Runner.max_sessions_range().last,
+             default: Runner.default_max_sessions(),
+             description:
+               "The most dispatches loopctl keeps in flight on this machine at once. The " <>
+                 "tenant's total is capped separately (RUNNER_MAX_IN_FLIGHT_SESSIONS)."
            }
          }
        }},
@@ -129,7 +151,11 @@ defmodule LoopctlWeb.RunnerController do
         "joined socket tracked under that machine name; `live_sockets` counts every socket " <>
         "tracked under it, so a value above 1 means more than one process is holding the " <>
         "runner's credential. `sample` is the latest health sample that socket reported, or " <>
-        "null before its first status update. Requires user role. Presence is a liveness " <>
+        "null before its first status update. `in_flight` and `max_sessions` are the " <>
+        "capacity Postgres holds for the runner — the values dispatch reserves against — and " <>
+        "are null only for a runner revoked while its socket is still draining; " <>
+        "`reported_in_flight` and `reported_max_sessions` are what the runner itself last " <>
+        "reported, a hint. Requires user role. Presence is a liveness " <>
         "hint, not a scheduler, and it converges only within a CLUSTER: on a deployment with " <>
         "more than one unclustered node, a runner connected to another node is absent here.",
     responses: %{
@@ -150,6 +176,8 @@ defmodule LoopctlWeb.RunnerController do
                    :in_flight,
                    :draining,
                    :max_sessions,
+                   :reported_in_flight,
+                   :reported_max_sessions,
                    :sample,
                    :live_sockets,
                    :node,
@@ -159,9 +187,31 @@ defmodule LoopctlWeb.RunnerController do
                    machine: %Schema{type: :string, description: "The enrolled machine name."},
                    runner_id: %Schema{type: :string, format: :uuid},
                    joined_at: %Schema{type: :string, format: :"date-time"},
-                   in_flight: %Schema{type: :integer, minimum: 0, nullable: true},
+                   in_flight: %Schema{
+                     type: :integer,
+                     minimum: 0,
+                     nullable: true,
+                     description: "Capacity slots reserved on this runner (Postgres)."
+                   },
                    draining: %Schema{type: :boolean, nullable: true},
-                   max_sessions: %Schema{type: :integer, minimum: 0, nullable: true},
+                   max_sessions: %Schema{
+                     type: :integer,
+                     minimum: 1,
+                     nullable: true,
+                     description: "The runner's enrolled slot limit (Postgres)."
+                   },
+                   reported_in_flight: %Schema{
+                     type: :integer,
+                     minimum: 0,
+                     nullable: true,
+                     description: "Sessions the runner last reported running. A hint."
+                   },
+                   reported_max_sessions: %Schema{
+                     type: :integer,
+                     minimum: 0,
+                     nullable: true,
+                     description: "The session limit the runner declared on join. A hint."
+                   },
                    sample: %Schema{
                      type: :object,
                      nullable: true,
@@ -201,7 +251,9 @@ defmodule LoopctlWeb.RunnerController do
 
     with :ok <- validate_key_limit(tenant),
          {:ok, %{runner: runner, raw_key: raw_key}} <-
-           Runners.enroll_runner(tenant.id, %{name: params["name"]},
+           Runners.enroll_runner(
+             tenant.id,
+             %{name: params["name"], max_sessions: params["max_sessions"]},
              actor_lineage: actor_lineage(conn)
            ) do
       conn
@@ -232,25 +284,31 @@ defmodule LoopctlWeb.RunnerController do
   def pool(conn, _params) do
     tenant = conn.assigns.current_tenant
 
+    # Presence says who is connected; Postgres says what they carry.
+    capacity = Runners.capacity(tenant.id)
+
     runners =
       tenant.id
       |> Runners.pool()
-      |> Enum.map(&pool_entry/1)
+      |> Enum.map(&pool_entry(&1, capacity))
       |> Enum.sort_by(& &1.machine)
 
     json(conn, %{runners: runners})
   end
 
-  defp pool_entry({machine, %{metas: metas}}) do
+  defp pool_entry({machine, %{metas: metas}}, capacity) do
     meta = Enum.max_by(metas, &Map.get(&1, :joined_at), &joined_no_later?/2)
+    held = Map.get(capacity, Map.get(meta, :runner_id), %{})
 
     %{
       machine: machine,
       runner_id: Map.get(meta, :runner_id),
       joined_at: Map.get(meta, :joined_at),
-      in_flight: Map.get(meta, :in_flight),
+      in_flight: Map.get(held, :in_flight),
       draining: Map.get(meta, :draining),
-      max_sessions: Map.get(meta, :max_sessions),
+      max_sessions: Map.get(held, :max_sessions),
+      reported_in_flight: Map.get(meta, :in_flight),
+      reported_max_sessions: Map.get(meta, :max_sessions),
       sample: Map.get(meta, :sample),
       live_sockets: length(metas),
       node: Map.get(meta, :node),
