@@ -67,8 +67,11 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
     test "resolves the repository and the environment and reads the DEPLOYMENT", ctx do
       # Design §9: never the workflow run's head. The environment is fleet configuration,
       # never a caller's, and the repository comes from the story's intake source.
-      Mox.expect(MockPullRequestSource, :latest_deployment, fn @repo, "production" ->
-        {:ok, %{id: 91, sha: @merge, state: :success}}
+      Mox.expect(MockPullRequestSource, :deployments_since, fn @repo, "production", since ->
+        # The `since` the forge is asked for is the moment the merge was RECORDED, read from
+        # the stage event — a deployment created before it cannot carry the merge.
+        assert %DateTime{} = since
+        {:ok, [%{id: 91, sha: @merge, state: :success, created_at: DateTime.utc_now()}]}
       end)
 
       assert {:ok, %Result{decision: :verified} = result} = evaluate(ctx)
@@ -102,7 +105,7 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
           Ecto.UUID.dump!(ctx.project_id)
         ])
 
-      Mox.stub(MockPullRequestSource, :latest_deployment, fn _repo, _env ->
+      Mox.stub(MockPullRequestSource, :deployments_since, fn _repo, _env, _since ->
         flunk("the forge must not be asked about a repository nothing could resolve")
       end)
 
@@ -144,9 +147,20 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
       assert row.attempts == %{}
     end
 
-    test "a MISMATCH escalates on verification_failed, naming both shas", ctx do
-      stub_deployment()
-      Mox.stub(MockPullRequestSource, :contains?, fn _r, _s, _ref -> {:ok, false} end)
+    test "a settled deploy that does not carry the merge WAITS, then escalates naming both",
+         ctx do
+      # Not an immediate failure: it may be a rollback or a deploy from another branch, and
+      # concluding failure from it read a concurrent deploy as a broken one. It is bounded
+      # by the in-flight count, and the escalation still names both shas.
+      stub_deployment(contains: false)
+      limit = PostDeployVerification.max_consecutive_unresolved(:deploy_pending)
+
+      for _attempt <- 1..limit do
+        assert {:ok, %Result{decision: :unresolved, unresolved_kind: :deploy_pending}} =
+                 enforce(ctx)
+      end
+
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :deployed
 
       assert {:ok, %Result{decision: :failed, reasons: reasons}} = enforce(ctx)
       assert {:merge_not_deployed, @merge, @deployed} in reasons
@@ -171,9 +185,7 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
       assert row.escalation_reason =~ "deploy_not_successful"
     end
 
-    test "a ROLLED-BACK deploy escalates", ctx do
-      # `inactive` on the NEWEST deployment of an environment is a deliberate
-      # deactivation: nothing newer superseded it, because this is the newest one.
+    test "a DEACTIVATED deploy that carries the merge escalates", ctx do
       stub_deployment(state: :inactive)
 
       assert {:ok, %Result{decision: :failed, reasons: reasons}} = enforce(ctx)
@@ -181,25 +193,68 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
       assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :escalated
     end
 
-    test "an environment with NO deployment escalates", ctx do
-      Mox.stub(MockPullRequestSource, :latest_deployment, fn _repo, _env -> {:ok, nil} end)
+    test "NO deployment since the merge WAITS — the deploy job has not made its record", ctx do
+      # THE HAPPY PATH. Between the runner reporting `deployed` and the deploy job creating
+      # its record (queued workflow, cold runner: 30-120s) there is nothing that could carry
+      # the merge, and the first sweep lands inside that window. This used to escalate every
+      # healthy delivery on the human-only edge.
+      stub_deployments([])
 
-      assert {:ok, %Result{decision: :failed, reasons: [{:no_deployment, "production"}]}} =
+      assert {:ok, %Result{decision: :unresolved, unresolved_kind: :deploy_pending} = result} =
                enforce(ctx)
 
-      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :escalated
+      assert {:deploy_not_started, @merge, "production"} in result.reasons
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :deployed
+    end
+
+    test "a LATER story's failed deploy does not escalate one that already shipped", ctx do
+      # A merges and deploy 1 carries it; B merges and deploy 2 fails. Reading only the
+      # newest deployment read deploy 2 as the whole truth and escalated A.
+      later = String.duplicate("e", 40)
+
+      stub_deployments([
+        %{id: 2, sha: later, state: :failure, created_at: DateTime.utc_now()},
+        %{id: 1, sha: @deployed, state: :success, created_at: DateTime.utc_now()}
+      ])
+
+      Mox.stub(MockPullRequestSource, :contains?, fn _repo, @merge, ref ->
+        {:ok, ref == @deployed}
+      end)
+
+      assert {:ok, %Result{decision: :verified} = result} = enforce(ctx)
+      assert result.deployment_id == 1
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :verified
     end
 
     test "a TRANSIENT forge fault leaves the story at deployed, and is COUNTED", ctx do
       stub_unreachable()
 
       assert {:ok, %Result{decision: :unresolved, reasons: reasons}} = enforce(ctx)
-      assert {:deployment_unavailable, {:github_unreachable, :timeout}} in reasons
+      assert {:deployments_unavailable, {:github_unreachable, :timeout}} in reasons
 
       # One blip must not park a story on a human: `escalated` is human-only.
       row = Stages.get(ctx.tenant_id, ctx.story_id)
       assert row.stage == :deployed
-      assert row.post_deploy_unresolved == %{"merge_sha" => @merge, "count" => 1}
+
+      assert row.post_deploy_unresolved ==
+               %{"merge_sha" => @merge, "kind" => "forge_fault", "count" => 1}
+    end
+
+    test "the two KINDS of waiting are counted separately, so one cannot spend the other",
+         ctx do
+      # A run of forge faults followed by a run of waiting is two different conditions with
+      # two different bounds; counting them on one number made the slower one inherit the
+      # faster one's ceiling and escalate the normal path.
+      stub_unreachable()
+      assert {:ok, %Result{unresolved_kind: :forge_fault}} = enforce(ctx)
+      assert {:ok, %Result{unresolved_kind: :forge_fault}} = enforce(ctx)
+      assert Stages.get(ctx.tenant_id, ctx.story_id).post_deploy_unresolved["count"] == 2
+
+      stub_deployments([])
+      assert {:ok, %Result{unresolved_kind: :deploy_pending}} = enforce(ctx)
+
+      assert Stages.get(ctx.tenant_id, ctx.story_id).post_deploy_unresolved ==
+               %{"merge_sha" => @merge, "kind" => "deploy_pending", "count" => 1}
     end
 
     test "a DEPLOY STILL RUNNING leaves the story at deployed, and is counted", ctx do
@@ -212,10 +267,12 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
       assert row.post_deploy_unresolved["count"] == 1
     end
 
-    test "a fault that never clears ESCALATES once it passes the bound", ctx do
-      # The backstop under "no condition may wait for ever with nobody told".
+    test "a fault that never clears ESCALATES once it passes ITS OWN bound", ctx do
+      # The backstop under "no condition may wait for ever with nobody told" — on the FORGE
+      # bound, which is the short one. A deploy still in flight has a much longer one, and
+      # the previous test proves they are separate.
       stub_unreachable()
-      limit = PostDeployVerification.max_consecutive_unresolved()
+      limit = PostDeployVerification.max_consecutive_unresolved(:forge_fault)
 
       for _attempt <- 1..limit do
         assert {:ok, %Result{decision: :unresolved}} = enforce(ctx)
@@ -224,13 +281,28 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
       assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :deployed
 
       assert {:ok, %Result{decision: :failed, reasons: reasons}} = enforce(ctx)
-      assert {:unresolved_limit_exceeded, limit + 1} in reasons
+      assert {:unresolved_limit_exceeded, :forge_fault, limit + 1, limit} in reasons
 
       row = Stages.get(ctx.tenant_id, ctx.story_id)
       assert row.stage == :escalated
       # The escalation names the fault, not just the count.
       assert row.escalation_reason =~ "unresolved_limit_exceeded"
       assert row.escalation_reason =~ "github_unreachable"
+    end
+
+    test "a deploy pending past ITS bound escalates too, on the longer ceiling", ctx do
+      stub_deployments([])
+      limit = PostDeployVerification.max_consecutive_unresolved(:deploy_pending)
+
+      for _attempt <- 1..limit do
+        assert {:ok, %Result{decision: :unresolved}} = enforce(ctx)
+      end
+
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :deployed
+
+      assert {:ok, %Result{decision: :failed, reasons: reasons}} = enforce(ctx)
+      assert {:unresolved_limit_exceeded, :deploy_pending, limit + 1, limit} in reasons
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :escalated
     end
 
     test "a verdict CLEARS the count a run of unresolved sweeps left behind", ctx do
@@ -254,7 +326,42 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
                |> Stages.list_events(ctx.story_id)
                |> Enum.filter(&(&1.event == "post_deploy_unresolved"))
 
-      assert data == %{"merge_sha" => @merge, "count" => 1}
+      assert data == %{"merge_sha" => @merge, "kind" => "forge_fault", "count" => 1}
+    end
+
+    test "a story with NO merge event fails closed — its history cannot date the merge", ctx do
+      # R7's gap. Without the merge time every deployment is a candidate again, which is the
+      # H1 failure; defaulting to the beginning of time would restore it silently, so the
+      # absence is a custody-integrity gap like a missing merge sha.
+      {:ok, {1, _}} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          from(e in StageEvent, where: e.story_id == ^ctx.story_id and e.to_stage == "merged")
+          |> Repo.delete_all()
+        end)
+
+      Mox.stub(MockPullRequestSource, :deployments_since, fn _repo, _env, _since ->
+        flunk("the forge must not be asked when the merge time is unknown")
+      end)
+
+      assert {:ok, %Result{decision: :failed, reasons: reasons}} = enforce(ctx)
+      assert {:merge_time_unknown, :no_merge_event} in reasons
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :escalated
+    end
+
+    test "an unresolvable repository reports THAT, and no phantom forge fault", ctx do
+      # R9's gap. The deployments fact is `:not_attempted`, a bare atom — reporting it as
+      # `{:error, :not_attempted}` would add a second, invented reason for the one real
+      # problem, and a caller fixing the repository would be told the forge failed too.
+      %{num_rows: 1} =
+        AdminRepo.query!("DELETE FROM intake_sources WHERE project_id = $1", [
+          Ecto.UUID.dump!(ctx.project_id)
+        ])
+
+      assert {:ok, %Result{decision: :failed, reasons: reasons}} = enforce(ctx)
+      assert Enum.any?(reasons, &match?({:repository_unresolved, {:no_intake_source, _}}, &1))
+
+      refute Enum.any?(reasons, &match?({:deployments_unavailable, _}, &1)),
+             "the consequence of a missing repository is not a second fault: #{inspect(reasons)}"
     end
 
     test "a repeated sweep does not verify twice", ctx do
@@ -312,14 +419,14 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
       assert {:ok, %Result{decision: :unresolved}} = enforce(ctx)
       assert Stages.get(ctx.tenant_id, ctx.story_id).post_deploy_unresolved["count"] == 1
 
-      Mox.stub(MockPullRequestSource, :latest_deployment, fn _repo, _env ->
+      Mox.stub(MockPullRequestSource, :deployments_since, fn _repo, _env, _since ->
         {:ok, {1, _}} =
           Repo.with_tenant(ctx.tenant_id, fn ->
             from(s in StoryStage, where: s.story_id == ^ctx.story_id)
             |> Repo.update_all(set: [stage: :escalated, escalation_reason: "raced"])
           end)
 
-        {:ok, %{id: 91, sha: @merge, state: :success}}
+        {:ok, [%{id: 91, sha: @merge, state: :success, created_at: DateTime.utc_now()}]}
       end)
 
       assert {:ok, %Result{decision: :verified, reasons: reasons}} = enforce(ctx)
@@ -369,6 +476,68 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
       assert Stages.get(ctx.tenant_id, ctx.story_id).lock_version == row.lock_version
     end
 
+    test "is UNIQUE over the cron interval, so a slow run does not get a second copy" do
+      # Overlapping runs were always SAFE — every write is a compare-and-set — but two of
+      # them are twice the forge traffic for one run's work, and they arrive exactly when a
+      # slow forge has already pushed a run past the two-minute interval.
+      unique = PostDeployVerificationWorker.__opts__()[:unique]
+
+      assert unique[:period] >= 120,
+             "the uniqueness window must cover the cron interval; got #{inspect(unique)}"
+
+      assert :executing in unique[:states],
+             "a RUNNING job must block the next one, which is the whole overlap case"
+    end
+
+    test "the run is bounded by wall clock as well as by count" do
+      # The count bounds how many stories a healthy run touches; only the clock bounds how
+      # long an unhealthy one takes, and a run that overruns the interval is the thing
+      # uniqueness then has to absorb.
+      assert PostDeployVerificationWorker.run_budget_ms() > 0
+      assert PostDeployVerificationWorker.run_budget_ms() < 120_000
+    end
+
+    test "the halt survives the pass that CROSSES the bound, which is a :failed result", ctx do
+      # R6's gap. The run that crosses the bound is exactly the run that just heard "out of
+      # quota", and its decision converts to `:failed`. Reading `retry_after` only on
+      # `:unresolved` disarmed the halt on precisely that pass, so the rest of the batch
+      # went on calling a forge that had said it was empty.
+      _second = build_story(%{id: ctx.tenant_id}, "acme/other")
+      limit = PostDeployVerification.max_consecutive_unresolved(:forge_fault)
+
+      Mox.stub(MockPullRequestSource, :deployments_since, fn _repo, _env, _since ->
+        {:error, {:github_rate_limited, 403, 60}}
+      end)
+
+      # Walk THIS story to the bound directly, so the next sweep's first candidate converts.
+      for _attempt <- 1..limit do
+        assert {:ok, %Result{decision: :unresolved}} = enforce(ctx)
+      end
+
+      calls = :counters.new(1, [])
+
+      Mox.stub(MockPullRequestSource, :deployments_since, fn _repo, _env, _since ->
+        :counters.add(calls, 1, 1)
+        {:error, {:github_rate_limited, 403, 60}}
+      end)
+
+      # The sweep takes oldest `updated_at` first, and counting bumped this row on every
+      # attempt above — so it is now the NEWEST. Age it back, so the candidate that crosses
+      # the bound is the one the sweep reaches first and the halt is about that pass.
+      {:ok, {1, _}} =
+        Repo.with_tenant(ctx.tenant_id, fn ->
+          from(st in StoryStage, where: st.story_id == ^ctx.story_id)
+          |> Repo.update_all(set: [updated_at: ~U[2020-01-01 00:00:00.000000Z]])
+        end)
+
+      assert :ok = perform_job(PostDeployVerificationWorker, %{})
+
+      # One candidate asked, and it was the one that crossed the bound and came back
+      # `:failed` — the halt read its retry_after anyway.
+      assert :counters.get(calls, 1) == 1
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :escalated
+    end
+
     test "a rate-limited forge HALTS the run rather than spending the rest of the window",
          ctx do
       # The remaining candidates would ask a forge that has already said it is out of quota.
@@ -376,7 +545,7 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
 
       calls = :counters.new(1, [])
 
-      Mox.stub(MockPullRequestSource, :latest_deployment, fn _repo, _env ->
+      Mox.stub(MockPullRequestSource, :deployments_since, fn _repo, _env, _since ->
         :counters.add(calls, 1, 1)
         {:error, {:github_rate_limited, 403, 60}}
       end)
@@ -403,18 +572,32 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
 
   defp perform_job(worker, args), do: worker.perform(%Oban.Job{args: args})
 
+  # One deployment created after the merge, which is what the forge returns once the deploy
+  # job has made its record. `contains` is answered by `contains?/3`, not baked in here, so
+  # the gather walk is exercised rather than bypassed.
   defp stub_deployment(opts \\ []) do
-    deployment = %{
-      id: 91,
-      sha: Keyword.get(opts, :sha, @deployed),
-      state: Keyword.get(opts, :state, :success)
-    }
+    stub_deployments([
+      %{
+        id: 91,
+        sha: Keyword.get(opts, :sha, @deployed),
+        state: Keyword.get(opts, :state, :success),
+        created_at: DateTime.utc_now()
+      }
+    ])
 
-    Mox.stub(MockPullRequestSource, :latest_deployment, fn _repo, _env -> {:ok, deployment} end)
+    Mox.stub(MockPullRequestSource, :contains?, fn _repo, _sha, _ref ->
+      {:ok, Keyword.get(opts, :contains, true)}
+    end)
+  end
+
+  defp stub_deployments(deployments) do
+    Mox.stub(MockPullRequestSource, :deployments_since, fn _repo, _env, %DateTime{} ->
+      {:ok, deployments}
+    end)
   end
 
   defp stub_unreachable do
-    Mox.stub(MockPullRequestSource, :latest_deployment, fn _repo, _env ->
+    Mox.stub(MockPullRequestSource, :deployments_since, fn _repo, _env, _since ->
       {:error, {:github_unreachable, :timeout}}
     end)
   end
@@ -450,7 +633,11 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
       claim_epoch: 0,
       pr_number: 4242,
       merge_sha: @merge,
-      release_id: "v586"
+      release_id: "v586",
+      # The `transitioned -> merged` event the machine would have written. Post-deploy
+      # verification reads it for the moment the merge was recorded; without it the story's
+      # history cannot say when it merged and the verifier fails closed.
+      merged_at: DateTime.add(DateTime.utc_now(), -300)
     })
 
     %{tenant_id: tenant.id, project_id: project.id, story_id: story.id}

@@ -463,13 +463,11 @@ defmodule Loopctl.Delivery.Stages do
   @counters %{
     merge_gate: %{
       column: :merge_gate_unevaluated,
-      key: "head_sha",
       stage: :ci,
       event: "merge_gate_unevaluated"
     },
     post_deploy: %{
       column: :post_deploy_unresolved,
-      key: "merge_sha",
       stage: :deployed,
       event: "post_deploy_unresolved"
     }
@@ -501,7 +499,7 @@ defmodule Loopctl.Delivery.Stages do
   @spec note_unevaluated(Ecto.UUID.t(), Ecto.UUID.t(), String.t() | nil, keyword()) ::
           {:ok, pos_integer()} | {:error, :not_found | :stale_claim_epoch | :wrong_stage | :busy}
   def note_unevaluated(tenant_id, story_id, head_sha, opts),
-    do: note_counter(:merge_gate, tenant_id, story_id, head_sha, opts)
+    do: note_counter(:merge_gate, tenant_id, story_id, %{"head_sha" => head_sha}, opts)
 
   @doc """
   Counts a post-deploy verification sweep at `merge_sha` that reached NO verdict (#803 §9),
@@ -515,9 +513,15 @@ defmodule Loopctl.Delivery.Stages do
   with nobody told, so the verifier escalates once this count passes its bound.
 
   Keyed to the MERGE, not the head: the question a sweep asks is whether THIS merge is
-  running in the target deployment. The count resets when `merge_sha` differs from the one
-  it was last kept for, and every edge that clears `merge_sha` clears it
+  running in the target deployment. Every edge that clears `merge_sha` clears it
   (`StageMachine.merge_keyed/0`).
+
+  **`kind` is part of the identity, and the count RESETS when it changes.** Two conditions
+  reach `:unresolved` and they want different bounds: a transient forge fault is a blip
+  measured in minutes, while a deploy that has not settled is measured in however long a
+  queued build takes. Counting them on one number meant the slower condition inherited the
+  faster one's bound and escalated every story on the normal path. A run of forge faults
+  followed by a run of waiting is two different conditions, so the second starts at 1.
 
   Fenced by the claim epoch like every other write here, and refused off `deployed` — no
   other stage runs this gate.
@@ -526,12 +530,21 @@ defmodule Loopctl.Delivery.Stages do
 
   - `:claim_epoch` (required), `:actor_label`
   """
-  @spec note_post_deploy_unresolved(Ecto.UUID.t(), Ecto.UUID.t(), String.t() | nil, keyword()) ::
+  @spec note_post_deploy_unresolved(
+          Ecto.UUID.t(),
+          Ecto.UUID.t(),
+          String.t() | nil,
+          atom(),
+          keyword()
+        ) ::
           {:ok, pos_integer()} | {:error, :not_found | :stale_claim_epoch | :wrong_stage | :busy}
-  def note_post_deploy_unresolved(tenant_id, story_id, merge_sha, opts),
-    do: note_counter(:post_deploy, tenant_id, story_id, merge_sha, opts)
+  def note_post_deploy_unresolved(tenant_id, story_id, merge_sha, kind, opts)
+      when is_atom(kind) do
+    identity = %{"merge_sha" => merge_sha, "kind" => Atom.to_string(kind)}
+    note_counter(:post_deploy, tenant_id, story_id, identity, opts)
+  end
 
-  defp note_counter(name, tenant_id, story_id, key_sha, opts) do
+  defp note_counter(name, tenant_id, story_id, identity, opts) do
     epoch = Keyword.fetch!(opts, :claim_epoch)
     counter = Map.fetch!(@counters, name)
 
@@ -541,17 +554,17 @@ defmodule Loopctl.Delivery.Stages do
 
       case lock_row(tenant_id, story_id) do
         nil -> Repo.rollback(:not_found)
-        row -> {count_unresolved(counter, row, story, key_sha, opts), nil}
+        row -> {count_unresolved(counter, row, story, identity, opts), nil}
       end
     end)
   end
 
-  defp count_unresolved(counter, row, story, key_sha, opts) do
+  defp count_unresolved(counter, row, story, identity, opts) do
     if row.claim_epoch != story.claim_epoch, do: Repo.rollback(:stale_claim_epoch)
     if row.stage != counter.stage, do: Repo.rollback(:wrong_stage)
 
-    count = next_unresolved_count(Map.fetch!(row, counter.column), counter.key, key_sha)
-    value = %{counter.key => key_sha, "count" => count}
+    count = next_unresolved_count(Map.fetch!(row, counter.column), identity)
+    value = Map.put(identity, "count", count)
 
     {1, [row]} =
       from(s in StoryStage,
@@ -639,14 +652,16 @@ defmodule Loopctl.Delivery.Stages do
     :cleared
   end
 
-  # `is_map_key` as well as the value comparison: a stored map with no key at all is
-  # malformed, not "a count at nil", and must restart rather than be incremented.
-  defp next_unresolved_count(%{"count" => count} = previous, key, key_sha)
-       when is_integer(count) and count >= 0 and is_map_key(previous, key) do
-    if Map.fetch!(previous, key) == key_sha, do: count + 1, else: 1
+  # The WHOLE identity has to match, not one key of it: the stored map is the identity plus
+  # `"count"`, so dropping the count and comparing catches a changed sha, a changed kind, a
+  # missing key and an extra one alike. Anything else restarts at 1 — a malformed or
+  # differently-shaped stored value is not "a count at something", it is no count.
+  defp next_unresolved_count(%{"count" => count} = previous, identity)
+       when is_integer(count) and count >= 0 do
+    if Map.delete(previous, "count") == identity, do: count + 1, else: 1
   end
 
-  defp next_unresolved_count(_previous, _key, _key_sha), do: 1
+  defp next_unresolved_count(_previous, _identity), do: 1
 
   @doc """
   Records the identity of a side effect on the story's stage row, idempotently.

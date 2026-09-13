@@ -30,19 +30,32 @@ defmodule Loopctl.Workers.PostDeployVerificationWorker do
   Oldest `updated_at` first, and each sweep touches the row it wrote, so a backlog past
   `@batch` drains round-robin rather than starving its tail.
 
-  `@batch` is small because each candidate makes up to three BOUNDED forge calls
-  (`Loopctl.Delivery.GitHubPullRequestSource`: 2s connect, 5s receive, no retries), and the
-  ceiling on a run has to stay well inside a cron interval. Verification is also the one
-  gate whose candidates all ask GitHub the SAME questions at the same time, so an
-  unbounded batch is a way to spend an hourly rate limit in a minute.
+  **Three things bound a run, and the count alone was not enough.** Each candidate makes up
+  to a handful of BOUNDED forge calls (`Loopctl.Delivery.GitHubPullRequestSource`: 2s
+  connect, 5s receive, no retries), so a slow forge could take a `@batch` run past the
+  two-minute cron interval and have the next run start on top of it — re-reading the same
+  candidates and doubling the load on a forge that is already struggling.
+
+  - `@batch` candidates, so one run cannot spend an hourly rate limit in a minute.
+    Verification is the one gate whose candidates all ask GitHub the SAME questions at once.
+  - `@run_budget_ms` of WALL CLOCK, checked between candidates. The count bounds how many
+    stories a healthy run touches; only the clock bounds how long an unhealthy one takes.
+  - Oban `unique` over the cron interval, so a run that overruns anyway does not get a
+    second copy of itself. Overlapping runs were always SAFE — every write is a
+    compare-and-set — but two of them are twice the forge traffic for one run's work.
 
   **A rate limit stops the run.** The first result carrying a `retry_after` halts the batch:
-  the remaining candidates would ask a forge that has already said it is out of quota,
-  burning what is left of the window and turning one limit into `@batch` unresolved counts.
-  They are picked up by the next run.
+  the remaining candidates would ask a forge that has already said it is out of quota. That
+  reads the result's `retry_after` WHATEVER the decision, which is why
+  `PostDeployVerification` keeps the field when an unresolved result converts to `:failed`
+  at its bound — the pass that crosses the bound is exactly the pass that just heard "out of
+  quota", and reading it only on `:unresolved` disarmed the halt there.
   """
 
-  use Oban.Worker, queue: :default, max_attempts: 3
+  use Oban.Worker,
+    queue: :default,
+    max_attempts: 3,
+    unique: [period: 120, states: [:available, :scheduled, :executing]]
 
   import Ecto.Query
 
@@ -54,6 +67,11 @@ defmodule Loopctl.Workers.PostDeployVerificationWorker do
   alias Loopctl.Delivery.StoryStage
 
   @batch 10
+
+  # Wall clock for one run, checked BETWEEN candidates so a slow forge cannot carry a run
+  # past the cron interval. Under the interval on purpose: the remainder of the batch is not
+  # lost, it is the next run's first candidates (oldest `updated_at` first).
+  @run_budget_ms 90_000
 
   @actor_label "worker:post_deploy_verification"
 
@@ -74,17 +92,36 @@ defmodule Loopctl.Workers.PostDeployVerificationWorker do
   @spec batch_size() :: pos_integer()
   def batch_size, do: @batch
 
+  @doc false
+  @spec run_budget_ms() :: pos_integer()
+  def run_budget_ms, do: @run_budget_ms
+
   # `reduce_while` rather than `map`: a rate-limited forge is a reason to stop asking, not a
-  # reason to ask nine more times.
+  # reason to ask nine more times — and so is a run that has used its wall clock.
   defp sweep(candidates) do
+    deadline = System.monotonic_time(:millisecond) + @run_budget_ms
+
     candidates
     |> Enum.reduce_while([], fn candidate, acc ->
       result = verify(candidate)
       acc = [{candidate, result} | acc]
 
-      if rate_limited?(result), do: {:halt, acc}, else: {:cont, acc}
+      cond do
+        rate_limited?(result) -> {:halt, acc}
+        System.monotonic_time(:millisecond) >= deadline -> {:halt, log_budget_spent(acc)}
+        true -> {:cont, acc}
+      end
     end)
     |> Enum.reverse()
+  end
+
+  defp log_budget_spent(acc) do
+    Logger.info(
+      "PostDeployVerificationWorker: wall-clock budget spent after #{length(acc)} " <>
+        "candidate(s); the rest are the next run's"
+    )
+
+    acc
   end
 
   defp verify(candidate) do
@@ -103,10 +140,10 @@ defmodule Loopctl.Workers.PostDeployVerificationWorker do
     result
   end
 
-  defp rate_limited?({:ok, %Result{decision: :unresolved, retry_after: seconds}})
-       when is_integer(seconds),
-       do: true
-
+  # WHATEVER the decision. A `:failed` result carrying a `retry_after` is an unresolved run
+  # that just crossed its bound, and it heard "out of quota" on the way — matching only
+  # `:unresolved` disarmed the halt on precisely that pass.
+  defp rate_limited?({:ok, %Result{retry_after: seconds}}) when is_integer(seconds), do: true
   defp rate_limited?(_result), do: false
 
   defp outcome({:ok, %Result{decision: decision}}), do: decision

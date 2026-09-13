@@ -39,7 +39,7 @@ defmodule Loopctl.Delivery.PullRequestSource do
   precondition asks for it at BOTH the head and the merge base, because a pattern matching
   at one and not the other is exactly the drift the guard exists to catch.
 
-  ## `latest_deployment/2` and `contains?/3` — the post-deploy half (#803 §9)
+  ## `deployments_since/3` and `contains?/3` — the post-deploy half (#803 §9)
 
   These two are the forge's read surface for `Loopctl.Delivery.PostDeployVerification`.
   They live on THIS behaviour, not a second client, so the whole delivery loop reaches the
@@ -47,13 +47,33 @@ defmodule Loopctl.Delivery.PullRequestSource do
   rate-limit classification. (The behaviour is named for its first consumer; it is the
   delivery loop's forge reads, and a deployment is one of them.)
 
-  **`latest_deployment/2` reads the DEPLOYMENT, never a workflow run's head.** Design §9:
-  a `workflow_run` deploy ships the TRIGGERING run's commit while the API attributes the
-  deploy run to whatever the branch head was when the run was created, so two merges minutes
-  apart give a run attributed to the second that shipped the first. A deployment record's
-  `sha` is written by the deploying job itself, which is the only party that knows what it
-  checked out. `{:ok, nil}` means the environment has no deployment at all — a FACT, and a
-  fail-closed one for the verifier, not a failure of the call.
+  **They read the DEPLOYMENT, never a workflow run's head.** Design §9: a `workflow_run`
+  deploy ships the TRIGGERING run's commit while the API attributes the deploy run to
+  whatever the branch head was when the run was created, so two merges minutes apart give a
+  run attributed to the second that shipped the first. A deployment record's `sha` is
+  written by the deploying job itself, which is the only party that knows what it checked
+  out.
+
+  **`deployments_since/3` is a PAGE, filtered by time, and both halves are load-bearing.**
+
+  - *A page, not the newest one.* Reading only the newest made a LATER story's failed deploy
+    escalate an EARLIER story that had already shipped: A merges and deploy 1 carries it, B
+    merges and deploy 2 fails, and A's next sweep read deploy 2 as the whole truth. A verdict
+    about one merge has to be reached from the deployment that would have CARRIED it, which
+    is not always the newest one.
+  - *Filtered by `since`, the moment the merge was recorded.* A deployment created BEFORE the
+    merge cannot contain it, so including one is not merely wasteful — it is how the happy
+    path escalated. Between a runner reporting `deployed` and the deploy job creating its
+    record (a queued workflow on a cold runner: routinely 30-120s) the newest deployment is
+    the PREVIOUS one, which by construction does not contain this merge, and a verifier that
+    could not tell "my deploy has not started" from "something else shipped" took the
+    human-only `verification_failed` edge on a healthy delivery.
+
+  So an EMPTY list is the ordinary early answer — "nothing that could carry this merge
+  exists yet" — and it is a FACT, not a failure of the call. Newest first.
+
+  Filtering by `since` also bounds the cost: the implementation resolves each surviving
+  deployment's state, and on the common early sweep there are none to resolve.
 
   **`contains?/3` is why verification is not sha equality.** Merges queue: a story's merge
   can be an ancestor of what is deployed rather than equal to it, and that IS shipped.
@@ -73,14 +93,17 @@ defmodule Loopctl.Delivery.PullRequestSource do
   - `:state` — the latest deployment status. `:pending` covers every state that has not
     settled (`queued`, `pending`, `in_progress`) AND a deployment with no status at all,
     because both mean the same thing to a verifier: ask again. `:inactive` is a deployment
-    deliberately deactivated — a rollback — and is a failure here, since this is the NEWEST
-    deployment of the environment and nothing newer superseded it
+    that was deactivated — either rolled back, or superseded by a later one
+  - `:created_at` — when the forge created the record. The verifier compares it against the
+    moment the merge was recorded, so this field is what tells a deploy that has not started
+    from one that shipped something else
   - `:id` — the forge's deployment id, for the escalation reason
   """
   @type deployment :: %{
           id: integer(),
           sha: String.t(),
-          state: :success | :failure | :error | :inactive | :pending
+          state: :success | :failure | :error | :inactive | :pending,
+          created_at: DateTime.t()
         }
 
   @type pull_request :: %{
@@ -100,11 +123,13 @@ defmodule Loopctl.Delivery.PullRequestSource do
   @callback repo_files(repo(), String.t()) :: {:ok, [String.t()]} | {:error, term()}
 
   @doc """
-  The NEWEST deployment of `environment`, or `{:ok, nil}` when it has none. See the
-  moduledoc for why this reads a deployment rather than a workflow run.
+  The recent deployments of `environment` created at or after `since`, NEWEST FIRST.
+
+  `{:ok, []}` is the ordinary early answer and a FACT, not a failure. See the moduledoc for
+  why this is a page filtered by time rather than the newest record.
   """
-  @callback latest_deployment(repo(), String.t()) ::
-              {:ok, deployment() | nil} | {:error, term()}
+  @callback deployments_since(repo(), String.t(), DateTime.t()) ::
+              {:ok, [deployment()]} | {:error, term()}
 
   @doc """
   Whether `sha` is reachable from `ref` — identical to it, or an ancestor of it.

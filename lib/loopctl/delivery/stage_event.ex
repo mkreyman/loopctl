@@ -14,6 +14,14 @@ defmodule Loopctl.Delivery.StageEvent do
     the forge was transiently unavailable (#803); `data` carries the head and the
     consecutive count. Nothing transitions on one of these, so without the event a story
     going quiet would leave no trace at all.
+  - `post_deploy_unresolved` — the same, for post-deploy verification (#803 §9): a sweep
+    that reached no verdict because the forge was unavailable or the deploy had not
+    settled. `data` carries the merge sha, the KIND of waiting (`forge_fault` or
+    `deploy_pending`, which have different bounds) and the consecutive count.
+
+  **This list is the `story_stage_events_event` CHECK's allow-list.** Adding an event name
+  means a migration that rewrites the constraint AND a line here; the two drifting is how a
+  reader learns the vocabulary wrong.
 
   Custody-critical transitions are ALSO on the audit chain; this table is the complete
   record and the chain the tamper-evident one.

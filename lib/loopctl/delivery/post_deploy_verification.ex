@@ -11,8 +11,8 @@ defmodule Loopctl.Delivery.PostDeployVerification do
 
   ## What it compares, and why not the workflow run
 
-  The story's recorded `merge_sha` against the commit the target environment's newest
-  DEPLOYMENT names. Never a workflow run's `head_sha`: design §9 and KB `3670a0de` — a
+  The story's recorded `merge_sha` against the commits the target environment's recent
+  DEPLOYMENTS name. Never a workflow run's `head_sha`: design §9 and KB `3670a0de` — a
   `workflow_run` deploy checks out the TRIGGERING run's commit while the API attributes the
   deploy run to whatever the branch head was when the run was created, so two merges four
   minutes apart produced a Deploy run attributed to the second that had shipped the first,
@@ -27,36 +27,56 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   that does not exist. What this module gives is the forge's own record instead of the
   forge's attribution, which is the improvement available without one.
 
-  ## Containment, not equality
+  ## Three things it reads that a naive version does not, each paid for by a defect
 
-  A merge that is an ANCESTOR of the deployed commit shipped. Merges queue: a story merged
-  at 10:00 and deployed inside the 10:04 deploy of a later merge is deployed, and equality
-  would escalate it. `PullRequestSource.contains?/3` is the question actually asked, and
-  identical shas skip the call rather than making it.
+  - **CONTAINMENT, not sha equality.** A merge that is an ANCESTOR of a deployed commit
+    shipped. Merges queue, so a story merged at 10:00 and carried by the 10:04 deploy of a
+    later merge is deployed, and equality would escalate it.
+  - **A PAGE of deployments, not the newest one.** A verdict about one merge comes from the
+    deployment that would have CARRIED it, which is not always the newest: A merges and
+    deploy 1 carries it, B merges and deploy 2 fails, and reading only the newest escalated
+    A — a story that had already shipped — on B's failure.
+  - **The TIME the merge was recorded.** A deployment created before the merge cannot
+    contain it. Between a runner reporting `deployed` and the deploy job creating its record
+    (a queued workflow on a cold runner: routinely 30-120s) the newest deployment is the
+    PREVIOUS one, and a verifier with no notion of time could not tell "my deploy has not
+    started" from "something else shipped" — so the first sweep, which lands inside that
+    window, took the human-only `verification_failed` edge on every healthy delivery.
 
   ## Every outcome
 
+  The walk is newest-first over the deployments created since the merge, and it stops at
+  the first one the forge confirms CARRIES the merge. That deployment decides:
+
   | what the forge says | decision | what happens to the story |
   |---|---|---|
-  | the merge is in the deployed commit, deployment succeeded | `:verified` | `{deployed, verified, :forward}` |
-  | it is not | `:failed` | `{deployed, escalated, :verification_failed}`, naming both shas |
-  | the deployment failed, errored, or was deactivated (rolled back) | `:failed` | escalated, naming the state |
-  | the environment has NO deployment | `:failed` | escalated. We cannot tell what is running, and that is a human's question |
-  | the story has no recorded `merge_sha` | `:failed` | escalated. Fail closed: there is nothing to verify against |
+  | a deployment carries the merge and succeeded | `:verified` | `{deployed, verified, :forward}` |
+  | a deployment carries it and failed, errored or was deactivated | `:failed` | escalated, naming the state and both shas |
+  | a deployment carries it and is still running | `:unresolved` | nothing. The next sweep asks again |
+  | NO deployment since the merge | `:unresolved` | nothing. The deploy job has not made its record |
+  | deployments exist, none carries the merge | `:unresolved` | nothing, until the bound. A rollback or a concurrent branch, not a verdict |
+  | the story has no recorded `merge_sha`, or no merge TIME | `:failed` | escalated. Fail closed: there is nothing to verify against |
+  | a state this module does not know | `:failed` | escalated. Never approximated to success |
   | a TRANSIENT forge fault | `:unresolved` | nothing. The next sweep asks again |
-  | the deployment has not settled | `:unresolved` | nothing. A deploy in flight is not a failed one |
+
+  A failed deployment that does NOT carry the merge is passed over entirely — it is
+  somebody else's deploy and says nothing about this story.
 
   ## A transient fault is not a verdict, and neither is a deploy still running
 
-  `escalated` is human-only, so one 5s timeout, one rate-limit 403, or one deploy that
-  takes six minutes would park a story until Mark acts. Both come back `:unresolved`:
-  nothing decided, nothing transitioned. The classification is
-  `Loopctl.Delivery.MergePrecondition.transient?/1` — the SAME one the merge gate uses, not
-  a second opinion about what GitHub's 403 means — and the backstop is the same shape too:
-  consecutive unresolved sweeps at one MERGE are counted
-  (`Loopctl.Delivery.Stages.note_post_deploy_unresolved/4`), and past
-  `max_consecutive_unresolved/0` the verdict becomes a refusal that escalates naming the
-  fault. No condition retries for ever with nobody told.
+  `escalated` is human-only, so one 5s timeout, one rate-limit 403, or one queued build
+  would park a story until Mark acts. Both come back `:unresolved`: nothing decided, nothing
+  transitioned. The classification is `Loopctl.Delivery.MergePrecondition.transient?/1` —
+  the SAME one the merge gate uses, not a second opinion about what GitHub's 403 means.
+
+  The backstop is the same shape as the merge gate's, with one difference that matters:
+  **TWO bounds, not one.** Consecutive unresolved sweeps are counted per MERGE and per KIND
+  (`Loopctl.Delivery.Stages.note_post_deploy_unresolved/5`), and past
+  `max_consecutive_unresolved/1` for that kind the verdict becomes a refusal that escalates
+  naming the fault. A forge fault is a blip measured in minutes; a deploy that has not
+  settled is measured in however long a queued build takes, and design §9 makes CI a
+  capacity-1 resource. One number for both meant the slower condition inherited the faster
+  one's ceiling and escalated every story on the normal path.
 
   The count is keyed to the merge rather than the head because that is what a sweep asks
   about, and every edge that clears `merge_sha` clears it
@@ -74,7 +94,7 @@ defmodule Loopctl.Delivery.PostDeployVerification do
 
   ## Retries and partitions
 
-  `evaluate/3` writes nothing and may be repeated freely. `enforce/3` adds the transition,
+  `evaluate/2` writes nothing and may be repeated freely. `enforce/3` adds the transition,
   which is the stage machine's compare-and-set from `deployed`, so a second run of the same
   sweep finds the row already at `verified` or `escalated` and is refused `:stale_stage` —
   it cannot verify twice or escalate twice. The count is a fenced write like any other.
@@ -87,7 +107,7 @@ defmodule Loopctl.Delivery.PostDeployVerification do
 
   Every forge call carries the bounded connect/receive timeouts
   `Loopctl.Delivery.GitHubPullRequestSource` sets, and `retry: false`. **No database
-  transaction is open across any of them**: `gather/2` makes every call before `enforce/3`
+  transaction is open across any of them**: `gather/3` makes every call before `enforce/3`
   writes anything, exactly as the merge precondition does, so a slow forge never holds a
   pooled connection.
 
@@ -110,11 +130,24 @@ defmodule Loopctl.Delivery.PostDeployVerification do
 
   @default_environment "production"
 
-  # The same bound, and the same reasoning, as the merge gate's: the cost of escalating a
-  # story that would have recovered is one human glance, and the cost of not escalating is a
-  # story nobody hears about again. At the sweep's cadence this is roughly ten minutes of a
-  # deploy that will not settle or a forge that will not answer.
-  @max_consecutive_unresolved 5
+  # TWO bounds, because two conditions reach `:unresolved` and they are not the same length
+  # of problem. One number for both is how the normal path escalated: five sweeps is about
+  # ten minutes, so every repository whose merge-to-deploy-settled time exceeded that
+  # escalated EVERY story on the happy path.
+  #
+  # - `:forge_fault` — the forge could not be read. A blip clears in seconds; a fault that
+  #   has not cleared in ten minutes is a token or an outage, and a human is the answer.
+  #   The merge gate's number, for the same reason it has it.
+  # - `:deploy_pending` — the deploy has not been created, has not settled, or has not
+  #   carried this merge yet. Sized from what the delivery loop actually costs, not from the
+  #   forge number: design §9 makes CI a capacity-1 resource on one self-hosted runner with
+  #   six concurrent implementations feeding it, so a deploy queued behind other jobs for
+  #   half an hour is ordinary rather than broken. An hour is the point at which a human
+  #   should look.
+  #
+  # At the sweep's two-minute cadence: ~10 minutes and ~60 minutes.
+  @max_consecutive_forge_faults 5
+  @max_consecutive_deploy_pending 30
 
   # Matches `Loopctl.Delivery.MergePrecondition`'s: the `story_stages_text_bounds` CHECK is
   # 4000 CODEPOINTS, and the margin is deliberate. A reason too long to store would roll the
@@ -124,12 +157,28 @@ defmodule Loopctl.Delivery.PostDeployVerification do
 
   @type fact(value) :: {:ok, value} | {:error, term()}
 
+  @typedoc "Which kind of waiting an `:unresolved` result is, and therefore which bound it has."
+  @type unresolved_kind :: :forge_fault | :deploy_pending
+
+  @typedoc """
+  Each deployment carries the containment answer alongside its own facts: `contains` is
+  `true` when the forge confirmed this deployment reaches the merge, `false` when it does
+  not, and `:not_asked` when the walk stopped before needing to ask.
+  """
+  @type judged_deployment :: %{
+          id: integer(),
+          sha: String.t(),
+          state: atom(),
+          created_at: DateTime.t(),
+          contains: boolean() | :not_asked
+        }
+
   @type facts :: %{
           required(:repo) => fact(String.t()),
           required(:environment) => String.t(),
           required(:merge_sha) => String.t() | nil,
-          required(:deployment) => fact(map() | nil),
-          required(:contains) => fact(boolean()) | :not_attempted
+          required(:merged_at) => fact(DateTime.t()),
+          required(:deployments) => fact([judged_deployment()]) | :not_attempted
         }
 
   @type error :: :not_found | :no_stage | :wrong_stage
@@ -143,11 +192,14 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   def failure_transition, do: {:deployed, :escalated, :verification_failed}
 
   @doc """
-  The consecutive-unresolved bound. Past it the sweep escalates rather than answering "not
-  yet" again, so no fault and no stuck deploy can wait for ever with nobody told.
+  The consecutive-unresolved bound for one KIND of waiting. Past it the sweep escalates
+  rather than answering "not yet" again, so neither a fault nor a stuck deploy can wait for
+  ever with nobody told. See the note above `@max_consecutive_forge_faults` for why the two
+  kinds do not share a number.
   """
-  @spec max_consecutive_unresolved() :: pos_integer()
-  def max_consecutive_unresolved, do: @max_consecutive_unresolved
+  @spec max_consecutive_unresolved(unresolved_kind()) :: pos_integer()
+  def max_consecutive_unresolved(:forge_fault), do: @max_consecutive_forge_faults
+  def max_consecutive_unresolved(:deploy_pending), do: @max_consecutive_deploy_pending
 
   @doc """
   The deployment environment whose newest deployment is compared against a story's merge.
@@ -174,16 +226,14 @@ defmodule Loopctl.Delivery.PostDeployVerification do
       resolution: Resolution.for_verdict(:escalated),
       repo: value(facts, :repo),
       merge_sha: Map.get(facts, :merge_sha),
-      deployed_sha: deployed(facts, :sha),
-      deployment_id: deployed(facts, :id),
-      deployment_state: deployed(facts, :state)
+      merged_at: value(facts, :merged_at)
     }
 
     # A transient fault decides FIRST and decides everything: nothing was established, so
     # nothing transitions. Only then the permanent faults, and only then the comparison.
     case {transient_reasons(facts), broken_reasons(facts)} do
       {[_ | _] = transient, other} ->
-        unresolved(base, transient ++ other, longest_retry_after(transient))
+        unresolved(base, transient ++ other, :forge_fault, longest_retry_after(transient))
 
       {[], [_ | _] = broken} ->
         failed(base, broken)
@@ -208,7 +258,7 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   def evaluate(tenant_id, story_id) do
     with {:ok, story} <- fetch_story(tenant_id, story_id),
          {:ok, stage} <- fetch_stage(tenant_id, story_id) do
-      {:ok, story |> gather(stage) |> judge()}
+      {:ok, tenant_id |> gather(story, stage) |> judge()}
     end
   end
 
@@ -245,14 +295,14 @@ defmodule Loopctl.Delivery.PostDeployVerification do
 
   # -- the judgement (pure) --------------------------------------------------------------
 
-  # `:contains` is judged only when it was ATTEMPTED. `:not_attempted` is the consequence of
-  # a fact missing above it, never a second fault, so listing it would report the same
-  # problem twice and — worse — a transient classification of it would suppress the
-  # permanent reason that caused it.
+  # A fact is judged only when it was ATTEMPTED. `:not_attempted` is the consequence of a
+  # fact missing above it, never a second fault, so listing it would report the same problem
+  # twice and — worse — a transient classification of it would suppress the permanent reason
+  # that caused it.
   @judged_facts [
     {:repo, :repository_unresolved},
-    {:deployment, :deployment_unavailable},
-    {:contains, :containment_unavailable}
+    {:merged_at, :merge_time_unknown},
+    {:deployments, :deployments_unavailable}
   ]
 
   defp transient_reasons(facts) do
@@ -278,64 +328,131 @@ defmodule Loopctl.Delivery.PostDeployVerification do
     end
   end
 
+  # The states a deployment can be in, as three disjoint sets. `@settled_failure` and
+  # `:success` and `:pending` are the WHOLE vocabulary the adapter can produce
+  # (`map_state/1` refuses anything else), and the walk below matches all three EXPLICITLY
+  # so a state nobody has thought about fails closed instead of falling through to the
+  # containment check and verifying.
+  @settled_failure [:failure, :error, :inactive]
+
   # Everything the forge could say has been established by here. What is left is the
-  # question, in the order a reader would ask it: do we know what had to ship, did the
-  # deploy happen, did it succeed, and is our commit in it.
+  # question, in the order a reader would ask it: do we know what had to ship, and does any
+  # deployment that could have carried it say it did.
   defp decide(result, facts) do
-    case {Map.get(facts, :merge_sha), value(facts, :deployment)} do
-      {nil, _deployment} ->
-        failed(result, [:merge_sha_not_recorded])
-
-      {_merge_sha, nil} ->
-        failed(result, [{:no_deployment, Map.get(facts, :environment)}])
-
-      {merge_sha, deployment} ->
-        decide_deployment(result, facts, merge_sha, deployment)
+    case Map.get(facts, :merge_sha) do
+      nil -> failed(result, [:merge_sha_not_recorded])
+      merge_sha -> decide_deployments(result, facts, merge_sha, value(facts, :deployments))
     end
   end
 
-  # A deploy that has not settled is not a failed one. It is the ordinary case for a story
-  # that reached `deployed` seconds ago, and escalating on it would make the common path the
-  # escalating one.
-  defp decide_deployment(result, _facts, merge_sha, %{state: :pending} = deployment),
-    do: unresolved(result, [{:deploy_in_flight, deployment.sha, merge_sha}], nil)
-
-  defp decide_deployment(result, _facts, merge_sha, %{state: state} = deployment)
-       when state in [:failure, :error, :inactive] do
-    # `:inactive` is the newest deployment of the environment having been DEACTIVATED, which
-    # is a rollback: nothing newer superseded it, because this is the newest one.
-    failed(result, [{:deploy_not_successful, state, deployment.sha, merge_sha}])
+  # NO deployment created since the merge. The deploy job has not made its record yet, which
+  # is the ORDINARY state of a story that reached `deployed` seconds ago: a queued workflow
+  # on a cold runner routinely takes 30-120s to get there. This is the case that used to
+  # escalate the happy path, because the newest deployment was then the PREVIOUS one, which
+  # by construction cannot contain this merge.
+  defp decide_deployments(result, facts, merge_sha, []) do
+    reason = {:deploy_not_started, merge_sha, Map.get(facts, :environment)}
+    unresolved(result, [reason], :deploy_pending, nil)
   end
 
-  defp decide_deployment(result, facts, merge_sha, deployment) do
-    case value(facts, :contains) do
-      true ->
-        %{
-          result
-          | decision: :verified,
-            reasons: [],
-            resolution: Resolution.for_verdict(:shipped)
-        }
-
-      _not_contained ->
-        failed(result, [{:merge_not_deployed, merge_sha, deployment.sha}])
+  defp decide_deployments(result, _facts, merge_sha, deployments) do
+    case Enum.find(deployments, &carries?/1) do
+      %{state: :success} = shipped -> verified(result, shipped)
+      %{state: state} = failed -> our_deploy_failed(result, merge_sha, state, failed)
+      nil -> nothing_carries_it(result, merge_sha, deployments)
     end
   end
 
+  # The deployment that WOULD have carried the merge, whatever it did next. `contains` is
+  # only ever `true` for one the forge confirmed reaches this commit, so a LATER story's
+  # failed deploy — the case that escalated an earlier story which had already shipped — is
+  # simply not this deployment and the walk passes over it.
+  defp carries?(%{contains: true}), do: true
+  defp carries?(_deployment), do: false
+
+  defp verified(result, deployment) do
+    %{
+      result
+      | decision: :verified,
+        reasons: [],
+        resolution: Resolution.for_verdict(:shipped),
+        deployed_sha: deployment.sha,
+        deployment_id: deployment.id,
+        deployment_state: deployment.state
+    }
+  end
+
+  # A deployment that carries this merge and did not succeed. THIS is the only failure the
+  # verifier concludes from a deploy state, because it is the only one that is about this
+  # story's merge rather than about whatever else the environment has been doing.
+  defp our_deploy_failed(result, merge_sha, state, deployment) do
+    result = %{
+      result
+      | deployed_sha: deployment.sha,
+        deployment_id: deployment.id,
+        deployment_state: state
+    }
+
+    if state in @settled_failure do
+      failed(result, [{:deploy_not_successful, state, deployment.sha, merge_sha}])
+    else
+      # `:pending` carrying our merge is our deploy, still running — and anything else is a
+      # state this module does not know, which fails closed rather than being approximated.
+      case state do
+        :pending ->
+          unresolved(
+            result,
+            [{:deploy_in_flight, deployment.sha, merge_sha}],
+            :deploy_pending,
+            nil
+          )
+
+        other ->
+          failed(result, [{:unrecognised_deployment_state, other}])
+      end
+    end
+  end
+
+  # Deployments exist since the merge, none of them carries it. Either one is still running
+  # and will, or something shipped past this merge without it — a rollback, or a deploy from
+  # another branch. Both are WAITING, bounded by the in-flight count, which escalates naming
+  # both shas. Concluding failure here is what read a concurrent deploy as a broken one.
+  defp nothing_carries_it(result, merge_sha, deployments) do
+    newest = List.first(deployments)
+
+    result = %{
+      result
+      | deployed_sha: newest && newest.sha,
+        deployment_id: newest && newest.id,
+        deployment_state: newest && newest.state
+    }
+
+    reasons =
+      if Enum.any?(deployments, &(&1.state == :pending)),
+        do: [{:deploy_in_flight, newest && newest.sha, merge_sha}],
+        else: [{:merge_not_deployed, merge_sha, newest && newest.sha}]
+
+    unresolved(result, reasons, :deploy_pending, nil)
+  end
+
+  # `retry_after` is a fact about the FORGE, not about the decision, so a conversion to
+  # `:failed` KEEPS it. Nulling it disarmed the sweep's rate-limit halt on exactly the pass
+  # that matters: the run that crosses the bound is the one that just heard "out of quota",
+  # and the batch went on calling.
   defp failed(result, reasons) do
     %{
       result
       | decision: :failed,
         reasons: Enum.uniq(reasons),
-        resolution: Resolution.for_verdict(:escalated),
-        retry_after: nil
+        resolution: Resolution.for_verdict(:escalated)
     }
   end
 
-  defp unresolved(result, reasons, retry_after) do
+  defp unresolved(result, reasons, kind, retry_after) do
     %{
       result
       | decision: :unresolved,
+        unresolved_kind: kind,
         reasons: Enum.uniq(reasons),
         resolution: Resolution.for_verdict(:escalated),
         retry_after: retry_after
@@ -361,19 +478,12 @@ defmodule Loopctl.Delivery.PostDeployVerification do
     end
   end
 
-  defp deployed(facts, key) do
-    case value(facts, :deployment) do
-      %{} = deployment -> Map.get(deployment, key)
-      _absent -> nil
-    end
-  end
-
   # -- gathering the facts ---------------------------------------------------------------
 
-  defp gather(story, stage) do
+  defp gather(tenant_id, story, stage) do
     repo = MergePrecondition.repo_for_story(story)
     env = environment()
-    deployment = latest_deployment(repo, env)
+    merged_at = merged_at(tenant_id, stage)
 
     %{
       repo: repo,
@@ -381,25 +491,66 @@ defmodule Loopctl.Delivery.PostDeployVerification do
       # From the STAGE ROW, never a caller: this is the merge the loop performed, written
       # inside the transition into `merged` and named in that transition's chain entry.
       merge_sha: stage.merge_sha,
-      deployment: deployment,
-      contains: contains(repo, stage.merge_sha, deployment)
+      merged_at: merged_at,
+      deployments: deployments(repo, env, merged_at, stage.merge_sha)
     }
   end
 
-  defp latest_deployment({:ok, repo}, environment),
-    do: source().latest_deployment(repo, environment)
-
-  defp latest_deployment(_repo, _environment), do: {:error, :not_attempted}
-
-  # Only asked when there is something to ask about — a SUCCESSFUL deployment and a merge to
-  # look for — and NOT asked when the shas are equal: a commit trivially contains itself, and
-  # the round trip could only add a way to fail.
-  defp contains({:ok, repo}, merge_sha, {:ok, %{sha: deployed, state: :success}})
-       when is_binary(merge_sha) do
-    if merge_sha == deployed, do: {:ok, true}, else: source().contains?(repo, merge_sha, deployed)
+  # WHEN the loop recorded the merge, read from the stage event the transition into `merged`
+  # wrote. That table is append-only and nothing prunes it, so the event is present for
+  # every story that reached `deployed` — it is the transition that got it there.
+  #
+  # Its ABSENCE therefore means the story's own history does not say when it merged, which
+  # is a custody-integrity gap like `merge_sha_not_recorded` and fails CLOSED. Defaulting to
+  # "the beginning of time" would put every deployment back in the candidate set and restore
+  # the failure this whole fact exists to remove.
+  defp merged_at(tenant_id, stage) do
+    tenant_id
+    |> Stages.list_events(stage.story_id)
+    |> Enum.filter(&(&1.event == "transitioned" and &1.to_stage == "merged"))
+    |> List.last()
+    |> case do
+      %{inserted_at: at} -> {:ok, at}
+      nil -> {:error, :no_merge_event}
+    end
   end
 
-  defp contains(_repo, _merge_sha, _deployment), do: :not_attempted
+  # The deployments that could carry this merge, each annotated with whether it does.
+  #
+  # The walk is newest-first and SHORT-CIRCUITS on the first deployment the forge confirms
+  # reaches the merge: that one settles the verdict, whatever its state, so nothing older
+  # needs asking about. On the common path this is one containment call, and on the very
+  # common early path the list is empty and there are none.
+  defp deployments({:ok, repo}, environment, {:ok, merged_at}, merge_sha)
+       when is_binary(merge_sha) do
+    case source().deployments_since(repo, environment, merged_at) do
+      {:ok, deployments} -> annotate(repo, merge_sha, deployments)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp deployments(_repo, _environment, _merged_at, _merge_sha), do: :not_attempted
+
+  defp annotate(repo, merge_sha, deployments) do
+    deployments
+    |> Enum.reduce_while({:ok, []}, fn deployment, {:ok, acc} ->
+      case contains(repo, merge_sha, deployment) do
+        {:ok, true} -> {:halt, {:ok, [Map.put(deployment, :contains, true) | acc]}}
+        {:ok, false} -> {:cont, {:ok, [Map.put(deployment, :contains, false) | acc]}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, annotated} -> {:ok, Enum.reverse(annotated)}
+      error -> error
+    end
+  end
+
+  # NOT asked when the shas are equal: a commit trivially contains itself, and the round
+  # trip could only add a way to fail.
+  defp contains(repo, merge_sha, %{sha: deployed}) do
+    if merge_sha == deployed, do: {:ok, true}, else: source().contains?(repo, merge_sha, deployed)
+  end
 
   defp fetch_story(tenant_id, story_id) do
     case Stories.get_story(tenant_id, story_id) do
@@ -454,12 +605,15 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   # Counting is itself a fenced write and can fail. A count that does not land leaves the
   # result `:unresolved` — the backstop is a safety net, not a second way to escalate — and
   # the failure is logged and reported.
-  defp note_unresolved(tenant_id, story_id, %Result{} = result, opts) do
+  defp note_unresolved(tenant_id, story_id, %Result{unresolved_kind: kind} = result, opts) do
     write_opts = Keyword.take(opts, [:claim_epoch, :actor_label])
+    bound = max_consecutive_unresolved(kind)
 
-    case Stages.note_post_deploy_unresolved(tenant_id, story_id, result.merge_sha, write_opts) do
-      {:ok, count} when count > @max_consecutive_unresolved ->
-        failed(result, result.reasons ++ [{:unresolved_limit_exceeded, count}])
+    tenant_id
+    |> Stages.note_post_deploy_unresolved(story_id, result.merge_sha, kind, write_opts)
+    |> case do
+      {:ok, count} when count > bound ->
+        failed(result, result.reasons ++ [{:unresolved_limit_exceeded, kind, count, bound}])
 
       {:ok, _count} ->
         result

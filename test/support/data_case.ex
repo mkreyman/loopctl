@@ -229,7 +229,7 @@ defmodule Loopctl.DataCase do
     # `{:error, :not_stubbed}` is NOT transient, so a test that reaches the forge without
     # saying so escalates the story rather than verifying it — the same direction the merge
     # precondition's default fails in.
-    Mox.stub(Loopctl.MockPullRequestSource, :latest_deployment, fn _repo, _environment ->
+    Mox.stub(Loopctl.MockPullRequestSource, :deployments_since, fn _repo, _environment, _since ->
       {:error, :not_stubbed}
     end)
 

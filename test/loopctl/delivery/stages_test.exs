@@ -70,6 +70,9 @@ defmodule Loopctl.Delivery.StagesTest do
     {story, fixture(:story_stage, row_attrs)}
   end
 
+  defp note_post_deploy(story, merge_sha, kind, opts),
+    do: Stages.note_post_deploy_unresolved(story.tenant_id, story.id, merge_sha, kind, opts)
+
   defp release_claim(story) do
     as_tenant(story.tenant_id, fn ->
       story = Repo.get!(Story, story.id)
@@ -450,25 +453,45 @@ defmodule Loopctl.Delivery.StagesTest do
       opts = [claim_epoch: story.claim_epoch]
 
       assert {:ok, 1} =
-               Stages.note_post_deploy_unresolved(story.tenant_id, story.id, @sha_a, opts)
+               note_post_deploy(story, @sha_a, :forge_fault, opts)
 
       assert {:ok, 2} =
-               Stages.note_post_deploy_unresolved(story.tenant_id, story.id, @sha_a, opts)
+               note_post_deploy(story, @sha_a, :forge_fault, opts)
 
       assert {:ok, 1} =
-               Stages.note_post_deploy_unresolved(story.tenant_id, story.id, @sha_b, opts)
+               note_post_deploy(story, @sha_b, :forge_fault, opts)
 
       row = Stages.get(story.tenant_id, story.id)
-      assert row.post_deploy_unresolved == %{"merge_sha" => @sha_b, "count" => 1}
+
+      assert row.post_deploy_unresolved ==
+               %{"merge_sha" => @sha_b, "kind" => "forge_fault", "count" => 1}
+
       # And it does NOT share a column with the merge gate's count.
       assert is_nil(row.merge_gate_unevaluated)
+    end
+
+    test "the KIND is part of the identity, so a different one restarts the count" do
+      # Two conditions reach `:unresolved` and they have different bounds. Counting them on
+      # one number made a slow-but-healthy deploy inherit the forge's much shorter ceiling
+      # and escalate the normal path.
+      {story, _row} = at_stage(:deployed)
+      opts = [claim_epoch: story.claim_epoch]
+
+      assert {:ok, 1} = note_post_deploy(story, @sha_a, :forge_fault, opts)
+      assert {:ok, 2} = note_post_deploy(story, @sha_a, :forge_fault, opts)
+      assert {:ok, 1} = note_post_deploy(story, @sha_a, :deploy_pending, opts)
+      assert {:ok, 2} = note_post_deploy(story, @sha_a, :deploy_pending, opts)
+      assert {:ok, 1} = note_post_deploy(story, @sha_a, :forge_fault, opts)
+
+      assert Stages.get(story.tenant_id, story.id).post_deploy_unresolved ==
+               %{"merge_sha" => @sha_a, "kind" => "forge_fault", "count" => 1}
     end
 
     test "leaves an event under its own name" do
       {story, _row} = at_stage(:deployed)
 
       assert {:ok, 1} =
-               Stages.note_post_deploy_unresolved(story.tenant_id, story.id, @sha_a,
+               note_post_deploy(story, @sha_a, :deploy_pending,
                  claim_epoch: story.claim_epoch,
                  actor_label: "test"
                )
@@ -478,7 +501,7 @@ defmodule Loopctl.Delivery.StagesTest do
                |> Stages.list_events(story.id)
                |> Enum.filter(&(&1.event == "post_deploy_unresolved"))
 
-      assert data == %{"merge_sha" => @sha_a, "count" => 1}
+      assert data == %{"merge_sha" => @sha_a, "kind" => "deploy_pending", "count" => 1}
     end
 
     test "clear_post_deploy_unresolved/3 removes the count, no-op with nothing to clear" do
@@ -489,7 +512,7 @@ defmodule Loopctl.Delivery.StagesTest do
                Stages.clear_post_deploy_unresolved(story.tenant_id, story.id, opts)
 
       assert {:ok, 1} =
-               Stages.note_post_deploy_unresolved(story.tenant_id, story.id, @sha_a, opts)
+               note_post_deploy(story, @sha_a, :forge_fault, opts)
 
       assert {:ok, :cleared} =
                Stages.clear_post_deploy_unresolved(story.tenant_id, story.id, opts)
@@ -515,7 +538,7 @@ defmodule Loopctl.Delivery.StagesTest do
       {:ok, _} = Stages.advance(story.tenant_id, story.id, {:merged, :deployed}, opts)
 
       assert {:ok, 1} =
-               Stages.note_post_deploy_unresolved(story.tenant_id, story.id, @sha_b, opts)
+               note_post_deploy(story, @sha_b, :forge_fault, opts)
 
       assert {:ok, :cleared} =
                Stages.clear_post_deploy_unresolved(story.tenant_id, story.id, opts)
@@ -529,18 +552,14 @@ defmodule Loopctl.Delivery.StagesTest do
       {story, _row} = at_stage(:ci)
 
       assert {:error, :wrong_stage} =
-               Stages.note_post_deploy_unresolved(story.tenant_id, story.id, @sha_a,
-                 claim_epoch: story.claim_epoch
-               )
+               note_post_deploy(story, @sha_a, :forge_fault, claim_epoch: story.claim_epoch)
     end
 
     test "is fenced by the claim epoch like every other write here" do
       {story, _row} = at_stage(:deployed)
 
       assert {:error, :stale_claim_epoch} =
-               Stages.note_post_deploy_unresolved(story.tenant_id, story.id, @sha_a,
-                 claim_epoch: story.claim_epoch + 7
-               )
+               note_post_deploy(story, @sha_a, :forge_fault, claim_epoch: story.claim_epoch + 7)
     end
   end
 

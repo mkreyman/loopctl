@@ -13,12 +13,14 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
 
   Post-deploy verification (#803 §9) adds three more, each bounded the same way:
 
-  4. `GET /repos/:repo/deployments?environment=:env&per_page=1` — the newest deployment of
-     the environment, whose `sha` is the commit the DEPLOYING JOB recorded. Never a
-     workflow run's `head_sha`: a `workflow_run` deploy ships the triggering run's commit
-     while the API attributes the run to the branch head at creation time, so the two
-     diverge whenever two merges land minutes apart
-  5. `GET /repos/:repo/deployments/:id/statuses?per_page=1` — its latest state
+  4. `GET /repos/:repo/deployments?environment=:env&per_page=…` — a small page
+     (`@deployment_page`) of the environment's newest deployments, each `sha` the commit the
+     DEPLOYING JOB recorded. Never a workflow run's `head_sha`: a `workflow_run` deploy ships the
+     triggering run's commit while the API attributes the run to the branch head at creation
+     time, so the two diverge whenever two merges land minutes apart
+  5. `GET /repos/:repo/deployments/:id/statuses?per_page=1` — one per deployment that
+     SURVIVES the `since` filter, and none at all on the common early sweep where the deploy
+     has not been created yet
   6. `GET /repos/:repo/compare/:sha...:ref` — whether a commit is reachable from another,
      which is what makes a story merged BEHIND the deployed head still count as shipped
 
@@ -83,6 +85,15 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
 
   @repo_name ~r{\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z}
   @ref ~r{\A[A-Za-z0-9_./-]+\z}
+  @control ~r/[\x00-\x1f\x7f]/
+
+  # How many of an environment's newest deployments one call reads before the `since` filter
+  # is applied. Small on purpose: every survivor costs a status request, and the page only
+  # has to be deep enough to reach past the deployments that landed between a story's merge
+  # and its sweep. A merge older than this many deployments reads as "nothing carries it
+  # yet" and waits out the verifier's in-flight bound — the safe direction, never a false
+  # verify.
+  @deployment_page 5
 
   @impl true
   def pull_request(repo, number) when is_integer(number) and number > 0 do
@@ -105,13 +116,16 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   end
 
   @impl true
-  def latest_deployment(repo, environment) do
+  def deployments_since(repo, environment, %DateTime{} = since) do
     with {:ok, repo} <- repo_name(repo),
          {:ok, environment} <- environment(environment),
-         {:ok, body} <- get(repo, "/deployments?environment=#{environment}&per_page=1") do
-      newest_deployment(repo, body)
+         path = "/deployments?environment=#{environment}&per_page=#{@deployment_page}",
+         {:ok, body} <- get(repo, path) do
+      deployments(repo, body, since)
     end
   end
+
+  def deployments_since(_repo, _environment, since), do: {:error, {:invalid_since, shape(since)}}
 
   @impl true
   def contains?(repo, sha, ref) do
@@ -123,21 +137,58 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
     end
   end
 
-  # GitHub lists deployments newest first, and `per_page=1` is the newest one. An EMPTY list
-  # is a fact, not a failure: the environment has never been deployed, or is named
-  # differently. The verifier fails closed on it — it cannot tell what is running — but it
-  # is reported as `nil` rather than as an error, because calling it an error would put it
-  # in the transient/permanent classification where it does not belong.
-  defp newest_deployment(_repo, []), do: {:ok, nil}
-
-  defp newest_deployment(repo, [%{"id" => id, "sha" => sha} | _rest])
-       when is_integer(id) and is_binary(sha) do
-    with {:ok, state} <- deployment_state(repo, id) do
-      {:ok, %{id: id, sha: sha, state: state}}
+  # GitHub lists deployments newest first. The `since` filter is applied BEFORE any status
+  # call, so the common early sweep — the deploy job has not created its record yet — costs
+  # exactly one request and returns `{:ok, []}`.
+  #
+  # An empty list is a FACT, not a failure. Calling it an error would put it in the
+  # transient/permanent classification, where "my deploy has not started" belongs to
+  # neither: it is not going to clear on a retry of a broken call, and it is not a contract
+  # change. The verifier waits on it, bounded by its own in-flight count.
+  defp deployments(repo, entries, since) when is_list(entries) do
+    entries
+    |> Enum.map(&deployment_record/1)
+    |> Enum.reduce_while({:ok, []}, &keep_since(&1, &2, since))
+    |> case do
+      {:ok, kept} -> kept |> Enum.reverse() |> resolve_states(repo)
+      error -> error
     end
   end
 
-  defp newest_deployment(_repo, body), do: {:error, {:unreadable_deployments, shape(body)}}
+  defp deployments(_repo, body, _since), do: {:error, {:unreadable_deployments, shape(body)}}
+
+  # The list is newest first, so the FIRST record older than `since` ends it: nothing below
+  # it can be newer, and every one of them would cost a status call to learn nothing.
+  defp keep_since({:error, _reason} = error, _acc, _since), do: {:halt, error}
+
+  defp keep_since({:ok, %{created_at: created_at} = record}, {:ok, acc}, since) do
+    if DateTime.compare(created_at, since) == :lt,
+      do: {:halt, {:ok, acc}},
+      else: {:cont, {:ok, [record | acc]}}
+  end
+
+  defp deployment_record(%{"id" => id, "sha" => sha, "created_at" => created_at})
+       when is_integer(id) and is_binary(sha) and is_binary(created_at) do
+    case DateTime.from_iso8601(created_at) do
+      {:ok, at, _offset} -> {:ok, %{id: id, sha: sha, created_at: at}}
+      {:error, reason} -> {:error, {:unreadable_deployment_created_at, reason}}
+    end
+  end
+
+  defp deployment_record(entry), do: {:error, {:unreadable_deployments, shape(entry)}}
+
+  defp resolve_states(records, repo) do
+    Enum.reduce_while(records, {:ok, []}, fn record, {:ok, acc} ->
+      case deployment_state(repo, record.id) do
+        {:ok, state} -> {:cont, {:ok, [Map.put(record, :state, state) | acc]}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, resolved} -> {:ok, Enum.reverse(resolved)}
+      error -> error
+    end
+  end
 
   # A deployment with NO status yet has not settled, which is the same answer to a verifier
   # as `queued`/`pending`/`in_progress`: ask again. An unrecognised state is NOT approximated
@@ -170,10 +221,21 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
 
   defp containment(body), do: {:error, {:unreadable_compare, shape(body)}}
 
-  # An environment name is spliced into a QUERY parameter, so the same rule as a ref:
-  # nothing that could change which resource is addressed or add a parameter of its own.
+  # An environment name goes in a QUERY PARAMETER, so it is ENCODED, not pattern-matched.
+  #
+  # It was validated against `@ref` and that was wrong in the direction that costs the most:
+  # GitHub environment names legally contain spaces (and much else), so a repository whose
+  # environment is called "production (fly)" made every waiting story escalate on a
+  # PERMANENT `invalid_environment` — an operator setting a correct value and being told it
+  # is malformed. `URI.encode_www_form/1` handles `&`, `?`, `#`, spaces and the rest, so
+  # nothing here can add a parameter of its own or address another resource.
+  #
+  # What is still refused is what encoding cannot make safe: a NUL or a control character,
+  # which is not a name anyone configured on purpose, and anything that is not a string.
   defp environment(name) when is_binary(name) do
-    if Regex.match?(@ref, name), do: {:ok, name}, else: {:error, {:invalid_environment, name}}
+    if String.valid?(name) and name != "" and not Regex.match?(@control, name),
+      do: {:ok, URI.encode_www_form(name)},
+      else: {:error, {:invalid_environment, printable(name)}}
   end
 
   defp environment(name), do: {:error, {:invalid_environment, shape(name)}}
