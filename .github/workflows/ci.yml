@@ -124,9 +124,12 @@ env:
 # and are not (`check_cwd: false`, and bind-mounting the runner work dir): loopctl KB
 # article 09245ceb.
 #
-# NOTE the exception list is per-repo. This repo keeps its PROJECT PLT in `priv/plts`
-# rather than in `_build`, so it needs excepting by name; the dialyxir CORE plts live in
-# each runner's own $MIX_HOME, outside the workspace, and the clean never reached them.
+# NOTE the exception list is per-repo. This repo keeps BOTH Dialyzer PLTs in `priv/plts`
+# rather than in `_build`: the project PLT (mix.exs plt_file) and, in the Dialyzer job, the
+# dialyxir CORE plts (DIALYZER_PLT_CORE_PATH). The clean deletes them and the per-slot
+# actions/cache restores them. The core plts used to default to $MIX_HOME, which is NOT
+# per-runner: every slot on the host runs as one user and shares one ~/.mix, while each
+# core PLT records beam paths under the slot that built it (see the Dialyzer job).
 
 jobs:
   lint:
