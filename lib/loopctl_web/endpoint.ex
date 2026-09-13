@@ -114,6 +114,11 @@ defmodule LoopctlWeb.Endpoint do
   # enforced: the corpus ingest description states it next to its item ceiling (a batch
   # of client-supplied vectors runs out of bytes long before it runs out of items) and
   # LoopctlWeb.ErrorJSON names it in the 413 body. One source, so they cannot drift.
+  # Issue #803: the GitHub intake webhook is signed over its RAW body, which Plug.Parsers
+  # would consume. This captures it for that one route, ahead of the parsers, and is a
+  # no-op for every other request. See the module.
+  plug LoopctlWeb.Plugs.IntakeRawBody
+
   plug Plug.Parsers,
     parsers: [:urlencoded, :json],
     pass: ["*/*"],

@@ -1,0 +1,242 @@
+defmodule LoopctlWeb.IntakeSourceControllerTest do
+  use LoopctlWeb.ConnCase, async: true
+
+  import Ecto.Query
+
+  alias Loopctl.AdminRepo
+  alias Loopctl.AuditChain.Entry
+  alias Loopctl.Intake
+  alias Loopctl.Intake.Signature
+  alias Loopctl.Intake.Source
+
+  setup :verify_on_exit!
+
+  defp auth(conn, raw_key), do: put_req_header(conn, "authorization", "Bearer #{raw_key}")
+
+  defp operator_ctx do
+    tenant = fixture(:tenant, %{trust_tier: :human_anchored})
+    {operator_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+    project = fixture(:project, %{tenant_id: tenant.id})
+    %{tenant: tenant, operator_key: operator_key, project: project}
+  end
+
+  defp create_params(ctx, repo \\ "mkreyman/home_care_billing"),
+    do: %{"repo_full_name" => repo, "project_id" => ctx.project.id}
+
+  describe "POST /api/v1/intake/sources" do
+    test "creates a source and returns its secret once", %{conn: conn} do
+      ctx = operator_ctx()
+
+      body =
+        conn
+        |> auth(ctx.operator_key)
+        |> post(~p"/api/v1/intake/sources", create_params(ctx))
+        |> json_response(201)
+
+      assert body["source"]["repo_full_name"] == "mkreyman/home_care_billing"
+      assert body["source"]["project_id"] == ctx.project.id
+      assert body["webhook_path"] == "/api/v1/intake/github/#{body["source"]["id"]}"
+      assert body["webhook_secret"] =~ ~r/\A[0-9a-f]{64}\z/
+      refute Map.has_key?(body["source"], "webhook_secret")
+
+      # The returned secret is the one deliveries are verified with.
+      {:ok, source} = Intake.get_source(ctx.tenant.id, body["source"]["id"])
+
+      assert Signature.valid?(
+               source.webhook_secret,
+               "x",
+               Signature.header(body["webhook_secret"], "x")
+             )
+
+      assert [%Entry{action: "intake_source_created"}] =
+               AdminRepo.all(
+                 from e in Entry,
+                   where: e.tenant_id == ^ctx.tenant.id and e.entity_id == ^source.id
+               )
+    end
+
+    test "the secret is encrypted at rest", %{conn: conn} do
+      ctx = operator_ctx()
+
+      %{"source" => %{"id" => id}, "webhook_secret" => secret} =
+        conn
+        |> auth(ctx.operator_key)
+        |> post(~p"/api/v1/intake/sources", create_params(ctx))
+        |> json_response(201)
+
+      {:ok, uuid} = Ecto.UUID.dump(id)
+
+      %{rows: [[stored]]} =
+        AdminRepo.query!("SELECT webhook_secret FROM intake_sources WHERE id = $1", [uuid])
+
+      refute stored =~ secret
+    end
+
+    test "the secret never appears in a listing", %{conn: conn} do
+      ctx = operator_ctx()
+      authed = auth(conn, ctx.operator_key)
+      assert json_response(post(authed, ~p"/api/v1/intake/sources", create_params(ctx)), 201)
+
+      [listed] = json_response(get(authed, ~p"/api/v1/intake/sources"), 200)["sources"]
+      refute Map.has_key?(listed, "webhook_secret")
+    end
+
+    test "422 on a malformed repository, a duplicate, or an unusable project", %{conn: conn} do
+      ctx = operator_ctx()
+      authed = auth(conn, ctx.operator_key)
+      kb = fixture(:project, %{tenant_id: ctx.tenant.id, kind: :kb})
+      other_tenant_project = fixture(:project, %{})
+
+      assert json_response(
+               post(authed, ~p"/api/v1/intake/sources", create_params(ctx, "no-slash")),
+               422
+             )
+
+      assert json_response(post(authed, ~p"/api/v1/intake/sources", create_params(ctx)), 201)
+
+      assert json_response(
+               post(
+                 authed,
+                 ~p"/api/v1/intake/sources",
+                 create_params(ctx, "MKREYMAN/home_care_billing")
+               ),
+               422
+             )
+
+      for project_id <- [kb.id, other_tenant_project.id, Ecto.UUID.generate(), nil] do
+        params = %{"repo_full_name" => "mkreyman/other", "project_id" => project_id}
+        assert json_response(post(authed, ~p"/api/v1/intake/sources", params), 422)
+      end
+    end
+
+    test "403 for orchestrator and agent keys", %{conn: conn} do
+      ctx = operator_ctx()
+
+      for role <- [:orchestrator, :agent] do
+        {raw, _} = fixture(:api_key, %{tenant_id: ctx.tenant.id, role: role})
+
+        assert conn
+               |> auth(raw)
+               |> post(~p"/api/v1/intake/sources", create_params(ctx))
+               |> json_response(403)
+      end
+
+      assert Intake.list_sources(ctx.tenant.id) == []
+    end
+
+    test "403 custody_tier_required for an agent-rooted tenant, on create and revoke",
+         %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {raw, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {_secret, source} = fixture(:intake_source, %{tenant_id: tenant.id, project_id: project.id})
+      authed = auth(conn, raw)
+
+      params = %{"repo_full_name" => "mkreyman/other", "project_id" => project.id}
+
+      for resp <- [
+            post(authed, ~p"/api/v1/intake/sources", params),
+            delete(authed, ~p"/api/v1/intake/sources/#{source.id}")
+          ] do
+        assert json_response(resp, 403)["error"]["code"] == "custody_tier_required"
+      end
+
+      assert [_still_active] = Intake.list_sources(tenant.id)
+      assert json_response(get(authed, ~p"/api/v1/intake/sources"), 200)
+    end
+
+    test "403 api_key_mint_forbidden for a dispatch-minted key", %{conn: conn} do
+      ctx = operator_ctx()
+      agent = fixture(:agent, %{tenant_id: ctx.tenant.id, agent_type: :orchestrator})
+
+      %{"api_key" => %{"raw_key" => dispatched_key}} =
+        build_conn()
+        |> auth(ctx.operator_key)
+        |> post(~p"/api/v1/dispatches", %{"role" => "user", "agent_id" => agent.id})
+        |> json_response(201)
+        |> Map.fetch!("data")
+
+      body =
+        conn
+        |> auth(dispatched_key)
+        |> post(~p"/api/v1/intake/sources", create_params(ctx))
+        |> json_response(403)
+
+      assert body["error"]["code"] == "api_key_mint_forbidden"
+      assert Intake.list_sources(ctx.tenant.id) == []
+    end
+  end
+
+  describe "GET /api/v1/intake/sources" do
+    test "lists active sources, and revoked ones on request", %{conn: conn} do
+      ctx = operator_ctx()
+
+      {_s, active} =
+        fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      {_s, gone} =
+        fixture(:intake_source, %{
+          tenant_id: ctx.tenant.id,
+          project_id: ctx.project.id,
+          repo_full_name: "mkreyman/gone"
+        })
+
+      {:ok, _} = Intake.revoke_source(ctx.tenant.id, gone.id)
+      authed = auth(conn, ctx.operator_key)
+
+      assert [%{"id" => id}] =
+               json_response(get(authed, ~p"/api/v1/intake/sources"), 200)["sources"]
+
+      assert id == active.id
+
+      all = json_response(get(authed, ~p"/api/v1/intake/sources?include_revoked=true"), 200)
+      assert length(all["sources"]) == 2
+    end
+
+    test "never lists another tenant's sources", %{conn: conn} do
+      ctx = operator_ctx()
+      {_s, _other} = fixture(:intake_source, %{})
+
+      assert json_response(get(auth(conn, ctx.operator_key), ~p"/api/v1/intake/sources"), 200) ==
+               %{"sources" => []}
+    end
+  end
+
+  describe "DELETE /api/v1/intake/sources/:id" do
+    test "revokes the source once, idempotently, with one audit entry", %{conn: conn} do
+      ctx = operator_ctx()
+
+      {_s, source} =
+        fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      authed = auth(conn, ctx.operator_key)
+
+      first = json_response(delete(authed, ~p"/api/v1/intake/sources/#{source.id}"), 200)
+      second = json_response(delete(authed, ~p"/api/v1/intake/sources/#{source.id}"), 200)
+
+      assert first["source"]["revoked_at"]
+      assert second["source"]["revoked_at"] == first["source"]["revoked_at"]
+
+      assert [_one] =
+               AdminRepo.all(
+                 from e in Entry,
+                   where: e.tenant_id == ^ctx.tenant.id and e.action == "intake_source_revoked"
+               )
+
+      # A revoked repository can be bound again.
+      assert json_response(post(authed, ~p"/api/v1/intake/sources", create_params(ctx)), 201)
+    end
+
+    test "404 for another tenant's source, which stays active", %{conn: conn} do
+      ctx = operator_ctx()
+      {_s, other} = fixture(:intake_source, %{})
+
+      assert conn
+             |> auth(ctx.operator_key)
+             |> delete(~p"/api/v1/intake/sources/#{other.id}")
+             |> json_response(404)
+
+      assert %Source{revoked_at: nil} = AdminRepo.get!(Source, other.id)
+    end
+  end
+end
