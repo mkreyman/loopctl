@@ -54,13 +54,15 @@ until dispatches are accepted nothing ships in production.
 
 Rotating the credential is `runner_revoke({id})`, then deleting the old token file (enrollment
 refuses an existing file), then enrolling again. That returns a new `runner.id` as well as a new
-token, so update `control.runner_id` too, then restart the service. Revoking disconnects the
-live socket. A runner left on the old id is refused `forbidden_topic`, and the daemon
-exits with status 78: systemd shows the unit failed without restarting it (then
-`systemctl --user restart loopctl-runner` once the config is fixed), and on macOS the agent stays
-stopped until `rel/install.sh` or `launchctl kickstart` starts it again. The log names the refusal. A token file that cannot be read three times in a row is treated the same way, so after fixing
-it, restart the service. (A token the server merely rejects is retried indefinitely, and a
-corrected file is picked up on the next reconnect without a restart.)
+token, so update `control.runner_id` too, then start the service again. Revoking disconnects the
+live socket: loopctl first pushes `disconnecting` with `runner_revoked` (contract 1.2), and the
+daemon stops rather than reconnecting. It stops the same way on `no_longer_authorized`, on a join
+refused as no longer authorized, on a runner left on the old id (`forbidden_topic`), and on a token
+file that cannot be read three times in a row. It exits with status 78: systemd shows the unit
+failed without restarting it (then `systemctl --user restart loopctl-runner` once fixed), and on
+macOS the agent stays stopped until `rel/install.sh` or `launchctl kickstart` starts it again. The
+log names the reason. A refused websocket upgrade (HTTP 403, which carries no reason) is retried
+with a backoff, and a corrected token file is picked up on the next attempt without a restart.
 
 Until dispatch handling lands, the daemon reports `draining: true`, so the control plane never
 reserves capacity on a machine that cannot start a session.
@@ -98,7 +100,9 @@ What the log says in each failure:
 | situation | log line |
 |---|---|
 | partition, or a half-open socket | `has not answered the status push` at the next status tick, then `socket disconnected: <reason>; reconnect attempt N in Xms` 30-60s in, when Slipstream finds its previous 30s heartbeat unanswered |
-| loopctl restarted or dropped the socket | `socket disconnected: :closed` (or `:closed_by_remote`), then `joined ... after Ns out of the pool (N reconnect attempts)` |
+| loopctl restarted or dropped the socket | `loopctl is disconnecting this runner (server_shutdown); it will reconnect` when loopctl announces it, then `socket disconnected: :closed (loopctl announced server_shutdown)`, then `joined ... after Ns out of the pool (N reconnect attempts)` |
+| loopctl closed only the channel | `loopctl channel runner:<id> closed: :closed_by_loopctl; rejoining`, then `joined ...` |
+| the runner was revoked | `loopctl is disconnecting this runner (runner_revoked); stopping until it is re-enrolled`, then `stopping with exit status 78` |
 | slow link | `loopctl answered a status push after Nms; the link is slow` (5s or more), when the late reply lands |
 | no answer at all | `loopctl has not answered the status push sent Nms ago (last answered <time>)`, at each tick once the oldest unanswered push is 5s old |
 | revoked or rejected token | `upgrade refused with HTTP 403; reconnect attempt N in Xms`, retried with backoff |

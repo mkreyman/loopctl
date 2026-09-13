@@ -24,9 +24,14 @@ Environment=LOOPCTL_RUNNER_CONFIG=@CONFIG@
 Environment=ERL_CRASH_DUMP_SECONDS=0
 Environment=PATH=@PATH@
 ExecStart=@RELEASE@/bin/loopctl_runner start
-ExecStop=@RELEASE@/bin/loopctl_runner stop
+# No ExecStop: `bin/loopctl_runner stop` is an rpc, and after rel/install.sh has repointed
+# `current` it is the NEW release's cookie calling the old node, which refuses it. SIGTERM to
+# the BEAM is the stop, and KillMode=mixed below keeps it an ordered one.
 # Stopping the runner ends the sessions it supervises: they are in its cgroup.
-KillMode=control-group
+# mixed, not control-group: SIGTERM goes to the BEAM alone, which ends its sessions through
+# ProcessGroup.terminate/3; whatever is left in the cgroup after it exits gets SIGKILL.
+# control-group would TERM every session at the same moment, before the runner could.
+KillMode=mixed
 # Exit status 78 is a refusal retrying cannot fix (wrong machine, contract, topic, token
 # file): never restarted, so the unit shows failed at once instead of burning the start
 # limit, which would also refuse the operator's own restart after fixing the config.

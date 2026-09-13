@@ -147,6 +147,10 @@ defmodule LoopctlRunner.ControlConfigTest do
 
     unit = File.read!(Path.expand("../../rel/systemd/loopctl-runner.service", __DIR__))
     assert unit =~ "RestartPreventExitStatus=78"
+    # A stop rpc from the newly installed release would carry the wrong cookie; SIGTERM stops it.
+    refute unit =~ ~r/^ExecStop=/m
+    # SIGTERM to the BEAM alone, so it ends its sessions itself before anything else is killed.
+    assert unit =~ ~r/^KillMode=mixed$/m
     refute unit =~ "LOOPCTL_RUNNER_FATAL_EXIT"
   end
 

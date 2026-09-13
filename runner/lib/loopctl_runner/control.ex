@@ -48,7 +48,9 @@ defmodule LoopctlRunner.Control do
 
     * `rate_limited` — the 30-joins-per-minute budget; rejoin after a backoff.
     * `not_authorized` — revoked runner or key, or inactive tenant. loopctl also closes the
-      socket, and the reconnect path backs off.
+      socket, and the reconnect path backs off; but a refusal carrying `disconnecting:
+      "join_refused_not_authorized"` (contract 1.2) means the credential no longer works, and is
+      fatal like the reasons below.
     * `machine_mismatch`, `unsupported_contract_version`, `invalid_payload`,
       `forbidden_topic`, `unknown_topic` — this machine's configuration or build is wrong,
       and retrying cannot fix it. The client calls its `:on_fatal` hook, which by default
@@ -57,6 +59,10 @@ defmodule LoopctlRunner.Control do
       restart on 78 (`RestartPreventExitStatus`), and the launchd agent exits 0, which
       `KeepAlive` does not restart.
       Re-enrolment gives a NEW runner id, so it is a config change plus a restart.
+
+  A `disconnecting` push (contract 1.2) arrives just before loopctl closes the connection
+  itself. `runner_revoked` and `no_longer_authorized` are fatal the same way; `server_shutdown`
+  is named on the close that follows, and the runner reconnects.
 
   A refused upgrade is an HTTP 403 with an empty body and no reason; it is retried with a
   backoff capped at two minutes. The token file is re-read on every attempt: an unreadable
@@ -192,6 +198,8 @@ defmodule LoopctlRunner.Control do
             # Health.measure/2, replaceable so an unreadable metric can be exercised.
             measure: Keyword.get(opts, :measure, &Health.measure/2),
             unhandled_events: MapSet.new(),
+            # The reason loopctl gave in a `disconnecting` push, named on the close that follows.
+            announced_disconnect: nil,
             # dispatch_reply pushes awaiting their reply: ref => {payload, story_id, carried?},
             # carried? being true once the reply has outlived a channel.
             dispatch_replies: %{},
@@ -283,6 +291,8 @@ defmodule LoopctlRunner.Control do
      |> assign(
        joined: true,
        joined_at: now_iso(),
+       # An announcement belongs to the close it preceded; a join means that close is over.
+       announced_disconnect: nil,
        unjoined_since: nil,
        last_refusal: nil,
        connect_attempts: 0,
@@ -301,7 +311,24 @@ defmodule LoopctlRunner.Control do
       " (#{attempts} reconnect attempts)"
   end
 
+  # A join refused as not_authorized carries `disconnecting` in its error reply (contract 1.2):
+  # the credential no longer works, so reconnecting cannot help until the runner is re-enrolled.
   @impl Slipstream
+  def handle_topic_close(
+        topic,
+        {:failed_to_join, %{"disconnecting" => "join_refused_not_authorized"} = response},
+        socket
+      ) do
+    Logger.error(
+      "loopctl refused #{topic}: the runner credential is no longer authorized: #{inspect(response)}"
+    )
+
+    fatal(
+      assign(socket, last_refusal: "not_authorized"),
+      {:join_refused, "not_authorized", response}
+    )
+  end
+
   def handle_topic_close(topic, {:failed_to_join, %{"reason" => reason} = response}, socket)
       when reason in @fatal_reasons do
     Logger.error("loopctl refused #{topic} (#{reason}): #{inspect(response)}")
@@ -330,15 +357,27 @@ defmodule LoopctlRunner.Control do
     end
   end
 
+  # loopctl closing the channel on its own (phx_close) reaches Slipstream as a leave, whose
+  # default callback does nothing: the runner would stay out of the pool, believing itself
+  # joined, and never rejoin. This client never leaves its topic, so every leave is loopctl's.
+  @impl Slipstream
+  def handle_leave(topic, socket), do: handle_topic_close(topic, :closed_by_loopctl, socket)
+
   defp refusal({:failed_to_join, %{"reason" => reason}}), do: reason
   defp refusal(_), do: nil
 
   @impl Slipstream
   def handle_disconnect(reason, socket) do
+    announced =
+      if socket.assigns.announced_disconnect,
+        do: " (loopctl announced #{socket.assigns.announced_disconnect})",
+        else: ""
+
     socket =
       socket
       |> cancel_status()
-      |> mark_unjoined(describe_disconnect(reason))
+      |> mark_unjoined(describe_disconnect(reason) <> announced)
+      |> assign(announced_disconnect: nil)
       |> schedule_reconnect()
 
     Logger.warning(
@@ -404,11 +443,20 @@ defmodule LoopctlRunner.Control do
 
     case build_status(a.config, a.draining, a.accepts_dispatches, measured) do
       {:ok, payload} ->
-        {:ok, ref} = push(socket, a.topic, "status", payload)
-        # Every push is tracked until its own reply lands: tracking only one would leave a late
-        # reply matching nothing, or a push sent meanwhile unwatched once the first settles.
-        pushes = socket.assigns.status_pushes ++ [{ref, now_ms()}]
-        {:noreply, socket |> assign(status_pushes: pushes) |> schedule_status()}
+        case push(socket, a.topic, "status", payload) do
+          {:ok, ref} ->
+            # Every push is tracked until its own reply lands: tracking only one would leave a
+            # late reply matching nothing, or a push sent meanwhile unwatched once the first
+            # settles.
+            pushes = socket.assigns.status_pushes ++ [{ref, now_ms()}]
+            {:noreply, socket |> assign(status_pushes: pushes) |> schedule_status()}
+
+          # loopctl closed the channel and the close is still on its way to handle_topic_close:
+          # the rejoin that follows sends a fresh status, so this tick is simply skipped.
+          {:error, reason} ->
+            Logger.info("status not sent: #{inspect(reason)}; the channel is rejoining")
+            {:noreply, schedule_status(socket)}
+        end
 
       {:error, errors} ->
         fatal(socket, {:invalid_status_payload, errors})
@@ -699,6 +747,33 @@ defmodule LoopctlRunner.Control do
     # The identifiers belong to this dispatch's lines only.
     Logger.metadata(Enum.map(dispatch_metadata(payload), fn {key, _} -> {key, nil} end))
     {:ok, socket}
+  end
+
+  # loopctl is about to close the connection itself (contract 1.2). A revoked or no longer
+  # authorized credential stops the runner, as a refusal retrying cannot fix does; a server
+  # shutdown is only named, and the reconnect path brings the runner back.
+  @stop_reasons ~w(runner_revoked no_longer_authorized)
+
+  def handle_message(_topic, "disconnecting", payload, socket) do
+    case {Contract.validate("RunnerDisconnecting", payload), payload} do
+      {:ok, %{"reason" => reason}} when reason in @stop_reasons ->
+        Logger.error(
+          "loopctl is disconnecting this runner (#{reason}); stopping until it is re-enrolled"
+        )
+
+        fatal(assign(socket, last_refusal: reason), {:disconnecting, reason})
+
+      {:ok, %{"reason" => reason}} ->
+        Logger.info("loopctl is disconnecting this runner (#{reason}); it will reconnect")
+        {:ok, assign(socket, announced_disconnect: reason)}
+
+      {{:error, errors}, _} ->
+        Logger.warning(
+          "malformed disconnecting push, the reconnect path will handle the close: #{inspect(errors)}"
+        )
+
+        {:ok, socket}
+    end
   end
 
   # Contract minor versions add optional fields and events; unknown ones are ignored, but

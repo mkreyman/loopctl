@@ -142,11 +142,12 @@ defmodule LoopctlRunner.TestLoopctl do
           {:error, %{reason: "invalid_payload"}}
 
         true ->
+          TestLoopctl.put(:channel_pid, self())
           scripted_reply(TestLoopctl.next_join_reply(), socket)
       end
     end
 
-    defp scripted_reply(:ok, socket), do: {:ok, %{contract_version: "1.1.0"}, socket}
+    defp scripted_reply(:ok, socket), do: {:ok, %{contract_version: "1.2.0"}, socket}
 
     # What loopctl does on not_authorized: refuse, then close the socket.
     defp scripted_reply(:not_authorized_disconnect, _socket) do
@@ -164,6 +165,10 @@ defmodule LoopctlRunner.TestLoopctl do
     end
 
     defp scripted_reply({:error, reply}, _socket), do: {:error, reply}
+
+    # What loopctl 1.2 does when a join is refused because the credential no longer works.
+    defp scripted_reply(:not_authorized_disconnecting, _socket),
+      do: {:error, %{reason: "not_authorized", disconnecting: "join_refused_not_authorized"}}
 
     # loopctl's 1s floor between status updates, measured on the monotonic clock.
     @impl true
@@ -315,7 +320,10 @@ defmodule LoopctlRunner.TestLoopctl do
       end
     end
 
+    # The channel closing on the server while the socket stays up.
     @impl true
+    def handle_info(:close_channel, socket), do: {:stop, {:shutdown, :closed}, socket}
+
     def handle_info({:push, event, payload}, socket) do
       push(socket, event, payload)
       {:noreply, socket}

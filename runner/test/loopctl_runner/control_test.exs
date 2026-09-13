@@ -51,7 +51,7 @@ defmodule LoopctlRunner.ControlTest do
     assert_receive {:test_loopctl, {:join, ^runner_id, join}}, 5_000
     assert Contract.validate("RunnerJoin", join) == :ok
     assert join["machine"] == "testbox"
-    assert join["contract_version"] == "1.1.0"
+    assert join["contract_version"] == "1.2.0"
     assert join["repos"] == ["mkreyman/home_care_billing"]
     assert %{"sampled_at" => _, "free_disk_mb" => _} = join["sample"]
 
@@ -71,6 +71,104 @@ defmodule LoopctlRunner.ControlTest do
 
     assert_receive {:test_loopctl, {:join, _, _}}
     refute_receive {:test_loopctl, {:join, _, _}}, 3_000
+  end
+
+  describe "loopctl announcing a disconnect (contract 1.2)" do
+    test "a revoked runner stops instead of reconnecting", ctx do
+      {pid, ref} = start_control(ctx.config)
+      :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+
+      topic = "runner:" <> TestLoopctl.get(:runner_id)
+      TestLoopctl.Endpoint.broadcast(topic, "disconnecting", %{"reason" => "runner_revoked"})
+
+      assert_receive {:fatal, {:disconnecting, "runner_revoked"}}, 3_000
+
+      assert_receive {:DOWN, ^ref, :process, ^pid,
+                      {:shutdown, {:disconnecting, "runner_revoked"}}},
+                     2_000
+    end
+
+    test "a server shutdown is named on the close and the runner reconnects", ctx do
+      Logger.configure(level: :info)
+      on_exit(fn -> Logger.configure(level: :warning) end)
+
+      log =
+        capture_log(fn ->
+          {pid, _ref} = start_control(ctx.config)
+          :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+
+          topic = "runner:" <> TestLoopctl.get(:runner_id)
+          TestLoopctl.Endpoint.broadcast(topic, "disconnecting", %{"reason" => "server_shutdown"})
+          Process.sleep(100)
+          TestLoopctl.disconnect_runner()
+
+          :ok = wait_until(fn -> not Control.info(pid).joined end, 3_000)
+          assert Control.info(pid).last_disconnect =~ "(loopctl announced server_shutdown)"
+          :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+          refute_received {:fatal, _}
+        end)
+
+      assert log =~ "loopctl is disconnecting this runner (server_shutdown); it will reconnect"
+    end
+
+    test "an announcement is not carried onto a later, unrelated disconnect", ctx do
+      {pid, _ref} = start_control(ctx.config)
+      :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+      topic = "runner:" <> TestLoopctl.get(:runner_id)
+
+      TestLoopctl.Endpoint.broadcast(topic, "disconnecting", %{"reason" => "server_shutdown"})
+      Process.sleep(100)
+      TestLoopctl.disconnect_runner()
+      :ok = wait_until(fn -> not Control.info(pid).joined end, 3_000)
+      :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+
+      # The announced shutdown and its close are over; the next drop is not announced.
+      TestLoopctl.disconnect_runner()
+      :ok = wait_until(fn -> not Control.info(pid).joined end, 3_000)
+      refute Control.info(pid).last_disconnect =~ "announced"
+    end
+
+    test "an announcement whose close never came is cleared by the next join", ctx do
+      {pid, _ref} = start_control(ctx.config)
+      :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+      topic = "runner:" <> TestLoopctl.get(:runner_id)
+
+      TestLoopctl.Endpoint.broadcast(topic, "disconnecting", %{"reason" => "server_shutdown"})
+      Process.sleep(100)
+      # Only the channel closes, and the rejoin on the same socket succeeds.
+      channel = TestLoopctl.get(:channel_pid)
+      send(channel, :close_channel)
+      :ok = wait_until(fn -> TestLoopctl.get(:channel_pid) != channel end, 8_000)
+      :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+
+      TestLoopctl.disconnect_runner()
+      :ok = wait_until(fn -> not Control.info(pid).joined end, 3_000)
+      refute Control.info(pid).last_disconnect =~ "announced"
+    end
+
+    test "a channel loopctl closes on its own is rejoined, not left for dead", ctx do
+      {pid, _ref} = start_control(ctx.config)
+      assert_receive {:test_loopctl, {:join, _, _}}, 5_000
+      :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+
+      send(TestLoopctl.get(:channel_pid), :close_channel)
+
+      assert_receive {:test_loopctl, {:join, _, _}}, 8_000
+      :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+      assert Control.info(pid).last_disconnect =~ "closed_by_loopctl"
+      assert Process.alive?(pid)
+    end
+
+    test "a join refused as no longer authorized stops the runner", ctx do
+      TestLoopctl.script_joins([:not_authorized_disconnecting])
+      {pid, ref} = start_control(ctx.config)
+
+      assert_receive {:fatal, {:join_refused, "not_authorized", _}}, 5_000
+
+      assert_receive {:DOWN, ^ref, :process, ^pid,
+                      {:shutdown, {:join_refused, "not_authorized", _}}},
+                     2_000
+    end
   end
 
   test "a rate-limited join is retried after a backoff", ctx do

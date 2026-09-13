@@ -1,7 +1,7 @@
 defmodule LoopctlRunner.Contract do
   @moduledoc """
   The loopctl runner wire contract, vendored from mkreyman/loopctl
-  `priv/runner_contract/v1.json` (JSON Schema 2020-12, `x-contract-version` 1.1.0).
+  `priv/runner_contract/v1.json` (JSON Schema 2020-12, `x-contract-version` 1.2.0).
 
   The file is copied, never re-typed: the server casts every payload against the same
   document, drops unknown fields at every depth, and refuses a mismatched major version.
