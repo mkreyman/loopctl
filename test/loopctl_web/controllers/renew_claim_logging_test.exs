@@ -10,6 +10,7 @@ defmodule LoopctlWeb.RenewClaimLoggingTest do
 
   use LoopctlWeb.ConnCase, async: false
 
+  import Ecto.Query
   import ExUnit.CaptureLog
 
   setup :verify_on_exit!
@@ -93,5 +94,38 @@ defmodule LoopctlWeb.RenewClaimLoggingTest do
     assert log =~ "story_id=:invalid"
     assert log =~ "current_epoch=nil"
     refute log =~ "STORYVALUE"
+  end
+
+  test "a 16-byte story id is :invalid, not a fabricated UUID, and no epoch is read for it", %{
+    conn: conn
+  } do
+    tenant = fixture(:tenant)
+    agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+    {raw_key, _key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})
+    segment = "aaaaaaaaaaaaaaaa"
+    # What Ecto.UUID.cast/1 makes of those 16 bytes. A story at exactly that id, with an
+    # epoch, shows whether the refusal path read one for the fabricated id.
+    {:ok, fabricated} = Ecto.UUID.cast(segment)
+    story = fixture(:story, %{tenant_id: tenant.id})
+
+    {1, _} =
+      Loopctl.AdminRepo.update_all(
+        from(s in Loopctl.WorkBreakdown.Story, where: s.id == ^story.id),
+        set: [id: fabricated, claim_epoch: 5]
+      )
+
+    log =
+      capture_log([level: :info], fn ->
+        conn
+        |> put_req_header("authorization", "Bearer #{raw_key}")
+        |> post("/api/v1/stories/#{segment}/renew-claim", %{"claim_epoch" => "1"})
+        |> response(400)
+      end)
+
+    assert log =~ "renew_claim refused"
+    assert log =~ "story_id=:invalid"
+    assert log =~ "current_epoch=nil"
+    refute log =~ fabricated
+    refute log =~ segment
   end
 end

@@ -34,7 +34,8 @@ All notable changes to loopctl are documented here.
   **Logs and metrics.** Production JSON logs now keep `runner_id`, `runner_name`, `story_id`,
   `dispatch_id`, `run_id`, `claim_epoch`, `node` and `machine` metadata. New log lines:
   runner channel close (reason, identity, node, machine, connected duration), every refused
-  runner message and join except `rate_limited`, server-initiated disconnects, the runner
+  runner message and join except `rate_limited` (an unknown event's line at most once a second
+  per channel; the counter below still counts every one), server-initiated disconnects, the runner
   socket's connect refusal (now with client IP and the resolved key/runner id), refused and
   dropped dispatches, refused `renew-claim` (presented and current epoch), and each reclaimed
   or failed candidate of `ReclaimExpiredClaimsWorker`. New Prometheus counters

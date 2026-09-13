@@ -18,11 +18,16 @@ defmodule Loopctl.LogValue do
   def epoch(epoch) when is_integer(epoch) and epoch >= 0 and epoch <= @max_bigint, do: epoch
   def epoch(_value), do: :invalid
 
-  @doc "A UUID, normalized as `Ecto.UUID.cast/1` does, else `:invalid`."
+  @doc """
+  A UUID in its 36-character hyphenated text form, normalized to lowercase, else `:invalid`.
+
+  Only the text form: `Ecto.UUID.cast/1` alone also accepts any 16-byte binary as a RAW UUID
+  and hex-encodes it, which would log `"aaaaaaaaaaaaaaaa"` as a fabricated id.
+  """
   @spec uuid(term()) :: Ecto.UUID.t() | nil | :invalid
   def uuid(nil), do: nil
 
-  def uuid(value) when is_binary(value) do
+  def uuid(value) when is_binary(value) and byte_size(value) == 36 do
     case Ecto.UUID.cast(value) do
       {:ok, uuid} -> uuid
       :error -> :invalid

@@ -62,9 +62,10 @@ defmodule LoopctlWeb.RunnerChannel do
   - The channel process carries `runner_id`, `runner_name`, `tenant_id`, `node` and
     `machine` as Logger metadata from join, and each message's `dispatch_id`, `run_id`,
     `claim_epoch` (and a dispatch's `story_id`) while it is handled.
-  - Every refusal — of a join or a message, `rate_limited` included — emits
-    `[:loopctl, :runners, :message_refused]`; every refusal except `rate_limited` is also
-    logged with its reason.
+  - Every refusal — of a join or a message, `rate_limited` and every unknown event included —
+    emits `[:loopctl, :runners, :message_refused]`. Every refusal except `rate_limited` is
+    also logged with its reason, except that an unknown event's log line is written at most
+    once per second per channel.
   - `terminate/2` logs why the channel closed, where it ran and for how long.
   - Before closing a runner's connection itself, the channel pushes `"disconnecting"` with
     the reason (`RunnerContract.RunnerDisconnecting`) and logs the same reason. A stopping
@@ -93,9 +94,9 @@ defmodule LoopctlWeb.RunnerChannel do
   @reply_refill_ms RunnerContract.dispatch_reply_burst() |> Map.fetch!("refill_interval_ms")
   @min_trace_interval_ms RunnerContract.min_interval_ms("trace")
   @min_cursor_interval_ms RunnerContract.min_interval_ms("trace_cursor")
-  # How often an unknown event is REPORTED (telemetry and a log line). It is answered
-  # `unknown_event` every time; this bounds only what loopctl writes about it.
-  @unknown_report_interval_ms 1_000
+  # How often an unknown event is LOGGED. It is answered `unknown_event` and counted in
+  # telemetry every time; this bounds only the log lines.
+  @unknown_log_interval_ms 1_000
   @join_window_ms 60_000
   @max_joins 30
 
@@ -313,19 +314,20 @@ defmodule LoopctlWeb.RunnerChannel do
 
   # An unknown event's name is the runner's own string: it is never a telemetry tag.
   # Every unknown event is answered `unknown_event` — never `rate_limited`, which would tell
-  # a newer runner its event exists and to retry it. What the interval bounds is the
-  # REPORTING: at most one telemetry event and one log line per interval, so a runner looping
-  # over made-up names cannot buy a log line per frame. The reply is still sent every time.
+  # a newer runner its event exists and to retry it — and counted in telemetry (its tag is
+  # the fixed "unknown"). What the interval bounds is the LOG: at most one line per interval,
+  # so a runner looping over made-up names cannot buy a log line per frame.
   defp handle_message(_event, _payload, socket) do
     now = System.monotonic_time(:millisecond)
 
-    case MinInterval.check(socket.assigns.last_unknown_at, now, @unknown_report_interval_ms) do
-      :ok ->
-        refuse(assign(socket, :last_unknown_at, now), "unknown", %{reason: "unknown_event"})
+    {socket, log?} =
+      case MinInterval.check(socket.assigns.last_unknown_at, now, @unknown_log_interval_ms) do
+        :ok -> {assign(socket, :last_unknown_at, now), true}
+        {:error, :rate_limited} -> {socket, false}
+      end
 
-      {:error, :rate_limited} ->
-        {:reply, {:error, %{reason: "unknown_event"}}, socket}
-    end
+    report_refusal(socket, "unknown", "unknown_event", log?)
+    {:reply, {:error, %{reason: "unknown_event"}}, socket}
   end
 
   @impl true
@@ -371,7 +373,7 @@ defmodule LoopctlWeb.RunnerChannel do
     reply
   end
 
-  defp report_refusal(socket, event, reason) do
+  defp report_refusal(socket, event, reason, log? \\ true) do
     metadata = Logger.metadata()
 
     :telemetry.execute([:loopctl, :runners, :message_refused], %{count: 1}, %{
@@ -383,7 +385,7 @@ defmodule LoopctlWeb.RunnerChannel do
       run_id: metadata[:run_id]
     })
 
-    if reason != "rate_limited" do
+    if log? and reason != "rate_limited" do
       Logger.info(
         "runner message refused: event=#{event} reason=#{reason} " <>
           "dispatch_id=#{inspect(metadata[:dispatch_id])} run_id=#{inspect(metadata[:run_id])}"

@@ -334,28 +334,34 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
       assert_received {:refused, _, %{event: "unknown", reason: "unknown_event"}}
     end
 
-    test "every unknown event is answered unknown_event; inside the interval it is not reported again" do
+    test "ten unknown events in one interval: ten unknown_event replies, ten telemetry events, one log line" do
       attach_refusals()
       %{channel: channel} = joined_runner()
 
       log =
         capture_log([level: :info], fn ->
-          ref = push(channel, "made-up-one", %{})
+          ref = push(channel, "made-up-1", %{})
           assert_reply ref, :error, %{reason: "unknown_event"}, @reply_timeout
 
-          # Pinned, so the refusal does not depend on how long the first reply took.
+          # Pinned, so the other nine land inside the interval however long the first took.
           :sys.replace_state(channel.channel_pid, fn socket ->
             at = System.monotonic_time(:millisecond) + 60_000
             %{socket | assigns: Map.put(socket.assigns, :last_unknown_at, at)}
           end)
 
-          ref = push(channel, "made-up-two", %{})
-          assert_reply ref, :error, reply, @reply_timeout
-          assert reply == %{reason: "unknown_event"}
+          for n <- 2..10 do
+            ref = push(channel, "made-up-#{n}", %{})
+            assert_reply ref, :error, reply, @reply_timeout
+            assert reply == %{reason: "unknown_event"}
+          end
         end)
 
       assert "unknown_event" in RunnerContract.error_reasons()["unknown_event"]
-      assert_received {:refused, _, %{event: "unknown", reason: "unknown_event"}}
+
+      for _ <- 1..10 do
+        assert_received {:refused, _, %{event: "unknown", reason: "unknown_event"}}
+      end
+
       refute_received {:refused, _, _}
       assert length(String.split(log, "reason=unknown_event")) == 2
     end

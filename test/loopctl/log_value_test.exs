@@ -37,7 +37,18 @@ defmodule Loopctl.LogValueTest do
     end
 
     test "anything else is :invalid, never the value" do
-      for value <- ["not-a-uuid", String.duplicate("x", 5_000), 1, %{"id" => "x"}, ["x"]] do
+      raw = Ecto.UUID.generate() |> Ecto.UUID.dump!()
+
+      # A 16-byte string is a RAW UUID to Ecto.UUID.cast/1; here it is not an id at all.
+      for value <- [
+            "aaaaaaaaaaaaaaaa",
+            raw,
+            "not-a-uuid",
+            String.duplicate("x", 5_000),
+            1,
+            %{"id" => "x"},
+            ["x"]
+          ] do
         assert LogValue.uuid(value) == :invalid, inspect(value, limit: 3)
       end
     end
