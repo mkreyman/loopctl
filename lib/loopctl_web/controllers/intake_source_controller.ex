@@ -1,0 +1,165 @@
+defmodule LoopctlWeb.IntakeSourceController do
+  @moduledoc """
+  Create, list and revoke the GitHub intake sources of the agent delivery loop (issue #803).
+
+  All actions require `user` role, and the writes require a human-anchored tenant
+  (`RequireHumanAnchor`, surface `:issue_intake`): an intake source admits outside text into
+  the work queue of a project whose stories an implementer will act on, so an agent-rooted
+  tenant may not open one for itself.
+
+  Creating a source MINTS a credential — the webhook secret, which belongs to no dispatch
+  lineage — so it carries the same lineage ceiling as `POST /api/v1/api_keys`: a caller whose
+  own key a dispatch minted is refused with `403 api_key_mint_forbidden`
+  (`LoopctlWeb.Plugs.RequireUnlineagedCaller`).
+  """
+
+  use LoopctlWeb, :controller
+  use OpenApiSpex.ControllerSpecs
+
+  alias Loopctl.ApiSpec.Schemas
+  alias Loopctl.Dispatches
+  alias Loopctl.Intake
+  alias Loopctl.Intake.Source
+  alias OpenApiSpex.Schema
+
+  action_fallback LoopctlWeb.FallbackController
+
+  plug LoopctlWeb.Plugs.RequireRole, role: :user
+  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:create, :delete]
+  plug LoopctlWeb.Plugs.RequireUnlineagedCaller when action in [:create]
+
+  tags(["Intake"])
+
+  @source_schema %Schema{
+    type: :object,
+    required: [:id, :project_id, :repo_full_name, :revoked_at, :inserted_at],
+    properties: %{
+      id: %Schema{type: :string, format: :uuid},
+      project_id: %Schema{type: :string, format: :uuid},
+      repo_full_name: %Schema{type: :string, pattern: Source.repo_format().source},
+      revoked_at: %Schema{type: :string, format: :"date-time", nullable: true},
+      inserted_at: %Schema{type: :string, format: :"date-time"},
+      updated_at: %Schema{type: :string, format: :"date-time"}
+    }
+  }
+
+  operation(:create,
+    summary: "Create a GitHub intake source",
+    description:
+      "Binds one GitHub repository to one ACTIVE WORK project and returns its webhook secret " <>
+        "ONCE, as `webhook_secret`, with the path to configure as the webhook URL, " <>
+        "`webhook_path`. Configure the repository webhook with that URL on this host, " <>
+        "content type `application/json`, the secret, and the `Issues` event. Issue text " <>
+        "arriving there is stored only as untrusted data and never becomes a story. Requires " <>
+        "user role and a human-anchored tenant; a caller whose key was minted by a dispatch " <>
+        "is refused with 403 `api_key_mint_forbidden`. 422 when the repository is not " <>
+        "`owner/name`, an active source already binds it, or the project is missing, not a " <>
+        "work project, or archived. The secret is encrypted at rest.",
+    request_body:
+      {"Intake source", "application/json",
+       %Schema{
+         type: :object,
+         required: [:repo_full_name, :project_id],
+         properties: %{
+           repo_full_name: %Schema{
+             type: :string,
+             pattern: Source.repo_format().source,
+             description: "The repository, e.g. `mkreyman/home_care_billing`."
+           },
+           project_id: %Schema{type: :string, format: :uuid}
+         }
+       }},
+    responses: %{
+      201 =>
+        {"Intake source created", "application/json",
+         %Schema{
+           type: :object,
+           required: [:source, :webhook_secret, :webhook_path],
+           properties: %{
+             source: @source_schema,
+             webhook_secret: %Schema{type: :string, description: "The HMAC secret. Shown once."},
+             webhook_path: %Schema{type: :string, description: "/api/v1/intake/github/<id>"}
+           }
+         }},
+      403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  operation(:index,
+    summary: "List GitHub intake sources",
+    description:
+      "Lists the tenant's intake sources. The secret is never returned here. Pass " <>
+        "`include_revoked=true` for revoked sources too.",
+    parameters: [
+      include_revoked: [in: :query, type: :boolean, description: "Include revoked sources"]
+    ],
+    responses: %{
+      200 =>
+        {"Intake sources", "application/json",
+         %Schema{
+           type: :object,
+           properties: %{sources: %Schema{type: :array, items: @source_schema}}
+         }},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  operation(:delete,
+    summary: "Revoke a GitHub intake source",
+    description:
+      "Revokes the source. Every later delivery to its webhook URL is refused with 401 " <>
+        "`invalid_signature`, exactly like a wrong secret. Records already received are kept. " <>
+        "Idempotent. Requires user role and a human-anchored tenant.",
+    parameters: [id: [in: :path, type: :string, description: "Intake source UUID"]],
+    responses: %{
+      200 =>
+        {"Intake source revoked", "application/json",
+         %Schema{type: :object, properties: %{source: @source_schema}}},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  @doc "POST /api/v1/intake/sources"
+  def create(conn, params) do
+    tenant = conn.assigns.current_tenant
+
+    attrs = %{repo_full_name: params["repo_full_name"], project_id: params["project_id"]}
+
+    with {:ok, %{source: source, webhook_secret: secret}} <-
+           Intake.create_source(tenant.id, attrs, actor_lineage: actor_lineage(conn)) do
+      conn
+      |> put_status(:created)
+      |> json(%{
+        source: source,
+        webhook_secret: secret,
+        webhook_path: "/api/v1/intake/github/#{source.id}"
+      })
+    end
+  end
+
+  @doc "GET /api/v1/intake/sources"
+  def index(conn, params) do
+    tenant = conn.assigns.current_tenant
+    include_revoked = params["include_revoked"] == "true"
+
+    json(conn, %{sources: Intake.list_sources(tenant.id, include_revoked: include_revoked)})
+  end
+
+  @doc "DELETE /api/v1/intake/sources/:id"
+  def delete(conn, %{"id" => source_id}) do
+    tenant = conn.assigns.current_tenant
+
+    with {:ok, source} <-
+           Intake.revoke_source(tenant.id, source_id, actor_lineage: actor_lineage(conn)) do
+      json(conn, %{source: source})
+    end
+  end
+
+  defp actor_lineage(conn) do
+    api_key = conn.assigns.current_api_key
+    Dispatches.lineage_for_api_key(api_key.tenant_id, api_key.id)
+  end
+end

@@ -158,6 +158,20 @@ defmodule LoopctlWeb.Router do
     get "/audit/sth/:tenant_id/inclusion/:position", AuditSthController, :inclusion
   end
 
+  # Issue #803 — the GitHub intake webhook. Authenticated by an HMAC over the raw body
+  # (captured ahead of Plug.Parsers by LoopctlWeb.Plugs.IntakeRawBody), not by API key, so
+  # it cannot sit on `:authenticated`; its own pipeline carries the per-IP throttle the
+  # `:api` pipeline lacks.
+  pipeline :github_intake do
+    plug LoopctlWeb.Plugs.GithubIntakeThrottle
+  end
+
+  scope "/api/v1", LoopctlWeb do
+    pipe_through [:api, :github_intake]
+
+    post "/intake/github/:source_id", GithubIntakeController, :deliver
+  end
+
   scope "/swaggerui" do
     get "/", OpenApiSpex.Plug.SwaggerUI, path: "/api/v1/openapi"
   end
@@ -331,6 +345,9 @@ defmodule LoopctlWeb.Router do
 
     # Issue #801 — runner enrollment for the agent delivery loop
     resources "/runners", RunnerController, only: [:create, :index, :delete]
+
+    # Issue #803 — GitHub intake sources for the agent delivery loop
+    resources "/intake/sources", IntakeSourceController, only: [:create, :index, :delete]
 
     # Audit log
     get "/audit", AuditController, :index
