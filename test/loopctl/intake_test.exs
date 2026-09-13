@@ -20,6 +20,25 @@ defmodule Loopctl.IntakeTest do
     })
   end
 
+  describe "wrapped context values" do
+    test "a benign ticket whose Page and Browser values are code spans is not escalated" do
+      {secret, source} = fixture(:intake_source, %{})
+      samsung = build(:intake_real_user_agents)["browsers"]["samsung_internet_android"]
+
+      body =
+        build(:intake_benign_ticket_body)
+        |> String.replace(~r/- \*\*Page\*\*: (.*)/, "- **Page**: `\\1`")
+        |> String.replace(~r/- \*\*Browser\*\*: .*/, "- **Browser**: `#{samsung}`")
+        |> String.replace(~r/- \*\*Tenant\*\*: (.*)/, "- **Tenant**: `\\1`")
+
+      assert body =~ "- **Browser**: `Mozilla/5.0 (Linux; Android 14; SAMSUNG"
+      assert {:ok, :recorded} = receive_issue(secret, source, %{body: body})
+
+      assert [%{status: :pending_triage, escalation_reasons: []}] =
+               Intake.list_records(source.tenant_id)
+    end
+  end
+
   describe "tenant isolation" do
     test "tenant B cannot read, list or revoke tenant A's sources and records" do
       {secret_a, source_a} = fixture(:intake_source, %{})

@@ -825,6 +825,26 @@ defmodule Loopctl.Fixtures do
     "test/support/intake_fixtures/hostile_samples.json" |> File.read!() |> Jason.decode!()
   end
 
+  # Recorded real user agents (#804): `"browsers"`, which must fire nothing and carry at most
+  # one instruction word, and `"non_browser_clients"`, which are out of the tripwire's domain
+  # and only asserted not to crash (asserted in injection_detector_test.exs).
+  def build(:intake_real_user_agents, _attrs) do
+    "test/support/intake_fixtures/real_user_agents.json" |> File.read!() |> Jason.decode!()
+  end
+
+  # The Google Play supported devices list (#804), as `[retail_branding, marketing_name, device,
+  # model]` rows. Derived from Google's published supported_devices.csv (UTF-16), fetched
+  # 2026-09-13: converted to UTF-8, duplicate rows dropped, written tab-separated with its header
+  # and gzipped. No field carries a tab or a newline. Read at test time, not compile time.
+  def build(:intake_play_supported_devices, _attrs) do
+    "test/support/intake_fixtures/play_supported_devices.tsv.gz"
+    |> File.read!()
+    |> :zlib.gunzip()
+    |> String.split("\n", trim: true)
+    |> Enum.drop(1)
+    |> Enum.map(&String.split(&1, "\t"))
+  end
+
   # A benign HomeCareBilling support ticket, in the issue format its worker files.
   def build(:intake_benign_ticket_body, _attrs) do
     File.read!("test/support/intake_fixtures/benign_ticket_body.md")

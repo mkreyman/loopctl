@@ -29,7 +29,14 @@ defmodule Loopctl.Intake.TicketFacts do
   - `ticket_kind` — `bug` or `feature`, from the title's `[Bug] ` / `[Feature] ` prefix.
 
   `page_url` and `user_agent` are returned for the injection detector and never stored:
-  both are client-supplied, so they are exactly where a payload hides.
+  both are client-supplied, so they are exactly where a payload hides. Each is trimmed, and
+  unwrapped ONLY from the producer's exact formatting: one backtick pair around a value that
+  contains no backtick. Anything else is left as it arrived, so a double pair, an extra
+  leading or trailing backtick, or a backtick in the middle reaches the detector and fires
+  its backtick rule. Quotes are never stripped.
+
+  The `Tenant` line is not a fact and is not read here at all (HomeCareBilling writes the
+  tenant name in a code span). It is still part of the body the detector scans.
 
   ## The reporter can type the format
 
@@ -74,6 +81,8 @@ defmodule Loopctl.Intake.TicketFacts do
     {footer_id, footer_spoof} = single(@footer_line, body, "footer")
     {page_url, page_spoof} = single(@page_line, body, "page")
     {user_agent, browser_spoof} = single(@browser_line, body, "browser")
+    page_url = unwrap(page_url)
+    user_agent = unwrap(user_agent)
 
     {ref, ticket_id, mismatch} = reconcile(ref, footer_id)
 
@@ -100,6 +109,20 @@ defmodule Loopctl.Intake.TicketFacts do
       [[value]] -> {value, nil}
       [] -> {nil, nil}
       [_, _ | _] -> {nil, "structured_field_spoof:#{line}_line"}
+    end
+  end
+
+  # The producer's exact formatting: one backtick pair around a value with no backtick inside.
+  @producer_code_span ~r/\A`([^`]+)`\z/
+
+  defp unwrap(nil), do: nil
+
+  defp unwrap(value) do
+    trimmed = String.trim(value)
+
+    case Regex.run(@producer_code_span, trimmed, capture: :all_but_first) do
+      [inner] -> String.trim(inner)
+      nil -> trimmed
     end
   end
 

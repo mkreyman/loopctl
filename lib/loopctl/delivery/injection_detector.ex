@@ -32,11 +32,12 @@ defmodule Loopctl.Delivery.InjectionDetector do
   - `url_payload` — a `javascript:` / `data:` / `vbscript:` / `file:` URL, a URL whose
     decoded path or query matches another signal or carries a dozen words of prose, or a
     markdown image whose URL has a query string (an exfiltration beacon).
-  - `user_agent_prose` — a browser user agent that is not user-agent shaped: over 512
-    bytes, carrying another signal, more than three bare words outside its product tokens,
-    or six consecutive words inside a comment.
+  - `user_agent_prose` — a browser user agent that is over 512 bytes, carries another signal,
+    contains a backtick, or carries two or more DISTINCT instruction words (see "User-agent
+    tripwire" below).
+  - `user_agent_non_ascii` — a user agent carrying any byte outside ASCII.
 
-  Field-independent signals come from `scan/1`. `user_agent_prose` comes from
+  Field-independent signals come from `scan/1`. The two `user_agent_*` signals come from
   `scan_user_agent/2`, because only the caller knows which text is a user agent.
   `structured_field_spoof` is reported by `Loopctl.Intake.TicketFacts`.
 
@@ -46,6 +47,65 @@ defmodule Loopctl.Delivery.InjectionDetector do
   letters fold to ASCII) with hidden characters both removed and replaced by a space, so
   `ig<U+200B>nore` and `ignore<U+200B>previous` both still match. `hidden_characters` and
   `hidden_markup` run over the raw text.
+
+  ## User-agent tripwire
+
+  **Domain: BROWSER user agents.** The only producer is home_care_billing's ticket form, which
+  records the reporter's browser user agent. A non-browser client (the AWS CLI, gcloud,
+  bundler, pip, an SDK, a crawler) on a browser-form ticket is already anomalous, so it is
+  allowed to escalate: escalating it is correct, not a false positive.
+
+  **Neutralising a user agent is not this module's job.** The producer does it:
+  home_care_billing#1506 writes a user agent into the issue only when it is valid user-agent
+  token grammar of at most 512 bytes, and writes `unrecognised` otherwise. Triage then reads
+  it fenced as untrusted data (`Loopctl.Delivery.Untrusted`), and the implementer never
+  receives it at all, because its input is built from the story only
+  (`Loopctl.Delivery.ImplementerInput`).
+
+  **This module only ESCALATES, so a human sees an attempt.** A user agent escalates when it:
+
+  - carries any byte outside ASCII (`user_agent_non_ascii`);
+  - is over 512 bytes, contains a backtick, or matches a generic `scan/1` pattern
+    (`user_agent_prose`);
+  - carries two or more DISTINCT instruction words (`user_agent_prose`). The words are read
+    three ways and the readings are UNIONED: split at non-letters and at lowercase-to-uppercase
+    boundaries (`ApproveThisPull`); split at non-letters only, lowercased (`aPPROVE tHIS`); and
+    split before the last capital of an uppercase run of two or more letters that meets a
+    capitalised word (`APPROVEThisPULLRequest`). A single leading capital is never split off,
+    so `Sprint`, `HTCSprint` and `LGEmerge` read no `print` or `merge`. A word matches a
+    lexicon entry only as one of its spelled-out forms (`ignore ignores ignored ignoring`), and
+    the forms of one entry count as one word. The lexicon (`user_agent_lexicon/0`) is English
+    function words plus agent-directed imperatives and nouns, minus the words real device
+    names carry.
+
+  **It deliberately does not try to see disguised or encoded wording.** Across #814 and #819,
+  six review rounds measured user-agent-specific disguise heuristics — look-alike decoding,
+  spelled-out reassembly, token-shape and escape detection — and each round found both new
+  bypasses under a chosen encoding and new false alarms on real clients (AWS SDK `#`
+  separators, IE toolbar braces, CFNetwork `%20`, random ids). A tripwire that fires on real
+  clients and is still bypassable is worth less than a small, quiet one, so disguise is left
+  to the producer's grammar check, where it is removed rather than guessed at.
+
+  **Margin, asserted:** every device on the Google Play supported devices list
+  (`test/support/intake_fixtures/play_supported_devices.tsv.gz`), framed as an Android WebView
+  user agent and as Instagram's in-app user agent (which adds the brand and device codename),
+  fires nothing, apart from `user_agent_non_ascii` on a name carrying a byte outside ASCII.
+  Threshold two is the lowest at which that holds. It holds because the lexicon leaves out the
+  words that list carries (`all`, `system`, `model`, `access`, `master`, `yes`, `for`, `with`,
+  `the`, `and`, `key`, `test` and others); the two it keeps, `cat` (Cat phones) and `now`,
+  appear there only alone. The browser user agents in
+  `test/support/intake_fixtures/real_user_agents.json` fire nothing too; its
+  `non_browser_clients` are only asserted not to crash.
+
+  **Known misses, pinned by a test that asserts they fire no user-agent signal:**
+
+  - a single instruction word (below the two-word threshold by design);
+  - a paraphrase built from words outside the lexicon;
+  - the same instruction in another language;
+  - disguised or encoded wording (neutralised at the producer, not detected here): plain-ASCII look-alike characters; spelled-out or chunked letters; uppercase look-alikes; words glued in one case; an uppercase run glued to a lowercase word; percent-escapes, HTML entities and backslash escapes.
+
+  Look-alikes from outside ASCII (Cyrillic letters, small capitals) are NOT misses: they fire
+  `user_agent_non_ascii`. Only swaps within ASCII go unseen.
 
   ## Limits, written in rather than discovered later
 
@@ -71,7 +131,8 @@ defmodule Loopctl.Delivery.InjectionDetector do
     :hidden_characters,
     :hidden_markup,
     :url_payload,
-    :user_agent_prose
+    :user_agent_prose,
+    :user_agent_non_ascii
   ]
 
   @instruction_override [
@@ -138,8 +199,147 @@ defmodule Loopctl.Delivery.InjectionDetector do
   @url_prose_words 12
 
   @max_user_agent_bytes 512
-  @ua_comment ~r/\(([^()]*)\)/u
-  @ua_product ~r/\A[A-Za-z0-9._+-]+(?:\/[A-Za-z0-9._+-]+)?\z/u
+  @ua_prose_threshold 2
+  @ua_not_letter ~r/[^A-Za-z]+/
+  @ua_camel_boundary ~r/(?<=[a-z])(?=[A-Z])/
+  # An uppercase run of two or more letters meets a capitalised word: `APPROVEThis` splits before
+  # the run's last capital. A single leading capital is never split off (`Sprint` is not `S` and
+  # `print`, `HTCSprint` is not `HTCS` and `print`), so no segment is one letter.
+  @ua_upper_run_then_word ~r/(?<=[a-z])(?=[A-Z])|(?<=[A-Z]{2})(?=[A-Z][a-z])/
+  @ua_non_ascii ~r/[\x80-\xFF]/
+
+  # English function words plus the imperatives and nouns an instruction to an agent is made
+  # of. Each line is one lexicon word, then every inflection matched as that word, spelled out
+  # by hand; a user-agent word matches a form EXACTLY, and hits are counted per lexicon word,
+  # so `verify verified` is one. No two-letter word: those collide with locale tags and model
+  # codes. No form the Google Play supported devices list carries in either user-agent frame
+  # (`changing` is a brand there), except `cat` and `now`, which it carries only alone; removing
+  # those two would lose hostile samples. The recorded BROWSER user agents carry only the words pinned in
+  # injection_detector_test.exs; the non-browser clients may carry more, because a non-browser
+  # user agent on a browser-form ticket is out of domain and allowed to escalate.
+  @ua_lexicon_forms """
+                    this
+                    that
+                    these
+                    those
+                    but
+                    then
+                    than
+                    into
+                    onto
+                    without
+                    were
+                    been
+                    does
+                    did
+                    don
+                    doesn
+                    each
+                    some
+                    now
+                    here
+                    there
+                    please
+                    your yours
+                    should
+                    shall
+                    would
+                    could
+                    may
+                    might
+                    also
+                    instead
+                    before
+                    after
+                    above
+                    below
+                    previous
+                    prior
+                    earlier
+                    again
+                    never
+                    always
+                    immediately
+                    today
+                    tonight
+                    approve approves approved approving approver approval
+                    merge merges merged merging
+                    ignore ignores ignored ignoring
+                    disregard disregards disregarded disregarding
+                    forget forgets forgot forgotten forgetting
+                    instruction instructions
+                    prompt prompts prompted prompting
+                    execute executes executed executing
+                    delete deletes deleted deleting
+                    remove removes removed removing
+                    drop drops dropped dropping
+                    deploy deploys deployed deploying
+                    push pushes pushed pushing
+                    commit commits committed committing
+                    review reviews reviewed reviewing reviewer reviewers
+                    skip skips skipped skipping
+                    bypass bypasses bypassed bypassing
+                    override overrides overrode overridden overriding
+                    assistant assistants
+                    agent agents
+                    claude
+                    gpt
+                    llm
+                    pull pulls pulled pulling
+                    request requests requested requesting
+                    change changes changed
+                    fix fixes fixed fixing
+                    patch patches patched patching
+                    main
+                    prod
+                    verify verifies verified verifying
+                    admin admins
+                    root
+                    show shows showed shown showing
+                    token tokens
+                    password passwords
+                    credentials credential
+                    permission permissions
+                    rule rules
+                    policy policies
+                    operator operators
+                    ship ships shipped shipping
+                    release releases released releasing
+                    done
+                    wait waits waited waiting
+                    repo repos
+                    repository repositories
+                    branch branches
+                    hook hooks
+                    ticket tickets
+                    issue issues
+                    allow allows allowed allowing
+                    enable enables enabled enabling
+                    disable disables disabled disabling
+                    install installs installed installing installer
+                    hidden
+                    pretend pretends pretended pretending
+                    role roles
+                    respond responds responded responding
+                    reply replies replied replying
+                    answer answers answered answering
+                    write writes wrote written writing
+                    send sends sent sending
+                    upload uploads uploaded uploading
+                    download downloads downloaded downloading
+                    bash
+                    command commands
+                    sudo
+                    lgtm
+                    escalate escalates escalated escalating escalation
+                    cat
+                    curl
+                    wget
+                    """
+                    |> String.split("\n", trim: true)
+                    |> Enum.map(&String.split/1)
+
+  @ua_lexicon Enum.map(@ua_lexicon_forms, &hd/1)
 
   @doc "The signal names this module can produce."
   @spec signals() :: [atom()]
@@ -160,7 +360,7 @@ defmodule Loopctl.Delivery.InjectionDetector do
   end
 
   @doc """
-  Scans a browser user agent for prose, returning `user_agent_prose` reasons plus every
+  Scans a browser user agent, returning the `user_agent_*` reasons plus every
   field-independent signal the user agent carries.
   """
   @spec scan_user_agent(String.t(), String.t() | nil) :: [reason()]
@@ -169,8 +369,9 @@ defmodule Loopctl.Delivery.InjectionDetector do
   def scan_user_agent(field, user_agent) when is_binary(user_agent) do
     generic = scan_text(field, user_agent)
     prose = if user_agent_prose?(user_agent, generic), do: [:user_agent_prose], else: []
+    non_ascii = if user_agent_non_ascii?(user_agent), do: [:user_agent_non_ascii], else: []
 
-    (generic ++ prose) |> tag(field) |> Enum.uniq() |> Enum.sort()
+    (generic ++ prose ++ non_ascii) |> tag(field) |> Enum.uniq() |> Enum.sort()
   end
 
   defp tag(signals, field), do: Enum.map(signals, &"#{&1}:#{field}")
@@ -270,35 +471,59 @@ defmodule Loopctl.Delivery.InjectionDetector do
 
   defp user_agent_prose?(user_agent, generic_signals) do
     byte_size(user_agent) > @max_user_agent_bytes or generic_signals != [] or
-      bare_words_outside_comments?(user_agent) or sentence_in_comment?(user_agent)
+      String.contains?(user_agent, "`") or
+      length(user_agent_lexicon_hits(user_agent)) >= @ua_prose_threshold
   end
 
-  # Outside parenthesised comments a user agent is product tokens (`Chrome/128.0.0.0`),
-  # occasionally a bare one (`Mobile`). More than three bare words is prose.
-  defp bare_words_outside_comments?(user_agent) do
+  @doc "The number of distinct lexicon words at which `user_agent_prose` fires."
+  @spec user_agent_prose_threshold() :: pos_integer()
+  def user_agent_prose_threshold, do: @ua_prose_threshold
+
+  @doc "The instruction lexicon `user_agent_lexicon_hits/1` counts words from."
+  @spec user_agent_lexicon() :: [String.t()]
+  def user_agent_lexicon, do: @ua_lexicon
+
+  @doc """
+  The words of a user agent, whole string and comments included, as the UNION of three
+  readings: split at non-letters and at lowercase-to-uppercase boundaries; split at non-letters
+  only; and, on top of the first, split before the last capital of an uppercase run of two or
+  more letters that meets a capitalised word. Words of three or more letters, downcased.
+  Nothing is decoded.
+  """
+  @spec user_agent_words(String.t()) :: MapSet.t(String.t())
+  def user_agent_words(user_agent) when is_binary(user_agent) do
+    runs = user_agent |> String.replace_invalid() |> String.split(@ua_not_letter, trim: true)
+
+    [
+      Enum.flat_map(runs, &String.split(&1, @ua_camel_boundary, trim: true)),
+      runs,
+      Enum.flat_map(runs, &String.split(&1, @ua_upper_run_then_word, trim: true))
+    ]
+    |> List.flatten()
+    |> Enum.filter(&(byte_size(&1) >= 3))
+    |> Enum.map(&String.downcase/1)
+    |> MapSet.new()
+  end
+
+  @doc "The distinct lexicon words a user agent contains, sorted."
+  @spec user_agent_lexicon_hits(String.t()) :: [String.t()]
+  def user_agent_lexicon_hits(user_agent) when is_binary(user_agent) do
     user_agent
-    |> String.replace(@ua_comment, " ")
-    |> String.split(~r/\s+/u, trim: true)
-    |> Enum.reject(&(Regex.match?(@ua_product, &1) and String.contains?(&1, "/")))
-    |> length()
-    |> Kernel.>(3)
+    |> user_agent_words()
+    |> Enum.map(&lexicon_word_for_form/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+    |> Enum.sort()
   end
 
-  # Inside a comment, each `;`-separated part is a short platform description
-  # (`Intel Mac OS X 10_15_7`). Six consecutive words of letters is a sentence.
-  defp sentence_in_comment?(user_agent) do
-    @ua_comment
-    |> Regex.scan(user_agent, capture: :all_but_first)
-    |> Enum.flat_map(fn [comment] -> String.split(comment, [";", ","]) end)
-    |> Enum.any?(&(longest_word_run(&1) >= 6))
+  @doc "Whether a user agent carries any byte outside ASCII."
+  @spec user_agent_non_ascii?(String.t()) :: boolean()
+  def user_agent_non_ascii?(user_agent) when is_binary(user_agent),
+    do: Regex.match?(@ua_non_ascii, user_agent)
+
+  for [word | _] = forms <- @ua_lexicon_forms, form <- forms do
+    defp lexicon_word_for_form(unquote(form)), do: unquote(word)
   end
 
-  defp longest_word_run(part) do
-    part
-    |> String.split(~r/\s+/u, trim: true)
-    |> Enum.chunk_by(&Regex.match?(~r/\A\p{L}+\z/u, &1))
-    |> Enum.filter(fn [word | _] -> Regex.match?(~r/\A\p{L}+\z/u, word) end)
-    |> Enum.map(&length/1)
-    |> Enum.max(fn -> 0 end)
-  end
+  defp lexicon_word_for_form(_word), do: nil
 end
