@@ -53,12 +53,18 @@ defmodule Loopctl.Delivery.StageMachineTest do
     refute Enum.any?(sources, &(&1 in [:merged, :deployed, :verified]))
   end
 
-  test "session_escalated leaves from every in-flight stage and no other" do
+  test "session_escalated leaves from every in-flight stage, plus merged and deployed" do
     sources = for {from, :escalated, :session_escalated} <- StageMachine.transitions(), do: from
-    assert Enum.sort(sources) == Enum.sort(StageMachine.in_flight_stages())
 
-    # Not from `merged` on: the outward effect has happened and no session holds the story.
-    refute Enum.any?(sources, &(&1 in [:merged, :deployed, :verified]))
+    assert Enum.sort(sources) ==
+             Enum.sort(StageMachine.in_flight_stages() ++ [:merged, :deployed])
+
+    # `merged` and `deployed` are here because they would otherwise be ABSORBING (#824 round
+    # 3, H2), not because a session holds the story there.
+    #
+    # `verified` is NOT: it is control's, reached only by control's own `deployed -> verified`,
+    # and `verified -> done` follows. Nothing a session does leaves it.
+    refute :verified in sources
     # And not from `triaged`, which has its own verdict edge with its own meaning.
     refute :triaged in sources
   end
@@ -146,12 +152,16 @@ defmodule Loopctl.Delivery.StageMachineTest do
     refute :verified in StageMachine.runner_to_stages()
     refute :done in StageMachine.runner_to_stages()
 
-    # The only terminal a runner can now reach is `escalated`, which STOPS the loop rather
-    # than completing it — the fail-safe direction.
+    # The only TERMINAL a runner can now reach is `escalated`, which STOPS the loop rather
+    # than completing it — the fail-safe direction. `deployed` also ends the SESSION (H1) but
+    # is not terminal: the story goes on, waiting on control.
     terminal_reachable =
-      StageMachine.runner_to_stages() |> Enum.filter(&StageMachine.ends_session?/1)
+      StageMachine.runner_to_stages() |> Enum.filter(&(&1 in StageMachine.terminal_stages()))
 
     assert terminal_reachable == [:escalated]
+
+    session_ends = StageMachine.runner_to_stages() |> Enum.filter(&StageMachine.ends_session?/1)
+    assert Enum.sort(session_ends) == [:deployed, :escalated]
 
     # The line is at the deploy, and the deploy itself stays reportable: it names a
     # `release_id`, and `merged` names a `merge_sha`, both of which control can check.
@@ -210,14 +220,44 @@ defmodule Loopctl.Delivery.StageMachineTest do
              reportable |> Enum.map(&elem(&1, 2)) |> Enum.uniq() |> Enum.sort()
   end
 
-  test "ends_session? is exactly the terminal stages, and no live one" do
+  test "the session ends at the deploy as well as at the terminals" do
+    # #824 round 3, H1. The set was the terminals alone, which was right while a runner could
+    # report through `verified -> done`; once the source filter stopped at `merged` the last
+    # thing a session reports is the DEPLOY, and `deployed` is not terminal — so the SUCCESS
+    # path released no slot inline and waited out heal's wall-clock bound. The session ending
+    # is not the story ending, and that is the distinction the set now draws.
+    assert Enum.sort(StageMachine.session_ends_at()) ==
+             Enum.sort(StageMachine.terminal_stages() ++ [:deployed])
+
     for stage <- StageMachine.stages() do
-      assert StageMachine.ends_session?(stage) == stage in StageMachine.terminal_stages()
+      assert StageMachine.ends_session?(stage) == stage in StageMachine.session_ends_at()
     end
 
+    assert StageMachine.ends_session?(:deployed)
     assert StageMachine.ends_session?(:escalated)
+
+    # The story continues from `deployed` — it waits on control for `verified`. Neither of
+    # those is a session end.
     refute StageMachine.ends_session?(:merged)
     refute StageMachine.ends_session?(:verified)
+    refute :deployed in StageMachine.terminal_stages()
+  end
+
+  test "merged and deployed are not absorbing: a session can escalate out of both" do
+    # #824 round 3, H2. Nothing in `lib/` could write any edge out of `deployed`, so the row
+    # froze for every principal the moment a deploy was reported.
+    for stage <- [:merged, :deployed] do
+      assert StageMachine.allowed?(stage, :escalated, :session_escalated),
+             "#{stage} has no session escalation and nothing else can leave it"
+    end
+
+    # And escalating restores the human path, which is the point.
+    for to <- [:queued, :done, :failed] do
+      assert StageMachine.allowed?(:escalated, to, :human_resolution)
+    end
+
+    # `deployed -> verified` stays for the control writer that does not exist yet.
+    assert StageMachine.allowed?(:deployed, :verified, :forward)
   end
 
   test "the merge identity is writable only at merged, where the sha exists" do

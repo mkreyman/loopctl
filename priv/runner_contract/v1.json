@@ -629,6 +629,7 @@
         "stale_stage",
         "unknown_story_stage",
         "effect_conflict",
+        "audit_chain_append_failed",
         "internal_error"
       ],
       "status": [
@@ -793,6 +794,11 @@
       {
         "edge": "session_escalated",
         "from": "ci",
+        "to": "escalated"
+      },
+      {
+        "edge": "session_escalated",
+        "from": "merged",
         "to": "escalated"
       }
     ],

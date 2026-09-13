@@ -68,6 +68,19 @@ defmodule LoopctlWeb.RunnerChannel.Refusal do
 
   def for_message({:invalid, messages}), do: %{reason: "invalid_payload", details: messages}
 
+  # The refusal CARRIES the recorded identities (#824 round 3, finding 4). Without them the
+  # documented remedy — read the recorded values and reconcile — is unreachable in the one
+  # case it was written for: a LOST ack. The runner never saw the ack naming the surviving
+  # sha, which is exactly why it re-sent a different one.
+  def for_message({:effect_conflict, effects}) when is_map(effects),
+    do: %{reason: "effect_conflict", effects: effects}
+
+  # The tenant's hash chain refused this transition's entry, so nothing was written. NOT
+  # `rate_limited`: it is deterministic, the next attempt fails the same way, and every
+  # custody transition in the tenant is failing until an operator acts. Its own permanent code,
+  # matching what the HTTP surface answers for the same condition. Do not retry.
+  def for_message(:audit_chain_append_failed), do: %{reason: "audit_chain_append_failed"}
+
   # Reasons whose atom IS the published code.
   #
   # `stale_stage`, `unknown_story_stage` and `effect_conflict` arrived with `stage` (1.4.0) and
@@ -126,7 +139,8 @@ defmodule LoopctlWeb.RunnerChannel.Refusal do
       "machine_mismatch",
       "batch_too_large",
       "event_data_too_large",
-      "internal_error"
+      "internal_error",
+      "audit_chain_append_failed"
       | Enum.map(@verbatim, &Atom.to_string/1)
     ])
   end

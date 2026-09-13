@@ -547,12 +547,15 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     def codepoints(value), do: value |> String.to_charlist() |> length()
 
     @doc """
-    The effect identities a `stage` message may carry, which is also the set its ack echoes
-    back so a runner can reconcile a replay.
+    The effect identities a `stage` message may carry, read off the schema's OWN properties.
 
-    Read off the schema's OWN properties rather than restated, so the wire shape and the ack
-    cannot name different things. At runtime, not compile time: `schema/0` is defined by the
-    `OpenApiSpex.schema` macro below and a module attribute cannot call it.
+    `StageMachine.reportable_effects/0` is the DECLARATION; this is what the schema actually
+    says, and `runner_contract_test.exs` asserts the two are equal — so a property added here
+    without the machine's blessing, or an effect the machine allows and the schema forgot,
+    both go red. The ack and the `effect_conflict` refusal read the machine's list.
+
+    At runtime, not compile time: `schema/0` is defined by the `OpenApiSpex.schema` macro
+    below and a module attribute cannot call it.
     """
     @spec effect_names() :: [atom()]
     def effect_names, do: schema().properties |> Map.keys() |> Enum.sort()
@@ -836,10 +839,17 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     # - `effect_conflict` — the server already recorded a DIFFERENT identity for this
     #   transition. Read the recorded values off the ack (`effects`) and reconcile; do NOT
     #   re-send. `invalid_payload` would tell a runner whose merge sha was dropped that its
-    #   message was malformed, which is both wrong and the wrong remedy.
+    #   message was malformed, which is both wrong and the wrong remedy. The refusal CARRIES
+    #   the recorded identities in `effects`, because the case it exists for is a LOST ack —
+    #   the runner never saw the one that named the surviving value.
+    # - `audit_chain_append_failed` — the tenant's hash chain refused this transition's entry
+    #   and nothing was written. PERMANENT: the next attempt fails the same way and every
+    #   custody transition in the tenant is failing until an operator acts. Do NOT retry; it is
+    #   deliberately not `rate_limited`, and it is the same code the HTTP surface answers.
     "stage" =>
       ~w(rate_limited invalid_payload unknown_dispatch dispatch_not_accepted stale_claim_epoch
-         stale_stage unknown_story_stage effect_conflict internal_error),
+         stale_stage unknown_story_stage effect_conflict audit_chain_append_failed
+         internal_error),
     # Since 1.2.0. `join` is the `phx_join` reply; `unknown_event` answers any event this
     # map does not name, every time.
     "join" => ~w(rate_limited not_authorized invalid_payload unsupported_contract_version

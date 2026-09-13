@@ -433,21 +433,10 @@ defmodule LoopctlWeb.RunnerChannel do
       claim_epoch: row.claim_epoch,
       lock_version: row.lock_version,
       attempts: row.attempts,
-      effects: recorded_effects(row)
+      # The identities the row actually holds, so a runner can RECONCILE. Same helper the
+      # `effect_conflict` refusal uses, so the ack and the refusal cannot name different sets.
+      effects: RunnerStages.recorded_effects(row)
     }
-  end
-
-  # The identities the row actually holds, so a runner can RECONCILE (#824 round 2). Without
-  # them a replay whose merge sha was dropped came back `ok` and the runner had no way to
-  # learn the server kept a different sha; now the ack names it, and a replay carrying a
-  # conflicting one is refused with `effect_conflict` rather than silently accepted.
-  # Only the identities that are set: an absent key means nothing was recorded.
-  defp recorded_effects(row) do
-    for effect <- RunnerContract.RunnerStage.effect_names(),
-        value = Map.get(row, effect),
-        not is_nil(value),
-        into: %{},
-        do: {effect, value}
   end
 
   defp rate_limited(socket, event, min_interval_ms),

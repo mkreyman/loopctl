@@ -27,6 +27,10 @@ defmodule Loopctl.Delivery.RunnerStagesTest do
 
   @epoch 4
 
+  # The member of `Loopctl.Delivery.Stages.advance_error/0` this file asserts about.
+  # `LoopctlWeb.RunnerChannel.RefusalTest` holds the full list against the type's own source.
+  @advance_errors [:audit_chain_append_failed]
+
   defp as_tenant(tenant_id, fun) do
     {:ok, result} = Repo.with_tenant(tenant_id, fun)
     result
@@ -222,14 +226,17 @@ defmodule Loopctl.Delivery.RunnerStagesTest do
       assert {:ok, same} = RunnerStages.apply(story.tenant_id, runner.id, first)
       assert same.merge_sha == sha_a
 
-      # A different one is not a replay at all.
-      assert {:error, :effect_conflict} =
+      # A different one is not a replay at all — and the refusal CARRIES the sha that
+      # survived, because the case it exists for is a LOST ack: the runner never saw the one
+      # that named it (#824 round 3, finding 4).
+      assert {:error, {:effect_conflict, recorded}} =
                RunnerStages.apply(
                  story.tenant_id,
                  runner.id,
                  message(record, %{from: :ci, to: :merged, effects: %{merge_sha: sha_b}})
                )
 
+      assert recorded.merge_sha == sha_a
       assert Stages.get(story.tenant_id, story.id).merge_sha == sha_a
     end
 
@@ -246,7 +253,8 @@ defmodule Loopctl.Delivery.RunnerStagesTest do
                  message(record, %{from: :implementing, to: :reviewing})
                )
 
-      assert {:error, :effect_conflict} =
+      # The refusal names what the row holds — here, nothing, which is the answer.
+      assert {:error, {:effect_conflict, recorded}} =
                RunnerStages.apply(
                  story.tenant_id,
                  runner.id,
@@ -257,6 +265,7 @@ defmodule Loopctl.Delivery.RunnerStagesTest do
                  })
                )
 
+      refute Map.has_key?(recorded, :head_sha)
       assert is_nil(Stages.get(story.tenant_id, story.id).head_sha)
     end
 
@@ -389,6 +398,42 @@ defmodule Loopctl.Delivery.RunnerStagesTest do
       assert in_flight(runner) == 0
     end
 
+    test "the SUCCESS path releases the slot: the session ends at the deploy" do
+      # #824 round 3, H1. With the runner's source filter stopping at `merged`, `deployed` is
+      # the last thing a session reports — and `deployed` is not terminal, so while the
+      # release keyed on the terminals alone a SUCCESSFUL run released nothing inline. Its
+      # slot then waited out `heal/3`'s wall-clock bound, which is the dispatch's whole
+      # budget: a ten-minute session held a slot for an hour and a two-session machine sat at
+      # capacity for the rest of it. The only inline release a runner could trigger was the
+      # FAILURE path.
+      %{story: story, runner: runner, record: record} = session(:merged)
+
+      assert in_flight(runner) == 1
+
+      assert {:ok, row} =
+               RunnerStages.apply(
+                 story.tenant_id,
+                 runner.id,
+                 message(record, %{from: :merged, to: :deployed})
+               )
+
+      assert row.stage == :deployed
+      assert in_flight(runner) == 0
+      assert released?(record)
+    end
+
+    test "a replay of the deploy releases no second slot" do
+      %{story: story, runner: runner, record: record} = session(:merged)
+      msg = message(record, %{from: :merged, to: :deployed})
+
+      assert {:ok, _} = RunnerStages.apply(story.tenant_id, runner.id, msg)
+      assert in_flight(runner) == 0
+
+      assert {:ok, replayed} = RunnerStages.apply(story.tenant_id, runner.id, msg)
+      assert replayed.stage == :deployed
+      assert in_flight(runner) == 0
+    end
+
     test "a NON-terminal transition releases nothing, even carrying a live dispatch" do
       %{story: story, runner: runner, record: record} = session(:implementing)
 
@@ -454,6 +499,35 @@ defmodule Loopctl.Delivery.RunnerStagesTest do
       assert {:ok, _} = RunnerStages.apply(story.tenant_id, runner.id, msg)
 
       assert chain_actions(story.tenant_id) == ["story_stage_escalated"]
+    end
+  end
+
+  describe "a refused chain append is permanent" do
+    test "classify/1 does not reclassify it as retryable" do
+      # #824 round 3, finding 5. It used to map to `:busy`, which reaches the runner as
+      # `rate_limited` — a RETRY instruction against a deterministic failure that will refuse
+      # the next attempt identically, while every custody transition in the tenant is failing
+      # until an operator acts. The HTTP surface answers 500 for the same condition and says
+      # retrying will not help; one condition must not carry opposite advice.
+      #
+      # A source assertion because the branch is unreachable from a test: making a tenant's
+      # hash chain refuse an append needs a broken chain, and `LoopctlWeb.RunnerChannel.Refusal`
+      # already carries the FORMAT of the refusal under its own falsifiable test. What is left
+      # to bind is only that nothing intercepts the atom on its way there.
+      code =
+        "lib/loopctl/delivery/runner_stages.ex"
+        |> File.read!()
+        |> String.split("\n")
+        |> Enum.reject(&(&1 |> String.trim_leading() |> String.starts_with?("#")))
+        |> Enum.join("\n")
+
+      refute code =~ "classify(:audit_chain_append_failed)",
+             "a refused chain append must pass through to Refusal as its own permanent code, " <>
+               "never be reclassified as retryable"
+
+      # And the atom really is in the set that reaches here, so the assertion is about a
+      # reachable value rather than a hypothetical one.
+      assert :audit_chain_append_failed in @advance_errors
     end
   end
 

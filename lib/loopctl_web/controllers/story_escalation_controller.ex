@@ -99,7 +99,10 @@ defmodule LoopctlWeb.StoryEscalationController do
         {"No such story, or it has no delivery stage row", "application/json",
          Schemas.ErrorResponse},
       409 =>
-        {"stale_claim_epoch, not_claimant, or stale_stage", "application/json",
+        {"`stale_claim_epoch` (the claim has ended), `not_claimant` (your key's agent is not " <>
+           "the story's), `stale_stage` (the row moved twice while this call was being made) " <>
+           "or `invalid_transition` (the story is at a stage no session may escalate from — " <>
+           "past the deploy, or already escalated under another epoch)", "application/json",
          Schemas.ErrorResponse},
       422 => {"The reason or payload was refused", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},

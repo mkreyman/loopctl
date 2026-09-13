@@ -92,7 +92,11 @@ defmodule Loopctl.Delivery.Escalations do
   - `:agent_id` (required) — the calling key's agent, compared against `assigned_agent_id`
   - `:reason` (required) — why, in the session's own words. Untrusted; see the moduledoc
   - `:payload` — an optional JSON-encodable map recorded on the stage event
-  - `:actor_label`, `:actor_lineage` — attribution, both SERVER-resolved by the caller
+  - `:actor_label` — attribution, SERVER-resolved by the caller
+  - `:actor_lineage` (required) — the caller's dispatch lineage, SERVER-resolved from its key.
+    Required rather than defaulted: entering `escalated` is a chained transition, and
+    `Stages.advance/4` refuses an absent lineage so that an attested `[]` cannot be confused
+    with a caller that never resolved one.
   """
   @spec escalate(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
           {:ok, StoryStage.t()} | {:error, error()}
@@ -186,7 +190,12 @@ defmodule Loopctl.Delivery.Escalations do
       event_data: Keyword.get(opts, :payload),
       actor_label: Keyword.get(opts, :actor_label),
       actor_role: :agent,
-      actor_lineage: Keyword.get(opts, :actor_lineage, [])
+      # `fetch!`, never a default (#824 round 3). `Stages.advance/4` refuses an ABSENT
+      # `:actor_lineage` on a chained transition precisely so that "resolved, and empty"
+      # cannot be confused with "forgot to resolve" — and defaulting to `[]` here defeated
+      # that refusal for every caller of this module. An empty list is an attested absence
+      # and is still accepted; it just has to be stated.
+      actor_lineage: Keyword.fetch!(opts, :actor_lineage)
     ]
 
     Stages.advance(tenant_id, story_id, transition, advance_opts)

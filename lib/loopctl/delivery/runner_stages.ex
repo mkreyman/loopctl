@@ -77,7 +77,8 @@ defmodule Loopctl.Delivery.RunnerStages do
           | :stale_claim_epoch
           | :stale_stage
           | :unknown_story_stage
-          | :effect_conflict
+          | {:effect_conflict, map()}
+          | :audit_chain_append_failed
           | :busy
           | {:invalid, [String.t()]}
 
@@ -125,7 +126,33 @@ defmodule Loopctl.Delivery.RunnerStages do
       {:ok, row} -> {:ok, row}
       {:error, :stale_stage} -> resolve_replay(tenant_id, session, stage)
       {:error, :not_found} -> {:error, :unknown_story_stage}
+      {:error, :effect_conflict} -> effect_conflict(tenant_id, session.story_id)
       {:error, reason} -> {:error, classify(reason)}
+    end
+  end
+
+  @doc """
+  The identities a story's stage row holds, as a `stage` ack and an `effect_conflict` refusal
+  report them: every effect a runner may carry (`StageMachine.reportable_effects/0`) that is
+  actually set. An absent key means nothing was recorded.
+  """
+  @spec recorded_effects(StoryStage.t()) :: map()
+  def recorded_effects(%StoryStage{} = row) do
+    for effect <- StageMachine.reportable_effects(),
+        value = Map.get(row, effect),
+        not is_nil(value),
+        into: %{},
+        do: {effect, value}
+  end
+
+  # An `effect_conflict` CARRIES the recorded identities (#824 round 3, finding 4). Without
+  # them the documented remedy — read the recorded values off the ack and reconcile — is
+  # unreachable in the one case it was written for: a LOST ack. The runner never saw the ack
+  # that named the surviving sha, which is precisely why it re-sent a different one.
+  defp effect_conflict(tenant_id, story_id) do
+    case Stages.get(tenant_id, story_id) do
+      nil -> {:error, :unknown_story_stage}
+      row -> {:error, {:effect_conflict, recorded_effects(row)}}
     end
   end
 
@@ -184,7 +211,7 @@ defmodule Loopctl.Delivery.RunnerStages do
       release_on_replay(tenant_id, session, stage)
       {:ok, row}
     else
-      {:error, :effect_conflict}
+      {:error, {:effect_conflict, recorded_effects(row)}}
     end
   end
 
@@ -233,6 +260,13 @@ defmodule Loopctl.Delivery.RunnerStages do
   ]
 
   defp classify(reason) when reason in @message_faults, do: {:invalid, [Atom.to_string(reason)]}
-  defp classify(:audit_chain_append_failed), do: :busy
+
+  # NOT `:busy`, which is what it was (#824 round 3, finding 5). `:busy` tells the runner to
+  # send it again, and this is a DETERMINISTIC failure: the tenant's hash chain refused the
+  # entry, so it will refuse the next one too, and every custody transition in that tenant is
+  # failing until an operator acts. A retry instruction there is a re-send loop against a
+  # broken chain. It also disagreed with the HTTP surface, which answers 500 for the same
+  # condition and says plainly that retrying will not help — one condition, opposite advice.
+  # It passes through under its own name and reaches the wire as its own permanent code.
   defp classify(reason), do: reason
 end

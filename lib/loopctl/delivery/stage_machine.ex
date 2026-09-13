@@ -28,14 +28,16 @@ defmodule Loopctl.Delivery.StageMachine do
     (design §4), including the disagreement that escalates by construction
   - `:merge_gate` — ci -> escalated, the merge-precondition gate refusing (design §5:
     a clean result merges with no human, anything else routes to Gate A)
-  - `:session_escalated` — any IN-FLIGHT stage -> escalated, the unattended session asking
-    for Mark (design §8, "Escalation is a command the session calls"). The one escalation
-    edge a session may take itself, and the only one available from the stages a runner
-    holds: `:triage_escalate`, `:merge_gate` and `:verification_failed` are each a
-    control-side verdict about a specific gate. Taken two ways, both of which end at this
-    one edge so the chain entry is identical either way — `POST /stories/:id/escalate` from
-    the claiming agent's own key, and a runner's `stage` message reporting what it read out
-    of the run's `escalations.ndjson`.
+  - `:session_escalated` — any in-flight stage, `merged` or `deployed` -> escalated: the
+    unattended session asking for Mark (design §8, "Escalation is a command the session
+    calls"). The one escalation edge a session may take itself, and the only one available
+    from the stages a runner holds: `:triage_escalate`, `:merge_gate` and
+    `:verification_failed` are each a control-side verdict about a specific gate. Taken two
+    ways, both of which end at this one edge so the chain entry is identical either way —
+    `POST /stories/:id/escalate` from the claiming agent's own key, and a runner's `stage`
+    message reporting what it read out of the run's `escalations.ndjson`. It reaches past the
+    in-flight stages because `merged` and `deployed` would otherwise be ABSORBING; see the
+    comment above `@session_escalated`.
   - `:merge_refused` — merged -> implementing, when the merge did not hold: a conflict, a
     branch protection rule, a required check. It needs a reason, it clears `merge_sha`
     along with the head, and it is CHAINED — the entry into `merged` is a custody fact, so
@@ -71,6 +73,10 @@ defmodule Loopctl.Delivery.StageMachine do
   # `max_reason_length/0` for why it lives here and nowhere else.
   @max_reason_length 4_000
 
+  # Where the RUNNER'S SESSION ends and its capacity slot goes back. The terminals, plus the
+  # deploy — see `session_ends_at/0` for why those are not the same set.
+  @session_ends_at @terminal ++ [:deployed]
+
   @forward @main_line
            |> Enum.chunk_every(2, 1, :discard)
            |> Enum.map(fn [from, to] -> {from, to, :forward} end)
@@ -85,8 +91,26 @@ defmodule Loopctl.Delivery.StageMachine do
 
   @human_resolution for to <- [:queued, :done, :failed], do: {:escalated, to, :human_resolution}
 
-  # The session's own escalation, from every stage a runner holds it in.
-  @session_escalated for from <- @in_flight, do: {from, :escalated, :session_escalated}
+  # The session's own escalation. From every stage a runner holds the story in, and ALSO from
+  # `merged` and `deployed` (#824 round 3, H2/3).
+  #
+  # Those two were absorbing. Narrowing the runner's source filter to stop at `merged` left
+  # `deployed` with no edge out that anything in `lib/` can write: `RunnerStages` cannot (not
+  # a source), `Escalations` builds `{row.stage, :escalated, :session_escalated}` which
+  # existed only for `@in_flight`, `follow_release/5` and `follow_claim/4` only rebind, and
+  # `:human_resolution` leaves `escalated` rather than reaching it. The moment a deploy was
+  # reported the row froze for EVERY principal, Mark included.
+  #
+  # `merged` was nearly as bad: its only other edge is `:merge_refused`, which clears
+  # `merge_sha` and CHAINS a retraction asserting the merge did not hold — a false custody
+  # statement for "the deploy broke", and the only thing a caller could reach for.
+  #
+  # Escalating from either is now the way out, and it restores the human path
+  # (`escalated -> queued | done | failed` over `:human_resolution`). `deployed -> verified`
+  # stays for the control writer that does not exist yet; until it does, ESCALATION IS THE
+  # ONLY WAY OUT OF `deployed`.
+  @session_escalated for from <- @in_flight ++ [:merged, :deployed],
+                         do: {from, :escalated, :session_escalated}
 
   @transitions @forward ++
                  [
@@ -231,6 +255,9 @@ defmodule Loopctl.Delivery.StageMachine do
   # head. A human re-queue starts over from nothing.
   @released_clears [:runner_id, :worktree_path, :head_sha]
 
+  # Every identity except `runner_id`: see `reportable_effects/0`.
+  @reportable_effects @effect_stages |> Map.keys() |> Kernel.--([:runner_id]) |> Enum.sort()
+
   @type stage ::
           :detected
           | :triaged
@@ -350,8 +377,9 @@ defmodule Loopctl.Delivery.StageMachine do
   def runner_transitions, do: @runner_transitions
 
   @doc """
-  The stages a runner may report a transition OUT of — the ones its session holds the story
-  in, plus the three it drives after the merge.
+  The stages a runner may report a transition OUT of: the ones its session holds the story in,
+  plus `merged` — the last one it drives, because reporting the deploy is the last thing a
+  session does. See the comment above `@runner_transitions` for why the list stops there.
   """
   @spec runner_source_stages() :: [stage()]
   def runner_source_stages, do: @runner_source_stages
@@ -381,17 +409,37 @@ defmodule Loopctl.Delivery.StageMachine do
   def runner_edges, do: @runner_edges
 
   @doc """
-  True when arriving at `to` ENDS the session that was working the story, so the runner slot
-  it held goes back (`Loopctl.Runners.DispatchLedger.release_slot_in/4`).
+  The stages at which the RUNNER'S SESSION is over, so its capacity slot goes back
+  (`Loopctl.Runners.DispatchLedger.release_slot_in/4`).
+
+  **The session ending is not the story ending, and conflating them leaked slots on the
+  SUCCESS path** (#824 round 3, H1). The terminals alone were the set, which was right while a
+  runner could report through `verified -> done`; once the source filter stopped at `merged`
+  the last thing a session reports is the DEPLOY, and `deployed` is not terminal — so a
+  successful run released nothing inline and its slot waited out `heal/3`'s wall-clock bound.
+  That bound is the dispatch's whole budget, so a ten-minute session held a slot for an hour,
+  a two-session machine sat at capacity for the rest of it, and the tenant ceiling counted the
+  phantom. The only inline release a runner could still trigger was the FAILURE path.
+
+  So the set is the terminals plus `deployed`: every stage from which this runner's session
+  does no more work. The story continues from `deployed` — it waits on control for
+  `verified` — which is exactly the distinction.
+  """
+  @spec session_ends_at() :: [stage()]
+  def session_ends_at, do: @session_ends_at
+
+  @doc """
+  True when arriving at `to` ends the session (`session_ends_at/0`).
 
   DERIVED from the destination stage, never asserted by the caller. A message that could say
   "my session is over" while it ran would let a runner free a slot it is still using, and the
   admission ceiling it feeds is what keeps six concurrent sessions off one Anthropic account
-  (design §9). `done`, `failed` and `escalated` are exactly the stages no session continues
-  from: `escalated` waits on Mark, and the other two are terminal.
+  (design §9). Both release paths read THIS — `Loopctl.Delivery.Stages`' inline release and
+  `Loopctl.Delivery.RunnerStages`' replay release — so they cannot disagree about when a
+  session ended.
   """
   @spec ends_session?(stage()) :: boolean()
-  def ends_session?(to), do: to in @terminal
+  def ends_session?(to), do: to in @session_ends_at
 
   @doc "True for an edge counted in `attempts` — every edge except `:forward`."
   @spec counted?(edge()) :: boolean()
@@ -409,6 +457,19 @@ defmodule Loopctl.Delivery.StageMachine do
   @doc "Every side-effect identity column."
   @spec effects() :: [effect()]
   def effects, do: Map.keys(@effect_stages)
+
+  @doc """
+  The identities a RUNNER may carry on a `stage` message, and the ones echoed back to it: every
+  effect except `runner_id`.
+
+  Which machine holds a story is CONTROL's to record — it is written by the transition into
+  `claimed`, which a runner may not report — so letting one name a `runner_id` would let it
+  attribute a story to another machine. One declaration here, so the contract's `RunnerStage`
+  properties, the `stage` ack and the `effect_conflict` refusal all name the same set;
+  `runner_contract_test.exs` asserts the schema against it.
+  """
+  @spec reportable_effects() :: [effect()]
+  def reportable_effects, do: @reportable_effects
 
   @doc """
   True for an identity that only a TRANSITION may write (`Loopctl.Delivery.Stages.advance/4`'s

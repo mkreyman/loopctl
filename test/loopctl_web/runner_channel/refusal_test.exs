@@ -20,11 +20,36 @@ defmodule LoopctlWeb.RunnerChannel.RefusalTest do
   alias Loopctl.ApiSpec.RunnerContract
   alias LoopctlWeb.RunnerChannel.Refusal
 
+  # Written by hand from `Loopctl.Delivery.Stages.advance_error/0`, which is a type and cannot
+  # be enumerated at runtime. ONE list: the walk below iterates it and the drift guard at the
+  # bottom compares it against the type's own source.
+  @advance_errors [
+    :invalid_transition,
+    :human_required,
+    :reason_required,
+    :not_found,
+    :not_claimed,
+    :stale_claim_epoch,
+    :stale_stage,
+    :actor_lineage_required,
+    :invalid_reason,
+    :missing_required_effect,
+    :invalid_effect,
+    :wrong_stage,
+    :effect_conflict,
+    :audit_chain_append_failed,
+    :invalid_event_data,
+    :busy
+  ]
+
   describe "the catch-all" do
     test "answers internal_error and logs the reason, which is never sent" do
-      log = capture_log(fn -> assert Refusal.catch_all(:a_reason_no_clause_names) end)
+      log =
+        capture_log(fn ->
+          send(self(), Refusal.catch_all(:a_reason_no_clause_names))
+        end)
 
-      refusal = Refusal.catch_all(:a_reason_no_clause_names)
+      refusal = receive_it()
       assert refusal == %{reason: "internal_error"}
 
       assert log =~ "a_reason_no_clause_names"
@@ -33,29 +58,10 @@ defmodule LoopctlWeb.RunnerChannel.RefusalTest do
     end
 
     test "EVERY reason the stage machine can return is answered, none raises" do
-      # This is the assertion the private clause could not carry. `Stages.advance_error/0` is
-      # the set `stage` widened the channel to, and every member of it must come back as a
-      # map rather than a `FunctionClauseError`.
-      advance_errors = [
-        :invalid_transition,
-        :human_required,
-        :reason_required,
-        :not_found,
-        :not_claimed,
-        :stale_claim_epoch,
-        :stale_stage,
-        :actor_lineage_required,
-        :invalid_reason,
-        :missing_required_effect,
-        :invalid_effect,
-        :wrong_stage,
-        :effect_conflict,
-        :audit_chain_append_failed,
-        :invalid_event_data,
-        :busy
-      ]
-
-      for reason <- advance_errors do
+      # This is the assertion the private clause could not carry. `@advance_errors` is the set
+      # `stage` widened the channel to, and every member of it must come back as a map rather
+      # than a `FunctionClauseError`.
+      for reason <- @advance_errors do
         refusal = capture_log(fn -> send(self(), Refusal.for_message(reason)) end) && receive_it()
         assert is_map(refusal), "#{reason} did not produce a refusal map"
         assert is_binary(refusal.reason), "#{reason} produced no reason string"
@@ -110,6 +116,19 @@ defmodule LoopctlWeb.RunnerChannel.RefusalTest do
       end
     end
 
+    test "a refused chain append is PERMANENT, never a retry instruction" do
+      # #824 round 3, finding 5. It was `rate_limited`, which tells the runner to send it
+      # again — against a deterministic failure that will refuse the next one identically,
+      # while every custody transition in the tenant is failing until an operator acts. It
+      # also disagreed with the HTTP surface, which answers 500 for the same condition and
+      # says plainly that retrying will not help.
+      refusal = Refusal.for_message(:audit_chain_append_failed)
+
+      assert refusal == %{reason: "audit_chain_append_failed"}
+      refute Map.has_key?(refusal, :min_interval_ms)
+      refute refusal.reason == "rate_limited"
+    end
+
     test "a lock this write could not get says retry, with an interval longer than the wait" do
       assert %{reason: "rate_limited", min_interval_ms: ms} = Refusal.for_message(:busy)
       assert ms > 0
@@ -117,10 +136,14 @@ defmodule LoopctlWeb.RunnerChannel.RefusalTest do
     end
   end
 
-  # `Stages.advance_error/0` is a type, so it cannot be enumerated at runtime; the list above
-  # is written from it by hand. This keeps the two from drifting: the type's own source is the
-  # thing to re-read when it changes.
-  test "the advance_error list above is written from the type's own source" do
+  # `Stages.advance_error/0` is a type, so it cannot be enumerated at runtime; `@advance_errors`
+  # is written from it by hand. This binds the two.
+  #
+  # It compares against the SAME attribute the walk above iterates (#824 round 3, finding 7).
+  # It used to compare against a second hardcoded copy, so adding a member to the type and
+  # updating only that copy left this guard green while the walk stayed short — a drift guard
+  # that could not see the drift it existed for.
+  test "@advance_errors is exactly what the type declares" do
     source = File.read!("lib/loopctl/delivery/stages.ex")
     [_, block] = String.split(source, "@type advance_error ::", parts: 2)
     [block, _] = String.split(block, "\n\n", parts: 2)
@@ -129,17 +152,11 @@ defmodule LoopctlWeb.RunnerChannel.RefusalTest do
       ~r/:([a-z_]+)/
       |> Regex.scan(block, capture: :all_but_first)
       |> List.flatten()
+      |> Enum.map(&String.to_existing_atom/1)
       |> Enum.sort()
 
-    covered =
-      ~w(invalid_transition human_required reason_required not_found not_claimed
-                 stale_claim_epoch stale_stage actor_lineage_required invalid_reason
-                 missing_required_effect invalid_effect wrong_stage effect_conflict
-                 audit_chain_append_failed invalid_event_data busy)
-      |> Enum.sort()
-
-    assert declared == covered,
-           "Stages.advance_error/0 changed; update the list in this file's catch-all test"
+    assert declared == Enum.sort(@advance_errors),
+           "Stages.advance_error/0 changed; update @advance_errors in this file"
   end
 
   defp receive_it do

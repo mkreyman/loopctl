@@ -290,8 +290,17 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
 
       refill_bucket(channel)
       ref = push(channel, "stage", message.(String.duplicate("b", 40)))
-      assert_reply ref, :error, %{reason: "effect_conflict"}, @reply_timeout
 
+      # The refusal CARRIES the identities the row holds (#824 round 3, finding 4). Without
+      # them the documented remedy — read the recorded values and reconcile — is unreachable
+      # in the one case it exists for: a LOST ack. The runner never saw the ack that named
+      # the surviving sha, which is exactly why it re-sent a different one.
+      assert_reply ref,
+                   :error,
+                   %{reason: "effect_conflict", effects: %{head_sha: recorded}},
+                   @reply_timeout
+
+      assert recorded == String.duplicate("a", 40)
       assert Stages.get(runner.tenant_id, story.id).head_sha == String.duplicate("a", 40)
     end
 

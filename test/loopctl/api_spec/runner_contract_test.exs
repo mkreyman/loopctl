@@ -121,6 +121,20 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       end
     end
 
+    test "the stage schema's effects are exactly the ones the machine says a runner may carry" do
+      # `StageMachine.reportable_effects/0` is the DECLARATION and the schema is what the wire
+      # actually says; the ack and the `effect_conflict` refusal read the machine's list. This
+      # binds the two, in both directions — a property added to the schema without the
+      # machine's blessing, or an effect the machine allows and the schema forgot, both go red.
+      #
+      # `runner_id` is the one deliberately absent: which machine holds a story is CONTROL's
+      # to record, written by the transition into `claimed` that a runner may not report, so
+      # letting one name a `runner_id` would let it attribute a story to another machine.
+      assert RunnerStage.effect_names() == StageMachine.reportable_effects()
+      refute :runner_id in RunnerStage.effect_names()
+      assert :runner_id in StageMachine.effects()
+    end
+
     test "the wire-to-atom conversion never reaches for String.to_existing_atom" do
       # The one assertion that can fail for the right reason in a VM where the atoms already
       # exist. `to_existing_atom` on a wire value is safe only if something has forced the

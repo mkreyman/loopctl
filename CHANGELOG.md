@@ -38,9 +38,19 @@ All notable changes to loopctl are documented here.
   also publishes `internal_error`, the server admitting a refusal reason it has no clause for
   — which used to raise and take the whole socket down with every session on it.
 
-  **Reporting a transition into a terminal stage releases the session's runner slot in the
-  same transaction**, which #822 had no signal for — until now such a slot waited out the heal
-  sweep. In practice `escalated` is the only terminal a runner can reach.
+  **Reporting a transition that ENDS THE SESSION releases the runner's slot in the same
+  transaction**, which #822 had no signal for — until now such a slot waited out the heal
+  sweep. The session ends at the terminals AND at `deployed`: with a runner reporting no
+  further than the deploy, that is the last thing it does, so keying the release on the
+  terminals alone leaked a slot on every SUCCESSFUL run for the dispatch's whole wall clock.
+  The story continues from `deployed` — it waits on control — which is why the two are not
+  the same set.
+
+  **`merged` and `deployed` can be escalated from**, by the session and by the endpoint.
+  Without that they were absorbing: nothing could write any edge out of `deployed`, so a
+  reported deploy froze the row for every principal, and `merged`'s only other edge chains a
+  retraction asserting the merge did not hold — a false custody statement for "the deploy
+  broke". Escalating restores the human path off both.
 
   **New endpoint `POST /api/v1/stories/:id/escalate`** (agent role, `exact_role`, human-anchored
   tenant): the story's CLAIMING agent parks it at the `escalated` stage and stops, presenting

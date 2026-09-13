@@ -198,10 +198,11 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
       assert Stages.get(story.tenant_id, story.id).stage == :implementing
     end
 
-    test "409, not 500, escalating from a stage no session holds" do
-      # `merged` is past the point a session holds the story, so the machine has no
-      # `:session_escalated` edge out of it and `Escalations` answers :invalid_transition.
-      %{story: story, raw_key: raw_key} = claimed_story(:merged)
+    test "409, not 500, escalating from a stage no session may escalate from" do
+      # `verified` is control's: it is reached only by control's own `deployed -> verified`,
+      # and nothing a session does leaves it. `merged` and `deployed` ARE escalatable — they
+      # would otherwise be absorbing (#824 round 3, H2) — so this uses the one that is not.
+      %{story: story, raw_key: raw_key} = claimed_story(:verified)
 
       conn =
         build_conn()
@@ -209,7 +210,21 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
         |> post(~p"/api/v1/stories/#{story.id}/escalate", body())
 
       assert json_response(conn, 409)["error"]["code"] == "invalid_transition"
-      assert Stages.get(story.tenant_id, story.id).stage == :merged
+      assert Stages.get(story.tenant_id, story.id).stage == :verified
+    end
+
+    test "escalating from deployed works, so the deploy is not a dead end" do
+      # H2: with the runner's source filter stopping at `merged`, nothing in lib/ could write
+      # any edge out of `deployed` — the row froze for every principal including Mark.
+      %{story: story, raw_key: raw_key} = claimed_story(:deployed)
+
+      conn =
+        build_conn()
+        |> auth(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/escalate", body())
+
+      assert json_response(conn, 200)["stage"]["stage"] == "escalated"
+      assert Stages.get(story.tenant_id, story.id).stage == :escalated
     end
 
     # #824 round 1, finding 5: `maxLength` counts GRAPHEMES and the CHECK counts CODEPOINTS,

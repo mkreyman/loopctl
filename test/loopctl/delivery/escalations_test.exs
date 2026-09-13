@@ -58,9 +58,16 @@ defmodule Loopctl.Delivery.EscalationsTest do
     {story, row, agent_id}
   end
 
+  # `:actor_lineage` is stated, never defaulted — `Escalations.escalate/3` requires it, so that
+  # an attested empty lineage cannot be confused with a caller that never resolved one.
   defp opts(agent_id, overrides \\ []) do
     Keyword.merge(
-      [claim_epoch: @epoch, agent_id: agent_id, reason: "the request contradicts US-3.1"],
+      [
+        claim_epoch: @epoch,
+        agent_id: agent_id,
+        reason: "the request contradicts US-3.1",
+        actor_lineage: []
+      ],
       overrides
     )
   end
@@ -98,18 +105,34 @@ defmodule Loopctl.Delivery.EscalationsTest do
       assert row.attempts["session_escalated"] == 1
     end
 
-    test "works from every stage a claim holds the story in, and no other" do
-      for stage <- StageMachine.in_flight_stages() do
+    test "works from every in-flight stage, and from merged and deployed" do
+      # #824 round 3, H2/3. `merged` and `deployed` were ABSORBING: narrowing the runner's
+      # source filter to stop at `merged` left `deployed` with no edge out that anything in
+      # `lib/` can write, so the moment a deploy was reported the row froze for every
+      # principal including Mark. `merged` was nearly as bad — its only other edge is
+      # `:merge_refused`, which chains a retraction asserting the merge did not hold, a FALSE
+      # custody statement for "the deploy broke".
+      for stage <- Escalations.escalatable_stages() do
         {story, _row, agent} = claimed(stage)
         assert {:ok, row} = Escalations.escalate(story.tenant_id, story.id, opts(agent))
         assert row.stage == :escalated, "expected #{stage} to be escalatable"
       end
 
       assert Enum.sort(Escalations.escalatable_stages()) ==
-               Enum.sort(StageMachine.in_flight_stages())
+               Enum.sort(StageMachine.in_flight_stages() ++ [:merged, :deployed])
 
-      # `merged` is past the point a session holds the story, so there is no edge from it.
-      {story, _row, agent} = claimed(:merged)
+      # And escalating is what RESTORES the human path out of them.
+      for stage <- [:merged, :deployed] do
+        {story, _row, agent} = claimed(stage)
+        assert {:ok, _} = Escalations.escalate(story.tenant_id, story.id, opts(agent))
+
+        assert StageMachine.allowed?(:escalated, :queued, :human_resolution)
+        assert StageMachine.allowed?(:escalated, :done, :human_resolution)
+        _ = stage
+      end
+
+      # `verified` is control's and still has no session edge out of it.
+      {story, _row, agent} = claimed(:verified)
 
       assert {:error, :invalid_transition} =
                Escalations.escalate(story.tenant_id, story.id, opts(agent))
@@ -213,6 +236,26 @@ defmodule Loopctl.Delivery.EscalationsTest do
 
       assert {:error, :unknown_story_stage} =
                Escalations.escalate(story.tenant_id, story.id, opts(agent.id))
+    end
+
+    test "requires the caller's lineage to be STATED, never defaulted" do
+      # Entering `escalated` is a chained transition, and `Stages.advance/4` refuses an ABSENT
+      # `:actor_lineage` so that "resolved, and empty" cannot be confused with "forgot to
+      # resolve". Defaulting it here defeated that refusal for every caller of this module.
+      {story, _row, agent} = claimed()
+      without = opts(agent) |> Keyword.delete(:actor_lineage)
+
+      assert_raise KeyError, fn ->
+        Escalations.escalate(story.tenant_id, story.id, without)
+      end
+
+      assert Stages.get(story.tenant_id, story.id).stage == :implementing
+
+      # An attested empty lineage is still fine — it just has to be said.
+      assert {:ok, row} =
+               Escalations.escalate(story.tenant_id, story.id, opts(agent, actor_lineage: []))
+
+      assert row.stage == :escalated
     end
 
     test "refuses a story that is not in the tenant" do
