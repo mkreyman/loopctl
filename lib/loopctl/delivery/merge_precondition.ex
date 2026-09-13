@@ -186,10 +186,23 @@ defmodule Loopctl.Delivery.MergePrecondition do
   @type error :: :not_found | :no_stage | :wrong_stage
 
   # The forge faults that mean "we could not tell", as opposed to a gate verdict: transport,
-  # a 5xx, a 429, and the 403 GitHub answers a rate limit with. Every one of them clears on
-  # its own, so the caller retries and the story STAYS at `ci`. Escalating on one would park
-  # a story on a network blip until a human acts, and `escalated` is human-only.
-  @transient_statuses [403, 408, 425, 429]
+  # a 5xx, and a status the forge itself said to come back after. Every one clears on its
+  # own, so the caller retries and the story STAYS at `ci`. Escalating on one would park a
+  # story on a network blip until a human acts, and `escalated` is human-only.
+  #
+  # A bare 403 is NOT here, and that is the whole point of the split: GitHub answers both a
+  # rate limit and a permanent permission denial with 403, and the adapter separates them by
+  # the rate-limit headers (`{:github_rate_limited, _, _}` versus `{:github_api_error, 403}`).
+  # A fine-grained token that cannot read a repository's contents 403s for ever; calling that
+  # transient is a story retried until the heat death of the universe with nobody told.
+  @transient_statuses [408, 425, 429]
+
+  # And the backstop, for every OTHER way a transient fault might never clear — a rate limit
+  # that stays exhausted, a forge that is down for a day. Consecutive unevaluated results at
+  # one head, after which the gate escalates and names the fault. Small on purpose: the cost
+  # of escalating a story that would have recovered is one human glance, and the cost of not
+  # escalating is a story nobody ever hears about again.
+  @max_consecutive_unevaluated 5
 
   @doc "The hard bound the design fixes, whatever the configuration says."
   @spec hard_bound() :: %{max_files: pos_integer(), max_changed_lines: pos_integer()}
@@ -218,7 +231,8 @@ defmodule Loopctl.Delivery.MergePrecondition do
       gate_a_inputs: :caller_asserted,
       custody: custody_code(custody),
       repo: value(facts, :repo),
-      pr_number: value(facts, :pr_number)
+      pr_number: value(facts, :pr_number),
+      recorded_head_sha: Map.get(facts, :recorded_head_sha)
     }
 
     # A transient forge fault is decided FIRST and decides everything: nothing was
@@ -227,7 +241,12 @@ defmodule Loopctl.Delivery.MergePrecondition do
     # about it — but the DECISION is that there is no verdict yet.
     case {unevaluated_reasons(facts), input_reasons(facts)} do
       {[_ | _] = transient, other} ->
-        %{base | decision: :unevaluated, reasons: Enum.uniq(transient ++ other ++ carried)}
+        %{
+          base
+          | decision: :unevaluated,
+            reasons: Enum.uniq(transient ++ other ++ carried),
+            retry_after: longest_retry_after(transient)
+        }
 
       {[], [_ | _] = broken} ->
         refuse(base, broken ++ carried)
@@ -302,6 +321,12 @@ defmodule Loopctl.Delivery.MergePrecondition do
     {:base_files, :base_files_unavailable}
   ]
 
+  # Only the pull request is consumed when it could not be read at all, and when it says the
+  # merge already happened: the already-merged branch reads neither file list. Judging a
+  # transient tree fault there would suppress the ungated-merge escalation — the loudest
+  # signal this module produces — on a fault the decision never touches.
+  @merged_facts [{:pull_request, :pull_request_unavailable}]
+
   # EVERY broken input, not the first. A refusal escalates, and after it the story is out
   # of `ci` and the gate cannot be re-run, so one reason where two are wrong sends a human
   # to fix half a problem. `:not_attempted` is dropped: it is the CONSEQUENCE of a missing
@@ -314,10 +339,18 @@ defmodule Loopctl.Delivery.MergePrecondition do
   end
 
   defp unevaluated_reasons(facts) do
-    for {key, kind} <- @forge_facts,
+    for {key, kind} <- consumed_facts(facts),
         reason = error_reason(facts, key),
         transient?(reason),
         do: {kind, reason}
+  end
+
+  defp consumed_facts(facts) do
+    case value(facts, :pull_request) do
+      %{merged?: true} -> @merged_facts
+      %{} -> @forge_facts
+      _unreadable -> @merged_facts
+    end
   end
 
   defp error_reason(facts, key) do
@@ -338,9 +371,38 @@ defmodule Loopctl.Delivery.MergePrecondition do
   """
   @spec transient?(term()) :: boolean()
   def transient?({:github_unreachable, _reason}), do: true
+  def transient?({:github_rate_limited, _status, _retry_after}), do: true
   def transient?({:github_api_error, status}) when status >= 500, do: true
   def transient?({:github_api_error, status}), do: status in @transient_statuses
   def transient?(_reason), do: false
+
+  @doc "How long the forge asked a caller to wait, when it said so at all."
+  @spec retry_after(term()) :: pos_integer() | nil
+  def retry_after({:github_rate_limited, _status, seconds})
+      when is_integer(seconds) and seconds > 0,
+      do: seconds
+
+  def retry_after(_reason), do: nil
+
+  @doc """
+  The consecutive-unevaluated bound. Past it the gate escalates rather than answering
+  "retry" again, so no fault can retry for ever with nobody told.
+  """
+  @spec max_consecutive_unevaluated() :: pos_integer()
+  def max_consecutive_unevaluated, do: @max_consecutive_unevaluated
+
+  # The longest wait any of the faults asked for, or nil when none of them said. `Enum.max`
+  # cannot do this directly: in Erlang term order every atom sorts above every number, so a
+  # single `nil` would win over a real delay.
+  defp longest_retry_after(reasons) do
+    reasons
+    |> Enum.map(fn {_kind, reason} -> retry_after(reason) end)
+    |> Enum.reject(&is_nil/1)
+    |> case do
+      [] -> nil
+      seconds -> Enum.max(seconds)
+    end
+  end
 
   defp value(facts, key) do
     case Map.get(facts, key) do
@@ -579,6 +641,10 @@ defmodule Loopctl.Delivery.MergePrecondition do
       repo: repo,
       pr_number: pr_number,
       pull_request: pull_request,
+      # NOT fetched on the merged path: that branch reads neither list, and the two calls
+      # were identical there anyway (the adapter reports a merged pull request's merge base
+      # as its head), so they were two round trips whose results were discarded and whose
+      # failure could suppress the ungated-merge escalation.
       head_files: repo_files(repo, pull_request, :head_sha),
       base_files: repo_files(repo, pull_request, :merge_base_sha),
       triggers: DeliveryGates.load_triggers(),
@@ -612,6 +678,8 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   defp pull_request({:ok, repo}, {:ok, number}), do: source().pull_request(repo, number)
   defp pull_request(_repo, _number), do: {:error, :not_attempted}
+
+  defp repo_files(_repo, {:ok, %{merged?: true}}, _key), do: {:error, :not_consumed}
 
   defp repo_files({:ok, repo}, {:ok, pr}, key) do
     case Map.get(pr, key) do
@@ -651,12 +719,29 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # `:unevaluated` and `:already_merged` transition NOTHING. `:unevaluated` because there is
   # no verdict to act on and a network blip must not park a story on a human; an authorised
   # `:already_merged` because the caller's next act is recording the merge it adopted.
-  defp act(_tenant_id, _story_id, %Verdict{decision: decision} = verdict, _opts)
-       when decision in [:unevaluated, :already_merged],
-       do: verdict
+  defp act(_tenant_id, _story_id, %Verdict{decision: :already_merged} = verdict, _opts),
+    do: verdict
 
   defp act(tenant_id, story_id, %Verdict{decision: :allow} = verdict, opts) do
-    record_allow(tenant_id, story_id, verdict, opts)
+    # A conversion re-enters `act/4` rather than returning: the controller's contract is
+    # that a `:refuse` has ALREADY escalated, and a refusal that skipped the escalation
+    # would hand the loop a refusal over HTTP 200 while the story sat at `ci` with nothing
+    # recorded — and the `:effect_conflict` variant would repeat that answer for ever,
+    # because the epoch does not move across a `ci -> implementing -> ci` cycle. The
+    # recursion terminates: the second call carries `:refuse`.
+    case record_allow(tenant_id, story_id, verdict, opts) do
+      %Verdict{decision: :allow} = allowed -> allowed
+      %Verdict{} = converted -> act(tenant_id, story_id, converted, opts)
+    end
+  end
+
+  # The same shape for the unevaluated backstop: past the bound it stops being "retry" and
+  # becomes a refusal, which escalates through the ordinary path.
+  defp act(tenant_id, story_id, %Verdict{decision: :unevaluated} = verdict, opts) do
+    case note_unevaluated(tenant_id, story_id, verdict, opts) do
+      %Verdict{decision: :unevaluated} = waiting -> waiting
+      %Verdict{} = converted -> act(tenant_id, story_id, converted, opts)
+    end
   end
 
   defp act(tenant_id, story_id, %Verdict{decision: :head_moved} = verdict, opts) do
@@ -685,6 +770,32 @@ defmodule Loopctl.Delivery.MergePrecondition do
         )
 
         refuse(verdict, [{:allow_not_recorded, reason}])
+    end
+  end
+
+  # Counting is itself a write, so it is fenced and it can fail. A count that does not land
+  # leaves the verdict `:unevaluated` — the backstop is a safety net, not a second way to
+  # refuse — and the failure is logged and reported.
+  defp note_unevaluated(tenant_id, story_id, %Verdict{} = verdict, opts) do
+    write_opts = Keyword.take(opts, [:claim_epoch, :actor_label])
+
+    # Keyed to the RECORDED head, not the forge's: when the pull request cannot be read at
+    # all there is no forge head, and the recorded one is what identifies the work the loop
+    # is trying to merge either way.
+    case Stages.note_unevaluated(tenant_id, story_id, verdict.recorded_head_sha, write_opts) do
+      {:ok, count} when count > @max_consecutive_unevaluated ->
+        refuse(verdict, verdict.reasons ++ [{:unevaluated_limit_exceeded, count}])
+
+      {:ok, _count} ->
+        verdict
+
+      {:error, reason} ->
+        Logger.warning(
+          "merge_gate unevaluated not counted story_id=#{story_id} tenant_id=#{tenant_id} " <>
+            "reason=#{inspect(reason)}"
+        )
+
+        %{verdict | reasons: verdict.reasons ++ [{:unevaluated_not_counted, reason}]}
     end
   end
 

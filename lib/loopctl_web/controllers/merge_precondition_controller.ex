@@ -50,6 +50,13 @@ defmodule LoopctlWeb.MergePreconditionController do
   error. `503` for `unevaluated`, a transient forge fault where nothing was decided and
   nothing transitioned: the caller retries, and an HTTP status that cannot be mistaken for
   an answer is the point.
+
+  A `503` always carries `Retry-After` — the forge's own delay when it gave one, else a
+  fixed floor. The commonest cause of an unevaluated verdict is a rate limit, so a caller
+  that retried at will would amplify the very condition it is waiting out. The retry is
+  also BOUNDED at the other end: consecutive unevaluated results at one head escalate the
+  story once they pass `Loopctl.Delivery.MergePrecondition.max_consecutive_unevaluated/0`,
+  so a fault that never clears ends with a human being told rather than an endless loop.
   """
 
   use LoopctlWeb, :controller
@@ -63,6 +70,10 @@ defmodule LoopctlWeb.MergePreconditionController do
   alias Loopctl.Dispatches
 
   action_fallback LoopctlWeb.FallbackController
+
+  # The `Retry-After` an `unevaluated` verdict carries when the forge named no delay of its
+  # own. Documented in the operation below, so the contract never reads as "retry at will".
+  @default_retry_after_seconds 30
 
   @reason_schema %OpenApiSpex.Schema{
     type: :object,
@@ -183,8 +194,10 @@ defmodule LoopctlWeb.MergePreconditionController do
     responses: %{
       200 => {"Verdict", "application/json", @verdict_schema},
       503 =>
-        {"Transient forge fault — nothing was decided and nothing transitioned; retry",
-         "application/json", @verdict_schema},
+        {"Transient forge fault — nothing was decided and nothing transitioned. Retry no " <>
+           "sooner than the `Retry-After` header, which is always present. Consecutive " <>
+           "unevaluated results at one head escalate the story, so this cannot repeat " <>
+           "for ever.", "application/json", @verdict_schema},
       403 =>
         {"Insufficient role (exact orchestrator or user)", "application/json",
          Schemas.ErrorResponse},
@@ -207,6 +220,7 @@ defmodule LoopctlWeb.MergePreconditionController do
            enforce(tenant_id, story_id, api_key, claim_epoch, trio_outputs, params) do
       conn
       |> put_status(status_for(verdict))
+      |> put_retry_after(verdict)
       |> json(%{data: render_verdict(verdict)})
     end
   end
@@ -214,6 +228,17 @@ defmodule LoopctlWeb.MergePreconditionController do
   # A transient forge fault is not an answer, and must not read as one.
   defp status_for(%Verdict{decision: :unevaluated}), do: :service_unavailable
   defp status_for(%Verdict{}), do: :ok
+
+  # The dominant cause of an unevaluated verdict is a rate limit, so a caller retrying at
+  # will amplifies the condition it is waiting out. `Retry-After` carries the forge's own
+  # delay when it gave one, and `@default_retry_after_seconds` when it did not — the
+  # contract states a floor either way, so there is no reading of it that means "at once".
+  defp put_retry_after(conn, %Verdict{decision: :unevaluated} = verdict) do
+    seconds = verdict.retry_after || @default_retry_after_seconds
+    put_resp_header(conn, "retry-after", Integer.to_string(seconds))
+  end
+
+  defp put_retry_after(conn, %Verdict{}), do: conn
 
   defp enforce(tenant_id, story_id, api_key, claim_epoch, trio_outputs, params) do
     opts = [
@@ -291,12 +316,14 @@ defmodule LoopctlWeb.MergePreconditionController do
       repo: verdict.repo,
       pr_number: verdict.pr_number,
       head_sha: verdict.head_sha,
+      recorded_head_sha: verdict.recorded_head_sha,
       merge_base_sha: verdict.merge_base_sha,
       merge_sha: verdict.merge_sha,
       diffstat: verdict.diffstat,
       hard_bound: MergePrecondition.hard_bound(),
       custody: verdict.custody,
       gate_a_inputs: verdict.gate_a_inputs,
+      retry_after: verdict.retry_after,
       gate_a: gate_a(verdict.gate_a),
       gate_b: gate_b(verdict.gate_b),
       proof: proof(verdict.proof)

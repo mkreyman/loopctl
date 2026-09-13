@@ -381,6 +381,73 @@ defmodule Loopctl.Delivery.Stages do
   end
 
   @doc """
+  Counts a merge-gate evaluation at `head_sha` that produced NO verdict (#803), and returns
+  the CONSECUTIVE count at that head.
+
+  `Loopctl.Delivery.MergePrecondition` answers `:unevaluated` and transitions nothing when
+  the forge is transiently unavailable, on purpose: one blip must not park a story on a
+  human, and `escalated` is human-only. A fault that never clears would then produce that
+  same answer for ever, with no escalation written and nobody told — so the gate escalates
+  once this count passes its bound.
+
+  The count RESETS when `head_sha` differs from the one it was last kept for: a new head is
+  new material, and a story's blips at an older head should not escalate it. It is not an
+  `attempts` key (those are EDGE names, per `StageMachine.counted?/1`) and it cannot be a
+  side-effect identity (a second, different value there is `:effect_conflict` by design), so
+  it has its own column and this writer.
+
+  Fenced by the claim epoch like every other write here, and refused off `ci` — no other
+  stage runs this gate.
+
+  ## Options
+
+  - `:claim_epoch` (required), `:actor_label`
+  """
+  @spec note_unevaluated(Ecto.UUID.t(), Ecto.UUID.t(), String.t() | nil, keyword()) ::
+          {:ok, pos_integer()} | {:error, :not_found | :stale_claim_epoch | :wrong_stage | :busy}
+  def note_unevaluated(tenant_id, story_id, head_sha, opts) do
+    epoch = Keyword.fetch!(opts, :claim_epoch)
+
+    in_tenant(tenant_id, fn ->
+      story = share_lock_story(tenant_id, story_id)
+      if story.claim_epoch != epoch, do: Repo.rollback(:stale_claim_epoch)
+
+      case lock_row(tenant_id, story_id) do
+        nil -> Repo.rollback(:not_found)
+        row -> {count_unevaluated(row, story, head_sha, opts), nil}
+      end
+    end)
+  end
+
+  defp count_unevaluated(row, story, head_sha, opts) do
+    if row.claim_epoch != story.claim_epoch, do: Repo.rollback(:stale_claim_epoch)
+    if row.stage != :ci, do: Repo.rollback(:wrong_stage)
+
+    count = next_unevaluated_count(row.merge_gate_unevaluated, head_sha)
+    value = %{"head_sha" => head_sha, "count" => count}
+
+    {1, [row]} =
+      from(s in StoryStage,
+        where: s.id == ^row.id and s.tenant_id == ^row.tenant_id,
+        select: s,
+        update: [
+          set: [merge_gate_unevaluated: ^value, updated_at: ^DateTime.utc_now()],
+          inc: [lock_version: 1]
+        ]
+      )
+      |> Repo.update_all([])
+
+    insert_event(Repo, row, "merge_gate_unevaluated", nil, nil, opts[:actor_label], value)
+    count
+  end
+
+  defp next_unevaluated_count(%{"head_sha" => head, "count" => count}, head)
+       when is_integer(count) and count >= 0,
+       do: count + 1
+
+  defp next_unevaluated_count(_previous, _head_sha), do: 1
+
+  @doc """
   Records the identity of a side effect on the story's stage row, idempotently.
 
   `effect` is one of `StageMachine.effects/0`: `:runner_id` (a runner UUID),

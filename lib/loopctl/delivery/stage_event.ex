@@ -10,6 +10,10 @@ defmodule Loopctl.Delivery.StageEvent do
     changing its stage (`Loopctl.Delivery.Stages.follow_release/5`).
   - `effect_recorded` — a side-effect identity was set for the first time; `data` carries
     its name and value, so an identity a later edge clears is still on record here.
+  - `merge_gate_unevaluated` — the merge precondition ran and produced NO verdict because
+    the forge was transiently unavailable (#803); `data` carries the head and the
+    consecutive count. Nothing transitions on one of these, so without the event a story
+    going quiet would leave no trace at all.
 
   Custody-critical transitions are ALSO on the audit chain; this table is the complete
   record and the chain the tamper-evident one.

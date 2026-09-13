@@ -33,6 +33,14 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   - a rename with no `previous_filename` — Gate B matches triggers against BOTH names, so
     a rename missing its old name could move a file out of a guarded path unseen
 
+  ## A 403 is two different things
+
+  GitHub answers both a rate limit and a permanent permission denial with 403. They need
+  opposite answers — retry versus tell a human — and the headers are what separate them:
+  `x-ratelimit-remaining: 0` or a `retry-after` means a limit, and neither means the token
+  cannot do this. A limit is reported as `{:github_rate_limited, status, retry_after}`;
+  everything else keeps `{:github_api_error, status}`.
+
   ## Authentication
 
   `GITHUB_TOKEN`, through `Loopctl.Verification.GitHubActions.auth_headers/1` — one rule
@@ -205,9 +213,51 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
     url = @api_base <> "/repos/" <> repo <> path
 
     case Req.get(url, req_options()) do
-      {:ok, %{status: 200, body: body}} -> {:ok, body}
-      {:ok, %{status: status}} -> {:error, {:github_api_error, status}}
+      {:ok, %Req.Response{status: 200, body: body}} -> {:ok, body}
+      {:ok, %Req.Response{} = response} -> {:error, failure(response)}
       {:error, reason} -> {:error, {:github_unreachable, shape(reason)}}
+    end
+  end
+
+  # A 403 is TWO different things at GitHub and they need opposite answers.
+  #
+  # A rate limit is transient: wait and it clears, so the caller retries and the story stays
+  # where it is. A PERMISSION denial is permanent — "Resource not accessible by personal
+  # access token" is the shape a fine-grained token with pull-request read but no contents
+  # read returns for every tree call, forever. Calling that transient makes the gate answer
+  # "retry" for all time with no escalation ever written and no human told, which is exactly
+  # what the 404/401 classification exists to avoid, reached through the one status assumed
+  # benign.
+  #
+  # The headers are what tell them apart: GitHub sends `x-ratelimit-remaining: 0` on a
+  # primary-limit 403 and a `retry-after` on a secondary one. Neither present means the
+  # token cannot do this, and that is configuration for a human.
+  defp failure(%Req.Response{status: status} = response) when status in [403, 429] do
+    case {exhausted?(response), retry_after(response)} do
+      {false, nil} when status == 403 -> {:github_api_error, 403}
+      {_exhausted, retry_after} -> {:github_rate_limited, status, retry_after}
+    end
+  end
+
+  defp failure(%Req.Response{status: status}), do: {:github_api_error, status}
+
+  defp exhausted?(response) do
+    case Req.Response.get_header(response, "x-ratelimit-remaining") do
+      ["0" | _rest] -> true
+      _other -> false
+    end
+  end
+
+  # Seconds, and only when the forge gave a plain delta. An HTTP-date `Retry-After` is legal
+  # and is deliberately NOT parsed into a number here: the caller's own backoff is the
+  # fallback, and a misparsed date would be worse than none.
+  defp retry_after(response) do
+    with [value | _rest] <- Req.Response.get_header(response, "retry-after"),
+         {seconds, ""} <- Integer.parse(String.trim(value)),
+         true <- seconds >= 0 do
+      seconds
+    else
+      _other -> nil
     end
   end
 

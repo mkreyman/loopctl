@@ -92,9 +92,56 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
     end
 
     test "a non-200 is an error, never an empty diff" do
-      stub(fn conn -> Plug.Conn.resp(conn, 403, ~s({"message":"rate limited"})) end)
+      stub(fn conn -> Plug.Conn.resp(conn, 500, ~s({"message":"boom"})) end)
+
+      assert {:error, {:github_api_error, 500}} = Source.pull_request(@repo, 7)
+    end
+
+    test "a 403 with NO rate-limit headers is a permission denial, not a rate limit" do
+      # "Resource not accessible by personal access token" — a fine-grained token missing a
+      # scope. It never clears, so it must not be reported as something to retry.
+      stub(fn conn ->
+        Plug.Conn.resp(conn, 403, ~s({"message":"Resource not accessible by token"}))
+      end)
 
       assert {:error, {:github_api_error, 403}} = Source.pull_request(@repo, 7)
+    end
+
+    test "a 403 with an exhausted rate limit IS a rate limit" do
+      stub(fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header("x-ratelimit-remaining", "0")
+        |> Plug.Conn.resp(403, ~s({"message":"API rate limit exceeded"}))
+      end)
+
+      assert {:error, {:github_rate_limited, 403, nil}} = Source.pull_request(@repo, 7)
+    end
+
+    test "a 403 with a retry-after IS a rate limit, and the delay is carried" do
+      stub(fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header("retry-after", "60")
+        |> Plug.Conn.resp(403, ~s({"message":"secondary rate limit"}))
+      end)
+
+      assert {:error, {:github_rate_limited, 403, 60}} = Source.pull_request(@repo, 7)
+    end
+
+    test "a 429 is a rate limit whatever its headers say" do
+      stub(fn conn -> Plug.Conn.resp(conn, 429, "") end)
+
+      assert {:error, {:github_rate_limited, 429, nil}} = Source.pull_request(@repo, 7)
+    end
+
+    test "an HTTP-date retry-after is not guessed at — the caller's own floor applies" do
+      stub(fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT")
+        |> Plug.Conn.put_resp_header("x-ratelimit-remaining", "0")
+        |> Plug.Conn.resp(403, "")
+      end)
+
+      assert {:error, {:github_rate_limited, 403, nil}} = Source.pull_request(@repo, 7)
     end
 
     test "a body missing the fields it needs is an error naming only its SHAPE" do

@@ -24,9 +24,14 @@ All notable changes to loopctl are documented here.
   its merge base all REFUSE. There is no failure that merges.
 
   **A TRANSIENT forge fault answers `503 unevaluated` and transitions nothing** — transport,
-  a 5xx, a 429, a rate-limit 403. `escalated` is human-only, so escalating on one network
-  blip would park a story until a human acted; the caller retries instead. A 404 or a 401 is
-  configuration, not a blip, and still escalates.
+  a 5xx, a 429, and a 403 GitHub marked as a rate limit. `escalated` is human-only, so
+  escalating on one network blip would park a story until a human acted; the caller retries
+  instead, no sooner than the `Retry-After` every 503 carries. A 404, a 401 and a BARE 403
+  are configuration, not a blip, and still escalate — GitHub answers a permanent permission
+  denial with 403 too, and the rate-limit headers are what separate them.
+
+  **The retry is bounded at both ends.** Consecutive unevaluated results at one head escalate
+  the story once they pass a small limit, so no fault can retry for ever with nobody told.
 
   **Merges the gate did not authorise are escalated, not ratified.** An `allow` is RECORDED
   against the head it judged, and an already-merged pull request is only adopted when a
@@ -34,7 +39,9 @@ All notable changes to loopctl are documented here.
   escalates with the sha named in the reason. A pull request whose head is not the one CI
   ran on comes back `head_moved` and returns to `implementing` rather than merging.
 
-  **Migration, no manual step:** `story_stages` gains `merge_gate_allowed_sha`, the head the
+  **Migrations, no manual step:** `story_stages` gains `merge_gate_unevaluated`, the
+  consecutive-unevaluated count per head, and `story_stage_events` accepts one more event
+  name for it. And `story_stages` gains `merge_gate_allowed_sha`, the head the
   merge gate allowed. It is cleared with `head_sha` by every edge that clears it. Existing
   rows get NULL, so an already-merged pull request in flight at deploy time escalates as
   ungated rather than being adopted — deliberate, and it clears as soon as the loop runs the

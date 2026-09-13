@@ -20,6 +20,13 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
   - `gate_a_inputs` — `:caller_asserted` while the triage trio's outputs arrive in the
     request. Recorded on every verdict and named in the escalation reason, because Gate A's
     verdict is only as trustworthy as inputs the same principal supplied
+  - `recorded_head_sha` — the head the STAGE ROW carries: what CI ran on and the story was
+    verified at. Known even when the forge cannot be reached, which is why the
+    consecutive-unevaluated count is kept per THIS head rather than the forge's
+  - `retry_after` — on `:unevaluated`, the seconds the FORGE asked a caller to wait, when it
+    said so at all. The endpoint sends it as `Retry-After`; the dominant cause of an
+    unevaluated verdict is a rate limit, so an unbounded retry would amplify the very
+    condition it is waiting out
   - `repo`, `pr_number`, `head_sha`, `merge_base_sha` — what was judged, server-resolved.
     A verdict is only ever about the diff at THIS head
   - `merge_sha` — set only on `:already_merged`: the sha the forge reports for a pull
@@ -54,6 +61,8 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
     :gate_a,
     :gate_b,
     :proof,
+    :retry_after,
+    :recorded_head_sha,
     custody: nil,
     gate_a_inputs: :caller_asserted
   ]
@@ -73,6 +82,8 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
           gate_b: GateB.Result.t() | nil,
           proof: GateB.ProofResult.t() | nil,
           custody: :ok | atom() | nil,
-          gate_a_inputs: :caller_asserted
+          gate_a_inputs: :caller_asserted,
+          retry_after: pos_integer() | nil,
+          recorded_head_sha: String.t() | nil
         }
 end

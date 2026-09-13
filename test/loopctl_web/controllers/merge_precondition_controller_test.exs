@@ -165,9 +165,27 @@ defmodule LoopctlWeb.MergePreconditionControllerTest do
 
       {key, _} = orchestrator_key(ctx)
 
-      assert %{"data" => data} = ctx |> post_precondition(key) |> json_response(503)
+      response = post_precondition(ctx, key)
+
+      assert %{"data" => data} = json_response(response, 503)
       assert data["decision"] == "unevaluated"
+      # The commonest cause is a rate limit, so an unbounded retry would amplify the very
+      # condition the caller is waiting out.
+      assert ["30"] = get_resp_header(response, "retry-after")
       assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :ci
+    end
+
+    test "a 503 carries the FORGE's own delay when it named one", ctx do
+      Mox.stub(MockPullRequestSource, :pull_request, fn _repo, _n ->
+        {:error, {:github_rate_limited, 403, 120}}
+      end)
+
+      {key, _} = orchestrator_key(ctx)
+      response = post_precondition(ctx, key)
+
+      assert %{"data" => data} = json_response(response, 503)
+      assert data["retry_after"] == 120
+      assert ["120"] = get_resp_header(response, "retry-after")
     end
 
     test "an allow is recorded against the head, and the endpoint is what records it", ctx do

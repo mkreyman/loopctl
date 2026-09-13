@@ -344,11 +344,19 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       assert {:pull_request_unavailable, {:github_unreachable, :timeout}} in verdict.reasons
     end
 
-    test "a rate-limited forge is :unevaluated" do
-      verdict = judge(pull_request: {:error, {:github_api_error, 403}})
+    test "a rate-limited forge is :unevaluated, and carries the delay it asked for" do
+      verdict = judge(pull_request: {:error, {:github_rate_limited, 403, 90}})
 
       assert verdict.decision == :unevaluated
-      assert {:pull_request_unavailable, {:github_api_error, 403}} in verdict.reasons
+      assert {:pull_request_unavailable, {:github_rate_limited, 403, 90}} in verdict.reasons
+      assert verdict.retry_after == 90
+    end
+
+    test "a rate limit with no stated delay is still :unevaluated, with no retry_after" do
+      verdict = judge(pull_request: {:error, {:github_rate_limited, 429, nil}})
+
+      assert verdict.decision == :unevaluated
+      assert is_nil(verdict.retry_after)
     end
 
     test "a 5xx is :unevaluated" do
@@ -385,10 +393,23 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       assert MergePrecondition.transient?({:github_unreachable, :closed})
       assert MergePrecondition.transient?({:github_api_error, 429})
       assert MergePrecondition.transient?({:github_api_error, 503})
+      assert MergePrecondition.transient?({:github_rate_limited, 403, 60})
       refute MergePrecondition.transient?({:github_api_error, 404})
       refute MergePrecondition.transient?({:github_api_error, 401})
       refute MergePrecondition.transient?({:unreadable_pull_request, :invalid_field_types})
       refute MergePrecondition.transient?({:tree_truncated, "abc"})
+    end
+
+    test "a BARE 403 is a permission denial and escalates — it is not a rate limit" do
+      # GitHub answers both with 403. A fine-grained token that cannot read a repository's
+      # contents 403s for ever, so treating every 403 as transient is a story retried for
+      # ever with nobody told.
+      refute MergePrecondition.transient?({:github_api_error, 403})
+
+      verdict = judge(pull_request: {:error, {:github_api_error, 403}})
+
+      assert verdict.decision == :refuse
+      assert {:pull_request_unavailable, {:github_api_error, 403}} in verdict.reasons
     end
   end
 
@@ -635,6 +656,27 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
 
       assert verdict.decision == :refuse
       assert :merged_without_sha in verdict.reasons
+    end
+
+    test "a TRANSIENT tree fault cannot suppress the ungated-merge escalation" do
+      # The already-merged branch reads neither file list, so a rate-limited tree call is a
+      # fault the decision never consumes — and suppressing the loudest signal this module
+      # produces on one is exactly the failure the scoping prevents.
+      merge_sha = String.duplicate("c", 40)
+
+      verdict =
+        judge(
+          merged?: true,
+          state: "closed",
+          merge_sha: merge_sha,
+          recorded_allow_sha: nil,
+          head_files: {:error, {:github_rate_limited, 429, 60}},
+          base_files: {:error, {:github_rate_limited, 429, 60}},
+          diffstat: %{files: 1, changed_lines: 1}
+        )
+
+      assert verdict.decision == :refuse
+      assert {:ungated_merge, merge_sha, :no_recorded_allow} in verdict.reasons
     end
 
     test "an authorised already-merged pull request still reports a custody problem" do

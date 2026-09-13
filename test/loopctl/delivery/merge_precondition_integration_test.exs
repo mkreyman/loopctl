@@ -158,9 +158,35 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert Stages.get(ctx.tenant_id, ctx.story_id).merge_gate_allowed_sha == @head
     end
 
-    test "an ALLOW that cannot be recorded becomes a refusal", ctx do
-      # A stale epoch cannot write, and an allow nobody recorded is an allow nobody can
-      # later account for — so it must not stand.
+    test "an ALLOW that cannot be recorded becomes a refusal, and that refusal ESCALATES",
+         ctx do
+      # An allow nobody recorded is an allow nobody can later account for, so it must not
+      # stand — AND the refusal it becomes has to take the same escalation path as any
+      # other, or the caller is handed "refuse" over HTTP 200 while the story sits at `ci`
+      # with nothing recorded.
+      stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 1})
+      conflicting_head = String.duplicate("9", 40)
+
+      {:ok, _row} =
+        Stages.record_effect(
+          ctx.tenant_id,
+          ctx.story_id,
+          :merge_gate_allowed_sha,
+          conflicting_head,
+          claim_epoch: 0
+        )
+
+      assert {:ok, %Verdict{decision: :refuse, reasons: reasons}} = enforce(ctx)
+      assert {:allow_not_recorded, :effect_conflict} in reasons
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :escalated
+      assert row.escalation_reason =~ "allow_not_recorded"
+    end
+
+    test "an allow that cannot be recorded under a stale epoch cannot escalate either", ctx do
+      # Both writes are fenced by the same epoch, so this one reports BOTH failures rather
+      # than claiming an escalation it did not write.
       stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 1})
 
       assert {:ok, %Verdict{decision: :refuse, reasons: reasons}} =
@@ -171,7 +197,11 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
                )
 
       assert {:allow_not_recorded, :stale_claim_epoch} in reasons
-      assert is_nil(Stages.get(ctx.tenant_id, ctx.story_id).merge_gate_allowed_sha)
+      assert {:transition_failed, :escalated, :merge_gate, :stale_claim_epoch} in reasons
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :ci
+      assert is_nil(row.merge_gate_allowed_sha)
     end
 
     test "an already-merged head with NO recorded allow escalates as an ungated merge", ctx do
@@ -224,16 +254,50 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert is_nil(row.merge_gate_allowed_sha)
     end
 
-    test "a TRANSIENT forge fault transitions nothing", ctx do
-      Mox.stub(MockPullRequestSource, :pull_request, fn _repo, _n ->
-        {:error, {:github_unreachable, :timeout}}
-      end)
+    test "a TRANSIENT forge fault transitions nothing, and is COUNTED", ctx do
+      stub_unreachable()
 
       assert {:ok, %Verdict{decision: :unevaluated, reasons: reasons}} = enforce(ctx)
       assert {:pull_request_unavailable, {:github_unreachable, :timeout}} in reasons
 
       # One blip must not park a story on a human: `escalated` is human-only.
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :ci
+      assert row.merge_gate_unevaluated == %{"head_sha" => @head, "count" => 1}
+    end
+
+    test "a fault that never clears ESCALATES once it passes the bound", ctx do
+      # The backstop under "no condition may retry for ever with nobody told".
+      stub_unreachable()
+      limit = MergePrecondition.max_consecutive_unevaluated()
+
+      for _attempt <- 1..limit do
+        assert {:ok, %Verdict{decision: :unevaluated}} = enforce(ctx)
+      end
+
       assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :ci
+
+      assert {:ok, %Verdict{decision: :refuse, reasons: reasons}} = enforce(ctx)
+      assert {:unevaluated_limit_exceeded, limit + 1} in reasons
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :escalated
+      # The escalation names the fault, not just the count.
+      assert row.escalation_reason =~ "unevaluated_limit_exceeded"
+      assert row.escalation_reason =~ "github_unreachable"
+    end
+
+    test "the count is kept per the RECORDED head, which is known when the forge is not",
+         ctx do
+      # The forge head is unknown when the pull request cannot be read at all, so keying on
+      # it would collapse every story's count onto `null`. The reset-on-a-new-head half is
+      # `Stages.note_unevaluated/4`'s own property and is tested there.
+      stub_unreachable()
+
+      assert {:ok, %Verdict{decision: :unevaluated, head_sha: nil, recorded_head_sha: @head}} =
+               enforce(ctx)
+
+      assert Stages.get(ctx.tenant_id, ctx.story_id).merge_gate_unevaluated["head_sha"] == @head
     end
 
     test "a repeated refusal does not escalate twice", ctx do
@@ -321,6 +385,16 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
     end)
 
     Mox.stub(MockPullRequestSource, :repo_files, fn @repo, _ref -> {:ok, @repo_files} end)
+  end
+
+  defp stub_unreachable do
+    Mox.stub(MockPullRequestSource, :pull_request, fn @repo, _number ->
+      {:error, {:github_unreachable, :timeout}}
+    end)
+
+    Mox.stub(MockPullRequestSource, :repo_files, fn @repo, _ref ->
+      {:error, {:github_unreachable, :timeout}}
+    end)
   end
 
   defp stub_merged(merge_sha) do

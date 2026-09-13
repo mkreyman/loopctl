@@ -348,6 +348,70 @@ defmodule Loopctl.Delivery.StagesTest do
     end
   end
 
+  describe "note_unevaluated/4" do
+    test "counts consecutive results at ONE head, and resets when the head moves" do
+      {story, _row} = at_stage(:ci)
+      opts = [claim_epoch: story.claim_epoch]
+      head = String.duplicate("a", 40)
+      moved = String.duplicate("b", 40)
+
+      assert {:ok, 1} = Stages.note_unevaluated(story.tenant_id, story.id, head, opts)
+      assert {:ok, 2} = Stages.note_unevaluated(story.tenant_id, story.id, head, opts)
+      assert {:ok, 3} = Stages.note_unevaluated(story.tenant_id, story.id, head, opts)
+
+      # A new head is new material: a story's blips at an older one must not escalate it.
+      assert {:ok, 1} = Stages.note_unevaluated(story.tenant_id, story.id, moved, opts)
+
+      row = Stages.get(story.tenant_id, story.id)
+      assert row.merge_gate_unevaluated == %{"head_sha" => moved, "count" => 1}
+    end
+
+    test "leaves an event, so a story going quiet is on the record" do
+      {story, _row} = at_stage(:ci)
+      head = String.duplicate("a", 40)
+
+      assert {:ok, 1} =
+               Stages.note_unevaluated(story.tenant_id, story.id, head,
+                 claim_epoch: story.claim_epoch,
+                 actor_label: "test"
+               )
+
+      assert [%StageEvent{event: "merge_gate_unevaluated", data: data, actor_label: "test"}] =
+               story.tenant_id
+               |> Stages.list_events(story.id)
+               |> Enum.filter(&(&1.event == "merge_gate_unevaluated"))
+
+      assert data == %{"head_sha" => head, "count" => 1}
+    end
+
+    test "is refused off the ci stage — no other stage runs this gate" do
+      {story, _row} = at_stage(:implementing)
+
+      assert {:error, :wrong_stage} =
+               Stages.note_unevaluated(story.tenant_id, story.id, String.duplicate("a", 40),
+                 claim_epoch: story.claim_epoch
+               )
+    end
+
+    test "is fenced by the claim epoch like every other write here" do
+      {story, _row} = at_stage(:ci)
+
+      assert {:error, :stale_claim_epoch} =
+               Stages.note_unevaluated(story.tenant_id, story.id, String.duplicate("a", 40),
+                 claim_epoch: story.claim_epoch + 7
+               )
+    end
+
+    test "refuses a story with no stage row" do
+      story = fixture(:stage_story, %{})
+
+      assert {:error, :not_found} =
+               Stages.note_unevaluated(story.tenant_id, story.id, String.duplicate("a", 40),
+                 claim_epoch: story.claim_epoch
+               )
+    end
+  end
+
   describe "record_effect/5" do
     @values %{
       worktree_path: "/home/runner/workspace/app/.claude/worktrees/us-1",
