@@ -457,6 +457,11 @@ defmodule LoopctlWeb.RunnerChannel do
   # broadcast, and each rejoin starts a fresh channel process whose status interval has
   # never fired. So joins are budgeted per runner, before any of that, on the shared
   # limiter (fail-CLOSED: a limiter fault refuses the join and the runner retries).
+  #
+  # The budget is per NODE unless `RATE_LIMITER=postgres` selects the shared counter: the
+  # default limiter is node-local ETS, so a runner alternating between two machines gets up
+  # to twice `@max_joins`. Clustering does not change that. It bounds a reconnect loop's
+  # cost per node, which is what it is for, so the per-node default stands.
   defp join_rate_ok(runner) do
     if Loopctl.RateLimiter.gate_ok?("runner_join:" <> runner.id, @join_window_ms, @max_joins),
       do: :ok,
@@ -468,8 +473,9 @@ defmodule LoopctlWeb.RunnerChannel do
   defp enrolled_machine(%{machine: declared}, _runner),
     do: {:error, {:machine_mismatch, declared}}
 
-  # `node` and `machine_id` answer "which node holds this runner": two Fly machines can share
-  # a node name, so the machine id is the one that tells them apart.
+  # `node` and `machine_id` answer "which node holds this runner". Presence replicates this
+  # meta to every node of the cluster, so `GET /api/v1/runners/pool` on either machine names
+  # the node that holds the socket.
   defp presence_meta(meta, runner) do
     Map.merge(meta, %{
       runner_id: runner.id,
@@ -479,7 +485,9 @@ defmodule LoopctlWeb.RunnerChannel do
   end
 
   # This socket is tracked, and its meta is the only one in the tenant's pool holding the
-  # runner's id. An untracked channel (no ref yet) is never the sole socket.
+  # runner's id. An untracked channel (no ref yet) is never the sole socket. The pool is the
+  # cluster-wide Presence replica, so a second socket on ANOTHER node counts too, once its
+  # entry has replicated (see `Loopctl.Runners`, "Across the cluster").
   defp sole_live_socket?(%{assigns: %{presence_ref: ref, runner: runner, tenant_id: tenant_id}})
        when is_binary(ref) do
     match?([%{phx_ref: ^ref}], Runners.live_metas(tenant_id, runner.id))

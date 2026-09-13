@@ -17,8 +17,219 @@ defmodule Loopctl.ClusterReadinessTest do
   use ExUnit.Case, async: true
 
   import ExUnit.CaptureLog
+  import Mox
 
   alias Loopctl.ClusterReadiness
+
+  describe "a deployment whose peers may be suspended" do
+    test "fewer peers, and the DNS query lists no other machine: :peers_may_be_suspended" do
+      assert %{status: :peers_may_be_suspended, peers: 0} =
+               ClusterReadiness.readiness(2, [], true, true, 0)
+    end
+
+    test "fewer peers while the DNS query lists another running machine: the alarm, switch or not" do
+      # Both machines running, clustering broken — the failure this signal exists for.
+      assert %{status: :expected_peers_missing} = ClusterReadiness.readiness(2, [], true, true, 1)
+
+      assert %{status: :expected_peers_missing} =
+               ClusterReadiness.readiness(3, [:a@h], true, true, 2)
+    end
+
+    test "a failed lookup is not evidence of suspension, and alarms" do
+      assert %{status: :expected_peers_missing} =
+               ClusterReadiness.readiness(2, [], true, true, :unknown)
+    end
+
+    test "with the switch off, fewer peers always alarms, whatever DNS says" do
+      assert %{status: :expected_peers_missing} =
+               ClusterReadiness.readiness(2, [], true, false, 0)
+    end
+
+    test "every other classification is unchanged by the switch and the evidence" do
+      for {expected, peers, dns?} <- [
+            {2, [:peer@host], true},
+            {1, [], true},
+            {2, [], false},
+            {3, [], false}
+          ] do
+        assert ClusterReadiness.readiness(expected, peers, dns?, true, 0).status ==
+                 ClusterReadiness.readiness(expected, peers, dns?, false, :unknown).status
+      end
+    end
+
+    test "the boot check is quiet about a suspended peer, WARNs about a running unconnected one, and still about an unroutable node" do
+      quiet =
+        capture_log(fn ->
+          assert :ok == ClusterReadiness.boot_check(:"loopctl-x@fdaa::2", 2, [], true, true, 0)
+        end)
+
+      refute quiet =~ "UN-CLUSTERED"
+
+      running =
+        capture_log(fn ->
+          assert :ok == ClusterReadiness.boot_check(:"loopctl-x@fdaa::2", 2, [], true, true, 1)
+        end)
+
+      assert running =~ "UN-CLUSTERED"
+
+      unroutable =
+        capture_log(fn ->
+          assert :ok == ClusterReadiness.boot_check(:"loopctl@127.0.0.1", 2, [], true, true, 0)
+        end)
+
+      assert unroutable =~ "named on a loopback host"
+    end
+
+    test "CLUSTER_PEERS_MAY_SUSPEND is on only for exactly \"true\"" do
+      assert ClusterReadiness.parse_peers_may_suspend("true")
+
+      for value <- [nil, "", "false", "TRUE", "1", "yes"] do
+        refute ClusterReadiness.parse_peers_may_suspend(value), inspect(value)
+      end
+    end
+
+    test "peers_may_suspend?/0 is off where the config does not set it (test env)" do
+      refute ClusterReadiness.peers_may_suspend?()
+    end
+  end
+
+  describe "unconnected_running_peers/3 (the DNS evidence, through the injected resolver)" do
+    setup :verify_on_exit!
+
+    @own {64_938, 2, 28_853, 2683, 1761, 12_111, 3777, 2}
+    @b {64_938, 2, 28_853, 2683, 1852, 42_988, 24_983, 2}
+    @c {64_938, 2, 28_853, 2683, 1900, 1, 2, 3}
+    @node :"loopctl-01M2@fdaa:2:70b5:a7b:6e1:2f4f:ec1:2"
+    @b_node :"loopctl-01M2@fdaa:2:70b5:a7b:73c:a7ec:6197:2"
+    @c_node :"loopctl-01M2@fdaa:2:70b5:a7b:76c:1:2:3"
+
+    test "counts a listed machine this node is not connected to" do
+      expect(Loopctl.MockClusterDnsResolver, :lookup, fn "loopctl.internal" ->
+        {:ok, [@own, @b]}
+      end)
+
+      assert ClusterReadiness.unconnected_running_peers("loopctl.internal", @node, []) == 1
+    end
+
+    test "a listed machine that is connected does not count" do
+      expect(Loopctl.MockClusterDnsResolver, :lookup, fn _ -> {:ok, [@own, @b]} end)
+      assert ClusterReadiness.unconnected_running_peers("loopctl.internal", @node, [@b_node]) == 0
+    end
+
+    test "is 0 when the query lists only this node (the other machine is suspended)" do
+      expect(Loopctl.MockClusterDnsResolver, :lookup, fn _ -> {:ok, [@own]} end)
+      assert ClusterReadiness.unconnected_running_peers("loopctl.internal", @node, []) == 0
+    end
+
+    test "three machines: a connected peer no longer listed does not hide a listed one that never connected" do
+      # B was just suspended but is still in Node.list; C runs and never connected. By count
+      # (1 peer vs 1 other listed) this looked explained; by address it is not.
+      expect(Loopctl.MockClusterDnsResolver, :lookup, fn _ -> {:ok, [@own, @c]} end)
+
+      unconnected =
+        ClusterReadiness.unconnected_running_peers("loopctl.internal", @node, [@b_node])
+
+      assert unconnected == 1
+
+      assert %{status: :expected_peers_missing} =
+               ClusterReadiness.readiness(3, [@b_node], true, true, unconnected)
+    end
+
+    test "three machines, both others listed and connected: nothing unconnected" do
+      expect(Loopctl.MockClusterDnsResolver, :lookup, fn _ -> {:ok, [@own, @b, @c]} end)
+
+      assert ClusterReadiness.unconnected_running_peers(
+               "loopctl.internal",
+               @node,
+               [@b_node, @c_node]
+             ) == 0
+    end
+
+    test "is :unknown when the lookup fails, and when there is no query" do
+      expect(Loopctl.MockClusterDnsResolver, :lookup, fn _ -> {:error, :timeout} end)
+      assert ClusterReadiness.unconnected_running_peers("loopctl.internal", @node, []) == :unknown
+      assert ClusterReadiness.unconnected_running_peers(nil, @node, []) == :unknown
+    end
+
+    test "end to end: both machines listed, none connected, switch on — the alarm and its WARN" do
+      expect(Loopctl.MockClusterDnsResolver, :lookup, fn _ -> {:ok, [@own, @b]} end)
+      unconnected = ClusterReadiness.unconnected_running_peers("loopctl.internal", @node, [])
+
+      assert %{status: :expected_peers_missing} =
+               ClusterReadiness.readiness(2, [], true, true, unconnected)
+
+      log =
+        capture_log(fn ->
+          ClusterReadiness.warn_if_expected_peers_missing(2, [], true, true, unconnected)
+        end)
+
+      assert log =~ "UN-CLUSTERED"
+    end
+  end
+
+  describe "connected_peers/0" do
+    test "is the connected peer count, with no expectation attached" do
+      assert ClusterReadiness.connected_peers() == length(Node.list())
+      assert is_integer(ClusterReadiness.connected_peers())
+    end
+  end
+
+  describe "distribution_routable?/1 and the unroutable-node WARN" do
+    test "a node named after a routable address is reachable; loopback and undistributed are not" do
+      assert ClusterReadiness.distribution_routable?(:"loopctl-01K4@fdaa:0:1:a7b:2b8:36e4:711e:2")
+      assert ClusterReadiness.distribution_routable?(:"loopctl@10.0.0.5")
+
+      for node <- [:"loopctl@127.0.0.1", :"loopctl@::1", :loopctl@localhost, :nonode@nohost] do
+        refute ClusterReadiness.distribution_routable?(node), inspect(node)
+      end
+    end
+
+    test "DNS configured on the production node name that could never cluster WARNs, without the name" do
+      log =
+        capture_log(fn ->
+          assert :ok ==
+                   ClusterReadiness.warn_if_distribution_unroutable(:"loopctl@127.0.0.1", true)
+        end)
+
+      assert log =~ "named on a loopback host"
+      assert log =~ "UN-CLUSTERED"
+      refute log =~ "127.0.0.1"
+      refute log =~ "loopctl@"
+    end
+
+    test "an undistributed node with DNS configured WARNs as not distributed" do
+      log =
+        capture_log(fn ->
+          assert :ok == ClusterReadiness.warn_if_distribution_unroutable(:nonode@nohost, true)
+        end)
+
+      assert log =~ "not distributed"
+    end
+
+    test "the boot check runs the unroutable-node WARN as well as the peers WARN" do
+      log =
+        capture_log(fn ->
+          assert :ok ==
+                   ClusterReadiness.boot_check(:"loopctl@127.0.0.1", 2, [], true, false, :unknown)
+        end)
+
+      assert log =~ "named on a loopback host"
+      assert log =~ "EXPECTED_APP_NODES=2"
+    end
+
+    test "no WARN when DNS is unset, or when the node is routable" do
+      log =
+        capture_log(fn ->
+          assert :ok ==
+                   ClusterReadiness.warn_if_distribution_unroutable(:"loopctl@127.0.0.1", false)
+
+          assert :ok ==
+                   ClusterReadiness.warn_if_distribution_unroutable(:"loopctl-x@fdaa::2", true)
+        end)
+
+      refute log =~ "Clustering readiness"
+    end
+  end
 
   describe "readiness/3 classification (AC-38.3.2)" do
     test "TC-38.3.2: <= 1 expected node is :single_node (clustering not required), never an error" do

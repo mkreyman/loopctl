@@ -6,6 +6,39 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **The production machines form one BEAM cluster.** Until now both Fly machines booted as
+  `loopctl@127.0.0.1` with IPv4 distribution and no `DNS_CLUSTER_QUERY`, so each was an
+  island: PubSub (runner dispatch delivery, revocation, cache invalidation) and the runner
+  pool (Presence) were node-local, and a runner that reconnected to the other machine
+  vanished from the first one's pool.
+
+  **`rel/env.sh.eex`** names the node `loopctl-<release>@$FLY_PRIVATE_IP` and exports
+  `ERL_AFLAGS="-proto_dist inet6_tcp"` when `FLY_PRIVATE_IP` is set (Fly's private network
+  is IPv6-only). Off Fly nothing changes. **`fly.toml` `[env]`** gains
+  `DNS_CLUSTER_QUERY = "loopctl.internal"`, `EXPECTED_APP_NODES = "2"` (the machines that
+  can run, which the DB connection budget needs) and `CLUSTER_PEERS_MAY_SUSPEND = "true"`:
+  with `auto_stop_machines` the second machine is usually suspended, so a missing peer reads
+  `peers_may_be_suspended` instead of the `expected_peers_missing` alarm — only while
+  `loopctl.internal`, which lists started machines only, lists no other machine this node
+  is not connected to. Two running machines that fail to connect still alarm.
+
+  **No secret to set, no deploy ordering.** The release carries its own cookie, and the node
+  basename carries the release, so only machines of one release cluster. **Before deploying,
+  confirm neither `DNS_CLUSTER_QUERY` nor `EXPECTED_APP_NODES` exists as a Fly secret**
+  (`fly secrets list`): a secret overrides `[env]`. During a rolling deploy the replaced
+  machine and the one still on the previous release do not see each other until the second
+  is replaced as well — the runner pool on each shows only its own runners for that window,
+  as it did before this change.
+
+  **Also:** the SystemConfig refresh cron now broadcasts its refresh, so every connected
+  node re-reads `system_configs` each minute (it ran on one node per tick); the STH
+  enqueuer's cluster singleton resolves the duplicate leadership two nodes bring to a
+  connection by standing one down instead of `:global` killing it; and
+  `Loopctl.ClusterReadiness` warns at boot when `DNS_CLUSTER_QUERY` is set on a node no peer
+  could reach. The new untagged `loopctl.cluster.peers.connected` gauge reports the connected
+  peer count with no judgement. **After the deploy, with both machines started, verify:**
+  `loopctl.cluster.peers.connected` is 1 on both machines.
+
 - **Runner control plane observability (#815).**
 
   **`fly.toml` now stops the VM with `kill_signal = "SIGTERM"` and `kill_timeout = 90`.** Fly's

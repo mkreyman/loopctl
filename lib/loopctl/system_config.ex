@@ -7,10 +7,12 @@ defmodule Loopctl.SystemConfig do
   no redeploy. The change is picked up immediately on the WRITING node (`put/2`).
   Other nodes refresh their node-local cache from the DB asynchronously via the
   `SystemConfigRefreshWorker` Oban cron. That cron enqueues ONE job per tick
-  CLUSTER-WIDE (run by a single node), so "within a minute" holds for a
-  SINGLE-NODE deployment; on a MULTI-NODE cluster a given node's adoption latency
-  is unbounded (it may lag many ticks). Callers that need a per-node propagation
-  guarantee must not assume ~60s fleet-wide — confirm per node.
+  CLUSTER-WIDE (run by a single node), which then broadcasts the refresh to every
+  CONNECTED node (`Loopctl.SystemConfig.RefreshListener`), so "within a minute" holds
+  per node while the nodes are clustered. A node that is NOT connected — a netsplit, an
+  unclustered deployment, a machine still on the previous release during a rolling
+  deploy — adopts a change only when the cron lands on it, which is unbounded. Callers
+  that need a per-node propagation guarantee must confirm per node.
 
   ## Hot-path read
 
@@ -39,9 +41,10 @@ defmodule Loopctl.SystemConfig do
       source) and before `Oban` and `LoopctlWeb.Endpoint` — because a supervisor
       starts children synchronously in list order, that placement GUARANTEES the
       cache is authoritative before either of those consumers accepts work, and
-    * every cron tick by `Loopctl.Workers.SystemConfigRefreshWorker` — but that
-      job runs on ONE node per tick, so on a multi-node cluster a given node's
-      refresh cadence is not bounded to one minute, and
+    * every cron tick by `Loopctl.Workers.SystemConfigRefreshWorker`, which runs on
+      ONE node per tick and broadcasts the refresh to every connected peer
+      (`Loopctl.SystemConfig.RefreshListener`) — an unconnected node's cadence is not
+      bounded to one minute, and
     * immediately for a single key on `put/2` (the writing node only).
 
   `refresh/0` guards the DB read with `rescue` AND `catch :exit, :throw` so a DB
@@ -115,6 +118,19 @@ defmodule Loopctl.SystemConfig do
   """
   @spec refresh() :: :ok | {:error, term()}
   def refresh, do: refresh_from(fn -> AdminRepo.all(Setting) end)
+
+  @doc "The PubSub topic a refresh is broadcast on (`Loopctl.SystemConfig.RefreshListener`)."
+  @spec refresh_topic() :: String.t()
+  def refresh_topic, do: "system_config_refresh"
+
+  @doc """
+  Tells every other connected node to re-read the table, as `{:system_config_refresh,
+  node()}`. Called by the cron worker after it refreshed this node.
+  """
+  @spec broadcast_refresh() :: :ok
+  def broadcast_refresh do
+    Phoenix.PubSub.broadcast(Loopctl.PubSub, refresh_topic(), {:system_config_refresh, node()})
+  end
 
   @doc false
   # Public ONLY as a seam for the guard's own tests: the test database always answers

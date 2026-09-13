@@ -154,3 +154,5 @@ Mox.defmock(Loopctl.MockFairShareCounter, for: Loopctl.Oban.FairShareCounterBeha
 Mox.defmock(Loopctl.MockStreamingExportBodyProbe,
   for: Loopctl.Knowledge.StreamingExport.BodyProbe
 )
+
+Mox.defmock(Loopctl.MockClusterDnsResolver, for: Loopctl.ClusterReadiness.Resolver)

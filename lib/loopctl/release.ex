@@ -177,11 +177,12 @@ defmodule Loopctl.Release do
   node is enforcing at this instant. Serving nodes refresh their node-local
   (`:persistent_term`) cache from the DB asynchronously: once at boot AND via the
   `SystemConfigRefreshWorker` Oban cron. That cron enqueues ONE job per tick
-  CLUSTER-WIDE (executed by a single node), so on a MULTI-NODE deployment a given
-  node's adoption latency is NOT bounded to ~60s — it can lag many ticks, and an
-  emergency `:disable` rollback may leave some nodes enforcing `signed` (401'ing
-  enrolled agents) for an unbounded window. The ~60s guarantee holds only on a
-  SINGLE-NODE deployment. To confirm a specific node has actually adopted the
+  CLUSTER-WIDE (executed by a single node), which broadcasts the refresh to every
+  CONNECTED peer, so ~60s holds per node while the nodes are clustered. A node that is
+  not connected (a netsplit, a machine still on the previous release mid-deploy) adopts
+  it only when the cron lands on it — NOT bounded to ~60s, so an emergency `:disable`
+  rollback may leave that node enforcing `signed` (401'ing enrolled agents) for an
+  unbounded window. To confirm a specific node has actually adopted the
   flip, read THAT node's `GET /.well-known/loopctl` `custody_profile` — each node
   serves its own node-local value. The `eval` node's own cache is irrelevant (it
   exits immediately); the DB row is the source of truth.
