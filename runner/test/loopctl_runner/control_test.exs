@@ -751,25 +751,67 @@ defmodule LoopctlRunner.ControlTest do
                      3_000
     end
 
-    test "a dispatch loopctl does not yet hold as accepted is retried on the poll, not given up",
+    test "a refused dispatch's trace is given up at once: dispatch_not_accepted is terminal",
          ctx do
       run_id = ctx.run_id
-      not_yet = {:error, %{reason: "dispatch_not_accepted"}}
-      TestLoopctl.put(:trace_replies, [not_yet, not_yet])
+      TestLoopctl.put(:trace_replies, [{:error, %{reason: "dispatch_not_accepted"}}])
       run_dir = dispatched_run(ctx, 0..2)
       shipping_control(ctx, trace_poll_ms: 100)
 
       assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id}}}, 5_000
-      assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id}}}, 3_000
+      :ok = wait_until(fn -> File.exists?(Path.join(run_dir, "trace_ship.json")) end, 3_000)
+
+      assert %{"abandoned" => "dispatch_not_accepted"} =
+               JSON.decode!(File.read!(Path.join(run_dir, "trace_ship.json")))
+
+      refute_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id}}}, 500
+    end
+
+    test "while this runner's accept is unacknowledged, dispatch_not_accepted waits instead",
+         ctx do
+      run_id = ctx.run_id
+      TestLoopctl.put(:trace_replies, [{:error, %{reason: "dispatch_not_accepted"}}])
+      run_dir = dispatched_run(ctx, 0..2)
+      pid = shipping_control(ctx, trace_poll_ms: 300)
+
+      # No accept path exists yet (build order step 6): plant the unacknowledged accept a
+      # rate-limited reply would leave in the backlog, before the join starts shipping. Its
+      # stand-in timer never fires, so the accept stays outstanding.
+      accept = %{"dispatch_id" => @dispatch_id, "claim_epoch" => 4, "decision" => "accepted"}
+
+      :sys.replace_state(pid, fn socket ->
+        Slipstream.Socket.assign(socket,
+          reply_backlog: [{accept, nil, false}],
+          reply_timer: {make_ref(), make_ref()}
+        )
+      end)
+
+      refute Control.info(pid).joined
+      assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id}}}, 5_000
+      # Not given up: tried again after a poll, and shipped once the refusal is gone.
       assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id}}}, 3_000
       :ok = wait_until(fn -> File.exists?(Path.join(run_dir, "trace_ship.json")) end, 3_000)
       assert %{"done" => true} = JSON.decode!(File.read!(Path.join(run_dir, "trace_ship.json")))
     end
 
+    test "a dispatch that is not this runner's is given up at once", ctx do
+      run_id = ctx.run_id
+      TestLoopctl.put(:trace_replies, [{:error, %{reason: "unknown_dispatch"}}])
+      run_dir = dispatched_run(ctx, 0..2)
+      shipping_control(ctx, trace_poll_ms: 100)
+
+      assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id}}}, 5_000
+      :ok = wait_until(fn -> File.exists?(Path.join(run_dir, "trace_ship.json")) end, 3_000)
+
+      assert %{"abandoned" => "unknown_dispatch"} =
+               JSON.decode!(File.read!(Path.join(run_dir, "trace_ship.json")))
+    end
+
     test "a run waiting on loopctl does not hold up the runs after it", ctx do
       waiting_id = ctx.run_id
       ready_id = LoopctlRunner.Session.uuid4()
-      TestLoopctl.put(:trace_refuse_runs, %{waiting_id => %{reason: "dispatch_not_accepted"}})
+      # An unexpected reply backs a run off for a poll instead of giving it up.
+      TestLoopctl.put(:trace_refuse_runs, %{waiting_id => %{reason: "something_new"}})
 
       # Run directories are listed in path order: "dispatched-run" comes before "zz-ready".
       dispatched_run(ctx, 0..2)
@@ -780,9 +822,13 @@ defmodule LoopctlRunner.ControlTest do
 
       :ok = wait_until(fn -> File.exists?(Path.join(ready_dir, "trace_ship.json")) end, 3_000)
       assert %{^ready_id => 2} = Control.info(pid).trace_acked
-      # The waiting run retries once per poll, not at the 50ms pace: two seconds on it has used
-      # a few of its 30 retries and is still waiting, not given up.
+
+      # The waiting run is retried once a poll, not at the 50ms pace: a handful of pushes in two
+      # seconds, where the pace would allow about forty.
       Process.sleep(2_000)
+      retries = count_traces(waiting_id, 0)
+      assert retries >= 1 and retries <= 5
+      # Still waiting, not given up.
       refute File.exists?(Path.join(ctx.config.runs_dir, "dispatched-run/trace_ship.json"))
     end
 
@@ -808,19 +854,6 @@ defmodule LoopctlRunner.ControlTest do
 
       :ok = wait_until(fn -> File.exists?(Path.join(late_dir, "trace_ship.json")) end, 3_000)
       refute File.exists?(Path.join(long_dir, "trace_ship.json"))
-    end
-
-    test "a dispatch that stays unknown is given up after the retries run out", ctx do
-      run_id = ctx.run_id
-      TestLoopctl.put(:trace_replies, List.duplicate({:error, %{reason: "unknown_dispatch"}}, 40))
-      run_dir = dispatched_run(ctx, 0..2)
-      shipping_control(ctx, trace_poll_ms: 20)
-
-      assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id}}}, 5_000
-      :ok = wait_until(fn -> File.exists?(Path.join(run_dir, "trace_ship.json")) end, 8_000)
-
-      assert %{"abandoned" => "unknown_dispatch"} =
-               JSON.decode!(File.read!(Path.join(run_dir, "trace_ship.json")))
     end
 
     test "a done run whose trace grows afterwards ships the new lines", ctx do
@@ -917,6 +950,14 @@ defmodule LoopctlRunner.ControlTest do
       {:test_loopctl, {:dispatch_reply, reply}} -> collect_dispatch_replies([reply | acc])
     after
       0 -> Enum.reverse(acc)
+    end
+  end
+
+  defp count_traces(run_id, n) do
+    receive do
+      {:test_loopctl, {:trace, %{"run_id" => ^run_id}}} -> count_traces(run_id, n + 1)
+    after
+      0 -> n
     end
   end
 

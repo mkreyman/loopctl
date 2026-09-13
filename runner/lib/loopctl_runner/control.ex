@@ -222,8 +222,6 @@ defmodule LoopctlRunner.Control do
             trace_timer: nil,
             # run_id => {max events per batch, until this seq is acknowledged}
             trace_max_events: %{},
-            # run_id => consecutive refusals that may be a race with the accept being recorded
-            trace_waiting: %{},
             # run_id => monotonic ms before which the run is not tried again, so a run waiting
             # on loopctl never holds up the others; and when run state was last rescanned.
             trace_backoff: %{},
@@ -1088,7 +1086,6 @@ defmodule LoopctlRunner.Control do
       acked == next.acked ->
         socket
         |> put_position(run, next)
-        |> assign(trace_waiting: Map.delete(socket.assigns.trace_waiting, run.run_id))
         |> schedule_trace(TraceShip.min_interval_ms("trace"))
 
       # loopctl holds more than this batch reached: its acknowledgement wins, offset unknown.
@@ -1117,11 +1114,12 @@ defmodule LoopctlRunner.Control do
         trace_positions: Map.put(socket.assigns.trace_positions, run.run_id, position)
       )
 
-  @given_up ~w(stale_claim_epoch run_mismatch)
-  # A trace can reach loopctl before the dispatch's acceptance is recorded (the reply may be
-  # rate-limited or carried across a rejoin), so these are retried on the poll for a while.
-  @not_yet ~w(unknown_dispatch dispatch_not_accepted)
-  @max_not_yet 30
+  # loopctl keeps no refusal state; what each of these means is fixed by its ledger fence, which
+  # runs story epoch, batch epoch, accepted, run binding in that order. unknown_dispatch means
+  # the row is not this runner's and never will be (the row is written before a dispatch is
+  # broadcast); stale_claim_epoch means the claim moved on; run_mismatch means the run is bound
+  # elsewhere. None of them changes, so each gives the run up at once.
+  @given_up ~w(unknown_dispatch stale_claim_epoch run_mismatch)
 
   defp trace_refused(socket, _push, %{"reason" => "rate_limited"} = refusal) do
     interval = Map.get(refusal, "min_interval_ms", TraceShip.min_interval_ms("trace"))
@@ -1167,35 +1165,35 @@ defmodule LoopctlRunner.Control do
     socket |> give_up(run, reason, refusal) |> schedule_trace(TraceShip.min_interval_ms("trace"))
   end
 
-  defp trace_refused(socket, %{run: run}, %{"reason" => reason} = refusal)
-       when reason in @not_yet do
-    tries = Map.get(socket.assigns.trace_waiting, run.run_id, 0) + 1
+  # dispatch_not_accepted flips only when this runner's accept dispatch_reply commits. While an
+  # accept for the run's dispatch is still unacknowledged (in flight, rate-limited, or carried
+  # across a rejoin) it is that reply the trace is waiting on: wait a poll and try again. With no
+  # accept outstanding it is terminal: the dispatch was refused, or its accept was lost.
+  defp trace_refused(socket, %{run: run}, %{"reason" => "dispatch_not_accepted"} = refusal) do
+    if accept_outstanding?(socket, run.dispatch_id) do
+      Logger.info(
+        "trace waits for this runner's accept of the dispatch to be recorded",
+        trace_ids(run)
+      )
 
-    cond do
-      tries > @max_not_yet ->
-        socket
-        |> give_up(run, reason, refusal)
-        |> schedule_trace(TraceShip.min_interval_ms("trace"))
-
-      tries == 1 ->
-        Logger.warning(
-          "loopctl does not yet hold this run's dispatch as accepted (#{reason}); " <>
-            "retrying on the poll, up to #{@max_not_yet} times",
-          trace_ids(run)
-        )
-
-        socket
-        |> assign(trace_waiting: Map.put(socket.assigns.trace_waiting, run.run_id, tries))
-        |> back_off(run)
-
-      true ->
-        socket
-        |> assign(trace_waiting: Map.put(socket.assigns.trace_waiting, run.run_id, tries))
-        |> back_off(run)
+      back_off(socket, run)
+    else
+      socket
+      |> give_up(run, "dispatch_not_accepted", refusal)
+      |> schedule_trace(TraceShip.min_interval_ms("trace"))
     end
   end
 
   defp trace_refused(socket, push, refusal), do: trace_unexpected(socket, push, {:error, refusal})
+
+  defp accept_outstanding?(socket, dispatch_id) do
+    a = socket.assigns
+    replies = Map.values(a.dispatch_replies) ++ a.reply_backlog
+
+    Enum.any?(replies, fn {payload, _story_id, _carried?} ->
+      payload["dispatch_id"] == dispatch_id and payload["decision"] == "accepted"
+    end)
+  end
 
   defp narrow_or_escalate(
          socket,

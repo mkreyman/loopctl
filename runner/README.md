@@ -113,7 +113,7 @@ What the log says in each failure:
 | loopctl refuses that reply | `loopctl refused the dispatch_reply (<reason>)`; `rate_limited` waits in the backlog, the rest are not resent |
 | the channel drops with a reply outstanding | `resending N dispatch_reply(s) loopctl had not recorded when the channel closed` after the rejoin; `no longer needs the resent dispatch_reply (<reason>)` when the claim moved on meanwhile |
 | a run's trace is being shipped | `trace cursor: loopctl holds this run through seq N`, then `trace shipped in full through seq N` once the run has finished, all with `run_id`, `dispatch_id` and `claim_epoch` |
-| loopctl does not yet hold the dispatch as accepted | `loopctl does not yet hold this run's dispatch as accepted (unknown_dispatch or dispatch_not_accepted)`, once; retried on each poll, given up after 30 |
+| loopctl holds the dispatch as not accepted | `trace waits for this runner's accept of the dispatch to be recorded` while an accept reply is unacknowledged; otherwise the run is given up at once (`dispatch_not_accepted`) |
 | loopctl will not take a trace | `loopctl will not take this run's trace (<reason>)`; the run's `trace_ship.json` records it and the run is not shipped again |
 | the runner and loopctl disagree on a size | `loopctl refused a N-event trace batch as too large` or `refused trace event N as too large` at error level: a byte-rule mismatch to report; shipping continues by splitting or by dropping that event's data |
 | loopctl cannot store an event | `loopctl refused a N-event trace batch as invalid`, then `refused trace event N (invalid_payload): ... shipping it as a stub`, at error level; the batch is narrowed only through the refused range, and a stub that is refused too gives the run up |
