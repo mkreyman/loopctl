@@ -47,6 +47,12 @@ defmodule Loopctl.MixProject do
       dialyzer: [
         plt_add_apps: [:mix, :ex_unit, :ecto, :ecto_sql],
         plt_file: {:no_warn, "priv/plts/dialyzer.plt"},
+        # Unset locally, so the core PLT stays in MIX_HOME and is shared across worktrees.
+        # CI sets it to priv/plts: on the self-hosted runner MIX_HOME is shared by every
+        # slot while OTP is installed per slot under _work/_temp, so a core PLT built by
+        # one slot names beam files another slot cannot see ("File not found:
+        # slot-N/.../erl_bif_types.beam").
+        plt_core_path: System.get_env("DIALYZER_PLT_CORE_PATH"),
         ignore_warnings: "priv/plts/dialyzer_ignore.exs"
       ]
     ]

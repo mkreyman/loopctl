@@ -889,6 +889,13 @@ jobs:
         run: mix deps.get
 
       - name: Run Dialyzer
+        # The core (Erlang/Elixir) PLT goes in priv/plts, which the cache above keys per
+        # runner slot. Left in the default MIX_HOME it is shared by every slot on the host
+        # and records beam paths under the slot that built it (_work/_temp/.setup-beam,
+        # wiped per job), so another slot fails with "File not found: slot-N/.../
+        # erl_bif_types.beam". See plt_core_path in mix.exs.
+        env:
+          DIALYZER_PLT_CORE_PATH: priv/plts
         run: mix dialyzer
 
   scale-test:
