@@ -20,6 +20,7 @@ defmodule LoopctlRunner.Config do
     :repos,
     :branch_prefixes,
     allowed_tools: [],
+    control: nil,
     max_wall_clock_s: 3600,
     max_turns: 200,
     park_after_s: 600,
@@ -36,6 +37,7 @@ defmodule LoopctlRunner.Config do
           repos: %{optional(String.t()) => String.t()},
           branch_prefixes: [String.t()],
           allowed_tools: [String.t()],
+          control: LoopctlRunner.ControlConfig.t() | nil,
           max_wall_clock_s: pos_integer(),
           max_turns: pos_integer(),
           park_after_s: pos_integer(),
@@ -79,6 +81,7 @@ defmodule LoopctlRunner.Config do
          {:ok, repos} <- repos(map),
          {:ok, prefixes} <- branch_prefixes(map),
          {:ok, tools} <- allowed_tools(map),
+         {:ok, control} <- control(map),
          {:ok, ints} <- positive_ints(map) do
       {:ok,
        struct!(
@@ -89,7 +92,8 @@ defmodule LoopctlRunner.Config do
            claude_launcher: launcher,
            repos: repos,
            branch_prefixes: prefixes,
-           allowed_tools: tools
+           allowed_tools: tools,
+           control: control
          ] ++ ints
        )}
     end
@@ -197,6 +201,14 @@ defmodule LoopctlRunner.Config do
 
       _ ->
         {:error, "config allowed_tools must be a list"}
+    end
+  end
+
+  # Absent means this machine runs stories by hand only and never connects to loopctl.
+  defp control(map) do
+    case Map.fetch(map, "control") do
+      :error -> {:ok, nil}
+      {:ok, control} -> LoopctlRunner.ControlConfig.from_map(control)
     end
   end
 

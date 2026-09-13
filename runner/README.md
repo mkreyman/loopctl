@@ -12,8 +12,41 @@ BEAM cluster. See `docs/agent-delivery-loop.md` section 2 for why.
 
 ## Status
 
-Build order step **1a** is implemented: a Mix task, no Phoenix and no network. Step 1b (the
-channel client and `Phoenix.Presence`) waits on loopctl#801.
+Build order steps **1a** and **1b** are implemented: hand-filed story runs (1a), and the daemon
+that keeps this machine joined to loopctl's runner pool (1b). Dispatch handling and trace upload
+follow loopctl#803, which emits `dispatch` and accepts `trace_event`; until then the daemon refuses
+dispatches.
+
+### The daemon
+
+1. Enroll the machine (a human-anchored `user` key; the token is shown once):
+
+   ```bash
+   curl -sS -X POST https://loopctl.com/api/v1/runners \
+     -H "Authorization: Bearer $LOOPCTL_USER_KEY" -H 'content-type: application/json' \
+     -d '{"name": "minis"}'
+   ```
+
+2. Put the returned `token` in `~/.config/loopctl-runner/token` (`chmod 600`), and the returned
+   `runner.id` in the `control` section of `~/.config/loopctl-runner/runner.json` (see
+   `config/runner.example.json`).
+3. `rel/install.sh` builds a release on this machine and installs it as a `systemd --user` unit
+   (Linux) or a launchd LaunchAgent (macOS). On Linux, `loginctl enable-linger $USER` makes it
+   start at boot. `mix loopctl.serve` runs the same daemon in the foreground for development.
+
+Rotating the credential is `DELETE /api/v1/runners/:id` and enrolling again. That returns a new
+`runner.id` as well as a new token, so update both `control.runner_id` and the token file, then
+restart the service. A runner left on the old id is refused `forbidden_topic`, and the daemon
+exits with status 78: systemd shows the unit failed without restarting it (then
+`systemctl --user restart loopctl-runner` once the config is fixed), and on macOS the agent stays
+stopped until `rel/install.sh` or `launchctl kickstart` starts it again. The log names the refusal. A token file that cannot be read three times in a row is treated the same way, so after fixing
+it, restart the service. (A token the server merely rejects is retried indefinitely, and a
+corrected file is picked up on the next reconnect without a restart.)
+
+Until dispatch handling lands (loopctl#803), the daemon reports `draining: true`, so the control
+plane never reserves capacity on a machine that cannot start a session.
+
+### Hand-filed runs
 
 ```bash
 mkdir -p ~/.config/loopctl-runner

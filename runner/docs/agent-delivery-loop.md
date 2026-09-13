@@ -1,6 +1,7 @@
 # Agent Delivery Loop
 
-**Status:** design. Build order step 1a (§12) is implemented in this repo; nothing else is.
+**Status:** design. Build order step 1a (§12) and the runner side of 1b (channel client,
+join, status, packaging) are implemented in this repo. Dispatch and trace upload wait on loopctl#803.
 
 This is the single current description of the loop. Git history is the record of how it got
 here; the comments on loopctl#800-805 and loopctl-runner#1 carry the evidence behind individual
@@ -442,11 +443,12 @@ releases are not portable across OS or arch. Not Burrito (its value is machines 
 toolchain). `systemd --user` on Linux, launchd `LaunchAgent` on macOS, user-scoped in both cases
 because the runner must reach `~/.claude`, `~/workspace`, asdf shims and GitHub credentials.
 
-Three traps: `ExecStart=.../bin/<app> foreground` is Distillery and yields a systemd restart loop
+Four traps: `ExecStart=.../bin/<app> foreground` is Distillery and yields a systemd restart loop
 — use `start`; do **not** copy `DynamicUser=true` from the standard hardened BEAM unit (it gives
-an ephemeral user and read-only system, fatal here) though `PrivateDevices=true` and
-`ERL_CRASH_DUMP_SECONDS=0` are worth keeping; a release in daemon mode logs to
-`tmp/log/erlang.log.1`, not journald.
+an ephemeral user and read-only system, fatal here); do not copy its `PrivateDevices=true` either,
+because a `systemd --user` manager cannot drop the capabilities it needs and the unit fails with
+`218/CAPABILITIES` (measured on Ubuntu 26.04) — `ERL_CRASH_DUMP_SECONDS=0` is the part worth
+keeping; and a release in daemon mode logs to `tmp/log/erlang.log.1`, not journald.
 
 ## 15. Still open
 

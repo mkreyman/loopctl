@@ -10,12 +10,15 @@ defmodule LoopctlRunner.MixProject do
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       aliases: aliases(),
-      dialyzer: [plt_add_apps: [:mix, :ex_unit]]
+      dialyzer: [plt_add_apps: [:mix, :ex_unit]],
+      releases: [
+        loopctl_runner: [include_executables_for: [:unix], strip_beams: false]
+      ]
     ]
   end
 
   def application do
-    [extra_applications: [:logger, :crypto]]
+    [extra_applications: [:logger, :crypto], mod: {LoopctlRunner.Application, []}]
   end
 
   def cli do
@@ -27,6 +30,11 @@ defmodule LoopctlRunner.MixProject do
 
   defp deps do
     [
+      {:slipstream, "~> 1.2"},
+      {:jason, "~> 1.4"},
+      # A real Phoenix socket to test the client against, never shipped in the release.
+      {:phoenix, "~> 1.8", only: :test},
+      {:bandit, "~> 1.12", only: :test},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}
     ]

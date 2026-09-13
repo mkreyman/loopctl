@@ -83,7 +83,11 @@ defmodule LoopctlRunner.Run do
       "error" => result.error
     })
 
-    RunState.update(run_dir, %{status: result.status})
+    RunState.update(run_dir, %{
+      status: result.status,
+      finished_at: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
+    })
+
     Trace.close(trace)
     Map.merge(result, %{run_id: run_id, run_dir: run_dir})
   end

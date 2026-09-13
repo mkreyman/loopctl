@@ -37,7 +37,8 @@ defmodule LoopctlRunner.HeadlessLauncherCanaryTest do
         "--exclude-standard",
         "lib",
         "priv",
-        "config"
+        "config",
+        "rel"
       ])
 
     offenders =

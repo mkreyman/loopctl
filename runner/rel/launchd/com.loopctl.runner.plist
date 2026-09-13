@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- launchd LaunchAgent for the loopctl runner (design §14). Rendered by rel/install.sh,
+     which fills in the release path, PATH and log path. A per-user agent, never a daemon: the
+     runner must run as the real user to reach ~/.claude, ~/workspace and credentials. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.loopctl.runner</string>
+  <!-- launchd runs the release directly, so the BEAM receives launchd's SIGTERM and shuts
+       its sessions down in order. KeepAlive/SuccessfulExit=false restarts any non-zero exit,
+       so a refusal retrying cannot fix exits 0 here (LOOPCTL_RUNNER_FATAL_EXIT below) and the
+       agent stays stopped; the log names the refusal. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>@RELEASE@/bin/loopctl_runner</string>
+    <string>start</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>LOOPCTL_RUNNER_DAEMON</key>
+    <string>1</string>
+    <key>LOOPCTL_RUNNER_CONFIG</key>
+    <string>@CONFIG@</string>
+    <key>LOOPCTL_RUNNER_FATAL_EXIT</key>
+    <string>0</string>
+    <key>ERL_CRASH_DUMP_SECONDS</key>
+    <string>0</string>
+    <key>PATH</key>
+    <string>@PATH@</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>@LOG@</string>
+  <key>StandardErrorPath</key>
+  <string>@LOG@</string>
+</dict>
+</plist>

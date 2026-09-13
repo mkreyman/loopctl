@@ -28,6 +28,14 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
   marker and its launcher tree file: on macOS the marker is invisible for Apple binaries.
   `priv/bin/session-launcher.sh` does the same when the Port's pipe closes; `LoopctlRunner.Reaper`
   is the boot-time backstop.
+- **The daemon's credential is a file readable by this user alone** (`control.token_file`,
+  mode 600), sent only in the `x-loopctl-runner-token` header. Never put it in the config JSON,
+  an environment variable a `claude` session inherits, or a URL.
+- **Every payload sent to loopctl is validated against the vendored contract**
+  (`priv/runner_contract/v1.json`, copied from mkreyman/loopctl, never re-typed). When loopctl
+  bumps the contract, copy the file again; do not edit it here.
+- **The daemon starts only under `LOOPCTL_RUNNER_DAEMON=1`**, so `mix loopctl.run` never joins
+  the pool.
 - **Unattended sessions can only run pre-allowed tools.** `--permission-prompts none` denies
   anything auto mode would have prompted for; a story's `allowed_tools` must each appear in the
   runner config's `allowed_tools`.
