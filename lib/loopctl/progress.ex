@@ -22,6 +22,7 @@ defmodule Loopctl.Progress do
   alias Loopctl.Audit
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Capabilities
+  alias Loopctl.Delivery.Stages
   alias Loopctl.Dispatches
   alias Loopctl.Tenants
   alias Loopctl.TokenUsage
@@ -1480,7 +1481,8 @@ defmodule Loopctl.Progress do
   `lifecycle_entered_at` stamped (so the backfill launder guard keeps refusing the
   story), lease cleared and epoch bumped. Recorded as a `claim_lease_expired` audit
   entry by the system actor, and announced as `story.force_unclaimed` with
-  `reason: "claim_lease_expired"`.
+  `reason: "claim_lease_expired"`. A delivery stage row in flight is moved back to
+  `queued` in the same transaction (`Loopctl.Delivery.Stages.requeue_lost_runner/3`).
 
   A story with NO lease (`claimed_until` NULL — claimed before leases existed, and
   never renewed since) is never reclaimed: nothing renews those claims, so a lease
@@ -1525,6 +1527,12 @@ defmodule Loopctl.Progress do
         story
         |> Ecto.Changeset.change(release_claim_changes(story))
         |> AdminRepo.update()
+      end)
+      # #803: the claimant is gone, so its delivery stage row goes back to `queued` in THIS
+      # transaction — the release and the requeue commit together or not at all. A row left
+      # in flight after the release would sit behind the new epoch, refused on every advance.
+      |> Multi.run(:stage, fn _repo, %{story: updated} ->
+        Stages.requeue_lost_runner(tenant_id, updated.id, updated.claim_epoch)
       end)
       |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
         %{

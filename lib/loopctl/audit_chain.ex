@@ -77,20 +77,55 @@ defmodule Loopctl.AuditChain do
 
     case AdminRepo.transaction(multi) do
       {:ok, %{insert_entry: entry}} ->
-        # US-26.5.1: broadcast new entry to the tenant's per-tenant subscribers.
-        ChainPubSub.broadcast_entry(tenant_id, entry)
-        # US-35.2: ALSO broadcast a MINIMAL tenant-scoped notification to the
-        # fixed cross-tenant firehose so the supervised SthEnqueuer can
-        # activity-gate STH computation. Only entry.tenant_id crosses this shared
-        # topic (never the entry payload/actor_lineage). Additive and
-        # fire-and-forget — it never changes or gates the existing per-tenant
-        # broadcast, and a firehose delivery fault never affects the append.
-        ChainPubSub.broadcast_entry_firehose(entry)
+        announce_entry(entry)
         {:ok, entry}
 
       {:error, _step, reason, _changes} ->
         {:error, reason}
     end
+  end
+
+  @doc """
+  Appends an entry INSIDE the caller's `Loopctl.Repo.with_tenant/2` transaction for
+  `tenant_id`, so the entry commits or rolls back with the state change it records (issue
+  #803: the delivery stage machine runs on the RLS repo, and an append on `AdminRepo` would
+  be a second transaction on a second connection — not atomic, and a checkout from a pool
+  of three).
+
+  Same construction and the same head-row lock as `append/2`. It does NOT broadcast: the
+  entry is not committed yet. The caller passes the returned entry to `announce_entry/1`
+  after its transaction commits.
+
+  Raises when called outside a `Loopctl.Repo` transaction.
+  """
+  @spec append_in_tenant_transaction(Ecto.UUID.t(), map()) ::
+          {:ok, Entry.t()} | {:error, Ecto.Changeset.t()}
+  def append_in_tenant_transaction(tenant_id, attrs)
+      when is_binary(tenant_id) and is_map(attrs) do
+    unless Loopctl.Repo.in_transaction?(),
+      do: raise(ArgumentError, "append_in_tenant_transaction/2 needs a Loopctl.Repo transaction")
+
+    {:ok, {position, prev_hash}} = lock_and_read_previous(Loopctl.Repo, tenant_id)
+    entry_attrs = build_entry_attrs(tenant_id, position, prev_hash, attrs, DateTime.utc_now())
+
+    %Entry{tenant_id: tenant_id}
+    |> Entry.changeset(entry_attrs)
+    |> Loopctl.Repo.insert()
+  end
+
+  @doc """
+  Publishes a COMMITTED entry: the per-tenant broadcast (US-26.5.1) and the minimal
+  firehose notification the STH enqueuer activity-gates on (US-35.2). `append/2` calls it
+  itself; a caller of `append_in_tenant_transaction/2` calls it after commit.
+  """
+  @spec announce_entry(Entry.t()) :: :ok
+  def announce_entry(%Entry{} = entry) do
+    ChainPubSub.broadcast_entry(entry.tenant_id, entry)
+    # Only entry.tenant_id crosses this shared topic (never the entry payload or
+    # actor_lineage). Additive and fire-and-forget — a firehose delivery fault never
+    # affects the append.
+    ChainPubSub.broadcast_entry_firehose(entry)
+    :ok
   end
 
   @doc """
@@ -811,7 +846,7 @@ defmodule Loopctl.AuditChain do
 
   # --- Private ---
 
-  defp lock_and_read_previous(tenant_id) do
+  defp lock_and_read_previous(repo \\ AdminRepo, tenant_id) do
     # Lock the latest entry to serialize concurrent appends
     case from(e in Entry,
            where: e.tenant_id == ^tenant_id,
@@ -819,7 +854,7 @@ defmodule Loopctl.AuditChain do
            limit: 1,
            lock: "FOR UPDATE"
          )
-         |> AdminRepo.one() do
+         |> repo.one() do
       nil ->
         # Genesis entry
         {:ok, {0, @zero_hash}}
