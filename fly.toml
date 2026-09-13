@@ -43,6 +43,15 @@ kill_timeout = 90
   # ScaleAlerts.config_status/2 flags BOTH half-done directions, so doing one without the
   # other turns /health/ready red with a reason naming the setting to fix.
   SCALE_ALERTS_ENABLED = "false"
+  # BEAM clustering over Fly's private network. DNSCluster resolves this name to every
+  # started machine's 6PN address and connects to the node of the same release there; the
+  # node name and IPv6 distribution come from rel/env.sh.eex. Not a secret: it names no
+  # credential, and a secret would silently override this line. EXPECTED_APP_NODES is the
+  # machine count Loopctl.ClusterReadiness (and the DbCapacity connection budget) expects,
+  # so `loopctl.cluster.peers.count{status}` reads `clustered` only when every machine is
+  # connected. Change both lines together when the machine count changes.
+  DNS_CLUSTER_QUERY = "loopctl.internal"
+  EXPECTED_APP_NODES = "2"
 
 [http_service]
   internal_port = 8080

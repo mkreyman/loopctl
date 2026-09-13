@@ -467,6 +467,53 @@ defmodule Loopctl.AuditChain.SthEnqueuerTest do
       assert enqueued_tid == tenant.id
     end
 
+    test "two leaders meeting: the one :global did not keep stops draining and monitors the survivor" do
+      # Two nodes boot unconnected (or heal from a netsplit) each holding the name. When
+      # they connect, :global keeps one holder and — through the resolver the enqueuer
+      # registers with — sends {:global_name_conflict, key} to the other. Reproduced on one
+      # node: a leader that is subscribed, the name moved to another process (the state
+      # :global leaves behind), then the notice.
+      key = :"sth_conflict_#{System.unique_integer([:positive])}"
+      topic = Loopctl.AuditChain.PubSub.firehose_topic()
+
+      loser =
+        start_supervised!(
+          Supervisor.child_spec({SthEnqueuer, [leadership_key: key, subscribe: true]},
+            id: :sth_conflict_loser,
+            restart: :temporary
+          )
+        )
+
+      assert :sys.get_state(loser).role == :leader
+      assert loser in subscribers(topic)
+
+      survivor = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> Process.exit(survivor, :kill) end)
+      :global.unregister_name(key)
+      :yes = :global.register_name(key, survivor)
+
+      send(loser, {:global_name_conflict, key})
+      state = :sys.get_state(loser)
+
+      assert state.role == :standby
+      assert is_reference(state.leader_ref)
+      refute loser in subscribers(topic)
+      assert Process.alive?(loser)
+
+      # And it still fails over: the survivor dies, the ex-leader takes the name back.
+      Process.exit(survivor, :kill)
+      assert eventually(fn -> :global.whereis_name(key) == loser end)
+      assert :sys.get_state(loser).role == :leader
+      assert loser in subscribers(topic)
+    end
+
+    test "leadership is registered with a resolver, so :global never kills a duplicate leader" do
+      # Without a resolver :global's default on a name clash is to KILL one holder. The
+      # resolver is what turns the clash into the message handled above.
+      source = File.read!("lib/loopctl/audit_chain/sth_enqueuer.ex")
+      assert source =~ "&:global.random_notify_name/3"
+    end
+
     test "TC-38.3.1: the app-boot instance holds the cluster-global {:global, SthEnqueuer} leadership" do
       # The app-boot instance started with default opts (:singleton mode keyed on
       # __MODULE__), so it registered under {:global, SthEnqueuer} and is the live
@@ -503,6 +550,10 @@ defmodule Loopctl.AuditChain.SthEnqueuerTest do
   # Poll a predicate until true or a bounded deadline — assert outcome CLASS, not
   # exact timing (the async-suite flake lesson): failover is asynchronous (:global
   # de-register + monitor :DOWN + re-register), so we wait for the end state.
+  defp subscribers(topic) do
+    for {pid, _value} <- Registry.lookup(Loopctl.PubSub, topic), do: pid
+  end
+
   defp eventually(fun, attempts \\ 100, sleep_ms \\ 20)
   defp eventually(_fun, 0, _sleep_ms), do: false
 

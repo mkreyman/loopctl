@@ -2,15 +2,25 @@ defmodule Loopctl.ClusterReadiness do
   @moduledoc """
   US-38.3 (AC-38.3.2/.3) — clustering-readiness verification signal + boot WARN gate.
 
-  loopctl runs single-node today. Every horizontal-scaling capability in Epic 38 is
-  code-only and env/flag-gated to that single-node behavior; this module adds the
-  MISSING SIGNAL so a machine-count bump can't silently run un-clustered (node-local
-  PubSub) with nobody noticing. It reports whether BEAM clustering is configured
+  Production runs two Fly machines clustered over the private network: `DNS_CLUSTER_QUERY`
+  and `EXPECTED_APP_NODES` are set in `fly.toml` `[env]`, and `rel/env.sh.eex` names each
+  node after its 6PN address with IPv6 distribution. This module is the SIGNAL that the
+  machines actually found each other, so a fleet can't silently run un-clustered
+  (node-local PubSub) with nobody noticing. It reports whether BEAM clustering is configured
   (`DNS_CLUSTER_QUERY`) and whether `Node.list/0` actually shows the expected peers
   (vs `EXPECTED_APP_NODES`, reused from `Loopctl.DbCapacity.expected_app_nodes/0` so
   the node count is parsed in exactly one place).
 
   ## What it is NOT
+
+  ## A node name no peer can reach
+
+  `DNS_CLUSTER_QUERY` alone does not cluster anything: DNSCluster connects to
+  `<basename>@<address>`, so a node named on a loopback host (`loopctl@127.0.0.1`, the
+  off-Fly default in `rel/env.sh.eex`) or not distributed at all can never be reached,
+  and `:expected_peers_missing` would read as a slow start forever. The boot check says so
+  separately (`warn_if_distribution_unroutable/2`), naming only the CLASS of the host,
+  never the node name.
 
   It NEVER crashes and NEVER enforces. On a single node it reports `:single_node`
   ("clustering not required"), not an error. The boot check
@@ -190,11 +200,52 @@ defmodule Loopctl.ClusterReadiness do
   """
   @spec warn_if_expected_peers_missing() :: :ok
   def warn_if_expected_peers_missing do
-    warn_if_expected_peers_missing(
-      DbCapacity.expected_app_nodes(),
-      peers(),
-      dns_cluster_query_configured?()
-    )
+    boot_check(node(), DbCapacity.expected_app_nodes(), peers(), dns_cluster_query_configured?())
+  end
+
+  @doc """
+  Both boot checks over injected inputs: the unroutable-node WARN
+  (`warn_if_distribution_unroutable/2`), then the peers WARN
+  (`warn_if_expected_peers_missing/3`). Returns `:ok` and never raises.
+  """
+  @spec boot_check(node(), pos_integer(), [node()], boolean()) :: :ok
+  def boot_check(node, expected_nodes, peers, dns_configured?) do
+    warn_if_distribution_unroutable(node, dns_configured?)
+    warn_if_expected_peers_missing(expected_nodes, peers, dns_configured?)
+  end
+
+  @doc """
+  Whether other nodes can reach `node` by name: it is distributed (not `nonode@nohost`)
+  and its host is not a loopback address.
+  """
+  @spec distribution_routable?(node()) :: boolean()
+  def distribution_routable?(node) when is_atom(node) do
+    case String.split(Atom.to_string(node), "@", parts: 2) do
+      [_name, host] when host not in ["nohost", "127.0.0.1", "::1", "localhost"] -> true
+      _ -> false
+    end
+  end
+
+  @doc """
+  Pure boot check over an injected node name: WARNs when `DNS_CLUSTER_QUERY` is configured
+  but `node` is unreachable by peers (`distribution_routable?/1`), and returns `:ok`. Logs
+  no node name.
+  """
+  @spec warn_if_distribution_unroutable(node(), boolean()) :: :ok
+  def warn_if_distribution_unroutable(node, dns_configured?)
+      when is_atom(node) and is_boolean(dns_configured?) do
+    if dns_configured? and not distribution_routable?(node) do
+      Logger.warning(
+        "Clustering readiness: DNS_CLUSTER_QUERY is configured but this node is " <>
+          "#{if node == :nonode@nohost, do: "not distributed", else: "named on a loopback host"}" <>
+          ", so no peer can ever connect to it and it runs UN-CLUSTERED. On Fly the node must " <>
+          "be named after FLY_PRIVATE_IP with IPv6 distribution (rel/env.sh.eex): check " <>
+          "RELEASE_NODE and ERL_AFLAGS in the machine's environment. This is a WARN, not a " <>
+          "crash — a single node always boots."
+      )
+    end
+
+    :ok
   end
 
   @doc """
@@ -245,7 +296,7 @@ defmodule Loopctl.ClusterReadiness do
             "SthEnqueuer/rate-limiter cluster paths are inert). An operator raised the node count " <>
             "without wiring clustering: unlike a missing-peers WARN, this will NOT self-clear — " <>
             "peers can never connect until DNS_CLUSTER_QUERY is set. GUARD: set the " <>
-            "DNS_CLUSTER_QUERY Fly secret FIRST, then confirm the steady-state " <>
+            "DNS_CLUSTER_QUERY (fly.toml [env]) FIRST, then confirm the steady-state " <>
             "loopctl.cluster.peers.count{status=\"clustered\"} gauge before raising machine count. " <>
             "See docs/user_stories/epic_38_scaling_readiness/README.md 'Runbook: verify clustering " <>
             "before scaling'. This is a WARN, not a crash — a single node always boots."

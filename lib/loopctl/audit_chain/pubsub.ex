@@ -85,6 +85,12 @@ defmodule Loopctl.AuditChain.PubSub do
     Phoenix.PubSub.subscribe(Loopctl.PubSub, @firehose_topic)
   end
 
+  @doc "Stops receiving the firehose (a leader that has lost its cluster-singleton name)."
+  @spec unsubscribe_firehose() :: :ok
+  def unsubscribe_firehose do
+    Phoenix.PubSub.unsubscribe(Loopctl.PubSub, @firehose_topic)
+  end
+
   @doc "Returns the PubSub topic for a tenant."
   @spec topic(Ecto.UUID.t()) :: String.t()
   def topic(tenant_id), do: "#{@topic_prefix}#{tenant_id}"

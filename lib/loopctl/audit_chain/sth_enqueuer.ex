@@ -46,6 +46,24 @@ defmodule Loopctl.AuditChain.SthEnqueuer do
   per-minute `ComputeSthWorker` cron (below), so any sub-second takeover gap only
   defers an activity-driven enqueue to the next cron tick — never data loss.
 
+  ### Two leaders: boot and netsplit
+
+  `:global` is only as global as the nodes it can see, so two leaders are normal, not
+  exceptional. Every node boots unconnected — DNSCluster finds its peers seconds after
+  this process has registered — so each node's instance wins its own registration. A
+  netsplit does the same: each side's standby sees the other side's leader go down
+  (`:noconnection`) and takes the name on its side. While two leaders run, both drain
+  their own side's firehose and both may enqueue; Oban `unique` in Postgres (below)
+  keeps that to one job per tenant per window, so the cost is redundant inserts, not
+  duplicate STHs.
+
+  When the nodes connect (or the split heals) `:global` finds the name registered twice
+  and calls the resolver passed to `register_name/3`: `:global.random_notify_name/3`
+  keeps one holder and sends `{:global_name_conflict, name}` to the other. That leader
+  unsubscribes from the firehose and becomes a standby monitoring the survivor. Without a
+  resolver `:global` KILLS one of the two, which a supervisor restarts — the same end
+  state, bought with a crash report on every boot of a clustered fleet.
+
   ## Mode / test seam — explicit `:name` opt yields a plain LOCAL standalone
 
   Two modes, resolved from opts in `start_link/1`:
@@ -277,6 +295,25 @@ defmodule Loopctl.AuditChain.SthEnqueuer do
 
   def handle_info(:retry_leadership, state), do: {:noreply, state}
 
+  # `:global` found this name registered on both sides of a (re)connection and kept the
+  # other holder (see "Two leaders" in the moduledoc). Stop draining and stand by.
+  @impl true
+  def handle_info({:global_name_conflict, key}, %{leadership_key: key} = state) do
+    if state.role == :leader and state.subscribe?, do: ChainPubSub.unsubscribe_firehose()
+
+    Logger.info(
+      "SthEnqueuer: another node holds cluster-singleton leadership after a (re)connection; " <>
+        "standing by (#{inspect(key)})"
+    )
+
+    state = become_standby(%{state | role: :standby, leader_ref: nil})
+
+    # Only if the name came back to this process after all (nothing else to monitor).
+    if state.role == :leader and state.subscribe?, do: ChainPubSub.subscribe_firehose()
+
+    {:noreply, state}
+  end
+
   @impl true
   def handle_info({:audit_chain_entry, %{tenant_id: tenant_id} = entry}, state)
       when is_binary(tenant_id) do
@@ -341,7 +378,11 @@ defmodule Loopctl.AuditChain.SthEnqueuer do
   # drainer and subscribe; on failure we become a monitoring standby ready to take
   # over. Called both at boot (establish_role) and on takeover (leader :DOWN).
   defp try_become_leader(state) do
-    case :global.register_name(state.leadership_key, self()) do
+    case :global.register_name(
+           state.leadership_key,
+           self(),
+           &:global.random_notify_name/3
+         ) do
       :yes ->
         if state.subscribe?, do: ChainPubSub.subscribe_firehose()
 

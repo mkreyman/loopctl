@@ -125,10 +125,12 @@ runbook, NOT a crash.
 
 **Steps to scale past 1 machine (gated, infra — Mark's hands, out of Epic 38's code scope):**
 
-1. Set the `DNS_CLUSTER_QUERY` Fly secret (the `<app>.internal` 6PN query) — the code
-   is already wired (`application.ex`, `runtime.exs`); this story does NOT set it.
-2. Set `EXPECTED_APP_NODES` to the target machine count so the readiness signal and
-   the `DbCapacity` connection-budget check reflect it.
+1. `DNS_CLUSTER_QUERY` (`loopctl.internal`) is set in `fly.toml` `[env]`, and
+   `rel/env.sh.eex` names each node after `FLY_PRIVATE_IP` with IPv6 distribution — both
+   are required; either one alone never clusters. Do not ALSO set it as a Fly secret: a
+   secret overrides `[env]`.
+2. Set `EXPECTED_APP_NODES` (also `fly.toml` `[env]`) to the target machine count so the
+   readiness signal and the `DbCapacity` connection-budget check reflect it.
 3. Deploy, then confirm clustering is GREEN: `readiness/0.status == :clustered` (or
    the `loopctl.cluster.peers.count{status="clustered"}` gauge shows the expected
    peers) and NO `expected_peers_missing` boot WARN in the logs.

@@ -20,6 +20,62 @@ defmodule Loopctl.ClusterReadinessTest do
 
   alias Loopctl.ClusterReadiness
 
+  describe "distribution_routable?/1 and the unroutable-node WARN" do
+    test "a node named after a routable address is reachable; loopback and undistributed are not" do
+      assert ClusterReadiness.distribution_routable?(:"loopctl-01K4@fdaa:0:1:a7b:2b8:36e4:711e:2")
+      assert ClusterReadiness.distribution_routable?(:"loopctl@10.0.0.5")
+
+      for node <- [:"loopctl@127.0.0.1", :"loopctl@::1", :loopctl@localhost, :nonode@nohost] do
+        refute ClusterReadiness.distribution_routable?(node), inspect(node)
+      end
+    end
+
+    test "DNS configured on the production node name that could never cluster WARNs, without the name" do
+      log =
+        capture_log(fn ->
+          assert :ok ==
+                   ClusterReadiness.warn_if_distribution_unroutable(:"loopctl@127.0.0.1", true)
+        end)
+
+      assert log =~ "named on a loopback host"
+      assert log =~ "UN-CLUSTERED"
+      refute log =~ "127.0.0.1"
+      refute log =~ "loopctl@"
+    end
+
+    test "an undistributed node with DNS configured WARNs as not distributed" do
+      log =
+        capture_log(fn ->
+          assert :ok == ClusterReadiness.warn_if_distribution_unroutable(:nonode@nohost, true)
+        end)
+
+      assert log =~ "not distributed"
+    end
+
+    test "the boot check runs the unroutable-node WARN as well as the peers WARN" do
+      log =
+        capture_log(fn ->
+          assert :ok == ClusterReadiness.boot_check(:"loopctl@127.0.0.1", 2, [], true)
+        end)
+
+      assert log =~ "named on a loopback host"
+      assert log =~ "EXPECTED_APP_NODES=2"
+    end
+
+    test "no WARN when DNS is unset, or when the node is routable" do
+      log =
+        capture_log(fn ->
+          assert :ok ==
+                   ClusterReadiness.warn_if_distribution_unroutable(:"loopctl@127.0.0.1", false)
+
+          assert :ok ==
+                   ClusterReadiness.warn_if_distribution_unroutable(:"loopctl-x@fdaa::2", true)
+        end)
+
+      refute log =~ "Clustering readiness"
+    end
+  end
+
   describe "readiness/3 classification (AC-38.3.2)" do
     test "TC-38.3.2: <= 1 expected node is :single_node (clustering not required), never an error" do
       assert %{status: :single_node, expected_nodes: 1, peers: 0} =

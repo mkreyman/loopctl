@@ -44,6 +44,45 @@ defmodule Loopctl.Runners do
   dispatch ledger (`Loopctl.Runners.DispatchLedger`) before it is broadcast, and the runner's
   `dispatch_reply` and trace land there. Placement, capacity reservation and claiming are the
   caller's (#803).
+
+  ## Across the cluster
+
+  The production machines form one BEAM cluster (`rel/env.sh.eex`, `DNS_CLUSTER_QUERY`). A
+  runner's socket, its channel process and its Presence entry live on whichever node it
+  connected to; every other node holds a REPLICA of that entry (Phoenix.Tracker, a CRDT
+  replicated over PubSub). Durable state — the runner row, the dispatch ledger, the story's
+  `claim_epoch` — lives only in Postgres.
+
+  - **Reaching a runner on another node.** `dispatch/3` may run on either node. It reads the
+    local Presence replica, records the dispatch in the ledger, and broadcasts on the
+    runner's `dispatch_topic/1`; PubSub delivers that to the channel on whichever node holds
+    the socket. Revocation (`revocation_topic/1`) and the socket `disconnect` broadcast
+    cross nodes the same way. The node-shutdown notice does not: it is `local_broadcast`.
+  - **One socket per runner, cluster-wide.** Both single-socket checks (here and the
+    channel's before the push) read Presence, which now includes the other node's
+    sockets. Two sockets holding one credential on two nodes each see two entries once
+    replication catches up (a Tracker delta, ~1.5 s) and both refuse, where two
+    unclustered nodes each saw one and both pushed. A runner that reconnects to the other
+    node while its old socket is still draining is briefly `:runner_ambiguous`, until the
+    old channel exits.
+  - **Netsplit, or a machine killed without its graceful stop.** Tracker goes by heartbeats:
+    after 30 s of silence (its default `down_period`) each side drops the other side's
+    entries until it hears from it again. A graceful stop is not this case: the draining
+    channels exit and their entries leave with them. Inside that window a caller can
+    read a stale entry and broadcast a dispatch that never crosses: the ledger row stays
+    `sent` with no `pushed_at` (#815), the runner never replies, and unless the claimant
+    renews it, the claim's lease expires into the reclaimer. After it, a runner on the far side reads as not connected
+    and the dispatch is refused before anything is recorded. A dispatch can also reach two
+    sockets of one credential, one per side. Exactly-once is held in Postgres, not in
+    Presence: `record_sent/3` writes one row per `dispatch_id`; a reply must present the
+    story's CURRENT `claim_epoch` under a row lock, and a differing second reply is
+    `:already_replied`; the first trace batch binds one `run_id` to the dispatch and any
+    other run is `:run_mismatch`. So a duplicate push can start a second process, but only
+    one accepted reply and one trace stream are ever recorded against the claim.
+  - **Retries.** Nothing here retries a broadcast. A dispatch re-sent with the same
+    `dispatch_id` finds its ledger row and is pushed again (see `DispatchLedger`).
+  - **Slow links.** Distribution declares a silent peer down after the default
+    `net_ticktime` (45-75 s); Presence drops a silent replica after 30 s (above).
   """
 
   import Ecto.Query
@@ -551,8 +590,9 @@ defmodule Loopctl.Runners do
 
   @doc """
   The Fly Machine this node runs on (`FLY_MACHINE_ID`, injected by Fly), or nil off Fly.
-  Two machines can share a node name (both are `loopctl@127.0.0.1` in production), so the
-  machine id is what tells a runner's connection apart across a rolling deploy.
+  Off Fly every node is named `loopctl@127.0.0.1` (`rel/env.sh.eex`), so the machine id is
+  what tells a runner's connection apart there; on Fly the node name already carries the
+  machine's address and release, and the machine id is the name an operator acts on.
   """
   @spec machine_id() :: String.t() | nil
   def machine_id do

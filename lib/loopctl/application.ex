@@ -79,6 +79,9 @@ defmodule Loopctl.Application do
       Loopctl.SystemConfig.CachePrimer,
       {DNSCluster, query: Application.get_env(:loopctl, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Loopctl.PubSub},
+      # Re-reads the SystemConfig cache on this node when the refresh cron ran on a peer
+      # (the cron job runs on one node per tick). Needs PubSub and AdminRepo.
+      Loopctl.SystemConfig.RefreshListener,
       # Issue #801: the runner pool. Its tracker needs PubSub and must be up before
       # the Endpoint accepts a runner socket.
       Loopctl.Runners.Presence,

@@ -67,4 +67,36 @@ defmodule Loopctl.FlyTomlTest do
 
     assert Keyword.fetch!(opts[:drainer], :shutdown) > LoopctlWeb.RunnerShutdownNotice.grace_ms()
   end
+
+  # The `[env]` table, as `KEY = "value"` pairs.
+  defp env_table(path) do
+    path
+    |> File.read!()
+    |> String.split("\n")
+    |> Enum.drop_while(&(String.trim(&1) != "[env]"))
+    |> Enum.drop(1)
+    |> Enum.take_while(&(not String.starts_with?(String.trim_leading(&1), "[")))
+    |> Enum.flat_map(fn line ->
+      case Regex.run(~r/^\s*([A-Z_]+)\s*=\s*"([^"]*)"\s*$/, line) do
+        [_, key, value] -> [{key, value}]
+        _ -> []
+      end
+    end)
+    |> Map.new()
+  end
+
+  describe "clustering" do
+    test "DNS_CLUSTER_QUERY is the app's own .internal name, in [env]" do
+      app = top_level("fly.toml")["app"] |> String.trim(~s("))
+      assert env_table("fly.toml")["DNS_CLUSTER_QUERY"] == "#{app}.internal"
+    end
+
+    test "EXPECTED_APP_NODES parses to the node count ClusterReadiness and DbCapacity read" do
+      value = env_table("fly.toml")["EXPECTED_APP_NODES"]
+      assert value, "EXPECTED_APP_NODES is not set in [env]"
+      assert {count, ""} = Integer.parse(value)
+      assert count > 1
+      assert Loopctl.DbCapacity.parse_expected_app_nodes(value) == count
+    end
+  end
 end
