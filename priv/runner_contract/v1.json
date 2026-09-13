@@ -1,5 +1,23 @@
 {
   "$defs": {
+    "RunnerDisconnecting": {
+      "description": "Pushed as `disconnecting` on the runner's topic immediately before loopctl closes the runner's connection itself. `runner_revoked` and `no_longer_authorized` mean the credential no longer works: do not reconnect until re-enrolled. `server_shutdown` means the node is stopping: reconnect. `join_refused_not_authorized` arrives as the `disconnecting` field of a refused join's error reply, because an unjoined topic cannot carry a push.",
+      "properties": {
+        "reason": {
+          "enum": [
+            "runner_revoked",
+            "no_longer_authorized",
+            "join_refused_not_authorized",
+            "server_shutdown"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason"
+      ],
+      "type": "object"
+    },
     "RunnerDispatch": {
       "description": "Control pushes `dispatch` to start a session. The runner validates it against its LOCAL allow-list (repos, branch prefixes, wall clock, token budget) and refuses by default: a dispatch is a prompt executed as the machine's user. Declared in contract v1; emitted from #803.",
       "properties": {
@@ -458,6 +476,15 @@
         "stale_claim_epoch",
         "already_replied"
       ],
+      "join": [
+        "rate_limited",
+        "not_authorized",
+        "invalid_payload",
+        "unsupported_contract_version",
+        "machine_mismatch",
+        "forbidden_topic",
+        "unknown_topic"
+      ],
       "status": [
         "rate_limited",
         "invalid_payload"
@@ -475,9 +502,13 @@
       "trace_cursor": [
         "rate_limited",
         "invalid_payload"
+      ],
+      "unknown_event": [
+        "unknown_event"
       ]
     },
     "events": {
+      "disconnecting": "RunnerDisconnecting",
       "dispatch": "RunnerDispatch",
       "dispatch_reply": "RunnerDispatchReply",
       "join": "RunnerJoin",
@@ -520,5 +551,5 @@
     "socket_path": "/runner/socket/websocket",
     "topic": "runner:{runner_id}"
   },
-  "x-contract-version": "1.1.0"
+  "x-contract-version": "1.2.0"
 }

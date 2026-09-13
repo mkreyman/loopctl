@@ -49,8 +49,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.1.0"
-      assert schema["x-contract-version"] == "1.1.0"
+      assert RunnerContract.version() == "1.2.0"
+      assert schema["x-contract-version"] == "1.2.0"
 
       assert %{
                "dispatch_reply" => "RunnerDispatchReply",
@@ -64,6 +64,9 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
              }
 
       assert connection["errors"] == RunnerContract.error_reasons()
+      assert "unknown_event" in connection["errors"]["unknown_event"]
+      assert "machine_mismatch" in connection["errors"]["join"]
+      assert RunnerContract.inbound_events() -- Map.keys(connection["errors"]) == []
 
       assert connection["limits"]["trace_max_events"] == RunnerTraceBatch.max_events()
       assert connection["limits"]["trace_max_batch_bytes"] == RunnerTraceBatch.max_bytes()
@@ -72,7 +75,10 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       assert connection["limits"]["dispatch_reply_burst"] == RunnerContract.dispatch_reply_burst()
 
       assert connection["limits"]["min_interval_ms"] ==
-               Map.new(~w(status trace trace_cursor), &{&1, RunnerContract.min_interval_ms(&1)})
+               Map.new(
+                 ~w(status trace trace_cursor),
+                 &{&1, RunnerContract.min_interval_ms(&1)}
+               )
 
       assert connection["limits"]["trace_max_event_data_bytes"] ==
                RunnerTraceEvent.max_data_bytes()
@@ -783,6 +789,24 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
                RunnerContract.cast_dispatch_reply(Map.put(reply, "detail", "a" <> <<0>>))
 
       assert message =~ "NUL"
+    end
+  end
+
+  describe "disconnecting (1.2.0)" do
+    test "the export declares the event, its schema and every reason the channel uses" do
+      schema = RunnerContract.json_schema()
+      assert schema["x-connection"]["events"]["disconnecting"] == "RunnerDisconnecting"
+
+      definition = schema["$defs"]["RunnerDisconnecting"]
+      assert definition["required"] == ["reason"]
+
+      assert definition["properties"]["reason"]["enum"] ==
+               RunnerContract.RunnerDisconnecting.reasons()
+
+      assert Enum.sort(RunnerContract.RunnerDisconnecting.reasons()) ==
+               Enum.sort(
+                 ~w(join_refused_not_authorized no_longer_authorized runner_revoked server_shutdown)
+               )
     end
   end
 

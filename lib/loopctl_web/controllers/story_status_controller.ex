@@ -14,11 +14,14 @@ defmodule LoopctlWeb.StoryStatusController do
   """
 
   use LoopctlWeb, :controller
+
+  require Logger
   use OpenApiSpex.ControllerSpecs
 
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Capabilities
   alias Loopctl.Dispatches
+  alias Loopctl.LogValue
   alias Loopctl.Progress
   alias Loopctl.Progress.StateMachine
   alias LoopctlWeb.AuditContext
@@ -622,8 +625,40 @@ defmodule LoopctlWeb.StoryStatusController do
              Keyword.put(opts, :claim_epoch, epoch)
            ) do
       json(conn, %{story: story, next_actions: StateMachine.next_actions(story, api_key.role)})
+    else
+      error ->
+        log_renew_refused(api_key, story_id, params, error)
+        error
     end
   end
+
+  # Issue #815: a claimant whose renewals are refused is about to lose its claim to the
+  # reclaimer, and without this line nothing records why. The current epoch is read only
+  # on this refusal path.
+  defp log_renew_refused(api_key, story_id, params, error) do
+    # The story id is the path segment and the epoch the body's: both are the client's, so
+    # each is logged only in the shape it claims (`Loopctl.LogValue`).
+    logged_story_id = LogValue.uuid(story_id)
+    presented = LogValue.epoch(Map.get(params, "claim_epoch"))
+
+    current =
+      if is_binary(logged_story_id),
+        do: Progress.current_claim_epoch(api_key.tenant_id, logged_story_id)
+
+    Logger.info(
+      "renew_claim refused: reason=#{inspect(refusal_reason(error))} " <>
+        "story_id=#{inspect(logged_story_id)} " <>
+        "presented_epoch=#{inspect(presented)} current_epoch=#{inspect(current)} " <>
+        "agent_id=#{inspect(api_key.agent_id)} tenant_id=#{api_key.tenant_id}",
+      story_id: logged_story_id,
+      claim_epoch: presented
+    )
+  end
+
+  defp refusal_reason({:error, reason}) when is_atom(reason), do: reason
+  defp refusal_reason({:error, reason, _message}), do: reason
+  defp refusal_reason({:error, %Ecto.Changeset{}}), do: :invalid_changeset
+  defp refusal_reason(other), do: other
 
   # --- Private helpers ---
 

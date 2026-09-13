@@ -7531,8 +7531,9 @@ const TOOLS = [
     description:
       "The tenant's CONNECTED runners, read from Presence (GET /api/v1/runners/pool): per machine " +
       "name, runner_id, joined_at, in_flight, draining, max_sessions, the latest health sample, " +
-      "and live_sockets. live_sockets above 1 means more than one process holds that runner's " +
-      "credential. A killed runner disappears once its socket closes. Presence converges only " +
+      "live_sockets, and the node and machine_id (Fly Machine) holding the socket. live_sockets " +
+      "above 1 means more than one process holds that runner's credential. A killed runner " +
+      "disappears once its socket closes. Presence converges only " +
       "within a cluster, so on an unclustered multi-node deployment a runner on another node is " +
       "absent. Requires LOOPCTL_USER_KEY (user role).",
     inputSchema: { type: "object", properties: {} },

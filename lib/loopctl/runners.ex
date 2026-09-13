@@ -48,6 +48,8 @@ defmodule Loopctl.Runners do
 
   import Ecto.Query
 
+  require Logger
+
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.ApiSpec.RunnerContract
@@ -55,6 +57,7 @@ defmodule Loopctl.Runners do
   alias Loopctl.AuditChain.Entry, as: AuditEntry
   alias Loopctl.Auth
   alias Loopctl.Auth.ApiKey
+  alias Loopctl.LogValue
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.Presence
   alias Loopctl.Runners.Runner
@@ -76,6 +79,14 @@ defmodule Loopctl.Runners do
   """
   @spec dispatch_topic(Ecto.UUID.t()) :: String.t()
   def dispatch_topic(runner_id) when is_binary(runner_id), do: "runner_dispatch:" <> runner_id
+
+  @doc """
+  The NODE-LOCAL PubSub topic every runner channel on this node listens on for this node's
+  shutdown (`LoopctlWeb.RunnerShutdownNotice`). Broadcast with `local_broadcast`: a stopping
+  node must tell only its own runners.
+  """
+  @spec shutdown_topic() :: String.t()
+  def shutdown_topic, do: "runner_shutdown"
 
   @doc """
   The joined runners of a tenant, as `Phoenix.Presence.list/1` returns them: a map of
@@ -351,6 +362,42 @@ defmodule Loopctl.Runners do
              | :dispatch_already_replied
              | :stale_claim_epoch}
   def dispatch(tenant_id, runner_id, payload) do
+    case do_dispatch(tenant_id, runner_id, payload) do
+      :ok ->
+        :ok
+
+      {:error, reason} = refused ->
+        log_dispatch_refused(tenant_id, runner_id, payload, reason)
+        refused
+    end
+  end
+
+  # Identifiers only, read defensively: a refused payload may be malformed, so each value is
+  # logged only in the shape it claims (`Loopctl.LogValue`).
+  defp log_dispatch_refused(tenant_id, runner_id, payload, reason) do
+    field = fn key ->
+      if is_map(payload),
+        do: Map.get(payload, key) || Map.get(payload, String.to_existing_atom(key))
+    end
+
+    tenant_id = LogValue.uuid(tenant_id)
+    runner_id = LogValue.uuid(runner_id)
+    dispatch_id = LogValue.uuid(field.("dispatch_id"))
+    story_id = LogValue.uuid(field.("story_id"))
+    claim_epoch = LogValue.epoch(field.("claim_epoch"))
+
+    Logger.info(
+      "runner dispatch refused: reason=#{inspect(reason)} tenant_id=#{inspect(tenant_id)} " <>
+        "runner_id=#{inspect(runner_id)} dispatch_id=#{inspect(dispatch_id)} " <>
+        "story_id=#{inspect(story_id)} claim_epoch=#{inspect(claim_epoch)}",
+      runner_id: runner_id,
+      dispatch_id: dispatch_id,
+      story_id: story_id,
+      claim_epoch: claim_epoch
+    )
+  end
+
+  defp do_dispatch(tenant_id, runner_id, payload) do
     with {:ok, dispatch} <- RunnerContract.cast_dispatch(payload),
          {:ok, tenant_id, runner_id} <- cast_ids(tenant_id, runner_id),
          :ok <- not_halted(tenant_id),
@@ -436,37 +483,82 @@ defmodule Loopctl.Runners do
   @spec authenticate(term()) ::
           {:ok, %{runner: Runner.t(), api_key: ApiKey.t()}}
           | {:error, :invalid_token | :tenant_inactive | :not_a_runner | :runner_revoked}
-  def authenticate(raw_token) when is_binary(raw_token) and raw_token != "" do
+  def authenticate(raw_token) do
+    case authenticate_identified(raw_token) do
+      {:ok, auth} -> {:ok, auth}
+      {:error, reason, _identity} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  `authenticate/1`, with what WAS resolved on a refusal (issue #815): the key's `api_key_id`,
+  `tenant_id` and `runner_id` where resolution got that far, `nil` otherwise. For the
+  socket's refusal log only; never the token.
+  """
+  @spec authenticate_identified(term()) ::
+          {:ok, %{runner: Runner.t(), api_key: ApiKey.t()}}
+          | {:error, :invalid_token | :tenant_inactive | :not_a_runner | :runner_revoked,
+             %{
+               api_key_id: Ecto.UUID.t() | nil,
+               tenant_id: Ecto.UUID.t() | nil,
+               runner_id: Ecto.UUID.t() | nil
+             }}
+  def authenticate_identified(raw_token) when is_binary(raw_token) and raw_token != "" do
     with {:ok, api_key} <- verify(raw_token),
-         :ok <- tenant_active(api_key.tenant),
+         :ok <- tenant_active(api_key),
          {:ok, runner} <- runner_for_key(api_key) do
       {:ok, %{runner: runner, api_key: api_key}}
     end
   end
 
-  def authenticate(_raw_token), do: {:error, :invalid_token}
+  def authenticate_identified(_raw_token), do: {:error, :invalid_token, identity(nil, nil)}
+
+  defp identity(api_key, runner) do
+    %{
+      api_key_id: api_key && api_key.id,
+      tenant_id: api_key && api_key.tenant_id,
+      runner_id: runner && runner.id
+    }
+  end
 
   defp verify(raw_token) do
     case Auth.verify_api_key(raw_token) do
       {:ok, %ApiKey{tenant_id: tenant_id, role: :agent} = api_key} when is_binary(tenant_id) ->
         {:ok, api_key}
 
-      {:ok, %ApiKey{}} ->
-        {:error, :not_a_runner}
+      {:ok, %ApiKey{} = api_key} ->
+        {:error, :not_a_runner, identity(api_key, nil)}
 
       {:error, _} ->
-        {:error, :invalid_token}
+        {:error, :invalid_token, identity(nil, nil)}
     end
   end
 
-  defp tenant_active(%Tenant{status: :active}), do: :ok
-  defp tenant_active(_tenant), do: {:error, :tenant_inactive}
+  defp tenant_active(%ApiKey{tenant: %Tenant{status: :active}}), do: :ok
+  defp tenant_active(api_key), do: {:error, :tenant_inactive, identity(api_key, nil)}
 
-  defp runner_for_key(%ApiKey{id: key_id, tenant_id: tenant_id}) do
+  defp runner_for_key(%ApiKey{id: key_id, tenant_id: tenant_id} = api_key) do
     case AdminRepo.get_by(Runner, api_key_id: key_id, tenant_id: tenant_id) do
-      nil -> {:error, :not_a_runner}
+      nil -> {:error, :not_a_runner, identity(api_key, nil)}
       %Runner{revoked_at: nil} = runner -> {:ok, runner}
-      %Runner{} -> {:error, :runner_revoked}
+      %Runner{} = runner -> {:error, :runner_revoked, identity(api_key, runner)}
+    end
+  end
+
+  @doc "This node's name, as a string, for runner presence metas and logs (issue #815)."
+  @spec node_name() :: String.t()
+  def node_name, do: Atom.to_string(node())
+
+  @doc """
+  The Fly Machine this node runs on (`FLY_MACHINE_ID`, injected by Fly), or nil off Fly.
+  Two machines can share a node name (both are `loopctl@127.0.0.1` in production), so the
+  machine id is what tells a runner's connection apart across a rolling deploy.
+  """
+  @spec machine_id() :: String.t() | nil
+  def machine_id do
+    case System.get_env("FLY_MACHINE_ID") do
+      id when is_binary(id) and id != "" -> id
+      _ -> nil
     end
   end
 

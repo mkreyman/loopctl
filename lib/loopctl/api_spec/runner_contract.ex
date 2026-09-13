@@ -24,21 +24,34 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   | direction | event | schema | ok reply | error `reason`s |
   |---|---|---|---|---|
-  | runner -> control | `phx_join` on `"runner:<runner_id>"` | `RunnerJoin` | `{contract_version}` | see `LoopctlWeb.RunnerChannel` |
+  | runner -> control | `phx_join` on `"runner:<runner_id>"` | `RunnerJoin` | `{contract_version}` | `rate_limited`, `not_authorized`, `invalid_payload`, `unsupported_contract_version`, `machine_mismatch`, `forbidden_topic`, `unknown_topic` |
   | runner -> control | `"status"` | `RunnerStatus` | empty | `rate_limited`, `invalid_payload` |
   | control -> runner | `"dispatch"` | `RunnerDispatch` (pushed only by `Loopctl.Runners.dispatch/3`) | — | — |
   | runner -> control | `"dispatch_reply"` | `RunnerDispatchReply` (since 1.1.0) | empty | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `stale_claim_epoch`, `already_replied` |
   | runner -> control | `"trace"` | `RunnerTraceBatch` of `RunnerTraceEvent` (since 1.1.0) | `RunnerTraceAck` | `rate_limited`, `invalid_payload`, `batch_too_large`, `event_data_too_large`, `unknown_dispatch`, `stale_claim_epoch`, `dispatch_not_accepted`, `run_mismatch` |
   | runner -> control | `"trace_cursor"` | `RunnerTraceCursor` (since 1.1.0) | `RunnerTraceAck` | `rate_limited`, `invalid_payload` |
+  | control -> runner | `"disconnecting"` | `RunnerDisconnecting` (since 1.2.0) | — | — |
+  | runner -> control | any other event | — | — | `unknown_event` (since 1.2.0; every time, never `rate_limited`) |
+
+  ## Server-initiated disconnects (since 1.2.0)
+
+  Before loopctl closes a runner's connection itself, it pushes `"disconnecting"` on the
+  runner's topic with a stable `reason` (`RunnerDisconnecting.reasons/0`), then closes, so
+  the runner can tell a revocation from a deploy from a network drop. `runner_revoked` and
+  `no_longer_authorized` precede the socket being closed; `server_shutdown` precedes the
+  drain of a stopping node, after which the runner should reconnect. A join refused as
+  `not_authorized` cannot carry a push — the topic was never joined — so its error reply
+  carries `disconnecting: "join_refused_not_authorized"` instead, and the socket is closed
+  only after that reply has been sent.
 
   ## Rate limits
 
   Published in `x-connection.limits`, and enforced per channel:
 
   - `min_interval_ms` (`min_interval_ms/1`) — `status` 1000 ms, `trace` 50 ms,
-    `trace_cursor` 50 ms. Each event has its OWN floor: a `trace` batch is not held back
-    by a recent `status` or `trace_cursor`, so the resume sequence (cursor, then batches)
-    is never refused, and a rejoining runner ships up to 20 batches a second.
+    `trace_cursor` 50 ms. Each event has its OWN floor: a `trace` batch is not held back by a recent
+    `status` or `trace_cursor`, so the resume sequence (cursor, then batches) is never
+    refused, and a rejoining runner ships up to 20 batches a second.
   - `dispatch_reply_burst` (`dispatch_reply_burst/0`) — a bucket of 8 replies that refills
     one every 250 ms, so several dispatches can be answered back to back.
 
@@ -93,7 +106,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   alias OpenApiSpex.Schema
 
-  @version "1.1.0"
+  @version "1.2.0"
   @major 1
 
   defmodule ByteRule do
@@ -492,6 +505,34 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     )
   end
 
+  defmodule RunnerDisconnecting do
+    @moduledoc false
+    require OpenApiSpex
+
+    @reasons ~w(runner_revoked no_longer_authorized join_refused_not_authorized server_shutdown)
+
+    @doc "Every reason loopctl gives for a disconnect it initiates."
+    @spec reasons() :: [String.t()]
+    def reasons, do: @reasons
+
+    OpenApiSpex.schema(
+      %{
+        title: "RunnerDisconnecting",
+        description:
+          "Pushed as `disconnecting` on the runner's topic immediately before loopctl closes " <>
+            "the runner's connection itself. `runner_revoked` and `no_longer_authorized` mean " <>
+            "the credential no longer works: do not reconnect until re-enrolled. " <>
+            "`server_shutdown` means the node is stopping: reconnect. " <>
+            "`join_refused_not_authorized` arrives as the `disconnecting` field of a refused " <>
+            "join's error reply, because an unjoined topic cannot carry a push.",
+        type: :object,
+        required: [:reason],
+        properties: %{reason: %Schema{type: :string, enum: @reasons}}
+      },
+      struct?: false
+    )
+  end
+
   defmodule RunnerTraceAck do
     @moduledoc false
     require OpenApiSpex
@@ -519,7 +560,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     RunnerTraceEvent,
     RunnerTraceBatch,
     RunnerTraceCursor,
-    RunnerTraceAck
+    RunnerTraceAck,
+    RunnerDisconnecting
   ]
 
   # The stable `reason` codes each runner-to-control event can be refused with. Exported, so
@@ -531,8 +573,16 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     "trace" =>
       ~w(rate_limited invalid_payload batch_too_large event_data_too_large unknown_dispatch
          stale_claim_epoch dispatch_not_accepted run_mismatch),
-    "trace_cursor" => ~w(rate_limited invalid_payload)
+    "trace_cursor" => ~w(rate_limited invalid_payload),
+    # Since 1.2.0. `join` is the `phx_join` reply; `unknown_event` answers any event this
+    # map does not name, every time.
+    "join" => ~w(rate_limited not_authorized invalid_payload unsupported_contract_version
+         machine_mismatch forbidden_topic unknown_topic),
+    "unknown_event" => ~w(unknown_event)
   }
+
+  # The runner-to-control events `LoopctlWeb.RunnerChannel.handle_in/3` acts on.
+  @inbound_events ~w(status dispatch_reply trace trace_cursor)
 
   # The minimum spacing, per channel, between two acted-on messages of one event. A message
   # inside it is refused with `rate_limited` and `min_interval_ms`. Each event has its OWN
@@ -582,9 +632,16 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   @spec max_seq() :: pos_integer()
   def max_seq, do: @max_seq
 
-  @doc "The stable error `reason` codes, per runner-to-control event."
+  @doc """
+  The stable error `reason` codes, per runner-to-control event, plus `join` (the `phx_join`
+  reply) and `unknown_event` (any event not named here).
+  """
   @spec error_reasons() :: %{String.t() => [String.t()]}
   def error_reasons, do: @error_reasons
+
+  @doc "The runner-to-control events the channel acts on (`phx_join` aside)."
+  @spec inbound_events() :: [String.t()]
+  def inbound_events, do: @inbound_events
 
   @doc "The schema modules the contract declares."
   @spec schema_modules() :: [module()]
@@ -848,7 +905,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           "dispatch_reply" => "RunnerDispatchReply",
           "trace" => "RunnerTraceBatch",
           "trace_cursor" => "RunnerTraceCursor",
-          "trace_event" => "RunnerTraceEvent"
+          "trace_event" => "RunnerTraceEvent",
+          "disconnecting" => "RunnerDisconnecting"
         },
         "replies" => %{
           "trace" => "RunnerTraceAck",

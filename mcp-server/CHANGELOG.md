@@ -5,6 +5,15 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.92.1 — 2026-09-12 (runner_pool names the node and machine)
+
+### Changed
+
+- **`runner_pool`** (loopctl #815): the description and README now name the `node` and
+  `machine_id` (Fly Machine) each connected runner's socket is held on, which
+  `GET /api/v1/runners/pool` entries now carry (nullable). Needs a loopctl server that returns
+  them; an older server simply omits both.
+
 ## 2.92.0 — 2026-09-12 (runner tools, and renewing a story claim's lease)
 
 ### Added

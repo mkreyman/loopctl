@@ -228,11 +228,11 @@ defmodule LoopctlWeb.RunnerChannelTest do
       refute in_pool?(runner.tenant_id, "minis")
     end
 
-    test "a runner built against contract 1.0.0 still joins the 1.1.0 server" do
+    test "a runner built against contract 1.0.0 still joins the 1.2.0 server" do
       {raw, runner} = fixture(:runner, %{name: "minis"})
       {:ok, socket} = connect_runner(raw)
 
-      assert {:ok, %{contract_version: "1.1.0"}, _channel} =
+      assert {:ok, %{contract_version: "1.2.0"}, _channel} =
                subscribe_and_join(
                  socket,
                  topic(socket),

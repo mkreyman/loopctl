@@ -53,8 +53,13 @@ defmodule LoopctlWeb.Endpoint do
   # 64 KB bounds ALL inbound frames at the transport (over-cap frames are dropped
   # and the connection closed by Bandit). This is defense-in-depth ON TOP OF the
   # per-handler size caps and rate limits.
+  #
+  # Issue #815: every socket's drainer is set EXPLICITLY (the /live values are Phoenix's
+  # defaults), because `fly.toml`'s `kill_timeout` is derived from their `shutdown` totals
+  # and a test holds that relationship. A drainer only runs on a graceful stop — SIGTERM.
   socket "/live", Phoenix.LiveView.Socket,
     websocket: [connect_info: [session: @session_options], max_frame_size: 64_000],
+    drainer: [batch_size: 10_000, batch_interval: 2_000, shutdown: 30_000],
     longpoll: [connect_info: [session: @session_options]]
 
   # Issue #801: the runner socket. Runners are non-browser clients that dial OUT to
@@ -62,9 +67,12 @@ defmodule LoopctlWeb.Endpoint do
   # `x-loopctl-runner-token` header (hence `:x_headers`), never in the URL. No longpoll:
   # a runner holds one long-lived websocket, and a second transport is a second surface
   # for nothing. The frame cap matches `/live` — no runner message is near 64 KB.
+  # A runner fleet is a handful of sockets, so one batch always drains it; `shutdown` bounds
+  # the whole drain, including `LoopctlWeb.RunnerShutdownNotice`'s grace.
   socket "/runner/socket", LoopctlWeb.RunnerSocket,
     websocket: [connect_info: [:peer_data, :x_headers], max_frame_size: 64_000],
-    longpoll: false
+    longpoll: false,
+    drainer: [batch_size: 10_000, batch_interval: 1_000, shutdown: 10_000]
 
   # Serve at "/" the static files from "priv/static" directory.
   #

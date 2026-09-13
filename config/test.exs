@@ -334,7 +334,16 @@ config :logger, :default_formatter,
     :duration_ms,
     :repo,
     :source,
-    :endpoint
+    :endpoint,
+    # Issue #815: runner control-plane correlation keys (mirrors config/config.exs).
+    :runner_id,
+    :runner_name,
+    :story_id,
+    :dispatch_id,
+    :run_id,
+    :claim_epoch,
+    :node,
+    :machine
   ]
 
 # Oban: inline testing mode (jobs execute synchronously in tests)

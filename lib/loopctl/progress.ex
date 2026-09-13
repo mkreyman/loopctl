@@ -1427,6 +1427,16 @@ defmodule Loopctl.Progress do
     end
   end
 
+  @doc "A story's current `claim_epoch`, or nil when it does not exist in the tenant."
+  @spec current_claim_epoch(Ecto.UUID.t(), Ecto.UUID.t()) :: non_neg_integer() | nil
+  def current_claim_epoch(tenant_id, story_id) do
+    from(s in Story,
+      where: s.id == ^story_id and s.tenant_id == ^tenant_id,
+      select: s.claim_epoch
+    )
+    |> AdminRepo.one()
+  end
+
   @doc """
   The claim fence: `:ok` when `epoch` is the story's current `claim_epoch`.
 

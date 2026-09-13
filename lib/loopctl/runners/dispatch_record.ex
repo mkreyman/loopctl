@@ -12,6 +12,8 @@ defmodule Loopctl.Runners.DispatchRecord do
 
   - `sent` — handed to the runner's channel. Not delivered: the channel may still drop it
     (a halt, a second socket), and re-dispatching the same `dispatch_id` re-sends it.
+    `pushed_at` is stamped when a channel actually pushes it, so `sent` with no `pushed_at`
+    is a dispatch that never reached a socket.
   - `accepted` / `refused` — the runner's reply. Terminal for the reply; a refusal carries a
     `reason` (`RunnerContract.refusal_reasons/0`).
   - `superseded` — the claim this dispatch served has ended: the story's `claim_epoch` moved
@@ -46,6 +48,7 @@ defmodule Loopctl.Runners.DispatchRecord do
     field :reason, :string
     field :reason_detail, :string
     field :replied_at, :utc_datetime_usec
+    field :pushed_at, :utc_datetime_usec
     field :run_id, :binary_id
     field :trace_acked_seq, :integer, default: -1
 
