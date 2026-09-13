@@ -10,6 +10,7 @@ defmodule LoopctlWeb.RunnerChannelTest do
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Auth
   alias Loopctl.Runners
+  alias Loopctl.Runners.Presence
   alias Loopctl.Tenants
   alias LoopctlWeb.RunnerSocket
 
@@ -441,6 +442,66 @@ defmodule LoopctlWeb.RunnerChannelTest do
 
       assert {:error, :runner_ambiguous} = dispatch_to(runner)
       refute_push "dispatch", _
+    end
+
+    @tag :capture_log
+    test "a second subscribed socket missing from the pool read gets no push; one push happens",
+         %{runner: runner, raw: raw} do
+      # The state a socket is in when `dispatch/3`'s pool read cannot see it: subscribed to
+      # the runner's dispatches but absent from the pool (not yet tracked, or not yet in this
+      # node's Presence view). Produced here by untracking a joined second socket.
+      {:ok, second} = connect_runner(raw)
+      {_reply, channel_b} = join_pool(second, "minis")
+      :ok = Presence.untrack(channel_b.channel_pid, Runners.pool_topic(runner.tenant_id), "minis")
+      assert eventually(fn -> length(Runners.live_metas(runner.tenant_id, runner.id)) == 1 end)
+
+      assert :ok = dispatch_to(runner)
+
+      # Both channels receive the broadcast; only the socket that is the pool's sole live
+      # meta pushes. Both transports are this test process, so count every push.
+      assert_receive %Phoenix.Socket.Message{event: "dispatch"}
+      refute_receive %Phoenix.Socket.Message{event: "dispatch"}
+    end
+
+    @tag :capture_log
+    test "a live meta the sender did not see stops the push", %{runner: runner} do
+      {:ok, dispatch} = RunnerContract.cast_dispatch(build(:runner_dispatch))
+      topic = Runners.dispatch_topic(runner.id)
+
+      # A second live socket for this runner, as another node's Presence would report it.
+      other =
+        spawn(fn ->
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      {:ok, _ref} =
+        Presence.track(other, Runners.pool_topic(runner.tenant_id), "minis", %{
+          runner_id: runner.id
+        })
+
+      Phoenix.PubSub.broadcast(Loopctl.PubSub, topic, {:runner_dispatch, dispatch})
+      refute_push "dispatch", _
+
+      # Once it is gone the same message is pushed, so the refusal above was the second meta.
+      send(other, :stop)
+      assert eventually(fn -> length(Runners.live_metas(runner.tenant_id, runner.id)) == 1 end)
+      Phoenix.PubSub.broadcast(Loopctl.PubSub, topic, {:runner_dispatch, dispatch})
+      assert_push "dispatch", _
+    end
+
+    test "still pushes after a status update re-issues the socket's Presence ref",
+         %{runner: runner, channel: channel} do
+      ref = push(channel, "status", %{"in_flight" => 1})
+      assert_reply ref, :ok
+
+      assert eventually(fn ->
+               match?([%{in_flight: 1}], Runners.live_metas(runner.tenant_id, runner.id))
+             end)
+
+      assert :ok = dispatch_to(runner)
+      assert_push "dispatch", _
     end
 
     test "a malformed payload is refused and nothing is pushed", %{runner: runner} do

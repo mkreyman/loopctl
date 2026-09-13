@@ -39,8 +39,9 @@ defmodule Loopctl.Runners do
 
   `dispatch/3` is the one path by which a dispatch reaches a runner. It validates the
   payload against the contract and refuses a halted tenant, an unauthorized runner and a
-  runner not in the pool before anything is sent; the channel re-reads the halt again right
-  before the push. Placement, capacity reservation and claiming are the caller's (#803).
+  runner without exactly one live socket before anything is sent; the channel repeats the
+  halt and single-socket checks right before the push. Placement, capacity reservation and
+  claiming are the caller's (#803).
   """
 
   import Ecto.Query
@@ -312,10 +313,17 @@ defmodule Loopctl.Runners do
   Then it broadcasts on `dispatch_topic/1`, and the runner's channel pushes the `"dispatch"`
   event on the runner's own `runner:<runner_id>` topic, never a shared or tenant topic.
 
-  `:ok` means handed to the runner's channel, not executed: the channel re-reads the halt
-  immediately before the push (a halt landing between this check and that one drops the
-  dispatch there), and a channel that died in between receives nothing. Acknowledgement
-  belongs to the dispatch protocol (#803), which bumps `claim_epoch` on reclaim.
+  `:ok` means handed to the runner's channel, not executed. The channel repeats two checks
+  immediately before the push and drops the dispatch when either fails: the halt (a halt
+  landing between this read and that one), and that it is the ONLY live socket for the
+  runner, by its own Presence ref (a second socket this read did not see yet). A channel
+  that died in between receives nothing. Acknowledgement belongs to the dispatch protocol
+  (#803), which bumps `claim_epoch` on reclaim.
+
+  Both single-socket checks read Presence, which is eventually consistent ACROSS nodes: two
+  sockets on one credential joined to DIFFERENT nodes within Presence's replication interval
+  can each see only itself. Exactly-once delivery is therefore not a Presence property; the
+  `claim_epoch` fence and the Postgres capacity reservation (#803) are what hold it.
   """
   @spec dispatch(term(), term(), term()) ::
           :ok
@@ -370,15 +378,21 @@ defmodule Loopctl.Runners do
     if authorized?(tenant_id, runner_id), do: :ok, else: {:error, :not_authorized}
   end
 
-  # The pool is keyed by machine name; the id is on each live socket's meta. Read from the
-  # TENANT's pool only, so a runner connected under another tenant is never found here.
-  defp single_live_socket(tenant_id, runner_id) do
-    metas =
-      for {_name, %{metas: metas}} <- pool(tenant_id),
-          %{runner_id: ^runner_id} = meta <- metas,
-          do: meta
+  @doc """
+  The Presence metas of every live socket holding `runner_id`'s credential in the tenant's
+  pool, each carrying its `:phx_ref`. The pool is keyed by machine name; the id is on each
+  meta. Read from the TENANT's pool only, so a runner connected under another tenant is
+  never found here.
+  """
+  @spec live_metas(Ecto.UUID.t(), Ecto.UUID.t()) :: [map()]
+  def live_metas(tenant_id, runner_id) when is_binary(tenant_id) and is_binary(runner_id) do
+    for {_name, %{metas: metas}} <- pool(tenant_id),
+        %{runner_id: ^runner_id} = meta <- metas,
+        do: meta
+  end
 
-    case metas do
+  defp single_live_socket(tenant_id, runner_id) do
+    case live_metas(tenant_id, runner_id) do
       [] -> {:error, :runner_not_connected}
       [_one] -> :ok
       [_ | _] -> {:error, :runner_ambiguous}

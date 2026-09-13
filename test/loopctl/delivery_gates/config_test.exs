@@ -86,6 +86,39 @@ defmodule Loopctl.DeliveryGates.ConfigTest do
       assert Config.from_config(with_newline) == {:error, :checksum_mismatch}
     end
 
+    if System.find_executable("sha256sum") do
+      test "the deploy/FLY_SECRETS.md recipe produces a matching pair; hashing the file does not" do
+        dir = Path.join(System.tmp_dir!(), "gates_recipe_#{System.unique_integer([:positive])}")
+        File.mkdir_p!(dir)
+        on_exit(fn -> File.rm_rf!(dir) end)
+
+        # An editor-saved document: it ends in a newline.
+        File.write!(
+          Path.join(dir, "triggers.json"),
+          Jason.encode!(build(:delivery_gates_config)) <> "\n"
+        )
+
+        # The recipe deploy/FLY_SECRETS.md documents (keep the two in step), with the value
+        # `fly secrets set` would receive captured to a file instead, plus the wrong recipe
+        # it warns against.
+        script = """
+        DOC="$(cat triggers.json)"
+        printf '%s' "$DOC" > value.bin
+        printf '%s' "$DOC" | sha256sum | cut -d' ' -f1
+        sha256sum triggers.json | cut -d' ' -f1
+        """
+
+        {out, 0} = System.cmd("sh", ["-c", script], cd: dir)
+        [recipe_sha, file_sha] = String.split(out, "\n", trim: true)
+        value = File.read!(Path.join(dir, "value.bin"))
+
+        assert {:ok, %Triggers{}} = Config.from_config(document: value, sha256: recipe_sha)
+
+        assert Config.from_config(document: value, sha256: file_sha) ==
+                 {:error, :checksum_mismatch}
+      end
+    end
+
     test "a non-keyword value" do
       assert Config.from_config(%{document: "x", sha256: "y"}) == {:error, :missing_config}
       assert Config.from_config(["x", "y"]) == {:error, :missing_config}
