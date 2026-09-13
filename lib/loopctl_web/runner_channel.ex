@@ -66,6 +66,7 @@ defmodule LoopctlWeb.RunnerChannel do
   alias Loopctl.Runners
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.Presence
+  alias LoopctlWeb.RunnerChannel.MinInterval
   alias LoopctlWeb.RunnerChannel.ReplyBucket
   alias LoopctlWeb.RunnerSocket
 
@@ -170,7 +171,7 @@ defmodule LoopctlWeb.RunnerChannel do
   def handle_in("status", payload, socket) do
     now = System.monotonic_time(:millisecond)
 
-    with :ok <- interval_ok(socket.assigns.last_status_at, now, @min_status_interval_ms),
+    with :ok <- MinInterval.check(socket.assigns.last_status_at, now, @min_status_interval_ms),
          {:ok, status} <- RunnerContract.cast_status(payload) do
       %{runner: runner, tenant_id: tenant_id, meta: meta} = socket.assigns
       meta = Map.merge(meta, status)
@@ -225,7 +226,7 @@ defmodule LoopctlWeb.RunnerChannel do
     now = System.monotonic_time(:millisecond)
     %{runner: runner, tenant_id: tenant_id} = socket.assigns
 
-    with :ok <- interval_ok(socket.assigns.last_trace_at, now, @min_trace_interval_ms),
+    with :ok <- MinInterval.check(socket.assigns.last_trace_at, now, @min_trace_interval_ms),
          {:ok, batch} <- RunnerContract.cast_trace_batch(payload) do
       socket = assign(socket, :last_trace_at, now)
 
@@ -243,7 +244,7 @@ defmodule LoopctlWeb.RunnerChannel do
     now = System.monotonic_time(:millisecond)
     %{runner: runner, tenant_id: tenant_id} = socket.assigns
 
-    with :ok <- interval_ok(socket.assigns.last_cursor_at, now, @min_cursor_interval_ms),
+    with :ok <- MinInterval.check(socket.assigns.last_cursor_at, now, @min_cursor_interval_ms),
          {:ok, %{run_id: run_id}} <- RunnerContract.cast_trace_cursor(payload) do
       acked_seq = DispatchLedger.trace_cursor(tenant_id, runner.id, run_id)
       {:reply, {:ok, %{acked_seq: acked_seq}}, assign(socket, :last_cursor_at, now)}
@@ -288,12 +289,6 @@ defmodule LoopctlWeb.RunnerChannel do
 
   defp enrolled_machine(%{machine: declared}, _runner),
     do: {:error, {:machine_mismatch, declared}}
-
-  # `:never` rather than 0: monotonic time is negative on a fresh VM, so a 0 sentinel
-  # would refuse the first update.
-  defp interval_ok(:never, _now, _min_ms), do: :ok
-  defp interval_ok(last, now, min_ms) when now - last >= min_ms, do: :ok
-  defp interval_ok(_last, _now, _min_ms), do: {:error, :rate_limited}
 
   defp presence_meta(meta, runner), do: Map.put(meta, :runner_id, runner.id)
 

@@ -331,12 +331,27 @@ defmodule LoopctlWeb.RunnerChannelTest do
       assert meta.cores == 16
     end
 
-    test "refuses an update inside the minimum interval", %{channel: channel} do
+    test "records when an update was admitted, and refuses one inside the minimum interval",
+         %{channel: channel} do
+      # The floor's comparison is LoopctlWeb.RunnerChannel.MinIntervalTest's, at fixed times.
+      # Here only what does not depend on how long the round trips take.
       ref = push(channel, "status", %{"in_flight" => 1})
       assert_reply ref, :ok, _, @reply_timeout
+      assert is_integer(:sys.get_state(channel.channel_pid).assigns.last_status_at)
 
+      # Pinned in the future, so the refusal holds however long the first update took.
+      :sys.replace_state(channel.channel_pid, fn socket ->
+        at = System.monotonic_time(:millisecond) + 60_000
+        %{socket | assigns: Map.put(socket.assigns, :last_status_at, at)}
+      end)
+
+      floor = RunnerContract.min_interval_ms("status")
       ref = push(channel, "status", %{"in_flight" => 2})
-      assert_reply ref, :error, %{reason: "rate_limited"}, @reply_timeout
+
+      assert_reply ref,
+                   :error,
+                   %{reason: "rate_limited", min_interval_ms: ^floor},
+                   @reply_timeout
     end
 
     test "refuses a status with no known field", %{channel: channel} do
