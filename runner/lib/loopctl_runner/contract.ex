@@ -1,7 +1,7 @@
 defmodule LoopctlRunner.Contract do
   @moduledoc """
   The loopctl runner wire contract, vendored from mkreyman/loopctl
-  `priv/runner_contract/v1.json` (JSON Schema 2020-12, `x-contract-version` 1.0.0).
+  `priv/runner_contract/v1.json` (JSON Schema 2020-12, `x-contract-version` 1.1.0).
 
   The file is copied, never re-typed: the server casts every payload against the same
   document, drops unknown fields at every depth, and refuses a mismatched major version.
@@ -10,9 +10,10 @@ defmodule LoopctlRunner.Contract do
 
   The validator covers exactly the keywords the contract uses — `type`, `required`,
   `properties`, `minimum`, `maximum`, `minLength`, `maxLength`, `pattern`, `enum`,
-  `items`, `maxItems`, `minProperties`. A keyword it does not know fails the validation
-  rather than being skipped, so a contract that grows a new constraint cannot be
-  silently under-checked.
+  `items`, `maxItems`, `minProperties`, and `format` for the two formats it uses, `uuid` and
+  `date-time`. A keyword or format it does not know fails the validation rather than being
+  skipped, so a contract that grows a new constraint cannot be silently under-checked: loopctl
+  casts ids as UUIDs, and a malformed one passing here would only surface as a refusal there.
   """
 
   @external_resource Path.expand("../../priv/runner_contract/v1.json", __DIR__)
@@ -93,6 +94,22 @@ defmodule LoopctlRunner.Contract do
 
   defp keyword("maxItems", max, value, path, _) when is_list(value),
     do: if(length(value) > max, do: ["#{path}: more than #{max} items"], else: [])
+
+  defp keyword("format", "uuid", value, path, _) when is_binary(value) do
+    if Regex.match?(~r/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i, value),
+      do: [],
+      else: ["#{path}: #{inspect(value)} is not a uuid"]
+  end
+
+  defp keyword("format", "date-time", value, path, _) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, _, _} -> []
+      {:error, _} -> ["#{path}: #{inspect(value)} is not an RFC 3339 date-time"]
+    end
+  end
+
+  defp keyword("format", format, _value, path, _) when format not in ["uuid", "date-time"],
+    do: ["#{path}: validator does not implement format #{format}"]
 
   defp keyword("minProperties", min, value, path, _) when is_map(value),
     do: if(map_size(value) < min, do: ["#{path}: fewer than #{min} properties"], else: [])

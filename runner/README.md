@@ -13,9 +13,9 @@ BEAM cluster. See `docs/agent-delivery-loop.md` section 2 for why.
 ## Status
 
 Build order steps **1a** and **1b** are implemented: hand-filed story runs (1a), and the daemon
-that keeps this machine joined to loopctl's runner pool (1b). Dispatch handling and trace upload
-follow loopctl#803, which emits `dispatch` and accepts `trace_event`; until then the daemon refuses
-dispatches.
+that keeps this machine joined to loopctl's runner pool (1b), on runner contract 1.1. The daemon
+accepts no dispatches until build order step 6: it reports `draining: true` and answers any
+`dispatch` with a `dispatch_reply` refusal, so loopctl records why rather than waiting on it.
 
 ### The daemon
 
@@ -56,8 +56,8 @@ stopped until `rel/install.sh` or `launchctl kickstart` starts it again. The log
 it, restart the service. (A token the server merely rejects is retried indefinitely, and a
 corrected file is picked up on the next reconnect without a restart.)
 
-Until dispatch handling lands (loopctl#803), the daemon reports `draining: true`, so the control
-plane never reserves capacity on a machine that cannot start a session.
+Until dispatch handling lands, the daemon reports `draining: true`, so the control plane never
+reserves capacity on a machine that cannot start a session.
 
 ### Troubleshooting the daemon
 
@@ -81,6 +81,7 @@ plane never reserves capacity on a machine that cannot start a session.
     is pending), and `accepts_dispatches`;
   - `last_disconnect`, `connect_attempts` and `next_reconnect_ms`;
   - `last_status_rtt_ms`, `last_status_acked_at` and `status_push_pending`;
+  - `dispatch_replies_pending` and `dispatch_reply_backlog` (rate-limited replies waiting);
   - `sample_error`, `last_refusal` and `token_failures`.
 - **The pool, as loopctl sees it:** `runner_pool`. It lists joined runners only, so a runner
   missing from it while `joined` is true is a disagreement worth reporting to loopctl.
@@ -96,6 +97,10 @@ What the log says in each failure:
 | revoked or rejected token | `upgrade refused with HTTP 403; reconnect attempt N in Xms`, retried with backoff |
 | misconfiguration | `loopctl refused runner:<id> (<reason>)`, then `stopping with exit status 78` (0 under launchd) |
 | a metric cannot be read | `health sample omitted: cannot read <metric>`, once, until `health sample readable again` |
+| a dispatch arrives | `dispatch <id> received: this runner accepts no dispatches yet`, then `dispatch_reply sent: refused (dispatches_disabled)` and `loopctl recorded the dispatch_reply`, all with `dispatch_id`, `story_id` and `claim_epoch` |
+| a dispatch that cannot be answered | `dispatch not answered: ...`, when it has no usable `dispatch_id` and `claim_epoch` or a refusal would fail the contract |
+| loopctl refuses that reply | `loopctl refused the dispatch_reply (<reason>)`; `rate_limited` waits in the backlog, the rest are not resent |
+| the channel drops with a reply outstanding | `resending N dispatch_reply(s) loopctl had not recorded when the channel closed` after the rejoin; `no longer needs the resent dispatch_reply (<reason>)` when the claim moved on meanwhile |
 | loopctl is ahead of this build | `loopctl sent "<event>", which this runner (contract X) does not handle`, once per event |
 
 A run's own record is its directory under `runs_dir`: `state.json`, `trace.ndjson`, `stdout.ndjson`

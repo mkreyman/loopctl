@@ -13,15 +13,29 @@ defmodule LoopctlRunner.Runs do
     end)
   end
 
-  @doc "When a run on this machine last succeeded, ISO 8601, or nil — the sample's `last_build_at`."
+  @doc """
+  When a run on this machine last succeeded, ISO 8601 in UTC, or nil — the sample's
+  `last_build_at`.
+
+  Each `finished_at` is parsed, compared as a time and re-rendered. A value that does not parse
+  (hand-edited, truncated, written without an offset) is skipped: the contract checks this
+  field as a date-time, and one bad file must not fail every join and stop the runner.
+  """
   @spec last_success_at(String.t()) :: String.t() | nil
   def last_success_at(runs_dir) do
     runs_dir
     |> RunState.all()
     |> Enum.flat_map(fn
-      {_dir, %{"status" => "succeeded", "finished_at" => at}} when is_binary(at) -> [at]
-      _ -> []
+      {_dir, %{"status" => "succeeded", "finished_at" => at}} when is_binary(at) ->
+        case DateTime.from_iso8601(at) do
+          {:ok, datetime, _offset} -> [datetime]
+          {:error, _} -> []
+        end
+
+      _ ->
+        []
     end)
-    |> Enum.max(fn -> nil end)
+    |> Enum.max(DateTime, fn -> nil end)
+    |> then(&(&1 && &1 |> DateTime.truncate(:second) |> DateTime.to_iso8601()))
   end
 end

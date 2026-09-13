@@ -51,7 +51,7 @@ defmodule LoopctlRunner.ControlTest do
     assert_receive {:test_loopctl, {:join, ^runner_id, join}}, 5_000
     assert Contract.validate("RunnerJoin", join) == :ok
     assert join["machine"] == "testbox"
-    assert join["contract_version"] == "1.0.0"
+    assert join["contract_version"] == "1.1.0"
     assert join["repos"] == ["mkreyman/home_care_billing"]
     assert %{"sampled_at" => _, "free_disk_mb" => _} = join["sample"]
 
@@ -145,6 +145,223 @@ defmodule LoopctlRunner.ControlTest do
     refute_receive {:test_loopctl, {:join, _, _}}, 500
     assert Process.alive?(pid)
     assert Control.info(pid).connect_attempts >= 1
+  end
+
+  describe "dispatch refusals" do
+    @dispatch %{
+      "dispatch_id" => "7d0c1f6e-3b1a-4f7e-9c2d-5a6b7c8d9e0f",
+      "story_id" => "1e2d3c4b-5a69-4788-9a0b-1c2d3e4f5a6b",
+      "kind" => "implement",
+      "repo" => "mkreyman/home_care_billing",
+      "base_branch" => "master",
+      "branch" => "loop/story-1",
+      "claim_epoch" => 3,
+      "wall_clock_seconds" => 3600,
+      "max_turns" => 200
+    }
+
+    defp joined_control(ctx) do
+      # A long interval, so any status seen below was sent for a reason under test.
+      slow = %{ctx.config | control: %{ctx.config.control | status_interval_s: 30}}
+      {pid, _ref} = start_control(slow)
+      :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+      {pid, "runner:" <> TestLoopctl.get(:runner_id)}
+    end
+
+    test "a valid dispatch is refused back to loopctl as dispatches_disabled", ctx do
+      {pid, topic} = joined_control(ctx)
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", @dispatch)
+
+      assert_receive {:test_loopctl, {:dispatch_reply, reply}}, 5_000
+      assert Contract.validate("RunnerDispatchReply", reply) == :ok
+
+      assert reply == %{
+               "dispatch_id" => @dispatch["dispatch_id"],
+               "claim_epoch" => 3,
+               "decision" => "refused",
+               "reason" => "dispatches_disabled"
+             }
+
+      assert Control.info(pid).joined
+    end
+
+    test "a rate-limited dispatch_reply is resent, and does not trigger a status", ctx do
+      TestLoopctl.put(:dispatch_reply_replies, [{:error, %{reason: "rate_limited"}}])
+      {_pid, topic} = joined_control(ctx)
+      flush_status()
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", @dispatch)
+
+      assert_receive {:test_loopctl, {:dispatch_reply, first}}, 5_000
+      assert_receive {:test_loopctl, {:dispatch_reply, ^first}}, 3_000
+      refute_receive {:test_loopctl, {:status, _}}, 1_500
+    end
+
+    test "a backlog of rate-limited replies is resent one per interval, not all at once", ctx do
+      TestLoopctl.put(:dispatch_reply_floor_ms, 200)
+      {_pid, topic} = joined_control(ctx)
+
+      ids =
+        for n <- 1..3 do
+          id = "7d0c1f6e-3b1a-4f7e-9c2d-5a6b7c8d9e0#{n}"
+          TestLoopctl.Endpoint.broadcast(topic, "dispatch", %{@dispatch | "dispatch_id" => id})
+          id
+        end
+
+      # One accepted at once, two refused; then one per 250ms interval, each past the 200ms
+      # floor. Retrying all together would have two collide on every interval.
+      Process.sleep(1_500)
+      replies = collect_dispatch_replies()
+      assert length(replies) == 5
+      assert replies |> Enum.map(& &1["dispatch_id"]) |> Enum.uniq() |> Enum.sort() == ids
+    end
+
+    test "a reply waiting out a rate limit when the channel drops is resent after the rejoin",
+         ctx do
+      TestLoopctl.put(:dispatch_reply_replies, [{:error, %{reason: "rate_limited"}}])
+      slow = %{ctx.config | control: %{ctx.config.control | status_interval_s: 30}}
+
+      log =
+        capture_log(fn ->
+          {pid, _ref} = start_control(slow, dispatch_reply_retry_ms: 300)
+          :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+          topic = "runner:" <> TestLoopctl.get(:runner_id)
+
+          TestLoopctl.Endpoint.broadcast(topic, "dispatch", @dispatch)
+          assert_receive {:test_loopctl, {:dispatch_reply, first}}, 5_000
+          # The refusal has reached the runner and the reply is waiting out the rate limit.
+          :ok = wait_until(fn -> Control.info(pid).dispatch_reply_backlog == 1 end, 3_000)
+
+          TestLoopctl.disconnect_runner()
+          :ok = wait_until(fn -> not Control.info(pid).joined end, 3_000)
+          :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+          assert_receive {:test_loopctl, {:dispatch_reply, ^first}}, 3_000
+          :ok = wait_until(fn -> Control.info(pid).dispatch_reply_backlog == 0 end, 3_000)
+        end)
+
+      # The backlog timer is cancelled with the channel: no push is even attempted while down.
+      refute log =~ "held until the channel rejoins"
+    end
+
+    test "a reply in flight when the channel drops is resent, and a settled answer is not a fault",
+         ctx do
+      TestLoopctl.put(:dispatch_reply_replies, [:none, {:error, %{reason: "stale_claim_epoch"}}])
+      Logger.configure(level: :info)
+      on_exit(fn -> Logger.configure(level: :warning) end)
+
+      log =
+        capture_log(fn ->
+          {pid, topic} = joined_control(ctx)
+          TestLoopctl.Endpoint.broadcast(topic, "dispatch", @dispatch)
+          assert_receive {:test_loopctl, {:dispatch_reply, first}}, 5_000
+          :ok = wait_until(fn -> Control.info(pid).dispatch_replies_pending == 1 end, 3_000)
+
+          TestLoopctl.disconnect_runner()
+          :ok = wait_until(fn -> not Control.info(pid).joined end, 3_000)
+          :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+
+          assert_receive {:test_loopctl, {:dispatch_reply, ^first}}, 3_000
+          :ok = wait_until(fn -> Control.info(pid).dispatch_replies_pending == 0 end, 3_000)
+        end)
+
+      assert log =~ "no longer needs the resent dispatch_reply (stale_claim_epoch)"
+      refute log =~ "refused the dispatch_reply"
+    end
+
+    test "a backlog timer message that outlived its timer is ignored, not re-armed", ctx do
+      TestLoopctl.put(:dispatch_reply_replies, [{:error, %{reason: "rate_limited"}}])
+      slow = %{ctx.config | control: %{ctx.config.control | status_interval_s: 30}}
+
+      log =
+        capture_log(fn ->
+          {pid, _ref} = start_control(slow, dispatch_reply_retry_ms: 5_000)
+          :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+          topic = "runner:" <> TestLoopctl.get(:runner_id)
+          TestLoopctl.Endpoint.broadcast(topic, "dispatch", @dispatch)
+          assert_receive {:test_loopctl, {:dispatch_reply, _}}, 5_000
+          :ok = wait_until(fn -> Control.info(pid).dispatch_reply_backlog == 1 end, 3_000)
+
+          TestLoopctl.disconnect_runner()
+          :ok = wait_until(fn -> not Control.info(pid).joined end, 3_000)
+          # What a timer that fired just before its cancel leaves in the mailbox.
+          send(pid, {:send_reply_backlog, make_ref()})
+          Process.sleep(200)
+          assert Control.info(pid).dispatch_reply_backlog == 1
+        end)
+
+      refute log =~ "held until the channel rejoins"
+    end
+
+    test "an error reply with no reason is a refusal, not a recorded reply", ctx do
+      TestLoopctl.put(:dispatch_reply_replies, [:bare_error])
+      Logger.configure(level: :info)
+      on_exit(fn -> Logger.configure(level: :warning) end)
+
+      log =
+        capture_log(fn ->
+          {pid, topic} = joined_control(ctx)
+          TestLoopctl.Endpoint.broadcast(topic, "dispatch", @dispatch)
+          assert_receive {:test_loopctl, {:dispatch_reply, _}}, 5_000
+          :ok = wait_until(fn -> Control.info(pid).dispatch_replies_pending == 0 end, 3_000)
+          Process.sleep(50)
+        end)
+
+      assert log =~ "loopctl refused the dispatch_reply without a reason: :error"
+      refute log =~ "recorded the dispatch_reply"
+    end
+
+    test "a dispatch_reply refused for a reason retrying cannot fix is logged, not resent", ctx do
+      TestLoopctl.put(:dispatch_reply_replies, [{:error, %{reason: "stale_claim_epoch"}}])
+      Logger.configure(level: :info)
+      on_exit(fn -> Logger.configure(level: :warning) end)
+
+      log =
+        capture_log([metadata: [:dispatch_id, :claim_epoch]], fn ->
+          {_pid, topic} = joined_control(ctx)
+          TestLoopctl.Endpoint.broadcast(topic, "dispatch", @dispatch)
+          assert_receive {:test_loopctl, {:dispatch_reply, _}}, 5_000
+          refute_receive {:test_loopctl, {:dispatch_reply, _}}, 1_000
+        end)
+
+      assert log =~
+               ~r/dispatch_id=#{@dispatch["dispatch_id"]} claim_epoch=3 .*refused the dispatch_reply \(stale_claim_epoch\)/
+    end
+
+    test "a malformed dispatch that still carries its id and epoch is refused as other", ctx do
+      {_pid, topic} = joined_control(ctx)
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", Map.delete(@dispatch, "repo"))
+
+      assert_receive {:test_loopctl, {:dispatch_reply, reply}}, 5_000
+      assert %{"decision" => "refused", "reason" => "other", "detail" => detail} = reply
+      assert detail =~ "missing repo"
+    end
+
+    test "a dispatch without a usable id or epoch gets no reply, and the log says so", ctx do
+      log =
+        capture_log(fn ->
+          {_pid, topic} = joined_control(ctx)
+          TestLoopctl.Endpoint.broadcast(topic, "dispatch", Map.delete(@dispatch, "claim_epoch"))
+          refute_receive {:test_loopctl, {:dispatch_reply, _}}, 1_000
+        end)
+
+      assert log =~ "dispatch not answered: it carries no usable dispatch_id and claim_epoch"
+      refute log =~ "refused"
+    end
+  end
+
+  defp collect_dispatch_replies(acc \\ []) do
+    receive do
+      {:test_loopctl, {:dispatch_reply, reply}} -> collect_dispatch_replies([reply | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
+  defp flush_status do
+    receive do
+      {:test_loopctl, {:status, _}} -> flush_status()
+    after
+      0 -> :ok
+    end
   end
 
   test "a dispatch push is refused without disturbing the connection", ctx do
@@ -417,7 +634,7 @@ defmodule LoopctlRunner.ControlTest do
 
       assert lines != []
       assert Enum.all?(lines, &(&1 =~ "runner_id=#{runner_id}"))
-      assert log =~ ~r/dispatch_id=d-1 story_id=s-1 claim_epoch=4 .*malformed dispatch ignored/
+      assert log =~ ~r/dispatch_id=d-1 story_id=s-1 claim_epoch=4 .*malformed dispatch received/
     end
 
     test "a refused upgrade logs its HTTP status, not the response headers", ctx do

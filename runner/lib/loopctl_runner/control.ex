@@ -14,11 +14,19 @@ defmodule LoopctlRunner.Control do
 
   ## Draining until dispatches are accepted
 
-  This runner has no dispatch accept path yet (loopctl#803). While `:accepts_dispatches` is
-  false — the default, and the only production setting until then — it reports
-  `draining: true` whatever `set_draining/2` was told, so the control plane never reserves
-  capacity here for a session that would not start. `dispatch` pushes are validated and
-  refused.
+  This runner has no dispatch accept path yet (design build order step 6). While
+  `:accepts_dispatches` is false — the default, and the only production setting until then — it
+  reports `draining: true` whatever `set_draining/2` was told, so the control plane never
+  reserves capacity here for a session that would not start.
+
+  A `dispatch` that does arrive is validated and refused back to loopctl with a
+  `dispatch_reply` (contract 1.1): `dispatches_disabled` for a valid one, `other` with the
+  validation errors for a malformed one that still carries its `dispatch_id` and `claim_epoch`.
+  Every reply is routed by the ref of the push it answers, so a rate-limited `dispatch_reply`
+  is never mistaken for a status. Rate-limited replies wait in a backlog sent one per the
+  contract's burst refill interval by a single timer. A reply loopctl had not recorded when the
+  channel closed is kept and resent after the rejoin: loopctl does not dispatch again, and it
+  answers an identical repeat `ok`.
 
   ## Refusals
 
@@ -169,7 +177,16 @@ defmodule LoopctlRunner.Control do
             sample_error: nil,
             # Health.measure/2, replaceable so an unreadable metric can be exercised.
             measure: Keyword.get(opts, :measure, &Health.measure/2),
-            unhandled_events: MapSet.new()
+            unhandled_events: MapSet.new(),
+            # dispatch_reply pushes awaiting their reply: ref => {payload, story_id, carried?},
+            # carried? being true once the reply has outlived a channel.
+            dispatch_replies: %{},
+            # Rate-limited dispatch_replies, oldest first, sent one per refill interval by a
+            # single timer, so a backlog never retries all at once.
+            reply_backlog: [],
+            reply_timer: nil,
+            dispatch_reply_retry_ms:
+              Keyword.get(opts, :dispatch_reply_retry_ms, dispatch_reply_retry_ms())
           )
 
         {:ok, socket, {:continue, :connect}}
@@ -215,6 +232,13 @@ defmodule LoopctlRunner.Control do
   def handle_join(topic, response, socket) do
     Logger.info("loopctl runner joined #{topic}#{outage(socket.assigns)}: #{inspect(response)}")
 
+    if socket.assigns.reply_backlog != [],
+      do:
+        Logger.info(
+          "resending #{length(socket.assigns.reply_backlog)} dispatch_reply(s) loopctl had not " <>
+            "recorded when the channel closed"
+        )
+
     {:ok,
      socket
      |> assign(
@@ -225,7 +249,8 @@ defmodule LoopctlRunner.Control do
        connect_attempts: 0,
        next_reconnect_ms: nil
      )
-     |> schedule_status()}
+     |> schedule_status()
+     |> schedule_reply_backlog()}
   end
 
   # How long the runner was out of the pool, so a rejoin line says what the outage cost.
@@ -292,8 +317,28 @@ defmodule LoopctlRunner.Control do
       joined: false,
       unjoined_since: socket.assigns.unjoined_since || now_ms(),
       last_disconnect: reason,
-      status_pushes: []
+      status_pushes: [],
+      dispatch_replies: %{},
+      reply_backlog: carry_dispatch_replies(socket.assigns),
+      reply_timer: cancel_reply_timer(socket.assigns.reply_timer)
     )
+  end
+
+  # A dispatch_reply loopctl had not recorded when the channel closed, in flight or waiting out
+  # a rate limit, is kept and resent after the rejoin (handle_join/3). loopctl does not dispatch
+  # again on a rejoin, so a dropped refusal would leave its ledger row waiting for as long as
+  # the claim holds; and an identical repeat is answered ok, so resending cannot do harm. The
+  # backlog timer is cancelled all the same: nothing is sent until the new channel is joined.
+  defp carry_dispatch_replies(%{dispatch_replies: in_flight, reply_backlog: backlog}) do
+    for {payload, story_id, _carried?} <- Map.values(in_flight) ++ backlog,
+        do: {payload, story_id, true}
+  end
+
+  defp cancel_reply_timer(nil), do: nil
+
+  defp cancel_reply_timer({timer, _token}) do
+    Process.cancel_timer(timer)
+    nil
   end
 
   # A refused upgrade carries only an HTTP status worth reading; its headers are noise.
@@ -327,6 +372,33 @@ defmodule LoopctlRunner.Control do
 
   def handle_info(:status, socket), do: {:noreply, assign(socket, status_timer: nil)}
 
+  # One backlogged dispatch_reply per refill interval. The timer is cancelled with the channel
+  # (mark_unjoined/2), but cancelling cannot recall a message already in the mailbox, so the
+  # message must carry the token of the CURRENT timer and find the channel joined; a stale one
+  # is dropped rather than re-arming a second timer.
+  def handle_info(
+        {:send_reply_backlog, token},
+        %{assigns: %{joined: true, reply_timer: {_timer, token}}} = socket
+      ) do
+    socket = assign(socket, reply_timer: nil)
+
+    case socket.assigns.reply_backlog do
+      [{payload, story_id, carried?} | rest] ->
+        socket =
+          socket
+          |> assign(reply_backlog: rest)
+          |> push_dispatch_reply(payload, story_id, carried?)
+          |> schedule_reply_backlog()
+
+        {:noreply, socket}
+
+      [] ->
+        {:noreply, socket}
+    end
+  end
+
+  def handle_info({:send_reply_backlog, _stale_token}, socket), do: {:noreply, socket}
+
   def handle_info(_message, socket), do: {:noreply, socket}
 
   @impl Slipstream
@@ -357,6 +429,8 @@ defmodule LoopctlRunner.Control do
     info =
       Map.merge(info, %{
         status_push_pending: a.status_pushes != [],
+        dispatch_replies_pending: map_size(a.dispatch_replies),
+        dispatch_reply_backlog: length(a.reply_backlog),
         # The value this runner reports, which is not the set_draining/2 flag while no dispatch
         # can be accepted. It is what the next status carries, not proof loopctl received it:
         # runner_pool can lag it while a push is pending, rate-limited or lost with the socket.
@@ -367,26 +441,116 @@ defmodule LoopctlRunner.Control do
     {:reply, info, socket}
   end
 
-  # A status that landed inside loopctl's 1s floor is sent again once the floor has passed,
-  # so a change such as draining is delayed, never dropped until the next tick.
+  # Every reply is routed by the ref of the push it answers, so a refusal is handled as a
+  # refusal of THAT event: a rate-limited dispatch_reply must not resend a status.
   @impl Slipstream
   def handle_reply(ref, reply, socket) do
-    handle_push_reply(reply, settle_status(socket, ref, reply))
+    cond do
+      Map.has_key?(socket.assigns.dispatch_replies, ref) ->
+        dispatch_reply_answered(ref, reply, socket)
+
+      List.keymember?(socket.assigns.status_pushes, ref, 0) ->
+        handle_status_reply(reply, settle_status(socket, ref, reply))
+
+      # A reply to a push from before the last rejoin: nothing is waiting on it any more.
+      true ->
+        {:ok, socket}
+    end
   end
 
-  defp handle_push_reply({:error, %{"reason" => "rate_limited"} = reply}, socket) do
+  # A status that landed inside loopctl's 1s floor is sent again once the floor has passed,
+  # so a change such as draining is delayed, never dropped until the next tick.
+  defp handle_status_reply({:error, %{"reason" => "rate_limited"} = reply}, socket) do
     retry_ms = Map.get(reply, "min_interval_ms", 1_000)
     Logger.info("loopctl rate-limited a status push; resending in #{retry_ms}ms")
     socket = cancel_status(socket)
     {:ok, assign(socket, status_timer: Process.send_after(self(), :status, retry_ms))}
   end
 
-  defp handle_push_reply({:error, %{"reason" => reason} = reply}, socket) do
-    Logger.warning("loopctl refused a push (#{reason}): #{inspect(reply)}")
+  defp handle_status_reply({:error, %{"reason" => reason} = reply}, socket) do
+    Logger.warning("loopctl refused a status push (#{reason}): #{inspect(reply)}")
     {:ok, socket}
   end
 
-  defp handle_push_reply(_reply, socket), do: {:ok, socket}
+  defp handle_status_reply(_reply, socket), do: {:ok, socket}
+
+  defp dispatch_reply_answered(ref, reply, socket) do
+    {{payload, story_id, carried?}, pending} = Map.pop(socket.assigns.dispatch_replies, ref)
+    socket = assign(socket, dispatch_replies: pending)
+
+    ids = [
+      dispatch_id: payload["dispatch_id"],
+      story_id: story_id,
+      claim_epoch: payload["claim_epoch"]
+    ]
+
+    case reply do
+      {:error, %{"reason" => "rate_limited"}} ->
+        backlog = socket.assigns.reply_backlog ++ [{payload, story_id, carried?}]
+
+        Logger.info(
+          "loopctl rate-limited a dispatch_reply; #{length(backlog)} in the backlog, " <>
+            "sent one every #{socket.assigns.dispatch_reply_retry_ms}ms",
+          ids
+        )
+
+        {:ok, socket |> assign(reply_backlog: backlog) |> schedule_reply_backlog()}
+
+      # A reply carried across a rejoin may find the question settled meanwhile: the claim moved
+      # on, or the first copy was recorded after all. That is the expected end of a resend.
+      {:error, %{"reason" => reason}}
+      when carried? and reason in ["stale_claim_epoch", "already_replied", "unknown_dispatch"] ->
+        Logger.info("loopctl no longer needs the resent dispatch_reply (#{reason})", ids)
+        {:ok, socket}
+
+      {:error, %{"reason" => reason} = refusal} ->
+        # unknown_dispatch, stale_claim_epoch, already_replied: resending cannot change them.
+        Logger.warning("loopctl refused the dispatch_reply (#{reason}): #{inspect(refusal)}", ids)
+        {:ok, socket}
+
+      ok when ok == :ok or (is_tuple(ok) and elem(ok, 0) == :ok) ->
+        Logger.info(
+          "loopctl recorded the dispatch_reply: #{payload["decision"]} (#{payload["reason"]})",
+          ids
+        )
+
+        {:ok, socket}
+
+      # A bare :error (an error reply with an empty body) or one without a reason: still a
+      # refusal, and not one resending is known to fix.
+      other ->
+        Logger.warning(
+          "loopctl refused the dispatch_reply without a reason: #{inspect(other)}",
+          ids
+        )
+
+        {:ok, socket}
+    end
+  end
+
+  # Arms the single backlog timer if there is a backlog and it is not already armed.
+  defp schedule_reply_backlog(%{assigns: %{reply_backlog: []}} = socket), do: socket
+
+  defp schedule_reply_backlog(%{assigns: %{reply_timer: timer}} = socket) when timer != nil,
+    do: socket
+
+  defp schedule_reply_backlog(socket) do
+    token = make_ref()
+
+    timer =
+      Process.send_after(
+        self(),
+        {:send_reply_backlog, token},
+        socket.assigns.dispatch_reply_retry_ms
+      )
+
+    assign(socket, reply_timer: {timer, token})
+  end
+
+  # The contract's burst refill: one token comes back every refill interval.
+  defp dispatch_reply_retry_ms do
+    get_in(Contract.connection(), ["limits", "dispatch_reply_burst", "refill_interval_ms"]) || 250
+  end
 
   # The round trip of a status push. A slow one is logged when its reply lands; one still
   # unanswered past the slow threshold is logged at each tick by warn_unanswered/1.
@@ -454,16 +618,23 @@ defmodule LoopctlRunner.Control do
   def handle_message(_topic, "dispatch", payload, socket) do
     Logger.metadata(dispatch_metadata(payload))
 
-    case Contract.validate("RunnerDispatch", payload) do
-      :ok ->
-        Logger.warning(
-          "dispatch #{payload["dispatch_id"]} refused: this runner accepts no dispatches yet " <>
-            "(story #{payload["story_id"]}, #{payload["kind"]}, claim_epoch #{payload["claim_epoch"]})"
-        )
+    socket =
+      case Contract.validate("RunnerDispatch", payload) do
+        :ok ->
+          Logger.warning(
+            "dispatch #{payload["dispatch_id"]} received: this runner accepts no dispatches yet " <>
+              "(story #{payload["story_id"]}, #{payload["kind"]}, claim_epoch #{payload["claim_epoch"]})"
+          )
 
-      {:error, errors} ->
-        Logger.warning("malformed dispatch ignored: #{inspect(errors)}")
-    end
+          # No accept path exists (build order step 6), so every dispatch is refused, and
+          # loopctl is told why rather than left waiting on a claim nobody will run.
+          refuse_dispatch(socket, payload, %{"reason" => "dispatches_disabled"})
+
+        {:error, errors} ->
+          Logger.warning("malformed dispatch received: #{inspect(errors)}")
+          detail = String.slice("invalid dispatch: " <> Enum.join(errors, "; "), 0, 500)
+          refuse_dispatch(socket, payload, %{"reason" => "other", "detail" => detail})
+      end
 
     # The identifiers belong to this dispatch's lines only.
     Logger.metadata(Enum.map(dispatch_metadata(payload), fn {key, _} -> {key, nil} end))
@@ -499,6 +670,59 @@ defmodule LoopctlRunner.Control do
   end
 
   defp dispatch_metadata(_payload), do: []
+
+  # A refusal can only be addressed to a dispatch whose id and epoch arrived intact; without
+  # them loopctl could not match the reply, and the malformed dispatch is logged only.
+  defp refuse_dispatch(socket, %{"dispatch_id" => id, "claim_epoch" => epoch} = dispatch, why)
+       when is_binary(id) and is_integer(epoch) and epoch >= 0 do
+    payload =
+      Map.merge(%{"dispatch_id" => id, "claim_epoch" => epoch, "decision" => "refused"}, why)
+
+    case Contract.validate("RunnerDispatchReply", payload) do
+      :ok ->
+        story_id = if is_binary(dispatch["story_id"]), do: dispatch["story_id"]
+        push_dispatch_reply(socket, payload, story_id)
+
+      {:error, errors} ->
+        Logger.warning(
+          "dispatch not answered: a refusal would fail the contract: #{inspect(errors)}"
+        )
+
+        socket
+    end
+  end
+
+  defp refuse_dispatch(socket, _dispatch, _why) do
+    Logger.warning("dispatch not answered: it carries no usable dispatch_id and claim_epoch")
+    socket
+  end
+
+  defp push_dispatch_reply(socket, payload, story_id, carried? \\ false) do
+    case push(socket, socket.assigns.topic, "dispatch_reply", payload) do
+      {:ok, ref} ->
+        Logger.info("dispatch_reply sent: #{payload["decision"]} (#{payload["reason"]})",
+          dispatch_id: payload["dispatch_id"],
+          story_id: story_id,
+          claim_epoch: payload["claim_epoch"]
+        )
+
+        assign(socket,
+          dispatch_replies:
+            Map.put(socket.assigns.dispatch_replies, ref, {payload, story_id, carried?})
+        )
+
+      # Not joined at this instant: kept, and sent once the channel is back.
+      {:error, reason} ->
+        Logger.warning("dispatch_reply held until the channel rejoins: #{inspect(reason)}",
+          dispatch_id: payload["dispatch_id"],
+          claim_epoch: payload["claim_epoch"]
+        )
+
+        assign(socket,
+          reply_backlog: socket.assigns.reply_backlog ++ [{payload, story_id, carried?}]
+        )
+    end
+  end
 
   defp fresh_join_payload(socket) do
     a = socket.assigns

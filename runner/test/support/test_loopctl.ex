@@ -23,7 +23,14 @@ defmodule LoopctlRunner.TestLoopctl do
       # :ok, {:delay, ms} for a slow link, :none for a push that is never answered, {:body, map}
       # for an ok reply carrying a body, or a list of those consumed one push at a time (the
       # last one then repeats).
-      status_reply: :ok
+      status_reply: :ok,
+      # Replies to dispatch_reply pushes, oldest first: :ok, {:error, reason_map}, or :none for
+      # a push left unanswered.
+      dispatch_reply_replies: [],
+      # When set, a dispatch_reply within this many ms of the last accepted one is refused
+      # rate_limited, like loopctl's burst bucket once it is empty.
+      dispatch_reply_floor_ms: nil,
+      last_dispatch_reply_ms: nil
     }
 
     case Agent.start(fn -> state end, name: __MODULE__) do
@@ -46,6 +53,16 @@ defmodule LoopctlRunner.TestLoopctl do
       %{status_reply: [reply]} = state -> {reply, state}
       %{status_reply: [reply | rest]} = state -> {reply, %{state | status_reply: rest}}
       %{status_reply: reply} = state -> {reply, state}
+    end)
+  end
+
+  def next_dispatch_reply_reply do
+    Agent.get_and_update(__MODULE__, fn
+      %{dispatch_reply_replies: [reply | rest]} = state ->
+        {reply, %{state | dispatch_reply_replies: rest}}
+
+      state ->
+        {:ok, state}
     end)
   end
 
@@ -109,7 +126,7 @@ defmodule LoopctlRunner.TestLoopctl do
       end
     end
 
-    defp scripted_reply(:ok, socket), do: {:ok, %{contract_version: "1.0.0"}, socket}
+    defp scripted_reply(:ok, socket), do: {:ok, %{contract_version: "1.1.0"}, socket}
 
     # What loopctl does on not_authorized: refuse, then close the socket.
     defp scripted_reply(:not_authorized_disconnect, _socket) do
@@ -143,8 +160,43 @@ defmodule LoopctlRunner.TestLoopctl do
       end
     end
 
+    def handle_in("dispatch_reply", payload, socket) do
+      TestLoopctl.notify({:dispatch_reply, payload})
+
+      case Contract.validate("RunnerDispatchReply", payload) do
+        :ok ->
+          case {floored?(), TestLoopctl.next_dispatch_reply_reply()} do
+            {true, _} ->
+              {:reply, {:error, %{reason: "rate_limited"}}, socket}
+
+            {false, :ok} ->
+              TestLoopctl.put(:last_dispatch_reply_ms, System.monotonic_time(:millisecond))
+              {:reply, :ok, socket}
+
+            {false, :none} ->
+              {:noreply, socket}
+
+            # An error reply with an empty body, which Slipstream hands over as a bare :error.
+            {false, :bare_error} ->
+              {:reply, :error, socket}
+
+            {false, {:error, reply}} ->
+              {:reply, {:error, reply}, socket}
+          end
+
+        {:error, details} ->
+          {:reply, {:error, %{reason: "invalid_payload", details: details}}, socket}
+      end
+    end
+
     def handle_in(_event, _payload, socket),
       do: {:reply, {:error, %{reason: "unknown_event"}}, socket}
+
+    defp floored? do
+      floor = TestLoopctl.get(:dispatch_reply_floor_ms)
+      last = TestLoopctl.get(:last_dispatch_reply_ms)
+      floor != nil and last != nil and System.monotonic_time(:millisecond) - last < floor
+    end
 
     defp accept_status(payload, socket) do
       TestLoopctl.notify({:status, payload})

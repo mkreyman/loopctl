@@ -6,7 +6,7 @@ defmodule LoopctlRunner.ContractTest do
   defp join(overrides \\ %{}) do
     Map.merge(
       %{
-        "contract_version" => "1.0.0",
+        "contract_version" => "1.1.0",
         "machine" => "minis",
         "cores" => 16,
         "memory_mb" => 28_000,
@@ -19,14 +19,50 @@ defmodule LoopctlRunner.ContractTest do
     )
   end
 
-  test "the vendored contract is v1.0.0 and names the socket and header the client uses" do
-    assert Contract.version() == "1.0.0"
+  test "the vendored contract is v1.1.0 and names the socket and header the client uses" do
+    assert Contract.version() == "1.1.0"
 
     assert %{
              "credential_header" => "x-loopctl-runner-token",
              "socket_path" => "/runner/socket/websocket",
              "topic" => "runner:{runner_id}"
            } = Contract.connection()
+  end
+
+  test "uuid and date-time formats are enforced, as loopctl casts them" do
+    reply = %{
+      "dispatch_id" => "7d0c1f6e-3b1a-4f7e-9c2d-5a6b7c8d9e0f",
+      "claim_epoch" => 0,
+      "decision" => "refused",
+      "reason" => "dispatches_disabled"
+    }
+
+    assert Contract.validate("RunnerDispatchReply", reply) == :ok
+
+    assert {:error, [msg]} =
+             Contract.validate("RunnerDispatchReply", %{reply | "dispatch_id" => "d-1"})
+
+    assert msg =~ "is not a uuid"
+
+    assert {:error, [msg]} =
+             Contract.validate("RunnerTraceCursor", %{"run_id" => "7d0c1f6e-3b1a-4f7e-9c2d"})
+
+    assert msg =~ "is not a uuid"
+
+    assert {:error, [msg]} =
+             Contract.validate("RunnerStatus", %{
+               "in_flight" => 0,
+               "draining" => true,
+               "sample" => %{
+                 "sampled_at" => "yesterday",
+                 "loadavg_1m" => 1.0,
+                 "free_ram_mb" => 1,
+                 "free_disk_mb" => 1,
+                 "last_build_at" => nil
+               }
+             })
+
+    assert msg =~ "is not an RFC 3339 date-time"
   end
 
   test "a complete join validates" do
@@ -54,8 +90,8 @@ defmodule LoopctlRunner.ContractTest do
 
     assert {:error, [msg]} =
              Contract.validate("RunnerDispatch", %{
-               "dispatch_id" => "d",
-               "story_id" => "s",
+               "dispatch_id" => "7d0c1f6e-3b1a-4f7e-9c2d-5a6b7c8d9e0f",
+               "story_id" => "1e2d3c4b-5a69-4788-9a0b-1c2d3e4f5a6b",
                "kind" => "deploy",
                "repo" => "a/b",
                "base_branch" => "master",
@@ -122,7 +158,7 @@ defmodule LoopctlRunner.ContractTest do
 
     nested = %{
       "sample" => %{
-        "sampled_at" => "x",
+        "sampled_at" => "2026-09-13T05:00:00Z",
         "loadavg_1m" => 0,
         "free_ram_mb" => 0,
         "free_disk_mb" => 0
@@ -130,5 +166,27 @@ defmodule LoopctlRunner.ContractTest do
     }
 
     assert Contract.validate("RunnerStatus", nested) == :ok
+
+    # The trace batch nests its event schema under items; one event reaches it.
+    run_id = "7d0c1f6e-3b1a-4f7e-9c2d-5a6b7c8d9e0f"
+
+    batch = %{
+      "run_id" => run_id,
+      "dispatch_id" => "1e2d3c4b-5a69-4788-9a0b-1c2d3e4f5a6b",
+      "claim_epoch" => 0,
+      "events" => [
+        %{
+          "run_id" => run_id,
+          "seq" => 0,
+          "event_id" => "0",
+          "parent" => nil,
+          "ts" => "2026-09-13T05:00:00Z",
+          "type" => "run.started",
+          "data" => %{}
+        }
+      ]
+    }
+
+    assert Contract.validate("RunnerTraceBatch", batch) == :ok
   end
 end
