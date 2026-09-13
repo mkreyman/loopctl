@@ -385,7 +385,8 @@ defmodule Loopctl.Delivery.Stages do
 
   `effect` is one of `StageMachine.effects/0`: `:runner_id` (a runner UUID),
   `:worktree_path` (1..4096 characters), `:branch` and `:release_id` (1..255),
-  `:pr_number` (positive integer), `:head_sha` and `:merge_sha` (40 or 64 lowercase hex).
+  `:pr_number` (positive integer), and `:head_sha`, `:merge_sha` and
+  `:merge_gate_allowed_sha` (40 or 64 lowercase hex).
 
   - `{:ok, row}` — recorded, or ALREADY recorded with this same value (a replay)
   - `:invalid_effect` — unknown effect or malformed value
@@ -832,7 +833,8 @@ defmodule Loopctl.Delivery.Stages do
        when is_integer(value) and value > 0 and value <= @max_pr_number,
        do: {:ok, value}
 
-  defp validate_effect(sha, value) when sha in [:head_sha, :merge_sha] and is_binary(value) do
+  defp validate_effect(sha, value)
+       when sha in [:head_sha, :merge_sha, :merge_gate_allowed_sha] and is_binary(value) do
     if Regex.match?(@sha, value), do: {:ok, value}, else: {:error, :invalid_effect}
   end
 

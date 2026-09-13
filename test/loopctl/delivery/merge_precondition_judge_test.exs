@@ -40,6 +40,7 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       assert verdict.head_sha == @head
       assert verdict.merge_base_sha == @base
       assert verdict.custody == :ok
+      assert verdict.gate_a_inputs == :caller_asserted
     end
 
     test "judges the same facts the same way twice" do
@@ -78,7 +79,7 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       assert :effect_proof_required in verdict.reasons
     end
 
-    test "an effect path with a PASSING proof allows" do
+    test "an effect path with a PASSING but CALLER-ASSERTED proof still refuses" do
       verdict =
         judge(
           files: ["priv/rates/2026.csv"],
@@ -91,8 +92,11 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
           }
         )
 
-      assert verdict.decision == :allow
+      # The proof is an assertion by the principal that drives the merge, so it is judged
+      # and recorded and it does NOT clear the gate. The server-side harness is what would.
+      assert verdict.decision == :refuse
       assert verdict.proof.verdict == :pass
+      assert {:effect_proof_caller_asserted, :pass} in verdict.reasons
     end
 
     test "an effect path with a FAILING proof refuses and routes to Gate A" do
@@ -330,22 +334,73 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
     end
   end
 
-  describe "the forge failing is never a pass" do
-    test "an unreachable forge escalates" do
+  describe "a TRANSIENT forge fault is not a verdict" do
+    # Escalating is expensive: `escalated` is human-only, so one blip would park a story
+    # until Mark acts. These decide nothing and transition nothing.
+    test "an unreachable forge is :unevaluated, not a refusal" do
       verdict = judge(pull_request: {:error, {:github_unreachable, :timeout}})
 
-      assert verdict.decision == :refuse
+      assert verdict.decision == :unevaluated
       assert {:pull_request_unavailable, {:github_unreachable, :timeout}} in verdict.reasons
     end
 
-    test "a rate-limited forge escalates" do
+    test "a rate-limited forge is :unevaluated" do
       verdict = judge(pull_request: {:error, {:github_api_error, 403}})
 
-      assert verdict.decision == :refuse
+      assert verdict.decision == :unevaluated
       assert {:pull_request_unavailable, {:github_api_error, 403}} in verdict.reasons
     end
 
-    test "a head file tree that cannot be read escalates" do
+    test "a 5xx is :unevaluated" do
+      verdict = judge(pull_request: {:error, {:github_api_error, 502}})
+      assert verdict.decision == :unevaluated
+    end
+
+    test "a merge-base file tree that 500s is :unevaluated" do
+      verdict =
+        judge(
+          files: ["lib/widgets/thing.ex"],
+          diffstat: %{files: 1, changed_lines: 1},
+          base_files: {:error, {:github_api_error, 500}}
+        )
+
+      assert verdict.decision == :unevaluated
+      assert {:base_files_unavailable, {:github_api_error, 500}} in verdict.reasons
+    end
+
+    test "an unevaluated verdict still reports everything else that is wrong" do
+      verdict =
+        judge(
+          pull_request: {:error, {:github_unreachable, :timeout}},
+          custody: {:error, :not_verified},
+          trio_outputs: nil
+        )
+
+      assert verdict.decision == :unevaluated
+      assert {:custody, :not_verified} in verdict.reasons
+      assert {:gate_a, {:trio_size, :not_a_list}} in verdict.reasons
+    end
+
+    test "transient?/1 is narrow: a 404, a 401 and an unreadable body are NOT transient" do
+      assert MergePrecondition.transient?({:github_unreachable, :closed})
+      assert MergePrecondition.transient?({:github_api_error, 429})
+      assert MergePrecondition.transient?({:github_api_error, 503})
+      refute MergePrecondition.transient?({:github_api_error, 404})
+      refute MergePrecondition.transient?({:github_api_error, 401})
+      refute MergePrecondition.transient?({:unreadable_pull_request, :invalid_field_types})
+      refute MergePrecondition.transient?({:tree_truncated, "abc"})
+    end
+  end
+
+  describe "a NON-transient forge failure is a refusal" do
+    test "a 404 escalates — the repository or the token is wrong, and a human fixes that" do
+      verdict = judge(pull_request: {:error, {:github_api_error, 404}})
+
+      assert verdict.decision == :refuse
+      assert {:pull_request_unavailable, {:github_api_error, 404}} in verdict.reasons
+    end
+
+    test "a head file tree GitHub truncated escalates" do
       verdict =
         judge(
           files: ["lib/widgets/thing.ex"],
@@ -357,16 +412,18 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       assert {:head_files_unavailable, {:tree_truncated, @head}} in verdict.reasons
     end
 
-    test "a merge-base file tree that cannot be read escalates" do
+    test "BOTH unreadable refs are reported, not just the first" do
       verdict =
         judge(
           files: ["lib/widgets/thing.ex"],
           diffstat: %{files: 1, changed_lines: 1},
-          base_files: {:error, {:github_api_error, 500}}
+          head_files: {:error, {:tree_truncated, @head}},
+          base_files: {:error, {:tree_truncated, @base}}
         )
 
       assert verdict.decision == :refuse
-      assert {:base_files_unavailable, {:github_api_error, 500}} in verdict.reasons
+      assert {:head_files_unavailable, {:tree_truncated, @head}} in verdict.reasons
+      assert {:base_files_unavailable, {:tree_truncated, @base}} in verdict.reasons
     end
 
     test "a diff that did not parse escalates, and no file list survives it" do
@@ -433,6 +490,49 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
     end
   end
 
+  describe "the judged head must be the head CI ran on" do
+    test "a head that does not match the recorded one goes back to implementing" do
+      # A push after CI and verification. New commits are ordinary, so this is NOT an
+      # escalation — but it does not merge either, because no CI run and no verifier saw it.
+      recorded = String.duplicate("e", 40)
+
+      verdict =
+        judge(
+          files: ["lib/widgets/thing.ex"],
+          diffstat: %{files: 1, changed_lines: 1},
+          recorded_head_sha: recorded
+        )
+
+      assert verdict.decision == :head_moved
+      assert {:head_moved, @head, recorded} in verdict.reasons
+    end
+
+    test "a stage row with NO recorded head does not merge" do
+      verdict =
+        judge(
+          files: ["lib/widgets/thing.ex"],
+          diffstat: %{files: 1, changed_lines: 1},
+          recorded_head_sha: nil
+        )
+
+      assert verdict.decision == :head_moved
+      assert :head_sha_not_recorded in verdict.reasons
+    end
+
+    test "a moved head still reports the custody and Gate A problems it found" do
+      verdict =
+        judge(
+          files: ["lib/widgets/thing.ex"],
+          diffstat: %{files: 1, changed_lines: 1},
+          recorded_head_sha: String.duplicate("e", 40),
+          custody: {:error, :not_verified}
+        )
+
+      assert verdict.decision == :head_moved
+      assert {:custody, :not_verified} in verdict.reasons
+    end
+  end
+
   describe "the custody precondition" do
     test "an unverified story is refused" do
       verdict =
@@ -473,7 +573,7 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
   end
 
   describe "the pull request's own state" do
-    test "a pull request GitHub already merged is :already_merged, not a refusal" do
+    test "an already-merged head the gate ALLOWED is :already_merged" do
       merge_sha = String.duplicate("c", 40)
 
       verdict =
@@ -481,6 +581,7 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
           merged?: true,
           state: "closed",
           merge_sha: merge_sha,
+          recorded_allow_sha: @head,
           diffstat: %{files: 1, changed_lines: 1}
         )
 
@@ -489,19 +590,67 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       assert verdict.reasons == []
     end
 
-    test "an already-merged pull request is reported even when the gates would refuse" do
-      # The effect is already out. Reporting it as an escalation would send a completed
-      # merge to a human and leave the caller unable to record the sha it produced.
+    test "an already-merged head with NO recorded allow is a refusal naming the sha" do
+      # A merge performed around the gate, or after it refused. The last gate before an
+      # outward effect must never report clean for an effect it did not authorise.
+      merge_sha = String.duplicate("c", 40)
+
+      verdict =
+        judge(
+          merged?: true,
+          state: "closed",
+          merge_sha: merge_sha,
+          recorded_allow_sha: nil,
+          diffstat: %{files: 1, changed_lines: 1}
+        )
+
+      assert verdict.decision == :refuse
+      assert {:ungated_merge, merge_sha, :no_recorded_allow} in verdict.reasons
+      # The sha is still reported, so the fact is not lost.
+      assert verdict.merge_sha == merge_sha
+    end
+
+    test "an already-merged head with an allow for a DIFFERENT head is a refusal" do
+      merge_sha = String.duplicate("c", 40)
+      other = String.duplicate("d", 40)
+
+      verdict =
+        judge(
+          merged?: true,
+          state: "closed",
+          merge_sha: merge_sha,
+          recorded_allow_sha: other,
+          diffstat: %{files: 1, changed_lines: 1}
+        )
+
+      assert verdict.decision == :refuse
+      assert {:ungated_merge, merge_sha, {:allow_for_other_head, other}} in verdict.reasons
+    end
+
+    test "an already-merged pull request with NO merge sha is a refusal, not a strand" do
+      # `advance/4` refuses a `merged` transition that names nothing, so reporting
+      # already_merged here would leave the caller unable to record anything at all.
+      verdict =
+        judge(merged?: true, state: "closed", merge_sha: nil, recorded_allow_sha: @head)
+
+      assert verdict.decision == :refuse
+      assert :merged_without_sha in verdict.reasons
+    end
+
+    test "an authorised already-merged pull request still reports a custody problem" do
       verdict =
         judge(
           merged?: true,
           state: "closed",
           merge_sha: String.duplicate("c", 40),
-          diffstat: %{files: 99, changed_lines: 99_999},
+          recorded_allow_sha: @head,
           custody: {:error, :not_verified}
         )
 
+      # The effect is already out and the allow covers it, so this is not a refusal — but
+      # the custody fact is on the verdict either way.
       assert verdict.decision == :already_merged
+      assert verdict.custody == :not_verified
     end
 
     test "a pull request closed WITHOUT merging escalates" do
@@ -528,15 +677,30 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
     test "the forge failing does not hide Gate A or custody" do
       verdict =
         judge(
-          pull_request: {:error, :timeout},
+          pull_request: {:error, {:github_api_error, 404}},
           trio_outputs: [trio("story"), trio("story"), trio("escalate")],
           custody: {:error, :not_verified}
         )
 
       assert verdict.decision == :refuse
-      assert {:pull_request_unavailable, :timeout} in verdict.reasons
+      assert {:pull_request_unavailable, {:github_api_error, 404}} in verdict.reasons
       assert {:custody, :not_verified} in verdict.reasons
       assert Enum.any?(verdict.reasons, &match?({:gate_a, _}, &1))
+    end
+
+    test "an unresolved repository AND an unrecorded pull request are BOTH reported" do
+      verdict =
+        judge(
+          repo: {:error, {:no_intake_source, "p-1"}},
+          pr_number: {:error, {:not_recorded, nil}},
+          pull_request: {:error, :not_attempted}
+        )
+
+      assert verdict.decision == :refuse
+      assert {:repository_unresolved, {:no_intake_source, "p-1"}} in verdict.reasons
+      assert {:no_pull_request_recorded, {:not_recorded, nil}} in verdict.reasons
+      # `:not_attempted` is the CONSEQUENCE of the two above, never a third fault.
+      refute Enum.any?(verdict.reasons, &match?({_kind, :not_attempted}, &1))
     end
 
     test "a human path does not hide the hard bound or custody" do
@@ -566,6 +730,8 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       base_files: Keyword.get(opts, :base_files, {:ok, @repo_files}),
       triggers: Keyword.get_lazy(opts, :triggers, &DeliveryGates.load_triggers/0),
       custody: Keyword.get(opts, :custody, :ok),
+      recorded_head_sha: Keyword.get(opts, :recorded_head_sha, @head),
+      recorded_allow_sha: Keyword.get(opts, :recorded_allow_sha),
       trio_outputs: Keyword.get(opts, :trio_outputs, List.duplicate(trio("story"), 3)),
       effect_proof: Keyword.get(opts, :effect_proof)
     }

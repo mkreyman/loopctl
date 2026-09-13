@@ -60,7 +60,17 @@ defmodule Loopctl.Delivery.StageMachineTest do
   end
 
   test "a refused merge clears the identity it never realised" do
-    assert StageMachine.clears(:merged, :implementing, :merge_refused) == [:head_sha, :merge_sha]
+    # `merge_gate_allowed_sha` goes with the head (#803 review round 1): the merge gate's
+    # allow is granted FOR a head, so an allow left behind would authorise the next one.
+    assert StageMachine.clears(:merged, :implementing, :merge_refused) ==
+             [:head_sha, :merge_sha, :merge_gate_allowed_sha]
+  end
+
+  test "going back to implementing clears the merge gate's allow with the head" do
+    for edge <- [:ci_red, :base_moved, :review_findings] do
+      assert :merge_gate_allowed_sha in StageMachine.clears(:ci, :implementing, edge) or
+               :merge_gate_allowed_sha in StageMachine.clears(:reviewing, :implementing, edge)
+    end
   end
 
   test "every stage is reachable from detected" do

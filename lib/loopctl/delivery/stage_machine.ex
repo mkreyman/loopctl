@@ -113,7 +113,16 @@ defmodule Loopctl.Delivery.StageMachine do
     # instead: a resuming runner ASKS GitHub whether that head is already merged and adopts
     # the answer, rather than merging again and recording a second sha.
     merge_sha: [:merged],
-    release_id: [:deployed]
+    release_id: [:deployed],
+    # Not an effect the loop performs — the record that one was AUTHORISED (#803, review
+    # round 1). `Loopctl.Delivery.MergePrecondition` writes the head sha it allowed, at
+    # `ci`, so an already-merged pull request whose head carries no allow is escalated as
+    # an ungated merge rather than reported clean. It is here rather than in a table of its
+    # own because it is bound to the head like every other identity, and because
+    # `record_effect/5`'s idempotence is exactly the semantics an allow needs: the same
+    # head twice is the same allow, and a DIFFERENT head is `:effect_conflict` rather than
+    # a silent re-grant.
+    merge_gate_allowed_sha: [:ci]
   }
 
   # Identities that stop describing the story when an edge is taken, cleared by that edge.
@@ -123,7 +132,9 @@ defmodule Loopctl.Delivery.StageMachine do
   # same); the branch and the PR
   # live on GitHub and the next runner reuses them. Going back to implementing makes a new
   # head. A human re-queue starts over from nothing.
-  @released_clears [:runner_id, :worktree_path, :head_sha]
+  # `merge_gate_allowed_sha` goes wherever `head_sha` goes: an allow is granted FOR a head,
+  # so leaving it behind would let a later, unjudged head inherit the authorisation.
+  @released_clears [:runner_id, :worktree_path, :head_sha, :merge_gate_allowed_sha]
 
   @type stage ::
           :detected
@@ -164,6 +175,7 @@ defmodule Loopctl.Delivery.StageMachine do
           | :pr_number
           | :merge_sha
           | :release_id
+          | :merge_gate_allowed_sha
 
   # `merge_sha` is written ONLY as part of the transition into `merged`, both ways round:
   # it is REQUIRED there (an entry asserting a merge must name it) and it is refused to
@@ -241,8 +253,12 @@ defmodule Loopctl.Delivery.StageMachine do
 
   def clears(:escalated, :queued, :human_resolution), do: Map.keys(@effect_stages)
   # A refused merge never happened, so the identity recorded for it goes with the head.
-  def clears(:merged, :implementing, :merge_refused), do: [:head_sha, :merge_sha]
-  def clears(_from, :implementing, edge) when edge != :forward, do: [:head_sha]
+  def clears(:merged, :implementing, :merge_refused),
+    do: [:head_sha, :merge_sha, :merge_gate_allowed_sha]
+
+  def clears(_from, :implementing, edge) when edge != :forward,
+    do: [:head_sha, :merge_gate_allowed_sha]
+
   def clears(_from, _to, _edge), do: []
 
   @doc """

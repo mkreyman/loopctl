@@ -2,9 +2,24 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
   @moduledoc """
   One merge-precondition evaluation (issue #803, design §5 "Both gates run twice" and §9).
 
-  - `decision` — `:allow`, `:refuse` or `:already_merged`
-  - `reasons` — every reason a `:refuse` is a refusal, all of them rather than the first,
-    so one escalation names the whole list. Empty on the other two decisions
+  - `decision` — one of five:
+    - `:allow` — and only from `enforce/3`, which records the allow against the head it
+      judged. Nothing else licenses a merge
+    - `:refuse` — a gate verdict. The story is escalated
+    - `:already_merged` — the forge had already merged THIS head, and a recorded allow says
+      the gate authorised it. Adopt `merge_sha`
+    - `:head_moved` — the pull request's head is not the one CI ran on and the story was
+      verified at, so the change goes back to `implementing`. New commits are ordinary; this
+      is not an escalation
+    - `:unevaluated` — a TRANSIENT forge fault. Nothing was decided and nothing transitions;
+      the caller retries. Never an escalation, because one network blip must not park a
+      story until a human acts
+  - `reasons` — every reason the decision is what it is, all of them rather than the first,
+    so one escalation names the whole list. Empty on `:allow` and on an authorised
+    `:already_merged`
+  - `gate_a_inputs` — `:caller_asserted` while the triage trio's outputs arrive in the
+    request. Recorded on every verdict and named in the escalation reason, because Gate A's
+    verdict is only as trustworthy as inputs the same principal supplied
   - `repo`, `pr_number`, `head_sha`, `merge_base_sha` — what was judged, server-resolved.
     A verdict is only ever about the diff at THIS head
   - `merge_sha` — set only on `:already_merged`: the sha the forge reports for a pull
@@ -39,10 +54,11 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
     :gate_a,
     :gate_b,
     :proof,
-    custody: nil
+    custody: nil,
+    gate_a_inputs: :caller_asserted
   ]
 
-  @type decision :: :allow | :refuse | :already_merged
+  @type decision :: :allow | :refuse | :already_merged | :head_moved | :unevaluated
 
   @type t :: %__MODULE__{
           decision: decision(),
@@ -56,6 +72,7 @@ defmodule Loopctl.Delivery.MergePrecondition.Verdict do
           gate_a: GateA.Result.t() | nil,
           gate_b: GateB.Result.t() | nil,
           proof: GateB.ProofResult.t() | nil,
-          custody: :ok | atom() | nil
+          custody: :ok | atom() | nil,
+          gate_a_inputs: :caller_asserted
         }
 end

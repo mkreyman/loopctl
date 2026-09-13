@@ -19,9 +19,26 @@ All notable changes to loopctl are documented here.
   of merging twice.
 
   **It fails closed.** A missing, empty or unparseable `DELIVERY_GATES_CONFIG`, an unknown
-  repository, a project with no GitHub intake source, an unreachable or rate-limited GitHub,
-  a truncated file list, a diff that does not parse, and a stale trigger at either the pull
-  request's head or its merge base all REFUSE. There is no failure that merges.
+  repository, a project with no GitHub intake source, a 404 from GitHub, a truncated file
+  list, a diff that does not parse, and a stale trigger at either the pull request's head or
+  its merge base all REFUSE. There is no failure that merges.
+
+  **A TRANSIENT forge fault answers `503 unevaluated` and transitions nothing** — transport,
+  a 5xx, a 429, a rate-limit 403. `escalated` is human-only, so escalating on one network
+  blip would park a story until a human acted; the caller retries instead. A 404 or a 401 is
+  configuration, not a blip, and still escalates.
+
+  **Merges the gate did not authorise are escalated, not ratified.** An `allow` is RECORDED
+  against the head it judged, and an already-merged pull request is only adopted when a
+  recorded allow names that same head; one with no allow, or an allow for a different head,
+  escalates with the sha named in the reason. A pull request whose head is not the one CI
+  ran on comes back `head_moved` and returns to `implementing` rather than merging.
+
+  **Migration, no manual step:** `story_stages` gains `merge_gate_allowed_sha`, the head the
+  merge gate allowed. It is cleared with `head_sha` by every edge that clears it. Existing
+  rows get NULL, so an already-merged pull request in flight at deploy time escalates as
+  ungated rather than being adopted — deliberate, and it clears as soon as the loop runs the
+  gate again.
 
   **`GITHUB_TOKEN` now gates merges as well as verification.** Unset, the calls are
   anonymous and work for a public repository until GitHub's per-IP hourly limit bites —

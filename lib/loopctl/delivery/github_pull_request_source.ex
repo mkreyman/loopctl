@@ -125,8 +125,12 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   defp strings?(values), do: Enum.all?(values, &is_binary/1)
   defp counts?(values), do: Enum.all?(values, &(is_integer(&1) and &1 >= 0))
 
+  # BOTH refs go through `ref/1`. `head_sha` is remote data like every other field on the
+  # response, and it is spliced into a URL path — an unvalidated one could change which
+  # resource is addressed.
   defp merge_base(repo, base_ref, head_sha) do
     with {:ok, base_ref} <- ref(base_ref),
+         {:ok, head_sha} <- ref(head_sha),
          {:ok, body} <- get(repo, "/compare/#{base_ref}...#{head_sha}") do
       case body do
         %{"merge_base_commit" => %{"sha" => sha}} when is_binary(sha) -> {:ok, sha}
@@ -211,6 +215,10 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
     maybe_add_plug(
       headers: headers(),
       retry: false,
+      # A renamed or transferred repository REDIRECTS, and Req follows by default — so the
+      # gate would read a repository the trigger list is not keyed to and judge the change
+      # against someone else's paths. `Loopctl.Webhooks.ReqDelivery` pins the same way.
+      redirect: false,
       receive_timeout: @receive_timeout_ms,
       connect_options: [timeout: @connect_timeout_ms]
     )

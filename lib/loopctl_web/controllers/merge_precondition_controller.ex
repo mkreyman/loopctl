@@ -25,12 +25,31 @@ defmodule LoopctlWeb.MergePreconditionController do
 
   ## What the caller may and may not supply
 
-  Nothing that decides the outcome in its own favour. The repository is resolved from the
-  story's intake source, the pull request number from the stage row's recorded `pr_number`,
-  the diff and the diffstat from GitHub, the trigger list from operator configuration, and
-  the custody facts from the database. What the caller supplies is `claim_epoch` — which
-  can only get the call REFUSED, never accepted, since it fences the escalation — and the
-  triage trio's outputs, which are Gate A's input and where any malformation escalates.
+  Almost nothing that decides the outcome in its own favour. The repository is resolved from
+  the story's intake source, the pull request number and the head CI ran on from the stage
+  row, the diff and the diffstat from GitHub, the trigger list from operator configuration,
+  and the custody facts from the database. `claim_epoch` can only get the call refused,
+  never accepted, since it fences the write.
+
+  **The two exceptions are named on every verdict, because they are assertions by the same
+  principal that drives the merge.**
+
+  - `trio_outputs` is Gate A's only input and there is nowhere else to read it from yet, so
+    a fabricated trio clears Gate A. Every verdict carries
+    `gate_a_inputs: "caller_asserted"` and every escalation reason begins with it. What
+    closes it: triage persisting its verdict against the story, after which this parameter
+    goes away.
+  - `effect_proof` is recorded and judged but can no longer produce an ALLOW — a
+    `prove_effect` outcome escalates whatever the proof says, because a fabricated proof
+    would otherwise wave through exactly the changes the gate exists for. What closes it:
+    the design's Gate B harness regenerating the fixture output server-side.
+
+  ## Status codes
+
+  `200` for every VERDICT, including a refusal — a refusal is an answer, not a request
+  error. `503` for `unevaluated`, a transient forge fault where nothing was decided and
+  nothing transitioned: the caller retries, and an HTTP status that cannot be mistaken for
+  an answer is the point.
   """
 
   use LoopctlWeb, :controller
@@ -61,10 +80,15 @@ defmodule LoopctlWeb.MergePreconditionController do
         properties: %{
           decision: %OpenApiSpex.Schema{
             type: :string,
-            enum: ["allow", "refuse", "already_merged"],
+            enum: ["allow", "refuse", "already_merged", "head_moved", "unevaluated"],
             description:
-              "`allow` licenses the merge. `refuse` has already escalated the story. " <>
-                "`already_merged` reports a merge GitHub had already performed."
+              "`allow` licenses the merge, and the allow has been RECORDED against the " <>
+                "head it judged. `refuse` has already escalated the story. " <>
+                "`already_merged` reports a merge GitHub had already performed AND a " <>
+                "recorded allow authorised — one nobody authorised is a `refuse` naming " <>
+                "the sha. `head_moved` sends the story back to `implementing` because the " <>
+                "pull request's head is not the one CI ran on. `unevaluated` (HTTP 503) is " <>
+                "a transient forge fault: nothing was decided, nothing transitioned, retry."
           },
           reasons: %OpenApiSpex.Schema{
             type: :array,
@@ -158,6 +182,9 @@ defmodule LoopctlWeb.MergePreconditionController do
        }},
     responses: %{
       200 => {"Verdict", "application/json", @verdict_schema},
+      503 =>
+        {"Transient forge fault — nothing was decided and nothing transitioned; retry",
+         "application/json", @verdict_schema},
       403 =>
         {"Insufficient role (exact orchestrator or user)", "application/json",
          Schemas.ErrorResponse},
@@ -178,9 +205,15 @@ defmodule LoopctlWeb.MergePreconditionController do
          {:ok, trio_outputs} <- trio_outputs(params),
          {:ok, verdict} <-
            enforce(tenant_id, story_id, api_key, claim_epoch, trio_outputs, params) do
-      json(conn, %{data: render_verdict(verdict)})
+      conn
+      |> put_status(status_for(verdict))
+      |> json(%{data: render_verdict(verdict)})
     end
   end
+
+  # A transient forge fault is not an answer, and must not read as one.
+  defp status_for(%Verdict{decision: :unevaluated}), do: :service_unavailable
+  defp status_for(%Verdict{}), do: :ok
 
   defp enforce(tenant_id, story_id, api_key, claim_epoch, trio_outputs, params) do
     opts = [
@@ -263,6 +296,7 @@ defmodule LoopctlWeb.MergePreconditionController do
       diffstat: verdict.diffstat,
       hard_bound: MergePrecondition.hard_bound(),
       custody: verdict.custody,
+      gate_a_inputs: verdict.gate_a_inputs,
       gate_a: gate_a(verdict.gate_a),
       gate_b: gate_b(verdict.gate_b),
       proof: proof(verdict.proof)

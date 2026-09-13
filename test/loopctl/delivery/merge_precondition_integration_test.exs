@@ -100,11 +100,13 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert {:custody, :not_verified} in reasons
     end
 
-    test "an unreachable forge escalates rather than passing", ctx do
-      Mox.stub(MockPullRequestSource, :pull_request, fn _repo, _n -> {:error, :timeout} end)
+    test "a forge failure that is NOT transient escalates rather than passing", ctx do
+      Mox.stub(MockPullRequestSource, :pull_request, fn _repo, _n ->
+        {:error, {:github_api_error, 404}}
+      end)
 
       assert {:ok, %Verdict{decision: :refuse, reasons: reasons}} = evaluate(ctx)
-      assert {:pull_request_unavailable, :timeout} in reasons
+      assert {:pull_request_unavailable, {:github_api_error, 404}} in reasons
     end
 
     test "a story that is not in the tenant is :not_found", ctx do
@@ -136,10 +138,101 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert row.attempts["merge_gate"] == 1
     end
 
-    test "an allow writes nothing — the caller performs the merge", ctx do
+    test "an allow does not transition, and RECORDS itself against the head it judged", ctx do
       stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 1})
 
       assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :ci
+      # The allow is a recorded fact or it is not an allow: without this an already-merged
+      # pull request could not be told from one merged around the gate.
+      assert row.merge_gate_allowed_sha == @head
+    end
+
+    test "an allow is idempotent — the same head twice is the same allow", ctx do
+      stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 1})
+
+      assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
+      assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
+      assert Stages.get(ctx.tenant_id, ctx.story_id).merge_gate_allowed_sha == @head
+    end
+
+    test "an ALLOW that cannot be recorded becomes a refusal", ctx do
+      # A stale epoch cannot write, and an allow nobody recorded is an allow nobody can
+      # later account for — so it must not stand.
+      stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 1})
+
+      assert {:ok, %Verdict{decision: :refuse, reasons: reasons}} =
+               MergePrecondition.enforce(
+                 ctx.tenant_id,
+                 ctx.story_id,
+                 Keyword.put(opts(), :claim_epoch, 99)
+               )
+
+      assert {:allow_not_recorded, :stale_claim_epoch} in reasons
+      assert is_nil(Stages.get(ctx.tenant_id, ctx.story_id).merge_gate_allowed_sha)
+    end
+
+    test "an already-merged head with NO recorded allow escalates as an ungated merge", ctx do
+      merge_sha = String.duplicate("c", 40)
+      stub_merged(merge_sha)
+
+      assert {:ok, %Verdict{decision: :refuse, reasons: reasons}} = enforce(ctx)
+      assert {:ungated_merge, merge_sha, :no_recorded_allow} in reasons
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :escalated
+      assert row.escalation_reason =~ "ungated_merge"
+      # The sha the gate never authorised is named in the escalation, not lost.
+      assert row.escalation_reason =~ merge_sha
+    end
+
+    test "an already-merged head the gate ALLOWED is adopted, not escalated", ctx do
+      stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 1})
+      assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
+
+      merge_sha = String.duplicate("c", 40)
+      stub_merged(merge_sha)
+
+      assert {:ok, %Verdict{decision: :already_merged, merge_sha: ^merge_sha, reasons: []}} =
+               enforce(ctx)
+
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :ci
+    end
+
+    test "a head that moved goes back to implementing, and takes the allow with it", ctx do
+      stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 1})
+      assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
+
+      moved = String.duplicate("e", 40)
+
+      stub_source(
+        files: ["lib/widgets/thing.ex"],
+        diffstat: %{files: 1, changed_lines: 1},
+        head: moved
+      )
+
+      assert {:ok, %Verdict{decision: :head_moved, reasons: reasons}} = enforce(ctx)
+      assert {:head_moved, moved, @head} in reasons
+
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :implementing
+      assert row.attempts["base_moved"] == 1
+      # Both cleared: an allow that outlived its head would authorise an unjudged one.
+      assert is_nil(row.head_sha)
+      assert is_nil(row.merge_gate_allowed_sha)
+    end
+
+    test "a TRANSIENT forge fault transitions nothing", ctx do
+      Mox.stub(MockPullRequestSource, :pull_request, fn _repo, _n ->
+        {:error, {:github_unreachable, :timeout}}
+      end)
+
+      assert {:ok, %Verdict{decision: :unevaluated, reasons: reasons}} = enforce(ctx)
+      assert {:pull_request_unavailable, {:github_unreachable, :timeout}} in reasons
+
+      # One blip must not park a story on a human: `escalated` is human-only.
       assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :ci
     end
 
@@ -166,7 +259,8 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
 
       row = Stages.get(ctx.tenant_id, ctx.story_id)
       assert row.stage == :escalated
-      assert String.length(row.escalation_reason) == 4_000
+      # Bounded in CODEPOINTS with a margin under the 4000 the DB CHECK counts.
+      assert row.escalation_reason |> String.to_charlist() |> length() == 3_900
       assert String.ends_with?(row.escalation_reason, "…")
     end
 
@@ -180,7 +274,7 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
                  Keyword.put(opts(), :claim_epoch, 99)
                )
 
-      assert {:escalation_failed, :stale_claim_epoch} in reasons
+      assert {:transition_failed, :escalated, :merge_gate, :stale_claim_epoch} in reasons
       assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :ci
     end
   end
@@ -211,16 +305,35 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
   end
 
   defp stub_source(opts) do
+    head = Keyword.get(opts, :head, @head)
+
     Mox.stub(MockPullRequestSource, :pull_request, fn @repo, _number ->
       {:ok,
        %{
-         state: "open",
+         state: Keyword.get(opts, :state, "open"),
          merged?: false,
          merge_sha: nil,
-         head_sha: @head,
+         head_sha: head,
          merge_base_sha: @base,
          diffstat: Keyword.fetch!(opts, :diffstat),
          diff: {:ok, %{files: Keyword.get(opts, :files, []), renames: []}}
+       }}
+    end)
+
+    Mox.stub(MockPullRequestSource, :repo_files, fn @repo, _ref -> {:ok, @repo_files} end)
+  end
+
+  defp stub_merged(merge_sha) do
+    Mox.stub(MockPullRequestSource, :pull_request, fn @repo, _number ->
+      {:ok,
+       %{
+         state: "closed",
+         merged?: true,
+         merge_sha: merge_sha,
+         head_sha: @head,
+         merge_base_sha: @head,
+         diffstat: %{files: 1, changed_lines: 1},
+         diff: {:ok, %{files: [], renames: []}}
        }}
     end)
 

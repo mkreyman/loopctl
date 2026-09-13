@@ -123,6 +123,7 @@ defmodule LoopctlWeb.MergePreconditionControllerTest do
       assert data["head_sha"] == @head
       assert data["merge_base_sha"] == @base
       assert data["custody"] == "ok"
+      assert data["gate_a_inputs"] == "caller_asserted"
       assert data["hard_bound"] == %{"max_files" => 12, "max_changed_lines" => 1000}
       assert data["gate_a"]["decision"] == "proceed"
       assert data["gate_b"]["outcome"] == "clear"
@@ -153,6 +154,30 @@ defmodule LoopctlWeb.MergePreconditionControllerTest do
       {key, _} = orchestrator_key(ctx)
 
       assert %{status: 200} = post_precondition(ctx, key)
+    end
+
+    test "a TRANSIENT forge fault is 503 and transitions nothing", ctx do
+      # 503 rather than 200: nothing was decided, and a status that cannot be mistaken for
+      # an answer is the point.
+      Mox.stub(MockPullRequestSource, :pull_request, fn _repo, _n ->
+        {:error, {:github_api_error, 503}}
+      end)
+
+      {key, _} = orchestrator_key(ctx)
+
+      assert %{"data" => data} = ctx |> post_precondition(key) |> json_response(503)
+      assert data["decision"] == "unevaluated"
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :ci
+    end
+
+    test "an allow is recorded against the head, and the endpoint is what records it", ctx do
+      stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 3})
+      {key, _} = orchestrator_key(ctx)
+
+      assert %{"data" => %{"decision" => "allow"}} =
+               ctx |> post_precondition(key) |> json_response(200)
+
+      assert Stages.get(ctx.tenant_id, ctx.story_id).merge_gate_allowed_sha == @head
     end
   end
 

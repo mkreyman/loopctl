@@ -111,6 +111,45 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
     test "a non-positive pull request number never reaches the network" do
       assert {:error, {:invalid_pr_number, 0}} = Source.pull_request(@repo, 0)
     end
+
+    test "a head sha the forge reports is VALIDATED before it is spliced into a URL" do
+      # The head is remote data like every other field, and it goes into a URL PATH.
+      stub(fn conn ->
+        case conn.request_path do
+          "/repos/acme/widgets/pulls/7" ->
+            json(conn, %{
+              "state" => "open",
+              "merged" => false,
+              "merge_commit_sha" => nil,
+              "head" => %{"sha" => "abc?ref=../../other"},
+              "base" => %{"ref" => "master"},
+              "changed_files" => 1,
+              "additions" => 1,
+              "deletions" => 0
+            })
+
+          other ->
+            flunk("an unvalidated head must not reach the network: #{other}")
+        end
+      end)
+
+      assert {:error, {:invalid_ref, "abc?ref=../../other"}} = Source.pull_request(@repo, 7)
+    end
+
+    test "a REDIRECT is not followed — a renamed repository is not the configured one" do
+      # Req follows redirects by default, so a transferred repository would be read under
+      # its new name while the trigger list stays keyed to the configured one.
+      stub(fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header(
+          "location",
+          "https://api.github.com/repos/other/repo/pulls/7"
+        )
+        |> Plug.Conn.resp(301, "")
+      end)
+
+      assert {:error, {:github_api_error, 301}} = Source.pull_request(@repo, 7)
+    end
   end
 
   describe "pull_request/2 — an already-merged pull request" do

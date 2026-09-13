@@ -25,10 +25,12 @@ defmodule Loopctl.Delivery.MergePrecondition do
   1. **Gate A** (`Loopctl.DeliveryGates.gate_a/1`) over the triage trio's outputs —
      `:proceed`, on a unanimous `story` verdict. A `reject` verdict is not something to
      merge, and anything malformed escalates by construction.
-  2. **Gate B** (`Loopctl.DeliveryGates.gate_b/3`) at `:merge` — `:clear`, or
-     `:prove_effect` cleared by an effect proof this call carried
-     (`Loopctl.DeliveryGates.judge_proof/4`; a proof that FAILS routes to Gate A, and a
-     `:prove_effect` with NO proof is a refusal, never a pass).
+  2. **Gate B** (`Loopctl.DeliveryGates.gate_b/3`) at `:merge` — `:clear`. A
+     `:prove_effect` outcome REFUSES today whatever proof the call carried: the proof is a
+     caller assertion by the same principal that drives the merge, so accepting it would
+     wave through exactly the changes the gate exists for. It is judged
+     (`Loopctl.DeliveryGates.judge_proof/4`) and recorded either way. The design's Gate B
+     harness — regenerating fixture output server-side — is what turns a pass into an allow.
   3. **The design's hard bound** — 12 files, 1,000 changed lines — applied on TOP of the
      configured limits, so a configuration that raises `max_files` cannot raise this. It is
      applied to the FORGE's own diffstat, never to the length of a file list that may have
@@ -37,6 +39,18 @@ defmodule Loopctl.Delivery.MergePrecondition do
      dispatch whose lineage is separate from the implementer's. That comparison is
      `Loopctl.Progress.merge_custody_status/1`, which is the L4 gate `verify` already runs;
      there is no second lineage comparison here.
+  5. **The head has not moved** — the pull request's head must be the `head_sha` the stage
+     row recorded, which is the head CI ran on and the story was verified at. A push after
+     either is ordinary work rather than an escalation, so it goes back to `implementing`
+     on `:base_moved`; it does not merge, because no CI run and no verifier saw it.
+
+  ## Gate A's inputs are caller-asserted, and every verdict says so
+
+  The triage trio's outputs arrive in the request because triage does not persist them yet,
+  so a fabricated trio clears Gate A. `gate_a_inputs: :caller_asserted` is on every verdict
+  and opens every escalation reason. Triage persisting its verdict against the story is
+  what closes it; nothing else here can, and pretending otherwise would be worse than
+  saying it.
 
   ## Fail closed, everywhere
 
@@ -79,17 +93,47 @@ defmodule Loopctl.Delivery.MergePrecondition do
   escalation — and that write is the stage machine's compare-and-set, so a repeat finds the
   row already `escalated` and never escalates twice.
 
-  A pull request the forge reports as ALREADY MERGED is `:already_merged`, not a refusal
-  and not an allow: the outward effect has happened, so there is nothing left to gate. A
-  caller that crashed between merging and recording the merge adopts `merge_sha` and
-  advances, instead of being told its own completed merge is an escalation.
+  A pull request the forge reports as ALREADY MERGED asks a different question — not
+  whether to merge, but whether the gate ever AUTHORISED this merge. The only thing that
+  can answer it is a RECORDED allow, so `enforce/3` writes `merge_gate_allowed_sha` on the
+  stage row when it allows, keyed to the head it judged, and the already-merged branch
+  compares it with the merged head:
+
+  - the recorded allow names this head — `:already_merged`, adopt `merge_sha`. A caller that
+    crashed between merging and recording the merge is told to finish, not escalated
+  - no recorded allow, or one for a DIFFERENT head — `:refuse` with `{:ungated_merge, sha,
+    why}`. The sha is still on the verdict and named in the escalation reason so the fact
+    is not lost, but the last gate before an outward effect never reports clean for an
+    effect it did not license
+  - merged with no sha at all — `:refuse`. Reporting `already_merged` there would strand the
+    caller: `advance/4` refuses a `merged` transition that names nothing
+
+  The allow is cleared with `head_sha` by every edge that clears it
+  (`Loopctl.Delivery.StageMachine.clears/3`), so a later, unjudged head can never inherit it.
+
+  ## A transient forge fault is not a verdict
+
+  Escalating is expensive: `escalated` is human-only, so one 5s timeout or one rate-limit
+  403 would park a story until Mark acts. Those come back `:unevaluated` — nothing decided,
+  nothing transitioned, the caller retries. `transient?/1` is the whole classification, and
+  it is deliberately narrow: a 404, a 401, a body that does not parse and a truncated list
+  are configuration or a contract change, and a human IS the right answer to each.
 
   ## The one write, and no second write path
 
-  A refusal takes `{:ci, :escalated, :merge_gate}` through `Loopctl.Delivery.Stages`, the
-  only writer of `story_stages`. An allow writes nothing at all: the CALLER performs the
-  merge and then advances `{:ci, :merged}` carrying the sha the forge returned, because the
-  merge commit does not exist until the merge happens.
+  Every write goes through `Loopctl.Delivery.Stages`, the only writer of `story_stages`:
+
+  - `:refuse` — `{:ci, :escalated, :merge_gate}`
+  - `:head_moved` — `{:ci, :implementing, :base_moved}`, which also CLEARS the head and the
+    recorded allow
+  - `:allow` — `record_effect(:merge_gate_allowed_sha, head)`. A write that does not land
+    turns the allow into a refusal, because an allow nobody recorded is an allow nobody can
+    later account for
+  - `:already_merged` and `:unevaluated` — nothing
+
+  The merge itself is still the CALLER's: it merges and then advances `{:ci, :merged}`
+  carrying the sha the forge returned, because the merge commit does not exist until the
+  merge happens.
   """
 
   require Logger
@@ -112,8 +156,16 @@ defmodule Loopctl.Delivery.MergePrecondition do
   @hard_max_files 12
   @hard_max_changed_lines 1_000
 
-  # The `story_stages_text_bounds` CHECK on `escalation_reason`.
-  @max_reason_chars 4_000
+  # The `story_stages_text_bounds` CHECK on `escalation_reason` is
+  # `char_length(...) BETWEEN 1 AND 4000`, and Postgres `char_length` counts CODEPOINTS —
+  # as does `Loopctl.Delivery.Stages`' own `bounded_text/2`. So the reason is bounded in
+  # codepoints, NOT graphemes: an NFD path or an emoji is several codepoints per grapheme,
+  # and a grapheme bound would let an over-long reason reach the CHECK, fail the write and
+  # leave the story sitting at `ci` with nothing recorded — the one outcome a fail-closed
+  # gate cannot have. The margin is deliberate: the truncation is the LAST thing that may
+  # cost an escalation its write.
+  # 4000 is the CHECK; 3900 is what this writes, and the 100-codepoint margin is the point.
+  @reason_budget 3_900
 
   @type fact(value) :: {:ok, value} | {:error, term()}
 
@@ -125,11 +177,19 @@ defmodule Loopctl.Delivery.MergePrecondition do
           required(:base_files) => fact([String.t()]),
           required(:triggers) => term(),
           required(:custody) => :ok | {:error, atom()},
+          required(:recorded_head_sha) => String.t() | nil,
+          required(:recorded_allow_sha) => String.t() | nil,
           optional(:trio_outputs) => term(),
           optional(:effect_proof) => map() | nil
         }
 
   @type error :: :not_found | :no_stage | :wrong_stage
+
+  # The forge faults that mean "we could not tell", as opposed to a gate verdict: transport,
+  # a 5xx, a 429, and the 403 GitHub answers a rate limit with. Every one of them clears on
+  # its own, so the caller retries and the story STAYS at `ci`. Escalating on one would park
+  # a story on a network blip until a human acts, and `escalated` is human-only.
+  @transient_statuses [403, 408, 425, 429]
 
   @doc "The hard bound the design fixes, whatever the configuration says."
   @spec hard_bound() :: %{max_files: pos_integer(), max_changed_lines: pos_integer()}
@@ -155,15 +215,25 @@ defmodule Loopctl.Delivery.MergePrecondition do
       decision: :refuse,
       reasons: [],
       gate_a: gate_a,
-      custody: custody_code(custody)
+      gate_a_inputs: :caller_asserted,
+      custody: custody_code(custody),
+      repo: value(facts, :repo),
+      pr_number: value(facts, :pr_number)
     }
 
-    case inputs(facts) do
-      {:ok, repo, pr_number, pr} ->
-        decide(%{base | repo: repo, pr_number: pr_number}, facts, pr, carried)
+    # A transient forge fault is decided FIRST and decides everything: nothing was
+    # evaluated, so nothing transitions. The reasons still carry whatever else is known —
+    # a caller fixing custody should not have to wait for the forge to come back to hear
+    # about it — but the DECISION is that there is no verdict yet.
+    case {unevaluated_reasons(facts), input_reasons(facts)} do
+      {[_ | _] = transient, other} ->
+        %{base | decision: :unevaluated, reasons: Enum.uniq(transient ++ other ++ carried)}
 
-      {:refuse, reason} ->
-        refuse(base, [reason | carried])
+      {[], [_ | _] = broken} ->
+        refuse(base, broken ++ carried)
+
+      {[], []} ->
+        decide(base, facts, value(facts, :pull_request), carried)
     end
   end
 
@@ -214,37 +284,86 @@ defmodule Loopctl.Delivery.MergePrecondition do
   @spec enforce(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) :: {:ok, Verdict.t()} | {:error, error()}
   def enforce(tenant_id, story_id, opts) do
     with {:ok, verdict} <- evaluate(tenant_id, story_id, opts) do
-      {:ok, escalate(tenant_id, story_id, verdict, opts)}
+      {:ok, act(tenant_id, story_id, verdict, opts)}
     end
   end
 
   # -- the judgement (pure) --------------------------------------------------------------
 
-  defp inputs(facts) do
-    with {:ok, repo} <- fact(facts, :repo, :repository_unresolved),
-         {:ok, pr_number} <- fact(facts, :pr_number, :no_pull_request_recorded),
-         {:ok, pr} <- fact(facts, :pull_request, :pull_request_unavailable) do
-      {:ok, repo, pr_number, pr}
-    end
+  @input_facts [
+    {:repo, :repository_unresolved},
+    {:pr_number, :no_pull_request_recorded},
+    {:pull_request, :pull_request_unavailable}
+  ]
+
+  @forge_facts [
+    {:pull_request, :pull_request_unavailable},
+    {:head_files, :head_files_unavailable},
+    {:base_files, :base_files_unavailable}
+  ]
+
+  # EVERY broken input, not the first. A refusal escalates, and after it the story is out
+  # of `ci` and the gate cannot be re-run, so one reason where two are wrong sends a human
+  # to fix half a problem. `:not_attempted` is dropped: it is the CONSEQUENCE of a missing
+  # input listed alongside it, never a second fault.
+  defp input_reasons(facts) do
+    for {key, kind} <- @input_facts,
+        reason = error_reason(facts, key),
+        reason != :not_attempted,
+        do: {kind, reason}
   end
 
-  defp fact(facts, key, kind) do
+  defp unevaluated_reasons(facts) do
+    for {key, kind} <- @forge_facts,
+        reason = error_reason(facts, key),
+        transient?(reason),
+        do: {kind, reason}
+  end
+
+  defp error_reason(facts, key) do
     case Map.get(facts, key) do
-      {:ok, value} -> {:ok, value}
-      {:error, reason} -> {:refuse, {kind, reason}}
-      other -> {:refuse, {kind, {:missing_fact, other}}}
+      {:ok, _value} -> nil
+      {:error, reason} -> reason
+      other -> {:missing_fact, shape(other)}
     end
   end
 
-  defp decide(verdict, _facts, %{merged?: true} = pr, _carried) do
-    %{
+  @doc """
+  True for a forge failure that means "we could not tell" rather than a gate verdict.
+
+  Public because it is the whole difference between a story that waits for a retry and one
+  parked on a human: transport, a 5xx, a 429, and the 403 GitHub answers a rate limit with.
+  A 404, a 401, a body that does not parse and a truncated list are NOT transient — they
+  are configuration or a contract change, and a human is the right answer to each.
+  """
+  @spec transient?(term()) :: boolean()
+  def transient?({:github_unreachable, _reason}), do: true
+  def transient?({:github_api_error, status}) when status >= 500, do: true
+  def transient?({:github_api_error, status}), do: status in @transient_statuses
+  def transient?(_reason), do: false
+
+  defp value(facts, key) do
+    case Map.get(facts, key) do
+      {:ok, value} -> value
+      _other -> nil
+    end
+  end
+
+  # An ALREADY-MERGED pull request. The outward effect has happened, so the question is no
+  # longer whether to merge but whether the gate ever AUTHORISED this merge — and the only
+  # thing that can answer it is a recorded allow keyed to the head that was merged.
+  defp decide(verdict, facts, %{merged?: true} = pr, carried) do
+    verdict = %{
       verdict
-      | decision: :already_merged,
-        reasons: [],
-        head_sha: pr.head_sha,
+      | head_sha: pr.head_sha,
         merge_sha: pr.merge_sha,
-        diffstat: pr.diffstat
+        diffstat: Map.get(pr, :diffstat)
     }
+
+    case ungated_reasons(pr, Map.get(facts, :recorded_allow_sha)) do
+      [] -> %{verdict | decision: :already_merged, reasons: []}
+      reasons -> refuse(verdict, reasons ++ carried)
+    end
   end
 
   defp decide(verdict, facts, pr, carried) do
@@ -255,6 +374,13 @@ defmodule Loopctl.Delivery.MergePrecondition do
         diffstat: Map.get(pr, :diffstat)
     }
 
+    case head_moved_reasons(pr, Map.get(facts, :recorded_head_sha)) do
+      [] -> gated(verdict, facts, pr, carried)
+      moved -> %{verdict | decision: :head_moved, reasons: Enum.uniq(moved ++ carried)}
+    end
+  end
+
+  defp gated(verdict, facts, pr, carried) do
     own = hard_bound_reasons(Map.get(pr, :diffstat)) ++ open_reasons(pr) ++ carried
 
     case gate_b(facts, pr) do
@@ -267,10 +393,39 @@ defmodule Loopctl.Delivery.MergePrecondition do
           reasons -> refuse(verdict, reasons)
         end
 
-      {:refuse, reason} ->
-        refuse(verdict, [reason | own])
+      {:refuse, reasons} ->
+        refuse(verdict, reasons ++ own)
     end
   end
+
+  # A merge nobody authorised. The sha is still reported on the verdict and named in the
+  # reason, so the fact is not lost — but the decision is a REFUSAL, because the last gate
+  # before an outward effect must never report clean for an effect it did not license.
+  defp ungated_reasons(%{merge_sha: nil}, _allowed),
+    do: [:merged_without_sha]
+
+  defp ungated_reasons(%{merge_sha: merge_sha, head_sha: head}, allowed) do
+    cond do
+      is_nil(allowed) -> [{:ungated_merge, merge_sha, :no_recorded_allow}]
+      allowed == head -> []
+      true -> [{:ungated_merge, merge_sha, {:allow_for_other_head, allowed}}]
+    end
+  end
+
+  defp ungated_reasons(pr, _allowed), do: [{:unreadable_pull_request, shape(pr)}]
+
+  # The head the gate is about to judge must be the head CI ran on and the story was
+  # verified at. A push after either is ordinary work, not an escalation, so it goes back
+  # to `implementing` — but it does NOT merge, because no CI run and no verifier saw it.
+  defp head_moved_reasons(%{head_sha: head}, recorded) do
+    cond do
+      is_nil(recorded) -> [:head_sha_not_recorded]
+      recorded == head -> []
+      true -> [{:head_moved, head, recorded}]
+    end
+  end
+
+  defp head_moved_reasons(_pr, _recorded), do: [:head_sha_not_recorded]
 
   defp refuse(verdict, reasons), do: %{verdict | decision: :refuse, reasons: Enum.uniq(reasons)}
 
@@ -293,8 +448,16 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   defp gate_b_reasons(%GateB.Result{outcome: :prove_effect}, nil), do: [:effect_proof_required]
 
+  # A PASSING proof does NOT clear the gate today, and that is deliberate. The proof is a
+  # caller assertion supplied by the same principal that drives the merge, so accepting it
+  # would let a fabricated one turn an effect path into an allow — the change most in need
+  # of a gate would be the easiest to wave through. It is recorded and it escalates.
+  # What closes this: the design's own Gate B harness (build order step 2) — deploy to
+  # staging, regenerate 837P output from the fixed fixture set server-side, and judge THAT.
+  # Then the proof is loopctl's measurement rather than the caller's claim, and this clause
+  # becomes `[]`.
   defp gate_b_reasons(%GateB.Result{outcome: :prove_effect}, %GateB.ProofResult{verdict: :pass}),
-    do: []
+    do: [{:effect_proof_caller_asserted, :pass}]
 
   defp gate_b_reasons(%GateB.Result{outcome: :prove_effect}, %GateB.ProofResult{
          failures: failures
@@ -351,21 +514,29 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   # -- Gate B, at both refs (pure) -------------------------------------------------------
 
+  @ref_facts [
+    {:head_files, :head_files_unavailable},
+    {:base_files, :base_files_unavailable}
+  ]
+
+  # BOTH file lists, and both failures if both are broken: the stale-trigger guard is only
+  # meaningful when it has seen both refs, so a caller told about one unreadable ref would
+  # fix it and be told about the other on a story it can no longer re-run the gate for.
   defp gate_b(facts, pr) do
-    with {:ok, head_files} <- fact(facts, :head_files, :head_files_unavailable),
-         {:ok, base_files} <- fact(facts, :base_files, :base_files_unavailable) do
-      triggers = Map.get(facts, :triggers)
-      repo = repo_of(facts)
+    case for({key, kind} <- @ref_facts, r = error_reason(facts, key), do: {kind, r}) do
+      [] ->
+        triggers = Map.get(facts, :triggers)
+        repo = value(facts, :repo)
 
-      at_head = evaluate_gate_b(repo, pr, head_files, triggers)
-      at_base = evaluate_gate_b(repo, pr, base_files, triggers)
+        at_head = evaluate_gate_b(repo, pr, value(facts, :head_files), triggers)
+        at_base = evaluate_gate_b(repo, pr, value(facts, :base_files), triggers)
 
-      {:ok, merge_results(at_head, at_base)}
+        {:ok, merge_results(at_head, at_base)}
+
+      reasons ->
+        {:refuse, reasons}
     end
   end
-
-  defp repo_of(%{repo: {:ok, repo}}), do: repo
-  defp repo_of(_facts), do: nil
 
   defp evaluate_gate_b(repo, pr, repo_files, triggers) do
     input =
@@ -412,6 +583,10 @@ defmodule Loopctl.Delivery.MergePrecondition do
       base_files: repo_files(repo, pull_request, :merge_base_sha),
       triggers: DeliveryGates.load_triggers(),
       custody: Progress.merge_custody_status(story),
+      # The head CI ran on and the story was verified at, and the head a previous allow was
+      # granted for. Both are read from the stage row, never from the caller.
+      recorded_head_sha: stage.head_sha,
+      recorded_allow_sha: stage.merge_gate_allowed_sha,
       trio_outputs: Keyword.get(opts, :trio_outputs),
       effect_proof: Keyword.get(opts, :effect_proof)
     }
@@ -473,27 +648,63 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   # -- the one write ---------------------------------------------------------------------
 
-  defp escalate(_tenant_id, _story_id, %Verdict{decision: decision} = verdict, _opts)
-       when decision != :refuse,
+  # `:unevaluated` and `:already_merged` transition NOTHING. `:unevaluated` because there is
+  # no verdict to act on and a network blip must not park a story on a human; an authorised
+  # `:already_merged` because the caller's next act is recording the merge it adopted.
+  defp act(_tenant_id, _story_id, %Verdict{decision: decision} = verdict, _opts)
+       when decision in [:unevaluated, :already_merged],
        do: verdict
 
-  defp escalate(tenant_id, story_id, %Verdict{} = verdict, opts) do
-    advance_opts =
-      opts
-      |> Keyword.take([:claim_epoch, :actor_label, :actor_role, :actor_lineage])
-      |> Keyword.put(:reason, reason_text(verdict))
+  defp act(tenant_id, story_id, %Verdict{decision: :allow} = verdict, opts) do
+    record_allow(tenant_id, story_id, verdict, opts)
+  end
 
-    case Stages.advance(tenant_id, story_id, escalation_transition(), advance_opts) do
+  defp act(tenant_id, story_id, %Verdict{decision: :head_moved} = verdict, opts) do
+    transition(tenant_id, story_id, verdict, {:ci, :implementing, :base_moved}, opts)
+  end
+
+  defp act(tenant_id, story_id, %Verdict{decision: :refuse} = verdict, opts) do
+    transition(tenant_id, story_id, verdict, escalation_transition(), opts)
+  end
+
+  # An allow is a RECORDED fact or it is not an allow. Without this the gate's authorisation
+  # lives only in the response, and an already-merged pull request cannot be told from one
+  # merged around the gate — so a write that does not land turns the allow into a refusal
+  # rather than a merge nobody can later account for.
+  defp record_allow(tenant_id, story_id, %Verdict{head_sha: head} = verdict, opts) do
+    write_opts = Keyword.take(opts, [:claim_epoch, :actor_label])
+
+    case Stages.record_effect(tenant_id, story_id, :merge_gate_allowed_sha, head, write_opts) do
       {:ok, _row} ->
         verdict
 
       {:error, reason} ->
         Logger.warning(
-          "merge_gate escalation not written story_id=#{story_id} tenant_id=#{tenant_id} " <>
+          "merge_gate allow not recorded story_id=#{story_id} tenant_id=#{tenant_id} " <>
+            "head=#{inspect(head)} reason=#{inspect(reason)}"
+        )
+
+        refuse(verdict, [{:allow_not_recorded, reason}])
+    end
+  end
+
+  defp transition(tenant_id, story_id, %Verdict{} = verdict, {_from, to, edge} = target, opts) do
+    advance_opts =
+      opts
+      |> Keyword.take([:claim_epoch, :actor_label, :actor_role, :actor_lineage])
+      |> Keyword.put(:reason, reason_text(verdict))
+
+    case Stages.advance(tenant_id, story_id, target, advance_opts) do
+      {:ok, _row} ->
+        verdict
+
+      {:error, reason} ->
+        Logger.warning(
+          "merge_gate #{to}/#{edge} not written story_id=#{story_id} tenant_id=#{tenant_id} " <>
             "reason=#{inspect(reason)} verdict_reasons=#{inspect(verdict.reasons)}"
         )
 
-        %{verdict | reasons: verdict.reasons ++ [{:escalation_failed, reason}]}
+        %{verdict | reasons: verdict.reasons ++ [{:transition_failed, to, edge, reason}]}
     end
   end
 
@@ -501,11 +712,22 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # still WRITE its escalation: a reason too long to store would roll the transition back
   # and leave the story sitting at `ci` with nothing recorded, which is the one outcome a
   # fail-closed gate cannot have.
-  defp reason_text(%Verdict{reasons: reasons}) do
-    text = "merge_gate: " <> Enum.map_join(reasons, "; ", &inspect/1)
+  defp reason_text(%Verdict{reasons: reasons, gate_a_inputs: gate_a_inputs}) do
+    bound_codepoints(
+      "merge_gate (gate_a inputs: #{gate_a_inputs}): " <>
+        Enum.map_join(reasons, "; ", &inspect/1)
+    )
+  end
 
-    if String.length(text) > @max_reason_chars,
-      do: String.slice(text, 0, @max_reason_chars - 1) <> "…",
+  # CODEPOINTS, matching Postgres `char_length` and `Stages`' own bound — see the note on
+  # `@reason_budget`. A codepoint prefix can split a grapheme cluster; that is cosmetic and
+  # the string stays valid UTF-8, which is the trade against an escalation that will not
+  # write at all.
+  defp bound_codepoints(text) do
+    chars = String.to_charlist(text)
+
+    if length(chars) > @reason_budget,
+      do: chars |> Enum.take(@reason_budget - 1) |> List.to_string() |> Kernel.<>("…"),
       else: text
   end
 

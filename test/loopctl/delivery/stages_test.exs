@@ -355,7 +355,8 @@ defmodule Loopctl.Delivery.StagesTest do
       head_sha: String.duplicate("c", 40),
       pr_number: 821,
       merge_sha: String.duplicate("d", 64),
-      release_id: "v421"
+      release_id: "v421",
+      merge_gate_allowed_sha: String.duplicate("1", 40)
     }
 
     @others %{
@@ -364,7 +365,8 @@ defmodule Loopctl.Delivery.StagesTest do
       head_sha: String.duplicate("e", 40),
       pr_number: 822,
       merge_sha: String.duplicate("f", 40),
-      release_id: "v422"
+      release_id: "v422",
+      merge_gate_allowed_sha: String.duplicate("2", 40)
     }
 
     test "a replay of every outward stage finds and reuses its recorded identity" do
@@ -1081,7 +1083,13 @@ defmodule Loopctl.Delivery.StagesTest do
       assert [%Entry{payload: payload}] = as_tenant(story.tenant_id, fn -> Repo.all(Entry) end)
       assert payload["reason"] == "required check missing"
       # Which merge it retracts — the row's own merge_sha is nil by now, cleared by the edge.
-      assert payload["retracted"] == %{"merge_sha" => merge_sha, "head_sha" => @sha_a}
+      # `merge_gate_allowed_sha` is retracted alongside the head it was granted for (#803
+      # review round 1): an allow that outlived its head would authorise an unjudged one.
+      assert payload["retracted"] == %{
+               "merge_sha" => merge_sha,
+               "head_sha" => @sha_a,
+               "merge_gate_allowed_sha" => nil
+             }
 
       # And the next attempt can record its own head again.
       {:ok, _} =
