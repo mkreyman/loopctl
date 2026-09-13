@@ -384,6 +384,38 @@ defmodule Loopctl.Delivery.StagesTest do
       assert data == %{"head_sha" => head, "count" => 1}
     end
 
+    test "clear_unevaluated/3 removes the count, and is a no-op with nothing to clear" do
+      {story, _row} = at_stage(:ci)
+      opts = [claim_epoch: story.claim_epoch]
+
+      assert {:ok, :nothing_to_clear} = Stages.clear_unevaluated(story.tenant_id, story.id, opts)
+
+      assert {:ok, 1} =
+               Stages.note_unevaluated(story.tenant_id, story.id, String.duplicate("a", 40), opts)
+
+      assert {:ok, :cleared} = Stages.clear_unevaluated(story.tenant_id, story.id, opts)
+      assert is_nil(Stages.get(story.tenant_id, story.id).merge_gate_unevaluated)
+
+      # And the next run starts over rather than resuming the cleared arithmetic.
+      assert {:ok, 1} =
+               Stages.note_unevaluated(story.tenant_id, story.id, String.duplicate("a", 40), opts)
+    end
+
+    test "an edge that clears head_sha clears the count with it" do
+      {story, _row} = at_stage(:ci)
+      opts = [claim_epoch: story.claim_epoch]
+
+      assert {:ok, 1} =
+               Stages.note_unevaluated(story.tenant_id, story.id, String.duplicate("a", 40), opts)
+
+      assert {:ok, row} =
+               Stages.advance(story.tenant_id, story.id, {:ci, :implementing, :ci_red},
+                 claim_epoch: story.claim_epoch
+               )
+
+      assert is_nil(row.merge_gate_unevaluated)
+    end
+
     test "is refused off the ci stage — no other stage runs this gate" do
       {story, _row} = at_stage(:implementing)
 
@@ -1152,7 +1184,8 @@ defmodule Loopctl.Delivery.StagesTest do
       assert payload["retracted"] == %{
                "merge_sha" => merge_sha,
                "head_sha" => @sha_a,
-               "merge_gate_allowed_sha" => nil
+               "merge_gate_allowed_sha" => nil,
+               "merge_gate_unevaluated" => nil
              }
 
       # And the next attempt can record its own head again.

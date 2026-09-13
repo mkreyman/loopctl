@@ -39,10 +39,12 @@ All notable changes to loopctl are documented here.
   escalates with the sha named in the reason. A pull request whose head is not the one CI
   ran on comes back `head_moved` and returns to `implementing` rather than merging.
 
-  **Migrations, no manual step:** `story_stages` gains `merge_gate_unevaluated`, the
-  consecutive-unevaluated count per head, and `story_stage_events` accepts one more event
-  name for it. And `story_stages` gains `merge_gate_allowed_sha`, the head the
-  merge gate allowed. It is cleared with `head_sha` by every edge that clears it. Existing
+  **Migrations, no manual step, and both roll back cleanly:** `story_stages` gains
+  `merge_gate_unevaluated`, the consecutive-unevaluated count per head, and
+  `story_stage_events` accepts one more event name for it (the down migration removes those
+  rows before restoring the old allow-list, so a rollback works after the gate has run). And
+  `story_stages` gains `merge_gate_allowed_sha`, the head the merge gate allowed. Both are
+  cleared by every edge that clears `head_sha`. It is cleared with `head_sha` by every edge that clears it. Existing
   rows get NULL, so an already-merged pull request in flight at deploy time escalates as
   ungated rather than being adopted — deliberate, and it clears as soon as the loop runs the
   gate again.

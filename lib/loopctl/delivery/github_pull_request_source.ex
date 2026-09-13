@@ -37,9 +37,17 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
 
   GitHub answers both a rate limit and a permanent permission denial with 403. They need
   opposite answers — retry versus tell a human — and the headers are what separate them:
-  `x-ratelimit-remaining: 0` or a `retry-after` means a limit, and neither means the token
-  cannot do this. A limit is reported as `{:github_rate_limited, status, retry_after}`;
-  everything else keeps `{:github_api_error, status}`.
+  `x-ratelimit-remaining: 0` or the PRESENCE of a `retry-after` means a limit, and neither
+  means the token cannot do this. A limit is reported as
+  `{:github_rate_limited, status, delay}`; everything else keeps
+  `{:github_api_error, status}`.
+
+  Presence and parse are separate questions. A `Retry-After` this module cannot turn into a
+  number — an HTTP-date, which is legal — still says "come back later", so it decides the
+  CLASS; the delay then comes from `x-ratelimit-reset` instead. That header is never used to
+  classify, because it rides on ordinary responses too, but it is the only thing that makes
+  a PRIMARY (hourly) limit usable: without it the caller waits a floor measured in seconds
+  against a window measured in an hour.
 
   ## Authentication
 
@@ -57,6 +65,10 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   @connect_timeout_ms 2_000
   @receive_timeout_ms 5_000
   @files_per_page 100
+
+  # GitHub's primary rate-limit window is an hour. Anything beyond that plus slack is not a
+  # window rolling over, so it is not turned into a delay a caller would sleep on.
+  @max_reset_delay_seconds 3_900
 
   @repo_name ~r{\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\z}
   @ref ~r{\A[A-Za-z0-9_./-]+\z}
@@ -232,14 +244,24 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   # The headers are what tell them apart: GitHub sends `x-ratelimit-remaining: 0` on a
   # primary-limit 403 and a `retry-after` on a secondary one. Neither present means the
   # token cannot do this, and that is configuration for a human.
+  # PRESENCE decides the CLASS; the parse only decides the DELAY. A 403 carrying a
+  # `Retry-After` this module cannot turn into a number — an HTTP-date, which is legal — is
+  # still a rate limit, and classifying it as a permission denial would escalate a story on
+  # the one shape that says most clearly "come back later".
   defp failure(%Req.Response{status: status} = response) when status in [403, 429] do
-    case {exhausted?(response), retry_after(response)} do
-      {false, nil} when status == 403 -> {:github_api_error, 403}
-      {_exhausted, retry_after} -> {:github_rate_limited, status, retry_after}
-    end
+    if status == 429 or limited?(response),
+      do: {:github_rate_limited, status, delay(response)},
+      else: {:github_api_error, 403}
   end
 
   defp failure(%Req.Response{status: status}), do: {:github_api_error, status}
+
+  # The two signals GitHub uses, and ONLY these two. `x-ratelimit-reset` is deliberately not
+  # one of them: it rides on ordinary responses too, so its presence says nothing about why
+  # THIS one failed. It is read below, for the delay, once the class is already decided.
+  defp limited?(response) do
+    exhausted?(response) or Req.Response.get_header(response, "retry-after") != []
+  end
 
   defp exhausted?(response) do
     case Req.Response.get_header(response, "x-ratelimit-remaining") do
@@ -248,13 +270,35 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
     end
   end
 
-  # Seconds, and only when the forge gave a plain delta. An HTTP-date `Retry-After` is legal
-  # and is deliberately NOT parsed into a number here: the caller's own backoff is the
-  # fallback, and a misparsed date would be worse than none.
-  defp retry_after(response) do
+  # How long to wait, in seconds, from whichever header can say.
+  #
+  # `x-ratelimit-reset` is what makes a PRIMARY limit usable: it is the epoch second the
+  # hourly window rolls over, and without it the caller falls back to a floor measured in
+  # seconds against a window measured in an hour — which then trips the consecutive-
+  # unevaluated bound and escalates the very fault that was going to clear on its own.
+  # `Retry-After` wins when it parses, because a secondary limit is the forge speaking about
+  # THIS request.
+  defp delay(response) do
+    retry_after_seconds(response) || reset_seconds(response)
+  end
+
+  defp retry_after_seconds(response) do
     with [value | _rest] <- Req.Response.get_header(response, "retry-after"),
          {seconds, ""} <- Integer.parse(String.trim(value)),
-         true <- seconds >= 0 do
+         true <- seconds > 0 do
+      seconds
+    else
+      _other -> nil
+    end
+  end
+
+  # An epoch second in the PAST, or one absurdly far ahead, tells a caller nothing useful, so
+  # neither becomes a delay. The cap is the forge's own longest window plus slack.
+  defp reset_seconds(response) do
+    with [value | _rest] <- Req.Response.get_header(response, "x-ratelimit-reset"),
+         {epoch, ""} <- Integer.parse(String.trim(value)),
+         seconds = epoch - DateTime.to_unix(DateTime.utc_now()),
+         true <- seconds > 0 and seconds <= @max_reset_delay_seconds do
       seconds
     else
       _other -> nil

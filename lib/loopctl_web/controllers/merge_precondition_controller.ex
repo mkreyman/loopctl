@@ -108,7 +108,18 @@ defmodule LoopctlWeb.MergePreconditionController do
           },
           repo: %OpenApiSpex.Schema{type: :string, nullable: true},
           pr_number: %OpenApiSpex.Schema{type: :integer, nullable: true},
-          head_sha: %OpenApiSpex.Schema{type: :string, nullable: true},
+          head_sha: %OpenApiSpex.Schema{
+            type: :string,
+            nullable: true,
+            description: "The head the FORGE reports for the pull request."
+          },
+          recorded_head_sha: %OpenApiSpex.Schema{
+            type: :string,
+            nullable: true,
+            description:
+              "The head the stage row carries — what CI ran on and the story was verified " <>
+                "at. A verdict is `head_moved` when the two disagree."
+          },
           merge_base_sha: %OpenApiSpex.Schema{type: :string, nullable: true},
           merge_sha: %OpenApiSpex.Schema{
             type: :string,
@@ -123,6 +134,23 @@ defmodule LoopctlWeb.MergePreconditionController do
                 "configuration may tighten it and may not loosen it."
           },
           custody: %OpenApiSpex.Schema{type: :string, nullable: true},
+          gate_a_inputs: %OpenApiSpex.Schema{
+            type: :string,
+            enum: ["caller_asserted"],
+            description:
+              "How Gate A's inputs reached the gate. `caller_asserted` while the triage " <>
+                "trio's outputs arrive in the request body, so Gate A's verdict is only " <>
+                "as trustworthy as inputs the caller supplied."
+          },
+          retry_after: %OpenApiSpex.Schema{
+            type: :integer,
+            nullable: true,
+            description:
+              "On `unevaluated`, the delay the FORGE asked for — a `Retry-After`, or the " <>
+                "time to its rate-limit reset. The `Retry-After` HEADER is authoritative " <>
+                "and is always sent on a 503; this is null when the forge named no delay " <>
+                "and the endpoint's own floor applied."
+          },
           gate_a: %OpenApiSpex.Schema{type: :object, nullable: true},
           gate_b: %OpenApiSpex.Schema{type: :object, nullable: true},
           proof: %OpenApiSpex.Schema{type: :object, nullable: true}
@@ -208,6 +236,18 @@ defmodule LoopctlWeb.MergePreconditionController do
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
+
+  @doc """
+  The response schema, exposed so a test can bind it to what `render_verdict/1` actually
+  emits.
+
+  It has drifted from the renderer twice — a field added to the payload and not to the
+  schema publishes a contract that omits what the description tells callers to act on, and
+  nothing about that fails. The guard in `merge_precondition_controller_test.exs` is what
+  makes it fail.
+  """
+  @spec verdict_schema() :: OpenApiSpex.Schema.t()
+  def verdict_schema, do: @verdict_schema
 
   @doc "POST /api/v1/stories/:id/merge-precondition"
   def create(conn, %{"id" => story_id} = params) do

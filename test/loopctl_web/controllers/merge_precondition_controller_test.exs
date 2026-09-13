@@ -188,6 +188,31 @@ defmodule LoopctlWeb.MergePreconditionControllerTest do
       assert ["120"] = get_resp_header(response, "retry-after")
     end
 
+    test "every field the response emits is DECLARED in the published schema", ctx do
+      # The schema has drifted from the renderer twice: a field added to the payload and not
+      # here publishes a contract that omits what the 503 description tells callers to act
+      # on, and nothing about that fails on its own.
+      stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 3})
+      {key, _} = orchestrator_key(ctx)
+
+      assert %{"data" => data} = ctx |> post_precondition(key) |> json_response(200)
+
+      declared =
+        LoopctlWeb.MergePreconditionController.verdict_schema()
+        |> get_in([Access.key!(:properties), :data, Access.key!(:properties)])
+        |> Map.keys()
+        |> Enum.map(&Atom.to_string/1)
+        |> MapSet.new()
+
+      emitted = data |> Map.keys() |> MapSet.new()
+
+      assert MapSet.subset?(emitted, declared),
+             "undeclared response fields: #{inspect(MapSet.difference(emitted, declared))}"
+
+      assert MapSet.subset?(declared, emitted),
+             "declared but never emitted: #{inspect(MapSet.difference(declared, emitted))}"
+    end
+
     test "an allow is recorded against the head, and the endpoint is what records it", ctx do
       stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 3})
       {key, _} = orchestrator_key(ctx)

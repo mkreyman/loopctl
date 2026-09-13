@@ -133,15 +133,90 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
       assert {:error, {:github_rate_limited, 429, nil}} = Source.pull_request(@repo, 7)
     end
 
-    test "an HTTP-date retry-after is not guessed at — the caller's own floor applies" do
+    test "an HTTP-date retry-after is a rate limit — PRESENCE decides the class" do
+      # No `x-ratelimit-remaining`, so the header itself is the only signal. An HTTP-date is
+      # legal; refusing to parse it into a number must not turn "come back later" into a
+      # permanent permission denial that escalates the story at once.
       stub(fn conn ->
         conn
         |> Plug.Conn.put_resp_header("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT")
-        |> Plug.Conn.put_resp_header("x-ratelimit-remaining", "0")
         |> Plug.Conn.resp(403, "")
       end)
 
       assert {:error, {:github_rate_limited, 403, nil}} = Source.pull_request(@repo, 7)
+    end
+
+    test "a NEGATIVE or unparseable retry-after is still a rate limit, with no delay" do
+      for value <- ["-5", "soon", ""] do
+        stub(fn conn ->
+          conn
+          |> Plug.Conn.put_resp_header("retry-after", value)
+          |> Plug.Conn.resp(403, "")
+        end)
+
+        assert {:error, {:github_rate_limited, 403, nil}} = Source.pull_request(@repo, 7)
+      end
+    end
+
+    test "a PRIMARY limit's delay comes from x-ratelimit-reset, not from a caller's floor" do
+      # The anonymous-quota case: an hourly window, and no `retry-after` at all. Without
+      # this the caller waits its floor (seconds) against a window of up to an hour, and the
+      # consecutive-unevaluated bound escalates the very fault that was going to clear.
+      reset = DateTime.utc_now() |> DateTime.to_unix() |> Kernel.+(1_800)
+
+      stub(fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header("x-ratelimit-remaining", "0")
+        |> Plug.Conn.put_resp_header("x-ratelimit-reset", Integer.to_string(reset))
+        |> Plug.Conn.resp(403, ~s({"message":"API rate limit exceeded"}))
+      end)
+
+      assert {:error, {:github_rate_limited, 403, seconds}} = Source.pull_request(@repo, 7)
+      assert_in_delta seconds, 1_800, 5
+    end
+
+    test "a retry-after that parses WINS over the reset — it is about this request" do
+      reset = DateTime.utc_now() |> DateTime.to_unix() |> Kernel.+(1_800)
+
+      stub(fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header("retry-after", "45")
+        |> Plug.Conn.put_resp_header("x-ratelimit-reset", Integer.to_string(reset))
+        |> Plug.Conn.resp(403, "")
+      end)
+
+      assert {:error, {:github_rate_limited, 403, 45}} = Source.pull_request(@repo, 7)
+    end
+
+    test "a reset in the PAST, or absurdly far ahead, yields no delay" do
+      past = DateTime.utc_now() |> DateTime.to_unix() |> Kernel.-(60)
+      far = DateTime.utc_now() |> DateTime.to_unix() |> Kernel.+(86_400)
+
+      for value <- [past, far] do
+        stub(fn conn ->
+          conn
+          |> Plug.Conn.put_resp_header("x-ratelimit-remaining", "0")
+          |> Plug.Conn.put_resp_header("x-ratelimit-reset", Integer.to_string(value))
+          |> Plug.Conn.resp(403, "")
+        end)
+
+        assert {:error, {:github_rate_limited, 403, nil}} = Source.pull_request(@repo, 7)
+      end
+    end
+
+    test "x-ratelimit-reset alone does NOT make a permission denial a rate limit" do
+      # It rides on ordinary responses too, so its presence says nothing about why THIS one
+      # failed. Only remaining-zero or a retry-after classify.
+      reset = DateTime.utc_now() |> DateTime.to_unix() |> Kernel.+(1_800)
+
+      stub(fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header("x-ratelimit-remaining", "4998")
+        |> Plug.Conn.put_resp_header("x-ratelimit-reset", Integer.to_string(reset))
+        |> Plug.Conn.resp(403, ~s({"message":"Resource not accessible by token"}))
+      end)
+
+      assert {:error, {:github_api_error, 403}} = Source.pull_request(@repo, 7)
     end
 
     test "a body missing the fields it needs is an error naming only its SHAPE" do

@@ -287,6 +287,46 @@ defmodule Loopctl.Delivery.MergePreconditionIntegrationTest do
       assert row.escalation_reason =~ "github_unreachable"
     end
 
+    test "a verdict CLEARS the count a run of unevaluated results left behind", ctx do
+      # Without this the count outlives the fault it recorded, and a later blip at the same
+      # head escalates on a predecessor's arithmetic.
+      stub_unreachable()
+      assert {:ok, %Verdict{decision: :unevaluated}} = enforce(ctx)
+      assert {:ok, %Verdict{decision: :unevaluated}} = enforce(ctx)
+      assert Stages.get(ctx.tenant_id, ctx.story_id).merge_gate_unevaluated["count"] == 2
+
+      stub_source(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 1})
+      assert {:ok, %Verdict{decision: :allow}} = enforce(ctx)
+
+      assert is_nil(Stages.get(ctx.tenant_id, ctx.story_id).merge_gate_unevaluated)
+    end
+
+    test "a HEAD-MOVED verdict is not masked by a rate-limited tree call", ctx do
+      # The head-moved branch reads neither file list, so a fault in one must not turn an
+      # ordinary push into an escalation once the unevaluated bound is reached.
+      moved = String.duplicate("e", 40)
+
+      Mox.stub(MockPullRequestSource, :pull_request, fn @repo, _number ->
+        {:ok,
+         %{
+           state: "open",
+           merged?: false,
+           merge_sha: nil,
+           head_sha: moved,
+           merge_base_sha: @base,
+           diffstat: %{files: 1, changed_lines: 1},
+           diff: {:ok, %{files: ["lib/widgets/thing.ex"], renames: []}}
+         }}
+      end)
+
+      Mox.stub(MockPullRequestSource, :repo_files, fn @repo, _ref ->
+        flunk("the head-moved branch must not fetch a file list")
+      end)
+
+      assert {:ok, %Verdict{decision: :head_moved}} = enforce(ctx)
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :implementing
+    end
+
     test "the count is kept per the RECORDED head, which is known when the forge is not",
          ctx do
       # The forge head is unknown when the pull request cannot be read at all, so keying on

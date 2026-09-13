@@ -441,6 +441,54 @@ defmodule Loopctl.Delivery.Stages do
     count
   end
 
+  @doc """
+  Clears the consecutive-unevaluated count after an evaluation that DID produce a verdict.
+
+  A no-op when there is nothing to clear, so a successful gate run in the ordinary case
+  writes nothing and leaves no event. Without it the count outlives the fault it recorded,
+  and a later blip at the same head escalates on a predecessor's arithmetic.
+
+  Every edge that clears `head_sha` clears the count too (`StageMachine.head_keyed/0`); this
+  is the path for the case where nothing transitions at all.
+
+  ## Options
+
+  - `:claim_epoch` (required), `:actor_label`
+  """
+  @spec clear_unevaluated(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, :cleared | :nothing_to_clear} | {:error, :not_found | :stale_claim_epoch | :busy}
+  def clear_unevaluated(tenant_id, story_id, opts) do
+    epoch = Keyword.fetch!(opts, :claim_epoch)
+
+    in_tenant(tenant_id, fn ->
+      story = share_lock_story(tenant_id, story_id)
+      if story.claim_epoch != epoch, do: Repo.rollback(:stale_claim_epoch)
+
+      case lock_row(tenant_id, story_id) do
+        nil -> Repo.rollback(:not_found)
+        %StoryStage{merge_gate_unevaluated: nil} -> {:nothing_to_clear, nil}
+        row -> {do_clear_unevaluated(row, opts), nil}
+      end
+    end)
+  end
+
+  defp do_clear_unevaluated(row, opts) do
+    {1, [row]} =
+      from(s in StoryStage,
+        where: s.id == ^row.id and s.tenant_id == ^row.tenant_id,
+        select: s,
+        update: [
+          set: [merge_gate_unevaluated: nil, updated_at: ^DateTime.utc_now()],
+          inc: [lock_version: 1]
+        ]
+      )
+      |> Repo.update_all([])
+
+    data = %{"cleared" => row.merge_gate_unevaluated}
+    insert_event(Repo, row, "merge_gate_unevaluated", nil, nil, opts[:actor_label], data)
+    :cleared
+  end
+
   defp next_unevaluated_count(%{"head_sha" => head, "count" => count}, head)
        when is_integer(count) and count >= 0,
        do: count + 1

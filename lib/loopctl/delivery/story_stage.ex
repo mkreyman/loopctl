@@ -52,7 +52,7 @@ defmodule Loopctl.Delivery.StoryStage do
     field :merge_sha, :string
     field :release_id, :string
     field :merge_gate_allowed_sha, :string
-    field :merge_gate_unevaluated, :map, default: %{}
+    field :merge_gate_unevaluated, :map
     field :attempts, :map, default: %{}
     field :escalation_reason, :string
     field :lock_version, :integer, default: 0

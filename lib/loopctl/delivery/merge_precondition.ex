@@ -345,13 +345,20 @@ defmodule Loopctl.Delivery.MergePrecondition do
         do: {kind, reason}
   end
 
+  # A branch that reads neither file list must not be judged on one. Both the merged branch
+  # and the head-moved branch decide from the pull request alone, so a rate-limited tree
+  # call there would mask the decision — turning an ordinary push into an escalation once
+  # the unevaluated bound was reached, instead of returning the story to `implementing`.
   defp consumed_facts(facts) do
     case value(facts, :pull_request) do
       %{merged?: true} -> @merged_facts
-      %{} -> @forge_facts
+      %{} = pr -> if head_moved?(pr, facts), do: @merged_facts, else: @forge_facts
       _unreadable -> @merged_facts
     end
   end
+
+  defp head_moved?(pr, facts),
+    do: head_moved_reasons(pr, Map.get(facts, :recorded_head_sha)) != []
 
   defp error_reason(facts, key) do
     case Map.get(facts, key) do
@@ -641,12 +648,13 @@ defmodule Loopctl.Delivery.MergePrecondition do
       repo: repo,
       pr_number: pr_number,
       pull_request: pull_request,
-      # NOT fetched on the merged path: that branch reads neither list, and the two calls
-      # were identical there anyway (the adapter reports a merged pull request's merge base
-      # as its head), so they were two round trips whose results were discarded and whose
-      # failure could suppress the ungated-merge escalation.
-      head_files: repo_files(repo, pull_request, :head_sha),
-      base_files: repo_files(repo, pull_request, :merge_base_sha),
+      # NOT fetched when the decision will not read them: the merged branch and the
+      # head-moved branch both decide from the pull request alone. On the merged path the
+      # two calls were identical anyway (the adapter reports a merged pull request's merge
+      # base as its head), so they were round trips whose results were discarded and whose
+      # failure could mask the decision they were not part of.
+      head_files: repo_files(repo, pull_request, :head_sha, stage.head_sha),
+      base_files: repo_files(repo, pull_request, :merge_base_sha, stage.head_sha),
       triggers: DeliveryGates.load_triggers(),
       custody: Progress.merge_custody_status(story),
       # The head CI ran on and the story was verified at, and the head a previous allow was
@@ -679,16 +687,17 @@ defmodule Loopctl.Delivery.MergePrecondition do
   defp pull_request({:ok, repo}, {:ok, number}), do: source().pull_request(repo, number)
   defp pull_request(_repo, _number), do: {:error, :not_attempted}
 
-  defp repo_files(_repo, {:ok, %{merged?: true}}, _key), do: {:error, :not_consumed}
+  defp repo_files(_repo, {:ok, %{merged?: true}}, _key, _recorded), do: {:error, :not_consumed}
 
-  defp repo_files({:ok, repo}, {:ok, pr}, key) do
-    case Map.get(pr, key) do
-      ref when is_binary(ref) -> source().repo_files(repo, ref)
-      other -> {:error, {:missing_ref, key, shape(other)}}
+  defp repo_files({:ok, repo}, {:ok, pr}, key, recorded) do
+    cond do
+      head_moved_reasons(pr, recorded) != [] -> {:error, :not_consumed}
+      is_binary(Map.get(pr, key)) -> source().repo_files(repo, Map.get(pr, key))
+      true -> {:error, {:missing_ref, key, shape(Map.get(pr, key))}}
     end
   end
 
-  defp repo_files(_repo, _pull_request, _key), do: {:error, :not_attempted}
+  defp repo_files(_repo, _pull_request, _key, _recorded), do: {:error, :not_attempted}
 
   # The repository is NEVER taken from the caller. Gate B's trigger list is keyed by
   # repository, so a caller that could name one could name a DIFFERENT configured
@@ -719,8 +728,8 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # `:unevaluated` and `:already_merged` transition NOTHING. `:unevaluated` because there is
   # no verdict to act on and a network blip must not park a story on a human; an authorised
   # `:already_merged` because the caller's next act is recording the merge it adopted.
-  defp act(_tenant_id, _story_id, %Verdict{decision: :already_merged} = verdict, _opts),
-    do: verdict
+  defp act(tenant_id, story_id, %Verdict{decision: :already_merged} = verdict, opts),
+    do: clear_unevaluated(tenant_id, story_id, verdict, opts)
 
   defp act(tenant_id, story_id, %Verdict{decision: :allow} = verdict, opts) do
     # A conversion re-enters `act/4` rather than returning: the controller's contract is
@@ -761,7 +770,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
     case Stages.record_effect(tenant_id, story_id, :merge_gate_allowed_sha, head, write_opts) do
       {:ok, _row} ->
-        verdict
+        clear_unevaluated(tenant_id, story_id, verdict, opts)
 
       {:error, reason} ->
         Logger.warning(
@@ -796,6 +805,27 @@ defmodule Loopctl.Delivery.MergePrecondition do
         )
 
         %{verdict | reasons: verdict.reasons ++ [{:unevaluated_not_counted, reason}]}
+    end
+  end
+
+  # An evaluation that produced a VERDICT ends whatever run of unevaluated ones preceded it.
+  # A failure to clear is tidying that did not land, not authorisation withheld: the decision
+  # stands and the failure is reported, because the worst it costs is an early escalation on
+  # a later fault, and refusing a merge the gate allowed would cost more.
+  defp clear_unevaluated(tenant_id, story_id, %Verdict{} = verdict, opts) do
+    write_opts = Keyword.take(opts, [:claim_epoch, :actor_label])
+
+    case Stages.clear_unevaluated(tenant_id, story_id, write_opts) do
+      {:ok, _outcome} ->
+        verdict
+
+      {:error, reason} ->
+        Logger.warning(
+          "merge_gate unevaluated count not cleared story_id=#{story_id} " <>
+            "tenant_id=#{tenant_id} reason=#{inspect(reason)}"
+        )
+
+        %{verdict | reasons: verdict.reasons ++ [{:unevaluated_not_cleared, reason}]}
     end
   end
 

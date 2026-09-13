@@ -59,18 +59,35 @@ defmodule Loopctl.Delivery.StageMachineTest do
     assert StageMachine.effect_stages(:merge_sha) == [:merged]
   end
 
-  test "a refused merge clears the identity it never realised" do
-    # `merge_gate_allowed_sha` goes with the head (#803 review round 1): the merge gate's
-    # allow is granted FOR a head, so an allow left behind would authorise the next one.
-    assert StageMachine.clears(:merged, :implementing, :merge_refused) ==
-             [:head_sha, :merge_sha, :merge_gate_allowed_sha]
+  test "a refused merge clears the identity it never realised, and the head with it" do
+    assert Enum.sort(StageMachine.clears(:merged, :implementing, :merge_refused)) ==
+             Enum.sort([:merge_sha | StageMachine.head_keyed()])
   end
 
-  test "going back to implementing clears the merge gate's allow with the head" do
-    for edge <- [:ci_red, :base_moved, :review_findings] do
-      assert :merge_gate_allowed_sha in StageMachine.clears(:ci, :implementing, edge) or
-               :merge_gate_allowed_sha in StageMachine.clears(:reviewing, :implementing, edge)
+  # The drift guard (#803 review rounds 1-3). Three fields are bound to the head — the head
+  # itself, the merge gate's allow, and its unevaluated count — and each one left behind
+  # would speak for a head that no longer exists. They were added one at a time, to one
+  # clause at a time, which is exactly how the next one gets forgotten.
+  test "EVERY head-keyed field is cleared wherever head_sha is, on every transition" do
+    head_keyed = MapSet.new(StageMachine.head_keyed())
+    assert :head_sha in head_keyed
+
+    for {from, to, edge} <- StageMachine.transitions() do
+      cleared = MapSet.new(StageMachine.clears(from, to, edge))
+
+      if :head_sha in cleared do
+        assert MapSet.subset?(head_keyed, cleared),
+               "#{from} -> #{to} (#{edge}) clears head_sha but not " <>
+                 inspect(MapSet.to_list(MapSet.difference(head_keyed, cleared)))
+      end
     end
+  end
+
+  test "a human re-queue starts over from nothing, the head-keyed fields included" do
+    cleared = MapSet.new(StageMachine.clears(:escalated, :queued, :human_resolution))
+
+    assert MapSet.subset?(MapSet.new(StageMachine.head_keyed()), cleared)
+    assert MapSet.subset?(MapSet.new(StageMachine.effects()), cleared)
   end
 
   test "every stage is reachable from detected" do

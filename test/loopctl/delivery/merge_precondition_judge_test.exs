@@ -540,6 +540,23 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       assert :head_sha_not_recorded in verdict.reasons
     end
 
+    test "a moved head is NOT masked by a transient fault in a list it never reads" do
+      # `gather/3` does not fetch the file lists once the head has moved, so this state is
+      # unreachable through `evaluate/3` today — but `judge/1` is public and its contract
+      # has to hold for any facts, and this is the clause that keeps an ordinary push from
+      # becoming an escalation if the fetch ever runs again.
+      verdict =
+        judge(
+          files: ["lib/widgets/thing.ex"],
+          diffstat: %{files: 1, changed_lines: 1},
+          recorded_head_sha: String.duplicate("e", 40),
+          head_files: {:error, {:github_rate_limited, 429, 60}},
+          base_files: {:error, {:github_rate_limited, 429, 60}}
+        )
+
+      assert verdict.decision == :head_moved
+    end
+
     test "a moved head still reports the custody and Gate A problems it found" do
       verdict =
         judge(

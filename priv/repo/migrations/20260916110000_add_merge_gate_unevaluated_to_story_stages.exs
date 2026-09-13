@@ -22,7 +22,10 @@ defmodule Loopctl.Repo.Migrations.AddMergeGateUnevaluatedToStoryStages do
   # story's history of blips at an older one should not escalate it.
   def up do
     alter table(:story_stages) do
-      add :merge_gate_unevaluated, :map, null: false, default: %{}
+      # NULLABLE, and no default: every edge that clears `head_sha` clears this too, and
+      # `Loopctl.Delivery.Stages` clears a field by setting it to NULL. "No count" and
+      # "cleared" are the same state and are both NULL.
+      add :merge_gate_unevaluated, :map, null: true
     end
 
     create constraint(:story_stages, :story_stages_merge_gate_unevaluated_object,
@@ -42,6 +45,12 @@ defmodule Loopctl.Repo.Migrations.AddMergeGateUnevaluatedToStoryStages do
   end
 
   def down do
+    # The rows the UP migration made legal have to go before the old allow-list comes back,
+    # or the rollback aborts on any database where the gate has run even once. They are the
+    # only rows carrying this name, and the count they record is rebuilt by the next
+    # evaluation.
+    execute "DELETE FROM story_stage_events WHERE event = 'merge_gate_unevaluated'"
+
     drop constraint(:story_stage_events, :story_stage_events_event)
 
     create constraint(:story_stage_events, :story_stage_events_event,
