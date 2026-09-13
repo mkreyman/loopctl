@@ -30,7 +30,14 @@ defmodule LoopctlRunner.TestLoopctl do
       # When set, a dispatch_reply within this many ms of the last accepted one is refused
       # rate_limited, like loopctl's burst bucket once it is empty.
       dispatch_reply_floor_ms: nil,
-      last_dispatch_reply_ms: nil
+      last_dispatch_reply_ms: nil,
+      # Stored trace seqs per run_id, and scripted replies to trace pushes, oldest first:
+      # :ok (store and ack) or {:error, reason_map}.
+      trace_seqs: %{},
+      trace_replies: [],
+      # run_id => a refusal returned for every trace batch of that run
+      trace_refuse_runs: %{},
+      last_trace_ms: %{}
     }
 
     case Agent.start(fn -> state end, name: __MODULE__) do
@@ -64,6 +71,19 @@ defmodule LoopctlRunner.TestLoopctl do
       state ->
         {:ok, state}
     end)
+  end
+
+  def next_trace_reply do
+    Agent.get_and_update(__MODULE__, fn
+      %{trace_replies: [reply | rest]} = state -> {reply, %{state | trace_replies: rest}}
+      state -> {:ok, state}
+    end)
+  end
+
+  @doc "The contiguous acknowledgement for a run: the highest seq with every seq below stored."
+  def acked_seq(run_id) do
+    seqs = Map.get(get(:trace_seqs), run_id, MapSet.new())
+    Stream.iterate(0, &(&1 + 1)) |> Enum.find(&(not MapSet.member?(seqs, &1))) |> Kernel.-(1)
   end
 
   def next_join_reply do
@@ -160,6 +180,20 @@ defmodule LoopctlRunner.TestLoopctl do
       end
     end
 
+    # loopctl's per-event floors: a push inside the interval is refused, not queued.
+    def handle_in(event, payload, socket) when event in ["trace", "trace_cursor"] do
+      now = System.monotonic_time(:millisecond)
+      last = Map.get(TestLoopctl.get(:last_trace_ms), event)
+
+      if last && now - last < 50 do
+        TestLoopctl.notify({:trace_rate_limited, event})
+        {:reply, {:error, %{reason: "rate_limited", min_interval_ms: 50}}, socket}
+      else
+        TestLoopctl.put(:last_trace_ms, Map.put(TestLoopctl.get(:last_trace_ms), event, now))
+        trace_in(event, payload, socket)
+      end
+    end
+
     def handle_in("dispatch_reply", payload, socket) do
       TestLoopctl.notify({:dispatch_reply, payload})
 
@@ -191,6 +225,60 @@ defmodule LoopctlRunner.TestLoopctl do
 
     def handle_in(_event, _payload, socket),
       do: {:reply, {:error, %{reason: "unknown_event"}}, socket}
+
+    defp trace_in("trace_cursor", %{"run_id" => run_id} = payload, socket) do
+      TestLoopctl.notify({:trace_cursor, payload})
+      {:reply, {:ok, %{acked_seq: TestLoopctl.acked_seq(run_id)}}, socket}
+    end
+
+    defp trace_in("trace", payload, socket) do
+      TestLoopctl.notify({:trace, payload})
+
+      case trace_problem(payload) do
+        nil -> scripted_trace_reply(payload, socket)
+        refusal -> {:reply, {:error, refusal}, socket}
+      end
+    end
+
+    defp trace_problem(payload) do
+      alias LoopctlRunner.ByteRule
+
+      too_big? = fn event ->
+        ByteRule.bytes(Map.get(event, "data", %{})) > 6_000 or ByteRule.bytes(event) > 12_000
+      end
+
+      cond do
+        Contract.validate("RunnerTraceBatch", payload) != :ok -> %{reason: "invalid_payload"}
+        Enum.any?(payload["events"], too_big?) -> %{reason: "event_data_too_large"}
+        ByteRule.bytes(payload) > 60_000 -> %{reason: "batch_too_large"}
+        true -> Map.get(TestLoopctl.get(:trace_refuse_runs), payload["run_id"])
+      end
+    end
+
+    defp scripted_trace_reply(payload, socket) do
+      case TestLoopctl.next_trace_reply() do
+        :ok ->
+          run_id = payload["run_id"]
+          seqs = TestLoopctl.get(:trace_seqs)
+
+          stored =
+            Enum.reduce(
+              payload["events"],
+              Map.get(seqs, run_id, MapSet.new()),
+              &MapSet.put(&2, &1["seq"])
+            )
+
+          TestLoopctl.put(:trace_seqs, Map.put(seqs, run_id, stored))
+          {:reply, {:ok, %{acked_seq: TestLoopctl.acked_seq(run_id)}}, socket}
+
+        # An acknowledgement that does not reflect the batch, as if a gap were left.
+        {:ack, acked} ->
+          {:reply, {:ok, %{acked_seq: acked}}, socket}
+
+        {:error, reply} ->
+          {:reply, {:error, reply}, socket}
+      end
+    end
 
     defp floored? do
       floor = TestLoopctl.get(:dispatch_reply_floor_ms)

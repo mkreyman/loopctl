@@ -348,6 +348,472 @@ defmodule LoopctlRunner.ControlTest do
     end
   end
 
+  describe "trace shipping" do
+    @dispatch_id "2e2d3c4b-5a69-4788-9a0b-1c2d3e4f5a6b"
+
+    # A run id of its own per test: a stopped runner's last pushes can still reach the fake
+    # after the next test has reset it, and must not land on this test's run.
+    setup do
+      {:ok, run_id: LoopctlRunner.Session.uuid4()}
+    end
+
+    defp dispatched_run(ctx, events, state \\ %{}, name \\ "dispatched-run") do
+      run_dir = Path.join(ctx.config.runs_dir, name)
+      File.mkdir_p!(run_dir)
+
+      LoopctlRunner.RunState.update(
+        run_dir,
+        Map.merge(
+          %{
+            "run_id" => ctx.run_id,
+            "dispatch_id" => @dispatch_id,
+            "claim_epoch" => 4,
+            "status" => "succeeded"
+          },
+          state
+        )
+      )
+
+      lines =
+        Enum.map_join(events, fn seq ->
+          JSON.encode!(%{
+            "run_id" => ctx.run_id,
+            "seq" => seq,
+            "event_id" => Integer.to_string(seq),
+            "parent" => if(seq == 0, do: nil, else: "0"),
+            "ts" => "2026-09-13T05:00:00Z",
+            "type" => "claude.tool_use",
+            "data" => %{"n" => seq}
+          }) <> "\n"
+        end)
+
+      File.write!(Path.join(run_dir, "trace.ndjson"), lines)
+      run_dir
+    end
+
+    defp shipping_control(ctx, opts \\ []) do
+      slow = %{ctx.config | control: %{ctx.config.control | status_interval_s: 30}}
+      {pid, _ref} = start_control(slow, Keyword.merge([trace_poll_ms: 200], opts))
+      pid
+    end
+
+    test "a finished dispatched run is shipped in full after a cursor, then marked done", ctx do
+      run_id = ctx.run_id
+      run_dir = dispatched_run(ctx, 0..44)
+      pid = shipping_control(ctx)
+
+      assert_receive {:test_loopctl, {:trace_cursor, %{"run_id" => ^run_id}}}, 5_000
+      assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id, "events" => first}}}, 3_000
+      assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id, "events" => second}}}, 3_000
+      assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id, "events" => third}}}, 3_000
+      assert Enum.map(first ++ second ++ third, & &1["seq"]) == Enum.to_list(0..44)
+
+      :ok = wait_until(fn -> File.exists?(Path.join(run_dir, "trace_ship.json")) end, 3_000)
+
+      assert %{"done" => true, "acked_seq" => 44} =
+               JSON.decode!(File.read!(Path.join(run_dir, "trace_ship.json")))
+
+      assert Control.info(pid).trace_acked == %{ctx.run_id => 44}
+      refute_receive {:test_loopctl, {:trace_rate_limited, _}}, 500
+      refute_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id}}}, 300
+    end
+
+    test "shipping resumes after what loopctl already holds", ctx do
+      run_id = ctx.run_id
+      TestLoopctl.put(:trace_seqs, %{ctx.run_id => MapSet.new(0..29)})
+      dispatched_run(ctx, 0..34)
+      shipping_control(ctx)
+
+      assert_receive {:test_loopctl, {:trace_cursor, %{"run_id" => ^run_id}}}, 5_000
+      assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id, "events" => events}}}, 3_000
+      assert Enum.map(events, & &1["seq"]) == Enum.to_list(30..34)
+    end
+
+    test "a live run ships what is written and is not marked done", ctx do
+      run_id = ctx.run_id
+
+      run_dir =
+        dispatched_run(
+          ctx,
+          0..2,
+          Map.merge(LoopctlRunner.Owner.current(), %{"status" => "running"})
+        )
+
+      shipping_control(ctx)
+      assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id, "events" => events}}}, 5_000
+      assert Enum.map(events, & &1["seq"]) == [0, 1, 2]
+
+      # More lines arrive; the idle shipper finds them on its next poll.
+      File.write!(
+        Path.join(run_dir, "trace.ndjson"),
+        File.read!(Path.join(run_dir, "trace.ndjson")) <>
+          JSON.encode!(%{
+            "run_id" => ctx.run_id,
+            "seq" => 3,
+            "event_id" => "3",
+            "parent" => "0",
+            "ts" => "2026-09-13T05:00:01Z",
+            "type" => "claude.result",
+            "data" => %{}
+          }) <> "\n",
+        []
+      )
+
+      assert_receive {:test_loopctl,
+                      {:trace, %{"run_id" => ^run_id, "events" => [%{"seq" => 3}]}}},
+                     3_000
+
+      refute File.exists?(Path.join(run_dir, "trace_ship.json"))
+    end
+
+    test "a run with no dispatch is never shipped", ctx do
+      run_id = ctx.run_id
+      run_dir = dispatched_run(ctx, 0..2)
+      state = JSON.decode!(File.read!(Path.join(run_dir, "state.json")))
+
+      File.write!(
+        Path.join(run_dir, "state.json"),
+        JSON.encode!(Map.drop(state, ["dispatch_id", "claim_epoch"]))
+      )
+
+      pid = shipping_control(ctx)
+      :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+      refute_receive {:test_loopctl, {:trace_cursor, %{"run_id" => ^run_id}}}, 1_000
+    end
+
+    test "a refusal resending cannot change gives the run up and stops shipping it", ctx do
+      run_id = ctx.run_id
+      TestLoopctl.put(:trace_replies, [{:error, %{reason: "stale_claim_epoch"}}])
+      run_dir = dispatched_run(ctx, 0..2)
+      shipping_control(ctx)
+
+      assert_receive {:test_loopctl, {:trace_cursor, %{"run_id" => ^run_id}}}, 5_000
+      assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id}}}, 3_000
+      :ok = wait_until(fn -> File.exists?(Path.join(run_dir, "trace_ship.json")) end, 3_000)
+
+      assert %{"abandoned" => "stale_claim_epoch"} =
+               JSON.decode!(File.read!(Path.join(run_dir, "trace_ship.json")))
+
+      refute_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id}}}, 800
+      refute_receive {:test_loopctl, {:trace_cursor, %{"run_id" => ^run_id}}}, 10
+    end
+
+    test "a rate-limited batch is resent, not skipped", ctx do
+      run_id = ctx.run_id
+      TestLoopctl.put(:trace_replies, [{:error, %{reason: "rate_limited", min_interval_ms: 50}}])
+      run_dir = dispatched_run(ctx, 0..2)
+      shipping_control(ctx)
+
+      assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id, "events" => events}}}, 5_000
+      assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id, "events" => ^events}}}, 3_000
+      :ok = wait_until(fn -> File.exists?(Path.join(run_dir, "trace_ship.json")) end, 3_000)
+    end
+
+    test "an event loopctl refuses as too large is resent without its data", ctx do
+      run_id = ctx.run_id
+      TestLoopctl.put(:trace_replies, [{:error, %{reason: "event_data_too_large", seq: 1}}])
+      dispatched_run(ctx, 0..2)
+      shipping_control(ctx)
+
+      assert_receive {:test_loopctl,
+                      {:trace,
+                       %{"run_id" => ^run_id, "events" => [_, %{"data" => %{"n" => 1}}, _]}}},
+                     5_000
+
+      assert_receive {:test_loopctl,
+                      {:trace,
+                       %{"events" => [_, %{"data" => %{"omitted" => "data_too_large"}}, _]}}},
+                     3_000
+    end
+
+    test "an acknowledgement that does not advance waits out the poll, not a tight resend",
+         ctx do
+      run_id = ctx.run_id
+      TestLoopctl.put(:trace_replies, [{:ack, -1}])
+      dispatched_run(ctx, 0..2)
+      shipping_control(ctx, trace_poll_ms: 1_000)
+
+      assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id}}}, 5_000
+      refute_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id}}}, 700
+      assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id}}}, 1_000
+    end
+
+    test "a batch loopctl refuses as invalid is narrowed to its event, which ships as a stub",
+         ctx do
+      run_id = ctx.run_id
+
+      invalid =
+        {:error, %{reason: "invalid_payload", details: ["a value was refused by the database"]}}
+
+      TestLoopctl.put(:trace_replies, [invalid, invalid])
+
+      run_dir =
+        dispatched_run(
+          ctx,
+          0..2,
+          Map.merge(LoopctlRunner.Owner.current(), %{"status" => "running"})
+        )
+
+      shipping_control(ctx)
+
+      assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id, "events" => [_, _, _]}}},
+                     5_000
+
+      assert_receive {:test_loopctl,
+                      {:trace,
+                       %{"run_id" => ^run_id, "events" => [%{"seq" => 0, "data" => %{"n" => 0}}]}}},
+                     3_000
+
+      assert_receive {:test_loopctl,
+                      {:trace,
+                       %{
+                         "run_id" => ^run_id,
+                         "events" => [%{"seq" => 0, "type" => "trace.unshippable"}]
+                       }}},
+                     3_000
+
+      assert_receive {:test_loopctl,
+                      {:trace, %{"run_id" => ^run_id, "events" => [%{"seq" => 1}]}}},
+                     3_000
+
+      assert_receive {:test_loopctl,
+                      {:trace, %{"run_id" => ^run_id, "events" => [%{"seq" => 2}]}}},
+                     3_000
+
+      # Past the refused range, batches are full size again.
+      more =
+        Enum.map_join(3..7, fn seq ->
+          JSON.encode!(%{
+            "run_id" => run_id,
+            "seq" => seq,
+            "event_id" => Integer.to_string(seq),
+            "parent" => "0",
+            "ts" => "2026-09-13T06:00:00Z",
+            "type" => "claude.tool_use",
+            "data" => %{}
+          }) <> "\n"
+        end)
+
+      File.write!(Path.join(run_dir, "trace.ndjson"), more, [:append])
+
+      assert_receive {:test_loopctl,
+                      {:trace, %{"run_id" => ^run_id, "events" => [_, _, _, _, _]}}},
+                     3_000
+    end
+
+    test "a size refusal repeated for one event escalates to a stub, then gives the run up",
+         ctx do
+      run_id = ctx.run_id
+      too_large = {:error, %{reason: "event_data_too_large", seq: 1}}
+      TestLoopctl.put(:trace_replies, [too_large, too_large, too_large])
+      run_dir = dispatched_run(ctx, 0..2)
+      shipping_control(ctx)
+
+      assert_receive {:test_loopctl,
+                      {:trace,
+                       %{"run_id" => ^run_id, "events" => [_, %{"data" => %{"n" => 1}}, _]}}},
+                     5_000
+
+      assert_receive {:test_loopctl,
+                      {:trace,
+                       %{
+                         "run_id" => ^run_id,
+                         "events" => [_, %{"data" => %{"omitted" => "data_too_large"}}, _]
+                       }}},
+                     3_000
+
+      assert_receive {:test_loopctl,
+                      {:trace,
+                       %{
+                         "run_id" => ^run_id,
+                         "events" => [_, %{"type" => "trace.unshippable"}, _]
+                       }}},
+                     3_000
+
+      :ok = wait_until(fn -> File.exists?(Path.join(run_dir, "trace_ship.json")) end, 3_000)
+
+      assert %{"abandoned" => "event_data_too_large"} =
+               JSON.decode!(File.read!(Path.join(run_dir, "trace_ship.json")))
+    end
+
+    test "a one-event batch refused as too large ships that event as a stub", ctx do
+      run_id = ctx.run_id
+      TestLoopctl.put(:trace_replies, [{:error, %{reason: "batch_too_large", max_events: 20}}])
+      dispatched_run(ctx, 0..0)
+      shipping_control(ctx)
+
+      assert_receive {:test_loopctl,
+                      {:trace,
+                       %{"run_id" => ^run_id, "events" => [%{"type" => "claude.tool_use"}]}}},
+                     5_000
+
+      assert_receive {:test_loopctl,
+                      {:trace,
+                       %{"run_id" => ^run_id, "events" => [%{"type" => "trace.unshippable"}]}}},
+                     3_000
+    end
+
+    test "a dispatch loopctl does not yet hold as accepted is retried on the poll, not given up",
+         ctx do
+      run_id = ctx.run_id
+      not_yet = {:error, %{reason: "dispatch_not_accepted"}}
+      TestLoopctl.put(:trace_replies, [not_yet, not_yet])
+      run_dir = dispatched_run(ctx, 0..2)
+      shipping_control(ctx, trace_poll_ms: 100)
+
+      assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id}}}, 5_000
+      assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id}}}, 3_000
+      assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id}}}, 3_000
+      :ok = wait_until(fn -> File.exists?(Path.join(run_dir, "trace_ship.json")) end, 3_000)
+      assert %{"done" => true} = JSON.decode!(File.read!(Path.join(run_dir, "trace_ship.json")))
+    end
+
+    test "a run waiting on loopctl does not hold up the runs after it", ctx do
+      waiting_id = ctx.run_id
+      ready_id = LoopctlRunner.Session.uuid4()
+      TestLoopctl.put(:trace_refuse_runs, %{waiting_id => %{reason: "dispatch_not_accepted"}})
+
+      # Run directories are listed in path order: "dispatched-run" comes before "zz-ready".
+      dispatched_run(ctx, 0..2)
+      ready_dir = dispatched_run(%{ctx | run_id: ready_id}, 0..2, %{}, "zz-ready")
+
+      pid = shipping_control(ctx, trace_poll_ms: 1_000)
+      assert_receive {:test_loopctl, {:trace, %{"run_id" => ^waiting_id}}}, 5_000
+
+      :ok = wait_until(fn -> File.exists?(Path.join(ready_dir, "trace_ship.json")) end, 3_000)
+      assert %{^ready_id => 2} = Control.info(pid).trace_acked
+      # The waiting run retries once per poll, not at the 50ms pace: two seconds on it has used
+      # a few of its 30 retries and is still waiting, not given up.
+      Process.sleep(2_000)
+      refute File.exists?(Path.join(ctx.config.runs_dir, "dispatched-run/trace_ship.json"))
+    end
+
+    test "runs with work take turns rather than one shipping its whole backlog first", ctx do
+      long_id = ctx.run_id
+      short_id = LoopctlRunner.Session.uuid4()
+      long_dir = dispatched_run(ctx, 0..199)
+      short_dir = dispatched_run(%{ctx | run_id: short_id}, 0..2, %{}, "zz-short")
+      shipping_control(ctx)
+
+      :ok = wait_until(fn -> File.exists?(Path.join(short_dir, "trace_ship.json")) end, 5_000)
+      refute File.exists?(Path.join(long_dir, "trace_ship.json"))
+      assert_received {:test_loopctl, {:trace, %{"run_id" => ^long_id}}}
+    end
+
+    test "a run that starts while another ships its backlog is found within a poll", ctx do
+      long_dir = dispatched_run(ctx, 0..399)
+      late_id = LoopctlRunner.Session.uuid4()
+      shipping_control(ctx, trace_poll_ms: 300)
+
+      assert_receive {:test_loopctl, {:trace, %{"run_id" => _}}}, 5_000
+      late_dir = dispatched_run(%{ctx | run_id: late_id}, 0..2, %{}, "zz-late")
+
+      :ok = wait_until(fn -> File.exists?(Path.join(late_dir, "trace_ship.json")) end, 3_000)
+      refute File.exists?(Path.join(long_dir, "trace_ship.json"))
+    end
+
+    test "a dispatch that stays unknown is given up after the retries run out", ctx do
+      run_id = ctx.run_id
+      TestLoopctl.put(:trace_replies, List.duplicate({:error, %{reason: "unknown_dispatch"}}, 40))
+      run_dir = dispatched_run(ctx, 0..2)
+      shipping_control(ctx, trace_poll_ms: 20)
+
+      assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id}}}, 5_000
+      :ok = wait_until(fn -> File.exists?(Path.join(run_dir, "trace_ship.json")) end, 8_000)
+
+      assert %{"abandoned" => "unknown_dispatch"} =
+               JSON.decode!(File.read!(Path.join(run_dir, "trace_ship.json")))
+    end
+
+    test "a done run whose trace grows afterwards ships the new lines", ctx do
+      run_id = ctx.run_id
+      run_dir = dispatched_run(ctx, 0..2)
+      shipping_control(ctx)
+
+      :ok = wait_until(fn -> File.exists?(Path.join(run_dir, "trace_ship.json")) end, 5_000)
+
+      # What the reaper does to a finished run when a later run starts.
+      reaped =
+        JSON.encode!(%{
+          "run_id" => run_id,
+          "seq" => 3,
+          "event_id" => "3",
+          "parent" => "0",
+          "ts" => "2026-09-13T06:00:00Z",
+          "type" => "run.reaped",
+          "data" => %{}
+        })
+
+      File.write!(Path.join(run_dir, "trace.ndjson"), reaped <> "\n", [:append])
+
+      assert_receive {:test_loopctl,
+                      {:trace, %{"run_id" => ^run_id, "events" => [%{"type" => "run.reaped"}]}}},
+                     3_000
+    end
+
+    test "a settle that cannot be recorded is logged, and neither crashes nor reships", ctx do
+      run_id = ctx.run_id
+      run_dir = dispatched_run(ctx, 0..2)
+      File.chmod!(run_dir, 0o555)
+      on_exit(fn -> File.chmod(run_dir, 0o755) end)
+
+      log =
+        capture_log(fn ->
+          pid = shipping_control(ctx)
+          assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id}}}, 5_000
+          :ok = wait_until(fn -> Control.info(pid).trace_acked == %{run_id => 2} end, 3_000)
+          refute_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id}}}, 800
+          assert Process.alive?(pid)
+        end)
+
+      # Settled in memory: not retried, and not logged again, on every later poll.
+      assert length(String.split(log, "recording it failed")) == 2
+      refute File.exists?(Path.join(run_dir, "trace_ship.json"))
+    end
+
+    test "shipping a long trace scans run state on polls, not before every batch", ctx do
+      run_id = ctx.run_id
+      run_dir = dispatched_run(ctx, 0..199)
+      test = self()
+
+      find_runs = fn runs_dir ->
+        send(test, :scanned_runs)
+        LoopctlRunner.TraceShip.runs(runs_dir)
+      end
+
+      shipping_control(ctx, trace_poll_ms: 60_000, trace_find_runs: find_runs)
+      :ok = wait_until(fn -> File.exists?(Path.join(run_dir, "trace_ship.json")) end, 10_000)
+      assert_received {:test_loopctl, {:trace, %{"run_id" => ^run_id}}}
+
+      # One scan at the join for a cursor and ten batches; the poll is a minute away.
+      assert_received :scanned_runs
+      refute_received :scanned_runs
+    end
+
+    test "a rejoin asks for the cursor again before shipping on", ctx do
+      run_id = ctx.run_id
+      # Hold the run live so it is never marked done between the channels.
+      run_dir =
+        dispatched_run(
+          ctx,
+          0..2,
+          Map.merge(LoopctlRunner.Owner.current(), %{"status" => "running"})
+        )
+
+      pid = shipping_control(ctx)
+      assert_receive {:test_loopctl, {:trace_cursor, %{"run_id" => ^run_id}}}, 5_000
+      assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id}}}, 3_000
+
+      TestLoopctl.disconnect_runner()
+      :ok = wait_until(fn -> not Control.info(pid).joined end, 3_000)
+      assert Control.info(pid).trace_acked == %{}
+      :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+
+      assert_receive {:test_loopctl, {:trace_cursor, %{"run_id" => ^run_id}}}, 3_000
+      refute File.exists?(Path.join(run_dir, "trace_ship.json"))
+    end
+  end
+
   defp collect_dispatch_replies(acc \\ []) do
     receive do
       {:test_loopctl, {:dispatch_reply, reply}} -> collect_dispatch_replies([reply | acc])

@@ -28,6 +28,20 @@ defmodule LoopctlRunner.Control do
   channel closed is kept and resent after the rejoin: loopctl does not dispatch again, and it
   answers an identical repeat `ok`.
 
+  ## Trace shipping
+
+  While joined, the client ships run traces as `LoopctlRunner.TraceShip` decides: a
+  `trace_cursor` for each shippable run after every join (loopctl replays nothing on a
+  rejoin), then `trace` batches after the acknowledged seq, one push in flight at a time, the
+  next sent no sooner than the contract's min interval after the last reply. With nothing to
+  send it looks again every `:trace_poll_ms`, which is also the only time it rescans the run
+  directories. Refusals are handled by reason: `rate_limited` waits; a size refusal splits the
+  batch or ships the named event without its data; `invalid_payload` narrows the batch to one
+  event and ships that event as a stub (all three logged as errors, since every batch is
+  already checked against the contract and the byte rule); and a dispatch loopctl will no
+  longer take gives the run up. A settle that cannot be written to disk is kept in memory and
+  logged once; it never takes the connection down.
+
   ## Refusals
 
   Join replies are read by `reason` (loopctl `RunnerChannel`):
@@ -55,7 +69,7 @@ defmodule LoopctlRunner.Control do
 
   require Logger
 
-  alias LoopctlRunner.{Config, Contract, ControlConfig, Health, Runs}
+  alias LoopctlRunner.{Config, Contract, ControlConfig, Health, Runs, TraceShip}
 
   @reconnect_backoff_ms [1_000, 2_000, 5_000, 10_000, 30_000, 60_000, 120_000]
   # The join budget is 30 per minute; this ladder never approaches it.
@@ -186,7 +200,32 @@ defmodule LoopctlRunner.Control do
             reply_backlog: [],
             reply_timer: nil,
             dispatch_reply_retry_ms:
-              Keyword.get(opts, :dispatch_reply_retry_ms, dispatch_reply_retry_ms())
+              Keyword.get(opts, :dispatch_reply_retry_ms, dispatch_reply_retry_ms()),
+            # The trace shipper (TraceShip): the acknowledged seq per run, learned by a cursor
+            # after each join; the one trace push awaiting its reply; its timer; per-run
+            # adjustments after a refusal; and how often an idle shipper looks for new lines.
+            # The trace shipper (TraceShip): the runs found at the last poll; where each run
+            # stands on this channel (acknowledged seq, and the byte offset after it once
+            # known); the one trace push awaiting its reply; its timer; per-run adjustments
+            # after a refusal; runs settled this session even if recording that failed.
+            trace_runs: nil,
+            trace_positions: %{},
+            trace_push: nil,
+            trace_timer: nil,
+            # run_id => {max events per batch, until this seq is acknowledged}
+            trace_max_events: %{},
+            # run_id => consecutive refusals that may be a race with the accept being recorded
+            trace_waiting: %{},
+            # run_id => monotonic ms before which the run is not tried again, so a run waiting
+            # on loopctl never holds up the others; and when run state was last rescanned.
+            trace_backoff: %{},
+            trace_refreshed_ms: nil,
+            trace_omit: MapSet.new(),
+            trace_stub: MapSet.new(),
+            trace_settled: %{},
+            trace_poll_ms: Keyword.get(opts, :trace_poll_ms, 2_000),
+            # TraceShip.runs/1, replaceable so a test can count how often run state is scanned.
+            trace_find_runs: Keyword.get(opts, :trace_find_runs, &TraceShip.runs/1)
           )
 
         {:ok, socket, {:continue, :connect}}
@@ -250,7 +289,8 @@ defmodule LoopctlRunner.Control do
        next_reconnect_ms: nil
      )
      |> schedule_status()
-     |> schedule_reply_backlog()}
+     |> schedule_reply_backlog()
+     |> schedule_trace(0, true)}
   end
 
   # How long the runner was out of the pool, so a rejoin line says what the outage cost.
@@ -320,7 +360,12 @@ defmodule LoopctlRunner.Control do
       status_pushes: [],
       dispatch_replies: %{},
       reply_backlog: carry_dispatch_replies(socket.assigns),
-      reply_timer: cancel_reply_timer(socket.assigns.reply_timer)
+      reply_timer: cancel_reply_timer(socket.assigns.reply_timer),
+      # loopctl replays nothing on a rejoin: every cursor is asked again on the next channel.
+      trace_positions: %{},
+      trace_runs: nil,
+      trace_push: nil,
+      trace_timer: cancel_reply_timer(socket.assigns.trace_timer)
     )
   end
 
@@ -399,6 +444,15 @@ defmodule LoopctlRunner.Control do
 
   def handle_info({:send_reply_backlog, _stale_token}, socket), do: {:noreply, socket}
 
+  # One trace step per tick, and only the current timer's tick on a joined channel.
+  def handle_info(
+        {:trace_tick, token, refresh?},
+        %{assigns: %{joined: true, trace_timer: {_timer, token}}} = socket
+      ),
+      do: {:noreply, socket |> assign(trace_timer: nil) |> trace_step(refresh?)}
+
+  def handle_info({:trace_tick, _stale_token, _refresh?}, socket), do: {:noreply, socket}
+
   def handle_info(_message, socket), do: {:noreply, socket}
 
   @impl Slipstream
@@ -431,6 +485,9 @@ defmodule LoopctlRunner.Control do
         status_push_pending: a.status_pushes != [],
         dispatch_replies_pending: map_size(a.dispatch_replies),
         dispatch_reply_backlog: length(a.reply_backlog),
+        trace_acked:
+          Map.new(a.trace_positions, fn {run_id, %{acked: acked}} -> {run_id, acked} end),
+        trace_push_pending: a.trace_push != nil,
         # The value this runner reports, which is not the set_draining/2 flag while no dispatch
         # can be accepted. It is what the next status carries, not proof loopctl received it:
         # runner_pool can lag it while a push is pending, rate-limited or lost with the socket.
@@ -448,6 +505,9 @@ defmodule LoopctlRunner.Control do
     cond do
       Map.has_key?(socket.assigns.dispatch_replies, ref) ->
         dispatch_reply_answered(ref, reply, socket)
+
+      match?(%{ref: ^ref}, socket.assigns.trace_push) ->
+        {:ok, trace_answered(reply, socket)}
 
       List.keymember?(socket.assigns.status_pushes, ref, 0) ->
         handle_status_reply(reply, settle_status(socket, ref, reply))
@@ -723,6 +783,400 @@ defmodule LoopctlRunner.Control do
         )
     end
   end
+
+  # --- Trace shipping (TraceShip decides, this process pushes) ---
+
+  # A poll tick re-reads the run directories; a tick after a reply works from the runs found
+  # then, so shipping a long trace at the contract's 50ms pace does not rescan every run's
+  # state (and spawn `ps` for each live one) twenty times a second.
+  defp schedule_trace(socket, ms, refresh? \\ false)
+
+  defp schedule_trace(%{assigns: %{trace_timer: timer}} = socket, _ms, _refresh?)
+       when timer != nil,
+       do: socket
+
+  defp schedule_trace(socket, ms, refresh?) do
+    token = make_ref()
+    timer = Process.send_after(self(), {:trace_tick, token, refresh?}, ms)
+    assign(socket, trace_timer: {timer, token})
+  end
+
+  defp poll_trace(socket), do: schedule_trace(socket, socket.assigns.trace_poll_ms, true)
+
+  # The first run with something to do gets one push; a run finished and fully acknowledged is
+  # settled on the way. With nothing to do, look again after the poll.
+  defp trace_step(%{assigns: %{trace_push: push}} = socket, _refresh?) when push != nil,
+    do: socket
+
+  defp trace_step(socket, refresh?) do
+    now = now_ms()
+    socket = refresh_runs(socket, refresh?, now)
+
+    live =
+      Enum.reject(
+        socket.assigns.trace_runs,
+        &(settled_here?(socket, &1) or backed_off?(socket, &1, now))
+      )
+
+    {action, socket} =
+      Enum.reduce_while(live, {nil, socket}, fn run, {_, socket} ->
+        case trace_action(run, socket) do
+          {:skip, socket} -> {:cont, {nil, socket}}
+          {action, socket} -> {:halt, {action, socket}}
+        end
+      end)
+
+    case action do
+      nil ->
+        poll_trace(socket)
+
+      {:cursor, run} ->
+        socket
+        |> take_turn(run)
+        |> push_trace(run, :cursor, "trace_cursor", %{"run_id" => run.run_id}, nil)
+
+      {:batch, run, payload, next} ->
+        socket |> take_turn(run) |> push_trace(run, :batch, "trace", payload, next)
+    end
+  end
+
+  # Settled this session: given up for good, or done while the trace is still the size it was
+  # then. A done trace that has grown (the reaper appends to it) ships again.
+  defp settled_here?(socket, run) do
+    case socket.assigns.trace_settled[run.run_id] do
+      nil -> false
+      :abandoned -> true
+      {:done, bytes} -> TraceShip.trace_bytes(run) <= bytes
+    end
+  end
+
+  defp trace_action(run, socket) do
+    a = socket.assigns
+
+    case Map.fetch(a.trace_positions, run.run_id) do
+      :error ->
+        {{:cursor, run}, socket}
+
+      {:ok, position} ->
+        opts = [
+          max_events: batch_cap(a.trace_max_events, run, position.acked),
+          omit_seqs: seqs_for(a.trace_omit, run),
+          stub_seqs: seqs_for(a.trace_stub, run)
+        ]
+
+        case TraceShip.next_batch(run, position, opts) do
+          {:ok, payload, next} ->
+            {{:batch, run, payload, next}, socket}
+
+          {:none, idle} ->
+            {:skip, socket |> put_position(run, idle) |> settle_if_shipped(run, idle.acked)}
+
+          {:error, errors} ->
+            {:skip, give_up(socket, run, "local_invalid_payload", errors)}
+        end
+    end
+  end
+
+  defp seqs_for(set, run), do: for({run_id, seq} <- set, run_id == run.run_id, do: seq)
+
+  # Rescanned on a poll, and at least once a poll interval even while a long backlog ships,
+  # so a run that starts meanwhile is not left waiting for the backlog to finish.
+  defp refresh_runs(%{assigns: a} = socket, refresh?, now) do
+    stale? = a.trace_refreshed_ms == nil or now - a.trace_refreshed_ms >= a.trace_poll_ms
+
+    if refresh? or a.trace_runs == nil or stale?,
+      do:
+        assign(socket, trace_runs: a.trace_find_runs.(a.config.runs_dir), trace_refreshed_ms: now),
+      else: socket
+  end
+
+  # The monotonic clock may be negative, so no backoff is the absence of an entry, never 0.
+  defp backed_off?(socket, run, now) do
+    case Map.fetch(socket.assigns.trace_backoff, run.run_id) do
+      {:ok, until} -> until > now
+      :error -> false
+    end
+  end
+
+  # The run that just got a push goes to the back, so every run with work takes turns.
+  defp take_turn(socket, run) do
+    {mine, others} = Enum.split_with(socket.assigns.trace_runs, &(&1.run_id == run.run_id))
+    assign(socket, trace_runs: others ++ mine)
+  end
+
+  # This run waits a poll interval; the others are tried at the contract's pace meanwhile.
+  defp back_off(socket, run) do
+    until = now_ms() + socket.assigns.trace_poll_ms
+
+    socket
+    |> assign(trace_backoff: Map.put(socket.assigns.trace_backoff, run.run_id, until))
+    |> schedule_trace(TraceShip.min_interval_ms("trace"))
+  end
+
+  # A narrowed batch size holds only until the refused range is acknowledged.
+  defp batch_cap(caps, run, acked) do
+    case caps[run.run_id] do
+      {max, until} when acked < until -> max
+      _ -> TraceShip.max_events()
+    end
+  end
+
+  defp narrow(socket, run, max, until),
+    do:
+      assign(socket,
+        trace_max_events: Map.put(socket.assigns.trace_max_events, run.run_id, {max, until})
+      )
+
+  # A run still in flight is not finished whatever it has shipped: skip the tail read for it.
+  defp settle_if_shipped(%{} = socket, %{finished?: false}, _acked), do: socket
+
+  defp settle_if_shipped(socket, run, acked) do
+    {trace_bytes, last} = TraceShip.last_seq(run)
+
+    if acked >= last do
+      case TraceShip.mark_done(run, acked, trace_bytes) do
+        :ok ->
+          Logger.info("trace shipped in full through seq #{acked}", trace_ids(run))
+
+        {:error, reason} ->
+          Logger.warning(
+            "trace shipped in full through seq #{acked}, but recording it failed " <>
+              "(#{inspect(reason)}); it will be asked about again after a restart",
+            trace_ids(run)
+          )
+      end
+
+      assign(socket,
+        trace_settled: Map.put(socket.assigns.trace_settled, run.run_id, {:done, trace_bytes})
+      )
+    else
+      socket
+    end
+  end
+
+  defp give_up(socket, run, reason, detail) do
+    Logger.warning(
+      "loopctl will not take this run's trace (#{reason}): #{inspect(detail)}; " <>
+        "no longer shipping it",
+      trace_ids(run)
+    )
+
+    with {:error, error} <- TraceShip.mark_abandoned(run, reason) do
+      Logger.warning(
+        "recording that the trace was given up failed (#{inspect(error)}); " <>
+          "it is skipped until a restart",
+        trace_ids(run)
+      )
+    end
+
+    assign(socket, trace_settled: Map.put(socket.assigns.trace_settled, run.run_id, :abandoned))
+  end
+
+  defp push_trace(socket, run, kind, event, payload, next) do
+    case push(socket, socket.assigns.topic, event, payload) do
+      {:ok, ref} ->
+        count = if kind == :batch, do: length(payload["events"]), else: 0
+        first = if kind == :batch, do: hd(payload["events"])["seq"]
+        push = %{ref: ref, kind: kind, run: run, next: next, count: count, first: first}
+        assign(socket, trace_push: push)
+
+      {:error, reason} ->
+        Logger.warning("#{event} not sent: #{inspect(reason)}", trace_ids(run))
+        poll_trace(socket)
+    end
+  end
+
+  defp trace_answered(reply, socket) do
+    push = socket.assigns.trace_push
+    socket = assign(socket, trace_push: nil)
+
+    case reply do
+      {:ok, %{"acked_seq" => acked}} when is_integer(acked) -> trace_acked(socket, push, acked)
+      {:error, %{"reason" => _} = refusal} -> trace_refused(socket, push, refusal)
+      other -> trace_unexpected(socket, push, other)
+    end
+  end
+
+  defp trace_acked(socket, %{kind: :cursor, run: run}, acked) do
+    Logger.info("trace cursor: loopctl holds this run through seq #{acked}", trace_ids(run))
+
+    socket
+    |> put_position(run, %{acked: acked, offset: nil})
+    |> schedule_trace(TraceShip.min_interval_ms("trace_cursor"))
+  end
+
+  defp trace_acked(socket, %{kind: :batch, run: run, next: next}, acked) do
+    before = socket.assigns.trace_positions[run.run_id]
+
+    cond do
+      # The batch landed exactly: resume from where its last line ends.
+      acked == next.acked ->
+        socket
+        |> put_position(run, next)
+        |> assign(trace_waiting: Map.delete(socket.assigns.trace_waiting, run.run_id))
+        |> schedule_trace(TraceShip.min_interval_ms("trace"))
+
+      # loopctl holds more than this batch reached: its acknowledgement wins, offset unknown.
+      acked > next.acked ->
+        socket
+        |> put_position(run, %{acked: acked, offset: nil})
+        |> schedule_trace(TraceShip.min_interval_ms("trace"))
+
+      # Stored but not contiguous: resending the same batch at once would spin.
+      true ->
+        Logger.warning(
+          "trace batch through seq #{next.acked} left the acknowledgement at #{acked} " <>
+            "(was #{inspect(before && before.acked)}); retrying after the poll",
+          trace_ids(run)
+        )
+
+        socket
+        |> put_position(run, %{acked: acked, offset: nil})
+        |> back_off(run)
+    end
+  end
+
+  defp put_position(socket, run, position),
+    do:
+      assign(socket,
+        trace_positions: Map.put(socket.assigns.trace_positions, run.run_id, position)
+      )
+
+  @given_up ~w(stale_claim_epoch run_mismatch)
+  # A trace can reach loopctl before the dispatch's acceptance is recorded (the reply may be
+  # rate-limited or carried across a rejoin), so these are retried on the poll for a while.
+  @not_yet ~w(unknown_dispatch dispatch_not_accepted)
+  @max_not_yet 30
+
+  defp trace_refused(socket, _push, %{"reason" => "rate_limited"} = refusal) do
+    interval = Map.get(refusal, "min_interval_ms", TraceShip.min_interval_ms("trace"))
+    schedule_trace(socket, interval)
+  end
+
+  # Every batch is checked against the contract and the byte rule before it is sent, so each of
+  # these means loopctl disagrees. Each is logged as an error and narrowed until it cannot be:
+  # a batch halves (or goes one event at a time), a size refusal of one event drops its data,
+  # and a repeat refusal of one event ships it as a stub. Only a refused stub gives the run up.
+  defp trace_refused(socket, %{run: run} = push, %{"reason" => "batch_too_large"} = refusal),
+    do: narrow_or_escalate(socket, push, refusal, div(push.count, 2), "too large", run)
+
+  defp trace_refused(
+         socket,
+         %{run: run},
+         %{"reason" => "event_data_too_large", "seq" => seq} = refusal
+       )
+       when is_integer(seq) do
+    if MapSet.member?(socket.assigns.trace_omit, {run.run_id, seq}) do
+      escalate_event(socket, run, seq, refusal)
+    else
+      Logger.error(
+        "loopctl refused trace event #{seq} as too large: #{inspect(refusal)}; " <>
+          "shipping it without its data",
+        trace_ids(run)
+      )
+
+      socket
+      |> assign(trace_omit: MapSet.put(socket.assigns.trace_omit, {run.run_id, seq}))
+      |> schedule_trace(TraceShip.min_interval_ms("trace"))
+    end
+  end
+
+  defp trace_refused(socket, %{run: run} = push, %{"reason" => "event_data_too_large"} = refusal),
+    do: narrow_or_escalate(socket, push, refusal, div(push.count, 2), "too large", run)
+
+  defp trace_refused(socket, %{run: run} = push, %{"reason" => "invalid_payload"} = refusal),
+    do: narrow_or_escalate(socket, push, refusal, 1, "invalid", run)
+
+  defp trace_refused(socket, %{run: run}, %{"reason" => reason} = refusal)
+       when reason in @given_up do
+    socket |> give_up(run, reason, refusal) |> schedule_trace(TraceShip.min_interval_ms("trace"))
+  end
+
+  defp trace_refused(socket, %{run: run}, %{"reason" => reason} = refusal)
+       when reason in @not_yet do
+    tries = Map.get(socket.assigns.trace_waiting, run.run_id, 0) + 1
+
+    cond do
+      tries > @max_not_yet ->
+        socket
+        |> give_up(run, reason, refusal)
+        |> schedule_trace(TraceShip.min_interval_ms("trace"))
+
+      tries == 1 ->
+        Logger.warning(
+          "loopctl does not yet hold this run's dispatch as accepted (#{reason}); " <>
+            "retrying on the poll, up to #{@max_not_yet} times",
+          trace_ids(run)
+        )
+
+        socket
+        |> assign(trace_waiting: Map.put(socket.assigns.trace_waiting, run.run_id, tries))
+        |> back_off(run)
+
+      true ->
+        socket
+        |> assign(trace_waiting: Map.put(socket.assigns.trace_waiting, run.run_id, tries))
+        |> back_off(run)
+    end
+  end
+
+  defp trace_refused(socket, push, refusal), do: trace_unexpected(socket, push, {:error, refusal})
+
+  defp narrow_or_escalate(
+         socket,
+         %{count: count, next: next},
+         refusal,
+         fewer,
+         what,
+         run
+       )
+       when count > 1 do
+    fewer = max(1, fewer)
+
+    Logger.error(
+      "loopctl refused a #{count}-event trace batch as #{what}: #{inspect(refusal)}; " <>
+        "sending #{fewer} at a time through seq #{next.acked}",
+      trace_ids(run)
+    )
+
+    socket
+    |> narrow(run, fewer, next.acked)
+    |> schedule_trace(TraceShip.min_interval_ms("trace"))
+  end
+
+  defp narrow_or_escalate(socket, %{first: first}, refusal, _fewer, _what, run),
+    do: escalate_event(socket, run, first, refusal)
+
+  # One event refused whole: ship it as a stub, and give up only if the stub is refused too.
+  defp escalate_event(socket, run, seq, refusal) do
+    if MapSet.member?(socket.assigns.trace_stub, {run.run_id, seq}) do
+      socket
+      |> give_up(run, refusal["reason"], refusal)
+      |> schedule_trace(TraceShip.min_interval_ms("trace"))
+    else
+      Logger.error(
+        "loopctl refused trace event #{seq} (#{refusal["reason"]}): #{inspect(refusal)}; " <>
+          "shipping it as a stub",
+        trace_ids(run)
+      )
+
+      socket
+      |> assign(trace_stub: MapSet.put(socket.assigns.trace_stub, {run.run_id, seq}))
+      |> schedule_trace(TraceShip.min_interval_ms("trace"))
+    end
+  end
+
+  defp trace_unexpected(socket, %{kind: kind, run: run}, reply) do
+    Logger.warning(
+      "unexpected reply to a #{kind} trace push: #{inspect(reply)}; retrying after the poll",
+      trace_ids(run)
+    )
+
+    back_off(socket, run)
+  end
+
+  defp trace_ids(run),
+    do: [run_id: run.run_id, dispatch_id: run.dispatch_id, claim_epoch: run.claim_epoch]
 
   defp fresh_join_payload(socket) do
     a = socket.assigns

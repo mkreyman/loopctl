@@ -17,6 +17,12 @@ that keeps this machine joined to loopctl's runner pool (1b), on runner contract
 accepts no dispatches until build order step 6: it reports `draining: true` and answers any
 `dispatch` with a `dispatch_reply` refusal, so loopctl records why rather than waiting on it.
 
+The daemon also ships run traces (`trace` and `trace_cursor`): after every join it asks loopctl
+where each run's stored trace ends and sends the lines after it, in batches within the
+contract's limits. loopctl stores a trace only for a dispatch this runner accepted, so a run ships
+only when its `state.json` carries `dispatch_id` and `claim_epoch`; hand-filed runs never do, and
+until dispatches are accepted nothing ships in production.
+
 ### The daemon
 
 1. Enroll the machine with the `runner_enroll` tool of loopctl-mcp-server 2.92.0 or later, from a
@@ -82,6 +88,7 @@ reserves capacity on a machine that cannot start a session.
   - `last_disconnect`, `connect_attempts` and `next_reconnect_ms`;
   - `last_status_rtt_ms`, `last_status_acked_at` and `status_push_pending`;
   - `dispatch_replies_pending` and `dispatch_reply_backlog` (rate-limited replies waiting);
+  - `trace_acked` (the acknowledged seq per run on this channel) and `trace_push_pending`;
   - `sample_error`, `last_refusal` and `token_failures`.
 - **The pool, as loopctl sees it:** `runner_pool`. It lists joined runners only, so a runner
   missing from it while `joined` is true is a disagreement worth reporting to loopctl.
@@ -101,10 +108,18 @@ What the log says in each failure:
 | a dispatch that cannot be answered | `dispatch not answered: ...`, when it has no usable `dispatch_id` and `claim_epoch` or a refusal would fail the contract |
 | loopctl refuses that reply | `loopctl refused the dispatch_reply (<reason>)`; `rate_limited` waits in the backlog, the rest are not resent |
 | the channel drops with a reply outstanding | `resending N dispatch_reply(s) loopctl had not recorded when the channel closed` after the rejoin; `no longer needs the resent dispatch_reply (<reason>)` when the claim moved on meanwhile |
+| a run's trace is being shipped | `trace cursor: loopctl holds this run through seq N`, then `trace shipped in full through seq N` once the run has finished, all with `run_id`, `dispatch_id` and `claim_epoch` |
+| loopctl does not yet hold the dispatch as accepted | `loopctl does not yet hold this run's dispatch as accepted (unknown_dispatch or dispatch_not_accepted)`, once; retried on each poll, given up after 30 |
+| loopctl will not take a trace | `loopctl will not take this run's trace (<reason>)`; the run's `trace_ship.json` records it and the run is not shipped again |
+| the runner and loopctl disagree on a size | `loopctl refused a N-event trace batch as too large` or `refused trace event N as too large` at error level: a byte-rule mismatch to report; shipping continues by splitting or by dropping that event's data |
+| loopctl cannot store an event | `loopctl refused a N-event trace batch as invalid`, then `refused trace event N (invalid_payload): ... shipping it as a stub`, at error level; the batch is narrowed only through the refused range, and a stub that is refused too gives the run up |
+| a finished run's trace grows | the reaper's `run.reaped` lines ship on the next poll; `trace_ship.json` records the trace size it was done at |
+| `trace_ship.json` cannot be written | `trace shipped in full through seq N, but recording it failed`, once; the run is asked about again after a restart |
 | loopctl is ahead of this build | `loopctl sent "<event>", which this runner (contract X) does not handle`, once per event |
 
 A run's own record is its directory under `runs_dir`: `state.json`, `trace.ndjson`, `stdout.ndjson`
-and `stderr.log`, and `mix loopctl.tree <run dir>` prints the trace as a tree.
+and `stderr.log`, plus `trace_ship.json` once its trace is fully shipped or given up on, and
+`mix loopctl.tree <run dir>` prints the trace as a tree.
 
 ### Hand-filed runs
 
