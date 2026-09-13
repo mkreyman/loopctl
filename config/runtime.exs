@@ -604,6 +604,14 @@ if config_env() == :prod do
 
   config :loopctl, :dns_cluster_query, System.get_env("DNS_CLUSTER_QUERY")
 
+  # Whether a peer machine may be suspended (`auto_stop_machines`), so ClusterReadiness
+  # reports fewer peers than EXPECTED_APP_NODES as :peers_may_be_suspended, not an alarm.
+  config :loopctl,
+         :cluster_peers_may_suspend,
+         Loopctl.ClusterReadiness.parse_peers_may_suspend(
+           System.get_env("CLUSTER_PEERS_MAY_SUSPEND")
+         )
+
   config :loopctl, LoopctlWeb.Endpoint,
     url: [host: host, port: 443, scheme: "https"],
     http: [

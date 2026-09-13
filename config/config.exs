@@ -389,7 +389,17 @@ config :logger, :default_handler,
        :duration_ms,
        :repo,
        :source,
-       :endpoint
+       :endpoint,
+       # Issue #815: runner control-plane correlation. A key not listed here is DROPPED
+       # from the JSON line even when set, which is how these went missing in production.
+       :runner_id,
+       :runner_name,
+       :story_id,
+       :dispatch_id,
+       :run_id,
+       :claim_epoch,
+       :node,
+       :machine
      ]}
 
 # Configure esbuild (the version is required)

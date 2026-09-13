@@ -6,6 +6,78 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **The production machines form one BEAM cluster.** Until now both Fly machines booted as
+  `loopctl@127.0.0.1` with IPv4 distribution and no `DNS_CLUSTER_QUERY`, so each was an
+  island: PubSub (runner dispatch delivery, revocation, cache invalidation) and the runner
+  pool (Presence) were node-local, and a runner that reconnected to the other machine
+  vanished from the first one's pool.
+
+  **`rel/env.sh.eex`** names the node `loopctl-<release>@$FLY_PRIVATE_IP` and exports
+  `ERL_AFLAGS="-proto_dist inet6_tcp"` when `FLY_PRIVATE_IP` is set (Fly's private network
+  is IPv6-only). Off Fly nothing changes. **`fly.toml` `[env]`** gains
+  `DNS_CLUSTER_QUERY = "loopctl.internal"`, `EXPECTED_APP_NODES = "2"` (the machines that
+  can run, which the DB connection budget needs) and `CLUSTER_PEERS_MAY_SUSPEND = "true"`:
+  with `auto_stop_machines` the second machine is usually suspended, so a missing peer reads
+  `peers_may_be_suspended` instead of the `expected_peers_missing` alarm — only while
+  `loopctl.internal`, which lists started machines only, lists no other machine this node
+  is not connected to. Two running machines that fail to connect still alarm.
+
+  **No secret to set, no deploy ordering.** The release carries its own cookie, and the node
+  basename carries the release, so only machines of one release cluster. **Before deploying,
+  confirm neither `DNS_CLUSTER_QUERY` nor `EXPECTED_APP_NODES` exists as a Fly secret**
+  (`fly secrets list`): a secret overrides `[env]`. During a rolling deploy the replaced
+  machine and the one still on the previous release do not see each other until the second
+  is replaced as well — the runner pool on each shows only its own runners for that window,
+  as it did before this change.
+
+  **Also:** the SystemConfig refresh cron now broadcasts its refresh, so every connected
+  node re-reads `system_configs` each minute (it ran on one node per tick); the STH
+  enqueuer's cluster singleton resolves the duplicate leadership two nodes bring to a
+  connection by standing one down instead of `:global` killing it; and
+  `Loopctl.ClusterReadiness` warns at boot when `DNS_CLUSTER_QUERY` is set on a node no peer
+  could reach. The new untagged `loopctl.cluster.peers.connected` gauge reports the connected
+  peer count with no judgement. **After the deploy, with both machines started, verify:**
+  `loopctl.cluster.peers.connected` is 1 on both machines.
+
+- **Runner control plane observability (#815).**
+
+  **`fly.toml` now stops the VM with `kill_signal = "SIGTERM"` and `kill_timeout = 90`.** Fly's
+  default SIGINT dropped the BEAM into its break handler, so no deploy or restart ever ran the
+  application stop, drained a socket or logged anything about the runners it cut off. With
+  SIGTERM a stop drains the sockets (explicit drainers on `/live` and `/runner/socket` in
+  `endpoint.ex`), then Bandit and Oban; 90 s outlasts that 70 s window. **After the next
+  deploy, confirm the logs show `DRAINING`/`runner socket draining` and no `BREAK`.** A stop
+  now takes up to that long.
+
+  **Migration `20260914120000`** adds a nullable `runner_dispatches.pushed_at` (catalog-only,
+  no backfill, no long lock). The runner channel stamps it when it actually pushes a dispatch,
+  so a `sent` row with no `pushed_at` never reached a socket.
+
+  **Runner contract 1.2.0 (minor).** Before closing a runner's connection itself, loopctl pushes
+  `disconnecting` (`RunnerDisconnecting`) with a reason: `runner_revoked`,
+  `no_longer_authorized` or `server_shutdown`; a join refused as `not_authorized` carries
+  `disconnecting: "join_refused_not_authorized"` in its error reply. `priv/runner_contract/v1.json`
+  is regenerated. A 1.0/1.1 runner still joins and can ignore the new event. The exported
+  `x-connection.errors` map now also declares `join` (every `phx_join` refusal reason) and
+  `unknown_event`, which answers any event the contract does not name, every time.
+
+  **`GET /api/v1/runners/pool` entries gain `node` and `machine_id`** (nullable), and so do the
+  presence metas behind them. `machine_id` is `FLY_MACHINE_ID`, which Fly injects.
+
+  **Logs and metrics.** Production JSON logs now keep `runner_id`, `runner_name`, `story_id`,
+  `dispatch_id`, `run_id`, `claim_epoch`, `node` and `machine` metadata. New log lines:
+  runner channel close (reason, identity, node, machine, connected duration), every refused
+  runner message and join except `rate_limited` (an unknown event's line at most once a second
+  per channel; the counter below still counts every one), server-initiated disconnects, the runner
+  socket's connect refusal (now with client IP and the resolved key/runner id), refused and
+  dropped dispatches, refused `renew-claim` (presented and current epoch), and each reclaimed
+  or failed candidate of `ReclaimExpiredClaimsWorker`. New Prometheus counters
+  `loopctl_runners_message_refused_count{event,reason}` and
+  `loopctl_runners_ledger_rejected_by_database_count{operation,sqlstate}`. The Phoenix, repo
+  and VM metrics that were summaries — which the reporter dropped at boot, so they never
+  existed in Prometheus — are now distributions and last values under the same names; the two
+  `*.start.system_time` summaries were removed.
+
 - **`GET /api/v1/runners/pool` (#809).** The caller's tenant's CONNECTED runners, read from
   Presence: per machine name, `runner_id`, `joined_at`, `in_flight`, `draining`,
   `max_sessions`, the latest health `sample`, and `live_sockets` (above 1 means more than one
@@ -136,6 +208,50 @@ All notable changes to loopctl are documented here.
   reason; the rows still emit `updated_at`, which is therefore no longer the sort key.
 
 ### Added
+
+- **Runner contract 1.1.0: dispatch replies, a dispatch ledger and trace intake (#803).**
+  Migrations `20260913120000` and `20260913120100` create `runner_dispatches` (one row per
+  `dispatch_id` per tenant, written by `Loopctl.Runners.dispatch/3` BEFORE it broadcasts) and
+  `runner_trace_events` (unique on `(tenant_id, run_id, seq)`). Both are new, empty tables
+  with RLS enabled: no backfill, no lock on an existing table, safe to deploy ahead of any
+  runner using them. The runner channel accepts three new runner-to-control events —
+  `dispatch_reply`, `trace` and `trace_cursor` — and `priv/runner_contract/v1.json` is
+  regenerated at `x-contract-version` 1.1.0, now also carrying each event's stable error
+  `reason` codes and its limits (`x-connection.errors`, `x-connection.limits`: at most 20
+  events and 60,000 bytes per batch, 12,000 per event and 6,000 of `data` per event, all
+  counted by one published encoder-independent byte rule (`json_byte_rule`: 6 bytes per
+  string character plus 12 per string, 32 per scalar, 2 per container and per member), so a
+  runner that splits by it never sends a frame the 64 KB socket cap closes; large payloads
+  belong in object storage — `trace_max_seq`,
+  `min_interval_ms` — each event's own rate floor per channel: `status` 1000, `trace` 50,
+  `trace_cursor` 50 — and `dispatch_reply_burst`, 8 replies refilled one per 250 ms). Only
+  a valid message spends a limit. The bump is minor: a runner built against 1.0.0 still
+  joins, and nothing it sends changed. Every UUID a runner sends is normalized to
+  lowercase, and a NUL character in any runner-supplied string is `invalid_payload`. A reply
+  or trace value Postgres still refuses is logged and emitted as the
+  `[:loopctl, :runners, :ledger_rejected_by_database]` telemetry event.
+
+  **Both tables are read and written on the RLS `Loopctl.Repo` pool (`POOL_SIZE`), never on
+  `AdminRepo`.** Trace intake is high-volume by design — a runner resuming after a deploy
+  may send 20 batches a second — and AdminRepo's small pool is read on every authenticated
+  request, so it must not queue behind it.
+
+  **`dispatch/3` has three new refusals.** `{:error, :stale_claim_epoch}` when the dispatch's
+  `claim_epoch` is not the story's current `stories.claim_epoch` (or the story does not
+  exist), `{:error, :dispatch_id_conflict}` when the ledger already holds that `dispatch_id`
+  for a different runner, story, `claim_epoch` or kind, and `{:error, :dispatch_already_replied}`
+  when the runner already answered it. Re-dispatching an unanswered `dispatch_id` re-sends it
+  without a second row.
+
+  **Replies and trace are fenced on the story's claim epoch (#810's `stories.claim_epoch`).**
+  In the transaction that locks the ledger row, the story's current epoch is read under a
+  share lock; once a claim is released or reclaimed, a `dispatch_reply` or `trace` about a
+  dispatch of the old claim is `stale_claim_epoch` and its ledger row is marked `superseded`.
+  `runner_dispatches` also carries an index on `(tenant_id, story_id)`.
+
+  **Trace has no retention yet.** `runner_trace_events` grows until a prune worker is added
+  to `oban_config.ex`; the table cascades from its `runner_dispatches` row, so pruning old
+  ledger rows prunes their trace.
 
 - **GitHub webhook intake for the agent delivery loop, with reporter text held as untrusted
   data (#803, #804).** Migration `20260913110000` creates `intake_sources`,

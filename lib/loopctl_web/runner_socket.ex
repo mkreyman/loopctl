@@ -55,18 +55,38 @@ defmodule LoopctlWeb.RunnerSocket do
   def connect(_params, socket, connect_info) do
     with :ok <- throttle(connect_info),
          {:ok, token} <- fetch_token(connect_info),
-         {:ok, %{runner: runner, api_key: api_key}} <- Runners.authenticate(token) do
+         {:ok, %{runner: runner, api_key: api_key}} <- Runners.authenticate_identified(token) do
       {:ok,
        socket
        |> assign(:runner, runner)
        |> assign(:tenant_id, runner.tenant_id)
        |> assign(:api_key_id, api_key.id)}
     else
-      {:error, reason} ->
-        Logger.info("runner socket refused: #{inspect(reason)}")
-        :error
+      {:error, reason} -> refuse(connect_info, reason, %{})
+      {:error, reason, identity} -> refuse(connect_info, reason, identity)
     end
   end
+
+  # The refusal line an operator diagnoses from (issue #815): the reason, the client IP the
+  # throttle keyed on, and whatever the credential resolved to before it was refused. Never
+  # the token.
+  defp refuse(connect_info, reason, identity) do
+    ip = client_ip(connect_info)
+
+    Logger.info(
+      "runner socket refused: reason=#{inspect(reason)} client_ip=#{format_ip(ip)} " <>
+        "api_key_id=#{inspect(identity[:api_key_id])} tenant_id=#{inspect(identity[:tenant_id])} " <>
+        "runner_id=#{inspect(identity[:runner_id])}",
+      remote_ip: format_ip(ip),
+      tenant_id: identity[:tenant_id],
+      runner_id: identity[:runner_id]
+    )
+
+    :error
+  end
+
+  defp format_ip(nil), do: "unresolved"
+  defp format_ip(ip), do: ip |> :inet.ntoa() |> to_string()
 
   @impl true
   def id(socket), do: socket_id(socket.assigns.runner.id)

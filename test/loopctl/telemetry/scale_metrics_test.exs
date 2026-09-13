@@ -70,6 +70,7 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
     "loopctl.ingestion.backlog_gate.failed_open.jobs",
     "loopctl.knowledge.article_linking.corpus_size",
     "loopctl.cluster.peers.count",
+    "loopctl.cluster.peers.connected",
     "loopctl.egress.blocked.count",
     "loopctl.system_config.prime_failed.count"
   ]
@@ -1374,6 +1375,15 @@ defmodule Loopctl.Telemetry.ScaleMetricsTest do
       assert %Telemetry.Metrics.LastValue{} = gauge
       assert gauge.tags == [:status]
       refute :tenant_id in gauge.tags
+    end
+
+    test "the connected-peer reading is an untagged last_value of the same poll's count" do
+      reading = metric("loopctl.cluster.peers.connected")
+
+      assert %Telemetry.Metrics.LastValue{} = reading
+      assert reading.event_name == [:loopctl, :cluster, :peers]
+      assert reading.measurement == :count
+      assert reading.tags == []
     end
 
     test "cluster_peers_tags/1 emits ONLY the bounded status (defaults missing to \"unknown\")" do

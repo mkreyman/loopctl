@@ -26,6 +26,9 @@ defmodule Loopctl.Application do
     # write it observes.
     IngestionWriteStats.attach()
 
+    # Issue #815: a stopping node tells its runners why their sockets close.
+    LoopctlWeb.RunnerShutdownNotice.attach()
+
     # See https://hexdocs.pm/elixir/Supervisor.html
     # for other strategies and supported options
     opts = [strategy: :one_for_one, name: Loopctl.Supervisor]
@@ -76,6 +79,9 @@ defmodule Loopctl.Application do
       Loopctl.SystemConfig.CachePrimer,
       {DNSCluster, query: Application.get_env(:loopctl, :dns_cluster_query) || :ignore},
       {Phoenix.PubSub, name: Loopctl.PubSub},
+      # Re-reads the SystemConfig cache on this node when the refresh cron ran on a peer
+      # (the cron job runs on one node per tick). Needs PubSub and AdminRepo.
+      Loopctl.SystemConfig.RefreshListener,
       # Issue #801: the runner pool. Its tracker needs PubSub and must be up before
       # the Endpoint accepts a runner socket.
       Loopctl.Runners.Presence,
@@ -256,9 +262,15 @@ defmodule Loopctl.Application do
     # peers (EXPECTED_APP_NODES > 1) but Node.list/0 is empty, WARN that this node is
     # running un-clustered (node-local PubSub) so a machine-count bump can't silently
     # run un-clustered. WARN + runbook, NEVER a crash — a single node always boots.
-    # Prod only, rescue-wrapped, mirroring DbCapacity.warn_if_over_budget/0.
-    if Application.get_env(:loopctl, :env) == :prod,
-      do: Loopctl.ClusterReadiness.warn_if_expected_peers_missing()
+    # Prod only, rescue-wrapped (the whole of warn_if_expected_peers_missing/0 logs "boot
+    # check skipped" on a raise), mirroring DbCapacity.warn_if_over_budget/0. Off the boot
+    # path: it may make a (bounded) DNS lookup, and a boot check must not wait on a resolver.
+    if Application.get_env(:loopctl, :env) == :prod do
+      Task.Supervisor.start_child(
+        Loopctl.TaskSupervisor,
+        &Loopctl.ClusterReadiness.warn_if_expected_peers_missing/0
+      )
+    end
 
     :ok
   end

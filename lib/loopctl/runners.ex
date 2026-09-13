@@ -40,11 +40,54 @@ defmodule Loopctl.Runners do
   `dispatch/3` is the one path by which a dispatch reaches a runner. It validates the
   payload against the contract and refuses a halted tenant, an unauthorized runner and a
   runner without exactly one live socket before anything is sent; the channel repeats the
-  halt and single-socket checks right before the push. Placement, capacity reservation and
-  claiming are the caller's (#803).
+  halt and single-socket checks right before the push. Every dispatch is recorded in the
+  dispatch ledger (`Loopctl.Runners.DispatchLedger`) before it is broadcast, and the runner's
+  `dispatch_reply` and trace land there. Placement, capacity reservation and claiming are the
+  caller's (#803).
+
+  ## Across the cluster
+
+  The production machines form one BEAM cluster (`rel/env.sh.eex`, `DNS_CLUSTER_QUERY`). A
+  runner's socket, its channel process and its Presence entry live on whichever node it
+  connected to; every other node holds a REPLICA of that entry (Phoenix.Tracker, a CRDT
+  replicated over PubSub). Durable state — the runner row, the dispatch ledger, the story's
+  `claim_epoch` — lives only in Postgres.
+
+  - **Reaching a runner on another node.** `dispatch/3` may run on either node. It reads the
+    local Presence replica, records the dispatch in the ledger, and broadcasts on the
+    runner's `dispatch_topic/1`; PubSub delivers that to the channel on whichever node holds
+    the socket. Revocation (`revocation_topic/1`) and the socket `disconnect` broadcast
+    cross nodes the same way. The node-shutdown notice does not: it is `local_broadcast`.
+  - **One socket per runner, cluster-wide.** Both single-socket checks (here and the
+    channel's before the push) read Presence, which now includes the other node's
+    sockets. Two sockets holding one credential on two nodes each see two entries once
+    replication catches up (a Tracker delta, ~1.5 s) and both refuse, where two
+    unclustered nodes each saw one and both pushed. A runner that reconnects to the other
+    node while its old socket is still draining is briefly `:runner_ambiguous`, until the
+    old channel exits.
+  - **Netsplit, or a machine killed without its graceful stop.** Tracker goes by heartbeats:
+    after 30 s of silence (its default `down_period`) each side drops the other side's
+    entries until it hears from it again. A graceful stop is not this case: the draining
+    channels exit and their entries leave with them. Inside that window a caller can
+    read a stale entry and broadcast a dispatch that never crosses: the ledger row stays
+    `sent` with no `pushed_at` (#815), the runner never replies, and unless the claimant
+    renews it, the claim's lease expires into the reclaimer. After it, a runner on the far side reads as not connected
+    and the dispatch is refused before anything is recorded. A dispatch can also reach two
+    sockets of one credential, one per side. Exactly-once is held in Postgres, not in
+    Presence: `record_sent/3` writes one row per `dispatch_id`; a reply must present the
+    story's CURRENT `claim_epoch` under a row lock, and a differing second reply is
+    `:already_replied`; the first trace batch binds one `run_id` to the dispatch and any
+    other run is `:run_mismatch`. So a duplicate push can start a second process, but only
+    one accepted reply and one trace stream are ever recorded against the claim.
+  - **Retries.** Nothing here retries a broadcast. A dispatch re-sent with the same
+    `dispatch_id` finds its ledger row and is pushed again (see `DispatchLedger`).
+  - **Slow links.** Distribution declares a silent peer down after the default
+    `net_ticktime` (45-75 s); Presence drops a silent replica after 30 s (above).
   """
 
   import Ecto.Query
+
+  require Logger
 
   alias Ecto.Multi
   alias Loopctl.AdminRepo
@@ -53,6 +96,8 @@ defmodule Loopctl.Runners do
   alias Loopctl.AuditChain.Entry, as: AuditEntry
   alias Loopctl.Auth
   alias Loopctl.Auth.ApiKey
+  alias Loopctl.LogValue
+  alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.Presence
   alias Loopctl.Runners.Runner
   alias Loopctl.Tenants
@@ -73,6 +118,14 @@ defmodule Loopctl.Runners do
   """
   @spec dispatch_topic(Ecto.UUID.t()) :: String.t()
   def dispatch_topic(runner_id) when is_binary(runner_id), do: "runner_dispatch:" <> runner_id
+
+  @doc """
+  The NODE-LOCAL PubSub topic every runner channel on this node listens on for this node's
+  shutdown (`LoopctlWeb.RunnerShutdownNotice`). Broadcast with `local_broadcast`: a stopping
+  node must tell only its own runners.
+  """
+  @spec shutdown_topic() :: String.t()
+  def shutdown_topic, do: "runner_shutdown"
 
   @doc """
   The joined runners of a tenant, as `Phoenix.Presence.list/1` returns them: a map of
@@ -309,9 +362,20 @@ defmodule Loopctl.Runners do
   5. `{:error, :runner_ambiguous}` — more than one live socket holds the runner's
      credential. A dispatch is a prompt executed as the machine's user; with two sockets
      there is no telling which is the enrolled machine, and both would receive it.
+  6. `{:error, :dispatch_id_conflict}` — the tenant's ledger already holds this `dispatch_id`
+     for a different runner, story, `claim_epoch` or kind.
+  7. `{:error, :dispatch_already_replied}` — the runner already accepted or refused this
+     `dispatch_id`; sending it again would start a second session.
+  8. `{:error, :stale_claim_epoch}` — the dispatch's `claim_epoch` is not the story's current
+     one (or the story does not exist): the claim it was built for has already ended.
 
-  Then it broadcasts on `dispatch_topic/1`, and the runner's channel pushes the `"dispatch"`
-  event on the runner's own `runner:<runner_id>` topic, never a shared or tenant topic.
+  Then it writes the dispatch's ledger row as `sent` (`DispatchLedger.record_sent/3`) — or
+  finds the one an earlier call with the same `dispatch_id` wrote, so a retry never creates a
+  second row — and only then broadcasts on `dispatch_topic/1`. That write runs on the RLS
+  `Loopctl.Repo` in a transaction of its own, like the rest of the ledger, so this function
+  must not be called from inside a `Repo` transaction (`Repo.with_tenant/2` raises there).
+  The runner's channel then pushes the `"dispatch"` event on the runner's own
+  `runner:<runner_id>` topic, never a shared or tenant topic.
 
   `:ok` means handed to the runner's channel, not executed. The channel repeats two checks
   immediately before the push and drops the dispatch when either fails: the halt (a halt
@@ -332,13 +396,53 @@ defmodule Loopctl.Runners do
              | :tenant_halted
              | :not_authorized
              | :runner_not_connected
-             | :runner_ambiguous}
+             | :runner_ambiguous
+             | :dispatch_id_conflict
+             | :dispatch_already_replied
+             | :stale_claim_epoch}
   def dispatch(tenant_id, runner_id, payload) do
+    case do_dispatch(tenant_id, runner_id, payload) do
+      :ok ->
+        :ok
+
+      {:error, reason} = refused ->
+        log_dispatch_refused(tenant_id, runner_id, payload, reason)
+        refused
+    end
+  end
+
+  # Identifiers only, read defensively: a refused payload may be malformed, so each value is
+  # logged only in the shape it claims (`Loopctl.LogValue`).
+  defp log_dispatch_refused(tenant_id, runner_id, payload, reason) do
+    field = fn key ->
+      if is_map(payload),
+        do: Map.get(payload, key) || Map.get(payload, String.to_existing_atom(key))
+    end
+
+    tenant_id = LogValue.uuid(tenant_id)
+    runner_id = LogValue.uuid(runner_id)
+    dispatch_id = LogValue.uuid(field.("dispatch_id"))
+    story_id = LogValue.uuid(field.("story_id"))
+    claim_epoch = LogValue.epoch(field.("claim_epoch"))
+
+    Logger.info(
+      "runner dispatch refused: reason=#{inspect(reason)} tenant_id=#{inspect(tenant_id)} " <>
+        "runner_id=#{inspect(runner_id)} dispatch_id=#{inspect(dispatch_id)} " <>
+        "story_id=#{inspect(story_id)} claim_epoch=#{inspect(claim_epoch)}",
+      runner_id: runner_id,
+      dispatch_id: dispatch_id,
+      story_id: story_id,
+      claim_epoch: claim_epoch
+    )
+  end
+
+  defp do_dispatch(tenant_id, runner_id, payload) do
     with {:ok, dispatch} <- RunnerContract.cast_dispatch(payload),
          {:ok, tenant_id, runner_id} <- cast_ids(tenant_id, runner_id),
          :ok <- not_halted(tenant_id),
          :ok <- runner_authorized(tenant_id, runner_id),
-         :ok <- single_live_socket(tenant_id, runner_id) do
+         :ok <- single_live_socket(tenant_id, runner_id),
+         {:ok, _record} <- DispatchLedger.record_sent(tenant_id, runner_id, dispatch) do
       Phoenix.PubSub.broadcast(
         Loopctl.PubSub,
         dispatch_topic(runner_id),
@@ -418,37 +522,83 @@ defmodule Loopctl.Runners do
   @spec authenticate(term()) ::
           {:ok, %{runner: Runner.t(), api_key: ApiKey.t()}}
           | {:error, :invalid_token | :tenant_inactive | :not_a_runner | :runner_revoked}
-  def authenticate(raw_token) when is_binary(raw_token) and raw_token != "" do
+  def authenticate(raw_token) do
+    case authenticate_identified(raw_token) do
+      {:ok, auth} -> {:ok, auth}
+      {:error, reason, _identity} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  `authenticate/1`, with what WAS resolved on a refusal (issue #815): the key's `api_key_id`,
+  `tenant_id` and `runner_id` where resolution got that far, `nil` otherwise. For the
+  socket's refusal log only; never the token.
+  """
+  @spec authenticate_identified(term()) ::
+          {:ok, %{runner: Runner.t(), api_key: ApiKey.t()}}
+          | {:error, :invalid_token | :tenant_inactive | :not_a_runner | :runner_revoked,
+             %{
+               api_key_id: Ecto.UUID.t() | nil,
+               tenant_id: Ecto.UUID.t() | nil,
+               runner_id: Ecto.UUID.t() | nil
+             }}
+  def authenticate_identified(raw_token) when is_binary(raw_token) and raw_token != "" do
     with {:ok, api_key} <- verify(raw_token),
-         :ok <- tenant_active(api_key.tenant),
+         :ok <- tenant_active(api_key),
          {:ok, runner} <- runner_for_key(api_key) do
       {:ok, %{runner: runner, api_key: api_key}}
     end
   end
 
-  def authenticate(_raw_token), do: {:error, :invalid_token}
+  def authenticate_identified(_raw_token), do: {:error, :invalid_token, identity(nil, nil)}
+
+  defp identity(api_key, runner) do
+    %{
+      api_key_id: api_key && api_key.id,
+      tenant_id: api_key && api_key.tenant_id,
+      runner_id: runner && runner.id
+    }
+  end
 
   defp verify(raw_token) do
     case Auth.verify_api_key(raw_token) do
       {:ok, %ApiKey{tenant_id: tenant_id, role: :agent} = api_key} when is_binary(tenant_id) ->
         {:ok, api_key}
 
-      {:ok, %ApiKey{}} ->
-        {:error, :not_a_runner}
+      {:ok, %ApiKey{} = api_key} ->
+        {:error, :not_a_runner, identity(api_key, nil)}
 
       {:error, _} ->
-        {:error, :invalid_token}
+        {:error, :invalid_token, identity(nil, nil)}
     end
   end
 
-  defp tenant_active(%Tenant{status: :active}), do: :ok
-  defp tenant_active(_tenant), do: {:error, :tenant_inactive}
+  defp tenant_active(%ApiKey{tenant: %Tenant{status: :active}}), do: :ok
+  defp tenant_active(api_key), do: {:error, :tenant_inactive, identity(api_key, nil)}
 
-  defp runner_for_key(%ApiKey{id: key_id, tenant_id: tenant_id}) do
+  defp runner_for_key(%ApiKey{id: key_id, tenant_id: tenant_id} = api_key) do
     case AdminRepo.get_by(Runner, api_key_id: key_id, tenant_id: tenant_id) do
-      nil -> {:error, :not_a_runner}
+      nil -> {:error, :not_a_runner, identity(api_key, nil)}
       %Runner{revoked_at: nil} = runner -> {:ok, runner}
-      %Runner{} -> {:error, :runner_revoked}
+      %Runner{} = runner -> {:error, :runner_revoked, identity(api_key, runner)}
+    end
+  end
+
+  @doc "This node's name, as a string, for runner presence metas and logs (issue #815)."
+  @spec node_name() :: String.t()
+  def node_name, do: Atom.to_string(node())
+
+  @doc """
+  The Fly Machine this node runs on (`FLY_MACHINE_ID`, injected by Fly), or nil off Fly.
+  Off Fly every node is named `loopctl@127.0.0.1` (`rel/env.sh.eex`), so the machine id is
+  what tells a runner's connection apart there; on Fly the node name already carries the
+  machine's address and release, and the machine id is the name an operator acts on.
+  """
+  @spec machine_id() :: String.t() | nil
+  def machine_id do
+    case System.get_env("FLY_MACHINE_ID") do
+      id when is_binary(id) and id != "" -> id
+      _ -> nil
     end
   end
 

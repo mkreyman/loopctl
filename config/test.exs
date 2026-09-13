@@ -334,7 +334,16 @@ config :logger, :default_formatter,
     :duration_ms,
     :repo,
     :source,
-    :endpoint
+    :endpoint,
+    # Issue #815: runner control-plane correlation keys (mirrors config/config.exs).
+    :runner_id,
+    :runner_name,
+    :story_id,
+    :dispatch_id,
+    :run_id,
+    :claim_epoch,
+    :node,
+    :machine
   ]
 
 # Oban: inline testing mode (jobs execute synchronously in tests)
@@ -347,6 +356,11 @@ config :loopctl, Oban, testing: :inline
 # subscriber start their OWN named instance with `subscribe: true`; production
 # leaves this unset (defaults true) so the tree child subscribes normally.
 config :loopctl, :sth_enqueuer_subscribe, false
+
+# A conflict loser and a standby racing a vanished holder retry on this interval; short
+# here so the leadership tests do not sleep through production's 200 ms.
+config :loopctl, :sth_enqueuer_leadership_retry_ms, 20
+config :loopctl, :sth_enqueuer_leadership_check_ms, 50
 
 # Initialize plugs at runtime for faster test compilation
 config :phoenix, :plug_init_mode, :runtime
@@ -394,6 +408,10 @@ config :phoenix,
 
 # DI: Use mock health checker in tests
 config :loopctl, :health_checker, Loopctl.MockHealthChecker
+
+# The clustering DNS evidence (Loopctl.ClusterReadiness.unconnected_running_peers/3). Nothing
+# in the test env configures DNS_CLUSTER_QUERY, so only tests that call it reach the mock.
+config :loopctl, :cluster_dns_resolver, Loopctl.MockClusterDnsResolver
 
 # US-32.4: scale-alerts config-guard DI (Loopctl.HealthCheck.Default's degraded-branch
 # coverage). Default stub in DataCase delegates to the real config_status/0.

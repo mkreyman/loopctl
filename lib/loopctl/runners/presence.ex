@@ -13,9 +13,12 @@ defmodule Loopctl.Runners.Presence do
   - **Liveness hint, not a scheduler.** Presence is an eventually-consistent CRDT with no
     compare-and-set; two readers can both see `in_flight: 0` and both dispatch to the
     same runner. Reserve capacity in Postgres.
-  - **It converges only within a cluster.** loopctl runs single-node today. If Fly starts
-    a second machine without `DNS_CLUSTER_QUERY`, a runner tracked on node A is invisible
-    on node B for as long as its socket lives.
+  - **It converges only within a cluster.** The production machines are clustered
+    (`rel/env.sh.eex`), so every node holds a replica of every runner's entry. A node
+    that is not connected — a netsplit, a machine on another release during a rolling
+    deploy — does not see runners on the far side, and drops a silent peer's entries
+    after 30 s of missed heartbeats. What that means for dispatch is in `Loopctl.Runners` ("Across the
+    cluster").
   """
 
   use Phoenix.Presence,

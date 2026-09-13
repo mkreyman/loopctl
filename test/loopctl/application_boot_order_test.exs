@@ -45,6 +45,16 @@ defmodule Loopctl.ApplicationBootOrderTest do
       assert primer_idx < endpoint_idx
     end
 
+    test "the SystemConfig refresh listener starts after PubSub, which it subscribes to" do
+      children = Loopctl.Application.children()
+      pubsub_idx = index_of(children, Phoenix.PubSub)
+      listener_idx = index_of(children, Loopctl.SystemConfig.RefreshListener)
+
+      assert is_integer(pubsub_idx), "Phoenix.PubSub is not in Application.children/0"
+      assert is_integer(listener_idx), "RefreshListener is not in Application.children/0"
+      assert pubsub_idx < listener_idx
+    end
+
     test "the Endpoint is still last, so nothing serves requests ahead of the tree" do
       children = Loopctl.Application.children()
       assert List.last(children) == LoopctlWeb.Endpoint

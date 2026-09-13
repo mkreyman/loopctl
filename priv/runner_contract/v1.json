@@ -1,5 +1,23 @@
 {
   "$defs": {
+    "RunnerDisconnecting": {
+      "description": "Pushed as `disconnecting` on the runner's topic immediately before loopctl closes the runner's connection itself. `runner_revoked` and `no_longer_authorized` mean the credential no longer works: do not reconnect until re-enrolled. `server_shutdown` means the node is stopping: reconnect. `join_refused_not_authorized` arrives as the `disconnecting` field of a refused join's error reply, because an unjoined topic cannot carry a push.",
+      "properties": {
+        "reason": {
+          "enum": [
+            "runner_revoked",
+            "no_longer_authorized",
+            "join_refused_not_authorized",
+            "server_shutdown"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason"
+      ],
+      "type": "object"
+    },
     "RunnerDispatch": {
       "description": "Control pushes `dispatch` to start a session. The runner validates it against its LOCAL allow-list (repos, branch prefixes, wall clock, token budget) and refuses by default: a dispatch is a prompt executed as the machine's user. Declared in contract v1; emitted from #803.",
       "properties": {
@@ -63,6 +81,53 @@
         "claim_epoch",
         "wall_clock_seconds",
         "max_turns"
+      ],
+      "type": "object"
+    },
+    "RunnerDispatchReply": {
+      "description": "The runner's answer to one `dispatch`, pushed as the `dispatch_reply` event. `reason` is REQUIRED when `decision` is `refused` and forbidden when it is `accepted`; `detail` is required when `reason` is `other` and allowed only on a refusal. The server applies the first reply, answers an identical repeat `ok`, and refuses a different one with `already_replied`.",
+      "properties": {
+        "claim_epoch": {
+          "description": "The `claim_epoch` of the dispatch being answered, echoed.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "decision": {
+          "enum": [
+            "accepted",
+            "refused"
+          ],
+          "type": "string"
+        },
+        "detail": {
+          "maxLength": 500,
+          "minLength": 1,
+          "type": "string"
+        },
+        "dispatch_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "reason": {
+          "enum": [
+            "dispatches_disabled",
+            "draining",
+            "at_capacity",
+            "insufficient_disk",
+            "repo_not_allowed",
+            "branch_not_allowed",
+            "wall_clock_exceeds_limit",
+            "max_turns_exceeds_limit",
+            "token_budget_exceeds_limit",
+            "other"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "dispatch_id",
+        "claim_epoch",
+        "decision"
       ],
       "type": "object"
     },
@@ -247,8 +312,110 @@
       },
       "type": "object"
     },
+    "RunnerTraceAck": {
+      "description": "The reply to `trace` and `trace_cursor`: the highest seq such that every seq from 0 to it is stored, or -1 when seq 0 is not. Resume from `acked_seq + 1`.",
+      "properties": {
+        "acked_seq": {
+          "minimum": -1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "acked_seq"
+      ],
+      "type": "object"
+    },
+    "RunnerTraceBatch": {
+      "description": "A batch of one run's trace events, pushed as the `trace` event. Every event's `run_id` must equal the batch's. At most 20 events and at most 60000 bytes under the byte rule below; either excess is refused with `batch_too_large`, so split the batch — except that a one-event batch over the budget is refused with `event_data_too_large` naming its `seq`, since splitting cannot help. The run must belong to an ACCEPTED dispatch this runner holds, at the dispatched `claim_epoch`; the first batch binds `run_id` to `dispatch_id`. Replied with `RunnerTraceAck`. Byte rule (compact JSON, any encoder): count 6 bytes for every character of every string and object key (12 for a character outside the Basic Multilingual Plane) plus 12 per string; 32 per number, true, false or null; 2 per array or object; 2 per array element or object member. A number may have at most 31 digits.",
+      "properties": {
+        "claim_epoch": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "dispatch_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "events": {
+          "items": {
+            "description": "One line of a run's NDJSON trace. The on-disk file is the source of truth: the runner ships `(run_id, seq)`, the server ACKs the last contiguous seq and dedups on the pair, and the runner resumes from that offset on rejoin. `parent` is REQUIRED on every event (null only for the root) so the agent tree can be rebuilt by query. `data` is at most 6000 bytes and the whole event at most 12000, both under the byte rule below; either excess is refused with `event_data_too_large` naming the event's `seq`. Large payloads (tool output, file contents) belong in object storage, referenced from `data`. Byte rule (compact JSON, any encoder): count 6 bytes for every character of every string and object key (12 for a character outside the Basic Multilingual Plane) plus 12 per string; 32 per number, true, false or null; 2 per array or object; 2 per array element or object member. A number may have at most 31 digits.",
+            "properties": {
+              "data": {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              "event_id": {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              "parent": {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "run_id": {
+                "format": "uuid",
+                "type": "string"
+              },
+              "seq": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "ts": {
+                "format": "date-time",
+                "type": "string"
+              },
+              "type": {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "run_id",
+              "seq",
+              "event_id",
+              "parent",
+              "ts",
+              "type"
+            ],
+            "type": "object"
+          },
+          "maxItems": 20,
+          "type": "array"
+        },
+        "run_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "dispatch_id",
+        "claim_epoch",
+        "events"
+      ],
+      "type": "object"
+    },
+    "RunnerTraceCursor": {
+      "description": "Asks where a run's stored trace ends, pushed as the `trace_cursor` event before resuming a shipment. Replied with `RunnerTraceAck`; a run this runner has not shipped (or does not hold) answers -1.",
+      "properties": {
+        "run_id": {
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id"
+      ],
+      "type": "object"
+    },
     "RunnerTraceEvent": {
-      "description": "One line of a run's NDJSON trace. The on-disk file is the source of truth: the runner ships `(run_id, seq)`, the server ACKs the last contiguous seq and dedups on the pair, and the runner resumes from that offset on rejoin. `parent` is REQUIRED on every event (null only for the root) so the agent tree can be rebuilt by query.",
+      "description": "One line of a run's NDJSON trace. The on-disk file is the source of truth: the runner ships `(run_id, seq)`, the server ACKs the last contiguous seq and dedups on the pair, and the runner resumes from that offset on rejoin. `parent` is REQUIRED on every event (null only for the root) so the agent tree can be rebuilt by query. `data` is at most 6000 bytes and the whole event at most 12000, both under the byte rule below; either excess is refused with `event_data_too_large` naming the event's `seq`. Large payloads (tool output, file contents) belong in object storage, referenced from `data`. Byte rule (compact JSON, any encoder): count 6 bytes for every character of every string and object key (12 for a character outside the Basic Multilingual Plane) plus 12 per string; 32 per number, true, false or null; 2 per array or object; 2 per array element or object member. A number may have at most 31 digits.",
       "properties": {
         "data": {
           "additionalProperties": true,
@@ -301,14 +468,88 @@
   "title": "loopctl runner contract",
   "x-connection": {
     "credential_header": "x-loopctl-runner-token",
+    "errors": {
+      "dispatch_reply": [
+        "rate_limited",
+        "invalid_payload",
+        "unknown_dispatch",
+        "stale_claim_epoch",
+        "already_replied"
+      ],
+      "join": [
+        "rate_limited",
+        "not_authorized",
+        "invalid_payload",
+        "unsupported_contract_version",
+        "machine_mismatch",
+        "forbidden_topic",
+        "unknown_topic"
+      ],
+      "status": [
+        "rate_limited",
+        "invalid_payload"
+      ],
+      "trace": [
+        "rate_limited",
+        "invalid_payload",
+        "batch_too_large",
+        "event_data_too_large",
+        "unknown_dispatch",
+        "stale_claim_epoch",
+        "dispatch_not_accepted",
+        "run_mismatch"
+      ],
+      "trace_cursor": [
+        "rate_limited",
+        "invalid_payload"
+      ],
+      "unknown_event": [
+        "unknown_event"
+      ]
+    },
     "events": {
+      "disconnecting": "RunnerDisconnecting",
       "dispatch": "RunnerDispatch",
+      "dispatch_reply": "RunnerDispatchReply",
       "join": "RunnerJoin",
       "status": "RunnerStatus",
+      "trace": "RunnerTraceBatch",
+      "trace_cursor": "RunnerTraceCursor",
       "trace_event": "RunnerTraceEvent"
+    },
+    "limits": {
+      "dispatch_reply_burst": {
+        "capacity": 8,
+        "refill_interval_ms": 250
+      },
+      "frame_envelope_bytes": 1000,
+      "json_byte_rule": {
+        "max_number_digits": 31,
+        "per_container": 2,
+        "per_member": 2,
+        "per_scalar": 32,
+        "per_string": 12,
+        "per_string_char": 6,
+        "text": "Byte rule (compact JSON, any encoder): count 6 bytes for every character of every string and object key (12 for a character outside the Basic Multilingual Plane) plus 12 per string; 32 per number, true, false or null; 2 per array or object; 2 per array element or object member. A number may have at most 31 digits."
+      },
+      "min_interval_ms": {
+        "status": 1000,
+        "trace": 50,
+        "trace_cursor": 50
+      },
+      "refusal_max_detail_length": 500,
+      "trace_max_batch_bytes": 60000,
+      "trace_max_event_bytes": 12000,
+      "trace_max_event_data_bytes": 6000,
+      "trace_max_events": 20,
+      "trace_max_seq": 9223372036854775806
+    },
+    "replies": {
+      "trace": "RunnerTraceAck",
+      "trace_cursor": "RunnerTraceAck"
     },
     "socket_path": "/runner/socket/websocket",
     "topic": "runner:{runner_id}"
   },
-  "x-contract-version": "1.0.0"
+  "x-contract-version": "1.2.0"
 }

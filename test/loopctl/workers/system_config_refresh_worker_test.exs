@@ -15,4 +15,12 @@ defmodule Loopctl.Workers.SystemConfigRefreshWorkerTest do
     assert :ok = SystemConfigRefreshWorker.perform(%Oban.Job{args: %{}})
     assert SystemConfig.get_int(setting.key, -1) == 8080
   end
+
+  test "perform/1 broadcasts the refresh, naming this node, for the listeners on its peers" do
+    :ok = Phoenix.PubSub.subscribe(Loopctl.PubSub, SystemConfig.refresh_topic())
+    origin = node()
+
+    assert :ok = SystemConfigRefreshWorker.perform(%Oban.Job{args: %{}})
+    assert_receive {:system_config_refresh, ^origin}
+  end
 end

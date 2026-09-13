@@ -151,7 +151,9 @@ defmodule LoopctlWeb.RunnerController do
                    :draining,
                    :max_sessions,
                    :sample,
-                   :live_sockets
+                   :live_sockets,
+                   :node,
+                   :machine_id
                  ],
                  properties: %{
                    machine: %Schema{type: :string, description: "The enrolled machine name."},
@@ -169,6 +171,19 @@ defmodule LoopctlWeb.RunnerController do
                      type: :integer,
                      minimum: 1,
                      description: "Live sockets tracked under this machine name."
+                   },
+                   node: %Schema{
+                     type: :string,
+                     nullable: true,
+                     description:
+                       "The Erlang node holding this socket. Two nodes can share a name, so " <>
+                         "`machine_id` is what tells them apart."
+                   },
+                   machine_id: %Schema{
+                     type: :string,
+                     nullable: true,
+                     description:
+                       "The Fly Machine (`FLY_MACHINE_ID`) holding this socket, or null off Fly."
                    }
                  }
                }
@@ -237,7 +252,9 @@ defmodule LoopctlWeb.RunnerController do
       draining: Map.get(meta, :draining),
       max_sessions: Map.get(meta, :max_sessions),
       sample: Map.get(meta, :sample),
-      live_sockets: length(metas)
+      live_sockets: length(metas),
+      node: Map.get(meta, :node),
+      machine_id: Map.get(meta, :machine_id)
     }
   end
 
