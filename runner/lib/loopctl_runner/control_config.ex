@@ -4,7 +4,7 @@ defmodule LoopctlRunner.ControlConfig do
 
       "control": {
         "url": "wss://loopctl.com/runner/socket/websocket",
-        "runner_id": "<uuid from POST /api/v1/runners>",
+        "runner_id": "<runner.id returned by runner_enroll>",
         "machine": "minis",
         "token_file": "~/.config/loopctl-runner/token",
         "repos": ["mkreyman/home_care_billing"],

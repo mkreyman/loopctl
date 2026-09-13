@@ -22,7 +22,7 @@
   "agents_probe_timeout_s": 20,
   "control": {
     "url": "wss://loopctl.com/runner/socket/websocket",
-    "runner_id": "<id returned by POST /api/v1/runners>",
+    "runner_id": "<runner.id returned by runner_enroll>",
     "machine": "minis",
     "token_file": "~/.config/loopctl-runner/token",
     "repos": [

@@ -19,24 +19,37 @@ dispatches.
 
 ### The daemon
 
-1. Enroll the machine (a human-anchored `user` key; the token is shown once):
+1. Enroll the machine with the `runner_enroll` tool of loopctl-mcp-server 2.92.0 or later, from a
+   session on THAT machine whose environment carries a user-role `LOOPCTL_USER_KEY`:
 
-   ```bash
-   curl -sS -X POST https://loopctl.com/api/v1/runners \
-     -H "Authorization: Bearer $LOOPCTL_USER_KEY" -H 'content-type: application/json' \
-     -d '{"name": "minis"}'
+   ```
+   runner_enroll({name: "minis", token_file: "~/.config/loopctl-runner/token"})
    ```
 
-2. Put the returned `token` in `~/.config/loopctl-runner/token` (`chmod 600`), and the returned
-   `runner.id` in the `control` section of `~/.config/loopctl-runner/runner.json` (see
-   `config/runner.example.json`).
+   The MCP server writes the token to `token_file` itself, mode 600, and returns only the runner
+   row, so the credential never reaches a transcript. It refuses a path that already exists
+   without enrolling anything. Do not enroll with a direct HTTP call: the response body is the
+   token. A machine whose environment has no user key can be enrolled from one that does, into a
+   fresh path there, and the file copied across. `scp` neither creates the directory nor refuses
+   to overwrite, so do both checks on the target first:
+
+   ```bash
+   ssh <target> 'mkdir -p -m 700 ~/.config/loopctl-runner && test ! -e ~/.config/loopctl-runner/token' &&
+     scp -p <fresh path> <target>:.config/loopctl-runner/token &&   # -p keeps mode 600
+     rm <fresh path>
+   ```
+2. Put the returned `runner.id` in the `control` section of `~/.config/loopctl-runner/runner.json`
+   (see `config/runner.example.json`).
 3. `rel/install.sh` builds a release on this machine and installs it as a `systemd --user` unit
    (Linux) or a launchd LaunchAgent (macOS). On Linux, `loginctl enable-linger $USER` makes it
    start at boot. `mix loopctl.serve` runs the same daemon in the foreground for development.
+4. `runner_pool` lists the connected runners; the machine appears within a few seconds of the
+   service starting. `runner_list` shows enrollments whether or not they are connected.
 
-Rotating the credential is `DELETE /api/v1/runners/:id` and enrolling again. That returns a new
-`runner.id` as well as a new token, so update both `control.runner_id` and the token file, then
-restart the service. A runner left on the old id is refused `forbidden_topic`, and the daemon
+Rotating the credential is `runner_revoke({id})`, then deleting the old token file (enrollment
+refuses an existing file), then enrolling again. That returns a new `runner.id` as well as a new
+token, so update `control.runner_id` too, then restart the service. Revoking disconnects the
+live socket. A runner left on the old id is refused `forbidden_topic`, and the daemon
 exits with status 78: systemd shows the unit failed without restarting it (then
 `systemctl --user restart loopctl-runner` once the config is fixed), and on macOS the agent stays
 stopped until `rel/install.sh` or `launchctl kickstart` starts it again. The log names the refusal. A token file that cannot be read three times in a row is treated the same way, so after fixing
