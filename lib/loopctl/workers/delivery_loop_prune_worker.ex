@@ -34,7 +34,10 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorker do
   `intake_delivery_retention_days` — defaulting to `default_trace_retention_days/0` and
   `default_intake_retention_days/0`. They are tenant settings rather than environment
   variables so an operator can widen one tenant's window without a deploy, which is the same
-  shape `Loopctl.Workers.WebhookCleanupWorker` uses. A setting that is
+  shape `Loopctl.Workers.WebhookCleanupWorker` uses. A setting above
+  `max_retention_days/0` is capped there — the value a slip most plausibly produces is a DATE
+  pasted where a day count belongs, which puts the cutoff outside `timestamptz` range and
+  makes Postgres refuse the query. A setting that is
   not a positive integer is IGNORED with a warning rather than silently taken (a JSON
   `"30"` is not 30), and one below a table's floor is raised to the floor: an operator may
   keep more than the default, never less than what is still load-bearing.
@@ -48,7 +51,18 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorker do
     `AdminRepo`, each following the isolation its owning module documents. The trace half in
     particular must NOT go on `AdminRepo`: that pool is three connections that
     `ValidateWitnessHeader` reads on every authenticated request, and this is the highest-
-    volume table in the system.
+    volume table in the system. The delivery half stays there — `Loopctl.Intake` resolves a
+    tenant FROM a source id and is `AdminRepo` throughout — and pays for it with numbers an
+    order of magnitude smaller (`Intake.prune_batch_size/0`, `Intake.prune_budget/0`): a batch
+    is its own short transaction that returns the connection between batches, and the budget
+    caps a tenant at ten of them per run. Deliveries arrive at webhook rate, so that still
+    reclaims far more per day than any repository produces.
+  - **One tenant never stops the rest.** Each tenant's each table is guarded: a raise or an
+    exit is logged with the tenant id, counted, and the fold continues. `list_tenants/1`
+    orders by name, so without this it is deterministically the same later tenants that are
+    never pruned. A transient database fault (a lock wait, a statement timeout, a deadlock, a
+    pool that was down) leaves the job `:ok` — the next tick retries it — while anything else
+    makes the job report an error so it is not silently green.
   - **Where the state lives.** Nowhere but the rows. There is no cursor, no checkpoint and
     nothing to reconcile: progress IS the deletion, candidates are ordered oldest-first, and
     a pruned row never comes back. Two runs an hour apart resume by re-selecting.
@@ -65,9 +79,12 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorker do
     times out. A batch that raises fails the job — visibly, with Oban's retry — rather than
     being swallowed.
   - **Falling behind.** Every run emits `[:loopctl, :delivery_loop, :prune]` per table with
-    the rows deleted and how many tenants stopped at their budget, and logs a warning naming
-    each. A `tenants_at_budget` that stays non-zero across runs is the signal that the
-    hourly cadence or the budget no longer matches the write rate.
+    the rows deleted, how many tenants stopped at their budget and how many failed, and logs
+    a warning naming each. A `tenants_at_budget` that stays non-zero across runs is the signal
+    that the hourly cadence or the budget no longer matches the write rate — and it is a
+    MEASURED signal, not an inferred one: a tenant that lands exactly on its budget is probed
+    for a further candidate before it is counted, so "budget reached" never means "reached it
+    and stopped exactly at the end".
   """
 
   use Oban.Worker, queue: :cleanup, max_attempts: 3
@@ -92,7 +109,25 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorker do
   # Observability only; one lost day of trace is not a correctness failure.
   @min_trace_retention_days 1
 
+  # Ten years. A window is a DAY COUNT, and the value a slip most plausibly produces is a
+  # DATE pasted where a count belongs (20260918 days is ~55,000 years, which puts `cutoff/2`
+  # outside `timestamptz` range and makes Postgres refuse the query). Keeping more than this
+  # is indistinguishable from keeping everything, so the ceiling costs an operator nothing.
+  @max_retention_days 3650
+
   @telemetry [:loopctl, :delivery_loop, :prune]
+
+  @typedoc """
+  One tenant's outcome for ONE table. `failed` counts a prune that could not be completed,
+  `hard_failed` the subset of those that were NOT a transient database fault — the ones that
+  make the job report an error rather than waiting for the next tick.
+  """
+  @type half_result :: %{
+          deleted: non_neg_integer(),
+          budget_exhausted: boolean(),
+          failed: 0 | 1,
+          hard_failed: 0 | 1
+        }
 
   @doc "Default trace-event retention, in days, when a tenant sets none."
   @spec default_trace_retention_days() :: pos_integer()
@@ -113,15 +148,20 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorker do
   @spec min_trace_retention_days() :: pos_integer()
   def min_trace_retention_days, do: @min_trace_retention_days
 
+  @doc "The ceiling over any tenant's retention window, whichever table."
+  @spec max_retention_days() :: pos_integer()
+  def max_retention_days, do: @max_retention_days
+
   @impl Oban.Worker
-  def perform(%Oban.Job{}) do
+  def perform(%Oban.Job{} = job) do
     started = System.monotonic_time(:millisecond)
     now = DateTime.utc_now()
+    opts = prune_opts(job.args)
     {:ok, tenants} = Tenants.list_tenants()
 
     totals =
       Enum.reduce(tenants, %{trace: empty(), intake: empty()}, fn tenant, acc ->
-        %{trace: trace, intake: intake} = prune_tenant(tenant, now)
+        %{trace: trace, intake: intake} = prune_tenant(tenant, now, opts)
         %{trace: merge(acc.trace, trace), intake: merge(acc.intake, intake)}
       end)
 
@@ -131,7 +171,39 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorker do
     report("intake_deliveries", totals.intake, length(tenants), duration)
     log_run(totals, length(tenants))
 
-    :ok
+    outcome(totals)
+  end
+
+  # The cron entry passes no args. `%{"batch_size" => n}` / `%{"budget" => n}` are the manual
+  # drain knob — one enqueue after a long outage reclaims a backlog faster than twenty-four
+  # hourly runs. Values are NOT validated here on purpose: they reach the database only as
+  # query PARAMETERS (`limit: ^limit`), so the worst a nonsense one can do is have Postgres
+  # refuse the statement, which the per-tenant guard below counts and reports rather than
+  # crashing the run. Validating them would trade that provable behaviour for an untestable
+  # branch.
+  defp prune_opts(args) when is_map(args) do
+    for {name, key} <- [{"batch_size", :batch_size}, {"budget", :budget}],
+        {:ok, value} <- [Map.fetch(args, name)],
+        do: {key, value}
+  end
+
+  defp prune_opts(_args), do: []
+
+  # A tenant whose prune could not be COMPLETED never stops the fold (each half is guarded),
+  # but it must not leave the job reading green either. A RETRYABLE fault — a lock wait that
+  # ran out, a statement timeout, a deadlock Postgres broke, a pool that was down — is "not
+  # this time": the next tick retries that tenant, and the telemetry counts it. Anything else
+  # is a fault nobody would otherwise see, so the job reports it and Oban retries.
+  defp outcome(%{trace: trace, intake: intake}) do
+    case trace.hard_failed + intake.hard_failed do
+      0 ->
+        :ok
+
+      n ->
+        {:error,
+         "DeliveryLoopPruneWorker: #{n} tenant/table prune(s) failed with a non-retryable " <>
+           "error; see the preceding log lines for the tenant ids and reasons"}
+    end
   end
 
   @doc """
@@ -143,8 +215,8 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorker do
   one tenant's backlog can call it with a larger `:budget` without waiting for the hour.
   """
   @spec prune_tenant(Tenant.t(), DateTime.t(), keyword()) :: %{
-          trace: %{deleted: non_neg_integer(), budget_exhausted: boolean()},
-          intake: %{deleted: non_neg_integer(), budget_exhausted: boolean()}
+          trace: half_result(),
+          intake: half_result()
         }
   def prune_tenant(%Tenant{} = tenant, %DateTime{} = now, opts \\ []) do
     %{trace: prune_trace(tenant, now, opts), intake: prune_intake(tenant, now, opts)}
@@ -159,9 +231,9 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorker do
         @min_trace_retention_days
       )
 
-    result = DispatchLedger.prune_trace_events(tenant.id, cutoff(now, days), opts)
-    log_tenant("runner_trace_events", tenant, days, result)
-    result
+    guarded("runner_trace_events", tenant, days, fn ->
+      DispatchLedger.prune_trace_events(tenant.id, cutoff(now, days), opts)
+    end)
   end
 
   defp prune_intake(tenant, now, opts) do
@@ -173,10 +245,67 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorker do
         @min_intake_retention_days
       )
 
-    result = Intake.prune_deliveries(tenant.id, cutoff(now, days), opts)
-    log_tenant("intake_deliveries", tenant, days, result)
-    result
+    guarded("intake_deliveries", tenant, days, fn ->
+      Intake.prune_deliveries(tenant.id, cutoff(now, days), opts)
+    end)
   end
+
+  # ONE tenant's ONE table. A raise or an exit here is contained to this call: the fold moves
+  # on to the next tenant, and — because `Tenants.list_tenants/1` orders by name — it is
+  # otherwise deterministically the SAME later tenants that never get pruned, hourly and for
+  # ever. Containing it is also what keeps the run's telemetry meaningful: `report/4` runs
+  # after the fold, so an escaping error suppressed `tenants_at_budget` on exactly the runs
+  # where it was non-zero.
+  defp guarded(table, tenant, days, fun) do
+    result = fun.()
+    log_tenant(table, tenant, days, result)
+    Map.merge(result, %{failed: 0, hard_failed: 0})
+  rescue
+    error -> failure(table, tenant, days, error, retryable?(error), __STACKTRACE__)
+  catch
+    # A pool that is down or wedged EXITS rather than raising, and that is always transient.
+    :exit, reason -> failure(table, tenant, days, {:exit, reason}, true, [])
+  end
+
+  defp failure(table, tenant, days, error, retryable?, stacktrace) do
+    message =
+      "DeliveryLoopPruneWorker: prune failed: table=#{table} tenant_id=#{tenant.id} " <>
+        "retention_days=#{days} retryable=#{retryable?} error=#{inspect(error)}"
+
+    if retryable? do
+      Logger.warning(message, tenant_id: tenant.id)
+    else
+      Logger.error(message <> " stacktrace=#{inspect(Enum.take(stacktrace, 5))}",
+        tenant_id: tenant.id
+      )
+    end
+
+    %{
+      deleted: 0,
+      budget_exhausted: false,
+      failed: 1,
+      hard_failed: if(retryable?, do: 0, else: 1)
+    }
+  end
+
+  # A lock wait that ran out (55P03), a deadlock Postgres broke (40P01), a statement the
+  # timeout cancelled (57014), a serialization failure, and a connection that went away. Each
+  # is "the database was busy", which the next tick retries; nothing else is.
+  defp retryable?(%DBConnection.ConnectionError{}), do: true
+
+  defp retryable?(%Postgrex.Error{postgres: %{code: code}})
+       when code in [
+              :lock_not_available,
+              :deadlock_detected,
+              :query_canceled,
+              :serialization_failure,
+              :admin_shutdown,
+              :crash_shutdown,
+              :cannot_connect_now
+            ],
+       do: true
+
+  defp retryable?(_error), do: false
 
   # An explicit timestamp, never a whole-day boundary: "older than N days" computed as a date
   # leaves the newest day of rows behind on every run, which reads as the pruner keeping up
@@ -190,6 +319,15 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorker do
   # does nothing is worse than one that is rejected.
   defp retention_days(tenant, key, default, floor) do
     case Tenants.get_tenant_settings(tenant, key, default) do
+      days when is_integer(days) and days > @max_retention_days ->
+        Logger.warning(
+          "DeliveryLoopPruneWorker: #{key}=#{days} for tenant #{tenant.id} exceeds the " <>
+            "#{@max_retention_days}-day ceiling; using the ceiling",
+          tenant_id: tenant.id
+        )
+
+        @max_retention_days
+
       days when is_integer(days) and days >= floor ->
         days
 
@@ -207,20 +345,28 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorker do
     end
   end
 
-  defp empty, do: %{deleted: 0, at_budget: 0}
+  defp empty, do: %{deleted: 0, at_budget: 0, failed: 0, hard_failed: 0}
 
-  defp merge(acc, %{deleted: deleted, budget_exhausted: exhausted?}) do
+  defp merge(acc, %{deleted: deleted, budget_exhausted: exhausted?} = half) do
     %{
       acc
       | deleted: acc.deleted + deleted,
-        at_budget: acc.at_budget + if(exhausted?, do: 1, else: 0)
+        at_budget: acc.at_budget + if(exhausted?, do: 1, else: 0),
+        failed: acc.failed + half.failed,
+        hard_failed: acc.hard_failed + half.hard_failed
     }
   end
 
-  defp report(table, %{deleted: deleted, at_budget: at_budget}, tenants, duration) do
+  defp report(table, totals, tenants, duration) do
     :telemetry.execute(
       @telemetry,
-      %{deleted: deleted, tenants_at_budget: at_budget, tenants: tenants, duration_ms: duration},
+      %{
+        deleted: totals.deleted,
+        tenants_at_budget: totals.at_budget,
+        tenants_failed: totals.failed,
+        tenants: tenants,
+        duration_ms: duration
+      },
       %{table: table}
     )
   end
@@ -244,11 +390,16 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorker do
   end
 
   defp log_run(%{trace: trace, intake: intake}, tenants) do
-    if trace.deleted > 0 or intake.deleted > 0 or trace.at_budget > 0 or intake.at_budget > 0 do
+    noteworthy? =
+      Enum.any?([trace, intake], fn t -> t.deleted > 0 or t.at_budget > 0 or t.failed > 0 end)
+
+    if noteworthy? do
       Logger.info(
         "DeliveryLoopPruneWorker: tenants=#{tenants} " <>
-          "runner_trace_events=#{trace.deleted} (at_budget=#{trace.at_budget}) " <>
-          "intake_deliveries=#{intake.deleted} (at_budget=#{intake.at_budget})"
+          "runner_trace_events=#{trace.deleted} " <>
+          "(at_budget=#{trace.at_budget} failed=#{trace.failed}) " <>
+          "intake_deliveries=#{intake.deleted} " <>
+          "(at_budget=#{intake.at_budget} failed=#{intake.failed})"
       )
     end
 

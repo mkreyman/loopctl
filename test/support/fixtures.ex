@@ -896,12 +896,22 @@ defmodule Loopctl.Fixtures do
         tenant
       end
 
-    # US-26.7.1: trust_tier is excluded from create_changeset's cast (never
-    # settable from a public changeset) — set it programmatically here,
-    # mirroring the audit_signing_public_key post-insert pattern above.
-    tenant
-    |> Ecto.Changeset.change(trust_tier: trust_tier)
-    |> AdminRepo.update!()
+    tenant =
+      tenant
+      |> Ecto.Changeset.change(trust_tier: trust_tier)
+      |> AdminRepo.update!()
+
+    # `create_changeset` PUTS `settings: %{}` — the create surface never accepts operator
+    # settings — so a fixture that passes them has to write them afterwards, like the two
+    # fields above. Without this a test asking for a tenant setting silently gets `%{}` and
+    # asserts against the default it was trying to override.
+    case Map.get(data, :settings, %{}) do
+      empty when empty == %{} ->
+        tenant
+
+      settings ->
+        tenant |> Ecto.Changeset.change(settings: settings) |> AdminRepo.update!()
+    end
   end
 
   def fixture(:root_authenticator, attrs) do

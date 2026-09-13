@@ -106,10 +106,17 @@ defmodule Loopctl.Intake do
 
   @issue_actions ~w(opened edited reopened closed labeled unlabeled)
 
-  # Retention (see "Retention" in the moduledoc). One DELETE statement's worth of rows, one
-  # tenant's worth per run, and the timeouts each statement runs under.
-  @prune_batch_size 1_000
-  @prune_budget 20_000
+  # Retention (see "Retention" in the moduledoc). DELIBERATELY an order of magnitude below the
+  # trace pruner's, because this half runs on `AdminRepo`, whose pool is 3 connections that
+  # `ValidateWitnessHeader` and the Postgres rate limiter touch on every authenticated
+  # request. A batch is its own short transaction, so the connection goes back to the pool
+  # between batches rather than being held for the run — but the batch is also the longest
+  # single statement, so 200 rows keeps it short and the 2,000-row budget keeps a first run
+  # after deploy to at most ten of them per tenant. Hourly, that budget still reclaims 48,000
+  # deliveries a day per tenant, orders of magnitude above any GitHub webhook rate, so the
+  # smaller numbers cost nothing in steady state and only lengthen the initial drain.
+  @prune_batch_size 200
+  @prune_budget 2_000
   @prune_statement_timeout_ms 15_000
   @prune_lock_timeout_ms 5_000
 
@@ -386,23 +393,21 @@ defmodule Loopctl.Intake do
 
   # The ONE stop, as in `Loopctl.Runners.DispatchLedger.prune_trace_events/3`: every batch
   # recurses through here, so this clause is the only place `budget_exhausted` becomes true.
-  defp prune_deliveries_loop(_tenant_id, _cutoff, _batch, budget, deleted) when deleted >= budget,
-    do: %{deleted: deleted, budget_exhausted: true}
+  # It PROBES rather than assuming — a tenant with exactly `budget` eligible rows has none
+  # left, and reporting that as "budget reached, rows left" is a false positive on the very
+  # signal an operator alerts on.
+  defp prune_deliveries_loop(tenant_id, cutoff, _batch, budget, deleted) when deleted >= budget,
+    do: %{deleted: deleted, budget_exhausted: more_deliveries?(tenant_id, cutoff)}
 
   defp prune_deliveries_loop(tenant_id, cutoff, batch_size, budget, deleted) do
     take = min(batch_size, budget - deleted)
 
-    {:ok, count} =
-      AdminRepo.transaction(fn ->
-        LocalGuc.scoped(AdminRepo, ["statement_timeout", "lock_timeout"], fn ->
-          AdminRepo.query!("SET LOCAL statement_timeout = #{@prune_statement_timeout_ms}")
-          AdminRepo.query!("SET LOCAL lock_timeout = #{@prune_lock_timeout_ms}")
-
-          delete_deliveries(
-            tenant_id,
-            AdminRepo.all(prunable_deliveries(tenant_id, cutoff, take))
-          )
-        end)
+    count =
+      bounded(fn ->
+        delete_deliveries(
+          tenant_id,
+          AdminRepo.all(prunable_deliveries(tenant_id, cutoff, take))
+        )
       end)
 
     if count == 0 do
@@ -410,6 +415,37 @@ defmodule Loopctl.Intake do
     else
       prune_deliveries_loop(tenant_id, cutoff, batch_size, budget, deleted + count)
     end
+  end
+
+  # Is anything still eligible? Read WITHOUT the row lock: this decides a report, so it must
+  # not take locks a concurrent run would then skip, and `SKIP LOCKED` would make the answer
+  # depend on what another run happens to hold.
+  defp more_deliveries?(tenant_id, cutoff) do
+    bounded(fn ->
+      tenant_id
+      |> prunable_deliveries(cutoff, 1)
+      |> exclude(:lock)
+      |> AdminRepo.exists?()
+    end)
+  end
+
+  # One batch, or the probe: its own transaction under its own bounded timeouts, scoped by
+  # `LocalGuc` so neither outlives it. Both GUCs go in ONE round trip — this runs on the
+  # 3-connection `AdminRepo` pool, where every avoidable round trip is a request's turn.
+  defp bounded(fun) do
+    {:ok, result} =
+      AdminRepo.transaction(fn ->
+        LocalGuc.scoped(AdminRepo, ["statement_timeout", "lock_timeout"], fn ->
+          AdminRepo.query!(
+            "SELECT set_config('statement_timeout', $1, true), set_config('lock_timeout', $2, true)",
+            ["#{@prune_statement_timeout_ms}ms", "#{@prune_lock_timeout_ms}ms"]
+          )
+
+          fun.()
+        end)
+      end)
+
+    result
   end
 
   defp delete_deliveries(_tenant_id, []), do: 0

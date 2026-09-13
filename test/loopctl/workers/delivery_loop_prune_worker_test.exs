@@ -262,6 +262,26 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorkerTest do
       assert length(trace_seqs(ctx.tenant_id, ctx.dispatch)) == 2
     end
 
+    test "a tenant with exactly its budget of eligible rows is NOT reported at budget", ctx do
+      # The probe is the difference between "stopped because there is more" and "stopped
+      # because that was all", and an operator alerts on the first.
+      assert %{deleted: 5, budget_exhausted: false} =
+               DispatchLedger.prune_trace_events(ctx.tenant_id, DateTime.utc_now(),
+                 batch_size: 2,
+                 budget: 5
+               )
+
+      assert trace_seqs(ctx.tenant_id, ctx.dispatch) == []
+    end
+
+    test "one more eligible row than the budget IS reported at budget", ctx do
+      assert %{deleted: 4, budget_exhausted: true} =
+               DispatchLedger.prune_trace_events(ctx.tenant_id, DateTime.utc_now(),
+                 batch_size: 2,
+                 budget: 4
+               )
+    end
+
     test "a batch smaller than the work still drains it inside one run", ctx do
       assert %{deleted: 5, budget_exhausted: false} =
                DispatchLedger.prune_trace_events(ctx.tenant_id, DateTime.utc_now(), batch_size: 2)
@@ -422,6 +442,24 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorkerTest do
       assert Intake.prune_budget() > 4
     end
 
+    test "a tenant with exactly its budget of deliveries is NOT reported at budget", ctx do
+      for n <- 1..3 do
+        fixture(:intake_delivery, %{
+          source: ctx.source,
+          github_delivery_id: "f#{n}",
+          inserted_at: ago(200 + n)
+        })
+      end
+
+      assert %{deleted: 3, budget_exhausted: false} =
+               Intake.prune_deliveries(ctx.tenant_id, DateTime.utc_now(),
+                 batch_size: 2,
+                 budget: 3
+               )
+
+      assert delivery_ids(ctx.tenant_id) == []
+    end
+
     test "the budget caps the last delivery batch, so a run never overshoots it", ctx do
       for n <- 1..4 do
         fixture(:intake_delivery, %{
@@ -438,6 +476,155 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorkerTest do
                )
 
       assert delivery_ids(ctx.tenant_id) == ["e2", "e1"]
+    end
+  end
+
+  describe "a window an operator actually persisted" do
+    test "perform/1 reads the window out of tenants.settings, not just a struct in a test" do
+      # Every other window case hand-builds the struct. This one persists the setting and
+      # drives the whole worker, so the KEY the code reads is bound to the key an operator
+      # writes: rename one and this is the test that notices.
+      tenant = fixture(:tenant, %{settings: %{"intake_delivery_retention_days" => 40}})
+      {_secret, source} = fixture(:intake_source, %{tenant_id: tenant.id})
+
+      fixture(:intake_delivery, %{
+        source: source,
+        github_delivery_id: "past-forty",
+        inserted_at: ago(50)
+      })
+
+      # Inside the tenant's 40 days, outside nothing: the DEFAULT of 90 would have kept both,
+      # so seeing exactly one go proves the persisted setting is what took effect.
+      fixture(:intake_delivery, %{
+        source: source,
+        github_delivery_id: "inside-forty",
+        inserted_at: ago(35)
+      })
+
+      assert :ok = run()
+      assert delivery_ids(tenant.id) == ["inside-forty"]
+    end
+
+    test "a window above the ceiling is capped rather than handed to Postgres", ctx_free do
+      _ = ctx_free
+      story = fixture(:stage_story, %{})
+      runner = fixture(:stage_runner, %{tenant_id: story.tenant_id})
+      dispatch = terminal_dispatch(story.tenant_id, runner)
+
+      fixture(:trace_event, %{dispatch: dispatch, seq: 1, inserted_at: ago(4000)})
+      fixture(:trace_event, %{dispatch: dispatch, seq: 2, inserted_at: ago(3000)})
+
+      # A DATE pasted where a day count belongs. Uncapped, the cutoff is ~55,000 years back,
+      # which is outside timestamptz and makes Postgres refuse the query.
+      tenant = tenant_struct(story.tenant_id, %{"runner_trace_retention_days" => 20_260_918})
+
+      assert %{trace: %{deleted: 1, failed: 0}} =
+               DeliveryLoopPruneWorker.prune_tenant(tenant, DateTime.utc_now())
+
+      # Capped at the ceiling, so the 4000-day row went and the 3000-day one stayed.
+      assert trace_seqs(story.tenant_id, dispatch) == [2]
+      assert DeliveryLoopPruneWorker.max_retention_days() == 3650
+    end
+  end
+
+  describe "a prune that fails" do
+    setup do
+      story = fixture(:stage_story, %{})
+      runner = fixture(:stage_runner, %{tenant_id: story.tenant_id})
+      dispatch = terminal_dispatch(story.tenant_id, runner)
+      fixture(:trace_event, %{dispatch: dispatch, seq: 1, inserted_at: ago(30)})
+
+      %{tenant_id: story.tenant_id, dispatch: dispatch}
+    end
+
+    test "is contained to its own table: it is counted, not raised, and the other half runs",
+         ctx do
+      {_secret, source} = fixture(:intake_source, %{})
+
+      fixture(:intake_delivery, %{
+        source: source,
+        github_delivery_id: "unaffected",
+        inserted_at: ago(200)
+      })
+
+      # A negative LIMIT is a Postgrex error the moment the first batch runs — the cheapest
+      # real database failure to provoke, and NOT a transient one, so it is a hard failure.
+      result =
+        DeliveryLoopPruneWorker.prune_tenant(
+          %Tenant{id: ctx.tenant_id, settings: %{}},
+          DateTime.utc_now(),
+          batch_size: -1
+        )
+
+      assert %{trace: %{deleted: 0, failed: 1, hard_failed: 1, budget_exhausted: false}} = result
+
+      # The trace half of this tenant blew up and the trace rows are untouched...
+      assert trace_seqs(ctx.tenant_id, ctx.dispatch) == [1]
+
+      # ...and the intake half of the SAME call still ran, which is the property the whole
+      # per-unit guard exists for. (Its own delete then failed on the same negative LIMIT, so
+      # it is counted too rather than silently passing.)
+      assert %{intake: %{failed: 1, hard_failed: 1}} = result
+      assert delivery_ids(source.tenant_id) == ["unaffected"]
+    end
+
+    test "does not stop the fold, and the run still reports what it managed" do
+      # TWO tenants, both of whose prunes will fail. `tenants_failed == 2` is the assertion
+      # that matters: the fold reached the second tenant. Without the guard the first raise
+      # escapes, and since `Tenants.list_tenants/1` orders by name it is deterministically
+      # the same later tenants that are never pruned, hourly and for ever.
+      {_s1, one} = fixture(:intake_source, %{})
+      {_s2, two} = fixture(:intake_source, %{})
+
+      for source <- [one, two] do
+        fixture(:intake_delivery, %{
+          source: source,
+          github_delivery_id: "keep-#{source.tenant_id}",
+          inserted_at: ago(200)
+        })
+      end
+
+      ref = :telemetry_test.attach_event_handlers(self(), [[:loopctl, :delivery_loop, :prune]])
+      on_exit(fn -> :telemetry.detach(ref) end)
+
+      assert {:error, message} =
+               DeliveryLoopPruneWorker.perform(%Oban.Job{args: %{"batch_size" => -1}})
+
+      assert message =~ "non-retryable"
+
+      assert_receive {[:loopctl, :delivery_loop, :prune], ^ref, intake,
+                      %{
+                        table: "intake_deliveries"
+                      }}
+
+      assert_receive {[:loopctl, :delivery_loop, :prune], ^ref, trace,
+                      %{
+                        table: "runner_trace_events"
+                      }}
+
+      # Emitted DESPITE the failures, and carrying them.
+      assert intake.tenants_failed == 2
+      assert trace.tenants_failed == 2
+      assert intake.deleted == 0
+
+      # And nothing was deleted on the way.
+      assert delivery_ids(one.tenant_id) == ["keep-#{one.tenant_id}"]
+      assert delivery_ids(two.tenant_id) == ["keep-#{two.tenant_id}"]
+    end
+
+    test "a later valid run over the same tenant still prunes", ctx do
+      _ =
+        DeliveryLoopPruneWorker.prune_tenant(
+          %Tenant{id: ctx.tenant_id, settings: %{}},
+          DateTime.utc_now(),
+          batch_size: -1
+        )
+
+      assert %{trace: %{deleted: 1, failed: 0, hard_failed: 0}} =
+               DeliveryLoopPruneWorker.prune_tenant(
+                 tenant_struct(ctx.tenant_id),
+                 DateTime.utc_now()
+               )
     end
   end
 
@@ -464,6 +651,7 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorkerTest do
 
       assert intake_measurements.deleted == 1
       assert intake_measurements.tenants_at_budget == 0
+      assert intake_measurements.tenants_failed == 0
       assert intake_measurements.tenants >= 1
       assert is_integer(intake_measurements.duration_ms)
 

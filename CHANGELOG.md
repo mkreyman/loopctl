@@ -16,10 +16,18 @@ All notable changes to loopctl are documented here.
   **Two windows, both tenant settings, no new environment variable.**
   `runner_trace_retention_days` (default 14) and `intake_delivery_retention_days` (default
   90), in `tenants.settings`, so an operator can widen one tenant's window without a deploy.
-  A setting that is not a positive integer is ignored with a warning. **A setting below a
-  floor is raised to the floor**: 30 days for the delivery log, because GitHub keeps roughly
-  30 days of delivery history and its Redeliver button reuses the delivery id, so a row
-  younger than that is still the idempotency evidence that makes a replay a no-op.
+  A setting that is not a positive integer is ignored with a warning, and one above 3650 days
+  is capped there (a date pasted where a day count belongs puts the cutoff outside
+  `timestamptz` range). **A setting below a floor is raised to the floor**: 30 days for the
+  delivery log, because GitHub keeps roughly 30 days of delivery history and its Redeliver
+  button reuses the delivery id, so a row younger than that is still the idempotency evidence
+  that makes a replay a no-op.
+
+  **To drain a backlog faster than the hourly cadence**, enqueue the worker with
+  `%{"batch_size" => n, "budget" => n}`; the cron entry passes no args and uses the defaults.
+  One tenant's failure never stops the others — it is logged with the tenant id, counted on
+  the run's telemetry as `tenants_failed`, and retried on the next tick when it was a
+  transient database fault or reported as a job error when it was not.
 
   **Age alone never decides.** A trace event whose dispatch has not been released is kept
   whatever its age — an unreleased slot means the session may still be running — and a
@@ -27,7 +35,8 @@ All notable changes to loopctl are documented here.
   Neither table is the audit chain, which this never touches.
 
   **New migration** adding two indexes (`runner_trace_events (tenant_id, inserted_at)` and
-  `intake_records (tenant_id, source_id, last_delivery_id)`) — no manual step, no backfill.
+  `intake_records (tenant_id, source_id, last_delivery_id)`), both `CONCURRENTLY` so the build
+  never blocks a runner's trace writes — no manual step, no backfill.
   Each run emits `[:loopctl, :delivery_loop, :prune]` per table with the rows deleted and the
   tenants that stopped at their budget: a `tenants_at_budget` that stays non-zero across runs
   is the pruner failing to keep up with the write rate.

@@ -626,23 +626,21 @@ defmodule Loopctl.Runners.DispatchLedger do
     prune_loop(tenant_id, cutoff, batch_size, budget, 0)
   end
 
-  # The ONE stop: reaching the budget ends the run with rows still eligible. Every batch
-  # recurses through here, including the one that lands exactly on the budget, so this clause
-  # is the only place `budget_exhausted` becomes true and a test can reach it.
-  defp prune_loop(_tenant_id, _cutoff, _batch_size, budget, deleted) when deleted >= budget,
-    do: %{deleted: deleted, budget_exhausted: true}
+  # The ONE stop: reaching the budget ends the run. Every batch recurses through here,
+  # including the one that lands exactly on the budget, so this clause is the only place
+  # `budget_exhausted` becomes true and a test can reach it. It PROBES for a further candidate
+  # rather than assuming one — a tenant with exactly `budget` eligible rows has none left, and
+  # reporting that as "budget reached, rows left" is a false positive on the one signal an
+  # operator alerts on.
+  defp prune_loop(tenant_id, cutoff, _batch_size, budget, deleted) when deleted >= budget,
+    do: %{deleted: deleted, budget_exhausted: more_events?(tenant_id, cutoff)}
 
   defp prune_loop(tenant_id, cutoff, batch_size, budget, deleted) do
     take = min(batch_size, budget - deleted)
 
-    {:ok, count} =
-      in_tenant(tenant_id, fn ->
-        LocalGuc.scoped(Repo, ["statement_timeout", "lock_timeout"], fn ->
-          Repo.query!("SET LOCAL statement_timeout = #{@prune_statement_timeout_ms}")
-          Repo.query!("SET LOCAL lock_timeout = #{Capacity.lock_timeout_ms()}")
-
-          delete_events(tenant_id, Repo.all(prunable_events(tenant_id, cutoff, take)))
-        end)
+    count =
+      bounded(tenant_id, fn ->
+        delete_events(tenant_id, Repo.all(prunable_events(tenant_id, cutoff, take)))
       end)
 
     if count == 0 do
@@ -650,6 +648,36 @@ defmodule Loopctl.Runners.DispatchLedger do
     else
       prune_loop(tenant_id, cutoff, batch_size, budget, deleted + count)
     end
+  end
+
+  # Is anything still eligible? Read WITHOUT the row lock: this decides a report, so it must
+  # not take locks a concurrent run would then skip, and under `SKIP LOCKED` the answer would
+  # depend on what another run happens to hold rather than on what exists.
+  defp more_events?(tenant_id, cutoff) do
+    bounded(tenant_id, fn ->
+      tenant_id
+      |> prunable_events(cutoff, 1)
+      |> exclude(:lock)
+      |> Repo.exists?()
+    end)
+  end
+
+  # One batch, or the probe: its own RLS transaction under its own bounded timeouts, scoped by
+  # `LocalGuc` so neither outlives it. Both GUCs are set in ONE round trip.
+  defp bounded(tenant_id, fun) do
+    {:ok, result} =
+      in_tenant(tenant_id, fn ->
+        LocalGuc.scoped(Repo, ["statement_timeout", "lock_timeout"], fn ->
+          Repo.query!(
+            "SELECT set_config('statement_timeout', $1, true), set_config('lock_timeout', $2, true)",
+            ["#{@prune_statement_timeout_ms}ms", "#{Capacity.lock_timeout_ms()}ms"]
+          )
+
+          fun.()
+        end)
+      end)
+
+    result
   end
 
   defp delete_events(_tenant_id, []), do: 0
