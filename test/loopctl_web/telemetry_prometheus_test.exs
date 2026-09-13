@@ -62,5 +62,29 @@ defmodule LoopctlWeb.TelemetryPrometheusTest do
 
       refute scrape =~ "runner_id="
     end
+
+    test "a channel event's tag is the declared event or \"unknown\", never the client's string" do
+      name = :"telemetry_test_events_#{System.unique_integer([:positive])}"
+
+      start_supervised!(
+        {TelemetryMetricsPrometheus.Core,
+         metrics: LoopctlWeb.Telemetry.metrics(), name: name, start_async: false}
+      )
+
+      for event <- ["trace", "made-up-#{System.unique_integer([:positive])}", "another-one"] do
+        :telemetry.execute([:phoenix, :channel_handled_in], %{duration: 1_000}, %{
+          ref: "1",
+          event: event,
+          params: %{},
+          socket: nil
+        })
+      end
+
+      scrape = TelemetryMetricsPrometheus.Core.scrape(name)
+      assert scrape =~ ~s(phoenix_channel_handled_in_duration_count{event="trace"} 1)
+      assert scrape =~ ~s(phoenix_channel_handled_in_duration_count{event="unknown"} 2)
+      refute scrape =~ "made-up"
+      refute scrape =~ "another-one"
+    end
   end
 end

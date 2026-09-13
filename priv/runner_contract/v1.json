@@ -523,7 +523,8 @@
       "min_interval_ms": {
         "status": 1000,
         "trace": 50,
-        "trace_cursor": 50
+        "trace_cursor": 50,
+        "unknown_event": 1000
       },
       "refusal_max_detail_length": 500,
       "trace_max_batch_bytes": 60000,

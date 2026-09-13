@@ -45,4 +45,32 @@ defmodule LoopctlWeb.RenewClaimLoggingTest do
     assert log =~ "agent_id=#{inspect(agent.id)}"
     assert log =~ "tenant_id=#{tenant.id}"
   end
+
+  test "a claim_epoch that is not an epoch is logged as :invalid, never its value", %{conn: conn} do
+    tenant = fixture(:tenant)
+    agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+    {raw_key, _key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})
+    story = fixture(:story, %{tenant_id: tenant.id, agent_status: :contracted})
+    marker = "EPOCHVALUE-" <> String.duplicate("x", 10_000)
+
+    conn
+    |> put_req_header("authorization", "Bearer #{raw_key}")
+    |> post(~p"/api/v1/stories/#{story.id}/claim")
+    |> json_response(200)
+
+    for epoch <- [marker, %{"nested" => %{"deep" => marker}}, 9_223_372_036_854_775_808, -1] do
+      log =
+        capture_log([level: :info], fn ->
+          build_conn()
+          |> put_req_header("authorization", "Bearer #{raw_key}")
+          |> post(~p"/api/v1/stories/#{story.id}/renew-claim", %{"claim_epoch" => epoch})
+          |> then(&assert(&1.status in [400, 409]))
+        end)
+
+      assert log =~ "presented_epoch=:invalid", "#{inspect(epoch, limit: 3)} not marked invalid"
+      refute log =~ "EPOCHVALUE"
+      refute log =~ "nested"
+      refute log =~ "9223372036854775808"
+    end
+  end
 end

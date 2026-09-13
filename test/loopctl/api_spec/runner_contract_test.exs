@@ -72,7 +72,10 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       assert connection["limits"]["dispatch_reply_burst"] == RunnerContract.dispatch_reply_burst()
 
       assert connection["limits"]["min_interval_ms"] ==
-               Map.new(~w(status trace trace_cursor), &{&1, RunnerContract.min_interval_ms(&1)})
+               Map.new(
+                 ~w(status trace trace_cursor unknown_event),
+                 &{&1, RunnerContract.min_interval_ms(&1)}
+               )
 
       assert connection["limits"]["trace_max_event_data_bytes"] ==
                RunnerTraceEvent.max_data_bytes()

@@ -92,6 +92,7 @@ defmodule LoopctlWeb.RunnerChannel do
   @reply_refill_ms RunnerContract.dispatch_reply_burst() |> Map.fetch!("refill_interval_ms")
   @min_trace_interval_ms RunnerContract.min_interval_ms("trace")
   @min_cursor_interval_ms RunnerContract.min_interval_ms("trace_cursor")
+  @min_unknown_interval_ms RunnerContract.min_interval_ms("unknown_event")
   @join_window_ms 60_000
   @max_joins 30
 
@@ -125,6 +126,7 @@ defmodule LoopctlWeb.RunnerChannel do
        |> assign(:reply_bucket, :full)
        |> assign(:last_trace_at, :never)
        |> assign(:last_cursor_at, :never)
+       |> assign(:last_unknown_at, :never)
        |> assign(:presence_ref, nil)}
     else
       {:error, reason} -> {:error, refuse_join(socket, join_error(reason))}
@@ -178,25 +180,26 @@ defmodule LoopctlWeb.RunnerChannel do
   # - a halt can land between that read and this message, and a dispatch is custody
   #   progress. Re-read fresh, from THIS channel's own tenant.
   def handle_info({:runner_dispatch, dispatch}, socket) do
-    Logger.metadata(
+    correlation = [
       dispatch_id: dispatch.dispatch_id,
       story_id: dispatch.story_id,
-      claim_epoch: dispatch.claim_epoch,
-      run_id: nil
-    )
+      claim_epoch: dispatch.claim_epoch
+    ]
 
-    cond do
-      not sole_live_socket?(socket) ->
-        drop_dispatch(socket, dispatch, "not the only live socket for this runner")
+    with_correlation(correlation, fn ->
+      cond do
+        not sole_live_socket?(socket) ->
+          drop_dispatch(socket, dispatch, "not the only live socket for this runner")
 
-      Runners.custody_halted?(socket.assigns.tenant_id) ->
-        drop_dispatch(socket, dispatch, "tenant custody halted")
+        Runners.custody_halted?(socket.assigns.tenant_id) ->
+          drop_dispatch(socket, dispatch, "tenant custody halted")
 
-      true ->
-        push(socket, "dispatch", dispatch)
-        DispatchLedger.mark_pushed(socket.assigns.tenant_id, dispatch.dispatch_id)
-        {:noreply, socket}
-    end
+        true ->
+          push(socket, "dispatch", dispatch)
+          DispatchLedger.mark_pushed(socket.assigns.tenant_id, dispatch.dispatch_id)
+          {:noreply, socket}
+      end
+    end)
   end
 
   def handle_info(:recheck, socket) do
@@ -212,8 +215,9 @@ defmodule LoopctlWeb.RunnerChannel do
 
   @impl true
   def handle_in(event, payload, socket) do
-    put_message_metadata(payload)
-    handle_message(event, payload, socket)
+    with_correlation(message_correlation(payload), fn ->
+      handle_message(event, payload, socket)
+    end)
   end
 
   defp handle_message("status", payload, socket) do
@@ -305,8 +309,19 @@ defmodule LoopctlWeb.RunnerChannel do
   end
 
   # An unknown event's name is the runner's own string: it is never a telemetry tag.
-  defp handle_message(_event, _payload, socket),
-    do: refuse(socket, "unknown", %{reason: "unknown_event"})
+  # Unknown events have a floor of their own: each one is always refused and logged, so a
+  # runner looping over made-up names must not buy a log line (or a reply payload) per frame.
+  defp handle_message(_event, _payload, socket) do
+    now = System.monotonic_time(:millisecond)
+
+    case MinInterval.check(socket.assigns.last_unknown_at, now, @min_unknown_interval_ms) do
+      :ok ->
+        refuse(assign(socket, :last_unknown_at, now), "unknown", %{reason: "unknown_event"})
+
+      {:error, :rate_limited} ->
+        rate_limited(socket, "unknown", @min_unknown_interval_ms)
+    end
+  end
 
   @impl true
   def terminate(reason, socket) do
@@ -374,13 +389,27 @@ defmodule LoopctlWeb.RunnerChannel do
   # Correlation ids of the message being handled, replaced on every message. Read from the
   # payload as sent, so only short strings and integers are taken — a runner cannot put an
   # arbitrary value into the log stream through them.
-  defp put_message_metadata(payload) do
-    Logger.metadata(
+  defp message_correlation(payload) do
+    [
       dispatch_id: correlation_id(payload, "dispatch_id"),
       run_id: correlation_id(payload, "run_id"),
-      claim_epoch: correlation_epoch(payload),
-      story_id: nil
-    )
+      claim_epoch: correlation_epoch(payload)
+    ]
+  end
+
+  @correlation_keys [:dispatch_id, :run_id, :story_id, :claim_epoch]
+
+  # A message's correlation ids label only the lines logged WHILE it is handled. They are
+  # cleared afterwards, so a later close, recheck or disconnect line carries only the sticky
+  # runner identity set at join — never the story of whatever dispatch came through last.
+  defp with_correlation(correlation, fun) do
+    Logger.metadata(correlation)
+
+    try do
+      fun.()
+    after
+      Logger.metadata(Enum.map(@correlation_keys, &{&1, nil}))
+    end
   end
 
   defp correlation_id(%{} = payload, key) do

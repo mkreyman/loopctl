@@ -839,30 +839,32 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
     defp floor_cases(dispatch) do
       run_id = Ecto.UUID.generate()
 
+      # {published key, event pushed, assign the floor is timed from, payload}
       [
-        {"status", :last_status_at, %{"in_flight" => 1}},
-        {"trace", :last_trace_at,
+        {"status", "status", :last_status_at, %{"in_flight" => 1}},
+        {"trace", "trace", :last_trace_at,
          build(:runner_trace_batch, %{
            :seqs => [],
            "run_id" => run_id,
            "dispatch_id" => dispatch["dispatch_id"],
            "claim_epoch" => dispatch["claim_epoch"]
          })},
-        {"trace_cursor", :last_cursor_at, %{"run_id" => run_id}}
+        {"trace_cursor", "trace_cursor", :last_cursor_at, %{"run_id" => run_id}},
+        {"unknown_event", "no_such_event", :last_unknown_at, %{}}
       ]
     end
 
     test "the export publishes every inbound event's floor, and the channel refuses with that value",
          %{channel: channel, dispatch: dispatch} do
       published = RunnerContract.json_schema()["x-connection"]["limits"]["min_interval_ms"]
-      events = for {event, _, _} <- floor_cases(dispatch), do: event
-      assert Enum.sort(Map.keys(published)) == Enum.sort(events)
+      keys = for {key, _, _, _} <- floor_cases(dispatch), do: key
+      assert Enum.sort(Map.keys(published)) == Enum.sort(keys)
 
-      for {event, assign, payload} <- floor_cases(dispatch) do
+      for {event, pushed, assign, payload} <- floor_cases(dispatch) do
         assert published[event] == RunnerContract.min_interval_ms(event)
 
         pin_interval(channel, assign)
-        ref = push(channel, event, payload)
+        ref = push(channel, pushed, payload)
 
         assert_reply ref,
                      :error,
@@ -879,7 +881,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       ref = push(channel, "dispatch_reply", accept(dispatch))
       assert_reply ref, :ok, _, @reply_timeout
 
-      for {event, assign, payload} <- floor_cases(dispatch) do
+      for {event, pushed, assign, payload} <- floor_cases(dispatch) do
         # Timed exactly one millisecond past the published floor: an enforced floor longer
         # than the published one refuses it.
         :sys.replace_state(channel.channel_pid, fn socket ->
@@ -887,7 +889,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
           %{socket | assigns: Map.put(socket.assigns, assign, at)}
         end)
 
-        ref = push(channel, event, payload)
+        ref = push(channel, pushed, payload)
         assert_reply ref, status, reply, @reply_timeout
         refute match?(%{reason: "rate_limited"}, reply), "#{event} (#{status}) was rate limited"
       end

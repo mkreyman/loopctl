@@ -132,7 +132,7 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
       assert Map.has_key?(metadata, :machine) or Runners.machine_id() == nil
     end
 
-    test "each message's correlation ids are set while it is handled, and replaced by the next" do
+    test "a message's correlation ids label the lines logged while it is handled, then are cleared" do
       %{channel: channel} = joined_runner()
       dispatch_id = Ecto.UUID.generate()
       run_id = Ecto.UUID.generate()
@@ -144,21 +144,46 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
         "events" => []
       }
 
-      ref = push(channel, "trace", batch)
-      assert_reply ref, :error, %{reason: "unknown_dispatch"}, @reply_timeout
+      log =
+        capture_log([level: :info], fn ->
+          ref = push(channel, "trace", batch)
+          assert_reply ref, :error, %{reason: "unknown_dispatch"}, @reply_timeout
+        end)
 
-      metadata = process_metadata(channel.channel_pid)
-      assert metadata[:dispatch_id] == dispatch_id
-      assert metadata[:run_id] == run_id
-      assert metadata[:claim_epoch] == 7
-
-      ref = push(channel, "status", %{"in_flight" => 0})
-      assert_reply ref, :ok, _, @reply_timeout
+      # The refusal line (logged while handling) carries them as metadata.
+      assert log =~ "dispatch_id=#{dispatch_id} run_id=#{run_id} claim_epoch=7"
 
       metadata = process_metadata(channel.channel_pid)
       refute Map.has_key?(metadata, :dispatch_id)
       refute Map.has_key?(metadata, :run_id)
+      refute Map.has_key?(metadata, :claim_epoch)
       assert metadata[:runner_id]
+    end
+
+    test "a pushed dispatch's story does not label the channel's later disconnect and close lines" do
+      %{runner: runner, channel: channel} = joined_runner()
+      Process.unlink(channel.channel_pid)
+      payload = dispatch_payload(runner.tenant_id)
+
+      assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
+      assert_push "dispatch", _, @reply_timeout
+      _ = :sys.get_state(channel.channel_pid)
+      refute Map.has_key?(process_metadata(channel.channel_pid), :story_id)
+
+      {:ok, key} = Auth.get_api_key(runner.tenant_id, runner.api_key_id)
+      {:ok, _} = Auth.revoke_api_key(key)
+
+      log =
+        capture_log([level: :info], fn ->
+          send(channel.channel_pid, :recheck)
+          assert eventually(fn -> not Process.alive?(channel.channel_pid) end, @reply_timeout)
+        end)
+
+      assert log =~ "runner disconnecting: reason=no_longer_authorized"
+      assert log =~ "runner channel closed"
+      refute log =~ "story_id="
+      refute log =~ "dispatch_id="
+      refute log =~ payload["story_id"]
     end
 
     test "a runner-supplied correlation id longer than an id is not taken into the logs" do
@@ -252,6 +277,31 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
       ref = push(channel, "made-up-#{System.unique_integer()}", %{})
       assert_reply ref, :error, %{reason: "unknown_event"}, @reply_timeout
       assert_received {:refused, _, %{event: "unknown", reason: "unknown_event"}}
+    end
+
+    test "unknown events have a floor: the second inside it is rate_limited, not logged again" do
+      attach_refusals()
+      %{channel: channel} = joined_runner()
+
+      log =
+        capture_log([level: :info], fn ->
+          ref = push(channel, "made-up-one", %{})
+          assert_reply ref, :error, %{reason: "unknown_event"}, @reply_timeout
+
+          # Pinned, so the refusal does not depend on how long the first reply took.
+          :sys.replace_state(channel.channel_pid, fn socket ->
+            at = System.monotonic_time(:millisecond) + 60_000
+            %{socket | assigns: Map.put(socket.assigns, :last_unknown_at, at)}
+          end)
+
+          ref = push(channel, "made-up-two", %{})
+          assert_reply ref, :error, %{reason: "rate_limited", min_interval_ms: ms}, @reply_timeout
+          assert ms == RunnerContract.min_interval_ms("unknown_event")
+        end)
+
+      assert_received {:refused, _, %{event: "unknown", reason: "unknown_event"}}
+      assert_received {:refused, _, %{event: "unknown", reason: "rate_limited"}}
+      assert length(String.split(log, "reason=unknown_event")) == 2
     end
 
     test "a refused join is counted and logged with its reason" do

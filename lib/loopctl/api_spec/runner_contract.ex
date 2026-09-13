@@ -48,9 +48,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   Published in `x-connection.limits`, and enforced per channel:
 
   - `min_interval_ms` (`min_interval_ms/1`) — `status` 1000 ms, `trace` 50 ms,
-    `trace_cursor` 50 ms. Each event has its OWN floor: a `trace` batch is not held back
-    by a recent `status` or `trace_cursor`, so the resume sequence (cursor, then batches)
-    is never refused, and a rejoining runner ships up to 20 batches a second.
+    `trace_cursor` 50 ms, and `unknown_event` 1000 ms for any event the contract does not
+    declare. Each event has its OWN floor: a `trace` batch is not held back by a recent
+    `status` or `trace_cursor`, so the resume sequence (cursor, then batches) is never
+    refused, and a rejoining runner ships up to 20 batches a second.
   - `dispatch_reply_burst` (`dispatch_reply_burst/0`) — a bucket of 8 replies that refills
     one every 250 ms, so several dispatches can be answered back to back.
 
@@ -582,7 +583,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   @min_interval_ms %{
     "status" => 1_000,
     "trace" => 50,
-    "trace_cursor" => 50
+    "trace_cursor" => 50,
+    # Any event the contract does not declare. Always refused (`unknown_event`), so the floor
+    # only bounds how often a runner can make loopctl reply and log about one.
+    "unknown_event" => 1_000
   }
 
   # `dispatch_reply` is a bucket rather than a floor: a runner handed several dispatches at

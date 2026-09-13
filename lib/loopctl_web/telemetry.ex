@@ -112,8 +112,12 @@ defmodule LoopctlWeb.Telemetry do
         unit: {:native, :millisecond},
         reporter_options: [buckets: @latency_buckets_ms]
       ),
+      # `event` here is whatever string the CLIENT sent (Phoenix puts the raw frame's event
+      # in the metadata), so it is mapped onto the declared runner events plus "unknown":
+      # otherwise every made-up name is a new, permanent histogram series.
       distribution("phoenix.channel_handled_in.duration",
         tags: [:event],
+        tag_values: &__MODULE__.bounded_channel_event/1,
         unit: {:native, :millisecond},
         reporter_options: [buckets: @latency_buckets_ms]
       ),
@@ -167,6 +171,19 @@ defmodule LoopctlWeb.Telemetry do
       last_value("vm.total_run_queue_lengths.io")
     ]
   end
+
+  @declared_channel_events Loopctl.ApiSpec.RunnerContract.error_reasons() |> Map.keys()
+
+  @doc """
+  Bounds `phoenix.channel_handled_in`'s `event` tag (issue #815): a runner-to-control event
+  the contract declares keeps its name, anything else is `"unknown"`. Every other tag in
+  `metrics/0` is server-derived — `route` is the router's matched pattern, never the path.
+  """
+  @spec bounded_channel_event(map()) :: %{event: String.t()}
+  def bounded_channel_event(%{event: event}) when event in @declared_channel_events,
+    do: %{event: event}
+
+  def bounded_channel_event(_metadata), do: %{event: "unknown"}
 
   # Public (mirrors `metrics/0` above) so the wiring itself is testable — a test
   # asserts the two US-34.1 Oban poller MFAs are present here, closing the gap

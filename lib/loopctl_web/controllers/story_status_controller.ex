@@ -641,14 +641,27 @@ defmodule LoopctlWeb.StoryStatusController do
         :error -> nil
       end
 
+    presented = loggable_epoch(Map.get(params, "claim_epoch"))
+
     Logger.info(
       "renew_claim refused: reason=#{inspect(refusal_reason(error))} story_id=#{inspect(story_id)} " <>
-        "presented_epoch=#{inspect(Map.get(params, "claim_epoch"))} current_epoch=#{inspect(current)} " <>
+        "presented_epoch=#{inspect(presented)} current_epoch=#{inspect(current)} " <>
         "agent_id=#{inspect(api_key.agent_id)} tenant_id=#{api_key.tenant_id}",
       story_id: story_id,
-      claim_epoch: Map.get(params, "claim_epoch")
+      claim_epoch: presented
     )
   end
+
+  @max_epoch 9_223_372_036_854_775_807
+
+  # The client's `claim_epoch` is written to the log only when it is one: a non-negative
+  # integer a bigint holds. Anything else — a huge string, a nested map — is `:invalid`, never
+  # the value itself.
+  defp loggable_epoch(epoch) when is_integer(epoch) and epoch >= 0 and epoch <= @max_epoch,
+    do: epoch
+
+  defp loggable_epoch(nil), do: nil
+  defp loggable_epoch(_epoch), do: :invalid
 
   defp refusal_reason({:error, reason}) when is_atom(reason), do: reason
   defp refusal_reason({:error, reason, _message}), do: reason

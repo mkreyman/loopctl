@@ -24,7 +24,9 @@ All notable changes to loopctl are documented here.
   `disconnecting` (`RunnerDisconnecting`) with a reason: `runner_revoked`,
   `no_longer_authorized` or `server_shutdown`; a join refused as `not_authorized` carries
   `disconnecting: "join_refused_not_authorized"` in its error reply. `priv/runner_contract/v1.json`
-  is regenerated. A 1.0/1.1 runner still joins and can ignore the new event.
+  is regenerated. A 1.0/1.1 runner still joins and can ignore the new event. Inbound events the
+  contract does not declare now have a floor of their own (`limits.min_interval_ms.unknown_event`,
+  1,000 ms): the second inside it is refused `rate_limited` instead of `unknown_event`.
 
   **`GET /api/v1/runners/pool` entries gain `node` and `machine_id`** (nullable), and so do the
   presence metas behind them. `machine_id` is `FLY_MACHINE_ID`, which Fly injects.
