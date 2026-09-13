@@ -24,8 +24,8 @@ defmodule Loopctl.Intake do
   4. **Record the delivery**, keyed by `X-GitHub-Delivery` under a unique index. A replay
      inserts nothing and changes nothing.
   5. **Apply the event.** `ping` is logged. `issues` with `opened`, `edited`, `reopened`,
-     `closed` or `labeled` updates the issue's intake record. Everything else is logged as
-     `ignored`.
+     `closed`, `labeled` or `unlabeled` updates the issue's intake record. Everything else is
+     logged as `ignored`.
 
   Steps 4 and 5 share one transaction, so a delivery is never marked seen without its
   effect.
@@ -38,9 +38,10 @@ defmodule Loopctl.Intake do
   reason escalates the record, is never cleared by a later delivery, and appends an
   `intake_escalated` entry to the audit chain naming the signals — never the text.
 
-  Out-of-order deliveries: the stored content is replaced only by a delivery whose
-  `issue.updated_at` is not older than the stored one. Its signals are still scanned, since
-  they arrived signed.
+  Out-of-order deliveries: the stored content, `last_action` and `last_delivery_id` are
+  replaced only by a delivery whose `issue.updated_at` is not older than the stored one, so
+  the record always describes one coherent delivery. A stale delivery's signals are still
+  scanned, since they arrived signed.
 
   ## Isolation
 
@@ -70,7 +71,7 @@ defmodule Loopctl.Intake do
   # it. `LoopctlWeb.Plugs.IntakeRawBody` enforces it and the OpenAPI spec states it.
   @max_body_bytes 1_048_576
 
-  @issue_actions ~w(opened edited reopened closed labeled)
+  @issue_actions ~w(opened edited reopened closed labeled unlabeled)
 
   @delivery_id_format ~r/\A[A-Za-z0-9-]{1,128}\z/
   @event_format ~r/\A[a-z_]{1,64}\z/
@@ -462,8 +463,8 @@ defmodule Loopctl.Intake do
     now = DateTime.utc_now()
 
     changes =
-      %{last_action: action, last_delivery_id: delivery_id}
-      |> Map.merge(content_changes(record, issue, extraction))
+      record
+      |> content_changes(issue, extraction, action, delivery_id)
       |> Map.merge(escalation_changes(record, new_reasons, now))
 
     with {:ok, updated} <- AdminRepo.update(Record.apply_changeset(record, changes)),
@@ -518,12 +519,16 @@ defmodule Loopctl.Intake do
     Enum.sort(Enum.uniq(detected ++ extraction.reasons))
   end
 
-  defp content_changes(record, issue, extraction) do
+  # A stale delivery changes nothing but escalation: its action and id stay out of the record
+  # too, or a reordered closed/reopened pair would leave `issue_state` and `last_action`
+  # describing different deliveries.
+  defp content_changes(record, issue, extraction, action, delivery_id) do
     if stale?(record.issue_updated_at, issue.updated_at) do
       %{}
     else
       issue
       |> GithubPayload.untrusted_fields()
+      |> Map.merge(%{last_action: action, last_delivery_id: delivery_id})
       |> Map.merge(extraction.facts)
       |> Map.merge(%{
         github_issue_id: issue.github_issue_id,

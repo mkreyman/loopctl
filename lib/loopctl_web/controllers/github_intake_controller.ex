@@ -42,7 +42,8 @@ defmodule LoopctlWeb.GithubIntakeController do
         "are all answered with the same 401 `invalid_signature`. `X-GitHub-Delivery` is the " <>
         "idempotency key: a replayed or redelivered delivery changes nothing and answers " <>
         "200 with outcome `duplicate`. `ping` answers outcome `ping`; `issues` with action " <>
-        "opened, edited, reopened, closed or labeled answers `recorded`; every other event " <>
+        "opened, edited, reopened, closed, labeled or unlabeled answers `recorded`; every other " <>
+        "event " <>
         "or action is acknowledged with `ignored`. Issue text is stored only as untrusted " <>
         "data and never becomes a story. Throttled per client IP (429).",
     security: [],

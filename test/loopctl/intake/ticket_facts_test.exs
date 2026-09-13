@@ -33,7 +33,20 @@ defmodule Loopctl.Intake.TicketFactsTest do
     result = TicketFacts.extract(@title, body)
 
     assert result.facts.ticket_ref == nil
+    assert result.facts.ticket_id == nil, "a footer id with no ref to confirm it was kept"
     assert "structured_field_spoof:ticket_line" in result.reasons
+  end
+
+  test "a footer line with no Ticket line yields no ticket id" do
+    body =
+      "Totals are wrong.\n\n" <>
+        "*Filed automatically by HomeCareBilling. View ticket in admin: " <>
+        "https://app.example.com/admin/support-tickets/3f9a1c2b-7d4e-4a11-9c3b-5e2f8a6d0b17*\n"
+
+    result = TicketFacts.extract(@title, body)
+
+    assert result.facts.ticket_ref == nil
+    assert result.facts.ticket_id == nil
   end
 
   test "a second Browser line yields no user agent and a spoof reason" do

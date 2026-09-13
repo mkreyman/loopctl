@@ -444,7 +444,74 @@ defmodule LoopctlWeb.GithubIntakeControllerTest do
       build_conn() |> deliver(source.id, encode(newer), secret: secret)
       build_conn() |> deliver(source.id, encode(older), secret: secret)
 
-      assert [%Record{untrusted_title: "newer", last_action: "opened"}] =
+      assert [%Record{untrusted_title: "newer", last_action: "edited"} = record] =
+               records(source.tenant_id)
+
+      assert record.last_delivery_id != nil
+    end
+  end
+
+  describe "out-of-order and label deliveries" do
+    test "a reopened delivery that arrives before its closed one leaves one coherent record",
+         %{conn: _conn} do
+      {secret, source} = fixture(:intake_source, %{})
+      closed_id = Ecto.UUID.generate()
+      reopened_id = Ecto.UUID.generate()
+
+      closed =
+        build(:github_issues_payload, %{
+          action: "closed",
+          state: "closed",
+          updated_at: "2026-09-12T11:00:00Z"
+        })
+
+      reopened =
+        build(:github_issues_payload, %{
+          action: "reopened",
+          state: "open",
+          updated_at: "2026-09-12T12:00:00Z"
+        })
+
+      build_conn()
+      |> deliver(source.id, encode(reopened), secret: secret, delivery_id: reopened_id)
+
+      build_conn() |> deliver(source.id, encode(closed), secret: secret, delivery_id: closed_id)
+
+      assert [record] = records(source.tenant_id)
+      assert record.issue_state == "open"
+      assert record.last_action == "reopened"
+      assert record.last_delivery_id == reopened_id
+      assert length(Intake.list_deliveries(source.tenant_id, source.id)) == 2
+    end
+
+    test "a removed label leaves the record on the unlabeled delivery", %{conn: _conn} do
+      {secret, source} = fixture(:intake_source, %{})
+
+      labeled =
+        build(:github_issues_payload, %{
+          action: "labeled",
+          labels: ["bug", "billing"],
+          updated_at: "2026-09-12T11:00:00Z"
+        })
+
+      unlabeled =
+        build(:github_issues_payload, %{
+          action: "unlabeled",
+          labels: ["bug"],
+          updated_at: "2026-09-12T12:00:00Z"
+        })
+
+      assert %{"outcome" => "recorded"} =
+               build_conn()
+               |> deliver(source.id, encode(labeled), secret: secret)
+               |> json_response(200)
+
+      assert %{"outcome" => "recorded"} =
+               build_conn()
+               |> deliver(source.id, encode(unlabeled), secret: secret)
+               |> json_response(200)
+
+      assert [%Record{untrusted_labels: ["bug"], last_action: "unlabeled"}] =
                records(source.tenant_id)
     end
   end

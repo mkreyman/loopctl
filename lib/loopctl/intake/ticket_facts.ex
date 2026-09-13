@@ -103,7 +103,9 @@ defmodule Loopctl.Intake.TicketFacts do
     end
   end
 
-  defp reconcile(nil, footer_id), do: {nil, footer_id, nil}
+  # The footer id is only ever kept as confirmation of a ref. With no ref there is nothing
+  # to check it against, so a footer line alone, typed or duplicated, is not a fact.
+  defp reconcile(nil, _footer_id), do: {nil, nil, nil}
   defp reconcile(ref, nil), do: {ref, nil, nil}
 
   defp reconcile("HCB-" <> short = ref, footer_id) do
