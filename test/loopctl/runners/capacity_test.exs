@@ -152,6 +152,17 @@ defmodule Loopctl.Runners.CapacityTest do
 
   defp heal(runner), do: unboxed(fn -> Runners.heal_capacity(runner.tenant_id, runner.id) end)
 
+  defp record(runner, dispatch_id),
+    do: unboxed(fn -> DispatchLedger.get_record(runner.tenant_id, dispatch_id) end)
+
+  defp generation(runner, dispatch_id), do: record(runner, dispatch_id).slot_generation
+
+  # The release a caller with no transaction of its own makes, naming the slot it holds.
+  defp release(runner, dispatch_id, generation \\ nil) do
+    generation = generation || generation(runner, dispatch_id)
+    unboxed(fn -> Runners.release_slot(runner.tenant_id, dispatch_id, generation) end)
+  end
+
   describe "reserve_slot/2" do
     test "from more concurrent callers than slots, exactly max_sessions win" do
       runner = runner(%{max_sessions: 3})
@@ -218,14 +229,22 @@ defmodule Loopctl.Runners.CapacityTest do
 
       assert {:ok, _} = send_dispatch(runner, d)
 
-      assert {:ok, :released} =
-               unboxed(fn -> Runners.release_slot(runner.tenant_id, d.dispatch_id) end)
-
+      first_slot = generation(runner, d.dispatch_id)
+      assert release(runner, d.dispatch_id, first_slot) == {:ok, :released}
       assert in_flight(runner) == 0
 
-      assert {:ok, record} = send_dispatch(runner, d)
-      assert is_nil(record.released_at)
+      assert {:ok, reserved} = send_dispatch(runner, d)
+      assert is_nil(reserved.released_at)
+      assert reserved.slot_generation == first_slot + 1
       assert in_flight(runner) == 1
+
+      # The release meant for the FIRST slot, retried after the re-send, must not free the
+      # second one — it is a different session.
+      assert release(runner, d.dispatch_id, first_slot) == {:ok, :already_released}
+      assert in_flight(runner) == 1
+
+      assert release(runner, d.dispatch_id, first_slot + 1) == {:ok, :released}
+      assert in_flight(runner) == 0
     end
 
     test "a revoked runner is refused and nothing is recorded" do
@@ -356,12 +375,10 @@ defmodule Loopctl.Runners.CapacityTest do
       {:ok, _} = send_dispatch(runner, d1)
       {:ok, _} = send_dispatch(runner, d2)
 
-      release = fn ->
-        unboxed(fn -> Runners.release_slot(runner.tenant_id, d1.dispatch_id) end)
-      end
+      slot = generation(runner, d1.dispatch_id)
 
-      assert release.() == {:ok, :released}
-      assert release.() == {:ok, :already_released}
+      assert release(runner, d1.dispatch_id, slot) == {:ok, :released}
+      assert release(runner, d1.dispatch_id, slot) == {:ok, :already_released}
       # d2's slot keeps the counter off the zero floor, so a double decrement would show.
       assert in_flight(runner) == 1
     end
@@ -372,9 +389,12 @@ defmodule Loopctl.Runners.CapacityTest do
       d2 = dispatch(runner.tenant_id)
       {:ok, _} = send_dispatch(runner, d1)
       {:ok, _} = send_dispatch(runner, d2)
+      slot = generation(runner, d1.dispatch_id)
 
       results =
-        concurrently(6, fn _ -> Runners.release_slot(runner.tenant_id, d1.dispatch_id) end)
+        concurrently(6, fn _ ->
+          Runners.release_slot(runner.tenant_id, d1.dispatch_id, slot)
+        end)
 
       assert Enum.count(results, &(&1 == {:ok, :released})) == 1
       assert in_flight(runner) == 1
@@ -429,7 +449,7 @@ defmodule Loopctl.Runners.CapacityTest do
       d = dispatch(runner.tenant_id)
       {:ok, _} = send_dispatch(runner, d)
 
-      assert unboxed(fn -> Runners.release_slot(other.tenant_id, d.dispatch_id) end) ==
+      assert unboxed(fn -> Runners.release_slot(other.tenant_id, d.dispatch_id, 1) end) ==
                {:error, :unknown_dispatch}
 
       assert in_flight(runner) == 1
@@ -447,6 +467,186 @@ defmodule Loopctl.Runners.CapacityTest do
           |> Repo.update!()
         end)
     end)
+  end
+
+  describe "retryable?/1" do
+    # What a caller answers `:capacity_busy` on. A deadlock is as transient as a lock
+    # timeout and just as pointless to raise: the transaction is already gone, and the
+    # alternative is a crashed channel or a 500 out of dispatch/3.
+    test "a lock timeout and a broken deadlock are retryable; nothing else is" do
+      for code <- [:lock_not_available, :deadlock_detected] do
+        assert Capacity.retryable?(%Postgrex.Error{postgres: %{code: code}})
+      end
+
+      for code <- [:unique_violation, :check_violation, :serialization_failure] do
+        refute Capacity.retryable?(%Postgrex.Error{postgres: %{code: code}})
+      end
+
+      refute Capacity.retryable?(%RuntimeError{message: "not a database error"})
+    end
+  end
+
+  describe "release_slot_in/4 — the caller's own transaction" do
+    test "releases inside an AdminRepo transaction, so it commits with the caller's work" do
+      runner = runner(%{max_sessions: 3})
+      d = dispatch(runner.tenant_id)
+      {:ok, _} = send_dispatch(runner, d)
+      slot = generation(runner, d.dispatch_id)
+
+      outcome =
+        Sandbox.unboxed_run(AdminRepo, fn ->
+          AdminRepo.transaction(fn ->
+            DispatchLedger.release_slot_in(AdminRepo, runner.tenant_id, d.dispatch_id, slot)
+          end)
+        end)
+
+      assert outcome == {:ok, {:ok, :released}}
+      assert in_flight(runner) == 0
+      assert record(runner, d.dispatch_id).released_at
+    end
+
+    test "releases inside a Repo transaction that carries the tenant's RLS context" do
+      runner = runner(%{max_sessions: 3})
+      d = dispatch(runner.tenant_id)
+      {:ok, _} = send_dispatch(runner, d)
+      slot = generation(runner, d.dispatch_id)
+
+      outcome =
+        unboxed(fn ->
+          Repo.with_tenant(runner.tenant_id, fn ->
+            DispatchLedger.release_slot_in(Repo, runner.tenant_id, d.dispatch_id, slot)
+          end)
+        end)
+
+      assert outcome == {:ok, {:ok, :released}}
+      assert in_flight(runner) == 0
+    end
+
+    test "refuses to run outside a transaction rather than opening one of its own" do
+      runner = runner(%{max_sessions: 3})
+      d = dispatch(runner.tenant_id)
+      {:ok, _} = send_dispatch(runner, d)
+      slot = generation(runner, d.dispatch_id)
+
+      assert_raise ArgumentError, ~r/must run inside the caller's/, fn ->
+        Sandbox.unboxed_run(AdminRepo, fn ->
+          DispatchLedger.release_slot_in(AdminRepo, runner.tenant_id, d.dispatch_id, slot)
+        end)
+      end
+
+      assert in_flight(runner) == 1
+    end
+
+    test "a rolled-back caller transaction takes the release with it" do
+      runner = runner(%{max_sessions: 3})
+      d = dispatch(runner.tenant_id)
+      {:ok, _} = send_dispatch(runner, d)
+      slot = generation(runner, d.dispatch_id)
+
+      Sandbox.unboxed_run(AdminRepo, fn ->
+        AdminRepo.transaction(fn ->
+          {:ok, :released} =
+            DispatchLedger.release_slot_in(AdminRepo, runner.tenant_id, d.dispatch_id, slot)
+
+          AdminRepo.rollback(:caller_changed_its_mind)
+        end)
+      end)
+
+      assert in_flight(runner) == 1
+      refute record(runner, d.dispatch_id).released_at
+    end
+  end
+
+  describe "lock order" do
+    # The cycle the one order removes, staged as two real transactions:
+    #
+    #   releaser  a claim release or stage transition: holds the story FOR UPDATE, then takes
+    #             the dispatch row (what `DispatchLedger.release_slot_in/4` does)
+    #   reply     the code under test
+    #
+    # Taking the dispatch row BEFORE fencing the story — the old order — makes `reply` hold
+    # the row while it waits for the story, so the releaser's wait for the row closes the
+    # cycle and Postgres breaks it with a deadlock error in about a second, well inside
+    # `lock_timeout`. Fencing the story FIRST leaves `reply` holding nothing while it waits,
+    # and both finish.
+    test "a reply racing a claim release never deadlocks" do
+      runner = runner(%{max_sessions: 3})
+      story = story(runner.tenant_id)
+      d = dispatch(runner.tenant_id, %{"story_id" => story.id})
+      {:ok, _} = send_dispatch(runner, d)
+
+      test = self()
+      waiting = waiting_locks()
+
+      releaser =
+        Task.async(fn ->
+          unboxed(fn ->
+            Repo.with_tenant(runner.tenant_id, fn ->
+              Repo.one!(
+                from s in Story,
+                  where: s.id == ^story.id,
+                  lock: "FOR UPDATE",
+                  select: s.claim_epoch
+              )
+
+              send(test, :holding_story)
+              assert_receive_in_task(:take_row)
+
+              Repo.one!(
+                from x in DispatchRecord,
+                  where: x.tenant_id == ^runner.tenant_id and x.dispatch_id == ^d.dispatch_id,
+                  lock: "FOR UPDATE",
+                  select: x.id
+              )
+
+              :took_row
+            end)
+          end)
+        end)
+
+      assert_receive :holding_story, 5_000
+
+      replier = Task.async(fn -> reply(runner, d, %{}) end)
+
+      # The reply is now blocked on something. Under the fixed order that is the story, and
+      # it holds nothing; under the old order it is the story too, but it holds the dispatch
+      # row the releaser is about to ask for.
+      await_waiting_locks(waiting + 1)
+      send(releaser.pid, :take_row)
+
+      assert {:ok, :took_row} = Task.await(releaser, 30_000)
+      assert {:ok, %DispatchRecord{status: "accepted"}} = Task.await(replier, 30_000)
+      assert in_flight(runner) == 1
+    end
+  end
+
+  defp assert_receive_in_task(message) do
+    receive do
+      ^message -> :ok
+    after
+      30_000 -> raise "the test never sent #{inspect(message)}"
+    end
+  end
+
+  defp waiting_locks do
+    %{rows: [[count]]} = Repo.query!("SELECT count(*) FROM pg_locks WHERE NOT granted", [])
+    count
+  end
+
+  # A transaction blocked on a row lock shows up in pg_locks as an ungranted request, so this
+  # waits for a REAL state rather than for a duration.
+  defp await_waiting_locks(expected, attempts \\ 400) do
+    cond do
+      waiting_locks() >= expected ->
+        :ok
+
+      attempts == 0 ->
+        flunk("expected #{expected} waiting locks; saw #{waiting_locks()}")
+
+      true ->
+        Process.sleep(25)
+        await_waiting_locks(expected, attempts - 1)
+    end
   end
 
   describe "heal" do
@@ -503,9 +703,9 @@ defmodule Loopctl.Runners.CapacityTest do
         replied_at: DateTime.add(now, -(600 + grace + 60))
       )
 
-      # Inserted long ago but accepted recently: the clock runs from acceptance.
+      # Reserved long ago but accepted recently: the clock runs from acceptance.
       force_dispatch(runner, live.dispatch_id,
-        inserted_at: DateTime.add(now, -(600 + grace + 60)),
+        reserved_at: DateTime.add(now, -(600 + grace + 60)),
         replied_at: DateTime.add(now, -(600 + grace - 60))
       )
 
@@ -515,7 +715,7 @@ defmodule Loopctl.Runners.CapacityTest do
                nil
     end
 
-    test "a dispatch never replied to is timed from its last push" do
+    test "a pushed dispatch never replied to is timed from its push" do
       runner = runner(%{max_sessions: 3})
       d = dispatch(runner.tenant_id, %{"wall_clock_seconds" => 600})
       {:ok, _} = send_dispatch(runner, d)
@@ -524,10 +724,45 @@ defmodule Loopctl.Runners.CapacityTest do
       now = DateTime.utc_now()
       old = DateTime.add(now, -(600 + grace + 60))
 
-      force_dispatch(runner, d.dispatch_id, inserted_at: old, pushed_at: now)
+      force_dispatch(runner, d.dispatch_id, reserved_at: old, pushed_at: now)
       assert heal(runner) == {:ok, %{released: 0, in_flight: 1}}
 
       force_dispatch(runner, d.dispatch_id, pushed_at: old)
+      assert heal(runner) == {:ok, %{released: 1, in_flight: 0}}
+    end
+
+    test "an UNPUSHED reservation is released on the short bound, not the wall clock" do
+      runner = runner(%{max_sessions: 3})
+      # A wall clock far longer than the unpushed bound: a dispatch that never reached a
+      # socket must not hold its slot for the length of a session that never started.
+      d = dispatch(runner.tenant_id, %{"wall_clock_seconds" => 3_600})
+      {:ok, _} = send_dispatch(runner, d)
+
+      unpushed = Capacity.unpushed_grace_seconds()
+      now = DateTime.utc_now()
+
+      force_dispatch(runner, d.dispatch_id, reserved_at: DateTime.add(now, -(unpushed - 30)))
+      assert heal(runner) == {:ok, %{released: 0, in_flight: 1}}
+
+      force_dispatch(runner, d.dispatch_id, reserved_at: DateTime.add(now, -(unpushed + 30)))
+      assert heal(runner) == {:ok, %{released: 1, in_flight: 0}}
+    end
+
+    test "a push from an EARLIER reservation does not count as this one's" do
+      runner = runner(%{max_sessions: 3})
+      d = dispatch(runner.tenant_id, %{"wall_clock_seconds" => 3_600})
+      {:ok, _} = send_dispatch(runner, d)
+
+      unpushed = Capacity.unpushed_grace_seconds()
+      now = DateTime.utc_now()
+
+      # Pushed under the first reservation, then released and re-sent: the new slot has
+      # never been pushed under, so the short bound applies to it.
+      force_dispatch(runner, d.dispatch_id, pushed_at: DateTime.add(now, -(unpushed + 300)))
+      assert release(runner, d.dispatch_id) == {:ok, :released}
+      assert {:ok, _} = send_dispatch(runner, d)
+
+      force_dispatch(runner, d.dispatch_id, reserved_at: DateTime.add(now, -(unpushed + 30)))
       assert heal(runner) == {:ok, %{released: 1, in_flight: 0}}
     end
 
@@ -568,16 +803,14 @@ defmodule Loopctl.Runners.CapacityTest do
       leaked = runner(%{max_sessions: 3})
       {:ok, _} = unboxed(fn -> Runners.reserve_slot(leaked.tenant_id, leaked.id) end)
 
-      # An unreleased dead dispatch on a runner whose counter already reads zero.
+      # A dead reservation whose runner's COUNTER agrees with its rows, so only the
+      # dead-reservation candidate query can find it.
       dead = runner(%{max_sessions: 3})
       s = story(dead.tenant_id)
       {:ok, _} = send_dispatch(dead, dispatch(dead.tenant_id, %{"story_id" => s.id}))
       bump_epoch(dead.tenant_id, s.id)
-
-      Sandbox.unboxed_run(AdminRepo, fn ->
-        {1, _} =
-          from(r in Runner, where: r.id == ^dead.id) |> AdminRepo.update_all(set: [in_flight: 0])
-      end)
+      assert in_flight(dead) == 1
+      assert unreleased(dead) == 1
 
       unboxed(fn ->
         Sandbox.unboxed_run(AdminRepo, fn ->
@@ -587,6 +820,20 @@ defmodule Loopctl.Runners.CapacityTest do
 
       assert in_flight(leaked) == 0
       assert unreleased(dead) == 0
+    end
+
+    test "the worker leaves a healthy runner's live reservation alone" do
+      runner = runner(%{max_sessions: 3})
+      {:ok, _} = send_dispatch(runner, dispatch(runner.tenant_id))
+
+      unboxed(fn ->
+        Sandbox.unboxed_run(AdminRepo, fn ->
+          assert :ok = HealRunnerCapacityWorker.perform(%Oban.Job{args: %{}})
+        end)
+      end)
+
+      assert in_flight(runner) == 1
+      assert unreleased(runner) == 1
     end
 
     test "the worker heals a leaked slot and a dead reservation" do

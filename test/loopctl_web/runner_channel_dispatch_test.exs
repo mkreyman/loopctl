@@ -359,6 +359,52 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       assert is_nil(DispatchLedger.get_record(runner.tenant_id, over["dispatch_id"]))
     end
 
+    test "the dispatch message carries the SLOT the ledger reserved", %{runner: runner} do
+      # The channel can only hand a dropped dispatch's slot back if the message names it.
+      Phoenix.PubSub.subscribe(Loopctl.PubSub, Runners.dispatch_topic(runner.id))
+      payload = dispatch_payload(runner.tenant_id)
+
+      assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
+
+      record = DispatchLedger.get_record(runner.tenant_id, payload["dispatch_id"])
+      assert record.slot_generation > 0
+
+      assert_receive {:runner_dispatch, broadcast, slot_generation}, @reply_timeout
+      assert broadcast.dispatch_id == payload["dispatch_id"]
+      assert slot_generation == record.slot_generation
+    end
+
+    test "a dispatch the channel DROPS gives its capacity slot back at once",
+         %{runner: runner, channel: channel} do
+      payload = dispatch_payload(runner.tenant_id)
+      assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
+      assert_push "dispatch", _, @reply_timeout
+
+      record = DispatchLedger.get_record(runner.tenant_id, payload["dispatch_id"])
+      refute record.released_at
+      {:ok, dispatch} = RunnerContract.cast_dispatch(payload)
+
+      # The same dispatch delivered again with a halt in place: the channel drops it instead
+      # of pushing, so the slot it carries is not holding a session and goes back.
+      {:ok, _} = Tenants.halt_custody(runner.tenant_id)
+
+      Phoenix.PubSub.broadcast(
+        Loopctl.PubSub,
+        Runners.dispatch_topic(runner.id),
+        {:runner_dispatch, dispatch, record.slot_generation}
+      )
+
+      _ = :sys.get_state(channel.channel_pid)
+      refute_push "dispatch", _
+
+      assert eventually(
+               fn ->
+                 DispatchLedger.get_record(runner.tenant_id, payload["dispatch_id"]).released_at
+               end,
+               @reply_timeout
+             )
+    end
+
     test "a dispatch_id whose ledger row disagrees is refused before anything is pushed",
          %{runner: runner} do
       payload = dispatch_payload(runner.tenant_id)

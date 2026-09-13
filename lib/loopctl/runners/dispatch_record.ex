@@ -23,8 +23,10 @@ defmodule Loopctl.Runners.DispatchRecord do
   ## Capacity
 
   A dispatch recorded as `sent` holds one of its runner's slots (`Loopctl.Runners.Capacity`)
-  until `released_at` is set, exactly once. `wall_clock_seconds` is the dispatch's own wall
-  clock, kept so an unreleased slot always has an end.
+  until `released_at` is set. `slot_generation` names the slot currently or last held — a
+  re-send of an undelivered dispatch takes a new one — and a release applies only to the
+  generation it names. `reserved_at` is when that slot was taken; `wall_clock_seconds` is
+  the dispatch's own wall clock. Together they give every unreleased slot an end.
 
   ## Trust boundary
 
@@ -61,6 +63,8 @@ defmodule Loopctl.Runners.DispatchRecord do
     field :trace_acked_seq, :integer, default: -1
     field :wall_clock_seconds, :integer
     field :released_at, :utc_datetime_usec
+    field :reserved_at, :utc_datetime_usec
+    field :slot_generation, :integer, default: 0
 
     timestamps()
   end

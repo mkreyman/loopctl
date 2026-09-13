@@ -16,10 +16,21 @@ defmodule Loopctl.Runners.DispatchLedger do
   in the SAME transaction that writes the row — admission over the tenant's total, then the
   runner's own `in_flight < max_sessions` — so a row exists exactly when its slot does and a
   crash between the two commits neither (`:admission_limit_reached`, `:runner_at_capacity`,
-  or `:capacity_busy` when a lock wait ran out). A re-dispatch of a row that still holds its
-  slot takes no second one; a re-dispatch of a row whose slot was already released takes a
-  fresh one. A refusal (`record_reply/3`) and a supersede (the claim fence) release the slot in
-  the transaction that records them, exactly once.
+  or `:capacity_busy` when a lock wait ran out or a deadlock was broken). A re-dispatch of a
+  row that still holds its slot takes no second one; a re-dispatch of a row whose slot was
+  already released takes a fresh one, under a NEW `slot_generation`, so a release meant for
+  the old slot can never free the new one. A refusal (`record_reply/3`) and a supersede (the
+  claim fence) release the slot in the transaction that records them, exactly once.
+
+  ## Lock order
+
+  Every path here takes the STORY row (the claim fence, `FOR SHARE`) before the
+  `runner_dispatches` row (`FOR UPDATE`), and the `runners` row last — the one order
+  `Loopctl.Runners.Capacity` documents. `record_reply/3` and `record_trace/3` used to take the
+  first two the other way round, which closed a cycle with a concurrent claim or release
+  holding the story `FOR UPDATE` and deadlocked. They now resolve the row's story from an
+  UNLOCKED pre-read (`story_id` never changes after the row is written), fence the story, and
+  only then lock the row.
 
   `record_reply/3` applies a runner's `dispatch_reply` under a row lock. The row must belong
   to the CALLING runner in the calling tenant (otherwise `:unknown_dispatch` — another
@@ -98,6 +109,12 @@ defmodule Loopctl.Runners.DispatchLedger do
       status: "sent",
       trace_acked_seq: -1,
       wall_clock_seconds: dispatch.wall_clock_seconds,
+      # Born holding NO slot: the row is inserted first (that is how a retry is told from a
+      # first send), and `take_slot/1` clears this in the same transaction. The CHECK that
+      # every unreleased row is bounded therefore holds at every instant, not only at commit
+      # — a CHECK cannot be deferred to commit in Postgres.
+      released_at: now,
+      slot_generation: 0,
       inserted_at: now,
       updated_at: now
     }
@@ -114,14 +131,13 @@ defmodule Loopctl.Runners.DispatchLedger do
       if current_claim_epoch(tenant_id, dispatch.story_id) != dispatch.claim_epoch,
         do: Repo.rollback(:stale_claim_epoch)
 
-      # Inserted BEFORE the slot is taken, so a retry is told apart from a first send by
-      # whether this write hit a row. A concurrent first send of the same id waits here on
-      # the unique index and then finds this transaction's committed row.
-      {inserted, _} =
-        Repo.insert_all(DispatchRecord, [row],
-          on_conflict: :nothing,
-          conflict_target: [:tenant_id, :dispatch_id]
-        )
+      # Inserted BEFORE the slot is taken, holding none. A concurrent first send of the same
+      # id waits here on the unique index and then finds this transaction's committed row;
+      # whether the row (new or found) holds a slot is what decides below.
+      Repo.insert_all(DispatchRecord, [row],
+        on_conflict: :nothing,
+        conflict_target: [:tenant_id, :dispatch_id]
+      )
 
       # Locked, so two retries of a released row cannot both take a fresh slot for it.
       record =
@@ -134,13 +150,13 @@ defmodule Loopctl.Runners.DispatchLedger do
       cond do
         not same_dispatch?(record, runner_id, dispatch) -> Repo.rollback(:dispatch_id_conflict)
         record.status != "sent" -> Repo.rollback(:dispatch_already_replied)
-        inserted == 1 or not is_nil(record.released_at) -> take_slot(record)
+        not is_nil(record.released_at) -> take_slot(record)
         true -> record
       end
     end)
   rescue
     error in Postgrex.Error ->
-      if Capacity.lock_timeout?(error),
+      if Capacity.retryable?(error),
         do: {:error, :capacity_busy},
         else: reraise(error, __STACKTRACE__)
   end
@@ -148,17 +164,9 @@ defmodule Loopctl.Runners.DispatchLedger do
   # A failure rolls the whole transaction back, the row this call inserted included, so no
   # reservation is ever left without its dispatch or a dispatch without its reservation.
   defp take_slot(%DispatchRecord{} = record) do
-    case Capacity.admit_and_reserve(record.tenant_id, record.runner_id) do
-      {:ok, _in_flight} when is_nil(record.released_at) ->
-        record
-
-      {:ok, _in_flight} ->
-        record
-        |> Ecto.Changeset.change(released_at: nil)
-        |> Repo.update!()
-
-      {:error, reason} ->
-        Repo.rollback(reason)
+    case Capacity.admit_and_reserve(Repo, record, DateTime.utc_now()) do
+      {:ok, reserved} -> reserved
+      {:error, reason} -> Repo.rollback(reason)
     end
   end
 
@@ -212,24 +220,61 @@ defmodule Loopctl.Runners.DispatchLedger do
   end
 
   @doc """
-  Releases the slot `dispatch_id` holds, exactly once: `{:ok, :released}` the first time,
-  `{:ok, :already_released}` on every replay. For the caller that learns a dispatch's
-  session ended, which the ledger does not model.
-  """
-  @spec release_slot(Ecto.UUID.t(), Ecto.UUID.t()) ::
-          {:ok, :released | :already_released} | {:error, :unknown_dispatch}
-  def release_slot(tenant_id, dispatch_id) do
-    in_tenant(tenant_id, fn ->
-      query =
-        from r in DispatchRecord,
-          where: r.tenant_id == ^tenant_id and r.dispatch_id == ^dispatch_id,
-          lock: "FOR UPDATE"
+  Releases the slot `generation` of `dispatch_id`, exactly once, in a transaction of its own:
+  `{:ok, :released}` the first time, `{:ok, :already_released}` on every replay and for a
+  generation the row no longer holds. For the caller that learns a dispatch's session ended,
+  which the ledger does not model.
 
-      case Repo.one(query) do
-        nil -> Repo.rollback(:unknown_dispatch)
-        record -> Capacity.release(record)
+  Read the generation from the row (`get_record/2`, `slot_generation`) at the point the
+  session STARTED — an accepted dispatch can never be re-sent, so its generation is final
+  from its reply onward.
+
+  **A caller inside a transaction of its own must use `release_slot_in/4`.** This function
+  opens one (`Repo.with_tenant/2` raises inside another `Repo` transaction, and against
+  `AdminRepo` it would take a second connection and commit apart from the caller). Called
+  AFTER a caller's transaction commits, it is also a second commit: a node that dies in
+  between leaves the slot held until the heal sweep's bound
+  (`Loopctl.Runners.Capacity`), which is the whole reason the in-transaction form exists.
+  """
+  @spec release_slot(Ecto.UUID.t(), Ecto.UUID.t(), integer()) ::
+          {:ok, :released | :already_released} | {:error, :unknown_dispatch}
+  def release_slot(tenant_id, dispatch_id, generation) when is_integer(generation) do
+    in_tenant(tenant_id, fn ->
+      case release_slot_in(Repo, tenant_id, dispatch_id, generation) do
+        {:ok, outcome} -> outcome
+        {:error, reason} -> Repo.rollback(reason)
       end
     end)
+  end
+
+  @doc """
+  `release_slot/3` inside the CALLER's transaction, on the caller's repo — the form for a
+  step of a claim release or a stage transition, which must commit with the transition that
+  decided it.
+
+  The caller owns the transaction and must already be in it; on `Loopctl.Repo` it must also
+  carry the tenant's RLS context (`Repo.set_rls_context/1`), or the row is invisible and the
+  answer is `{:error, :unknown_dispatch}`. Keep the lock order: the story row (if the caller
+  locks one) before this row, and the `runners` row after it — which is what this does.
+  """
+  @spec release_slot_in(Ecto.Repo.t(), Ecto.UUID.t(), Ecto.UUID.t(), integer()) ::
+          {:ok, :released | :already_released} | {:error, :unknown_dispatch}
+  def release_slot_in(repo, tenant_id, dispatch_id, generation) when is_integer(generation) do
+    unless repo.in_transaction?() do
+      raise ArgumentError,
+            "Loopctl.Runners.DispatchLedger.release_slot_in/4 must run inside the caller's " <>
+              "#{inspect(repo)} transaction; use release_slot/3 when you have none."
+    end
+
+    query =
+      from r in DispatchRecord,
+        where: r.tenant_id == ^tenant_id and r.dispatch_id == ^dispatch_id,
+        lock: "FOR UPDATE"
+
+    case repo.one(query) do
+      nil -> {:error, :unknown_dispatch}
+      record -> {:ok, Capacity.release(repo, record, generation)}
+    end
   end
 
   @doc """
@@ -243,8 +288,7 @@ defmodule Loopctl.Runners.DispatchLedger do
     context = %{operation: :record_reply, dispatch_id: reply.dispatch_id, run_id: nil}
 
     runner_write(tenant_id, runner_id, context, fn ->
-      with {:ok, record} <- lock_held(tenant_id, runner_id, reply.dispatch_id),
-           :ok <- story_fence(record),
+      with {:ok, record} <- fence_then_lock(tenant_id, runner_id, reply.dispatch_id),
            :ok <- epoch_matches(record, reply.claim_epoch),
            {:ok, record} <- apply_reply(record, reply) do
         release_if_refused(record)
@@ -276,7 +320,7 @@ defmodule Loopctl.Runners.DispatchLedger do
   # the release is a no-op, so a first reply whose release was lost with its transaction
   # cannot leave the slot held.
   defp release_if_refused(%DispatchRecord{status: "refused"} = record),
-    do: Capacity.release(record)
+    do: Capacity.release(Repo, record, record.slot_generation)
 
   defp release_if_refused(%DispatchRecord{}), do: :ok
 
@@ -296,8 +340,7 @@ defmodule Loopctl.Runners.DispatchLedger do
     context = %{operation: :record_trace, dispatch_id: batch.dispatch_id, run_id: batch.run_id}
 
     runner_write(tenant_id, runner_id, context, fn ->
-      with {:ok, record} <- lock_held(tenant_id, runner_id, batch.dispatch_id),
-           :ok <- story_fence(record),
+      with {:ok, record} <- fence_then_lock(tenant_id, runner_id, batch.dispatch_id),
            :ok <- epoch_matches(record, batch.claim_epoch),
            :ok <- accepted(record),
            {:ok, record} <- bind_run(record, batch.run_id) do
@@ -392,14 +435,30 @@ defmodule Loopctl.Runners.DispatchLedger do
     :telemetry.execute([:loopctl, :runners, :ledger_rejected_by_database], %{count: 1}, metadata)
   end
 
+  # The lock order (see the moduledoc): the story's row, then the dispatch's. The story is
+  # resolved from an UNLOCKED pre-read, which learns only `story_id` — written once with the
+  # row and never changed — and the fence is then decided on the row read UNDER its lock, so
+  # nothing is judged on the unlocked copy.
+  defp fence_then_lock(tenant_id, runner_id, dispatch_id) do
+    with {:ok, %DispatchRecord{story_id: story_id}} <- held(tenant_id, runner_id, dispatch_id) do
+      current = current_claim_epoch(tenant_id, story_id)
+
+      with {:ok, record} <- held(tenant_id, runner_id, dispatch_id, true),
+           :ok <- story_fence(record, current) do
+        {:ok, record}
+      end
+    end
+  end
+
   # The ownership predicate: tenant AND runner. A row another runner holds is refused
   # exactly like a row that does not exist.
-  defp lock_held(tenant_id, runner_id, dispatch_id) do
+  defp held(tenant_id, runner_id, dispatch_id, locked? \\ false) do
     query =
       from r in DispatchRecord,
         where: r.tenant_id == ^tenant_id and r.runner_id == ^runner_id,
-        where: r.dispatch_id == ^dispatch_id,
-        lock: "FOR UPDATE"
+        where: r.dispatch_id == ^dispatch_id
+
+    query = if locked?, do: lock(query, "FOR UPDATE"), else: query
 
     case Repo.one(query) do
       nil -> {:error, :unknown_dispatch}
@@ -409,13 +468,13 @@ defmodule Loopctl.Runners.DispatchLedger do
 
   # The fence against a zombie runner (issue #803). The authoritative epoch is the story's
   # (`stories.claim_epoch`, bumped by every claim and every release — `Progress`), not the
-  # epoch this row recorded when it was sent. Read under a share lock in the transaction that
-  # holds the row lock. When the story has moved past the row, the claim this dispatch
-  # served is over: the row is marked `superseded` — so it stops reading as a live dispatch —
-  # and every message about it is `stale_claim_epoch`. A story that no longer exists is
-  # treated the same way.
-  defp story_fence(%DispatchRecord{} = record) do
-    if current_claim_epoch(record.tenant_id, record.story_id) == record.claim_epoch do
+  # epoch this row recorded when it was sent. Read under a share lock BEFORE the row lock
+  # (the lock order), in the same transaction. When the story has moved past the row, the
+  # claim this dispatch served is over: the row is marked `superseded` — so it stops reading
+  # as a live dispatch — and every message about it is `stale_claim_epoch`. A story that no
+  # longer exists is treated the same way.
+  defp story_fence(%DispatchRecord{} = record, current_epoch) do
+    if current_epoch == record.claim_epoch do
       :ok
     else
       supersede(record)
@@ -443,7 +502,7 @@ defmodule Loopctl.Runners.DispatchLedger do
       set: [status: "superseded", updated_at: DateTime.utc_now()]
     )
 
-    Capacity.release(record)
+    Capacity.release(Repo, record, record.slot_generation)
   end
 
   # A superseded dispatch's claim was reclaimed, so every epoch it carries is stale.

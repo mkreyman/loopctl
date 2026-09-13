@@ -19,16 +19,17 @@ defmodule Loopctl.Runners.Capacity do
 
   ## Reserve
 
-  `reserve/2` is one conditional UPDATE (`in_flight < max_sessions`, runner not revoked).
-  Two dispatchers on two loopctl nodes racing for the last slot both issue it; Postgres
-  row-locks the runner, the second re-evaluates the predicate against the first's committed
-  value, and exactly one gets a row back.
+  `reserve/3` is one conditional UPDATE (`in_flight < max_sessions`, runner not revoked)
+  and stamps the dispatch row's `reserved_at` and next `slot_generation`. Two dispatchers
+  on two loopctl nodes racing for the last slot both issue it; Postgres row-locks the
+  runner, the second re-evaluates the predicate against the first's committed value, and
+  exactly one gets a row back.
 
   ## Admission
 
   All of a tenant's runners share one Anthropic account, and the account's rate limit is
   what bites on parallel work, so the tenant's TOTAL in-flight sessions are capped as well
-  (`limit/0`). `admit/1` sums the active runners' `in_flight` under a transaction-scoped
+  (`limit/0`). `admit/2` sums the active runners' `in_flight` under a transaction-scoped
   advisory lock keyed on the tenant, so two admissions in one tenant serialize and the
   second sees the first's reservation. Chosen over a per-tenant counter row with its own
   compare-and-set because that would be a SECOND counter of the same facts, able to drift
@@ -36,18 +37,21 @@ defmodule Loopctl.Runners.Capacity do
   rows. The lock is taken only by admissions, never by a release, which can only lower the
   sum, so a release never waits on it.
 
-  ## Release, exactly once
+  ## Release, exactly once PER SLOT
 
-  `release/2` sets `released_at` with `WHERE released_at IS NULL` and decrements only when
-  that write matched a row. A release replayed for the same dispatch — a reply re-sent after
-  a lost acknowledgement, a supersede found again by a later trace, the heal sweep finding
-  what an inline release already did — matches nothing and changes nothing. The decrement
-  never goes below zero.
+  A dispatch row can hold several slots over its life: one released because the push never
+  reached a socket is taken again when the same `dispatch_id` is re-sent. So a release
+  names the `slot_generation` it means, and `release/4` sets `released_at`
+  `WHERE released_at IS NULL AND slot_generation = $g`, decrementing only when that write
+  matched a row. A release replayed for an earlier generation — a reply re-sent after a
+  lost acknowledgement, a supersede found again by a later trace, the heal sweep finding
+  what an inline release already did, a caller retrying after the dispatch was re-sent —
+  matches nothing and changes nothing. The decrement never goes below zero.
 
-  A slot is released when its dispatch reaches a terminal state the ledger models:
-  `refused` (`DispatchLedger.record_reply/3`), `superseded` (the claim fence), or an explicit
-  `Loopctl.Runners.release_slot/2` when the caller learns the session ended. The ledger has
-  no completed state, so `heal/3` covers the rest.
+  A slot is released when its dispatch reaches a terminal state the ledger models
+  (`refused`, `superseded`), when the channel DROPS it instead of pushing, and on an
+  explicit `Loopctl.Runners.release_slot/3` from the caller that learns the session ended.
+  The ledger has no completed state, so `heal/3` covers the rest.
 
   ## Heal
 
@@ -57,39 +61,63 @@ defmodule Loopctl.Runners.Capacity do
   - its story is gone, or its `claim_epoch` moved past the dispatch's (the claim ended);
   - its runner is revoked — including by an api-key revoke, whose trigger revokes the runner
     row without passing through `Loopctl.Runners.revoke_runner/3`;
+  - it was never PUSHED under this reservation (`pushed_at` NULL or older than
+    `reserved_at`) and `unpushed_grace_seconds/0` has passed. A dispatch is broadcast to a
+    channel that pushes it within milliseconds or not at all, so an unpushed reservation is
+    an undelivered one — a runner that dropped its socket between the pool read and the
+    broadcast. Bounding it by the wall clock instead held a slot for the length of a session
+    that never started;
   - its wall clock has run out: the runner stops a session at `wall_clock_seconds`, so past
-    the later of its acceptance (or last push) plus that plus `release_grace_seconds/0`, the
+    the later of its acceptance (or push) plus that plus `release_grace_seconds/0`, the
     session is over whether or not anything said so.
 
   Then it recomputes `in_flight` from the unreleased rows. That second step is what returns
   a slot taken with `Loopctl.Runners.reserve_slot/2` and never tied to a dispatch.
   `Loopctl.Workers.HealRunnerCapacityWorker` runs it every minute.
 
-  A revoked runner's slots stop counting against the tenant AT ONCE — `admit/1` sums active
-  runners only, and `reserve/2` refuses a revoked one — while the rows themselves are
+  A revoked runner's slots stop counting against the tenant AT ONCE — `admit/2` sums active
+  runners only, and `reserve/3` refuses a revoked one — while the rows themselves are
   released by the next heal.
 
-  ## Locks and waits
+  ## Lock order — story, then dispatch row, then runner row
 
-  Lock order is ledger row, then runner row, on every path that holds both (reserve after
-  its insert, release, heal's first step). Heal's recount takes the runner row and then only
-  READS ledger rows. The advisory lock is taken only before a runner row. So no cycle.
+  ONE order, everywhere, including `Loopctl.Runners.DispatchLedger` and any caller that
+  releases a slot inside its own transaction: **the story row first (the claim fence), then
+  the `runner_dispatches` row, then the admission advisory lock, then the `runners` row.**
+  Two of these paths used to take the first two in opposite orders — `record_sent/3` fenced
+  the story then locked the dispatch row, `record_reply/3` and `record_trace/3` locked the
+  dispatch row then fenced the story — which with a concurrent claim or release (holding
+  the story `FOR UPDATE`) closed a three-transaction cycle and deadlocked in ~1 s, well
+  inside `lock_timeout_ms/0`, so the timeout never saw it. `heal/3` takes dispatch rows then
+  the runner row and never a story lock; its recount holds the runner row and only READS
+  dispatch rows.
 
   Every transaction here that can queue behind another sets `lock_timeout`
   (`lock_timeout_ms/0`). A dispatcher behind a stuck admission gets `:capacity_busy` rather
   than an unbounded wait inside an open transaction; nothing is reserved and it may retry.
+  A deadlock is classified the same way (`retryable?/1`) rather than raised: with one order
+  it should not happen, and if a future path reintroduces one, a dispatcher retrying beats a
+  crashed channel holding a runner's socket.
 
   ## Partitions
 
-  A runner that disconnects holding a slot keeps it: its session may still be running, and
-  the heal's wall-clock bound, the claim lease (whose reclaim bumps the epoch) and revocation
-  are what end it — never Presence, which drops a silent node's entries after 30 s whether
-  or not the machine is still working. A runner that loses loopctl mid-session and is
-  released by the wall clock then accepts late is the one case the counter can undercount;
-  the runner's own local `max_sessions` (it refuses `at_capacity`) is the backstop there.
+  A runner that disconnects holding a slot keeps it while its session may still be running:
+  the wall-clock bound, the claim lease (whose reclaim bumps the epoch) and revocation are
+  what end it — never Presence, which drops a silent node's entries after 30 s whether or
+  not the machine is still working. A runner that loses loopctl mid-session and is released
+  by the wall clock then accepts late is the one case the counter can undercount; the
+  runner's own local `max_sessions` (it refuses `at_capacity`) is the backstop there.
 
-  Every function here runs INSIDE a `Loopctl.Repo` transaction whose tenant context is set
-  (`Repo.with_tenant/2`); none opens one. `Loopctl.Runners` wraps them for callers.
+  ## Repo
+
+  Every function here runs INSIDE a transaction the CALLER owns; none opens one. It takes
+  the repo as its first argument, because a release belongs in whatever transaction is
+  already recording the session's end — `Loopctl.Repo` inside `Repo.with_tenant/2` for the
+  ledger's own writes, `Loopctl.AdminRepo` for a step of a claim release, which runs there.
+  On `Loopctl.Repo` the caller's transaction must already carry the tenant's RLS context, or
+  the rows are invisible and nothing is released; on `AdminRepo` the explicit `tenant_id`
+  predicate every query below carries is the only scoping. `Loopctl.Runners` wraps these for
+  callers that have no transaction of their own.
   """
 
   import Ecto.Query
@@ -102,6 +130,7 @@ defmodule Loopctl.Runners.Capacity do
   @default_limit 6
   @lock_timeout_ms 5_000
   @release_grace_seconds 300
+  @unpushed_grace_seconds 120
 
   # `pg_advisory_xact_lock` takes two int4s. The namespace isolates this lock class from
   # every other advisory lock keyed on a tenant (`Loopctl.Egress` uses 0x4105_0001).
@@ -127,49 +156,67 @@ defmodule Loopctl.Runners.Capacity do
   @spec release_grace_seconds() :: pos_integer()
   def release_grace_seconds, do: @release_grace_seconds
 
+  @doc """
+  How long a reservation whose dispatch was never pushed under it is presumed still on its
+  way to a socket.
+  """
+  @spec unpushed_grace_seconds() :: pos_integer()
+  def unpushed_grace_seconds, do: @unpushed_grace_seconds
+
   @doc "Bounds every lock wait for the rest of the current transaction."
-  @spec set_lock_timeout!() :: :ok
-  def set_lock_timeout! do
-    Repo.query!("SELECT set_config('lock_timeout', $1, true)", ["#{@lock_timeout_ms}ms"])
+  @spec set_lock_timeout!(Ecto.Repo.t()) :: :ok
+  def set_lock_timeout!(repo \\ Repo) do
+    repo.query!("SELECT set_config('lock_timeout', $1, true)", ["#{@lock_timeout_ms}ms"])
     :ok
   end
 
   @doc """
-  Whether a `Postgrex.Error` is a lock wait that ran out of `lock_timeout`. The transaction
-  that raised it is aborted, so a caller rescues it OUTSIDE the transaction.
+  Whether a `Postgrex.Error` is a lock wait this code should answer with a retryable
+  refusal: `lock_timeout` ran out, or Postgres broke a deadlock by choosing this
+  transaction. Either way the transaction that raised it is aborted, so a caller rescues it
+  OUTSIDE the transaction and nothing it wrote survives.
   """
-  @spec lock_timeout?(Exception.t()) :: boolean()
-  def lock_timeout?(%Postgrex.Error{postgres: %{code: :lock_not_available}}), do: true
-  def lock_timeout?(_error), do: false
+  @spec retryable?(Exception.t()) :: boolean()
+  def retryable?(%Postgrex.Error{postgres: %{code: code}})
+      when code in [:lock_not_available, :deadlock_detected],
+      do: true
+
+  def retryable?(_error), do: false
 
   @doc """
-  Admission then reservation, in the caller's transaction: serializes the tenant's
-  admissions, refuses when its active runners already hold `limit/0` slots, then reserves
-  one on `runner_id`.
-  """
-  @spec admit_and_reserve(Ecto.UUID.t(), Ecto.UUID.t()) ::
-          {:ok, non_neg_integer()} | {:error, :admission_limit_reached | :runner_at_capacity}
-  def admit_and_reserve(tenant_id, runner_id) do
-    lock_admission!(tenant_id)
+  Admission then reservation for `record`, in the caller's transaction: serializes the
+  tenant's admissions, refuses when its active runners already hold `limit/0` slots, then
+  takes a slot on the dispatch's runner and stamps the row with it.
 
-    with :ok <- admit(tenant_id) do
-      reserve(tenant_id, runner_id)
+  The dispatch row must already be locked by the caller (the lock order above).
+  """
+  @spec admit_and_reserve(Ecto.Repo.t(), DispatchRecord.t(), DateTime.t()) ::
+          {:ok, DispatchRecord.t()}
+          | {:error, :admission_limit_reached | :runner_at_capacity}
+  def admit_and_reserve(repo \\ Repo, %DispatchRecord{} = record, now \\ DateTime.utc_now()) do
+    lock_admission!(repo, record.tenant_id)
+
+    with :ok <- admit(repo, record.tenant_id),
+         {:ok, _in_flight} <- reserve(repo, record.tenant_id, record.runner_id) do
+      {:ok, stamp_reservation(repo, record, now)}
     end
   end
 
   @doc """
   `:ok` when the tenant's active runners hold fewer than `limit/0` slots. Serialized only
-  when the caller holds the admission lock (`admit_and_reserve/2`); unlocked it is a read.
+  when the caller holds the admission lock (`admit_and_reserve/3`); unlocked it is a read.
   """
-  @spec admit(Ecto.UUID.t()) :: :ok | {:error, :admission_limit_reached}
-  def admit(tenant_id) do
-    if tenant_in_flight(tenant_id) < limit(), do: :ok, else: {:error, :admission_limit_reached}
+  @spec admit(Ecto.Repo.t(), Ecto.UUID.t()) :: :ok | {:error, :admission_limit_reached}
+  def admit(repo \\ Repo, tenant_id) do
+    if tenant_in_flight(repo, tenant_id) < limit(),
+      do: :ok,
+      else: {:error, :admission_limit_reached}
   end
 
   @doc "The slots a tenant's active runners hold."
-  @spec tenant_in_flight(Ecto.UUID.t()) :: non_neg_integer()
-  def tenant_in_flight(tenant_id) do
-    Repo.one(
+  @spec tenant_in_flight(Ecto.Repo.t(), Ecto.UUID.t()) :: non_neg_integer()
+  def tenant_in_flight(repo \\ Repo, tenant_id) do
+    repo.one(
       from r in Runner,
         where: r.tenant_id == ^tenant_id and is_nil(r.revoked_at),
         select: coalesce(sum(r.in_flight), 0)
@@ -178,39 +225,65 @@ defmodule Loopctl.Runners.Capacity do
 
   @doc """
   Takes one slot on an active runner that has one free. Returns the runner's new
-  `in_flight`.
+  `in_flight`. The slot belongs to no dispatch until `admit_and_reserve/3` stamps one, so
+  the heal sweep returns a slot taken here on its own.
   """
-  @spec reserve(Ecto.UUID.t(), Ecto.UUID.t()) ::
+  @spec reserve(Ecto.Repo.t(), Ecto.UUID.t(), Ecto.UUID.t()) ::
           {:ok, pos_integer()} | {:error, :runner_at_capacity}
-  def reserve(tenant_id, runner_id) do
+  def reserve(repo \\ Repo, tenant_id, runner_id) do
     query =
       from r in Runner,
         where: r.id == ^runner_id and r.tenant_id == ^tenant_id,
         where: is_nil(r.revoked_at) and r.in_flight < r.max_sessions,
         select: r.in_flight
 
-    case Repo.update_all(query, inc: [in_flight: 1], set: [updated_at: DateTime.utc_now()]) do
+    case repo.update_all(query, inc: [in_flight: 1], set: [updated_at: DateTime.utc_now()]) do
       {1, [in_flight]} -> {:ok, in_flight}
       {0, _} -> {:error, :runner_at_capacity}
     end
   end
 
+  # The dispatch row records WHICH slot it now holds. `slot_generation` only ever rises, so
+  # a release naming an earlier one can never free this slot.
+  defp stamp_reservation(repo, %DispatchRecord{} = record, now) do
+    generation = record.slot_generation + 1
+
+    {1, _} =
+      from(d in DispatchRecord,
+        where: d.id == ^record.id and d.tenant_id == ^record.tenant_id
+      )
+      |> repo.update_all(
+        set: [
+          released_at: nil,
+          reserved_at: now,
+          slot_generation: generation,
+          updated_at: now
+        ]
+      )
+
+    %{record | released_at: nil, reserved_at: now, slot_generation: generation}
+  end
+
   @doc """
-  Releases the slot a dispatch holds, exactly once. `:already_released` for a dispatch
-  whose slot is already back — a replay, or a row the heal got to first.
+  Releases the slot `generation` of a dispatch, exactly once. `:already_released` when that
+  generation's slot is already back — a replay, a release naming a slot the row no longer
+  holds, or a row the heal got to first.
   """
-  @spec release(DispatchRecord.t(), DateTime.t()) :: :released | :already_released
-  def release(%DispatchRecord{} = record, now \\ DateTime.utc_now()) do
+  @spec release(Ecto.Repo.t(), DispatchRecord.t(), integer(), DateTime.t()) ::
+          :released | :already_released
+  def release(repo \\ Repo, record, generation, now \\ DateTime.utc_now())
+
+  def release(repo, %DispatchRecord{} = record, generation, now) when is_integer(generation) do
     marked =
       from(d in DispatchRecord,
         where: d.id == ^record.id and d.tenant_id == ^record.tenant_id,
-        where: is_nil(d.released_at)
+        where: is_nil(d.released_at) and d.slot_generation == ^generation
       )
-      |> Repo.update_all(set: [released_at: now])
+      |> repo.update_all(set: [released_at: now, updated_at: now])
 
     case marked do
       {1, _} ->
-        give_back(record.tenant_id, record.runner_id, 1)
+        give_back(repo, record.tenant_id, record.runner_id, 1)
         :released
 
       {0, _} ->
@@ -226,13 +299,66 @@ defmodule Loopctl.Runners.Capacity do
           {:ok, %{released: non_neg_integer(), in_flight: non_neg_integer() | nil}}
   def heal(tenant_id, runner_id, now \\ DateTime.utc_now()) do
     {released, _ids} =
-      tenant_id
-      |> dead_reservations(runner_id, now)
-      |> Repo.update_all(set: [released_at: now])
+      now
+      |> dead_reservations()
+      |> where([d], d.tenant_id == ^tenant_id and d.runner_id == ^runner_id)
+      |> Repo.update_all(set: [released_at: now, updated_at: now])
 
-    if released > 0, do: give_back(tenant_id, runner_id, released)
+    if released > 0, do: give_back(Repo, tenant_id, runner_id, released)
 
     {:ok, %{released: released, in_flight: recount(tenant_id, runner_id)}}
+  end
+
+  @doc """
+  Every unreleased reservation that can no longer be running, fleet-wide, as of `now`. The
+  heal scopes it to one runner; `Loopctl.Workers.HealRunnerCapacityWorker` reads it whole to
+  find the runners that need one.
+  """
+  @spec dead_reservations(DateTime.t()) :: Ecto.Query.t()
+  def dead_reservations(now) do
+    claim_current =
+      from s in Story,
+        where: s.tenant_id == parent_as(:dispatch).tenant_id,
+        where: s.id == parent_as(:dispatch).story_id,
+        where: s.claim_epoch == parent_as(:dispatch).claim_epoch,
+        select: 1
+
+    runner_active =
+      from r in Runner,
+        where: r.tenant_id == parent_as(:dispatch).tenant_id,
+        where: r.id == parent_as(:dispatch).runner_id,
+        where: is_nil(r.revoked_at),
+        select: 1
+
+    from d in DispatchRecord,
+      as: :dispatch,
+      where: is_nil(d.released_at),
+      # Never pushed under THIS reservation, and the push had time to happen: a dispatch
+      # is broadcast to a channel that pushes it at once or not at all, so an unpushed
+      # reservation is an undelivered one.
+      # The runner stops a session at its wall clock. Timed from acceptance, else from
+      # the push this reservation made, else from the reservation itself.
+      where:
+        d.status in ["refused", "superseded"] or not exists(claim_current) or
+          not exists(runner_active) or
+          (d.status == "sent" and (is_nil(d.pushed_at) or d.pushed_at < d.reserved_at) and
+             fragment(
+               "? + make_interval(secs => ?) < ?",
+               d.reserved_at,
+               type(^@unpushed_grace_seconds, :integer),
+               type(^now, :utc_datetime_usec)
+             )) or
+          fragment(
+            "? + make_interval(secs => ? + ?) < ?",
+            coalesce(
+              d.replied_at,
+              fragment("GREATEST(?, ?)", d.reserved_at, coalesce(d.pushed_at, d.reserved_at))
+            ),
+            d.wall_clock_seconds,
+            type(^@release_grace_seconds, :integer),
+            type(^now, :utc_datetime_usec)
+          ),
+      select: d.id
   end
 
   # Under the runner's row lock, so a reservation or release racing this commits either
@@ -251,73 +377,46 @@ defmodule Loopctl.Runners.Capacity do
       nil ->
         nil
 
-      %{in_flight: in_flight, max_sessions: max_sessions} ->
-        live =
-          Repo.aggregate(
-            from(d in DispatchRecord,
-              where: d.tenant_id == ^tenant_id and d.runner_id == ^runner_id,
-              where: is_nil(d.released_at)
-            ),
-            :count
-          )
-
-        # Above `max_sessions` only if the runner was re-enrolled smaller while holding
-        # slots; the CHECK would refuse the exact count, and admitting nothing until the
-        # rows drain is the same outcome.
-        target = min(live, max_sessions)
-
-        if target != in_flight do
-          from(r in Runner, where: r.id == ^runner_id and r.tenant_id == ^tenant_id)
-          |> Repo.update_all(set: [in_flight: target, updated_at: DateTime.utc_now()])
-        end
-
-        target
+      %{in_flight: in_flight, max_sessions: max} ->
+        write_count(tenant_id, runner_id, in_flight, max)
     end
   end
 
-  defp give_back(tenant_id, runner_id, count) do
+  defp write_count(tenant_id, runner_id, in_flight, max_sessions) do
+    live = Repo.aggregate(unreleased(tenant_id, runner_id), :count)
+
+    # Above `max_sessions` only if the runner was re-enrolled smaller while holding slots;
+    # the CHECK would refuse the exact count, and admitting nothing until the rows drain is
+    # the same outcome.
+    target = min(live, max_sessions)
+
+    if target != in_flight do
+      from(r in Runner, where: r.id == ^runner_id and r.tenant_id == ^tenant_id)
+      |> Repo.update_all(set: [in_flight: target, updated_at: DateTime.utc_now()])
+    end
+
+    target
+  end
+
+  @doc "A runner's live reservations."
+  @spec unreleased(Ecto.UUID.t(), Ecto.UUID.t()) :: Ecto.Query.t()
+  def unreleased(tenant_id, runner_id) do
+    from d in DispatchRecord,
+      where: d.tenant_id == ^tenant_id and d.runner_id == ^runner_id,
+      where: is_nil(d.released_at)
+  end
+
+  defp give_back(repo, tenant_id, runner_id, count) do
     from(r in Runner,
       where: r.id == ^runner_id and r.tenant_id == ^tenant_id,
       update: [set: [in_flight: fragment("GREATEST(? - ?, 0)", r.in_flight, ^count)]]
     )
-    |> Repo.update_all([])
+    |> repo.update_all([])
   end
 
-  defp dead_reservations(tenant_id, runner_id, now) do
-    claim_current =
-      from s in Story,
-        where: s.tenant_id == parent_as(:dispatch).tenant_id,
-        where: s.id == parent_as(:dispatch).story_id,
-        where: s.claim_epoch == parent_as(:dispatch).claim_epoch,
-        select: 1
-
-    runner_active =
-      from r in Runner,
-        where: r.tenant_id == parent_as(:dispatch).tenant_id,
-        where: r.id == parent_as(:dispatch).runner_id,
-        where: is_nil(r.revoked_at),
-        select: 1
-
-    from d in DispatchRecord,
-      as: :dispatch,
-      where: d.tenant_id == ^tenant_id and d.runner_id == ^runner_id,
-      where: is_nil(d.released_at),
-      where:
-        d.status in ["refused", "superseded"] or not exists(claim_current) or
-          not exists(runner_active) or
-          fragment(
-            "? + make_interval(secs => ? + ?) < ?",
-            coalesce(d.replied_at, coalesce(d.pushed_at, d.inserted_at)),
-            d.wall_clock_seconds,
-            type(^@release_grace_seconds, :integer),
-            type(^now, :utc_datetime_usec)
-          ),
-      select: d.id
-  end
-
-  defp lock_admission!(tenant_id) do
+  defp lock_admission!(repo, tenant_id) do
     {:ok, <<key::signed-integer-32, _rest::binary>>} = Ecto.UUID.dump(tenant_id)
-    Repo.query!("SELECT pg_advisory_xact_lock($1, $2)", [@admission_lock_ns, key])
+    repo.query!("SELECT pg_advisory_xact_lock($1, $2)", [@admission_lock_ns, key])
     :ok
   end
 end

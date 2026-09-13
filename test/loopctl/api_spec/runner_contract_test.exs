@@ -49,8 +49,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.2.0"
-      assert schema["x-contract-version"] == "1.2.0"
+      assert RunnerContract.version() == "1.3.0"
+      assert schema["x-contract-version"] == "1.3.0"
 
       assert %{
                "dispatch_reply" => "RunnerDispatchReply",
@@ -476,6 +476,26 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       assert dispatch.claim_epoch == 0
       assert dispatch.token_budget == 200_000
       refute Enum.any?(Map.keys(dispatch), &is_binary/1)
+    end
+
+    test "refuses a wall clock past the bound, and accepts it at the bound" do
+      max = RunnerContract.RunnerDispatch.max_wall_clock_seconds()
+
+      assert {:ok, %{wall_clock_seconds: ^max}} =
+               RunnerContract.cast_dispatch(
+                 build(:runner_dispatch, %{"wall_clock_seconds" => max})
+               )
+
+      # Unbounded, this reaches an integer column as an out-of-range value and raises out of
+      # dispatch/3 instead of being refused as the invalid payload it is.
+      for over <- [max + 1, 2_147_483_648, 9_999_999_999_999] do
+        assert {:error, {:invalid, messages}} =
+                 RunnerContract.cast_dispatch(
+                   build(:runner_dispatch, %{"wall_clock_seconds" => over})
+                 )
+
+        assert Enum.any?(messages, &(&1 =~ "maximum #{max}"))
+      end
     end
 
     test "drops undeclared keys, including ones that look internal" do

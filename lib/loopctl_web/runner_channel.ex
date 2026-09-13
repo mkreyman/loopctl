@@ -183,7 +183,10 @@ defmodule LoopctlWeb.RunnerChannel do
   #   runner; every other receiver drops it.
   # - a halt can land between that read and this message, and a dispatch is custody
   #   progress. Re-read fresh, from THIS channel's own tenant.
-  def handle_info({:runner_dispatch, dispatch}, socket) do
+  def handle_info({:runner_dispatch, dispatch}, socket),
+    do: handle_info({:runner_dispatch, dispatch, nil}, socket)
+
+  def handle_info({:runner_dispatch, dispatch, slot_generation}, socket) do
     correlation = [
       dispatch_id: dispatch.dispatch_id,
       story_id: dispatch.story_id,
@@ -193,10 +196,15 @@ defmodule LoopctlWeb.RunnerChannel do
     with_correlation(correlation, fn ->
       cond do
         not sole_live_socket?(socket) ->
-          drop_dispatch(socket, dispatch, "not the only live socket for this runner")
+          drop_dispatch(
+            socket,
+            dispatch,
+            slot_generation,
+            "not the only live socket for this runner"
+          )
 
         Runners.custody_halted?(socket.assigns.tenant_id) ->
-          drop_dispatch(socket, dispatch, "tenant custody halted")
+          drop_dispatch(socket, dispatch, slot_generation, "tenant custody halted")
 
         true ->
           push(socket, "dispatch", dispatch)
@@ -495,14 +503,37 @@ defmodule LoopctlWeb.RunnerChannel do
 
   defp sole_live_socket?(_socket), do: false
 
-  defp drop_dispatch(socket, dispatch, why) do
+  # A dropped dispatch reaches no session, so its capacity slot goes back at once rather than
+  # waiting for the heal sweep's bound. The release names the slot the broadcast carried, so
+  # it can never free a later reservation of the same dispatch; a message with no slot (a
+  # direct broadcast, as tests make) releases nothing. A failure here is logged and swallowed
+  # — the drop has already happened, and the sweep still bounds the slot — for the same
+  # reason `mark_pushed/2` swallows one: a raise would take down the runner's socket.
+  defp drop_dispatch(socket, dispatch, slot_generation, why) do
     Logger.warning(
       "runner #{socket.assigns.runner.id} dispatch #{dispatch.dispatch_id} dropped: #{why} " <>
         "tenant_id=#{socket.assigns.tenant_id} story_id=#{dispatch.story_id} " <>
         "claim_epoch=#{dispatch.claim_epoch}"
     )
 
+    release_dropped_slot(socket.assigns.tenant_id, dispatch, slot_generation)
+
     {:noreply, socket}
+  end
+
+  defp release_dropped_slot(_tenant_id, _dispatch, nil), do: :ok
+
+  defp release_dropped_slot(tenant_id, dispatch, slot_generation) do
+    DispatchLedger.release_slot(tenant_id, dispatch.dispatch_id, slot_generation)
+    :ok
+  rescue
+    error in [DBConnection.ConnectionError, Postgrex.Error] ->
+      Logger.warning(
+        "runner dispatch slot not released on drop: tenant_id=#{tenant_id} " <>
+          "dispatch_id=#{dispatch.dispatch_id} error=#{inspect(error.__struct__)}"
+      )
+
+      :error
   end
 
   defp schedule_recheck, do: Process.send_after(self(), :recheck, @recheck_interval_ms)

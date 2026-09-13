@@ -473,24 +473,26 @@ defmodule Loopctl.Runners do
          :ok <- not_halted(tenant_id),
          :ok <- runner_authorized(tenant_id, runner_id),
          :ok <- single_live_socket(tenant_id, runner_id),
-         {:ok, _record} <- DispatchLedger.record_sent(tenant_id, runner_id, dispatch) do
-      broadcast_dispatch(tenant_id, runner_id, dispatch)
+         {:ok, record} <- DispatchLedger.record_sent(tenant_id, runner_id, dispatch) do
+      broadcast_dispatch(tenant_id, runner_id, dispatch, record.slot_generation)
     end
   end
 
-  # The only failure after the slot is committed. Nothing was handed to any channel, so the
-  # slot goes back (idempotently); a re-send of the same `dispatch_id` takes a fresh one.
-  defp broadcast_dispatch(tenant_id, runner_id, dispatch) do
+  # The message carries the SLOT the dispatch holds, so a channel that drops it instead of
+  # pushing hands exactly that slot back and never a later one.
+  defp broadcast_dispatch(tenant_id, runner_id, dispatch, generation) do
     case Phoenix.PubSub.broadcast(
            Loopctl.PubSub,
            dispatch_topic(runner_id),
-           {:runner_dispatch, dispatch}
+           {:runner_dispatch, dispatch, generation}
          ) do
       :ok ->
         :ok
 
+      # The only failure after the slot is committed. Nothing was handed to any channel, so
+      # the slot goes back; a re-send of the same `dispatch_id` takes a fresh one.
       {:error, _reason} = error ->
-        {:ok, _} = DispatchLedger.release_slot(tenant_id, dispatch.dispatch_id)
+        {:ok, _} = DispatchLedger.release_slot(tenant_id, dispatch.dispatch_id, generation)
         error
     end
   end
@@ -507,19 +509,26 @@ defmodule Loopctl.Runners do
   @spec reserve_slot(Ecto.UUID.t(), Ecto.UUID.t()) ::
           {:ok, pos_integer()} | {:error, :runner_at_capacity}
   def reserve_slot(tenant_id, runner_id) when is_binary(tenant_id) and is_binary(runner_id) do
-    Repo.with_tenant(tenant_id, fn -> Capacity.reserve(tenant_id, runner_id) end)
+    Repo.with_tenant(tenant_id, fn -> Capacity.reserve(Repo, tenant_id, runner_id) end)
     |> flatten()
   end
 
   @doc """
-  Releases the slot a dispatch holds, exactly once (`DispatchLedger.release_slot/2`). Call it
-  when a dispatch's session ends; a replay returns `{:ok, :already_released}` and changes
-  nothing.
+  Releases the slot GENERATION a dispatch holds, exactly once
+  (`DispatchLedger.release_slot/3`), in a transaction of its own. Call it when a dispatch's
+  session ends; a replay, or a generation the row no longer holds, returns
+  `{:ok, :already_released}` and changes nothing.
+
+  Read the generation from `DispatchLedger.get_record/2` (`slot_generation`) when the
+  session starts. A caller that already owns a transaction — a claim release, a stage
+  transition — uses `DispatchLedger.release_slot_in/4` instead, so the release commits with
+  the transition that decided it rather than after it.
   """
-  @spec release_slot(Ecto.UUID.t(), Ecto.UUID.t()) ::
+  @spec release_slot(Ecto.UUID.t(), Ecto.UUID.t(), integer()) ::
           {:ok, :released | :already_released} | {:error, :unknown_dispatch}
-  def release_slot(tenant_id, dispatch_id) when is_binary(tenant_id) and is_binary(dispatch_id),
-    do: DispatchLedger.release_slot(tenant_id, dispatch_id)
+  def release_slot(tenant_id, dispatch_id, generation)
+      when is_binary(tenant_id) and is_binary(dispatch_id) and is_integer(generation),
+      do: DispatchLedger.release_slot(tenant_id, dispatch_id, generation)
 
   @doc """
   Whether the tenant is under its admission limit right now, for a caller deciding whether
@@ -530,7 +539,9 @@ defmodule Loopctl.Runners do
           {:ok, %{in_flight: non_neg_integer(), limit: pos_integer()}}
           | {:error, :admission_limit_reached}
   def admission(tenant_id) when is_binary(tenant_id) do
-    {:ok, in_flight} = Repo.with_tenant(tenant_id, fn -> Capacity.tenant_in_flight(tenant_id) end)
+    {:ok, in_flight} =
+      Repo.with_tenant(tenant_id, fn -> Capacity.tenant_in_flight(Repo, tenant_id) end)
+
     limit = Capacity.limit()
 
     if in_flight < limit,
@@ -546,7 +557,7 @@ defmodule Loopctl.Runners do
           {:ok, %{released: non_neg_integer(), in_flight: non_neg_integer() | nil}}
   def heal_capacity(tenant_id, runner_id) when is_binary(tenant_id) and is_binary(runner_id) do
     Repo.with_tenant(tenant_id, fn ->
-      Capacity.set_lock_timeout!()
+      Capacity.set_lock_timeout!(Repo)
       Capacity.heal(tenant_id, runner_id)
     end)
     |> flatten()

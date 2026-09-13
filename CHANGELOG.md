@@ -29,7 +29,16 @@ All notable changes to loopctl are documented here.
   `max_sessions` and `in_flight`. **`GET /api/v1/runners/pool` changes meaning:** its
   `in_flight` and `max_sessions` are now the Postgres values dispatch reserves against (null
   only for a runner revoked while its socket drains), and what the runner itself reported
-  moved to the new `reported_in_flight` and `reported_max_sessions`.
+  moved to the new `reported_in_flight` and `reported_max_sessions`. `loopctl-mcp-server`
+  2.93.0 carries both: `runner_enroll` takes `max_sessions`, and `runner_pool` names the
+  new fields.
+
+  **Runner contract 1.3.0 (minor).** A dispatch's `wall_clock_seconds` is now bounded at a
+  day (`RunnerDispatch.max_wall_clock_seconds/0`): loopctl stores it and presumes a slot free
+  past it plus a grace, and an unbounded value overflowed the column it is stored in. A
+  larger one is refused as an invalid payload before anything is recorded. Runners need no
+  change — they already send a session-sized wall clock — and `priv/runner_contract/v1.json`
+  is regenerated.
 
 - **The production machines form one BEAM cluster.** Until now both Fly machines booted as
   `loopctl@127.0.0.1` with IPv4 distribution and no `DNS_CLUSTER_QUERY`, so each was an

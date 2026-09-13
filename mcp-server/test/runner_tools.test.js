@@ -129,6 +129,27 @@ describe("runner_enroll", () => {
     assert.deepEqual(calls, [{ method: "POST", path: "/api/v1/runners", body: { name: "minis" } }]);
   });
 
+  test("sends max_sessions only when given, and returns it on the runner", async () => {
+    const { calls, apiCall } = fakeApi({
+      "POST /api/v1/runners": { runner: { ...RUNNER, max_sessions: 4 }, token: TOKEN },
+    });
+
+    const withLimit = await enrollRunner(
+      { name: "minis", token_file: path.join(tmp, "with.token"), max_sessions: 4 },
+      { userKey: USER_KEY, apiCall },
+    );
+
+    assert.deepEqual(calls[0].body, { name: "minis", max_sessions: 4 });
+    assert.equal(withLimit.runner.max_sessions, 4);
+
+    await enrollRunner(
+      { name: "blockit", token_file: path.join(tmp, "without.token") },
+      { userKey: USER_KEY, apiCall },
+    );
+
+    assert.deepEqual(calls[1].body, { name: "blockit" });
+  });
+
   test("expands a leading ~/ against the home directory", async () => {
     const { apiCall } = fakeApi(enrolled);
     const result = await enrollRunner(
@@ -543,6 +564,22 @@ describe("index.js wiring", () => {
     assert.match(functionSource("runnerList"), /listRunners\(args, runnerDeps\(\)\)/);
     assert.match(functionSource("runnerRevoke"), /revokeRunner\(args, runnerDeps\(\)\)/);
     assert.match(functionSource("runnerPoolRead"), /runnerPool\(args, runnerDeps\(\)\)/);
+  });
+
+  test("runner_enroll declares max_sessions and runner_pool names the Postgres capacity", () => {
+    const enroll = INDEX_SRC.slice(
+      INDEX_SRC.indexOf('name: "runner_enroll",'),
+      INDEX_SRC.indexOf('name: "runner_list",'),
+    );
+    assert.match(enroll, /max_sessions: \{/);
+
+    const pool = INDEX_SRC.slice(
+      INDEX_SRC.indexOf('name: "runner_pool",'),
+      INDEX_SRC.indexOf('name: "runner_pool",') + 2000,
+    );
+    assert.match(pool, /reported_in_flight/);
+    assert.match(pool, /reported_max_sessions/);
+    assert.ok(README.includes("reported_in_flight"), "the README names reported_in_flight");
   });
 
   test("runner_enroll's description states the token-handling property and the undo", () => {

@@ -11,15 +11,20 @@ defmodule Loopctl.Repo.Migrations.AddRunnerCapacity do
   #   UPDATE runners SET in_flight = in_flight + 1
   #    WHERE id = $1 AND tenant_id = $2 AND revoked_at IS NULL AND in_flight < max_sessions
   #
-  # `runner_dispatches.released_at` is the exactly-once marker for giving a slot back: a
-  # release sets it with `WHERE released_at IS NULL` and decrements only when that write hit
-  # a row, so a release replayed for the same dispatch changes nothing. The invariant the
-  # heal sweep restores is `runners.in_flight = count of this runner's unreleased dispatches`.
+  # A dispatch row holds at most one slot at a time, but can hold SEVERAL over its life: a
+  # slot released because the push never happened is taken again when the same `dispatch_id`
+  # is re-sent. `slot_generation` names each one (incremented on every reservation) and
+  # `released_at` marks the current one released. A release names the generation it means
+  # and sets `released_at` only `WHERE released_at IS NULL AND slot_generation = $g`, so a
+  # release replayed for an earlier slot can never free a later one. The invariant the heal
+  # sweep restores is `runners.in_flight = count of this runner's unreleased dispatches`.
   #
-  # `wall_clock_seconds` is copied from the dispatch so an unreleased slot always has an end:
-  # the runner stops a session at its wall clock, so past it (plus a grace) the session is
-  # gone whether or not anything reported that. The CHECK makes an unbounded reservation
-  # unrepresentable.
+  # `reserved_at` and `wall_clock_seconds` give every unreleased slot an end. A slot whose
+  # dispatch was never pushed under this reservation (`pushed_at` NULL or older than
+  # `reserved_at`) is presumed undelivered after a short bound; one that was pushed or
+  # accepted ends with the runner's wall clock plus a grace, because the runner stops a
+  # session there whether or not anything reported it. The CHECK makes an unbounded
+  # reservation unrepresentable.
   #
   # Adding a NOT NULL column with a constant default rewrites no rows (PG 11+). The CHECKs
   # validate by scanning, which is cheap on these tables (a handful of runners, and a ledger
@@ -42,17 +47,25 @@ defmodule Loopctl.Repo.Migrations.AddRunnerCapacity do
 
     alter table(:runner_dispatches) do
       add :released_at, :utc_datetime_usec, null: true
+      add :reserved_at, :utc_datetime_usec, null: true
+      add :slot_generation, :bigint, null: false, default: 0
       add :wall_clock_seconds, :integer, null: true
     end
 
     execute "UPDATE runner_dispatches SET released_at = now() WHERE released_at IS NULL"
+
+    create constraint(:runner_dispatches, :runner_dispatches_slot_generation_nonneg,
+             check: "slot_generation >= 0"
+           )
 
     create constraint(:runner_dispatches, :runner_dispatches_wall_clock_positive,
              check: "wall_clock_seconds IS NULL OR wall_clock_seconds > 0"
            )
 
     create constraint(:runner_dispatches, :runner_dispatches_unreleased_bounded,
-             check: "released_at IS NOT NULL OR wall_clock_seconds IS NOT NULL"
+             check:
+               "released_at IS NOT NULL OR " <>
+                 "(wall_clock_seconds IS NOT NULL AND reserved_at IS NOT NULL AND slot_generation > 0)"
            )
 
     # The heal sweep's and the pool's read: a runner's live reservations.
@@ -69,9 +82,12 @@ defmodule Loopctl.Repo.Migrations.AddRunnerCapacity do
 
     drop constraint(:runner_dispatches, :runner_dispatches_unreleased_bounded)
     drop constraint(:runner_dispatches, :runner_dispatches_wall_clock_positive)
+    drop constraint(:runner_dispatches, :runner_dispatches_slot_generation_nonneg)
 
     alter table(:runner_dispatches) do
       remove :wall_clock_seconds
+      remove :slot_generation
+      remove :reserved_at
       remove :released_at
     end
 

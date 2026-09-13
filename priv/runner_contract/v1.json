@@ -67,6 +67,8 @@
           ]
         },
         "wall_clock_seconds": {
+          "description": "How long the runner lets the session run before stopping it. At most 86400 (a day) since contract 1.3.0.",
+          "maximum": 86400,
           "minimum": 1,
           "type": "integer"
         }
@@ -551,5 +553,5 @@
     "socket_path": "/runner/socket/websocket",
     "topic": "runner:{runner_id}"
   },
-  "x-contract-version": "1.2.0"
+  "x-contract-version": "1.3.0"
 }
