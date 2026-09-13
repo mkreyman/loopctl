@@ -40,8 +40,10 @@ defmodule Loopctl.Runners do
   `dispatch/3` is the one path by which a dispatch reaches a runner. It validates the
   payload against the contract and refuses a halted tenant, an unauthorized runner and a
   runner without exactly one live socket before anything is sent; the channel repeats the
-  halt and single-socket checks right before the push. Placement, capacity reservation and
-  claiming are the caller's (#803).
+  halt and single-socket checks right before the push. Every dispatch is recorded in the
+  dispatch ledger (`Loopctl.Runners.DispatchLedger`) before it is broadcast, and the runner's
+  `dispatch_reply` and trace land there. Placement, capacity reservation and claiming are the
+  caller's (#803).
   """
 
   import Ecto.Query
@@ -53,6 +55,7 @@ defmodule Loopctl.Runners do
   alias Loopctl.AuditChain.Entry, as: AuditEntry
   alias Loopctl.Auth
   alias Loopctl.Auth.ApiKey
+  alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.Presence
   alias Loopctl.Runners.Runner
   alias Loopctl.Tenants
@@ -309,9 +312,20 @@ defmodule Loopctl.Runners do
   5. `{:error, :runner_ambiguous}` — more than one live socket holds the runner's
      credential. A dispatch is a prompt executed as the machine's user; with two sockets
      there is no telling which is the enrolled machine, and both would receive it.
+  6. `{:error, :dispatch_id_conflict}` — the tenant's ledger already holds this `dispatch_id`
+     for a different runner, story, `claim_epoch` or kind.
+  7. `{:error, :dispatch_already_replied}` — the runner already accepted or refused this
+     `dispatch_id`; sending it again would start a second session.
+  8. `{:error, :stale_claim_epoch}` — the dispatch's `claim_epoch` is not the story's current
+     one (or the story does not exist): the claim it was built for has already ended.
 
-  Then it broadcasts on `dispatch_topic/1`, and the runner's channel pushes the `"dispatch"`
-  event on the runner's own `runner:<runner_id>` topic, never a shared or tenant topic.
+  Then it writes the dispatch's ledger row as `sent` (`DispatchLedger.record_sent/3`) — or
+  finds the one an earlier call with the same `dispatch_id` wrote, so a retry never creates a
+  second row — and only then broadcasts on `dispatch_topic/1`. That write runs on the RLS
+  `Loopctl.Repo` in a transaction of its own, like the rest of the ledger, so this function
+  must not be called from inside a `Repo` transaction (`Repo.with_tenant/2` raises there).
+  The runner's channel then pushes the `"dispatch"` event on the runner's own
+  `runner:<runner_id>` topic, never a shared or tenant topic.
 
   `:ok` means handed to the runner's channel, not executed. The channel repeats two checks
   immediately before the push and drops the dispatch when either fails: the halt (a halt
@@ -332,13 +346,17 @@ defmodule Loopctl.Runners do
              | :tenant_halted
              | :not_authorized
              | :runner_not_connected
-             | :runner_ambiguous}
+             | :runner_ambiguous
+             | :dispatch_id_conflict
+             | :dispatch_already_replied
+             | :stale_claim_epoch}
   def dispatch(tenant_id, runner_id, payload) do
     with {:ok, dispatch} <- RunnerContract.cast_dispatch(payload),
          {:ok, tenant_id, runner_id} <- cast_ids(tenant_id, runner_id),
          :ok <- not_halted(tenant_id),
          :ok <- runner_authorized(tenant_id, runner_id),
-         :ok <- single_live_socket(tenant_id, runner_id) do
+         :ok <- single_live_socket(tenant_id, runner_id),
+         {:ok, _record} <- DispatchLedger.record_sent(tenant_id, runner_id, dispatch) do
       Phoenix.PubSub.broadcast(
         Loopctl.PubSub,
         dispatch_topic(runner_id),

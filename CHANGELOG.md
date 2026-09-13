@@ -137,6 +137,50 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Runner contract 1.1.0: dispatch replies, a dispatch ledger and trace intake (#803).**
+  Migrations `20260913120000` and `20260913120100` create `runner_dispatches` (one row per
+  `dispatch_id` per tenant, written by `Loopctl.Runners.dispatch/3` BEFORE it broadcasts) and
+  `runner_trace_events` (unique on `(tenant_id, run_id, seq)`). Both are new, empty tables
+  with RLS enabled: no backfill, no lock on an existing table, safe to deploy ahead of any
+  runner using them. The runner channel accepts three new runner-to-control events —
+  `dispatch_reply`, `trace` and `trace_cursor` — and `priv/runner_contract/v1.json` is
+  regenerated at `x-contract-version` 1.1.0, now also carrying each event's stable error
+  `reason` codes and its limits (`x-connection.errors`, `x-connection.limits`: at most 20
+  events and 60,000 bytes per batch, 12,000 per event and 6,000 of `data` per event, all
+  counted by one published encoder-independent byte rule (`json_byte_rule`: 6 bytes per
+  string character plus 12 per string, 32 per scalar, 2 per container and per member), so a
+  runner that splits by it never sends a frame the 64 KB socket cap closes; large payloads
+  belong in object storage — `trace_max_seq`,
+  `min_interval_ms` — each event's own rate floor per channel: `status` 1000, `trace` 50,
+  `trace_cursor` 50 — and `dispatch_reply_burst`, 8 replies refilled one per 250 ms). Only
+  a valid message spends a limit. The bump is minor: a runner built against 1.0.0 still
+  joins, and nothing it sends changed. Every UUID a runner sends is normalized to
+  lowercase, and a NUL character in any runner-supplied string is `invalid_payload`. A reply
+  or trace value Postgres still refuses is logged and emitted as the
+  `[:loopctl, :runners, :ledger_rejected_by_database]` telemetry event.
+
+  **Both tables are read and written on the RLS `Loopctl.Repo` pool (`POOL_SIZE`), never on
+  `AdminRepo`.** Trace intake is high-volume by design — a runner resuming after a deploy
+  may send 20 batches a second — and AdminRepo's small pool is read on every authenticated
+  request, so it must not queue behind it.
+
+  **`dispatch/3` has three new refusals.** `{:error, :stale_claim_epoch}` when the dispatch's
+  `claim_epoch` is not the story's current `stories.claim_epoch` (or the story does not
+  exist), `{:error, :dispatch_id_conflict}` when the ledger already holds that `dispatch_id`
+  for a different runner, story, `claim_epoch` or kind, and `{:error, :dispatch_already_replied}`
+  when the runner already answered it. Re-dispatching an unanswered `dispatch_id` re-sends it
+  without a second row.
+
+  **Replies and trace are fenced on the story's claim epoch (#810's `stories.claim_epoch`).**
+  In the transaction that locks the ledger row, the story's current epoch is read under a
+  share lock; once a claim is released or reclaimed, a `dispatch_reply` or `trace` about a
+  dispatch of the old claim is `stale_claim_epoch` and its ledger row is marked `superseded`.
+  `runner_dispatches` also carries an index on `(tenant_id, story_id)`.
+
+  **Trace has no retention yet.** `runner_trace_events` grows until a prune worker is added
+  to `oban_config.ex`; the table cascades from its `runner_dispatches` row, so pruning old
+  ledger rows prunes their trace.
+
 - **GitHub webhook intake for the agent delivery loop, with reporter text held as untrusted
   data (#803, #804).** Migration `20260913110000` creates `intake_sources`,
   `intake_records` and `intake_deliveries`, all new tables with RLS enabled; it rewrites no

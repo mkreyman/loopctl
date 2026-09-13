@@ -9,6 +9,7 @@ defmodule Loopctl.Fixtures do
   separate tenants via `fixture(:tenant)`.
   """
 
+  alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.Agents.Agent
   alias Loopctl.Artifacts.ArtifactReport
@@ -35,6 +36,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Orchestrator.OrchestratorState
   alias Loopctl.Projects.Project
   alias Loopctl.QualityAssurance.UiTestRun
+  alias Loopctl.Runners.Runner
   alias Loopctl.Skills.Skill
   alias Loopctl.Skills.SkillResult
   alias Loopctl.Skills.SkillVersion
@@ -91,6 +93,9 @@ defmodule Loopctl.Fixtures do
   Builds a data map for the given type without database insertion.
   Useful for changeset tests and unit tests that don't need persistence.
   """
+  # Slug prefix of every tenant `fixture(:committed_tenant)` commits; see the sweep below.
+  @committed_runner_marker "committed-runner-"
+
   def build(type, attrs \\ %{})
 
   def build(:tenant, attrs) do
@@ -710,6 +715,44 @@ defmodule Loopctl.Fixtures do
         "max_turns" => 50
       },
       Enum.into(attrs, %{})
+    )
+  end
+
+  # One event of a run's trace satisfying RunnerTraceEvent, string-keyed as the runner ships
+  # it. Pass "run_id" and "seq"; the rest defaults.
+  def build(:runner_trace_event, attrs) do
+    attrs = Enum.into(attrs, %{})
+    seq = Map.get(attrs, "seq", 0)
+
+    Map.merge(
+      %{
+        "run_id" => Ecto.UUID.generate(),
+        "seq" => seq,
+        "event_id" => "evt-#{seq}",
+        "parent" => if(seq == 0, do: nil, else: "evt-0"),
+        "ts" => "2026-09-12T20:36:46.485Z",
+        "type" => "claude.tool_use",
+        "data" => %{"tool" => "Read"}
+      },
+      attrs
+    )
+  end
+
+  # A `trace` batch for `run_id` carrying one event per seq in `seqs`.
+  def build(:runner_trace_batch, attrs) do
+    attrs = Enum.into(attrs, %{})
+    run_id = Map.get(attrs, "run_id", Ecto.UUID.generate())
+    seqs = Map.get(attrs, :seqs, [0])
+
+    Map.merge(
+      %{
+        "run_id" => run_id,
+        "dispatch_id" => Ecto.UUID.generate(),
+        "claim_epoch" => 0,
+        "events" =>
+          Enum.map(seqs, &build(:runner_trace_event, %{"run_id" => run_id, "seq" => &1}))
+      },
+      Map.delete(attrs, :seqs)
     )
   end
 
@@ -1849,6 +1892,77 @@ defmodule Loopctl.Fixtures do
     {raw_key, runner}
   end
 
+  # A tenant, runner key and runner row COMMITTED outside the sandbox, for tests of the
+  # runner dispatch ledger (#803). The ledger lives on the RLS `Loopctl.Repo`, while the
+  # runner socket authenticates through `Loopctl.AdminRepo`; the two are separate sandbox
+  # connections, so both the runner row and its tenant must be visible to both. Only a
+  # `async: false` module may use these (a committed row is visible to every running
+  # test), and it must call `sweep_committed_runner_tenants/0` in `setup_all` and on exit.
+  # No audit-chain entry is written: those rows cannot be deleted, so the sweep could not
+  # remove the tenant.
+  def fixture(:committed_runner, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.get_lazy(attrs, :tenant_id, fn -> fixture(:committed_tenant, %{}).id end)
+    name = Map.get(attrs, :name, "runner-#{System.unique_integer([:positive])}")
+
+    Sandbox.unboxed_run(AdminRepo, fn ->
+      {:ok, {raw_key, api_key}} =
+        Auth.generate_api_key(%{tenant_id: tenant_id, name: "runner:" <> name, role: :agent})
+
+      runner =
+        %Runner{tenant_id: tenant_id}
+        |> Runner.create_changeset(%{name: name})
+        |> Ecto.Changeset.put_change(:api_key_id, api_key.id)
+        |> AdminRepo.insert!()
+
+      {raw_key, runner}
+    end)
+  end
+
+  # A story (with its project and epic) on the RLS `Loopctl.Repo` connection, at a given
+  # `claim_epoch`, for the dispatch ledger's claim fence (#803). The ledger reads
+  # `stories.claim_epoch` on `Repo` inside its own transaction, and `Repo` and `AdminRepo`
+  # hold separate sandbox transactions, so a story made by `fixture(:story)` (AdminRepo) is
+  # invisible to it. `tenant_id` must be visible to `Repo` (a committed tenant).
+  def fixture(:ledger_story, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+
+    {:ok, story} =
+      Loopctl.Repo.with_tenant(tenant_id, fn ->
+        project =
+          %Project{tenant_id: tenant_id, kind: :work}
+          |> Project.create_changeset(build(:project, %{}))
+          |> Loopctl.Repo.insert!()
+
+        epic =
+          %Epic{tenant_id: tenant_id, project_id: project.id}
+          |> Epic.create_changeset(build(:epic, %{}))
+          |> Loopctl.Repo.insert!()
+
+        %Story{tenant_id: tenant_id, project_id: project.id, epic_id: epic.id}
+        |> Story.create_changeset(build(:story, %{}))
+        |> Ecto.Changeset.change(claim_epoch: Map.get(attrs, :claim_epoch, 0))
+        |> Loopctl.Repo.insert!()
+      end)
+
+    story
+  end
+
+  def fixture(:committed_tenant, _attrs) do
+    seq = System.unique_integer([:positive])
+
+    Sandbox.unboxed_run(AdminRepo, fn ->
+      %Tenant{}
+      |> Tenant.create_changeset(%{
+        name: "Committed runner tenant #{seq}",
+        slug: "#{@committed_runner_marker}#{seq}",
+        email: "#{@committed_runner_marker}#{seq}@example.com"
+      })
+      |> AdminRepo.insert!()
+    end)
+  end
+
   # A GitHub intake source (issue #803). Returns `{webhook_secret, source}` so a test can
   # sign deliveries. Auto-creates the tenant and an active work project when not given.
   def fixture(:intake_source, attrs) do
@@ -2238,5 +2352,18 @@ defmodule Loopctl.Fixtures do
 
   defp ensure_scope_entity(attrs, _unknown, _tenant_id) do
     {Ecto.UUID.generate(), attrs}
+  end
+
+  @doc "Deletes every tenant `fixture(:committed_runner | :committed_tenant)` committed."
+  def sweep_committed_runner_tenants do
+    import Ecto.Query, only: [from: 2]
+
+    Sandbox.unboxed_run(AdminRepo, fn ->
+      AdminRepo.delete_all(
+        from(t in Tenant, where: like(t.slug, ^"#{@committed_runner_marker}%"))
+      )
+    end)
+
+    :ok
   end
 end
