@@ -85,6 +85,23 @@ defmodule Loopctl.Runners.DispatchLedger do
   Neither replies nor trace are refused on a custody halt: a halt stops new custody
   progress, and a halted tenant must still be able to record what already happened.
 
+  ## Retention
+
+  `prune_trace_events/3` is the trace table's retention pass, called by
+  `Loopctl.Workers.DeliveryLoopPruneWorker`. It deletes events past a tenant's window whose
+  dispatch is TERMINAL — `released_at` set — in bounded batches, oldest first. A dispatch
+  nothing has released keeps its whole trace however old it is: `released_at` is the one
+  column that says the session is over (a finished run stays `accepted` for ever, so
+  `status` cannot say it), and a slot nothing gave back is either still running or a leak
+  `Loopctl.Workers.HealRunnerCapacityWorker` is about to release.
+
+  Retention does NOT disturb the resume protocol. A runner resumes from `trace_acked_seq`,
+  a column on the DISPATCH row, and `advance_cursor/1` only ever reads seqs above it — see
+  the note there — so a pruned event below the cursor is invisible to both. The trace file
+  on the runner's disk stays the source of truth for the run; this table is the copy
+  loopctl keeps, and the window is a disk bound, not amnesia. The audit chain is a
+  different table and is never touched here.
+
   ## Repo and isolation
 
   Every read and write runs on the RLS-enforced `Loopctl.Repo`, inside
@@ -100,11 +117,28 @@ defmodule Loopctl.Runners.DispatchLedger do
 
   require Logger
 
+  alias Loopctl.LocalGuc
   alias Loopctl.Repo
   alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Runners.TraceEvent
   alias Loopctl.WorkBreakdown.Story
+
+  # Retention (see "Retention" in the moduledoc). The batch is one DELETE statement's worth of
+  # rows and the budget is one tenant's worth per run: both bound how long a single statement
+  # and a single run can hold a connection of the RLS pool, and the budget is what makes a run
+  # that cannot keep up stop cleanly instead of running until something else times out.
+  @prune_batch_size 1_000
+  @prune_budget 20_000
+  @prune_statement_timeout_ms 15_000
+
+  @doc "The rows one retention DELETE statement takes."
+  @spec prune_batch_size() :: pos_integer()
+  def prune_batch_size, do: @prune_batch_size
+
+  @doc "The rows one retention run may delete for one tenant."
+  @spec prune_budget() :: pos_integer()
+  def prune_budget, do: @prune_budget
 
   @doc """
   Records a validated dispatch as `sent`, or finds the row an earlier dispatch of the same
@@ -569,6 +603,94 @@ defmodule Loopctl.Runners.DispatchLedger do
     acked || -1
   end
 
+  @doc """
+  Deletes one tenant's trace events past `cutoff` whose dispatch is terminal, oldest first,
+  in batches of `:batch_size` up to `:budget` rows. See "Retention" in the moduledoc.
+
+  Returns `%{deleted: n, budget_exhausted: bool}`. `budget_exhausted` means the tenant still
+  had eligible rows when the budget ran out; the next run resumes where this one stopped,
+  because the candidates are ordered by age and nothing puts a pruned row back.
+
+  Each batch is its OWN transaction, with its own `statement_timeout` and `lock_timeout`, so
+  nothing here holds a transaction open across a large delete and a run interrupted between
+  batches leaves every earlier batch committed. Candidate rows are taken
+  `FOR UPDATE SKIP LOCKED`, so two overlapping runs prune disjoint sets instead of one
+  waiting on the other, and neither double-counts.
+  """
+  @spec prune_trace_events(Ecto.UUID.t(), DateTime.t(), keyword()) ::
+          %{deleted: non_neg_integer(), budget_exhausted: boolean()}
+  def prune_trace_events(tenant_id, %DateTime{} = cutoff, opts \\ []) do
+    batch_size = Keyword.get(opts, :batch_size, @prune_batch_size)
+    budget = Keyword.get(opts, :budget, @prune_budget)
+
+    prune_loop(tenant_id, cutoff, batch_size, budget, 0)
+  end
+
+  # The ONE stop: reaching the budget ends the run with rows still eligible. Every batch
+  # recurses through here, including the one that lands exactly on the budget, so this clause
+  # is the only place `budget_exhausted` becomes true and a test can reach it.
+  defp prune_loop(_tenant_id, _cutoff, _batch_size, budget, deleted) when deleted >= budget,
+    do: %{deleted: deleted, budget_exhausted: true}
+
+  defp prune_loop(tenant_id, cutoff, batch_size, budget, deleted) do
+    take = min(batch_size, budget - deleted)
+
+    {:ok, count} =
+      in_tenant(tenant_id, fn ->
+        LocalGuc.scoped(Repo, ["statement_timeout", "lock_timeout"], fn ->
+          Repo.query!("SET LOCAL statement_timeout = #{@prune_statement_timeout_ms}")
+          Repo.query!("SET LOCAL lock_timeout = #{Capacity.lock_timeout_ms()}")
+
+          delete_events(tenant_id, Repo.all(prunable_events(tenant_id, cutoff, take)))
+        end)
+      end)
+
+    if count == 0 do
+      %{deleted: deleted, budget_exhausted: false}
+    else
+      prune_loop(tenant_id, cutoff, batch_size, budget, deleted + count)
+    end
+  end
+
+  defp delete_events(_tenant_id, []), do: 0
+
+  defp delete_events(tenant_id, ids) do
+    {count, _} =
+      Repo.delete_all(from(e in TraceEvent, where: e.tenant_id == ^tenant_id and e.id in ^ids))
+
+    count
+  end
+
+  # A batch of one tenant's prunable event ids, oldest first. `released_at` is the terminality
+  # test: a dispatch still holding its slot may still be running, and its trace is kept
+  # whatever its age. `SKIP LOCKED` makes two concurrent runs disjoint rather than serial.
+  #
+  # SELECTED first and deleted by id in a SECOND statement of the SAME transaction, never as
+  # `DELETE ... WHERE id IN (this)`. The `FOR UPDATE` makes the subquery non-hashable, so the
+  # planner may re-execute it once per candidate row — and under `SKIP LOCKED` each execution
+  # returns a DIFFERENT set, so one statement deletes a multiple of `limit`. It is
+  # plan-dependent, so it passed the file's own tests and failed in the full suite: the budget
+  # tests caught a run of 4 against a budget of 2. The row locks this statement takes are held
+  # until the transaction commits, so the delete that follows still sees exactly this set.
+  defp prunable_events(tenant_id, cutoff, limit) do
+    terminal_dispatch =
+      from d in DispatchRecord,
+        where: d.tenant_id == parent_as(:prunable).tenant_id,
+        where: d.id == parent_as(:prunable).runner_dispatch_id,
+        where: not is_nil(d.released_at),
+        select: 1
+
+    from e in TraceEvent,
+      as: :prunable,
+      where: e.tenant_id == ^tenant_id,
+      where: e.inserted_at < ^cutoff,
+      where: exists(terminal_dispatch),
+      order_by: [asc: e.inserted_at],
+      limit: ^limit,
+      lock: "FOR UPDATE SKIP LOCKED",
+      select: e.id
+  end
+
   # The one way this module reaches the database: an RLS transaction it owns. A database
   # error raises: `record_sent/3` and the reads are given server-side values, so an error
   # there is a server bug.
@@ -779,10 +901,17 @@ defmodule Loopctl.Runners.DispatchLedger do
   defp usec(%DateTime{microsecond: {us, _precision}} = ts), do: %{ts | microsecond: {us, 6}}
 
   # The contiguous ack, advanced from the stored cursor so a long run is not rescanned from
-  # seq 0 on every batch. Seqs up to `acked` are all stored (the invariant). If `acked + 1`
-  # is not stored the cursor stays; otherwise the new cursor is the first stored seq at or
-  # after it whose successor is missing — every seq in between has its successor, so the
-  # whole stretch is contiguous. The row lock serialises batches of one run.
+  # seq 0 on every batch. Every seq up to `acked` was STORED at the moment the cursor reached
+  # it (the invariant), and the cursor is a column on this row, never recomputed from the
+  # events. If `acked + 1` is not stored the cursor stays; otherwise the new cursor is the
+  # first stored seq at or after it whose successor is missing — every seq in between has its
+  # successor, so the whole stretch is contiguous. The row lock serialises batches of one run.
+  #
+  # Retention (`prune_trace_events/3`) may DELETE stored seqs at or below `acked`, so the
+  # invariant is about what was stored, not about what is still there. Nothing here reads
+  # below `acked + 1` and the cursor never moves backwards, so a pruned event cannot lower an
+  # ack or make a runner resend. Do not "simplify" this into a scan from seq 0 — with
+  # retention behind it, that would reset a live run's cursor to -1.
   defp advance_cursor(%DispatchRecord{trace_acked_seq: acked} = record) do
     next = acked + 1
 

@@ -136,6 +136,22 @@ defmodule LoopctlWeb.Telemetry do
         description: "Runner-supplied ledger writes Postgres refused as data."
       ),
 
+      # Delivery-loop retention (#803 §11). `table` is one of two literals, so the tag is
+      # bounded; tenant ids stay in the logs. `tenants_at_budget` is the one to alert on —
+      # non-zero across consecutive runs means the pruner is not keeping up with the writes.
+      sum("loopctl.delivery_loop.prune.deleted",
+        event_name: [:loopctl, :delivery_loop, :prune],
+        measurement: :deleted,
+        tags: [:table],
+        description: "Rows the delivery-loop retention pass deleted, by table."
+      ),
+      last_value("loopctl.delivery_loop.prune.tenants_at_budget",
+        event_name: [:loopctl, :delivery_loop, :prune],
+        measurement: :tenants_at_budget,
+        tags: [:table],
+        description: "Tenants whose retention pass stopped at its per-run budget, by table."
+      ),
+
       # Database Metrics
       distribution("loopctl.repo.query.total_time",
         unit: {:native, :millisecond},

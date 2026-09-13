@@ -30,6 +30,24 @@ defmodule Loopctl.Intake do
   Steps 4 and 5 share one transaction, so a delivery is never marked seen without its
   effect.
 
+  ## Retention
+
+  `prune_deliveries/3` is the delivery log's retention pass, called by
+  `Loopctl.Workers.DeliveryLoopPruneWorker`. What the log is FOR decides the predicate:
+
+  - A row is the IDEMPOTENCY EVIDENCE of step 4. Deleting one lets the same
+    `X-GitHub-Delivery` be applied a second time, so the window must outlast GitHub's own
+    delivery history — GitHub keeps ~30 days and its "Redeliver" button reuses the delivery
+    id, so the floor on any tenant's setting is
+    `Loopctl.Workers.DeliveryLoopPruneWorker.min_intake_retention_days/0` and the default is
+    three times it. Past that window nothing upstream can replay the delivery, so the row is
+    disk rather than evidence.
+  - A row a RECORD still names as `last_delivery_id` is kept whatever its age. That is the
+    provenance of content triage may not have consumed yet, and it costs one row per record.
+
+  Neither clause is the audit trail: an escalation appends to the hash-chained audit log,
+  which this never touches.
+
   ## The record is the queue entry, and its text is untrusted
 
   An intake record holds reporter text ONLY in `untrusted_*` fields (`Loopctl.Intake.Record`).
@@ -77,6 +95,7 @@ defmodule Loopctl.Intake do
   alias Loopctl.Intake.Signature
   alias Loopctl.Intake.Source
   alias Loopctl.Intake.TicketFacts
+  alias Loopctl.LocalGuc
   alias Loopctl.Projects.Project
   alias Loopctl.Tenants.Tenant
 
@@ -86,6 +105,13 @@ defmodule Loopctl.Intake do
   @max_body_bytes 1_048_576
 
   @issue_actions ~w(opened edited reopened closed labeled unlabeled)
+
+  # Retention (see "Retention" in the moduledoc). One DELETE statement's worth of rows, one
+  # tenant's worth per run, and the timeouts each statement runs under.
+  @prune_batch_size 1_000
+  @prune_budget 20_000
+  @prune_statement_timeout_ms 15_000
+  @prune_lock_timeout_ms 5_000
 
   @delivery_id_format ~r/\A[A-Za-z0-9-]{1,128}\z/
   @event_format ~r/\A[a-z_]{1,64}\z/
@@ -326,6 +352,101 @@ defmodule Loopctl.Intake do
   # ---------------------------------------------------------------------------
   # Deliveries
   # ---------------------------------------------------------------------------
+
+  @doc "The rows one retention DELETE statement takes."
+  @spec prune_batch_size() :: pos_integer()
+  def prune_batch_size, do: @prune_batch_size
+
+  @doc "The delivery rows one retention run may delete for one tenant."
+  @spec prune_budget() :: pos_integer()
+  def prune_budget, do: @prune_budget
+
+  @doc """
+  Deletes one tenant's delivery rows past `cutoff` that are no longer idempotency evidence,
+  oldest first, in batches of `:batch_size` up to `:budget` rows. See "Retention" in the
+  moduledoc for what a row is FOR and why the window has a floor.
+
+  Returns `%{deleted: n, budget_exhausted: bool}`. `budget_exhausted` means eligible rows
+  were left; the next run resumes on them, since candidates are ordered by age.
+
+  Each batch is its own transaction under its own `statement_timeout` and `lock_timeout`, so
+  no transaction is held across a large delete and an interrupted run keeps every committed
+  batch. Candidates are taken `FOR UPDATE SKIP LOCKED`: two overlapping runs prune disjoint
+  sets rather than queueing, and a row a webhook is inserting is never in the set anyway
+  (it is newer than any cutoff).
+  """
+  @spec prune_deliveries(Ecto.UUID.t(), DateTime.t(), keyword()) ::
+          %{deleted: non_neg_integer(), budget_exhausted: boolean()}
+  def prune_deliveries(tenant_id, %DateTime{} = cutoff, opts \\ []) when is_binary(tenant_id) do
+    batch_size = Keyword.get(opts, :batch_size, @prune_batch_size)
+    budget = Keyword.get(opts, :budget, @prune_budget)
+
+    prune_deliveries_loop(tenant_id, cutoff, batch_size, budget, 0)
+  end
+
+  # The ONE stop, as in `Loopctl.Runners.DispatchLedger.prune_trace_events/3`: every batch
+  # recurses through here, so this clause is the only place `budget_exhausted` becomes true.
+  defp prune_deliveries_loop(_tenant_id, _cutoff, _batch, budget, deleted) when deleted >= budget,
+    do: %{deleted: deleted, budget_exhausted: true}
+
+  defp prune_deliveries_loop(tenant_id, cutoff, batch_size, budget, deleted) do
+    take = min(batch_size, budget - deleted)
+
+    {:ok, count} =
+      AdminRepo.transaction(fn ->
+        LocalGuc.scoped(AdminRepo, ["statement_timeout", "lock_timeout"], fn ->
+          AdminRepo.query!("SET LOCAL statement_timeout = #{@prune_statement_timeout_ms}")
+          AdminRepo.query!("SET LOCAL lock_timeout = #{@prune_lock_timeout_ms}")
+
+          delete_deliveries(
+            tenant_id,
+            AdminRepo.all(prunable_deliveries(tenant_id, cutoff, take))
+          )
+        end)
+      end)
+
+    if count == 0 do
+      %{deleted: deleted, budget_exhausted: false}
+    else
+      prune_deliveries_loop(tenant_id, cutoff, batch_size, budget, deleted + count)
+    end
+  end
+
+  defp delete_deliveries(_tenant_id, []), do: 0
+
+  defp delete_deliveries(tenant_id, ids) do
+    {count, _} =
+      AdminRepo.delete_all(from(d in Delivery, where: d.tenant_id == ^tenant_id and d.id in ^ids))
+
+    count
+  end
+
+  # A batch of one tenant's prunable delivery ids, oldest first. The row a record still names
+  # as `last_delivery_id` is kept whatever its age: it is the provenance of content triage
+  # has not consumed yet, and it is one row per record, not per delivery.
+  #
+  # SELECTED first and deleted by id in a SECOND statement of the SAME transaction, for the
+  # reason `Loopctl.Runners.DispatchLedger.prunable_events/3` states: `DELETE ... WHERE id IN
+  # (SELECT ... FOR UPDATE SKIP LOCKED LIMIT n)` can re-execute the subplan per row and delete
+  # a multiple of `n`.
+  defp prunable_deliveries(tenant_id, cutoff, limit) do
+    still_cited =
+      from r in Record,
+        where: r.tenant_id == parent_as(:prunable).tenant_id,
+        where: r.source_id == parent_as(:prunable).source_id,
+        where: r.last_delivery_id == parent_as(:prunable).github_delivery_id,
+        select: 1
+
+    from d in Delivery,
+      as: :prunable,
+      where: d.tenant_id == ^tenant_id,
+      where: d.inserted_at < ^cutoff,
+      where: not exists(still_cited),
+      order_by: [asc: d.inserted_at],
+      limit: ^limit,
+      lock: "FOR UPDATE SKIP LOCKED",
+      select: d.id
+  end
 
   @doc """
   Receives one GitHub webhook delivery for the source `source_id`. See the moduledoc for

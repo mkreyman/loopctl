@@ -436,6 +436,37 @@ defmodule Loopctl.ObanPluginsConfigTest do
     end
   end
 
+  describe "#803 §11: DeliveryLoopPruneWorker crontab entry" do
+    setup do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+
+      {Oban.Plugins.Cron, cron_opts} =
+        Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      entry =
+        Enum.find(cron_opts[:crontab], fn
+          {_schedule, Loopctl.Workers.DeliveryLoopPruneWorker} -> true
+          {_schedule, Loopctl.Workers.DeliveryLoopPruneWorker, _opts} -> true
+          _ -> false
+        end)
+
+      %{entry: entry}
+    end
+
+    test "delivery-loop retention is scheduled, hourly", %{entry: entry} do
+      assert entry,
+             "expected a DeliveryLoopPruneWorker crontab entry — nothing else deletes from " <>
+               "runner_trace_events or intake_deliveries, so without one both grow for as " <>
+               "long as the fleet runs (#803 §11)"
+
+      assert elem(entry, 0) == "20 * * * *"
+    end
+
+    test "it is not parked" do
+      refute Loopctl.Workers.DeliveryLoopPruneWorker in Loopctl.ObanConfig.parked_crons()
+    end
+  end
+
   describe "US-40.B1: ChannelClaimSweeper crontab entry" do
     setup do
       plugins = Application.get_env(:loopctl, Oban)[:plugins]

@@ -11,6 +11,14 @@ defmodule Loopctl.Runners.TraceEvent do
   Not the audit chain: trace events are observability, and the chain serialises every
   writer on the tenant's latest entry.
 
+  ## Retention
+
+  Rows are deleted past a tenant's window by `Loopctl.Workers.DeliveryLoopPruneWorker`,
+  through `Loopctl.Runners.DispatchLedger.prune_trace_events/3` — but only once their
+  dispatch is terminal (`runner_dispatches.released_at` set). A run that may still be going
+  keeps its whole trace whatever its age. See "Retention" in
+  `Loopctl.Runners.DispatchLedger`.
+
   ## Isolation
 
   Read and written only through `Loopctl.Runners.DispatchLedger`, on the RLS-enforced

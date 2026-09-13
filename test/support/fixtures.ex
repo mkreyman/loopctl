@@ -21,6 +21,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.ContextRetriever.Entity
   alias Loopctl.Coordination.ChannelClaim
   alias Loopctl.Delivery.StoryStage
+  alias Loopctl.Intake.Delivery, as: IntakeDelivery
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleAccessEvent
   alias Loopctl.Knowledge.ArticleLink
@@ -41,6 +42,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Runners.Runner
+  alias Loopctl.Runners.TraceEvent
   alias Loopctl.Skills.Skill
   alias Loopctl.Skills.SkillResult
   alias Loopctl.Skills.SkillVersion
@@ -2188,6 +2190,63 @@ defmodule Loopctl.Fixtures do
           tenant |> Ecto.Changeset.change(trust_tier: tier) |> AdminRepo.update!()
       end
     end)
+  end
+
+  # One stored trace event of a run, on the RLS `Loopctl.Repo` connection, inserted DIRECTLY
+  # so a test can place it at an arbitrary AGE (#803 retention). The production writer
+  # (`DispatchLedger.record_trace/3`) always stamps `inserted_at` as now, and age is exactly
+  # what `Loopctl.Workers.DeliveryLoopPruneWorker` selects on. Pass the `:dispatch` record it
+  # belongs to; `:seq` and `:inserted_at` default to a fresh sequence and now.
+  def fixture(:trace_event, attrs) do
+    attrs = Enum.into(attrs, %{})
+    dispatch = Map.fetch!(attrs, :dispatch)
+    at = Map.get(attrs, :inserted_at, DateTime.utc_now())
+    seq = Map.get(attrs, :seq, System.unique_integer([:positive]))
+
+    {:ok, event} =
+      Loopctl.Repo.with_tenant(dispatch.tenant_id, fn ->
+        Loopctl.Repo.insert!(%TraceEvent{
+          tenant_id: dispatch.tenant_id,
+          runner_dispatch_id: dispatch.id,
+          run_id: dispatch.run_id || dispatch.dispatch_id,
+          seq: seq,
+          event_id: "evt-#{seq}",
+          ts: at,
+          type: "tool_use",
+          data: %{},
+          inserted_at: at
+        })
+      end)
+
+    event
+  end
+
+  # One accepted GitHub webhook delivery row (#803), inserted DIRECTLY so a test can place it
+  # at an arbitrary AGE — the same reason as `:trace_event` above. On `AdminRepo`, which is
+  # where `Loopctl.Intake` reads and writes. Pass the `:source`; `:github_delivery_id` defaults
+  # to a fresh one, so two calls are two distinct deliveries rather than a replay.
+  def fixture(:intake_delivery, attrs) do
+    attrs = Enum.into(attrs, %{})
+    source = Map.fetch!(attrs, :source)
+    at = Map.get(attrs, :inserted_at, DateTime.utc_now())
+    delivery_id = Map.get(attrs, :github_delivery_id, "dl-#{System.unique_integer([:positive])}")
+
+    row = %{
+      id: Ecto.UUID.generate(),
+      tenant_id: source.tenant_id,
+      source_id: source.id,
+      github_delivery_id: delivery_id,
+      event: Map.get(attrs, :event, "issues"),
+      action: Map.get(attrs, :action, "opened"),
+      outcome: Map.get(attrs, :outcome, "recorded"),
+      issue_number: Map.get(attrs, :issue_number, 1),
+      payload_sha256: :sha256 |> :crypto.hash(delivery_id) |> Base.encode16(case: :lower),
+      inserted_at: at,
+      updated_at: at
+    }
+
+    {1, [delivery]} = AdminRepo.insert_all(IntakeDelivery, [row], returning: true)
+    delivery
   end
 
   # A GitHub intake source (issue #803). Returns `{webhook_secret, source}` so a test can

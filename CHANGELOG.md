@@ -6,6 +6,32 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Retention for the delivery loop's two high-volume tables (#803 §11).** Nothing deleted
+  from `runner_trace_events` or `intake_deliveries`, so both grew for as long as the fleet
+  ran. `Loopctl.Workers.DeliveryLoopPruneWorker` now prunes them hourly, per tenant, oldest
+  first, in bounded batches — each its own transaction under its own `statement_timeout` and
+  `lock_timeout`, so no run holds a transaction across a large delete, and a run that reaches
+  its per-tenant budget stops and resumes on the next tick.
+
+  **Two windows, both tenant settings, no new environment variable.**
+  `runner_trace_retention_days` (default 14) and `intake_delivery_retention_days` (default
+  90), in `tenants.settings`, so an operator can widen one tenant's window without a deploy.
+  A setting that is not a positive integer is ignored with a warning. **A setting below a
+  floor is raised to the floor**: 30 days for the delivery log, because GitHub keeps roughly
+  30 days of delivery history and its Redeliver button reuses the delivery id, so a row
+  younger than that is still the idempotency evidence that makes a replay a no-op.
+
+  **Age alone never decides.** A trace event whose dispatch has not been released is kept
+  whatever its age — an unreleased slot means the session may still be running — and a
+  delivery row an `intake_records.last_delivery_id` still names is kept whatever its age.
+  Neither table is the audit chain, which this never touches.
+
+  **New migration** adding two indexes (`runner_trace_events (tenant_id, inserted_at)` and
+  `intake_records (tenant_id, source_id, last_delivery_id)`) — no manual step, no backfill.
+  Each run emits `[:loopctl, :delivery_loop, :prune]` per table with the rows deleted and the
+  tenants that stopped at their budget: a `tenants_at_budget` that stays non-zero across runs
+  is the pruner failing to keep up with the write rate.
+
 - **Post-deploy verification, and the verdict-to-resolution mapping (#803 §9, #805).** A
   story that reached `deployed` used to have exactly one way out — a human escalating it.
   `Loopctl.Workers.PostDeployVerificationWorker` now sweeps those stories every two minutes
