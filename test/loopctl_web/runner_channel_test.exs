@@ -18,6 +18,13 @@ defmodule LoopctlWeb.RunnerChannelTest do
 
   setup :verify_on_exit!
 
+  # A BOUND on a real round trip, never a delay: each wait below follows a handler that
+  # reads the database (`Runners.authorized?/2`) or updates Presence, and the assertion
+  # returns the moment the reply lands. ExUnit's 100 ms default is shorter than those round
+  # trips take under a loaded full suite, which made these tests flaky. Also the deadline
+  # of every `eventually/2` poll.
+  @reply_timeout 2_000
+
   defp connect_info(token) do
     %{
       x_headers: [{RunnerSocket.token_header(), token}],
@@ -144,7 +151,7 @@ defmodule LoopctlWeb.RunnerChannelTest do
       Process.unlink(channel.channel_pid)
       Process.exit(channel.channel_pid, :kill)
 
-      assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end)
+      assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end, @reply_timeout)
     end
 
     test "re-reads authorization on every join, so a revoked runner cannot rejoin" do
@@ -154,8 +161,8 @@ defmodule LoopctlWeb.RunnerChannelTest do
 
       Process.unlink(channel.channel_pid)
       ref = leave(channel)
-      assert_reply ref, :ok
-      assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end)
+      assert_reply ref, :ok, _, @reply_timeout
+      assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end, @reply_timeout)
 
       # Revoked through the api_keys route: no broadcast reaches the unjoined socket.
       {:ok, key} = Auth.get_api_key(runner.tenant_id, runner.api_key_id)
@@ -189,7 +196,7 @@ defmodule LoopctlWeb.RunnerChannelTest do
       assert {:error, %{reason: "not_authorized"}} =
                subscribe_and_join(socket, topic(socket), join_payload("minis"))
 
-      assert_receive %Phoenix.Socket.Broadcast{event: "disconnect"}
+      assert_receive %Phoenix.Socket.Broadcast{event: "disconnect"}, @reply_timeout
     end
 
     test "joins are budgeted per runner BEFORE the authorization read" do
@@ -232,7 +239,7 @@ defmodule LoopctlWeb.RunnerChannelTest do
                  join_payload("minis", %{"contract_version" => "1.0.0"})
                )
 
-      assert eventually(fn -> in_pool?(runner.tenant_id, "minis") end)
+      assert eventually(fn -> in_pool?(runner.tenant_id, "minis") end, @reply_timeout)
     end
 
     test "refuses a contract major version the server does not speak" do
@@ -309,13 +316,16 @@ defmodule LoopctlWeb.RunnerChannelTest do
 
     test "updates the runner's meta in the pool", %{runner: runner, channel: channel} do
       ref = push(channel, "status", %{"in_flight" => 1, "draining" => true})
-      assert_reply ref, :ok
+      assert_reply ref, :ok, _, @reply_timeout
 
       assert %{"minis" => %{metas: [meta]}} =
-               eventually(fn ->
-                 pool = Runners.pool(runner.tenant_id)
-                 match?(%{"minis" => %{metas: [%{in_flight: 1}]}}, pool) && pool
-               end)
+               eventually(
+                 fn ->
+                   pool = Runners.pool(runner.tenant_id)
+                   match?(%{"minis" => %{metas: [%{in_flight: 1}]}}, pool) && pool
+                 end,
+                 @reply_timeout
+               )
 
       assert meta.draining == true
       assert meta.cores == 16
@@ -323,20 +333,20 @@ defmodule LoopctlWeb.RunnerChannelTest do
 
     test "refuses an update inside the minimum interval", %{channel: channel} do
       ref = push(channel, "status", %{"in_flight" => 1})
-      assert_reply ref, :ok
+      assert_reply ref, :ok, _, @reply_timeout
 
       ref = push(channel, "status", %{"in_flight" => 2})
-      assert_reply ref, :error, %{reason: "rate_limited"}
+      assert_reply ref, :error, %{reason: "rate_limited"}, @reply_timeout
     end
 
     test "refuses a status with no known field", %{channel: channel} do
       ref = push(channel, "status", %{"bogus" => 1})
-      assert_reply ref, :error, %{reason: "invalid_payload"}
+      assert_reply ref, :error, %{reason: "invalid_payload"}, @reply_timeout
     end
 
     test "refuses an unknown event", %{channel: channel} do
       ref = push(channel, "dispatch", %{})
-      assert_reply ref, :error, %{reason: "unknown_event"}
+      assert_reply ref, :error, %{reason: "unknown_event"}, @reply_timeout
     end
   end
 
@@ -353,8 +363,8 @@ defmodule LoopctlWeb.RunnerChannelTest do
     test "revoke_runner disconnects the socket and empties the pool", %{runner: runner} do
       {:ok, _} = Runners.revoke_runner(runner.tenant_id, runner.id)
 
-      assert_receive %Phoenix.Socket.Broadcast{event: "disconnect"}
-      assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end)
+      assert_receive %Phoenix.Socket.Broadcast{event: "disconnect"}, @reply_timeout
+      assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end, @reply_timeout)
     end
 
     test "the periodic recheck catches a key revoked through the api_keys route",
@@ -364,8 +374,8 @@ defmodule LoopctlWeb.RunnerChannelTest do
 
       send(channel.channel_pid, :recheck)
 
-      assert_receive %Phoenix.Socket.Broadcast{event: "disconnect"}
-      assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end)
+      assert_receive %Phoenix.Socket.Broadcast{event: "disconnect"}, @reply_timeout
+      assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end, @reply_timeout)
     end
 
     test "the periodic recheck leaves an authorized runner connected",

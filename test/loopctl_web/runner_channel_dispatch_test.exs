@@ -42,8 +42,10 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
     :ok
   end
 
-  # The dispatch, reply and trace tests below each wait on a database transaction in the
-  # channel process; the 100ms default is too tight for that under a loaded full suite.
+  # A BOUND on a real round trip, never a delay: every dispatch, reply and trace below waits
+  # on a database transaction in the channel process, and the assertion returns the moment
+  # the reply lands. ExUnit's 100 ms default is shorter than that under a loaded full suite.
+  # Also the deadline of every `eventually/2` poll.
   @reply_timeout 2_000
 
   defp connect_info(token) do
@@ -106,7 +108,9 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       topic = "runner:" <> runner.id
       other_topic = "runner:" <> runner_b.id
 
-      assert_receive %Phoenix.Socket.Message{topic: ^topic, event: "dispatch", payload: pushed}
+      assert_receive %Phoenix.Socket.Message{topic: ^topic, event: "dispatch", payload: pushed},
+                     @reply_timeout
+
       assert pushed.dispatch_id == payload["dispatch_id"]
       assert pushed.claim_epoch == 0
       refute_received %Phoenix.Socket.Message{topic: ^other_topic, event: "dispatch"}
@@ -118,7 +122,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       @endpoint.subscribe("runner:" <> runner.id)
 
       assert :ok = dispatch_to(runner)
-      assert_push "dispatch", _
+      assert_push "dispatch", _, @reply_timeout
       refute_received %Phoenix.Socket.Broadcast{event: "dispatch"}
     end
 
@@ -130,7 +134,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
                  "token_budget" => 1_000
                })
 
-      assert_push "dispatch", pushed
+      assert_push "dispatch", pushed, @reply_timeout
       refute Map.has_key?(pushed, :tenant_id)
       refute Map.has_key?(pushed, :prompt)
       refute Enum.any?(Map.keys(pushed), &is_binary/1)
@@ -167,7 +171,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       # The same message once the halt is cleared is pushed, so the refusal above was the halt.
       {:ok, _} = Tenants.clear_custody_halt(runner.tenant_id)
       Phoenix.PubSub.broadcast(Loopctl.PubSub, topic, {:runner_dispatch, dispatch})
-      assert_push "dispatch", %{dispatch_id: dispatch_id}
+      assert_push "dispatch", %{dispatch_id: dispatch_id}, @reply_timeout
       assert dispatch_id == dispatch.dispatch_id
     end
 
@@ -193,8 +197,8 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
     test "a runner whose socket left the pool is refused", %{runner: runner, channel: channel} do
       Process.unlink(channel.channel_pid)
       ref = leave(channel)
-      assert_reply ref, :ok
-      assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end)
+      assert_reply ref, :ok, _, @reply_timeout
+      assert eventually(fn -> not in_pool?(runner.tenant_id, "minis") end, @reply_timeout)
 
       assert {:error, :runner_not_connected} = dispatch_to(runner)
     end
@@ -216,13 +220,17 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       {:ok, second} = connect_runner(raw)
       {_reply, channel_b} = join_pool(second, "minis")
       :ok = Presence.untrack(channel_b.channel_pid, Runners.pool_topic(runner.tenant_id), "minis")
-      assert eventually(fn -> length(Runners.live_metas(runner.tenant_id, runner.id)) == 1 end)
+
+      assert eventually(
+               fn -> length(Runners.live_metas(runner.tenant_id, runner.id)) == 1 end,
+               @reply_timeout
+             )
 
       assert :ok = dispatch_to(runner)
 
       # Both channels receive the broadcast; only the socket that is the pool's sole live
       # meta pushes. Both transports are this test process, so count every push.
-      assert_receive %Phoenix.Socket.Message{event: "dispatch"}
+      assert_receive %Phoenix.Socket.Message{event: "dispatch"}, @reply_timeout
       refute_receive %Phoenix.Socket.Message{event: "dispatch"}
     end
 
@@ -249,22 +257,30 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
       # Once it is gone the same message is pushed, so the refusal above was the second meta.
       send(other, :stop)
-      assert eventually(fn -> length(Runners.live_metas(runner.tenant_id, runner.id)) == 1 end)
+
+      assert eventually(
+               fn -> length(Runners.live_metas(runner.tenant_id, runner.id)) == 1 end,
+               @reply_timeout
+             )
+
       Phoenix.PubSub.broadcast(Loopctl.PubSub, topic, {:runner_dispatch, dispatch})
-      assert_push "dispatch", _
+      assert_push "dispatch", _, @reply_timeout
     end
 
     test "still pushes after a status update re-issues the socket's Presence ref",
          %{runner: runner, channel: channel} do
       ref = push(channel, "status", %{"in_flight" => 1})
-      assert_reply ref, :ok
+      assert_reply ref, :ok, _, @reply_timeout
 
-      assert eventually(fn ->
-               match?([%{in_flight: 1}], Runners.live_metas(runner.tenant_id, runner.id))
-             end)
+      assert eventually(
+               fn ->
+                 match?([%{in_flight: 1}], Runners.live_metas(runner.tenant_id, runner.id))
+               end,
+               @reply_timeout
+             )
 
       assert :ok = dispatch_to(runner)
-      assert_push "dispatch", _
+      assert_push "dispatch", _, @reply_timeout
     end
 
     test "is recorded in the ledger as sent, and a re-send of the same id adds no row",
@@ -338,7 +354,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       assert :ok = Runners.dispatch(tenant_b.id, runner_b.id, build(:runner_dispatch))
       topic = "runner:" <> runner.id
       topic_b = "runner:" <> runner_b.id
-      assert_receive %Phoenix.Socket.Message{topic: ^topic_b, event: "dispatch"}
+      assert_receive %Phoenix.Socket.Message{topic: ^topic_b, event: "dispatch"}, @reply_timeout
       refute_received %Phoenix.Socket.Message{topic: ^topic, event: "dispatch"}
     end
 
@@ -347,7 +363,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       {:ok, _} = Tenants.halt_custody(tenant_b.id)
 
       assert :ok = dispatch_to(runner)
-      assert_push "dispatch", _
+      assert_push "dispatch", _, @reply_timeout
     end
 
     test "malformed ids address no runner", %{runner: runner} do
