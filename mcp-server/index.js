@@ -7474,6 +7474,9 @@ const TOOLS = [
       "The file is created exclusively (O_EXCL): an existing path is refused before anything is " +
       "enrolled, never overwritten. Missing parent directories are created with mode 0700. If the " +
       "token cannot be written after enrollment, the runner is revoked before the error returns. " +
+      "A failure that may still have enrolled it (timeout, 5xx, a 2xx that did not parse) never " +
+      "echoes the response body: the runner is revoked when the response proves its id, and " +
+      "otherwise the error says to find it with runner_list and revoke it. " +
       "runner_revoke is the undo for an enrollment. Requires LOOPCTL_USER_KEY (user role) on a " +
       "human-anchored tenant; errors pass through with their code (422 name malformed or taken, " +
       "403 custody_tier_required or api_key_mint_forbidden).",

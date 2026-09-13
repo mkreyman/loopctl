@@ -14,6 +14,10 @@
  * can still fail after enrollment is the write itself (ENOSPC, EIO). That token is then
  * unrecoverable, so the runner is revoked before the error is returned.
  *
+ * Only a 4xx is an unambiguous refusal. Every other failure may have enrolled the runner,
+ * and a 2xx whose body failed to parse carries the token in the text apiCall kept, so on
+ * those paths no response body is echoed at all (`ambiguousEnrollment`).
+ *
  * Missing PARENT directories are created with mode 0700. That is safe: `mkdir` with
  * `recursive` leaves every existing directory's mode alone, only ever creates directories
  * this user owns, and 0700 is no wider than the 0600 file inside. Refusing instead would
@@ -96,6 +100,19 @@ export async function enrollRunner(
     );
   }
 
+  // The identity of the file this call created, taken BEFORE anything is written, so the
+  // file can still be told apart from a replacement if the handle later becomes unusable.
+  let opened;
+  try {
+    opened = await handle.stat();
+  } catch (err) {
+    await closeQuietly(handle);
+    return refuse(
+      `Could not stat the new token_file '${tokenPath}' (${err?.code || "error"}). Nothing was ` +
+        "enrolled; an empty file may remain at that path.",
+    );
+  }
+
   let result;
   try {
     result = await apiCall("POST", RUNNERS_PATH, { name });
@@ -103,37 +120,19 @@ export async function enrollRunner(
     result = { error: true, status: 0, body: "Enrollment request failed." };
   }
 
-  const runner = result && !result.error ? result.runner : undefined;
-  const token = result && !result.error ? result.token : undefined;
+  // A 4xx is a refusal: nothing was committed, and its body is the server's error, which
+  // carries a code the caller needs. Pass it through as it came.
+  if (result && result.error === true && result.status >= 400 && result.status < 500) {
+    const removed = await discardReservation(fs, handle, tokenPath, opened);
+    return removed ? result : { ...result, token_file_not_removed: tokenPath };
+  }
+
+  const runner = result && result.error !== true ? result.runner : undefined;
+  const token = result && result.error !== true ? result.token : undefined;
 
   if (!runner || typeof runner.id !== "string" || typeof token !== "string" || token === "") {
-    await discardReservation(fs, handle, tokenPath);
-
-    if (result && result.error) {
-      // A 4xx body carries the server's error code and never a token. A status-0 failure
-      // (timeout, network) may have enrolled the runner without our seeing its id.
-      if (result.status === 0) {
-        return {
-          ...result,
-          body:
-            `${typeof result.body === "string" ? result.body : "Request failed"}. If the ` +
-            "enrollment reached the server its token is lost: find it with runner_list and " +
-            "revoke it with runner_revoke.",
-        };
-      }
-      return result;
-    }
-
-    // A success with the wrong shape. Never echo the body: it may hold the token.
-    const revoked = runner && typeof runner.id === "string" ? await revoke(apiCall, runner.id) : null;
-    return refuse(
-      "Enrollment returned an unexpected response (body withheld: it may contain the token). " +
-        (revoked === null
-          ? "Check runner_list for a runner you did not intend and revoke it."
-          : revoked.ok
-            ? `Runner ${runner.id} was revoked.`
-            : `Revoking runner ${runner.id} FAILED (${revoked.detail}); revoke it with runner_revoke.`),
-    );
+    const removed = await discardReservation(fs, handle, tokenPath, opened);
+    return ambiguousEnrollment(result, runner, apiCall, tokenPath, removed);
   }
 
   try {
@@ -141,15 +140,16 @@ export async function enrollRunner(
     await handle.sync();
     await handle.close();
   } catch (err) {
-    await discardReservation(fs, handle, tokenPath);
+    const removed = await discardReservation(fs, handle, tokenPath, opened);
     const revoked = await revoke(apiCall, runner.id);
     return refuse(
       `Runner '${runner.name}' (${runner.id}) was enrolled, but its token could not be written ` +
-        `to '${tokenPath}' (${err?.code || "error"}). The token cannot be recovered, so ` +
+        `to '${tokenPath}' (${err?.code || "error"}). The token cannot be relied on, so ` +
         (revoked.ok
-          ? "the runner was revoked. Fix the path and enroll again."
+          ? "the runner was revoked. "
           : `revoking the runner FAILED (${revoked.detail}); revoke it with runner_revoke id ` +
-            `${runner.id} before enrolling again.`),
+            `${runner.id}. `) +
+        reservationOutcome(tokenPath, removed),
     );
   }
 
@@ -157,6 +157,55 @@ export async function enrollRunner(
     runner: { id: runner.id, name: runner.name, inserted_at: runner.inserted_at },
     token_file: tokenPath,
   };
+}
+
+// Every outcome that is neither a 4xx refusal nor a well-formed enrollment: a timeout, a
+// network error, a 5xx from the edge after the commit, a 3xx, or a 2xx whose body did not
+// parse or lacks the token. The runner MAY exist, so no response body is ever echoed — a
+// 2xx body that failed to parse is the enrollment itself, token included, and apiCall puts
+// its first 200 characters in `body`. The runner is revoked only when this response proves
+// its id; a runner found by name alone could be an earlier, legitimate enrollment.
+async function ambiguousEnrollment(result, runner, apiCall, tokenPath, removed) {
+  const status = result && Number.isInteger(result.status) ? result.status : undefined;
+  const id = (runner && typeof runner.id === "string" && runner.id) || provenRunnerId(result);
+
+  const what =
+    status === 0 && typeof result.body === "string"
+      ? `Enrollment outcome unknown (${result.body}).`
+      : `Enrollment outcome unknown (HTTP ${status ?? "?"}; response body withheld: it may contain the token).`;
+
+  let next;
+  if (id) {
+    const revoked = await revoke(apiCall, id);
+    next = revoked.ok
+      ? `The response identified runner ${id}; it was revoked, since its token cannot be recovered.`
+      : `The response identified runner ${id}, but revoking it FAILED (${revoked.detail}); revoke it with runner_revoke.`;
+  } else {
+    next =
+      "The runner may have been enrolled with a token nobody holds. Check runner_list for it " +
+      "(an active runner with this name and a new inserted_at) and revoke it with runner_revoke " +
+      "before enrolling again.";
+  }
+
+  return { error: true, status: status ?? 0, body: `${what} ${next} ${reservationOutcome(tokenPath, removed)}` };
+}
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// The runner id from a 2xx response that did not parse. The id is read from the raw text
+// apiCall kept, is required to be a UUID inside the "runner" object, and never leaves this
+// function as anything but that UUID.
+function provenRunnerId(result) {
+  if (!result || result.error !== true || !(result.status >= 200 && result.status < 300)) return null;
+  if (typeof result.body !== "string") return null;
+  const match = result.body.match(/"runner"\s*:\s*\{[^{}]*?"id"\s*:\s*"([^"]{36})"/);
+  return match && UUID.test(match[1]) ? match[1] : null;
+}
+
+function reservationOutcome(tokenPath, removed) {
+  return removed
+    ? `The token_file '${tokenPath}' was removed; the same path can be used again.`
+    : `The token_file '${tokenPath}' could NOT be removed: delete it before enrolling again at that path.`;
 }
 
 async function revoke(apiCall, id) {
@@ -169,27 +218,33 @@ async function revoke(apiCall, id) {
   }
 }
 
-// Close and remove the file this call created. Removal is by path, so it first checks
-// that the path still names the file this handle opened.
-async function discardReservation(fs, handle, tokenPath) {
-  let opened;
-  try {
-    opened = await handle.stat();
-  } catch {
-    opened = null;
-  }
+async function closeQuietly(handle) {
   try {
     await handle.close();
   } catch {
     // already closed, or the close is what failed
   }
+}
+
+// Close the handle and remove the file this call created. Removal is by path, so it first
+// checks that the path still names the file identified by `opened`, the stat taken right
+// after the open. Resolves to whether the path no longer holds that file.
+async function discardReservation(fs, handle, tokenPath, opened) {
+  await closeQuietly(handle);
+
+  let current;
   try {
-    const current = await fs.lstat(tokenPath);
-    if (opened && current.ino === opened.ino && current.dev === opened.dev) {
-      await fs.unlink(tokenPath);
-    }
-  } catch {
-    // gone already, or unreadable; nothing further is safe to do
+    current = await fs.lstat(tokenPath);
+  } catch (err) {
+    return err?.code === "ENOENT";
+  }
+  if (current.ino !== opened.ino || current.dev !== opened.dev) return false;
+
+  try {
+    await fs.unlink(tokenPath);
+    return true;
+  } catch (err) {
+    return err?.code === "ENOENT";
   }
 }
 

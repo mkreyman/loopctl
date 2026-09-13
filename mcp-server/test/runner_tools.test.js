@@ -28,6 +28,7 @@ import {
   runnerPool,
   expandHome,
 } from "../lib/runners.js";
+import { parseJsonResponseBody } from "../lib/http-helpers.js";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
 const INDEX_SRC = readFileSync(path.join(DIR, "..", "index.js"), "utf8");
@@ -293,6 +294,158 @@ describe("runner_enroll", () => {
     assert.equal(result.error, true);
     assert.ok(!JSON.stringify(result).includes(TOKEN));
     assert.equal(calls.at(-1).method, "DELETE");
+  });
+
+  test("a 201 whose body did not parse leaks no token bytes, and the id it proves is revoked", async () => {
+    const tokenFile = path.join(tmp, "token");
+    // Exactly what apiCall returns for a truncated 2xx: the real parser's error, whose body
+    // quotes the first 200 characters of the enrollment, token prefix included.
+    const raw = JSON.stringify({ runner: RUNNER, token: TOKEN });
+    const truncated = parseJsonResponseBody(raw.slice(0, raw.length - 6), 201);
+    assert.ok(truncated.body.includes(TOKEN.slice(0, 10)), "fixture must carry token bytes");
+
+    const { calls, apiCall } = fakeApi({
+      "POST /api/v1/runners": truncated,
+      [`DELETE /api/v1/runners/${RUNNER.id}`]: { runner: RUNNER },
+    });
+
+    const [result, captured] = await capturingOutput(() =>
+      enrollRunner({ name: "minis", token_file: tokenFile }, { userKey: USER_KEY, apiCall }),
+    );
+
+    assert.equal(result.error, true);
+    assert.equal(result.status, 201);
+    const serialized = JSON.stringify(result);
+    assert.ok(!serialized.includes(TOKEN.slice(0, 6)), `token bytes leaked: ${serialized}`);
+    assert.ok(!serialized.includes('\\"token\\"'), "no fragment of the raw body is echoed");
+    assert.ok(!captured.includes(TOKEN.slice(0, 6)));
+    assert.match(result.body, /withheld/);
+    assert.match(result.body, new RegExp(`runner ${RUNNER.id}; it was revoked`));
+    assert.deepEqual(
+      calls.map((c) => `${c.method} ${c.path}`),
+      ["POST /api/v1/runners", `DELETE /api/v1/runners/${RUNNER.id}`],
+    );
+    await assert.rejects(fs.stat(tokenFile), { code: "ENOENT" });
+  });
+
+  test("a 2xx body cut before the runner id gives recovery guidance and revokes nothing", async () => {
+    const truncated = parseJsonResponseBody('{"runner":{"na', 201);
+    const { calls, apiCall } = fakeApi({ "POST /api/v1/runners": truncated });
+
+    const result = await enrollRunner(
+      { name: "minis", token_file: path.join(tmp, "token") },
+      { userKey: USER_KEY, apiCall },
+    );
+
+    assert.equal(result.error, true);
+    assert.match(result.body, /runner_list/);
+    assert.match(result.body, /runner_revoke/);
+    assert.ok(!result.body.includes('{"runner"'), "the raw body is not echoed");
+    assert.equal(calls.length, 1);
+  });
+
+  test("a 502 after the request gives recovery guidance and withholds its body", async () => {
+    const tokenFile = path.join(tmp, "token");
+    const edge = { error: true, status: 502, body: `<html>bad gateway ${TOKEN}</html>` };
+    const { calls, apiCall } = fakeApi({ "POST /api/v1/runners": edge });
+
+    const result = await enrollRunner(
+      { name: "minis", token_file: tokenFile },
+      { userKey: USER_KEY, apiCall },
+    );
+
+    assert.equal(result.error, true);
+    assert.equal(result.status, 502);
+    assert.match(result.body, /HTTP 502/);
+    assert.match(result.body, /may have been enrolled/);
+    assert.match(result.body, /runner_list/);
+    assert.ok(!JSON.stringify(result).includes(TOKEN));
+    assert.ok(!result.body.includes("bad gateway"));
+    assert.equal(calls.length, 1, "no id is proven, so nothing is revoked");
+    await assert.rejects(fs.stat(tokenFile), { code: "ENOENT" });
+  });
+
+  test("a timeout keeps apiCall's own message and gives recovery guidance", async () => {
+    const { apiCall } = fakeApi({
+      "POST /api/v1/runners": { error: true, status: 0, body: "Request timed out after 30s" },
+    });
+    const result = await enrollRunner(
+      { name: "minis", token_file: path.join(tmp, "token") },
+      { userKey: USER_KEY, apiCall },
+    );
+    assert.match(result.body, /Request timed out after 30s/);
+    assert.match(result.body, /runner_revoke/);
+  });
+
+  test("a close() that rejects after the token was synced removes the file and says so", async () => {
+    const tokenFile = path.join(tmp, "token");
+    const { calls, apiCall } = fakeApi({
+      ...enrolled,
+      [`DELETE /api/v1/runners/${RUNNER.id}`]: { runner: RUNNER },
+    });
+    const closeFailsFs = {
+      ...fs,
+      open: async (...args) => {
+        const handle = await fs.open(...args);
+        let closed = false;
+        return {
+          writeFile: (data) => handle.writeFile(data),
+          sync: () => handle.sync(),
+          stat: () => (closed ? Promise.reject(Object.assign(new Error("EBADF"), { code: "EBADF" })) : handle.stat()),
+          close: async () => {
+            if (!closed) {
+              closed = true;
+              await handle.close();
+            }
+            throw Object.assign(new Error("EIO"), { code: "EIO" });
+          },
+        };
+      },
+    };
+
+    const result = await enrollRunner(
+      { name: "minis", token_file: tokenFile },
+      { userKey: USER_KEY, apiCall, fs: closeFailsFs },
+    );
+
+    assert.equal(result.error, true);
+    assert.match(result.body, /\(EIO\)/);
+    assert.match(result.body, /the runner was revoked/);
+    assert.match(result.body, /was removed; the same path can be used again/);
+    await assert.rejects(fs.stat(tokenFile), { code: "ENOENT" }, "the synced token is not left on disk");
+    assert.equal(calls.at(-1).method, "DELETE");
+  });
+
+  test("a token file that cannot be removed is named in the message", async () => {
+    const tokenFile = path.join(tmp, "token");
+    const { apiCall } = fakeApi({
+      ...enrolled,
+      [`DELETE /api/v1/runners/${RUNNER.id}`]: { runner: RUNNER },
+    });
+    const stuckFs = {
+      ...fs,
+      unlink: async () => {
+        throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+      },
+      open: async (...args) => {
+        const handle = await fs.open(...args);
+        return {
+          writeFile: async () => {
+            throw Object.assign(new Error("ENOSPC"), { code: "ENOSPC" });
+          },
+          sync: () => handle.sync(),
+          close: () => handle.close(),
+          stat: () => handle.stat(),
+        };
+      },
+    };
+
+    const result = await enrollRunner(
+      { name: "minis", token_file: tokenFile },
+      { userKey: USER_KEY, apiCall, fs: stuckFs },
+    );
+
+    assert.match(result.body, new RegExp(`'${tokenFile}' could NOT be removed`));
   });
 
   test("errors clearly without LOOPCTL_USER_KEY and calls nothing", async () => {
