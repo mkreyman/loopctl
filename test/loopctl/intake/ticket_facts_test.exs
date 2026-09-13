@@ -61,38 +61,45 @@ defmodule Loopctl.Intake.TicketFactsTest do
         "- **Browser**: #{browser}\n"
     end
 
-    for {wrapper, open, close} <- [
-          {"a code span", "`", "`"},
-          {"a double-backtick code span", "`` ", " ``"},
-          {"double quotes", "\"", "\""},
-          {"single quotes", "'", "'"}
-        ] do
-      @open open
-      @close close
-      test "#{wrapper} around the values is removed, and a real UA fires nothing" do
-        result =
-          TicketFacts.extract(
-            @title,
-            context_body(@open <> @page <> @close, @open <> @samsung <> @close)
-          )
+    test "the producer's one backtick pair is removed, and a real UA fires nothing" do
+      result =
+        TicketFacts.extract(@title, context_body("`" <> @page <> "`", "`" <> @samsung <> "`"))
 
-        assert result.page_url == @page
-        assert result.user_agent == @samsung
-        assert result.reasons == []
-        assert InjectionDetector.scan_user_agent("user_agent", result.user_agent) == []
+      assert result.page_url == @page
+      assert result.user_agent == @samsung
+      assert result.reasons == []
+      assert InjectionDetector.scan_user_agent("user_agent", result.user_agent) == []
+    end
+
+    test "quotes are not stripped, and a quoted real UA still fires nothing" do
+      result = TicketFacts.extract(@title, context_body(@page, "\"" <> @samsung <> "\""))
+
+      assert result.user_agent == "\"" <> @samsung <> "\""
+      assert InjectionDetector.scan_user_agent("user_agent", result.user_agent) == []
+    end
+
+    for {value, index} <-
+          Enum.with_index(build(:intake_hostile_samples)["user_agent"]["browser_line_values"]) do
+      @value value
+      test "hostile Browser line value ##{index} escalates after extraction" do
+        result = TicketFacts.extract(@title, context_body(@page, @value))
+
+        assert Enum.any?(
+                 InjectionDetector.scan_user_agent("user_agent", result.user_agent),
+                 &String.starts_with?(&1, "user_agent_prose")
+               ),
+               "#{inspect(@value)} reached the detector as #{inspect(result.user_agent)}"
       end
     end
 
-    test "only the outermost pair goes, so a backtick inside the value is still flagged" do
-      result =
-        TicketFacts.extract(@title, context_body(@page, "`Mozilla/5.0 `rm -rf /` Chrome/1`"))
-
-      assert result.user_agent == "Mozilla/5.0 `rm -rf /` Chrome/1"
-
-      assert "user_agent_prose:user_agent" in InjectionDetector.scan_user_agent(
-               "user_agent",
-               result.user_agent
-             )
+    test "any backtick beyond the producer's one pair is left in place" do
+      for {value, kept} <- [
+            {"``cat``", "``cat``"},
+            {"`cat``", "`cat``"},
+            {"`a `b` c`", "`a `b` c`"}
+          ] do
+        assert TicketFacts.extract(@title, context_body(@page, value)).user_agent == kept
+      end
     end
 
     test "the Tenant line is ignored, code span and all" do

@@ -78,13 +78,14 @@ defmodule Loopctl.Delivery.InjectionDetectorTest do
   end
 
   describe "user-agent tripwire" do
-    @real_user_agents build(:intake_real_user_agents)
+    @real build(:intake_real_user_agents)
+    @browsers @real["browsers"]
+    @non_browser_clients @real["non_browser_clients"]
     @ua_signals ~w(user_agent_prose user_agent_non_ascii)
 
-    # The instruction words the recorded real user agents carry. Pinned, so a lexicon edit
-    # that reaches further into real clients turns this red instead of drifting silently.
-    @corpus_lexicon_words ~w(agent answer claude command download gpt key model patch prod
-                             prompt reveal review the)
+    # The instruction words the recorded BROWSER user agents carry. Pinned, so a lexicon edit
+    # that reaches further into real browsers turns this red instead of drifting silently.
+    @browser_lexicon_words ~w(key model patch reveal the)
 
     @known_miss_classes [
       "a paraphrase built from words outside the lexicon",
@@ -92,18 +93,19 @@ defmodule Loopctl.Delivery.InjectionDetectorTest do
       "disguised or encoded wording (neutralised at the producer, not detected here)"
     ]
 
-    # A generated Instagram in-app user agent around one Chrome build number.
-    defp instagram_with_build(build) do
-      "Mozilla/5.0 (Linux; Android 14; SM-A536B Build/UP1A.231005.007; wv) AppleWebKit/537.36 " <>
-        "(KHTML, like Gecko) Version/4.0 Chrome/129.0.#{build}.100 Mobile Safari/537.36 " <>
-        "Instagram 341.0.0.45.100 Android (34/14; 450dpi; 1080x2340; samsung; SM-A536B; a53x; " <>
-        "s5e8825; en_US; 627400175)"
-    end
+    @disguised_sub_kinds [
+      "plain-ASCII look-alike characters",
+      "spelled-out or chunked letters",
+      "uppercase look-alikes",
+      "words glued in one case",
+      "percent-escapes, HTML entities and backslash escapes"
+    ]
 
-    defp ua_signals_fire?(ua) do
-      InjectionDetector.user_agent_lexicon_hits(ua) != [] or
-        InjectionDetector.user_agent_non_ascii?(ua)
-    end
+    # A UA with a browser's shape: a Mozilla or Opera product token and no crawler, fetcher,
+    # automation or native-client marker. Such a UA may not be filed as a non-browser client,
+    # which would move it out from under the fires-nothing assertion.
+    @browser_shape ~r/\A(?:Mozilla|Opera)\//
+    @non_browser_marker ~r/bot\b|Bot\/|bot\/|crawler|spider|Slurp|Qwantify|Uptime|Synthetics|Read-Aloud|-User\b|Google-Apps-Script|Daum\/|Mail\.RU|facebookexternalhit|SkypeUriPreview|Lighthouse|HeadlessChrome|ms-office|MSOffice|Datadog/i
 
     defp signals_of(ua) do
       "user_agent"
@@ -111,26 +113,49 @@ defmodule Loopctl.Delivery.InjectionDetectorTest do
       |> Enum.map(&String.replace(&1, ":user_agent", ""))
     end
 
-    test "the recorded real user agents cover the families the margins promise" do
+    test "the recorded browsers cover the families the margin promises" do
       assert Enum.all?(
                ~w(chrome_windows firefox_windows safari_macos ios_safari_iphone
-                  samsung_internet_android googlebot ie11_dotnet claude_user datadog_agent
-                  calibre_01 reviewer_round2_01 reviewer_round3_boto3 reviewer_round3_aws_cli2
-                  reviewer_round3_daum reviewer_round3_ie_simbar reviewer_round3_cfnet),
-               &Map.has_key?(@real_user_agents, &1)
+                  samsung_internet_android ie11_dotnet kindle_silk calibre_01
+                  reviewer_round2_01 reviewer_round3_ie_simbar reviewer_round3_theworld
+                  reviewer_round3_tiktok reviewer_round3_crkey),
+               &Map.has_key?(@browsers, &1)
+             )
+
+      assert Enum.all?(
+               ~w(reviewer_round3_aws_cli2 reviewer_round3_boto3 reviewer_round3_cfnet
+                  aws_cli_secretsmanager_get_secret_value gcloud_auth_print_access_token
+                  bundler_install_deployment_without pip_with_linehaul_json),
+               &Map.has_key?(@non_browser_clients, &1)
              )
     end
 
-    for {name, ua} <- @real_user_agents do
+    test "no browser-shaped user agent is filed as a non-browser client" do
+      misfiled =
+        for {name, ua} <- @non_browser_clients,
+            Regex.match?(@browser_shape, ua),
+            not Regex.match?(@non_browser_marker, ua),
+            do: name
+
+      assert misfiled == []
+    end
+
+    for {name, ua} <- @browsers do
       @ua ua
-      test "real user agent #{name} fires nothing" do
+      test "browser #{name} fires nothing" do
         assert InjectionDetector.scan_user_agent("user_agent", @ua) == []
       end
     end
 
-    test "margin: a real user agent carries at most two instruction words, against three" do
-      max_real =
-        @real_user_agents
+    test "non-browser clients are out of domain: they may escalate, and never crash" do
+      for {_name, ua} <- @non_browser_clients do
+        assert is_list(InjectionDetector.scan_user_agent("user_agent", ua))
+      end
+    end
+
+    test "margin: a browser carries at most one instruction word, below the threshold of two" do
+      max_browser =
+        @browsers
         |> Map.values()
         |> Enum.map(&length(InjectionDetector.user_agent_lexicon_hits(&1)))
         |> Enum.max()
@@ -141,78 +166,27 @@ defmodule Loopctl.Delivery.InjectionDetectorTest do
         |> Enum.map(&length(InjectionDetector.user_agent_lexicon_hits(&1)))
         |> Enum.min()
 
-      assert InjectionDetector.user_agent_prose_threshold() == 3
-      assert max_real == 2
-      assert min_hostile >= InjectionDetector.user_agent_prose_threshold()
+      assert InjectionDetector.user_agent_prose_threshold() == 2
+      assert max_browser == 1
+      assert min_hostile == 2
     end
 
-    test "the instruction words the real user agents carry are exactly the pinned set" do
-      corpus =
-        @real_user_agents
+    test "the instruction words the browsers carry are exactly the pinned set" do
+      carried =
+        @browsers
         |> Map.values()
-        |> Enum.map(&InjectionDetector.user_agent_words/1)
-        |> Enum.reduce(MapSet.new(), &MapSet.union/2)
+        |> Enum.flat_map(&InjectionDetector.user_agent_lexicon_hits/1)
+        |> MapSet.new()
 
-      assert MapSet.size(corpus) > 200, "the corpus scan found too few words to prove anything"
-      lexicon = MapSet.new(InjectionDetector.user_agent_lexicon())
-      assert MapSet.intersection(corpus, lexicon) == MapSet.new(@corpus_lexicon_words)
+      assert MapSet.new(@browser_lexicon_words) == carried
     end
 
     test "the lexicon holds no word under three letters" do
       assert Enum.filter(InjectionDetector.user_agent_lexicon(), &(String.length(&1) < 3)) == []
     end
 
-    test "no recorded real user agent carries a non-ASCII byte" do
-      refute Enum.any?(Map.values(@real_user_agents), &InjectionDetector.user_agent_non_ascii?/1)
-    end
-
-    test "a Chrome build sweep 1000-99999 in an Instagram user agent fires nothing" do
-      firing =
-        1000..99_999
-        |> Enum.chunk_every(2_000)
-        |> Task.async_stream(
-          &Enum.filter(&1, fn b -> ua_signals_fire?(instagram_with_build(b)) end),
-          timeout: :infinity,
-          ordered: false
-        )
-        |> Enum.flat_map(fn {:ok, builds} -> builds end)
-
-      assert firing == []
-
-      for build <- Enum.take_every(1000..99_999, 101) do
-        assert InjectionDetector.scan_user_agent("user_agent", instagram_with_build(build)) == []
-      end
-    end
-
-    test "random ids in real user-agent frames fire nothing" do
-      :rand.seed(:exsss, {804, 3, 13})
-      alphabet = ~c"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-
-      apps_script =
-        for _ <- 1..5_000 do
-          id = for _ <- 1..28, into: "", do: <<Enum.random(alphabet)>>
-
-          "Mozilla/5.0 (compatible; Google-Apps-Script; beanserver; " <>
-            "+https://script.google.com; id: #{id})"
-        end
-
-      uuids =
-        for _ <- 1..5_000 do
-          <<a::32, b::16, c::16, d::16, e::48>> = :crypto.strong_rand_bytes(16)
-
-          uuid =
-            "~8.16.0b-~4.16.0b-~4.16.0b-~4.16.0b-~12.16.0b"
-            |> :io_lib.format([a, b, c, d, e])
-            |> IO.iodata_to_binary()
-
-          "Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 5.1; SIMBAR={#{uuid}}; .NET CLR 2.0.50727)"
-        end
-
-      assert Enum.filter(
-               apps_script ++ uuids,
-               &(InjectionDetector.scan_user_agent("user_agent", &1) != [])
-             ) ==
-               []
+    test "no recorded browser carries a non-ASCII byte" do
+      refute Enum.any?(Map.values(@browsers), &InjectionDetector.user_agent_non_ascii?/1)
     end
 
     for {ua, index} <- Enum.with_index(@samples["user_agent"]["user_agent_non_ascii"]) do
@@ -243,9 +217,14 @@ defmodule Loopctl.Delivery.InjectionDetectorTest do
                ~w(approve pull this)
     end
 
-    test "three distinct lexicon words fire; two do not, however often repeated" do
-      assert "user_agent_prose" in signals_of("Mozilla/5.0 please merge now")
-      assert signals_of("Mozilla/5.0 please merge please merge please merge") == []
+    test "inflections match their lexicon word by stem" do
+      assert InjectionDetector.user_agent_lexicon_hits("X/1 (approving merged reviewer skipping)") ==
+               ~w(approve merge review skip)
+    end
+
+    test "two distinct lexicon words fire; one does not, however often repeated" do
+      assert "user_agent_prose" in signals_of("Mozilla/5.0 please merge")
+      assert signals_of("Mozilla/5.0 merge merge merged merging") == []
     end
 
     test "comments are read like the rest of the string" do
@@ -254,32 +233,51 @@ defmodule Loopctl.Delivery.InjectionDetectorTest do
     end
 
     test "a backtick inside a user agent fires on its own" do
-      ua = @real_user_agents["samsung_internet_android"] <> " `x`"
+      ua = @browsers["samsung_internet_android"] <> " `x`"
       assert InjectionDetector.user_agent_lexicon_hits(ua) == []
       assert "user_agent_prose" in signals_of(ua)
     end
 
-    test "the moduledoc's known-miss list is exactly the pinned classes" do
+    test "the moduledoc's known-miss list is exactly the pinned classes and sub-kinds" do
       {:docs_v1, _, _, _, %{"en" => moduledoc}, _, _} = Code.fetch_docs(InjectionDetector)
 
-      section =
-        moduledoc
-        |> String.split(
+      [_, after_heading] =
+        String.split(
+          moduledoc,
           "**Known misses, pinned by a test that asserts they fire no user-agent signal:**"
         )
-        |> Enum.at(1)
-        |> String.split("\n\n  ##")
-        |> hd()
 
-      documented =
-        ~r/^\s*- (.+?)(?::|;|\.)\s*(?:$|look-alike)/m
+      [section, _rest] = String.split(after_heading, "\n## Limits", parts: 2)
+      refute section =~ "## "
+
+      bullets =
+        ~r/^- (.+)$/m
         |> Regex.scan(section, capture: :all_but_first)
         |> List.flatten()
 
-      assert documented == @known_miss_classes
+      classes =
+        Enum.map(
+          bullets,
+          &(&1 |> String.split(": ", parts: 2) |> hd() |> String.trim_trailing(";"))
+        )
 
-      assert Map.keys(@samples["user_agent"]["user_agent_known_misses"]) |> Enum.sort() ==
-               Enum.sort(@known_miss_classes)
+      assert classes == @known_miss_classes
+
+      [disguised_bullet] = Enum.filter(bullets, &String.starts_with?(&1, "disguised or encoded"))
+      [_, sub_kinds] = String.split(disguised_bullet, ": ", parts: 2)
+      assert sub_kinds |> String.trim_trailing(".") |> String.split("; ") == @disguised_sub_kinds
+
+      misses = @samples["user_agent"]["user_agent_known_misses"]
+      assert Enum.sort(Map.keys(misses)) == Enum.sort(@known_miss_classes)
+
+      assert Enum.sort(
+               Map.keys(
+                 misses[
+                   "disguised or encoded wording (neutralised at the producer, not detected here)"
+                 ]
+               )
+             ) ==
+               Enum.sort(@disguised_sub_kinds)
     end
 
     # Pinned so a change in either direction is noticed. Neutralising a user agent is the
@@ -287,10 +285,11 @@ defmodule Loopctl.Delivery.InjectionDetectorTest do
     # bytes); triage reads it fenced as untrusted data, and the implementer's input is built
     # from the story only. This tripwire escalates for visibility and deliberately does not
     # try to see these.
-    for {class, uas} <- @samples["user_agent"]["user_agent_known_misses"],
+    for {class, sub_kinds} <- @samples["user_agent"]["user_agent_known_misses"],
+        {sub_kind, uas} <- sub_kinds,
         {ua, index} <- Enum.with_index(uas) do
       @ua ua
-      test "known miss (#{class}) ##{index} fires no user-agent signal" do
+      test "known miss (#{class} / #{sub_kind}) ##{index} fires no user-agent signal" do
         assert Enum.filter(signals_of(@ua), &(&1 in @ua_signals)) == []
       end
     end

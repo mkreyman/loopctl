@@ -29,11 +29,11 @@ defmodule Loopctl.Intake.TicketFacts do
   - `ticket_kind` — `bug` or `feature`, from the title's `[Bug] ` / `[Feature] ` prefix.
 
   `page_url` and `user_agent` are returned for the injection detector and never stored:
-  both are client-supplied, so they are exactly where a payload hides. Each is trimmed and
-  loses ONE pair of delimiters wrapping the whole value — an inline code span (one or two
-  backticks) or matching double or single quotes — because a producer formatting the issue
-  may wrap them, and a wrapper is formatting, not content. Only the outermost pair goes: a
-  backtick left inside a user agent still reaches the detector, which flags it.
+  both are client-supplied, so they are exactly where a payload hides. Each is trimmed, and
+  unwrapped ONLY from the producer's exact formatting: one backtick pair around a value that
+  contains no backtick. Anything else is left as it arrived, so a double pair, an extra
+  leading or trailing backtick, or a backtick in the middle reaches the detector and fires
+  its backtick rule. Quotes are never stripped.
 
   The `Tenant` line is not a fact and is not read here at all (HomeCareBilling writes the
   tenant name in a code span). It is still part of the body the detector scans.
@@ -112,22 +112,18 @@ defmodule Loopctl.Intake.TicketFacts do
     end
   end
 
-  # Outermost first, so a double-backtick span is not mistaken for a single one.
-  @wrappers [{"``", "``"}, {"`", "`"}, {"\"", "\""}, {"'", "'"}]
+  # The producer's exact formatting: one backtick pair around a value with no backtick inside.
+  @producer_code_span ~r/\A`([^`]+)`\z/
 
   defp unwrap(nil), do: nil
 
   defp unwrap(value) do
     trimmed = String.trim(value)
 
-    Enum.find_value(@wrappers, trimmed, fn {open, close} ->
-      if byte_size(trimmed) > byte_size(open) + byte_size(close) and
-           String.starts_with?(trimmed, open) and String.ends_with?(trimmed, close) do
-        trimmed
-        |> binary_part(byte_size(open), byte_size(trimmed) - byte_size(open) - byte_size(close))
-        |> String.trim()
-      end
-    end)
+    case Regex.run(@producer_code_span, trimmed, capture: :all_but_first) do
+      [inner] -> String.trim(inner)
+      nil -> trimmed
+    end
   end
 
   # The footer id is only ever kept as confirmation of a ref. With no ref there is nothing

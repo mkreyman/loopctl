@@ -23,7 +23,7 @@ defmodule Loopctl.IntakeTest do
   describe "wrapped context values" do
     test "a benign ticket whose Page and Browser values are code spans is not escalated" do
       {secret, source} = fixture(:intake_source, %{})
-      samsung = build(:intake_real_user_agents)["samsung_internet_android"]
+      samsung = build(:intake_real_user_agents)["browsers"]["samsung_internet_android"]
 
       body =
         build(:intake_benign_ticket_body)

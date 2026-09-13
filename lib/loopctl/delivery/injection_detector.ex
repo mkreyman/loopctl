@@ -33,7 +33,7 @@ defmodule Loopctl.Delivery.InjectionDetector do
     decoded path or query matches another signal or carries a dozen words of prose, or a
     markdown image whose URL has a query string (an exfiltration beacon).
   - `user_agent_prose` — a browser user agent that is over 512 bytes, carries another signal,
-    contains a backtick, or carries three or more DISTINCT instruction words (see "User-agent
+    contains a backtick, or carries two or more DISTINCT instruction words (see "User-agent
     tripwire" below).
   - `user_agent_non_ascii` — a user agent carrying any byte outside ASCII.
 
@@ -50,6 +50,11 @@ defmodule Loopctl.Delivery.InjectionDetector do
 
   ## User-agent tripwire
 
+  **Domain: BROWSER user agents.** The only producer is home_care_billing's ticket form, which
+  records the reporter's browser user agent. A non-browser client (the AWS CLI, gcloud,
+  bundler, pip, an SDK, a crawler) on a browser-form ticket is already anomalous, so it is
+  allowed to escalate: escalating it is correct, not a false positive.
+
   **Neutralising a user agent is not this module's job.** The producer does it:
   home_care_billing#1506 writes a user agent into the issue only when it is valid user-agent
   token grammar of at most 512 bytes, and writes `unrecognised` otherwise. Triage then reads
@@ -62,35 +67,35 @@ defmodule Loopctl.Delivery.InjectionDetector do
   - carries any byte outside ASCII (`user_agent_non_ascii`);
   - is over 512 bytes, contains a backtick, or matches a generic `scan/1` pattern
     (`user_agent_prose`);
-  - carries three or more DISTINCT instruction words (`user_agent_prose`). The words are read
+  - carries two or more DISTINCT instruction words (`user_agent_prose`). The words are read
     three ways and the readings are UNIONED: split at non-letters and at lowercase-to-uppercase
     boundaries (`ApproveThisPull`); split at non-letters only, lowercased (`aPPROVE tHIS`); and
-    split at every change of case (`APPROVEthisPULL`). Words of three or more letters count.
-    The lexicon (`user_agent_lexicon/0`) is English function words plus agent-directed
-    imperatives and nouns.
+    split at every change of case (`APPROVEthisPULL`). Words of three or more letters are
+    compared by STEM (`Loopctl.Delivery.WordStem`), so `approving`, `approved` and `reviewer`
+    match `approve` and `review`. The lexicon (`user_agent_lexicon/0`) is English function words
+    plus agent-directed imperatives and nouns.
 
   **It deliberately does not try to see disguised or encoded wording.** Across #814 and #819,
   six review rounds measured user-agent-specific disguise heuristics — look-alike decoding,
   spelled-out reassembly, token-shape and escape detection — and each round found both new
   bypasses under a chosen encoding and new false alarms on real clients (AWS SDK `#`
-  separators, IE toolbar braces, CFNetwork `%20`, random ids tripping on up to one run in
-  five). A tripwire that fires on real clients and is still bypassable is worth less than a
-  small, quiet one, so disguise is left to the producer's grammar check, where it is removed
-  rather than guessed at.
+  separators, IE toolbar braces, CFNetwork `%20`, random ids). A tripwire that fires on real
+  clients and is still bypassable is worth less than a small, quiet one, so disguise is left
+  to the producer's grammar check, where it is removed rather than guessed at.
 
-  **Margins, asserted** against `test/support/intake_fixtures/real_user_agents.json`, a Chrome
-  build sweep 1000-99999 in an Instagram in-app user agent, and 5,000 generated Apps Script
-  ids and 5,000 lowercase UUIDs in real user-agent frames: every one fires nothing, and a real
-  user agent carries at most TWO instruction words (the AWS CLI's `md/prompt#off
-  md/command#s3.ls`) against a threshold of three.
+  **Margin, asserted:** the browser user agents in
+  `test/support/intake_fixtures/real_user_agents.json` fire nothing and carry at most ONE
+  instruction word, one below the threshold of two. That threshold is the lowest one the
+  browser corpus sits below. The file's `non_browser_clients` are only asserted not to crash.
 
   **Known misses, pinned by a test that asserts they fire no user-agent signal:**
 
   - a paraphrase built from words outside the lexicon;
   - the same instruction in another language;
-  - disguised or encoded wording (neutralised at the producer, not detected here): look-alike
-    characters, spelled-out or chunked letters, uppercase look-alikes, words glued in one
-    case, percent-escapes and HTML entities.
+  - disguised or encoded wording (neutralised at the producer, not detected here): plain-ASCII look-alike characters; spelled-out or chunked letters; uppercase look-alikes; words glued in one case; percent-escapes, HTML entities and backslash escapes.
+
+  Look-alikes from outside ASCII (Cyrillic letters, small capitals) are NOT misses: they fire
+  `user_agent_non_ascii`. Only swaps within ASCII go unseen.
 
   ## Limits, written in rather than discovered later
 
@@ -104,6 +109,7 @@ defmodule Loopctl.Delivery.InjectionDetector do
   """
 
   alias Loopctl.Delivery.Untrusted
+  alias Loopctl.Delivery.WordStem
 
   @type reason :: String.t()
 
@@ -184,18 +190,20 @@ defmodule Loopctl.Delivery.InjectionDetector do
   @url_prose_words 12
 
   @max_user_agent_bytes 512
-  @ua_prose_threshold 3
+  @ua_prose_threshold 2
   @ua_not_letter ~r/[^A-Za-z]+/
   @ua_camel_boundary ~r/(?<=[a-z])(?=[A-Z])/
   @ua_case_change ~r/(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[a-z])/
   @ua_non_ascii ~r/[\x80-\xFF]/
 
   # English function words plus the imperatives and nouns an instruction to an agent is made
-  # of. No two-letter word (they collide with locale tags and model codes), and no word the
-  # recorded real user agents carry except `agent` and `claude`: a test binds it to that corpus.
+  # of, matched by stem (`Loopctl.Delivery.WordStem`). No two-letter word: those collide with
+  # locale tags and model codes. The recorded BROWSER user agents carry only the words pinned in
+  # injection_detector_test.exs; the non-browser clients may carry more, because a non-browser
+  # user agent on a browser-form ticket is out of domain and allowed to escalate.
   @ua_lexicon ~w(
     the this that these those and but then than for into onto with without are were been
-    does did don doesn not all every each some its now here there please you your yours must
+    does did don doesn all every each some its now here there please you your yours must
     should shall will would could may might just only also instead before after above below
     previous prior earlier again never always immediately today tonight
     approve approved merge merged ignore disregard forget instructions instruction system
@@ -206,7 +214,13 @@ defmodule Loopctl.Delivery.InjectionDetector do
     human operator ship release test tests safe done wait repo repository branch hook hooks
     ticket story issue yes trust trusted allow enable disable install hidden act pretend role
     respond reply answer write send upload download bash command commands sudo
+    lgtm verified escalation escalate cat curl wget
   )
+
+  # Each lexicon word by its stem; the first word with a stem names it.
+  @ua_lexicon_stems @ua_lexicon
+                    |> Enum.reverse()
+                    |> Map.new(&{Loopctl.Delivery.WordStem.stem(&1), &1})
 
   @doc "The signal names this module can produce."
   @spec signals() :: [atom()]
@@ -376,7 +390,9 @@ defmodule Loopctl.Delivery.InjectionDetector do
   def user_agent_lexicon_hits(user_agent) when is_binary(user_agent) do
     user_agent
     |> user_agent_words()
-    |> Enum.filter(&lexicon_word?/1)
+    |> Enum.map(&lexicon_word_for_stem(WordStem.stem(&1)))
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
     |> Enum.sort()
   end
 
@@ -385,9 +401,9 @@ defmodule Loopctl.Delivery.InjectionDetector do
   def user_agent_non_ascii?(user_agent) when is_binary(user_agent),
     do: Regex.match?(@ua_non_ascii, user_agent)
 
-  for word <- @ua_lexicon do
-    defp lexicon_word?(unquote(word)), do: true
+  for {stem, word} <- @ua_lexicon_stems do
+    defp lexicon_word_for_stem(unquote(stem)), do: unquote(word)
   end
 
-  defp lexicon_word?(_word), do: false
+  defp lexicon_word_for_stem(_stem), do: nil
 end

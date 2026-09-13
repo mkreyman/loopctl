@@ -782,8 +782,9 @@ defmodule Loopctl.Fixtures do
     "test/support/intake_fixtures/hostile_samples.json" |> File.read!() |> Jason.decode!()
   end
 
-  # Recorded real user agents, keyed by browser and platform (#804). Every one must fire
-  # nothing and carry at most two instruction words (asserted in injection_detector_test.exs).
+  # Recorded real user agents (#804): `"browsers"`, which must fire nothing and carry at most
+  # one instruction word, and `"non_browser_clients"`, which are out of the tripwire's domain
+  # and only asserted not to crash (asserted in injection_detector_test.exs).
   def build(:intake_real_user_agents, _attrs) do
     "test/support/intake_fixtures/real_user_agents.json" |> File.read!() |> Jason.decode!()
   end
