@@ -87,7 +87,8 @@ defmodule LoopctlRunner.ReaperTest do
     assert {:ok, %{"status" => "reaped"}} = RunState.read(run_dir)
 
     {:ok, events} = Trace.read(Path.join(run_dir, "trace.ndjson"))
-    assert [_, %{"type" => "run.reaped", "parent" => ^run_seq}] = events
+    run_event_id = Integer.to_string(run_seq)
+    assert [_, %{"type" => "run.reaped", "parent" => ^run_event_id}] = events
     assert {:ok, _} = Trace.tree(events)
 
     # Reaping is idempotent: a reaped run is not revisited.

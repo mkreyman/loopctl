@@ -7,13 +7,15 @@ defmodule LoopctlRunner.Run do
   Every step lands in the run's trace under one root event, and every side effect's
   identity is in `state.json` before the side effect happens.
 
-  Run directory layout, under the configured `runs_dir`:
+  A run is identified by a UUID (`run_id`, in `state.json`, every trace line and the
+  worktree lock). Its directory under `runs_dir` has a readable name instead,
+  `<story id>-<UTC stamp>-<first 8 hex of the run id>`:
 
-      <run_id>/story.json      the validated story
-      <run_id>/state.json      side-effect identities and status (RunState)
-      <run_id>/trace.ndjson    the parent-linked event stream (Trace)
-      <run_id>/stdout.ndjson   the CLI's stream-json, verbatim
-      <run_id>/stderr.log      the CLI's stderr
+      <dir>/story.json      the validated story
+      <dir>/state.json      side-effect identities and status (RunState)
+      <dir>/trace.ndjson    the parent-linked event stream (Trace)
+      <dir>/stdout.ndjson   the CLI's stream-json, verbatim
+      <dir>/stderr.log      the CLI's stderr
   """
 
   alias LoopctlRunner.{
@@ -40,8 +42,9 @@ defmodule LoopctlRunner.Run do
   @spec execute(Config.t(), Story.t(), keyword()) :: result()
   def execute(%Config{} = config, %Story{} = story, opts \\ []) do
     reaped = Reaper.reap(config.runs_dir, config.kill_grace_s * 1000)
-    run_id = run_id(story)
-    run_dir = Path.join(config.runs_dir, run_id)
+    # The contract identifies a run by UUID; the directory keeps a name a person can find.
+    run_id = Session.uuid4()
+    run_dir = Path.join(config.runs_dir, run_dir_name(story, run_id))
     File.mkdir_p!(run_dir)
     File.write!(Path.join(run_dir, "story.json"), JSON.encode!(Story.to_map(story)))
 
@@ -69,7 +72,7 @@ defmodule LoopctlRunner.Run do
 
     result =
       try do
-        with_worktree(config, story, run_dir, trace, run_seq, opts)
+        with_worktree(config, story, run_dir, trace, run_seq, run_id, opts)
       rescue
         # A raise must not leave the run recorded in flight. The worktree lock is already
         # released by the `after` in with_worktree.
@@ -103,10 +106,8 @@ defmodule LoopctlRunner.Run do
     :exit, _ -> :ok
   end
 
-  defp with_worktree(config, story, run_dir, trace, run_seq, opts) do
+  defp with_worktree(config, story, run_dir, trace, run_seq, run_id, opts) do
     path = Worktree.path_for(story.repo_path, story.id)
-
-    run_id = Path.basename(run_dir)
 
     case WorktreeLock.acquire(config.runs_dir, path, run_id) do
       :ok ->
@@ -202,10 +203,9 @@ defmodule LoopctlRunner.Run do
   defp session_status(%{reason: :exited}), do: "failed"
   defp session_status(%{reason: reason}), do: Atom.to_string(reason)
 
-  defp run_id(story) do
+  defp run_dir_name(story, run_id) do
     stamp = DateTime.utc_now() |> Calendar.strftime("%Y%m%dT%H%M%SZ")
-    suffix = :crypto.strong_rand_bytes(3) |> Base.encode16(case: :lower)
-    "#{story.id}-#{stamp}-#{suffix}"
+    "#{story.id}-#{stamp}-#{binary_part(run_id, 0, 8)}"
   end
 
   defp hostname do

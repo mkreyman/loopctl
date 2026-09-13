@@ -88,11 +88,20 @@ defmodule LoopctlRunner.RunTest do
     [read_use] = Enum.filter(by_type["claude.tool_use"], &(&1["data"]["name"] == "Read"))
 
     [subagent_msg] =
-      Enum.filter(by_type["claude.assistant"], &(&1["parent"] == agent_dispatch["seq"]))
+      Enum.filter(by_type["claude.assistant"], &(&1["parent"] == agent_dispatch["event_id"]))
 
-    assert read_use["parent"] == subagent_msg["seq"]
-    assert session["parent"] == root_node.event["seq"]
-    assert hd(by_type["claude.unparsed"])["parent"] == session["seq"]
+    assert read_use["parent"] == subagent_msg["event_id"]
+    assert session["parent"] == root_node.event["event_id"]
+    assert hd(by_type["claude.unparsed"])["parent"] == session["event_id"]
+
+    # Every line is a valid contract RunnerTraceEvent, under a UUID run id.
+    assert result.run_id =~
+             ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\z/
+
+    assert Enum.all?(events, &(&1["run_id"] == result.run_id))
+    assert Enum.all?(events, &(LoopctlRunner.Contract.validate("RunnerTraceEvent", &1) == :ok))
+    assert {:ok, %{"run_id" => run_id}} = RunState.read(result.run_dir)
+    assert run_id == result.run_id
     # The last line had no trailing newline and still arrived.
     assert [%{"data" => %{"num_turns" => 2}}] = by_type["claude.result.success"]
 
@@ -326,6 +335,28 @@ defmodule LoopctlRunner.RunTest do
 
     assert results |> Enum.map(& &1.status) |> Enum.sort() == ["failed", "wall_clock_exceeded"]
     assert Enum.find(results, &(&1.status == "failed")).error =~ "in use by live run"
+  end
+
+  test "while a run holds its worktree, the lock names the run's UUID", %{
+    root: root,
+    state: state
+  } do
+    restore = fake_env!(state, [{"FAKE_CLAUDE_MODE", "hang"}, {"FAKE_AGENTS", "busy"}])
+    config = config!(root)
+    {:ok, story} = Story.from_map(story_map(%{"wall_clock_s" => 4}), config)
+    worktree = Path.join([root, "repo", ".claude/worktrees/loop-s1"])
+    task = Task.async(fn -> Run.execute(config, story) end)
+
+    try do
+      :ok =
+        wait_until(fn -> WorktreeLock.live_holder(config.runs_dir, worktree) != nil end, 10_000)
+
+      holder = WorktreeLock.live_holder(config.runs_dir, worktree)
+      result = Task.await(task, 30_000)
+      assert holder == result.run_id
+    after
+      restore.()
+    end
   end
 
   test "a raise inside a run frees the worktree lock", %{root: root, state: state} do

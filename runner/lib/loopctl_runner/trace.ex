@@ -2,14 +2,19 @@ defmodule LoopctlRunner.Trace do
   @moduledoc """
   The run's NDJSON event stream (design §11).
 
-  One file per run. Every event is one JSON object on one line:
+  One file per run. Every event is one JSON object on one line, shaped as the loopctl
+  contract's `RunnerTraceEvent` so a shipper sends lines as they are:
 
-      {"run_id": "...", "seq": 7, "parent": 3, "ts": "2026-09-12T20:36:46.485Z",
-       "type": "claude.tool_use", "data": {...}}
+      {"run_id": "<uuid>", "seq": 7, "event_id": "7", "parent": "3",
+       "ts": "2026-09-12T20:36:46.485Z", "type": "claude.tool_use", "data": {...}}
 
-  `(run_id, seq)` is the event's identity and `parent` is the `seq` of the event it
-  hangs off, or `null` for the run's root. That link is what makes the agent tree
-  reconstructable with a query instead of `bin/who-did-it.sh`: see `tree/1`.
+  `(run_id, seq)` is the event's identity and `event_id` is `seq` as a string. `parent` is
+  the parent's `event_id`, or `null` for the run's root. That link is what makes the agent
+  tree reconstructable with a query instead of `bin/who-did-it.sh`: see `tree/1`.
+
+  Traces written before this shape (no `event_id`, integer `parent`, a non-UUID run id)
+  are still read and rebuilt: `read/1` normalises both fields. Such a run cannot be shipped
+  under the contract, whose `run_id` is a UUID, and a shipper must skip it.
 
   The file on disk is the source of truth. `seq` is gapless and strictly increasing, so
   a later shipper can ACK the last contiguous seq and resume from it.
@@ -22,7 +27,7 @@ defmodule LoopctlRunner.Trace do
   @spec start_link(String.t(), String.t()) :: GenServer.on_start()
   def start_link(path, run_id), do: GenServer.start_link(__MODULE__, {path, run_id})
 
-  @doc "Appends an event and returns its `seq`."
+  @doc "Appends an event under `parent` (a `seq`, or nil for the root) and returns its `seq`."
   @spec emit(GenServer.server(), String.t(), event_id() | nil, map()) :: event_id()
   def emit(trace, type, parent, data \\ %{}) when is_binary(type) and is_map(data) do
     GenServer.call(trace, {:emit, type, parent, data})
@@ -45,10 +50,24 @@ defmodule LoopctlRunner.Trace do
 
   defp decode_lines([line | rest], acc) do
     case JSON.decode(line) do
-      {:ok, event} -> decode_lines(rest, [event | acc])
+      {:ok, event} -> decode_lines(rest, [normalize(event) | acc])
       {:error, reason} -> {:error, {:unparseable_line, line, reason}}
     end
   end
+
+  @doc false
+  # A line written before event_id existed carries only an integer seq and parent.
+  @spec normalize(map()) :: map()
+  def normalize(%{"seq" => seq} = event) when is_integer(seq) do
+    event
+    |> Map.put_new("event_id", Integer.to_string(seq))
+    |> Map.update("parent", nil, fn
+      parent when is_integer(parent) -> Integer.to_string(parent)
+      parent -> parent
+    end)
+  end
+
+  def normalize(event), do: event
 
   @doc """
   Rebuilds the event tree from `parent` links.
@@ -59,9 +78,10 @@ defmodule LoopctlRunner.Trace do
   """
   @spec tree([map()]) :: {:ok, [map()]} | {:error, {:dangling_parent, map()}}
   def tree(events) do
-    seqs = MapSet.new(events, & &1["seq"])
+    events = Enum.map(events, &normalize/1)
+    ids = MapSet.new(events, & &1["event_id"])
 
-    case Enum.find(events, &(&1["parent"] != nil and not MapSet.member?(seqs, &1["parent"]))) do
+    case Enum.find(events, &(&1["parent"] != nil and not MapSet.member?(ids, &1["parent"]))) do
       nil ->
         by_parent = Enum.group_by(events, & &1["parent"])
         {:ok, build(by_parent, nil)}
@@ -74,7 +94,7 @@ defmodule LoopctlRunner.Trace do
   defp build(by_parent, parent) do
     by_parent
     |> Map.get(parent, [])
-    |> Enum.map(&%{event: &1, children: build(by_parent, &1["seq"])})
+    |> Enum.map(&%{event: &1, children: build(by_parent, &1["event_id"])})
   end
 
   @doc "The last `seq` written to an existing trace file, or -1 for none."
@@ -99,7 +119,8 @@ defmodule LoopctlRunner.Trace do
     event = %{
       "run_id" => state.run_id,
       "seq" => state.seq,
-      "parent" => parent,
+      "event_id" => Integer.to_string(state.seq),
+      "parent" => parent && Integer.to_string(parent),
       "ts" => DateTime.utc_now() |> DateTime.to_iso8601(),
       "type" => type,
       "data" => data
