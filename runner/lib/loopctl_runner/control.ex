@@ -57,6 +57,9 @@ defmodule LoopctlRunner.Control do
   # An empty or mid-rewrite token file gets a few attempts; a file that stays unreadable is
   # a misconfiguration, and fatal, so the service does not sit "active" with no connection.
   @max_token_failures 3
+  # A status reply slower than this is logged: the link is degraded well before the heartbeat
+  # timeout declares it dead.
+  @slow_reply_ms 5_000
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -84,7 +87,10 @@ defmodule LoopctlRunner.Control do
   @doc "The `RunnerJoin` payload for this machine, validated against the contract."
   @spec join_payload(Config.t(), map(), boolean(), boolean()) ::
           {:ok, map()} | {:error, [String.t()]}
-  def join_payload(%Config{control: control} = config, capacity, draining?, accepts? \\ false) do
+  def join_payload(%Config{} = config, capacity, draining?, accepts? \\ false),
+    do: build_join(config, capacity, draining?, accepts?, measure(config))
+
+  defp build_join(%Config{control: control} = config, capacity, draining?, accepts?, measured) do
     payload =
       %{
         "contract_version" => Contract.version(),
@@ -96,36 +102,40 @@ defmodule LoopctlRunner.Control do
         "in_flight" => Runs.in_flight(config.runs_dir),
         "draining" => reported_draining(draining?, accepts?)
       }
-      |> put_sample(config)
+      |> put_sample(measured)
 
     with :ok <- Contract.validate("RunnerJoin", payload), do: {:ok, payload}
   end
 
   @doc "The `RunnerStatus` payload, validated against the contract."
   @spec status_payload(Config.t(), boolean(), boolean()) :: {:ok, map()} | {:error, [String.t()]}
-  def status_payload(%Config{} = config, draining?, accepts? \\ false) do
+  def status_payload(%Config{} = config, draining?, accepts? \\ false),
+    do: build_status(config, draining?, accepts?, measure(config))
+
+  defp build_status(config, draining?, accepts?, measured) do
     payload =
       %{
         "in_flight" => Runs.in_flight(config.runs_dir),
         "draining" => reported_draining(draining?, accepts?)
       }
-      |> put_sample(config)
+      |> put_sample(measured)
 
     with :ok <- Contract.validate("RunnerStatus", payload), do: {:ok, payload}
   end
 
+  defp measure(config, measure \\ &Health.measure/2),
+    do: measure.(config.runs_dir, Runs.last_success_at(config.runs_dir))
+
   # An unreadable metric omits the sample rather than reporting a healthy-looking zero;
   # loopctl treats a stale sample as a breached threshold.
-  defp put_sample(payload, config) do
-    case Health.sample(config.runs_dir, Runs.last_success_at(config.runs_dir)) do
-      nil -> payload
-      sample -> Map.put(payload, "sample", sample)
-    end
-  end
+  defp put_sample(payload, {:ok, sample}), do: Map.put(payload, "sample", sample)
+  defp put_sample(payload, {:error, _metric}), do: payload
 
   @impl Slipstream
   def init(opts) do
     %Config{control: %ControlConfig{} = control} = config = Keyword.fetch!(opts, :config)
+    # Every line from this process names the runner, the key loopctl's logs correlate on.
+    Logger.metadata(runner_id: control.runner_id)
 
     case Health.capacity() do
       {:ok, capacity} ->
@@ -144,8 +154,22 @@ defmodule LoopctlRunner.Control do
             draining: false,
             joined: false,
             connect_attempts: 0,
+            next_reconnect_ms: nil,
             status_timer: nil,
-            last_refusal: nil
+            last_refusal: nil,
+            slow_reply_ms: Keyword.get(opts, :slow_reply_ms, @slow_reply_ms),
+            # What an operator needs to tell a partition from a slow link: see info/1.
+            joined_at: nil,
+            unjoined_since: nil,
+            last_disconnect: nil,
+            # Every status push awaiting its reply, oldest first, as {ref, sent_ms}.
+            status_pushes: [],
+            last_status_rtt_ms: nil,
+            last_status_acked_at: nil,
+            sample_error: nil,
+            # Health.measure/2, replaceable so an unreadable metric can be exercised.
+            measure: Keyword.get(opts, :measure, &Health.measure/2),
+            unhandled_events: MapSet.new()
           )
 
         {:ok, socket, {:continue, :connect}}
@@ -156,8 +180,9 @@ defmodule LoopctlRunner.Control do
   end
 
   defp halt(reason) do
-    Logger.error("loopctl runner stopping: #{inspect(reason)}")
-    System.stop(fatal_exit_status())
+    status = fatal_exit_status()
+    Logger.error("loopctl runner stopping with exit status #{status}: #{inspect(reason)}")
+    System.stop(status)
   end
 
   @doc """
@@ -181,19 +206,34 @@ defmodule LoopctlRunner.Control do
   @impl Slipstream
   def handle_connect(socket) do
     case fresh_join_payload(socket) do
-      {:ok, payload} -> {:ok, join(socket, socket.assigns.topic, payload)}
-      {:error, errors} -> fatal(socket, {:invalid_join_payload, errors})
+      {{:ok, payload}, socket} -> {:ok, join(socket, socket.assigns.topic, payload)}
+      {{:error, errors}, socket} -> fatal(socket, {:invalid_join_payload, errors})
     end
   end
 
   @impl Slipstream
   def handle_join(topic, response, socket) do
-    Logger.info("loopctl runner joined #{topic}: #{inspect(response)}")
+    Logger.info("loopctl runner joined #{topic}#{outage(socket.assigns)}: #{inspect(response)}")
 
     {:ok,
      socket
-     |> assign(joined: true, last_refusal: nil, connect_attempts: 0)
+     |> assign(
+       joined: true,
+       joined_at: now_iso(),
+       unjoined_since: nil,
+       last_refusal: nil,
+       connect_attempts: 0,
+       next_reconnect_ms: nil
+     )
      |> schedule_status()}
+  end
+
+  # How long the runner was out of the pool, so a rejoin line says what the outage cost.
+  defp outage(%{unjoined_since: nil}), do: ""
+
+  defp outage(%{unjoined_since: since, connect_attempts: attempts}) do
+    " after #{Float.round((now_ms() - since) / 1000, 1)}s out of the pool" <>
+      " (#{attempts} reconnect attempts)"
   end
 
   @impl Slipstream
@@ -205,15 +245,23 @@ defmodule LoopctlRunner.Control do
 
   def handle_topic_close(topic, reason, socket) do
     Logger.warning("loopctl channel #{topic} closed: #{inspect(reason)}; rejoining")
-    socket = socket |> cancel_status() |> assign(joined: false, last_refusal: refusal(reason))
 
-    with {:ok, payload} <- fresh_join_payload(socket),
-         {:ok, socket} <- rejoin(socket, topic, payload) do
-      {:ok, socket}
-    else
-      {:error, errors} when is_list(errors) -> fatal(socket, {:invalid_join_payload, errors})
-      # Disconnected meanwhile: the reconnect path will join again, freshly.
-      {:error, _} -> {:ok, socket}
+    socket =
+      socket
+      |> cancel_status()
+      |> mark_unjoined(inspect(reason))
+      |> assign(last_refusal: refusal(reason))
+
+    case fresh_join_payload(socket) do
+      {{:ok, payload}, socket} ->
+        case rejoin(socket, topic, payload) do
+          {:ok, socket} -> {:ok, socket}
+          # Disconnected meanwhile: the reconnect path will join again, freshly.
+          {:error, _} -> {:ok, socket}
+        end
+
+      {{:error, errors}, socket} ->
+        fatal(socket, {:invalid_join_payload, errors})
     end
   end
 
@@ -222,9 +270,37 @@ defmodule LoopctlRunner.Control do
 
   @impl Slipstream
   def handle_disconnect(reason, socket) do
-    Logger.warning("loopctl socket disconnected: #{inspect(reason)}")
-    {:ok, socket |> cancel_status() |> assign(joined: false) |> schedule_reconnect()}
+    socket =
+      socket
+      |> cancel_status()
+      |> mark_unjoined(describe_disconnect(reason))
+      |> schedule_reconnect()
+
+    Logger.warning(
+      "loopctl socket disconnected: #{socket.assigns.last_disconnect}; " <>
+        "reconnect attempt #{socket.assigns.connect_attempts} " <>
+        "in #{socket.assigns.next_reconnect_ms}ms"
+    )
+
+    {:ok, socket}
   end
+
+  # A push still awaiting its reply died with the channel: that is a disconnect, already
+  # logged, not an unanswered status.
+  defp mark_unjoined(socket, reason) do
+    assign(socket,
+      joined: false,
+      unjoined_since: socket.assigns.unjoined_since || now_ms(),
+      last_disconnect: reason,
+      status_pushes: []
+    )
+  end
+
+  # A refused upgrade carries only an HTTP status worth reading; its headers are noise.
+  defp describe_disconnect({:error, {:upgrade_failure, %{status_code: code}}}),
+    do: "upgrade refused with HTTP #{code}"
+
+  defp describe_disconnect(reason), do: inspect(reason)
 
   @impl Slipstream
   def handle_info(:reconnect, socket), do: connect_now(socket)
@@ -232,14 +308,17 @@ defmodule LoopctlRunner.Control do
   def handle_info(:status, %{assigns: %{joined: true}} = socket) do
     socket = assign(socket, status_timer: nil)
 
-    case status_payload(
-           socket.assigns.config,
-           socket.assigns.draining,
-           socket.assigns.accepts_dispatches
-         ) do
+    a = socket.assigns
+    measured = measure(a.config, a.measure)
+    socket = socket |> note_sample(measured) |> warn_unanswered()
+
+    case build_status(a.config, a.draining, a.accepts_dispatches, measured) do
       {:ok, payload} ->
-        {:ok, _ref} = push(socket, socket.assigns.topic, "status", payload)
-        {:noreply, schedule_status(socket)}
+        {:ok, ref} = push(socket, a.topic, "status", payload)
+        # Every push is tracked until its own reply lands: tracking only one would leave a late
+        # reply matching nothing, or a push sent meanwhile unwatched once the first settles.
+        pushes = socket.assigns.status_pushes ++ [{ref, now_ms()}]
+        {:noreply, socket |> assign(status_pushes: pushes) |> schedule_status()}
 
       {:error, errors} ->
         fatal(socket, {:invalid_status_payload, errors})
@@ -259,49 +338,163 @@ defmodule LoopctlRunner.Control do
   @impl Slipstream
   def handle_call(:info, _from, socket) do
     info =
-      Map.take(socket.assigns, [:joined, :draining, :connect_attempts, :last_refusal, :topic])
+      Map.take(socket.assigns, [
+        :joined,
+        :joined_at,
+        :draining,
+        :connect_attempts,
+        :next_reconnect_ms,
+        :last_refusal,
+        :last_disconnect,
+        :last_status_rtt_ms,
+        :last_status_acked_at,
+        :sample_error,
+        :token_failures,
+        :topic
+      ])
 
-    {:reply, info, socket}
+    {:reply, Map.put(info, :status_push_pending, socket.assigns.status_pushes != []), socket}
   end
 
   # A status that landed inside loopctl's 1s floor is sent again once the floor has passed,
   # so a change such as draining is delayed, never dropped until the next tick.
   @impl Slipstream
-  def handle_reply(_ref, {:error, %{"reason" => "rate_limited"} = reply}, socket) do
+  def handle_reply(ref, reply, socket) do
+    handle_push_reply(reply, settle_status(socket, ref, reply))
+  end
+
+  defp handle_push_reply({:error, %{"reason" => "rate_limited"} = reply}, socket) do
     retry_ms = Map.get(reply, "min_interval_ms", 1_000)
     Logger.info("loopctl rate-limited a status push; resending in #{retry_ms}ms")
     socket = cancel_status(socket)
     {:ok, assign(socket, status_timer: Process.send_after(self(), :status, retry_ms))}
   end
 
-  def handle_reply(_ref, {:error, %{"reason" => reason} = reply}, socket) do
+  defp handle_push_reply({:error, %{"reason" => reason} = reply}, socket) do
     Logger.warning("loopctl refused a push (#{reason}): #{inspect(reply)}")
     {:ok, socket}
   end
 
-  def handle_reply(_ref, _reply, socket), do: {:ok, socket}
+  defp handle_push_reply(_reply, socket), do: {:ok, socket}
+
+  # The round trip of a status push. A slow one is logged when its reply lands; one still
+  # unanswered past the slow threshold is logged at each tick by warn_unanswered/1.
+  defp settle_status(socket, ref, reply) do
+    case List.keyfind(socket.assigns.status_pushes, ref, 0) do
+      nil ->
+        socket
+
+      {^ref, sent_ms} ->
+        rtt = now_ms() - sent_ms
+
+        if rtt >= socket.assigns.slow_reply_ms,
+          do: Logger.warning("loopctl answered a status push after #{rtt}ms; the link is slow")
+
+        assign(socket,
+          status_pushes: List.keydelete(socket.assigns.status_pushes, ref, 0),
+          last_status_rtt_ms: rtt,
+          last_status_acked_at:
+            if(acked?(reply), do: now_iso(), else: socket.assigns.last_status_acked_at)
+        )
+    end
+  end
+
+  # Slipstream hands an empty ok reply over as :ok and one with a body as {:ok, body}.
+  defp acked?(:ok), do: true
+  defp acked?({:ok, _body}), do: true
+  defp acked?(_reply), do: false
+
+  # Measured from the oldest unanswered push, and only past the slow threshold: a status sent
+  # at once by set_draining/2 can find the last push still in flight on a healthy link.
+  defp warn_unanswered(%{assigns: %{status_pushes: [{_ref, sent_ms} | _]}} = socket) do
+    age = now_ms() - sent_ms
+
+    if age >= socket.assigns.slow_reply_ms do
+      Logger.warning(
+        "loopctl has not answered the status push sent #{age}ms ago " <>
+          "(last answered #{socket.assigns.last_status_acked_at || "never"}); " <>
+          "the link is slow or half-open"
+      )
+    end
+
+    socket
+  end
+
+  defp warn_unanswered(socket), do: socket
+
+  defp note_sample(socket, {:ok, _sample}) do
+    if socket.assigns.sample_error,
+      do: Logger.info("health sample readable again; loopctl receives samples")
+
+    assign(socket, sample_error: nil)
+  end
+
+  defp note_sample(socket, {:error, metric}) do
+    if socket.assigns.sample_error != metric,
+      do:
+        Logger.warning(
+          "health sample omitted: cannot read #{metric}; loopctl sees this runner's sample as stale"
+        )
+
+    assign(socket, sample_error: metric)
+  end
 
   @impl Slipstream
   def handle_message(_topic, "dispatch", payload, socket) do
+    Logger.metadata(dispatch_metadata(payload))
+
     case Contract.validate("RunnerDispatch", payload) do
       :ok ->
         Logger.warning(
-          "dispatch #{payload["dispatch_id"]} refused: this runner accepts no dispatches yet"
+          "dispatch #{payload["dispatch_id"]} refused: this runner accepts no dispatches yet " <>
+            "(story #{payload["story_id"]}, #{payload["kind"]}, claim_epoch #{payload["claim_epoch"]})"
         )
 
       {:error, errors} ->
         Logger.warning("malformed dispatch ignored: #{inspect(errors)}")
     end
 
+    # The identifiers belong to this dispatch's lines only.
+    Logger.metadata(Enum.map(dispatch_metadata(payload), fn {key, _} -> {key, nil} end))
     {:ok, socket}
   end
 
-  # Contract minor versions add optional fields and events; unknown ones are ignored.
-  def handle_message(_topic, _event, _payload, socket), do: {:ok, socket}
+  # Contract minor versions add optional fields and events; unknown ones are ignored, but
+  # logged once per event name, so a server ahead of this build is visible in the log.
+  def handle_message(_topic, event, _payload, socket) do
+    if MapSet.member?(socket.assigns.unhandled_events, event) do
+      {:ok, socket}
+    else
+      Logger.warning(
+        "loopctl sent #{inspect(event)}, which this runner (contract #{Contract.version()}) " <>
+          "does not handle; ignoring it and any repeats"
+      )
+
+      {:ok, assign(socket, unhandled_events: MapSet.put(socket.assigns.unhandled_events, event))}
+    end
+  end
+
+  # Whatever identifiers a dispatch carries, even a malformed one, so its log lines join
+  # loopctl's on the same keys.
+  defp dispatch_metadata(payload) when is_map(payload) do
+    for {key, field} <- [
+          dispatch_id: "dispatch_id",
+          story_id: "story_id",
+          claim_epoch: "claim_epoch"
+        ],
+        value = payload[field],
+        is_binary(value) or is_integer(value),
+        do: {key, value}
+  end
+
+  defp dispatch_metadata(_payload), do: []
 
   defp fresh_join_payload(socket) do
     a = socket.assigns
-    join_payload(a.config, a.capacity, a.draining, a.accepts_dispatches)
+    measured = measure(a.config, a.measure)
+
+    {build_join(a.config, a.capacity, a.draining, a.accepts_dispatches, measured),
+     note_sample(socket, measured)}
   end
 
   # The token is re-read on every attempt, so a corrected file is picked up without a
@@ -336,8 +529,11 @@ defmodule LoopctlRunner.Control do
     attempt = socket.assigns.connect_attempts
     delay = Enum.at(@reconnect_backoff_ms, attempt, List.last(@reconnect_backoff_ms))
     Process.send_after(self(), :reconnect, delay)
-    assign(socket, connect_attempts: attempt + 1)
+    assign(socket, connect_attempts: attempt + 1, next_reconnect_ms: delay)
   end
+
+  defp now_ms, do: System.monotonic_time(:millisecond)
+  defp now_iso, do: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
 
   defp fatal(socket, reason) do
     socket.assigns.on_fatal.(reason)

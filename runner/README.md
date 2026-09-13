@@ -59,6 +59,46 @@ corrected file is picked up on the next reconnect without a restart.)
 Until dispatch handling lands (loopctl#803), the daemon reports `draining: true`, so the control
 plane never reserves capacity on a machine that cannot start a session.
 
+### Troubleshooting the daemon
+
+- **Logs:** `journalctl --user -u loopctl-runner` on Linux, `~/Library/Logs/loopctl-runner.log` on
+  macOS.
+  - Every line is stamped in UTC and carries `runner_id`, except a refusal to start logged before
+    the config has loaded (`refusing to start the runner daemon`), so do not filter on
+    `runner_id` when the daemon will not start.
+  - A dispatch's lines also carry `dispatch_id`, `story_id` and `claim_epoch`, the keys loopctl
+    logs, so the two sides of one incident join on them.
+- **Live state:** ask the running daemon directly.
+
+  ```bash
+  ~/.local/share/loopctl-runner/current/bin/loopctl_runner rpc \
+    'IO.inspect(LoopctlRunner.Control.info(LoopctlRunner.Control))'
+  ```
+
+  It returns:
+  - `joined` and `joined_at`;
+  - `last_disconnect`, `connect_attempts` and `next_reconnect_ms`;
+  - `last_status_rtt_ms`, `last_status_acked_at` and `status_push_pending`;
+  - `sample_error`, `last_refusal` and `token_failures`.
+- **The pool, as loopctl sees it:** `runner_pool`. It lists joined runners only, so a runner
+  missing from it while `joined` is true is a disagreement worth reporting to loopctl.
+
+What the log says in each failure:
+
+| situation | log line |
+|---|---|
+| partition, or a half-open socket | `has not answered the status push` at the next status tick, then `socket disconnected: <reason>; reconnect attempt N in Xms` 30-60s in, when Slipstream finds its previous 30s heartbeat unanswered |
+| loopctl restarted or dropped the socket | `socket disconnected: :closed` (or `:closed_by_remote`), then `joined ... after Ns out of the pool (N reconnect attempts)` |
+| slow link | `loopctl answered a status push after Nms; the link is slow` (5s or more), when the late reply lands |
+| no answer at all | `loopctl has not answered the status push sent Nms ago (last answered <time>)`, at each tick once the oldest unanswered push is 5s old |
+| revoked or rejected token | `upgrade refused with HTTP 403; reconnect attempt N in Xms`, retried with backoff |
+| misconfiguration | `loopctl refused runner:<id> (<reason>)`, then `stopping with exit status 78` (0 under launchd) |
+| a metric cannot be read | `health sample omitted: cannot read <metric>`, once, until `health sample readable again` |
+| loopctl is ahead of this build | `loopctl sent "<event>", which this runner (contract X) does not handle`, once per event |
+
+A run's own record is its directory under `runs_dir`: `state.json`, `trace.ndjson`, `stdout.ndjson`
+and `stderr.log`, and `mix loopctl.tree <run dir>` prints the trace as a tree.
+
 ### Hand-filed runs
 
 ```bash

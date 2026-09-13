@@ -3,6 +3,7 @@ defmodule LoopctlRunner.ControlTest do
   use ExUnit.Case, async: false
 
   alias LoopctlRunner.{Contract, Control, ControlConfig, TestLoopctl}
+  import ExUnit.CaptureLog
   import LoopctlRunner.TestSupport
 
   @moduletag timeout: 60_000
@@ -221,5 +222,214 @@ defmodule LoopctlRunner.ControlTest do
     Process.sleep(1_100)
     Control.set_draining(pid, false)
     assert_receive {:test_loopctl, {:status, %{"draining" => false}}}, 3_000
+  end
+
+  describe "what the log says when something goes wrong" do
+    # The suite logs at :warning; the rejoin line is :info.
+    setup do
+      Logger.configure(level: :info)
+      on_exit(fn -> Logger.configure(level: :warning) end)
+    end
+
+    test "a disconnect names the next attempt, and the rejoin says how long the outage lasted",
+         ctx do
+      log =
+        capture_log(fn ->
+          {pid, _ref} = start_control(ctx.config)
+          :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+          first_join = Control.info(pid).joined_at
+
+          TestLoopctl.disconnect_runner()
+          :ok = wait_until(fn -> not Control.info(pid).joined end, 5_000)
+          assert Control.info(pid).last_disconnect =~ "closed"
+
+          :ok = wait_until(fn -> Control.info(pid).joined end, 10_000)
+          assert Control.info(pid).joined_at >= first_join
+        end)
+
+      assert log =~ ~r/socket disconnected: .+; reconnect attempt 1 in \d+ms/
+      assert log =~ ~r/joined runner:\S+ after \d+\.\ds out of the pool \(1 reconnect attempts\)/
+    end
+
+    test "a slow status reply is logged with its round trip", ctx do
+      TestLoopctl.put(:status_reply, {:delay, 700})
+
+      log =
+        capture_log(fn ->
+          {pid, _ref} = start_control(ctx.config, slow_reply_ms: 500)
+          :ok = wait_until(fn -> is_integer(Control.info(pid).last_status_rtt_ms) end, 10_000)
+          assert Control.info(pid).last_status_rtt_ms >= 700
+          assert is_binary(Control.info(pid).last_status_acked_at)
+        end)
+
+      assert log =~ ~r/answered a status push after \d+ms; the link is slow/
+    end
+
+    test "a status push that is never answered is logged at the next tick", ctx do
+      TestLoopctl.put(:status_reply, :none)
+
+      log =
+        capture_log(fn ->
+          {_pid, _ref} = start_control(ctx.config, slow_reply_ms: 500)
+          assert_receive {:test_loopctl, {:status, _}}, 5_000
+          assert_receive {:test_loopctl, {:status, _}}, 5_000
+          Process.sleep(100)
+        end)
+
+      assert log =~ "has not answered the status push sent"
+      assert log =~ "(last answered never)"
+    end
+
+    test "a reply slower than the status interval is still measured, not called unanswered",
+         ctx do
+      TestLoopctl.put(:status_reply, {:delay, 1_500})
+
+      log =
+        capture_log(fn ->
+          {pid, _ref} = start_control(ctx.config, slow_reply_ms: 1_000)
+          :ok = wait_until(fn -> is_binary(Control.info(pid).last_status_acked_at) end, 10_000)
+          assert Control.info(pid).last_status_rtt_ms >= 1_500
+        end)
+
+      assert log =~ ~r/answered a status push after \d+ms; the link is slow/
+    end
+
+    test "a push sent while an earlier one was pending stays watched after that one settles",
+         ctx do
+      # The first reply is late, and every reply after it never comes.
+      TestLoopctl.put(:status_reply, [{:delay, 1_200}, :none])
+
+      log =
+        capture_log(fn ->
+          {pid, _ref} = start_control(ctx.config, slow_reply_ms: 500)
+          :ok = wait_until(fn -> is_binary(Control.info(pid).last_status_acked_at) end, 10_000)
+          # The second push went out before the first reply landed and is still unanswered.
+          assert Control.info(pid).status_push_pending
+          Process.sleep(1_500)
+        end)
+
+      assert log =~ ~r/has not answered the status push sent \d+ms ago \(last answered 20/
+    end
+
+    test "an ok reply carrying a body counts as answered", ctx do
+      TestLoopctl.put(:status_reply, {:body, %{next_interval_ms: 1_000}})
+
+      capture_log(fn ->
+        {pid, _ref} = start_control(ctx.config)
+        :ok = wait_until(fn -> is_binary(Control.info(pid).last_status_acked_at) end, 5_000)
+        refute Control.info(pid).status_push_pending
+      end)
+    end
+
+    test "a status sent at once while the last push is in flight is not a slow link", ctx do
+      TestLoopctl.put(:status_reply, {:delay, 300})
+      slow = %{ctx.config | control: %{ctx.config.control | status_interval_s: 30}}
+
+      log =
+        capture_log(fn ->
+          {pid, _ref} = start_control(slow)
+          :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+
+          Control.set_draining(pid, true)
+          assert_receive {:test_loopctl, {:status, _}}, 3_000
+          Control.set_draining(pid, false)
+          :ok = wait_until(fn -> is_binary(Control.info(pid).last_status_acked_at) end, 5_000)
+        end)
+
+      refute log =~ "has not answered the status push"
+    end
+
+    test "an event this build does not handle is logged once, not on every repeat", ctx do
+      log =
+        capture_log(fn ->
+          {pid, _ref} = start_control(ctx.config)
+          :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+          topic = "runner:" <> TestLoopctl.get(:runner_id)
+
+          for _ <- 1..3, do: TestLoopctl.Endpoint.broadcast(topic, "trace_cursor", %{"seq" => 1})
+
+          assert_receive {:test_loopctl, {:status, _}}, 5_000
+          assert Control.info(pid).joined
+        end)
+
+      assert length(String.split(log, ~s(loopctl sent "trace_cursor"))) == 2
+    end
+
+    test "an unreadable health metric is logged once when it fails and once when it recovers",
+         ctx do
+      {:ok, readings} =
+        Agent.start_link(fn -> [{:error, "free_disk_mb"}, {:error, "free_disk_mb"}] end)
+
+      measure = fn path, last ->
+        Agent.get_and_update(readings, fn
+          [reading | rest] -> {reading, rest}
+          [] -> {LoopctlRunner.Health.measure(path, last), []}
+        end)
+      end
+
+      # A long interval, so each status below is the one set_draining sends at once.
+      slow = %{ctx.config | control: %{ctx.config.control | status_interval_s: 30}}
+
+      log =
+        capture_log(fn ->
+          {pid, _ref} = start_control(slow, measure: measure)
+          assert_receive {:test_loopctl, {:join, _, join}}, 5_000
+          refute Map.has_key?(join, "sample")
+          :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+          # Recorded by the join itself, before any status has been sent.
+          assert Control.info(pid).sample_error == "free_disk_mb"
+
+          Control.set_draining(pid, true)
+          assert_receive {:test_loopctl, {:status, status}}, 3_000
+          refute Map.has_key?(status, "sample")
+
+          Process.sleep(1_100)
+          Control.set_draining(pid, false)
+          assert_receive {:test_loopctl, {:status, %{"sample" => _}}}, 3_000
+          assert Control.info(pid).sample_error == nil
+        end)
+
+      assert length(String.split(log, "health sample omitted: cannot read free_disk_mb")) == 2
+      assert log =~ "health sample readable again"
+    end
+
+    test "every line carries the runner id, and a dispatch line its story and epoch", ctx do
+      runner_id = TestLoopctl.get(:runner_id)
+
+      log =
+        capture_log([metadata: [:runner_id, :dispatch_id, :story_id, :claim_epoch]], fn ->
+          {pid, _ref} = start_control(ctx.config)
+          :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+
+          dispatch = %{"dispatch_id" => "d-1", "story_id" => "s-1", "claim_epoch" => 4}
+          TestLoopctl.Endpoint.broadcast("runner:" <> runner_id, "dispatch", dispatch)
+          assert_receive {:test_loopctl, {:status, _}}, 5_000
+        end)
+
+      # The fake server's own Phoenix lines (CONNECTED TO, JOINED) are not the runner's.
+      lines =
+        log
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&(&1 =~ ~r/\[(info|warning|error)\]/))
+        |> Enum.reject(&(&1 =~ ~r/\] (CONNECTED TO|JOINED) /))
+
+      assert lines != []
+      assert Enum.all?(lines, &(&1 =~ "runner_id=#{runner_id}"))
+      assert log =~ ~r/dispatch_id=d-1 story_id=s-1 claim_epoch=4 .*malformed dispatch ignored/
+    end
+
+    test "a refused upgrade logs its HTTP status, not the response headers", ctx do
+      File.write!(ctx.token_file, "lc_wrong_token")
+
+      log =
+        capture_log(fn ->
+          {pid, _ref} = start_control(ctx.config)
+          :ok = wait_until(fn -> Control.info(pid).connect_attempts >= 1 end, 5_000)
+          Process.sleep(100)
+        end)
+
+      assert log =~ "upgrade refused with HTTP 403; reconnect attempt 1 in 1000ms"
+      refute log =~ "resp_headers"
+    end
   end
 end

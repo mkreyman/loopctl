@@ -68,6 +68,9 @@ defmodule LoopctlRunner.Application do
         raise "runner config #{path} has no control section; the daemon has nothing to connect to"
 
       {:ok, config} ->
+        # Primary metadata, so every process's lines carry the runner id, supervisor reports
+        # about Control included. Lines logged before the config loads cannot.
+        :logger.update_primary_config(%{metadata: %{runner_id: config.control.runner_id}})
         [{Control, config: config, name: Control}]
 
       {:error, reason} ->

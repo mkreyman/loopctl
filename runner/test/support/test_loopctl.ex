@@ -19,7 +19,11 @@ defmodule LoopctlRunner.TestLoopctl do
       token: "lc_test_token",
       runner_id: "0b1c7a52-6a4c-4f7e-9d7b-1a2b3c4d5e6f",
       join_replies: [],
-      last_status_ms: nil
+      last_status_ms: nil,
+      # :ok, {:delay, ms} for a slow link, :none for a push that is never answered, {:body, map}
+      # for an ok reply carrying a body, or a list of those consumed one push at a time (the
+      # last one then repeats).
+      status_reply: :ok
     }
 
     case Agent.start(fn -> state end, name: __MODULE__) do
@@ -36,6 +40,14 @@ defmodule LoopctlRunner.TestLoopctl do
 
   @doc "Scripts the next join replies, oldest first: `:ok` or `{:error, reason_map}`."
   def script_joins(replies), do: put(:join_replies, replies)
+
+  def next_status_reply do
+    Agent.get_and_update(__MODULE__, fn
+      %{status_reply: [reply]} = state -> {reply, state}
+      %{status_reply: [reply | rest]} = state -> {reply, %{state | status_reply: rest}}
+      %{status_reply: reply} = state -> {reply, state}
+    end)
+  end
 
   def next_join_reply do
     Agent.get_and_update(__MODULE__, fn
@@ -137,6 +149,23 @@ defmodule LoopctlRunner.TestLoopctl do
     defp accept_status(payload, socket) do
       TestLoopctl.notify({:status, payload})
 
+      case TestLoopctl.next_status_reply() do
+        {:body, body} ->
+          {:reply, {:ok, body}, socket}
+
+        :none ->
+          {:noreply, socket}
+
+        {:delay, ms} ->
+          Process.sleep(ms)
+          status_reply(payload, socket)
+
+        :ok ->
+          status_reply(payload, socket)
+      end
+    end
+
+    defp status_reply(payload, socket) do
       case Contract.validate("RunnerStatus", payload) do
         :ok ->
           {:reply, :ok, socket}

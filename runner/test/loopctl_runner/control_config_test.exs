@@ -150,6 +150,37 @@ defmodule LoopctlRunner.ControlConfigTest do
     refute unit =~ "LOOPCTL_RUNNER_FATAL_EXIT"
   end
 
+  test "the daemon tags every process's log lines with its runner id" do
+    root = tmp_dir!("daemon-tag")
+    token = Path.join(root, "token")
+    File.write!(token, "lc_x")
+    File.chmod!(token, 0o600)
+
+    control = %{
+      "url" => "wss://loopctl.example/runner/socket/websocket",
+      "runner_id" => "3781bee6-2b97-4df0-9664-7f01a492630f",
+      "machine" => "minis",
+      "token_file" => token,
+      "repos" => ["mkreyman/home_care_billing"],
+      "max_sessions" => 1
+    }
+
+    path = Path.join(root, "runner.json")
+    File.write!(path, JSON.encode!(Map.put(config_map(root), "control", control)))
+    System.put_env("LOOPCTL_RUNNER_CONFIG", path)
+    %{metadata: before} = :logger.get_primary_config()
+
+    on_exit(fn ->
+      System.delete_env("LOOPCTL_RUNNER_CONFIG")
+      :logger.update_primary_config(%{metadata: before})
+    end)
+
+    assert [{LoopctlRunner.Control, _}] = LoopctlRunner.Application.daemon_children!()
+
+    assert %{metadata: %{runner_id: "3781bee6-2b97-4df0-9664-7f01a492630f"}} =
+             :logger.get_primary_config()
+  end
+
   test "the daemon refuses to start without a control section" do
     root = tmp_dir!("daemon")
     path = Path.join(root, "runner.json")

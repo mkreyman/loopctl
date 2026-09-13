@@ -31,20 +31,35 @@ defmodule LoopctlRunner.Health do
   @doc "A health sample for the filesystem holding `path`, or nil when any metric is unreadable."
   @spec sample(String.t(), String.t() | nil) :: sample() | nil
   def sample(path, last_build_at) do
-    with {:ok, load} <- loadavg_1m(),
-         {:ok, free_ram} <- free_ram_mb(),
-         {:ok, free_disk} <- free_disk_mb(path) do
-      %{
-        "sampled_at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
-        "loadavg_1m" => load,
-        "free_ram_mb" => free_ram,
-        "free_disk_mb" => free_disk,
-        "last_build_at" => last_build_at
-      }
-    else
-      _ -> nil
+    case measure(path, last_build_at) do
+      {:ok, sample} -> sample
+      {:error, _metric} -> nil
     end
   end
+
+  @doc """
+  Like `sample/2`, but an unreadable metric is named, so the runner can log why loopctl is
+  receiving no sample.
+  """
+  @spec measure(String.t(), String.t() | nil) :: {:ok, sample()} | {:error, String.t()}
+  def measure(path, last_build_at) do
+    with {:ok, load} <- metric("loadavg_1m", loadavg_1m()),
+         {:ok, free_ram} <- metric("free_ram_mb", free_ram_mb()),
+         {:ok, free_disk} <- metric("free_disk_mb", free_disk_mb(path)) do
+      {:ok,
+       %{
+         "sampled_at" =>
+           DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+         "loadavg_1m" => load,
+         "free_ram_mb" => free_ram,
+         "free_disk_mb" => free_disk,
+         "last_build_at" => last_build_at
+       }}
+    end
+  end
+
+  defp metric(_name, {:ok, _} = ok), do: ok
+  defp metric(name, _unreadable), do: {:error, name}
 
   defp darwin?, do: :os.type() == {:unix, :darwin}
 
