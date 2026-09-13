@@ -6,6 +6,31 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Runner capacity is reserved in Postgres, and a tenant's total is admission-controlled
+  (#803).** `Loopctl.Runners.dispatch/3` now takes a slot on the runner in the same
+  transaction that records the dispatch, and refuses `:runner_at_capacity` past the runner's
+  `max_sessions` and `:admission_limit_reached` past the tenant's total, so two dispatchers
+  (on either node) can no longer both use a runner's last slot. A slot is given back when the
+  runner refuses the dispatch, when its claim is superseded, on `Runners.release_slot/2`, and
+  otherwise by the new every-minute `HealRunnerCapacityWorker` once the claim ends, the
+  runner is revoked, or the dispatch's wall clock plus five minutes has passed.
+
+  **New env var `RUNNER_MAX_IN_FLIGHT_SESSIONS`** (default `6`): the most sessions one tenant
+  may have in flight across all its runners — every session shares one Anthropic account.
+  See `deploy/FLY_SECRETS.md`.
+
+  **Migration, no manual step:** `runners` gains `max_sessions` (default 2, 1..64) and
+  `in_flight`; `runner_dispatches` gains `released_at` and `wall_clock_seconds`, and rows
+  recorded before it are marked released (they never took a slot). **An already-enrolled
+  runner gets `max_sessions` 2**; one that should carry a different number is re-enrolled
+  (revoke, then `POST /api/v1/runners` with `max_sessions`).
+
+  **`POST /api/v1/runners` takes an optional `max_sessions`**, and runner rows now carry
+  `max_sessions` and `in_flight`. **`GET /api/v1/runners/pool` changes meaning:** its
+  `in_flight` and `max_sessions` are now the Postgres values dispatch reserves against (null
+  only for a runner revoked while its socket drains), and what the runner itself reported
+  moved to the new `reported_in_flight` and `reported_max_sessions`.
+
 - **The production machines form one BEAM cluster.** Until now both Fly machines booted as
   `loopctl@127.0.0.1` with IPv4 distribution and no `DNS_CLUSTER_QUERY`, so each was an
   island: PubSub (runner dispatch delivery, revocation, cache invalidation) and the runner

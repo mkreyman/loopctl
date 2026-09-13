@@ -371,6 +371,36 @@ defmodule Loopctl.ObanPluginsConfigTest do
     end
   end
 
+  describe "#803: HealRunnerCapacityWorker crontab entry" do
+    setup do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+
+      {Oban.Plugins.Cron, cron_opts} =
+        Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      entry =
+        Enum.find(cron_opts[:crontab], fn
+          {_schedule, Loopctl.Workers.HealRunnerCapacityWorker} -> true
+          {_schedule, Loopctl.Workers.HealRunnerCapacityWorker, _opts} -> true
+          _ -> false
+        end)
+
+      %{entry: entry}
+    end
+
+    test "the capacity heal is scheduled, every minute", %{entry: entry} do
+      assert entry,
+             "expected a HealRunnerCapacityWorker crontab entry — without it a leaked runner " <>
+               "slot refuses admissions for its tenant forever (#803)"
+
+      assert elem(entry, 0) == "* * * * *"
+    end
+
+    test "it is not parked" do
+      refute Loopctl.Workers.HealRunnerCapacityWorker in Loopctl.ObanConfig.parked_crons()
+    end
+  end
+
   describe "US-40.B1: ChannelClaimSweeper crontab entry" do
     setup do
       plugins = Application.get_env(:loopctl, Oban)[:plugins]

@@ -36,6 +36,33 @@ defmodule Loopctl.RunnersTest do
              )
     end
 
+    test "enrolls with max_sessions, defaulting to two, and refuses one out of range" do
+      tenant = fixture(:tenant)
+
+      assert {:ok, %{runner: %{max_sessions: 2, in_flight: 0}}} =
+               Runners.enroll_runner(tenant.id, %{name: "minis"})
+
+      assert {:ok, %{runner: %{max_sessions: 5}}} =
+               Runners.enroll_runner(tenant.id, %{"name" => "blockit", "max_sessions" => 5})
+
+      # Refused by the changeset itself, before the CHECK constraint behind it is reached.
+      for bad <- [0, 65] do
+        refute Runner.create_changeset(%Runner{tenant_id: tenant.id}, %{
+                 name: "nuc",
+                 max_sessions: bad
+               }).valid?
+      end
+
+      for bad <- [0, 65, -1] do
+        assert {:error, %Ecto.Changeset{} = cs} =
+                 Runners.enroll_runner(tenant.id, %{name: "nuc", max_sessions: bad})
+
+        assert %{max_sessions: _} = errors_on(cs)
+      end
+
+      assert Auth.count_api_keys(tenant.id) == 2
+    end
+
     test "refuses a malformed name without minting a key" do
       tenant = fixture(:tenant)
 

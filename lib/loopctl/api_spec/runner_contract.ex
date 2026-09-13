@@ -251,7 +251,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
             type: :integer,
             minimum: 0,
             maximum: 64,
-            description: "Concurrent sessions this machine accepts. Advisory; see in_flight."
+            description:
+              "Concurrent sessions this machine accepts; it refuses past them with " <>
+                "`at_capacity`. Advisory to loopctl, which reserves against the max_sessions " <>
+                "the runner was ENROLLED with, never this value."
           },
           in_flight: %Schema{
             type: :integer,

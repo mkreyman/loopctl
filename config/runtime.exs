@@ -146,6 +146,15 @@ case System.get_env("STORY_CLAIM_LEASE_SECONDS") &&
   _ -> :ok
 end
 
+# #803: the most runner sessions one tenant may have in flight across all its runners
+# (admission control). Positive integer; anything else leaves the default in
+# Loopctl.Runners.Capacity.limit/0.
+case System.get_env("RUNNER_MAX_IN_FLIGHT_SESSIONS") &&
+       Integer.parse(System.get_env("RUNNER_MAX_IN_FLIGHT_SESSIONS")) do
+  {sessions, ""} when sessions > 0 -> config :loopctl, :runner_max_in_flight_sessions, sessions
+  _ -> :ok
+end
+
 endpoint_http = [
   # Transport-layer DoS backstop. `websocket_options` is a BANDIT server-level
   # setting (the Phoenix `socket "/live", websocket: [...]` DSL rejects

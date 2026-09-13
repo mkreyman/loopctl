@@ -1907,7 +1907,10 @@ defmodule Loopctl.Fixtures do
     name = Map.get(attrs, :name, "runner-#{System.unique_integer([:positive])}")
 
     {:ok, %{runner: runner, raw_key: raw_key}} =
-      Loopctl.Runners.enroll_runner(tenant_id, %{name: name})
+      Loopctl.Runners.enroll_runner(
+        tenant_id,
+        Map.merge(%{name: name}, Map.take(attrs, [:max_sessions]))
+      )
 
     {raw_key, runner}
   end
@@ -1931,7 +1934,7 @@ defmodule Loopctl.Fixtures do
 
       runner =
         %Runner{tenant_id: tenant_id}
-        |> Runner.create_changeset(%{name: name})
+        |> Runner.create_changeset(Map.merge(%{name: name}, Map.take(attrs, [:max_sessions])))
         |> Ecto.Changeset.put_change(:api_key_id, api_key.id)
         |> AdminRepo.insert!()
 

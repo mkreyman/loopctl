@@ -187,6 +187,12 @@ during an incident with `fly secrets set … && fly apps restart` — no deploy.
 |-----------------------------|---------|-------------|
 | `STORY_CLAIM_LEASE_SECONDS` | `86400` | How long a story claim lives without a renewal (`POST /api/v1/stories/:id/renew-claim`). Past it, `ReclaimExpiredClaimsWorker` (every 5 minutes) releases the story back to `pending` and bumps its `claim_epoch`. Positive integer seconds; unset, blank or malformed leaves the 24h default rather than failing boot. **Too SHORT releases stories agents are still working** — the duplicate-work race a claim exists to prevent, and it fires on long HEALTHY sessions, not on crashed ones. Too long only delays reopening a story whose session is already gone. Bias long, and have claimants renew well inside the window. Applies to leases granted or renewed after a restart; existing `claimed_until` values are not rewritten. Also the renewal grace granted when a custody halt is cleared or a tenant is re-activated: every live lease is extended to at least one lease from the clear |
 
+#### Runner admission control
+
+| Variable                        | Default | Description |
+|---------------------------------|---------|-------------|
+| `RUNNER_MAX_IN_FLIGHT_SESSIONS` | `6`     | The most runner sessions ONE tenant may have in flight across all its runners at once (#803). `Loopctl.Runners.dispatch/3` refuses past it with `:admission_limit_reached`, under a Postgres advisory lock, before any slot is reserved; each runner is separately capped at its enrolled `max_sessions`. It exists because every session of a tenant runs on one Anthropic account, whose rate limit is what bites on parallel work: **too HIGH** and the sessions throttle each other into 429s and slow turns, **too LOW** and runners sit idle with free slots while stories queue. Positive integer; unset, blank or malformed leaves the default rather than failing boot. Read on every dispatch, so it applies from the restart that sets it; slots already held are not revoked |
+
 #### Agent delivery loop: Gate B triggers
 
 Gate B (`Loopctl.DeliveryGates`) decides from these which paths a delivery-loop change may

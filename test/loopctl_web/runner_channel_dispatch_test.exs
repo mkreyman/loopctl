@@ -28,6 +28,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
   alias Loopctl.ApiSpec.RunnerContract.RunnerTraceEvent
   alias Loopctl.Auth
   alias Loopctl.Runners
+  alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Runners.Presence
@@ -307,6 +308,55 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
       assert_push "dispatch", _, @reply_timeout
       assert DispatchLedger.get_record(runner.tenant_id, payload["dispatch_id"]).id == record.id
+    end
+
+    test "a runner at max_sessions is refused before anything is recorded or pushed; a re-send is not",
+         %{runner: runner} do
+      # The setup runner is enrolled with the default of two slots.
+      first = dispatch_payload(runner.tenant_id)
+
+      for payload <- [first, dispatch_payload(runner.tenant_id)] do
+        assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
+        assert_push "dispatch", _, @reply_timeout
+      end
+
+      third = dispatch_payload(runner.tenant_id)
+      assert {:error, :runner_at_capacity} = Runners.dispatch(runner.tenant_id, runner.id, third)
+      refute_push "dispatch", _
+      assert is_nil(DispatchLedger.get_record(runner.tenant_id, third["dispatch_id"]))
+
+      # The retry of a dispatch that already holds its slot needs no new one.
+      assert :ok = Runners.dispatch(runner.tenant_id, runner.id, first)
+      assert_push "dispatch", _, @reply_timeout
+    end
+
+    test "the tenant's admission limit refuses a runner that still has free slots",
+         %{runner: runner} do
+      {raw_b, runner_b} =
+        fixture(:committed_runner, %{
+          name: "blockit",
+          tenant_id: runner.tenant_id,
+          max_sessions: 8
+        })
+
+      {:ok, socket_b} = connect_runner(raw_b)
+      {_reply, _channel_b} = join_pool(socket_b, "blockit")
+
+      for _ <- 1..Capacity.limit() do
+        assert :ok =
+                 Runners.dispatch(
+                   runner.tenant_id,
+                   runner_b.id,
+                   dispatch_payload(runner.tenant_id)
+                 )
+      end
+
+      over = dispatch_payload(runner.tenant_id)
+
+      assert {:error, :admission_limit_reached} =
+               Runners.dispatch(runner.tenant_id, runner_b.id, over)
+
+      assert is_nil(DispatchLedger.get_record(runner.tenant_id, over["dispatch_id"]))
     end
 
     test "a dispatch_id whose ledger row disagrees is refused before anything is pushed",

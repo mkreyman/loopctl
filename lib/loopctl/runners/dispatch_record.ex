@@ -20,15 +20,23 @@ defmodule Loopctl.Runners.DispatchRecord do
     past this row's. Written by `Loopctl.Runners.DispatchLedger` when a reply or trace about
     the row finds that, never by the runner; a `refused` row is left refused.
 
+  ## Capacity
+
+  A dispatch recorded as `sent` holds one of its runner's slots (`Loopctl.Runners.Capacity`)
+  until `released_at` is set, exactly once. `wall_clock_seconds` is the dispatch's own wall
+  clock, kept so an unreleased slot always has an end.
+
   ## Trust boundary
 
   Every field is set programmatically in `Loopctl.Runners`; there is no caller changeset.
 
   ## Isolation
 
-  Read and written only through `Loopctl.Runners.DispatchLedger`, on the RLS-enforced
-  `Loopctl.Repo` inside `Repo.with_tenant/2`, with an explicit `tenant_id` predicate as
-  well. Never `AdminRepo` — see that module.
+  Written only through `Loopctl.Runners.DispatchLedger` and `Loopctl.Runners.Capacity` (which
+  sets `released_at`), on the RLS-enforced `Loopctl.Repo` inside `Repo.with_tenant/2`, with an
+  explicit `tenant_id` predicate as well. Never written through `AdminRepo` — see
+  `DispatchLedger`; `Loopctl.Workers.HealRunnerCapacityWorker` only reads a bounded candidate
+  list there.
   """
 
   use Loopctl.Schema
@@ -51,6 +59,8 @@ defmodule Loopctl.Runners.DispatchRecord do
     field :pushed_at, :utc_datetime_usec
     field :run_id, :binary_id
     field :trace_acked_seq, :integer, default: -1
+    field :wall_clock_seconds, :integer
+    field :released_at, :utc_datetime_usec
 
     timestamps()
   end

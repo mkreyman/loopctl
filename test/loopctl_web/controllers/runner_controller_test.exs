@@ -25,6 +25,8 @@ defmodule LoopctlWeb.RunnerControllerTest do
         |> json_response(201)
 
       assert body["runner"]["name"] == "minis"
+      assert body["runner"]["max_sessions"] == 2
+      assert body["runner"]["in_flight"] == 0
       assert is_nil(body["runner"]["revoked_at"])
       refute Map.has_key?(body["runner"], "api_key_id")
 
@@ -39,6 +41,24 @@ defmodule LoopctlWeb.RunnerControllerTest do
       assert json_response(post(authed, ~p"/api/v1/runners", %{"name" => "Bad Name"}), 422)
       assert json_response(post(authed, ~p"/api/v1/runners", %{"name" => "minis"}), 201)
       assert json_response(post(authed, ~p"/api/v1/runners", %{"name" => "minis"}), 422)
+    end
+
+    test "takes max_sessions, and 422 when it is out of range", %{conn: conn} do
+      ctx = operator_ctx()
+      authed = auth(conn, ctx.operator_key)
+
+      assert json_response(
+               post(authed, ~p"/api/v1/runners", %{"name" => "big", "max_sessions" => 65}),
+               422
+             )
+
+      body =
+        json_response(
+          post(authed, ~p"/api/v1/runners", %{"name" => "small", "max_sessions" => 1}),
+          201
+        )
+
+      assert body["runner"]["max_sessions"] == 1
     end
 
     test "403 for orchestrator and agent keys", %{conn: conn} do
@@ -185,7 +205,9 @@ defmodule LoopctlWeb.RunnerControllerTest do
 
     test "returns a connected runner with its meta and latest sample", %{conn: conn} do
       ctx = operator_ctx()
-      {_raw, runner} = fixture(:runner, %{tenant_id: ctx.tenant.id, name: "minis"})
+
+      {_raw, runner} =
+        fixture(:runner, %{tenant_id: ctx.tenant.id, name: "minis", max_sessions: 3})
 
       sample = %{
         sampled_at: "2026-09-12T10:00:00Z",
@@ -204,9 +226,12 @@ defmodule LoopctlWeb.RunnerControllerTest do
 
       assert entry["machine"] == "minis"
       assert entry["runner_id"] == runner.id
-      assert entry["in_flight"] == 1
+      # Capacity is Postgres's; what the runner reported is kept apart as a hint.
+      assert entry["in_flight"] == 0
+      assert entry["max_sessions"] == 3
+      assert entry["reported_in_flight"] == 1
+      assert entry["reported_max_sessions"] == 2
       assert entry["draining"] == false
-      assert entry["max_sessions"] == 2
       assert entry["live_sockets"] == 1
       assert {:ok, _, _} = DateTime.from_iso8601(entry["joined_at"])
       assert entry["sample"]["free_ram_mb"] == 12_000
@@ -242,7 +267,7 @@ defmodule LoopctlWeb.RunnerControllerTest do
                |> json_response(200)
 
       assert entry["live_sockets"] == 2
-      assert entry["in_flight"] == 2
+      assert entry["reported_in_flight"] == 2
       assert entry["joined_at"] == "2026-09-12T10:00:00Z"
     end
 
