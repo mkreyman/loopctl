@@ -124,13 +124,19 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorkerTest do
 
     test "stories it will never release cannot fill the bounded batch and starve a real expiry" do
       # The sweep reads at most batch_size/0 candidates, oldest lease first. Stories in
-      # review, or in a halted tenant, are refused under the lock on every run and stay
-      # that way — so if the READ admitted them, enough old ones would take every slot on
-      # every run and a genuinely expired claim behind them would never be released.
+      # review, in a halted tenant, or in a suspended tenant are refused under the lock on
+      # every run and stay that way — so if the READ admitted them, enough old ones would
+      # take every slot on every run and a genuinely expired claim behind them would never
+      # be released.
       halted_tenant = fixture(:tenant)
+      suspended_tenant = fixture(:tenant)
       tenant = fixture(:tenant)
       agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
       halted_agent = fixture(:agent, %{tenant_id: halted_tenant.id, agent_type: :implementer})
+
+      suspended_agent =
+        fixture(:agent, %{tenant_id: suspended_tenant.id, agent_type: :implementer})
+
       old_lease = DateTime.add(DateTime.utc_now(), -3_600, :second)
       # Each kind ALONE is enough to fill the batch, so each exclusion is proved on its own.
       overflow = ReclaimExpiredClaimsWorker.batch_size() + 1
@@ -147,11 +153,17 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorkerTest do
         halted_tenant.id
         |> then(&fixture(:story, %{tenant_id: &1, agent_status: :assigned}))
         |> force(assigned_agent_id: halted_agent.id, claimed_until: old_lease)
+
+        suspended_tenant.id
+        |> then(&fixture(:story, %{tenant_id: &1, agent_status: :assigned}))
+        |> force(assigned_agent_id: suspended_agent.id, claimed_until: old_lease)
       end
 
       {1, _} =
         from(t in Tenant, where: t.id == ^halted_tenant.id)
         |> AdminRepo.update_all(set: [custody_halted_at: DateTime.utc_now()])
+
+      {:ok, _} = Tenants.suspend_tenant(suspended_tenant)
 
       %{story: real} = claimed_story(tenant)
       real = expire(real)
@@ -273,7 +285,7 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorkerTest do
       assert survived.agent_status == :assigned
 
       assert_in_delta DateTime.diff(survived.claimed_until, DateTime.utc_now(), :second),
-                      Progress.halt_clear_grace_seconds(),
+                      Progress.renewal_grace_seconds(),
                       5
 
       # Once the grace itself has run out with no renewal, the claim is reclaimable.
@@ -311,6 +323,89 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorkerTest do
 
       :ok = halt(tenant_a)
       {:ok, _} = Tenants.clear_custody_halt(tenant_a.id)
+
+      assert reload(story_b).claimed_until == story_b.claimed_until
+    end
+  end
+
+  describe "tenants that are not active" do
+    defp set_status(tenant, status) do
+      {1, _} =
+        from(t in Tenant, where: t.id == ^tenant.id)
+        |> AdminRepo.update_all(set: [status: status])
+
+      AdminRepo.get!(Tenant, tenant.id)
+    end
+
+    test "a suspended tenant's expired lease is not reclaimed by the sweep" do
+      tenant = fixture(:tenant)
+      %{story: story} = claimed_story(tenant)
+      {:ok, _} = Tenants.suspend_tenant(tenant)
+      story = expire(story)
+
+      assert :ok = sweep()
+
+      assert reload(story).agent_status == :assigned
+      assert reload(story).claim_epoch == story.claim_epoch
+    end
+
+    test "the locked re-check refuses every non-active status, even when the sweep read it active" do
+      for status <- [:suspended, :deactivated, :pending_enrollment] do
+        tenant = fixture(:tenant)
+        %{story: story} = claimed_story(tenant)
+        story = expire(story)
+        set_status(tenant, status)
+
+        assert {:error, :tenant_inactive} =
+                 Progress.reclaim_expired_claim(tenant.id, story.id, story.claim_epoch),
+               "#{status} tenant was reclaimed"
+
+        assert reload(story).agent_status == :assigned
+      end
+    end
+
+    test "re-activation grants a full lease of grace; once that runs out the claim is reclaimable" do
+      tenant = fixture(:tenant)
+      %{story: story} = claimed_story(tenant)
+      {:ok, suspended} = Tenants.suspend_tenant(tenant)
+      story = expire(story)
+
+      {:ok, _} = Tenants.activate_tenant(suspended)
+      assert :ok = sweep()
+
+      survived = reload(story)
+      assert survived.agent_status == :assigned
+
+      assert_in_delta DateTime.diff(survived.claimed_until, DateTime.utc_now(), :second),
+                      Progress.renewal_grace_seconds(),
+                      5
+
+      expire(story)
+      assert :ok = sweep()
+      assert reload(story).agent_status == :pending
+    end
+
+    test "activating an already-active tenant grants nothing, even from a stale suspended struct" do
+      tenant = fixture(:tenant)
+      %{story: story} = claimed_story(tenant)
+      story = expire(story)
+
+      {:ok, _} = Tenants.activate_tenant(tenant)
+      assert reload(story).claimed_until == story.claimed_until
+
+      # The caller's struct says :suspended, the row says :active: the LOCKED row decides.
+      {:ok, _} = Tenants.activate_tenant(%{tenant | status: :suspended})
+      assert reload(story).claimed_until == story.claimed_until
+    end
+
+    test "tenant isolation: activating one tenant extends no other tenant's leases" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      %{story: story_b} = claimed_story(tenant_b)
+      story_b = expire(story_b)
+
+      {:ok, suspended_a} = Tenants.suspend_tenant(tenant_a)
+      {:ok, _} = Tenants.activate_tenant(suspended_a)
 
       assert reload(story_b).claimed_until == story_b.claimed_until
     end

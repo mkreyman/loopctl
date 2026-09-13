@@ -1024,7 +1024,7 @@ defmodule Loopctl.Tenants do
   Clears a custody halt (break-glass operation).
 
   In the same transaction, when the tenant WAS halted, every live story claim lease is
-  extended to at least one renewal grace from now (`Loopctl.Progress.grant_halt_clear_grace/2`,
+  extended to at least one renewal grace from now (`Loopctl.Progress.grant_renewal_grace/2`,
   #803). `renew-claim` is custody surface and was blocked for the whole halt, so without it
   every lease that ran out during the halt would be reclaimed by the first sweep after the
   clear, before any claimant could renew. Clearing a tenant that is not halted changes
@@ -1032,26 +1032,36 @@ defmodule Loopctl.Tenants do
   """
   @spec clear_custody_halt(Ecto.UUID.t()) :: {:ok, Tenant.t()} | {:error, term()}
   def clear_custody_halt(tenant_id) do
-    case get_tenant(tenant_id) do
-      {:ok, tenant} ->
-        tenant
-        |> clear_halt_and_grant_lease_grace()
-        |> bust_key_cache_on_update()
-
-      error ->
-        error
-    end
+    tenant_id
+    |> update_granting_renewal_grace(
+      fn %Tenant{custody_halted_at: halted_at} -> not is_nil(halted_at) end,
+      &Ecto.Changeset.change(&1, custody_halted_at: nil)
+    )
+    |> bust_key_cache_on_update()
   end
 
-  # Tenant row first, then the story leases: the lock order
-  # `Progress.reclaim_expired_claim/3` also takes (tenant FOR SHARE, then story).
-  defp clear_halt_and_grant_lease_grace(%Tenant{custody_halted_at: halted_at} = tenant) do
+  # #803: the one shape every transition that makes claim renewal possible again goes
+  # through. Locks the tenant row FOR UPDATE, decides from the LOCKED row whether the
+  # transition actually happens (a stale caller struct must not decide it), applies the
+  # change, and — only then — grants the renewal grace, all in one transaction. Tenant row
+  # first, then the story leases: the lock order `Progress.reclaim_expired_claim/3` also
+  # takes (tenant FOR SHARE, then story).
+  defp update_granting_renewal_grace(tenant_id, becomes_renewable?, change_fun) do
     AdminRepo.transaction(fn ->
-      tenant
-      |> Ecto.Changeset.change(custody_halted_at: nil)
-      |> AdminRepo.update()
-      |> grant_lease_grace_if_halted(halted_at)
+      with {:ok, locked} <- lock_tenant_for_update(AdminRepo, tenant_id),
+           {:ok, updated} <- update_then_grant(locked, becomes_renewable?.(locked), change_fun) do
+        updated
+      else
+        {:error, reason} -> AdminRepo.rollback(reason)
+      end
     end)
+  end
+
+  defp update_then_grant(locked, grant?, change_fun) do
+    with {:ok, updated} <- locked |> change_fun.() |> AdminRepo.update() do
+      if grant?, do: Loopctl.Progress.grant_renewal_grace(updated.id)
+      {:ok, updated}
+    end
   end
 
   @doc "Returns true if tenant's custody operations are halted."
@@ -1107,12 +1117,28 @@ defmodule Loopctl.Tenants do
 
   @doc """
   Activates a tenant by setting its status to `:active`.
+
+  When the tenant was NOT already active (read from the locked row), every live story
+  claim lease is extended to at least one renewal grace from now, in the same transaction
+  (`Loopctl.Progress.grant_renewal_grace/2`, #803). `ResolveApiKey` refuses every request
+  from a tenant that is not `:active`, `renew-claim` included, so without it every lease
+  that ran out during a suspension would be reclaimed by the first sweep after
+  reactivation. Activating an already-active tenant grants nothing.
+
+  This is the only path that RETURNS a tenant with existing claims to `:active`. The other
+  write of `:active`, `Tenant.activate_after_enrollment_changeset/1`, flips a signup's
+  `:pending_enrollment` row inside the same transaction that inserted it, so that tenant
+  can hold no story; an abandoned pending row is deleted by `PendingEnrollmentCleanupWorker`,
+  never activated.
   """
-  @spec activate_tenant(Tenant.t()) :: {:ok, Tenant.t()} | {:error, Ecto.Changeset.t()}
+  @spec activate_tenant(Tenant.t()) ::
+          {:ok, Tenant.t()} | {:error, Ecto.Changeset.t() | :not_found}
   def activate_tenant(%Tenant{} = tenant) do
-    tenant
-    |> Tenant.status_changeset(:active)
-    |> AdminRepo.update()
+    tenant.id
+    |> update_granting_renewal_grace(
+      fn %Tenant{status: status} -> status != :active end,
+      &Tenant.status_changeset(&1, :active)
+    )
     |> bust_key_cache_on_update()
   end
 
@@ -1431,16 +1457,6 @@ defmodule Loopctl.Tenants do
   # preloaded tenant by the auth pipeline). Bust the tenant's cached keys on every
   # successful tenant update so the change takes effect on the very next request
   # rather than after the TTL. A failed update is passed through untouched.
-  defp grant_lease_grace_if_halted({:ok, cleared}, nil), do: cleared
-
-  defp grant_lease_grace_if_halted({:ok, cleared}, %DateTime{}) do
-    Loopctl.Progress.grant_halt_clear_grace(cleared.id)
-    cleared
-  end
-
-  defp grant_lease_grace_if_halted({:error, changeset}, _halted_at),
-    do: AdminRepo.rollback(changeset)
-
   defp bust_key_cache_on_update({:ok, %Tenant{} = tenant} = result) do
     Auth.invalidate_tenant_key_cache(tenant.id)
     result

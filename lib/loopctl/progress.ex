@@ -1478,22 +1478,30 @@ defmodule Loopctl.Progress do
   been requested (`review_requested_at` set): the implementer's lease stopped applying
   when it handed the work to review.
 
-  A tenant under a custody HALT is refused with `{:error, :custody_halted}`, read under
-  a `FOR SHARE` lock on the tenant row taken BEFORE the story lock. `renew-claim` is
-  custody surface, so no claimant can renew during a halt; the share lock means a halt
-  that lands after the sweep's read still wins, and the tenant-then-story order matches
-  `Loopctl.Tenants.clear_custody_halt/1`, which updates the tenant and then the leases.
+  A tenant whose claimants CANNOT RENEW is refused, read under a `FOR SHARE` lock on
+  the tenant row taken BEFORE the story lock: a custody HALT (`{:error, :custody_halted}`
+  — `renew-claim` is custody surface) or any status other than `:active`
+  (`{:error, :tenant_inactive}` — `ResolveApiKey` 403s every request from such a tenant,
+  renew-claim included). The share lock means a halt or suspension that lands after the
+  sweep's read still wins, and the tenant-then-story order matches
+  `Loopctl.Tenants.clear_custody_halt/1` and `Loopctl.Tenants.activate_tenant/1`, which
+  update the tenant and then the leases.
   """
   @spec reclaim_expired_claim(Ecto.UUID.t(), Ecto.UUID.t(), non_neg_integer()) ::
           {:ok, Story.t()}
-          | {:error, :not_found | :claim_not_expired | :custody_halted | Ecto.Changeset.t()}
+          | {:error,
+             :not_found
+             | :claim_not_expired
+             | :custody_halted
+             | :tenant_inactive
+             | Ecto.Changeset.t()}
   def reclaim_expired_claim(tenant_id, story_id, expected_epoch) do
     now = DateTime.utc_now()
 
     multi =
       Multi.new()
       |> Multi.run(:tenant_gate, fn _repo, _changes ->
-        lock_tenant_unless_halted(tenant_id)
+        lock_tenant_if_claims_renewable(tenant_id)
       end)
       |> Multi.run(:lock, fn _repo, _changes ->
         lock_story(tenant_id, story_id)
@@ -1553,49 +1561,57 @@ defmodule Loopctl.Progress do
     end
   end
 
-  # SHARE-locks the tenant row for the rest of the reclaim's transaction, so a halt
-  # (an UPDATE of that row) cannot commit between this check and the release.
-  defp lock_tenant_unless_halted(tenant_id) do
+  # "Can this tenant's claimants renew right now?" — the one condition every lease release
+  # depends on. Two things make the answer no, and both are refused: a custody halt
+  # (renew-claim is custody surface) and a tenant that is not `:active` (ResolveApiKey
+  # 403s every request, renew-claim included — suspended, deactivated, or never enrolled).
+  #
+  # SHARE-locks the tenant row for the rest of the reclaim's transaction, so a halt or a
+  # status change (an UPDATE of that row) cannot commit between this check and the release.
+  defp lock_tenant_if_claims_renewable(tenant_id) do
     from(t in Tenants.Tenant,
       where: t.id == ^tenant_id,
-      select: {t.id, t.custody_halted_at},
+      select: {t.status, t.custody_halted_at},
       lock: "FOR SHARE"
     )
     |> AdminRepo.one()
     |> case do
       nil -> {:error, :not_found}
-      {_id, nil} -> {:ok, :not_halted}
-      {_id, %DateTime{}} -> {:error, :custody_halted}
+      {_status, %DateTime{}} -> {:error, :custody_halted}
+      {:active, nil} -> {:ok, :renewable}
+      {_inactive, nil} -> {:error, :tenant_inactive}
     end
   end
 
   @doc """
-  Seconds of renewal grace every live lease gets when a custody halt is cleared: one full
+  Seconds of renewal grace every live lease gets when a tenant's claimants become able to
+  renew again — a custody halt cleared, or the tenant returned to `:active`: one full
   lease, `claim_lease_seconds/0`.
 
-  `renew-claim` is blocked for the whole halt, so without this every lease that ran out
-  during it would be reclaimed by the first sweep after the clear — before a single
-  claimant could renew. One LEASE rather than a fixed number of minutes, because the
-  lease is by definition the window a claimant is expected to renew within, and it moves
-  with `STORY_CLAIM_LEASE_SECONDS`; a fixed grace shorter than a claimant's renewal
+  `renew-claim` is unreachable for the whole halt or suspension, so without this every
+  lease that ran out during it would be reclaimed by the first sweep afterwards — before a
+  single claimant could renew. One LEASE rather than a fixed number of minutes, because
+  the lease is by definition the window a claimant is expected to renew within, and it
+  moves with `STORY_CLAIM_LEASE_SECONDS`; a fixed grace shorter than a claimant's renewal
   cadence would recreate the defect.
   """
-  @spec halt_clear_grace_seconds() :: pos_integer()
-  def halt_clear_grace_seconds, do: claim_lease_seconds()
+  @spec renewal_grace_seconds() :: pos_integer()
+  def renewal_grace_seconds, do: claim_lease_seconds()
 
   @doc """
   Extends every live, leased claim in the tenant to at least `now` plus
-  `halt_clear_grace_seconds/0`. A lease already past that point is left alone, and a
-  NULL lease stays NULL. Returns how many leases moved.
+  `renewal_grace_seconds/0`. A lease already past that point is left alone, and a NULL
+  lease stays NULL. Returns how many leases moved.
 
-  Called by `Loopctl.Tenants.clear_custody_halt/1` INSIDE the clear's transaction, after
-  the tenant row is updated — the same tenant-then-story lock order
-  `reclaim_expired_claim/3` takes, so the two cannot deadlock and no sweep can see the
-  cleared tenant with the old leases.
+  Called INSIDE the transaction of each transition that makes renewal possible again —
+  `Loopctl.Tenants.clear_custody_halt/1` and `Loopctl.Tenants.activate_tenant/1` — after
+  the tenant row is updated: the same tenant-then-story lock order
+  `reclaim_expired_claim/3` takes, so they cannot deadlock and no sweep can see the
+  renewable tenant with the old leases.
   """
-  @spec grant_halt_clear_grace(Ecto.UUID.t(), DateTime.t()) :: non_neg_integer()
-  def grant_halt_clear_grace(tenant_id, %DateTime{} = now \\ DateTime.utc_now()) do
-    floor = DateTime.add(now, halt_clear_grace_seconds(), :second)
+  @spec grant_renewal_grace(Ecto.UUID.t(), DateTime.t()) :: non_neg_integer()
+  def grant_renewal_grace(tenant_id, %DateTime{} = now \\ DateTime.utc_now()) do
+    floor = DateTime.add(now, renewal_grace_seconds(), :second)
 
     {count, _} =
       from(s in Story,
@@ -1607,8 +1623,8 @@ defmodule Loopctl.Progress do
 
     if count > 0 do
       Logger.info(
-        "claim_lease_halt_grace: extended #{count} claim lease(s) to #{DateTime.to_iso8601(floor)} " <>
-          "after a custody halt was cleared tenant_id=#{tenant_id}"
+        "claim_lease_renewal_grace: extended #{count} claim lease(s) to " <>
+          "#{DateTime.to_iso8601(floor)} as renewal became possible again tenant_id=#{tenant_id}"
       )
     end
 

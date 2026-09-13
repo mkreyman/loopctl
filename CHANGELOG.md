@@ -26,9 +26,10 @@ All notable changes to loopctl are documented here.
   - `POST /stories/:id/request-review` now stamps `stories.review_requested_at` (same
     migration). A story in review is never reclaimed: it waits on a different principal's
     report, and only its implementer could renew.
-  - The reclaimer never releases a claim in a custody-halted tenant (re-checked under a lock),
-    and clearing a halt extends every live lease to at least one full lease from the clear, in
-    the same transaction — `renew-claim` was blocked for the whole halt.
+  - The reclaimer never releases a claim in a tenant whose claimants cannot renew — one under a
+    custody halt, or one whose status is not `active` (re-checked under a lock) — and clearing a
+    halt or re-activating a tenant extends every live lease to at least one full lease from that
+    moment, in the same transaction.
   - New env var `STORY_CLAIM_LEASE_SECONDS` (default `86400`).
 
   **Deploy note.** Claims that exist at deploy time have `claimed_until` NULL and are never

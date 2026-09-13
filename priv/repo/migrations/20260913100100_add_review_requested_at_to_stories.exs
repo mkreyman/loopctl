@@ -16,9 +16,17 @@ defmodule Loopctl.Repo.Migrations.AddReviewRequestedAtToStories do
   `review_requested_at IS NULL` filter is applied on top of the index scan.
   """
 
-  def change do
+  # Explicit up/down: `add_if_not_exists` is not reversible, so inside `change/0` a
+  # rollback raises instead of dropping the column.
+  def up do
     alter table(:stories) do
       add_if_not_exists :review_requested_at, :utc_datetime_usec
+    end
+  end
+
+  def down do
+    alter table(:stories) do
+      remove_if_exists :review_requested_at, :utc_datetime_usec
     end
   end
 end

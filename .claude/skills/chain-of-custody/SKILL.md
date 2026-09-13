@@ -168,11 +168,15 @@ Invariants:
   `lease_expired?/3` under the lock both refuse a stamped story, and a renewal cannot re-arm it. A
   marker rather than a NULLed lease precisely because renewal would re-arm a NULL. Cleared by every
   release.
-- **A halt never causes a reclaim.** `renew-claim` is custody surface, so it is blocked during a halt.
-  The sweep skips halted tenants, `reclaim_expired_claim/3` re-checks the halt under a `FOR SHARE`
-  lock on the tenant row taken BEFORE the story lock, and `Tenants.clear_custody_halt/1` extends every
-  live lease to now + `halt_clear_grace_seconds/0` (one lease) in the clear's transaction, tenant row
-  first. Keep that tenant-then-story lock order on both sides or they can deadlock.
+- **"The claimant cannot renew" never causes a reclaim.** Two conditions make renewal impossible: a
+  custody halt (`renew-claim` is custody surface) and a tenant status other than `:active`
+  (`ResolveApiKey` 403s every request). The sweep skips both, `reclaim_expired_claim/3` re-checks both
+  under a `FOR SHARE` lock on the tenant row taken BEFORE the story lock, and both transitions back —
+  `Tenants.clear_custody_halt/1` and `Tenants.activate_tenant/1` — extend every live lease to now +
+  `renewal_grace_seconds/0` (one lease) inside their transaction, deciding from the LOCKED tenant row
+  and granting only on a real transition. Keep that tenant-then-story lock order on every side or they
+  can deadlock. A new path that returns a tenant to `:active`, or lifts any other renewal blocker, must
+  go through the same grace.
 - **The epoch is a FENCE, not a credential.** It is readable on the story; identity checks still
   apply on every operation. `start`/`report` accept it OPTIONALLY (absent = no check, so existing MCP
   clients work); the delivery-loop runner path is where it becomes mandatory, via
