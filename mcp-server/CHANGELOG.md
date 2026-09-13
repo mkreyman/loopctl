@@ -5,6 +5,30 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.92.0 — 2026-09-12 (runner tools, and renewing a story claim's lease)
+
+### Added
+
+- **`runner_enroll`, `runner_list`, `runner_revoke`, `runner_pool`** (issue #809), all on
+  `LOOPCTL_USER_KEY`. `runner_enroll` writes the runner's credential to the required
+  `token_file` (created exclusively, mode 0600, parent directories 0700) and returns only the
+  runner row and the path; an existing `token_file` is refused before anything is enrolled,
+  and a write that fails after enrollment revokes the runner. Only a 4xx passes through as a
+  refusal; any other failure may have enrolled the runner, so its response body is withheld
+  and the runner is revoked when the response proves its id. `runner_pool` reads the new
+  `GET /api/v1/runners/pool`, which needs a loopctl server that has it.
+- **`renew_story_claim({ story_id, claim_epoch })`** (loopctl #803/#810), on the agent key
+  like `claim_story`. Claims now expire after `STORY_CLAIM_LEASE_SECONDS` (default 24 hours)
+  unless renewed; without this tool an MCP-driven claim held past the lease would be released
+  under the agent. The server's 400, 422 `not_claimed`, 409 `stale_claim_epoch` and 409
+  `not_claimant` pass through unchanged. Needs a loopctl server with claim leases.
+
+### Changed
+
+- **`claim_story` leads its result with `claim_epoch` and `claimed_until`** when the server
+  returns them, so the agent keeps the epoch a renewal needs. An older server returns
+  neither and the result is unchanged.
+
 ## 2.91.1 — 2026-09-12 (payload_path no longer discloses or uploads files that are not a payload)
 
 ### Security

@@ -44,6 +44,8 @@ import {
 } from "./lib/generated-tools.js";
 import { createHandoff } from "./lib/handoff.js";
 import { readPayloadFile } from "./lib/payload-path.js";
+import { enrollRunner, listRunners, revokeRunner, runnerPool } from "./lib/runners.js";
+import { claimLeaseNotice, renewStoryClaim as renewStoryClaimRequest } from "./lib/claim-lease.js";
 
 // Single source of truth for the server version: the package.json this file
 // ships with (npm always includes package.json in the published tarball).
@@ -1134,7 +1136,19 @@ async function claimStory({ story_id }) {
   );
   // The claim response carries the start_cap that POST /start will require.
   rememberCap(story_id, result && result.capability);
-  return toContent(result);
+  return withClaimLeaseNotice(result);
+}
+
+// #803/#810: a claim carries a lease and an epoch. Put both at the top of the result, when
+// the server returns them, so the agent keeps the epoch renew_story_claim needs.
+function withClaimLeaseNotice(result) {
+  const notice = claimLeaseNotice(result);
+  if (!notice) return toContent(result);
+  return { content: [{ type: "text", text: notice }, ...toContent(result).content] };
+}
+
+async function renewStoryClaim(args) {
+  return withClaimLeaseNotice(await renewStoryClaimRequest(args, { apiCall }));
 }
 
 async function startStory({ story_id, capability }) {
@@ -3097,6 +3111,34 @@ async function revokeAuthenticator({ tenant_id, authenticator_id, webauthn_asser
   return toContent(result);
 }
 
+// Issue #809: runner tools. All four take the EXACT user-role key: a runner credential
+// is minted by a user key on a human-anchored tenant, and a global LOOPCTL_API_KEY must
+// never stand in for it. The logic, including how runner_enroll keeps the token out of
+// the tool result, lives in lib/runners.js.
+function runnerDeps() {
+  const userKey = process.env.LOOPCTL_USER_KEY;
+  return {
+    userKey,
+    apiCall: (method, path, body) => apiCall(method, path, body, userKey, { exactKey: true }),
+  };
+}
+
+async function runnerEnroll(args) {
+  return toContent(await enrollRunner(args, runnerDeps()));
+}
+
+async function runnerList(args) {
+  return toContent(await listRunners(args, runnerDeps()));
+}
+
+async function runnerRevoke(args) {
+  return toContent(await revokeRunner(args, runnerDeps()));
+}
+
+async function runnerPoolRead(args) {
+  return toContent(await runnerPool(args, runnerDeps()));
+}
+
 // US-26: Signed Tree Head retrieval
 async function getSth({ tenant_id }) {
   const result = await apiCall("GET", `/api/v1/audit/sth/${tenant_id}`);
@@ -4002,7 +4044,10 @@ const TOOLS = [
     name: "claim_story",
     description:
       "Agent claims a contracted story. Uses pessimistic locking to prevent double-claims. " +
-      "Transitions contracted -> assigned. Uses the AGENT key.",
+      "Transitions contracted -> assigned. Uses the AGENT key. On a loopctl with claim leases " +
+      "the result leads with the claim's claim_epoch and claimed_until: keep the epoch, and " +
+      "renew with renew_story_claim before claimed_until (default lease 24 hours) or the story " +
+      "is released back to pending under you.",
     inputSchema: {
       type: "object",
       properties: {
@@ -4012,6 +4057,32 @@ const TOOLS = [
         },
       },
       required: ["story_id"],
+    },
+  },
+  {
+    name: "renew_story_claim",
+    description:
+      "Renew your claim's lease (POST /api/v1/stories/:id/renew-claim): claimed_until becomes " +
+      "now plus the lease length, measured from NOW. Call it well inside the lease on any story " +
+      "you hold longer than it. Uses the AGENT key, the same key as claim_story. Refusals pass " +
+      "through: 400 claim_epoch missing or not a non-negative integer; 422 not_claimed (the " +
+      "story is not assigned or implementing); 409 stale_claim_epoch (the claim has ENDED: it " +
+      "expired and was reclaimed, released, or claimed again, so stop working it); 409 " +
+      "not_claimant (your key's agent is not the story's assigned agent).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        story_id: {
+          type: "string",
+          description: "The UUID of the story.",
+        },
+        claim_epoch: {
+          type: "integer",
+          minimum: 0,
+          description: "The claim_epoch your claim_story result returned.",
+        },
+      },
+      required: ["story_id", "claim_epoch"],
     },
   },
   {
@@ -7392,6 +7463,81 @@ const TOOLS = [
     },
   },
 
+  // Issue #809: runner enrollment and the Presence pool (user key)
+  {
+    name: "runner_enroll",
+    description:
+      "Enroll this dev machine as a runner of the agent delivery loop (POST /api/v1/runners). " +
+      "The runner's credential is written to `token_file` with mode 0600 and is NEVER returned: " +
+      "whoever holds it can join as this machine and receive its dispatches, and a tool result " +
+      "lands in the transcript. The result is only `{ runner: {id, name, inserted_at}, token_file }`. " +
+      "The file is created exclusively (O_EXCL): an existing path is refused before anything is " +
+      "enrolled, never overwritten. Missing parent directories are created with mode 0700. If the " +
+      "token cannot be written after enrollment, the runner is revoked before the error returns. " +
+      "A failure that may still have enrolled it (timeout, 5xx, a 2xx that did not parse) never " +
+      "echoes the response body: the runner is revoked when the response proves its id, and " +
+      "otherwise the error says to find it with runner_list and revoke it. " +
+      "runner_revoke is the undo for an enrollment. Requires LOOPCTL_USER_KEY (user role) on a " +
+      "human-anchored tenant; errors pass through with their code (422 name malformed or taken, " +
+      "403 custody_tier_required or api_key_mint_forbidden).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: {
+          type: "string",
+          description: "The machine name the runner will declare when it joins, e.g. `minis`.",
+        },
+        token_file: {
+          type: "string",
+          description:
+            "Absolute path, or one starting with ~/, for the token file. Must not exist yet.",
+        },
+      },
+      required: ["name", "token_file"],
+    },
+  },
+  {
+    name: "runner_list",
+    description:
+      "List the tenant's enrolled runners (GET /api/v1/runners): id, name, revoked_at, inserted_at. " +
+      "Enrollment only, never tokens; whether a runner is CONNECTED is runner_pool. " +
+      "Requires LOOPCTL_USER_KEY (user role).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        include_revoked: {
+          type: "boolean",
+          description: "Include revoked runners. Default false.",
+        },
+      },
+    },
+  },
+  {
+    name: "runner_revoke",
+    description:
+      "Revoke a runner (DELETE /api/v1/runners/:id): its credential stops authenticating and its " +
+      "live socket is disconnected, which removes it from runner_pool. This is the undo for " +
+      "runner_enroll. Idempotent. Requires LOOPCTL_USER_KEY (user role) on a human-anchored tenant.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "The runner UUID (from runner_enroll or runner_list)." },
+      },
+      required: ["id"],
+    },
+  },
+  {
+    name: "runner_pool",
+    description:
+      "The tenant's CONNECTED runners, read from Presence (GET /api/v1/runners/pool): per machine " +
+      "name, runner_id, joined_at, in_flight, draining, max_sessions, the latest health sample, " +
+      "and live_sockets. live_sockets above 1 means more than one process holds that runner's " +
+      "credential. A killed runner disappears once its socket closes. Presence converges only " +
+      "within a cluster, so on an unclustered multi-node deployment a runner on another node is " +
+      "absent. Requires LOOPCTL_USER_KEY (user role).",
+    inputSchema: { type: "object", properties: {} },
+  },
+
   // LCP-1 §9 signed-profile tools
   {
     name: "register_custody_owner_key",
@@ -8130,6 +8276,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case "claim_story":
       return await claimStory(args);
 
+    case "renew_story_claim":
+      return await renewStoryClaim(args);
+
     case "start_story":
       return await startStory(args);
 
@@ -8395,6 +8544,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "dispatch":
       return await createDispatch(args);
+
+    case "runner_enroll":
+      return await runnerEnroll(args);
+
+    case "runner_list":
+      return await runnerList(args);
+
+    case "runner_revoke":
+      return await runnerRevoke(args);
+
+    case "runner_pool":
+      return await runnerPoolRead(args);
 
     case "register_custody_owner_key":
       return await registerCustodyOwnerKey(args);

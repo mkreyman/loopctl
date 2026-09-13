@@ -341,6 +341,36 @@ defmodule Loopctl.ObanPluginsConfigTest do
     end
   end
 
+  describe "#803: ReclaimExpiredClaimsWorker crontab entry" do
+    setup do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+
+      {Oban.Plugins.Cron, cron_opts} =
+        Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      entry =
+        Enum.find(cron_opts[:crontab], fn
+          {_schedule, Loopctl.Workers.ReclaimExpiredClaimsWorker} -> true
+          {_schedule, Loopctl.Workers.ReclaimExpiredClaimsWorker, _opts} -> true
+          _ -> false
+        end)
+
+      %{entry: entry}
+    end
+
+    test "the reclaimer is scheduled, every 5 minutes", %{entry: entry} do
+      assert entry,
+             "expected a ReclaimExpiredClaimsWorker crontab entry — without it no expired " <>
+               "story claim is ever released (#803)"
+
+      assert elem(entry, 0) == "*/5 * * * *"
+    end
+
+    test "it is not parked" do
+      refute Loopctl.Workers.ReclaimExpiredClaimsWorker in Loopctl.ObanConfig.parked_crons()
+    end
+  end
+
   describe "US-40.B1: ChannelClaimSweeper crontab entry" do
     setup do
       plugins = Application.get_env(:loopctl, Oban)[:plugins]

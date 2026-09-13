@@ -21,8 +21,10 @@ defmodule LoopctlWeb.CustodySurface do
 
     * **Story lifecycle writes** — `POST /stories/:id/{contract,claim,start,
       request-review,report,unclaim,report-done,start-work,review-complete,
-      verify,reject,backfill,force-unclaim,recover-cap,artifacts}`. These ARE the
-      custody chain.
+      verify,reject,backfill,force-unclaim,recover-cap,artifacts,renew-claim}`.
+      These ARE the custody chain. (`renew-claim` blocked means a lease cannot be kept
+      alive through a halt, which is why `ReclaimExpiredClaimsWorker` skips halted
+      tenants.)
     * **Bulk story operations** — `POST /stories/bulk/*` and
       `POST /epics/:id/verify-all`. Same transitions, wider blast radius.
     * **Project import** — `POST /projects/:id/import`. `initial_agent_status`
@@ -77,7 +79,7 @@ defmodule LoopctlWeb.CustodySurface do
   @story_custody_ops ~w(
     contract claim start request-review report unclaim report-done start-work
     review-complete verify reject backfill force-unclaim recover-cap artifacts
-    mark-complete
+    mark-complete renew-claim
   )
 
   # Work-breakdown rows whose DELETION destroys the custody record itself.

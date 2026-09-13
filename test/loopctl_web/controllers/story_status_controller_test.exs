@@ -927,6 +927,162 @@ defmodule LoopctlWeb.StoryStatusControllerTest do
 
   # --- Role enforcement tests ---
 
+  describe "#803 claim lease and fence" do
+    defp claimed_via_api(conn) do
+      %{story: story, raw_key: raw_key} =
+        ctx = setup_story_with_agent(%{agent_status: :contracted})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/claim")
+        |> json_response(200)
+
+      Map.put(ctx, :claimed, body["story"])
+    end
+
+    test "the claim response carries claimed_until and claim_epoch", %{conn: conn} do
+      %{claimed: claimed} = claimed_via_api(conn)
+
+      assert claimed["claim_epoch"] == 1
+      assert {:ok, until, 0} = DateTime.from_iso8601(claimed["claimed_until"])
+      assert DateTime.compare(until, DateTime.utc_now()) == :gt
+    end
+
+    test "renew-claim extends the lease for the claimant", %{conn: conn} do
+      %{story: story, raw_key: raw_key, claimed: claimed} = claimed_via_api(conn)
+
+      body =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/renew-claim", %{"claim_epoch" => 1})
+        |> json_response(200)
+
+      assert body["story"]["claim_epoch"] == 1
+      assert body["story"]["claimed_until"] >= claimed["claimed_until"]
+    end
+
+    test "renew-claim without claim_epoch, or with a string, is 400", %{conn: conn} do
+      %{story: story, raw_key: raw_key} = claimed_via_api(conn)
+
+      for body <- [%{}, %{"claim_epoch" => "1"}, %{"claim_epoch" => -1}] do
+        assert build_conn()
+               |> auth_conn(raw_key)
+               |> post(~p"/api/v1/stories/#{story.id}/renew-claim", body)
+               |> json_response(400)
+      end
+    end
+
+    test "renew-claim with a stale epoch is 409 stale_claim_epoch", %{conn: conn} do
+      %{story: story, raw_key: raw_key} = claimed_via_api(conn)
+
+      body =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/renew-claim", %{"claim_epoch" => 0})
+        |> json_response(409)
+
+      assert body["error"]["code"] == "stale_claim_epoch"
+    end
+
+    test "renew-claim by another agent is 409 not_claimant", %{conn: conn} do
+      %{story: story, tenant: tenant} = claimed_via_api(conn)
+      other = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+
+      {other_key, _} =
+        fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: other.id})
+
+      body =
+        build_conn()
+        |> auth_conn(other_key)
+        |> post(~p"/api/v1/stories/#{story.id}/renew-claim", %{"claim_epoch" => 1})
+        |> json_response(409)
+
+      assert body["error"]["code"] == "not_claimant"
+    end
+
+    test "renew-claim on an unclaimed story is 422 not_claimed", %{conn: conn} do
+      %{story: story, raw_key: raw_key} = setup_story_with_agent(%{agent_status: :contracted})
+
+      body =
+        conn
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/renew-claim", %{"claim_epoch" => 0})
+        |> json_response(422)
+
+      assert body["error"]["code"] == "not_claimed"
+    end
+
+    test "renew-claim is exact_role :agent — an orchestrator key is 403", %{conn: conn} do
+      %{story: story, tenant: tenant} = claimed_via_api(conn)
+      {orch_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :orchestrator})
+
+      assert build_conn()
+             |> auth_conn(orch_key)
+             |> post(~p"/api/v1/stories/#{story.id}/renew-claim", %{"claim_epoch" => 1})
+             |> json_response(403)
+    end
+
+    test "renew-claim cross-tenant is 404", %{conn: conn} do
+      %{story: story} = claimed_via_api(conn)
+      %{raw_key: other_raw_key} = setup_story_with_agent()
+
+      assert build_conn()
+             |> auth_conn(other_raw_key)
+             |> post(~p"/api/v1/stories/#{story.id}/renew-claim", %{"claim_epoch" => 1})
+             |> json_response(404)
+    end
+
+    test "start with a stale claim_epoch is 409 stale_claim_epoch; with the current one it starts",
+         %{conn: conn} do
+      %{story: story, raw_key: raw_key} = claimed_via_api(conn)
+
+      body =
+        build_conn()
+        |> auth_conn(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/start", %{"claim_epoch" => 0})
+        |> json_response(409)
+
+      assert body["error"]["code"] == "stale_claim_epoch"
+
+      assert build_conn()
+             |> auth_conn(raw_key)
+             |> post(~p"/api/v1/stories/#{story.id}/start", %{"claim_epoch" => 1})
+             |> json_response(200)
+    end
+
+    test "start with a malformed claim_epoch is 400", %{conn: conn} do
+      %{story: story, raw_key: raw_key} = claimed_via_api(conn)
+
+      assert build_conn()
+             |> auth_conn(raw_key)
+             |> post(~p"/api/v1/stories/#{story.id}/start", %{"claim_epoch" => "1"})
+             |> json_response(400)
+    end
+
+    test "report with a stale claim_epoch is 409, and with a malformed one 400", %{conn: conn} do
+      %{story: story, reviewer_key: reviewer_key} = implementing_story_with_reviewer()
+
+      body =
+        conn
+        |> auth_conn(reviewer_key)
+        |> post(~p"/api/v1/stories/#{story.id}/report", %{"claim_epoch" => story.claim_epoch + 1})
+        |> json_response(409)
+
+      assert body["error"]["code"] == "stale_claim_epoch"
+
+      assert build_conn()
+             |> auth_conn(reviewer_key)
+             |> post(~p"/api/v1/stories/#{story.id}/report", %{"claim_epoch" => "x"})
+             |> json_response(400)
+
+      assert build_conn()
+             |> auth_conn(reviewer_key)
+             |> post(~p"/api/v1/stories/#{story.id}/report", %{"claim_epoch" => story.claim_epoch})
+             |> json_response(200)
+    end
+  end
+
   describe "role enforcement" do
     test "orchestrator role cannot use agent-only endpoints (403)", %{conn: conn} do
       tenant = fixture(:tenant)
