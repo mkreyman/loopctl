@@ -213,6 +213,18 @@ defmodule Loopctl.DataCase do
       &NoopBodyProbe.ignore/1
     end)
 
+    # #803: the merge precondition's pull-request source. The default is an ERROR on
+    # purpose, and it is the only default here that is not "production behaviour": for an
+    # outward call the fail-closed answer IS the safe default, and a test that reaches
+    # GitHub without saying so gets an escalation rather than a merge it never set up.
+    Mox.stub(Loopctl.MockPullRequestSource, :pull_request, fn _repo, _number ->
+      {:error, :not_stubbed}
+    end)
+
+    Mox.stub(Loopctl.MockPullRequestSource, :repo_files, fn _repo, _ref ->
+      {:error, :not_stubbed}
+    end)
+
     # Shape MUST match `Loopctl.HealthCheck.Default.check/0`. It notably carries NO
     # `version` key: #461 item 5 removed the app version from this response on purpose,
     # because /health is the highest-frequency unauthenticated probe and there is no

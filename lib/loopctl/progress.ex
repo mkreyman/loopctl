@@ -2819,6 +2819,52 @@ defmodule Loopctl.Progress do
     end
   end
 
+  @doc """
+  Whether a story's RECORDED custody permits an unattended merge (issue #803, design §9).
+
+  The design's rule is one sentence: *merge requires `verified_status = :verified` set by a
+  verifier dispatch with a different lineage.* This is that sentence, and it is deliberately
+  NOT a second lineage comparison — the separation half delegates to
+  `verify_recorded_separation/2`, the same L4 clause `verify` itself runs, so a change to
+  what "separate lineage" means moves both at once.
+
+  It differs from the verify gate in what it does with MISSING provenance, and only there.
+  `verify` may legitimately reach a story with no verifier dispatch, because `request-review`
+  is optional, and its caller-side lineage clause is what gates that path. A MERGE has no
+  caller to compare: it asks about a decision already recorded, so a story with no
+  implementer dispatch or no verifier dispatch has nothing to show separation WITH, and both
+  are refused rather than falling through to `verify_recorded_separation/2`'s `{:ok, story}`.
+  That fall-through is correct where a live caller is being judged and vacuous here.
+
+  `nil` is passed for the caller's agent id for the same reason: there is no caller. The
+  `assigned_agent_id` equality clauses inside the comparison are inert against `nil`, which
+  is what leaves the lineage comparison as the whole of the test.
+
+  Returns `:ok`, or `{:error, code}` where `code` is one of `:not_verified`,
+  `:missing_implementer_dispatch`, `:missing_verifier_dispatch`,
+  `:unresolvable_dispatch_lineage` (an unloadable dispatch row on either side, fail closed)
+  or `:self_verify_blocked` (the recorded verifier shares the implementer's lineage ROOT).
+  """
+  @spec merge_custody_status(Story.t()) :: :ok | {:error, atom()}
+  def merge_custody_status(%Story{} = story) do
+    cond do
+      story.verified_status != :verified ->
+        {:error, :not_verified}
+
+      is_nil(story.implementer_dispatch_id) ->
+        {:error, :missing_implementer_dispatch}
+
+      is_nil(story.verifier_dispatch_id) ->
+        {:error, :missing_verifier_dispatch}
+
+      true ->
+        case verify_recorded_separation(story, nil) do
+          {:ok, %Story{}} -> :ok
+          {:error, reason} -> {:error, reason}
+        end
+    end
+  end
+
   # CALLER separation (LCP-1 §7.5) — the same comparison report and review-complete
   # run, and the ONLY clause here that says anything about the principal actually
   # making this call: the verifier's lineage is resolved SERVER-SIDE from the

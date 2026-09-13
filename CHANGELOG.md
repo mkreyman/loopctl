@@ -6,6 +6,54 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **The merge precondition: both delivery gates run a second time, over the real pull
+  request (#803).** `POST /api/v1/stories/:id/merge-precondition` (exact role `orchestrator`
+  or `user`, human-anchored tenant) runs Gate A and Gate B over the diff that actually
+  exists rather than the triage trio's predicted touches, adds the design's hard bound of 12
+  files / 1,000 changed lines — applied ON TOP of the configured limits, so a trigger
+  document may tighten it and may not loosen it — and requires the story's
+  `verified_status` to be `verified`, set by a verifier dispatch whose lineage is separate
+  from the implementer's. Only an `allow` licenses a merge; a `refuse` has already escalated
+  the story on the `merge_gate` edge before it answers, and `already_merged` reports a merge
+  GitHub had already performed so a caller that crashed after merging adopts the sha instead
+  of merging twice.
+
+  **It fails closed.** A missing, empty or unparseable `DELIVERY_GATES_CONFIG`, an unknown
+  repository, a project with no GitHub intake source, a 404 from GitHub, a truncated file
+  list, a diff that does not parse, and a stale trigger at either the pull request's head or
+  its merge base all REFUSE. There is no failure that merges.
+
+  **A TRANSIENT forge fault answers `503 unevaluated` and transitions nothing** — transport,
+  a 5xx, a 429, and a 403 GitHub marked as a rate limit. `escalated` is human-only, so
+  escalating on one network blip would park a story until a human acted; the caller retries
+  instead, no sooner than the `Retry-After` every 503 carries. A 404, a 401 and a BARE 403
+  are configuration, not a blip, and still escalate — GitHub answers a permanent permission
+  denial with 403 too, and the rate-limit headers are what separate them.
+
+  **The retry is bounded at both ends.** Consecutive unevaluated results at one head escalate
+  the story once they pass a small limit, so no fault can retry for ever with nobody told.
+
+  **Merges the gate did not authorise are escalated, not ratified.** An `allow` is RECORDED
+  against the head it judged, and an already-merged pull request is only adopted when a
+  recorded allow names that same head; one with no allow, or an allow for a different head,
+  escalates with the sha named in the reason. A pull request whose head is not the one CI
+  ran on comes back `head_moved` and returns to `implementing` rather than merging.
+
+  **Migrations, no manual step, and both roll back cleanly:** `story_stages` gains
+  `merge_gate_unevaluated`, the consecutive-unevaluated count per head, and
+  `story_stage_events` accepts one more event name for it (the down migration removes those
+  rows before restoring the old allow-list, so a rollback works after the gate has run). And
+  `story_stages` gains `merge_gate_allowed_sha`, the head the merge gate allowed. Both are
+  cleared by every edge that clears `head_sha`. It is cleared with `head_sha` by every edge that clears it. Existing
+  rows get NULL, so an already-merged pull request in flight at deploy time escalates as
+  ungated rather than being adopted — deliberate, and it clears as soon as the loop runs the
+  gate again.
+
+  **`GITHUB_TOKEN` now gates merges as well as verification.** Unset, the calls are
+  anonymous and work for a public repository until GitHub's per-IP hourly limit bites —
+  after which every delivery-loop change escalates to a human. No new environment variable;
+  see the updated row in `deploy/FLY_SECRETS.md`.
+
 - **Runner capacity is reserved in Postgres, and a tenant's total is admission-controlled
   (#803).** `Loopctl.Runners.dispatch/3` now takes a slot on the runner in the same
   transaction that records the dispatch, and refuses `:runner_at_capacity` past the runner's

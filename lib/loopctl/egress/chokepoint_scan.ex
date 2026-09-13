@@ -74,6 +74,11 @@ defmodule Loopctl.Egress.ChokepointScan do
     "Loopctl.Verification.GitHubActions" =>
       "Reads GitHub check-run status for verification. Operator-plane, fixed vendor " <>
         "host, carries no tenant content outbound.",
+    "Loopctl.Delivery.GitHubPullRequestSource" =>
+      "Reads a pull request's state, diffstat, changed names and file tree for the #803 " <>
+        "merge precondition. Operator-plane, fixed vendor host, GET only, and the " <>
+        "repository is resolved server-side from the story's intake source — never from " <>
+        "a tenant-supplied URL. Carries no tenant content outbound.",
     "Loopctl.Secrets.FlyAdapter" =>
       "Operator-plane secret management against the Fly GraphQL API. Fixed host, not " <>
         "tenant-content egress, and never reachable from a tenant-supplied URL.",

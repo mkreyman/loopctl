@@ -156,3 +156,8 @@ Mox.defmock(Loopctl.MockStreamingExportBodyProbe,
 )
 
 Mox.defmock(Loopctl.MockClusterDnsResolver, for: Loopctl.ClusterReadiness.Resolver)
+
+# #803: the merge precondition's view of a real pull request. The DataCase default stub
+# answers `{:error, :not_stubbed}` for both callbacks, so a test that forgets to set an
+# expectation gets the fail-closed answer (an escalation) rather than a merge.
+Mox.defmock(Loopctl.MockPullRequestSource, for: Loopctl.Delivery.PullRequestSource)

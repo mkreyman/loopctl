@@ -8,6 +8,13 @@ defmodule Loopctl.Delivery.StoryStage do
     the story's is stale: the claim that drove it has been released.
   - side-effect identities — `runner_id`, `worktree_path`, `branch`, `pr_number`,
     `head_sha`, `merge_sha`, `release_id`, each written by its stage BEFORE the effect.
+  - `merge_gate_allowed_sha` — the head the merge precondition ALLOWED (#803). Not an
+    effect the loop performs but the record that one was authorised, so an already-merged
+    pull request can be told from one merged around the gate. Cleared with `head_sha`.
+  - `merge_gate_unevaluated` — `%{"head_sha" => sha, "count" => n}`, consecutive merge-gate
+    evaluations at one head that produced NO verdict because the forge was transiently
+    unavailable (#803). The gate escalates once it passes its bound, so a fault that never
+    clears cannot retry for ever with nobody told.
   - `attempts` — how many times each failure edge has been taken, keyed by edge name.
   - `escalation_reason` — why the story last escalated (required while `escalated`).
   - `lock_version` — incremented by every write, so an observer can tell two reads of the
@@ -44,6 +51,8 @@ defmodule Loopctl.Delivery.StoryStage do
     field :head_sha, :string
     field :merge_sha, :string
     field :release_id, :string
+    field :merge_gate_allowed_sha, :string
+    field :merge_gate_unevaluated, :map
     field :attempts, :map, default: %{}
     field :escalation_reason, :string
     field :lock_version, :integer, default: 0

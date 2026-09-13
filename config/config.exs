@@ -1279,6 +1279,10 @@ config :loopctl, :knowledge_importance_strength, 0.1
 # DI: WebAuthn adapter — defaults to Wax (overridden in test env)
 config :loopctl, :webauthn_adapter, Loopctl.WebAuthn.Wax
 
+# DI (#803): where the merge precondition reads a real pull request from. GitHub in every
+# environment but :test, which maps it to a Mox mock so no test makes a live call.
+config :loopctl, :delivery_pull_request_source, Loopctl.Delivery.GitHubPullRequestSource
+
 # WebAuthn relying party configuration. `rp_id` must match the host the
 # signup LiveView is served from. Overridden in dev and prod as needed.
 config :loopctl, :webauthn,

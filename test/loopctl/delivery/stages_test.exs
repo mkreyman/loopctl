@@ -348,6 +348,102 @@ defmodule Loopctl.Delivery.StagesTest do
     end
   end
 
+  describe "note_unevaluated/4" do
+    test "counts consecutive results at ONE head, and resets when the head moves" do
+      {story, _row} = at_stage(:ci)
+      opts = [claim_epoch: story.claim_epoch]
+      head = String.duplicate("a", 40)
+      moved = String.duplicate("b", 40)
+
+      assert {:ok, 1} = Stages.note_unevaluated(story.tenant_id, story.id, head, opts)
+      assert {:ok, 2} = Stages.note_unevaluated(story.tenant_id, story.id, head, opts)
+      assert {:ok, 3} = Stages.note_unevaluated(story.tenant_id, story.id, head, opts)
+
+      # A new head is new material: a story's blips at an older one must not escalate it.
+      assert {:ok, 1} = Stages.note_unevaluated(story.tenant_id, story.id, moved, opts)
+
+      row = Stages.get(story.tenant_id, story.id)
+      assert row.merge_gate_unevaluated == %{"head_sha" => moved, "count" => 1}
+    end
+
+    test "leaves an event, so a story going quiet is on the record" do
+      {story, _row} = at_stage(:ci)
+      head = String.duplicate("a", 40)
+
+      assert {:ok, 1} =
+               Stages.note_unevaluated(story.tenant_id, story.id, head,
+                 claim_epoch: story.claim_epoch,
+                 actor_label: "test"
+               )
+
+      assert [%StageEvent{event: "merge_gate_unevaluated", data: data, actor_label: "test"}] =
+               story.tenant_id
+               |> Stages.list_events(story.id)
+               |> Enum.filter(&(&1.event == "merge_gate_unevaluated"))
+
+      assert data == %{"head_sha" => head, "count" => 1}
+    end
+
+    test "clear_unevaluated/3 removes the count, and is a no-op with nothing to clear" do
+      {story, _row} = at_stage(:ci)
+      opts = [claim_epoch: story.claim_epoch]
+
+      assert {:ok, :nothing_to_clear} = Stages.clear_unevaluated(story.tenant_id, story.id, opts)
+
+      assert {:ok, 1} =
+               Stages.note_unevaluated(story.tenant_id, story.id, String.duplicate("a", 40), opts)
+
+      assert {:ok, :cleared} = Stages.clear_unevaluated(story.tenant_id, story.id, opts)
+      assert is_nil(Stages.get(story.tenant_id, story.id).merge_gate_unevaluated)
+
+      # And the next run starts over rather than resuming the cleared arithmetic.
+      assert {:ok, 1} =
+               Stages.note_unevaluated(story.tenant_id, story.id, String.duplicate("a", 40), opts)
+    end
+
+    test "an edge that clears head_sha clears the count with it" do
+      {story, _row} = at_stage(:ci)
+      opts = [claim_epoch: story.claim_epoch]
+
+      assert {:ok, 1} =
+               Stages.note_unevaluated(story.tenant_id, story.id, String.duplicate("a", 40), opts)
+
+      assert {:ok, row} =
+               Stages.advance(story.tenant_id, story.id, {:ci, :implementing, :ci_red},
+                 claim_epoch: story.claim_epoch
+               )
+
+      assert is_nil(row.merge_gate_unevaluated)
+    end
+
+    test "is refused off the ci stage — no other stage runs this gate" do
+      {story, _row} = at_stage(:implementing)
+
+      assert {:error, :wrong_stage} =
+               Stages.note_unevaluated(story.tenant_id, story.id, String.duplicate("a", 40),
+                 claim_epoch: story.claim_epoch
+               )
+    end
+
+    test "is fenced by the claim epoch like every other write here" do
+      {story, _row} = at_stage(:ci)
+
+      assert {:error, :stale_claim_epoch} =
+               Stages.note_unevaluated(story.tenant_id, story.id, String.duplicate("a", 40),
+                 claim_epoch: story.claim_epoch + 7
+               )
+    end
+
+    test "refuses a story with no stage row" do
+      story = fixture(:stage_story, %{})
+
+      assert {:error, :not_found} =
+               Stages.note_unevaluated(story.tenant_id, story.id, String.duplicate("a", 40),
+                 claim_epoch: story.claim_epoch
+               )
+    end
+  end
+
   describe "record_effect/5" do
     @values %{
       worktree_path: "/home/runner/workspace/app/.claude/worktrees/us-1",
@@ -355,7 +451,8 @@ defmodule Loopctl.Delivery.StagesTest do
       head_sha: String.duplicate("c", 40),
       pr_number: 821,
       merge_sha: String.duplicate("d", 64),
-      release_id: "v421"
+      release_id: "v421",
+      merge_gate_allowed_sha: String.duplicate("1", 40)
     }
 
     @others %{
@@ -364,7 +461,8 @@ defmodule Loopctl.Delivery.StagesTest do
       head_sha: String.duplicate("e", 40),
       pr_number: 822,
       merge_sha: String.duplicate("f", 40),
-      release_id: "v422"
+      release_id: "v422",
+      merge_gate_allowed_sha: String.duplicate("2", 40)
     }
 
     test "a replay of every outward stage finds and reuses its recorded identity" do
@@ -1081,7 +1179,14 @@ defmodule Loopctl.Delivery.StagesTest do
       assert [%Entry{payload: payload}] = as_tenant(story.tenant_id, fn -> Repo.all(Entry) end)
       assert payload["reason"] == "required check missing"
       # Which merge it retracts — the row's own merge_sha is nil by now, cleared by the edge.
-      assert payload["retracted"] == %{"merge_sha" => merge_sha, "head_sha" => @sha_a}
+      # `merge_gate_allowed_sha` is retracted alongside the head it was granted for (#803
+      # review round 1): an allow that outlived its head would authorise an unjudged one.
+      assert payload["retracted"] == %{
+               "merge_sha" => merge_sha,
+               "head_sha" => @sha_a,
+               "merge_gate_allowed_sha" => nil,
+               "merge_gate_unevaluated" => nil
+             }
 
       # And the next attempt can record its own head again.
       {:ok, _} =
