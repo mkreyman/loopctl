@@ -75,10 +75,16 @@ defmodule Loopctl.Egress.ChokepointScan do
       "Reads GitHub check-run status for verification. Operator-plane, fixed vendor " <>
         "host, carries no tenant content outbound.",
     "Loopctl.Delivery.GitHubPullRequestSource" =>
-      "Reads a pull request's state, diffstat, changed names and file tree for the #803 " <>
-        "merge precondition. Operator-plane, fixed vendor host, GET only, and the " <>
-        "repository is resolved server-side from the story's intake source — never from " <>
-        "a tenant-supplied URL. Carries no tenant content outbound.",
+      "Reads a pull request's state, diffstat, changed names, file tree and deployments " <>
+        "for the #803 merge precondition and post-deploy verification, AND (#805) WRITES " <>
+        "to the issue a story came from: it adds a loopctl:resolution-* label, posts the " <>
+        "resolution text and closes the issue. NO LONGER GET ONLY — that justification was " <>
+        "true until #805 and is corrected here rather than left to the parity test, which " <>
+        "compares module names and cannot see a verb change. Still operator-plane and a " <>
+        "fixed vendor host, and the repository is resolved server-side from the story's " <>
+        "intake source, never from a tenant-supplied URL. The writes carry NO tenant and NO " <>
+        "reporter content outbound: the comment body is one of two compile-time constants " <>
+        "in Loopctl.Delivery.Resolution, and the label is one of two constants beside them.",
     "Loopctl.Secrets.FlyAdapter" =>
       "Operator-plane secret management against the Fly GraphQL API. Fixed host, not " <>
         "tenant-content egress, and never reachable from a tenant-supplied URL.",

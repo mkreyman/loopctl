@@ -62,19 +62,49 @@ defmodule Loopctl.Intake.IssueClosures do
   alias Loopctl.Intake.Source
 
   # How many TRANSIENT attempts a closure gets before it becomes a human's problem. A blip
-  # clears in seconds; at the backoff below, six attempts spans about half an hour, which is
-  # past any rate-limit window GitHub applies and well past an outage worth waiting out.
+  # clears in seconds; at the backoff below, six attempts spans about an hour and a half of
+  # wall clock even when the forge says nothing about when to come back.
+  #
+  # An earlier version of this note claimed six attempts was "past any rate-limit window
+  # GitHub applies", and that was FALSE (#826 review, H1): the backoffs then totalled about
+  # half an hour, while GitHub's PRIMARY limit is hourly. A closure hitting a primary limit
+  # spent all six attempts inside one window and abandoned with the reporter never told. Two
+  # things fix it and both are needed — the schedule below, and `retry_after` being HONOURED
+  # rather than computed and dropped.
   @max_attempts 6
 
-  # Exponential, in seconds, indexed by the attempt just made: 1m, 2m, 4m, 8m, 16m. The list
+  # Exponential, in seconds, indexed by the attempt just made: 3m, 6m, 12m, 24m, 48m. The list
   # is one shorter than `@max_attempts` because there is no wait after the last one.
-  @backoff_seconds [60, 120, 240, 480, 960]
+  #
+  # It STARTS ABOVE THE CRON INTERVAL, and that is the other half of H1. The drainer runs
+  # every 120s, so the previous first two entries (60s and 120s) were not backoff at all —
+  # the row was due again on the very next sweep, and a struggling forge got hit at full
+  # cadence for the two attempts that matter most.
+  @backoff_seconds [180, 360, 720, 1_440, 2_880]
+
+  # The pessimistic delay `claim_attempt/2` writes BEFORE an attempt runs. See the note there:
+  # it is what stops a candidate that RAISES from sitting at the head of the oldest-first
+  # queue and being re-served on every sweep.
+  @in_flight_backoff_seconds 180
 
   @typedoc "Why a closure will never be attempted again."
   @type abandon_reason ::
           :closed_by_other
+          | :source_revoked
           | :retries_exhausted
           | {:permanent_forge_failure, term()}
+
+  # The abandon reasons an operator may RE-DRIVE, as they are stored (#826 review, finding 4).
+  #
+  # `retries_exhausted` and `permanent_forge_failure` are both reachable from a MISCONFIGURED
+  # DEPLOYMENT — a `GITHUB_TOKEN` without `issues: write` 403s every closure in the window and
+  # abandons each on its first attempt — so the operator who fixes the secret needs the
+  # backlog to be recoverable rather than dead.
+  #
+  # `closed_by_other` is deliberately NOT here, and never should be. It means a human already
+  # closed the reporter's issue; re-driving it is the duplicate close this whole module exists
+  # to prevent, and no amount of fixing a token makes it right.
+  @requeueable_prefixes ["retries_exhausted", "permanent_forge_failure"]
 
   @doc "How many transient attempts a closure gets. See the moduledoc."
   @spec max_attempts() :: pos_integer()
@@ -123,15 +153,20 @@ defmodule Loopctl.Intake.IssueClosures do
   #
   # The repository comes from the SOURCE and the issue number from the RECORD. Both are
   # captured now rather than joined at close time, so the outward act addresses the issue the
-  # verdict was actually about — a later delivery can move a record's content, and a source
-  # can be revoked, but neither may redirect a close that was already decided.
+  # verdict was actually about — a later delivery can move a record's content, but it may not
+  # redirect a close that was already decided.
   #
-  # A record whose source is gone is `:no_link`: there is nothing to address.
+  # A record whose source is gone, or REVOKED, is `:no_link`: revoking a source is a tenant
+  # disconnecting a repository, and loopctl may not keep writing to it afterwards (#826
+  # review, finding 6). Refusing here is the smaller of the two windows the review offered —
+  # no row is recorded at all, so there is nothing to drain — and `source_live?/2` below
+  # covers the other one, a source revoked AFTER the row was written.
   defp target(repo, tenant_id, record_id) do
     from(r in Record,
       join: s in Source,
       on: s.id == r.source_id and s.tenant_id == r.tenant_id,
       where: r.tenant_id == ^tenant_id and r.id == ^record_id,
+      where: is_nil(s.revoked_at),
       select: %{repo_full_name: s.repo_full_name, issue_number: r.issue_number}
     )
     |> repo.one()
@@ -139,6 +174,28 @@ defmodule Loopctl.Intake.IssueClosures do
       %{issue_number: number} = target when is_integer(number) -> {:ok, target}
       _missing -> :no_link
     end
+  end
+
+  @doc """
+  Whether the intake source a closure targets is still connected.
+
+  Read by `Loopctl.Delivery.IssueCloser` BEFORE its first forge call, and it closes the half
+  of finding 6 that `target/3` cannot: a source revoked AFTER the verdict was recorded. The
+  tenant disconnected that repository, and the write scope this feature added means "keep
+  going anyway" would label, comment on and close an issue there regardless.
+
+  `false` also for a record or source that has been deleted outright — there is nothing to
+  address, and the closer abandons rather than guessing.
+  """
+  @spec source_live?(IssueClosure.t()) :: boolean()
+  def source_live?(%IssueClosure{tenant_id: tenant_id, intake_record_id: record_id}) do
+    AdminRepo.exists?(
+      from r in Record,
+        join: s in Source,
+        on: s.id == r.source_id and s.tenant_id == r.tenant_id,
+        where: r.tenant_id == ^tenant_id and r.id == ^record_id,
+        where: is_nil(s.revoked_at)
+    )
   end
 
   defp insert(repo, tenant_id, story_id, record_id, verdict, target) do
@@ -216,7 +273,7 @@ defmodule Loopctl.Intake.IssueClosures do
   end
 
   @doc """
-  Marks an attempt as STARTED: bumps `attempts` and clears `next_attempt_at`.
+  Marks an attempt as STARTED: bumps `attempts` and schedules the NEXT one pessimistically.
 
   Taken BEFORE the first forge call of an attempt, and it is a compare-and-set on
   `:pending` — so two drainers that both read the same candidate cannot both proceed to make
@@ -225,12 +282,28 @@ defmodule Loopctl.Intake.IssueClosures do
   Bumping the counter FIRST is deliberate: a run that dies mid-attempt has still spent one,
   so `max_attempts/0` bounds crashes as well as forge faults. A counter bumped only on a
   recorded failure would let a crash loop run for ever.
+
+  **Writing a backoff here, rather than clearing one, is what stops a raising candidate from
+  wedging the whole drainer** (#826 review, finding 5). `due/1` reads oldest-first, so a row
+  whose attempt RAISES — rather than returning an error anything can record — would otherwise
+  be first in the candidate set on every subsequent sweep, and one issue could stall every
+  other tenant's closures fleet-wide. Scheduled forward before the attempt runs, a crash
+  behaves like a transient failure: the row waits, the batch moves on, and the attempt
+  counter still bounds it.
+
+  Every path that reaches a verdict overwrites this: `mark_closed/2` clears it,
+  `mark_transient_failure/4` replaces it with the real delay.
   """
   @spec claim_attempt(Ecto.UUID.t(), Ecto.UUID.t()) ::
           {:ok, IssueClosure.t()} | {:error, :not_pending}
   def claim_attempt(tenant_id, id) do
+    now = DateTime.utc_now()
+
     update_pending(tenant_id, id,
-      set: [next_attempt_at: nil, updated_at: DateTime.utc_now()],
+      set: [
+        next_attempt_at: DateTime.add(now, @in_flight_backoff_seconds, :second),
+        updated_at: now
+      ],
       inc: [attempts: 1]
     )
   end
@@ -274,23 +347,51 @@ defmodule Loopctl.Intake.IssueClosures do
   Returns `{:ok, row}` with the row's new state either way — `:pending` while attempts
   remain, `:abandoned` with `retries_exhausted` once they do not — so a caller never has to
   count them itself.
+
+  ## `retry_after` is HONOURED, not merely reported (#826 review, H1)
+
+  `retry_after` is the delay the FORGE asked for, in seconds, or `nil` when it said nothing.
+  The wait is `max(backoff, retry_after)`, and the `max` is load-bearing in both directions:
+  the forge's number wins when it is longer, and the local schedule wins when the forge asks
+  for a token gesture.
+
+  It was computed and thrown away before, and that lost the case it was computed FOR. GitHub's
+  primary rate limit resets on an HOURLY boundary and says so on `x-ratelimit-reset`, which
+  `GitHubPullRequestSource` already parses into this value — so a closure that hit one spent
+  every attempt inside a single window it was told the end of, and abandoned with the reporter
+  never told what happened to her issue.
   """
-  @spec mark_transient_failure(Ecto.UUID.t(), IssueClosure.t(), term()) ::
+  @spec mark_transient_failure(Ecto.UUID.t(), IssueClosure.t(), term(), pos_integer() | nil) ::
           {:ok, IssueClosure.t()} | {:error, :not_pending}
-  def mark_transient_failure(tenant_id, %IssueClosure{} = closure, reason) do
+  def mark_transient_failure(tenant_id, %IssueClosure{} = closure, reason, retry_after \\ nil) do
     if closure.attempts >= @max_attempts do
       mark_abandoned(tenant_id, closure.id, :retries_exhausted, reason)
     else
       now = DateTime.utc_now()
+      wait = wait_seconds(closure.attempts, retry_after)
 
       update_pending(tenant_id, closure.id,
         set: [
-          next_attempt_at: DateTime.add(now, backoff(closure.attempts), :second),
+          next_attempt_at: DateTime.add(now, wait, :second),
           last_error: error_text(reason),
           updated_at: now
         ]
       )
     end
+  end
+
+  @doc """
+  The seconds a transient failure waits: the local backoff, or the forge's `retry_after` when
+  that is longer.
+
+  Public because it is the one number H1 turned on, and a bound that cannot be asserted
+  directly is a bound nobody can prove still holds.
+  """
+  @spec wait_seconds(non_neg_integer(), pos_integer() | nil) :: pos_integer()
+  def wait_seconds(attempts_made, retry_after) do
+    backoff = backoff(attempts_made)
+
+    if is_integer(retry_after) and retry_after > backoff, do: retry_after, else: backoff
   end
 
   @doc """
@@ -315,6 +416,71 @@ defmodule Loopctl.Intake.IssueClosures do
       ]
     )
   end
+
+  @doc """
+  Moves ABANDONED closures back to `:pending` so the drainer picks them up again.
+
+  The operator's way back from a deploy-time misconfiguration (#826 review, finding 4). The
+  likeliest cause of a mass abandonment is a `GITHUB_TOKEN` without `issues: write`: every
+  closure in the window 403s, which is permanent and correctly abandons on the first attempt —
+  and before this existed, nothing in `lib/` could move a non-pending row, so fixing the
+  secret left the whole backlog dead with no reporter ever told.
+
+  Called from a remote console after the cause is fixed:
+
+      Loopctl.Intake.IssueClosures.requeue_abandoned()          # fleet-wide
+      Loopctl.Intake.IssueClosures.requeue_abandoned(tenant_id: id)
+      Loopctl.Intake.IssueClosures.requeue_abandoned(id: closure_id)
+
+  Returns `{:ok, count}`.
+
+  **`closed_by_other` is never requeued**, whatever is passed: a human already closed that
+  reporter's issue, and re-driving it is exactly the duplicate close the module exists to
+  prevent. Requeueing is otherwise SAFE to run speculatively — a row whose issue loopctl did
+  in fact close is caught by the closer's read of the issue's live state and recorded closed
+  without a second outward call.
+
+  `attempts` is reset, because the operator fixing the cause is what makes a fresh budget
+  meaningful; a requeue that inherited an exhausted counter would abandon again immediately.
+  """
+  @spec requeue_abandoned(keyword()) :: {:ok, non_neg_integer()}
+  def requeue_abandoned(opts \\ []) do
+    now = DateTime.utc_now()
+
+    query =
+      from c in IssueClosure,
+        where: c.status == :abandoned,
+        where:
+          fragment(
+            "EXISTS (SELECT 1 FROM unnest(?::text[]) p WHERE ? LIKE p || '%')",
+            ^@requeueable_prefixes,
+            c.abandoned_reason
+          )
+
+    query =
+      Enum.reduce(opts, query, fn
+        {:tenant_id, tenant_id}, q -> where(q, [c], c.tenant_id == ^tenant_id)
+        {:id, id}, q -> where(q, [c], c.id == ^id)
+        _other, q -> q
+      end)
+
+    {count, _} =
+      AdminRepo.update_all(query,
+        set: [
+          status: :pending,
+          abandoned_reason: nil,
+          attempts: 0,
+          next_attempt_at: nil,
+          updated_at: now
+        ]
+      )
+
+    {:ok, count}
+  end
+
+  @doc "The stored `abandoned_reason` prefixes `requeue_abandoned/1` will re-drive."
+  @spec requeueable_reasons() :: [String.t()]
+  def requeueable_reasons, do: @requeueable_prefixes
 
   # -- writes ------------------------------------------------------------------------------
 
@@ -345,14 +511,36 @@ defmodule Loopctl.Intake.IssueClosures do
   end
 
   defp abandon_text(:closed_by_other), do: "closed_by_other"
+  defp abandon_text(:source_revoked), do: "source_revoked"
   defp abandon_text(:retries_exhausted), do: "retries_exhausted"
 
   defp abandon_text({:permanent_forge_failure, reason}),
     do: "permanent_forge_failure: #{error_text(reason)}"
 
-  # A forge reason is REMOTE DATA. Only its inspected form, bounded, reaches a stored column
-  # and the operator log — the CHECK caps it at 2000 characters, and a write that the CHECK
-  # rejects would roll back the one record that says this close must not be retried.
+  # A forge reason is REMOTE DATA, and this is the ONE column built from an unbounded amount
+  # of it. Only its inspected form, bounded, reaches the row.
+  #
+  # BOUNDED IN CODE POINTS, because that is what the `intake_issue_closures_text_bounds` CHECK
+  # counts (`char_length`). `String.slice/3` counts GRAPHEMES, and a grapheme can be several
+  # code points — so a reason carrying emoji or combining marks passed the slice at 1,900
+  # graphemes and arrived at Postgres well over 2,000 code points (#826 review, finding 5).
+  # The CHECK then raised INSIDE `mark_abandoned/4`, which is precisely the write that says
+  # "never retry this": the row stayed `:pending`, `due/1` reads oldest-first, and one issue
+  # with a decorated label could abort every subsequent sweep for every tenant.
+  #
+  # The blast radius is fixed in three places and all three are wanted: this bound, the
+  # pessimistic schedule in `claim_attempt/2` so a raise cannot hold the head of the queue,
+  # and the callers no longer echoing RAW LABEL NAMES into a reason at all.
+  @error_text_budget 1_900
+
   defp error_text(nil), do: nil
-  defp error_text(reason), do: reason |> inspect() |> String.slice(0, 1_900)
+
+  defp error_text(reason) do
+    text = inspect(reason)
+    chars = String.to_charlist(text)
+
+    if length(chars) > @error_text_budget,
+      do: chars |> Enum.take(@error_text_budget) |> List.to_string(),
+      else: text
+  end
 end

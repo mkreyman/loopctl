@@ -15,9 +15,7 @@ defmodule Loopctl.Workers.IntakeIssueCloseWorkerTest do
   setup :verify_on_exit!
 
   setup do
-    tenant = fixture(:tenant)
-    record = fixture(:intake_record, %{tenant_id: tenant.id, repo: AdminRepo})
-    %{tenant: tenant, record: record}
+    %{tenant: fixture(:tenant)}
   end
 
   test "closes a due closure end to end", ctx do
@@ -86,7 +84,7 @@ defmodule Loopctl.Workers.IntakeIssueCloseWorkerTest do
       fixture(:issue_closure, %{
         tenant_id: ctx.tenant.id,
         story_id: fixture(:story, %{tenant_id: ctx.tenant.id}).id,
-        intake_record: ctx.record,
+        intake_record: fixture(:intake_record, %{tenant_id: ctx.tenant.id, repo: AdminRepo}),
         next_attempt_at: DateTime.add(DateTime.utc_now(), 3600, :second)
       })
 
@@ -106,6 +104,44 @@ defmodule Loopctl.Workers.IntakeIssueCloseWorkerTest do
              AdminRepo.get(IssueClosure, closure.id)
   end
 
+  test "one candidate that RAISES does not kill the run", ctx do
+    raiser = closure(ctx, :shipped)
+    survivor = closure(ctx, :shipped)
+
+    # `due/1` reads oldest-first, so the raiser is first. An exception propagating out of
+    # `perform/1` would skip every remaining candidate, burn an Oban attempt, and — since the
+    # raiser stays at the head — do it again on every sweep, stalling closures fleet-wide.
+    parent = self()
+
+    stub(MockPullRequestSource, :issue, fn _repo, number ->
+      if number == raiser.issue_number do
+        raise "the forge adapter blew up"
+      else
+        send(parent, {:reached, number})
+        {:ok, %{state: "open", labels: []}}
+      end
+    end)
+
+    stub(MockPullRequestSource, :label_issue, fn _r, _n, _l -> :ok end)
+    stub(MockPullRequestSource, :comment_issue, fn _r, _n, _b -> :ok end)
+    stub(MockPullRequestSource, :close_issue, fn _r, _n, _s -> :ok end)
+
+    assert :ok = IntakeIssueCloseWorker.perform(%Oban.Job{args: %{}})
+
+    # The batch continued and the survivor closed.
+    assert_received {:reached, _}
+    assert %IssueClosure{status: :closed} = AdminRepo.get(IssueClosure, survivor.id)
+
+    # And the raiser is not left at the head of the queue: `claim_attempt/2` scheduled it
+    # forward before anything outward ran, so a crash behaves like a transient failure and is
+    # still bounded by the attempt counter.
+    raised = AdminRepo.get(IssueClosure, raiser.id)
+    assert raised.status == :pending
+    assert raised.attempts == 1
+    assert %DateTime{} = raised.next_attempt_at
+    refute raised.id in Enum.map(IssueClosures.due(50), & &1.id)
+  end
+
   test "the worker is scheduled on the crontab" do
     entries =
       Loopctl.ObanConfig.plugins() |> Keyword.get(Oban.Plugins.Cron) |> Keyword.get(:crontab)
@@ -117,11 +153,14 @@ defmodule Loopctl.Workers.IntakeIssueCloseWorkerTest do
            end)
   end
 
+  # A DISTINCT intake record per closure. `intake_issue_closures_record_uidx` allows exactly
+  # one closure per record (#826 review, finding 3), so a test that needs two candidates needs
+  # two records — which is also what production looks like.
   defp closure(ctx, verdict) do
     fixture(:issue_closure, %{
       tenant_id: ctx.tenant.id,
       story_id: fixture(:story, %{tenant_id: ctx.tenant.id}).id,
-      intake_record: ctx.record,
+      intake_record: fixture(:intake_record, %{tenant_id: ctx.tenant.id, repo: AdminRepo}),
       verdict: verdict
     })
   end

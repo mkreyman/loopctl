@@ -8,6 +8,10 @@ defmodule Loopctl.Delivery.IssueCloser do
 
   ## What it does, in order, and why that order
 
+  0. **Checks the intake source is still connected.** A revoked source is a tenant
+     disconnecting that repository; loopctl abandons with `source_revoked` rather than writing
+     to it (#826 review, finding 6). `IssueClosures.record_in/5` covers a source revoked before
+     the verdict; this covers one revoked after it.
   1. **READS the issue.** Closed already?
      - carrying one of `Loopctl.Delivery.Resolution.labels/0` — loopctl closed it. Record
        `:closed` and stop. This is what makes a replay a no-op even when the crash landed
@@ -15,7 +19,10 @@ defmodule Loopctl.Delivery.IssueCloser do
      - carrying none — a HUMAN closed it. `:abandoned` with `closed_by_other`, never retried.
        Re-closing an issue somebody already resolved would fire the reporting system's
        webhook and email the reporter about work she has already been told about.
-  2. **ADDS the resolution label**, unless already recorded.
+  2. **ADDS the resolution label**, unless the issue's LIVE label list already carries it. Not
+     unless our own `labelled_at` marker is set — a maintainer can remove the label between
+     attempts, and trusting the marker there closes the issue unlabelled, which is precisely
+     the default-text failure this feature exists to prevent (#826 review, finding 2).
   3. **POSTS the resolution text**, unless already recorded.
   4. **CLOSES the issue**, with `state_reason` `completed` for a shipped fix and
      `not_planned` for a report nothing was built for.
@@ -50,9 +57,17 @@ defmodule Loopctl.Delivery.IssueCloser do
   the first occurrence, because a 404, a 401, or a 403 whose headers do not say "rate limit"
   is the forge's final answer and retrying it is a loop.
 
+  **The forge's `retry_after` decides the wait when it is longer than the local backoff.** A
+  GitHub PRIMARY rate limit resets on an hourly boundary and says so; scheduling from the
+  backoff alone spent every attempt inside one window and abandoned a closure the forge had
+  already told us when to retry.
+
   Even the transient path is bounded: `IssueClosures.max_attempts/0`. A fault that has not
   cleared by then is a token or an outage, and an operator reading `intake_issue_closures` for
-  `abandoned_reason = 'retries_exhausted'` is how it surfaces.
+  `abandoned_reason = 'retries_exhausted'` is how it surfaces — and
+  `IssueClosures.requeue_abandoned/1` is how they re-drive the backlog once the cause is
+  fixed, which matters because a token missing `issues: write` abandons every closure in the
+  window on its first attempt.
 
   ## Where it runs, and how it resumes
 
@@ -107,7 +122,21 @@ defmodule Loopctl.Delivery.IssueCloser do
   end
 
   # The read that makes a replay safe, and the three writes it guards.
+  #
+  # The SOURCE check comes first and costs one indexed row: revoking an intake source is a
+  # tenant disconnecting a repository, and the write scope this feature added means loopctl
+  # must stop labelling, commenting on and closing issues there (#826 review, finding 6).
+  # `IssueClosures.record_in/5` refuses at verdict time, which covers a source already revoked
+  # then; this covers one revoked between the verdict and the sweep.
   defp attempt(%IssueClosure{} = closure) do
+    if IssueClosures.source_live?(closure) do
+      read_issue(closure)
+    else
+      abandon(closure, :source_revoked, nil)
+    end
+  end
+
+  defp read_issue(%IssueClosure{} = closure) do
     case source().issue(closure.repo_full_name, closure.issue_number) do
       {:ok, issue} -> proceed(closure, issue)
       {:error, reason} -> fault(closure, reason)
@@ -124,15 +153,18 @@ defmodule Loopctl.Delivery.IssueCloser do
   # closed with loopctl's resolution on it.
   defp proceed(%IssueClosure{} = closure, %{state: "closed", labels: labels}) do
     case Resolution.for_labels(labels) do
+      # LABEL COUNT, never the label NAMES. A label name is unbounded remote data, and this
+      # reason is stored on a length-CHECKed column — echoing the names is how a decorated
+      # label could make the abandon write itself fail (#826 review, finding 5).
       %Resolution{} -> record_closed(closure, :already_closed_by_loopctl)
-      nil -> abandon(closure, :closed_by_other, {:issue_closed_without_loopctl_label, labels})
+      nil -> abandon(closure, :closed_by_other, {:no_loopctl_label, length(labels)})
     end
   end
 
-  defp proceed(%IssueClosure{} = closure, %{state: _open}) do
+  defp proceed(%IssueClosure{} = closure, %{state: _open, labels: live_labels}) do
     resolution = IssueClosure.resolution(closure)
 
-    with {:ok, closure} <- apply_label(closure, resolution),
+    with {:ok, closure} <- apply_label(closure, resolution, live_labels),
          {:ok, closure} <- apply_comment(closure, resolution) do
       apply_close(closure, resolution)
     else
@@ -141,16 +173,30 @@ defmodule Loopctl.Delivery.IssueCloser do
     end
   end
 
-  # STEP 2. Additive at the forge and idempotent, so the marker is an optimisation rather than
-  # the safety property — but it also means a run that already labelled and then failed at the
-  # comment does not spend a call re-labelling.
-  defp apply_label(%IssueClosure{labelled_at: %DateTime{}} = closure, _resolution),
-    do: {:ok, closure}
-
-  defp apply_label(%IssueClosure{} = closure, %Resolution{label: label}) do
-    case source().label_issue(closure.repo_full_name, closure.issue_number, label) do
-      :ok -> IssueClosures.mark_labelled(closure.tenant_id, closure.id)
-      {:error, reason} -> {:fault, reason}
+  # STEP 2, GATED ON THE ISSUE'S LIVE LABELS RATHER THAN ON OUR OWN MARKER (#826 review,
+  # finding 2).
+  #
+  # `labelled_at` records that WE put the label on; it does not say the label is still there.
+  # A maintainer can remove it between attempts, and trusting the marker then produced the one
+  # outcome this whole mechanism exists to prevent: attempt 1 labels and comments, the close
+  # 502s, the label is removed, attempt 2 skips re-labelling and closes — and the reporting
+  # system, finding no loopctl label on the close, sends its default text and tells the
+  # reporter a fix shipped for something nobody built.
+  #
+  # The corrective data costs nothing: the closer has just READ the issue for its replay
+  # check, so the live label list is already in hand. `labelled_at` stays on the row as the
+  # record of when loopctl first applied it, and is no longer consulted as a gate.
+  #
+  # Re-applying a label that IS present would be harmless at the forge — the endpoint is
+  # additive — so this test is about spending a call, not about safety. Its absence is not.
+  defp apply_label(%IssueClosure{} = closure, %Resolution{label: label}, live_labels) do
+    if label in live_labels do
+      {:ok, closure}
+    else
+      case source().label_issue(closure.repo_full_name, closure.issue_number, label) do
+        :ok -> IssueClosures.mark_labelled(closure.tenant_id, closure.id)
+        {:error, reason} -> {:fault, reason}
+      end
     end
   end
 
@@ -225,8 +271,12 @@ defmodule Loopctl.Delivery.IssueCloser do
     end
   end
 
+  # `retry_after` is PASSED THROUGH, not merely returned to the worker (#826 review, H1). It
+  # is the forge's own statement of when its window reopens — for a PRIMARY rate limit that is
+  # up to an hour out — and scheduling from the local backoff alone spent every attempt inside
+  # one window the forge had already told us the end of.
   defp defer(%IssueClosure{} = closure, reason, retry_after) do
-    case IssueClosures.mark_transient_failure(closure.tenant_id, closure, reason) do
+    case IssueClosures.mark_transient_failure(closure.tenant_id, closure, reason, retry_after) do
       # The bound converted it: the row is abandoned, and this is the one path that reaches
       # `:abandoned` from a transient fault.
       {:ok, %IssueClosure{status: :abandoned}} ->

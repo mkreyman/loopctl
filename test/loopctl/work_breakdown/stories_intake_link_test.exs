@@ -107,6 +107,58 @@ defmodule Loopctl.WorkBreakdown.StoriesIntakeLinkTest do
     assert updated.title == "renamed"
   end
 
+  test "at most ONE story per intake record", ctx do
+    assert {:ok, _first} =
+             Stories.create_story(ctx.tenant.id, attrs(ctx, "2.1"),
+               intake_record_id: ctx.record.id
+             )
+
+    # Two stories from one reported issue means two closures aimed at one issue, and then
+    # whichever verdict lands first decides what the reporter is told — a rejected sibling
+    # closing her issue with "nothing has been deployed" while the real fix is still being
+    # implemented. Design §4's triage contract emits one story per verdict, so this is an
+    # invariant rather than a restriction.
+    assert {:error, :intake_record_already_linked} =
+             Stories.create_story(ctx.tenant.id, attrs(ctx, "2.2"),
+               intake_record_id: ctx.record.id
+             )
+
+    # The refusal is the DATABASE's, and the second story does not exist.
+    assert {:ok, %{total: 1}} = Stories.list_stories(ctx.tenant.id, ctx.epic.id)
+  end
+
+  test "the one-story rule does not constrain UNLINKED stories", ctx do
+    # The index is partial on `intake_record_id IS NOT NULL`, so the ordinary case — many
+    # authored stories, none from an issue — is untouched.
+    for number <- ["3.1", "3.2", "3.3"] do
+      assert {:ok, %{intake_record_id: nil}} =
+               Stories.create_story(ctx.tenant.id, attrs(ctx, number))
+    end
+
+    assert {:ok, %{total: 3}} = Stories.list_stories(ctx.tenant.id, ctx.epic.id)
+  end
+
+  test "two tenants may each link a story to their OWN record of the same issue", ctx do
+    other = fixture(:tenant)
+    other_project = fixture(:project, %{tenant_id: other.id})
+    other_epic = fixture(:epic, %{tenant_id: other.id, project_id: other_project.id})
+    other_record = fixture(:intake_record, %{tenant_id: other.id, repo: AdminRepo})
+
+    assert {:ok, _} =
+             Stories.create_story(ctx.tenant.id, attrs(ctx, "4.1"),
+               intake_record_id: ctx.record.id
+             )
+
+    # The index is keyed on (tenant_id, intake_record_id), so it is not a cross-tenant
+    # bottleneck.
+    assert {:ok, _} =
+             Stories.create_story(
+               other.id,
+               %{epic_id: other_epic.id, number: "4.1", title: "theirs"},
+               intake_record_id: other_record.id
+             )
+  end
+
   test "neither changeset casts the link", _ctx do
     for changeset <- [
           Story.create_changeset(%Story{}, %{

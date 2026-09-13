@@ -48,16 +48,31 @@ defmodule Loopctl.WorkBreakdown.Stories do
   That check is the readable error in front of the `stories_intake_record_fkey` composite
   foreign key, which is what actually makes a cross-tenant link impossible.
 
+  **At most one story per record**, enforced by `stories_intake_record_uidx` and surfaced as
+  `{:error, :intake_record_already_linked}`. Splitting one reported issue across two stories
+  would give the reporter two closures aimed at one issue, and then whichever verdict landed
+  first would decide what she is told — a rejected sibling closing her issue with "nothing has
+  been deployed" while the real fix is still being implemented. Design §4's triage contract
+  emits ONE story per verdict, so this is an invariant rather than a restriction; if splitting
+  is ever wanted, this error is what forces the verdict-arbitration question to be answered
+  deliberately.
+
   ## Returns
 
   - `{:ok, %Story{}}` on success
   - `{:error, changeset}` on validation failure
   - `{:error, :epic_not_found}` if the epic doesn't exist
   - `{:error, :intake_record_not_found}` if `:intake_record_id` names no record of this tenant
+  - `{:error, :intake_record_already_linked}` if another story of this tenant already came
+    from that record
   """
   @spec create_story(Ecto.UUID.t(), map(), keyword()) ::
           {:ok, Story.t()}
-          | {:error, Ecto.Changeset.t() | :epic_not_found | :intake_record_not_found}
+          | {:error,
+             Ecto.Changeset.t()
+             | :epic_not_found
+             | :intake_record_not_found
+             | :intake_record_already_linked}
   def create_story(tenant_id, attrs, opts \\ []) do
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
@@ -73,6 +88,13 @@ defmodule Loopctl.WorkBreakdown.Stories do
           intake_record_id: intake_record_id
         }
         |> Story.create_changeset(attrs)
+        # Maps `stories_intake_record_uidx` to a changeset error rather than a raise, so a
+        # second story from one reported issue is a refusal a caller can read. The INDEX is
+        # the enforcement; this is its message.
+        |> Ecto.Changeset.unique_constraint(:intake_record_id,
+          name: :stories_intake_record_uidx,
+          message: "already has a story"
+        )
 
       multi =
         Multi.new()
@@ -103,9 +125,18 @@ defmodule Loopctl.WorkBreakdown.Stories do
           {:ok, story}
 
         {:error, :story, changeset, _changes} ->
-          {:error, changeset}
+          intake_conflict_or_changeset(changeset)
       end
     end
+  end
+
+  # A second story from one intake record gets its OWN error atom rather than a changeset, so
+  # a caller can tell "this issue already has a story" from an ordinary validation failure
+  # without reading error keywords. Every other changeset failure is unchanged.
+  defp intake_conflict_or_changeset(%Ecto.Changeset{errors: errors} = changeset) do
+    if Enum.any?(errors, &match?({:intake_record_id, {_msg, [constraint: :unique] ++ _}}, &1)),
+      do: {:error, :intake_record_already_linked},
+      else: {:error, changeset}
   end
 
   @doc """

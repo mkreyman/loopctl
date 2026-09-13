@@ -6,6 +6,8 @@ defmodule Loopctl.Delivery.IssueCloserTest do
 
   use Loopctl.DataCase, async: true
 
+  import Ecto.Query
+
   alias Loopctl.AdminRepo
   alias Loopctl.Delivery.IssueCloser
   alias Loopctl.Delivery.Resolution
@@ -206,6 +208,30 @@ defmodule Loopctl.Delivery.IssueCloserTest do
       assert row.closed_at == nil
     end
 
+    test "PATHOLOGICAL label names do not stop the abandon from being recorded", ctx do
+      closure = closure(ctx, :shipped)
+
+      # A label name is unbounded REMOTE data, and `abandoned_reason`/`last_error` are
+      # length-CHECKed columns. Echoing the names into the reason let a decorated label make
+      # the abandon write itself raise — the one write that says "never retry this" — so the
+      # row stayed pending at the head of an oldest-first queue and stalled the drainer for
+      # every tenant. The reason carries the label COUNT instead.
+      labels = for _n <- 1..200, do: String.duplicate("🇺🇸", 200)
+
+      expect(MockPullRequestSource, :issue, fn _repo, _number ->
+        {:ok, %{state: "closed", labels: labels}}
+      end)
+
+      assert {:abandoned, nil} = IssueCloser.close(closure)
+
+      row = reload(ctx)
+      assert row.status == :abandoned
+      assert row.abandoned_reason == "closed_by_other"
+
+      # And nothing of the label TEXT reached the row.
+      refute row.last_error =~ "🇺🇸"
+    end
+
     test "a 404 is abandoned on the first attempt and never retried", ctx do
       closure = closure(ctx, :shipped)
 
@@ -222,6 +248,26 @@ defmodule Loopctl.Delivery.IssueCloserTest do
 
       # And it is out of the drainer's candidate set for good.
       refute row.id in Enum.map(IssueClosures.due(50), & &1.id)
+    end
+
+    test "a REVOKED intake source stops every write, before the issue is even read", ctx do
+      closure = closure(ctx, :shipped)
+
+      # The tenant disconnected the repository. No `issue` expectation is set, so ANY forge
+      # call — including the read — fails this test: with the write scope this feature added,
+      # loopctl must not touch a repo a tenant has disconnected.
+      {1, _} =
+        AdminRepo.update_all(
+          from(s in Loopctl.Intake.Source, where: s.id == ^ctx.record.source_id),
+          set: [revoked_at: DateTime.utc_now()]
+        )
+
+      assert {:abandoned, nil} = IssueCloser.close(closure)
+
+      row = reload(ctx)
+      assert row.status == :abandoned
+      assert row.abandoned_reason == "source_revoked"
+      assert row.closed_at == nil
     end
 
     test "a 403 the headers do not call a rate limit is permanent", ctx do
@@ -268,7 +314,64 @@ defmodule Loopctl.Delivery.IssueCloserTest do
       assert %IssueClosure{status: :pending} = reload(ctx)
     end
 
-    test "a step that already succeeded is not repeated on the retry", ctx do
+    test "the forge's retry_after is HONOURED, not just reported", ctx do
+      closure = closure(ctx, :shipped)
+
+      # A PRIMARY rate limit: GitHub's hourly window, and it says when it reopens. The local
+      # backoff for attempt 1 is minutes; scheduling from that alone spent every attempt
+      # inside one window the forge had already told us the end of, and abandoned a closure
+      # with the reporter never notified.
+      hour = 3_600
+
+      expect(MockPullRequestSource, :issue, fn _repo, _number ->
+        {:error, {:github_rate_limited, 403, hour}}
+      end)
+
+      before = DateTime.utc_now()
+      assert {:deferred, ^hour} = IssueCloser.close(closure)
+
+      row = reload(ctx)
+      waited = DateTime.diff(row.next_attempt_at, before, :second)
+
+      assert waited >= hour - 5,
+             "expected the wait to honour the forge's #{hour}s, got #{waited}s"
+    end
+
+    test "a retry_after SHORTER than the local backoff does not shorten the wait", ctx do
+      closure = closure(ctx, :shipped)
+
+      # `max`, in both directions: the forge's number wins when it is longer, and the local
+      # schedule wins when the forge asks for a token gesture that would hammer it.
+      expect(MockPullRequestSource, :issue, fn _repo, _number ->
+        {:error, {:github_rate_limited, 403, 1}}
+      end)
+
+      before = DateTime.utc_now()
+      assert {:deferred, 1} = IssueCloser.close(closure)
+
+      waited = DateTime.diff(reload(ctx).next_attempt_at, before, :second)
+      assert waited >= IssueClosures.wait_seconds(1, nil) - 5
+    end
+
+    test "the first backoff is longer than the drainer's cron interval", _ctx do
+      # A backoff at or under the interval is not backoff: the row is due again on the very
+      # next sweep, and a struggling forge is hit at full cadence for the attempts that
+      # matter most.
+      interval = 120
+
+      assert IssueClosures.wait_seconds(1, nil) > interval
+
+      # And the whole schedule exceeds GitHub's hourly primary window even when the forge
+      # says nothing, which is the claim the moduledoc now makes.
+      total =
+        Enum.reduce(1..(IssueClosures.max_attempts() - 1), 0, fn n, acc ->
+          acc + IssueClosures.wait_seconds(n, nil)
+        end)
+
+      assert total > 3_600, "the whole retry schedule spans #{total}s, inside an hourly window"
+    end
+
+    test "the comment is not repeated on the retry", ctx do
       closure = closure(ctx, :shipped)
 
       # Attempt 1: label and comment land, the close does not.
@@ -286,13 +389,52 @@ defmodule Loopctl.Delivery.IssueCloserTest do
       assert %DateTime{} = after_first.labelled_at
       assert %DateTime{} = after_first.commented_at
 
-      # Attempt 2: ONE issue read and ONE close. No second label and — the one that matters —
-      # NO SECOND COMMENT on the reporter's ticket. `expect/3` with no label_issue or
-      # comment_issue expectation means a call to either fails this test.
-      expect_open_issue()
+      # Attempt 2, with the label STILL ON the issue: one read, one close, and — the one that
+      # matters — NO SECOND COMMENT on the reporter's ticket. No `comment_issue` expectation
+      # is set, so a call to it fails this test.
+      expect_open_issue(labels: ["bug", @shipped_label])
       expect(MockPullRequestSource, :close_issue, fn _r, _n, _s -> :ok end)
 
       assert {:closed, nil} = IssueCloser.close(%{after_first | next_attempt_at: nil})
+      assert %IssueClosure{status: :closed} = reload(ctx)
+    end
+
+    test "the label is RE-APPLIED when a maintainer removed it between attempts", ctx do
+      closure = closure(ctx, :shipped)
+
+      # Attempt 1: label and comment land, the close 502s.
+      expect_open_issue()
+      expect(MockPullRequestSource, :label_issue, fn _r, _n, _l -> :ok end)
+      expect(MockPullRequestSource, :comment_issue, fn _r, _n, _b -> :ok end)
+
+      expect(MockPullRequestSource, :close_issue, fn _r, _n, _s ->
+        {:error, {:github_api_error, 502}}
+      end)
+
+      assert {:deferred, nil} = IssueCloser.close(closure)
+      assert %DateTime{} = reload(ctx).labelled_at
+
+      # A maintainer removes the loopctl label. The MARKER still says we applied it, and
+      # trusting the marker here is what closed the issue unlabelled — at which point the
+      # reporting system falls back to its default text and tells the reporter a fix shipped.
+      # So the live list decides, and the label goes back on.
+      parent = self()
+      expect_open_issue(labels: ["bug"])
+
+      expect(MockPullRequestSource, :label_issue, fn _r, _n, label ->
+        send(parent, {:relabelled, label})
+        :ok
+      end)
+
+      expect(MockPullRequestSource, :close_issue, fn _r, _n, _s ->
+        send(parent, :closed)
+        :ok
+      end)
+
+      assert {:closed, nil} = IssueCloser.close(%{reload(ctx) | next_attempt_at: nil})
+
+      assert_received {:relabelled, @shipped_label}
+      assert_received :closed
       assert %IssueClosure{status: :closed} = reload(ctx)
     end
 
@@ -341,9 +483,11 @@ defmodule Loopctl.Delivery.IssueCloserTest do
     })
   end
 
-  defp expect_open_issue do
+  defp expect_open_issue(opts \\ []) do
+    labels = Keyword.get(opts, :labels, ["bug"])
+
     expect(MockPullRequestSource, :issue, fn _repo, _number ->
-      {:ok, %{state: "open", labels: ["bug"]}}
+      {:ok, %{state: "open", labels: labels}}
     end)
   end
 

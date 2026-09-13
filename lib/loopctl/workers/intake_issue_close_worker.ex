@@ -129,10 +129,41 @@ defmodule Loopctl.Workers.IntakeIssueCloseWorker do
   # `reduce_while` rather than `map`: a rate-limited forge is a reason to stop asking, not a
   # reason to ask nineteen more times.
   defp after_candidate(closure, acc) do
-    {outcome, retry_after} = IssueCloser.close(closure)
+    {outcome, retry_after} = attempt(closure)
     acc = [{closure, outcome} | acc]
 
     if is_integer(retry_after), do: {:halt, acc}, else: {:cont, acc}
+  end
+
+  # ONE CANDIDATE MAY NOT KILL THE RUN (#826 review, finding 5).
+  #
+  # An exception here propagates out of `perform/1`, so every remaining candidate in the batch
+  # is skipped and an Oban attempt is burned — and since `due/1` reads oldest-first, a row that
+  # raises reliably sits at the head of the next batch too. That is a fleet-wide stall caused
+  # by one issue, across every tenant.
+  #
+  # The specific way in was a length-CHECK violation inside the very write that records "never
+  # retry this", and that root cause is fixed at the bound in `Loopctl.Intake.IssueClosures`.
+  # This is the containment: whatever else can raise, it costs one candidate.
+  #
+  # It is SAFE to carry on because `claim_attempt/2` already committed before anything outward
+  # ran — the attempt is counted, and the row is scheduled forward — so a raising row waits its
+  # backoff like a transient failure and is still bounded by `max_attempts/0` rather than
+  # retrying for ever. Nothing is swallowed silently: it is logged at ERROR with the row's
+  # identity, which is what an operator greps for.
+  defp attempt(closure) do
+    IssueCloser.close(closure)
+  rescue
+    error ->
+      Logger.error(
+        "IntakeIssueCloseWorker: candidate raised, continuing with the rest of the batch: " <>
+          "tenant_id=#{closure.tenant_id} story_id=#{closure.story_id} " <>
+          "closure_id=#{closure.id} error=#{Exception.format(:error, error, __STACKTRACE__)}",
+        tenant_id: closure.tenant_id,
+        story_id: closure.story_id
+      )
+
+      {:errored, nil}
   end
 
   defp log_budget_spent(acc) do

@@ -30,12 +30,21 @@ All notable changes to loopctl are documented here.
 
   **`GITHUB_TOKEN` now needs `issues: write`** on the target repository, the only write scope
   loopctl asks for. Without it every close is refused 403, recorded `abandoned`, and no
-  reporter is notified; nothing else breaks and nothing loops. See `deploy/FLY_SECRETS.md`.
+  reporter is notified; nothing else breaks and nothing loops. That is the likeliest cause of
+  a mass abandonment, so it has a way back: after fixing the secret,
+  `Loopctl.Intake.IssueClosures.requeue_abandoned()` re-drives the backlog. It never re-drives
+  an issue a human already closed. See `deploy/FLY_SECRETS.md`.
+
+  **A disconnected repository stops receiving writes.** Revoking an intake source is refused
+  at the verdict (no closure is recorded) and again at close time (`source_revoked`), so a
+  tenant that disconnects a repo is not written to afterwards.
 
   **Migration:** adds `stories.intake_record_id` (nullable, with a composite foreign key on
-  `(tenant_id, intake_record_id)` so a story can never link to another tenant's record) and
-  the `intake_issue_closures` table. No manual step, no backfill — existing stories carry no
-  link and close nothing.
+  `(tenant_id, intake_record_id)` so a story can never link to another tenant's record, and a
+  unique index so ONE reported issue yields at most one story — two would give the reporter
+  two closures aimed at one issue and let the first verdict to land decide what she is told)
+  and the `intake_issue_closures` table. No manual step, no backfill — existing stories carry
+  no link and close nothing.
 
 - **Post-deploy verification, and the verdict-to-resolution mapping (#803 §9, #805).** A
   story that reached `deployed` used to have exactly one way out — a human escalating it.

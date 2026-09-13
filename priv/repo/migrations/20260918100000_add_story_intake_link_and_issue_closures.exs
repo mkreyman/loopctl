@@ -30,9 +30,33 @@ defmodule Loopctl.Repo.Migrations.AddStoryIntakeLinkAndIssueClosures do
       add :intake_record_id, :binary_id, null: true
     end
 
-    create index(:stories, [:tenant_id, :intake_record_id],
+    # AT MOST ONE STORY PER RECORD, and this is a correctness invariant rather than tidiness
+    # (#826 review, finding 3).
+    #
+    # An issue split into two stories gives two closures aimed at one issue, and then the
+    # FIRST verdict to land decides what the reporter is told: a rejected sibling closes her
+    # issue saying nothing was deployed while the real fix is still being implemented, and the
+    # closer's replay check then accepts the wrong verdict's label as "our close".
+    #
+    # Both fixes offered in review — key the closure on the record, or require every sibling
+    # terminal — presuppose that splitting is ALLOWED and then have to arbitrate between two
+    # verdicts for one reporter. Nothing in design §4 says triage may split: its contract
+    # emits ONE `story` object per verdict. So the invariant is enforced where it is cheap and
+    # unambiguous, and the arbitration question never arises.
+    #
+    # If splitting is ever genuinely wanted, this index failing is what forces that decision
+    # to be made deliberately — instead of it being discovered by a reporter receiving the
+    # wrong resolution email.
+    #
+    # The `WHERE` is a SIZE optimisation and NOT the mechanism, stated because the obvious
+    # reading is the wrong one: Postgres treats NULLs as distinct in a unique index by
+    # default, so unlinked stories are unconstrained with or without it. `bin/mutate.sh`
+    # returned exit 1 on removing this clause — no test can tell the difference, correctly —
+    # and it is kept only because most stories carry no link and a full index would hold a
+    # dead entry for every one of them.
+    create unique_index(:stories, [:tenant_id, :intake_record_id],
              where: "intake_record_id IS NOT NULL",
-             name: :stories_intake_record_idx
+             name: :stories_intake_record_uidx
            )
 
     # MATCH SIMPLE (the default) is what makes the link OPTIONAL and the tenant binding
@@ -98,8 +122,22 @@ defmodule Loopctl.Repo.Migrations.AddStoryIntakeLinkAndIssueClosures do
              name: :intake_issue_closures_story_uidx
            )
 
-    # The drainer's candidate read: pending work, oldest first.
-    create index(:intake_issue_closures, [:status, :next_attempt_at],
+    # One closure per RECORD as well. Redundant by construction while
+    # `stories_intake_record_uidx` above holds — one story per record plus one closure per
+    # story is already one closure per record — and kept anyway, because it is the invariant
+    # that actually protects the REPORTER, and it states itself at the table whose rows write
+    # to her issue rather than two joins away.
+    create unique_index(:intake_issue_closures, [:tenant_id, :intake_record_id],
+             name: :intake_issue_closures_record_uidx
+           )
+
+    # The drainer's candidate read (#826 review, finding 8): PARTIAL on the one status it
+    # reads, ordered the way `due/1` orders. Keyed on `(inserted_at, id)` and not on
+    # `next_attempt_at`, because the ORDER is what the index has to serve — the backoff filter
+    # is a cheap predicate applied along the scan, while a mis-keyed index makes every sweep
+    # sort the whole pending set.
+    create index(:intake_issue_closures, [:inserted_at, :id],
+             where: "status = 'pending'",
              name: :intake_issue_closures_due_idx
            )
 
