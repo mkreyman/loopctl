@@ -73,4 +73,25 @@ defmodule LoopctlWeb.RenewClaimLoggingTest do
       refute log =~ "9223372036854775808"
     end
   end
+
+  test "a story id that is not a UUID is logged as :invalid, never its value", %{conn: conn} do
+    tenant = fixture(:tenant)
+    agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+    {raw_key, _key} = fixture(:api_key, %{tenant_id: tenant.id, role: :agent, agent_id: agent.id})
+    junk = "STORYVALUE" <> String.duplicate("y", 2_000)
+
+    # A string epoch is refused before the story is read, so the junk id reaches the log.
+    log =
+      capture_log([level: :info], fn ->
+        conn
+        |> put_req_header("authorization", "Bearer #{raw_key}")
+        |> post("/api/v1/stories/#{junk}/renew-claim", %{"claim_epoch" => "1"})
+        |> response(400)
+      end)
+
+    assert log =~ "renew_claim refused"
+    assert log =~ "story_id=:invalid"
+    assert log =~ "current_epoch=nil"
+    refute log =~ "STORYVALUE"
+  end
 end

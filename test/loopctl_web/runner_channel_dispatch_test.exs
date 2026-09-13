@@ -849,8 +849,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
            "dispatch_id" => dispatch["dispatch_id"],
            "claim_epoch" => dispatch["claim_epoch"]
          })},
-        {"trace_cursor", "trace_cursor", :last_cursor_at, %{"run_id" => run_id}},
-        {"unknown_event", "no_such_event", :last_unknown_at, %{}}
+        {"trace_cursor", "trace_cursor", :last_cursor_at, %{"run_id" => run_id}}
       ]
     end
 

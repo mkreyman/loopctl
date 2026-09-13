@@ -64,6 +64,9 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
              }
 
       assert connection["errors"] == RunnerContract.error_reasons()
+      assert "unknown_event" in connection["errors"]["unknown_event"]
+      assert "machine_mismatch" in connection["errors"]["join"]
+      assert RunnerContract.inbound_events() -- Map.keys(connection["errors"]) == []
 
       assert connection["limits"]["trace_max_events"] == RunnerTraceBatch.max_events()
       assert connection["limits"]["trace_max_batch_bytes"] == RunnerTraceBatch.max_bytes()
@@ -73,7 +76,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
       assert connection["limits"]["min_interval_ms"] ==
                Map.new(
-                 ~w(status trace trace_cursor unknown_event),
+                 ~w(status trace trace_cursor),
                  &{&1, RunnerContract.min_interval_ms(&1)}
                )
 

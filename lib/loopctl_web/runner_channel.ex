@@ -78,6 +78,7 @@ defmodule LoopctlWeb.RunnerChannel do
   require Logger
 
   alias Loopctl.ApiSpec.RunnerContract
+  alias Loopctl.LogValue
   alias Loopctl.Runners
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.Presence
@@ -92,7 +93,9 @@ defmodule LoopctlWeb.RunnerChannel do
   @reply_refill_ms RunnerContract.dispatch_reply_burst() |> Map.fetch!("refill_interval_ms")
   @min_trace_interval_ms RunnerContract.min_interval_ms("trace")
   @min_cursor_interval_ms RunnerContract.min_interval_ms("trace_cursor")
-  @min_unknown_interval_ms RunnerContract.min_interval_ms("unknown_event")
+  # How often an unknown event is REPORTED (telemetry and a log line). It is answered
+  # `unknown_event` every time; this bounds only what loopctl writes about it.
+  @unknown_report_interval_ms 1_000
   @join_window_ms 60_000
   @max_joins 30
 
@@ -309,17 +312,19 @@ defmodule LoopctlWeb.RunnerChannel do
   end
 
   # An unknown event's name is the runner's own string: it is never a telemetry tag.
-  # Unknown events have a floor of their own: each one is always refused and logged, so a
-  # runner looping over made-up names must not buy a log line (or a reply payload) per frame.
+  # Every unknown event is answered `unknown_event` — never `rate_limited`, which would tell
+  # a newer runner its event exists and to retry it. What the interval bounds is the
+  # REPORTING: at most one telemetry event and one log line per interval, so a runner looping
+  # over made-up names cannot buy a log line per frame. The reply is still sent every time.
   defp handle_message(_event, _payload, socket) do
     now = System.monotonic_time(:millisecond)
 
-    case MinInterval.check(socket.assigns.last_unknown_at, now, @min_unknown_interval_ms) do
+    case MinInterval.check(socket.assigns.last_unknown_at, now, @unknown_report_interval_ms) do
       :ok ->
         refuse(assign(socket, :last_unknown_at, now), "unknown", %{reason: "unknown_event"})
 
       {:error, :rate_limited} ->
-        rate_limited(socket, "unknown", @min_unknown_interval_ms)
+        {:reply, {:error, %{reason: "unknown_event"}}, socket}
     end
   end
 
@@ -386,43 +391,46 @@ defmodule LoopctlWeb.RunnerChannel do
     end
   end
 
-  # Correlation ids of the message being handled, replaced on every message. Read from the
-  # payload as sent, so only short strings and integers are taken — a runner cannot put an
-  # arbitrary value into the log stream through them.
-  defp message_correlation(payload) do
+  # Correlation ids of the message being handled. Read from the payload as sent, so each is
+  # taken only in the shape it claims (`Loopctl.LogValue`: a UUID or an epoch, else
+  # `:invalid`) — a runner cannot put an arbitrary value into the log stream through them.
+  defp message_correlation(%{} = payload) do
     [
-      dispatch_id: correlation_id(payload, "dispatch_id"),
-      run_id: correlation_id(payload, "run_id"),
-      claim_epoch: correlation_epoch(payload)
+      dispatch_id: LogValue.uuid(Map.get(payload, "dispatch_id")),
+      run_id: LogValue.uuid(Map.get(payload, "run_id")),
+      claim_epoch: LogValue.epoch(Map.get(payload, "claim_epoch"))
     ]
   end
+
+  defp message_correlation(_payload), do: []
 
   @correlation_keys [:dispatch_id, :run_id, :story_id, :claim_epoch]
 
   # A message's correlation ids label only the lines logged WHILE it is handled. They are
-  # cleared afterwards, so a later close, recheck or disconnect line carries only the sticky
-  # runner identity set at join — never the story of whatever dispatch came through last.
+  # cleared when it returns, so a later close, recheck or disconnect line carries only the
+  # sticky runner identity set at join — never the story of whatever dispatch came last.
+  #
+  # NOT cleared when handling raises: the process is about to die, and its crash report and
+  # the `runner channel closed` warning are exactly the lines that need the ids.
   defp with_correlation(correlation, fun) do
     Logger.metadata(correlation)
 
-    try do
-      fun.()
-    after
-      Logger.metadata(Enum.map(@correlation_keys, &{&1, nil}))
-    end
+    result =
+      try do
+        fun.()
+      catch
+        kind, reason ->
+          Logger.error(
+            "runner message handling failed: " <>
+              Exception.format_banner(kind, reason, __STACKTRACE__)
+          )
+
+          :erlang.raise(kind, reason, __STACKTRACE__)
+      end
+
+    Logger.metadata(Enum.map(@correlation_keys, &{&1, nil}))
+    result
   end
-
-  defp correlation_id(%{} = payload, key) do
-    case Map.get(payload, key) do
-      id when is_binary(id) and byte_size(id) <= 64 -> id
-      _ -> nil
-    end
-  end
-
-  defp correlation_id(_payload, _key), do: nil
-
-  defp correlation_epoch(%{"claim_epoch" => epoch}) when is_integer(epoch), do: epoch
-  defp correlation_epoch(_payload), do: nil
 
   # The socket authenticated once, at connect. A join can come much later — a runner can
   # leave and rejoin on the same connection — so every join re-reads authorization, or a

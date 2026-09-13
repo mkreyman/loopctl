@@ -186,12 +186,67 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
       refute log =~ payload["story_id"]
     end
 
-    test "a runner-supplied correlation id longer than an id is not taken into the logs" do
+    test "a runner-supplied id or epoch not in its claimed shape is logged as :invalid, never its value" do
       %{channel: channel} = joined_runner()
+      junk = "JUNKID" <> String.duplicate("x", 5_000)
+      # What the JSON decoder makes of a many-thousand-digit number.
+      bignum = Integer.pow(10, 5_000)
 
-      ref = push(channel, "dispatch_reply", %{"dispatch_id" => String.duplicate("x", 500)})
-      assert_reply ref, :error, %{reason: "invalid_payload"}, @reply_timeout
-      refute Map.has_key?(process_metadata(channel.channel_pid), :dispatch_id)
+      log =
+        capture_log([level: :info], fn ->
+          for epoch <- [bignum, -1] do
+            # An invalid trace spends no floor, so every one of these is refused and logged.
+            ref =
+              push(channel, "trace", %{
+                "dispatch_id" => junk,
+                "run_id" => %{"nested" => junk},
+                "claim_epoch" => epoch,
+                "events" => "not a list"
+              })
+
+            assert_reply ref, :error, %{reason: "invalid_payload"}, @reply_timeout
+          end
+        end)
+
+      lines = log |> String.split("\n") |> Enum.filter(&(&1 =~ "runner message refused"))
+      assert length(lines) == 2
+
+      for line <- lines do
+        assert line =~ "dispatch_id=:invalid run_id=:invalid"
+        assert line =~ "claim_epoch=invalid"
+        refute line =~ "JUNKID"
+        refute line =~ "nested"
+        refute line =~ "0000000000"
+        refute line =~ "claim_epoch=-1"
+      end
+    end
+
+    test "a message whose handling raises keeps its correlation ids on the crash and close lines" do
+      %{runner: runner, channel: channel} = joined_runner()
+      Process.unlink(channel.channel_pid)
+      _ = :sys.get_state(channel.channel_pid)
+      payload = dispatch_payload(runner.tenant_id, %{"claim_epoch" => 7})
+      {:ok, dispatch} = RunnerContract.cast_dispatch(payload)
+      # Not a UUID, so the ledger's pushed_at write raises a cast error after the push.
+      dispatch = %{dispatch | dispatch_id: "not-a-uuid"}
+
+      log =
+        capture_log([level: :info], fn ->
+          send(channel.channel_pid, {:runner_dispatch, dispatch})
+          assert eventually(fn -> not Process.alive?(channel.channel_pid) end, @reply_timeout)
+        end)
+
+      lines = String.split(log, "\n")
+      failed = Enum.find(lines, &(&1 =~ "runner message handling failed"))
+      closed = Enum.find(lines, &(&1 =~ "runner channel closed"))
+      assert failed, log
+      assert closed, log
+
+      for line <- [failed, closed] do
+        assert line =~ "dispatch_id=not-a-uuid"
+        assert line =~ "story_id=#{dispatch.story_id}"
+        assert line =~ "claim_epoch=7"
+      end
     end
   end
 
@@ -279,7 +334,7 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
       assert_received {:refused, _, %{event: "unknown", reason: "unknown_event"}}
     end
 
-    test "unknown events have a floor: the second inside it is rate_limited, not logged again" do
+    test "every unknown event is answered unknown_event; inside the interval it is not reported again" do
       attach_refusals()
       %{channel: channel} = joined_runner()
 
@@ -295,12 +350,13 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
           end)
 
           ref = push(channel, "made-up-two", %{})
-          assert_reply ref, :error, %{reason: "rate_limited", min_interval_ms: ms}, @reply_timeout
-          assert ms == RunnerContract.min_interval_ms("unknown_event")
+          assert_reply ref, :error, reply, @reply_timeout
+          assert reply == %{reason: "unknown_event"}
         end)
 
+      assert "unknown_event" in RunnerContract.error_reasons()["unknown_event"]
       assert_received {:refused, _, %{event: "unknown", reason: "unknown_event"}}
-      assert_received {:refused, _, %{event: "unknown", reason: "rate_limited"}}
+      refute_received {:refused, _, _}
       assert length(String.split(log, "reason=unknown_event")) == 2
     end
 
@@ -319,6 +375,7 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
                        %{event: "join", reason: "machine_mismatch", runner_id: runner_id}}
 
       assert runner_id == runner.id
+      assert "machine_mismatch" in RunnerContract.error_reasons()["join"]
       assert log =~ "runner message refused: event=join reason=machine_mismatch"
     end
   end
@@ -493,6 +550,28 @@ defmodule LoopctlWeb.RunnerObservabilityTest do
       assert log =~ "runner dispatch refused: reason=:tenant_halted"
       assert log =~ payload["dispatch_id"]
       assert log =~ payload["story_id"]
+    end
+
+    test "a refused dispatch/3's malformed ids and epoch are logged as :invalid, never their values" do
+      %{runner: runner} = joined_runner()
+      junk = "DISPATCHJUNK" <> String.duplicate("z", 2_000)
+
+      payload =
+        runner.tenant_id
+        |> dispatch_payload()
+        |> Map.merge(%{"dispatch_id" => junk, "claim_epoch" => Integer.pow(10, 500)})
+
+      log =
+        capture_log([level: :info], fn ->
+          assert {:error, _} = Runners.dispatch(junk, runner.id, payload)
+        end)
+
+      assert log =~ "runner dispatch refused"
+      assert log =~ "tenant_id=:invalid"
+      assert log =~ "dispatch_id=:invalid"
+      assert log =~ "claim_epoch=:invalid"
+      refute log =~ "DISPATCHJUNK"
+      refute log =~ "0000000000"
     end
   end
 end

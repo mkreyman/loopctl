@@ -476,6 +476,15 @@
         "stale_claim_epoch",
         "already_replied"
       ],
+      "join": [
+        "rate_limited",
+        "not_authorized",
+        "invalid_payload",
+        "unsupported_contract_version",
+        "machine_mismatch",
+        "forbidden_topic",
+        "unknown_topic"
+      ],
       "status": [
         "rate_limited",
         "invalid_payload"
@@ -493,6 +502,9 @@
       "trace_cursor": [
         "rate_limited",
         "invalid_payload"
+      ],
+      "unknown_event": [
+        "unknown_event"
       ]
     },
     "events": {
@@ -523,8 +535,7 @@
       "min_interval_ms": {
         "status": 1000,
         "trace": 50,
-        "trace_cursor": 50,
-        "unknown_event": 1000
+        "trace_cursor": 50
       },
       "refusal_max_detail_length": 500,
       "trace_max_batch_bytes": 60000,

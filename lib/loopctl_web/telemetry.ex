@@ -172,7 +172,7 @@ defmodule LoopctlWeb.Telemetry do
     ]
   end
 
-  @declared_channel_events Loopctl.ApiSpec.RunnerContract.error_reasons() |> Map.keys()
+  @declared_channel_events Loopctl.ApiSpec.RunnerContract.inbound_events()
 
   @doc """
   Bounds `phoenix.channel_handled_in`'s `event` tag (issue #815): a runner-to-control event

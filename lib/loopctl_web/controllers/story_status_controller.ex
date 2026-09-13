@@ -21,6 +21,7 @@ defmodule LoopctlWeb.StoryStatusController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Capabilities
   alias Loopctl.Dispatches
+  alias Loopctl.LogValue
   alias Loopctl.Progress
   alias Loopctl.Progress.StateMachine
   alias LoopctlWeb.AuditContext
@@ -635,33 +636,24 @@ defmodule LoopctlWeb.StoryStatusController do
   # reclaimer, and without this line nothing records why. The current epoch is read only
   # on this refusal path.
   defp log_renew_refused(api_key, story_id, params, error) do
-    current =
-      case Ecto.UUID.cast(story_id) do
-        {:ok, id} -> Progress.current_claim_epoch(api_key.tenant_id, id)
-        :error -> nil
-      end
+    # The story id is the path segment and the epoch the body's: both are the client's, so
+    # each is logged only in the shape it claims (`Loopctl.LogValue`).
+    logged_story_id = LogValue.uuid(story_id)
+    presented = LogValue.epoch(Map.get(params, "claim_epoch"))
 
-    presented = loggable_epoch(Map.get(params, "claim_epoch"))
+    current =
+      if is_binary(logged_story_id),
+        do: Progress.current_claim_epoch(api_key.tenant_id, logged_story_id)
 
     Logger.info(
-      "renew_claim refused: reason=#{inspect(refusal_reason(error))} story_id=#{inspect(story_id)} " <>
+      "renew_claim refused: reason=#{inspect(refusal_reason(error))} " <>
+        "story_id=#{inspect(logged_story_id)} " <>
         "presented_epoch=#{inspect(presented)} current_epoch=#{inspect(current)} " <>
         "agent_id=#{inspect(api_key.agent_id)} tenant_id=#{api_key.tenant_id}",
-      story_id: story_id,
+      story_id: logged_story_id,
       claim_epoch: presented
     )
   end
-
-  @max_epoch 9_223_372_036_854_775_807
-
-  # The client's `claim_epoch` is written to the log only when it is one: a non-negative
-  # integer a bigint holds. Anything else — a huge string, a nested map — is `:invalid`, never
-  # the value itself.
-  defp loggable_epoch(epoch) when is_integer(epoch) and epoch >= 0 and epoch <= @max_epoch,
-    do: epoch
-
-  defp loggable_epoch(nil), do: nil
-  defp loggable_epoch(_epoch), do: :invalid
 
   defp refusal_reason({:error, reason}) when is_atom(reason), do: reason
   defp refusal_reason({:error, reason, _message}), do: reason

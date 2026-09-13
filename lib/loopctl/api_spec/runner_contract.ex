@@ -24,13 +24,14 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   | direction | event | schema | ok reply | error `reason`s |
   |---|---|---|---|---|
-  | runner -> control | `phx_join` on `"runner:<runner_id>"` | `RunnerJoin` | `{contract_version}` | see `LoopctlWeb.RunnerChannel` |
+  | runner -> control | `phx_join` on `"runner:<runner_id>"` | `RunnerJoin` | `{contract_version}` | `rate_limited`, `not_authorized`, `invalid_payload`, `unsupported_contract_version`, `machine_mismatch`, `forbidden_topic`, `unknown_topic` |
   | runner -> control | `"status"` | `RunnerStatus` | empty | `rate_limited`, `invalid_payload` |
   | control -> runner | `"dispatch"` | `RunnerDispatch` (pushed only by `Loopctl.Runners.dispatch/3`) | — | — |
   | runner -> control | `"dispatch_reply"` | `RunnerDispatchReply` (since 1.1.0) | empty | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `stale_claim_epoch`, `already_replied` |
   | runner -> control | `"trace"` | `RunnerTraceBatch` of `RunnerTraceEvent` (since 1.1.0) | `RunnerTraceAck` | `rate_limited`, `invalid_payload`, `batch_too_large`, `event_data_too_large`, `unknown_dispatch`, `stale_claim_epoch`, `dispatch_not_accepted`, `run_mismatch` |
   | runner -> control | `"trace_cursor"` | `RunnerTraceCursor` (since 1.1.0) | `RunnerTraceAck` | `rate_limited`, `invalid_payload` |
   | control -> runner | `"disconnecting"` | `RunnerDisconnecting` (since 1.2.0) | — | — |
+  | runner -> control | any other event | — | — | `unknown_event` (since 1.2.0; every time, never `rate_limited`) |
 
   ## Server-initiated disconnects (since 1.2.0)
 
@@ -48,8 +49,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   Published in `x-connection.limits`, and enforced per channel:
 
   - `min_interval_ms` (`min_interval_ms/1`) — `status` 1000 ms, `trace` 50 ms,
-    `trace_cursor` 50 ms, and `unknown_event` 1000 ms for any event the contract does not
-    declare. Each event has its OWN floor: a `trace` batch is not held back by a recent
+    `trace_cursor` 50 ms. Each event has its OWN floor: a `trace` batch is not held back by a recent
     `status` or `trace_cursor`, so the resume sequence (cursor, then batches) is never
     refused, and a rejoining runner ships up to 20 batches a second.
   - `dispatch_reply_burst` (`dispatch_reply_burst/0`) — a bucket of 8 replies that refills
@@ -573,8 +573,16 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     "trace" =>
       ~w(rate_limited invalid_payload batch_too_large event_data_too_large unknown_dispatch
          stale_claim_epoch dispatch_not_accepted run_mismatch),
-    "trace_cursor" => ~w(rate_limited invalid_payload)
+    "trace_cursor" => ~w(rate_limited invalid_payload),
+    # Since 1.2.0. `join` is the `phx_join` reply; `unknown_event` answers any event this
+    # map does not name, every time.
+    "join" => ~w(rate_limited not_authorized invalid_payload unsupported_contract_version
+         machine_mismatch forbidden_topic unknown_topic),
+    "unknown_event" => ~w(unknown_event)
   }
+
+  # The runner-to-control events `LoopctlWeb.RunnerChannel.handle_in/3` acts on.
+  @inbound_events ~w(status dispatch_reply trace trace_cursor)
 
   # The minimum spacing, per channel, between two acted-on messages of one event. A message
   # inside it is refused with `rate_limited` and `min_interval_ms`. Each event has its OWN
@@ -583,10 +591,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   @min_interval_ms %{
     "status" => 1_000,
     "trace" => 50,
-    "trace_cursor" => 50,
-    # Any event the contract does not declare. Always refused (`unknown_event`), so the floor
-    # only bounds how often a runner can make loopctl reply and log about one.
-    "unknown_event" => 1_000
+    "trace_cursor" => 50
   }
 
   # `dispatch_reply` is a bucket rather than a floor: a runner handed several dispatches at
@@ -627,9 +632,16 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   @spec max_seq() :: pos_integer()
   def max_seq, do: @max_seq
 
-  @doc "The stable error `reason` codes, per runner-to-control event."
+  @doc """
+  The stable error `reason` codes, per runner-to-control event, plus `join` (the `phx_join`
+  reply) and `unknown_event` (any event not named here).
+  """
   @spec error_reasons() :: %{String.t() => [String.t()]}
   def error_reasons, do: @error_reasons
+
+  @doc "The runner-to-control events the channel acts on (`phx_join` aside)."
+  @spec inbound_events() :: [String.t()]
+  def inbound_events, do: @inbound_events
 
   @doc "The schema modules the contract declares."
   @spec schema_modules() :: [module()]

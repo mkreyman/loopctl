@@ -57,6 +57,7 @@ defmodule Loopctl.Runners do
   alias Loopctl.AuditChain.Entry, as: AuditEntry
   alias Loopctl.Auth
   alias Loopctl.Auth.ApiKey
+  alias Loopctl.LogValue
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.Presence
   alias Loopctl.Runners.Runner
@@ -371,21 +372,28 @@ defmodule Loopctl.Runners do
     end
   end
 
-  # Identifiers only, read defensively: a refused payload may be malformed.
+  # Identifiers only, read defensively: a refused payload may be malformed, so each value is
+  # logged only in the shape it claims (`Loopctl.LogValue`).
   defp log_dispatch_refused(tenant_id, runner_id, payload, reason) do
     field = fn key ->
       if is_map(payload),
         do: Map.get(payload, key) || Map.get(payload, String.to_existing_atom(key))
     end
 
+    tenant_id = LogValue.uuid(tenant_id)
+    runner_id = LogValue.uuid(runner_id)
+    dispatch_id = LogValue.uuid(field.("dispatch_id"))
+    story_id = LogValue.uuid(field.("story_id"))
+    claim_epoch = LogValue.epoch(field.("claim_epoch"))
+
     Logger.info(
       "runner dispatch refused: reason=#{inspect(reason)} tenant_id=#{inspect(tenant_id)} " <>
-        "runner_id=#{inspect(runner_id)} dispatch_id=#{inspect(field.("dispatch_id"))} " <>
-        "story_id=#{inspect(field.("story_id"))} claim_epoch=#{inspect(field.("claim_epoch"))}",
+        "runner_id=#{inspect(runner_id)} dispatch_id=#{inspect(dispatch_id)} " <>
+        "story_id=#{inspect(story_id)} claim_epoch=#{inspect(claim_epoch)}",
       runner_id: runner_id,
-      dispatch_id: field.("dispatch_id"),
-      story_id: field.("story_id"),
-      claim_epoch: field.("claim_epoch")
+      dispatch_id: dispatch_id,
+      story_id: story_id,
+      claim_epoch: claim_epoch
     )
   end
 
