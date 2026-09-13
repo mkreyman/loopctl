@@ -6,8 +6,10 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.ApiSpec.RunnerContract.RunnerDispatchReply
+  alias Loopctl.ApiSpec.RunnerContract.RunnerStage
   alias Loopctl.ApiSpec.RunnerContract.RunnerTraceBatch
   alias Loopctl.ApiSpec.RunnerContract.RunnerTraceEvent
+  alias Loopctl.Delivery.StageMachine
 
   @join %{
     "contract_version" => "1.0.0",
@@ -45,17 +47,18 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       assert "claim_epoch" in defs["RunnerDispatch"]["required"]
     end
 
-    test "is contract 1.1.0 and names the 1.1 events, replies, errors and limits" do
+    test "is the current contract version and names its events, replies, errors and limits" do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.3.0"
-      assert schema["x-contract-version"] == "1.3.0"
+      assert RunnerContract.version() == "1.4.0"
+      assert schema["x-contract-version"] == "1.4.0"
 
       assert %{
                "dispatch_reply" => "RunnerDispatchReply",
                "trace" => "RunnerTraceBatch",
-               "trace_cursor" => "RunnerTraceCursor"
+               "trace_cursor" => "RunnerTraceCursor",
+               "stage" => "RunnerStageReport"
              } = connection["events"]
 
       assert connection["replies"] == %{
@@ -73,6 +76,16 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       assert connection["limits"]["trace_max_event_bytes"] == RunnerTraceEvent.max_bytes()
       assert connection["limits"]["frame_envelope_bytes"] == RunnerContract.frame_envelope_bytes()
       assert connection["limits"]["dispatch_reply_burst"] == RunnerContract.dispatch_reply_burst()
+      assert connection["limits"]["stage_burst"] == RunnerContract.stage_burst()
+
+      # #803: the stage transition table is published so a runner can refuse an impossible
+      # transition locally. It is DERIVED from the server's machine — asserted here against
+      # `StageMachine.runner_transitions/0` rather than against a copy, so an edge added to
+      # the machine reaches the wire without anyone remembering to widen a list.
+      assert connection["stage_transitions"] ==
+               Enum.map(StageMachine.runner_transitions(), fn {from, to, edge} ->
+                 %{"from" => to_string(from), "to" => to_string(to), "edge" => to_string(edge)}
+               end)
 
       assert connection["limits"]["min_interval_ms"] ==
                Map.new(
@@ -85,6 +98,64 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
       assert schema["$defs"]["RunnerTraceBatch"]["properties"]["events"]["maxItems"] ==
                RunnerTraceBatch.max_events()
+    end
+
+    test "every published stage/edge string resolves to the machine's own atom" do
+      # #824 round 1 follow-on. `cast_stage/1` used `String.to_existing_atom/1` and raised
+      # `ArgumentError: not an already existing atom` on `session_escalated`, taking the
+      # runner's channel down. The atoms are literals in `StageMachine` — but an atom in a
+      # module's constant pool exists only once that MODULE IS LOADED, Elixir loads lazily,
+      # and this module's enums compile down to STRINGS, so nothing on the cast's path forces
+      # the load. It passed until a test-ordering change stopped some earlier test loading
+      # `StageMachine` first.
+      #
+      # This asserts the MAPPING is complete. It cannot reproduce the raise: the atoms exist
+      # in any VM that has run the suite this far. The source assertion below is what binds
+      # the mechanism.
+      for name <- RunnerStage.from_stages() ++ RunnerStage.to_stages() do
+        assert String.to_existing_atom(name) in StageMachine.stages()
+      end
+
+      for name <- RunnerStage.edges() do
+        assert String.to_existing_atom(name) in StageMachine.runner_reportable_edges()
+      end
+    end
+
+    test "the stage schema's effects are exactly the ones the machine says a runner may carry" do
+      # `StageMachine.reportable_effects/0` is the DECLARATION and the schema is what the wire
+      # actually says; the ack and the `effect_conflict` refusal read the machine's list. This
+      # binds the two, in both directions — a property added to the schema without the
+      # machine's blessing, or an effect the machine allows and the schema forgot, both go red.
+      #
+      # `runner_id` is the one deliberately absent: which machine holds a story is CONTROL's
+      # to record, written by the transition into `claimed` that a runner may not report, so
+      # letting one name a `runner_id` would let it attribute a story to another machine.
+      assert RunnerStage.effect_names() == StageMachine.reportable_effects()
+      refute :runner_id in RunnerStage.effect_names()
+      assert :runner_id in StageMachine.effects()
+    end
+
+    test "the wire-to-atom conversion never reaches for String.to_existing_atom" do
+      # The one assertion that can fail for the right reason in a VM where the atoms already
+      # exist. `to_existing_atom` on a wire value is safe only if something has forced the
+      # defining module to load, which is a property of the CALLER's history and not of this
+      # code — so the rule is a compile-time map, and this is the rule.
+      # The CALL shape, `to_existing_atom(`, not the name. The module documents this rule in
+      # a comment and a `@doc` that both name the function in its `/1` arity form, so
+      # matching the bare name asserts nothing but "nobody wrote it down" — and it failed on
+      # the very prose that documents the fix. Line comments are stripped as well, so a
+      # commented-out call cannot hold the assertion red either.
+      code =
+        "lib/loopctl/api_spec/runner_contract.ex"
+        |> File.read!()
+        |> String.split("\n")
+        |> Enum.reject(&(&1 |> String.trim_leading() |> String.starts_with?("#")))
+        |> Enum.join("\n")
+
+      refute code =~ "to_existing_atom(",
+             "cast_stage/1 must map wire strings through the compile-time @wire_atoms map: " <>
+               "an atom in another module's constant pool does not exist until that module " <>
+               "loads, and the first `stage` message in a fresh VM raised."
     end
 
     test "uses only the JSON Schema keywords the runner's vendored validator implements" do

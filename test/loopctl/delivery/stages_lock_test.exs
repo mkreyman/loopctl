@@ -21,6 +21,7 @@ defmodule Loopctl.Delivery.StagesLockTest do
   alias Loopctl.AdminRepo
   alias Loopctl.AuditChain
   alias Loopctl.AuditChain.Entry
+  alias Loopctl.Delivery.Escalations
   alias Loopctl.Delivery.StageEvent
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
@@ -444,5 +445,115 @@ defmodule Loopctl.Delivery.StagesLockTest do
              Stages.record_effect(story.tenant_id, story.id, :pr_number, 7, claim_epoch: 1)
 
     assert AdminRepo.get!(StoryStage, row.id).stage == :queued
+  end
+
+  test "escalate retries ONCE when the runner moves the story under it", %{story: story} do
+    # #824 round 2, finding 4. `Escalations.escalate/3` reads the stage row OUTSIDE the
+    # transition, so a `stage` message landing in between makes its compare-and-set miss.
+    # It used to answer 409 `stale_stage` and the escalation was LOST — neither the context
+    # nor the MCP tool retries — even though escalating from the new stage is a valid edge.
+    #
+    # The interleaving is forced by a LOCK, not by timing. `Stages.advance/4` takes the story
+    # `FOR SHARE` before it touches the stage row, so a session holding the story `FOR UPDATE`
+    # parks the escalation at exactly the point after its read and before its
+    # compare-and-set — which is the window the finding is about.
+    agent = fixture(:stage_agent, %{tenant_id: story.tenant_id})
+
+    {1, _} =
+      from(s in Story, where: s.id == ^story.id)
+      |> AdminRepo.update_all(set: [assigned_agent_id: agent.id])
+
+    row =
+      fixture(:story_stage, %{
+        repo: AdminRepo,
+        tenant_id: story.tenant_id,
+        story_id: story.id,
+        stage: :implementing,
+        claim_epoch: story.claim_epoch
+      })
+
+    blocker_ready = self()
+
+    # The runner: hold the story, move the stage row, and commit only once the escalation is
+    # demonstrably waiting behind us. It reports its own BACKEND pid, which is what makes the
+    # wait check precise — see `blocking?/1`.
+    blocker =
+      unboxed([AdminRepo], fn ->
+        AdminRepo.transaction(fn ->
+          AdminRepo.one!(from s in Story, where: s.id == ^story.id, lock: "FOR UPDATE")
+          %{rows: [[backend_pid]]} = AdminRepo.query!("SELECT pg_backend_pid()")
+          send(blocker_ready, {:holding, backend_pid})
+
+          receive do
+            :escalation_is_waiting -> :ok
+          after
+            @ownership_timeout -> flunk("the escalation never blocked on the story lock")
+          end
+
+          {1, _} =
+            from(s in StoryStage, where: s.id == ^row.id)
+            |> AdminRepo.update_all(set: [stage: :reviewing])
+        end)
+      end)
+
+    assert_receive {:holding, blocker_backend}, @ownership_timeout
+
+    # NOTHING is blocked by the blocker yet. This is what makes the check below evidence
+    # rather than decoration: a predicate that answered `true` unconditionally — which is what
+    # the first, unscoped version effectively did on a shared database — fails HERE. The
+    # race's outcome cannot tell the two apart, so the predicate is bounded in both directions
+    # instead (#824 round 3, finding 6).
+    refute blocking?(blocker_backend)
+
+    escalation =
+      unboxed([Repo], fn ->
+        Escalations.escalate(story.tenant_id, story.id,
+          claim_epoch: story.claim_epoch,
+          agent_id: agent.id,
+          reason: "a human is needed",
+          actor_lineage: []
+        )
+      end)
+
+    # It has read `implementing` and is now parked on the story lock the blocker holds.
+    assert blocking?(blocker_backend)
+    send(blocker.pid, :escalation_is_waiting)
+    Task.await(blocker, @ownership_timeout)
+
+    # The retry escalates from `reviewing`, the stage the row ACTUALLY reached.
+    assert {:ok, escalated} = Task.await(escalation, @ownership_timeout)
+    assert escalated.stage == :escalated
+    assert escalated.escalation_reason == "a human is needed"
+    assert AdminRepo.get!(StoryStage, row.id).stage == :escalated
+  end
+
+  # Is anything blocked BY OUR BLOCKER? `pg_blocking_pids/1` names the backends actually
+  # holding what a given backend waits for, so this asks the precise question — and the only
+  # thing our blocker holds is this story's row.
+  #
+  # The first version asked a much weaker one (#824 round 3, finding 6): any blocked backend
+  # whose query text mentioned `stories`, ignoring its `story_id` argument entirely, on a
+  # database every branch on this box shares. A concurrent match satisfied it early, the
+  # escalation then read the NEW stage on its first attempt, the retry was never exercised —
+  # and every assertion still passed, because the outcome is the same either way. A guard that
+  # cannot fail is worse than none, and this one was guarding the only test of the retry.
+  defp blocking?(blocker_backend) do
+    eventually(fn ->
+      %{rows: [[blocked]]} =
+        AdminRepo.query!(
+          "SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))",
+          [blocker_backend]
+        )
+
+      blocked > 0
+    end)
+  end
+
+  defp eventually(fun, attempts \\ 200) do
+    cond do
+      fun.() -> true
+      attempts <= 0 -> false
+      true -> Process.sleep(25) && eventually(fun, attempts - 1)
+    end
   end
 end

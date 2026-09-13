@@ -27,8 +27,16 @@ defmodule Loopctl.Runners.DispatchLedger do
   The fleet-wide order, which `Loopctl.Runners.Capacity` states in full:
 
       capacity advisory lock (0x41050803) -> story row
-        -> runner_dispatches / story_stages row -> chain advisory lock (0x4105A1D7)
-        -> audit-chain head -> runners row
+        -> runner_dispatches / story_stages row -> runners row
+        -> chain advisory lock (0x4105A1D7) -> audit-chain head
+
+  **The chain append is always LAST** (corrected in the #824 review — this copy, and
+  `Capacity`'s, put the `runners` row after the chain, while every writer in the fleet takes
+  it before: `Loopctl.Runners.revoke_runner/3` and the session-end slot release in
+  `Loopctl.Delivery.Stages`. Nothing takes the chain first and a `runners` row second, so the
+  table moved rather than the code.) Nothing in THIS module appends to the chain at all — a
+  reply is the runner's own report about its machine, not a custody transition — so the part
+  of the order it follows ends at the `runners` row.
 
   So `record_sent/3` takes the tenant's admission lock as the FIRST thing in its transaction —
   before the claim fence, not with the reservation at the end — and `record_reply/3` and
@@ -407,6 +415,49 @@ defmodule Loopctl.Runners.DispatchLedger do
     case repo.one(query) do
       nil -> {:error, :unknown_dispatch}
       record -> {:ok, Capacity.release(repo, record, generation)}
+    end
+  end
+
+  @doc """
+  The session a runner is running under `dispatch_id`: `{:ok, %{story_id:, claim_epoch:,
+  slot_generation:}}` for an ACCEPTED dispatch this runner holds in this tenant.
+
+  For the `stage` path (#803, contract 1.4.0), which needs the story the dispatch is for and
+  the slot generation to release when the session ends. It is a READ and takes no lock: the
+  three values it returns are all final from the dispatch's acceptance onward — `story_id`
+  is written with the row and never changed, an accepted dispatch is never re-sent so its
+  `slot_generation` cannot advance, and `claim_epoch` is the row's, which nothing rewrites.
+  The authoritative fence is still the STORY's epoch, taken under a share lock inside
+  `Loopctl.Delivery.Stages.advance/4`'s own transaction; this one only refuses a message
+  whose epoch does not even match the dispatch it names, before that transaction is opened.
+
+  `:unknown_dispatch` for a row another runner or another tenant holds, exactly as for one
+  that does not exist. `:dispatch_not_accepted` for a row still `sent`, `refused` or
+  `superseded`: no session is running, so there is no transition to report.
+  """
+  @spec accepted_session(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, %{story_id: Ecto.UUID.t(), claim_epoch: integer(), slot_generation: integer()}}
+          | {:error, :unknown_dispatch | :dispatch_not_accepted}
+  def accepted_session(tenant_id, runner_id, dispatch_id) do
+    {:ok, result} =
+      in_tenant(tenant_id, fn ->
+        Repo.one(
+          from r in DispatchRecord,
+            where: r.tenant_id == ^tenant_id and r.runner_id == ^runner_id,
+            where: r.dispatch_id == ^dispatch_id,
+            select: %{
+              status: r.status,
+              story_id: r.story_id,
+              claim_epoch: r.claim_epoch,
+              slot_generation: r.slot_generation
+            }
+        )
+      end)
+
+    case result do
+      nil -> {:error, :unknown_dispatch}
+      %{status: "accepted"} = row -> {:ok, Map.delete(row, :status)}
+      %{} -> {:error, :dispatch_not_accepted}
     end
   end
 

@@ -38,6 +38,8 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Orchestrator.OrchestratorState
   alias Loopctl.Projects.Project
   alias Loopctl.QualityAssurance.UiTestRun
+  alias Loopctl.Runners.Capacity
+  alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Runners.Runner
   alias Loopctl.Skills.Skill
   alias Loopctl.Skills.SkillResult
@@ -1944,6 +1946,38 @@ defmodule Loopctl.Fixtures do
     end)
   end
 
+  # An agent and its `:agent`-role key, COMMITTED outside the sandbox, for a CONTROLLER test
+  # of a path whose context runs on the RLS `Loopctl.Repo` (#803's escalate endpoint). The
+  # auth pipeline resolves the key on `AdminRepo` while `Loopctl.Delivery.Stages` reads the
+  # story on `Repo`, and those are separate sandbox connections that cannot see each other's
+  # uncommitted rows — so the TENANT and the KEY must be committed (both connections see
+  # them) while the story stays inside the `Repo` sandbox (`fixture(:ledger_story)`). Only an
+  # `async: false` module may use it, and it must call `sweep_committed_runner_tenants/0` in
+  # `setup_all` and on exit; the tenant it makes carries the sweep's slug marker.
+  #
+  # Returns `{raw_key, api_key, agent}`.
+  def fixture(:committed_agent_key, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+
+    Sandbox.unboxed_run(AdminRepo, fn ->
+      agent =
+        %Agent{tenant_id: tenant_id}
+        |> Agent.register_changeset(build(:agent, Map.take(attrs, [:name, :agent_type])))
+        |> AdminRepo.insert!()
+
+      {:ok, {raw_key, api_key}} =
+        Auth.generate_api_key(%{
+          tenant_id: tenant_id,
+          name: "agent:#{agent.id}",
+          role: :agent,
+          agent_id: agent.id
+        })
+
+      {raw_key, api_key, agent}
+    end)
+  end
+
   # A story (with its project and epic) on the RLS `Loopctl.Repo` connection, at a given
   # `claim_epoch`, for the dispatch ledger's claim fence (#803). The ledger reads
   # `stories.claim_epoch` on `Repo` inside its own transaction, and `Repo` and `AdminRepo`
@@ -2008,6 +2042,23 @@ defmodule Loopctl.Fixtures do
     end
   end
 
+  # An agent on the RLS `Loopctl.Repo` sandbox connection, for a `stories.assigned_agent_id`
+  # a `Repo`-side test needs to satisfy `stories_assigned_agent_id_fkey` (#803's escalation
+  # path, whose claimant check runs on `Repo`). The default `fixture(:agent)` writes through
+  # `AdminRepo`, whose uncommitted rows a `Repo` FK check cannot see.
+  def fixture(:stage_agent, attrs) do
+    tenant_id = attrs |> Enum.into(%{}) |> Map.fetch!(:tenant_id)
+
+    {:ok, agent} =
+      Loopctl.Repo.with_tenant(tenant_id, fn ->
+        %Agent{tenant_id: tenant_id}
+        |> Agent.register_changeset(build(:agent, %{}))
+        |> Loopctl.Repo.insert!()
+      end)
+
+    agent
+  end
+
   # A runner (and its key) on the RLS `Loopctl.Repo` sandbox connection, for a
   # `story_stages.runner_id` written by `Loopctl.Delivery.Stages` in an async test (#803).
   def fixture(:stage_runner, attrs) do
@@ -2060,17 +2111,71 @@ defmodule Loopctl.Fixtures do
     end
   end
 
-  def fixture(:committed_tenant, _attrs) do
+  # An ACCEPTED dispatch ledger row holding one slot, on the RLS `Loopctl.Repo` connection,
+  # for the runner `stage` path (#803). Everything the stage path touches — the story, the
+  # stage row, the ledger row and the `runners` row it decrements — lives on `Repo`, so a
+  # module using this stays `async: true` and needs no committed rows.
+  #
+  # It reserves through `Loopctl.Runners.Capacity` rather than writing `in_flight` by hand,
+  # so a test asserting a release actually observes the counter the production path moves.
+  def fixture(:accepted_dispatch, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+    runner = Map.fetch!(attrs, :runner)
+
+    {:ok, record} =
+      Loopctl.Repo.with_tenant(tenant_id, fn ->
+        now = DateTime.utc_now()
+
+        record =
+          Loopctl.Repo.insert!(%DispatchRecord{
+            tenant_id: tenant_id,
+            runner_id: runner.id,
+            dispatch_id: Map.get(attrs, :dispatch_id, Ecto.UUID.generate()),
+            story_id: Map.fetch!(attrs, :story_id),
+            claim_epoch: Map.get(attrs, :claim_epoch, 0),
+            kind: Map.get(attrs, :kind, "implement"),
+            status: Map.get(attrs, :status, "accepted"),
+            trace_acked_seq: -1,
+            wall_clock_seconds: 3_600,
+            delivery: "pushed",
+            pushed_at: now,
+            replied_at: now,
+            released_at: now,
+            slot_generation: 0
+          })
+
+        {:ok, reserved} = Capacity.admit_and_reserve(Loopctl.Repo, record, now)
+        reserved
+      end)
+
+    record
+  end
+
+  # `:trust_tier` defaults to the column's own default (`:agent_rooted`, what a signup with no
+  # WebAuthn ceremony gets). Pass `trust_tier: :human_anchored` for a test of a surface behind
+  # `LoopctlWeb.Plugs.RequireHumanAnchor` — every work-breakdown and chain-of-custody route.
+  def fixture(:committed_tenant, attrs) do
+    attrs = Enum.into(attrs, %{})
     seq = System.unique_integer([:positive])
 
     Sandbox.unboxed_run(AdminRepo, fn ->
-      %Tenant{}
-      |> Tenant.create_changeset(%{
-        name: "Committed runner tenant #{seq}",
-        slug: "#{@committed_runner_marker}#{seq}",
-        email: "#{@committed_runner_marker}#{seq}@example.com"
-      })
-      |> AdminRepo.insert!()
+      tenant =
+        %Tenant{}
+        |> Tenant.create_changeset(%{
+          name: "Committed runner tenant #{seq}",
+          slug: "#{@committed_runner_marker}#{seq}",
+          email: "#{@committed_runner_marker}#{seq}@example.com"
+        })
+        |> AdminRepo.insert!()
+
+      case Map.get(attrs, :trust_tier) do
+        nil ->
+          tenant
+
+        tier ->
+          tenant |> Ecto.Changeset.change(trust_tier: tier) |> AdminRepo.update!()
+      end
     end)
   end
 

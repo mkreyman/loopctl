@@ -53,6 +53,67 @@ All notable changes to loopctl are documented here.
   anonymous and work for a public repository until GitHub's per-IP hourly limit bites —
   after which every delivery-loop change escalates to a human. No new environment variable;
   see the updated row in `deploy/FLY_SECRETS.md`.
+- **A runner reports its delivery stage, and a session can escalate to a human (#803).**
+  Two new ways into the per-story delivery stage machine, both landing on
+  `Loopctl.Delivery.Stages.advance/4`, which stays the only writer of `story_stages`.
+
+  **Runner contract 1.4.0** adds a runner-to-control `stage` message
+  (`priv/runner_contract/v1.json`, vendored by `mkreyman/loopctl-runner`). It carries the
+  dispatch, its `claim_epoch`, the `from` and `to` stages, the edge and the identities the
+  transition produced, and is fenced on the claim epoch exactly as `dispatch_reply` and
+  `trace` are. It is metered by a new `stage_burst` bucket (12, refilled one per 250 ms), and
+  the transition table a runner may report is published at `x-connection.stage_transitions`.
+
+  **That table is what a session DID AND CONTROL CAN INDEPENDENTLY CHECK, plus its own
+  escalation — never the outcome of a check it does not perform.** Two allowlists. The edges
+  exclude the verdicts another principal reaches: the merge-precondition gate, post-deploy
+  verification, and a budget overrun, which would park a story in `failed`, the one stage with
+  no way out at all. The sources stop at `merged`: `merged` and `deployed` name a sha and a
+  release id GitHub can confirm, while `verified` and `done` name nothing. **A story waits at
+  `deployed` for control, and a runner has no path to `verified` or `done`** — reporting the
+  deploy is the last thing a session does. Nothing into `claimed` is reportable either.
+
+  The `reason` bound is 4000 CODEPOINTS, which is what Postgres counts; the schema's
+  `maxLength` is the same number counted as graphemes and is therefore looser, so split by
+  codepoints.
+
+  Three new refusal codes. `stale_stage` and `unknown_story_stage` because no existing code
+  carries their remedy, and `effect_conflict` because a REPLAY must carry the same identities
+  its first copy did: `ci -> merged` retried after a lost ack, naming a second merge commit,
+  would otherwise be answered `ok` while the row and the chain entry kept the first sha. The
+  ack now echoes the identities the row holds so a runner can reconcile. Every inbound event
+  also publishes `internal_error`, the server admitting a refusal reason it has no clause for
+  — which used to raise and take the whole socket down with every session on it.
+
+  **Reporting a transition that ENDS THE SESSION releases the runner's slot in the same
+  transaction**, which #822 had no signal for — until now such a slot waited out the heal
+  sweep. The session ends at the terminals AND at `deployed`: with a runner reporting no
+  further than the deploy, that is the last thing it does, so keying the release on the
+  terminals alone leaked a slot on every SUCCESSFUL run for the dispatch's whole wall clock.
+  The story continues from `deployed` — it waits on control — which is why the two are not
+  the same set.
+
+  **`merged` and `deployed` can be escalated from**, by the session and by the endpoint.
+  Without that they were absorbing: nothing could write any edge out of `deployed`, so a
+  reported deploy froze the row for every principal, and `merged`'s only other edge chains a
+  retraction asserting the merge did not hold — a false custody statement for "the deploy
+  broke". Escalating restores the human path off both.
+
+  **New endpoint `POST /api/v1/stories/:id/escalate`** (agent role, `exact_role`, human-anchored
+  tenant): the story's CLAIMING agent parks it at the `escalated` stage and stops, presenting
+  the `claim_epoch` its claim returned and a reason. This is the affordance an unattended
+  session has instead of a question. It is idempotent under the same epoch. The endpoint is
+  `exact_role: :agent` deliberately — the human key that RESOLVES an escalation must not be
+  able to raise one.
+
+  **An unmapped error atom is now a 500 carrying `code: "internal_error"` plus a log line
+  naming the atom, instead of a `FunctionClauseError` in `LoopctlWeb.FallbackController`.**
+  API-wide, not just this endpoint: the status was already 500 either way, but the body is now
+  the standard error shape and the atom reaches the log rather than a stack trace. The atom is
+  never echoed to the client. Every shape with its own rendering — a changeset, an
+  `{:error, reason, message}` triple, every named atom — is untouched.
+
+  No new environment variable and no migration.
 
 - **Runner capacity is reserved in Postgres, and a tenant's total is admission-controlled
   (#803).** `Loopctl.Runners.dispatch/3` now takes a slot on the runner in the same

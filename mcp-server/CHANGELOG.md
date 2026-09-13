@@ -5,6 +5,21 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.94.0 — 2026-09-13 (escalate_story: what a session calls instead of asking)
+
+### Added
+
+- **`escalate_story`** (loopctl #803, `POST /api/v1/stories/:id/escalate`, AGENT key). Parks a
+  story you hold for a human to decide, and stops. An unattended session has no way to ask a
+  question — a headless run has no AskUserQuestion, and nothing fires when the model wanted to
+  ask — so escalating is the affordance rather than something to be detected. Required
+  `story_id`, `claim_epoch`, `reason`; optional `payload` object. The result leads with a STOP
+  line, because carrying on after a successful escalation is the failure this exists to
+  prevent. Idempotent under the same epoch. Refusals pass through unchanged: 409
+  `stale_claim_epoch`, 409 `not_claimant`, 404 `unknown_story_stage`, 400 for a malformed
+  epoch or reason. An orchestrator or user key is 403'd on purpose — the principal that
+  resolves an escalation must not be able to raise one.
+
 ## 2.93.0 — 2026-09-13 (runner capacity: enroll with max_sessions, pool reports Postgres)
 
 ### Added

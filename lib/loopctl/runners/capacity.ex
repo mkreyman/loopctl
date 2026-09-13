@@ -90,14 +90,23 @@ defmodule Loopctl.Runners.Capacity do
       capacity advisory lock (0x41050803)
         -> story row
         -> runner_dispatches / story_stages row
+        -> runners row
         -> chain advisory lock (0x4105A1D7)
         -> audit-chain head
-        -> runners row
 
   **Take the capacity lock FIRST in any transaction that also touches a story or the chain,
   never after** — a transaction holding a story and then asking for it closes a cycle with
   every dispatch, which takes it before anything else
   (`Loopctl.Runners.DispatchLedger.record_sent/3`).
+
+  **And the chain append is always LAST** (corrected in the #824 review). This table put the
+  `runners` row after the chain until then, and it was wrong about the fleet as it stands:
+  `Loopctl.Runners.revoke_runner/3` locks the `runners` row and THEN appends
+  (`lock_runner` -> `mark_revoked` -> `:audit`), and so does the session-end slot release in
+  `Loopctl.Delivery.Stages`. Nothing anywhere takes the chain first and a `runners` row
+  second, so the TABLE moved rather than the code. Keeping the chain last is also what makes
+  the order safe to extend: the tenant's chain head is the row every writer in the tenant
+  contends on, so it is the one to hold for the shortest time.
 
   **What an operator sees because the capacity lock is first:** a claim release sitting on a
   story makes every dispatch in that tenant queue behind it, and past `lock_timeout_ms/0`

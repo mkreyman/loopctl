@@ -25,8 +25,15 @@ defmodule LoopctlWeb.FallbackController do
   - `{:error, :must_contract_first}` -> 409 (claim before contracting)
   - `{:error, :must_claim_first}` -> 409 (start before claiming)
   - `{:error, :stale_claim_epoch}` -> 409 (#803: the presented `claim_epoch` is not the story's current one — the caller's claim has ended)
-  - `{:error, :not_claimant}` -> 409 (#803: renew-claim by a caller that is not the story's assigned agent)
+  - `{:error, :not_claimant}` -> 409 (#803: renew-claim or escalate by a caller that is not the story's assigned agent)
   - `{:error, :not_claimed}` -> 422 (#803: renew-claim on a story that is not assigned or implementing)
+  - `{:error, :stale_stage}` -> 409 (#803: the delivery stage row is not where the caller believed; the CLAIM is still good, unlike `stale_claim_epoch`)
+  - `{:error, :unknown_story_stage}` -> 404 (#803: the story has no `story_stages` row, so it is not in the delivery loop)
+  - `{:error, :busy}` -> 503 with `Retry-After` (#803: a delivery-stage write gave up waiting on a lock; nothing was written)
+  - `{:error, :invalid_transition}` -> 409 (#803: the stage machine has no such transition; the story-lifecycle `{:invalid_transition, ctx}` above is a different thing)
+  - `{:error, :reason_required | :invalid_reason | :invalid_event_data | :invalid_effect | :missing_required_effect | :wrong_stage | :effect_conflict | :human_required}` -> 422 (#803: the stage machine refusing the REQUEST, `code` says which)
+  - `{:error, :audit_chain_append_failed}` -> 500 (#803: the transition's chain entry did not land, so it rolled back)
+  - `{:error, atom}` with no clause above -> 500, the atom LOGGED and never echoed. The last clause, and an atom only: a changeset, an `{:error, reason, message}` triple and every struct clause keep their own rendering.
   - `{:error, :self_verify_blocked}` -> 409 (same agent implemented and tries to verify)
   - `{:error, :self_report_blocked}` -> 409 (implementer tries to report their own work)
   - `{:error, :self_review_blocked}` -> 409 (implementer tries to review their own work)
@@ -58,7 +65,9 @@ defmodule LoopctlWeb.FallbackController do
   alias Ecto.Changeset
   alias Loopctl.ApiSpec.Messages
   alias Loopctl.Custody.ViolationMonitor
+  alias Loopctl.Delivery.StageMachine
   alias Loopctl.Llm.Remediation
+  alias Loopctl.Runners.Capacity
   alias LoopctlWeb.DBError
   alias LoopctlWeb.DBErrorLogger
 
@@ -255,6 +264,61 @@ defmodule LoopctlWeb.FallbackController do
     })
   end
 
+  # #803: the delivery stage row is not where the caller believed it was, so its
+  # compare-and-set matched nothing. Distinct from `stale_claim_epoch` on purpose — the claim
+  # is fine and the caller should keep working; only its picture of the stage is out of date.
+  def call(conn, {:error, :stale_stage}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "stale_stage",
+        message:
+          "This story's delivery stage moved while this call was being made, twice, so " <>
+            "nothing was written. Your claim is still good — only your picture of the " <>
+            "stage is out of date, which usually means your own runner is advancing the " <>
+            "story at the same time. Re-read the story's stage and make the call again."
+      }
+    })
+  end
+
+  # #803: a story with no `story_stages` row at all. It is a control-plane state, not
+  # something the caller can clear by retrying or by giving up its claim, which is why it is
+  # a 404 naming the stage row rather than the story.
+  def call(conn, {:error, :unknown_story_stage}) do
+    conn
+    |> put_status(:not_found)
+    |> json(%{
+      error: %{
+        status: 404,
+        code: "unknown_story_stage",
+        message:
+          "This story has no delivery stage row, so it is not in the delivery loop. " <>
+            "Nothing was written."
+      }
+    })
+  end
+
+  # #803: a lock a delivery-stage write could not get inside its bounded wait, or a deadlock
+  # Postgres broke by choosing it. NOTHING was written and the request is fine, so it is
+  # retryable — with a `retry-after` LONGER than the wait that just ran out, because retrying
+  # at exactly that wait puts the caller back in the same queue with no backoff.
+  def call(conn, {:error, :busy}) do
+    conn
+    |> maybe_put_retry_after(div(Capacity.busy_retry_ms(), 1000) + 1)
+    |> put_status(:service_unavailable)
+    |> json(%{
+      error: %{
+        status: 503,
+        code: "busy",
+        message:
+          "The delivery stage row was locked by another writer and this call gave up " <>
+            "waiting. Nothing was written; retry after the retry-after interval."
+      }
+    })
+  end
+
   def call(conn, {:error, :not_claimant}) do
     conn
     |> put_status(:conflict)
@@ -263,8 +327,8 @@ defmodule LoopctlWeb.FallbackController do
         status: 409,
         code: "not_claimant",
         message:
-          "Only the story's assigned agent can renew its claim, and your key's agent is " <>
-            "not it."
+          "Only the story's assigned agent can do this, and your key's agent is not it. " <>
+            "Renewing a claim and escalating a story are both the claimant's."
       }
     })
   end
@@ -847,6 +911,110 @@ defmodule LoopctlWeb.FallbackController do
         code: "no_api_key",
         message: message,
         remediation: Remediation.for_credential(:anthropic)
+      }
+    })
+  end
+
+  # #803: the delivery stage machine refusing the TRANSITION a caller asked for. Distinct
+  # from `{:invalid_transition, ctx}` above, which is the story lifecycle's and carries the
+  # statuses it would have moved between; this one is bare because the stage machine's table
+  # is a fixed triple and the caller already knows the one it sent.
+  def call(conn, {:error, :invalid_transition}) do
+    conn
+    |> put_status(:conflict)
+    |> json(%{
+      error: %{
+        status: 409,
+        code: "invalid_transition",
+        message:
+          "The delivery stage machine has no such transition from this story's current " <>
+            "stage. Nothing was written."
+      }
+    })
+  end
+
+  # #803: everything the stage machine refuses about the REQUEST rather than about the
+  # story's state. One clause, because the remedy is the same for all of them — the call as
+  # sent cannot be made, and resending it unchanged will not help — and the `code` says which.
+  @stage_request_faults %{
+    reason_required: "A reason is required for this transition.",
+    invalid_reason:
+      "The reason is empty, too long, or contains a character the database cannot store. " <>
+        "The bound is #{StageMachine.max_reason_length()} codepoints, which is what " <>
+        "Postgres counts, not graphemes.",
+    invalid_event_data:
+      "The structured payload is not a JSON object, is over 8000 bytes once encoded, or " <>
+        "contains a NUL.",
+    invalid_effect: "One of the side-effect identities is malformed or is not a known effect.",
+    missing_required_effect:
+      "This transition must carry an identity it did not: entering `merged` has to name " <>
+        "the merge sha.",
+    wrong_stage: "This story's stage does not produce the side-effect identity given.",
+    effect_conflict:
+      "That side-effect identity is already recorded with a DIFFERENT value. A replay may " <>
+        "re-send the same value; it may never record a second one.",
+    human_required:
+      "Only a human principal may take this transition: a role of at least `user` on a key " <>
+        "no dispatch minted."
+  }
+
+  def call(conn, {:error, fault}) when is_map_key(@stage_request_faults, fault) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        code: Atom.to_string(fault),
+        message: Map.fetch!(@stage_request_faults, fault)
+      }
+    })
+  end
+
+  # #803: a custody transition whose hash-chain entry did not land, so the whole transition
+  # rolled back. A 500 because it is a server-side fault an operator has to look at — the
+  # caller did nothing wrong and retrying will not help while the chain is refusing — and
+  # `Loopctl.Delivery.Stages` has already logged it with the tenant, story and reason.
+  def call(conn, {:error, :audit_chain_append_failed}) do
+    conn
+    |> put_status(:internal_server_error)
+    |> json(%{
+      error: %{
+        status: 500,
+        code: "audit_chain_append_failed",
+        message:
+          "The audit chain refused this transition's entry, so nothing was written. This " <>
+            "is a server-side condition; it has been logged."
+      }
+    })
+  end
+
+  # THE LAST CLAUSE. An `{:error, atom}` no clause above names used to raise
+  # `FunctionClauseError` here, which reaches the client as a 500 that is indistinguishable
+  # from a crash and reaches the operator as a stack trace naming this module rather than the
+  # atom. Both halves were the problem: #824 shipped four reachable atoms with no clause and
+  # nothing failed until a request hit one.
+  #
+  # It answers 500, not 422: an unmapped atom is a GAP, and rendering it as a client error
+  # would tell the caller its request was wrong when nobody has decided that. The atom is
+  # logged, never echoed — a context's internal vocabulary is not a public error code.
+  #
+  # Deliberately narrow. It matches an ATOM only, so a changeset, a `{:error, reason, message}`
+  # triple and every struct clause above keep their own rendering, and a new refusal shape
+  # still fails loudly rather than being absorbed here.
+  def call(conn, {:error, reason}) when is_atom(reason) do
+    Logger.error(
+      "FallbackController has no clause for #{inspect(reason)}; answered 500. " <>
+        "Add a clause, or map it in the controller. " <>
+        "path=#{conn.request_path} method=#{conn.method}"
+    )
+
+    conn
+    |> put_status(:internal_server_error)
+    |> json(%{
+      error: %{
+        status: 500,
+        code: "internal_error",
+        message: "The server could not complete this request. It has been logged."
       }
     })
   end
