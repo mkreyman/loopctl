@@ -76,6 +76,15 @@ defmodule Loopctl.Delivery.Stages do
   - **This module never takes the capacity advisory lock.** Nothing here raises a tenant's
     in-flight sum — a release only lowers it — so acquiring it would add a lock ahead of
     everything else for no admission decision.
+
+    What that costs an OPERATOR reading a burst of `:capacity_busy` (#822's wording,
+    repeated here because this module owns the other half of the order): the capacity lock
+    is taken FIRST, so a dispatch holding it and waiting on a story row makes every other
+    dispatch in that tenant queue behind the capacity lock and fall out as
+    `:capacity_busy` once the 5s `lock_timeout` elapses. A burst of them therefore means a
+    LONG-HELD STORY LOCK — a claim release, a reclaim sweep, a transition that is waiting
+    on something — not a capacity shortage. Look at what is holding the story row before
+    raising a tenant's cap.
   - **When the session-end wiring lands, `release_slot_in/4` runs BEFORE
     `AuditChain.append`, never after**: it takes the dispatch row and the `runners` row,
     both of which sit after the chain in this order.
