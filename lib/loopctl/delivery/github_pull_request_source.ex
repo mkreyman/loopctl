@@ -87,13 +87,33 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   @ref ~r{\A[A-Za-z0-9_./-]+\z}
   @control ~r/[\x00-\x1f\x7f]/
 
-  # How many of an environment's newest deployments one call reads before the `since` filter
-  # is applied. Small on purpose: every survivor costs a status request, and the page only
-  # has to be deep enough to reach past the deployments that landed between a story's merge
-  # and its sweep. A merge older than this many deployments reads as "nothing carries it
-  # yet" and waits out the verifier's in-flight bound — the safe direction, never a false
-  # verify.
-  @deployment_page 5
+  # How many of an environment's newest deployments one call reads, BEFORE the `since`
+  # filter. Deep enough that reaching a record older than the merge is the ordinary outcome:
+  # the forge applies this size first, so a page whose oldest record is still newer than
+  # `since` is one that may be HIDING the deployment that carries the merge, and that is
+  # refused rather than reported as a short list (a short list there is indistinguishable
+  # from "nothing carries it" and ends in a confident false escalation).
+  #
+  # The list call is one request whatever this is; the cost is in the SURVIVORS, each of
+  # which needs a status request and then a containment request from the verifier. So the
+  # page is generous and the survivor count is what is capped.
+  @deployment_page 30
+
+  # How many deployments since the merge this will resolve states for. Past it the answer is
+  # a refusal, not a truncated list, for the same reason as above.
+  #
+  # Five bounds the worst case at 11 requests for one story — one list, five statuses, and
+  # the verifier's five containment calls — which at the 2s/5s timeouts is the ~77s the
+  # sweep's wall-clock budget is sized against. More than five deployments landing on one
+  # environment inside a story's verification window is an environment nobody can judge a
+  # single merge against from here, and a human should look.
+  @max_deployments_since 5
+
+  # Statuses read per deployment. More than one because `state` (the latest) and
+  # `succeeded?` (did `success` EVER appear) are different questions, and it is the second
+  # that says whether the commit shipped — GitHub writes `inactive` over a perfectly good
+  # deployment as soon as a newer one succeeds. Same request either way.
+  @status_page 20
 
   @impl true
   def pull_request(repo, number) when is_integer(number) and number > 0 do
@@ -127,6 +147,10 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
 
   def deployments_since(_repo, _environment, since), do: {:error, {:invalid_since, shape(since)}}
 
+  @doc "The most deployments since a merge this adapter will judge. See `@max_deployments_since`."
+  @spec max_deployments_since() :: pos_integer()
+  def max_deployments_since, do: @max_deployments_since
+
   @impl true
   def contains?(repo, sha, ref) do
     with {:ok, repo} <- repo_name(repo),
@@ -150,12 +174,40 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
     |> Enum.map(&deployment_record/1)
     |> Enum.reduce_while({:ok, []}, &keep_since(&1, &2, since))
     |> case do
-      {:ok, kept} -> kept |> Enum.reverse() |> resolve_states(repo)
+      {:ok, kept} -> kept |> Enum.reverse() |> bounded(entries, since, repo)
       error -> error
     end
   end
 
   defp deployments(_repo, body, _since), do: {:error, {:unreadable_deployments, shape(body)}}
+
+  # Two ways the answer can be INCOMPLETE, and both are refusals rather than short lists.
+  #
+  # A page that never reached a record older than `since` may be hiding the deployment that
+  # carries the merge — the forge applied its page size before this filter did. And more
+  # survivors than this adapter will resolve is the same problem one layer along.
+  #
+  # Neither is transient, so both escalate with the reason named; reporting either as
+  # "nothing carries it" is a confident false escalation instead of an honest one.
+  defp bounded(kept, entries, since, repo) do
+    cond do
+      # Truncation FIRST: when the page is full it is the more accurate diagnosis, and a
+      # full page is also over the survivor cap, so the other clause would mask it.
+      truncated?(kept, entries, since) ->
+        {:error, {:deployment_page_exhausted, @deployment_page, since}}
+
+      length(kept) > @max_deployments_since ->
+        {:error, {:too_many_deployments_since_merge, length(kept), @max_deployments_since}}
+
+      true ->
+        resolve_states(kept, repo)
+    end
+  end
+
+  # The page was FULL and every record on it survived the filter, so there may be more.
+  # A page that reached an older record, or a short page, is the whole truth.
+  defp truncated?(kept, entries, _since),
+    do: length(entries) >= @deployment_page and length(kept) == length(entries)
 
   # The list is newest first, so the FIRST record older than `since` ends it: nothing below
   # it can be newer, and every one of them would cost a status call to learn nothing.
@@ -180,7 +232,7 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   defp resolve_states(records, repo) do
     Enum.reduce_while(records, {:ok, []}, fn record, {:ok, acc} ->
       case deployment_state(repo, record.id) do
-        {:ok, state} -> {:cont, {:ok, [Map.put(record, :state, state) | acc]}}
+        {:ok, facts} -> {:cont, {:ok, [Map.merge(record, facts) | acc]}}
         {:error, _reason} = error -> {:halt, error}
       end
     end)
@@ -190,17 +242,34 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
     end
   end
 
-  # A deployment with NO status yet has not settled, which is the same answer to a verifier
-  # as `queued`/`pending`/`in_progress`: ask again. An unrecognised state is NOT approximated
-  # — a state we have not thought about is not evidence that a deploy succeeded.
+  # TWO facts from one request, because they answer different questions.
+  #
+  # `state` is the LATEST status. A deployment with none yet has not settled, which is the
+  # same answer to a verifier as `queued`/`pending`/`in_progress`: ask again. An
+  # unrecognised state is NOT approximated — a state we have not thought about is not
+  # evidence that a deploy succeeded.
+  #
+  # `succeeded?` is whether `success` appears anywhere in the history. That is the one that
+  # says the commit SHIPPED: GitHub writes `inactive` over an earlier deployment as soon as
+  # a newer one succeeds, so a deployment that shipped is routinely `inactive` by the time
+  # a sweep reads it, and judging on `state` alone escalated those.
   defp deployment_state(repo, id) do
-    case get(repo, "/deployments/#{id}/statuses?per_page=1") do
-      {:ok, []} -> {:ok, :pending}
-      {:ok, [%{"state" => state} | _rest]} when is_binary(state) -> map_state(state)
+    case get(repo, "/deployments/#{id}/statuses?per_page=#{@status_page}") do
+      {:ok, []} -> {:ok, %{state: :pending, succeeded?: false}}
+      {:ok, [_ | _] = statuses} -> deployment_facts(statuses)
       {:ok, body} -> {:error, {:unreadable_deployment_statuses, shape(body)}}
       {:error, reason} -> {:error, reason}
     end
   end
+
+  defp deployment_facts([%{"state" => latest} | _rest] = statuses) when is_binary(latest) do
+    with {:ok, state} <- map_state(latest) do
+      {:ok, %{state: state, succeeded?: Enum.any?(statuses, &(&1["state"] == "success"))}}
+    end
+  end
+
+  defp deployment_facts(statuses),
+    do: {:error, {:unreadable_deployment_statuses, shape(statuses)}}
 
   defp map_state("success"), do: {:ok, :success}
   defp map_state("failure"), do: {:ok, :failure}

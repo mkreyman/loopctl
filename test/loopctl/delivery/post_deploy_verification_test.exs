@@ -71,7 +71,17 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
         # The `since` the forge is asked for is the moment the merge was RECORDED, read from
         # the stage event — a deployment created before it cannot carry the merge.
         assert %DateTime{} = since
-        {:ok, [%{id: 91, sha: @merge, state: :success, created_at: DateTime.utc_now()}]}
+
+        {:ok,
+         [
+           %{
+             id: 91,
+             sha: @merge,
+             state: :success,
+             succeeded?: true,
+             created_at: DateTime.utc_now()
+           }
+         ]}
       end)
 
       assert {:ok, %Result{decision: :verified} = result} = evaluate(ctx)
@@ -79,6 +89,26 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
       assert result.merge_sha == @merge
       assert result.deployed_sha == @merge
       assert result.deployment_id == 91
+    end
+
+    test "the `since` handed to the forge carries a CLOCK TOLERANCE", ctx do
+      # `merged_at` is loopctl's commit time and `created_at` is GitHub's. A deploy job that
+      # creates its record before loopctl commits the merged transition, or a few seconds of
+      # skew, would put the ONLY deployment that can carry the merge permanently outside the
+      # window — on every sweep for ever, because a record never gets newer.
+      merged_at = merge_event_at(ctx)
+      test = self()
+
+      Mox.stub(MockPullRequestSource, :deployments_since, fn _repo, _env, since ->
+        send(test, {:since, since})
+        {:ok, []}
+      end)
+
+      assert {:ok, %Result{decision: :unresolved}} = evaluate(ctx)
+      assert_received {:since, since}
+
+      slack = DateTime.diff(merged_at, since, :second)
+      assert slack == PostDeployVerification.clock_tolerance_seconds()
     end
 
     test "the containment call is SKIPPED when the deployed commit is the merge itself", ctx do
@@ -213,17 +243,69 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
       later = String.duplicate("e", 40)
 
       stub_deployments([
-        %{id: 2, sha: later, state: :failure, created_at: DateTime.utc_now()},
-        %{id: 1, sha: @deployed, state: :success, created_at: DateTime.utc_now()}
+        %{id: 2, sha: later, state: :failure, succeeded?: false, created_at: DateTime.utc_now()},
+        %{
+          id: 1,
+          sha: @deployed,
+          state: :success,
+          succeeded?: true,
+          created_at: DateTime.utc_now()
+        }
       ])
 
-      Mox.stub(MockPullRequestSource, :contains?, fn _repo, @merge, ref ->
-        {:ok, ref == @deployed}
-      end)
+      # BOTH carry it. B is a descendant of A, so the later deploy contains A's merge too —
+      # answering `false` there is something the forge cannot do, and stubbing it that way
+      # made this guard vacuous while the newest-carrier bug was live.
+      Mox.stub(MockPullRequestSource, :contains?, fn _repo, @merge, _ref -> {:ok, true} end)
 
       assert {:ok, %Result{decision: :verified} = result} = enforce(ctx)
       assert result.deployment_id == 1
       assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :verified
+    end
+
+    test "an INACTIVE deployment that once succeeded still shipped", ctx do
+      # GitHub auto-inactivates an earlier deployment the moment a newer one succeeds, so a
+      # deployment that shipped is routinely `inactive` by the time a sweep reads it.
+      stub_deployment(state: :inactive, succeeded?: true)
+
+      assert {:ok, %Result{decision: :verified}} = enforce(ctx)
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :verified
+    end
+
+    test "alternating KINDS still reach a bound — the total is what stops the loop", ctx do
+      # Each per-kind count restarts when the kind changes, so alternating between a 5xx-ing
+      # forge and a wedged deploy reached neither bound: the story sat at `deployed` for
+      # ever and nobody was told, the one outcome the counter exists to prevent.
+      total = PostDeployVerification.max_consecutive_total()
+
+      for attempt <- 1..total do
+        if rem(attempt, 2) == 0, do: stub_unreachable(), else: stub_deployments([])
+        assert {:ok, %Result{decision: :unresolved}} = enforce(ctx)
+      end
+
+      # Neither per-kind count is anywhere near its own bound.
+      row = Stages.get(ctx.tenant_id, ctx.story_id)
+      assert row.stage == :deployed
+      assert row.post_deploy_unresolved["count"] == 1
+      assert row.post_deploy_unresolved["total"] == total
+
+      stub_deployments([])
+
+      assert {:ok, %Result{decision: :failed, reasons: reasons}} = enforce(ctx)
+      assert {:unresolved_total_exceeded, total + 1, total} in reasons
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :escalated
+    end
+
+    test "a verdict clears the TOTAL as well as the per-kind count", ctx do
+      stub_unreachable()
+      assert {:ok, %Result{decision: :unresolved}} = enforce(ctx)
+      stub_deployments([])
+      assert {:ok, %Result{decision: :unresolved}} = enforce(ctx)
+      assert Stages.get(ctx.tenant_id, ctx.story_id).post_deploy_unresolved["total"] == 2
+
+      stub_deployment(sha: @merge)
+      assert {:ok, %Result{decision: :verified}} = enforce(ctx)
+      assert is_nil(Stages.get(ctx.tenant_id, ctx.story_id).post_deploy_unresolved)
     end
 
     test "a TRANSIENT forge fault leaves the story at deployed, and is COUNTED", ctx do
@@ -237,7 +319,7 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
       assert row.stage == :deployed
 
       assert row.post_deploy_unresolved ==
-               %{"merge_sha" => @merge, "kind" => "forge_fault", "count" => 1}
+               %{"merge_sha" => @merge, "kind" => "forge_fault", "count" => 1, "total" => 1}
     end
 
     test "the two KINDS of waiting are counted separately, so one cannot spend the other",
@@ -254,7 +336,7 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
       assert {:ok, %Result{unresolved_kind: :deploy_pending}} = enforce(ctx)
 
       assert Stages.get(ctx.tenant_id, ctx.story_id).post_deploy_unresolved ==
-               %{"merge_sha" => @merge, "kind" => "deploy_pending", "count" => 1}
+               %{"merge_sha" => @merge, "kind" => "deploy_pending", "count" => 1, "total" => 3}
     end
 
     test "a DEPLOY STILL RUNNING leaves the story at deployed, and is counted", ctx do
@@ -326,7 +408,8 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
                |> Stages.list_events(ctx.story_id)
                |> Enum.filter(&(&1.event == "post_deploy_unresolved"))
 
-      assert data == %{"merge_sha" => @merge, "kind" => "forge_fault", "count" => 1}
+      assert data ==
+               %{"merge_sha" => @merge, "kind" => "forge_fault", "count" => 1, "total" => 1}
     end
 
     test "a story with NO merge event fails closed — its history cannot date the merge", ctx do
@@ -426,7 +509,16 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
             |> Repo.update_all(set: [stage: :escalated, escalation_reason: "raced"])
           end)
 
-        {:ok, [%{id: 91, sha: @merge, state: :success, created_at: DateTime.utc_now()}]}
+        {:ok,
+         [
+           %{
+             id: 91,
+             sha: @merge,
+             state: :success,
+             succeeded?: true,
+             created_at: DateTime.utc_now()
+           }
+         ]}
       end)
 
       assert {:ok, %Result{decision: :verified, reasons: reasons}} = enforce(ctx)
@@ -538,6 +630,27 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
       assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :escalated
     end
 
+    test "the deadline is checked BEFORE a candidate, not only after one", ctx do
+      # Checked only after, a run could start a candidate just under the budget and finish
+      # ~77s later — past the 120s cron, at which point the `unique` window drops the next
+      # tick, halves the cadence and stretches both of the verifier's documented bounds.
+      _second = build_story(%{id: ctx.tenant_id}, "acme/other")
+      stub_deployment(sha: @merge)
+
+      Mox.stub(MockPullRequestSource, :deployments_since, fn _repo, _env, _since ->
+        flunk("no candidate may start once the budget is spent")
+      end)
+
+      spent = System.monotonic_time(:millisecond) - 1
+
+      assert PostDeployVerificationWorker.sweep(
+               [%{tenant_id: ctx.tenant_id, story_id: ctx.story_id, claim_epoch: 0}],
+               spent
+             ) == []
+
+      assert Stages.get(ctx.tenant_id, ctx.story_id).stage == :deployed
+    end
+
     test "a rate-limited forge HALTS the run rather than spending the rest of the window",
          ctx do
       # The remaining candidates would ask a forge that has already said it is out of quota.
@@ -572,6 +685,14 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
 
   defp perform_job(worker, args), do: worker.perform(%Oban.Job{args: args})
 
+  defp merge_event_at(ctx) do
+    ctx.tenant_id
+    |> Stages.list_events(ctx.story_id)
+    |> Enum.filter(&(&1.event == "transitioned" and &1.to_stage == "merged"))
+    |> List.last()
+    |> Map.fetch!(:inserted_at)
+  end
+
   # One deployment created after the merge, which is what the forge returns once the deploy
   # job has made its record. `contains` is answered by `contains?/3`, not baked in here, so
   # the gather walk is exercised rather than bypassed.
@@ -581,6 +702,8 @@ defmodule Loopctl.Delivery.PostDeployVerificationTest do
         id: 91,
         sha: Keyword.get(opts, :sha, @deployed),
         state: Keyword.get(opts, :state, :success),
+        succeeded?:
+          Keyword.get(opts, :succeeded?, Keyword.get(opts, :state, :success) == :success),
         created_at: DateTime.utc_now()
       }
     ])

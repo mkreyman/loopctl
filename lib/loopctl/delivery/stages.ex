@@ -460,16 +460,28 @@ defmodule Loopctl.Delivery.Stages do
   #
   # They are separate COLUMNS rather than two keys of one map: clearing a verdict at one
   # gate must not clear the other's count, and the two are cleared by different edges.
+  # `totalled_by` is the subset of the identity that a SECOND, coarser count is kept over.
+  #
+  # The post-deploy counter's identity carries a `kind`, and the per-kind count RESTARTS
+  # when the kind changes — right for the two different bounds, and wrong on its own: an
+  # intermittently 5xx-ing forge alternating with a wedged deploy resets each count before
+  # either reaches its bound, so the story sits at `deployed` for ever and nobody is told.
+  # That is the ONE outcome the counter exists to prevent. The total is kept over the merge
+  # ALONE, so alternating kinds still accumulate, and a verdict clears both together.
+  #
+  # The merge gate has one kind and therefore no total; its stored shape is unchanged.
   @counters %{
     merge_gate: %{
       column: :merge_gate_unevaluated,
       stage: :ci,
-      event: "merge_gate_unevaluated"
+      event: "merge_gate_unevaluated",
+      totalled_by: nil
     },
     post_deploy: %{
       column: :post_deploy_unresolved,
       stage: :deployed,
-      event: "post_deploy_unresolved"
+      event: "post_deploy_unresolved",
+      totalled_by: ["merge_sha"]
     }
   }
 
@@ -498,8 +510,14 @@ defmodule Loopctl.Delivery.Stages do
   """
   @spec note_unevaluated(Ecto.UUID.t(), Ecto.UUID.t(), String.t() | nil, keyword()) ::
           {:ok, pos_integer()} | {:error, :not_found | :stale_claim_epoch | :wrong_stage | :busy}
-  def note_unevaluated(tenant_id, story_id, head_sha, opts),
-    do: note_counter(:merge_gate, tenant_id, story_id, %{"head_sha" => head_sha}, opts)
+  # The merge gate keeps its ORIGINAL return — a bare count. It has one kind, so it carries
+  # no total, and `Loopctl.Delivery.MergePrecondition` matches on the integer.
+  def note_unevaluated(tenant_id, story_id, head_sha, opts) do
+    case note_counter(:merge_gate, tenant_id, story_id, %{"head_sha" => head_sha}, opts) do
+      {:ok, %{count: count}} -> {:ok, count}
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
   @doc """
   Counts a post-deploy verification sweep at `merge_sha` that reached NO verdict (#803 §9),
@@ -537,7 +555,8 @@ defmodule Loopctl.Delivery.Stages do
           atom(),
           keyword()
         ) ::
-          {:ok, pos_integer()} | {:error, :not_found | :stale_claim_epoch | :wrong_stage | :busy}
+          {:ok, %{count: pos_integer(), total: pos_integer()}}
+          | {:error, :not_found | :stale_claim_epoch | :wrong_stage | :busy}
   def note_post_deploy_unresolved(tenant_id, story_id, merge_sha, kind, opts)
       when is_atom(kind) do
     identity = %{"merge_sha" => merge_sha, "kind" => Atom.to_string(kind)}
@@ -563,8 +582,8 @@ defmodule Loopctl.Delivery.Stages do
     if row.claim_epoch != story.claim_epoch, do: Repo.rollback(:stale_claim_epoch)
     if row.stage != counter.stage, do: Repo.rollback(:wrong_stage)
 
-    count = next_unresolved_count(Map.fetch!(row, counter.column), identity)
-    value = Map.put(identity, "count", count)
+    counts = next_counts(Map.fetch!(row, counter.column), identity, counter.totalled_by)
+    value = identity |> Map.put("count", counts.count) |> put_total(counter, counts)
 
     {1, [row]} =
       from(s in StoryStage,
@@ -578,8 +597,11 @@ defmodule Loopctl.Delivery.Stages do
       |> Repo.update_all([])
 
     insert_event(Repo, row, counter.event, nil, nil, opts[:actor_label], value)
-    count
+    counts
   end
+
+  defp put_total(value, %{totalled_by: nil}, _counts), do: value
+  defp put_total(value, _counter, counts), do: Map.put(value, "total", counts.total)
 
   @doc """
   Clears the consecutive-unevaluated count after an evaluation that DID produce a verdict.
@@ -652,16 +674,34 @@ defmodule Loopctl.Delivery.Stages do
     :cleared
   end
 
-  # The WHOLE identity has to match, not one key of it: the stored map is the identity plus
-  # `"count"`, so dropping the count and comparing catches a changed sha, a changed kind, a
-  # missing key and an extra one alike. Anything else restarts at 1 — a malformed or
-  # differently-shaped stored value is not "a count at something", it is no count.
-  defp next_unresolved_count(%{"count" => count} = previous, identity)
+  # Two counts from one stored map.
+  #
+  # `count` needs the WHOLE identity to match — a changed sha, a changed kind, a missing key
+  # and an extra one all restart it. `total` needs only `totalled_by` to match, so a run
+  # that alternates kinds keeps accumulating instead of the two resetting each other to 1
+  # and reaching neither bound.
+  #
+  # A malformed or differently-shaped stored value is not "a count at something", it is no
+  # count, and both restart at 1.
+  defp next_counts(%{"count" => count} = previous, identity, totalled_by)
        when is_integer(count) and count >= 0 do
-    if Map.delete(previous, "count") == identity, do: count + 1, else: 1
+    stored = previous |> Map.delete("count") |> Map.delete("total")
+
+    %{
+      count: if(stored == identity, do: count + 1, else: 1),
+      total: next_total(stored, identity, totalled_by, Map.get(previous, "total", count))
+    }
   end
 
-  defp next_unresolved_count(_previous, _identity), do: 1
+  defp next_counts(_previous, _identity, _totalled_by), do: %{count: 1, total: 1}
+
+  defp next_total(_stored, _identity, nil, _total), do: 1
+
+  defp next_total(stored, identity, totalled_by, total) when is_integer(total) and total >= 0 do
+    if Map.take(stored, totalled_by) == Map.take(identity, totalled_by), do: total + 1, else: 1
+  end
+
+  defp next_total(_stored, _identity, _totalled_by, _total), do: 1
 
   @doc """
   Records the identity of a side effect on the story's stage row, idempotently.

@@ -38,8 +38,11 @@ defmodule Loopctl.Workers.PostDeployVerificationWorker do
 
   - `@batch` candidates, so one run cannot spend an hourly rate limit in a minute.
     Verification is the one gate whose candidates all ask GitHub the SAME questions at once.
-  - `@run_budget_ms` of WALL CLOCK, checked between candidates. The count bounds how many
-    stories a healthy run touches; only the clock bounds how long an unhealthy one takes.
+  - `@run_budget_ms` of WALL CLOCK, checked BEFORE each candidate and sized as the cron
+    interval minus one candidate's worst case. The count bounds how many stories a healthy
+    run touches; only the clock bounds how long an unhealthy one takes — and checking it
+    only AFTER a candidate let a run start one just under the budget and finish past the
+    interval, which drops the next tick to the `unique` window and halves the cadence.
   - Oban `unique` over the cron interval, so a run that overruns anyway does not get a
     second copy of itself. Overlapping runs were always SAFE — every write is a
     compare-and-set — but two of them are twice the forge traffic for one run's work.
@@ -68,10 +71,20 @@ defmodule Loopctl.Workers.PostDeployVerificationWorker do
 
   @batch 10
 
-  # Wall clock for one run, checked BETWEEN candidates so a slow forge cannot carry a run
-  # past the cron interval. Under the interval on purpose: the remainder of the batch is not
-  # lost, it is the next run's first candidates (oldest `updated_at` first).
-  @run_budget_ms 90_000
+  # Wall clock for one run, checked BEFORE each candidate rather than only after one.
+  #
+  # Sized as INTERVAL MINUS WORST CASE, which is what the "between candidates" check alone
+  # got wrong: a candidate's worst case is the adapter's bound of 11 bounded requests (one
+  # deployment list, up to five statuses, up to five containment calls) at 2s connect + 5s
+  # receive, so ~77s. Checked only after a candidate, a run could start one at 89s and
+  # finish at ~166s — past the 120s cron, at which point the `unique` window drops the next
+  # tick, HALVES the cadence and silently stretches both of the verifier's documented bounds.
+  #
+  # 40s + 77s stays inside 120s. In the ordinary case a candidate costs two or three sub-
+  # second calls, so a full batch of ten finishes in well under a second and the budget is
+  # never consulted; it is the pathological run this bounds, and the remainder is not lost —
+  # it is the next run's first candidates (oldest `updated_at` first).
+  @run_budget_ms 40_000
 
   @actor_label "worker:post_deploy_verification"
 
@@ -98,21 +111,36 @@ defmodule Loopctl.Workers.PostDeployVerificationWorker do
 
   # `reduce_while` rather than `map`: a rate-limited forge is a reason to stop asking, not a
   # reason to ask nine more times — and so is a run that has used its wall clock.
-  defp sweep(candidates) do
-    deadline = System.monotonic_time(:millisecond) + @run_budget_ms
+  defp sweep(candidates),
+    do: sweep(candidates, System.monotonic_time(:millisecond) + @run_budget_ms)
 
+  @doc """
+  One pass over `candidates`, stopping at `deadline` (a `System.monotonic_time(:millisecond)`
+  value) or at the first rate-limited result.
+
+  Public with the deadline as an argument ONLY so the budget's behaviour is falsifiable: the
+  budget is a compile-time constant measured in tens of seconds, and a test that had to
+  spend it in real time could not tell "checked before the candidate" from "checked after".
+  Production calls `sweep/1`, which computes the deadline itself.
+  """
+  @spec sweep([map()], integer()) :: [{map(), term()}]
+  def sweep(candidates, deadline) do
     candidates
     |> Enum.reduce_while([], fn candidate, acc ->
-      result = verify(candidate)
-      acc = [{candidate, result} | acc]
-
-      cond do
-        rate_limited?(result) -> {:halt, acc}
-        System.monotonic_time(:millisecond) >= deadline -> {:halt, log_budget_spent(acc)}
-        true -> {:cont, acc}
+      if System.monotonic_time(:millisecond) >= deadline do
+        {:halt, log_budget_spent(acc)}
+      else
+        after_candidate(candidate, acc)
       end
     end)
     |> Enum.reverse()
+  end
+
+  defp after_candidate(candidate, acc) do
+    result = verify(candidate)
+    acc = [{candidate, result} | acc]
+
+    if rate_limited?(result), do: {:halt, acc}, else: {:cont, acc}
   end
 
   defp log_budget_spent(acc) do

@@ -341,10 +341,10 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
       # merges land minutes apart.
       stub(fn conn ->
         case {conn.request_path, conn.query_string} do
-          {"/repos/acme/widgets/deployments", "environment=production&per_page=5"} ->
+          {"/repos/acme/widgets/deployments", "environment=production&per_page=30"} ->
             json(conn, [%{"id" => 501, "sha" => @head, "created_at" => "2026-09-13T12:05:00Z"}])
 
-          {"/repos/acme/widgets/deployments/501/statuses", "per_page=1"} ->
+          {"/repos/acme/widgets/deployments/501/statuses", "per_page=20"} ->
             json(conn, [%{"state" => "success"}])
 
           other ->
@@ -356,7 +356,56 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
       assert deployment.id == 501
       assert deployment.sha == @head
       assert deployment.state == :success
+      assert deployment.succeeded?
       assert deployment.created_at == ~U[2026-09-13 12:05:00Z]
+    end
+
+    test "succeeded? reads the status HISTORY, so an auto-inactivated deploy still shipped" do
+      # GitHub writes `inactive` onto an earlier deployment as soon as a newer one succeeds,
+      # so a deployment that shipped perfectly well is routinely `inactive` when a sweep
+      # reads it. The latest state and "did it ever ship" are different questions.
+      stub(&deployment_route(&1, [%{"state" => "inactive"}, %{"state" => "success"}]))
+
+      assert {:ok, [deployment]} = Source.deployments_since(@repo, "production", @since)
+      assert deployment.state == :inactive
+      assert deployment.succeeded?
+    end
+
+    test "a deployment deactivated having NEVER succeeded is not marked as shipped" do
+      stub(&deployment_route(&1, [%{"state" => "inactive"}, %{"state" => "in_progress"}]))
+
+      assert {:ok, [deployment]} = Source.deployments_since(@repo, "production", @since)
+      assert deployment.state == :inactive
+      refute deployment.succeeded?
+    end
+
+    test "a FULL page whose oldest record is still newer than `since` is REFUSED" do
+      # The forge applies its page size BEFORE this filter, so a full page that never
+      # reached an older record may be hiding the deployment that carries the merge — and a
+      # short list there is indistinguishable from "nothing carries it", which ends in a
+      # confident false escalation at the long bound.
+      entries =
+        for i <- 1..30 do
+          %{"id" => i, "sha" => @head, "created_at" => "2026-09-13T12:05:00Z"}
+        end
+
+      stub(fn conn -> json(conn, entries) end)
+
+      assert {:error, {:deployment_page_exhausted, 30, @since}} =
+               Source.deployments_since(@repo, "production", @since)
+    end
+
+    test "more survivors than it will resolve is refused, not truncated" do
+      entries =
+        for i <- 1..6 do
+          %{"id" => i, "sha" => @head, "created_at" => "2026-09-13T12:05:00Z"}
+        end ++
+          [%{"id" => 99, "sha" => @merge_base, "created_at" => "2026-09-13T10:00:00Z"}]
+
+      stub(fn conn -> json(conn, entries) end)
+
+      assert {:error, {:too_many_deployments_since_merge, 6, 5}} =
+               Source.deployments_since(@repo, "production", @since)
     end
 
     test "STOPS at the first deployment older than `since`, and pays for no status call" do
@@ -457,7 +506,7 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
       # GitHub environment names allow spaces. Pattern-matching them against the ref shape
       # made a correct configured value a PERMANENT fault that escalated every waiting story.
       stub(fn conn ->
-        assert conn.query_string == "environment=production+%28fly%29&per_page=5"
+        assert conn.query_string == "environment=production+%28fly%29&per_page=30"
         json(conn, [])
       end)
 
@@ -466,7 +515,7 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
 
     test "an ampersand cannot smuggle a second query parameter" do
       stub(fn conn ->
-        assert conn.query_string == "environment=prod%26per_page%3D100&per_page=5"
+        assert conn.query_string == "environment=prod%26per_page%3D100&per_page=30"
         json(conn, [])
       end)
 

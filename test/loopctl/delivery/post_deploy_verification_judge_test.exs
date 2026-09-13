@@ -47,14 +47,16 @@ defmodule Loopctl.Delivery.PostDeployVerificationJudgeTest do
       assert result.deployed_sha == @deployed
     end
 
-    test "an OLDER successful deployment verifies even when a newer one did not carry it" do
-      # The regression this page exists for: A merges and deploy 1 carries it, B merges and
-      # deploy 2 fails. Reading only the newest read deploy 2 as the whole truth and
-      # escalated A, which had already shipped.
+    test "an older carrying SUCCESS beats a newer carrying FAILURE" do
+      # THE case, with the containment answers GitHub would actually give. A merges and
+      # deploy 1 carries it; B merges and deploy 2 fails. B is a DESCENDANT of A, so deploy
+      # 2 carries A's merge too — `contains: false` there is an answer the forge cannot
+      # give, and stubbing it that way made the guard vacuous. With both carrying, halting
+      # at the first (newest) carrier escalates A although A's code is running.
       result =
         judge(
           deployments: [
-            deployment(id: 2, sha: @other, state: :failure, contains: false),
+            deployment(id: 2, sha: @other, state: :failure, contains: true),
             deployment(id: 1, sha: @deployed, state: :success, contains: true)
           ]
         )
@@ -62,6 +64,17 @@ defmodule Loopctl.Delivery.PostDeployVerificationJudgeTest do
       assert %Result{decision: :verified} = result
       assert result.deployment_id == 1
       assert result.deployed_sha == @deployed
+    end
+
+    test "an INACTIVE deployment that once succeeded still shipped" do
+      # GitHub writes `inactive` onto an earlier deployment the moment a newer one succeeds
+      # (`auto_inactive`, on any environment not flagged `production_environment` — and the
+      # name is configurable). Reading the latest state alone escalated a story whose
+      # deployment had shipped perfectly well.
+      result =
+        judge(deployments: [deployment(state: :inactive, succeeded?: true, contains: true)])
+
+      assert %Result{decision: :verified} = result
     end
 
     test "and ONLY a verification produces a `shipped` resolution" do
@@ -75,15 +88,30 @@ defmodule Loopctl.Delivery.PostDeployVerificationJudgeTest do
 
   describe "the deploy that WOULD have carried it failed" do
     for state <- [:failure, :error, :inactive] do
-      test "a #{state} deployment that carries the merge escalates" do
+      test "a #{state} deployment that carries the merge and NEVER succeeded escalates" do
         state = unquote(state)
-        result = judge(deployments: [deployment(state: state, contains: true)])
+
+        result =
+          judge(deployments: [deployment(state: state, succeeded?: false, contains: true)])
 
         assert %Result{decision: :failed, reasons: reasons} = result
         assert {:deploy_not_successful, state, @deployed, @merge} in reasons
         assert result.resolution == Resolution.for_verdict(:escalated)
         refute result.resolution.close?
       end
+    end
+
+    test "every carrying deployment must have failed — one success anywhere is enough" do
+      result =
+        judge(
+          deployments: [
+            deployment(id: 3, sha: @other, state: :failure, contains: true),
+            deployment(id: 2, sha: @deployed, state: :inactive, succeeded?: true, contains: true),
+            deployment(id: 1, sha: @deployed, state: :error, contains: true)
+          ]
+        )
+
+      assert %Result{decision: :verified, deployment_id: 2} = result
     end
 
     test "a failed deployment that does NOT carry the merge is passed over" do
@@ -113,6 +141,18 @@ defmodule Loopctl.Delivery.PostDeployVerificationJudgeTest do
 
       assert %Result{decision: :unresolved, unresolved_kind: :deploy_pending} = result
       assert {:deploy_in_flight, @deployed, @merge} in result.reasons
+    end
+
+    test "a failed carrier does not escalate while another carrier is still running" do
+      result =
+        judge(
+          deployments: [
+            deployment(id: 2, sha: @other, state: :pending, contains: true),
+            deployment(id: 1, sha: @deployed, state: :failure, contains: true)
+          ]
+        )
+
+      assert %Result{decision: :unresolved, unresolved_kind: :deploy_pending} = result
     end
 
     test "a deployment that has not settled waits even when it is not ours yet" do
@@ -228,7 +268,8 @@ defmodule Loopctl.Delivery.PostDeployVerificationJudgeTest do
     test "a state this module does not know NEVER falls through to a verification" do
       # The dispatch used to fail OPEN: anything not pending and not in the failure list
       # reached the containment check and could verify.
-      result = judge(deployments: [deployment(state: :something_new, contains: true)])
+      result =
+        judge(deployments: [deployment(state: :something_new, succeeded?: false, contains: true)])
 
       assert %Result{decision: :failed, reasons: reasons} = result
       assert {:unrecognised_deployment_state, :something_new} in reasons
@@ -251,6 +292,13 @@ defmodule Loopctl.Delivery.PostDeployVerificationJudgeTest do
     for kind <- [:forge_fault, :deploy_pending] do
       assert PostDeployVerification.max_consecutive_unresolved(kind) > 0
     end
+
+    # The total sits ABOVE the longest single-kind bound, or it would fire on a run that
+    # never alternated and the two per-kind numbers would be decoration.
+    assert PostDeployVerification.max_consecutive_total() >
+             PostDeployVerification.max_consecutive_unresolved(:deploy_pending)
+
+    assert PostDeployVerification.clock_tolerance_seconds() > 0
   end
 
   # -- helpers -----------------------------------------------------------------------------
@@ -268,11 +316,18 @@ defmodule Loopctl.Delivery.PostDeployVerificationJudgeTest do
   defp wrap(deployments) when is_list(deployments), do: {:ok, deployments}
   defp wrap(other), do: other
 
+  # `succeeded?` defaults from the state the way the adapter derives it — `success` now, or
+  # anything that once was — and is set explicitly for the case that matters: an `:inactive`
+  # deployment that DID ship, which is what GitHub leaves behind whenever a newer deploy
+  # succeeds.
   defp deployment(opts) do
+    state = Keyword.get(opts, :state, :success)
+
     %{
       id: Keyword.get(opts, :id, 77),
       sha: Keyword.get(opts, :sha, @deployed),
-      state: Keyword.get(opts, :state, :success),
+      state: state,
+      succeeded?: Keyword.get(opts, :succeeded?, state == :success),
       created_at: Keyword.get(opts, :created_at, DateTime.add(@merged_at, 60)),
       contains: Keyword.fetch!(opts, :contains)
     }

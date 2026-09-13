@@ -86,14 +86,30 @@ defmodule Loopctl.Delivery.PullRequestSource do
 
   @type diff :: {:ok, DiffNames.parsed()} | {:error, term()}
 
+  @type pull_request :: %{
+          state: String.t(),
+          merged?: boolean(),
+          merge_sha: String.t() | nil,
+          head_sha: String.t(),
+          merge_base_sha: String.t(),
+          diffstat: %{files: non_neg_integer(), changed_lines: non_neg_integer()},
+          diff: diff()
+        }
+
   @typedoc """
   One deployment of one environment.
 
   - `:sha` — the commit the DEPLOYMENT names, as the deploying job recorded it
-  - `:state` — the latest deployment status. `:pending` covers every state that has not
-    settled (`queued`, `pending`, `in_progress`) AND a deployment with no status at all,
-    because both mean the same thing to a verifier: ask again. `:inactive` is a deployment
-    that was deactivated — either rolled back, or superseded by a later one
+  - `:state` — its LATEST status. `:pending` covers every state that has not settled
+    (`queued`, `pending`, `in_progress`) and a deployment with no status at all, because
+    both mean the same thing to a verifier: ask again
+  - `:succeeded?` — whether `success` appears ANYWHERE in its recent status history, which
+    is a different question from `state` and the one that says whether the commit shipped.
+    GitHub writes `inactive` onto earlier deployments whenever a newer one succeeds
+    (`auto_inactive`, which applies to any environment not flagged
+    `production_environment` — and the environment name here is configurable), so a
+    deployment that shipped perfectly well is routinely `inactive` by the time a sweep
+    reads it. Reading `state` alone escalated those
   - `:created_at` — when the forge created the record. The verifier compares it against the
     moment the merge was recorded, so this field is what tells a deploy that has not started
     from one that shipped something else
@@ -103,17 +119,8 @@ defmodule Loopctl.Delivery.PullRequestSource do
           id: integer(),
           sha: String.t(),
           state: :success | :failure | :error | :inactive | :pending,
+          succeeded?: boolean(),
           created_at: DateTime.t()
-        }
-
-  @type pull_request :: %{
-          state: String.t(),
-          merged?: boolean(),
-          merge_sha: String.t() | nil,
-          head_sha: String.t(),
-          merge_base_sha: String.t(),
-          diffstat: %{files: non_neg_integer(), changed_lines: non_neg_integer()},
-          diff: diff()
         }
 
   @doc "The facts of one pull request. See the moduledoc."
@@ -127,6 +134,13 @@ defmodule Loopctl.Delivery.PullRequestSource do
 
   `{:ok, []}` is the ordinary early answer and a FACT, not a failure. See the moduledoc for
   why this is a page filtered by time rather than the newest record.
+
+  **An incomplete answer is an ERROR, never a short list.** The forge applies its page size
+  BEFORE this filter does, so a page whose oldest record is still newer than `since` may be
+  hiding the deployment that carries the merge — and a short list there is
+  indistinguishable from "nothing carries it", which ends in a confident false escalation.
+  That case, and a survivor count past what the implementation will resolve states for,
+  are both refusals naming themselves.
   """
   @callback deployments_since(repo(), String.t(), DateTime.t()) ::
               {:ok, [deployment()]} | {:error, term()}

@@ -19,6 +19,21 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   with every surface reporting success. A deployment record's `sha` is written by the
   deploying job, which is the only party that knows what it checked out.
 
+  **A ROLLBACK IS NOT DISTINGUISHED, and this is the honest statement of it.** A story whose
+  carrying deployment succeeded is `:verified`, and it stays `:verified` if a later deploy
+  rolls production back to an earlier commit. Every signal available here says it shipped,
+  because it did — at the moment it was checked. What would distinguish the two is the
+  ENVIRONMENT'S ACTIVE deployment rather than its recent ones, and GitHub exposes no
+  endpoint for that: "active" has to be inferred as "the newest whose latest status is
+  `success` and which is not `inactive`", which is the same shape as an ordinary deploy of
+  another branch, so inferring it would trade a missed rollback for a false escalation on
+  the commoner case. Closing it properly needs the artifact check below — asking the running
+  application what it is running — and that needs an endpoint on the target app.
+
+  An earlier version of this note claimed a rollback "waits out the long bound". That was
+  wrong: the carrying deployment is still inside the window, so the sweep reaches a verdict
+  rather than waiting.
+
   **Known bound, stated rather than discovered later:** this is only as good as what the
   deploy job wrote on the deployment. A job that creates its deployment with the attributed
   sha instead of the one it checked out reproduces the trap one layer down, and nothing
@@ -45,14 +60,22 @@ defmodule Loopctl.Delivery.PostDeployVerification do
 
   ## Every outcome
 
-  The walk is newest-first over the deployments created since the merge, and it stops at
-  the first one the forge confirms CARRIES the merge. That deployment decides:
+  **ANY carrying deployment that succeeded wins.** Not the first carrier and not the newest:
+  in a single-branch pipeline every later deploy is of a descendant and therefore carries
+  every earlier merge, so "the newest carrier decides" means a later story's failed deploy
+  escalates an earlier story whose code is running. A newer carrying FAILURE over an older
+  carrying SUCCESS means the ship still stands; failure is concluded only when NO carrying
+  deployment ever succeeded.
+
+  "Succeeded" is read from the deployment's status HISTORY, not its latest status, because
+  GitHub writes `inactive` over an earlier deployment as soon as a newer one succeeds — so a
+  deployment that shipped is routinely `inactive` by the time a sweep reads it.
 
   | what the forge says | decision | what happens to the story |
   |---|---|---|
-  | a deployment carries the merge and succeeded | `:verified` | `{deployed, verified, :forward}` |
-  | a deployment carries it and failed, errored or was deactivated | `:failed` | escalated, naming the state and both shas |
-  | a deployment carries it and is still running | `:unresolved` | nothing. The next sweep asks again |
+  | ANY deployment carrying the merge ever succeeded | `:verified` | `{deployed, verified, :forward}` |
+  | deployments carry it, none ever succeeded, all settled | `:failed` | escalated, naming the state and both shas |
+  | deployments carry it, none succeeded, one is still running | `:unresolved` | nothing. The next sweep asks again |
   | NO deployment since the merge | `:unresolved` | nothing. The deploy job has not made its record |
   | deployments exist, none carries the merge | `:unresolved` | nothing, until the bound. A rollback or a concurrent branch, not a verdict |
   | the story has no recorded `merge_sha`, or no merge TIME | `:failed` | escalated. Fail closed: there is nothing to verify against |
@@ -146,8 +169,15 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   #   should look.
   #
   # At the sweep's two-minute cadence: ~10 minutes and ~60 minutes.
+  # And a THIRD, over both kinds together. The per-kind counts restart when the kind
+  # changes, which an intermittently 5xx-ing forge alternating with a wedged deploy exploits
+  # by construction: neither count ever reaches its bound, the story sits at `deployed` for
+  # ever and nobody is told — the one outcome the whole counter exists to prevent. The total
+  # is kept over the merge alone (`Loopctl.Delivery.Stages`' `totalled_by`) and is set above
+  # the longest single-kind bound, so it only ever fires on a run that alternated.
   @max_consecutive_forge_faults 5
   @max_consecutive_deploy_pending 30
+  @max_consecutive_total 40
 
   # Matches `Loopctl.Delivery.MergePrecondition`'s: the `story_stages_text_bounds` CHECK is
   # 4000 CODEPOINTS, and the margin is deliberate. A reason too long to store would roll the
@@ -200,6 +230,13 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   @spec max_consecutive_unresolved(unresolved_kind()) :: pos_integer()
   def max_consecutive_unresolved(:forge_fault), do: @max_consecutive_forge_faults
   def max_consecutive_unresolved(:deploy_pending), do: @max_consecutive_deploy_pending
+
+  @doc """
+  The bound over BOTH kinds together, which is what stops a story alternating between them
+  from waiting for ever. See the note above `@max_consecutive_total`.
+  """
+  @spec max_consecutive_total() :: pos_integer()
+  def max_consecutive_total, do: @max_consecutive_total
 
   @doc """
   The deployment environment whose newest deployment is compared against a story's merge.
@@ -328,11 +365,14 @@ defmodule Loopctl.Delivery.PostDeployVerification do
     end
   end
 
-  # The states a deployment can be in, as three disjoint sets. `@settled_failure` and
-  # `:success` and `:pending` are the WHOLE vocabulary the adapter can produce
-  # (`map_state/1` refuses anything else), and the walk below matches all three EXPLICITLY
-  # so a state nobody has thought about fails closed instead of falling through to the
-  # containment check and verifying.
+  # The states that say a deployment is FINISHED and did not ship.
+  #
+  # `:inactive` is deliberately IN this list and deliberately not enough on its own: it is
+  # reached both by a genuine deactivation and by GitHub auto-inactivating an earlier
+  # deployment the moment a newer one succeeds. Which one it is, is answered by
+  # `succeeded?`, which the `verified` branch above reads FIRST — so an `:inactive`
+  # deployment that once succeeded has already won by the time this list is consulted, and
+  # what reaches here is one that was deactivated having never shipped.
   @settled_failure [:failure, :error, :inactive]
 
   # Everything the forge could say has been established by here. What is left is the
@@ -355,20 +395,23 @@ defmodule Loopctl.Delivery.PostDeployVerification do
     unresolved(result, [reason], :deploy_pending, nil)
   end
 
+  # **ANY carrying deployment that SUCCEEDED wins.** Not the first, and emphatically not the
+  # newest: in a single-branch pipeline every later deploy is of a descendant and therefore
+  # carries every earlier merge, so "the newest carrier decides" means a later story's
+  # failed deploy escalates an earlier story whose code is running. That is the regression
+  # reading a page was supposed to fix, reintroduced one layer along by halting the walk at
+  # the first carrier.
+  #
+  # A newer carrying FAILURE over an older carrying SUCCESS means the ship still stands.
+  # Failure is concluded only when NO carrying deployment succeeded.
   defp decide_deployments(result, _facts, merge_sha, deployments) do
-    case Enum.find(deployments, &carries?/1) do
-      %{state: :success} = shipped -> verified(result, shipped)
-      %{state: state} = failed -> our_deploy_failed(result, merge_sha, state, failed)
-      nil -> nothing_carries_it(result, merge_sha, deployments)
+    carrying = Enum.filter(deployments, & &1.contains)
+
+    case Enum.find(carrying, & &1.succeeded?) do
+      %{} = shipped -> verified(result, shipped)
+      nil -> not_shipped(result, merge_sha, carrying, deployments)
     end
   end
-
-  # The deployment that WOULD have carried the merge, whatever it did next. `contains` is
-  # only ever `true` for one the forge confirmed reaches this commit, so a LATER story's
-  # failed deploy — the case that escalated an earlier story which had already shipped — is
-  # simply not this deployment and the walk passes over it.
-  defp carries?(%{contains: true}), do: true
-  defp carries?(_deployment), do: false
 
   defp verified(result, deployment) do
     %{
@@ -382,41 +425,40 @@ defmodule Loopctl.Delivery.PostDeployVerification do
     }
   end
 
-  # A deployment that carries this merge and did not succeed. THIS is the only failure the
-  # verifier concludes from a deploy state, because it is the only one that is about this
-  # story's merge rather than about whatever else the environment has been doing.
-  defp our_deploy_failed(result, merge_sha, state, deployment) do
+  # Nothing that carries the merge has ever succeeded. Which of the three that is depends on
+  # what the carriers are doing, and on whether there are any.
+  defp not_shipped(result, merge_sha, [], deployments),
+    do: nothing_carries_it(result, merge_sha, deployments)
+
+  defp not_shipped(result, merge_sha, carrying, _deployments) do
+    newest = List.first(carrying)
+
     result = %{
       result
-      | deployed_sha: deployment.sha,
-        deployment_id: deployment.id,
-        deployment_state: state
+      | deployed_sha: newest.sha,
+        deployment_id: newest.id,
+        deployment_state: newest.state
     }
 
-    if state in @settled_failure do
-      failed(result, [{:deploy_not_successful, state, deployment.sha, merge_sha}])
-    else
-      # `:pending` carrying our merge is our deploy, still running — and anything else is a
-      # state this module does not know, which fails closed rather than being approximated.
-      case state do
-        :pending ->
-          unresolved(
-            result,
-            [{:deploy_in_flight, deployment.sha, merge_sha}],
-            :deploy_pending,
-            nil
-          )
+    cond do
+      Enum.any?(carrying, &(&1.state == :pending)) ->
+        # Our deploy is running. Not a failure, and the common case seconds after a merge.
+        unresolved(result, [{:deploy_in_flight, newest.sha, merge_sha}], :deploy_pending, nil)
 
-        other ->
-          failed(result, [{:unrecognised_deployment_state, other}])
-      end
+      Enum.all?(carrying, &(&1.state in @settled_failure)) ->
+        failed(result, [{:deploy_not_successful, newest.state, newest.sha, merge_sha}])
+
+      true ->
+        # A state this module does not know, on a deployment that carries the merge. NEVER
+        # approximated to success: the dispatch used to fall through to a verification.
+        failed(result, [{:unrecognised_deployment_state, newest.state}])
     end
   end
 
-  # Deployments exist since the merge, none of them carries it. Either one is still running
-  # and will, or something shipped past this merge without it — a rollback, or a deploy from
-  # another branch. Both are WAITING, bounded by the in-flight count, which escalates naming
-  # both shas. Concluding failure here is what read a concurrent deploy as a broken one.
+  # Deployments exist since the merge, none carries it. Either one is still running and
+  # will, or something shipped past this merge without it. Both are WAITING, bounded by the
+  # in-flight count, which escalates naming both shas. Concluding failure here read a
+  # concurrent deploy as a broken one.
   defp nothing_carries_it(result, merge_sha, deployments) do
     newest = List.first(deployments)
 
@@ -504,16 +546,32 @@ defmodule Loopctl.Delivery.PostDeployVerification do
   # is a custody-integrity gap like `merge_sha_not_recorded` and fails CLOSED. Defaulting to
   # "the beginning of time" would put every deployment back in the candidate set and restore
   # the failure this whole fact exists to remove.
+  # How far BEFORE the recorded merge a deployment may have been created and still be a
+  # candidate. Two clocks and two writers: `merged_at` is loopctl's commit time and
+  # `created_at` is GitHub's, and a deploy job that creates its record before loopctl commits
+  # the `merged` transition — or a few seconds of clock skew — would put the ONLY deployment
+  # that can carry the merge permanently outside the window, on every sweep for ever, because
+  # a record never gets newer. The cost of the tolerance is nil: an older deployment that
+  # slips in simply answers `contains?` false.
+  @clock_tolerance_seconds 120
+
   defp merged_at(tenant_id, stage) do
     tenant_id
     |> Stages.list_events(stage.story_id)
     |> Enum.filter(&(&1.event == "transitioned" and &1.to_stage == "merged"))
     |> List.last()
     |> case do
-      %{inserted_at: at} -> {:ok, at}
+      %{inserted_at: at} -> {:ok, DateTime.add(at, -@clock_tolerance_seconds, :second)}
       nil -> {:error, :no_merge_event}
     end
   end
+
+  @doc """
+  The clock tolerance subtracted from the recorded merge time before asking the forge. See
+  the note above `@clock_tolerance_seconds`.
+  """
+  @spec clock_tolerance_seconds() :: pos_integer()
+  def clock_tolerance_seconds, do: @clock_tolerance_seconds
 
   # The deployments that could carry this merge, each annotated with whether it does.
   #
@@ -531,19 +589,42 @@ defmodule Loopctl.Delivery.PostDeployVerification do
 
   defp deployments(_repo, _environment, _merged_at, _merge_sha), do: :not_attempted
 
+  # Containment for every candidate, because the rule is "does ANY carrying deployment say
+  # it succeeded" and that cannot be answered from one of them. The walk halts early on the
+  # one answer that settles it — a carrier that SUCCEEDED — and the rest are then marked
+  # `false` without being asked, since nothing they could say changes a verdict already
+  # reached. Halting on the first CARRIER (rather than the first carrying success) is what
+  # reintroduced the newest-deployment bug: in a single-branch pipeline every later deploy
+  # carries every earlier merge, so the first carrier is just the newest deployment again.
+  #
+  # Bounded by the adapter's own survivor cap, so this is a handful of calls at worst and
+  # one in the ordinary case.
   defp annotate(repo, merge_sha, deployments) do
     deployments
-    |> Enum.reduce_while({:ok, []}, fn deployment, {:ok, acc} ->
+    |> Enum.reduce_while({:ok, [], false}, fn deployment, {:ok, acc, _done} ->
       case contains(repo, merge_sha, deployment) do
-        {:ok, true} -> {:halt, {:ok, [Map.put(deployment, :contains, true) | acc]}}
-        {:ok, false} -> {:cont, {:ok, [Map.put(deployment, :contains, false) | acc]}}
-        {:error, _reason} = error -> {:halt, error}
+        {:ok, contains} ->
+          annotated = Map.put(deployment, :contains, contains)
+          settled = contains and deployment.succeeded?
+          {if(settled, do: :halt, else: :cont), {:ok, [annotated | acc], settled}}
+
+        {:error, _reason} = error ->
+          {:halt, error}
       end
     end)
     |> case do
-      {:ok, annotated} -> {:ok, Enum.reverse(annotated)}
+      {:ok, annotated, _settled} -> {:ok, unasked(Enum.reverse(annotated), deployments)}
       error -> error
     end
+  end
+
+  # The tail the walk never reached, marked `contains: false` so the judge sees one shape.
+  # Sound because the walk only stops early on a verdict nothing here could change.
+  defp unasked(annotated, deployments) do
+    annotated ++
+      (deployments
+       |> Enum.drop(length(annotated))
+       |> Enum.map(&Map.put(&1, :contains, false)))
   end
 
   # NOT asked when the shas are equal: a commit trivially contains itself, and the round
@@ -612,10 +693,17 @@ defmodule Loopctl.Delivery.PostDeployVerification do
     tenant_id
     |> Stages.note_post_deploy_unresolved(story_id, result.merge_sha, kind, write_opts)
     |> case do
-      {:ok, count} when count > bound ->
+      {:ok, %{count: count}} when count > bound ->
         failed(result, result.reasons ++ [{:unresolved_limit_exceeded, kind, count, bound}])
 
-      {:ok, _count} ->
+      # The alternating case. Neither per-kind count reached its bound, and it never would.
+      {:ok, %{total: total}} when total > @max_consecutive_total ->
+        failed(
+          result,
+          result.reasons ++ [{:unresolved_total_exceeded, total, @max_consecutive_total}]
+        )
+
+      {:ok, _counts} ->
         result
 
       {:error, reason} ->

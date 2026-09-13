@@ -452,19 +452,19 @@ defmodule Loopctl.Delivery.StagesTest do
       {story, _row} = at_stage(:deployed)
       opts = [claim_epoch: story.claim_epoch]
 
-      assert {:ok, 1} =
+      assert {:ok, %{count: 1}} =
                note_post_deploy(story, @sha_a, :forge_fault, opts)
 
-      assert {:ok, 2} =
+      assert {:ok, %{count: 2}} =
                note_post_deploy(story, @sha_a, :forge_fault, opts)
 
-      assert {:ok, 1} =
+      assert {:ok, %{count: 1}} =
                note_post_deploy(story, @sha_b, :forge_fault, opts)
 
       row = Stages.get(story.tenant_id, story.id)
 
       assert row.post_deploy_unresolved ==
-               %{"merge_sha" => @sha_b, "kind" => "forge_fault", "count" => 1}
+               %{"merge_sha" => @sha_b, "kind" => "forge_fault", "count" => 1, "total" => 1}
 
       # And it does NOT share a column with the merge gate's count.
       assert is_nil(row.merge_gate_unevaluated)
@@ -477,20 +477,25 @@ defmodule Loopctl.Delivery.StagesTest do
       {story, _row} = at_stage(:deployed)
       opts = [claim_epoch: story.claim_epoch]
 
-      assert {:ok, 1} = note_post_deploy(story, @sha_a, :forge_fault, opts)
-      assert {:ok, 2} = note_post_deploy(story, @sha_a, :forge_fault, opts)
-      assert {:ok, 1} = note_post_deploy(story, @sha_a, :deploy_pending, opts)
-      assert {:ok, 2} = note_post_deploy(story, @sha_a, :deploy_pending, opts)
-      assert {:ok, 1} = note_post_deploy(story, @sha_a, :forge_fault, opts)
+      assert {:ok, %{count: 1}} = note_post_deploy(story, @sha_a, :forge_fault, opts)
+      assert {:ok, %{count: 2}} = note_post_deploy(story, @sha_a, :forge_fault, opts)
+      assert {:ok, %{count: 1}} = note_post_deploy(story, @sha_a, :deploy_pending, opts)
+      assert {:ok, %{count: 2}} = note_post_deploy(story, @sha_a, :deploy_pending, opts)
+      assert {:ok, %{count: 1}} = note_post_deploy(story, @sha_a, :forge_fault, opts)
 
-      assert Stages.get(story.tenant_id, story.id).post_deploy_unresolved ==
-               %{"merge_sha" => @sha_a, "kind" => "forge_fault", "count" => 1}
+      row = Stages.get(story.tenant_id, story.id).post_deploy_unresolved
+      assert row["count"] == 1
+      assert row["kind"] == "forge_fault"
+
+      # And the TOTAL kept accumulating across the alternation — without it neither count
+      # ever reaches its bound and the story waits for ever with nobody told.
+      assert row["total"] == 5
     end
 
     test "leaves an event under its own name" do
       {story, _row} = at_stage(:deployed)
 
-      assert {:ok, 1} =
+      assert {:ok, %{count: 1}} =
                note_post_deploy(story, @sha_a, :deploy_pending,
                  claim_epoch: story.claim_epoch,
                  actor_label: "test"
@@ -501,7 +506,8 @@ defmodule Loopctl.Delivery.StagesTest do
                |> Stages.list_events(story.id)
                |> Enum.filter(&(&1.event == "post_deploy_unresolved"))
 
-      assert data == %{"merge_sha" => @sha_a, "kind" => "deploy_pending", "count" => 1}
+      assert data ==
+               %{"merge_sha" => @sha_a, "kind" => "deploy_pending", "count" => 1, "total" => 1}
     end
 
     test "clear_post_deploy_unresolved/3 removes the count, no-op with nothing to clear" do
@@ -511,7 +517,7 @@ defmodule Loopctl.Delivery.StagesTest do
       assert {:ok, :nothing_to_clear} =
                Stages.clear_post_deploy_unresolved(story.tenant_id, story.id, opts)
 
-      assert {:ok, 1} =
+      assert {:ok, %{count: 1}} =
                note_post_deploy(story, @sha_a, :forge_fault, opts)
 
       assert {:ok, :cleared} =
@@ -537,7 +543,7 @@ defmodule Loopctl.Delivery.StagesTest do
 
       {:ok, _} = Stages.advance(story.tenant_id, story.id, {:merged, :deployed}, opts)
 
-      assert {:ok, 1} =
+      assert {:ok, %{count: 1}} =
                note_post_deploy(story, @sha_b, :forge_fault, opts)
 
       assert {:ok, :cleared} =
@@ -545,6 +551,7 @@ defmodule Loopctl.Delivery.StagesTest do
 
       row = Stages.get(story.tenant_id, story.id)
       assert is_nil(row.post_deploy_unresolved)
+      # The merge gate has ONE kind, so it carries no total and its stored shape is unchanged.
       assert row.merge_gate_unevaluated == %{"head_sha" => @sha_a, "count" => 1}
     end
 
