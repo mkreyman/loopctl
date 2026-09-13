@@ -165,6 +165,14 @@ defmodule Loopctl.Delivery.StageMachine do
           | :merge_sha
           | :release_id
 
+  # `merge_sha` is written ONLY as part of the transition into `merged`, both ways round:
+  # it is REQUIRED there (an entry asserting a merge must name it) and it is refused to
+  # `record_effect/5` (recorded afterwards it would leave the chain saying the story merged
+  # at nothing while the row named a sha the chain never saw). The two halves are one rule
+  # and belong together — relaxing either reopens it.
+  @transition_only [:merge_sha]
+  @required_effects %{merged: [:merge_sha]}
+
   @type transition :: {stage(), stage(), edge()}
 
   @doc "Every stage, in main-line order followed by the off-line stages."
@@ -207,6 +215,20 @@ defmodule Loopctl.Delivery.StageMachine do
   @doc "Every side-effect identity column."
   @spec effects() :: [effect()]
   def effects, do: Map.keys(@effect_stages)
+
+  @doc """
+  True for an identity that only a TRANSITION may write (`Loopctl.Delivery.Stages.advance/4`'s
+  `:effects`), never `record_effect/5`: the merge sha, which a chained entry has to name.
+  """
+  @spec transition_only?(atom()) :: boolean()
+  def transition_only?(effect), do: effect in @transition_only
+
+  @doc """
+  The identities a transition into `to` MUST carry. Entering `merged` without the sha would
+  chain a merge that names nothing.
+  """
+  @spec required_effects(stage()) :: [effect()]
+  def required_effects(to), do: Map.get(@required_effects, to, [])
 
   @doc "The stages allowed to record `effect`; `[]` for an unknown effect."
   @spec effect_stages(atom()) :: [stage()]

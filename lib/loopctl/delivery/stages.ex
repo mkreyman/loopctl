@@ -34,10 +34,12 @@ defmodule Loopctl.Delivery.Stages do
     first attempt committed finds the row already past `from` and is refused
     `:stale_stage` — it does not happen twice. The caller reads `get/2` to learn where the
     row is; the row, not the caller's memory, is the truth.
-  - `record_effect/5` records an identity once. The same value again is `{:ok, row}`, so a
-    replayed stage finds the worktree, PR or release its first run recorded and reuses it;
-    a DIFFERENT value for an identity already set is `:effect_conflict`, so a replay can
-    never record a second one. Record the identity BEFORE performing the effect.
+  - `record_effect/5` records an identity once — the worktree, the branch, the head, the PR,
+    the release, the runner; everything except the merge sha, which only a transition may
+    write. The same value again is `{:ok, row}`, so a replayed stage finds what its first
+    run recorded and reuses it; a DIFFERENT value for an identity already set is
+    `:effect_conflict`, so a replay can never record a second one. Record the identity
+    BEFORE performing the effect.
   - The MERGE is the one identity that cannot be written first, because the merge commit
     does not exist until GitHub makes it. Its shape is: perform the merge, take the sha
     GitHub returns, then `advance(…, {:ci, :merged}, effects: [merge_sha: sha])` — one
@@ -138,11 +140,16 @@ defmodule Loopctl.Delivery.Stages do
           | :stale_stage
           | :actor_lineage_required
           | :invalid_reason
+          | :missing_required_effect
+          | :invalid_effect
+          | :wrong_stage
+          | :effect_conflict
           | :audit_chain_append_failed
           | :busy
 
   @type effect_error ::
           :invalid_effect
+          | :transition_only_effect
           | :not_found
           | :stale_claim_epoch
           | :wrong_stage
@@ -244,6 +251,15 @@ defmodule Loopctl.Delivery.Stages do
   - `:not_claimed` — entering `claimed` on a story no claim holds
   - `:stale_stage` — the row is not at `from`: another writer, or this caller's own earlier
     attempt, already moved it
+  - `:invalid_effect`, `:wrong_stage`, `:effect_conflict` — from the `:effects` this
+    transition carries, on the same terms as `record_effect/5`. `:invalid_effect` is
+    decided before the transaction; the other two roll it back.
+
+  And refused before the database, with everything else in that list:
+
+  - `:missing_required_effect` — a transition into `merged` that does not carry
+    `merge_sha` (`StageMachine.required_effects/1`). The chained entry has to name the
+    merge it asserts.
 
   Entering `claimed` rebinds the row to the story's current epoch — the claim just made.
   Every other transition requires the row to already be at it.
@@ -278,7 +294,8 @@ defmodule Loopctl.Delivery.Stages do
          :ok <- lineage_declared(from, to, edge, opts),
          :ok <- human_gate(edge, opts),
          :ok <- reason_given(to, edge, reason),
-         {:ok, effects} <- validate_effects(opts) do
+         {:ok, effects} <- validate_effects(opts),
+         :ok <- required_effects_present(to, effects) do
       in_tenant(tenant_id, fn ->
         transition(tenant_id, story_id, {from, to, edge}, epoch, effects, opts)
       end)
@@ -368,9 +385,8 @@ defmodule Loopctl.Delivery.Stages do
   - `:wrong_stage` — the row is not in a stage that produces this effect
     (`StageMachine.effect_stages/1`)
   - `:effect_conflict` — the identity is already set to a DIFFERENT value
-
-  For an identity that IS the outcome of a transition — the merge sha — pass it to
-  `advance/4` as `:effects` instead, so the chained entry can name it.
+  - `:transition_only_effect` — `:merge_sha`, which only the transition into `merged` may
+    write (`advance/4`'s `:effects`), so that its chained entry names the merge
 
   ## Options
 
@@ -381,11 +397,20 @@ defmodule Loopctl.Delivery.Stages do
   def record_effect(tenant_id, story_id, effect, value, opts) do
     epoch = Keyword.fetch!(opts, :claim_epoch)
 
-    with {:ok, value} <- validate_effect(effect, value) do
+    with :ok <- recordable(effect),
+         {:ok, value} <- validate_effect(effect, value) do
       in_tenant(tenant_id, fn ->
         effect_write(tenant_id, story_id, {effect, value}, epoch, opts)
       end)
     end
+  end
+
+  # The merge sha is the transition's to write (see `advance/4`'s `:effects`). Recorded
+  # here it would land with a `story_stage_events` row and NO chain entry, so the chain
+  # would say the story merged at nothing while the row named a sha the chain never saw —
+  # and a later retraction would withdraw a sha nothing had asserted.
+  defp recordable(effect) do
+    if StageMachine.transition_only?(effect), do: {:error, :transition_only_effect}, else: :ok
   end
 
   defp effect_write(tenant_id, story_id, {effect, value}, epoch, opts) do
@@ -752,16 +777,39 @@ defmodule Loopctl.Delivery.Stages do
   # --- effects ------------------------------------------------------------------------------
 
   # The `:effects` a transition carries, validated the same way `record_effect/5` validates
-  # its one — before the transaction, so a malformed value never opens one.
+  # its one — before the transaction, so a malformed value never opens one. The SHAPE is
+  # checked first: `:effects` is a brand-new public option, and a caller's typo (`nil`, a
+  # bare list, a map of strings) reached `Enum.reduce/3` and raised a Protocol or
+  # FunctionClause error that `in_tenant/2`'s rescue does not catch — a 500 for a bad
+  # argument.
   defp validate_effects(opts) do
-    opts
-    |> Keyword.get(:effects, [])
-    |> Enum.reduce_while({:ok, []}, fn {effect, value}, {:ok, acc} ->
-      case validate_effect(effect, value) do
-        {:ok, value} -> {:cont, {:ok, acc ++ [{effect, value}]}}
-        {:error, reason} -> {:halt, {:error, reason}}
-      end
-    end)
+    with {:ok, effects} <- effect_pairs(Keyword.get(opts, :effects, [])) do
+      Enum.reduce_while(effects, {:ok, []}, &validate_pair/2)
+    end
+  end
+
+  defp validate_pair({effect, value}, {:ok, acc}) do
+    case validate_effect(effect, value) do
+      {:ok, value} -> {:cont, {:ok, acc ++ [{effect, value}]}}
+      {:error, reason} -> {:halt, {:error, reason}}
+    end
+  end
+
+  defp effect_pairs(effects) when is_map(effects), do: effects |> Map.to_list() |> effect_pairs()
+
+  defp effect_pairs(effects) when is_list(effects) do
+    if Enum.all?(effects, &match?({key, _value} when is_atom(key), &1)),
+      do: {:ok, effects},
+      else: {:error, :invalid_effect}
+  end
+
+  defp effect_pairs(_effects), do: {:error, :invalid_effect}
+
+  # An identity the destination stage's chained entry must name.
+  defp required_effects_present(to, effects) do
+    if Enum.all?(StageMachine.required_effects(to), &Keyword.has_key?(effects, &1)),
+      do: :ok,
+      else: {:error, :missing_required_effect}
   end
 
   defp validate_effect(:runner_id, value) do

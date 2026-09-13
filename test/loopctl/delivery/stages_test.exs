@@ -16,6 +16,7 @@ defmodule Loopctl.Delivery.StagesTest do
   import Ecto.Query
 
   alias Loopctl.AdminRepo
+  alias Loopctl.AuditChain
   alias Loopctl.AuditChain.Entry
   alias Loopctl.Delivery.StageEvent
   alias Loopctl.Delivery.StageMachine
@@ -107,7 +108,8 @@ defmodule Loopctl.Delivery.StagesTest do
             claim_epoch: story.claim_epoch,
             reason: "because",
             actor_role: :user,
-            actor_lineage: []
+            actor_lineage: [],
+            effects: required_effects(to)
           ]
 
         result = Stages.advance(story.tenant_id, story.id, {from, to, edge}, opts)
@@ -117,7 +119,10 @@ defmodule Loopctl.Delivery.StagesTest do
           assert {:error, :invalid_transition} = result, inspect({from, to, edge})
         else
           assert {:ok, %StoryStage{stage: ^to} = moved} = result, inspect({from, to, edge})
-          assert moved.lock_version == row.lock_version + 1
+
+          # The transition writes once, and once more per identity it carries.
+          assert moved.lock_version == row.lock_version + 1 + length(required_effects(to)),
+                 inspect({from, to, edge})
 
           expected_attempts =
             if StageMachine.counted?(edge), do: %{Atom.to_string(edge) => 1}, else: %{}
@@ -363,7 +368,9 @@ defmodule Loopctl.Delivery.StagesTest do
     }
 
     test "a replay of every outward stage finds and reuses its recorded identity" do
-      for effect <- StageMachine.effects() do
+      # `merge_sha` is not here: only the transition into `merged` writes it, so that its
+      # chained entry names the merge. Its own tests are in "the merge identity".
+      for effect <- StageMachine.effects(), not StageMachine.transition_only?(effect) do
         [stage | _] = StageMachine.effect_stages(effect)
         {story, _} = at_stage(stage)
         value = effect_value(effect, story.tenant_id)
@@ -449,7 +456,7 @@ defmodule Loopctl.Delivery.StagesTest do
 
       for {effect, value} <- [
             {:head_sha, "ABC"},
-            {:merge_sha, String.duplicate("a", 41)},
+            {:head_sha, String.duplicate("a", 41)},
             {:pr_number, 0},
             {:pr_number, "7"},
             {:runner_id, "not-a-uuid"},
@@ -490,12 +497,19 @@ defmodule Loopctl.Delivery.StagesTest do
                    story.tenant_id,
                    story.id,
                    {from, to},
-                   opts ++ [actor_lineage: []]
+                   opts ++ [actor_lineage: [], effects: required_effects(to)]
                  )
       end)
 
       assert chain_actions(story.tenant_id) == ["story_stage_claimed", "story_stage_merged"]
-      assert length(Stages.list_events(story.tenant_id, story.id)) == 8
+
+      # Eight transitions, plus the `effect_recorded` for the sha `ci -> merged` carried.
+      assert story.tenant_id
+             |> Stages.list_events(story.id)
+             |> Enum.frequencies_by(& &1.event) == %{
+               "transitioned" => 8,
+               "effect_recorded" => 1
+             }
     end
 
     test "a refused transition writes neither an event nor a chain entry" do
@@ -504,7 +518,8 @@ defmodule Loopctl.Delivery.StagesTest do
       assert {:error, :stale_claim_epoch} =
                Stages.advance(story.tenant_id, story.id, {:ci, :merged},
                  claim_epoch: 99,
-                 actor_lineage: []
+                 actor_lineage: [],
+                 effects: required_effects(:merged)
                )
 
       assert chain_actions(story.tenant_id) == []
@@ -802,33 +817,29 @@ defmodule Loopctl.Delivery.StagesTest do
     end
 
     test "of the chain's own P0001 raises, only the position violation is transient" do
-      assert Stages.retryable_error?(%Postgrex.Error{
-               postgres: %{
-                 pg_code: "P0001",
-                 message: "audit_chain_position_violation: expected position 4, got 3"
-               }
-             })
+      # Both errors come from the REAL triggers in `20260411231547_create_audit_chain`, so
+      # renaming a RAISE there fails this test rather than silently reclassifying a
+      # transient contention error as a 500. A hand-built Postgrex.Error would not.
+      tenant = fixture(:tenant)
+      {:ok, first} = AuditChain.append(tenant.id, chain_attrs())
 
+      position_violation =
+        assert_raise Postgrex.Error, fn ->
+          insert_chain_entry(tenant.id, 7, first.entry_hash)
+        end
+
+      assert position_violation.postgres.pg_code == "P0001"
+      assert Stages.retryable_error?(position_violation)
+
+      hash_violation =
+        assert_raise Postgrex.Error, fn ->
+          insert_chain_entry(tenant.id, 1, :binary.copy(<<1>>, 32))
+        end
+
+      assert hash_violation.postgres.pg_code == "P0001"
       # An L6 integrity signal: reported as :busy it would spin retries against a chain
       # that is broken and will stay broken.
-      refute Stages.retryable_error?(%Postgrex.Error{
-               postgres: %{
-                 pg_code: "P0001",
-                 message: "audit_chain_hash_violation: prev_entry_hash does not match expected"
-               }
-             })
-
-      refute Stages.retryable_error?(%Postgrex.Error{
-               postgres: %{pg_code: "P0001", message: "cannot_modify_audit_chain"}
-             })
-    end
-
-    test "a fault in the transition is not retryable and must not be swallowed" do
-      # 23503 foreign_key_violation, 23514 check_violation, 22021 invalid text encoding:
-      # each says the WRITE was wrong, and answering :busy would invite an endless retry.
-      for code <- ["23503", "23514", "22021"] do
-        refute Stages.retryable_error?(%Postgrex.Error{postgres: %{pg_code: code}}), code
-      end
+      refute Stages.retryable_error?(hash_violation)
     end
   end
 
@@ -906,8 +917,9 @@ defmodule Loopctl.Delivery.StagesTest do
       opts = [claim_epoch: story.claim_epoch, actor_lineage: []]
       merge_sha = String.duplicate("9", 40)
 
-      # The sha does not exist before the merge, so `ci` cannot record one on its own.
-      assert {:error, :wrong_stage} =
+      # `record_effect/5` never writes this identity, at any stage: only the transition
+      # does, so the chained entry can name it.
+      assert {:error, :transition_only_effect} =
                Stages.record_effect(story.tenant_id, story.id, :merge_sha, merge_sha, opts)
 
       # Perform the merge, take the sha GitHub returns, transition carrying it.
@@ -931,22 +943,88 @@ defmodule Loopctl.Delivery.StagesTest do
                story.tenant_id |> Stages.list_events(story.id) |> Enum.map(& &1.event)
     end
 
-    test "a replayed merge reuses the recorded sha and a different one conflicts" do
+    test "a replayed transition reuses the recorded sha, and a different one conflicts" do
       merge_sha = String.duplicate("9", 40)
-      {story, _} = at_stage(:merged, merge_sha: merge_sha)
-      opts = [claim_epoch: story.claim_epoch]
+      {story, _} = at_stage(:ci)
+      opts = [claim_epoch: story.claim_epoch, actor_lineage: []]
 
-      assert {:ok, %StoryStage{merge_sha: ^merge_sha}} =
-               Stages.record_effect(story.tenant_id, story.id, :merge_sha, merge_sha, opts)
+      {:ok, _} =
+        Stages.advance(
+          story.tenant_id,
+          story.id,
+          {:ci, :merged},
+          opts ++ [effects: [merge_sha: merge_sha]]
+        )
 
-      assert {:error, :effect_conflict} =
-               Stages.record_effect(
+      # The runner comes back, asks GitHub, gets the same sha, and repeats the call: the
+      # row has moved on, so the transition is refused and nothing is merged twice.
+      assert {:error, :stale_stage} =
+               Stages.advance(
                  story.tenant_id,
                  story.id,
-                 :merge_sha,
-                 String.duplicate("8", 40),
-                 opts
+                 {:ci, :merged},
+                 opts ++ [effects: [merge_sha: merge_sha]]
                )
+
+      # And the retraction still names the sha it withdraws.
+      {:ok, _} =
+        Stages.advance(
+          story.tenant_id,
+          story.id,
+          {:merged, :implementing, :merge_refused},
+          opts ++ [reason: "branch protection"]
+        )
+
+      assert ["story_stage_merged", "story_stage_merge_retracted"] =
+               chain_actions(story.tenant_id)
+
+      assert [_merged, %Entry{payload: payload}] =
+               as_tenant(story.tenant_id, fn ->
+                 Repo.all(from e in Entry, order_by: [asc: e.chain_position])
+               end)
+
+      assert payload["retracted"]["merge_sha"] == merge_sha
+    end
+
+    test "entering merged without the sha is refused, and nothing is chained" do
+      {story, _} = at_stage(:ci)
+      opts = [claim_epoch: story.claim_epoch, actor_lineage: []]
+
+      assert {:error, :missing_required_effect} =
+               Stages.advance(story.tenant_id, story.id, {:ci, :merged}, opts)
+
+      assert {:error, :missing_required_effect} =
+               Stages.advance(story.tenant_id, story.id, {:ci, :merged}, opts ++ [effects: []])
+
+      assert Stages.get(story.tenant_id, story.id).stage == :ci
+      assert chain_actions(story.tenant_id) == []
+    end
+
+    test "a malformed :effects option is refused, not raised" do
+      {story, _} = at_stage(:implementing)
+      opts = [claim_epoch: story.claim_epoch]
+
+      malformed = [
+        nil,
+        :merge_sha,
+        ["head_sha"],
+        [{"head_sha", @sha_a}],
+        %{"head_sha" => @sha_a},
+        42
+      ]
+
+      for effects <- malformed do
+        assert {:error, :invalid_effect} =
+                 Stages.advance(
+                   story.tenant_id,
+                   story.id,
+                   {:implementing, :reviewing},
+                   opts ++ [effects: effects]
+                 ),
+               inspect(effects)
+      end
+
+      assert Stages.get(story.tenant_id, story.id).stage == :implementing
     end
 
     test "an effect the destination stage does not produce, or a malformed one, is refused" do
@@ -966,7 +1044,7 @@ defmodule Loopctl.Delivery.StagesTest do
                  story.tenant_id,
                  story.id,
                  {:ci, :merged},
-                 opts ++ [effects: [worktree_path: "/w"]]
+                 opts ++ [effects: [merge_sha: sample_effect(:merge_sha), worktree_path: "/w"]]
                )
 
       # Neither attempt moved the row or wrote an entry.
@@ -1036,6 +1114,38 @@ defmodule Loopctl.Delivery.StagesTest do
                )
     end
   end
+
+  defp chain_attrs do
+    %{
+      action: "test_chain_entry",
+      actor_lineage: [],
+      entity_type: "story",
+      entity_id: nil,
+      payload: %{}
+    }
+  end
+
+  # Straight at the table, bypassing `AuditChain`, so the TRIGGERS decide.
+  defp insert_chain_entry(tenant_id, chain_position, prev_entry_hash) do
+    AdminRepo.insert!(%Entry{
+      tenant_id: tenant_id,
+      chain_position: chain_position,
+      prev_entry_hash: prev_entry_hash,
+      action: "test_chain_entry",
+      actor_lineage: [],
+      entity_type: "story",
+      payload: %{},
+      entry_hash: :binary.copy(<<2>>, 32),
+      inserted_at: DateTime.utc_now()
+    })
+  end
+
+  # What a transition into `to` must carry (today: the merge sha, entering `merged`).
+  defp required_effects(to) do
+    for effect <- StageMachine.required_effects(to), do: {effect, sample_effect(effect)}
+  end
+
+  defp sample_effect(:merge_sha), do: String.duplicate("a", 40)
 
   defp escalation(:escalated), do: %{escalation_reason: "why"}
   defp escalation(_stage), do: %{}

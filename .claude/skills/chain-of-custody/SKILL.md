@@ -248,7 +248,7 @@ correct behavior; do not add a workaround.
   a read-then-write.
 
 **Enforcement is conditional — this is the deprecation seam.** `Progress.maybe_consume_cap/6`
-(`progress.ex:425-448`) is what actually gates the custody ops: a `nil` `cap_id` is rejected with
+(`progress.ex:433-456`) is what actually gates the custody ops: a `nil` `cap_id` is rejected with
 `:missing_capability` **only for tenants that have an audit key** (`tenant_has_audit_key?/1`,
 `progress.ex:705-710`); a pre-v2 (keyless) tenant returns `{:ok, :pre_v2_tenant}` and the operation
 proceeds with NO capability at all. So L1 strength is per-tenant. A REJECTED cap is split by

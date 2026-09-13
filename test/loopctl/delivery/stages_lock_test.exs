@@ -436,7 +436,8 @@ defmodule Loopctl.Delivery.StagesLockTest do
     assert {:error, :stale_claim_epoch} =
              Stages.advance(story.tenant_id, story.id, {:ci, :merged},
                claim_epoch: 1,
-               actor_lineage: []
+               actor_lineage: [],
+               effects: [merge_sha: String.duplicate("a", 40)]
              )
 
     assert {:error, :stale_claim_epoch} =
