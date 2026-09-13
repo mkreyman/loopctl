@@ -35,12 +35,16 @@ defmodule Loopctl.Delivery.InjectionDetector do
   - `user_agent_prose` — a browser user agent carrying prose: over 512 bytes, carrying
     another signal, containing a backtick, or three or more DISTINCT lexicon words anywhere
     in the string (see "User-agent prose" below).
-  - `user_agent_spelled_out` — a user agent spelling a word out one letter at a time
-    (`a.p.p.r.o.v.e.t.h.i.s`), eight letters or more.
+  - `user_agent_spelled_out` — a user agent spelling a word out in segments of one or two
+    letters (`a.p.p.r.o.v.e`, `p, l, e, a, s, e`, `ap-pr-ov-e`), eight letters or more.
+  - `user_agent_non_ascii` — a user agent carrying any byte outside ASCII. Browsers send
+    visible ASCII; an accent, a combining mark, a small capital, a full-width or superscript
+    character, or a letter from another script is a disguise, and it is flagged rather than
+    decoded.
 
-  Field-independent signals come from `scan/1`. `user_agent_prose` and
-  `user_agent_spelled_out` come from `scan_user_agent/2`, because only the caller knows which
-  text is a user agent.
+  Field-independent signals come from `scan/1`. `user_agent_prose`,
+  `user_agent_spelled_out` and `user_agent_non_ascii` come from `scan_user_agent/2`, because
+  only the caller knows which text is a user agent.
   `structured_field_spoof` is reported by `Loopctl.Intake.TicketFacts`.
 
   ## Matching
@@ -58,47 +62,62 @@ defmodule Loopctl.Delivery.InjectionDetector do
   each closed one bypass class and opened another, because a shape rule has to guess which
   characters an attacker will use to join words, and the attacker chooses them.
 
+  **Disguised letters are flagged, not decoded.** Any byte outside ASCII fires
+  `user_agent_non_ascii` on its own. Decoding disguises one alphabet at a time loses: NFKC has
+  no mapping for Latin small capitals, and composing a combining accent onto a letter makes it
+  a non-ASCII letter the word split then discards. So the lexicon measure below reads ASCII
+  only, and everything else is the disguise signal's job.
+
   `user_agent_lexicon_hits/1`:
 
-  1. **Normalise.** NFKC folds full-width letters and superscript digits to ASCII. The words
-     are then taken twice, once with combining marks (Unicode category M) stripped and once with them
-     left as separators, so a mark decorating every letter and a mark joining two words are
-     both undone.
-  2. **Words.** Split on EVERY character that is not an ASCII letter. Digits, punctuation,
-     symbols, whitespace and non-ASCII letters are all separators, so `approve-this`,
-     `approve2`, `approve.this`, `pull/request` and `approve` U+01C0 `this` all yield their words.
-     Segments of two or more letters are kept, downcased.
-  3. **Spelled-out letters.** A maximal run of single letters each separated by exactly one
-     non-letter character is joined and read as one word (`p.l.e.a.s.e` is `please`), and is
-     also split at whitespace, so `p.l.e.a.s.e m.e.r.g.e` yields both words. A joined run
-     of eight or more letters also fires `user_agent_spelled_out` on its own, since no real
-     user agent spells anything out.
-  4. **Digit-for-letter spelling.** A letters-and-digits run whose digits are all in `013457`
-     is also read with them as `o i/l e a s t` (`appr0ve`, `th1s`, `pu11`), and counts only
-     when that reading is a lexicon word. Runs shorter than four characters are never read,
-     so a build suffix such as `A1` does not become `ai`.
-  5. **Score** is the number of DISTINCT lexicon words found. Three or more fire.
+  1. **Words.** Split on EVERY character that is not an ASCII letter. Digits, punctuation,
+     symbols, whitespace and anything non-ASCII are separators, so `approve-this`,
+     `approve2`, `approve.this` and `pull/request` all yield their words. Segments of two or
+     more letters are kept, downcased.
+  2. **Spelled-out segments.** A run of four or more segments of one or two letters, each
+     separated by one to three characters that are neither letters nor digits, is joined and
+     read as one word, and also split at whitespace: `p, l, e, a, s, e` is `please`,
+     `ap-pr-ov-e th-is` yields `approve` and `this`. Digits do not separate, because a model
+     code such as `SM-A105F` would otherwise join with its neighbours. A joined run of eight
+     or more letters also fires `user_agent_spelled_out`.
+  3. **Look-alike characters.** A maximal run of four or more characters from letters,
+     digits and `@ $ ! |` that contains a non-letter is read POSITION BY POSITION against every
+     lexicon word of the same length, each character standing for its class (`0` o, `1` i or l,
+     `2` z, `3` e, `4` a, `5` s, `6` g or b, `7` t, `8` b, `9` g, `@` a, `$` s, `!` i, `|` l, a
+     letter for itself). Mixed readings of one character (`1n5ta11`) just work. The run is
+     also read with up to two non-letter characters trimmed from each end (`appr0ve2`,
+     `m3rg32`).
+  4. **Score** is the number of DISTINCT lexicon words found. Three or more fire.
 
   The lexicon (`user_agent_lexicon/0`) is English function words plus the imperatives and
   nouns an instruction to an agent is made of (`approve`, `merge`, `ignore`, `instructions`,
-  `deploy`, `review`, `agent`, `pull`, `request`). It deliberately leaves out every word a real
-  user agent carries (`like`, `mobile`, `compatible`, `version`, `build`, `preview`, `bot`,
-  `on`, `one`, `edge`, `plus`, `help`), and a test fails if it ever shares a word with the
-  recorded real user agents in `test/support/intake_fixtures/real_user_agents.json`.
+  `deploy`, `review`, `pull`, `request`). It holds NO two-letter word: those collide with
+  ISO 639 locale tags (`be-BY`, `en-US`) and model codes. It leaves out every word the
+  recorded real user agents carry — `like`, `mobile`, `version`, `build`, `preview`, `user`,
+  `code`, `production`, `from`, `our`, `was`, `can`, `any` — and a test fails if the lexicon
+  ever shares a word with `test/support/intake_fixtures/real_user_agents.json` beyond
+  `agent` and `claude`, which are kept because a real user agent carries at most one of them.
 
-  **Margin, asserted:** every recorded real user agent — desktop and mobile browsers, in-app
-  webviews, crawlers, link expanders, and user agents carrying an email address or a URL —
-  scores ZERO lexicon words, against a firing threshold of three.
+  **Margin, asserted:** every recorded real user agent in that file scores AT MOST ONE lexicon
+  word (`Claude-User` is `claude`, `Datadog Agent` is `agent`) against a firing threshold of
+  three, and fires nothing. The file is the whole proof and names what it covers: desktop
+  Chrome, Firefox, Safari, Edge, Opera and IE11; iOS Safari and Chrome; Android Chrome,
+  WebView, Samsung Internet, UC Browser, MIUI Browser, Kindle Silk and Huawei, Honor, Xiaomi
+  and Motorola devices; Facebook and LinkedIn in-app browsers; Googlebot, Bingbot, Discordbot,
+  facebookexternalhit, Slackbot and the Skype URL preview; the Claude, Perplexity and Mistral
+  user fetchers; Datadog Agent, Code, Make and curl; the Palo Alto Xpanse scanner; one crawler
+  carrying an email address and one Android user agent with a bot URL appended. It proves
+  nothing about a user agent outside that list.
 
   A backtick anywhere in a user agent fires on its own: no browser sends one, and
   `Loopctl.Intake.TicketFacts` has already removed a code span wrapping the whole value,
   so one that remains is inside it.
 
   **Known misses, pinned by a test that asserts they do NOT fire:** a paraphrase built from
-  words outside the lexicon, the same instruction in another language, and a word spelled
-  with a confusable letter from another script (a Cyrillic U+0430 inside `approve`). A
-  lexicon is a tripwire and cannot enumerate those. It is allowed to miss them because three
-  controls that do not depend on it bound the risk:
+  words outside the lexicon, the same instruction in another language, and look-alike
+  padding of more than two characters at a word's edge (`appr0ve222`). A lexicon is a
+  tripwire and cannot enumerate those. It is allowed to miss them because three controls
+  that do not depend on it bound the risk:
 
   1. **The implementer's input is built from the story only**
      (`Loopctl.Delivery.ImplementerInput`), so no user agent text reaches the session with
@@ -135,7 +154,8 @@ defmodule Loopctl.Delivery.InjectionDetector do
     :hidden_markup,
     :url_payload,
     :user_agent_prose,
-    :user_agent_spelled_out
+    :user_agent_spelled_out,
+    :user_agent_non_ascii
   ]
 
   @instruction_override [
@@ -205,29 +225,48 @@ defmodule Loopctl.Delivery.InjectionDetector do
   @ua_prose_threshold 3
   @ua_spelled_out_min_letters 8
   @ua_not_letter ~r/[^A-Za-z]+/
-  @ua_spelled_out ~r/(?<![A-Za-z])[A-Za-z](?:[^A-Za-z][A-Za-z])+(?![A-Za-z])/u
-  @ua_leet_run ~r/[A-Za-z0-9]+/
-  @ua_leet_digits ~r/\A[A-Za-z013457]*\z/
+  @ua_spelled_out ~r/(?<![A-Za-z])[A-Za-z]{1,2}(?:[^A-Za-z0-9]{1,3}[A-Za-z]{1,2}){3,}(?![A-Za-z])/
+  @ua_look_alike_run ~r/[A-Za-z0-9@$!|]+/
+  @ua_look_alike_non_letter ~r/[^A-Za-z]/
+  @ua_non_ascii ~r/[\x80-\xFF]/
+
+  # What each look-alike character can stand for, read position by position.
+  @ua_look_alike_classes %{
+    ?0 => ~c"o",
+    ?1 => ~c"il",
+    ?2 => ~c"z",
+    ?3 => ~c"e",
+    ?4 => ~c"a",
+    ?5 => ~c"s",
+    ?6 => ~c"gb",
+    ?7 => ~c"t",
+    ?8 => ~c"b",
+    ?9 => ~c"g",
+    ?@ => ~c"a",
+    ?$ => ~c"s",
+    ?! => ~c"i",
+    ?| => ~c"l"
+  }
 
   # English function words plus the imperatives and nouns an instruction to an agent is made
-  # of. It must never contain a word a real user agent carries: a test binds it to the
-  # recorded real corpus.
+  # of. No two-letter word (they collide with locale tags and model codes), and no word the
+  # recorded real user agents carry except `agent` and `claude`: a test binds it to that corpus.
   @ua_lexicon ~w(
-    the this that these those and or but if then than so to of for in into onto from with
-    without by at as is are was were be been do does did don doesn not no all any every each
-    some it its now here there please you your yours we our me my must should shall will would
-    can could may might just only also instead before after above below previous prior earlier
-    again never always immediately today tonight
+    the this that these those and but then than for into onto with without are were been
+    does did don doesn not all every each some its now here there please you your yours must
+    should shall will would could may might just only also instead before after above below
+    previous prior earlier again never always immediately today tonight
     approve approved merge merged ignore disregard forget instructions instruction system
     prompt prompts execute run delete remove drop deploy push commit review reviews skip
-    bypass override assistant agent agents claude gpt llm ai model pull request change changes
-    code fix patch master main production prod force verify admin root reveal print show tell
-    secret secrets token tokens key keys password credentials grant access permission rule
-    rules policy user human operator ship release test tests safe done wait repo repository
-    branch hook hooks ticket story issue pr ok yes trust trusted allow enable disable hidden
-    act pretend role respond reply answer write send upload download install shell bash
-    command commands sudo rm
+    bypass override assistant agent agents claude gpt llm model pull request change changes
+    fix patch master main prod force verify admin root reveal print show tell secret secrets
+    token tokens key keys password credentials grant access permission rule rules policy
+    human operator ship release test tests safe done wait repo repository branch hook hooks
+    ticket story issue yes trust trusted allow enable disable install hidden act pretend role
+    respond reply answer write send upload download shell bash command commands sudo
   )
+
+  @ua_lexicon_by_length Enum.group_by(@ua_lexicon, &String.length/1)
 
   @doc "The signal names this module can produce."
   @spec signals() :: [atom()]
@@ -248,8 +287,8 @@ defmodule Loopctl.Delivery.InjectionDetector do
   end
 
   @doc """
-  Scans a browser user agent, returning `user_agent_prose` and `user_agent_spelled_out`
-  reasons plus every field-independent signal the user agent carries.
+  Scans a browser user agent, returning `user_agent_prose`, `user_agent_spelled_out` and
+  `user_agent_non_ascii` reasons plus every field-independent signal the user agent carries.
   """
   @spec scan_user_agent(String.t(), String.t() | nil) :: [reason()]
   def scan_user_agent(_field, nil), do: []
@@ -258,8 +297,9 @@ defmodule Loopctl.Delivery.InjectionDetector do
     generic = scan_text(field, user_agent)
     prose = if user_agent_prose?(user_agent, generic), do: [:user_agent_prose], else: []
     spelled = if user_agent_spelled_out?(user_agent), do: [:user_agent_spelled_out], else: []
+    non_ascii = if user_agent_non_ascii?(user_agent), do: [:user_agent_non_ascii], else: []
 
-    (generic ++ prose ++ spelled) |> tag(field) |> Enum.uniq() |> Enum.sort()
+    (generic ++ prose ++ spelled ++ non_ascii) |> tag(field) |> Enum.uniq() |> Enum.sort()
   end
 
   defp tag(signals, field), do: Enum.map(signals, &"#{&1}:#{field}")
@@ -373,16 +413,14 @@ defmodule Loopctl.Delivery.InjectionDetector do
 
   @doc """
   Every candidate word of a user agent, whole string and comments included: the plain words,
-  the spelled-out words, and the digit-for-letter readings that are lexicon words. See
-  "User-agent prose" in the moduledoc.
+  the spelled-out words, and the look-alike readings that are lexicon words. See "User-agent
+  prose" in the moduledoc.
   """
   @spec user_agent_words(String.t()) :: MapSet.t(String.t())
   def user_agent_words(user_agent) when is_binary(user_agent) do
-    user_agent
-    |> normalised_forms()
-    |> Enum.flat_map(fn text ->
-      plain_words(text) ++ spelled_out_words(text) ++ leet_words(text)
-    end)
+    text = String.replace_invalid(user_agent)
+
+    (plain_words(text) ++ spelled_out_words(text) ++ look_alike_words(text))
     |> MapSet.new()
   end
 
@@ -395,32 +433,25 @@ defmodule Loopctl.Delivery.InjectionDetector do
     |> Enum.sort()
   end
 
-  @doc "Whether a user agent spells out a word of eight or more single letters."
+  @doc "Whether a user agent spells a word out in segments of eight or more letters."
   @spec user_agent_spelled_out?(String.t()) :: boolean()
   def user_agent_spelled_out?(user_agent) when is_binary(user_agent) do
     user_agent
-    |> normalised_forms()
-    |> Enum.flat_map(&spelled_out_runs/1)
+    |> String.replace_invalid()
+    |> spelled_out_runs()
     |> Enum.any?(&(String.length(&1) >= @ua_spelled_out_min_letters))
   end
+
+  @doc "Whether a user agent carries any byte outside ASCII."
+  @spec user_agent_non_ascii?(String.t()) :: boolean()
+  def user_agent_non_ascii?(user_agent) when is_binary(user_agent),
+    do: Regex.match?(@ua_non_ascii, user_agent)
 
   for word <- @ua_lexicon do
     defp lexicon_word?(unquote(word)), do: true
   end
 
   defp lexicon_word?(_word), do: false
-
-  # NFKC, then the text twice: combining marks stripped, and marks left in place, where they
-  # separate words like any other non-letter.
-  defp normalised_forms(user_agent) do
-    normalised =
-      case user_agent |> String.replace_invalid() |> :unicode.characters_to_nfkc_binary() do
-        binary when is_binary(binary) -> binary
-        _ -> user_agent
-      end
-
-    Enum.uniq([Regex.replace(~r/\p{M}/u, normalised, ""), normalised])
-  end
 
   defp plain_words(text) do
     text
@@ -429,13 +460,13 @@ defmodule Loopctl.Delivery.InjectionDetector do
     |> Enum.map(&String.downcase/1)
   end
 
-  # Each run is read whole (`a.p-p.r.o.v.e` is `approve`) and also split at whitespace, so
+  # Each run is read whole (`ap-pr-ov-e` is `approve`) and also split at whitespace, so
   # `p.l.e.a.s.e m.e.r.g.e` yields `please` and `merge` as well as the joined run.
   defp spelled_out_words(text) do
     @ua_spelled_out
     |> Regex.scan(text)
     |> Enum.flat_map(fn [run] ->
-      [run | String.split(run, ~r/\s/u, trim: true)]
+      [run | String.split(run, ~r/\s/, trim: true)]
       |> Enum.map(&(&1 |> String.replace(@ua_not_letter, "") |> String.downcase()))
       |> Enum.filter(&(byte_size(&1) >= 2))
     end)
@@ -447,29 +478,38 @@ defmodule Loopctl.Delivery.InjectionDetector do
     |> Enum.map(fn [run] -> String.replace(run, @ua_not_letter, "") end)
   end
 
-  # `appr0ve`, `th1s`, `pu11`: read the digits as letters, and keep only a lexicon word. A
-  # run shorter than four characters is never read, so a build suffix such as `A1` cannot.
-  defp leet_words(text) do
-    for [run] <- Regex.scan(@ua_leet_run, text),
+  # `appr0ve`, `1n5ta11`, `@ppr0ve`, `m3rg32`: each position is read as its class against
+  # every lexicon word of that length. A run shorter than four characters is never read, so a
+  # build suffix such as `A1` or `LX1` cannot become a word.
+  defp look_alike_words(text) do
+    for [run] <- Regex.scan(@ua_look_alike_run, text),
         byte_size(run) >= 4,
-        String.match?(run, ~r/[A-Za-z]/) and String.match?(run, ~r/[0-9]/),
-        String.match?(run, @ua_leet_digits),
-        reading <- leet_readings(run),
-        lexicon_word?(reading),
+        Regex.match?(@ua_look_alike_non_letter, run),
+        candidate <- edge_trimmed(run),
+        word <- Map.get(@ua_lexicon_by_length, length(candidate), []),
+        reads_as?(candidate, String.to_charlist(word)),
         uniq: true,
-        do: reading
+        do: word
   end
 
-  defp leet_readings(run) do
-    base =
-      run
-      |> String.downcase()
-      |> String.replace("0", "o")
-      |> String.replace("3", "e")
-      |> String.replace("4", "a")
-      |> String.replace("5", "s")
-      |> String.replace("7", "t")
+  # The run itself, and the run with up to two non-letter characters trimmed from each end.
+  defp edge_trimmed(run) do
+    chars = run |> String.downcase() |> String.to_charlist()
 
-    Enum.uniq([String.replace(base, "1", "i"), String.replace(base, "1", "l")])
+    for left <- 0..2,
+        right <- 0..2,
+        chars |> Enum.take(left) |> Enum.all?(&(&1 not in ?a..?z)),
+        chars |> Enum.reverse() |> Enum.take(right) |> Enum.all?(&(&1 not in ?a..?z)),
+        candidate = chars |> Enum.drop(left) |> Enum.drop(-right),
+        length(candidate) >= 3,
+        uniq: true,
+        do: candidate
+  end
+
+  defp reads_as?([], []), do: true
+
+  defp reads_as?([char | chars], [letter | letters]) do
+    (char == letter or letter in Map.get(@ua_look_alike_classes, char, [])) and
+      reads_as?(chars, letters)
   end
 end

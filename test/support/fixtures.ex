@@ -782,8 +782,8 @@ defmodule Loopctl.Fixtures do
     "test/support/intake_fixtures/hostile_samples.json" |> File.read!() |> Jason.decode!()
   end
 
-  # Recorded real user agents, keyed by browser and platform (#804). Every one must score at
-  # most half the user_agent_prose threshold.
+  # Recorded real user agents, keyed by browser and platform (#804). Every one must fire
+  # nothing and carry at most one lexicon word (asserted in injection_detector_test.exs).
   def build(:intake_real_user_agents, _attrs) do
     "test/support/intake_fixtures/real_user_agents.json" |> File.read!() |> Jason.decode!()
   end

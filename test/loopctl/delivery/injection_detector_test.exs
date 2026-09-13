@@ -26,7 +26,7 @@ defmodule Loopctl.Delivery.InjectionDetectorTest do
       assert MapSet.equal?(
                MapSet.difference(
                  declared,
-                 MapSet.new(~w(user_agent_prose user_agent_spelled_out))
+                 MapSet.new(~w(user_agent_prose user_agent_spelled_out user_agent_non_ascii))
                ),
                sampled
              )
@@ -91,7 +91,7 @@ defmodule Loopctl.Delivery.InjectionDetectorTest do
              )
     end
 
-    test "the lexicon shares no word with the recorded real user agents" do
+    test "the lexicon shares no word with the recorded real user agents but agent and claude" do
       corpus =
         @real_user_agents
         |> Map.values()
@@ -100,10 +100,14 @@ defmodule Loopctl.Delivery.InjectionDetectorTest do
 
       assert MapSet.size(corpus) > 50, "the corpus scan found too few words to prove anything"
       lexicon = MapSet.new(InjectionDetector.user_agent_lexicon())
-      assert MapSet.intersection(corpus, lexicon) == MapSet.new()
+      assert MapSet.intersection(corpus, lexicon) == MapSet.new(~w(agent claude))
     end
 
-    test "the margin: real user agents score zero lexicon words against a threshold of three" do
+    test "the lexicon holds no two-letter word" do
+      assert Enum.filter(InjectionDetector.user_agent_lexicon(), &(String.length(&1) < 3)) == []
+    end
+
+    test "the margin: a real user agent scores at most one lexicon word against a threshold of three" do
       max_hits =
         @real_user_agents
         |> Map.values()
@@ -117,8 +121,41 @@ defmodule Loopctl.Delivery.InjectionDetectorTest do
         |> Enum.min()
 
       assert InjectionDetector.user_agent_prose_threshold() == 3
-      assert max_hits == 0
+      assert max_hits == 1
       assert min_hostile >= InjectionDetector.user_agent_prose_threshold()
+    end
+
+    test "no recorded real user agent carries a non-ASCII byte" do
+      assert Enum.reject(Map.values(@real_user_agents), &(&1 =~ ~r/[\x80-\xFF]/)) ==
+               Map.values(@real_user_agents)
+    end
+
+    for {ua, index} <- Enum.with_index(@samples["user_agent"]["user_agent_non_ascii"]) do
+      @ua ua
+      test "non-ASCII sample ##{index} fires user_agent_non_ascii" do
+        assert "user_agent_non_ascii:user_agent" in InjectionDetector.scan_user_agent(
+                 "user_agent",
+                 @ua
+               )
+      end
+    end
+
+    test "every hostile user agent carrying a non-ASCII byte fires user_agent_non_ascii" do
+      carrying =
+        @samples["user_agent"]
+        |> Map.take(~w(user_agent_prose user_agent_spelled_out user_agent_non_ascii))
+        |> Map.values()
+        |> List.flatten()
+        |> Enum.filter(&(&1 =~ ~r/[\x80-\xFF]/))
+
+      assert length(carrying) >= 5
+
+      for ua <- carrying do
+        assert "user_agent_non_ascii:user_agent" in InjectionDetector.scan_user_agent(
+                 "user_agent",
+                 ua
+               )
+      end
     end
 
     for {name, ua} <- @real_user_agents do
@@ -162,8 +199,8 @@ defmodule Loopctl.Delivery.InjectionDetectorTest do
     end
 
     # Pinned so a change in either direction is noticed: a paraphrase outside the lexicon,
-    # another language, and confusable letters from another script. A lexicon cannot
-    # enumerate those. The risk is bounded by controls that do not depend on it: the
+    # another language, and look-alike padding of more than two characters at a word's edge.
+    # A lexicon cannot enumerate those. The risk is bounded by controls that do not depend on it: the
     # implementer's input is built from the story only, triage sees the UA fenced as
     # untrusted data, and home_care_billing#1506 validates UA grammar at the producer.
     for {ua, index} <- Enum.with_index(@samples["user_agent"]["user_agent_prose_known_misses"]) do

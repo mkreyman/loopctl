@@ -34,5 +34,15 @@
   "discordbot": "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)",
   "skype_url_preview": "Mozilla/5.0 (Windows NT 6.1; WOW64) SkypeUriPreview Preview/0.5 skype-url-preview@microsoft.com",
   "android_chrome_with_bot_url": "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36 +https://www.example.com/bot",
-  "crawler_with_email": "Foo/1.0 help@crawler.example.com"
+  "crawler_with_email": "Foo/1.0 help@crawler.example.com",
+  "claude_user": "Claude-User",
+  "perplexity_user": "Perplexity-User",
+  "mistralai_user": "MistralAI-User",
+  "datadog_agent": "Datadog Agent",
+  "vscode": "Code/1.93",
+  "make_production": "Make/production",
+  "uc_browser_be_by_huawei": "Mozilla/5.0 (Linux; U; Android 8.0.0; be-BY; WAS-LX1 Build/HUAWEIWAS-LX1) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/57.0.2987.108 UCBrowser/13.4.0.1306 Mobile Safari/537.36",
+  "huawei_can_l11": "Mozilla/5.0 (Linux; Android 7.0; HUAWEI CAN-L11) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36",
+  "honor_any_lx1": "Mozilla/5.0 (Linux; Android 12; ANY-LX1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36",
+  "palo_alto_xpanse": "Hello from Palo Alto Networks, find out more about our scans in https://docs-cortex.paloaltonetworks.com/r/1/Cortex-Xpanse/Scanning-activity"
 }
