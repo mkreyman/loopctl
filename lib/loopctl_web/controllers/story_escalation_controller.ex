@@ -28,7 +28,8 @@ defmodule LoopctlWeb.StoryEscalationController do
   plug LoopctlWeb.Plugs.RequireRole, [exact_role: :agent] when action in [:escalate]
   plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:escalate]
 
-  # `Loopctl.Delivery.Stages`' bound, which is the `story_stages_text_bounds` CHECK's.
+  # `Loopctl.Delivery.Stages`' bound, which is the `story_stages_text_bounds` CHECK's, counted
+  # in CODEPOINTS the way Postgres counts it — see `codepoints/1`.
   @max_reason_length 4_000
 
   tags(["Progress"])
@@ -72,7 +73,9 @@ defmodule LoopctlWeb.StoryEscalationController do
              maxLength: @max_reason_length,
              description:
                "Why a human is needed, in the session's own words. Recorded verbatim, " <>
-                 "capped at #{@max_reason_length} codepoints, never executed."
+                 "capped at #{@max_reason_length} CODEPOINTS (what Postgres counts, not " <>
+                 "graphemes — an emoji family is one grapheme and several codepoints), " <>
+                 "never executed. Over the bound is a 400."
            },
            payload: %OpenApiSpex.Schema{
              type: :object,
@@ -99,6 +102,9 @@ defmodule LoopctlWeb.StoryEscalationController do
          Schemas.ErrorResponse},
       422 => {"The reason or payload was refused", "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      500 =>
+        {"The transition's audit-chain entry did not land, so nothing was written",
+         "application/json", Schemas.ErrorResponse},
       503 =>
         {"A lock the write needed was not free; nothing was written", "application/json",
          Schemas.ErrorResponse}
@@ -143,7 +149,7 @@ defmodule LoopctlWeb.StoryEscalationController do
   defp reason(params) do
     case Map.get(params, "reason") do
       reason when is_binary(reason) ->
-        if String.trim(reason) == "" or String.length(reason) > @max_reason_length,
+        if String.trim(reason) == "" or codepoints(reason) > @max_reason_length,
           do: {:error, :bad_request, reason_message()},
           else: {:ok, reason}
 
@@ -152,8 +158,15 @@ defmodule LoopctlWeb.StoryEscalationController do
     end
   end
 
+  # CODEPOINTS, which is what Postgres `char_length` counts and what the
+  # `story_stages_text_bounds` CHECK bounds. `String.length/1` counts GRAPHEMES, and an emoji
+  # family or a combining mark is one grapheme and several characters to Postgres — so
+  # counting graphemes here let a reason past this 400 that `Loopctl.Delivery.Stages` then
+  # refused as `:invalid_reason`, which had no fallback clause and answered 500.
+  defp codepoints(value), do: value |> String.to_charlist() |> length()
+
   defp reason_message,
-    do: "reason must be a non-empty string of at most #{@max_reason_length} characters"
+    do: "reason must be a non-empty string of at most #{@max_reason_length} codepoints"
 
   defp payload(params) do
     case Map.get(params, "payload") do

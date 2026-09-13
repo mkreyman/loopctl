@@ -59,15 +59,24 @@ defmodule Loopctl.Delivery.Stages do
 
   ## Locks and their order
 
-  ONE order, fleet-wide (#822 review), and every writer follows the part of it that it
-  needs:
+  ONE order, fleet-wide (#822 review, corrected in #824 review), and every writer follows the
+  part of it that it needs:
 
       capacity advisory lock (0x41050803) -> story row -> runner_dispatches / story_stages
-      row -> chain advisory lock (0x4105A1D7) -> audit-chain head -> runners row
+      row -> runners row -> chain advisory lock (0x4105A1D7) -> audit-chain head
+
+  **The chain append is always LAST.** The order published by #822 had the `runners` row
+  after the chain, and it was wrong about the fleet as it stands: `Loopctl.Runners`'
+  `revoke_runner/3` takes the `runners` row and THEN appends, and so does the session-end
+  release below. Nothing anywhere takes the chain first and a `runners` row second, so the
+  table is the one that moves, not the code. Keeping the chain last is also what makes the
+  order safe to extend — the tenant's chain head is the row every writer in the tenant
+  contends on, so it is the one to hold for the shortest possible time.
 
   Here that is: `FOR SHARE` on the story (so a claim release cannot commit between reading
-  `claim_epoch` and the write it fences), then the stage row, then — only for a chained
-  transition — the tenant's chain advisory lock and its head
+  `claim_epoch` and the write it fences), then the stage row, then — for a session-end
+  transition — the dispatch row and the `runners` row, then, only for a chained transition,
+  the tenant's chain advisory lock and its head
   (`Loopctl.AuditChain.append_in_tenant_transaction/2`). `Loopctl.Progress`' release paths
   take the story `FOR UPDATE` first and the stage row second, the same way round.
 
@@ -86,14 +95,12 @@ defmodule Loopctl.Delivery.Stages do
     on something — not a capacity shortage. Look at what is holding the story row before
     raising a tenant's cap.
   - **The session-end release (`:session_dispatch`) runs BEFORE `AuditChain.append`, never
-    after.** It takes the `runner_dispatches` row and then the `runners` row, and the chain
-    lock sits between them in the order above, so releasing first is what keeps the chain
-    lock the LAST thing this transaction acquires. Appending first would have it held while
-    waiting on the `runners` row — and `Loopctl.Runners.Capacity` and
-    `Loopctl.Runners.DispatchLedger` reach that row without ever touching the chain, so
-    nothing takes the pair the other way and no cycle exists. Committing together is the
-    other half: a release that landed while its transition rolled back would free the slot
-    of a session the story does not know ended.
+    after** — which is simply the order above, since the `runners` row it ends at comes
+    before the chain. Appending first would hold the tenant's chain lock while waiting on a
+    `runners` row, and `Loopctl.Runners.revoke_runner/3` takes that row and then appends, so
+    the two together would close a cycle. Committing in one transaction is the other half:
+    a release that landed while its transition rolled back would free the slot of a session
+    the story does not know ended.
 
   Only ACQUIRED locks are ordered; the tenant-scoped `runners` SELECT in `record_effect/5`
   takes none. Taking any pair the other way round can deadlock; `lock_timeout` turns that
@@ -233,34 +240,6 @@ defmodule Loopctl.Delivery.Stages do
       Repo.with_tenant(tenant_id, fn -> row_query(tenant_id, story_id) |> Repo.one() end)
 
     row
-  end
-
-  @doc """
-  A story's current `claim_epoch`, or nil when the tenant has no such story. On the RLS
-  `Loopctl.Repo`, so a caller already reading `story_stages` here needs no second repo.
-
-  The AUTHORITY on whether a caller's claim is still live. A stage ROW's `claim_epoch` is not
-  that authority and must never be used as one: it is what the row was last WRITTEN under,
-  and while every release rebinds it (`follow_release/5`), reading the row to decide whether
-  the row is current is circular. Every caller that resolves a REPLAY — "is the row already
-  where this message wanted it?" — checks this first, or a zombie presenting the epoch its
-  own stale row still carries would be answered `ok`.
-
-  `Loopctl.Progress.current_claim_epoch/2` answers the same question on `AdminRepo`, whose
-  pool is three connections; this is the delivery loop's copy and the one a hot path uses.
-  """
-  @spec current_claim_epoch(Ecto.UUID.t(), Ecto.UUID.t()) :: non_neg_integer() | nil
-  def current_claim_epoch(tenant_id, story_id) do
-    {:ok, epoch} =
-      Repo.with_tenant(tenant_id, fn ->
-        Repo.one(
-          from s in Story,
-            where: s.id == ^story_id and s.tenant_id == ^tenant_id,
-            select: s.claim_epoch
-        )
-      end)
-
-    epoch
   end
 
   @doc "A story's stage events, oldest first."
@@ -859,6 +838,16 @@ defmodule Loopctl.Delivery.Stages do
   reason renders it through this and nothing else.** The JSON an operator or a dashboard
   reads gets the raw value, because a fence there would hide what was actually written; the
   fence exists for the one hop where the text lands in front of a model.
+
+  > **This is a CONVENTION with no binding guard, and it is on the next story to make it
+  > one.** Nothing in `lib/` renders `escalation_reason` into a prompt today — the prompt
+  > that will carry an escalation back to a human, or to a resumed session, does not exist
+  > yet — so this function is exercised only by its test and no mechanism forces a future
+  > caller through it. `Loopctl.Delivery.ImplementerInput` shows the shape the binding takes
+  > when there is something to bind: a test that names the untrusted fields and fails when
+  > they appear anywhere in `lib/` outside the modules that own the boundary. Whoever builds
+  > that prompt adds `escalation_reason` to a guard of that kind in the same change; until
+  > then the only thing stopping a raw interpolation is this paragraph.
   """
   @spec escalation_block(StoryStage.t()) :: String.t() | nil
   def escalation_block(%StoryStage{escalation_reason: nil}), do: nil

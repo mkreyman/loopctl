@@ -15,12 +15,19 @@ All notable changes to loopctl are documented here.
   dispatch, its `claim_epoch`, the `from` and `to` stages, the edge and the identities the
   transition produced, and is fenced on the claim epoch exactly as `dispatch_reply` and
   `trace` are. It is metered by a new `stage_burst` bucket (12, refilled one per 250 ms), and
-  the transition table a runner may report is published at
-  `x-connection.stage_transitions`. Two new refusal codes, `stale_stage` and
-  `unknown_story_stage`, because neither existing code carries their remedy. **Reporting a
-  transition into `done`, `failed` or `escalated` releases the session's runner slot in the
-  same transaction**, which #822 had no signal for — until now such a slot waited out the
-  heal sweep.
+  the transition table a runner may report is published at `x-connection.stage_transitions`.
+
+  **That table is what a session OBSERVED ABOUT ITS OWN WORK and nothing else.** The verdicts
+  another principal reaches are not reportable: the merge-precondition gate, post-deploy
+  verification, and a budget overrun — which would park a story in `failed`, the one stage
+  with no way out at all. Neither is anything into `claimed`. The `reason` bound is 4000
+  CODEPOINTS, which is what Postgres counts; the schema's `maxLength` is the same number
+  counted as graphemes and is therefore looser, so split by codepoints.
+
+  Two new refusal codes, `stale_stage` and `unknown_story_stage`, because neither existing
+  code carries their remedy. **Reporting a transition into a terminal stage releases the
+  session's runner slot in the same transaction**, which #822 had no signal for — until now
+  such a slot waited out the heal sweep.
 
   **New endpoint `POST /api/v1/stories/:id/escalate`** (agent role, `exact_role`, human-anchored
   tenant): the story's CLAIMING agent parks it at the `escalated` stage and stops, presenting
@@ -28,6 +35,13 @@ All notable changes to loopctl are documented here.
   session has instead of a question. It is idempotent under the same epoch. The endpoint is
   `exact_role: :agent` deliberately — the human key that RESOLVES an escalation must not be
   able to raise one.
+
+  **An unmapped error atom is now a 500 carrying `code: "internal_error"` plus a log line
+  naming the atom, instead of a `FunctionClauseError` in `LoopctlWeb.FallbackController`.**
+  API-wide, not just this endpoint: the status was already 500 either way, but the body is now
+  the standard error shape and the atom reaches the log rather than a stack trace. The atom is
+  never echoed to the client. Every shape with its own rendering — a changeset, an
+  `{:error, reason, message}` triple, every named atom — is untouched.
 
   No new environment variable and no migration.
 

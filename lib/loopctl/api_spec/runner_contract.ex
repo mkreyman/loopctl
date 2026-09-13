@@ -43,11 +43,21 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   `lock_version` and `attempts`. The transition table is published at
   `x-connection.stage_transitions`, derived from the server's own machine.
 
-  A runner may report only the part of the machine its session drives: nothing out of a
-  stage no session holds, nothing into `claimed`, and never `runner_lost`, `claim_released`
-  or `human_resolution`. Arriving at `done`, `failed` or `escalated` ends the session and the
-  runner's slot goes back in the same transaction — the server decides that from the
-  destination stage, so no message can free a slot while its session runs.
+  **A runner may report what its own session OBSERVED ABOUT ITS OWN WORK, and nothing else.**
+  The published table is that rule applied to the server's machine: transitions out of the
+  stages a session holds, over an ALLOWLIST of edges. Held back, and each for its own reason,
+  are the verdicts some OTHER principal reaches about the session — `merge_gate` (the
+  merge-precondition gate is control's), `verification_failed` (post-deploy verification
+  compares the deployed sha against the merge commit, which the session cannot see) and
+  `budget_exceeded` (`failed` is terminal with no way out at all, so a runner able to report
+  it could park a story for good — a session out of budget escalates instead and control
+  decides). Also held back: anything into `claimed`, and `runner_lost`, `claim_released` and
+  `human_resolution`.
+
+  Arriving at a terminal stage ends the session and the runner's slot goes back in the same
+  transaction — the server decides that from the destination stage, so no message can free a
+  slot while its session runs. The terminal stages a runner can reach are `done` and
+  `escalated`; `failed` is not reportable at all.
 
   Every `stage` message is safe to REPLAY. One whose first copy committed finds the row
   already at `to` under the same epoch and is answered `ok` with that row, so a re-send after
@@ -506,8 +516,18 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     @edges Enum.map(StageMachine.runner_edges(), &Atom.to_string/1)
 
     # `Loopctl.Delivery.Stages`' own bound, which is the `story_stages_text_bounds` CHECK's.
-    # Codepoints, matching `char_length`, not graphemes.
+    #
+    # CODEPOINTS, matching Postgres `char_length`. The schema's `maxLength` below cannot
+    # enforce that: OpenApiSpex counts it with `String.length/1`, which counts GRAPHEMES, and
+    # an emoji family or a combining mark is one grapheme and several characters to Postgres
+    # — so a 4000-grapheme reason cast clean here and was refused by the CHECK afterwards,
+    # which is not a retryable class. `RunnerContract.reason_length_errors/1` applies the
+    # codepoint bound, and the `maxLength` stays as the published number a runner splits by.
     @max_reason_length 4_000
+
+    @doc "The bound counted the way Postgres counts it."
+    @spec codepoints(String.t()) :: non_neg_integer()
+    def codepoints(value), do: value |> String.to_charlist() |> length()
 
     @doc "The stages a runner may report a transition OUT of."
     @spec from_stages() :: [String.t()]
@@ -610,7 +630,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
               "REQUIRED entering `escalated` and on `merge_refused`, a free note " <>
                 "otherwise. Session-authored and therefore untrusted: it is recorded and " <>
                 "capped, never executed, and fenced as untrusted data wherever it reaches " <>
-                "a prompt. At most #{RunnerStage.max_reason_length()} codepoints."
+                "a prompt. At most #{RunnerStage.max_reason_length()} CODEPOINTS — the " <>
+                "`maxLength` beside this is the same number counted as graphemes, which " <>
+                "is looser, so split by codepoints. A reason over the bound is " <>
+                "`invalid_payload`."
           },
           effects: RunnerStage.schema()
         }
@@ -1030,8 +1053,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     `merge_refused`). `Loopctl.Delivery.Stages` refuses it too — this is the copy that
     answers the runner before the write, not the enforcement.
 
-  The stage and edge atoms are `String.to_existing_atom/1` over the machine's own lists,
-  reached only after the enum has matched, so no wire value ever creates an atom.
+  The stage and edge atoms come from a COMPILE-TIME map of the machine's own atoms, so no
+  wire value ever creates one — and, unlike the `String.to_existing_atom/1` this used to
+  call, the conversion does not depend on `Loopctl.Delivery.StageMachine` already having been
+  loaded. See the comment above `@wire_atoms`.
   """
   @spec cast_stage(term()) :: {:ok, map()} | {:error, term()}
   def cast_stage(payload) do
@@ -1052,11 +1077,50 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     end
   end
 
-  defp stage_atom(name), do: String.to_existing_atom(name)
+  # Wire string -> the machine's own atom, resolved through a COMPILE-TIME map and never
+  # through `String.to_existing_atom/1`.
+  #
+  # That function raised here, and the bug is worth naming because it looks impossible: the
+  # atoms plainly exist, they are written as literals in `Loopctl.Delivery.StageMachine`. But
+  # an atom in a module's constant pool comes into being when that MODULE IS LOADED, and
+  # Elixir loads lazily. This module's enums are compiled down to STRINGS
+  # (`Atom.to_string/1` at compile time), so nothing in `cast_stage/1`'s path forces
+  # `StageMachine` to load before the conversion — the first call in a fresh VM raised
+  # `ArgumentError: not an already existing atom` and took the runner's channel down with it.
+  # It passed for a while only because some earlier test happened to load the module first,
+  # which is a test-ordering accident and not a property of the code.
+  #
+  # The map's VALUES are atom literals in THIS module's constant pool, so they exist the
+  # moment this code runs. `Map.get/2` rather than `fetch!/2`: an unmapped string yields nil,
+  # `runner_reportable?/3` refuses the triple, and the caller gets `invalid_payload` instead
+  # of a raise. The OpenApiSpex enum has already rejected anything unmapped, but "another
+  # validator already checked it" is exactly the reasoning that produced the raise above.
+  @wire_atoms Map.new(
+                StageMachine.stages() ++ StageMachine.runner_edges(),
+                &{Atom.to_string(&1), &1}
+              )
+
+  defp stage_atom(name), do: Map.get(@wire_atoms, name)
 
   defp stage_shape_errors(%{from: from, to: to, edge: edge} = stage) do
-    transition_errors(from, to, edge) ++ reason_errors(to, edge, stage)
+    transition_errors(from, to, edge) ++
+      reason_errors(to, edge, stage) ++
+      reason_length_errors(stage)
   end
+
+  # The `maxLength` on the schema counts GRAPHEMES; Postgres counts CODEPOINTS. Left to the
+  # schema alone the wire bound was LOOSER than the `story_stages_text_bounds` CHECK, so a
+  # reason of 4000 graphemes and more codepoints was accepted here, refused by
+  # `Loopctl.Delivery.Stages` deeper in, and on the HTTP path reached the database and died
+  # as a 23514 the caller could do nothing with. Counted here, the wire, the context and the
+  # CHECK all agree on one number.
+  defp reason_length_errors(%{reason: reason}) when is_binary(reason) do
+    if RunnerStage.codepoints(reason) > RunnerStage.max_reason_length(),
+      do: ["reason may be at most #{RunnerStage.max_reason_length()} codepoints"],
+      else: []
+  end
+
+  defp reason_length_errors(_stage), do: []
 
   defp transition_errors(from, to, edge) do
     if StageMachine.runner_reportable?(from, to, edge),

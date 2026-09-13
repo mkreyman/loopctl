@@ -96,22 +96,60 @@ defmodule Loopctl.Delivery.StageMachine do
                    {:merged, :implementing, :merge_refused}
                  ] ++ @budget_exceeded ++ @released ++ @human_resolution ++ @session_escalated
 
-  # The part of the machine a RUNNER may report over the channel. Derived from
-  # `@transitions`, so an edge added above is reportable or not by these rules rather than by
-  # a second list somebody has to remember to extend. See `runner_transitions/0`.
+  # The part of the machine a RUNNER may report over the channel: one definition, from which
+  # `runner_transitions/0`'s doc, the wire enums and the published
+  # `x-connection.stage_transitions` table all derive.
+  #
+  # It is an ALLOWLIST of edges, not a blocklist. Written as a blocklist it silently admitted
+  # three transitions a session has no standing to assert — `:merge_gate`,
+  # `:verification_failed` and `:budget_exceeded` — because none of them was on the list of
+  # things to hold back. An allowlist fails the other way: a new edge is unreportable until
+  # somebody decides it is a session's to report.
+  #
+  # The rule: a runner may report what its own session OBSERVED ABOUT ITS OWN WORK. Each of
+  # these is something the session did or watched happen to its branch —
+  #
+  # - `:forward`, from `claimed` on: it made the worktree, wrote code, opened the PR, watched
+  #   CI, merged, deployed, saw verification pass.
+  # - `:ci_red`, `:review_findings`, `:base_moved`: its own run went red, its own review came
+  #   back, its own base moved under it.
+  # - `:merge_refused`: its own merge did not hold.
+  # - `:session_escalated`: it is asking for Mark (design §8).
+  #
+  # and each of the three held back is a VERDICT SOMEBODY ELSE REACHES about the session:
+  #
+  # - `:merge_gate` — the merge-precondition gate (design §5). The gates compute their own
+  #   triggers and OR them with an agent's signals, never reading an agent's negative; a
+  #   runner able to report the gate's verdict could write a chain entry asserting a gate
+  #   ruling that never ran.
+  # - `:verification_failed` — post-deploy verification, which is control's comparison of the
+  #   deployed sha against the merge commit (design §9), not something the session can see.
+  # - `:budget_exceeded` — and this one is the worst of the three, because `failed` is
+  #   terminal with NO way out, `:human_resolution` included. A runner able to report it can
+  #   park a story for good with no path back. A session that has run out of budget escalates
+  #   instead; control decides whether that is `failed`.
+  #
+  # The SOURCE filter is what keeps `claimed` out as a destination: `queued` is the only stage
+  # anything enters `claimed` from, and `queued` is not a source. A separate `to != :claimed`
+  # clause was here and is gone — `bin/mutate.sh` returned exit 1 on it, which is the tool
+  # saying no test can tell whether it is there. `stage_machine_test.exs` asserts the property
+  # directly instead, so widening the source list to include `queued` goes red rather than
+  # quietly handing a runner the transition that writes `runner_id` and the claim's chain
+  # entry. The same test asserts the three held-back edges by name.
   @runner_source_stages @in_flight ++ [:merged, :deployed, :verified]
-  @runner_forbidden_edges [:runner_lost, :claim_released, :human_resolution]
 
-  # The SOURCE filter is also what keeps `claimed` out as a destination: `queued` is the only
-  # stage anything enters `claimed` from, and `queued` is not a source. A separate
-  # `to != :claimed` clause was here and is gone — `bin/mutate.sh` returned exit 1 on it,
-  # which is the tool saying no test can tell whether it is there. `stage_machine_test.exs`
-  # asserts the property directly instead, so widening the source list to include `queued`
-  # goes red rather than quietly handing a runner the transition that writes `runner_id` and
-  # the claim's chain entry.
+  @runner_reportable_edges [
+    :forward,
+    :ci_red,
+    :review_findings,
+    :base_moved,
+    :merge_refused,
+    :session_escalated
+  ]
+
   @runner_transitions for {from, to, edge} <- @transitions,
                           from in @runner_source_stages,
-                          edge not in @runner_forbidden_edges,
+                          edge in @runner_reportable_edges,
                           do: {from, to, edge}
 
   @runner_from_stages @runner_transitions |> Enum.map(&elem(&1, 0)) |> Enum.uniq()
@@ -234,21 +272,15 @@ defmodule Loopctl.Delivery.StageMachine do
   def human_only?(edge), do: edge == :human_resolution
 
   @doc """
-  The transitions a RUNNER may report over the channel (`stage`, contract 1.4.0), derived
-  from `transitions/0` so the wire enum and the machine cannot drift.
+  The transitions a RUNNER may report over the channel (`stage`, contract 1.4.0).
 
-  A runner may report only the part of the machine its own session drives, so three classes
-  are held back and each for its own reason:
-
-  - anything OUT OF a stage no session holds (`detected`, `triaged`, `queued`, `escalated`).
-    Those are control's — triage and the human resolution — and a session that has been
-    escalated away from is precisely the one that must not move the row back.
-  - anything INTO `claimed`. That transition writes `runner_id` and a chain entry, and it is
-    control's `advance(queued -> claimed)` alongside the claim itself; a runner reporting it
-    would be naming its own machine as the story's holder.
-  - `:runner_lost` and `:claim_released` (a runner that can report itself lost is not lost,
-    and a release is the releasing transaction's — `Loopctl.Delivery.Stages.follow_release/5`)
-    and `:human_resolution`, which is Mark's.
+  **A runner may report what its own session OBSERVED ABOUT ITS OWN WORK, and nothing else.**
+  That one sentence is the definition; the set is derived from `transitions/0` by two filters
+  over `runner_source_stages/0` and `runner_reportable_edges/0`, so the wire enums, the
+  contract's published `x-connection.stage_transitions` table and this doc cannot drift from
+  each other or from the machine. Read the comment above `@runner_transitions` for what each
+  filter holds back and why; `runner_reportable_edges/0` is an ALLOWLIST, so an edge added to
+  the machine is unreportable until somebody decides it is a session's to report.
 
   `from` is on the wire and is part of the compare-and-set: a runner states the stage it
   believed the story was at, and a row that has moved refuses it rather than taking a
@@ -256,6 +288,21 @@ defmodule Loopctl.Delivery.StageMachine do
   """
   @spec runner_transitions() :: [transition()]
   def runner_transitions, do: @runner_transitions
+
+  @doc """
+  The stages a runner may report a transition OUT of — the ones its session holds the story
+  in, plus the three it drives after the merge.
+  """
+  @spec runner_source_stages() :: [stage()]
+  def runner_source_stages, do: @runner_source_stages
+
+  @doc """
+  The edges a runner may report: the ALLOWLIST half of `runner_transitions/0`. Everything
+  else is a verdict some other principal reaches about the session — see the comment above
+  `@runner_transitions`.
+  """
+  @spec runner_reportable_edges() :: [edge()]
+  def runner_reportable_edges, do: @runner_reportable_edges
 
   @doc "True when `{from, to, edge}` is one a runner may report."
   @spec runner_reportable?(stage(), stage(), edge()) :: boolean()

@@ -76,7 +76,7 @@ defmodule Loopctl.Delivery.StageMachineTest do
     # is control's, alongside the claim itself.
     refute Enum.any?(reportable, &match?({_, :claimed, _}, &1))
 
-    # And never the three edges another principal owns.
+    # And never an edge another principal owns.
     for edge <- [:runner_lost, :claim_released, :human_resolution] do
       refute Enum.any?(reportable, &match?({_, _, ^edge}, &1))
     end
@@ -88,6 +88,71 @@ defmodule Loopctl.Delivery.StageMachineTest do
     assert {:implementing, :escalated, :session_escalated} in reportable
     assert StageMachine.runner_reportable?(:ci, :implementing, :ci_red)
     refute StageMachine.runner_reportable?(:queued, :claimed, :forward)
+  end
+
+  test "a runner cannot report a verdict SOMEBODY ELSE reaches about its session" do
+    # #824 round 1, finding 2. The set was a blocklist and silently admitted all three of
+    # these, so a runner could write a chain entry asserting a control-side gate ruling that
+    # never ran — and, worse, park a story in a stage with no way out.
+    reportable = StageMachine.runner_transitions()
+
+    # The merge-precondition gate (design §5) is control's; the gates compute their own
+    # triggers and never read an agent's negative.
+    refute {:ci, :escalated, :merge_gate} in reportable
+    refute StageMachine.runner_reportable?(:ci, :escalated, :merge_gate)
+
+    # Post-deploy verification (design §9) compares the deployed sha against the merge
+    # commit — a comparison the session cannot see.
+    refute {:deployed, :escalated, :verification_failed} in reportable
+    refute StageMachine.runner_reportable?(:deployed, :escalated, :verification_failed)
+
+    # And `failed` is terminal with NO way out, `:human_resolution` included, so a runner
+    # able to report `:budget_exceeded` could park a story for good.
+    refute Enum.any?(reportable, &match?({_, :failed, _}, &1))
+    refute Enum.any?(reportable, &match?({_, _, :budget_exceeded}, &1))
+    refute :failed in StageMachine.runner_to_stages()
+
+    # The three above are real transitions the machine has — this test is about who may
+    # report them, not about whether they exist.
+    for triple <- [
+          {:ci, :escalated, :merge_gate},
+          {:deployed, :escalated, :verification_failed},
+          {:implementing, :failed, :budget_exceeded}
+        ] do
+      assert triple in StageMachine.transitions(), inspect(triple)
+    end
+  end
+
+  test "the reportable edge list is an ALLOWLIST, so a new edge is unreportable by default" do
+    # The definition the doc, the wire enums and the published table all derive from. Written
+    # as a blocklist it admitted three transitions nobody had thought to exclude; as an
+    # allowlist a new edge stays out until somebody decides it is a session's to report.
+    assert Enum.sort(StageMachine.runner_reportable_edges()) ==
+             Enum.sort([
+               :forward,
+               :ci_red,
+               :review_findings,
+               :base_moved,
+               :merge_refused,
+               :session_escalated
+             ])
+
+    for {_from, _to, edge} <- StageMachine.runner_transitions() do
+      assert edge in StageMachine.runner_reportable_edges()
+    end
+
+    for {from, _to, _edge} <- StageMachine.runner_transitions() do
+      assert from in StageMachine.runner_source_stages()
+    end
+
+    # And the set really is the two filters applied to the machine, not a hand-kept list.
+    assert StageMachine.runner_transitions() ==
+             for(
+               {from, to, edge} <- StageMachine.transitions(),
+               from in StageMachine.runner_source_stages(),
+               edge in StageMachine.runner_reportable_edges(),
+               do: {from, to, edge}
+             )
   end
 
   test "the published from/to/edge lists are the reportable table's own projections" do

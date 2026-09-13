@@ -181,6 +181,59 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
       assert Stages.get(story.tenant_id, story.id).stage == :implementing
     end
 
+    # #824 round 1, finding 1: these two atoms had NO FallbackController clause and no
+    # catch-all, so both answered 500 — the declared 422 and 409 were fiction. Both are
+    # reachable from a well-formed request, which is what makes them worth a test rather
+    # than a comment.
+    test "422, not 500, for a payload the stage event will not take" do
+      %{story: story, raw_key: raw_key} = claimed_story()
+      oversized = %{"blob" => String.duplicate("x", 8_001)}
+
+      conn =
+        build_conn()
+        |> auth(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/escalate", body(%{"payload" => oversized}))
+
+      assert json_response(conn, 422)["error"]["code"] == "invalid_event_data"
+      assert Stages.get(story.tenant_id, story.id).stage == :implementing
+    end
+
+    test "409, not 500, escalating from a stage no session holds" do
+      # `merged` is past the point a session holds the story, so the machine has no
+      # `:session_escalated` edge out of it and `Escalations` answers :invalid_transition.
+      %{story: story, raw_key: raw_key} = claimed_story(:merged)
+
+      conn =
+        build_conn()
+        |> auth(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/escalate", body())
+
+      assert json_response(conn, 409)["error"]["code"] == "invalid_transition"
+      assert Stages.get(story.tenant_id, story.id).stage == :merged
+    end
+
+    # #824 round 1, finding 5: `maxLength` counts GRAPHEMES and the CHECK counts CODEPOINTS,
+    # so a reason under the schema's bound and over Postgres' used to reach the database and
+    # die there. An emoji family is ONE grapheme and SEVEN codepoints.
+    test "400 for a reason over the bound in CODEPOINTS though under it in graphemes" do
+      %{story: story, raw_key: raw_key} = claimed_story()
+      family = "👨‍👩‍👧‍👦"
+
+      assert String.length(family) == 1
+      assert family |> String.to_charlist() |> length() == 7
+
+      # 1000 graphemes, 7000 codepoints: inside maxLength 4000, well past the CHECK's 4000.
+      reason = String.duplicate(family, 1_000)
+
+      conn =
+        build_conn()
+        |> auth(raw_key)
+        |> post(~p"/api/v1/stories/#{story.id}/escalate", body(%{"reason" => reason}))
+
+      assert json_response(conn, 400)
+      assert Stages.get(story.tenant_id, story.id).stage == :implementing
+    end
+
     test "404 when the story has no delivery stage row", %{conn: conn} do
       tenant = fixture(:committed_tenant, %{trust_tier: :human_anchored})
       {raw_key, _api_key, agent} = fixture(:committed_agent_key, %{tenant_id: tenant.id})

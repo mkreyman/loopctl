@@ -317,10 +317,7 @@
             "ci_red",
             "review_findings",
             "base_moved",
-            "verification_failed",
-            "merge_gate",
             "merge_refused",
-            "budget_exceeded",
             "session_escalated"
           ],
           "type": "string"
@@ -374,7 +371,7 @@
           "type": "string"
         },
         "reason": {
-          "description": "REQUIRED entering `escalated` and on `merge_refused`, a free note otherwise. Session-authored and therefore untrusted: it is recorded and capped, never executed, and fenced as untrusted data wherever it reaches a prompt. At most 4000 codepoints.",
+          "description": "REQUIRED entering `escalated` and on `merge_refused`, a free note otherwise. Session-authored and therefore untrusted: it is recorded and capped, never executed, and fenced as untrusted data wherever it reaches a prompt. At most 4000 CODEPOINTS — the `maxLength` beside this is the same number counted as graphemes, which is looser, so split by codepoints. A reason over the bound is `invalid_payload`.",
           "maxLength": 4000,
           "minLength": 1,
           "type": "string"
@@ -390,8 +387,7 @@
             "deployed",
             "verified",
             "done",
-            "escalated",
-            "failed"
+            "escalated"
           ],
           "type": "string"
         }
@@ -773,64 +769,9 @@
         "to": "implementing"
       },
       {
-        "edge": "verification_failed",
-        "from": "deployed",
-        "to": "escalated"
-      },
-      {
-        "edge": "merge_gate",
-        "from": "ci",
-        "to": "escalated"
-      },
-      {
         "edge": "merge_refused",
         "from": "merged",
         "to": "implementing"
-      },
-      {
-        "edge": "budget_exceeded",
-        "from": "claimed",
-        "to": "failed"
-      },
-      {
-        "edge": "budget_exceeded",
-        "from": "worktree",
-        "to": "failed"
-      },
-      {
-        "edge": "budget_exceeded",
-        "from": "implementing",
-        "to": "failed"
-      },
-      {
-        "edge": "budget_exceeded",
-        "from": "reviewing",
-        "to": "failed"
-      },
-      {
-        "edge": "budget_exceeded",
-        "from": "pr_open",
-        "to": "failed"
-      },
-      {
-        "edge": "budget_exceeded",
-        "from": "ci",
-        "to": "failed"
-      },
-      {
-        "edge": "budget_exceeded",
-        "from": "merged",
-        "to": "failed"
-      },
-      {
-        "edge": "budget_exceeded",
-        "from": "deployed",
-        "to": "failed"
-      },
-      {
-        "edge": "budget_exceeded",
-        "from": "verified",
-        "to": "failed"
       },
       {
         "edge": "session_escalated",

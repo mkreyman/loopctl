@@ -189,6 +189,65 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
       end
     end
 
+    test "a verdict another principal reaches is refused at the contract", ctx do
+      # #824 round 1, finding 2. Each of these IS a transition the machine has; none is a
+      # runner's to report. Refused by the cast, so none reaches a database transaction and
+      # none can write a chain entry asserting a gate ruling that never ran.
+      %{channel: channel, dispatch_id: dispatch_id, runner: runner, story: story} = ctx
+
+      for {from, to, edge} <- [
+            {"ci", "escalated", "merge_gate"},
+            {"deployed", "escalated", "verification_failed"},
+            {"implementing", "failed", "budget_exceeded"}
+          ] do
+        refill_bucket(channel)
+
+        ref =
+          push(
+            channel,
+            "stage",
+            stage_message(dispatch_id, %{
+              "from" => from,
+              "to" => to,
+              "edge" => edge,
+              "reason" => "trying it on"
+            })
+          )
+
+        assert_reply ref, :error, %{reason: "invalid_payload"}, @reply_timeout
+      end
+
+      assert Stages.get(runner.tenant_id, story.id).stage == :implementing
+    end
+
+    test "a reason over the bound in CODEPOINTS is refused though maxLength admits it", ctx do
+      # #824 round 1, finding 5. `maxLength` counts graphemes; the story_stages CHECK counts
+      # codepoints. An emoji family is one grapheme and seven codepoints, so 1000 of them
+      # sit inside maxLength 4000 and well past the CHECK's 4000 — and used to be cast
+      # clean, then refused deeper where nothing could act on it.
+      %{channel: channel, dispatch_id: dispatch_id, runner: runner, story: story} = ctx
+      reason = String.duplicate("👨‍👩‍👧‍👦", 1_000)
+
+      assert String.length(reason) == 1_000
+      assert reason |> String.to_charlist() |> length() == 7_000
+
+      ref =
+        push(
+          channel,
+          "stage",
+          stage_message(dispatch_id, %{
+            "from" => "implementing",
+            "to" => "escalated",
+            "edge" => "session_escalated",
+            "reason" => reason
+          })
+        )
+
+      assert_reply ref, :error, %{reason: "invalid_payload", details: details}, @reply_timeout
+      assert Enum.any?(details, &String.contains?(&1, "codepoints"))
+      assert Stages.get(runner.tenant_id, story.id).stage == :implementing
+    end
+
     test "a replay is answered ok with the row, not stale_stage", ctx do
       %{channel: channel, dispatch_id: dispatch_id} = ctx
       message = stage_message(dispatch_id, %{"from" => "implementing", "to" => "reviewing"})
@@ -271,25 +330,17 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
       _ = channel
     end
 
-    test "the bucket the contract publishes is the one the channel enforces", ctx do
+    # The bucket, in two DETERMINISTIC halves. Draining it with a burst of `capacity + 1` real
+    # pushes is the obvious test and it is a flake: every push is a database round trip, the
+    # bucket earns a token every 250 ms, and under a loaded full suite the burst outlasts the
+    # refill — green alone, red in `mix test` (#824 round 1). Neither assertion below reads
+    # the wall clock.
+    test "a push spends one of the tokens the CONTRACT publishes", ctx do
       %{channel: channel, dispatch_id: dispatch_id} = ctx
       capacity = RunnerContract.stage_burst() |> Map.fetch!("capacity")
 
-      # Every one of these is a VALID message that spends a token — an invalid one is
-      # refused before the bucket, so it would not exercise the limit at all. They all
-      # refuse on the compare-and-set (the row never leaves `implementing`), which is what
-      # keeps a burst of capacity + 1 pushes from walking the machine off its own line.
-      for _ <- 1..capacity do
-        ref =
-          push(
-            channel,
-            "stage",
-            stage_message(dispatch_id, %{"from" => "reviewing", "to" => "pr_open"})
-          )
-
-        assert_reply ref, :error, %{reason: "stale_stage"}, @reply_timeout
-      end
-
+      # A valid message — an invalid one is refused before the bucket and spends nothing.
+      # It refuses on the compare-and-set, which is beside the point here.
       ref =
         push(
           channel,
@@ -297,8 +348,38 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
           stage_message(dispatch_id, %{"from" => "reviewing", "to" => "pr_open"})
         )
 
+      assert_reply ref, :error, %{reason: "stale_stage"}, @reply_timeout
+
+      # ONE push against a `:full` bucket, so the token count is exactly `capacity - 1`
+      # however long the round trip took. This is what binds the channel's constant to the
+      # contract's number: a channel enforcing a different capacity lands on a different count.
+      assert {tokens, _refilled_at} = :sys.get_state(channel.channel_pid).assigns.stage_bucket
+      assert tokens == capacity - 1
+    end
+
+    test "an exhausted bucket refuses with the contract's interval", ctx do
+      %{channel: channel, dispatch_id: dispatch_id} = ctx
+
+      # Zero tokens, last one earned an hour into the FUTURE, so `earned` is clamped to 0 and
+      # no amount of elapsed test time can refill it. The refusal is the channel's, not the
+      # clock's.
+      :sys.replace_state(channel.channel_pid, fn socket ->
+        future = System.monotonic_time(:millisecond) + 3_600_000
+        %{socket | assigns: %{socket.assigns | stage_bucket: {0, future}}}
+      end)
+
+      ref =
+        push(
+          channel,
+          "stage",
+          stage_message(dispatch_id, %{"from" => "implementing", "to" => "reviewing"})
+        )
+
       assert_reply ref, :error, %{reason: "rate_limited", min_interval_ms: ms}, @reply_timeout
       assert ms == RunnerContract.stage_burst() |> Map.fetch!("refill_interval_ms")
+
+      # And nothing was written: a message refused by the bucket never reaches the machine.
+      assert Stages.get(ctx.runner.tenant_id, ctx.story.id).stage == :implementing
     end
   end
 end
