@@ -24,7 +24,7 @@ gated, so escalating to a bigger key never clears a 403 there:
 |----------|------|
 | `verify` / `reject` / `force_unclaim` / `verify_all` | `exact_role: :orchestrator` (`story_verification_controller.ex:28-29`) — a superadmin key CANNOT verify |
 | `contract` / `report` | `exact_role: [:agent, :orchestrator]` (`story_status_controller.ex:26-30`) — a human user key CANNOT report |
-| `claim` / `start` / `request-review` / `unclaim` | `exact_role: :agent` (`story_status_controller.ex:32-33`) |
+| `claim` / `start` / `request-review` / `unclaim` / `renew-claim` | `exact_role: :agent` (`story_status_controller.ex`) |
 | `review-complete` | `exact_role: [:orchestrator, :user]` (`review_record_controller.ex:22-23`) — an agent key never reaches the controller |
 
 **Anti-pattern: never "normalize" an `exact_role` custody gate to `role:`.** That is exactly what
@@ -96,8 +96,8 @@ caller's lineage is always resolved SERVER-SIDE from the authenticating key
   `get_dispatch_lineage/2`) fails **CLOSED**, and the `assigned_agent_id`
   equality check runs IN ADDITION to the lineage comparison rather than being short-circuited by it.
   `verifier_dispatch_id` is written only by the assign-verifier flow (`assign_rotating_verifier/3`,
-  `progress.ex:603-650`); that write is result-checked, and a failure flags `verifier_needed` plus a
-  `verifier_not_assigned` audit event (`flag_verifier_needed/5`, `progress.ex:655`) instead of
+  `progress.ex:617-664`); that write is result-checked, and a failure flags `verifier_needed` plus a
+  `verifier_not_assigned` audit event (`flag_verifier_needed/5`, `progress.ex:669`) instead of
   silently leaving the field nil. `request-review` is OPTIONAL, so most stories reach verify with no
   verifier dispatch — the CALLER-lineage step is what keeps that path lineage-gated.
 - **report** — `validate_not_self_report/3`. `nil` caller blocked
@@ -137,12 +137,52 @@ pre-loopctl work. `guard_no_lifecycle_history/2` (`progress.ex`) consults three 
 (retention-bounded — `AuditPartitionWorker` DROPs partitions past `:audit_retention_days`, so it
 expires). The column is stamped by all FOUR paths that clear `assigned_agent_id` on a worked story
 (`unclaim_story/3`, `force_unclaim_story/3`, `perform_auto_reset/4` and
-`BulkOperations.auto_reset_agent_status/1`) and never cleared. Re-running `force_unclaim_story/3` on
+`BulkOperations.auto_reset_agent_status/1`) — plus the lease reclaimer, which releases through the same
+`release_claim_changes/1` as unclaim and force-unclaim — and never cleared. Re-running `force_unclaim_story/3` on
 a story already at `:pending` stamps it too — the remedy for a story reset before the column
 existed — but only when the row or the audit log still shows it was worked. **It is a
 column and not a `metadata` key on purpose**: `metadata` is cast by `Story.update_changeset/2` and
 REPLACED wholesale by `PATCH /api/v1/stories/:id`, so one ordinary orchestrator request erased the
 marker and handed the launder path back. Never add `:lifecycle_entered_at` to a `cast` list.
+
+## Claim lease and epoch fence (#803)
+
+A claim is not held forever. `claim_story/3` (and `BulkOperations.bulk_claim/4`, via
+`Progress.claim_lease_change/2`) sets `stories.claimed_until` to now plus
+`Progress.claim_lease_seconds/0` (default 24h, `STORY_CLAIM_LEASE_SECONDS`) and increments
+`stories.claim_epoch`, inside the claim's transaction. `renew_claim/3`
+(`POST /stories/:id/renew-claim`) extends the lease from NOW for the assigned agent presenting the
+current epoch — refusals `422 not_claimed`, `409 stale_claim_epoch`, `409 not_claimant`, in that
+order. `Loopctl.Workers.ReclaimExpiredClaimsWorker` (cron `*/5`) releases an expired lease through
+`reclaim_expired_claim/3`, which re-checks status, lease and the epoch it read UNDER the row lock, so
+a renewal or re-claim between the sweep's read and the lock wins.
+
+Invariants:
+- **Every release bumps the epoch**: unclaim, force-unclaim, reclaim, and both reject auto-resets
+  (`Progress.claim_release_change/1`). A release that kept the epoch would let a session still holding
+  it pass `check_claim_epoch/3` on a story it no longer holds.
+- **A NULL lease is never reclaimed** — every claim made before the column existed, which nothing
+  renews. Renewing one gives it a lease.
+- **A story in review is never reclaimed.** `request_review/3` stamps `review_requested_at` (a
+  conditional UPDATE, so it cannot land on a story released since its read); the sweep and
+  `lease_expired?/3` under the lock both refuse a stamped story, and a renewal cannot re-arm it. A
+  marker rather than a NULLed lease precisely because renewal would re-arm a NULL. Cleared by every
+  release.
+- **"The claimant cannot renew" never causes a reclaim.** Two conditions make renewal impossible: a
+  custody halt (`renew-claim` is custody surface) and a tenant status other than `:active`
+  (`ResolveApiKey` 403s every request). The sweep skips both, `reclaim_expired_claim/3` re-checks both
+  under a `FOR SHARE` lock on the tenant row taken BEFORE the story lock, and both transitions back —
+  `Tenants.clear_custody_halt/1` and `Tenants.activate_tenant/1` — extend every live lease to now +
+  `renewal_grace_seconds/0` (one lease) inside their transaction, deciding from the LOCKED tenant row
+  and granting only on a real transition. Keep that tenant-then-story lock order on every side or they
+  can deadlock. A new path that returns a tenant to `:active`, or lifts any other renewal blocker, must
+  go through the same grace.
+- **The epoch is a FENCE, not a credential.** It is readable on the story; identity checks still
+  apply on every operation. `start`/`report` accept it OPTIONALLY (absent = no check, so existing MCP
+  clients work); the delivery-loop runner path is where it becomes mandatory, via
+  `check_claim_epoch/3`.
+- Neither column is in any `cast` list — a PATCH that set the epoch could re-arm a zombie, and one that
+  set the lease could pin a claim forever.
 
 **The MCP server must NEVER hold both an implementer and a reviewer key in one process** — the 409s are
 correct behavior; do not add a workaround.
@@ -208,9 +248,9 @@ correct behavior; do not add a workaround.
   a read-then-write.
 
 **Enforcement is conditional — this is the deprecation seam.** `Progress.maybe_consume_cap/6`
-(`progress.ex:411-434`) is what actually gates the custody ops: a `nil` `cap_id` is rejected with
+(`progress.ex:425-448`) is what actually gates the custody ops: a `nil` `cap_id` is rejected with
 `:missing_capability` **only for tenants that have an audit key** (`tenant_has_audit_key?/1`,
-`progress.ex:683-688`); a pre-v2 (keyless) tenant returns `{:ok, :pre_v2_tenant}` and the operation
+`progress.ex:697-702`); a pre-v2 (keyless) tenant returns `{:ok, :pre_v2_tenant}` and the operation
 proceeds with NO capability at all. So L1 strength is per-tenant. A REJECTED cap is split by
 `cap_refusal/4`: only `:invalid_signature` / `:replay` surface as `{:cap_rejected, _}`, which
 FallbackController answers with a plain 403 — it halts NOTHING and counts toward nothing (see the
@@ -257,7 +297,7 @@ exist, but every one descends from the implementer's root — the single-root te
 not a shortage; its remedy is the operator minting an independently-rooted verifier tree.
 
 **Empty-lineage caveat, in BOTH directions.** When the implementer dispatch cannot be loaded,
-`assign_rotating_verifier/3` passes `[]` (`progress.ex:603-607`), and with `[]` the rejection is
+`assign_rotating_verifier/3` passes `[]` (`progress.ex:617-621`), and with `[]` the rejection is
 inert — selection can then pick a same-lineage (even the implementer's own) dispatch. The verify-time
 comparison is fail-closed on an empty lineage, so this is caught at verify rather than at selection;
 do not "simplify" either half.

@@ -15,6 +15,37 @@ All notable changes to loopctl are documented here.
   `runner_revoke` and `runner_pool` (loopctl-mcp-server 2.92.0) use it and the existing
   `/api/v1/runners` routes; `runner_pool` needs a server carrying this endpoint.
 
+- **Story claims get a lease, renewal, a reclaimer and an epoch fence (#803).** Migration
+  `20260913100000` adds `stories.claimed_until` (nullable) and `stories.claim_epoch` (integer, not
+  null, default 0), plus a partial index built `CONCURRENTLY`. The ADD COLUMNs are catalog-only and
+  rewrite no rows; the migration runs outside a DDL transaction for the concurrent index.
+
+  - `POST /api/v1/stories/:id/claim` (and bulk claim) now sets `claimed_until` to now plus the lease
+    and increments `claim_epoch`; both are returned on the story.
+  - **New endpoint** `POST /api/v1/stories/:id/renew-claim` (`exact_role: :agent`, human-anchored,
+    custody surface) with body `{"claim_epoch": <int>}`. Refusals: `400` missing or malformed
+    epoch, `422 not_claimed`, `409 stale_claim_epoch`, `409 not_claimant`.
+  - `POST /stories/:id/start` and `/report` accept an OPTIONAL `claim_epoch`; a stale one is
+    `409 stale_claim_epoch`, a malformed one `400`. Omitted, they behave exactly as before.
+  - New cron `ReclaimExpiredClaimsWorker` (every 5 minutes) releases a claim whose lease has run
+    out back to `pending`, bumps the epoch, stamps `lifecycle_entered_at`, writes a
+    `claim_lease_expired` audit entry and emits `story.force_unclaimed` with
+    `reason: "claim_lease_expired"`. Every other release (unclaim, force-unclaim, reject
+    auto-reset) now bumps the epoch too.
+  - `POST /stories/:id/request-review` now stamps `stories.review_requested_at` (same
+    migration). A story in review is never reclaimed: it waits on a different principal's
+    report, and only its implementer could renew.
+  - The reclaimer never releases a claim in a tenant whose claimants cannot renew — one under a
+    custody halt, or one whose status is not `active` (re-checked under a lock) — and clearing a
+    halt or re-activating a tenant extends every live lease to at least one full lease from that
+    moment, in the same transaction.
+  - New env var `STORY_CLAIM_LEASE_SECONDS` (default `86400`).
+
+  **Deploy note.** Claims that exist at deploy time have `claimed_until` NULL and are never
+  reclaimed — nothing renews them. They keep today's behaviour until released or renewed.
+  **A client that holds a claim longer than the lease must now renew it**, or its story is
+  released under it. MCP clients renew with `renew_story_claim` (loopctl-mcp-server 2.92.0).
+
 ### Changed
 
 - **The usage-based importance prior is now ENABLED (#790).**
@@ -105,6 +136,33 @@ All notable changes to loopctl are documented here.
   reason; the rows still emit `updated_at`, which is therefore no longer the sort key.
 
 ### Added
+
+- **GitHub webhook intake for the agent delivery loop, with reporter text held as untrusted
+  data (#803, #804).** Migration `20260913110000` creates `intake_sources`,
+  `intake_records` and `intake_deliveries`, all new tables with RLS enabled; it rewrites no
+  existing rows and needs no manual step.
+
+  **A new PUBLIC, unauthenticated route: `POST /api/v1/intake/github/:source_id`.** It takes
+  no API key. It is authenticated by GitHub's `X-Hub-Signature-256` HMAC over the raw body,
+  under a per-source secret, and answers every failure (unknown or revoked source, suspended
+  tenant, missing or wrong signature, a payload for another repository) with the same
+  `401 invalid_signature`. Its body is capped at 1 MiB (`413 payload_too_large`), read ahead
+  of `Plug.Parsers` so the JSON is never decoded before the signature is checked, and it is
+  throttled per client IP, fail-closed, at 1,200 requests a minute
+  (`config :loopctl, LoopctlWeb.Plugs.GithubIntakeThrottle`). GitHub's deliveries share a
+  few egress addresses across every tenant, which is why that ceiling is high. A replayed
+  or redelivered `X-GitHub-Delivery` changes nothing and answers `200 duplicate`.
+
+  **Sources: `POST`, `GET` and `DELETE /api/v1/intake/sources`**, user role, writes behind
+  the human anchor (new `issue_intake` surface in the tier map), and creation behind the
+  lineage ceiling (`403 api_key_mint_forbidden`) because it mints a credential. The webhook
+  secret is generated server-side, **encrypted at rest** (Cloak AES-256-GCM, re-encrypted by
+  `mix loopctl.reencrypt_secrets` like every other encrypted column) and returned once.
+
+  Issue title, body, labels and author are stored only in `untrusted_*` columns, capped, and
+  never copied into a story. A deterministic injection detector escalates a record and
+  appends an `intake_escalated` audit chain entry naming the signals, never the text. Nothing
+  creates stories or dispatches triage yet.
 
 - **Two new secrets for the agent delivery loop's Gate B: `DELIVERY_GATES_CONFIG` and
   `DELIVERY_GATES_CONFIG_SHA256` (#803 prerequisites).** The first is the trigger JSON

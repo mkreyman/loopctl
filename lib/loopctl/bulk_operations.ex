@@ -516,12 +516,15 @@ defmodule Loopctl.BulkOperations do
   defp apply_claim(story, agent_id) do
     now = DateTime.utc_now()
 
+    # The same lease and epoch Progress.claim_story/3 writes (#803), so a bulk claim is
+    # released by the reclaimer like any other rather than holding its stories forever.
     story
-    |> Ecto.Changeset.change(%{
-      agent_status: :assigned,
-      assigned_agent_id: agent_id,
-      assigned_at: now
-    })
+    |> Ecto.Changeset.change(
+      Map.merge(
+        %{agent_status: :assigned, assigned_agent_id: agent_id, assigned_at: now},
+        Progress.claim_lease_change(story, now)
+      )
+    )
     |> AdminRepo.update()
   end
 
@@ -577,15 +580,16 @@ defmodule Loopctl.BulkOperations do
       # path was stamped to stop depending on. See Progress.guard_no_lifecycle_history/2.
       # WORKED is checked, not assumed: bulk-rejecting a never-dispatched imported story
       # erases no marker, so it earns none (Progress.lifecycle_stamp_change/1).
-      Map.merge(
-        %{
-          agent_status: :pending,
-          assigned_agent_id: nil,
-          assigned_at: nil,
-          reported_done_at: nil
-        },
-        Progress.lifecycle_stamp_change(story)
-      )
+      # The claim fence moves with it (#803): a release bumps claim_epoch wherever it
+      # happens, or a runner still holding the old epoch passes the fence.
+      %{
+        agent_status: :pending,
+        assigned_agent_id: nil,
+        assigned_at: nil,
+        reported_done_at: nil
+      }
+      |> Map.merge(Progress.lifecycle_stamp_change(story))
+      |> Map.merge(Progress.claim_release_change(story))
     )
     |> AdminRepo.update()
   end

@@ -158,6 +158,20 @@ defmodule LoopctlWeb.Router do
     get "/audit/sth/:tenant_id/inclusion/:position", AuditSthController, :inclusion
   end
 
+  # Issue #803 — the GitHub intake webhook. Authenticated by an HMAC over the raw body
+  # (captured ahead of Plug.Parsers by LoopctlWeb.Plugs.IntakeRawBody), not by API key, so
+  # it cannot sit on `:authenticated`; its own pipeline carries the per-IP throttle the
+  # `:api` pipeline lacks.
+  pipeline :github_intake do
+    plug LoopctlWeb.Plugs.GithubIntakeThrottle
+  end
+
+  scope "/api/v1", LoopctlWeb do
+    pipe_through [:api, :github_intake]
+
+    post "/intake/github/:source_id", GithubIntakeController, :deliver
+  end
+
   scope "/swaggerui" do
     get "/", OpenApiSpex.Plug.SwaggerUI, path: "/api/v1/openapi"
   end
@@ -334,6 +348,9 @@ defmodule LoopctlWeb.Router do
     get "/runners/pool", RunnerController, :pool
     resources "/runners", RunnerController, only: [:create, :index, :delete]
 
+    # Issue #803 — GitHub intake sources for the agent delivery loop
+    resources "/intake/sources", IntakeSourceController, only: [:create, :index, :delete]
+
     # Audit log
     get "/audit", AuditController, :index
 
@@ -373,6 +390,7 @@ defmodule LoopctlWeb.Router do
     post "/stories/:id/request-review", StoryStatusController, :request_review
     post "/stories/:id/report", StoryStatusController, :report
     post "/stories/:id/unclaim", StoryStatusController, :unclaim
+    post "/stories/:id/renew-claim", StoryStatusController, :renew_claim
     # Discoverability aliases — same actions, alternate URL patterns agents tend to guess
     post "/stories/:id/report-done", StoryStatusController, :report
     post "/stories/:id/start-work", StoryStatusController, :start
