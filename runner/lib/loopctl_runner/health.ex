@@ -142,9 +142,28 @@ defmodule LoopctlRunner.Health do
       else: existing_ancestor(Path.dirname(path))
   end
 
-  defp cmd(executable, args) do
-    case System.cmd(executable, args, stderr_to_stdout: true) do
-      {out, 0} -> {:ok, String.trim(out)}
+  # The service's PATH is whatever its unit or plist declares, not a login shell's. The one
+  # rel/install.sh used to write left out /usr/sbin, where macOS keeps sysctl, so the daemon
+  # could not read its own memory size and never started (measured on mac-mini). Found by
+  # PATH first, then at each tool's standard location, so a narrow PATH cannot do that again.
+  @standard_paths %{
+    "sysctl" => ["/usr/sbin/sysctl", "/sbin/sysctl"],
+    "vm_stat" => ["/usr/bin/vm_stat"],
+    "df" => ["/bin/df", "/usr/bin/df"]
+  }
+
+  @doc false
+  @spec executable(String.t()) :: String.t() | nil
+  def executable(name) do
+    System.find_executable(name) ||
+      @standard_paths |> Map.get(name, []) |> Enum.find(&File.exists?/1)
+  end
+
+  defp cmd(name, args) do
+    with path when is_binary(path) <- executable(name),
+         {out, 0} <- System.cmd(path, args, stderr_to_stdout: true) do
+      {:ok, String.trim(out)}
+    else
       _ -> :error
     end
   rescue

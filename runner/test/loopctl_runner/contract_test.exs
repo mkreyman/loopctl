@@ -1,5 +1,5 @@
 defmodule LoopctlRunner.ContractTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias LoopctlRunner.{Contract, Health}
 
@@ -74,6 +74,32 @@ defmodule LoopctlRunner.ContractTest do
     assert Contract.validate("RunnerSample", sample) == :ok
     assert {:ok, %{"cores" => cores, "memory_mb" => mb}} = Health.capacity()
     assert cores >= 1 and mb >= 1
+  end
+
+  describe "with a PATH that cannot find the tools" do
+    setup do
+      original = System.get_env("PATH")
+      # An empty directory: nothing is found by PATH, so only the fallback can succeed.
+      System.put_env("PATH", LoopctlRunner.TestSupport.tmp_dir!("empty-path"))
+      on_exit(fn -> System.put_env("PATH", original) end)
+    end
+
+    test "each tool the health check runs is still found at its standard location" do
+      assert Health.executable("df") in ["/bin/df", "/usr/bin/df"]
+
+      if :os.type() == {:unix, :darwin} do
+        assert Health.executable("sysctl") in ["/usr/sbin/sysctl", "/sbin/sysctl"]
+        assert Health.executable("vm_stat") == "/usr/bin/vm_stat"
+      end
+
+      assert Health.executable("no-such-tool") == nil
+    end
+
+    test "capacity and a sample are still readable" do
+      assert {:ok, %{"memory_mb" => mb}} = Health.capacity()
+      assert mb >= 1
+      assert is_map(Health.sample(System.tmp_dir!(), nil))
+    end
   end
 
   test "every keyword the vendored file uses is one the validator implements" do

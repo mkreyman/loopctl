@@ -28,7 +28,9 @@ esac
 case "$config" in
     *[[:space:]%\\\&\|\<\>\"\']*) echo "config path contains characters the unit cannot carry: $config" >&2; exit 1 ;;
 esac
-path_value="$HOME/.asdf/shims:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+# /usr/sbin and /sbin too: a service manager's PATH is not a login shell's, and macOS keeps
+# sysctl there.
+path_value="$HOME/.asdf/shims:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 render() {
     sed -e "s|@RELEASE@|$prefix/current|g" -e "s|@PATH@|$path_value|g" \
