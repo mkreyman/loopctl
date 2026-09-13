@@ -24,8 +24,9 @@ defmodule LoopctlWeb.RunnerSocket do
   `SetTenant` has no equivalent here on purpose. It writes the RLS tenant into the
   process dictionary of the REQUEST process; a channel is a different, long-lived
   process, and every context call it makes passes `tenant_id` explicitly. The witness
-  header and `CheckCustodyHalt` are not applied: the socket carries no audit-chain read
-  and no custody operation. Dispatch (#803) will, and must add the halt check there.
+  header and `CheckCustodyHalt` are not applied: the socket's one custody-relevant operation
+  is the outbound dispatch, and `Loopctl.Runners.dispatch/3` and the channel apply the halt
+  check to it themselves.
 
   Every refusal answers identically (HTTP 403); the reason goes to the server log only.
   """

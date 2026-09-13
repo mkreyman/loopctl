@@ -23,6 +23,19 @@ defmodule LoopctlWeb.RunnerChannel do
     key revoked through `DELETE /api/v1/api_keys/:id`, an expired key and a suspended
     tenant. That is the upper bound on how long such a revocation takes to bite.
 
+  ## Dispatch
+
+  The channel subscribes to `Runners.dispatch_topic/1` only once its Presence entry is
+  tracked, and pushes each dispatch addressed to it as the `"dispatch"` event on its own
+  topic. `Runners.dispatch/3` is the only sender and has already validated the payload and
+  refused a halted tenant, an unauthorized runner, and a runner with zero or several live
+  sockets. Immediately before the push the channel checks again, and drops the dispatch
+  (logged) unless its own Presence ref is the only live meta for the runner AND the custody
+  halt, re-read fresh, is clear. Those are the reads nearest the push; they close the window
+  between the sender's reads and delivery. Across nodes Presence is eventually consistent, so
+  exactly-once is held by `claim_epoch` (#803), not here. A runner cannot send `"dispatch"`
+  itself; inbound it is an unknown event.
+
   ## Status
 
   `"status"` updates the runner's Presence meta (`RunnerStatus`). Updates closer
@@ -61,7 +74,8 @@ defmodule LoopctlWeb.RunnerChannel do
       {:ok, %{contract_version: RunnerContract.version()},
        socket
        |> assign(:meta, Map.put(meta, :joined_at, DateTime.utc_now()))
-       |> assign(:last_status_at, :never)}
+       |> assign(:last_status_at, :never)
+       |> assign(:presence_ref, nil)}
     else
       {:error, reason} -> {:error, join_error(reason)}
     end
@@ -74,7 +88,7 @@ defmodule LoopctlWeb.RunnerChannel do
   def handle_info(:after_join, socket) do
     %{runner: runner, tenant_id: tenant_id, meta: meta} = socket.assigns
 
-    {:ok, _ref} =
+    {:ok, ref} =
       Presence.track(
         self(),
         Runners.pool_topic(tenant_id),
@@ -82,11 +96,39 @@ defmodule LoopctlWeb.RunnerChannel do
         presence_meta(meta, runner)
       )
 
+    # Subscribe to dispatches only AFTER this socket is in the pool, so no process can
+    # receive a dispatch while `Runners.dispatch/3`'s single-socket read cannot see it. The
+    # revocation subscribe stays in join/3, before the authorization read.
+    :ok = Phoenix.PubSub.subscribe(Loopctl.PubSub, Runners.dispatch_topic(runner.id))
+
     schedule_recheck()
-    {:noreply, socket}
+    {:noreply, assign(socket, :presence_ref, ref)}
   end
 
   def handle_info(:runner_revoked, socket), do: disconnect(socket, :runner_revoked)
+
+  # The checks nearest the push. `Runners.dispatch/3` made both already, but its reads can be
+  # stale by the time this message arrives:
+  #
+  # - a second socket on this credential that its pool read did not see (joined since, or
+  #   not yet in that node's Presence view) is subscribed too, and would push the same
+  #   prompt. So push only when this socket's own Presence ref is the ONE live meta for the
+  #   runner; every other receiver drops it.
+  # - a halt can land between that read and this message, and a dispatch is custody
+  #   progress. Re-read fresh, from THIS channel's own tenant.
+  def handle_info({:runner_dispatch, dispatch}, socket) do
+    cond do
+      not sole_live_socket?(socket) ->
+        drop_dispatch(socket, dispatch, "not the only live socket for this runner")
+
+      Runners.custody_halted?(socket.assigns.tenant_id) ->
+        drop_dispatch(socket, dispatch, "tenant custody halted")
+
+      true ->
+        push(socket, "dispatch", dispatch)
+        {:noreply, socket}
+    end
+  end
 
   def handle_info(:recheck, socket) do
     %{runner: runner, tenant_id: tenant_id} = socket.assigns
@@ -108,7 +150,7 @@ defmodule LoopctlWeb.RunnerChannel do
       %{runner: runner, tenant_id: tenant_id, meta: meta} = socket.assigns
       meta = Map.merge(meta, status)
 
-      {:ok, _ref} =
+      {:ok, ref} =
         Presence.update(
           self(),
           Runners.pool_topic(tenant_id),
@@ -116,7 +158,12 @@ defmodule LoopctlWeb.RunnerChannel do
           presence_meta(meta, runner)
         )
 
-      {:reply, :ok, socket |> assign(:meta, meta) |> assign(:last_status_at, now)}
+      # An update re-issues the meta's phx_ref; keep the current one for sole_live_socket?/1.
+      {:reply, :ok,
+       socket
+       |> assign(:meta, meta)
+       |> assign(:last_status_at, now)
+       |> assign(:presence_ref, ref)}
     else
       {:error, :rate_limited} ->
         {:reply, {:error, %{reason: "rate_limited", min_interval_ms: @min_status_interval_ms}},
@@ -168,6 +215,23 @@ defmodule LoopctlWeb.RunnerChannel do
   defp status_interval_ok(_last, _now), do: {:error, :rate_limited}
 
   defp presence_meta(meta, runner), do: Map.put(meta, :runner_id, runner.id)
+
+  # This socket is tracked, and its meta is the only one in the tenant's pool holding the
+  # runner's id. An untracked channel (no ref yet) is never the sole socket.
+  defp sole_live_socket?(%{assigns: %{presence_ref: ref, runner: runner, tenant_id: tenant_id}})
+       when is_binary(ref) do
+    match?([%{phx_ref: ^ref}], Runners.live_metas(tenant_id, runner.id))
+  end
+
+  defp sole_live_socket?(_socket), do: false
+
+  defp drop_dispatch(socket, dispatch, why) do
+    Logger.warning(
+      "runner #{socket.assigns.runner.id} dispatch #{dispatch.dispatch_id} dropped: #{why}"
+    )
+
+    {:noreply, socket}
+  end
 
   defp schedule_recheck, do: Process.send_after(self(), :recheck, @recheck_interval_ms)
 

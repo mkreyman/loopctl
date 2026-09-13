@@ -899,3 +899,14 @@ config :loopctl, :knowledge_tagger, Loopctl.Knowledge.Tagger.Llm
 # same one production falls back to. Tests that DO want the semantic path pass
 # `conflict_judge_impl:` explicitly rather than mutating this.
 config :loopctl, :knowledge_conflict_judge, Loopctl.Knowledge.ConflictJudge.Similarity
+
+# Gate B's trigger configuration (#803 prerequisites). config/runtime.exs copies it from
+# DELIVERY_GATES_CONFIG / DELIVERY_GATES_CONFIG_SHA256 outside :test; here it is a SYNTHETIC
+# document with its checksum written out literally, so `Loopctl.DeliveryGates.Config.triggers/0`
+# is exercised end to end — the config key, the document AND the checksum wiring — without
+# `Application.put_env`. The checksum is `printf '%s' <document> | sha256sum`; editing one
+# without the other fails the loader test, which is the point.
+config :loopctl, Loopctl.DeliveryGates.Config,
+  document:
+    ~s({"version":1,"repos":{"acme/widgets":{"effect_paths":["priv/rates/**"],"human_paths":["lib/widgets_web/router.ex"],"limits":{"max_files":12,"max_changed_lines":1000}}}}),
+  sha256: "2f3c86e749445d6820a406d7e3dc2127f452179b4c7f31e565a5c2d01bcc27a2"

@@ -694,6 +694,25 @@ defmodule Loopctl.Fixtures do
     )
   end
 
+  # A `dispatch` payload that satisfies the runner contract's RunnerDispatch, string-keyed
+  # as a caller building it from JSON would hand it over.
+  def build(:runner_dispatch, attrs) do
+    Map.merge(
+      %{
+        "dispatch_id" => Ecto.UUID.generate(),
+        "story_id" => Ecto.UUID.generate(),
+        "kind" => "implement",
+        "repo" => "acme/widgets",
+        "base_branch" => "master",
+        "branch" => "feature/widget-rounding",
+        "claim_epoch" => 0,
+        "wall_clock_seconds" => 3_600,
+        "max_turns" => 50
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
   # A Gate B input for the repository above that touches nothing guarded.
   def build(:gate_b_input, attrs) do
     Map.merge(

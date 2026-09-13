@@ -95,6 +95,17 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Two new secrets for the agent delivery loop's Gate B: `DELIVERY_GATES_CONFIG` and
+  `DELIVERY_GATES_CONFIG_SHA256` (#803 prerequisites).** The first is the trigger JSON
+  document, inline; the second is the hex SHA-256 of its exact bytes. Both default to unset,
+  and unset, empty, malformed or mismatched means every delivery-loop change escalates to a
+  human — deliberately fail-closed, never an empty trigger set. Set them together in one
+  `fly secrets set`, and compute the checksum over the value exactly as set:
+  `DOC="$(cat triggers.json)"` then `printf '%s' "$DOC" | sha256sum`. Not
+  `sha256sum triggers.json` — that hashes the file's trailing newline, which `$(cat ...)`
+  stripped from the value, and every change escalates on the mismatch. Rows and the full
+  recipe in `deploy/FLY_SECRETS.md`.
+
 - **A claim now says whether you created it, and which session holds it (issue #779).**
   `POST /api/v1/channel/claims` answers a FRESH claim with `201` and `created: true`, and
   an idempotent owner re-claim with `200`, `created: false`, `already_held: true` and the
