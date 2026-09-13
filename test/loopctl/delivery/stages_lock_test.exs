@@ -27,6 +27,15 @@ defmodule Loopctl.Delivery.StagesLockTest do
   alias Loopctl.Repo
   alias Loopctl.WorkBreakdown.Story
 
+  # The test process holds one connection of the pool the racers share; the second is left
+  # spare deliberately, so a slow runner has somewhere to go. Every other test in this
+  # module runs at most two concurrent tasks against one pool, which fits any pool this
+  # config produces (`test_concurrency * 2`, floor 2 schedulers).
+  @reserved_connections 2
+  @min_racers 2
+  @max_racers 6
+  @ownership_timeout :timer.seconds(60)
+
   setup_all do
     sweep_committed_runner_tenants()
     on_exit(&sweep_committed_runner_tenants/0)
@@ -72,12 +81,33 @@ defmodule Loopctl.Delivery.StagesLockTest do
     AdminRepo.query!("ALTER TABLE audit_chain ENABLE TRIGGER audit_chain_prevent_delete_trigger")
   end
 
-  defp unboxed(fun) do
+  # Each `sandbox: false` task HOLDS a real connection of every repo it checks out for its
+  # whole life, so a task checks out only the repos it uses: `Stages` is `Repo`, the
+  # reclaimer, the raw row writes and `AuditChain.append/2` are `AdminRepo`. Checking out
+  # both everywhere doubled the demand on a pool the CI runner has less headroom in than
+  # this box (#821: "connection not available and request was dropped from queue").
+  defp unboxed(repos, fun) do
     Task.async(fn ->
-      :ok = Sandbox.checkout(Repo, sandbox: false)
-      :ok = Sandbox.checkout(AdminRepo, sandbox: false)
+      Enum.each(repos, fn repo ->
+        :ok = Sandbox.checkout(repo, sandbox: false, ownership_timeout: @ownership_timeout)
+      end)
+
       fun.()
     end)
+  end
+
+  # How many racers the pool can actually serve. `config/test.exs` sizes each repo's pool
+  # from the machine's scheduler count, so the number is READ, never assumed: the CI runner
+  # is smaller and busier than a dev box, and a test that outruns the pool fails on a
+  # checkout queue timeout instead of on the race it is testing. Two is the floor — a race
+  # needs two — and the assertion is the same at any size: exactly one winner.
+  defp racers do
+    pool_size = Application.get_env(:loopctl, Repo)[:pool_size] || @min_racers
+
+    pool_size
+    |> Kernel.-(@reserved_connections)
+    |> min(@max_racers)
+    |> max(@min_racers)
   end
 
   test "concurrent advances from the same stage: exactly one wins", %{story: story} do
@@ -89,12 +119,12 @@ defmodule Loopctl.Delivery.StagesLockTest do
         claim_epoch: 1
       })
 
-    n = 6
+    n = racers()
     parent = self()
 
     tasks =
       for _ <- 1..n do
-        unboxed(fn ->
+        unboxed([Repo], fn ->
           send(parent, {:ready, self()})
 
           receive do
@@ -106,6 +136,7 @@ defmodule Loopctl.Delivery.StagesLockTest do
       end
 
     pids = for _ <- 1..n, do: receive(do: ({:ready, pid} -> pid))
+    assert n >= @min_racers
     Enum.each(pids, &send(&1, :go))
     results = Task.await_many(tasks, 15_000)
 
@@ -134,7 +165,7 @@ defmodule Loopctl.Delivery.StagesLockTest do
     # A release in flight: the story's epoch is bumped but not committed. Without the FOR
     # SHARE lock the advance reads the last COMMITTED epoch (1), matches, and moves the row.
     releaser =
-      unboxed(fn ->
+      unboxed([AdminRepo], fn ->
         AdminRepo.transaction(fn ->
           {1, _} =
             from(s in Story, where: s.id == ^story.id)
@@ -151,7 +182,7 @@ defmodule Loopctl.Delivery.StagesLockTest do
     assert_receive :releasing, 2_000
 
     advancer =
-      unboxed(fn ->
+      unboxed([Repo], fn ->
         Stages.advance(story.tenant_id, story.id, {:implementing, :reviewing}, claim_epoch: 1)
       end)
 
@@ -204,7 +235,7 @@ defmodule Loopctl.Delivery.StagesLockTest do
     parent = self()
 
     holder =
-      unboxed(fn ->
+      unboxed([AdminRepo], fn ->
         AdminRepo.transaction(fn ->
           AdminRepo.query!("SELECT pg_advisory_xact_lock($1::int, hashtext($2))", [
             AuditChain.chain_lock_namespace(),
@@ -222,7 +253,7 @@ defmodule Loopctl.Delivery.StagesLockTest do
     assert_receive :holding, 2_000
 
     advancer =
-      unboxed(fn ->
+      unboxed([Repo], fn ->
         started = System.monotonic_time(:millisecond)
 
         result =
@@ -265,7 +296,7 @@ defmodule Loopctl.Delivery.StagesLockTest do
 
     tasks =
       for story <- [first, second] do
-        unboxed(fn ->
+        unboxed([Repo], fn ->
           send(parent, {:ready, self()})
 
           receive do
@@ -302,7 +333,7 @@ defmodule Loopctl.Delivery.StagesLockTest do
 
     tasks =
       for n <- 1..2 do
-        unboxed(fn ->
+        unboxed([AdminRepo], fn ->
           send(parent, {:ready, self()})
 
           receive do
