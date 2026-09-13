@@ -163,8 +163,16 @@ Invariants:
   it pass `check_claim_epoch/3` on a story it no longer holds.
 - **A NULL lease is never reclaimed** — every claim made before the column existed, which nothing
   renews. Renewing one gives it a lease.
-- **The reclaimer skips custody-halted tenants**, because `renew-claim` is custody surface and cannot
-  be called during a halt.
+- **A story in review is never reclaimed.** `request_review/3` stamps `review_requested_at` (a
+  conditional UPDATE, so it cannot land on a story released since its read); the sweep and
+  `lease_expired?/3` under the lock both refuse a stamped story, and a renewal cannot re-arm it. A
+  marker rather than a NULLed lease precisely because renewal would re-arm a NULL. Cleared by every
+  release.
+- **A halt never causes a reclaim.** `renew-claim` is custody surface, so it is blocked during a halt.
+  The sweep skips halted tenants, `reclaim_expired_claim/3` re-checks the halt under a `FOR SHARE`
+  lock on the tenant row taken BEFORE the story lock, and `Tenants.clear_custody_halt/1` extends every
+  live lease to now + `halt_clear_grace_seconds/0` (one lease) in the clear's transaction, tenant row
+  first. Keep that tenant-then-story lock order on both sides or they can deadlock.
 - **The epoch is a FENCE, not a credential.** It is readable on the story; identity checks still
   apply on every operation. `start`/`report` accept it OPTIONALLY (absent = no check, so existing MCP
   clients work); the delivery-loop runner path is where it becomes mandatory, via

@@ -1020,19 +1020,38 @@ defmodule Loopctl.Tenants do
     end
   end
 
-  @doc "Clears a custody halt (break-glass operation)."
+  @doc """
+  Clears a custody halt (break-glass operation).
+
+  In the same transaction, when the tenant WAS halted, every live story claim lease is
+  extended to at least one renewal grace from now (`Loopctl.Progress.grant_halt_clear_grace/2`,
+  #803). `renew-claim` is custody surface and was blocked for the whole halt, so without it
+  every lease that ran out during the halt would be reclaimed by the first sweep after the
+  clear, before any claimant could renew. Clearing a tenant that is not halted changes
+  nothing, so an operator retry does not extend leases.
+  """
   @spec clear_custody_halt(Ecto.UUID.t()) :: {:ok, Tenant.t()} | {:error, term()}
   def clear_custody_halt(tenant_id) do
     case get_tenant(tenant_id) do
       {:ok, tenant} ->
         tenant
-        |> Ecto.Changeset.change(custody_halted_at: nil)
-        |> AdminRepo.update()
+        |> clear_halt_and_grant_lease_grace()
         |> bust_key_cache_on_update()
 
       error ->
         error
     end
+  end
+
+  # Tenant row first, then the story leases: the lock order
+  # `Progress.reclaim_expired_claim/3` also takes (tenant FOR SHARE, then story).
+  defp clear_halt_and_grant_lease_grace(%Tenant{custody_halted_at: halted_at} = tenant) do
+    AdminRepo.transaction(fn ->
+      tenant
+      |> Ecto.Changeset.change(custody_halted_at: nil)
+      |> AdminRepo.update()
+      |> grant_lease_grace_if_halted(halted_at)
+    end)
   end
 
   @doc "Returns true if tenant's custody operations are halted."
@@ -1412,6 +1431,16 @@ defmodule Loopctl.Tenants do
   # preloaded tenant by the auth pipeline). Bust the tenant's cached keys on every
   # successful tenant update so the change takes effect on the very next request
   # rather than after the TTL. A failed update is passed through untouched.
+  defp grant_lease_grace_if_halted({:ok, cleared}, nil), do: cleared
+
+  defp grant_lease_grace_if_halted({:ok, cleared}, %DateTime{}) do
+    Loopctl.Progress.grant_halt_clear_grace(cleared.id)
+    cleared
+  end
+
+  defp grant_lease_grace_if_halted({:error, changeset}, _halted_at),
+    do: AdminRepo.rollback(changeset)
+
   defp bust_key_cache_on_update({:ok, %Tenant{} = tenant} = result) do
     Auth.invalidate_tenant_key_cache(tenant.id)
     result

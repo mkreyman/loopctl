@@ -1112,7 +1112,8 @@ defmodule Loopctl.Progress do
 
       story ->
         with :ok <- validate_story_implementing(story),
-             :ok <- validate_assigned_agent(story, agent_id) do
+             :ok <- validate_assigned_agent(story, agent_id),
+             {:ok, story} <- mark_review_requested(story, agent_id) do
           insert_events_with_delivery(tenant_id, "story.review_requested", story.project_id, %{
             "event" => "story.review_requested",
             "story_id" => story_id,
@@ -1217,6 +1218,62 @@ defmodule Loopctl.Progress do
     end
   end
 
+  # #803: requesting review ENDS the implementer's lease. The story stays `implementing`
+  # until a DIFFERENT principal reports it, and only the implementer — whose session is
+  # usually gone by then — can renew. Left armed, a review that outlasted the lease had
+  # the reclaimer reset finished work to `pending` under the reviewer, whose report then
+  # failed `invalid_transition`.
+  #
+  # A MARKER rather than NULLing `claimed_until`: a runner renews on a timer, and a
+  # renewal after review was requested would silently re-arm a nulled lease, recreating
+  # the defect. The marker holds whatever renew writes, and both the sweep and
+  # `lease_expired?/3` under the row lock refuse a story that carries it. Cleared by every
+  # release (`claim_release_change/1`), so a re-claimed story starts with a live lease.
+  #
+  # A conditional UPDATE, so it cannot land on a story the reclaimer released between the
+  # read above and this write: after that release the row no longer matches, zero rows
+  # update, and the caller gets the refusal the fresh row warrants. The FIRST request is
+  # kept (`coalesce`).
+  defp mark_review_requested(%Story{} = story, agent_id) do
+    now = DateTime.utc_now()
+
+    query =
+      from(s in Story,
+        where:
+          s.id == ^story.id and s.tenant_id == ^story.tenant_id and
+            s.agent_status == :implementing and s.assigned_agent_id == ^agent_id,
+        select: s,
+        update: [
+          set: [
+            review_requested_at:
+              fragment("coalesce(?, ?)", s.review_requested_at, type(^now, :utc_datetime_usec))
+          ]
+        ]
+      )
+
+    case AdminRepo.update_all(query, []) do
+      {1, [updated]} ->
+        {:ok, updated}
+
+      {0, _} ->
+        review_request_lost(story, agent_id)
+    end
+  end
+
+  # Zero rows: the claim changed between the caller's read and the conditional UPDATE.
+  # Answer from the fresh row, as if the request had arrived after the change.
+  defp review_request_lost(story, agent_id) do
+    case AdminRepo.get_by(Story, id: story.id, tenant_id: story.tenant_id) do
+      nil ->
+        {:error, :not_found}
+
+      current ->
+        with :ok <- validate_story_implementing(current),
+             :ok <- validate_assigned_agent(current, agent_id),
+             do: {:error, :not_assigned_agent}
+    end
+  end
+
   # --- Claim lease and fence (#803) ---
 
   # A claim held by a session that crashed after its UPDATE used to hold the story
@@ -1272,7 +1329,7 @@ defmodule Loopctl.Progress do
   """
   @spec claim_release_change(Story.t()) :: map()
   def claim_release_change(%Story{claim_epoch: epoch}),
-    do: %{claimed_until: nil, claim_epoch: epoch + 1}
+    do: %{claimed_until: nil, claim_epoch: epoch + 1, review_requested_at: nil}
 
   # The one release shape shared by unclaim, force-unclaim and the lease reclaimer.
   defp release_claim_changes(story) do
@@ -1417,15 +1474,27 @@ defmodule Loopctl.Progress do
 
   A story with NO lease (`claimed_until` NULL — claimed before leases existed, and
   never renewed since) is never reclaimed: nothing renews those claims, so a lease
-  applied retroactively would release in-flight work.
+  applied retroactively would release in-flight work. Nor is a story whose review has
+  been requested (`review_requested_at` set): the implementer's lease stopped applying
+  when it handed the work to review.
+
+  A tenant under a custody HALT is refused with `{:error, :custody_halted}`, read under
+  a `FOR SHARE` lock on the tenant row taken BEFORE the story lock. `renew-claim` is
+  custody surface, so no claimant can renew during a halt; the share lock means a halt
+  that lands after the sweep's read still wins, and the tenant-then-story order matches
+  `Loopctl.Tenants.clear_custody_halt/1`, which updates the tenant and then the leases.
   """
   @spec reclaim_expired_claim(Ecto.UUID.t(), Ecto.UUID.t(), non_neg_integer()) ::
-          {:ok, Story.t()} | {:error, :not_found | :claim_not_expired | Ecto.Changeset.t()}
+          {:ok, Story.t()}
+          | {:error, :not_found | :claim_not_expired | :custody_halted | Ecto.Changeset.t()}
   def reclaim_expired_claim(tenant_id, story_id, expected_epoch) do
     now = DateTime.utc_now()
 
     multi =
       Multi.new()
+      |> Multi.run(:tenant_gate, fn _repo, _changes ->
+        lock_tenant_unless_halted(tenant_id)
+      end)
       |> Multi.run(:lock, fn _repo, _changes ->
         lock_story(tenant_id, story_id)
       end)
@@ -1477,19 +1546,88 @@ defmodule Loopctl.Progress do
 
     case AdminRepo.transaction(multi) do
       {:ok, %{story: updated}} -> {:ok, updated}
+      {:error, :tenant_gate, reason, _} -> {:error, reason}
       {:error, :lock, reason, _} -> {:error, reason}
       {:error, :validate, reason, _} -> {:error, reason}
       {:error, :story, changeset, _} -> {:error, changeset}
     end
   end
 
+  # SHARE-locks the tenant row for the rest of the reclaim's transaction, so a halt
+  # (an UPDATE of that row) cannot commit between this check and the release.
+  defp lock_tenant_unless_halted(tenant_id) do
+    from(t in Tenants.Tenant,
+      where: t.id == ^tenant_id,
+      select: {t.id, t.custody_halted_at},
+      lock: "FOR SHARE"
+    )
+    |> AdminRepo.one()
+    |> case do
+      nil -> {:error, :not_found}
+      {_id, nil} -> {:ok, :not_halted}
+      {_id, %DateTime{}} -> {:error, :custody_halted}
+    end
+  end
+
+  @doc """
+  Seconds of renewal grace every live lease gets when a custody halt is cleared: one full
+  lease, `claim_lease_seconds/0`.
+
+  `renew-claim` is blocked for the whole halt, so without this every lease that ran out
+  during it would be reclaimed by the first sweep after the clear — before a single
+  claimant could renew. One LEASE rather than a fixed number of minutes, because the
+  lease is by definition the window a claimant is expected to renew within, and it moves
+  with `STORY_CLAIM_LEASE_SECONDS`; a fixed grace shorter than a claimant's renewal
+  cadence would recreate the defect.
+  """
+  @spec halt_clear_grace_seconds() :: pos_integer()
+  def halt_clear_grace_seconds, do: claim_lease_seconds()
+
+  @doc """
+  Extends every live, leased claim in the tenant to at least `now` plus
+  `halt_clear_grace_seconds/0`. A lease already past that point is left alone, and a
+  NULL lease stays NULL. Returns how many leases moved.
+
+  Called by `Loopctl.Tenants.clear_custody_halt/1` INSIDE the clear's transaction, after
+  the tenant row is updated — the same tenant-then-story lock order
+  `reclaim_expired_claim/3` takes, so the two cannot deadlock and no sweep can see the
+  cleared tenant with the old leases.
+  """
+  @spec grant_halt_clear_grace(Ecto.UUID.t(), DateTime.t()) :: non_neg_integer()
+  def grant_halt_clear_grace(tenant_id, %DateTime{} = now \\ DateTime.utc_now()) do
+    floor = DateTime.add(now, halt_clear_grace_seconds(), :second)
+
+    {count, _} =
+      from(s in Story,
+        where:
+          s.tenant_id == ^tenant_id and s.agent_status in ^@claimed_statuses and
+            not is_nil(s.claimed_until) and s.claimed_until < ^floor
+      )
+      |> AdminRepo.update_all(set: [claimed_until: floor])
+
+    if count > 0 do
+      Logger.info(
+        "claim_lease_halt_grace: extended #{count} claim lease(s) to #{DateTime.to_iso8601(floor)} " <>
+          "after a custody halt was cleared tenant_id=#{tenant_id}"
+      )
+    end
+
+    count
+  end
+
   # Every clause is load-bearing and re-read under the lock: the status (a reported or
   # released story is not a held claim), a lease that exists at all (NULL is never
   # reclaimed), a lease still in the past (a renewal between the sweep's read and this
   # lock moved it), and the epoch the sweep read (a release plus a re-claim in that
-  # window started a DIFFERENT claim, whose lease is not the one that expired).
+  # window started a DIFFERENT claim, whose lease is not the one that expired), and no
+  # review requested (once handed to review, the implementer's lease no longer applies).
   defp lease_expired?(
-         %Story{agent_status: status, claimed_until: %DateTime{} = until, claim_epoch: epoch},
+         %Story{
+           agent_status: status,
+           claimed_until: %DateTime{} = until,
+           claim_epoch: epoch,
+           review_requested_at: nil
+         },
          expected_epoch,
          now
        )

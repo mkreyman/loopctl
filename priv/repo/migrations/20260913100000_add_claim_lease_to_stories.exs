@@ -19,6 +19,10 @@ defmodule Loopctl.Repo.Migrations.AddClaimLeaseToStories do
     in-flight work on the first sweep after deploy.
   - `claim_epoch` — bumped by every claim AND every release, so a message carrying the
     epoch its sender was given stops matching the moment that claim ends.
+  - `review_requested_at` — set by `Progress.request_review/3`. The story stays
+    `implementing` until a different principal reports it, and only the implementer can
+    renew, so the implementer's lease stops applying once review is requested and the
+    reclaimer skips the story. Cleared by every release.
 
   Neither column is in any changeset `cast` list; only `Progress` writes them.
 
@@ -30,6 +34,7 @@ defmodule Loopctl.Repo.Migrations.AddClaimLeaseToStories do
     alter table(:stories) do
       add_if_not_exists :claimed_until, :utc_datetime_usec
       add_if_not_exists :claim_epoch, :integer, null: false, default: 0
+      add_if_not_exists :review_requested_at, :utc_datetime_usec
     end
 
     flush()
@@ -37,7 +42,8 @@ defmodule Loopctl.Repo.Migrations.AddClaimLeaseToStories do
     execute("""
     CREATE INDEX CONCURRENTLY IF NOT EXISTS stories_claimed_until_leased_idx
       ON stories (claimed_until)
-      WHERE claimed_until IS NOT NULL AND agent_status IN ('assigned', 'implementing')
+      WHERE claimed_until IS NOT NULL AND review_requested_at IS NULL
+        AND agent_status IN ('assigned', 'implementing')
     """)
   end
 
@@ -45,6 +51,7 @@ defmodule Loopctl.Repo.Migrations.AddClaimLeaseToStories do
     execute("DROP INDEX CONCURRENTLY IF EXISTS stories_claimed_until_leased_idx")
 
     alter table(:stories) do
+      remove_if_exists :review_requested_at, :utc_datetime_usec
       remove_if_exists :claim_epoch, :integer
       remove_if_exists :claimed_until, :utc_datetime_usec
     end

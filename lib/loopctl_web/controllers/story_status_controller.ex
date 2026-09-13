@@ -178,7 +178,10 @@ defmodule LoopctlWeb.StoryStatusController do
     summary: "Request review",
     description:
       "Assigned agent signals that implementation is complete and ready for review. " <>
-        "Does NOT change status. Fires a story.review_requested webhook event.",
+        "Does NOT change status. Fires a story.review_requested webhook event. Ends the " <>
+        "claim's lease: the story records `review_requested_at`, and from then on the " <>
+        "reclaimer never releases it for an expired `claimed_until` (renewing does not " <>
+        "re-arm it), because the work now waits on a different principal's report.",
     parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
     responses: %{
       200 => {"Review requested", "application/json", Schemas.StoryStatusResponse},

@@ -14,6 +14,7 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorkerTest do
   alias Loopctl.AdminRepo
   alias Loopctl.Audit.AuditLog
   alias Loopctl.Progress
+  alias Loopctl.Tenants
   alias Loopctl.Tenants.Tenant
   alias Loopctl.WorkBreakdown.Story
   alias Loopctl.Workers.ReclaimExpiredClaimsWorker
@@ -121,6 +122,45 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorkerTest do
       assert reload(story).agent_status == :assigned
     end
 
+    test "stories it will never release cannot fill the bounded batch and starve a real expiry" do
+      # The sweep reads at most batch_size/0 candidates, oldest lease first. Stories in
+      # review, or in a halted tenant, are refused under the lock on every run and stay
+      # that way — so if the READ admitted them, enough old ones would take every slot on
+      # every run and a genuinely expired claim behind them would never be released.
+      halted_tenant = fixture(:tenant)
+      tenant = fixture(:tenant)
+      agent = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+      halted_agent = fixture(:agent, %{tenant_id: halted_tenant.id, agent_type: :implementer})
+      old_lease = DateTime.add(DateTime.utc_now(), -3_600, :second)
+      # Each kind ALONE is enough to fill the batch, so each exclusion is proved on its own.
+      overflow = ReclaimExpiredClaimsWorker.batch_size() + 1
+
+      for _ <- 1..overflow do
+        tenant.id
+        |> then(&fixture(:story, %{tenant_id: &1, agent_status: :implementing}))
+        |> force(
+          assigned_agent_id: agent.id,
+          claimed_until: old_lease,
+          review_requested_at: DateTime.utc_now()
+        )
+
+        halted_tenant.id
+        |> then(&fixture(:story, %{tenant_id: &1, agent_status: :assigned}))
+        |> force(assigned_agent_id: halted_agent.id, claimed_until: old_lease)
+      end
+
+      {1, _} =
+        from(t in Tenant, where: t.id == ^halted_tenant.id)
+        |> AdminRepo.update_all(set: [custody_halted_at: DateTime.utc_now()])
+
+      %{story: real} = claimed_story(tenant)
+      real = expire(real)
+
+      assert :ok = sweep()
+
+      assert reload(real).agent_status == :pending
+    end
+
     test "running twice releases once" do
       tenant = fixture(:tenant)
       %{story: story} = claimed_story(tenant)
@@ -131,6 +171,148 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorkerTest do
 
       assert reload(story).claim_epoch == story.claim_epoch + 1
       assert [_one] = lease_expired_audit(story)
+    end
+  end
+
+  describe "a story handed to review" do
+    defp in_review(tenant) do
+      %{story: story, agent: agent} = claimed_story(tenant)
+      {:ok, _} = Progress.start_story(tenant.id, story.id, agent_id: agent.id)
+      {:ok, reviewed} = Progress.request_review(tenant.id, story.id, agent_id: agent.id)
+      %{story: reviewed, agent: agent}
+    end
+
+    test "is not reclaimed when its lease runs out, and the reviewer's report succeeds" do
+      tenant = fixture(:tenant)
+      %{story: story} = in_review(tenant)
+      assert %DateTime{} = story.review_requested_at
+      story = expire(story)
+
+      assert :ok = sweep()
+
+      assert reload(story).agent_status == :implementing
+      assert reload(story).claim_epoch == story.claim_epoch
+
+      reviewer = fixture(:agent, %{tenant_id: tenant.id, agent_type: :implementer})
+
+      assert {:ok, %Story{agent_status: :reported_done}} =
+               Progress.report_story(tenant.id, story.id,
+                 agent_id: reviewer.id,
+                 claim_epoch: story.claim_epoch
+               )
+    end
+
+    test "the locked re-check refuses it too, even when the sweep's read predated the request" do
+      tenant = fixture(:tenant)
+      %{story: story} = in_review(tenant)
+      story = expire(story)
+
+      assert {:error, :claim_not_expired} =
+               Progress.reclaim_expired_claim(tenant.id, story.id, story.claim_epoch)
+    end
+
+    test "a renewal after the request does not re-arm the lease" do
+      tenant = fixture(:tenant)
+      %{story: story, agent: agent} = in_review(tenant)
+
+      {:ok, _} =
+        Progress.renew_claim(tenant.id, story.id,
+          agent_id: agent.id,
+          claim_epoch: story.claim_epoch
+        )
+
+      story = expire(story)
+      assert :ok = sweep()
+
+      assert reload(story).agent_status == :implementing
+    end
+
+    test "a second request keeps the first timestamp, and a release clears the marker" do
+      tenant = fixture(:tenant)
+      %{story: story, agent: agent} = in_review(tenant)
+
+      {:ok, again} = Progress.request_review(tenant.id, story.id, agent_id: agent.id)
+      assert again.review_requested_at == story.review_requested_at
+
+      {:ok, released} = Progress.force_unclaim_story(tenant.id, story.id)
+      assert released.review_requested_at == nil
+    end
+  end
+
+  describe "custody halts" do
+    defp halt(tenant) do
+      {1, _} =
+        from(t in Tenant, where: t.id == ^tenant.id)
+        |> AdminRepo.update_all(set: [custody_halted_at: DateTime.utc_now()])
+
+      :ok
+    end
+
+    test "a halt that lands after the sweep read is refused under the lock" do
+      tenant = fixture(:tenant)
+      %{story: story} = claimed_story(tenant)
+      story = expire(story)
+      :ok = halt(tenant)
+
+      assert {:error, :custody_halted} =
+               Progress.reclaim_expired_claim(tenant.id, story.id, story.claim_epoch)
+
+      assert reload(story).agent_status == :assigned
+    end
+
+    test "a lease that ran out during a halt survives the first sweep after the clear" do
+      tenant = fixture(:tenant)
+      %{story: story} = claimed_story(tenant)
+      :ok = halt(tenant)
+      story = expire(story)
+
+      {:ok, _} = Tenants.clear_custody_halt(tenant.id)
+      assert :ok = sweep()
+
+      survived = reload(story)
+      assert survived.agent_status == :assigned
+
+      assert_in_delta DateTime.diff(survived.claimed_until, DateTime.utc_now(), :second),
+                      Progress.halt_clear_grace_seconds(),
+                      5
+
+      # Once the grace itself has run out with no renewal, the claim is reclaimable.
+      expire(story)
+      assert :ok = sweep()
+      assert reload(story).agent_status == :pending
+    end
+
+    test "the clear moves only short leases, never NULL ones, and not on an unhalted tenant" do
+      tenant = fixture(:tenant)
+      %{story: long} = claimed_story(tenant)
+      long = force(long, claimed_until: DateTime.add(DateTime.utc_now(), 10 * 86_400, :second))
+      %{story: legacy} = claimed_story(tenant)
+      legacy = force(legacy, claimed_until: nil)
+      %{story: short} = claimed_story(tenant)
+      short = expire(short)
+
+      # Not halted: a retried clear changes no lease.
+      {:ok, _} = Tenants.clear_custody_halt(tenant.id)
+      assert reload(short).claimed_until == short.claimed_until
+
+      :ok = halt(tenant)
+      {:ok, _} = Tenants.clear_custody_halt(tenant.id)
+
+      assert reload(long).claimed_until == long.claimed_until
+      assert reload(legacy).claimed_until == nil
+      assert DateTime.compare(reload(short).claimed_until, DateTime.utc_now()) == :gt
+    end
+
+    test "tenant isolation: clearing one tenant's halt extends no other tenant's leases" do
+      tenant_a = fixture(:tenant)
+      tenant_b = fixture(:tenant)
+      %{story: story_b} = claimed_story(tenant_b)
+      story_b = expire(story_b)
+
+      :ok = halt(tenant_a)
+      {:ok, _} = Tenants.clear_custody_halt(tenant_a.id)
+
+      assert reload(story_b).claimed_until == story_b.claimed_until
     end
   end
 

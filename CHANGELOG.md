@@ -23,6 +23,12 @@ All notable changes to loopctl are documented here.
     `claim_lease_expired` audit entry and emits `story.force_unclaimed` with
     `reason: "claim_lease_expired"`. Every other release (unclaim, force-unclaim, reject
     auto-reset) now bumps the epoch too.
+  - `POST /stories/:id/request-review` now stamps `stories.review_requested_at` (same
+    migration). A story in review is never reclaimed: it waits on a different principal's
+    report, and only its implementer could renew.
+  - The reclaimer never releases a claim in a custody-halted tenant (re-checked under a lock),
+    and clearing a halt extends every live lease to at least one full lease from the clear, in
+    the same transaction — `renew-claim` was blocked for the whole halt.
   - New env var `STORY_CLAIM_LEASE_SECONDS` (default `86400`).
 
   **Deploy note.** Claims that exist at deploy time have `claimed_until` NULL and are never

@@ -55,6 +55,7 @@ defmodule Loopctl.WorkBreakdown.Story do
              :lifecycle_entered_at,
              :claimed_until,
              :claim_epoch,
+             :review_requested_at,
              :inserted_at,
              :updated_at
            ]}
@@ -108,6 +109,10 @@ defmodule Loopctl.WorkBreakdown.Story do
     # could re-arm a zombie, and one that could set the lease could pin a claim forever.
     field :claimed_until, :utc_datetime_usec
     field :claim_epoch, :integer, default: 0
+    # Set (once) by `Progress.request_review/3`: the implementer handed the work to review,
+    # so its lease no longer applies and the reclaimer leaves the story alone. Cleared by
+    # every release. Same no-cast rule as the two fields above.
+    field :review_requested_at, :utc_datetime_usec
 
     # Issue #621: the capability minted by the lifecycle transition that returned
     # this struct — the credential the caller needs for its NEXT custody op
