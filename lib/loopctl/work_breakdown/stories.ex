@@ -17,6 +17,7 @@ defmodule Loopctl.WorkBreakdown.Stories do
   alias Ecto.Multi
   alias Loopctl.AdminRepo
   alias Loopctl.Audit
+  alias Loopctl.Intake.Record, as: IntakeRecord
   alias Loopctl.Repo
   alias Loopctl.WorkBreakdown.Epic
   alias Loopctl.WorkBreakdown.Story
@@ -31,24 +32,46 @@ defmodule Loopctl.WorkBreakdown.Stories do
 
   - `tenant_id` -- the tenant UUID
   - `attrs` -- map with `:epic_id`, `:number`, `:title`, and optional fields
-  - `opts` -- keyword list with `:actor_id` and `:actor_label`
+  - `opts` -- keyword list with `:actor_id`, `:actor_label` and `:intake_record_id`
+
+  ## `:intake_record_id` — the intake link (#803 §4, #805)
+
+  The `Loopctl.Intake.Record` this story was created FROM, when it was. It arrives as an
+  OPTION and is set on the struct, never through `attrs`: it is provenance, so it must not
+  be reachable from a request body the way a cast field is, and it is never rewritten
+  afterwards (there is no update path for it, deliberately).
+
+  It is OPTIONAL. Omitting it is the ordinary case — an authored story came from nobody's
+  issue — and a story without one closes no issue and is not an error anywhere.
+
+  A record that is not this tenant's, or does not exist, is `{:error, :intake_record_not_found}`.
+  That check is the readable error in front of the `stories_intake_record_fkey` composite
+  foreign key, which is what actually makes a cross-tenant link impossible.
 
   ## Returns
 
   - `{:ok, %Story{}}` on success
   - `{:error, changeset}` on validation failure
   - `{:error, :epic_not_found}` if the epic doesn't exist
+  - `{:error, :intake_record_not_found}` if `:intake_record_id` names no record of this tenant
   """
   @spec create_story(Ecto.UUID.t(), map(), keyword()) ::
-          {:ok, Story.t()} | {:error, Ecto.Changeset.t() | :epic_not_found}
+          {:ok, Story.t()}
+          | {:error, Ecto.Changeset.t() | :epic_not_found | :intake_record_not_found}
   def create_story(tenant_id, attrs, opts \\ []) do
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
     epic_id = Map.get(attrs, :epic_id) || Map.get(attrs, "epic_id")
 
-    with {:ok, epic} <- get_parent_epic(tenant_id, epic_id) do
+    with {:ok, epic} <- get_parent_epic(tenant_id, epic_id),
+         {:ok, intake_record_id} <- intake_link(tenant_id, opts) do
       changeset =
-        %Story{tenant_id: tenant_id, project_id: epic.project_id, epic_id: epic.id}
+        %Story{
+          tenant_id: tenant_id,
+          project_id: epic.project_id,
+          epic_id: epic.id,
+          intake_record_id: intake_record_id
+        }
         |> Story.create_changeset(attrs)
 
       multi =
@@ -69,7 +92,8 @@ defmodule Loopctl.WorkBreakdown.Stories do
               "epic_id" => story.epic_id,
               "project_id" => story.project_id,
               "agent_status" => to_string(story.agent_status),
-              "verified_status" => to_string(story.verified_status)
+              "verified_status" => to_string(story.verified_status),
+              "intake_record_id" => story.intake_record_id
             }
           }
         end)
@@ -406,6 +430,33 @@ defmodule Loopctl.WorkBreakdown.Stories do
   end
 
   defp get_parent_epic(_tenant_id, _epic_id), do: {:error, :epic_not_found}
+
+  # The intake link, resolved from the OPTION and checked against THIS tenant's records.
+  #
+  # Absent is `{:ok, nil}` and is the ordinary case. A malformed id is refused rather than
+  # cast-and-hoped: `Ecto.UUID.cast/1` here means the FK never sees a value the database
+  # would reject with a 500 instead of a domain error.
+  defp intake_link(tenant_id, opts) do
+    case Keyword.get(opts, :intake_record_id) do
+      nil ->
+        {:ok, nil}
+
+      record_id ->
+        with {:ok, id} <- cast_uuid(record_id),
+             %IntakeRecord{} <- AdminRepo.get_by(IntakeRecord, id: id, tenant_id: tenant_id) do
+          {:ok, id}
+        else
+          _not_this_tenants -> {:error, :intake_record_not_found}
+        end
+    end
+  end
+
+  defp cast_uuid(value) do
+    case Ecto.UUID.cast(value) do
+      {:ok, id} -> {:ok, id}
+      :error -> :error
+    end
+  end
 
   defp apply_filters(query, opts) do
     query

@@ -237,6 +237,26 @@ defmodule Loopctl.DataCase do
       {:error, :not_stubbed}
     end)
 
+    # #805: the reporter's side of the same source. The fail-closed default matters MORE for
+    # these three than for anything above, because they WRITE: an unstubbed test must never
+    # reach a real GitHub issue, and `{:error, :not_stubbed}` is not transient, so it abandons
+    # the closure loudly instead of retrying it round the sweep.
+    Mox.stub(Loopctl.MockPullRequestSource, :issue, fn _repo, _number ->
+      {:error, :not_stubbed}
+    end)
+
+    Mox.stub(Loopctl.MockPullRequestSource, :label_issue, fn _repo, _number, _label ->
+      {:error, :not_stubbed}
+    end)
+
+    Mox.stub(Loopctl.MockPullRequestSource, :comment_issue, fn _repo, _number, _body ->
+      {:error, :not_stubbed}
+    end)
+
+    Mox.stub(Loopctl.MockPullRequestSource, :close_issue, fn _repo, _number, _state_reason ->
+      {:error, :not_stubbed}
+    end)
+
     # Shape MUST match `Loopctl.HealthCheck.Default.check/0`. It notably carries NO
     # `version` key: #461 item 5 removed the app version from this response on purpose,
     # because /health is the highest-frequency unauthenticated probe and there is no

@@ -45,13 +45,20 @@ defmodule Loopctl.Delivery.Resolution do
   `PostDeployVerification` puts the resolution on every result it produces, so the verdict
   and the text it implies are decided in one place and travel together.
 
-  **Nothing in `lib/` closes a GitHub issue yet**, and this module does not do it either:
-  the story-to-intake-record link that would say WHICH issue a story came from is triage's
-  (design §4, build order step 4) and does not exist. When a closer is written, it goes
-  through `for_verdict/1` and applies `label/1` — that is a CONVENTION with no binding
-  guard today, exactly as `Loopctl.Delivery.Stages.escalation_block/1` is, because there is
-  no call site to bind. The guard is one test naming the closer, and it belongs to the
-  change that writes one.
+  `Loopctl.Delivery.IssueCloser` is the CLOSER (#805, since the intake link landed). It takes
+  its label and its text from `for_verdict/1` and nowhere else, and
+  `Loopctl.Intake.IssueClosure` derives the set of storable verdicts from `close?` here — so a
+  verdict that stops closing in this module stops being recordable, rather than leaving the
+  closer an enum value to decide about. `Loopctl.Delivery.IssueCloserTest` is the binding
+  guard the earlier version of this note asked a future change to write: it asserts the exact
+  label and the exact text on each close, and that a shipped close never carries the
+  not-actionable one.
+
+  Which TRANSITIONS reach a verdict at all is `Loopctl.Delivery.StageMachine.resolution_verdict/1`,
+  and it is deliberately somewhere else: this module maps a verdict to what the reporter is
+  told, and the machine maps an edge to a verdict. Keeping them apart is what lets `failed`
+  be reached by both a triage reject (tell her) and a budget exhaustion (tell her nothing)
+  without either module having to know about the other's case.
   """
 
   @shipped_label "loopctl:resolution-shipped"

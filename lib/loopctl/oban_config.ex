@@ -636,6 +636,14 @@ defmodule Loopctl.ObanConfig do
            # Bounded per run. Keep in sync with the crontab assertion in
            # oban_plugins_config_test.exs.
            {"*/2 * * * *", Loopctl.Workers.PostDeployVerificationWorker},
+           # #805: drains the issue-closure outbox — tells the reporter what happened to the
+           # issue her story came from. Up to FOUR bounded GitHub calls per candidate (read,
+           # label, comment, close), 80 for a full batch, which is where the worker's
+           # ~28s-per-candidate worst case and its wall-clock budget come from. Two minutes
+           # rather than something slower because the row is written at the verdict and the
+           # reporter has already been waiting for the deploy. Keep in sync with the crontab
+           # assertion in oban_plugins_config_test.exs.
+           {"*/2 * * * *", Loopctl.Workers.IntakeIssueCloseWorker},
            {"* * * * *", Loopctl.Workers.SystemConfigRefreshWorker},
            # US-41.1 (review): the STANDING embedding-side-table reconciliation pass —
            # sweeps the dual-write crash window (legacy row without its dim-1536 mirror)

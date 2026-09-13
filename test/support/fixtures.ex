@@ -9,6 +9,8 @@ defmodule Loopctl.Fixtures do
   separate tenants via `fixture(:tenant)`.
   """
 
+  import Ecto.Query, only: [from: 2]
+
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.Agents.Agent
@@ -21,6 +23,9 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.ContextRetriever.Entity
   alias Loopctl.Coordination.ChannelClaim
   alias Loopctl.Delivery.StoryStage
+  alias Loopctl.Intake.IssueClosure
+  alias Loopctl.Intake.Record, as: IntakeRecord
+  alias Loopctl.Intake.Source, as: IntakeSource
   alias Loopctl.Knowledge.Article
   alias Loopctl.Knowledge.ArticleAccessEvent
   alias Loopctl.Knowledge.ArticleLink
@@ -2214,6 +2219,124 @@ defmodule Loopctl.Fixtures do
       })
 
     {secret, source}
+  end
+
+  # An intake SOURCE + RECORD pair inserted DIRECTLY (#805), bypassing
+  # `Loopctl.Intake.receive_github_delivery/2` so a test does not have to sign a webhook
+  # delivery to get a record to link a story to. Returns the record.
+  #
+  # `:repo` picks the sandbox connection, exactly as `fixture(:story_stage)` does and for the
+  # same reason: `Loopctl.Repo` (default) when the story under test lives there — which is
+  # where `Loopctl.Delivery.Stages` writes the closure row from — or `Loopctl.AdminRepo` when
+  # the test drives `Loopctl.Intake.IssueClosures` directly. `Loopctl.Intake.create_source/3`
+  # is AdminRepo-only, so it cannot serve the first case.
+  def fixture(:intake_record, attrs) do
+    attrs = Enum.into(attrs, %{})
+    repo = Map.get(attrs, :repo, Loopctl.Repo)
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+    now = DateTime.utc_now()
+
+    insert = fn ->
+      project_id =
+        Map.get_lazy(attrs, :project_id, fn ->
+          unique = System.unique_integer([:positive])
+
+          repo.insert!(%Project{
+            tenant_id: tenant_id,
+            name: "intake-#{unique}",
+            slug: "intake-#{unique}",
+            kind: :work,
+            status: :active
+          }).id
+        end)
+
+      repo_full_name = Map.get(attrs, :repo_full_name, "mkreyman/home_care_billing")
+
+      # REUSED when the tenant already has one for this repository, because that is what
+      # production has — one source, many issues — and because a second row would violate
+      # `intake_sources_active_repo_uidx` and fail the test for a reason nothing under test
+      # is about.
+      source =
+        repo.one(
+          from s in IntakeSource,
+            where: s.tenant_id == ^tenant_id and s.repo_full_name == ^repo_full_name
+        ) ||
+          repo.insert!(%IntakeSource{
+            tenant_id: tenant_id,
+            project_id: project_id,
+            repo_full_name: repo_full_name,
+            webhook_secret: :crypto.strong_rand_bytes(32) |> Base.encode16(case: :lower),
+            inserted_at: now,
+            updated_at: now
+          })
+
+      repo.insert!(%IntakeRecord{
+        tenant_id: tenant_id,
+        source_id: source.id,
+        project_id: project_id,
+        issue_number: Map.get(attrs, :issue_number, System.unique_integer([:positive])),
+        untrusted_title: Map.get(attrs, :untrusted_title, "a reported problem"),
+        inserted_at: now,
+        updated_at: now
+      })
+    end
+
+    if repo == Loopctl.Repo do
+      {:ok, record} = Loopctl.Repo.with_tenant(tenant_id, insert)
+      record
+    else
+      insert.()
+    end
+  end
+
+  # A PENDING issue-closure row (#805), inserted directly so a closer/worker test can start
+  # from a verdict without walking a story through the stage machine to reach one.
+  #
+  # Defaults to `Loopctl.AdminRepo`, which is the connection
+  # `Loopctl.Intake.IssueClosures.due/1` and every marker write use — the opposite default
+  # from `fixture(:intake_record)`, because the closer is driven from there and the outbox is
+  # written from `Loopctl.Repo`.
+  def fixture(:issue_closure, attrs) do
+    attrs = Enum.into(attrs, %{})
+    repo = Map.get(attrs, :repo, AdminRepo)
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+    now = DateTime.utc_now()
+
+    record =
+      Map.get_lazy(attrs, :intake_record, fn ->
+        fixture(:intake_record, %{tenant_id: tenant_id, repo: repo})
+      end)
+
+    story_id = Map.fetch!(attrs, :story_id)
+
+    insert = fn ->
+      repo.insert!(
+        struct!(
+          IssueClosure,
+          attrs
+          |> Map.drop([:repo, :intake_record])
+          |> Map.merge(%{
+            tenant_id: tenant_id,
+            story_id: story_id,
+            intake_record_id: record.id,
+            inserted_at: now,
+            updated_at: now
+          })
+          |> Map.put_new(:repo_full_name, "mkreyman/home_care_billing")
+          |> Map.put_new(:issue_number, record.issue_number)
+          |> Map.put_new(:verdict, :shipped)
+          |> Map.put_new(:status, :pending)
+          |> Map.put_new(:attempts, 0)
+        )
+      )
+    end
+
+    if repo == Loopctl.Repo do
+      {:ok, row} = Loopctl.Repo.with_tenant(tenant_id, insert)
+      row
+    else
+      insert.()
+    end
   end
 
   def fixture(:api_key, attrs) do
