@@ -79,6 +79,11 @@ defmodule Loopctl.Repo.Migrations.CreateIntake do
       add :last_action, :text, null: true
       add :last_delivery_id, :text, null: true
 
+      # GitHub's issue.updated_at has one-second precision and a payload carries no other
+      # ordering key, so two deliveries stamped with the same second cannot be ordered.
+      add :order_ambiguous, :boolean, null: false, default: false
+      add :order_ambiguous_at, :utc_datetime_usec, null: true
+
       timestamps(type: :utc_datetime_usec)
     end
 
@@ -97,6 +102,11 @@ defmodule Loopctl.Repo.Migrations.CreateIntake do
              check:
                "(status = 'escalated') = (escalated_at IS NOT NULL) AND " <>
                  "(status <> 'escalated' OR cardinality(escalation_reasons) > 0)"
+           )
+
+    # An ambiguous order always names the second it is ambiguous at.
+    create constraint(:intake_records, :intake_records_order_ambiguity_shape,
+             check: "order_ambiguous = (order_ambiguous_at IS NOT NULL)"
            )
 
     # Mirrors the caps in Loopctl.Intake.GithubPayload.

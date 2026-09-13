@@ -516,6 +516,87 @@ defmodule LoopctlWeb.GithubIntakeControllerTest do
     end
   end
 
+  describe "same-second deliveries" do
+    defp same_second_labels(secret, source) do
+      removed_id = Ecto.UUID.generate()
+      added_id = Ecto.UUID.generate()
+
+      # A label swap: GitHub stamps both events 11:00:00 and sends the later one first.
+      unlabeled =
+        build(:github_issues_payload, %{
+          action: "unlabeled",
+          labels: ["bug"],
+          updated_at: "2026-09-12T11:00:00Z"
+        })
+
+      labeled =
+        build(:github_issues_payload, %{
+          action: "labeled",
+          labels: ["bug", "billing"],
+          updated_at: "2026-09-12T11:00:00Z"
+        })
+
+      build_conn()
+      |> deliver(source.id, encode(unlabeled), secret: secret, delivery_id: removed_id)
+
+      build_conn() |> deliver(source.id, encode(labeled), secret: secret, delivery_id: added_id)
+
+      added_id
+    end
+
+    test "a reversed pair in one second is applied and marked order_ambiguous", %{conn: _conn} do
+      {secret, source} = fixture(:intake_source, %{})
+      added_id = same_second_labels(secret, source)
+
+      assert [record] = records(source.tenant_id)
+      assert record.order_ambiguous
+      assert record.order_ambiguous_at == ~U[2026-09-12 11:00:00.000000Z]
+      assert record.untrusted_labels == ["bug", "billing"]
+      assert record.last_action == "labeled"
+      assert record.last_delivery_id == added_id
+    end
+
+    test "a strictly newer delivery clears order_ambiguous", %{conn: _conn} do
+      {secret, source} = fixture(:intake_source, %{})
+      same_second_labels(secret, source)
+
+      edited =
+        build(:github_issues_payload, %{
+          action: "edited",
+          labels: ["bug"],
+          updated_at: "2026-09-12T11:00:01Z"
+        })
+
+      build_conn() |> deliver(source.id, encode(edited), secret: secret)
+
+      assert [record] = records(source.tenant_id)
+      refute record.order_ambiguous
+      assert record.order_ambiguous_at == nil
+      assert record.untrusted_labels == ["bug"]
+      assert record.last_action == "edited"
+    end
+
+    test "identical content in the same second sets nothing", %{conn: _conn} do
+      {secret, source} = fixture(:intake_source, %{})
+      first_id = Ecto.UUID.generate()
+      opened = build(:github_issues_payload, %{updated_at: "2026-09-12T11:00:00Z"})
+      restated = %{opened | "action" => "edited"}
+
+      build_conn() |> deliver(source.id, encode(opened), secret: secret, delivery_id: first_id)
+
+      assert %{"outcome" => "recorded"} =
+               build_conn()
+               |> deliver(source.id, encode(restated), secret: secret)
+               |> json_response(200)
+
+      assert [record] = records(source.tenant_id)
+      refute record.order_ambiguous
+      assert record.order_ambiguous_at == nil
+      assert record.last_action == "opened"
+      assert record.last_delivery_id == first_id
+    end
+  end
+
   describe "tenant isolation" do
     test "a delivery lands only in its source's tenant", %{conn: conn} do
       {secret_a, source_a} = fixture(:intake_source, %{})

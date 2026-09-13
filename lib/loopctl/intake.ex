@@ -38,10 +38,24 @@ defmodule Loopctl.Intake do
   reason escalates the record, is never cleared by a later delivery, and appends an
   `intake_escalated` entry to the audit chain naming the signals — never the text.
 
-  Out-of-order deliveries: the stored content, `last_action` and `last_delivery_id` are
-  replaced only by a delivery whose `issue.updated_at` is not older than the stored one, so
-  the record always describes one coherent delivery. A stale delivery's signals are still
-  scanned, since they arrived signed.
+  ## Delivery order
+
+  GitHub does not promise delivery order, and `issue.updated_at` is the only ordering key a
+  payload carries. The stored content, `last_action` and `last_delivery_id` move together,
+  decided by comparing that timestamp with the stored one:
+
+  - **newer**: applied, and `order_ambiguous` is cleared;
+  - **older**: nothing is applied (a stale delivery's signals are still scanned, since they
+    arrived signed);
+  - **the same second, identical content**: nothing is applied — it restates known state;
+  - **the same second, different content**: applied, and the record is marked
+    `order_ambiguous` at that second. `updated_at` has one-second precision, so a label
+    swap or a bot's close-and-reopen can stamp two deliveries identically, and whichever
+    arrived last wins with nothing to say it was really the later event. That is not
+    guessed around: **triage must re-read the live issue from GitHub whenever
+    `order_ambiguous` is set** (a runner has `gh` access; loopctl does not), and treat the
+    stored content as possibly one event behind. The flag clears on the next strictly
+    newer delivery, which settles the order.
 
   ## Isolation
 
@@ -519,16 +533,12 @@ defmodule Loopctl.Intake do
     Enum.sort(Enum.uniq(detected ++ extraction.reasons))
   end
 
-  # A stale delivery changes nothing but escalation: its action and id stay out of the record
-  # too, or a reordered closed/reopened pair would leave `issue_state` and `last_action`
-  # describing different deliveries.
+  # The content, `last_action` and `last_delivery_id` move together, so the record always
+  # describes one delivery. See "Delivery order" in the moduledoc for the four cases.
   defp content_changes(record, issue, extraction, action, delivery_id) do
-    if stale?(record.issue_updated_at, issue.updated_at) do
-      %{}
-    else
+    content =
       issue
       |> GithubPayload.untrusted_fields()
-      |> Map.merge(%{last_action: action, last_delivery_id: delivery_id})
       |> Map.merge(extraction.facts)
       |> Map.merge(%{
         github_issue_id: issue.github_issue_id,
@@ -536,14 +546,39 @@ defmodule Loopctl.Intake do
         issue_state: issue.state,
         issue_updated_at: issue.updated_at
       })
+
+    delivery = %{last_action: action, last_delivery_id: delivery_id}
+
+    case order(record.issue_updated_at, issue.updated_at) do
+      :older ->
+        %{}
+
+      :same ->
+        if same_content?(record, content),
+          do: %{},
+          else: content |> Map.merge(delivery) |> Map.merge(ambiguous_at(issue.updated_at))
+
+      :newer ->
+        content |> Map.merge(delivery) |> Map.merge(ambiguous_at(nil))
     end
   end
 
-  defp stale?(%DateTime{} = stored, %DateTime{} = incoming),
-    do: DateTime.compare(incoming, stored) == :lt
+  defp order(nil, _incoming), do: :newer
+  defp order(%DateTime{}, nil), do: :older
 
-  defp stale?(%DateTime{}, nil), do: true
-  defp stale?(nil, _incoming), do: false
+  defp order(%DateTime{} = stored, %DateTime{} = incoming) do
+    case DateTime.compare(incoming, stored) do
+      :gt -> :newer
+      :eq -> :same
+      :lt -> :older
+    end
+  end
+
+  defp same_content?(record, content),
+    do: Map.take(record, Map.keys(content)) == content
+
+  defp ambiguous_at(nil), do: %{order_ambiguous: false, order_ambiguous_at: nil}
+  defp ambiguous_at(%DateTime{} = at), do: %{order_ambiguous: true, order_ambiguous_at: at}
 
   defp escalation_changes(_record, [], _now), do: %{}
 

@@ -25,6 +25,15 @@ defmodule Loopctl.Intake.Record do
   a model. Each is shape-constrained so it cannot carry prose, but each is still a
   CLAIM made by text the reporter influences.
 
+  ## Order ambiguity
+
+  `order_ambiguous` with `order_ambiguous_at` marks a record whose last applied delivery
+  carried the same `issue.updated_at` second as the one before it but different content.
+  GitHub's timestamp has one-second precision and a payload has no other ordering key, so
+  the stored content may be one event behind the live issue. **Triage must re-read the live
+  issue from GitHub whenever `order_ambiguous` is set** (a runner has `gh` access; loopctl
+  does not). A strictly newer delivery clears it. See "Delivery order" in `Loopctl.Intake`.
+
   ## Escalation
 
   `status: :escalated` with `escalation_reasons` (`"<signal>:<field>"` strings) is set
@@ -65,6 +74,8 @@ defmodule Loopctl.Intake.Record do
     field :escalated_at, :utc_datetime_usec
     field :last_action, :string
     field :last_delivery_id, :string
+    field :order_ambiguous, :boolean, default: false
+    field :order_ambiguous_at, :utc_datetime_usec
 
     timestamps()
   end
@@ -84,5 +95,6 @@ defmodule Loopctl.Intake.Record do
     |> check_constraint(:untrusted_body, name: :intake_records_untrusted_caps)
     |> check_constraint(:ticket_ref, name: :intake_records_ticket_shape)
     |> check_constraint(:status, name: :intake_records_escalation_shape)
+    |> check_constraint(:order_ambiguous, name: :intake_records_order_ambiguity_shape)
   end
 end
