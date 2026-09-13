@@ -901,23 +901,41 @@ defmodule Loopctl.Delivery.StagesTest do
   end
 
   describe "the merge identity" do
-    test "is recorded only at merged, after the merge, and a replay reuses it" do
+    test "is carried on the transition, so the merged chain entry names the merge" do
       {story, _} = at_stage(:ci)
       opts = [claim_epoch: story.claim_epoch, actor_lineage: []]
       merge_sha = String.duplicate("9", 40)
 
-      # The sha does not exist before the merge, so `ci` cannot record one.
+      # The sha does not exist before the merge, so `ci` cannot record one on its own.
       assert {:error, :wrong_stage} =
                Stages.record_effect(story.tenant_id, story.id, :merge_sha, merge_sha, opts)
 
-      {:ok, _} = Stages.advance(story.tenant_id, story.id, {:ci, :merged}, opts)
+      # Perform the merge, take the sha GitHub returns, transition carrying it.
+      assert {:ok, %StoryStage{stage: :merged, merge_sha: ^merge_sha}} =
+               Stages.advance(
+                 story.tenant_id,
+                 story.id,
+                 {:ci, :merged},
+                 opts ++ [effects: [merge_sha: merge_sha]]
+               )
 
-      assert {:ok, %StoryStage{merge_sha: ^merge_sha}} =
-               Stages.record_effect(story.tenant_id, story.id, :merge_sha, merge_sha, opts)
+      # The custody record NAMES the merge. A nil here is an entry that asserts a merge and
+      # identifies nothing.
+      assert [%Entry{action: "story_stage_merged", payload: payload}] =
+               as_tenant(story.tenant_id, fn -> Repo.all(Entry) end)
 
-      # The resuming runner asks GitHub whether its head is merged, gets the same sha back
-      # and records it again: idempotent, while a DIFFERENT sha is a conflict rather than a
-      # second merge quietly overwriting the first.
+      assert payload["merge_sha"] == merge_sha
+
+      # One `effect_recorded` event alongside the transition's own.
+      assert ["transitioned", "effect_recorded"] =
+               story.tenant_id |> Stages.list_events(story.id) |> Enum.map(& &1.event)
+    end
+
+    test "a replayed merge reuses the recorded sha and a different one conflicts" do
+      merge_sha = String.duplicate("9", 40)
+      {story, _} = at_stage(:merged, merge_sha: merge_sha)
+      opts = [claim_epoch: story.claim_epoch]
+
       assert {:ok, %StoryStage{merge_sha: ^merge_sha}} =
                Stages.record_effect(story.tenant_id, story.id, :merge_sha, merge_sha, opts)
 
@@ -929,6 +947,31 @@ defmodule Loopctl.Delivery.StagesTest do
                  String.duplicate("8", 40),
                  opts
                )
+    end
+
+    test "an effect the destination stage does not produce, or a malformed one, is refused" do
+      {story, _} = at_stage(:ci)
+      opts = [claim_epoch: story.claim_epoch, actor_lineage: []]
+
+      assert {:error, :invalid_effect} =
+               Stages.advance(
+                 story.tenant_id,
+                 story.id,
+                 {:ci, :merged},
+                 opts ++ [effects: [merge_sha: "not-a-sha"]]
+               )
+
+      assert {:error, :wrong_stage} =
+               Stages.advance(
+                 story.tenant_id,
+                 story.id,
+                 {:ci, :merged},
+                 opts ++ [effects: [worktree_path: "/w"]]
+               )
+
+      # Neither attempt moved the row or wrote an entry.
+      assert Stages.get(story.tenant_id, story.id).stage == :ci
+      assert chain_actions(story.tenant_id) == []
     end
 
     test "a refused merge is chained as a retraction, with its reason" do

@@ -35,12 +35,17 @@ defmodule Loopctl.Delivery.Stages do
     `:stale_stage` — it does not happen twice. The caller reads `get/2` to learn where the
     row is; the row, not the caller's memory, is the truth.
   - `record_effect/5` records an identity once. The same value again is `{:ok, row}`, so a
-    replayed stage finds the worktree, PR, merge or release its first run recorded and
-    reuses it; a DIFFERENT value for an identity already set is `:effect_conflict`, so a
-    replay can never record a second one. Record the identity BEFORE performing the effect
-    — which is why `merge_sha` is writable at `ci`, the stage that performs the merge, and
-    not only at `merged`, and why a merge that is then REFUSED takes
-    `{merged, implementing, :merge_refused}`, clearing the identity it never realised.
+    replayed stage finds the worktree, PR or release its first run recorded and reuses it;
+    a DIFFERENT value for an identity already set is `:effect_conflict`, so a replay can
+    never record a second one. Record the identity BEFORE performing the effect.
+  - The MERGE is the one identity that cannot be written first, because the merge commit
+    does not exist until GitHub makes it. Its shape is: perform the merge, take the sha
+    GitHub returns, then `advance(…, {:ci, :merged}, effects: [merge_sha: sha])` — one
+    transaction, so the row and the `story_stage_merged` chain entry name the same merge.
+    Its replay anchor is `pr_number` + `head_sha`: a resuming runner asks GitHub whether
+    that head is already merged and adopts the answer instead of merging again. A merge
+    that did not hold takes `{merged, implementing, :merge_refused}`, whose chained
+    retraction names the sha it withdraws.
   - `open/3` inserts `ON CONFLICT DO NOTHING` and returns the one row either way.
 
   ## Slow connections
@@ -246,6 +251,12 @@ defmodule Loopctl.Delivery.Stages do
   ## Options
 
   - `:claim_epoch` (required) — the epoch the caller acts under
+  - `:effects` — identities to record AS PART OF this transition, e.g.
+    `effects: [merge_sha: sha]` on `ci -> merged`. They are applied in the transition's own
+    transaction, after the stage moves and BEFORE the chain entry is built, so a chained
+    transition's entry names the effect it asserts. Same rules as `record_effect/5`
+    (validated first, idempotent on the same value, `:effect_conflict` on a different one),
+    and the destination stage is what `StageMachine.effect_stages/1` is checked against.
   - `:reason` — the escalation reason (required into `escalated`), or a note
   - `:actor_label`, `:actor_role`, `:actor_lineage` — attribution; role and lineage are
     SERVER-resolved by the caller from the authenticating key, never taken from a request
@@ -266,14 +277,15 @@ defmodule Loopctl.Delivery.Stages do
     with :ok <- allowed_for_caller(from, to, edge),
          :ok <- lineage_declared(from, to, edge, opts),
          :ok <- human_gate(edge, opts),
-         :ok <- reason_given(to, edge, reason) do
+         :ok <- reason_given(to, edge, reason),
+         {:ok, effects} <- validate_effects(opts) do
       in_tenant(tenant_id, fn ->
-        transition(tenant_id, story_id, {from, to, edge}, epoch, opts)
+        transition(tenant_id, story_id, {from, to, edge}, epoch, effects, opts)
       end)
     end
   end
 
-  defp transition(tenant_id, story_id, {from, to, edge} = transition, epoch, opts) do
+  defp transition(tenant_id, story_id, {from, to, edge} = transition, epoch, effects, opts) do
     reason = Keyword.get(opts, :reason)
     story = share_lock_story(tenant_id, story_id)
 
@@ -292,6 +304,12 @@ defmodule Loopctl.Delivery.Stages do
 
     row = compare_and_set(tenant_id, story, transition, reason)
     insert_event(Repo, row, "transitioned", from, edge, opts[:actor_label], note(reason))
+
+    # BEFORE the chain entry is built, in this same transaction: the entry has to NAME the
+    # effect the transition asserts. `ci -> merged` carrying the sha GitHub just returned is
+    # the case that forces it — recorded afterwards, the `story_stage_merged` entry says a
+    # merge happened and identifies nothing.
+    row = put_effects(row, effects, opts)
     {row, maybe_chain(row, previous, transition, reason, opts)}
   end
 
@@ -351,6 +369,9 @@ defmodule Loopctl.Delivery.Stages do
     (`StageMachine.effect_stages/1`)
   - `:effect_conflict` — the identity is already set to a DIFFERENT value
 
+  For an identity that IS the outcome of a transition — the merge sha — pass it to
+  `advance/4` as `:effects` instead, so the chained entry can name it.
+
   ## Options
 
   - `:claim_epoch` (required), `:actor_label`
@@ -382,10 +403,16 @@ defmodule Loopctl.Delivery.Stages do
   defp apply_effect(nil, _story, _effect, _value, _opts), do: Repo.rollback(:not_found)
 
   defp apply_effect(row, story, effect, value, opts) do
+    if row.claim_epoch != story.claim_epoch, do: Repo.rollback(:stale_claim_epoch)
+    put_effect(row, effect, value, opts)
+  end
+
+  # The one place an identity is written, shared by `record_effect/5` and by the `:effects`
+  # a transition carries. The caller has already validated the value and the epoch.
+  defp put_effect(row, effect, value, opts) do
     current = Map.fetch!(row, effect)
 
     cond do
-      row.claim_epoch != story.claim_epoch -> Repo.rollback(:stale_claim_epoch)
       not runner_resolvable?(effect, value, row.tenant_id) -> Repo.rollback(:invalid_effect)
       # A replay of the write that already landed, from any stage: nothing to do.
       current == value -> row
@@ -393,6 +420,10 @@ defmodule Loopctl.Delivery.Stages do
       not is_nil(current) -> Repo.rollback(:effect_conflict)
       true -> set_effect(row, effect, value, opts)
     end
+  end
+
+  defp put_effects(row, effects, opts) do
+    Enum.reduce(effects, row, fn {effect, value}, acc -> put_effect(acc, effect, value, opts) end)
   end
 
   defp set_effect(row, effect, value, opts) do
@@ -719,6 +750,19 @@ defmodule Loopctl.Delivery.Stages do
   defp chain_action(_from, to, _edge), do: "story_stage_" <> Atom.to_string(to)
 
   # --- effects ------------------------------------------------------------------------------
+
+  # The `:effects` a transition carries, validated the same way `record_effect/5` validates
+  # its one — before the transaction, so a malformed value never opens one.
+  defp validate_effects(opts) do
+    opts
+    |> Keyword.get(:effects, [])
+    |> Enum.reduce_while({:ok, []}, fn {effect, value}, {:ok, acc} ->
+      case validate_effect(effect, value) do
+        {:ok, value} -> {:cont, {:ok, acc ++ [{effect, value}]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+  end
 
   defp validate_effect(:runner_id, value) do
     case Ecto.UUID.cast(value) do

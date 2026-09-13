@@ -106,10 +106,12 @@ defmodule Loopctl.Delivery.StageMachine do
     # `merge_sha` is writable ONLY at `merged`, and only AFTER GitHub returns it. It is the
     # one identity that cannot be written before its effect, because the merge commit does
     # not exist until the merge happens: a value written at `ci` would be one the caller
-    # never obtained, and it would land verbatim in the `story_stage_merged` chain entry as
-    # if it were the merge. The merge's replay safety comes from `pr_number` + `head_sha`
-    # instead — a resuming runner ASKS GitHub whether that head is already merged and
-    # adopts the answer, rather than merging again and recording a second sha.
+    # never obtained. It is carried ON the transition —
+    # `advance(…, {:ci, :merged}, effects: [merge_sha: sha])` — so the row and the
+    # `story_stage_merged` chain entry are written in one transaction and the entry names
+    # the merge it asserts. The merge's replay safety comes from `pr_number` + `head_sha`
+    # instead: a resuming runner ASKS GitHub whether that head is already merged and adopts
+    # the answer, rather than merging again and recording a second sha.
     merge_sha: [:merged],
     release_id: [:deployed]
   }
