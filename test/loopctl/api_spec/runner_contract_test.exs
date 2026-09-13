@@ -65,6 +65,10 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       assert connection["errors"] == RunnerContract.error_reasons()
 
       assert connection["limits"]["trace_max_events"] == RunnerTraceBatch.max_events()
+      assert connection["limits"]["dispatch_reply_burst"] == RunnerContract.dispatch_reply_burst()
+
+      assert connection["limits"]["min_interval_ms"] ==
+               Map.new(~w(status trace trace_cursor), &{&1, RunnerContract.min_interval_ms(&1)})
 
       assert connection["limits"]["trace_max_event_data_bytes"] ==
                RunnerTraceEvent.max_data_bytes()
@@ -98,7 +102,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
       event = %{
         "run_id" => run_id,
-        "seq" => 9_223_372_036_854_775_807,
+        "seq" => RunnerContract.max_seq(),
         "event_id" => String.duplicate("e", 128),
         "parent" => String.duplicate("p", 128),
         "ts" => "2026-09-12T20:36:46.485123+00:00",
@@ -407,7 +411,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
       for event_change <- [
             %{"run_id" => Ecto.UUID.generate()},
-            %{"seq" => 9_223_372_036_854_775_808},
+            %{"seq" => RunnerContract.max_seq() + 1},
             %{"seq" => -1},
             %{"parent" => ""},
             %{"ts" => "yesterday"}
@@ -426,6 +430,111 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
                RunnerContract.cast_trace_batch(
                  update_in(batch, ["events", Access.at(0)], &Map.delete(&1, "parent"))
                )
+    end
+  end
+
+  describe "the seq bound" do
+    test "max_seq is accepted and one past it refused, and the bound leaves room for seq + 1" do
+      max = RunnerContract.max_seq()
+      bigint_max = 9_223_372_036_854_775_807
+      assert max + 1 <= bigint_max
+
+      at_max =
+        update_in(
+          build(:runner_trace_batch, %{seqs: [0]}),
+          ["events", Access.at(0)],
+          &Map.put(&1, "seq", max)
+        )
+
+      assert {:ok, %{events: [%{seq: ^max}]}} = RunnerContract.cast_trace_batch(at_max)
+
+      for seq <- [max + 1, bigint_max] do
+        past = update_in(at_max, ["events", Access.at(0)], &Map.put(&1, "seq", seq))
+        assert {:error, {:invalid, _}} = RunnerContract.cast_trace_batch(past)
+      end
+
+      assert RunnerContract.json_schema()["x-connection"]["limits"]["trace_max_seq"] == max
+    end
+  end
+
+  describe "UUID normalization" do
+    test "every UUID a runner or a caller sends is returned lowercase" do
+      run_id = Ecto.UUID.generate()
+      dispatch_id = Ecto.UUID.generate()
+      story_id = Ecto.UUID.generate()
+      up = &String.upcase/1
+
+      batch =
+        build(:runner_trace_batch, %{
+          :seqs => [0, 1],
+          "run_id" => up.(run_id),
+          "dispatch_id" => up.(dispatch_id)
+        })
+        |> update_in(["events", Access.all()], &Map.put(&1, "run_id", up.(run_id)))
+
+      assert {:ok, cast} = RunnerContract.cast_trace_batch(batch)
+      assert cast.run_id == run_id
+      assert cast.dispatch_id == dispatch_id
+      assert Enum.all?(cast.events, &(&1.run_id == run_id))
+
+      assert {:ok, %{run_id: ^run_id}} =
+               RunnerContract.cast_trace_cursor(%{"run_id" => up.(run_id)})
+
+      assert {:ok, %{dispatch_id: ^dispatch_id}} =
+               RunnerContract.cast_dispatch_reply(%{
+                 "dispatch_id" => up.(dispatch_id),
+                 "claim_epoch" => 0,
+                 "decision" => "accepted"
+               })
+
+      assert {:ok, %{dispatch_id: ^dispatch_id, story_id: ^story_id}} =
+               RunnerContract.cast_dispatch(
+                 build(:runner_dispatch, %{
+                   "dispatch_id" => up.(dispatch_id),
+                   "story_id" => up.(story_id)
+                 })
+               )
+    end
+  end
+
+  describe "NUL refusal" do
+    test "a NUL in any string of a trace event, at any depth of data, is invalid" do
+      nul = "a" <> <<0>> <> "b"
+      batch = build(:runner_trace_batch, %{seqs: [0]})
+
+      for change <- [
+            %{"event_id" => nul},
+            %{"parent" => nul},
+            %{"type" => nul},
+            %{"data" => %{"k" => nul}},
+            %{"data" => %{nul => "v"}},
+            %{"data" => %{"list" => [1, %{"deep" => [nul]}]}}
+          ] do
+        payload = update_in(batch, ["events", Access.at(0)], &Map.merge(&1, change))
+
+        assert {:error, {:invalid, [message]}} = RunnerContract.cast_trace_batch(payload),
+               "expected #{inspect(change)} to be refused"
+
+        assert message =~ "NUL"
+      end
+
+      assert {:ok, _} = RunnerContract.cast_trace_batch(batch)
+    end
+
+    test "a NUL in a refusal's detail is invalid" do
+      reply = %{
+        "dispatch_id" => Ecto.UUID.generate(),
+        "claim_epoch" => 0,
+        "decision" => "refused",
+        "reason" => "other"
+      }
+
+      assert {:ok, _} = RunnerContract.cast_dispatch_reply(Map.put(reply, "detail", "fine"))
+
+      assert {:error, {:invalid, [message]}} =
+               RunnerContract.cast_dispatch_reply(Map.put(reply, "detail", "a" <> <<0>>))
+
+      assert message =~ "NUL"
     end
   end
 

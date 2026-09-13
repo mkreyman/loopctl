@@ -117,7 +117,8 @@ defmodule Loopctl.Runners.DispatchLedger do
   """
   @spec record_reply(Ecto.UUID.t(), Ecto.UUID.t(), map()) ::
           {:ok, DispatchRecord.t()}
-          | {:error, :unknown_dispatch | :stale_claim_epoch | :already_replied}
+          | {:error,
+             :unknown_dispatch | :stale_claim_epoch | :already_replied | :rejected_by_database}
   def record_reply(tenant_id, runner_id, reply) do
     in_tenant(tenant_id, fn ->
       with {:ok, record} <- lock_held(tenant_id, runner_id, reply.dispatch_id),
@@ -155,7 +156,11 @@ defmodule Loopctl.Runners.DispatchLedger do
   @spec record_trace(Ecto.UUID.t(), Ecto.UUID.t(), map()) ::
           {:ok, integer()}
           | {:error,
-             :unknown_dispatch | :stale_claim_epoch | :dispatch_not_accepted | :run_mismatch}
+             :unknown_dispatch
+             | :stale_claim_epoch
+             | :dispatch_not_accepted
+             | :run_mismatch
+             | :rejected_by_database}
   def record_trace(tenant_id, runner_id, batch) do
     in_tenant(tenant_id, fn ->
       with {:ok, record} <- lock_held(tenant_id, runner_id, batch.dispatch_id),
@@ -190,7 +195,28 @@ defmodule Loopctl.Runners.DispatchLedger do
   end
 
   # The one way this module reaches the database: an RLS transaction it owns.
-  defp in_tenant(tenant_id, fun), do: Repo.with_tenant(tenant_id, fun)
+  #
+  # A runner-supplied value Postgres refuses as data comes back as
+  # `{:error, :rejected_by_database}` rather than a raise. That covers SQLSTATE class 22 (a
+  # NUL in text or jsonb, a number out of range) and a CHECK violation (a `seq` past its
+  # bound). Raised inside the channel's handle_in it would crash the channel, the runner
+  # would resend the same message on rejoin, and the loop would never end. The contract cast
+  # refuses the known cases first; this is the backstop. Any other database error raises.
+  defp in_tenant(tenant_id, fun) do
+    Repo.with_tenant(tenant_id, fun)
+  rescue
+    error in Postgrex.Error ->
+      if data_exception?(error),
+        do: {:error, :rejected_by_database},
+        else: reraise(error, __STACKTRACE__)
+  end
+
+  defp data_exception?(%Postgrex.Error{postgres: %{pg_code: "22" <> _}}), do: true
+
+  defp data_exception?(%Postgrex.Error{postgres: %{constraint: "runner_trace_events_seq"}}),
+    do: true
+
+  defp data_exception?(_error), do: false
 
   # The ownership predicate: tenant AND runner. A row another runner holds is refused
   # exactly like a row that does not exist.

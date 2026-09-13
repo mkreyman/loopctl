@@ -47,10 +47,11 @@ defmodule LoopctlWeb.RunnerChannel do
   `"dispatch_reply"` (`RunnerDispatchReply`), `"trace"` (`RunnerTraceBatch`) and
   `"trace_cursor"` (`RunnerTraceCursor`) are validated against the contract and applied by
   `Loopctl.Runners.DispatchLedger`, always as THIS socket's runner in THIS socket's tenant —
-  a runner can answer, and ship a trace for, only a dispatch it was sent. Each has its own
-  minimum interval, refused with `rate_limited` and the interval, because each one is a
-  database transaction. The floors are `RunnerContract.min_interval_ms/1`, one per event and
-  independent of each other.
+  a runner can answer, and ship a trace for, only a dispatch it was sent. Each is rate
+  limited, refused with `rate_limited` and a retry interval, because each one is a database
+  transaction: `trace` and `trace_cursor` by their own floors
+  (`RunnerContract.min_interval_ms/1`), `dispatch_reply` by a small bucket
+  (`RunnerContract.dispatch_reply_burst/0`). Only a valid message spends its limit.
 
   None of them checks the custody halt. The halt guards control-to-runner pushes, which
   start custody progress; these record what a runner already did, and a halted tenant must
@@ -70,7 +71,8 @@ defmodule LoopctlWeb.RunnerChannel do
   @recheck_interval_ms 30_000
   # One source: the contract publishes these same values in its export.
   @min_status_interval_ms RunnerContract.min_interval_ms("status")
-  @min_reply_interval_ms RunnerContract.min_interval_ms("dispatch_reply")
+  @reply_capacity RunnerContract.dispatch_reply_burst() |> Map.fetch!("capacity")
+  @reply_refill_ms RunnerContract.dispatch_reply_burst() |> Map.fetch!("refill_interval_ms")
   @min_trace_interval_ms RunnerContract.min_interval_ms("trace")
   @min_cursor_interval_ms RunnerContract.min_interval_ms("trace_cursor")
   @join_window_ms 60_000
@@ -94,7 +96,7 @@ defmodule LoopctlWeb.RunnerChannel do
        socket
        |> assign(:meta, Map.put(meta, :joined_at, DateTime.utc_now()))
        |> assign(:last_status_at, :never)
-       |> assign(:last_reply_at, :never)
+       |> assign(:reply_bucket, :full)
        |> assign(:last_trace_at, :never)
        |> assign(:last_cursor_at, :never)
        |> assign(:presence_ref, nil)}
@@ -196,20 +198,24 @@ defmodule LoopctlWeb.RunnerChannel do
     end
   end
 
+  # Each handler below spends its rate limit only once the message is VALID — that is, once
+  # it will cost a database round trip. A message refused at the contract cast costs none,
+  # so the runner can correct it and resend at once.
   def handle_in("dispatch_reply", payload, socket) do
     now = System.monotonic_time(:millisecond)
     %{runner: runner, tenant_id: tenant_id} = socket.assigns
 
-    with :ok <- interval_ok(socket.assigns.last_reply_at, now, @min_reply_interval_ms),
-         {:ok, reply} <- RunnerContract.cast_dispatch_reply(payload),
-         {:ok, _record} <- DispatchLedger.record_reply(tenant_id, runner.id, reply) do
-      {:reply, :ok, assign(socket, :last_reply_at, now)}
-    else
-      {:error, :rate_limited} ->
-        rate_limited(socket, @min_reply_interval_ms)
+    with {:ok, reply} <- RunnerContract.cast_dispatch_reply(payload),
+         {:ok, bucket} <- take_reply_token(socket.assigns.reply_bucket, now) do
+      socket = assign(socket, :reply_bucket, bucket)
 
-      {:error, reason} ->
-        {:reply, {:error, message_error(reason)}, assign(socket, :last_reply_at, now)}
+      case DispatchLedger.record_reply(tenant_id, runner.id, reply) do
+        {:ok, _record} -> {:reply, :ok, socket}
+        {:error, reason} -> {:reply, {:error, message_error(reason)}, socket}
+      end
+    else
+      {:error, :rate_limited} -> rate_limited(socket, @reply_refill_ms)
+      {:error, reason} -> {:reply, {:error, message_error(reason)}, socket}
     end
   end
 
@@ -218,15 +224,16 @@ defmodule LoopctlWeb.RunnerChannel do
     %{runner: runner, tenant_id: tenant_id} = socket.assigns
 
     with :ok <- interval_ok(socket.assigns.last_trace_at, now, @min_trace_interval_ms),
-         {:ok, batch} <- RunnerContract.cast_trace_batch(payload),
-         {:ok, acked_seq} <- DispatchLedger.record_trace(tenant_id, runner.id, batch) do
-      {:reply, {:ok, %{acked_seq: acked_seq}}, assign(socket, :last_trace_at, now)}
-    else
-      {:error, :rate_limited} ->
-        rate_limited(socket, @min_trace_interval_ms)
+         {:ok, batch} <- RunnerContract.cast_trace_batch(payload) do
+      socket = assign(socket, :last_trace_at, now)
 
-      {:error, reason} ->
-        {:reply, {:error, message_error(reason)}, assign(socket, :last_trace_at, now)}
+      case DispatchLedger.record_trace(tenant_id, runner.id, batch) do
+        {:ok, acked_seq} -> {:reply, {:ok, %{acked_seq: acked_seq}}, socket}
+        {:error, reason} -> {:reply, {:error, message_error(reason)}, socket}
+      end
+    else
+      {:error, :rate_limited} -> rate_limited(socket, @min_trace_interval_ms)
+      {:error, reason} -> {:reply, {:error, message_error(reason)}, socket}
     end
   end
 
@@ -239,11 +246,8 @@ defmodule LoopctlWeb.RunnerChannel do
       acked_seq = DispatchLedger.trace_cursor(tenant_id, runner.id, run_id)
       {:reply, {:ok, %{acked_seq: acked_seq}}, assign(socket, :last_cursor_at, now)}
     else
-      {:error, :rate_limited} ->
-        rate_limited(socket, @min_cursor_interval_ms)
-
-      {:error, reason} ->
-        {:reply, {:error, message_error(reason)}, assign(socket, :last_cursor_at, now)}
+      {:error, :rate_limited} -> rate_limited(socket, @min_cursor_interval_ms)
+      {:error, reason} -> {:reply, {:error, message_error(reason)}, socket}
     end
   end
 
@@ -288,6 +292,21 @@ defmodule LoopctlWeb.RunnerChannel do
   defp interval_ok(:never, _now, _min_ms), do: :ok
   defp interval_ok(last, now, min_ms) when now - last >= min_ms, do: :ok
   defp interval_ok(_last, _now, _min_ms), do: {:error, :rate_limited}
+
+  # The `dispatch_reply` bucket, `{tokens, refilled_at}`: `@reply_capacity` replies back to
+  # back, one more earned every `@reply_refill_ms`. A fresh channel starts `:full`.
+  defp take_reply_token(:full, now), do: {:ok, {@reply_capacity - 1, now}}
+
+  defp take_reply_token({tokens, refilled_at}, now) do
+    earned = div(now - refilled_at, @reply_refill_ms)
+
+    {tokens, refilled_at} =
+      if tokens + earned >= @reply_capacity,
+        do: {@reply_capacity, now},
+        else: {tokens + max(earned, 0), refilled_at + max(earned, 0) * @reply_refill_ms}
+
+    if tokens >= 1, do: {:ok, {tokens - 1, refilled_at}}, else: {:error, :rate_limited}
+  end
 
   defp presence_meta(meta, runner), do: Map.put(meta, :runner_id, runner.id)
 
@@ -352,6 +371,10 @@ defmodule LoopctlWeb.RunnerChannel do
               :run_mismatch
             ],
        do: %{reason: Atom.to_string(reason)}
+
+  # A value the contract let through and Postgres still refused (DispatchLedger's backstop).
+  defp message_error(:rejected_by_database),
+    do: %{reason: "invalid_payload", details: ["a value was refused by the database"]}
 
   defp message_error(reason), do: join_error(reason)
 end

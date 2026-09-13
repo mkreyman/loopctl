@@ -104,10 +104,12 @@ All notable changes to loopctl are documented here.
   `dispatch_reply`, `trace` and `trace_cursor` — and `priv/runner_contract/v1.json` is
   regenerated at `x-contract-version` 1.1.0, now also carrying each event's stable error
   `reason` codes and its limits (`x-connection.errors`, `x-connection.limits`: at most 20
-  events per batch, 2,048 bytes of JSON `data` per event, and `min_interval_ms` — each
-  event's own rate floor per channel: `status` 1000, `dispatch_reply` 250, `trace` 50,
-  `trace_cursor` 50). The bump is minor: a runner built against 1.0.0 still joins, and
-  nothing it sends changed.
+  events per batch, 2,048 bytes of JSON `data` per event, `trace_max_seq`,
+  `min_interval_ms` — each event's own rate floor per channel: `status` 1000, `trace` 50,
+  `trace_cursor` 50 — and `dispatch_reply_burst`, 8 replies refilled one per 250 ms). Only
+  a valid message spends a limit. The bump is minor: a runner built against 1.0.0 still
+  joins, and nothing it sends changed. Every UUID a runner sends is normalized to
+  lowercase, and a NUL character in any runner-supplied string is `invalid_payload`.
 
   **Both tables are read and written on the RLS `Loopctl.Repo` pool (`POOL_SIZE`), never on
   `AdminRepo`.** Trace intake is high-volume by design — a runner resuming after a deploy

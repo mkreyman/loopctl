@@ -443,6 +443,96 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
     end
   end
 
+  describe "values a runner can send" do
+    test "an uppercase run_id is one run across batches", %{runner: runner} do
+      record = accepted(runner)
+      upper = String.upcase(Ecto.UUID.generate())
+
+      assert {:ok, 0} = trace(runner, record, upper, [0])
+      assert {:ok, 1} = trace(runner, record, upper, [1])
+      assert {:ok, 2} = trace(runner, record, String.downcase(upper), [2])
+      assert DispatchLedger.trace_cursor(runner.tenant_id, runner.id, String.downcase(upper)) == 2
+    end
+
+    test "an uppercase story_id or dispatch_id is sendable, and a re-send finds the same row",
+         %{runner: runner} do
+      payload =
+        build(:runner_dispatch, %{
+          "dispatch_id" => String.upcase(Ecto.UUID.generate()),
+          "story_id" => String.upcase(Ecto.UUID.generate())
+        })
+
+      {:ok, dispatch} = RunnerContract.cast_dispatch(payload)
+      assert {:ok, first} = DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch)
+      assert {:ok, again} = DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch)
+      assert again.id == first.id
+
+      {:ok, reply} =
+        RunnerContract.cast_dispatch_reply(%{
+          "dispatch_id" => payload["dispatch_id"],
+          "claim_epoch" => 0,
+          "decision" => "accepted"
+        })
+
+      assert {:ok, %{status: "accepted"}} =
+               DispatchLedger.record_reply(runner.tenant_id, runner.id, reply)
+    end
+
+    test "a seq at max_seq is stored, and the ack keeps advancing after it", %{runner: runner} do
+      record = accepted(runner)
+      run_id = Ecto.UUID.generate()
+
+      assert {:ok, 0} = trace(runner, record, run_id, [0, RunnerContract.max_seq()])
+      assert {:ok, 1} = trace(runner, record, run_id, [1])
+      assert {:ok, 2} = trace(runner, record, run_id, [2])
+    end
+
+    test "a value Postgres refuses is rejected_by_database, never a raise, and the next call works",
+         %{runner: runner} do
+      record = accepted(runner)
+      run_id = Ecto.UUID.generate()
+
+      {:ok, batch} =
+        RunnerContract.cast_trace_batch(
+          build(:runner_trace_batch, %{
+            :seqs => [0],
+            "run_id" => run_id,
+            "dispatch_id" => record.dispatch_id,
+            "claim_epoch" => record.claim_epoch
+          })
+        )
+
+      # Built past the contract cast, which refuses these first: the backstop is what is tested.
+      nul_data = update_in(batch, [:events, Access.at(0)], &Map.put(&1, :data, %{"k" => <<0>>}))
+      nul_text = update_in(batch, [:events, Access.at(0)], &Map.put(&1, :type, "a" <> <<0>>))
+
+      past_bound =
+        update_in(batch, [:events, Access.at(0)], &Map.put(&1, :seq, 9_223_372_036_854_775_807))
+
+      for bad <- [nul_data, nul_text, past_bound] do
+        assert {:error, :rejected_by_database} =
+                 DispatchLedger.record_trace(runner.tenant_id, runner.id, bad)
+      end
+
+      assert {:ok, 0} = DispatchLedger.record_trace(runner.tenant_id, runner.id, batch)
+
+      pending = sent(runner)
+
+      reply = %{
+        dispatch_id: pending.dispatch_id,
+        claim_epoch: pending.claim_epoch,
+        decision: "refused",
+        reason: "other",
+        detail: "a" <> <<0>>
+      }
+
+      assert {:error, :rejected_by_database} =
+               DispatchLedger.record_reply(runner.tenant_id, runner.id, reply)
+
+      assert DispatchLedger.get_record(runner.tenant_id, pending.dispatch_id).status == "sent"
+    end
+  end
+
   describe "the Repo path" do
     test "every ledger and trace query runs on Loopctl.Repo inside an RLS context, none on AdminRepo",
          %{runner: runner} do

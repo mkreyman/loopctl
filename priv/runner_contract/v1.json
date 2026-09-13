@@ -487,15 +487,19 @@
       "trace_event": "RunnerTraceEvent"
     },
     "limits": {
+      "dispatch_reply_burst": {
+        "capacity": 8,
+        "refill_interval_ms": 250
+      },
       "min_interval_ms": {
-        "dispatch_reply": 250,
         "status": 1000,
         "trace": 50,
         "trace_cursor": 50
       },
       "refusal_max_detail_length": 500,
       "trace_max_event_data_bytes": 2048,
-      "trace_max_events": 20
+      "trace_max_events": 20,
+      "trace_max_seq": 9223372036854775806
     },
     "replies": {
       "trace": "RunnerTraceAck",

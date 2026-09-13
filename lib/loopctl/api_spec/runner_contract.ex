@@ -31,14 +31,28 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | runner -> control | `"trace"` | `RunnerTraceBatch` of `RunnerTraceEvent` (since 1.1.0) | `RunnerTraceAck` | `rate_limited`, `invalid_payload`, `batch_too_large`, `event_data_too_large`, `unknown_dispatch`, `stale_claim_epoch`, `dispatch_not_accepted`, `run_mismatch` |
   | runner -> control | `"trace_cursor"` | `RunnerTraceCursor` (since 1.1.0) | `RunnerTraceAck` | `rate_limited`, `invalid_payload` |
 
-  ## Rate floors
+  ## Rate limits
 
-  Each runner-to-control event has its own minimum interval per channel, published as
-  `x-connection.limits.min_interval_ms` (`min_interval_ms/1`): `status` 1000 ms,
-  `dispatch_reply` 250 ms, `trace` 50 ms, `trace_cursor` 50 ms. They are independent — a
-  `trace` batch is not held back by a recent `status` or `trace_cursor` — so a rejoining
-  runner resumes its trace at up to 20 batches a second. A message inside its floor is
-  refused with `rate_limited` and `min_interval_ms`; send it again after that long.
+  Published in `x-connection.limits`, and enforced per channel:
+
+  - `min_interval_ms` (`min_interval_ms/1`) — `status` 1000 ms, `trace` 50 ms,
+    `trace_cursor` 50 ms. Each event has its OWN floor: a `trace` batch is not held back
+    by a recent `status` or `trace_cursor`, so the resume sequence (cursor, then batches)
+    is never refused, and a rejoining runner ships up to 20 batches a second.
+  - `dispatch_reply_burst` (`dispatch_reply_burst/0`) — a bucket of 8 replies that refills
+    one every 250 ms, so several dispatches can be answered back to back.
+
+  Only a message that is ACTED ON counts: one refused before the database (`invalid_payload`,
+  `batch_too_large`, `event_data_too_large`) neither starts a floor nor spends a reply, so
+  a runner can correct it and resend at once. A message inside its limit is refused with
+  `rate_limited` and `min_interval_ms`; send it again after that long.
+
+  ## Values
+
+  Every UUID a runner sends is normalized to lowercase before it is compared or stored, so
+  `ABCD...` and `abcd...` are the same id. `seq` must be below 2^63 - 1. No string —
+  including any key or value inside an event's `data` — may contain a NUL character
+  (`\\u0000`), which Postgres cannot store; such a message is `invalid_payload`.
 
   ## Dispatch replies
 
@@ -423,19 +437,23 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     "trace_cursor" => ~w(rate_limited invalid_payload)
   }
 
-  # The minimum spacing, per channel, between two messages of one runner-to-control event.
-  # A message inside it is refused with `rate_limited` and `min_interval_ms`. Each event has
-  # its OWN floor: `trace` and `trace_cursor` do not share `status`'s, nor each other's.
-  # `LoopctlWeb.RunnerChannel` enforces exactly these values and the export publishes them.
+  # The minimum spacing, per channel, between two acted-on messages of one event. A message
+  # inside it is refused with `rate_limited` and `min_interval_ms`. Each event has its OWN
+  # floor. `LoopctlWeb.RunnerChannel` enforces exactly these values and the export publishes
+  # them.
   @min_interval_ms %{
     "status" => 1_000,
-    "dispatch_reply" => 250,
     "trace" => 50,
     "trace_cursor" => 50
   }
 
-  # Postgres `bigint`, the column `seq` is stored in.
-  @max_seq 9_223_372_036_854_775_807
+  # `dispatch_reply` is a bucket rather than a floor: a runner handed several dispatches at
+  # once answers them back to back, and a single per-runner gap refused the second answer.
+  @dispatch_reply_burst %{"capacity" => 8, "refill_interval_ms" => 250}
+
+  # One below Postgres `bigint`'s maximum: the contiguous-ack query probes `seq + 1`, which
+  # must itself fit. The `runner_trace_events_seq` CHECK holds the same bound.
+  @max_seq 9_223_372_036_854_775_806
 
   @doc "The contract version loopctl speaks (semver)."
   @spec version() :: String.t()
@@ -447,6 +465,17 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   """
   @spec min_interval_ms(String.t()) :: pos_integer()
   def min_interval_ms(event), do: Map.fetch!(@min_interval_ms, event)
+
+  @doc """
+  The `dispatch_reply` bucket: `capacity` replies back to back, refilled one per
+  `refill_interval_ms`. The channel enforces it and the export publishes it.
+  """
+  @spec dispatch_reply_burst() :: %{String.t() => pos_integer()}
+  def dispatch_reply_burst, do: @dispatch_reply_burst
+
+  @doc "The largest `seq` a trace event may carry."
+  @spec max_seq() :: pos_integer()
+  def max_seq, do: @max_seq
 
   @doc "The stable error `reason` codes, per runner-to-control event."
   @spec error_reasons() :: %{String.t() => [String.t()]}
@@ -502,9 +531,9 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   """
   @spec cast_dispatch_reply(term()) :: {:ok, map()} | {:error, term()}
   def cast_dispatch_reply(payload) do
-    with {:ok, cast} <- cast(payload, RunnerDispatchReply.schema()) do
-      reply = known_fields(cast, RunnerDispatchReply.schema())
-
+    with {:ok, cast} <- cast(payload, RunnerDispatchReply.schema()),
+         reply = known_fields(cast, RunnerDispatchReply.schema()),
+         :ok <- no_nul(reply) do
       case reply_shape_errors(reply) do
         [] -> {:ok, reply}
         errors -> {:error, {:invalid, errors}}
@@ -539,7 +568,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
          {:ok, cast} <- cast(payload, RunnerTraceBatch.schema()) do
       batch = known_fields(cast, RunnerTraceBatch.schema())
 
-      with :ok <- events_ok(batch) do
+      with :ok <- no_nul(batch),
+           :ok <- events_ok(batch) do
         {:ok, batch}
       end
     end
@@ -580,6 +610,26 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     end
   end
 
+  # Postgres refuses a NUL in `text` and in any jsonb string, and the error would escape the
+  # channel's handle_in on every resend of the same message. So a NUL anywhere a runner can
+  # put one — every string, and every key and value of a free-form `data` object, at any
+  # depth — is refused here, before anything is stored.
+  defp no_nul(value) do
+    if contains_nul?(value),
+      do: {:error, {:invalid, ["strings may not contain a NUL character"]}},
+      else: :ok
+  end
+
+  defp contains_nul?(value) when is_binary(value), do: String.contains?(value, <<0>>)
+  defp contains_nul?(value) when is_list(value), do: Enum.any?(value, &contains_nul?/1)
+
+  defp contains_nul?(%DateTime{}), do: false
+
+  defp contains_nul?(value) when is_map(value),
+    do: Enum.any?(value, fn {k, v} -> contains_nul?(k) or contains_nul?(v) end)
+
+  defp contains_nul?(_value), do: false
+
   # OpenApiSpex keeps undeclared keys on an object, at every depth. Drop them at every
   # depth too, so nothing the contract does not declare reaches Presence.
   # An object that declares no properties (`RunnerTraceEvent.data`) is free-form by design.
@@ -592,6 +642,15 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   defp known_fields(list, %Schema{type: :array, items: %Schema{} = items}) when is_list(list),
     do: Enum.map(list, &known_fields(&1, items))
+
+  # A UUID is compared and stored in ONE form. OpenApiSpex accepts either case, but Postgres
+  # reads a uuid back lowercase, so an uppercase id would never equal its own stored value.
+  defp known_fields(value, %Schema{type: :string, format: :uuid}) when is_binary(value) do
+    case Ecto.UUID.cast(value) do
+      {:ok, uuid} -> uuid
+      :error -> value
+    end
+  end
 
   defp known_fields(value, _schema), do: value
 
@@ -646,7 +705,9 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           "trace_max_events" => RunnerTraceBatch.max_events(),
           "trace_max_event_data_bytes" => RunnerTraceEvent.max_data_bytes(),
           "refusal_max_detail_length" => RunnerDispatchReply.max_detail_length(),
-          "min_interval_ms" => @min_interval_ms
+          "trace_max_seq" => @max_seq,
+          "min_interval_ms" => @min_interval_ms,
+          "dispatch_reply_burst" => @dispatch_reply_burst
         }
       },
       "$defs" => defs

@@ -42,7 +42,10 @@ defmodule Loopctl.Repo.Migrations.CreateRunnerTraceEvents do
 
     create index(:runner_trace_events, [:runner_dispatch_id])
 
-    create constraint(:runner_trace_events, :runner_trace_events_seq, check: "seq >= 0")
+    # Below bigint's maximum, so the contiguous-ack query's `seq + 1` can never overflow.
+    create constraint(:runner_trace_events, :runner_trace_events_seq,
+             check: "seq >= 0 AND seq < 9223372036854775807"
+           )
 
     enable_rls(:runner_trace_events)
   end
