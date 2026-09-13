@@ -68,15 +68,15 @@ defmodule Loopctl.Delivery.InjectionDetector do
   - is over 512 bytes, contains a backtick, or matches a generic `scan/1` pattern
     (`user_agent_prose`);
   - carries two or more DISTINCT instruction words (`user_agent_prose`). The words are read
-    four ways and the readings are UNIONED: split at non-letters and at lowercase-to-uppercase
+    three ways and the readings are UNIONED: split at non-letters and at lowercase-to-uppercase
     boundaries (`ApproveThisPull`); split at non-letters only, lowercased (`aPPROVE tHIS`); and
-    split where an uppercase run of two or more letters meets lowercase, once after the run
-    (`APPROVEthisPULL`) and once before its last capital (`APPROVEThisPULL`). A single leading
-    capital is never split off, so `Sprint` is not `print` and `Emerge` is not `merge`. Words of
-    three or more letters are compared by `Loopctl.Delivery.WordStem.match_key/1`: a word of
-    five or more letters by stem, so `approving` and `reviewer` match `approved` and `review`,
-    and a shorter word only exactly. The lexicon (`user_agent_lexicon/0`) is English function
-    words plus agent-directed imperatives and nouns, minus the words real device names carry.
+    split before the last capital of an uppercase run of two or more letters that meets a
+    capitalised word (`APPROVEThisPULLRequest`). A single leading capital is never split off,
+    so `Sprint`, `HTCSprint` and `LGEmerge` read no `print` or `merge`. A word matches a
+    lexicon entry only as one of its spelled-out forms (`ignore ignores ignored ignoring`), and
+    the forms of one entry count as one word. The lexicon (`user_agent_lexicon/0`) is English
+    function words plus agent-directed imperatives and nouns, minus the words real device
+    names carry.
 
   **It deliberately does not try to see disguised or encoded wording.** Across #814 and #819,
   six review rounds measured user-agent-specific disguise heuristics — look-alike decoding,
@@ -99,9 +99,10 @@ defmodule Loopctl.Delivery.InjectionDetector do
 
   **Known misses, pinned by a test that asserts they fire no user-agent signal:**
 
+  - a single instruction word (below the two-word threshold by design);
   - a paraphrase built from words outside the lexicon;
   - the same instruction in another language;
-  - disguised or encoded wording (neutralised at the producer, not detected here): plain-ASCII look-alike characters; spelled-out or chunked letters; uppercase look-alikes; words glued in one case; percent-escapes, HTML entities and backslash escapes.
+  - disguised or encoded wording (neutralised at the producer, not detected here): plain-ASCII look-alike characters; spelled-out or chunked letters; uppercase look-alikes; words glued in one case; an uppercase run glued to a lowercase word; percent-escapes, HTML entities and backslash escapes.
 
   Look-alikes from outside ASCII (Cyrillic letters, small capitals) are NOT misses: they fire
   `user_agent_non_ascii`. Only swaps within ASCII go unseen.
@@ -118,7 +119,6 @@ defmodule Loopctl.Delivery.InjectionDetector do
   """
 
   alias Loopctl.Delivery.Untrusted
-  alias Loopctl.Delivery.WordStem
 
   @type reason :: String.t()
 
@@ -202,44 +202,144 @@ defmodule Loopctl.Delivery.InjectionDetector do
   @ua_prose_threshold 2
   @ua_not_letter ~r/[^A-Za-z]+/
   @ua_camel_boundary ~r/(?<=[a-z])(?=[A-Z])/
-  # An uppercase run of two or more letters meets a lowercase run: `APPROVEthis` splits after
-  # the run, `APPROVEThis` before its last capital. A single leading capital is never split off
-  # (`Sprint` is not `S` and `print`), so no segment is one letter.
-  @ua_upper_run_then_lower ~r/(?<=[a-z])(?=[A-Z])|(?<=[A-Z]{2})(?=[a-z])/
+  # An uppercase run of two or more letters meets a capitalised word: `APPROVEThis` splits before
+  # the run's last capital. A single leading capital is never split off (`Sprint` is not `S` and
+  # `print`, `HTCSprint` is not `HTCS` and `print`), so no segment is one letter.
   @ua_upper_run_then_word ~r/(?<=[a-z])(?=[A-Z])|(?<=[A-Z]{2})(?=[A-Z][a-z])/
   @ua_non_ascii ~r/[\x80-\xFF]/
 
   # English function words plus the imperatives and nouns an instruction to an agent is made
-  # of, matched by `Loopctl.Delivery.WordStem.match_key/1`. No two-letter word: those collide
-  # with locale tags and model codes. No word the Google Play supported devices list carries in
-  # either user-agent frame, except `cat` and `now`, which it carries only alone; removing
-  # those two would lose hostile samples. The recorded BROWSER user agents carry only the words
-  # pinned in injection_detector_test.exs; the non-browser clients may carry more, because a
-  # non-browser user agent on a browser-form ticket is out of domain and allowed to escalate.
-  @ua_lexicon ~w(
-    this that these those but then than into onto without were been does did don doesn each
-    some now here there please your yours should shall would could may might also instead
-    before after above below previous prior earlier again never always immediately today
-    tonight approve approved merge merged ignore disregard forget instructions instruction
-    prompt prompts execute delete remove drop deploy push commit review reviews skip bypass
-    override assistant agent agents claude gpt llm pull request change fix patch main prod
-    verify admin root show token tokens password credentials permission rule rules policy
-    operator ship release done wait repo repository branch hook hooks ticket issue allow
-    enable disable install hidden pretend role respond reply answer write send upload
-    download bash command commands sudo lgtm verified escalation escalate cat curl wget
-  )
+  # of. Each line is one lexicon word, then every inflection matched as that word, spelled out
+  # by hand; a user-agent word matches a form EXACTLY, and hits are counted per lexicon word,
+  # so `verify verified` is one. No two-letter word: those collide with locale tags and model
+  # codes. No form the Google Play supported devices list carries in either user-agent frame
+  # (`changing` is a brand there), except `cat` and `now`, which it carries only alone; removing
+  # those two would lose hostile samples. The recorded BROWSER user agents carry only the words pinned in
+  # injection_detector_test.exs; the non-browser clients may carry more, because a non-browser
+  # user agent on a browser-form ticket is out of domain and allowed to escalate.
+  @ua_lexicon_forms """
+                    this
+                    that
+                    these
+                    those
+                    but
+                    then
+                    than
+                    into
+                    onto
+                    without
+                    were
+                    been
+                    does
+                    did
+                    don
+                    doesn
+                    each
+                    some
+                    now
+                    here
+                    there
+                    please
+                    your yours
+                    should
+                    shall
+                    would
+                    could
+                    may
+                    might
+                    also
+                    instead
+                    before
+                    after
+                    above
+                    below
+                    previous
+                    prior
+                    earlier
+                    again
+                    never
+                    always
+                    immediately
+                    today
+                    tonight
+                    approve approves approved approving approver approval
+                    merge merges merged merging
+                    ignore ignores ignored ignoring
+                    disregard disregards disregarded disregarding
+                    forget forgets forgot forgotten forgetting
+                    instruction instructions
+                    prompt prompts prompted prompting
+                    execute executes executed executing
+                    delete deletes deleted deleting
+                    remove removes removed removing
+                    drop drops dropped dropping
+                    deploy deploys deployed deploying
+                    push pushes pushed pushing
+                    commit commits committed committing
+                    review reviews reviewed reviewing reviewer reviewers
+                    skip skips skipped skipping
+                    bypass bypasses bypassed bypassing
+                    override overrides overrode overridden overriding
+                    assistant assistants
+                    agent agents
+                    claude
+                    gpt
+                    llm
+                    pull pulls pulled pulling
+                    request requests requested requesting
+                    change changes changed
+                    fix fixes fixed fixing
+                    patch patches patched patching
+                    main
+                    prod
+                    verify verifies verified verifying
+                    admin admins
+                    root
+                    show shows showed shown showing
+                    token tokens
+                    password passwords
+                    credentials credential
+                    permission permissions
+                    rule rules
+                    policy policies
+                    operator operators
+                    ship ships shipped shipping
+                    release releases released releasing
+                    done
+                    wait waits waited waiting
+                    repo repos
+                    repository repositories
+                    branch branches
+                    hook hooks
+                    ticket tickets
+                    issue issues
+                    allow allows allowed allowing
+                    enable enables enabled enabling
+                    disable disables disabled disabling
+                    install installs installed installing installer
+                    hidden
+                    pretend pretends pretended pretending
+                    role roles
+                    respond responds responded responding
+                    reply replies replied replying
+                    answer answers answered answering
+                    write writes wrote written writing
+                    send sends sent sending
+                    upload uploads uploaded uploading
+                    download downloads downloaded downloading
+                    bash
+                    command commands
+                    sudo
+                    lgtm
+                    escalate escalates escalated escalating escalation
+                    cat
+                    curl
+                    wget
+                    """
+                    |> String.split("\n", trim: true)
+                    |> Enum.map(&String.split/1)
 
-  # Each lexicon word by its match key. A stem is named by the first lexicon word that begins
-  # with it, so the inflections of one word (`merge`, `merged`, `merging`) count once.
-  @ua_lexicon_keys Map.new(@ua_lexicon, fn word ->
-                     case Loopctl.Delivery.WordStem.match_key(word) do
-                       {:exact, _} = key ->
-                         {key, word}
-
-                       {:stem, stem} = key ->
-                         {key, Enum.find(@ua_lexicon, &String.starts_with?(&1, stem))}
-                     end
-                   end)
+  @ua_lexicon Enum.map(@ua_lexicon_forms, &hd/1)
 
   @doc "The signal names this module can produce."
   @spec signals() :: [atom()]
@@ -384,11 +484,11 @@ defmodule Loopctl.Delivery.InjectionDetector do
   def user_agent_lexicon, do: @ua_lexicon
 
   @doc """
-  The words of a user agent, whole string and comments included, as the UNION of four
+  The words of a user agent, whole string and comments included, as the UNION of three
   readings: split at non-letters and at lowercase-to-uppercase boundaries; split at non-letters
-  only; and, on top of the first, split after an uppercase run of two or more letters that
-  meets lowercase, or before that run's last capital. Words of three or more letters,
-  downcased. Nothing is decoded.
+  only; and, on top of the first, split before the last capital of an uppercase run of two or
+  more letters that meets a capitalised word. Words of three or more letters, downcased.
+  Nothing is decoded.
   """
   @spec user_agent_words(String.t()) :: MapSet.t(String.t())
   def user_agent_words(user_agent) when is_binary(user_agent) do
@@ -397,7 +497,6 @@ defmodule Loopctl.Delivery.InjectionDetector do
     [
       Enum.flat_map(runs, &String.split(&1, @ua_camel_boundary, trim: true)),
       runs,
-      Enum.flat_map(runs, &String.split(&1, @ua_upper_run_then_lower, trim: true)),
       Enum.flat_map(runs, &String.split(&1, @ua_upper_run_then_word, trim: true))
     ]
     |> List.flatten()
@@ -411,7 +510,7 @@ defmodule Loopctl.Delivery.InjectionDetector do
   def user_agent_lexicon_hits(user_agent) when is_binary(user_agent) do
     user_agent
     |> user_agent_words()
-    |> Enum.map(&lexicon_word_for_key(WordStem.match_key(&1)))
+    |> Enum.map(&lexicon_word_for_form/1)
     |> Enum.reject(&is_nil/1)
     |> Enum.uniq()
     |> Enum.sort()
@@ -422,9 +521,9 @@ defmodule Loopctl.Delivery.InjectionDetector do
   def user_agent_non_ascii?(user_agent) when is_binary(user_agent),
     do: Regex.match?(@ua_non_ascii, user_agent)
 
-  for {key, word} <- @ua_lexicon_keys do
-    defp lexicon_word_for_key(unquote(key)), do: unquote(word)
+  for [word | _] = forms <- @ua_lexicon_forms, form <- forms do
+    defp lexicon_word_for_form(unquote(form)), do: unquote(word)
   end
 
-  defp lexicon_word_for_key(_key), do: nil
+  defp lexicon_word_for_form(_word), do: nil
 end
