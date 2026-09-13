@@ -66,8 +66,12 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   ## Trace
 
   The runner's on-disk NDJSON file is the source of truth. It ships events in batches of at
-  most `RunnerTraceBatch.max_events/0`, each with at most
-  `RunnerTraceEvent.max_data_bytes/0` of JSON `data`; the server stores `(run_id, seq)` once
+  most `RunnerTraceBatch.max_events/0` events and `RunnerTraceBatch.max_bytes/0` bytes, each
+  with at most `RunnerTraceEvent.max_data_bytes/0` of JSON `data`, both byte limits counted by
+  `json_bytes_upper_bound/1` (published as `x-connection.limits.trace_max_batch_bytes`). The
+  byte budget is what keeps a batch inside the socket's frame cap: a frame over it is closed
+  by the transport before loopctl sees it, so a runner must split by the budget, not by the
+  per-field character limits; the server stores `(run_id, seq)` once
   and replies `acked_seq`, the highest seq such that EVERY seq from 0 to it is stored. The
   runner resumes from `acked_seq + 1` — on a rejoin it asks `trace_cursor` first, because
   Phoenix replays nothing and a rejoin happens on every rolling deploy. The first batch of a
@@ -277,8 +281,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
             "dedups on the pair, and the runner resumes from that offset on rejoin. " <>
             "`parent` is REQUIRED on every event (null only for the root) so the agent " <>
             "tree can be rebuilt by query. `data` is at most #{@max_data_bytes} bytes of " <>
-            "JSON (refused with `event_data_too_large`); larger payloads belong in object " <>
-            "storage, referenced from `data`.",
+            "JSON, counted like the batch budget (refused with `event_data_too_large`); " <>
+            "larger payloads belong in object storage, referenced from `data`.",
         type: :object,
         required: [:run_id, :seq, :event_id, :parent, :ts, :type],
         properties: %{
@@ -346,21 +350,33 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     alias Loopctl.ApiSpec.RunnerContract.RunnerTraceEvent
 
     # Referenced by `maxItems` below and enforced by `RunnerContract.cast_trace_batch/1`.
-    # A worst-case batch (every string at its maxLength, `data` at its cap) stays well inside
-    # the runner socket's 64 KB frame cap; a test holds that.
     @max_events 20
+
+    # The byte budget of a whole batch, measured by `RunnerContract.json_bytes_upper_bound/1`
+    # (every character as the longest escape a JSON encoder may write). A string's maxLength
+    # counts CHARACTERS, and a control character escapes to six bytes, an astral one to
+    # twelve, so a batch inside every per-field limit could still exceed the runner socket's
+    # 64 KB frame, which Bandit closes before any of this code runs. This budget plus the
+    # V2 frame envelope stays under that cap; a test holds it for the worst case.
+    @max_bytes 60_000
 
     @doc "The most events one `trace` batch may carry."
     @spec max_events() :: pos_integer()
     def max_events, do: @max_events
+
+    @doc "The byte budget of one `trace` batch, as `RunnerContract.json_bytes_upper_bound/1` counts it."
+    @spec max_bytes() :: pos_integer()
+    def max_bytes, do: @max_bytes
 
     OpenApiSpex.schema(
       %{
         title: "RunnerTraceBatch",
         description:
           "A batch of one run's trace events, pushed as the `trace` event. Every event's " <>
-            "`run_id` must equal the batch's. At most #{@max_events} events (refused with " <>
-            "`batch_too_large`). The run must belong to an ACCEPTED dispatch this runner " <>
+            "`run_id` must equal the batch's. At most #{@max_events} events and at most " <>
+            "#{@max_bytes} bytes of JSON, counting every character at its longest escape " <>
+            "(control characters 6 bytes, other non-ASCII 6, astral 12); either excess is " <>
+            "refused with `batch_too_large`. The run must belong to an ACCEPTED dispatch this runner " <>
             "holds, at the dispatched `claim_epoch`; the first batch binds `run_id` to " <>
             "`dispatch_id`. Replied with `RunnerTraceAck`.",
         type: :object,
@@ -556,7 +572,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   @doc """
   Validates a `trace` batch. Returns the declared fields only, with atom keys, or
-  `{:error, reason}` where reason is `{:batch_too_large, max}`,
+  `{:error, reason}` where reason is `{:batch_too_large, max_events, max_bytes}`,
   `{:event_data_too_large, seq, max}` or `{:invalid, messages}`.
 
   The batch size is checked BEFORE the schema cast, so an oversize batch costs no per-event
@@ -575,12 +591,63 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     end
   end
 
-  defp batch_size_ok(%{"events" => events}) when is_list(events) do
-    max = RunnerTraceBatch.max_events()
-    if length(events) > max, do: {:error, {:batch_too_large, max}}, else: :ok
+  # Measured on the payload AS SENT, undeclared keys included, since those were in the frame.
+  defp batch_size_ok(payload) do
+    max_events = RunnerTraceBatch.max_events()
+    max_bytes = RunnerTraceBatch.max_bytes()
+
+    too_many? =
+      match?(%{"events" => events} when is_list(events) and length(events) > max_events, payload)
+
+    if too_many? or json_bytes_upper_bound(payload) > max_bytes,
+      do: {:error, {:batch_too_large, max_events, max_bytes}},
+      else: :ok
   end
 
-  defp batch_size_ok(_payload), do: :ok
+  @doc """
+  An upper bound on the bytes of `term` encoded as compact JSON by ANY standard encoder.
+
+  Every character is counted at the longest form an encoder may write it in: a control
+  character or a non-ASCII BMP character as a six-byte `\\uXXXX`, an astral character as a
+  twelve-byte surrogate pair, `"`, `\\` and `/` as two bytes, and printable ASCII as one.
+  Floats count as 24 bytes. It is what the `trace` byte budget and the per-event `data` cap
+  are measured with, so a runner that splits its batches by the same rule can never send a
+  frame the socket closes.
+  """
+  @spec json_bytes_upper_bound(term()) :: non_neg_integer()
+  def json_bytes_upper_bound(term) when is_binary(term), do: 2 + string_bytes(term, 0)
+  def json_bytes_upper_bound(term) when is_integer(term), do: byte_size(Integer.to_string(term))
+  def json_bytes_upper_bound(term) when is_float(term), do: 24
+  def json_bytes_upper_bound(term) when term in [true, false, nil], do: 5
+
+  def json_bytes_upper_bound(term) when is_atom(term),
+    do: json_bytes_upper_bound(Atom.to_string(term))
+
+  def json_bytes_upper_bound(term) when is_list(term),
+    do: 2 + separators(length(term)) + Enum.sum_by(term, &json_bytes_upper_bound/1)
+
+  def json_bytes_upper_bound(term) when is_map(term) do
+    2 + separators(map_size(term)) +
+      Enum.sum_by(term, fn {k, v} -> json_bytes_upper_bound(k) + 1 + json_bytes_upper_bound(v) end)
+  end
+
+  defp separators(0), do: 0
+  defp separators(n), do: n - 1
+
+  defp string_bytes(<<>>, acc), do: acc
+
+  defp string_bytes(<<c::utf8, rest::binary>>, acc) when c in [?", ?\\, ?/],
+    do: string_bytes(rest, acc + 2)
+
+  defp string_bytes(<<c::utf8, rest::binary>>, acc) when c < 0x20, do: string_bytes(rest, acc + 6)
+  defp string_bytes(<<c::utf8, rest::binary>>, acc) when c < 0x7F, do: string_bytes(rest, acc + 1)
+
+  defp string_bytes(<<c::utf8, rest::binary>>, acc) when c < 0x10000,
+    do: string_bytes(rest, acc + 6)
+
+  defp string_bytes(<<_c::utf8, rest::binary>>, acc), do: string_bytes(rest, acc + 12)
+  # Not valid UTF-8 (the socket's JSON decoder refuses it first); count a byte at its escape.
+  defp string_bytes(<<_byte, rest::binary>>, acc), do: string_bytes(rest, acc + 6)
 
   defp events_ok(%{run_id: run_id, events: events}) do
     max = RunnerTraceEvent.max_data_bytes()
@@ -593,7 +660,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
         event.seq > @max_seq ->
           {:halt, {:error, {:invalid, ["event seq #{event.seq} exceeds #{@max_seq}"]}}}
 
-        byte_size(Jason.encode!(Map.get(event, :data, %{}))) > max ->
+        json_bytes_upper_bound(Map.get(event, :data, %{})) > max ->
           {:halt, {:error, {:event_data_too_large, event.seq, max}}}
 
         true ->
@@ -704,6 +771,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
         "limits" => %{
           "trace_max_events" => RunnerTraceBatch.max_events(),
           "trace_max_event_data_bytes" => RunnerTraceEvent.max_data_bytes(),
+          "trace_max_batch_bytes" => RunnerTraceBatch.max_bytes(),
           "refusal_max_detail_length" => RunnerDispatchReply.max_detail_length(),
           "trace_max_seq" => @max_seq,
           "min_interval_ms" => @min_interval_ms,

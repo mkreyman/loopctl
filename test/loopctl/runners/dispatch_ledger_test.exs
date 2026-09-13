@@ -503,8 +503,14 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
         )
 
       # Built past the contract cast, which refuses these first: the backstop is what is tested.
-      nul_data = update_in(batch, [:events, Access.at(0)], &Map.put(&1, :data, %{"k" => <<0>>}))
-      nul_text = update_in(batch, [:events, Access.at(0)], &Map.put(&1, :type, "a" <> <<0>>))
+      nul_data =
+        update_in(
+          batch,
+          [:events, Access.at(0)],
+          &Map.put(&1, :data, %{"k" => "SECRET" <> <<0>>})
+        )
+
+      nul_text = update_in(batch, [:events, Access.at(0)], &Map.put(&1, :type, "SECRET" <> <<0>>))
 
       past_bound =
         update_in(batch, [:events, Access.at(0)], &Map.put(&1, :seq, 9_223_372_036_854_775_807))
@@ -523,13 +529,85 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
         claim_epoch: pending.claim_epoch,
         decision: "refused",
         reason: "other",
-        detail: "a" <> <<0>>
+        detail: "SECRET" <> <<0>>
       }
 
       assert {:error, :rejected_by_database} =
                DispatchLedger.record_reply(runner.tenant_id, runner.id, reply)
 
       assert DispatchLedger.get_record(runner.tenant_id, pending.dispatch_id).status == "sent"
+    end
+
+    test "a rejection is logged and counted with identifiers and SQLSTATE, never the value",
+         %{runner: runner} do
+      record = accepted(runner)
+      run_id = Ecto.UUID.generate()
+      handler = "ledger-rejected-#{System.unique_integer([:positive])}"
+      test_pid = self()
+
+      :telemetry.attach(
+        handler,
+        [:loopctl, :runners, :ledger_rejected_by_database],
+        fn _event, measurements, metadata, _ ->
+          send(test_pid, {:rejected, measurements, metadata})
+        end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler) end)
+
+      {:ok, batch} =
+        RunnerContract.cast_trace_batch(
+          build(:runner_trace_batch, %{
+            :seqs => [0],
+            "run_id" => run_id,
+            "dispatch_id" => record.dispatch_id,
+            "claim_epoch" => record.claim_epoch
+          })
+        )
+
+      bad = update_in(batch, [:events, Access.at(0)], &Map.put(&1, :type, "SECRET" <> <<0>>))
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:error, :rejected_by_database} =
+                   DispatchLedger.record_trace(runner.tenant_id, runner.id, bad)
+        end)
+
+      assert_received {:rejected, %{count: 1}, metadata}
+      assert metadata.operation == :record_trace
+      assert metadata.tenant_id == runner.tenant_id
+      assert metadata.runner_id == runner.id
+      assert metadata.dispatch_id == record.dispatch_id
+      assert metadata.run_id == run_id
+      assert "22" <> _ = metadata.sqlstate
+
+      for fragment <- [
+            "rejected by the database",
+            "operation=record_trace",
+            "sqlstate=#{metadata.sqlstate}",
+            runner.tenant_id,
+            runner.id,
+            record.dispatch_id,
+            run_id
+          ] do
+        assert log =~ fragment
+      end
+
+      refute log =~ "SECRET"
+      refute inspect(metadata) =~ "SECRET"
+    end
+
+    test "record_sent/3 is not a runner write: a database error there raises", %{runner: runner} do
+      {:ok, dispatch} = RunnerContract.cast_dispatch(build(:runner_dispatch))
+
+      # Server-side input the contract cannot produce; Postgres refuses the NUL in `kind`.
+      assert_raise Postgrex.Error, fn ->
+        DispatchLedger.record_sent(runner.tenant_id, runner.id, %{
+          dispatch
+          | kind: "implement" <> <<0>>
+        })
+      end
     end
   end
 

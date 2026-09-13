@@ -651,6 +651,35 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       assert_reply ref, :error, %{reason: "run_mismatch"}, @reply_timeout
     end
 
+    test "a batch within the event count but over the byte budget is batch_too_large, and the channel carries on",
+         %{channel: channel, dispatch: dispatch, run_id: run_id} do
+      max_bytes = RunnerTraceBatch.max_bytes()
+      astral = <<0x1F600::utf8>>
+
+      # Every string at its character limit in 12-byte-escaped characters: about 5 KB an
+      # event, so the byte budget binds long before the event count does.
+      heavy =
+        update_in(
+          batch(dispatch, run_id, Enum.to_list(0..(RunnerTraceBatch.max_events() - 1))),
+          ["events", Access.all()],
+          &Map.merge(&1, %{
+            "event_id" => String.duplicate(astral, 128),
+            "parent" => String.duplicate(astral, 128),
+            "type" => String.duplicate(astral, 64)
+          })
+        )
+
+      ref = send_trace(channel, heavy)
+
+      assert_reply ref,
+                   :error,
+                   %{reason: "batch_too_large", max_bytes: ^max_bytes},
+                   @reply_timeout
+
+      ref = send_trace(channel, batch(dispatch, run_id, [0]))
+      assert_reply ref, :ok, %{acked_seq: 0}, @reply_timeout
+    end
+
     test "an oversize batch and an oversize event are refused with their limits",
          %{channel: channel, dispatch: dispatch, run_id: run_id} do
       max_events = RunnerTraceBatch.max_events()
@@ -828,19 +857,23 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       end
     end
 
-    test "the export publishes the dispatch_reply burst, and the channel enforces exactly it",
+    test "the export publishes the dispatch_reply burst, and the channel wires exactly it",
          %{runner: runner, channel: channel, dispatch: dispatch} do
+      # The refill arithmetic is LoopctlWeb.RunnerChannel.ReplyBucketTest's, at fixed times.
+      # Here only what does not depend on how long the round trips take: the channel's bucket
+      # starts at the published capacity, a drained bucket refuses with the published
+      # refill interval, and one published interval later it admits again.
       published = RunnerContract.json_schema()["x-connection"]["limits"]["dispatch_reply_burst"]
       assert published == RunnerContract.dispatch_reply_burst()
       %{"capacity" => capacity, "refill_interval_ms" => refill} = published
 
-      # `capacity` replies back to back are applied (identical repeats are ok)...
-      for _ <- 1..capacity do
-        ref = push(channel, "dispatch_reply", accept(dispatch))
-        assert_reply ref, :ok, _, @reply_timeout
-      end
+      ref = push(channel, "dispatch_reply", accept(dispatch))
+      assert_reply ref, :ok, _, @reply_timeout
+      # From `:full`, one reply leaves capacity - 1 whenever it lands.
+      assert {left, _} = :sys.get_state(channel.channel_pid).assigns.reply_bucket
+      assert left == capacity - 1
 
-      # ...and the next one is refused with the published refill interval.
+      drain_reply_bucket(channel)
       ref = push(channel, "dispatch_reply", accept(dispatch))
 
       assert_reply ref,
@@ -848,7 +881,6 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
                    %{reason: "rate_limited", min_interval_ms: ^refill},
                    @reply_timeout
 
-      # One refill later, exactly, a reply is admitted again.
       :sys.replace_state(channel.channel_pid, fn socket ->
         at = System.monotonic_time(:millisecond) - refill - 1
         %{socket | assigns: Map.put(socket.assigns, :reply_bucket, {0, at})}

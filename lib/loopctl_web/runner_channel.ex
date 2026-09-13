@@ -66,6 +66,7 @@ defmodule LoopctlWeb.RunnerChannel do
   alias Loopctl.Runners
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Runners.Presence
+  alias LoopctlWeb.RunnerChannel.ReplyBucket
   alias LoopctlWeb.RunnerSocket
 
   @recheck_interval_ms 30_000
@@ -206,7 +207,8 @@ defmodule LoopctlWeb.RunnerChannel do
     %{runner: runner, tenant_id: tenant_id} = socket.assigns
 
     with {:ok, reply} <- RunnerContract.cast_dispatch_reply(payload),
-         {:ok, bucket} <- take_reply_token(socket.assigns.reply_bucket, now) do
+         {:ok, bucket} <-
+           ReplyBucket.take(socket.assigns.reply_bucket, now, @reply_capacity, @reply_refill_ms) do
       socket = assign(socket, :reply_bucket, bucket)
 
       case DispatchLedger.record_reply(tenant_id, runner.id, reply) do
@@ -293,21 +295,6 @@ defmodule LoopctlWeb.RunnerChannel do
   defp interval_ok(last, now, min_ms) when now - last >= min_ms, do: :ok
   defp interval_ok(_last, _now, _min_ms), do: {:error, :rate_limited}
 
-  # The `dispatch_reply` bucket, `{tokens, refilled_at}`: `@reply_capacity` replies back to
-  # back, one more earned every `@reply_refill_ms`. A fresh channel starts `:full`.
-  defp take_reply_token(:full, now), do: {:ok, {@reply_capacity - 1, now}}
-
-  defp take_reply_token({tokens, refilled_at}, now) do
-    earned = div(now - refilled_at, @reply_refill_ms)
-
-    {tokens, refilled_at} =
-      if tokens + earned >= @reply_capacity,
-        do: {@reply_capacity, now},
-        else: {tokens + max(earned, 0), refilled_at + max(earned, 0) * @reply_refill_ms}
-
-    if tokens >= 1, do: {:ok, {tokens - 1, refilled_at}}, else: {:error, :rate_limited}
-  end
-
   defp presence_meta(meta, runner), do: Map.put(meta, :runner_id, runner.id)
 
   # This socket is tracked, and its meta is the only one in the tenant's pool holding the
@@ -357,7 +344,8 @@ defmodule LoopctlWeb.RunnerChannel do
     do: %{reason: "machine_mismatch", declared: declared}
 
   # The stable codes of `RunnerContract.error_reasons/0`.
-  defp message_error({:batch_too_large, max}), do: %{reason: "batch_too_large", max_events: max}
+  defp message_error({:batch_too_large, max_events, max_bytes}),
+    do: %{reason: "batch_too_large", max_events: max_events, max_bytes: max_bytes}
 
   defp message_error({:event_data_too_large, seq, max}),
     do: %{reason: "event_data_too_large", seq: seq, max_data_bytes: max}

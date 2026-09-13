@@ -308,7 +308,7 @@
       "type": "object"
     },
     "RunnerTraceBatch": {
-      "description": "A batch of one run's trace events, pushed as the `trace` event. Every event's `run_id` must equal the batch's. At most 20 events (refused with `batch_too_large`). The run must belong to an ACCEPTED dispatch this runner holds, at the dispatched `claim_epoch`; the first batch binds `run_id` to `dispatch_id`. Replied with `RunnerTraceAck`.",
+      "description": "A batch of one run's trace events, pushed as the `trace` event. Every event's `run_id` must equal the batch's. At most 20 events and at most 60000 bytes of JSON, counting every character at its longest escape (control characters 6 bytes, other non-ASCII 6, astral 12); either excess is refused with `batch_too_large`. The run must belong to an ACCEPTED dispatch this runner holds, at the dispatched `claim_epoch`; the first batch binds `run_id` to `dispatch_id`. Replied with `RunnerTraceAck`.",
       "properties": {
         "claim_epoch": {
           "minimum": 0,
@@ -320,7 +320,7 @@
         },
         "events": {
           "items": {
-            "description": "One line of a run's NDJSON trace. The on-disk file is the source of truth: the runner ships `(run_id, seq)`, the server ACKs the last contiguous seq and dedups on the pair, and the runner resumes from that offset on rejoin. `parent` is REQUIRED on every event (null only for the root) so the agent tree can be rebuilt by query. `data` is at most 2048 bytes of JSON (refused with `event_data_too_large`); larger payloads belong in object storage, referenced from `data`.",
+            "description": "One line of a run's NDJSON trace. The on-disk file is the source of truth: the runner ships `(run_id, seq)`, the server ACKs the last contiguous seq and dedups on the pair, and the runner resumes from that offset on rejoin. `parent` is REQUIRED on every event (null only for the root) so the agent tree can be rebuilt by query. `data` is at most 2048 bytes of JSON, counted like the batch budget (refused with `event_data_too_large`); larger payloads belong in object storage, referenced from `data`.",
             "properties": {
               "data": {
                 "additionalProperties": true,
@@ -397,7 +397,7 @@
       "type": "object"
     },
     "RunnerTraceEvent": {
-      "description": "One line of a run's NDJSON trace. The on-disk file is the source of truth: the runner ships `(run_id, seq)`, the server ACKs the last contiguous seq and dedups on the pair, and the runner resumes from that offset on rejoin. `parent` is REQUIRED on every event (null only for the root) so the agent tree can be rebuilt by query. `data` is at most 2048 bytes of JSON (refused with `event_data_too_large`); larger payloads belong in object storage, referenced from `data`.",
+      "description": "One line of a run's NDJSON trace. The on-disk file is the source of truth: the runner ships `(run_id, seq)`, the server ACKs the last contiguous seq and dedups on the pair, and the runner resumes from that offset on rejoin. `parent` is REQUIRED on every event (null only for the root) so the agent tree can be rebuilt by query. `data` is at most 2048 bytes of JSON, counted like the batch budget (refused with `event_data_too_large`); larger payloads belong in object storage, referenced from `data`.",
       "properties": {
         "data": {
           "additionalProperties": true,
@@ -497,6 +497,7 @@
         "trace_cursor": 50
       },
       "refusal_max_detail_length": 500,
+      "trace_max_batch_bytes": 60000,
       "trace_max_event_data_bytes": 2048,
       "trace_max_events": 20,
       "trace_max_seq": 9223372036854775806

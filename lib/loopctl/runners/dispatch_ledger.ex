@@ -30,6 +30,11 @@ defmodule Loopctl.Runners.DispatchLedger do
   `trace_acked_seq` is advanced in SQL to the end of the contiguous run of stored seqs that
   starts at 0 — never by loading the run's rows. `trace_cursor/3` reads it back.
 
+  A reply or trace value Postgres still refuses after the contract cast is answered
+  `{:error, :rejected_by_database}`, logged with its SQLSTATE and identifiers (never its
+  values) and counted as the `[:loopctl, :runners, :ledger_rejected_by_database]` telemetry
+  event.
+
   Neither replies nor trace are refused on a custody halt: a halt stops new custody
   progress, and a halted tenant must still be able to record what already happened.
 
@@ -45,6 +50,8 @@ defmodule Loopctl.Runners.DispatchLedger do
   """
 
   import Ecto.Query
+
+  require Logger
 
   alias Loopctl.Repo
   alias Loopctl.Runners.DispatchRecord
@@ -120,7 +127,9 @@ defmodule Loopctl.Runners.DispatchLedger do
           | {:error,
              :unknown_dispatch | :stale_claim_epoch | :already_replied | :rejected_by_database}
   def record_reply(tenant_id, runner_id, reply) do
-    in_tenant(tenant_id, fn ->
+    context = %{operation: :record_reply, dispatch_id: reply.dispatch_id, run_id: nil}
+
+    runner_write(tenant_id, runner_id, context, fn ->
       with {:ok, record} <- lock_held(tenant_id, runner_id, reply.dispatch_id),
            :ok <- epoch_matches(record, reply.claim_epoch),
            {:ok, record} <- apply_reply(record, reply) do
@@ -162,7 +171,9 @@ defmodule Loopctl.Runners.DispatchLedger do
              | :run_mismatch
              | :rejected_by_database}
   def record_trace(tenant_id, runner_id, batch) do
-    in_tenant(tenant_id, fn ->
+    context = %{operation: :record_trace, dispatch_id: batch.dispatch_id, run_id: batch.run_id}
+
+    runner_write(tenant_id, runner_id, context, fn ->
       with {:ok, record} <- lock_held(tenant_id, runner_id, batch.dispatch_id),
            :ok <- epoch_matches(record, batch.claim_epoch),
            :ok <- accepted(record),
@@ -194,21 +205,29 @@ defmodule Loopctl.Runners.DispatchLedger do
     acked || -1
   end
 
-  # The one way this module reaches the database: an RLS transaction it owns.
-  #
-  # A runner-supplied value Postgres refuses as data comes back as
-  # `{:error, :rejected_by_database}` rather than a raise. That covers SQLSTATE class 22 (a
-  # NUL in text or jsonb, a number out of range) and a CHECK violation (a `seq` past its
-  # bound). Raised inside the channel's handle_in it would crash the channel, the runner
-  # would resend the same message on rejoin, and the loop would never end. The contract cast
-  # refuses the known cases first; this is the backstop. Any other database error raises.
-  defp in_tenant(tenant_id, fun) do
-    Repo.with_tenant(tenant_id, fun)
+  # The one way this module reaches the database: an RLS transaction it owns. A database
+  # error raises: `record_sent/3` and the reads are given server-side values, so an error
+  # there is a server bug.
+  defp in_tenant(tenant_id, fun), do: Repo.with_tenant(tenant_id, fun)
+
+  # `in_tenant/2` for a write of RUNNER-SUPPLIED values (`record_reply/3`, `record_trace/3`)
+  # and only those. A value Postgres refuses as data comes back as
+  # `{:error, :rejected_by_database}` rather than a raise: SQLSTATE class 22 (a NUL in text
+  # or jsonb, a number out of range) and the `runner_trace_events_seq` CHECK. Raised inside
+  # the channel's handle_in it would crash the channel, the runner would resend the same
+  # message on rejoin, and the loop would never end. The contract cast refuses the known
+  # cases first; this is the backstop, so reaching it is logged and counted — a run whose
+  # `acked_seq` stops advancing must leave an operator a signal. Any other error raises.
+  defp runner_write(tenant_id, runner_id, context, fun) do
+    in_tenant(tenant_id, fun)
   rescue
     error in Postgrex.Error ->
-      if data_exception?(error),
-        do: {:error, :rejected_by_database},
-        else: reraise(error, __STACKTRACE__)
+      if data_exception?(error) do
+        report_rejection(error, tenant_id, runner_id, context)
+        {:error, :rejected_by_database}
+      else
+        reraise(error, __STACKTRACE__)
+      end
   end
 
   defp data_exception?(%Postgrex.Error{postgres: %{pg_code: "22" <> _}}), do: true
@@ -217,6 +236,29 @@ defmodule Loopctl.Runners.DispatchLedger do
     do: true
 
   defp data_exception?(_error), do: false
+
+  # Identifiers and the SQLSTATE only. Never the error's message or detail, which can quote
+  # the refused value, and never the payload.
+  defp report_rejection(%Postgrex.Error{postgres: postgres}, tenant_id, runner_id, context) do
+    metadata = %{
+      operation: context.operation,
+      sqlstate: postgres[:pg_code],
+      constraint: postgres[:constraint],
+      tenant_id: tenant_id,
+      runner_id: runner_id,
+      dispatch_id: context.dispatch_id,
+      run_id: context.run_id
+    }
+
+    Logger.warning(
+      "runner ledger write rejected by the database: operation=#{metadata.operation} " <>
+        "sqlstate=#{metadata.sqlstate} constraint=#{inspect(metadata.constraint)} " <>
+        "tenant_id=#{tenant_id} runner_id=#{runner_id} dispatch_id=#{metadata.dispatch_id} " <>
+        "run_id=#{inspect(metadata.run_id)}"
+    )
+
+    :telemetry.execute([:loopctl, :runners, :ledger_rejected_by_database], %{count: 1}, metadata)
+  end
 
   # The ownership predicate: tenant AND runner. A row another runner holds is refused
   # exactly like a row that does not exist.

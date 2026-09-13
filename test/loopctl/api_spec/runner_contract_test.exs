@@ -65,6 +65,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       assert connection["errors"] == RunnerContract.error_reasons()
 
       assert connection["limits"]["trace_max_events"] == RunnerTraceBatch.max_events()
+      assert connection["limits"]["trace_max_batch_bytes"] == RunnerTraceBatch.max_bytes()
       assert connection["limits"]["dispatch_reply_burst"] == RunnerContract.dispatch_reply_burst()
 
       assert connection["limits"]["min_interval_ms"] ==
@@ -89,47 +90,86 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       end
     end
 
-    test "a worst-case trace batch fits inside the runner socket's frame cap" do
+    test "no batch the cast admits can exceed the runner socket's frame cap, whatever it escapes to" do
       {_path, _socket, opts} =
         Enum.find(LoopctlWeb.Endpoint.__sockets__(), &match?({"/runner/socket", _, _}, &1))
 
       frame_cap = opts |> Keyword.fetch!(:websocket) |> Keyword.fetch!(:max_frame_size)
-      run_id = Ecto.UUID.generate()
-      data_bytes = RunnerTraceEvent.max_data_bytes()
-      # {"k":"<padding>"} is 8 bytes of framing around the padding.
-      data = %{"k" => String.duplicate("x", data_bytes - 8)}
-      assert byte_size(Jason.encode!(data)) == data_bytes
+      max_bytes = RunnerTraceBatch.max_bytes()
 
-      event = %{
-        "run_id" => run_id,
-        "seq" => RunnerContract.max_seq(),
-        "event_id" => String.duplicate("e", 128),
-        "parent" => String.duplicate("p", 128),
-        "ts" => "2026-09-12T20:36:46.485123+00:00",
-        "type" => String.duplicate("t", 64),
-        "data" => data
-      }
+      # The costliest characters a runner can send: a control character escapes to six bytes,
+      # a non-ASCII BMP character to six under a \\u-escaping encoder, an astral one (4 bytes
+      # of UTF-8) to a twelve-byte surrogate pair. Every string at its maxLength in each.
+      costly = [<<1>>, <<0xE9::utf8>>, <<0x1F600::utf8>>, "x"]
 
-      batch = %{
-        "run_id" => run_id,
-        "dispatch_id" => Ecto.UUID.generate(),
-        "claim_epoch" => 9_223_372_036_854_775_807,
-        "events" => List.duplicate(event, RunnerTraceBatch.max_events())
-      }
+      batches =
+        for char <- costly, count <- [1, 5, 10, RunnerTraceBatch.max_events()] do
+          run_id = Ecto.UUID.generate()
+          fill = fn n -> String.duplicate(char, n) end
+          data_chars = div(RunnerTraceEvent.max_data_bytes() - 8, 12)
 
-      assert {:ok, _} = RunnerContract.cast_trace_batch(batch)
+          events =
+            for seq <- 1..count do
+              %{
+                "run_id" => run_id,
+                "seq" => RunnerContract.max_seq() - seq,
+                "event_id" => fill.(128),
+                "parent" => fill.(128),
+                "ts" => "2026-09-12T20:36:46.485123+00:00",
+                "type" => fill.(64),
+                "data" => %{"k" => String.duplicate(<<0x1F600::utf8>>, data_chars)}
+              }
+            end
 
-      # The V2 serializer's frame: [join_ref, ref, topic, event, payload].
-      frame =
-        Jason.encode!([
-          "1",
-          "999999",
-          "runner:" <> Ecto.UUID.generate(),
-          "trace",
-          batch
-        ])
+          %{
+            "run_id" => run_id,
+            "dispatch_id" => Ecto.UUID.generate(),
+            "claim_epoch" => 9_223_372_036_854_775_807,
+            "events" => events
+          }
+        end
 
-      assert byte_size(frame) < frame_cap
+      outcomes =
+        for batch <- batches do
+          # The bound really is an upper bound for both escaping styles.
+          bound = RunnerContract.json_bytes_upper_bound(batch)
+          assert bound >= byte_size(Jason.encode!(batch))
+          assert bound >= byte_size(Jason.encode!(batch, escape: :unicode_safe))
+
+          case RunnerContract.cast_trace_batch(batch) do
+            {:ok, _} ->
+              # The V2 serializer's frame, [join_ref, ref, topic, event, payload], escaped the
+              # costliest way an encoder may.
+              frame = [
+                "4294967295",
+                "4294967295",
+                "runner:" <> Ecto.UUID.generate(),
+                "trace",
+                batch
+              ]
+
+              assert byte_size(Jason.encode!(frame, escape: :unicode_safe)) < frame_cap
+              :ok
+
+            {:error, {:batch_too_large, _max_events, ^max_bytes}} ->
+              assert bound > max_bytes
+              :refused
+          end
+        end
+
+      # Both branches ran, so neither assertion above is vacuous.
+      assert :ok in outcomes
+      assert :refused in outcomes
+    end
+
+    test "the byte bound counts every escape at its longest" do
+      assert RunnerContract.json_bytes_upper_bound("") == 2
+      assert RunnerContract.json_bytes_upper_bound("ab") == 4
+      assert RunnerContract.json_bytes_upper_bound(<<1>>) == 8
+      assert RunnerContract.json_bytes_upper_bound(<<0xE9::utf8>>) == 8
+      assert RunnerContract.json_bytes_upper_bound(<<0x1F600::utf8>>) == 14
+      assert RunnerContract.json_bytes_upper_bound(~s(a"b\\c/)) == 11
+      assert RunnerContract.json_bytes_upper_bound(%{"k" => [1, true, nil]}) == 21
     end
   end
 
@@ -388,7 +428,9 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
                )
 
       oversize = build(:runner_trace_batch, %{seqs: Enum.to_list(0..max)})
-      assert {:error, {:batch_too_large, ^max}} = RunnerContract.cast_trace_batch(oversize)
+
+      assert {:error, {:batch_too_large, ^max, _max_bytes}} =
+               RunnerContract.cast_trace_batch(oversize)
     end
 
     test "refuses an event whose data exceeds max_data_bytes, naming its seq" do
