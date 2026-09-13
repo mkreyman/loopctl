@@ -494,8 +494,7 @@ defmodule Loopctl.AuditChain.SthEnqueuerTest do
       # Then the table is updated to the survivor, as the name server's cast would.
       survivor = spawn(fn -> Process.sleep(:infinity) end)
       on_exit(fn -> Process.exit(survivor, :kill) end)
-      :global.unregister_name(key)
-      :yes = :global.register_name(key, survivor)
+      :yes = :global.re_register_name(key, survivor)
 
       assert eventually(fn -> monitors?(loser, survivor) end)
       assert :sys.get_state(loser).role == :standby
@@ -538,8 +537,7 @@ defmodule Loopctl.AuditChain.SthEnqueuerTest do
 
       survivor = spawn(fn -> Process.sleep(:infinity) end)
       on_exit(fn -> Process.exit(survivor, :kill) end)
-      :global.unregister_name(key)
-      :yes = :global.register_name(key, survivor)
+      :yes = :global.re_register_name(key, survivor)
 
       assert eventually(fn -> :sys.get_state(loser).role == :standby end, 200, 25)
       refute loser in subscribers(topic)
@@ -574,8 +572,7 @@ defmodule Loopctl.AuditChain.SthEnqueuerTest do
 
       survivor = spawn(fn -> Process.sleep(:infinity) end)
       on_exit(fn -> Process.exit(survivor, :kill) end)
-      :global.unregister_name(key)
-      :yes = :global.register_name(key, survivor)
+      :yes = :global.re_register_name(key, survivor)
 
       assert eventually(fn -> monitors?(loser, survivor) end)
       # Let any stray retry chain run out before counting.
@@ -613,8 +610,7 @@ defmodule Loopctl.AuditChain.SthEnqueuerTest do
       assert :sys.get_state(standby).role == :standby
       assert monitors?(standby, first)
 
-      :global.unregister_name(key)
-      :yes = :global.register_name(key, second)
+      :yes = :global.re_register_name(key, second)
 
       assert eventually(fn -> monitors?(standby, second) end, 200, 25)
       refute monitors?(standby, first)

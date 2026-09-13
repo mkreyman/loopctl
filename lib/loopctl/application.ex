@@ -262,9 +262,9 @@ defmodule Loopctl.Application do
     # peers (EXPECTED_APP_NODES > 1) but Node.list/0 is empty, WARN that this node is
     # running un-clustered (node-local PubSub) so a machine-count bump can't silently
     # run un-clustered. WARN + runbook, NEVER a crash — a single node always boots.
-    # Prod only, rescue-wrapped, mirroring DbCapacity.warn_if_over_budget/0.
-    # Off the boot path: it may make a (bounded) DNS lookup, and a boot check must not wait
-    # on a resolver.
+    # Prod only, rescue-wrapped (the whole of warn_if_expected_peers_missing/0 logs "boot
+    # check skipped" on a raise), mirroring DbCapacity.warn_if_over_budget/0. Off the boot
+    # path: it may make a (bounded) DNS lookup, and a boot check must not wait on a resolver.
     if Application.get_env(:loopctl, :env) == :prod do
       Task.Supervisor.start_child(
         Loopctl.TaskSupervisor,

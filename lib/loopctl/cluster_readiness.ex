@@ -353,6 +353,8 @@ defmodule Loopctl.ClusterReadiness do
       may_suspend?,
       evidence(expected, peers, dns?, may_suspend?)
     )
+  rescue
+    e -> Logger.warning("ClusterReadiness boot check skipped: #{Exception.message(e)}")
   end
 
   @doc """
@@ -426,10 +428,11 @@ defmodule Loopctl.ClusterReadiness do
 
   ## Boot-time transient (why a lone WARN is not proof of a broken cluster)
 
-  This is sampled ONCE, synchronously, at the end of `Application.start/2`.
-  `DNSCluster` discovers and connects peers a few seconds LATER (its periodic DNS
-  poll), so on a genuinely-healthy multi-node deploy `Node.list/0` can still be empty
-  at this instant and this WARN can fire transiently during the startup window before
+  At boot this is sampled ONCE, from a task `Loopctl.Application` starts under
+  `Loopctl.TaskSupervisor` right after the supervision tree is up (off the boot path, since
+  it may make a bounded DNS lookup). `DNSCluster` discovers and connects peers a few
+  seconds LATER (its periodic DNS poll), so on a genuinely-healthy multi-node deploy
+  `Node.list/0` can still be empty at that instant and this WARN can fire transiently during the startup window before
   peers connect. The reliable STEADY-STATE signal is the 10s-polled
   `loopctl.cluster.peers.count{status}` gauge (and `readiness/0`), NOT this
   point-in-time boot line — see the runbook. A persistent `:expected_peers_missing`
