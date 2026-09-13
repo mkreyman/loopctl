@@ -26,6 +26,9 @@ defmodule Loopctl.Application do
     # write it observes.
     IngestionWriteStats.attach()
 
+    # Issue #815: a stopping node tells its runners why their sockets close.
+    LoopctlWeb.RunnerShutdownNotice.attach()
+
     # See https://hexdocs.pm/elixir/Supervisor.html
     # for other strategies and supported options
     opts = [strategy: :one_for_one, name: Loopctl.Supervisor]

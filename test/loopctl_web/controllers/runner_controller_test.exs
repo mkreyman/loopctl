@@ -194,7 +194,7 @@ defmodule LoopctlWeb.RunnerControllerTest do
         free_disk_mb: 400_000
       }
 
-      track_runner(runner, %{sample: sample})
+      track_runner(runner, %{sample: sample, node: "loopctl@10.0.0.7", machine_id: "d8d9e2a1"})
 
       assert %{"runners" => [entry]} =
                conn
@@ -210,6 +210,8 @@ defmodule LoopctlWeb.RunnerControllerTest do
       assert entry["live_sockets"] == 1
       assert {:ok, _, _} = DateTime.from_iso8601(entry["joined_at"])
       assert entry["sample"]["free_ram_mb"] == 12_000
+      assert entry["node"] == "loopctl@10.0.0.7"
+      assert entry["machine_id"] == "d8d9e2a1"
     end
 
     test "is empty when no runner is connected, and a sample is null until reported",

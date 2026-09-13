@@ -30,6 +30,18 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | runner -> control | `"dispatch_reply"` | `RunnerDispatchReply` (since 1.1.0) | empty | `rate_limited`, `invalid_payload`, `unknown_dispatch`, `stale_claim_epoch`, `already_replied` |
   | runner -> control | `"trace"` | `RunnerTraceBatch` of `RunnerTraceEvent` (since 1.1.0) | `RunnerTraceAck` | `rate_limited`, `invalid_payload`, `batch_too_large`, `event_data_too_large`, `unknown_dispatch`, `stale_claim_epoch`, `dispatch_not_accepted`, `run_mismatch` |
   | runner -> control | `"trace_cursor"` | `RunnerTraceCursor` (since 1.1.0) | `RunnerTraceAck` | `rate_limited`, `invalid_payload` |
+  | control -> runner | `"disconnecting"` | `RunnerDisconnecting` (since 1.2.0) | — | — |
+
+  ## Server-initiated disconnects (since 1.2.0)
+
+  Before loopctl closes a runner's connection itself, it pushes `"disconnecting"` on the
+  runner's topic with a stable `reason` (`RunnerDisconnecting.reasons/0`), then closes, so
+  the runner can tell a revocation from a deploy from a network drop. `runner_revoked` and
+  `no_longer_authorized` precede the socket being closed; `server_shutdown` precedes the
+  drain of a stopping node, after which the runner should reconnect. A join refused as
+  `not_authorized` cannot carry a push — the topic was never joined — so its error reply
+  carries `disconnecting: "join_refused_not_authorized"` instead, and the socket is closed
+  only after that reply has been sent.
 
   ## Rate limits
 
@@ -93,7 +105,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   alias OpenApiSpex.Schema
 
-  @version "1.1.0"
+  @version "1.2.0"
   @major 1
 
   defmodule ByteRule do
@@ -492,6 +504,34 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     )
   end
 
+  defmodule RunnerDisconnecting do
+    @moduledoc false
+    require OpenApiSpex
+
+    @reasons ~w(runner_revoked no_longer_authorized join_refused_not_authorized server_shutdown)
+
+    @doc "Every reason loopctl gives for a disconnect it initiates."
+    @spec reasons() :: [String.t()]
+    def reasons, do: @reasons
+
+    OpenApiSpex.schema(
+      %{
+        title: "RunnerDisconnecting",
+        description:
+          "Pushed as `disconnecting` on the runner's topic immediately before loopctl closes " <>
+            "the runner's connection itself. `runner_revoked` and `no_longer_authorized` mean " <>
+            "the credential no longer works: do not reconnect until re-enrolled. " <>
+            "`server_shutdown` means the node is stopping: reconnect. " <>
+            "`join_refused_not_authorized` arrives as the `disconnecting` field of a refused " <>
+            "join's error reply, because an unjoined topic cannot carry a push.",
+        type: :object,
+        required: [:reason],
+        properties: %{reason: %Schema{type: :string, enum: @reasons}}
+      },
+      struct?: false
+    )
+  end
+
   defmodule RunnerTraceAck do
     @moduledoc false
     require OpenApiSpex
@@ -519,7 +559,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     RunnerTraceEvent,
     RunnerTraceBatch,
     RunnerTraceCursor,
-    RunnerTraceAck
+    RunnerTraceAck,
+    RunnerDisconnecting
   ]
 
   # The stable `reason` codes each runner-to-control event can be refused with. Exported, so
@@ -848,7 +889,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           "dispatch_reply" => "RunnerDispatchReply",
           "trace" => "RunnerTraceBatch",
           "trace_cursor" => "RunnerTraceCursor",
-          "trace_event" => "RunnerTraceEvent"
+          "trace_event" => "RunnerTraceEvent",
+          "disconnecting" => "RunnerDisconnecting"
         },
         "replies" => %{
           "trace" => "RunnerTraceAck",

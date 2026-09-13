@@ -14,6 +14,8 @@ defmodule LoopctlWeb.StoryStatusController do
   """
 
   use LoopctlWeb, :controller
+
+  require Logger
   use OpenApiSpex.ControllerSpecs
 
   alias Loopctl.ApiSpec.Schemas
@@ -622,8 +624,36 @@ defmodule LoopctlWeb.StoryStatusController do
              Keyword.put(opts, :claim_epoch, epoch)
            ) do
       json(conn, %{story: story, next_actions: StateMachine.next_actions(story, api_key.role)})
+    else
+      error ->
+        log_renew_refused(api_key, story_id, params, error)
+        error
     end
   end
+
+  # Issue #815: a claimant whose renewals are refused is about to lose its claim to the
+  # reclaimer, and without this line nothing records why. The current epoch is read only
+  # on this refusal path.
+  defp log_renew_refused(api_key, story_id, params, error) do
+    current =
+      case Ecto.UUID.cast(story_id) do
+        {:ok, id} -> Progress.current_claim_epoch(api_key.tenant_id, id)
+        :error -> nil
+      end
+
+    Logger.info(
+      "renew_claim refused: reason=#{inspect(refusal_reason(error))} story_id=#{inspect(story_id)} " <>
+        "presented_epoch=#{inspect(Map.get(params, "claim_epoch"))} current_epoch=#{inspect(current)} " <>
+        "agent_id=#{inspect(api_key.agent_id)} tenant_id=#{api_key.tenant_id}",
+      story_id: story_id,
+      claim_epoch: Map.get(params, "claim_epoch")
+    )
+  end
+
+  defp refusal_reason({:error, reason}) when is_atom(reason), do: reason
+  defp refusal_reason({:error, reason, _message}), do: reason
+  defp refusal_reason({:error, %Ecto.Changeset{}}), do: :invalid_changeset
+  defp refusal_reason(other), do: other
 
   # --- Private helpers ---
 

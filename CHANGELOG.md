@@ -6,6 +6,42 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Runner control plane observability (#815).**
+
+  **`fly.toml` now stops the VM with `kill_signal = "SIGTERM"` and `kill_timeout = 90`.** Fly's
+  default SIGINT dropped the BEAM into its break handler, so no deploy or restart ever ran the
+  application stop, drained a socket or logged anything about the runners it cut off. With
+  SIGTERM a stop drains the sockets (explicit drainers on `/live` and `/runner/socket` in
+  `endpoint.ex`), then Bandit and Oban; 90 s outlasts that 70 s window. **After the next
+  deploy, confirm the logs show `DRAINING`/`runner socket draining` and no `BREAK`.** A stop
+  now takes up to that long.
+
+  **Migration `20260914120000`** adds a nullable `runner_dispatches.pushed_at` (catalog-only,
+  no backfill, no long lock). The runner channel stamps it when it actually pushes a dispatch,
+  so a `sent` row with no `pushed_at` never reached a socket.
+
+  **Runner contract 1.2.0 (minor).** Before closing a runner's connection itself, loopctl pushes
+  `disconnecting` (`RunnerDisconnecting`) with a reason: `runner_revoked`,
+  `no_longer_authorized` or `server_shutdown`; a join refused as `not_authorized` carries
+  `disconnecting: "join_refused_not_authorized"` in its error reply. `priv/runner_contract/v1.json`
+  is regenerated. A 1.0/1.1 runner still joins and can ignore the new event.
+
+  **`GET /api/v1/runners/pool` entries gain `node` and `machine_id`** (nullable), and so do the
+  presence metas behind them. `machine_id` is `FLY_MACHINE_ID`, which Fly injects.
+
+  **Logs and metrics.** Production JSON logs now keep `runner_id`, `runner_name`, `story_id`,
+  `dispatch_id`, `run_id`, `claim_epoch`, `node` and `machine` metadata. New log lines:
+  runner channel close (reason, identity, node, machine, connected duration), every refused
+  runner message and join except `rate_limited`, server-initiated disconnects, the runner
+  socket's connect refusal (now with client IP and the resolved key/runner id), refused and
+  dropped dispatches, refused `renew-claim` (presented and current epoch), and each reclaimed
+  or failed candidate of `ReclaimExpiredClaimsWorker`. New Prometheus counters
+  `loopctl_runners_message_refused_count{event,reason}` and
+  `loopctl_runners_ledger_rejected_by_database_count{operation,sqlstate}`. The Phoenix, repo
+  and VM metrics that were summaries — which the reporter dropped at boot, so they never
+  existed in Prometheus — are now distributions and last values under the same names; the two
+  `*.start.system_time` summaries were removed.
+
 - **`GET /api/v1/runners/pool` (#809).** The caller's tenant's CONNECTED runners, read from
   Presence: per machine name, `runner_id`, `joined_at`, `in_flight`, `draining`,
   `max_sessions`, the latest health `sample`, and `live_sockets` (above 1 means more than one

@@ -57,7 +57,11 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorker do
       now
       |> expired_claims()
       |> Enum.map(fn candidate ->
-        Progress.reclaim_expired_claim(candidate.tenant_id, candidate.id, candidate.claim_epoch)
+        result =
+          Progress.reclaim_expired_claim(candidate.tenant_id, candidate.id, candidate.claim_epoch)
+
+        log_candidate(candidate, result)
+        result
       end)
 
     reclaimed = Enum.count(results, &match?({:ok, _}, &1))
@@ -75,6 +79,39 @@ defmodule Loopctl.Workers.ReclaimExpiredClaimsWorker do
 
     :ok
   end
+
+  # Issue #815: the summary line only counts. This names every candidate that was not
+  # skipped: a reclaim (which ends a claimant's lease, so its runner will be fenced) and a
+  # failure. A skip is decided under the row lock and is routine, so it stays out.
+  defp log_candidate(candidate, {:ok, story}) do
+    Logger.info(
+      "ReclaimExpiredClaimsWorker: reclaimed: tenant_id=#{candidate.tenant_id} " <>
+        "story_id=#{candidate.id} claim_epoch=#{candidate.claim_epoch} " <>
+        "new_claim_epoch=#{story.claim_epoch} reason=:claim_lease_expired",
+      tenant_id: candidate.tenant_id,
+      story_id: candidate.id,
+      claim_epoch: candidate.claim_epoch
+    )
+  end
+
+  defp log_candidate(_candidate, {:error, reason}) when reason in @skip_reasons, do: :ok
+
+  defp log_candidate(candidate, {:error, reason}) do
+    Logger.warning(
+      "ReclaimExpiredClaimsWorker: reclaim failed: tenant_id=#{candidate.tenant_id} " <>
+        "story_id=#{candidate.id} claim_epoch=#{candidate.claim_epoch} " <>
+        "reason=#{inspect(failure_reason(reason))}",
+      tenant_id: candidate.tenant_id,
+      story_id: candidate.id,
+      claim_epoch: candidate.claim_epoch
+    )
+  end
+
+  # A changeset is summarised by its errors; its data is a story row and stays out of logs.
+  defp failure_reason(%Ecto.Changeset{errors: errors}),
+    do: {:invalid_changeset, Keyword.keys(errors)}
+
+  defp failure_reason(reason), do: reason
 
   @doc false
   @spec batch_size() :: pos_integer()

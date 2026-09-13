@@ -79,67 +79,92 @@ defmodule LoopctlWeb.Telemetry do
     base_metrics() ++ ScaleMetrics.scale_metrics()
   end
 
+  # Issue #815: every metric here is a type `TelemetryMetricsPrometheus` exports. The
+  # reporter logs "Metric type summary is unsupported" and DROPS a summary at boot, so the
+  # summaries these started as never reached Prometheus; they are distributions (latencies)
+  # and last values (VM gauges) now, under the same names. The two `*.start.system_time`
+  # summaries are gone rather than converted: a wall-clock timestamp is not a distribution.
+  @latency_buckets_ms [5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000]
+
   defp base_metrics do
     [
       # Phoenix Metrics
-      summary("phoenix.endpoint.start.system_time",
-        unit: {:native, :millisecond}
+      distribution("phoenix.endpoint.stop.duration",
+        unit: {:native, :millisecond},
+        reporter_options: [buckets: @latency_buckets_ms]
       ),
-      summary("phoenix.endpoint.stop.duration",
-        unit: {:native, :millisecond}
-      ),
-      summary("phoenix.router_dispatch.start.system_time",
+      distribution("phoenix.router_dispatch.exception.duration",
         tags: [:route],
-        unit: {:native, :millisecond}
+        unit: {:native, :millisecond},
+        reporter_options: [buckets: @latency_buckets_ms]
       ),
-      summary("phoenix.router_dispatch.exception.duration",
+      distribution("phoenix.router_dispatch.stop.duration",
         tags: [:route],
-        unit: {:native, :millisecond}
+        unit: {:native, :millisecond},
+        reporter_options: [buckets: @latency_buckets_ms]
       ),
-      summary("phoenix.router_dispatch.stop.duration",
-        tags: [:route],
-        unit: {:native, :millisecond}
-      ),
-      summary("phoenix.socket_connected.duration",
-        unit: {:native, :millisecond}
+      distribution("phoenix.socket_connected.duration",
+        unit: {:native, :millisecond},
+        reporter_options: [buckets: @latency_buckets_ms]
       ),
       sum("phoenix.socket_drain.count"),
-      summary("phoenix.channel_joined.duration",
-        unit: {:native, :millisecond}
+      distribution("phoenix.channel_joined.duration",
+        unit: {:native, :millisecond},
+        reporter_options: [buckets: @latency_buckets_ms]
       ),
-      summary("phoenix.channel_handled_in.duration",
+      distribution("phoenix.channel_handled_in.duration",
         tags: [:event],
-        unit: {:native, :millisecond}
+        unit: {:native, :millisecond},
+        reporter_options: [buckets: @latency_buckets_ms]
+      ),
+
+      # Runner control plane (issue #815). `event` is a fixed set (join, status,
+      # dispatch_reply, trace, trace_cursor, unknown) and `reason` a contract code, so both
+      # are bounded tags; ids stay in the logs.
+      counter("loopctl.runners.message_refused.count",
+        event_name: [:loopctl, :runners, :message_refused],
+        tags: [:event, :reason],
+        description: "Runner messages (and joins) the runner channel refused, by reason."
+      ),
+      counter("loopctl.runners.ledger_rejected_by_database.count",
+        event_name: [:loopctl, :runners, :ledger_rejected_by_database],
+        tags: [:operation, :sqlstate],
+        description: "Runner-supplied ledger writes Postgres refused as data."
       ),
 
       # Database Metrics
-      summary("loopctl.repo.query.total_time",
+      distribution("loopctl.repo.query.total_time",
         unit: {:native, :millisecond},
-        description: "The sum of the other measurements"
+        description: "The sum of the other measurements",
+        reporter_options: [buckets: @latency_buckets_ms]
       ),
-      summary("loopctl.repo.query.decode_time",
+      distribution("loopctl.repo.query.decode_time",
         unit: {:native, :millisecond},
-        description: "The time spent decoding the data received from the database"
+        description: "The time spent decoding the data received from the database",
+        reporter_options: [buckets: @latency_buckets_ms]
       ),
-      summary("loopctl.repo.query.query_time",
+      distribution("loopctl.repo.query.query_time",
         unit: {:native, :millisecond},
-        description: "The time spent executing the query"
+        description: "The time spent executing the query",
+        reporter_options: [buckets: @latency_buckets_ms]
       ),
-      summary("loopctl.repo.query.queue_time",
+      distribution("loopctl.repo.query.queue_time",
         unit: {:native, :millisecond},
-        description: "The time spent waiting for a database connection"
+        description: "The time spent waiting for a database connection",
+        reporter_options: [buckets: @latency_buckets_ms]
       ),
-      summary("loopctl.repo.query.idle_time",
+      distribution("loopctl.repo.query.idle_time",
         unit: {:native, :millisecond},
         description:
-          "The time the connection spent waiting before being checked out for the query"
+          "The time the connection spent waiting before being checked out for the query",
+        reporter_options: [buckets: @latency_buckets_ms]
       ),
 
       # VM Metrics
-      summary("vm.memory.total", unit: {:byte, :kilobyte}),
-      summary("vm.total_run_queue_lengths.total"),
-      summary("vm.total_run_queue_lengths.cpu"),
-      summary("vm.total_run_queue_lengths.io")
+      last_value("vm.memory.total", unit: {:byte, :kilobyte}),
+      last_value("vm.total_run_queue_lengths.total"),
+      last_value("vm.total_run_queue_lengths.cpu"),
+      last_value("vm.total_run_queue_lengths.io")
     ]
   end
 

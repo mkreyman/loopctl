@@ -116,6 +116,36 @@ defmodule Loopctl.Runners.DispatchLedger do
       record.claim_epoch == dispatch.claim_epoch and record.kind == dispatch.kind
   end
 
+  @doc """
+  Stamps `pushed_at` on a dispatch the runner's channel has just pushed to its socket
+  (issue #815). The latest push wins, so a re-sent dispatch records when it last left.
+
+  Observability, not custody: the push has already happened, so a database fault here is
+  logged and swallowed rather than crashing the channel that holds the runner's socket.
+  """
+  @spec mark_pushed(Ecto.UUID.t(), Ecto.UUID.t()) :: :ok | :error
+  def mark_pushed(tenant_id, dispatch_id) do
+    {:ok, _} =
+      in_tenant(tenant_id, fn ->
+        Repo.update_all(
+          from(r in DispatchRecord,
+            where: r.tenant_id == ^tenant_id and r.dispatch_id == ^dispatch_id
+          ),
+          set: [pushed_at: DateTime.utc_now()]
+        )
+      end)
+
+    :ok
+  rescue
+    error in [DBConnection.ConnectionError, Postgrex.Error] ->
+      Logger.warning(
+        "runner ledger pushed_at not recorded: tenant_id=#{tenant_id} " <>
+          "dispatch_id=#{dispatch_id} error=#{inspect(error.__struct__)}"
+      )
+
+      :error
+  end
+
   @doc "A tenant's ledger row for `dispatch_id`, or nil."
   @spec get_record(Ecto.UUID.t(), Ecto.UUID.t()) :: DispatchRecord.t() | nil
   def get_record(tenant_id, dispatch_id) do

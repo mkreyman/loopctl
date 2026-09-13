@@ -4,6 +4,21 @@
 app = "loopctl"
 primary_region = "lax"
 
+# Issue #815: Fly's default kill signal is SIGINT, which drops the BEAM into its break
+# handler — no application stop, no socket drain, nothing logged about the runner sockets.
+# SIGTERM runs a graceful stop: the Endpoint drains its sockets (runner channels push
+# `disconnecting` / `server_shutdown` first), then Bandit and Oban wind down.
+#
+# `kill_timeout` must outlast that whole stop, or Fly SIGKILLs it half way. The window
+# (the drainers set explicitly, the rest at their defaults), held by
+# test/loopctl/fly_toml_test.exs:
+#   socket drainers  30 s (/live) + 10 s (/runner/socket)  — lib/loopctl_web/endpoint.ex
+#   Bandit            15 s  (ThousandIsland shutdown_timeout default)
+#   Oban              15 s  (shutdown_grace_period default)
+#   = 70 s, so 90 s leaves 20 s of margin.
+kill_signal = "SIGTERM"
+kill_timeout = 90
+
 [build]
   [build.args]
     MIX_ENV = "prod"

@@ -69,6 +69,7 @@ fly secrets set CLOAK_KEY="GENERATED_BASE64_KEY"
 | `SECRETS_ADAPTER`   | Fly GraphQL | Set to `local_file` to store the per-tenant audit keypairs on disk instead of in Fly secrets — REQUIRED when self-hosting off Fly (see below) |
 | `SECRETS_FILE`      | `/data/loopctl/secrets.json` | Path for the `local_file` adapter. Put it on a PERSISTENT volume |
 | `FLY_APP_NAME`      | injected by Fly | The app the DEFAULT (Fly GraphQL) secrets adapter writes tenant audit keys to. Fly Machines set this for you, so it only needs setting when running the Fly adapter off Fly — a case better served by `SECRETS_ADAPTER=local_file` |
+| `FLY_MACHINE_ID`    | injected by Fly | The Fly Machine this node runs on. Read for observability only (#815): it goes into runner presence metas, `GET /api/v1/runners/pool` entries (`machine_id`) and runner channel log lines, because both production machines share the node name `loopctl@127.0.0.1` and only this tells them apart. Unset off Fly, where those fields are `null` and nothing else changes |
 | `FLY_API_TOKEN`     | -       | API token the Fly secrets adapter authenticates with (`fly tokens create deploy`). **Not injected** — with either it or `FLY_APP_NAME` missing, the adapter refuses every write with `fly_not_configured`, and since tenant signup mints and stores a per-tenant Ed25519 audit keypair, no tenant can be created. Unset it and use `local_file` when self-hosting |
 | `FTS_REGCONFIG`     | `english` | Postgres text-search config for keyword FTS (see below) |
 
