@@ -196,17 +196,31 @@ defmodule LoopctlRunner.Config do
   # run with --permission-prompts none, which DENIES every call auto mode would have
   # prompted for (measured: a repo script under the Bash tool), so a session can only run
   # what is pre-allowed. Absent means none.
+  # A rule for a tool the session cannot have at all (`LoopctlRunner.Session.session_tools/0`)
+  # would load cleanly and then be denied in every session, silently: refused here instead.
   defp allowed_tools(map) do
     case Map.get(map, "allowed_tools", []) do
       tools when is_list(tools) ->
-        if Enum.all?(tools, &(is_binary(&1) and &1 != "")),
-          do: {:ok, tools},
-          else: {:error, "config allowed_tools entries must be non-empty strings"}
+        cond do
+          not Enum.all?(tools, &(is_binary(&1) and &1 != "")) ->
+            {:error, "config allowed_tools entries must be non-empty strings"}
+
+          bad = Enum.find(tools, &(rule_tool(&1) not in LoopctlRunner.Session.session_tools())) ->
+            {:error,
+             "config allowed_tools #{inspect(bad)} names a tool sessions do not have; they have " <>
+               Enum.join(LoopctlRunner.Session.session_tools(), ", ")}
+
+          true ->
+            {:ok, tools}
+        end
 
       _ ->
         {:error, "config allowed_tools must be a list"}
     end
   end
+
+  # "Bash(mix test:*)" names Bash; "Read" names Read.
+  defp rule_tool(rule), do: rule |> String.split("(", parts: 2) |> hd()
 
   # Per repo, extra environment for that repo's sessions: {"repo": {"NAME": "value"}}. In a value,
   # "{story}" becomes 8 hex of a hash of the story id, stable across that story's runs, and "{run}"

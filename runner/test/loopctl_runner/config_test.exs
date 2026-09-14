@@ -128,4 +128,17 @@ defmodule LoopctlRunner.ConfigTest do
       end
     end
   end
+
+  test "an allowed_tools rule for a tool sessions cannot have is refused at load" do
+    root = tmp_dir!("tools-rule")
+
+    for ok <- [["Bash(mix test:*)", "Read", "Edit"], []] do
+      assert {:ok, _} = Config.from_map(Map.put(config_map(root), "allowed_tools", ok))
+    end
+
+    for bad <- ["WebFetch", "Skill", "Agent", "mcp__loopctl__get_story", "WebSearch(x)"] do
+      assert {:error, msg} = Config.from_map(Map.put(config_map(root), "allowed_tools", [bad]))
+      assert msg =~ "names a tool sessions do not have"
+    end
+  end
 end

@@ -92,6 +92,10 @@ defmodule LoopctlRunner.RunTest do
     assert env =~ ~r/^LOOP_MODE=1$/m
     argv = File.read!(Path.join(state, "argv"))
     assert argv =~ "--permission-prompts\nnone\n"
+    # The session's tools are limited, not merely allowed: every restricting flag reaches claude.
+    assert argv =~ "--tools\nRead,Edit,Write,Glob,Grep,Bash\n"
+    assert argv =~ "--strict-mcp-config\n--mcp-config\n{\"mcpServers\":{}}\n"
+    assert argv =~ "--disallowedTools\nmcp__*\n"
     assert argv =~ "--session-id\n#{result.session.session_id}\n"
     assert argv =~ "--allowedTools\nRead\n"
     assert argv =~ "--allowedTools\nBash(#{LoopctlRunner.Session.escalate_script()}:*)\n"

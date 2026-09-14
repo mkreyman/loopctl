@@ -322,8 +322,17 @@ leadership rather than assume it.)
 **The session's cwd must be the worktree** — `block-foreign-repo-write.sh` keys on
 `git rev-parse --git-common-dir`, so `--add-dir` from elsewhere blocks every write.
 
-**Not `--bare`** (it would strip the hooks, agents, MCP servers and CLAUDE.md the loop depends
-on), which means every guard hook loads — including `gate-unmerged-pr.sh`, which blocks exactly
+**Contain what the session can use, not only what it may run.** `--allowedTools` grants; it removes
+nothing. Measured on Claude Code 2.1.270 (KB c6452b2b): with only the flags above, a session also
+had Agent, Workflow, Skill, SendMessage, RemoteTrigger, WebFetch, every configured MCP server —
+loopctl's destructive tools, with the machine's keys — and every plugin tool. An implement session
+is therefore launched with `--tools Read,Edit,Write,Glob,Grep,Bash`, `--strict-mcp-config
+--mcp-config '{"mcpServers":{}}'` and `--disallowedTools "mcp__*"`, fixed in the runner and never
+widened by a story or the config. A triage session (§4) needs its read-only lenses as agents, so it
+gets its own contained set — the Agent tool limited to the triage lenses, still no MCP — designed
+with its contract, not this set widened.
+
+**Not `--bare`** (it would drop the login, CLAUDE.md and the guard hooks), which means every guard hook loads — including `gate-unmerged-pr.sh`, which blocks exactly
 the "merging nothing" end state build-order step 1 prescribes. The runner sets a loop-mode
 variable that gate exits 0 on.
 

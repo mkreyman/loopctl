@@ -10,8 +10,14 @@ defmodule LoopctlRunner.Session do
 
   Unattended flags (design §8): `--permission-mode auto --permission-prompts none` removes
   `AskUserQuestion` from the tool list, which makes waiting on a human impossible rather
-  than costly, and `--max-turns` is the hard stop. Not `--bare`, which would strip the
-  hooks, agents and MCP servers the loop depends on.
+  than costly, and `--max-turns` is the hard stop. Not `--bare`, which would drop the login
+  and CLAUDE.md and the guard hooks with it.
+
+  What a session can use at all is contained separately (`session_tools/0`): six built-in
+  tools, no MCP server and no plugin tool. An implement session needs a shell and the file
+  tools, and nothing that reaches beyond the worktree: no subagents, no loopctl MCP tools, no
+  web. A triage session will need its read-only lenses as agents; it gets its own contained set
+  when its contract exists (design §8), never this one widened.
   """
 
   use GenServer
@@ -96,6 +102,22 @@ defmodule LoopctlRunner.Session do
     """
   end
 
+  # What an unattended session can use at all, as opposed to what it may run without asking.
+  # --allowedTools is an allow list: it grants, it does not remove. Measured on Claude Code
+  # 2.1.270 (KB c6452b2b, and on minis with this runner's own flags): without these, a session
+  # also had Agent, Workflow, Skill, SendMessage, RemoteTrigger, WebFetch, the cron tools, every
+  # configured MCP server (loopctl's destructive tools, with this machine's keys) and every
+  # function-hook plugin tool. A session that reads story text must have none of that:
+  #   --tools            the built-ins it keeps;
+  #   --strict-mcp-config --mcp-config '{"mcpServers":{}}'   no configured MCP server;
+  #   --disallowedTools "mcp__*"                              no plugin tool, present or future.
+  # Fixed here, never taken from a story or the config, so nothing a dispatch carries can widen it.
+  @session_tools ~w(Read Edit Write Glob Grep Bash)
+
+  @doc "The built-in tools every session is limited to."
+  @spec session_tools() :: [String.t()]
+  def session_tools, do: @session_tools
+
   @doc "The argv handed to claude-headless.sh."
   @spec claude_args(Story.t(), String.t()) :: [String.t()]
   def claude_args(%Story{} = story, session_id) do
@@ -113,7 +135,14 @@ defmodule LoopctlRunner.Session do
       "--permission-prompts",
       "none",
       "--max-turns",
-      Integer.to_string(story.max_turns)
+      Integer.to_string(story.max_turns),
+      "--tools",
+      Enum.join(@session_tools, ","),
+      "--strict-mcp-config",
+      "--mcp-config",
+      ~s({"mcpServers":{}}),
+      "--disallowedTools",
+      "mcp__*"
     ] ++
       if(story.model, do: ["--model", story.model], else: []) ++
       Enum.flat_map(story.allowed_tools, &["--allowedTools", &1]) ++
