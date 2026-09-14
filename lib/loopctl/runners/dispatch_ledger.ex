@@ -427,6 +427,39 @@ defmodule Loopctl.Runners.DispatchLedger do
   end
 
   @doc """
+  Every kind each of a tenant's runners has refused with `kind_not_supported`, as
+  `%{runner_id => [kind]}`. Runners that have refused nothing are absent.
+
+  The OPERATOR's view of the same fact `kind_unsupported?/3` decides a dispatch on, and the
+  reason it exists: `implement` is the only dispatchable kind today, so ONE
+  `kind_not_supported` reply removes that machine from all work for the life of its `runners`
+  row. With nothing exposing it, an operator sees a connected, unrevoked, idle runner that
+  silently never gets work — and a runner that maps a transient local condition to that reason
+  bricks itself until a human revokes and re-enrols it. Surfaced on `GET /api/v1/runners` and
+  `GET /api/v1/runners/pool`, it is one line of output away instead of a database session.
+
+  One grouped query for the whole tenant, so a list of runners costs one round trip rather
+  than one each.
+  """
+  @spec unsupported_kinds(Ecto.UUID.t()) :: %{Ecto.UUID.t() => [String.t()]}
+  def unsupported_kinds(tenant_id) when is_binary(tenant_id) do
+    {:ok, pairs} =
+      in_tenant(tenant_id, fn ->
+        Repo.all(
+          from r in DispatchRecord,
+            where: r.tenant_id == ^tenant_id and r.status == "refused",
+            where: r.reason == "kind_not_supported",
+            distinct: true,
+            select: {r.runner_id, r.kind}
+        )
+      end)
+
+    pairs
+    |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+    |> Map.new(fn {runner_id, kinds} -> {runner_id, Enum.sort(kinds)} end)
+  end
+
+  @doc """
   Releases the slot `generation` of `dispatch_id`, exactly once, in a transaction of its own:
   `{:ok, :released}` the first time, `{:ok, :already_released}` on every replay and for a
   generation the row no longer holds. For the caller that learns a dispatch's session ended,

@@ -780,6 +780,36 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       assert RunnerContract.json_schema()["$defs"]["RunnerDispatch"]["properties"]["story"] ==
                story
     end
+
+    test "the published story limits are EVERY bound the schema declares, and only those" do
+      # The list was written by hand and only three of its entries were pinned to the schema,
+      # so a field added to the schema and forgotten in `limits/0` published an incomplete set
+      # with every test green — and a runner splitting by the published caps had no bound for
+      # the new field. This walks the schema itself, so neither direction can drift: a bound
+      # the schema declares must be published, and a published one must exist in the schema.
+      published = RunnerStory.limits()["fields"]
+
+      declared =
+        for {name, sub} <- RunnerStory.schema().properties,
+            bounds = declared_bounds(sub),
+            bounds != %{},
+            into: %{},
+            do: {Atom.to_string(name), bounds}
+
+      assert declared != %{}, "the schema walk found no bounds, so it proves nothing"
+      assert published == declared
+
+      # Every property EXCEPT the id carries a bound. `id` is a uuid, bounded by its format;
+      # anything else unbounded is a field a runner cannot split by.
+      unbounded =
+        for {name, sub} <- RunnerStory.schema().properties,
+            declared_bounds(sub) == %{},
+            do: name
+
+      assert unbounded == [:id]
+
+      assert RunnerStory.limits()["max_bytes"] == RunnerStory.max_bytes()
+    end
   end
 
   describe "dispatchable kinds (1.5.0)" do
@@ -1116,6 +1146,19 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     dispatch = build(:runner_dispatch)
     Map.put(dispatch, "story", Map.put(story, "id", dispatch["story_id"]))
   end
+
+  # An INDEPENDENT reading of the schema's bounds, written from the JSON Schema keywords
+  # rather than by calling the private function `limits/0` uses — otherwise the assertion
+  # above would be comparing one implementation with itself.
+  defp declared_bounds(%OpenApiSpex.Schema{} = sub) do
+    %{}
+    |> put_bound("max_length", sub.type == :string && sub.maxLength)
+    |> put_bound("max_items", sub.type == :array && sub.maxItems)
+    |> put_bound("max_item_length", sub.type == :array && sub.items && sub.items.maxLength)
+  end
+
+  defp put_bound(bounds, _key, value) when value in [nil, false], do: bounds
+  defp put_bound(bounds, key, value), do: Map.put(bounds, key, value)
 
   defp string(length), do: String.duplicate("a", length)
 

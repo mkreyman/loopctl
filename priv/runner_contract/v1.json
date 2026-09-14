@@ -816,16 +816,30 @@
       },
       "stage_max_reason_length": 4000,
       "story": {
-        "max_bytes": 48000,
-        "max_criteria": 20,
-        "max_criterion_length": 500,
-        "max_description_length": 8000,
-        "max_domain_reference_length": 500,
-        "max_test_case_length": 500,
-        "max_test_cases": 20,
-        "max_title_length": 200,
-        "max_touch_length": 200,
-        "max_touches": 100
+        "fields": {
+          "acceptance_criteria": {
+            "max_item_length": 500,
+            "max_items": 20
+          },
+          "description": {
+            "max_length": 8000
+          },
+          "domain_reference": {
+            "max_length": 500
+          },
+          "test_cases": {
+            "max_item_length": 500,
+            "max_items": 20
+          },
+          "title": {
+            "max_length": 200
+          },
+          "touches": {
+            "max_item_length": 200,
+            "max_items": 100
+          }
+        },
+        "max_bytes": 48000
       },
       "trace_max_batch_bytes": 60000,
       "trace_max_event_bytes": 12000,

@@ -11,9 +11,11 @@ defmodule Loopctl.Delivery.StoryPayloadTest do
   use Loopctl.DataCase, async: true
 
   import Ecto.Query
+  import ExUnit.CaptureLog
 
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.ApiSpec.RunnerContract.RunnerStory
+  alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryPayload
   alias Loopctl.Repo
@@ -159,17 +161,59 @@ defmodule Loopctl.Delivery.StoryPayloadTest do
       assert escalations == 0
     end
 
-    test "an oversize story whose stage has no escalation edge says so, loudly" do
-      # `done` is terminal: there is no way out of it and nothing may pretend there is. The
-      # caller still must not dispatch, so this is an error either way — a louder one,
-      # because a story that is neither dispatchable nor parked is one nothing picks up.
-      story = staged(long_story_attrs(), :done)
+    test "a stage escalation cannot leave is NAMED, not reported as a bare invalid transition" do
+      # Every stage the session-escalation edge does not leave, not just the terminal one:
+      # `queued` and `triaged` are the reachable mistakes — a caller composing a payload
+      # before claiming — and a bare `:invalid_transition` gives them nothing to act on.
+      for stage <- [:queued, :triaged, :done] do
+        story = staged(long_story_attrs(), stage)
 
-      assert {:error, {:escalation_failed, :invalid_transition, violations}} =
-               StoryPayload.build(story.tenant_id, story.id, opts())
+        assert {:error, {:escalation_failed, {:no_escalation_edge, ^stage}, violations}} =
+                 StoryPayload.build(story.tenant_id, story.id, opts()),
+               "expected #{stage} to be named"
 
-      assert violations != []
-      assert Stages.get(story.tenant_id, story.id).stage == :done
+        assert violations != []
+        assert Stages.get(story.tenant_id, story.id).stage == stage
+      end
+    end
+
+    test "the named stages are exactly the ones the machine has no escalation edge from" do
+      # Bound to the machine, so an edge added there stops being a refusal here without
+      # anyone remembering to update a list.
+      escapable =
+        for {from, :escalated, :session_escalated} <- StageMachine.transitions(), do: from
+
+      refute :queued in escapable
+      refute :triaged in escapable
+      refute :done in escapable
+      assert :claimed in escapable
+    end
+
+    test "the NOT-escalated outcome logs at error and the escalated one does not" do
+      # The two used to be the wrong way round: the harmless branch — a human now has the
+      # story — logged a warning, and the strictly worse one, neither dispatchable nor
+      # parked, logged nothing at all. Captured at `:error` alone, so the assertion is about
+      # the LEVEL and not the wording.
+      parked = staged(long_story_attrs())
+
+      quiet =
+        capture_log([level: :error], fn ->
+          assert {:error, {:story_too_large, _}} =
+                   StoryPayload.build(parked.tenant_id, parked.id, opts())
+        end)
+
+      assert quiet == ""
+
+      stranded = staged(long_story_attrs(), :done)
+
+      loud =
+        capture_log([level: :error], fn ->
+          assert {:error, {:escalation_failed, _, _}} =
+                   StoryPayload.build(stranded.tenant_id, stranded.id, opts())
+        end)
+
+      assert loud =~ "NOT ESCALATED"
+      assert loud =~ stranded.id
     end
 
     test "a stale claim epoch refuses the escalation rather than writing under a dead claim" do
@@ -179,6 +223,56 @@ defmodule Loopctl.Delivery.StoryPayloadTest do
                StoryPayload.build(story.tenant_id, story.id, opts(claim_epoch: @epoch + 1))
 
       assert Stages.get(story.tenant_id, story.id).stage == :claimed
+    end
+
+    test "a story with hundreds of violations still escalates, with a bounded event" do
+      # The regression: `list_violations/4` emits one message per offending ITEM and nothing
+      # caps how many acceptance criteria a story may carry, so an unbounded event_data pushed
+      # past `Stages.max_event_data_bytes/0`, `advance/4` answered `:invalid_event_data`, and
+      # the story was neither dispatched NOR escalated — the exact outcome the reason
+      # truncation already existed to prevent.
+      criteria =
+        for index <- 1..400,
+            do: %{
+              "id" => "AC-#{index}",
+              "description" => String.duplicate("y", RunnerStory.max_criterion_length() + 1)
+            }
+
+      story = staged(%{acceptance_criteria: criteria})
+
+      assert {:error, {:story_too_large, violations}} =
+               StoryPayload.build(story.tenant_id, story.id, opts())
+
+      assert length(violations) > 100
+
+      assert Stages.get(story.tenant_id, story.id).stage == :escalated
+
+      transition =
+        story.tenant_id
+        |> Stages.list_events(story.id)
+        |> Enum.find(&(&1.to_stage == "escalated"))
+
+      recorded = transition.data["payload"]
+
+      # The COUNT is exact even though the list is a prefix, so a reader is never misled
+      # about how many there were.
+      assert recorded["story_payload_violation_count"] == length(violations)
+      assert length(recorded["story_payload_violations"]) < length(violations)
+      assert recorded["story_payload_violations"] != []
+
+      assert byte_size(Jason.encode!(recorded)) <= Stages.max_event_data_bytes()
+    end
+
+    test "both required options are read before the story is, not only when it is oversize" do
+      # A composer integration-tested against ordinary stories must not pass everything and
+      # then raise on its first oversize one.
+      story = staged()
+
+      for missing <- [:claim_epoch, :actor_lineage] do
+        assert_raise KeyError, fn ->
+          StoryPayload.build(story.tenant_id, story.id, Keyword.delete(opts(), missing))
+        end
+      end
     end
 
     test "an unknown story is not found" do

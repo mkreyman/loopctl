@@ -2004,6 +2004,26 @@ defmodule Loopctl.Fixtures do
     end)
   end
 
+  # A committed `:user`-role key, for a CONTROLLER test of an operator-facing read whose data
+  # is written on the RLS `Loopctl.Repo` — the runner registry's `unsupported_kinds`, which is
+  # derived from `runner_dispatches`. Same two-repo constraint as `:committed_agent_key`
+  # above: only an `async: false` module may use it, and it must sweep at the boundary.
+  def fixture(:committed_operator_key, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+
+    Sandbox.unboxed_run(AdminRepo, fn ->
+      {:ok, {raw_key, _api_key}} =
+        Auth.generate_api_key(%{
+          tenant_id: tenant_id,
+          name: "operator-#{System.unique_integer([:positive])}",
+          role: :user
+        })
+
+      raw_key
+    end)
+  end
+
   # A story (with its project and epic) on the RLS `Loopctl.Repo` connection, at a given
   # `claim_epoch`, for the dispatch ledger's claim fence (#803). The ledger reads
   # `stories.claim_epoch` on `Repo` inside its own transaction, and `Repo` and `AdminRepo`

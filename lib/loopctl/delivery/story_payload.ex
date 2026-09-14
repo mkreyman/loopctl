@@ -60,11 +60,18 @@ defmodule Loopctl.Delivery.StoryPayload do
 
   @type violation :: String.t()
 
+  # `:unknown_story_stage` and `:no_escalation_edge` are NOT bare members: they arise only
+  # inside the escalation and always reach the caller wrapped in `:escalation_failed`, so
+  # listing them flat would have an exhaustive `case` writing a clause nothing reaches.
   @type error ::
           :not_found
-          | :unknown_story_stage
           | {:story_too_large, [violation()]}
-          | {:escalation_failed, term(), [violation()]}
+          | {:escalation_failed, escalation_error(), [violation()]}
+
+  @type escalation_error ::
+          :unknown_story_stage
+          | {:no_escalation_edge, StageMachine.stage()}
+          | Stages.advance_error()
 
   @doc """
   The story object for an `implement` dispatch of `story_id`, or an escalation.
@@ -75,10 +82,25 @@ defmodule Loopctl.Delivery.StoryPayload do
   `{:error, {:story_too_large, violations}}` means the story broke a cap AND has been
   escalated: the stage row is at `escalated`, the violations are on the transition's event,
   and the caller must not dispatch. `{:error, {:escalation_failed, reason, violations}}` is
-  the same refusal with the escalation itself refused — louder on purpose, because a story
-  that is neither dispatchable nor parked is one nothing will pick up.
+  the same refusal with the escalation itself refused — louder on purpose, and logged at
+  error, because a story that is neither dispatchable nor parked is one nothing will pick up.
+
+  ## Precondition: the story must be at a stage escalation can leave
+
+  `:session_escalated` leaves the in-flight stages (`claimed` through `ci`), `merged` and
+  `deployed`, and nothing else. That is satisfied by construction where a dispatch is
+  composed — a story is CLAIMED before it is dispatched, and the ledger's own claim fence
+  refuses a dispatch for a story no claim holds — so the precondition costs a caller nothing
+  it was not already doing. Called at `queued`, `triaged` or a terminal stage, this cannot
+  park the story, and it says so by name: `{:escalation_failed, {:no_escalation_edge, stage},
+  violations}` rather than a bare `:invalid_transition` a caller has to guess at.
 
   ## Options
+
+  Both required options are read at the TOP of the call, before the story is loaded, so a
+  composer that omits one learns on its first ordinary dispatch instead of raising a KeyError
+  on its first oversize story — which would turn "too large to dispatch" into a crash in the
+  caller.
 
   - `:claim_epoch` (required) — the epoch the caller's claim returned. The fence on the
     escalation, exactly as it is on every other transition.
@@ -92,10 +114,22 @@ defmodule Loopctl.Delivery.StoryPayload do
   """
   @spec build(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) :: {:ok, map()} | {:error, error()}
   def build(tenant_id, story_id, opts) when is_binary(tenant_id) and is_binary(story_id) do
+    # Read here rather than on the refusal path: they are only USED when a story is oversize,
+    # and a required option that is only read on the rare branch is a required option nobody
+    # discovers they are missing.
+    escalation = [
+      claim_epoch: Keyword.fetch!(opts, :claim_epoch),
+      actor_lineage: Keyword.fetch!(opts, :actor_lineage),
+      actor_label: Keyword.get(opts, :actor_label, @escalation_actor)
+    ]
+
     with {:ok, story} <- fetch_story(tenant_id, story_id) do
       case ImplementerInput.story_object(story, opts) do
-        {:ok, object} -> {:ok, object}
-        {:error, {:story_too_large, violations}} -> refuse(tenant_id, story_id, violations, opts)
+        {:ok, object} ->
+          {:ok, object}
+
+        {:error, {:story_too_large, violations}} ->
+          refuse(tenant_id, story_id, violations, escalation)
       end
     end
   end
@@ -112,21 +146,38 @@ defmodule Loopctl.Delivery.StoryPayload do
   # The refusal, and the whole reason this module is not just the pure builder: a story
   # loopctl cannot describe within the contract is a story a human has to look at, so it is
   # parked rather than left in the queue for the next dispatcher to fail on identically.
-  defp refuse(tenant_id, story_id, violations, opts) do
-    Logger.warning(
-      "story too large to dispatch: tenant_id=#{tenant_id} story_id=#{story_id} " <>
-        "violations=#{inspect(violations)}",
-      tenant_id: tenant_id,
-      story_id: story_id
-    )
+  defp refuse(tenant_id, story_id, violations, escalation) do
+    case escalate(tenant_id, story_id, violations, escalation) do
+      {:ok, _row} ->
+        Logger.warning(
+          "story too large to dispatch, escalated: tenant_id=#{tenant_id} " <>
+            "story_id=#{story_id} violations=#{inspect(Enum.take(violations, 5))} " <>
+            "violation_count=#{length(violations)}",
+          tenant_id: tenant_id,
+          story_id: story_id
+        )
 
-    case escalate(tenant_id, story_id, violations, opts) do
-      {:ok, _row} -> {:error, {:story_too_large, violations}}
-      {:error, reason} -> {:error, {:escalation_failed, reason, violations}}
+        {:error, {:story_too_large, violations}}
+
+      {:error, reason} ->
+        # ERROR, and louder than the branch above on purpose: the escalated case is the
+        # HARMLESS one — a human has the story. This one leaves it neither dispatchable nor
+        # parked, so it is the outcome nothing downstream will pick up and nobody is watching
+        # for.
+        Logger.error(
+          "story too large to dispatch AND NOT ESCALATED: tenant_id=#{tenant_id} " <>
+            "story_id=#{story_id} escalation_error=#{inspect(reason)} " <>
+            "violations=#{inspect(Enum.take(violations, 5))} " <>
+            "violation_count=#{length(violations)}",
+          tenant_id: tenant_id,
+          story_id: story_id
+        )
+
+        {:error, {:escalation_failed, reason, violations}}
     end
   end
 
-  defp escalate(tenant_id, story_id, violations, opts) do
+  defp escalate(tenant_id, story_id, violations, escalation) do
     case Stages.get(tenant_id, story_id) do
       nil ->
         {:error, :unknown_story_stage}
@@ -138,14 +189,56 @@ defmodule Loopctl.Delivery.StoryPayload do
         {:ok, row}
 
       %StoryStage{stage: stage} ->
-        Stages.advance(tenant_id, story_id, {stage, :escalated, :session_escalated},
-          claim_epoch: Keyword.fetch!(opts, :claim_epoch),
-          actor_lineage: Keyword.fetch!(opts, :actor_lineage),
-          actor_label: Keyword.get(opts, :actor_label, @escalation_actor),
-          reason: reason_text(violations),
-          event_data: %{"story_payload_violations" => violations}
-        )
+        advance_or_name_the_gap(tenant_id, story_id, stage, violations, escalation)
     end
+  end
+
+  # The edge is checked BEFORE the transition is attempted, against the machine's own table,
+  # so a stage escalation cannot leave is named rather than reported as a bare
+  # `:invalid_transition` the caller must decode. See the precondition on `build/3`.
+  defp advance_or_name_the_gap(tenant_id, story_id, stage, violations, escalation) do
+    if {stage, :escalated, :session_escalated} in StageMachine.transitions() do
+      Stages.advance(
+        tenant_id,
+        story_id,
+        {stage, :escalated, :session_escalated},
+        escalation ++
+          [reason: reason_text(violations), event_data: violation_event_data(violations)]
+      )
+    else
+      {:error, {:no_escalation_edge, stage}}
+    end
+  end
+
+  # BOUNDED against the same cap `Stages` enforces, read from its accessor rather than
+  # restated. Unbounded, this was the sibling of the reason truncation below and the same
+  # failure: `list_violations/4` emits one message per offending item, nothing caps the number
+  # of acceptance criteria a story may carry, and about 140 over-length items pushed the
+  # encoded map past 8_000 — `advance/4` answered `:invalid_event_data` and the story was
+  # neither dispatched NOR escalated, which is precisely the outcome the truncation exists to
+  # prevent.
+  #
+  # The COUNT is exact and the list is a prefix, so a reader is never misled about how many
+  # there were. Halving rather than dropping one at a time because the encode is what costs,
+  # and a prefix that is a little shorter than it could be loses nothing: the full list is on
+  # the return value and in the log.
+  defp violation_event_data(violations) do
+    fit(violations, length(violations))
+  end
+
+  defp fit(violations, 0) do
+    %{"story_payload_violations" => [], "story_payload_violation_count" => length(violations)}
+  end
+
+  defp fit(violations, take) do
+    candidate = %{
+      "story_payload_violations" => Enum.take(violations, take),
+      "story_payload_violation_count" => length(violations)
+    }
+
+    if byte_size(Jason.encode!(candidate)) <= Stages.max_event_data_bytes(),
+      do: candidate,
+      else: fit(violations, div(take, 2))
   end
 
   # Capped at the same bound `story_stages_text_bounds` holds the column to, read from the

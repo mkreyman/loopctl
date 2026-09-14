@@ -580,6 +580,16 @@ defmodule Loopctl.Runners do
       do: DispatchLedger.release_slot(tenant_id, dispatch_id, generation)
 
   @doc """
+  Every kind each of the tenant's runners has told loopctl it does not do, as
+  `%{runner_id => [kind]}`. See `Loopctl.Runners.DispatchLedger.unsupported_kinds/1` — it is
+  the operator-facing view of the memory step 6 of `dispatch/3` refuses on, so a machine
+  barred from all work is visible rather than merely idle.
+  """
+  @spec unsupported_kinds(Ecto.UUID.t()) :: %{Ecto.UUID.t() => [String.t()]}
+  def unsupported_kinds(tenant_id) when is_binary(tenant_id),
+    do: DispatchLedger.unsupported_kinds(tenant_id)
+
+  @doc """
   Whether the tenant is under its admission limit right now, for a caller deciding whether
   to CLAIM a story it would then dispatch. A read, not a reservation: two callers can both
   be told `:ok`, and `dispatch/3` is where the limit is enforced under a lock.

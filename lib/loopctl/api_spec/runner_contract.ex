@@ -491,22 +491,42 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     @spec max_domain_reference_length() :: pos_integer()
     def max_domain_reference_length, do: @max_domain_reference_length
 
-    @doc "Every cap of the story object, as the export publishes them."
-    @spec limits() :: %{String.t() => pos_integer()}
+    @doc """
+    Every cap of the story object, as the export publishes them: `max_bytes` for the whole
+    object, and `fields` keyed by the field each bound belongs to.
+
+    DERIVED from `schema/0`, never restated. The list used to be written out by hand, so a
+    field added to the schema and forgotten here published an incomplete set with every test
+    green — and a runner splitting by the published caps would have had no bound for the new
+    field. Reading the schema means the two cannot disagree: a bound only exists here because
+    it is declared there.
+
+    `max_bytes` is the one entry that is not read off the schema, because it is not a JSON
+    Schema keyword — it is the whole object under `ByteRule`.
+
+    At runtime, not compile time: `schema/0` is defined by the `OpenApiSpex.schema` macro
+    below and a module attribute cannot call it.
+    """
+    @spec limits() :: %{String.t() => term()}
     def limits do
-      %{
-        "max_bytes" => @max_bytes,
-        "max_title_length" => @max_title_length,
-        "max_description_length" => @max_description_length,
-        "max_criteria" => @max_criteria,
-        "max_criterion_length" => @max_criterion_length,
-        "max_test_cases" => @max_test_cases,
-        "max_test_case_length" => @max_test_case_length,
-        "max_touches" => @max_touches,
-        "max_touch_length" => @max_touch_length,
-        "max_domain_reference_length" => @max_domain_reference_length
-      }
+      fields =
+        for {name, sub} <- schema().properties,
+            bounds = field_bounds(sub),
+            bounds != %{},
+            into: %{},
+            do: {Atom.to_string(name), bounds}
+
+      %{"max_bytes" => @max_bytes, "fields" => fields}
     end
+
+    defp field_bounds(%Schema{type: :array, maxItems: items, items: %Schema{maxLength: length}})
+         when is_integer(items) and is_integer(length),
+         do: %{"max_items" => items, "max_item_length" => length}
+
+    defp field_bounds(%Schema{type: :string, maxLength: length}) when is_integer(length),
+      do: %{"max_length" => length}
+
+    defp field_bounds(%Schema{}), do: %{}
 
     OpenApiSpex.schema(
       %{

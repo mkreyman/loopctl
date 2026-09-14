@@ -303,6 +303,43 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
     end
   end
 
+  describe "unsupported_kinds/1" do
+    test "groups the tenant's barred kinds by runner, and omits runners with none",
+         %{runner: runner} do
+      {_raw, clean} = fixture(:committed_runner, %{name: "blockit", tenant_id: runner.tenant_id})
+
+      barred = sent(runner)
+
+      {:ok, _} =
+        reply(runner, barred, %{"decision" => "refused", "reason" => "kind_not_supported"})
+
+      # A second refusal of the SAME kind must not produce a duplicate entry.
+      again = sent(runner)
+
+      {:ok, _} =
+        reply(runner, again, %{"decision" => "refused", "reason" => "kind_not_supported"})
+
+      ordinary = sent(clean)
+      {:ok, _} = reply(clean, ordinary, %{"decision" => "refused", "reason" => "draining"})
+
+      kinds = DispatchLedger.unsupported_kinds(runner.tenant_id)
+
+      assert kinds == %{runner.id => ["implement"]}
+      refute Map.has_key?(kinds, clean.id)
+    end
+
+    test "is tenant-scoped", %{runner: runner} do
+      other_tenant = fixture(:committed_tenant, %{})
+
+      record = sent(runner)
+
+      {:ok, _} =
+        reply(runner, record, %{"decision" => "refused", "reason" => "kind_not_supported"})
+
+      assert DispatchLedger.unsupported_kinds(other_tenant.id) == %{}
+    end
+  end
+
   describe "record_reply/3" do
     test "accepted moves the row out of sent and writes no audit-chain entry",
          %{runner: runner} do
