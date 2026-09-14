@@ -1,0 +1,382 @@
+{
+  "biases": [
+    "The oracle over-flags by construction (a HCPCS-shaped literal in a test assertion fires it), so the false-negative rate is an UPPER bound.",
+    "The oracle is lexical and path-blind, so an arithmetic change that moves claim output without naming any billing vocabulary is invisible to it. A false-negative count of zero is NOT evidence that Gate B has none.",
+    "Gate B's proof step (deploy, regenerate 837P from the fixed fixture set, diff it) cannot be replayed over history, so :prove_effect is counted as its own outcome and never scored as a pass or a fail.",
+    "The trigger document is TODAY's, replayed over historical trees. A pattern that matches nothing at an old ref escalates as a stale trigger — the gate working, on a question the replay invented. The configuration_applied stratum excludes those.",
+    "Only the :merge phase is replayed. The :triage run judges the trio's PREDICTED touches, and a replay has no prediction; substituting the real merged file list would bias that number optimistic."
+  ],
+  "false_negatives": [
+    {
+      "changed_lines": 611,
+      "committed_at": "2026-09-13T04:00:44Z",
+      "diff_files_listed": 2,
+      "effect_matches": [],
+      "files": 2,
+      "human_matches": [],
+      "oracle_families": [
+        "edi",
+        "billing_codes"
+      ],
+      "outcome": "clear",
+      "pr": 1507,
+      "sha": "e3a8f0fddffe"
+    },
+    {
+      "changed_lines": 309,
+      "committed_at": "2026-09-12T17:07:53Z",
+      "diff_files_listed": 11,
+      "effect_matches": [],
+      "files": 11,
+      "human_matches": [],
+      "oracle_families": [
+        "billing_codes",
+        "outbound"
+      ],
+      "outcome": "clear",
+      "pr": 1500,
+      "sha": "a78202f5f6c0"
+    },
+    {
+      "changed_lines": 173,
+      "committed_at": "2026-08-28T17:54:50Z",
+      "diff_files_listed": 2,
+      "effect_matches": [],
+      "files": 2,
+      "human_matches": [],
+      "oracle_families": [
+        "rates"
+      ],
+      "outcome": "clear",
+      "pr": 1395,
+      "sha": "c28b808a6a72"
+    },
+    {
+      "changed_lines": 730,
+      "committed_at": "2026-08-28T17:39:01Z",
+      "diff_files_listed": 4,
+      "effect_matches": [],
+      "files": 4,
+      "human_matches": [],
+      "oracle_families": [
+        "edi",
+        "rates",
+        "outbound"
+      ],
+      "outcome": "clear",
+      "pr": 1393,
+      "sha": "bf4a2271534a"
+    },
+    {
+      "changed_lines": 22,
+      "committed_at": "2026-08-28T03:05:09Z",
+      "diff_files_listed": 2,
+      "effect_matches": [],
+      "files": 2,
+      "human_matches": [],
+      "oracle_families": [
+        "edi"
+      ],
+      "outcome": "clear",
+      "pr": 1390,
+      "sha": "ac620027f307"
+    },
+    {
+      "changed_lines": 515,
+      "committed_at": "2026-08-28T02:27:21Z",
+      "diff_files_listed": 7,
+      "effect_matches": [],
+      "files": 7,
+      "human_matches": [],
+      "oracle_families": [
+        "edi",
+        "billing_codes",
+        "outbound"
+      ],
+      "outcome": "clear",
+      "pr": 1386,
+      "sha": "b7476cbf33b0"
+    },
+    {
+      "changed_lines": 400,
+      "committed_at": "2026-08-28T02:27:18Z",
+      "diff_files_listed": 2,
+      "effect_matches": [],
+      "files": 2,
+      "human_matches": [],
+      "oracle_families": [
+        "outbound"
+      ],
+      "outcome": "clear",
+      "pr": 1384,
+      "sha": "f21779f960ab"
+    },
+    {
+      "changed_lines": 67,
+      "committed_at": "2026-08-28T01:49:41Z",
+      "diff_files_listed": 11,
+      "effect_matches": [],
+      "files": 11,
+      "human_matches": [],
+      "oracle_families": [
+        "edi",
+        "outbound"
+      ],
+      "outcome": "clear",
+      "pr": 1382,
+      "sha": "6fc397a255dd"
+    },
+    {
+      "changed_lines": 111,
+      "committed_at": "2026-08-25T17:50:00Z",
+      "diff_files_listed": 5,
+      "effect_matches": [],
+      "files": 5,
+      "human_matches": [],
+      "oracle_families": [
+        "billing_codes"
+      ],
+      "outcome": "clear",
+      "pr": 1351,
+      "sha": "ed95d07b4674"
+    },
+    {
+      "changed_lines": 978,
+      "committed_at": "2026-08-25T17:11:02Z",
+      "diff_files_listed": 12,
+      "effect_matches": [],
+      "files": 12,
+      "human_matches": [],
+      "oracle_families": [
+        "billing_codes"
+      ],
+      "outcome": "clear",
+      "pr": 1346,
+      "sha": "1d6bb11ca778"
+    },
+    {
+      "changed_lines": 1000,
+      "committed_at": "2026-08-25T16:15:00Z",
+      "diff_files_listed": 11,
+      "effect_matches": [],
+      "files": 11,
+      "human_matches": [],
+      "oracle_families": [
+        "billing_codes"
+      ],
+      "outcome": "clear",
+      "pr": 1344,
+      "sha": "0776a734764a"
+    },
+    {
+      "changed_lines": 148,
+      "committed_at": "2026-08-25T10:04:03Z",
+      "diff_files_listed": 2,
+      "effect_matches": [],
+      "files": 2,
+      "human_matches": [],
+      "oracle_families": [
+        "edi"
+      ],
+      "outcome": "clear",
+      "pr": 1335,
+      "sha": "3ebf398d061c"
+    },
+    {
+      "changed_lines": 149,
+      "committed_at": "2026-08-24T23:31:05Z",
+      "diff_files_listed": 2,
+      "effect_matches": [],
+      "files": 2,
+      "human_matches": [],
+      "oracle_families": [
+        "edi",
+        "outbound"
+      ],
+      "outcome": "clear",
+      "pr": 1313,
+      "sha": "c245a0fb1f43"
+    },
+    {
+      "changed_lines": 4,
+      "committed_at": "2026-08-24T17:51:52Z",
+      "diff_files_listed": 2,
+      "effect_matches": [],
+      "files": 2,
+      "human_matches": [],
+      "oracle_families": [
+        "billing_codes",
+        "outbound"
+      ],
+      "outcome": "clear",
+      "pr": 1301,
+      "sha": "cb928c145ce8"
+    },
+    {
+      "changed_lines": 238,
+      "committed_at": "2026-08-22T01:02:11Z",
+      "diff_files_listed": 9,
+      "effect_matches": [],
+      "files": 9,
+      "human_matches": [],
+      "oracle_families": [
+        "billing_codes",
+        "rates"
+      ],
+      "outcome": "clear",
+      "pr": 1288,
+      "sha": "0546c85f0489"
+    },
+    {
+      "changed_lines": 115,
+      "committed_at": "2026-08-21T22:46:24Z",
+      "diff_files_listed": 3,
+      "effect_matches": [],
+      "files": 3,
+      "human_matches": [],
+      "oracle_families": [
+        "billing_codes",
+        "rates"
+      ],
+      "outcome": "clear",
+      "pr": 1284,
+      "sha": "62c7153ae29f"
+    },
+    {
+      "changed_lines": 611,
+      "committed_at": "2026-08-21T20:35:31Z",
+      "diff_files_listed": 6,
+      "effect_matches": [],
+      "files": 6,
+      "human_matches": [],
+      "oracle_families": [
+        "billing_codes"
+      ],
+      "outcome": "clear",
+      "pr": 1274,
+      "sha": "aa2c729d6893"
+    }
+  ],
+  "gate": "B",
+  "meta": {
+    "generated_at": "2026-09-14T06:32:51.964149Z",
+    "harness": "mix loopctl.gates.measure_b",
+    "head": "03ad989c711a433812727fdb4bee8d512857fe5d",
+    "limit": null,
+    "repo": "mkreyman/home_care_billing",
+    "since": null,
+    "trigger_fingerprint": "5d6b6b65b602",
+    "trigger_shape": {
+      "effect_patterns": 13,
+      "human_patterns": 3,
+      "repos": 1,
+      "version": 1
+    },
+    "trigger_status": {
+      "status": "parsed"
+    },
+    "until": null
+  },
+  "oracle_families": {
+    "billing_codes": 199,
+    "edi": 297,
+    "outbound": 276,
+    "rates": 228
+  },
+  "outcomes": {
+    "clear": 45,
+    "human": 731,
+    "prove_effect": 56,
+    "size_bound": 21,
+    "unreadable": 1
+  },
+  "question": "Of the changes Gate B and the size bound would let through, how many can move claim output?",
+  "reason_kinds": {
+    "hard_bound_changed_lines_exceeded": 272,
+    "hard_bound_files_exceeded": 239,
+    "human_path": 150,
+    "max_changed_lines_exceeded": 272,
+    "max_files_exceeded": 239,
+    "stale_trigger": 712
+  },
+  "reason_kinds_by_outcome": {
+    "clear": {},
+    "human": {
+      "hard_bound_changed_lines_exceeded": 233,
+      "hard_bound_files_exceeded": 215,
+      "human_path": 150,
+      "max_changed_lines_exceeded": 233,
+      "max_files_exceeded": 215,
+      "stale_trigger": 712
+    },
+    "prove_effect": {
+      "hard_bound_changed_lines_exceeded": 23,
+      "hard_bound_files_exceeded": 12,
+      "max_changed_lines_exceeded": 23,
+      "max_files_exceeded": 12
+    },
+    "size_bound": {
+      "hard_bound_changed_lines_exceeded": 16,
+      "hard_bound_files_exceeded": 12,
+      "max_changed_lines_exceeded": 16,
+      "max_files_exceeded": 12
+    },
+    "unreadable": {}
+  },
+  "scope_note": "`clear` is Gate B's own clear plus the size bound, NOT the auto-merge set. Loopctl.Delivery.MergePrecondition additionally requires Gate A, custody, an unmoved head and an open pull request, so `clear` is a strict SUPERSET of what would actually auto-merge. The false-negative rate survives that: everything the merge precondition adds can only REMOVE changes from this set, never add one.",
+  "size_bounded_by_outcome": {
+    "clear": 0,
+    "human": 284,
+    "prove_effect": 27,
+    "size_bound": 21,
+    "unreadable": 0
+  },
+  "strata": {
+    "all": {
+      "changes": 853,
+      "clear_rate": 0.05275498241500586,
+      "cleared": 45,
+      "false_negative_rate": 0.37777777777777777,
+      "false_negatives": 17,
+      "first": "2025-12-13T03:59:33Z",
+      "last": "2026-09-14T01:41:33Z",
+      "scored_clears": 45,
+      "unscored_clears": 0
+    },
+    "configuration_applied": {
+      "changes": 141,
+      "clear_rate": 0.3191489361702128,
+      "cleared": 45,
+      "false_negative_rate": 0.37777777777777777,
+      "false_negatives": 17,
+      "first": "2026-08-20T19:56:14Z",
+      "last": "2026-09-14T01:41:33Z",
+      "scored_clears": 45,
+      "unscored_clears": 0
+    },
+    "configuration_applied_production_files": {
+      "changes": 117,
+      "clear_rate": 0.2222222222222222,
+      "cleared": 26,
+      "false_negative_rate": 0.4230769230769231,
+      "false_negatives": 11,
+      "first": "2026-08-20T19:56:14Z",
+      "last": "2026-09-14T01:41:33Z",
+      "scored_clears": 26,
+      "unscored_clears": 0
+    }
+  },
+  "totals": {
+    "changes": 854,
+    "readable": 853,
+    "unreadable": 1,
+    "with_stale_triggers": 712
+  },
+  "unreadable": [
+    {
+      "error_kind": "root_commit",
+      "sha": "2da65a55f054"
+    }
+  ],
+  "unscored_clears": []
+}

@@ -3,6 +3,7 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDriftTest do
 
   import ExUnit.CaptureIO
 
+  alias Loopctl.DeliveryGates.Measurement.Report
   alias Loopctl.DeliveryGates.Triggers
   alias Mix.Tasks.Loopctl.Gates.CheckDrift
 
@@ -93,60 +94,61 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDriftTest do
   end
 
   describe "one redaction rule, not two" do
-    # Two implementations of one redaction rule is the underlying defect behind the leak, and
-    # this task still has its own list only because the measurement harness is not on this
-    # branch yet (PR #830 is unmerged, so a call to it would not compile). This test is the
-    # forcing function: the moment that module IS available, the suite goes red until the
-    # duplicate list is deleted and the routing done. A reminder in a comment would not.
-    @report_module Module.concat([:Loopctl, :DeliveryGates, :Measurement, :Report])
+    # This replaces a test that REFUSED while #830 was unmerged and named the four steps to
+    # take once it landed. It has done its job: the module reached master, the test went red —
+    # in CI first, on the merge commit GitHub builds, one step earlier than designed — and
+    # these are the steps it asked for.
+    #
+    # Keys are named LITERALLY here, never derived from published_meta_keys/0. A test that
+    # builds its expectation from the list it is checking moves with any change to that list
+    # and can never go red when a key is dropped.
 
-    test "the local allow-list is deleted as soon as #830's is callable" do
-      refute Code.ensure_loaded?(@report_module), """
-      #{inspect(@report_module)} is now on this branch, so this task must stop defining its own
-      allow-list.
+    @leaky_meta %{
+      repo: "acme/app",
+      head: "abc123",
+      checkout: "/home/someone/workspace/target",
+      tree_files: 3982,
+      ref: "HEAD",
+      trigger_fingerprint: "0123456789ab",
+      trigger_checksum_source: "operator_pin",
+      generated_at: "2026-09-14T00:00:00Z",
+      harness: "mix loopctl.gates.check_drift"
+    }
 
-      Do this, in the same commit as the merge that brought it in:
+    test "one meta, both artifacts, the same published keys" do
+      drift = CheckDrift.report([], @leaky_meta, :redacted).meta
+      measurement = Report.gate_b([], @leaky_meta, detail: :redacted).meta
 
-        1. delete @published_meta_keys and published_meta_keys/0 from
-           Mix.Tasks.Loopctl.Gates.CheckDrift
-        2. defp meta(meta, _redacted), do: Map.take(meta, Report.published_meta_keys())
-        3. add :trigger_checksum_source to Report's @meta_published, with the reason: it is a
-           property of the RUN rather than of the machine or the target, and it is the only
-           field that says whether the fingerprint was verified against the checksum production
-           pinned or merely recomputed from a local file
-        4. replace this test with one asserting both call sites redact ONE input to the same
-           key set, with the keys named literally
-
-      Verified equivalent against #830 at 3d260ca: for this task's meta,
-      Map.take(meta, Report.published_meta_keys()) yields the same keys as
-      Report.gate_b([], meta, detail: :redacted).meta, plus :trigger_checksum_source once
-      step 3 is done.
-      """
+      assert Enum.sort(Map.keys(drift)) == Enum.sort(Map.keys(measurement)),
+             "the two artifacts no longer redact one meta to the same keys"
     end
 
-    test "this task publishes nothing #830's allow-list would not, bar the one added key" do
-      # #830's list, transcribed literally at 3d260ca rather than read from the module — the
-      # module is not here, and transcribing is what makes this go red if the lists diverge.
-      eight_thirty = [
-        :corpus,
-        :corpus_fingerprint,
-        :generated_at,
-        :gate,
-        :harness,
-        :head,
-        :limit,
-        :repo,
-        :since,
-        :tickets,
-        :trigger_fingerprint,
-        :trigger_shape,
-        :trigger_status,
-        :unparseable_records,
-        :until
-      ]
+    test "neither artifact publishes a local path or the target's size" do
+      for meta <- [
+            CheckDrift.report([], @leaky_meta, :redacted).meta,
+            Report.gate_b([], @leaky_meta, detail: :redacted).meta
+          ] do
+        refute Map.has_key?(meta, :checkout)
+        refute Map.has_key?(meta, :tree_files)
+        refute Map.has_key?(meta, :ref)
+      end
+    end
 
-      assert CheckDrift.published_meta_keys() -- eight_thirty == [:trigger_checksum_source],
-             "this task publishes a key #830's allow-list does not, beyond the one agreed"
+    test "the run's checksum provenance survives, because it is what makes a pin readable" do
+      assert CheckDrift.report([], @leaky_meta, :redacted).meta.trigger_checksum_source ==
+               "operator_pin"
+    end
+
+    test "the keys that identify a run survive in both" do
+      for meta <- [
+            CheckDrift.report([], @leaky_meta, :redacted).meta,
+            Report.gate_b([], @leaky_meta, detail: :redacted).meta
+          ] do
+        assert meta.repo == "acme/app"
+        assert meta.head == "abc123"
+        assert meta.trigger_fingerprint == "0123456789ab"
+        assert meta.generated_at == "2026-09-14T00:00:00Z"
+      end
     end
   end
 
@@ -768,10 +770,26 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDriftTest do
       assert repo |> git!(["config", "--local", "--get", "user.name"]) |> String.trim() ==
                "fixture"
 
-      # And the real repository's identity is untouched by that write.
-      {real_ident, 0} = System.cmd("git", ["var", "GIT_AUTHOR_IDENT"], cd: File.cwd!())
+      # And nothing of the fixture's reached THIS repository's local config, which is the thing
+      # actually at risk: linked worktrees share it, so a fixture identity written here would
+      # author the next commit from any of them.
+      #
+      # Asserted on the LOCAL config, not on the resolved identity. Resolving requires an
+      # identity to exist, and CI has none — no user.name, no user.email, no global config — so
+      # `git var GIT_AUTHOR_IDENT` exits non-zero there and the assertion blew up on a machine
+      # that had nothing wrong with it. A test about identity POLLUTION that only runs where an
+      # identity is already configured is the same shape as a guard that cannot fail.
+      for key <- ~w(user.name user.email) do
+        {value, status} =
+          System.cmd("git", ["config", "--local", "--get", key],
+            cd: File.cwd!(),
+            stderr_to_stdout: true
+          )
 
-      refute real_ident =~ "fixture@example.invalid"
+        # `--get` exits 1 with empty output when the key is unset, which is the expected state.
+        assert status == 1 and String.trim(value) == "",
+               "this repository's local #{key} is set to #{inspect(String.trim(value))}"
+      end
     end
   end
 

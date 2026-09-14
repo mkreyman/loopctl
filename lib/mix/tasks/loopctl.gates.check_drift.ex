@@ -57,7 +57,7 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDrift do
   fingerprint, whether that fingerprint was pinned or computed, the timestamp and the harness.
 
   The list is an allow-list rather than a deny-list because the two fail in opposite directions
-  and only one of them is noticed — see the note above `@published_meta_keys`. A key nobody has
+  and only one of them is noticed — see the note above `Report.published_meta_keys/0`. A key nobody has
   thought of yet is full-detail only, by default, without anyone having to remember.
 
   ## Fail closed
@@ -71,6 +71,7 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDrift do
 
   use Mix.Task
 
+  alias Loopctl.DeliveryGates.Measurement.Report
   alias Loopctl.DeliveryGates.TriggerDrift
   alias Loopctl.DeliveryGates.Triggers
 
@@ -129,54 +130,14 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDrift do
     report_drift(coverage)
   end
 
-  # The `meta` keys a REDACTED artifact publishes. An ALLOW-list: everything not named here is
-  # full-detail only, including a key nobody has thought of yet.
+  # `meta` is redacted by the SAME allow-list the measurement artifacts use
+  # (`Report.published_meta_keys/0`), not by a second list here. This task carried its own for
+  # one round, only because #830 was unmerged and a call to that module would not have compiled;
+  # a test refused the moment it became loadable, and this is that refusal being honoured.
   #
-  # This was a DENY-list for one round, on the argument that a new key then shows up in a diff
-  # rather than vanishing silently. That argument loses to a measurement. A deny-list is updated
-  # by whoever ADDS a key; an allow-list is updated by whoever wants one PUBLISHED, which is the
-  # person who has thought about it — and the same leak escaped review twice under the first
-  # rule, in PR #830's first round (two absolute paths) and in this task's first round
-  # (`:checkout`, plus `:tree_files`, which nobody had discussed at all). "A reviewer sees it in
-  # the diff" is a claim about reviewers, and the reviewers did not see it either time.
-  #
-  # The two failure modes are not symmetric, which is what decides it. An allow-list fails by
-  # DROPPING a field somebody wanted, and a missing field on an artifact gets noticed. A
-  # deny-list fails by PUBLISHING a path out of a private repository, and nothing notices.
-  #
-  # Why each of these is safe to publish:
-  #
-  # - `:repo` — the `owner/repo` key, already public in the design document.
-  # - `:head` — the commit the tree was read at. It identifies the corpus and describes nothing.
-  # - `:trigger_fingerprint` — 12 characters of the document's SHA-256, the same truncated
-  #   commitment the measurement artifacts publish and for the same reason.
-  # - `:trigger_checksum_source` — `"operator_pin"` or `"computed"`. A property of the RUN, not
-  #   of the machine or the target: it is the only field that says whether the fingerprint was
-  #   verified against the checksum production pinned or merely recomputed from a local file.
-  # - `:generated_at`, `:harness` — when, and by what.
-  #
-  # Deliberately NOT here: `:checkout` and `:tree_files` (an absolute local path, and a private
-  # repository's file count, which no reading of "a boolean, not a count" permits), and `:ref`
-  # (the resolved head sha is strictly more precise about which tree was read).
-  @published_meta_keys [
-    :generated_at,
-    :harness,
-    :head,
-    :repo,
-    :trigger_checksum_source,
-    :trigger_fingerprint
-  ]
-
-  @doc """
-  The `meta` keys a REDACTED artifact publishes.
-
-  Public so a test can bind this task's redaction to the measurement harness's — two
-  implementations of one redaction rule is the underlying defect, and this list is the half of
-  it that survives until `Loopctl.DeliveryGates.Measurement.Report` is on this branch and can be
-  called directly.
-  """
-  @spec published_meta_keys() :: [atom()]
-  def published_meta_keys, do: @published_meta_keys
+  # An allow-list and not a deny-list, and the reasoning is #830's: a deny-list is updated by
+  # whoever ADDS a key, an allow-list by whoever wants one PUBLISHED — which is the person who
+  # has thought about it. The same leak escaped review twice under the other rule.
 
   @doc """
   The artifact, as a map. Public so the test asserting over a committed artifact and the task
@@ -201,7 +162,7 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDrift do
   end
 
   defp meta(meta, :full), do: meta
-  defp meta(meta, _redacted), do: Map.take(meta, @published_meta_keys)
+  defp meta(meta, _redacted), do: Map.take(meta, Report.published_meta_keys())
 
   # Redacted: kind, configuration index, and whether the pattern matched anything. The pattern
   # text is the guard map itself, and the match count is how broadly each guard reaches; neither
