@@ -14,7 +14,11 @@ All notable changes to loopctl are documented here.
   Before this, a dispatch reached a real runner whose first stage report was refused
   `stale_stage`, because nothing had claimed the story.
 
-  **It is human-anchored, and the gate is in the CONTEXT rather than a plug.** Minting a
+  **It is halt-gated and human-anchored, and both gates are in the CONTEXT rather than a
+  plug.** A halted tenant (L6) is refused `tenant_halted` before anything is minted:
+  `CheckCustodyHalt` is a pipeline plug that blocks both of the endpoints a placement stands
+  in for, and `Runners.dispatch/3`'s own halt check runs after the mint and after both
+  commits. Minting a
   custody dispatch and driving a chained custody transition are both behind
   `RequireHumanAnchor` on the HTTP surface, and this path has no `conn` — a worker or an MCP
   tool calls it directly — so it calls `Loopctl.Tenants.require_human_anchor/1` itself and

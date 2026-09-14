@@ -1345,6 +1345,44 @@ defmodule Loopctl.Progress do
   def claim_release_change(%Story{claim_epoch: epoch}),
     do: %{claimed_until: nil, claim_epoch: epoch + 1, review_requested_at: nil}
 
+  @doc """
+  Clears a story's `implementer_dispatch_id` when the dispatch it names NEVER IMPLEMENTED
+  ANYTHING — the placement compensation path (`Loopctl.Delivery.Placement`, #803) and nothing
+  else.
+
+  `release_claim_changes/1` deliberately does not clear it: an unclaimed or reclaimed story
+  keeps the provenance of who was working on it, which is what the L4 gates compare. The one
+  case where that provenance is VACUOUS is a placement that claimed a story, failed before any
+  session started, and released it again — the recorded dispatch did nothing, and the placement
+  is about to revoke it.
+
+  Leaving it is not tidy-up, it is a poisoned story: a REVOKED recorded dispatch resolves to an
+  empty lineage, which `lineage_status/2` treats as `:unresolvable` and fails CLOSED, so the
+  next agent to do the work could never report it; an UNREVOKED one refuses that agent with
+  `caller_lineage_required` instead.
+
+  **Both conditions in the WHERE are load-bearing, and neither may be relaxed.** It clears only
+  when the story still names THIS dispatch — so it can never erase a different implementer's
+  provenance — and only while the story is `pending`, so a story somebody re-claimed between
+  the release and this call is left exactly as it is. Nothing is audited because nothing about
+  the story's HISTORY changes: `lifecycle_entered_at` is already stamped by the release, and
+  the mint, the claim and the release each wrote their own record.
+  """
+  @spec clear_unused_implementer_dispatch(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, :cleared | :unchanged}
+  def clear_unused_implementer_dispatch(tenant_id, story_id, dispatch_id)
+      when is_binary(tenant_id) and is_binary(story_id) and is_binary(dispatch_id) do
+    {count, _} =
+      from(s in Story,
+        where: s.tenant_id == ^tenant_id and s.id == ^story_id,
+        where: s.implementer_dispatch_id == ^dispatch_id,
+        where: s.agent_status == :pending
+      )
+      |> AdminRepo.update_all(set: [implementer_dispatch_id: nil])
+
+    if count == 1, do: {:ok, :cleared}, else: {:ok, :unchanged}
+  end
+
   # The one release shape shared by unclaim, force-unclaim and the lease reclaimer.
   defp release_claim_changes(story) do
     Map.merge(

@@ -43,7 +43,7 @@ defmodule Loopctl.Delivery.Placement do
   key's role is at least `:user` — the same positive operator test, for the same reason: an
   empty lineage is also what a legacy env-var key and an unresolvable dispatch look like.
 
-  ## The human anchor is applied HERE, because no plug can be
+  ## The halt and the human anchor are applied HERE, because no plug can be
 
   Minting a custody dispatch and driving a chained custody transition are both behind
   `LoopctlWeb.Plugs.RequireHumanAnchor` on the HTTP surface, and `Dispatches.create_dispatch/3`
@@ -55,6 +55,18 @@ defmodule Loopctl.Delivery.Placement do
   `lib/loopctl_web` only and cannot see a context-layer gate at all. Letting an agent-rooted
   tenant through would be an L0 regression, and it would be one that the existing drift guard
   was structurally incapable of noticing.
+
+  **The same argument applies to the L6 HALT, and the tier gate alone did not cover it.**
+  `CheckCustodyHalt` is a PIPELINE plug, so it blocks `POST /stories/:id/claim` and
+  `POST /api/v1/dispatches` — the two things a placement does — and neither
+  `Progress.claim_story/3` nor `Dispatches.create_dispatch/3` checks a halt itself.
+  `Runners.dispatch/3` does, but at step 2 of the PUSH, which here runs after the mint and
+  after both commits: a halted tenant would have got a live ephemeral key, two IMMUTABLE chain
+  entries appended under its own chain lock, and a claim-then-release. A halt is what L6 does
+  when the system believes the tenant is being lied to, so `not_halted/1` runs before any of
+  it. Note also that the lease is NOT a backstop for a halted tenant —
+  `Loopctl.Workers.ReclaimExpiredClaimsWorker` skips them — so a claim left standing there
+  would never be reclaimed.
 
   ## The credential the session dispatch mints does NOT reach the session
 
@@ -150,7 +162,9 @@ defmodule Loopctl.Delivery.Placement do
 
   @type error ::
           :root_dispatch_forbidden
+          | :insufficient_role
           | :custody_tier_required
+          | :tenant_halted
           | :not_authorized
           | :runner_not_provisioned
           | :invalid_transition
@@ -190,11 +204,17 @@ defmodule Loopctl.Delivery.Placement do
 
   ## Refusals
 
+  - `:tenant_halted` — the tenant's custody operations are halted (L6). Checked BEFORE the
+    mint, because `CheckCustodyHalt` is a pipeline plug and this path has no `conn`, and
+    because `Runners.dispatch/3`'s own halt check runs after both commits.
   - `:custody_tier_required` — an `agent_rooted` tenant. This path mints a custody dispatch
     and drives a chained custody transition, both of which the HTTP surface gates behind
     `LoopctlWeb.Plugs.RequireHumanAnchor`; a context reachable from a worker or an MCP tool
     has to apply the same gate itself (`Loopctl.Tenants.require_human_anchor/1`).
   - `:root_dispatch_forbidden` — an unlineaged caller below `:user` (see the moduledoc)
+  - `:insufficient_role` — a LINEAGED caller below `:orchestrator`. Minting a dispatch is
+    `RequireRole, role: :orchestrator` on the HTTP surface and `create_dispatch/3` has no role
+    gate of its own, so this path applies it.
   - `:not_authorized` — a key from another tenant, or no such runner in this tenant, or its
     row, key or tenant is no longer valid
   - `:runner_not_provisioned` — a runner row with no `agent_id`, which the
@@ -229,6 +249,7 @@ defmodule Loopctl.Delivery.Placement do
     with {:ok, dispatch_id} <- fetch_uuid(dispatch, "dispatch_id"),
          {:ok, story_id} <- fetch_uuid(dispatch, "story_id"),
          {:ok, caller} <- resolve_caller(tenant_id, Keyword.fetch!(opts, :api_key)),
+         :ok <- not_halted(tenant_id),
          :ok <- Tenants.require_human_anchor(tenant_id),
          :ok <- may_mint_session_dispatch(caller.lineage, caller.role) do
       case DispatchLedger.get_record(tenant_id, dispatch_id) do
@@ -254,6 +275,29 @@ defmodule Loopctl.Delivery.Placement do
   end
 
   defp resolve_caller(_tenant_id, _api_key), do: {:error, :not_authorized}
+
+  # THE L6 HALT, applied here for the same reason the tier gate is: `CheckCustodyHalt` is a
+  # PIPELINE plug, and this path has no `conn`. Both endpoints that do what a placement does —
+  # `POST /stories/:id/claim` and `POST /api/v1/dispatches` — are blocked by it during a halt,
+  # and neither `Progress.claim_story/3` nor `Dispatches.create_dispatch/3` checks a halt
+  # itself.
+  #
+  # `Runners.dispatch/3` checks one, but at step 2 of the PUSH — which in `place/4` runs after
+  # the mint and after both commits. Without this a placement on a halted tenant would mint a
+  # dispatch and a live ephemeral key, append `dispatch_created` and `story_stage_claimed` to
+  # the IMMUTABLE chain under the tenant's chain lock, claim the story and then release it.
+  # A halt is what L6 does when the system believes the tenant is being lied to, so custody
+  # progress and two permanent chain entries are exactly what must not happen — and the
+  # compensation is not a consolation either, because
+  # `Loopctl.Workers.ReclaimExpiredClaimsWorker` skips halted tenants, so a claim left standing
+  # by a failed release would never be reclaimed.
+  #
+  # Read FRESH, like the tier: `Runners.custody_halted?/1` re-reads the tenant rather than
+  # trusting a struct loaded earlier, which is the whole point on a value that flips precisely
+  # when something has gone wrong.
+  defp not_halted(tenant_id) do
+    if Runners.custody_halted?(tenant_id), do: {:error, :tenant_halted}, else: :ok
+  end
 
   # A retry of a dispatch the ledger already holds. Nothing is claimed, minted or bumped: the
   # placement already happened, and what is left is to put the frame on the wire again under
@@ -375,7 +419,10 @@ defmodule Loopctl.Delivery.Placement do
        }}
     else
       {:error, reason} ->
-        release_claim(tenant_id, story.id, reason, opts)
+        # BOTH, and the dispatch revoke is not optional here either. The claim goes back, and
+        # the session dispatch it recorded is revoked and UNRECORDED — see
+        # `undo_claim/5` for why leaving the id behind is worse than leaving it unrevoked.
+        undo_claim(tenant_id, story.id, session, reason, opts)
         {:error, reason}
     end
   end
@@ -435,7 +482,15 @@ defmodule Loopctl.Delivery.Placement do
     if Role.role_at_least?(role, :user), do: :ok, else: {:error, :root_dispatch_forbidden}
   end
 
-  defp may_mint_session_dispatch([_ | _], _role), do: :ok
+  # THE ROLE CEILING, which the empty-lineage clause above only happened to cover. Minting a
+  # dispatch is `RequireRole, role: :orchestrator` on `DispatchController.:create`, and
+  # `create_dispatch/3` has no caller-role gate of its own — the plug IS the gate there. So a
+  # lineaged AGENT-role key, which the HTTP surface 403s, minted a child custody dispatch and a
+  # live ephemeral key through this path until this clause tested the role too. `:user` clears
+  # `:orchestrator` by hierarchy, so the clause above is strictly stronger and the two agree.
+  defp may_mint_session_dispatch([_ | _], role) do
+    if Role.role_at_least?(role, :orchestrator), do: :ok, else: {:error, :insufficient_role}
+  end
 
   # The runner's agent, read through the tenant-scoped registry so another tenant's runner id
   # resolves to nothing. `nil` is not "claim for nobody": a story whose `implementer_dispatch_id`
@@ -447,6 +502,30 @@ defmodule Loopctl.Delivery.Placement do
       {:ok, %{agent_id: agent_id}} -> {:ok, agent_id}
       {:error, :not_found} -> {:error, :not_authorized}
     end
+  end
+
+  # THE WHOLE UNDO: release the claim, UNRECORD the session dispatch, then revoke it. Three
+  # steps because the claim's release does only the first.
+  #
+  # `Progress.release_claim_changes/1` clears `assigned_agent_id` and does NOT clear
+  # `implementer_dispatch_id` — correctly, for its own callers: a reclaimed or unclaimed story
+  # keeps the provenance of who was working on it. Here nobody was. Leaving the id behind on a
+  # story going back to `pending` is not merely untidy, it POISONS the story two ways:
+  #
+  # - revoked-and-recorded is the worse half. `Progress`' `lineage_status/2` resolves the
+  #   recorded dispatch's lineage, a revoked row yields `[]`, and `[]` there is
+  #   `:unresolvable` — fail CLOSED — so the next agent to do this story could never report it.
+  # - unrevoked-and-recorded is the half the review found: `validate_not_self_report/3` refuses
+  #   the agent that actually did the work with `caller_lineage_required`, because its own
+  #   lineage is not the stale one the story names.
+  #
+  # So the order matters: unrecord BEFORE revoking, and make the unrecord conditional on the
+  # story still naming THIS dispatch and still being unclaimed, so a story someone re-claimed
+  # in the meantime is left entirely alone.
+  defp undo_claim(tenant_id, story_id, session, reason, opts) do
+    release_claim(tenant_id, story_id, reason, opts)
+    Progress.clear_unused_implementer_dispatch(tenant_id, story_id, session.id)
+    revoke_session_dispatch(tenant_id, session, reason)
   end
 
   # Compensation, not a second decision. A refusal after the claim committed means no session

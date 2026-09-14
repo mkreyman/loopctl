@@ -176,6 +176,42 @@ defmodule Loopctl.Delivery.PlacementTest do
       assert unboxed(fn -> session_dispatch_count(runner.tenant_id, story.id) end) == 0
     end
 
+    test "a halted tenant is refused the whole path, and nothing is minted or claimed", ctx do
+      # L6. `CheckCustodyHalt` is a pipeline plug and there is no `conn` here;
+      # `Runners.dispatch/3`'s own halt check runs at the PUSH, after the mint and after both
+      # commits. And the usual backstop does not apply — `ReclaimExpiredClaimsWorker` skips
+      # halted tenants — so a claim left standing on one is never reclaimed.
+      %{runner: runner, story: story} = ctx
+      before = unboxed(fn -> tenant_dispatch_count(runner.tenant_id) end)
+      unboxed(fn -> halt_custody(runner.tenant_id) end)
+
+      assert {:error, :tenant_halted} = place(ctx, dispatch_payload(story))
+      refute_push "dispatch", _pushed, 200
+
+      assert unboxed(fn -> tenant_dispatch_count(runner.tenant_id) end) == before
+      untouched = unboxed(fn -> reload(runner.tenant_id, story.id) end)
+      assert untouched.agent_status == :contracted
+      assert untouched.claim_epoch == story.claim_epoch
+      assert unboxed(fn -> chain_entry_count(runner.tenant_id) end) == 0
+    end
+
+    test "a lineaged caller below :orchestrator may not mint at all", ctx do
+      # `DispatchController` mounts `RequireRole, role: :orchestrator` on `:create` and
+      # `create_dispatch/3` has no role gate of its own, so without this an AGENT-role key that
+      # some dispatch minted could mint a child custody dispatch and a live ephemeral key
+      # through a path the HTTP surface 403s.
+      %{runner: runner, story: story} = ctx
+      %{api_key: agent_key} = unboxed(fn -> lineaged_agent(runner.tenant_id) end)
+      before = unboxed(fn -> tenant_dispatch_count(runner.tenant_id) end)
+
+      assert {:error, :insufficient_role} =
+               place(ctx, dispatch_payload(story), api_key: agent_key)
+
+      refute_push "dispatch", _pushed, 200
+      assert unboxed(fn -> tenant_dispatch_count(runner.tenant_id) end) == before
+      assert unboxed(fn -> reload(runner.tenant_id, story.id) end).agent_status == :contracted
+    end
+
     test "a story that is not ready is refused BEFORE anything is minted", ctx do
       %{runner: runner, story: story} = ctx
       before = unboxed(fn -> tenant_dispatch_count(runner.tenant_id) end)
@@ -310,6 +346,15 @@ defmodule Loopctl.Delivery.PlacementTest do
       assert row.stage == :queued
       assert is_nil(row.runner_id)
       assert row.claim_epoch == released.claim_epoch
+
+      # The claim's release does NOT clear `implementer_dispatch_id` — correctly, for its own
+      # callers — so the undo has to, and it has to revoke the dispatch too. Left recorded, a
+      # REVOKED dispatch resolves to an empty lineage, which `lineage_status/2` fails CLOSED on
+      # (`unresolvable_dispatch_lineage`), so the next agent to do this story could never
+      # report it; left recorded and UNREVOKED, that agent is refused
+      # `caller_lineage_required` instead. Both are a story poisoned by a session that never ran.
+      assert is_nil(released.implementer_dispatch_id)
+      assert unboxed(fn -> session_dispatch(runner.tenant_id, story.id) end).revoked_at
     end
 
     test "a payload with no usable dispatch_id is refused before anything is claimed", ctx do
@@ -365,6 +410,14 @@ defmodule Loopctl.Delivery.PlacementTest do
       # vocabulary list can decide, because the next such field will be named something nobody
       # listed. Pinning the set makes whoever adds ANY field come and look at this test, which
       # is the only place the question gets asked.
+      #
+      # AT EVERY DEPTH THE PAYLOAD HAS. `cast_dispatch/1` drops undeclared keys at any depth,
+      # so a credential can only arrive in a DECLARED field — and a field declared under the
+      # nested `story:` object leaves the top-level key set unchanged. Pinning one level and
+      # claiming the property for the whole payload is the same defect as the substring match,
+      # one level of nesting along. `RunnerStory`'s own properties are scalars and arrays of
+      # scalars, so these two sets are the whole shape; a THIRD level would need its own line
+      # here, which is the point of asserting rather than describing.
       assert RunnerContract.RunnerDispatch.schema().properties |> Map.keys() |> Enum.sort() == [
                :base_branch,
                :branch,
@@ -377,6 +430,16 @@ defmodule Loopctl.Delivery.PlacementTest do
                :story_id,
                :token_budget,
                :wall_clock_seconds
+             ]
+
+      assert RunnerContract.RunnerStory.schema().properties |> Map.keys() |> Enum.sort() == [
+               :acceptance_criteria,
+               :description,
+               :domain_reference,
+               :id,
+               :test_cases,
+               :title,
+               :touches
              ]
     end
   end
@@ -421,6 +484,22 @@ defmodule Loopctl.Delivery.PlacementTest do
       Dispatches.create_dispatch(tenant_id, %{role: :orchestrator}, actor_lineage: [])
 
     %{dispatch: dispatch, api_key: AdminRepo.get!(ApiKey, dispatch.api_key_id)}
+  end
+
+  # An AGENT-role dispatch and the key it minted: lineaged, so it clears the root gate, and
+  # below `:orchestrator`, so it must not clear the mint gate.
+  defp lineaged_agent(tenant_id) do
+    {:ok, %{dispatch: dispatch}} =
+      Dispatches.create_dispatch(tenant_id, %{role: :agent, agent_id: nil}, actor_lineage: [])
+
+    %{dispatch: dispatch, api_key: AdminRepo.get!(ApiKey, dispatch.api_key_id)}
+  end
+
+  defp halt_custody(tenant_id) do
+    Tenant
+    |> AdminRepo.get!(tenant_id)
+    |> Ecto.Changeset.change(custody_halted_at: DateTime.utc_now())
+    |> AdminRepo.update!()
   end
 
   defp set_trust_tier(tenant_id, tier) do
