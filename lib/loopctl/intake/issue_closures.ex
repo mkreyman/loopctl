@@ -215,13 +215,20 @@ defmodule Loopctl.Intake.IssueClosures do
       updated_at: now
     }
 
-    # The unique index decides the replay. Zero rows inserted means a row for this story
-    # already exists — this verdict has been recorded — which is success, not a conflict.
-    _ =
-      repo.insert_all(IssueClosure, [row],
-        on_conflict: :nothing,
-        conflict_target: [:tenant_id, :story_id]
-      )
+    # The unique indexes decide the replay. Zero rows inserted means a closure for this story
+    # — or for its intake record — already exists, which is success, not a conflict.
+    #
+    # NO `conflict_target`, deliberately (#826 round 2, finding 5). A target names ONE index,
+    # so a conflict on the other raised instead — inside a function whose moduledoc says a
+    # failure here is uncaught on purpose, which would roll the verdict transition back and
+    # leave the story permanently un-advanceable. The record-level index exists as insurance
+    # for the day the story-level one does not hold, and insurance that wedges a story is
+    # worse than none.
+    #
+    # Untargeted `ON CONFLICT DO NOTHING` covers every unique violation on the table and
+    # nothing else: a foreign-key or CHECK failure still raises, which is what the uncaught
+    # rule is actually about.
+    _ = repo.insert_all(IssueClosure, [row], on_conflict: :nothing)
 
     :ok
   end
@@ -293,18 +300,40 @@ defmodule Loopctl.Intake.IssueClosures do
 
   Every path that reaches a verdict overwrites this: `mark_closed/2` clears it,
   `mark_transient_failure/4` replaces it with the real delay.
+
+  ## The forward schedule is ALSO the mutual exclusion (#826 round 2, H1)
+
+  The predicate is `status == :pending` **AND the row being DUE** — `next_attempt_at` null or
+  in the past — and the update pushes `next_attempt_at` forward. Those two together are the
+  compare-and-set: of two drainers that read the same candidate, the first commits and moves
+  the row out of "due", and the second matches nothing and is refused `:not_pending`.
+
+  The status test alone was NOT mutual exclusion, and three moduledocs called it one. A claim
+  leaves the row `:pending`, so both callers matched, both got `{:ok, claimed}`, and both went
+  on to label, COMMENT and close — two resolution comments on the reporter's ticket. Nothing
+  in this module prevented it; what happened to prevent it in practice was Oban's `unique`
+  option plus cron leadership, which is not the stated mechanism and does not survive a manual
+  enqueue or a retry landing beside a slow run.
+
+  The loser's `{:error, :not_pending}` is therefore an ordinary outcome under concurrency, not
+  a bug: `Loopctl.Delivery.IssueCloser` reports it as `:skipped` and makes no forge call.
   """
   @spec claim_attempt(Ecto.UUID.t(), Ecto.UUID.t()) ::
           {:ok, IssueClosure.t()} | {:error, :not_pending}
   def claim_attempt(tenant_id, id) do
     now = DateTime.utc_now()
 
-    update_pending(tenant_id, id,
-      set: [
-        next_attempt_at: DateTime.add(now, @in_flight_backoff_seconds, :second),
-        updated_at: now
+    update_pending(
+      tenant_id,
+      id,
+      [
+        set: [
+          next_attempt_at: DateTime.add(now, @in_flight_backoff_seconds, :second),
+          updated_at: now
+        ],
+        inc: [attempts: 1]
       ],
-      inc: [attempts: 1]
+      dynamic([c], is_nil(c.next_attempt_at) or c.next_attempt_at <= ^now)
     )
   end
 
@@ -426,27 +455,60 @@ defmodule Loopctl.Intake.IssueClosures do
   and before this existed, nothing in `lib/` could move a non-pending row, so fixing the
   secret left the whole backlog dead with no reporter ever told.
 
-  Called from a remote console after the cause is fixed:
+  ## It MUST be bounded, and it counts before it writes (#826 round 2, finding 3)
 
-      Loopctl.Intake.IssueClosures.requeue_abandoned()          # fleet-wide
-      Loopctl.Intake.IssueClosures.requeue_abandoned(tenant_id: id)
-      Loopctl.Intake.IssueClosures.requeue_abandoned(id: closure_id)
+  A closure abandoned months ago by an unrelated outage still names a live GitHub issue. Waking
+  it puts a fresh label, comment and close on a ticket the reporter has long since moved on
+  from, carrying a verdict about work nobody remembers. So an unbounded call is REFUSED:
 
-  Returns `{:ok, count}`.
+      # look first — counts, writes nothing
+      IssueClosures.requeue_abandoned(abandoned_after: ~U[2026-09-13 00:00:00Z], dry_run: true)
 
-  **`closed_by_other` is never requeued**, whatever is passed: a human already closed that
-  reporter's issue, and re-driving it is exactly the duplicate close the module exists to
-  prevent. Requeueing is otherwise SAFE to run speculatively — a row whose issue loopctl did
-  in fact close is caught by the closer's read of the issue's live state and recorded closed
-  without a second outward call.
+      # then act, over the same window
+      IssueClosures.requeue_abandoned(abandoned_after: ~U[2026-09-13 00:00:00Z])
+
+      IssueClosures.requeue_abandoned(id: closure_id)     # one row, inherently bounded
+      IssueClosures.requeue_abandoned(unbounded: true)    # everything, said out loud
+
+  Returns `{:ok, count}`, or `{:error, :bound_required}` when none of `:abandoned_after`,
+  `:id` or `unbounded: true` is given. `:tenant_id` NARROWS a window; it is not a bound of its
+  own, because one tenant's whole history is exactly the blast radius this guards.
+
+  The window is read from `updated_at`, which is when the row was abandoned: nothing writes to
+  a terminal row afterwards.
+
+  **`closed_by_other` and `source_revoked` are never requeued**, whatever is passed. A human
+  already closed that reporter's issue, or the tenant disconnected the repository; re-driving
+  either is the outward act this module exists to prevent, and fixing a token makes neither
+  right.
+
+  The safety argument for the rest is narrower than it looks and is stated rather than
+  assumed: a row whose issue loopctl DID close is caught by the closer's read of the live
+  state and recorded without a second outward call — but an ordinary `retries_exhausted` row's
+  issue is still open, and that one really will be closed. The time bound is what makes that
+  acceptable.
 
   `attempts` is reset, because the operator fixing the cause is what makes a fresh budget
   meaningful; a requeue that inherited an exhausted counter would abandon again immediately.
+  The step MARKERS are deliberately not reset — a comment already posted must not be posted
+  again.
   """
-  @spec requeue_abandoned(keyword()) :: {:ok, non_neg_integer()}
+  @spec requeue_abandoned(keyword()) ::
+          {:ok, non_neg_integer()} | {:error, :bound_required}
   def requeue_abandoned(opts \\ []) do
-    now = DateTime.utc_now()
+    if bounded?(opts), do: do_requeue(opts), else: {:error, :bound_required}
+  end
 
+  # `:tenant_id` is NOT a bound. One tenant's entire abandoned history is precisely the set
+  # that should not wake up together, so narrowing to it changes the blast radius' owner and
+  # not its size.
+  defp bounded?(opts) do
+    Keyword.has_key?(opts, :id) or
+      match?(%DateTime{}, Keyword.get(opts, :abandoned_after)) or
+      Keyword.get(opts, :unbounded) == true
+  end
+
+  defp do_requeue(opts) do
     query =
       from c in IssueClosure,
         where: c.status == :abandoned,
@@ -461,9 +523,16 @@ defmodule Loopctl.Intake.IssueClosures do
       Enum.reduce(opts, query, fn
         {:tenant_id, tenant_id}, q -> where(q, [c], c.tenant_id == ^tenant_id)
         {:id, id}, q -> where(q, [c], c.id == ^id)
+        {:abandoned_after, %DateTime{} = at}, q -> where(q, [c], c.updated_at >= ^at)
         _other, q -> q
       end)
 
+    if Keyword.get(opts, :dry_run) == true,
+      do: {:ok, AdminRepo.aggregate(query, :count)},
+      else: apply_requeue(query)
+  end
+
+  defp apply_requeue(query) do
     {count, _} =
       AdminRepo.update_all(query,
         set: [
@@ -471,7 +540,7 @@ defmodule Loopctl.Intake.IssueClosures do
           abandoned_reason: nil,
           attempts: 0,
           next_attempt_at: nil,
-          updated_at: now
+          updated_at: DateTime.utc_now()
         ]
       )
 
@@ -494,11 +563,13 @@ defmodule Loopctl.Intake.IssueClosures do
   # That is what makes the whole thing safe under two concurrent drainers and under a replay:
   # once a row is `:closed` or `:abandoned` nothing can move it, so a late writer from an
   # earlier attempt cannot resurrect it, un-close it, or reset its backoff.
-  defp update_pending(tenant_id, id, updates) do
+  defp update_pending(tenant_id, id, updates, extra_predicate \\ nil) do
     query =
       from c in IssueClosure,
         where: c.tenant_id == ^tenant_id and c.id == ^id and c.status == :pending,
         select: c
+
+    query = if extra_predicate, do: where(query, ^extra_predicate), else: query
 
     case AdminRepo.update_all(query, updates) do
       {1, [row]} -> {:ok, row}
@@ -506,9 +577,19 @@ defmodule Loopctl.Intake.IssueClosures do
     end
   end
 
-  defp backoff(attempts_made) do
-    Enum.at(@backoff_seconds, attempts_made - 1, List.last(@backoff_seconds))
-  end
+  # WHICH DELAY an attempt waits, indexed from the attempt just MADE.
+  #
+  # `attempts_made` is 1 after the first claim, so the index is one less. Zero is guarded
+  # explicitly rather than left to `Enum.at/3`, which treats -1 as "from the end" and would
+  # return the LONGEST delay as the shortest — a 48-minute first backoff. It is unreachable
+  # through `close/1`, which always claims before it can fail, but `wait_seconds/2` is public
+  # precisely so the schedule can be asserted without driving a closure, and an assertion
+  # helper that lies about its own first entry is worse than no helper (#826 round 2,
+  # finding 4).
+  defp backoff(attempts_made) when attempts_made <= 1, do: hd(@backoff_seconds)
+
+  defp backoff(attempts_made),
+    do: Enum.at(@backoff_seconds, attempts_made - 1, List.last(@backoff_seconds))
 
   defp abandon_text(:closed_by_other), do: "closed_by_other"
   defp abandon_text(:source_revoked), do: "source_revoked"

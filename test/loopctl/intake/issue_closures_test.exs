@@ -80,6 +80,34 @@ defmodule Loopctl.Intake.IssueClosuresTest do
       assert %IssueClosure{verdict: :shipped} = IssueClosures.get(ctx.tenant.id, ctx.story.id)
     end
 
+    test "a conflict on the RECORD index is absorbed, not raised", ctx do
+      other_story = fixture(:story, %{tenant_id: ctx.tenant.id})
+
+      :ok =
+        IssueClosures.record_in(AdminRepo, ctx.tenant.id, ctx.story.id, ctx.record.id, :shipped)
+
+      # A DIFFERENT story naming the SAME record. `stories_intake_record_uidx` normally makes
+      # this impossible, which is exactly why the record-level closure index is insurance for
+      # the day it does not hold — and insurance that RAISES is worse than none: `record_in/5`
+      # is deliberately uncaught, so the exception would roll the verdict transition back and
+      # leave that story permanently un-advanceable.
+      #
+      # A `conflict_target` names ONE index, so a conflict on the other one raised. Untargeted
+      # `ON CONFLICT DO NOTHING` covers both.
+      assert :ok =
+               IssueClosures.record_in(
+                 AdminRepo,
+                 ctx.tenant.id,
+                 other_story.id,
+                 ctx.record.id,
+                 :not_actionable
+               )
+
+      # One closure for the record, and it is the FIRST verdict — the reporter is told once.
+      assert [%IssueClosure{verdict: :shipped}] = IssueClosures.list(ctx.tenant.id)
+      assert IssueClosures.get(ctx.tenant.id, other_story.id) == nil
+    end
+
     test "a REVOKED source records nothing at all", ctx do
       # Revoking an intake source is a tenant disconnecting a repository. Refusing HERE is the
       # smaller of the two windows: no row is written, so there is nothing for the drainer to
@@ -129,14 +157,34 @@ defmodule Loopctl.Intake.IssueClosuresTest do
       %{closure: closure}
     end
 
-    test "claim_attempt bumps attempts and is refused once the row is terminal", ctx do
+    test "claim_attempt is MUTUAL EXCLUSION: the second claimer is refused", ctx do
       assert {:ok, %IssueClosure{attempts: 1}} =
                IssueClosures.claim_attempt(ctx.tenant.id, ctx.closure.id)
 
+      # THE ROUND-2 H1 REGRESSION TEST, and this file previously asserted the opposite.
+      #
+      # A claim leaves the row `:pending`, so a predicate testing only the status matched both
+      # callers: two drainers each got `{:ok, claimed}` and each went on to label, COMMENT and
+      # close — two resolution comments on one reporter's ticket. The claim also pushes
+      # `next_attempt_at` forward and tests it, which is what makes it a compare-and-set.
+      assert {:error, :not_pending} = IssueClosures.claim_attempt(ctx.tenant.id, ctx.closure.id)
+
+      assert %IssueClosure{attempts: 1} = IssueClosures.get(ctx.tenant.id, ctx.story.id)
+    end
+
+    test "a claim is possible again once the backoff has elapsed", ctx do
+      {:ok, _first} = IssueClosures.claim_attempt(ctx.tenant.id, ctx.closure.id)
+
+      # Exclusion, not a one-shot lock: a genuinely retryable row comes back when its wait is
+      # over, which is the whole retry mechanism.
+      make_due(ctx.closure.id)
+
       assert {:ok, %IssueClosure{attempts: 2}} =
                IssueClosures.claim_attempt(ctx.tenant.id, ctx.closure.id)
+    end
 
-      {:ok, _closed} = IssueClosures.mark_closed(ctx.tenant.id, ctx.closure.id)
+    test "a claim is refused once the row is terminal", ctx do
+      {:ok, _} = IssueClosures.mark_closed(ctx.tenant.id, ctx.closure.id)
 
       assert {:error, :not_pending} = IssueClosures.claim_attempt(ctx.tenant.id, ctx.closure.id)
     end
@@ -224,6 +272,31 @@ defmodule Loopctl.Intake.IssueClosuresTest do
     end
   end
 
+  describe "wait_seconds/2 — the schedule, asserted directly" do
+    test "zero attempts made yields the SHORTEST delay, not the longest", _ctx do
+      first = IssueClosures.wait_seconds(1, nil)
+
+      # `Enum.at(list, -1)` treats -1 as "from the end", so an unguarded index returned the
+      # 48-minute LAST entry as the first backoff. Unreachable through `close/1`, which always
+      # claims before it can fail — but this function is public precisely so the schedule can
+      # be asserted without driving a closure, and a helper that lies about its own first
+      # entry is worse than no helper.
+      assert IssueClosures.wait_seconds(0, nil) == first
+      assert IssueClosures.wait_seconds(0, nil) < List.last(schedule())
+    end
+
+    test "the schedule is monotonic and never returns the tail early", _ctx do
+      assert schedule() == Enum.sort(schedule())
+      assert Enum.uniq(schedule()) == schedule()
+    end
+
+    test "past the end it holds at the longest delay", _ctx do
+      longest = List.last(schedule())
+
+      assert IssueClosures.wait_seconds(IssueClosures.max_attempts() + 10, nil) == longest
+    end
+  end
+
   describe "requeue_abandoned/1 — the operator's way back" do
     setup ctx do
       closure =
@@ -248,7 +321,14 @@ defmodule Loopctl.Intake.IssueClosuresTest do
           {:github_api_error, 403}
         )
 
-      assert {:ok, 1} = IssueClosures.requeue_abandoned(tenant_id: ctx.tenant.id)
+      window = [abandoned_after: DateTime.add(DateTime.utc_now(), -60, :second)]
+
+      # DRY RUN first: counts, writes nothing. That is the shape FLY_SECRETS tells an operator
+      # to use, because the act is outward and they should see the size before they take it.
+      assert {:ok, 1} = IssueClosures.requeue_abandoned(window ++ [dry_run: true])
+      assert %IssueClosure{status: :abandoned} = IssueClosures.get(ctx.tenant.id, ctx.story.id)
+
+      assert {:ok, 1} = IssueClosures.requeue_abandoned(window ++ [tenant_id: ctx.tenant.id])
 
       row = IssueClosures.get(ctx.tenant.id, ctx.story.id)
       assert row.status == :pending
@@ -258,6 +338,41 @@ defmodule Loopctl.Intake.IssueClosuresTest do
 
       # And it is a candidate again.
       assert row.id in Enum.map(IssueClosures.due(50), & &1.id)
+    end
+
+    test "an UNBOUNDED requeue is refused", ctx do
+      {:ok, _} =
+        IssueClosures.mark_abandoned(ctx.tenant.id, ctx.closure.id, :retries_exhausted, :timeout)
+
+      # A closure abandoned months ago by an unrelated outage still names a live issue. Waking
+      # it puts a fresh label, comment and close on a ticket the reporter has moved on from,
+      # carrying a verdict about work nobody remembers — so the bare call is a refusal.
+      assert {:error, :bound_required} = IssueClosures.requeue_abandoned()
+
+      # A tenant is NOT a bound: one tenant's whole history is exactly the blast radius.
+      assert {:error, :bound_required} =
+               IssueClosures.requeue_abandoned(tenant_id: ctx.tenant.id)
+
+      assert %IssueClosure{status: :abandoned} = IssueClosures.get(ctx.tenant.id, ctx.story.id)
+
+      # Three things bound it, and each is the operator saying so out loud.
+      for opts <- [
+            [id: ctx.closure.id],
+            [abandoned_after: DateTime.add(DateTime.utc_now(), -60, :second)],
+            [unbounded: true]
+          ] do
+        assert {:ok, 1} = IssueClosures.requeue_abandoned(opts ++ [dry_run: true])
+      end
+    end
+
+    test "a row abandoned BEFORE the window is left alone", ctx do
+      {:ok, _} =
+        IssueClosures.mark_abandoned(ctx.tenant.id, ctx.closure.id, :retries_exhausted, :timeout)
+
+      future = DateTime.add(DateTime.utc_now(), 60, :second)
+
+      assert {:ok, 0} = IssueClosures.requeue_abandoned(abandoned_after: future)
+      assert %IssueClosure{status: :abandoned} = IssueClosures.get(ctx.tenant.id, ctx.story.id)
     end
 
     test "re-drives an exhausted retry budget", ctx do
@@ -274,8 +389,7 @@ defmodule Loopctl.Intake.IssueClosuresTest do
 
       # Re-driving this is the duplicate close the whole module exists to prevent, and no
       # amount of fixing a token makes it right.
-      assert {:ok, 0} = IssueClosures.requeue_abandoned()
-      assert {:ok, 0} = IssueClosures.requeue_abandoned(tenant_id: ctx.tenant.id)
+      assert {:ok, 0} = IssueClosures.requeue_abandoned(unbounded: true)
       assert {:ok, 0} = IssueClosures.requeue_abandoned(id: ctx.closure.id)
 
       row = IssueClosures.get(ctx.tenant.id, ctx.story.id)
@@ -286,7 +400,7 @@ defmodule Loopctl.Intake.IssueClosuresTest do
     test "leaves a CLOSED row alone — it is done, not stuck", ctx do
       {:ok, _} = IssueClosures.mark_closed(ctx.tenant.id, ctx.closure.id)
 
-      assert {:ok, 0} = IssueClosures.requeue_abandoned()
+      assert {:ok, 0} = IssueClosures.requeue_abandoned(unbounded: true)
       assert %IssueClosure{status: :closed} = IssueClosures.get(ctx.tenant.id, ctx.story.id)
     end
 
@@ -305,7 +419,8 @@ defmodule Loopctl.Intake.IssueClosuresTest do
         {:ok, _} = IssueClosures.mark_abandoned(tid, cid, :retries_exhausted, :timeout)
       end
 
-      assert {:ok, 1} = IssueClosures.requeue_abandoned(tenant_id: ctx.tenant.id)
+      assert {:ok, 1} =
+               IssueClosures.requeue_abandoned(unbounded: true, tenant_id: ctx.tenant.id)
 
       assert %IssueClosure{status: :pending} = IssueClosures.get(ctx.tenant.id, ctx.story.id)
       assert %IssueClosure{status: :abandoned} = IssueClosures.get(other.id, other_story.id)
@@ -410,19 +525,39 @@ defmodule Loopctl.Intake.IssueClosuresTest do
     end
   end
 
+  # The waits an attempt actually takes, in order, read through the public function rather
+  # than the private list.
+  defp schedule do
+    Enum.map(1..(IssueClosures.max_attempts() - 1), &IssueClosures.wait_seconds(&1, nil))
+  end
+
   # What Postgres `char_length` counts, and therefore what the CHECK caps — NOT graphemes,
   # which is the distinction the whole bound turns on.
   defp codepoints(nil), do: 0
   defp codepoints(text), do: length(String.to_charlist(text))
+
+  # Makes a claimed row DUE again. Production waits out the backoff; a test that spent it in
+  # real time would take minutes.
+  defp make_due(id) do
+    {1, _} =
+      AdminRepo.update_all(from(c in IssueClosure, where: c.id == ^id),
+        set: [next_attempt_at: nil]
+      )
+
+    :ok
+  end
 
   defp other_record(ctx) do
     fixture(:intake_record, %{tenant_id: ctx.tenant.id, repo: AdminRepo})
   end
 
   # Drives `attempts` up through the real claim path rather than writing the column, so the
-  # bound is exercised against the counter the production path actually moves.
+  # bound is exercised against the counter the production path actually moves. Each claim now
+  # schedules the row forward — that is the mutual exclusion — so the wait is cleared between
+  # them, exactly as elapsed time would.
   defp spend_attempts(tenant_id, closure, n) do
     Enum.reduce(1..n, closure, fn _i, acc ->
+      :ok = make_due(acc.id)
       {:ok, next} = IssueClosures.claim_attempt(tenant_id, acc.id)
       next
     end)

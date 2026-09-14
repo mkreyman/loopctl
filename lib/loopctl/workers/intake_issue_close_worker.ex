@@ -24,9 +24,12 @@ defmodule Loopctl.Workers.IntakeIssueCloseWorker do
   ## Idempotent, and safe to run twice
 
   Overlapping runs cannot double-close. `Loopctl.Delivery.IssueCloser` takes a compare-and-set
-  on `:pending` before its first forge call, so of two runs holding the same candidate exactly
-  one proceeds and the other reports `:skipped`. Behind that, one row per story decided by a
-  unique index, and a read of the issue's live state that catches even a crash between a
+  on `:pending` AND on the row being DUE before its first forge call, pushing `next_attempt_at`
+  forward — so of two runs holding the same candidate exactly one proceeds and the other
+  reports `:skipped`. That CAS is the mechanism; Oban's `unique` option below reduces wasted
+  work and is NOT what makes this safe, which matters because `unique` does not survive a
+  manual enqueue or a retry landing beside a slow run. Behind it, one row per story decided by
+  a unique index, and a read of the issue's live state that catches even a crash between a
   successful close and the record of it.
 
   A story with NO intake link never produced a row, so it is not a candidate and closes
@@ -43,10 +46,10 @@ defmodule Loopctl.Workers.IntakeIssueCloseWorker do
 
   - `@batch` candidates, so one run cannot spend an hourly rate limit in a minute.
   - `@run_budget_ms` of wall clock, checked BEFORE each candidate and sized as the cron
-    interval minus one candidate's worst case (four bounded calls at 2s connect + 5s receive,
-    so ~28s). Checked only afterwards, a run could start a candidate just under the budget and
-    finish past the interval, which drops the next tick to the `unique` window and halves the
-    cadence.
+    interval minus one candidate's worst case (FIVE bounded calls at 2s connect + 5s receive,
+    so ~35s — the fifth is the pre-close state re-read added by #826 round 2). Checked only
+    afterwards, a run could start a candidate just under the budget and finish past the
+    interval, which drops the next tick to the `unique` window and halves the cadence.
   - Oban `unique` over the cron interval, so an overrunning run does not get a second copy of
     itself doubling the traffic to a forge that is already struggling.
 
@@ -73,12 +76,18 @@ defmodule Loopctl.Workers.IntakeIssueCloseWorker do
 
   # Wall clock for one run, checked BEFORE each candidate.
   #
-  # A candidate's worst case is four bounded requests (read, label, comment, close) at 2s
-  # connect + 5s receive, so ~28s. 90s + 28s stays inside the 120s cron interval. In the
-  # ordinary case a candidate costs four sub-second calls and a full batch finishes in a
-  # second or two; this bounds the pathological run, and the remainder is not lost — it is the
-  # next run's first candidates, since the read is oldest-first.
-  @run_budget_ms 90_000
+  # A candidate's worst case is FIVE bounded requests — read, label, comment, re-read, close —
+  # at 2s connect + 5s receive, so ~35s. 80s + 35s stays inside the 120s cron interval.
+  #
+  # It was 90s while the worst case was four calls; #826 round 2 added the pre-close state
+  # re-read, and leaving the budget alone would have let a run start a candidate at 89s and
+  # finish at ~124s, past the interval — which drops the next tick to the `unique` window and
+  # silently halves the cadence. A budget sized against a stale call count is not a budget.
+  #
+  # In the ordinary case a candidate costs five sub-second calls and a full batch finishes in
+  # a second or two; this bounds the pathological run, and the remainder is not lost — it is
+  # the next run's first candidates, since the read is oldest-first.
+  @run_budget_ms 80_000
 
   @impl Oban.Worker
   def perform(%Oban.Job{}) do
@@ -90,8 +99,28 @@ defmodule Loopctl.Workers.IntakeIssueCloseWorker do
       Logger.info("IntakeIssueCloseWorker: #{inspect(tally)}")
     end
 
-    :ok
+    run_result(results, Map.get(tally, :errored, 0))
   end
+
+  # A SYSTEMIC failure must not report as a successful job (#826 round 2, finding 2).
+  #
+  # The per-candidate rescue below is right for ONE bad row and wrong for a bad WORLD: on a
+  # connection-pool outage every candidate raises, the rescue swallows each, `perform/1`
+  # returned `:ok`, and Oban recorded a clean run. `max_attempts` never fired, no job went to
+  # `discarded`, and nothing anywhere alerted — the failure was visible only as twenty log
+  # lines nobody was watching.
+  #
+  # So: every candidate erroring is an ERROR for the job, which Oban retries and eventually
+  # discards where it can be seen. A run with some errors and some progress stays `:ok` —
+  # that is the one-bad-row case the rescue exists for, and the row's own attempt counter
+  # bounds it.
+  defp run_result([], _errored), do: :ok
+
+  defp run_result(results, errored) when errored == length(results) do
+    {:error, {:all_candidates_errored, errored}}
+  end
+
+  defp run_result(_results, _errored), do: :ok
 
   @doc false
   @spec batch_size() :: pos_integer()
@@ -150,20 +179,36 @@ defmodule Loopctl.Workers.IntakeIssueCloseWorker do
   # ran — the attempt is counted, and the row is scheduled forward — so a raising row waits its
   # backoff like a transient failure and is still bounded by `max_attempts/0` rather than
   # retrying for ever. Nothing is swallowed silently: it is logged at ERROR with the row's
-  # identity, which is what an operator greps for.
+  # identity, and `perform/1` turns a whole batch of them into a failed job.
+  #
+  # EXITS are caught as well as raises (#826 round 2, finding 2). Rescue alone missed the very
+  # class this is written for: a `Finch` pool checkout timeout, a `GenServer.call` timeout and
+  # a `DBConnection` ownership failure all EXIT rather than raise, so each still killed the
+  # batch while the rescue looked like it covered them. `catch` takes both kinds.
   defp attempt(closure) do
     IssueCloser.close(closure)
   rescue
-    error ->
-      Logger.error(
-        "IntakeIssueCloseWorker: candidate raised, continuing with the rest of the batch: " <>
-          "tenant_id=#{closure.tenant_id} story_id=#{closure.story_id} " <>
-          "closure_id=#{closure.id} error=#{Exception.format(:error, error, __STACKTRACE__)}",
-        tenant_id: closure.tenant_id,
-        story_id: closure.story_id
-      )
+    error -> errored(closure, Exception.format(:error, error, __STACKTRACE__))
+  catch
+    # The `:exit` clause is for the MESSAGE only — `Exception.format_exit/1` renders a pool
+    # checkout timeout readably where the generic formatter does not. The catch-all below it
+    # already handles exits, so removing this clause changes no behaviour and `bin/mutate.sh`
+    # correctly returns exit 1 on it; the falsifiable guard is the whole `catch`, which a
+    # mutation does turn red.
+    :exit, reason -> errored(closure, "exit: " <> Exception.format_exit(reason))
+    kind, value -> errored(closure, Exception.format(kind, value, __STACKTRACE__))
+  end
 
-      {:errored, nil}
+  defp errored(closure, detail) do
+    Logger.error(
+      "IntakeIssueCloseWorker: candidate failed, continuing with the rest of the batch: " <>
+        "tenant_id=#{closure.tenant_id} story_id=#{closure.story_id} " <>
+        "closure_id=#{closure.id} detail=#{detail}",
+      tenant_id: closure.tenant_id,
+      story_id: closure.story_id
+    )
+
+    {:errored, nil}
   end
 
   defp log_budget_spent(acc) do

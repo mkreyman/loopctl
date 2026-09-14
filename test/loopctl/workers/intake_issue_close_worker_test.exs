@@ -30,9 +30,10 @@ defmodule Loopctl.Workers.IntakeIssueCloseWorkerTest do
   test "a second run closes nothing a second time", ctx do
     closure = closure(ctx, :shipped)
 
-    # EXACTLY one of each write across BOTH runs. A second close would fail this by count,
-    # which is the assertion that actually guards the reporter's inbox.
-    expect(MockPullRequestSource, :issue, fn _r, _n -> {:ok, %{state: "open", labels: []}} end)
+    # EXACTLY one of each WRITE across BOTH runs. A second close would fail this by count,
+    # which is the assertion that actually guards the reporter's inbox. Two READS, because
+    # the closer re-reads the state immediately before the irreversible act.
+    expect(MockPullRequestSource, :issue, 2, fn _r, _n -> {:ok, %{state: "open", labels: []}} end)
     expect(MockPullRequestSource, :label_issue, fn _r, _n, _l -> :ok end)
     expect(MockPullRequestSource, :comment_issue, fn _r, _n, _b -> :ok end)
     expect(MockPullRequestSource, :close_issue, fn _r, _n, _s -> :ok end)
@@ -140,6 +141,68 @@ defmodule Loopctl.Workers.IntakeIssueCloseWorkerTest do
     assert raised.attempts == 1
     assert %DateTime{} = raised.next_attempt_at
     refute raised.id in Enum.map(IssueClosures.due(50), & &1.id)
+  end
+
+  test "a whole batch erroring is a FAILED job, not a clean run", ctx do
+    for _n <- 1..2, do: closure(ctx, :shipped)
+
+    # A pool outage, a dead adapter, a bad deploy: every candidate fails. The per-candidate
+    # rescue is right for one bad row and wrong for a bad world — swallowing all of them made
+    # `perform/1` return `:ok`, so Oban recorded a clean run, `max_attempts` never fired,
+    # nothing reached `discarded`, and the only trace was log lines nobody was watching.
+    stub(MockPullRequestSource, :issue, fn _r, _n -> raise "everything is on fire" end)
+
+    assert {:error, {:all_candidates_errored, 2}} =
+             IntakeIssueCloseWorker.perform(%Oban.Job{args: %{}})
+  end
+
+  test "an EXIT is caught too, not just a raise", ctx do
+    survivor = closure(ctx, :shipped)
+    exiter = closure(ctx, :shipped)
+
+    # Rescue alone missed the class this containment was written for: a Finch pool checkout,
+    # a GenServer.call timeout and a DBConnection ownership failure all EXIT rather than
+    # raise, so each still killed the batch while the rescue looked like it covered them.
+    stub(MockPullRequestSource, :issue, fn _repo, number ->
+      if number == exiter.issue_number do
+        exit({:timeout, {GenServer, :call, [:some_pool, :checkout, 5_000]}})
+      else
+        {:ok, %{state: "open", labels: []}}
+      end
+    end)
+
+    stub(MockPullRequestSource, :label_issue, fn _r, _n, _l -> :ok end)
+    stub(MockPullRequestSource, :comment_issue, fn _r, _n, _b -> :ok end)
+    stub(MockPullRequestSource, :close_issue, fn _r, _n, _s -> :ok end)
+
+    assert :ok = IntakeIssueCloseWorker.perform(%Oban.Job{args: %{}})
+
+    assert %IssueClosure{status: :closed} = AdminRepo.get(IssueClosure, survivor.id)
+    assert %IssueClosure{status: :pending, attempts: 1} = AdminRepo.get(IssueClosure, exiter.id)
+  end
+
+  test "some errors alongside progress is still a successful run", ctx do
+    survivor = closure(ctx, :shipped)
+    raiser = closure(ctx, :shipped)
+
+    # The one-bad-row case the rescue exists for. Failing the job here would retry the whole
+    # batch for a row whose own attempt counter already bounds it.
+    stub(MockPullRequestSource, :issue, fn _repo, number ->
+      if number == raiser.issue_number,
+        do: raise("one bad row"),
+        else: {:ok, %{state: "open", labels: []}}
+    end)
+
+    stub(MockPullRequestSource, :label_issue, fn _r, _n, _l -> :ok end)
+    stub(MockPullRequestSource, :comment_issue, fn _r, _n, _b -> :ok end)
+    stub(MockPullRequestSource, :close_issue, fn _r, _n, _s -> :ok end)
+
+    assert :ok = IntakeIssueCloseWorker.perform(%Oban.Job{args: %{}})
+    assert %IssueClosure{status: :closed} = AdminRepo.get(IssueClosure, survivor.id)
+  end
+
+  test "an empty run is :ok, not an error" do
+    assert :ok = IntakeIssueCloseWorker.perform(%Oban.Job{args: %{}})
   end
 
   test "the worker is scheduled on the crontab" do

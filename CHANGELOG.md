@@ -32,8 +32,11 @@ All notable changes to loopctl are documented here.
   loopctl asks for. Without it every close is refused 403, recorded `abandoned`, and no
   reporter is notified; nothing else breaks and nothing loops. That is the likeliest cause of
   a mass abandonment, so it has a way back: after fixing the secret,
-  `Loopctl.Intake.IssueClosures.requeue_abandoned()` re-drives the backlog. It never re-drives
-  an issue a human already closed. See `deploy/FLY_SECRETS.md`.
+  `Loopctl.Intake.IssueClosures.requeue_abandoned(abandoned_after: ...)` re-drives that
+  window's backlog, with `dry_run: true` to count first. The time bound is REQUIRED — a
+  closure abandoned months ago still names a live issue, and waking it would put a fresh
+  close on a ticket the reporter has moved on from. It never re-drives an issue a human
+  already closed. See `deploy/FLY_SECRETS.md`.
 
   **A disconnected repository stops receiving writes.** Revoking an intake source is refused
   at the verdict (no closure is recorded) and again at close time (`source_revoked`), so a

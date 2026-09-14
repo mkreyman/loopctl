@@ -108,7 +108,7 @@ defmodule Loopctl.WorkBreakdown.StoriesIntakeLinkTest do
   end
 
   test "at most ONE story per intake record", ctx do
-    assert {:ok, _first} =
+    assert {:ok, first} =
              Stories.create_story(ctx.tenant.id, attrs(ctx, "2.1"),
                intake_record_id: ctx.record.id
              )
@@ -118,10 +118,16 @@ defmodule Loopctl.WorkBreakdown.StoriesIntakeLinkTest do
     # closing her issue with "nothing has been deployed" while the real fix is still being
     # implemented. Design §4's triage contract emits one story per verdict, so this is an
     # invariant rather than a restriction.
-    assert {:error, :intake_record_already_linked} =
+    # The refusal CARRIES THE EXISTING STORY'S ID. Triage creates over a network, so its
+    # create is at-least-once: a lost response makes it retry, and a bare refusal gave it no
+    # way to tell its own success from a collision with somebody else's story — and no id to
+    # carry on with.
+    assert {:error, {:intake_record_already_linked, existing_id}} =
              Stories.create_story(ctx.tenant.id, attrs(ctx, "2.2"),
                intake_record_id: ctx.record.id
              )
+
+    assert existing_id == first.id
 
     # The refusal is the DATABASE's, and the second story does not exist.
     assert {:ok, %{total: 1}} = Stories.list_stories(ctx.tenant.id, ctx.epic.id)

@@ -49,7 +49,11 @@ defmodule Loopctl.WorkBreakdown.Stories do
   foreign key, which is what actually makes a cross-tenant link impossible.
 
   **At most one story per record**, enforced by `stories_intake_record_uidx` and surfaced as
-  `{:error, :intake_record_already_linked}`. Splitting one reported issue across two stories
+  `{:error, {:intake_record_already_linked, existing_story_id}}` — the id is carried because
+  triage's create is at-least-once over a network, and a bare refusal gave a retry no way to
+  tell its own lost-response success from a genuine collision. The id is `nil` only if that
+  story was deleted between the conflict and the read. Splitting one reported issue across two
+  stories
   would give the reporter two closures aimed at one issue, and then whichever verdict landed
   first would decide what she is told — a rejected sibling closing her issue with "nothing has
   been deployed" while the real fix is still being implemented. Design §4's triage contract
@@ -63,8 +67,8 @@ defmodule Loopctl.WorkBreakdown.Stories do
   - `{:error, changeset}` on validation failure
   - `{:error, :epic_not_found}` if the epic doesn't exist
   - `{:error, :intake_record_not_found}` if `:intake_record_id` names no record of this tenant
-  - `{:error, :intake_record_already_linked}` if another story of this tenant already came
-    from that record
+  - `{:error, {:intake_record_already_linked, story_id}}` if another story of this tenant
+    already came from that record; `story_id` is that story's, or `nil` if it has since gone
   """
   @spec create_story(Ecto.UUID.t(), map(), keyword()) ::
           {:ok, Story.t()}
@@ -72,7 +76,7 @@ defmodule Loopctl.WorkBreakdown.Stories do
              Ecto.Changeset.t()
              | :epic_not_found
              | :intake_record_not_found
-             | :intake_record_already_linked}
+             | {:intake_record_already_linked, Ecto.UUID.t() | nil}}
   def create_story(tenant_id, attrs, opts \\ []) do
     actor_id = Keyword.get(opts, :actor_id)
     actor_label = Keyword.get(opts, :actor_label)
@@ -125,18 +129,47 @@ defmodule Loopctl.WorkBreakdown.Stories do
           {:ok, story}
 
         {:error, :story, changeset, _changes} ->
-          intake_conflict_or_changeset(changeset)
+          intake_conflict_or_changeset(tenant_id, intake_record_id, changeset)
       end
     end
   end
 
-  # A second story from one intake record gets its OWN error atom rather than a changeset, so
-  # a caller can tell "this issue already has a story" from an ordinary validation failure
+  # A second story from one intake record gets its OWN error rather than a changeset, so a
+  # caller can tell "this issue already has a story" from an ordinary validation failure
   # without reading error keywords. Every other changeset failure is unchanged.
-  defp intake_conflict_or_changeset(%Ecto.Changeset{errors: errors} = changeset) do
-    if Enum.any?(errors, &match?({:intake_record_id, {_msg, [constraint: :unique] ++ _}}, &1)),
-      do: {:error, :intake_record_already_linked},
+  #
+  # It CARRIES THE EXISTING STORY'S ID (#826 round 2, finding 6). Triage creates stories over
+  # a network, so its create is at-least-once: a response lost in flight makes it retry, and a
+  # bare refusal gave it no way to tell its OWN successful create from a genuine collision
+  # with somebody else's story — and no id to carry on with. With the id, the retry recognises
+  # its own work.
+  #
+  # The constraint is matched by READING the opts rather than by shape. `match?` on
+  # `[constraint: :unique] ++ _` depended on Ecto putting that key first in a keyword list it
+  # makes no ordering promise about, so a reordering upstream would silently turn every one of
+  # these into a plain changeset error.
+  defp intake_conflict_or_changeset(tenant_id, record_id, %Ecto.Changeset{} = changeset) do
+    if unique_violation?(changeset, :intake_record_id),
+      do: {:error, {:intake_record_already_linked, existing_story_id(tenant_id, record_id)}},
       else: {:error, changeset}
+  end
+
+  defp unique_violation?(%Ecto.Changeset{errors: errors}, field) do
+    Enum.any?(errors, fn
+      {^field, {_message, opts}} -> Keyword.get(opts, :constraint) == :unique
+      _other -> false
+    end)
+  end
+
+  # Best effort by design: the row is read outside the rolled-back transaction, so a story
+  # deleted in between yields `nil`. The caller still learns WHY it was refused; the id is the
+  # part that may be missing, never the refusal.
+  defp existing_story_id(tenant_id, record_id) do
+    AdminRepo.one(
+      from s in Story,
+        where: s.tenant_id == ^tenant_id and s.intake_record_id == ^record_id,
+        select: s.id
+    )
   end
 
   @doc """

@@ -177,6 +177,26 @@ defmodule Loopctl.Delivery.IssueCloserTest do
       assert {:skipped, nil} = IssueCloser.close(closure)
     end
 
+    test "a close carrying the OTHER verdict's label is NOT ours", ctx do
+      closure = closure(ctx, :not_actionable)
+
+      # A maintainer labelled a not-actionable story's issue `resolution-shipped` and closed
+      # it. The reporting system has already sent the SHIPPED text for work nobody did.
+      # Reading "some loopctl label" as our own close recorded `:closed`, never posted the
+      # not-actionable text, and left that wrong message standing — the exact #805 failure,
+      # reached through the check meant to prevent it.
+      expect(MockPullRequestSource, :issue, fn _repo, _number ->
+        {:ok, %{state: "closed", labels: [@shipped_label]}}
+      end)
+
+      assert {:abandoned, nil} = IssueCloser.close(closure)
+
+      row = reload(ctx)
+      assert row.status == :abandoned
+      assert row.abandoned_reason == "closed_by_other"
+      assert row.closed_at == nil
+    end
+
     test "an issue already closed carrying our label is recorded closed, not closed again",
          ctx do
       closure = closure(ctx, :shipped)
@@ -248,6 +268,38 @@ defmodule Loopctl.Delivery.IssueCloserTest do
 
       # And it is out of the drainer's candidate set for good.
       refute row.id in Enum.map(IssueClosures.due(50), & &1.id)
+    end
+
+    test "a human close landing MID-SEQUENCE is detected instead of PATCHed over", ctx do
+      closure = closure(ctx, :shipped)
+
+      parent = self()
+
+      # Read 1: open. We label and comment. Then a human closes it — their close fired the
+      # reporting system's webhook with no loopctl label on the issue yet, so the reporter
+      # already got the default shipped text.
+      expect(MockPullRequestSource, :issue, fn _r, _n ->
+        {:ok, %{state: "open", labels: []}}
+      end)
+
+      expect(MockPullRequestSource, :label_issue, fn _r, _n, _l -> :ok end)
+      expect(MockPullRequestSource, :comment_issue, fn _r, _n, _b -> :ok end)
+
+      # Read 2, immediately before the irreversible act: it moved.
+      expect(MockPullRequestSource, :issue, fn _r, _n ->
+        send(parent, :rechecked)
+        {:ok, %{state: "closed", labels: ["wontfix"]}}
+      end)
+
+      # No `close_issue` expectation: PATCHing an already-closed issue is answered 200 by
+      # GitHub, so without the re-read the close "succeeded", `closed_by_other` was never
+      # recorded, and nothing told the operator the reporter had been misinformed.
+      assert {:abandoned, nil} = IssueCloser.close(closure)
+
+      assert_received :rechecked
+      row = reload(ctx)
+      assert row.status == :abandoned
+      assert row.abandoned_reason == "closed_by_other"
     end
 
     test "a REVOKED intake source stops every write, before the issue is even read", ctx do
@@ -395,7 +447,7 @@ defmodule Loopctl.Delivery.IssueCloserTest do
       expect_open_issue(labels: ["bug", @shipped_label])
       expect(MockPullRequestSource, :close_issue, fn _r, _n, _s -> :ok end)
 
-      assert {:closed, nil} = IssueCloser.close(%{after_first | next_attempt_at: nil})
+      assert {:closed, nil} = IssueCloser.close(due(ctx))
       assert %IssueClosure{status: :closed} = reload(ctx)
     end
 
@@ -431,7 +483,7 @@ defmodule Loopctl.Delivery.IssueCloserTest do
         :ok
       end)
 
-      assert {:closed, nil} = IssueCloser.close(%{reload(ctx) | next_attempt_at: nil})
+      assert {:closed, nil} = IssueCloser.close(due(ctx))
 
       assert_received {:relabelled, @shipped_label}
       assert_received :closed
@@ -483,15 +535,25 @@ defmodule Loopctl.Delivery.IssueCloserTest do
     })
   end
 
+  # The closer reads the issue TWICE on any path that reaches the close: once for the replay
+  # check, and once immediately before the irreversible act (#826 round 2, finding 8). `times`
+  # is 2 by default for that reason; a test that stops earlier says so.
   defp expect_open_issue(opts \\ []) do
     labels = Keyword.get(opts, :labels, ["bug"])
+    times = Keyword.get(opts, :times, 2)
 
-    expect(MockPullRequestSource, :issue, fn _repo, _number ->
+    expect(MockPullRequestSource, :issue, times, fn _repo, _number ->
       {:ok, %{state: "open", labels: labels}}
     end)
   end
 
   defp reload(ctx), do: IssueClosures.get(ctx.tenant.id, ctx.story.id)
+
+  defp due(ctx) do
+    row = reload(ctx)
+    :ok = make_due(row.id)
+    reload(ctx)
+  end
 
   # Drains the mailbox in arrival order, which IS the order the closer made its calls in.
   defp receive_order(acc \\ []) do
@@ -503,8 +565,22 @@ defmodule Loopctl.Delivery.IssueCloserTest do
   end
 
   # The bound test drives attempts back to back; production waits out the backoff instead.
+  #
+  # Cleared in the DATABASE, not on the struct: since #826 round 2 the claim is a
+  # compare-and-set on the row being DUE, so an in-memory nil would be refused — which is the
+  # mutual exclusion working.
   defp clear_backoff(ctx) do
     row = reload(ctx)
-    %{row | next_attempt_at: nil}
+    :ok = make_due(row.id)
+    reload(ctx)
+  end
+
+  defp make_due(id) do
+    {1, _} =
+      AdminRepo.update_all(from(c in IssueClosure, where: c.id == ^id),
+        set: [next_attempt_at: nil]
+      )
+
+    :ok
   end
 end
