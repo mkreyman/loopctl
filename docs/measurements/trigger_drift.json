@@ -1,9 +1,8 @@
 {
   "meta": {
-    "head": "3bf59943d1d6a62f8838513a1021ef3c29b28f3b",
-    "ref": "HEAD",
+    "head": "b49b60008ab514b8fd5bdbef40c40d859bfd6b1a",
     "repo": "mkreyman/home_care_billing",
-    "generated_at": "2026-09-14T04:22:09.484299Z",
+    "generated_at": "2026-09-14T04:47:37.033580Z",
     "harness": "mix loopctl.gates.check_drift",
     "trigger_checksum_source": "operator_pin",
     "trigger_fingerprint": "5d6b6b65b602"

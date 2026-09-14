@@ -77,13 +77,25 @@ Both are named as follow-on work in the pull request that added this.
 matched anything. A BOOLEAN, not the match count — the assertion needs only "at least one", and
 a count would publish how broadly each guard reaches for no gain.
 
-**`meta` is redacted on the same rule.** The local absolute checkout path and `tree_files`, the
-target repository's file count, are dropped: a path names the machine that ran the check, and a
-file count is a count of a private repository under a policy that already refuses per-pattern
-counts. What remains identifies the run without describing the target — the `owner/repo` key,
-the ref and head, the trigger fingerprint, whether that fingerprint came from an operator's pin
-or was computed, the timestamp and the harness name. The unredacted artifact
-(`tmp/gate_measurement/trigger_drift.full.json`, gitignored) carries all of it.
+**`meta` is redacted on the same rule, by an ALLOW-list.** What it publishes is the `owner/repo`
+key, the head, the trigger fingerprint, whether that fingerprint came from an operator's pin or
+was computed, the timestamp and the harness name — enough to identify the run and compare it
+with another, and nothing that describes the target. The unredacted artifact
+(`tmp/gate_measurement/trigger_drift.full.json`, gitignored) carries everything.
+
+Not published, and why: the local absolute checkout path names the machine that ran the check;
+`tree_files` is a private repository's file count, under a policy that already refuses
+per-pattern counts; and `ref` is superfluous beside the resolved head sha, which says more
+precisely which tree was read.
+
+**Allow-list and not deny-list, which was the shape for one round.** The argument for a
+deny-list is that a newly added key then appears in a diff rather than vanishing silently. It
+loses to a measurement: a deny-list is maintained by whoever ADDS a key, an allow-list by
+whoever wants one PUBLISHED, and the same leak escaped review twice under the first rule — in
+PR #830's first round and in this task's. The two failure modes are also not symmetric. An
+allow-list fails by dropping a field somebody wanted, which gets noticed on the artifact; a
+deny-list fails by publishing a path out of a private repository, which does not. Adding a key
+to the allow-list means stating why publishing it is safe.
 
 `meta.trigger_fingerprint` is the first 12 characters of the document's SHA-256, the same
 truncated commitment the measurement artifacts use and for the same reason: two runs can say

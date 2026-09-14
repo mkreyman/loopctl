@@ -225,7 +225,9 @@ defmodule Loopctl.DeliveryGates.TriggerDriftLiveTest do
   defp assert_redacted(artifact) do
     meta = artifact["meta"] || %{}
 
-    for key <- ~w(checkout tree_files) do
+    # Named literally, never derived from the task's own allow-list: a test that reads the list
+    # it is checking moves with any change to it and can never go red when the list widens.
+    for key <- ~w(checkout tree_files ref) do
       refute Map.has_key?(meta, key), "the committed artifact's meta leaks #{key}"
     end
 
