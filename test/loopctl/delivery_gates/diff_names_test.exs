@@ -5,6 +5,7 @@ defmodule Loopctl.DeliveryGates.DiffNamesTest do
   alias Loopctl.DeliveryGates.DiffNames
   alias Loopctl.DeliveryGates.GateB.Result
   alias Loopctl.DeliveryGates.Triggers
+  alias Mix.Tasks.Loopctl.Gates.CheckDrift
 
   @repo "acme/widgets"
 
@@ -29,19 +30,12 @@ defmodule Loopctl.DeliveryGates.DiffNamesTest do
   # Hermetic git: no global or system config, and none of the GIT_* variables a pre-commit
   # hook exports — under the hook, GIT_INDEX_FILE would otherwise point every command here
   # at the OUTER repository's index.
-  @git_env [
-    {"GIT_DIR", nil},
-    {"GIT_WORK_TREE", nil},
-    {"GIT_INDEX_FILE", nil},
-    {"GIT_OBJECT_DIRECTORY", nil},
-    {"GIT_ALTERNATE_OBJECT_DIRECTORIES", nil},
-    {"GIT_COMMON_DIR", nil},
-    {"GIT_PREFIX", nil},
-    {"GIT_CONFIG_GLOBAL", "/dev/null"},
-    {"GIT_CONFIG_NOSYSTEM", "1"}
-  ]
-
-  @git_config [
+  #
+  # The environment comes from `CheckDrift.git_env/0` rather than a second list here. This file
+  # used to carry its own, and the two were NOT nested: this one had the config isolation the
+  # other lacked, the other had GIT_NAMESPACE and GIT_CEILING_DIRECTORIES this one lacked, and
+  # the newer of the two was the weaker. One answer, one place.
+  @identity [
     "-c",
     "user.name=Gate Test",
     "-c",
@@ -49,13 +43,16 @@ defmodule Loopctl.DeliveryGates.DiffNamesTest do
     "-c",
     "commit.gpgsign=false",
     "-c",
-    "core.hooksPath=/dev/null",
-    "-c",
     "init.defaultBranch=main"
   ]
 
   defp git(dir, args) do
-    {out, 0} = System.cmd("git", @git_config ++ args, cd: dir, env: @git_env)
+    {out, 0} =
+      System.cmd("git", @identity ++ CheckDrift.git_config_args() ++ args,
+        cd: dir,
+        env: CheckDrift.git_env()
+      )
+
     out
   end
 

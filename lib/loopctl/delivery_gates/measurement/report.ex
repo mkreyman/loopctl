@@ -434,6 +434,13 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
   # - `:unparseable_reasons` echoes whatever a ticket record failed on. The COUNT beside it,
   #   `:unparseable_records`, is the number a reader needs.
   #
+  # `:trigger_checksum_source` is published — `"operator_pin"` or `"computed"`. It is a property
+  # of the RUN, not of the machine or the target: it names nothing, and it is the only field
+  # that says whether the fingerprint beside it was verified against the checksum production
+  # pinned or merely recomputed from whatever file was on disk. Without it a reader cannot tell
+  # a checked run from an unchecked one. Added for `mix loopctl.gates.check_drift`, which is the
+  # task that can be given a pin.
+  #
   # `:trigger_status` IS published, reduced: the task REPLAYS a configuration failure rather
   # than refusing, by design, so it is a path the harness is built to take. A
   # `Triggers.parse/2` error is `{:invalid_pattern, ["repos", "<owner/repo>", "effect_paths"],
@@ -450,6 +457,7 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
     :repo,
     :since,
     :tickets,
+    :trigger_checksum_source,
     :trigger_fingerprint,
     :trigger_shape,
     :trigger_status,

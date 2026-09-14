@@ -187,18 +187,17 @@ defmodule Loopctl.DeliveryGates.Measurement.RepoHistory do
   the fixture's files onto the working branch ten times while the suite reported green. Reads and
   writes alike were retargeted, and nothing in the output said so.
 
-  Only the DISCOVERY variables are unset. `GIT_CONFIG_*` is deliberately left alone: config
-  resolution is a legitimate thing for an operator to arrange, and the pins at the call sites
-  already neutralise the config that could change a measurement.
+  The global and system CONFIG go too, which this module originally did not do. The reason given
+  for leaving them was that "the pins at the call sites already neutralise the config that could
+  change a measurement" — and those pins did not exist: there was no `-c` anywhere in these
+  modules. A global `core.quotePath` changes the shape of the paths git prints here, and
+  `core.hooksPath` is set globally on this fleet.
+
+  Delegates to `Loopctl.DeliveryGates.GitEnv`, which is the ONE answer in this repository to how
+  git is spawned. There were three, no one of them a superset of the others.
   """
-  @spec scrubbed_git_env() :: [{String.t(), nil}]
-  def scrubbed_git_env do
-    Enum.map(
-      ~w(GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY
-         GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX GIT_CEILING_DIRECTORIES),
-      &{&1, nil}
-    )
-  end
+  @spec scrubbed_git_env() :: [{String.t(), String.t() | nil}]
+  defdelegate scrubbed_git_env(), to: Loopctl.DeliveryGates.GitEnv, as: :spawn_env
 
   # -- reading ------------------------------------------------------------------------------
 
