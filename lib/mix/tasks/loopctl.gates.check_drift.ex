@@ -250,8 +250,18 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDrift do
     """)
   end
 
+  # NEVER `inspect(reason)`: `{:invalid_pattern, ["repos", "<owner/repo>", "effect_paths"],
+  # pattern}` carries a live guard pattern and the target repository's name, and this lands in a
+  # terminal and in a runner log — as public as a committed artifact, by this task's own rule.
+  # The scenario is exactly the one the task exists for: an operator hand-edits the document and
+  # fat-fingers a glob.
   defp repo_triggers!({:error, reason}, _repo_name) do
-    Mix.raise("the trigger document did not parse: #{inspect(reason)}")
+    Mix.raise("""
+    the trigger document did not parse: #{TriggerDrift.describe_error(reason)}
+
+    The reason is reduced to its kind and the key path's depth on purpose — the full reason
+    names the offending pattern. Read it from the document itself.
+    """)
   end
 
   defp read_triggers!(path) do
@@ -289,17 +299,28 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDrift do
     checksum(document, pinned)
   end
 
+  # The file list is read at the RESOLVED sha, never at `ref` again. These are two processes,
+  # and the moduledoc blesses pointing this at a tree somebody is working in: a commit landing
+  # between them would pair the pre-commit sha with the post-commit tree, and the artifact would
+  # certify no drift at a head it did not read.
+  #
+  # `ref` is deliberately OUT OF SCOPE in `files_at/2`, rather than merely unused there. This
+  # race cannot be provoked by a deterministic test — it needs a commit to land between two
+  # processes — so the defect is made unrepresentable instead of guarded: re-introducing it
+  # would not compile. A sha cannot move.
   defp read_tree!(repo, ref) do
     head = repo |> git!(["rev-parse", ref]) |> String.trim()
-
-    files =
-      repo
-      |> git!(["ls-tree", "-r", "--name-only", "-z", ref])
-      |> String.split(<<0>>, trim: true)
+    files = files_at(repo, head)
 
     if files == [], do: Mix.raise("#{repo} at #{ref} lists no files — refusing a vacuous pass")
 
     {files, head}
+  end
+
+  defp files_at(repo, head) do
+    repo
+    |> git!(["ls-tree", "-r", "--name-only", "-z", head])
+    |> String.split(<<0>>, trim: true)
   end
 
   # `-z` so a path with a special byte arrives unquoted, the same form the gate is given and the

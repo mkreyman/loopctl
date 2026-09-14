@@ -184,4 +184,112 @@ defmodule Loopctl.DeliveryGates.TriggerDriftTest do
       end
     end
   end
+
+  describe "agree?/2 — the two matchers cannot silently diverge" do
+    # unmatched/2 short-circuits and coverage/2 counts. They share Glob.match?/2 and the
+    # fail-closed guard and nothing else, so nothing but this makes them answer the same
+    # question. A disagreement is the failure the moduledoc calls worse than no checker: the
+    # artifact attests every guard alive while the gate escalates on a stale trigger.
+    test "they agree when nothing has drifted" do
+      triggers = triggers(["priv/rates/**", "config/runtime.exs"], ["lib/app_web/router.ex"])
+
+      assert TriggerDrift.agree?(triggers, [
+               "priv/rates/a.csv",
+               "config/runtime.exs",
+               "lib/app_web/router.ex"
+             ])
+    end
+
+    test "they agree on which patterns drifted, not merely on how many" do
+      triggers =
+        triggers(
+          ["priv/rates/**", "lib/app/gone/**", "config/runtime.exs"],
+          ["lib/app_web/router.ex", "lib/app_web/moved.ex"]
+        )
+
+      files = ["priv/rates/a.csv", "config/runtime.exs", "lib/app_web/router.ex"]
+
+      assert TriggerDrift.agree?(triggers, files)
+
+      {:ok, unmatched} = TriggerDrift.unmatched(triggers, files)
+      {:ok, coverage} = TriggerDrift.coverage(triggers, files)
+
+      assert Enum.sort(unmatched) ==
+               coverage
+               |> Enum.filter(&(&1.matches == 0))
+               |> Enum.map(& &1.pattern)
+               |> Enum.sort()
+    end
+
+    test "they agree on every refusal, not only on the happy path" do
+      triggers = triggers(["priv/rates/**"], ["lib/app_web/router.ex"])
+
+      for repo_files <- [[], nil, "not-a-list", ["priv/rates/a.csv", :atom]] do
+        assert TriggerDrift.agree?(triggers, repo_files),
+               "the two matchers disagree on #{inspect(repo_files)}"
+      end
+    end
+
+    test "agreed?/2 SEES a disagreement — the only way to prove the checker can fail" do
+      # The two matchers agree on every real input, so feeding agree?/2 real inputs can never
+      # show that its comparison works. These pairs are constructed to disagree.
+      refute TriggerDrift.agreed?(
+               {:ok, ["lib/app/gone/**"]},
+               {:ok, [%{kind: :effect, index: 0, pattern: "lib/app/gone/**", matches: 3}]}
+             )
+
+      refute TriggerDrift.agreed?(
+               {:ok, []},
+               {:ok, [%{kind: :effect, index: 0, pattern: "lib/app/gone/**", matches: 0}]}
+             )
+
+      refute TriggerDrift.agreed?(
+               {:ok, ["a/**"]},
+               {:ok, [%{kind: :effect, index: 0, pattern: "b/**", matches: 0}]}
+             )
+
+      refute TriggerDrift.agreed?({:ok, []}, {:error, :missing_repo_files})
+      refute TriggerDrift.agreed?({:error, :missing_repo_files}, {:ok, []})
+      refute TriggerDrift.agreed?({:error, :missing_repo_files}, {:error, :invalid_repo_files})
+
+      # And says so when they do agree, or the refutes above prove only that it always fails.
+      assert TriggerDrift.agreed?(
+               {:ok, ["lib/app/gone/**"]},
+               {:ok, [%{kind: :effect, index: 0, pattern: "lib/app/gone/**", matches: 0}]}
+             )
+
+      assert TriggerDrift.agreed?({:error, :missing_repo_files}, {:error, :missing_repo_files})
+    end
+
+    test "a pattern matching exactly one file is where a short-circuit and a count could part" do
+      triggers = triggers(["priv/rates/only.csv", "priv/rates/**"], ["lib/app_web/router.ex"])
+
+      assert TriggerDrift.agree?(triggers, ["priv/rates/only.csv", "lib/app_web/router.ex"])
+    end
+  end
+
+  describe "describe_error/1 — a parse failure is reported without its pattern" do
+    test "an invalid pattern is reduced to its kind and the key path's depth" do
+      reason =
+        {:invalid_pattern, ["repos", "acme/private-repo", "effect_paths"], "priv/secret/**"}
+
+      described = TriggerDrift.describe_error(reason)
+
+      assert described == "invalid_pattern (key path depth 3)"
+      refute described =~ "priv/secret"
+      refute described =~ "acme/private-repo"
+    end
+
+    test "a bare atom reason survives as itself" do
+      assert TriggerDrift.describe_error(:checksum_mismatch) ==
+               "checksum_mismatch (key path depth 0)"
+    end
+
+    test "an unrecognised reason shape still says nothing about its contents" do
+      described = TriggerDrift.describe_error(%{pattern: "priv/secret/**"})
+
+      assert described == "unknown (key path depth 0)"
+      refute described =~ "priv/secret"
+    end
+  end
 end

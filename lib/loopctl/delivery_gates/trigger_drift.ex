@@ -42,10 +42,72 @@ defmodule Loopctl.DeliveryGates.TriggerDrift do
   @type error :: :missing_repo_files | :invalid_repo_files
 
   @doc """
+  A `Loopctl.DeliveryGates.Triggers.parse/2` error reduced to what is safe to PRINT.
+
+  The reason carries the offending glob verbatim — `{:invalid_pattern, ["repos", "<owner/repo>",
+  "effect_paths"], pattern}` is a live guard pattern and the target repository's name — and the
+  places that report a parse failure are a terminal and a runner log, which are as public as a
+  committed artifact. Only the KIND and the key path's DEPTH survive. Same reduction PR #830
+  applies in `Report.trigger_status/1`, for the same reason.
+  """
+  @spec describe_error(term()) :: String.t()
+  def describe_error(reason) do
+    "#{error_kind(reason)} (key path depth #{key_path_depth(reason)})"
+  end
+
+  defp error_kind(reason) when is_atom(reason), do: reason
+  defp error_kind(reason) when is_tuple(reason) and tuple_size(reason) > 0, do: elem(reason, 0)
+  defp error_kind(_reason), do: :unknown
+
+  defp key_path_depth(reason) when is_tuple(reason) and tuple_size(reason) > 1 do
+    case elem(reason, 1) do
+      path when is_list(path) -> length(path)
+      _other -> 0
+    end
+  end
+
+  defp key_path_depth(_reason), do: 0
+
+  @doc """
+  Asserts that `unmatched/2` and `coverage/2` answer the same question about the same input.
+
+  They are two loops — `unmatched/2` short-circuits per pattern because it runs on Gate B's
+  per-evaluation path, `coverage/2` counts because the artifact wants the number — and they
+  share only `Glob.match?/2` and the fail-closed guard. Nothing else makes them agree, and a
+  disagreement is the failure this module's first paragraph calls worse than no checker: the
+  artifact attests every guard alive while the gate escalates on a stale trigger, or the
+  reverse. Callers do not need this; it exists so a test can bind them.
+  """
+  @spec agree?(RepoTriggers.t(), term()) :: boolean()
+  def agree?(%RepoTriggers{} = triggers, repo_files) do
+    agreed?(unmatched(triggers, repo_files), coverage(triggers, repo_files))
+  end
+
+  @doc """
+  Whether an `unmatched/2` result and a `coverage/2` result say the same thing.
+
+  Split out from `agree?/2` so a test can hand it a DISAGREEMENT. Nothing else can: the two
+  matchers agree on every real input, so a weakening of this comparison is invisible to any test
+  that only ever feeds it consistent pairs — which is the shape of unfalsifiable assertion this
+  whole change is about.
+  """
+  @spec agreed?(term(), term()) :: boolean()
+  def agreed?({:ok, drifted}, {:ok, coverage}) when is_list(drifted) and is_list(coverage) do
+    Enum.sort(drifted) ==
+      coverage |> Enum.filter(&(&1.matches == 0)) |> Enum.map(& &1.pattern) |> Enum.sort()
+  end
+
+  def agreed?({:error, one}, {:error, other}), do: one == other
+  def agreed?(_unmatched, _coverage), do: false
+
+  @doc """
   The sources of every configured pattern that matches none of `repo_files`, in configuration
   order (`effect_paths` then `human_paths`).
 
   `{:ok, []}` is the clean answer. `{:ok, [_ | _]}` names the drifted patterns.
+
+  A separate loop from `coverage/2`, not a projection of it — see `agree?/2`, which is what
+  binds them.
   """
   @spec unmatched(RepoTriggers.t(), term()) :: {:ok, [String.t()]} | {:error, error()}
   def unmatched(%RepoTriggers{} = triggers, repo_files) do
@@ -66,10 +128,12 @@ defmodule Loopctl.DeliveryGates.TriggerDrift do
   @doc """
   Every configured pattern with the NUMBER of files it matches, in configuration order.
 
-  The count is what an artifact can carry in a public repository: it says a pattern is alive
-  and how broadly it reaches without naming the pattern or a single path. `unmatched/2` is
-  defined over this, so the count a report publishes and the verdict the gate reaches come
-  from one matcher.
+  The count is what the UNREDACTED artifact carries: it says a pattern is alive and how broadly
+  it reaches. `unmatched/2` is NOT defined over this — it short-circuits per pattern because it
+  runs on Gate B's per-evaluation path, while this counts every file. They share `Glob.match?/2`
+  and the fail-closed guard and nothing else, so `agree?/2` exists to assert they answer the
+  same question, and a test calls it. Two matchers that quietly disagree would let the artifact
+  attest every guard alive while the gate escalates on a stale trigger.
   """
   @spec coverage(RepoTriggers.t(), term()) :: {:ok, [pattern_coverage()]} | {:error, error()}
   def coverage(%RepoTriggers{} = triggers, repo_files) do

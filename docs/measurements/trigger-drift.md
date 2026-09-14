@@ -64,8 +64,19 @@ the artifact against the running release before reading a green build as a state
 production:
 
 ```bash
-fly ssh console -a loopctl -C "/app/bin/loopctl rpc 'IO.inspect(Loopctl.DeliveryGates.Config.triggers())'"
+fly ssh console -a loopctl -C "/app/bin/loopctl rpc '
+  case Loopctl.DeliveryGates.Config.triggers() do
+    {:ok, t} -> IO.puts(String.slice(t.sha256, 0, 12))
+    {:error, reason} -> IO.puts(\"NOT LOADED: #{Loopctl.DeliveryGates.TriggerDrift.describe_error(reason)}\")
+  end'"
 ```
+
+**Print the fingerprint, never the trigger set.** `IO.inspect` on the parsed value dumps every
+configured pattern — neither `Triggers`, `RepoTriggers` nor `Glob` implements `Inspect`, so the
+default derives one over every field — into a console and, on a machine that ships console
+output, into the logs. That is the guard map, in the one command whose whole purpose is to
+compare twelve characters. The error branch is reduced for the same reason: a parse failure
+names the offending pattern verbatim.
 
 Closing either needs the check to run where the tree and the live document are — the target
 repository's own CI, or a scheduled check in production reading the tree through the GitHub API.

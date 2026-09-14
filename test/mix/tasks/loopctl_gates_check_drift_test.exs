@@ -1,6 +1,8 @@
 defmodule Mix.Tasks.Loopctl.Gates.CheckDriftTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureIO
+
   alias Loopctl.DeliveryGates.Triggers
   alias Mix.Tasks.Loopctl.Gates.CheckDrift
 
@@ -198,4 +200,342 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDriftTest do
       assert CheckDrift.checksum(@document, String.upcase(@document_hash)) == @document_hash
     end
   end
+
+  # -- run/1, against a real git fixture -----------------------------------------------------
+  #
+  # Everything above is pure over report/3 and checksum/2. NONE of it executed run/1, so the
+  # WIRING was untested: which detail level reaches which file, whether a drift actually exits
+  # non-zero, whether the refusals refuse. A reviewer proved all of that by mutation — flipping
+  # :redacted to :full on the public artifact, and replacing Mix.raise with Mix.shell().info,
+  # each left the whole suite green.
+  #
+  # These tests build a throwaway git repository per test (unique directory, removed on exit),
+  # so the file stays async.
+
+  describe "run/1 — which detail level reaches which file" do
+    test "the --out artifact is redacted and the --full-out artifact is not" do
+      repo = fixture_repo([{"lib/app/claims.ex", "x"}, {"config/runtime.exs", "y"}])
+      triggers = trigger_file(repo, ["lib/app/**"], ["config/runtime.exs"])
+      out = tmp_path("out.json")
+      full = tmp_path("full.json")
+
+      capture_io(fn ->
+        CheckDrift.run(argv(repo, triggers, out: out, full_out: full))
+      end)
+
+      redacted = read_json(out)
+      unredacted = read_json(full)
+
+      # The public one: no pattern text, no counts, meta is exactly the six.
+      assert Enum.all?(redacted["patterns"], &(not Map.has_key?(&1, "pattern")))
+      assert Enum.all?(redacted["patterns"], &(not Map.has_key?(&1, "matches")))
+      assert Enum.all?(redacted["patterns"], &is_boolean(&1["matched"]))
+
+      assert Enum.sort(Map.keys(redacted["meta"])) == [
+               "generated_at",
+               "harness",
+               "head",
+               "repo",
+               "trigger_checksum_source",
+               "trigger_fingerprint"
+             ]
+
+      refute String.contains?(File.read!(out), repo)
+
+      # The gitignored one: everything, or it is not worth writing.
+      assert Enum.any?(unredacted["patterns"], &(&1["pattern"] == "lib/app/**"))
+      assert Enum.any?(unredacted["patterns"], &is_integer(&1["matches"]))
+      assert unredacted["meta"]["checkout"] == repo
+      assert is_integer(unredacted["meta"]["tree_files"])
+    end
+
+    test "the COMMITTED tree is read, never the working tree" do
+      # Adjacent to the resolve-then-read wiring and testable where the race is not: a file
+      # present on disk and absent from HEAD must not satisfy a pattern.
+      repo = fixture_repo([{"lib/app/claims.ex", "x"}, {"config/runtime.exs", "y"}])
+      File.mkdir_p!(Path.join(repo, "priv/rates"))
+      File.write!(Path.join(repo, "priv/rates/staged.csv"), "a,b")
+      # STAGED, not committed: in the index, absent from HEAD. An untracked file would not
+      # distinguish `ls-tree HEAD` from `ls-files`, which is the substitution worth catching.
+      git!(repo, ["add", "priv/rates/staged.csv"])
+
+      triggers = trigger_file(repo, ["lib/app/**", "priv/rates/**"], ["config/runtime.exs"])
+
+      error =
+        assert_raise Mix.Error, fn ->
+          capture_io(fn ->
+            CheckDrift.run(argv(repo, triggers, out: tmp_path("out.json")))
+          end)
+        end
+
+      assert error.message =~ "effect pattern #1"
+    end
+
+    test "a --ref that is not HEAD is resolved, and the artifact records what was read" do
+      repo = fixture_repo([{"lib/app/claims.ex", "x"}, {"config/runtime.exs", "y"}])
+      first = repo |> git!(["rev-parse", "HEAD"]) |> String.trim()
+
+      File.write!(Path.join(repo, "lib/app/claims.ex"), "changed")
+      git!(repo, ["add", "lib/app/claims.ex"])
+      git!(repo, ["commit", "--quiet", "-m", "second"])
+
+      triggers = trigger_file(repo, ["lib/app/**"], ["config/runtime.exs"])
+      out = tmp_path("out.json")
+
+      capture_io(fn ->
+        CheckDrift.run(argv(repo, triggers, out: out) ++ ["--ref", first])
+      end)
+
+      assert read_json(out)["meta"]["head"] == first
+      refute read_json(out)["meta"]["head"] == String.trim(git!(repo, ["rev-parse", "HEAD"]))
+    end
+
+    test "the head on the artifact is the head the file list was read at" do
+      repo = fixture_repo([{"lib/app/claims.ex", "x"}, {"config/runtime.exs", "y"}])
+      triggers = trigger_file(repo, ["lib/app/**"], ["config/runtime.exs"])
+      out = tmp_path("out.json")
+
+      capture_io(fn -> CheckDrift.run(argv(repo, triggers, out: out)) end)
+
+      {head, 0} = System.cmd("git", ["-C", repo, "rev-parse", "HEAD"])
+
+      assert read_json(out)["meta"]["head"] == String.trim(head)
+    end
+  end
+
+  describe "run/1 — the refusals actually refuse" do
+    test "a drifted pattern exits non-zero, naming its kind and index and never its text" do
+      repo = fixture_repo([{"lib/app/claims.ex", "x"}, {"config/runtime.exs", "y"}])
+      triggers = trigger_file(repo, ["lib/app/**", "priv/gone/**"], ["config/runtime.exs"])
+
+      error =
+        assert_raise Mix.Error, fn ->
+          capture_io(fn ->
+            CheckDrift.run(argv(repo, triggers, out: tmp_path("out.json")))
+          end)
+        end
+
+      assert error.message =~ "1 configured pattern(s) match NOTHING"
+      assert error.message =~ "effect pattern #1"
+      refute error.message =~ "priv/gone"
+    end
+
+    test "a tree with no files exits non-zero rather than passing vacuously" do
+      repo = empty_fixture_repo()
+      triggers = trigger_file(repo, ["lib/app/**"], ["config/runtime.exs"])
+
+      error =
+        assert_raise Mix.Error, fn ->
+          capture_io(fn ->
+            CheckDrift.run(argv(repo, triggers, out: tmp_path("out.json")))
+          end)
+        end
+
+      assert error.message =~ "lists no files"
+      assert error.message =~ "refusing a vacuous pass"
+    end
+
+    test "a checksum pin that does not match the bytes exits non-zero, naming the trap" do
+      repo = fixture_repo([{"lib/app/claims.ex", "x"}, {"config/runtime.exs", "y"}])
+      triggers = trigger_file(repo, ["lib/app/**"], ["config/runtime.exs"])
+
+      # The document, plus the trailing newline an editor adds. Same JSON, different bytes.
+      File.write!(triggers, File.read!(triggers) <> "\n")
+
+      error =
+        assert_raise Mix.Error, fn ->
+          capture_io(fn ->
+            CheckDrift.run(
+              argv(repo, triggers, out: tmp_path("out.json"), sha256: sha256_of(triggers, "\n"))
+            )
+          end)
+        end
+
+      assert error.message =~ "does not hash to the checksum given as --sha256"
+      assert error.message =~ "trailing newline"
+    end
+
+    test "a malformed checksum pin exits non-zero before anything is read" do
+      repo = fixture_repo([{"lib/app/claims.ex", "x"}, {"config/runtime.exs", "y"}])
+      triggers = trigger_file(repo, ["lib/app/**"], ["config/runtime.exs"])
+
+      error =
+        assert_raise Mix.Error, fn ->
+          capture_io(fn ->
+            CheckDrift.run(argv(repo, triggers, out: tmp_path("out.json"), sha256: "nope"))
+          end)
+        end
+
+      assert error.message =~ "--sha256 must be 64 hex characters"
+    end
+
+    test "a document that does not name the repo exits non-zero" do
+      repo = fixture_repo([{"lib/app/claims.ex", "x"}, {"config/runtime.exs", "y"}])
+      triggers = trigger_file(repo, ["lib/app/**"], ["config/runtime.exs"], "other/repo")
+
+      error =
+        assert_raise Mix.Error, fn ->
+          capture_io(fn ->
+            CheckDrift.run(argv(repo, triggers, out: tmp_path("out.json")))
+          end)
+        end
+
+      assert error.message =~ "does not name acme/app"
+    end
+
+    test "a document that does not parse exits non-zero WITHOUT printing the bad pattern" do
+      repo = fixture_repo([{"lib/app/claims.ex", "x"}, {"config/runtime.exs", "y"}])
+      triggers = tmp_path("bad.json")
+
+      # An empty pattern is invalid, and the reason carries it plus the repository name.
+      File.write!(
+        triggers,
+        Jason.encode!(%{
+          "version" => 1,
+          "repos" => %{
+            "acme/app" => %{
+              "effect_paths" => [""],
+              "human_paths" => ["config/runtime.exs"],
+              "limits" => %{"max_files" => 12, "max_changed_lines" => 1000}
+            }
+          }
+        })
+      )
+
+      error =
+        assert_raise Mix.Error, fn ->
+          capture_io(fn ->
+            CheckDrift.run(argv(repo, triggers, out: tmp_path("out.json")))
+          end)
+        end
+
+      assert error.message =~ "did not parse: invalid_pattern"
+      assert error.message =~ "key path depth 3"
+      refute error.message =~ "acme/app"
+      refute error.message =~ "effect_paths"
+    end
+
+    test "a clean tree says so and writes both artifacts" do
+      repo = fixture_repo([{"lib/app/claims.ex", "x"}, {"config/runtime.exs", "y"}])
+      triggers = trigger_file(repo, ["lib/app/**"], ["config/runtime.exs"])
+      out = tmp_path("out.json")
+      full = tmp_path("full.json")
+
+      output =
+        capture_io(fn ->
+          CheckDrift.run(argv(repo, triggers, out: out, full_out: full))
+        end)
+
+      assert output =~ "no drift: 2 configured patterns, every one matching"
+      assert File.exists?(out)
+      assert File.exists?(full)
+    end
+  end
+
+  # -- fixtures ------------------------------------------------------------------------------
+
+  defp argv(repo, triggers, opts) do
+    base = [
+      "--repo",
+      repo,
+      "--repo-name",
+      "acme/app",
+      "--triggers",
+      triggers,
+      "--out",
+      Keyword.fetch!(opts, :out),
+      "--full-out",
+      Keyword.get(opts, :full_out, tmp_path("full.json"))
+    ]
+
+    case Keyword.get(opts, :sha256) do
+      nil -> base
+      pin -> base ++ ["--sha256", pin]
+    end
+  end
+
+  defp trigger_file(repo, effect, human, repo_name \\ "acme/app") do
+    path = Path.join(repo, "triggers.json")
+
+    File.write!(
+      path,
+      Jason.encode!(%{
+        "version" => 1,
+        "repos" => %{
+          repo_name => %{
+            "effect_paths" => effect,
+            "human_paths" => human,
+            "limits" => %{"max_files" => 12, "max_changed_lines" => 1000}
+          }
+        }
+      })
+    )
+
+    path
+  end
+
+  defp sha256_of(path, suffix) do
+    # The checksum of the document WITHOUT the suffix — what the operator pinned before an
+    # editor appended a newline.
+    contents = path |> File.read!() |> String.replace_suffix(suffix, "")
+    :sha256 |> :crypto.hash(contents) |> Base.encode16(case: :lower)
+  end
+
+  defp tmp_path(name) do
+    path = Path.join(tmp_dir(), name)
+    File.mkdir_p!(Path.dirname(path))
+    path
+  end
+
+  defp tmp_dir do
+    dir =
+      Path.join(
+        System.tmp_dir!(),
+        "check_drift_#{System.unique_integer([:positive, :monotonic])}_#{:erlang.phash2(self())}"
+      )
+
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf(dir) end)
+    dir
+  end
+
+  defp fixture_repo(files) do
+    dir = init_repo()
+
+    for {path, contents} <- files do
+      full = Path.join(dir, path)
+      File.mkdir_p!(Path.dirname(full))
+      File.write!(full, contents)
+    end
+
+    # Explicit paths, never `git add .` — the same discipline the repository applies to its own
+    # commits, and it keeps triggers.json out of the tree the check reads.
+    git!(dir, ["add" | Enum.map(files, &elem(&1, 0))])
+    git!(dir, ["commit", "--quiet", "-m", "fixture"])
+    dir
+  end
+
+  defp empty_fixture_repo do
+    dir = init_repo()
+    git!(dir, ["commit", "--quiet", "--allow-empty", "-m", "no files"])
+    dir
+  end
+
+  defp init_repo do
+    dir = tmp_dir()
+    git!(dir, ["init", "--quiet"])
+    git!(dir, ["config", "user.email", "fixture@example.invalid"])
+    git!(dir, ["config", "user.name", "fixture"])
+    git!(dir, ["config", "commit.gpgsign", "false"])
+    dir
+  end
+
+  defp git!(dir, args) do
+    case System.cmd("git", ["-C", dir | args], stderr_to_stdout: true) do
+      {output, 0} -> output
+      {output, status} -> raise "git #{Enum.join(args, " ")} exited #{status}: #{output}"
+    end
+  end
+
+  defp read_json(path), do: path |> File.read!() |> Jason.decode!()
 end

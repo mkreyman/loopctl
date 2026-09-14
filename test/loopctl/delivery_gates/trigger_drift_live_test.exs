@@ -146,8 +146,13 @@ defmodule Loopctl.DeliveryGates.TriggerDriftLiveTest do
 
     parsed =
       case Triggers.parse(document, sha) do
-        {:ok, parsed} -> parsed
-        {:error, reason} -> flunk("the trigger document did not parse: #{inspect(reason)}")
+        {:ok, parsed} ->
+          parsed
+
+        # Reduced, never inspected: the full reason names the offending glob, and live mode
+        # runs on the runner, whose log is as public as a committed artifact.
+        {:error, reason} ->
+          flunk("the trigger document did not parse: #{TriggerDrift.describe_error(reason)}")
       end
 
     case Triggers.fetch_repo(parsed, repo_name) do
@@ -225,11 +230,23 @@ defmodule Loopctl.DeliveryGates.TriggerDriftLiveTest do
   defp assert_redacted(artifact) do
     meta = artifact["meta"] || %{}
 
-    # Named literally, never derived from the task's own allow-list: a test that reads the list
-    # it is checking moves with any change to it and can never go red when the list widens.
-    for key <- ~w(checkout tree_files ref) do
-      refute Map.has_key?(meta, key), "the committed artifact's meta leaks #{key}"
-    end
+    # EQUALITY, not a deny list. Refuting three known-bad keys is the polarity this change just
+    # replaced in the code, and leaving it here left the only artifact that actually ships
+    # unguarded against a key nobody thought of — a branch name, a document filename, a
+    # hostname, a tree_bytes count would all have passed.
+    #
+    # The six are written out literally rather than read from
+    # `CheckDrift.published_meta_keys/0`: a test that derives its expectation from the list it
+    # is checking moves with any change to that list and can never go red when one widens.
+    assert Enum.sort(Map.keys(meta)) == [
+             "generated_at",
+             "harness",
+             "head",
+             "repo",
+             "trigger_checksum_source",
+             "trigger_fingerprint"
+           ],
+           "the committed artifact's meta is not exactly the six published keys"
 
     for row <- artifact["patterns"], key <- ~w(pattern matches) do
       refute Map.has_key?(row, key), "the committed artifact leaks #{key}"
