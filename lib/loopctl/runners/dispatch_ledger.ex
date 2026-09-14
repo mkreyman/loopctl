@@ -459,13 +459,21 @@ defmodule Loopctl.Runners.DispatchLedger do
   Every kind each of a tenant's runners has refused with `kind_not_supported`, as
   `%{runner_id => [kind]}`. Runners that have refused nothing are absent.
 
-  The OPERATOR's view of the same fact `kind_unsupported?/3` decides a dispatch on, and the
-  reason it exists: `implement` is the only dispatchable kind today, so ONE
-  `kind_not_supported` reply removes that machine from all work for the life of its `runners`
-  row. With nothing exposing it, an operator sees a connected, unrevoked, idle runner that
-  silently never gets work — and a runner that maps a transient local condition to that reason
-  bricks itself until a human revokes and re-enrols it. Surfaced on `GET /api/v1/runners` and
-  `GET /api/v1/runners/pool`, it is one line of output away instead of a database session.
+  The OPERATOR's view of what each machine has actually REFUSED, and the reason it exists:
+  `implement` is the only dispatchable kind today, so ONE `kind_not_supported` reply removes an
+  UNDECLARING machine from all work for the life of its `runners` row. With nothing exposing
+  it, an operator sees a connected, unrevoked, idle runner that silently never gets work — and
+  a runner that maps a transient local condition to that reason bricks itself. Surfaced on
+  `GET /api/v1/runners` and `GET /api/v1/runners/pool`, it is one line of output away instead
+  of a database session.
+
+  Since contract 1.6.0 a row here is no longer the last word on what a runner will be sent:
+  a runner that declares its kinds on join (`RunnerJoin.kinds`) is decided by that declaration
+  and this record is not read for it (`Loopctl.Runners.dispatch/3`, step 6). So a kind listed
+  here for a DECLARING runner is history — what it refused before — rather than a statement
+  about the next dispatch, and re-enrolment is no longer the way to clear one: reconnecting
+  with the kind declared is. The record is kept for both audiences: it is the audit trail of
+  the refusal, and it is still the whole decision for a runner that declares nothing.
 
   One grouped query for the whole tenant, so a list of runners costs one round trip rather
   than one each, and served by the same partial index as `kind_unsupported?/3` — including

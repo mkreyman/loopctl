@@ -98,6 +98,7 @@ defmodule Loopctl.Runners do
   alias Loopctl.AdminRepo
   alias Loopctl.Agents.Agent
   alias Loopctl.ApiSpec.RunnerContract
+  alias Loopctl.ApiSpec.RunnerContract.Kinds
   alias Loopctl.AuditChain
   alias Loopctl.AuditChain.Entry, as: AuditEntry
   alias Loopctl.Auth
@@ -482,14 +483,24 @@ defmodule Loopctl.Runners do
   5. `{:error, :runner_ambiguous}` — more than one live socket holds the runner's
      credential. A dispatch is a prompt executed as the machine's user; with two sockets
      there is no telling which is the enrolled machine, and both would receive it.
-  6. `{:error, :kind_not_supported}` — this runner has already refused this KIND with
-     `kind_not_supported` (`DispatchLedger.kind_unsupported?/3`). A capability statement is
-     permanent for that machine and that kind, so asking again would spend a dispatch, a
-     round trip and the runner's attention on the same refusal. It is refused BEFORE the
-     ledger, so it takes no slot and passes no admission — a machine that does not do the
-     work must not hold capacity for it. Two dispatches of an unsupported kind racing can
-     both pass this read, which costs one extra refusal and no slot; the memory the first
-     reply writes settles every dispatch after it.
+  6. `{:error, :kind_not_supported}` — this runner does not do this KIND of work. Since
+     contract 1.6.0 the runner's OWN DECLARATION decides (`RunnerJoin.kinds`, read off the
+     Presence meta of the sole socket step 5 just proved): a kind outside it is refused, and a
+     kind inside it is sent even where an earlier `kind_not_supported` reply is on record.
+     Only a runner that declared nothing is decided by that record
+     (`DispatchLedger.kind_unsupported?/3`), and then only for the kinds loopctl sent before
+     the field existed — a kind it has said nothing about is refused rather than tried.
+
+     The declaration leads because the record is a CACHED NEGATIVE with no expiry and no
+     clearing path: without it, a machine that gains a kind by being upgraded stays ineligible
+     until a human revokes and re-enrols it. The record is kept as the operator's view of what
+     a machine actually refused (`unsupported_kinds/1`) and as the fallback above.
+
+     Either way it is refused BEFORE the ledger, so it takes no slot and passes no admission —
+     a machine that does not do the work must not hold capacity for it. Two dispatches of an
+     unsupported kind racing can both pass this read, which costs one extra refusal and no
+     slot; for an undeclaring runner the memory the first reply writes settles every dispatch
+     after it.
   7. `{:error, :dispatch_id_conflict}` — the tenant's ledger already holds this `dispatch_id`
      for a different runner, story, `claim_epoch` or kind.
   8. `{:error, :dispatch_already_replied}` — the runner already accepted or refused this
@@ -583,8 +594,8 @@ defmodule Loopctl.Runners do
          {:ok, tenant_id, runner_id} <- cast_ids(tenant_id, runner_id),
          :ok <- not_halted(tenant_id),
          :ok <- runner_authorized(tenant_id, runner_id),
-         :ok <- single_live_socket(tenant_id, runner_id),
-         :ok <- kind_supported(tenant_id, runner_id, dispatch.kind),
+         {:ok, meta} <- single_live_socket(tenant_id, runner_id),
+         :ok <- kind_supported(tenant_id, runner_id, meta, dispatch.kind),
          {:ok, _record} <- DispatchLedger.record_sent(tenant_id, runner_id, dispatch) do
       broadcast_dispatch(tenant_id, runner_id, dispatch)
     end
@@ -777,11 +788,75 @@ defmodule Loopctl.Runners do
 
   # Before the ledger transaction on purpose: a kind this machine does not do must take no
   # slot and pass no admission on the way to being refused. See step 6 of `dispatch/3`.
-  defp kind_supported(tenant_id, runner_id, kind) do
-    if DispatchLedger.kind_unsupported?(tenant_id, runner_id, kind),
-      do: {:error, :kind_not_supported},
-      else: :ok
+  #
+  # THE RUNNER'S OWN DECLARATION DECIDES, and the ledger's memory is only the fallback for a
+  # runner that made none (contract 1.6.0). The declaration comes off the Presence meta of the
+  # SOLE live socket — the one `single_live_socket/2` just proved, so this is the connection
+  # the dispatch will be pushed to and not some other socket's claim about the same machine.
+  #
+  # The order matters and is the whole point. `DispatchLedger.kind_unsupported?/3` is a CACHED
+  # NEGATIVE with no expiry and no clearing path: a runner that refused a kind once is
+  # ineligible for it for the life of its `runners` row, so a machine that GAINS the kind by
+  # being upgraded stays locked out until a human revokes and re-enrols it. Reading the
+  # declaration first is what unlocks it — reconnecting is enough — and consulting the ledger
+  # afterwards for a declaring runner would put the cache straight back in front of the fact it
+  # is a stale copy of.
+  #
+  # A runner that declares nothing is read as declaring what loopctl sent before the field
+  # existed (`Kinds.implied_by_silence/0`) — NOT as declaring everything. Those are the two
+  # halves of an undeclaring runner's answer and they are decided separately:
+  #
+  #   - MEMBERSHIP is answered by the implied set, so a kind loopctl never sent before 1.6.0
+  #     is refused rather than being tried on a machine that has said nothing about it. Falling
+  #     through to the ledger here would have sent the first triage dispatch to every runner
+  #     ever built, since a kind that has never been refused is not recorded as unsupported.
+  #   - the LEDGER still governs the kinds in that set, so an older runner's `implement`
+  #     behaviour is byte-for-byte what it was: refused once, refused after.
+  #
+  # The unlock is therefore precise. It reaches a runner that DECLARED the kind, and only that
+  # runner, which is exactly the machine whose declaration is newer evidence than the cache.
+  defp kind_supported(tenant_id, runner_id, meta, kind) do
+    {source, kinds} = declared_kinds(meta)
+
+    cond do
+      kind not in kinds ->
+        {:error, :kind_not_supported}
+
+      source == :declared ->
+        :ok
+
+      DispatchLedger.kind_unsupported?(tenant_id, runner_id, kind) ->
+        {:error, :kind_not_supported}
+
+      true ->
+        :ok
+    end
   end
+
+  @doc """
+  The dispatch kinds a runner's join meta declares, tagged with where they came from:
+  `{:declared, kinds}` when the runner sent `RunnerJoin.kinds` (contract 1.6.0), and
+  `{:implied, kinds}` when it sent none and is therefore read as declaring what loopctl sent
+  before the field existed (`RunnerContract.Kinds.implied_by_silence/0`).
+
+  The tag is the half that matters, and it is not cosmetic: `dispatch/3` reads the ledger's
+  `kind_not_supported` memory for an `:implied` runner and NOT for a `:declared` one. A meta
+  that fell back to `:implied` by accident would put a runner that has just declared a kind
+  back behind the cached negative it declared its way out of, which is the whole change.
+
+  A declaration is believed only in the shape `RunnerContract.cast_join/1` produces — a
+  non-empty list of binaries. The cast has already refused anything else, so this guard is
+  against a meta built some other way (a test, a future writer) reading as a declaration it
+  is not.
+  """
+  @spec declared_kinds(map()) :: {:declared | :implied, [String.t()]}
+  def declared_kinds(%{kinds: [_ | _] = kinds}) do
+    if Enum.all?(kinds, &is_binary/1),
+      do: {:declared, kinds},
+      else: {:implied, Kinds.implied_by_silence()}
+  end
+
+  def declared_kinds(meta) when is_map(meta), do: {:implied, Kinds.implied_by_silence()}
 
   @doc """
   The Presence metas of every live socket holding `runner_id`'s credential in the tenant's
@@ -799,7 +874,7 @@ defmodule Loopctl.Runners do
   defp single_live_socket(tenant_id, runner_id) do
     case live_metas(tenant_id, runner_id) do
       [] -> {:error, :runner_not_connected}
-      [_one] -> :ok
+      [one] -> {:ok, one}
       [_ | _] -> {:error, :runner_ambiguous}
     end
   end

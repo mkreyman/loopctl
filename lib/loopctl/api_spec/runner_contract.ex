@@ -35,6 +35,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | control -> runner | `"disconnecting"` | `RunnerDisconnecting` (since 1.2.0) | — | — |
   | (1.3.0) a dispatch's `wall_clock_seconds` is bounded: `RunnerDispatch.max_wall_clock_seconds/0` | | | | |
   | (1.5.0) an implement dispatch carries a `RunnerStory`, and a runner may refuse a kind with `kind_not_supported` | | | | |
+  | (1.6.0) a runner DECLARES the kinds it runs on join (`RunnerJoin.kinds`); where present it is the only thing consulted | | | | |
 
   ## The story object (since 1.5.0)
 
@@ -85,6 +86,29 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   A runner may also answer a dispatch with `kind_not_supported`, a CAPABILITY statement rather
   than a fault: this machine does not do this kind of work. loopctl records it and does not
   send that kind to that runner again (`Loopctl.Runners.DispatchLedger.kind_unsupported?/3`).
+
+  ### A runner DECLARES its kinds on join (since 1.6.0), and the declaration decides
+
+  `RunnerJoin.kinds` is the positive statement of the same fact, and where it is present it is
+  the ONLY thing consulted: `Loopctl.Runners.dispatch/3` refuses a kind outside it and sends a
+  kind inside it even when the ledger holds an old `kind_not_supported` for that pair. A runner
+  that does not send `kinds` — every runner built before 1.6.0 — is read as declaring
+  `["implement"]`, the only kind loopctl sent before this version, so nothing it has not already
+  agreed to reaches it.
+
+  It exists because the ledger's inference is a CACHED NEGATIVE with no expiry and no clearing
+  path: one `kind_not_supported` reply is permanent for the life of the `runners` row, so a
+  runner that gains a kind by being upgraded stays ineligible for it until a human revokes and
+  re-enrols the machine. Worse in the other direction — `implement` was the only dispatchable
+  kind, so a runner that mapped a transient local condition to that reason took itself out of
+  ALL work silently. A declaration has neither problem: it is per-CONNECTION, carried in the
+  runner's Presence meta rather than a table, so an upgraded runner reconnecting declares its
+  new set and is immediately eligible, and a downgrade is just as visible.
+
+  The ledger memory is kept, and is still what an operator reads
+  (`Loopctl.Runners.unsupported_kinds/1`): it is the record of what a machine actually REFUSED,
+  which a declaration — a claim made at join time about a future dispatch — cannot replace. It
+  is the fallback for an undeclaring runner and the audit trail for a declaring one.
 
   ## Stage reporting (since 1.4.0)
 
@@ -214,7 +238,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   alias Loopctl.Delivery.StageMachine
   alias OpenApiSpex.Schema
 
-  @version "1.5.0"
+  @version "1.6.0"
   @major 1
 
   defmodule ByteRule do
@@ -282,6 +306,46 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     defp utf16_units(<<_byte, rest::binary>>, n), do: utf16_units(rest, n + 1)
   end
 
+  defmodule Kinds do
+    @moduledoc false
+
+    # The dispatch-kind VOCABULARY, and the subset loopctl will actually send. ONE declaration,
+    # read by two schemas that sit at opposite ends of this file: `RunnerJoin.kinds` (what a
+    # runner says it runs, since 1.6.0) and `RunnerDispatch.kind` (what control sends). They
+    # cannot drift, because a second copy is what would let a runner declare a kind the cast
+    # then refuses — a runner correctly advertising a capability and never being given it.
+    #
+    # `triage` stays in the vocabulary and out of the dispatchable set. Narrowing an enum would
+    # be a BREAKING change and a minor version may only add — and the vocabulary is what a
+    # runner declares and answers `kind_not_supported` about. What keeps triage off the wire is
+    # `cast_dispatch/1`: its input is the reporter's own words, which the implementer must never
+    # see (design §10), so it needs its own payload with its own fencing, and `RunnerDispatch`
+    # has no field that could carry it.
+    @all ["triage", "implement"]
+    @dispatchable ["implement"]
+
+    # What a runner built before 1.6.0 is read as having declared. It MUST be the set loopctl
+    # was already sending when the field did not exist, or introducing the field would start
+    # sending an undeclaring runner something it never agreed to — or stop sending it work it
+    # has been doing all along.
+    @implied_by_silence ["implement"]
+
+    @doc "Every dispatch kind the contract names."
+    @spec all() :: [String.t()]
+    def all, do: @all
+
+    @doc "The kinds loopctl will send. Every other declared kind is refused by the cast."
+    @spec dispatchable() :: [String.t()]
+    def dispatchable, do: @dispatchable
+
+    @doc """
+    The kinds a runner that sends no `kinds` on join is read as declaring. See the module
+    comment: it is what loopctl sent before the field existed, and nothing else is safe.
+    """
+    @spec implied_by_silence() :: [String.t()]
+    def implied_by_silence, do: @implied_by_silence
+  end
+
   defmodule RunnerSample do
     @moduledoc false
     require OpenApiSpex
@@ -316,6 +380,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     @moduledoc false
     require OpenApiSpex
 
+    alias Loopctl.ApiSpec.RunnerContract.Kinds
     alias Loopctl.ApiSpec.RunnerContract.RunnerSample
 
     OpenApiSpex.schema(
@@ -374,6 +439,22 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           draining: %Schema{
             type: :boolean,
             description: "True when the runner accepts no new dispatches."
+          },
+          kinds: %Schema{
+            type: :array,
+            minItems: 1,
+            maxItems: length(Kinds.all()),
+            uniqueItems: true,
+            items: %Schema{type: :string, enum: Kinds.all()},
+            description:
+              "The dispatch kinds this machine runs (since 1.6.0). Where present this is " <>
+                "the ONLY thing consulted: loopctl refuses a kind outside it, and sends a " <>
+                "kind inside it even where an earlier `kind_not_supported` reply is on " <>
+                "record for this runner. A runner that omits it is read as declaring " <>
+                "#{inspect(Kinds.implied_by_silence())} — what loopctl sent before the " <>
+                "field existed. Declare it on EVERY join: it is per-connection, so an " <>
+                "upgraded runner becomes eligible for a new kind by reconnecting rather " <>
+                "than by being re-enrolled."
           },
           sample: RunnerSample.schema()
         }
@@ -604,27 +685,19 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     @spec max_wall_clock_seconds() :: pos_integer()
     def max_wall_clock_seconds, do: @max_wall_clock_seconds
 
-    # The `kind` VOCABULARY, and the subset loopctl will actually send (since 1.5.0). Both are
-    # declared here; `RunnerContract.cast_dispatch/1` refuses a kind outside
-    # `dispatchable_kinds/0` before anything is recorded or broadcast, and the export
-    # publishes both lists.
-    #
-    # `triage` stays in the enum and out of the dispatchable set. Narrowing an enum would be a
-    # BREAKING change and a minor version may only add — and the vocabulary is what a runner
-    # answers `kind_not_supported` about. What keeps triage off the wire is the cast: its
-    # input is the reporter's own words, which the implementer must never see (design §10), so
-    # it needs its own payload with its own fencing, and this shape has no field that could
-    # carry it.
-    @kinds ["triage", "implement"]
-    @dispatchable_kinds ["implement"]
+    # The kind vocabulary and the dispatchable subset are declared ONCE, in
+    # `RunnerContract.Kinds` — `RunnerJoin.kinds` reads the same lists and sits 300 lines
+    # above this module, so a copy here is exactly the drift that would let a runner declare a
+    # kind `cast_dispatch/1` then refuses. These two delegate; the export publishes both lists.
+    alias Loopctl.ApiSpec.RunnerContract.Kinds
 
     @doc "Every dispatch kind the contract names."
     @spec kinds() :: [String.t()]
-    def kinds, do: @kinds
+    def kinds, do: Kinds.all()
 
     @doc "The kinds loopctl will send. Every other declared kind is refused by the cast."
     @spec dispatchable_kinds() :: [String.t()]
-    def dispatchable_kinds, do: @dispatchable_kinds
+    def dispatchable_kinds, do: Kinds.dispatchable()
 
     OpenApiSpex.schema(
       %{
@@ -654,7 +727,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
         properties: %{
           dispatch_id: %Schema{type: :string, format: :uuid},
           story_id: %Schema{type: :string, format: :uuid},
-          kind: %Schema{type: :string, enum: @kinds},
+          kind: %Schema{type: :string, enum: Kinds.all()},
           repo: %Schema{type: :string, pattern: "^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$"},
           base_branch: %Schema{type: :string, minLength: 1, maxLength: 255},
           branch: %Schema{type: :string, minLength: 1, maxLength: 255},
@@ -1621,6 +1694,11 @@ defmodule Loopctl.ApiSpec.RunnerContract do
         # VOCABULARY, which is wider: `triage` is declared and refused by `cast_dispatch/1`
         # until it has its own payload. Published so a runner knows which it must handle.
         "dispatchable_kinds" => RunnerDispatch.dispatchable_kinds(),
+        # What loopctl reads a runner that sends no `RunnerJoin.kinds` as having declared
+        # (since 1.6.0). Published rather than left in prose because it is the one value a
+        # runner author has to know to tell "I said nothing" from "I said implement" — they
+        # are the same thing today, and a runner that wants any other set must send the field.
+        "implied_kinds" => Kinds.implied_by_silence(),
         "replies" => %{
           "trace" => "RunnerTraceAck",
           "trace_cursor" => "RunnerTraceAck"

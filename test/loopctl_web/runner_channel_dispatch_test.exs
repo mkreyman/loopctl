@@ -28,6 +28,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.ApiSpec.RunnerContract
+  alias Loopctl.ApiSpec.RunnerContract.Kinds
   alias Loopctl.ApiSpec.RunnerContract.RunnerTraceBatch
   alias Loopctl.ApiSpec.RunnerContract.RunnerTraceEvent
   alias Loopctl.Auth
@@ -60,7 +61,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
     }
   end
 
-  defp join_payload(machine, overrides \\ %{}) do
+  defp join_payload(machine, overrides) do
     Map.merge(
       %{
         "contract_version" => RunnerContract.version(),
@@ -81,13 +82,30 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
   # Joins and waits for the channel to process :after_join (the Presence track).
   defp topic(socket), do: "runner:" <> socket.assigns.runner.id
 
-  defp join_pool(socket, machine) do
-    {:ok, reply, channel} = subscribe_and_join(socket, topic(socket), join_payload(machine))
+  defp join_pool(socket, machine, overrides \\ %{}) do
+    {:ok, reply, channel} =
+      subscribe_and_join(socket, topic(socket), join_payload(machine, overrides))
+
     _ = :sys.get_state(channel.channel_pid)
     {reply, channel}
   end
 
   defp in_pool?(tenant_id, name), do: Map.has_key?(Runners.pool(tenant_id), name)
+
+  # Reconnects a runner, joining with a different payload. The old channel must be GONE from
+  # the pool first: two live sockets on one credential are `:runner_ambiguous`, which would
+  # refuse a dispatch for a reason that has nothing to do with the kind under test. The unlink
+  # is because a channel shutting down with `:left` takes the linked test process with it.
+  defp rejoin_declaring(channel, raw, runner, kinds) do
+    Process.unlink(channel.channel_pid)
+    ref = leave(channel)
+    assert_reply ref, :ok, _, @reply_timeout
+    assert eventually(fn -> not in_pool?(runner.tenant_id, runner.name) end, @reply_timeout)
+
+    {:ok, socket} = connect_runner(raw)
+    {_reply, channel} = join_pool(socket, runner.name, %{"kinds" => kinds})
+    channel
+  end
 
   # A dispatch RECORDED in the ledger, as `Runners.dispatch/3` records one before it
   # broadcasts. Tests that broadcast by hand need it: the channel takes the delivery decision
@@ -664,6 +682,102 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
       tenant_b = fixture(:committed_tenant, %{})
       refute DispatchLedger.kind_unsupported?(tenant_b.id, runner.id, "implement")
+    end
+
+    # Contract 1.6.0. The ledger's `kind_not_supported` memory has no expiry and no clearing
+    # path, so before the declaration a machine that GAINED a kind by being upgraded stayed
+    # ineligible for the life of its runners row — the operator's only remedy was revoke and
+    # re-enrol. Reconnecting with the kind declared is now the remedy, and this is that.
+    test "a runner that DECLARES a kind is sent it despite a recorded kind_not_supported",
+         %{runner: runner, raw: raw, channel: channel} do
+      payload = dispatch_payload(runner.tenant_id)
+      assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
+      assert_push "dispatch", _, @reply_timeout
+
+      ref =
+        push(channel, "dispatch_reply", %{
+          "dispatch_id" => payload["dispatch_id"],
+          "claim_epoch" => payload["claim_epoch"],
+          "decision" => "refused",
+          "reason" => "kind_not_supported"
+        })
+
+      assert_reply ref, :ok, _, @reply_timeout
+      assert DispatchLedger.kind_unsupported?(runner.tenant_id, runner.id, "implement")
+
+      # Undeclared, the next one is refused — the behaviour the declaration overrides.
+      assert {:error, :kind_not_supported} =
+               Runners.dispatch(runner.tenant_id, runner.id, dispatch_payload(runner.tenant_id))
+
+      # The machine reconnects declaring the kind. Nothing about the runners row, the ledger
+      # row or the recorded refusal changed: the ONLY new fact is what it said on join.
+      _channel = rejoin_declaring(channel, raw, runner, ["implement"])
+
+      assert :ok =
+               Runners.dispatch(runner.tenant_id, runner.id, dispatch_payload(runner.tenant_id))
+
+      assert_push "dispatch", _, @reply_timeout
+
+      # And the record itself is untouched — it is the audit trail of what the machine
+      # refused, which a later declaration does not rewrite.
+      assert DispatchLedger.kind_unsupported?(runner.tenant_id, runner.id, "implement")
+    end
+
+    test "a kind the runner did not declare is refused, and takes no slot or ledger row",
+         %{runner: runner, raw: raw, channel: channel} do
+      # A declaration that does NOT include `implement`. `triage` is in the contract's
+      # vocabulary and is what a triage-only machine would say.
+      _channel = rejoin_declaring(channel, raw, runner, ["triage"])
+
+      held = in_flight_of(runner)
+      payload = dispatch_payload(runner.tenant_id)
+
+      assert {:error, :kind_not_supported} =
+               Runners.dispatch(runner.tenant_id, runner.id, payload)
+
+      refute_push "dispatch", _
+      assert DispatchLedger.get_record(runner.tenant_id, payload["dispatch_id"]) == nil
+      assert in_flight_of(runner) == held
+
+      # Refused on the declaration alone: the ledger holds no refusal for this pair, so
+      # nothing but the join payload can have decided it.
+      refute DispatchLedger.kind_unsupported?(runner.tenant_id, runner.id, "implement")
+    end
+  end
+
+  describe "declared_kinds/1" do
+    test "a runner that sent kinds declared them" do
+      assert Runners.declared_kinds(%{kinds: ["implement"]}) == {:declared, ["implement"]}
+
+      assert Runners.declared_kinds(%{kinds: ["triage", "implement"]}) ==
+               {:declared, ["triage", "implement"]}
+    end
+
+    # The tag, not just the list. `dispatch/3` reads the ledger's cached negative for an
+    # `:implied` runner and NOT for a `:declared` one, so a meta that fell back to `:implied`
+    # by accident would put a runner that has just declared a kind back behind the very cache
+    # it declared its way out of.
+    test "a runner that sent none is read as declaring what loopctl sent before the field" do
+      implied = Kinds.implied_by_silence()
+
+      assert Runners.declared_kinds(%{}) == {:implied, implied}
+      assert Runners.declared_kinds(%{machine: "minis"}) == {:implied, implied}
+
+      # NOT "everything": a kind loopctl never sent before 1.6.0 is outside the implied set,
+      # so an undeclaring machine is never tried with one it has said nothing about.
+      assert "implement" in implied
+      refute "triage" in implied
+    end
+
+    # `cast_join/1` refuses these before a meta is built. The guard is against a meta built
+    # some other way reading as a declaration it is not — which would be a SILENT widening,
+    # since the `:declared` tag is what skips the ledger.
+    test "a malformed kinds value is not a declaration" do
+      implied = Kinds.implied_by_silence()
+
+      assert Runners.declared_kinds(%{kinds: []}) == {:implied, implied}
+      assert Runners.declared_kinds(%{kinds: ["implement", :triage]}) == {:implied, implied}
+      assert Runners.declared_kinds(%{kinds: "implement"}) == {:implied, implied}
     end
   end
 

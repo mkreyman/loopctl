@@ -214,6 +214,18 @@
           "minimum": 0,
           "type": "integer"
         },
+        "kinds": {
+          "description": "The dispatch kinds this machine runs (since 1.6.0). Where present this is the ONLY thing consulted: loopctl refuses a kind outside it, and sends a kind inside it even where an earlier `kind_not_supported` reply is on record for this runner. A runner that omits it is read as declaring [\"implement\"] — what loopctl sent before the field existed. Declare it on EVERY join: it is per-connection, so an upgraded runner becomes eligible for a new kind by reconnecting rather than by being re-enrolled.",
+          "items": {
+            "enum": [
+              "triage",
+              "implement"
+            ],
+            "type": "string"
+          },
+          "maxItems": 2,
+          "type": "array"
+        },
         "machine": {
           "description": "The machine name the runner was enrolled under. Must match exactly.",
           "pattern": "^[a-z0-9][a-z0-9._-]{0,62}$",
@@ -789,6 +801,9 @@
       "trace_cursor": "RunnerTraceCursor",
       "trace_event": "RunnerTraceEvent"
     },
+    "implied_kinds": [
+      "implement"
+    ],
     "limits": {
       "dispatch_reply_burst": {
         "capacity": 8,
@@ -951,5 +966,5 @@
     ],
     "topic": "runner:{runner_id}"
   },
-  "x-contract-version": "1.5.0"
+  "x-contract-version": "1.6.0"
 }

@@ -6,6 +6,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.ApiSpec.RunnerContract.ByteRule
+  alias Loopctl.ApiSpec.RunnerContract.Kinds
   alias Loopctl.ApiSpec.RunnerContract.RunnerDispatch
   alias Loopctl.ApiSpec.RunnerContract.RunnerDispatchReply
   alias Loopctl.ApiSpec.RunnerContract.RunnerStage
@@ -54,8 +55,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.5.0"
-      assert schema["x-contract-version"] == "1.5.0"
+      assert RunnerContract.version() == "1.6.0"
+      assert schema["x-contract-version"] == "1.6.0"
 
       assert %{
                "dispatch_reply" => "RunnerDispatchReply",
@@ -68,6 +69,13 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
                "trace" => "RunnerTraceAck",
                "trace_cursor" => "RunnerTraceAck"
              }
+
+      # #803: the kind lists are published so a runner reads them rather than parsing prose.
+      # Asserted against the ONE declaration both schemas read, never against a copy — a
+      # literal here would let `RunnerJoin.kinds` and `RunnerDispatch.kind` drift apart while
+      # this test stayed green, which is the failure `Kinds` exists to make impossible.
+      assert connection["dispatchable_kinds"] == Kinds.dispatchable()
+      assert connection["implied_kinds"] == Kinds.implied_by_silence()
 
       assert connection["errors"] == RunnerContract.error_reasons()
       assert "unknown_event" in connection["errors"]["unknown_event"]
