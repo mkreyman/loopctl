@@ -729,6 +729,24 @@ defmodule Loopctl.Fixtures do
     )
   end
 
+  # A `story` object satisfying the runner contract's RunnerStory (1.5.0), string-keyed as
+  # `Loopctl.Delivery.ImplementerInput.story_object/2` emits it. Pass "id" to match a
+  # dispatch's "story_id" — `cast_dispatch/1` refuses a story naming a different one.
+  def build(:runner_story, attrs) do
+    Map.merge(
+      %{
+        "id" => Ecto.UUID.generate(),
+        "title" => "Round a visit's billable minutes up to the nearest unit",
+        "description" => "The monthly total must equal the sum of its visits.",
+        "acceptance_criteria" => ["[AC-1] The monthly total equals the sum of its visits."],
+        "test_cases" => ["A visit of 7 minutes bills one unit."],
+        "touches" => ["lib/home_care_billing/billing/visit.ex"],
+        "domain_reference" => "docs/architecture/timesheets-and-work-orders.md"
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
   # One event of a run's trace satisfying RunnerTraceEvent, string-keyed as the runner ships
   # it. Pass "run_id" and "seq"; the rest defaults.
   def build(:runner_trace_event, attrs) do

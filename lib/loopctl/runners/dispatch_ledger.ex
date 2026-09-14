@@ -387,6 +387,46 @@ defmodule Loopctl.Runners.DispatchLedger do
   end
 
   @doc """
+  Whether `runner_id` has told this tenant it does not do `kind` — a `dispatch_reply` refused
+  with `kind_not_supported` (contract 1.5.0).
+
+  The memory is DERIVED from the ledger rather than kept in a column, and that is the whole
+  design decision. The ledger already records every reply with its reason, keyed by exactly
+  the pair the statement is about (`runner_id`, `kind`), so the evidence and the conclusion
+  cannot drift apart, no migration is needed, and there is no second place to forget to
+  clear. A capability that CHANGES — the machine is upgraded and now does the kind — is
+  cleared the way a runner's other bindings are: revoke and re-enroll, which mints a new
+  `runners` row that no reply refers to. A column would have to be un-set by hand instead,
+  and a stale one would silently starve a machine that had gained the capability.
+
+  It is a statement about capability, not health: a refusal releases its slot in the same
+  transaction that records it, and nothing in loopctl reads a refusal as a runner being
+  unwell. This read is what keeps loopctl from asking the same machine the same impossible
+  question again.
+
+  Indexed by `runner_dispatches (tenant_id, runner_id)`, filtered to the refused rows, and it
+  stops at the first match. The `status` predicate is defence in depth over an L2 invariant
+  rather than the enforcement: the `runner_dispatches_reason_iff_refused` CHECK already makes
+  a reason without a refusal impossible, which is why no test can turn that clause red — see
+  the note on it in `dispatch_ledger_test.exs`.
+  """
+  @spec kind_unsupported?(Ecto.UUID.t(), Ecto.UUID.t(), String.t()) :: boolean()
+  def kind_unsupported?(tenant_id, runner_id, kind)
+      when is_binary(tenant_id) and is_binary(runner_id) and is_binary(kind) do
+    {:ok, unsupported?} =
+      in_tenant(tenant_id, fn ->
+        Repo.exists?(
+          from r in DispatchRecord,
+            where: r.tenant_id == ^tenant_id and r.runner_id == ^runner_id,
+            where: r.kind == ^kind and r.status == "refused",
+            where: r.reason == "kind_not_supported"
+        )
+      end)
+
+    unsupported?
+  end
+
+  @doc """
   Releases the slot `generation` of `dispatch_id`, exactly once, in a transaction of its own:
   `{:ok, :released}` the first time, `{:ok, :already_released}` on every replay and for a
   generation the row no longer holds. For the caller that learns a dispatch's session ended,

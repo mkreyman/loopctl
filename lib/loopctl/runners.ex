@@ -380,21 +380,29 @@ defmodule Loopctl.Runners do
   5. `{:error, :runner_ambiguous}` — more than one live socket holds the runner's
      credential. A dispatch is a prompt executed as the machine's user; with two sockets
      there is no telling which is the enrolled machine, and both would receive it.
-  6. `{:error, :dispatch_id_conflict}` — the tenant's ledger already holds this `dispatch_id`
+  6. `{:error, :kind_not_supported}` — this runner has already refused this KIND with
+     `kind_not_supported` (`DispatchLedger.kind_unsupported?/3`). A capability statement is
+     permanent for that machine and that kind, so asking again would spend a dispatch, a
+     round trip and the runner's attention on the same refusal. It is refused BEFORE the
+     ledger, so it takes no slot and passes no admission — a machine that does not do the
+     work must not hold capacity for it. Two dispatches of an unsupported kind racing can
+     both pass this read, which costs one extra refusal and no slot; the memory the first
+     reply writes settles every dispatch after it.
+  7. `{:error, :dispatch_id_conflict}` — the tenant's ledger already holds this `dispatch_id`
      for a different runner, story, `claim_epoch` or kind.
-  7. `{:error, :dispatch_already_replied}` — the runner already accepted or refused this
+  8. `{:error, :dispatch_already_replied}` — the runner already accepted or refused this
      `dispatch_id`; sending it again would start a second session.
-  8. `{:error, :stale_claim_epoch}` — the dispatch's `claim_epoch` is not the story's current
+  9. `{:error, :stale_claim_epoch}` — the dispatch's `claim_epoch` is not the story's current
      one (or the story does not exist): the claim it was built for has already ended.
-  9. `{:error, :admission_limit_reached}` — the tenant's runners already hold
-     `Capacity.limit/0` slots between them. All of a tenant's sessions run on one Anthropic
-     account, and its rate limit is what bites.
-  10. `{:error, :runner_at_capacity}` — this runner already holds `max_sessions` slots (or
+  10. `{:error, :admission_limit_reached}` — the tenant's runners already hold
+      `Capacity.limit/0` slots between them. All of a tenant's sessions run on one Anthropic
+      account, and its rate limit is what bites.
+  11. `{:error, :runner_at_capacity}` — this runner already holds `max_sessions` slots (or
       was revoked since step 3).
-  11. `{:error, :capacity_busy}` — a lock the reservation waits on was not granted within
+  12. `{:error, :capacity_busy}` — a lock the reservation waits on was not granted within
       `Capacity.lock_timeout_ms/0`. Nothing was recorded or reserved; retry.
 
-  Steps 6-11 run in ONE transaction: the ledger row and its slot commit together or not at
+  Steps 7-12 run in ONE transaction: the ledger row and its slot commit together or not at
   all, and a re-send of a `dispatch_id` whose row still holds its slot takes no second one.
 
   Then it writes the dispatch's ledger row as `sent` (`DispatchLedger.record_sent/3`) — or
@@ -425,6 +433,7 @@ defmodule Loopctl.Runners do
              | :not_authorized
              | :runner_not_connected
              | :runner_ambiguous
+             | :kind_not_supported
              | :dispatch_id_conflict
              | :dispatch_already_replied
              | :stale_claim_epoch
@@ -473,6 +482,7 @@ defmodule Loopctl.Runners do
          :ok <- not_halted(tenant_id),
          :ok <- runner_authorized(tenant_id, runner_id),
          :ok <- single_live_socket(tenant_id, runner_id),
+         :ok <- kind_supported(tenant_id, runner_id, dispatch.kind),
          {:ok, _record} <- DispatchLedger.record_sent(tenant_id, runner_id, dispatch) do
       broadcast_dispatch(tenant_id, runner_id, dispatch)
     end
@@ -651,6 +661,14 @@ defmodule Loopctl.Runners do
 
   defp runner_authorized(tenant_id, runner_id) do
     if authorized?(tenant_id, runner_id), do: :ok, else: {:error, :not_authorized}
+  end
+
+  # Before the ledger transaction on purpose: a kind this machine does not do must take no
+  # slot and pass no admission on the way to being refused. See step 6 of `dispatch/3`.
+  defp kind_supported(tenant_id, runner_id, kind) do
+    if DispatchLedger.kind_unsupported?(tenant_id, runner_id, kind),
+      do: {:error, :kind_not_supported},
+      else: :ok
   end
 
   @doc """

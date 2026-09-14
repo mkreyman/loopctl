@@ -39,7 +39,12 @@ defmodule Loopctl.Delivery.ImplementerInputTest do
     "lib/loopctl/delivery/injection_detector.ex"
   ]
 
-  @story_field_allowlist ~w(number title description acceptance_criteria)
+  # `id` is on the list for `story_object/2` (contract 1.5.0): the dispatch carries the
+  # story's own id and the contract refuses a story naming a different one. It is an
+  # identifier the control plane generated, never text anybody wrote, so it widens the
+  # allowlist without widening the reporter-text boundary this test exists to hold. Every
+  # other entry is still prose a triage session authored.
+  @story_field_allowlist ~w(id number title description acceptance_criteria)
 
   defp hostile_record do
     {secret, source} = fixture(:intake_source, %{})
@@ -143,6 +148,46 @@ defmodule Loopctl.Delivery.ImplementerInputTest do
     assert output =~ "Include every visit in the monthly billing total"
     assert output =~ "[AC-1] The monthly total equals the sum of its visits."
     assert_no_reporter_text(output, record)
+  end
+
+  test "the typed story object carries no reporter text either, metadata quote and all" do
+    {source, record} = hostile_record()
+
+    story =
+      fixture(:story, %{
+        tenant_id: source.tenant_id,
+        project_id: source.project_id,
+        title: "Include every visit in the monthly billing total",
+        description: "The October total omits two visits from batch 4821; include them.",
+        acceptance_criteria: [
+          %{"id" => "AC-1", "description" => "The monthly total equals the sum of its visits."}
+        ],
+        metadata: %{
+          "reporter_quote" => record.untrusted_body,
+          "reporter_title" => record.untrusted_title,
+          # The three fields the object CAN carry, parked where a careless writer would put
+          # them. They must not be picked up from here: they are options the dispatch
+          # composer passes, and `metadata` is off the allowlist.
+          "test_cases" => [record.untrusted_title],
+          "touches" => [record.untrusted_body],
+          "domain_reference" => record.untrusted_author_login
+        }
+      })
+
+    assert {:ok, object} = ImplementerInput.story_object(story)
+
+    assert object["id"] == story.id
+    assert object["title"] == "Include every visit in the monthly billing total"
+
+    assert object["acceptance_criteria"] == [
+             "[AC-1] The monthly total equals the sum of its visits."
+           ]
+
+    refute Map.has_key?(object, "test_cases")
+    refute Map.has_key?(object, "touches")
+    refute Map.has_key?(object, "domain_reference")
+
+    assert_no_reporter_text(Jason.encode!(object), record)
   end
 
   test "only a Story is accepted" do

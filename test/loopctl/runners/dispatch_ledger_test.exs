@@ -76,9 +76,14 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
     end)
   end
 
-  defp sent(runner, attrs \\ %{}) do
+  # `after_cast` overrides fields of the CAST dispatch, for the values the outbound cast
+  # legitimately refuses but the ledger must still store.
+  defp sent(runner, attrs \\ %{}, after_cast \\ %{}) do
     {:ok, dispatch} = RunnerContract.cast_dispatch(dispatch_payload(runner.tenant_id, attrs))
-    {:ok, record} = DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch)
+
+    {:ok, record} =
+      DispatchLedger.record_sent(runner.tenant_id, runner.id, Map.merge(dispatch, after_cast))
+
     record
   end
 
@@ -135,7 +140,10 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
 
   describe "record_sent/3" do
     test "writes one `sent` row carrying the dispatch's identity", %{runner: runner} do
-      record = sent(runner, %{"claim_epoch" => 3, "kind" => "triage"})
+      # The kind is set AFTER the cast: `triage` is a declared kind the cast refuses to
+      # dispatch (contract 1.5.0), while the ledger stores whatever kind it is handed — which
+      # is what this asserts, and what keeps the row honest once triage has its own payload.
+      record = sent(runner, %{"claim_epoch" => 3}, %{kind: "triage"})
 
       assert record.status == "sent"
       assert record.runner_id == runner.id
@@ -181,15 +189,21 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
       # so the refusal is the ledger's identity check, not the fence.
       other_story = fixture(:ledger_story, %{tenant_id: runner.tenant_id})
 
-      for {who, attrs} <- [
-            {runner, %{"kind" => "triage"}},
-            {runner, %{"story_id" => other_story.id}},
-            {other, %{}}
+      # `after_cast` for the kind, which the outbound cast refuses to dispatch; the ledger's
+      # identity check reads the stored column either way.
+      for {who, attrs, after_cast} <- [
+            {runner, %{}, %{kind: "triage"}},
+            {runner, %{"story_id" => other_story.id}, %{}},
+            {other, %{}, %{}}
           ] do
         {:ok, dispatch} = RunnerContract.cast_dispatch(Map.merge(base, attrs))
 
         assert {:error, :dispatch_id_conflict} =
-                 DispatchLedger.record_sent(who.tenant_id, who.id, dispatch)
+                 DispatchLedger.record_sent(
+                   who.tenant_id,
+                   who.id,
+                   Map.merge(dispatch, after_cast)
+                 )
       end
 
       # A different epoch on the SAME story: once the story has moved to it, that too is a
@@ -230,6 +244,62 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
       assert record_b.id != record.id
       assert DispatchLedger.get_record(tenant_b.id, record.dispatch_id).id == record_b.id
       assert DispatchLedger.get_record(runner.tenant_id, record.dispatch_id).id == record.id
+    end
+  end
+
+  describe "kind_unsupported?/3" do
+    test "is true only for the kind the runner actually refused", %{runner: runner} do
+      # Scoped BY KIND, and that cannot be shown through `Runners.dispatch/3` while
+      # `implement` is the only dispatchable kind — so it is shown here, against the read
+      # itself. Without the kind predicate a machine that declined triage would never be sent
+      # an implement dispatch again.
+      record = sent(runner)
+
+      {:ok, _} =
+        reply(runner, record, %{"decision" => "refused", "reason" => "kind_not_supported"})
+
+      assert DispatchLedger.kind_unsupported?(runner.tenant_id, runner.id, "implement")
+      refute DispatchLedger.kind_unsupported?(runner.tenant_id, runner.id, "triage")
+    end
+
+    test "an accepted or otherwise-refused dispatch says nothing about the kind",
+         %{runner: runner} do
+      accepted = sent(runner)
+      {:ok, _} = reply(runner, accepted)
+
+      other = sent(runner)
+      {:ok, _} = reply(runner, other, %{"decision" => "refused", "reason" => "draining"})
+
+      refute DispatchLedger.kind_unsupported?(runner.tenant_id, runner.id, "implement")
+    end
+
+    test "the database is what makes a reason without a refusal impossible", %{runner: runner} do
+      # `kind_unsupported?/3` also filters on `status == "refused"`, and no test can turn that
+      # predicate red — because the state it excludes cannot exist. This is why: the
+      # `runner_dispatches_reason_iff_refused` CHECK refuses the row outright, so the
+      # predicate is defence in depth over an L2 invariant rather than the enforcement. If
+      # this assertion ever goes red, that predicate has become load-bearing and needs a test
+      # of its own.
+      record = sent(runner)
+
+      assert_raise Postgrex.Error, ~r/runner_dispatches_reason_iff_refused/, fn ->
+        as_tenant(runner.tenant_id, fn ->
+          from(r in DispatchRecord, where: r.id == ^record.id)
+          |> Repo.update_all(set: [reason: "kind_not_supported"])
+        end)
+      end
+    end
+
+    test "one runner's refusal does not speak for another", %{runner: runner} do
+      {_raw, other} = fixture(:committed_runner, %{name: "blockit", tenant_id: runner.tenant_id})
+
+      record = sent(runner)
+
+      {:ok, _} =
+        reply(runner, record, %{"decision" => "refused", "reason" => "kind_not_supported"})
+
+      assert DispatchLedger.kind_unsupported?(runner.tenant_id, runner.id, "implement")
+      refute DispatchLedger.kind_unsupported?(other.tenant_id, other.id, "implement")
     end
   end
 
