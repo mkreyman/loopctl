@@ -26,12 +26,16 @@ defmodule LoopctlRunner.Control do
     1. a `dispatch_id` this runner already started is never run again: the same `claim_epoch`
        is answered `accepted` again (loopctl answers an identical repeat `ok`), another is
        refused `other`;
-    2. `LoopctlRunner.DispatchPolicy` — its reason and detail on a refusal, with `in_flight`
+    2. `kind` must be `implement`: any other is refused `kind_not_supported`, before the policy,
+       because loopctl reads that reason as permanent for this runner and a transient refusal
+       (draining, at capacity) would have it keep sending the kind;
+    3. `LoopctlRunner.DispatchPolicy` — its reason and detail on a refusal, with `in_flight`
        counting every run this process accepted from the moment it accepted it;
-    3. `kind` must be `implement`: a triage dispatch is refused `other`, which becomes
-       `kind_not_supported` once contract 1.5.0 is vendored;
-    4. the dispatch must carry a well-formed `story` object (contract 1.5.0, read defensively by
-       `LoopctlRunner.DispatchRun`), or it is refused `other`.
+    4. the dispatch must carry a `story` object meeting what the schema cannot say, chiefly
+       `story.id` equal to `story_id` (`LoopctlRunner.DispatchRun`), or it is refused `other`.
+
+  Before any of these, the contract's own `RunnerDispatch` validation (1.5.0 types the story)
+  refuses a malformed dispatch `other`, naming the field.
 
   The decision runs on untrusted input, so anything it raises is refused `other` naming only the
   exception's kind; the full error is logged locally and Control keeps running.
@@ -165,10 +169,9 @@ defmodule LoopctlRunner.Control do
   @terminal_internal_error_attempts 8
   # The longest wait between stage retries.
   @max_stage_backoff_ms 5_000
-  # The refusal of a dispatch whose kind this runner does not run. The vendored contract 1.4.0
-  # has no kind_not_supported, so it is `other` for now: vendoring 1.5.0 changes this ONE line to
-  # "kind_not_supported" (1.5.0 x-connection.dispatchable_kinds is ["implement"]).
-  @kind_refusal_reason "other"
+  # The refusal of a dispatch whose kind this runner does not run (contract 1.5.0): a capability
+  # statement, which loopctl reads as permanent for this runner, not a fault.
+  @kind_refusal_reason "kind_not_supported"
   @kind_refusal "triage dispatches are not supported by this runner yet"
 
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -1123,8 +1126,8 @@ defmodule LoopctlRunner.Control do
     config = %{a.config | control: %{a.config.control | accepts_dispatches: a.accepts_dispatches}}
     state = %{draining: a.draining, in_flight: in_flight(a), free_disk_mb: &free_disk_mb(a, &1)}
 
-    with {:accept, fields} <- a.decide.(dispatch, config, state),
-         :ok <- implement_kind(dispatch),
+    with :ok <- implement_kind(dispatch),
+         {:accept, fields} <- a.decide.(dispatch, config, state),
          {:ok, story_object} <- dispatch_story(dispatch),
          {:ok, story} <- local_story(dispatch, fields, story_object, a.config) do
       {:accept, story}

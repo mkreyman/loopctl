@@ -6,7 +6,7 @@ defmodule LoopctlRunner.ContractTest do
   defp join(overrides \\ %{}) do
     Map.merge(
       %{
-        "contract_version" => "1.4.0",
+        "contract_version" => "1.5.0",
         "machine" => "minis",
         "cores" => 16,
         "memory_mb" => 28_000,
@@ -19,8 +19,8 @@ defmodule LoopctlRunner.ContractTest do
     )
   end
 
-  test "the vendored contract is v1.4.0 and names the socket and header the client uses" do
-    assert Contract.version() == "1.4.0"
+  test "the vendored contract is v1.5.0 and names the socket and header the client uses" do
+    assert Contract.version() == "1.5.0"
 
     assert %{
              "credential_header" => "x-loopctl-runner-token",

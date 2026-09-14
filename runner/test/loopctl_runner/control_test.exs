@@ -57,7 +57,7 @@ defmodule LoopctlRunner.ControlTest do
     assert_receive {:test_loopctl, {:join, ^runner_id, join}}, 5_000
     assert Contract.validate("RunnerJoin", join) == :ok
     assert join["machine"] == "testbox"
-    assert join["contract_version"] == "1.4.0"
+    assert join["contract_version"] == "1.5.0"
     assert join["repos"] == ["mkreyman/home_care_billing"]
     assert %{"sampled_at" => _, "free_disk_mb" => _} = join["sample"]
 
@@ -1263,7 +1263,8 @@ defmodule LoopctlRunner.ControlTest do
         assert_receive {:test_loopctl, {:dispatch_reply, reply}}, 5_000
 
         assert %{"decision" => "refused", "reason" => "other", "detail" => detail} = reply
-        assert detail == "the dispatch story #{key}[0] is null"
+        # Contract 1.5.0 types the story, so its own validation refuses the null first.
+        assert detail =~ "story.#{key}[0]"
       end
 
       assert Process.alive?(pid)
@@ -1508,7 +1509,8 @@ defmodule LoopctlRunner.ControlTest do
       assert_receive {:delivered, ^message}, 1_000
     end
 
-    test "a dispatch without a story, and a triage dispatch, are refused as other", ctx do
+    test "a dispatch without a story is refused as other, a triage one as kind_not_supported",
+         ctx do
       {pid, topic} = accepting_control(ctx, "stream")
 
       no_story = story_dispatch() |> Map.delete("story")
@@ -1522,13 +1524,26 @@ defmodule LoopctlRunner.ControlTest do
       TestLoopctl.Endpoint.broadcast(topic, "dispatch", triage)
       assert_receive {:test_loopctl, {:dispatch_reply, reply}}, 5_000
 
-      assert %{"decision" => "refused", "reason" => "other", "detail" => detail} = reply
+      assert %{"decision" => "refused", "reason" => "kind_not_supported", "detail" => detail} =
+               reply
+
       assert detail == "triage dispatches are not supported by this runner yet"
+
+      # Permanent, so it wins over a transient policy refusal: at capacity, still kind_not_supported.
+      Control.set_draining(pid, true)
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", story_dispatch(%{"kind" => "triage"}))
+
+      assert_receive {:test_loopctl, {:dispatch_reply, %{"reason" => "kind_not_supported"}}},
+                     5_000
+
+      Control.set_draining(pid, false)
 
       malformed = story_dispatch() |> put_in(["story", "title"], String.duplicate("a", 201))
       TestLoopctl.Endpoint.broadcast(topic, "dispatch", malformed)
       assert_receive {:test_loopctl, {:dispatch_reply, reply}}, 5_000
-      assert %{"reason" => "other", "detail" => "the dispatch story title is longer" <> _} = reply
+      # Contract 1.5.0 bounds the story, so its validation names the field first.
+      assert %{"reason" => "other", "detail" => detail} = reply
+      assert detail =~ "story.title"
 
       refute_receive {:test_loopctl, {:stage, _}}, 500
       assert Control.info(pid).runs_in_flight == []

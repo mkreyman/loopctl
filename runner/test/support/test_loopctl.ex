@@ -157,7 +157,7 @@ defmodule LoopctlRunner.TestLoopctl do
       end
     end
 
-    defp scripted_reply(:ok, socket), do: {:ok, %{contract_version: "1.4.0"}, socket}
+    defp scripted_reply(:ok, socket), do: {:ok, %{contract_version: "1.5.0"}, socket}
 
     # What loopctl does on not_authorized: refuse, then close the socket.
     defp scripted_reply(:not_authorized_disconnect, _socket) do

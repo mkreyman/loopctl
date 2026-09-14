@@ -19,7 +19,7 @@
       "type": "object"
     },
     "RunnerDispatch": {
-      "description": "Control pushes `dispatch` to start a session. The runner validates it against its LOCAL allow-list (repos, branch prefixes, wall clock, token budget) and refuses by default: a dispatch is a prompt executed as the machine's user. Declared in contract v1; emitted from #803.",
+      "description": "Control pushes `dispatch` to start a session. The runner validates it against its LOCAL allow-list (repos, branch prefixes, wall clock, token budget) and refuses by default: a dispatch runs as the machine's user. Since 1.5.0 an `implement` dispatch carries the story as TYPED FIELDS (`story`) and never a prompt — the runner composes its own from them. `story` is allowed only on an `implement` dispatch and its `id` must equal `story_id`. Only the kinds in `x-connection.dispatchable_kinds` are sent; a runner that does not do a kind answers `kind_not_supported` and is not sent that kind again. Declared in contract v1; emitted from #803.",
       "properties": {
         "base_branch": {
           "maxLength": 255,
@@ -54,6 +54,64 @@
         "repo": {
           "pattern": "^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$",
           "type": "string"
+        },
+        "story": {
+          "description": "The story an `implement` dispatch is for, as TYPED FIELDS (since 1.5.0). loopctl never sends a prompt: the runner composes one from these fields with its own template, because a dispatch runs as the machine's user and a control plane able to hand a runner prose to execute is able to run anything on it. `id` must be the dispatch's own `story_id`. The whole object is at most 48000 bytes under the byte rule below, which is the cap that usually binds; loopctl REFUSES an oversize story and escalates it to a human rather than truncating one, since a dropped acceptance criterion is a story built to the wrong spec. `domain_reference` is the domain document the change belongs to, required by some repositories' own pull-request gates. Byte rule (compact JSON, any encoder): count 6 bytes for every character of every string and object key (12 for a character outside the Basic Multilingual Plane) plus 12 per string; 32 per number, true, false or null; 2 per array or object; 2 per array element or object member. A number may have at most 31 digits.",
+          "properties": {
+            "acceptance_criteria": {
+              "description": "What the work is judged against, one string per criterion, in the story's own order. Never truncated: a story with more than 20 is refused.",
+              "items": {
+                "maxLength": 500,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 20,
+              "type": "array"
+            },
+            "description": {
+              "maxLength": 8000,
+              "type": "string"
+            },
+            "domain_reference": {
+              "maxLength": 500,
+              "minLength": 1,
+              "type": "string"
+            },
+            "id": {
+              "description": "The story's id. Must equal the dispatch's `story_id`.",
+              "format": "uuid",
+              "type": "string"
+            },
+            "test_cases": {
+              "items": {
+                "maxLength": 500,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 20,
+              "type": "array"
+            },
+            "title": {
+              "maxLength": 200,
+              "minLength": 1,
+              "type": "string"
+            },
+            "touches": {
+              "description": "The paths triage predicted the change touches. Advisory to the session and never a permission: what a runner may write is its own local allow-list.",
+              "items": {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 100,
+              "type": "array"
+            }
+          },
+          "required": [
+            "id",
+            "title"
+          ],
+          "type": "object"
         },
         "story_id": {
           "format": "uuid",
@@ -121,6 +179,7 @@
             "wall_clock_exceeds_limit",
             "max_turns_exceeds_limit",
             "token_budget_exceeds_limit",
+            "kind_not_supported",
             "other"
           ],
           "type": "string"
@@ -446,6 +505,64 @@
       },
       "type": "object"
     },
+    "RunnerStory": {
+      "description": "The story an `implement` dispatch is for, as TYPED FIELDS (since 1.5.0). loopctl never sends a prompt: the runner composes one from these fields with its own template, because a dispatch runs as the machine's user and a control plane able to hand a runner prose to execute is able to run anything on it. `id` must be the dispatch's own `story_id`. The whole object is at most 48000 bytes under the byte rule below, which is the cap that usually binds; loopctl REFUSES an oversize story and escalates it to a human rather than truncating one, since a dropped acceptance criterion is a story built to the wrong spec. `domain_reference` is the domain document the change belongs to, required by some repositories' own pull-request gates. Byte rule (compact JSON, any encoder): count 6 bytes for every character of every string and object key (12 for a character outside the Basic Multilingual Plane) plus 12 per string; 32 per number, true, false or null; 2 per array or object; 2 per array element or object member. A number may have at most 31 digits.",
+      "properties": {
+        "acceptance_criteria": {
+          "description": "What the work is judged against, one string per criterion, in the story's own order. Never truncated: a story with more than 20 is refused.",
+          "items": {
+            "maxLength": 500,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 20,
+          "type": "array"
+        },
+        "description": {
+          "maxLength": 8000,
+          "type": "string"
+        },
+        "domain_reference": {
+          "maxLength": 500,
+          "minLength": 1,
+          "type": "string"
+        },
+        "id": {
+          "description": "The story's id. Must equal the dispatch's `story_id`.",
+          "format": "uuid",
+          "type": "string"
+        },
+        "test_cases": {
+          "items": {
+            "maxLength": 500,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 20,
+          "type": "array"
+        },
+        "title": {
+          "maxLength": 200,
+          "minLength": 1,
+          "type": "string"
+        },
+        "touches": {
+          "description": "The paths triage predicted the change touches. Advisory to the session and never a permission: what a runner may write is its own local allow-list.",
+          "items": {
+            "maxLength": 200,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 100,
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "title"
+      ],
+      "type": "object"
+    },
     "RunnerTraceAck": {
       "description": "The reply to `trace` and `trace_cursor`: the highest seq such that every seq from 0 to it is stored, or -1 when seq 0 is not. Resume from `acked_seq + 1`.",
       "properties": {
@@ -602,6 +719,9 @@
   "title": "loopctl runner contract",
   "x-connection": {
     "credential_header": "x-loopctl-runner-token",
+    "dispatchable_kinds": [
+      "implement"
+    ],
     "errors": {
       "dispatch_reply": [
         "rate_limited",
@@ -664,6 +784,7 @@
       "join": "RunnerJoin",
       "stage": "RunnerStageReport",
       "status": "RunnerStatus",
+      "story": "RunnerStory",
       "trace": "RunnerTraceBatch",
       "trace_cursor": "RunnerTraceCursor",
       "trace_event": "RunnerTraceEvent"
@@ -694,6 +815,32 @@
         "refill_interval_ms": 250
       },
       "stage_max_reason_length": 4000,
+      "story": {
+        "fields": {
+          "acceptance_criteria": {
+            "max_item_length": 500,
+            "max_items": 20
+          },
+          "description": {
+            "max_length": 8000
+          },
+          "domain_reference": {
+            "max_length": 500
+          },
+          "test_cases": {
+            "max_item_length": 500,
+            "max_items": 20
+          },
+          "title": {
+            "max_length": 200
+          },
+          "touches": {
+            "max_item_length": 200,
+            "max_items": 100
+          }
+        },
+        "max_bytes": 48000
+      },
       "trace_max_batch_bytes": 60000,
       "trace_max_event_bytes": 12000,
       "trace_max_event_data_bytes": 6000,
@@ -804,5 +951,5 @@
     ],
     "topic": "runner:{runner_id}"
   },
-  "x-contract-version": "1.4.0"
+  "x-contract-version": "1.5.0"
 }

@@ -7,9 +7,11 @@ defmodule LoopctlRunner.DispatchRun do
   ## The story object
 
   Contract 1.5.0 (loopctl PR #829) adds a `RunnerDispatch.story` object carrying the story's
-  typed fields, sent only on an `implement` dispatch. The vendored 1.4.0 schema does not know it,
-  so it is read defensively here, against 1.5.0's per-field caps, counted in characters
-  (`String.length/1`, as the vendored validator counts `maxLength`):
+  typed fields, sent only on an `implement` dispatch. The contract's own validation checks it
+  first; it is read again here as the second line, with the bounds taken from the vendored
+  contract at compile time (`limits.story.fields` and `$defs.RunnerStory`, never re-typed),
+  counted in characters (`String.length/1`, as the vendored validator counts `maxLength`), and
+  for what the schema cannot say:
 
     * `id` (required) — a UUID equal to the dispatch's `story_id`, compared lowercased;
     * `title` (required) — 1 to 200; `description` — up to 8000; `domain_reference` — 1 to 500;
@@ -25,14 +27,23 @@ defmodule LoopctlRunner.DispatchRun do
 
   @uuid ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i
 
+  # The bounds come from the vendored contract, never re-typed: maxima from the published
+  # x-connection.limits.story.fields (derived on loopctl's side from the schema), minima from
+  # $defs.RunnerStory. A story field the schema adds lands here on the next vendoring.
+  @story_schema Contract.schema_def("RunnerStory")
+  @story_limits get_in(Contract.connection(), ["limits", "story", "fields"])
+
   # key => {min, max} characters
-  @text_bounds %{"title" => {1, 200}, "description" => {0, 8000}, "domain_reference" => {1, 500}}
+  @text_bounds (for {key, %{"max_length" => max}} <- @story_limits, into: %{} do
+                  {key, {get_in(@story_schema, ["properties", key, "minLength"]) || 0, max}}
+                end)
+
   # key => {max items, {min, max} characters per item}
-  @list_bounds %{
-    "acceptance_criteria" => {20, {1, 500}},
-    "test_cases" => {20, {1, 500}},
-    "touches" => {100, {1, 200}}
-  }
+  @list_bounds (for {key, %{"max_items" => items, "max_item_length" => max}} <- @story_limits,
+                    into: %{} do
+                  min = get_in(@story_schema, ["properties", key, "items", "minLength"]) || 0
+                  {key, {items, {min, max}}}
+                end)
 
   @max_reason Map.fetch!(Map.fetch!(Contract.connection(), "limits"), "stage_max_reason_length")
 
