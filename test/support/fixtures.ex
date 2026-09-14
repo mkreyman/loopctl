@@ -789,6 +789,68 @@ defmodule Loopctl.Fixtures do
     )
   end
 
+  # The `git ls-files`-shaped tree the `:gate_b_input` repository above has, reused by the
+  # measurement fixtures so a replayed change is judged against the same synthetic repository.
+  @measurement_repo_files [
+    "README.md",
+    "config/runtime.exs",
+    "lib/app/accounts/user.ex",
+    "lib/app/data_migrations/backfill_rates.ex",
+    "lib/app/payments/submit.ex",
+    "lib/app_web/router.ex",
+    "priv/rates/2026.csv"
+  ]
+
+  # One merged change for the Gate B measurement harness (#828). SYNTHETIC, like every other
+  # delivery-gates fixture, for the same reason: the real target repository is private and its
+  # trigger list is configuration.
+  #
+  # Pass `files:` as a list of paths (all modified) to get the `-z` name-status bytes built for
+  # you, or `diff:` to supply the raw bytes yourself — a malformed diff is exactly what the
+  # refuse-rather-than-guess tests need.
+  def build(:measurement_change, attrs) do
+    attrs = Enum.into(attrs, %{})
+    files = Map.get(attrs, :files, ["lib/app/accounts/user.ex"])
+
+    defaults = %{
+      sha: String.duplicate("a", 40),
+      parent_sha: String.duplicate("b", 40),
+      pr_number: 42,
+      subject: "A synthetic change (#42)",
+      committed_at: ~U[2026-09-01 12:00:00Z],
+      diff: name_status_z(files),
+      diffstat: %{files: length(files), changed_lines: 10},
+      content: "",
+      head_files: @measurement_repo_files,
+      base_files: @measurement_repo_files
+    }
+
+    struct!(
+      Loopctl.DeliveryGates.Measurement.Change,
+      Map.merge(defaults, Map.delete(attrs, :files))
+    )
+  end
+
+  # One past ticket, as `gh issue list --json` emits it (string keys), for the Gate A
+  # measurement harness (#828).
+  def build(:measurement_ticket, attrs) do
+    attrs = Enum.into(attrs, %{})
+    labels = Map.get(attrs, :labels, [])
+
+    Map.merge(
+      %{
+        "number" => 1234,
+        "title" => "[Bug] Acme Homecare: the monthly total is wrong",
+        "body" => "The total on the billing page does not match the invoice.",
+        "labels" => Enum.map(labels, &%{"name" => &1}),
+        "state" => "CLOSED",
+        "stateReason" => "COMPLETED",
+        "createdAt" => "2026-09-01T12:00:00Z"
+      },
+      Map.drop(attrs, [:labels])
+    )
+  end
+
   # One triage agent's output, as the trio contract emits it: an uncontested story.
   def build(:trio_output, attrs) do
     Map.merge(
@@ -2661,6 +2723,17 @@ defmodule Loopctl.Fixtures do
   Generates a fresh binary UUID for use in tests.
   """
   def uuid, do: Ecto.UUID.generate()
+
+  @doc """
+  The bytes of `git diff --name-status -M -z` for a list of MODIFIED paths.
+
+  Every field is NUL-TERMINATED, including the last, which is what
+  `Loopctl.DeliveryGates.Measurement.RepoHistory` and `DiffNames` both require: output with
+  anything after the final NUL is a record git was cut off mid-way through.
+  """
+  def name_status_z(files) do
+    Enum.map_join(files, "", fn file -> "M" <> <<0>> <> file <> <<0>> end)
+  end
 
   @doc """
   Inserts a knowledge `Article` with a controlled `inserted_at` and `source_type`.
