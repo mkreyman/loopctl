@@ -252,15 +252,33 @@ an arbitrary prompt executed as the user with that machine's credentials.
 
 ## 8. Unattended sessions
 
-**Launch with `--permission-mode auto --permission-prompts none`.** That flag *removes*
-`AskUserQuestion` from the tool list and cancels MCP elicitations — making the wrong thing
-impossible rather than costly. Requires 2.1.259+. Add `--max-turns` as the hard stop.
+**Launch with `--permission-mode dontAsk --permission-prompts none --setting-sources ""`.**
+`--permission-prompts none` *removes* `AskUserQuestion` from the tool list and cancels MCP
+elicitations — making the wrong thing impossible rather than costly. Requires 2.1.259+. Add
+`--max-turns` as the hard stop.
 
-**The same flag denies every tool call auto mode would have prompted for.** Measured on 2.1.270:
-a Bash call running a repository script, and a `python3 -c`, were both denied with "non-interactive
-session without an approval surface". An unattended session can only run what is pre-allowed, so
-a story names its tool rules (`"allowed_tools": ["Bash(mix test:*)"]`), the runner refuses any
-rule not in its own configured allow-list, and passes the rest as `--allowedTools`.
+**`dontAsk` is what makes the allow-list a limit.** It runs only what an `--allowedTools` rule
+names and denies the rest without a prompt. An unattended session can only run what is
+pre-allowed, so a story names its tool rules (`"allowed_tools": ["Bash(mix test:*)"]`), the runner
+refuses any rule not in its own configured allow-list, and passes the rest as `--allowedTools`,
+after its own file rules `Read|Glob|Grep|Edit|Write(./**)`, which scope the file tools to the
+worktree.
+
+This section named `auto` until 2026-09-14, and `auto` contains nothing: its classifier approves
+whatever it judges safe, and `--permission-prompts none` only denies what would still have
+prompted. The first end-to-end run, under it, committed through a bash wrapper, ran `docker exec
+psql` and `gh issue view`, and read `~/.claude`. Probed on 2.1.270 with the same prompt and one
+flag changed: under `auto`, `touch`, `bash -c`, `git status && touch` and a Write outside the cwd
+all ran; under `dontAsk`, each was denied (KB `c6452b2b`).
+
+**`--setting-sources ""` keeps the operator's harness out.** Without it the session loaded the
+user's settings: their permission allow rules, hooks and plugins, and a delivery loop written for
+a human that told it to commit. It also ignores the repository's `.claude/settings.json`, which a
+session could otherwise write to grant itself more. Unlike `--bare`, it keeps the login.
+
+**The allow-list is not a sandbox.** An allowed `mix test` runs whatever code the session wrote,
+as this user. The allow-list bounds the session's own commands; anything stronger needs an OS
+boundary (a separate user, a container) that the runner does not have yet.
 
 Do not reach for a `PreToolUse` deny hook instead. That is one rung down and retryable: the retry
 control lives on `PermissionDenied`, which does not fire for `PreToolUse` denials, so nothing
@@ -285,8 +303,10 @@ The escalation text is session-authored and untrusted, like reporter text (§10)
 capped, and never executed.
 
 The runner passes `LOOP_MODE=1` and `LOOP_STORY_FILE` (a regular file written just before the
-session starts) in the environment, which hooks inherit. claude-config's loop mode keys on both,
-and on the story file's freshness, to stand `gate-unmerged-pr` down for loop sessions.
+session starts) in the environment. claude-config's loop mode keys on both, and on the story
+file's freshness, to stand `gate-unmerged-pr` down for loop sessions; under
+`--setting-sources ""` no user hook loads at all, so those variables now matter only to what the
+session's own commands read.
 
 **Parking detection.** Do not use "no writes under `subagents/` in N minutes" — measured on
 mac-mini, **0 of 1,543 project directories** contain one, because that directory exists only when

@@ -8,10 +8,10 @@ defmodule LoopctlRunner.Session do
   process carrying this session's `LOOP_SESSION_ID` marker, because the CLI's Bash tool
   detaches its commands into new sessions (see `LoopctlRunner.ProcessGroup`).
 
-  Unattended flags (design §8): `--permission-mode auto --permission-prompts none` removes
-  `AskUserQuestion` from the tool list, which makes waiting on a human impossible rather
-  than costly, and `--max-turns` is the hard stop. Not `--bare`, which would drop the login
-  and CLAUDE.md and the guard hooks with it.
+  Unattended flags (design §8): `--permission-mode dontAsk --permission-prompts none` runs only
+  what is pre-allowed and removes `AskUserQuestion`, which makes waiting on a human impossible
+  rather than costly, `--setting-sources ""` keeps the operator's and the repository's settings
+  out, and `--max-turns` is the hard stop. Not `--bare`, which would drop the login.
 
   What a session can use at all is contained separately (`session_tools/0`): six built-in
   tools, no MCP server and no plugin tool. An implement session needs a shell and the file
@@ -114,9 +114,27 @@ defmodule LoopctlRunner.Session do
   # Fixed here, never taken from a story or the config, so nothing a dispatch carries can widen it.
   @session_tools ~w(Read Edit Write Glob Grep Bash)
 
+  # What a session may run without asking, which under dontAsk is everything it may run at all.
+  # --permission-mode auto was the first choice and it contained nothing: its classifier approves
+  # whatever it judges safe, so the first end-to-end run (2026-09-14) committed through a bash
+  # wrapper, ran docker exec psql and gh, and read ~/.claude. Probed on Claude Code 2.1.270 with
+  # claude-opus-5, the same prompt, one flag changed:
+  #   auto     touch, bash -c, `git status && touch` and a Write outside the cwd all ran;
+  #   dontAsk  each was denied, and only the rules below and the story's allowed_tools ran.
+  # --setting-sources "" loads no user, project or local settings: no permission allow rules the
+  # operator or the repository added (a session could otherwise write .claude/settings.json and
+  # grant itself more), no hooks, no plugins. The login is kept, unlike --bare.
+  # The file tools are scoped to the worktree, the session's cwd: outside it, Read, Grep and
+  # Write were denied in the same probe.
+  @file_rules ~w[Read(./**) Glob(./**) Grep(./**) Edit(./**) Write(./**)]
+
   @doc "The built-in tools every session is limited to."
   @spec session_tools() :: [String.t()]
   def session_tools, do: @session_tools
+
+  @doc "The file-tool rules every session gets, scoped to its worktree."
+  @spec file_rules() :: [String.t()]
+  def file_rules, do: @file_rules
 
   @doc "The argv handed to claude-headless.sh."
   @spec claude_args(Story.t(), String.t()) :: [String.t()]
@@ -131,9 +149,11 @@ defmodule LoopctlRunner.Session do
       "--session-id",
       session_id,
       "--permission-mode",
-      "auto",
+      "dontAsk",
       "--permission-prompts",
       "none",
+      "--setting-sources",
+      "",
       "--max-turns",
       Integer.to_string(story.max_turns),
       "--tools",
@@ -145,7 +165,7 @@ defmodule LoopctlRunner.Session do
       "mcp__*"
     ] ++
       if(story.model, do: ["--model", story.model], else: []) ++
-      Enum.flat_map(story.allowed_tools, &["--allowedTools", &1]) ++
+      Enum.flat_map(@file_rules ++ story.allowed_tools, &["--allowedTools", &1]) ++
       ["--allowedTools", "Bash(#{escalate_script()}:*)"] ++
       ["--append-system-prompt", escalation_prompt()] ++
       ["--", story.prompt]
@@ -233,9 +253,61 @@ defmodule LoopctlRunner.Session do
 
     unset = ["ANTHROPIC_API_KEY" | Worktree.repo_locating_env()]
 
-    Enum.map(base ++ extra, fn {k, v} -> {to_charlist(k), to_charlist(v)} end) ++
-      Enum.map(unset, &{to_charlist(&1), false})
+    # The repo's own session_env comes after PATH, so a configured PATH still wins; the names
+    # release_env/1 unsets are refused in session_env by Config, so nothing there is lost.
+    Enum.map(base ++ release_path(System.get_env()) ++ extra, fn {k, v} ->
+      {to_charlist(k), to_charlist(v)}
+    end) ++
+      Enum.map(unset ++ release_env(System.get_env()), &{to_charlist(&1), false})
   end
+
+  @doc """
+  The names in `env` that belong to the runner's own release, which a session must not inherit.
+
+  A release boots with `RELEASE_*` (the node's cookie among them), `EMU`, `PROGNAME`, `ROOTDIR`,
+  `BINDIR` and `ERL_CRASH_DUMP_SECONDS`, and the daemon runs under `LOOPCTL_RUNNER_*`. The first end-to-end
+  run inherited all of them, and `mix` in the story's repo ran against the release instead of
+  the machine's own Erlang, until the session wrote a script to strip them.
+  """
+  @spec release_env(%{String.t() => String.t()}) :: [String.t()]
+  def release_env(env) do
+    env
+    |> Map.keys()
+    |> Enum.filter(&release_env_name?/1)
+    |> Enum.sort()
+  end
+
+  # The release's bin script exports RELEASE_*, and erts-*/bin/erl exports EMU, PROGNAME,
+  # ROOTDIR and BINDIR, all pointing into the release.
+  @release_env_prefixes ["RELEASE_", "LOOPCTL_RUNNER_"]
+  @release_env_names ~w(EMU PROGNAME ROOTDIR BINDIR ERL_CRASH_DUMP_SECONDS)
+
+  @doc """
+  Whether `name` is one `release_env/1` unsets. `Config` refuses these in `session_env`: the
+  unset would silently win over a repo's value under the daemon, and only there.
+  """
+  @spec release_env_name?(String.t()) :: boolean()
+  def release_env_name?(name),
+    do: String.starts_with?(name, @release_env_prefixes) or name in @release_env_names
+
+  @doc """
+  `PATH` without the release's own directories, as a `{name, value}` pair, or nothing when the
+  runner is not a release. A release puts its `erts-*/bin` and `bin` first, so a session's `erl`
+  and `mix` would resolve to the runner's ERTS.
+  """
+  @spec release_path(%{String.t() => String.t()}) :: [{String.t(), String.t()}]
+  def release_path(%{"RELEASE_ROOT" => root, "PATH" => path}) when root != "" do
+    root = Path.expand(root)
+
+    kept =
+      path
+      |> String.split(":")
+      |> Enum.reject(&(&1 == root or String.starts_with?(&1, root <> "/")))
+
+    [{"PATH", Enum.join(kept, ":")}]
+  end
+
+  def release_path(_env), do: []
 
   @impl true
   # Raw chunks, split here. The Port's own {:line, N} mode delivers a trailing

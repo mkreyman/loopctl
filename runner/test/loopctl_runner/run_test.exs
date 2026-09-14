@@ -60,6 +60,13 @@ defmodule LoopctlRunner.RunTest do
     # Built at runtime: a key-named variable assigned a string literal reads to a secret
     # scanner as a leaked credential.
     System.put_env("ANTHROPIC_API_KEY", "canary-#{System.unique_integer([:positive])}")
+    # What a mix release boots with: a session must inherit none of it.
+    release_root = Path.join(root, "loopctl-release-canary")
+    path = System.get_env("PATH")
+    System.put_env("RELEASE_ROOT", release_root)
+    System.put_env("RELEASE_COOKIE", "canary-#{System.unique_integer([:positive])}")
+    System.put_env("EMU", "beam")
+    System.put_env("PATH", Path.join(release_root, "erts-0/bin") <> ":" <> path)
 
     result =
       try do
@@ -67,13 +74,14 @@ defmodule LoopctlRunner.RunTest do
           root,
           state,
           [{"FAKE_CLAUDE_MODE", "stream"}],
-          %{"allowed_tools" => ["Read"], "prompt" => "- do the thing"},
+          %{"allowed_tools" => ["Edit(./lib/**)"], "prompt" => "- do the thing"},
           %{
-            "allowed_tools" => ["Read"]
+            "allowed_tools" => ["Edit(./lib/**)"]
           }
         )
       after
-        System.delete_env("ANTHROPIC_API_KEY")
+        System.put_env("PATH", path)
+        Enum.each(~w(ANTHROPIC_API_KEY RELEASE_ROOT RELEASE_COOKIE EMU), &System.delete_env/1)
       end
 
     assert result.status == "succeeded"
@@ -89,15 +97,25 @@ defmodule LoopctlRunner.RunTest do
     # Launched through claude-headless.sh, in loop mode, with the key stripped.
     env = File.read!(Path.join(state, "env"))
     refute env =~ ~r/^ANTHROPIC_API_KEY PRESENT$/m
+    refute env =~ ~r/^(RELEASE_ROOT|RELEASE_COOKIE|EMU|RELEASE_PATH) PRESENT$/m
     assert env =~ ~r/^LOOP_MODE=1$/m
     argv = File.read!(Path.join(state, "argv"))
+    # Only what is pre-allowed runs, under no operator or repository settings.
+    assert argv =~ "--permission-mode\ndontAsk\n"
     assert argv =~ "--permission-prompts\nnone\n"
+    assert argv =~ "--setting-sources\n\n"
+    refute argv =~ "\nauto\n"
+
+    for rule <- LoopctlRunner.Session.file_rules() do
+      assert argv =~ "--allowedTools\n#{rule}\n"
+    end
+
     # The session's tools are limited, not merely allowed: every restricting flag reaches claude.
     assert argv =~ "--tools\nRead,Edit,Write,Glob,Grep,Bash\n"
     assert argv =~ "--strict-mcp-config\n--mcp-config\n{\"mcpServers\":{}}\n"
     assert argv =~ "--disallowedTools\nmcp__*\n"
     assert argv =~ "--session-id\n#{result.session.session_id}\n"
-    assert argv =~ "--allowedTools\nRead\n"
+    assert argv =~ "--allowedTools\nEdit(./lib/**)\n"
     assert argv =~ "--allowedTools\nBash(#{LoopctlRunner.Session.escalate_script()}:*)\n"
     assert argv =~ "--append-system-prompt\n"
     assert argv =~ LoopctlRunner.Session.escalate_script()

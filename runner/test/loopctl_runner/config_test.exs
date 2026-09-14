@@ -119,6 +119,9 @@ defmodule LoopctlRunner.ConfigTest do
             %{repo => %{"LOOPCTL_LAUNCHER_SETSID" => "1"}},
             %{repo => %{"ANTHROPIC_API_KEY" => "x"}},
             %{repo => %{"GIT_DIR" => "/tmp"}},
+            %{repo => %{"RELEASE_COOKIE" => "x"}},
+            %{repo => %{"ERL_CRASH_DUMP_SECONDS" => "0"}},
+            %{repo => %{"ROOTDIR" => "/tmp"}},
             %{repo => %{"lower" => "x"}},
             %{repo => %{"OK" => 1}},
             %{"not_a_repo" => %{"OK" => "x"}},
@@ -132,13 +135,34 @@ defmodule LoopctlRunner.ConfigTest do
   test "an allowed_tools rule for a tool sessions cannot have is refused at load" do
     root = tmp_dir!("tools-rule")
 
-    for ok <- [["Bash(mix test:*)", "Read", "Edit"], []] do
+    for ok <- [["Bash(mix test:*)", "Read(./**)", "Edit(./lib/**)", "Bash(git status)"], []] do
       assert {:ok, _} = Config.from_map(Map.put(config_map(root), "allowed_tools", ok))
     end
 
     for bad <- ["WebFetch", "Skill", "Agent", "mcp__loopctl__get_story", "WebSearch(x)"] do
       assert {:error, msg} = Config.from_map(Map.put(config_map(root), "allowed_tools", [bad]))
       assert msg =~ "names a tool sessions do not have"
+    end
+  end
+
+  test "a rule wider than it reads is refused at load: unscoped file tools, shells, bare Bash" do
+    root = tmp_dir!("tools-scope")
+
+    for {bad, why} <- [
+          {"Write", "not scoped to the worktree"},
+          {"Edit(~/**)", "not scoped to the worktree"},
+          {"Read(/etc/**)", "not scoped to the worktree"},
+          {"Write(./../outside/**)", "not scoped to the worktree"},
+          {"Grep(./)", "not scoped to the worktree"},
+          {"Bash", "does not name one command"},
+          {"Bash(*)", "does not name one command"},
+          {"Bash(bash:*)", "does not name one command"},
+          {"Bash(sh -c:*)", "does not name one command"},
+          {"Bash(/usr/bin/env:*)", "does not name one command"},
+          {"Bash(python3:*)", "does not name one command"}
+        ] do
+      assert {:error, msg} = Config.from_map(Map.put(config_map(root), "allowed_tools", [bad]))
+      assert msg =~ why, inspect(bad)
     end
   end
 end

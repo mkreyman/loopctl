@@ -39,9 +39,17 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
 - **A loop session asks for a human by running `priv/bin/loop-escalate`**, the one command the
   runner always pre-allows. No hook can observe a question a headless session wanted to ask, so
   escalation must stay a command it calls; the run ends `escalated`.
-- **Unattended sessions can only run pre-allowed tools.** `--permission-prompts none` denies
-  anything auto mode would have prompted for; a story's `allowed_tools` must each appear in the
-  runner config's `allowed_tools`.
+- **Unattended sessions can only run pre-allowed tools.** `--permission-mode dontAsk` runs only
+  what an `--allowedTools` rule names, under `--setting-sources ""` so no operator or repository
+  settings add rules, hooks or plugins; the file tools are scoped to the worktree; a story's
+  `allowed_tools` must each appear in the runner config's `allowed_tools`. Never `auto`: its
+  classifier approves what it judges safe, and the first end-to-end run committed, ran docker
+  and gh, and read `~/.claude` under it.
+- **A session inherits none of the runner's release environment** (`RELEASE_*`, the release's
+  `PATH` entries): `Session.release_env/1` and `release_path/1`.
+- **The Bash allow-list is not a sandbox.** `mix test` runs whatever code the session wrote, as
+  this user. The allow-list stops the session's own commands; isolation beyond that needs an OS
+  boundary the runner does not have yet.
 - **Parking is never "no writes under `subagents/`"** (design §8). See `LoopctlRunner.Liveness`.
 - **Fail closed.** A missing or malformed config refuses every dispatch.
 - **The runner commits, pushes and merges nothing** in step 1. Teardown keeps a branch that has

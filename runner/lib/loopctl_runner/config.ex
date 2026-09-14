@@ -192,12 +192,22 @@ defmodule LoopctlRunner.Config do
     end
   end
 
-  # Tool permission rules a story may request, e.g. "Bash(mix test:*)". Unattended sessions
-  # run with --permission-prompts none, which DENIES every call auto mode would have
-  # prompted for (measured: a repo script under the Bash tool), so a session can only run
-  # what is pre-allowed. Absent means none.
-  # A rule for a tool the session cannot have at all (`LoopctlRunner.Session.session_tools/0`)
-  # would load cleanly and then be denied in every session, silently: refused here instead.
+  # Tool permission rules a story may request, e.g. "Bash(mix test:*)". Sessions run under
+  # --permission-mode dontAsk, where these rules are the whole of what a session may do (see
+  # LoopctlRunner.Session), so a rule wider than it looks is refused at load rather than trusted:
+  #   - a tool the session cannot have at all (`Session.session_tools/0`) would load cleanly and
+  #     be denied in every session, silently;
+  #   - a file-tool rule must be scoped under the worktree, "./": a bare "Write" or
+  #     "Edit(~/**)" writes anywhere this user can;
+  #   - a Bash rule must name its command, and not one that runs other commands: a bare "Bash"
+  #     or "Bash(bash:*)" is the first end-to-end run's commit, docker and gh over again. The
+  #     list below is a backstop for a slip in the config, not the boundary; the boundary is
+  #     that each rule names one command.
+  # Absent means none.
+  @file_tools ~w(Read Glob Grep Edit Write)
+  @command_runners ~w(bash sh zsh dash fish env exec eval xargs sudo nohup timeout nice
+                      python python3 perl ruby node npx elixir iex erl escript)
+
   defp allowed_tools(map) do
     case Map.get(map, "allowed_tools", []) do
       tools when is_list(tools) ->
@@ -205,10 +215,8 @@ defmodule LoopctlRunner.Config do
           not Enum.all?(tools, &(is_binary(&1) and &1 != "")) ->
             {:error, "config allowed_tools entries must be non-empty strings"}
 
-          bad = Enum.find(tools, &(rule_tool(&1) not in LoopctlRunner.Session.session_tools())) ->
-            {:error,
-             "config allowed_tools #{inspect(bad)} names a tool sessions do not have; they have " <>
-               Enum.join(LoopctlRunner.Session.session_tools(), ", ")}
+          problem = Enum.find_value(tools, &rule_problem/1) ->
+            {:error, "config allowed_tools " <> problem}
 
           true ->
             {:ok, tools}
@@ -219,8 +227,50 @@ defmodule LoopctlRunner.Config do
     end
   end
 
-  # "Bash(mix test:*)" names Bash; "Read" names Read.
-  defp rule_tool(rule), do: rule |> String.split("(", parts: 2) |> hd()
+  defp rule_problem(rule) do
+    {tool, spec} = rule_parts(rule)
+
+    cond do
+      tool not in LoopctlRunner.Session.session_tools() ->
+        "#{inspect(rule)} names a tool sessions do not have; they have " <>
+          Enum.join(LoopctlRunner.Session.session_tools(), ", ")
+
+      tool in @file_tools and not worktree_path?(spec) ->
+        "#{inspect(rule)} is not scoped to the worktree; write it as #{tool}(./<path>)"
+
+      tool == "Bash" and not named_command?(spec) ->
+        "#{inspect(rule)} does not name one command; write it as Bash(<command>:*), " <>
+          "and not a shell or interpreter"
+
+      true ->
+        nil
+    end
+  end
+
+  # "Bash(mix test:*)" is {"Bash", "mix test:*"}; "Read" is {"Read", nil}.
+  defp rule_parts(rule) do
+    case Regex.run(~r/\A([^(]+)\((.*)\)\z/s, rule) do
+      [_, tool, spec] -> {tool, spec}
+      nil -> {rule |> String.split("(", parts: 2) |> hd(), nil}
+    end
+  end
+
+  defp worktree_path?("./" <> path),
+    do: path != "" and ".." not in Path.split(path) and not String.contains?(path, "\\")
+
+  defp worktree_path?(_spec), do: false
+
+  defp named_command?(spec) when is_binary(spec) do
+    case spec |> String.trim_leading() |> String.split([" ", ":"], parts: 2) do
+      [command | _] ->
+        command =~ ~r/\A[A-Za-z0-9._\/-]+\z/ and Path.basename(command) not in @command_runners
+
+      _ ->
+        false
+    end
+  end
+
+  defp named_command?(_spec), do: false
 
   # Per repo, extra environment for that repo's sessions: {"repo": {"NAME": "value"}}. In a value,
   # "{story}" becomes 8 hex of a hash of the story id, stable across that story's runs, and "{run}"
@@ -229,7 +279,8 @@ defmodule LoopctlRunner.Config do
   # branch's migration never touches the checkout's). Prefer {story}: nothing drops what a value
   # creates, so {run} leaves a new database behind on every run, while {story} reuses one per
   # story, as its worktree is. A name the runner sets or reads itself (LOOP_*, LOOPCTL_*,
-  # ANTHROPIC_*, GIT_*) is refused, as is a repo not in repos.
+  # ANTHROPIC_*, GIT_*) is refused, as is one a session never inherits from the release
+  # (Session.release_env_name?/1: RELEASE_*, EMU, ROOTDIR...), and a repo not in repos.
   @env_name ~r/\A[A-Z_][A-Z0-9_]{0,63}\z/
   @reserved_env ["LOOP_", "LOOPCTL_", "ANTHROPIC_", "GIT_"]
 
@@ -270,6 +321,7 @@ defmodule LoopctlRunner.Config do
   defp env_var?(name, value) do
     is_binary(name) and name =~ @env_name and
       not Enum.any?(@reserved_env, &String.starts_with?(name, &1)) and
+      not LoopctlRunner.Session.release_env_name?(name) and
       is_binary(value) and byte_size(value) <= 1024 and not String.contains?(value, <<0>>)
   end
 

@@ -34,7 +34,8 @@ here=$(realpath .)
 printf '%s\n' "$here" > "$state/cwd"
 # Names only for the key, never values: a failing assertion prints this file, and the
 # real environment carries credentials.
-env | awk -F= '$1 == "ANTHROPIC_API_KEY" || $1 ~ /^GIT_/ { print $1 " PRESENT"; next } $1 ~ /^LOOP_[A-Z_]*$/ || $1 == "RUNNER_ENV_PROBE"' > "$state/env"
+env | awk -F= '$1 == "ANTHROPIC_API_KEY" || $1 ~ /^GIT_/ || $1 ~ /^RELEASE_/ || $1 == "EMU" { print $1 " PRESENT"; next } $1 ~ /^LOOP_[A-Z_]*$/ || $1 == "RUNNER_ENV_PROBE"' > "$state/env"
+case ":$PATH:" in *loopctl-release-canary*) echo "RELEASE_PATH PRESENT" >> "$state/env" ;; esac
 printf '%s\n' "$@" > "$state/argv"
 # claude-config's loop mode needs LOOP_STORY_FILE to be a regular, fresh file when hooks run.
 if [ -f "${LOOP_STORY_FILE:-}" ]; then echo regular > "$state/story_file"; else echo missing > "$state/story_file"; fi

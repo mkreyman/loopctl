@@ -22,8 +22,9 @@ capacity, free disk, repo, branch prefix, wall clock, turns, token budget), must
 dispatch, and must carry a well-formed `story` object (contract 1.5.0); anything else is refused
 with a reason. An accepted dispatch runs `claude -p` in a worktree on the dispatch's branch, with a
 prompt built from a fixed local template in which every story field is fenced as untrusted data,
-and the runner config's own `allowed_tools`. The session implements and tests; it pushes, opens
-PRs and merges nothing.
+and the runner config's own `allowed_tools`, under `--permission-mode dontAsk` so nothing else
+runs, with no user or repository settings loaded and none of the runner's release environment.
+The session implements and tests; it commits, pushes, opens PRs and merges nothing.
 
 Each accepted run reports its delivery stages to loopctl (`stage`): `claimed -> worktree`,
 `worktree -> implementing`, and, however the run ends, `-> escalated` with edge
