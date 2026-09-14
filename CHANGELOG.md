@@ -6,6 +6,49 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **The story-to-intake link, and the closer that tells a reporter what happened (#803 §4/§9,
+  #805 item 1).** A story created from a reported GitHub issue now records which intake record
+  it came from (`stories.intake_record_id`), and when it reaches a terminal verdict loopctl
+  closes that issue with the resolution the verdict implies. Only two verdicts close:
+  post-deploy `verified` closes with `loopctl:resolution-shipped` and GitHub's `completed`,
+  and a triage `reject` closes with `loopctl:resolution-not-actionable` and `not_planned`. An
+  ESCALATION closes nothing — the story is waiting on a human, so there is no verdict to
+  report — and a story that came from no reported issue closes nothing and is not an error.
+
+  **The label goes on before the close, and that ordering is the point.** The reporting
+  system's webhook fires on the close and picks its resolution text by the label it finds;
+  without one it sends its default, *"Our team has shipped a fix for this issue"* — which for
+  a rejected report tells the reporter to go looking for a fix nobody built.
+
+  **At most once per story, decided by Postgres.** The intent is recorded in the same
+  transaction as the verdict, one row per story under a unique index, and the outward close
+  happens afterwards in a two-minute sweep with no transaction open across any network call. A
+  replay closes nothing a second time: the row is terminal, and even a crash between a
+  successful close and the record of it is caught by reading the issue's live state before
+  acting. A transient forge fault backs off and is retried up to a bound; a permanent one — a
+  human closed the issue first, a 404, a permission denial — is recorded and never retried.
+
+  **`GITHUB_TOKEN` now needs `issues: write`** on the target repository, the only write scope
+  loopctl asks for. Without it every close is refused 403, recorded `abandoned`, and no
+  reporter is notified; nothing else breaks and nothing loops. That is the likeliest cause of
+  a mass abandonment, so it has a way back: after fixing the secret,
+  `Loopctl.Intake.IssueClosures.requeue_abandoned(abandoned_after: ...)` re-drives that
+  window's backlog, with `dry_run: true` to count first. The time bound is REQUIRED — a
+  closure abandoned months ago still names a live issue, and waking it would put a fresh
+  close on a ticket the reporter has moved on from. It never re-drives an issue a human
+  already closed. See `deploy/FLY_SECRETS.md`.
+
+  **A disconnected repository stops receiving writes.** Revoking an intake source is refused
+  at the verdict (no closure is recorded) and again at close time (`source_revoked`), so a
+  tenant that disconnects a repo is not written to afterwards.
+
+  **Migration:** adds `stories.intake_record_id` (nullable, with a composite foreign key on
+  `(tenant_id, intake_record_id)` so a story can never link to another tenant's record, and a
+  unique index so ONE reported issue yields at most one story — two would give the reporter
+  two closures aimed at one issue and let the first verdict to land decide what she is told)
+  and the `intake_issue_closures` table. No manual step, no backfill — existing stories carry
+  no link and close nothing.
+
 - **Post-deploy verification, and the verdict-to-resolution mapping (#803 §9, #805).** A
   story that reached `deployed` used to have exactly one way out — a human escalating it.
   `Loopctl.Workers.PostDeployVerificationWorker` now sweeps those stories every two minutes

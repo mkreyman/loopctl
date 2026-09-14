@@ -11,6 +11,7 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
   use ExUnit.Case, async: true
 
   alias Loopctl.Delivery.GitHubPullRequestSource, as: Source
+  alias Loopctl.Delivery.MergePrecondition
 
   @repo "acme/widgets"
   @head String.duplicate("a", 40)
@@ -691,5 +692,125 @@ defmodule Loopctl.Delivery.GitHubPullRequestSourceTest do
     conn
     |> Plug.Conn.put_resp_content_type("application/json")
     |> Plug.Conn.resp(200, Jason.encode!(body))
+  end
+
+  # -- the reporter's side (#805) ----------------------------------------------------------
+
+  describe "issue/2" do
+    test "reads state and label NAMES, dropping anything that is not one" do
+      stub(fn conn ->
+        assert conn.request_path == "/repos/acme/widgets/issues/7"
+        json(conn, %{"state" => "open", "labels" => [%{"name" => "bug"}, "plain", 3]})
+      end)
+
+      assert {:ok, %{state: "open", labels: ["bug", "plain"]}} = Source.issue(@repo, 7)
+    end
+
+    test "a body it cannot read is refused, never assumed open" do
+      stub(fn conn -> json(conn, %{"state" => "open"}) end)
+      assert {:error, {:unreadable_issue, _shape}} = Source.issue(@repo, 7)
+    end
+
+    test "a non-positive issue number never reaches the network" do
+      assert {:error, {:invalid_issue_number, 0}} = Source.issue(@repo, 0)
+      assert {:error, {:invalid_issue_number, -1}} = Source.issue(@repo, -1)
+    end
+  end
+
+  describe "label_issue/3" do
+    test "POSTs to the labels sub-resource, which ADDS rather than replaces" do
+      parent = self()
+
+      stub(fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(parent, {:request, conn.method, conn.request_path, Jason.decode!(body)})
+        json(conn, [])
+      end)
+
+      assert :ok = Source.label_issue(@repo, 7, "loopctl:resolution-shipped")
+
+      assert_received {:request, "POST", "/repos/acme/widgets/issues/7/labels",
+                       %{"labels" => ["loopctl:resolution-shipped"]}}
+    end
+
+    test "a label carrying a control character is refused before the network" do
+      assert {:error, {:invalid_label, _}} = Source.label_issue(@repo, 7, "bad\nlabel")
+      assert {:error, {:invalid_label, _}} = Source.label_issue(@repo, 7, "")
+    end
+  end
+
+  describe "comment_issue/3" do
+    test "POSTs the body to the comments sub-resource" do
+      parent = self()
+
+      stub(fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(parent, {:request, conn.request_path, Jason.decode!(body)})
+        Plug.Conn.resp(conn, 201, "{}")
+      end)
+
+      assert :ok = Source.comment_issue(@repo, 7, "no change was made")
+
+      assert_received {:request, "/repos/acme/widgets/issues/7/comments",
+                       %{"body" => "no change was made"}}
+    end
+
+    test "an oversized body is refused before the network" do
+      assert {:error, {:invalid_comment_body, _}} =
+               Source.comment_issue(@repo, 7, String.duplicate("x", 8_193))
+    end
+  end
+
+  describe "close_issue/3" do
+    test "PATCHes state closed with the state_reason it was given" do
+      parent = self()
+
+      stub(fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        send(parent, {:request, conn.method, conn.request_path, Jason.decode!(body)})
+        json(conn, %{})
+      end)
+
+      assert :ok = Source.close_issue(@repo, 7, :not_planned)
+
+      assert_received {:request, "PATCH", "/repos/acme/widgets/issues/7",
+                       %{"state" => "closed", "state_reason" => "not_planned"}}
+    end
+
+    test "a state_reason this module does not know never reaches the network" do
+      assert {:error, {:invalid_state_reason, :whatever}} =
+               Source.close_issue(@repo, 7, :whatever)
+    end
+  end
+
+  describe "the writes share the read path's failure classification" do
+    test "a rate-limited close is transient and carries the delay" do
+      stub(fn conn ->
+        conn
+        |> Plug.Conn.put_resp_header("retry-after", "45")
+        |> Plug.Conn.resp(403, "{}")
+      end)
+
+      assert {:error, {:github_rate_limited, 403, 45} = reason} =
+               Source.close_issue(@repo, 7, :completed)
+
+      assert MergePrecondition.transient?(reason)
+    end
+
+    test "a 403 with no rate-limit header is a PERMANENT permission problem" do
+      stub(fn conn -> Plug.Conn.resp(conn, 403, "{}") end)
+
+      assert {:error, {:github_api_error, 403} = reason} =
+               Source.close_issue(@repo, 7, :completed)
+
+      refute MergePrecondition.transient?(reason)
+    end
+
+    test "a 404 on a write is permanent, so the closer abandons rather than looping" do
+      stub(fn conn -> Plug.Conn.resp(conn, 404, "{}") end)
+
+      assert {:error, {:github_api_error, 404} = reason} = Source.label_issue(@repo, 7, "x")
+      refute MergePrecondition.transient?(reason)
+    end
   end
 end

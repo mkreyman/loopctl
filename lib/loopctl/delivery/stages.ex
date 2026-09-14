@@ -135,6 +135,7 @@ defmodule Loopctl.Delivery.Stages do
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Delivery.Untrusted
+  alias Loopctl.Intake.IssueClosures
   alias Loopctl.LocalGuc
   alias Loopctl.Repo
   alias Loopctl.Runners.DispatchLedger
@@ -376,7 +377,44 @@ defmodule Loopctl.Delivery.Stages do
     # merge happened and identifies nothing.
     row = put_effects(row, effects, opts)
     release_session_slot(row, to, opts)
+    record_issue_closure(row, story, transition)
     {row, maybe_chain(row, previous, transition, reason, opts)}
+  end
+
+  # THE OUTBOX for what the reporter is told (#805 item 1), written in THIS transaction.
+  #
+  # A terminal verdict on a story that came from a reported GitHub issue is the moment
+  # loopctl learns what to tell the person who filed it. Recording it here — atomically with
+  # the verdict — is what makes the outward close at-most-once and never-lost: a transition
+  # that rolls back records no intent, and one that commits cannot lose it to a node dying
+  # between the commit and an enqueue.
+  #
+  # The CLOSE itself is emphatically not here. `Loopctl.Workers.IntakeIssueCloseWorker` drains
+  # these rows outside any transaction, so no GitHub call ever holds a pooled connection or
+  # the story row this transaction is holding.
+  #
+  # Which transitions produce one is the MACHINE's decision (`resolution_verdict/1`), read off
+  # the whole `{from, to, edge}` — `failed` and `done` are each reachable two ways that mean
+  # different things to a reporter. Almost every transition produces nothing, and so does
+  # every story that came from no intake record, which is the ordinary case.
+  #
+  # BEFORE `maybe_chain/5`, keeping the chain append last per the moduledoc's lock order. This
+  # takes no lock anything else in that order contends on: an insert of a fresh row plus one
+  # indexed read of the tenant's own record and source.
+  defp record_issue_closure(row, story, transition) do
+    case StageMachine.resolution_verdict(transition) do
+      nil ->
+        :ok
+
+      verdict ->
+        IssueClosures.record_in(
+          Repo,
+          row.tenant_id,
+          row.story_id,
+          story.intake_record_id,
+          verdict
+        )
+    end
   end
 
   # The session's runner slot, given back in the transition that ends the session — never in
@@ -1338,7 +1376,15 @@ defmodule Loopctl.Delivery.Stages do
     from(s in Story,
       where: s.id == ^story_id and s.tenant_id == ^tenant_id,
       lock: "FOR SHARE",
-      select: %{id: s.id, claim_epoch: s.claim_epoch, agent_status: s.agent_status}
+      select: %{
+        id: s.id,
+        claim_epoch: s.claim_epoch,
+        agent_status: s.agent_status,
+        # Read under the SAME share lock as the epoch, so the closure outbox below cannot
+        # record a link the story does not have. It is write-once provenance, so nothing can
+        # change it under us anyway — the lock is what makes that a fact and not a hope.
+        intake_record_id: s.intake_record_id
+      }
     )
     |> Repo.one()
     |> case do
