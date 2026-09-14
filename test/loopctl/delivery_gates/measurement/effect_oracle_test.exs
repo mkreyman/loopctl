@@ -61,6 +61,38 @@ defmodule Loopctl.DeliveryGates.Measurement.EffectOracleTest do
       assert {:ok, %{effect_bearing?: false, families: []}} = EffectOracle.judge("")
     end
 
+    test "a HEX DIGEST containing 837 does not fire :edi" do
+      # Bounded by decimal digits alone this matched inside `a837f`, so any diff full of content
+      # hashes read as EDI. That is not the declared over-flag bias, it is a bug.
+      assert {:ok, %{effect_bearing?: false}} =
+               EffectOracle.judge(~s|  @digest "9e2db568a837f5c5f793ed102b5485d5832af9e2"|)
+    end
+
+    test "a domain spelling whose neighbour is a hex LETTER still fires :edi" do
+      # `era835`: bounding by a SINGLE hex character rejected this, because `a` is hex — and
+      # that silently dropped a real claims-path false negative between two runs. The bound is a
+      # RUN of two hex characters, which is a digest rather than a name.
+      assert {:ok, %{effect_bearing?: true, families: [:edi]}} =
+               EffectOracle.judge("          next_step: :none | :ta1 | :era835,")
+    end
+
+    test "the bare word 'modifier' does not fire :billing_codes" do
+      # It is ordinary programming vocabulary — a modifier function, a modifier key, a CSS
+      # modifier. The DOMAIN sense always arrives qualified.
+      assert {:ok, %{effect_bearing?: false}} =
+               EffectOracle.judge("  def apply_modifier(assigns, modifier) do")
+    end
+
+    test "a QUALIFIED modifier does fire :billing_codes" do
+      assert {:ok, %{effect_bearing?: true, families: [:billing_codes]}} =
+               EffectOracle.judge("      hcpcs_modifier = row.modifier_code")
+    end
+
+    test "a literal HCPF modifier value fires :billing_codes" do
+      assert {:ok, %{effect_bearing?: true, families: [:billing_codes]}} =
+               EffectOracle.judge(~s|      @waiver_qualifier "U9"|)
+    end
+
     test "a word that merely CONTAINS a token does not fire it" do
       # `era` inside `operation`, `st` inside `list` — the patterns are anchored, and an
       # unanchored version of this oracle would call every change effect-bearing.

@@ -100,7 +100,7 @@ defmodule Loopctl.DeliveryGates.Measurement.ReportTest do
       assert report.totals.readable == 1
       assert report.totals.unreadable == 1
       assert report.strata.all.changes == 1
-      assert [%{sha: "deadbeef", error: ":root_commit"}] = report.unreadable
+      assert [%{sha: "deadbeef", error_kind: :root_commit}] = report.unreadable
     end
 
     test "the configuration_applied stratum excludes stale-trigger changes" do
@@ -114,6 +114,30 @@ defmodule Loopctl.DeliveryGates.Measurement.ReportTest do
       assert report.totals.with_stale_triggers == 1
       assert report.strata.all.changes == 2
       assert report.strata.configuration_applied.changes == 1
+    end
+
+    test "the production-files stratum is NESTED inside configuration_applied" do
+      # Over `readable` its clear rate would carry the stale-trigger artifact the third stratum
+      # exists to remove, printed on the line next to the honest one.
+      results = [
+        result(outcome: :clear, production_files?: true),
+        result(outcome: :human, production_files?: true, stale_triggers: ["priv/rates/**"]),
+        result(outcome: :clear, production_files?: false)
+      ]
+
+      report = Report.gate_b(results, %{})
+
+      assert report.strata.configuration_applied.changes == 2
+      assert report.strata.configuration_applied_production_files.changes == 1
+      assert report.strata.configuration_applied_production_files.clear_rate == 1.0
+      refute Map.has_key?(report.strata, :production_files)
+    end
+
+    test "scope_note says :clear is a superset of the auto-merge set" do
+      report = Report.gate_b([result(outcome: :clear)], %{})
+
+      assert report.scope_note =~ "SUPERSET"
+      assert report.scope_note =~ "MergePrecondition"
     end
 
     test "reason kinds count RESULTS, so one change with four human paths counts once" do
@@ -165,6 +189,82 @@ defmodule Loopctl.DeliveryGates.Measurement.ReportTest do
       assert [%{sha: sha}] = Report.gate_b(results, %{}).false_negatives
       assert String.length(sha) == 12
     end
+
+    test "an unreadable row carries the error KIND, not git's stderr" do
+      # git names paths and object ids in a read failure: "fatal: bad object <sha>", a gitlink's
+      # submodule path, a missing ref's name.
+      results = [
+        GateBReplay.unreadable("deadbeef", {:git_failed, 128, "fatal: bad object lib/secret.ex"})
+      ]
+
+      assert [row] = Report.gate_b(results, %{}).unreadable
+      assert row.error_kind == :git_failed
+      refute row |> inspect() |> String.contains?("lib/secret")
+
+      assert [full] = Report.gate_b(results, %{}, detail: :full).unreadable
+      assert full.error =~ "lib/secret.ex"
+    end
+  end
+
+  describe "gate_b/3 META redaction" do
+    test "absolute local paths never reach a redacted artifact" do
+      meta = %{repo: "acme/repo", checkout: "/home/someone/workspace/acme", head: "abc"}
+
+      redacted = Report.gate_b([], meta)
+
+      refute Map.has_key?(redacted.meta, :checkout)
+      assert redacted.meta.repo == "acme/repo"
+
+      assert Report.gate_b([], meta, detail: :full).meta.checkout ==
+               "/home/someone/workspace/acme"
+    end
+
+    test "a trigger-parse error never carries the pattern or the repository into a redacted artifact" do
+      # This is a path the task takes BY DESIGN — it replays a configuration failure rather than
+      # refusing, because the fail-closed behaviour is a real thing to measure — so an unredacted
+      # meta would write a live guard pattern into a public file on an ordinary run.
+      error =
+        {:error,
+         {:invalid_pattern, ["repos", "acme/private-repo", "effect_paths"], "priv/secret/**"}}
+
+      meta = %{repo: "acme/repo", trigger_status: Report.trigger_status(error)}
+
+      redacted = Report.gate_b([], meta)
+
+      assert redacted.meta.trigger_status.status == "error"
+      assert redacted.meta.trigger_status.kind == :invalid_pattern
+      assert redacted.meta.trigger_status.key_path_depth == 3
+      refute Map.has_key?(redacted.meta.trigger_status, :detail)
+      refute redacted |> inspect() |> String.contains?("priv/secret")
+      refute redacted |> inspect() |> String.contains?("private-repo")
+
+      full = Report.gate_b([], meta, detail: :full)
+      assert full.meta.trigger_status.detail =~ "priv/secret/**"
+    end
+
+    test "a parsed trigger status survives redaction unchanged" do
+      meta = %{trigger_status: Report.trigger_status({:ok, :triggers})}
+
+      assert Report.gate_b([], meta).meta.trigger_status == %{status: "parsed"}
+    end
+
+    test "the Gate A corpus path and its unparseable reasons are full-detail only" do
+      meta = %{
+        corpus: "acme/repo",
+        tickets_file: "/tmp/someone/tickets.json",
+        unparseable_records: 1,
+        unparseable_reasons: ["{:missing_number, [\"title\"]}"]
+      }
+
+      redacted = Report.gate_a([], meta)
+
+      refute Map.has_key?(redacted.meta, :tickets_file)
+      refute Map.has_key?(redacted.meta, :unparseable_reasons)
+      assert redacted.meta.unparseable_records == 1
+
+      assert Report.gate_a([], meta, detail: :full).meta.tickets_file ==
+               "/tmp/someone/tickets.json"
+    end
   end
 
   describe "gate_a/3" do
@@ -198,6 +298,36 @@ defmodule Loopctl.DeliveryGates.Measurement.ReportTest do
 
       assert report.strata.all.escalated == 0
       assert report.strata.all.not_story == 1
+    end
+
+    test "intake_is_feature_share flags a rate that is really the corpus split" do
+      replays = [
+        replay(%{"title" => "[Feature] Acme Homecare: a column"}),
+        replay(%{})
+      ]
+
+      share = Report.gate_a(replays, %{}).intake_is_feature_share
+
+      assert share.degenerate?
+      assert share.escalated == 1
+      assert share.request_shaped == 1
+      assert share.escalation_reason_kinds == [:workflow_change]
+    end
+
+    test "it is NOT degenerate once another trigger also fires" do
+      replays = [
+        replay(%{"title" => "[Feature] Acme Homecare: a column"}),
+        replay(%{"body" => "We no longer want the date stamp."})
+      ]
+
+      share = Report.gate_a(replays, %{}).intake_is_feature_share
+
+      refute share.degenerate?
+      assert :inverts_deliberate_behaviour in share.escalation_reason_kinds
+    end
+
+    test "no escalations at all is not degenerate" do
+      refute Report.gate_a([replay(%{})], %{}).intake_is_feature_share.degenerate?
     end
 
     test "an absent sensitivity run says so rather than being omitted" do

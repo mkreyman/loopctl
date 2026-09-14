@@ -39,8 +39,13 @@ defmodule Mix.Tasks.Loopctl.Gates.MeasureB do
     * `--sha256` — pin the checksum instead of computing it from the file's bytes. Absent, the
       harness computes it, which measures the GATE rather than the operator's checksum
       discipline. Pass it to reproduce a run against the exact bytes production had.
+    * `--head` — the commit the window runs back from (default `HEAD`, resolved to a sha before
+      anything is read). **Pass a previous run's recorded head to reproduce it.** A checkout is
+      not a fixed corpus: the target's HEAD advanced under this harness between two runs on
+      2026-09-13 and the corpus silently grew by 23 changes, which is how a set of numbers came
+      to be reported against an artifact that no longer produced them.
     * `--since` / `--until` — the window, in anything `git log` accepts. Absent, the whole
-      first-parent history up to the checkout's HEAD.
+      first-parent history up to `--head`.
     * `--limit` — cap the number of changes (newest first). For a quick run.
     * `--out` — where the REDACTED machine-readable artifact goes (default
       `docs/measurements/gate_b_<date>.json`). Safe to commit: no file paths, no trigger
@@ -52,11 +57,14 @@ defmodule Mix.Tasks.Loopctl.Gates.MeasureB do
 
   ## Reproducing a run
 
-  Two things move under a replay: the checkout's HEAD and the trigger document. The artifact
-  records the head sha, the window as given, the number of changes, and the trigger
+  Two things move under a replay: the checkout's tip and the trigger document. The artifact
+  records the RESOLVED head sha, the window as given, the number of changes, and the trigger
   fingerprint, so a later run can say whether it measured the same corpus against the same
-  configuration. It does NOT fetch, so the window's upper end is whatever the local checkout
-  holds.
+  configuration — and `--head <that sha>` makes it measure the same one. It does NOT fetch,
+  so an unpinned run's upper end is whatever the local checkout holds at that moment.
+
+  **A run's numbers and its artifact are ONE record.** Nothing in a report is safe to quote from
+  an earlier run of the same command: re-run and restate, or pin `--head` and prove they match.
   """
 
   use Mix.Task
@@ -71,6 +79,7 @@ defmodule Mix.Tasks.Loopctl.Gates.MeasureB do
     repo_name: :string,
     triggers: :string,
     sha256: :string,
+    head: :string,
     since: :string,
     until: :string,
     limit: :integer,
@@ -106,7 +115,7 @@ defmodule Mix.Tasks.Loopctl.Gates.MeasureB do
       # document be confirmed against a public artifact; 12 characters is a compromise, not a
       # guarantee, and the residual is stated in docs/measurements/README.md.
       trigger_fingerprint: String.slice(sha256, 0, 12),
-      trigger_status: trigger_status(triggers),
+      trigger_status: Report.trigger_status(triggers),
       trigger_shape: trigger_shape(triggers),
       generated_at: DateTime.utc_now() |> DateTime.to_iso8601(),
       harness: "mix loopctl.gates.measure_b"
@@ -120,14 +129,24 @@ defmodule Mix.Tasks.Loopctl.Gates.MeasureB do
     if path = opts[:summary], do: write_text(path, summary <> "\n")
   end
 
+  # The tip is RESOLVED to a sha before anything is read, and the resolved sha — not the ref the
+  # operator typed — is what the window runs back from and what the artifact records. Resolving
+  # once is the difference between a repeatable corpus and whatever the checkout happened to hold:
+  # the target's HEAD advanced under this harness between two runs on 2026-09-13 and the corpus
+  # silently grew by 23 changes.
   defp replay(repo, repo_name, triggers, opts) do
-    stream_opts = Keyword.take(opts, [:since, :until, :limit])
+    requested = opts[:head] || "HEAD"
 
     head =
-      case RepoHistory.git(repo, ["rev-parse", "HEAD"]) do
-        {:ok, sha} -> String.trim(sha)
-        {:error, reason} -> Mix.raise("cannot read HEAD of #{repo}: #{inspect(reason)}")
+      case RepoHistory.git(repo, ["rev-parse", "--verify", requested <> "^{commit}"]) do
+        {:ok, sha} ->
+          String.trim(sha)
+
+        {:error, reason} ->
+          Mix.raise("cannot resolve #{requested} in #{repo}: #{inspect(reason)}")
       end
+
+    stream_opts = opts |> Keyword.take([:since, :until, :limit]) |> Keyword.put(:head, head)
 
     case RepoHistory.stream(repo, stream_opts) do
       {:ok, stream} ->
@@ -171,15 +190,19 @@ defmodule Mix.Tasks.Loopctl.Gates.MeasureB do
     Mix.shell().info("triggers: parsed, fingerprint #{String.slice(sha256, 0, 12)}")
   end
 
+  # The KIND, never the reason. `Triggers.parse/2` returns `{:invalid_pattern, ["repos",
+  # "<owner/repo>", "effect_paths"], pattern}` — a live guard pattern and the private repository
+  # together — and console output is pasted into pull requests and chat as readily as an artifact
+  # is committed.
   defp announce_triggers({:error, reason}, sha256) do
+    status = Report.trigger_status({:error, reason})
+
     Mix.shell().error(
-      "triggers: DID NOT PARSE (#{inspect(reason)}), fingerprint #{String.slice(sha256, 0, 12)}. " <>
-        "Every change will escalate as :human — that is the gate failing closed, not a measurement of it."
+      "triggers: DID NOT PARSE (#{status.kind}), fingerprint #{String.slice(sha256, 0, 12)}. " <>
+        "Every change will escalate as :human — that is the gate failing closed, not a measurement of it. " <>
+        "The full reason is in the unredacted artifact only."
     )
   end
-
-  defp trigger_status({:ok, _triggers}), do: "parsed"
-  defp trigger_status({:error, reason}), do: "error: #{inspect(reason)}"
 
   # COUNTS, never patterns. Enough for a reader to see that a later run's configuration grew or
   # shrank; not enough to reconstruct which paths skip human review.

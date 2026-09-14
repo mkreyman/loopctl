@@ -22,10 +22,13 @@ defmodule Loopctl.DeliveryGates.Measurement.RepoHistoryTest do
   end
 
   defp key(["log", "-1" | _rest]), do: :header
-  defp key(["log" | _rest]), do: :log
+  defp key(["log" | _rest] = args), do: {:log, List.last(args)}
   defp key(["diff", "--name-status" | _rest]), do: :name_status
-  defp key(["diff", "--numstat" | _rest]), do: :numstat
-  defp key(["diff", "--unified=0" | _rest]), do: :content
+  # `-M` is asserted in the KEY of the two reads that used to omit it. Without it those two
+  # disagree with the name-status read whenever a machine's gitconfig has `diff.renames` off, so
+  # two operators re-running the same window get different artifacts.
+  defp key(["diff", "--numstat", "-M" | _rest]), do: :numstat
+  defp key(["diff", "--unified=0", "-M" | _rest]), do: :content
   defp key(["ls-tree", "-r", "--name-only", "-z", @sha]), do: :head_files
   defp key(["ls-tree", "-r", "--name-only", "-z", @parent]), do: :base_files
   defp key(args), do: args
@@ -148,13 +151,23 @@ defmodule Loopctl.DeliveryGates.Measurement.RepoHistoryTest do
 
   describe "shas/2" do
     test "splits the log output, newest first" do
-      responses = %{log: "#{@sha}\n#{@parent}\n"}
+      responses = %{{:log, "HEAD"} => "#{@sha}\n#{@parent}\n"}
 
       assert {:ok, [@sha, @parent]} = RepoHistory.shas("/repo", runner: runner(responses))
     end
 
     test "an empty window is an empty list — the caller decides whether that is an error" do
-      assert {:ok, []} = RepoHistory.shas("/repo", runner: runner(%{log: ""}))
+      assert {:ok, []} = RepoHistory.shas("/repo", runner: runner(%{{:log, "HEAD"} => ""}))
+    end
+
+    test ":head runs the window back from a PINNED commit, not from whatever HEAD is" do
+      # A checkout is not a fixed corpus. The target's HEAD advanced under this harness between
+      # two runs on 2026-09-13 and the corpus silently grew by 23 changes, which is what makes a
+      # pinned tip the difference between a comparison and a coincidence.
+      responses = %{{:log, @parent} => "#{@parent}\n"}
+
+      assert {:ok, [@parent]} =
+               RepoHistory.shas("/repo", runner: runner(responses), head: @parent)
     end
   end
 end

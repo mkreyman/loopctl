@@ -13,8 +13,11 @@ defmodule Loopctl.DeliveryGates.Measurement.GateBReplay do
 
   ## The five outcomes
 
-  - `:clear` — Gate B cleared it and the hard bound allowed it. This is the auto-merge set,
-    and the only one a false negative can live in
+  - `:clear` — Gate B cleared it and the hard bound allowed it, and the only outcome a false
+    negative can live in. It is a strict SUPERSET of what would actually auto-merge:
+    `Loopctl.Delivery.MergePrecondition` additionally requires Gate A, custody, an unmoved head
+    and an open pull request. The false-negative RATE survives that, because everything the
+    merge precondition adds can only remove changes from this set
   - `:prove_effect` — an effect path was touched. Not scored as pass or fail: the proof step
     regenerates 837P output from a fixed fixture set on a deployed branch, which cannot be
     replayed over history
@@ -22,9 +25,9 @@ defmodule Loopctl.DeliveryGates.Measurement.GateBReplay do
   - `:size_bound` — refused ONLY on size: the configured `max_files` / `max_changed_lines`, the
     design's 12-file / 1,000-line ceiling, or both. Reported apart from `:human` because the two
     say different things about the gate — a human path is the gate finding something, a size
-    refusal is the gate declining to look — and because it turns out to be the largest bucket.
-    A change over the bound that ALSO touches a human path is counted as `:human`: the path is
-    the stronger statement
+    refusal is the gate declining to look. A change over the bound that ALSO touches a human
+    path is `:human`, and one that also touches an EFFECT path is `:prove_effect`: what the gate
+    found beats what it declined to look at, in both cases
   - `:unreadable` — the change could not be read at all. Counted, never dropped
 
   ## What counts as a false negative
@@ -169,16 +172,25 @@ defmodule Loopctl.DeliveryGates.Measurement.GateBReplay do
     %__MODULE__{sha: sha, outcome: :unreadable, error: reason}
   end
 
-  defp score(base, %GateB.Result{outcome: gate_outcome} = result, hard_bound) do
+  defp score(base, %GateB.Result{} = result, hard_bound) do
     stale = for {:stale_trigger, pattern} <- result.reasons, do: pattern
     reasons = result.reasons ++ hard_bound
     non_size = Enum.reject(reasons, &size_reason?/1)
 
+    # PRECEDENCE, strongest signal first, the same rule that puts a human path above a size
+    # refusal: what the gate FOUND beats what it declined to look at. Ordering `:size_bound`
+    # above the effect signal lost it on any change that was also over the bound — inert at
+    # today's limits and live for any looser configuration.
+    #
+    # Read `effect_matches` rather than the Result's own `outcome`: Gate B reports `:human` the
+    # moment it has ANY reason, size reasons included, so a change over the bound that touches an
+    # effect path never carries a `:prove_effect` outcome to read. `effect_matches` is computed
+    # from the paths independently of the reasons, which is what makes it the honest signal here.
     outcome =
       cond do
         non_size != [] -> :human
+        result.effect_matches != [] -> :prove_effect
         reasons != [] -> :size_bound
-        gate_outcome == :prove_effect -> :prove_effect
         true -> :clear
       end
 

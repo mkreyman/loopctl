@@ -7,7 +7,7 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
 
   ## Redaction, and why a public repository forces it
 
-  loopctl is PUBLIC and `mkreyman/home_care_billing` is PRIVATE. Two things therefore never
+  loopctl is PUBLIC and `mkreyman/home_care_billing` is PRIVATE. Three things therefore never
   reach a committed artifact:
 
   - **File paths.** Publishing `(files, verdict)` pairs for hundreds of changes reconstructs
@@ -16,6 +16,13 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
     proof that none of its paths is guarded.
   - **Trigger patterns and PR titles.** The first is that map directly; the second is a private
     repository's content.
+  - **Anything the RUN's own metadata carries** — an absolute checkout path, an absolute corpus
+    path, and above all a trigger-parse error, which names a live guard pattern and the private
+    repository together. `meta/2` redacts those exactly as `row/2` redacts a row. Redacting rows
+    alone was the defect: the first committed artifact asserted no file paths reached it while
+    carrying two, and a malformed trigger document would have written a guard pattern into a
+    public file through a path the task takes BY DESIGN (it replays a configuration failure
+    rather than refusing, because the fail-closed behaviour is a real thing to measure).
 
   What a redacted row keeps is enough to spot-check with: the pull request NUMBER, the sha, the
   date, the diffstat, the file COUNT and the oracle's families. Anyone who can judge "would a
@@ -24,6 +31,15 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
 
   `detail: :full` produces the same report with the paths, the patterns and the subjects, for
   writing OUTSIDE the repository. The Mix task defaults it to a gitignored path and says so.
+
+  ## `:clear` is not the auto-merge set
+
+  Gate B's `:clear` plus the size bound is what this measures, and it is a strict SUPERSET of
+  what would actually auto-merge: `Loopctl.Delivery.MergePrecondition` additionally requires
+  Gate A, custody, an unmoved head and an open pull request. The false-negative RATE survives
+  that — everything the merge precondition adds can only remove changes from the set, never add
+  one — but the wording must not imply the denominator is the merge set. `scope_note` on every
+  Gate B report says so.
   """
 
   alias Loopctl.DeliveryGates.GateA
@@ -43,9 +59,10 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
   @gate_a_biases [
     "Trio DISAGREEMENT, the design's primary signal, is unobservable in a replay: every ticket is presented as three identical outputs. The measured rate is a strict LOWER BOUND.",
     "The contradicts field is empty by construction, not by measurement. Lower bound again.",
-    "workflow_change_not_defect_fix stands in as the intake chat's [Feature] prefix (intake stratum) or an enhancement/idea label with no bug label (all stratum). The label stratum carries hindsight the trio would not have had; the intake stratum does not, because the prefix is stamped at filing time.",
+    "workflow_change_not_defect_fix stands in as the intake chat's [Feature] prefix for an INTAKE ticket and as an enhancement/idea label with no bug label for everything else. The two strata are NOT two corpora: `all` is the whole corpus and therefore MIXES both classifiers, because it contains the intake tickets too. Only the label half carries hindsight (a label is often applied after the outcome was known); the prefix is stamped at filing time.",
     "inverts_or_removes_deliberate_behaviour stands in as an inversion phrase in the title or body, so an inversion described in other words is missed. Conservative.",
-    "confidence is sent as 0.0. Gate A requires the field and never reads it; the column is a placeholder, not a measurement."
+    "confidence is sent as 0.0. Gate A requires the field and never reads it; the column is a placeholder, not a measurement.",
+    "Read `intake_is_feature_share` before comparing the intake rate with the design's 54%. Where every intake escalation is a [Feature] ticket firing on workflow_change alone, the rate is ARITHMETICALLY the [Feature] share of the corpus — the harness is measuring the corpus split, not Gate A's judgement, and the comparison is weaker than the bare number reads."
   ]
 
   @doc """
@@ -64,8 +81,10 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
     %{
       gate: "B",
       question:
-        "Of the changes Gate B would have cleared for auto-merge, how many can move claim output?",
-      meta: meta,
+        "Of the changes Gate B and the size bound would let through, how many can move claim output?",
+      scope_note:
+        "`clear` is Gate B's own clear plus the size bound, NOT the auto-merge set. Loopctl.Delivery.MergePrecondition additionally requires Gate A, custody, an unmoved head and an open pull request, so `clear` is a strict SUPERSET of what would actually auto-merge. The false-negative rate survives that: everything the merge precondition adds can only REMOVE changes from this set, never add one.",
+      meta: meta(meta, detail),
       biases: @gate_b_biases,
       totals: %{
         changes: length(results),
@@ -77,13 +96,21 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
       reason_kinds: reason_kinds(results),
       strata: %{
         all: stratum(readable),
-        production_files: stratum(Enum.filter(readable, & &1.production_files?)),
-        configuration_applied: stratum(configuration_applied)
+        configuration_applied: stratum(configuration_applied),
+        # NESTED inside configuration_applied on purpose, and named so. Over `readable` its
+        # clear rate would carry the stale-trigger artifact the third stratum exists to remove,
+        # printed on the line next to the honest one.
+        configuration_applied_production_files:
+          stratum(Enum.filter(configuration_applied, & &1.production_files?))
       },
       oracle_families: family_counts(readable),
       false_negatives: Enum.map(false_negatives(readable), &row(&1, detail)),
       unscored_clears: Enum.map(unscored_clears(readable), &row(&1, detail)),
-      unreadable: Enum.map(Enum.filter(results, &(&1.outcome == :unreadable)), &unreadable_row/1)
+      unreadable:
+        Enum.map(
+          Enum.filter(results, &(&1.outcome == :unreadable)),
+          &unreadable_row(&1, detail)
+        )
     }
   end
 
@@ -104,7 +131,7 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
     %{
       gate: "A",
       question: "How often would Gate A escalate a past ticket to a human?",
-      meta: meta,
+      meta: meta(meta, detail),
       biases: @gate_a_biases,
       design_reference: %{
         collapsed_predicate_rate: 0.54,
@@ -115,6 +142,7 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
         intake: gate_a_stratum(intake),
         all: gate_a_stratum(replays)
       },
+      intake_is_feature_share: feature_share(intake),
       sensitivity: sensitivity(Keyword.get(opts, :sensitivity)),
       escalations:
         Enum.map(Enum.filter(replays, &GateAReplay.escalated?/1), &ticket_row(&1, detail))
@@ -135,8 +163,13 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
       "reason kinds: " <> inspect(report.reason_kinds),
       "",
       stratum_line("all readable", report.strata.all),
-      stratum_line("production files", report.strata.production_files),
       stratum_line("configuration applied", report.strata.configuration_applied),
+      stratum_line(
+        "  ... of those, production files",
+        report.strata.configuration_applied_production_files
+      ),
+      "",
+      report.scope_note,
       "",
       "false negatives listed: #{length(report.false_negatives)}",
       "unscored clears (oracle could not run): #{length(report.unscored_clears)}",
@@ -157,6 +190,8 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
        ""
      ] ++
        sensitivity_lines(report.sensitivity) ++
+       [""] ++
+       feature_share_lines(report.intake_is_feature_share) ++
        [
          "",
          "design's collapsed-predicate rate, for comparison: 54%",
@@ -164,6 +199,18 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
          "Read with these:"
        ] ++ Enum.map(report.biases, &("  - " <> &1)))
     |> Enum.join("\n")
+  end
+
+  defp feature_share_lines(%{degenerate?: true} = share) do
+    [
+      "DEGENERATE: all #{share.escalated} intake escalations fired on workflow_change alone, and " <>
+        "#{share.request_shaped} of #{share.tickets} intake tickets are [Feature]. The rate IS the " <>
+        "feature share of the corpus — this measures the corpus split, not Gate A's judgement."
+    ]
+  end
+
+  defp feature_share_lines(%{escalation_reason_kinds: kinds}) do
+    ["intake escalation reason kinds: #{inspect(kinds)} (not degenerate)"]
   end
 
   defp sensitivity_lines(%{run: false, note: note}), do: ["sensitivity: " <> note]
@@ -264,6 +311,38 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
     }
   end
 
+  @doc """
+  Whether the intake escalation rate is measuring Gate A at all, or just the corpus split.
+
+  When EVERY escalation in the stratum fires on `workflow_change` alone, and that stand-in is the
+  `[Feature]` prefix, the escalation count IS the count of feature requests — so the rate is
+  arithmetically the `[Feature]` share of the corpus and the harness has measured the intake
+  chat's bug/feature mix rather than any judgement Gate A made. `degenerate?` says which case a
+  run is in, computed rather than asserted, so a later run where the inversion trigger also fires
+  reports `false` and the comparison with the design's 54% regains its force.
+  """
+  @spec feature_share([GateAReplay.t()]) :: map()
+  def feature_share(replays) when is_list(replays) do
+    escalated = Enum.filter(replays, &GateAReplay.escalated?/1)
+
+    kinds =
+      escalated
+      |> Enum.flat_map(&Enum.map(&1.result.reasons, fn r -> elem(r, 0) end))
+      |> Enum.uniq()
+
+    request_shaped = Enum.count(replays, & &1.signals.request_shaped?)
+
+    %{
+      tickets: length(replays),
+      escalated: length(escalated),
+      request_shaped: request_shaped,
+      escalation_reason_kinds: kinds,
+      degenerate?: escalated != [] and kinds == [:workflow_change],
+      note:
+        "degenerate? true means every escalation fired on workflow_change alone, so the rate equals the [Feature] share of the corpus and measures the corpus split rather than Gate A's judgement. Weigh the comparison with the design's 54% accordingly."
+    }
+  end
+
   defp gate_a_stratum(replays) do
     results = Enum.map(replays, & &1.result)
     rate = GateA.rate(results)
@@ -278,7 +357,65 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
     })
   end
 
-  # -- rows ------------------------------------------------------------------------------------
+  # -- meta redaction --------------------------------------------------------------------------
+
+  # `meta` is REDACTED exactly as a row is, and this is not belt-and-braces. Three values in it
+  # are as disclosing as any row:
+  #
+  # - `:checkout` and `:tickets_file` are ABSOLUTE local paths, so an artifact asserting that no
+  #   file path reaches it carried two.
+  # - `:trigger_status` names a configuration failure, and the task REPLAYS rather than refuses
+  #   on one by design — so this is a path the harness is built to take, not an edge. A
+  #   `Triggers.parse/2` error is `{:invalid_pattern, ["repos", "<owner/repo>", "effect_paths"],
+  #   pattern}`: a LIVE GUARD PATTERN and the private repository's name, in the committed file.
+  #   Reduced to its KIND plus the key path's DEPTH.
+  # - `:unparseable_reasons` echoes whatever a ticket record failed on. The COUNT beside it is
+  #   the number a reader needs.
+  @meta_full_only [:checkout, :tickets_file, :unparseable_reasons]
+
+  defp meta(meta, :full), do: meta
+
+  defp meta(meta, _redacted) do
+    meta
+    |> Map.drop(@meta_full_only)
+    |> Map.replace_lazy(:trigger_status, &redact_status/1)
+  end
+
+  defp redact_status(%{detail: _detail} = status), do: Map.delete(status, :detail)
+  defp redact_status(status), do: status
+
+  @doc """
+  A trigger-parse outcome reduced to what may be published: the status, the error's KIND, and how
+  deep in the document the key path pointed. Never the pattern and never the repository name.
+
+  Public because the Mix task builds `meta` and the redaction has to be applied to the value it
+  built, not to a string it already flattened — `"error: " <> inspect(reason)` cannot be
+  un-flattened afterwards.
+  """
+  @spec trigger_status(term()) :: map()
+  def trigger_status({:ok, _triggers}), do: %{status: "parsed"}
+
+  def trigger_status({:error, reason}) do
+    %{
+      status: "error",
+      kind: kind(reason),
+      key_path_depth: key_path_depth(reason),
+      detail: inspect(reason)
+    }
+  end
+
+  def trigger_status(other), do: %{status: "error", kind: :unrecognised, detail: inspect(other)}
+
+  defp key_path_depth(reason) when is_tuple(reason) and tuple_size(reason) > 1 do
+    case elem(reason, 1) do
+      path when is_list(path) -> length(path)
+      _other -> nil
+    end
+  end
+
+  defp key_path_depth(_reason), do: nil
+
+  # -- rows --------------------------------------------------------------------------------------
 
   defp row(%GateBReplay{} = result, detail) do
     base = %{
@@ -302,8 +439,15 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
     end
   end
 
-  defp unreadable_row(%GateBReplay{} = result) do
+  # The KIND only. A read failure's payload is git's own stderr, and git names paths and object
+  # ids in it — "fatal: bad object <sha>", a gitlink's submodule path, a missing ref's name. This
+  # run produced only `:root_commit`, which is why the hole was invisible rather than absent.
+  defp unreadable_row(%GateBReplay{} = result, :full) do
     %{sha: String.slice(result.sha, 0, 12), error: inspect(result.error)}
+  end
+
+  defp unreadable_row(%GateBReplay{} = result, _redacted) do
+    %{sha: String.slice(result.sha, 0, 12), error_kind: kind(result.error)}
   end
 
   defp ticket_row(%GateAReplay{} = replay, detail) do

@@ -1,0 +1,481 @@
+{
+  "meta": {
+    "head": "03ad989c711a433812727fdb4bee8d512857fe5d",
+    "until": null,
+    "limit": null,
+    "since": null,
+    "repo": "mkreyman/home_care_billing",
+    "trigger_status": {
+      "status": "parsed"
+    },
+    "generated_at": "2026-09-14T03:27:59.258875Z",
+    "harness": "mix loopctl.gates.measure_b",
+    "trigger_fingerprint": "9e2db568545c",
+    "trigger_shape": {
+      "version": 1,
+      "repos": 1,
+      "effect_patterns": 7,
+      "human_patterns": 3
+    }
+  },
+  "question": "Of the changes Gate B and the size bound would let through, how many can move claim output?",
+  "unscored_clears": [],
+  "gate": "B",
+  "totals": {
+    "changes": 854,
+    "readable": 853,
+    "unreadable": 1,
+    "with_stale_triggers": 712
+  },
+  "unreadable": [
+    {
+      "sha": "2da65a55f054",
+      "error_kind": "root_commit"
+    }
+  ],
+  "outcomes": {
+    "clear": 57,
+    "unreadable": 1,
+    "prove_effect": 38,
+    "human": 731,
+    "size_bound": 27
+  },
+  "reason_kinds": {
+    "max_files_exceeded": 239,
+    "max_changed_lines_exceeded": 272,
+    "hard_bound_files_exceeded": 239,
+    "hard_bound_changed_lines_exceeded": 272,
+    "stale_trigger": 712,
+    "human_path": 150
+  },
+  "strata": {
+    "all": {
+      "first": "2025-12-13T03:59:33Z",
+      "last": "2026-09-14T01:41:33Z",
+      "changes": 853,
+      "cleared": 57,
+      "scored_clears": 57,
+      "unscored_clears": 0,
+      "false_negatives": 26,
+      "clear_rate": 0.0668229777256741,
+      "false_negative_rate": 0.45614035087719296
+    },
+    "configuration_applied": {
+      "first": "2026-08-20T19:56:14Z",
+      "last": "2026-09-14T01:41:33Z",
+      "changes": 141,
+      "cleared": 57,
+      "scored_clears": 57,
+      "unscored_clears": 0,
+      "false_negatives": 26,
+      "clear_rate": 0.40425531914893614,
+      "false_negative_rate": 0.45614035087719296
+    },
+    "configuration_applied_production_files": {
+      "first": "2026-08-20T19:56:14Z",
+      "last": "2026-09-14T01:41:33Z",
+      "changes": 117,
+      "cleared": 38,
+      "scored_clears": 38,
+      "unscored_clears": 0,
+      "false_negatives": 20,
+      "clear_rate": 0.3247863247863248,
+      "false_negative_rate": 0.5263157894736842
+    }
+  },
+  "scope_note": "`clear` is Gate B's own clear plus the size bound, NOT the auto-merge set. Loopctl.Delivery.MergePrecondition additionally requires Gate A, custody, an unmoved head and an open pull request, so `clear` is a strict SUPERSET of what would actually auto-merge. The false-negative rate survives that: everything the merge precondition adds can only REMOVE changes from this set, never add one.",
+  "false_negatives": [
+    {
+      "sha": "e3a8f0fddffe",
+      "files": 2,
+      "outcome": "clear",
+      "committed_at": "2026-09-13T04:00:44Z",
+      "pr": 1507,
+      "changed_lines": 611,
+      "diff_files_listed": 2,
+      "oracle_families": [
+        "edi",
+        "billing_codes"
+      ],
+      "effect_matches": [],
+      "human_matches": []
+    },
+    {
+      "sha": "a78202f5f6c0",
+      "files": 11,
+      "outcome": "clear",
+      "committed_at": "2026-09-12T17:07:53Z",
+      "pr": 1500,
+      "changed_lines": 309,
+      "diff_files_listed": 11,
+      "oracle_families": [
+        "billing_codes",
+        "outbound"
+      ],
+      "effect_matches": [],
+      "human_matches": []
+    },
+    {
+      "sha": "9804b84dbaa9",
+      "files": 4,
+      "outcome": "clear",
+      "committed_at": "2026-09-02T02:46:14Z",
+      "pr": 1411,
+      "changed_lines": 737,
+      "diff_files_listed": 4,
+      "oracle_families": [
+        "edi"
+      ],
+      "effect_matches": [],
+      "human_matches": []
+    },
+    {
+      "sha": "d85be5710927",
+      "files": 3,
+      "outcome": "clear",
+      "committed_at": "2026-08-31T22:51:35Z",
+      "pr": 1406,
+      "changed_lines": 283,
+      "diff_files_listed": 3,
+      "oracle_families": [
+        "edi",
+        "billing_codes"
+      ],
+      "effect_matches": [],
+      "human_matches": []
+    },
+    {
+      "sha": "c28b808a6a72",
+      "files": 2,
+      "outcome": "clear",
+      "committed_at": "2026-08-28T17:54:50Z",
+      "pr": 1395,
+      "changed_lines": 173,
+      "diff_files_listed": 2,
+      "oracle_families": [
+        "rates"
+      ],
+      "effect_matches": [],
+      "human_matches": []
+    },
+    {
+      "sha": "bf4a2271534a",
+      "files": 4,
+      "outcome": "clear",
+      "committed_at": "2026-08-28T17:39:01Z",
+      "pr": 1393,
+      "changed_lines": 730,
+      "diff_files_listed": 4,
+      "oracle_families": [
+        "edi",
+        "rates",
+        "outbound"
+      ],
+      "effect_matches": [],
+      "human_matches": []
+    },
+    {
+      "sha": "ac620027f307",
+      "files": 2,
+      "outcome": "clear",
+      "committed_at": "2026-08-28T03:05:09Z",
+      "pr": 1390,
+      "changed_lines": 22,
+      "diff_files_listed": 2,
+      "oracle_families": [
+        "edi"
+      ],
+      "effect_matches": [],
+      "human_matches": []
+    },
+    {
+      "sha": "b7476cbf33b0",
+      "files": 7,
+      "outcome": "clear",
+      "committed_at": "2026-08-28T02:27:21Z",
+      "pr": 1386,
+      "changed_lines": 515,
+      "diff_files_listed": 7,
+      "oracle_families": [
+        "edi",
+        "billing_codes",
+        "outbound"
+      ],
+      "effect_matches": [],
+      "human_matches": []
+    },
+    {
+      "sha": "f21779f960ab",
+      "files": 2,
+      "outcome": "clear",
+      "committed_at": "2026-08-28T02:27:18Z",
+      "pr": 1384,
+      "changed_lines": 400,
+      "diff_files_listed": 2,
+      "oracle_families": [
+        "outbound"
+      ],
+      "effect_matches": [],
+      "human_matches": []
+    },
+    {
+      "sha": "6fc397a255dd",
+      "files": 11,
+      "outcome": "clear",
+      "committed_at": "2026-08-28T01:49:41Z",
+      "pr": 1382,
+      "changed_lines": 67,
+      "diff_files_listed": 11,
+      "oracle_families": [
+        "edi",
+        "outbound"
+      ],
+      "effect_matches": [],
+      "human_matches": []
+    },
+    {
+      "sha": "ed95d07b4674",
+      "files": 5,
+      "outcome": "clear",
+      "committed_at": "2026-08-25T17:50:00Z",
+      "pr": 1351,
+      "changed_lines": 111,
+      "diff_files_listed": 5,
+      "oracle_families": [
+        "billing_codes"
+      ],
+      "effect_matches": [],
+      "human_matches": []
+    },
+    {
+      "sha": "1d6bb11ca778",
+      "files": 12,
+      "outcome": "clear",
+      "committed_at": "2026-08-25T17:11:02Z",
+      "pr": 1346,
+      "changed_lines": 978,
+      "diff_files_listed": 12,
+      "oracle_families": [
+        "billing_codes"
+      ],
+      "effect_matches": [],
+      "human_matches": []
+    },
+    {
+      "sha": "0776a734764a",
+      "files": 11,
+      "outcome": "clear",
+      "committed_at": "2026-08-25T16:15:00Z",
+      "pr": 1344,
+      "changed_lines": 1000,
+      "diff_files_listed": 11,
+      "oracle_families": [
+        "billing_codes"
+      ],
+      "effect_matches": [],
+      "human_matches": []
+    },
+    {
+      "sha": "1270cc9b4f6d",
+      "files": 6,
+      "outcome": "clear",
+      "committed_at": "2026-08-25T14:07:15Z",
+      "pr": 1341,
+      "changed_lines": 412,
+      "diff_files_listed": 6,
+      "oracle_families": [
+        "edi"
+      ],
+      "effect_matches": [],
+      "human_matches": []
+    },
+    {
+      "sha": "3ebf398d061c",
+      "files": 2,
+      "outcome": "clear",
+      "committed_at": "2026-08-25T10:04:03Z",
+      "pr": 1335,
+      "changed_lines": 148,
+      "diff_files_listed": 2,
+      "oracle_families": [
+        "edi"
+      ],
+      "effect_matches": [],
+      "human_matches": []
+    },
+    {
+      "sha": "c245a0fb1f43",
+      "files": 2,
+      "outcome": "clear",
+      "committed_at": "2026-08-24T23:31:05Z",
+      "pr": 1313,
+      "changed_lines": 149,
+      "diff_files_listed": 2,
+      "oracle_families": [
+        "edi",
+        "outbound"
+      ],
+      "effect_matches": [],
+      "human_matches": []
+    },
+    {
+      "sha": "cb928c145ce8",
+      "files": 2,
+      "outcome": "clear",
+      "committed_at": "2026-08-24T17:51:52Z",
+      "pr": 1301,
+      "changed_lines": 4,
+      "diff_files_listed": 2,
+      "oracle_families": [
+        "billing_codes",
+        "outbound"
+      ],
+      "effect_matches": [],
+      "human_matches": []
+    },
+    {
+      "sha": "f0bd2d5b367a",
+      "files": 3,
+      "outcome": "clear",
+      "committed_at": "2026-08-22T08:12:16Z",
+      "pr": 1294,
+      "changed_lines": 106,
+      "diff_files_listed": 3,
+      "oracle_families": [
+        "rates"
+      ],
+      "effect_matches": [],
+      "human_matches": []
+    },
+    {
+      "sha": "0546c85f0489",
+      "files": 9,
+      "outcome": "clear",
+      "committed_at": "2026-08-22T01:02:11Z",
+      "pr": 1288,
+      "changed_lines": 238,
+      "diff_files_listed": 9,
+      "oracle_families": [
+        "billing_codes",
+        "rates"
+      ],
+      "effect_matches": [],
+      "human_matches": []
+    },
+    {
+      "sha": "62c7153ae29f",
+      "files": 3,
+      "outcome": "clear",
+      "committed_at": "2026-08-21T22:46:24Z",
+      "pr": 1284,
+      "changed_lines": 115,
+      "diff_files_listed": 3,
+      "oracle_families": [
+        "billing_codes",
+        "rates"
+      ],
+      "effect_matches": [],
+      "human_matches": []
+    },
+    {
+      "sha": "aa2c729d6893",
+      "files": 6,
+      "outcome": "clear",
+      "committed_at": "2026-08-21T20:35:31Z",
+      "pr": 1274,
+      "changed_lines": 611,
+      "diff_files_listed": 6,
+      "oracle_families": [
+        "billing_codes"
+      ],
+      "effect_matches": [],
+      "human_matches": []
+    },
+    {
+      "sha": "316b29c2a02d",
+      "files": 2,
+      "outcome": "clear",
+      "committed_at": "2026-08-21T17:40:01Z",
+      "pr": 1269,
+      "changed_lines": 220,
+      "diff_files_listed": 2,
+      "oracle_families": [
+        "edi",
+        "outbound"
+      ],
+      "effect_matches": [],
+      "human_matches": []
+    },
+    {
+      "sha": "4d7c81cff86c",
+      "files": 6,
+      "outcome": "clear",
+      "committed_at": "2026-08-21T16:48:46Z",
+      "pr": 1266,
+      "changed_lines": 251,
+      "diff_files_listed": 6,
+      "oracle_families": [
+        "edi",
+        "outbound"
+      ],
+      "effect_matches": [],
+      "human_matches": []
+    },
+    {
+      "sha": "66fcabadda21",
+      "files": 2,
+      "outcome": "clear",
+      "committed_at": "2026-08-21T16:24:06Z",
+      "pr": 1263,
+      "changed_lines": 84,
+      "diff_files_listed": 2,
+      "oracle_families": [
+        "edi"
+      ],
+      "effect_matches": [],
+      "human_matches": []
+    },
+    {
+      "sha": "dabc54be127d",
+      "files": 2,
+      "outcome": "clear",
+      "committed_at": "2026-08-21T13:48:58Z",
+      "pr": 1252,
+      "changed_lines": 101,
+      "diff_files_listed": 2,
+      "oracle_families": [
+        "edi",
+        "outbound"
+      ],
+      "effect_matches": [],
+      "human_matches": []
+    },
+    {
+      "sha": "21d102750c7b",
+      "files": 4,
+      "outcome": "clear",
+      "committed_at": "2026-08-21T00:57:04Z",
+      "pr": 1242,
+      "changed_lines": 272,
+      "diff_files_listed": 4,
+      "oracle_families": [
+        "edi"
+      ],
+      "effect_matches": [],
+      "human_matches": []
+    }
+  ],
+  "biases": [
+    "The oracle over-flags by construction (a HCPCS-shaped literal in a test assertion fires it), so the false-negative rate is an UPPER bound.",
+    "The oracle is lexical and path-blind, so an arithmetic change that moves claim output without naming any billing vocabulary is invisible to it. A false-negative count of zero is NOT evidence that Gate B has none.",
+    "Gate B's proof step (deploy, regenerate 837P from the fixed fixture set, diff it) cannot be replayed over history, so :prove_effect is counted as its own outcome and never scored as a pass or a fail.",
+    "The trigger document is TODAY's, replayed over historical trees. A pattern that matches nothing at an old ref escalates as a stale trigger — the gate working, on a question the replay invented. The configuration_applied stratum excludes those.",
+    "Only the :merge phase is replayed. The :triage run judges the trio's PREDICTED touches, and a replay has no prediction; substituting the real merged file list would bias that number optimistic."
+  ],
+  "oracle_families": {
+    "outbound": 276,
+    "edi": 300,
+    "billing_codes": 190,
+    "rates": 228
+  }
+}

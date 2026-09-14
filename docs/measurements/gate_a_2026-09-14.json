@@ -3,11 +3,9 @@
     "until": "2026-09-13T19:30:12Z",
     "since": "2026-03-18T17:26:12Z",
     "tickets": 322,
-    "corpus": "mkreyman/home_care_billing GitHub issues, all states",
-    "generated_at": "2026-09-14T02:58:08.042419Z",
+    "corpus": "mkreyman/home_care_billing GitHub issues, all states, fetched 2026-09-14T02:30Z",
+    "generated_at": "2026-09-14T03:28:16.290573Z",
     "harness": "mix loopctl.gates.measure_a",
-    "tickets_file": "/tmp/claude-1000/-home-mkreyman-workspace-loopctl/fb461c39-6be8-4e5f-bad8-5a601a61970f/scratchpad/issues.json",
-    "unparseable_reasons": [],
     "unparseable_records": 0
   },
   "question": "How often would Gate A escalate a past ticket to a human?",
@@ -22,11 +20,12 @@
       "not_story": 5,
       "by_signal": {
         "rejected": 5,
-        "inversion_phrase": 34,
-        "request_shaped": 0
+        "request_shaped": 0,
+        "inversion_phrase": 34
       }
     },
     "run": true,
+    "note": "the same corpus with every feature request read as NOT a workflow change. The true rate is between this and the headline, and which end it sits at is a definition question for the design, not a tuning question.",
     "intake": {
       "total": 26,
       "rate": 0.0,
@@ -35,19 +34,19 @@
       "not_story": 0,
       "by_signal": {
         "rejected": 0,
-        "inversion_phrase": 0,
-        "request_shaped": 0
+        "request_shaped": 0,
+        "inversion_phrase": 0
       }
     },
-    "note": "the same corpus with every feature request read as NOT a workflow change. The true rate is between this and the headline, and which end it sits at is a definition question for the design, not a tuning question.",
     "suppressed": "workflow_change_not_defect_fix"
   },
   "biases": [
     "Trio DISAGREEMENT, the design's primary signal, is unobservable in a replay: every ticket is presented as three identical outputs. The measured rate is a strict LOWER BOUND.",
     "The contradicts field is empty by construction, not by measurement. Lower bound again.",
-    "workflow_change_not_defect_fix stands in as the intake chat's [Feature] prefix (intake stratum) or an enhancement/idea label with no bug label (all stratum). The label stratum carries hindsight the trio would not have had; the intake stratum does not, because the prefix is stamped at filing time.",
+    "workflow_change_not_defect_fix stands in as the intake chat's [Feature] prefix for an INTAKE ticket and as an enhancement/idea label with no bug label for everything else. The two strata are NOT two corpora: `all` is the whole corpus and therefore MIXES both classifiers, because it contains the intake tickets too. Only the label half carries hindsight (a label is often applied after the outcome was known); the prefix is stamped at filing time.",
     "inverts_or_removes_deliberate_behaviour stands in as an inversion phrase in the title or body, so an inversion described in other words is missed. Conservative.",
-    "confidence is sent as 0.0. Gate A requires the field and never reads it; the column is a placeholder, not a measurement."
+    "confidence is sent as 0.0. Gate A requires the field and never reads it; the column is a placeholder, not a measurement.",
+    "Read `intake_is_feature_share` before comparing the intake rate with the design's 54%. Where every intake escalation is a [Feature] ticket firing on workflow_change alone, the rate is ARITHMETICALLY the [Feature] share of the corpus — the harness is measuring the corpus split, not Gate A's judgement, and the comparison is weaker than the bare number reads."
   ],
   "design_reference": {
     "note": "Design section 5: collapsing Gate A and Gate B into one escalation produced a 54% escalation rate on 80 first-parent commits, and a rate resembling it is a design failure rather than a tuning question.",
@@ -1059,6 +1058,16 @@
     }
   ],
   "gate": "A",
+  "intake_is_feature_share": {
+    "tickets": 26,
+    "escalated": 13,
+    "degenerate?": true,
+    "escalation_reason_kinds": [
+      "workflow_change"
+    ],
+    "note": "degenerate? true means every escalation fired on workflow_change alone, so the rate equals the [Feature] share of the corpus and measures the corpus split rather than Gate A's judgement. Weigh the comparison with the design's 54% accordingly.",
+    "request_shaped": 13
+  },
   "strata": {
     "all": {
       "total": 322,
@@ -1071,8 +1080,8 @@
       "not_story": 5,
       "by_signal": {
         "rejected": 5,
-        "inversion_phrase": 34,
-        "request_shaped": 45
+        "request_shaped": 45,
+        "inversion_phrase": 34
       }
     },
     "intake": {
@@ -1085,8 +1094,8 @@
       "not_story": 0,
       "by_signal": {
         "rejected": 0,
-        "inversion_phrase": 0,
-        "request_shaped": 13
+        "request_shaped": 13,
+        "inversion_phrase": 0
       }
     }
   }

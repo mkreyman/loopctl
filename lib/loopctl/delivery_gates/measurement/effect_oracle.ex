@@ -15,8 +15,10 @@ defmodule Loopctl.DeliveryGates.Measurement.EffectOracle do
 
   - `:edi` — X12 structure: a quoted segment identifier, or an `837`/`835` transaction number.
     837P generation is the irreversible effect the design names first.
-  - `:billing_codes` — a HCPCS-shaped literal (a letter and four digits, `T1019`), or the
-    vocabulary that names one: `procedure_code`, `billing_code`, `revenue_code`, `modifier`.
+  - `:billing_codes` — a HCPCS-shaped literal (a letter and four digits, `T1019`), the
+    vocabulary that names one (`procedure_code`, `billing_code`, `revenue_code`), a QUALIFIED
+    `modifier` (`modifier_code`, `hcpcs_modifier` — never the bare word, which is ordinary
+    programming vocabulary), or a literal HCPF modifier value.
   - `:rates` — what a claim is priced at: `fee_schedule`, `rate_cents`, `unit_rate`,
     `reimbursement`, `medicaid`. A rate table edit is a Medicaid rate change.
   - `:outbound` — what carries the effect out of the building: `sftp`, `clearinghouse`,
@@ -29,6 +31,12 @@ defmodule Loopctl.DeliveryGates.Measurement.EffectOracle do
   `procedure_code` fires `:billing_codes` while changing no behaviour. Over-flagging inflates
   the false-negative count, which is the safe direction for a gate measurement: the rate it
   produces is an UPPER bound on Gate B's false negatives.
+
+  Two patterns over-flagged in ways that bias is NOT a licence for, and both were narrowed after
+  the first run: the `837`/`835` pattern was bounded by DECIMAL digits and therefore fired inside
+  any hex digest containing the substring, and `modifier` was unqualified and therefore fired on
+  the ordinary programming word. A bias the moduledoc declares is a bound on the number; a
+  pattern matching a content hash is not a bias, it is a bug, and it moved the rate.
 
   It **under-detects silently**, and this one has no bound. A change that alters claim output
   through arithmetic — a rounding rule in a shared helper, a date-window boundary, a sort order
@@ -52,8 +60,15 @@ defmodule Loopctl.DeliveryGates.Measurement.EffectOracle do
       ~r/["'](ISA|GS|GE|IEA|ST|SE|CLM|SV1|SV2|SV5|NM1|HI|DTP|SBR|PRV|CAS|SVC|AMT|QTY)["']/,
       # NOT `\b83[57]\b`: an underscore is a word character, so `\b` never fires on
       # `build_837` or `Generator837P` — the two shapes an EDI module is actually named in.
-      # Bounded by DIGITS instead, so `1837` and `8370` do not match.
-      ~r/(?<![0-9])83[57]P?(?![0-9])/,
+      #
+      # The bound is TWO hex characters on either side, and both halves of that were paid for.
+      # Bounded by a single DECIMAL digit it fired inside every content hash carrying the
+      # substring, so a diff full of digests read as EDI. Bounded by a single HEX character it
+      # went too far the other way and lost `era835`, `x835` and every other domain spelling
+      # whose neighbouring letter happens to be hex — which silently dropped a real claims-path
+      # false negative (PR 1263) from the corpus between two runs. A RUN of two hex characters
+      # is a digest; one letter next to a transaction number is a name.
+      ~r/(?<![0-9A-Fa-f]{2})83[57]P?(?![0-9A-Fa-f]{2})/,
       ~r/\bx12\b/i,
       ~r/\bedi_/i,
       ~r/\bsegment_terminator\b/i
@@ -64,7 +79,14 @@ defmodule Loopctl.DeliveryGates.Measurement.EffectOracle do
       ~r/\bprocedure_code/,
       ~r/\bbilling_code/,
       ~r/\brevenue_code/,
-      ~r/\bmodifier/
+      # NOT a bare `\bmodifier`: that is an ordinary programming word (a modifier function, a
+      # modifier key, a CSS modifier) and it fired on code with no billing content at all. The
+      # DOMAIN sense always appears qualified, or as one of the literal HCPF modifier values.
+      ~r/\bmodifier_(code|codes|program|list|values?)\b/,
+      ~r/\b(hcpcs|billing|service|claim|payer|procedure)_modifiers?\b/,
+      # `SE` is deliberately absent: it is an X12 segment id, already in the :edi family, and
+      # listing it here would report one signal as two families.
+      ~r/["'](U[1-9]|HQ|TT|GT|TF|TG|UA|UB|SC)["']/
     ],
     rates: [
       ~r/\bfee_schedule/,

@@ -77,6 +77,20 @@ defmodule Loopctl.DeliveryGates.Measurement.GateBReplayTest do
       assert Enum.any?(result.reasons, &match?({:max_changed_lines_exceeded, 1001, 1000}, &1))
     end
 
+    test "a change over the bound that ALSO touches an effect path is :prove_effect" do
+      # What the gate FOUND beats what it declined to look at, the same rule that puts a human
+      # path above a size refusal. Bucketing this as :size_bound lost the effect signal.
+      result =
+        replay(
+          files: ["priv/rates/2026.csv"],
+          diffstat: %{files: 40, changed_lines: 9_000}
+        )
+
+      assert result.outcome == :prove_effect
+      assert "priv/rates/**" in result.effect_matches
+      assert Enum.any?(result.reasons, &match?({:hard_bound_files_exceeded, _, _}, &1))
+    end
+
     test "a change that is BOTH over the bound and on a human path is :human" do
       # The path is the stronger statement: the gate found something, rather than declining to
       # look. Classifying it as :size_bound would hide a human-path hit inside the size bucket.

@@ -22,7 +22,17 @@ SHIPPED gate code over history and count.
 | `gate_a_<date>.md` | that run's human summary |
 
 Add a new dated pair per run rather than overwriting: the point of these is a TRACK RECORD, and
-a rate with nothing to compare it against is one number.
+a rate with nothing to compare it against is one number. **The date in the filename is the UTC
+date of the run**, matching `meta.generated_at` — not the local date, which put a file a day
+ahead of the run inside it and broke the only convention a reader has for pairing them.
+
+**A run's numbers and its artifact are ONE record.** Nothing quoted anywhere — a pull request
+body, this directory, a message — may come from a different run of the same command than the
+artifact beside it. The first version of this work got that wrong: the target repository's HEAD
+advanced between two runs (somebody else fetched), the corpus grew from 831 changes to 854, and
+a set of hand-reviewed numbers was reported against an artifact that no longer produced them.
+`--head` exists so that cannot recur silently: pass a previous run's recorded head sha and the
+corpus is the same one.
 
 **The INTERPRETATION of a run does not live here.** What the numbers mean, which false negatives
 survived a hand review and which configuration defect caused them, names paths in a private
@@ -40,9 +50,14 @@ mix loopctl.gates.measure_b \
   --repo /path/to/target/checkout \
   --repo-name owner/repo \
   --triggers /path/to/triggers.json \
+  --head <sha> \
   --out docs/measurements/gate_b_<date>.json \
   --summary docs/measurements/gate_b_<date>.md
 ```
+
+`--head` defaults to `HEAD` and is resolved to a sha before anything is read; the artifact
+records the resolved value. **To REPRODUCE a run, pass that recorded sha** — a checkout is not a
+fixed corpus, and an unpinned re-run measures whatever the checkout holds at that moment.
 
 Gate A takes a ticket corpus as a FILE, so the run is offline and repeatable. The one networked
 step is deliberately outside the task:
@@ -95,21 +110,31 @@ commitment at all.
 
 ## Reading a Gate B result
 
-Three strata, and the one to read is usually not the first:
+Three strata, NESTED, and the one to read is not the first:
 
 - **all readable** — every change in the window that could be read.
-- **production files** — the subset touching at least one file outside `test/`, `docs/`,
-  `.github/`, `priv/repo/` and `assets/`. A corpus stratification only: the oracle stays
-  path-blind and this decides nothing about a verdict.
 - **configuration applied** — the subset where every configured pattern matched a file at BOTH
   refs. The trigger document is TODAY's; replayed over a tree from before a guarded path
   existed, a pattern that matches nothing escalates as a stale trigger. That is the gate working
   as designed, on a question the replay invented, so a rate over the full window is dominated by
   a replay artifact. **This stratum is the honest corpus**, and it carries its own date range,
   which is not the run's window.
+- **configuration applied, production files** — that subset again, narrowed to changes touching
+  at least one file outside `test/`, `docs/`, `.github/`, `priv/repo/` and `assets/`. It is
+  nested inside the second on purpose and named so: computed over the whole window instead, its
+  clear rate carries the same stale-trigger artifact the second stratum exists to remove, and it
+  would print next to the honest one with nothing to distinguish them. The narrowing is a CORPUS
+  stratification only — the oracle stays path-blind and this decides nothing about a verdict.
 
 `false_negative_rate` is over the SCORED clears, never over all of them: a clear whose oracle
 could not run is neither a false negative nor a true one.
+
+**`clear` is not the auto-merge set.** It is Gate B's own clear plus the size bound.
+`Loopctl.Delivery.MergePrecondition` additionally requires Gate A, custody, an unmoved head and
+an open pull request, so `clear` is a strict SUPERSET of what would actually auto-merge. The
+false-negative RATE survives that — everything the merge precondition adds can only remove
+changes from the set — but do not read the denominator as "changes that would have merged".
+Every Gate B artifact carries `scope_note` saying so.
 
 ## Reading a Gate A result
 
@@ -123,6 +148,17 @@ Two strata plus a sensitivity run:
 - **sensitivity** — the same corpus with `workflow_change_not_defect_fix` suppressed. Gate A's
   rate turns almost entirely on whether a feature request counts as a workflow change, so the
   result is a RANGE and the report says so rather than picking one end.
+
+**Read `intake_is_feature_share.degenerate?` before comparing the intake rate with anything.**
+When every escalation fires on `workflow_change` alone and that stand-in is the `[Feature]`
+prefix, the escalation count IS the count of feature requests — so the rate is arithmetically
+the `[Feature]` share of the corpus, and the harness has measured the intake chat's bug/feature
+mix rather than any judgement Gate A made. The field is computed, not asserted, so a later run
+where the inversion trigger also fires reports `false` and the comparison regains its force.
+
+The `all` stratum is the whole corpus and therefore MIXES the two classifiers: it contains the
+intake tickets, which keep the filing-time prefix reading, plus everything else, classified by
+label. It is not a second, disjoint corpus.
 
 Every bias each harness carries is printed on the summary and stored on the artifact. Read the
 rate with them or not at all.

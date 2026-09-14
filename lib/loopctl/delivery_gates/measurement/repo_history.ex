@@ -33,6 +33,7 @@ defmodule Loopctl.DeliveryGates.Measurement.RepoHistory do
 
   @type opts :: [
           runner: runner(),
+          head: String.t() | nil,
           since: String.t() | nil,
           until: String.t() | nil,
           limit: pos_integer() | nil,
@@ -43,14 +44,22 @@ defmodule Loopctl.DeliveryGates.Measurement.RepoHistory do
   The shas of the first-parent commits in the window, newest first.
 
   `:since` and `:until` are passed to `git log` verbatim (any date it accepts); `:limit` caps
-  the count. An empty window is `{:ok, []}` — a caller decides whether that is an error, and
-  the report does: a rate over nothing is not a rate.
+  the count. `:head` is the TIP the window runs back from, defaulting to `HEAD`.
+
+  `:head` exists because a checkout is not a fixed corpus. On 2026-09-13 the target repository's
+  HEAD advanced between two runs of this harness — somebody else fetched — and the second run
+  measured 854 changes where the first measured 831, silently. Pass the sha a previous run
+  RECORDED and the corpus is the same one; pass nothing and you measure whatever the checkout
+  holds at that moment, which is fine for a first run and useless for a comparison.
+
+  An empty window is `{:ok, []}` — a caller decides whether that is an error, and the report
+  does: a rate over nothing is not a rate.
   """
   @spec shas(String.t(), opts()) :: {:ok, [String.t()]} | {:error, term()}
   def shas(repo, opts \\ []) do
     args =
       ["log", "--first-parent", "--format=%H"] ++
-        window_args(opts) ++ ["HEAD"]
+        window_args(opts) ++ [Keyword.get(opts, :head, "HEAD")]
 
     case read(repo, args, opts) do
       {:ok, output} -> {:ok, String.split(output, "\n", trim: true)}
@@ -67,7 +76,13 @@ defmodule Loopctl.DeliveryGates.Measurement.RepoHistory do
   def change(repo, sha, opts \\ []) do
     with {:ok, [parent | _] = _parents, meta} <- header(repo, sha, opts),
          {:ok, diff} <- read(repo, ["diff", "--name-status", "-M", "-z", parent, sha], opts),
-         {:ok, numstat} <- read(repo, ["diff", "--numstat", "-z", parent, sha], opts),
+         # `-M` on the DIFFSTAT too, not only on the name-status read. Without it the two reads
+         # disagree whenever `diff.renames` is off in a machine's own gitconfig: the name-status
+         # read (which passes it explicitly) sees one rename, the numstat read sees an add plus a
+         # delete and inflates both counts. Two operators re-running the same window would get
+         # different artifacts, which is exactly what the compare-against-the-last-run convention
+         # cannot survive.
+         {:ok, numstat} <- read(repo, ["diff", "--numstat", "-M", "-z", parent, sha], opts),
          {:ok, head_files} <- read(repo, ["ls-tree", "-r", "--name-only", "-z", sha], opts),
          {:ok, base_files} <- read(repo, ["ls-tree", "-r", "--name-only", "-z", parent], opts),
          {:ok, content} <- content(repo, parent, sha, opts) do
@@ -134,11 +149,24 @@ defmodule Loopctl.DeliveryGates.Measurement.RepoHistory do
   end
 
   # `--unified=0` because only the changed lines are wanted and context would put a neighbouring
-  # function's text into the oracle's input. `--no-color` and `--no-ext-diff` so a developer's
-  # `~/.gitconfig` cannot inject escape codes or an external differ into what is being scanned.
+  # function's text into the oracle's input. `-M` for the same reason the numstat read takes it:
+  # without it a pure file MOVE arrives as a whole-file delete plus a whole-file add, so every
+  # line of a moved billing module reaches the oracle as changed text and the move reads as an
+  # effect-bearing change. `--no-color`, `--no-ext-diff` and `--no-textconv` so a developer's
+  # `~/.gitconfig` or a `.gitattributes` cannot inject escape codes, an external differ or a
+  # transformed rendering into what is being scanned.
   defp content(repo, parent, sha, opts) do
     if Keyword.get(opts, :content?, true) do
-      args = ["diff", "--unified=0", "--no-color", "--no-ext-diff", parent, sha]
+      args = [
+        "diff",
+        "--unified=0",
+        "-M",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        parent,
+        sha
+      ]
 
       with {:ok, unified} <- read(repo, args, opts) do
         {:ok, changed_lines(unified)}
