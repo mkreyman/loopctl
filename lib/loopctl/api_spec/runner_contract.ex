@@ -34,6 +34,57 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | runner -> control | any other event | — | — | `unknown_event` (since 1.2.0; every time, never `rate_limited`) |
   | control -> runner | `"disconnecting"` | `RunnerDisconnecting` (since 1.2.0) | — | — |
   | (1.3.0) a dispatch's `wall_clock_seconds` is bounded: `RunnerDispatch.max_wall_clock_seconds/0` | | | | |
+  | (1.5.0) an implement dispatch carries a `RunnerStory`, and a runner may refuse a kind with `kind_not_supported` | | | | |
+
+  ## The story object (since 1.5.0)
+
+  An `implement` dispatch carries the story as TYPED FIELDS — `RunnerStory` — and loopctl
+  never sends a prompt. The runner composes its own prompt from those fields with its own
+  template.
+
+  That is a security property and not a convenience. A dispatch is executed as the machine's
+  user with that machine's credentials, so a control plane able to hand a runner PROSE TO
+  EXECUTE is a control plane able to run anything on every enrolled laptop. Typed fields
+  bound what a dispatch can say: a field the schema does not declare cannot be sent, and
+  every field it does declare is data the runner places inside a template it wrote.
+
+  The object is OPTIONAL on the wire, so a 1.4.0 runner ignores it, and it is allowed only on
+  an `implement` dispatch. Its `id` must be the dispatch's own `story_id`: a dispatch naming
+  one story and carrying another's text is the confusion the check exists to prevent.
+
+  Every cap is declared once in `RunnerStory` and published at
+  `x-connection.limits.story`. The per-field caps are `maxLength`/`maxItems` — characters and
+  items, the units JSON Schema counts in — and the WHOLE OBJECT is bounded in bytes by the
+  same `ByteRule` every other payload here is measured with (`RunnerStory.max_bytes/0`). The
+  object cap is the one that usually binds, and loopctl REFUSES an oversize story rather than
+  truncating it: a silently dropped acceptance criterion is a story built to the wrong spec.
+  See `Loopctl.Delivery.StoryPayload`, which escalates the story to a human instead of
+  dispatching a partial one.
+
+  `domain_reference` looks like another repository's concern and is on this wire deliberately.
+  `mkreyman/home_care_billing` runs a domain gate that refuses any pull request touching
+  `lib/home_care_billing*` without a reference to the domain document the change belongs to
+  (loopctl #805). The implementing session has to name it in the pull request it opens, and
+  the session's only input is this dispatch — so a field loopctl does not carry is a field the
+  session cannot produce, and every such pull request fails that repository's gate. It is one
+  bounded string, chosen by triage, and no other repository is obliged to set it.
+
+  ## Dispatchable kinds
+
+  `kind` declares the vocabulary (`triage`, `implement`); `RunnerDispatch.dispatchable_kinds/0`
+  is what loopctl will actually send, and `cast_dispatch/1` refuses anything else BEFORE a
+  payload is recorded or broadcast. Today that is `implement` alone.
+
+  Triage is excluded structurally rather than by convention. Its input is the reporter's own
+  words, which the implementer must never see (design §10), so it needs its own payload with
+  its own fencing (`Loopctl.Delivery.Untrusted`) — and the implement payload has no field that
+  could carry it. A triage dispatch on this shape would reach a machine with no input and a
+  template for the wrong job. The `kind` enum keeps `triage` because narrowing an enum is a
+  BREAKING change and a minor version may only add; the refusal lives in the cast instead.
+
+  A runner may also answer a dispatch with `kind_not_supported`, a CAPABILITY statement rather
+  than a fault: this machine does not do this kind of work. loopctl records it and does not
+  send that kind to that runner again (`Loopctl.Runners.DispatchLedger.kind_unsupported?/3`).
 
   ## Stage reporting (since 1.4.0)
 
@@ -163,7 +214,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   alias Loopctl.Delivery.StageMachine
   alias OpenApiSpex.Schema
 
-  @version "1.4.0"
+  @version "1.5.0"
   @major 1
 
   defmodule ByteRule do
@@ -355,9 +406,190 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     )
   end
 
+  defmodule RunnerStory do
+    @moduledoc false
+    require OpenApiSpex
+
+    alias Loopctl.ApiSpec.RunnerContract.ByteRule
+
+    # EVERY cap of the story object, declared once here (since 1.5.0). The schema below reads
+    # them, `RunnerContract.cast_dispatch/1` enforces the byte cap from `max_bytes/0`,
+    # `Loopctl.Delivery.ImplementerInput.story_object/2` builds against them, and
+    # `limits/0` publishes them. Nothing restates a number.
+    #
+    # The per-field caps are `maxLength`/`maxItems` — the units JSON Schema counts in, and
+    # the ones the runner's vendored validator implements. OpenApiSpex counts a `maxLength`
+    # in GRAPHEMES, which is looser than codepoints; that is harmless here because nothing
+    # downstream is a Postgres CHECK, and the object cap below is counted with `ByteRule`,
+    # which charges six bytes per UTF-16 unit and therefore bounds anything a loose grapheme
+    # count let through.
+    @max_title_length 200
+    @max_description_length 8_000
+    @max_criteria 20
+    @max_criterion_length 500
+    @max_test_cases 20
+    @max_test_case_length 500
+    @max_touches 100
+    @max_touch_length 200
+    @max_domain_reference_length 500
+
+    # The WHOLE object, under `ByteRule` — the one byte counter this contract has.
+    #
+    # It is derived from the frame, not chosen: the contract's demonstrated-safe payload
+    # budget is `RunnerTraceBatch.max_bytes/0` (60_000) plus
+    # `RunnerContract.frame_envelope_bytes/0`, held against a 64 KB socket frame by a test
+    # that assumes an encoder escaping every character. A dispatch's non-story fields, every
+    # one of them at its own maximum, cost about 6_000 under the same rule, so 48_000 leaves
+    # the story the budget the frame can carry with headroom to spare —
+    # `runner_contract_test.exs` asserts that sum rather than trusting this arithmetic.
+    #
+    # It is also the cap that BINDS. The per-field caps above sum to far more than this, so
+    # in practice a story is refused for its total size and not for one long field. Measured
+    # on the committed `docs/user_stories` corpus on 2026-09-13: a story's title, description,
+    # acceptance criteria and test cases run 14_000-38_500 bytes under this rule, so 48_000
+    # admits the corpus and an oversize story is a genuinely oversize story rather than an
+    # ordinary one meeting a cap set too low.
+    @max_bytes 48_000
+
+    @doc "The largest story object, under the byte rule."
+    @spec max_bytes() :: pos_integer()
+    def max_bytes, do: @max_bytes
+
+    @doc "The longest title."
+    @spec max_title_length() :: pos_integer()
+    def max_title_length, do: @max_title_length
+
+    @doc "The longest description."
+    @spec max_description_length() :: pos_integer()
+    def max_description_length, do: @max_description_length
+
+    @doc "The most acceptance criteria, and the longest one."
+    @spec max_criteria() :: pos_integer()
+    def max_criteria, do: @max_criteria
+
+    @doc "The longest acceptance criterion."
+    @spec max_criterion_length() :: pos_integer()
+    def max_criterion_length, do: @max_criterion_length
+
+    @doc "The most test cases."
+    @spec max_test_cases() :: pos_integer()
+    def max_test_cases, do: @max_test_cases
+
+    @doc "The longest test case."
+    @spec max_test_case_length() :: pos_integer()
+    def max_test_case_length, do: @max_test_case_length
+
+    @doc "The most paths a story may predict it touches."
+    @spec max_touches() :: pos_integer()
+    def max_touches, do: @max_touches
+
+    @doc "The longest touched path."
+    @spec max_touch_length() :: pos_integer()
+    def max_touch_length, do: @max_touch_length
+
+    @doc "The longest domain reference."
+    @spec max_domain_reference_length() :: pos_integer()
+    def max_domain_reference_length, do: @max_domain_reference_length
+
+    @doc """
+    Every cap of the story object, as the export publishes them: `max_bytes` for the whole
+    object, and `fields` keyed by the field each bound belongs to.
+
+    DERIVED from `schema/0`, never restated. The list used to be written out by hand, so a
+    field added to the schema and forgotten here published an incomplete set with every test
+    green — and a runner splitting by the published caps would have had no bound for the new
+    field. Reading the schema means the two cannot disagree: a bound only exists here because
+    it is declared there.
+
+    `max_bytes` is the one entry that is not read off the schema, because it is not a JSON
+    Schema keyword — it is the whole object under `ByteRule`.
+
+    At runtime, not compile time: `schema/0` is defined by the `OpenApiSpex.schema` macro
+    below and a module attribute cannot call it.
+    """
+    @spec limits() :: %{String.t() => term()}
+    def limits do
+      fields =
+        for {name, sub} <- schema().properties,
+            bounds = field_bounds(sub),
+            bounds != %{},
+            into: %{},
+            do: {Atom.to_string(name), bounds}
+
+      %{"max_bytes" => @max_bytes, "fields" => fields}
+    end
+
+    defp field_bounds(%Schema{type: :array, maxItems: items, items: %Schema{maxLength: length}})
+         when is_integer(items) and is_integer(length),
+         do: %{"max_items" => items, "max_item_length" => length}
+
+    defp field_bounds(%Schema{type: :string, maxLength: length}) when is_integer(length),
+      do: %{"max_length" => length}
+
+    defp field_bounds(%Schema{}), do: %{}
+
+    OpenApiSpex.schema(
+      %{
+        title: "RunnerStory",
+        description:
+          "The story an `implement` dispatch is for, as TYPED FIELDS (since 1.5.0). loopctl " <>
+            "never sends a prompt: the runner composes one from these fields with its own " <>
+            "template, because a dispatch runs as the machine's user and a control plane " <>
+            "able to hand a runner prose to execute is able to run anything on it. `id` " <>
+            "must be the dispatch's own `story_id`. The whole object is at most " <>
+            "#{@max_bytes} bytes under the byte rule below, which is the cap that usually " <>
+            "binds; loopctl REFUSES an oversize story and escalates it to a human rather " <>
+            "than truncating one, since a dropped acceptance criterion is a story built to " <>
+            "the wrong spec. `domain_reference` is the domain document the change belongs " <>
+            "to, required by some repositories' own pull-request gates. " <> ByteRule.text(),
+        type: :object,
+        required: [:id, :title],
+        properties: %{
+          id: %Schema{
+            type: :string,
+            format: :uuid,
+            description: "The story's id. Must equal the dispatch's `story_id`."
+          },
+          title: %Schema{type: :string, minLength: 1, maxLength: @max_title_length},
+          description: %Schema{type: :string, maxLength: @max_description_length},
+          acceptance_criteria: %Schema{
+            type: :array,
+            maxItems: @max_criteria,
+            items: %Schema{type: :string, minLength: 1, maxLength: @max_criterion_length},
+            description:
+              "What the work is judged against, one string per criterion, in the story's " <>
+                "own order. Never truncated: a story with more than #{@max_criteria} is " <>
+                "refused."
+          },
+          test_cases: %Schema{
+            type: :array,
+            maxItems: @max_test_cases,
+            items: %Schema{type: :string, minLength: 1, maxLength: @max_test_case_length}
+          },
+          touches: %Schema{
+            type: :array,
+            maxItems: @max_touches,
+            items: %Schema{type: :string, minLength: 1, maxLength: @max_touch_length},
+            description:
+              "The paths triage predicted the change touches. Advisory to the session and " <>
+                "never a permission: what a runner may write is its own local allow-list."
+          },
+          domain_reference: %Schema{
+            type: :string,
+            minLength: 1,
+            maxLength: @max_domain_reference_length
+          }
+        }
+      },
+      struct?: false
+    )
+  end
+
   defmodule RunnerDispatch do
     @moduledoc false
     require OpenApiSpex
+
+    alias Loopctl.ApiSpec.RunnerContract.RunnerStory
 
     # A session's wall clock, bounded (since 1.3.0). The runner stops a session there, and
     # loopctl stores the value and presumes a slot free past it plus a grace
@@ -372,13 +604,40 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     @spec max_wall_clock_seconds() :: pos_integer()
     def max_wall_clock_seconds, do: @max_wall_clock_seconds
 
+    # The `kind` VOCABULARY, and the subset loopctl will actually send (since 1.5.0). Both are
+    # declared here; `RunnerContract.cast_dispatch/1` refuses a kind outside
+    # `dispatchable_kinds/0` before anything is recorded or broadcast, and the export
+    # publishes both lists.
+    #
+    # `triage` stays in the enum and out of the dispatchable set. Narrowing an enum would be a
+    # BREAKING change and a minor version may only add — and the vocabulary is what a runner
+    # answers `kind_not_supported` about. What keeps triage off the wire is the cast: its
+    # input is the reporter's own words, which the implementer must never see (design §10), so
+    # it needs its own payload with its own fencing, and this shape has no field that could
+    # carry it.
+    @kinds ["triage", "implement"]
+    @dispatchable_kinds ["implement"]
+
+    @doc "Every dispatch kind the contract names."
+    @spec kinds() :: [String.t()]
+    def kinds, do: @kinds
+
+    @doc "The kinds loopctl will send. Every other declared kind is refused by the cast."
+    @spec dispatchable_kinds() :: [String.t()]
+    def dispatchable_kinds, do: @dispatchable_kinds
+
     OpenApiSpex.schema(
       %{
         title: "RunnerDispatch",
         description:
           "Control pushes `dispatch` to start a session. The runner validates it against " <>
             "its LOCAL allow-list (repos, branch prefixes, wall clock, token budget) and " <>
-            "refuses by default: a dispatch is a prompt executed as the machine's user. " <>
+            "refuses by default: a dispatch runs as the machine's user. Since 1.5.0 an " <>
+            "`implement` dispatch carries the story as TYPED FIELDS (`story`) and never a " <>
+            "prompt — the runner composes its own from them. `story` is allowed only on an " <>
+            "`implement` dispatch and its `id` must equal `story_id`. Only the kinds in " <>
+            "`x-connection.dispatchable_kinds` are sent; a runner that does not do a kind " <>
+            "answers `kind_not_supported` and is not sent that kind again. " <>
             "Declared in contract v1; emitted from #803.",
         type: :object,
         required: [
@@ -395,7 +654,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
         properties: %{
           dispatch_id: %Schema{type: :string, format: :uuid},
           story_id: %Schema{type: :string, format: :uuid},
-          kind: %Schema{type: :string, enum: ["triage", "implement"]},
+          kind: %Schema{type: :string, enum: @kinds},
           repo: %Schema{type: :string, pattern: "^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$"},
           base_branch: %Schema{type: :string, minLength: 1, maxLength: 255},
           branch: %Schema{type: :string, minLength: 1, maxLength: 255},
@@ -415,7 +674,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
                 "#{@max_wall_clock_seconds} (a day) since contract 1.3.0."
           },
           max_turns: %Schema{type: :integer, minimum: 1},
-          token_budget: %Schema{type: :integer, minimum: 1, nullable: true}
+          token_budget: %Schema{type: :integer, minimum: 1, nullable: true},
+          story: RunnerStory.schema()
         }
       },
       struct?: false
@@ -476,9 +736,17 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     @moduledoc false
     require OpenApiSpex
 
+    # `kind_not_supported` (since 1.5.0) is the one refusal that is a CAPABILITY STATEMENT
+    # rather than a fault: this machine does not do this kind of work, and it will not do it
+    # after a retry either. loopctl treats it as PERMANENT for that runner and that kind and
+    # sends no more of them (`Loopctl.Runners.DispatchLedger.kind_unsupported?/3`), which is
+    # what makes it different from `draining` or `at_capacity` — those are about right now.
+    # Like every refusal it gives the slot straight back, so it costs the runner no capacity,
+    # and nothing reads a refusal as a health signal.
     @refusal_reasons ~w(dispatches_disabled draining at_capacity insufficient_disk
                         repo_not_allowed branch_not_allowed wall_clock_exceeds_limit
-                        max_turns_exceeds_limit token_budget_exceeds_limit other)
+                        max_turns_exceeds_limit token_budget_exceeds_limit
+                        kind_not_supported other)
     @max_detail_length 500
 
     @doc "Every refusal reason a runner may give."
@@ -794,6 +1062,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     RunnerJoin,
     RunnerStatus,
     RunnerSample,
+    RunnerStory,
     RunnerDispatch,
     RunnerDispatchReply,
     RunnerTraceEvent,
@@ -970,13 +1239,62 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   Outbound is validated too, because the runner refuses by default and a push it cannot
   parse is a dispatch silently lost — and because nothing the contract does not declare
   may reach a machine that executes the payload as its user.
+
+  Beyond the schema it applies the three cross-field rules JSON Schema cannot state, all
+  three of which keep something off a machine that would execute it:
+
+  - the `kind` is one loopctl actually sends (`RunnerDispatch.dispatchable_kinds/0`). Triage
+    is declared and not dispatchable; see the moduledoc.
+  - a `story` rides only an `implement` dispatch, and its `id` is the dispatch's own
+    `story_id`. A dispatch naming one story and carrying another's text is the confusion
+    worth refusing rather than resolving.
+  - the story is within `RunnerStory.max_bytes/0` under `ByteRule`. Refused, never truncated:
+    the caller escalates the story instead (`Loopctl.Delivery.StoryPayload`).
   """
   @spec cast_dispatch(term()) :: {:ok, map()} | {:error, term()}
   def cast_dispatch(payload) do
     with {:ok, cast} <- cast(payload, RunnerDispatch.schema()) do
-      {:ok, known_fields(cast, RunnerDispatch.schema())}
+      dispatch = known_fields(cast, RunnerDispatch.schema())
+
+      case dispatch_shape_errors(dispatch) do
+        [] -> {:ok, dispatch}
+        errors -> {:error, {:invalid, errors}}
+      end
     end
   end
+
+  defp dispatch_shape_errors(dispatch) do
+    kind_errors(dispatch) ++ story_errors(dispatch)
+  end
+
+  defp kind_errors(%{kind: kind}) do
+    if kind in RunnerDispatch.dispatchable_kinds(),
+      do: [],
+      else: [
+        "kind #{kind} is declared but not dispatchable: loopctl sends only " <>
+          Enum.join(RunnerDispatch.dispatchable_kinds(), ", ")
+      ]
+  end
+
+  defp kind_errors(_dispatch), do: []
+
+  defp story_errors(%{story: story, kind: kind, story_id: story_id}) do
+    cond do
+      kind != "implement" ->
+        ["story is only allowed when kind is implement"]
+
+      Map.get(story, :id) != story_id ->
+        ["story.id must be the dispatch's story_id"]
+
+      ByteRule.bytes(story) > RunnerStory.max_bytes() ->
+        ["story exceeds #{RunnerStory.max_bytes()} bytes under the byte rule"]
+
+      true ->
+        []
+    end
+  end
+
+  defp story_errors(_dispatch), do: []
 
   @doc """
   Validates a `dispatch_reply` payload. Returns the declared fields only, with atom keys, or
@@ -1296,8 +1614,13 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           "trace_cursor" => "RunnerTraceCursor",
           "trace_event" => "RunnerTraceEvent",
           "disconnecting" => "RunnerDisconnecting",
-          "stage" => "RunnerStageReport"
+          "stage" => "RunnerStageReport",
+          "story" => "RunnerStory"
         },
+        # The kinds loopctl will actually send. `RunnerDispatch.kind`'s enum is the
+        # VOCABULARY, which is wider: `triage` is declared and refused by `cast_dispatch/1`
+        # until it has its own payload. Published so a runner knows which it must handle.
+        "dispatchable_kinds" => RunnerDispatch.dispatchable_kinds(),
         "replies" => %{
           "trace" => "RunnerTraceAck",
           "trace_cursor" => "RunnerTraceAck"
@@ -1315,7 +1638,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           "min_interval_ms" => @min_interval_ms,
           "dispatch_reply_burst" => @dispatch_reply_burst,
           "stage_burst" => @stage_burst,
-          "stage_max_reason_length" => RunnerStage.max_reason_length()
+          "stage_max_reason_length" => RunnerStage.max_reason_length(),
+          "story" => RunnerStory.limits()
         },
         # The transition table a `stage` message is checked against, published so a runner
         # can refuse an impossible transition locally instead of learning it from a refusal.
