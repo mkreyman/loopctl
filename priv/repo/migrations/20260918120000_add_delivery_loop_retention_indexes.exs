@@ -1,6 +1,4 @@
 defmodule Loopctl.Repo.Migrations.AddDeliveryLoopRetentionIndexes do
-  use Ecto.Migration
-
   @moduledoc """
   Issue #803 (design §11): the two indexes `Loopctl.Workers.DeliveryLoopPruneWorker` reads.
   No column, constraint or policy changes; no backfill and no manual step.
@@ -16,39 +14,76 @@ defmodule Loopctl.Repo.Migrations.AddDeliveryLoopRetentionIndexes do
      of the source for every candidate delivery, which is quadratic in exactly the tenant that
      has the most of both.
 
-  `CONCURRENTLY` on both, because a plain `create index` takes a SHARE lock for the whole
-  build and blocks every INSERT meanwhile — on `runner_trace_events`, which this migration
-  itself calls the highest-volume table here, that is every runner's trace stalling behind a
-  DDL. `create_if_not_exists` + explicit `up`/`down`, per `20260827121000` and
-  `20260905120200`: plain `create index(concurrently: true)` emits no `IF NOT EXISTS`, so an
-  interrupted build leaves an INVALID index and no migration row, and every later deploy trips
-  over it.
+  ## Why CONCURRENTLY, and why that needs a validity guard
+
+  A plain build takes a SHARE lock for its whole duration and blocks every INSERT meanwhile —
+  on `runner_trace_events` that is every runner's trace stalling behind DDL. So both are built
+  `CONCURRENTLY`, which costs `@disable_ddl_transaction` + `@disable_migration_lock` and raw
+  `execute/1`.
+
+  The guard is the other half and it is NOT optional. An interrupted concurrent build leaves
+  an INVALID index behind: it still occupies the name, so `IF NOT EXISTS` quietly declines to
+  build a working one, and no planner will use it. On this table that means the retention scan
+  silently goes back to a sequential scan of the largest table here — a pruner that looks like
+  it is running and is not. `stale?/1` therefore reconciles VALIDITY and SHAPE, not just the
+  name, and drops what it finds before the create; this is the `ensure_index` pattern from
+  `20260821120000` / `20260825130000` / `20260827121000`. Absent is not stale — there is
+  nothing to drop and the create lays it down.
   """
+
+  use Ecto.Migration
 
   @disable_ddl_transaction true
   @disable_migration_lock true
 
+  @trace_name "runner_trace_events_tenant_inserted_at_idx"
+  @record_name "intake_records_tenant_source_last_delivery_idx"
+
+  # Loose on the deparser's parenthesisation and casts (both version dependent), exact on the
+  # table and the key order — the two things that decide whether the retention scan uses it.
+  @trace_shape ~r/ON public\.runner_trace_events USING btree \(tenant_id, inserted_at\)/
+  @record_shape ~r/ON public\.intake_records USING btree \(tenant_id, source_id, last_delivery_id\)/
+
+  @create_trace """
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS #{@trace_name}
+    ON runner_trace_events (tenant_id, inserted_at)
+  """
+
+  @create_record """
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS #{@record_name}
+    ON intake_records (tenant_id, source_id, last_delivery_id)
+  """
+
   def up do
-    create_if_not_exists(trace_age_index())
-    create_if_not_exists(record_delivery_index())
+    if stale?(@trace_name, @trace_shape),
+      do: execute("DROP INDEX CONCURRENTLY IF EXISTS #{@trace_name}")
+
+    execute(@create_trace)
+
+    if stale?(@record_name, @record_shape),
+      do: execute("DROP INDEX CONCURRENTLY IF EXISTS #{@record_name}")
+
+    execute(@create_record)
   end
 
   def down do
-    drop_if_exists(record_delivery_index())
-    drop_if_exists(trace_age_index())
+    execute("DROP INDEX CONCURRENTLY IF EXISTS #{@record_name}")
+    execute("DROP INDEX CONCURRENTLY IF EXISTS #{@trace_name}")
   end
 
-  defp trace_age_index do
-    index(:runner_trace_events, [:tenant_id, :inserted_at],
-      name: :runner_trace_events_tenant_inserted_at_idx,
-      concurrently: true
-    )
-  end
+  # Stale = INVALID, a different shape, or ambiguous. Absent is NOT stale.
+  defp stale?(name, shape) do
+    sql = """
+    SELECT pg_get_indexdef(c.oid), x.indisvalid
+      FROM pg_class c
+      JOIN pg_index x ON x.indexrelid = c.oid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.relname = $1 AND c.relkind = 'i' AND n.nspname = 'public'
+    """
 
-  defp record_delivery_index do
-    index(:intake_records, [:tenant_id, :source_id, :last_delivery_id],
-      name: :intake_records_tenant_source_last_delivery_idx,
-      concurrently: true
-    )
+    case repo().query!(sql, [name]).rows do
+      [[indexdef, true]] -> not (indexdef =~ shape)
+      rows -> rows != []
+    end
   end
 end

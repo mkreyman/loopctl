@@ -607,18 +607,29 @@ defmodule Loopctl.Runners.DispatchLedger do
   Deletes one tenant's trace events past `cutoff` whose dispatch is terminal, oldest first,
   in batches of `:batch_size` up to `:budget` rows. See "Retention" in the moduledoc.
 
-  Returns `%{deleted: n, budget_exhausted: bool}`. `budget_exhausted` means the tenant still
-  had eligible rows when the budget ran out; the next run resumes where this one stopped,
-  because the candidates are ordered by age and nothing puts a pruned row back.
+  Returns `%{deleted: n, budget_exhausted: bool, error: nil | term()}`. `budget_exhausted`
+  means eligible rows were LEFT — it is probed, not inferred from arithmetic, so a tenant
+  that lands exactly on its budget with nothing left reports `false`. The next run resumes
+  where this one stopped, because candidates are ordered by age and nothing puts a pruned row
+  back.
+
+  **It does not raise.** A batch that faults returns with the fault in `:error` AND the count
+  of everything the earlier batches committed, because those are the batches a long run makes
+  most of: raising would report zero deleted on exactly the run that deleted the most. The
+  caller decides what a fault means.
 
   Each batch is its OWN transaction, with its own `statement_timeout` and `lock_timeout`, so
   nothing here holds a transaction open across a large delete and a run interrupted between
   batches leaves every earlier batch committed. Candidate rows are taken
   `FOR UPDATE SKIP LOCKED`, so two overlapping runs prune disjoint sets instead of one
   waiting on the other, and neither double-counts.
+
+  `opts` (`:batch_size`, `:budget`) are an INTERNAL contract and are not validated here —
+  `Loopctl.Workers.DeliveryLoopPruneWorker` validates everything an operator can supply
+  before it reaches them.
   """
   @spec prune_trace_events(Ecto.UUID.t(), DateTime.t(), keyword()) ::
-          %{deleted: non_neg_integer(), budget_exhausted: boolean()}
+          %{deleted: non_neg_integer(), budget_exhausted: boolean(), error: nil | term()}
   def prune_trace_events(tenant_id, %DateTime{} = cutoff, opts \\ []) do
     batch_size = Keyword.get(opts, :batch_size, @prune_batch_size)
     budget = Keyword.get(opts, :budget, @prune_budget)
@@ -632,34 +643,47 @@ defmodule Loopctl.Runners.DispatchLedger do
   # rather than assuming one — a tenant with exactly `budget` eligible rows has none left, and
   # reporting that as "budget reached, rows left" is a false positive on the one signal an
   # operator alerts on.
-  defp prune_loop(tenant_id, cutoff, _batch_size, budget, deleted) when deleted >= budget,
-    do: %{deleted: deleted, budget_exhausted: more_events?(tenant_id, cutoff)}
+  # The probe reads WITHOUT the row lock: it decides a report, so it must not take locks a
+  # concurrent run would then skip, and under `SKIP LOCKED` the answer would depend on what
+  # another run happens to hold rather than on what exists.
+  defp prune_loop(tenant_id, cutoff, _batch_size, budget, deleted) when deleted >= budget do
+    case attempt(tenant_id, fn ->
+           tenant_id
+           |> prunable_events(cutoff, 1)
+           |> exclude(:lock)
+           |> Repo.exists?()
+         end) do
+      # A probe that could not run cannot say the backlog is empty, so it says it is not.
+      {:ok, more?} -> %{deleted: deleted, budget_exhausted: more?, error: nil}
+      {:error, error} -> %{deleted: deleted, budget_exhausted: true, error: error}
+    end
+  end
 
   defp prune_loop(tenant_id, cutoff, batch_size, budget, deleted) do
     take = min(batch_size, budget - deleted)
 
-    count =
-      bounded(tenant_id, fn ->
+    batch =
+      attempt(tenant_id, fn ->
         delete_events(tenant_id, Repo.all(prunable_events(tenant_id, cutoff, take)))
       end)
 
-    if count == 0 do
-      %{deleted: deleted, budget_exhausted: false}
-    else
-      prune_loop(tenant_id, cutoff, batch_size, budget, deleted + count)
+    case batch do
+      {:ok, 0} -> %{deleted: deleted, budget_exhausted: false, error: nil}
+      {:ok, count} -> prune_loop(tenant_id, cutoff, batch_size, budget, deleted + count)
+      {:error, error} -> %{deleted: deleted, budget_exhausted: false, error: error}
     end
   end
 
-  # Is anything still eligible? Read WITHOUT the row lock: this decides a report, so it must
-  # not take locks a concurrent run would then skip, and under `SKIP LOCKED` the answer would
-  # depend on what another run happens to hold rather than on what exists.
-  defp more_events?(tenant_id, cutoff) do
-    bounded(tenant_id, fn ->
-      tenant_id
-      |> prunable_events(cutoff, 1)
-      |> exclude(:lock)
-      |> Repo.exists?()
-    end)
+  # One batch, or the probe, RETURNING its fault instead of raising it. Raising would throw
+  # away the count of everything the earlier batches already COMMITTED, and those batches are
+  # the ones a long run makes most of: the caller would report zero deleted on exactly the run
+  # that deleted the most.
+  defp attempt(tenant_id, fun) do
+    {:ok, bounded(tenant_id, fun)}
+  rescue
+    error -> {:error, error}
+  catch
+    :exit, reason -> {:error, {:exit, reason}}
   end
 
   # One batch, or the probe: its own RLS transaction under its own bounded timeouts, scoped by

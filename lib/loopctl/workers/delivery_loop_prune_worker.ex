@@ -57,12 +57,17 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorker do
     is its own short transaction that returns the connection between batches, and the budget
     caps a tenant at ten of them per run. Deliveries arrive at webhook rate, so that still
     reclaims far more per day than any repository produces.
-  - **One tenant never stops the rest.** Each tenant's each table is guarded: a raise or an
-    exit is logged with the tenant id, counted, and the fold continues. `list_tenants/1`
-    orders by name, so without this it is deterministically the same later tenants that are
-    never pruned. A transient database fault (a lock wait, a statement timeout, a deadlock, a
-    pool that was down) leaves the job `:ok` — the next tick retries it — while anything else
-    makes the job report an error so it is not silently green.
+  - **One tenant never stops the rest.** Each tenant's each table is guarded: a fault is
+    logged with the tenant id, counted, and the fold continues, carrying the rows the batches
+    BEFORE it already committed. `list_tenants/1` orders by name, so without this it is
+    deterministically the same later tenants that are never pruned.
+  - **A fault gets ONE immediate retry, and then it is a failure** (`verdict/2`). A genuine
+    blip — a lock wait, a deadlock — clears on that retry. A DETERMINISTIC fault does not, and
+    after the retry it is counted and the job reports an error. That bound is the point:
+    treating a 15-second statement timeout a query has outgrown as "transient" for ever meant
+    it retried hourly with the job green and every alert metric at zero. Oban retries the job,
+    so a real blip still resolves without anyone being told; a persistent one exhausts the
+    attempts and shows up as a discarded job.
   - **Where the state lives.** Nowhere but the rows. There is no cursor, no checkpoint and
     nothing to reconcile: progress IS the deletion, candidates are ordered oldest-first, and
     a pruned row never comes back. Two runs an hour apart resume by re-selecting.
@@ -78,13 +83,17 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorker do
     budget stops a run that cannot keep up instead of letting it run until something else
     times out. A batch that raises fails the job — visibly, with Oban's retry — rather than
     being swallowed.
-  - **Falling behind.** Every run emits `[:loopctl, :delivery_loop, :prune]` per table with
-    the rows deleted, how many tenants stopped at their budget and how many failed, and logs
-    a warning naming each. A `tenants_at_budget` that stays non-zero across runs is the signal
-    that the hourly cadence or the budget no longer matches the write rate — and it is a
-    MEASURED signal, not an inferred one: a tenant that lands exactly on its budget is probed
-    for a further candidate before it is counted, so "budget reached" never means "reached it
-    and stopped exactly at the end".
+  - **Falling behind, and the two signals that say so.** Every run emits
+    `[:loopctl, :delivery_loop, :prune]` PER TABLE with `deleted`, `tenants_at_budget`,
+    `tenants_failed`, `tenants` and `duration_ms`.
+
+    **ALERT ON BOTH.** `tenants_at_budget` staying non-zero across runs means the cadence or
+    the budget no longer matches the write rate — and it is measured rather than inferred,
+    since a tenant landing exactly on its budget is probed for a further candidate before it
+    is counted. `tenants_failed` is the other half and it must be alerted on separately,
+    because a run where EVERY tenant failed emits the profile of an idle healthy fleet on the
+    first signal alone: nothing deleted, nobody at budget. What distinguishes them is
+    `tenants_failed` and the job's own error, so neither can be the only thing watched.
   """
 
   use Oban.Worker, queue: :cleanup, max_attempts: 3
@@ -117,16 +126,18 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorker do
 
   @telemetry [:loopctl, :delivery_loop, :prune]
 
+  # A transient fault gets ONE immediate retry inside the run; the second failure is the
+  # bound (`verdict/2`).
+  @attempts_per_unit 2
+
   @typedoc """
-  One tenant's outcome for ONE table. `failed` counts a prune that could not be completed,
-  `hard_failed` the subset of those that were NOT a transient database fault — the ones that
-  make the job report an error rather than waiting for the next tick.
+  One tenant's outcome for ONE table. `deleted` is what was COMMITTED, including by the
+  batches before a fault; `failed` marks a prune that did not finish even after its retry.
   """
   @type half_result :: %{
           deleted: non_neg_integer(),
           budget_exhausted: boolean(),
-          failed: 0 | 1,
-          hard_failed: 0 | 1
+          failed: 0 | 1
         }
 
   @doc "Default trace-event retention, in days, when a tenant sets none."
@@ -154,10 +165,24 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorker do
 
   @impl Oban.Worker
   def perform(%Oban.Job{} = job) do
-    started = System.monotonic_time(:millisecond)
-    now = DateTime.utc_now()
-    opts = prune_opts(job.args)
     {:ok, tenants} = Tenants.list_tenants()
+
+    run(tenants, DateTime.utc_now(), prune_opts(job.args))
+  end
+
+  @doc """
+  The whole run over `tenants`: prune each, report per table, and return the job's verdict.
+  `perform/1` is this plus resolving the tenant list and VALIDATING the operator's args.
+
+  Public for the reason `Loopctl.ObanConfig.parse_unparked/1` is: the behaviour that matters
+  here — one tenant's failure not stopping the rest, and the run still reporting what it
+  managed — needs a prune that FAILS, and `perform/1` cannot be given one now that its args
+  are validated. `opts` here are the same internal, unvalidated contract `prune_tenant/3`
+  documents.
+  """
+  @spec run([Tenant.t()], DateTime.t(), keyword()) :: :ok | {:error, String.t()}
+  def run(tenants, %DateTime{} = now, opts \\ []) do
+    started = System.monotonic_time(:millisecond)
 
     totals =
       Enum.reduce(tenants, %{trace: empty(), intake: empty()}, fn tenant, acc ->
@@ -174,35 +199,85 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorker do
     outcome(totals)
   end
 
-  # The cron entry passes no args. `%{"batch_size" => n}` / `%{"budget" => n}` are the manual
-  # drain knob — one enqueue after a long outage reclaims a backlog faster than twenty-four
-  # hourly runs. Values are NOT validated here on purpose: they reach the database only as
-  # query PARAMETERS (`limit: ^limit`), so the worst a nonsense one can do is have Postgres
-  # refuse the statement, which the per-tenant guard below counts and reports rather than
-  # crashing the run. Validating them would trade that provable behaviour for an untestable
-  # branch.
-  defp prune_opts(args) when is_map(args) do
-    for {name, key} <- [{"batch_size", :batch_size}, {"budget", :budget}],
-        {:ok, value} <- [Map.fetch(args, name)],
-        do: {key, value}
+  @doc """
+  The pure resolution of the operator's job args into prune options.
+
+  The cron entry passes none. `%{"batch_size" => n}` / `%{"budget" => n}` are the manual drain
+  knob — one enqueue after a long outage reclaims a backlog faster than twenty-four hourly
+  runs. Each must be a POSITIVE INTEGER; anything else is ignored with a warning and the
+  default applies.
+
+  That validation is not defensive tidiness, which is why this is public and unit-tested.
+  `take = min(batch_size, budget - deleted)` is a TERM comparison, and in Elixir's term order
+  a number sorts before every string, atom and map — so `min(nil, 20_000)` is `20_000`, not an
+  error. An unvalidated `"1000"` would therefore be refused by nothing: it would silently
+  become the WHOLE budget and put 20,000 rows in one DELETE, which is the single thing the
+  batch exists to prevent. An unvalidated `budget` is worse still — `deleted >= "1"` is never
+  true, so the loop would run to an `ArithmeticError` instead of stopping.
+  """
+  @spec prune_opts(map()) :: keyword()
+  def prune_opts(args) when is_map(args) do
+    Enum.flat_map([{"batch_size", :batch_size}, {"budget", :budget}], fn {name, key} ->
+      case Map.fetch(args, name) do
+        {:ok, value} when is_integer(value) and value > 0 ->
+          [{key, value}]
+
+        {:ok, other} ->
+          Logger.warning(
+            "DeliveryLoopPruneWorker: ignoring #{name}=#{inspect(other)} — expected a " <>
+              "positive integer; using the default"
+          )
+
+          []
+
+        :error ->
+          []
+      end
+    end)
   end
 
-  defp prune_opts(_args), do: []
+  def prune_opts(_args), do: []
 
-  # A tenant whose prune could not be COMPLETED never stops the fold (each half is guarded),
-  # but it must not leave the job reading green either. A RETRYABLE fault — a lock wait that
-  # ran out, a statement timeout, a deadlock Postgres broke, a pool that was down — is "not
-  # this time": the next tick retries that tenant, and the telemetry counts it. Anything else
-  # is a fault nobody would otherwise see, so the job reports it and Oban retries.
+  @doc """
+  Caps prune options at the intake half's own constants.
+
+  That half runs on `AdminRepo`, whose three connections carry request traffic on every
+  authenticated call, so `Intake.prune_batch_size/0` and `Intake.prune_budget/0` are a CEILING
+  and not merely a default: a drain override raises the TRACE half, and is capped here. A
+  smaller value stands — this is a ceiling, not an override — and anything that is not a
+  number passes through, since `prune_tenant/3`'s opts are an internal contract and only
+  `prune_opts/1` faces an operator.
+
+  Public and pure for the same reason `prune_opts/1` is: the cap only becomes observable in a
+  run that crosses the budget, and unit-testing the values costs nothing.
+  """
+  @spec intake_opts(keyword()) :: keyword()
+  def intake_opts(opts) do
+    Enum.map(opts, fn
+      {:batch_size, value} -> {:batch_size, cap(value, Intake.prune_batch_size())}
+      {:budget, value} -> {:budget, cap(value, Intake.prune_budget())}
+      other -> other
+    end)
+  end
+
+  defp cap(value, ceiling) when is_number(value), do: min(value, ceiling)
+  defp cap(value, _ceiling), do: value
+
+  # A tenant whose prune could not be completed never stops the fold — but it never leaves the
+  # job reading green either. A transient fault has ALREADY had its immediate retry by the
+  # time it is counted here (`verdict/2`), so anything that reaches this point is either
+  # deterministic or a database that stayed unhappy across two attempts, and both are things
+  # an operator has to see. Oban retries the job; a real blip clears on that retry, and a
+  # persistent fault exhausts the attempts and shows up as a discarded job.
   defp outcome(%{trace: trace, intake: intake}) do
-    case trace.hard_failed + intake.hard_failed do
+    case trace.failed + intake.failed do
       0 ->
         :ok
 
       n ->
         {:error,
-         "DeliveryLoopPruneWorker: #{n} tenant/table prune(s) failed with a non-retryable " <>
-           "error; see the preceding log lines for the tenant ids and reasons"}
+         "DeliveryLoopPruneWorker: #{n} tenant/table prune(s) failed after their retry; " <>
+           "see the preceding log lines for the tenant ids and reasons"}
     end
   end
 
@@ -245,8 +320,10 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorker do
         @min_intake_retention_days
       )
 
+    capped = intake_opts(opts)
+
     guarded("intake_deliveries", tenant, days, fn ->
-      Intake.prune_deliveries(tenant.id, cutoff(now, days), opts)
+      Intake.prune_deliveries(tenant.id, cutoff(now, days), capped)
     end)
   end
 
@@ -256,44 +333,66 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorker do
   # ever. Containing it is also what keeps the run's telemetry meaningful: `report/4` runs
   # after the fold, so an escaping error suppressed `tenants_at_budget` on exactly the runs
   # where it was non-zero.
-  defp guarded(table, tenant, days, fun) do
-    result = fun.()
-    log_tenant(table, tenant, days, result)
-    Map.merge(result, %{failed: 0, hard_failed: 0})
-  rescue
-    error -> failure(table, tenant, days, error, retryable?(error), __STACKTRACE__)
-  catch
-    # A pool that is down or wedged EXITS rather than raising, and that is always transient.
-    :exit, reason -> failure(table, tenant, days, {:exit, reason}, true, [])
-  end
+  defp guarded(table, tenant, days, fun), do: try_prune(table, tenant, days, fun, 1, 0)
 
-  defp failure(table, tenant, days, error, retryable?, stacktrace) do
-    message =
-      "DeliveryLoopPruneWorker: prune failed: table=#{table} tenant_id=#{tenant.id} " <>
-        "retention_days=#{days} retryable=#{retryable?} error=#{inspect(error)}"
+  defp try_prune(table, tenant, days, fun, attempt, deleted_before) do
+    result = safely(fun)
+    deleted = deleted_before + result.deleted
 
-    if retryable? do
-      Logger.warning(message, tenant_id: tenant.id)
-    else
-      Logger.error(message <> " stacktrace=#{inspect(Enum.take(stacktrace, 5))}",
-        tenant_id: tenant.id
-      )
+    case result.error do
+      nil ->
+        outcome = %{deleted: deleted, budget_exhausted: result.budget_exhausted}
+        log_tenant(table, tenant, days, outcome)
+        Map.put(outcome, :failed, 0)
+
+      error ->
+        case verdict(error, attempt) do
+          :retry ->
+            log_retry(table, tenant, error)
+            try_prune(table, tenant, days, fun, attempt + 1, deleted)
+
+          :fail ->
+            log_failure(table, tenant, days, error, deleted)
+            %{deleted: deleted, budget_exhausted: false, failed: 1}
+        end
     end
-
-    %{
-      deleted: 0,
-      budget_exhausted: false,
-      failed: 1,
-      hard_failed: if(retryable?, do: 0, else: 1)
-    }
   end
 
-  # A lock wait that ran out (55P03), a deadlock Postgres broke (40P01), a statement the
-  # timeout cancelled (57014), a serialization failure, and a connection that went away. Each
-  # is "the database was busy", which the next tick retries; nothing else is.
-  defp retryable?(%DBConnection.ConnectionError{}), do: true
+  # The prune functions report their own faults (with the count they got to), so this is the
+  # BACKSTOP for anything they did not catch — including an exit, which is how a pool that is
+  # down or wedged fails.
+  defp safely(fun) do
+    fun.()
+  rescue
+    error -> %{deleted: 0, budget_exhausted: false, error: error}
+  catch
+    :exit, reason -> %{deleted: 0, budget_exhausted: false, error: {:exit, reason}}
+  end
 
-  defp retryable?(%Postgrex.Error{postgres: %{code: code}})
+  @doc """
+  The pure decision behind a failed prune: retry it once inside this run, or give up on it.
+
+  A TRANSIENT database fault — a lock wait that ran out (55P03), a deadlock Postgres broke
+  (40P01), a statement the timeout cancelled (57014), a serialization failure, a connection
+  that went away — is retried IMMEDIATELY, once. A genuine blip clears on that retry; a
+  DETERMINISTIC fault (the 15-second timeout a query has outgrown) does not, and after the
+  retry it is treated exactly like a non-transient error: counted, logged, and reported by the
+  job. That bound is the point. Classifying such a fault "transient" for ever meant it retried
+  hourly with the job green and every alert metric at zero.
+
+  Public and PURE because the branch a real lock timeout takes cannot otherwise be exercised:
+  a lock wait needs a second connection, and the SQL sandbox gives a test one per repo. Same
+  reason `Loopctl.Repo.assert_not_nested!/2` is public.
+  """
+  @spec verdict(term(), pos_integer()) :: :retry | :fail
+  def verdict(error, attempt) when is_integer(attempt) and attempt > 0 do
+    if transient?(error) and attempt < @attempts_per_unit, do: :retry, else: :fail
+  end
+
+  defp transient?(%DBConnection.ConnectionError{}), do: true
+  defp transient?({:exit, _reason}), do: true
+
+  defp transient?(%Postgrex.Error{postgres: %{code: code}})
        when code in [
               :lock_not_available,
               :deadlock_detected,
@@ -305,7 +404,23 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorker do
             ],
        do: true
 
-  defp retryable?(_error), do: false
+  defp transient?(_error), do: false
+
+  defp log_retry(table, tenant, error) do
+    Logger.warning(
+      "DeliveryLoopPruneWorker: transient fault, retrying once: table=#{table} " <>
+        "tenant_id=#{tenant.id} error=#{inspect(error)}",
+      tenant_id: tenant.id
+    )
+  end
+
+  defp log_failure(table, tenant, days, error, deleted) do
+    Logger.error(
+      "DeliveryLoopPruneWorker: prune failed: table=#{table} tenant_id=#{tenant.id} " <>
+        "retention_days=#{days} deleted_before_failure=#{deleted} error=#{inspect(error)}",
+      tenant_id: tenant.id
+    )
+  end
 
   # An explicit timestamp, never a whole-day boundary: "older than N days" computed as a date
   # leaves the newest day of rows behind on every run, which reads as the pruner keeping up
@@ -345,15 +460,14 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorker do
     end
   end
 
-  defp empty, do: %{deleted: 0, at_budget: 0, failed: 0, hard_failed: 0}
+  defp empty, do: %{deleted: 0, at_budget: 0, failed: 0}
 
   defp merge(acc, %{deleted: deleted, budget_exhausted: exhausted?} = half) do
     %{
       acc
       | deleted: acc.deleted + deleted,
         at_budget: acc.at_budget + if(exhausted?, do: 1, else: 0),
-        failed: acc.failed + half.failed,
-        hard_failed: acc.hard_failed + half.hard_failed
+        failed: acc.failed + half.failed
     }
   end
 

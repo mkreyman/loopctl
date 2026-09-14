@@ -24,10 +24,17 @@ All notable changes to loopctl are documented here.
   that makes a replay a no-op.
 
   **To drain a backlog faster than the hourly cadence**, enqueue the worker with
-  `%{"batch_size" => n, "budget" => n}`; the cron entry passes no args and uses the defaults.
-  One tenant's failure never stops the others — it is logged with the tenant id, counted on
-  the run's telemetry as `tenants_failed`, and retried on the next tick when it was a
-  transient database fault or reported as a job error when it was not.
+  `%{"batch_size" => n, "budget" => n}` (positive integers; anything else is ignored with a
+  warning). The cron entry passes no args. The override raises the TRACE half only — the
+  delivery half is capped at its own constants, which are sized for the three-connection admin
+  pool it runs on.
+
+  **Alert on `tenants_failed` as well as `tenants_at_budget`** — both are per table on
+  `[:loopctl, :delivery_loop, :prune]`. One tenant's failure never stops the others, but a run
+  where every tenant failed emits the profile of an idle healthy fleet on `tenants_at_budget`
+  alone: nothing deleted, nobody at budget. A fault gets one immediate retry; if it recurs the
+  tenant is counted, logged with its id, and the job reports an error (so Oban retries it and
+  a persistent fault ends as a discarded job rather than a green run).
 
   **Age alone never decides.** A trace event whose dispatch has not been released is kept
   whatever its age — an unreleased slot means the session may still be running — and a

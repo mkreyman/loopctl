@@ -556,7 +556,7 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorkerTest do
           batch_size: -1
         )
 
-      assert %{trace: %{deleted: 0, failed: 1, hard_failed: 1, budget_exhausted: false}} = result
+      assert %{trace: %{deleted: 0, failed: 1, budget_exhausted: false}} = result
 
       # The trace half of this tenant blew up and the trace rows are untouched...
       assert trace_seqs(ctx.tenant_id, ctx.dispatch) == [1]
@@ -564,8 +564,50 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorkerTest do
       # ...and the intake half of the SAME call still ran, which is the property the whole
       # per-unit guard exists for. (Its own delete then failed on the same negative LIMIT, so
       # it is counted too rather than silently passing.)
-      assert %{intake: %{failed: 1, hard_failed: 1}} = result
+      assert %{intake: %{failed: 1}} = result
       assert delivery_ids(source.tenant_id) == ["unaffected"]
+    end
+
+    test "carries the rows the batches BEFORE it already committed", ctx do
+      # Four more events, five in all, and a budget that runs out MID-LOOP: the third batch's
+      # `take` is 0.5, which Postgres refuses. Two batches have committed by then, and their
+      # count is what a run must not throw away — a long run is mostly already-committed
+      # batches, so discarding them reports zero deleted on the run that deleted the most.
+      for seq <- 2..5,
+          do: fixture(:trace_event, %{dispatch: ctx.dispatch, seq: seq, inserted_at: ago(30)})
+
+      assert %{trace: %{deleted: 4, failed: 1}} =
+               DeliveryLoopPruneWorker.prune_tenant(
+                 tenant_struct(ctx.tenant_id),
+                 DateTime.utc_now(),
+                 batch_size: 2,
+                 budget: 4.5
+               )
+
+      # Exactly the four the two committed batches took, and the fifth is still there.
+      assert length(trace_seqs(ctx.tenant_id, ctx.dispatch)) == 1
+    end
+
+    test "carries the delivery rows its committed batches took, too" do
+      {_secret, source} = fixture(:intake_source, %{})
+
+      for n <- 1..5 do
+        fixture(:intake_delivery, %{
+          source: source,
+          github_delivery_id: "h#{n}",
+          inserted_at: ago(200 + n)
+        })
+      end
+
+      assert %{intake: %{deleted: 4, failed: 1}} =
+               DeliveryLoopPruneWorker.prune_tenant(
+                 %Tenant{id: source.tenant_id, settings: %{}},
+                 DateTime.utc_now(),
+                 batch_size: 2,
+                 budget: 4.5
+               )
+
+      assert length(delivery_ids(source.tenant_id)) == 1
     end
 
     test "does not stop the fold, and the run still reports what it managed" do
@@ -587,10 +629,12 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorkerTest do
       ref = :telemetry_test.attach_event_handlers(self(), [[:loopctl, :delivery_loop, :prune]])
       on_exit(fn -> :telemetry.detach(ref) end)
 
-      assert {:error, message} =
-               DeliveryLoopPruneWorker.perform(%Oban.Job{args: %{"batch_size" => -1}})
+      tenants = for s <- [one, two], do: %Tenant{id: s.tenant_id, settings: %{}}
 
-      assert message =~ "non-retryable"
+      assert {:error, message} =
+               DeliveryLoopPruneWorker.run(tenants, DateTime.utc_now(), batch_size: -1)
+
+      assert message =~ "failed after their retry"
 
       assert_receive {[:loopctl, :delivery_loop, :prune], ^ref, intake,
                       %{
@@ -620,11 +664,104 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorkerTest do
           batch_size: -1
         )
 
-      assert %{trace: %{deleted: 1, failed: 0, hard_failed: 0}} =
+      assert %{trace: %{deleted: 1, failed: 0}} =
                DeliveryLoopPruneWorker.prune_tenant(
                  tenant_struct(ctx.tenant_id),
                  DateTime.utc_now()
                )
+    end
+  end
+
+  describe "the operator's job args" do
+    test "a positive integer is taken; anything else is ignored" do
+      assert DeliveryLoopPruneWorker.prune_opts(%{"batch_size" => 10, "budget" => 20}) == [
+               batch_size: 10,
+               budget: 20
+             ]
+
+      # Term order is why each of these matters: `min("1000", 20_000)` is 20_000 and
+      # `0 >= "1"` is false, so an unvalidated value is not refused — it silently becomes the
+      # whole budget, or runs the loop to an ArithmeticError.
+      for bad <- ["1000", nil, 0, -1, 2.5, %{"n" => 5}, [5]] do
+        assert DeliveryLoopPruneWorker.prune_opts(%{"batch_size" => bad, "budget" => bad}) == [],
+               "#{inspect(bad)} must not reach the prune"
+      end
+
+      assert DeliveryLoopPruneWorker.prune_opts(%{}) == []
+      assert DeliveryLoopPruneWorker.prune_opts(%{"other" => 1}) == []
+      assert DeliveryLoopPruneWorker.prune_opts(nil) == []
+    end
+
+    test "the intake ceiling is applied to the override, not merely defaulted from" do
+      assert DeliveryLoopPruneWorker.intake_opts(batch_size: 100_000, budget: 500_000) == [
+               batch_size: Intake.prune_batch_size(),
+               budget: Intake.prune_budget()
+             ]
+
+      # Below the ceiling the operator's smaller value stands — the cap is a ceiling, not an
+      # override — and an option this worker does not know is passed through untouched.
+      assert DeliveryLoopPruneWorker.intake_opts(batch_size: 5, budget: 7, other: :x) == [
+               batch_size: 5,
+               budget: 7,
+               other: :x
+             ]
+    end
+
+    test "a trace-sized drain override does not run unbounded against the admin pool" do
+      # The ceiling is only OBSERVABLE past itself, so this test crosses it: one more delivery
+      # than the intake budget allows. Uncapped, the override's 500,000 takes them all in one
+      # run against the three-connection pool; capped, the run stops at the budget and says so.
+      {_secret, source} = fixture(:intake_source, %{})
+      over = Intake.prune_budget() + 1
+      fixture(:intake_deliveries, %{source: source, count: over, inserted_at: ago(200)})
+
+      assert %{intake: %{deleted: deleted, budget_exhausted: true}} =
+               DeliveryLoopPruneWorker.prune_tenant(
+                 %Tenant{id: source.tenant_id, settings: %{}},
+                 DateTime.utc_now(),
+                 batch_size: 100_000,
+                 budget: 500_000
+               )
+
+      assert deleted == Intake.prune_budget()
+      assert length(delivery_ids(source.tenant_id)) == 1
+    end
+  end
+
+  describe "verdict/2 (the pure retry decision)" do
+    # A real lock wait needs a second connection holding the row, and the SQL sandbox gives a
+    # test one connection per repo — so the branch a transient fault takes is exercised here,
+    # against synthesized errors, rather than by provoking one.
+    @transient [
+      %Postgrex.Error{postgres: %{code: :lock_not_available}},
+      %Postgrex.Error{postgres: %{code: :deadlock_detected}},
+      %Postgrex.Error{postgres: %{code: :query_canceled}},
+      %Postgrex.Error{postgres: %{code: :serialization_failure}},
+      %DBConnection.ConnectionError{message: "pool is down"},
+      {:exit, :killed}
+    ]
+
+    test "a transient fault is retried ONCE, then treated like any other failure" do
+      for error <- @transient do
+        assert DeliveryLoopPruneWorker.verdict(error, 1) == :retry,
+               "#{inspect(error)} should get its one immediate retry"
+
+        # THE bound. Without it a deterministic 15-second timeout is 'transient' for ever:
+        # retried hourly, job green, every alert metric at zero.
+        assert DeliveryLoopPruneWorker.verdict(error, 2) == :fail,
+               "#{inspect(error)} must not be retried a second time"
+      end
+    end
+
+    test "anything else fails on the first attempt, with no retry" do
+      for error <- [
+            %Postgrex.Error{postgres: %{code: :invalid_text_representation}},
+            %ArgumentError{message: "bad"},
+            %RuntimeError{message: "boom"}
+          ] do
+        assert DeliveryLoopPruneWorker.verdict(error, 1) == :fail,
+               "#{inspect(error)} is not transient and must not be retried"
+      end
     end
   end
 

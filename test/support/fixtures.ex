@@ -896,22 +896,13 @@ defmodule Loopctl.Fixtures do
         tenant
       end
 
-    tenant =
-      tenant
-      |> Ecto.Changeset.change(trust_tier: trust_tier)
-      |> AdminRepo.update!()
-
-    # `create_changeset` PUTS `settings: %{}` — the create surface never accepts operator
-    # settings — so a fixture that passes them has to write them afterwards, like the two
-    # fields above. Without this a test asking for a tenant setting silently gets `%{}` and
-    # asserts against the default it was trying to override.
-    case Map.get(data, :settings, %{}) do
-      empty when empty == %{} ->
-        tenant
-
-      settings ->
-        tenant |> Ecto.Changeset.change(settings: settings) |> AdminRepo.update!()
-    end
+    # `:settings` needs nothing here — `Tenant.create_changeset/2` casts it, so
+    # `fixture(:tenant, %{settings: %{...}})` already persists. (`signup_changeset/2` and
+    # `self_signup_changeset/2` are the ones that PUT an empty map; they are a different
+    # surface and not what this fixture calls.)
+    tenant
+    |> Ecto.Changeset.change(trust_tier: trust_tier)
+    |> AdminRepo.update!()
   end
 
   def fixture(:root_authenticator, attrs) do
@@ -2257,6 +2248,39 @@ defmodule Loopctl.Fixtures do
 
     {1, [delivery]} = AdminRepo.insert_all(IntakeDelivery, [row], returning: true)
     delivery
+  end
+
+  # `count` delivery rows of one source in ONE insert, all at the same age. For the retention
+  # tests that have to cross a production BUDGET (2,000): one at a time is 2,000 round trips,
+  # and the budget is exactly what those tests are about.
+  def fixture(:intake_deliveries, attrs) do
+    attrs = Enum.into(attrs, %{})
+    source = Map.fetch!(attrs, :source)
+    count = Map.fetch!(attrs, :count)
+    at = Map.get(attrs, :inserted_at, DateTime.utc_now())
+    prefix = Map.get(attrs, :prefix, "bulk")
+
+    rows =
+      for n <- 1..count do
+        delivery_id = "#{prefix}-#{n}-#{System.unique_integer([:positive])}"
+
+        %{
+          id: Ecto.UUID.generate(),
+          tenant_id: source.tenant_id,
+          source_id: source.id,
+          github_delivery_id: delivery_id,
+          event: "issues",
+          action: "opened",
+          outcome: "recorded",
+          issue_number: n,
+          payload_sha256: :sha256 |> :crypto.hash(delivery_id) |> Base.encode16(case: :lower),
+          inserted_at: at,
+          updated_at: at
+        }
+      end
+
+    {^count, _} = AdminRepo.insert_all(IntakeDelivery, rows)
+    count
   end
 
   # A GitHub intake source (issue #803). Returns `{webhook_secret, source}` so a test can

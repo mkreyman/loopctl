@@ -373,17 +373,24 @@ defmodule Loopctl.Intake do
   oldest first, in batches of `:batch_size` up to `:budget` rows. See "Retention" in the
   moduledoc for what a row is FOR and why the window has a floor.
 
-  Returns `%{deleted: n, budget_exhausted: bool}`. `budget_exhausted` means eligible rows
-  were left; the next run resumes on them, since candidates are ordered by age.
+  Returns `%{deleted: n, budget_exhausted: bool, error: nil | term()}`, with the same contract
+  `Loopctl.Runners.DispatchLedger.prune_trace_events/3` documents: `budget_exhausted` is
+  PROBED rather than inferred, and a fault comes back in `:error` alongside the count of
+  everything the earlier batches committed rather than being raised.
 
   Each batch is its own transaction under its own `statement_timeout` and `lock_timeout`, so
   no transaction is held across a large delete and an interrupted run keeps every committed
   batch. Candidates are taken `FOR UPDATE SKIP LOCKED`: two overlapping runs prune disjoint
   sets rather than queueing, and a row a webhook is inserting is never in the set anyway
   (it is newer than any cutoff).
+
+  `opts` (`:batch_size`, `:budget`) are an INTERNAL contract and are not validated here —
+  `Loopctl.Workers.DeliveryLoopPruneWorker` validates everything an operator can supply, and
+  additionally caps both at this module's own constants, which are sized for `AdminRepo`'s
+  three connections.
   """
   @spec prune_deliveries(Ecto.UUID.t(), DateTime.t(), keyword()) ::
-          %{deleted: non_neg_integer(), budget_exhausted: boolean()}
+          %{deleted: non_neg_integer(), budget_exhausted: boolean(), error: nil | term()}
   def prune_deliveries(tenant_id, %DateTime{} = cutoff, opts \\ []) when is_binary(tenant_id) do
     batch_size = Keyword.get(opts, :batch_size, @prune_batch_size)
     budget = Keyword.get(opts, :budget, @prune_budget)
@@ -396,37 +403,54 @@ defmodule Loopctl.Intake do
   # It PROBES rather than assuming — a tenant with exactly `budget` eligible rows has none
   # left, and reporting that as "budget reached, rows left" is a false positive on the very
   # signal an operator alerts on.
-  defp prune_deliveries_loop(tenant_id, cutoff, _batch, budget, deleted) when deleted >= budget,
-    do: %{deleted: deleted, budget_exhausted: more_deliveries?(tenant_id, cutoff)}
+  # The probe reads WITHOUT the row lock: it decides a report, so it must not take locks a
+  # concurrent run would then skip, and `SKIP LOCKED` would make the answer depend on what
+  # another run happens to hold.
+  defp prune_deliveries_loop(tenant_id, cutoff, _batch, budget, deleted) when deleted >= budget do
+    case attempt(fn ->
+           tenant_id
+           |> prunable_deliveries(cutoff, 1)
+           |> exclude(:lock)
+           |> AdminRepo.exists?()
+         end) do
+      # A probe that could not run cannot say the backlog is empty, so it says it is not.
+      {:ok, more?} -> %{deleted: deleted, budget_exhausted: more?, error: nil}
+      {:error, error} -> %{deleted: deleted, budget_exhausted: true, error: error}
+    end
+  end
 
   defp prune_deliveries_loop(tenant_id, cutoff, batch_size, budget, deleted) do
     take = min(batch_size, budget - deleted)
 
-    count =
-      bounded(fn ->
+    batch =
+      attempt(fn ->
         delete_deliveries(
           tenant_id,
           AdminRepo.all(prunable_deliveries(tenant_id, cutoff, take))
         )
       end)
 
-    if count == 0 do
-      %{deleted: deleted, budget_exhausted: false}
-    else
-      prune_deliveries_loop(tenant_id, cutoff, batch_size, budget, deleted + count)
+    case batch do
+      {:ok, 0} ->
+        %{deleted: deleted, budget_exhausted: false, error: nil}
+
+      {:ok, count} ->
+        prune_deliveries_loop(tenant_id, cutoff, batch_size, budget, deleted + count)
+
+      {:error, error} ->
+        %{deleted: deleted, budget_exhausted: false, error: error}
     end
   end
 
-  # Is anything still eligible? Read WITHOUT the row lock: this decides a report, so it must
-  # not take locks a concurrent run would then skip, and `SKIP LOCKED` would make the answer
-  # depend on what another run happens to hold.
-  defp more_deliveries?(tenant_id, cutoff) do
-    bounded(fn ->
-      tenant_id
-      |> prunable_deliveries(cutoff, 1)
-      |> exclude(:lock)
-      |> AdminRepo.exists?()
-    end)
+  # One batch, or the probe, RETURNING its fault instead of raising it — see
+  # `Loopctl.Runners.DispatchLedger.prune_trace_events/3`: raising discards the count of every
+  # batch already committed, which is most of a long run.
+  defp attempt(fun) do
+    {:ok, bounded(fun)}
+  rescue
+    error -> {:error, error}
+  catch
+    :exit, reason -> {:error, {:exit, reason}}
   end
 
   # One batch, or the probe: its own transaction under its own bounded timeouts, scoped by
