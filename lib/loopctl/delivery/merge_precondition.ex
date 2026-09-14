@@ -452,7 +452,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
   defp gated(verdict, facts, pr, carried) do
     own = hard_bound_reasons(Map.get(pr, :diffstat)) ++ open_reasons(pr) ++ carried
 
-    case gate_b(facts, pr) do
+    case gate_b_verdict(facts, pr) do
       {:ok, gate_b} ->
         proof = proof(gate_b, Map.get(facts, :effect_proof))
         verdict = %{verdict | gate_b: gate_b, proof: proof}
@@ -552,12 +552,18 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
   defp proof(_gate_b, _effect_proof), do: nil
 
-  # The design's ceiling, applied to the FORGE's own diffstat and independent of the
-  # configured limits Gate B already applied. `max(count, listed)` is Gate B's business;
-  # here the authoritative totals are what a merge is bounded by, so a file list the forge
-  # truncated cannot shrink the bound that judges the change.
-  defp hard_bound_reasons(%{files: files, changed_lines: lines})
-       when is_integer(files) and is_integer(lines) do
+  @doc """
+  The design's ceiling, applied to the FORGE's own diffstat and independent of the
+  configured limits Gate B already applied. `max(count, listed)` is Gate B's business;
+  here the authoritative totals are what a merge is bounded by, so a file list the forge
+  truncated cannot shrink the bound that judges the change.
+
+  Public for the same reason as `gate_b_verdict/2`: the measurement harness applies the
+  ceiling the merge applies, not a copy of the two numbers.
+  """
+  @spec hard_bound_reasons(term()) :: [term()]
+  def hard_bound_reasons(%{files: files, changed_lines: lines})
+      when is_integer(files) and is_integer(lines) do
     files_reason =
       if files > @hard_max_files,
         do: [{:hard_bound_files_exceeded, files, @hard_max_files}],
@@ -571,7 +577,7 @@ defmodule Loopctl.Delivery.MergePrecondition do
     files_reason ++ lines_reason
   end
 
-  defp hard_bound_reasons(diffstat), do: [{:invalid_diffstat, shape(diffstat)}]
+  def hard_bound_reasons(diffstat), do: [{:invalid_diffstat, shape(diffstat)}]
 
   defp custody_reasons(:ok), do: []
   defp custody_reasons({:error, reason}), do: [{:custody, reason}]
@@ -588,10 +594,27 @@ defmodule Loopctl.Delivery.MergePrecondition do
     {:base_files, :base_files_unavailable}
   ]
 
-  # BOTH file lists, and both failures if both are broken: the stale-trigger guard is only
-  # meaningful when it has seen both refs, so a caller told about one unreadable ref would
-  # fix it and be told about the other on a story it can no longer re-run the gate for.
-  defp gate_b(facts, pr) do
+  @doc """
+  Gate B at BOTH refs, OR-ed. Pure, and public so the offline measurement harness
+  (`Loopctl.DeliveryGates.Measurement.GateBReplay`, issue #828) replays the run that gates
+  rather than a second implementation of it.
+
+  `facts` supplies `:repo`, `:triggers`, `:head_files` and `:base_files` (each an
+  `{:ok, value}` or an `{:error, reason}`); `pr` supplies `:diffstat` and `:diff`.
+
+  **`:diff` is a `Loopctl.DeliveryGates.DiffNames.parse/1` RESULT — `{:ok, %{files: _, renames:
+  _}}` or `{:error, reason}` — never the raw bytes.** That is the shape
+  `Loopctl.Delivery.GitHubPullRequestSource` puts on a pull request, and it is what lets a diff
+  that did not parse arrive as the unreadable-diff marker instead of as an argument error.
+  Passing the bytes is silently WRONG rather than loud: `merge_input/2` turns them into
+  `{:not_a_parse, _}` and every change comes back `:human`, which reads as a gate doing its job.
+
+  BOTH file lists, and both failures if both are broken: the stale-trigger guard is only
+  meaningful when it has seen both refs, so a caller told about one unreadable ref would
+  fix it and be told about the other on a story it can no longer re-run the gate for.
+  """
+  @spec gate_b_verdict(map(), map()) :: {:ok, GateB.Result.t()} | {:refuse, [term()]}
+  def gate_b_verdict(facts, pr) do
     case for({key, kind} <- @ref_facts, r = error_reason(facts, key), do: {kind, r}) do
       [] ->
         triggers = Map.get(facts, :triggers)
