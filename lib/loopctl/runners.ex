@@ -96,6 +96,7 @@ defmodule Loopctl.Runners do
 
   alias Ecto.Multi
   alias Loopctl.AdminRepo
+  alias Loopctl.Agents.Agent
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.AuditChain
   alias Loopctl.AuditChain.Entry, as: AuditEntry
@@ -143,9 +144,15 @@ defmodule Loopctl.Runners do
   def pool(tenant_id) when is_binary(tenant_id), do: Presence.list(pool_topic(tenant_id))
 
   @doc """
-  Enrolls a machine as a runner: mints its `:agent` API key and binds it to `name` in
-  one transaction, and records the enrollment on the audit chain. `max_sessions` (1..64,
-  default `Runner.default_max_sessions/0`) is how many slots loopctl will reserve on it.
+  Enrolls a machine as a runner: mints its `:agent` API key, gets or creates the
+  `runner:<name>` agent its sessions work as, and binds both to `name` in one transaction,
+  then records the enrollment on the audit chain. `max_sessions` (1..64, default
+  `Runner.default_max_sessions/0`) is how many slots loopctl will reserve on it.
+
+  The agent is GOT or created, never created blindly: `runners_active_name_uidx` is partial on
+  `revoked_at IS NULL`, so re-enrolling a revoked machine makes a second runner row for the
+  same machine, and both rows must name the one agent — the work is the same machine's either
+  way. An agent the tenant already named `runner:<name>` is adopted for the same reason.
 
   Returns `{:ok, %{runner: runner, raw_key: raw_key}}`. The raw key is returned once
   and never stored.
@@ -182,9 +189,11 @@ defmodule Loopctl.Runners do
       |> Multi.run(:mint_key, fn _repo, _ ->
         Auth.generate_api_key(%{tenant_id: tenant_id, name: "runner:" <> name, role: :agent})
       end)
-      |> Multi.run(:runner, fn _repo, %{mint_key: {_raw, api_key}} ->
+      |> Multi.run(:agent, fn _repo, _ -> runner_agent(tenant_id, name) end)
+      |> Multi.run(:runner, fn _repo, %{mint_key: {_raw, api_key}, agent: agent} ->
         changeset
         |> Ecto.Changeset.put_change(:api_key_id, api_key.id)
+        |> Ecto.Changeset.put_change(:agent_id, agent.id)
         |> AdminRepo.insert()
       end)
       |> Multi.run(:audit, fn _repo, %{runner: runner, mint_key: {_raw, api_key}} ->
@@ -196,6 +205,7 @@ defmodule Loopctl.Runners do
           payload: %{
             "name" => runner.name,
             "api_key_id" => api_key.id,
+            "agent_id" => runner.agent_id,
             "max_sessions" => runner.max_sessions
           }
         })
@@ -207,6 +217,98 @@ defmodule Loopctl.Runners do
 
       {:error, _step, reason, _} ->
         {:error, reason}
+    end
+  end
+
+  @doc """
+  The name of the agent a runner's sessions work as: `runner:<machine name>`.
+
+  THE one declaration on the Elixir side. `20260920100000_add_agent_id_to_runners.exs`
+  restates it as SQL because a migration cannot call this, and nothing binds the two — see
+  that migration's note.
+  """
+  @spec agent_name(String.t()) :: String.t()
+  def agent_name(name) when is_binary(name), do: "runner:" <> name
+
+  # The agent this machine's sessions work as, in the enrollment transaction.
+  #
+  # REUSE IS DECIDED BY A PREVIOUS RUNNER ROW, NEVER BY THE NAME ALONE. The obvious shape —
+  # insert `ON CONFLICT DO NOTHING`, then read back by name — adopts whatever agent happens to
+  # carry that name, and `AgentController`'s `:register` is `exact_role: :agent`, so ANY
+  # agent-role key in the tenant can create `runner:minis` before the machine is ever enrolled.
+  # No privilege is gained by that (the squatter cannot make the runner do anything), but
+  # enrollment would stop owning what a runner's work is attributed to, and a story claimed for
+  # this machine would name a row someone else made.
+  #
+  # So: the only agent adopted is one a PREVIOUS runner row of this tenant and machine name
+  # already points at, which is exactly the re-enrollment case the partial active-name index
+  # creates (a revoked machine re-enrolled keeps its identity, because it is the same machine).
+  # Otherwise a fresh agent is created, and a name already taken by someone else gets a
+  # disambiguating suffix rather than failing the enrollment — a squatter must not be able to
+  # stop a machine being enrolled either.
+  defp runner_agent(tenant_id, name) do
+    case previous_runner_agent(tenant_id, name) do
+      %Agent{} = agent -> {:ok, agent}
+      nil -> create_runner_agent(tenant_id, name)
+    end
+  end
+
+  defp previous_runner_agent(tenant_id, name) do
+    AdminRepo.one(
+      from r in Runner,
+        join: a in Agent,
+        on: a.id == r.agent_id and a.tenant_id == r.tenant_id,
+        where: r.tenant_id == ^tenant_id and r.name == ^name and not is_nil(r.agent_id),
+        order_by: [desc: r.inserted_at],
+        limit: 1,
+        select: a
+    )
+  end
+
+  # `ON CONFLICT DO NOTHING` + `returning` tells insert from conflict without a second read:
+  # an empty return means the preferred name is taken by an agent no runner of this name owns.
+  # Two concurrent enrollments of one machine both land here (the partial index does not stop a
+  # revoked name being re-enrolled twice), and the loser takes the suffixed path rather than
+  # failing — they are separate runner rows, so separate agents is a true statement about them.
+  defp create_runner_agent(tenant_id, name) do
+    case insert_agent(tenant_id, agent_name(name)) do
+      {:ok, agent} -> {:ok, agent}
+      :taken -> insert_suffixed_agent(tenant_id, name)
+    end
+  end
+
+  defp insert_suffixed_agent(tenant_id, name) do
+    case insert_agent(tenant_id, agent_name(name) <> "-" <> Ecto.UUID.generate()) do
+      {:ok, agent} -> {:ok, agent}
+      :taken -> {:error, :agent_not_resolved}
+    end
+  end
+
+  defp insert_agent(tenant_id, agent_name) do
+    now = DateTime.utc_now()
+
+    AdminRepo.insert_all(
+      Agent,
+      [
+        %{
+          id: Ecto.UUID.generate(),
+          tenant_id: tenant_id,
+          name: agent_name,
+          agent_type: :implementer,
+          status: :active,
+          last_seen_at: now,
+          metadata: %{},
+          inserted_at: now,
+          updated_at: now
+        }
+      ],
+      on_conflict: :nothing,
+      conflict_target: [:tenant_id, :name],
+      returning: [:id]
+    )
+    |> case do
+      {1, [%Agent{id: id}]} -> {:ok, AdminRepo.get!(Agent, id)}
+      _conflicted -> :taken
     end
   end
 

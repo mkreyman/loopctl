@@ -185,6 +185,26 @@ defmodule Loopctl.Tenants.TierCapabilities do
     coordination_quarantine: ["LoopctlWeb.ChannelPostController"]
   }
 
+  # The OTHER half of the boundary, and the reason it exists (#803): a human-anchored surface
+  # reachable WITHOUT a controller. `Loopctl.Delivery.Placement.place/4` mints a custody
+  # dispatch and drives the chained `queued -> claimed` transition, and an Oban worker or an
+  # MCP tool calls it directly — there is no `conn` for `RequireHumanAnchor` to run on, so it
+  # calls `Loopctl.Tenants.require_human_anchor/1` itself.
+  #
+  # `@gated_controllers` above is scanned against `lib/loopctl_web/**`, which by construction
+  # CANNOT see a context-layer gate; a context that enforced the tier and appeared nowhere
+  # would advertise a surface as gated with nothing binding the claim, and one that FORGOT to
+  # enforce it would leave the advertised map lying in the dangerous direction. So this map is
+  # scanned the same way against `lib/loopctl/**`, in both directions, by
+  # `test/loopctl/tenants/tier_capabilities_test.exs`.
+  #
+  # Placement is filed under `chain_of_custody` rather than `dispatch` because the claim is
+  # what it is for — the mint is how it gets a lineage to claim under. Modules are STRINGS for
+  # symmetry with the controller map, though these carry no cross-layer dependency.
+  @gated_contexts %{
+    chain_of_custody: ["Loopctl.Delivery.Placement"]
+  }
+
   @learn_more "https://loopctl.com/wiki/chain-of-custody"
 
   # The upgrade is an IN-PLACE tier flip on the tenant you already own, not a new
@@ -380,4 +400,16 @@ defmodule Loopctl.Tenants.TierCapabilities do
   """
   @spec gated_controllers() :: %{surface() => [String.t()]}
   def gated_controllers, do: @gated_controllers
+
+  @doc """
+  Per-`:human_anchored`-surface list of the CONTEXT module names (as strings) that enforce the
+  tier themselves by calling `Loopctl.Tenants.require_human_anchor/1`, because they are
+  reachable without a controller.
+
+  The companion to `gated_controllers/0`, guarded the same way and for the stronger reason: a
+  controller scan cannot see a context-layer gate at all, so without this map a human-anchored
+  surface could move below the web layer and take its whole binding with it.
+  """
+  @spec gated_contexts() :: %{surface() => [String.t()]}
+  def gated_contexts, do: @gated_contexts
 end

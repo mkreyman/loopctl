@@ -1345,6 +1345,95 @@ defmodule Loopctl.Progress do
   def claim_release_change(%Story{claim_epoch: epoch}),
     do: %{claimed_until: nil, claim_epoch: epoch + 1, review_requested_at: nil}
 
+  @doc """
+  Clears a story's `implementer_dispatch_id` when the dispatch it names NEVER IMPLEMENTED
+  ANYTHING — the placement compensation path (`Loopctl.Delivery.Placement`, #803) and nothing
+  else.
+
+  `release_claim_changes/1` deliberately does not clear it: an unclaimed or reclaimed story
+  keeps the provenance of who was working on it, which is what the L4 gates compare. The one
+  case where that provenance is VACUOUS is a placement that claimed a story, failed before any
+  session started, and released it again — the recorded dispatch did nothing.
+
+  ## What a stale id actually costs, corrected (#833 round 3)
+
+  This docstring used to say that a REVOKED recorded dispatch resolves to an empty lineage and
+  is therefore worse than an unrevoked one. **That is false and nothing in the code ever did
+  it.** `lineage_status/2` resolves through `get_dispatch_lineage/2` -> `Dispatches.get_dispatch/2`,
+  a plain `get_by` with NO `revoked_at` filter, and `Dispatches.revoke/2` stamps `revoked_at`
+  and leaves `lineage_path` intact — so a revoked dispatch resolves exactly like a live one.
+  `:unresolvable` comes only from a MISSING or FOREIGN row. The confusion was with
+  `Dispatches.lineage_for_api_key/2`, which DOES exclude revoked dispatches, but that is the
+  CALLER side, not the story side.
+
+  So revocation changes nothing here, and the real cost of a stale id is the same either way:
+  the next claimant is judged against a dispatch that did nothing. An UNLINEAGED claimant (a
+  legacy bearer key, a runner's own enrollment key) is refused `caller_lineage_required`; one
+  whose lineage happens to share a chain with the stale dispatch is refused
+  `self_report_blocked`. Both are a story nobody can report.
+
+  Anything that later relies on "revoking a dispatch neutralises the custody claim on a story"
+  is wrong, and this paragraph is here because two of us asserted it to each other and neither
+  checked.
+
+  ## The WHERE is the dispatch id and the tenant, and that is ALL it needs
+
+  There was an `agent_status == :pending` condition here, to leave a story somebody re-claimed
+  between the release and this call alone. It was wrong, and the case it was protecting does
+  not exist: a re-claim THROUGH A DISPATCH overwrites `implementer_dispatch_id`, so the id
+  predicate already declines those; a re-claim with a LEGACY BEARER key writes no dispatch id
+  at all, so the story keeps THIS one — and there the stale id is just as poisonous for the new
+  claimant, who is exactly the unlineaged caller the gate refuses. Clearing is right in every
+  case the id predicate admits.
+
+  Dropping it also removed a dependency on the release having SUCCEEDED, which was a live bug:
+  `release_claim/4` swallows every failure, so the story could still be `:assigned` when this
+  ran, the condition missed, and the stale id survived the lease — which
+  `release_claim_changes/1` never clears either.
+
+  The id predicate stays load-bearing and may not be relaxed: it is what stops this erasing a
+  DIFFERENT implementer's provenance.
+  """
+  @spec clear_unused_implementer_dispatch(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, :cleared | :unchanged}
+  def clear_unused_implementer_dispatch(tenant_id, story_id, dispatch_id)
+      when is_binary(tenant_id) and is_binary(story_id) and is_binary(dispatch_id) do
+    {count, _} =
+      from(s in Story,
+        where: s.tenant_id == ^tenant_id and s.id == ^story_id,
+        where: s.implementer_dispatch_id == ^dispatch_id
+      )
+      |> AdminRepo.update_all(set: [implementer_dispatch_id: nil])
+
+    if count == 1 do
+      audit_dispatch_cleared(tenant_id, story_id, dispatch_id)
+      {:ok, :cleared}
+    else
+      {:ok, :unchanged}
+    end
+  end
+
+  # `update_all` bypasses changesets, so nothing would otherwise record that the story STOPPED
+  # naming this dispatch — while the hash chain still carries `dispatch_created` and
+  # `story_stage_claimed` naming it. An operator reading the chain alone would conclude the
+  # story is still attributed to a dispatch it no longer names.
+  #
+  # The audit LOG rather than the chain: the chain is for custody-critical TRANSITIONS
+  # (`StageMachine.chained?/3`) and appending needs a `Repo` transaction plus a resolved actor
+  # lineage, neither of which a compensation step has. This is the tier `force_unclaim_story/3`
+  # writes its own release to, and it is enough to answer "where did the provenance go".
+  defp audit_dispatch_cleared(tenant_id, story_id, dispatch_id) do
+    Audit.create_log_entry(tenant_id, %{
+      entity_type: "story",
+      entity_id: story_id,
+      action: "implementer_dispatch_cleared",
+      actor_type: "system",
+      actor_label: "placement:compensation",
+      old_state: %{"implementer_dispatch_id" => dispatch_id},
+      new_state: %{"implementer_dispatch_id" => nil}
+    })
+  end
+
   # The one release shape shared by unclaim, force-unclaim and the lease reclaimer.
   defp release_claim_changes(story) do
     Map.merge(

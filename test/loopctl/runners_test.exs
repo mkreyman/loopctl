@@ -4,6 +4,7 @@ defmodule Loopctl.RunnersTest do
   import Ecto.Query
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Agents.Agent
   alias Loopctl.AuditChain.Entry
   alias Loopctl.Auth
   alias Loopctl.Runners
@@ -34,6 +35,53 @@ defmodule Loopctl.RunnersTest do
                    e.tenant_id == ^tenant.id and e.action == "runner_enrolled" and
                      e.entity_id == ^runner.id
              )
+    end
+
+    test "binds the machine to a `runner:<name>` agent, and re-enrollment reuses it" do
+      tenant = fixture(:tenant)
+
+      assert {:ok, %{runner: runner}} = Runners.enroll_runner(tenant.id, %{name: "minis"})
+
+      agent = AdminRepo.get!(Agent, runner.agent_id)
+      assert agent.tenant_id == tenant.id
+      # The LITERAL, not `Runners.agent_name("minis")`: comparing the name against the
+      # function that produced it is a tautology no change to that function can fail, and
+      # `bin/mutate.sh` said so — rewriting the prefix came back inert against this test.
+      assert agent.name == "runner:minis"
+      assert Runners.agent_name("minis") == "runner:minis"
+      assert agent.agent_type == :implementer
+
+      # `Loopctl.Delivery.Placement` claims the story for THIS agent, and a claimed story with
+      # an implementer dispatch and no `assigned_agent_id` violates
+      # `stories_reported_done_requires_agent` — so the binding is what makes the whole
+      # dispatch path reachable, not attribution polish.
+      assert AdminRepo.get!(Runner, runner.id).agent_id == agent.id
+
+      # The active-name index is partial on `revoked_at IS NULL`, so the same machine can be
+      # enrolled again — and it is the same machine, so it keeps the one agent.
+      {:ok, _revoked} = Runners.revoke_runner(tenant.id, runner.id)
+      assert {:ok, %{runner: again}} = Runners.enroll_runner(tenant.id, %{name: "minis"})
+      assert again.agent_id == agent.id
+    end
+
+    test "does not adopt an agent somebody else named `runner:<name>` first" do
+      tenant = fixture(:tenant)
+
+      # `AgentController`'s :register is `exact_role: :agent`, so ANY agent-role key in the
+      # tenant can create this row before the machine is ever enrolled. Adopting it would hand
+      # a squatter the identity a runner's work is attributed to — `Loopctl.Delivery.Placement`
+      # claims stories for `runners.agent_id`.
+      squatter =
+        %Agent{tenant_id: tenant.id}
+        |> Agent.register_changeset(%{name: "runner:minis", agent_type: :implementer})
+        |> AdminRepo.insert!()
+
+      assert {:ok, %{runner: runner}} = Runners.enroll_runner(tenant.id, %{name: "minis"})
+
+      refute runner.agent_id == squatter.id
+      # And enrollment still SUCCEEDS: a squatter must not be able to stop a machine joining
+      # either, so the fresh agent takes a disambiguating name rather than failing the insert.
+      assert AdminRepo.get!(Agent, runner.agent_id).name =~ ~r/^runner:minis-/
     end
 
     test "enrolls with max_sessions, defaulting to two, and refuses one out of range" do

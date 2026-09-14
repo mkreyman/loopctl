@@ -20,6 +20,7 @@ defmodule Loopctl.Tenants.TierCapabilitiesTest do
 
   setup :verify_on_exit!
 
+  alias Loopctl.SourceScan
   alias Loopctl.Tenants.TierCapabilities
 
   describe "for_tier/1 — agent_rooted" do
@@ -312,6 +313,41 @@ defmodule Loopctl.Tenants.TierCapabilitiesTest do
       end
     end
 
+    # THE SCAN ABOVE CANNOT SEE A CONTEXT-LAYER GATE, and #803 made that a real hole rather
+    # than a theoretical one: `Loopctl.Delivery.Placement.place/4` mints a custody dispatch and
+    # drives a chained custody transition with no `conn` for a plug to run on. A human-anchored
+    # surface that moves below the web layer would otherwise take its whole binding with it.
+    test "every context enforcing the tier itself is claimed by exactly one human_anchored surface" do
+      claimed = TierCapabilities.gated_contexts() |> Map.values() |> List.flatten()
+
+      assert claimed == Enum.uniq(claimed),
+             "a context is claimed by more than one surface: " <>
+               inspect(claimed -- Enum.uniq(claimed))
+
+      assert Enum.sort(claimed) == Enum.sort(anchor_enforcing_contexts()),
+             """
+             TierCapabilities.gated_contexts/0 has drifted from the modules that actually
+             call Loopctl.Tenants.require_human_anchor/1.
+
+             Enforces the gate but unclaimed: #{inspect(anchor_enforcing_contexts() -- claimed)}
+             Claimed but does not enforce it: #{inspect(claimed -- anchor_enforcing_contexts())}
+
+             A context on the second list is the dangerous one: the map says a surface is
+             gated and nothing gates it. Fix lib/loopctl/tenants/tier_capabilities.ex — do
+             NOT relax this test.
+             """
+    end
+
+    test "every surface naming a gated context is itself human_anchored" do
+      blocked = TierCapabilities.for_tier(:agent_rooted).blocked
+
+      for surface <- Map.keys(TierCapabilities.gated_contexts()) do
+        assert surface in blocked,
+               "surface #{inspect(surface)} covers a context that enforces the human anchor " <>
+                 "but is advertised as allowed to an agent_rooted tenant"
+      end
+    end
+
     test "the advertised-allowed kb-scope actions are NOT inside a RequireHumanAnchor mount" do
       # The controller-level guard above is controller-granular while the gate is
       # ACTION-granular: ProjectController hosts a blocked surface
@@ -354,6 +390,24 @@ defmodule Loopctl.Tenants.TierCapabilitiesTest do
 
   defp mounts_human_anchor?(source) do
     String.match?(source, ~r/^\s*plug[\s(]+(LoopctlWeb\.Plugs\.)?RequireHumanAnchor\b/m)
+  end
+
+  # The context half, and it PARSES rather than greps (#833 round 3). The first version matched
+  # raw source text, so a `#` comment naming the function counted as enforcement — the same
+  # defect the sibling halt guard had, in the direction both of their failure messages call the
+  # dangerous one. `Loopctl.SourceScan` walks the AST, and a comment cannot produce a call node.
+  #
+  # Scanned under `lib/loopctl/**` and never `lib/loopctl_web/**` — the plug is the web layer's
+  # job. `Loopctl.Tenants` DEFINES the function; its own file contains no call, so nothing needs
+  # excluding, and an exclusion would stand ready to hide a real context-layer gate added there.
+  #
+  # Limits, the same as the halt guard's: it matches the module's last alias segment, so a
+  # RENAMED alias, a macro-built call and `apply/3` are invisible, and it cannot tell an
+  # enforced refusal from a discarded result.
+  @context_scan_glob "lib/loopctl/**/*.ex"
+
+  defp anchor_enforcing_contexts do
+    SourceScan.callers(@context_scan_glob, :Tenants, :require_human_anchor)
   end
 
   # The actions a `plug ... RequireHumanAnchor ... when action in [...]` mount

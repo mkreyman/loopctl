@@ -40,7 +40,7 @@ defmodule LoopctlWeb.RunnerUnsupportedKindsTest do
   defp operator_ctx do
     tenant = fixture(:committed_tenant, %{trust_tier: :human_anchored})
     {_raw, runner} = fixture(:committed_runner, %{name: "minis", tenant_id: tenant.id})
-    raw_key = fixture(:committed_operator_key, %{tenant_id: tenant.id})
+    {raw_key, _api_key} = fixture(:committed_operator_key, %{tenant_id: tenant.id})
     %{tenant: tenant, runner: runner, operator_key: raw_key}
   end
 
@@ -124,7 +124,7 @@ defmodule LoopctlWeb.RunnerUnsupportedKindsTest do
 
     other = fixture(:committed_tenant, %{trust_tier: :human_anchored})
     {_raw, theirs} = fixture(:committed_runner, %{name: "blockit", tenant_id: other.id})
-    other_key = fixture(:committed_operator_key, %{tenant_id: other.id})
+    {other_key, _other_api_key} = fixture(:committed_operator_key, %{tenant_id: other.id})
 
     assert [listed] =
              conn
