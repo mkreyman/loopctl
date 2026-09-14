@@ -275,6 +275,30 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDrift do
   end
 
   @doc """
+  The environment overrides that must be cleared before spawning git.
+
+  Every one of these redirects repository discovery, and git EXPORTS them to hooks — so a `git`
+  spawned from anything running under `mix precommit` inherits the repository being committed
+  to, whatever `-C` says. Public so a test's own git calls clear exactly the same set: two lists
+  would be one list and one bug.
+  """
+  @spec git_env() :: [{String.t(), nil}]
+  def git_env do
+    for name <- ~w(
+          GIT_DIR
+          GIT_WORK_TREE
+          GIT_COMMON_DIR
+          GIT_INDEX_FILE
+          GIT_OBJECT_DIRECTORY
+          GIT_ALTERNATE_OBJECT_DIRECTORIES
+          GIT_NAMESPACE
+          GIT_PREFIX
+          GIT_CEILING_DIRECTORIES
+        ),
+        do: {name, nil}
+  end
+
+  @doc """
   The checksum `Loopctl.DeliveryGates.Triggers.parse/2` is verified against.
 
   An operator's PIN wins over the document's own hash, and is returned even when it does not
@@ -331,8 +355,15 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDrift do
   # verbatim as the head sha, and one ahead of `ls-tree -z` carries no NUL, so it is glued onto
   # the first path and that path silently stops matching any pattern. It goes to this process's
   # stderr instead, where an operator reads it and the parser never sees it.
+  #
+  # And the environment is SCRUBBED. git hooks export `GIT_DIR`, and `mix precommit` runs the
+  # suite from inside one, so anything git this process spawns inherits it — `-C` changes
+  # directory while `GIT_DIR` overrides discovery, so `git -C /some/other/repo ls-tree` reads
+  # the repository the hook is committing to and this task certifies drift against a tree it
+  # never looked at. Measured, not theorised: a test fixture doing exactly this committed to
+  # loopctl's own branch. `--repo` must mean `--repo`.
   defp git!(repo, args) do
-    case System.cmd("git", ["-C", repo | args], stderr_to_stdout: false) do
+    case System.cmd("git", ["-C", repo | args], stderr_to_stdout: false, env: git_env()) do
       {output, 0} ->
         output
 

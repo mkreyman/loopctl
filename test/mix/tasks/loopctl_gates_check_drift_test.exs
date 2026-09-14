@@ -297,9 +297,11 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDriftTest do
 
       capture_io(fn -> CheckDrift.run(argv(repo, triggers, out: out)) end)
 
-      {head, 0} = System.cmd("git", ["-C", repo, "rev-parse", "HEAD"])
+      # Through git!/2, never a bare System.cmd: an unscrubbed call here read the REAL
+      # repository's HEAD under the hook's GIT_DIR and failed this assertion against it.
+      head = repo |> git!(["rev-parse", "HEAD"]) |> String.trim()
 
-      assert read_json(out)["meta"]["head"] == String.trim(head)
+      assert read_json(out)["meta"]["head"] == head
     end
   end
 
@@ -432,6 +434,54 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDriftTest do
     end
   end
 
+  describe "--repo means --repo, whatever the environment says" do
+    test "git_env/0 clears every override that redirects repository discovery" do
+      cleared = Map.new(CheckDrift.git_env())
+
+      # Named literally. Each of these makes git ignore where it was pointed, and git EXPORTS
+      # them to hooks.
+      for name <- ~w(GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY
+                     GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX
+                     GIT_CEILING_DIRECTORIES) do
+        assert Map.fetch(cleared, name) == {:ok, nil},
+               "#{name} is not cleared before spawning git"
+      end
+    end
+
+    @tag :tmp_dir
+    test "an inherited GIT_DIR does not redirect the read to another repository" do
+      # This is not hypothetical. git hooks EXPORT GIT_DIR, `mix precommit` runs the suite from
+      # inside one, and before the scrub this file's own fixture helper staged a one-byte
+      # config/runtime.exs into loopctl's real index and committed it to the branch — because
+      # `-C` changes directory while GIT_DIR overrides discovery. The failure mode for the TASK
+      # is quieter and worse: it reads a tree it was not pointed at and certifies no drift.
+      #
+      # Run in a SUBPROCESS with the poisoned environment rather than System.put_env, which
+      # would leak GIT_DIR to every other test in this async run.
+      repo = fixture_repo([{"lib/app/claims.ex", "x"}, {"config/runtime.exs", "y"}])
+      other = fixture_repo([{"README.md", "unrelated"}])
+      triggers = trigger_file(repo, ["lib/app/**"], ["config/runtime.exs"])
+      out = tmp_path("out.json")
+
+      {output, status} =
+        System.cmd(
+          "mix",
+          ["loopctl.gates.check_drift"] ++ argv(repo, triggers, out: out),
+          env: [{"GIT_DIR", Path.join(other, ".git")}, {"MIX_ENV", "test"}],
+          stderr_to_stdout: true,
+          cd: File.cwd!()
+        )
+
+      assert status == 0, output
+
+      assert read_json(out)["meta"]["head"] ==
+               repo |> git!(["rev-parse", "HEAD"]) |> String.trim()
+
+      refute read_json(out)["meta"]["head"] ==
+               other |> git!(["rev-parse", "HEAD"]) |> String.trim()
+    end
+  end
+
   # -- fixtures ------------------------------------------------------------------------------
 
   defp argv(repo, triggers, opts) do
@@ -530,8 +580,15 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDriftTest do
     dir
   end
 
+  # The SAME scrub the task applies, from the same list. Without it this helper committed to
+  # loopctl's own branch: `mix precommit` runs the suite from inside a git hook, the hook exports
+  # GIT_DIR, and `git -C <tmp> add config/runtime.exs` then staged the fixture's one-byte file
+  # into the real repository's index and committed it.
   defp git!(dir, args) do
-    case System.cmd("git", ["-C", dir | args], stderr_to_stdout: true) do
+    case System.cmd("git", ["-C", dir | args],
+           stderr_to_stdout: true,
+           env: CheckDrift.git_env()
+         ) do
       {output, 0} -> output
       {output, status} -> raise "git #{Enum.join(args, " ")} exited #{status}: #{output}"
     end
