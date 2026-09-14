@@ -2082,19 +2082,25 @@ defmodule Loopctl.Fixtures do
   # is written on the RLS `Loopctl.Repo` — the runner registry's `unsupported_kinds`, which is
   # derived from `runner_dispatches`. Same two-repo constraint as `:committed_agent_key`
   # above: only an `async: false` module may use it, and it must sweep at the boundary.
+  #
+  # Returns `{raw_key, api_key}`. A controller test wants the raw token; a CONTEXT test wants
+  # the `%ApiKey{}` struct, because `Loopctl.Delivery.Placement.place/4` resolves the caller's
+  # lineage and role from the key itself rather than taking them as options. It is also the
+  # tenant's OPERATOR principal — `role: :user`, minted by no dispatch, so its lineage resolves
+  # to `[]` — which is the one principal allowed to root a lineage tree.
   def fixture(:committed_operator_key, attrs) do
     attrs = Enum.into(attrs, %{})
     tenant_id = Map.fetch!(attrs, :tenant_id)
 
     Sandbox.unboxed_run(AdminRepo, fn ->
-      {:ok, {raw_key, _api_key}} =
+      {:ok, {raw_key, api_key}} =
         Auth.generate_api_key(%{
           tenant_id: tenant_id,
           name: "operator-#{System.unique_integer([:positive])}",
           role: :user
         })
 
-      raw_key
+      {raw_key, api_key}
     end)
   end
 
@@ -2995,10 +3001,20 @@ defmodule Loopctl.Fixtures do
   A committed test that reaches a CHAINED transition (`Loopctl.Delivery.Placement` claims a
   story, which appends `story_stage_claimed`) leaves `audit_chain` rows, and
   `audit_chain_prevent_delete_trigger` raises on any DELETE — including the one a tenant
-  cascade would issue. Those rows are therefore removed first, under
-  `session_replication_role = replica`, which suppresses user triggers for THIS SESSION only
-  so no concurrently running test is affected. It is restored before the tenant delete,
-  because the same setting suppresses FK triggers and the cascade has to fire.
+  cascade would issue. Those rows are therefore removed first with user triggers suppressed.
+
+  **`SET LOCAL`, inside an explicit transaction, and never a bare `SET`.** A bare `SET
+  session_replication_role` is CONNECTION state on a POOLED connection: any path out of this
+  function that is not the happy one — a `DBConnection.ConnectionError`, an `Ecto.UUID.dump!/1`
+  raise on a malformed id, anything the `rescue` below does not match — checks the connection
+  back in with user triggers AND FK enforcement still disabled, for whatever test picks it up
+  next. That is silent, non-local corruption of the rest of the suite, and it would disable
+  `audit_chain_prevent_delete_trigger` for a test that has no idea it is running unprotected.
+  `SET LOCAL` reverts when the transaction ends, on commit and on rollback alike, so there is
+  no path that leaks it.
+
+  The suppression covers the `audit_chain` delete ALONE. It also suppresses FK triggers, so the
+  tenant delete — which needs its cascades to fire — runs outside that transaction.
 
   Best effort: `session_replication_role` needs a superuser, and a test database whose role
   is not one keeps its marker tenants rather than failing an `on_exit`.
@@ -3018,18 +3034,45 @@ defmodule Loopctl.Fixtures do
     :ok
   end
 
+  @doc """
+  Deletes the `audit_chain` rows of the given tenants (raw 16-byte uuids), with user triggers
+  suppressed for that ONE statement.
+
+  Public so its two properties can be asserted directly — `sweep_committed_runner_tenants/0`
+  swallows its own failure by design (it runs in an `on_exit`), so nothing would notice this
+  silently stopping to work except a test database that slowly fills with tenants nobody can
+  delete.
+
+  1. It actually deletes. `audit_chain_prevent_delete_trigger` raises on ANY delete, a tenant
+     cascade included, so without the suppression a tenant that ever appended an entry is
+     undeletable.
+  2. It does NOT leak. `SET LOCAL` reverts when the transaction ends, on commit and on
+     rollback alike. A bare `SET` here is CONNECTION state on a POOLED connection: any path
+     out that is not the happy one returns it with user triggers AND FK enforcement disabled,
+     for whatever test checks it out next — silent, non-local corruption of the rest of the
+     suite, and the disabled trigger would be the very one protecting the audit chain.
+  """
+  def delete_audit_chain_rows!(raw_ids) do
+    {:ok, _} =
+      AdminRepo.transaction(fn ->
+        AdminRepo.query!("SET LOCAL session_replication_role = replica")
+        AdminRepo.query!("DELETE FROM audit_chain WHERE tenant_id = ANY($1)", [raw_ids])
+      end)
+
+    :ok
+  end
+
   defp sweep_tenant_ids(ids) do
     import Ecto.Query, only: [from: 2]
 
     raw_ids = Enum.map(ids, &Ecto.UUID.dump!/1)
 
-    AdminRepo.query!("SET session_replication_role = replica")
-    AdminRepo.query!("DELETE FROM audit_chain WHERE tenant_id = ANY($1)", [raw_ids])
-    AdminRepo.query!("SET session_replication_role = origin")
+    delete_audit_chain_rows!(raw_ids)
 
     # `dispatches_tenant_id_fkey` does NOT cascade, so a tenant that minted one — every
     # placement does — cannot be deleted until its dispatches are, and a claimed story
-    # REFERENCES its implementer dispatch, so those two columns go first.
+    # REFERENCES its implementer dispatch, so those two columns go first. Outside the
+    # transaction above on purpose: these need the FK triggers the suppression turns off.
     AdminRepo.query!(
       "UPDATE stories SET implementer_dispatch_id = NULL, verifier_dispatch_id = NULL " <>
         "WHERE tenant_id = ANY($1)",
@@ -3039,9 +3082,7 @@ defmodule Loopctl.Fixtures do
     AdminRepo.query!("DELETE FROM dispatches WHERE tenant_id = ANY($1)", [raw_ids])
     AdminRepo.delete_all(from(t in Tenant, where: t.id in ^ids))
   rescue
-    error in Postgrex.Error ->
-      AdminRepo.query("SET session_replication_role = origin")
-
+    error ->
       IO.warn(
         "committed-runner tenants left behind: #{Exception.message(error)}. " <>
           "Removing an audit_chain row needs a superuser connection."

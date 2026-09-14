@@ -230,12 +230,61 @@ defmodule Loopctl.Runners do
   @spec agent_name(String.t()) :: String.t()
   def agent_name(name) when is_binary(name), do: "runner:" <> name
 
-  # Get-or-create, in the enrollment transaction. `ON CONFLICT DO NOTHING` plus a read is the
-  # shape rather than `register_agent/3` + rescue: two enrollments of one machine name race
-  # here (the partial active-name index does not stop a revoked name being re-enrolled twice),
-  # and an insert that loses must find the winner's row rather than fail the enrollment.
+  # The agent this machine's sessions work as, in the enrollment transaction.
+  #
+  # REUSE IS DECIDED BY A PREVIOUS RUNNER ROW, NEVER BY THE NAME ALONE. The obvious shape —
+  # insert `ON CONFLICT DO NOTHING`, then read back by name — adopts whatever agent happens to
+  # carry that name, and `AgentController`'s `:register` is `exact_role: :agent`, so ANY
+  # agent-role key in the tenant can create `runner:minis` before the machine is ever enrolled.
+  # No privilege is gained by that (the squatter cannot make the runner do anything), but
+  # enrollment would stop owning what a runner's work is attributed to, and a story claimed for
+  # this machine would name a row someone else made.
+  #
+  # So: the only agent adopted is one a PREVIOUS runner row of this tenant and machine name
+  # already points at, which is exactly the re-enrollment case the partial active-name index
+  # creates (a revoked machine re-enrolled keeps its identity, because it is the same machine).
+  # Otherwise a fresh agent is created, and a name already taken by someone else gets a
+  # disambiguating suffix rather than failing the enrollment — a squatter must not be able to
+  # stop a machine being enrolled either.
   defp runner_agent(tenant_id, name) do
-    agent_name = agent_name(name)
+    case previous_runner_agent(tenant_id, name) do
+      %Agent{} = agent -> {:ok, agent}
+      nil -> create_runner_agent(tenant_id, name)
+    end
+  end
+
+  defp previous_runner_agent(tenant_id, name) do
+    AdminRepo.one(
+      from r in Runner,
+        join: a in Agent,
+        on: a.id == r.agent_id and a.tenant_id == r.tenant_id,
+        where: r.tenant_id == ^tenant_id and r.name == ^name and not is_nil(r.agent_id),
+        order_by: [desc: r.inserted_at],
+        limit: 1,
+        select: a
+    )
+  end
+
+  # `ON CONFLICT DO NOTHING` + `returning` tells insert from conflict without a second read:
+  # an empty return means the preferred name is taken by an agent no runner of this name owns.
+  # Two concurrent enrollments of one machine both land here (the partial index does not stop a
+  # revoked name being re-enrolled twice), and the loser takes the suffixed path rather than
+  # failing — they are separate runner rows, so separate agents is a true statement about them.
+  defp create_runner_agent(tenant_id, name) do
+    case insert_agent(tenant_id, agent_name(name)) do
+      {:ok, agent} -> {:ok, agent}
+      :taken -> insert_suffixed_agent(tenant_id, name)
+    end
+  end
+
+  defp insert_suffixed_agent(tenant_id, name) do
+    case insert_agent(tenant_id, agent_name(name) <> "-" <> Ecto.UUID.generate()) do
+      {:ok, agent} -> {:ok, agent}
+      :taken -> {:error, :agent_not_resolved}
+    end
+  end
+
+  defp insert_agent(tenant_id, agent_name) do
     now = DateTime.utc_now()
 
     AdminRepo.insert_all(
@@ -254,12 +303,12 @@ defmodule Loopctl.Runners do
         }
       ],
       on_conflict: :nothing,
-      conflict_target: [:tenant_id, :name]
+      conflict_target: [:tenant_id, :name],
+      returning: [:id]
     )
-
-    case AdminRepo.get_by(Agent, tenant_id: tenant_id, name: agent_name) do
-      nil -> {:error, :agent_not_resolved}
-      agent -> {:ok, agent}
+    |> case do
+      {1, [%Agent{id: id}]} -> {:ok, AdminRepo.get!(Agent, id)}
+      _conflicted -> :taken
     end
   end
 

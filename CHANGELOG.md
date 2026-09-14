@@ -14,6 +14,14 @@ All notable changes to loopctl are documented here.
   Before this, a dispatch reached a real runner whose first stage report was refused
   `stale_stage`, because nothing had claimed the story.
 
+  **It is human-anchored, and the gate is in the CONTEXT rather than a plug.** Minting a
+  custody dispatch and driving a chained custody transition are both behind
+  `RequireHumanAnchor` on the HTTP surface, and this path has no `conn` — a worker or an MCP
+  tool calls it directly — so it calls `Loopctl.Tenants.require_human_anchor/1` itself and
+  refuses an `agent_rooted` tenant with `custody_tier_required`. The advertised capability map
+  stays bound to it through `TierCapabilities.gated_contexts/0`, a second drift guard scanning
+  `lib/loopctl` for the same reason the existing one scans `lib/loopctl_web`.
+
   **New migration, with a backfill and one deploy-ordering consequence.** `runners.agent_id`
   is added NOT NULL and backfilled with one `runner:<machine name>` agent per runner (an
   agent a tenant already named that way is reused, not duplicated). A claimed story with an

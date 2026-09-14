@@ -64,6 +64,26 @@ defmodule Loopctl.RunnersTest do
       assert again.agent_id == agent.id
     end
 
+    test "does not adopt an agent somebody else named `runner:<name>` first" do
+      tenant = fixture(:tenant)
+
+      # `AgentController`'s :register is `exact_role: :agent`, so ANY agent-role key in the
+      # tenant can create this row before the machine is ever enrolled. Adopting it would hand
+      # a squatter the identity a runner's work is attributed to — `Loopctl.Delivery.Placement`
+      # claims stories for `runners.agent_id`.
+      squatter =
+        %Agent{tenant_id: tenant.id}
+        |> Agent.register_changeset(%{name: "runner:minis", agent_type: :implementer})
+        |> AdminRepo.insert!()
+
+      assert {:ok, %{runner: runner}} = Runners.enroll_runner(tenant.id, %{name: "minis"})
+
+      refute runner.agent_id == squatter.id
+      # And enrollment still SUCCEEDS: a squatter must not be able to stop a machine joining
+      # either, so the fresh agent takes a disambiguating name rather than failing the insert.
+      assert AdminRepo.get!(Agent, runner.agent_id).name =~ ~r/^runner:minis-/
+    end
+
     test "enrolls with max_sessions, defaulting to two, and refuses one out of range" do
       tenant = fixture(:tenant)
 

@@ -1070,6 +1070,38 @@ defmodule Loopctl.Tenants do
   def custody_halted?(%Tenant{}), do: true
 
   @doc """
+  The L0 human-anchor gate, for a CONTEXT that is not reached through a controller.
+
+  `LoopctlWeb.Plugs.RequireHumanAnchor` is the gate for every HTTP surface, and it is the
+  whole gate as long as a human-anchored surface is only reachable that way. `#803`'s
+  `Loopctl.Delivery.Placement.place/4` is not: it mints a custody dispatch and drives a
+  chained custody transition, and an Oban worker or an MCP tool calls it directly, with no
+  `conn` for a plug to run on. Without this the tier boundary would exist on the HTTP surface
+  and nowhere else — an `agent_rooted` tenant refused at `POST /api/v1/dispatches` could reach
+  the same mint one layer down, which CLAUDE.md names an L0 regression.
+
+  Reads the tier FRESH from the database, never from a `Tenant` struct loaded earlier, for the
+  same reason `Loopctl.Runners.custody_halted?/1` does: the tier can flip under a long-running
+  caller (enrolling the first authenticator flips `agent_rooted` to `human_anchored`), and a
+  stale struct decides an authorization question on a value nobody re-read.
+
+  An UNKNOWN tenant is refused, not passed: a gate that opens when it cannot find the subject
+  is not a gate.
+
+  `Loopctl.Tenants.TierCapabilities.gated_contexts/0` names every module that calls this, and
+  `test/loopctl/tenants/tier_capabilities_test.exs` scans `lib/loopctl/**` for the calls and
+  fails in both directions — the same binding the controller mounts have, so a new
+  context-layer custody path cannot be added without appearing in the advertised map.
+  """
+  @spec require_human_anchor(Ecto.UUID.t()) :: :ok | {:error, :custody_tier_required}
+  def require_human_anchor(tenant_id) when is_binary(tenant_id) do
+    case get_tenant(tenant_id) do
+      {:ok, %Tenant{trust_tier: :human_anchored}} -> :ok
+      _other -> {:error, :custody_tier_required}
+    end
+  end
+
+  @doc """
   Updates a tenant with the given attributes.
 
   When `settings` is provided in attrs, it is merged into the existing

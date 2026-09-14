@@ -21,12 +21,14 @@ defmodule Loopctl.Delivery.PlacementTest do
   alias Loopctl.AdminRepo
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.AuditChain
+  alias Loopctl.Auth.ApiKey
   alias Loopctl.Delivery.Placement
   alias Loopctl.Delivery.Stages
   alias Loopctl.Dispatches
   alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Progress
   alias Loopctl.Runners.DispatchLedger
+  alias Loopctl.Tenants.Tenant
   alias Loopctl.WorkBreakdown.Stories
   alias LoopctlWeb.RunnerSocket
 
@@ -41,7 +43,11 @@ defmodule Loopctl.Delivery.PlacementTest do
   @reply_timeout 2_000
 
   setup do
-    {raw, runner} = fixture(:committed_runner, %{name: "minis"})
+    # HUMAN-ANCHORED explicitly: `place/4` applies the L0 tier gate itself, and the committed
+    # tenant's column default is `:agent_rooted`.
+    tenant = fixture(:committed_tenant, %{trust_tier: :human_anchored})
+    {raw, runner} = fixture(:committed_runner, %{tenant_id: tenant.id, name: "minis"})
+    {_operator_raw, operator} = fixture(:committed_operator_key, %{tenant_id: tenant.id})
 
     {:ok, socket} = connect(RunnerSocket, %{}, connect_info: connect_info(raw))
 
@@ -59,7 +65,7 @@ defmodule Loopctl.Delivery.PlacementTest do
     story = fixture(:committed_story, %{tenant_id: runner.tenant_id})
     story = unboxed(fn -> contract_and_queue(runner.tenant_id, story) end)
 
-    %{runner: runner, channel: channel, story: story}
+    %{runner: runner, channel: channel, story: story, operator: operator, runner_key: raw}
   end
 
   describe "place/4" do
@@ -67,7 +73,7 @@ defmodule Loopctl.Delivery.PlacementTest do
       %{runner: runner, story: story} = ctx
       payload = dispatch_payload(story)
 
-      assert {:ok, placed} = place(runner, payload)
+      assert {:ok, placed} = place(ctx, payload)
       assert_push "dispatch", pushed, @reply_timeout
 
       assert pushed.dispatch_id == payload["dispatch_id"]
@@ -89,7 +95,7 @@ defmodule Loopctl.Delivery.PlacementTest do
     test "the claim's chain entry is attributed to the dispatch it minted", ctx do
       %{runner: runner, story: story} = ctx
 
-      assert {:ok, placed} = place(runner, dispatch_payload(story))
+      assert {:ok, placed} = place(ctx, dispatch_payload(story))
       assert_push "dispatch", _pushed, @reply_timeout
 
       session = unboxed(fn -> AdminRepo.get!(Dispatch, placed.implementer_dispatch_id) end)
@@ -104,31 +110,35 @@ defmodule Loopctl.Delivery.PlacementTest do
       assert session.role == :agent
     end
 
-    test "the session dispatch lands inside the caller's own subtree", ctx do
+    test "the session dispatch lands inside the caller's OWN subtree, resolved from its key",
+         ctx do
       %{runner: runner, story: story} = ctx
-      parent = unboxed(fn -> operator_dispatch(runner.tenant_id) end)
+      %{dispatch: parent, api_key: parent_key} = unboxed(fn -> orchestrator(runner.tenant_id) end)
 
-      assert {:ok, placed} =
-               place(runner, dispatch_payload(story),
-                 caller_lineage: parent.lineage_path,
-                 caller_role: :orchestrator
-               )
-
+      assert {:ok, placed} = place(ctx, dispatch_payload(story), api_key: parent_key)
       assert_push "dispatch", _pushed, @reply_timeout
 
       session = unboxed(fn -> AdminRepo.get!(Dispatch, placed.implementer_dispatch_id) end)
       assert session.parent_dispatch_id == List.last(parent.lineage_path)
       assert List.starts_with?(session.lineage_path, parent.lineage_path)
+
+      # Nothing named that parent: it was derived from the key the caller authenticated with.
+      # `place/4` takes no lineage option at all, which is what makes "inside the CALLER's
+      # subtree" a property rather than a restatement of what the caller asked for.
+      assert Dispatches.lineage_for_api_key(runner.tenant_id, parent_key.id) ==
+               parent.lineage_path
     end
 
     test "an unlineaged caller below :user may not start a tree, and claims nothing", ctx do
-      %{runner: runner, story: story} = ctx
+      %{runner: runner, story: story, runner_key: raw} = ctx
+
+      # The RUNNER's own key: role `:agent`, minted by no dispatch, so its resolved lineage is
+      # `[]`. Realistic rather than contrived — it is the credential nearest to hand for
+      # anything running on the machine the dispatch would start a session on.
+      {:ok, runner_api_key} = unboxed(fn -> Loopctl.Auth.verify_api_key(raw) end)
 
       assert {:error, :root_dispatch_forbidden} =
-               place(runner, dispatch_payload(story),
-                 caller_lineage: [],
-                 caller_role: :orchestrator
-               )
+               place(ctx, dispatch_payload(story), api_key: runner_api_key)
 
       refute_push "dispatch", _pushed, 200
 
@@ -136,13 +146,127 @@ defmodule Loopctl.Delivery.PlacementTest do
       assert untouched.agent_status == :contracted
       assert untouched.claim_epoch == story.claim_epoch
       assert unboxed(fn -> Stages.get(runner.tenant_id, story.id) end).stage == :queued
+      assert unboxed(fn -> session_dispatch_count(runner.tenant_id, story.id) end) == 0
+    end
+
+    test "a key from another tenant is not authorized, whatever its role", ctx do
+      %{story: story} = ctx
+      other = fixture(:committed_tenant, %{trust_tier: :human_anchored})
+      {_raw, intruder} = fixture(:committed_operator_key, %{tenant_id: other.id})
+
+      assert {:error, :not_authorized} =
+               place(ctx, dispatch_payload(story), api_key: intruder)
+
+      refute_push "dispatch", _pushed, 200
+    end
+
+    test "an agent_rooted tenant is refused the whole path, and claims nothing", ctx do
+      # The L0 gate, applied in the context because no plug can reach here. Both halves of
+      # what this path does — minting a custody dispatch and driving a chained custody
+      # transition — are human-anchored on the HTTP surface.
+      %{runner: runner, story: story} = ctx
+      unboxed(fn -> set_trust_tier(runner.tenant_id, :agent_rooted) end)
+
+      assert {:error, :custody_tier_required} = place(ctx, dispatch_payload(story))
+
+      refute_push "dispatch", _pushed, 200
+
+      untouched = unboxed(fn -> reload(runner.tenant_id, story.id) end)
+      assert untouched.agent_status == :contracted
+      assert unboxed(fn -> session_dispatch_count(runner.tenant_id, story.id) end) == 0
+    end
+
+    test "a story that is not ready is refused BEFORE anything is minted", ctx do
+      %{runner: runner, story: story} = ctx
+      before = unboxed(fn -> tenant_dispatch_count(runner.tenant_id) end)
+
+      # Its stage row is at `queued`, but the story itself is back at `pending`.
+      unboxed(fn -> Progress.force_unclaim_story(runner.tenant_id, story.id, []) end)
+
+      assert {:error, :invalid_transition} = place(ctx, dispatch_payload(story))
+
+      # The point of the pre-check: a loop over an unready story writes no `dispatches` row,
+      # no ephemeral key and no immutable chain entry, and takes the tenant's chain advisory
+      # lock zero times.
+      assert unboxed(fn -> tenant_dispatch_count(runner.tenant_id) end) == before
+      refute_push "dispatch", _pushed, 200
+    end
+
+    test "a stage row that is not at `queued` is refused before anything is minted", ctx do
+      %{runner: runner} = ctx
+      before = unboxed(fn -> tenant_dispatch_count(runner.tenant_id) end)
+
+      # A second story, CONTRACTED but left at `detected` — the story half of the readiness
+      # check passes and the stage half does not, so this pins the stage half on its own.
+      early = fixture(:committed_story, %{tenant_id: runner.tenant_id})
+
+      early =
+        unboxed(fn ->
+          {:ok, contracted} =
+            Progress.contract_story(runner.tenant_id, early.id, %{},
+              actor_label: "test",
+              skip_contract_check: true
+            )
+
+          {:ok, _row} = Stages.open(runner.tenant_id, early.id, actor_label: "test")
+          contracted
+        end)
+
+      assert unboxed(fn -> Stages.get(runner.tenant_id, early.id) end).stage == :detected
+      assert {:error, :wrong_stage} = place(ctx, dispatch_payload(early))
+      assert unboxed(fn -> tenant_dispatch_count(runner.tenant_id) end) == before
+    end
+
+    test "a claim that fails past the pre-check REVOKES the dispatch it minted", ctx do
+      %{runner: runner, story: story} = ctx
+
+      # The race `claimable/2` cannot close, made deterministic. An unmet story dependency is
+      # invisible to the pre-check — the story is `contracted` and its stage row is at `queued`
+      # — and `claim_story/3` refuses it. That is the one path on which a dispatch is minted
+      # for a claim that never happens, so its ephemeral key must not be left live for its
+      # four-hour TTL with no session to use it and nothing else to revoke it.
+      blocker = fixture(:committed_story, %{tenant_id: runner.tenant_id})
+
+      unboxed(fn ->
+        fixture(:story_dependency, %{
+          tenant_id: runner.tenant_id,
+          story_id: story.id,
+          depends_on_story_id: blocker.id
+        })
+      end)
+
+      assert {:error, :dependencies_not_met} = place(ctx, dispatch_payload(story))
+      refute_push "dispatch", _pushed, 200
+
+      session = unboxed(fn -> session_dispatch(runner.tenant_id, story.id) end)
+      assert session.revoked_at, "the minted dispatch was left live for a claim that failed"
+      assert unboxed(fn -> AdminRepo.get!(ApiKey, session.api_key_id) end).revoked_at
+
+      untouched = unboxed(fn -> reload(runner.tenant_id, story.id) end)
+      assert untouched.agent_status == :contracted
+      assert is_nil(untouched.implementer_dispatch_id)
+    end
+
+    test "a dispatch_id is spent by the claim it was placed under", ctx do
+      %{runner: runner, story: story} = ctx
+      payload = dispatch_payload(story)
+
+      assert {:ok, _first} = place(ctx, payload)
+      assert_push "dispatch", _pushed, @reply_timeout
+
+      # The claim ends — an operator force-unclaims — so the ledger row's epoch is now a claim
+      # that does not exist. Re-placing the SAME dispatch_id can never work again, which is the
+      # fence doing its job and the reason `place/4`'s doc says a re-place needs a new id.
+      unboxed(fn -> Progress.force_unclaim_story(runner.tenant_id, story.id, []) end)
+
+      assert {:error, :stale_claim_epoch} = place(ctx, payload)
     end
 
     test "a re-sent dispatch_id claims nothing a second time, and releases nothing", ctx do
       %{runner: runner, story: story, channel: channel} = ctx
       payload = dispatch_payload(story)
 
-      assert {:ok, first} = place(runner, payload)
+      assert {:ok, first} = place(ctx, payload)
       assert_push "dispatch", _pushed, @reply_timeout
 
       # The runner goes away between the two placements, so the RETRY refuses at the push.
@@ -154,7 +278,7 @@ defmodule Loopctl.Delivery.PlacementTest do
       # SANDBOX transaction and that row lock is held for the rest of the test.)
       disconnect(channel, runner)
 
-      assert {:error, :runner_not_connected} = place(runner, payload)
+      assert {:error, :runner_not_connected} = place(ctx, payload)
 
       after_retry = unboxed(fn -> reload(runner.tenant_id, story.id) end)
       assert after_retry.claim_epoch == first.claim_epoch
@@ -176,7 +300,7 @@ defmodule Loopctl.Delivery.PlacementTest do
       # `:runner_not_connected` AFTER the claim has committed — the window this compensates.
       disconnect(channel, runner)
 
-      assert {:error, :runner_not_connected} = place(runner, dispatch_payload(story))
+      assert {:error, :runner_not_connected} = place(ctx, dispatch_payload(story))
 
       released = unboxed(fn -> reload(runner.tenant_id, story.id) end)
       assert released.agent_status == :pending
@@ -192,7 +316,7 @@ defmodule Loopctl.Delivery.PlacementTest do
       %{runner: runner, story: story} = ctx
       payload = Map.put(dispatch_payload(story), "dispatch_id", "not-a-uuid")
 
-      assert {:error, {:invalid, ["dispatch_id: must be a UUID"]}} = place(runner, payload)
+      assert {:error, {:invalid, ["dispatch_id: must be a UUID"]}} = place(ctx, payload)
 
       untouched = unboxed(fn -> reload(runner.tenant_id, story.id) end)
       assert untouched.agent_status == :contracted
@@ -200,23 +324,70 @@ defmodule Loopctl.Delivery.PlacementTest do
     end
   end
 
+  describe "delete_audit_chain_rows!/1 — what makes the committed-runner sweep possible" do
+    test "deletes immutable entries, and leaves the connection's triggers ON", ctx do
+      %{runner: runner, story: story} = ctx
+
+      assert {:ok, _placed} = place(ctx, dispatch_payload(story))
+      assert_push "dispatch", _pushed, @reply_timeout
+      assert unboxed(fn -> claimed_entry(runner.tenant_id, story.id) end)
+
+      raw_id = Ecto.UUID.dump!(runner.tenant_id)
+
+      # ONE `unboxed/1` block, so both assertions read the SAME checked-out connection. Reading
+      # the setting from a second block proves nothing: the pool would hand back a different
+      # connection and report `origin` whether or not the first one leaked, which is precisely
+      # what makes this hazard nondeterministic in production use — `bin/mutate.sh` came back
+      # exit 1 on the two-block version.
+      unboxed(fn ->
+        delete_audit_chain_rows!([raw_id])
+
+        # 1. It deletes. Without the suppression `audit_chain_prevent_delete_trigger` raises
+        #    and every committed test tenant becomes permanently undeletable.
+        assert chain_entry_count(runner.tenant_id) == 0
+
+        # 2. It does not LEAK. `SET LOCAL` reverts with the transaction; a bare `SET` leaves
+        #    THIS connection in `replica` when it goes back to the pool, so the next test runs
+        #    with user triggers and FK enforcement off — the audit chain's own protection
+        #    included — and nothing says so.
+        assert replication_role() == "origin"
+      end)
+    end
+  end
+
   describe "the minted credential does not reach the session" do
-    test "the dispatch payload has no field that could carry a key" do
-      # The premise of the moduledoc's "the credential ... does NOT reach the session"
-      # section, asserted rather than asserted-in-prose: a session therefore still
-      # authenticates as the runner's enrollment key. Adding such a field is what makes a
-      # runner session a custody principal, and this is what goes red when someone does.
-      refute Enum.any?(
-               RunnerContract.RunnerDispatch.schema().properties,
-               fn {name, _schema} -> String.contains?(Atom.to_string(name), "key") end
-             )
+    test "the dispatch payload carries exactly these fields, and none of them is a credential" do
+      # The premise of the moduledoc's "the credential ... does NOT reach the session" section.
+      #
+      # THE EXACT SET, not a substring match on "key": a field named `credential`, `token`,
+      # `secret`, `auth` or `raw` would have passed a name filter, and the property being
+      # asserted is that the payload carries NO way to hand a session a credential — which no
+      # vocabulary list can decide, because the next such field will be named something nobody
+      # listed. Pinning the set makes whoever adds ANY field come and look at this test, which
+      # is the only place the question gets asked.
+      assert RunnerContract.RunnerDispatch.schema().properties |> Map.keys() |> Enum.sort() == [
+               :base_branch,
+               :branch,
+               :claim_epoch,
+               :dispatch_id,
+               :kind,
+               :max_turns,
+               :repo,
+               :story,
+               :story_id,
+               :token_budget,
+               :wall_clock_seconds
+             ]
     end
   end
 
   # --- helpers ------------------------------------------------------------------------------
 
-  defp place(runner, payload, opts \\ []) do
-    opts = Keyword.merge([caller_lineage: [], caller_role: :user], opts)
+  # `ctx` carries the operator key, so the default caller is the one principal allowed to root
+  # a tree. Pass `api_key:` to place as somebody else.
+  defp place(ctx, payload, opts \\ []) do
+    %{runner: runner, operator: operator} = ctx
+    opts = Keyword.merge([api_key: operator], opts)
     unboxed(fn -> Placement.place(runner.tenant_id, runner.id, payload, opts) end)
   end
 
@@ -243,11 +414,43 @@ defmodule Loopctl.Delivery.PlacementTest do
     story
   end
 
-  defp operator_dispatch(tenant_id) do
+  # An orchestrator dispatch and the key it minted — a LINEAGED caller, so the placement it
+  # makes parents inside its own subtree rather than rooting a new tree.
+  defp orchestrator(tenant_id) do
     {:ok, %{dispatch: dispatch}} =
       Dispatches.create_dispatch(tenant_id, %{role: :orchestrator}, actor_lineage: [])
 
-    dispatch
+    %{dispatch: dispatch, api_key: AdminRepo.get!(ApiKey, dispatch.api_key_id)}
+  end
+
+  defp set_trust_tier(tenant_id, tier) do
+    Tenant
+    |> AdminRepo.get!(tenant_id)
+    |> Ecto.Changeset.change(trust_tier: tier)
+    |> AdminRepo.update!()
+  end
+
+  defp chain_entry_count(tenant_id) do
+    AdminRepo.aggregate(
+      from(e in AuditChain.Entry, where: e.tenant_id == ^tenant_id),
+      :count,
+      :id
+    )
+  end
+
+  defp replication_role do
+    %{rows: [[role]]} = AdminRepo.query!("SHOW session_replication_role")
+    role
+  end
+
+  defp session_dispatch(tenant_id, story_id) do
+    AdminRepo.one!(
+      from d in Dispatch, where: d.tenant_id == ^tenant_id and d.story_id == ^story_id
+    )
+  end
+
+  defp tenant_dispatch_count(tenant_id) do
+    AdminRepo.aggregate(from(d in Dispatch, where: d.tenant_id == ^tenant_id), :count, :id)
   end
 
   defp dispatch_payload(story) do

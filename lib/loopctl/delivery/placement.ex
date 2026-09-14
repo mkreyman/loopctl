@@ -29,15 +29,32 @@ defmodule Loopctl.Delivery.Placement do
   - `stories.assigned_agent_id` is the runner's agent (`runners.agent_id`), so the equality
     check every L4 gate runs ALONGSIDE its lineage comparison names the machine.
 
-  **The lineage ceiling is enforced here, not inherited.** The caller states the lineage it
-  resolved SERVER-SIDE from its own authenticating key (`:caller_lineage`, no default — an
-  absent one is a caller that never resolved one, exactly as `Stages.advance/4` treats it) and
-  the role of that key (`:caller_role`). The session dispatch is parented on the LAST element
-  of that lineage, so it can only ever land inside the caller's own subtree. A caller with NO
-  lineage would be minting a ROOT, which only the tenant's operator key may do, so it is
-  refused `:root_dispatch_forbidden` unless the role is at least `:user` — the same positive
-  operator test `LoopctlWeb.DispatchController` applies, for the same reason: an empty lineage
-  is also what a legacy env-var key and an unresolvable dispatch look like.
+  **The lineage ceiling is enforced here, not inherited — which means this module RESOLVES the
+  caller's lineage rather than accepting one.** `place/4` takes the `Loopctl.Auth.ApiKey` the
+  request authenticated with and derives both the lineage (`Dispatches.lineage_for_api_key/2`)
+  and the role from it, exactly as `LoopctlWeb.DispatchController.create/2` does. A lineage
+  passed in as an option would be a CLAIM about who the caller is, and enforcing a mint against
+  a claimed lineage enforces only that the parent is SOME named leaf — not that it is the
+  CALLER's, which is the whole content of `parent_outside_caller_lineage`.
+
+  The session dispatch is parented on the LAST element of that resolved lineage, so it can only
+  land inside the caller's own subtree. A caller with NO lineage would be minting a ROOT, which
+  only the tenant's operator key may do, so it is refused `:root_dispatch_forbidden` unless the
+  key's role is at least `:user` — the same positive operator test, for the same reason: an
+  empty lineage is also what a legacy env-var key and an unresolvable dispatch look like.
+
+  ## The human anchor is applied HERE, because no plug can be
+
+  Minting a custody dispatch and driving a chained custody transition are both behind
+  `LoopctlWeb.Plugs.RequireHumanAnchor` on the HTTP surface, and `Dispatches.create_dispatch/3`
+  does not check the tier itself — the plug is the whole gate there. This path has no `conn`:
+  a worker or an MCP tool calls it directly. So it calls `Loopctl.Tenants.require_human_anchor/1`
+  and refuses an `agent_rooted` tenant with `:custody_tier_required`, and
+  `Loopctl.Tenants.TierCapabilities.gated_contexts/0` names this module so the advertised
+  capability map stays bound to the enforced gate — `gated_controllers/0`'s scan reads
+  `lib/loopctl_web` only and cannot see a context-layer gate at all. Letting an agent-rooted
+  tenant through would be an L0 regression, and it would be one that the existing drift guard
+  was structurally incapable of noticing.
 
   ## The credential the session dispatch mints does NOT reach the session
 
@@ -114,24 +131,30 @@ defmodule Loopctl.Delivery.Placement do
 
   require Logger
 
+  alias Loopctl.Auth.ApiKey
   alias Loopctl.Auth.Role
   alias Loopctl.Delivery.Stages
   alias Loopctl.Dispatches
   alias Loopctl.Progress
   alias Loopctl.Runners
   alias Loopctl.Runners.DispatchLedger
+  alias Loopctl.Tenants
   alias Loopctl.WorkBreakdown.Stories
 
   # How long the session dispatch's credential lives. `Dispatches.create_dispatch/3` caps this
   # at four hours of its own accord, while a dispatch's `wall_clock_seconds` may be a day, so
   # the two do NOT line up and this is the shorter of them on purpose: the dispatch row's
   # lineage is what the custody gates read and it outlives the key, while the key itself has
-  # no holder yet (see `session_dispatch_key_unused/0`).
+  # no holder at all (see the moduledoc).
   @session_expires_in_seconds 14_400
 
   @type error ::
           :root_dispatch_forbidden
+          | :custody_tier_required
           | :not_authorized
+          | :runner_not_provisioned
+          | :invalid_transition
+          | :wrong_stage
           | :busy
           | atom()
           | {:invalid, [String.t()]}
@@ -148,8 +171,9 @@ defmodule Loopctl.Delivery.Placement do
   contract inside `Runners.dispatch/3`.
 
   The story must already be `contracted` (`Loopctl.Progress.contract_story/3`) and its stage
-  row must be at `queued`; anything else is refused before the push, and the claim is released
-  again.
+  row must be at `queued`. Both are checked BEFORE anything is minted, so the ordinary
+  "not ready yet" answer costs no `dispatches` row, no ephemeral key and no audit-chain entry
+  — see `claimable/2` for why that matters more than it looks.
 
   Returns `{:ok, %{dispatch_id:, claim_epoch:, implementer_dispatch_id:}}` — the last of which
   is the session dispatch this placement minted, or the one the original placement minted when
@@ -157,24 +181,40 @@ defmodule Loopctl.Delivery.Placement do
 
   ## Options
 
-  - `:caller_lineage` (required) — the lineage of the key asking for this placement, resolved
-    SERVER-SIDE by the caller. There is no default: an absent one is a caller that never
-    resolved a lineage, which is not the same as a caller that has none.
-  - `:caller_role` (required) — that key's role, likewise server-resolved. Only a `:user` or
-    above may place with an EMPTY lineage, because the session dispatch would then be a root.
+  - `:api_key` (required) — the `Loopctl.Auth.ApiKey` the request authenticated with. Its
+    LINEAGE and its ROLE are resolved here, from the key, and are never taken as options: a
+    caller-supplied lineage is exactly what `parent_outside_caller_lineage` exists to refuse,
+    so accepting one would enforce that the mint parents on SOME named leaf rather than on the
+    CALLER's. A key belonging to another tenant is `:not_authorized`.
   - `:actor_label` — recorded on the claim, the transition and the release.
 
   ## Refusals
 
+  - `:custody_tier_required` — an `agent_rooted` tenant. This path mints a custody dispatch
+    and drives a chained custody transition, both of which the HTTP surface gates behind
+    `LoopctlWeb.Plugs.RequireHumanAnchor`; a context reachable from a worker or an MCP tool
+    has to apply the same gate itself (`Loopctl.Tenants.require_human_anchor/1`).
   - `:root_dispatch_forbidden` — an unlineaged caller below `:user` (see the moduledoc)
-  - `:not_authorized` — no such runner in this tenant, or its row, key or tenant is no
-    longer valid
+  - `:not_authorized` — a key from another tenant, or no such runner in this tenant, or its
+    row, key or tenant is no longer valid
   - `:runner_not_provisioned` — a runner row with no `agent_id`, which the
     `add_agent_id_to_runners` migration makes unreachable and this refuses rather than
     claiming a story for nobody
-  - everything `Loopctl.Dispatches.create_dispatch/3`, `Loopctl.Progress.claim_story/3`,
-    `Loopctl.Delivery.Stages.advance/4` and `Loopctl.Runners.dispatch/3` refuse, unchanged.
-    Every refusal after the claim commits releases the claim before returning.
+  - `:not_found`, `:invalid_transition`, `:wrong_stage` — from the pre-mint readiness check.
+    A story that passes the check and is claimed by someone else in between instead gets
+    `Loopctl.Progress.claim_story/3`'s own richer `{:invalid_transition, map()}`, and the
+    session dispatch minted for it is REVOKED before returning.
+  - everything `Loopctl.Dispatches.create_dispatch/3`, `Loopctl.Delivery.Stages.advance/4`
+    and `Loopctl.Runners.dispatch/3` refuse, unchanged. Every refusal after the claim commits
+    releases the claim before returning.
+
+  ## A dispatch_id is spent by the claim it was placed under
+
+  "Safe to repeat" means a repeat under the SAME claim. Once that claim ends — the lease
+  expires, an operator force-unclaims, a refused push releases it — the ledger row still
+  carries the old epoch, so every later `place/4` with that `dispatch_id` resumes, pushes the
+  recorded epoch and is refused `:stale_claim_epoch` for ever. That is the fence working: the
+  row names a claim that no longer exists. **Re-placing the story needs a NEW `dispatch_id`.**
   """
   @spec place(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
           {:ok,
@@ -186,18 +226,34 @@ defmodule Loopctl.Delivery.Placement do
           | {:error, error()}
   def place(tenant_id, runner_id, %{} = dispatch, opts)
       when is_binary(tenant_id) and is_binary(runner_id) do
-    caller_lineage = Keyword.fetch!(opts, :caller_lineage)
-    caller_role = Keyword.fetch!(opts, :caller_role)
-
     with {:ok, dispatch_id} <- fetch_uuid(dispatch, "dispatch_id"),
          {:ok, story_id} <- fetch_uuid(dispatch, "story_id"),
-         :ok <- may_mint_session_dispatch(caller_lineage, caller_role) do
+         {:ok, caller} <- resolve_caller(tenant_id, Keyword.fetch!(opts, :api_key)),
+         :ok <- Tenants.require_human_anchor(tenant_id),
+         :ok <- may_mint_session_dispatch(caller.lineage, caller.role) do
       case DispatchLedger.get_record(tenant_id, dispatch_id) do
-        nil -> claim_and_push(tenant_id, runner_id, dispatch, story_id, opts)
+        nil -> claim_and_push(tenant_id, runner_id, dispatch, story_id, caller, opts)
         record -> resume(tenant_id, runner_id, dispatch, record)
       end
     end
   end
+
+  # THE CALLER'S OWN LINEAGE AND ROLE, DERIVED FROM THE KEY IT AUTHENTICATED WITH — the same
+  # resolution `LoopctlWeb.DispatchController.create/2` performs, and for the same reason: a
+  # lineage handed in as an option is a CLAIM about who the caller is, and the ceiling it feeds
+  # is precisely what `parent_outside_caller_lineage` exists to refuse. Taking it as an opt
+  # enforced that the mint parents on SOME named leaf, which is not the property the moduledoc
+  # says is enforced here.
+  #
+  # The repeated `tenant_id` in the head is the tenant check: a key belonging to another tenant
+  # matches no clause and is `:not_authorized`. So is anything that is not an `ApiKey` at all —
+  # a caller passing a bare id or a map gets a refusal rather than a lineage of `[]`, which
+  # would have read as "an operator" to the clause below.
+  defp resolve_caller(tenant_id, %ApiKey{tenant_id: tenant_id, id: id, role: role}) do
+    {:ok, %{lineage: Dispatches.lineage_for_api_key(tenant_id, id), role: role}}
+  end
+
+  defp resolve_caller(_tenant_id, _api_key), do: {:error, :not_authorized}
 
   # A retry of a dispatch the ledger already holds. Nothing is claimed, minted or bumped: the
   # placement already happened, and what is left is to put the frame on the wire again under
@@ -224,11 +280,75 @@ defmodule Loopctl.Delivery.Placement do
     end
   end
 
-  defp claim_and_push(tenant_id, runner_id, dispatch, story_id, opts) do
+  defp claim_and_push(tenant_id, runner_id, dispatch, story_id, caller, opts) do
     with {:ok, agent_id} <- runner_agent_id(tenant_id, runner_id),
-         {:ok, session} <- mint_session_dispatch(tenant_id, agent_id, story_id, opts),
-         {:ok, story} <- claim(tenant_id, story_id, agent_id, session, opts) do
-      enter_claimed_and_push(tenant_id, runner_id, dispatch, story, session, opts)
+         :ok <- claimable(tenant_id, story_id),
+         {:ok, session} <- mint_session_dispatch(tenant_id, agent_id, story_id, caller, opts) do
+      claim_then_push(tenant_id, runner_id, dispatch, story_id, agent_id, session, opts)
+    end
+  end
+
+  # WHETHER THE CLAIM IS EVEN WORTH MINTING FOR, read before anything is minted. Not an
+  # optimisation, and not the fence either — the claim's own transaction is both.
+  #
+  # Minting is not free and it is not undoable. Every mint writes a `dispatches` row, an
+  # `api_keys` row, and an IMMUTABLE, STH-covered `dispatch_created` entry appended under the
+  # tenant's chain advisory lock — the row every writer in the tenant contends on. Nothing
+  # deletes a chain entry, by design. So a caller looping over a story that is not ready (still
+  # `pending`, already claimed, its stage row not at `queued`) would have written a permanent
+  # chain entry and taken the chain lock once per attempt, for an outcome that was never going
+  # to succeed. Reading two rows first turns that into two SELECTs.
+  #
+  # It cannot be complete, and is not meant to be: a story claimed between this read and the
+  # claim's own lock takes `claim_story/3`'s refusal instead, and `claim_then_push/7` revokes
+  # the dispatch minted for it. This bounds the COMMON case; that bounds the race.
+  defp claimable(tenant_id, story_id) do
+    with {:ok, story} <- Stories.get_story(tenant_id, story_id) do
+      cond do
+        story.agent_status != :contracted -> {:error, :invalid_transition}
+        stage_of(tenant_id, story_id) != :queued -> {:error, :wrong_stage}
+        true -> :ok
+      end
+    end
+  end
+
+  defp stage_of(tenant_id, story_id) do
+    case Stages.get(tenant_id, story_id) do
+      nil -> nil
+      row -> row.stage
+    end
+  end
+
+  # The race `claimable/2` cannot close. A claim that fails here leaves a minted dispatch that
+  # will never be an implementer, so it is REVOKED rather than left to expire: its ephemeral key
+  # is live for four hours otherwise, and nothing else would ever revoke it. The chain entry it
+  # already wrote stays — entries are immutable — which is why the pre-check above is the part
+  # that bounds a loop.
+  defp claim_then_push(tenant_id, runner_id, dispatch, story_id, agent_id, session, opts) do
+    case claim(tenant_id, story_id, agent_id, session, opts) do
+      {:ok, story} ->
+        enter_claimed_and_push(tenant_id, runner_id, dispatch, story, session, opts)
+
+      {:error, reason} ->
+        revoke_session_dispatch(tenant_id, session, reason)
+        {:error, reason}
+    end
+  end
+
+  defp revoke_session_dispatch(tenant_id, session, reason) do
+    case Dispatches.revoke(tenant_id, session.id) do
+      {:ok, _count} ->
+        :ok
+
+      other ->
+        Logger.error(
+          "placement could not revoke the session dispatch its claim never used; the key " <>
+            "stays live until it expires: tenant_id=#{tenant_id} dispatch_id=#{session.id} " <>
+            "claim_error=#{inspect(reason)} revoke_error=#{inspect(other)}",
+          tenant_id: tenant_id
+        )
+
+        :ok
     end
   end
 
@@ -276,8 +396,8 @@ defmodule Loopctl.Delivery.Placement do
   # caller's subtree — the lineage ceiling, applied by this path rather than inherited from a
   # controller it does not go through. `nil` is a ROOT and has already been gated by
   # `may_mint_session_dispatch/2`.
-  defp mint_session_dispatch(tenant_id, agent_id, story_id, opts) do
-    caller_lineage = Keyword.fetch!(opts, :caller_lineage)
+  defp mint_session_dispatch(tenant_id, agent_id, story_id, caller, opts) do
+    caller_lineage = caller.lineage
 
     attrs = %{
       parent_dispatch_id: List.last(caller_lineage),
@@ -297,11 +417,25 @@ defmodule Loopctl.Delivery.Placement do
   # The operator test, positive and role-based — an empty lineage is ALSO what a legacy
   # env-var key and a key whose dispatch no longer resolves look like, so it cannot on its own
   # earn the right to start a tree. Identical to `LoopctlWeb.DispatchController`'s `operator?`.
+  # TOTAL over what can actually reach it, and deliberately NOT given a catch-all beyond that.
+  #
+  # Both arguments come from `resolve_caller/2`: the lineage from
+  # `Dispatches.lineage_for_api_key/2`, which returns a list or `[]`, and the role from
+  # `ApiKey.role`, an `Ecto.Enum` that is never a string and never nil on a key the auth
+  # pipeline resolved. A string role out of request params — the input that would otherwise
+  # make `Role.role_at_least?/2` raise — cannot arrive here at all now that the role is derived
+  # from the key rather than accepted as an option.
+  #
+  # A defensive clause for those was written and REMOVED: `bin/mutate.sh` opened it to `:ok`
+  # and every test still passed (exit 1), which is the tool saying nothing can reach it. An
+  # unreachable clause that reads as a guard is worse than no clause — and if `resolve_caller/2`
+  # ever hands this something else, that is a broken invariant inside this module and a crash
+  # is the right answer, not a `:root_dispatch_forbidden` that hides it.
   defp may_mint_session_dispatch([], role) do
     if Role.role_at_least?(role, :user), do: :ok, else: {:error, :root_dispatch_forbidden}
   end
 
-  defp may_mint_session_dispatch(lineage, _role) when is_list(lineage), do: :ok
+  defp may_mint_session_dispatch([_ | _], _role), do: :ok
 
   # The runner's agent, read through the tenant-scoped registry so another tenant's runner id
   # resolves to nothing. `nil` is not "claim for nobody": a story whose `implementer_dispatch_id`
@@ -322,24 +456,37 @@ defmodule Loopctl.Delivery.Placement do
   # A failure HERE is logged and swallowed: the caller is owed the refusal that caused this,
   # not this one, and the claim's lease plus `ReclaimExpiredClaimsWorker` is the backstop that
   # already exists for a placement whose node died at this exact point.
+  #
+  # **AND IT HAS TO SWALLOW A RAISE, NOT ONLY AN `{:error, _}`.** A `case` alone did not, and
+  # the paths that raise are the ordinary ones rather than exotica:
+  # `force_unclaim_story/3`'s own result `case` matches three shapes, so a failure in its
+  # `:stage` or `:audit` step is a `CaseClauseError`; `Stages.follow_release/5` hard-matches
+  # `{1, [updated]}`, so a reclaimer that got there first is a `MatchError`; and that
+  # `AdminRepo` transaction sets no `lock_timeout`, so a contended story row raises a
+  # `DBConnection` error. None of those is `{:error, _}`, so each one replaced the push refusal
+  # the caller is owed with an exception, LOST the original reason, and left the claim standing
+  # anyway — strictly worse than the outcome this function exists to improve on.
   defp release_claim(tenant_id, story_id, reason, opts) do
     case Progress.force_unclaim_story(tenant_id, story_id,
            actor_label: Keyword.get(opts, :actor_label)
          ) do
-      {:ok, _story} ->
-        :ok
-
-      other ->
-        Logger.error(
-          "placement could not release the claim it made; the lease is the backstop: " <>
-            "tenant_id=#{tenant_id} story_id=#{story_id} " <>
-            "placement_error=#{inspect(reason)} release_error=#{inspect(other)}",
-          tenant_id: tenant_id,
-          story_id: story_id
-        )
-
-        :ok
+      {:ok, _story} -> :ok
+      other -> log_release_failure(tenant_id, story_id, reason, other)
     end
+  rescue
+    error -> log_release_failure(tenant_id, story_id, reason, error)
+  end
+
+  defp log_release_failure(tenant_id, story_id, reason, outcome) do
+    Logger.error(
+      "placement could not release the claim it made; the lease is the backstop: " <>
+        "tenant_id=#{tenant_id} story_id=#{story_id} " <>
+        "placement_error=#{inspect(reason)} release_error=#{inspect(outcome)}",
+      tenant_id: tenant_id,
+      story_id: story_id
+    )
+
+    :ok
   end
 
   defp implementer_dispatch_id(tenant_id, story_id) do
