@@ -29,6 +29,15 @@ defmodule Loopctl.DeliveryGates.Measurement.RepoHistory do
 
   @pr_number ~r/\(#(\d+)\)\s*\z/
 
+  # PINNED, on every diff read, to git's own documented default. Four other knobs are already
+  # pinned (`-M`, `--no-color`, `--no-ext-diff`, `--no-textconv`) and this was the one left to a
+  # machine's `~/.gitconfig` — and it is not cosmetic: the algorithm decides which lines a hunk
+  # contains, so it moves BOTH the oracle's input and the numstat counts. The committed artifact
+  # has a change at exactly 1,000 changed lines and another at exactly 12 files, either of which
+  # crosses the bound under a different algorithm, so two operators re-running one window would
+  # not merely differ in a count — they would differ in an OUTCOME.
+  @algorithm "--diff-algorithm=myers"
+
   @type runner :: ([String.t()] -> {:ok, binary()} | {:error, term()})
 
   @type opts :: [
@@ -75,14 +84,16 @@ defmodule Loopctl.DeliveryGates.Measurement.RepoHistory do
           {:ok, Change.t()} | {:error, {String.t(), term()}}
   def change(repo, sha, opts \\ []) do
     with {:ok, [parent | _] = _parents, meta} <- header(repo, sha, opts),
-         {:ok, diff} <- read(repo, ["diff", "--name-status", "-M", "-z", parent, sha], opts),
+         {:ok, diff} <-
+           read(repo, ["diff", "--name-status", "-M", @algorithm, "-z", parent, sha], opts),
          # `-M` on the DIFFSTAT too, not only on the name-status read. Without it the two reads
          # disagree whenever `diff.renames` is off in a machine's own gitconfig: the name-status
          # read (which passes it explicitly) sees one rename, the numstat read sees an add plus a
          # delete and inflates both counts. Two operators re-running the same window would get
          # different artifacts, which is exactly what the compare-against-the-last-run convention
          # cannot survive.
-         {:ok, numstat} <- read(repo, ["diff", "--numstat", "-M", "-z", parent, sha], opts),
+         {:ok, numstat} <-
+           read(repo, ["diff", "--numstat", "-M", @algorithm, "-z", parent, sha], opts),
          {:ok, head_files} <- read(repo, ["ls-tree", "-r", "--name-only", "-z", sha], opts),
          {:ok, base_files} <- read(repo, ["ls-tree", "-r", "--name-only", "-z", parent], opts),
          {:ok, content} <- content(repo, parent, sha, opts) do
@@ -119,15 +130,35 @@ defmodule Loopctl.DeliveryGates.Measurement.RepoHistory do
     end
   end
 
-  @doc "The default runner: `git -C <repo> <args>`, read-only."
+  @doc """
+  The default runner: `git -C <repo> <args>`, read-only.
+
+  stdout is captured ALONE. Merging stderr into it (`stderr_to_stdout: true`) is wrong here even
+  though the command SUCCEEDED: git writes advisory warnings to stderr on a zero exit —
+  `warning: unable to access ...`, a `core.fsmonitor` complaint, a detached-HEAD notice — and
+  `ls-tree -z` output is then NUL-split into the repository file list, so a warning becomes a
+  PHANTOM PATH in the list every stale-trigger check is run against. On a non-zero exit the
+  command is re-run with stderr merged, purely to build the error MESSAGE; that second run never
+  supplies bytes anything parses.
+  """
   @spec git(String.t(), [String.t()]) :: {:ok, binary()} | {:error, term()}
   def git(repo, args) do
-    case System.cmd("git", ["-C", repo | args], stderr_to_stdout: true) do
+    case System.cmd("git", ["-C", repo | args], stderr_to_stdout: false) do
       {output, 0} -> {:ok, output}
-      {output, status} -> {:error, {:git_failed, status, String.trim(output)}}
+      {_output, status} -> {:error, {:git_failed, status, diagnostic(repo, args)}}
     end
   rescue
     error -> {:error, {:git_unavailable, Exception.message(error)}}
+  end
+
+  # Error MESSAGE only. It re-runs the command, so it may observe a repository that has moved;
+  # that is acceptable for a diagnostic and is why it never feeds a parse.
+  defp diagnostic(repo, args) do
+    case System.cmd("git", ["-C", repo | args], stderr_to_stdout: true) do
+      {output, _status} -> String.trim(output)
+    end
+  rescue
+    _error -> "stderr not captured"
   end
 
   # -- reading ------------------------------------------------------------------------------
@@ -161,6 +192,7 @@ defmodule Loopctl.DeliveryGates.Measurement.RepoHistory do
         "diff",
         "--unified=0",
         "-M",
+        @algorithm,
         "--no-color",
         "--no-ext-diff",
         "--no-textconv",

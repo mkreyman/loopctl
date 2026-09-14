@@ -242,6 +242,53 @@ defmodule Loopctl.DeliveryGates.Measurement.ReportTest do
       assert full.meta.trigger_status.detail =~ "priv/secret/**"
     end
 
+    test "a meta key NOBODY allow-listed does not reach a redacted artifact" do
+      # The deny-list version of this published every future key by default, and that defect
+      # reappeared the same day through a DEFAULT (`--corpus` falling back to a file path). The
+      # allow-list is what makes an unforeseen key safe.
+      meta = %{repo: "acme/repo", some_future_key: "/home/someone/secrets/path"}
+
+      redacted = Report.gate_b([], meta)
+
+      refute Map.has_key?(redacted.meta, :some_future_key)
+      assert redacted.meta.repo == "acme/repo"
+      assert Report.gate_b([], meta, detail: :full).meta.some_future_key =~ "secrets"
+    end
+
+    test "every published meta key is one somebody put on the allow-list" do
+      meta = Map.new(Report.published_meta_keys(), &{&1, "value"})
+
+      assert Report.gate_b([], meta).meta |> Map.keys() |> Enum.sort() ==
+               Enum.sort(Report.published_meta_keys())
+    end
+
+    test "the keys that IDENTIFY a run do survive redaction" do
+      # The test above builds its input FROM the allow-list, so it moves with any change to it
+      # and pins nothing in the still-published direction — a mutation removing a key passed it.
+      # These are named literally: an artifact that cannot say which corpus, which head, which
+      # trigger document or when is not comparable with anything, which is the whole point of
+      # committing it.
+      meta = %{
+        repo: "acme/repo",
+        corpus: "acme/repo issues, all states",
+        corpus_fingerprint: "38065cd323ce",
+        head: "03ad989c",
+        trigger_fingerprint: "9e2db568545c",
+        generated_at: "2026-09-14T04:08:37Z",
+        since: "2026-03-18",
+        until: "2026-09-13",
+        tickets: 322,
+        unparseable_records: 0,
+        harness: "mix loopctl.gates.measure_a"
+      }
+
+      published = Report.gate_a([], meta).meta
+
+      for {key, value} <- meta do
+        assert Map.get(published, key) == value, "expected meta.#{key} to survive redaction"
+      end
+    end
+
     test "a parsed trigger status survives redaction unchanged" do
       meta = %{trigger_status: Report.trigger_status({:ok, :triggers})}
 

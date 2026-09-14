@@ -600,8 +600,14 @@ defmodule Loopctl.Delivery.MergePrecondition do
   rather than a second implementation of it.
 
   `facts` supplies `:repo`, `:triggers`, `:head_files` and `:base_files` (each an
-  `{:ok, value}` or an `{:error, reason}`); `pr` supplies `:diff` — the raw bytes of
-  `git diff --name-status -M -z` — and `:diffstat`.
+  `{:ok, value}` or an `{:error, reason}`); `pr` supplies `:diffstat` and `:diff`.
+
+  **`:diff` is a `Loopctl.DeliveryGates.DiffNames.parse/1` RESULT — `{:ok, %{files: _, renames:
+  _}}` or `{:error, reason}` — never the raw bytes.** That is the shape
+  `Loopctl.Delivery.GitHubPullRequestSource` puts on a pull request, and it is what lets a diff
+  that did not parse arrive as the unreadable-diff marker instead of as an argument error.
+  Passing the bytes is silently WRONG rather than loud: `merge_input/2` turns them into
+  `{:not_a_parse, _}` and every change comes back `:human`, which reads as a gate doing its job.
 
   BOTH file lists, and both failures if both are broken: the stale-trigger guard is only
   meaningful when it has seen both refs, so a caller told about one unreadable ref would

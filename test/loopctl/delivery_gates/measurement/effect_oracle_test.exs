@@ -68,6 +68,27 @@ defmodule Loopctl.DeliveryGates.Measurement.EffectOracleTest do
                EffectOracle.judge(~s|  @digest "9e2db568a837f5c5f793ed102b5485d5832af9e2"|)
     end
 
+    test "a PLAIN DECIMAL integer containing 837 or 835 does not fire :edi" do
+      # Widening the bound to admit `era835` let every ordinary integer through: `18370`,
+      # `8350`, `8375` and a version string all matched. A transaction number never has a
+      # decimal digit, a dot or a hyphen touching it.
+      for line <- [
+            "      total = 18370",
+            "      timeout: 8350,",
+            "      port: 8375",
+            ~s|      @version "1.0.837"|,
+            "      id: 9837"
+          ] do
+        assert {:ok, %{effect_bearing?: false}} = EffectOracle.judge(line),
+               "expected no :edi signal from #{line}"
+      end
+    end
+
+    test "a hyphen-separated UUID segment does not fire :edi" do
+      assert {:ok, %{effect_bearing?: false}} =
+               EffectOracle.judge(~s|  @id "9e2db568-a837-4f79-b12c-5485d5832af9"|)
+    end
+
     test "a domain spelling whose neighbour is a hex LETTER still fires :edi" do
       # `era835`: bounding by a SINGLE hex character rejected this, because `a` is hex — and
       # that silently dropped a real claims-path false negative between two runs. The bound is a
@@ -86,6 +107,21 @@ defmodule Loopctl.DeliveryGates.Measurement.EffectOracleTest do
     test "a QUALIFIED modifier does fire :billing_codes" do
       assert {:ok, %{effect_bearing?: true, families: [:billing_codes]}} =
                EffectOracle.judge("      hcpcs_modifier = row.modifier_code")
+    end
+
+    test "the SV1 field names and the bare PLURAL still fire :billing_codes" do
+      # The first narrowing dropped these along with the bare singular, with no test pinning the
+      # still-fires direction — the same gap that lost `era835`. `modifiers` is how the list is
+      # spelled wherever it is a list of HCPCS modifiers.
+      for line <- [
+            "      modifier_1 = svc.modifier_2",
+            "      modifier_3, modifier_4",
+            "      modifiers = Enum.reject(svc.modifiers, &is_nil/1)"
+          ] do
+        assert {:ok, %{effect_bearing?: true, families: [:billing_codes]}} =
+                 EffectOracle.judge(line),
+               "expected a :billing_codes signal from #{line}"
+      end
     end
 
     test "a literal HCPF modifier value fires :billing_codes" do

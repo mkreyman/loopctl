@@ -28,11 +28,19 @@ ahead of the run inside it and broke the only convention a reader has for pairin
 
 **A run's numbers and its artifact are ONE record.** Nothing quoted anywhere — a pull request
 body, this directory, a message — may come from a different run of the same command than the
-artifact beside it. The first version of this work got that wrong: the target repository's HEAD
-advanced between two runs (somebody else fetched), the corpus grew from 831 changes to 854, and
-a set of hand-reviewed numbers was reported against an artifact that no longer produced them.
-`--head` exists so that cannot recur silently: pass a previous run's recorded head sha and the
-corpus is the same one.
+artifact beside it, and that includes a BEFORE/AFTER pair straddling two runs. The first version
+of this work got it wrong twice: the target repository's HEAD advanced between two runs
+(somebody else fetched) and a set of hand-reviewed numbers was reported against an artifact that
+no longer produced them; then a claim about how a classification change moved two outcome counts
+took its "before" from the superseded run and its "after" from the current one, which made the
+two sides describe different corpora and their sums disagree. If a change's effect matters,
+report it from ONE artifact — "of the N changes in outcome X, M also carry reason Y" — or do not
+report a number for it at all.
+
+`--head` (Gate B) and `--expect-corpus` (Gate A) exist so the first half cannot recur silently:
+pass a previous run's recorded value and the corpus is the same one. Nothing can stop the second
+half but reading the two numbers you are about to put side by side and asking which run each
+came from.
 
 **The INTERPRETATION of a run does not live here.** What the numbers mean, which false negatives
 survived a hand review and which configuration defect caused them, names paths in a private
@@ -68,10 +76,19 @@ gh issue list -R owner/repo --state all --limit 1000 \
 
 mix loopctl.gates.measure_a \
   --tickets tickets.json \
-  --corpus owner/repo \
+  --corpus "owner/repo issues, all states, fetched <when>" \
+  --expect-corpus <fingerprint> \
   --out docs/measurements/gate_a_<date>.json \
   --summary docs/measurements/gate_a_<date>.md
 ```
+
+`--corpus` is a LABEL and is REQUIRED, not defaulted: it is published, and the obvious default
+is the tickets path, which is how an absolute local path reached a committed artifact once.
+
+`--expect-corpus` is Gate A's `--head`. Every Gate A signal reads a MUTABLE issue field — a
+title edited, a label applied, an issue closed as not-planned — so a corpus re-fetched a day
+later measures something else. Pass the `corpus_fingerprint` a previous run recorded and a
+corpus whose bytes differ is refused rather than measured.
 
 ### The trigger document is NOT in this repository
 

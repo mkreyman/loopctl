@@ -21,14 +21,18 @@ defmodule Loopctl.DeliveryGates.Measurement.RepoHistoryTest do
     end
   end
 
+  # The FLAGS are asserted in the key, so a dropped one is an unexpected command rather than a
+  # silently different answer. `-M` because without it the diffstat and content reads disagree
+  # with the name-status read under `diff.renames=false`; `--diff-algorithm` because the
+  # algorithm decides which lines a hunk contains and therefore moves both the oracle's input
+  # and the numstat counts.
+  @algorithm "--diff-algorithm=myers"
+
   defp key(["log", "-1" | _rest]), do: :header
   defp key(["log" | _rest] = args), do: {:log, List.last(args)}
-  defp key(["diff", "--name-status" | _rest]), do: :name_status
-  # `-M` is asserted in the KEY of the two reads that used to omit it. Without it those two
-  # disagree with the name-status read whenever a machine's gitconfig has `diff.renames` off, so
-  # two operators re-running the same window get different artifacts.
-  defp key(["diff", "--numstat", "-M" | _rest]), do: :numstat
-  defp key(["diff", "--unified=0", "-M" | _rest]), do: :content
+  defp key(["diff", "--name-status", "-M", @algorithm | _rest]), do: :name_status
+  defp key(["diff", "--numstat", "-M", @algorithm | _rest]), do: :numstat
+  defp key(["diff", "--unified=0", "-M", @algorithm | _rest]), do: :content
   defp key(["ls-tree", "-r", "--name-only", "-z", @sha]), do: :head_files
   defp key(["ls-tree", "-r", "--name-only", "-z", @parent]), do: :base_files
   defp key(args), do: args

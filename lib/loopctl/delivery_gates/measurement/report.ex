@@ -18,11 +18,11 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
     repository's content.
   - **Anything the RUN's own metadata carries** — an absolute checkout path, an absolute corpus
     path, and above all a trigger-parse error, which names a live guard pattern and the private
-    repository together. `meta/2` redacts those exactly as `row/2` redacts a row. Redacting rows
-    alone was the defect: the first committed artifact asserted no file paths reached it while
-    carrying two, and a malformed trigger document would have written a guard pattern into a
-    public file through a path the task takes BY DESIGN (it replays a configuration failure
-    rather than refusing, because the fail-closed behaviour is a real thing to measure).
+    repository together. `meta/2` redacts those exactly as `row/2` redacts a row, and it does so
+    with an ALLOW-LIST (`published_meta_keys/0`). Redacting rows alone was the first defect; a
+    deny-list was the second, and it failed the same day it was written, because a key nobody
+    had thought about (`:corpus`, defaulting to a file path) publishes by default under a
+    deny-list. Adding a meta key now requires a deliberate act by whoever wants it published.
 
   What a redacted row keeps is enough to spot-check with: the pull request NUMBER, the sha, the
   date, the diffstat, the file COUNT and the oracle's families. Anyone who can judge "would a
@@ -359,25 +359,52 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
 
   # -- meta redaction --------------------------------------------------------------------------
 
-  # `meta` is REDACTED exactly as a row is, and this is not belt-and-braces. Three values in it
-  # are as disclosing as any row:
+  # `meta` is REDACTED exactly as a row is, and this is an ALLOW-LIST, not a deny-list. The
+  # first version dropped three named keys, which made PUBLISHING the default for every key
+  # anyone adds later — and that defect reappeared within the same change, through a
+  # DEFAULT: `--corpus` was optional and fell back to the tickets file path, so the absolute
+  # path reached the artifact under a key the deny-list did not name. A deny-list has to be
+  # updated by whoever adds a key; an allow-list has to be updated by whoever wants one
+  # published, which is the person who has thought about it.
   #
-  # - `:checkout` and `:tickets_file` are ABSOLUTE local paths, so an artifact asserting that no
-  #   file path reaches it carried two.
-  # - `:trigger_status` names a configuration failure, and the task REPLAYS rather than refuses
-  #   on one by design — so this is a path the harness is built to take, not an edge. A
-  #   `Triggers.parse/2` error is `{:invalid_pattern, ["repos", "<owner/repo>", "effect_paths"],
-  #   pattern}`: a LIVE GUARD PATTERN and the private repository's name, in the committed file.
-  #   Reduced to its KIND plus the key path's DEPTH.
-  # - `:unparseable_reasons` echoes whatever a ticket record failed on. The COUNT beside it is
-  #   the number a reader needs.
-  @meta_full_only [:checkout, :tickets_file, :unparseable_reasons]
+  # What is deliberately NOT here, and why:
+  #
+  # - `:checkout` and `:tickets_file` are ABSOLUTE local paths.
+  # - `:unparseable_reasons` echoes whatever a ticket record failed on. The COUNT beside it,
+  #   `:unparseable_records`, is the number a reader needs.
+  #
+  # `:trigger_status` IS published, reduced: the task REPLAYS a configuration failure rather
+  # than refusing, by design, so it is a path the harness is built to take. A
+  # `Triggers.parse/2` error is `{:invalid_pattern, ["repos", "<owner/repo>", "effect_paths"],
+  # pattern}` — a LIVE GUARD PATTERN and the private repository's name — so only its KIND and
+  # the key path's DEPTH survive.
+  @meta_published [
+    :corpus,
+    :corpus_fingerprint,
+    :generated_at,
+    :gate,
+    :harness,
+    :head,
+    :limit,
+    :repo,
+    :since,
+    :tickets,
+    :trigger_fingerprint,
+    :trigger_shape,
+    :trigger_status,
+    :unparseable_records,
+    :until
+  ]
+
+  @doc "The meta keys a REDACTED artifact publishes. Everything else is full-detail only."
+  @spec published_meta_keys() :: [atom()]
+  def published_meta_keys, do: @meta_published
 
   defp meta(meta, :full), do: meta
 
   defp meta(meta, _redacted) do
     meta
-    |> Map.drop(@meta_full_only)
+    |> Map.take(@meta_published)
     |> Map.replace_lazy(:trigger_status, &redact_status/1)
   end
 
@@ -467,9 +494,16 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
 
   # -- rendering -------------------------------------------------------------------------------
 
+  # The summary names whatever PINS the corpus — a resolved head for Gate B, a content
+  # fingerprint for Gate A — so the human artifact says what to pass to reproduce it rather than
+  # sending a reader to the JSON for the one value they need.
   defp window_line(meta) do
     "window: #{meta[:since] || "repository start"} .. #{meta[:until] || "corpus head"}" <>
-      if(meta[:head], do: " (head #{meta[:head]})", else: "")
+      if(meta[:head], do: " (head #{meta[:head]})", else: "") <>
+      if(meta[:corpus_fingerprint],
+        do: " (corpus #{meta[:corpus_fingerprint]})",
+        else: ""
+      )
   end
 
   defp outcome_line(outcomes) do

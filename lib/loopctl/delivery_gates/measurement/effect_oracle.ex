@@ -61,14 +61,20 @@ defmodule Loopctl.DeliveryGates.Measurement.EffectOracle do
       # NOT `\b83[57]\b`: an underscore is a word character, so `\b` never fires on
       # `build_837` or `Generator837P` — the two shapes an EDI module is actually named in.
       #
-      # The bound is TWO hex characters on either side, and both halves of that were paid for.
-      # Bounded by a single DECIMAL digit it fired inside every content hash carrying the
-      # substring, so a diff full of digests read as EDI. Bounded by a single HEX character it
-      # went too far the other way and lost `era835`, `x835` and every other domain spelling
-      # whose neighbouring letter happens to be hex — which silently dropped a real claims-path
-      # false negative (PR 1263) from the corpus between two runs. A RUN of two hex characters
-      # is a digest; one letter next to a transaction number is a name.
-      ~r/(?<![0-9A-Fa-f]{2})83[57]P?(?![0-9A-Fa-f]{2})/,
+      # TWO guards, and each was paid for by the other's absence:
+      #
+      # - `(?<![0-9.\-])` / `(?![0-9.\-])` — no DECIMAL digit, dot or hyphen touching it. Without
+      #   this, `total = 18370`, `timeout: 8350`, `port: 8375` and `"1.0.837"` all fired, and a
+      #   hyphen-separated UUID leaked at its segment boundaries. A transaction number never has
+      #   a digit next to it.
+      # - `(?<![0-9A-Fa-f]{2})` / `(?![0-9A-Fa-f]{2})` — no RUN of two hex characters touching
+      #   it. That is what a content hash looks like, and without it a diff full of digests read
+      #   as EDI.
+      #
+      # A single-hex bound alone was too strong in the other direction and lost `era835` — `a`
+      # is hex — which silently dropped a real claims-path false negative (PR 1263) between two
+      # runs. Both directions are pinned by tests, because each fix here has broken the other.
+      ~r/(?<![0-9.\-])(?<![0-9A-Fa-f]{2})83[57]P?(?![0-9.\-])(?![0-9A-Fa-f]{2})/,
       ~r/\bx12\b/i,
       ~r/\bedi_/i,
       ~r/\bsegment_terminator\b/i
@@ -79,10 +85,16 @@ defmodule Loopctl.DeliveryGates.Measurement.EffectOracle do
       ~r/\bprocedure_code/,
       ~r/\bbilling_code/,
       ~r/\brevenue_code/,
-      # NOT a bare `\bmodifier`: that is an ordinary programming word (a modifier function, a
-      # modifier key, a CSS modifier) and it fired on code with no billing content at all. The
-      # DOMAIN sense always appears qualified, or as one of the literal HCPF modifier values.
+      # NOT a bare singular `\bmodifier`: that is an ordinary programming word (a modifier
+      # function, a modifier key, a CSS modifier) and it fired on code with no billing content
+      # at all. The domain sense arrives qualified, as the SV1 field names `modifier_1`..
+      # `modifier_4`, or as the PLURAL — which the first narrowing dropped along with the bare
+      # word, and which is how the list is spelled everywhere it is a list of HCPCS modifiers.
+      # `modifiers` does occur in ordinary programming prose; that is the accepted cost of not
+      # losing the domain spelling, and both directions have a test.
       ~r/\bmodifier_(code|codes|program|list|values?)\b/,
+      ~r/\bmodifier_[1-4]\b/,
+      ~r/\bmodifiers\b/,
       ~r/\b(hcpcs|billing|service|claim|payer|procedure)_modifiers?\b/,
       # `SE` is deliberately absent: it is an X12 segment id, already in the :edi family, and
       # listing it here would report one signal as two families.
