@@ -1,22 +1,15 @@
 {
   "meta": {
-    "head": "03ad989c711a433812727fdb4bee8d512857fe5d",
+    "head": "3bf59943d1d6a62f8838513a1021ef3c29b28f3b",
     "ref": "HEAD",
     "repo": "mkreyman/home_care_billing",
-    "checkout": "/home/mkreyman/workspace/home_care_billing",
-    "tree_files": 3982,
-    "trigger_fingerprint": "5d6b6b65b602",
-    "generated_at": "2026-09-14T03:18:58.260680Z",
-    "harness": "mix loopctl.gates.check_drift"
+    "generated_at": "2026-09-14T04:22:09.484299Z",
+    "harness": "mix loopctl.gates.check_drift",
+    "trigger_checksum_source": "operator_pin",
+    "trigger_fingerprint": "5d6b6b65b602"
   },
   "check": "gate_b_trigger_drift",
   "question": "Does every configured Gate B pattern still match a file in the target repository?",
-  "totals": {
-    "patterns": 16,
-    "effect_patterns": 13,
-    "human_patterns": 3,
-    "unmatched": 0
-  },
   "patterns": [
     {
       "index": 0,
@@ -98,5 +91,11 @@
       "matched": true,
       "kind": "human"
     }
-  ]
+  ],
+  "totals": {
+    "effect_patterns": 13,
+    "human_patterns": 3,
+    "patterns": 16,
+    "unmatched": 0
+  }
 }

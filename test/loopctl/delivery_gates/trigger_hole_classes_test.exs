@@ -150,17 +150,41 @@ defmodule Loopctl.DeliveryGates.TriggerHoleClassesTest do
 
       human = ["lib/app_web/router.ex"]
 
-      for file <- @repo_files ++ ["mix.exs", "test/app/claims_test.exs"] do
-        narrow_outcome = evaluate(triggers(narrow, human), file).outcome
-        wide_outcome = evaluate(triggers(wide, human), file).outcome
-
-        # `:clear` is the only permissive outcome. Widening may turn a clear into a
-        # prove_effect; it may never turn a prove_effect or a human into a clear.
-        if narrow_outcome != :clear do
-          assert wide_outcome != :clear,
-                 "#{file}: widening the pattern set cleared a change the narrower set did not"
+      outcomes =
+        for file <- @repo_files ++ ["mix.exs", "test/app/claims_test.exs"] do
+          {file, evaluate(triggers(narrow, human), file).outcome,
+           evaluate(triggers(wide, human), file).outcome}
         end
+
+      # `:clear` is the only permissive outcome. Widening may turn a clear into a prove_effect;
+      # it may never turn a prove_effect or a human into a clear.
+      for {file, narrow_outcome, wide_outcome} <- outcomes, narrow_outcome != :clear do
+        assert wide_outcome != :clear,
+               "#{file}: widening the pattern set cleared a change the narrower set did not"
       end
+
+      # Both counts, because the assertion above lives inside a filter and a trimmed
+      # @repo_files or a trimmed narrow set would empty it — leaving a test that passes by
+      # checking nothing. Neither number is the point on its own; a zero in either means the
+      # property was never exercised.
+      guarded_under_narrow = Enum.count(outcomes, fn {_f, narrow, _w} -> narrow != :clear end)
+
+      assert guarded_under_narrow > 0,
+             "no path is non-clear under the narrow set, so the widening property is vacuous"
+
+      # The property the PR actually claims: widening MOVES changes out of the auto-merge set.
+      newly_guarded =
+        Enum.count(outcomes, fn {_f, narrow, wide} ->
+          narrow == :clear and wide == :prove_effect
+        end)
+
+      assert newly_guarded > 0,
+             "no path moved from clear to prove_effect, so the wider set guards nothing new"
+
+      # And the direction, over the whole set rather than per file: the wide set clears strictly
+      # fewer paths.
+      assert Enum.count(outcomes, fn {_f, _n, wide} -> wide == :clear end) <
+               Enum.count(outcomes, fn {_f, narrow, _w} -> narrow == :clear end)
     end
   end
 end

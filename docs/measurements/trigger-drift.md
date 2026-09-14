@@ -49,22 +49,51 @@ proved nothing, and "no patterns drifted" over no files is a vacuous pass.
 These three variables are read only by that test. They are not application configuration and do
 not belong in `deploy/FLY_SECRETS.md`.
 
-**The bound, stated rather than left to be discovered:** artifact mode cannot see a rename that
-happened after the artifact was written. It makes a committed drifted artifact red and a missing
-one red; it does not make a STALE one red, because a staleness deadline would fail builds on
-quiet weeks for a reason unrelated to drift. Closing that gap needs the check to run where the
-tree is — the target repository's own CI, or a scheduled check reading the tree through the
-GitHub API. Both are named as follow-on work in the pull request that added this.
+### Two bounds on artifact mode, stated rather than left to be discovered
+
+**It cannot see a rename that happened AFTER the artifact was written.** It makes a committed
+drifted artifact red and a missing one red; it does not make a STALE one red, because a
+staleness deadline would fail builds on quiet weeks for a reason unrelated to drift.
+
+**It says nothing about WHICH document is live.** The artifact's `meta.trigger_fingerprint`
+names the document the check ran against, and while a corrected document is written but not yet
+imported that is not the one production is running — so a green build here is green over a
+configuration in a file, not over the gate as deployed. Nothing in this repository can close
+that: the live document is a secret and loopctl's CI cannot read it. Compare the fingerprint on
+the artifact against the running release before reading a green build as a statement about
+production:
+
+```bash
+fly ssh console -a loopctl -C "/app/bin/loopctl rpc 'IO.inspect(Loopctl.DeliveryGates.Config.triggers())'"
+```
+
+Closing either needs the check to run where the tree and the live document are — the target
+repository's own CI, or a scheduled check in production reading the tree through the GitHub API.
+Both are named as follow-on work in the pull request that added this.
 
 ## The artifact
 
 `trigger_drift.json` carries, per pattern: its kind, its configuration index, and whether it
 matched anything. A BOOLEAN, not the match count — the assertion needs only "at least one", and
-a count would publish how broadly each guard reaches for no gain. The unredacted artifact
-(`tmp/gate_measurement/trigger_drift.full.json`, gitignored) carries the patterns and the counts.
+a count would publish how broadly each guard reaches for no gain.
+
+**`meta` is redacted on the same rule.** The local absolute checkout path and `tree_files`, the
+target repository's file count, are dropped: a path names the machine that ran the check, and a
+file count is a count of a private repository under a policy that already refuses per-pattern
+counts. What remains identifies the run without describing the target — the `owner/repo` key,
+the ref and head, the trigger fingerprint, whether that fingerprint came from an operator's pin
+or was computed, the timestamp and the harness name. The unredacted artifact
+(`tmp/gate_measurement/trigger_drift.full.json`, gitignored) carries all of it.
 
 `meta.trigger_fingerprint` is the first 12 characters of the document's SHA-256, the same
 truncated commitment the measurement artifacts use and for the same reason: two runs can say
 whether they checked the same configuration, and a reader who can guess the document
 byte-for-byte can confirm the guess. Regenerate the artifact whenever the document changes, so
 the fingerprint on it names the configuration that is live.
+
+Pass `--sha256` with the checksum the operator pinned in production. It is what
+`Triggers.parse/2` verifies against, so a local file whose bytes differ from the pinned ones
+fails the run — which is the only way the trailing-newline trap in `deploy/FLY_SECRETS.md` is
+catchable here. Without it the document is verified against its own hash, which checks the gate
+rather than the operator's checksum discipline; `meta.trigger_checksum_source` records which
+happened.

@@ -49,8 +49,17 @@ defmodule Loopctl.DeliveryGates.TriggerDrift do
   """
   @spec unmatched(RepoTriggers.t(), term()) :: {:ok, [String.t()]} | {:error, error()}
   def unmatched(%RepoTriggers{} = triggers, repo_files) do
-    with {:ok, coverage} <- coverage(triggers, repo_files) do
-      {:ok, for(%{matches: 0, pattern: pattern} <- coverage, do: pattern)}
+    with :ok <- usable(repo_files) do
+      # `Enum.any?` and not `coverage/2`'s count: this runs on Gate B's per-evaluation path, and
+      # the question here is only "at least one", so it stops at the first match. `coverage/2`
+      # counts because the artifact wants the number; the two would otherwise be one function
+      # doing the expensive half of the work for the caller that does not need it.
+      drifted =
+        for glob <- triggers.effect_paths ++ triggers.human_paths,
+            not Enum.any?(repo_files, &Glob.match?(glob, &1)),
+            do: glob.source
+
+      {:ok, drifted}
     end
   end
 
@@ -63,17 +72,21 @@ defmodule Loopctl.DeliveryGates.TriggerDrift do
   from one matcher.
   """
   @spec coverage(RepoTriggers.t(), term()) :: {:ok, [pattern_coverage()]} | {:error, error()}
-  def coverage(%RepoTriggers{} = triggers, [_ | _] = repo_files) do
-    if Enum.all?(repo_files, &is_binary/1) do
+  def coverage(%RepoTriggers{} = triggers, repo_files) do
+    with :ok <- usable(repo_files) do
       {:ok,
        tagged(triggers.effect_paths, :effect, repo_files) ++
          tagged(triggers.human_paths, :human, repo_files)}
-    else
-      {:error, :invalid_repo_files}
     end
   end
 
-  def coverage(%RepoTriggers{}, _repo_files), do: {:error, :missing_repo_files}
+  # The one place the fail-closed rule is decided, so `unmatched/2` and `coverage/2` cannot
+  # come to different conclusions about a file list neither of them can use.
+  defp usable([_ | _] = repo_files) do
+    if Enum.all?(repo_files, &is_binary/1), do: :ok, else: {:error, :invalid_repo_files}
+  end
+
+  defp usable(_repo_files), do: {:error, :missing_repo_files}
 
   defp tagged(globs, kind, repo_files) do
     globs
