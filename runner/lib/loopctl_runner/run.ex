@@ -207,6 +207,9 @@ defmodule LoopctlRunner.Run do
   end
 
   defp with_worktree(config, story, run_dir, trace, run_seq, run_id, opts) do
+    # The session environment is rendered per run (Config.session_env_for/3).
+    opts = Keyword.put(opts, :run_id, run_id)
+
     path = Worktree.path_for(story.repo_path, story.id)
 
     case WorktreeLock.acquire(config.runs_dir, path, run_id) do
@@ -239,7 +242,16 @@ defmodule LoopctlRunner.Run do
         })
 
         stage(opts, {:worktree, %{branch: story.branch, worktree_path: path}})
-        run_session(config, story, run_dir, trace, run_seq, path, opts)
+
+        run_session(
+          config,
+          story,
+          run_dir,
+          trace,
+          run_seq,
+          path,
+          opts
+        )
 
       {:error, reason} ->
         Trace.emit(trace, "worktree.failed", run_seq, %{"error" => reason})
@@ -261,7 +273,9 @@ defmodule LoopctlRunner.Run do
            run_dir: run_dir,
            trace: trace,
            parent: run_seq,
-           env: Keyword.get(opts, :env, [])
+           env:
+             Config.session_env_for(config, story.repo, story.id, Keyword.fetch!(opts, :run_id)) ++
+               Keyword.get(opts, :env, [])
          ), nil}
       catch
         :exit, reason ->

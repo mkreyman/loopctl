@@ -20,6 +20,7 @@ defmodule LoopctlRunner.Config do
     :repos,
     :branch_prefixes,
     allowed_tools: [],
+    session_env: %{},
     control: nil,
     max_wall_clock_s: 3600,
     max_turns: 200,
@@ -37,6 +38,7 @@ defmodule LoopctlRunner.Config do
           repos: %{optional(String.t()) => String.t()},
           branch_prefixes: [String.t()],
           allowed_tools: [String.t()],
+          session_env: %{optional(String.t()) => %{optional(String.t()) => String.t()}},
           control: LoopctlRunner.ControlConfig.t() | nil,
           max_wall_clock_s: pos_integer(),
           max_turns: pos_integer(),
@@ -81,6 +83,7 @@ defmodule LoopctlRunner.Config do
          {:ok, repos} <- repos(map),
          {:ok, prefixes} <- branch_prefixes(map),
          {:ok, tools} <- allowed_tools(map),
+         {:ok, session_env} <- session_env(map, repos),
          {:ok, control} <- control(map),
          {:ok, ints} <- positive_ints(map) do
       {:ok,
@@ -93,6 +96,7 @@ defmodule LoopctlRunner.Config do
            repos: repos,
            branch_prefixes: prefixes,
            allowed_tools: tools,
+           session_env: session_env,
            control: control
          ] ++ ints
        )}
@@ -202,6 +206,73 @@ defmodule LoopctlRunner.Config do
       _ ->
         {:error, "config allowed_tools must be a list"}
     end
+  end
+
+  # Per repo, extra environment for that repo's sessions: {"repo": {"NAME": "value"}}. In a value,
+  # "{story}" becomes 8 hex of a hash of the story id, stable across that story's runs, and "{run}"
+  # the first 8 hex of the run id. It is how a repo's own knobs keep a run apart from the machine's
+  # shared state (home_care_billing's TEST_DB_BASE gives a story its own test database, so a
+  # branch's migration never touches the checkout's). Prefer {story}: nothing drops what a value
+  # creates, so {run} leaves a new database behind on every run, while {story} reuses one per
+  # story, as its worktree is. A name the runner sets or reads itself (LOOP_*, LOOPCTL_*,
+  # ANTHROPIC_*, GIT_*) is refused, as is a repo not in repos.
+  @env_name ~r/\A[A-Z_][A-Z0-9_]{0,63}\z/
+  @reserved_env ["LOOP_", "LOOPCTL_", "ANTHROPIC_", "GIT_"]
+
+  defp session_env(map, repos) do
+    case Map.get(map, "session_env", %{}) do
+      env when is_map(env) ->
+        Enum.reduce_while(env, {:ok, %{}}, &add_repo_env(&1, &2, repos))
+
+      _ ->
+        {:error, "config session_env must be an object"}
+    end
+  end
+
+  defp add_repo_env({repo, vars}, {:ok, acc}, repos) do
+    case repo_env(repo, vars, repos) do
+      {:ok, vars} -> {:cont, {:ok, Map.put(acc, repo, vars)}}
+      {:error, _} = error -> {:halt, error}
+    end
+  end
+
+  defp repo_env(repo, vars, repos) when is_map(vars) do
+    cond do
+      not Map.has_key?(repos, repo) ->
+        {:error, "config session_env names #{inspect(repo)}, which is not in repos"}
+
+      bad = Enum.find(vars, fn {name, value} -> not env_var?(name, value) end) ->
+        {name, _} = bad
+        {:error, "config session_env.#{repo}.#{name} is not an allowed variable and string value"}
+
+      true ->
+        {:ok, vars}
+    end
+  end
+
+  defp repo_env(repo, _vars, _repos),
+    do: {:error, "config session_env.#{repo} must be an object"}
+
+  defp env_var?(name, value) do
+    is_binary(name) and name =~ @env_name and
+      not Enum.any?(@reserved_env, &String.starts_with?(name, &1)) and
+      is_binary(value) and byte_size(value) <= 1024 and not String.contains?(value, <<0>>)
+  end
+
+  @doc """
+  The session environment `config` adds for `story`'s run `run_id` in `repo`, as name-value pairs.
+  """
+  @spec session_env_for(t(), String.t(), String.t(), String.t()) :: [{String.t(), String.t()}]
+  def session_env_for(%__MODULE__{session_env: env}, repo, story_id, run_id) do
+    run = binary_part(run_id, 0, 8)
+    story = :sha256 |> :crypto.hash(story_id) |> Base.encode16(case: :lower) |> binary_part(0, 8)
+
+    env
+    |> Map.get(repo, %{})
+    |> Enum.sort()
+    |> Enum.map(fn {name, value} ->
+      {name, value |> String.replace("{story}", story) |> String.replace("{run}", run)}
+    end)
   end
 
   # Absent means this machine runs stories by hand only and never connects to loopctl.

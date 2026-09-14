@@ -152,6 +152,16 @@ A run's own record is its directory under `runs_dir`: `state.json`, `trace.ndjso
 and `stderr.log`, plus `trace_ship.json` once its trace is fully shipped or given up on, and
 `mix loopctl.tree <run dir>` prints the trace as a tree.
 
+### Per-repo session environment
+
+`session_env` in the runner config adds environment variables to every session for one repo, e.g.
+`{"home_care_billing": {"TEST_DB_BASE": "home_care_billing_loop_{story}_test"}}`, so a branch's
+migration never touches the checkout's test database. In a value, `{story}` becomes 8 hex of a hash
+of the story id, stable across that story's runs, and `{run}` the first 8 hex of the run id. Prefer
+`{story}`: nothing drops what a session creates, so `{run}` leaves a new database behind on every
+run, while `{story}` reuses one per story, as the story's worktree is reused. Names the runner sets
+or reads itself (`LOOP_*`, `LOOPCTL_*`, `ANTHROPIC_*`, `GIT_*`) are refused.
+
 ### Hand-filed runs
 
 ```bash

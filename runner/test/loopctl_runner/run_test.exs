@@ -34,6 +34,25 @@ defmodule LoopctlRunner.RunTest do
 
   defp types(events), do: Enum.map(events, & &1["type"])
 
+  test "a repo's session_env reaches its session, with {run} and {story} rendered", %{
+    root: root,
+    state: state
+  } do
+    result =
+      run!(root, state, [{"FAKE_CLAUDE_MODE", "stream"}], %{}, %{
+        "session_env" => %{
+          "fixture" => %{"RUNNER_ENV_PROBE" => "fixture_loop_{run}_{story}_test"}
+        }
+      })
+
+    assert result.status == "succeeded"
+    short = binary_part(result.run_id, 0, 8)
+    story = :sha256 |> :crypto.hash("s1") |> Base.encode16(case: :lower) |> binary_part(0, 8)
+
+    assert File.read!(Path.join(state, "env")) =~
+             ~r/^RUNNER_ENV_PROBE=fixture_loop_#{short}_#{story}_test$/m
+  end
+
   test "a story runs claude in the worktree and leaves a reconstructable trace", %{
     root: root,
     state: state

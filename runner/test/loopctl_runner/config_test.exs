@@ -89,4 +89,43 @@ defmodule LoopctlRunner.ConfigTest do
       assert rest =~ "not an executable file"
     end
   end
+
+  describe "session_env" do
+    defp with_env(root, env), do: Map.put(config_map(root), "session_env", env)
+
+    test "is per repo, and refuses names the runner owns, unknown repos, and non-string values" do
+      root = tmp_dir!("session-env")
+      repo = config_map(root)["repos"] |> Map.keys() |> hd()
+
+      env = %{repo => %{"TEST_DB_BASE" => "x_{story}", "RUN_PROBE" => "r_{run}"}}
+      assert {:ok, config} = Config.from_map(with_env(root, env))
+
+      [{"RUN_PROBE", "r_01234567"}, {"TEST_DB_BASE", "x_" <> story}] =
+        Config.session_env_for(config, repo, "story-a", "0123456789abcdef")
+
+      # {story} is stable across a story's runs, and differs between stories.
+      assert [_, {"TEST_DB_BASE", "x_" <> ^story}] =
+               Config.session_env_for(config, repo, "story-a", "fedcba9876543210")
+
+      assert [_, {"TEST_DB_BASE", other}] =
+               Config.session_env_for(config, repo, "story-b", "0123456789abcdef")
+
+      assert other != "x_" <> story
+      assert byte_size(story) == 8
+      assert Config.session_env_for(config, "other", "story-a", "0123456789abcdef") == []
+
+      for bad <- [
+            %{repo => %{"LOOP_MODE" => "0"}},
+            %{repo => %{"LOOPCTL_LAUNCHER_SETSID" => "1"}},
+            %{repo => %{"ANTHROPIC_API_KEY" => "x"}},
+            %{repo => %{"GIT_DIR" => "/tmp"}},
+            %{repo => %{"lower" => "x"}},
+            %{repo => %{"OK" => 1}},
+            %{"not_a_repo" => %{"OK" => "x"}},
+            %{repo => "x"}
+          ] do
+        assert {:error, _} = Config.from_map(with_env(root, bad)), inspect(bad)
+      end
+    end
+  end
 end
