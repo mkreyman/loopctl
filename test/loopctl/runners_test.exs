@@ -44,7 +44,11 @@ defmodule Loopctl.RunnersTest do
 
       agent = AdminRepo.get!(Agent, runner.agent_id)
       assert agent.tenant_id == tenant.id
-      assert agent.name == Runners.agent_name("minis")
+      # The LITERAL, not `Runners.agent_name("minis")`: comparing the name against the
+      # function that produced it is a tautology no change to that function can fail, and
+      # `bin/mutate.sh` said so — rewriting the prefix came back inert against this test.
+      assert agent.name == "runner:minis"
+      assert Runners.agent_name("minis") == "runner:minis"
       assert agent.agent_type == :implementer
 
       # `Loopctl.Delivery.Placement` claims the story for THIS agent, and a claimed story with
