@@ -595,7 +595,7 @@ defmodule LoopctlRunner.Control do
 
     case build_status(a.draining, a.accepts_dispatches, measured, in_flight(a)) do
       {:ok, payload} ->
-        case push(socket, a.topic, "status", payload) do
+        case push_event(socket, a.topic, "status", payload) do
           {:ok, ref} ->
             # Every push is tracked until its own reply lands: tracking only one would leave a
             # late reply matching nothing, or a push sent meanwhile unwatched once the first
@@ -1558,7 +1558,7 @@ defmodule LoopctlRunner.Control do
   end
 
   defp push_stage(socket, id, stream, payload) do
-    case push(socket, socket.assigns.topic, "stage", payload) do
+    case push_event(socket, socket.assigns.topic, "stage", payload) do
       {:ok, ref} ->
         Logger.info(
           "stage report sent: #{payload["from"]} -> #{payload["to"]}",
@@ -1882,7 +1882,7 @@ defmodule LoopctlRunner.Control do
   end
 
   defp push_dispatch_reply(socket, payload, story_id, carried? \\ false) do
-    case push(socket, socket.assigns.topic, "dispatch_reply", payload) do
+    case push_event(socket, socket.assigns.topic, "dispatch_reply", payload) do
       {:ok, ref} ->
         Logger.info("dispatch_reply sent: #{payload["decision"]} (#{payload["reason"]})",
           dispatch_id: payload["dispatch_id"],
@@ -2096,8 +2096,54 @@ defmodule LoopctlRunner.Control do
     assign(socket, trace_settled: Map.put(socket.assigns.trace_settled, run.run_id, :abandoned))
   end
 
+  @doc """
+  `Slipstream.push/4`, or a deliberate restart of Control when the connection is gone.
+
+  A push is a `GenServer.call` to the connection process. Two outcomes mean that process is
+  gone, or no longer answering, while Control still believes it is joined:
+
+    * the call EXITS: the process stopped mid-call (loopctl closing the socket for a deploy,
+      14:02:06 on 2026-09-14) or did not answer in time;
+    * it returns `{:error, :not_connected}`: the process died before the call, without a
+      disconnect reaching Control (a crash sends none).
+
+  Neither can be handled at a push site. A dead connection sends no disconnect, so nothing would
+  ever rejoin, and a timed-out push may still have been delivered. The restart is the recovery
+  Control already has and the first end-to-end run proved: it reconnects, resends pending
+  accepts (an identical repeat is answered `ok`), resumes every trace from loopctl's cursor and
+  every run's stages from its state. What this adds is the cause, logged in one line before the
+  exit.
+
+  The exit is `{:push_exited, reason}`, deliberately NOT `{:shutdown, _}`: Control's child spec
+  is `:transient`, which restarts only an abnormal exit, and `{:shutdown, _}` is how `fatal/2`
+  stops Control for good. `reason` is the call's own exit reason, without the call's arguments,
+  which carry the whole socket.
+  """
+  @spec push_event(Slipstream.Socket.t(), String.t(), String.t(), map()) ::
+          {:ok, term()} | {:error, term()}
+  def push_event(socket, topic, event, payload) do
+    case push_or_exit_reason(socket, topic, event, payload) do
+      {:exited, reason} -> restart_on_push(event, reason)
+      {:error, :not_connected} -> restart_on_push(event, :not_connected)
+      result -> result
+    end
+  end
+
+  # The catch stays in here: an exit raised by the restart must not be caught by it.
+  defp push_or_exit_reason(socket, topic, event, payload) do
+    push(socket, topic, event, payload)
+  catch
+    :exit, {reason, {GenServer, :call, _args}} -> {:exited, reason}
+    :exit, reason -> {:exited, reason}
+  end
+
+  defp restart_on_push(event, reason) do
+    Logger.warning("#{event} push failed (#{inspect(reason)}); restarting the loopctl client")
+    exit({:push_exited, reason})
+  end
+
   defp push_trace(socket, run, kind, event, payload, next) do
-    case push(socket, socket.assigns.topic, event, payload) do
+    case push_event(socket, socket.assigns.topic, event, payload) do
       {:ok, ref} ->
         count = if kind == :batch, do: length(payload["events"]), else: 0
         first = if kind == :batch, do: hd(payload["events"])["seq"]
