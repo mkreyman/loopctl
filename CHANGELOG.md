@@ -23,18 +23,21 @@ All notable changes to loopctl are documented here.
   button reuses the delivery id, so a row younger than that is still the idempotency evidence
   that makes a replay a no-op.
 
-  **To drain a backlog faster than the hourly cadence**, enqueue the worker with
-  `%{"batch_size" => n, "budget" => n}` (positive integers; anything else is ignored with a
-  warning). The cron entry passes no args. The override raises the TRACE half only — the
-  delivery half is capped at its own constants, which are sized for the three-connection admin
-  pool it runs on.
+  **The job args `%{"batch_size" => n, "budget" => n}` only ever make a run SMALLER.** Each is
+  capped at its half's own constants — a positive integer above them is lowered, anything that
+  is not a positive integer is ignored with a warning — because an uncapped override put one
+  20,000-row `DELETE` in a single transaction, which then exceeded the statement timeout,
+  rolled back and retried identically, so that tenant pruned nothing at all. To clear a
+  backlog faster, enqueue more runs; each one is bounded. A run also stops at a ten-minute
+  wall clock and reports `tenants_skipped` rather than holding a cleanup slot for hours.
 
   **Alert on `tenants_failed` as well as `tenants_at_budget`** — both are per table on
-  `[:loopctl, :delivery_loop, :prune]`. One tenant's failure never stops the others, but a run
-  where every tenant failed emits the profile of an idle healthy fleet on `tenants_at_budget`
-  alone: nothing deleted, nobody at budget. A fault gets one immediate retry; if it recurs the
-  tenant is counted, logged with its id, and the job reports an error (so Oban retries it and
-  a persistent fault ends as a discarded job rather than a green run).
+  `[:loopctl, :delivery_loop, :prune]`. One tenant's failure never stops the others and does
+  NOT fail the job (that would re-run the whole fan-out three times an hour and bias the
+  fleet-wide discard rate), so `tenants_failed` is the only signal that moves: a run where
+  every tenant failed would otherwise look exactly like an idle healthy fleet. Only a run
+  where NOTHING succeeded reports an error, and the worker's backoff is minutes rather than
+  seconds so a rolling deploy — the ordinary cause — outlasts nothing.
 
   **Age alone never decides.** A trace event whose dispatch has not been released is kept
   whatever its age — an unreleased slot means the session may still be running — and a

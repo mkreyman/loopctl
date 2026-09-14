@@ -157,6 +157,12 @@ defmodule LoopctlWeb.Telemetry do
         tags: [:table],
         description: "Tenants whose retention pass could not be completed, by table."
       ),
+      last_value("loopctl.delivery_loop.prune.tenants_skipped",
+        event_name: [:loopctl, :delivery_loop, :prune],
+        measurement: :tenants_skipped,
+        tags: [:table],
+        description: "Tenants a retention run did not reach before its wall clock, by table."
+      ),
 
       # Database Metrics
       distribution("loopctl.repo.query.total_time",

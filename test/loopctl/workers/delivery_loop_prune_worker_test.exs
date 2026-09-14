@@ -634,7 +634,9 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorkerTest do
       assert {:error, message} =
                DeliveryLoopPruneWorker.run(tenants, DateTime.utc_now(), batch_size: -1)
 
-      assert message =~ "failed after their retry"
+      # EVERY unit failed, which is an outage rather than a broken tenant — that one is the
+      # job's to report, so Oban's backoff becomes its retry.
+      assert message =~ "every one of"
 
       assert_receive {[:loopctl, :delivery_loop, :prune], ^ref, intake,
                       %{
@@ -654,6 +656,53 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorkerTest do
       # And nothing was deleted on the way.
       assert delivery_ids(one.tenant_id) == ["keep-#{one.tenant_id}"]
       assert delivery_ids(two.tenant_id) == ["keep-#{two.tenant_id}"]
+    end
+
+    test "one broken tenant does NOT discard the run — tenants_failed carries it", ctx do
+      # A partial failure returning an error undid the isolation: the job discarded, Oban
+      # re-ran the whole fan-out three times an hour re-pruning every healthy tenant with a
+      # fresh full budget, and the exception events biased the fleet-wide discard rate, where
+      # a discard means something else entirely.
+      {_secret, healthy} = fixture(:intake_source, %{})
+
+      fixture(:intake_delivery, %{
+        source: healthy,
+        github_delivery_id: "healthy",
+        inserted_at: ago(200)
+      })
+
+      # Four more trace events, five in all, so the fractional budget's THIRD batch faults —
+      # while every other unit in the run (this tenant's empty intake half, and the healthy
+      # tenant's two halves) completes. Exactly one unit of four fails.
+      for seq <- 2..5,
+          do: fixture(:trace_event, %{dispatch: ctx.dispatch, seq: seq, inserted_at: ago(30)})
+
+      broken = tenant_struct(ctx.tenant_id)
+      ok = %Tenant{id: healthy.tenant_id, settings: %{}}
+
+      ref = :telemetry_test.attach_event_handlers(self(), [[:loopctl, :delivery_loop, :prune]])
+      on_exit(fn -> :telemetry.detach(ref) end)
+
+      assert :ok =
+               DeliveryLoopPruneWorker.run([broken, ok], DateTime.utc_now(),
+                 batch_size: 2,
+                 budget: 4.5
+               )
+
+      assert_receive {[:loopctl, :delivery_loop, :prune], ^ref, intake,
+                      %{
+                        table: "intake_deliveries"
+                      }}
+
+      assert_receive {[:loopctl, :delivery_loop, :prune], ^ref, trace,
+                      %{
+                        table: "runner_trace_events"
+                      }}
+
+      assert trace.tenants_failed == 1, "the broken unit is counted"
+      assert intake.tenants_failed == 0
+      assert intake.deleted == 1, "the healthy tenant was still pruned"
+      assert delivery_ids(healthy.tenant_id) == []
     end
 
     test "a later valid run over the same tenant still prunes", ctx do
@@ -692,19 +741,58 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorkerTest do
       assert DeliveryLoopPruneWorker.prune_opts(nil) == []
     end
 
-    test "the intake ceiling is applied to the override, not merely defaulted from" do
-      assert DeliveryLoopPruneWorker.intake_opts(batch_size: 100_000, budget: 500_000) == [
+    test "BOTH halves cap the override at their own constants" do
+      huge = [batch_size: 100_000, budget: 500_000]
+
+      # The trace half too. Uncapped, `batch_size: 20_000` is one SELECT FOR UPDATE of 20,000
+      # rows and one DELETE of 20,000 in a single transaction — which usually exceeds the
+      # statement timeout, rolls back, is read as contention, retries identically and fails,
+      # so that tenant prunes nothing at all, hourly.
+      assert DeliveryLoopPruneWorker.trace_opts(huge) == [
+               batch_size: DispatchLedger.prune_batch_size(),
+               budget: DispatchLedger.prune_budget()
+             ]
+
+      assert DeliveryLoopPruneWorker.intake_opts(huge) == [
                batch_size: Intake.prune_batch_size(),
                budget: Intake.prune_budget()
              ]
 
-      # Below the ceiling the operator's smaller value stands — the cap is a ceiling, not an
-      # override — and an option this worker does not know is passed through untouched.
+      # The knob only ever makes a run SMALLER: below the ceiling the operator's value stands,
+      # an unknown option passes through, and both keys are always set (the retry subtracts
+      # from `:budget`, so it has to be there).
       assert DeliveryLoopPruneWorker.intake_opts(batch_size: 5, budget: 7, other: :x) == [
                batch_size: 5,
                budget: 7,
                other: :x
              ]
+
+      assert DeliveryLoopPruneWorker.trace_opts([]) == [
+               batch_size: DispatchLedger.prune_batch_size(),
+               budget: DispatchLedger.prune_budget()
+             ]
+    end
+
+    test "a trace-sized override cannot put one huge DELETE on the RLS pool" do
+      story = fixture(:stage_story, %{})
+      runner = fixture(:stage_runner, %{tenant_id: story.tenant_id})
+      dispatch = terminal_dispatch(story.tenant_id, runner)
+
+      for seq <- 1..3,
+          do: fixture(:trace_event, %{dispatch: dispatch, seq: seq, inserted_at: ago(30)})
+
+      # The capped batch is what runs, so the rows still go — the cap bounds the STATEMENT,
+      # not the work. What it forbids is the single 20,000-row transaction.
+      assert %{trace: %{deleted: 3, failed: 0}} =
+               DeliveryLoopPruneWorker.prune_tenant(
+                 tenant_struct(story.tenant_id),
+                 DateTime.utc_now(),
+                 batch_size: 20_000,
+                 budget: 1_000_000
+               )
+
+      assert DispatchLedger.prune_batch_size() < 20_000
+      assert DispatchLedger.prune_budget() < 1_000_000
     end
 
     test "a trace-sized drain override does not run unbounded against the admin pool" do
@@ -728,28 +816,172 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorkerTest do
     end
   end
 
+  describe "the in-run retry (attempt_prune/5, with an injected prune)" do
+    setup do
+      %{tenant: %Tenant{id: Ecto.UUID.generate(), settings: %{}}}
+    end
+
+    defp injected(results) do
+      {:ok, agent} = Agent.start_link(fn -> {results, []} end)
+
+      fun = fn opts ->
+        Agent.get_and_update(agent, fn {[head | rest], seen} ->
+          {head, {rest, seen ++ [opts]}}
+        end)
+      end
+
+      {fun, fn -> Agent.get(agent, fn {_rest, seen} -> seen end) end}
+    end
+
+    @contention %Postgrex.Error{postgres: %{code: :lock_not_available}}
+
+    test "the retry gets the budget MINUS what the first attempt already deleted", ctx do
+      # Re-invoking a closure with the budget baked in let one tenant and table delete up to
+      # TWICE its budget in a run — the second helping against a pool that had just reported
+      # contention.
+      {fun, calls} =
+        injected([
+          %{deleted: 30, budget_exhausted: false, error: @contention},
+          %{deleted: 12, budget_exhausted: false, error: nil}
+        ])
+
+      assert %{deleted: 42, failed: 0, budget_exhausted: false} =
+               DeliveryLoopPruneWorker.attempt_prune(
+                 "runner_trace_events",
+                 ctx.tenant,
+                 14,
+                 [batch_size: 10, budget: 100],
+                 fun
+               )
+
+      assert [first, second] = calls.()
+      assert first[:budget] == 100
+      assert second[:budget] == 70
+      assert second[:batch_size] == 10
+    end
+
+    test "the remaining budget floors at zero rather than going negative", ctx do
+      {fun, calls} =
+        injected([
+          %{deleted: 100, budget_exhausted: false, error: @contention},
+          %{deleted: 0, budget_exhausted: false, error: nil}
+        ])
+
+      assert %{deleted: 100, failed: 0} =
+               DeliveryLoopPruneWorker.attempt_prune(
+                 "runner_trace_events",
+                 ctx.tenant,
+                 14,
+                 [batch_size: 10, budget: 100],
+                 fun
+               )
+
+      assert [_first, second] = calls.()
+      assert second[:budget] == 0
+    end
+
+    test "a second contention fault ends it, counted, with both attempts' rows", ctx do
+      {fun, calls} =
+        injected([
+          %{deleted: 30, budget_exhausted: false, error: @contention},
+          %{deleted: 5, budget_exhausted: false, error: @contention}
+        ])
+
+      assert %{deleted: 35, failed: 1} =
+               DeliveryLoopPruneWorker.attempt_prune(
+                 "runner_trace_events",
+                 ctx.tenant,
+                 14,
+                 [batch_size: 10, budget: 100],
+                 fun
+               )
+
+      assert length(calls.()) == 2, "a contention fault gets exactly one retry, not more"
+    end
+
+    test "a connection-class fault is NOT retried in-run", ctx do
+      # The backend or pool is gone; an immediate retry cannot clear it, and spending the
+      # attempt only brings the failure forward. `backoff/1` is its retry.
+      {fun, calls} =
+        injected([
+          %{deleted: 7, budget_exhausted: false, error: %DBConnection.ConnectionError{}},
+          %{deleted: 999, budget_exhausted: false, error: nil}
+        ])
+
+      assert %{deleted: 7, failed: 1} =
+               DeliveryLoopPruneWorker.attempt_prune(
+                 "intake_deliveries",
+                 ctx.tenant,
+                 90,
+                 [batch_size: 10, budget: 100],
+                 fun
+               )
+
+      assert length(calls.()) == 1
+    end
+
+    test "a failed probe's conservative budget_exhausted survives the failure", ctx do
+      # Both prune loops set it true when the PROBE faulted, because a probe that could not
+      # run cannot say the backlog is empty. Hard-coding false there threw that away.
+      {fun, _calls} =
+        injected([%{deleted: 4, budget_exhausted: true, error: %RuntimeError{message: "x"}}])
+
+      assert %{deleted: 4, failed: 1, budget_exhausted: true} =
+               DeliveryLoopPruneWorker.attempt_prune(
+                 "runner_trace_events",
+                 ctx.tenant,
+                 14,
+                 [batch_size: 10, budget: 100],
+                 fun
+               )
+    end
+  end
+
   describe "verdict/2 (the pure retry decision)" do
     # A real lock wait needs a second connection holding the row, and the SQL sandbox gives a
     # test one connection per repo — so the branch a transient fault takes is exercised here,
     # against synthesized errors, rather than by provoking one.
-    @transient [
+    @contention_errors [
       %Postgrex.Error{postgres: %{code: :lock_not_available}},
       %Postgrex.Error{postgres: %{code: :deadlock_detected}},
       %Postgrex.Error{postgres: %{code: :query_canceled}},
-      %Postgrex.Error{postgres: %{code: :serialization_failure}},
-      %DBConnection.ConnectionError{message: "pool is down"},
-      {:exit, :killed}
+      %Postgrex.Error{postgres: %{code: :serialization_failure}}
     ]
 
-    test "a transient fault is retried ONCE, then treated like any other failure" do
-      for error <- @transient do
+    @connection_errors [
+      %DBConnection.ConnectionError{message: "pool is down"},
+      {:exit, :killed},
+      %Postgrex.Error{postgres: %{code: :admin_shutdown}},
+      %Postgrex.Error{postgres: %{code: :crash_shutdown}},
+      %Postgrex.Error{postgres: %{code: :cannot_connect_now}}
+    ]
+
+    test "CONTENTION is retried once, then treated like any other failure" do
+      for error <- @contention_errors do
         assert DeliveryLoopPruneWorker.verdict(error, 1) == :retry,
-               "#{inspect(error)} should get its one immediate retry"
+               "#{inspect(error)} is another transaction's doing and can be gone in ms"
 
         # THE bound. Without it a deterministic 15-second timeout is 'transient' for ever:
         # retried hourly, job green, every alert metric at zero.
         assert DeliveryLoopPruneWorker.verdict(error, 2) == :fail,
                "#{inspect(error)} must not be retried a second time"
+      end
+    end
+
+    test "a CONNECTION-class fault is never retried in-run — backoff/1 is its retry" do
+      # The backend or pool is gone, so an immediate retry cannot clear it: it spends the
+      # attempt for nothing and brings the failure forward. With Oban's default backoff that
+      # discarded the job inside a minute, which is shorter than a rolling deploy.
+      for error <- @connection_errors do
+        assert DeliveryLoopPruneWorker.verdict(error, 1) == :fail,
+               "#{inspect(error)} cannot clear on an immediate retry"
+
+        assert DeliveryLoopPruneWorker.connection_fault?(error),
+               "#{inspect(error)} must be logged as the connection class, not as contention"
+      end
+
+      for error <- @contention_errors do
+        refute DeliveryLoopPruneWorker.connection_fault?(error)
       end
     end
 
@@ -760,8 +992,67 @@ defmodule Loopctl.Workers.DeliveryLoopPruneWorkerTest do
             %RuntimeError{message: "boom"}
           ] do
         assert DeliveryLoopPruneWorker.verdict(error, 1) == :fail,
-               "#{inspect(error)} is not transient and must not be retried"
+               "#{inspect(error)} is not contention and must not be retried"
       end
+    end
+
+    test "the backoff is minutes, so a rolling deploy outlasts nothing" do
+      assert DeliveryLoopPruneWorker.backoff(%Oban.Job{attempt: 1}) == 60
+      assert DeliveryLoopPruneWorker.backoff(%Oban.Job{attempt: 4}) == 240
+    end
+  end
+
+  describe "the run's wall clock" do
+    test "a run past its deadline stops, says how many it did not reach, and stays :ok" do
+      {_secret, source} = fixture(:intake_source, %{})
+
+      fixture(:intake_delivery, %{
+        source: source,
+        github_delivery_id: "untouched",
+        inserted_at: ago(200)
+      })
+
+      tenants = [%Tenant{id: source.tenant_id, settings: %{}}]
+
+      ref = :telemetry_test.attach_event_handlers(self(), [[:loopctl, :delivery_loop, :prune]])
+      on_exit(fn -> :telemetry.detach(ref) end)
+
+      # A deadline already spent: every tenant is skipped rather than the run holding a
+      # :cleanup slot for hours. Nothing failed, so the job is still :ok.
+      assert :ok = DeliveryLoopPruneWorker.run(tenants, DateTime.utc_now(), deadline_ms: -1)
+
+      assert_receive {[:loopctl, :delivery_loop, :prune], ^ref, intake,
+                      %{
+                        table: "intake_deliveries"
+                      }}
+
+      assert intake.tenants_skipped == 1
+      assert intake.tenants == 0
+      assert intake.deleted == 0
+      assert delivery_ids(source.tenant_id) == ["untouched"]
+    end
+
+    test "a run inside its deadline reaches everyone and skips nobody" do
+      {_secret, source} = fixture(:intake_source, %{})
+
+      fixture(:intake_delivery, %{
+        source: source,
+        github_delivery_id: "old",
+        inserted_at: ago(200)
+      })
+
+      ref = :telemetry_test.attach_event_handlers(self(), [[:loopctl, :delivery_loop, :prune]])
+      on_exit(fn -> :telemetry.detach(ref) end)
+
+      assert :ok = run()
+
+      assert_receive {[:loopctl, :delivery_loop, :prune], ^ref, intake,
+                      %{
+                        table: "intake_deliveries"
+                      }}
+
+      assert intake.tenants_skipped == 0
+      assert intake.deleted == 1
     end
   end
 
