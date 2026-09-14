@@ -208,8 +208,12 @@ defmodule Loopctl.Delivery.StoryPayloadTest do
                    StoryPayload.build(parked.tenant_id, parked.id, opts())
         end)
 
-      refute quiet =~ "NOT ESCALATED"
       refute quiet =~ parked.id
+      refute quiet =~ parked.tenant_id
+      # Defence in depth only, and NOT an independent assertion: the marker exists at one
+      # site and that same message interpolates the story id, so nothing can redden this
+      # line alone. It is here against a future edit that drops the raw id from it.
+      refute quiet =~ "NOT ESCALATED"
 
       stranded = staged(long_story_attrs(), :done)
 
@@ -244,8 +248,9 @@ defmodule Loopctl.Delivery.StoryPayloadTest do
                    StoryPayload.build(story.tenant_id, story.id, opts())
         end)
 
-      refute log =~ "NOT ESCALATED"
       refute log =~ story.id
+      refute log =~ story.tenant_id
+      refute log =~ "NOT ESCALATED"
 
       row = Stages.get(story.tenant_id, story.id)
       assert row.stage == :escalated
