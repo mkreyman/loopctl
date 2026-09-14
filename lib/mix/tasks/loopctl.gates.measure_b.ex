@@ -143,7 +143,7 @@ defmodule Mix.Tasks.Loopctl.Gates.MeasureB do
           String.trim(sha)
 
         {:error, reason} ->
-          Mix.raise("cannot resolve #{requested} in #{repo}: #{inspect(reason)}")
+          Mix.raise("cannot resolve #{requested} in #{repo}: #{git_error_kind(reason)}")
       end
 
     stream_opts = opts |> Keyword.take([:since, :until, :limit]) |> Keyword.put(:head, head)
@@ -165,9 +165,22 @@ defmodule Mix.Tasks.Loopctl.Gates.MeasureB do
         {results, head}
 
       {:error, reason} ->
-        Mix.raise("cannot read #{repo}: #{inspect(reason)}")
+        Mix.raise("cannot read #{repo}: #{git_error_kind(reason)}")
     end
   end
+
+  # The KIND, never the payload — the same reduction `announce_triggers/2` applies. A git failure
+  # carries the command's output, and git names object ids, submodule paths and ref names of the
+  # PRIVATE repository in it; `Mix.raise` puts that on the console, which this task's own
+  # redaction note calls as readily pasted into a pull request as an artifact is committed.
+  defp git_error_kind({:git_failed, status, _output}), do: "git exited #{status}"
+  defp git_error_kind({:git_unavailable, _message}), do: "git could not be run"
+  defp git_error_kind(reason) when is_atom(reason), do: to_string(reason)
+
+  defp git_error_kind(reason) when is_tuple(reason) and tuple_size(reason) > 0,
+    do: reason |> elem(0) |> to_string()
+
+  defp git_error_kind(_reason), do: "unrecognised failure"
 
   # The document's bytes are hashed EXACTLY as read, with no trailing-newline handling, because
   # that is what `Loopctl.DeliveryGates.Triggers.parse/2` hashes. A file written with a trailing

@@ -38,9 +38,22 @@ report it from ONE artifact — "of the N changes in outcome X, M also carry rea
 report a number for it at all.
 
 `--head` (Gate B) and `--expect-corpus` (Gate A) exist so the first half cannot recur silently:
-pass a previous run's recorded value and the corpus is the same one. Nothing can stop the second
-half but reading the two numbers you are about to put side by side and asking which run each
-came from.
+pass a previous run's recorded value and the corpus is the same one.
+
+**The carve-out, because an absolute ban would forbid the thing those flags exist to produce.**
+Two runs MAY be compared when their PINNING FIELDS are identical and those fields are quoted
+beside the comparison — `meta.head` plus `meta.trigger_fingerprint` for Gate B,
+`meta.corpus_fingerprint` for Gate A. That is a like-for-like comparison and is exactly what a
+pinned re-run is for: it is how "the oracle narrowing moved nine matches corpus-wide and no
+change in or out of the cleared set" is a fact rather than an impression. Without the pins
+quoted it is not a comparison, it is two numbers next to each other.
+
+`mix loopctl.gates.check_measurements` enforces the half that can be enforced
+(`Loopctl.DeliveryGates.Measurement.ArtifactPins`): every artifact must CARRY its pins, two
+artifacts of one gate keyed by the same pin must agree on the rest, and a filename's date must
+be the UTC date of the run inside it. It cannot read prose and does not try; what it removes is
+every case where the prose could not have been right. The committed directory is checked by
+`test/loopctl/delivery_gates/measurement/artifact_pins_test.exs`, so CI holds it.
 
 **The INTERPRETATION of a run does not live here.** What the numbers mean, which false negatives
 survived a hand review and which configuration defect caused them, names paths in a private

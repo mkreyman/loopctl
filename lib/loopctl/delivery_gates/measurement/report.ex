@@ -94,6 +94,8 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
       },
       outcomes: outcome_counts(results),
       reason_kinds: reason_kinds(results),
+      reason_kinds_by_outcome: reason_kinds_by_outcome(results),
+      size_bounded_by_outcome: size_bounded_by_outcome(results),
       strata: %{
         all: stratum(readable),
         configuration_applied: stratum(configuration_applied),
@@ -270,6 +272,29 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
       result.reasons |> Enum.map(&kind/1) |> Enum.uniq()
     end)
     |> Enum.frequencies()
+  end
+
+  # The SAME counting, stratified by outcome. Corpus-wide `reason_kinds` cannot answer "of the
+  # changes in outcome X, how many carry reason Y", so a claim of that shape — the shape the
+  # README now prescribes for describing a classification change — was not derivable from the
+  # record it cited. Only the cross-tab makes it checkable.
+  defp reason_kinds_by_outcome(results) do
+    results
+    |> Enum.group_by(& &1.outcome)
+    |> Map.new(fn {outcome, group} -> {outcome, reason_kinds(group)} end)
+  end
+
+  # How many changes in each outcome were over a size bound AT ALL — the UNION the per-kind
+  # cross-tab above cannot give, because a change over both bounds is counted in both kinds. It
+  # is the one number a claim like "of the N in outcome X, M were also over the bound" needs, and
+  # without it that claim was not derivable from the artifact carrying it.
+  defp size_bounded_by_outcome(results) do
+    results
+    |> Enum.group_by(& &1.outcome)
+    |> Map.new(fn {outcome, group} ->
+      {outcome,
+       Enum.count(group, &Enum.any?(&1.reasons, fn r -> GateBReplay.size_reason?(r) end))}
+    end)
   end
 
   defp kind(reason) when is_atom(reason), do: reason

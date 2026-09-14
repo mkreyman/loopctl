@@ -29,14 +29,26 @@ defmodule Loopctl.DeliveryGates.Measurement.RepoHistory do
 
   @pr_number ~r/\(#(\d+)\)\s*\z/
 
-  # PINNED, on every diff read, to git's own documented default. Four other knobs are already
-  # pinned (`-M`, `--no-color`, `--no-ext-diff`, `--no-textconv`) and this was the one left to a
-  # machine's `~/.gitconfig` — and it is not cosmetic: the algorithm decides which lines a hunk
-  # contains, so it moves BOTH the oracle's input and the numstat counts. The committed artifact
-  # has a change at exactly 1,000 changed lines and another at exactly 12 files, either of which
-  # crosses the bound under a different algorithm, so two operators re-running one window would
-  # not merely differ in a count — they would differ in an OUTCOME.
-  @algorithm "--diff-algorithm=myers"
+  # Every read pins the config knobs that would otherwise let one operator's `~/.gitconfig`
+  # change what this harness measures. This is NOT a claim to have pinned all of them — git has
+  # more config than any comment can enumerate, and two were missed on the first attempt at
+  # exactly this list. It is the set known to move a number here, each with the reason:
+  #
+  # - `--diff-algorithm=myers` (git's documented default) — the algorithm decides which lines a
+  #   hunk contains, so it moves BOTH the oracle's input and the numstat counts. The committed
+  #   artifact has a change at exactly 1,000 changed lines and another at exactly 12 files, so a
+  #   different algorithm changes an OUTCOME there, not merely a count.
+  # - `--indent-heuristic` (also the default) — it shifts hunk BOUNDARIES on ordinary small
+  #   diffs, so under `--unified=0` a different set of lines reaches the oracle. Same failure as
+  #   the algorithm, on a knob that bites at any size rather than only at a boundary.
+  # - `--no-show-signature` on every `git log` read — `log.showSignature=true` makes git prepend
+  #   signature lines to each record, and `header/3`'s `%P%x00%ct%x00%s` then mis-splits. That
+  #   one does not shift a number; it makes the whole corpus unreadable.
+  #
+  # `-M`, `--no-color`, `--no-ext-diff` and `--no-textconv` are pinned at their call sites for
+  # the reasons given there. Anything found later that moves a number belongs in this list.
+  @diff_pins ["--diff-algorithm=myers", "--indent-heuristic"]
+  @log_pins ["--no-show-signature"]
 
   @type runner :: ([String.t()] -> {:ok, binary()} | {:error, term()})
 
@@ -68,7 +80,7 @@ defmodule Loopctl.DeliveryGates.Measurement.RepoHistory do
   def shas(repo, opts \\ []) do
     args =
       ["log", "--first-parent", "--format=%H"] ++
-        window_args(opts) ++ [Keyword.get(opts, :head, "HEAD")]
+        @log_pins ++ window_args(opts) ++ [Keyword.get(opts, :head, "HEAD")]
 
     case read(repo, args, opts) do
       {:ok, output} -> {:ok, String.split(output, "\n", trim: true)}
@@ -85,7 +97,7 @@ defmodule Loopctl.DeliveryGates.Measurement.RepoHistory do
   def change(repo, sha, opts \\ []) do
     with {:ok, [parent | _] = _parents, meta} <- header(repo, sha, opts),
          {:ok, diff} <-
-           read(repo, ["diff", "--name-status", "-M", @algorithm, "-z", parent, sha], opts),
+           read(repo, ["diff", "--name-status", "-M"] ++ @diff_pins ++ ["-z", parent, sha], opts),
          # `-M` on the DIFFSTAT too, not only on the name-status read. Without it the two reads
          # disagree whenever `diff.renames` is off in a machine's own gitconfig: the name-status
          # read (which passes it explicitly) sees one rename, the numstat read sees an add plus a
@@ -93,7 +105,7 @@ defmodule Loopctl.DeliveryGates.Measurement.RepoHistory do
          # different artifacts, which is exactly what the compare-against-the-last-run convention
          # cannot survive.
          {:ok, numstat} <-
-           read(repo, ["diff", "--numstat", "-M", @algorithm, "-z", parent, sha], opts),
+           read(repo, ["diff", "--numstat", "-M"] ++ @diff_pins ++ ["-z", parent, sha], opts),
          {:ok, head_files} <- read(repo, ["ls-tree", "-r", "--name-only", "-z", sha], opts),
          {:ok, base_files} <- read(repo, ["ls-tree", "-r", "--name-only", "-z", parent], opts),
          {:ok, content} <- content(repo, parent, sha, opts) do
@@ -134,31 +146,58 @@ defmodule Loopctl.DeliveryGates.Measurement.RepoHistory do
   The default runner: `git -C <repo> <args>`, read-only.
 
   stdout is captured ALONE. Merging stderr into it (`stderr_to_stdout: true`) is wrong here even
-  though the command SUCCEEDED: git writes advisory warnings to stderr on a zero exit —
-  `warning: unable to access ...`, a `core.fsmonitor` complaint, a detached-HEAD notice — and
-  `ls-tree -z` output is then NUL-split into the repository file list, so a warning becomes a
-  PHANTOM PATH in the list every stale-trigger check is run against. On a non-zero exit the
-  command is re-run with stderr merged, purely to build the error MESSAGE; that second run never
-  supplies bytes anything parses.
+  though the command SUCCEEDED: git writes advisory warnings to stderr on a zero exit — a
+  malformed `.gitattributes`, a rename-limit notice, an `unable to access` — and the output of
+  these reads is then split into a file list or a numstat, so a warning line becomes a PHANTOM
+  ENTRY in exactly the lists the stale-trigger split and the diffstat are computed from. That is
+  falsifiable rather than asserted: `repo_history_git_test.exs` drives this function against a
+  temporary repository configured to warn on a ZERO exit.
+
+  The command is run ONCE. An earlier version re-ran it with stderr merged to build a richer
+  error message, which had two defects: a transient that cleared between the two runs returned a
+  SUCCESSFUL payload as the text of a `git_failed` error, and git's stderr names object ids,
+  submodule paths and ref names of a private repository — which then reached the console through
+  `Mix.raise`. The error carries the first run's stdout and the status, and callers raise on the
+  KIND, never on the payload.
   """
   @spec git(String.t(), [String.t()]) :: {:ok, binary()} | {:error, term()}
   def git(repo, args) do
-    case System.cmd("git", ["-C", repo | args], stderr_to_stdout: false) do
+    opts = [stderr_to_stdout: false, env: scrubbed_git_env()]
+
+    case System.cmd("git", ["-C", repo | args], opts) do
       {output, 0} -> {:ok, output}
-      {_output, status} -> {:error, {:git_failed, status, diagnostic(repo, args)}}
+      {output, status} -> {:error, {:git_failed, status, String.trim(output)}}
     end
   rescue
     error -> {:error, {:git_unavailable, Exception.message(error)}}
   end
 
-  # Error MESSAGE only. It re-runs the command, so it may observe a repository that has moved;
-  # that is acceptable for a diagnostic and is why it never feeds a parse.
-  defp diagnostic(repo, args) do
-    case System.cmd("git", ["-C", repo | args], stderr_to_stdout: true) do
-      {output, _status} -> String.trim(output)
-    end
-  rescue
-    _error -> "stderr not captured"
+  @doc """
+  The inherited git REPOSITORY-DISCOVERY environment, unset for every command this module runs.
+
+  `-C <repo>` does NOT win against `GIT_DIR`. Anything that runs this harness from inside a git
+  hook, a `git rebase -x`, a `git bisect run` or a `git filter-branch` inherits an exported
+  `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE` pointing at the repository that INVOKED it —
+  so every read here silently targets that repository instead of the one named on the command
+  line.
+
+  That is not hypothetical and it is not only a read hazard. This project's own `pre-commit` hook
+  runs the test suite, and git exports `GIT_DIR` to a hook: the first version of this module's
+  test created its fixture repository with `git init`, had it silently overridden, and committed
+  the fixture's files onto the working branch ten times while the suite reported green. Reads and
+  writes alike were retargeted, and nothing in the output said so.
+
+  Only the DISCOVERY variables are unset. `GIT_CONFIG_*` is deliberately left alone: config
+  resolution is a legitimate thing for an operator to arrange, and the pins at the call sites
+  already neutralise the config that could change a measurement.
+  """
+  @spec scrubbed_git_env() :: [{String.t(), nil}]
+  def scrubbed_git_env do
+    Enum.map(
+      ~w(GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_INDEX_FILE GIT_OBJECT_DIRECTORY
+         GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX GIT_CEILING_DIRECTORIES),
+      &{&1, nil}
+    )
   end
 
   # -- reading ------------------------------------------------------------------------------
@@ -166,7 +205,8 @@ defmodule Loopctl.DeliveryGates.Measurement.RepoHistory do
   defp header(repo, sha, opts) do
     # %P is the parent list; %ct the committer timestamp; %s the subject. Read in ONE call so
     # the three cannot come from different commits.
-    with {:ok, output} <- read(repo, ["log", "-1", "--format=%P%x00%ct%x00%s", sha], opts),
+    with {:ok, output} <-
+           read(repo, ["log", "-1"] ++ @log_pins ++ ["--format=%P%x00%ct%x00%s", sha], opts),
          [parents, timestamp, subject] <- output |> String.trim_trailing("\n") |> split_nul(3),
          {unix, ""} <- Integer.parse(timestamp),
          {:ok, committed_at} <- DateTime.from_unix(unix),
@@ -188,17 +228,9 @@ defmodule Loopctl.DeliveryGates.Measurement.RepoHistory do
   # transformed rendering into what is being scanned.
   defp content(repo, parent, sha, opts) do
     if Keyword.get(opts, :content?, true) do
-      args = [
-        "diff",
-        "--unified=0",
-        "-M",
-        @algorithm,
-        "--no-color",
-        "--no-ext-diff",
-        "--no-textconv",
-        parent,
-        sha
-      ]
+      args =
+        ["diff", "--unified=0", "-M"] ++
+          @diff_pins ++ ["--no-color", "--no-ext-diff", "--no-textconv", parent, sha]
 
       with {:ok, unified} <- read(repo, args, opts) do
         {:ok, changed_lines(unified)}

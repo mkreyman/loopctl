@@ -203,10 +203,18 @@ defmodule Loopctl.DeliveryGates.Measurement.GateBReplay do
     }
   end
 
-  defp size_reason?(reason) when is_tuple(reason) and tuple_size(reason) > 0,
+  @doc """
+  True for a refusal that is only about SIZE — the configured limits or the design's ceiling.
+
+  Public so `Report` counts size-bounded changes per outcome from the same list the
+  classification uses. A second copy of this list would be a second answer to "was this refused
+  only for being big", and the report would eventually disagree with the outcome beside it.
+  """
+  @spec size_reason?(term()) :: boolean()
+  def size_reason?(reason) when is_tuple(reason) and tuple_size(reason) > 0,
     do: elem(reason, 0) in @size_reasons
 
-  defp size_reason?(_reason), do: false
+  def size_reason?(_reason), do: false
 
   defp oracle(%Change{content: content}) do
     case EffectOracle.judge(content) do

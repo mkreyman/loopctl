@@ -2,15 +2,45 @@
   "meta": {
     "until": "2026-09-13T19:30:12Z",
     "since": "2026-03-18T17:26:12Z",
-    "corpus": "mkreyman/home_care_billing GitHub issues, all states, fetched 2026-09-14T02:30Z",
     "tickets": 322,
+    "corpus": "mkreyman/home_care_billing GitHub issues, all states, fetched 2026-09-14T02:30Z",
     "corpus_fingerprint": "38065cd323ce",
-    "generated_at": "2026-09-14T04:12:56.813147Z",
+    "generated_at": "2026-09-14T04:46:25.025751Z",
     "harness": "mix loopctl.gates.measure_a",
     "unparseable_records": 0
   },
   "question": "How often would Gate A escalate a past ticket to a human?",
-  "gate": "A",
+  "sensitivity": {
+    "all": {
+      "total": 322,
+      "rate": 0.10559006211180125,
+      "by_reason": {
+        "inverts_deliberate_behaviour": 34
+      },
+      "escalated": 34,
+      "not_story": 5,
+      "by_signal": {
+        "rejected": 5,
+        "request_shaped": 0,
+        "inversion_phrase": 34
+      }
+    },
+    "run": true,
+    "note": "the same corpus with every feature request read as NOT a workflow change. The true rate is between this and the headline, and which end it sits at is a definition question for the design, not a tuning question.",
+    "intake": {
+      "total": 26,
+      "rate": 0.0,
+      "by_reason": {},
+      "escalated": 0,
+      "not_story": 0,
+      "by_signal": {
+        "rejected": 0,
+        "request_shaped": 0,
+        "inversion_phrase": 0
+      }
+    },
+    "suppressed": "workflow_change_not_defect_fix"
+  },
   "biases": [
     "Trio DISAGREEMENT, the design's primary signal, is unobservable in a replay: every ticket is presented as three identical outputs. The measured rate is a strict LOWER BOUND.",
     "The contradicts field is empty by construction, not by measurement. Lower bound again.",
@@ -19,1085 +49,1055 @@
     "confidence is sent as 0.0. Gate A requires the field and never reads it; the column is a placeholder, not a measurement.",
     "Read `intake_is_feature_share` before comparing the intake rate with the design's 54%. Where every intake escalation is a [Feature] ticket firing on workflow_change alone, the rate is ARITHMETICALLY the [Feature] share of the corpus — the harness is measuring the corpus split, not Gate A's judgement, and the comparison is weaker than the bare number reads."
   ],
+  "design_reference": {
+    "note": "Design section 5: collapsing Gate A and Gate B into one escalation produced a 54% escalation rate on 80 first-parent commits, and a rate resembling it is a design failure rather than a tuning question.",
+    "collapsed_predicate_rate": 0.54
+  },
+  "escalations": [
+    {
+      "created_at": "2026-09-10T16:04:28Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": true,
+      "issue": 1494
+    },
+    {
+      "created_at": "2026-08-31T15:50:14Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 1400
+    },
+    {
+      "created_at": "2026-08-28T14:28:07Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 1392
+    },
+    {
+      "created_at": "2026-08-28T01:59:20Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 1385
+    },
+    {
+      "created_at": "2026-08-21T00:39:19Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 1243
+    },
+    {
+      "created_at": "2026-08-18T04:54:24Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 1175
+    },
+    {
+      "created_at": "2026-08-13T20:28:23Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 1140
+    },
+    {
+      "created_at": "2026-08-12T02:48:57Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": true,
+      "issue": 1104
+    },
+    {
+      "created_at": "2026-07-27T15:26:05Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": true,
+      "issue": 956
+    },
+    {
+      "created_at": "2026-07-24T19:21:27Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": true,
+      "issue": 926
+    },
+    {
+      "created_at": "2026-07-23T00:07:30Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 913
+    },
+    {
+      "created_at": "2026-07-22T20:00:17Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": true,
+      "issue": 910
+    },
+    {
+      "created_at": "2026-07-21T04:42:34Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 892
+    },
+    {
+      "created_at": "2026-07-19T02:01:51Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 866
+    },
+    {
+      "created_at": "2026-07-18T16:13:36Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 842
+    },
+    {
+      "created_at": "2026-07-17T20:58:26Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 830
+    },
+    {
+      "created_at": "2026-07-17T20:58:12Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 816
+    },
+    {
+      "created_at": "2026-07-17T20:58:10Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 815
+    },
+    {
+      "created_at": "2026-07-17T20:58:06Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 811
+    },
+    {
+      "created_at": "2026-07-08T23:10:16Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": true,
+      "issue": 665
+    },
+    {
+      "created_at": "2026-07-08T01:18:31Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 661
+    },
+    {
+      "created_at": "2026-07-08T01:18:12Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 660
+    },
+    {
+      "created_at": "2026-07-08T01:17:54Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 659
+    },
+    {
+      "created_at": "2026-07-08T01:17:37Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 658
+    },
+    {
+      "created_at": "2026-07-08T01:17:16Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 657
+    },
+    {
+      "created_at": "2026-07-08T01:16:57Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 656
+    },
+    {
+      "created_at": "2026-07-08T01:16:37Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 655
+    },
+    {
+      "created_at": "2026-07-08T01:16:22Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 654
+    },
+    {
+      "created_at": "2026-07-08T01:16:09Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 653
+    },
+    {
+      "created_at": "2026-07-08T01:15:54Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 652
+    },
+    {
+      "created_at": "2026-07-08T01:15:39Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 651
+    },
+    {
+      "created_at": "2026-07-08T01:00:15Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 650
+    },
+    {
+      "created_at": "2026-07-07T23:07:02Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 647
+    },
+    {
+      "created_at": "2026-07-07T23:06:45Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change",
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 646
+    },
+    {
+      "created_at": "2026-07-07T23:06:24Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 645
+    },
+    {
+      "created_at": "2026-07-07T23:05:59Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change",
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 644
+    },
+    {
+      "created_at": "2026-07-07T20:13:40Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 643
+    },
+    {
+      "created_at": "2026-07-04T01:13:43Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 630
+    },
+    {
+      "created_at": "2026-07-04T01:11:22Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 627
+    },
+    {
+      "created_at": "2026-06-20T03:07:47Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 574
+    },
+    {
+      "created_at": "2026-06-11T05:34:31Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 510
+    },
+    {
+      "created_at": "2026-06-11T05:34:10Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 504
+    },
+    {
+      "created_at": "2026-06-11T05:31:58Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 467
+    },
+    {
+      "created_at": "2026-06-11T05:31:22Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 457
+    },
+    {
+      "created_at": "2026-06-11T05:29:22Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 423
+    },
+    {
+      "created_at": "2026-06-11T05:29:18Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 422
+    },
+    {
+      "created_at": "2026-06-11T05:28:39Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 411
+    },
+    {
+      "created_at": "2026-06-01T02:50:46Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 376
+    },
+    {
+      "created_at": "2026-06-01T02:50:45Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 375
+    },
+    {
+      "created_at": "2026-06-01T02:50:33Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 374
+    },
+    {
+      "created_at": "2026-06-01T02:49:30Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 372
+    },
+    {
+      "created_at": "2026-05-30T22:59:59Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 347
+    },
+    {
+      "created_at": "2026-05-30T22:59:53Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 342
+    },
+    {
+      "created_at": "2026-05-30T22:57:21Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 336
+    },
+    {
+      "created_at": "2026-05-30T22:57:10Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 327
+    },
+    {
+      "created_at": "2026-05-29T04:09:41Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 325
+    },
+    {
+      "created_at": "2026-05-28T22:43:33Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": true,
+      "issue": 321
+    },
+    {
+      "created_at": "2026-05-20T20:57:50Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": true,
+      "issue": 316
+    },
+    {
+      "created_at": "2026-05-20T20:17:43Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": true,
+      "issue": 315
+    },
+    {
+      "created_at": "2026-05-13T21:15:28Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 312
+    },
+    {
+      "created_at": "2026-05-08T18:12:12Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": true,
+      "issue": 306
+    },
+    {
+      "created_at": "2026-05-07T01:38:44Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 305
+    },
+    {
+      "created_at": "2026-05-07T00:30:15Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 303
+    },
+    {
+      "created_at": "2026-05-06T04:12:00Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 297
+    },
+    {
+      "created_at": "2026-05-06T04:11:59Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 296
+    },
+    {
+      "created_at": "2026-05-06T04:11:57Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 295
+    },
+    {
+      "created_at": "2026-05-06T04:11:56Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 294
+    },
+    {
+      "created_at": "2026-05-06T04:11:47Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 292
+    },
+    {
+      "created_at": "2026-05-06T01:05:54Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 289
+    },
+    {
+      "created_at": "2026-04-27T19:08:57Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": true,
+      "issue": 283
+    },
+    {
+      "created_at": "2026-04-21T21:22:54Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": true,
+      "issue": 270
+    },
+    {
+      "created_at": "2026-04-19T02:43:45Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 257
+    },
+    {
+      "created_at": "2026-04-12T01:42:36Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 212
+    },
+    {
+      "created_at": "2026-04-08T22:48:25Z",
+      "signals": {
+        "request_shaped?": false,
+        "inversion_phrase?": true,
+        "rejected?": false
+      },
+      "reasons": [
+        "inverts_deliberate_behaviour"
+      ],
+      "intake": false,
+      "issue": 196
+    },
+    {
+      "created_at": "2026-03-27T00:13:10Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": true,
+      "issue": 176
+    },
+    {
+      "created_at": "2026-03-21T21:39:40Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 150
+    },
+    {
+      "created_at": "2026-03-21T21:39:40Z",
+      "signals": {
+        "request_shaped?": true,
+        "inversion_phrase?": false,
+        "rejected?": false
+      },
+      "reasons": [
+        "workflow_change"
+      ],
+      "intake": false,
+      "issue": 149
+    }
+  ],
+  "gate": "A",
+  "intake_is_feature_share": {
+    "tickets": 26,
+    "escalated": 13,
+    "degenerate?": true,
+    "escalation_reason_kinds": [
+      "workflow_change"
+    ],
+    "note": "degenerate? true means every escalation fired on workflow_change alone, so the rate equals the [Feature] share of the corpus and measures the corpus split rather than Gate A's judgement. Weigh the comparison with the design's 54% accordingly.",
+    "request_shaped": 13
+  },
   "strata": {
     "all": {
       "total": 322,
-      "escalated": 77,
       "rate": 0.2391304347826087,
+      "by_reason": {
+        "inverts_deliberate_behaviour": 34,
+        "workflow_change": 45
+      },
+      "escalated": 77,
       "not_story": 5,
       "by_signal": {
         "rejected": 5,
         "request_shaped": 45,
         "inversion_phrase": 34
-      },
-      "by_reason": {
-        "workflow_change": 45,
-        "inverts_deliberate_behaviour": 34
       }
     },
     "intake": {
       "total": 26,
-      "escalated": 13,
       "rate": 0.5,
+      "by_reason": {
+        "workflow_change": 13
+      },
+      "escalated": 13,
       "not_story": 0,
       "by_signal": {
         "rejected": 0,
         "request_shaped": 13,
         "inversion_phrase": 0
-      },
-      "by_reason": {
-        "workflow_change": 13
       }
     }
-  },
-  "design_reference": {
-    "collapsed_predicate_rate": 0.54,
-    "note": "Design section 5: collapsing Gate A and Gate B into one escalation produced a 54% escalation rate on 80 first-parent commits, and a rate resembling it is a design failure rather than a tuning question."
-  },
-  "intake_is_feature_share": {
-    "note": "degenerate? true means every escalation fired on workflow_change alone, so the rate equals the [Feature] share of the corpus and measures the corpus split rather than Gate A's judgement. Weigh the comparison with the design's 54% accordingly.",
-    "degenerate?": true,
-    "escalated": 13,
-    "request_shaped": 13,
-    "tickets": 26,
-    "escalation_reason_kinds": [
-      "workflow_change"
-    ]
-  },
-  "sensitivity": {
-    "all": {
-      "total": 322,
-      "escalated": 34,
-      "rate": 0.10559006211180125,
-      "not_story": 5,
-      "by_signal": {
-        "rejected": 5,
-        "request_shaped": 0,
-        "inversion_phrase": 34
-      },
-      "by_reason": {
-        "inverts_deliberate_behaviour": 34
-      }
-    },
-    "run": true,
-    "intake": {
-      "total": 26,
-      "escalated": 0,
-      "rate": 0.0,
-      "not_story": 0,
-      "by_signal": {
-        "rejected": 0,
-        "request_shaped": 0,
-        "inversion_phrase": 0
-      },
-      "by_reason": {}
-    },
-    "note": "the same corpus with every feature request read as NOT a workflow change. The true rate is between this and the headline, and which end it sits at is a definition question for the design, not a tuning question.",
-    "suppressed": "workflow_change_not_defect_fix"
-  },
-  "escalations": [
-    {
-      "intake": true,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 1494,
-      "created_at": "2026-09-10T16:04:28Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 1400,
-      "created_at": "2026-08-31T15:50:14Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 1392,
-      "created_at": "2026-08-28T14:28:07Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 1385,
-      "created_at": "2026-08-28T01:59:20Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 1243,
-      "created_at": "2026-08-21T00:39:19Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 1175,
-      "created_at": "2026-08-18T04:54:24Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 1140,
-      "created_at": "2026-08-13T20:28:23Z"
-    },
-    {
-      "intake": true,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 1104,
-      "created_at": "2026-08-12T02:48:57Z"
-    },
-    {
-      "intake": true,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 956,
-      "created_at": "2026-07-27T15:26:05Z"
-    },
-    {
-      "intake": true,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 926,
-      "created_at": "2026-07-24T19:21:27Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 913,
-      "created_at": "2026-07-23T00:07:30Z"
-    },
-    {
-      "intake": true,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 910,
-      "created_at": "2026-07-22T20:00:17Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 892,
-      "created_at": "2026-07-21T04:42:34Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 866,
-      "created_at": "2026-07-19T02:01:51Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 842,
-      "created_at": "2026-07-18T16:13:36Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 830,
-      "created_at": "2026-07-17T20:58:26Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 816,
-      "created_at": "2026-07-17T20:58:12Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 815,
-      "created_at": "2026-07-17T20:58:10Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 811,
-      "created_at": "2026-07-17T20:58:06Z"
-    },
-    {
-      "intake": true,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 665,
-      "created_at": "2026-07-08T23:10:16Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 661,
-      "created_at": "2026-07-08T01:18:31Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 660,
-      "created_at": "2026-07-08T01:18:12Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 659,
-      "created_at": "2026-07-08T01:17:54Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 658,
-      "created_at": "2026-07-08T01:17:37Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 657,
-      "created_at": "2026-07-08T01:17:16Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 656,
-      "created_at": "2026-07-08T01:16:57Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 655,
-      "created_at": "2026-07-08T01:16:37Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 654,
-      "created_at": "2026-07-08T01:16:22Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 653,
-      "created_at": "2026-07-08T01:16:09Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 652,
-      "created_at": "2026-07-08T01:15:54Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 651,
-      "created_at": "2026-07-08T01:15:39Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 650,
-      "created_at": "2026-07-08T01:00:15Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 647,
-      "created_at": "2026-07-07T23:07:02Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change",
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 646,
-      "created_at": "2026-07-07T23:06:45Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 645,
-      "created_at": "2026-07-07T23:06:24Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change",
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 644,
-      "created_at": "2026-07-07T23:05:59Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 643,
-      "created_at": "2026-07-07T20:13:40Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 630,
-      "created_at": "2026-07-04T01:13:43Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 627,
-      "created_at": "2026-07-04T01:11:22Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 574,
-      "created_at": "2026-06-20T03:07:47Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 510,
-      "created_at": "2026-06-11T05:34:31Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 504,
-      "created_at": "2026-06-11T05:34:10Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 467,
-      "created_at": "2026-06-11T05:31:58Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 457,
-      "created_at": "2026-06-11T05:31:22Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 423,
-      "created_at": "2026-06-11T05:29:22Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 422,
-      "created_at": "2026-06-11T05:29:18Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 411,
-      "created_at": "2026-06-11T05:28:39Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 376,
-      "created_at": "2026-06-01T02:50:46Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 375,
-      "created_at": "2026-06-01T02:50:45Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 374,
-      "created_at": "2026-06-01T02:50:33Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 372,
-      "created_at": "2026-06-01T02:49:30Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 347,
-      "created_at": "2026-05-30T22:59:59Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 342,
-      "created_at": "2026-05-30T22:59:53Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 336,
-      "created_at": "2026-05-30T22:57:21Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 327,
-      "created_at": "2026-05-30T22:57:10Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 325,
-      "created_at": "2026-05-29T04:09:41Z"
-    },
-    {
-      "intake": true,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 321,
-      "created_at": "2026-05-28T22:43:33Z"
-    },
-    {
-      "intake": true,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 316,
-      "created_at": "2026-05-20T20:57:50Z"
-    },
-    {
-      "intake": true,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 315,
-      "created_at": "2026-05-20T20:17:43Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 312,
-      "created_at": "2026-05-13T21:15:28Z"
-    },
-    {
-      "intake": true,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 306,
-      "created_at": "2026-05-08T18:12:12Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 305,
-      "created_at": "2026-05-07T01:38:44Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 303,
-      "created_at": "2026-05-07T00:30:15Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 297,
-      "created_at": "2026-05-06T04:12:00Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 296,
-      "created_at": "2026-05-06T04:11:59Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 295,
-      "created_at": "2026-05-06T04:11:57Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 294,
-      "created_at": "2026-05-06T04:11:56Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 292,
-      "created_at": "2026-05-06T04:11:47Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 289,
-      "created_at": "2026-05-06T01:05:54Z"
-    },
-    {
-      "intake": true,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 283,
-      "created_at": "2026-04-27T19:08:57Z"
-    },
-    {
-      "intake": true,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 270,
-      "created_at": "2026-04-21T21:22:54Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 257,
-      "created_at": "2026-04-19T02:43:45Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 212,
-      "created_at": "2026-04-12T01:42:36Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "inverts_deliberate_behaviour"
-      ],
-      "signals": {
-        "request_shaped?": false,
-        "inversion_phrase?": true,
-        "rejected?": false
-      },
-      "issue": 196,
-      "created_at": "2026-04-08T22:48:25Z"
-    },
-    {
-      "intake": true,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 176,
-      "created_at": "2026-03-27T00:13:10Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 150,
-      "created_at": "2026-03-21T21:39:40Z"
-    },
-    {
-      "intake": false,
-      "reasons": [
-        "workflow_change"
-      ],
-      "signals": {
-        "request_shaped?": true,
-        "inversion_phrase?": false,
-        "rejected?": false
-      },
-      "issue": 149,
-      "created_at": "2026-03-21T21:39:40Z"
-    }
-  ]
+  }
 }

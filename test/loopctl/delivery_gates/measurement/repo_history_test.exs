@@ -21,18 +21,25 @@ defmodule Loopctl.DeliveryGates.Measurement.RepoHistoryTest do
     end
   end
 
-  # The FLAGS are asserted in the key, so a dropped one is an unexpected command rather than a
-  # silently different answer. `-M` because without it the diffstat and content reads disagree
-  # with the name-status read under `diff.renames=false`; `--diff-algorithm` because the
-  # algorithm decides which lines a hunk contains and therefore moves both the oracle's input
-  # and the numstat counts.
-  @algorithm "--diff-algorithm=myers"
+  # The WHOLE pin list is asserted in the key, not just its first element, so dropping ANY pin is
+  # an unexpected command rather than a silently different answer. Pinning only the algorithm was
+  # the gap: `--indent-heuristic` and `--no-show-signature` could both be removed with the suite
+  # green, which is exactly the partial-pinning shape that let a meta key be dropped unnoticed a
+  # round earlier.
+  #
+  # `-M` so the diffstat and content reads agree with the name-status read under
+  # `diff.renames=false`; `--diff-algorithm` and `--indent-heuristic` because both decide which
+  # lines a hunk contains, and so move the oracle's input AND the numstat counts;
+  # `--no-show-signature` because `log.showSignature=true` prepends signature lines and
+  # `header/3`'s NUL-delimited format then mis-splits.
+  @diff_pins ["--diff-algorithm=myers", "--indent-heuristic"]
+  @log_pins ["--no-show-signature"]
 
-  defp key(["log", "-1" | _rest]), do: :header
-  defp key(["log" | _rest] = args), do: {:log, List.last(args)}
-  defp key(["diff", "--name-status", "-M", @algorithm | _rest]), do: :name_status
-  defp key(["diff", "--numstat", "-M", @algorithm | _rest]), do: :numstat
-  defp key(["diff", "--unified=0", "-M", @algorithm | _rest]), do: :content
+  defp key(["log", "-1"] ++ @log_pins ++ _rest), do: :header
+  defp key(["log", "--first-parent", _format] ++ @log_pins ++ rest), do: {:log, List.last(rest)}
+  defp key(["diff", "--name-status", "-M"] ++ @diff_pins ++ _rest), do: :name_status
+  defp key(["diff", "--numstat", "-M"] ++ @diff_pins ++ _rest), do: :numstat
+  defp key(["diff", "--unified=0", "-M"] ++ @diff_pins ++ _rest), do: :content
   defp key(["ls-tree", "-r", "--name-only", "-z", @sha]), do: :head_files
   defp key(["ls-tree", "-r", "--name-only", "-z", @parent]), do: :base_files
   defp key(args), do: args

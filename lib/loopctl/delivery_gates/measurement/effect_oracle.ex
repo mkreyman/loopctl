@@ -61,20 +61,30 @@ defmodule Loopctl.DeliveryGates.Measurement.EffectOracle do
       # NOT `\b83[57]\b`: an underscore is a word character, so `\b` never fires on
       # `build_837` or `Generator837P` — the two shapes an EDI module is actually named in.
       #
-      # TWO guards, and each was paid for by the other's absence:
+      # THREE guards. Every one of them was paid for by an earlier version being wrong, twice in
+      # each direction, which is why the still-fires cases below are pinned as hard as the
+      # suppressed ones:
       #
-      # - `(?<![0-9.\-])` / `(?![0-9.\-])` — no DECIMAL digit, dot or hyphen touching it. Without
-      #   this, `total = 18370`, `timeout: 8350`, `port: 8375` and `"1.0.837"` all fired, and a
-      #   hyphen-separated UUID leaked at its segment boundaries. A transaction number never has
-      #   a digit next to it.
+      # - `(?<![0-9])` / `(?![0-9])` — no DECIMAL digit touching it. Without this `18370`,
+      #   `8350`, `8375` and `9837` all read as EDI. A transaction number never has a digit
+      #   beside it.
+      # - `(?<![0-9][.\-])` / `(?![.\-][0-9])` — a dot or hyphen only blocks when a DIGIT sits on
+      #   its FAR side, which is what a version string (`1.0.837`) and a UUID boundary
+      #   (`-837-4f79`) look like. Blocking a dot or hyphen OUTRIGHT was the round-2 defect and
+      #   it failed in the unbounded direction: it stopped `Generator837.build`, `Edi837.new()`,
+      #   `"claims-837.txt"` and `"out/837.edi"` — the commonest Elixir spellings of an EDI call
+      #   — so a cleared change whose only evidence was one of those scored inert and dropped
+      #   OUT of the false-negative count, pushing the published rate DOWN.
       # - `(?<![0-9A-Fa-f]{2})` / `(?![0-9A-Fa-f]{2})` — no RUN of two hex characters touching
-      #   it. That is what a content hash looks like, and without it a diff full of digests read
-      #   as EDI.
+      #   it, which is what a content hash looks like. A SINGLE hex character was too strong and
+      #   lost `era835`, silently dropping a real claims-path false negative (PR 1263).
       #
-      # A single-hex bound alone was too strong in the other direction and lost `era835` — `a`
-      # is hex — which silently dropped a real claims-path false negative (PR 1263) between two
-      # runs. Both directions are pinned by tests, because each fix here has broken the other.
-      ~r/(?<![0-9.\-])(?<![0-9A-Fa-f]{2})83[57]P?(?![0-9.\-])(?![0-9A-Fa-f]{2})/,
+      # Known residual, accepted rather than chased: a UUID segment of the shape `<hex>-837a-`
+      # still matches, because neither neighbour is a digit and neither run is two hex
+      # characters. That is an OVER-flag, the bounded direction — it can only inflate the
+      # false-negative count, which the moduledoc already declares an upper bound — and every
+      # attempt so far to close a residual by widening a guard has cost a real signal.
+      ~r/(?<![0-9])(?<![0-9][.\-])(?<![0-9A-Fa-f]{2})83[57]P?(?![0-9])(?![.\-][0-9])(?![0-9A-Fa-f]{2})/,
       ~r/\bx12\b/i,
       ~r/\bedi_/i,
       ~r/\bsegment_terminator\b/i

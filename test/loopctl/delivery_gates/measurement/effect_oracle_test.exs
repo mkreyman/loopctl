@@ -97,6 +97,23 @@ defmodule Loopctl.DeliveryGates.Measurement.EffectOracleTest do
                EffectOracle.judge("          next_step: :none | :ta1 | :era835,")
     end
 
+    test "the commonest Elixir spellings of an EDI call still fire :edi" do
+      # Blocking a dot or hyphen OUTRIGHT stopped every one of these, and it failed in the
+      # UNBOUNDED direction: a cleared change whose only EDI evidence is a Generator837.build
+      # call scored inert, dropped out of the false-negative count and pushed the published
+      # rate DOWN. A dot or hyphen now blocks only when a DIGIT sits on its far side.
+      for line <- [
+            "      Generator837.build(claim)",
+            "      Edi837.new()",
+            ~s|      @fixture "claims-837.txt"|,
+            ~s|      path = "out/837.edi"|,
+            "      Generator837P.build(claim)"
+          ] do
+        assert {:ok, %{effect_bearing?: true, families: [:edi]}} = EffectOracle.judge(line),
+               "expected an :edi signal from #{line}"
+      end
+    end
+
     test "the bare word 'modifier' does not fire :billing_codes" do
       # It is ordinary programming vocabulary — a modifier function, a modifier key, a CSS
       # modifier. The DOMAIN sense always arrives qualified.

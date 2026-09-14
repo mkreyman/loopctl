@@ -154,6 +154,46 @@ defmodule Loopctl.DeliveryGates.Measurement.ReportTest do
 
       assert %{human_path: 1, max_files_exceeded: 1} = Report.gate_b(results, %{}).reason_kinds
     end
+
+    test "reason kinds are also cross-tabulated BY OUTCOME" do
+      # Corpus-wide counts cannot answer "of the changes in outcome X, how many carry reason Y",
+      # which is the shape the README prescribes for describing a classification change — so a
+      # claim of that shape was not derivable from the artifact that carried it.
+      results = [
+        result(outcome: :prove_effect, reasons: [{:max_files_exceeded, 40, 12}]),
+        result(outcome: :prove_effect, reasons: []),
+        result(outcome: :size_bound, reasons: [{:max_changed_lines_exceeded, 2000, 1000}]),
+        result(outcome: :human, reasons: [{:human_path, "a.ex", "p"}])
+      ]
+
+      by_outcome = Report.gate_b(results, %{}).reason_kinds_by_outcome
+
+      assert by_outcome[:prove_effect] == %{max_files_exceeded: 1}
+      assert by_outcome[:size_bound] == %{max_changed_lines_exceeded: 1}
+      assert by_outcome[:human] == %{human_path: 1}
+    end
+
+    test "size_bounded_by_outcome is the UNION the per-kind cross-tab cannot give" do
+      # A change over BOTH bounds is counted in both kinds, so the per-kind counts cannot be
+      # added. This is the single number a claim of the form "of the N in outcome X, M were also
+      # over the bound" actually needs.
+      results = [
+        result(
+          outcome: :prove_effect,
+          reasons: [{:max_files_exceeded, 40, 12}, {:max_changed_lines_exceeded, 2000, 1000}]
+        ),
+        result(outcome: :prove_effect, reasons: [{:max_files_exceeded, 40, 12}]),
+        result(outcome: :prove_effect, reasons: []),
+        result(outcome: :human, reasons: [{:human_path, "a.ex", "p"}])
+      ]
+
+      report = Report.gate_b(results, %{})
+
+      assert report.size_bounded_by_outcome[:prove_effect] == 2
+      assert report.size_bounded_by_outcome[:human] == 0
+      # A human path is not a size reason, so the union does not silently absorb it.
+      assert report.reason_kinds_by_outcome[:prove_effect][:max_files_exceeded] == 2
+    end
   end
 
   describe "gate_b/3 redaction" do
@@ -287,6 +327,25 @@ defmodule Loopctl.DeliveryGates.Measurement.ReportTest do
       for {key, value} <- meta do
         assert Map.get(published, key) == value, "expected meta.#{key} to survive redaction"
       end
+    end
+
+    test "the Gate B run-shape keys survive redaction too" do
+      # `:trigger_shape`, `:limit`, `:gate` and `:trigger_status` were on the allow-list with no
+      # literal test, so dropping any of them passed — the same self-referential gap that let
+      # `:corpus` be dropped silently.
+      meta = %{
+        gate: "B",
+        limit: 40,
+        trigger_shape: %{effect_patterns: 7, human_patterns: 3},
+        trigger_status: %{status: "parsed"}
+      }
+
+      published = Report.gate_b([], meta).meta
+
+      assert published.gate == "B"
+      assert published.limit == 40
+      assert published.trigger_shape == %{effect_patterns: 7, human_patterns: 3}
+      assert published.trigger_status == %{status: "parsed"}
     end
 
     test "a parsed trigger status survives redaction unchanged" do
