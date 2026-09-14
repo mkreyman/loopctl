@@ -6,6 +6,36 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Runner contract 1.5.0: a dispatch carries the story as typed fields, and a runner may
+  refuse a kind it does not do (#803).** An `implement` dispatch now carries a `RunnerStory`
+  object — id, title, description, acceptance criteria, test cases, predicted touches and a
+  domain reference — and loopctl still sends no prompt: the runner composes one from those
+  fields with its own template, because a dispatch runs as that machine's user and a control
+  plane able to hand a runner prose to execute is able to run anything on it. Additive and
+  optional, so a runner built against 1.4.0 ignores it; the vendored export is
+  `priv/runner_contract/v1.json` and the major version is unchanged, so **no runner has to be
+  upgraded and no operator action is required**.
+
+  **A story that will not fit is escalated, never truncated.** Every cap is published at
+  `x-connection.limits.story`, the whole object is bounded in bytes by the contract's one byte
+  rule, and a story past any of them is parked at `escalated` for a human instead of being cut
+  down — a dropped acceptance criterion is a story built to the wrong spec.
+
+  **`kind_not_supported`** is a new `dispatch_reply` refusal reason and a capability
+  statement rather than a fault: loopctl records it and never sends that kind to that runner
+  again, it costs the runner no capacity, and nothing reads it as a health signal. It is
+  cleared by re-enrolling the machine. `triage` remains a declared kind and is deliberately
+  not dispatchable until it has its own payload — its input is the reporter's own words, which
+  the implementer must never see.
+
+  **New migration, no manual step and no backfill:** one partial index on `runner_dispatches
+  (tenant_id, runner_id, kind) WHERE status = 'refused' AND reason = 'kind_not_supported'`,
+  built `CONCURRENTLY` so it never blocks a dispatch or a reply. Both reads of the capability
+  memory — the dispatch path and the runner pool — would otherwise scan a table that has no
+  age-based retention. **Anything that later prunes `runner_dispatches` by age must exclude
+  those rows**: they are the entire storage of the memory, so deleting one makes a machine
+  that said it cannot do a kind eligible for it again, silently and on a schedule.
+
 - **The story-to-intake link, and the closer that tells a reporter what happened (#803 §4/§9,
   #805 item 1).** A story created from a reported GitHub issue now records which intake record
   it came from (`stories.intake_record_id`), and when it reaches a terminal verdict loopctl

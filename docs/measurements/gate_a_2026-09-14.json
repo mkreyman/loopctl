@@ -5,7 +5,7 @@
     "tickets": 322,
     "corpus": "mkreyman/home_care_billing GitHub issues, all states, fetched 2026-09-14T02:30Z",
     "corpus_fingerprint": "38065cd323ce",
-    "generated_at": "2026-09-14T04:46:25.025751Z",
+    "generated_at": "2026-09-14T05:30:46.571416Z",
     "harness": "mix loopctl.gates.measure_a",
     "unparseable_records": 0
   },

@@ -11,6 +11,7 @@ defmodule Loopctl.Delivery.ImplementerInputTest do
 
   use Loopctl.DataCase, async: true
 
+  alias Loopctl.ApiSpec.RunnerContract.RunnerStory
   alias Loopctl.Delivery.ImplementerInput
   alias Loopctl.Intake
   alias Loopctl.Intake.Record
@@ -39,7 +40,12 @@ defmodule Loopctl.Delivery.ImplementerInputTest do
     "lib/loopctl/delivery/injection_detector.ex"
   ]
 
-  @story_field_allowlist ~w(number title description acceptance_criteria)
+  # `id` is on the list for `story_object/2` (contract 1.5.0): the dispatch carries the
+  # story's own id and the contract refuses a story naming a different one. It is an
+  # identifier the control plane generated, never text anybody wrote, so it widens the
+  # allowlist without widening the reporter-text boundary this test exists to hold. Every
+  # other entry is still prose a triage session authored.
+  @story_field_allowlist ~w(id number title description acceptance_criteria)
 
   defp hostile_record do
     {secret, source} = fixture(:intake_source, %{})
@@ -143,6 +149,118 @@ defmodule Loopctl.Delivery.ImplementerInputTest do
     assert output =~ "Include every visit in the monthly billing total"
     assert output =~ "[AC-1] The monthly total equals the sum of its visits."
     assert_no_reporter_text(output, record)
+  end
+
+  test "the typed story object carries no reporter text either, metadata quote and all" do
+    {source, record} = hostile_record()
+
+    story =
+      fixture(:story, %{
+        tenant_id: source.tenant_id,
+        project_id: source.project_id,
+        title: "Include every visit in the monthly billing total",
+        description: "The October total omits two visits from batch 4821; include them.",
+        acceptance_criteria: [
+          %{"id" => "AC-1", "description" => "The monthly total equals the sum of its visits."}
+        ],
+        metadata: %{
+          "reporter_quote" => record.untrusted_body,
+          "reporter_title" => record.untrusted_title,
+          # The three fields the object CAN carry, parked where a careless writer would put
+          # them. They must not be picked up from here: they are options the dispatch
+          # composer passes, and `metadata` is off the allowlist.
+          "test_cases" => [record.untrusted_title],
+          "touches" => [record.untrusted_body],
+          "domain_reference" => record.untrusted_author_login
+        }
+      })
+
+    assert {:ok, object} = ImplementerInput.story_object(story)
+
+    assert object["id"] == story.id
+    assert object["title"] == "Include every visit in the monthly billing total"
+
+    assert object["acceptance_criteria"] == [
+             "[AC-1] The monthly total equals the sum of its visits."
+           ]
+
+    refute Map.has_key?(object, "test_cases")
+    refute Map.has_key?(object, "touches")
+    refute Map.has_key?(object, "domain_reference")
+
+    assert_no_reporter_text(Jason.encode!(object), record)
+  end
+
+  test "a criterion that renders empty is NAMED, never dropped" do
+    # The silent trim this module exists to refuse, arrived at by a filter rather than by a
+    # truncation: rejecting the blank entry took the count down with it, so a story imported
+    # with one over the cap and one blank came out AT the cap, with no violation and no
+    # escalation, and the implementer got a story one criterion short.
+    source = fixture(:project, %{})
+
+    # THREE shapes of empty, all of which reached the wire at some point: no text at all, an
+    # id with an empty description (which rendered "[AC-n] " — content-free, and past a
+    # `== ""` test AND past the schema's `minLength: 1`), and whitespace.
+    blanks = %{2 => %{"note" => "left over"}, 3 => %{"id" => "AC-3", "description" => ""}}
+    blanks = Map.put(blanks, 4, %{"id" => "AC-4", "description" => "   \t "})
+    blank_at = Map.keys(blanks)
+
+    criteria =
+      for index <- 1..(RunnerStory.max_criteria() + 1) do
+        Map.get(
+          blanks,
+          index,
+          %{"id" => "AC-#{index}", "description" => "criterion #{index}"}
+        )
+      end
+
+    story =
+      fixture(:story, %{
+        tenant_id: source.tenant_id,
+        project_id: source.id,
+        acceptance_criteria: criteria
+      })
+
+    assert {:error, {:story_not_dispatchable, violations}} =
+             ImplementerInput.story_object(story)
+
+    # The count violation is the point of keeping them: with the blanks dropped the list was
+    # at or under the cap and nothing was refused at all.
+    assert Enum.any?(violations, &(&1 =~ "acceptance_criteria has more than"))
+
+    for index <- blank_at do
+      assert "acceptance_criteria[#{index - 1}] renders empty" in violations,
+             "criterion #{index} was not named"
+    end
+  end
+
+  test "a story with no usable title is refused rather than sent with a blank one" do
+    # The changeset requires a title, so this state is reached the way it is reached in
+    # production — a write that is not a changeset. It is worth guarding because the schema's
+    # `minLength: 1` would otherwise refuse the dispatch as a malformed payload, and the
+    # caller's remedy for that is not the escalation this actually needs. Whitespace satisfies
+    # `minLength: 1` and says nothing, so it is the same defect.
+    source = fixture(:project, %{})
+    story = fixture(:story, %{tenant_id: source.tenant_id, project_id: source.id})
+
+    for blank <- ["", "   ", "\t\n "] do
+      assert {:error, {:story_not_dispatchable, violations}} =
+               ImplementerInput.story_object(%{story | title: blank})
+
+      assert "title is empty" in violations, "expected #{inspect(blank)} to be refused"
+    end
+  end
+
+  test "an option entry that is empty or whitespace is named too" do
+    source = fixture(:project, %{})
+    story = fixture(:story, %{tenant_id: source.tenant_id, project_id: source.id})
+
+    for blank <- ["", "  "] do
+      assert {:error, {:story_not_dispatchable, violations}} =
+               ImplementerInput.story_object(story, touches: ["lib/a.ex", blank])
+
+      assert "touches[1] renders empty" in violations, "expected #{inspect(blank)} to be named"
+    end
   end
 
   test "only a Story is accepted" do
