@@ -106,19 +106,29 @@ defmodule Loopctl.Delivery.ImplementerInput do
 
   ## Refusal
 
-  `{:error, {:story_too_large, violations}}` when the story exceeds ANY cap the contract
-  declares — a field, an item count, or the whole object's byte budget — with one message per
-  violation. It is never truncated to fit: a dropped acceptance criterion is a story built to
-  the wrong spec, and an implementer cannot tell a story that had three criteria from one
-  whose fourth was cut. `Loopctl.Delivery.StoryPayload` is what turns that refusal into an
-  escalation.
+  `{:error, {:story_not_dispatchable, violations}}` when the story cannot be sent AS IT
+  STANDS, with one message per violation. It is never trimmed to fit: a dropped acceptance
+  criterion is a story built to the wrong spec, and an implementer cannot tell a story that
+  had three criteria from one whose fourth was cut. `Loopctl.Delivery.StoryPayload` is what
+  turns that refusal into an escalation.
+
+  Two kinds of violation, and the second is the one that nearly slipped through as a silent
+  trim:
+
+  - a cap — a field, an item count, or the whole object's byte budget;
+  - an item that RENDERS EMPTY. A criterion whose map carries no usable text renders as `""`,
+    which the schema refuses (`minLength: 1`) and which an earlier version DROPPED. A story
+    imported with 21 criteria one of which is blank then yielded 20 on the wire, under the cap,
+    with no violation and no escalation — the exact wrong-spec outcome this module exists to
+    prevent, arrived at by a filter rather than by a truncation. The entry is kept so the
+    COUNT is honest and the cap binds, and it is named as a violation so nothing dispatches.
 
   Lengths are counted with `String.length/1` — GRAPHEMES, the unit `OpenApiSpex` counts a
   `maxLength` in — so this refuses exactly what the schema would, and the byte budget is the
   contract's one `ByteRule`.
   """
   @spec story_object(Story.t(), keyword()) ::
-          {:ok, map()} | {:error, {:story_too_large, [String.t()]}}
+          {:ok, map()} | {:error, {:story_not_dispatchable, [String.t()]}}
   def story_object(%Story{} = story, opts \\ []) do
     object =
       %{"id" => story.id, "title" => story.title || ""}
@@ -130,21 +140,23 @@ defmodule Loopctl.Delivery.ImplementerInput do
 
     case violations(object) do
       [] -> {:ok, object}
-      violations -> {:error, {:story_too_large, violations}}
+      violations -> {:error, {:story_not_dispatchable, violations}}
     end
   end
 
+  # EVERY criterion, including one that renders empty. Rejecting the empty ones here was a
+  # silent trim: the count went down, the cap stopped binding, and a story shipped one
+  # criterion short with nothing refused. `violations/1` names it instead.
   defp criteria_strings(%Story{acceptance_criteria: criteria}) do
     criteria
     |> List.wrap()
     |> Enum.map(&criterion_text/1)
-    |> Enum.reject(&(&1 == ""))
   end
 
   defp strings(nil), do: []
 
-  defp strings(values) when is_list(values),
-    do: values |> Enum.map(&to_string/1) |> Enum.reject(&(&1 == ""))
+  # Same rule as the criteria: an empty option entry is kept and named, never dropped.
+  defp strings(values) when is_list(values), do: Enum.map(values, &to_string/1)
 
   defp put_present(object, _key, nil), do: object
   defp put_present(object, _key, ""), do: object
@@ -153,9 +165,11 @@ defmodule Loopctl.Delivery.ImplementerInput do
   defp put_list(object, _key, []), do: object
   defp put_list(object, key, values), do: Map.put(object, key, values)
 
-  # Every cap the contract declares, read from `RunnerStory` so no number is restated here.
+  # Every cap the contract declares, read from `RunnerStory` so no number is restated here,
+  # plus the shape rules a cap cannot express.
   defp violations(object) do
-    length_violation(object, "title", RunnerStory.max_title_length()) ++
+    blank_violation(object, "title") ++
+      length_violation(object, "title", RunnerStory.max_title_length()) ++
       length_violation(object, "description", RunnerStory.max_description_length()) ++
       list_violations(
         object,
@@ -177,6 +191,13 @@ defmodule Loopctl.Delivery.ImplementerInput do
       ) ++
       length_violation(object, "domain_reference", RunnerStory.max_domain_reference_length()) ++
       bytes_violation(object)
+  end
+
+  # The schema requires a non-empty title, so a story with none cannot be dispatched. Named
+  # here rather than left to the cast: the caller's remedy is an escalation, and
+  # `invalid_payload` from the wire would tell it the payload was malformed instead.
+  defp blank_violation(object, key) do
+    if Map.get(object, key) in [nil, ""], do: ["#{key} is empty"], else: []
   end
 
   defp length_violation(object, key, max) do
@@ -204,7 +225,16 @@ defmodule Loopctl.Delivery.ImplementerInput do
           String.length(value) > max_length,
           do: "#{key}[#{index}] is longer than #{max_length} characters"
 
-    count ++ too_long
+    # An entry that renders empty is NAMED, never dropped — dropping it is the silent trim
+    # this module exists to refuse, and it takes the item count down with it so the cap stops
+    # binding. The schema refuses an empty item too (`minLength: 1`); this is the copy that
+    # answers with an escalation instead of a malformed-payload refusal from the wire.
+    empty =
+      for {value, index} <- Enum.with_index(values),
+          value == "",
+          do: "#{key}[#{index}] renders empty"
+
+    count ++ too_long ++ empty
   end
 
   defp bytes_violation(object) do

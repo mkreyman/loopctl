@@ -28,6 +28,14 @@ All notable changes to loopctl are documented here.
   not dispatchable until it has its own payload — its input is the reporter's own words, which
   the implementer must never see.
 
+  **New migration, no manual step and no backfill:** one partial index on `runner_dispatches
+  (tenant_id, runner_id, kind) WHERE status = 'refused' AND reason = 'kind_not_supported'`,
+  built `CONCURRENTLY` so it never blocks a dispatch or a reply. Both reads of the capability
+  memory — the dispatch path and the runner pool — would otherwise scan a table that has no
+  age-based retention. **Anything that later prunes `runner_dispatches` by age must exclude
+  those rows**: they are the entire storage of the memory, so deleting one makes a machine
+  that said it cannot do a kind eligible for it again, silently and on a schedule.
+
 - **The story-to-intake link, and the closer that tells a reporter what happened (#803 §4/§9,
   #805 item 1).** A story created from a reported GitHub issue now records which intake record
   it came from (`stories.intake_record_id`), and when it reaches a terminal verdict loopctl

@@ -338,6 +338,66 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
 
       assert DispatchLedger.unsupported_kinds(other_tenant.id) == %{}
     end
+
+    test "the partial index the two reads depend on exists, is valid, and is partial" do
+      # `kind_unsupported?/3` runs on the dispatch hot path and `unsupported_kinds/1` on every
+      # pool poll, and `runner_dispatches` has no age-based retention — so without this index
+      # the common NO-MATCH case examines every dispatch the runner ever held.
+      #
+      # What this asserts is existence, VALIDITY and shape. A concurrent build that was
+      # interrupted leaves an INVALID index occupying the name: the reads silently go back to
+      # the scan and nothing looks wrong, which is the failure worth a test. What it does NOT
+      # assert is the query PLAN — at test-DB scale the planner picks a sequential scan
+      # whatever indexes exist, so an EXPLAIN here would prove nothing about production.
+      sql = """
+      SELECT pg_get_indexdef(c.oid), x.indisvalid
+        FROM pg_class c
+        JOIN pg_index x ON x.indexrelid = c.oid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE c.relname = $1 AND c.relkind = 'i' AND n.nspname = 'public'
+      """
+
+      assert [[definition, true]] =
+               Repo.query!(sql, ["runner_dispatches_unsupported_kind_idx"]).rows
+
+      assert definition =~ "USING btree (tenant_id, runner_id, kind)"
+
+      # PARTIAL on both values, which is what keeps it a handful of rows rather than a second
+      # copy of the table.
+      assert definition =~ "WHERE"
+      assert definition =~ "refused"
+      assert definition =~ "kind_not_supported"
+    end
+
+    test "nothing under lib/ deletes a dispatch row, because those rows ARE the memory" do
+      # The capability memory is DERIVED from `runner_dispatches`, so its lifetime is that
+      # table's retention — and the coupling is invisible from a pruner's own file. The day
+      # something prunes this table by age, a runner that told loopctl it cannot do a kind
+      # becomes eligible again: silently, on a schedule, with no reply from the runner and
+      # nothing in any log to say why the dispatches resumed. This is where a pruner's author
+      # finds out. Excluding those rows in the predicate is the fix; relaxing this is not.
+      files = Path.wildcard("lib/**/*.ex")
+      assert length(files) > 100, "the source scan found no files, so it proves nothing"
+
+      mentions = Enum.filter(files, &(File.read!(&1) =~ "DispatchRecord"))
+
+      assert "lib/loopctl/runners/dispatch_ledger.ex" in mentions,
+             "the scan no longer sees the module that owns these rows"
+
+      deletes =
+        Enum.filter(mentions, fn file ->
+          source = File.read!(file)
+
+          Regex.match?(~r/delete_all\(\s*from\([a-z_]+ in DispatchRecord/, source) or
+            Regex.match?(~r/Repo\.delete[_!a-z]*\(\s*%?DispatchRecord/, source)
+        end)
+
+      assert deletes == [],
+             "these delete dispatch rows: #{inspect(deletes)}. A row with status " <>
+               "'refused' and reason 'kind_not_supported' is the ONLY storage of the " <>
+               "capability memory kind_unsupported?/3 reads — see the Retention section of " <>
+               "Loopctl.Runners.DispatchLedger. Exclude those rows, or do not prune here."
+    end
   end
 
   describe "record_reply/3" do

@@ -11,6 +11,7 @@ defmodule Loopctl.Delivery.ImplementerInputTest do
 
   use Loopctl.DataCase, async: true
 
+  alias Loopctl.ApiSpec.RunnerContract.RunnerStory
   alias Loopctl.Delivery.ImplementerInput
   alias Loopctl.Intake
   alias Loopctl.Intake.Record
@@ -188,6 +189,67 @@ defmodule Loopctl.Delivery.ImplementerInputTest do
     refute Map.has_key?(object, "domain_reference")
 
     assert_no_reporter_text(Jason.encode!(object), record)
+  end
+
+  test "a criterion that renders empty is NAMED, never dropped" do
+    # The silent trim this module exists to refuse, arrived at by a filter rather than by a
+    # truncation: rejecting the blank entry took the count down with it, so a story imported
+    # with one over the cap and one blank came out AT the cap, with no violation and no
+    # escalation, and the implementer got a story one criterion short.
+    source = fixture(:project, %{})
+
+    blank_at = 3
+
+    # Neither an id nor a description, so `criterion_text/1` renders "". A criterion carrying
+    # an id and no text renders "[AC-n] " and is NOT this case — it is not empty, so it was
+    # never dropped and the cap always saw it.
+    criteria =
+      for index <- 1..(RunnerStory.max_criteria() + 1) do
+        if index == blank_at,
+          do: %{"note" => "left over from an import"},
+          else: %{"id" => "AC-#{index}", "description" => "criterion #{index}"}
+      end
+
+    story =
+      fixture(:story, %{
+        tenant_id: source.tenant_id,
+        project_id: source.id,
+        acceptance_criteria: criteria
+      })
+
+    assert {:error, {:story_not_dispatchable, violations}} =
+             ImplementerInput.story_object(story)
+
+    # BOTH, and the count one is the point: with the blank dropped the list was exactly at
+    # the cap and nothing was refused at all.
+    assert Enum.any?(violations, &(&1 =~ "acceptance_criteria has more than"))
+
+    assert "acceptance_criteria[#{blank_at - 1}] renders empty" in violations
+  end
+
+  test "a story with no title is refused rather than sent with an empty one" do
+    # The changeset requires a title, so this state is reached the way it is reached in
+    # production — a write that is not a changeset. It is worth guarding because the schema's
+    # `minLength: 1` would otherwise refuse the dispatch as a malformed payload, and the
+    # caller's remedy for that is not the escalation this actually needs.
+    source = fixture(:project, %{})
+    story = fixture(:story, %{tenant_id: source.tenant_id, project_id: source.id})
+    blank = %{story | title: ""}
+
+    assert {:error, {:story_not_dispatchable, violations}} =
+             ImplementerInput.story_object(blank)
+
+    assert "title is empty" in violations
+  end
+
+  test "an option entry that is empty is named too" do
+    source = fixture(:project, %{})
+    story = fixture(:story, %{tenant_id: source.tenant_id, project_id: source.id})
+
+    assert {:error, {:story_not_dispatchable, violations}} =
+             ImplementerInput.story_object(story, touches: ["lib/a.ex", ""])
+
+    assert "touches[1] renders empty" in violations
   end
 
   test "only a Story is accepted" do

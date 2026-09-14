@@ -65,7 +65,7 @@ defmodule Loopctl.Delivery.StoryPayload do
   # listing them flat would have an exhaustive `case` writing a clause nothing reaches.
   @type error ::
           :not_found
-          | {:story_too_large, [violation()]}
+          | {:story_not_dispatchable, [violation()]}
           | {:escalation_failed, escalation_error(), [violation()]}
 
   @type escalation_error ::
@@ -79,11 +79,13 @@ defmodule Loopctl.Delivery.StoryPayload do
   Returns `{:ok, object}` — string-keyed, ready to put under the dispatch payload's `"story"`
   key.
 
-  `{:error, {:story_too_large, violations}}` means the story broke a cap AND has been
-  escalated: the stage row is at `escalated`, the violations are on the transition's event,
-  and the caller must not dispatch. `{:error, {:escalation_failed, reason, violations}}` is
-  the same refusal with the escalation itself refused — louder on purpose, and logged at
-  error, because a story that is neither dispatchable nor parked is one nothing will pick up.
+  `{:error, {:story_not_dispatchable, violations}}` means the story cannot be sent as it
+  stands AND has been escalated: the stage row is at `escalated`, the violations are on the
+  transition's event, and the caller must not dispatch. A row ALREADY at `escalated` — parked
+  by an earlier attempt or by anything else — is this answer too, because the story is where
+  this call wanted to put it. `{:error, {:escalation_failed, reason, violations}}` is the same
+  refusal with the escalation itself refused — louder on purpose, and logged at error, because
+  a story that is neither dispatchable nor parked is one nothing will pick up.
 
   ## Precondition: the story must be at a stage escalation can leave
 
@@ -99,8 +101,7 @@ defmodule Loopctl.Delivery.StoryPayload do
 
   Both required options are read at the TOP of the call, before the story is loaded, so a
   composer that omits one learns on its first ordinary dispatch instead of raising a KeyError
-  on its first oversize story — which would turn "too large to dispatch" into a crash in the
-  caller.
+  on its first undispatchable story — which would turn a refusal into a crash in the caller.
 
   - `:claim_epoch` (required) — the epoch the caller's claim returned. The fence on the
     escalation, exactly as it is on every other transition.
@@ -128,7 +129,7 @@ defmodule Loopctl.Delivery.StoryPayload do
         {:ok, object} ->
           {:ok, object}
 
-        {:error, {:story_too_large, violations}} ->
+        {:error, {:story_not_dispatchable, violations}} ->
           refuse(tenant_id, story_id, violations, escalation)
       end
     end
@@ -150,22 +151,23 @@ defmodule Loopctl.Delivery.StoryPayload do
     case escalate(tenant_id, story_id, violations, escalation) do
       {:ok, _row} ->
         Logger.warning(
-          "story too large to dispatch, escalated: tenant_id=#{tenant_id} " <>
+          "story not dispatchable, escalated: tenant_id=#{tenant_id} " <>
             "story_id=#{story_id} violations=#{inspect(Enum.take(violations, 5))} " <>
             "violation_count=#{length(violations)}",
           tenant_id: tenant_id,
           story_id: story_id
         )
 
-        {:error, {:story_too_large, violations}}
+        {:error, {:story_not_dispatchable, violations}}
 
       {:error, reason} ->
         # ERROR, and louder than the branch above on purpose: the escalated case is the
         # HARMLESS one — a human has the story. This one leaves it neither dispatchable nor
         # parked, so it is the outcome nothing downstream will pick up and nobody is watching
-        # for.
+        # for. Which is exactly why `escalate/4` re-reads before it gets here: the loudest
+        # signal in this module must not fire on a story that IS parked.
         Logger.error(
-          "story too large to dispatch AND NOT ESCALATED: tenant_id=#{tenant_id} " <>
+          "story not dispatchable AND NOT ESCALATED: tenant_id=#{tenant_id} " <>
             "story_id=#{story_id} escalation_error=#{inspect(reason)} " <>
             "violations=#{inspect(Enum.take(violations, 5))} " <>
             "violation_count=#{length(violations)}",
@@ -198,17 +200,48 @@ defmodule Loopctl.Delivery.StoryPayload do
   # `:invalid_transition` the caller must decode. See the precondition on `build/3`.
   defp advance_or_name_the_gap(tenant_id, story_id, stage, violations, escalation) do
     if {stage, :escalated, :session_escalated} in StageMachine.transitions() do
-      Stages.advance(
-        tenant_id,
+      tenant_id
+      |> Stages.advance(
         story_id,
         {stage, :escalated, :session_escalated},
         escalation ++
           [reason: reason_text(violations), event_data: violation_event_data(violations)]
       )
+      |> settle_lost_race(tenant_id, story_id)
     else
       {:error, {:no_escalation_edge, stage}}
     end
   end
+
+  @doc """
+  Resolves a transition refused because the row MOVED, by re-reading it. Internal to the
+  escalation; public only so the race can be tested without racing.
+
+  The read in `escalate/4` and the write are two transactions, so another writer can park the
+  row in between. The compare-and-set then answers `:stale_stage` — and without this the
+  module's LOUDEST signal, "NOT ESCALATED" at error, fired for a story that IS escalated. One
+  re-read, no recursion: a row at `escalated` is the outcome this call wanted, whoever wrote
+  it, so it is `:ok`. Anything else is the caller's error, and the loud path is kept for the
+  genuinely stranded story it was written for.
+
+  The epoch is deliberately NOT compared, unlike `Loopctl.Delivery.Escalations.escalate/3`.
+  That one is a SESSION claiming its own escalation, so an escalation under another epoch is
+  somebody else's. This is control asking for the story to be PARKED; parked under any epoch
+  is the outcome, and a human looks at it either way.
+  """
+  @spec settle_lost_race({:ok, StoryStage.t()} | {:error, term()}, Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, StoryStage.t()} | {:error, term()}
+  def settle_lost_race(result, tenant_id, story_id)
+
+  def settle_lost_race({:error, reason}, tenant_id, story_id)
+      when reason in [:stale_stage, :invalid_transition] do
+    case Stages.get(tenant_id, story_id) do
+      %StoryStage{stage: :escalated} = row -> {:ok, row}
+      _other -> {:error, reason}
+    end
+  end
+
+  def settle_lost_race(result, _tenant_id, _story_id), do: result
 
   # BOUNDED against the same cap `Stages` enforces, read from its accessor rather than
   # restated. Unbounded, this was the sibling of the reason truncation below and the same
@@ -247,8 +280,9 @@ defmodule Loopctl.Delivery.StoryPayload do
   # escalate", the one outcome that leaves a story nowhere.
   defp reason_text(violations) do
     text =
-      "loopctl did not dispatch this story: it exceeds the runner contract's caps, and a " <>
-        "truncated story would be built to the wrong spec. " <> Enum.join(violations, "; ")
+      "loopctl did not dispatch this story: it does not satisfy the runner contract's story " <>
+        "object, and a trimmed story would be built to the wrong spec. " <>
+        Enum.join(violations, "; ")
 
     # CODEPOINTS, the unit the CHECK counts in — never `String.slice/2`, which counts
     # graphemes and would leave a 4000-grapheme reason with more codepoints than the column

@@ -102,6 +102,18 @@ defmodule Loopctl.Runners.DispatchLedger do
   loopctl keeps, and the window is a disk bound, not amnesia. The audit chain is a
   different table and is never touched here.
 
+  **INVARIANT for anyone adding an age-based prune of `runner_dispatches` ITSELF: a row with
+  `status = "refused"` and `reason = "kind_not_supported"` is EVIDENCE, not history, and must
+  never be deleted.** Those rows are the entire storage of the capability memory
+  `kind_unsupported?/3` reads (contract 1.5.0) — there is no column and no second copy — so
+  deleting one makes a machine that told loopctl it cannot do a kind eligible for that kind
+  again: silently, on a schedule, with no reply from the runner and nothing in any log to say
+  why the dispatches resumed. Only the trace TABLE has retention today, and the coupling is
+  invisible from a pruner's own file, which is why this is stated here AND asserted by a
+  source scan in `dispatch_ledger_test.exs` that goes red the moment anything under `lib/`
+  deletes a `DispatchRecord`. Exclude these rows in the pruner's predicate, or leave this
+  table alone.
+
   ## Repo and isolation
 
   Every read and write runs on the RLS-enforced `Loopctl.Repo`, inside
@@ -398,6 +410,12 @@ defmodule Loopctl.Runners.DispatchLedger do
   cleared the way a runner's other bindings are: revoke and re-enroll, which mints a new
   `runners` row that no reply refers to. A column would have to be un-set by hand instead,
   and a stale one would silently starve a machine that had gained the capability.
+
+  What deriving it COSTS, stated plainly because "no second place to forget to clear"
+  understates it: the memory's lifetime is now this TABLE's retention. Nothing prunes
+  `runner_dispatches` today, and the day something does, these rows must be excluded or the
+  memory resets on a schedule. The invariant is in the moduledoc's Retention section and a
+  source scan asserts it — read it before adding a pruner.
 
   It is a statement about capability, not health: a refusal releases its slot in the same
   transaction that records it, and nothing in loopctl reads a refusal as a runner being

@@ -129,14 +129,14 @@ defmodule Loopctl.Delivery.StoryPayloadTest do
     test "an oversize story is escalated and NOT dispatched" do
       story = staged(long_story_attrs())
 
-      assert {:error, {:story_too_large, violations}} =
+      assert {:error, {:story_not_dispatchable, violations}} =
                StoryPayload.build(story.tenant_id, story.id, opts())
 
       assert Enum.any?(violations, &(&1 =~ "under the byte rule"))
 
       row = Stages.get(story.tenant_id, story.id)
       assert row.stage == :escalated
-      assert row.escalation_reason =~ "exceeds the runner contract's caps"
+      assert row.escalation_reason =~ "does not satisfy the runner contract's story object"
 
       events = Stages.list_events(story.tenant_id, story.id)
       transition = Enum.find(events, &(&1.to_stage == "escalated"))
@@ -147,10 +147,10 @@ defmodule Loopctl.Delivery.StoryPayloadTest do
     test "a story already escalated is not escalated a second time" do
       story = staged(long_story_attrs(), :escalated)
 
-      assert {:error, {:story_too_large, _}} =
+      assert {:error, {:story_not_dispatchable, _}} =
                StoryPayload.build(story.tenant_id, story.id, opts())
 
-      assert {:error, {:story_too_large, _}} =
+      assert {:error, {:story_not_dispatchable, _}} =
                StoryPayload.build(story.tenant_id, story.id, opts())
 
       escalations =
@@ -198,7 +198,7 @@ defmodule Loopctl.Delivery.StoryPayloadTest do
 
       quiet =
         capture_log([level: :error], fn ->
-          assert {:error, {:story_too_large, _}} =
+          assert {:error, {:story_not_dispatchable, _}} =
                    StoryPayload.build(parked.tenant_id, parked.id, opts())
         end)
 
@@ -214,6 +214,34 @@ defmodule Loopctl.Delivery.StoryPayloadTest do
 
       assert loud =~ "NOT ESCALATED"
       assert loud =~ stranded.id
+    end
+
+    test "another writer parking the story first is the ok outcome, not the loudest error" do
+      # Whoever parked it, the story is where this call wanted it, so the caller gets the
+      # ordinary refusal and NOTHING is logged at error — the level reserved for a story that
+      # is neither dispatchable nor parked.
+      story = staged(long_story_attrs())
+
+      {:ok, _row} =
+        Stages.advance(story.tenant_id, story.id, {:claimed, :escalated, :session_escalated},
+          claim_epoch: @epoch,
+          actor_lineage: [],
+          actor_label: "someone-else",
+          reason: "a human was already asked to look at this"
+        )
+
+      log =
+        capture_log([level: :error], fn ->
+          assert {:error, {:story_not_dispatchable, _}} =
+                   StoryPayload.build(story.tenant_id, story.id, opts())
+        end)
+
+      assert log == ""
+
+      row = Stages.get(story.tenant_id, story.id)
+      assert row.stage == :escalated
+      # The other writer's reason stands: this call did not park it a second time.
+      assert row.escalation_reason == "a human was already asked to look at this"
     end
 
     test "a stale claim epoch refuses the escalation rather than writing under a dead claim" do
@@ -240,7 +268,7 @@ defmodule Loopctl.Delivery.StoryPayloadTest do
 
       story = staged(%{acceptance_criteria: criteria})
 
-      assert {:error, {:story_too_large, violations}} =
+      assert {:error, {:story_not_dispatchable, violations}} =
                StoryPayload.build(story.tenant_id, story.id, opts())
 
       assert length(violations) > 100
@@ -293,11 +321,54 @@ defmodule Loopctl.Delivery.StoryPayloadTest do
     end
   end
 
+  describe "settle_lost_race/3" do
+    # The race itself cannot be staged from one process: the read and the write are two calls
+    # inside `build/3`, and a test that has to win a real race is a flaky test. So the
+    # RESOLUTION is exercised directly — it is the whole of the logic — while the outcome a
+    # caller sees is asserted through `build/3` above. Every mutation of this function is
+    # killed here; the pipe that CALLS it is killed by the build-level test.
+    test "a refusal caused by the row moving becomes ok once the row is escalated" do
+      story = staged(long_story_attrs(), :escalated)
+
+      for reason <- [:stale_stage, :invalid_transition] do
+        assert {:ok, row} =
+                 StoryPayload.settle_lost_race({:error, reason}, story.tenant_id, story.id)
+
+        assert row.stage == :escalated
+      end
+    end
+
+    test "the same refusal on a row that is NOT escalated stays the caller's error" do
+      story = staged(long_story_attrs())
+
+      for reason <- [:stale_stage, :invalid_transition] do
+        assert {:error, ^reason} =
+                 StoryPayload.settle_lost_race({:error, reason}, story.tenant_id, story.id)
+      end
+    end
+
+    test "any other outcome passes straight through, escalated row or not" do
+      story = staged(long_story_attrs(), :escalated)
+
+      # A story parked for some OTHER reason must not turn a stale epoch into a success:
+      # only the two refusals that mean "the row moved" are re-read.
+      assert {:error, :stale_claim_epoch} =
+               StoryPayload.settle_lost_race(
+                 {:error, :stale_claim_epoch},
+                 story.tenant_id,
+                 story.id
+               )
+
+      row = Stages.get(story.tenant_id, story.id)
+      assert {:ok, ^row} = StoryPayload.settle_lost_race({:ok, row}, story.tenant_id, story.id)
+    end
+  end
+
   describe "the field caps" do
     test "a title past its cap is refused by name, not trimmed" do
       story = staged(%{title: String.duplicate("t", RunnerStory.max_title_length() + 1)})
 
-      assert {:error, {:story_too_large, violations}} =
+      assert {:error, {:story_not_dispatchable, violations}} =
                StoryPayload.build(story.tenant_id, story.id, opts())
 
       assert Enum.any?(violations, &(&1 =~ "title is longer than"))
@@ -310,7 +381,7 @@ defmodule Loopctl.Delivery.StoryPayloadTest do
 
       story = staged(%{acceptance_criteria: criteria})
 
-      assert {:error, {:story_too_large, violations}} =
+      assert {:error, {:story_not_dispatchable, violations}} =
                StoryPayload.build(story.tenant_id, story.id, opts())
 
       assert Enum.any?(violations, &(&1 =~ "acceptance_criteria has more than"))
@@ -324,7 +395,7 @@ defmodule Loopctl.Delivery.StoryPayloadTest do
             touches: [String.duplicate("p", RunnerStory.max_touch_length() + 1)],
             domain_reference: String.duplicate("d", RunnerStory.max_domain_reference_length() + 1)
           ] do
-        assert {:error, {:story_too_large, _}} =
+        assert {:error, {:story_not_dispatchable, _}} =
                  StoryPayload.build(story.tenant_id, story.id, opts([{key, value}])),
                "expected #{key} past its cap to be refused"
       end
