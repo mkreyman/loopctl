@@ -76,9 +76,14 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
     end)
   end
 
-  defp sent(runner, attrs \\ %{}) do
+  # `after_cast` overrides fields of the CAST dispatch, for the values the outbound cast
+  # legitimately refuses but the ledger must still store.
+  defp sent(runner, attrs \\ %{}, after_cast \\ %{}) do
     {:ok, dispatch} = RunnerContract.cast_dispatch(dispatch_payload(runner.tenant_id, attrs))
-    {:ok, record} = DispatchLedger.record_sent(runner.tenant_id, runner.id, dispatch)
+
+    {:ok, record} =
+      DispatchLedger.record_sent(runner.tenant_id, runner.id, Map.merge(dispatch, after_cast))
+
     record
   end
 
@@ -135,7 +140,10 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
 
   describe "record_sent/3" do
     test "writes one `sent` row carrying the dispatch's identity", %{runner: runner} do
-      record = sent(runner, %{"claim_epoch" => 3, "kind" => "triage"})
+      # The kind is set AFTER the cast: `triage` is a declared kind the cast refuses to
+      # dispatch (contract 1.5.0), while the ledger stores whatever kind it is handed — which
+      # is what this asserts, and what keeps the row honest once triage has its own payload.
+      record = sent(runner, %{"claim_epoch" => 3}, %{kind: "triage"})
 
       assert record.status == "sent"
       assert record.runner_id == runner.id
@@ -181,15 +189,21 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
       # so the refusal is the ledger's identity check, not the fence.
       other_story = fixture(:ledger_story, %{tenant_id: runner.tenant_id})
 
-      for {who, attrs} <- [
-            {runner, %{"kind" => "triage"}},
-            {runner, %{"story_id" => other_story.id}},
-            {other, %{}}
+      # `after_cast` for the kind, which the outbound cast refuses to dispatch; the ledger's
+      # identity check reads the stored column either way.
+      for {who, attrs, after_cast} <- [
+            {runner, %{}, %{kind: "triage"}},
+            {runner, %{"story_id" => other_story.id}, %{}},
+            {other, %{}, %{}}
           ] do
         {:ok, dispatch} = RunnerContract.cast_dispatch(Map.merge(base, attrs))
 
         assert {:error, :dispatch_id_conflict} =
-                 DispatchLedger.record_sent(who.tenant_id, who.id, dispatch)
+                 DispatchLedger.record_sent(
+                   who.tenant_id,
+                   who.id,
+                   Map.merge(dispatch, after_cast)
+                 )
       end
 
       # A different epoch on the SAME story: once the story has moved to it, that too is a
@@ -230,6 +244,184 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
       assert record_b.id != record.id
       assert DispatchLedger.get_record(tenant_b.id, record.dispatch_id).id == record_b.id
       assert DispatchLedger.get_record(runner.tenant_id, record.dispatch_id).id == record.id
+    end
+  end
+
+  describe "kind_unsupported?/3" do
+    test "is true only for the kind the runner actually refused", %{runner: runner} do
+      # Scoped BY KIND, and that cannot be shown through `Runners.dispatch/3` while
+      # `implement` is the only dispatchable kind — so it is shown here, against the read
+      # itself. Without the kind predicate a machine that declined triage would never be sent
+      # an implement dispatch again.
+      record = sent(runner)
+
+      {:ok, _} =
+        reply(runner, record, %{"decision" => "refused", "reason" => "kind_not_supported"})
+
+      assert DispatchLedger.kind_unsupported?(runner.tenant_id, runner.id, "implement")
+      refute DispatchLedger.kind_unsupported?(runner.tenant_id, runner.id, "triage")
+    end
+
+    test "an accepted or otherwise-refused dispatch says nothing about the kind",
+         %{runner: runner} do
+      accepted = sent(runner)
+      {:ok, _} = reply(runner, accepted)
+
+      other = sent(runner)
+      {:ok, _} = reply(runner, other, %{"decision" => "refused", "reason" => "draining"})
+
+      refute DispatchLedger.kind_unsupported?(runner.tenant_id, runner.id, "implement")
+    end
+
+    test "the database is what makes a reason without a refusal impossible", %{runner: runner} do
+      # `kind_unsupported?/3` also filters on `status == "refused"`, and no test can turn that
+      # predicate red — because the state it excludes cannot exist. This is why: the
+      # `runner_dispatches_reason_iff_refused` CHECK refuses the row outright, so the
+      # predicate is defence in depth over an L2 invariant rather than the enforcement. If
+      # this assertion ever goes red, that predicate has become load-bearing and needs a test
+      # of its own.
+      record = sent(runner)
+
+      assert_raise Postgrex.Error, ~r/runner_dispatches_reason_iff_refused/, fn ->
+        as_tenant(runner.tenant_id, fn ->
+          from(r in DispatchRecord, where: r.id == ^record.id)
+          |> Repo.update_all(set: [reason: "kind_not_supported"])
+        end)
+      end
+    end
+
+    test "one runner's refusal does not speak for another", %{runner: runner} do
+      {_raw, other} = fixture(:committed_runner, %{name: "blockit", tenant_id: runner.tenant_id})
+
+      record = sent(runner)
+
+      {:ok, _} =
+        reply(runner, record, %{"decision" => "refused", "reason" => "kind_not_supported"})
+
+      assert DispatchLedger.kind_unsupported?(runner.tenant_id, runner.id, "implement")
+      refute DispatchLedger.kind_unsupported?(other.tenant_id, other.id, "implement")
+    end
+  end
+
+  describe "unsupported_kinds/1" do
+    test "groups the tenant's barred kinds by runner, and omits runners with none",
+         %{runner: runner} do
+      {_raw, clean} = fixture(:committed_runner, %{name: "blockit", tenant_id: runner.tenant_id})
+
+      barred = sent(runner)
+
+      {:ok, _} =
+        reply(runner, barred, %{"decision" => "refused", "reason" => "kind_not_supported"})
+
+      # A second refusal of the SAME kind must not produce a duplicate entry.
+      again = sent(runner)
+
+      {:ok, _} =
+        reply(runner, again, %{"decision" => "refused", "reason" => "kind_not_supported"})
+
+      ordinary = sent(clean)
+      {:ok, _} = reply(clean, ordinary, %{"decision" => "refused", "reason" => "draining"})
+
+      kinds = DispatchLedger.unsupported_kinds(runner.tenant_id)
+
+      assert kinds == %{runner.id => ["implement"]}
+      refute Map.has_key?(kinds, clean.id)
+    end
+
+    test "is tenant-scoped", %{runner: runner} do
+      other_tenant = fixture(:committed_tenant, %{})
+
+      record = sent(runner)
+
+      {:ok, _} =
+        reply(runner, record, %{"decision" => "refused", "reason" => "kind_not_supported"})
+
+      assert DispatchLedger.unsupported_kinds(other_tenant.id) == %{}
+    end
+
+    test "the partial index the two reads depend on exists, is valid, and is partial" do
+      # `kind_unsupported?/3` runs on the dispatch hot path and `unsupported_kinds/1` on every
+      # pool poll, and `runner_dispatches` has no age-based retention — so without this index
+      # the common NO-MATCH case examines every dispatch the runner ever held.
+      #
+      # What this asserts is existence, VALIDITY and shape. A concurrent build that was
+      # interrupted leaves an INVALID index occupying the name: the reads silently go back to
+      # the scan and nothing looks wrong, which is the failure worth a test. What it does NOT
+      # assert is the query PLAN — at test-DB scale the planner picks a sequential scan
+      # whatever indexes exist, so an EXPLAIN here would prove nothing about production.
+      sql = """
+      SELECT pg_get_indexdef(c.oid), x.indisvalid
+        FROM pg_class c
+        JOIN pg_index x ON x.indexrelid = c.oid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE c.relname = $1 AND c.relkind = 'i' AND n.nspname = 'public'
+      """
+
+      assert [[definition, true]] =
+               Repo.query!(sql, ["runner_dispatches_unsupported_kind_idx"]).rows
+
+      assert definition =~ "USING btree (tenant_id, runner_id, kind)"
+
+      # PARTIAL on both values, which is what keeps it a handful of rows rather than a second
+      # copy of the table.
+      assert definition =~ "WHERE"
+      assert definition =~ "refused"
+      assert definition =~ "kind_not_supported"
+    end
+
+    test "nothing under lib/ deletes a dispatch row, because those rows ARE the memory" do
+      # The capability memory is DERIVED from `runner_dispatches`, so its lifetime is that
+      # table's retention — and the coupling is invisible from a pruner's own file. The day
+      # something prunes this table by age, a runner that told loopctl it cannot do a kind
+      # becomes eligible again: silently, on a schedule, with no reply from the runner and
+      # nothing in any log to say why the dispatches resumed. This is where a pruner's author
+      # finds out. Excluding those rows in the predicate is the fix; relaxing this is not.
+      # Matched by PROXIMITY, not by one call shape. The first version of this guard matched
+      # only `delete_all(from(x in DispatchRecord` and `Repo.delete(%DispatchRecord` — and the
+      # PIPE form, which is how most of the deletes in `lib/` are actually written, walked
+      # straight past it, as did `Multi.delete_all` and raw SQL naming the table. A guard that
+      # misses the way the code is written is not a guard.
+      #
+      # The unit is a CHUNK: contiguous non-blank lines, which is one expression or function
+      # body in this codebase's layout. A chunk carrying both a delete verb and a reference to
+      # these rows is flagged whichever order they appear in, so the pipe form (target first)
+      # and the argument form (verb first) are both caught.
+      # Raw SQL is in the pattern too: a pruner written as `Repo.query!("DELETE FROM
+      # runner_dispatches ...")` carries no Ecto verb at all and slipped past a shape-based
+      # scan entirely.
+      verb =
+        ~r/\b(?:delete_all|delete!?)\s*[(|]|\|>\s*[A-Za-z.]*[Rr]epo\.delete|\bDELETE\s+FROM\b|\bTRUNCATE\b/i
+
+      target = ~r/DispatchRecord|runner_dispatches/
+
+      files = Path.wildcard("lib/**/*.ex")
+      assert length(files) > 100, "the source scan found no files, so it proves nothing"
+
+      mentions = Enum.filter(files, &(File.read!(&1) =~ target))
+
+      assert "lib/loopctl/runners/dispatch_ledger.ex" in mentions,
+             "the scan no longer sees the module that owns these rows"
+
+      # The verb pattern must actually match the delete shapes this repo uses, or the scan is
+      # looking for something that is never written and can never fire.
+      assert Enum.any?(Path.wildcard("lib/**/*.ex"), fn file ->
+               File.read!(file) =~ ~r/\|>\s*[A-Za-z.]*[Rr]epo\.delete_all\(/
+             end),
+             "no pipe-form delete found in lib/, so the pipe half of the verb pattern is untested"
+
+      deletes =
+        for file <- mentions,
+            source = File.read!(file),
+            chunk <- String.split(source, ~r/\n\s*\n/),
+            Regex.match?(verb, chunk) and Regex.match?(target, chunk),
+            uniq: true,
+            do: file
+
+      assert deletes == [],
+             "these delete dispatch rows: #{inspect(deletes)}. A row with status " <>
+               "'refused' and reason 'kind_not_supported' is the ONLY storage of the " <>
+               "capability memory kind_unsupported?/3 reads — see the Retention section of " <>
+               "Loopctl.Runners.DispatchLedger. Exclude those rows, or do not prune here."
     end
   end
 

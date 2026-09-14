@@ -235,6 +235,17 @@ defmodule Loopctl.Delivery.Stages do
     end)
   end
 
+  @doc """
+  The encoded size of the `:event_data` a transition may carry, in bytes.
+
+  Public so a CALLER that composes `event_data` can fit it rather than discover the bound as
+  an `:invalid_event_data` refusal — which, on a transition the caller cannot skip, turns
+  "record this" into "the story went nowhere" (`Loopctl.Delivery.StoryPayload` is the case
+  that forced it). This is the ONE declaration; nothing restates the number.
+  """
+  @spec max_event_data_bytes() :: pos_integer()
+  def max_event_data_bytes, do: @max_event_data_bytes
+
   @doc "A tenant's stage row for `story_id`, or nil."
   @spec get(Ecto.UUID.t(), Ecto.UUID.t()) :: StoryStage.t() | nil
   def get(tenant_id, story_id) do

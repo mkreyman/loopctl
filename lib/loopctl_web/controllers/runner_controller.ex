@@ -58,6 +58,27 @@ defmodule LoopctlWeb.RunnerController do
     }
   }
 
+  # A runner's dispatch kinds, refused permanently by the runner itself. Declared once and
+  # used by both read shapes — the registry and the pool — because it answers the same
+  # question in both: why does this machine never get work?
+  @unsupported_kinds_schema %Schema{
+    type: :array,
+    items: %Schema{type: :string},
+    description:
+      "Dispatch kinds this runner answered `kind_not_supported` for. A CAPABILITY " <>
+        "statement, treated as permanent: loopctl sends none of these to this machine " <>
+        "again. `implement` is currently the only dispatchable kind, so a runner listing " <>
+        "it gets NO work at all while it stays enrolled — it is not idle, it is barred. " <>
+        "Cleared by revoking and re-enrolling the machine, which mints a new runner row."
+  }
+
+  @listed_runner_schema %Schema{
+    @runner_schema
+    | required: @runner_schema.required ++ [:unsupported_kinds],
+      properties:
+        Map.put(@runner_schema.properties, :unsupported_kinds, @unsupported_kinds_schema)
+  }
+
   operation(:create,
     summary: "Enroll a runner",
     description:
@@ -113,7 +134,9 @@ defmodule LoopctlWeb.RunnerController do
     summary: "List runners",
     description:
       "Lists the tenant's enrolled runners. Enrollment only: whether a runner is CONNECTED " <>
-        "is Presence, not a row. Pass `include_revoked=true` for revoked ones too.",
+        "is Presence, not a row. Pass `include_revoked=true` for revoked ones too. " <>
+        "`unsupported_kinds` names the dispatch kinds each machine has refused permanently; " <>
+        "a runner listing every dispatchable kind receives no work at all.",
     parameters: [
       include_revoked: [in: :query, type: :boolean, description: "Include revoked runners"]
     ],
@@ -122,7 +145,7 @@ defmodule LoopctlWeb.RunnerController do
         {"Runners", "application/json",
          %Schema{
            type: :object,
-           properties: %{runners: %Schema{type: :array, items: @runner_schema}}
+           properties: %{runners: %Schema{type: :array, items: @listed_runner_schema}}
          }},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
@@ -181,7 +204,8 @@ defmodule LoopctlWeb.RunnerController do
                    :sample,
                    :live_sockets,
                    :node,
-                   :machine_id
+                   :machine_id,
+                   :unsupported_kinds
                  ],
                  properties: %{
                    machine: %Schema{type: :string, description: "The enrolled machine name."},
@@ -234,7 +258,8 @@ defmodule LoopctlWeb.RunnerController do
                      nullable: true,
                      description:
                        "The Fly Machine (`FLY_MACHINE_ID`) holding this socket, or null off Fly."
-                   }
+                   },
+                   unsupported_kinds: @unsupported_kinds_schema
                  }
                }
              }
@@ -266,8 +291,23 @@ defmodule LoopctlWeb.RunnerController do
   def index(conn, params) do
     tenant = conn.assigns.current_tenant
     include_revoked = params["include_revoked"] == "true"
+    barred = Runners.unsupported_kinds(tenant.id)
 
-    json(conn, %{runners: Runners.list_runners(tenant.id, include_revoked: include_revoked)})
+    runners =
+      tenant.id
+      |> Runners.list_runners(include_revoked: include_revoked)
+      |> Enum.map(&listed_runner(&1, barred))
+
+    json(conn, %{runners: runners})
+  end
+
+  # The struct's own render plus the one DERIVED field. `Runner.public_fields/0` is the same
+  # list its Jason encoder derives from, so this shape cannot drift from the plain one that
+  # `create` and `delete` return.
+  defp listed_runner(%Runner{} = runner, barred) do
+    runner
+    |> Map.take(Runner.public_fields())
+    |> Map.put(:unsupported_kinds, Map.get(barred, runner.id, []))
   end
 
   @doc "DELETE /api/v1/runners/:id"
@@ -286,17 +326,18 @@ defmodule LoopctlWeb.RunnerController do
 
     # Presence says who is connected; Postgres says what they carry.
     capacity = Runners.capacity(tenant.id)
+    barred = Runners.unsupported_kinds(tenant.id)
 
     runners =
       tenant.id
       |> Runners.pool()
-      |> Enum.map(&pool_entry(&1, capacity))
+      |> Enum.map(&pool_entry(&1, capacity, barred))
       |> Enum.sort_by(& &1.machine)
 
     json(conn, %{runners: runners})
   end
 
-  defp pool_entry({machine, %{metas: metas}}, capacity) do
+  defp pool_entry({machine, %{metas: metas}}, capacity, barred) do
     meta = Enum.max_by(metas, &Map.get(&1, :joined_at), &joined_no_later?/2)
     held = Map.get(capacity, Map.get(meta, :runner_id), %{})
 
@@ -312,7 +353,10 @@ defmodule LoopctlWeb.RunnerController do
       sample: Map.get(meta, :sample),
       live_sockets: length(metas),
       node: Map.get(meta, :node),
-      machine_id: Map.get(meta, :machine_id)
+      machine_id: Map.get(meta, :machine_id),
+      # The pool is where an operator looks at a machine that is connected and doing nothing,
+      # so it is where "barred from every kind" has to be readable.
+      unsupported_kinds: Map.get(barred, Map.get(meta, :runner_id), [])
     }
   end
 

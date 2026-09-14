@@ -729,6 +729,24 @@ defmodule Loopctl.Fixtures do
     )
   end
 
+  # A `story` object satisfying the runner contract's RunnerStory (1.5.0), string-keyed as
+  # `Loopctl.Delivery.ImplementerInput.story_object/2` emits it. Pass "id" to match a
+  # dispatch's "story_id" — `cast_dispatch/1` refuses a story naming a different one.
+  def build(:runner_story, attrs) do
+    Map.merge(
+      %{
+        "id" => Ecto.UUID.generate(),
+        "title" => "Round a visit's billable minutes up to the nearest unit",
+        "description" => "The monthly total must equal the sum of its visits.",
+        "acceptance_criteria" => ["[AC-1] The monthly total equals the sum of its visits."],
+        "test_cases" => ["A visit of 7 minutes bills one unit."],
+        "touches" => ["lib/home_care_billing/billing/visit.ex"],
+        "domain_reference" => "docs/architecture/timesheets-and-work-orders.md"
+      },
+      Enum.into(attrs, %{})
+    )
+  end
+
   # One event of a run's trace satisfying RunnerTraceEvent, string-keyed as the runner ships
   # it. Pass "run_id" and "seq"; the rest defaults.
   def build(:runner_trace_event, attrs) do
@@ -1983,6 +2001,26 @@ defmodule Loopctl.Fixtures do
         })
 
       {raw_key, api_key, agent}
+    end)
+  end
+
+  # A committed `:user`-role key, for a CONTROLLER test of an operator-facing read whose data
+  # is written on the RLS `Loopctl.Repo` — the runner registry's `unsupported_kinds`, which is
+  # derived from `runner_dispatches`. Same two-repo constraint as `:committed_agent_key`
+  # above: only an `async: false` module may use it, and it must sweep at the boundary.
+  def fixture(:committed_operator_key, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+
+    Sandbox.unboxed_run(AdminRepo, fn ->
+      {:ok, {raw_key, _api_key}} =
+        Auth.generate_api_key(%{
+          tenant_id: tenant_id,
+          name: "operator-#{System.unique_integer([:positive])}",
+          role: :user
+        })
+
+      raw_key
     end)
   end
 

@@ -102,6 +102,18 @@ defmodule Loopctl.Runners.DispatchLedger do
   loopctl keeps, and the window is a disk bound, not amnesia. The audit chain is a
   different table and is never touched here.
 
+  **INVARIANT for anyone adding an age-based prune of `runner_dispatches` ITSELF: a row with
+  `status = "refused"` and `reason = "kind_not_supported"` is EVIDENCE, not history, and must
+  never be deleted.** Those rows are the entire storage of the capability memory
+  `kind_unsupported?/3` reads (contract 1.5.0) — there is no column and no second copy — so
+  deleting one makes a machine that told loopctl it cannot do a kind eligible for that kind
+  again: silently, on a schedule, with no reply from the runner and nothing in any log to say
+  why the dispatches resumed. Only the trace TABLE has retention today, and the coupling is
+  invisible from a pruner's own file, which is why this is stated here AND asserted by a
+  source scan in `dispatch_ledger_test.exs` that goes red the moment anything under `lib/`
+  deletes a `DispatchRecord`. Exclude these rows in the pruner's predicate, or leave this
+  table alone.
+
   ## Repo and isolation
 
   Every read and write runs on the RLS-enforced `Loopctl.Repo`, inside
@@ -384,6 +396,99 @@ defmodule Loopctl.Runners.DispatchLedger do
       end)
 
     record
+  end
+
+  @doc """
+  Whether `runner_id` has told this tenant it does not do `kind` — a `dispatch_reply` refused
+  with `kind_not_supported` (contract 1.5.0).
+
+  The memory is DERIVED from the ledger rather than kept in a column, and that is the whole
+  design decision. The ledger already records every reply with its reason, keyed by exactly
+  the pair the statement is about (`runner_id`, `kind`), so the evidence and the conclusion
+  cannot drift apart, no migration is needed, and there is no second place to forget to
+  clear. A capability that CHANGES — the machine is upgraded and now does the kind — is
+  cleared the way a runner's other bindings are: revoke and re-enroll, which mints a new
+  `runners` row that no reply refers to. A column would have to be un-set by hand instead,
+  and a stale one would silently starve a machine that had gained the capability.
+
+  What deriving it COSTS, stated plainly because "no second place to forget to clear"
+  understates it: the memory's lifetime is now this TABLE's retention. Nothing prunes
+  `runner_dispatches` today, and the day something does, these rows must be excluded or the
+  memory resets on a schedule. The invariant is in the moduledoc's Retention section and a
+  source scan asserts it — read it before adding a pruner.
+
+  It is a statement about capability, not health: a refusal releases its slot in the same
+  transaction that records it, and nothing in loopctl reads a refusal as a runner being
+  unwell. This read is what keeps loopctl from asking the same machine the same impossible
+  question again.
+
+  Served by the PARTIAL index `runner_dispatches_unsupported_kind_idx` on
+  `(tenant_id, runner_id, kind) WHERE status = 'refused' AND reason = 'kind_not_supported'`
+  (migration `20260919100000`), so the common NO-MATCH answer costs a lookup rather than a
+  scan of every dispatch the runner ever held — which is what it cost on the general
+  `(tenant_id, runner_id)` index, on the dispatch hot path, in a table with no retention.
+
+  The `status` predicate is defence in depth over an L2 invariant rather than the enforcement:
+  the `runner_dispatches_reason_iff_refused` CHECK already makes a reason without a refusal
+  impossible, which is why no test can turn that clause red — see the note on it in
+  `dispatch_ledger_test.exs`.
+  """
+  @spec kind_unsupported?(Ecto.UUID.t(), Ecto.UUID.t(), String.t()) :: boolean()
+  def kind_unsupported?(tenant_id, runner_id, kind)
+      when is_binary(tenant_id) and is_binary(runner_id) and is_binary(kind) do
+    {:ok, unsupported?} =
+      in_tenant(tenant_id, fn ->
+        Repo.exists?(
+          from r in DispatchRecord,
+            where: r.tenant_id == ^tenant_id and r.runner_id == ^runner_id,
+            # LITERALS, never pinned variables or module attributes with `^`. Ecto inlines a
+            # literal into the SQL, so Postgres sees `status = 'refused'` as a constant and can
+            # PROVE the partial index's predicate covers this query. Pinned, the same values
+            # arrive as bind parameters, the proof fails, and the planner falls back to a
+            # sequential scan — the index becomes dead weight and nothing anywhere goes red.
+            # Verified against the planner: literals use the index, bind parameters do not.
+            where: r.kind == ^kind and r.status == "refused",
+            where: r.reason == "kind_not_supported"
+        )
+      end)
+
+    unsupported?
+  end
+
+  @doc """
+  Every kind each of a tenant's runners has refused with `kind_not_supported`, as
+  `%{runner_id => [kind]}`. Runners that have refused nothing are absent.
+
+  The OPERATOR's view of the same fact `kind_unsupported?/3` decides a dispatch on, and the
+  reason it exists: `implement` is the only dispatchable kind today, so ONE
+  `kind_not_supported` reply removes that machine from all work for the life of its `runners`
+  row. With nothing exposing it, an operator sees a connected, unrevoked, idle runner that
+  silently never gets work — and a runner that maps a transient local condition to that reason
+  bricks itself until a human revokes and re-enrols it. Surfaced on `GET /api/v1/runners` and
+  `GET /api/v1/runners/pool`, it is one line of output away instead of a database session.
+
+  One grouped query for the whole tenant, so a list of runners costs one round trip rather
+  than one each, and served by the same partial index as `kind_unsupported?/3` — including
+  its dependence on the predicate values staying LITERALS; see the comment there.
+  """
+  @spec unsupported_kinds(Ecto.UUID.t()) :: %{Ecto.UUID.t() => [String.t()]}
+  def unsupported_kinds(tenant_id) when is_binary(tenant_id) do
+    {:ok, pairs} =
+      in_tenant(tenant_id, fn ->
+        Repo.all(
+          # Literals for the same reason as `kind_unsupported?/3` — pinning them makes the
+          # partial index unusable and turns this into a scan of the tenant's whole history.
+          from r in DispatchRecord,
+            where: r.tenant_id == ^tenant_id and r.status == "refused",
+            where: r.reason == "kind_not_supported",
+            distinct: true,
+            select: {r.runner_id, r.kind}
+        )
+      end)
+
+    pairs
+    |> Enum.group_by(&elem(&1, 0), &elem(&1, 1))
+    |> Map.new(fn {runner_id, kinds} -> {runner_id, Enum.sort(kinds)} end)
   end
 
   @doc """

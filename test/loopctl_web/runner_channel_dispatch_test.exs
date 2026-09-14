@@ -494,8 +494,13 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
       assert_push "dispatch", _, @reply_timeout
 
+      # A DIFFERENT story under the same dispatch_id. It used to be a different `kind`, which
+      # since contract 1.5.0 is refused by the cast before the ledger sees it — a real
+      # refusal, but not the one this test is about.
+      other = fixture(:ledger_story, %{tenant_id: runner.tenant_id, claim_epoch: 0})
+
       assert {:error, :dispatch_id_conflict} =
-               Runners.dispatch(runner.tenant_id, runner.id, %{payload | "kind" => "triage"})
+               Runners.dispatch(runner.tenant_id, runner.id, %{payload | "story_id" => other.id})
 
       refute_push "dispatch", _
     end
@@ -572,6 +577,94 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       assert {:error, :not_authorized} =
                Runners.dispatch(runner.tenant_id, "not-a-uuid", build(:runner_dispatch))
     end
+
+    test "kind_not_supported is permanent for that runner and that kind",
+         %{runner: runner, channel: channel} do
+      first = dispatch_payload(runner.tenant_id)
+      assert :ok = Runners.dispatch(runner.tenant_id, runner.id, first)
+      assert_push "dispatch", _, @reply_timeout
+
+      held = in_flight_of(runner)
+      assert held >= 1
+
+      ref =
+        push(channel, "dispatch_reply", %{
+          "dispatch_id" => first["dispatch_id"],
+          "claim_epoch" => first["claim_epoch"],
+          "decision" => "refused",
+          "reason" => "kind_not_supported"
+        })
+
+      assert_reply ref, :ok, _, @reply_timeout
+      assert status_of(runner, first) == "refused"
+
+      # A capability statement costs the runner no capacity: the refusal gave the slot back
+      # in the same transaction that recorded it, exactly as every other refusal does.
+      assert in_flight_of(runner) == held - 1
+
+      assert DispatchLedger.kind_unsupported?(runner.tenant_id, runner.id, "implement")
+
+      # And the next one of that kind never reaches the machine, never takes a slot and never
+      # writes a ledger row.
+      second = dispatch_payload(runner.tenant_id)
+
+      assert {:error, :kind_not_supported} =
+               Runners.dispatch(runner.tenant_id, runner.id, second)
+
+      refute_push "dispatch", _
+      assert DispatchLedger.get_record(runner.tenant_id, second["dispatch_id"]) == nil
+      assert in_flight_of(runner) == held - 1
+    end
+
+    test "an ordinary refusal does not make a kind unsupported",
+         %{runner: runner, channel: channel} do
+      payload = dispatch_payload(runner.tenant_id)
+      assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
+      assert_push "dispatch", _, @reply_timeout
+
+      ref =
+        push(channel, "dispatch_reply", %{
+          "dispatch_id" => payload["dispatch_id"],
+          "claim_epoch" => payload["claim_epoch"],
+          "decision" => "refused",
+          "reason" => "at_capacity"
+        })
+
+      assert_reply ref, :ok, _, @reply_timeout
+
+      refute DispatchLedger.kind_unsupported?(runner.tenant_id, runner.id, "implement")
+      assert :ok = dispatch_to(runner)
+      assert_push "dispatch", _, @reply_timeout
+    end
+
+    test "one runner's kind_not_supported binds neither another runner nor another tenant",
+         %{runner: runner, channel: channel} do
+      payload = dispatch_payload(runner.tenant_id)
+      assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
+      assert_push "dispatch", _, @reply_timeout
+
+      ref =
+        push(channel, "dispatch_reply", %{
+          "dispatch_id" => payload["dispatch_id"],
+          "claim_epoch" => payload["claim_epoch"],
+          "decision" => "refused",
+          "reason" => "kind_not_supported"
+        })
+
+      assert_reply ref, :ok, _, @reply_timeout
+
+      {raw_b, runner_b} =
+        fixture(:committed_runner, %{name: "blockit", tenant_id: runner.tenant_id})
+
+      {:ok, socket_b} = connect_runner(raw_b)
+      {_reply, _channel_b} = join_pool(socket_b, "blockit")
+
+      refute DispatchLedger.kind_unsupported?(runner.tenant_id, runner_b.id, "implement")
+      assert :ok = dispatch_to(runner_b)
+
+      tenant_b = fixture(:committed_tenant, %{})
+      refute DispatchLedger.kind_unsupported?(tenant_b.id, runner.id, "implement")
+    end
   end
 
   # The minimum intervals are per channel process; a test that sends several messages in a
@@ -621,6 +714,22 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
   defp status_of(runner, dispatch),
     do: DispatchLedger.get_record(runner.tenant_id, dispatch["dispatch_id"]).status
+
+  # The runner's `in_flight` as Postgres holds it, read on the RLS connection the dispatch
+  # path reserves on — `Runners.capacity/1` reads AdminRepo, which is a different connection
+  # and cannot see this sandbox's uncommitted reservation.
+  defp in_flight_of(runner) do
+    {:ok, in_flight} =
+      Loopctl.Repo.with_tenant(runner.tenant_id, fn ->
+        Loopctl.Repo.one!(
+          from r in Loopctl.Runners.Runner,
+            where: r.id == ^runner.id and r.tenant_id == ^runner.tenant_id,
+            select: r.in_flight
+        )
+      end)
+
+    in_flight
+  end
 
   # A row every connection can see, and a transaction of its own to lock it from — the only
   # way to make the channel's own writes WAIT on something inside a test.

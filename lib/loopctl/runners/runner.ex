@@ -42,8 +42,20 @@ defmodule Loopctl.Runners.Runner do
   @max_sessions_range 1..64
   @default_max_sessions 2
 
-  @derive {Jason.Encoder,
-           only: [:id, :name, :max_sessions, :in_flight, :revoked_at, :inserted_at, :updated_at]}
+  # The ONE declaration of what a runner renders as. `public_fields/0` reads it back so a
+  # caller that needs to ADD a derived field (the API's `unsupported_kinds`) builds the same
+  # map rather than restating this list — which would then quietly drift from it.
+  @public_fields [
+    :id,
+    :name,
+    :max_sessions,
+    :in_flight,
+    :revoked_at,
+    :inserted_at,
+    :updated_at
+  ]
+
+  @derive {Jason.Encoder, only: @public_fields}
 
   schema "runners" do
     tenant_field()
@@ -55,6 +67,10 @@ defmodule Loopctl.Runners.Runner do
 
     timestamps()
   end
+
+  @doc "The fields a runner renders as — the same list the Jason encoder derives from."
+  @spec public_fields() :: [atom()]
+  def public_fields, do: @public_fields
 
   @doc "The machine-name format a runner is enrolled under."
   @spec name_format() :: Regex.t()
