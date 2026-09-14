@@ -26,6 +26,14 @@ defmodule Loopctl.Delivery.StageMachine do
   - `:verification_failed` — post-deploy verification failing: deployed -> escalated
   - `:triage_escalate` — triaged -> escalated, the triage trio's `escalate` verdict
     (design §4), including the disagreement that escalates by construction
+  - `:triage_reject` — triaged -> failed, the triage trio's `reject` verdict (design §4):
+    the report is genuinely non-actionable — a duplicate, or already covered by shipped
+    behaviour. Its own edge and not `:budget_exceeded`, which shares the `{triaged, failed}`
+    pair, because the two say opposite things to the person who reported the issue and
+    `resolution_verdict/1` reads the EDGE to tell them apart: a reject closes her issue
+    saying no change was needed, while a budget exhaustion closes nothing at all. A verdict
+    somebody else reaches about the report, so it is not runner-reportable — `triaged` is
+    not a runner source stage
   - `:merge_gate` — ci -> escalated, the merge-precondition gate refusing (design §5:
     a clean result merges with no human, anything else routes to Gate A)
   - `:session_escalated` — any in-flight stage, `merged` or `deployed` -> escalated: the
@@ -120,6 +128,7 @@ defmodule Loopctl.Delivery.StageMachine do
                    {:ci, :implementing, :base_moved},
                    {:deployed, :escalated, :verification_failed},
                    {:triaged, :escalated, :triage_escalate},
+                   {:triaged, :failed, :triage_reject},
                    {:ci, :escalated, :merge_gate},
                    {:merged, :implementing, :merge_refused}
                  ] ++ @budget_exceeded ++ @released ++ @human_resolution ++ @session_escalated
@@ -330,6 +339,7 @@ defmodule Loopctl.Delivery.StageMachine do
           | :base_moved
           | :verification_failed
           | :triage_escalate
+          | :triage_reject
           | :merge_gate
           | :merge_refused
           | :budget_exceeded
@@ -391,6 +401,45 @@ defmodule Loopctl.Delivery.StageMachine do
   """
   @spec max_reason_length() :: pos_integer()
   def max_reason_length, do: @max_reason_length
+
+  # WHICH TRANSITIONS ARE A VERDICT THE REPORTER IS TOLD ABOUT (#805 item 1).
+  #
+  # Keyed on the whole TRANSITION, never on the destination stage, and that is the point of
+  # it. Two of the three terminal stages are reachable by more than one route with different
+  # meanings, so a stage cannot say what the reporter should be told:
+  #
+  # - `failed` is reached by `:triage_reject` (no change was needed — tell her) and by
+  #   `:budget_exceeded` from every live stage (the loop ran out — tell her nothing, a human
+  #   is looking).
+  # - `done` is reached by `verified -> done` (the ordinary end of a shipped story, already
+  #   accounted for one edge earlier) and by `escalated -> done` over `:human_resolution`,
+  #   where a human has decided the outcome and loopctl has no verdict of its own to report.
+  #
+  # `{deployed, verified, :forward}` is the ONLY shipped verdict, and it is deploy-gated
+  # rather than merge-gated on purpose: `Loopctl.Delivery.PostDeployVerification` writes that
+  # edge, the merge is not the ship, and nothing at `merged` may tell a reporter a fix
+  # shipped. Every `-> escalated` edge is deliberately absent: an escalated story is waiting
+  # on a human, so there is no verdict yet and any close would claim the work is finished.
+  @resolution_verdicts %{
+    {:deployed, :verified, :forward} => :shipped,
+    {:triaged, :failed, :triage_reject} => :not_actionable
+  }
+
+  @doc """
+  The `Loopctl.Delivery.Resolution` verdict a transition implies, or `nil` for the transitions
+  that tell the reporter nothing — which is almost all of them.
+
+  Pure, and the single declaration of which edges reach the reporter. See the note above
+  `@resolution_verdicts` for why this reads the whole transition rather than the destination
+  stage.
+  """
+  @spec resolution_verdict(transition()) :: :shipped | :not_actionable | nil
+  def resolution_verdict({_from, _to, _edge} = transition),
+    do: Map.get(@resolution_verdicts, transition)
+
+  @doc "Every transition that produces a resolution, with the verdict it produces."
+  @spec resolution_transitions() :: %{transition() => :shipped | :not_actionable}
+  def resolution_transitions, do: @resolution_verdicts
 
   @doc "True when `{from, to, edge}` is in the table."
   @spec allowed?(stage(), stage(), edge()) :: boolean()

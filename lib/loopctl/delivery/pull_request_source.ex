@@ -78,6 +78,18 @@ defmodule Loopctl.Delivery.PullRequestSource do
   **`contains?/3` is why verification is not sha equality.** Merges queue: a story's merge
   can be an ancestor of what is deployed rather than equal to it, and that IS shipped.
   The forge answers whether `sha` is reachable from `ref`.
+
+  ## `issue/2`, `label_issue/3`, `comment_issue/3` and `close_issue/3` — the reporter's side (#805)
+
+  The four calls `Loopctl.Delivery.IssueCloser` makes to tell the person who filed a GitHub
+  issue what happened to it. They live on THIS behaviour for the same reason the deployment
+  pair does: one config-resolved forge client for the whole delivery loop, with one set of
+  bounded timeouts and one rate-limit classification, rather than a second client with its
+  own opinion about what a 403 means.
+
+  They are the only WRITE callbacks here. Everything above reads. That asymmetry is why the
+  closer, and not this behaviour, carries the at-most-once machinery: a read may be repeated
+  freely and a close may not.
   """
 
   alias Loopctl.DeliveryGates.DiffNames
@@ -161,4 +173,53 @@ defmodule Loopctl.Delivery.PullRequestSource do
   establish is `{:error, reason}`, and the verifier never reads that as containment.
   """
   @callback contains?(repo(), String.t(), String.t()) :: {:ok, boolean()} | {:error, term()}
+
+  @typedoc """
+  The state of one issue, as much of it as the closer needs.
+
+  `state` is GitHub's own word, `"open"` or `"closed"`. `labels` is every label name on the
+  issue — the closer matches it against `Loopctl.Delivery.Resolution.labels/0` to tell a
+  close IT made from one somebody else made.
+  """
+  @type issue :: %{state: String.t(), labels: [String.t()]}
+
+  @doc """
+  The state and labels of one issue.
+
+  Read BEFORE any of the three write callbacks below, and it is what makes a replay safe: an
+  issue already closed carrying one of loopctl's resolution labels is a close loopctl already
+  performed, and re-performing it would fire the reporting system's webhook a second time and
+  email the reporter twice.
+  """
+  @callback issue(repo(), pos_integer()) :: {:ok, issue()} | {:error, term()}
+
+  @doc """
+  ADDS one label to an issue, leaving every other label alone.
+
+  Additive rather than a whole-set replace, which is what the issue-update endpoint would do:
+  a replace built from a list read a moment earlier drops any label added in between, and the
+  labels on a reporter's ticket are not ours to prune. Adding a label the issue already
+  carries is a no-op at the forge, so this callback is safe to repeat.
+  """
+  @callback label_issue(repo(), pos_integer(), String.t()) :: :ok | {:error, term()}
+
+  @doc """
+  Posts one comment on an issue.
+
+  The ONLY callback here that is not naturally idempotent — a second call is a second comment
+  — so the caller guards it with its own recorded marker rather than relying on the forge.
+  """
+  @callback comment_issue(repo(), pos_integer(), String.t()) :: :ok | {:error, term()}
+
+  @doc """
+  CLOSES an issue, with GitHub's `state_reason`.
+
+  The outward, effectively irreversible act the whole idempotence apparatus exists for: the
+  reporting system's webhook fires on the close and emails the reporter. It is called last,
+  AFTER the resolution label is on the issue, because the reporting system selects the
+  resolution text by that label and a close that arrives first is a close it reads with the
+  wrong text.
+  """
+  @callback close_issue(repo(), pos_integer(), :completed | :not_planned) ::
+              :ok | {:error, term()}
 end

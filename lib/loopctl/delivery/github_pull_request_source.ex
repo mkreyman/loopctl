@@ -24,6 +24,20 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   6. `GET /repos/:repo/compare/:sha...:ref` — whether a commit is reachable from another,
      which is what makes a story merged BEHIND the deployed head still count as shipped
 
+  Telling the reporter what happened (#805) adds four more, and they are the only WRITES
+  this module makes:
+
+  7. `GET /repos/:repo/issues/:number` — state and labels, read BEFORE anything is written.
+     An issue already closed carrying one of `Loopctl.Delivery.Resolution`'s labels is a
+     close loopctl already made, and this read is what stops it being made twice
+  8. `POST /repos/:repo/issues/:number/labels` — ADDS the resolution label. Additive rather
+     than the issue endpoint's whole-set replace, which would drop a label somebody added
+     between the read and the write
+  9. `POST /repos/:repo/issues/:number/comments` — the resolution text
+  10. `PATCH /repos/:repo/issues/:number` — `state: closed` with GitHub's `state_reason`.
+      LAST, because the reporting system's webhook fires on the close and selects its
+      resolution text by the label from call 8
+
   ## Slow connections, and the ceiling a caller sees
 
   Every request carries a 2s connect timeout and a 5s receive timeout, and `retry: false`
@@ -109,6 +123,12 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
   # single merge against from here, and a human should look.
   @max_deployments_since 5
 
+  # The largest resolution comment this will post. `Loopctl.Delivery.Resolution`'s longest
+  # string is under 300 bytes, so this is a guard against a future caller rather than a bound
+  # anyone meets — GitHub's own issue-body limit is 65,536 and a body it rejects for size
+  # would fail a close that has no other reason to fail.
+  @max_comment_bytes 8_192
+
   # Statuses read per deployment. More than one because `state` (the latest) and
   # `succeeded?` (did `success` EVER appear) are different questions, and it is the second
   # that says whether the commit shipped — GitHub writes `inactive` over a perfectly good
@@ -160,6 +180,96 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
       containment(body)
     end
   end
+
+  @impl true
+  def issue(repo, number) when is_integer(number) and number > 0 do
+    with {:ok, repo} <- repo_name(repo),
+         {:ok, body} <- get(repo, "/issues/#{number}") do
+      issue_facts(body)
+    end
+  end
+
+  def issue(_repo, number), do: {:error, {:invalid_issue_number, number}}
+
+  @impl true
+  def label_issue(repo, number, label) when is_integer(number) and number > 0 do
+    with {:ok, repo} <- repo_name(repo),
+         {:ok, label} <- label(label),
+         {:ok, _body} <- post(repo, "/issues/#{number}/labels", %{labels: [label]}) do
+      :ok
+    end
+  end
+
+  def label_issue(_repo, number, _label), do: {:error, {:invalid_issue_number, number}}
+
+  @impl true
+  def comment_issue(repo, number, body) when is_integer(number) and number > 0 do
+    with {:ok, repo} <- repo_name(repo),
+         {:ok, body} <- comment_body(body),
+         {:ok, _response} <- post(repo, "/issues/#{number}/comments", %{body: body}) do
+      :ok
+    end
+  end
+
+  def comment_issue(_repo, number, _body), do: {:error, {:invalid_issue_number, number}}
+
+  @impl true
+  def close_issue(repo, number, state_reason)
+      when is_integer(number) and number > 0 and state_reason in [:completed, :not_planned] do
+    with {:ok, repo} <- repo_name(repo),
+         {:ok, _body} <-
+           patch(repo, "/issues/#{number}", %{
+             state: "closed",
+             state_reason: Atom.to_string(state_reason)
+           }) do
+      :ok
+    end
+  end
+
+  def close_issue(_repo, number, state_reason) when is_integer(number) and number > 0,
+    do: {:error, {:invalid_state_reason, state_reason}}
+
+  def close_issue(_repo, number, _state_reason), do: {:error, {:invalid_issue_number, number}}
+
+  # ONLY the two fields the closer judges on. The rest of an issue payload is reporter-
+  # controlled text (`Loopctl.Intake.Record`'s untrusted boundary) and nothing here needs it,
+  # so nothing here reads it.
+  #
+  # A non-string label is dropped rather than refused: it cannot match one of loopctl's, and
+  # refusing the whole read on it would strand a close on somebody else's malformed label.
+  defp issue_facts(%{"state" => state, "labels" => labels})
+       when is_binary(state) and is_list(labels) do
+    {:ok, %{state: state, labels: for(name <- Enum.map(labels, &label_name/1), name, do: name)}}
+  end
+
+  defp issue_facts(body), do: {:error, {:unreadable_issue, shape(body)}}
+
+  defp label_name(%{"name" => name}) when is_binary(name), do: name
+  defp label_name(name) when is_binary(name), do: name
+  defp label_name(_other), do: nil
+
+  # A label goes in a JSON BODY, never a URL path, so nothing here can address another
+  # resource. What is still refused is what a body cannot make safe: an empty name, a control
+  # character, or anything that is not a string.
+  defp label(name) when is_binary(name) do
+    if String.valid?(name) and name != "" and not Regex.match?(@control, name),
+      do: {:ok, name},
+      else: {:error, {:invalid_label, printable(name)}}
+  end
+
+  defp label(name), do: {:error, {:invalid_label, shape(name)}}
+
+  # The resolution text. Capped because it becomes a comment on somebody else's ticket and a
+  # body GitHub rejects for size would fail the whole close; `Loopctl.Delivery.Resolution`'s
+  # strings are two orders of magnitude under this, so the cap is a guard rather than a
+  # constraint anyone will meet.
+  defp comment_body(body) when is_binary(body) do
+    if String.valid?(body) and body != "" and byte_size(body) <= @max_comment_bytes,
+      do: {:ok, body},
+      else: {:error, {:invalid_comment_body, byte_size(body)}}
+  end
+
+  defp comment_body(body), do: {:error, {:invalid_comment_body, shape(body)}}
 
   # GitHub lists deployments newest first. The `since` filter is applied BEFORE any status
   # call, so the common early sweep — the deploy job has not created its record yet — costs
@@ -460,6 +570,30 @@ defmodule Loopctl.Delivery.GitHubPullRequestSource do
 
     case Req.get(url, req_options()) do
       {:ok, %Req.Response{status: 200, body: body}} -> {:ok, body}
+      {:ok, %Req.Response{} = response} -> {:error, failure(response)}
+      {:error, reason} -> {:error, {:github_unreachable, shape(reason)}}
+    end
+  end
+
+  # The two WRITE verbs (#805). Same options as `get/2` — the same bounded timeouts, the same
+  # `retry: false`, the same `redirect: false` — so a write is no less bounded than a read and
+  # a renamed repository cannot silently redirect one onto somebody else's issue.
+  #
+  # `retry: false` matters more here than it does on a read: Req's default retry would repeat
+  # an outward act, and the caller's at-most-once record cannot see a retry the HTTP client
+  # made underneath it.
+  defp post(repo, path, body), do: write(&Req.post/2, repo, path, body)
+  defp patch(repo, path, body), do: write(&Req.patch/2, repo, path, body)
+
+  # GitHub answers 200 or 201 to the three writes here. Every other status goes through the
+  # SAME `failure/1` a read does, so a rate limit stays transient and a 403 the headers do not
+  # call a limit stays a permanent permission problem — one classification for the whole
+  # client, which is why these live on this module rather than a second one.
+  defp write(verb, repo, path, body) do
+    url = @api_base <> "/repos/" <> repo <> path
+
+    case verb.(url, Keyword.put(req_options(), :json, body)) do
+      {:ok, %Req.Response{status: status, body: body}} when status in [200, 201] -> {:ok, body}
       {:ok, %Req.Response{} = response} -> {:error, failure(response)}
       {:error, reason} -> {:error, {:github_unreachable, shape(reason)}}
     end

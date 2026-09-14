@@ -53,6 +53,7 @@ defmodule Loopctl.WorkBreakdown.Story do
              :verifier_dispatch_id,
              :verifier_needed,
              :lifecycle_entered_at,
+             :intake_record_id,
              :claimed_until,
              :claim_epoch,
              :review_requested_at,
@@ -99,6 +100,24 @@ defmodule Loopctl.WorkBreakdown.Story do
     # `Progress` writes it, via `Ecto.Changeset.change/2` on the struct. Never add
     # it to a `cast` list.
     field :lifecycle_entered_at, :utc_datetime_usec
+
+    # #803 §4 / #805: the intake record this story was created FROM, or nil.
+    #
+    # PROVENANCE, exactly like `implementer_dispatch_id` above it: set once by
+    # `Loopctl.WorkBreakdown.Stories.create_story/3` from an OPTION, never rewritten, and
+    # deliberately absent from both `cast` lists below for the same reason
+    # `lifecycle_entered_at` is — `metadata` is cast and whole-map-replaced by
+    # `PATCH /api/v1/stories/:id`, and a link a caller could move is a link that can be
+    # pointed at somebody else's reported issue before the loop closes it.
+    #
+    # NULLABLE and always will be: most stories are authored rather than reported, and
+    # nothing may require one. A story with no link closes no issue and that is not an
+    # error.
+    #
+    # The `stories_intake_record_fkey` composite FK on `(tenant_id, intake_record_id)` is
+    # what makes a cross-tenant link impossible; the application check in `create_story/3`
+    # is the friendly error in front of it, not the enforcement.
+    field :intake_record_id, Ecto.UUID
 
     # #803: the claim's lease and its fence. `claimed_until` is when the claim may be
     # released by `Loopctl.Workers.ReclaimExpiredClaimsWorker` (NULL = no lease, which
