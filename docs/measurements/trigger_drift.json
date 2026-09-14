@@ -1,0 +1,102 @@
+{
+  "meta": {
+    "head": "03ad989c711a433812727fdb4bee8d512857fe5d",
+    "ref": "HEAD",
+    "repo": "mkreyman/home_care_billing",
+    "checkout": "/home/mkreyman/workspace/home_care_billing",
+    "tree_files": 3982,
+    "trigger_fingerprint": "5d6b6b65b602",
+    "generated_at": "2026-09-14T03:18:58.260680Z",
+    "harness": "mix loopctl.gates.check_drift"
+  },
+  "check": "gate_b_trigger_drift",
+  "question": "Does every configured Gate B pattern still match a file in the target repository?",
+  "totals": {
+    "patterns": 16,
+    "effect_patterns": 13,
+    "human_patterns": 3,
+    "unmatched": 0
+  },
+  "patterns": [
+    {
+      "index": 0,
+      "matched": true,
+      "kind": "effect"
+    },
+    {
+      "index": 1,
+      "matched": true,
+      "kind": "effect"
+    },
+    {
+      "index": 2,
+      "matched": true,
+      "kind": "effect"
+    },
+    {
+      "index": 3,
+      "matched": true,
+      "kind": "effect"
+    },
+    {
+      "index": 4,
+      "matched": true,
+      "kind": "effect"
+    },
+    {
+      "index": 5,
+      "matched": true,
+      "kind": "effect"
+    },
+    {
+      "index": 6,
+      "matched": true,
+      "kind": "effect"
+    },
+    {
+      "index": 7,
+      "matched": true,
+      "kind": "effect"
+    },
+    {
+      "index": 8,
+      "matched": true,
+      "kind": "effect"
+    },
+    {
+      "index": 9,
+      "matched": true,
+      "kind": "effect"
+    },
+    {
+      "index": 10,
+      "matched": true,
+      "kind": "effect"
+    },
+    {
+      "index": 11,
+      "matched": true,
+      "kind": "effect"
+    },
+    {
+      "index": 12,
+      "matched": true,
+      "kind": "effect"
+    },
+    {
+      "index": 0,
+      "matched": true,
+      "kind": "human"
+    },
+    {
+      "index": 1,
+      "matched": true,
+      "kind": "human"
+    },
+    {
+      "index": 2,
+      "matched": true,
+      "kind": "human"
+    }
+  ]
+}

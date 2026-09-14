@@ -56,12 +56,17 @@ defmodule Loopctl.DeliveryGates.GateB do
   input. Every configured pattern must match at least one of `repo_files`. A pattern that
   matches nothing means the configuration has drifted from the repository — a rename
   silently unguarded a trigger — and that escalates, naming the pattern.
+
+  `Loopctl.DeliveryGates.TriggerDrift` owns that check, so the same code answers here, per
+  evaluation, and in `mix loopctl.gates.check_drift`, ahead of time. Drift is a configuration
+  alarm; reaching it only through a production escalation is how a rename stays unnoticed.
   """
 
   alias Loopctl.DeliveryGates.GateB.ProofResult
   alias Loopctl.DeliveryGates.GateB.Result
   alias Loopctl.DeliveryGates.Glob
   alias Loopctl.DeliveryGates.RepoTriggers
+  alias Loopctl.DeliveryGates.TriggerDrift
   alias Loopctl.DeliveryGates.Triggers
 
   @phases [:triage, :merge]
@@ -215,17 +220,15 @@ defmodule Loopctl.DeliveryGates.GateB do
 
   defp usable(_repo_triggers), do: {:escalate, {:config_error, :empty_trigger_set}}
 
-  defp stale_trigger_reasons(repo_triggers, [_ | _] = repo_files) do
-    if Enum.all?(repo_files, &is_binary/1) do
-      for glob <- repo_triggers.effect_paths ++ repo_triggers.human_paths,
-          not Enum.any?(repo_files, &Glob.match?(glob, &1)),
-          do: {:stale_trigger, glob.source}
-    else
-      [:invalid_repo_files]
+  # `TriggerDrift` owns the matching, so the check CI runs ahead of time and the check the gate
+  # runs per evaluation are one implementation. A second copy here could clear a configuration
+  # the gate escalates on, or the reverse.
+  defp stale_trigger_reasons(repo_triggers, repo_files) do
+    case TriggerDrift.unmatched(repo_triggers, repo_files) do
+      {:ok, patterns} -> Enum.map(patterns, &{:stale_trigger, &1})
+      {:error, reason} -> [reason]
     end
   end
-
-  defp stale_trigger_reasons(_repo_triggers, _repo_files), do: [:missing_repo_files]
 
   defp file_reasons([_ | _] = files) do
     for file <- files, not valid_path?(file), do: {:invalid_path, file}

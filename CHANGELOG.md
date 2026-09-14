@@ -6,6 +6,27 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **`DELIVERY_GATES_CONFIG` must be re-imported to close three Gate B pattern holes.** The
+  first measurement of Gate B (#828, PR #830) found that three configured trigger patterns
+  each declare an intent and miss a file that intent plainly covers, so changes those
+  patterns were meant to guard cleared for auto-merge. Closing them is a change to the
+  SECRET, not to this repository: the trigger document is configuration by design (agent
+  delivery loop §13), so the replacement document, its `DELIVERY_GATES_CONFIG_SHA256` and the
+  import ceremony are held outside this public repository and named in the pull request. The
+  document and its checksum must be imported TOGETHER — a document that does not match what
+  was pinned is refused before it is decoded, and Gate B then escalates every delivery-loop
+  change until they agree.
+
+  Until the new document is imported the gate keeps running the previous one, which is
+  correct but under-guards the three paths. No deploy ordering constraint and no migration:
+  the configuration is read at call time, so an import plus a restart takes effect without a
+  deploy.
+
+- **`mix loopctl.gates.check_drift`** asserts that every configured Gate B pattern still
+  matches at least one file in the target repository, and exits non-zero when one stops —
+  the drift check the design specifies. Run it after any trigger-document change, and after
+  any rename in a target repository. See `docs/measurements/trigger-drift.md`.
+
 - **The story-to-intake link, and the closer that tells a reporter what happened (#803 §4/§9,
   #805 item 1).** A story created from a reported GitHub issue now records which intake record
   it came from (`stories.intake_record_id`), and when it reaches a terminal verdict loopctl
