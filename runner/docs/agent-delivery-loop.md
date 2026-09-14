@@ -62,7 +62,7 @@ never as a query parameter. Rotating that key through `/api_keys` is refused; ro
 `DELETE /api/v1/runners/:id` and re-enrolling.
 
 **Contract.** The wire contract is JSON Schema, `priv/runner_contract/v1.json` in mkreyman/loopctl
-(`contract_version` 1.2.0), vendored into this repo rather than re-typed. The join payload must
+(`contract_version` 1.4.0), vendored into this repo rather than re-typed. The join payload must
 declare `machine` exactly equal to the enrolled name. Joins are budgeted at 30 per minute per
 runner, a join refused as `not_authorized` disconnects the socket, status updates are at least
 1s apart, and unknown fields are dropped at every depth.

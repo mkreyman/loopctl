@@ -12,21 +12,77 @@ defmodule LoopctlRunner.Control do
   — rejoins included — carries a freshly built payload: a rejoin that replayed the first
   join's payload would tell loopctl stale `draining`, `in_flight` and sample values.
 
-  ## Draining until dispatches are accepted
+  ## Dispatches
 
-  This runner has no dispatch accept path yet (design build order step 6). While
-  `:accepts_dispatches` is false — the default, and the only production setting until then — it
+  `control.accepts_dispatches` (false by default; the `:accepts_dispatches` option overrides it
+  in tests) decides whether this runner takes dispatches at all. While it is false the runner
   reports `draining: true` whatever `set_draining/2` was told, so the control plane never
   reserves capacity here for a session that would not start.
 
-  A `dispatch` that does arrive is validated and refused back to loopctl with a
-  `dispatch_reply` (contract 1.1): `dispatches_disabled` for a valid one, `other` with the
-  validation errors for a malformed one that still carries its `dispatch_id` and `claim_epoch`.
+  Every `dispatch` is answered with a `dispatch_reply` (contract 1.1). A malformed one that still
+  carries its `dispatch_id` and `claim_epoch` is refused `other` with the validation errors. A
+  valid one is checked in this order:
+
+    1. a `dispatch_id` this runner already started is never run again: the same `claim_epoch`
+       is answered `accepted` again (loopctl answers an identical repeat `ok`), another is
+       refused `other`;
+    2. `LoopctlRunner.DispatchPolicy` — its reason and detail on a refusal, with `in_flight`
+       counting every run this process accepted from the moment it accepted it;
+    3. `kind` must be `implement`: a triage dispatch is refused `other`, which becomes
+       `kind_not_supported` once contract 1.5.0 is vendored;
+    4. the dispatch must carry a well-formed `story` object (contract 1.5.0, read defensively by
+       `LoopctlRunner.DispatchRun`), or it is refused `other`.
+
+  The decision runs on untrusted input, so anything it raises is refused `other` naming only the
+  exception's kind; the full error is logged locally and Control keeps running.
+
+  An accepted dispatch is answered `accepted` and recorded as a pending start, which already counts
+  in `in_flight` and against a repeat. Its run starts only when loopctl acknowledges that accept
+  `ok` (a resend after a rejoin included), under the run supervisor (a `Task.Supervisor`), never
+  inside this process: `LoopctlRunner.Run.execute/3` with the dispatch bound into `state.json`
+  and a prompt from `LoopctlRunner.DispatchPrompt`. Any final refusal of the accept drops the
+  pending start unrun, since a session started on an accept loopctl refused could not be stopped.
+
+  The runs outlive this process, and what it would otherwise forget is on disk. On init:
+
+    * every dispatch bound in a `state.json` (any status) or pending in `LoopctlRunner.PendingStarts`
+      is treated as started, so a redelivered dispatch is answered `accepted` and starts nothing;
+    * each pending start has its accept resent, and its run starts on `ok`;
+    * each bound run that is over without `terminal_reported` in its `state.json` gets its terminal
+      report, from the stage it recorded reaching, with the fallback chain.
+
+  Runs report their stages to the registered name, waiting up to a minute for one to exist, so they
+  reach the successor.
+
   Every reply is routed by the ref of the push it answers, so a rate-limited `dispatch_reply`
   is never mistaken for a status. Rate-limited replies wait in a backlog sent one per the
-  contract's burst refill interval by a single timer. A reply loopctl had not recorded when the
-  channel closed is kept and resent after the rejoin: loopctl does not dispatch again, and it
-  answers an identical repeat `ok`.
+  contract's burst refill interval by a single timer; `internal_error` replies go the same way,
+  but only `@internal_error_attempts` times before the reply is given up and logged as an error.
+  A reply loopctl had not recorded when the channel closed is kept and resent after the rejoin:
+  loopctl does not dispatch again, and it answers an identical repeat `ok`.
+
+  ## Stage reports
+
+  The run tells this process where it is through `Run.execute/3`'s `:on_stage` callback, as
+  messages carrying the dispatch binding, and each becomes a contract `stage` report, pushed
+  strictly in order, one at a time per dispatch. A message from a run this process did not start
+  opens that dispatch's stream on demand, from the stage its event follows:
+
+    * `claimed` -> `worktree` once the worktree exists, with its `branch` and `worktree_path`;
+    * `worktree` -> `implementing` as the session starts;
+    * however the run ends, from the last stage reported -> `escalated` with edge
+      `session_escalated` and a reason: exactly `DispatchRun.finished_reason/0` for a run that
+      finished, otherwise its status, exit reason and any escalation text. A run whose task dies
+      without saying so is reported as crashed.
+
+  Replies: `ok` sends the next; `rate_limited` and `internal_error` retry with a backoff, the
+  latter 3 times for an intermediate report (then that report is given up and the next goes) and
+  8 times for the terminal one. A stream whose intermediate reports stop (`stale_stage` or another
+  refusal) still sends its terminal `escalated` report, since that is what frees loopctl's slot;
+  `stale_stage` on the terminal report retries it from the believed stage, then `implementing`,
+  `worktree` and `claimed`, stopping at the first acknowledgement. Reports not yet
+  acknowledged when the channel closes are resent after the rejoin, in order; a replay whose first
+  copy committed is answered `ok`.
 
   ## Trace shipping
 
@@ -75,7 +131,20 @@ defmodule LoopctlRunner.Control do
 
   require Logger
 
-  alias LoopctlRunner.{Config, Contract, ControlConfig, Health, Runs, TraceShip}
+  alias LoopctlRunner.{
+    Config,
+    Contract,
+    ControlConfig,
+    DispatchPolicy,
+    DispatchRun,
+    Health,
+    Owner,
+    PendingStarts,
+    Run,
+    Runs,
+    RunState,
+    TraceShip
+  }
 
   @reconnect_backoff_ms [1_000, 2_000, 5_000, 10_000, 30_000, 60_000, 120_000]
   # The join budget is 30 per minute; this ladder never approaches it.
@@ -88,6 +157,19 @@ defmodule LoopctlRunner.Control do
   # A status reply slower than this is logged: the link is degraded well before the heartbeat
   # timeout declares it dead.
   @slow_reply_ms 5_000
+  # loopctl's internal_error is transient on its side, but unlike rate_limited it carries no
+  # promise that waiting helps: a few attempts, then the message is given up and logged.
+  @internal_error_attempts 3
+  # The terminal stage report frees loopctl's slot, so it is retried longer, still bounded: with
+  # the doubling backoff capped at 5s, eight attempts span about 20 seconds.
+  @terminal_internal_error_attempts 8
+  # The longest wait between stage retries.
+  @max_stage_backoff_ms 5_000
+  # The refusal of a dispatch whose kind this runner does not run. The vendored contract 1.4.0
+  # has no kind_not_supported, so it is `other` for now: vendoring 1.5.0 changes this ONE line to
+  # "kind_not_supported" (1.5.0 x-connection.dispatchable_kinds is ["implement"]).
+  @kind_refusal_reason "other"
+  @kind_refusal "triage dispatches are not supported by this runner yet"
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -116,9 +198,16 @@ defmodule LoopctlRunner.Control do
   @spec join_payload(Config.t(), map(), boolean(), boolean()) ::
           {:ok, map()} | {:error, [String.t()]}
   def join_payload(%Config{} = config, capacity, draining?, accepts? \\ false),
-    do: build_join(config, capacity, draining?, accepts?, measure(config))
+    do:
+      build_join(
+        config,
+        capacity,
+        {draining?, accepts?},
+        measure(config),
+        Runs.in_flight(config.runs_dir)
+      )
 
-  defp build_join(%Config{control: control} = config, capacity, draining?, accepts?, measured) do
+  defp build_join(%Config{control: control}, capacity, {draining?, accepts?}, measured, in_flight) do
     payload =
       %{
         "contract_version" => Contract.version(),
@@ -127,7 +216,7 @@ defmodule LoopctlRunner.Control do
         "memory_mb" => capacity["memory_mb"],
         "repos" => control.repos,
         "max_sessions" => control.max_sessions,
-        "in_flight" => Runs.in_flight(config.runs_dir),
+        "in_flight" => in_flight,
         "draining" => reported_draining(draining?, accepts?)
       }
       |> put_sample(measured)
@@ -138,12 +227,12 @@ defmodule LoopctlRunner.Control do
   @doc "The `RunnerStatus` payload, validated against the contract."
   @spec status_payload(Config.t(), boolean(), boolean()) :: {:ok, map()} | {:error, [String.t()]}
   def status_payload(%Config{} = config, draining?, accepts? \\ false),
-    do: build_status(config, draining?, accepts?, measure(config))
+    do: build_status(draining?, accepts?, measure(config), Runs.in_flight(config.runs_dir))
 
-  defp build_status(config, draining?, accepts?, measured) do
+  defp build_status(draining?, accepts?, measured, in_flight) do
     payload =
       %{
-        "in_flight" => Runs.in_flight(config.runs_dir),
+        "in_flight" => in_flight,
         "draining" => reported_draining(draining?, accepts?)
       }
       |> put_sample(measured)
@@ -174,9 +263,38 @@ defmodule LoopctlRunner.Control do
             control: control,
             capacity: capacity,
             on_fatal: Keyword.get(opts, :on_fatal, &halt/1),
-            # No dispatch accept path exists yet (loopctl#803); an option so the draining
-            # value is observable in tests before it does.
-            accepts_dispatches: Keyword.get(opts, :accepts_dispatches, false),
+            # The config decides; the option lets a test override it.
+            accepts_dispatches:
+              Keyword.get(opts, :accepts_dispatches, control.accepts_dispatches),
+            # Where accepted runs are started, and what runs them (replaceable in tests).
+            run_supervisor: Keyword.get(opts, :run_supervisor, LoopctlRunner.RunSupervisor),
+            run: Keyword.get(opts, :run, &Run.execute/3),
+            # dispatch_id => claim_epoch for every dispatch this process started a run for, so
+            # a repeat of one is never run twice.
+            started_dispatches: started_dispatches(config.runs_dir),
+            # dispatch_id => %{dispatch, story, opts}: accepted, waiting for loopctl to record it.
+            pending_starts: %{},
+            # The registered name runs report to, so they reach a successor of this process.
+            name: Keyword.get(opts, :name),
+            # Runs in flight: dispatch_id => %{ref, run_id, run_dir}; and task ref => dispatch_id.
+            runs: %{},
+            run_refs: %{},
+            # dispatch_id => the stage stream (see stage_stream/1); push ref => dispatch_id.
+            stage_streams: %{},
+            stage_refs: %{},
+            stage_retry_ms: Keyword.get(opts, :stage_retry_ms, stage_retry_ms()),
+            internal_error_attempts:
+              Keyword.get(opts, :internal_error_attempts, @internal_error_attempts),
+            terminal_internal_error_attempts:
+              Keyword.get(
+                opts,
+                :terminal_internal_error_attempts,
+                @terminal_internal_error_attempts
+              ),
+            # dispatch_id => internal_error replies so far to its dispatch_reply.
+            reply_errors: %{},
+            # run_id => internal_error replies so far to its trace pushes.
+            trace_errors: %{},
             token_failures: 0,
             topic: "runner:" <> control.runner_id,
             draining: false,
@@ -197,6 +315,10 @@ defmodule LoopctlRunner.Control do
             sample_error: nil,
             # Health.measure/2, replaceable so an unreadable metric can be exercised.
             measure: Keyword.get(opts, :measure, &Health.measure/2),
+            # Health.free_disk_mb/1 for the dispatch policy, read apart from the sample.
+            free_disk: Keyword.get(opts, :free_disk, &Health.free_disk_mb/1),
+            # DispatchPolicy.decide/3, replaceable so a test can make the decision raise.
+            decide: Keyword.get(opts, :decide, &DispatchPolicy.decide/3),
             unhandled_events: MapSet.new(),
             # The reason loopctl gave in a `disconnecting` push, named on the close that follows.
             announced_disconnect: nil,
@@ -234,10 +356,31 @@ defmodule LoopctlRunner.Control do
             trace_find_runs: Keyword.get(opts, :trace_find_runs, &TraceShip.runs/1)
           )
 
+        # What a crashed predecessor left unfinished: accepts whose run never started, and
+        # finished runs whose terminal report loopctl never acknowledged.
+        socket = socket |> restore_pending_starts() |> recover_terminal_reports()
         {:ok, socket, {:continue, :connect}}
 
       {:error, reason} ->
         {:stop, {:shutdown, {:capacity_unreadable, reason}}}
+    end
+  end
+
+  # Every dispatch a run on this machine is bound to, in any status: a Control that restarted
+  # must answer a redelivered dispatch accepted again, and never start it a second time.
+  defp started_dispatches(runs_dir) do
+    bound =
+      for {_dir, %{"dispatch_id" => id, "claim_epoch" => epoch}} <- RunState.all(runs_dir),
+          do: {id, epoch}
+
+    pending =
+      for %{"dispatch_id" => id, "claim_epoch" => epoch} <- PendingStarts.all(runs_dir),
+          do: {id, epoch}
+
+    for {id, epoch} <- bound ++ pending,
+        is_binary(id) and is_integer(epoch),
+        reduce: %{} do
+      acc -> Map.update(acc, id, epoch, &max(&1, epoch))
     end
   end
 
@@ -298,7 +441,8 @@ defmodule LoopctlRunner.Control do
      )
      |> schedule_status()
      |> schedule_reply_backlog()
-     |> schedule_trace(0, true)}
+     |> schedule_trace(0, true)
+     |> resume_stages()}
   end
 
   # How long the runner was out of the pool, so a rejoin line says what the outage cost.
@@ -402,7 +546,14 @@ defmodule LoopctlRunner.Control do
       trace_positions: %{},
       trace_runs: nil,
       trace_push: nil,
-      trace_timer: cancel_reply_timer(socket.assigns.trace_timer)
+      trace_timer: cancel_reply_timer(socket.assigns.trace_timer),
+      # A stage report stays at the head of its queue until acknowledged, so one in flight is
+      # simply sent again, in order, after the rejoin.
+      stage_refs: %{},
+      stage_streams:
+        Map.new(socket.assigns.stage_streams, fn {id, stream} ->
+          {id, %{stream | push: nil, timer: cancel_reply_timer(stream.timer)}}
+        end)
     )
   end
 
@@ -439,7 +590,7 @@ defmodule LoopctlRunner.Control do
     measured = measure(a.config, a.measure)
     socket = socket |> note_sample(measured) |> warn_unanswered()
 
-    case build_status(a.config, a.draining, a.accepts_dispatches, measured) do
+    case build_status(a.draining, a.accepts_dispatches, measured, in_flight(a)) do
       {:ok, payload} ->
         case push(socket, a.topic, "status", payload) do
           {:ok, ref} ->
@@ -499,6 +650,35 @@ defmodule LoopctlRunner.Control do
 
   def handle_info({:trace_tick, _stale_token, _refresh?}, socket), do: {:noreply, socket}
 
+  # What a run reports through Run.execute/3's :on_stage callback.
+  def handle_info({:run_stage, binding, event}, socket) when is_map(binding),
+    do: {:noreply, run_message(socket, binding, event)}
+
+  def handle_info({:stage_retry, dispatch_id, token}, socket) do
+    case socket.assigns.stage_streams[dispatch_id] do
+      %{timer: {_timer, ^token}} = stream ->
+        socket
+        |> put_stream(dispatch_id, %{stream | timer: nil})
+        |> send_next_stage(dispatch_id)
+        |> then(&{:noreply, &1})
+
+      # A timer cancelled with the channel, or for a stream already over.
+      _ ->
+        {:noreply, socket}
+    end
+  end
+
+  # A run's task returned; its result is in the run directory and its end already reported.
+  def handle_info({ref, _result}, socket)
+      when is_reference(ref) and is_map_key(socket.assigns.run_refs, ref) do
+    Process.demonitor(ref, [:flush])
+    {:noreply, run_ended(socket, ref, :normal)}
+  end
+
+  def handle_info({:DOWN, ref, :process, _pid, reason}, socket)
+      when is_map_key(socket.assigns.run_refs, ref),
+      do: {:noreply, run_ended(socket, ref, reason)}
+
   def handle_info(_message, socket), do: {:noreply, socket}
 
   @impl Slipstream
@@ -538,7 +718,12 @@ defmodule LoopctlRunner.Control do
         # can be accepted. It is what the next status carries, not proof loopctl received it:
         # runner_pool can lag it while a push is pending, rate-limited or lost with the socket.
         draining: reported_draining(a.draining, a.accepts_dispatches),
-        accepts_dispatches: a.accepts_dispatches
+        accepts_dispatches: a.accepts_dispatches,
+        # Runs this process accepted that are still going, and stage reports not yet recorded.
+        runs_in_flight: Map.keys(a.runs),
+        pending_starts: Map.keys(a.pending_starts),
+        stage_reports_pending:
+          a.stage_streams |> Map.values() |> Enum.map(&length(&1.queue)) |> Enum.sum()
       })
 
     {:reply, info, socket}
@@ -554,6 +739,9 @@ defmodule LoopctlRunner.Control do
 
       match?(%{ref: ^ref}, socket.assigns.trace_push) ->
         {:ok, trace_answered(reply, socket)}
+
+      Map.has_key?(socket.assigns.stage_refs, ref) ->
+        {:ok, stage_answered(ref, reply, socket)}
 
       List.keymember?(socket.assigns.status_pushes, ref, 0) ->
         handle_status_reply(reply, settle_status(socket, ref, reply))
@@ -590,9 +778,22 @@ defmodule LoopctlRunner.Control do
       claim_epoch: payload["claim_epoch"]
     ]
 
+    if acked?(reply) do
+      Logger.info(
+        "loopctl recorded the dispatch_reply: #{payload["decision"]} (#{payload["reason"]})",
+        ids
+      )
+
+      {:ok, settle_reply(socket, payload, :recorded)}
+    else
+      {:ok, dispatch_reply_refused(socket, reply, {payload, story_id, carried?}, ids)}
+    end
+  end
+
+  defp dispatch_reply_refused(socket, reply, {payload, _story_id, carried?} = entry, ids) do
     case reply do
       {:error, %{"reason" => "rate_limited"}} ->
-        backlog = socket.assigns.reply_backlog ++ [{payload, story_id, carried?}]
+        backlog = socket.assigns.reply_backlog ++ [entry]
 
         Logger.info(
           "loopctl rate-limited a dispatch_reply; #{length(backlog)} in the backlog, " <>
@@ -600,27 +801,22 @@ defmodule LoopctlRunner.Control do
           ids
         )
 
-        {:ok, socket |> assign(reply_backlog: backlog) |> schedule_reply_backlog()}
+        socket |> assign(reply_backlog: backlog) |> schedule_reply_backlog()
+
+      {:error, %{"reason" => "internal_error"} = refusal} ->
+        reply_internal_error(socket, entry, refusal, ids)
 
       # A reply carried across a rejoin may find the question settled meanwhile: the claim moved
       # on, or the first copy was recorded after all. That is the expected end of a resend.
       {:error, %{"reason" => reason}}
       when carried? and reason in ["stale_claim_epoch", "already_replied", "unknown_dispatch"] ->
         Logger.info("loopctl no longer needs the resent dispatch_reply (#{reason})", ids)
-        {:ok, socket}
+        settle_reply(socket, payload, {:refused, reason})
 
       {:error, %{"reason" => reason} = refusal} ->
         # unknown_dispatch, stale_claim_epoch, already_replied: resending cannot change them.
         Logger.warning("loopctl refused the dispatch_reply (#{reason}): #{inspect(refusal)}", ids)
-        {:ok, socket}
-
-      ok when ok == :ok or (is_tuple(ok) and elem(ok, 0) == :ok) ->
-        Logger.info(
-          "loopctl recorded the dispatch_reply: #{payload["decision"]} (#{payload["reason"]})",
-          ids
-        )
-
-        {:ok, socket}
+        settle_reply(socket, payload, {:refused, reason})
 
       # A bare :error (an error reply with an empty body) or one without a reason: still a
       # refusal, and not one resending is known to fix.
@@ -630,7 +826,53 @@ defmodule LoopctlRunner.Control do
           ids
         )
 
-        {:ok, socket}
+        settle_reply(socket, payload, {:refused, "no reason given"})
+    end
+  end
+
+  # An internal_error is retried through the backlog, but only a few times: unlike rate_limited
+  # it promises nothing about waiting. Giving up is an error, because loopctl's ledger row then
+  # waits on this dispatch for as long as the claim holds.
+  defp reply_internal_error(socket, {payload, _story_id, _carried?} = entry, refusal, ids) do
+    id = payload["dispatch_id"]
+    attempts = Map.get(socket.assigns.reply_errors, id, 0) + 1
+
+    if attempts >= socket.assigns.internal_error_attempts do
+      Logger.error(
+        "giving up on the dispatch_reply (#{payload["decision"]}) for dispatch #{id} after " <>
+          "#{attempts} internal_error replies from loopctl: #{inspect(refusal)}",
+        ids
+      )
+
+      settle_reply(socket, payload, {:refused, "internal_error"})
+    else
+      Logger.warning(
+        "loopctl answered the dispatch_reply for dispatch #{id} with internal_error " <>
+          "(#{attempts} of #{socket.assigns.internal_error_attempts}); resending",
+        ids
+      )
+
+      socket
+      |> assign(
+        reply_errors: Map.put(socket.assigns.reply_errors, id, attempts),
+        reply_backlog: socket.assigns.reply_backlog ++ [entry]
+      )
+      |> schedule_reply_backlog()
+    end
+  end
+
+  # The reply's question is settled one way or the other, for good: its error count goes, and an
+  # accept decides its pending run. Only loopctl recording the accept starts the run; any final
+  # refusal of it (the claim moved on, the dispatch is unknown, a conflicting reply was recorded,
+  # no reason, internal_error given up) means the run never starts.
+  defp settle_reply(socket, payload, outcome) do
+    id = payload["dispatch_id"]
+    socket = assign(socket, reply_errors: Map.delete(socket.assigns.reply_errors, id))
+
+    case {payload["decision"], outcome} do
+      {"accepted", :recorded} -> start_pending(socket, id)
+      {"accepted", {:refused, why}} -> drop_pending(socket, id, why)
+      _ -> socket
     end
   end
 
@@ -651,6 +893,10 @@ defmodule LoopctlRunner.Control do
       )
 
     assign(socket, reply_timer: {timer, token})
+  end
+
+  defp stage_retry_ms do
+    get_in(Contract.connection(), ["limits", "stage_burst", "refill_interval_ms"]) || 250
   end
 
   # The contract's burst refill: one token comes back every refill interval.
@@ -727,14 +973,12 @@ defmodule LoopctlRunner.Control do
     socket =
       case Contract.validate("RunnerDispatch", payload) do
         :ok ->
-          Logger.warning(
-            "dispatch #{payload["dispatch_id"]} received: this runner accepts no dispatches yet " <>
+          Logger.info(
+            "dispatch #{payload["dispatch_id"]} received " <>
               "(story #{payload["story_id"]}, #{payload["kind"]}, claim_epoch #{payload["claim_epoch"]})"
           )
 
-          # No accept path exists (build order step 6), so every dispatch is refused, and
-          # loopctl is told why rather than left waiting on a claim nobody will run.
-          refuse_dispatch(socket, payload, %{"reason" => "dispatches_disabled"})
+          handle_dispatch(socket, payload)
 
         {:error, errors} ->
           Logger.warning("malformed dispatch received: #{inspect(errors)}")
@@ -803,6 +1047,810 @@ defmodule LoopctlRunner.Control do
   end
 
   defp dispatch_metadata(_payload), do: []
+
+  # --- The accept path ---
+
+  # The contract's dispatch_reply is idempotent on loopctl's side only: a repeat of a dispatch
+  # this runner already started must never start a second session.
+  defp handle_dispatch(socket, dispatch) do
+    id = dispatch["dispatch_id"]
+    epoch = dispatch["claim_epoch"]
+
+    case Map.fetch(socket.assigns.started_dispatches, id) do
+      {:ok, ^epoch} ->
+        Logger.warning(
+          "dispatch #{id} was already accepted and started here; answering accepted again, " <>
+            "starting nothing"
+        )
+
+        push_dispatch_reply(socket, accepted_reply(dispatch), dispatch["story_id"])
+
+      {:ok, started_epoch} ->
+        Logger.warning(
+          "dispatch #{id} was already started here at claim_epoch #{started_epoch}; refusing it"
+        )
+
+        refuse_dispatch(socket, dispatch, %{
+          "reason" => "other",
+          "detail" => "this runner already started dispatch #{id} at claim_epoch #{started_epoch}"
+        })
+
+      :error ->
+        decide_dispatch(socket, dispatch)
+    end
+  end
+
+  defp decide_dispatch(socket, dispatch) do
+    case guarded_decision(socket.assigns, dispatch) do
+      {:accept, story} ->
+        accept_dispatch(socket, dispatch, story)
+
+      {:refuse, reason, detail} ->
+        Logger.warning("dispatch #{dispatch["dispatch_id"]} refused (#{reason}): #{detail}")
+
+        refuse_dispatch(socket, dispatch, %{
+          "reason" => reason,
+          "detail" => String.slice(detail, 0, 500)
+        })
+    end
+  end
+
+  # The whole decision — policy, story validation, prompt — runs on a payload from the wire, so
+  # whatever it raises becomes a refusal instead of taking Control down. loopctl is told only the
+  # kind of failure; the message and stack, which can quote the payload, stay in the local log.
+  defp guarded_decision(a, dispatch) do
+    decision(a, dispatch)
+  rescue
+    exception ->
+      Logger.error(
+        "deciding dispatch #{dispatch["dispatch_id"]} raised; refusing it: " <>
+          Exception.format(:error, exception, __STACKTRACE__)
+      )
+
+      {:refuse, "other",
+       "the runner failed deciding this dispatch (#{inspect(exception.__struct__)})"}
+  catch
+    kind, reason ->
+      Logger.error(
+        "deciding dispatch #{dispatch["dispatch_id"]} failed; refusing it: " <>
+          Exception.format(kind, reason, __STACKTRACE__)
+      )
+
+      {:refuse, "other", "the runner failed deciding this dispatch (#{kind})"}
+  end
+
+  defp decision(a, dispatch) do
+    config = %{a.config | control: %{a.config.control | accepts_dispatches: a.accepts_dispatches}}
+    state = %{draining: a.draining, in_flight: in_flight(a), free_disk_mb: &free_disk_mb(a, &1)}
+
+    with {:accept, fields} <- a.decide.(dispatch, config, state),
+         :ok <- implement_kind(dispatch),
+         {:ok, story_object} <- dispatch_story(dispatch),
+         {:ok, story} <- local_story(dispatch, fields, story_object, a.config) do
+      {:accept, story}
+    end
+  end
+
+  defp implement_kind(%{"kind" => "implement"}), do: :ok
+  defp implement_kind(_dispatch), do: {:refuse, @kind_refusal_reason, @kind_refusal}
+
+  defp dispatch_story(dispatch) do
+    case DispatchRun.story_object(dispatch) do
+      {:ok, story} -> {:ok, story}
+      :none -> {:refuse, "other", "the dispatch carries no story"}
+      {:error, detail} -> {:refuse, "other", detail}
+    end
+  end
+
+  defp local_story(dispatch, fields, story_object, config) do
+    case DispatchRun.story(dispatch, fields, story_object, config) do
+      {:ok, story} ->
+        {:ok, story}
+
+      {:error, detail} ->
+        {:refuse, "other", "the dispatch does not make a runnable story: " <> detail}
+    end
+  end
+
+  defp free_disk_mb(a, path) do
+    case a.free_disk.(path) do
+      {:ok, free} -> free
+      :error -> nil
+    end
+  end
+
+  # Runs this process accepted count from the moment they are accepted, while their start waits
+  # on loopctl and before their state.json exists; every other run in flight on this machine
+  # (a run started by an earlier Control included) counts from its state.json.
+  defp in_flight(a) do
+    mine = MapSet.new(Map.keys(a.runs) ++ Map.keys(a.pending_starts))
+    Runs.in_flight(a.config.runs_dir, mine) + map_size(a.runs) + map_size(a.pending_starts)
+  end
+
+  defp accepted_reply(dispatch),
+    do: %{
+      "dispatch_id" => dispatch["dispatch_id"],
+      "claim_epoch" => dispatch["claim_epoch"],
+      "decision" => "accepted"
+    }
+
+  # Accepting sends the accept and records a pending start; the run starts only once loopctl has
+  # recorded the accept (settle_reply/3). A session started on an accept loopctl then refused
+  # would run with no way to stop it, reporting stages and a trace nobody takes.
+  defp accept_dispatch(socket, dispatch, story) do
+    reply = accepted_reply(dispatch)
+    :ok = Contract.validate("RunnerDispatchReply", reply)
+
+    Logger.info(
+      "dispatch #{dispatch["dispatch_id"]} accepted: run of #{story.id} starts once loopctl " <>
+        "records it"
+    )
+
+    socket
+    |> register_pending(dispatch, story)
+    |> push_dispatch_reply(reply, dispatch["story_id"])
+  end
+
+  # The pending start is kept in memory and on disk (PendingStarts), so a restart resumes it.
+  defp register_pending(socket, dispatch, story) do
+    a = socket.assigns
+    id = dispatch["dispatch_id"]
+    binding = DispatchRun.binding(dispatch)
+    target = a.name || self()
+    on_stage = fn event -> notify_control(target, {:run_stage, binding, event}) end
+    pending = %{dispatch: dispatch, story: story, opts: [binding: binding, on_stage: on_stage]}
+
+    with {:error, reason} <- PendingStarts.write(a.config.runs_dir, dispatch) do
+      Logger.error(
+        "could not record the pending start of dispatch #{id} on disk (#{inspect(reason)}); " <>
+          "a restart before it starts would forget it",
+        dispatch_id: id
+      )
+    end
+
+    assign(socket,
+      started_dispatches: Map.put(a.started_dispatches, id, dispatch["claim_epoch"]),
+      pending_starts: Map.put(a.pending_starts, id, pending)
+    )
+  end
+
+  # A Control starting over pending files resends each accept and starts the run on ok, as for a
+  # fresh accept. The story is rebuilt against the current config; one that no longer builds is
+  # logged and forgotten rather than started.
+  defp restore_pending_starts(socket) do
+    a = socket.assigns
+
+    Enum.reduce(PendingStarts.all(a.config.runs_dir), socket, fn dispatch, socket ->
+      id = dispatch["dispatch_id"]
+
+      case rebuild_story(socket.assigns, dispatch) do
+        {:ok, story} ->
+          Logger.info("resending the accept of pending dispatch #{id}", dispatch_id: id)
+          entry = {accepted_reply(dispatch), dispatch["story_id"], true}
+
+          socket
+          |> register_pending(dispatch, story)
+          |> assign(reply_backlog: socket.assigns.reply_backlog ++ [entry])
+
+        {:error, why} ->
+          Logger.error(
+            "pending dispatch #{id} no longer makes a runnable story (#{why}); not started",
+            dispatch_id: id
+          )
+
+          PendingStarts.delete(a.config.runs_dir, id)
+          socket
+      end
+    end)
+  end
+
+  # Capacity, draining and disk were decided when the dispatch was accepted; only what the story
+  # is built from is checked again.
+  defp rebuild_story(a, dispatch) do
+    control = %{
+      a.config.control
+      | accepts_dispatches: true,
+        max_sessions: max(a.config.control.max_sessions, 1)
+    }
+
+    min = control.min_free_disk_mb
+    state = %{draining: false, in_flight: 0, free_disk_mb: fn _path -> min end}
+
+    with {:accept, fields} <-
+           DispatchPolicy.decide(dispatch, %{a.config | control: control}, state),
+         {:ok, story_object} <- DispatchRun.story_object(dispatch),
+         {:ok, story} <- DispatchRun.story(dispatch, fields, story_object, a.config) do
+      {:ok, story}
+    else
+      {:refuse, reason, detail} -> {:error, "#{reason}: #{detail}"}
+      :none -> {:error, "no story"}
+      {:error, detail} -> {:error, detail}
+    end
+  rescue
+    exception -> {:error, inspect(exception.__struct__)}
+  end
+
+  # A bound run that is over (finished, or its owner gone) and whose terminal report loopctl never
+  # acknowledged gets it now, from the stage it recorded reaching, with the full fallback chain.
+  defp recover_terminal_reports(socket) do
+    runs_dir = socket.assigns.config.runs_dir
+
+    for {run_dir, %{"dispatch_id" => id, "claim_epoch" => epoch} = state} <-
+          RunState.all(runs_dir),
+        is_binary(id) and is_integer(epoch),
+        is_nil(state["terminal_reported"]),
+        not live?(state),
+        reduce: socket do
+      socket -> recover_terminal_report(socket, run_dir, state)
+    end
+  end
+
+  # A stream already opened for the dispatch (a second run bound to it) is left alone.
+  defp recover_terminal_report(socket, _run_dir, %{"dispatch_id" => id})
+       when is_map_key(socket.assigns.stage_streams, id),
+       do: socket
+
+  defp recover_terminal_report(socket, run_dir, %{"dispatch_id" => id} = state) do
+    status = state["status"]
+    reached = state["reached"]
+    Logger.info("reporting the unacknowledged end of dispatch #{id}'s run", dispatch_id: id)
+
+    summary =
+      if status in [nil, "starting", "running"],
+        do: %{status: "crashed", error: "the run did not finish on a live runner"},
+        else: %{status: status, reached: reached, escalations: Run.escalations(run_dir)}
+
+    binding = Map.take(state, ["dispatch_id", "claim_epoch", "story_id"])
+
+    socket
+    |> put_stream(id, stage_stream(binding, reached || "implementing"))
+    |> queue_end(id, summary)
+  end
+
+  defp live?(state), do: state["status"] in ["starting", "running"] and Owner.alive?(state)
+
+  # A run reports to whichever Control is alive: by registered name when there is one, so a run
+  # that outlives a Control crash reaches its successor. While none is registered (a restart in
+  # progress) the run waits for one, up to `:wait_ms`, then logs what it could not deliver; the
+  # run itself must never crash on it.
+  @notify_wait_ms 60_000
+  @notify_poll_ms 200
+
+  @doc false
+  @spec notify_control(atom() | pid(), term(), keyword()) :: :ok
+  def notify_control(target, message, opts \\ [])
+
+  def notify_control(target, message, opts) when is_atom(target) do
+    deadline = System.monotonic_time(:millisecond) + Keyword.get(opts, :wait_ms, @notify_wait_ms)
+    await_control(target, message, deadline, Keyword.get(opts, :poll_ms, @notify_poll_ms))
+  end
+
+  def notify_control(pid, message, _opts) when is_pid(pid) do
+    send(pid, message)
+    :ok
+  end
+
+  defp await_control(target, message, deadline, poll_ms) do
+    case Process.whereis(target) do
+      pid when is_pid(pid) ->
+        notify_control(pid, message)
+
+      nil ->
+        if System.monotonic_time(:millisecond) < deadline do
+          Process.sleep(poll_ms)
+          await_control(target, message, deadline, poll_ms)
+        else
+          Logger.error(
+            "no #{inspect(target)} registered to take a run's stage message " <>
+              "(#{describe_run_message(message)}); it was not delivered"
+          )
+
+          :ok
+        end
+    end
+  end
+
+  defp describe_run_message({:run_stage, %{"dispatch_id" => id}, event}) when is_tuple(event),
+    do: "#{elem(event, 0)} for dispatch #{id}"
+
+  defp describe_run_message(_message), do: "unrecognised message"
+
+  defp start_pending(socket, id) do
+    a = socket.assigns
+
+    case Map.pop(a.pending_starts, id) do
+      {nil, _} ->
+        socket
+
+      {%{dispatch: dispatch, story: story, opts: opts}, pending} ->
+        run = a.run
+        config = a.config
+
+        task =
+          Task.Supervisor.async_nolink(a.run_supervisor, fn -> run.(config, story, opts) end)
+
+        Logger.info(
+          "dispatch #{id} recorded as accepted: run of #{story.id} started on #{story.branch}",
+          dispatch_id: id
+        )
+
+        PendingStarts.delete(config.runs_dir, id)
+
+        assign(socket,
+          pending_starts: pending,
+          runs: Map.put(a.runs, id, %{ref: task.ref, run_id: nil, run_dir: nil}),
+          run_refs: Map.put(a.run_refs, task.ref, id),
+          stage_streams: Map.put(a.stage_streams, id, stage_stream(dispatch, "claimed"))
+        )
+    end
+  end
+
+  defp drop_pending(socket, id, why) do
+    a = socket.assigns
+
+    case Map.pop(a.pending_starts, id) do
+      {nil, _} ->
+        socket
+
+      {_pending, pending} ->
+        Logger.error(
+          "loopctl did not record this runner's accept of dispatch #{id} (#{why}); " <>
+            "its run is not started",
+          dispatch_id: id
+        )
+
+        PendingStarts.delete(a.config.runs_dir, id)
+
+        assign(socket,
+          pending_starts: pending,
+          started_dispatches: Map.delete(a.started_dispatches, id)
+        )
+    end
+  end
+
+  # --- Stage reports (a run's messages in, contract `stage` pushes out) ---
+
+  # One per accepted dispatch: the dispatch it reports for, the stage last queued, reports
+  # waiting in order (the head stays until acknowledged), the push in flight, a retry timer and
+  # its attempts, whether INTERMEDIATE reports have stopped, whether the run's end is queued, and
+  # the stages the terminal report was already refused from as stale.
+  #
+  # `stopped` never stops the terminal report. The terminal `escalated` is what gives loopctl's
+  # slot back, so it is sent on every stream however its intermediate reports fared.
+  defp stage_stream(dispatch, stage),
+    do: %{
+      dispatch: Map.take(dispatch, ["dispatch_id", "claim_epoch", "story_id"]),
+      stage: stage,
+      queue: [],
+      push: nil,
+      timer: nil,
+      rate_limited: 0,
+      internal_errors: 0,
+      stopped: false,
+      ended: false,
+      terminal_tried: []
+    }
+
+  defp put_stream(socket, id, stream),
+    do: assign(socket, stage_streams: Map.put(socket.assigns.stage_streams, id, stream))
+
+  # A run this process did not start (its Control crashed and this one replaced it) gets a stream
+  # on its first stage message, built from the binding the message carries. Its accept was
+  # recorded, or it would not be running; the stage it reports from is the one its event follows.
+  defp run_message(socket, %{"dispatch_id" => id} = binding, event) when is_binary(id) do
+    socket =
+      case {socket.assigns.stage_streams[id], event_from(event)} do
+        {nil, from} when is_binary(from) ->
+          Logger.info(
+            "a run this Control did not start reported #{elem(event, 0)}; " <>
+              "reporting its stages from #{from}",
+            dispatch_id: id
+          )
+
+          put_stream(socket, id, stage_stream(binding, from))
+
+        _ ->
+          socket
+      end
+
+    run_stage(socket, id, event)
+  end
+
+  defp run_message(socket, _binding, _event), do: socket
+
+  defp event_from({:worktree, _}), do: "claimed"
+  defp event_from({:implementing, _}), do: "worktree"
+  defp event_from({:finished, summary}), do: Map.get(summary, :reached) || "implementing"
+  defp event_from(_event), do: nil
+
+  defp run_stage(socket, id, {:started, %{run_id: run_id, run_dir: run_dir}}) do
+    case socket.assigns.runs[id] do
+      nil ->
+        socket
+
+      run ->
+        runs = Map.put(socket.assigns.runs, id, %{run | run_id: run_id, run_dir: run_dir})
+        assign(socket, runs: runs)
+    end
+  end
+
+  defp run_stage(socket, id, {:worktree, %{branch: branch, worktree_path: path}}),
+    do:
+      queue_stage(socket, id, "worktree", effects: %{"branch" => branch, "worktree_path" => path})
+
+  defp run_stage(socket, id, {:implementing, _}), do: queue_stage(socket, id, "implementing")
+
+  defp run_stage(socket, id, {:finished, summary}), do: queue_end(socket, id, summary)
+
+  defp run_stage(socket, _id, _event), do: socket
+
+  # Escalated is the terminal for this deliberate merge-nothing first run ONLY, and must not be
+  # generalised: once the loop merges, a story goes merged -> deployed.
+  defp queue_end(socket, id, summary) do
+    case socket.assigns.stage_streams[id] do
+      %{ended: false} = stream ->
+        socket
+        |> put_stream(id, %{stream | ended: true})
+        |> queue_stage(id, "escalated",
+          edge: "session_escalated",
+          reason: DispatchRun.end_reason(summary)
+        )
+
+      _ ->
+        socket
+    end
+  end
+
+  defp queue_stage(socket, id, to, opts \\ []) do
+    case socket.assigns.stage_streams[id] do
+      nil ->
+        socket
+
+      %{stopped: true} = stream when to != "escalated" ->
+        Logger.info(
+          "stage #{stream.stage} -> #{to} not reported: this dispatch's intermediate reports " <>
+            "have stopped; its terminal report will still be sent",
+          stage_ids(stream)
+        )
+
+        socket
+
+      stream ->
+        case DispatchRun.stage_report(stream.dispatch, stream.stage, to, opts) do
+          {:ok, payload} ->
+            socket
+            |> put_stream(id, %{stream | stage: to, queue: stream.queue ++ [payload]})
+            |> send_next_stage(id)
+
+          {:error, errors} ->
+            Logger.error(
+              "stage #{stream.stage} -> #{to} not reported: it would fail the contract: " <>
+                inspect(errors),
+              stage_ids(stream)
+            )
+
+            socket
+        end
+    end
+  end
+
+  defp resume_stages(socket),
+    do: Enum.reduce(Map.keys(socket.assigns.stage_streams), socket, &send_next_stage(&2, &1))
+
+  # The head of the queue goes out when nothing is in flight or waiting out a retry and the
+  # channel is joined. A stream exists only for a run that started, and a run starts only once
+  # loopctl has recorded its accept, so nothing here waits on the accept.
+  defp send_next_stage(socket, id) do
+    a = socket.assigns
+
+    case a.stage_streams[id] do
+      %{queue: [payload | _], push: nil, timer: nil} = stream ->
+        if a.joined,
+          do: push_stage(socket, id, stream, payload),
+          else: socket
+
+      _ ->
+        socket
+    end
+  end
+
+  defp push_stage(socket, id, stream, payload) do
+    case push(socket, socket.assigns.topic, "stage", payload) do
+      {:ok, ref} ->
+        Logger.info(
+          "stage report sent: #{payload["from"]} -> #{payload["to"]}",
+          stage_ids(stream)
+        )
+
+        socket
+        |> put_stream(id, %{stream | push: ref})
+        |> assign(stage_refs: Map.put(socket.assigns.stage_refs, ref, id))
+
+      # Not joined at this instant: the rejoin resumes every stream.
+      {:error, reason} ->
+        Logger.info("stage report held until the channel rejoins: #{inspect(reason)}")
+        socket
+    end
+  end
+
+  defp stage_answered(ref, reply, socket) do
+    {id, refs} = Map.pop(socket.assigns.stage_refs, ref)
+    socket = assign(socket, stage_refs: refs)
+
+    case socket.assigns.stage_streams[id] do
+      %{push: ^ref, queue: [_ | _]} = stream ->
+        stream = %{stream | push: nil}
+
+        stage_reply(socket, id, stream, reply)
+
+      # A reply to a push from before the last rejoin.
+      _ ->
+        socket
+    end
+  end
+
+  defp stage_reply(socket, id, %{queue: [payload | _]} = stream, reply) do
+    case reply do
+      {:error, %{"reason" => "rate_limited"}} ->
+        retry_stage(socket, id, %{stream | rate_limited: stream.rate_limited + 1})
+
+      {:error, %{"reason" => "internal_error"} = refusal} ->
+        stage_internal_error(socket, id, stream, payload, refusal)
+
+      {:error, %{"reason" => "stale_stage"} = refusal} ->
+        stale_stage(socket, id, stream, payload, refusal)
+
+      _ ->
+        if acked?(reply),
+          do: stage_recorded(socket, id, stream, payload),
+          else: stage_refused(socket, id, stream, payload, inspect(reply))
+    end
+  end
+
+  defp stage_recorded(socket, id, stream, payload) do
+    Logger.info(
+      "loopctl recorded the stage #{payload["from"]} -> #{payload["to"]}",
+      stage_ids(stream)
+    )
+
+    if terminal?(payload), do: mark_terminal_reported(socket, stream)
+    advance(socket, id, stream)
+  end
+
+  defp terminal?(payload), do: payload["to"] == "escalated"
+
+  # Recorded beside the run, so a later Control does not report this end again: true once loopctl
+  # acknowledged it, "refused" once it refused it from every stage (a later Control would only be
+  # refused again, and loopctl's heal sweep does that accounting).
+  defp mark_terminal_reported(socket, stream, value \\ true)
+
+  defp mark_terminal_reported(socket, %{dispatch: %{"dispatch_id" => id} = dispatch}, value) do
+    epoch = dispatch["claim_epoch"]
+
+    for {run_dir, %{"dispatch_id" => ^id, "claim_epoch" => ^epoch}} <-
+          RunState.all(socket.assigns.config.runs_dir) do
+      RunState.update(run_dir, %{terminal_reported: value})
+    end
+
+    :ok
+  rescue
+    exception ->
+      Logger.warning(
+        "could not record that dispatch #{id}'s terminal report was acknowledged " <>
+          "(#{inspect(exception.__struct__)}); a restart will report it again",
+        dispatch_id: id
+      )
+  end
+
+  # The head is settled, one way or another: the next report goes.
+  defp advance(socket, id, %{queue: [_ | rest]} = stream) do
+    socket
+    |> put_stream(id, %{
+      stream
+      | queue: rest,
+        rate_limited: 0,
+        internal_errors: 0,
+        terminal_tried: []
+    })
+    |> drop_stream_if_done(id)
+    |> send_next_stage(id)
+  end
+
+  # A refusal nothing can fix. On an intermediate report it stops the intermediate reports, which
+  # can no longer follow a stage loopctl disagrees with, and keeps the terminal one. On the
+  # terminal report it is the end of the stream.
+  defp stage_refused(socket, id, stream, payload, why) do
+    if terminal?(payload) do
+      Logger.error(
+        "loopctl refused the terminal stage #{payload["from"]} -> escalated for dispatch #{id}: " <>
+          "#{why}; the story stays where it is until loopctl reclaims it",
+        stage_ids(stream)
+      )
+
+      mark_terminal_reported(socket, stream, "refused")
+      advance(socket, id, stream)
+    else
+      Logger.error(
+        "loopctl refused the stage #{payload["from"]} -> #{payload["to"]} for dispatch #{id}: " <>
+          "#{why}; no further intermediate stages are reported for it, the terminal one still is",
+        stage_ids(stream)
+      )
+
+      stop_intermediates(socket, id, stream)
+    end
+  end
+
+  # The story is not where the report said. For the terminal report that is recoverable: the
+  # runner's belief can lag (reports lost with a crashed Control, or refused, or given up), so the
+  # same report is tried from each stage the story could still be at — the believed one, then
+  # implementing, worktree, claimed — stopping at the first acknowledgement. When the claim was
+  # really reclaimed every attempt is refused, and loopctl's heal sweep does the accounting.
+  @fallback_froms ["implementing", "worktree", "claimed"]
+
+  defp stale_stage(socket, id, stream, payload, refusal) do
+    if terminal?(payload),
+      do: fall_back(socket, id, stream, payload),
+      else: stage_refused(socket, id, stream, payload, "stale_stage #{inspect(refusal)}")
+  end
+
+  defp fall_back(socket, id, %{queue: [_ | rest]} = stream, payload) do
+    tried = stream.terminal_tried ++ [payload["from"]]
+    chain = Enum.uniq([hd(tried) | @fallback_froms])
+
+    with from when is_binary(from) <- Enum.find(chain, &(&1 not in tried)),
+         {:ok, retry} <-
+           DispatchRun.stage_report(stream.dispatch, from, "escalated",
+             edge: payload["edge"],
+             reason: payload["reason"]
+           ) do
+      Logger.warning(
+        "loopctl refused #{payload["from"]} -> escalated for dispatch #{id} as stale_stage; " <>
+          "trying #{from} -> escalated",
+        stage_ids(stream)
+      )
+
+      socket
+      |> put_stream(id, %{stream | queue: [retry | rest], terminal_tried: tried})
+      |> send_next_stage(id)
+    else
+      _ ->
+        stage_refused(
+          socket,
+          id,
+          stream,
+          payload,
+          "stale_stage from every stage it could be at (#{Enum.join(tried, ", ")})"
+        )
+    end
+  end
+
+  # internal_error: an intermediate report is retried a few times and then given up, and the
+  # stream moves on to the next report; the terminal report gets a longer bounded retry, because
+  # it is the one that frees loopctl's slot.
+  defp stage_internal_error(socket, id, stream, payload, refusal) do
+    attempts = stream.internal_errors + 1
+
+    ceiling =
+      if terminal?(payload),
+        do: socket.assigns.terminal_internal_error_attempts,
+        else: socket.assigns.internal_error_attempts
+
+    cond do
+      attempts < ceiling ->
+        retry_stage(socket, id, %{stream | internal_errors: attempts})
+
+      terminal?(payload) ->
+        Logger.error(
+          "giving up on the terminal stage #{payload["from"]} -> escalated for dispatch #{id} " <>
+            "after #{attempts} internal_error replies from loopctl: #{inspect(refusal)}; the " <>
+            "story is left short of its terminal until loopctl reclaims it",
+          stage_ids(stream)
+        )
+
+        advance(socket, id, stream)
+
+      true ->
+        Logger.error(
+          "giving up on the stage #{payload["from"]} -> #{payload["to"]} for dispatch #{id} " <>
+            "after #{attempts} internal_error replies from loopctl: #{inspect(refusal)}; " <>
+            "moving on to the next report",
+          stage_ids(stream)
+        )
+
+        advance(socket, id, stream)
+    end
+  end
+
+  # Doubling from the contract's burst refill interval, capped: a stream never retries tightly.
+  defp retry_stage(socket, id, stream) do
+    tries = stream.rate_limited + stream.internal_errors
+
+    delay =
+      min(
+        socket.assigns.stage_retry_ms * Integer.pow(2, min(tries - 1, 10)),
+        @max_stage_backoff_ms
+      )
+
+    token = make_ref()
+    timer = Process.send_after(self(), {:stage_retry, id, token}, delay)
+    put_stream(socket, id, %{stream | timer: {timer, token}})
+  end
+
+  # No further intermediate reports; a terminal report already queued stays and is sent.
+  defp stop_intermediates(socket, id, %{queue: [_ | rest]} = stream) do
+    socket
+    |> put_stream(id, %{
+      stream
+      | stopped: true,
+        queue: Enum.filter(rest, &terminal?/1),
+        rate_limited: 0,
+        internal_errors: 0
+    })
+    |> drop_stream_if_done(id)
+    |> send_next_stage(id)
+  end
+
+  # A stream is forgotten once its run has ended and it has nothing left to send.
+  defp drop_stream_if_done(socket, id) do
+    a = socket.assigns
+
+    case a.stage_streams[id] do
+      %{ended: true, push: nil, queue: []} ->
+        if Map.has_key?(a.runs, id),
+          do: socket,
+          else: assign(socket, stage_streams: Map.delete(a.stage_streams, id))
+
+      _ ->
+        socket
+    end
+  end
+
+  defp stage_ids(%{dispatch: dispatch}),
+    do: [
+      dispatch_id: dispatch["dispatch_id"],
+      story_id: dispatch["story_id"],
+      claim_epoch: dispatch["claim_epoch"]
+    ]
+
+  # The task is over. A run that ended without reporting it (killed, or an exit rather than a
+  # raise) is reported as crashed, and a state.json it left in flight is closed.
+  defp run_ended(socket, ref, reason) do
+    a = socket.assigns
+    {id, run_refs} = Map.pop(a.run_refs, ref)
+    {run, runs} = Map.pop(a.runs, id)
+    socket = assign(socket, run_refs: run_refs, runs: runs)
+
+    socket =
+      if reason == :normal do
+        socket
+      else
+        Logger.error("the run of dispatch #{id} died: #{inspect(reason)}", dispatch_id: id)
+        close_crashed_state(run.run_dir)
+
+        queue_end(socket, id, %{
+          status: "crashed",
+          error: "the run's process died: #{inspect(reason, limit: 5)}"
+        })
+      end
+
+    socket
+    |> queue_end(id, %{status: "crashed", error: "the run ended without reporting its end"})
+    |> drop_stream_if_done(id)
+  end
+
+  defp close_crashed_state(nil), do: :ok
+
+  defp close_crashed_state(run_dir) do
+    case RunState.read(run_dir) do
+      {:ok, %{"status" => status}} when status in ["starting", "running"] ->
+        RunState.update(run_dir, %{status: "crashed"})
+
+      _ ->
+        :ok
+    end
+  rescue
+    _ -> :ok
+  end
 
   # A refusal can only be addressed to a dispatch whose id and epoch arrived intact; without
   # them loopctl could not match the reply, and the malformed dispatch is logged only.
@@ -1064,9 +2112,16 @@ defmodule LoopctlRunner.Control do
     socket = assign(socket, trace_push: nil)
 
     case reply do
-      {:ok, %{"acked_seq" => acked}} when is_integer(acked) -> trace_acked(socket, push, acked)
-      {:error, %{"reason" => _} = refusal} -> trace_refused(socket, push, refusal)
-      other -> trace_unexpected(socket, push, other)
+      {:ok, %{"acked_seq" => acked}} when is_integer(acked) ->
+        socket
+        |> assign(trace_errors: Map.delete(socket.assigns.trace_errors, push.run.run_id))
+        |> trace_acked(push, acked)
+
+      {:error, %{"reason" => _} = refusal} ->
+        trace_refused(socket, push, refusal)
+
+      other ->
+        trace_unexpected(socket, push, other)
     end
   end
 
@@ -1184,6 +2239,39 @@ defmodule LoopctlRunner.Control do
     end
   end
 
+  # loopctl failed on its side. Retried after a poll like an unexpected reply, but only a few
+  # times: then the run is given up for this session, in memory only, so a restart tries again.
+  defp trace_refused(socket, %{run: run} = push, %{"reason" => "internal_error"} = refusal) do
+    attempts = Map.get(socket.assigns.trace_errors, run.run_id, 0) + 1
+
+    socket =
+      assign(socket, trace_errors: Map.put(socket.assigns.trace_errors, run.run_id, attempts))
+
+    if attempts >= socket.assigns.internal_error_attempts do
+      Logger.error(
+        "giving up on this run's #{push.kind} trace pushes for dispatch #{run.dispatch_id} " <>
+          "after #{attempts} internal_error replies from loopctl: #{inspect(refusal)}; " <>
+          "it is shipped again after a restart",
+        trace_ids(run)
+      )
+
+      socket
+      |> assign(
+        trace_settled: Map.put(socket.assigns.trace_settled, run.run_id, :abandoned),
+        trace_errors: Map.delete(socket.assigns.trace_errors, run.run_id)
+      )
+      |> schedule_trace(TraceShip.min_interval_ms("trace"))
+    else
+      Logger.warning(
+        "loopctl answered a #{push.kind} trace push with internal_error " <>
+          "(#{attempts} of #{socket.assigns.internal_error_attempts}); retrying after the poll",
+        trace_ids(run)
+      )
+
+      back_off(socket, run)
+    end
+  end
+
   defp trace_refused(socket, push, refusal), do: trace_unexpected(socket, push, {:error, refusal})
 
   defp accept_outstanding?(socket, dispatch_id) do
@@ -1255,7 +2343,7 @@ defmodule LoopctlRunner.Control do
     a = socket.assigns
     measured = measure(a.config, a.measure)
 
-    {build_join(a.config, a.capacity, a.draining, a.accepts_dispatches, measured),
+    {build_join(a.config, a.capacity, {a.draining, a.accepts_dispatches}, measured, in_flight(a)),
      note_sample(socket, measured)}
   end
 

@@ -29,6 +29,9 @@
       "mkreyman/home_care_billing"
     ],
     "max_sessions": 2,
-    "status_interval_s": 30
+    "status_interval_s": 30,
+    "accepts_dispatches": false,
+    "min_free_disk_mb": 10240,
+    "max_token_budget": null
   }
 }

@@ -13,15 +13,29 @@ BEAM cluster. See `docs/agent-delivery-loop.md` section 2 for why.
 ## Status
 
 Build order steps **1a** and **1b** are implemented: hand-filed story runs (1a), and the daemon
-that keeps this machine joined to loopctl's runner pool (1b), on runner contract 1.1. The daemon
-accepts no dispatches until build order step 6: it reports `draining: true` and answers any
-`dispatch` with a `dispatch_reply` refusal, so loopctl records why rather than waiting on it.
+that keeps this machine joined to loopctl's runner pool (1b), on runner contract 1.4.0.
+
+The daemon has a dispatch accept path, off by default. With `control.accepts_dispatches` false
+(the default) it reports `draining: true` and refuses every `dispatch` with `dispatches_disabled`.
+With it true, a dispatch passes the local allow-list (`LoopctlRunner.DispatchPolicy`: draining,
+capacity, free disk, repo, branch prefix, wall clock, turns, token budget), must be an `implement`
+dispatch, and must carry a well-formed `story` object (contract 1.5.0); anything else is refused
+with a reason. An accepted dispatch runs `claude -p` in a worktree on the dispatch's branch, with a
+prompt built from a fixed local template in which every story field is fenced as untrusted data,
+and the runner config's own `allowed_tools`. The session implements and tests; it pushes, opens
+PRs and merges nothing.
+
+Each accepted run reports its delivery stages to loopctl (`stage`): `claimed -> worktree`,
+`worktree -> implementing`, and, however the run ends, `-> escalated` with edge
+`session_escalated`. This first end-to-end run merges nothing by design, so `escalated` is its
+deliberate terminal: a run that finished says "first end-to-end run: implementation finished,
+merging nothing by design", and any other end names its status, exit reason and escalation text.
 
 The daemon also ships run traces (`trace` and `trace_cursor`): after every join it asks loopctl
 where each run's stored trace ends and sends the lines after it, in batches within the
 contract's limits. loopctl stores a trace only for a dispatch this runner accepted, so a run ships
-only when its `state.json` carries `dispatch_id` and `claim_epoch`; hand-filed runs never do, and
-until dispatches are accepted nothing ships in production.
+only when its `state.json` carries `dispatch_id` and `claim_epoch`, which an accepted run writes
+before its session starts; hand-filed runs never do.
 
 ### The daemon
 
@@ -64,8 +78,8 @@ macOS the agent stays stopped until `rel/install.sh` or `launchctl kickstart` st
 log names the reason. A refused websocket upgrade (HTTP 403, which carries no reason) is retried
 with a backoff, and a corrected token file is picked up on the next attempt without a restart.
 
-Until dispatch handling lands, the daemon reports `draining: true`, so the control plane never
-reserves capacity on a machine that cannot start a session.
+While `control.accepts_dispatches` is false, the daemon reports `draining: true`, so the control
+plane never reserves capacity on a machine that will not start a session.
 
 ### Troubleshooting the daemon
 
@@ -90,6 +104,8 @@ reserves capacity on a machine that cannot start a session.
   - `last_disconnect`, `connect_attempts` and `next_reconnect_ms`;
   - `last_status_rtt_ms`, `last_status_acked_at` and `status_push_pending`;
   - `dispatch_replies_pending` and `dispatch_reply_backlog` (rate-limited replies waiting);
+  - `pending_starts` (accepted, waiting for loopctl to record the accept), `runs_in_flight` (the
+    dispatch ids of runs still going) and `stage_reports_pending`;
   - `trace_acked` (the acknowledged seq per run on this channel) and `trace_push_pending`;
   - `sample_error`, `last_refusal` and `token_failures`.
 - **The pool, as loopctl sees it:** `runner_pool`. It lists joined runners only, so a runner
@@ -108,7 +124,18 @@ What the log says in each failure:
 | revoked or rejected token | `upgrade refused with HTTP 403; reconnect attempt N in Xms`, retried with backoff |
 | misconfiguration | `loopctl refused runner:<id> (<reason>)`, then `stopping with exit status 78` (0 under launchd) |
 | a metric cannot be read | `health sample omitted: cannot read <metric>`, once, until `health sample readable again` |
-| a dispatch arrives | `dispatch <id> received: this runner accepts no dispatches yet`, then `dispatch_reply sent: refused (dispatches_disabled)` and `loopctl recorded the dispatch_reply`, all with `dispatch_id`, `story_id` and `claim_epoch` |
+| a dispatch arrives | `dispatch <id> received`, then either `dispatch <id> refused (<reason>): <detail>` and `dispatch_reply sent: refused (<reason>)`, or `dispatch <id> accepted: run of story-<story_id> starts once loopctl records it` and `dispatch_reply sent: accepted`; then `loopctl recorded the dispatch_reply`, all with `dispatch_id`, `story_id` and `claim_epoch` |
+| a dispatch is refused `other` | `the dispatch carries no story`, `triage dispatches are not supported by this runner yet`, `the dispatch story <field> ...` for a malformed story, or `the dispatch does not make a runnable story: ...` |
+| a dispatch arrives again | `dispatch <id> was already accepted and started here; answering accepted again, starting nothing`; a different `claim_epoch` is refused `other` |
+| an accepted run moves | `stage report sent: claimed -> worktree`, then `loopctl recorded the stage claimed -> worktree`, and the same for `worktree -> implementing` and `-> escalated`. Reports outstanding when the channel closes are resent after the rejoin |
+| an accepted run ends | the escalation marker is the `-> escalated` report with edge `session_escalated`; its reason is `first end-to-end run: implementation finished, merging nothing by design` for a finished run, otherwise `run ended <status>; session exit reason ...; the session escalated: <text>` |
+| loopctl refuses a stage | `refused the stage <from> -> <to> for dispatch <id> as stale_stage` (or with another reason), at error level; no later stage of that run is reported (`stage <from> -> <to> not reported`) |
+| loopctl answers `internal_error` | resent with a backoff, at most 3 times, then `giving up on the stage ...`, `giving up on the dispatch_reply ...` or `giving up on this run's ... trace pushes` at error level; a trace given up this way ships again after a restart |
+| a run's task dies without reporting | `the run of dispatch <id> died: <reason>`; its `state.json` is marked `crashed` and it is reported `-> escalated` as crashed |
+| loopctl did not record an accept | `dispatch <id> accepted: run of ... starts once loopctl records it`, then either `dispatch <id> recorded as accepted: run of ... started` or `loopctl did not record this runner's accept of dispatch <id> (<reason>); its run is not started` at error level. A run starts only after loopctl records its accept |
+| the daemon restarted with runs going | runs keep going and report to the new daemon (`a run this Control did not start reported ...`), waiting up to a minute for it to register; a redelivered dispatch already bound in a `state.json` is answered `accepted` again and starts nothing |
+| the daemon restarted with work unfinished | `resending the accept of pending dispatch <id>` for each file in `runs_dir/.pending/` (an accepted dispatch whose run had not started), and `reporting the unacknowledged end of dispatch <id>'s run` for each finished run whose `state.json` lacks `terminal_reported` |
+| a later dispatch of the same story | its worktree is `.claude/worktrees/loop-story-<story_id>`, keyed on the story, so it adopts the worktree an earlier run kept |
 | a dispatch that cannot be answered | `dispatch not answered: ...`, when it has no usable `dispatch_id` and `claim_epoch` or a refusal would fail the contract |
 | loopctl refuses that reply | `loopctl refused the dispatch_reply (<reason>)`; `rate_limited` waits in the backlog, the rest are not resent |
 | the channel drops with a reply outstanding | `resending N dispatch_reply(s) loopctl had not recorded when the channel closed` after the rejoin; `no longer needs the resent dispatch_reply (<reason>)` when the claim moved on meanwhile |

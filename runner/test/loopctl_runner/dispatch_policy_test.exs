@@ -1,0 +1,179 @@
+defmodule LoopctlRunner.DispatchPolicyTest do
+  use ExUnit.Case, async: true
+
+  alias LoopctlRunner.{ControlConfig, DispatchPolicy}
+  import LoopctlRunner.TestSupport
+
+  @dispatch %{
+    "dispatch_id" => "7d0c1f6e-3b1a-4f7e-9c2d-5a6b7c8d9e0f",
+    "story_id" => "1e2d3c4b-5a69-4788-9a0b-1c2d3e4f5a6b",
+    "kind" => "implement",
+    "repo" => "mkreyman/home_care_billing",
+    "base_branch" => "master",
+    "branch" => "loop/story-1",
+    "claim_epoch" => 3,
+    "wall_clock_seconds" => 1800,
+    "max_turns" => 100,
+    "token_budget" => nil
+  }
+
+  @ready %{draining: false, in_flight: 0, free_disk_mb: &__MODULE__.plenty/1}
+
+  def plenty(_path), do: 50_000
+
+  setup do
+    root = tmp_dir!("policy")
+    base = config!(root)
+
+    control = %ControlConfig{
+      url: "wss://loopctl.example/runner/socket/websocket",
+      runner_id: "3781bee6-2b97-4df0-9664-7f01a492630f",
+      machine: "minis",
+      token_file: Path.join(root, "token"),
+      repos: ["mkreyman/home_care_billing"],
+      max_sessions: 2,
+      accepts_dispatches: true
+    }
+
+    config = %{
+      base
+      | control: control,
+        repos: %{"home_care_billing" => root},
+        branch_prefixes: ["loop/"],
+        max_wall_clock_s: 3600,
+        max_turns: 200
+    }
+
+    {:ok, config: config, root: root}
+  end
+
+  defp decide(ctx, dispatch \\ @dispatch, state \\ @ready, control \\ %{}) do
+    config = %{ctx.config | control: Map.merge(ctx.config.control, control)}
+    DispatchPolicy.decide(dispatch, config, state)
+  end
+
+  defp reason({:refuse, reason, _detail}), do: reason
+  defp reason(other), do: other
+
+  test "a dispatch inside every limit is accepted with the fields a story is built from", ctx do
+    assert {:accept, story} = decide(ctx)
+    root = ctx.root
+
+    assert %{
+             repo: "home_care_billing",
+             repo_path: ^root,
+             base: "master",
+             branch: "loop/story-1",
+             wall_clock_s: 1800,
+             max_turns: 100
+           } = story
+  end
+
+  test "nothing is accepted unless the runner is configured to accept dispatches", ctx do
+    assert reason(decide(ctx, @dispatch, @ready, %{accepts_dispatches: false})) ==
+             "dispatches_disabled"
+
+    # The default of a config that never mentions it.
+    assert %ControlConfig{accepts_dispatches: false} = struct(ControlConfig, [])
+  end
+
+  test "draining and capacity come before anything about the dispatch itself", ctx do
+    bad_repo = %{@dispatch | "repo" => "someone/else"}
+    assert reason(decide(ctx, bad_repo, %{@ready | draining: true})) == "draining"
+    assert reason(decide(ctx, bad_repo, %{@ready | in_flight: 2})) == "at_capacity"
+    assert reason(decide(ctx, @dispatch, %{@ready | in_flight: 1})) != "at_capacity"
+  end
+
+  test "too little free disk, or none measured, is refused", ctx do
+    assert reason(decide(ctx, @dispatch, %{@ready | free_disk_mb: fn _ -> 100 end})) ==
+             "insufficient_disk"
+
+    assert reason(decide(ctx, @dispatch, %{@ready | free_disk_mb: fn _ -> nil end})) ==
+             "insufficient_disk"
+  end
+
+  test "the repo checkout's volume is checked, not only the runs directory's", ctx do
+    repo_path = ctx.root
+    test = self()
+
+    low_on_repo = fn
+      ^repo_path -> 100
+      path -> send(test, {:checked, path}) && 50_000
+    end
+
+    assert {:refuse, "insufficient_disk", detail} =
+             decide(ctx, @dispatch, %{@ready | free_disk_mb: low_on_repo})
+
+    assert detail =~ "under #{repo_path}"
+    runs_dir = ctx.config.runs_dir
+    assert_received {:checked, ^runs_dir}
+
+    # The runs directory's volume can refuse on its own too.
+    low_on_runs = fn
+      ^runs_dir -> nil
+      _ -> 50_000
+    end
+
+    assert reason(decide(ctx, @dispatch, %{@ready | free_disk_mb: low_on_runs})) ==
+             "insufficient_disk"
+  end
+
+  test "a repo must be allowed by control.repos and have a local checkout", ctx do
+    assert reason(decide(ctx, %{@dispatch | "repo" => "someone/else"})) == "repo_not_allowed"
+
+    unmapped = %{ctx | config: %{ctx.config | repos: %{"other" => ctx.root}}}
+    assert reason(decide(unmapped)) == "repo_not_allowed"
+    assert reason(decide(ctx, Map.delete(@dispatch, "repo"))) == "repo_not_allowed"
+  end
+
+  test "the branch must carry an allowed prefix, and both refs be plain ref names", ctx do
+    assert reason(decide(ctx, %{@dispatch | "branch" => "master"})) == "branch_not_allowed"
+
+    assert reason(decide(ctx, %{@dispatch | "branch" => "loop/../master"})) ==
+             "branch_not_allowed"
+
+    assert reason(decide(ctx, %{@dispatch | "base_branch" => "-x"})) == "branch_not_allowed"
+  end
+
+  test "wall clock and turns over this runner's own limits are refused", ctx do
+    assert reason(decide(ctx, %{@dispatch | "wall_clock_seconds" => 3601})) ==
+             "wall_clock_exceeds_limit"
+
+    assert reason(decide(ctx, %{@dispatch | "max_turns" => 201})) == "max_turns_exceeds_limit"
+
+    assert {:accept, _} =
+             decide(ctx, %{@dispatch | "wall_clock_seconds" => 3600, "max_turns" => 200})
+  end
+
+  test "a configured token budget refuses a larger budget and a dispatch with none", ctx do
+    limited = %{max_token_budget: 1_000_000}
+    assert {:accept, _} = decide(ctx, %{@dispatch | "token_budget" => 500_000}, @ready, limited)
+
+    assert reason(decide(ctx, %{@dispatch | "token_budget" => 2_000_000}, @ready, limited)) ==
+             "token_budget_exceeds_limit"
+
+    assert reason(decide(ctx, @dispatch, @ready, limited)) == "token_budget_exceeds_limit"
+    # With no limit configured, a dispatch without a budget is fine.
+    assert {:accept, _} = decide(ctx)
+  end
+
+  test "the config reads accepts_dispatches as a strict boolean, false when absent" do
+    base = %{
+      "url" => "wss://loopctl.example/runner/socket/websocket",
+      "runner_id" => "3781bee6-2b97-4df0-9664-7f01a492630f",
+      "machine" => "minis",
+      "token_file" => "/tmp/token",
+      "repos" => ["mkreyman/home_care_billing"],
+      "max_sessions" => 1
+    }
+
+    assert {:ok, %ControlConfig{accepts_dispatches: false, max_token_budget: nil}} =
+             ControlConfig.from_map(base)
+
+    assert {:ok, %ControlConfig{accepts_dispatches: true}} =
+             ControlConfig.from_map(Map.put(base, "accepts_dispatches", true))
+
+    assert {:error, _} = ControlConfig.from_map(Map.put(base, "accepts_dispatches", "yes"))
+    assert {:error, _} = ControlConfig.from_map(Map.put(base, "max_token_budget", 0))
+  end
+end

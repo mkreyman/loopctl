@@ -37,7 +37,10 @@ defmodule LoopctlRunner.TestLoopctl do
       trace_replies: [],
       # run_id => a refusal returned for every trace batch of that run
       trace_refuse_runs: %{},
-      last_trace_ms: %{}
+      last_trace_ms: %{},
+      # Replies to stage pushes, oldest first: :ok (validate and ack), :none for a push left
+      # unanswered, or {:error, reason_map}; once used up every stage is acknowledged.
+      stage_replies: []
     }
 
     case Agent.start(fn -> state end, name: __MODULE__) do
@@ -70,6 +73,13 @@ defmodule LoopctlRunner.TestLoopctl do
 
       state ->
         {:ok, state}
+    end)
+  end
+
+  def next_stage_reply do
+    Agent.get_and_update(__MODULE__, fn
+      %{stage_replies: [reply | rest]} = state -> {reply, %{state | stage_replies: rest}}
+      state -> {:ok, state}
     end)
   end
 
@@ -147,7 +157,7 @@ defmodule LoopctlRunner.TestLoopctl do
       end
     end
 
-    defp scripted_reply(:ok, socket), do: {:ok, %{contract_version: "1.2.0"}, socket}
+    defp scripted_reply(:ok, socket), do: {:ok, %{contract_version: "1.4.0"}, socket}
 
     # What loopctl does on not_authorized: refuse, then close the socket.
     defp scripted_reply(:not_authorized_disconnect, _socket) do
@@ -221,6 +231,23 @@ defmodule LoopctlRunner.TestLoopctl do
 
             {false, {:error, reply}} ->
               {:reply, {:error, reply}, socket}
+          end
+
+        {:error, details} ->
+          {:reply, {:error, %{reason: "invalid_payload", details: details}}, socket}
+      end
+    end
+
+    # loopctl's compare-and-set on the story's stage row is not modelled: the reply is scripted.
+    def handle_in("stage", payload, socket) do
+      TestLoopctl.notify({:stage, payload})
+
+      case Contract.validate("RunnerStageReport", payload) do
+        :ok ->
+          case TestLoopctl.next_stage_reply() do
+            :ok -> {:reply, {:ok, %{stage: payload["to"]}}, socket}
+            :none -> {:noreply, socket}
+            {:error, reply} -> {:reply, {:error, reply}, socket}
           end
 
         {:error, details} ->

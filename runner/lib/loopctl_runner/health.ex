@@ -139,7 +139,13 @@ defmodule LoopctlRunner.Health do
     end
   end
 
-  defp free_disk_mb(path) do
+  @doc """
+  Free disk in MB on the filesystem holding `path`, or `:error` when it cannot be read. Read on
+  its own for the dispatch policy: a sample fails at its first unreadable metric, and an
+  unreadable load average must not make every dispatch look short of disk.
+  """
+  @spec free_disk_mb(String.t()) :: {:ok, non_neg_integer()} | :error
+  def free_disk_mb(path) do
     # POSIX `df -Pk`: header, then "fs 1024-blocks used available capacity mount".
     with {:ok, out} <- cmd("df", ["-Pk", existing_ancestor(path)]),
          [_header, row | _] <- String.split(out, "\n", trim: true),

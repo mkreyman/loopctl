@@ -303,7 +303,13 @@ defmodule LoopctlRunner.ControlConfigTest do
       :logger.update_primary_config(%{metadata: before})
     end)
 
-    assert [{LoopctlRunner.Control, _}] = LoopctlRunner.Application.daemon_children!()
+    # The run supervisor starts first, so it exists whenever Control accepts a dispatch.
+    assert [
+             {Task.Supervisor, [name: LoopctlRunner.RunSupervisor]},
+             {LoopctlRunner.Control, control_opts}
+           ] = LoopctlRunner.Application.daemon_children!()
+
+    assert control_opts[:run_supervisor] == LoopctlRunner.RunSupervisor
 
     assert %{metadata: %{runner_id: "3781bee6-2b97-4df0-9664-7f01a492630f"}} =
              :logger.get_primary_config()

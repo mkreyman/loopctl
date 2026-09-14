@@ -39,8 +39,61 @@ defmodule LoopctlRunner.Run do
           error: String.t() | nil
         }
 
+  @typedoc """
+  What `:on_stage` is called with, in this order: `{:started, %{run_id, run_dir}}` once
+  `state.json` exists; `{:worktree, %{branch, worktree_path}}` once the worktree exists;
+  `{:implementing, %{}}` as the session starts; and `{:finished, summary}` however the run ends
+  (a raise included, just before it is re-raised), whose summary names the stage the run
+  `reached`. A run that never gets a worktree goes from `:started` straight to `:finished`.
+  """
+  @type stage_event ::
+          {:started, %{run_id: String.t(), run_dir: String.t()}}
+          | {:worktree, %{branch: String.t(), worktree_path: String.t()}}
+          | {:implementing, map()}
+          | {:finished, map()}
+
+  @doc """
+  Runs the story to the end and returns its result.
+
+  Options: `:env` (extra session environment), `:keep_worktree`, `:binding` (a map written into
+  the initial `state.json` before anything else happens, e.g. the dispatch this run serves), and
+  `:on_stage` (a one-argument function called with each `t:stage_event/0`).
+  """
+  @summary_key {__MODULE__, :finished_summary}
+
   @spec execute(Config.t(), Story.t(), keyword()) :: result()
   def execute(%Config{} = config, %Story{} = story, opts \\ []) do
+    # `:finished` goes out from ONE place, the `after`, so it is sent exactly once however the run
+    # ends: a return, a raise, an exit or a throw, inside the worktree step or after it. The
+    # summary it carries is left in the process dictionary by whichever path ended the run.
+    Process.delete(@summary_key)
+
+    try do
+      run(config, story, opts)
+    catch
+      kind, reason ->
+        Process.put(@summary_key, crash_summary(kind, reason))
+        :erlang.raise(kind, reason, __STACKTRACE__)
+    after
+      stage(
+        opts,
+        {:finished,
+         Process.delete(@summary_key) ||
+           %{status: "crashed", error: "the run ended without a summary", escalations: []}}
+      )
+    end
+  end
+
+  # The kind is what a reader needs first: an exit or a throw has no exception message.
+  defp crash_summary(kind, reason) do
+    %{
+      status: "crashed",
+      error: "#{kind}: " <> String.slice(Exception.format_banner(kind, reason), 0, 500),
+      escalations: []
+    }
+  end
+
+  defp run(config, story, opts) do
     reaped = Reaper.reap(config.runs_dir, config.kill_grace_s * 1000)
     # The contract identifies a run by UUID; the directory keeps a name a person can find.
     run_id = Session.uuid4()
@@ -60,25 +113,30 @@ defmodule LoopctlRunner.Run do
         "reaped_before_start" => length(reaped)
       })
 
+    # The binding is in the first write, before any side effect: a run whose dispatch is not
+    # recorded beside it could never ship its trace.
     RunState.update(
       run_dir,
-      Map.merge(Owner.current(), %{
+      Map.merge(Keyword.get(opts, :binding, %{}), %{
         "run_id" => run_id,
         "run_seq" => run_seq,
         "status" => "starting",
         "repo_path" => story.repo_path
       })
+      |> Map.merge(Owner.current())
     )
+
+    stage(opts, {:started, %{run_id: run_id, run_dir: run_dir}})
 
     result =
       try do
         with_worktree(config, story, run_dir, trace, run_seq, run_id, opts)
-      rescue
-        # A raise must not leave the run recorded in flight. The worktree lock is already
+      catch
+        # Any way out must not leave the run recorded in flight. The worktree lock is already
         # released by the `after` in with_worktree.
-        exception ->
-          record_crash(run_dir, trace, run_seq, exception)
-          reraise exception, __STACKTRACE__
+        kind, reason ->
+          record_crash(run_dir, trace, run_seq, Exception.format_banner(kind, reason))
+          :erlang.raise(kind, reason, __STACKTRACE__)
       end
 
     Trace.emit(trace, "run.finished", run_seq, %{
@@ -86,18 +144,60 @@ defmodule LoopctlRunner.Run do
       "error" => result.error
     })
 
+    summary = summary(result, run_dir)
+
+    # `reached` is recorded so a Control that did not see the run end can still report its
+    # terminal stage from the right place.
     RunState.update(run_dir, %{
       status: result.status,
+      reached: summary.reached,
       finished_at: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()
     })
 
     Trace.close(trace)
+    Process.put(@summary_key, summary)
     Map.merge(result, %{run_id: run_id, run_dir: run_dir})
   end
 
+  defp stage(opts, event) do
+    case Keyword.get(opts, :on_stage) do
+      nil -> :ok
+      on_stage -> on_stage.(event)
+    end
+  end
+
+  # What the run's end is reported as: its status, why the session ended, and the session's own
+  # escalation text, which is untrusted data and only ever recorded.
+  defp summary(result, run_dir) do
+    %{
+      status: result.status,
+      error: result.error,
+      exit_reason: result.session && Atom.to_string(result.session.reason),
+      exit_status: result.session && result.session.exit_status,
+      escalations: escalations(run_dir),
+      # The last stage the run reached: a run that got no worktree never started a session.
+      reached: if(result.teardown, do: "implementing", else: "claimed")
+    }
+  end
+
+  @doc false
+  @spec escalations(String.t()) :: [String.t()]
+  def escalations(run_dir) do
+    case File.read(Path.join(run_dir, "escalations.ndjson")) do
+      {:ok, raw} ->
+        for line <- String.split(raw, "\n", trim: true),
+            {:ok, %{"reason" => reason}} <- [JSON.decode(line)],
+            is_binary(reason),
+            do: reason
+
+      {:error, _} ->
+        []
+    end
+  end
+
   # Best effort: whatever raised may be the run directory itself going away.
-  defp record_crash(run_dir, trace, run_seq, exception) do
-    Trace.emit(trace, "run.crashed", run_seq, %{"error" => Exception.message(exception)})
+  defp record_crash(run_dir, trace, run_seq, error) do
+    Trace.emit(trace, "run.crashed", run_seq, %{"error" => error})
     RunState.update(run_dir, %{status: "crashed"})
     Trace.close(trace)
   rescue
@@ -138,6 +238,7 @@ defmodule LoopctlRunner.Run do
           "reused" => created.reused
         })
 
+        stage(opts, {:worktree, %{branch: story.branch, worktree_path: path}})
         run_session(config, story, run_dir, trace, run_seq, path, opts)
 
       {:error, reason} ->
@@ -149,6 +250,8 @@ defmodule LoopctlRunner.Run do
   defp run_session(config, story, run_dir, trace, run_seq, path, opts) do
     # Teardown runs even when the session monitor crashes. A BEAM that dies outright
     # never gets here: that is the launcher watchdog's job, then the reaper's.
+    stage(opts, {:implementing, %{}})
+
     {session, error} =
       try do
         {Session.run(

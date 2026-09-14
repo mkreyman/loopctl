@@ -7,9 +7,18 @@ defmodule LoopctlRunner.Runs do
 
   @doc "Runs in flight on a live BEAM on this machine — the join's and status's `in_flight`."
   @spec in_flight(String.t()) :: non_neg_integer()
-  def in_flight(runs_dir) do
+  def in_flight(runs_dir), do: in_flight(runs_dir, MapSet.new())
+
+  @doc """
+  Like `in_flight/1`, but not counting runs bound to any of `dispatch_ids`: the control client
+  counts the runs it started itself from the moment it accepts them, before their `state.json`
+  exists, and must not count them twice once it does.
+  """
+  @spec in_flight(String.t(), MapSet.t(String.t())) :: non_neg_integer()
+  def in_flight(runs_dir, dispatch_ids) do
     Enum.count(RunState.all(runs_dir), fn {_dir, state} ->
-      state["status"] in @in_flight and Owner.alive?(state)
+      state["status"] in @in_flight and not MapSet.member?(dispatch_ids, state["dispatch_id"]) and
+        Owner.alive?(state)
     end)
   end
 

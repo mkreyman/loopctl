@@ -292,6 +292,60 @@ defmodule LoopctlRunner.RunTest do
     assert "worktree.kept" in types(events!(result))
   end
 
+  test "a later dispatch of the same story adopts the worktree the earlier run kept", %{
+    root: root,
+    state: state
+  } do
+    alias LoopctlRunner.{DispatchRun, Worktree}
+
+    restore = fake_env!(state, [{"FAKE_CLAUDE_MODE", "write_file"}])
+    config = config!(root)
+    story_id = LoopctlRunner.Session.uuid4()
+
+    fields = %{
+      repo: "fixture",
+      repo_path: Path.join(root, "repo"),
+      base: "master",
+      branch: "loop/s1",
+      wall_clock_s: 30,
+      max_turns: 5
+    }
+
+    stories =
+      for _ <- 1..2 do
+        dispatch = %{
+          "dispatch_id" => LoopctlRunner.Session.uuid4(),
+          "story_id" => story_id,
+          "repo" => "mkreyman/fixture"
+        }
+
+        {:ok, story} =
+          DispatchRun.story(dispatch, fields, %{"id" => story_id, "title" => "t"}, config)
+
+        story
+      end
+
+    [first, second] = stories
+    assert first.id == second.id
+    assert first.id == "story-" <> story_id
+
+    assert Worktree.path_for(first.repo_path, first.id) ==
+             Worktree.path_for(second.repo_path, second.id)
+
+    try do
+      earlier = Run.execute(config, first)
+      assert {:kept, _} = earlier.teardown.worktree
+
+      later = Run.execute(config, second)
+      assert later.status == "succeeded"
+
+      assert [%{"data" => %{"reused" => true}}] =
+               Enum.filter(events!(later), &(&1["type"] == "worktree.created"))
+    after
+      restore.()
+    end
+  end
+
   test "a re-run adopting a worktree takes it over in the registry", %{root: root, state: state} do
     first = run!(root, state, [{"FAKE_CLAUDE_MODE", "write_file"}])
     assert {:ok, %{"worktree" => %{"status" => "kept"}}} = RunState.read(first.run_dir)
@@ -361,6 +415,30 @@ defmodule LoopctlRunner.RunTest do
     after
       restore.()
     end
+  end
+
+  test "a run that ends by exit still reports :finished, exactly once", %{
+    root: root,
+    state: state
+  } do
+    restore = fake_env!(state, [{"FAKE_CLAUDE_MODE", "stream"}])
+    config = config!(root)
+    {:ok, story} = Story.from_map(story_map(), config)
+    test = self()
+
+    on_stage = fn
+      {:worktree, _} -> exit(:boom)
+      event -> send(test, {:stage, event})
+    end
+
+    try do
+      assert catch_exit(Run.execute(config, story, on_stage: on_stage)) == :boom
+    after
+      restore.()
+    end
+
+    assert_received {:stage, {:finished, %{status: "crashed", error: "exit: " <> _}}}
+    refute_received {:stage, {:finished, _}}
   end
 
   test "a raise inside a run frees the worktree lock", %{root: root, state: state} do

@@ -71,7 +71,13 @@ defmodule LoopctlRunner.Application do
         # Primary metadata, so every process's lines carry the runner id, supervisor reports
         # about Control included. Lines logged before the config loads cannot.
         :logger.update_primary_config(%{metadata: %{runner_id: config.control.runner_id}})
-        [{Control, config: config, name: Control}]
+        # Accepted runs live under their own supervisor, started before Control so it exists
+        # whenever a dispatch is accepted. A run is a synchronous Run.execute in a task: Control
+        # is never blocked by one, and a Control restart does not take running sessions down.
+        [
+          {Task.Supervisor, name: LoopctlRunner.RunSupervisor},
+          {Control, config: config, name: Control, run_supervisor: LoopctlRunner.RunSupervisor}
+        ]
 
       {:error, reason} ->
         raise "refusing to start the runner daemon: #{reason}"

@@ -9,8 +9,14 @@ defmodule LoopctlRunner.ControlConfig do
         "token_file": "~/.config/loopctl-runner/token",
         "repos": ["mkreyman/home_care_billing"],
         "max_sessions": 2,
-        "status_interval_s": 30
+        "status_interval_s": 30,
+        "accepts_dispatches": false,
+        "min_free_disk_mb": 10240,
+        "max_token_budget": null
       }
+
+  `accepts_dispatches` is false unless set: until then every dispatch is refused
+  `dispatches_disabled` whatever else is configured (`LoopctlRunner.DispatchPolicy`).
 
   Fails closed like the rest of the config. Three rules carry the security weight:
 
@@ -29,7 +35,10 @@ defmodule LoopctlRunner.ControlConfig do
     :token_file,
     :repos,
     :max_sessions,
-    status_interval_s: 30
+    status_interval_s: 30,
+    accepts_dispatches: false,
+    min_free_disk_mb: 10_240,
+    max_token_budget: nil
   ]
 
   @type t :: %__MODULE__{
@@ -39,7 +48,10 @@ defmodule LoopctlRunner.ControlConfig do
           token_file: String.t(),
           repos: [String.t()],
           max_sessions: non_neg_integer(),
-          status_interval_s: pos_integer()
+          status_interval_s: pos_integer(),
+          accepts_dispatches: boolean(),
+          min_free_disk_mb: non_neg_integer(),
+          max_token_budget: pos_integer() | nil
         }
 
   @uuid ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/
@@ -57,7 +69,11 @@ defmodule LoopctlRunner.ControlConfig do
          {:ok, repos} <- repos(map["repos"]),
          {:ok, max_sessions} <- int(map, "max_sessions", 0, 64),
          {:ok, interval} <-
-           int(Map.put_new(map, "status_interval_s", 30), "status_interval_s", 5, 3600) do
+           int(Map.put_new(map, "status_interval_s", 30), "status_interval_s", 5, 3600),
+         {:ok, accepts} <- accepts_dispatches(map),
+         {:ok, min_disk} <-
+           int(Map.put_new(map, "min_free_disk_mb", 10_240), "min_free_disk_mb", 0, 10_000_000),
+         {:ok, max_budget} <- max_token_budget(map) do
       {:ok,
        %__MODULE__{
          url: url,
@@ -66,12 +82,32 @@ defmodule LoopctlRunner.ControlConfig do
          token_file: token_file,
          repos: repos,
          max_sessions: max_sessions,
-         status_interval_s: interval
+         status_interval_s: interval,
+         accepts_dispatches: accepts,
+         min_free_disk_mb: min_disk,
+         max_token_budget: max_budget
        }}
     end
   end
 
   def from_map(_), do: {:error, "config control must be an object"}
+
+  # Only a literal true opens the runner to dispatches; anything else but absence is a
+  # malformed config, refused rather than read as false.
+  defp accepts_dispatches(map) do
+    case Map.get(map, "accepts_dispatches", false) do
+      value when is_boolean(value) -> {:ok, value}
+      _ -> {:error, "config control.accepts_dispatches must be true or false"}
+    end
+  end
+
+  defp max_token_budget(map) do
+    case Map.get(map, "max_token_budget") do
+      nil -> {:ok, nil}
+      value when is_integer(value) and value >= 1 -> {:ok, value}
+      _ -> {:error, "config control.max_token_budget must be a positive integer or null"}
+    end
+  end
 
   @doc """
   Reads the token, refusing a file any other user can read: the token lets whoever holds
