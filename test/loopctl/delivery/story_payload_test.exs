@@ -194,6 +194,12 @@ defmodule Loopctl.Delivery.StoryPayloadTest do
       # story — logged a warning, and the strictly worse one, neither dispatchable nor
       # parked, logged nothing at all. Captured at `:error` alone, so the assertion is about
       # the LEVEL and not the wording.
+      #
+      # The quiet half is asserted as the ABSENCE OF THIS STORY'S LINE, never as an empty
+      # buffer. `capture_log` installs a PROCESS-GLOBAL handler, so under `async: true` a
+      # sibling test's worker — `ChannelPostRescanWorker` was the one that caught us — writes
+      # its own `[error]` lines into this buffer, and `== ""` then fails for a reason that has
+      # nothing to do with the subject. Scoping to the marker asserts what this test means.
       parked = staged(long_story_attrs())
 
       quiet =
@@ -202,7 +208,12 @@ defmodule Loopctl.Delivery.StoryPayloadTest do
                    StoryPayload.build(parked.tenant_id, parked.id, opts())
         end)
 
-      assert quiet == ""
+      refute quiet =~ parked.id
+      refute quiet =~ parked.tenant_id
+      # Defence in depth only, and NOT an independent assertion: the marker exists at one
+      # site and that same message interpolates the story id, so nothing can redden this
+      # line alone. It is here against a future edit that drops the raw id from it.
+      refute quiet =~ "NOT ESCALATED"
 
       stranded = staged(long_story_attrs(), :done)
 
@@ -218,8 +229,9 @@ defmodule Loopctl.Delivery.StoryPayloadTest do
 
     test "another writer parking the story first is the ok outcome, not the loudest error" do
       # Whoever parked it, the story is where this call wanted it, so the caller gets the
-      # ordinary refusal and NOTHING is logged at error — the level reserved for a story that
-      # is neither dispatchable nor parked.
+      # ordinary refusal and THIS STORY produces no error line — the level reserved for a
+      # story that is neither dispatchable nor parked. Scoped to the marker rather than
+      # asserted as an empty buffer, for the reason given on the test above.
       story = staged(long_story_attrs())
 
       {:ok, _row} =
@@ -236,7 +248,9 @@ defmodule Loopctl.Delivery.StoryPayloadTest do
                    StoryPayload.build(story.tenant_id, story.id, opts())
         end)
 
-      assert log == ""
+      refute log =~ story.id
+      refute log =~ story.tenant_id
+      refute log =~ "NOT ESCALATED"
 
       row = Stages.get(story.tenant_id, story.id)
       assert row.stage == :escalated
