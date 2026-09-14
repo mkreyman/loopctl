@@ -71,6 +71,7 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDrift do
 
   use Mix.Task
 
+  alias Loopctl.DeliveryGates.GitEnv
   alias Loopctl.DeliveryGates.Measurement.Report
   alias Loopctl.DeliveryGates.TriggerDrift
   alias Loopctl.DeliveryGates.Triggers
@@ -235,54 +236,21 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDrift do
     end
   end
 
-  # Every variable here redirects repository DISCOVERY, and git exports them to hooks — so a
-  # `git` spawned from anything running under the quality gate inherits the repository being
-  # committed to, whatever `-C` says.
-  @discovery_overrides ~w(
-    GIT_DIR
-    GIT_WORK_TREE
-    GIT_COMMON_DIR
-    GIT_INDEX_FILE
-    GIT_OBJECT_DIRECTORY
-    GIT_ALTERNATE_OBJECT_DIRECTORIES
-    GIT_NAMESPACE
-    GIT_PREFIX
-    GIT_CEILING_DIRECTORIES
-  )
-
   @doc """
-  The environment every git invocation is spawned with: discovery overrides cleared, and the
-  user's global and system configuration taken out of the picture.
+  The environment every git invocation is spawned with.
 
-  Both halves matter and they fail differently. The DISCOVERY half decides which repository
-  git operates on at all. The CONFIG half decides how it behaves once it is there — a global
-  `core.quotePath` changes the shape of the paths this task matches patterns against, and a
-  global `core.hooksPath` means a freshly initialised throwaway repository still runs the
-  machine's real pre-commit hook on commit.
-
-  Public because this repository must hold exactly ONE answer to "how do I spawn git safely".
-  It held two — this list and a longer-but-differently-wrong one in
-  `test/loopctl/delivery_gates/diff_names_test.exs`, neither a superset of the other — which is
-  the same defect as two copies of a redaction rule, in a place where the failure is silent.
+  Delegates to `Loopctl.DeliveryGates.GitEnv`, which is the one answer in this repository to how
+  git is spawned — a Mix task must depend on lib and never the reverse, so the list lives there
+  and this is the task's name for it. Public so a test's git calls use exactly the same set.
   """
   @spec git_env() :: [{String.t(), String.t() | nil}]
-  def git_env do
-    for(name <- @discovery_overrides, do: {name, nil}) ++
-      [{"GIT_CONFIG_GLOBAL", "/dev/null"}, {"GIT_CONFIG_NOSYSTEM", "1"}]
-  end
+  defdelegate git_env(), to: GitEnv, as: :spawn_env
 
   @doc """
   Command-line `-c` overrides for a git invocation that may WRITE.
-
-  Belt and braces over `git_env/0`'s config isolation: `GIT_CONFIG_GLOBAL=/dev/null` already
-  hides a global `core.hooksPath`, and this says so on the command line where it is visible in
-  a failure. A throwaway fixture repository running the machine's real quality gate on every
-  commit passes only for as long as that gate finds nothing to check — stage a `mix.exs`, which
-  is a perfectly natural trigger pattern to test, and it goes red with nothing but git's exit
-  status to explain it.
   """
   @spec git_config_args() :: [String.t()]
-  def git_config_args, do: ["-c", "core.hooksPath=/dev/null"]
+  defdelegate git_config_args(), to: GitEnv, as: :config_args
 
   @doc """
   The checksum `Loopctl.DeliveryGates.Triggers.parse/2` is verified against.
