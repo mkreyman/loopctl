@@ -68,6 +68,13 @@ defmodule Loopctl.Delivery.Placement do
   `Loopctl.Workers.ReclaimExpiredClaimsWorker` skips them — so a claim left standing there
   would never be reclaimed.
 
+  And it is bound the same way, by a SECOND guard for the same reason: this module is the first
+  custody-progressing entry point with no route at all, and `custody_surface_test.exs` proves
+  its half by walking `LoopctlWeb.Router.__routes__/0`, which cannot see a context function an
+  Oban worker calls. `Loopctl.Custody.ContextSurface.halt_enforcing_contexts/0` names this
+  module and `test/loopctl/custody/context_surface_test.exs` scans `lib/loopctl/**` for the
+  call, in both directions.
+
   ## The credential the session dispatch mints does NOT reach the session
 
   `Loopctl.Dispatches.create_dispatch/3` mints an ephemeral key with every dispatch, and the
