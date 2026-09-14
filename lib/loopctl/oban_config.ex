@@ -645,6 +645,15 @@ defmodule Loopctl.ObanConfig do
            # assertion in oban_plugins_config_test.exs.
            {"*/2 * * * *", Loopctl.Workers.IntakeIssueCloseWorker},
            {"* * * * *", Loopctl.Workers.SystemConfigRefreshWorker},
+           # #803 §11: retention for the delivery loop's two unbounded high-volume tables,
+           # `runner_trace_events` and `intake_deliveries`. Nothing else deletes from either.
+           # HOURLY rather than daily, and bounded per tenant per table: the trace table takes
+           # a row per line of every run's NDJSON, so a daily run large enough to keep up with
+           # a busy fleet is also a run large enough to matter to the database, while twenty-
+           # four bounded ones are not. Past twenty minutes of the hour so it does not start
+           # alongside the on-the-hour cleanups. Keep in sync with the crontab assertion in
+           # oban_plugins_config_test.exs.
+           {"20 * * * *", Loopctl.Workers.DeliveryLoopPruneWorker},
            # US-41.1 (review): the STANDING embedding-side-table reconciliation pass —
            # sweeps the dual-write crash window (legacy row without its dim-1536 mirror)
            # AND the active-dimension gap a writer racing complete_reembed's sweep can

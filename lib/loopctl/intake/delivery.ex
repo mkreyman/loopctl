@@ -10,6 +10,11 @@ defmodule Loopctl.Intake.Delivery do
 
   `payload_sha256` is the digest of the exact bytes the signature covered. No payload
   text is stored here.
+
+  Rows are deleted past a tenant's window by `Loopctl.Workers.DeliveryLoopPruneWorker`,
+  through `Loopctl.Intake.prune_deliveries/3` — never inside GitHub's redelivery window, and
+  never a row an `intake_records.last_delivery_id` still names. See "Retention" in
+  `Loopctl.Intake`.
   """
 
   use Loopctl.Schema

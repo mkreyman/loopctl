@@ -23,6 +23,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.ContextRetriever.Entity
   alias Loopctl.Coordination.ChannelClaim
   alias Loopctl.Delivery.StoryStage
+  alias Loopctl.Intake.Delivery, as: IntakeDelivery
   alias Loopctl.Intake.IssueClosure
   alias Loopctl.Intake.Record, as: IntakeRecord
   alias Loopctl.Intake.Source, as: IntakeSource
@@ -46,6 +47,7 @@ defmodule Loopctl.Fixtures do
   alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Runners.Runner
+  alias Loopctl.Runners.TraceEvent
   alias Loopctl.Skills.Skill
   alias Loopctl.Skills.SkillResult
   alias Loopctl.Skills.SkillVersion
@@ -899,9 +901,10 @@ defmodule Loopctl.Fixtures do
         tenant
       end
 
-    # US-26.7.1: trust_tier is excluded from create_changeset's cast (never
-    # settable from a public changeset) — set it programmatically here,
-    # mirroring the audit_signing_public_key post-insert pattern above.
+    # `:settings` needs nothing here — `Tenant.create_changeset/2` casts it, so
+    # `fixture(:tenant, %{settings: %{...}})` already persists. (`signup_changeset/2` and
+    # `self_signup_changeset/2` are the ones that PUT an empty map; they are a different
+    # surface and not what this fixture calls.)
     tenant
     |> Ecto.Changeset.change(trust_tier: trust_tier)
     |> AdminRepo.update!()
@@ -2193,6 +2196,96 @@ defmodule Loopctl.Fixtures do
           tenant |> Ecto.Changeset.change(trust_tier: tier) |> AdminRepo.update!()
       end
     end)
+  end
+
+  # One stored trace event of a run, on the RLS `Loopctl.Repo` connection, inserted DIRECTLY
+  # so a test can place it at an arbitrary AGE (#803 retention). The production writer
+  # (`DispatchLedger.record_trace/3`) always stamps `inserted_at` as now, and age is exactly
+  # what `Loopctl.Workers.DeliveryLoopPruneWorker` selects on. Pass the `:dispatch` record it
+  # belongs to; `:seq` and `:inserted_at` default to a fresh sequence and now.
+  def fixture(:trace_event, attrs) do
+    attrs = Enum.into(attrs, %{})
+    dispatch = Map.fetch!(attrs, :dispatch)
+    at = Map.get(attrs, :inserted_at, DateTime.utc_now())
+    seq = Map.get(attrs, :seq, System.unique_integer([:positive]))
+
+    {:ok, event} =
+      Loopctl.Repo.with_tenant(dispatch.tenant_id, fn ->
+        Loopctl.Repo.insert!(%TraceEvent{
+          tenant_id: dispatch.tenant_id,
+          runner_dispatch_id: dispatch.id,
+          run_id: dispatch.run_id || dispatch.dispatch_id,
+          seq: seq,
+          event_id: "evt-#{seq}",
+          ts: at,
+          type: "tool_use",
+          data: %{},
+          inserted_at: at
+        })
+      end)
+
+    event
+  end
+
+  # One accepted GitHub webhook delivery row (#803), inserted DIRECTLY so a test can place it
+  # at an arbitrary AGE — the same reason as `:trace_event` above. On `AdminRepo`, which is
+  # where `Loopctl.Intake` reads and writes. Pass the `:source`; `:github_delivery_id` defaults
+  # to a fresh one, so two calls are two distinct deliveries rather than a replay.
+  def fixture(:intake_delivery, attrs) do
+    attrs = Enum.into(attrs, %{})
+    source = Map.fetch!(attrs, :source)
+    at = Map.get(attrs, :inserted_at, DateTime.utc_now())
+    delivery_id = Map.get(attrs, :github_delivery_id, "dl-#{System.unique_integer([:positive])}")
+
+    row = %{
+      id: Ecto.UUID.generate(),
+      tenant_id: source.tenant_id,
+      source_id: source.id,
+      github_delivery_id: delivery_id,
+      event: Map.get(attrs, :event, "issues"),
+      action: Map.get(attrs, :action, "opened"),
+      outcome: Map.get(attrs, :outcome, "recorded"),
+      issue_number: Map.get(attrs, :issue_number, 1),
+      payload_sha256: :sha256 |> :crypto.hash(delivery_id) |> Base.encode16(case: :lower),
+      inserted_at: at,
+      updated_at: at
+    }
+
+    {1, [delivery]} = AdminRepo.insert_all(IntakeDelivery, [row], returning: true)
+    delivery
+  end
+
+  # `count` delivery rows of one source in ONE insert, all at the same age. For the retention
+  # tests that have to cross a production BUDGET (2,000): one at a time is 2,000 round trips,
+  # and the budget is exactly what those tests are about.
+  def fixture(:intake_deliveries, attrs) do
+    attrs = Enum.into(attrs, %{})
+    source = Map.fetch!(attrs, :source)
+    count = Map.fetch!(attrs, :count)
+    at = Map.get(attrs, :inserted_at, DateTime.utc_now())
+    prefix = Map.get(attrs, :prefix, "bulk")
+
+    rows =
+      for n <- 1..count do
+        delivery_id = "#{prefix}-#{n}-#{System.unique_integer([:positive])}"
+
+        %{
+          id: Ecto.UUID.generate(),
+          tenant_id: source.tenant_id,
+          source_id: source.id,
+          github_delivery_id: delivery_id,
+          event: "issues",
+          action: "opened",
+          outcome: "recorded",
+          issue_number: n,
+          payload_sha256: :sha256 |> :crypto.hash(delivery_id) |> Base.encode16(case: :lower),
+          inserted_at: at,
+          updated_at: at
+        }
+      end
+
+    {^count, _} = AdminRepo.insert_all(IntakeDelivery, rows)
+    count
   end
 
   # A GitHub intake source (issue #803). Returns `{webhook_secret, source}` so a test can
