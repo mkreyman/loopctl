@@ -544,13 +544,17 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDriftTest do
         "check_drift_#{System.unique_integer([:positive, :monotonic])}_#{:erlang.phash2(self())}"
       )
 
+    # Measure 3, checked rather than assumed.
+    outside_project!(dir)
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf(dir) end)
     dir
   end
 
-  defp fixture_repo(files) do
-    dir = init_repo()
+  defp fixture_repo(files), do: fixture_repo_at(tmp_dir(), files)
+
+  defp fixture_repo_at(dir, files) do
+    init_repo_at(dir)
 
     for {path, contents} <- files do
       full = Path.join(dir, path)
@@ -566,26 +570,198 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDriftTest do
   end
 
   defp empty_fixture_repo do
-    dir = init_repo()
+    dir = init_repo_at(tmp_dir())
     git!(dir, ["commit", "--quiet", "--allow-empty", "-m", "no files"])
     dir
   end
 
-  defp init_repo do
-    dir = tmp_dir()
-    git!(dir, ["init", "--quiet"])
-    git!(dir, ["config", "user.email", "fixture@example.invalid"])
-    git!(dir, ["config", "user.name", "fixture"])
-    git!(dir, ["config", "commit.gpgsign", "false"])
+  defp init_repo_at(dir) do
+    # Measure 3 again, because fixture_repo_at/2 can be handed a directory tmp_dir/0 did not
+    # make — which is exactly how the guard gets tested.
+    outside_project!(dir)
+    File.mkdir_p!(dir)
+
+    # `init` is the one call that cannot be preceded by the toplevel check: there is no
+    # repository to ask yet. It runs with measures 1, 2 and 3, and the check fires immediately
+    # afterwards — before a single file is written or staged.
+    git_raw!(dir, ["init", "--quiet"])
+    inside_fixture!(dir)
+
+    # --local, always. An unscoped `git config` wrote core.bare and a fixture identity into the
+    # REAL repository's config, which every linked worktree shares.
+    git!(dir, ["config", "--local", "user.email", "fixture@example.invalid"])
+    git!(dir, ["config", "--local", "user.name", "fixture"])
+    git!(dir, ["config", "--local", "commit.gpgsign", "false"])
     dir
   end
 
-  # The SAME scrub the task applies, from the same list. Without it this helper committed to
-  # loopctl's own branch: `mix precommit` runs the suite from inside a git hook, the hook exports
-  # GIT_DIR, and `git -C <tmp> add config/runtime.exs` then staged the fixture's one-byte file
-  # into the real repository's index and committed it.
+  describe "the fixture cannot reach the real repository" do
+    # These test the GUARDS THEMSELVES, not the destructive path behind them, and that is
+    # deliberate. A first attempt asserted that `fixture_repo_at(File.cwd!(), [])` refuses —
+    # and when the guard was mutated off to check the assertion could fail, the test did the
+    # thing the guard exists to prevent: it ran `git init` and `git config` with --git-dir
+    # resolved to the REAL repository. Mutating a safety guard must not arm the hazard.
+
+    test "outside_project!/1 refuses the repository root itself" do
+      error = assert_raise RuntimeError, fn -> outside_project!(File.cwd!()) end
+
+      assert error.message =~ "inside this repository"
+    end
+
+    test "outside_project!/1 refuses any path beneath the repository" do
+      for path <- ["tmp/x", "lib/app", "deep/nested/fixture", ".git/hooks"] do
+        error =
+          assert_raise RuntimeError, fn -> outside_project!(Path.join(File.cwd!(), path)) end
+
+        assert error.message =~ "refusing to build a git fixture"
+      end
+    end
+
+    test "outside_project!/1 permits a path outside it, or every fixture would be refused" do
+      assert outside_project!(tmp_dir()) == :ok
+      assert outside_project!("/tmp") == :ok
+    end
+
+    test "outside_project!/1 is not fooled by a sibling with the root as a prefix" do
+      # `<root>-scratch` starts with the root string but is NOT inside it.
+      assert outside_project!(File.cwd!() <> "-scratch") == :ok
+    end
+
+    test "inside_fixture!/1 refuses when git does not name the fixture as the toplevel" do
+      # A directory that exists and is not a repository. Under a redirected environment git
+      # answers for somewhere else; the guard demands it answer for here.
+      dir = tmp_dir()
+
+      error = assert_raise RuntimeError, fn -> inside_fixture!(dir) end
+
+      assert error.message =~ "refusing to run git for a fixture"
+      assert error.message =~ "toplevel"
+    end
+
+    test "inside_fixture!/1 refuses a directory INSIDE a repository that is not its root" do
+      # status 0 with a FOREIGN toplevel — the half a status-only check cannot see, and the
+      # shape a leaked GIT_DIR produces.
+      repo = fixture_repo([{"a.txt", "x"}])
+      nested = Path.join(repo, "nested")
+      File.mkdir_p!(nested)
+
+      error = assert_raise RuntimeError, fn -> inside_fixture!(nested) end
+
+      assert error.message =~ "git reports the toplevel as"
+    end
+
+    test "inside_fixture!/1 permits a real fixture, or every fixture would be refused" do
+      assert inside_fixture!(fixture_repo([{"a.txt", "x"}])) == :ok
+    end
+
+    test "the guard is WIRED into the fixture builder, not merely defined" do
+      # Targets a gitignored path under tmp/, so if the guard is ever mutated off this test
+      # creates a throwaway repo there and nothing else — never the real one. Cleanup is
+      # registered before the call, so it runs even then.
+      inside =
+        Path.join(File.cwd!(), "tmp/fixture_guard_wiring_#{System.unique_integer([:positive])}")
+
+      on_exit(fn -> File.rm_rf(inside) end)
+
+      error =
+        assert_raise RuntimeError, fn ->
+          fixture_repo_at(inside, [{"config/runtime.exs", "y"}])
+        end
+
+      assert error.message =~ "inside this repository"
+      refute File.exists?(inside)
+    end
+
+    test "the fixture's config writes are --local, so they cannot reach a shared config" do
+      repo = fixture_repo([{"lib/app/claims.ex", "x"}])
+
+      assert repo |> git!(["config", "--local", "--get", "user.name"]) |> String.trim() ==
+               "fixture"
+
+      # And the real repository's identity is untouched by that write.
+      {real_ident, 0} = System.cmd("git", ["var", "GIT_AUTHOR_IDENT"], cd: File.cwd!())
+
+      refute real_ident =~ "fixture@example.invalid"
+    end
+  end
+
+  # -- fixture isolation ----------------------------------------------------------------------
+  #
+  # Four measures, and KB d1f32cc7 is explicit that no ONE of them isolates a fixture. This
+  # suite learned it the expensive way: it committed to loopctl's own branch and pushed, because
+  # `git -C` does NOT beat `GIT_DIR`, and the quality gate runs the suite from inside a
+  # pre-commit hook, which exports GIT_DIR, GIT_WORK_TREE and GIT_INDEX_FILE into every test
+  # process.
+  #
+  #   1. the discovery environment is cleared       — CheckDrift.git_env/0
+  #   2. --git-dir and --work-tree are explicit     — git_raw!/2
+  #   3. the fixture lives outside the project      — outside_project!/1
+  #   4. git must AGREE the toplevel is the fixture — inside_fixture!/1
+  #
+  # Both guards run BEFORE the thing they protect, never around it: the damage began at
+  # File.write!, before any git ran, so a guard wrapped only around the commit would have let
+  # the file through and only caught it on the way out.
+
+  defp outside_project!(dir) do
+    root = Path.expand(File.cwd!())
+    target = Path.expand(dir)
+
+    if target == root or String.starts_with?(target, root <> "/") do
+      raise """
+      refusing to build a git fixture at #{target}: it is inside this repository (#{root}).
+
+      A fixture under the project tree is one mis-scoped git invocation away from committing to
+      the repository you are working in. That has already happened here once.
+      """
+    end
+
+    :ok
+  end
+
+  defp inside_fixture!(dir) do
+    expected = Path.expand(dir)
+
+    # Deliberately WITHOUT --git-dir. Asking git where it thinks it is while TELLING it where
+    # it is makes the answer tautological: --show-toplevel then just echoes -C. The value of
+    # this guard is that it re-derives the answer the way an UNSCOPED call would, so a leaked
+    # GIT_DIR — the exact failure that put two commits on this branch — yields a foreign
+    # toplevel here and is refused, instead of being masked by the very flag under test.
+    {output, status} =
+      System.cmd("git", ["-C", expected, "rev-parse", "--show-toplevel"],
+        stderr_to_stdout: true,
+        env: CheckDrift.git_env()
+      )
+
+    actual = String.trim(output)
+
+    unless status == 0 and Path.expand(actual) == expected do
+      raise """
+      refusing to run git for a fixture at #{expected}: git reports the toplevel as #{inspect(actual)}.
+
+      This is the guard that turns a recurrence into a red test instead of more phantom commits.
+      If it fires, something is still redirecting discovery — look at GIT_DIR first.
+      """
+    end
+
+    :ok
+  end
+
+  # Measures 1, 2 and 4 on every invocation. Never a bare System.cmd("git", ...) in this file:
+  # one that slipped through read the REAL repository's HEAD under the hook's GIT_DIR.
   defp git!(dir, args) do
-    case System.cmd("git", ["-C", dir | args],
+    inside_fixture!(dir)
+    git_raw!(dir, args)
+  end
+
+  # Measures 1, 2 and 3 — no toplevel check, for the one call that CREATES the repository the
+  # check needs in order to be answerable.
+  defp git_raw!(dir, args) do
+    expanded = Path.expand(dir)
+
+    case System.cmd(
+           "git",
+           ["--git-dir", Path.join(expanded, ".git"), "--work-tree", expanded, "-C", expanded] ++
+             args,
            stderr_to_stdout: true,
            env: CheckDrift.git_env()
          ) do
