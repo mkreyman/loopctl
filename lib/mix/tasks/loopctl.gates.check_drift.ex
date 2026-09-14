@@ -274,29 +274,54 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDrift do
     end
   end
 
-  @doc """
-  The environment overrides that must be cleared before spawning git.
+  # Every variable here redirects repository DISCOVERY, and git exports them to hooks — so a
+  # `git` spawned from anything running under the quality gate inherits the repository being
+  # committed to, whatever `-C` says.
+  @discovery_overrides ~w(
+    GIT_DIR
+    GIT_WORK_TREE
+    GIT_COMMON_DIR
+    GIT_INDEX_FILE
+    GIT_OBJECT_DIRECTORY
+    GIT_ALTERNATE_OBJECT_DIRECTORIES
+    GIT_NAMESPACE
+    GIT_PREFIX
+    GIT_CEILING_DIRECTORIES
+  )
 
-  Every one of these redirects repository discovery, and git EXPORTS them to hooks — so a `git`
-  spawned from anything running under `mix precommit` inherits the repository being committed
-  to, whatever `-C` says. Public so a test's own git calls clear exactly the same set: two lists
-  would be one list and one bug.
+  @doc """
+  The environment every git invocation is spawned with: discovery overrides cleared, and the
+  user's global and system configuration taken out of the picture.
+
+  Both halves matter and they fail differently. The DISCOVERY half decides which repository
+  git operates on at all. The CONFIG half decides how it behaves once it is there — a global
+  `core.quotePath` changes the shape of the paths this task matches patterns against, and a
+  global `core.hooksPath` means a freshly initialised throwaway repository still runs the
+  machine's real pre-commit hook on commit.
+
+  Public because this repository must hold exactly ONE answer to "how do I spawn git safely".
+  It held two — this list and a longer-but-differently-wrong one in
+  `test/loopctl/delivery_gates/diff_names_test.exs`, neither a superset of the other — which is
+  the same defect as two copies of a redaction rule, in a place where the failure is silent.
   """
-  @spec git_env() :: [{String.t(), nil}]
+  @spec git_env() :: [{String.t(), String.t() | nil}]
   def git_env do
-    for name <- ~w(
-          GIT_DIR
-          GIT_WORK_TREE
-          GIT_COMMON_DIR
-          GIT_INDEX_FILE
-          GIT_OBJECT_DIRECTORY
-          GIT_ALTERNATE_OBJECT_DIRECTORIES
-          GIT_NAMESPACE
-          GIT_PREFIX
-          GIT_CEILING_DIRECTORIES
-        ),
-        do: {name, nil}
+    for(name <- @discovery_overrides, do: {name, nil}) ++
+      [{"GIT_CONFIG_GLOBAL", "/dev/null"}, {"GIT_CONFIG_NOSYSTEM", "1"}]
   end
+
+  @doc """
+  Command-line `-c` overrides for a git invocation that may WRITE.
+
+  Belt and braces over `git_env/0`'s config isolation: `GIT_CONFIG_GLOBAL=/dev/null` already
+  hides a global `core.hooksPath`, and this says so on the command line where it is visible in
+  a failure. A throwaway fixture repository running the machine's real quality gate on every
+  commit passes only for as long as that gate finds nothing to check — stage a `mix.exs`, which
+  is a perfectly natural trigger pattern to test, and it goes red with nothing but git's exit
+  status to explain it.
+  """
+  @spec git_config_args() :: [String.t()]
+  def git_config_args, do: ["-c", "core.hooksPath=/dev/null"]
 
   @doc """
   The checksum `Loopctl.DeliveryGates.Triggers.parse/2` is verified against.
@@ -323,20 +348,36 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDrift do
     checksum(document, pinned)
   end
 
-  # The file list is read at the RESOLVED sha, never at `ref` again. These are two processes,
-  # and the moduledoc blesses pointing this at a tree somebody is working in: a commit landing
-  # between them would pair the pre-commit sha with the post-commit tree, and the artifact would
-  # certify no drift at a head it did not read.
+  # The file list is read at the RESOLVED sha, never at `ref`. These are two processes, and the
+  # moduledoc blesses pointing this at a tree somebody is working in: a commit landing between
+  # them would pair the pre-commit sha with the post-commit tree, and the artifact would certify
+  # no drift at a head it did not read.
   #
-  # `ref` is deliberately OUT OF SCOPE in `files_at/2`, rather than merely unused there. This
-  # race cannot be provoked by a deterministic test — it needs a commit to land between two
-  # processes — so the defect is made unrepresentable instead of guarded: re-introducing it
-  # would not compile. A sha cannot move.
-  defp read_tree!(repo, ref) do
-    head = repo |> git!(["rev-parse", ref]) |> String.trim()
+  # The race itself cannot be provoked by a deterministic test — it needs a commit to land
+  # between two processes. So the structure carries it: `tree_at!/2` has no `ref` in scope at
+  # all, and `read_tree!/2` passes nothing but `resolve_head!/2`'s result. A reintroduction
+  # therefore cannot be quiet — it makes `ref` flow into `head`, so the artifact records a
+  # branch name or a tag instead of a commit sha, and the symbolic-ref and annotated-tag tests
+  # both go red.
+  #
+  # An earlier version of this comment claimed a reintroduction "would not compile". That was
+  # too strong and a reviewer was right to say so: `files_at(repo, ref)` compiled fine. What is
+  # true now is weaker and testable, which is the better trade.
+  defp read_tree!(repo, ref), do: tree_at!(repo, resolve_head!(repo, ref))
+
+  # `^{commit}` PEELS. `rev-parse` on an annotated tag yields the TAG OBJECT's sha while
+  # `ls-tree` peels to the commit, so an unpeeled read is correct about the files and records
+  # something that is not a commit as the head — an artifact naming an object nobody can
+  # `git show --stat`.
+  defp resolve_head!(repo, ref) do
+    repo |> git!(["rev-parse", "#{ref}^{commit}"]) |> String.trim()
+  end
+
+  defp tree_at!(repo, head) do
     files = files_at(repo, head)
 
-    if files == [], do: Mix.raise("#{repo} at #{ref} lists no files — refusing a vacuous pass")
+    if files == [],
+      do: Mix.raise("#{repo} at #{head} lists no files — refusing a vacuous pass")
 
     {files, head}
   end

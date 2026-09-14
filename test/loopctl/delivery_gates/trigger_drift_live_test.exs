@@ -45,6 +45,7 @@ defmodule Loopctl.DeliveryGates.TriggerDriftLiveTest do
 
   alias Loopctl.DeliveryGates.TriggerDrift
   alias Loopctl.DeliveryGates.Triggers
+  alias Mix.Tasks.Loopctl.Gates.CheckDrift
 
   @artifact "docs/measurements/trigger_drift.json"
 
@@ -119,9 +120,13 @@ defmodule Loopctl.DeliveryGates.TriggerDriftLiveTest do
       {:ok, drifted} ->
         # The patterns are the guard map. Count and kind only, even in a failure message: a
         # CI log is as public as a committed artifact.
+        # Counts and kinds only, and NOT the checkout path or the tree's size: those are
+        # `:checkout` and `:tree_files`, the two keys this change deleted from the artifact on
+        # the stated rule that a CI log is as public as a committed artifact. The line above
+        # already withholds the pattern text; withholding one and printing the others was
+        # incoherent.
         flunk("""
-        #{length(drifted)} configured pattern(s) match nothing in #{repo_name} \
-        (#{length(files)} files read from #{repo}).
+        #{length(drifted)} configured pattern(s) match nothing in the target repository.
 
         Each has stopped guarding the path it names. Run
         `mix loopctl.gates.check_drift` for the unredacted list, which it writes outside
@@ -138,8 +143,15 @@ defmodule Loopctl.DeliveryGates.TriggerDriftLiveTest do
   defp live_repo_triggers(path, repo_name) do
     document =
       case File.read(path) do
-        {:ok, document} -> document
-        {:error, reason} -> flunk("cannot read #{path}: #{:file.format_error(reason)}")
+        {:ok, document} ->
+          document
+
+        # The variable's NAME, never its value: the value is a local absolute path to the
+        # trigger document, and this message lands in the same log as the others.
+        {:error, reason} ->
+          flunk(
+            "cannot read the document named by #{@document_var}: #{:file.format_error(reason)}"
+          )
       end
 
     sha = :sha256 |> :crypto.hash(document) |> Base.encode16(case: :lower)
@@ -161,22 +173,32 @@ defmodule Loopctl.DeliveryGates.TriggerDriftLiveTest do
     end
   end
 
-  # stderr is NEVER merged into stdout: `ls-tree -z` separates paths with NUL, a git advisory
+  # Two things this call must get right, and it got only one of them for a round.
+  #
+  # stderr is never merged into stdout: `ls-tree -z` separates paths with NUL, a git advisory
   # carries none, so a merged warning is glued onto the first path and that path silently stops
-  # matching any pattern. It goes to this process's stderr, where it is visible and inert.
+  # matching any pattern.
+  #
+  # And the ENVIRONMENT is scrubbed, from the same one list everything else here uses. Without
+  # it this was the very defect this change exists to close, in LIVE mode: `mix test` is run by
+  # the quality gate from inside the pre-commit hook, the hook exports GIT_DIR, and GIT_DIR beats
+  # `-C`. The drift assertion would then be computed against loopctl's own file list — patterns
+  # that happen to match a loopctl path reporting alive, the rest reporting a drift that does not
+  # exist — so the runner's green and its red would both say nothing about the target repository.
   defp live_files(repo) do
     files =
       case System.cmd("git", ["-C", repo, "ls-tree", "-r", "--name-only", "-z", "HEAD"],
-             stderr_to_stdout: false
+             stderr_to_stdout: false,
+             env: CheckDrift.git_env()
            ) do
         {output, 0} ->
           String.split(output, <<0>>, trim: true)
 
         {_output, status} ->
-          flunk("git ls-tree in #{repo} exited #{status} — git's own diagnostic is on stderr")
+          flunk("git ls-tree exited #{status} — git's own diagnostic is on stderr")
       end
 
-    refute files == [], "#{repo} lists no files — refusing a vacuous pass"
+    refute files == [], "the target repository lists no files — refusing a vacuous pass"
 
     files
   end

@@ -290,6 +290,67 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDriftTest do
       refute read_json(out)["meta"]["head"] == String.trim(git!(repo, ["rev-parse", "HEAD"]))
     end
 
+    test "a SYMBOLIC --ref is resolved, so ref and head are not the same string" do
+      # Both earlier --ref tests pass a full sha, where `ref` and `head` are byte-identical —
+      # so neither could catch `files_at(repo, ref)` at the call site, which compiles and
+      # restores the race. A branch name cannot be passed to ls-tree and yield the same
+      # guarantee, so this is the case that distinguishes them.
+      repo = fixture_repo([{"lib/app/claims.ex", "x"}, {"config/runtime.exs", "y"}])
+      branch = repo |> git!(["rev-parse", "--abbrev-ref", "HEAD"]) |> String.trim()
+      triggers = trigger_file(repo, ["lib/app/**"], ["config/runtime.exs"])
+      out = tmp_path("out.json")
+
+      capture_io(fn -> CheckDrift.run(argv(repo, triggers, out: out) ++ ["--ref", branch]) end)
+
+      head = read_json(out)["meta"]["head"]
+
+      assert head == repo |> git!(["rev-parse", branch]) |> String.trim()
+      refute head == branch
+      assert String.match?(head, ~r/\A[0-9a-f]{40}\z/)
+    end
+
+    test "an ANNOTATED TAG records the commit, not the tag object" do
+      # rev-parse on an annotated tag yields the TAG OBJECT's sha; ls-tree peels to the commit.
+      # Unpeeled, the artifact is correct about the files and names an object that is not a
+      # commit — `meta.head` would not be something anyone can `git show --stat`.
+      repo = fixture_repo([{"lib/app/claims.ex", "x"}, {"config/runtime.exs", "y"}])
+      git!(repo, ["tag", "-a", "v1", "-m", "release"])
+
+      tag_object = repo |> git!(["rev-parse", "v1"]) |> String.trim()
+      commit = repo |> git!(["rev-parse", "v1^{commit}"]) |> String.trim()
+
+      # The fixture is only meaningful if those two actually differ.
+      refute tag_object == commit
+
+      triggers = trigger_file(repo, ["lib/app/**"], ["config/runtime.exs"])
+      out = tmp_path("out.json")
+
+      capture_io(fn -> CheckDrift.run(argv(repo, triggers, out: out) ++ ["--ref", "v1"]) end)
+
+      assert read_json(out)["meta"]["head"] == commit
+      refute read_json(out)["meta"]["head"] == tag_object
+    end
+
+    test "a fixture commit does not run the machine's real hooks" do
+      # core.hooksPath is set GLOBALLY on this fleet, so a freshly initialised throwaway repo
+      # resolves it and runs the whole quality gate on every fixture commit. It passes today
+      # only because that hook exits early when it finds no mix.exs at or above a staged path.
+      # Staging one — a perfectly natural trigger pattern to test — is what turns that into a
+      # red suite explained by nothing but git's exit status.
+      repo = fixture_repo([{"mix.exs", "defmodule X do\nend\n"}, {"config/runtime.exs", "y"}])
+      triggers = trigger_file(repo, ["mix.exs"], ["config/runtime.exs"])
+      out = tmp_path("out.json")
+
+      output = capture_io(fn -> CheckDrift.run(argv(repo, triggers, out: out)) end)
+
+      assert output =~ "no drift"
+
+      # And the hook the fixture would have run resolves to nothing executable.
+      hook = repo |> git!(["rev-parse", "--git-path", "hooks/pre-commit"]) |> String.trim()
+
+      refute File.exists?(Path.expand(hook, repo))
+    end
+
     test "the head on the artifact is the head the file list was read at" do
       repo = fixture_repo([{"lib/app/claims.ex", "x"}, {"config/runtime.exs", "y"}])
       triggers = trigger_file(repo, ["lib/app/**"], ["config/runtime.exs"])
@@ -448,6 +509,21 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDriftTest do
       end
     end
 
+    test "git_env/0 also takes the user's global and system config out of the picture" do
+      cleared = Map.new(CheckDrift.git_env())
+
+      # Named literally, and these two are the half that was missing. A global
+      # `core.hooksPath` — which this fleet sets — means a freshly initialised throwaway
+      # repository still runs the machine's whole quality gate on every commit, and a global
+      # `core.quotePath` changes the shape of the paths this task matches patterns against.
+      assert Map.fetch(cleared, "GIT_CONFIG_GLOBAL") == {:ok, "/dev/null"}
+      assert Map.fetch(cleared, "GIT_CONFIG_NOSYSTEM") == {:ok, "1"}
+    end
+
+    test "git_config_args/0 neutralises hooks on the command line too" do
+      assert CheckDrift.git_config_args() == ["-c", "core.hooksPath=/dev/null"]
+    end
+
     @tag :tmp_dir
     test "an inherited GIT_DIR does not redirect the read to another repository" do
       # This is not hypothetical. git hooks EXPORT GIT_DIR, `mix precommit` runs the suite from
@@ -472,13 +548,27 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDriftTest do
           cd: File.cwd!()
         )
 
-      assert status == 0, output
+      # The ARTIFACT is the verdict, and the exit status is not. This shells out to `mix` from
+      # an async test sharing _build/test and Mix's build lock, so an unrelated compile or a
+      # contended lock exits non-zero — and asserting on that first would report someone else's
+      # build as a scrub regression. If the artifact was written, the scrub either held or it
+      # did not, and that is answerable; if it was not written, the run is inconclusive and says
+      # so rather than accusing this code.
+      if File.exists?(out) do
+        assert read_json(out)["meta"]["head"] ==
+                 repo |> git!(["rev-parse", "HEAD"]) |> String.trim()
 
-      assert read_json(out)["meta"]["head"] ==
-               repo |> git!(["rev-parse", "HEAD"]) |> String.trim()
+        refute read_json(out)["meta"]["head"] ==
+                 other |> git!(["rev-parse", "HEAD"]) |> String.trim()
+      else
+        flunk("""
+        the subprocess wrote no artifact, so this run proves nothing either way — it is
+        INCONCLUSIVE, not a scrub failure. Usual cause is a contended Mix build lock or an
+        unrelated compile error in the subprocess. git exited #{status}.
 
-      refute read_json(out)["meta"]["head"] ==
-               other |> git!(["rev-parse", "HEAD"]) |> String.trim()
+        #{output}
+        """)
+      end
     end
   end
 
@@ -760,7 +850,8 @@ defmodule Mix.Tasks.Loopctl.Gates.CheckDriftTest do
 
     case System.cmd(
            "git",
-           ["--git-dir", Path.join(expanded, ".git"), "--work-tree", expanded, "-C", expanded] ++
+           CheckDrift.git_config_args() ++
+             ["--git-dir", Path.join(expanded, ".git"), "--work-tree", expanded, "-C", expanded] ++
              args,
            stderr_to_stdout: true,
            env: CheckDrift.git_env()
