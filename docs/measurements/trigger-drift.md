@@ -7,7 +7,7 @@ A configured pattern that matches nothing in the target repository has stopped g
 it names — most often because the path was renamed. `Loopctl.DeliveryGates.GateB` already
 escalates on it at runtime, as `{:stale_trigger, pattern}`; that is fail-closed but it announces
 itself as one more escalation among many, and the first Gate B measurement (#828, PR #830) found
-712 of 830 replayed changes escalating that way with nobody having noticed. Checked ahead of
+712 of 853 readable replayed changes escalating that way with nobody having noticed. Checked ahead of
 time it is what it actually is: a configuration alarm.
 
 `Loopctl.DeliveryGates.TriggerDrift` is the check, extracted from `GateB`'s own private
