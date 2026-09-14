@@ -321,46 +321,71 @@ defmodule Loopctl.Delivery.StoryPayloadTest do
     end
   end
 
-  describe "settle_lost_race/3" do
-    # The race itself cannot be staged from one process: the read and the write are two calls
-    # inside `build/3`, and a test that has to win a real race is a flaky test. So the
-    # RESOLUTION is exercised directly — it is the whole of the logic — while the outcome a
-    # caller sees is asserted through `build/3` above. Every mutation of this function is
-    # killed here; the pipe that CALLS it is killed by the build-level test.
-    test "a refusal caused by the row moving becomes ok once the row is escalated" do
+  describe "settle_if_parked/3" do
+    # The pipe that CALLS this is reached by the already-parked test in `build/3` above —
+    # `escalated` has no `:session_escalated` edge out of it, so that story takes the no-edge
+    # branch and this function is what recognises it. That was NOT true in round 2: an early
+    # clause answered first and the pipe deleted with the suite green while the test's own
+    # comment claimed to cover it.
+    #
+    # A genuine mid-call race still cannot be staged from one process, so the two refusals it
+    # produces are exercised on the function directly. That is the whole of the logic.
+    @move_refusals [:stale_stage, :stale_claim_epoch, :invalid_transition]
+
+    test "every refusal that means the row moved becomes ok once the row is escalated" do
       story = staged(long_story_attrs(), :escalated)
 
-      for reason <- [:stale_stage, :invalid_transition] do
+      for reason <- @move_refusals ++ [{:no_escalation_edge, :escalated}] do
         assert {:ok, row} =
-                 StoryPayload.settle_lost_race({:error, reason}, story.tenant_id, story.id)
+                 StoryPayload.settle_if_parked({:error, reason}, story.tenant_id, story.id),
+               "expected #{inspect(reason)} on a parked story to settle as ok"
 
         assert row.stage == :escalated
       end
     end
 
-    test "the same refusal on a row that is NOT escalated stays the caller's error" do
+    test "stale_claim_epoch is folded because the epoch is checked BEFORE the stage" do
+      # `Stages.transition/6` share-locks the story, rolls back on the epoch, and only then
+      # compare-and-sets the stage — so a racing park that ALSO released the claim surfaces
+      # here as `:stale_claim_epoch` and never as `:stale_stage`. Omitting it left the loudest
+      # signal in the module firing on a story that is in fact parked.
+      story = staged(long_story_attrs(), :escalated)
+
+      assert {:ok, %{stage: :escalated}} =
+               StoryPayload.settle_if_parked(
+                 {:error, :stale_claim_epoch},
+                 story.tenant_id,
+                 story.id
+               )
+    end
+
+    test "the same refusals on a row that is NOT escalated stay the caller's error" do
       story = staged(long_story_attrs())
 
-      for reason <- [:stale_stage, :invalid_transition] do
+      for reason <- @move_refusals ++ [{:no_escalation_edge, :queued}] do
         assert {:error, ^reason} =
-                 StoryPayload.settle_lost_race({:error, reason}, story.tenant_id, story.id)
+                 StoryPayload.settle_if_parked({:error, reason}, story.tenant_id, story.id),
+               "expected #{inspect(reason)} on an unparked story to stay an error"
       end
     end
 
     test "any other outcome passes straight through, escalated row or not" do
       story = staged(long_story_attrs(), :escalated)
 
-      # A story parked for some OTHER reason must not turn a stale epoch into a success:
-      # only the two refusals that mean "the row moved" are re-read.
-      assert {:error, :stale_claim_epoch} =
-               StoryPayload.settle_lost_race(
-                 {:error, :stale_claim_epoch},
+      # Only refusals that mean "the row moved" are re-read. An unrelated failure on a parked
+      # story must not be laundered into a success.
+      assert {:error, :not_claimed} =
+               StoryPayload.settle_if_parked({:error, :not_claimed}, story.tenant_id, story.id)
+
+      assert {:error, :invalid_event_data} =
+               StoryPayload.settle_if_parked(
+                 {:error, :invalid_event_data},
                  story.tenant_id,
                  story.id
                )
 
       row = Stages.get(story.tenant_id, story.id)
-      assert {:ok, ^row} = StoryPayload.settle_lost_race({:ok, row}, story.tenant_id, story.id)
+      assert {:ok, ^row} = StoryPayload.settle_if_parked({:ok, row}, story.tenant_id, story.id)
     end
   end
 

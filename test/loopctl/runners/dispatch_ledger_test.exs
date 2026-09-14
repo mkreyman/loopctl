@@ -376,21 +376,46 @@ defmodule Loopctl.Runners.DispatchLedgerTest do
       # becomes eligible again: silently, on a schedule, with no reply from the runner and
       # nothing in any log to say why the dispatches resumed. This is where a pruner's author
       # finds out. Excluding those rows in the predicate is the fix; relaxing this is not.
+      # Matched by PROXIMITY, not by one call shape. The first version of this guard matched
+      # only `delete_all(from(x in DispatchRecord` and `Repo.delete(%DispatchRecord` — and the
+      # PIPE form, which is how most of the deletes in `lib/` are actually written, walked
+      # straight past it, as did `Multi.delete_all` and raw SQL naming the table. A guard that
+      # misses the way the code is written is not a guard.
+      #
+      # The unit is a CHUNK: contiguous non-blank lines, which is one expression or function
+      # body in this codebase's layout. A chunk carrying both a delete verb and a reference to
+      # these rows is flagged whichever order they appear in, so the pipe form (target first)
+      # and the argument form (verb first) are both caught.
+      # Raw SQL is in the pattern too: a pruner written as `Repo.query!("DELETE FROM
+      # runner_dispatches ...")` carries no Ecto verb at all and slipped past a shape-based
+      # scan entirely.
+      verb =
+        ~r/\b(?:delete_all|delete!?)\s*[(|]|\|>\s*[A-Za-z.]*[Rr]epo\.delete|\bDELETE\s+FROM\b|\bTRUNCATE\b/i
+
+      target = ~r/DispatchRecord|runner_dispatches/
+
       files = Path.wildcard("lib/**/*.ex")
       assert length(files) > 100, "the source scan found no files, so it proves nothing"
 
-      mentions = Enum.filter(files, &(File.read!(&1) =~ "DispatchRecord"))
+      mentions = Enum.filter(files, &(File.read!(&1) =~ target))
 
       assert "lib/loopctl/runners/dispatch_ledger.ex" in mentions,
              "the scan no longer sees the module that owns these rows"
 
-      deletes =
-        Enum.filter(mentions, fn file ->
-          source = File.read!(file)
+      # The verb pattern must actually match the delete shapes this repo uses, or the scan is
+      # looking for something that is never written and can never fire.
+      assert Enum.any?(Path.wildcard("lib/**/*.ex"), fn file ->
+               File.read!(file) =~ ~r/\|>\s*[A-Za-z.]*[Rr]epo\.delete_all\(/
+             end),
+             "no pipe-form delete found in lib/, so the pipe half of the verb pattern is untested"
 
-          Regex.match?(~r/delete_all\(\s*from\([a-z_]+ in DispatchRecord/, source) or
-            Regex.match?(~r/Repo\.delete[_!a-z]*\(\s*%?DispatchRecord/, source)
-        end)
+      deletes =
+        for file <- mentions,
+            source = File.read!(file),
+            chunk <- String.split(source, ~r/\n\s*\n/),
+            Regex.match?(verb, chunk) and Regex.match?(target, chunk),
+            uniq: true,
+            do: file
 
       assert deletes == [],
              "these delete dispatch rows: #{inspect(deletes)}. A row with status " <>

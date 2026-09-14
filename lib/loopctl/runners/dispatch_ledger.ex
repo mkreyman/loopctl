@@ -422,11 +422,16 @@ defmodule Loopctl.Runners.DispatchLedger do
   unwell. This read is what keeps loopctl from asking the same machine the same impossible
   question again.
 
-  Indexed by `runner_dispatches (tenant_id, runner_id)`, filtered to the refused rows, and it
-  stops at the first match. The `status` predicate is defence in depth over an L2 invariant
-  rather than the enforcement: the `runner_dispatches_reason_iff_refused` CHECK already makes
-  a reason without a refusal impossible, which is why no test can turn that clause red — see
-  the note on it in `dispatch_ledger_test.exs`.
+  Served by the PARTIAL index `runner_dispatches_unsupported_kind_idx` on
+  `(tenant_id, runner_id, kind) WHERE status = 'refused' AND reason = 'kind_not_supported'`
+  (migration `20260919100000`), so the common NO-MATCH answer costs a lookup rather than a
+  scan of every dispatch the runner ever held — which is what it cost on the general
+  `(tenant_id, runner_id)` index, on the dispatch hot path, in a table with no retention.
+
+  The `status` predicate is defence in depth over an L2 invariant rather than the enforcement:
+  the `runner_dispatches_reason_iff_refused` CHECK already makes a reason without a refusal
+  impossible, which is why no test can turn that clause red — see the note on it in
+  `dispatch_ledger_test.exs`.
   """
   @spec kind_unsupported?(Ecto.UUID.t(), Ecto.UUID.t(), String.t()) :: boolean()
   def kind_unsupported?(tenant_id, runner_id, kind)
@@ -436,6 +441,12 @@ defmodule Loopctl.Runners.DispatchLedger do
         Repo.exists?(
           from r in DispatchRecord,
             where: r.tenant_id == ^tenant_id and r.runner_id == ^runner_id,
+            # LITERALS, never pinned variables or module attributes with `^`. Ecto inlines a
+            # literal into the SQL, so Postgres sees `status = 'refused'` as a constant and can
+            # PROVE the partial index's predicate covers this query. Pinned, the same values
+            # arrive as bind parameters, the proof fails, and the planner falls back to a
+            # sequential scan — the index becomes dead weight and nothing anywhere goes red.
+            # Verified against the planner: literals use the index, bind parameters do not.
             where: r.kind == ^kind and r.status == "refused",
             where: r.reason == "kind_not_supported"
         )
@@ -457,13 +468,16 @@ defmodule Loopctl.Runners.DispatchLedger do
   `GET /api/v1/runners/pool`, it is one line of output away instead of a database session.
 
   One grouped query for the whole tenant, so a list of runners costs one round trip rather
-  than one each.
+  than one each, and served by the same partial index as `kind_unsupported?/3` — including
+  its dependence on the predicate values staying LITERALS; see the comment there.
   """
   @spec unsupported_kinds(Ecto.UUID.t()) :: %{Ecto.UUID.t() => [String.t()]}
   def unsupported_kinds(tenant_id) when is_binary(tenant_id) do
     {:ok, pairs} =
       in_tenant(tenant_id, fn ->
         Repo.all(
+          # Literals for the same reason as `kind_unsupported?/3` — pinning them makes the
+          # partial index unusable and turns this into a scan of the tenant's whole history.
           from r in DispatchRecord,
             where: r.tenant_id == ^tenant_id and r.status == "refused",
             where: r.reason == "kind_not_supported",

@@ -72,17 +72,32 @@ defmodule Loopctl.Delivery.ImplementerInput do
   end
 
   defp criterion_text(%{} = criterion) do
-    id = Map.get(criterion, "id") || Map.get(criterion, :id)
-
-    text =
-      Map.get(criterion, "description") || Map.get(criterion, :description) ||
-        Map.get(criterion, "criterion") || Map.get(criterion, :criterion) || ""
-
-    if is_binary(id) and id != "", do: "[#{id}] #{text}", else: to_string(text)
+    criterion
+    |> criterion_body()
+    |> labelled(criterion_id(criterion))
   end
 
   defp criterion_text(other) when is_binary(other), do: other
   defp criterion_text(_other), do: ""
+
+  defp criterion_id(criterion), do: Map.get(criterion, "id") || Map.get(criterion, :id)
+
+  defp criterion_body(criterion) do
+    Map.get(criterion, "description") || Map.get(criterion, :description) ||
+      Map.get(criterion, "criterion") || Map.get(criterion, :criterion) || ""
+  end
+
+  # A criterion with no usable text is EMPTY however it is labelled. Prefixing an id onto
+  # nothing produced "[AC-3] ", which reads as a criterion, clears the wire's `minLength: 1`,
+  # and states no requirement — so the emptiness is judged on the text BEFORE the label is
+  # attached, and `violations/1` names what this returns.
+  defp labelled(text, id) do
+    cond do
+      String.trim(to_string(text)) == "" -> ""
+      is_binary(id) and id != "" -> "[#{id}] #{text}"
+      true -> to_string(text)
+    end
+  end
 
   @doc """
   The `RunnerStory` object an `implement` dispatch carries (contract 1.5.0), string-keyed so
@@ -116,12 +131,16 @@ defmodule Loopctl.Delivery.ImplementerInput do
   trim:
 
   - a cap — a field, an item count, or the whole object's byte budget;
-  - an item that RENDERS EMPTY. A criterion whose map carries no usable text renders as `""`,
-    which the schema refuses (`minLength: 1`) and which an earlier version DROPPED. A story
-    imported with 21 criteria one of which is blank then yielded 20 on the wire, under the cap,
-    with no violation and no escalation — the exact wrong-spec outcome this module exists to
-    prevent, arrived at by a filter rather than by a truncation. The entry is kept so the
-    COUNT is honest and the cap binds, and it is named as a violation so nothing dispatches.
+  - an item with no usable TEXT. A criterion whose text is missing or whitespace renders as
+    `""` — its id alone does not save it, because `[AC-3] ` states no requirement — and that
+    is judged on the TRIMMED text, not on exact emptiness. An earlier version tested `== ""`
+    after formatting, so `%{"id" => "AC-3", "description" => ""}` rendered `[AC-3] `, cleared
+    `minLength: 1`, and dispatched content-free; the version before THAT dropped the entry
+    entirely, so a story imported with 21 criteria one of them blank yielded 20 on the wire,
+    under the cap, with no violation and no escalation. Both are the wrong-spec outcome this
+    module exists to prevent, reached once by a filter and once by a formatting artefact. The
+    entry is now KEPT so the COUNT is honest and the cap binds, and NAMED so nothing
+    dispatches. The same trimmed test covers the title and the option lists.
 
   Lengths are counted with `String.length/1` — GRAPHEMES, the unit `OpenApiSpex` counts a
   `maxLength` in — so this refuses exactly what the schema would, and the byte budget is the
@@ -197,8 +216,14 @@ defmodule Loopctl.Delivery.ImplementerInput do
   # here rather than left to the cast: the caller's remedy is an escalation, and
   # `invalid_payload` from the wire would tell it the payload was malformed instead.
   defp blank_violation(object, key) do
-    if Map.get(object, key) in [nil, ""], do: ["#{key} is empty"], else: []
+    if blank?(Map.get(object, key)), do: ["#{key} is empty"], else: []
   end
+
+  # TRIMMED, not `== ""`. A title of three spaces satisfies the wire's `minLength: 1` and says
+  # nothing, which is the same defect as a content-free criterion one field over.
+  defp blank?(nil), do: true
+  defp blank?(value) when is_binary(value), do: String.trim(value) == ""
+  defp blank?(_value), do: false
 
   defp length_violation(object, key, max) do
     case Map.get(object, key) do
@@ -231,7 +256,7 @@ defmodule Loopctl.Delivery.ImplementerInput do
     # answers with an escalation instead of a malformed-payload refusal from the wire.
     empty =
       for {value, index} <- Enum.with_index(values),
-          value == "",
+          blank?(value),
           do: "#{key}[#{index}] renders empty"
 
     count ++ too_long ++ empty

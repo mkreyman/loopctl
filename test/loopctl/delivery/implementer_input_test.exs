@@ -198,16 +198,20 @@ defmodule Loopctl.Delivery.ImplementerInputTest do
     # escalation, and the implementer got a story one criterion short.
     source = fixture(:project, %{})
 
-    blank_at = 3
+    # THREE shapes of empty, all of which reached the wire at some point: no text at all, an
+    # id with an empty description (which rendered "[AC-n] " — content-free, and past a
+    # `== ""` test AND past the schema's `minLength: 1`), and whitespace.
+    blanks = %{2 => %{"note" => "left over"}, 3 => %{"id" => "AC-3", "description" => ""}}
+    blanks = Map.put(blanks, 4, %{"id" => "AC-4", "description" => "   \t "})
+    blank_at = Map.keys(blanks)
 
-    # Neither an id nor a description, so `criterion_text/1` renders "". A criterion carrying
-    # an id and no text renders "[AC-n] " and is NOT this case — it is not empty, so it was
-    # never dropped and the cap always saw it.
     criteria =
       for index <- 1..(RunnerStory.max_criteria() + 1) do
-        if index == blank_at,
-          do: %{"note" => "left over from an import"},
-          else: %{"id" => "AC-#{index}", "description" => "criterion #{index}"}
+        Map.get(
+          blanks,
+          index,
+          %{"id" => "AC-#{index}", "description" => "criterion #{index}"}
+        )
       end
 
     story =
@@ -220,36 +224,43 @@ defmodule Loopctl.Delivery.ImplementerInputTest do
     assert {:error, {:story_not_dispatchable, violations}} =
              ImplementerInput.story_object(story)
 
-    # BOTH, and the count one is the point: with the blank dropped the list was exactly at
-    # the cap and nothing was refused at all.
+    # The count violation is the point of keeping them: with the blanks dropped the list was
+    # at or under the cap and nothing was refused at all.
     assert Enum.any?(violations, &(&1 =~ "acceptance_criteria has more than"))
 
-    assert "acceptance_criteria[#{blank_at - 1}] renders empty" in violations
+    for index <- blank_at do
+      assert "acceptance_criteria[#{index - 1}] renders empty" in violations,
+             "criterion #{index} was not named"
+    end
   end
 
-  test "a story with no title is refused rather than sent with an empty one" do
+  test "a story with no usable title is refused rather than sent with a blank one" do
     # The changeset requires a title, so this state is reached the way it is reached in
     # production — a write that is not a changeset. It is worth guarding because the schema's
     # `minLength: 1` would otherwise refuse the dispatch as a malformed payload, and the
-    # caller's remedy for that is not the escalation this actually needs.
+    # caller's remedy for that is not the escalation this actually needs. Whitespace satisfies
+    # `minLength: 1` and says nothing, so it is the same defect.
     source = fixture(:project, %{})
     story = fixture(:story, %{tenant_id: source.tenant_id, project_id: source.id})
-    blank = %{story | title: ""}
 
-    assert {:error, {:story_not_dispatchable, violations}} =
-             ImplementerInput.story_object(blank)
+    for blank <- ["", "   ", "\t\n "] do
+      assert {:error, {:story_not_dispatchable, violations}} =
+               ImplementerInput.story_object(%{story | title: blank})
 
-    assert "title is empty" in violations
+      assert "title is empty" in violations, "expected #{inspect(blank)} to be refused"
+    end
   end
 
-  test "an option entry that is empty is named too" do
+  test "an option entry that is empty or whitespace is named too" do
     source = fixture(:project, %{})
     story = fixture(:story, %{tenant_id: source.tenant_id, project_id: source.id})
 
-    assert {:error, {:story_not_dispatchable, violations}} =
-             ImplementerInput.story_object(story, touches: ["lib/a.ex", ""])
+    for blank <- ["", "  "] do
+      assert {:error, {:story_not_dispatchable, violations}} =
+               ImplementerInput.story_object(story, touches: ["lib/a.ex", blank])
 
-    assert "touches[1] renders empty" in violations
+      assert "touches[1] renders empty" in violations, "expected #{inspect(blank)} to be named"
+    end
   end
 
   test "only a Story is accepted" do

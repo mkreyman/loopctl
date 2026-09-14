@@ -184,64 +184,86 @@ defmodule Loopctl.Delivery.StoryPayload do
       nil ->
         {:error, :unknown_story_stage}
 
-      %StoryStage{stage: :escalated} = row ->
-        # Already parked, by this caller's own earlier attempt or by anything else. Re-parking
-        # it would spend a second `attempts` count and write a second chain entry for one
-        # story that was too large once.
-        {:ok, row}
-
       %StoryStage{stage: stage} ->
-        advance_or_name_the_gap(tenant_id, story_id, stage, violations, escalation)
+        tenant_id
+        |> attempt(story_id, stage, violations, escalation)
+        |> settle_if_parked(tenant_id, story_id)
     end
   end
 
-  # The edge is checked BEFORE the transition is attempted, against the machine's own table,
-  # so a stage escalation cannot leave is named rather than reported as a bare
-  # `:invalid_transition` the caller must decode. See the precondition on `build/3`.
-  defp advance_or_name_the_gap(tenant_id, story_id, stage, violations, escalation) do
+  # Attempts the transition, or names the missing edge. It NEVER decides whether the story
+  # ended up parked — `escalate/4` pipes both outcomes through the one `settle_if_parked/3`
+  # above.
+  #
+  # That single call site is the point. This used to ask the question twice: an early
+  # `%StoryStage{stage: :escalated}` clause returned before any attempt, and a second re-read
+  # sat on the advance's own result for the race. The early clause answered first, so the
+  # round-2 test for the race never executed the re-read at all and the pipe deleted with the
+  # whole suite green (#829 round 3, finding 1). Worse, the surviving call site was the one
+  # reachable ONLY by a genuine mid-call race, which no in-process test can stage — so it
+  # could never be covered. One call site, reached by the ordinary already-parked story, is
+  # both simpler and the only version a test can hold.
+  #
+  # An already-parked row still spends no second `attempts` count and writes no second chain
+  # entry: `escalated` has no `:session_escalated` edge OUT of it, so no transition is
+  # attempted on it at all.
+  #
+  # The edge is checked against the machine's own table BEFORE the transition, so a stage
+  # escalation cannot leave is named rather than reported as a bare `:invalid_transition` the
+  # caller must decode. See the precondition on `build/3`.
+  defp attempt(tenant_id, story_id, stage, violations, escalation) do
     if {stage, :escalated, :session_escalated} in StageMachine.transitions() do
-      tenant_id
-      |> Stages.advance(
+      Stages.advance(
+        tenant_id,
         story_id,
         {stage, :escalated, :session_escalated},
         escalation ++
           [reason: reason_text(violations), event_data: violation_event_data(violations)]
       )
-      |> settle_lost_race(tenant_id, story_id)
     else
       {:error, {:no_escalation_edge, stage}}
     end
   end
 
   @doc """
-  Resolves a transition refused because the row MOVED, by re-reading it. Internal to the
-  escalation; public only so the race can be tested without racing.
+  Answers "is the story parked anyway?" for a refusal that would otherwise be reported as a
+  failure to park it. Internal to the escalation; public only so the RACE half can be tested
+  without racing.
 
-  The read in `escalate/4` and the write are two transactions, so another writer can park the
-  row in between. The compare-and-set then answers `:stale_stage` — and without this the
-  module's LOUDEST signal, "NOT ESCALATED" at error, fired for a story that IS escalated. One
-  re-read, no recursion: a row at `escalated` is the outcome this call wanted, whoever wrote
-  it, so it is `:ok`. Anything else is the caller's error, and the loud path is kept for the
-  genuinely stranded story it was written for.
+  Three refusals qualify, and all three mean the row is not where this call last read it:
+
+  - `:stale_stage` — another writer moved it between the read and the compare-and-set.
+  - `:stale_claim_epoch` — the same, plus a claim release. `Loopctl.Delivery.Stages` checks the
+    epoch BEFORE the stage, so a racing park that also released the claim surfaces as this and
+    never as `:stale_stage`. Confirmed by reading `transition/6`: `share_lock_story/2`, then
+    the epoch rollback, then `compare_and_set/4`.
+  - `{:no_escalation_edge, stage}` — including the ordinary case where the row is ALREADY at
+    `escalated`, which has no `:session_escalated` edge leaving it.
+
+  A row at `escalated` is the outcome this call wanted, whoever wrote it, so it is `:ok`.
+  Anything else returns the original error unchanged, which is what keeps the module's loudest
+  signal — "NOT ESCALATED" at `:error` — for the genuinely stranded story it was written for.
+  One re-read, no recursion.
 
   The epoch is deliberately NOT compared, unlike `Loopctl.Delivery.Escalations.escalate/3`.
   That one is a SESSION claiming its own escalation, so an escalation under another epoch is
   somebody else's. This is control asking for the story to be PARKED; parked under any epoch
   is the outcome, and a human looks at it either way.
   """
-  @spec settle_lost_race({:ok, StoryStage.t()} | {:error, term()}, Ecto.UUID.t(), Ecto.UUID.t()) ::
+  @spec settle_if_parked({:ok, StoryStage.t()} | {:error, term()}, Ecto.UUID.t(), Ecto.UUID.t()) ::
           {:ok, StoryStage.t()} | {:error, term()}
-  def settle_lost_race(result, tenant_id, story_id)
+  def settle_if_parked(result, tenant_id, story_id)
 
-  def settle_lost_race({:error, reason}, tenant_id, story_id)
-      when reason in [:stale_stage, :invalid_transition] do
+  def settle_if_parked({:error, reason}, tenant_id, story_id)
+      when reason in [:stale_stage, :stale_claim_epoch, :invalid_transition]
+      when is_tuple(reason) and elem(reason, 0) == :no_escalation_edge do
     case Stages.get(tenant_id, story_id) do
       %StoryStage{stage: :escalated} = row -> {:ok, row}
       _other -> {:error, reason}
     end
   end
 
-  def settle_lost_race(result, _tenant_id, _story_id), do: result
+  def settle_if_parked(result, _tenant_id, _story_id), do: result
 
   # BOUNDED against the same cap `Stages` enforces, read from its accessor rather than
   # restated. Unbounded, this was the sibling of the reason truncation below and the same
@@ -276,8 +298,8 @@ defmodule Loopctl.Delivery.StoryPayload do
 
   # Capped at the same bound `story_stages_text_bounds` holds the column to, read from the
   # machine rather than restated, so a story with many violations cannot produce a reason the
-  # transition then refuses — which would turn "too large to dispatch" into "too large to
-  # escalate", the one outcome that leaves a story nowhere.
+  # transition then refuses — which would turn "not dispatchable" into "not escalatable
+  # either", the one outcome that leaves a story nowhere.
   defp reason_text(violations) do
     text =
       "loopctl did not dispatch this story: it does not satisfy the runner contract's story " <>
