@@ -6,6 +6,26 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **A dispatch now CLAIMS the story it is sent for, and a runner names an agent (#803).**
+  `Loopctl.Delivery.Placement.place/4` is the path a queued story reaches a runner by: it
+  mints a custody `dispatches` row for the runner session, claims the story under that
+  dispatch (so `stories.implementer_dispatch_id` and `assigned_agent_id` are set), advances
+  the delivery stage row `queued -> claimed` with the minted lineage, and only then pushes.
+  Before this, a dispatch reached a real runner whose first stage report was refused
+  `stale_stage`, because nothing had claimed the story.
+
+  **New migration, with a backfill and one deploy-ordering consequence.** `runners.agent_id`
+  is added NOT NULL and backfilled with one `runner:<machine name>` agent per runner (an
+  agent a tenant already named that way is reused, not duplicated). A claimed story with an
+  implementer dispatch and no `assigned_agent_id` violates
+  `stories_reported_done_requires_agent`, so the column is what makes the dispatch path
+  reachable at all. `SET NOT NULL` scans `runners`, which is one row per enrolled machine.
+  **Enrollment (`POST /api/v1/runners`) fails for any node still running the previous
+  release once the column exists**, because that code inserts no `agent_id` — so migrate and
+  deploy together rather than leaving a long window, or expect enrollments in it to 500.
+  Nothing else is affected: existing runners keep working, and the runner API renders no new
+  field.
+
 - **Runner contract 1.5.0: a dispatch carries the story as typed fields, and a runner may
   refuse a kind it does not do (#803).** An `implement` dispatch now carries a `RunnerStory`
   object — id, title, description, acceptance criteria, test cases, predicted touches and a

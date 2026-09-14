@@ -96,6 +96,7 @@ defmodule Loopctl.Runners do
 
   alias Ecto.Multi
   alias Loopctl.AdminRepo
+  alias Loopctl.Agents.Agent
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.AuditChain
   alias Loopctl.AuditChain.Entry, as: AuditEntry
@@ -143,9 +144,15 @@ defmodule Loopctl.Runners do
   def pool(tenant_id) when is_binary(tenant_id), do: Presence.list(pool_topic(tenant_id))
 
   @doc """
-  Enrolls a machine as a runner: mints its `:agent` API key and binds it to `name` in
-  one transaction, and records the enrollment on the audit chain. `max_sessions` (1..64,
-  default `Runner.default_max_sessions/0`) is how many slots loopctl will reserve on it.
+  Enrolls a machine as a runner: mints its `:agent` API key, gets or creates the
+  `runner:<name>` agent its sessions work as, and binds both to `name` in one transaction,
+  then records the enrollment on the audit chain. `max_sessions` (1..64, default
+  `Runner.default_max_sessions/0`) is how many slots loopctl will reserve on it.
+
+  The agent is GOT or created, never created blindly: `runners_active_name_uidx` is partial on
+  `revoked_at IS NULL`, so re-enrolling a revoked machine makes a second runner row for the
+  same machine, and both rows must name the one agent — the work is the same machine's either
+  way. An agent the tenant already named `runner:<name>` is adopted for the same reason.
 
   Returns `{:ok, %{runner: runner, raw_key: raw_key}}`. The raw key is returned once
   and never stored.
@@ -182,9 +189,11 @@ defmodule Loopctl.Runners do
       |> Multi.run(:mint_key, fn _repo, _ ->
         Auth.generate_api_key(%{tenant_id: tenant_id, name: "runner:" <> name, role: :agent})
       end)
-      |> Multi.run(:runner, fn _repo, %{mint_key: {_raw, api_key}} ->
+      |> Multi.run(:agent, fn _repo, _ -> runner_agent(tenant_id, name) end)
+      |> Multi.run(:runner, fn _repo, %{mint_key: {_raw, api_key}, agent: agent} ->
         changeset
         |> Ecto.Changeset.put_change(:api_key_id, api_key.id)
+        |> Ecto.Changeset.put_change(:agent_id, agent.id)
         |> AdminRepo.insert()
       end)
       |> Multi.run(:audit, fn _repo, %{runner: runner, mint_key: {_raw, api_key}} ->
@@ -196,6 +205,7 @@ defmodule Loopctl.Runners do
           payload: %{
             "name" => runner.name,
             "api_key_id" => api_key.id,
+            "agent_id" => runner.agent_id,
             "max_sessions" => runner.max_sessions
           }
         })
@@ -207,6 +217,49 @@ defmodule Loopctl.Runners do
 
       {:error, _step, reason, _} ->
         {:error, reason}
+    end
+  end
+
+  @doc """
+  The name of the agent a runner's sessions work as: `runner:<machine name>`.
+
+  THE one declaration on the Elixir side. `20260920100000_add_agent_id_to_runners.exs`
+  restates it as SQL because a migration cannot call this, and nothing binds the two — see
+  that migration's note.
+  """
+  @spec agent_name(String.t()) :: String.t()
+  def agent_name(name) when is_binary(name), do: "runner:" <> name
+
+  # Get-or-create, in the enrollment transaction. `ON CONFLICT DO NOTHING` plus a read is the
+  # shape rather than `register_agent/3` + rescue: two enrollments of one machine name race
+  # here (the partial active-name index does not stop a revoked name being re-enrolled twice),
+  # and an insert that loses must find the winner's row rather than fail the enrollment.
+  defp runner_agent(tenant_id, name) do
+    agent_name = agent_name(name)
+    now = DateTime.utc_now()
+
+    AdminRepo.insert_all(
+      Agent,
+      [
+        %{
+          id: Ecto.UUID.generate(),
+          tenant_id: tenant_id,
+          name: agent_name,
+          agent_type: :implementer,
+          status: :active,
+          last_seen_at: now,
+          metadata: %{},
+          inserted_at: now,
+          updated_at: now
+        }
+      ],
+      on_conflict: :nothing,
+      conflict_target: [:tenant_id, :name]
+    )
+
+    case AdminRepo.get_by(Agent, tenant_id: tenant_id, name: agent_name) do
+      nil -> {:error, :agent_not_resolved}
+      agent -> {:ok, agent}
     end
   end
 

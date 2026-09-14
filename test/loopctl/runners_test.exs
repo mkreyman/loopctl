@@ -4,6 +4,7 @@ defmodule Loopctl.RunnersTest do
   import Ecto.Query
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Agents.Agent
   alias Loopctl.AuditChain.Entry
   alias Loopctl.Auth
   alias Loopctl.Runners
@@ -34,6 +35,29 @@ defmodule Loopctl.RunnersTest do
                    e.tenant_id == ^tenant.id and e.action == "runner_enrolled" and
                      e.entity_id == ^runner.id
              )
+    end
+
+    test "binds the machine to a `runner:<name>` agent, and re-enrollment reuses it" do
+      tenant = fixture(:tenant)
+
+      assert {:ok, %{runner: runner}} = Runners.enroll_runner(tenant.id, %{name: "minis"})
+
+      agent = AdminRepo.get!(Agent, runner.agent_id)
+      assert agent.tenant_id == tenant.id
+      assert agent.name == Runners.agent_name("minis")
+      assert agent.agent_type == :implementer
+
+      # `Loopctl.Delivery.Placement` claims the story for THIS agent, and a claimed story with
+      # an implementer dispatch and no `assigned_agent_id` violates
+      # `stories_reported_done_requires_agent` — so the binding is what makes the whole
+      # dispatch path reachable, not attribution polish.
+      assert AdminRepo.get!(Runner, runner.id).agent_id == agent.id
+
+      # The active-name index is partial on `revoked_at IS NULL`, so the same machine can be
+      # enrolled again — and it is the same machine, so it keeps the one agent.
+      {:ok, _revoked} = Runners.revoke_runner(tenant.id, runner.id)
+      assert {:ok, %{runner: again}} = Runners.enroll_runner(tenant.id, %{name: "minis"})
+      assert again.agent_id == agent.id
     end
 
     test "enrolls with max_sessions, defaulting to two, and refuses one out of range" do

@@ -16,10 +16,17 @@ defmodule Loopctl.Runners.Runner do
   values a runner reports in Presence are a hint. `in_flight` is written only by
   `Loopctl.Runners.Capacity`, never through a changeset.
 
+  It also names the AGENT its sessions work as (#803): `agent_id`, the `runner:<name>` agent
+  row `Loopctl.Runners.enroll_runner/3` gets or creates. A dispatch claims the story it is
+  sent for and a claim writes `stories.assigned_agent_id`, so without this a runner-claimed
+  story named nobody. The agent belongs to the MACHINE rather than to this row: re-enrolling
+  a revoked name makes a second runner row pointing at the same agent, which is why nothing
+  makes `agent_id` unique here.
+
   ## Trust boundary
 
-  `tenant_id`, `api_key_id`, `revoked_at` and `in_flight` are set programmatically in
-  `Loopctl.Runners`, never via `cast/3`. `name` and `max_sessions` are the caller-supplied
+  `tenant_id`, `api_key_id`, `agent_id`, `revoked_at` and `in_flight` are set programmatically
+  in `Loopctl.Runners`, never via `cast/3`. `name` and `max_sessions` are the caller-supplied
   fields.
 
   ## Isolation
@@ -60,6 +67,7 @@ defmodule Loopctl.Runners.Runner do
   schema "runners" do
     tenant_field()
     field :api_key_id, :binary_id
+    field :agent_id, :binary_id
     field :name, :string
     field :max_sessions, :integer, default: @default_max_sessions
     field :in_flight, :integer, default: 0
