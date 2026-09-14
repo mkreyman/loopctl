@@ -40,9 +40,39 @@ defmodule Loopctl.Repo.Migrations.AddAgentIdToRunners do
      unique by construction AND makes the join back exact, where a `LIKE 'runner:<name>-%'`
      would also match a runner genuinely named `<name>-<something>`.
 
-  If a row is still NULL after both passes — someone holds `runner:<name>-<that exact uuid>` —
-  the `SET NOT NULL` below FAILS THE MIGRATION. Deliberate: refusing to deploy is correct where
-  the alternative is binding a machine's work to somebody else's agent.
+  Pass 2 BINDS BY EXACT NAME rather than by what it inserted, and that is the one place
+  adopting by name is safe: the name embeds the RUNNER'S OWN UUID, and the squatting principal
+  cannot learn it. Squatting is an `AgentController` `:register` call, `exact_role: :agent`,
+  while every `RunnerController` action including `index` is `role: :user` — so an agent-role
+  key cannot list runners and has no way to spell `runner:<name>-<that exact uuid>`. A `:user`
+  key could, and a `:user` key is the operator.
+
+  **So `SET NOT NULL` does not, in practice, have a case to fail on**, and an earlier draft of
+  this note claimed it did. Pass 2 always finds or creates the suffixed agent, so a row stays
+  NULL only if that INSERT and that BIND both fail, which needs a same-tenant agent at the
+  suffixed name — the case just shown to be unreachable to the threat, and adopted rather than
+  refused when an operator creates it. The constraint stays as the structural backstop it is;
+  it is not the squat defence.
+
+  ## `up` AFTER A `down` LEAVES ONE ORPHANED AGENT PER RUNNER, ONCE
+
+  `down/0` drops the column and leaves the agents standing — it must, because
+  `stories.assigned_agent_id` may already reference them and deleting one would either fail on
+  the FK or strip a story's attribution. The squat-safety above is what costs the idempotency
+  the earlier join-by-name version had, and the trade is stated here rather than discovered:
+
+  - first `up`: a runner with a free name gets `runner:<name>`.
+  - `down`: column gone, that agent orphaned.
+  - second `up`: pass 1 now conflicts with the agent the FIRST run created and binds nothing —
+    it cannot tell that row from a squatter's — so pass 2 binds `runner:<name>-<runner id>`.
+    The `runner:<name>` agent is left behind, referenced by whatever already pointed at it.
+  - every `up` after that: pass 2's insert conflicts and its BIND adopts the same
+    `runner:<name>-<runner id>` row. No further agents are created.
+
+  So the cost is bounded at one orphan per runner, on the first rollback cycle only, and an
+  operator who wants it gone deletes the unreferenced `runner:%` agents by hand. Pass 2 is split
+  into insert-then-bind for exactly this: binding only what a single statement RETURNED would
+  have created a fresh agent on every cycle.
 
   The `'runner:' || ...` literal below is a SECOND copy of `Loopctl.Runners.agent_name/1`,
   because a migration cannot call application code. `runners_test.exs` asserts the ENROLL path
@@ -76,22 +106,27 @@ defmodule Loopctl.Repo.Migrations.AddAgentIdToRunners do
        AND i.name = 'runner:' || r.name
     """)
 
-    # Pass 2: whatever pass 1 could not have, under a name unique by construction.
+    # Pass 2, INSERT: whatever pass 1 could not have, under a name unique by construction.
     execute("""
-    WITH inserted AS (
-      INSERT INTO agents (id, tenant_id, name, agent_type, status, last_seen_at, inserted_at, updated_at)
-      SELECT gen_random_uuid(), r.tenant_id, 'runner:' || r.name || '-' || r.id::text,
-             'implementer', 'active', now(), now(), now()
-        FROM runners r
-       WHERE r.agent_id IS NULL
-      ON CONFLICT (tenant_id, name) DO NOTHING
-      RETURNING id, tenant_id, name
-    )
+    INSERT INTO agents (id, tenant_id, name, agent_type, status, last_seen_at, inserted_at, updated_at)
+    SELECT gen_random_uuid(), r.tenant_id, 'runner:' || r.name || '-' || r.id::text,
+           'implementer', 'active', now(), now(), now()
+      FROM runners r
+     WHERE r.agent_id IS NULL
+    ON CONFLICT (tenant_id, name) DO NOTHING
+    """)
+
+    # Pass 2, BIND: by exact name rather than by what this statement inserted, which is the one
+    # place adopting by name is safe — the name embeds the RUNNER'S OWN UUID, which nobody can
+    # hold without having read the row. That is also what makes a re-run converge: see the
+    # rollback note in the moduledoc.
+    execute("""
     UPDATE runners r
-       SET agent_id = i.id
-      FROM inserted i
-     WHERE i.tenant_id = r.tenant_id
-       AND i.name = 'runner:' || r.name || '-' || r.id::text
+       SET agent_id = a.id
+      FROM agents a
+     WHERE r.agent_id IS NULL
+       AND a.tenant_id = r.tenant_id
+       AND a.name = 'runner:' || r.name || '-' || r.id::text
     """)
 
     alter table(:runners) do

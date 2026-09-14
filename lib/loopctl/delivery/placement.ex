@@ -103,11 +103,17 @@ defmodule Loopctl.Delivery.Placement do
   That is the recoverable direction, and the other one is not:
 
   - **Claimed, never pushed.** The story is `assigned` at stage `claimed` with no session. A
-    refusal from `Runners.dispatch/3` is answered inline by releasing the claim
-    (`Loopctl.Progress.force_unclaim_story/3`), which bumps the epoch and requeues the stage
-    row over `:claim_released`. If THAT fails too, the claim's lease expires and
-    `Loopctl.Workers.ReclaimExpiredClaimsWorker` does the same thing over `:runner_lost`. Both
-    ends are already built; nothing is stranded.
+    refusal from `Runners.dispatch/3` is answered inline by `undo_claim/5`: release the claim
+    (`Loopctl.Progress.force_unclaim_story/3`, which bumps the epoch and requeues the stage row
+    over `:claim_released`), unrecord the session dispatch, revoke it.
+
+    **The lease is a PARTIAL backstop, and this used to say it was a total one.** If the
+    release fails, `Loopctl.Workers.ReclaimExpiredClaimsWorker` does release the claim over
+    `:runner_lost` — but `release_claim_changes/1` clears no dispatch id and nothing revokes a
+    dispatch, so the two steps the lease does not perform are precisely the two this path
+    added. The unrecord no longer depends on the release having succeeded (it predicates on the
+    dispatch id alone), so in practice the gap is the revoke; `log_undo/5` names any step that
+    did not do what it was for, because nothing downstream will.
   - **Pushed, never claimed.** A session starts work on a story whose stage row refuses every
     report it makes, for as long as the session runs. Nothing recovers it, because nothing is
     wrong from the row's point of view. That is the failure that was observed in production,
@@ -386,6 +392,9 @@ defmodule Loopctl.Delivery.Placement do
     end
   end
 
+  # Returns `:ok` or the failure, so the undo can report it rather than swallow it. The failure
+  # is worth naming on its own: the ephemeral key stays live for its full TTL with no session
+  # that will ever use it, and nothing else revokes it.
   defp revoke_session_dispatch(tenant_id, session, reason) do
     case Dispatches.revoke(tenant_id, session.id) do
       {:ok, _count} ->
@@ -399,7 +408,7 @@ defmodule Loopctl.Delivery.Placement do
           tenant_id: tenant_id
         )
 
-        :ok
+        other
     end
   end
 
@@ -511,28 +520,55 @@ defmodule Loopctl.Delivery.Placement do
     end
   end
 
-  # THE WHOLE UNDO: release the claim, UNRECORD the session dispatch, then revoke it. Three
-  # steps because the claim's release does only the first.
+  # THE WHOLE UNDO: release the claim, UNRECORD the session dispatch, revoke it. Three steps
+  # because the claim's release does only the first.
   #
   # `Progress.release_claim_changes/1` clears `assigned_agent_id` and does NOT clear
   # `implementer_dispatch_id` — correctly, for its own callers: a reclaimed or unclaimed story
-  # keeps the provenance of who was working on it. Here nobody was. Leaving the id behind on a
-  # story going back to `pending` is not merely untidy, it POISONS the story two ways:
+  # keeps the provenance of who was working on it. Here nobody was, and a story left naming a
+  # dispatch that did nothing refuses its NEXT claimant — `caller_lineage_required` for an
+  # unlineaged one, `self_report_blocked` for one whose lineage shares a chain with the stale
+  # dispatch. Revoking changes neither of those; see
+  # `Progress.clear_unused_implementer_dispatch/3` for why the opposite claim, which this
+  # comment used to make, was false.
   #
-  # - revoked-and-recorded is the worse half. `Progress`' `lineage_status/2` resolves the
-  #   recorded dispatch's lineage, a revoked row yields `[]`, and `[]` there is
-  #   `:unresolvable` — fail CLOSED — so the next agent to do this story could never report it.
-  # - unrevoked-and-recorded is the half the review found: `validate_not_self_report/3` refuses
-  #   the agent that actually did the work with `caller_lineage_required`, because its own
-  #   lineage is not the stale one the story names.
+  # ## What the ORDER is and is not
   #
-  # So the order matters: unrecord BEFORE revoking, and make the unrecord conditional on the
-  # story still naming THIS dispatch and still being unclaimed, so a story someone re-claimed
-  # in the meantime is left entirely alone.
+  # RELEASE FIRST IS REQUIRED. Everything downstream describes a story nobody is working on,
+  # and the release is what makes that true.
+  #
+  # CLEAR BEFORE REVOKE IS NOT REQUIRED, and this no longer claims it is. It was justified by
+  # the false mechanism above; with that gone the two are independent — a story naming a
+  # revoked dispatch and one naming a live dispatch are refused identically. They stay in this
+  # order because it reads as the undo of the claim that recorded it, not because a window
+  # between them is dangerous.
+  #
+  # Each step reports, and `log_undo/5` says so when any of them did not do what it was for.
+  # Nothing here rolls anything back on failure: the caller is owed the refusal that brought it
+  # here, not a second one.
   defp undo_claim(tenant_id, story_id, session, reason, opts) do
-    release_claim(tenant_id, story_id, reason, opts)
-    Progress.clear_unused_implementer_dispatch(tenant_id, story_id, session.id)
-    revoke_session_dispatch(tenant_id, session, reason)
+    release = release_claim(tenant_id, story_id, reason, opts)
+    cleared = Progress.clear_unused_implementer_dispatch(tenant_id, story_id, session.id)
+    revoked = revoke_session_dispatch(tenant_id, session, reason)
+    log_undo(tenant_id, story_id, session, reason, {release, cleared, revoked})
+  end
+
+  # Silent when the undo did everything it is for. `{:ok, :unchanged}` from the clear is NOT a
+  # failure — it means the story no longer names this dispatch, which is what a re-claim
+  # THROUGH A DISPATCH leaves behind — but it is worth one line, because it is also what a
+  # deleted story leaves behind and nothing else on this path would say so.
+  defp log_undo(_tenant_id, _story_id, _session, _reason, {:ok, {:ok, :cleared}, :ok}), do: :ok
+
+  defp log_undo(tenant_id, story_id, session, reason, {release, cleared, revoked}) do
+    Logger.warning(
+      "placement undo did not fully undo: tenant_id=#{tenant_id} story_id=#{story_id} " <>
+        "session_dispatch_id=#{session.id} placement_error=#{inspect(reason)} " <>
+        "release=#{inspect(release)} clear=#{inspect(cleared)} revoke=#{inspect(revoked)}",
+      tenant_id: tenant_id,
+      story_id: story_id
+    )
+
+    :ok
   end
 
   # Compensation, not a second decision. A refusal after the claim committed means no session
@@ -552,6 +588,10 @@ defmodule Loopctl.Delivery.Placement do
   # `DBConnection` error. None of those is `{:error, _}`, so each one replaced the push refusal
   # the caller is owed with an exception, LOST the original reason, and left the claim standing
   # anyway — strictly worse than the outcome this function exists to improve on.
+  # Returns `:ok` or the failure. It used to return `:ok` unconditionally, which read as "the
+  # lease is the backstop, nothing is stranded" — no longer true now that the undo has steps
+  # the lease does not perform, and the caller cannot tell a released claim from a swallowed
+  # failure if every outcome looks the same.
   defp release_claim(tenant_id, story_id, reason, opts) do
     case Progress.force_unclaim_story(tenant_id, story_id,
            actor_label: Keyword.get(opts, :actor_label)
@@ -565,14 +605,14 @@ defmodule Loopctl.Delivery.Placement do
 
   defp log_release_failure(tenant_id, story_id, reason, outcome) do
     Logger.error(
-      "placement could not release the claim it made; the lease is the backstop: " <>
-        "tenant_id=#{tenant_id} story_id=#{story_id} " <>
+      "placement could not release the claim it made; the lease releases the CLAIM but " <>
+        "clears no dispatch id: tenant_id=#{tenant_id} story_id=#{story_id} " <>
         "placement_error=#{inspect(reason)} release_error=#{inspect(outcome)}",
       tenant_id: tenant_id,
       story_id: story_id
     )
 
-    :ok
+    {:error, outcome}
   end
 
   defp implementer_dispatch_id(tenant_id, story_id) do

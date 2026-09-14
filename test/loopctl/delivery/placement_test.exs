@@ -336,7 +336,17 @@ defmodule Loopctl.Delivery.PlacementTest do
       # `:runner_not_connected` AFTER the claim has committed — the window this compensates.
       disconnect(channel, runner)
 
-      assert {:error, :runner_not_connected} = place(ctx, dispatch_payload(story))
+      # A COMPLETE undo says nothing. `log_undo/5` warns only when a step did not do what it
+      # was for, and a warning on the ordinary compensation path would be noise that trains an
+      # operator to skip the line that matters. (The FAILURE half of that log is not falsifiable
+      # here — nothing in this harness can make `force_unclaim_story/3` fail — and is reported
+      # as such rather than counted.)
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert {:error, :runner_not_connected} = place(ctx, dispatch_payload(story))
+        end)
+
+      refute log =~ "placement undo did not fully undo"
 
       released = unboxed(fn -> reload(runner.tenant_id, story.id) end)
       assert released.agent_status == :pending
@@ -348,11 +358,15 @@ defmodule Loopctl.Delivery.PlacementTest do
       assert row.claim_epoch == released.claim_epoch
 
       # The claim's release does NOT clear `implementer_dispatch_id` — correctly, for its own
-      # callers — so the undo has to, and it has to revoke the dispatch too. Left recorded, a
-      # REVOKED dispatch resolves to an empty lineage, which `lineage_status/2` fails CLOSED on
-      # (`unresolvable_dispatch_lineage`), so the next agent to do this story could never
-      # report it; left recorded and UNREVOKED, that agent is refused
-      # `caller_lineage_required` instead. Both are a story poisoned by a session that never ran.
+      # callers — so the undo has to. Left recorded, the next claimant is judged against a
+      # dispatch that did nothing: refused `caller_lineage_required` if unlineaged, or
+      # `self_report_blocked` if its lineage shares a chain with the stale one.
+      #
+      # REVOKING CHANGES NEITHER OF THOSE, and an earlier version of this comment said it did.
+      # `Dispatches.get_dispatch/2` has no `revoked_at` filter and `revoke/2` leaves
+      # `lineage_path` intact, so a revoked recorded dispatch resolves exactly like a live one.
+      # The revoke is asserted because the KEY must not stay live for its TTL with no session
+      # to use it — a credential-hygiene property, not a custody-gate one.
       assert is_nil(released.implementer_dispatch_id)
       assert unboxed(fn -> session_dispatch(runner.tenant_id, story.id) end).revoked_at
     end

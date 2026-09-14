@@ -5,21 +5,25 @@ defmodule Loopctl.Progress.ClearUnusedImplementerDispatchTest do
 
   `release_claim_changes/1` deliberately keeps `implementer_dispatch_id` on an unclaimed or
   reclaimed story: that is the provenance the L4 gates compare. The one case where it is
-  VACUOUS is a placement that claimed a story, failed before any session started, released it,
-  and is about to revoke the dispatch it recorded — at which point leaving the id behind
-  POISONS the story, because `lineage_status/2` reads a revoked dispatch as an empty lineage
-  and fails CLOSED.
+  VACUOUS is a placement that claimed a story, failed before any session started, and released
+  it — the recorded dispatch did nothing, and the next claimant is then judged against it:
+  refused `caller_lineage_required` if unlineaged, `self_report_blocked` if its lineage shares
+  a chain with the stale one.
 
-  Both conditions in its WHERE are tested here rather than described, because the placement's
-  own happy path cannot reach either: at the moment it calls this, the story is always
-  `pending` and always names this dispatch, so a mutation that DROPS a condition stays green
-  against that test. (`bin/mutate.sh` said exactly that — dropping the `agent_status` guard
-  came back exit 1 against `placement_test.exs`.)
+  **Revocation has nothing to do with it**, contrary to what this file used to say. A revoked
+  dispatch still resolves its `lineage_path` — `Dispatches.get_dispatch/2` has no `revoked_at`
+  filter and `revoke/2` leaves the path intact — so `:unresolvable` comes only from a missing
+  or foreign row, and a revoked recorded dispatch behaves exactly like a live one.
+
+  Its WHERE is tested here rather than described, because the placement's own happy path cannot
+  reach the cases that decide it: at the moment it calls this, the story always names this
+  dispatch, so a mutation that DROPS a condition stays green against `placement_test.exs`.
   """
 
   use Loopctl.DataCase, async: true
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Audit.AuditLog
   alias Loopctl.Dispatches
   alias Loopctl.Progress
   alias Loopctl.WorkBreakdown.Story
@@ -32,7 +36,7 @@ defmodule Loopctl.Progress.ClearUnusedImplementerDispatchTest do
     %{tenant: tenant, story: story}
   end
 
-  test "clears the id when the story is pending and names THAT dispatch", ctx do
+  test "clears the id when the story names THAT dispatch", ctx do
     %{tenant: tenant, story: story} = ctx
     dispatch_id = dispatch(tenant)
     record(story, dispatch_id, :pending)
@@ -43,19 +47,49 @@ defmodule Loopctl.Progress.ClearUnusedImplementerDispatchTest do
     assert is_nil(reload(story).implementer_dispatch_id)
   end
 
-  test "leaves a story somebody re-claimed between the release and this call alone", ctx do
+  test "clears it even on a story a LEGACY BEARER key has already re-claimed", ctx do
     %{tenant: tenant, story: story} = ctx
     dispatch_id = dispatch(tenant)
 
-    # The race the `agent_status == :pending` condition exists for: the compensation released
-    # the claim, another agent claimed the story, and by the time this runs the id it is about
-    # to clear belongs to work that is now UNDER WAY.
+    # There was an `agent_status == :pending` condition here, to leave a re-claimed story
+    # alone. This is the case that shows it was wrong. A re-claim THROUGH A DISPATCH overwrites
+    # `implementer_dispatch_id`, so the id predicate already declines those; a BEARER re-claim
+    # writes no dispatch id, so the story is `:assigned` and still names the dead placement's
+    # dispatch — and there the stale id is exactly as poisonous for the new claimant, who is
+    # the unlineaged caller `caller_lineage_required` refuses.
     record(story, dispatch_id, :assigned)
 
-    assert {:ok, :unchanged} =
+    assert {:ok, :cleared} =
              Progress.clear_unused_implementer_dispatch(tenant.id, story.id, dispatch_id)
 
-    assert reload(story).implementer_dispatch_id == dispatch_id
+    assert is_nil(reload(story).implementer_dispatch_id)
+  end
+
+  test "a re-claim through a DISPATCH is declined, because it overwrote the id", ctx do
+    %{tenant: tenant, story: story} = ctx
+    dead_placement = dispatch(tenant)
+    new_implementer = dispatch(tenant)
+    record(story, new_implementer, :assigned)
+
+    assert {:ok, :unchanged} =
+             Progress.clear_unused_implementer_dispatch(tenant.id, story.id, dead_placement)
+
+    assert reload(story).implementer_dispatch_id == new_implementer
+  end
+
+  test "records the clear on the audit log", ctx do
+    %{tenant: tenant, story: story} = ctx
+    dispatch_id = dispatch(tenant)
+    record(story, dispatch_id, :pending)
+
+    {:ok, :cleared} = Progress.clear_unused_implementer_dispatch(tenant.id, story.id, dispatch_id)
+
+    # `update_all` bypasses changesets, so without this nothing records that the story STOPPED
+    # naming the dispatch — while the hash chain still carries `dispatch_created` and
+    # `story_stage_claimed` naming it.
+    assert %{action: "implementer_dispatch_cleared"} = entry = latest_entry(tenant, story)
+    assert entry.old_state["implementer_dispatch_id"] == dispatch_id
+    assert entry.new_state["implementer_dispatch_id"] == nil
   end
 
   test "never erases a DIFFERENT implementer's provenance", ctx do
@@ -100,4 +134,14 @@ defmodule Loopctl.Progress.ClearUnusedImplementerDispatchTest do
   end
 
   defp reload(story), do: AdminRepo.get!(Story, story.id)
+
+  defp latest_entry(tenant, story) do
+    import Ecto.Query, only: [from: 2]
+
+    AdminRepo.one!(
+      from e in AuditLog,
+        where: e.tenant_id == ^tenant.id and e.entity_id == ^story.id,
+        where: e.action == "implementer_dispatch_cleared"
+    )
+  end
 end

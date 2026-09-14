@@ -12,30 +12,39 @@ defmodule Loopctl.Custody.ContextSurfaceTest do
   The direction that matters more is "claimed but does not enforce": the declaration would then
   assert a gate that is not there, which is worse than an unclaimed enforcement.
 
+  ## It parses; it does not grep
+
+  The first version matched raw file text, and a `#` comment satisfied it — a module declared
+  as enforcing the halt that only MENTIONED `Runners.custody_halted?(` in prose passed, in the
+  direction this guard's own failure message calls the dangerous one. `Loopctl.SourceScan` walks
+  the AST instead, and a comment cannot produce a call node.
+
   ## Scope limits, stated so this is not over-trusted
 
-  It scans SOURCE TEXT, so a call reached through an alias this regex does not spell, or
-  injected by a macro, is invisible to it. It cannot tell an enforced refusal from a call whose
-  result is discarded. And it says nothing about whether a context SHOULD be gated — only that
-  the declaration and the calls agree. Judging what belongs on the halt surface is
+  It matches the module's last alias segment, so `Runners.custody_halted?(...)` and the fully
+  qualified form both count; a call through a RENAMED alias, one built by a macro, and
+  `apply/3` are invisible to it. It cannot tell an enforced refusal from a call whose result is
+  discarded. And it says nothing about whether a context SHOULD be gated — only that the
+  declaration and the calls agree. Judging what belongs on the halt surface is
   `LoopctlWeb.CustodySurface`'s moduledoc, and it is a human's call.
   """
 
   use ExUnit.Case, async: true
 
   alias Loopctl.Custody.ContextSurface
+  alias Loopctl.SourceScan
 
-  # `lib/loopctl/runners.ex` DEFINES `custody_halted?/1` and calls it for `dispatch/3`, which
-  # is reached through a route. A definition is not an enforcement, and that call is the web
-  # surface's, so the file is excluded rather than declared.
+  # Deliberately anchored on the `Runners` MODULE — `Tenants.custody_halted?/1` takes an
+  # already-loaded struct and is the MONITOR's read (`Loopctl.Custody.ViolationMonitor`), not a
+  # gate: a struct loaded before the halt was armed answers `false` for ever. Matching the bare
+  # function name would sweep that in and make the guard assert something it does not mean.
+  #
+  # `lib/loopctl/runners.ex` is NOT excluded, and the exclusion it used to carry was inert:
+  # that file's own call is UNQUALIFIED (`if custody_halted?(tenant_id)`), so it never matched
+  # a module-qualified scan and the exclusion removed nothing — while standing ready to hide a
+  # real routeless halt gate added there later. If a qualified self-call ever appears in it,
+  # this guard will report it and somebody will have to decide whether it belongs on the map.
   @scan_glob "lib/loopctl/**/*.ex"
-  @definition_source "lib/loopctl/runners.ex"
-
-  # Deliberately anchored on `Runners.` — `Tenants.custody_halted?/1` takes an already-loaded
-  # struct and is the MONITOR's read (`Loopctl.Custody.ViolationMonitor`), not a gate: a struct
-  # loaded before the halt was armed answers `false` for ever. Matching the bare function name
-  # would sweep that in and make the guard assert something it does not mean.
-  @call_pattern ~r/(?<![\w.])(Loopctl\.)?Runners\.custody_halted\?\(/
 
   test "the declared halt-enforcing contexts are exactly the ones that call the check" do
     declared = Enum.sort(ContextSurface.halt_enforcing_contexts())
@@ -65,19 +74,6 @@ defmodule Loopctl.Custody.ContextSurfaceTest do
   end
 
   defp halt_enforcing_modules do
-    @scan_glob
-    |> Path.wildcard()
-    |> Enum.reject(&(&1 == @definition_source))
-    |> Enum.filter(&calls_halt_check?/1)
-    |> Enum.map(&defmodule_name/1)
-  end
-
-  defp calls_halt_check?(path), do: path |> File.read!() |> then(&Regex.match?(@call_pattern, &1))
-
-  defp defmodule_name(path) do
-    case Regex.run(~r/^defmodule\s+([\w.]+)\s+do/m, File.read!(path)) do
-      [_, module] -> module
-      nil -> flunk("could not read a defmodule name out of #{path} — widen defmodule_name/1")
-    end
+    SourceScan.callers(@scan_glob, :Runners, :custody_halted?)
   end
 end

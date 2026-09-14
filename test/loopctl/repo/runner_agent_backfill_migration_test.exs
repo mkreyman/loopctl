@@ -70,6 +70,64 @@ defmodule Loopctl.Repo.RunnerAgentBackfillMigrationTest do
     assert name_of(squatter) == "runner:minis"
   end
 
+  test "two runner rows of ONE machine in ONE tenant share ONE agent" do
+    # The headline invariant, and the least obvious behaviour in the file:
+    # `runners_active_name_uidx` is partial on `revoked_at IS NULL`, so re-enrolling a revoked
+    # machine leaves TWO rows with the same name. Pass 1's SELECT yields the same
+    # `runner:minis` twice, `ON CONFLICT DO NOTHING` resolves the intra-statement duplicate to
+    # ONE inserted row, and the single RETURNING row then binds BOTH runners by name.
+    tenant = insert_tenant()
+    revoked = insert_runner(tenant, "minis", revoked: true)
+    active = insert_runner(tenant, "minis")
+
+    migrate(:up)
+
+    assert agent_of(revoked) == agent_of(active)
+    assert name_of(agent_of(active)) == "runner:minis"
+  end
+
+  test "an agent already at the SUFFIXED name is adopted, and that is the safe case" do
+    tenant = insert_tenant()
+    runner = insert_runner(tenant, "minis")
+    squatted = insert_agent(tenant, "runner:minis")
+    preexisting = insert_agent(tenant, "runner:minis-#{runner}")
+
+    migrate(:up)
+
+    # This test was first written asserting the opposite — that both spellings being taken
+    # fails the migration at `SET NOT NULL`. It does not, because pass 2 BINDS BY NAME, and
+    # that is correct rather than a hole: the suffixed name embeds the runner's own uuid, and
+    # the squatting principal cannot learn it. Squatting is an `AgentController` `:register`
+    # call (`exact_role: :agent`) while every `RunnerController` action INCLUDING `index` is
+    # `role: :user`, so an agent-role key cannot list runners at all.
+    assert agent_of(runner) == preexisting
+    refute agent_of(runner) == squatted
+  end
+
+  test "a rollback and re-apply converges instead of creating an agent per cycle" do
+    tenant = insert_tenant()
+    runner = insert_runner(tenant, "minis")
+
+    migrate(:up)
+    first = agent_of(runner)
+    assert name_of(first) == "runner:minis"
+
+    # `down` leaves the agents standing — it must, because `stories.assigned_agent_id` may
+    # already point at them. So the second `up` cannot tell its own previous row from a
+    # squatter's and falls to pass 2, orphaning the first agent ONCE.
+    migrate(:down)
+    migrate(:up)
+    second = agent_of(runner)
+    assert name_of(second) == "runner:minis-#{runner}"
+    refute second == first
+
+    # And from there it CONVERGES: pass 2's insert conflicts and its bind adopts the same row,
+    # which is why pass 2 is split into insert-then-bind rather than binding what it RETURNED.
+    migrate(:down)
+    migrate(:up)
+    assert agent_of(runner) == second
+  end
+
   test "two runners of the same name in DIFFERENT tenants each get their own agent" do
     tenant_a = insert_tenant()
     tenant_b = insert_tenant()
@@ -143,16 +201,25 @@ defmodule Loopctl.Repo.RunnerAgentBackfillMigrationTest do
     id
   end
 
-  defp insert_runner(tenant_id, name) do
+  # `revoked: true` is what makes a SECOND row of the same name legal: the active-name index is
+  # partial on `revoked_at IS NULL`.
+  defp insert_runner(tenant_id, name, opts \\ []) do
     id = Ecto.UUID.generate()
     key_id = insert_api_key(tenant_id, name)
+    revoked_at = if Keyword.get(opts, :revoked, false), do: DateTime.utc_now()
 
     AdminRepo.query!(
       """
-      INSERT INTO runners (id, tenant_id, api_key_id, name, max_sessions, in_flight, inserted_at, updated_at)
-      VALUES ($1::uuid, $2::uuid, $3::uuid, $4, 2, 0, now(), now())
+      INSERT INTO runners (id, tenant_id, api_key_id, name, max_sessions, in_flight, revoked_at, inserted_at, updated_at)
+      VALUES ($1::uuid, $2::uuid, $3::uuid, $4, 2, 0, $5, now(), now())
       """,
-      [Ecto.UUID.dump!(id), Ecto.UUID.dump!(tenant_id), Ecto.UUID.dump!(key_id), name]
+      [
+        Ecto.UUID.dump!(id),
+        Ecto.UUID.dump!(tenant_id),
+        Ecto.UUID.dump!(key_id),
+        name,
+        revoked_at
+      ]
     )
 
     id

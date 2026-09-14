@@ -20,6 +20,7 @@ defmodule Loopctl.Tenants.TierCapabilitiesTest do
 
   setup :verify_on_exit!
 
+  alias Loopctl.SourceScan
   alias Loopctl.Tenants.TierCapabilities
 
   describe "for_tier/1 — agent_rooted" do
@@ -391,24 +392,22 @@ defmodule Loopctl.Tenants.TierCapabilitiesTest do
     String.match?(source, ~r/^\s*plug[\s(]+(LoopctlWeb\.Plugs\.)?RequireHumanAnchor\b/m)
   end
 
-  # The context half. Same shape and the same scope limits as the controller scan: SOURCE
-  # TEXT, matching a CALL to `Tenants.require_human_anchor(` with or without the full alias,
-  # under `lib/loopctl/**` and never `lib/loopctl_web/**` (the plug is the web layer's job).
-  # `Loopctl.Tenants` itself is excluded — it DEFINES the function, and a definition is not an
-  # enforcement.
+  # The context half, and it PARSES rather than greps (#833 round 3). The first version matched
+  # raw source text, so a `#` comment naming the function counted as enforcement — the same
+  # defect the sibling halt guard had, in the direction both of their failure messages call the
+  # dangerous one. `Loopctl.SourceScan` walks the AST, and a comment cannot produce a call node.
+  #
+  # Scanned under `lib/loopctl/**` and never `lib/loopctl_web/**` — the plug is the web layer's
+  # job. `Loopctl.Tenants` DEFINES the function; its own file contains no call, so nothing needs
+  # excluding, and an exclusion would stand ready to hide a real context-layer gate added there.
+  #
+  # Limits, the same as the halt guard's: it matches the module's last alias segment, so a
+  # RENAMED alias, a macro-built call and `apply/3` are invisible, and it cannot tell an
+  # enforced refusal from a discarded result.
   @context_scan_glob "lib/loopctl/**/*.ex"
-  @anchor_source "lib/loopctl/tenants.ex"
 
   defp anchor_enforcing_contexts do
-    @context_scan_glob
-    |> Path.wildcard()
-    |> Enum.reject(&(String.starts_with?(&1, "lib/loopctl_web/") or &1 == @anchor_source))
-    |> Enum.filter(&(&1 |> File.read!() |> calls_require_human_anchor?()))
-    |> Enum.map(&defmodule_name/1)
-  end
-
-  defp calls_require_human_anchor?(source) do
-    String.match?(source, ~r/(?<![\w.])(Loopctl\.)?Tenants\.require_human_anchor\(/)
+    SourceScan.callers(@context_scan_glob, :Tenants, :require_human_anchor)
   end
 
   # The actions a `plug ... RequireHumanAnchor ... when action in [...]` mount
