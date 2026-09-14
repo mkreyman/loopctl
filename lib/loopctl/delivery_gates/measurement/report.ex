@@ -152,6 +152,42 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
   end
 
   @doc """
+  Encodes a report with every object's keys SORTED, so two runs of one pinned corpus differ only
+  where they genuinely differ.
+
+  Map iteration order in Erlang is not stable across runs for a map of this size, so re-running
+  the same pinned corpus reshuffled the JSON and the whole artifact showed as changed. That is
+  not cosmetic here: the deliverable IS a pair of artifacts that get compared, `README.md`
+  carries a cross-run rule that assumes a reader can diff two pinned runs and read the result,
+  and churn pushes every future reader back to `diff -w` and reading the numbers by eye — the
+  manual step the pins exist to remove.
+
+  `generated_at` is deliberately NOT normalised. Two runs SHOULD differ there; one changed line
+  is information, a reshuffled object is not.
+
+  Both Mix tasks encode through here rather than calling `Jason.encode!/2` themselves, so the
+  two writers cannot drift into producing differently-ordered artifacts.
+  """
+  @spec encode!(term()) :: String.t()
+  def encode!(report), do: Jason.encode!(sort_keys(report), pretty: true) <> "\n"
+
+  # `Stratum` is the only struct that reaches an artifact as an object; every other struct here
+  # (a `DateTime`) has its own encoder and a date turned into a map would be a regression, not a
+  # sort.
+  defp sort_keys(%Stratum{} = stratum), do: stratum |> Map.from_struct() |> sort_keys()
+  defp sort_keys(%_other{} = value), do: value
+
+  defp sort_keys(%{} = map) do
+    map
+    |> Enum.map(fn {key, value} -> {to_string(key), sort_keys(value)} end)
+    |> Enum.sort_by(&elem(&1, 0))
+    |> Jason.OrderedObject.new()
+  end
+
+  defp sort_keys(list) when is_list(list), do: Enum.map(list, &sort_keys/1)
+  defp sort_keys(value), do: value
+
+  @doc """
   The human summary of either report. One line per number a reader acts on, then the biases,
   because a rate read without them is worse than no rate.
   """
@@ -162,7 +198,7 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
       window_line(report.meta),
       "changes: #{report.totals.changes} (readable #{report.totals.readable}, unreadable #{report.totals.unreadable}, stale-trigger #{report.totals.with_stale_triggers})",
       "outcomes: " <> outcome_line(report.outcomes),
-      "reason kinds: " <> inspect(report.reason_kinds),
+      "reason kinds: " <> ordered(report.reason_kinds),
       "",
       stratum_line("all readable", report.strata.all),
       stratum_line("configuration applied", report.strata.configuration_applied),
@@ -212,7 +248,7 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
   end
 
   defp feature_share_lines(%{escalation_reason_kinds: kinds}) do
-    ["intake escalation reason kinds: #{inspect(kinds)} (not degenerate)"]
+    ["intake escalation reason kinds: #{ordered(kinds)} (not degenerate)"]
   end
 
   defp sensitivity_lines(%{run: false, note: note}), do: ["sensitivity: " <> note]
@@ -552,8 +588,13 @@ defmodule Loopctl.DeliveryGates.Measurement.Report do
 
   defp gate_a_line(label, stratum) do
     "#{label}: n=#{stratum.total} escalated=#{stratum.escalated} (#{pct(stratum.rate)}) " <>
-      "not_story=#{stratum.not_story} by_reason=#{inspect(stratum.by_reason)}"
+      "not_story=#{stratum.not_story} by_reason=#{ordered(stratum.by_reason)}"
   end
+
+  # The .md is a COMPARED artifact too, and `inspect` over a map renders it in whatever order
+  # the map iterates — the same churn the JSON had. Sorted, so a summary diff means something.
+  defp ordered(%{} = map), do: map |> Enum.sort() |> inspect()
+  defp ordered(list) when is_list(list), do: list |> Enum.sort() |> inspect()
 
   defp rate(_numerator, 0), do: nil
   defp rate(numerator, denominator), do: numerator / denominator

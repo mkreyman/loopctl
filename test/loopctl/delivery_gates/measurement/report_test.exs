@@ -456,6 +456,79 @@ defmodule Loopctl.DeliveryGates.Measurement.ReportTest do
     end
   end
 
+  describe "encode!/1 is byte-stable for a pinned run" do
+    test "keys are sorted in the top-level object and in nested ones" do
+      # Map iteration order in Erlang is not stable across runs at this size, so re-running one
+      # pinned corpus reshuffled the JSON and the whole artifact read as changed — which makes
+      # the cross-run diff the README's rule depends on unreadable.
+      report = Report.gate_b([result(outcome: :clear)], %{repo: "acme/repo", head: "abc"})
+
+      json = Report.encode!(report)
+
+      top = keys_at(json, ~r/^  "(\w+)":/m)
+      assert top == Enum.sort(top)
+      assert "meta" in top
+
+      # Each nested object separately: an indent level spans SEVERAL objects, so concatenating
+      # them and sorting the whole list would assert a property no encoder has.
+      for object <- ~w(meta outcomes strata oracle_families) do
+        keys = object_keys(json, object)
+        assert keys != [], "expected #{object} to be a non-empty object"
+        assert keys == Enum.sort(keys), "#{object} keys are not sorted: #{inspect(keys)}"
+      end
+    end
+
+    test "a map built in a different insertion order encodes identically" do
+      one = Report.gate_b([], %{repo: "acme/repo", head: "abc", limit: 1})
+      two = Report.gate_b([], %{limit: 1, head: "abc", repo: "acme/repo"})
+
+      assert Report.encode!(one) == Report.encode!(two)
+    end
+
+    test "a Stratum survives as an object rather than a struct dump, with ITS keys sorted too" do
+      # A Stratum holds only scalars, so converting it without recursing produces a plain map
+      # that encodes correctly but UNSORTED — a gap the parent object's sorted keys hide, and
+      # one a mutation found rather than a reading.
+      json = Report.encode!(Report.gate_b([result(outcome: :clear)], %{}))
+
+      refute json =~ "__struct__"
+      assert json =~ "\"clear_rate\""
+
+      keys = keys_at(json, ~r/^      "(\w+)":/m)
+      assert "clear_rate" in keys
+      assert Enum.take(keys, 8) == Enum.sort(Enum.take(keys, 8))
+    end
+
+    test "a DateTime is still encoded as a date, not exploded into an object" do
+      assert Report.encode!(%{at: ~U[2026-09-14 04:08:37Z]}) =~ "2026-09-14T04:08:37Z"
+    end
+
+    test "the summary's inspected maps are sorted too — the .md is a compared artifact" do
+      results = [
+        result(outcome: :human, reasons: [{:stale_trigger, "p"}, {:human_path, "a.ex", "p"}])
+      ]
+
+      summary = Report.summarize(Report.gate_b(results, %{}))
+
+      assert summary =~ "reason kinds: [human_path: 1, stale_trigger: 1]"
+    end
+  end
+
+  defp keys_at(json, regex) do
+    regex |> Regex.scan(json) |> Enum.map(&Enum.at(&1, 1))
+  end
+
+  # The keys of ONE named object: everything at the next indent level between its opening brace
+  # and the first line that closes back to its own indent.
+  defp object_keys(json, name) do
+    json
+    |> String.split(~r/^  "#{name}": \{$/m)
+    |> Enum.at(1, "")
+    |> String.split(~r/^  \}/m)
+    |> Enum.at(0, "")
+    |> then(&keys_at(&1, ~r/^    "(\w+)":/m))
+  end
+
   describe "summarize/1" do
     test "the Gate B summary states every bias, because a rate read without them misleads" do
       summary = Report.summarize(Report.gate_b([result(outcome: :clear)], %{repo: "acme/repo"}))

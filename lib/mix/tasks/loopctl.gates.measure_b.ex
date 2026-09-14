@@ -241,7 +241,7 @@ defmodule Mix.Tasks.Loopctl.Gates.MeasureB do
   defp today, do: Date.utc_today() |> Date.to_iso8601()
 
   defp write(report, path) do
-    write_text(path, Jason.encode!(report, pretty: true) <> "\n")
+    write_text(path, Report.encode!(report))
   end
 
   defp write_text(path, contents) do

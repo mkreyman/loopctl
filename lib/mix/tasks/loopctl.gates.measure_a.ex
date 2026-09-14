@@ -190,7 +190,7 @@ defmodule Mix.Tasks.Loopctl.Gates.MeasureA do
     )
   end
 
-  defp write(report, path), do: write_text(path, Jason.encode!(report, pretty: true) <> "\n")
+  defp write(report, path), do: write_text(path, Report.encode!(report))
 
   defp write_text(path, contents) do
     File.mkdir_p!(Path.dirname(path))
