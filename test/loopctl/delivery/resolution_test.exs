@@ -90,27 +90,26 @@ defmodule Loopctl.Delivery.ResolutionTest do
     test "a label that is not ours is nil — that close was somebody else's" do
       assert is_nil(Resolution.for_label("bug"))
       assert is_nil(Resolution.for_label("loopctl:something-else"))
-      assert is_nil(Resolution.for_labels(["bug", "wontfix"]))
-      assert is_nil(Resolution.for_labels([]))
     end
 
-    test "a list resolves on the FIRST loopctl label it holds, in the list's order" do
-      assert Resolution.for_labels(["bug", "loopctl:resolution-not-actionable"]).verdict ==
-               :not_actionable
+    # `for_labels/1` was REMOVED in #826 round 3 (findings 4 and 5), and the three tests that
+    # covered it went with it. It resolved a label LIST to the FIRST loopctl label it found,
+    # and its one caller was wrong to use it: an issue carrying BOTH resolution labels is
+    # ambiguous, and "first one wins" let the reporting system send one verdict while loopctl
+    # recorded the other as delivered. The closer now filters with `labels/0`, insists on
+    # exactly one, and treats anything else as somebody else's close.
+    test "reading a closed issue back is the CALLER's job, and ambiguity is theirs to refuse" do
+      both = ["loopctl:resolution-shipped", "loopctl:resolution-not-actionable"]
 
-      assert Resolution.for_labels([
-               "loopctl:resolution-not-actionable",
-               "loopctl:resolution-shipped"
-             ]).verdict == :not_actionable
+      # The supported way: filter to ours, insist on exactly one, then resolve it.
+      assert [_a, _b] = Enum.filter(both, &(&1 in Resolution.labels()))
 
-      assert Resolution.for_labels([
-               "loopctl:resolution-shipped",
-               "loopctl:resolution-not-actionable"
-             ]).verdict == :shipped
-    end
+      assert [one] =
+               Enum.filter(["bug", "loopctl:resolution-shipped"], &(&1 in Resolution.labels()))
 
-    test "a non-string in the label list does not crash the read" do
-      assert Resolution.for_labels([nil, 42, "loopctl:resolution-shipped"]).verdict == :shipped
+      assert Resolution.for_label(one).verdict == :shipped
+
+      refute function_exported?(Resolution, :for_labels, 1)
     end
   end
 end

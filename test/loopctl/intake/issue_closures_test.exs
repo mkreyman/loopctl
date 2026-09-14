@@ -108,6 +108,51 @@ defmodule Loopctl.Intake.IssueClosuresTest do
       assert IssueClosures.get(ctx.tenant.id, other_story.id) == nil
     end
 
+    test "a record-index conflict is LOGGED, not silently identical to a replay", ctx do
+      other_story = fixture(:story, %{tenant_id: ctx.tenant.id})
+
+      :ok =
+        IssueClosures.record_in(AdminRepo, ctx.tenant.id, ctx.story.id, ctx.record.id, :shipped)
+
+      # Untargeted ON CONFLICT makes both conflicts return zero rows, so absorbing them
+      # identically left the second case with no trace anywhere: no closure exists for THIS
+      # story, the transition still commits, and the reporter is never told.
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert :ok =
+                   IssueClosures.record_in(
+                     AdminRepo,
+                     ctx.tenant.id,
+                     other_story.id,
+                     ctx.record.id,
+                     :not_actionable
+                   )
+        end)
+
+      assert log =~ "intake closure NOT recorded"
+      assert log =~ other_story.id
+      assert log =~ "[error]"
+    end
+
+    test "an ordinary REPLAY is absorbed silently — it is not the same thing", ctx do
+      :ok =
+        IssueClosures.record_in(AdminRepo, ctx.tenant.id, ctx.story.id, ctx.record.id, :shipped)
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          assert :ok =
+                   IssueClosures.record_in(
+                     AdminRepo,
+                     ctx.tenant.id,
+                     ctx.story.id,
+                     ctx.record.id,
+                     :shipped
+                   )
+        end)
+
+      refute log =~ "intake closure NOT recorded"
+    end
+
     test "a REVOKED source records nothing at all", ctx do
       # Revoking an intake source is a tenant disconnecting a repository. Refusing HERE is the
       # smaller of the two windows: no row is written, so there is nothing for the drainer to
@@ -363,6 +408,23 @@ defmodule Loopctl.Intake.IssueClosuresTest do
           ] do
         assert {:ok, 1} = IssueClosures.requeue_abandoned(opts ++ [dry_run: true])
       end
+    end
+
+    test "dry_run fails SAFE on a value that is not the atom true", ctx do
+      {:ok, _} =
+        IssueClosures.mark_abandoned(ctx.tenant.id, ctx.closure.id, :retries_exhausted, :timeout)
+
+      # `== true` meant a copy-pasted `dry_run: "true"`, or a typo, performed the REAL requeue
+      # on live reporter tickets — while `unbounded` fails the other way, leaving the call
+      # refused. Two guards on one function must not fail in opposite directions.
+      for value <- [true, "true", 1, :yes] do
+        assert {:ok, 1} = IssueClosures.requeue_abandoned(unbounded: true, dry_run: value)
+        assert %IssueClosure{status: :abandoned} = IssueClosures.get(ctx.tenant.id, ctx.story.id)
+      end
+
+      # Absent, or explicitly false, still performs the requeue — the flag is opt-in.
+      assert {:ok, 1} = IssueClosures.requeue_abandoned(unbounded: true, dry_run: false)
+      assert %IssueClosure{status: :pending} = IssueClosures.get(ctx.tenant.id, ctx.story.id)
     end
 
     test "a row abandoned BEFORE the window is left alone", ctx do

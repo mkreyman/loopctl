@@ -140,14 +140,16 @@ defmodule Loopctl.Delivery.Resolution do
   def for_label(@not_actionable_label), do: for_verdict(:not_actionable)
   def for_label(_label), do: nil
 
-  @doc """
-  The resolution named by the FIRST loopctl label in a list, or `nil` when it holds none.
-
-  Order is the list's, not ours, so an issue that somehow carries two of them resolves to
-  the one that appears first rather than to whichever this module happens to check first.
-  """
-  @spec for_labels([String.t()]) :: t() | nil
-  def for_labels(labels) when is_list(labels) do
-    Enum.find_value(labels, fn label -> is_binary(label) and for_label(label) end)
-  end
+  # REMOVED: `for_labels/1`, which resolved a label LIST to the first loopctl label it found
+  # (#826 round 3, findings 4 and 5).
+  #
+  # It had exactly one caller, `Loopctl.Delivery.IssueCloser`, and that caller was wrong to use
+  # it: "first one wins" is not a safe reading of an issue carrying BOTH resolution labels. The
+  # reporting system resolves such a close by its own order, which may not be ours, so the
+  # reporter can be sent one verdict while loopctl records the other as delivered. The closer
+  # now treats more than one loopctl label as AMBIGUOUS and refuses to claim the close.
+  #
+  # Nothing replaces it here on purpose. A reader that has a closed issue and wants the text
+  # should filter with `labels/0`, insist on exactly one, and then call `for_label/1` — which
+  # makes the ambiguity a decision at the call site instead of hiding it behind an order.
 end

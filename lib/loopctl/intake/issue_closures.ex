@@ -56,6 +56,8 @@ defmodule Loopctl.Intake.IssueClosures do
 
   import Ecto.Query
 
+  require Logger
+
   alias Loopctl.AdminRepo
   alias Loopctl.Intake.IssueClosure
   alias Loopctl.Intake.Record
@@ -215,9 +217,6 @@ defmodule Loopctl.Intake.IssueClosures do
       updated_at: now
     }
 
-    # The unique indexes decide the replay. Zero rows inserted means a closure for this story
-    # — or for its intake record — already exists, which is success, not a conflict.
-    #
     # NO `conflict_target`, deliberately (#826 round 2, finding 5). A target names ONE index,
     # so a conflict on the other raised instead — inside a function whose moduledoc says a
     # failure here is uncaught on purpose, which would roll the verdict transition back and
@@ -228,7 +227,40 @@ defmodule Loopctl.Intake.IssueClosures do
     # Untargeted `ON CONFLICT DO NOTHING` covers every unique violation on the table and
     # nothing else: a foreign-key or CHECK failure still raises, which is what the uncaught
     # rule is actually about.
-    _ = repo.insert_all(IssueClosure, [row], on_conflict: :nothing)
+    case repo.insert_all(IssueClosure, [row], on_conflict: :nothing) do
+      {1, _} -> :ok
+      {0, _} -> absorbed_conflict(repo, tenant_id, story_id, record_id)
+    end
+  end
+
+  # ZERO ROWS IS TWO DIFFERENT THINGS, and dropping the target made them look identical
+  # (#826 round 3, finding 3).
+  #
+  # A conflict on the STORY index is an ordinary replay: this story's closure is already
+  # recorded, and returning `:ok` is correct. A conflict on the RECORD index is not — no
+  # closure exists for THIS story, the transition still commits, and the reporter is never
+  # told anything about it. Silently returning `:ok` for both meant that second case left no
+  # trace anywhere.
+  #
+  # So the count is read and a zero is DISAMBIGUATED by asking whether this story now has a
+  # row. It is still not an error — refusing would wedge the story, which is what dropping the
+  # target was for — but it is logged at ERROR, because a reporter going untold is something
+  # an operator has to be able to find.
+  defp absorbed_conflict(repo, tenant_id, story_id, record_id) do
+    exists? =
+      repo.exists?(
+        from c in IssueClosure, where: c.tenant_id == ^tenant_id and c.story_id == ^story_id
+      )
+
+    unless exists? do
+      Logger.error(
+        "intake closure NOT recorded: another story already owns this intake record's " <>
+          "closure, so this story's verdict will never reach the reporter. " <>
+          "tenant_id=#{tenant_id} story_id=#{story_id} intake_record_id=#{record_id}",
+        tenant_id: tenant_id,
+        story_id: story_id
+      )
+    end
 
     :ok
   end
@@ -317,6 +349,15 @@ defmodule Loopctl.Intake.IssueClosures do
 
   The loser's `{:error, :not_pending}` is therefore an ordinary outcome under concurrency, not
   a bug: `Loopctl.Delivery.IssueCloser` reports it as `:skipped` and makes no forge call.
+
+  **The assumption it rests on, named rather than left implicit:** both halves of the
+  comparison come from the APPLICATION's clock — the `now` in the predicate and the deadline
+  written into `next_attempt_at` — so on two nodes it is only as good as their agreement. It
+  holds while cross-node skew stays well under `@in_flight_backoff_seconds` (180s), which NTP
+  makes true by orders of magnitude; a fleet that drifted minutes apart could let a second
+  node read a claimed row as due. Moving `now` to `fragment("now()")` would make Postgres the
+  single clock and remove the assumption entirely — worth doing if loopctl ever runs somewhere
+  clock discipline is not guaranteed. Nothing else here depends on the two clocks agreeing.
   """
   @spec claim_attempt(Ecto.UUID.t(), Ecto.UUID.t()) ::
           {:ok, IssueClosure.t()} | {:error, :not_pending}
@@ -527,9 +568,26 @@ defmodule Loopctl.Intake.IssueClosures do
         _other, q -> q
       end)
 
-    if Keyword.get(opts, :dry_run) == true,
+    if dry_run?(opts),
       do: {:ok, AdminRepo.aggregate(query, :count)},
       else: apply_requeue(query)
+  end
+
+  # DRY RUN FAILS SAFE, symmetrically with `unbounded` (#826 round 3, finding 7).
+  #
+  # `Keyword.get(opts, :dry_run) == true` meant anything that was not the atom `true` — a
+  # string "true" from a copy-pasted console line, a typo, a `1` — performed the REAL requeue
+  # on live reporter tickets. `unbounded` fails the other way: a value that is not `true`
+  # leaves the call unbounded and therefore refused. Two guards on the same function should
+  # not fail in opposite directions.
+  #
+  # So: present and not explicitly `false` means dry run. Getting it wrong now costs a count.
+  defp dry_run?(opts) do
+    case Keyword.fetch(opts, :dry_run) do
+      :error -> false
+      {:ok, value} when value in [false, nil] -> false
+      {:ok, _anything_else} -> true
+    end
   end
 
   defp apply_requeue(query) do

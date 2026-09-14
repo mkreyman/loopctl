@@ -13,22 +13,24 @@ defmodule Loopctl.Delivery.IssueCloser do
      to it (#826 review, finding 6). `IssueClosures.record_in/5` covers a source revoked before
      the verdict; this covers one revoked after it.
   1. **READS the issue.** Closed already?
-     - carrying THIS CLOSURE'S OWN resolution label — loopctl closed it, for this verdict.
-       Record `:closed` and stop. This is what makes a replay a no-op even when the crash
-       landed between the close and the record of it.
-     - carrying anything else, including the OTHER verdict's loopctl label — not our close.
-       `:abandoned` with `closed_by_other`, never retried. Re-closing an issue somebody
-       already resolved would fire the reporting system's webhook and email the reporter
-       about work she has already been told about.
+     - carrying EXACTLY ONE loopctl resolution label and it is THIS CLOSURE'S — loopctl closed
+       it, for this verdict. Record `:closed` and stop. This is what makes a replay a no-op
+       even when the crash landed between the close and the record of it.
+     - carrying anything else — the other verdict's label, BOTH labels, or none — not our
+       close, or not unambiguously ours. `:abandoned` with `closed_by_other`, never retried.
+       Re-closing an issue somebody already resolved would fire the reporting system's webhook
+       and email the reporter about work she has already been told about.
   2. **ADDS the resolution label**, unless the issue's LIVE label list already carries it. Not
      unless our own `labelled_at` marker is set — a maintainer can remove the label between
      attempts, and trusting the marker there closes the issue unlabelled, which is precisely
      the default-text failure this feature exists to prevent (#826 review, finding 2).
   3. **POSTS the resolution text**, unless already recorded.
-  4. **READS THE STATE AGAIN**, and closes only if the issue is still open. A human closing it
-     between step 1 and here fired the webhook with no loopctl label on the issue, so the
-     reporter already got the default text; PATCHing it closed afterwards is answered 200 by
-     GitHub and would hide that entirely (#826 round 2, finding 8).
+  4. **READS THE STATE AGAIN**, and closes only if the issue is still open. Anything closed
+     here is `closed_by_other` UNCONDITIONALLY — read 1 saw it open and nothing since then
+     calls `close_issue/3`, so a close observed now is not ours whatever the labels say. It
+     must NOT re-run step 1's classifier: step 2 has already POSTed our label, so that check
+     would find it and record somebody else's close as ours, making the whole guard inert in
+     the case it exists for (#826 round 3, H1).
   5. **CLOSES the issue**, with `state_reason` `completed` for a shipped fix and
      `not_planned` for a report nothing was built for.
 
@@ -56,7 +58,7 @@ defmodule Loopctl.Delivery.IssueCloser do
   Steps 2 and 3 additionally carry their own markers, so a crash inside the sequence redoes at
   most the step it died in. A duplicated label is a no-op at the forge. A duplicated comment
   is a duplicated comment — visible, harmless, and the accepted cost of not holding a
-  transaction across four network calls.
+  transaction across five network calls.
 
   ## Transient versus permanent
 
@@ -91,7 +93,8 @@ defmodule Loopctl.Delivery.IssueCloser do
   and nothing is assumed about the issue's state.
 
   Every call carries `Loopctl.Delivery.GitHubPullRequestSource`'s bounded connect and receive
-  timeouts with no retries, so the worst case for one closure is four bounded calls.
+  timeouts with no retries, so the worst case for one closure is FIVE bounded calls —
+  read, label, comment, re-read, close.
   **No database transaction is open across any of them** — each marker is its own short
   write between calls.
   """
@@ -152,36 +155,39 @@ defmodule Loopctl.Delivery.IssueCloser do
     end
   end
 
-  # A CLOSED issue is not ours to close again, and which of the two cases it is decides
-  # whether that is success or a stop.
+  # A CLOSED issue found at STEP 1 counts as ours only when the loopctl resolution labels on
+  # it are EXACTLY this closure's own — one of them, and the right one.
   #
-  # `Resolution.for_labels/1` is the reverse of the mapping the verdict came from: a non-nil
-  # answer means the close carries one of loopctl's labels, so loopctl made it. It does NOT
-  # have to be for the same verdict — a story whose verdict somehow changed after a close
-  # still must not be closed twice, and the record we want either way is that the issue is
-  # closed with loopctl's resolution on it.
-  # A CLOSED issue counts as ours only when it carries THIS CLOSURE'S OWN resolution label —
-  # never merely "some loopctl label" (#826 round 2, finding 7).
+  # Two ways that used to be wrong, both ending with the reporter told the opposite of what
+  # happened while loopctl recorded a job well done:
   #
-  # The looser test recorded somebody else's close as ours whenever the label happened to be
-  # one of the two. A maintainer who labels a `not_actionable` story's issue
-  # `loopctl:resolution-shipped` and closes it has already made the reporting system send the
-  # shipped text; reading that as our own close then recorded `:closed`, never posted the
-  # not-actionable text, and left the reporter told a fix shipped for work nobody did — the
-  # exact failure #805 exists to prevent, reached through the check meant to prevent it.
+  # - "some loopctl label" (#826 round 2, finding 7). A maintainer who labels a
+  #   `not_actionable` story's issue `loopctl:resolution-shipped` and closes it has already
+  #   made the reporting system send the SHIPPED text; reading that as our close recorded
+  #   `:closed` and never posted the not-actionable text.
+  # - BOTH labels present (#826 round 3, finding 4). `own_label in labels` accepted that, and
+  #   the reporting system resolves whichever it sees first — so the reporter may have been
+  #   sent the opposite verdict while we recorded the closure as correctly delivered. More
+  #   than one resolution label is AMBIGUOUS, and an ambiguous close is not ours to claim.
   #
-  # A close carrying the WRONG verdict's label is therefore `closed_by_other`: it is not this
-  # closure's, and re-closing it is not the remedy either.
+  # Either way the answer is `closed_by_other`: it is not this closure's close, and
+  # re-closing is not the remedy.
   defp proceed(%IssueClosure{} = closure, %{state: "closed", labels: labels}) do
     %Resolution{label: own_label} = IssueClosure.resolution(closure)
 
-    if own_label in labels do
-      record_closed(closure, :already_closed_by_loopctl)
-    else
-      # LABEL COUNT, never the label NAMES. A label name is unbounded remote data, and this
-      # reason is stored on a length-CHECKed column — echoing the names is how a decorated
-      # label could make the abandon write itself fail (#826 round 1, finding 5).
-      abandon(closure, :closed_by_other, {:no_matching_loopctl_label, length(labels)})
+    case Enum.filter(labels, &(&1 in Resolution.labels())) do
+      [^own_label] ->
+        record_closed(closure, :already_closed_by_loopctl)
+
+      others ->
+        # LABEL COUNTS, never the label NAMES. A label name is unbounded remote data, and this
+        # reason is stored on a length-CHECKed column — echoing the names is how a decorated
+        # label could make the abandon write itself fail (#826 round 1, finding 5).
+        abandon(
+          closure,
+          :closed_by_other,
+          {:unmatched_loopctl_labels, length(others), length(labels)}
+        )
     end
   end
 
@@ -207,14 +213,34 @@ defmodule Loopctl.Delivery.IssueCloser do
   # was already closed. GitHub answers that 200, so the close "succeeded", `closed_by_other`
   # was never recorded, and the operator had no sign anything went wrong.
   #
-  # One extra bounded call per closure, on the path that is about to make the irreversible
-  # one. Both outcomes are the same classification `proceed/2` already applies to a closed
-  # issue, so a close that turns out to be OURS is still recorded rather than redone.
+  # IT MUST NOT RE-RUN THE STEP-1 CLASSIFIER, and doing so made the whole check INERT in the
+  # exact scenario above (#826 round 3, H1). By the time this runs, `apply_label/3` has POSTed
+  # our own label — GitHub accepts that on a closed issue — so read 2 sees `own_label` in the
+  # list, `proceed/2` calls it `already_closed_by_loopctl`, and the human's close is recorded
+  # as ours. The labels here cannot answer the question, because WE put one of them there.
+  #
+  # What answers it is state captured BEFORE the label went on: read 1 saw the issue OPEN, and
+  # nothing between there and here calls `close_issue/3`. So a close observed now is NOT ours,
+  # whatever the labels say, and no label test is needed or wanted. (A close made by an
+  # EARLIER attempt cannot reach here either: read 1 would have found the issue closed and
+  # taken the step-1 branch.)
+  #
+  # The one thing worth recording is whether our label was on the issue at this moment, which
+  # is what tells an operator whether the reporter likely got the right text or the reporting
+  # system's default — a close that landed before our label POST fired the webhook unlabelled.
+  # It is a boolean, never the label names.
   defp recheck_state(%IssueClosure{} = closure) do
+    %Resolution{label: own_label} = IssueClosure.resolution(closure)
+
     case source().issue(closure.repo_full_name, closure.issue_number) do
-      {:ok, %{state: "closed"} = issue} -> {:closed, proceed(closure, issue)}
-      {:ok, _still_open} -> :open
-      {:error, reason} -> {:fault, reason}
+      {:ok, %{state: "closed", labels: labels}} ->
+        {:closed, abandon(closure, :closed_by_other, {:closed_mid_attempt, own_label in labels})}
+
+      {:ok, _still_open} ->
+        :open
+
+      {:error, reason} ->
+        {:fault, reason}
     end
   end
 

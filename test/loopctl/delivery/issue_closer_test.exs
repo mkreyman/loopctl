@@ -197,6 +197,23 @@ defmodule Loopctl.Delivery.IssueCloserTest do
       assert row.closed_at == nil
     end
 
+    test "a close carrying BOTH loopctl labels is ambiguous, not ours", ctx do
+      closure = closure(ctx, :shipped)
+
+      # `own_label in labels` accepted this. The reporting system resolves such a close by the
+      # order IT sees, which may not be ours — so the reporter may have been sent the
+      # not-actionable text while loopctl recorded the shipped closure as delivered.
+      expect(MockPullRequestSource, :issue, fn _repo, _number ->
+        {:ok, %{state: "closed", labels: [@not_actionable_label, @shipped_label]}}
+      end)
+
+      assert {:abandoned, nil} = IssueCloser.close(closure)
+
+      row = reload(ctx)
+      assert row.status == :abandoned
+      assert row.abandoned_reason == "closed_by_other"
+    end
+
     test "an issue already closed carrying our label is recorded closed, not closed again",
          ctx do
       closure = closure(ctx, :shipped)
@@ -285,10 +302,17 @@ defmodule Loopctl.Delivery.IssueCloserTest do
       expect(MockPullRequestSource, :label_issue, fn _r, _n, _l -> :ok end)
       expect(MockPullRequestSource, :comment_issue, fn _r, _n, _b -> :ok end)
 
-      # Read 2, immediately before the irreversible act: it moved.
+      # Read 2, immediately before the irreversible act: it moved — AND IT CARRIES OUR LABEL,
+      # because step 2 POSTed it and GitHub accepts a label on a closed issue.
+      #
+      # This is the state GitHub can actually return, and the first version of this test
+      # omitted it (`labels: ["wontfix"]`), which is why the check passed while being INERT:
+      # re-running step 1's classifier on the real state finds our label, calls it
+      # `already_closed_by_loopctl`, and records the human's close as ours. What decides it is
+      # that read 1 saw the issue OPEN and nothing since calls `close_issue/3`.
       expect(MockPullRequestSource, :issue, fn _r, _n ->
         send(parent, :rechecked)
-        {:ok, %{state: "closed", labels: ["wontfix"]}}
+        {:ok, %{state: "closed", labels: ["wontfix", @shipped_label]}}
       end)
 
       # No `close_issue` expectation: PATCHing an already-closed issue is answered 200 by
@@ -300,6 +324,28 @@ defmodule Loopctl.Delivery.IssueCloserTest do
       row = reload(ctx)
       assert row.status == :abandoned
       assert row.abandoned_reason == "closed_by_other"
+      assert row.closed_at == nil
+    end
+
+    test "a mid-attempt close is closed_by_other even with NO label on the issue", ctx do
+      closure = closure(ctx, :shipped)
+
+      # The other real shape: the human's close landed before our label POST was visible. The
+      # verdict is the same, because what decides it is that read 1 saw the issue OPEN — not
+      # the labels, which by this point we have written to ourselves.
+      expect(MockPullRequestSource, :issue, fn _r, _n ->
+        {:ok, %{state: "open", labels: []}}
+      end)
+
+      expect(MockPullRequestSource, :label_issue, fn _r, _n, _l -> :ok end)
+      expect(MockPullRequestSource, :comment_issue, fn _r, _n, _b -> :ok end)
+
+      expect(MockPullRequestSource, :issue, fn _r, _n ->
+        {:ok, %{state: "closed", labels: []}}
+      end)
+
+      assert {:abandoned, nil} = IssueCloser.close(closure)
+      assert %IssueClosure{status: :abandoned, abandoned_reason: "closed_by_other"} = reload(ctx)
     end
 
     test "a REVOKED intake source stops every write, before the issue is even read", ctx do

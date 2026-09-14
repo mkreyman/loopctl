@@ -71,7 +71,7 @@ defmodule Loopctl.Workers.IntakeIssueCloseWorkerTest do
   test "the wall-clock budget is checked BEFORE a candidate, not after", ctx do
     closure = closure(ctx, :shipped)
 
-    # A deadline already in the past. Checked afterwards, this run would still make four
+    # A deadline already in the past. Checked afterwards, this run would still make five
     # outward calls for the first candidate; checked before, it makes none — and the default
     # stubs would abandon the row if it did.
     past = System.monotonic_time(:millisecond) - 1
@@ -203,6 +203,19 @@ defmodule Loopctl.Workers.IntakeIssueCloseWorkerTest do
 
   test "an empty run is :ok, not an error" do
     assert :ok = IntakeIssueCloseWorker.perform(%Oban.Job{args: %{}})
+  end
+
+  test "the unique states cover :retryable, which this PR made reachable" do
+    # Before round 2 `perform/1` always returned `:ok`, so no job could BE retryable and the
+    # omission cost nothing. Now a systemic failure returns an error, and without this state a
+    # backed-off job does not block the next cron insert: every two minutes adds a fresh job
+    # beside the retryable one, each up to max_attempts — the doubling the option exists to
+    # prevent, arriving when the forge is already struggling.
+    states =
+      IntakeIssueCloseWorker.__opts__() |> Keyword.fetch!(:unique) |> Keyword.fetch!(:states)
+
+    assert :retryable in states
+    assert :executing in states
   end
 
   test "the worker is scheduled on the crontab" do

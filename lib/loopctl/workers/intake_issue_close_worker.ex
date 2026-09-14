@@ -6,7 +6,7 @@ defmodule Loopctl.Workers.IntakeIssueCloseWorker do
   ## Why a drainer and not a call at the verdict
 
   The verdict is written inside a database transaction (`Loopctl.Delivery.Stages`), and
-  closing an issue is four bounded network calls to GitHub. Doing it there would mean either
+  closing an issue is five bounded network calls to GitHub. Doing it there would mean either
   holding a pooled connection and the story's row lock across those calls, or performing the
   outward act after the commit and losing it outright if the node died in between.
 
@@ -65,7 +65,14 @@ defmodule Loopctl.Workers.IntakeIssueCloseWorker do
   use Oban.Worker,
     queue: :default,
     max_attempts: 3,
-    unique: [period: 120, states: [:available, :scheduled, :executing]]
+    # `:retryable` is in the states deliberately (#826 round 3, finding 2). Before this PR's
+    # round-2 change `perform/1` always returned `:ok`, so no job of this worker could ever BE
+    # retryable and omitting the state cost nothing. Now a systemic failure returns an error —
+    # and without `:retryable` here the backed-off job does not block the next cron insert, so
+    # a two-minute cadence accumulates a retryable job PLUS a fresh one every tick, each up to
+    # `max_attempts`. That is exactly the doubling this option is documented below as
+    # preventing, arriving in the one situation where the forge is already struggling.
+    unique: [period: 120, states: [:available, :scheduled, :executing, :retryable]]
 
   require Logger
 
