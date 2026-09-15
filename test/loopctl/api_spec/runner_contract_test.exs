@@ -1430,6 +1430,47 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       # this pass by comparing two empty sets.
       assert MapSet.size(named) >= 10
     end
+
+    test "every OTHER cross-reference in x-connection is total too" do
+      # The `$defs` check above closes ONE class. Four more could dangle exactly the same way
+      # and none was guarded — measured clean today, which is the moment to pin them rather
+      # than after a runner finds the next one by trying to vendor it.
+      connection = RunnerContract.json_schema()["x-connection"]
+      events = connection["events"] |> Map.keys() |> MapSet.new()
+      errors = connection["errors"] |> Map.keys() |> MapSet.new()
+      inbound = MapSet.new(RunnerContract.inbound_events())
+
+      # `join` is the phx_join reply and `unknown_event` answers anything unnamed; neither is
+      # an event in the map, and both legitimately carry refusals.
+      assert MapSet.difference(errors, MapSet.union(events, MapSet.new(~w(join unknown_event)))) ==
+               MapSet.new(),
+             "an errors entry names something that is not an event"
+
+      # The direction that actually bites: an event a runner may SEND with no published
+      # refusals is one whose failures it cannot branch on.
+      assert MapSet.difference(inbound, errors) == MapSet.new(),
+             "an inbound event publishes no refusal codes"
+
+      assert MapSet.difference(MapSet.new(Map.keys(connection["replies"])), events) ==
+               MapSet.new(),
+             "a replies entry names something that is not an event"
+
+      # A permanent code no event can return is dead text a runner branches on for ever.
+      reasons = connection["errors"] |> Map.values() |> List.flatten() |> MapSet.new()
+
+      permanent =
+        connection["permanent_errors"]
+        |> Map.values()
+        |> List.flatten()
+        |> MapSet.new()
+
+      assert MapSet.difference(permanent, reasons) == MapSet.new(),
+             "permanent_errors names a code no event can return"
+
+      # Non-vacuous on every axis above.
+      assert MapSet.size(inbound) >= 5
+      assert MapSet.size(permanent) >= 10
+    end
   end
 
   describe "the triage verdict message (1.9.0)" do
