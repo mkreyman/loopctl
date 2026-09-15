@@ -584,6 +584,15 @@ defmodule LoopctlWeb.RunnerChannel do
   #
   # Only for a DECLARING runner: an undeclaring one is already bounded by the ledger, and
   # writing this meta for it would add a second, weaker mechanism in front of the durable one.
+  #
+  # THIS IS A BOUND ON THE DAMAGE, NOT A SUPPORTED RECOVERY PATH, and the difference decides
+  # what to do when it fires. `mkreyman/loopctl-runner` builds its join declaration and its
+  # kind check from ONE list (its maintaining session, 2026-09-14), so a runner declaring a
+  # kind and then refusing it is a BUG on that side — not a state anyone should recover from
+  # by reconnecting. Reconnecting clears the suppression because the declaration it
+  # contradicts is per-connection, not because a reconnect is the remedy. A log line here is
+  # something to go and fix on the runner, and if a future change makes this fire routinely,
+  # that is the signal the two sides have drifted apart rather than that the bound is working.
   defp note_kind_refusal(socket, %{decision: "refused", reason: "kind_not_supported"}, record) do
     %{runner: runner, tenant_id: tenant_id, meta: meta} = socket.assigns
 
