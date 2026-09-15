@@ -66,8 +66,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.9.1"
-      assert schema["x-contract-version"] == "1.9.1"
+      assert RunnerContract.version() == "1.9.2"
+      assert schema["x-contract-version"] == "1.9.2"
 
       assert %{
                "dispatch_reply" => "RunnerDispatchReply",
@@ -88,6 +88,14 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       # this test stayed green, which is the failure `Kinds` exists to make impossible.
       assert connection["dispatchable_kinds"] == Kinds.dispatchable()
       assert connection["implied_kinds"] == Kinds.implied_by_silence()
+
+      # 1.9.2: the one permanent code whose permanence has a condition, published so a
+      # vendoring runner reads the condition instead of inferring it — asserted against the
+      # declaration, never a copy, and non-vacuously.
+      assert connection["permanent_error_conditions"] ==
+               RunnerContract.permanent_error_conditions()
+
+      assert Map.has_key?(connection["permanent_error_conditions"], "dispatch_not_accepted")
 
       assert connection["errors"] == RunnerContract.error_reasons()
       assert "unknown_event" in connection["errors"]["unknown_event"]
@@ -179,6 +187,54 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
              "cast_stage/1 must map wire strings through the compile-time @wire_atoms map: " <>
                "an atom in another module's constant pool does not exist until that module " <>
                "loads, and the first `stage` message in a fresh VM raised."
+    end
+
+    test "every NULLABLE ENUM publishes null as a member of its enum (1.9.2)" do
+      # `nullable` widens the exported `type` to `[t, "null"]`, and under JSON Schema 2020-12
+      # `enum` constrains EVERY instance including null — so a nullable enum that does not
+      # list null publishes two keywords that contradict each other, and a validator
+      # implementing enum as written refuses a null the type allows.
+      #
+      # That is not hypothetical: `RunnerTriageVerdictMessage.incomplete` shipped exactly so
+      # in 1.9.0 and 1.9.1, and a runner sending a real verdict beside `"incomplete": null` —
+      # the ordinary shape of a struct serialised whole — was refused `invalid_payload`,
+      # which `permanent_errors` makes PERMANENT, losing the run's only output. The mirror
+      # message was accepted, because `verdict` is nullable with no enum.
+      #
+      # TOTAL over every published schema rather than asserted on that one field, because the
+      # defect is a property of the TRANSLATION: any nullable enum this contract declares
+      # later would publish the same contradiction, and nothing else would notice.
+      candidates =
+        for {title, definition} <- RunnerContract.json_schema()["$defs"],
+            {path, subschema} <- flatten_subschemas(definition, title),
+            is_list(subschema["enum"]),
+            is_list(subschema["type"]) and "null" in subschema["type"],
+            do: {path, subschema["enum"]}
+
+      # NON-VACUOUS FIRST, and this is the assertion that makes the rest mean anything. The
+      # only nullable enum published today sits at depth 2 (a property of a definition), so a
+      # `flatten_subschemas/2` that stopped at the top level would find NO candidates and the
+      # emptiness assertion below would pass with the defect present — a guard that goes
+      # green by not looking is the failure this whole change is about.
+      assert candidates != [],
+             "no nullable enum was found at all, so this guard is measuring nothing — the " <>
+               "walk is broken, or the exporter stopped emitting nullable enums"
+
+      offenders = for {path, enum} <- candidates, not Enum.member?(enum, nil), do: path
+
+      assert offenders == [],
+             "these nullable enums do not list null, so a validator implementing 2020-12 " <>
+               "refuses a null their own type allows: #{inspect(offenders)}"
+    end
+
+    test "a non-nullable enum does NOT gain a null member" do
+      # The other direction of the same rule, and the reason the widening is keyed to
+      # `nullable` rather than applied to every enum: `kind` is required and not nullable, so
+      # publishing null in its enum would tell a runner that a null kind is dispatchable.
+      kind = RunnerContract.json_schema()["$defs"]["RunnerDispatch"]["properties"]["kind"]
+
+      assert kind["type"] == "string"
+      refute Enum.member?(kind["enum"], nil)
     end
 
     test "uses only the JSON Schema keywords the runner's vendored validator implements" do
@@ -538,9 +594,26 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     for _ <- 1..:rand.uniform(8), into: "", do: <<Enum.random(alphabet)::utf8>>
   end
 
-  # Every `%Schema{}` reachable from one, as {dotted path, schema}, so an offender names the
-  # field rather than just the top-level message. Nested schemas are inlined by the exporter
-  # (`RunnerSample` inside `RunnerJoin`), so the walk has to follow properties AND items.
+  # Every subschema of an EXPORTED definition — string-keyed maps, not `%Schema{}` structs —
+  # as {dotted path, subschema}, so an offender names the field rather than just the
+  # top-level message. Follows `properties` and `items`, which is the whole of what
+  # `schema_to_map/1` emits: nested schemas are INLINED by the exporter (`RunnerSample`
+  # inside `RunnerJoin`), so there is nothing else to descend into.
+  defp flatten_subschemas(%{} = definition, path) do
+    children =
+      Enum.flat_map(Map.get(definition, "properties", %{}), fn {name, child} ->
+        flatten_subschemas(child, "#{path}.#{name}")
+      end) ++
+        case Map.get(definition, "items") do
+          %{} = items -> flatten_subschemas(items, "#{path}[]")
+          _ -> []
+        end
+
+    [{path, definition} | children]
+  end
+
+  defp flatten_subschemas(_other, _path), do: []
+
   defp walk_schema(%OpenApiSpex.Schema{} = schema, path) do
     nested =
       Enum.flat_map(schema.properties || %{}, fn {key, sub} ->
@@ -1489,6 +1562,17 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
              |> MapSet.difference(events) == MapSet.new(),
              "permanent_errors is keyed by something that is not an event"
 
+      # A CONDITION ON A CODE THAT IS NOT PERMANENT is dead text a runner branches on for
+      # ever, and a condition on a code no event returns is worse — it reads as a promise
+      # about a refusal that cannot arrive. Bound to the same two sets the codes are.
+      conditioned = connection["permanent_error_conditions"] |> Map.keys() |> MapSet.new()
+
+      assert MapSet.subset?(conditioned, permanent),
+             "permanent_error_conditions names a code that is not permanent"
+
+      assert MapSet.subset?(conditioned, reasons),
+             "permanent_error_conditions names a code no event can return"
+
       # Non-vacuous where it can be. Not because a rename would compare empty sets — renaming
       # `events` makes `Map.values(nil)` raise, which is loud — but because the maps SHRINKING
       # is the quiet failure: a set that lost most of its members still satisfies every
@@ -1534,6 +1618,38 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
         assert {:error, {:invalid, ["exactly_one_of_verdict_or_incomplete"]}} =
                  RunnerContract.cast_triage_verdict_message(verdict_msg(bad))
       end
+    end
+
+    test "a NULL beside the field that is set is accepted, both ways round (1.9.2)" do
+      # The shape an ordinary emitter produces: one struct serialised whole, every declared
+      # key present, the unused one null — Go without `omitempty`, serde without
+      # `skip_serializing_if`. Both directions, because each was broken separately and each
+      # cost the same thing: the refusal is `invalid_payload`, `permanent_errors` makes it
+      # permanent, so the run's only output is lost and a conforming runner does not resend.
+      #
+      # 1.9.1 fixed the `verdict` side (the inlining had dropped its `nullable`). This test
+      # exists because the OTHER side was still broken in the PUBLISHED schema — `incomplete`
+      # was nullable with an enum that did not list null, and under 2020-12 an enum
+      # constrains null too. loopctl accepted it; the contract said it would not; the runner
+      # validating against the vendored file refused to send it. So this asserts what loopctl
+      # DOES, and the export guard above asserts the published schema agrees.
+      assert {:ok, %{verdict: verdict}} =
+               RunnerContract.cast_triage_verdict_message(
+                 verdict_msg(%{"verdict" => a_verdict(), "incomplete" => nil})
+               )
+
+      assert verdict.outcome == "escalate"
+
+      assert {:ok, %{incomplete: "session_crashed"}} =
+               RunnerContract.cast_triage_verdict_message(
+                 verdict_msg(%{"verdict" => nil, "incomplete" => "session_crashed"})
+               )
+
+      # And BOTH null is still neither, which is the rule the nullability must not weaken.
+      assert {:error, {:invalid, ["exactly_one_of_verdict_or_incomplete"]}} =
+               RunnerContract.cast_triage_verdict_message(
+                 verdict_msg(%{"verdict" => nil, "incomplete" => nil})
+               )
     end
 
     test "the nested verdict goes through the SAME shape rules as a bare one" do
