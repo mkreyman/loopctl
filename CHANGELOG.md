@@ -6,6 +6,44 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **`POST /api/v1/runners/:runner_id/dispatches` — the control-side dispatch trigger (#803).**
+  `Loopctl.Delivery.Placement.place/4` shipped with #833 and had NO CALLER: the mechanism was
+  built, tested and documented, and nothing could reach it. The delivery loop's first
+  end-to-end run on 2026-09-14 therefore went out by production RPC, which the finding written
+  from that run names as blocker #1 — *"There is no API or MCP path; `Runners.dispatch/3` is
+  an Elixir function."*
+
+  It is a TRIGGER, not a scheduler. The caller names the story and the runner; nothing selects
+  work, ranks it, or runs on a cadence. An unattended driver that picks stories by a policy
+  nobody stated is the part of this loop that changes what runs on someone's machines, and
+  that remains a decision to be made rather than a default to be inferred.
+
+  Every gate is `place/4`'s own — the L6 halt, the human anchor, the lineage ceiling and the
+  role floor — so the HTTP surface and every other caller cannot drift about who may place.
+  **Note the effective caller:** the ceiling is checked before the runner is resolved, so an
+  UNLINEAGED key below `user` role is refused `root_dispatch_forbidden`. A `user` key or a
+  lineaged orchestrator may place; an unlineaged orchestrator may not.
+
+  **A caller may not supply the `story` object.** `RunnerDispatch` carries the story as typed
+  fields and the runner composes its PROMPT from them; the contract's stated reason for that
+  shape is that "a control plane able to hand a runner prose to execute is able to run
+  anything on it". `Loopctl.Delivery.StoryPayload.build/3` is the server-side builder and
+  `place/4` does not call it, so the object was whatever the caller sent — unreachable while
+  `place/4` had no caller, and reachable the moment this endpoint existed. It is refused with
+  `422 story_not_accepted` rather than dropped, so a caller cannot believe it sent one.
+
+  **Consequence, stated plainly:** until `place/4` builds the story server-side, an implement
+  dispatch placed through this endpoint carries NO story object. The runner sees exactly what
+  loopctl vouched for, which is nothing. Wiring `StoryPayload.build/3` into the claim path is
+  the follow-on that makes implement placements complete.
+
+  Six of `place/4`'s documented refusals had no `FallbackController` clause, and its catch-all
+  answers 500 for an atom it does not know. They are mapped in the controller, with the status
+  and code the PLUGS use for the same conditions elsewhere (503 `tenant_halted`, 403
+  `custody_tier_required`, 403 `insufficient_role`), so a caller cannot tell which mechanism
+  refused it. Unmapped, the commonest legitimate answers of the loop's dispatch trigger would
+  each have been a 500.
+
 - **`/api/v1/recall` says whether its results are ANSWERS (#742).** The response carried a
   bare 0..1 `score` per row and nothing a reader could judge relevance by. Semantic search
   has no no-answer mode, so a query with nothing relevant in the corpus still gets its
