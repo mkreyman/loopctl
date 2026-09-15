@@ -20,6 +20,56 @@ defmodule LoopctlRunner.TriageVerdictTest do
 
   defp state(reason), do: {:error, reason}
 
+  describe "an escalation with no words" do
+    @codes LoopctlRunner.TriagePrompt.reason_codes()
+    @gating hd(Map.fetch!(@codes, :gating))
+    @soft hd(Map.fetch!(@codes, :soft))
+
+    test "an escalate carrying only bare codes, or none at all, gives a person nothing" do
+      assert TriageVerdict.bare_escalation?(verdict())
+      assert TriageVerdict.bare_escalation?(verdict(%{"escalation_reasons" => []}))
+      assert TriageVerdict.bare_escalation?(verdict(%{"escalation_reasons" => [@gating]}))
+
+      # The soft code counts too: it is equally a classification, and the prompt's own rule for it
+      # says the sentence naming what was read is a SEPARATE entry beside it.
+      assert TriageVerdict.bare_escalation?(verdict(%{"escalation_reasons" => [@soft]}))
+      assert TriageVerdict.bare_escalation?(verdict(%{"escalation_reasons" => [@gating, @soft]}))
+    end
+
+    test "one sentence beside the codes is enough, and no other outcome is judged" do
+      words = "the export has run without the site column since the March migration"
+
+      refute TriageVerdict.bare_escalation?(verdict(%{"escalation_reasons" => [words]}))
+      refute TriageVerdict.bare_escalation?(verdict(%{"escalation_reasons" => [@gating, words]}))
+
+      # A reworded code is prose to the loop and prose to a person: it is words, so it counts.
+      refute TriageVerdict.bare_escalation?(
+               verdict(%{"escalation_reasons" => ["#{@gating} - the form never printed this"]})
+             )
+
+      # `story` and `reject` carry the codes too and are not sent to a person to act on, so the
+      # requirement is `escalate`'s alone.
+      for outcome <- ~w(story reject) do
+        refute TriageVerdict.bare_escalation?(%{
+                 "outcome" => outcome,
+                 "escalation_reasons" => [@gating]
+               })
+      end
+    end
+
+    test "it is NOT a validation failure, because refusing one loses more than it saves" do
+      # loopctl records `escalation_reasons` verbatim and routes on `outcome` alone, so a thin
+      # escalate still reaches a human with its evidence and missing_information. Refused here it
+      # would be `verdict_invalid` instead — the run reporting that it produced nothing — and the
+      # session cannot be asked again: `loop-verdict` links the file into place before anything
+      # validates it, and a run records one verdict.
+      thin = verdict(%{"escalation_reasons" => [@gating]})
+
+      assert TriageVerdict.bare_escalation?(thin)
+      assert {:ok, ^thin} = TriageVerdict.validate(thin)
+    end
+  end
+
   describe "what a verdict must be" do
     test "a verdict the contract admits passes, with and without its draft story" do
       assert {:ok, _} = TriageVerdict.validate(verdict())

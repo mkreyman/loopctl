@@ -385,14 +385,36 @@ defmodule LoopctlRunner.TriagePromptTest do
 
     codes = TriagePrompt.reason_codes()
 
+    # Still spelled out literally, for the reason above, and in the contract's own order.
     assert codes.gating ==
-             ~w(workflow_change_not_defect_fix inverts_or_removes_deliberate_behaviour)
+             ~w(inverts_or_removes_deliberate_behaviour workflow_change_not_defect_fix)
 
     assert codes.soft == ["already_implemented_at_head"]
+
+    # And WIRED to the vendored file rather than transcribed beside it, which is what makes a
+    # rewording arrive as a vendoring instead of as a gate that silently stopped firing. The
+    # literal assertion above is what catches the rewording; this is what catches the copy.
+    assert codes.gating ==
+             LoopctlRunner.Contract.connection() |> Map.fetch!("triage_gating_reasons")
+
+    # Not gating, and the contract is where that is said: a code it does not publish is a soft
+    # signal here, and the prompt glosses it as one.
+    refute "already_implemented_at_head" in codes.gating
 
     assert prompt =~ "compares entries WHOLE"
     assert prompt =~ "never coin one"
     assert prompt =~ "keeps that rate at zero"
+  end
+
+  test "an escalate is required to carry a sentence, not only the bare codes" do
+    # The codes classify; they are not words a person can act on, and `escalate` is the outcome
+    # that puts this in front of one. The runner does not refuse a thin verdict — TriageVerdict
+    # argues why — so the prompt is the only place the requirement is stated to the party that
+    # can meet it.
+    prompt = build()
+
+    assert prompt =~ "AT LEAST ONE ENTRY MUST BE A SENTENCE and not a code"
+    assert prompt =~ ~r/never all of it, on an\s+`escalate`/
   end
 
   test "the session is given the rules that DECIDE an outcome, not a pointer to the lenses'" do

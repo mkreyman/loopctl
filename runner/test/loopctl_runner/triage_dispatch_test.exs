@@ -175,6 +175,38 @@ defmodule LoopctlRunner.TriageDispatchTest do
       assert TriageDispatch.classify(nil) == :unknown
     end
 
+    test "a reason permanent for THIS event is never conditional, whatever conditions it carries" do
+      # 1.11.0 gave stale_stage a condition — for a `stage` report, where the refusal carries the
+      # row to retry from — while still naming it permanent under `triage_verdict`, where the
+      # condition's own prose says the story has left `detected` and nothing will match again.
+      # Read conditions-first, classify/1 answers :conditional here, Control asks whether the
+      # accept is outstanding, and a RESENT verdict — the case where it is — is pushed again for
+      # the life of the claim at a row nothing will ever move.
+      connection = Contract.connection()
+      conditions = Map.keys(get_in(connection, ["permanent_error_conditions"]))
+      permanent = get_in(connection, ["permanent_errors", "triage_verdict"])
+
+      assert "stale_stage" in conditions
+      assert "stale_stage" in permanent
+      assert TriageDispatch.classify("stale_stage") == :permanent
+
+      # The other side of the same subtraction: a condition this event does NOT call permanent is
+      # still read as one, or the runner gives up on an accept that is merely still in flight.
+      assert "dispatch_not_accepted" in conditions
+      refute "dispatch_not_accepted" in permanent
+      assert TriageDispatch.classify("dispatch_not_accepted") == :conditional
+    end
+
+    test "the conditional set is exactly what Control has a branch for" do
+      # `:conditional` means "resend if the CALLER's own evidence says so", and Control implements
+      # one condition — an accept of ours still unacknowledged. The derivation subtracts this
+      # event's permanent list and never `permanent_errors["*"]`, so a condition published for a
+      # "*"-permanent code would arrive here as :conditional and be answered with evidence about a
+      # different question, for the life of the claim. Control raises at compile time on exactly
+      # this list; asserting it here is what names the reason a reader needs.
+      assert TriageDispatch.conditional() == ["dispatch_not_accepted"]
+    end
+
     # The compile-time guard's claim, asserted where a reader can see it: a refusal this build
     # does not know is given up on, so one the contract publishes must never be unknown.
     test "every refusal the contract publishes for a triage_verdict is handled" do

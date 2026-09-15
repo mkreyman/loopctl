@@ -32,10 +32,11 @@ defmodule LoopctlRunner.TriageDispatch do
   ## Refusals
 
   Read from the contract rather than from a list written here: `x-connection.errors.triage_verdict`
-  names what can come back, `x-connection.permanent_errors` says which of those never clear, and
-  `x-connection.permanent_error_conditions` carries the one reason whose permanence has a
-  condition. A refusal this build does not handle by name is neither retried nor believed
-  harmless — see `classify/1`.
+  names what can come back, `x-connection.permanent_errors` says which of those never clear — both
+  for every event and for this one — and `x-connection.permanent_error_conditions` carries the
+  reasons whose permanence has a condition, which is read only where this event does not call the
+  reason permanent outright. A refusal this build does not handle by name is neither retried nor
+  believed harmless — see `classify/1`.
   """
 
   alias LoopctlRunner.{ByteRule, Contract}
@@ -64,7 +65,16 @@ defmodule LoopctlRunner.TriageDispatch do
   @permanent_errors Map.fetch!(Contract.connection(), "permanent_errors")
   @permanent Map.fetch!(@permanent_errors, "*") ++
                Map.get(@permanent_errors, "triage_verdict", [])
-  @conditional Map.keys(Map.fetch!(Contract.connection(), "permanent_error_conditions"))
+  # A condition is read ONLY for a reason this event does not already call permanent outright, and
+  # that subtraction is load-bearing as of 1.11.0: `stale_stage` gained a condition — read the row
+  # off the refusal and report from where it says — while `permanent_errors.triage_verdict` names
+  # it permanent, and the condition's own prose says why the two agree. A verdict has no row to
+  # read: the story has left `detected` and the verdict's first transition can never match again.
+  # Ordered the other way, `classify/1` would answer `:conditional` for it, `Control` would ask
+  # whether its accept is still outstanding, and a resent verdict — the case where it IS — would
+  # be pushed again for the life of the claim at a row nothing will ever move.
+  @conditional Map.keys(Map.fetch!(Contract.connection(), "permanent_error_conditions")) --
+                 Map.get(@permanent_errors, "triage_verdict", [])
 
   # The reasons `classify/1` answers for by name.
   @named ~w(rate_limited internal_error) ++ @conditional
@@ -84,6 +94,18 @@ defmodule LoopctlRunner.TriageDispatch do
   @doc "The refusal reasons the contract publishes for a `triage_verdict`."
   @spec errors() :: [String.t()]
   def errors, do: @errors
+
+  @doc """
+  The reasons `classify/1` answers `:conditional` for: published conditions, less what this event
+  calls permanent outright.
+
+  Exposed because the CALLER implements each condition, and one caller today implements exactly
+  one. A condition it does not know is worse than an unknown refusal: `:conditional` means
+  "resend if the caller's own evidence says so", and evidence gathered for a different question
+  is a guess wearing a verdict's clothes.
+  """
+  @spec conditional() :: [String.t()]
+  def conditional, do: @conditional
 
   @doc "The object cap the contract publishes for a triage report."
   @spec max_bytes() :: pos_integer()
@@ -215,7 +237,9 @@ defmodule LoopctlRunner.TriageDispatch do
     * `:internal_error` — transient on loopctl's side, with no promise that waiting helps: a
       bounded retry, then give up;
     * `:conditional` — permanent unless an accept this runner sent for the dispatch is still
-      unacknowledged (`x-connection.permanent_error_conditions`), which only the caller knows;
+      unacknowledged (`x-connection.permanent_error_conditions`), which only the caller knows. A
+      reason `permanent_errors` names for THIS event is never conditional, whatever conditions it
+      also carries: `stale_stage` carries one for a `stage` report and none for a verdict;
     * `:permanent` — nothing will change it, so the message is given up;
     * `:unknown` — a reason with no name, or one this build does not know. Given up, because
       resending on a reason whose meaning is unknown is as much a guess as not resending, and the

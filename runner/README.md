@@ -13,7 +13,7 @@ BEAM cluster. See `docs/agent-delivery-loop.md` section 2 for why.
 ## Status
 
 Build order steps **1a** and **1b** are implemented: hand-filed story runs (1a), and the daemon
-that keeps this machine joined to loopctl's runner pool (1b), on runner contract 1.9.2. The triage dispatch arrived in 1.7.0 and is NOT
+that keeps this machine joined to loopctl's runner pool (1b), on runner contract 1.11.0. The triage dispatch arrived in 1.7.0 and is NOT
 dispatchable here yet: the prompt a triage session reads and the verdict it states are built
 (`LoopctlRunner.TriagePrompt`, `LoopctlRunner.TriageVerdict`), while the accept path that would
 run one is not. This runner declares only `implement`, so loopctl sends it nothing else.

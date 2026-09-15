@@ -34,10 +34,59 @@ defmodule LoopctlRunner.TriageTools do
   disagree" unrepresentable, which is the one signal triage exists to surface.
   """
 
-  alias LoopctlRunner.Session
+  alias LoopctlRunner.{Session, TriagePrompt}
 
   # Read, search and dispatch the lenses — and Bash for exactly one command. No Edit, no Write.
   @tools ~w(Read Glob Grep Agent Bash)
+
+  # THE SAME VOCABULARY THE SESSION PROMPT USES, from the same place: `TriagePrompt.reason_codes/0`,
+  # which reads the gating half out of the vendored contract. Transcribing them here as well is the
+  # 1.9.0 envelope failure with an extra copy — a lens names the code in its report and the session
+  # copies that line into `escalation_reasons`, so the two prompts must spell one string. Reworded
+  # upstream, a transcription leaves every lens emitting the old spelling while the session prompt
+  # has the new one, and a gate that compares entries WHOLE fires on neither.
+  @reason_codes TriagePrompt.reason_codes()
+  @gating_codes Map.fetch!(@reason_codes, :gating)
+  @soft_codes Map.fetch!(@reason_codes, :soft)
+
+  if @gating_codes == [] do
+    raise "the contract publishes no gating reasons; the lens instruction below would name none, " <>
+            "and every lens would report a workflow change as ordinary prose"
+  end
+
+  # Outcome 1 of the four is written around ONE soft code and names it in its own sentence, so a
+  # second would be silently dropped by the interpolation rather than reaching a lens.
+  if length(@soft_codes) != 1 do
+    raise "the lens prompt's outcome 1 names a single soft code and #{length(@soft_codes)} are " <>
+            "published (#{inspect(@soft_codes)}); give the others their own sentence first"
+  end
+
+  @already_code hd(@soft_codes)
+
+  # WHEN a lens reports each published gating code, in the lens's own voice. Guarded exactly as
+  # `TriagePrompt`'s glosses are, and the guard matters more here: the session prompt's gloss
+  # explains a code to the party that emits it, while this decides whether a lens ever names it at
+  # all. A published code with no entry here is a gate that can never fire — nothing would report
+  # the fact it gates on — and that failure is invisible, because the session prompt would still
+  # list the code and the build would still be green.
+  @lens_conditions %{
+    "workflow_change_not_defect_fix" => "when the test above answers WORKFLOW CHANGE",
+    "inverts_or_removes_deliberate_behaviour" =>
+      "when the request inverts or removes behaviour a previous story deliberately added"
+  }
+
+  for code <- @gating_codes do
+    unless Map.has_key?(@lens_conditions, code) do
+      raise "the contract publishes the gating reason #{code} and no lens is told to report it; " <>
+              "the session prompt would carry a code nothing ever establishes"
+    end
+  end
+
+  @gating_lines Enum.map_join(
+                  @gating_codes,
+                  "\n",
+                  &"  - #{&1} — #{Map.fetch!(@lens_conditions, &1)}."
+                )
 
   # Scoped to the checkout, like an implement session's, minus everything that writes.
   @file_rules ~w[Read(./**) Glob(./**) Grep(./**)]
@@ -57,7 +106,8 @@ defmodule LoopctlRunner.TriageTools do
   #
   # ADAPTED, not copied: over there each lens states its own verdict block and emits
   # escalation_reasons itself. Here a lens REPORTS and the session states the one verdict, so a
-  # lens names the code in its report and the session carries it into escalation_reasons. The
+  # lens names the code in its report and the session carries it into escalation_reasons — which is
+  # why the codes below are interpolated from the one vocabulary and never written out again. The
   # words of the operational test are verbatim, because the measurement is of those words.
   @judgement """
 
@@ -73,10 +123,9 @@ defmodule LoopctlRunner.TriageTools do
   wrong value, a crash, a missing save, or a screen showing other than what it was built to show \
   is a defect fix even when filed as a feature.
 
-  When the answer is a workflow change, say so in your report with the literal string \
-  workflow_change_not_defect_fix on a line of its own. The same for \
-  inverts_or_removes_deliberate_behaviour when the request inverts or removes behaviour a previous \
-  story deliberately added.
+  Report each of these with the literal string on a line of its own:
+
+  #{@gating_lines}
 
   WRITE THE CODE BARE: no backticks, no quotes, no brackets, nothing before or after it on that \
   line. The session copies that line into the verdict and the loop's gate compares entries WHOLE, \
@@ -96,7 +145,7 @@ defmodule LoopctlRunner.TriageTools do
   verdict is the session's to decide, and it is told the same rules.
 
   1. The code already does what is being asked, CORRECTLY — both halves, present and behaving as \
-  asked. Report already_implemented_at_head on a line of its own, bare, and name what you read. A \
+  asked. Report #{@already_code} on a line of its own, bare, and name what you read. A \
   feature that exists and misbehaves is outcome 2, not this.
   2. The code carries the behaviour and gets it wrong — a wrong value, a crash, a save that does \
   not happen. That is the ordinary defect fix, it is the commonest thing intake brings, and it \

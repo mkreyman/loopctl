@@ -174,6 +174,46 @@ defmodule LoopctlRunner.TriageVerdict do
   @spec max_bytes() :: pos_integer()
   def max_bytes, do: @max_bytes
 
+  @doc """
+  Whether an `escalate` verdict gives a person no words: every `escalation_reasons` entry is one of
+  the codes the prompt tells a session to spell bare, or there are none at all.
+
+  The contract asks for the opposite in the field's own description — "at least one entry must be
+  prose, a bare code is not words a person can act on" — and `escalate` is the outcome that sends
+  this to a human, so a verdict carrying only a classification sends them back to the start of the
+  reading it just did.
+
+  IT IS NOT ONE OF `validate/1`'s CHECKS, deliberately, and the asymmetry is the whole argument.
+  The three there are things loopctl would refuse on the wire, where refusing locally costs the run
+  nothing it had. This one loopctl accepts: it records `escalation_reasons` verbatim and routes on
+  `outcome` alone. Refusing it here would turn a verdict that escalates CORRECTLY — with its
+  evidence, its `missing_information`, and a human on the other end — into `verdict_invalid`, which
+  is the run reporting that it produced nothing at all. Nor can the session make it good: nothing
+  validates a verdict until `loop-verdict` has already linked it into place, a run records one, and
+  by the time this is read the session is over. So the prompt REQUIRES a sentence, this says when
+  one did not arrive, and the thin verdict still goes: less than was asked for, and far more than
+  the alternative.
+
+  Read from `TriagePrompt.reason_codes/0` at call time so there is one list — the codes a session
+  is told to spell bare are exactly the strings that are not words.
+  """
+  @spec bare_escalation?(verdict()) :: boolean()
+  def bare_escalation?(%{"outcome" => "escalate"} = verdict) do
+    codes = bare_codes()
+
+    verdict
+    |> Map.get("escalation_reasons")
+    |> List.wrap()
+    |> Enum.all?(&(&1 in codes))
+  end
+
+  def bare_escalation?(_verdict), do: false
+
+  defp bare_codes do
+    %{gating: gating, soft: soft} = LoopctlRunner.TriagePrompt.reason_codes()
+    gating ++ soft
+  end
+
   defp type_of(value) when is_list(value), do: "a JSON array"
   defp type_of(value) when is_binary(value), do: "a JSON string"
   defp type_of(value) when is_number(value), do: "a JSON number"

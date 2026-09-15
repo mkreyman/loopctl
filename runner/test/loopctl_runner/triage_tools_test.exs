@@ -160,6 +160,24 @@ defmodule LoopctlRunner.TriageToolsTest do
         refute prompt =~ code <> "`", "#{name}: #{code} shown wrapped"
       end
 
+      # EVERY published code is named, and named from the one vocabulary. The literals above are
+      # what catches a rewording; this is what catches the transcription coming back — a lens told
+      # the old spelling while the session prompt carries the new one gates nothing, and the split
+      # between the two prompts is exactly where that goes unnoticed.
+      codes = LoopctlRunner.TriagePrompt.reason_codes()
+
+      for code <- codes.gating ++ codes.soft do
+        # As a WHOLE TOKEN, never as a substring. A gate compares entries whole, so a lens told
+        # `already_implemented_at_head_OLD` reports a string that matches nothing — and `prompt =~
+        # code` passes on it, because the stale spelling contains the live one. Mutation-checked:
+        # the substring form stayed green under exactly that edit.
+        assert prompt =~ ~r/(?<![\w-])#{Regex.escape(code)}(?![\w-])/,
+               "#{name}: #{code} is published and no lens is told to report it, bare"
+      end
+
+      assert codes.gating ==
+               LoopctlRunner.Contract.connection() |> Map.fetch!("triage_gating_reasons")
+
       # And a lens still states no verdict, in any wording: "the verdict should escalate" is
       # stating one, and it would make the lenses disagreeing unrepresentable.
       refute prompt =~ "verdict should", "#{name}"

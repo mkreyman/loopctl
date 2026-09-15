@@ -6,7 +6,7 @@ defmodule LoopctlRunner.ContractTest do
   defp join(overrides \\ %{}) do
     Map.merge(
       %{
-        "contract_version" => "1.9.2",
+        "contract_version" => "1.11.0",
         "kinds" => ["implement"],
         "machine" => "minis",
         "cores" => 16,
@@ -20,8 +20,8 @@ defmodule LoopctlRunner.ContractTest do
     )
   end
 
-  test "the vendored contract is v1.9.2 and names the socket and header the client uses" do
-    assert Contract.version() == "1.9.2"
+  test "the vendored contract is v1.11.0 and names the socket and header the client uses" do
+    assert Contract.version() == "1.11.0"
 
     assert %{
              "credential_header" => "x-loopctl-runner-token",
@@ -866,6 +866,42 @@ defmodule LoopctlRunner.ContractTest do
              |> Map.fetch!("dispatch_not_accepted") =~ "claim_epoch"
 
       refute "dispatch_not_accepted" in LoopctlRunner.Control.given_up()
+    end
+
+    test "error_fields answers per event and per code, and raises rather than reading nil" do
+      # The table is COMPLETE as of 1.11.0: a code that carries nothing publishes an explicit [].
+      # So nothing found means the event or the code is not published, which must be loud — got
+      # rather than fetched, a caller reading a field off a refusal would read nil off every
+      # refusal from the next vendoring on, and fall back to whatever guess the field replaced.
+      assert "stage" in Contract.error_fields("stage", "stale_stage")
+      assert Contract.error_fields("stage", "internal_error") == []
+      assert Contract.error_fields("join", "rate_limited") == ~w(max_joins window_ms)
+
+      assert_raise KeyError, fn -> Contract.error_fields("stage", "no_such_code") end
+      assert_raise KeyError, fn -> Contract.error_fields("no_such_event", "internal_error") end
+    end
+
+    test "a stale_stage refusal of a stage report carries the row, and its permanence is conditional" do
+      # Both halves are what `Control` retries a terminal report on. Until 1.11.0 the refusal said
+      # only `stale_stage`, so the runner walked a fixed list of the stages the story could be at;
+      # on 2026-09-14 all three were refused in turn and not one could say where the row was.
+      assert Contract.error_fields("stage", "stale_stage") ==
+               ~w(stage claim_epoch lock_version attempts effects)
+
+      condition =
+        Contract.connection()
+        |> Map.fetch!("permanent_error_conditions")
+        |> Map.fetch!("stale_stage")
+
+      assert condition =~ "stage_transitions"
+      assert condition =~ "PERMANENT"
+
+      # The condition turns on that table, so it must name a `from` for every stage a report can
+      # leave — and leave `escalated` naming none, which is what makes the permanence reachable.
+      froms = Contract.connection() |> Map.fetch!("stage_transitions") |> Enum.map(& &1["from"])
+
+      assert "implementing" in froms
+      refute "escalated" in froms
     end
 
     test "a length is counted in CODEPOINTS, the way loopctl counts it" do

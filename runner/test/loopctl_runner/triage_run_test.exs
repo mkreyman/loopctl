@@ -8,7 +8,15 @@ defmodule LoopctlRunner.TriageRunTest do
 
   @moduletag timeout: 60_000
 
-  @verdict %{"outcome" => "escalate", "confidence" => "high", "missing_information" => ["what?"]}
+  # A REALISTIC escalate verdict: it carries a sentence in `escalation_reasons` as well as the
+  # missing information, which is what the prompt requires of one and what `bare_escalation?/1`
+  # looks for. Without it every run in this file logs that its escalation gave a person no words.
+  @verdict %{
+    "outcome" => "escalate",
+    "confidence" => "high",
+    "missing_information" => ["what?"],
+    "escalation_reasons" => ["the form and the invoice disagree on which date is billed"]
+  }
 
   @triage %{
     "record_id" => "7d0c1f6e-3b1a-4f7e-9c2d-5a6b7c8d9e0f",
@@ -45,6 +53,28 @@ defmodule LoopctlRunner.TriageRunTest do
     assert verdict["outcome"] == "escalate"
     assert File.read!(TriageVerdict.file(result.run_dir)) == Jason.encode!(@verdict)
     assert {:ok, %{"status" => "verdict", "kind" => "triage"}} = RunStateRead.read(result.run_dir)
+  end
+
+  test "an escalate carrying only bare codes is SENT, and said about", ctx do
+    # The one moment the runner holds such a verdict and knows it is about to go. It is not
+    # refused: `TriageVerdict.bare_escalation?/1` carries the argument, and the short of it is that
+    # `verdict_invalid` would report that this run produced nothing, while loopctl accepts this and
+    # routes a human to it. So the outcome must still be the verdict, and the line must still be
+    # there — a check nobody logs is a check that changes nothing.
+    thin =
+      Map.put(@verdict, "escalation_reasons", [
+        hd(LoopctlRunner.TriagePrompt.reason_codes().gating)
+      ])
+
+    log =
+      capture_log(fn ->
+        result =
+          execute(ctx, [{"FAKE_CLAUDE_MODE", "stream"}, {"FAKE_VERDICT", Jason.encode!(thin)}])
+
+        assert {:verdict, ^thin} = result.outcome
+      end)
+
+    assert log =~ "carries no words a person can act on"
   end
 
   test "the session is launched with the TRIAGE containment, not the implement one", ctx do

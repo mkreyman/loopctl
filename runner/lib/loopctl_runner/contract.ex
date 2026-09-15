@@ -1,7 +1,7 @@
 defmodule LoopctlRunner.Contract do
   @moduledoc """
   The loopctl runner wire contract, vendored from mkreyman/loopctl
-  `priv/runner_contract/v1.json` (JSON Schema 2020-12, `x-contract-version` 1.9.2).
+  `priv/runner_contract/v1.json` (JSON Schema 2020-12, `x-contract-version` 1.11.0).
 
   The file is copied, never re-typed: the server casts every payload against the same
   document, drops unknown fields at every depth, and refuses a mismatched major version.
@@ -37,6 +37,25 @@ defmodule LoopctlRunner.Contract do
 
   @spec connection() :: map()
   def connection, do: Map.fetch!(@schema, "x-connection")
+
+  @doc """
+  The fields a refusal of `event` with `code` carries, from `x-connection.error_fields` (1.11.0).
+
+  That table is COMPLETE by the contract's own rule: a code that carries nothing publishes an
+  explicit `[]`. So nothing found here means the EVENT or the CODE is not published at all, never
+  that the refusal is bare — which is why both keys are fetched. A caller that reads a field off a
+  refusal calls this from a module attribute, so a vendoring that stops publishing the field fails
+  the build; got rather than fetched, it would read nil off every refusal at runtime and put back
+  whatever guess the field replaced, with nothing able to see it.
+  """
+  @spec error_fields(String.t(), String.t()) :: [String.t()]
+  def error_fields(event, code) do
+    @schema
+    |> Map.fetch!("x-connection")
+    |> Map.fetch!("error_fields")
+    |> Map.fetch!(event)
+    |> Map.fetch!(code)
+  end
 
   @doc "One `$defs` entry of the vendored contract, e.g. \"RunnerStory\"."
   @spec schema_def(String.t()) :: map()

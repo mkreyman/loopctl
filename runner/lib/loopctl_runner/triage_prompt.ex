@@ -31,41 +31,108 @@ defmodule LoopctlRunner.TriagePrompt do
   @story_required @verdict_props |> Map.fetch!("story") |> Map.fetch!("required")
   @contradicts_item @verdict_props |> Map.fetch!("contradicts") |> Map.fetch!("items")
 
-  # Transcribed from `Loopctl.DeliveryGates.GateA`, whose @gating_codes map is keyed by the first
-  # two of these as whole strings (`Map.has_key?`), with every other code collected as a soft
-  # signal — which is where the third sits, recorded and never gating.
+  # THE GATING CODES ARE READ FROM THE VENDORED FILE, not transcribed. 1.11.0 publishes them as
+  # `x-connection.triage_gating_reasons` — deliberately as their own list and not as an enum on
+  # `escalation_reasons`, since that field also carries the prose that makes an escalation
+  # actionable. They are the strings `Loopctl.DeliveryGates.GateA` matches WHOLE, so a reworded one
+  # stops the gate firing with nothing to notice; read from the file, a rewording arrives as a
+  # vendoring and this prompt follows it.
   #
   # WHAT THIS DOES NOT DO TODAY, stated because the opposite is the easy thing to assume: a
   # `triage_verdict` message does NOT reach that gate. Gate A's input is a trio_outputs fact from
   # the INTERACTIVE trio, and the wire path reads `outcome` alone — loopctl records
-  # `escalation_reasons` verbatim and matches nothing in it (loopctl-54, 2026-09-15). So nothing
-  # here is silently failing to gate right now; these codes are carried for the day a runner's
-  # verdict is what feeds Gate A, which is the whole point of the trio running unattended.
-  #
-  # On that day a reworded code stops the gate firing with nothing to notice — the 1.9.0 envelope
-  # failure again — so the vocabulary is being PUBLISHED in contract 1.9.3 as its own list in
-  # x-connection, deliberately not as an enum on the field, since escalation_reasons also carries
-  # the prose that makes an escalation actionable. When it lands, these three come from the
-  # vendored file and this comment goes with them.
-  @workflow_code "workflow_change_not_defect_fix"
-  @inverts_code "inverts_or_removes_deliberate_behaviour"
+  # `escalation_reasons` verbatim and matches nothing in it, which the field's own description says
+  # in the same breath as publishing the list. So nothing here is silently failing to gate right
+  # now; these codes are carried for the day a runner's verdict is what feeds Gate A, which is the
+  # whole point of the trio running unattended.
+  @gating_codes Map.fetch!(Contract.connection(), "triage_gating_reasons")
+
+  # NOT published as gating, and that is what it is: Gate A collects every other code as a soft
+  # signal. It stays written here because the contract publishes no list of the non-gating ones —
+  # there is nothing to read it from — and it is spelled bare in the prompt for the same reason the
+  # gating two are, since only their EFFECT differs.
   @already_code "already_implemented_at_head"
+
+  # An empty published list would leave the prompt naming no gating code at all, and the
+  # counter-example below reading it would raise while BUILDING a prompt — inside an accepted
+  # dispatch, where the failure is a run that produces nothing rather than a build that says why.
+  if @gating_codes == [] do
+    raise "the vendored contract publishes an empty triage_gating_reasons; this prompt would " <>
+            "tell a session to spell codes it never names, and the loop's gate would fire on none"
+  end
+
+  if @already_code in @gating_codes do
+    raise "the vendored contract now publishes #{@already_code} as a gating reason; it is glossed " <>
+            "here as a soft signal whose rate has still to earn it a place, and the prompt says so"
+  end
+
+  # A gloss per gating code, the same rule the outcomes below are held to: a code the contract
+  # publishes and nothing here explains would reach a session as a bare word, which is exactly the
+  # form the prompt tells it never to invent.
+  @gating_glosses %{
+    "workflow_change_not_defect_fix" =>
+      "the operational test below answered WORKFLOW CHANGE. Whatever your outcome is.",
+    "inverts_or_removes_deliberate_behaviour" =>
+      "the request inverts or removes behaviour a previous story deliberately added. " <>
+        "Whatever your outcome is."
+  }
+
+  for code <- @gating_codes do
+    unless Map.has_key?(@gating_glosses, code) do
+      raise "the contract publishes the gating reason #{code} and this prompt does not explain it"
+    end
+  end
+
+  @codes @gating_codes ++ [@already_code]
+
+  @code_glosses Map.put(
+                  @gating_glosses,
+                  @already_code,
+                  "the code already does, correctly, what is being asked. See the rule below, " <>
+                    "which fixes the outcome. It is not gating today and you emit it every time " <>
+                    "it applies anyway: the rate at which it fires is what decides whether it " <>
+                    "earns a gating place, and dropping it as pointless is the one thing that " <>
+                    "keeps that rate at zero."
+                )
 
   @max_reasons Contract.schema_def("RunnerTriageVerdict")
                |> get_in(["properties", "escalation_reasons", "maxItems"]) ||
                  raise("the vendored contract publishes no maxItems for escalation_reasons")
+
+  # The instructions below are only satisfiable while the codes LEAVE ROOM for a sentence: every
+  # code goes in first, at most `maxItems` entries fit, and an `escalate` must carry at least one
+  # entry that is not a code. Both sides of that can move at a vendoring — the published list can
+  # grow and the cap can shrink — and neither failure is visible, because each rule stays true on
+  # its own while the three together become impossible. A session then either drops a code to fit
+  # or has the whole verdict refused, and both are silent.
+  if length(@codes) >= @max_reasons do
+    raise "the contract publishes #{length(@codes)} codes for an escalation_reasons of at most " <>
+            "#{@max_reasons} entries, which leaves no room for the sentence this prompt requires " <>
+            "of an escalate; the precedence rule needs deciding before the vendoring lands"
+  end
 
   defp max_reasons, do: @max_reasons
 
   @doc """
   The codes a verdict spells exactly and bare, because the loop compares entries WHOLE.
 
-  Two of them GATE — `#{@workflow_code}` and `#{@inverts_code}` — and `#{@already_code}` is
-  recorded as a soft signal until its measured rate earns it a place among them. All three are
-  spelled the same way for the same reason; only their effect differs.
+  The gating ones are the contract's `x-connection.triage_gating_reasons`; `#{@already_code}` is
+  recorded as a soft signal until its measured rate earns it a place among them. All are spelled
+  the same way for the same reason; only their effect differs.
   """
   @spec reason_codes() :: %{gating: [String.t()], soft: [String.t()]}
-  def reason_codes, do: %{gating: [@workflow_code, @inverts_code], soft: [@already_code]}
+  def reason_codes, do: %{gating: @gating_codes, soft: [@already_code]}
+
+  # The heading counts the list rather than spelling a word, so a published code added at the next
+  # vendoring cannot leave the session told there are three when it is shown four.
+  defp code_count, do: length(@codes)
+
+  # The counter-example is a real code, because the warning is about what the loop does to THIS
+  # string; any gating one shows it.
+  defp example_code, do: hd(@gating_codes)
+
+  defp code_bullets,
+    do: Enum.map_join(@codes, "\n", &"- #{&1} — #{Map.fetch!(@code_glosses, &1)}")
 
   @doc """
   The prompt for `triage`, a `RunnerTriage` object, in the repository checked out at `repo`.
@@ -118,12 +185,17 @@ defmodule LoopctlRunner.TriagePrompt do
       say what is missing sends someone back to the start of your own reading.
     - `escalation_reasons` is YOUR reason a human is needed, not loopctl's detector output below.
       It carries TWO different things, and only one of them depends on your outcome. The CODES
-      named under "The three codes" below go in on EVERY outcome, `story` and `reject` included —
-      a workflow change queued as a story with no code is the one thing the loop cannot see. The
+      named under "The #{code_count()} codes" below
+      go in on EVERY outcome, `story` and `reject` included — a workflow change queued as a
+      story with no code is the one thing the loop cannot see. The
       plain sentences, one per reason, are what a human is needed FOR, and those are meaningful on
-      `escalate`. It holds at most #{max_reasons()} entries in total and the whole verdict is
+      `escalate` — where AT LEAST ONE ENTRY MUST BE A SENTENCE and not a code. The codes are a
+      classification; a person opening an escalated verdict has nothing to act on until something
+      says what a lens actually SAW, and a person is who `escalate` sends this to. It holds at most
+      #{max_reasons()} entries in total and the whole verdict is
       refused if it holds more, never truncated, so when they will not all fit, EVERY code that
-      applies goes in FIRST and the sentences take what is left. A code is what the loop can act
+      applies goes in FIRST and the sentences take what is left — never all of it, on an
+      `escalate`. A code is what the loop can act
       on; a sentence is what a person reads, and a person can read the rest in
       `missing_information` and `evidence`.
     - `contradicts` is a list of OBJECTS, not sentences: #{contradicts_shape()}. Use it for what
@@ -136,25 +208,18 @@ defmodule LoopctlRunner.TriagePrompt do
       emoji therefore costs double, and every field at its maximum is already close to the cap, so
       keep the draft story to what it needs.
 
-    ## The three codes
+    ## The #{code_count()} codes
 
     Write each one BARE as its own entry: no backticks, no quotes, nothing before or after it. The
     loop compares entries WHOLE, so an entry reading
 
-        #{@workflow_code} - the form never printed this
+        #{example_code()} - the form never printed this
 
     is a different string, is recorded as ordinary prose, and is acted on by nothing. Put the
     sentence that explains it in an entry of its own. Never reword one and never coin one: an
     invented code is prose, which is the same as saying nothing.
 
-    - #{@workflow_code} — the operational test below answered WORKFLOW CHANGE. Whatever your
-      outcome is.
-    - #{@inverts_code} — the request inverts or removes behaviour a previous story deliberately
-      added. Whatever your outcome is.
-    - #{@already_code} — the code already does, correctly, what is being asked. See the rule
-      below, which fixes the outcome. It is not gating today and you emit it every time it applies
-      anyway: the rate at which it fires is what decides whether it earns a gating place, and
-      dropping it as pointless is the one thing that keeps that rate at zero.
+    #{code_bullets()}
 
     ## Defect fix or workflow change — the operational test
 

@@ -436,7 +436,7 @@ defmodule LoopctlRunner.TriageRun do
 
   defp outcome(run_dir, session) do
     case TriageVerdict.read(run_dir) do
-      {:ok, verdict} -> {:verdict, verdict}
+      {:ok, verdict} -> {:verdict, note_bare_escalation(verdict)}
       {:error, :none} -> incomplete(run_dir, session)
       {:error, {:invalid, reason}} -> reported("verdict_invalid", reason)
       # An IO failure reaches loopctl as an incomplete rather than a runner error — loopctl asked
@@ -445,6 +445,25 @@ defmodule LoopctlRunner.TriageRun do
       # assumed, because the contract defines verdict_invalid as the session having written one.
       {:error, {:unreadable, reason}} -> unreadable(run_dir, reason)
     end
+  end
+
+  # Logged and SENT, never refused — `TriageVerdict.bare_escalation?/1` carries the argument. It is
+  # said here because this is the one moment the runner holds the verdict and knows it is about to
+  # go: the run is over, the session cannot be asked again, and loopctl will record it as it stands.
+  # An error rather than a warning, because what reaches the human on the other end of this
+  # escalation is a classification and no words, and the prompt that should have got a sentence out
+  # of the session is the thing to go and look at.
+  defp note_bare_escalation(verdict) do
+    if TriageVerdict.bare_escalation?(verdict) do
+      Logger.error(
+        "this run's escalate verdict carries no words a person can act on: every " <>
+          "escalation_reason is one of the bare codes, or there are none. It is being sent as " <>
+          "stated — loopctl records the field verbatim and routes on the outcome — but whoever " <>
+          "opens it gets a classification and nothing to read"
+      )
+    end
+
+    verdict
   end
 
   # Order matters: the runner's own reasons first, because it KNOWS them, and a parked session's

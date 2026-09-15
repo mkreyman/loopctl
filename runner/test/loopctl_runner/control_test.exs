@@ -57,7 +57,7 @@ defmodule LoopctlRunner.ControlTest do
     assert_receive {:test_loopctl, {:join, ^runner_id, join}}, 5_000
     assert Contract.validate("RunnerJoin", join) == :ok
     assert join["machine"] == "testbox"
-    assert join["contract_version"] == "1.9.2"
+    assert join["contract_version"] == "1.11.0"
     # Declared on EVERY join, from the same list the kind check reads.
     assert join["kinds"] == LoopctlRunner.Control.kinds()
     assert join["kinds"] == ["implement"]
@@ -1457,8 +1457,12 @@ defmodule LoopctlRunner.ControlTest do
       runs_done(pid)
     end
 
-    test "a stream opened on demand retries its terminal report from earlier stages", ctx do
-      stale = {:error, %{reason: "stale_stage"}}
+    test "a stream opened on demand retries its terminal report from the stage the refusal names",
+         ctx do
+      # The refusal CARRIES THE ROW (contract 1.11.0), so the retry goes from where loopctl says
+      # the story is — not from the next entry of a list of stages it might be at. `claimed` is
+      # deliberately not the stage the old walk would have tried next.
+      stale = {:error, %{reason: "stale_stage", stage: "claimed"}}
       TestLoopctl.put(:stage_replies, [stale, :ok])
       {pid, _topic} = accepting_control(ctx, "stream")
       binding = DispatchRun.binding(story_dispatch())
@@ -1473,7 +1477,7 @@ defmodule LoopctlRunner.ControlTest do
       assert next_stage() == %{
                "dispatch_id" => binding["dispatch_id"],
                "claim_epoch" => 3,
-               "from" => "worktree",
+               "from" => "claimed",
                "to" => "escalated",
                "edge" => "session_escalated",
                "reason" => reason
@@ -1484,9 +1488,9 @@ defmodule LoopctlRunner.ControlTest do
       assert Control.info(pid).stage_reports_pending == 0
     end
 
-    test "a stream Control started itself walks the fallback chain for its terminal report",
-         ctx do
-      TestLoopctl.put(:stage_replies, [:ok, :ok, {:error, %{reason: "stale_stage"}}, :ok])
+    test "a stream Control started itself retries its terminal report where the row says", ctx do
+      stale = {:error, %{reason: "stale_stage", stage: "claimed"}}
+      TestLoopctl.put(:stage_replies, [:ok, :ok, stale, :ok])
 
       capture_log(fn ->
         {pid, topic} = accepting_control(ctx, "stream")
@@ -1495,7 +1499,7 @@ defmodule LoopctlRunner.ControlTest do
         assert %{"to" => "worktree"} = next_stage()
         assert %{"to" => "implementing"} = next_stage()
         assert %{"from" => "implementing", "to" => "escalated"} = next_stage()
-        assert %{"from" => "worktree", "to" => "escalated", "reason" => reason} = next_stage()
+        assert %{"from" => "claimed", "to" => "escalated", "reason" => reason} = next_stage()
         assert reason == DispatchRun.finished_reason()
         runs_done(pid)
         refute_receive {:test_loopctl, {:stage, _}}, 1_000
@@ -1503,16 +1507,22 @@ defmodule LoopctlRunner.ControlTest do
       end)
     end
 
-    test "an on-demand stream whose intermediate report is stale still records its terminal",
-         ctx do
-      stale = {:error, %{reason: "stale_stage"}}
-      TestLoopctl.put(:stage_replies, [stale, stale, stale, :ok])
+    test "a row that keeps moving is followed, and no stage is reported from twice", ctx do
+      # Each refusal names where the row is NOW, so the retries follow it rather than walking a
+      # fixed order — here backwards, which no list written in this repo would have produced.
+      TestLoopctl.put(:stage_replies, [
+        {:error, %{reason: "stale_stage", stage: "implementing"}},
+        {:error, %{reason: "stale_stage", stage: "worktree"}},
+        {:error, %{reason: "stale_stage", stage: "reviewing"}},
+        :ok
+      ])
 
       capture_log(fn ->
         {pid, _topic} = accepting_control(ctx, "stream")
         binding = DispatchRun.binding(story_dispatch())
 
-        # The replacement guesses the story is at worktree; it is still at claimed.
+        # The replacement guesses the story is at worktree; the intermediate is refused and the
+        # intermediates stop, which is unchanged — only the terminal report is retried.
         send(pid, {:run_stage, binding, {:implementing, %{}}})
         assert %{"from" => "worktree", "to" => "implementing"} = next_stage(5_000)
 
@@ -1523,11 +1533,69 @@ defmodule LoopctlRunner.ControlTest do
 
         assert %{"from" => "implementing", "to" => "escalated"} = next_stage(5_000)
         assert %{"from" => "worktree", "to" => "escalated"} = next_stage(5_000)
-        assert %{"from" => "claimed", "to" => "escalated", "reason" => reason} = next_stage(5_000)
+
+        assert %{"from" => "reviewing", "to" => "escalated", "reason" => reason} =
+                 next_stage(5_000)
+
         assert reason == DispatchRun.finished_reason()
         refute_receive {:test_loopctl, {:stage, _}}, 800
         :ok = wait_until(fn -> Control.info(pid).stage_reports_pending == 0 end, 3_000)
       end)
+    end
+
+    test "a stale_stage naming a stage no transition leaves ends the run rather than retrying",
+         ctx do
+      # `permanent_error_conditions` calls stale_stage PERMANENT here: the story has reached a
+      # stage no runner can report out of, which a session reaches by escalating through the HTTP
+      # surface under the same claim while its run is still going. Retrying into it is what the
+      # walk this replaced would do, for ever.
+      dispatch = story_dispatch()
+      TestLoopctl.put(:stage_replies, [{:error, %{reason: "stale_stage", stage: "escalated"}}])
+
+      log =
+        capture_log(fn ->
+          {pid, _topic} = accepting_control(ctx, "stream")
+          binding = DispatchRun.binding(dispatch)
+
+          send(
+            pid,
+            {:run_stage, binding, {:finished, %{status: "succeeded", reached: "implementing"}}}
+          )
+
+          assert %{"from" => "implementing", "to" => "escalated"} = next_stage()
+          # Nothing is tried from `escalated`, nor from anywhere else.
+          refute_receive {:test_loopctl, {:stage, _}}, 1_000
+          assert Control.info(pid).stage_reports_pending == 0
+        end)
+
+      assert log =~ "is at escalated, which no transition leaves"
+      # The contract's own words for why, carried into the line an operator reads.
+      assert log =~ "stage_transitions"
+    end
+
+    test "a stale_stage that names no stage is given up rather than guessed at", ctx do
+      # A refusal with no row is one this runner cannot act on: 1.11.0 publishes `stage` on every
+      # stale_stage refusal of a stage report, so a bare one means something upstream changed, and
+      # guessing is what cost 2026-09-14 three refused attempts that could name nothing.
+      dispatch = story_dispatch()
+      TestLoopctl.put(:stage_replies, [{:error, %{reason: "stale_stage"}}])
+
+      log =
+        capture_log(fn ->
+          {pid, _topic} = accepting_control(ctx, "stream")
+          binding = DispatchRun.binding(dispatch)
+
+          send(
+            pid,
+            {:run_stage, binding, {:finished, %{status: "succeeded", reached: "implementing"}}}
+          )
+
+          assert %{"from" => "implementing", "to" => "escalated"} = next_stage()
+          refute_receive {:test_loopctl, {:stage, _}}, 1_000
+          assert Control.info(pid).stage_reports_pending == 0
+        end)
+
+      assert log =~ "stale_stage naming no stage"
     end
 
     test "free disk is checked on the repo checkout's volume too", ctx do
@@ -1587,7 +1655,8 @@ defmodule LoopctlRunner.ControlTest do
       refute_receive {:test_loopctl, {:stage, _}}, 800
     end
 
-    test "a terminal report refused from every stage is recorded and not reported again", ctx do
+    test "a terminal report refused from a stage already tried is recorded and not reported again",
+         ctx do
       dispatch = story_dispatch()
       run_dir = Path.join(ctx.config.runs_dir, "refused-run")
       File.mkdir_p!(run_dir)
@@ -1601,8 +1670,11 @@ defmodule LoopctlRunner.ControlTest do
         })
       )
 
-      stale = {:error, %{reason: "stale_stage"}}
-      TestLoopctl.put(:stage_replies, [stale, stale, stale])
+      # The row is named as `worktree` twice. A stage already reported from is never reported from
+      # again, which is what bounds the retries however the row moves underneath: without it, a
+      # refusal that keeps naming one stage is an unbounded loop rather than a run that ends.
+      stale = {:error, %{reason: "stale_stage", stage: "worktree"}}
+      TestLoopctl.put(:stage_replies, [stale, stale])
       {pid, _topic} = accepting_control(ctx, "stream")
 
       refused? = fn ->
@@ -1764,6 +1836,30 @@ defmodule LoopctlRunner.ControlTest do
       assert log =~
                "refused the stage claimed -> worktree for dispatch #{dispatch["dispatch_id"]}: " <>
                  "stale_stage"
+    end
+
+    test "a stale intermediate report re-aims the terminal one at the row it named", ctx do
+      # The intermediates stop either way — they cannot follow a stage loopctl disagrees with — but
+      # the row the refusal carries still applies to the TERMINAL report, which is built from
+      # `stream.stage`. Left at the refused value it costs that report a guaranteed refused round
+      # trip and an entry of a retry budget bounded by the transition table.
+      TestLoopctl.put(:stage_replies, [{:error, %{reason: "stale_stage", stage: "reviewing"}}])
+      dispatch = story_dispatch()
+
+      capture_log(fn ->
+        {pid, topic} = accepting_control(ctx, "stream")
+        TestLoopctl.Endpoint.broadcast(topic, "dispatch", dispatch)
+
+        assert %{"from" => "claimed", "to" => "worktree"} = next_stage()
+
+        # NOT "worktree", which is where this stream believed the story was and what the old code
+        # would have sent: the refusal said `reviewing`, and the terminal report goes from there.
+        assert %{"from" => "reviewing", "to" => "escalated", "reason" => reason} = next_stage()
+        assert reason == DispatchRun.finished_reason()
+        runs_done(pid)
+        refute_receive {:test_loopctl, {:stage, _}}, 1_000
+        assert Control.info(pid).stage_reports_pending == 0
+      end)
     end
 
     test "a report given up after internal_error blocks neither later reports nor the terminal",

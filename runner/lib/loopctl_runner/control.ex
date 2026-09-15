@@ -59,7 +59,7 @@ defmodule LoopctlRunner.Control do
       is treated as started, so a redelivered dispatch is answered `accepted` and starts nothing;
     * each pending start has its accept resent, and its run starts on `ok`;
     * each bound run that is over without `terminal_reported` in its `state.json` gets its terminal
-      report, from the stage it recorded reaching, with the fallback chain.
+      report, from the stage it recorded reaching, retried from wherever a refusal says the row is.
 
   Runs report their stages to the registered name, waiting up to a minute for one to exist, so they
   reach the successor.
@@ -89,8 +89,10 @@ defmodule LoopctlRunner.Control do
   latter 3 times for an intermediate report (then that report is given up and the next goes) and
   8 times for the terminal one. A stream whose intermediate reports stop (`stale_stage` or another
   refusal) still sends its terminal `escalated` report, since that is what frees loopctl's slot;
-  `stale_stage` on the terminal report retries it from the believed stage, then `implementing`,
-  `worktree` and `claimed`, stopping at the first acknowledgement. Reports not yet
+  `stale_stage` on the terminal report CARRIES THE ROW it refused (contract 1.11.0), so the report
+  is sent again from the `stage` it names, and never from the same stage twice. A stage no
+  transition leaves is where that stops: `permanent_error_conditions` calls stale_stage permanent
+  there, because the story has reached a stage no runner can report out of. Reports not yet
   acknowledged when the channel closes are resent after the rejoin, in order; a replay whose first
   copy committed is answered `ok`.
 
@@ -1097,6 +1099,21 @@ defmodule LoopctlRunner.Control do
 
   defp triage_verdict_retry_ms, do: @triage_verdict_retry_ms
 
+  # `verdict_refused/4`'s `:conditional` branch implements ONE condition — dispatch_not_accepted's,
+  # whose evidence is an accept of ours still unacknowledged (`accept_outstanding?/3`). Pinned,
+  # because `TriageDispatch` derives that set and the derivation subtracts only the EVENT's
+  # permanent list, never `permanent_errors["*"]`: a vendoring that gave a "*"-permanent code a
+  # condition would make `classify/1` answer `:conditional` for it, and this runner would then
+  # resend the verdict on whether its accept is outstanding — evidence about an entirely different
+  # question — for the life of the claim. A new condition is a branch to write, so it fails here.
+  @verdict_conditional TriageDispatch.conditional()
+
+  unless Enum.sort(@verdict_conditional) == ["dispatch_not_accepted"] do
+    raise "the contract publishes conditions for #{inspect(Enum.sort(@verdict_conditional))} on a " <>
+            "triage_verdict, and this module implements only dispatch_not_accepted's; give each " <>
+            "new one its own branch before the vendoring lands"
+  end
+
   # The round trip of a status push. A slow one is logged when its reply lands; one still
   # unanswered past the slow threshold is logged at each tick by warn_unanswered/1.
   defp settle_status(socket, ref, reply) do
@@ -2070,46 +2087,176 @@ defmodule LoopctlRunner.Control do
     end
   end
 
-  # The story is not where the report said. For the terminal report that is recoverable: the
-  # runner's belief can lag (reports lost with a crashed Control, or refused, or given up), so the
-  # same report is tried from each stage the story could still be at — the believed one, then
-  # implementing, worktree, claimed — stopping at the first acknowledgement. When the claim was
-  # really reclaimed every attempt is refused, and loopctl's heal sweep does the accounting.
-  @fallback_froms ["implementing", "worktree", "claimed"]
+  # Every stage a report can be sent FROM, read from the contract's own transition table. A stage
+  # that is no entry's `from` is terminal: nothing a runner can say moves the story out of it, so
+  # it is what `permanent_error_conditions` turns stale_stage's permanence on.
+  @stage_transitions Map.fetch!(Contract.connection(), "stage_transitions")
+  @reportable_froms @stage_transitions |> Enum.map(&Map.fetch!(&1, "from")) |> Enum.uniq()
 
-  defp stale_stage(socket, id, stream, payload, refusal) do
-    if terminal?(payload),
-      do: fall_back(socket, id, stream, payload),
-      else: stage_refused(socket, id, stream, payload, "stale_stage #{inspect(refusal)}")
+  # Two lists that must agree, with nothing checking that they do — which is the shape this repo
+  # keeps finding defects in. `RunnerStageReport.from` is what a report may SAY; the transition
+  # table is what this runner may report FROM. They are equal today, and the equality is why the
+  # branch that handled "the named stage builds no report" was unreachable: a stage the table
+  # names is always a stage the enum accepts. Asserted at compile time so a contract that moves
+  # one and not the other fails the build, rather than making that branch quietly live again.
+  @report_froms Contract.schema_def("RunnerStageReport")
+                |> Map.fetch!("properties")
+                |> Map.fetch!("from")
+                |> Map.fetch!("enum")
+
+  if Enum.sort(@reportable_froms) != Enum.sort(@report_froms) do
+    raise "the contract's stage_transitions and RunnerStageReport.from no longer agree: " <>
+            "#{inspect(Enum.sort(@reportable_froms))} vs #{inspect(Enum.sort(@report_froms))}"
   end
 
-  defp fall_back(socket, id, %{queue: [_ | rest]} = stream, payload) do
-    tried = stream.terminal_tried ++ [payload["from"]]
-    chain = Enum.uniq([hd(tried) | @fallback_froms])
+  # A `stale_stage` refusal CARRIES THE ROW since 1.11.0, and `stage` is the field this reads.
+  # Fetched at COMPILE time, and through `error_fields/2`, which fetches the event and the code
+  # too: the table is complete, so a lookup that finds nothing means the field is no longer
+  # published — and got rather than fetched, `refusal["stage"]` would simply be nil on every
+  # refusal from then on, which is the fixed walk this replaced, back with nothing to see it.
+  @stale_stage_fields Contract.error_fields("stage", "stale_stage")
 
-    with from when is_binary(from) <- Enum.find(chain, &(&1 not in tried)),
-         {:ok, retry} <-
-           DispatchRun.stage_report(stream.dispatch, from, "escalated",
-             edge: payload["edge"],
-             reason: payload["reason"]
-           ) do
-      Logger.warning(
-        "loopctl refused #{payload["from"]} -> escalated for dispatch #{id} as stale_stage; " <>
-          "trying #{from} -> escalated",
-        stage_ids(stream)
-      )
+  unless "stage" in @stale_stage_fields do
+    raise "the vendored contract no longer publishes `stage` on a stale_stage refusal of a " <>
+            "stage report (it publishes #{inspect(@stale_stage_fields)}); the terminal report " <>
+            "has nothing to retry from and would guess again"
+  end
 
-      socket
-      |> put_stream(id, %{stream | queue: [retry | rest], terminal_tried: tried})
-      |> send_next_stage(id)
+  # And its permanence is CONDITIONAL, on that same table. Pinned so a vendoring that drops the
+  # condition — making stale_stage flatly transient, or flatly permanent in `permanent_errors` —
+  # fails the build rather than leaving this code implementing a rule the contract stopped stating.
+  @stale_stage_condition Map.fetch!(
+                           Map.fetch!(Contract.connection(), "permanent_error_conditions"),
+                           "stale_stage"
+                         )
+
+  defp stale_stage(socket, id, stream, payload, refusal) do
+    if terminal?(payload) do
+      retry_terminal(socket, id, stream, payload, refusal)
     else
-      _ ->
+      stage_refused(
+        socket,
+        id,
+        resync_stage(stream, refusal, id),
+        payload,
+        "stale_stage #{inspect(refusal)}"
+      )
+    end
+  end
+
+  # The row is worth keeping even when the report it refused was an INTERMEDIATE one. The
+  # intermediates stop either way — they cannot follow a stage loopctl disagrees with — but
+  # `stream.stage` is what `queue_end/3` builds the terminal report's `from` from, and left at the
+  # value loopctl has just called wrong it guarantees that report one refused round trip before
+  # `retry_terminal/5` can act on the same row. That round trip also spends an entry of
+  # `terminal_tried`, out of a budget bounded by the transition table, so the report that frees
+  # loopctl's slot gets fewer attempts for nothing.
+  defp resync_stage(stream, refusal, id) do
+    believed = stream.stage
+
+    case refusal["stage"] do
+      stage when stage in @reportable_froms and stage != believed ->
+        Logger.info(
+          "dispatch #{id}'s row is at #{stage}, not #{believed}; its terminal report will be " <>
+            "sent from there",
+          stage_ids(stream)
+        )
+
+        %{stream | stage: stage}
+
+      # No row, the stage this stream already believes, or one no report may be sent from: nothing
+      # to learn, and a stage outside the enum would only fail the contract check locally.
+      _stage ->
+        stream
+    end
+  end
+
+  # The story is not where the report said, and since 1.11.0 the refusal says where it IS: the
+  # terminal report is sent again FROM the stage it names, which is the transition that applies
+  # from there. Only the terminal report is retried — it is the one that frees loopctl's slot.
+  #
+  # PERMANENT when that stage is no transition's `from`. The story has then reached a stage no
+  # runner can report out of, which a session reaches by escalating through the HTTP surface under
+  # the same claim while its run is still going, and there is nothing left to say: the run ends.
+  # That is the published condition, checked as published — whether the specific edge exists from
+  # there is loopctl's to refuse, and inventing a second condition here is how the two sides drift.
+  #
+  # This used to walk a FIXED list of the stages the story could still be at, because the refusal
+  # named none. On 2026-09-14 all three were refused in turn and not one of them could say where
+  # the row was. A stage already tried is never tried again, which bounds this at the length of the
+  # transition table however the row moves underneath.
+  defp retry_terminal(socket, id, %{queue: [_ | rest]} = stream, payload, refusal) do
+    tried = stream.terminal_tried ++ [payload["from"]]
+    stage = refusal["stage"]
+
+    cond do
+      # A refusal with no row at all. loopctl builds this reply in ONE place, from a row it already
+      # holds, so it should not happen — but `error_fields` is an override table maintained BESIDE
+      # that builder rather than derived from it (read in loopctl's source, 2026-09-15), so the
+      # promise can drift from the reply without either side noticing. This is what makes that
+      # tolerable: the refusal is given up with a line naming it, rather than sending the runner
+      # back to guessing at stages, which is what the walk here used to do on exactly this input.
+      not is_binary(stage) ->
         stage_refused(
           socket,
           id,
           stream,
           payload,
-          "stale_stage from every stage it could be at (#{Enum.join(tried, ", ")})"
+          "stale_stage naming no stage: #{inspect(refusal)}"
+        )
+
+      stage not in @reportable_froms ->
+        Logger.error(
+          "dispatch #{id}'s story is at #{stage}, which no transition leaves; its terminal " <>
+            "report is given up and the run ends. #{@stale_stage_condition}",
+          stage_ids(stream)
+        )
+
+        stage_refused(
+          socket,
+          id,
+          stream,
+          payload,
+          "the story is at #{stage}, which no transition leaves"
+        )
+
+      stage in tried ->
+        stage_refused(
+          socket,
+          id,
+          stream,
+          payload,
+          "stale_stage naming #{stage}, already tried (#{Enum.join(tried, ", ")})"
+        )
+
+      true ->
+        retry_terminal_from(socket, id, stream, payload, rest, stage, tried)
+    end
+  end
+
+  defp retry_terminal_from(socket, id, stream, payload, rest, stage, tried) do
+    case DispatchRun.stage_report(stream.dispatch, stage, payload["to"],
+           edge: payload["edge"],
+           reason: payload["reason"]
+         ) do
+      {:ok, retry} ->
+        Logger.warning(
+          "loopctl refused #{payload["from"]} -> #{payload["to"]} for dispatch #{id} as " <>
+            "stale_stage; its row is at #{stage}, so trying #{stage} -> #{payload["to"]}",
+          stage_ids(stream)
+        )
+
+        socket
+        |> put_stream(id, %{stream | queue: [retry | rest], terminal_tried: tried})
+        |> send_next_stage(id)
+
+      {:error, errors} ->
+        stage_refused(
+          socket,
+          id,
+          stream,
+          payload,
+          "stale_stage naming #{stage}, which this runner cannot report from: #{inspect(errors)}"
         )
     end
   end
@@ -2628,9 +2775,9 @@ defmodule LoopctlRunner.Control do
       :internal_error ->
         verdict_internal_error(socket, entry, reply, ids)
 
-      # The one refusal whose permanence has a condition, and the condition is about evidence only
-      # this runner holds: the row is not `accepted`, which covers an accept of ours still in
-      # flight as well as one loopctl refused or superseded for good.
+      # `dispatch_not_accepted`'s condition, and ONLY it — see `@verdict_conditional`. The evidence
+      # is the one thing only this runner holds: the row is not `accepted`, which covers an accept
+      # of ours still in flight as well as one loopctl refused or superseded for good.
       :conditional ->
         if accept_outstanding?(socket, payload["dispatch_id"], payload["claim_epoch"]) do
           Logger.info(
