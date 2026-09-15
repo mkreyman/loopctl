@@ -111,7 +111,7 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorkerTest do
   end
 
   describe "partial index dispatches_expires_at_active_index (AC-32.1.2)" do
-    test "the sweep's predicate plans as an Index Scan on the partial index, never a Seq Scan" do
+    test "the sweep's predicate plans as an index scan on the partial index, never a Seq Scan" do
       # Mirror the worker's EXACT sweep predicate (RevokeExpiredDispatchesWorker.perform/1):
       #   from(d in Dispatch, where: is_nil(d.revoked_at) and d.expires_at < ^now, ...)
       # so this EXPLAIN exercises the identical query shape that runs every 60s.
@@ -152,7 +152,17 @@ defmodule Loopctl.Workers.RevokeExpiredDispatchesWorkerTest do
           Enum.map_join(rows, "\n", fn [line] -> line end)
         end)
 
-      assert plan =~ "Index Scan using dispatches_expires_at_active_index"
+      # EITHER index access path proves what AC-32.1.2 asserts, and what the comment above
+      # already says this test means: the index MATCHES the predicate and the planner can USE
+      # it. Which of the two Postgres picks is a cost decision that moves with the table's
+      # statistics, so pinning the one spelling made this go red on a plan that satisfies it —
+      # observed as `Bitmap Index Scan on dispatches_expires_at_active_index` once other tests
+      # had left enough rows behind to change the estimate. The assertion still names the
+      # index, so it cannot pass on a plan that reaches the rows any other way, and a Seq Scan
+      # is still what must never appear.
+      assert plan =~
+               ~r/(Index Scan using|Bitmap Index Scan on) dispatches_expires_at_active_index/
+
       assert plan =~ "Index Cond: (expires_at <"
       refute plan =~ "Seq Scan"
     end
