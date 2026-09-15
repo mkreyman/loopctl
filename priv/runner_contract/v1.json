@@ -869,7 +869,7 @@
           ]
         },
         "escalation_reasons": {
-          "description": "Why this needs a human. Meaningful when `outcome` is `escalate`.",
+          "description": "Why this needs a human. Meaningful when `outcome` is `escalate`. FREE-FORM by design — a sentence saying what a lens actually saw is what makes an escalation actionable — but the entries in `x-connection.triage_gating_reasons` are GATING CODES matched as whole strings by the control-side gate that decides whether a human is asked. Emit those verbatim, as their own entries, and put prose in other entries: a reworded gating code does not gate, and nothing anywhere reports that it failed to. A code NOT on that list is recorded and never gates.",
           "items": {
             "maxLength": 150,
             "type": "string"
@@ -1062,7 +1062,7 @@
               ]
             },
             "escalation_reasons": {
-              "description": "Why this needs a human. Meaningful when `outcome` is `escalate`.",
+              "description": "Why this needs a human. Meaningful when `outcome` is `escalate`. FREE-FORM by design — a sentence saying what a lens actually saw is what makes an escalation actionable — but the entries in `x-connection.triage_gating_reasons` are GATING CODES matched as whole strings by the control-side gate that decides whether a human is asked. Emit those verbatim, as their own entries, and put prose in other entries: a reworded gating code does not gate, and nothing anywhere reports that it failed to. A code NOT on that list is recorded and never gates.",
               "items": {
                 "maxLength": 150,
                 "type": "string"
@@ -1511,7 +1511,11 @@
         "to": "escalated"
       }
     ],
-    "topic": "runner:{runner_id}"
+    "topic": "runner:{runner_id}",
+    "triage_gating_reasons": [
+      "inverts_or_removes_deliberate_behaviour",
+      "workflow_change_not_defect_fix"
+    ]
   },
-  "x-contract-version": "1.9.2"
+  "x-contract-version": "1.9.3"
 }

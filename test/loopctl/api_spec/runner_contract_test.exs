@@ -14,6 +14,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
   alias Loopctl.ApiSpec.RunnerContract.RunnerTraceBatch
   alias Loopctl.ApiSpec.RunnerContract.RunnerTraceEvent
   alias Loopctl.Delivery.StageMachine
+  alias Loopctl.DeliveryGates.GateA
   alias OpenApiSpex.Schema
 
   @join %{
@@ -66,8 +67,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.9.2"
-      assert schema["x-contract-version"] == "1.9.2"
+      assert RunnerContract.version() == "1.9.3"
+      assert schema["x-contract-version"] == "1.9.3"
 
       assert %{
                "dispatch_reply" => "RunnerDispatchReply",
@@ -92,6 +93,13 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       # 1.9.2: the one permanent code whose permanence has a condition, published so a
       # vendoring runner reads the condition instead of inferring it — asserted against the
       # declaration, never a copy, and non-vacuously.
+      # 1.9.3: the gating vocabulary, published because the control side matches it as WHOLE
+      # STRINGS. Asserted against `GateA`'s own declaration, never a copy — a list restated
+      # here would let the published contract and the gate that reads it drift, which is the
+      # entire failure this publishes to prevent.
+      assert connection["triage_gating_reasons"] == GateA.gating_reason_codes()
+      assert connection["triage_gating_reasons"] != []
+
       assert connection["permanent_error_conditions"] ==
                RunnerContract.permanent_error_conditions()
 

@@ -41,6 +41,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.9.0) a triage session's result comes back on its own `triage_verdict` message, carrying EXACTLY ONE of `verdict` or `incomplete`. Idempotent per dispatch: a byte-identical resend is answered `ok`. `x-connection.permanent_errors` says which refusals are worth resending | | | | |
   | (1.9.1) `RunnerTriageVerdictMessage` and `RunnerTriageVerdictAck` are actually DEFINED. 1.9.0 named both in `x-connection` and published neither, so the envelope was unresolvable and a runner had to re-type it. RE-VENDOR: a copy taken at 1.9.0 is missing both, and the version string is the only signal that it is | | | | |
   | (1.9.2) a NULLABLE ENUM publishes `null` as a member. `incomplete` was typed `[string, null]` with an enum of five reasons, and under 2020-12 an enum constrains null too — so a runner validating a message against the published file could not SEND a real verdict beside `"incomplete": null`, while the mirror message validated. loopctl accepted both all along; the schema was what disagreed. Also publishes `x-connection.permanent_error_conditions`. RE-VENDOR to send both keys | | | | |
+  | (1.9.3) `x-connection.triage_gating_reasons` publishes the `escalation_reasons` entries that GATE — matched as whole strings on the control side, while the field itself stays free-form prose. A reworded code silently does not gate, which had already happened on the interactive path | | | | |
 
   ## The story object (since 1.5.0)
 
@@ -200,6 +201,15 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     Branch on this rather than on a list copied into a runner's own source; everything not
     in it is worth resending unchanged.
 
+  - `triage_gating_reasons` (`Loopctl.DeliveryGates.GateA.gating_reason_codes/0`) — the
+    `escalation_reasons` entries a triage verdict may carry that GATE, matched as whole
+    strings on the control side. Published for the reason the 1.9.0 envelope had to be: a
+    rule that decides an outcome, living in one side's prose, cannot be checked from the
+    other — and it had already failed exactly that way on the interactive path, where the
+    lens prompts asked for "one plain sentence per reason" and neither code could ever fire.
+    Validate the gating entries you emit against this list; everything else in the field is
+    prose and stays free.
+
   - `permanent_error_conditions` (`permanent_error_conditions/0`) — the ONE code in the list
     above whose permanence has a condition, published so a runner reads the condition rather
     than inferring it. `dispatch_not_accepted` means the ledger row for that dispatch is not
@@ -276,9 +286,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   require OpenApiSpex
 
   alias Loopctl.Delivery.StageMachine
+  alias Loopctl.DeliveryGates.GateA
   alias OpenApiSpex.Schema
 
-  @version "1.9.2"
+  @version "1.9.3"
   @major 1
 
   defmodule ByteRule do
@@ -1212,7 +1223,15 @@ defmodule Loopctl.ApiSpec.RunnerContract do
             type: :array,
             maxItems: @max_reasons,
             items: %Schema{type: :string, maxLength: @max_reason_length},
-            description: "Why this needs a human. Meaningful when `outcome` is `escalate`."
+            description:
+              "Why this needs a human. Meaningful when `outcome` is `escalate`. FREE-FORM by " <>
+                "design — a sentence saying what a lens actually saw is what makes an " <>
+                "escalation actionable — but the entries in " <>
+                "`x-connection.triage_gating_reasons` are GATING CODES matched as whole " <>
+                "strings by the control-side gate that decides whether a human is asked. " <>
+                "Emit those verbatim, as their own entries, and put prose in other entries: " <>
+                "a reworded gating code does not gate, and nothing anywhere reports that it " <>
+                "failed to. A code NOT on that list is recorded and never gates."
           },
           missing_information: %Schema{
             type: :array,
@@ -2741,6 +2760,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
         # runner reads it in the same breath as the code it just got.
         "permanent_errors" => @permanent_errors,
         "permanent_error_conditions" => @permanent_error_conditions,
+        "triage_gating_reasons" => GateA.gating_reason_codes(),
         "socket_path" => "/runner/socket/websocket",
         "credential_header" => "x-loopctl-runner-token",
         "topic" => "runner:{runner_id}",
