@@ -602,6 +602,8 @@ defmodule LoopctlWeb.RunnerChannel do
   defp note_kind_refusal(socket, %{decision: "refused", reason: "kind_not_supported"}, record) do
     %{runner: runner, tenant_id: tenant_id, meta: meta} = socket.assigns
 
+    emit_kind_refused(tenant_id, runner, record, Runners.declared_kinds(meta))
+
     case {Runners.declared_kinds(meta), record.kind} do
       {{:declared, kinds}, kind} when is_binary(kind) ->
         if kind in kinds and pushed_here?(socket, record) do
@@ -621,6 +623,34 @@ defmodule LoopctlWeb.RunnerChannel do
   end
 
   defp note_kind_refusal(socket, _reply, _record), do: socket
+
+  # EMITTED ON EVERY `kind_not_supported`, NOT ONLY THE SUPPRESSED ONES — and that ordering
+  # is the whole point. This counter first lived inside `suppress_kind/5`, which runs only
+  # for a runner that DECLARED the kind, so it read zero during the one incident that is
+  # live on the fleet today: no runner declares yet, so every machine takes the UNDECLARING
+  # path, where a single refusal is permanent for the life of its `runners` row and the
+  # machine sits connected and healthy-looking with no work for ever. An instrument blind to
+  # the worst case it could report is the same defect as the event that had no metric at
+  # all, one layer in.
+  #
+  # `outcome` separates the two, and both tags are bounded: `kind` comes from the LEDGER row
+  # of a dispatch loopctl itself sent, so it is from `dispatchable_kinds` and never a
+  # runner-supplied string, and `outcome` is two literals. Ids stay in the logs.
+  defp emit_kind_refused(tenant_id, runner, %{kind: kind}, declared) when is_binary(kind) do
+    outcome =
+      case declared do
+        {:declared, kinds} -> if kind in kinds, do: "suppressed", else: "not_declared"
+        {:implied, _} -> "permanent"
+      end
+
+    :telemetry.execute(
+      [:loopctl, :runners, :declared_kind_refused],
+      %{count: 1},
+      %{kind: kind, outcome: outcome, tenant_id: tenant_id, runner_id: runner.id}
+    )
+  end
+
+  defp emit_kind_refused(_tenant_id, _runner, _record, _declared), do: :ok
 
   # THE SUPPRESSION BELONGS TO THE CONNECTION THAT CARRIED THE DISPATCH, not to whichever one
   # the reply happens to arrive on. `DispatchLedger.record_reply/3` fences on
@@ -651,16 +681,6 @@ defmodule LoopctlWeb.RunnerChannel do
   # its own key and `Runners.kind_supported/4` subtracts it at the decision.
   defp suppress_kind(socket, meta, runner, tenant_id, kind) do
     meta = Map.update(meta, :suppressed_kinds, [kind], &Enum.uniq([kind | &1]))
-
-    # Countable, not just logged. The ledger row the refusal wrote is the durable record an
-    # operator reads (`unsupported_kinds`), but it cannot distinguish a machine that refused
-    # once from one cycling its socket and re-contradicting itself every connection — which
-    # is the residue the per-connection lifetime leaves. This event is what an alert counts.
-    :telemetry.execute(
-      [:loopctl, :runners, :declared_kind_refused],
-      %{count: 1},
-      %{tenant_id: tenant_id, runner_id: runner.id, kind: kind}
-    )
 
     {:ok, ref} =
       Presence.update(

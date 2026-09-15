@@ -149,10 +149,14 @@ defmodule LoopctlWeb.Telemetry do
       # other counter here.
       counter("loopctl.runners.declared_kind_refused.count",
         event_name: [:loopctl, :runners, :declared_kind_refused],
-        tags: [:kind],
+        tags: [:kind, :outcome],
         description:
-          "Dispatches refused `kind_not_supported` by a runner that declared that kind on " <>
-            "join. Non-zero means a runner is contradicting its own declaration."
+          "Dispatches a runner refused `kind_not_supported`. `outcome` says what loopctl " <>
+            "did with it: `permanent` is an UNDECLARING runner, now barred from that kind " <>
+            "for the life of its runners row — alert on this one, the machine stays " <>
+            "connected and looks healthy; `suppressed` is a runner contradicting its own " <>
+            "declaration, bounded to that connection; `not_declared` refused a kind it " <>
+            "never claimed."
       ),
 
       # Delivery-loop retention (#803 §11). `table` is one of two literals, so the tag is

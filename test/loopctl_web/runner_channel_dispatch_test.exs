@@ -820,6 +820,76 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       assert_push "dispatch", _, @reply_timeout
     end
 
+    # The blind spot a peer session found in round 3's own fix: the counter lived inside
+    # suppress_kind, which runs ONLY for a declaring runner, so it read zero during the
+    # incident that is live on the fleet today. No runner declares yet, so every machine
+    # takes the UNDECLARING path where one refusal is permanent for the life of its runners
+    # row — the worst outcome, and the one the instrument could not see.
+    test "an UNDECLARING runner's refusal is counted as permanent", %{
+      runner: runner,
+      channel: channel
+    } do
+      ref =
+        :telemetry_test.attach_event_handlers(self(), [
+          [:loopctl, :runners, :declared_kind_refused]
+        ])
+
+      on_exit(fn -> :telemetry.detach(ref) end)
+
+      payload = dispatch_payload(runner.tenant_id)
+      assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
+      assert_push "dispatch", _, @reply_timeout
+
+      reply_ref =
+        push(channel, "dispatch_reply", %{
+          "dispatch_id" => payload["dispatch_id"],
+          "claim_epoch" => payload["claim_epoch"],
+          "decision" => "refused",
+          "reason" => "kind_not_supported"
+        })
+
+      assert_reply reply_ref, :ok, _, @reply_timeout
+
+      assert_receive {[:loopctl, :runners, :declared_kind_refused], ^ref, %{count: 1}, meta},
+                     @reply_timeout
+
+      # `permanent` is the tag an operator alerts on — this machine now gets no work at all
+      # and stays connected looking healthy.
+      assert meta.outcome == "permanent"
+      assert meta.kind == "implement"
+    end
+
+    test "a DECLARING runner's self-contradiction is counted as suppressed, not permanent",
+         %{runner: runner, raw: raw, channel: channel} do
+      channel = rejoin_declaring(channel, raw, runner, ["implement"])
+
+      ref =
+        :telemetry_test.attach_event_handlers(self(), [
+          [:loopctl, :runners, :declared_kind_refused]
+        ])
+
+      on_exit(fn -> :telemetry.detach(ref) end)
+
+      payload = dispatch_payload(runner.tenant_id)
+      assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
+      assert_push "dispatch", _, @reply_timeout
+
+      reply_ref =
+        push(channel, "dispatch_reply", %{
+          "dispatch_id" => payload["dispatch_id"],
+          "claim_epoch" => payload["claim_epoch"],
+          "decision" => "refused",
+          "reason" => "kind_not_supported"
+        })
+
+      assert_reply reply_ref, :ok, _, @reply_timeout
+
+      assert_receive {[:loopctl, :runners, :declared_kind_refused], ^ref, %{count: 1}, meta},
+                     @reply_timeout
+
+      assert meta.outcome == "suppressed"
+    end
+
     test "an ordinary refusal does not suppress a declared kind",
          %{runner: runner, raw: raw, channel: channel} do
       channel = rejoin_declaring(channel, raw, runner, ["implement"])
