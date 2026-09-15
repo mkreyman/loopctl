@@ -133,6 +133,18 @@ defmodule LoopctlWeb.MergePreconditionController do
               "The design's ceiling, applied on top of the configured limits: a " <>
                 "configuration may tighten it and may not loosen it."
           },
+          self_deploy_excluded_repos: %OpenApiSpex.Schema{
+            type: :array,
+            items: %OpenApiSpex.Schema{type: :string},
+            description:
+              "Repositories this loop refuses to merge, as `owner/name`, lowercased " <>
+                "(issue #803 correction 11). loopctl deploys on every push to master and " <>
+                "IS the control plane, so merging it restarts the node holding the story's " <>
+                "own state and drops every runner socket, the asking session's included; " <>
+                "claude-config is symlinked into every machine's ~/.claude. A refusal names " <>
+                "`self_deploy_excluded` and a human merges it instead. Decided before " <>
+                "everything else, including a forge outage, because no retry clears it."
+          },
           custody: %OpenApiSpex.Schema{type: :string, nullable: true},
           gate_a_inputs: %OpenApiSpex.Schema{
             type: :string,
@@ -361,6 +373,10 @@ defmodule LoopctlWeb.MergePreconditionController do
       merge_sha: verdict.merge_sha,
       diffstat: verdict.diffstat,
       hard_bound: MergePrecondition.hard_bound(),
+      # SHOWN rather than left to be discovered by refusal, exactly as `hard_bound` is: a
+      # session that reads a `self_deploy_excluded` refusal and cannot see the list has no
+      # way to tell a policy from a bug.
+      self_deploy_excluded_repos: MergePrecondition.self_deploy_excluded_repos(),
       custody: verdict.custody,
       gate_a_inputs: verdict.gate_a_inputs,
       retry_after: verdict.retry_after,

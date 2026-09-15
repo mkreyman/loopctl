@@ -153,6 +153,110 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
     end
   end
 
+  describe "the loop may not merge its own control plane (#803 correction 11)" do
+    # loopctl deploys on every push to master AND is the control plane: merging it restarts
+    # the node holding the story's own DurableServer and drops every runner socket, including
+    # the socket of the session that asked. claude-config is symlinked into ~/.claude on every
+    # machine, so a change there rewrites what every live session is running under.
+    test "an excluded repository refuses on facts that would otherwise ALLOW" do
+      clean = [files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 10}]
+
+      # The positive control, and it is the whole test: without it this would pass against an
+      # implementation that refused every repository, which is the same guard-that-cannot-
+      # distinguish defect one layer up.
+      assert judge(clean).decision == :allow
+
+      for repo <- ["mkreyman/loopctl", "mkreyman/claude-config"] do
+        verdict = judge(clean ++ [repo: {:ok, repo}])
+
+        assert verdict.decision == :refuse, "#{repo} was not refused"
+        assert {:self_deploy_excluded, repo} in verdict.reasons
+      end
+    end
+
+    test "the match is case-insensitive, as GitHub's own names are" do
+      verdict =
+        judge(
+          files: ["lib/widgets/thing.ex"],
+          diffstat: %{files: 1, changed_lines: 10},
+          repo: {:ok, "MKreyman/LoopCtl"}
+        )
+
+      assert verdict.decision == :refuse
+      # The reason carries the repo AS GIVEN, not the lowercased form it matched on: an
+      # operator reading the escalation is looking for the string they configured.
+      assert {:self_deploy_excluded, "MKreyman/LoopCtl"} in verdict.reasons
+    end
+
+    test "it is decided BEFORE a transient forge fault, so no retry is ever suggested" do
+      # `:unevaluated` carries a `retry_after` and counts toward
+      # `max_consecutive_unevaluated`. On a repository that can never be merged that is two
+      # wrongs: it tells the session to come back for a decision that cannot change, and when
+      # the count runs out it escalates naming the FORGE rather than the exclusion — so the
+      # human reads "GitHub was down" about a permanent policy.
+      verdict =
+        judge(
+          files: ["lib/widgets/thing.ex"],
+          diffstat: %{files: 1, changed_lines: 10},
+          repo: {:ok, "mkreyman/loopctl"},
+          head_files: {:error, {:github_rate_limited, 429, 60}}
+        )
+
+      assert verdict.decision == :refuse
+      assert verdict.retry_after == nil
+      assert {:self_deploy_excluded, "mkreyman/loopctl"} in verdict.reasons
+
+      # And the transient fault is still REPORTED — the refusal is not a reason to hide it.
+      assert {:head_files_unavailable, {:github_rate_limited, 429, 60}} in verdict.reasons
+    end
+
+    test "an ALREADY MERGED excluded repository refuses rather than reporting a clean run" do
+      # The event correction 11 exists to prevent, having happened. Reporting `already_merged`
+      # with no reasons would make the one occurrence of it the quietest verdict this module
+      # produces.
+      merged = [
+        merged?: true,
+        state: "closed",
+        merge_sha: String.duplicate("c", 40),
+        recorded_allow_sha: @head,
+        diffstat: %{files: 1, changed_lines: 1}
+      ]
+
+      # The positive control: these same facts on an ordinary repository ARE `already_merged`.
+      assert judge(merged).decision == :already_merged
+
+      verdict = judge(merged ++ [repo: {:ok, "mkreyman/loopctl"}])
+
+      assert verdict.decision == :refuse
+      assert {:self_deploy_excluded, "mkreyman/loopctl"} in verdict.reasons
+    end
+
+    test "the list is configurable, because another deployment's control plane is elsewhere" do
+      # A hardcoded `mkreyman/loopctl` is wrong by default for everyone else running loopctl,
+      # which is worse than a guard that can be set. `acme/widgets` is the fixture repo every
+      # other test in this file merges happily.
+      assert judge(files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 10}).decision ==
+               :allow
+
+      assert "acme/widgets" not in MergePrecondition.self_deploy_excluded_repos()
+      assert "mkreyman/loopctl" in MergePrecondition.self_deploy_excluded_repos()
+    end
+
+    test "an UNREADABLE repository is repository_unresolved, not silently allowed through" do
+      # Answering "not excluded" for a repository nobody could read is the shape this guard
+      # exists to avoid. It is already refused upstream, and this pins that it still is.
+      verdict =
+        judge(
+          files: ["lib/widgets/thing.ex"],
+          diffstat: %{files: 1, changed_lines: 10},
+          repo: {:error, :no_intake_source}
+        )
+
+      assert verdict.decision == :refuse
+      assert {:repository_unresolved, :no_intake_source} in verdict.reasons
+    end
+  end
+
   describe "the hard bound" do
     test "12 files and 1000 lines pass" do
       verdict = judge(files: files(12), diffstat: %{files: 12, changed_lines: 1000})

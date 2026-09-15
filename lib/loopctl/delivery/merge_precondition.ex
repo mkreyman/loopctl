@@ -43,6 +43,34 @@ defmodule Loopctl.Delivery.MergePrecondition do
      row recorded, which is the head CI ran on and the story was verified at. A push after
      either is ordinary work rather than an escalation, so it goes back to `implementing`
      on `:base_moved`; it does not merge, because no CI run and no verifier saw it.
+  6. **The repository is not one the loop deploys itself from** — issue #803's correction
+     11, and the only precondition decided before anything else, including a forge outage.
+     See below.
+
+  ## The loop may not merge its own control plane
+
+  loopctl deploys on every push to master AND IS the control plane: a story that changes
+  loopctl restarts the node holding its own `DurableServer`, and a rolling deploy drops
+  every runner socket — including the socket of the session that asked for the merge. So a
+  merge of this repository is not a merge that went wrong afterwards; it is one that cannot
+  report its own outcome. `claude-config` is excluded on the same ground one layer up: it is
+  symlinked into `~/.claude` on every machine in the fleet, so a change there rewrites the
+  instructions every session is running under, this one included.
+
+  This is `{:self_deploy_excluded, repo}`, and it is decided FIRST — ahead of the transient
+  forge branch, which otherwise answers `:unevaluated` and invites a retry against the one
+  condition retrying can never clear.
+
+  The list is CONFIGURABLE (`:self_deploy_excluded_repos`) and defaults to the two repos
+  above, because "the repository this control plane deploys from" is the real invariant and
+  a hardcoded `mkreyman/loopctl` is simply wrong for anyone else running loopctl — a guard
+  that names one owner's slug is off by default for every other deployment, which is worse
+  than one that can be set. Matching is case-insensitive, as GitHub's own names are.
+
+  It is a REFUSAL rather than a silent skip: the story escalates to a human, who merges it
+  themselves. Nothing here can merge anything — this module returns a verdict and the
+  session acts on it — so refusing is the whole of the enforcement available, and that is
+  precisely why it must never be reachable past a branch that reports `:allow`.
 
   ## Gate A's inputs are caller-asserted, and every verdict says so
 
@@ -204,6 +232,12 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # escalating is a story nobody ever hears about again.
   @max_consecutive_unevaluated 5
 
+  # Issue #803, correction 11. loopctl IS the control plane and deploys on every push to
+  # master; claude-config is symlinked into ~/.claude on every machine in the fleet. See the
+  # moduledoc. Overridable with `config :loopctl, :self_deploy_excluded_repos, [...]`,
+  # because another deployment's control plane is not at this slug.
+  @default_self_deploy_excluded ["mkreyman/loopctl", "mkreyman/claude-config"]
+
   @doc "The hard bound the design fixes, whatever the configuration says."
   @spec hard_bound() :: %{max_files: pos_integer(), max_changed_lines: pos_integer()}
   def hard_bound, do: %{max_files: @hard_max_files, max_changed_lines: @hard_max_changed_lines}
@@ -239,7 +273,24 @@ defmodule Loopctl.Delivery.MergePrecondition do
     # evaluated, so nothing transitions. The reasons still carry whatever else is known —
     # a caller fixing custody should not have to wait for the forge to come back to hear
     # about it — but the DECISION is that there is no verdict yet.
-    case {unevaluated_reasons(facts), input_reasons(facts)} do
+    case {self_deploy_reasons(facts), unevaluated_reasons(facts), input_reasons(facts)} do
+      # BEFORE the transient branch, deliberately. A forge outage on an excluded repository
+      # would otherwise answer `:unevaluated` with a `retry_after`, which tells the caller to
+      # come back for a decision that will never change — and `max_consecutive_unevaluated`
+      # then escalates it for the wrong reason, naming the forge rather than the exclusion.
+      {[_ | _] = excluded, transient, other} ->
+        # The transient fault is REPORTED and does not decide. Dropping it would contradict
+        # the rule the branch below states — reasons carry whatever else is known — and would
+        # hide a forge outage from the operator who now has to merge this by hand.
+        refuse(base, excluded ++ transient ++ other ++ carried)
+
+      {[], transient, other} ->
+        undecided(base, transient, other, carried, facts)
+    end
+  end
+
+  defp undecided(base, transient, other, carried, facts) do
+    case {transient, other} do
       {[_ | _] = transient, other} ->
         %{
           base
@@ -253,6 +304,34 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
       {[], []} ->
         decide(base, facts, value(facts, :pull_request), carried)
+    end
+  end
+
+  @doc """
+  The repositories this loop will not merge, lowercased. See the moduledoc.
+
+  Public so `GET`-ing a verdict can SHOW the list rather than leaving a caller to discover
+  it by being refused, the way `hard_bound/0` already does for the size bound.
+  """
+  @spec self_deploy_excluded_repos() :: [String.t()]
+  def self_deploy_excluded_repos do
+    :loopctl
+    |> Application.get_env(:self_deploy_excluded_repos, @default_self_deploy_excluded)
+    |> Enum.map(&String.downcase/1)
+  end
+
+  # An UNREADABLE repo is not judged here: it is already `:repository_unresolved` from
+  # `input_reasons/1`, and answering "not excluded" for a repository nobody could read would
+  # be the cap-that-cannot-bind shape this guard exists to avoid.
+  defp self_deploy_reasons(facts) do
+    case value(facts, :repo) do
+      repo when is_binary(repo) ->
+        if String.downcase(repo) in self_deploy_excluded_repos(),
+          do: [{:self_deploy_excluded, repo}],
+          else: []
+
+      _unreadable ->
+        []
     end
   end
 
