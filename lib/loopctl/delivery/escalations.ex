@@ -59,6 +59,15 @@ defmodule Loopctl.Delivery.Escalations do
   said AND can see what was hidden in it. Prose is untouched; a bidirectional override, a
   zero-width run or a NUL becomes a visible `<U+XXXX>`.
 
+  **The escape is NOT injective, and the honest statement of what it buys says so.** A session
+  that writes the literal ASCII text `<U+202E>` produces a stored value identical to one
+  produced by a real bidirectional override — `sanitise/1` is idempotent, so it cannot
+  distinguish them and neither can a reader. So: a HIDDEN character always becomes visible,
+  which is the property this is for; a VISIBLE one that looks like an escape becomes
+  indistinguishable from a hidden one, which means a session can fabricate the appearance of
+  an attack it did not make. That is a much smaller problem than text that silently lies about
+  itself, and it is stated rather than left for a reader to discover.
+
   That is a deliberate reversal of the strict-verbatim rule this line used to state, and the
   reason is that the field is PERMANENT in two places nobody can edit: the column and, on a
   chained transition, the tenant's append-only hash chain. Text whose hidden characters are

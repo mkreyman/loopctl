@@ -1641,7 +1641,7 @@ defmodule Loopctl.ApiSpec.Schemas do
               type: :string,
               nullable: true,
               description:
-                "Why the story last escalated, VERBATIM as the session wrote it. Always " <>
+                "Why the story last escalated, as the session wrote it and ESCAPED FOR INVISIBLE CHARACTERS (#804): prose is untouched, and a bidirectional override, a zero-width run or any other hidden codepoint is rewritten to a visible `<U+XXXX>`. So a consumer diffing this against what the session emitted will find them unequal whenever the session wrote something hidden - that is the field working, not a fault. The 4000-codepoint bound is on what the CALLER sends, before escaping. Always " <>
                   "present while the stage is `escalated`."
             },
             escalation_reason_untrusted: %Schema{

@@ -304,9 +304,12 @@ defmodule LoopctlWeb.StoryEscalationController do
   defp actor_label(%{agent_id: nil, id: key_id}), do: "api_key:" <> key_id
   defp actor_label(%{agent_id: agent_id}), do: "agent:" <> agent_id
 
-  # The stage row as the API renders it. `escalation_reason` is the RAW text: this is a JSON
-  # body for an operator or a dashboard, not a prompt, and fencing it here would hide what
-  # the session actually wrote. The flag beside it is what a client acts on — a caller that
+  # The stage row as the API renders it. `escalation_reason` is the STORED text — escaped for
+  # invisible characters on the way in (#804) and never fenced: this is a JSON body for an
+  # operator or a dashboard, not a prompt. Fencing it here would hide what the session
+  # actually wrote; the escape shows what it HID without changing the words.
+  #
+  # The flag beside it is what a client acts on — a caller that
   # puts the reason in front of a model renders it through
   # `Loopctl.Delivery.Stages.escalation_block/1` first. It is a constant because the property
   # is one of the FIELD, not of any particular value: every reason is session-authored.

@@ -2823,8 +2823,16 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   # schema alone the wire bound was LOOSER than the `story_stages_text_bounds` CHECK, so a
   # reason of 4000 graphemes and more codepoints was accepted here, refused by
   # `Loopctl.Delivery.Stages` deeper in, and on the HTTP path reached the database and died
-  # as a 23514 the caller could do nothing with. Counted here, the wire, the context and the
-  # CHECK all agree on one number.
+  # as a 23514 the caller could do nothing with. Counted here, the wire and the context agree
+  # on one number, and it is the number a CALLER can measure: the codepoints of the text it is
+  # about to send.
+  #
+  # The column's own CHECK is deliberately WIDER since #804, and that is not a third
+  # disagreement. `escalation_reason` is escaped for invisible characters before storage, which
+  # EXPANDS it, so the stored string is longer than the one bounded here. The caller cannot
+  # predict that length without implementing loopctl's escape table — which is exactly why the
+  # published bound stays on the raw text and the column is given room instead. Bounding the
+  # escaped form here would publish a number no client could honour.
   defp reason_length_errors(%{reason: reason}) when is_binary(reason) do
     if RunnerStage.codepoints(reason) > RunnerStage.max_reason_length(),
       do: ["reason may be at most #{RunnerStage.max_reason_length()} codepoints"],
