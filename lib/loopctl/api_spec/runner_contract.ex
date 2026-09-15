@@ -865,6 +865,178 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     )
   end
 
+  defmodule RunnerTriageVerdict do
+    @moduledoc false
+    require OpenApiSpex
+
+    alias Loopctl.ApiSpec.RunnerContract.ByteRule
+    alias Loopctl.ApiSpec.RunnerContract.RunnerStory
+
+    # WHAT A TRIAGE SESSION RETURNS (since 1.7.0). On the wire and not a convention in a
+    # runner's prompt, because a convention has no schema: its shape drifts per runner and per
+    # prompt edit, and loopctl cannot REJECT a malformed verdict it never declared. Asked for
+    # by the `loopctl-runner` maintaining session on exactly that ground, 2026-09-15, and the
+    # session that has to emit it would rather fill a form than author a document — which is
+    # also the shape least steerable by the text it just read.
+    #
+    # **THIS OBJECT IS SESSION-AUTHORED AND IS NOT TRUSTED INPUT.** It was composed by a
+    # session whose whole job was to read attacker-controllable text, so every field here is
+    # potentially shaped by that text — including `story`, whose fields become a story row.
+    # loopctl RECORDS it, bounds it, and never executes it, and anything downstream that puts
+    # these strings into another prompt fences them exactly as reporter text is fenced. The
+    # trio is the laundering boundary the design relies on (§4, §10); this object is where
+    # that reliance is concentrated, so it is the thing to be suspicious of.
+    @outcomes ["story", "escalate", "reject"]
+
+    # An ENUM, not a float. A float invites 0.85, and nobody — not the session, not a reader —
+    # can say what would have made it 0.8, so it reads as precision that does not exist. Each
+    # level below states what it MEANS, so the session is choosing between descriptions rather
+    # than inventing a number.
+    @confidences ["low", "medium", "high"]
+
+    @max_reasons 20
+    @max_reason_length 300
+    @max_missing 20
+    @max_missing_length 300
+    @max_evidence 40
+    @max_evidence_length 300
+    @max_contradicts 20
+    @max_contradict_ref_length 200
+    @max_contradict_why_length 500
+    @contradict_kinds ["story", "kb", "code"]
+
+    # The same budget as a dispatch object, for the same frame.
+    @max_bytes 48_000
+
+    @doc "Every outcome a verdict may carry."
+    @spec outcomes() :: [String.t()]
+    def outcomes, do: @outcomes
+
+    @doc "Every confidence level a verdict may carry."
+    @spec confidences() :: [String.t()]
+    def confidences, do: @confidences
+
+    @doc "The largest verdict, under the byte rule."
+    @spec max_bytes() :: pos_integer()
+    def max_bytes, do: @max_bytes
+
+    @doc "The most evidence entries, and the longest one."
+    @spec max_evidence() :: pos_integer()
+    def max_evidence, do: @max_evidence
+
+    OpenApiSpex.schema(
+      %{
+        title: "RunnerTriageVerdict",
+        description:
+          "What a `triage` session returns (since 1.7.0). SESSION-AUTHORED AND UNTRUSTED: " <>
+            "it was composed by a session that had just read reporter text, so loopctl " <>
+            "records and bounds it, never executes it, and fences these strings wherever " <>
+            "they later reach a prompt — `story` included, because those fields were " <>
+            "written by that same session. `story` is REQUIRED when `outcome` is `story` " <>
+            "and forbidden otherwise, the same shape rule a dispatch uses for `story` and " <>
+            "`triage`; a verdict that says `story` and carries none has moved the work " <>
+            "rather than done it. `confidence` is an enum and not a number on purpose: " <>
+            "`low` means the session would not act on this without a human reading the " <>
+            "report, `medium` means the request is clear but something it could not check " <>
+            "remains, `high` means it found the request actionable and contradicted by " <>
+            "nothing it read. The whole object is at most #{@max_bytes} bytes under the " <>
+            "byte rule.",
+        type: :object,
+        required: [:outcome, :confidence],
+        properties: %{
+          outcome: %Schema{type: :string, enum: @outcomes},
+          confidence: %Schema{type: :string, enum: @confidences},
+          story: %Schema{
+            type: :object,
+            description:
+              "The draft story, required when `outcome` is `story`. Bounded exactly as " <>
+                "`RunnerStory` bounds the same fields, so one set of limits governs a " <>
+                "story in both directions. No `id`: the story row already exists and " <>
+                "loopctl owns its identity.",
+            required: [:title, :description, :acceptance_criteria],
+            properties: %{
+              title: %Schema{type: :string, maxLength: RunnerStory.max_title_length()},
+              description: %Schema{
+                type: :string,
+                maxLength: RunnerStory.max_description_length()
+              },
+              acceptance_criteria: %Schema{
+                type: :array,
+                maxItems: RunnerStory.max_criteria(),
+                items: %Schema{type: :string, maxLength: RunnerStory.max_criterion_length()}
+              },
+              test_cases: %Schema{
+                type: :array,
+                maxItems: RunnerStory.max_test_cases(),
+                items: %Schema{type: :string, maxLength: RunnerStory.max_test_case_length()}
+              },
+              touches: %Schema{
+                type: :array,
+                maxItems: RunnerStory.max_touches(),
+                items: %Schema{type: :string, maxLength: RunnerStory.max_touch_length()}
+              },
+              domain_reference: %Schema{
+                type: :string,
+                maxLength: RunnerStory.max_domain_reference_length()
+              }
+            }
+          },
+          escalation_reasons: %Schema{
+            type: :array,
+            maxItems: @max_reasons,
+            items: %Schema{type: :string, maxLength: @max_reason_length},
+            description: "Why this needs a human. Meaningful when `outcome` is `escalate`."
+          },
+          missing_information: %Schema{
+            type: :array,
+            maxItems: @max_missing,
+            items: %Schema{type: :string, maxLength: @max_missing_length},
+            description:
+              "What the session would need in order to reach a verdict — the field that " <>
+                "makes an escalation actionable rather than putting a human back at the " <>
+                "start of the same reading."
+          },
+          evidence: %Schema{
+            type: :array,
+            maxItems: @max_evidence,
+            items: %Schema{type: :string, maxLength: @max_evidence_length},
+            description:
+              "What the session actually read: file paths with optional line numbers, " <>
+                "knowledge-base article ids. It makes a verdict checkable by someone who " <>
+                "does not re-run it, which is the cheapest defence against a confident " <>
+                "verdict with nothing behind it. Capped hard: it is session-authored."
+          },
+          duplicate_of: %Schema{
+            type: :string,
+            format: :uuid,
+            nullable: true,
+            description:
+              "An existing story this report already describes. Its own field rather than " <>
+                "a `contradicts` entry, because a duplicate is the commonest outcome after " <>
+                "`reject` and it is not a contradiction."
+          },
+          contradicts: %Schema{
+            type: :array,
+            maxItems: @max_contradicts,
+            items: %Schema{
+              type: :object,
+              required: [:kind, :ref, :why],
+              properties: %{
+                kind: %Schema{type: :string, enum: @contradict_kinds},
+                ref: %Schema{type: :string, maxLength: @max_contradict_ref_length},
+                why: %Schema{type: :string, maxLength: @max_contradict_why_length}
+              }
+            },
+            description:
+              "What this request conflicts with in the existing stories, the knowledge " <>
+                "base, or the code. A DUPLICATE is not this; see `duplicate_of`."
+          }
+        }
+      },
+      struct?: false
+    )
+  end
+
   defmodule RunnerDispatch do
     @moduledoc false
     require OpenApiSpex
@@ -1347,6 +1519,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     RunnerSample,
     RunnerStory,
     RunnerTriage,
+    RunnerTriageVerdict,
     RunnerDispatch,
     RunnerDispatchReply,
     RunnerTraceEvent,
@@ -1605,6 +1778,60 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   end
 
   defp triage_errors(_dispatch), do: []
+
+  @doc """
+  Validates a triage verdict (since 1.7.0). Returns the declared fields only, with atom
+  keys, or `{:error, {:invalid, messages}}`.
+
+  The schema cannot state the one rule that matters, so this does: a `story` outcome MUST
+  carry a draft story and every other outcome must not. A verdict saying `story` and
+  carrying none has moved the work rather than done it — a human re-reads the report and
+  writes the story by hand, which is the step triage exists to remove — and a draft story on
+  a `reject` is a payload whose two halves disagree about what was decided.
+
+  It is the same shape rule `cast_dispatch/1` applies to `story` and `triage`, and it is
+  stated the same way: as two independent conditions, so a verdict that breaks both is
+  refused for both.
+
+  **What this does NOT do is make the verdict trustworthy.** It bounds a session-authored
+  object composed by a session that had just read attacker-controllable text. Passing this
+  cast means the shape is right and the strings are within their caps; it says nothing about
+  whether the content was steered. Callers record it, never execute it, and fence its
+  strings wherever they reach another prompt.
+  """
+  @spec cast_triage_verdict(term()) :: {:ok, map()} | {:error, term()}
+  def cast_triage_verdict(payload) do
+    with {:ok, cast} <- cast(payload, RunnerTriageVerdict.schema()) do
+      verdict = known_fields(cast, RunnerTriageVerdict.schema())
+
+      case verdict_shape_errors(verdict) do
+        [] -> {:ok, verdict}
+        errors -> {:error, {:invalid, errors}}
+      end
+    end
+  end
+
+  defp verdict_shape_errors(verdict) do
+    outcome = Map.get(verdict, :outcome)
+    story = Map.get(verdict, :story)
+
+    missing_story =
+      if outcome == "story" and is_nil(story),
+        do: ["a story outcome must carry the draft story"],
+        else: []
+
+    unexpected_story =
+      if outcome != "story" and not is_nil(story),
+        do: ["story is only allowed when outcome is story"],
+        else: []
+
+    oversize =
+      if ByteRule.bytes(verdict) > RunnerTriageVerdict.max_bytes(),
+        do: ["verdict exceeds #{RunnerTriageVerdict.max_bytes()} bytes under the byte rule"],
+        else: []
+
+    missing_story ++ unexpected_story ++ oversize
+  end
 
   @doc """
   Validates a `dispatch_reply` payload. Returns the declared fields only, with atom keys, or

