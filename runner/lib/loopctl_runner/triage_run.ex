@@ -22,7 +22,7 @@ defmodule LoopctlRunner.TriageRun do
 
   The outcome is one of `{:verdict, verdict}`, `{:incomplete, reason, detail}` or
   `{:error, reason}`. The incomplete reasons come from the vendored contract's
-  `RunnerTriageVerdictMessage.incomplete` enum (1.9.1) and are read from it rather than repeated
+  `RunnerTriageVerdictMessage.incomplete` enum (its non-null members; 1.9.2) and are read from it rather than repeated
   here — `incomplete_reasons/0` is the list, and a value outside it raises at compile time.
   Four of the five describe what the SESSION did: `session_crashed`, `wall_clock_exceeded`,
   `no_verdict_written` (including an escalation, whose own words go in the detail), and
@@ -68,8 +68,12 @@ defmodule LoopctlRunner.TriageRun do
 
   # Read from the vendored contract at COMPILE time, not repeated: the last time this repo held
   # its own copy of this enum, the copy was one value short and nothing could see it.
+  # `null` is a MEMBER of that enum since 1.9.2 — the field is nullable, and an enum that did not
+  # list null refused the explicit null an emitter sends beside a real verdict. It is not a
+  # reason, so it is not in this list: what this module reports is always one of the strings.
   @incomplete_reasons Contract.schema_def("RunnerTriageVerdictMessage")
                       |> get_in(["properties", "incomplete", "enum"])
+                      |> Enum.reject(&is_nil/1)
 
   for reason <- ~w(session_crashed wall_clock_exceeded checkout_unreadable no_verdict_written
                    verdict_invalid) do
@@ -78,7 +82,12 @@ defmodule LoopctlRunner.TriageRun do
     end
   end
 
-  @doc "The incomplete reasons the vendored contract publishes."
+  @doc """
+  The incomplete REASONS the vendored contract publishes: the enum's non-null members.
+
+  `null` is in that enum since 1.9.2 and is not a reason — it is how a message that carries a
+  verdict says it carries no incomplete.
+  """
   @spec incomplete_reasons() :: [String.t()]
   def incomplete_reasons, do: @incomplete_reasons
 

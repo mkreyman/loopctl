@@ -6,7 +6,7 @@ defmodule LoopctlRunner.ContractTest do
   defp join(overrides \\ %{}) do
     Map.merge(
       %{
-        "contract_version" => "1.9.1",
+        "contract_version" => "1.9.2",
         "kinds" => ["implement"],
         "machine" => "minis",
         "cores" => 16,
@@ -20,8 +20,8 @@ defmodule LoopctlRunner.ContractTest do
     )
   end
 
-  test "the vendored contract is v1.9.1 and names the socket and header the client uses" do
-    assert Contract.version() == "1.9.1"
+  test "the vendored contract is v1.9.2 and names the socket and header the client uses" do
+    assert Contract.version() == "1.9.2"
 
     assert %{
              "credential_header" => "x-loopctl-runner-token",
@@ -678,7 +678,7 @@ defmodule LoopctlRunner.ContractTest do
     end
   end
 
-  describe "the triage verdict message (1.9.1)" do
+  describe "the triage verdict message" do
     @dispatch %{
       "dispatch_id" => "7d0c1f6e-3b1a-4f7e-9c2d-5a6b7c8d9e0f",
       "claim_epoch" => 3
@@ -709,9 +709,12 @@ defmodule LoopctlRunner.ContractTest do
         Contract.schema_def("RunnerTriageVerdictMessage")
         |> get_in(["properties", "incomplete"])
 
-      assert Enum.sort(reasons) ==
+      # null is a member too since 1.9.2, because the field is nullable — see the test below.
+      assert Enum.sort(Enum.reject(reasons, &is_nil/1)) ==
                Enum.sort(~w(session_crashed wall_clock_exceeded checkout_unreadable
                             no_verdict_written verdict_invalid))
+
+      assert nil in reasons
 
       for reason <- reasons do
         assert Contract.validate(
@@ -795,26 +798,31 @@ defmodule LoopctlRunner.ContractTest do
       refute error =~ "loud"
     end
 
-    test "incomplete CANNOT be sent as an explicit null, unlike verdict" do
-      # The mirror of the case above, and it goes the other way: `incomplete` is typed
-      # ["string","null"] but its enum lists only the five reasons, and under 2020-12 an enum
-      # constrains every instance including null. So a message carrying a real verdict beside
-      # "incomplete": null is refused invalid_payload — permanent — while the same shape with the
-      # fields swapped is accepted. An emitter that serialises a struct whole sends both.
-      #
-      # Pinned rather than worked around, like the exactly-one-of rule: the sender OMITS the field
-      # it is not using. Raised with loopctl; this test is what goes red if the enum gains null.
+    test "incomplete may be sent as an explicit null, as verdict may" do
+      # Until 1.9.2 it could not: the field was typed ["string","null"] while its enum listed only
+      # the five reasons, and under 2020-12 an enum constrains every instance including null. So a
+      # message carrying a real verdict beside "incomplete": null was refused invalid_payload —
+      # permanent — while the same shape with the fields swapped was accepted, and an emitter that
+      # serialises a struct whole sends both. This test asserted that refusal and pinned it as a
+      # sender rule; 1.9.2 publishes null as a member of the enum, so the asymmetry is gone and
+      # this is the direction that must now hold.
       message =
         Map.merge(@dispatch, %{
           "verdict" => %{"outcome" => "escalate", "confidence" => "high"},
           "incomplete" => nil
         })
 
-      assert {:error, [error]} = Contract.validate("RunnerTriageVerdictMessage", message)
-      assert error =~ "incomplete"
+      assert Contract.validate("RunnerTriageVerdictMessage", message) == :ok
 
       assert Contract.validate("RunnerTriageVerdictMessage", Map.delete(message, "incomplete")) ==
                :ok
+
+      # A reason outside the enum is still refused, null or no null.
+      assert {:error, _} =
+               Contract.validate("RunnerTriageVerdictMessage", %{
+                 message
+                 | "incomplete" => "gave_up"
+               })
     end
 
     test "the inlined verdict and the verdict definition are the same schema" do
@@ -844,11 +852,19 @@ defmodule LoopctlRunner.ContractTest do
                "#{reason} is given up on, and the contract does not call it permanent"
       end
 
-      # The one deliberate disagreement, named so it cannot pass unnoticed: the contract calls
-      # dispatch_not_accepted permanent, and Control retries it while this runner's OWN accept for
-      # that dispatch is still unacknowledged, because the flag flips when that reply commits. It
-      # gives up as soon as no accept is outstanding. Raised with loopctl.
+      # dispatch_not_accepted is in the flat list AND carries a condition, published as of 1.9.2:
+      # permanence for it is conditional, because the refusal covers three ledger states and only
+      # one of them is still moving. That is why the reason is not in given_up/0 and must not be
+      # added to it — giving up at once would abandon the traces of runs whose accept is simply
+      # still in flight. What READS the condition is `Control.accept_outstanding?/2`, and this
+      # assertion does not check it: only that runner's own tests, driving real dispatch
+      # sequences, can say whether it reads all three conjuncts. This is the contract half.
       assert "dispatch_not_accepted" in permanent
+
+      assert Contract.connection()
+             |> Map.fetch!("permanent_error_conditions")
+             |> Map.fetch!("dispatch_not_accepted") =~ "claim_epoch"
+
       refute "dispatch_not_accepted" in LoopctlRunner.Control.given_up()
     end
 
