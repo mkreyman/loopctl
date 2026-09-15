@@ -14,8 +14,7 @@ defmodule LoopctlWeb.DispatchPlacementControllerTest do
 
   alias Loopctl.AdminRepo
   alias Loopctl.Dispatches.Dispatch
-  alias LoopctlWeb.Plugs.RequireHumanAnchor
-  alias LoopctlWeb.Plugs.RequireRole
+  alias LoopctlWeb.DispatchPlacementController
 
   setup :verify_on_exit!
 
@@ -128,13 +127,36 @@ defmodule LoopctlWeb.DispatchPlacementControllerTest do
       assert body["error"]["code"] == "not_authorized"
     end
 
-    test "the status and code MATCH THE PLUGS that refuse the same conditions elsewhere" do
-      # A caller must not be able to tell which mechanism refused it. `RequireHumanAnchor`
-      # answers 403 `custody_tier_required` and `RequireRole` 403 `insufficient_role`; this
-      # path applies both in the context, so the renderings have to agree or the same
-      # condition reads as two different failures depending on the route.
-      assert RequireHumanAnchor.__info__(:module)
-      assert RequireRole.__info__(:module)
+    test "a PUSH refusal renders, and backpressure is a 429 rather than a fault" do
+      # THE EIGHT `Runners.dispatch/3` REFUSALS, none of which had a clause anywhere. The
+      # commonest operational failure of a dispatch trigger is a runner whose machine is
+      # asleep, and it answered 500 saying the server had a gap.
+      #
+      # Asserted on the MAPPING rather than through a live push: staging a real refusal needs
+      # a claimable story and a socket, so what is checked here is that every documented
+      # refusal has a rendering and that backpressure is separated from fault. The codes come
+      # from `Runners.dispatch/3`'s own spec.
+      for {reason, status} <- [
+            {:runner_not_connected, 409},
+            {:runner_ambiguous, 409},
+            {:kind_not_supported, 409},
+            {:dispatch_id_conflict, 409},
+            {:dispatch_already_replied, 409},
+            {:admission_limit_reached, 429},
+            {:runner_at_capacity, 429},
+            {:capacity_busy, 429}
+          ] do
+        conn =
+          DispatchPlacementController.render_refusal(
+            Phoenix.ConnTest.build_conn(),
+            reason
+          )
+
+        assert conn.status == status,
+               "#{reason} answered #{conn.status}, expected #{status}"
+
+        assert Jason.decode!(conn.resp_body)["error"]["code"] == Atom.to_string(reason)
+      end
     end
   end
 
@@ -198,6 +220,42 @@ defmodule LoopctlWeb.DispatchPlacementControllerTest do
     end
   end
 
+  describe "the shapes the fallback renders best" do
+    test "an invalid_transition keeps the fallback's 409 WITH the story's statuses" do
+      # An `is_atom` guard on the forwarding clause threw this away and answered 500 — while
+      # the comment above it claimed the shared rendering was kept. This is the race
+      # `place/4`'s own docs name: a story that passes the readiness check and is claimed by
+      # someone else before `claim_story/3` takes its lock.
+      ctx = %{
+        story_id: Ecto.UUID.generate(),
+        agent_status: "implementing",
+        verified_status: "unverified"
+      }
+
+      conn =
+        DispatchPlacementController.render_refusal(
+          Phoenix.ConnTest.build_conn(),
+          {:invalid_transition, ctx}
+        )
+
+      assert conn.status == 409
+      refute conn.status == 500
+    end
+
+    test "a CHANGESET keeps the fallback's 422 with its field errors" do
+      # `create_dispatch/3` surfaces its insert failure verbatim, so this shape is reachable.
+      changeset =
+        {%{}, %{name: :string}}
+        |> Ecto.Changeset.cast(%{}, [:name])
+        |> Ecto.Changeset.validate_required([:name])
+
+      conn =
+        DispatchPlacementController.render_refusal(Phoenix.ConnTest.build_conn(), changeset)
+
+      assert conn.status == 422
+    end
+  end
+
   describe "the lineage ceiling" do
     test "an UNLINEAGED ORCHESTRATOR key is refused root_dispatch_forbidden", %{conn: conn} do
       # A credential that no dispatch minted carries no lineage, and a dispatch may only be
@@ -227,7 +285,11 @@ defmodule LoopctlWeb.DispatchPlacementControllerTest do
     end
   end
 
-  # WHAT THESE DO NOT COVER, stated rather than implied by a green file: no test here stages a
+  # WHAT THESE DO NOT COVER, stated rather than implied by a green file. Second: the
+  # SUPERADMIN-with-no-impersonation path. Reading the tenant from `conn.assigns.current_tenant`
+  # dereferenced nil there and answered 500 on a valid credential; it reads the KEY now, as
+  # `DispatchController.create/2` does. A superadmin key is not tenant-scoped, so this file's
+  # `fixture(:api_key)` cannot build one and the edge is unasserted. First: no test here stages a
   # SUCCESSFUL placement. That needs a contracted story at `queued`, a connected runner on a
   # live socket and a push that is accepted — `Loopctl.Delivery.PlacementTest` owns that, and
   # mounting it through the endpoint would test the socket rather than the route. The

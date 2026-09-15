@@ -45,8 +45,6 @@ defmodule LoopctlWeb.DispatchPlacementController do
   use LoopctlWeb, :controller
   use OpenApiSpex.ControllerSpecs
 
-  require Logger
-
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Delivery.Placement
   alias OpenApiSpex.Schema
@@ -92,10 +90,28 @@ defmodule LoopctlWeb.DispatchPlacementController do
       {"Dispatch", "application/json",
        %Schema{
          type: :object,
-         required: [:dispatch_id, :story_id],
+         # EVERY FIELD `RunnerDispatch` REQUIRES except `claim_epoch`, which `place/4` injects
+         # from the claim it just took. Under-declaring these is not a documentation nicety:
+         # `cast_dispatch/1` applies NO defaults, so a caller following a shorter list gets
+         # through the readiness check, has a session dispatch and an ephemeral key minted,
+         # has `dispatch_created` and `story_stage_claimed` appended to an IMMUTABLE chain and
+         # the story claimed — and only then is refused. That is exactly the cost the pre-mint
+         # readiness check exists to avoid, reintroduced by a wrong schema.
+         required: [
+           :dispatch_id,
+           :story_id,
+           :kind,
+           :repo,
+           :base_branch,
+           :branch,
+           :wall_clock_seconds,
+           :max_turns
+         ],
          description:
-           "The dispatch object, as `RunnerDispatch` declares it. `kind` defaults to " <>
-             "`implement`; only the kinds in `x-connection.dispatchable_kinds` are accepted.",
+           "The dispatch object, as `RunnerDispatch` declares it, minus `claim_epoch` (which " <>
+             "loopctl injects from the claim) and minus `story` (which is REFUSED — see " <>
+             "`story_not_accepted` below). Nothing is defaulted: `kind` must be sent and " <>
+             "must be one of `x-connection.dispatchable_kinds`.",
          properties: %{
            dispatch_id: %Schema{
              type: :string,
@@ -105,10 +121,14 @@ defmodule LoopctlWeb.DispatchPlacementController do
                  "claim ends needs a new one."
            },
            story_id: %Schema{type: :string, format: :uuid},
-           kind: %Schema{type: :string},
+           kind: %Schema{
+             type: :string,
+             description: "Only the kinds in `x-connection.dispatchable_kinds` are accepted."
+           },
            repo: %Schema{type: :string},
            branch: %Schema{type: :string},
            base_branch: %Schema{type: :string},
+           wall_clock_seconds: %Schema{type: :integer, minimum: 1},
            max_turns: %Schema{type: :integer, minimum: 1}
          }
        }},
@@ -139,14 +159,23 @@ defmodule LoopctlWeb.DispatchPlacementController do
       403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 => {"Not placeable", "application/json", Schemas.ErrorResponse},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      422 =>
+        {"Validation error, or `story_not_accepted` — the story object is built by loopctl " <>
+           "from its own records and may not be supplied by a caller", "application/json",
+         Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
 
   @doc "POST /api/v1/runners/:runner_id/dispatches"
   def create(conn, %{"runner_id" => runner_id} = params) do
-    tenant = conn.assigns.current_tenant
+    # FROM THE KEY, not from `conn.assigns.current_tenant`. A superadmin key with no
+    # impersonation header passes `RequireRole` by hierarchy and `RequireHumanAnchor`'s
+    # leading `current_tenant: nil` clause unconditionally — so reading the assign
+    # dereferenced nil and answered 500 on a valid credential, in a controller whose whole
+    # thesis is that ordinary conditions must not. `DispatchController.create/2` reads the key
+    # for the same reason; this at least reaches `place/4`'s `is_binary` guard.
+    tenant_id = conn.assigns.current_api_key.tenant_id
 
     # The dispatch object is passed THROUGH, not reassembled: `place/4` hands it to
     # `Runners.dispatch/3`, which casts it against `RunnerDispatch` and refuses anything the
@@ -158,7 +187,7 @@ defmodule LoopctlWeb.DispatchPlacementController do
 
     if caller_supplied_story?(dispatch),
       do: refuse_story(conn),
-      else: do_place(conn, tenant, runner_id, dispatch)
+      else: do_place(conn, tenant_id, runner_id, dispatch)
   end
 
   # THE STORY OBJECT MAY NOT COME FROM THE WIRE, and this endpoint is what would have let it.
@@ -189,8 +218,8 @@ defmodule LoopctlWeb.DispatchPlacementController do
     })
   end
 
-  defp do_place(conn, tenant, runner_id, dispatch) do
-    case Placement.place(tenant.id, runner_id, dispatch,
+  defp do_place(conn, tenant_id, runner_id, dispatch) do
+    case Placement.place(tenant_id, runner_id, dispatch,
            api_key: conn.assigns.current_api_key,
            actor_label: "api:dispatch_placement"
          ) do
@@ -198,6 +227,17 @@ defmodule LoopctlWeb.DispatchPlacementController do
       {:error, reason} -> refuse(conn, reason)
     end
   end
+
+  @doc """
+  The rendering of one refusal, public so every mapped code is testable.
+
+  Staging a real push refusal needs a claimable story and a live socket, so the alternative
+  was a test that asserted the mapping existed by inspecting the module — which is what the
+  first version of this file did, and it could not fail. An unfalsifiable guard reads as
+  coverage the file does not have.
+  """
+  @spec render_refusal(Plug.Conn.t(), term()) :: Plug.Conn.t()
+  def render_refusal(conn, reason), do: refuse(conn, reason)
 
   # MAPPED HERE, and this is not ceremony. `FallbackController`'s catch-all answers 500 for
   # an atom it has no clause for — deliberately, because an unmapped refusal is a gap and
@@ -272,27 +312,80 @@ defmodule LoopctlWeb.DispatchPlacementController do
     })
   end
 
+  # THE PUSH'S OWN REFUSALS, all eight of them, and none had a clause anywhere. `place/4`
+  # ends in `Runners.dispatch/3`, whose spec returns these — and the most ordinary failure a
+  # dispatch trigger has is the first one: a runner whose machine is asleep. The claim is
+  # taken, the stage advances, the push is refused, `undo_claim/5` correctly releases and
+  # revokes — and the caller got a 500 saying the server had a gap. Mapping `place/4`'s own
+  # refusals and stopping there was the same defect one layer out.
+  #
+  # 409 for a state the caller can see and act on; 429 for BACKPRESSURE, which is a wait
+  # rather than a fault and is the difference between "try another runner" and "try later".
+  defp refuse(conn, :runner_not_connected) do
+    error(conn, 409, "runner_not_connected", %{
+      message:
+        "The runner has no live connection. The claim was released and the session dispatch " <>
+          "revoked, so re-placing needs a NEW dispatch_id once it reconnects."
+    })
+  end
+
+  defp refuse(conn, :runner_ambiguous) do
+    error(conn, 409, "runner_ambiguous", %{
+      message: "More than one live connection for this runner; loopctl will not guess."
+    })
+  end
+
+  defp refuse(conn, :kind_not_supported) do
+    error(conn, 409, "kind_not_supported", %{
+      message: "This runner does not run that kind. See x-connection.dispatchable_kinds."
+    })
+  end
+
+  defp refuse(conn, :dispatch_id_conflict) do
+    error(conn, 409, "dispatch_id_conflict", %{
+      message:
+        "This dispatch_id is already recorded against a different story or runner. A " <>
+          "dispatch_id names one placement; use a new one."
+    })
+  end
+
+  defp refuse(conn, :dispatch_already_replied) do
+    error(conn, 409, "dispatch_already_replied", %{
+      message: "The runner has already answered this dispatch."
+    })
+  end
+
+  defp refuse(conn, reason) when reason in [:admission_limit_reached, :runner_at_capacity] do
+    error(conn, 429, Atom.to_string(reason), %{
+      message:
+        "Backpressure, not a fault: the tenant or the runner is at its session limit. The " <>
+          "claim was released. Retry when a slot frees."
+    })
+  end
+
+  defp refuse(conn, :capacity_busy) do
+    error(conn, 429, "capacity_busy", %{
+      message: "The capacity reservation is contended. Retry."
+    })
+  end
+
   # Everything else — `:not_found`, `:wrong_stage`, `{:invalid_transition, _}`,
   # `:stale_claim_epoch`, every changeset and every fault `Dispatches`, `Stages` and
   # `Runners` already raise — keeps the shared rendering. Those ARE mapped, and duplicating
   # them here is how two renderings of one refusal drift apart.
-  defp refuse(conn, reason) when is_atom(reason),
-    do: LoopctlWeb.FallbackController.call(conn, {:error, reason})
-
-  # A NON-ATOM refusal the fallback cannot take. Its catch-all matches an atom only, on
-  # purpose — "a new refusal shape still fails loudly rather than being absorbed here" — so
-  # handing it a tuple raises. Rendering it as a 500 keeps that loudness (the shape IS a gap)
-  # without turning every unknown refusal into a crash inside the controller.
-  defp refuse(conn, reason) do
-    Logger.error(
-      "DispatchPlacementController has no clause for #{inspect(reason)}; answered 500. " <>
-        "path=#{conn.request_path}"
-    )
-
-    error(conn, 500, "internal_error", %{
-      message: "The server could not complete this request. It has been logged."
-    })
-  end
+  # FORWARDED, whatever the shape. The previous version guarded this `when is_atom(reason)`
+  # and sent everything else to a local 500 — which threw away the two shapes the fallback
+  # renders BEST, while the comment above claimed they kept the shared rendering:
+  #
+  #   * `{:invalid_transition, ctx}` — the race `place/4`'s own docs name, a story claimed by
+  #     someone else between the readiness check and the lock. The fallback answers 409 WITH
+  #     the story's current statuses; the guard made it a 500.
+  #   * `%Ecto.Changeset{}` — `create_dispatch/3` surfaces its insert failure verbatim. The
+  #     fallback answers 422 with the field errors; the guard made it a 500.
+  #
+  # The fallback's own atom-only catch-all still answers 500 for an atom nobody mapped, which
+  # is the loudness that belongs there rather than here.
+  defp refuse(conn, reason), do: LoopctlWeb.FallbackController.call(conn, {:error, reason})
 
   defp error(conn, status, code, extra) do
     conn
