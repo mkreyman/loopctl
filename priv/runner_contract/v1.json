@@ -1167,6 +1167,7 @@
   "x-connection": {
     "credential_header": "x-loopctl-runner-token",
     "dispatchable_kinds": [
+      "triage",
       "implement"
     ],
     "error_fields": {
@@ -1636,5 +1637,5 @@
       "workflow_change_not_defect_fix"
     ]
   },
-  "x-contract-version": "1.10.0"
+  "x-contract-version": "1.11.0"
 }

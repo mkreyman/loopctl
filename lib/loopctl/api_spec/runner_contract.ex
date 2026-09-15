@@ -42,7 +42,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.9.1) `RunnerTriageVerdictMessage` and `RunnerTriageVerdictAck` are actually DEFINED. 1.9.0 named both in `x-connection` and published neither, so the envelope was unresolvable and a runner had to re-type it. RE-VENDOR: a copy taken at 1.9.0 is missing both, and the version string is the only signal that it is | | | | |
   | (1.9.2) a NULLABLE ENUM publishes `null` as a member. `incomplete` was typed `[string, null]` with an enum of five reasons, and under 2020-12 an enum constrains null too — so a runner validating a message against the published file could not SEND a real verdict beside `"incomplete": null`, while the mirror message validated. loopctl accepted both all along; the schema was what disagreed. Also publishes `x-connection.permanent_error_conditions`. RE-VENDOR to send both keys | | | | |
   | (1.9.3) `x-connection.triage_gating_reasons` publishes the `escalation_reasons` entries the control-side gate matches as whole strings, while the field itself stays free-form prose — and an escalate verdict must now carry at least one entry that is NOT a code, because a classification is not words a person can act on. RE-VENDOR: a copy taken at 1.9.2 has no such key to validate against | | | | |
-  | (1.10.0) a `stage` refused `stale_stage` carries the ROW — `stage`, `claim_epoch`, `lock_version`, `attempts`, `effects`, the same shape the ok ack sends. The remedy this code prescribes is to re-read the story and send the transition that applies, and there is no endpoint to read it from: the reply IS the read. A runner holding a `from` fallback list can delete it. `x-connection.error_fields` publishes what EVERY refusal carries beside its `reason`, per event and complete, and `permanent_error_conditions` now names the one state in which `stale_stage` is permanent for `stage`. RE-VENDOR: a copy taken at 1.9.3 has neither key, and the version string is the only signal that it is missing them | | | | |
+  | (1.10.0) TRIAGE IS DISPATCHABLE. `x-connection.dispatchable_kinds` is `triage` and `implement`, so loopctl sends a `triage` dispatch for a story it has just detected. Only a runner that DECLARES `triage` on join receives one — `implied_by_silence` stays `implement` alone | | | | |
+  | (1.11.0) a `stage` refused `stale_stage` carries the ROW — `stage`, `claim_epoch`, `lock_version`, `attempts`, `effects`, the same shape the ok ack sends. The remedy this code prescribes is to re-read the story and send the transition that applies, and there is no endpoint to read it from: the reply IS the read. A runner holding a `from` fallback list can delete it. `x-connection.error_fields` publishes what EVERY refusal carries beside its `reason`, per event and complete, and `permanent_error_conditions` now names the one state in which `stale_stage` is permanent for `stage`. RE-VENDOR: a copy taken at 1.10.0 has neither key, and the version string is the only signal that it is missing them | | | | |
 
   ## The story object (since 1.5.0)
 
@@ -81,23 +82,28 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
   `kind` declares the vocabulary (`triage`, `implement`); `RunnerDispatch.dispatchable_kinds/0`
   is what loopctl will actually send, and `cast_dispatch/1` refuses anything else BEFORE a
-  payload is recorded or broadcast. Today that is `implement` alone.
+  payload is recorded or broadcast. Since 1.10.0 that is BOTH.
 
-  **Triage HAS its payload since 1.7.0 (`RunnerTriage`) and is still not dispatchable, and
-  the reason has changed — do not read the old one.** Until 1.7.0 it was excluded because the
+  **THE INTERLOCK HAS MOVED (1.10.0), and the reasoning is kept rather than deleted, because
+  it is what says when it may move again.** Triage has had its payload since 1.7.0
+  (`RunnerTriage`). Until 1.7.0 it was excluded because the
   implement payload had no field that could carry the reporter's words and a triage dispatch
   would have reached a machine with no input. That is fixed: the object exists, it is
   disjoint from `story`, and the cast refuses either one on the wrong kind.
 
-  What holds it back now is the OTHER END. No runner accepts the kind yet — the deployed
-  fleet answers `kind_not_supported` for anything but `implement` — and a triage session
-  needs a tool set of its own rather than the implement set widened, which is the runner's
-  work and not loopctl's. Sending the kind before that exists would spend a dispatch and a
-  round trip on a refusal, and against an UNDECLARING runner it would write a permanent
-  `kind_not_supported` for that machine (see `RunnerJoin.kinds`). So `dispatchable_kinds/0`
-  is the interlock: it moves when the runners can take the work, and the payload landing
-  first is what lets both sides be built at once. The `kind` enum keeps `triage` throughout
-  because narrowing an enum is a BREAKING change and a minor version may only add.
+  What held it back was the OTHER END: no runner accepted the kind, so sending it would have
+  spent a dispatch and a round trip on a refusal, and against an UNDECLARING runner it would
+  have written a permanent `kind_not_supported` for that machine (see `RunnerJoin.kinds`).
+
+  Both halves are answered now. The runner implementation composes its three triage lenses
+  from its own tool set and emits a `triage_verdict` (1.9.x), so the work has somewhere to
+  land — and an undeclaring runner is still protected, because `implied_by_silence/0` stays
+  `implement` ALONE: a machine that says nothing is sent exactly what it was sent before, and
+  only a runner that DECLARES `triage` on join receives one. That asymmetry is the whole
+  safety of this bump and must not be "tidied up" by making the two lists equal.
+
+  The `kind` enum kept `triage` throughout, which is what let both sides be built at once:
+  narrowing an enum is a BREAKING change and a minor version may only add.
 
   A runner may also answer a dispatch with `kind_not_supported`, a CAPABILITY statement rather
   than a fault: this machine does not do this kind of work. loopctl records it and does not
@@ -163,7 +169,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   whose first copy committed finds the row already at `to` under the same epoch and is
   answered `ok` with that row, so a re-send after a lost acknowledgement — which happens on
   every rolling deploy — never transitions twice. A message for a row that has moved somewhere
-  ELSE is `stale_stage`, and since 1.10.0 that refusal CARRIES THE ROW — the same
+  ELSE is `stale_stage`, and since 1.11.0 that refusal CARRIES THE ROW — the same
   `{stage, claim_epoch, lock_version, attempts, effects}` the ok ack sends, beside the
   `reason`. Send the transition that applies FROM the `stage` it names; do not guess by
   trying each `from` in turn, and do not go looking for an endpoint to read the row from.
@@ -301,7 +307,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   alias Loopctl.DeliveryGates.GateA
   alias OpenApiSpex.Schema
 
-  @version "1.10.0"
+  @version "1.11.0"
   @major 1
 
   defmodule ByteRule do
@@ -477,7 +483,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     # OTHER END: no deployed runner accepts the kind. The moduledoc has the full version;
     # this stays one sentence so the two cannot diverge again.
     @all ["triage", "implement"]
-    @dispatchable ["implement"]
+    @dispatchable ["triage", "implement"]
 
     # What a runner built before 1.6.0 is read as having declared. It MUST be the set loopctl
     # was already sending when the field did not exist, or introducing the field would start
@@ -1985,7 +1991,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     #
     # - `stale_stage` — the row is not at `from`. The message is well formed and the claim is
     #   fine, so `invalid_payload` (stop sending this) and `stale_claim_epoch` (stop working
-    #   the story) are both actively wrong. Since 1.10.0 the refusal CARRIES the row — the
+    #   the story) are both actively wrong. Since 1.11.0 the refusal CARRIES the row — the
     #   same `{stage, claim_epoch, lock_version, attempts, effects}` the ok ack sends — and
     #   the transition that applies is read off it. Before that it carried the code alone,
     #   which made the prescribed remedy unfollowable: `story_stages` has no runner-facing
@@ -2040,7 +2046,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   # vendoring runner never reads — the lesson 1.9.2 and 1.9.3 already paid for with
   # `permanent_error_conditions` and `triage_gating_reasons`. A refusal's EXTRA FIELDS were
   # the one part of this contract a holder could only learn by reading loopctl's source or by
-  # observing a refusal in production, and 1.10.0 is the release that makes that expensive:
+  # observing a refusal in production, and 1.11.0 is the release that makes that expensive:
   # its whole point is that a `stale_stage` runner reads the row off the refusal instead of
   # brute-forcing `from`, and a vendored copy said nothing about there being a row to read.
   #
@@ -2084,7 +2090,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
       "rate_limited" => ~w(min_interval_ms),
       "invalid_payload" => ~w(details),
       "effect_conflict" => ~w(effects),
-      # SINCE 1.10.0, and the reason for the release. The same shape the ok ack sends, so one
+      # SINCE 1.11.0, and the reason for the release. The same shape the ok ack sends, so one
       # parser serves both: the row this story's stage is actually at.
       "stale_stage" => ~w(stage claim_epoch lock_version attempts effects)
     },
@@ -2253,7 +2259,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   def permanent_error_conditions, do: @permanent_error_conditions
 
   @doc """
-  What each refusal carries BESIDE its `reason`, keyed by event then by code (1.10.0).
+  What each refusal carries BESIDE its `reason`, keyed by event then by code (1.11.0).
 
   Complete: every code `error_reasons/0` publishes for an event has an entry here, and a code
   that carries nothing has an explicit `[]`. So a lookup that finds nothing means the EVENT or
@@ -2931,7 +2937,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
         # runner reads it in the same breath as the code it just got.
         "permanent_errors" => @permanent_errors,
         "permanent_error_conditions" => @permanent_error_conditions,
-        # WHAT EACH REFUSAL CARRIES BESIDE `reason`, per event, complete (1.10.0). Beside
+        # WHAT EACH REFUSAL CARRIES BESIDE `reason`, per event, complete (1.11.0). Beside
         # `errors` for the same reason `permanent_errors` is: a runner reads it in the same
         # breath as the code it just got.
         "error_fields" => @error_fields,

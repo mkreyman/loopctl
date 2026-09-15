@@ -90,14 +90,15 @@ describe("place_dispatch", () => {
 
   test("carries the overrides it WAS given, including the repository", async () => {
     // An override is for the case the derivation cannot serve: a project bound to two sources,
-    // or a deliberate branch. `kind` stays `implement` here — `dispatchable_kinds` is the live
-    // list of what loopctl will send, and a kind not on it is refused after the claim.
+    // or a deliberate branch. `triage` is dispatchable since contract 1.10.0 — and reaches
+    // only a runner that DECLARES the kind on join.
     const { calls, apiCall } = fakeApi();
 
     await placeDispatch(
       {
         story_id: STORY_ID,
         runner_id: RUNNER_ID,
+        kind: "triage",
         repo: "mkreyman/home_care_billing",
         branch: "feature/x",
         base_branch: "main",
@@ -107,6 +108,7 @@ describe("place_dispatch", () => {
       deps({ apiCall }),
     );
 
+    assert.equal(calls[0].body.kind, "triage");
     assert.equal(calls[0].body.repo, "mkreyman/home_care_billing");
     assert.equal(calls[0].body.branch, "feature/x");
     assert.equal(calls[0].body.base_branch, "main");
