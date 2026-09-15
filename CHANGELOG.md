@@ -6,6 +6,13 @@ All notable changes to loopctl are documented here.
 
 ### Fixed
 
+- **Contract 1.9.1 — the envelope is actually published, and re-vendoring is signalled.**
+  1.9.0 named `RunnerTriageVerdictMessage` and `RunnerTriageVerdictAck` in `x-connection` and
+  defined neither. **A copy of `v1.json` taken at 1.9.0 is missing both**, and the version
+  string was the only thing that could tell a holder to take it again — so this bumps, even
+  though 1.9.0's DECLARED shape is unchanged. `supported_version/1` matches on the major, so
+  the bump breaks no handshake.
+
 - **Contract 1.9.0 named two schemas `$defs` did not define.** `x-connection.events.triage_verdict`
   pointed at `RunnerTriageVerdictMessage` and `x-connection.replies.triage_verdict` at
   `RunnerTriageVerdictAck`, and neither was in `@schemas` — the list `$defs` is built from. So

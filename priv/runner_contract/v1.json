@@ -1011,7 +1011,7 @@
           ]
         },
         "verdict": {
-          "description": "What a `triage` session returns (since 1.7.0). SESSION-AUTHORED AND UNTRUSTED: it was composed by a session that had just read reporter text, so loopctl records and bounds it, never executes it, and fences these strings wherever they later reach a prompt — `story` included, because those fields were written by that same session. `story` is REQUIRED when `outcome` is `story` and forbidden otherwise, the same shape rule a dispatch uses for `story` and `triage`; a verdict that says `story` and carries none has moved the work rather than done it. `confidence` is an enum and not a number on purpose: `low` means the session would not act on this without a human reading the report, `medium` means the request is clear but something it could not check remains, `high` means it found the request actionable and contradicted by nothing it read. THE OBJECT CAP IS WHAT BINDS: at most 48000 bytes under the byte rule, which charges 6 bytes per character and 12 for one outside the Basic Multilingual Plane — so the per-field character maxima do NOT guarantee a payload that fits. A verdict at every declared maximum fits in ordinary text and does not once enough of it is astral. Check the byte rule against `max_bytes` (published in `x-connection.limits.triage_verdict`) rather than the field lengths: the lengths bound one field each, the cap bounds the message.",
+          "description": "The session's judgement. Forbidden when `incomplete` is present. Its own fields are inlined here rather than referenced, so the whole shape is resolvable from this message.",
           "properties": {
             "confidence": {
               "enum": [
@@ -1147,7 +1147,10 @@
             "outcome",
             "confidence"
           ],
-          "type": "object"
+          "type": [
+            "object",
+            "null"
+          ]
         }
       },
       "required": [
@@ -1506,5 +1509,5 @@
     ],
     "topic": "runner:{runner_id}"
   },
-  "x-contract-version": "1.9.0"
+  "x-contract-version": "1.9.1"
 }
