@@ -14,6 +14,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
   alias Loopctl.ApiSpec.RunnerContract.RunnerTraceBatch
   alias Loopctl.ApiSpec.RunnerContract.RunnerTraceEvent
   alias Loopctl.Delivery.StageMachine
+  alias OpenApiSpex.Schema
 
   @join %{
     "contract_version" => "1.0.0",
@@ -562,9 +563,14 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
   # The KB said so already (`b05ce162`, from contract 1.1): "worst-case frame tests must use
   # control characters and astral characters at every max length ... not plain ASCII". I wrote
   # this guard without searching, and the `loopctl-runner` session measured the gap instead:
-  # a verdict at every published maximum is about 45_352 bytes in BMP characters and about
-  # 88_282 in astral ones, against a 48_000 cap. So "inside every published bound is accepted"
-  # was true only for text nobody promised to send.
+  # a verdict at every published maximum is 45_880 bytes in BMP characters and 89_584 in
+  # astral ones, against a 48_000 cap. So "inside every published bound is accepted" was true
+  # only for text nobody promised to send.
+  #
+  # Those figures read 45_352 and 88_282 for a round, matching neither the code below nor the
+  # module's own comment (which said 45_880 and was right). Three numbers for one measurement
+  # in one PR is what happens when a figure is written in prose and asserted nowhere; every
+  # one of them is now named in an assertion.
   defp widest_value(sub), do: widest_value(sub, "x")
 
   defp widest_value(%OpenApiSpex.Schema{type: :string, maxLength: n}, fill) when is_integer(n),
@@ -789,6 +795,12 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       assert bytes <= cap,
              "a verdict inside every declared bound costs #{bytes} against a cap of #{cap}, " <>
                "so some field's published limit cannot be used with the others"
+
+      # AND THE FIGURE BY NAME. `<= cap` is the claim that matters and it cannot tell a
+      # correct measurement from one 7_710 bytes out — which is exactly what the triage half
+      # of this pair carried, green, for a round. The module comment states this number; if
+      # a cap moves, this fails and the comment gets corrected with it.
+      assert bytes == 45_880
     end
 
     test "a triage object at every declared maximum fits the object cap, in BMP text" do
@@ -806,6 +818,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
       assert bytes <= cap,
              "a triage object inside every declared bound costs #{bytes} against #{cap}"
+
+      assert bytes == 46_074
     end
 
     # THE LIMIT OF THE TWO TESTS ABOVE, measured rather than left implicit. `ByteRule` charges
@@ -828,8 +842,14 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     # this guard was written without searching for it.
     test "astral text at every maximum does NOT fit, and the contract says the cap binds" do
       # The fill reaches EVERY string at every depth — the nested story's fields and the
-      # array items too, which is the half the first attempt at this test missed: filling
-      # only the top-level strings reported 45_880 and looked like it nearly fitted.
+      # array items too. Filling only the TOP-LEVEL strings reports 46_096, which is under
+      # the 48_000 cap and so reads as "astral nearly fits" when it does not: the true figure
+      # is 89_584, nearly twice the cap.
+      #
+      # What round 1 added was the `fill` PARAMETER, not the recursion — `widest_value/1`
+      # already walked `:object` and `:array`. The comment here said otherwise for a round,
+      # and a reader who believed it would have judged the recursion to be the new, deletable
+      # part. The depth is load-bearing and predates this change.
       widest =
         RunnerContract.RunnerTriageVerdict.schema().properties
         |> Map.new(fn {name, sub} -> {name, widest_value(sub, "𝄞")} end)
@@ -838,6 +858,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
       cap = RunnerContract.RunnerTriageVerdict.max_bytes()
       assert ByteRule.bytes(widest) > cap
+      assert ByteRule.bytes(widest) == 89_584
 
       # And the contract SAYS so, where a runner author reads it rather than only here.
       description = RunnerContract.RunnerTriageVerdict.schema().description
@@ -845,11 +866,14 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       assert description =~ "outside the Basic Multilingual Plane"
     end
 
-    # The triage half of the same fact, which had no test: `untrusted` at its 5_000-character
-    # maximum with every other field at its own is 38_364 bytes in BMP text and 75_864 in
-    # astral. The comment on `@max_untrusted_length` claimed the worst case unconditionally;
-    # it is the worst ORDINARY case, and this pins both figures so neither can drift into a
-    # claim again.
+    # The triage half of the same fact: `untrusted` at its 5_000-character maximum with every
+    # other field at its own is 46_074 bytes in BMP text and 91_290 in astral. The comment on
+    # `@max_untrusted_length` claimed the worst case unconditionally; it is the worst ORDINARY
+    # case.
+    #
+    # This test SAID it pinned both figures and asserted only `<= cap` and `> cap`, while the
+    # figures it named were wrong by 7_710 and 15_426 bytes. An inequality pins nothing: both
+    # assertions passed on numbers that were never measured. The equalities below are the pin.
     test "the triage object's headroom is BMP-only too, and the cap is what binds" do
       cap = RunnerContract.RunnerTriage.max_bytes()
 
@@ -861,7 +885,10 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       end
 
       assert ByteRule.bytes(widest.("x")) <= cap
+      assert ByteRule.bytes(widest.("x")) == 46_074
+
       assert ByteRule.bytes(widest.("𝄞")) > cap
+      assert ByteRule.bytes(widest.("𝄞")) == 91_290
     end
 
     test "undeclared keys are dropped rather than carried" do
@@ -1289,50 +1316,83 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     # `RunnerTriage` and `RunnerTriageVerdict` published an incomplete set. Nothing bound them
     # to their schemas at all; the only thing holding them was the v1.json snapshot, which is
     # a change detector and not a completeness check.
+    #
+    # There is ONE of these now. Round 1 added the three-object test beside the RunnerStory
+    # one and left both, so the same walk ran twice and only the older copy carried the
+    # unbounded-field assertion — which is the half that does the work below.
     test "every object's published limits are EVERY bound its schema declares, and only those" do
-      for mod <- [RunnerStory, RunnerContract.RunnerTriage, RunnerContract.RunnerTriageVerdict] do
-        published = mod.limits()["fields"]
+      defs = RunnerContract.json_schema()["$defs"]
 
-        declared =
-          for {name, sub} <- mod.schema().properties,
-              bounds = declared_bounds(sub),
-              bounds != %{},
-              into: %{},
-              do: {Atom.to_string(name), bounds}
+      # THE FIELDS WITH NO BOUND AT ALL, NAMED. Without this the guard cannot see a new
+      # unbounded string: `declared_bounds/1` returns %{} for one, so it is skipped on BOTH
+      # sides and `published == declared` still holds, while `widest_value/2` charges it 36
+      # characters and the object-cap tests stay green too. Add `summary: %Schema{type:
+      # :string}` to `RunnerTriageVerdict` and every assertion in this file passed while the
+      # table claimed to publish every bound the schema declares — the exact "reads as
+      # complete, is not" defect this PR was opened to fix, reintroduced inside its own guard.
+      #
+      # An allowlist rather than `== []`, because each entry is a field a runner genuinely
+      # cannot split by and none of them is a defect: an enum, a uuid, an integer, a boolean.
+      expected_unbounded = [
+        {RunnerStory, ["id"]},
+        {RunnerContract.RunnerTriage, ["issue_number", "record_id", "truncated"]},
+        {RunnerContract.RunnerTriageVerdict, ["confidence", "duplicate_of", "outcome"]}
+      ]
+
+      for {mod, unbounded} <- expected_unbounded do
+        properties = defs[mod |> Module.split() |> List.last()]["properties"]
+        published = mod.limits()["fields"]
+        declared = declared_fields(properties)
 
         assert declared != %{}, "#{inspect(mod)}: the schema walk found no bounds"
         assert published == declared, "#{inspect(mod)}: published limits do not match the schema"
+
+        assert Enum.sort(for {name, sub} <- properties, declared_bounds(sub) == %{}, do: name) ==
+                 unbounded,
+               "#{inspect(mod)}: a field gained or lost its bound; if that is intended, say " <>
+                 "so here, and if it is a new string that needs a maxLength, add the bound"
+
+        assert mod.limits()["max_bytes"] == mod.max_bytes()
       end
     end
 
-    test "the published story limits are EVERY bound the schema declares, and only those" do
-      # The list was written by hand and only three of its entries were pinned to the schema,
-      # so a field added to the schema and forgotten in `limits/0` published an incomplete set
-      # with every test green — and a runner splitting by the published caps had no bound for
-      # the new field. This walks the schema itself, so neither direction can drift: a bound
-      # the schema declares must be published, and a published one must exist in the schema.
-      published = RunnerStory.limits()["fields"]
+    # THE TWO SHAPES NO FIELD HAS YET, which is exactly why they need a test: the guard above
+    # walks the real schemas, so a clause that only fires on a shape nothing uses is a claim
+    # no assertion touches. "EVERY bounded field at every depth" is that claim, and it was
+    # false in both directions.
+    test "an array with no declared items still publishes its max_items" do
+      schema = %Schema{
+        type: :object,
+        properties: %{tags: %Schema{type: :array, maxItems: 4}}
+      }
 
-      declared =
-        for {name, sub} <- RunnerStory.schema().properties,
-            bounds = declared_bounds(sub),
-            bounds != %{},
-            into: %{},
-            do: {Atom.to_string(name), bounds}
+      # It published NOTHING for this field — `max_items` included — because the clause
+      # required `items: %Schema{}`. A cap that binds, dropped because the thing inside it
+      # had no bound of its own.
+      assert RunnerContract.Limits.of(schema, 100) == %{
+               "max_bytes" => 100,
+               "fields" => %{"tags" => %{"max_items" => 4}}
+             }
+    end
 
-      assert declared != %{}, "the schema walk found no bounds, so it proves nothing"
-      assert published == declared
+    test "an array of arrays is REFUSED rather than published with its inner bounds dropped" do
+      schema = %Schema{
+        type: :object,
+        properties: %{
+          rows: %Schema{
+            type: :array,
+            maxItems: 2,
+            items: %Schema{type: :array, maxItems: 3, items: %Schema{type: :string, maxLength: 9}}
+          }
+        }
+      }
 
-      # Every property EXCEPT the id carries a bound. `id` is a uuid, bounded by its format;
-      # anything else unbounded is a field a runner cannot split by.
-      unbounded =
-        for {name, sub} <- RunnerStory.schema().properties,
-            declared_bounds(sub) == %{},
-            do: name
-
-      assert unbounded == [:id]
-
-      assert RunnerStory.limits()["max_bytes"] == RunnerStory.max_bytes()
+      # Silently dropping the inner bounds is what shipped last time. Inventing a wire name
+      # here would be worse: it puts a key nobody agreed on into a document runners vendor.
+      # So the build fails and naming the shape becomes a contract decision.
+      assert_raise ArgumentError, ~r/array of arrays/, fn ->
+        RunnerContract.Limits.of(schema, 100)
+      end
     end
   end
 
@@ -1671,45 +1731,79 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     Map.put(dispatch, "story", Map.put(story, "id", dispatch["story_id"]))
   end
 
-  # An INDEPENDENT reading of the schema's bounds, written from the JSON Schema keywords
-  # rather than by calling the private function `limits/0` uses — otherwise the assertion
-  # above would be comparing one implementation with itself.
-  # EVERY DEPTH, because the flat version is why the gap shipped. It read a string's
-  # maxLength and an array-of-strings' item length and nothing else, which happens to be all
-  # `RunnerStory` has — so the guard passed while `limits.triage_verdict` omitted the nested
-  # draft story and `contradicts` entirely. A guard that only covers the shape that was
-  # already correct proves nothing about the shape that was not.
-  defp declared_bounds(%OpenApiSpex.Schema{
-         type: :array,
-         maxItems: n,
-         items: %OpenApiSpex.Schema{} = item
-       })
-       when is_integer(n) do
-    Map.merge(%{"max_items" => n}, declared_item_bounds(item))
+  # AN INDEPENDENT READING, and independent now rather than by assertion. Round 1 wrote it as
+  # a clause-for-clause transliteration of `Limits.field_bounds/1` — same patterns, same
+  # guards, same clause order, same published key names — so the comparison above was one
+  # implementation against a copy of itself. A bound class BOTH walkers ignore is then
+  # invisible, which is precisely how the shipped bug survived: the pre-PR pair also agreed
+  # with each other, both flat, both returning %{} for the nested `story`.
+  #
+  # This reads the EMITTED JSON SCHEMA instead — the document a runner actually vendors — so
+  # it shares no pattern with the struct walk. The difference is not cosmetic: JSON spells a
+  # nullable string `["string", "null"]` rather than carrying a `nullable:` field, so a walker
+  # that matches `"string"` alone reports `html_url` as unbounded while the contract publishes
+  # its 500. The struct walk cannot make that mistake and this one can. That is what a second
+  # reading is for, and it cost one wrong answer to find out.
+  defp declared_fields(props) when is_map(props) do
+    for {name, sub} <- props,
+        bounds = declared_bounds(sub),
+        bounds != %{},
+        into: %{},
+        do: {name, bounds}
   end
 
-  defp declared_bounds(%OpenApiSpex.Schema{type: :string, maxLength: n}) when is_integer(n),
-    do: %{"max_length" => n}
+  defp declared_bounds(%{} = schema) do
+    case json_type(schema) do
+      "array" -> declared_array_bounds(schema)
+      "string" -> declared_string_bounds(schema)
+      "object" -> declared_object_bounds(schema)
+      _ -> %{}
+    end
+  end
 
-  defp declared_bounds(%OpenApiSpex.Schema{type: :object, properties: props})
-       when is_map(props) do
-    nested =
-      for {name, sub} <- props,
-          bounds = declared_bounds(sub),
-          bounds != %{},
-          into: %{},
-          do: {Atom.to_string(name), bounds}
+  defp declared_bounds(_), do: %{}
 
+  # `["string", "null"]` is how the emitted document spells a nullable field.
+  defp json_type(%{"type" => types}) when is_list(types), do: Enum.find(types, &(&1 != "null"))
+  defp json_type(%{"type" => type}), do: type
+  defp json_type(%{}), do: nil
+
+  defp declared_array_bounds(%{"maxItems" => n} = schema),
+    do: Map.merge(%{"max_items" => n}, declared_item_bounds(Map.get(schema, "items")))
+
+  defp declared_array_bounds(%{}), do: %{}
+
+  defp declared_string_bounds(%{"maxLength" => n}), do: %{"max_length" => n}
+  defp declared_string_bounds(%{}), do: %{}
+
+  defp declared_object_bounds(%{"properties" => props}) do
+    nested = declared_fields(props)
     if nested == %{}, do: %{}, else: %{"fields" => nested}
   end
 
-  defp declared_bounds(%OpenApiSpex.Schema{}), do: %{}
+  defp declared_object_bounds(%{}), do: %{}
 
-  defp declared_item_bounds(%OpenApiSpex.Schema{type: :string, maxLength: n}) when is_integer(n),
-    do: %{"max_item_length" => n}
+  # `item_fields`, never `fields`: an array publishes the bounds of its ELEMENTS, and reusing
+  # the object key for that is the ambiguity 1.8.0 removes.
+  defp declared_item_bounds(%{} = item) do
+    case json_type(item) do
+      "string" -> declared_string_item_bounds(item)
+      "object" -> declared_object_item_bounds(item)
+      _ -> %{}
+    end
+  end
 
-  defp declared_item_bounds(%OpenApiSpex.Schema{type: :object} = item), do: declared_bounds(item)
-  defp declared_item_bounds(%OpenApiSpex.Schema{}), do: %{}
+  defp declared_item_bounds(_), do: %{}
+
+  defp declared_string_item_bounds(%{"maxLength" => n}), do: %{"max_item_length" => n}
+  defp declared_string_item_bounds(%{}), do: %{}
+
+  defp declared_object_item_bounds(%{"properties" => props}) do
+    nested = declared_fields(props)
+    if nested == %{}, do: %{}, else: %{"item_fields" => nested}
+  end
+
+  defp declared_object_item_bounds(%{}), do: %{}
 
   defp string(length), do: String.duplicate("a", length)
 

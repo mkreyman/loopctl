@@ -37,7 +37,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.5.0) an implement dispatch carries a `RunnerStory`, and a runner may refuse a kind with `kind_not_supported` | | | | |
   | (1.6.0) a runner DECLARES the kinds it runs on join (`RunnerJoin.kinds`); where present it is the only thing consulted | | | | |
   | (1.7.0) a `triage` dispatch carries a `RunnerTriage` whose `untrusted` field is the reporter's own words, already fenced | | | | |
-  | (1.8.0) `x-connection.limits` publishes every bounded field at every depth, so a `fields` entry may now be a nested map | | | | |
+  | (1.8.0) `x-connection.limits` publishes every bounded field at every depth. A `fields` entry may now be a nested map, and an ARRAY of objects publishes its element bounds under `item_fields` — never `fields`, which always means the bounds of the object you are looking at | | | | |
 
   ## The story object (since 1.5.0)
 
@@ -351,10 +351,13 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
     defp fields(%Schema{}), do: %{}
 
-    # EVERY BOUNDED FIELD AT EVERY DEPTH.
-    defp field_bounds(%Schema{type: :array, maxItems: items, items: %Schema{} = item})
-         when is_integer(items) do
-      Map.merge(%{"max_items" => items}, item_bounds(item))
+    # EVERY BOUNDED FIELD AT EVERY DEPTH, and "every depth" is now something the code does
+    # rather than something this comment claims. It matched `items: %Schema{}`, so an array
+    # that declares `maxItems` and leaves its items unstated published NOTHING — `max_items`
+    # included. A cap that binds, dropped because the thing inside it had no bound of its own,
+    # is the same "reads as complete, is not" defect this module was extracted to end.
+    defp field_bounds(%Schema{type: :array, maxItems: items} = schema) when is_integer(items) do
+      Map.merge(%{"max_items" => items}, item_bounds(schema.items))
     end
 
     defp field_bounds(%Schema{type: :string, maxLength: length}) when is_integer(length),
@@ -367,14 +370,38 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
     defp field_bounds(%Schema{}), do: %{}
 
-    # An array's items are a string (its length is the bound a caller needs) or an object
-    # (its own fields are). `max_item_length` keeps the name the export already published for
-    # the string case, so a runner reading the old table still finds what it read before.
+    # AN ARRAY'S BOUNDS ARE PER-ITEM AND THE KEY MUST SAY SO. `max_item_length` already did,
+    # for the string case, and it is kept unchanged so a runner reading the old table still
+    # finds what it read before. The object case did NOT: it returned `field_bounds/1`'s
+    # `"fields"`, the same key an OBJECT property publishes — so `contradicts` came out as
+    # `{"max_items": 3, "fields": {"why": {"max_length": 200}}}` where `fields` means "each
+    # item's fields", while `story` published `{"fields": {...}}` where it means "this
+    # object's fields". One recursive reader cannot tell them apart, and the one that guesses
+    # wrong applies a per-element cap to a three-element array and only finds out when a real
+    # verdict is refused. `item_fields` removes the guess. Nothing published before 1.8.0
+    # carried a nested map at all — `RunnerStory` is flat — so this renames nothing a runner
+    # has vendored.
     defp item_bounds(%Schema{type: :string, maxLength: length}) when is_integer(length),
       do: %{"max_item_length" => length}
 
-    defp item_bounds(%Schema{type: :object} = item), do: field_bounds(item)
+    defp item_bounds(%Schema{type: :object, properties: props}) when is_map(props) do
+      nested = fields(%Schema{type: :object, properties: props})
+      if nested == %{}, do: %{}, else: %{"item_fields" => nested}
+    end
+
+    # AN ARRAY OF ARRAYS HAS NO AGREED WIRE SHAPE, and inventing one here would put a key
+    # nobody decided on into a contract runners vendor. No such field exists today. It
+    # REFUSES rather than dropping the inner bounds silently, because silent dropping is
+    # exactly what shipped last time: the build fails the moment such a field is added, and
+    # naming its published shape becomes a contract decision instead of an accident.
+    defp item_bounds(%Schema{type: :array} = item) do
+      raise ArgumentError,
+            "an array of arrays has no published limits shape; name one before adding " <>
+              "this field: #{inspect(item)}"
+    end
+
     defp item_bounds(%Schema{}), do: %{}
+    defp item_bounds(nil), do: %{}
   end
 
   defmodule Kinds do
@@ -652,15 +679,25 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     # a reason no declared bound could explain.
     #
     # 5_000 is measured against every other field of this object at its own maximum, IN BMP
-    # TEXT: 38_364 bytes against the 48_000 cap. That is the worst ORDINARY case and not the
-    # worst case simply — the same object in astral characters is 75_864, because the byte
+    # TEXT: 46_074 bytes against the 48_000 cap. That is the worst ORDINARY case and not the
+    # worst case simply — the same object in astral characters is 91_290, because the byte
     # rule charges double outside the BMP.
+    #
+    # Those two numbers were 38_364 and 75_864 for one round, and the error is worth naming
+    # because it is arithmetic anyone can redo: 38_364 is this object measured with
+    # `RunnerTriageVerdict`'s `escalation_reasons` bounds (5 x 150) instead of its OWN
+    # (20 x 100), and 46_074 - 12_282 + 4_572 = 38_364 exactly. It survived because no test
+    # named a figure. It matters because the headroom it reports is 9_636 bytes where there
+    # are 1_926 — about 321 characters, not 1_606 — so a later session sizing this cap off
+    # this block raises it back toward 6_000 and reinstates the defect round 3 removed.
     #
     # The caps are not sized for that, for the reason `RunnerTriageVerdict` states at length:
     # doing so would halve what a reporter may write to defend a case no report produces, and
     # the byte rule is already a worst-case-encoder bound. What holds instead is that the
     # OBJECT CAP binds and `Loopctl.Delivery.TriagePayload` checks it — a report that does not
-    # fit is escalated to a human rather than cut. Both figures are pinned by tests.
+    # fit is escalated to a human rather than cut. BOTH FIGURES ARE ASSERTED BY NAME in
+    # `runner_contract_test.exs`, not merely bounded by `<= cap` and `> cap` — an inequality
+    # cannot tell a wrong figure from a right one, which is how the pair above drifted.
     #
     # The six-times charge is deliberate worst-case-encoder accounting, so an ASCII report of
     # this length costs about 5 KB on the wire and the frame is nowhere near full. That
@@ -993,14 +1030,16 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     # a limit, is not what binds" defect one level up again.
     #
     # Measured at these values, in BMP text: a verdict with every field at its maximum is
-    # 45_880 against the 48_000 cap. A test asserts it FITS — `bytes <= cap` — which is the
-    # claim that matters and is weaker than naming a figure; the figure is here so a later
-    # reader can tell whether the headroom has been spent, and is not what the suite checks.
+    # 45_880 against the 48_000 cap. A test asserts BOTH — that it fits, which is the claim
+    # that matters, and the figure itself, so a reader can tell whether the headroom has been
+    # spent and a wrong number cannot sit here green. Leaving the figure unasserted is what
+    # let this object's triage twin carry a figure 7_710 bytes out for a round.
     #
     # The headroom is 2_120 bytes and it is BMP-ONLY. `ByteRule` charges 12 for a character
     # outside the Basic Multilingual Plane against 6 inside, so about 354 astral characters
     # spend it — a handful of emoji do not, a title written in an astral script does. A
-    # separate test pins the astral figure rather than leaving it to be discovered.
+    # separate test asserts the astral figure BY NAME (89_584), rather than only that it
+    # exceeds the cap — an inequality holds just as well for a number that is wrong.
     @max_evidence 6
     @max_evidence_length 150
     @max_missing 5

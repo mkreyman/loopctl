@@ -1111,7 +1111,7 @@
       "triage_verdict": {
         "fields": {
           "contradicts": {
-            "fields": {
+            "item_fields": {
               "ref": {
                 "max_length": 100
               },
