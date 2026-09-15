@@ -159,12 +159,21 @@ defmodule LoopctlWeb.DispatchPlacementController do
          }},
       403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
-      409 => {"Not placeable", "application/json", Schemas.ErrorResponse},
-      422 =>
-        {"Validation error, or `story_not_accepted` — the story object is built by loopctl " <>
-           "from its own records and may not be supplied by a caller", "application/json",
+      409 =>
+        {"Not placeable, or `implementer_dispatch_unknown` — a recorded dispatch_id whose " <>
+           "story object cannot be rebuilt for the re-send", "application/json",
          Schemas.ErrorResponse},
-      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+      422 =>
+        {"Validation error; `story_not_accepted` — the story object is built by loopctl from " <>
+           "its own records and may not be supplied by a caller; or " <>
+           "`story_not_dispatchable` — the story exceeds a cap the runner contract declares " <>
+           "and HAS BEEN ESCALATED to a human, with the claim released and nothing " <>
+           "dispatched", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      500 =>
+        {"`story_escalation_failed` — the story is neither dispatchable nor parked, so " <>
+           "nothing is on a runner and no human has it either", "application/json",
+         Schemas.ErrorResponse}
     }
   )
 
@@ -367,6 +376,51 @@ defmodule LoopctlWeb.DispatchPlacementController do
           "claim was released. Retry when a slot frees."
     })
   end
+
+  # THE STORY WAS TOO BIG FOR THE CONTRACT AND A HUMAN NOW HAS IT. An ordinary outcome of this
+  # endpoint since `place/4` builds the story object: the story is escalated, the claim is
+  # released, and nothing is on a runner. Rendered here because the shared fallback matches
+  # `{:error, reason} when is_atom(reason)` and a TUPLE matched no clause at all — the same
+  # FunctionClauseError this file already records for `{:invalid, messages}`, which would have
+  # answered a 500 and a crash log to a caller whose story is sitting in front of a person.
+  defp refuse(conn, {:story_not_dispatchable, violations}) do
+    error(conn, 422, "story_not_dispatchable", %{
+      message:
+        "The story exceeds a cap the runner contract declares, so it was ESCALATED to a " <>
+          "human rather than truncated — a dropped acceptance criterion is a story built to " <>
+          "the wrong spec. The claim was released and nothing was dispatched. Shorten the " <>
+          "story and it becomes dispatchable again.",
+      violations: Enum.take(violations, 10)
+    })
+  end
+
+  # NEITHER DISPATCHABLE NOR PARKED, which is the outcome nothing downstream picks up. 500 and
+  # not 422: the story is undersized for nobody's fault, the escalation loopctl tried to write
+  # failed, and the caller cannot fix either by changing the request.
+  defp refuse(conn, {:escalation_failed, reason, violations}) do
+    error(conn, 500, "story_escalation_failed", %{
+      message:
+        "The story is not dispatchable AND could not be escalated, so it is in neither " <>
+          "place: nothing is on a runner and no human has been given it. This needs an " <>
+          "operator.",
+      escalation_error: inspect(reason),
+      violations: Enum.take(violations, 10)
+    })
+  end
+
+  # A RESUME WHOSE STORY OBJECT CANNOT BE REBUILT, refused rather than pushed without one: a
+  # story-less implement dispatch is refused by the runner and leaves this endpoint answering
+  # 201 as though work had been placed.
+  defp refuse(conn, :implementer_dispatch_unknown) do
+    error(conn, 409, "implementer_dispatch_unknown", %{
+      message:
+        "This dispatch_id is recorded, but the story's implementer dispatch cannot be read, " <>
+          "so the story object cannot be rebuilt for the re-send. Place the story under a " <>
+          "NEW dispatch_id."
+    })
+  end
+
+  defp refuse(conn, :story_not_accepted), do: refuse_story(conn)
 
   defp refuse(conn, :capacity_busy) do
     error(conn, 429, "capacity_busy", %{

@@ -369,6 +369,74 @@ defmodule Loopctl.Delivery.PlacementTest do
       assert {:error, :stale_claim_epoch} = place(ctx, payload)
     end
 
+    test "a RESUME rebuilds the story object, and refuses rather than re-sending without one",
+         ctx do
+      %{runner: runner, story: story, channel: channel} = ctx
+      payload = dispatch_payload(story)
+
+      assert {:ok, _first} = place(ctx, payload)
+      assert_push "dispatch", _pushed, @reply_timeout
+
+      # The retry path pushed the CALLER's map, which since `no_caller_story/1` can never
+      # carry a story — so a re-send (a lost HTTP response, a failed broadcast, a dropped
+      # frame; each leaves the ledger row at `sent`, which is what routes a re-send here) put
+      # an implement dispatch with no story on the wire while this function answered `{:ok,
+      # ...}` as though work had been placed. That is the very defect this change exists to
+      # fix, left open on the ordinary retry path.
+      #
+      # Proven by making the STORY undispatchable between the two calls: the resume can only
+      # answer this if it actually built the object. Without the rebuild it reaches the push
+      # and answers `:runner_not_connected` instead, which is what the test below asserts for
+      # a story that is still fine.
+      disconnect(channel, runner)
+      unboxed(fn -> oversize!(runner.tenant_id, story.id) end)
+
+      assert {:error, {:story_not_dispatchable, [_ | _]}} = place(ctx, payload)
+    end
+
+    test "a resume whose implementer dispatch cannot be read is refused, not sent bare", ctx do
+      %{runner: runner, story: story, channel: channel} = ctx
+      payload = dispatch_payload(story)
+
+      assert {:ok, _first} = place(ctx, payload)
+      assert_push "dispatch", _pushed, @reply_timeout
+
+      # The escalation a refusal writes is a CHAINED transition, so the rebuild needs the
+      # lineage of the dispatch the story records as its implementer. Unreadable, the honest
+      # answer is a refusal: pushing without the story object is the defect, and inventing an
+      # empty lineage would attribute an escalation to nobody.
+      disconnect(channel, runner)
+
+      # NIL, which is the reachable shape: the column is nullable, and a story claimed before
+      # dispatch lineage existed — or by any path that does not mint one — carries none. An id
+      # pointing at a MISSING row is not reachable at all while
+      # `stories_implementer_dispatch_id_fkey` holds, which is why the clause covering it is
+      # defensive and is documented as such rather than tested here.
+      unboxed(fn -> forget_implementer!(runner.tenant_id, story.id) end)
+
+      assert {:error, :implementer_dispatch_unknown} = place(ctx, payload)
+    end
+
+    test "an upper-case story_id is placed, and the object matches the id on the wire", ctx do
+      %{runner: runner, story: story} = ctx
+      shouty = String.upcase(story.id)
+      payload = Map.put(dispatch_payload(story), "story_id", shouty)
+
+      # `Ecto.UUID.cast/1` DOWN-CASES, so the claim uses the canonical id while the caller's
+      # map keeps its own spelling — and the object loopctl builds carries the ROW's id, which
+      # the contract then compares against the dispatch's `story_id`. Round 1 of this PR's
+      # review read that as a regression; it is not, and this test is the disproof rather than
+      # a fix: `RunnerContract.cast_dispatch/1` normalises `story_id` before the comparison,
+      # and `Runners.dispatch/3` broadcasts the CAST map, so the frame carries the canonical
+      # id too. Kept because nothing else pinned it.
+      assert {:ok, _placed} = place(ctx, payload)
+      assert_push "dispatch", pushed, @reply_timeout
+
+      assert pushed.story_id == story.id
+      assert pushed.story.id == story.id
+      assert unboxed(fn -> Stages.get(runner.tenant_id, story.id) end).stage == :claimed
+    end
+
     test "a re-sent dispatch_id claims nothing a second time, and releases nothing", ctx do
       %{runner: runner, story: story, channel: channel} = ctx
       payload = dispatch_payload(story)
@@ -657,6 +725,14 @@ defmodule Loopctl.Delivery.PlacementTest do
             %{"id" => "AC-1", "description" => "The monthly total equals the sum of its visits"}
           ]
         ]
+      )
+  end
+
+  defp forget_implementer!(tenant_id, story_id) do
+    {1, _} =
+      AdminRepo.update_all(
+        from(s in Story, where: s.id == ^story_id and s.tenant_id == ^tenant_id),
+        set: [implementer_dispatch_id: nil]
       )
   end
 

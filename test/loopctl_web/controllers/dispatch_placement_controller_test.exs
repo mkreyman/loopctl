@@ -158,6 +158,49 @@ defmodule LoopctlWeb.DispatchPlacementControllerTest do
         assert Jason.decode!(conn.resp_body)["error"]["code"] == Atom.to_string(reason)
       end
     end
+
+    test "the BUILDER's refusals render too, and they are tuples" do
+      # The shape the fallback cannot render at all. Its catch-all is
+      # `{:error, reason} when is_atom(reason)`, so a TUPLE matches no clause and the request
+      # raises a FunctionClauseError — a 500 and a crash log, for an outcome that is now
+      # ORDINARY: `place/4` builds the story object, and a story past a contract cap is
+      # escalated with the claim released. The caller would have got a server error while a
+      # human quietly acquired the story.
+      violations = ["the story is 51000 bytes under the byte rule, over 48000"]
+
+      conn =
+        DispatchPlacementController.render_refusal(
+          Phoenix.ConnTest.build_conn(),
+          {:story_not_dispatchable, violations}
+        )
+
+      assert conn.status == 422
+      body = Jason.decode!(conn.resp_body)
+      assert body["error"]["code"] == "story_not_dispatchable"
+      assert body["error"]["violations"] == violations
+
+      # NEITHER dispatchable NOR parked: nothing is on a runner and nobody has been told. 500
+      # is the honest answer — the caller cannot fix it by changing the request.
+      failed =
+        DispatchPlacementController.render_refusal(
+          Phoenix.ConnTest.build_conn(),
+          {:escalation_failed, :busy, violations}
+        )
+
+      assert failed.status == 500
+      assert Jason.decode!(failed.resp_body)["error"]["code"] == "story_escalation_failed"
+
+      # And the re-send whose story object cannot be rebuilt, which must refuse rather than
+      # put a story-less dispatch on the wire and answer 201.
+      unknown =
+        DispatchPlacementController.render_refusal(
+          Phoenix.ConnTest.build_conn(),
+          :implementer_dispatch_unknown
+        )
+
+      assert unknown.status == 409
+      assert Jason.decode!(unknown.resp_body)["error"]["code"] == "implementer_dispatch_unknown"
+    end
   end
 
   describe "the role gate" do
