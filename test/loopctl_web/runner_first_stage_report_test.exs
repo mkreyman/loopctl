@@ -17,8 +17,15 @@ defmodule LoopctlWeb.RunnerFirstStageReportTest do
   path writes the field this reads, and which test fails if that write is deleted?
 
   `async: false` and COMMITTED, for the reason `Loopctl.Delivery.PlacementTest` gives: a
-  placement writes through both repos and the channel process cannot see a sandbox
-  connection's uncommitted rows.
+  placement writes through BOTH repos — the claim on `AdminRepo`, the transition on
+  `Loopctl.Repo` — and those two sandbox connections cannot see each other's uncommitted work.
+
+  What is NOT the reason, because a maintainer acting on it would break the file: the channel
+  process CAN see this test's uncommitted rows. `Loopctl.DataCase` starts every sandbox owner
+  with `shared: not tags[:async]`, so under `async: false` the channel runs on exactly this
+  connection — which is why the stage assertion below reads the SANDBOX row and not the
+  committed one, and why rewriting it as the `unboxed(...)` read `PlacementTest` uses would
+  report a working write as a failure.
   """
 
   use LoopctlWeb.ChannelCase, async: false
@@ -96,6 +103,13 @@ defmodule LoopctlWeb.RunnerFirstStageReportTest do
     test "and the SAME report is refused when nothing claimed the story", ctx do
       %{channel: channel, runner: runner, story: story} = ctx
 
+      # BOUND ONCE, off the STORY, because the story's epoch is what `Stages.advance/4` fences
+      # on — and `RunnerStages.apply/3` compares the message against the DISPATCH record before
+      # the row is consulted at all. Re-read per message, a lease reclaim landing mid-test
+      # would make this control fail with `stale_claim_epoch`: a refusal, but not the one it
+      # names.
+      epoch = story_epoch(ctx)
+
       # The negative control, and the whole reason the positive one means something. This is
       # the production RPC path the first run took: `Runners.dispatch/3` pushes and claims
       # NOTHING — its own moduledoc says "placement and claiming are the caller's" — so the
@@ -106,24 +120,27 @@ defmodule LoopctlWeb.RunnerFirstStageReportTest do
       payload =
         build(:runner_dispatch, %{
           "story_id" => story.id,
-          "claim_epoch" => claim_epoch(ctx),
+          "claim_epoch" => epoch,
           "repo" => @repo
         })
 
       :ok = unboxed(fn -> Loopctl.Runners.dispatch(runner.tenant_id, runner.id, payload) end)
       assert_push "dispatch", _pushed, @reply_timeout
-      accept!(channel, payload["dispatch_id"], claim_epoch(ctx))
+      accept!(channel, payload["dispatch_id"], epoch)
 
       ref =
         push(channel, "stage", %{
           "dispatch_id" => payload["dispatch_id"],
-          "claim_epoch" => claim_epoch(ctx),
+          "claim_epoch" => epoch,
           "from" => "claimed",
           "to" => "worktree"
         })
 
+      # THE REASON IS THE WHOLE ASSERTION, and there is deliberately no row read beside it: the
+      # control writes nothing, so `queued` is equally true of the committed row and of the
+      # sandbox one, and asserting it would look like evidence the row was inspected while
+      # being true either way.
       assert_reply ref, :error, %{reason: "stale_stage"}, @reply_timeout
-      assert sandboxed_stage(story) == :queued
     end
   end
 
@@ -176,8 +193,11 @@ defmodule LoopctlWeb.RunnerFirstStageReportTest do
     row.stage
   end
 
-  defp claim_epoch(ctx) do
-    unboxed(fn -> Stages.get(ctx.tenant.id, ctx.story.id) end).claim_epoch
+  # The STORY's epoch, which is what every transition is fenced on. The stage row carries one
+  # too and they are in lockstep here, but a reclaim moves the story's without rebinding the
+  # row — and reading the row's would then fence a message against a number nothing checks.
+  defp story_epoch(ctx) do
+    unboxed(fn -> AdminRepo.get!(Loopctl.WorkBreakdown.Story, ctx.story.id) end).claim_epoch
   end
 
   defp contract_and_queue(tenant_id, story) do
