@@ -44,6 +44,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.9.3) `x-connection.triage_gating_reasons` publishes the `escalation_reasons` entries the control-side gate matches as whole strings, while the field itself stays free-form prose — and an escalate verdict must now carry at least one entry that is NOT a code, because a classification is not words a person can act on. RE-VENDOR: a copy taken at 1.9.2 has no such key to validate against | | | | |
   | (1.10.0) TRIAGE IS DISPATCHABLE. `x-connection.dispatchable_kinds` is `triage` and `implement`, so loopctl sends a `triage` dispatch for a story it has just detected. Only a runner that DECLARES `triage` on join receives one — `implied_by_silence` stays `implement` alone | | | | |
   | (1.11.0) a `stage` refused `stale_stage` carries the ROW — `stage`, `claim_epoch`, `lock_version`, `attempts`, `effects`, the same shape the ok ack sends. The remedy this code prescribes is to re-read the story and send the transition that applies, and there is no endpoint to read it from: the reply IS the read. A runner holding a `from` fallback list can delete it. `x-connection.error_fields` publishes what EVERY refusal carries beside its `reason`, per event and complete, and `permanent_error_conditions` now names the one state in which `stale_stage` is permanent for `stage`. RE-VENDOR: a copy taken at 1.10.0 has neither key, and the version string is the only signal that it is missing them | | | | |
+  | (1.12.0) A SECURITY CORRECTION TO WHAT THIS CONTRACT PROMISES. `RunnerTriageVerdict` said loopctl "fences these strings wherever they later reach a prompt — `story` included". It does not and never did: a drafted story becomes loopctl's own story row and reaches a runner as `RunnerStory`, typed and unfenced. What loopctl DOES do is escape invisible characters and SCREEN the draft with its injection detector, escalating a flagged one to a human instead of queueing it, so it never reaches an implement dispatch. RE-VENDOR and re-read: a copy taken at 1.11.0 tells you the implement path is fenced | | | | |
 
   ## The story object (since 1.5.0)
 
@@ -307,7 +308,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   alias Loopctl.DeliveryGates.GateA
   alias OpenApiSpex.Schema
 
-  @version "1.11.0"
+  @version "1.12.0"
   @major 1
 
   defmodule ByteRule do
@@ -1182,9 +1183,17 @@ defmodule Loopctl.ApiSpec.RunnerContract do
         description:
           "What a `triage` session returns (since 1.7.0). SESSION-AUTHORED AND UNTRUSTED: " <>
             "it was composed by a session that had just read reporter text, so loopctl " <>
-            "records and bounds it, never executes it, and fences these strings wherever " <>
-            "they later reach a prompt — `story` included, because those fields were " <>
-            "written by that same session. `story` is REQUIRED when `outcome` is `story` " <>
+            "records and bounds it and never executes it. WHAT LOOPCTL DOES WITH `story` IS " <>
+            "NOT A FENCE, and this description said it was until 1.12.0: a drafted title, " <>
+            "description and criterion are escaped for invisible characters, SCREENED by the " <>
+            "injection detector, and then stored as loopctl's own story row - which " <>
+            "`RunnerStory` later carries as ordinary typed fields, with no fence and no " <>
+            "marker. A draft the screen flags is escalated to a human instead of queued, so " <>
+            "it never reaches an implement dispatch at all; a draft that passes is " <>
+            "indistinguishable from a story a person wrote, and a runner composing its " <>
+            "prompt should treat `RunnerStory` as content loopctl vouches for rather than as " <>
+            "fenced data. Contrast `RunnerTriage.untrusted`, which IS fenced and says so. " <>
+            "`story` is REQUIRED when `outcome` is `story` " <>
             "and forbidden otherwise, the same shape rule a dispatch uses for `story` and " <>
             "`triage`; a verdict that says `story` and carries none has moved the work " <>
             "rather than done it. `confidence` is an enum and not a number on purpose: " <>
