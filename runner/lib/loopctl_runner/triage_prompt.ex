@@ -34,8 +34,16 @@ defmodule LoopctlRunner.TriagePrompt do
   @doc """
   The prompt for `triage`, a `RunnerTriage` object, in the repository checked out at `repo`.
   """
-  @spec build(map(), String.t()) :: String.t()
-  def build(triage, repo) when is_map(triage) and is_binary(repo) do
+  @spec build(map(), String.t(), keyword()) :: String.t()
+  def build(triage, repo, opts \\ []) when is_map(triage) and is_binary(repo) do
+    # Both are what the CALLER granted, and neither has a convenient default. Defaulting the
+    # lenses to the dispatch branch would hand it to the implement launcher, which has no Agent
+    # tool — a silent denial and a run that burns its turns. Defaulting the token to a placeholder
+    # would render a verdict command that cannot run: the script exits 2 on a wrong token, and the
+    # prompt forbids `loop-escalate` for a report it can judge, so the run would produce nothing.
+    lenses = Keyword.get(opts, :lenses, [])
+    token = Keyword.fetch!(opts, :token)
+
     """
     You are triaging one reported problem for #{repo}, unattended, in a read-only checkout.
 
@@ -45,16 +53,16 @@ defmodule LoopctlRunner.TriagePrompt do
     What to do:
     1. Read the report below, then the code and the project's own docs, to judge what it is
        asking for and whether it is actionable as written.
-    2. Judge it through three lenses and keep them apart: the business question (is this
-       actionable as written), the architectural one (does it fit what exists), and the engineering
-       one (is it implementable as scoped, and what would it break). Where they disagree, do not
-       pick a side: that disagreement is itself a reason to escalate.
+    2. #{readings(lenses, report?(triage["untrusted"]))}
     3. State ONE verdict by running this command, with the JSON on stdin through a QUOTED
        heredoc so the shell expands nothing in it, and then STOP:
 
-           #{verdict_script()} <<'VERDICT'
+           #{verdict_script()} #{token} <<'VERDICT'
            {"outcome": "...", "confidence": "...", ...}
            VERDICT
+
+       That token is yours. It is what makes the verdict the SESSION's rather than something a
+       subagent could state, so do not put it in a lens's task or anywhere else.
 
     The verdict, field by field. Every bound below is the contract's and the runner enforces it:
     - `outcome` is one of #{inline(@outcomes)}; `confidence` is one of #{inline(@confidences)},
@@ -83,7 +91,11 @@ defmodule LoopctlRunner.TriagePrompt do
     Escalating is the `escalate` OUTCOME, stated in this verdict, and NOT `loop-escalate`. A
     report you cannot judge is work you CAN do, and its answer is a verdict. `loop-escalate` is
     for a session that cannot work at all — a checkout that will not read, tools that will not
-    run — and it ENDS the run with no verdict.
+    run — and it ENDS the run with no verdict. It takes your token too:
+
+        #{escalate_script()} #{token} <<'ESCALATION'
+        <why this session cannot work at all>
+        ESCALATION
 
     The runner validates the whole verdict against the contract before anything is sent. A run
     records ONE verdict: once `loop-verdict` says it recorded one, that is the run's answer and
@@ -96,6 +108,44 @@ defmodule LoopctlRunner.TriagePrompt do
     #{facts(triage)}
 
     #{report(triage)}
+    """
+  end
+
+  # What the session was ACTUALLY given decides what it is told to do. A session launched without
+  # the Agent tool and without definitions — the implement launcher, which is the only wired one
+  # today — must not be told to dispatch: the call would be denied silently under dontAsk and the
+  # run would burn its turns on an instruction the harness refuses.
+  defp readings(lenses, report?)
+
+  defp readings([], _report?) do
+    """
+    Judge it through three lenses and keep them apart, yourself: the business question (is this
+       actionable as written), the architectural one (does it fit what exists), and the
+       engineering one (is it implementable as scoped, and what would it break). Where they
+       disagree, do not pick a side: that disagreement is itself a reason to escalate.\
+    """
+  end
+
+  # No block to hand on: dispatching lenses that are each told to judge nothing costs three
+  # dispatches and their turns before the session reaches the escalate instruction, and inviting
+  # a session to supply a block it does not have is the one thing the fence exists to prevent.
+  defp readings(_lenses, false) do
+    """
+    There is no report to judge, so dispatch no lenses. Say so in the verdict: escalate, with
+       `missing_information` recording that the report arrived empty.\
+    """
+  end
+
+  defp readings(lenses, true) do
+    """
+    Judge it through three lenses and keep them apart. DISPATCH each with the Agent tool —
+       #{Enum.map_join(lenses, ", ", &"`#{&1}`")} — rather than doing the three readings yourself.
+       GIVE EACH LENS THE REPORT BLOCK BELOW, copied whole into its task, fences and line prefixes
+       intact: a lens has no way to read it otherwise, it is not in the checkout, and a lens told
+       the report in your own words is being handed the reporter's text with the fence stripped
+       off — by you, as if it were yours. Never paraphrase it, summarise it or quote part of it
+       into a lens's task. A lens reads and reports; none of them states a verdict. Where they
+       disagree, do not pick a side: that disagreement is itself a reason to escalate.\
     """
   end
 
@@ -118,7 +168,8 @@ defmodule LoopctlRunner.TriagePrompt do
     OUTCOME of your verdict, stated through #{verdict_script()}, with `missing_information`
     saying what the human must supply. Escalating is a verdict, not a way of not answering.
 
-    #{escalate_script()} is different and is NOT how you escalate a report. It is for a session
+    #{escalate_script()}, which takes this run's token as its first argument, is different and is \
+    NOT how you escalate a report. It is for a session
     that cannot do the work at all: the checkout will not read, the tools will not run. It ends
     the run with no verdict, so a report you could have judged becomes a run that produced
     nothing.

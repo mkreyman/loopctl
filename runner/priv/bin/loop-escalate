@@ -22,6 +22,21 @@ set -u
 
 : "${LOOP_RUN_DIR:?loop-escalate only works inside a loop session}"
 
+# A run that mints an escalate token requires it as the FIRST argument — the triage runs do,
+# because their sessions dispatch subagents and an escalation ENDS the run with no verdict. That
+# is the same "a subagent decides the run's outcome" hole the verdict token closes, on the branch
+# whose outcome is nothing at all. A run without the file (every implement run) is unchanged:
+# escalation stays a command any part of that session may call.
+expected=$(cat "$LOOP_RUN_DIR/escalate.token" 2> /dev/null || true)
+
+if [ -n "$expected" ]; then
+    if [ "${1:-}" != "$expected" ]; then
+        echo "escalate as: loop-escalate <the token from your prompt> <<'ESCALATION' ... ESCALATION" >&2
+        exit 2
+    fi
+    shift
+fi
+
 if [ ! -t 0 ]; then
     reason=$(cat)
 else

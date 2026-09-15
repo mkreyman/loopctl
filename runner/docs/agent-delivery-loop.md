@@ -314,7 +314,9 @@ model wanted to ask: no tool call is attempted, so neither `PreToolUse` nor `Per
 sees anything (measured on 2.1.270, KB `16d4ff67`). The runner therefore:
 
 - ships `priv/bin/loop-escalate` and pre-allows exactly that absolute path
-  (`--allowedTools "Bash(<path>:*)"`, verified to run under `--permission-prompts none`);
+  (`--allowedTools "Bash(<path>:*)"`, verified to run under `--permission-prompts none`). A run
+  that mints an `escalate.token` requires it as the command's first argument; an implement run
+  mints none and is unchanged;
 - tells the session through `--append-system-prompt` to run it, with the decision and the reason,
   and stop, whenever a request is ambiguous, contradicts existing behaviour, removes deliberate
   behaviour, or needs a business call;
@@ -372,13 +374,28 @@ loopctl's destructive tools, with the machine's keys — and every plugin tool. 
 is therefore launched with `--tools Read,Edit,Write,Glob,Grep,Bash`, `--strict-mcp-config
 --mcp-config '{"mcpServers":{}}'` and `--disallowedTools "mcp__*"`, fixed in the runner and never
 widened by a story or the config. A triage session (§4) needs its read-only lenses as agents, so it
-gets its own contained set — the Agent tool limited to the triage lenses, still no MCP — designed
-with its contract, not this set widened. **The runner supplies those lens definitions itself, as
-`--agents` JSON.** It cannot inherit them: they are user-scope files (`~/.claude/agents/triage-*.md`)
-and `--setting-sources ""` is what keeps the operator's settings out, so a session launched
-without it has no definitions to dispatch and the trio silently degrades to one session doing all
-three lenses. Shipping them from the runner is also what makes the lens set a thing this repo
-tests rather than a thing a machine happens to have. **No MCP means no knowledge base**: a dispatched session
+gets its own contained set (`LoopctlRunner.TriageTools`) — designed with its contract, not this
+set widened: `Read`, `Glob`, `Grep`, `Agent`, and `Bash` for exactly TWO commands: the verdict
+and the escalate its system prompt names. No `Edit` and no `Write` at all, and still no MCP. Both
+commands take a per-run token that reaches the SESSION's prompt and nothing else, because
+`--agents` leaves the built-in agent types dispatchable and a subagent inherits the session's
+allow-rules — without it, a fourth reading could state the run's verdict or end the run. **The runner supplies the lens definitions itself, as
+`--agents` JSON**, because it cannot inherit them: they are user-scope files
+(`~/.claude/agents/triage-*.md`) and `--setting-sources ""` is what keeps the operator's settings
+out, so a session launched without them has nothing to dispatch and the trio silently degrades to
+one session doing all three readings. Shipping them from the runner also makes the lens set a
+thing this repo tests rather than a thing a machine happens to have, and the triage prompt NAMES
+them, since a session given lenses and not told to use them degrades the same way. Each lens
+DECLARES its own `tools` (`Read`, `Glob`, `Grep`): a definition without them inherits broad
+capability, and "a repository you may only read" in its prompt is prose rather than a boundary.
+
+Measured on 2026-09-15 against the real CLI: the three lenses load and dispatch, `Write` and
+`Edit` are absent from the session's tool list, a lens told to run a `Bash` command was denied and created
+nothing, and `general-purpose` — which declares no tool restriction of its own — was dispatched
+from a contained session, told to write with Write or `Bash touch`, and also created nothing. What does NOT hold is limiting the Agent tool to the lenses — the
+built-in agent types (`general-purpose`, `Explore`, `Plan`) stay listed beside them, and
+`--agents` adds rather than replaces. The containment is therefore the permission rules a
+subagent inherits and the tools each lens declares, never the agent list. **No MCP means no knowledge base**: a dispatched session
 never holds this machine's loopctl keys, so a lens that wants the KB gets what the runner puts in
 its prompt, or nothing. Its verdict leaves through `priv/bin/loop-verdict`, the one command it is
 pre-allowed, for the same reason escalation is a command: a verdict scraped out of a session's

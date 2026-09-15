@@ -115,12 +115,26 @@ defmodule LoopctlRunner.TriageVerdictTest do
     # beside the run dir and never in the shared system temp: `System.unique_integer/1` is unique
     # within one BEAM, so two concurrent suites — one per worktree, the fleet's normal shape —
     # would pick the same name there, and one would truncate or delete the other's stdin.
-    defp run(run_dir, input) do
-      System.cmd("sh", ["-c", "#{script()} < #{write_stdin(input)}"],
+    defp run(run_dir, input, args \\ :minted) do
+      args =
+        case args do
+          :minted ->
+            {:ok, token} = TriageVerdict.mint_token(run_dir)
+            [token]
+
+          given ->
+            given
+        end
+
+      System.cmd("sh", ["-c", "#{script()} #{Enum.join(args, " ")} < #{write_stdin(input)}"],
         env: [{"LOOP_RUN_DIR", run_dir}],
         stderr_to_stdout: true
       )
     end
+
+    # What the script left behind, beside the token the runner minted for the run.
+    defp leftovers(run_dir),
+      do: run_dir |> File.ls!() |> Enum.reject(&(&1 == "verdict.token")) |> Enum.sort()
 
     defp write_stdin(input) do
       path = Path.join(tmp_dir!("stdin"), "stdin")
@@ -154,7 +168,7 @@ defmodule LoopctlRunner.TriageVerdictTest do
       assert {out, 2} = run(run_dir, String.duplicate("x", 300_000))
       assert out =~ "over"
       refute File.exists?(TriageVerdict.file(run_dir))
-      assert File.ls!(run_dir) == []
+      assert leftovers(run_dir) == []
     end
 
     test "a runaway verdict of MULTIBYTE characters is refused, not truncated", %{
@@ -166,7 +180,7 @@ defmodule LoopctlRunner.TriageVerdictTest do
       assert {out, 2} = run(run_dir, String.duplicate("中", 200_000))
       assert out =~ "over"
       refute File.exists?(TriageVerdict.file(run_dir))
-      assert File.ls!(run_dir) == []
+      assert leftovers(run_dir) == []
     end
 
     test "the claim is atomic: a verdict appearing mid-read does not lose", %{run_dir: run_dir} do
@@ -179,9 +193,11 @@ defmodule LoopctlRunner.TriageVerdictTest do
       feeder =
         ~s(printf '%s' '{"outcome":"escalate",'; sleep 1; printf '%s' '"confidence":"high"}')
 
+      {:ok, token} = TriageVerdict.mint_token(run_dir)
+
       task =
         Task.async(fn ->
-          System.cmd("sh", ["-c", "(#{feeder}) | #{script()}"],
+          System.cmd("sh", ["-c", "(#{feeder}) | #{script()} #{token}"],
             env: [{"LOOP_RUN_DIR", run_dir}],
             stderr_to_stdout: true
           )
@@ -194,7 +210,7 @@ defmodule LoopctlRunner.TriageVerdictTest do
       assert out =~ "already stated"
       assert File.read!(TriageVerdict.file(run_dir)) == winner
       # And the loser left nothing behind.
-      assert Enum.reject(File.ls!(run_dir), &(&1 == "verdict.json")) == []
+      assert leftovers(run_dir) == ["verdict.json"]
     end
 
     test "an over-cap verdict cut at a newline is refused, not stored short", %{run_dir: run_dir} do
@@ -209,7 +225,7 @@ defmodule LoopctlRunner.TriageVerdictTest do
       assert {out, 2} = run(run_dir, over)
       assert out =~ "over"
       refute File.exists?(TriageVerdict.file(run_dir))
-      assert File.ls!(run_dir) == []
+      assert leftovers(run_dir) == []
     end
 
     test "bytes that are plainly not a verdict are refused, not called recorded", %{
@@ -220,7 +236,7 @@ defmodule LoopctlRunner.TriageVerdictTest do
       assert {out, 2} = run(run_dir, "I think this is a bug, probably")
       assert out =~ "not a JSON object"
       refute File.exists?(TriageVerdict.file(run_dir))
-      assert File.ls!(run_dir) == []
+      assert leftovers(run_dir) == []
     end
 
     test "a write that fails for another reason is not called an existing verdict", %{
@@ -235,9 +251,10 @@ defmodule LoopctlRunner.TriageVerdictTest do
       File.write!(stub, "#!/bin/sh\necho 'ln: hard links not supported' >&2\nexit 1\n")
       File.chmod!(stub, 0o755)
       stdin = write_stdin(~s({"outcome":"reject"}))
+      {:ok, token} = TriageVerdict.mint_token(run_dir)
 
       {out, code} =
-        System.cmd("sh", ["-c", "#{script()} < #{stdin}"],
+        System.cmd("sh", ["-c", "#{script()} #{token} < #{stdin}"],
           env: [{"LOOP_RUN_DIR", run_dir}, {"PATH", bin <> ":" <> System.get_env("PATH")}],
           stderr_to_stdout: true
         )
@@ -249,9 +266,99 @@ defmodule LoopctlRunner.TriageVerdictTest do
       refute File.exists?(TriageVerdict.file(run_dir))
     end
 
+    test "a verdict without this run's token is refused, and records nothing", %{run_dir: run_dir} do
+      # The session's allow-rule lets any subagent it dispatched run this script, and the verdict
+      # is first-write-wins — so without the token a fourth reading could fix the run's answer.
+      {:ok, token} = TriageVerdict.mint_token(run_dir)
+      body = Jason.encode!(verdict())
+
+      assert {out, 2} = run(run_dir, body, ["wrong-token"])
+      assert out =~ "the token from your prompt"
+      refute File.exists?(TriageVerdict.file(run_dir))
+
+      assert {out, 2} = run(run_dir, body, [])
+      assert out =~ "the token from your prompt"
+      refute File.exists?(TriageVerdict.file(run_dir))
+
+      assert {_, 0} = run(run_dir, body, [token])
+      assert File.read!(TriageVerdict.file(run_dir)) == body
+    end
+
+    test "a run with no token minted records nothing at all", %{run_dir: run_dir} do
+      assert {out, 2} = run(run_dir, Jason.encode!(verdict()), ["anything"])
+      assert out =~ "no verdict token"
+      refute File.exists?(TriageVerdict.file(run_dir))
+    end
+
+    test "an escalate token gates the command that ENDS a run, for runs that mint one" do
+      # A subagent that could run loop-escalate could decide the run's outcome as surely as one
+      # that could state a verdict — on the branch whose outcome is nothing at all.
+      run_dir = tmp_dir!("escalate-token")
+      escalate = Path.expand("../../priv/bin/loop-escalate", __DIR__)
+      {:ok, token} = TriageVerdict.mint_escalate_token(run_dir)
+      stdin = write_stdin("the checkout will not read")
+
+      {out, 2} =
+        System.cmd("sh", ["-c", "#{escalate} wrong-token < #{stdin}"],
+          env: [{"LOOP_RUN_DIR", run_dir}],
+          stderr_to_stdout: true
+        )
+
+      assert out =~ "the token from your prompt"
+      refute File.exists?(Path.join(run_dir, "escalations.ndjson"))
+
+      {_, 0} =
+        System.cmd("sh", ["-c", "#{escalate} #{token} < #{stdin}"],
+          env: [{"LOOP_RUN_DIR", run_dir}],
+          stderr_to_stdout: true
+        )
+
+      assert File.read!(Path.join(run_dir, "escalations.ndjson")) =~ "will not read"
+    end
+
+    test "a run that mints no escalate token escalates as before", %{run_dir: run_dir} do
+      # Every implement run: escalation stays a command any part of that session may call.
+      escalate = Path.expand("../../priv/bin/loop-escalate", __DIR__)
+      stdin = write_stdin("should voided visits count?")
+
+      {_, 0} =
+        System.cmd("sh", ["-c", "#{escalate} < #{stdin}"],
+          env: [{"LOOP_RUN_DIR", run_dir}],
+          stderr_to_stdout: true
+        )
+
+      assert File.read!(Path.join(run_dir, "escalations.ndjson")) =~ "voided visits"
+    end
+
+    test "the token file is this user's alone", %{run_dir: run_dir} do
+      assert {:ok, token} = TriageVerdict.mint_token(run_dir)
+      assert byte_size(token) >= 24
+      path = Path.join(run_dir, "verdict.token")
+      assert File.read!(path) == token
+      assert {:ok, %File.Stat{mode: mode}} = File.stat(path)
+      assert Bitwise.band(mode, 0o077) == 0
+
+      # The final mode is the same whichever order the mint uses, so the ORDER is pinned at the
+      # source: the window where the file exists at the umask's mode with the token already in it
+      # cannot be observed from here without racing the mint.
+      source = File.read!("lib/loopctl_runner/triage_verdict.ex")
+      touch = :binary.match(source, "File.touch(path)") |> elem(0)
+      chmod = :binary.match(source, "File.chmod(path, 0o600)") |> elem(0)
+      write = :binary.match(source, "File.write(path, token)") |> elem(0)
+      assert touch < chmod and chmod < write, "the token is written before the file is narrowed"
+
+      assert {:ok, escalate} = TriageVerdict.mint_escalate_token(run_dir)
+      assert escalate != token
+      assert {:ok, %File.Stat{mode: mode}} = File.stat(Path.join(run_dir, "escalate.token"))
+      assert Bitwise.band(mode, 0o077) == 0
+    end
+
     test "the script refuses to run outside a loop session" do
       assert {out, code} =
-               System.cmd(script(), [], env: [{"LOOP_RUN_DIR", ""}], stderr_to_stdout: true)
+               System.cmd(script(), ["token"],
+                 env: [{"LOOP_RUN_DIR", ""}],
+                 stderr_to_stdout: true
+               )
 
       assert code != 0
       assert out =~ "only works inside a loop session"

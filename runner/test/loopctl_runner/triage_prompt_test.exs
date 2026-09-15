@@ -21,8 +21,18 @@ defmodule LoopctlRunner.TriagePromptTest do
     "truncated" => false
   }
 
-  defp build(overrides \\ %{}),
-    do: TriagePrompt.build(Map.merge(@triage, overrides), "mkreyman/home_care_billing")
+  # build/3 requires a token and grants no lenses by default: both are the caller's to supply,
+  # and both defaults were the unsafe branch before review round 3.
+  defp build(overrides \\ %{}, opts \\ []),
+    do:
+      TriagePrompt.build(
+        Map.merge(@triage, overrides),
+        "mkreyman/home_care_billing",
+        Keyword.put_new(opts, :token, "T0KEN")
+      )
+
+  defp build_with_lenses(overrides \\ %{}),
+    do: build(overrides, lenses: LoopctlRunner.TriageTools.lenses())
 
   test "the fenced block is reproduced byte for byte" do
     prompt = build()
@@ -138,14 +148,54 @@ defmodule LoopctlRunner.TriagePromptTest do
   end
 
   test "the lenses are readings the session makes, not agents it may not have" do
-    prompt = build()
+    prompt = build_with_lenses()
 
-    # Session.claude_args/2 gives no Agent tool and no agent definitions; instructing a dispatch
-    # would be instructing something the harness denies silently.
-    refute prompt =~ "dispatch the triage agents"
+    # With lenses granted, the session is told to dispatch them. Without them it is told to do
+    # the readings itself — the test below — because the implement launcher has no Agent tool and
+    # no definitions, and a dispatch would be denied silently.
     assert prompt =~ "three lenses"
     assert prompt =~ "disagreement is itself a reason to escalate"
+
+    # Named, and named from the set the session is actually given: shipping the definitions and
+    # never telling the session to use them leaves it doing all three readings inline, silently.
+    for lens <- LoopctlRunner.TriageTools.lenses(), do: assert(prompt =~ "`#{lens}`")
+    assert prompt =~ "DISPATCH each with the Agent tool"
+    assert "Agent" in LoopctlRunner.TriageTools.tools()
+    # And an implement session has no Agent tool at all.
     refute "Agent" in LoopctlRunner.Session.session_tools()
+  end
+
+  test "a session given NO lenses is told to do the readings, never to dispatch" do
+    # Which is also the DEFAULT: the only wired launcher grants none.
+    # The only wired launcher today is the implement one: no Agent tool, no definitions. Telling
+    # such a session to dispatch is telling it to do something dontAsk denies without a prompt,
+    # and it would burn its turns on it.
+    prompt = build()
+
+    refute prompt =~ "DISPATCH"
+    refute prompt =~ "Agent tool"
+    for lens <- LoopctlRunner.TriageTools.lenses(), do: refute(prompt =~ lens)
+    assert prompt =~ "keep them apart, yourself"
+    assert prompt =~ "disagreement is itself a reason to escalate"
+  end
+
+  test "a lens is handed the block whole, never the session's account of it" do
+    prompt = build_with_lenses()
+
+    assert prompt =~ "GIVE EACH LENS THE REPORT BLOCK BELOW, copied whole into its task"
+    assert prompt =~ "fences and line prefixes"
+    assert prompt =~ "intact: a lens has no way to read it otherwise"
+    assert prompt =~ "Never paraphrase it, summarise it or quote part of it"
+    # Because a lens cannot read it: it is not in the checkout, and a lens has only file tools.
+    assert prompt =~ "it is not in the checkout"
+  end
+
+  test "the verdict token is the session's, and the prompt says not to pass it on" do
+    prompt = build()
+
+    assert prompt =~ "#{TriagePrompt.verdict_script()} T0KEN <<'VERDICT'"
+    assert prompt =~ "do not put it in a lens's task"
+    assert prompt =~ "subagent could state"
   end
 
   test "the verdict command, its outcomes and its bounds come from the contract" do

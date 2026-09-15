@@ -35,6 +35,53 @@ defmodule LoopctlRunner.TriageVerdict do
 
   @type verdict :: %{String.t() => term()}
 
+  @doc """
+  Mints this run's verdict token, writes it where `loop-verdict` checks it, and returns it.
+
+  The token goes in the session's PROMPT. A subagent inherits the environment and the session's
+  allow-rules, so a built-in agent type dispatched for a fourth reading could otherwise run
+  `loop-verdict` — and the verdict is first-write-wins, so it would fix the run's answer. It
+  cannot state one it was never given the token for: a subagent is given a task, not the
+  session's prompt, and its own tools cannot read the session's argv (no shell it may run, and
+  its file tools are scoped to the checkout).
+
+  What this does NOT defend against is another process on the machine: the token is an argv
+  element of every `loop-verdict` call and of the `claude` process carrying the prompt, so any
+  local user who can read `/proc` can read it. The boundary here is between the session and what
+  it dispatches, not between this user and the machine.
+  """
+  @spec mint_token(String.t()) :: {:ok, String.t()} | {:error, String.t()}
+  def mint_token(run_dir), do: mint(run_dir, "verdict.token")
+
+  @doc """
+  Mints this run's ESCALATE token, for the same reason and with the same rule.
+
+  `loop-escalate` ends a run with no verdict, so a subagent that could call it could decide the
+  run's outcome as surely as one that could state a verdict. A run that mints this requires it;
+  an implement run mints none and is unchanged.
+  """
+  @spec mint_escalate_token(String.t()) :: {:ok, String.t()} | {:error, String.t()}
+  def mint_escalate_token(run_dir), do: mint(run_dir, "escalate.token")
+
+  defp mint(run_dir, name) do
+    token = 24 |> :crypto.strong_rand_bytes() |> Base.url_encode64(padding: false)
+    path = Path.join(run_dir, name)
+
+    # Created empty and narrowed BEFORE the token is in it: File.write/2 creates at the umask's
+    # mode, so writing first leaves a window where any local user can read the capability. A
+    # chmod that fails fails the mint, rather than returning a credential at 0644 — the same
+    # standard `ControlConfig` holds the daemon's token to.
+    with :ok <- File.touch(path),
+         :ok <- File.chmod(path, 0o600),
+         :ok <- File.write(path, token) do
+      {:ok, token}
+    else
+      {:error, reason} ->
+        File.rm(path)
+        {:error, "the verdict token could not be written: #{:file.format_error(reason)}"}
+    end
+  end
+
   @doc "The file `loop-verdict` writes in a run directory."
   @spec file(String.t()) :: String.t()
   def file(run_dir), do: Path.join(run_dir, @verdict_file)
