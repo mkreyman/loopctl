@@ -114,6 +114,17 @@ defmodule LoopctlWeb.RunnerChannel.Refusal do
   def for_message(reason) when reason in [:capacity_busy, :busy],
     do: %{reason: "rate_limited", min_interval_ms: Capacity.busy_retry_ms()}
 
+  # A DRAFTED STORY POSTGRES REFUSED. The verdict itself is well-formed — it passed the
+  # contract's caps — and what failed is the row write, so the runner is told its PAYLOAD was
+  # invalid rather than being sent back to resend a message that will fail identically. The
+  # detail names the field class without echoing the draft: that text was composed by a
+  # session reading reporter input and this string reaches a log the runner controls.
+  def for_message(:story_draft_invalid),
+    do: %{
+      reason: "invalid_payload",
+      details: ["the drafted story was refused when written to the story row"]
+    }
+
   def for_message(reason), do: catch_all(reason)
 
   @doc """

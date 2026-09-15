@@ -89,6 +89,33 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **An accepted triage verdict writes the story and QUEUES it (#803).** This is the join the
+  loop was missing: `Loopctl.Delivery.TriageVerdict`'s `story` route was empty, so an accepted
+  verdict left the story at `triaged` — and nothing in `lib/` wrote `triaged -> queued`, while
+  the dispatch driver selects stage rows at `queued`. The loop therefore had no continuation
+  at all: intake promoted a story, triage accepted it, and it stopped one stage short of the
+  only thing that could pick it up. An accepted verdict now replaces the stub row
+  (`TriageTrigger` writes loopctl's own facts — a repository and an issue number — precisely
+  so the reporter's title never wears a story's clothes, and its comment already said "triage
+  replaces this with the drafted title") with the drafted title, description and acceptance
+  criteria, and then advances to `queued`.
+
+  **Every drafted string is sanitised first** (`Loopctl.Delivery.Untrusted.sanitise/1`, new):
+  bidirectional overrides, zero-width characters, Unicode TAG runs and controls become visible
+  `<U+XXXX>` escapes, because a drafted title is composed by a session that has just read
+  reporter text and lands in a field a runner builds its prompt from. Ordinary prose is NOT
+  touched — a draft saying "ignore previous instructions" is stored verbatim, since that is a
+  semantic attack for the triage trio to catch and mangling prose would corrupt real stories.
+  An escalation or a rejection drafts nothing, and a draft loopctl could not DISPATCH — one
+  whose sanitised title exceeds the cap the stored story is judged against, one whose title is
+  empty, or one stating no acceptance criteria — is ESCALATED rather than queued, leaving the
+  stub row intact. A half-applied route (the first transition committed, the second not) is
+  COMPLETED by the resend, including after a claim reclaim, rather than reported as a clean
+  run: nothing else in `lib/` writes `triaged -> queued`, so a story stranded there was dead. The draft's
+  `test_cases`, `touches` and `domain_reference` are kept under `metadata["triage_draft"]`:
+  the story row has no columns for them and they are dispatch options, but dropping them lost
+  what a session wrote.
+
 - **A placed dispatch carries the STORY, built server-side (#803).** `Placement.place/4` now
   builds the `implement` dispatch's `story` object from loopctl's own rows
   (`Loopctl.Delivery.StoryPayload.build/3`) after the claim and before the push. Until now
