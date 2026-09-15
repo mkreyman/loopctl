@@ -202,20 +202,138 @@ defmodule LoopctlRunner.TriageRunTest do
              ]).outcome
   end
 
-  test "a repo with no local checkout fails before anything runs", ctx do
+  test "a checkout the runner cannot read is a reportable incomplete, not a runner error", ctx do
+    # checkout/2 LOOKED, so the cause is verified and the contract has a word for it. As
+    # {:error, _} this had no wire form at all: the dispatch it answers would sit in flight for
+    # ever, which is the failure the incomplete path exists to prevent. Both ways of failing —
+    # no configured checkout, and a path that is not a directory — report the same reason with
+    # their own detail.
     restore = fake_env!(ctx.state, [{"FAKE_CLAUDE_MODE", "stream"}])
 
-    result =
+    missing = Path.join(ctx.root, "not-a-repo")
+    File.write!(missing, "")
+    config = config!(ctx.root, %{"repos" => %{"fixture" => missing}})
+
+    results =
       try do
-        TriageRun.execute(ctx.config, @triage, "someone/absent")
+        [
+          TriageRun.execute(ctx.config, @triage, "someone/absent"),
+          TriageRun.execute(config, @triage, "mkreyman/fixture")
+        ]
       after
         restore.()
       end
 
-    assert {:error, reason} = result.outcome
+    assert [absent, not_a_dir] = results
+    assert {:incomplete, "checkout_unreadable", reason} = absent.outcome
     assert reason =~ "no local checkout"
-    assert result.session == nil
+    assert {:incomplete, "checkout_unreadable", reason} = not_a_dir.outcome
+    assert reason =~ "is not a directory"
+
+    for result <- results do
+      assert result.session == nil
+
+      assert {:ok, %{"status" => "incomplete:checkout_unreadable"}} =
+               RunStateRead.read(result.run_dir)
+    end
+
     refute File.exists?(Path.join(ctx.state, "argv"))
+  end
+
+  test "a detail longer than the contract allows is cut, never sent whole", ctx do
+    # An escalating session's own words are admitted up to 4000 characters by Session, and the
+    # contract caps detail at 300. Over it the WHOLE message is refused invalid_payload, which
+    # permanent_errors makes permanent, so the least important field in the message would take
+    # the verdict down with it.
+    long = String.duplicate("x", 5_000)
+
+    result =
+      execute(ctx, [{"FAKE_CLAUDE_MODE", "stream"}, {"FAKE_ESCALATE", long}])
+
+    assert {:incomplete, "no_verdict_written", detail} = result.outcome
+    assert String.length(detail) == TriageRun.max_detail()
+    assert TriageRun.max_detail() == 300
+
+    # And the cut detail still validates as the message field it becomes.
+    assert LoopctlRunner.Contract.validate_against(
+             LoopctlRunner.Contract.schema_def("RunnerTriageVerdictMessage")
+             |> get_in(["properties", "detail"]),
+             detail,
+             "detail"
+           ) == :ok
+  end
+
+  test "a verdict path that will not read is reported by WHAT IS THERE, not by assumption", ctx do
+    # loopctl asked for an IO failure to reach it as an incomplete rather than a runner error, on
+    # the checkout_unreadable argument: an error has no wire form and strands the dispatch. Which
+    # incomplete is a different question, and the contract answers it — verdict_invalid means the
+    # session DID write one. A DIRECTORY at the verdict path is not something loop-verdict can
+    # create, so nothing was written and saying otherwise asserts a cause nobody checked.
+    result = execute(ctx, [{"FAKE_CLAUDE_MODE", "stream"}, {"FAKE_VERDICT_UNREADABLE", "dir"}])
+
+    assert {:incomplete, "no_verdict_written", detail} = result.outcome
+    assert detail =~ "could not be read"
+
+    assert {:ok, %{"status" => "incomplete:no_verdict_written"}} =
+             RunStateRead.read(result.run_dir)
+
+    # A regular file that will not read IS the session's, because only loop-verdict links one in.
+    unreadable =
+      execute(ctx, [{"FAKE_CLAUDE_MODE", "stream"}, {"FAKE_VERDICT_UNREADABLE", "chmod"}])
+
+    assert {:incomplete, "verdict_invalid", detail} = unreadable.outcome
+    assert detail =~ "could not be read"
+  end
+
+  test "a run the runner cannot prepare is reported, never left without a wire form", ctx do
+    # The tokens are written AFTER the run directory and state.json exist, so the dispatch is
+    # already this runner's by then. A read-only or full runs volume is the same operator failure
+    # that makes a verdict file unreadable, one step earlier — and as {:error, _} it had no wire
+    # form at all, so the dispatch it answers would sit in flight for ever.
+    #
+    # The failure is planted rather than simulated, and without a seam in the module: a DIRECTORY
+    # where verdict.token goes, so File.touch refuses it. The run directory carries a timestamp to
+    # the second, so both the current second's name and the next one are prepared and whichever
+    # the run picks is the one it fails in.
+    restore = fake_env!(ctx.state, [{"FAKE_CLAUDE_MODE", "stream"}])
+    run_id = LoopctlRunner.Session.uuid4()
+
+    for offset <- [0, 1] do
+      stamp =
+        DateTime.utc_now()
+        |> DateTime.add(offset, :second)
+        |> Calendar.strftime("%Y%m%dT%H%M%SZ")
+
+      dir =
+        Path.join(
+          ctx.config.runs_dir,
+          "triage-#{@triage["record_id"]}-#{stamp}-#{binary_part(run_id, 0, 8)}"
+        )
+
+      File.mkdir_p!(Path.join(dir, "verdict.token"))
+    end
+
+    result =
+      try do
+        TriageRun.execute(ctx.config, @triage, "mkreyman/fixture", run_id: run_id)
+      after
+        restore.()
+      end
+
+    assert {:incomplete, "no_verdict_written", detail} = result.outcome
+    assert detail =~ "could not be prepared"
+    # The session never started, so nothing was launched to produce anything.
+    refute File.exists?(Path.join(ctx.state, "argv"))
+
+    assert {:ok, %{"status" => "incomplete:no_verdict_written"}} =
+             RunStateRead.read(result.run_dir)
+  end
+
+  test "every reason this module reports is one the vendored contract publishes" do
+    # The compile-time raise is the real guard; this is what says so where a reader looks, and it
+    # fails if the contract is vendored with a reason renamed out from under the code.
+    assert "checkout_unreadable" in TriageRun.incomplete_reasons()
+    assert length(TriageRun.incomplete_reasons()) == 5
   end
 
   test "a verdict the session stated survives the session monitor dying", ctx do

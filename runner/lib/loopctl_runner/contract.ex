@@ -1,7 +1,7 @@
 defmodule LoopctlRunner.Contract do
   @moduledoc """
   The loopctl runner wire contract, vendored from mkreyman/loopctl
-  `priv/runner_contract/v1.json` (JSON Schema 2020-12, `x-contract-version` 1.8.0).
+  `priv/runner_contract/v1.json` (JSON Schema 2020-12, `x-contract-version` 1.9.1).
 
   The file is copied, never re-typed: the server casts every payload against the same
   document, drops unknown fields at every depth, and refuses a mismatched major version.
@@ -102,11 +102,18 @@ defmodule LoopctlRunner.Contract do
   defp keyword("maximum", max, value, path, _) when is_number(value) and value > max,
     do: ["#{path}: above maximum #{max}"]
 
+  # CODEPOINTS, not graphemes. JSON Schema 2020-12 defines a string's length in code points and
+  # loopctl refuses by them, while `String.length/1` counts graphemes and is the looser count — so
+  # this validator used to pass a story description of 900 graphemes that is over 900 code points
+  # once it carries emoji with modifiers or combining marks, and the payload it let through would
+  # be refused `invalid_payload` on the wire. That code is permanent, so the run's only output
+  # would be lost. `DispatchRun.cap_reason/1` and `TriageRun`'s detail cap already cut by this
+  # count; this is the check agreeing with them.
   defp keyword("minLength", min, value, path, _) when is_binary(value),
-    do: if(String.length(value) < min, do: ["#{path}: shorter than #{min}"], else: [])
+    do: if(codepoints(value) < min, do: ["#{path}: shorter than #{min}"], else: [])
 
   defp keyword("maxLength", max, value, path, _) when is_binary(value),
-    do: if(String.length(value) > max, do: ["#{path}: longer than #{max}"], else: [])
+    do: if(codepoints(value) > max, do: ["#{path}: longer than #{max}"], else: [])
 
   defp keyword("pattern", pattern, value, path, _) when is_binary(value) do
     if Regex.match?(Regex.compile!(pattern), value),
@@ -206,17 +213,38 @@ defmodule LoopctlRunner.Contract do
   # untrusted the same way. Everything else names its value, loopctl's own `record_id`,
   # `issue_number`, `html_url` and `escalation_reasons` included: those are how a malformed
   # dispatch is diagnosed, and a refusal nobody can act on is its own defect.
-  @untrusted_leaf "untrusted"
-  @untrusted_definition "runnertriageverdict"
+  # Matched on SEGMENTS, never on a name prefix. 1.9.1 added `RunnerTriageVerdictMessage` and
+  # `RunnerTriageVerdictAck`, both of which start with the verdict definition's name, and a prefix
+  # test silently spread the suppression over `dispatch_id`, `claim_epoch`, `recorded_at` and
+  # `replayed` — every one of them loopctl-generated, none of them anyone's prose. A refusal that
+  # will not name a malformed timestamp loopctl itself sent is the "refusal nobody can act on"
+  # this rule's own second half forbids.
+  # `detail` is on this list because the contract says so in its own description — "UNTRUSTED like
+  # every other runner-authored string" — and because `TriageRun` fills it from an escalating
+  # session's prose. The narrowing that stopped suppressing loopctl's envelope fields freed this
+  # one with them, which was not intended and is not wanted.
+  @untrusted_leaves ~w(untrusted detail)
+  @verdict_definition "runnertriageverdict"
+  @verdict_property "verdict"
 
   defp shown(value, path) do
-    down = String.downcase(path)
+    segments = path |> String.downcase() |> String.split(".")
 
-    if String.ends_with?(down, @untrusted_leaf) or
-         String.starts_with?(down, @untrusted_definition),
-       do: "<#{type_of(value)}, not shown: untrusted>",
-       else: inspect(value)
+    if untrusted_path?(segments),
+      do: "<#{type_of(value)}, not shown: untrusted>",
+      else: inspect(value)
   end
+
+  # The verdict is untrusted wherever it sits: as the definition validated by name, and as the
+  # object inlined into the message, whose every leaf is still composed by a session that had just
+  # read the reporter's words.
+  defp untrusted_path?(segments) do
+    List.last(segments) in @untrusted_leaves or
+      List.first(segments) == @verdict_definition or
+      @verdict_property in segments
+  end
+
+  defp codepoints(value), do: value |> String.codepoints() |> length()
 
   defp type_of(value) when is_binary(value), do: "a string"
   defp type_of(value) when is_list(value), do: "a list"

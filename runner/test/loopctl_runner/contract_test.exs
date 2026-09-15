@@ -6,7 +6,7 @@ defmodule LoopctlRunner.ContractTest do
   defp join(overrides \\ %{}) do
     Map.merge(
       %{
-        "contract_version" => "1.8.0",
+        "contract_version" => "1.9.1",
         "kinds" => ["implement"],
         "machine" => "minis",
         "cores" => 16,
@@ -20,8 +20,8 @@ defmodule LoopctlRunner.ContractTest do
     )
   end
 
-  test "the vendored contract is v1.8.0 and names the socket and header the client uses" do
-    assert Contract.version() == "1.8.0"
+  test "the vendored contract is v1.9.1 and names the socket and header the client uses" do
+    assert Contract.version() == "1.9.1"
 
     assert %{
              "credential_header" => "x-loopctl-runner-token",
@@ -674,6 +674,225 @@ defmodule LoopctlRunner.ContractTest do
       for {event, name} <- named do
         assert name in Contract.definitions(),
                "x-connection.#{map}.#{event} names #{name}, which $defs does not define"
+      end
+    end
+  end
+
+  describe "the triage verdict message (1.9.1)" do
+    @dispatch %{
+      "dispatch_id" => "7d0c1f6e-3b1a-4f7e-9c2d-5a6b7c8d9e0f",
+      "claim_epoch" => 3
+    }
+
+    test "an incomplete run may send verdict and detail as explicit nulls" do
+      # The one the loopctl session flagged, and the reason it is worth a test on THIS side: its
+      # first inlining dropped `nullable` from `verdict`, so a message carrying "verdict": null
+      # beside a real `incomplete` would have been refused invalid_payload — which is in
+      # x-connection.permanent_errors, so a conforming runner does not resend and the run's only
+      # output is lost for good. An emitter that serialises every field of a struct sends exactly
+      # that shape, and nothing about the failure is visible from here.
+      message =
+        Map.merge(@dispatch, %{
+          "verdict" => nil,
+          "incomplete" => "no_verdict_written",
+          "detail" => nil
+        })
+
+      assert Contract.validate("RunnerTriageVerdictMessage", message) == :ok
+    end
+
+    test "the five incomplete reasons are the contract's, and checkout_unreadable is one" do
+      # Transcribing this enum out of loopctl's commit message lost checkout_unreadable, which is
+      # how this repo came to be missing a reason it had a verified condition for. Read from the
+      # file now, and this test is what fails if the file and the code disagree again.
+      %{"enum" => reasons} =
+        Contract.schema_def("RunnerTriageVerdictMessage")
+        |> get_in(["properties", "incomplete"])
+
+      assert Enum.sort(reasons) ==
+               Enum.sort(~w(session_crashed wall_clock_exceeded checkout_unreadable
+                            no_verdict_written verdict_invalid))
+
+      for reason <- reasons do
+        assert Contract.validate(
+                 "RunnerTriageVerdictMessage",
+                 Map.put(@dispatch, "incomplete", reason)
+               ) ==
+                 :ok
+      end
+
+      assert {:error, [error]} =
+               Contract.validate(
+                 "RunnerTriageVerdictMessage",
+                 Map.put(@dispatch, "incomplete", "gave_up")
+               )
+
+      # And it NAMES the bad value. An incomplete reason is a runner-authored keyword from a
+      # closed enum, never anyone's prose, so there is nothing here to suppress and a refusal that
+      # hid it could not be acted on. This assertion used to be its opposite, passing only because
+      # the suppression matched on a name prefix that 1.9.1's two new definitions happen to share
+      # with the verdict's.
+      assert error =~ "incomplete"
+      assert error =~ "gave_up"
+    end
+
+    test "EXACTLY ONE OF verdict and incomplete is prose, so the sender owes the rule" do
+      # The schema carries neither oneOf nor a conditional: `verdict` and `incomplete` are both
+      # optional and both nullable, so a message with BOTH and a message with NEITHER validate
+      # here and are refused invalid_payload on the wire — permanently, since that code is in
+      # x-connection.permanent_errors. This is pinned rather than worked around: the rule belongs
+      # in whatever builds the message, the way TriageVerdict already carries the conditional story
+      # rule, and this test goes red the day loopctl publishes a keyword that would enforce it.
+      verdict = %{"outcome" => "escalate", "confidence" => "high"}
+
+      assert Contract.validate("RunnerTriageVerdictMessage", @dispatch) == :ok
+
+      assert Contract.validate(
+               "RunnerTriageVerdictMessage",
+               Map.merge(@dispatch, %{"verdict" => verdict, "incomplete" => "verdict_invalid"})
+             ) == :ok
+
+      keywords = Map.keys(Contract.schema_def("RunnerTriageVerdictMessage"))
+      assert Enum.sort(keywords) == ~w(description properties required type)
+    end
+
+    test "the envelope's own fields name their values; the verdict's leaves never do" do
+      # The suppression exists for text a REPORTER or a session wrote. dispatch_id, claim_epoch,
+      # recorded_at and replayed are loopctl's own, and a refusal that will not name a malformed
+      # timestamp loopctl itself sent is unactionable — which is what a prefix match over
+      # RunnerTriageVerdictMessage and RunnerTriageVerdictAck produced, since both names begin
+      # with the verdict definition's.
+      assert {:error, [error]} =
+               Contract.validate("RunnerTriageVerdictMessage", %{
+                 @dispatch
+                 | "dispatch_id" => "nope"
+               })
+
+      assert error =~ "nope"
+
+      assert {:error, [error]} =
+               Contract.validate("RunnerTriageVerdictAck", %{
+                 "recorded_at" => "not-a-time",
+                 "replayed" => false
+               })
+
+      assert error =~ "not-a-time"
+
+      # The verdict inlined into the message is still the session's, leaf by leaf.
+      verdict = %{"outcome" => "escalate", "confidence" => "loud"}
+
+      assert {:error, [error]} =
+               Contract.validate(
+                 "RunnerTriageVerdictMessage",
+                 Map.put(@dispatch, "verdict", verdict)
+               )
+
+      assert error =~ "verdict.confidence"
+      refute error =~ "loud"
+
+      # And as the definition validated by its own name, which is where it arrives from disk.
+      assert {:error, [error]} = Contract.validate("RunnerTriageVerdict", verdict)
+      refute error =~ "loud"
+    end
+
+    test "incomplete CANNOT be sent as an explicit null, unlike verdict" do
+      # The mirror of the case above, and it goes the other way: `incomplete` is typed
+      # ["string","null"] but its enum lists only the five reasons, and under 2020-12 an enum
+      # constrains every instance including null. So a message carrying a real verdict beside
+      # "incomplete": null is refused invalid_payload — permanent — while the same shape with the
+      # fields swapped is accepted. An emitter that serialises a struct whole sends both.
+      #
+      # Pinned rather than worked around, like the exactly-one-of rule: the sender OMITS the field
+      # it is not using. Raised with loopctl; this test is what goes red if the enum gains null.
+      message =
+        Map.merge(@dispatch, %{
+          "verdict" => %{"outcome" => "escalate", "confidence" => "high"},
+          "incomplete" => nil
+        })
+
+      assert {:error, [error]} = Contract.validate("RunnerTriageVerdictMessage", message)
+      assert error =~ "incomplete"
+
+      assert Contract.validate("RunnerTriageVerdictMessage", Map.delete(message, "incomplete")) ==
+               :ok
+    end
+
+    test "the inlined verdict and the verdict definition are the same schema" do
+      # The file now carries the verdict twice: TriageVerdict.read/1 validates what the session
+      # wrote against the $def, and the wire message will be validated against the inline copy. A
+      # vendor that updated one and not the other would make a verdict this runner accepts and
+      # records refused invalid_payload on the wire — permanent, and invisible until it happened.
+      inline =
+        Contract.schema_def("RunnerTriageVerdictMessage") |> get_in(["properties", "verdict"])
+
+      # Set aside only what MUST differ: the inline copy says what the field is for, and is
+      # nullable because the message sends it or its counterpart.
+      assert Map.drop(inline, ["description", "type"]) ==
+               Map.drop(Contract.schema_def("RunnerTriageVerdict"), ["description", "type"])
+
+      assert inline["type"] == ["object", "null"]
+    end
+
+    test "the reason lists Control keeps by hand agree with the contract's permanent_errors" do
+      # Three hand-written lists decide whether a refusal is retried, and the contract publishes
+      # the answer — the same re-typing the vendoring rule exists to prevent, one layer up. Today
+      # they agree; this is what notices when a vendored contract moves one of them.
+      permanent = Contract.connection() |> Map.fetch!("permanent_errors") |> Map.fetch!("*")
+
+      for reason <- LoopctlRunner.Control.fatal_reasons() ++ LoopctlRunner.Control.given_up() do
+        assert reason in permanent,
+               "#{reason} is given up on, and the contract does not call it permanent"
+      end
+
+      # The one deliberate disagreement, named so it cannot pass unnoticed: the contract calls
+      # dispatch_not_accepted permanent, and Control retries it while this runner's OWN accept for
+      # that dispatch is still unacknowledged, because the flag flips when that reply commits. It
+      # gives up as soon as no accept is outstanding. Raised with loopctl.
+      assert "dispatch_not_accepted" in permanent
+      refute "dispatch_not_accepted" in LoopctlRunner.Control.given_up()
+    end
+
+    test "a length is counted in CODEPOINTS, the way loopctl counts it" do
+      # String.length counts GRAPHEMES, which is the looser count: a family emoji is one grapheme
+      # and seven code points. Checked that way, this validator passed payloads loopctl refuses
+      # invalid_payload — permanent, so the run's only output is lost — which is the exact failure
+      # validating on this side exists to prevent. The detail cap in TriageRun cuts by code
+      # points; this is the check agreeing with it.
+      schema = %{"type" => "string", "maxLength" => 5}
+
+      one_grapheme = "👨‍👩‍👧‍👦"
+      assert String.length(one_grapheme) == 1
+      assert one_grapheme |> String.codepoints() |> length() == 7
+
+      assert {:error, [error]} = Contract.validate_against(schema, one_grapheme, "detail")
+      assert error =~ "longer than 5"
+
+      assert Contract.validate_against(schema, String.duplicate("a", 5), "detail") == :ok
+      assert {:error, _} = Contract.validate_against(schema, String.duplicate("a", 6), "detail")
+    end
+
+    test "the detail is untrusted, because the contract's own description says so" do
+      # The narrowing that stopped suppressing loopctl's envelope fields freed this one with them.
+      # TriageRun fills it from an escalating session's prose, and v1.json calls it "UNTRUSTED like
+      # every other runner-authored string".
+      assert Contract.schema_def("RunnerTriageVerdictMessage")
+             |> get_in(["properties", "detail", "description"]) =~ "UNTRUSTED"
+
+      assert {:error, [error]} =
+               Contract.validate("RunnerTriageVerdictMessage", Map.put(@dispatch, "detail", 12))
+
+      assert error =~ "detail"
+      refute error =~ "12"
+    end
+
+    test "the ack says when the verdict was first recorded and whether this was a resend" do
+      # `replayed` is what makes the idempotent resend observable here: an ok that applied nothing
+      # and an ok that recorded the verdict are otherwise the same answer.
+      ack = %{"recorded_at" => "2026-09-15T12:00:00Z", "replayed" => true}
+      assert Contract.validate("RunnerTriageVerdictAck", ack) == :ok
+
+      for missing <- ~w(recorded_at replayed) do
+        assert {:error, _} = Contract.validate("RunnerTriageVerdictAck", Map.delete(ack, missing))
       end
     end
   end

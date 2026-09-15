@@ -1174,6 +1174,10 @@ defmodule LoopctlRunner.Control do
   @spec kinds() :: [String.t()]
   def kinds, do: @kinds
 
+  @doc "The join refusals this runner treats as fatal to the service."
+  @spec fatal_reasons() :: [String.t()]
+  def fatal_reasons, do: @fatal_reasons
+
   defp dispatch_story(dispatch) do
     case DispatchRun.story_object(dispatch) do
       {:ok, story} -> {:ok, story}
@@ -2261,6 +2265,10 @@ defmodule LoopctlRunner.Control do
   # broadcast); stale_claim_epoch means the claim moved on; run_mismatch means the run is bound
   # elsewhere. None of them changes, so each gives the run up at once.
   @given_up ~w(unknown_dispatch stale_claim_epoch run_mismatch)
+
+  @doc "The trace refusals that give a run up at once."
+  @spec given_up() :: [String.t()]
+  def given_up, do: @given_up
 
   defp trace_refused(socket, _push, %{"reason" => "rate_limited"} = refusal) do
     interval = Map.get(refusal, "min_interval_ms", TraceShip.min_interval_ms("trace"))

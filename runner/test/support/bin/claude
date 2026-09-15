@@ -64,6 +64,16 @@ if [ -n "${FAKE_VERDICT:-}" ]; then
     printf '%s' "$FAKE_VERDICT" | "$script" "$token" > /dev/null 2>&1 || true
 fi
 
+# An IO failure at the verdict path that the session cannot cause and the runner cannot parse
+# around: a DIRECTORY where the file goes. The runner must report it, not raise it.
+# Two ways a verdict path refuses to read, and the runner must tell them apart: a DIRECTORY,
+# which loop-verdict cannot create, so nothing was written; and a regular file it cannot open,
+# which only loop-verdict puts there.
+case "${FAKE_VERDICT_UNREADABLE:-}" in
+    dir) mkdir -p "$LOOP_RUN_DIR/verdict.json" ;;
+    chmod) : > "$LOOP_RUN_DIR/verdict.json"; chmod 000 "$LOOP_RUN_DIR/verdict.json" ;;
+esac
+
 if [ -n "${FAKE_ESCALATE:-}" ]; then
     prompt=${*: -1}
     escalate=$(printf '%s' "$prompt" | grep -oE '/[^ ]*loop-escalate [A-Za-z0-9_-]+' | head -1)

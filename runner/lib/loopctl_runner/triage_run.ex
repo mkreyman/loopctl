@@ -21,20 +21,40 @@ defmodule LoopctlRunner.TriageRun do
     5. the verdict, read and validated against the contract before anything believes it.
 
   The outcome is one of `{:verdict, verdict}`, `{:incomplete, reason, detail}` or
-  `{:error, reason}`. The incomplete reasons are the ones loopctl declared for `triage_verdict` in
-  contract 1.9.0 — which this repo has NOT vendored yet (1.8.0 is current here, and carries no
-  `incomplete` concept at all), so they are a local vocabulary chosen to match until the vendor
-  pins them. They describe what the SESSION
-  did: `session_crashed`, `wall_clock_exceeded`, `no_verdict_written` (including an escalation,
-  whose own words go in the detail), and `verdict_invalid`. What the RUNNER could not do — no
-  checkout, a budget over the configured ceiling, a verdict file it could not read — is
-  `{:error, _}`, because none of those is the session's mistake to be reported as.
+  `{:error, reason}`. The incomplete reasons come from the vendored contract's
+  `RunnerTriageVerdictMessage.incomplete` enum (1.9.1) and are read from it rather than repeated
+  here — `incomplete_reasons/0` is the list, and a value outside it raises at compile time.
+  Four of the five describe what the SESSION did: `session_crashed`, `wall_clock_exceeded`,
+  `no_verdict_written` (including an escalation, whose own words go in the detail), and
+  `verdict_invalid`.
+
+  The fifth, `checkout_unreadable`, is the RUNNER's, and the distinction it turns on is whether
+  the cause was verified. An escalating session says only that it could not work at all and never
+  why, so naming a cause there would send a reader to a checkout that is fine. `checkout/2` is
+  different: it looked, so a repo with no configured checkout or a path that is not a directory
+  is reported as `checkout_unreadable` and reaches loopctl as a finished run. That mapping was
+  missing while the enum was transcribed out of a commit message instead of read from the file,
+  and the cost was not cosmetic — the condition returned `{:error, _}`, which has no wire form, so
+  the dispatch it answers would have stayed in flight for ever.
+
+  A verdict file the runner could NOT READ reports by what is actually at the path: a regular file
+  is something the session wrote, so `verdict_invalid`; anything else, or nothing, is
+  `no_verdict_written`. A run the runner could not PREPARE — a token it could not write, the same
+  failing volume seen one step earlier — is `no_verdict_written` too, because by then the dispatch
+  is already this runner's and an outcome with no wire form would strand it. What stays
+  `{:error, _}` is the one thing that is not an outcome at all — a budget over this runner's
+  configured ceiling, where the dispatch is refused and no run begins. That belongs to
+  `RunnerDispatchReply` (`wall_clock_exceeds_limit`, `max_turns_exceeds_limit`), which is a
+  refusal of the dispatch rather than a report about a run.
+
+  Every detail is cut to the contract's `maxLength` before it leaves, in codepoints.
   """
 
   require Logger
 
   alias LoopctlRunner.{
     Config,
+    Contract,
     Owner,
     Run,
     RunState,
@@ -45,6 +65,53 @@ defmodule LoopctlRunner.TriageRun do
     TriageTools,
     TriageVerdict
   }
+
+  # Read from the vendored contract at COMPILE time, not repeated: the last time this repo held
+  # its own copy of this enum, the copy was one value short and nothing could see it.
+  @incomplete_reasons Contract.schema_def("RunnerTriageVerdictMessage")
+                      |> get_in(["properties", "incomplete", "enum"])
+
+  for reason <- ~w(session_crashed wall_clock_exceeded checkout_unreadable no_verdict_written
+                   verdict_invalid) do
+    unless reason in @incomplete_reasons do
+      raise "this module reports #{reason}, which the vendored contract does not publish"
+    end
+  end
+
+  @doc "The incomplete reasons the vendored contract publishes."
+  @spec incomplete_reasons() :: [String.t()]
+  def incomplete_reasons, do: @incomplete_reasons
+
+  # The detail is BOUNDED by the same file, and two of its producers are wildly over: an
+  # escalation's own words are admitted up to 4000 characters by `Session.escalation_data/1`, and
+  # an exit reason is a formatted term of no fixed size. Over the cap the whole message is refused
+  # invalid_payload, which `x-connection.permanent_errors` makes permanent, so the run's only
+  # output is discarded rather than retried — the detail is the least important field in the
+  # message and would take the verdict down with it.
+  # `|| raise`, for the same reason the enum above has its guard: `get_in/2` answers nil rather
+  # than raising, and a nil cap makes `Enum.take/2` raise inside every incomplete outcome — so a
+  # vendored contract that renamed `detail` would turn each one into a crash caught by the run's
+  # own guard, which is `{:error, _}`, which has no wire form. The hole this module closes would
+  # reopen at vendor time with nothing naming it.
+  @max_detail Contract.schema_def("RunnerTriageVerdictMessage")
+              |> get_in(["properties", "detail", "maxLength"]) ||
+                raise("the vendored contract publishes no maxLength for a triage verdict detail")
+
+  # Codepoints, not graphemes: the schema's maxLength is the looser count and loopctl refuses by
+  # the stricter one, exactly as `DispatchRun.cap_reason/1` already does for a stage reason.
+  defp detail(text) do
+    text |> String.codepoints() |> Enum.take(@max_detail) |> Enum.join()
+  end
+
+  # The one constructor: every reason leaves through here, so a reason added later cannot forget
+  # the cap by being written as a bare tuple. NOT called `incomplete/2` — that arity is the
+  # dispatcher over the session's ending, and a second clause of it would have been unreachable,
+  # sending every reason out as no_verdict_written.
+  defp reported(reason, detail), do: {:incomplete, reason, detail(detail)}
+
+  @doc "The detail cap the vendored contract publishes."
+  @spec max_detail() :: pos_integer()
+  def max_detail, do: @max_detail
 
   @type outcome ::
           {:verdict, map()}
@@ -155,8 +222,8 @@ defmodule LoopctlRunner.TriageRun do
   defp run(config, triage, repo, run_dir, run_id, trace, seq, opts) do
     with {:ok, name, path} <- checkout(config, repo),
          :ok <- budgets(config, opts),
-         {:ok, token} <- TriageVerdict.mint_token(run_dir),
-         {:ok, escalate} <- TriageVerdict.mint_escalate_token(run_dir) do
+         {:ok, token} <- mint(run_dir, &TriageVerdict.mint_token/1),
+         {:ok, escalate} <- mint(run_dir, &TriageVerdict.mint_escalate_token/1) do
       lenses = Keyword.get(opts, :lenses, TriageTools.lenses())
 
       prompt =
@@ -187,21 +254,55 @@ defmodule LoopctlRunner.TriageRun do
         outcome: outcome(run_dir, session)
       }
     else
+      {:unreadable, reason} ->
+        %{
+          run_id: run_id,
+          run_dir: run_dir,
+          session: nil,
+          outcome: reported("checkout_unreadable", reason)
+        }
+
+      {:unreported, reason} ->
+        %{
+          run_id: run_id,
+          run_dir: run_dir,
+          session: nil,
+          outcome: reported("no_verdict_written", "the run could not be prepared: #{reason}")
+        }
+
       {:error, reason} ->
         %{run_id: run_id, run_dir: run_dir, session: nil, outcome: {:error, reason}}
     end
   end
 
+  # A token that cannot be written is the SAME operator failure that makes a verdict file
+  # unreadable — a full or read-only runs volume — and it happens after the run directory and
+  # state.json exist, so the dispatch is already this runner's. As `{:error, _}` it had no wire
+  # form and would have left that dispatch in flight for ever, which is the hole this module
+  # exists to close; `no_verdict_written` is what the run produced, stated without claiming a
+  # session ran.
+  defp mint(run_dir, fun) do
+    case fun.(run_dir) do
+      {:ok, token} -> {:ok, token}
+      {:error, reason} -> {:unreported, reason}
+    end
+  end
+
   # The checkout is READ, never branched: a triage session judges what is there.
+  #
+  # Its failures are `{:unreadable, _}` rather than `{:error, _}`, because this function LOOKED:
+  # the contract has a reason for exactly this and a verified cause is reportable.
   defp checkout(config, repo) do
     name = repo |> String.split("/") |> List.last()
 
     case Map.fetch(config.repos, name) do
       {:ok, path} ->
-        if File.dir?(path), do: {:ok, name, path}, else: {:error, "#{path} is not a directory"}
+        if File.dir?(path),
+          do: {:ok, name, path},
+          else: {:unreadable, "#{path} is not a directory"}
 
       :error ->
-        {:error, "#{repo} has no local checkout in repos"}
+        {:unreadable, "#{repo} has no local checkout in repos"}
     end
   end
 
@@ -273,10 +374,12 @@ defmodule LoopctlRunner.TriageRun do
     case TriageVerdict.read(run_dir) do
       {:ok, verdict} -> {:verdict, verdict}
       {:error, :none} -> incomplete(run_dir, session)
-      {:error, {:invalid, reason}} -> {:incomplete, "verdict_invalid", reason}
-      # The runner could not read what the session wrote. Reporting that as an invalid verdict
-      # would blame the session for an operator's failing volume or mode change.
-      {:error, {:unreadable, reason}} -> {:error, reason}
+      {:error, {:invalid, reason}} -> reported("verdict_invalid", reason)
+      # An IO failure reaches loopctl as an incomplete rather than a runner error — loopctl asked
+      # for that on the argument that decided checkout_unreadable: an error has no wire form, so
+      # it leaves the dispatch in flight for ever. WHICH incomplete is decided by looking, not
+      # assumed, because the contract defines verdict_invalid as the session having written one.
+      {:error, {:unreadable, reason}} -> unreadable(run_dir, reason)
     end
   end
 
@@ -286,25 +389,40 @@ defmodule LoopctlRunner.TriageRun do
   # First of all, the session monitor dying: whatever it wrote still counts, and outcome/2 has
   # already looked, so reaching here means there was no verdict to keep.
   defp incomplete(_run_dir, {:session_failed, detail}),
-    do: {:incomplete, "session_crashed", "the session could not be supervised: #{detail}"}
+    do: reported("session_crashed", "the session could not be supervised: #{detail}")
 
   defp incomplete(_run_dir, %{reason: :wall_clock_exceeded}),
-    do: {:incomplete, "wall_clock_exceeded", "the session ran out of wall clock"}
+    do: reported("wall_clock_exceeded", "the session ran out of wall clock")
 
   defp incomplete(_run_dir, %{reason: reason}) when reason in [:parked, :not_group_leader],
-    do: {:incomplete, "no_verdict_written", "the runner stopped the session: #{reason}"}
+    do: reported("no_verdict_written", "the runner stopped the session: #{reason}")
 
   # An escalation says the session judged it could not work at all — never WHY, since the text is
   # its own. `checkout_unreadable` would be the runner asserting a cause it never checked, and
   # sending whoever reads it to a checkout that is fine.
   defp incomplete(run_dir, %{reason: :escalated}),
-    do: {:incomplete, "no_verdict_written", "the session escalated: #{escalation_text(run_dir)}"}
+    do: reported("no_verdict_written", "the session escalated: #{escalation_text(run_dir)}")
 
   defp incomplete(_run_dir, %{exit_status: status}) when status != 0,
-    do: {:incomplete, "session_crashed", "the session exited #{status}"}
+    do: reported("session_crashed", "the session exited #{status}")
 
   defp incomplete(_run_dir, _session),
-    do: {:incomplete, "no_verdict_written", "the session ended without stating a verdict"}
+    do: reported("no_verdict_written", "the session ended without stating a verdict")
+
+  # A file that will not read is two different outcomes, and the difference is checkable: a
+  # REGULAR FILE at the verdict path is something the session wrote — only `loop-verdict` puts one
+  # there, by linking it into place — so the runner could not turn what the session wrote into a
+  # verdict, which is verdict_invalid as the contract defines it. Anything else at that path, or
+  # nothing, means no verdict was ever written: a directory (which `loop-verdict` cannot create)
+  # or a path the runner may no longer stat. Reporting the first for the second would assert a
+  # cause nobody verified, which is the objection this module already makes to naming a checkout
+  # as the reason a session escalated.
+  defp unreadable(run_dir, reason) do
+    case File.stat(TriageVerdict.file(run_dir)) do
+      {:ok, %File.Stat{type: :regular}} -> reported("verdict_invalid", reason)
+      _ -> reported("no_verdict_written", reason)
+    end
+  end
 
   # The session's own words, decoded out of the line rather than handed on as JSON.
   defp escalation_text(run_dir) do

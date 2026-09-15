@@ -104,8 +104,11 @@ defmodule LoopctlRunner.TriageVerdict do
         {:error, :none}
 
       {:error, reason} ->
-        # The runner's problem, not the session's: blaming the session for a mode change or a
-        # failing volume would report a verdict it never wrote badly.
+        # Says only that the file would not read, and never why THAT is — deciding whether a
+        # session wrote anything needs a look at what is actually at the path, which is
+        # `TriageRun.unreadable/2`'s job. This used to say the failure was the runner's problem
+        # and not the session's, and therefore not reportable; loopctl asked for the opposite and
+        # was right, because an outcome with no wire form leaves the dispatch in flight for ever.
         {:error,
          {:unreadable, "the verdict file could not be read: #{:file.format_error(reason)}"}}
     end
