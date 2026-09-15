@@ -21,6 +21,16 @@ All notable changes to loopctl are documented here.
   that can never be merged that tells a session to come back for a decision that cannot
   change, and then escalates naming the forge rather than the policy.
 
+  **A story in an excluded repository now terminates at `escalated`, so its intake issue is
+  never closed automatically.** `StageMachine`'s resolution verdicts are reached from
+  `{:deployed, :verified}` and `{:triaged, :failed}`; a self-deploy refusal takes
+  `{:ci, :escalated, :merge_gate}`, and `:human_resolution` leads to `queued`, `done` or
+  `failed`, none of which produce a resolution. So the human who merges one of these by hand
+  also closes or comments on the reporter's issue by hand. loopctl's own repository is the
+  primary user of this loop, so that is a real population rather than a corner. Mapping a
+  human resolution onto an intake outcome belongs to #805, which owns the verdict-to-
+  resolution mapping and lands before the loop is turned on for a non-engineer reporter.
+
   **Operators:** the list defaults to `mkreyman/loopctl` and `mkreyman/claude-config` and is
   settable with `config :loopctl, :self_deploy_excluded_repos, ["owner/name", ...]` — set it
   if your control plane is deployed from a different repository, because the default names
