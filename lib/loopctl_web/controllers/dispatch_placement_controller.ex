@@ -109,7 +109,8 @@ defmodule LoopctlWeb.DispatchPlacementController do
          ],
          description:
            "The dispatch object, as `RunnerDispatch` declares it, minus `claim_epoch` (which " <>
-             "loopctl injects from the claim) and minus `story` (which is REFUSED — see " <>
+             "loopctl injects from the claim) and minus `story` (which is REFUSED and built " <>
+             "server-side from loopctl's own rows — see " <>
              "`story_not_accepted` below). Nothing is defaulted: `kind` must be sent and " <>
              "must be one of `x-connection.dispatchable_kinds`.",
          properties: %{
@@ -160,10 +161,18 @@ defmodule LoopctlWeb.DispatchPlacementController do
       404 => {"Not found", "application/json", Schemas.ErrorResponse},
       409 => {"Not placeable", "application/json", Schemas.ErrorResponse},
       422 =>
-        {"Validation error, or `story_not_accepted` — the story object is built by loopctl " <>
-           "from its own records and may not be supplied by a caller", "application/json",
-         Schemas.ErrorResponse},
-      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+        {"Validation error; `story_not_accepted` — the story object is built by loopctl from " <>
+           "its own records and may not be supplied by a caller; or " <>
+           "`story_not_dispatchable` — the story exceeds a cap the runner contract declares " <>
+           "and HAS BEEN ESCALATED to a human, with the claim released and nothing " <>
+           "dispatched; or `story_no_longer_dispatchable` — the same cap on a RE-SEND of a " <>
+           "recorded dispatch_id, where nothing is written and the claim stands",
+         "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError},
+      500 =>
+        {"`story_escalation_failed` — the story is neither dispatchable nor parked, so " <>
+           "nothing is on a runner and no human has it either", "application/json",
+         Schemas.ErrorResponse}
     }
   )
 
@@ -199,14 +208,18 @@ defmodule LoopctlWeb.DispatchPlacementController do
   # anything on it." A caller-supplied `story` IS prose handed to a runner, one level along.
   #
   # `Loopctl.Delivery.StoryPayload.build/3` is the server-side builder — "built from
-  # Postgres" — and `place/4` does not call it, so the object was whatever the caller sent.
-  # That was unreachable while `place/4` had no caller; THIS endpoint makes it reachable, so
-  # closing it belongs to this change and not to a later one.
+  # Postgres" — and `place/4` NOW CALLS IT (`attach_story/6`), after the claim, which is the
+  # only point where an undispatchable story can be escalated rather than truncated. So an
+  # implement dispatch placed here carries a story object loopctl built from its own rows, and
+  # the runner receives work rather than a story_id with nothing attached.
   #
-  # Refused rather than silently dropped: a caller that sent a story and got a dispatch with
-  # none would have no way to tell, and the runner would start work on a story object nobody
-  # intended. Until `place/4` builds it server-side, an implement dispatch placed here carries
-  # no story object and the runner sees exactly what loopctl vouched for — nothing.
+  # This guard stays, and it is no longer the only one: `place/4` refuses a caller-supplied
+  # `story` itself, so a worker, an MCP tool or the unattended driver is bound by the same
+  # rule without passing through this endpoint. What this one adds is the message — a caller
+  # is told to send `story_id` alone rather than getting a bare reason code.
+  #
+  # Refused rather than silently dropped: a caller that sent a story and got a dispatch
+  # carrying a different one would have no way to tell.
   defp caller_supplied_story?(dispatch), do: Map.has_key?(dispatch, "story")
 
   defp refuse_story(conn) do
@@ -362,6 +375,55 @@ defmodule LoopctlWeb.DispatchPlacementController do
           "claim was released. Retry when a slot frees."
     })
   end
+
+  # THE STORY WAS TOO BIG FOR THE CONTRACT AND A HUMAN NOW HAS IT. An ordinary outcome of this
+  # endpoint since `place/4` builds the story object: the story is escalated, the claim is
+  # released, and nothing is on a runner. Rendered here because the shared fallback matches
+  # `{:error, reason} when is_atom(reason)` and a TUPLE matched no clause at all — the same
+  # FunctionClauseError this file already records for `{:invalid, messages}`, which would have
+  # answered a 500 and a crash log to a caller whose story is sitting in front of a person.
+  defp refuse(conn, {:story_not_dispatchable, violations}) do
+    error(conn, 422, "story_not_dispatchable", %{
+      message:
+        "The story exceeds a cap the runner contract declares, so it was ESCALATED to a " <>
+          "human rather than truncated — a dropped acceptance criterion is a story built to " <>
+          "the wrong spec. The claim was released and nothing was dispatched. Shorten the " <>
+          "story and it becomes dispatchable again.",
+      violations: Enum.take(violations, 10)
+    })
+  end
+
+  # NEITHER DISPATCHABLE NOR PARKED, which is the outcome nothing downstream picks up. 500 and
+  # not 422: the story is undersized for nobody's fault, the escalation loopctl tried to write
+  # failed, and the caller cannot fix either by changing the request.
+  defp refuse(conn, {:escalation_failed, reason, violations}) do
+    error(conn, 500, "story_escalation_failed", %{
+      message:
+        "The story is not dispatchable AND could not be escalated, so it is in neither " <>
+          "place: nothing is on a runner and no human has been given it. This needs an " <>
+          "operator.",
+      escalation_error: inspect(reason),
+      violations: Enum.take(violations, 10)
+    })
+  end
+
+  # THE RESUME'S VERSION, and it says the opposite about the claim on purpose. A re-send does
+  # not own the claim it would be parking — the story may be live under a session right now —
+  # so this path writes NOTHING: no escalation, no release, no chain entry. Telling the
+  # operator "the claim was released" here, as the message above does, would be a false
+  # statement about system state that they would then act on.
+  defp refuse(conn, {:story_no_longer_dispatchable, violations}) do
+    error(conn, 422, "story_no_longer_dispatchable", %{
+      message:
+        "This dispatch_id is already recorded, and the story no longer fits a cap the runner " <>
+          "contract declares — it must have been edited since it was placed. NOTHING was " <>
+          "changed: the claim stands and any session under it is untouched. Shorten the " <>
+          "story, or release the claim and place it again.",
+      violations: Enum.take(violations, 10)
+    })
+  end
+
+  defp refuse(conn, :story_not_accepted), do: refuse_story(conn)
 
   defp refuse(conn, :capacity_busy) do
     error(conn, 429, "capacity_busy", %{

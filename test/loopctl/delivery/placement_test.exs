@@ -22,6 +22,7 @@ defmodule Loopctl.Delivery.PlacementTest do
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.AuditChain
   alias Loopctl.Auth.ApiKey
+  alias Loopctl.Delivery.ImplementerInput
   alias Loopctl.Delivery.Placement
   alias Loopctl.Delivery.Stages
   alias Loopctl.Dispatches
@@ -30,6 +31,7 @@ defmodule Loopctl.Delivery.PlacementTest do
   alias Loopctl.Runners.DispatchLedger
   alias Loopctl.Tenants.Tenant
   alias Loopctl.WorkBreakdown.Stories
+  alias Loopctl.WorkBreakdown.Story
   alias LoopctlWeb.RunnerSocket
 
   setup :verify_on_exit!
@@ -69,6 +71,75 @@ defmodule Loopctl.Delivery.PlacementTest do
   end
 
   describe "place/4" do
+    test "the dispatch carries the story object loopctl built from its own row", ctx do
+      %{runner: runner, story: story} = ctx
+
+      # Real acceptance criteria on the ROW, because they are what an implementer is judged
+      # against and what the fixture story does not have: without them the object is a title
+      # and an id, and this test would pass on a dispatch carrying no work either.
+      unboxed(fn -> give_criteria!(runner.tenant_id, story.id) end)
+      story = unboxed(fn -> reload(runner.tenant_id, story.id) end)
+
+      assert {:ok, _placed} = place(ctx, dispatch_payload(story))
+      assert_push "dispatch", pushed, @reply_timeout
+
+      # The whole point of the dispatch, and it was MISSING: an implement dispatch carries the
+      # story as typed fields and the runner composes its prompt from them, so a dispatch with
+      # no `story` names a story_id and carries no work. The runner refuses it outright and
+      # identically on every redispatch — a clean, permanent, invisible no — which is what
+      # both callers of this function sent until now.
+      assert pushed.story.id == story.id
+      assert pushed.story.title == story.title
+
+      # Built from POSTGRES, not echoed from the caller: the criteria are the story's own.
+      assert pushed.story.acceptance_criteria == expected_criteria(story)
+    end
+
+    test "a CALLER-supplied story object is refused, and nothing is claimed", ctx do
+      %{runner: runner, story: story} = ctx
+
+      payload =
+        Map.put(dispatch_payload(story), "story", build(:runner_story, %{"id" => story.id}))
+
+      # The contract's no-prompt rule, holding one level along: a caller able to hand a runner
+      # an arbitrary story object is a caller able to hand it prose to execute, and a dispatch
+      # runs as the machine's user. Refused in `place/4` and not only at the HTTP edge,
+      # because a worker, an MCP tool and the unattended driver never pass through that edge.
+      assert {:error, :story_not_accepted} = place(ctx, payload)
+      refute_push "dispatch", _pushed
+
+      row = unboxed(fn -> Stages.get(runner.tenant_id, story.id) end)
+      assert row.stage == :queued
+      assert unboxed(fn -> reload(runner.tenant_id, story.id) end).agent_status == :contracted
+    end
+
+    test "a story too large for the contract is ESCALATED, and the claim goes back", ctx do
+      %{runner: runner, story: story} = ctx
+
+      # Oversize by the contract's own byte rule, which charges 6 bytes per character. loopctl
+      # REFUSES such a story rather than truncating it — a dropped acceptance criterion is a
+      # story built to the wrong spec and an implementer cannot tell three criteria from four
+      # with the fourth cut.
+      unboxed(fn -> oversize!(runner.tenant_id, story.id) end)
+
+      assert {:error, {:story_not_dispatchable, [_ | _]}} = place(ctx, dispatch_payload(story))
+      refute_push "dispatch", _pushed
+
+      # ESCALATED, not requeued, and both halves matter. The escalation is where the builder
+      # put the story — a human has it — and `undo_claim/5` must not fight that:
+      # `Stages.follow_release/5` requeues only an IN-FLIGHT row and rebinds anything else, so
+      # the row keeps `escalated` and takes the released epoch rather than going back to
+      # `queued` for the next pass to fail on identically.
+      row = unboxed(fn -> Stages.get(runner.tenant_id, story.id) end)
+      assert row.stage == :escalated
+
+      # And the claim is released: no session will ever run under it.
+      released = unboxed(fn -> reload(runner.tenant_id, story.id) end)
+      assert released.assigned_agent_id == nil
+      assert released.claim_epoch > story.claim_epoch
+      assert row.claim_epoch == released.claim_epoch
+    end
+
     test "claims the story, enters `claimed` and pushes the dispatch", ctx do
       %{runner: runner, story: story} = ctx
       payload = dispatch_payload(story)
@@ -296,6 +367,61 @@ defmodule Loopctl.Delivery.PlacementTest do
       unboxed(fn -> Progress.force_unclaim_story(runner.tenant_id, story.id, []) end)
 
       assert {:error, :stale_claim_epoch} = place(ctx, payload)
+    end
+
+    test "a RESUME rebuilds the story object, and refuses rather than re-sending without one",
+         ctx do
+      %{runner: runner, story: story, channel: channel} = ctx
+      payload = dispatch_payload(story)
+
+      assert {:ok, _first} = place(ctx, payload)
+      assert_push "dispatch", _pushed, @reply_timeout
+
+      # The retry path pushed the CALLER's map, which since `no_caller_story/1` can never
+      # carry a story — so a re-send (a lost HTTP response, a failed broadcast, a dropped
+      # frame; each leaves the ledger row at `sent`, which is what routes a re-send here) put
+      # an implement dispatch with no story on the wire while this function answered `{:ok,
+      # ...}` as though work had been placed. That is the very defect this change exists to
+      # fix, left open on the ordinary retry path.
+      #
+      # Proven by making the STORY undispatchable between the two calls: the resume can only
+      # answer this if it actually built the object. Without the rebuild it reaches the push
+      # and answers `:runner_not_connected` instead, which is what the test below asserts for
+      # a story that is still fine.
+      disconnect(channel, runner)
+      unboxed(fn -> oversize!(runner.tenant_id, story.id) end)
+
+      assert {:error, {:story_no_longer_dispatchable, [_ | _]}} = place(ctx, payload)
+
+      # AND NOTHING WAS WRITTEN. A re-send does not own the claim it would be parking — the
+      # story may be live under a session right now — and the ledger's own fences
+      # (`dispatch_already_replied`, `stale_claim_epoch`) are not reached until the PUSH, so
+      # escalating here would have written over a story nobody asked about, for a duplicate
+      # retry of a dispatch that was already answered. Round 2 of this PR's review caught it.
+      assert unboxed(fn -> Stages.get(runner.tenant_id, story.id) end).stage == :claimed
+      still = unboxed(fn -> reload(runner.tenant_id, story.id) end)
+      assert still.agent_status == :assigned
+      assert still.assigned_agent_id == runner.agent_id
+    end
+
+    test "an upper-case story_id is placed, and the object matches the id on the wire", ctx do
+      %{runner: runner, story: story} = ctx
+      shouty = String.upcase(story.id)
+      payload = Map.put(dispatch_payload(story), "story_id", shouty)
+
+      # `Ecto.UUID.cast/1` DOWN-CASES, so the claim uses the canonical id while the caller's
+      # map keeps its own spelling — and the object loopctl builds carries the ROW's id, which
+      # the contract then compares against the dispatch's `story_id`. Round 1 of this PR's
+      # review read that as a regression; it is not, and this test is the disproof rather than
+      # a fix: `RunnerContract.cast_dispatch/1` normalises `story_id` before the comparison,
+      # and `Runners.dispatch/3` broadcasts the CAST map, so the frame carries the canonical
+      # id too. Kept because nothing else pinned it.
+      assert {:ok, _placed} = place(ctx, payload)
+      assert_push "dispatch", pushed, @reply_timeout
+
+      assert pushed.story_id == story.id
+      assert pushed.story.id == story.id
+      assert unboxed(fn -> Stages.get(runner.tenant_id, story.id) end).stage == :claimed
     end
 
     test "a re-sent dispatch_id claims nothing a second time, and releases nothing", ctx do
@@ -562,11 +688,44 @@ defmodule Loopctl.Delivery.PlacementTest do
     AdminRepo.aggregate(from(d in Dispatch, where: d.tenant_id == ^tenant_id), :count, :id)
   end
 
-  defp dispatch_payload(story) do
-    build(:runner_dispatch, %{
-      "story_id" => story.id,
-      "story" => build(:runner_story, %{"id" => story.id})
-    })
+  # NO `story` KEY: loopctl builds the object itself now (`attach_story/6`), and `place/4`
+  # REFUSES a caller-supplied one — a caller able to hand a runner prose is able to run
+  # anything on that machine. What the runner receives is asserted in "the dispatch carries
+  # the story object loopctl built" rather than echoed from here.
+  defp dispatch_payload(story), do: build(:runner_dispatch, %{"story_id" => story.id})
+
+  # The criteria as `ImplementerInput.story_object/2` renders them — the one derivation, so
+  # this asserts the object came from the story rather than re-implementing the builder here.
+  defp expected_criteria(story) do
+    {:ok, object} = ImplementerInput.story_object(story)
+    object["acceptance_criteria"]
+  end
+
+  defp give_criteria!(tenant_id, story_id) do
+    {1, _} =
+      AdminRepo.update_all(
+        from(s in Story,
+          where: s.id == ^story_id and s.tenant_id == ^tenant_id
+        ),
+        set: [
+          acceptance_criteria: [
+            %{"id" => "AC-1", "description" => "The monthly total equals the sum of its visits"}
+          ]
+        ]
+      )
+  end
+
+  # A description past `RunnerStory.max_bytes/0` under the contract's byte rule (6 bytes per
+  # character, 12 per string). Written straight to the row: no changeset needs to allow this,
+  # and the point is a story that EXISTS and cannot be described within the contract.
+  defp oversize!(tenant_id, story_id) do
+    {1, _} =
+      AdminRepo.update_all(
+        from(s in Story,
+          where: s.id == ^story_id and s.tenant_id == ^tenant_id
+        ),
+        set: [description: String.duplicate("a", 20_000)]
+      )
   end
 
   defp reload(tenant_id, story_id) do
