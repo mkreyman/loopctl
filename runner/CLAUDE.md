@@ -40,11 +40,16 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
   than being skipped, so a definition carrying one would refuse every payload on this side.
   `Contract.validate_against/3` tests a keyword on an inline schema before the vendored file
   uses it; loopctl's own test fails when its enforced set exceeds its exported set.
-- **A refusal naming a capability must be a real capability statement.** `kind_not_supported`
-  says this runner never runs that kind, and loopctl caches it. Declaring a kind on join and
-  then refusing it is a BUG here, and loopctl's per-connection suppression of that kind is a
-  bound on the damage, never a recovery to lean on. A transient local condition gets its own
-  `DispatchPolicy` reason instead.
+- **A refusal naming a capability must be a real capability statement**, and
+  **`kind_not_supported` for `implement` would take this machine out of ALL work, permanently**.
+  loopctl records the refusal in `DispatchLedger`, keyed by kind: a cached negative with no
+  expiry and no clearing path, cleared only by revoking and re-enrolling the runner. `implement`
+  is the only dispatchable kind, so a refusal of it ends dispatch to this machine while it stays
+  connected and looks healthy. Today the only site that answers this reason is
+  `Control.implement_kind/1`, which fires for a kind that is NOT `implement` — so the ledger
+  caches that other kind and `implement` dispatch is untouched. Keep it that way: nothing here
+  may answer `kind_not_supported` for anything but a real capability statement, and a transient
+  local condition gets its own `DispatchPolicy` reason instead.
 - **The daemon starts only under `LOOPCTL_RUNNER_DAEMON=1`**, so `mix loopctl.run` never joins
   the pool.
 - **A loop session asks for a human by running `priv/bin/loop-escalate`**, the one command the
