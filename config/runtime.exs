@@ -167,6 +167,32 @@ case System.get_env("RUNNER_MAX_IN_FLIGHT_SESSIONS") &&
   _ -> :ok
 end
 
+# #803: the unattended dispatch driver (Loopctl.Delivery.DispatchDriver). OPT-IN — anything
+# but "true"/"1" leaves it off, including a typo, because this is the component that spends
+# money and runs code on someone's machines with nobody watching.
+config :loopctl,
+       :dispatch_driver_enabled,
+       System.get_env("DISPATCH_DRIVER_ENABLED") in ~w(true 1)
+
+# Its per-session budgets. NO DEFAULT on purpose: enabled with either unset, the driver
+# places nothing and the cron job FAILS naming the key, rather than dispatching on a figure
+# nobody chose. Set both, as ordinary config (not secrets), before enabling.
+#
+# Spelled out one variable at a time rather than looped over a list of {var, key} pairs,
+# which is how this was first written: `mix loopctl.check_env_docs` scans these files
+# TEXTUALLY and refuses a name built at runtime, because a name it cannot resolve is a name
+# it cannot check the documentation for — exactly the silent gap #566 closed.
+case System.get_env("DISPATCH_WALL_CLOCK_SECONDS") &&
+       Integer.parse(System.get_env("DISPATCH_WALL_CLOCK_SECONDS")) do
+  {seconds, ""} when seconds > 0 -> config :loopctl, :dispatch_wall_clock_seconds, seconds
+  _ -> :ok
+end
+
+case System.get_env("DISPATCH_MAX_TURNS") && Integer.parse(System.get_env("DISPATCH_MAX_TURNS")) do
+  {turns, ""} when turns > 0 -> config :loopctl, :dispatch_max_turns, turns
+  _ -> :ok
+end
+
 endpoint_http = [
   # Transport-layer DoS backstop. `websocket_options` is a BANDIT server-level
   # setting (the Phoenix `socket "/live", websocket: [...]` DSL rejects

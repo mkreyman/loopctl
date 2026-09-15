@@ -101,7 +101,9 @@ defmodule LoopctlWeb.IntakeSourceController do
            }
          }},
       403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
-      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      422 =>
+        {"Validation error, or `nothing_to_update` — the body named neither field",
+         "application/json", Schemas.ErrorResponse},
       429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
     }
   )
@@ -144,7 +146,10 @@ defmodule LoopctlWeb.IntakeSourceController do
   operation(:update,
     summary: "Repoint a GitHub intake source at an epic",
     description:
-      "Sets `target_epic_id` on an ACTIVE source, or clears it with an explicit null. The " <>
+      "Sets `target_epic_id` on an ACTIVE source, or clears it with an explicit null, and/or " <>
+        "`base_branch`. BOTH ARE OPTIONAL AND A FIELD YOU DO NOT SEND IS LEFT ALONE — " <>
+        "clearing the epic takes an explicit null, and a body naming neither field is a 422. " <>
+        "The " <>
         "epic must belong to this source\'s project. This is the remedy for a source enrolled " <>
         "before the field existed, or one whose reports are being retried because it names no " <>
         "epic: until it does, every record from it stays `pending_triage` and is retried, and " <>
@@ -157,7 +162,6 @@ defmodule LoopctlWeb.IntakeSourceController do
       {"Repoint", "application/json",
        %Schema{
          type: :object,
-         required: [:target_epic_id],
          properties: %{
            target_epic_id: %Schema{
              type: :string,
@@ -167,6 +171,20 @@ defmodule LoopctlWeb.IntakeSourceController do
                "The epic triaged stories land in; it must belong to this source\'s project. " <>
                  "Null clears it, which returns the source to escalating nothing and " <>
                  "retrying every report."
+           },
+           base_branch: %Schema{
+             type: :string,
+             minLength: 1,
+             maxLength: 255,
+             description:
+               "The branch every dispatch for this repository is cut FROM, and the " <>
+                 "`base_branch` an unattended dispatch carries (#803). Defaults to " <>
+                 "`master`, which is what dispatches carried before the field existed; set " <>
+                 "it to `main` for a repository created on GitHub since 2020, or the loop " <>
+                 "places work against a branch that does not exist. OPTIONAL and NOT " <>
+                 "nullable, unlike `target_epic_id`: omitting it leaves the current value " <>
+                 "(there is no unanswered state for a branch a dispatch must name), and an " <>
+                 "explicit null is a 422."
            }
          }
        }},
@@ -212,16 +230,50 @@ defmodule LoopctlWeb.IntakeSourceController do
   def update(conn, %{"id" => source_id} = params) do
     tenant = conn.assigns.current_tenant
 
-    # `Map.get`, so an absent key and an explicit null are the SAME here — both nil — and that
-    # is deliberate: the body has exactly one field, so a PATCH that names nothing is a
-    # request to clear it rather than a no-op worth distinguishing. `target_epic_id` is
-    # `required` in the request schema, which is what makes "absent" an OpenAPI error rather
-    # than a silent clear for anyone reading the spec.
-    with {:ok, source} <-
-           Intake.repoint_source(tenant.id, source_id, Map.get(params, "target_epic_id"),
-             actor_lineage: actor_lineage(conn)
-           ) do
-      json(conn, %{source: source})
+    # PRESENCE, for both fields. A PATCH is partial by definition, and this action now carries
+    # two fields, so "absent means clear" — which the epic alone could just about justify —
+    # became a trap the moment a caller could legitimately send only the other one: setting
+    # the base branch would have silently UN-POINTED the source from its epic, which by this
+    # action's own description strands every record from it at `pending_triage`. The `required`
+    # marker in the request schema is documentation, not enforcement: this router mounts no
+    # `CastAndValidate`, so nothing refused the body that did it.
+    #
+    # An explicit null still clears the epic. That is the difference a map can carry and two
+    # positional arguments cannot, and it is why the whole update goes to `Intake` as one.
+    attrs =
+      %{}
+      |> put_if_present(params, "target_epic_id", :target_epic_id)
+      |> put_if_present(params, "base_branch", :base_branch)
+
+    case Intake.update_source(tenant.id, source_id, attrs, actor_lineage: actor_lineage(conn)) do
+      {:ok, source} ->
+        json(conn, %{source: source})
+
+      # RENDERED HERE, because `FallbackController`'s catch-all answers 500 for an atom it has
+      # no clause for — correctly, since an unmapped refusal is a gap. A body naming neither
+      # field is a caller error and says so.
+      {:error, :nothing_to_update} ->
+        conn
+        |> put_status(422)
+        |> json(%{
+          error: %{
+            status: 422,
+            code: "nothing_to_update",
+            message:
+              "Name at least one of target_epic_id (null clears it) or base_branch. A field " <>
+                "you do not send is left exactly as it was."
+          }
+        })
+
+      {:error, reason} ->
+        LoopctlWeb.FallbackController.call(conn, {:error, reason})
+    end
+  end
+
+  defp put_if_present(attrs, params, key, field) do
+    case Map.fetch(params, key) do
+      {:ok, value} -> Map.put(attrs, field, value)
+      :error -> attrs
     end
   end
 

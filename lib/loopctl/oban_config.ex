@@ -653,6 +653,15 @@ defmodule Loopctl.ObanConfig do
            # waiting since her issue arrived. Bounded per run. Keep in sync with the crontab
            # assertion in oban_plugins_config_test.exs.
            {"* * * * *", Loopctl.Workers.TriageTriggerWorker},
+           # #803 §3: places queued stories on connected runners — the cadence half of
+           # Loopctl.Delivery.Placement.place/4, whose only other caller is an operator's
+           # POST. SCHEDULED ALWAYS AND INERT UNTIL TURNED ON: `:dispatch_driver_enabled`
+           # defaults to false, so until an operator sets it this entry runs, places nothing
+           # and reports :ok. Every minute for the same reason as the triage trigger above —
+           # a candidate is local statements on AdminRepo plus one push to a connected
+           # socket, so the bound is that pool and not anyone's rate limit. Bounded per run.
+           # Keep in sync with the crontab assertion in oban_plugins_config_test.exs.
+           {"* * * * *", Loopctl.Workers.DispatchDriverWorker},
            {"* * * * *", Loopctl.Workers.SystemConfigRefreshWorker},
            # #803 §11: retention for the delivery loop's two unbounded high-volume tables,
            # `runner_trace_events` and `intake_deliveries`. Nothing else deletes from either.
