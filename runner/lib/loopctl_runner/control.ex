@@ -35,8 +35,10 @@ defmodule LoopctlRunner.Control do
        the connection for a runner that declares, and is permanent for one that does not;
     3. `LoopctlRunner.DispatchPolicy` — its reason and detail on a refusal, with `in_flight`
        counting every run this process accepted from the moment it accepted it;
-    4. the dispatch must carry a `story` object meeting what the schema cannot say, chiefly
-       `story.id` equal to `story_id` (`LoopctlRunner.DispatchRun`), or it is refused `other`.
+    4. the dispatch must carry the object its kind is run from, meeting what the schema cannot
+       say, or it is refused `other`: a `story` whose `id` equals `story_id`
+       (`LoopctlRunner.DispatchRun`) for an `implement` dispatch, a `triage` report within the
+       contract's byte cap (`LoopctlRunner.TriageDispatch`) for a `triage` one.
 
   Before any of these, the contract's own `RunnerDispatch` validation (1.5.0 types the story)
   refuses a malformed dispatch `other`, naming the field.
@@ -91,6 +93,43 @@ defmodule LoopctlRunner.Control do
   `worktree` and `claimed`, stopping at the first acknowledgement. Reports not yet
   acknowledged when the channel closes are resent after the rejoin, in order; a replay whose first
   copy committed is answered `ok`.
+
+  ## Triage verdicts
+
+  An accepted `triage` dispatch runs `LoopctlRunner.TriageRun.execute/4` on the same supervisor,
+  and reports ONE thing: a `triage_verdict` message carrying exactly one of `verdict` and
+  `incomplete`. It reports no stages — the contract's stage machine moves a story, and a triage
+  dispatch has none — so that message is the whole of its report, and the run tells this process
+  its outcome the way an implement run tells it a stage: as a message to the registered name, so a
+  run whose Control died reaches the successor.
+
+  The run's task dying without having reported is itself reported, as `no_verdict_written`, and
+  the state.json it left at `running` is closed with the run directory the run announced when it
+  started: the outcome is this dispatch's only output, and one never sent leaves loopctl's ledger
+  row waiting for as long as the claim holds — while a state left in flight would be counted by
+  every status push for the life of this BEAM.
+
+  The message outlives this process the way a pending accept does. It is written to its run
+  directory (`LoopctlRunner.PendingVerdicts`) before anything is told about it and deleted when
+  loopctl has recorded it or the refusal is one no resend can move, so a Control that starts over
+  one resends exactly the bytes that were composed for it — never a message rebuilt, which loopctl
+  would refuse `already_recorded` if a single field had drifted. The run itself writes one at its
+  end, which is what covers a run that finishes while NO Control is registered to take its
+  message; this process writes the one it states for a run whose task died saying nothing.
+
+  Refusals are read from the contract (`LoopctlRunner.TriageDispatch.classify/1`), not from a list
+  written here: `rate_limited` waits out the `triage_verdict_burst` refill in the same shape of
+  backlog a `dispatch_reply` uses, `internal_error` is retried to the terminal ceiling, and a
+  permanent refusal is logged as an error and given up, since the contract says nothing will move
+  it. `dispatch_not_accepted` is permanent unless an accept this runner sent for that dispatch is
+  still unacknowledged, which is the one case worth waiting for. A verdict loopctl had not
+  recorded when the channel closed is resent after the rejoin: the message is idempotent per
+  dispatch, and a byte-identical resend is answered `ok` with `replayed` true — which is logged,
+  because an `ok` that recorded the verdict and an `ok` that applied nothing are otherwise the
+  same answer.
+
+  `triage` is NOT in `@kinds`, so none of this is reachable from the wire today: a triage dispatch
+  is refused `kind_not_supported` before the accept path is consulted.
 
   ## Trace shipping
 
@@ -148,10 +187,13 @@ defmodule LoopctlRunner.Control do
     Health,
     Owner,
     PendingStarts,
+    PendingVerdicts,
     Run,
     Runs,
     RunState,
-    TraceShip
+    TraceShip,
+    TriageDispatch,
+    TriageRun
   }
 
   @reconnect_backoff_ms [1_000, 2_000, 5_000, 10_000, 30_000, 60_000, 120_000]
@@ -305,6 +347,7 @@ defmodule LoopctlRunner.Control do
             # Where accepted runs are started, and what runs them (replaceable in tests).
             run_supervisor: Keyword.get(opts, :run_supervisor, LoopctlRunner.RunSupervisor),
             run: Keyword.get(opts, :run, &Run.execute/3),
+            triage_run: Keyword.get(opts, :triage_run, &TriageRun.execute/4),
             # dispatch_id => claim_epoch for every dispatch this process started a run for, so
             # a repeat of one is never run twice.
             started_dispatches: started_dispatches(config.runs_dir),
@@ -315,11 +358,14 @@ defmodule LoopctlRunner.Control do
             # per dispatch when that dispatch's trace is settled, which is the last moment anything
             # asks about it.
             superseded_dispatches: %{},
-            # dispatch_id => %{dispatch, story, opts}: accepted, waiting for loopctl to record it.
+            # dispatch_id => %{dispatch, work, opts}: accepted, waiting for loopctl to record it.
+            # `work` is what the dispatch's kind runs — a story, or a triage report and its repo.
             pending_starts: %{},
             # The registered name runs report to, so they reach a successor of this process.
             name: Keyword.get(opts, :name),
-            # Runs in flight: dispatch_id => %{ref, run_id, run_dir}; and task ref => dispatch_id.
+            # Runs in flight: dispatch_id => %{ref, run_id, run_dir, kind}, a triage run's entry
+            # also carrying `binding` and `verdict` (:pending until its outcome is reported, which
+            # is what keeps its task ending from reporting a second time); and ref => dispatch_id.
             runs: %{},
             run_refs: %{},
             # dispatch_id => the stage stream (see stage_stream/1); push ref => dispatch_id.
@@ -374,6 +420,16 @@ defmodule LoopctlRunner.Control do
             reply_timer: nil,
             dispatch_reply_retry_ms:
               Keyword.get(opts, :dispatch_reply_retry_ms, dispatch_reply_retry_ms()),
+            # triage_verdict pushes awaiting their reply (ref => {payload, carried?}), those
+            # waiting out a refusal, their single timer, and the internal_errors each dispatch's
+            # verdict has collected. Shaped like the dispatch_reply backlog above, and separate
+            # from it: the two events have their own burst budgets and their own refusals.
+            verdict_pushes: %{},
+            verdict_backlog: [],
+            verdict_timer: nil,
+            verdict_errors: %{},
+            triage_verdict_retry_ms:
+              Keyword.get(opts, :triage_verdict_retry_ms, triage_verdict_retry_ms()),
             # The trace shipper (TraceShip): the acknowledged seq per run, learned by a cursor
             # after each join; the one trace push awaiting its reply; its timer; per-run
             # adjustments after a refusal; and how often an idle shipper looks for new lines.
@@ -399,9 +455,14 @@ defmodule LoopctlRunner.Control do
             trace_find_runs: Keyword.get(opts, :trace_find_runs, &TraceShip.runs/1)
           )
 
-        # What a crashed predecessor left unfinished: accepts whose run never started, and
-        # finished runs whose terminal report loopctl never acknowledged.
-        socket = socket |> restore_pending_starts() |> recover_terminal_reports()
+        # What a crashed predecessor left unfinished: accepts whose run never started, triage
+        # verdicts loopctl never recorded, and finished runs whose terminal report it never took.
+        socket =
+          socket
+          |> restore_pending_starts()
+          |> restore_pending_verdicts()
+          |> recover_terminal_reports()
+
         {:ok, socket, {:continue, :connect}}
 
       {:error, reason} ->
@@ -470,6 +531,13 @@ defmodule LoopctlRunner.Control do
             "recorded when the channel closed"
         )
 
+    if socket.assigns.verdict_backlog != [],
+      do:
+        Logger.info(
+          "resending #{length(socket.assigns.verdict_backlog)} triage_verdict(s) loopctl had " <>
+            "not recorded when the channel closed"
+        )
+
     {:ok,
      socket
      |> assign(
@@ -484,6 +552,7 @@ defmodule LoopctlRunner.Control do
      )
      |> schedule_status()
      |> schedule_reply_backlog()
+     |> schedule_verdict_backlog()
      |> schedule_trace(0, true)
      |> resume_stages()}
   end
@@ -585,6 +654,12 @@ defmodule LoopctlRunner.Control do
       dispatch_replies: %{},
       reply_backlog: carry_dispatch_replies(socket.assigns),
       reply_timer: cancel_reply_timer(socket.assigns.reply_timer),
+      # A verdict is a run's ONLY output and is idempotent per dispatch, so one the channel died
+      # under is resent after the rejoin rather than lost; loopctl answers the repeat `ok` and
+      # applies no second transition.
+      verdict_pushes: %{},
+      verdict_backlog: carry_verdicts(socket.assigns),
+      verdict_timer: cancel_reply_timer(socket.assigns.verdict_timer),
       # loopctl replays nothing on a rejoin: every cursor is asked again on the next channel.
       trace_positions: %{},
       trace_runs: nil,
@@ -608,6 +683,11 @@ defmodule LoopctlRunner.Control do
   defp carry_dispatch_replies(%{dispatch_replies: in_flight, reply_backlog: backlog}) do
     for {payload, story_id, _carried?} <- Map.values(in_flight) ++ backlog,
         do: {payload, story_id, true}
+  end
+
+  defp carry_verdicts(%{verdict_pushes: in_flight, verdict_backlog: backlog}) do
+    for {payload, run_dir, _carried?} <- Map.values(in_flight) ++ backlog,
+        do: {payload, run_dir, true}
   end
 
   defp cancel_reply_timer(nil), do: nil
@@ -684,6 +764,42 @@ defmodule LoopctlRunner.Control do
 
   def handle_info({:send_reply_backlog, _stale_token}, socket), do: {:noreply, socket}
 
+  # The same shape for triage_verdicts, on their own burst budget and their own timer: a
+  # rate-limited verdict must not wait behind a rate-limited dispatch_reply, nor spend its refill.
+  def handle_info(
+        {:send_verdict_backlog, token},
+        %{assigns: %{joined: true, verdict_timer: {_timer, token}}} = socket
+      ) do
+    socket = assign(socket, verdict_timer: nil)
+
+    case socket.assigns.verdict_backlog do
+      [{payload, run_dir, carried?} | rest] ->
+        socket =
+          socket
+          |> assign(verdict_backlog: rest)
+          |> push_verdict(payload, run_dir, carried?)
+          |> schedule_verdict_backlog()
+
+        {:noreply, socket}
+
+      [] ->
+        {:noreply, socket}
+    end
+  end
+
+  def handle_info({:send_verdict_backlog, _stale_token}, socket), do: {:noreply, socket}
+
+  # What a triage run reports: its one outcome, carried as a message rather than read off the
+  # task's return value, so a run whose Control died reaches the successor — the same reason
+  # `{:run_stage, _, _}` above is a message.
+  def handle_info({:triage_outcome, binding, run, outcome}, socket)
+      when is_map(binding) and is_map(run),
+      do: {:noreply, triage_outcome(socket, binding, run[:run_dir], outcome)}
+
+  # Where a triage run keeps its state, learned while it is still running.
+  def handle_info({:triage_started, %{"dispatch_id" => id}, run}, socket) when is_map(run),
+    do: {:noreply, triage_started(socket, id, run)}
+
   # One trace step per tick, and only the current timer's tick on a joined channel.
   def handle_info(
         {:trace_tick, token, refresh?},
@@ -754,6 +870,8 @@ defmodule LoopctlRunner.Control do
         status_push_pending: a.status_pushes != [],
         dispatch_replies_pending: map_size(a.dispatch_replies),
         dispatch_reply_backlog: length(a.reply_backlog),
+        triage_verdicts_pending: map_size(a.verdict_pushes),
+        triage_verdict_backlog: length(a.verdict_backlog),
         trace_acked:
           Map.new(a.trace_positions, fn {run_id, %{acked: acked}} -> {run_id, acked} end),
         trace_push_pending: a.trace_push != nil,
@@ -762,8 +880,11 @@ defmodule LoopctlRunner.Control do
         # runner_pool can lag it while a push is pending, rate-limited or lost with the socket.
         draining: reported_draining(a.draining, a.accepts_dispatches),
         accepts_dispatches: a.accepts_dispatches,
-        # Runs this process accepted that are still going, and stage reports not yet recorded.
+        # Runs this process accepted that are still going, where each keeps its state (nil until
+        # the run says, which is what lets a run that dies be closed), and stage reports not yet
+        # recorded.
         runs_in_flight: Map.keys(a.runs),
+        run_dirs: Map.new(a.runs, fn {id, run} -> {id, run.run_dir} end),
         pending_starts: Map.keys(a.pending_starts),
         stage_reports_pending:
           a.stage_streams |> Map.values() |> Enum.map(&length(&1.queue)) |> Enum.sum()
@@ -779,6 +900,9 @@ defmodule LoopctlRunner.Control do
     cond do
       Map.has_key?(socket.assigns.dispatch_replies, ref) ->
         dispatch_reply_answered(ref, reply, socket)
+
+      Map.has_key?(socket.assigns.verdict_pushes, ref) ->
+        {:ok, verdict_answered(ref, reply, socket)}
 
       match?(%{ref: ^ref}, socket.assigns.trace_push) ->
         {:ok, trace_answered(reply, socket)}
@@ -938,14 +1062,40 @@ defmodule LoopctlRunner.Control do
     assign(socket, reply_timer: {timer, token})
   end
 
-  defp stage_retry_ms do
-    get_in(Contract.connection(), ["limits", "stage_burst", "refill_interval_ms"]) || 250
-  end
+  # The contract's burst refill: one token comes back every refill interval. Fetched at COMPILE
+  # time and never defaulted, for the reason spelled out under @triage_verdict_retry_ms below —
+  # these two carried `|| 250` while 250 is exactly what the contract publishes, so a renamed key
+  # would have changed nothing observable on the implement path either.
+  @burst_refill_ms Map.fetch!(Contract.connection(), "limits")
 
-  # The contract's burst refill: one token comes back every refill interval.
-  defp dispatch_reply_retry_ms do
-    get_in(Contract.connection(), ["limits", "dispatch_reply_burst", "refill_interval_ms"]) || 250
-  end
+  @stage_retry_ms Map.fetch!(Map.fetch!(@burst_refill_ms, "stage_burst"), "refill_interval_ms")
+
+  @dispatch_reply_retry_ms Map.fetch!(
+                             Map.fetch!(@burst_refill_ms, "dispatch_reply_burst"),
+                             "refill_interval_ms"
+                           )
+
+  defp stage_retry_ms, do: @stage_retry_ms
+
+  defp dispatch_reply_retry_ms, do: @dispatch_reply_retry_ms
+
+  # A verdict's own budget, which is far slower than a dispatch_reply's: 4 per second refilling
+  # one a second.
+  #
+  # Fetched at COMPILE time and never defaulted. A default that happens to equal what the contract
+  # publishes is the worst kind: a vendoring that renames or moves this key would change nothing
+  # observable, leaving this runner resending at an interval loopctl no longer refills at — too
+  # fast is a rate limit it keeps hitting, too slow is a verdict that crawls — with no test and no
+  # log able to see it. A renamed key fails the build instead, which is the moment to decide.
+  @triage_verdict_retry_ms Map.fetch!(
+                             Map.fetch!(
+                               Map.fetch!(Contract.connection(), "limits"),
+                               "triage_verdict_burst"
+                             ),
+                             "refill_interval_ms"
+                           )
+
+  defp triage_verdict_retry_ms, do: @triage_verdict_retry_ms
 
   # The round trip of a status push. A slow one is logged when its reply lands; one still
   # unanswered past the slow threshold is logged at each tick by warn_unanswered/1.
@@ -1146,8 +1296,8 @@ defmodule LoopctlRunner.Control do
 
   defp decide_dispatch(socket, dispatch) do
     case guarded_decision(socket.assigns, dispatch) do
-      {:accept, story} ->
-        accept_dispatch(socket, dispatch, story)
+      {:accept, work} ->
+        accept_dispatch(socket, dispatch, work)
 
       {:refuse, reason, detail} ->
         Logger.warning("dispatch #{dispatch["dispatch_id"]} refused (#{reason}): #{detail}")
@@ -1189,14 +1339,58 @@ defmodule LoopctlRunner.Control do
 
     with :ok <- declared_kind(dispatch),
          {:accept, fields} <- a.decide.(dispatch, config, state),
-         {:ok, story_object} <- dispatch_story(dispatch),
-         {:ok, story} <- local_story(dispatch, fields, story_object, a.config) do
-      {:accept, story}
+         {:ok, work} <- work(dispatch, fields, a.config) do
+      {:accept, work}
     end
   end
 
+  # What this dispatch's kind is run from, checked for what the schema cannot say. Only a kind
+  # `declared_kind/1` let through reaches here, and a declared kind with no clause of its own is
+  # refused rather than guessed at: the note on `@kinds` says so, because a kind whose payload
+  # this runner cannot read is work it would soak and never do.
+  defp work(%{"kind" => "implement"} = dispatch, fields, config) do
+    with {:ok, story_object} <- dispatch_story(dispatch),
+         {:ok, story} <- local_story(dispatch, fields, story_object, config) do
+      {:ok, %{kind: "implement", story: story}}
+    end
+  end
+
+  # A triage run reads the checkout where it is, so it needs no branch and no worktree: the repo
+  # the policy allowed, the report, and the budgets the policy already held to this runner's
+  # ceilings. `dispatch["repo"]` is the owner/name form `TriageRun` resolves against `repos`.
+  defp work(%{"kind" => "triage"} = dispatch, fields, _config) do
+    with {:ok, triage} <- dispatch_triage(dispatch) do
+      {:ok,
+       %{
+         kind: "triage",
+         triage: triage,
+         repo: dispatch["repo"],
+         wall_clock_s: fields.wall_clock_s,
+         max_turns: fields.max_turns
+       }}
+    end
+  end
+
+  # Reached two ways, and the wording has to be true of both: a kind this runner DECLARES and
+  # cannot read (the note on `@kinds`), and a kind in a pending file that `rebuild_work/2` does not
+  # re-check the declaration for. What is true either way is that there is no accept path.
+  defp work(%{"kind" => kind}, _fields, _config),
+    do: {:refuse, "other", "this runner has no accept path for a dispatch of kind #{kind}"}
+
   defp declared_kind(%{"kind" => kind}) when kind in @kinds, do: :ok
   defp declared_kind(_dispatch), do: {:refuse, @kind_refusal_reason, @kind_refusal}
+
+  # A pending start this build would no longer accept: it is finished anyway (see rebuild_work/2),
+  # and the one thing that must not happen is its doing so quietly.
+  defp undeclared_kind_warning(%{"kind" => kind} = dispatch) when kind not in @kinds do
+    Logger.warning(
+      "pending dispatch #{dispatch["dispatch_id"]} is a #{kind}, which this runner no longer " <>
+        "declares; finishing it because its accept was already given",
+      dispatch_id: dispatch["dispatch_id"]
+    )
+  end
+
+  defp undeclared_kind_warning(_dispatch), do: :ok
 
   @doc "The dispatch kinds this runner declares and runs."
   @spec kinds() :: [String.t()]
@@ -1210,6 +1404,14 @@ defmodule LoopctlRunner.Control do
     case DispatchRun.story_object(dispatch) do
       {:ok, story} -> {:ok, story}
       :none -> {:refuse, "other", "the dispatch carries no story"}
+      {:error, detail} -> {:refuse, "other", detail}
+    end
+  end
+
+  defp dispatch_triage(dispatch) do
+    case TriageDispatch.triage_object(dispatch) do
+      {:ok, triage} -> {:ok, triage}
+      :none -> {:refuse, "other", "the dispatch carries no triage report"}
       {:error, detail} -> {:refuse, "other", detail}
     end
   end
@@ -1249,28 +1451,31 @@ defmodule LoopctlRunner.Control do
   # Accepting sends the accept and records a pending start; the run starts only once loopctl has
   # recorded the accept (settle_reply/3). A session started on an accept loopctl then refused
   # would run with no way to stop it, reporting stages and a trace nobody takes.
-  defp accept_dispatch(socket, dispatch, story) do
+  defp accept_dispatch(socket, dispatch, work) do
     reply = accepted_reply(dispatch)
     :ok = Contract.validate("RunnerDispatchReply", reply)
 
     Logger.info(
-      "dispatch #{dispatch["dispatch_id"]} accepted: run of #{story.id} starts once loopctl " <>
-        "records it"
+      "dispatch #{dispatch["dispatch_id"]} accepted: #{describe_work(work)} starts once " <>
+        "loopctl records it"
     )
 
     socket
-    |> register_pending(dispatch, story)
+    |> register_pending(dispatch, work)
     |> push_dispatch_reply(reply, dispatch["story_id"])
   end
 
+  defp describe_work(%{kind: "implement", story: story}), do: "run of #{story.id}"
+  defp describe_work(%{kind: "triage", triage: triage}), do: "triage of #{triage["record_id"]}"
+
   # The pending start is kept in memory and on disk (PendingStarts), so a restart resumes it.
-  defp register_pending(socket, dispatch, story) do
+  defp register_pending(socket, dispatch, work) do
     a = socket.assigns
     id = dispatch["dispatch_id"]
     binding = DispatchRun.binding(dispatch)
     target = a.name || self()
     on_stage = fn event -> notify_control(target, {:run_stage, binding, event}) end
-    pending = %{dispatch: dispatch, story: story, opts: [binding: binding, on_stage: on_stage]}
+    pending = %{dispatch: dispatch, work: work, opts: [binding: binding, on_stage: on_stage]}
 
     with {:error, reason} <- PendingStarts.write(a.config.runs_dir, dispatch) do
       Logger.error(
@@ -1287,7 +1492,7 @@ defmodule LoopctlRunner.Control do
   end
 
   # A Control starting over pending files resends each accept and starts the run on ok, as for a
-  # fresh accept. The story is rebuilt against the current config; one that no longer builds is
+  # fresh accept. The work is rebuilt against the current config; work that no longer builds is
   # logged and forgotten rather than started.
   defp restore_pending_starts(socket) do
     a = socket.assigns
@@ -1295,18 +1500,18 @@ defmodule LoopctlRunner.Control do
     Enum.reduce(PendingStarts.all(a.config.runs_dir), socket, fn dispatch, socket ->
       id = dispatch["dispatch_id"]
 
-      case rebuild_story(socket.assigns, dispatch) do
-        {:ok, story} ->
+      case rebuild_work(socket.assigns, dispatch) do
+        {:ok, work} ->
           Logger.info("resending the accept of pending dispatch #{id}", dispatch_id: id)
           entry = {accepted_reply(dispatch), dispatch["story_id"], true}
 
           socket
-          |> register_pending(dispatch, story)
+          |> register_pending(dispatch, work)
           |> assign(reply_backlog: socket.assigns.reply_backlog ++ [entry])
 
         {:error, why} ->
           Logger.error(
-            "pending dispatch #{id} no longer makes a runnable story (#{why}); not started",
+            "pending dispatch #{id} no longer makes runnable work (#{why}); not started",
             dispatch_id: id
           )
 
@@ -1316,9 +1521,48 @@ defmodule LoopctlRunner.Control do
     end)
   end
 
-  # Capacity, draining and disk were decided when the dispatch was accepted; only what the story
-  # is built from is checked again.
-  defp rebuild_story(a, dispatch) do
+  # A triage verdict its predecessor pushed and loopctl never recorded is sent again, as the bytes
+  # that were pushed: the run is long over, its answer exists, and nothing else will ever state it.
+  # The resend is idempotent per dispatch — loopctl answers it `ok` with `replayed` true — so
+  # sending one loopctl did record costs a log line, while not sending one it did not costs the
+  # whole run. A payload that no longer validates is not sent and is not deleted: it cannot be
+  # made into a message, and it is the only record of what that run concluded.
+  defp restore_pending_verdicts(socket) do
+    Enum.reduce(PendingVerdicts.all(socket.assigns.config.runs_dir), socket, fn {run_dir, payload},
+                                                                                socket ->
+      id = payload["dispatch_id"]
+
+      case TriageDispatch.sendable(payload) do
+        {:ok, payload} ->
+          Logger.info("resending the triage verdict of dispatch #{id}", dispatch_id: id)
+
+          assign(socket,
+            verdict_backlog: socket.assigns.verdict_backlog ++ [{payload, run_dir, true}]
+          )
+
+        {:error, errors} ->
+          Logger.error(
+            "the triage verdict recorded in #{run_dir} is not a message this runner may send " <>
+              "(#{inspect(errors)}); it is kept, unsent",
+            dispatch_id: id
+          )
+
+          socket
+      end
+    end)
+  end
+
+  # Capacity, draining and disk were decided when the dispatch was accepted; only what the work is
+  # built from is checked again.
+  #
+  # The KIND is not re-checked, for that same reason, and the distinction is worth stating because
+  # it looks like a way past `declared_kind/1`: that check decides whether this runner TAKES ON new
+  # work, and a pending file is work it already took on and told loopctl it had. The accept is what
+  # binds — loopctl's ledger row is waiting on it — so a build whose `@kinds` lost a kind finishes
+  # what it accepted rather than dropping it silently, and says so in the log. Nothing on the wire
+  # reaches here: a pending file is written only by this runner, only after `declared_kind/1` let
+  # the dispatch through.
+  defp rebuild_work(a, dispatch) do
     control = %{
       a.config.control
       | accepts_dispatches: true,
@@ -1330,13 +1574,13 @@ defmodule LoopctlRunner.Control do
 
     with {:accept, fields} <-
            DispatchPolicy.decide(dispatch, %{a.config | control: control}, state),
-         {:ok, story_object} <- DispatchRun.story_object(dispatch),
-         {:ok, story} <- DispatchRun.story(dispatch, fields, story_object, a.config) do
-      {:ok, story}
+         {:ok, work} <- work(dispatch, fields, a.config) do
+      undeclared_kind_warning(dispatch)
+      {:ok, work}
     else
+      # Every refusal on this path is a policy or a payload one; `work/3` turns what the object
+      # validators report into the same shape, so there is nothing else to come back.
       {:refuse, reason, detail} -> {:error, "#{reason}: #{detail}"}
-      :none -> {:error, "no story"}
-      {:error, detail} -> {:error, detail}
     end
   rescue
     exception -> {:error, inspect(exception.__struct__)}
@@ -1350,6 +1594,11 @@ defmodule LoopctlRunner.Control do
     for {run_dir, %{"dispatch_id" => id, "claim_epoch" => epoch} = state} <-
           RunState.all(runs_dir),
         is_binary(id) and is_integer(epoch),
+        # A triage run reports no stages, so there is no terminal stage to recover for one: its
+        # report is the verdict, and a stage stream opened for it would move a story it does not
+        # have. What a restart does NOT do is re-send that verdict, so a triage run whose Control
+        # died between its outcome and loopctl recording it is left to loopctl's heal sweep.
+        state["kind"] != "triage",
         is_nil(state["terminal_reported"]),
         not live?(state),
         reduce: socket do
@@ -1425,6 +1674,14 @@ defmodule LoopctlRunner.Control do
   defp describe_run_message({:run_stage, %{"dispatch_id" => id}, event}) when is_tuple(event),
     do: "#{elem(event, 0)} for dispatch #{id}"
 
+  # A triage run's outcome is its ONLY report, so the line that says it was not delivered is the
+  # only record of it: it names the dispatch and what the run concluded.
+  defp describe_run_message({:triage_outcome, %{"dispatch_id" => id}, _run, outcome}),
+    do: "the triage outcome of dispatch #{id} (#{describe_outcome(outcome)})"
+
+  defp describe_run_message({:triage_started, %{"dispatch_id" => id}, %{run_dir: dir}}),
+    do: "the start of dispatch #{id}'s triage run in #{dir}"
+
   defp describe_run_message(_message), do: "unrecognised message"
 
   defp start_pending(socket, id) do
@@ -1434,7 +1691,7 @@ defmodule LoopctlRunner.Control do
       {nil, _} ->
         socket
 
-      {%{dispatch: dispatch, story: story, opts: opts}, pending} ->
+      {%{work: %{kind: "implement", story: story}, dispatch: dispatch, opts: opts}, pending} ->
         run = a.run
         config = a.config
 
@@ -1450,9 +1707,70 @@ defmodule LoopctlRunner.Control do
 
         assign(socket,
           pending_starts: pending,
-          runs: Map.put(a.runs, id, %{ref: task.ref, run_id: nil, run_dir: nil}),
+          runs:
+            Map.put(a.runs, id, %{
+              ref: task.ref,
+              run_id: nil,
+              run_dir: nil,
+              kind: "implement"
+            }),
           run_refs: Map.put(a.run_refs, task.ref, id),
           stage_streams: Map.put(a.stage_streams, id, stage_stream(dispatch, "claimed"))
+        )
+
+      # A triage run opens no stage stream: the contract's stages move a STORY through its
+      # lifecycle, and this dispatch has none to move. Its one report is the verdict, which the
+      # run sends back as a message so that a Control which restarted under it still receives it.
+      {%{work: %{kind: "triage"} = work, opts: opts}, pending} ->
+        triage_run = a.triage_run
+        config = a.config
+        binding = Keyword.fetch!(opts, :binding)
+        target = a.name || self()
+
+        task =
+          Task.Supervisor.async_nolink(a.run_supervisor, fn ->
+            result =
+              triage_run.(config, work.triage, work.repo,
+                binding: binding,
+                # Where the run keeps its state, reported the moment it exists rather than at the
+                # end: a task killed from outside never reaches the end, and its state.json is
+                # then the only thing that can be closed — by whoever knows where it is.
+                on_start: fn run -> notify_control(target, {:triage_started, binding, run}) end,
+                # The run directory travels with the outcome: it is where the message this
+                # process is about to build is kept until loopctl records it, and a Control that
+                # did not start this run has no other way to learn it.
+                wall_clock_s: work.wall_clock_s,
+                max_turns: work.max_turns
+              )
+
+            notify_control(
+              target,
+              {:triage_outcome, binding, Map.take(result, [:run_id, :run_dir]), result.outcome}
+            )
+
+            result
+          end)
+
+        Logger.info(
+          "dispatch #{id} recorded as accepted: triage of #{work.triage["record_id"]} started " <>
+            "in #{work.repo}",
+          dispatch_id: id
+        )
+
+        PendingStarts.delete(config.runs_dir, id)
+
+        assign(socket,
+          pending_starts: pending,
+          runs:
+            Map.put(a.runs, id, %{
+              ref: task.ref,
+              run_id: nil,
+              run_dir: nil,
+              kind: "triage",
+              verdict: :pending,
+              binding: binding
+            }),
+          run_refs: Map.put(a.run_refs, task.ref, id)
         )
     end
   end
@@ -1892,6 +2210,115 @@ defmodule LoopctlRunner.Control do
     {run, runs} = Map.pop(a.runs, id)
     socket = assign(socket, run_refs: run_refs, runs: runs)
 
+    case run do
+      %{kind: "triage"} -> triage_run_ended(socket, id, run, reason)
+      _ -> implement_run_ended(socket, id, run, reason)
+    end
+  end
+
+  # A triage run that reported its outcome is over: the verdict is its whole report, and the task
+  # ending is not news. The state is closed all the same, and that is not belt and braces:
+  # `TriageRun.finish/5` is rescue-guarded because `RunState.update/2` can fail, and a run whose
+  # end could not be written reports its outcome perfectly well while leaving `running` and a live
+  # owner behind — counted by `Runs.in_flight/2` for the life of this BEAM, with nothing to reap.
+  # `close_crashed_state/1` does nothing to a state that is already closed.
+  defp triage_run_ended(socket, _id, %{verdict: :reported, run_dir: run_dir}, _reason) do
+    close_crashed_state(run_dir)
+    socket
+  end
+
+  # A run that did NOT report is reported here, because the alternative is a dispatch loopctl waits
+  # on for as long as the claim holds — but never OVER what the run itself concluded. `finish/5`
+  # records the outcome as a message before the trace closes, the state is written or the task
+  # returns, so a task killed anywhere in that window leaves a real verdict on disk while this
+  # process sees only a death. Sending a report over it would be worse than sending nothing: the
+  # real verdict then differs from what loopctl recorded, and a different verdict for one dispatch
+  # is refused `already_recorded`, permanently.
+  #
+  # So the order is what the run got as far as: the message it recorded, then the verdict it read
+  # but never turned into one (`TriageRun` makes that judgement, not this process — two mappings
+  # from the same directory would drift), and only then the runner's own account of the death.
+  defp triage_run_ended(socket, id, %{binding: binding, run_dir: run_dir}, reason) do
+    detail =
+      if reason == :normal,
+        do: "the run ended without reporting its outcome",
+        else: "the run's process died: #{inspect(reason, limit: 5)}"
+
+    Logger.error("the triage run of dispatch #{id} #{detail}", dispatch_id: id)
+
+    # The run cannot close its own state: it is not running any more. Left at `running` with this
+    # BEAM's live owner recorded, `Runs.in_flight/2` would count it on every status push for as
+    # long as this BEAM lives, and the runner would refuse dispatches at_capacity for ever — with
+    # nothing to reap, since the owner really is alive. `run_dir` is nil only for a run killed
+    # before its announcement reached this process, and `TriageRun` announces before it writes
+    # any state, so that really is a run with nothing to close: a directory and nothing in it.
+    close_crashed_state(run_dir)
+
+    case recorded_message(run_dir) do
+      {:ok, payload} ->
+        Logger.info(
+          "the run had already recorded its outcome; sending that, not an account of its death",
+          verdict_ids(payload)
+        )
+
+        push_verdict(socket, payload, run_dir)
+
+      :none ->
+        triage_outcome(socket, binding, run_dir, died_with(run_dir, detail))
+    end
+  end
+
+  # The outcome the run recorded, and only if it is still one this runner may push. Pushing a
+  # payload without that check is how the run's real answer would be destroyed rather than
+  # delivered: loopctl refuses it `invalid_payload`, which is permanent, and settling a permanent
+  # refusal DELETES the file — taking with it the fallback in `died_with/2`, which can still
+  # recover the verdict the session wrote. Unsendable, it is kept and stepped over, exactly as the
+  # startup sweep keeps one.
+  defp recorded_message(run_dir) do
+    case PendingVerdicts.read(run_dir) do
+      {:ok, payload} -> checked_message(payload, run_dir)
+      :none -> :none
+      {:error, why} -> recorded_message_unusable(run_dir, "cannot be read (#{inspect(why)})")
+    end
+  end
+
+  defp checked_message(payload, run_dir) do
+    case TriageDispatch.sendable(payload) do
+      {:ok, payload} ->
+        {:ok, payload}
+
+      {:error, errors} ->
+        recorded_message_unusable(
+          run_dir,
+          "is not a message this runner may send (#{inspect(errors)})"
+        )
+    end
+  end
+
+  defp recorded_message_unusable(run_dir, why) do
+    Logger.error(
+      "the outcome recorded in #{run_dir} #{why}; it is not sent, and what the run directory " <>
+        "says is reported instead"
+    )
+
+    :none
+  end
+
+  # What the run left behind, judged by the module that judges it for a run that lives: a verdict
+  # the session wrote is still the answer, and bytes that are not one are still `verdict_invalid`.
+  # Everything else is the death, in this process's own words, because that is the only part of
+  # this it witnessed.
+  defp died_with(nil, detail), do: {:incomplete, "no_verdict_written", detail}
+
+  defp died_with(run_dir, detail) do
+    case TriageRun.outcome_on_disk(run_dir) do
+      {:verdict, _} = verdict -> verdict
+      {:incomplete, "verdict_invalid", _} = invalid -> invalid
+      _ -> {:incomplete, "no_verdict_written", detail}
+    end
+  end
+
+  defp implement_run_ended(socket, id, run, reason) do
     socket =
       if reason == :normal do
         socket
@@ -1976,6 +2403,349 @@ defmodule LoopctlRunner.Control do
         )
     end
   end
+
+  # --- Triage verdicts (a triage run's one report) ---
+
+  # The run's outcome, however it ended, becomes the one message loopctl is owed for this
+  # dispatch. A payload that would fail the contract is NOT sent: loopctl refuses it
+  # `invalid_payload`, which is permanent, so pushing it would discard the run's only output and
+  # leave the ledger row waiting all the same — and the local log is the only place the outcome
+  # can still be read.
+  defp triage_outcome(socket, binding, run_dir, outcome) do
+    id = binding["dispatch_id"]
+
+    case sendable_message(binding, outcome) do
+      {:ok, payload} ->
+        Logger.info(
+          "the triage run of dispatch #{id} ended: #{describe_outcome(outcome)}",
+          verdict_ids(payload)
+        )
+
+        socket
+        |> mark_verdict_reported(id)
+        |> store_verdict(run_dir, payload)
+        |> push_verdict(payload, run_dir)
+
+      :none ->
+        Logger.error(
+          "nothing can be sent for dispatch #{id}: not even an incomplete addressed to it is a " <>
+            "message loopctl would take; its run's outcome was #{describe_outcome(outcome)}",
+          dispatch_id: id
+        )
+
+        socket
+    end
+  end
+
+  # The outcome as a message, or the nearest thing loopctl will take. A run whose outcome will not
+  # make one is still a dispatch loopctl is waiting on, and a report it can record beats silence:
+  # `verdict_invalid` says exactly what happened when the verdict is what would not go — the
+  # session wrote one and this runner's own validation refused it — and `no_verdict_written` is
+  # expressible from a binding alone. Only a binding this runner cannot even address a message to
+  # has nothing left, and then nothing is marked reported, so the run's task ending tries again.
+  defp sendable_message(binding, outcome) do
+    case TriageDispatch.verdict_message(binding, outcome) do
+      {:ok, payload} -> {:ok, payload}
+      {:error, errors} -> fallback_message(binding, outcome, errors)
+    end
+  end
+
+  defp fallback_message(binding, outcome, errors) do
+    reason = fallback_reason(outcome)
+
+    Logger.error(
+      "the triage verdict for dispatch #{binding["dispatch_id"]} is not a message this runner " <>
+        "may send (#{inspect(errors)}); reporting #{reason} instead",
+      dispatch_id: binding["dispatch_id"]
+    )
+
+    # The detail says where to look, never what was wrong: the errors can quote a verdict a
+    # session composed after reading the reporter's own words, and the local log is where that
+    # belongs.
+    fallback =
+      {:incomplete, reason,
+       "the runner could not turn this run's outcome into a message; see the runner's log"}
+
+    case TriageDispatch.verdict_message(binding, fallback) do
+      {:ok, payload} -> {:ok, payload}
+      {:error, _errors} -> :none
+    end
+  end
+
+  # A verdict that would not go is the one case the contract has a word for.
+  defp fallback_reason({:verdict, _verdict}), do: "verdict_invalid"
+  defp fallback_reason(_outcome), do: "no_verdict_written"
+
+  # The outcome named by its contract enums only. A verdict's prose and an incomplete's detail are
+  # written by a session that had just read the reporter's words, and this line is not where they
+  # are quoted.
+  defp describe_outcome({:verdict, verdict}),
+    do: "a verdict (#{verdict["outcome"]}, confidence #{verdict["confidence"]})"
+
+  defp describe_outcome({:incomplete, reason, _detail}), do: "incomplete: #{reason}"
+  defp describe_outcome({:error, _reason}), do: "a runner failure, reported as incomplete"
+
+  # A run this process did not start (its Control was replaced while it ran) has nothing here to
+  # record against, and needs nothing: whatever ends it will report its own outcome.
+  defp triage_started(socket, id, %{run_id: run_id, run_dir: run_dir}) do
+    case socket.assigns.runs[id] do
+      %{kind: "triage"} = run ->
+        assign(socket,
+          runs: Map.put(socket.assigns.runs, id, %{run | run_id: run_id, run_dir: run_dir})
+        )
+
+      _ ->
+        socket
+    end
+  end
+
+  # A run this process started is remembered as having reported, so its task ending does not
+  # report a second time for the same dispatch.
+  defp mark_verdict_reported(socket, id) do
+    case socket.assigns.runs[id] do
+      %{kind: "triage"} = run ->
+        assign(socket, runs: Map.put(socket.assigns.runs, id, %{run | verdict: :reported}))
+
+      _ ->
+        socket
+    end
+  end
+
+  # The message goes to disk BEFORE it is pushed, so that the copy which survives a restart is the
+  # one that was sent rather than one rebuilt afterwards: loopctl answers a resend of the same
+  # message `ok` and refuses a different verdict for the same dispatch permanently.
+  #
+  # Usually a second write of what the run already recorded at its end, and deliberately so: this
+  # is the copy of the bytes that were actually PUSHED, and it is the only copy for the one
+  # outcome no run can record — the one this process states because the run's task died before it
+  # concluded anything.
+  #
+  # A run with no directory is a run that failed before it had one, so there is nothing to keep it
+  # beside and nothing else about it to recover; it is logged, because what is lost is the restart
+  # guarantee and not the push.
+  defp store_verdict(socket, nil, payload) do
+    Logger.warning(
+      "the triage verdict is sent but not recorded on disk: its run has no directory; a restart " <>
+        "before loopctl records it would lose it",
+      verdict_ids(payload)
+    )
+
+    socket
+  end
+
+  defp store_verdict(socket, run_dir, payload) do
+    with {:error, reason} <- PendingVerdicts.write(run_dir, payload) do
+      Logger.error(
+        "could not record the triage verdict in #{run_dir} (#{inspect(reason)}); a restart " <>
+          "before loopctl records it would lose it",
+        verdict_ids(payload)
+      )
+    end
+
+    socket
+  end
+
+  defp push_verdict(socket, payload, run_dir, carried? \\ false) do
+    case push_event(socket, socket.assigns.topic, "triage_verdict", payload) do
+      {:ok, ref} ->
+        Logger.info("triage_verdict sent", verdict_ids(payload))
+
+        assign(socket,
+          verdict_pushes:
+            Map.put(socket.assigns.verdict_pushes, ref, {payload, run_dir, carried?})
+        )
+
+      # Not joined at this instant: kept, and sent once the channel is back.
+      {:error, reason} ->
+        Logger.warning(
+          "triage_verdict held until the channel rejoins: #{inspect(reason)}",
+          verdict_ids(payload)
+        )
+
+        assign(socket,
+          verdict_backlog: socket.assigns.verdict_backlog ++ [{payload, run_dir, carried?}]
+        )
+    end
+  end
+
+  defp verdict_answered(ref, reply, socket) do
+    {{payload, run_dir, carried?}, pending} = Map.pop(socket.assigns.verdict_pushes, ref)
+    socket = assign(socket, verdict_pushes: pending)
+    ids = verdict_ids(payload)
+
+    if acked?(reply) do
+      note_recorded(reply, ids)
+      settle_verdict(socket, payload, run_dir)
+    else
+      verdict_refused(socket, reply, {payload, run_dir, carried?}, ids)
+    end
+  end
+
+  # `replayed` is the whole reason the ack has a body: an `ok` that recorded this verdict and an
+  # `ok` that found it already recorded and applied nothing are the same reply otherwise, and
+  # after a resend the difference is what says whether the first copy landed.
+  defp note_recorded({:ok, body}, ids) when is_map(body) do
+    case Contract.validate("RunnerTriageVerdictAck", body) do
+      :ok ->
+        Logger.info(
+          "loopctl recorded the triage verdict at #{body["recorded_at"]} " <>
+            "(replayed: #{body["replayed"]})",
+          ids
+        )
+
+      {:error, errors} ->
+        Logger.warning(
+          "loopctl acknowledged the triage verdict with an ack this build cannot read " <>
+            "(#{inspect(errors)}); whether it was recorded now or replayed is unknown",
+          ids
+        )
+    end
+  end
+
+  defp note_recorded(_reply, ids),
+    do:
+      Logger.warning(
+        "loopctl acknowledged the triage verdict with no ack body; whether it was recorded now " <>
+          "or replayed is unknown",
+        ids
+      )
+
+  defp verdict_refused(socket, reply, {payload, _run_dir, _carried?} = entry, ids) do
+    reason = refusal_reason(reply)
+
+    case TriageDispatch.classify(reason) do
+      :rate_limited ->
+        backlog = socket.assigns.verdict_backlog ++ [entry]
+
+        Logger.info(
+          "loopctl rate-limited a triage_verdict; #{length(backlog)} in the backlog, sent one " <>
+            "every #{socket.assigns.triage_verdict_retry_ms}ms",
+          ids
+        )
+
+        socket |> assign(verdict_backlog: backlog) |> schedule_verdict_backlog()
+
+      :internal_error ->
+        verdict_internal_error(socket, entry, reply, ids)
+
+      # The one refusal whose permanence has a condition, and the condition is about evidence only
+      # this runner holds: the row is not `accepted`, which covers an accept of ours still in
+      # flight as well as one loopctl refused or superseded for good.
+      :conditional ->
+        if accept_outstanding?(socket, payload["dispatch_id"], payload["claim_epoch"]) do
+          Logger.info(
+            "loopctl has not recorded this runner's accept yet (#{reason}); resending the " <>
+              "triage verdict after #{socket.assigns.triage_verdict_retry_ms}ms",
+            ids
+          )
+
+          socket
+          |> assign(verdict_backlog: socket.assigns.verdict_backlog ++ [entry])
+          |> schedule_verdict_backlog()
+        else
+          give_up_verdict(socket, entry, reason, reply, "no accept of it is outstanding", ids)
+        end
+
+      :permanent ->
+        give_up_verdict(socket, entry, reason, reply, "nothing will change it", ids)
+
+      :unknown ->
+        give_up_verdict(
+          socket,
+          entry,
+          reason,
+          reply,
+          "this build (contract #{Contract.version()}) does not handle that refusal",
+          ids
+        )
+    end
+  end
+
+  defp refusal_reason({:error, %{"reason" => reason}}), do: reason
+  defp refusal_reason(_reply), do: nil
+
+  # Normally an error: the verdict is everything the run produced, and giving it up leaves
+  # loopctl's ledger row waiting on this dispatch for as long as the claim holds.
+  #
+  # Not for a RESENT one whose dispatch has since gone away. A message carried across a rejoin or
+  # restored at startup can arrive after the claim moved on or the dispatch was forgotten, and
+  # that is the expected end of a resend rather than something to wake an operator for — the same
+  # demotion `dispatch_reply_refused/4` makes, for the same reasons, on the same argument.
+  #
+  # The stored copy goes either way. Every refusal that reaches here is one no resend can move, so
+  # a file left behind would be re-sent by every restart from now on, each one refused again.
+  @settled_meanwhile ~w(unknown_dispatch stale_claim_epoch)
+
+  defp give_up_verdict(socket, {payload, run_dir, carried?}, reason, reply, why, ids) do
+    if carried? and reason in @settled_meanwhile do
+      Logger.info("loopctl no longer needs the resent triage verdict (#{reason})", ids)
+    else
+      Logger.error(
+        "giving up on the triage verdict for dispatch #{payload["dispatch_id"]} " <>
+          "(#{reason || "no reason given"}): #{why}: #{inspect(reply)}",
+        ids
+      )
+    end
+
+    settle_verdict(socket, payload, run_dir)
+  end
+
+  # The verdict is this run's terminal report, so it gets the terminal ceiling: loopctl promises
+  # nothing about waiting out an internal_error, and the alternative to a bounded retry is a
+  # message resent for ever.
+  defp verdict_internal_error(socket, {payload, _run_dir, _carried?} = entry, reply, ids) do
+    id = payload["dispatch_id"]
+    attempts = Map.get(socket.assigns.verdict_errors, id, 0) + 1
+    ceiling = socket.assigns.terminal_internal_error_attempts
+
+    if attempts >= ceiling do
+      give_up_verdict(socket, entry, "internal_error", reply, "#{attempts} attempts", ids)
+    else
+      Logger.warning(
+        "loopctl answered the triage verdict for dispatch #{id} with internal_error " <>
+          "(#{attempts} of #{ceiling}); resending",
+        ids
+      )
+
+      socket
+      |> assign(
+        verdict_errors: Map.put(socket.assigns.verdict_errors, id, attempts),
+        verdict_backlog: socket.assigns.verdict_backlog ++ [entry]
+      )
+      |> schedule_verdict_backlog()
+    end
+  end
+
+  # Settled one way or the other: nothing is owed for this dispatch any more, so the copy kept for
+  # a restart goes, and so does its error count.
+  defp settle_verdict(socket, payload, run_dir) do
+    PendingVerdicts.delete(run_dir)
+
+    assign(socket,
+      verdict_errors: Map.delete(socket.assigns.verdict_errors, payload["dispatch_id"])
+    )
+  end
+
+  defp schedule_verdict_backlog(%{assigns: %{verdict_backlog: []}} = socket), do: socket
+
+  defp schedule_verdict_backlog(%{assigns: %{verdict_timer: timer}} = socket) when timer != nil,
+    do: socket
+
+  defp schedule_verdict_backlog(socket) do
+    token = make_ref()
+
+    timer =
+      Process.send_after(
+        self(),
+        {:send_verdict_backlog, token},
+        socket.assigns.triage_verdict_retry_ms
+      )
+
+    assign(socket, verdict_timer: {timer, token})
+  end
+
+  defp verdict_ids(payload),
+    do: [dispatch_id: payload["dispatch_id"], claim_epoch: payload["claim_epoch"]]
 
   # --- Trace shipping (TraceShip decides, this process pushes) ---
 

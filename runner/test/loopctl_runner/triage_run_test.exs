@@ -3,6 +3,7 @@ defmodule LoopctlRunner.TriageRunTest do
   use ExUnit.Case, async: false
 
   alias LoopctlRunner.{TriageRun, TriageVerdict}
+  import ExUnit.CaptureLog
   import LoopctlRunner.TestSupport
 
   @moduletag timeout: 60_000
@@ -120,6 +121,96 @@ defmodule LoopctlRunner.TriageRunTest do
 
     assert LoopctlRunner.Owner.alive?(state)
     assert state["beam_os_pid"] == System.pid() |> String.to_integer()
+  end
+
+  test "the run announces its directory before it writes any state, and before the session runs",
+       ctx do
+    # A task killed from outside never reaches the end of the run, and what it leaves behind is a
+    # state at `running` with a live owner, which `Runs.in_flight/2` counts for the life of the
+    # BEAM. Whoever supervises the run can only close that by knowing the directory WHILE the run
+    # is still going, so the announcement is the fix, and being early is the whole of it.
+    test = self()
+
+    result =
+      execute(
+        ctx,
+        [{"FAKE_CLAUDE_MODE", "stream"}, {"FAKE_VERDICT", Jason.encode!(@verdict)}],
+        on_start: fn run ->
+          send(
+            test,
+            {:announced, run, LoopctlRunner.RunState.read(run.run_dir),
+             File.exists?(Path.join(ctx.state, "argv"))}
+          )
+        end
+      )
+
+    assert_received {:announced, run, state, session_launched?}
+    assert run.run_dir == result.run_dir
+    assert run.run_id == result.run_id
+    assert File.dir?(run.run_dir)
+
+    # No state yet, and that ordering is the point: a state at `running` naming a live owner that
+    # nobody knows the directory of is a run nothing can close and nothing will reap. Announced
+    # first, the worst a kill in this window leaves is an empty directory.
+    assert state == {:error, :enoent}
+
+    # Before the session: the fake CLI had not been launched when the announcement was made.
+    refute session_launched?
+    assert File.exists?(Path.join(ctx.state, "argv"))
+    assert {:ok, %{"kind" => "triage", "status" => "verdict"}} = RunStateRead.read(result.run_dir)
+  end
+
+  test "the run records its outcome as the message that states it, beside the verdict", ctx do
+    # What a run that outlives every Control leaves behind: its outcome reaches Control as a
+    # message, and a message reaches nobody when none is registered to take it.
+    binding = %{
+      "dispatch_id" => "1f0b6b8e-2c3d-4e5f-8a9b-0c1d2e3f4a5b",
+      "claim_epoch" => 3,
+      "story_id" => "9fdefcf9-b7a4-4062-86f1-011d691db036"
+    }
+
+    result =
+      execute(
+        ctx,
+        [{"FAKE_CLAUDE_MODE", "stream"}, {"FAKE_VERDICT", Jason.encode!(@verdict)}],
+        binding: binding
+      )
+
+    assert [{run_dir, recorded}] = LoopctlRunner.PendingVerdicts.all(ctx.config.runs_dir)
+    assert run_dir == result.run_dir
+
+    assert recorded == %{
+             "dispatch_id" => binding["dispatch_id"],
+             "claim_epoch" => 3,
+             "verdict" => @verdict
+           }
+
+    # Checkable by exactly what checks a message kept for a restart, because it is one.
+    assert {:ok, ^recorded} = LoopctlRunner.TriageDispatch.sendable(recorded)
+  end
+
+  test "a run with no dispatch to answer records no message, and complains about none", ctx do
+    log =
+      capture_log(fn ->
+        result = execute(ctx, [{"FAKE_CLAUDE_MODE", "stream"}])
+        refute File.exists?(LoopctlRunner.PendingVerdicts.file(result.run_dir))
+      end)
+
+    # Not an error either: a run nobody dispatched has nobody to report to, which is the whole
+    # difference between no message and a message that cannot be sent.
+    refute log =~ "not a message anything can send"
+    assert LoopctlRunner.PendingVerdicts.all(ctx.config.runs_dir) == []
+  end
+
+  test "an announcement that raises does not take the run down with it", ctx do
+    result =
+      execute(
+        ctx,
+        [{"FAKE_CLAUDE_MODE", "stream"}, {"FAKE_VERDICT", Jason.encode!(@verdict)}],
+        on_start: fn _run -> raise "the listener is gone" end
+      )
+
+    assert {:verdict, _} = result.outcome
   end
 
   test "the session is given the ESCALATE token, not the verdict one", ctx do

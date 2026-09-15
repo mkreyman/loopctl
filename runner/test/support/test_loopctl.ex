@@ -40,7 +40,11 @@ defmodule LoopctlRunner.TestLoopctl do
       last_trace_ms: %{},
       # Replies to stage pushes, oldest first: :ok (validate and ack), :none for a push left
       # unanswered, or {:error, reason_map}; once used up every stage is acknowledged.
-      stage_replies: []
+      stage_replies: [],
+      # Replies to triage_verdict pushes, oldest first: :ok (record and ack), :replayed (ack a
+      # resend, applying nothing), :bare_ok for an ok with no body, :none for a push left
+      # unanswered, or {:error, reason_map}.
+      triage_verdict_replies: []
     }
 
     case Agent.start(fn -> state end, name: __MODULE__) do
@@ -80,6 +84,16 @@ defmodule LoopctlRunner.TestLoopctl do
     Agent.get_and_update(__MODULE__, fn
       %{stage_replies: [reply | rest]} = state -> {reply, %{state | stage_replies: rest}}
       state -> {:ok, state}
+    end)
+  end
+
+  def next_triage_verdict_reply do
+    Agent.get_and_update(__MODULE__, fn
+      %{triage_verdict_replies: [reply | rest]} = state ->
+        {reply, %{state | triage_verdict_replies: rest}}
+
+      state ->
+        {:ok, state}
     end)
   end
 
@@ -256,8 +270,50 @@ defmodule LoopctlRunner.TestLoopctl do
       end
     end
 
+    # loopctl's own recording is not modelled; what IS modelled is the refusal the schema cannot
+    # express, because it is the trap this message carries: exactly one of verdict and incomplete,
+    # or invalid_payload — which is permanent, so a runner that gets it wrong loses the run's only
+    # output.
+    def handle_in("triage_verdict", payload, socket) do
+      TestLoopctl.notify({:triage_verdict, payload})
+
+      case verdict_problem(payload) do
+        nil -> scripted_verdict_reply(socket)
+        refusal -> {:reply, {:error, refusal}, socket}
+      end
+    end
+
     def handle_in(_event, _payload, socket),
       do: {:reply, {:error, %{reason: "unknown_event"}}, socket}
+
+    defp verdict_problem(payload) do
+      stated = Enum.count(["verdict", "incomplete"], &(Map.get(payload, &1) != nil))
+
+      cond do
+        Contract.validate("RunnerTriageVerdictMessage", payload) != :ok ->
+          %{reason: "invalid_payload"}
+
+        stated != 1 ->
+          %{reason: "invalid_payload", detail: "#{stated} of verdict and incomplete"}
+
+        true ->
+          nil
+      end
+    end
+
+    defp scripted_verdict_reply(socket) do
+      case TestLoopctl.next_triage_verdict_reply() do
+        :ok -> {:reply, {:ok, verdict_ack(false)}, socket}
+        :replayed -> {:reply, {:ok, verdict_ack(true)}, socket}
+        :bare_ok -> {:reply, :ok, socket}
+        :none -> {:noreply, socket}
+        {:error, reply} -> {:reply, {:error, reply}, socket}
+      end
+    end
+
+    defp verdict_ack(replayed?) do
+      %{recorded_at: DateTime.utc_now() |> DateTime.to_iso8601(), replayed: replayed?}
+    end
 
     defp trace_in("trace_cursor", %{"run_id" => run_id} = payload, socket) do
       TestLoopctl.notify({:trace_cursor, payload})

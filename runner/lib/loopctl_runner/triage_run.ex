@@ -10,7 +10,10 @@ defmodule LoopctlRunner.TriageRun do
 
   The order matters and each step is a precondition of the next:
 
-    1. the run directory and `state.json`, so a crash is attributable before anything runs;
+    1. the run directory, ANNOUNCED to whoever is supervising this run (`:on_start`), and then
+       `state.json`, so a crash is attributable before anything runs. That order is the whole of
+       it: a state naming a live owner that nobody knows the directory of is a run no one can
+       close and nothing will reap;
     2. the two tokens (`LoopctlRunner.TriageVerdict.mint_token/1` and `mint_escalate_token/1`),
        minted BEFORE the prompt is built because the prompt carries them — they are what make the
        verdict and the escalation the SESSION's rather than something a subagent it dispatches
@@ -18,7 +21,12 @@ defmodule LoopctlRunner.TriageRun do
     3. the prompt, from the fenced report and the lenses this run actually grants;
     4. the session, with `LoopctlRunner.TriageTools`' contained set rather than the implement
        one;
-    5. the verdict, read and validated against the contract before anything believes it.
+    5. the verdict, read and validated against the contract before anything believes it;
+    6. the outcome recorded as the MESSAGE that states it (`LoopctlRunner.PendingVerdicts`),
+       beside the verdict and before anything is told about it. The outcome reaches Control as a
+       message and a message reaches nobody when none is registered, so a run that outlives every
+       Control would otherwise have done the work and left loopctl waiting on the dispatch for the
+       life of the claim.
 
   The outcome is one of `{:verdict, verdict}`, `{:incomplete, reason, detail}` or
   `{:error, reason}`. The incomplete reasons come from the vendored contract's
@@ -56,11 +64,13 @@ defmodule LoopctlRunner.TriageRun do
     Config,
     Contract,
     Owner,
+    PendingVerdicts,
     Run,
     RunState,
     Session,
     Story,
     Trace,
+    TriageDispatch,
     TriagePrompt,
     TriageTools,
     TriageVerdict
@@ -137,8 +147,16 @@ defmodule LoopctlRunner.TriageRun do
   @doc """
   Runs `triage` (a `RunnerTriage` object) for `repo` in its local checkout.
 
-  Options: `:binding` (written into `state.json`, the dispatch this run answers), `:lenses`
+  Options: `:binding` (written into `state.json`, the dispatch this run answers), `:on_start`
+  (called with `%{run_id:, run_dir:}` the moment the run directory and its state exist), `:lenses`
   (default `TriageTools.lenses/0`), `:wall_clock_s`, `:max_turns`, `:model`, `:run_id`.
+
+  `:on_start` is what makes this run's directory reachable by whoever is supervising it BEFORE the
+  run ends, which is the only moment that matters when it does not end normally: a task killed
+  from outside leaves a state at `running` with a live owner, and `Runs.in_flight/2` counts such a
+  run for the life of the BEAM. It is called before that state is written, so there is no instant
+  at which such a state exists and nobody knows where it is. It mirrors the `{:started, _}` event
+  `Run.execute/3` reports.
   """
   @spec execute(Config.t(), map(), String.t(), keyword()) :: result()
   def execute(%Config{} = config, triage, repo, opts \\ []) do
@@ -166,6 +184,13 @@ defmodule LoopctlRunner.TriageRun do
 
   defp start(config, triage, repo, record, run_id, opts) do
     run_dir = run_dir(config, record, run_id)
+
+    # BEFORE the state, not after: `state.json` at `running` carries this BEAM's live owner, so a
+    # task killed between writing it and announcing it leaves a run nothing can close — the
+    # supervisor never learned the directory, `Runs.in_flight/2` counts it for the life of the
+    # BEAM, and the reaper skips it because the owner really is alive. Announced first, the worst a
+    # kill leaves is an empty directory, which nothing counts and nothing has to clean up.
+    announce(opts, %{run_id: run_id, run_dir: run_dir})
 
     RunState.update(
       run_dir,
@@ -203,15 +228,32 @@ defmodule LoopctlRunner.TriageRun do
           }
       end
 
-    finish(trace, seq, run_dir, result)
+    finish(trace, seq, run_dir, result, Keyword.get(opts, :binding, %{}))
     result
+  end
+
+  # Guarded, and the guard is the point: this runs OUTSIDE the try below, before the state or the
+  # trace exists, so a callback that raises would take the run down before it had written anything
+  # about itself. Whoever is listening loses the early notice; the run goes on, and its outcome
+  # still reports.
+  defp announce(opts, run) do
+    case Keyword.get(opts, :on_start) do
+      nil -> :ok
+      on_start when is_function(on_start, 1) -> on_start.(run)
+    end
+  rescue
+    error -> Logger.error("the triage run's start could not be announced: #{inspect(error)}")
+  catch
+    kind, reason ->
+      Logger.error("the triage run's start could not be announced: #{inspect({kind, reason})}")
   end
 
   # Guarded too: `RunState.update/2` writes and renames, and a full volume or a run directory the
   # session removed would otherwise raise HERE — leaving state.json at "running" with this BEAM's
   # live owner recorded, which is precisely the combination the reaper will never clean up.
-  defp finish(trace, seq, run_dir, result) do
+  defp finish(trace, seq, run_dir, result, binding) do
     name = outcome_name(result.outcome)
+    record(run_dir, binding, result.outcome)
     Trace.emit(trace, "triage.finished", seq, %{"outcome" => name})
     Trace.close(trace)
 
@@ -379,6 +421,19 @@ defmodule LoopctlRunner.TriageRun do
   # What the run produced, judged in the order that tells the truth: a verdict the session wrote
   # is the answer even if the session then failed, because it stated it; only then does how the
   # session ended matter.
+  @doc """
+  What a run's directory says it concluded, for a run that died before it could say so itself:
+  `outcome/2` with no session, so a verdict the session wrote still wins and bytes that are not a
+  verdict are still `verdict_invalid`.
+
+  It exists so that the one process left — whoever was supervising the run — does not have to
+  make this judgement a second time, in its own words. The mapping from what is on disk to an
+  outcome belongs here, with the run, or the two answers drift and the second one to reach loopctl
+  is refused permanently.
+  """
+  @spec outcome_on_disk(String.t()) :: outcome()
+  def outcome_on_disk(run_dir), do: outcome(run_dir, nil)
+
   defp outcome(run_dir, session) do
     case TriageVerdict.read(run_dir) do
       {:ok, verdict} -> {:verdict, verdict}
@@ -440,6 +495,39 @@ defmodule LoopctlRunner.TriageRun do
       [] -> "no reason recorded"
     end
   end
+
+  # The outcome as the MESSAGE that states it, written where it was concluded and before anything
+  # is told about it.
+  #
+  # This is what a run that outlives every Control leaves behind. The outcome reaches Control as a
+  # message, and a message reaches nobody when no Control is registered to take it: the run would
+  # then have done the work, written the verdict, and left loopctl waiting on the dispatch for the
+  # life of the claim. Composing it HERE is also the only way to compose it safely — a sweep that
+  # rebuilt one later from `verdict.json` and a status string would be one refactor away from
+  # different bytes, and loopctl refuses a second, different verdict for a dispatch permanently.
+  #
+  # Guarded like everything else on this path, and skipped for a run with no dispatch to answer
+  # (`execute/4` called without a binding): there is nobody to report to.
+  defp record(run_dir, %{"dispatch_id" => _, "claim_epoch" => _} = binding, outcome) do
+    case TriageDispatch.verdict_message(binding, outcome) do
+      {:ok, payload} ->
+        with {:error, reason} <- PendingVerdicts.write(run_dir, payload) do
+          Logger.error("the triage run's outcome could not be recorded: #{inspect(reason)}")
+        end
+
+      {:error, errors} ->
+        Logger.error(
+          "the triage run's outcome is not a message anything can send: #{inspect(errors)}"
+        )
+    end
+  rescue
+    error -> Logger.error("the triage run's outcome could not be recorded: #{inspect(error)}")
+  catch
+    kind, reason ->
+      Logger.error("the triage run's outcome could not be recorded: #{inspect({kind, reason})}")
+  end
+
+  defp record(_run_dir, _binding, _outcome), do: :ok
 
   defp outcome_name({:verdict, _}), do: "verdict"
   defp outcome_name({:incomplete, reason, _}), do: "incomplete:#{reason}"
