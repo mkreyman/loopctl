@@ -59,6 +59,23 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **A placed dispatch carries the STORY, built server-side (#803).** `Placement.place/4` now
+  builds the `implement` dispatch's `story` object from loopctl's own rows
+  (`Loopctl.Delivery.StoryPayload.build/3`) after the claim and before the push. Until now
+  neither caller sent one: the operator endpoint refuses a caller-supplied object — a caller
+  able to hand a runner prose is able to run anything on that machine — and nothing built a
+  server-side one, so every placed dispatch named a `story_id` and carried no work. The runner
+  implementation refuses such a dispatch outright, cleanly and identically on every
+  redispatch, which means the loop could place work unattended and nothing would ever run.
+
+  Built AFTER the claim because it is the only point where it can be: a story too large for
+  the contract's caps is escalated rather than truncated, and that edge exists only from
+  `claimed` onwards. A refusal releases the claim and leaves the story escalated for a human —
+  `Stages.follow_release/5` rebinds a non-in-flight row rather than requeueing it, so the
+  escalation stands. `place/4` also refuses a caller-supplied `story` itself now, so a worker,
+  an MCP tool and the unattended driver are bound by the rule without passing through the HTTP
+  edge.
+
 - **`POST /api/v1/runners/:runner_id/dispatches` — the control-side dispatch trigger (#803).**
   `Loopctl.Delivery.Placement.place/4` shipped with #833 and had NO CALLER: the mechanism was
   built, tested and documented, and nothing could reach it. The delivery loop's first

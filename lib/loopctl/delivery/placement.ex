@@ -159,6 +159,7 @@ defmodule Loopctl.Delivery.Placement do
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Auth.Role
   alias Loopctl.Delivery.Stages
+  alias Loopctl.Delivery.StoryPayload
   alias Loopctl.Dispatches
   alias Loopctl.Progress
   alias Loopctl.Runners
@@ -259,7 +260,8 @@ defmodule Loopctl.Delivery.Placement do
           | {:error, error()}
   def place(tenant_id, runner_id, %{} = dispatch, opts)
       when is_binary(tenant_id) and is_binary(runner_id) do
-    with {:ok, dispatch_id} <- fetch_uuid(dispatch, "dispatch_id"),
+    with :ok <- no_caller_story(dispatch),
+         {:ok, dispatch_id} <- fetch_uuid(dispatch, "dispatch_id"),
          {:ok, story_id} <- fetch_uuid(dispatch, "story_id"),
          {:ok, caller} <- resolve_caller(tenant_id, Keyword.fetch!(opts, :api_key)),
          :ok <- not_halted(tenant_id),
@@ -270,6 +272,21 @@ defmodule Loopctl.Delivery.Placement do
         record -> resume(tenant_id, runner_id, dispatch, record)
       end
     end
+  end
+
+  # THE STORY OBJECT IS LOOPCTL'S TO BUILD, so a caller may not supply one. `attach_story/6`
+  # builds it from Postgres; a caller-supplied one would be prose handed to a runner one level
+  # along, which the contract's no-prompt rule exists to prevent — "a dispatch runs as the
+  # machine's user and a control plane able to hand a runner prose to execute is able to run
+  # anything on it".
+  #
+  # REFUSED rather than dropped, and refused HERE rather than only at the HTTP edge. The
+  # endpoint's own guard (`LoopctlWeb.DispatchPlacementController`) still answers with the
+  # better message, and this is what binds the callers that never touch it — a worker, an MCP
+  # tool, the unattended driver. A silently dropped object would have the caller believe the
+  # runner saw a story it never received.
+  defp no_caller_story(dispatch) do
+    if Map.has_key?(dispatch, "story"), do: {:error, :story_not_accepted}, else: :ok
   end
 
   # THE CALLER'S OWN LINEAGE AND ROLE, DERIVED FROM THE KEY IT AUTHENTICATED WITH — the same
@@ -426,6 +443,7 @@ defmodule Loopctl.Delivery.Placement do
       )
 
     with {:ok, _row} <- advance,
+         {:ok, dispatch} <- attach_story(tenant_id, dispatch, story, session, epoch, opts),
          :ok <- Runners.dispatch(tenant_id, runner_id, Map.put(dispatch, "claim_epoch", epoch)) do
       {:ok,
        %{
@@ -440,6 +458,42 @@ defmodule Loopctl.Delivery.Placement do
         # `undo_claim/5` for why leaving the id behind is worse than leaving it unrevoked.
         undo_claim(tenant_id, story.id, session, reason, opts)
         {:error, reason}
+    end
+  end
+
+  # THE STORY OBJECT, BUILT HERE, WHICH IS THE ONLY PLACE IT CAN BE BUILT.
+  #
+  # An `implement` dispatch carries the story as TYPED FIELDS and never a prompt — the runner
+  # composes its own from them — so a dispatch with no `story` names a `story_id` and carries
+  # no work at all. The runner implementation refuses it outright ("the dispatch carries no
+  # story"), before composing anything, and does so identically on every redispatch: a clean,
+  # permanent, invisible no. Both callers of `place/4` sent exactly that until now — the
+  # operator endpoint refuses a CALLER-supplied object (rightly: a caller able to hand a
+  # runner prose is able to run anything on that machine) and nothing built a server-side one.
+  #
+  # AFTER THE CLAIM, not before, and that is forced rather than chosen. A story loopctl
+  # cannot describe within the contract's caps is ESCALATED rather than truncated, and
+  # `:session_escalated` leaves the in-flight stages only — at `queued` there is no edge, so
+  # the same refusal before the claim could not park the story and would leave it to be
+  # refused identically by every later pass.
+  #
+  # A refusal here therefore reaches the `else` below, and `undo_claim/5` does the right thing
+  # with an escalated row rather than fighting it: `Stages.follow_release/5` REQUEUES only an
+  # in-flight row and REBINDS anything else, so an escalated row keeps its stage and takes the
+  # new epoch. The claim goes back, the session dispatch is revoked, and the story stays where
+  # `StoryPayload.build/3` put it — with a human.
+  defp attach_story(tenant_id, dispatch, story, session, epoch, opts) do
+    if Map.get(dispatch, "kind") == "implement" do
+      case StoryPayload.build(tenant_id, story.id,
+             claim_epoch: epoch,
+             actor_lineage: session.lineage_path,
+             actor_label: Keyword.get(opts, :actor_label, "control:dispatch")
+           ) do
+        {:ok, object} -> {:ok, Map.put(dispatch, "story", object)}
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:ok, dispatch}
     end
   end
 

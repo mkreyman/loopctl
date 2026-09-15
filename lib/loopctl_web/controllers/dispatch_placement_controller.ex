@@ -109,7 +109,8 @@ defmodule LoopctlWeb.DispatchPlacementController do
          ],
          description:
            "The dispatch object, as `RunnerDispatch` declares it, minus `claim_epoch` (which " <>
-             "loopctl injects from the claim) and minus `story` (which is REFUSED — see " <>
+             "loopctl injects from the claim) and minus `story` (which is REFUSED and built " <>
+             "server-side from loopctl's own rows — see " <>
              "`story_not_accepted` below). Nothing is defaulted: `kind` must be sent and " <>
              "must be one of `x-connection.dispatchable_kinds`.",
          properties: %{
@@ -199,14 +200,18 @@ defmodule LoopctlWeb.DispatchPlacementController do
   # anything on it." A caller-supplied `story` IS prose handed to a runner, one level along.
   #
   # `Loopctl.Delivery.StoryPayload.build/3` is the server-side builder — "built from
-  # Postgres" — and `place/4` does not call it, so the object was whatever the caller sent.
-  # That was unreachable while `place/4` had no caller; THIS endpoint makes it reachable, so
-  # closing it belongs to this change and not to a later one.
+  # Postgres" — and `place/4` NOW CALLS IT (`attach_story/6`), after the claim, which is the
+  # only point where an undispatchable story can be escalated rather than truncated. So an
+  # implement dispatch placed here carries a story object loopctl built from its own rows, and
+  # the runner receives work rather than a story_id with nothing attached.
   #
-  # Refused rather than silently dropped: a caller that sent a story and got a dispatch with
-  # none would have no way to tell, and the runner would start work on a story object nobody
-  # intended. Until `place/4` builds it server-side, an implement dispatch placed here carries
-  # no story object and the runner sees exactly what loopctl vouched for — nothing.
+  # This guard stays, and it is no longer the only one: `place/4` refuses a caller-supplied
+  # `story` itself, so a worker, an MCP tool or the unattended driver is bound by the same
+  # rule without passing through this endpoint. What this one adds is the message — a caller
+  # is told to send `story_id` alone rather than getting a bare reason code.
+  #
+  # Refused rather than silently dropped: a caller that sent a story and got a dispatch
+  # carrying a different one would have no way to tell.
   defp caller_supplied_story?(dispatch), do: Map.has_key?(dispatch, "story")
 
   defp refuse_story(conn) do
