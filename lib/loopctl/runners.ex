@@ -859,8 +859,18 @@ defmodule Loopctl.Runners do
   # A runner that declared NO repos has declared nothing to check — it is the pre-1.x shape
   # and the field is required only from the contract's own version, so an empty or absent
   # list is read as "ask the runner", which is the behaviour every caller had before this
-  # function existed. A non-empty list is a statement and is honoured exactly.
-  defp repo_allowed?(%{repos: [_ | _] = repos}, repo), do: repo in repos
+  # function existed. A non-empty list is a statement and is honoured.
+  #
+  # CASE-INSENSITIVELY, which is the same rule `Loopctl.Intake` applies when it decides
+  # whether a webhook's repository is the one a source is bound to. GitHub treats
+  # `owner/Repo` and `owner/repo` as one repository, so an exact comparison here would answer
+  # "this runner does not have that checkout" for a machine that plainly does — and for the
+  # unattended driver that answer is `:no_runner`, the one outcome that logs nothing at all.
+  defp repo_allowed?(%{repos: [_ | _] = repos}, repo) do
+    wanted = String.downcase(repo)
+    Enum.any?(repos, &(is_binary(&1) and String.downcase(&1) == wanted))
+  end
+
   defp repo_allowed?(_meta, _repo), do: true
 
   defp kind_supported(tenant_id, runner_id, meta, kind) do

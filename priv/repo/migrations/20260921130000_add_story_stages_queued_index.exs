@@ -3,15 +3,23 @@ defmodule Loopctl.Repo.Migrations.AddStoryStagesQueuedIndex do
   Issue #803: the partial index behind `Loopctl.Delivery.DispatchDriver.candidates/1`. No
   column, constraint or policy changes; no backfill and no manual step.
 
-  The driver's candidate read is fleet-wide with no tenant in its predicate —
-  `stage = 'queued' ORDER BY updated_at, story_id LIMIT n` — and runs every pass. It is the
-  same shape as the triage trigger's, and migration `20260921110000` records what that cost
-  before it had an index: the only index on the table is tenant-leading, so with no tenant to
-  seek on the planner sorts every stage row ever written to find the oldest few.
+  The driver's candidate read is fleet-wide and RANKS EACH TENANT'S QUEUE SEPARATELY —
+  `stage = 'queued'`, `row_number() OVER (PARTITION BY tenant_id ORDER BY updated_at,
+  story_id)` — and runs every pass. Migration `20260921110000` records what the unindexed
+  shape cost the triage trigger: the only other index on the table is tenant-leading with the
+  stage nowhere in it, so the planner sorts every stage row ever written to find the oldest
+  few.
 
-  PARTIAL on the status, keyed by the sort. `queued` is a TRANSIENT stage — a story leaves it
-  the moment it is claimed — so the index holds only work actually waiting, which keeps it
-  small in a healthy fleet and large exactly when the driver most needs it to be fast.
+  KEYED `(tenant_id, updated_at, story_id)`, in that order, because that is the window's own
+  PARTITION BY plus its ORDER BY: Postgres can then read each tenant's partition in order
+  straight off the index instead of sorting the whole queued set per pass. Round 2 of #803's
+  review caught this — the first version was keyed `(updated_at, story_id)`, which fitted the
+  global ordering the driver had BEFORE fairness and could not serve the window at all, so the
+  migration would have shipped claiming to remove a sort it left in place.
+
+  PARTIAL on the status. `queued` is a TRANSIENT stage — a story leaves it the moment it is
+  claimed — so the index holds only work actually waiting, which keeps it small in a healthy
+  fleet and large exactly when the driver most needs it to be fast.
 
   `CONCURRENTLY` plus the validity guard, for the reasons `20260919100000` states: a plain
   build blocks every stage transition for its duration, and an interrupted concurrent build
@@ -28,13 +36,15 @@ defmodule Loopctl.Repo.Migrations.AddStoryStagesQueuedIndex do
   @name "story_stages_queued_idx"
 
   # Loose on parenthesisation and casts (deparser-version dependent), exact on the table and
-  # key order, and it MUST be partial on the stage: a full index of the same columns would
-  # answer the query while holding every stage row in the fleet.
-  @shape ~r/ON public\.story_stages USING btree \(updated_at, story_id\)\s+WHERE .*queued/s
+  # key ORDER — `(tenant_id, updated_at, story_id)` is the window's partition plus its sort,
+  # and any other order makes the planner sort again — and it MUST be partial on the stage: a
+  # full index of the same columns would answer the query while holding every stage row in the
+  # fleet.
+  @shape ~r/ON public\.story_stages USING btree \(tenant_id, updated_at, story_id\)\s+WHERE .*queued/s
 
   @create """
   CREATE INDEX CONCURRENTLY IF NOT EXISTS #{@name}
-    ON story_stages (updated_at, story_id)
+    ON story_stages (tenant_id, updated_at, story_id)
     WHERE stage = 'queued'
   """
 

@@ -319,6 +319,102 @@ defmodule Loopctl.Intake do
   end
 
   @doc """
+  Updates an ACTIVE source's mutable fields in ONE transaction (#803 round 2).
+
+  `attrs` is a map that may carry `:target_epic_id` (nullable — an explicit `nil` clears it)
+  and `:base_branch` (NOT nullable). A key that is ABSENT is left alone, which is why this
+  takes a map rather than two positional arguments: "absent" and "explicitly null" are
+  different requests for the epic, and only the map can carry that difference.
+
+  ATOMIC, and it has to be. The controller used to call `repoint_source/4` and then
+  `set_base_branch/4`, so a PATCH whose branch was invalid had already committed the repoint
+  AND appended its chain entry before the 422 — a caller reading the refusal would believe
+  neither field had changed.
+
+  One chain entry per field that actually changed, under the action that names it, so an
+  operator reading the chain still sees a repoint as a repoint and a rebase as a rebase.
+  """
+  @spec update_source(Ecto.UUID.t(), Ecto.UUID.t(), map(), keyword()) ::
+          {:ok, Source.t()} | {:error, Ecto.Changeset.t() | :not_found | :nothing_to_update}
+  def update_source(tenant_id, source_id, attrs, opts \\ [])
+      when is_binary(tenant_id) and is_binary(source_id) and is_map(attrs) do
+    epic? = Map.has_key?(attrs, :target_epic_id)
+    branch? = Map.has_key?(attrs, :base_branch)
+
+    if epic? or branch? do
+      case active_source_of(tenant_id, source_id) do
+        nil -> {:error, :not_found}
+        %Source{} = source -> apply_update(tenant_id, source, attrs, epic?, branch?, opts)
+      end
+    else
+      {:error, :nothing_to_update}
+    end
+  end
+
+  defp apply_update(tenant_id, source, attrs, epic?, branch?, opts) do
+    changeset = Ecto.Changeset.change(source)
+
+    changeset =
+      if epic?,
+        do: put_target_epic(changeset, tenant_id, Map.get(attrs, :target_epic_id)),
+        else: changeset
+
+    changeset =
+      if branch?, do: cast_base_branch(changeset, Map.get(attrs, :base_branch)), else: changeset
+
+    with {:ok, changeset} <- valid(changeset) do
+      write_update(tenant_id, changeset, epic?, branch?, opts)
+    end
+  end
+
+  # `empty_values: []`, which is NOT the default and matters here: Ecto's default treats `""`
+  # as an absent value, so an empty branch was dropped from the changeset and the source kept
+  # its old one while the caller got a 200 — a silent no-op for a request that was plainly
+  # wrong. A caller that SENT a value gets an answer about the value it sent.
+  defp cast_base_branch(changeset, value) do
+    changeset
+    |> Ecto.Changeset.cast(%{base_branch: value}, [:base_branch], empty_values: [])
+    |> Ecto.Changeset.validate_required([:base_branch])
+    |> Ecto.Changeset.validate_length(:base_branch, min: 1, max: 255)
+  end
+
+  # ONE transaction for the row and BOTH chain entries: a rebase recorded without its repoint,
+  # or either recorded against an update that did not commit, is a chain that disagrees with
+  # the table it describes.
+  defp write_update(tenant_id, changeset, epic?, branch?, opts) do
+    AdminRepo.transaction(fn ->
+      with {:ok, source} <- AdminRepo.update(changeset),
+           :ok <- append_if(epic?, tenant_id, source, "intake_source_repointed", opts),
+           :ok <- append_if(branch?, tenant_id, source, "intake_source_base_branch_set", opts) do
+        source
+      else
+        {:error, reason} -> AdminRepo.rollback(reason)
+      end
+    end)
+  end
+
+  defp append_if(false, _tenant_id, _source, _action, _opts), do: :ok
+
+  defp append_if(true, tenant_id, source, action, opts) do
+    payload =
+      case action do
+        "intake_source_repointed" -> %{"target_epic_id" => source.target_epic_id}
+        "intake_source_base_branch_set" -> %{"base_branch" => source.base_branch}
+      end
+
+    case AuditChain.append(tenant_id, %{
+           action: action,
+           actor_lineage: Keyword.get(opts, :actor_lineage, []),
+           entity_type: "intake_source",
+           entity_id: source.id,
+           payload: payload
+         }) do
+      {:ok, _entry} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
   Sets the branch dispatches for this source's repository are cut FROM (#803 round 1).
 
   ACTIVE sources only, for the same reason `repoint_source/4` is: a revoked source will never

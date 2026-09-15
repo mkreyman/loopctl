@@ -35,7 +35,9 @@ defmodule Loopctl.Workers.DispatchDriverWorker do
 
   @impl Oban.Worker
   @spec perform(Oban.Job.t()) ::
-          :ok | {:error, {:all_candidates_errored, pos_integer()}} | {:cancel, {:unset, atom()}}
+          :ok
+          | {:error, {:all_candidates_errored, pos_integer()}}
+          | {:cancel, {:misconfigured, atom()}}
   def perform(%Oban.Job{}) do
     case DispatchDriver.run(@batch) do
       {:ok, results} -> report(results)
@@ -96,11 +98,19 @@ defmodule Loopctl.Workers.DispatchDriverWorker do
   # once per pass, carries the reason, and is not retried, because a retry cannot change an
   # environment variable. The log line is the operator's remedy and it names the key.
   defp misconfigured({:unset, key}) do
-    Logger.error(
-      "DispatchDriverWorker: enabled but #{key} is unset — placing nothing. " <>
-        "Set it in config; there is deliberately no default."
-    )
+    cancel(key, "is unset", "Set it in config; there is deliberately no default.")
+  end
 
-    {:cancel, {:unset, key}}
+  # OVER THE CONTRACT'S OWN MAXIMUM, which `cast_dispatch/1` would refuse after the claim.
+  # Same answer as unset and for the same reason: an operator typed a number the loop cannot
+  # spend against, and no retry changes it.
+  defp misconfigured({:over_contract_maximum, key}) do
+    cancel(key, "is over the maximum the runner contract declares", "Lower it.")
+  end
+
+  defp cancel(key, what, remedy) do
+    Logger.error("DispatchDriverWorker: enabled but #{key} #{what} — placing nothing. #{remedy}")
+
+    {:cancel, {:misconfigured, key}}
   end
 end

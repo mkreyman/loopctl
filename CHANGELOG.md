@@ -70,9 +70,19 @@ All notable changes to loopctl are documented here.
   pass still reported success.
 
   Migration `20260921130000` adds the partial index the candidate read needs
-  (`story_stages (updated_at, story_id) WHERE stage = 'queued'`, built `CONCURRENTLY`, no
-  manual step): the only other index on the table is tenant-leading, and this read has no
-  tenant in its predicate.
+  (`story_stages (tenant_id, updated_at, story_id) WHERE stage = 'queued'`, built
+  `CONCURRENTLY`, no manual step): the key order is the candidate window's own PARTITION BY
+  plus its ORDER BY, and the only other index on the table is tenant-leading with the stage
+  nowhere in it.
+
+  **Round 2 added one more operator-visible change to the same PATCH.** `PATCH
+  /api/v1/intake/sources/:id` no longer treats an ABSENT `target_epic_id` as a request to
+  clear it: both fields are optional, a field you do not send is left alone, clearing the epic
+  takes an explicit null, and a body naming neither is a 422 `nothing_to_update`. Without that,
+  following the note above and setting the base branch before enabling the driver would have
+  un-pointed the source from its epic — which by that endpoint's own description strands every
+  record from it at `pending_triage`. Both fields are also written in ONE transaction now, so
+  a refused branch no longer leaves a committed repoint and its chain entry behind.
 
 - **`POST /api/v1/runners/:runner_id/dispatches` — the control-side dispatch trigger (#803).**
   `Loopctl.Delivery.Placement.place/4` shipped with #833 and had NO CALLER: the mechanism was

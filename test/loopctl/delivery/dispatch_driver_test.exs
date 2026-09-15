@@ -70,13 +70,13 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
 
   describe "candidates/1" do
     test "selects only stage rows at queued, oldest first, bounded", ctx do
-      first = queued_story(ctx)
-      second = queued_story(ctx)
+      first = bind_repo(ctx, queued_story(ctx))
+      second = bind_repo(ctx, queued_story(ctx))
 
       # The row that must NOT be a candidate, left at `triaged` by the machine rather than
       # moved by an UPDATE: the predicate is the stage, and a story one edge short of queued
       # is the nearest miss there is.
-      triaged = triaged_story(ctx)
+      triaged = bind_repo(ctx, triaged_story(ctx))
 
       # Backdated so the ORDER is a fact of the data rather than of insertion timing — two
       # rows written in the same millisecond would make an oldest-first assertion a coin toss.
@@ -96,7 +96,7 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
 
   describe "candidates/1 — the states a stage row alone cannot tell apart" do
     test "a RELEASED story is not a candidate, however long it sits at queued", ctx do
-      story = queued_story(ctx)
+      story = bind_repo(ctx, queued_story(ctx))
       assert story.id in candidate_ids(50)
 
       # What every release does — the lease's `:runner_lost`, and `place/4`'s own undo on a
@@ -116,13 +116,14 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
     end
 
     test "the bound is shared FAIRLY: every tenant's oldest before any tenant's second", ctx do
-      first = queued_story(ctx)
-      second = queued_story(ctx)
+      first = bind_repo(ctx, queued_story(ctx))
+      second = bind_repo(ctx, queued_story(ctx))
       unboxed(fn -> backdate(first.id, -600) end)
       unboxed(fn -> backdate(second.id, -590) end)
 
       other = fixture(:committed_tenant, %{trust_tier: :human_anchored})
-      other_story = queued_story(%{ctx | tenant: other})
+      other_ctx = %{ctx | tenant: other}
+      other_story = bind_repo(other_ctx, queued_story(other_ctx))
       unboxed(fn -> backdate(other_story.id, -60) end)
 
       # On a plain global ordering the two oldest rows are BOTH the first tenant's, so a
@@ -213,6 +214,18 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
                end)
     end
 
+    test "the repo declaration is matched case-insensitively, as GitHub treats it", ctx do
+      join_runner(ctx, %{"repos" => [String.upcase(@repo)]})
+
+      # GitHub treats `owner/Repo` and `owner/repo` as ONE repository, and `Loopctl.Intake`
+      # already compares them down-cased when it decides whether a webhook's repository is the
+      # one a source is bound to. An exact comparison here answered "this runner does not have
+      # that checkout" for a machine that plainly does — and for the driver that answer is
+      # `:no_runner`, the one outcome that logs nothing at all, so the queue would simply stop
+      # with no line anywhere saying why.
+      assert %Runner{} = unboxed(fn -> DispatchDriver.available_runner(ctx.tenant.id, @repo) end)
+    end
+
     test "nil when the TENANT is at its admission limit, even with a free slot on the row",
          ctx do
       join_runner(ctx)
@@ -278,7 +291,7 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
       # Off is not a failure and not an error: the cron entry runs every minute from the
       # deploy that ships it, and until somebody enables the driver it must report a clean run.
       # A queued story is standing right here, so this is the gate and not an empty queue.
-      _story = queued_story(ctx)
+      bind_repo(ctx, queued_story(ctx), @repo)
       join_runner(ctx)
 
       assert unboxed(fn -> DispatchDriver.run(20) end) == {:ok, []}
@@ -287,7 +300,7 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
 
   describe "run_with/2" do
     test "places a queued story on the connected runner", ctx do
-      story = bind_repo(ctx, queued_story(ctx))
+      story = bind_repo(ctx, queued_story(ctx), @repo)
       channel = join_runner(ctx)
 
       assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) == [:placed]
@@ -320,7 +333,7 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
     end
 
     test "no connected runner leaves the story queued for the next pass", ctx do
-      story = bind_repo(ctx, queued_story(ctx))
+      story = bind_repo(ctx, queued_story(ctx), @repo)
 
       assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) == [:no_runner]
 
@@ -348,7 +361,7 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
     end
 
     test "a tenant whose only operator key has EXPIRED is blocked, not placed", ctx do
-      bind_repo(ctx, queued_story(ctx))
+      bind_repo(ctx, queued_story(ctx), @repo)
       join_runner(ctx)
 
       # Expiry is what key ROTATION uses (`Auth.expire_api_key/2`), so a rotated-out key is
@@ -362,16 +375,35 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
       refute_push "dispatch", _pushed
     end
 
-    test "a story whose project has no intake source is BLOCKED, and the pass goes on", ctx do
-      # A project with no intake source has no repository, and `fixture(:committed_story)`
-      # creates exactly that — the ordinary shape of a story the driver cannot address. It is
-      # `:blocked` and not `:unplaceable` because nothing clears it on its own: somebody has
-      # to enrol a source. The distinction is the whole of what an operator reads when a queue
-      # stops draining, and it must not take the pass down with it either.
-      _blocked = queued_story(ctx)
-      join_runner(ctx)
+    test "a story whose project has no intake source is not selected at all, and does not " <>
+           "hold a slot in the batch",
+         ctx do
+      # It USED to be selected and reported `:blocked`, which was honest but was the same trap
+      # the `contracted` predicate closed: a blocked story's `updated_at` never moves, so it
+      # sat at the head of an oldest-first queue for ever and twenty of them filled every
+      # pass's batch while the job still reported a clean run. Excluded in the PREDICATE, a
+      # placeable story behind it is reached in the same pass.
+      unaddressable = queued_story(ctx)
+      placeable = bind_repo(ctx, queued_story(ctx), @repo)
+      unboxed(fn -> backdate(unaddressable.id, -600) end)
 
-      assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) == [:blocked]
+      channel = join_runner(ctx)
+
+      refute unaddressable.id in candidate_ids(50)
+      assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) == [:placed]
+      assert_push "dispatch", pushed, @reply_timeout
+      assert pushed.story_id == placeable.id
+      leave_channel(channel)
+    end
+
+    test "a project bound to TWO active sources is not selected either", ctx do
+      # Two sources name two repositories, so nothing can choose between them without choosing
+      # a repository nobody nominated. Same exclusion and the same reason as none at all: it
+      # is a configuration a person has to fix, and until they do it must not occupy the queue.
+      ambiguous = bind_repo(ctx, queued_story(ctx), @repo)
+      bind_repo(ctx, ambiguous, "mkreyman/cron_books")
+
+      refute ambiguous.id in candidate_ids(50)
     end
   end
 
@@ -426,7 +458,13 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
   # intake source, so a driver-placed story is unaddressable until this exists. Inserted rather
   # than taken from `fixture(:committed_intake, ...)`: that fixture makes its OWN project, and
   # the binding under test is the one between the story's project and a repository.
-  defp bind_repo(ctx, story, repo \\ @repo, base_branch \\ "master") do
+  # A UNIQUE repository by default, because `intake_sources_active_repo_uidx` allows one
+  # ACTIVE source per repository per tenant — so two stories in two projects of one tenant
+  # cannot both be bound to the same repo. The placing tests pass `@repo` explicitly, since
+  # that is the one the joined runner declares.
+  defp bind_repo(ctx, story, repo \\ nil, base_branch \\ "master") do
+    repo = repo || "mkreyman/repo-#{System.unique_integer([:positive])}"
+
     now = DateTime.utc_now()
 
     unboxed(fn ->

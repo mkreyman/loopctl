@@ -72,9 +72,11 @@ defmodule Loopctl.Delivery.DispatchDriver do
 
   import Ecto.Query
 
+  alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.Delivery.Placement
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Intake
+  alias Loopctl.Intake.Source
   alias Loopctl.Repo
   alias Loopctl.Runners
   alias Loopctl.Runners.Capacity
@@ -97,23 +99,41 @@ defmodule Loopctl.Delivery.DispatchDriver do
   @doc """
   The stories this pass will attempt, at most `limit`, fairly across tenants.
 
-  `queued` AND `contracted` — see the moduledoc on why the stage row alone selected released
-  stories for ever. Ranked per tenant and ordered by that rank first, so a tenant with one
-  queued story is reached in the same pass as a tenant with two hundred.
+  `queued` AND `contracted` AND under a project bound to exactly ONE active intake source —
+  see the moduledoc on why the stage row alone selected released stories for ever, and why an
+  unaddressable project is the same trap wearing the driver's own `:blocked` label. Ranked per
+  tenant and ordered by that rank first, so a tenant with one queued story is reached in the
+  same pass as a tenant with two hundred.
 
   Fleet-wide and with no tenant in the predicate, exactly like the triage trigger's own
   candidate read — and carrying the same cost, which migration `20260921110000` documents for
   that one: a read on this shape with no supporting index sorts the whole table every pass.
-  `story_stages_queued_idx` is its counterpart.
+  `story_stages_queued_idx` is its counterpart, keyed `(tenant_id, updated_at, story_id)` to
+  match the window's PARTITION BY plus its ORDER BY.
 
   Public so the selection is falsifiable rather than buried in the pass.
   """
   @spec candidates(pos_integer()) :: [candidate()]
   def candidates(limit) when is_integer(limit) and limit > 0 do
+    # ONE ACTIVE INTAKE SOURCE, in the predicate rather than discovered per story. A project
+    # with none has no repository and a project with two names no single one, so every story
+    # under it is `:blocked` — and a blocked story's `updated_at` never moves, which put it at
+    # the head of an oldest-first queue for ever. Twenty of them filled every pass's batch
+    # while the job reported a clean run: the same trap the `contracted` predicate closed for
+    # released stories, left open for the class this driver's own reporting introduced.
+    bound_projects =
+      from src in Source,
+        where: is_nil(src.revoked_at),
+        group_by: [src.tenant_id, src.project_id],
+        having: count(src.id) == 1,
+        select: %{tenant_id: src.tenant_id, project_id: src.project_id}
+
     ranked =
       from s in StoryStage,
         join: st in Story,
         on: st.id == s.story_id and st.tenant_id == s.tenant_id,
+        join: b in subquery(bound_projects),
+        on: b.tenant_id == st.tenant_id and b.project_id == st.project_id,
         where: s.stage == :queued,
         where: st.agent_status == :contracted,
         select: %{
@@ -182,7 +202,7 @@ defmodule Loopctl.Delivery.DispatchDriver do
   """
   @spec budgets() ::
           {:ok, %{wall_clock_seconds: pos_integer(), max_turns: pos_integer()}}
-          | {:error, {:unset, atom()}}
+          | {:error, {:unset, atom()} | {:over_contract_maximum, atom()}}
   def budgets do
     with {:ok, seconds} <- fetch_budget(:dispatch_wall_clock_seconds),
          {:ok, turns} <- fetch_budget(:dispatch_max_turns) do
@@ -204,10 +224,30 @@ defmodule Loopctl.Delivery.DispatchDriver do
   `Application.put_env` in tests, so the key is unset in every one and the branches below
   would otherwise be reachable only from production.
   """
-  @spec normalise_budget(term(), atom()) :: {:ok, pos_integer()} | {:error, {:unset, atom()}}
+  @spec normalise_budget(term(), atom()) ::
+          {:ok, pos_integer()} | {:error, {:unset, atom()} | {:over_contract_maximum, atom()}}
   def normalise_budget(value, key) when is_atom(key) do
-    if is_integer(value) and value > 0, do: {:ok, value}, else: {:error, {:unset, key}}
+    cond do
+      not (is_integer(value) and value > 0) -> {:error, {:unset, key}}
+      value > budget_maximum(key) -> {:error, {:over_contract_maximum, key}}
+      true -> {:ok, value}
+    end
   end
+
+  # THE CONTRACT'S OWN CEILING, read from the contract rather than copied. A wall clock over
+  # `RunnerDispatch.max_wall_clock_seconds/0` is refused by `cast_dispatch/1` INSIDE
+  # `Runners.dispatch/3` — which is after the claim, so an operator who set a two-day budget
+  # would spend twenty mint-claim-refuse-release cycles a minute, each one a permanent chain
+  # entry, for a number the contract was never going to accept. Read once per pass here, and
+  # the pass does not run at all.
+  #
+  # `max_turns` has a minimum in the contract and no maximum, so its only ceiling is the one
+  # above: a positive integer. Stated rather than left implicit, because the pair is read as a
+  # pair and a silent `:infinity` for one of them is how the other's bound gets forgotten.
+  defp budget_maximum(:dispatch_wall_clock_seconds),
+    do: RunnerContract.RunnerDispatch.max_wall_clock_seconds()
+
+  defp budget_maximum(:dispatch_max_turns), do: :infinity
 
   @doc "True when an operator has turned the driver on. Defaults to FALSE."
   @spec enabled?() :: boolean()
@@ -219,7 +259,8 @@ defmodule Loopctl.Delivery.DispatchDriver do
   Returns `{:error, {:unset, key}}` rather than running when a budget is missing, and
   `{:ok, []}` when the driver is off — off is not a failure.
   """
-  @spec run(pos_integer()) :: {:ok, [outcome()]} | {:error, {:unset, atom()}}
+  @spec run(pos_integer()) ::
+          {:ok, [outcome()]} | {:error, {:unset, atom()} | {:over_contract_maximum, atom()}}
   def run(limit) when is_integer(limit) and limit > 0 do
     if enabled?() do
       with {:ok, budgets} <- budgets(), do: {:ok, run_with(limit, budgets)}

@@ -323,6 +323,85 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
                )
     end
 
+    test "a PATCH naming ONLY the base branch leaves the epic pointed", %{conn: conn} do
+      ctx = operator_ctx()
+      epic = fixture(:epic, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      {_s, source} =
+        fixture(:intake_source, %{
+          tenant_id: ctx.tenant.id,
+          project_id: ctx.project.id,
+          target_epic_id: epic.id
+        })
+
+      # THE TRAP THIS ACTION USED TO CARRY: absent meant "clear" for the epic, and the
+      # `required` marker in the request schema is documentation rather than enforcement —
+      # this router mounts no `CastAndValidate`. So following the deploy note and setting the
+      # base branch before enabling the driver un-pointed the source from its epic, which by
+      # this action's own description strands every record from it at `pending_triage`.
+      body =
+        conn
+        |> auth(ctx.operator_key)
+        |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"base_branch" => "main"})
+        |> json_response(200)
+
+      assert body["source"]["base_branch"] == "main"
+      assert body["source"]["target_epic_id"] == epic.id
+      assert AdminRepo.get!(Source, source.id).target_epic_id == epic.id
+    end
+
+    test "a body naming neither field is refused rather than clearing anything", %{conn: conn} do
+      ctx = operator_ctx()
+      epic = fixture(:epic, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      {_s, source} =
+        fixture(:intake_source, %{
+          tenant_id: ctx.tenant.id,
+          project_id: ctx.project.id,
+          target_epic_id: epic.id
+        })
+
+      body =
+        conn
+        |> auth(ctx.operator_key)
+        |> patch(~p"/api/v1/intake/sources/#{source.id}", %{})
+        |> json_response(422)
+
+      assert body["error"]["code"] == "nothing_to_update"
+      assert AdminRepo.get!(Source, source.id).target_epic_id == epic.id
+    end
+
+    test "an invalid base branch commits NOTHING, the repoint included", %{conn: conn} do
+      ctx = operator_ctx()
+      epic = fixture(:epic, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      {_s, source} =
+        fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      # Two context calls in sequence committed the repoint AND appended its chain entry
+      # before the branch could be refused, so a caller reading the 422 believed neither field
+      # had changed while one had — and the chain carried an entry for it.
+      conn
+      |> auth(ctx.operator_key)
+      |> patch(~p"/api/v1/intake/sources/#{source.id}", %{
+        "target_epic_id" => epic.id,
+        "base_branch" => ""
+      })
+      |> json_response(422)
+
+      reloaded = AdminRepo.get!(Source, source.id)
+      assert reloaded.target_epic_id == nil
+      assert reloaded.base_branch == "master"
+
+      assert [] ==
+               AdminRepo.all(
+                 from e in Entry,
+                   where:
+                     e.tenant_id == ^ctx.tenant.id and
+                       e.action in ["intake_source_repointed", "intake_source_base_branch_set"]
+               )
+    end
+
     test "a PATCH that does not name the base branch leaves it where it was", %{conn: conn} do
       ctx = operator_ctx()
       epic = fixture(:epic, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
