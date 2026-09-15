@@ -244,6 +244,41 @@ defmodule Loopctl.ObanPluginsConfigTest do
     end
   end
 
+  describe "TriageTriggerWorker crontab entry" do
+    setup do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+
+      {Oban.Plugins.Cron, cron_opts} =
+        Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      entry =
+        Enum.find(cron_opts[:crontab], fn
+          {_schedule, Loopctl.Workers.TriageTriggerWorker} -> true
+          {_schedule, Loopctl.Workers.TriageTriggerWorker, _opts} -> true
+          _ -> false
+        end)
+
+      %{entry: entry}
+    end
+
+    test "the TriageTriggerWorker entry exists in the crontab", %{entry: entry} do
+      assert entry,
+             "expected a TriageTriggerWorker crontab entry — #803 §2/§4. Without one nothing " <>
+               "in lib/ calls Loopctl.Delivery.TriageTrigger.promote/1, so a reported issue " <>
+               "stays an intake record for ever and the delivery loop never sees it. The " <>
+               "webhook cannot promote in its own transaction, so there is no other caller."
+    end
+
+    test "it runs every minute and takes no all_tenants fan-out", %{entry: entry} do
+      # Fleet-wide in ONE job (the candidate read is on AdminRepo across tenants), so there is
+      # no per-tenant child to fan out to. Every minute rather than the two the forge drainers
+      # beside it take: a candidate makes no network call at all, so the cadence is bounded by
+      # AdminRepo's pool rather than anyone's rate limit.
+      assert elem(entry, 0) == "* * * * *"
+      assert tuple_size(entry) == 2
+    end
+  end
+
   describe "#249: inert KB crons are PARKED by default" do
     setup do
       plugins = Application.get_env(:loopctl, Oban)[:plugins]

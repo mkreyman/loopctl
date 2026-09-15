@@ -199,6 +199,35 @@ defmodule Loopctl.WorkBreakdown.EpicsTest do
 
       assert length(result.data) == 1
     end
+
+    test "an epic an intake source targets is refused as a changeset error" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      {_secret, _source} =
+        fixture(:intake_source, %{
+          tenant_id: tenant.id,
+          project_id: project.id,
+          target_epic_id: epic.id
+        })
+
+      assert {:error, changeset} = Epics.delete_epic(tenant.id, epic)
+
+      # `intake_sources.target_epic_id` is the one FK onto `epics` that RESTRICTS rather than
+      # cascading (#803), so the delete is refused BY POSTGRES either way. What the fix buys
+      # is the shape: through a bare struct it raised `Ecto.ConstraintError`, which the
+      # fallback controller cannot render, so the operator got a 500 with no idea what was
+      # pointing at the epic instead of a 422 telling them which source to repoint.
+      # On `:id`, not `:target_epic_id`. The constraint lives on `intake_sources`, but the
+      # changeset being rendered is an EPIC — a 422 keyed on a field the epic does not have
+      # tells the operator to fix an attribute they never sent.
+      refute Map.has_key?(errors_on(changeset), :target_epic_id)
+      assert %{id: [message]} = errors_on(changeset)
+      assert message =~ "intake source"
+
+      assert {:ok, _still_there} = Epics.get_epic(tenant.id, epic.id)
+    end
   end
 
   describe "list_epics/3" do

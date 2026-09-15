@@ -55,6 +55,66 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
                )
     end
 
+    test "target_epic_id is persisted and comes back in the response", %{conn: conn} do
+      ctx = operator_ctx()
+      epic = fixture(:epic, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      body =
+        conn
+        |> auth(ctx.operator_key)
+        |> post(
+          ~p"/api/v1/intake/sources",
+          Map.put(create_params(ctx), "target_epic_id", epic.id)
+        )
+        |> json_response(201)
+
+      # BOTH halves, because both were missing. The controller dropped the parameter, so the
+      # column could only ever be set by direct SQL and every promote of a record from a
+      # source enrolled through this endpoint escalated for want of a target epic — the
+      # feature had no code path at all. The response field was absent too, so an operator
+      # could not tell a source that names an epic from one that does not.
+      assert body["source"]["target_epic_id"] == epic.id
+
+      {:ok, source} = Intake.get_source(ctx.tenant.id, body["source"]["id"])
+      assert source.target_epic_id == epic.id
+    end
+
+    test "a source enrolled without a target epic reports it as null", %{conn: conn} do
+      ctx = operator_ctx()
+
+      body =
+        conn
+        |> auth(ctx.operator_key)
+        |> post(~p"/api/v1/intake/sources", create_params(ctx))
+        |> json_response(201)
+
+      # The key is PRESENT and null rather than absent: "the question has not been answered"
+      # is a state an operator reads off this endpoint, and a missing key reads as a client
+      # that is out of date instead.
+      assert Map.has_key?(body["source"], "target_epic_id")
+      assert body["source"]["target_epic_id"] == nil
+    end
+
+    test "422 naming target_epic_id for an epic outside the source's project", %{conn: conn} do
+      ctx = operator_ctx()
+      other_project = fixture(:project, %{tenant_id: ctx.tenant.id})
+      epic = fixture(:epic, %{tenant_id: ctx.tenant.id, project_id: other_project.id})
+
+      body =
+        conn
+        |> auth(ctx.operator_key)
+        |> post(
+          ~p"/api/v1/intake/sources",
+          Map.put(create_params(ctx), "target_epic_id", epic.id)
+        )
+        |> json_response(422)
+
+      # A 422 rather than an `Ecto.ConstraintError` 500, and the field is named: the mistake
+      # is one an operator makes at enrollment and can fix there, not on the first webhook.
+      assert body["error"]["details"]["target_epic_id"]
+      assert Intake.list_sources(ctx.tenant.id) == []
+    end
+
     test "the secret is encrypted at rest", %{conn: conn} do
       ctx = operator_ctx()
 
@@ -199,6 +259,96 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
 
       assert json_response(get(auth(conn, ctx.operator_key), ~p"/api/v1/intake/sources"), 200) ==
                %{"sources" => []}
+    end
+  end
+
+  describe "PATCH /api/v1/intake/sources/:id" do
+    test "repoints an active source and records it", %{conn: conn} do
+      ctx = operator_ctx()
+
+      {_s, source} =
+        fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      epic = fixture(:epic, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      body =
+        conn
+        |> auth(ctx.operator_key)
+        |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"target_epic_id" => epic.id})
+        |> json_response(200)
+
+      assert body["source"]["target_epic_id"] == epic.id
+      refute Map.has_key?(body["source"], "webhook_secret")
+      assert AdminRepo.get!(Source, source.id).target_epic_id == epic.id
+
+      assert [_one] =
+               AdminRepo.all(
+                 from e in Entry,
+                   where: e.tenant_id == ^ctx.tenant.id and e.action == "intake_source_repointed"
+               )
+    end
+
+    test "an explicit null clears the target", %{conn: conn} do
+      ctx = operator_ctx()
+      epic = fixture(:epic, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      {_s, source} =
+        fixture(:intake_source, %{
+          tenant_id: ctx.tenant.id,
+          project_id: ctx.project.id,
+          target_epic_id: epic.id
+        })
+
+      body =
+        conn
+        |> auth(ctx.operator_key)
+        |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"target_epic_id" => nil})
+        |> json_response(200)
+
+      assert body["source"]["target_epic_id"] == nil
+      assert AdminRepo.get!(Source, source.id).target_epic_id == nil
+    end
+
+    test "422 for an epic outside the source's project", %{conn: conn} do
+      ctx = operator_ctx()
+      other_project = fixture(:project, %{tenant_id: ctx.tenant.id})
+      epic = fixture(:epic, %{tenant_id: ctx.tenant.id, project_id: other_project.id})
+
+      {_s, source} =
+        fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      assert conn
+             |> auth(ctx.operator_key)
+             |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"target_epic_id" => epic.id})
+             |> json_response(422)
+
+      assert AdminRepo.get!(Source, source.id).target_epic_id == nil
+    end
+
+    test "404 for another tenant's source, which is not repointed", %{conn: conn} do
+      ctx = operator_ctx()
+      {_s, other} = fixture(:intake_source, %{})
+      epic = fixture(:epic, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      assert conn
+             |> auth(ctx.operator_key)
+             |> patch(~p"/api/v1/intake/sources/#{other.id}", %{"target_epic_id" => epic.id})
+             |> json_response(404)
+
+      assert AdminRepo.get!(Source, other.id).target_epic_id == nil
+    end
+
+    test "an agent-rooted tenant is refused: intake is a human-anchored surface", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {operator_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      {_s, source} = fixture(:intake_source, %{tenant_id: tenant.id})
+
+      # The WRITE half of the surface is what the anchor gates, and a repoint redirects where
+      # outside text lands — the same act as enrolling the source, arriving later.
+      assert conn
+             |> auth(operator_key)
+             |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"target_epic_id" => nil})
+             |> json_response(403)
     end
   end
 
