@@ -138,6 +138,146 @@ defmodule LoopctlRunner.ContractTest do
     end
   end
 
+  describe "list constraints, implemented before loopctl can publish them" do
+    @kinds %{
+      "type" => "array",
+      "items" => %{"type" => "string", "enum" => ["implement", "triage"]},
+      "minItems" => 1,
+      "maxItems" => 2,
+      "uniqueItems" => true
+    }
+
+    test "minItems, maxItems and uniqueItems each refuse, and a good list passes" do
+      assert Contract.validate_against(@kinds, ["implement"], "kinds") == :ok
+      assert Contract.validate_against(@kinds, ["implement", "triage"], "kinds") == :ok
+
+      assert {:error, ["kinds: fewer than 1 items"]} =
+               Contract.validate_against(@kinds, [], "kinds")
+
+      assert {:error, ["kinds: items are not unique"]} =
+               Contract.validate_against(@kinds, ["implement", "implement"], "kinds")
+
+      # Every failing keyword is reported, not the first. Order follows map iteration, which
+      # this validator does not fix, so the assertion is on membership.
+      assert {:error, errors} =
+               Contract.validate_against(@kinds, ["implement", "triage", "implement"], "kinds")
+
+      assert Enum.sort(errors) ==
+               Enum.sort(["kinds: more than 2 items", "kinds: items are not unique"])
+    end
+
+    test "uniqueItems false allows the very repeats true refuses" do
+      repeats = ["implement", "implement"]
+      permissive = %{@kinds | "uniqueItems" => false, "minItems" => 0}
+
+      assert Contract.validate_against(permissive, repeats, "kinds") == :ok
+      assert Contract.validate_against(permissive, [], "kinds") == :ok
+
+      assert {:error, ["kinds: items are not unique"]} =
+               Contract.validate_against(%{permissive | "uniqueItems" => true}, repeats, "kinds")
+    end
+
+    test "uniqueItems compares JSON values: 1 and 1.0 are the same number" do
+      numbers = %{"type" => "array", "uniqueItems" => true}
+
+      assert {:error, ["n: items are not unique"]} =
+               Contract.validate_against(numbers, [1, 1.0], "n")
+
+      assert {:error, ["n: items are not unique"]} =
+               Contract.validate_against(numbers, [%{"a" => [1]}, %{"a" => [1.0]}], "n")
+
+      assert Contract.validate_against(numbers, [1, 2, "1"], "n") == :ok
+    end
+
+    test "additionalProperties as a subschema validates the properties the schema does not name" do
+      schema = %{
+        "type" => "object",
+        "properties" => %{"kind" => %{"type" => "string"}},
+        "additionalProperties" => %{"type" => "string"}
+      }
+
+      assert Contract.validate_against(schema, %{"kind" => "implement", "note" => "x"}, "d") ==
+               :ok
+
+      assert {:error, [error]} =
+               Contract.validate_against(schema, %{"kind" => "implement", "note" => 1}, "d")
+
+      assert error =~ ~s(d.note: expected "string", got 1)
+    end
+
+    test "uniqueItems is exact on integers a float cannot hold, and does not raise on a bignum" do
+      numbers = %{"type" => "array", "uniqueItems" => true}
+      big = 9_007_199_254_740_993
+
+      assert Contract.validate_against(numbers, [big, big - 1], "n") == :ok
+      assert Contract.validate_against(numbers, [10 ** 400, 1], "n") == :ok
+
+      assert {:error, ["n: items are not unique"]} =
+               Contract.validate_against(numbers, [big, big], "n")
+    end
+
+    test "additionalProperties false refuses a property the schema does not name" do
+      schema = %{
+        "type" => "object",
+        "properties" => %{"kind" => %{"type" => "string"}},
+        "additionalProperties" => false
+      }
+
+      assert Contract.validate_against(schema, %{"kind" => "implement"}, "d") == :ok
+
+      assert {:error, [error]} =
+               Contract.validate_against(schema, %{"kind" => "implement", "extra" => 1}, "d")
+
+      assert error =~ "has extra, which the schema does not allow"
+
+      assert Contract.validate_against(
+               %{schema | "additionalProperties" => true},
+               %{"x" => 1},
+               "d"
+             ) == :ok
+    end
+
+    test "a keyword the validator does not implement still fails rather than being skipped" do
+      assert {:error, [error]} =
+               Contract.validate_against(%{"type" => "array", "contains" => %{}}, [], "kinds")
+
+      assert error =~ "does not implement contains"
+    end
+  end
+
+  # One schema per keyword that MUST produce an error, so a keyword listed in @known without an
+  # implementing clause fails here instead of silently passing every payload it appears in.
+  @refusals %{
+    "type" => {%{"type" => "string"}, 1},
+    "required" => {%{"type" => "object", "required" => ["a"]}, %{}},
+    "properties" => {%{"properties" => %{"a" => %{"type" => "string"}}}, %{"a" => 1}},
+    "minimum" => {%{"minimum" => 2}, 1},
+    "maximum" => {%{"maximum" => 2}, 3},
+    "minLength" => {%{"minLength" => 2}, "a"},
+    "maxLength" => {%{"maxLength" => 1}, "ab"},
+    "pattern" => {%{"pattern" => "\\Aa\\z"}, "b"},
+    "enum" => {%{"enum" => ["a"]}, "b"},
+    "items" => {%{"items" => %{"type" => "string"}}, [1]},
+    "minItems" => {%{"minItems" => 1}, []},
+    "maxItems" => {%{"maxItems" => 1}, [1, 2]},
+    "uniqueItems" => {%{"uniqueItems" => true}, [1, 1]},
+    "minProperties" => {%{"minProperties" => 1}, %{}},
+    "format" => {%{"format" => "uuid"}, "not-a-uuid"},
+    "additionalProperties" => {%{"additionalProperties" => false}, %{"a" => 1}}
+  }
+
+  # `description` annotates and constrains nothing; it is the only known keyword with no refusal.
+  @annotations ~w(description)
+
+  test "every keyword in the known list is implemented, not merely listed" do
+    assert Enum.sort(Map.keys(@refusals) ++ @annotations) == Enum.sort(Contract.known_keywords())
+
+    for {keyword, {schema, value}} <- @refusals do
+      assert {:error, [_ | _]} = Contract.validate_against(schema, value, keyword),
+             "#{keyword} is in the known list but refuses nothing: it would pass every payload"
+    end
+  end
+
   test "every keyword the vendored file uses is one the validator implements" do
     # validate/2 reports an unimplemented keyword as a failure; walk every $defs entry
     # with a value that reaches every nested schema, and look for that message.

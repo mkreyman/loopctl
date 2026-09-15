@@ -33,7 +33,18 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
   an environment variable a `claude` session inherits, or a URL.
 - **Every payload sent to loopctl is validated against the vendored contract**
   (`priv/runner_contract/v1.json`, copied from mkreyman/loopctl, never re-typed). When loopctl
-  bumps the contract, copy the file again; do not edit it here.
+  bumps the contract, copy the file again from loopctl MASTER, once it is merged AND deployed;
+  a branch or an unmerged master is the same trap in the other direction. Do not edit it here.
+- **A schema keyword is implemented in `Contract` before loopctl publishes it, and deployed on
+  every runner before loopctl enforces it.** An unimplemented keyword FAILS validation rather
+  than being skipped, so a definition carrying one would refuse every payload on this side.
+  `Contract.validate_against/3` tests a keyword on an inline schema before the vendored file
+  uses it; loopctl's own test fails when its enforced set exceeds its exported set.
+- **A refusal naming a capability must be a real capability statement.** `kind_not_supported`
+  says this runner never runs that kind, and loopctl caches it. Declaring a kind on join and
+  then refusing it is a BUG here, and loopctl's per-connection suppression of that kind is a
+  bound on the damage, never a recovery to lean on. A transient local condition gets its own
+  `DispatchPolicy` reason instead.
 - **The daemon starts only under `LOOPCTL_RUNNER_DAEMON=1`**, so `mix loopctl.run` never joins
   the pool.
 - **A loop session asks for a human by running `priv/bin/loop-escalate`**, the one command the
