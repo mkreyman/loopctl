@@ -22,6 +22,7 @@ defmodule Loopctl.Delivery.StagesTest do
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
+  alias Loopctl.Delivery.Untrusted
   alias Loopctl.Progress
   alias Loopctl.Repo
   alias Loopctl.WorkBreakdown.Story
@@ -44,6 +45,29 @@ defmodule Loopctl.Delivery.StagesTest do
           where: e.tenant_id == ^tenant_id,
           order_by: [asc: e.chain_position],
           select: e.action
+      )
+    end)
+  end
+
+  # The transition's own event rows, whose jsonb `data` carries the reason.
+  defp transition_events(tenant_id, story_id) do
+    as_tenant(tenant_id, fn ->
+      Repo.all(
+        from e in StageEvent,
+          where: e.tenant_id == ^tenant_id and e.story_id == ^story_id,
+          order_by: [asc: e.inserted_at, asc: e.lock_version]
+      )
+    end)
+  end
+
+  # The chain entries' payloads — the half of the record nobody can edit afterwards.
+  defp chain_payloads(tenant_id) do
+    as_tenant(tenant_id, fn ->
+      Repo.all(
+        from e in Entry,
+          where: e.tenant_id == ^tenant_id,
+          order_by: [asc: e.chain_position],
+          select: e.payload
       )
     end)
   end
@@ -295,20 +319,27 @@ defmodule Loopctl.Delivery.StagesTest do
                  base ++ [reason: String.duplicate("x", 4001)]
                )
 
-      assert {:error, :invalid_reason} =
-               Stages.advance(
-                 story.tenant_id,
-                 story.id,
-                 transition,
-                 base ++ [reason: "log tail" <> <<0>>]
-               )
+      # The NUL case moved to its own test below: it now SUCCEEDS, and a success here would
+      # advance the row out from under the refusals that follow.
 
       # The CHECK counts CODEPOINTS (char_length); a grapheme count does not. This family
       # emoji is ONE grapheme and several codepoints, so at the boundary a grapheme-counting
       # guard passed a value Postgres then refused as 23514 — losing the escalation.
+      #
+      # It is ALSO the case that shows what escaping costs, which is why it is still measured
+      # here rather than simplified away: the sequence is joined by ZERO-WIDTH JOINERS, and
+      # `sanitise/1` cannot tell a legitimate joiner from a hidden one, so each becomes eight
+      # visible characters. The bound is therefore measured on the SANITISED text — the thing
+      # the column actually holds — and a caller near the cap has less room than the raw
+      # length suggests. That is the accepted price of a permanent record whose invisible
+      # characters are visible; it is measured rather than asserted.
       family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"
       assert String.length(family) == 1
-      family_codepoints = family |> String.to_charlist() |> length()
+
+      stored = Untrusted.sanitise(family)
+      assert stored =~ "<U+200D>"
+      stored_codepoints = stored |> String.to_charlist() |> length()
+      assert stored_codepoints > family |> String.to_charlist() |> length()
 
       assert {:error, :invalid_reason} =
                Stages.advance(
@@ -318,18 +349,28 @@ defmodule Loopctl.Delivery.StagesTest do
                  base ++ [reason: String.duplicate("x", 4000 - 1) <> family]
                )
 
-      assert {:ok, %StoryStage{stage: :escalated}} =
-               Stages.advance(
-                 story.tenant_id,
-                 story.id,
-                 transition,
-                 base ++ [reason: String.duplicate("x", 4000 - family_codepoints) <> family]
-               )
+      # THE DISCRIMINATING CASE, which round 1 of #859's review found missing: raw INSIDE the
+      # bound and escaped OUTSIDE it. Both of the assertions above are decided identically
+      # with or without the escape — 4004 raw codepoints is over 4000 either way — so neither
+      # pinned the new behaviour, while the comment claimed the cost was measured here.
+      #
+      # This one is the whole design in a single assertion: the caller is bounded on what it
+      # SENT, so a reason that is 4,000 raw codepoints is ACCEPTED even though what lands in
+      # the column is longer. Bounding the escaped form instead is what split one published
+      # number into two and lost the escalation.
+      at_bound = String.duplicate("x", 4000 - 5) <> family
+      assert at_bound |> String.to_charlist() |> length() == 4000
+      assert Untrusted.sanitise(at_bound) |> String.to_charlist() |> length() > 4000
 
-      # The accepted one above left the row at `escalated`, so the reason is read back.
+      assert {:ok, %StoryStage{stage: :escalated}} =
+               Stages.advance(story.tenant_id, story.id, transition, base ++ [reason: at_bound])
+
+      # The accepted one left the row at `escalated`, so the reason is read back — and it ends
+      # with the SANITISED sequence, not the raw one. That is what says the column holds the
+      # escaped form while the caller was judged on the raw one.
       assert String.ends_with?(
                Stages.get(story.tenant_id, story.id).escalation_reason,
-               family
+               stored
              )
 
       assert {:error, :stale_stage} =
@@ -341,6 +382,42 @@ defmodule Loopctl.Delivery.StagesTest do
                )
 
       assert chain_actions(story.tenant_id) == ["story_stage_escalated"]
+    end
+
+    test "a NUL in the reason is ESCAPED and the escalation survives" do
+      # It used to be refused — Postgres will not take a NUL in text, so the guard caught it
+      # before the transition — and the cost was that a session escalating with one byte of
+      # rubbish in its reason got NO ESCALATION AT ALL and the story was stranded at whatever
+      # stage it was in. The reason is escaped before it is bounded now, so the NUL is
+      # recorded visibly and the escalation lands.
+      {story, _} = at_stage(:deployed)
+      transition = {:deployed, :escalated, :verification_failed}
+      base = [claim_epoch: story.claim_epoch, actor_lineage: []]
+
+      assert {:ok, row} =
+               Stages.advance(
+                 story.tenant_id,
+                 story.id,
+                 transition,
+                 base ++ [reason: "log tail" <> <<0>>]
+               )
+
+      assert row.escalation_reason == "log tail<U+0000>"
+      assert row.stage == :escalated
+
+      # THE COLUMN IS HALF THE CLAIM. The reason also reaches the stage EVENT's jsonb and, on
+      # a chained transition, the tenant's append-only chain entry — and the chain is half of
+      # why this escape exists at all. Asserted here because a regression that escaped only
+      # the value handed to the compare-and-set would pass on the column alone while a NUL
+      # reached both of the places nobody can edit afterwards. Postgres refuses a NUL in
+      # jsonb, so such a regression would not merely record badly, it would raise.
+      events = transition_events(story.tenant_id, story.id)
+      assert Enum.any?(events, &(&1.data["reason"] == "log tail<U+0000>"))
+
+      assert Enum.any?(
+               chain_payloads(story.tenant_id),
+               &(&1["reason"] == "log tail<U+0000>")
+             )
     end
 
     test "no stage row is not_found" do

@@ -356,8 +356,11 @@ defmodule Loopctl.Delivery.Stages do
          :ok <- event_data_ok(opts),
          {:ok, effects} <- validate_effects(opts),
          :ok <- required_effects_present(to, effects) do
+      # ESCAPED ONLY AFTER EVERY REFUSAL THE CALLER CAN PREDICT. See `sanitise_reason/1`:
+      # the caller is bounded on the text it sent, the column holds the escaped form, and the
+      # two numbers are deliberately different.
       in_tenant(tenant_id, fn ->
-        transition(tenant_id, story_id, {from, to, edge}, epoch, effects, opts)
+        transition(tenant_id, story_id, {from, to, edge}, epoch, effects, sanitise_reason(opts))
       end)
     end
   end
@@ -1084,7 +1087,7 @@ defmodule Loopctl.Delivery.Stages do
       is_nil(reason) ->
         :ok
 
-      match?({:ok, _}, bounded_text(reason, @max_reason_chars)) ->
+      reason_within_bound?(reason) ->
         :ok
 
       true ->
@@ -1093,6 +1096,67 @@ defmodule Loopctl.Delivery.Stages do
   end
 
   defp present?(reason), do: is_binary(reason) and String.trim(reason) != ""
+
+  # THE REASON'S OWN BOUND, and not `bounded_text/2`, which is the EFFECTS' bound and rejects
+  # a NUL and invalid UTF-8 outright.
+  #
+  # Neither of those is a refusal any more: both are things `sanitise/1` ESCAPES on the way to
+  # storage, and refusing them here would be the old behaviour under a new name — a session
+  # asking for a human got nothing because its log tail carried one stray byte. What is left
+  # is the LENGTH, measured on the text the caller actually sent, which is the number the
+  # controller and the contract publish.
+  #
+  # `replace_invalid/1` first so the count is defined at all: `String.to_charlist/1` raises on
+  # invalid UTF-8, and a reason carrying a truncated multi-byte sequence would crash the count
+  # rather than be measured. It replaces each bad byte with one replacement character, so the
+  # length it yields is the caller's own, and it is the same first step `sanitise/1` takes.
+  defp reason_within_bound?(reason) do
+    reason
+    |> String.replace_invalid()
+    |> codepoints()
+    |> Kernel.in(1..@max_reason_chars)
+  end
+
+  # THE REASON IS ESCAPED BEFORE IT IS STORED, AND BOUNDED BEFORE IT IS ESCAPED.
+  #
+  # `escalation_reason` is written by a SESSION — a model that had just read reporter text —
+  # and it lands in two places nobody can edit afterwards: the `story_stages` column an
+  # operator reads, and, on a chained transition, the tenant's append-only hash chain. A
+  # bidirectional override or a run of zero-width characters in it is invisible in both, so
+  # the text an operator sees is not the text that was written, permanently.
+  #
+  # `sanitise/1` does NOT change what was said — it rewrites invisible and invalid codepoints
+  # to `<U+XXXX>`, which is strictly better for the operator this field exists for, so the
+  # VERBATIM promise `Loopctl.Delivery.Escalations` makes is kept rather than broken. What it
+  # is not is a fence: prose stays prose, which is `escalation_block/1`'s job at the one hop
+  # where the text goes in front of a model.
+  #
+  # AFTER every validation, and this ORDER is what round 1 of #859's review corrected. The
+  # first version escaped first and bounded the escaped text, which split one published number
+  # into two: `StoryEscalationController` and `RunnerContract` bound the RAW reason at
+  # #{@max_reason_chars} codepoints, so a reason of exactly that length carrying one zero-width
+  # space passed the HTTP check and was then refused `:invalid_reason` here. The escalation was
+  # lost — the precise failure this escaping exists to end, reintroduced one layer up.
+  #
+  # A caller cannot predict the escaped length without implementing this escape table, and the
+  # contract PUBLISHES the bound for a runner to validate against before sending. So the caller
+  # is held to what it can measure and the COLUMN holds what it actually stores, with its CHECK
+  # widened to `#{@max_reason_chars} * 10` (migration `20260921170000`) — a ceiling a conforming
+  # caller cannot reach rather than a limit anyone approaches.
+  #
+  # It rewrites `opts` rather than a local because `transition/6` reads `:reason` again from
+  # there, and a second read of the raw value is how the escaped form would reach the event
+  # while the raw one reached the column.
+  #
+  # `present?/1` runs on the RAW text, above, for the same ordering reason: `sanitise/1` turns
+  # a blank C0 control into visible text, so a reason of `"\f"` alone would satisfy
+  # "a reason is required" with nothing a person can read.
+  defp sanitise_reason(opts) do
+    case Keyword.get(opts, :reason) do
+      reason when is_binary(reason) -> Keyword.put(opts, :reason, Untrusted.sanitise(reason))
+      _ -> opts
+    end
+  end
 
   # The caller's structured payload, bounded on the JSON that is actually stored. Refused
   # BEFORE the transaction, like every other value: a jsonb Postgres will not take (a NUL in
@@ -1143,8 +1207,10 @@ defmodule Loopctl.Delivery.Stages do
   the runner read out of `escalations.ndjson` — so it is reporter-shaped text under design
   §8 and §10: recorded and capped, never executed. **Any prompt that carries an escalation
   reason renders it through this and nothing else.** The JSON an operator or a dashboard
-  reads gets the raw value, because a fence there would hide what was actually written; the
-  fence exists for the one hop where the text lands in front of a model.
+  reads gets the STORED value — escaped for invisible characters by `sanitise_reason/1` on
+  the way in, never fenced — because a fence there would hide what was actually written while
+  the escape makes hidden characters visible without changing the words. The fence exists for
+  the one hop where the text lands in front of a model.
 
   > **This is a CONVENTION with no binding guard, and it is on the next story to make it
   > one.** Nothing in `lib/` renders `escalation_reason` into a prompt today — the prompt

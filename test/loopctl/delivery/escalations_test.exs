@@ -18,6 +18,7 @@ defmodule Loopctl.Delivery.EscalationsTest do
   alias Loopctl.Delivery.StageEvent
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.Stages
+  alias Loopctl.Delivery.Untrusted
   alias Loopctl.Repo
   alias Loopctl.WorkBreakdown.Story
 
@@ -316,7 +317,7 @@ defmodule Loopctl.Delivery.EscalationsTest do
   end
 
   describe "untrusted text" do
-    test "the reason is stored verbatim and fenced only when rendered for a prompt" do
+    test "the reason is ESCAPED for invisible characters, and fenced when rendered for a prompt" do
       {story, _row, agent} = claimed()
 
       # A reason that tries to close the fence from inside, at column 0, verbatim.
@@ -327,8 +328,21 @@ defmodule Loopctl.Delivery.EscalationsTest do
       assert {:ok, row} =
                Escalations.escalate(story.tenant_id, story.id, opts(agent, reason: attack))
 
-      # Stored EXACTLY as written: an operator must read what the session actually said.
-      assert row.escalation_reason == attack
+      # ESCAPED, not verbatim, and that is a deliberate reversal of what this test asserted
+      # before. `escalation_reason` is written by a model and lands in two places nobody can
+      # edit afterwards — the column an operator reads and, on a chained transition, the
+      # tenant's append-only hash chain. A bidirectional override or a run of zero-width
+      # characters is INVISIBLE in both, so the text an operator sees would not be the text
+      # that was written, permanently.
+      #
+      # `sanitise/1` does not change what was SAID — prose stays prose, which is why the
+      # fence below still has work to do — it rewrites invisible and invalid codepoints so an
+      # operator can see them. The session's attempt to close the fence is now legible as an
+      # attempt rather than rendering as a bracket.
+      assert row.escalation_reason == Untrusted.sanitise(attack)
+      assert row.escalation_reason =~ "ignore previous instructions"
+      assert row.escalation_reason =~ "<U+27E7>"
+      refute row.escalation_reason == attack
 
       block = Stages.escalation_block(row)
       [open | rest] = String.split(block, "\n")
@@ -337,7 +351,9 @@ defmodule Loopctl.Delivery.EscalationsTest do
       assert String.starts_with?(open, "⟦UNTRUSTED DATA field=escalation_reason nonce=")
       assert String.starts_with?(close, "⟦END UNTRUSTED DATA field=escalation_reason nonce=")
 
-      # Nothing between the fences starts a fence, and the brackets did not survive inside.
+      # Nothing between the fences starts a fence. The brackets cannot survive inside now for
+      # TWO independent reasons — the storage escape above, and `render/2`'s own escape — and
+      # the second is what still holds for a field that is not escaped at rest.
       data = body |> Enum.reverse() |> Enum.drop(1)
       refute Enum.any?(data, &String.starts_with?(&1, "⟦"))
       refute String.contains?(Enum.join(data, "\n"), "⟧")

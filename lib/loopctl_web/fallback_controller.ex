@@ -939,9 +939,12 @@ defmodule LoopctlWeb.FallbackController do
   @stage_request_faults %{
     reason_required: "A reason is required for this transition.",
     invalid_reason:
-      "The reason is empty, too long, or contains a character the database cannot store. " <>
-        "The bound is #{StageMachine.max_reason_length()} codepoints, which is what " <>
-        "Postgres counts, not graphemes.",
+      "The reason is empty or too long. The bound is " <>
+        "#{StageMachine.max_reason_length()} codepoints of the text you SEND, which is what " <>
+        "Postgres counts and not graphemes — measure what you are about to send, not what " <>
+        "is stored: a hidden character is escaped to a visible `<U+XXXX>` on the way in, so " <>
+        "the stored value is longer and its own bound is wider. A NUL is no longer a cause " <>
+        "here; it is escaped rather than refused.",
     invalid_event_data:
       "The structured payload is not a JSON object, is over 8000 bytes once encoded, or " <>
         "contains a NUL.",
