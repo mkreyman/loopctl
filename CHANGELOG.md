@@ -38,6 +38,25 @@ All notable changes to loopctl are documented here.
   Nothing else is affected: existing runners keep working, and the runner API renders no new
   field.
 
+- **Runner contract 1.6.0: a runner DECLARES the kinds it runs, and the declaration decides
+  (#803).** `RunnerJoin` gains an optional `kinds` array. Where a runner sends it, it is the
+  only thing consulted: loopctl refuses a dispatch of a kind outside it, and sends a kind
+  inside it **even where an earlier `kind_not_supported` reply is on record for that runner**.
+  A runner that sends no `kinds` is read as declaring `x-connection.implied_kinds` — what
+  loopctl sent before the field existed — and is decided exactly as before, by the ledger.
+  Additive and optional, the major version is unchanged, and no runner sends the field yet,
+  so **no runner has to be upgraded and no operator action is required**; the vendored export
+  is `priv/runner_contract/v1.json`.
+
+  **Operator-facing change: how you clear a stuck runner.** A `kind_not_supported` reply is
+  recorded permanently for that runner and kind, with no expiry, so until now a machine that
+  refused a kind once — including a machine that mapped a transient local condition to that
+  reason, which took it out of ALL work, `implement` being the only dispatchable kind — could
+  only be recovered by revoking and re-enrolling it. A runner that declares the kind on join
+  is now eligible again by RECONNECTING. `GET /api/v1/runners` and `/runners/pool` still show
+  what each machine has refused; for a declaring runner that list is now history rather than a
+  statement about the next dispatch.
+
 - **Runner contract 1.5.0: a dispatch carries the story as typed fields, and a runner may
   refuse a kind it does not do (#803).** An `implement` dispatch now carries a `RunnerStory`
   object — id, title, description, acceptance criteria, test cases, predicted touches and a

@@ -158,6 +158,12 @@ defmodule LoopctlWeb.RunnerChannel do
        |> assign(:last_cursor_at, :never)
        |> assign(:last_unknown_at, :never)
        |> assign(:last_unknown_info_at, :never)
+       # The dispatches THIS connection put on the wire. Per-connection on purpose: it is
+       # what lets a `kind_not_supported` reply be attributed to the connection that carried
+       # the dispatch rather than to whichever one the reply lands on
+       # (`note_kind_refusal/3`). Bounded by the runner's capacity, since a slot is held from
+       # push until the reply, and it dies with the channel.
+       |> assign(:pushed_dispatches, MapSet.new())
        |> assign(:presence_ref, nil)}
     else
       {:error, reason} -> {:error, refuse_join(socket, join_error(reason))}
@@ -314,7 +320,7 @@ defmodule LoopctlWeb.RunnerChannel do
       socket = assign(socket, :reply_bucket, bucket)
 
       case DispatchLedger.record_reply(tenant_id, runner.id, reply) do
-        {:ok, _record} -> {:reply, :ok, socket}
+        {:ok, record} -> {:reply, :ok, note_kind_refusal(socket, reply, record)}
         {:error, reason} -> refuse(socket, "dispatch_reply", message_error(reason))
       end
     else
@@ -565,6 +571,128 @@ defmodule LoopctlWeb.RunnerChannel do
     })
   end
 
+  # A RUNNER CONTRADICTING ITS OWN DECLARATION IS BOUNDED PER CONNECTION (contract 1.6.0).
+  #
+  # `Runners.dispatch/3` consults the declaration alone for a declaring runner and never the
+  # ledger's `kind_not_supported` memory — deliberately, because that memory has no expiry
+  # and is what locked an upgraded machine out for the life of its `runners` row. The cost is
+  # that a runner which DECLARES a kind and then refuses it has nothing stopping the next
+  # dispatch: each one writes a ledger row, takes a slot, is refused, releases the slot, and
+  # the loop has no bound at all. That is not hypothetical — the motivating failure is a
+  # runner mapping a TRANSIENT LOCAL CONDITION to `kind_not_supported`, and such a runner goes
+  # on declaring the kind at every reconnect.
+  #
+  # So the refusal is honoured for the life of THIS CONNECTION, in this socket's own Presence
+  # meta. Per-connection is the right lifetime and not a compromise: the declaration it
+  # contradicts is per-connection, so the contradiction expires exactly when the claim does,
+  # and the reconnect that re-declares the kind is the same unlock as everywhere else. It
+  # needs no table and cannot outlive the machine that said it.
+  #
+  # Only for a DECLARING runner: an undeclaring one is already bounded by the ledger, and
+  # writing this meta for it would add a second, weaker mechanism in front of the durable one.
+  #
+  # THIS IS A BOUND ON THE DAMAGE, NOT A SUPPORTED RECOVERY PATH, and the difference decides
+  # what to do when it fires. `mkreyman/loopctl-runner` builds its join declaration and its
+  # kind check from ONE list (its maintaining session, 2026-09-14), so a runner declaring a
+  # kind and then refusing it is a BUG on that side — not a state anyone should recover from
+  # by reconnecting. Reconnecting clears the suppression because the declaration it
+  # contradicts is per-connection, not because a reconnect is the remedy. A log line here is
+  # something to go and fix on the runner, and if a future change makes this fire routinely,
+  # that is the signal the two sides have drifted apart rather than that the bound is working.
+  defp note_kind_refusal(socket, %{decision: "refused", reason: "kind_not_supported"}, record) do
+    %{runner: runner, tenant_id: tenant_id, meta: meta} = socket.assigns
+
+    emit_kind_refused(tenant_id, runner, record, Runners.declared_kinds(meta))
+
+    case {Runners.declared_kinds(meta), record.kind} do
+      {{:declared, kinds}, kind} when is_binary(kind) ->
+        if kind in kinds and pushed_here?(socket, record) do
+          Logger.warning(
+            "runner declared kind #{kind} and then refused it as kind_not_supported; " <>
+              "suppressing that kind for the rest of this connection. Reconnecting clears it."
+          )
+
+          suppress_kind(socket, meta, runner, tenant_id, kind)
+        else
+          socket
+        end
+
+      _ ->
+        socket
+    end
+  end
+
+  defp note_kind_refusal(socket, _reply, _record), do: socket
+
+  # EMITTED ON EVERY `kind_not_supported`, NOT ONLY THE SUPPRESSED ONES — and that ordering
+  # is the whole point. This counter first lived inside `suppress_kind/5`, which runs only
+  # for a runner that DECLARED the kind, so it read zero during the one incident that is
+  # live on the fleet today: no runner declares yet, so every machine takes the UNDECLARING
+  # path, where a single refusal is permanent for the life of its `runners` row and the
+  # machine sits connected and healthy-looking with no work for ever. An instrument blind to
+  # the worst case it could report is the same defect as the event that had no metric at
+  # all, one layer in.
+  #
+  # `outcome` separates the two, and both tags are bounded: `kind` comes from the LEDGER row
+  # of a dispatch loopctl itself sent, so it is from `dispatchable_kinds` and never a
+  # runner-supplied string, and `outcome` is two literals. Ids stay in the logs.
+  defp emit_kind_refused(tenant_id, runner, %{kind: kind}, declared) when is_binary(kind) do
+    outcome =
+      case declared do
+        {:declared, kinds} -> if kind in kinds, do: "suppressed", else: "not_declared"
+        {:implied, _} -> "permanent"
+      end
+
+    :telemetry.execute(
+      [:loopctl, :runners, :declared_kind_refused],
+      %{count: 1},
+      %{kind: kind, outcome: outcome, tenant_id: tenant_id, runner_id: runner.id}
+    )
+  end
+
+  defp emit_kind_refused(_tenant_id, _runner, _record, _declared), do: :ok
+
+  # THE SUPPRESSION BELONGS TO THE CONNECTION THAT CARRIED THE DISPATCH, not to whichever one
+  # the reply happens to arrive on. `DispatchLedger.record_reply/3` fences on
+  # `(tenant_id, runner_id, dispatch_id)` and `claim_epoch` — never on a socket — so a reply
+  # is accepted on ANY of the runner's channels.
+  #
+  # Without this, a reply that crosses a reconnect punishes the wrong connection: the runner
+  # decides locally it cannot run a dispatch, its socket drops before the reply flushes, it
+  # reconnects, re-declares the kind and sends the queued refusal — and the FRESH connection,
+  # which has contradicted nothing, is suppressed for its whole life. That also defeats the
+  # remedy this module and the pool's OpenAPI text both promise, "reconnecting clears it",
+  # for the connection that just performed it.
+  defp pushed_here?(%{assigns: %{pushed_dispatches: pushed}}, %{dispatch_id: id}),
+    do: MapSet.member?(pushed, id)
+
+  defp pushed_here?(_socket, _record), do: false
+
+  defp remember_pushed(socket, dispatch) do
+    update_in(socket.assigns.pushed_dispatches, &MapSet.put(&1, dispatch.dispatch_id))
+  end
+
+  # THE DECLARATION IS LEFT EXACTLY AS THE RUNNER SENT IT. An earlier version of this took
+  # the kind out of `:kinds`, which made the pool report a statement the machine never made:
+  # one that declared ["triage", "implement"] and refused a single implement dispatch
+  # rendered as a triage-only machine, and one that declared ["implement"] and refused it
+  # rendered as having declared NOTHING — the same as a pre-1.6.0 runner. The suppression is
+  # a fact about what loopctl is withholding, not about what the runner said, so it lives in
+  # its own key and `Runners.kind_supported/4` subtracts it at the decision.
+  defp suppress_kind(socket, meta, runner, tenant_id, kind) do
+    meta = Map.update(meta, :suppressed_kinds, [kind], &Enum.uniq([kind | &1]))
+
+    {:ok, ref} =
+      Presence.update(
+        self(),
+        Runners.pool_topic(tenant_id),
+        runner.name,
+        presence_meta(meta, runner)
+      )
+
+    socket |> assign(:meta, meta) |> assign(:presence_ref, ref)
+  end
+
   # This socket is tracked, and its meta is the only one in the tenant's pool holding the
   # runner's id. An untracked channel (no ref yet) is never the sole socket. The pool is the
   # cluster-wide Presence replica, so a second socket on ANOTHER node counts too, once its
@@ -586,7 +714,9 @@ defmodule LoopctlWeb.RunnerChannel do
     case DispatchLedger.record_push(socket.assigns.tenant_id, dispatch) do
       {:ok, :pushed} ->
         push(socket, "dispatch", dispatch)
-        {:noreply, socket}
+        # Remembered so a `kind_not_supported` reply can be attributed to the connection
+        # that actually carried the dispatch — see `note_kind_refusal/3`.
+        {:noreply, remember_pushed(socket, dispatch)}
 
       {:ok, {:already, decided}} ->
         log_undelivered(socket, dispatch, "another process already decided: #{decided}")

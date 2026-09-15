@@ -6,6 +6,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.ApiSpec.RunnerContract.ByteRule
+  alias Loopctl.ApiSpec.RunnerContract.Kinds
   alias Loopctl.ApiSpec.RunnerContract.RunnerDispatch
   alias Loopctl.ApiSpec.RunnerContract.RunnerDispatchReply
   alias Loopctl.ApiSpec.RunnerContract.RunnerStage
@@ -54,8 +55,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.5.0"
-      assert schema["x-contract-version"] == "1.5.0"
+      assert RunnerContract.version() == "1.6.0"
+      assert schema["x-contract-version"] == "1.6.0"
 
       assert %{
                "dispatch_reply" => "RunnerDispatchReply",
@@ -68,6 +69,13 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
                "trace" => "RunnerTraceAck",
                "trace_cursor" => "RunnerTraceAck"
              }
+
+      # #803: the kind lists are published so a runner reads them rather than parsing prose.
+      # Asserted against the ONE declaration both schemas read, never against a copy — a
+      # literal here would let `RunnerJoin.kinds` and `RunnerDispatch.kind` drift apart while
+      # this test stayed green, which is the failure `Kinds` exists to make impossible.
+      assert connection["dispatchable_kinds"] == Kinds.dispatchable()
+      assert connection["implied_kinds"] == Kinds.implied_by_silence()
 
       assert connection["errors"] == RunnerContract.error_reasons()
       assert "unknown_event" in connection["errors"]["unknown_event"]
@@ -164,13 +172,76 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     test "uses only the JSON Schema keywords the runner's vendored validator implements" do
       # mkreyman/loopctl-runner's LoopctlRunner.Contract FAILS a definition carrying a keyword
       # it does not know, so a new keyword here breaks every runner validating that message.
-      known =
-        ~w(type required properties minimum maximum minLength maxLength pattern enum items
-           maxItems minProperties description format additionalProperties)
+      known = RunnerContract.exported_keywords()
 
       for {title, definition} <- RunnerContract.json_schema()["$defs"] do
         assert unknown_keywords(definition, known) == [], "#{title} uses an unknown keyword"
       end
+    end
+
+    # THE OTHER DIRECTION, and the one the test above cannot see. It reads the EXPORT, so a
+    # keyword set on a Schema struct and silently dropped by `schema_to_map/1` passes it —
+    # while `OpenApiSpex.Cast` enforces that keyword on every join. The runner author then
+    # validates against the vendored file, passes, sends the message, and is refused for a
+    # constraint the published contract does not contain.
+    #
+    # Round 1 of #834 found exactly that: `RunnerJoin.kinds` carried `minItems: 1` and
+    # `uniqueItems: true`, neither of which this exporter emits, and `kinds` was the first
+    # field in the whole contract to use either — so nothing went red.
+    test "enforces no schema keyword it does not publish" do
+      exported = MapSet.new(RunnerContract.exported_keywords(), &String.to_atom/1)
+
+      # Published by TRANSFORMATION rather than as a literal keyword, so their absence from
+      # the keyword list is not a gap: `title` becomes the definition's KEY under `$defs`,
+      # and `nullable` becomes the `["string", "null"]` type union `schema_to_map/1` writes.
+      # Both reach the runner, so neither can refuse a join for an unpublished reason.
+      transformed = MapSet.new([:title, :nullable])
+
+      # ANNOTATION-ONLY, and the reason this test cannot just be "every unexported field".
+      # None of these constrains a cast, so dropping one from the export costs a runner
+      # author documentation and never a refused join — which is the whole harm this guard
+      # is about. Flagging them would fail the build on an added `example:` with a message
+      # saying it is ENFORCED, which is false, and a remedy (publish it, upgrade every
+      # validator) that is wrong for a field nothing validates.
+      # DOCUMENTARY ONLY. `discriminator`, `$ref`, `anyOf`, `allOf`, `oneOf` and `not` are
+      # deliberately NOT here — each of them changes what a cast accepts, so the exporter
+      # dropping one is exactly the defect this test exists for. `readOnly`/`writeOnly` are
+      # also left out: they are inert for the plain casts this module makes today, but they
+      # do decide a cast under a read/write context, and a keyword that constrains under
+      # ANY reading belongs on the failing side of a guard like this.
+      annotations =
+        MapSet.new([:example, :examples, :deprecated, :externalDocs, :xml, :extensions])
+
+      # Structural, not a copy: every field the Schema struct HAS, minus the ones the
+      # exporter carries either way and the ones that constrain nothing. A new OpenApiSpex
+      # version adding a CONSTRAINT keyword lands in this set automatically rather than
+      # being quietly allowed — which is the direction that has to fail safe.
+      never_published =
+        %OpenApiSpex.Schema{}
+        |> Map.from_struct()
+        |> Map.keys()
+        |> Enum.reject(&(&1 in exported or &1 in transformed or &1 in annotations))
+        |> MapSet.new()
+
+      # The guard is worthless if everything is excluded, and the exclusion lists above are
+      # hand-maintained. Assert it still watches the keywords it was written for.
+      assert MapSet.subset?(MapSet.new([:minItems, :uniqueItems, :multipleOf]), never_published)
+
+      offenders =
+        for mod <- RunnerContract.schema_modules(),
+            {path, %OpenApiSpex.Schema{} = schema} <-
+              walk_schema(mod.schema(), mod.schema().title),
+            {field, value} <- Map.from_struct(schema),
+            not is_nil(value),
+            field in never_published,
+            do: "#{path}.#{field}"
+
+      assert offenders == [],
+             "these constraints are ENFORCED by OpenApiSpex and absent from the export, so " <>
+               "a runner validating against the vendored contract passes and is then " <>
+               "refused for a rule it cannot read: #{Enum.join(offenders, ", ")}. Either " <>
+               "publish the keyword (and upgrade every runner's validator first) or accept " <>
+               "the value and settle it in code."
     end
 
     test "the published byte rule is the implemented one, on random payloads" do
@@ -455,6 +526,24 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     for _ <- 1..:rand.uniform(8), into: "", do: <<Enum.random(alphabet)::utf8>>
   end
 
+  # Every `%Schema{}` reachable from one, as {dotted path, schema}, so an offender names the
+  # field rather than just the top-level message. Nested schemas are inlined by the exporter
+  # (`RunnerSample` inside `RunnerJoin`), so the walk has to follow properties AND items.
+  defp walk_schema(%OpenApiSpex.Schema{} = schema, path) do
+    nested =
+      Enum.flat_map(schema.properties || %{}, fn {key, sub} ->
+        walk_schema(sub, "#{path}.#{key}")
+      end) ++
+        case schema.items do
+          %OpenApiSpex.Schema{} = items -> walk_schema(items, "#{path}[]")
+          _ -> []
+        end
+
+    [{path, schema} | nested]
+  end
+
+  defp walk_schema(_other, _path), do: []
+
   defp unknown_keywords(%{} = schema, known) do
     own = Map.keys(schema) -- known
 
@@ -469,6 +558,41 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
         end
 
     own ++ nested
+  end
+
+  describe "cast_join/1 kinds (contract 1.6.0)" do
+    # #834 round 3, finding 3. This value goes verbatim into the Presence meta, which
+    # Phoenix.Tracker replicates to EVERY node for the life of the socket and the pool read
+    # echoes. `maxItems` bounds the entry COUNT; the resource is count times length, and
+    # every other string in RunnerJoin is bounded by a pattern.
+    test "an over-long kind is refused, so the replicated meta cannot be inflated" do
+      long = String.duplicate("k", 65)
+
+      assert {:error, {:invalid, _}} =
+               RunnerContract.cast_join(Map.put(@join, "kinds", [long]))
+
+      assert {:ok, %{kinds: [_]}} =
+               RunnerContract.cast_join(Map.put(@join, "kinds", [String.duplicate("k", 64)]))
+    end
+
+    # The bound that must NOT exist: a kind this server has never heard of is carried, not
+    # refused, or a runner upgraded ahead of loopctl loses its connection entirely.
+    test "a kind this server does not know is accepted" do
+      assert {:ok, %{kinds: ["implement", "review"]}} =
+               RunnerContract.cast_join(Map.put(@join, "kinds", ["implement", "review"]))
+    end
+
+    test "an empty array and a duplicate are both accepted on the wire" do
+      assert {:ok, %{kinds: []}} = RunnerContract.cast_join(Map.put(@join, "kinds", []))
+
+      assert {:ok, %{kinds: ["implement", "implement"]}} =
+               RunnerContract.cast_join(Map.put(@join, "kinds", ["implement", "implement"]))
+    end
+
+    test "a non-string entry is refused, which is why declared_kinds keeps its own guard" do
+      assert {:error, {:invalid, _}} =
+               RunnerContract.cast_join(Map.put(@join, "kinds", ["implement", 3]))
+    end
   end
 
   describe "cast_join/1" do
