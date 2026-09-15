@@ -48,7 +48,9 @@ defmodule LoopctlRunner.Session do
   @doc """
   Runs the session to completion and returns its result.
 
-  Options: `:config`, `:story`, `:worktree`, `:run_dir`, `:trace`, `:parent` (the run's
+  Options: `:config`, `:story`, `:worktree`, `:run_dir`, `:trace`, `:system_prompt` (what
+  `--append-system-prompt` carries; the implement session's escalation prompt by default),
+  `:parent` (the run's
   trace seq), and optionally `:session_id` and `:env` (extra `{name, value}` pairs).
   """
   @spec run(keyword()) :: result()
@@ -136,9 +138,17 @@ defmodule LoopctlRunner.Session do
   @spec file_rules() :: [String.t()]
   def file_rules, do: @file_rules
 
-  @doc "The argv handed to claude-headless.sh."
-  @spec claude_args(Story.t(), String.t()) :: [String.t()]
-  def claude_args(%Story{} = story, session_id) do
+  @doc """
+  The argv handed to claude-headless.sh.
+
+  `system_prompt` is what `--append-system-prompt` carries, and it defaults to
+  `escalation_prompt/0`, which is right for an implement session. A triage session must pass its
+  own (`LoopctlRunner.TriagePrompt.system_prompt/0`): this one tells a session to run
+  `loop-escalate` and stop when a request is ambiguous, which is the commonest triage verdict, so
+  a triage session launched with it ends escalated with no verdict.
+  """
+  @spec claude_args(Story.t(), String.t(), String.t()) :: [String.t()]
+  def claude_args(%Story{} = story, session_id, system_prompt \\ escalation_prompt()) do
     # -p is a flag, not an option taking a value: the prompt is positional, so a prompt
     # starting with "-" (a markdown list, front matter) would parse as an option.
     [
@@ -167,7 +177,7 @@ defmodule LoopctlRunner.Session do
       if(story.model, do: ["--model", story.model], else: []) ++
       Enum.flat_map(@file_rules ++ story.allowed_tools, &["--allowedTools", &1]) ++
       ["--allowedTools", "Bash(#{escalate_script()}:*)"] ++
-      ["--append-system-prompt", escalation_prompt()] ++
+      ["--append-system-prompt", system_prompt] ++
       ["--", story.prompt]
   end
 
@@ -191,7 +201,11 @@ defmodule LoopctlRunner.Session do
         :binary,
         :exit_status,
         cd: worktree,
-        args: [stderr_log, config.claude_launcher | claude_args(story, session_id)],
+        args: [
+          stderr_log,
+          config.claude_launcher
+          | claude_args(story, session_id, Keyword.get(opts, :system_prompt, escalation_prompt()))
+        ],
         env: port_env(run_dir, session_id, config, Keyword.get(opts, :env, []))
       ])
 

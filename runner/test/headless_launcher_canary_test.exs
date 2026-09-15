@@ -67,8 +67,8 @@ defmodule LoopctlRunner.HeadlessLauncherCanaryTest do
     session = File.read!(Path.join(@root, "lib/loopctl_runner/session.ex"))
     assert session =~ "Port.open({:spawn_executable, launcher_script()}"
 
-    assert session =~
-             "args: [stderr_log, config.claude_launcher | claude_args(story, session_id)]"
+    # The launcher and the wrapper are what this canary pins; the system prompt is an argument.
+    assert session =~ "config.claude_launcher\n          | claude_args(story, session_id,"
 
     launcher = File.read!(Path.join(@root, "priv/bin/session-launcher.sh"))
     assert launcher =~ ~s|"$headless" "$@" </dev/null|
