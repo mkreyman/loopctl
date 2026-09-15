@@ -59,6 +59,26 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **The delivery loop is reachable from a session: `place_dispatch`, `story_stage`,
+  `resolve_escalation` (#803, #850).** Three MCP tools and the two endpoints two of them
+  needed. The placement endpoint shipped with #842 and NO tool called it — and `curl` at
+  loopctl is refused by the fleet's own guardrail — so the only way to place a dispatch was a
+  shell on the production node. That is the same defect as `place/4` shipping with no caller,
+  failing one layer later.
+
+  New: **`GET /api/v1/stories/:id/stage`** (any authenticated key) returns where a story is in
+  the delivery machine — stage, `claim_epoch`, `lock_version`, `attempts`, the runner holding
+  it, the escalation reason. Nothing on the API returned a stage before, so an operator could
+  not watch a run and a runner refused `stale_stage` could only guess which transition now
+  applies. **`POST /api/v1/stories/:id/stage/resolve`** (`role: :user`, human-anchored) moves
+  an escalated story to `queued`, `done` or `failed` over `:human_resolution` — the edge the
+  machine reserves for a person, which nothing in `lib/` or on the API could take, so a story
+  a session parked stayed parked for ever. An agent key is 403'd: the principal that raises an
+  escalation may not clear it.
+
+  **A rule now governs this**, in `CLAUDE.md`: an operator-facing endpoint is not done until an
+  MCP tool calls it, in the same PR.
+
 - **A placed dispatch carries the STORY, built server-side (#803).** `Placement.place/4` now
   builds the `implement` dispatch's `story` object from loopctl's own rows
   (`Loopctl.Delivery.StoryPayload.build/3`) after the claim and before the push. Until now

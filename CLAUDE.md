@@ -404,6 +404,37 @@ tally — e.g. AdminRepo's 3-connection pool (`config/runtime.exs:190`), which i
 *why* a heavy read starves the admin pool. Cite it at `file:line` so it can be
 re-checked.
 
+### An operator-facing endpoint is NOT DONE until an MCP tool calls it
+
+Mark, 2026-09-15: *"loopctl should be given the instruction to update its mcp as part of this
+development."* The tool ships in the SAME PR as the endpoint, not in a follow-up.
+
+This is not tidiness, it is reachability. **The MCP server is how every session on this fleet
+reaches loopctl, and it is the only way**: `claude-config`'s `hooks/orchestrator-guardrail.sh`
+refuses `curl` carrying `loopctl.com` or a `LOOPCTL_*_KEY` from any session, deliberately, and
+that guard is staying. An endpoint with no tool is reachable by exactly one thing — a human
+with `iex` on the production node.
+
+The case, and it is the same defect twice one layer apart. `Placement.place/4` shipped with
+#833 and had no caller, so the delivery loop's first end-to-end run went out by production
+RPC. #842 gave it an endpoint. Then the ENDPOINT shipped with no MCP tool, so the session
+orchestrating the loop — holding the story id, the runner id and the runner's free slots from
+`runner_pool` — still could not place a dispatch. A trigger nobody outside the app can pull is
+a function nobody calls, failing one layer later.
+
+So, for any endpoint an operator, an orchestrator or an agent is meant to use:
+
+- add the tool in `mcp-server/` (a `lib/` module with the request shape, a declaration and a
+  `case` in `index.js`, a row in `mcp-server/README.md`) in the same change;
+- pin the wiring in a test — a tool declared and not dispatched, or dispatched and not
+  declared, is the same invisible gap inside the MCP server (see
+  `test/delivery_loop_tools.test.js`);
+- say in the tool description what the endpoint REFUSES and which key it needs. A session
+  reads that description instead of the controller.
+
+Internal endpoints a machine calls — the runner socket, webhooks — are exempt: their caller is
+the machine, and it already exists.
+
 ### Doc hygiene: ALWAYS document a new env var or API constraint
 
 The inverse rule, and the one that actually bit us. Two things are easy to ship

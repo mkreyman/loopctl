@@ -54,12 +54,19 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
       |> Repo.update_all(set: [assigned_agent_id: agent.id, agent_status: :implementing])
     end)
 
-    fixture(:story_stage, %{
-      tenant_id: tenant.id,
-      story_id: story.id,
-      stage: stage,
-      claim_epoch: @epoch
-    })
+    # `story_stages_escalation_reason` requires one when the row IS escalated — the column and
+    # the stage are constrained together, so a fixture that parks a row without a reason is
+    # refused by Postgres rather than by the machine.
+    reason =
+      if stage == :escalated, do: %{escalation_reason: "parked by the first run"}, else: %{}
+
+    fixture(
+      :story_stage,
+      Map.merge(
+        %{tenant_id: tenant.id, story_id: story.id, stage: stage, claim_epoch: @epoch},
+        reason
+      )
+    )
 
     %{tenant: tenant, raw_key: raw_key, agent: agent, story: story}
   end
@@ -69,6 +76,114 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
       %{"claim_epoch" => @epoch, "reason" => "the request contradicts US-3.1"},
       overrides
     )
+  end
+
+  describe "GET /api/v1/stories/:id/stage" do
+    test "returns where the story is in the delivery machine", %{conn: conn} do
+      %{story: story, raw_key: raw_key} = claimed_story(:worktree)
+
+      # THE LOOP WAS UNOBSERVABLE WITHOUT THIS. Nothing on the API returned a stage, so an
+      # operator watching a run could not see where a story was, and a runner refused
+      # `stale_stage` — which means "the row is not where you think" — had no way to find out
+      # where it actually was. The deployed runner brute-forces three transitions for want of
+      # this one read.
+      body =
+        conn
+        |> auth(raw_key)
+        |> get(~p"/api/v1/stories/#{story.id}/stage")
+        |> json_response(200)
+
+      assert body["stage"]["stage"] == "worktree"
+      assert body["stage"]["story_id"] == story.id
+      assert body["stage"]["claim_epoch"] == @epoch
+      assert body["stage"]["escalation_reason_untrusted"] == true
+    end
+
+    test "a story the delivery loop has never touched answers null, not 404", %{conn: conn} do
+      tenant = fixture(:committed_tenant, %{trust_tier: :human_anchored})
+      {raw_key, _api_key, _agent} = fixture(:committed_agent_key, %{tenant_id: tenant.id})
+      story = fixture(:ledger_story, %{tenant_id: tenant.id, claim_epoch: 0})
+
+      # A story with no stage row is an ORDINARY state — every story created outside the
+      # delivery loop is in it — so it is an answer rather than an error. A 404 here would be
+      # indistinguishable from a story id that does not exist.
+      body =
+        conn
+        |> auth(raw_key)
+        |> get(~p"/api/v1/stories/#{story.id}/stage")
+        |> json_response(200)
+
+      assert body["stage"] == nil
+    end
+  end
+
+  describe "POST /api/v1/stories/:id/stage/resolve" do
+    test "a human sends an escalated story back to be worked", %{conn: conn} do
+      %{story: story, tenant: tenant} = claimed_story(:escalated)
+      {operator_key, _operator} = fixture(:committed_operator_key, %{tenant_id: tenant.id})
+
+      # The other half of `escalate`, and it had NO caller of any kind: `:human_resolution` is
+      # in the stage machine, `Stages.advance/4` gates it, and nothing in `lib/` or on the API
+      # could take it — so a story a session parked for a person stayed parked for ever,
+      # including the one the loop's first end-to-end run left behind.
+      body =
+        conn
+        |> auth(operator_key)
+        |> post(~p"/api/v1/stories/#{story.id}/stage/resolve", %{
+          "to" => "queued",
+          "reason" => "rescoped, go ahead"
+        })
+        |> json_response(200)
+
+      assert body["stage"]["stage"] == "queued"
+      assert Stages.get(story.tenant_id, story.id).stage == :queued
+    end
+
+    test "an AGENT key cannot resolve, which is the separation", %{conn: conn} do
+      %{story: story, raw_key: raw_key} = claimed_story(:escalated)
+
+      # `escalate` is `exact_role: :agent` and this is `role: :user`, so the principal that
+      # raises an escalation cannot clear it. The stage machine enforces the same thing itself
+      # — a `:user`+ role on a key no dispatch minted — and this gate says so before any story
+      # is read.
+      conn
+      |> auth(raw_key)
+      |> post(~p"/api/v1/stories/#{story.id}/stage/resolve", %{"to" => "queued"})
+      |> json_response(403)
+
+      assert Stages.get(story.tenant_id, story.id).stage == :escalated
+    end
+
+    test "a story that is NOT escalated is refused, and told which stage it is at", %{conn: conn} do
+      %{story: story, tenant: tenant} = claimed_story(:implementing)
+      {operator_key, _operator} = fixture(:committed_operator_key, %{tenant_id: tenant.id})
+
+      # Named rather than answered with the machine's `stale_stage`, which is the word it uses
+      # for a story that moved under a runner — an operator reading that would go looking for
+      # a race that did not happen.
+      body =
+        conn
+        |> auth(operator_key)
+        |> post(~p"/api/v1/stories/#{story.id}/stage/resolve", %{"to" => "queued"})
+        |> json_response(409)
+
+      assert body["error"]["code"] == "not_escalated"
+      assert body["error"]["stage"] == "implementing"
+    end
+
+    test "a target the stage machine does not have is refused", %{conn: conn} do
+      %{story: story, tenant: tenant} = claimed_story(:escalated)
+      {operator_key, _operator} = fixture(:committed_operator_key, %{tenant_id: tenant.id})
+
+      # `escalated` leads to `queued`, `done` or `failed` and nowhere else. Sending a story
+      # straight back to `implementing` would skip the claim it no longer has.
+      conn
+      |> auth(operator_key)
+      |> post(~p"/api/v1/stories/#{story.id}/stage/resolve", %{"to" => "implementing"})
+      |> json_response(400)
+
+      assert Stages.get(story.tenant_id, story.id).stage == :escalated
+    end
   end
 
   describe "POST /api/v1/stories/:id/escalate" do

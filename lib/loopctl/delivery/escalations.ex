@@ -80,6 +80,11 @@ defmodule Loopctl.Delivery.Escalations do
           | :invalid_reason
           | :invalid_event_data
           | :busy
+          # `resolve/3`'s own two, which name what an operator actually did wrong rather than
+          # leaving the machine to answer `stale_stage` — the word it uses for a story that
+          # moved under a runner.
+          | {:not_escalated, StageMachine.stage()}
+          | {:unresolvable_target, term()}
           | Stages.advance_error()
 
   @doc """
@@ -243,4 +248,63 @@ defmodule Loopctl.Delivery.Escalations do
   def escalatable_stages do
     for {from, :escalated, :session_escalated} <- StageMachine.transitions(), do: from
   end
+
+  @doc """
+  Moves an ESCALATED story off `escalated`, as a human (#803 design §8).
+
+  The other half of `escalate/3`, and it had no caller of any kind: `:human_resolution` is in
+  the stage machine, `Stages.advance/4` gates it, and nothing in `lib/` or on the API could
+  take it. So a story a session parked for a person stayed parked for ever — including the
+  one the loop's first end-to-end run left behind — and the affordance this module is named
+  for was one-way.
+
+  `to` is `:queued`, `:done` or `:failed`, which is what `StageMachine` allows out of
+  `escalated`: send it back to be worked, accept it as finished, or close it as not going to
+  happen.
+
+  ## Who may call it
+
+  A HUMAN principal, which the machine itself defines as a role of at least `:user` on a key
+  NO DISPATCH MINTED — `human?/1` in `Loopctl.Delivery.Stages`. Both halves are passed through
+  from the caller rather than asserted here: the route supplies the role from the
+  authenticating key, and the lineage is server-resolved, so a session cannot resolve the
+  escalation it raised by claiming to be a person.
+
+  ## The epoch
+
+  Read fresh, not taken from the caller. An escalated story is not held by a claim — that is
+  what escalating did to it — so there is no epoch the caller could be holding, and demanding
+  one would mean an operator reading a number off the row before they could act on it. The
+  compare-and-set is still the fence: the transition is refused unless the row is at
+  `escalated` when it lands.
+  """
+  @spec resolve(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
+          {:ok, StoryStage.t()} | {:error, error()}
+  def resolve(tenant_id, story_id, opts) do
+    to = Keyword.fetch!(opts, :to)
+
+    with :ok <- resolvable(to),
+         {:ok, row} <- live_row(tenant_id, story_id),
+         :ok <- at_escalated(row) do
+      Stages.advance(tenant_id, story_id, {:escalated, to, :human_resolution},
+        claim_epoch: row.claim_epoch,
+        reason: Keyword.get(opts, :reason),
+        actor_label: Keyword.get(opts, :actor_label),
+        actor_role: Keyword.fetch!(opts, :actor_role),
+        actor_lineage: Keyword.fetch!(opts, :actor_lineage)
+      )
+    end
+  end
+
+  defp resolvable(to) do
+    if {:escalated, to, :human_resolution} in StageMachine.transitions(),
+      do: :ok,
+      else: {:error, {:unresolvable_target, to}}
+  end
+
+  # A story that is not escalated has nothing to resolve, and saying so is better than the
+  # machine's `:stale_stage` — which is the same word it uses for a story that moved under a
+  # runner, and would send an operator looking for a race that did not happen.
+  defp at_escalated(%StoryStage{stage: :escalated}), do: :ok
+  defp at_escalated(%StoryStage{stage: stage}), do: {:error, {:not_escalated, stage}}
 end
