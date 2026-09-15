@@ -644,6 +644,15 @@ defmodule Loopctl.ObanConfig do
            # reporter has already been waiting for the deploy. Keep in sync with the crontab
            # assertion in oban_plugins_config_test.exs.
            {"*/2 * * * *", Loopctl.Workers.IntakeIssueCloseWorker},
+           # #803 §2/§4: drains pending_triage intake records into stories the delivery loop
+           # can see — the production caller of Loopctl.Delivery.TriageTrigger.promote/1, which
+           # had none. EVERY MINUTE, unlike the two-minute forge drainers beside it, because a
+           # candidate makes no network call at all: it is a handful of local statements on
+           # AdminRepo, so the cadence is bounded by that pool rather than by anyone's rate
+           # limit, and a minute is the smallest latency cron can give a reporter who has been
+           # waiting since her issue arrived. Bounded per run. Keep in sync with the crontab
+           # assertion in oban_plugins_config_test.exs.
+           {"* * * * *", Loopctl.Workers.TriageTriggerWorker},
            {"* * * * *", Loopctl.Workers.SystemConfigRefreshWorker},
            # #803 §11: retention for the delivery loop's two unbounded high-volume tables,
            # `runner_trace_events` and `intake_deliveries`. Nothing else deletes from either.

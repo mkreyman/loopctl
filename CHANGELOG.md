@@ -6,6 +6,21 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **`PATCH /api/v1/intake/sources/:id` repoints a source at an epic (#803).** `target_epic_id`
+  was writable only at enrolment, so a source enrolled before that column existed could never
+  be given one — and a record from a source naming no epic is RETRIED, not escalated, so those
+  sources accumulate records waiting on an operator action the API did not offer. This is that
+  action. User role, human-anchored tenant, and the epic must belong to the source's project;
+  an explicit null clears it. Revoked sources are 404 — revoking clears the target so the epic
+  can be deleted, and repointing one would restore that block on a source that will never
+  report again. Every repoint is recorded as `intake_source_repointed` on the audit chain.
+
+  **Migration `20260921110000` adds `intake_records_pending_triage_idx`** — partial on
+  `status = 'pending_triage'`, keyed `(inserted_at, id)`, built `CONCURRENTLY`, no manual
+  step. The triage worker's candidate read runs every minute with no tenant in its predicate,
+  and the only index on the table is tenant-leading, so before this it sorted every intake
+  record ever received to find the fifty oldest.
+
 - **A dispatch now CLAIMS the story it is sent for, and a runner names an agent (#803).**
   `Loopctl.Delivery.Placement.place/4` is the path a queued story reaches a runner by: it
   mints a custody `dispatches` row for the runner session, claims the story under that

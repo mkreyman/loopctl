@@ -217,7 +217,13 @@ defmodule Loopctl.WorkBreakdown.Epics do
 
     multi =
       Multi.new()
-      |> Multi.delete(:epic, epic)
+      # A CHANGESET, not the bare struct, so the one FK onto `epics` that is RESTRICT rather
+      # than cascade comes back as a 422 naming the field instead of an `Ecto.ConstraintError`
+      # the fallback controller cannot render. `intake_sources.target_epic_id` is that FK
+      # (#803): an intake source pointing at this epic must be repointed or revoked first,
+      # which is the whole reason the reference restricts rather than nilifying — nilify would
+      # silently turn that source's next report into an escalation.
+      |> Multi.delete(:epic, epic_delete_changeset(epic))
       |> Audit.log_in_multi(:audit, fn %{epic: deleted} ->
         %{
           tenant_id: tenant_id,
@@ -389,5 +395,27 @@ defmodule Loopctl.WorkBreakdown.Epics do
     |> Enum.into(%{}, fn {status, count} ->
       {status, count}
     end)
+  end
+
+  # Names the reference so its violation renders as a 422 instead of an `Ecto.ConstraintError`
+  # the fallback controller cannot turn into a response.
+  #
+  # `intake_sources.target_epic_fkey` is the only FK onto `epics` that is not `delete_all`,
+  # and the message names the ONE remedy that actually works. It used to say "repoint or
+  # revoke": there is no repoint path — no update route, and `create_changeset/2` does not
+  # cast the field — and revoking used to leave the reference standing, so both halves were
+  # false and the epic was undeletable for ever. `Source.revoke_changeset/2` now clears the
+  # target, which is what makes the remaining half true.
+  defp epic_delete_changeset(epic) do
+    epic
+    |> Ecto.Changeset.change()
+    # `:id`, NOT `:target_epic_id`. The constraint lives on `intake_sources`, but the changeset
+    # being rendered is an EPIC, and a 422 whose errors map names a field the epic does not
+    # have tells a client to fix an attribute it never sent. `:id` is the epic, which is what
+    # the refusal is actually about.
+    |> Ecto.Changeset.foreign_key_constraint(:id,
+      name: :intake_sources_target_epic_fkey,
+      message: "is the target epic of an active intake source; revoke that source first"
+    )
   end
 end
