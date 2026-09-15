@@ -723,6 +723,76 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       assert DispatchLedger.kind_unsupported?(runner.tenant_id, runner.id, "implement")
     end
 
+    # #834 round 1, finding 4. The declaration beating the ledger is the point of 1.6.0, and
+    # its cost is that a runner which DECLARES a kind and then refuses it has nothing stopping
+    # the next dispatch — each one takes a slot, is refused, releases it, forever. The
+    # motivating failure is precisely a runner mapping a transient local condition to
+    # `kind_not_supported`, and such a runner keeps declaring the kind.
+    test "a runner that refuses a kind it DECLARED is not sent it again on that connection",
+         %{runner: runner, raw: raw, channel: channel} do
+      channel = rejoin_declaring(channel, raw, runner, ["implement"])
+
+      first = dispatch_payload(runner.tenant_id)
+      assert :ok = Runners.dispatch(runner.tenant_id, runner.id, first)
+      assert_push "dispatch", _, @reply_timeout
+      held = in_flight_of(runner)
+
+      ref =
+        push(channel, "dispatch_reply", %{
+          "dispatch_id" => first["dispatch_id"],
+          "claim_epoch" => first["claim_epoch"],
+          "decision" => "refused",
+          "reason" => "kind_not_supported"
+        })
+
+      assert_reply ref, :ok, _, @reply_timeout
+      assert in_flight_of(runner) == held - 1
+
+      # Without the brake this is :ok and the loop has no bound at all.
+      second = dispatch_payload(runner.tenant_id)
+
+      assert {:error, :kind_not_supported} =
+               Runners.dispatch(runner.tenant_id, runner.id, second)
+
+      refute_push "dispatch", _
+      assert DispatchLedger.get_record(runner.tenant_id, second["dispatch_id"]) == nil
+      assert in_flight_of(runner) == held - 1
+
+      # PER CONNECTION, and that is the whole design: the declaration it contradicts is
+      # per-connection too, so reconnecting re-declares the kind and clears the suppression
+      # — the same unlock as everywhere else in 1.6.0.
+      _channel = rejoin_declaring(channel, raw, runner, ["implement"])
+
+      assert :ok =
+               Runners.dispatch(runner.tenant_id, runner.id, dispatch_payload(runner.tenant_id))
+
+      assert_push "dispatch", _, @reply_timeout
+    end
+
+    test "an ordinary refusal does not suppress a declared kind",
+         %{runner: runner, raw: raw, channel: channel} do
+      channel = rejoin_declaring(channel, raw, runner, ["implement"])
+
+      payload = dispatch_payload(runner.tenant_id)
+      assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
+      assert_push "dispatch", _, @reply_timeout
+
+      ref =
+        push(channel, "dispatch_reply", %{
+          "dispatch_id" => payload["dispatch_id"],
+          "claim_epoch" => payload["claim_epoch"],
+          "decision" => "refused",
+          "reason" => "at_capacity"
+        })
+
+      assert_reply ref, :ok, _, @reply_timeout
+
+      assert :ok =
+               Runners.dispatch(runner.tenant_id, runner.id, dispatch_payload(runner.tenant_id))
+
+      assert_push "dispatch", _, @reply_timeout
+    end
+
     test "a kind the runner did not declare is refused, and takes no slot or ledger row",
          %{runner: runner, raw: raw, channel: channel} do
       # A declaration that does NOT include `implement`. `triage` is in the contract's

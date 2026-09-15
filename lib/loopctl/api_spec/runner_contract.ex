@@ -440,21 +440,26 @@ defmodule Loopctl.ApiSpec.RunnerContract do
             type: :boolean,
             description: "True when the runner accepts no new dispatches."
           },
+          # NO `minItems` or `uniqueItems`, deliberately — see the note above `@keywords` in
+          # `schema_to_map/1`. A constraint this exporter cannot publish is a constraint that
+          # refuses a join for a reason the vendored contract does not state, so the ENFORCED
+          # set is held equal to the PUBLISHED one: an empty array and a repeated kind are
+          # both accepted here and settled by `Loopctl.Runners.declared_kinds/1` instead.
           kinds: %Schema{
             type: :array,
-            minItems: 1,
             maxItems: length(Kinds.all()),
-            uniqueItems: true,
             items: %Schema{type: :string, enum: Kinds.all()},
             description:
-              "The dispatch kinds this machine runs (since 1.6.0). Where present this is " <>
-                "the ONLY thing consulted: loopctl refuses a kind outside it, and sends a " <>
-                "kind inside it even where an earlier `kind_not_supported` reply is on " <>
-                "record for this runner. A runner that omits it is read as declaring " <>
+              "The dispatch kinds this machine runs (since 1.6.0). Where present and " <>
+                "NON-EMPTY this is the ONLY thing consulted: loopctl refuses a kind " <>
+                "outside it, and sends a kind inside it even where an earlier " <>
+                "`kind_not_supported` reply is on record for this runner. Omitting it, or " <>
+                "sending an EMPTY array, is read as declaring `implied_kinds` " <>
                 "#{inspect(Kinds.implied_by_silence())} — what loopctl sent before the " <>
-                "field existed. Declare it on EVERY join: it is per-connection, so an " <>
-                "upgraded runner becomes eligible for a new kind by reconnecting rather " <>
-                "than by being re-enrolled."
+                "field existed. An empty array is therefore NOT how a runner says it wants " <>
+                "no work; `draining` is. Duplicates are accepted and ignored. Declare it " <>
+                "on EVERY join: it is per-connection, so an upgraded runner becomes " <>
+                "eligible for a new kind by reconnecting rather than by being re-enrolled."
           },
           sample: RunnerSample.schema()
         }
@@ -1757,6 +1762,32 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   # OpenApiSpex nullable -> JSON Schema 2020-12 type union. Nested schemas are inlined
   # (`RunnerSample` inside `RunnerJoin`), because `OpenApiSpex.Cast` cannot resolve a
   # module reference without a full spec, and validation must use these exact structs.
+  # THE EXPORTED KEYWORD SET IS A CEILING ON WHAT MAY BE ENFORCED, not a formatting detail.
+  # `mkreyman/loopctl-runner`'s vendored validator FAILS a definition carrying a keyword it
+  # does not implement, so this list cannot grow without upgrading every runner first — and a
+  # keyword set on a `Schema` but missing here is enforced by `OpenApiSpex.Cast` while being
+  # absent from the published contract. That combination refuses a join for a reason the
+  # runner author cannot read anywhere: their own pre-flight check against
+  # `priv/runner_contract/v<major>.json` passes and loopctl still says no.
+  #
+  # So a constraint this cannot carry is not expressed as a schema keyword at all. Either
+  # publish it the way `x-connection.limits` and `ByteRule` publish the constraints JSON
+  # Schema cannot hold, or accept the value and settle it in code — which is what
+  # `RunnerJoin.kinds` does with an empty array and with duplicates. `exported_keywords/0`
+  # names the set for the test that binds it in both directions.
+  @exported_keywords ~w(type required properties minimum maximum minLength maxLength pattern
+                        enum items maxItems minProperties description format
+                        additionalProperties)
+
+  @doc """
+  The JSON Schema keywords `json_schema/0` publishes — the ceiling on what any schema here
+  may enforce. See the note above `schema_to_map/1`: the runner's vendored validator refuses
+  an unknown keyword, and a keyword enforced but unpublished refuses a join for a reason the
+  published contract does not state.
+  """
+  @spec exported_keywords() :: [String.t()]
+  def exported_keywords, do: @exported_keywords
+
   defp schema_to_map(%Schema{} = schema) do
     base =
       [

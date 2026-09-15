@@ -693,10 +693,20 @@ defmodule Loopctl.Runners do
       do: DispatchLedger.release_slot(tenant_id, dispatch_id, generation)
 
   @doc """
-  Every kind each of the tenant's runners has told loopctl it does not do, as
-  `%{runner_id => [kind]}`. See `Loopctl.Runners.DispatchLedger.unsupported_kinds/1` — it is
-  the operator-facing view of the memory step 6 of `dispatch/3` refuses on, so a machine
-  barred from all work is visible rather than merely idle.
+  Every kind each of the tenant's runners has REFUSED with `kind_not_supported`, as
+  `%{runner_id => [kind]}`. See `Loopctl.Runners.DispatchLedger.unsupported_kinds/1`.
+
+  Since contract 1.6.0 this is the memory step 6 of `dispatch/3` refuses on for an
+  UNDECLARING runner only. A runner that declared its kinds on join is decided by the
+  declaration, so for that machine this list is the history of what it refused and not a
+  statement about the next dispatch.
+
+  **On its own it therefore no longer answers "why does this connected machine get no
+  work".** A runner declaring `["triage"]` is refused every `implement` dispatch by the
+  declaration, which writes no ledger row, so it appears here with nothing against it. The
+  declaration is rendered beside this list on `GET /api/v1/runners/pool` (`kinds`) for
+  exactly that reason; read both. It is absent from `GET /api/v1/runners`, which reads
+  enrollment rows and cannot see a per-connection value at all.
   """
   @spec unsupported_kinds(Ecto.UUID.t()) :: %{Ecto.UUID.t() => [String.t()]}
   def unsupported_kinds(tenant_id) when is_binary(tenant_id),

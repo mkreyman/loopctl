@@ -314,7 +314,7 @@ defmodule LoopctlWeb.RunnerChannel do
       socket = assign(socket, :reply_bucket, bucket)
 
       case DispatchLedger.record_reply(tenant_id, runner.id, reply) do
-        {:ok, _record} -> {:reply, :ok, socket}
+        {:ok, record} -> {:reply, :ok, note_kind_refusal(socket, reply, record)}
         {:error, reason} -> refuse(socket, "dispatch_reply", message_error(reason))
       end
     else
@@ -563,6 +563,68 @@ defmodule LoopctlWeb.RunnerChannel do
       node: Runners.node_name(),
       machine_id: Runners.machine_id()
     })
+  end
+
+  # A RUNNER CONTRADICTING ITS OWN DECLARATION IS BOUNDED PER CONNECTION (contract 1.6.0).
+  #
+  # `Runners.dispatch/3` consults the declaration alone for a declaring runner and never the
+  # ledger's `kind_not_supported` memory — deliberately, because that memory has no expiry
+  # and is what locked an upgraded machine out for the life of its `runners` row. The cost is
+  # that a runner which DECLARES a kind and then refuses it has nothing stopping the next
+  # dispatch: each one writes a ledger row, takes a slot, is refused, releases the slot, and
+  # the loop has no bound at all. That is not hypothetical — the motivating failure is a
+  # runner mapping a TRANSIENT LOCAL CONDITION to `kind_not_supported`, and such a runner goes
+  # on declaring the kind at every reconnect.
+  #
+  # So the refusal is honoured for the life of THIS CONNECTION, in this socket's own Presence
+  # meta. Per-connection is the right lifetime and not a compromise: the declaration it
+  # contradicts is per-connection, so the contradiction expires exactly when the claim does,
+  # and the reconnect that re-declares the kind is the same unlock as everywhere else. It
+  # needs no table and cannot outlive the machine that said it.
+  #
+  # Only for a DECLARING runner: an undeclaring one is already bounded by the ledger, and
+  # writing this meta for it would add a second, weaker mechanism in front of the durable one.
+  defp note_kind_refusal(socket, %{decision: "refused", reason: "kind_not_supported"}, record) do
+    %{runner: runner, tenant_id: tenant_id, meta: meta} = socket.assigns
+
+    case {Runners.declared_kinds(meta), record.kind} do
+      {{:declared, kinds}, kind} when is_binary(kind) ->
+        if kind in kinds do
+          Logger.warning(
+            "runner declared kind #{kind} and then refused it as kind_not_supported; " <>
+              "suppressing that kind for the rest of this connection. Reconnecting clears it."
+          )
+
+          suppress_kind(socket, meta, runner, tenant_id, kind)
+        else
+          socket
+        end
+
+      _ ->
+        socket
+    end
+  end
+
+  defp note_kind_refusal(socket, _reply, _record), do: socket
+
+  defp suppress_kind(socket, meta, runner, tenant_id, kind) do
+    kinds = Enum.reject(Runners.declared_kinds(meta) |> elem(1), &(&1 == kind))
+    meta = Map.put(meta, :kinds, kinds)
+
+    # An EMPTY list here would read as "declared nothing" (`Runners.declared_kinds/1` fails
+    # safe to `:implied`), which would hand the runner straight back to the ledger — and for
+    # a machine that just refused its only kind, the ledger says the same thing. Either way
+    # it gets no more of that kind on this connection, which is the property wanted; the
+    # ledger row its refusal wrote is what a later connection reads.
+    {:ok, ref} =
+      Presence.update(
+        self(),
+        Runners.pool_topic(tenant_id),
+        runner.name,
+        presence_meta(meta, runner)
+      )
+
+    socket |> assign(:meta, meta) |> assign(:presence_ref, ref)
   end
 
   # This socket is tracked, and its meta is the only one in the tenant's pool holding the

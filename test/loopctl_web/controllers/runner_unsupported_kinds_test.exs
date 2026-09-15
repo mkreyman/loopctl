@@ -66,11 +66,16 @@ defmodule LoopctlWeb.RunnerUnsupportedKindsTest do
     :ok
   end
 
-  defp track(runner) do
+  defp track(runner, extra \\ %{}) do
     pid = spawn(fn -> Process.sleep(:infinity) end)
     on_exit(fn -> Process.exit(pid, :kill) end)
 
-    meta = %{machine: runner.name, joined_at: DateTime.utc_now(), runner_id: runner.id}
+    meta =
+      Map.merge(
+        %{machine: runner.name, joined_at: DateTime.utc_now(), runner_id: runner.id},
+        extra
+      )
+
     {:ok, _ref} = Presence.track(pid, Runners.pool_topic(runner.tenant_id), runner.name, meta)
     pid
   end
@@ -106,6 +111,38 @@ defmodule LoopctlWeb.RunnerUnsupportedKindsTest do
 
     assert [entry] = json_response(get(authed, ~p"/api/v1/runners/pool"), 200)["runners"]
     assert entry["unsupported_kinds"] == []
+  end
+
+  # #834 round 1, finding 3. Since contract 1.6.0 the declaration alone decides for a
+  # declaring runner, and a dispatch it refuses on that basis writes NO ledger row — so
+  # `unsupported_kinds` reports nothing wrong about a machine that is being refused every
+  # dispatch. That is the same "connected, unrevoked, idle, silently gets no work" blind
+  # spot `unsupported_kinds` was added to close, reopened through the new decision path.
+  test "the pool renders what a runner DECLARED, which is what actually decides", %{conn: conn} do
+    ctx = operator_ctx()
+    # A triage-only machine: in the contract vocabulary, and refused every implement
+    # dispatch by its own declaration while the ledger holds nothing against it.
+    track(ctx.runner, %{kinds: ["triage"]})
+
+    authed = auth(conn, ctx.operator_key)
+
+    assert [entry] = json_response(get(authed, ~p"/api/v1/runners/pool"), 200)["runners"]
+    assert entry["kinds"] == ["triage"]
+    assert entry["unsupported_kinds"] == []
+  end
+
+  test "a runner that declared nothing renders null, never the implied set", %{conn: conn} do
+    # `null` and `["implement"]` are DIFFERENT answers to an operator: the implied set is
+    # loopctl's reading of silence, and printing it as the machine's own declaration would
+    # report a statement the runner never made.
+    ctx = operator_ctx()
+    track(ctx.runner)
+
+    authed = auth(conn, ctx.operator_key)
+
+    assert [entry] = json_response(get(authed, ~p"/api/v1/runners/pool"), 200)["runners"]
+    assert Map.has_key?(entry, "kinds")
+    assert entry["kinds"] == nil
   end
 
   test "an ordinary refusal bars nothing", %{conn: conn} do

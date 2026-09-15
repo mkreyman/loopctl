@@ -172,13 +172,56 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     test "uses only the JSON Schema keywords the runner's vendored validator implements" do
       # mkreyman/loopctl-runner's LoopctlRunner.Contract FAILS a definition carrying a keyword
       # it does not know, so a new keyword here breaks every runner validating that message.
-      known =
-        ~w(type required properties minimum maximum minLength maxLength pattern enum items
-           maxItems minProperties description format additionalProperties)
+      known = RunnerContract.exported_keywords()
 
       for {title, definition} <- RunnerContract.json_schema()["$defs"] do
         assert unknown_keywords(definition, known) == [], "#{title} uses an unknown keyword"
       end
+    end
+
+    # THE OTHER DIRECTION, and the one the test above cannot see. It reads the EXPORT, so a
+    # keyword set on a Schema struct and silently dropped by `schema_to_map/1` passes it —
+    # while `OpenApiSpex.Cast` enforces that keyword on every join. The runner author then
+    # validates against the vendored file, passes, sends the message, and is refused for a
+    # constraint the published contract does not contain.
+    #
+    # Round 1 of #834 found exactly that: `RunnerJoin.kinds` carried `minItems: 1` and
+    # `uniqueItems: true`, neither of which this exporter emits, and `kinds` was the first
+    # field in the whole contract to use either — so nothing went red.
+    test "enforces no schema keyword it does not publish" do
+      exported = MapSet.new(RunnerContract.exported_keywords(), &String.to_atom/1)
+
+      # Published by TRANSFORMATION rather than as a literal keyword, so their absence from
+      # the keyword list is not a gap: `title` becomes the definition's KEY under `$defs`,
+      # and `nullable` becomes the `["string", "null"]` type union `schema_to_map/1` writes.
+      # Both reach the runner, so neither can refuse a join for an unpublished reason.
+      transformed = MapSet.new([:title, :nullable])
+
+      # Structural, not a copy: every field the Schema struct HAS, minus the ones the
+      # exporter carries either way. A new OpenApiSpex version adding a constraint keyword
+      # lands in this set automatically rather than being quietly allowed.
+      never_published =
+        %OpenApiSpex.Schema{}
+        |> Map.from_struct()
+        |> Map.keys()
+        |> Enum.reject(&(&1 in exported or &1 in transformed))
+        |> MapSet.new()
+
+      offenders =
+        for mod <- RunnerContract.schema_modules(),
+            {path, %OpenApiSpex.Schema{} = schema} <-
+              walk_schema(mod.schema(), mod.schema().title),
+            {field, value} <- Map.from_struct(schema),
+            not is_nil(value),
+            field in never_published,
+            do: "#{path}.#{field}"
+
+      assert offenders == [],
+             "these constraints are ENFORCED by OpenApiSpex and absent from the export, so " <>
+               "a runner validating against the vendored contract passes and is then " <>
+               "refused for a rule it cannot read: #{Enum.join(offenders, ", ")}. Either " <>
+               "publish the keyword (and upgrade every runner's validator first) or accept " <>
+               "the value and settle it in code."
     end
 
     test "the published byte rule is the implemented one, on random payloads" do
@@ -462,6 +505,24 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     alphabet = [?a, ?<, ?&, ?", ?\\, 1, 0xE9, 0x4E2D, 0x1F600]
     for _ <- 1..:rand.uniform(8), into: "", do: <<Enum.random(alphabet)::utf8>>
   end
+
+  # Every `%Schema{}` reachable from one, as {dotted path, schema}, so an offender names the
+  # field rather than just the top-level message. Nested schemas are inlined by the exporter
+  # (`RunnerSample` inside `RunnerJoin`), so the walk has to follow properties AND items.
+  defp walk_schema(%OpenApiSpex.Schema{} = schema, path) do
+    nested =
+      Enum.flat_map(schema.properties || %{}, fn {key, sub} ->
+        walk_schema(sub, "#{path}.#{key}")
+      end) ++
+        case schema.items do
+          %OpenApiSpex.Schema{} = items -> walk_schema(items, "#{path}[]")
+          _ -> []
+        end
+
+    [{path, schema} | nested]
+  end
+
+  defp walk_schema(_other, _path), do: []
 
   defp unknown_keywords(%{} = schema, known) do
     own = Map.keys(schema) -- known

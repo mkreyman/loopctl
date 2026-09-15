@@ -58,18 +58,23 @@ defmodule LoopctlWeb.RunnerController do
     }
   }
 
-  # A runner's dispatch kinds, refused permanently by the runner itself. Declared once and
-  # used by both read shapes — the registry and the pool — because it answers the same
-  # question in both: why does this machine never get work?
+  # A runner's dispatch kinds, refused by the runner itself. Declared once and used by both
+  # read shapes — the registry and the pool — because it answers the same question in both:
+  # why does this machine never get work?
   @unsupported_kinds_schema %Schema{
     type: :array,
     items: %Schema{type: :string},
     description:
       "Dispatch kinds this runner answered `kind_not_supported` for. A CAPABILITY " <>
-        "statement, treated as permanent: loopctl sends none of these to this machine " <>
-        "again. `implement` is currently the only dispatchable kind, so a runner listing " <>
-        "it gets NO work at all while it stays enrolled — it is not idle, it is barred. " <>
-        "Cleared by revoking and re-enrolling the machine, which mints a new runner row."
+        "statement, recorded permanently. Since contract 1.6.0 it is the whole decision " <>
+        "ONLY for a runner that declares no `kinds` on join: loopctl sends none of these " <>
+        "to such a machine again, and `implement` being the only dispatchable kind, one " <>
+        "entry means it gets NO work at all while it stays enrolled. For a runner that " <>
+        "DOES declare its kinds this list is HISTORY — what the machine refused before — " <>
+        "and not a statement about the next dispatch, which the declaration alone decides " <>
+        "(see `kinds` on the pool entry). Cleared for a declaring runner by RECONNECTING " <>
+        "with the kind declared; for an undeclaring one only by revoking and re-enrolling " <>
+        "the machine, which mints a new runner row."
   }
 
   @listed_runner_schema %Schema{
@@ -135,8 +140,12 @@ defmodule LoopctlWeb.RunnerController do
     description:
       "Lists the tenant's enrolled runners. Enrollment only: whether a runner is CONNECTED " <>
         "is Presence, not a row. Pass `include_revoked=true` for revoked ones too. " <>
-        "`unsupported_kinds` names the dispatch kinds each machine has refused permanently; " <>
-        "a runner listing every dispatchable kind receives no work at all.",
+        "`unsupported_kinds` names the dispatch kinds each machine has refused. Since " <>
+        "contract 1.6.0 that decides what a machine is sent only while it declares no " <>
+        "`kinds` on join; for a declaring runner the declaration decides and this list is " <>
+        "history. The declaration is per-connection, so it is on the POOL entry and not " <>
+        "here: this endpoint reads enrollment rows and cannot see it. To answer why a " <>
+        "connected machine gets no work, read `GET /api/v1/runners/pool`.",
     parameters: [
       include_revoked: [in: :query, type: :boolean, description: "Include revoked runners"]
     ],
@@ -178,7 +187,10 @@ defmodule LoopctlWeb.RunnerController do
         "capacity Postgres holds for the runner — the values dispatch reserves against — and " <>
         "are null only for a runner revoked while its socket is still draining; " <>
         "`reported_in_flight` and `reported_max_sessions` are what the runner itself last " <>
-        "reported, a hint. Requires user role. Presence is a liveness " <>
+        "reported, a hint. `kinds` is what the runner DECLARED on join (contract 1.6.0), " <>
+        "and where it is present it alone decides which dispatches the machine is sent — " <>
+        "so a connected machine that never gets work is explained by `kinds` or by " <>
+        "`unsupported_kinds`, and both have to be read. Requires user role. Presence is a liveness " <>
         "hint, not a scheduler, and it converges only within a CLUSTER: on a deployment with " <>
         "more than one unclustered node, a runner connected to another node is absent here.",
     responses: %{
@@ -205,6 +217,7 @@ defmodule LoopctlWeb.RunnerController do
                    :live_sockets,
                    :node,
                    :machine_id,
+                   :kinds,
                    :unsupported_kinds
                  ],
                  properties: %{
@@ -258,6 +271,19 @@ defmodule LoopctlWeb.RunnerController do
                      nullable: true,
                      description:
                        "The Fly Machine (`FLY_MACHINE_ID`) holding this socket, or null off Fly."
+                   },
+                   kinds: %Schema{
+                     type: :array,
+                     nullable: true,
+                     items: %Schema{type: :string},
+                     description:
+                       "The dispatch kinds this runner DECLARED on join (contract 1.6.0), " <>
+                         "or null from a runner that declared none. Where it is present it " <>
+                         "is the whole decision: loopctl sends a kind in this list and " <>
+                         "refuses one outside it, whatever `unsupported_kinds` holds. A " <>
+                         "connected machine that never gets work is explained by this " <>
+                         "field or by that one — read both. Per-CONNECTION, so it can " <>
+                         "change when the runner reconnects."
                    },
                    unsupported_kinds: @unsupported_kinds_schema
                  }
@@ -337,6 +363,18 @@ defmodule LoopctlWeb.RunnerController do
     json(conn, %{runners: runners})
   end
 
+  # What the runner DECLARED, or nil when it declared nothing — rendered from the SAME
+  # function `Runners.dispatch/3` decides on, so the pool cannot show one thing while
+  # dispatch does another. `:implied` renders null rather than `["implement"]`: that value
+  # is loopctl's reading of silence, and printing it as the machine's own declaration would
+  # tell an operator the runner said something it never said.
+  defp declared_kinds(meta) do
+    case Runners.declared_kinds(meta) do
+      {:declared, kinds} -> kinds
+      {:implied, _kinds} -> nil
+    end
+  end
+
   defp pool_entry({machine, %{metas: metas}}, capacity, barred) do
     meta = Enum.max_by(metas, &Map.get(&1, :joined_at), &joined_no_later?/2)
     held = Map.get(capacity, Map.get(meta, :runner_id), %{})
@@ -355,7 +393,14 @@ defmodule LoopctlWeb.RunnerController do
       node: Map.get(meta, :node),
       machine_id: Map.get(meta, :machine_id),
       # The pool is where an operator looks at a machine that is connected and doing nothing,
-      # so it is where "barred from every kind" has to be readable.
+      # so it is where "barred from every kind" has to be readable — and since contract
+      # 1.6.0 that takes BOTH fields, because the declaration is what decides for a runner
+      # that made one and it writes no ledger row when it refuses. A machine declaring
+      # ["triage"] is refused every implement dispatch while `unsupported_kinds` stays
+      # empty, which is the same silent-idle blind spot that list was added to close.
+      # Null, not [], for a runner that declared nothing: an empty declaration and no
+      # declaration are DIFFERENT states here, and only one of them decides anything.
+      kinds: declared_kinds(meta),
       unsupported_kinds: Map.get(barred, Map.get(meta, :runner_id), [])
     }
   end

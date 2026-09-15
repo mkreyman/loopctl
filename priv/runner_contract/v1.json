@@ -215,7 +215,7 @@
           "type": "integer"
         },
         "kinds": {
-          "description": "The dispatch kinds this machine runs (since 1.6.0). Where present this is the ONLY thing consulted: loopctl refuses a kind outside it, and sends a kind inside it even where an earlier `kind_not_supported` reply is on record for this runner. A runner that omits it is read as declaring [\"implement\"] — what loopctl sent before the field existed. Declare it on EVERY join: it is per-connection, so an upgraded runner becomes eligible for a new kind by reconnecting rather than by being re-enrolled.",
+          "description": "The dispatch kinds this machine runs (since 1.6.0). Where present and NON-EMPTY this is the ONLY thing consulted: loopctl refuses a kind outside it, and sends a kind inside it even where an earlier `kind_not_supported` reply is on record for this runner. Omitting it, or sending an EMPTY array, is read as declaring `implied_kinds` [\"implement\"] — what loopctl sent before the field existed. An empty array is therefore NOT how a runner says it wants no work; `draining` is. Duplicates are accepted and ignored. Declare it on EVERY join: it is per-connection, so an upgraded runner becomes eligible for a new kind by reconnecting rather than by being re-enrolled.",
           "items": {
             "enum": [
               "triage",
