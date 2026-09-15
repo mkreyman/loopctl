@@ -6,6 +6,32 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Contract 1.10.0 — TRIAGE IS DISPATCHABLE, and loopctl sends it (#803 §4).** This is the
+  hop the loop did without: intake promoted a reported issue to a story at `detected`, the
+  verdict path could apply a triage verdict, and NOTHING asked a runner to do the triage in
+  between — `dispatchable_kinds` was `implement` alone and nothing in `lib/` built the
+  dispatch. A real ticket stopped at `detected` for ever, and the trio ran only where a person
+  ran it.
+
+  `Loopctl.Delivery.TriageDispatcher` plus `Loopctl.Workers.TriageDispatchWorker` (every
+  minute, off with the driver under the same `:dispatch_driver_enabled`) send a `triage`
+  dispatch carrying the reporter's words, fenced, for every detected story that came from an
+  intake record. It CLAIMS NOTHING — a triage session decides whether the story is work at
+  all, and claiming would put it at `claimed`, the stage an implement session reports from.
+  The `dispatch_id` is derived from the story and its epoch, so a pass that runs while a
+  triage session is live does not start a second one on the same ticket.
+
+  **Only a runner that DECLARES `triage` on join receives one.** `implied_by_silence` stays
+  `implement` alone, so a machine built before the `kinds` field existed is sent exactly what
+  it was sent before — that asymmetry is what makes this safe to deploy ahead of the fleet and
+  must not be tidied away.
+
+  Two new operator variables, documented in `deploy/FLY_SECRETS.md`:
+  **`TRIAGE_WALL_CLOCK_SECONDS`** and **`TRIAGE_MAX_TURNS`**, with NO DEFAULT for the same
+  reason the implement budgets have none. They are separate from the implement budgets because
+  a triage run reads a ticket and answers — a fraction of an implement run — and inheriting
+  those numbers would hand a reading session a day of wall clock.
+
 - **Contract 1.9.3 — `x-connection.triage_gating_reasons` publishes the gating vocabulary.**
   `Loopctl.DeliveryGates.GateA` matches two `escalation_reasons` entries as WHOLE STRINGS to
   decide whether a human is asked, while the contract typed that field as free-form text with

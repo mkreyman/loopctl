@@ -151,12 +151,10 @@ defmodule Loopctl.Delivery.TriagePayloadTest do
         "triage" => Map.new(triage, fn {k, v} -> {to_string(k), v} end)
       }
 
-      # `triage` is not dispatchable yet, so the cast refuses the KIND — and that refusal is
-      # the only one. Nothing about the triage object itself is rejected.
-      assert {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(dispatch)
-      assert Enum.any?(errors, &(&1 =~ "not dispatchable"))
-      refute Enum.any?(errors, &(&1 =~ "triage exceeds"))
-      refute Enum.any?(errors, &(&1 =~ "triage is only allowed"))
+      # Since 1.10.0 the kind is dispatchable, so this asserts the STRONGER thing it could
+      # only approximate before: the object this builder produces passes the wire outright,
+      # rather than being refused for the kind with nothing else wrong.
+      assert {:ok, %{kind: "triage"}} = RunnerContract.cast_dispatch(dispatch)
     end
 
     # #835 round 1, finding 1 (HIGH). The byte rule admits about 7_400 rendered characters
@@ -210,12 +208,11 @@ defmodule Loopctl.Delivery.TriagePayloadTest do
               "triage" => Map.new(triage, fn {k, v} -> {to_string(k), v} end)
             }
 
-            {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(payload)
-
-            # The kind refusal is expected until triage is dispatchable. Anything ELSE means
-            # the builder accepted what the wire will not.
-            assert Enum.all?(errors, &(&1 =~ "not dispatchable")),
-                   "body #{body_len} built but the wire refused it: #{inspect(errors)}"
+            # The whole point of the sweep: whatever the builder accepts, the wire takes. It
+            # used to be expressed as "refused for the kind and nothing else", because the
+            # kind was not dispatchable; now it can be said directly.
+            assert {:ok, _cast} = RunnerContract.cast_dispatch(payload),
+                   "body #{body_len} built but the wire refused it"
         end
       end
     end
@@ -244,11 +241,8 @@ defmodule Loopctl.Delivery.TriagePayloadTest do
         "triage" => Map.new(triage, fn {k, v} -> {to_string(k), v} end)
       }
 
-      {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(payload)
-
-      # The kind refusal only. A nil html_url must not be what refuses it.
-      assert Enum.all?(errors, &(&1 =~ "not dispatchable")),
-             "a nil html_url was refused by the wire: #{inspect(errors)}"
+      # A nil html_url must not be what refuses it — and since 1.10.0 nothing does.
+      assert {:ok, %{triage: %{html_url: nil}}} = RunnerContract.cast_dispatch(payload)
     end
 
     test "the built object is within the contract's byte cap with room for the dispatch" do

@@ -322,6 +322,37 @@ defmodule Loopctl.ObanPluginsConfigTest do
     end
   end
 
+  describe "TriageDispatchWorker crontab entry" do
+    setup do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+
+      {Oban.Plugins.Cron, cron_opts} =
+        Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      entry =
+        Enum.find(cron_opts[:crontab], fn
+          {_schedule, Loopctl.Workers.TriageDispatchWorker} -> true
+          {_schedule, Loopctl.Workers.TriageDispatchWorker, _opts} -> true
+          _ -> false
+        end)
+
+      %{entry: entry}
+    end
+
+    test "the TriageDispatchWorker entry exists in the crontab", %{entry: entry} do
+      assert entry,
+             "expected a TriageDispatchWorker crontab entry — #803 §4. Without one nothing " <>
+               "asks a runner to triage a detected story, so a real ticket stops at " <>
+               "`detected` and every stage after it is unreachable. Safe to schedule " <>
+               "unconditionally: it is off with the driver, under the same config key."
+    end
+
+    test "it runs every minute, like the drainer and the driver it sits between", %{entry: entry} do
+      assert elem(entry, 0) == "* * * * *"
+      assert tuple_size(entry) == 2
+    end
+  end
+
   describe "#249: inert KB crons are PARKED by default" do
     setup do
       plugins = Application.get_env(:loopctl, Oban)[:plugins]
