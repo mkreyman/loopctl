@@ -53,9 +53,21 @@ defmodule Loopctl.Delivery.Escalations do
 
   ## Untrusted text
 
-  `reason` is written by the session, which is a model. It is stored VERBATIM so an operator
-  reads what was actually said, capped at the `story_stages_text_bounds` CHECK's bound, and
-  never executed. Anything that puts it in front of a model renders it through
+  `reason` is written by the session, which is a model. It is stored ESCAPED FOR INVISIBLE
+  CHARACTERS and otherwise verbatim — `Loopctl.Delivery.Stages.advance/4` runs it through
+  `Untrusted.sanitise/1` before the bound is checked — so an operator reads what was actually
+  said AND can see what was hidden in it. Prose is untouched; a bidirectional override, a
+  zero-width run or a NUL becomes a visible `<U+XXXX>`.
+
+  That is a deliberate reversal of the strict-verbatim rule this line used to state, and the
+  reason is that the field is PERMANENT in two places nobody can edit: the column and, on a
+  chained transition, the tenant's append-only hash chain. Text whose hidden characters are
+  invisible is text that does not say what it appears to say, for ever. The NUL case decides
+  it on its own: Postgres will not store one, so a reason containing one was refused outright
+  and THE ESCALATION WAS LOST — a session asking for a human got nothing, over one byte.
+
+  It is capped at the `story_stages_text_bounds` CHECK's bound, measured on the escaped text
+  because that is what is stored, and never executed. Anything that puts it in front of a model renders it through
   `Loopctl.Delivery.Stages.escalation_block/1`, which fences it as untrusted data. The
   optional `payload` goes to the stage event's `data` under its own key and never to
   `story_stages` at all.

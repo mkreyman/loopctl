@@ -347,6 +347,7 @@ defmodule Loopctl.Delivery.Stages do
 
   def advance(tenant_id, story_id, {from, to, edge}, opts) do
     epoch = Keyword.fetch!(opts, :claim_epoch)
+    opts = sanitise_reason(opts)
     reason = Keyword.get(opts, :reason)
 
     with :ok <- allowed_for_caller(from, to, edge),
@@ -1094,6 +1095,34 @@ defmodule Loopctl.Delivery.Stages do
 
   defp present?(reason), do: is_binary(reason) and String.trim(reason) != ""
 
+  # THE REASON IS ESCAPED BEFORE IT IS STORED, AND BEFORE IT IS BOUNDED.
+  #
+  # `escalation_reason` is written by a SESSION — a model that had just read reporter text —
+  # and it lands in two places nobody can edit afterwards: the `story_stages` column an
+  # operator reads, and, on a chained transition, the tenant's append-only hash chain. A
+  # bidirectional override or a run of zero-width characters in it is invisible in both, so
+  # the text an operator sees is not the text that was written, permanently.
+  #
+  # `sanitise/1` does NOT change what was said — it rewrites invisible and invalid codepoints
+  # to `<U+XXXX>`, which is strictly better for the operator this field exists for, so the
+  # VERBATIM promise `Loopctl.Delivery.Escalations` makes is kept rather than broken. What it
+  # is not is a fence: prose stays prose, which is `escalation_block/1`'s job at the one hop
+  # where the text goes in front of a model.
+  #
+  # BEFORE `reason_given/3`, deliberately. Sanitising EXPANDS text — one bidi mark becomes
+  # eight characters — so a reason inside the cap can sit outside it once escaped. Bounded
+  # after, the column would take a value the check had never seen; bounded before, the caller
+  # is refused `:invalid_reason` for a length it can actually measure. It is also why this
+  # rewrites `opts` rather than a local: `transition/6` reads `:reason` again from there, and
+  # a second read of the raw value is how the escaped form reaches the event and the raw one
+  # reaches the column.
+  defp sanitise_reason(opts) do
+    case Keyword.get(opts, :reason) do
+      reason when is_binary(reason) -> Keyword.put(opts, :reason, Untrusted.sanitise(reason))
+      _ -> opts
+    end
+  end
+
   # The caller's structured payload, bounded on the JSON that is actually stored. Refused
   # BEFORE the transaction, like every other value: a jsonb Postgres will not take (a NUL in
   # a key or a value) raises 23514/22021 after the transition is already decided, and that
@@ -1143,8 +1172,10 @@ defmodule Loopctl.Delivery.Stages do
   the runner read out of `escalations.ndjson` — so it is reporter-shaped text under design
   §8 and §10: recorded and capped, never executed. **Any prompt that carries an escalation
   reason renders it through this and nothing else.** The JSON an operator or a dashboard
-  reads gets the raw value, because a fence there would hide what was actually written; the
-  fence exists for the one hop where the text lands in front of a model.
+  reads gets the STORED value — escaped for invisible characters by `sanitise_reason/1` on
+  the way in, never fenced — because a fence there would hide what was actually written while
+  the escape makes hidden characters visible without changing the words. The fence exists for
+  the one hop where the text lands in front of a model.
 
   > **This is a CONVENTION with no binding guard, and it is on the next story to make it
   > one.** Nothing in `lib/` renders `escalation_reason` into a prompt today — the prompt

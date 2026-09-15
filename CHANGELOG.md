@@ -6,6 +6,25 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **An escalation reason is ESCAPED for invisible characters before it is stored (#804).** It
+  was stored strictly verbatim, and it is written by a SESSION — a model that had just read
+  reporter text — into two places nobody can edit afterwards: the `story_stages` column an
+  operator reads, and, on a chained transition, the tenant's append-only hash chain. A
+  bidirectional override or a zero-width run in it is invisible in both, so the text an
+  operator sees was not the text that was written, permanently.
+
+  `Stages.advance/4` now runs the reason through `Untrusted.sanitise/1` BEFORE the length
+  bound, so what is bounded is what is stored. Prose is untouched — this is not a fence, and
+  `escalation_block/1` is still what fences the text at the one hop where it reaches a model —
+  but a hidden character becomes a visible `<U+XXXX>`.
+
+  **A NUL no longer loses the escalation.** Postgres will not store one, so a reason
+  containing a NUL was refused outright and the escalation never happened: a session asking
+  for a human got nothing, over one byte. It is now recorded visibly and the escalation lands.
+  The cost, measured and accepted: escaping EXPANDS text, so a reason near the 4,000-codepoint
+  cap has less room than its raw length suggests, and an emoji joined by zero-width joiners
+  shows them.
+
 - **Contract 1.12.0 — a SECURITY CORRECTION to what this contract promises, and the screen
   that makes the corrected statement true (#804).** `RunnerTriageVerdict`'s description said
   loopctl *"fences these strings wherever they later reach a prompt — `story` included"*. It

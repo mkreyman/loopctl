@@ -22,6 +22,7 @@ defmodule Loopctl.Delivery.StagesTest do
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
+  alias Loopctl.Delivery.Untrusted
   alias Loopctl.Progress
   alias Loopctl.Repo
   alias Loopctl.WorkBreakdown.Story
@@ -295,20 +296,27 @@ defmodule Loopctl.Delivery.StagesTest do
                  base ++ [reason: String.duplicate("x", 4001)]
                )
 
-      assert {:error, :invalid_reason} =
-               Stages.advance(
-                 story.tenant_id,
-                 story.id,
-                 transition,
-                 base ++ [reason: "log tail" <> <<0>>]
-               )
+      # The NUL case moved to its own test below: it now SUCCEEDS, and a success here would
+      # advance the row out from under the refusals that follow.
 
       # The CHECK counts CODEPOINTS (char_length); a grapheme count does not. This family
       # emoji is ONE grapheme and several codepoints, so at the boundary a grapheme-counting
       # guard passed a value Postgres then refused as 23514 — losing the escalation.
+      #
+      # It is ALSO the case that shows what escaping costs, which is why it is still measured
+      # here rather than simplified away: the sequence is joined by ZERO-WIDTH JOINERS, and
+      # `sanitise/1` cannot tell a legitimate joiner from a hidden one, so each becomes eight
+      # visible characters. The bound is therefore measured on the SANITISED text — the thing
+      # the column actually holds — and a caller near the cap has less room than the raw
+      # length suggests. That is the accepted price of a permanent record whose invisible
+      # characters are visible; it is measured rather than asserted.
       family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"
       assert String.length(family) == 1
-      family_codepoints = family |> String.to_charlist() |> length()
+
+      stored = Untrusted.sanitise(family)
+      assert stored =~ "<U+200D>"
+      stored_codepoints = stored |> String.to_charlist() |> length()
+      assert stored_codepoints > family |> String.to_charlist() |> length()
 
       assert {:error, :invalid_reason} =
                Stages.advance(
@@ -323,13 +331,15 @@ defmodule Loopctl.Delivery.StagesTest do
                  story.tenant_id,
                  story.id,
                  transition,
-                 base ++ [reason: String.duplicate("x", 4000 - family_codepoints) <> family]
+                 base ++ [reason: String.duplicate("x", 4000 - stored_codepoints) <> family]
                )
 
-      # The accepted one above left the row at `escalated`, so the reason is read back.
+      # The accepted one above left the row at `escalated`, so the reason is read back — and
+      # it ends with the SANITISED sequence, not the raw one, which is the whole point of
+      # measuring the bound against `stored` rather than against the input.
       assert String.ends_with?(
                Stages.get(story.tenant_id, story.id).escalation_reason,
-               family
+               stored
              )
 
       assert {:error, :stale_stage} =
@@ -341,6 +351,28 @@ defmodule Loopctl.Delivery.StagesTest do
                )
 
       assert chain_actions(story.tenant_id) == ["story_stage_escalated"]
+    end
+
+    test "a NUL in the reason is ESCAPED and the escalation survives" do
+      # It used to be refused — Postgres will not take a NUL in text, so the guard caught it
+      # before the transition — and the cost was that a session escalating with one byte of
+      # rubbish in its reason got NO ESCALATION AT ALL and the story was stranded at whatever
+      # stage it was in. The reason is escaped before it is bounded now, so the NUL is
+      # recorded visibly and the escalation lands.
+      {story, _} = at_stage(:deployed)
+      transition = {:deployed, :escalated, :verification_failed}
+      base = [claim_epoch: story.claim_epoch, actor_lineage: []]
+
+      assert {:ok, row} =
+               Stages.advance(
+                 story.tenant_id,
+                 story.id,
+                 transition,
+                 base ++ [reason: "log tail" <> <<0>>]
+               )
+
+      assert row.escalation_reason == "log tail<U+0000>"
+      assert row.stage == :escalated
     end
 
     test "no stage row is not_found" do
