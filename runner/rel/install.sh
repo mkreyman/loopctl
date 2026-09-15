@@ -15,6 +15,13 @@
 
 set -euo pipefail
 
+# Every `cd` below feeds a command substitution, and bash's cd PRINTS the directory it landed
+# in whenever CDPATH resolved it — so an operator who exports CDPATH (mac-mini does, from
+# ~/.bash_profile) turns `$(cd ... && pwd)` into the path TWICE, separated by a newline, and the
+# install dies on a repo path that does not exist. Unset rather than quoted around each call:
+# the value is inherited by the subshells further down as well.
+unset CDPATH
+
 repo=$(cd "$(dirname "$0")/.." && pwd)
 prefix="${LOOPCTL_RUNNER_PREFIX:-$HOME/.local/share/loopctl-runner}"
 # The prefix is rendered into the unit and plist too, so it takes the config path's checks.

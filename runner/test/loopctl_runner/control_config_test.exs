@@ -139,6 +139,52 @@ defmodule LoopctlRunner.ControlConfigTest do
     end
   end
 
+  describe "the installer's own environment (rel/install.sh)" do
+    test "an exported CDPATH does not corrupt the paths the unit is rendered with" do
+      # bash's cd PRINTS where it landed whenever CDPATH resolved the target, so every
+      # `$(cd ... && pwd)` in the installer comes back as the path TWICE with a newline between.
+      # mac-mini exports CDPATH from ~/.bash_profile, and the deploy there died on a repo
+      # directory that does not exist while the same command worked by hand on minis. A deploy
+      # script that breaks on one of three enrolled machines is how a merged fix stays undeployed.
+      # BOTH paths are spelled relatively, and that is the whole test: bash consults CDPATH only
+      # for a target that does not begin with /, ./ or ../, so an absolute spelling is
+      # structurally immune and an assertion on one proves nothing about this bug. `rel/install.sh`
+      # is how an operator invokes it, and a relative LOOPCTL_RUNNER_CONFIG is allowed — the
+      # installer resolves one to absolute through a `cd` of its own — so the resolution at that
+      # second site is exercised here rather than merely present.
+      repo = Path.expand("../..", __DIR__)
+      config = "_build/install-cdpath/runner.json"
+      File.mkdir_p!(Path.join(repo, Path.dirname(config)))
+      File.write!(Path.join(repo, config), "{}")
+
+      env = [
+        {"CDPATH", ".:#{System.user_home!()}:/tmp"},
+        {"LOOPCTL_RUNNER_PREFIX", "/tmp/loopctl-runner-render"},
+        {"LOOPCTL_RUNNER_CONFIG", config}
+      ]
+
+      {out, status} =
+        System.cmd("bash", ["rel/install.sh", "--render"],
+          env: env,
+          cd: repo,
+          stderr_to_stdout: true
+        )
+
+      # The exit is what goes red on today's bug: a corrupted $repo names no template, and the
+      # render dies before any path is substituted.
+      assert status == 0, out
+      # The resolved config, exactly once. Doubled is what an unguarded cd produces, and the unit
+      # cannot carry a newline in Environment= — so this is the assertion that would catch the
+      # config resolution regressing on its own, without the repo resolution regressing with it.
+      absolute = Path.join(repo, config)
+      assert out =~ absolute
+      refute out =~ "#{absolute}\n#{absolute}"
+      # The prefix never passes through a cd at all; asserted as a rendering sanity check only.
+      assert out =~ "/tmp/loopctl-runner-render/current"
+      refute out =~ "No such file or directory"
+    end
+  end
+
   describe "release pruning (rel/install.sh)" do
     @script Path.expand("../../rel/install.sh", __DIR__)
 
