@@ -68,6 +68,13 @@ All notable changes to loopctl are documented here.
   implementation refuses such a dispatch outright, cleanly and identically on every
   redispatch, which means the loop could place work unattended and nothing would ever run.
 
+  A RE-SEND of a recorded `dispatch_id` rebuilds the object too — that path pushed the
+  caller's map, which can never carry a story, so an ordinary retry put a story-less dispatch
+  on the wire while the endpoint answered 201. It rebuilds with the PURE builder and refuses
+  `story_no_longer_dispatchable` (422) without writing anything: a retry does not own the
+  claim it would be parking, the ledger's own fences are not reached until the push, and an
+  escalation there would have written over a story live under somebody else's session.
+
   Built AFTER the claim because it is the only point where it can be: a story too large for
   the contract's caps is escalated rather than truncated, and that edge exists only from
   `claimed` onwards. A refusal releases the claim and leaves the story escalated for a human —

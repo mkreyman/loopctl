@@ -190,16 +190,19 @@ defmodule LoopctlWeb.DispatchPlacementControllerTest do
       assert failed.status == 500
       assert Jason.decode!(failed.resp_body)["error"]["code"] == "story_escalation_failed"
 
-      # And the re-send whose story object cannot be rebuilt, which must refuse rather than
-      # put a story-less dispatch on the wire and answer 201.
-      unknown =
+      # And the RESUME's version of the cap refusal, which says the opposite about the claim:
+      # a re-send writes nothing, so the claim stands and any session under it is untouched.
+      # Telling an operator the claim went back would be a false statement they act on.
+      resumed =
         DispatchPlacementController.render_refusal(
           Phoenix.ConnTest.build_conn(),
-          :implementer_dispatch_unknown
+          {:story_no_longer_dispatchable, violations}
         )
 
-      assert unknown.status == 409
-      assert Jason.decode!(unknown.resp_body)["error"]["code"] == "implementer_dispatch_unknown"
+      assert resumed.status == 422
+      body = Jason.decode!(resumed.resp_body)
+      assert body["error"]["code"] == "story_no_longer_dispatchable"
+      assert body["error"]["message"] =~ "the claim stands"
     end
   end
 

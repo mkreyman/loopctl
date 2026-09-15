@@ -391,30 +391,17 @@ defmodule Loopctl.Delivery.PlacementTest do
       disconnect(channel, runner)
       unboxed(fn -> oversize!(runner.tenant_id, story.id) end)
 
-      assert {:error, {:story_not_dispatchable, [_ | _]}} = place(ctx, payload)
-    end
+      assert {:error, {:story_no_longer_dispatchable, [_ | _]}} = place(ctx, payload)
 
-    test "a resume whose implementer dispatch cannot be read is refused, not sent bare", ctx do
-      %{runner: runner, story: story, channel: channel} = ctx
-      payload = dispatch_payload(story)
-
-      assert {:ok, _first} = place(ctx, payload)
-      assert_push "dispatch", _pushed, @reply_timeout
-
-      # The escalation a refusal writes is a CHAINED transition, so the rebuild needs the
-      # lineage of the dispatch the story records as its implementer. Unreadable, the honest
-      # answer is a refusal: pushing without the story object is the defect, and inventing an
-      # empty lineage would attribute an escalation to nobody.
-      disconnect(channel, runner)
-
-      # NIL, which is the reachable shape: the column is nullable, and a story claimed before
-      # dispatch lineage existed — or by any path that does not mint one — carries none. An id
-      # pointing at a MISSING row is not reachable at all while
-      # `stories_implementer_dispatch_id_fkey` holds, which is why the clause covering it is
-      # defensive and is documented as such rather than tested here.
-      unboxed(fn -> forget_implementer!(runner.tenant_id, story.id) end)
-
-      assert {:error, :implementer_dispatch_unknown} = place(ctx, payload)
+      # AND NOTHING WAS WRITTEN. A re-send does not own the claim it would be parking — the
+      # story may be live under a session right now — and the ledger's own fences
+      # (`dispatch_already_replied`, `stale_claim_epoch`) are not reached until the PUSH, so
+      # escalating here would have written over a story nobody asked about, for a duplicate
+      # retry of a dispatch that was already answered. Round 2 of this PR's review caught it.
+      assert unboxed(fn -> Stages.get(runner.tenant_id, story.id) end).stage == :claimed
+      still = unboxed(fn -> reload(runner.tenant_id, story.id) end)
+      assert still.agent_status == :assigned
+      assert still.assigned_agent_id == runner.agent_id
     end
 
     test "an upper-case story_id is placed, and the object matches the id on the wire", ctx do
@@ -725,14 +712,6 @@ defmodule Loopctl.Delivery.PlacementTest do
             %{"id" => "AC-1", "description" => "The monthly total equals the sum of its visits"}
           ]
         ]
-      )
-  end
-
-  defp forget_implementer!(tenant_id, story_id) do
-    {1, _} =
-      AdminRepo.update_all(
-        from(s in Story, where: s.id == ^story_id and s.tenant_id == ^tenant_id),
-        set: [implementer_dispatch_id: nil]
       )
   end
 

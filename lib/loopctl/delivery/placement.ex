@@ -158,10 +158,10 @@ defmodule Loopctl.Delivery.Placement do
 
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Auth.Role
+  alias Loopctl.Delivery.ImplementerInput
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryPayload
   alias Loopctl.Dispatches
-  alias Loopctl.Dispatches.Dispatch
   alias Loopctl.Progress
   alias Loopctl.Runners
   alias Loopctl.Runners.DispatchLedger
@@ -189,8 +189,8 @@ defmodule Loopctl.Delivery.Placement do
           | {:invalid, [String.t()]}
           | {:invalid_transition, map()}
           | :story_not_accepted
-          | :implementer_dispatch_unknown
           | {:story_not_dispatchable, [String.t()]}
+          | {:story_no_longer_dispatchable, [String.t()]}
           | {:escalation_failed, term(), [String.t()]}
 
   @doc """
@@ -205,11 +205,14 @@ defmodule Loopctl.Delivery.Placement do
   `dispatch_id`, `kind`, the repo, the branches, the wall clock — is the caller's and is
   validated by the contract inside `Runners.dispatch/3`.
 
-  Two refusals come from the builder rather than from the caller's payload:
+  Three refusals come from the builder rather than from the caller's payload:
   `{:story_not_dispatchable, violations}` means the story exceeds a contract cap and HAS BEEN
-  ESCALATED to a human (the claim is released, the stage row stays `escalated`), and
+  ESCALATED to a human (the claim is released, the stage row stays `escalated`);
   `{:escalation_failed, reason, violations}` means it is neither dispatchable nor parked,
-  which is the outcome nothing downstream will pick up.
+  which is the outcome nothing downstream will pick up; and
+  `{:story_no_longer_dispatchable, violations}` is the RESUME's version — nothing was
+  written, the claim stands and the session under it is untouched, because a retry does not
+  own the claim it would be parking.
 
   The story must already be `contracted` (`Loopctl.Progress.contract_story/3`) and its stage
   row must be at `queued`. Both are checked BEFORE anything is minted, so the ordinary
@@ -342,11 +345,11 @@ defmodule Loopctl.Delivery.Placement do
     if Runners.custody_halted?(tenant_id), do: {:error, :tenant_halted}, else: :ok
   end
 
-  # A retry of a dispatch the ledger already holds. Nothing is claimed, minted or bumped: the
-  # placement already happened, and what is left is to put the frame on the wire again under
-  # the epoch the ORIGINAL claim produced. Pushing under a freshly read epoch instead would
-  # hand the runner a number its ledger row does not carry, and `record_sent/3` would refuse
-  # it as a `:dispatch_id_conflict`.
+  # A retry of a dispatch the ledger already holds. NOTHING IS CLAIMED, MINTED, BUMPED OR
+  # WRITTEN: the placement already happened, and what is left is to put the frame on the wire
+  # again under the epoch the ORIGINAL claim produced. Pushing under a freshly read epoch
+  # instead would hand the runner a number its ledger row does not carry, and `record_sent/3`
+  # would refuse it as a `:dispatch_id_conflict`.
   #
   # THE STORY OBJECT IS REBUILT HERE TOO, and leaving it out was the same defect this change
   # exists to fix, left open on the retry path. The caller's map can never carry a `story` —
@@ -356,15 +359,25 @@ defmodule Loopctl.Delivery.Placement do
   # lost HTTP response, a failed broadcast or a dropped frame all leave the ledger row at
   # `sent`, which is exactly what routes a re-send here.
   #
-  # `StoryPayload.build/3` is a pure function of the row and its options, so the object is
-  # byte-identical to the one the original send carried unless the story itself was edited —
-  # and the ledger only ever re-sends a row still at `sent`, i.e. one no session has answered,
-  # so there is no session holding the older text to be inconsistent with.
+  # BUILT WITH THE PURE BUILDER, NOT `StoryPayload.build/3`, and that is the whole difference
+  # between this path and the claim path. `build/3` ESCALATES an undispatchable story — a
+  # stage transition and a chain entry — which is right where the caller owns the claim it is
+  # parking, and wrong here for three reasons this path cannot escape:
   #
-  # The lineage comes from the RECORDED implementer dispatch, not from the caller: this path
-  # mints nothing, and the escalation a refusal writes must be attributed to the dispatch that
-  # actually holds the story. A story whose implementer dispatch cannot be read is refused
-  # rather than pushed story-less — fail closed, because the alternative is the defect above.
+  #   * the ledger's fences (`:dispatch_already_replied`, `:stale_claim_epoch`) live inside
+  #     `record_sent/3`, which a resume does not reach until the PUSH — so a duplicate retry of
+  #     an ALREADY-ANSWERED dispatch, or one whose claim has since been released and the story
+  #     re-placed, would have written an escalation over a story that is live under somebody
+  #     else's claim, and answered 422 or 500 where the pre-change code answered a fence;
+  #   * the escalation would be attributed to a dispatch this call did not mint and does not
+  #     own, or refused for want of a lineage it has no business resolving;
+  #   * a resume that escalated but did not release would leave the story `escalated` AND
+  #     claimed, with a live key and a ticking lease, while the refusal told the operator the
+  #     claim had gone back.
+  #
+  # So a story that no longer fits the contract is REFUSED here and nothing is written. The
+  # claim stands, the session under it is untouched, and the next placement through the claim
+  # path is what parks the story — with the fences applied first, where they belong.
   defp resume(tenant_id, runner_id, dispatch, record) do
     with {:ok, payload} <- resume_payload(tenant_id, dispatch, record) do
       push_resumed(tenant_id, runner_id, payload, record)
@@ -373,30 +386,25 @@ defmodule Loopctl.Delivery.Placement do
 
   defp resume_payload(tenant_id, dispatch, record) do
     with {:ok, story} <- Stories.get_story(tenant_id, record.story_id),
-         {:ok, lineage} <- recorded_lineage(tenant_id, story),
-         {:ok, dispatch} <-
-           attach_story(tenant_id, dispatch, story, %{lineage_path: lineage}, record.claim_epoch,
-             actor_label: "control:dispatch_resume"
-           ) do
+         {:ok, dispatch} <- rebuild_story(dispatch, story) do
       {:ok, Map.put(dispatch, "claim_epoch", record.claim_epoch)}
     end
   end
 
-  # The lineage of the dispatch the story RECORDS as its implementer. An `[]` here is not a
-  # usable answer: entering `escalated` is a chained transition and `Stages.advance/4` refuses
-  # an absent lineage, so a story with no recorded implementer would take the refusal inside
-  # the builder instead of here, where it can be named.
-  defp recorded_lineage(tenant_id, %{implementer_dispatch_id: nil}) when is_binary(tenant_id),
-    do: {:error, :implementer_dispatch_unknown}
+  # `ImplementerInput.story_object/2` is the pure half of `StoryPayload.build/3` — the same
+  # allowlist and the same caps, with no database write of any kind. Non-implement kinds carry
+  # no story object at all, exactly as on the claim path.
+  defp rebuild_story(dispatch, story) do
+    if Map.get(dispatch, "kind") == "implement" do
+      case ImplementerInput.story_object(story) do
+        {:ok, object} ->
+          {:ok, Map.put(dispatch, "story", object)}
 
-  # The second clause is DEFENSIVE and says so: `stories_implementer_dispatch_id_fkey` makes a
-  # story pointing at a missing dispatch unreachable while the constraint holds, so it is the
-  # unlineaged row and a dropped constraint that it actually covers. It fails closed either
-  # way — the alternative is an escalation attributed to nobody, or a push with no story.
-  defp recorded_lineage(tenant_id, %{implementer_dispatch_id: dispatch_id}) do
-    case Loopctl.AdminRepo.get_by(Dispatch, id: dispatch_id, tenant_id: tenant_id) do
-      %Dispatch{lineage_path: [_ | _] = lineage} -> {:ok, lineage}
-      _unreadable_or_unlineaged -> {:error, :implementer_dispatch_unknown}
+        {:error, {:story_not_dispatchable, violations}} ->
+          {:error, {:story_no_longer_dispatchable, violations}}
+      end
+    else
+      {:ok, dispatch}
     end
   end
 
