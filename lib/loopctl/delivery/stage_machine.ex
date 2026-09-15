@@ -123,9 +123,16 @@ defmodule Loopctl.Delivery.StageMachine do
   # statement for "the deploy broke", and the only thing a caller could reach for.
   #
   # Escalating from either is now the way out, and it restores the human path
-  # (`escalated -> queued | done | failed` over `:human_resolution`). `deployed -> verified`
-  # stays for the control writer that does not exist yet; until it does, ESCALATION IS THE
-  # ONLY WAY OUT OF `deployed`.
+  # (`escalated -> queued | done | failed` over `:human_resolution`).
+  #
+  # `deployed -> verified` HAS its control writer now — `Loopctl.Delivery.PostDeployVerification`
+  # — so escalation is no longer the only way out of `deployed`. The sentence that said
+  # otherwise outlived the writer it was waiting for, which mattered more than a stale comment
+  # usually does: the trap it describes MOVED ONE STAGE FORWARD each time a writer was added,
+  # and reading it as already-solved is what hid `verified` becoming absorbing in its turn.
+  # `verified -> done` is written by `Loopctl.Delivery.Completion`, and that is the end of the
+  # line — there is no next stage for the trap to move to. Whenever a writer is added here,
+  # ask what writes the edge out of the stage it now leaves stories in.
   @session_escalated for from <- @in_flight ++ [:merged, :deployed],
                          do: {from, :escalated, :session_escalated}
 
