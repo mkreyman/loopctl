@@ -502,6 +502,40 @@ defmodule LoopctlRunner.ControlTest do
       run_dir
     end
 
+    # The run directory must exist BEFORE the control starts, because started_dispatches is
+    # rebuilt from the run directories at boot and that is what makes a re-dispatch of this run's
+    # own dispatch_id answerable. Its trace must arrive AFTER, because the first trace tick fires
+    # at join and would spend the single queued dispatch_not_accepted before any reply is pending.
+    # So: an empty trace at boot, events written when the test is ready for them.
+    #
+    # An empty trace at boot is NOT inert, which is the trap. The run is `succeeded`, so the first
+    # poll settles it — last_seq is -1 on an empty file, -1 >= -1, and trace_ship.json is written
+    # as done with acked_seq -1 before the events exist. Waiting on that file's EXISTENCE is
+    # therefore a race in one direction and vacuous in the other: it can satisfy on the boot
+    # marker instead of the abandon marker, and `done: true` is true whether or not anything ever
+    # shipped. Every wait below is on CONTENT, and shipped/2 requires the acked seq.
+    defp trace_events(ctx, run_dir, events) do
+      dispatched_run(ctx, events, %{}, Path.basename(run_dir))
+      run_dir
+    end
+
+    defp ship_state(run_dir) do
+      path = Path.join(run_dir, "trace_ship.json")
+      if File.exists?(path), do: JSON.decode!(File.read!(path)), else: nil
+    end
+
+    defp abandoned(run_dir, reason) do
+      :ok = wait_until(fn -> match?(%{"abandoned" => ^reason}, ship_state(run_dir)) end, 5_000)
+    end
+
+    defp shipped(run_dir, through) do
+      :ok =
+        wait_until(
+          fn -> match?(%{"done" => true, "acked_seq" => ^through}, ship_state(run_dir)) end,
+          5_000
+        )
+    end
+
     defp shipping_control(ctx, opts \\ []) do
       slow = %{ctx.config | control: %{ctx.config.control | status_interval_s: 30}}
       {pid, _ref} = start_control(slow, Keyword.merge([trace_poll_ms: 200], opts))
@@ -805,6 +839,115 @@ defmodule LoopctlRunner.ControlTest do
       assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id}}}, 3_000
       :ok = wait_until(fn -> File.exists?(Path.join(run_dir, "trace_ship.json")) end, 3_000)
       assert %{"done" => true} = JSON.decode!(File.read!(Path.join(run_dir, "trace_ship.json")))
+    end
+
+    # The dispatch the run on disk was started from, at whatever epoch a test re-sends it.
+    defp this_run(epoch),
+      do: %{@dispatch | "dispatch_id" => @dispatch_id, "claim_epoch" => epoch}
+
+    # These drive REAL dispatch sequences rather than planting state: the runner rebuilds
+    # started_dispatches from the run directories at boot, so a re-dispatch of a run's own
+    # dispatch_id is answered exactly as it would be in production — accepted again at the started
+    # epoch, refused at any other.
+    #
+    # The ORDER is enforced, not hoped for. The first trace tick fires at join, so a run directory
+    # present before the control starts would spend the single queued dispatch_not_accepted before
+    # any reply is pending. Each test therefore starts the control, waits for the join, makes its
+    # replies pending, and only THEN writes the run directory for the next poll to find.
+    defp pending_dispatch(topic, payload, decision) do
+      TestLoopctl.Endpoint.broadcast(topic, "dispatch", payload)
+      assert_receive {:test_loopctl, {:dispatch_reply, %{"decision" => ^decision} = reply}}, 5_000
+      reply
+    end
+
+    defp joined_shipping_control(ctx) do
+      pid = shipping_control(ctx, trace_poll_ms: 300)
+      :ok = wait_until(fn -> Control.info(pid).joined end, 5_000)
+      {pid, "runner:" <> TestLoopctl.get(:runner_id)}
+    end
+
+    test "a refusal at a NEWER epoch proves the claim moved, and the trace is given up", ctx do
+      # The runner's own evidence that the row for this run's epoch is superseded: it refused a
+      # re-dispatch of the same dispatch at a newer claim_epoch, which is what loopctl reclaiming
+      # the story looks like from here. Nothing will move that row, so polling against it is
+      # polling for ever.
+      TestLoopctl.put(:dispatch_reply_replies, [:none, :none])
+      TestLoopctl.put(:trace_replies, [{:error, %{reason: "dispatch_not_accepted"}}])
+      run_dir = dispatched_run(ctx, [], %{}, "moved-run")
+      {_pid, topic} = joined_shipping_control(ctx)
+
+      # This run's own accept, pending because loopctl does not answer it.
+      pending_dispatch(topic, this_run(4), "accepted")
+      # And the proof, at a newer epoch.
+      assert %{"claim_epoch" => 5} = pending_dispatch(topic, this_run(5), "refused")
+
+      trace_events(ctx, run_dir, 0..2)
+      abandoned(run_dir, "dispatch_not_accepted")
+    end
+
+    test "a refusal at an OLDER epoch is stale history, and the trace still ships", ctx do
+      # The regression an earlier version of this guard introduced, and worse than the bug it was
+      # fixing: a refusal left pending from before the claim moved would abandon the trace of a run
+      # whose own accept is genuinely in flight — permanently, since TraceShip never revisits a run
+      # it gave up on. Neither reply is ever answered here, so the refusal is STILL pending when
+      # the trace ships, which is the invariant.
+      run_id = ctx.run_id
+      TestLoopctl.put(:dispatch_reply_replies, [:none, :none])
+      TestLoopctl.put(:trace_replies, [{:error, %{reason: "dispatch_not_accepted"}}])
+      run_dir = dispatched_run(ctx, [], %{}, "stale-refusal-run")
+      {_pid, topic} = joined_shipping_control(ctx)
+
+      assert %{"claim_epoch" => 3} = pending_dispatch(topic, this_run(3), "refused")
+      pending_dispatch(topic, this_run(4), "accepted")
+
+      trace_events(ctx, run_dir, 0..2)
+      assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id}}}, 5_000
+      # Through seq 2: the boot marker says done at acked_seq -1, so only the seq proves it.
+      shipped(run_dir, 2)
+    end
+
+    test "a refusal of a MALFORMED redelivery is not a withdrawal of this runner's accept", ctx do
+      # A dispatch that fails contract validation never reaches the accept path at all: it is
+      # refused with the claim_epoch echoed straight out of the payload just rejected as invalid.
+      # Reading any pending refusal for that dispatch_id as a withdrawal therefore destroyed a
+      # healthy run's trace on a redelivery loopctl mangled — the same permanent loss, reached
+      # from the other side. The runner's accept stands; loopctl records it and answers the later
+      # refusal already_replied.
+      run_id = ctx.run_id
+      TestLoopctl.put(:dispatch_reply_replies, [:none, :none])
+      TestLoopctl.put(:trace_replies, [{:error, %{reason: "dispatch_not_accepted"}}])
+      run_dir = dispatched_run(ctx, [], %{}, "malformed-redelivery-run")
+      {_pid, topic} = joined_shipping_control(ctx)
+
+      pending_dispatch(topic, this_run(4), "accepted")
+      # Same dispatch, same epoch, one required field gone.
+      assert %{"claim_epoch" => 4} =
+               pending_dispatch(topic, Map.delete(this_run(4), "repo"), "refused")
+
+      trace_events(ctx, run_dir, 0..2)
+      assert_receive {:test_loopctl, {:trace, %{"run_id" => ^run_id}}}, 5_000
+      shipped(run_dir, 2)
+    end
+
+    test "a LATE redelivery at an older epoch does not undo a supersession already recorded",
+         ctx do
+      # The newest epoch seen is what says how far the claim has moved, and redeliveries are not
+      # ordered: a queued epoch-3 copy arriving after the epoch-6 refusal must not overwrite it.
+      # Without that, the run whose claim genuinely moved goes back to polling for ever — and no
+      # other test can catch it, because storing an OLDER epoch is absorbed by the comparison in
+      # accept_outstanding?/3 either way.
+      TestLoopctl.put(:dispatch_reply_replies, [:none, :none, :none])
+      TestLoopctl.put(:trace_replies, [{:error, %{reason: "dispatch_not_accepted"}}])
+      run_dir = dispatched_run(ctx, [], %{}, "late-older-redelivery-run")
+      {_pid, topic} = joined_shipping_control(ctx)
+
+      pending_dispatch(topic, this_run(4), "accepted")
+      assert %{"claim_epoch" => 6} = pending_dispatch(topic, this_run(6), "refused")
+      # Late, and older than the supersession already recorded.
+      assert %{"claim_epoch" => 3} = pending_dispatch(topic, this_run(3), "refused")
+
+      trace_events(ctx, run_dir, 0..2)
+      abandoned(run_dir, "dispatch_not_accepted")
     end
 
     test "a dispatch that is not this runner's is given up at once", ctx do

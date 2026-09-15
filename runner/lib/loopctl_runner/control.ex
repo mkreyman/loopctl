@@ -308,6 +308,13 @@ defmodule LoopctlRunner.Control do
             # dispatch_id => claim_epoch for every dispatch this process started a run for, so
             # a repeat of one is never run twice.
             started_dispatches: started_dispatches(config.runs_dir),
+            # In memory, for the life of this PROCESS — `mark_unjoined/2` does not clear it, and
+            # that is deliberate rather than an oversight: a superseded ledger row stays
+            # superseded, so the fact does not expire with a connection, and forgetting it on a
+            # rejoin would send this runner back to polling a row nothing will move. It is dropped
+            # per dispatch when that dispatch's trace is settled, which is the last moment anything
+            # asks about it.
+            superseded_dispatches: %{},
             # dispatch_id => %{dispatch, story, opts}: accepted, waiting for loopctl to record it.
             pending_starts: %{},
             # The registered name runs report to, so they reach a successor of this process.
@@ -1106,7 +1113,28 @@ defmodule LoopctlRunner.Control do
           "dispatch #{id} was already started here at claim_epoch #{started_epoch}; refusing it"
         )
 
-        refuse_dispatch(socket, dispatch, %{
+        # THE signal that a claim moved, recorded where it happens rather than inferred later from
+        # whatever replies happen to be pending. A NEWER epoch for a dispatch this runner already
+        # started means loopctl reclaimed the story, so the ledger row for the epoch the run holds
+        # is superseded and no accept will ever move it. An older one says nothing.
+        #
+        # This is also the first moment the runner knows a session it is RUNNING has lost its
+        # claim: every stage report that session makes will be refused stale, and its work will
+        # not be taken. It is logged at error rather than acted on — ending a live session on a
+        # reclaim is loopctl's call to make and there is no accept path for it to travel yet, and
+        # a runner that killed sessions on its own reading of an epoch would be the more dangerous
+        # mistake of the two.
+        if epoch > started_epoch do
+          Logger.error(
+            "dispatch #{id} was reclaimed at claim_epoch #{epoch} while this runner holds it at " <>
+              "#{started_epoch}; a session may still be running for a claim that has moved",
+            dispatch_id: id
+          )
+        end
+
+        socket
+        |> note_superseded(id, epoch, started_epoch)
+        |> refuse_dispatch(dispatch, %{
           "reason" => "other",
           "detail" => "this runner already started dispatch #{id} at claim_epoch #{started_epoch}"
         })
@@ -2111,7 +2139,9 @@ defmodule LoopctlRunner.Control do
           )
       end
 
-      assign(socket,
+      socket
+      |> forget_superseded(run.dispatch_id)
+      |> assign(
         trace_settled: Map.put(socket.assigns.trace_settled, run.run_id, {:done, trace_bytes})
       )
     else
@@ -2134,7 +2164,17 @@ defmodule LoopctlRunner.Control do
       )
     end
 
-    assign(socket, trace_settled: Map.put(socket.assigns.trace_settled, run.run_id, :abandoned))
+    socket
+    |> forget_superseded(run.dispatch_id)
+    |> assign(trace_settled: Map.put(socket.assigns.trace_settled, run.run_id, :abandoned))
+  end
+
+  # Nothing else removes an entry — unlike `started_dispatches`, this map is never rebuilt from
+  # disk, so on a long-lived connection across many reclaims it would only grow. A settled trace
+  # is the last thing that asks about it.
+  defp forget_superseded(socket, dispatch_id) do
+    seen = Map.delete(socket.assigns.superseded_dispatches, dispatch_id)
+    assign(socket, superseded_dispatches: seen)
   end
 
   @doc """
@@ -2319,7 +2359,7 @@ defmodule LoopctlRunner.Control do
   # across a rejoin) it is that reply the trace is waiting on: wait a poll and try again. With no
   # accept outstanding it is terminal: the dispatch was refused, or its accept was lost.
   defp trace_refused(socket, %{run: run}, %{"reason" => "dispatch_not_accepted"} = refusal) do
-    if accept_outstanding?(socket, run.dispatch_id) do
+    if accept_outstanding?(socket, run.dispatch_id, run.claim_epoch) do
       Logger.info(
         "trace waits for this runner's accept of the dispatch to be recorded",
         trace_ids(run)
@@ -2368,14 +2408,50 @@ defmodule LoopctlRunner.Control do
 
   defp trace_refused(socket, push, refusal), do: trace_unexpected(socket, push, {:error, refusal})
 
-  defp accept_outstanding?(socket, dispatch_id) do
+  # The refusal means the ledger row is not `accepted`, and only ONE of the states that covers is
+  # worth retrying: `sent`, where the accept this runner pushed has not landed yet. `refused` and
+  # `superseded` are final and no later accept moves them. loopctl publishes the condition as
+  # `x-connection.permanent_error_conditions`; this is that condition read against the only
+  # evidence this runner has.
+  #
+  # Two earlier versions of this guard inferred that evidence from the REPLIES pending for the
+  # same dispatch_id, and both were wrong in the same expensive direction — they abandoned the
+  # trace of a live run, permanently, because `TraceShip` never revisits a run it gave up on:
+  #
+  #   * comparing the ACCEPT's epoch to the run's can never be false, since an accept is only ever
+  #     pushed at the epoch its run started from;
+  #   * counting any pending REFUSAL for that dispatch as a withdrawal catches refusals that say
+  #     nothing about this accept — a malformed re-delivery is refused with the `claim_epoch`
+  #     echoed straight out of the payload the runner just rejected as invalid, and a policy
+  #     refusal from before the run started is still queued behind the reply rate limit.
+  #
+  # So the claim moving is RECORDED where it is observed — `note_superseded/4`, on the one branch
+  # that means it — instead of being pattern-matched out of a mailbox. There is no same-epoch case
+  # to detect: after an accept, a re-dispatch at that same epoch is answered with another accept
+  # (`handle_dispatch/2`), never a refusal.
+  defp accept_outstanding?(socket, dispatch_id, claim_epoch) do
     a = socket.assigns
-    replies = Map.values(a.dispatch_replies) ++ a.reply_backlog
 
-    Enum.any?(replies, fn {payload, _story_id, _carried?} ->
-      payload["dispatch_id"] == dispatch_id and payload["decision"] == "accepted"
-    end)
+    accepted? =
+      Enum.any?(Map.values(a.dispatch_replies) ++ a.reply_backlog, fn {payload, _id, _carried?} ->
+        payload["dispatch_id"] == dispatch_id and payload["decision"] == "accepted"
+      end)
+
+    accepted? and Map.get(a.superseded_dispatches, dispatch_id, claim_epoch) <= claim_epoch
   end
+
+  # `put`, and the GUARD is what makes that safe. Every entry this can store is already newer than
+  # the epoch the run holds, and the predicate only asks whether ANY stored epoch exceeds it, so
+  # which of two newer epochs wins cannot change an answer. Folding with `max` here — the shape
+  # `started_dispatches/1` uses, and the obvious defensive move — would be strictly worse: it
+  # would ALSO absorb an older epoch if the guard ever stopped rejecting one, which is exactly the
+  # defect the guard exists to prevent, and it would hide it from every test that could catch it.
+  defp note_superseded(socket, id, epoch, started_epoch) when epoch > started_epoch do
+    seen = Map.put(socket.assigns.superseded_dispatches, id, epoch)
+    Slipstream.Socket.assign(socket, superseded_dispatches: seen)
+  end
+
+  defp note_superseded(socket, _id, _epoch, _started_epoch), do: socket
 
   defp narrow_or_escalate(
          socket,
