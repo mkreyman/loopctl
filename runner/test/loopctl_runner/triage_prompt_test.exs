@@ -365,4 +365,83 @@ defmodule LoopctlRunner.TriagePromptTest do
       refute prompt =~ "The report follows"
     end
   end
+
+  test "the verdict prompt spells the codes bare, and binds the one with a fixed outcome" do
+    prompt = build()
+
+    # Spelled out LITERALLY, never taken from TriagePrompt.reason_codes/0: comparing the prompt
+    # against the same constant it was built from passes under any rename, including a rename that
+    # stops the loop's gate matching. These three strings are Gate A's, and only an exact match
+    # fires it.
+    for code <- ~w(workflow_change_not_defect_fix inverts_or_removes_deliberate_behaviour
+                   already_implemented_at_head) do
+      # The BULLET, which is the form shown as an entry — not merely the code somewhere in the
+      # prompt, which the counter-example would satisfy on its own.
+      assert prompt =~ "- " <> code <> " —"
+      # And nothing wears backticks, including the counter-example that warns against them.
+      refute prompt =~ "`" <> code
+      refute prompt =~ code <> "`"
+    end
+
+    codes = TriagePrompt.reason_codes()
+
+    assert codes.gating ==
+             ~w(workflow_change_not_defect_fix inverts_or_removes_deliberate_behaviour)
+
+    assert codes.soft == ["already_implemented_at_head"]
+
+    assert prompt =~ "compares entries WHOLE"
+    assert prompt =~ "never coin one"
+    assert prompt =~ "keeps that rate at zero"
+  end
+
+  test "the session is given the rules that DECIDE an outcome, not a pointer to the lenses'" do
+    # The session states the one verdict, so a rule that lives only in a lens prompt cannot reach
+    # the party that acts on it. Both of these did: the session was told to emit the workflow code
+    # when a test it had never been shown answered WORKFLOW CHANGE, and nothing bound
+    # already_implemented_at_head to escalate — so a session could carry the code and still reject.
+    prompt = build()
+
+    assert prompt =~ "Does the CURRENT behaviour match what the system was built to do?"
+    # The codes are not conditional on the outcome; the human-facing sentences are. A session that
+    # reads "meaningful on escalate" and leaves them empty on a `story` hides the one signal that
+    # would stop a workflow change being queued to an unattended agent.
+    assert prompt =~ "go in on EVERY outcome, `story` and `reject` included"
+    assert prompt =~ "never attempted at all is a workflow change"
+    assert prompt =~ "The request may already be satisfied at HEAD"
+    assert prompt =~ "NOT `reject`, and NOT `story`"
+    # The binding itself: the code and the outcome named in the same rule.
+    assert prompt =~ ~r/the outcome is\s+`escalate`, and already_implemented_at_head/
+  end
+
+  test "nothing tells a session its lenses will report when it dispatches none" do
+    # readings/2 exists because an instruction to dispatch, given to a session with no Agent tool,
+    # is denied silently and burns turns. The implement launcher is that session and is the only
+    # wired one today, so a rule that mentions lenses unconditionally routes around the guard.
+    without = build()
+    refute without =~ "lenses you dispatch"
+    refute without =~ "carry it through"
+    assert without =~ "yourself"
+
+    with_lenses = build_with_lenses()
+    assert with_lenses =~ "lenses you dispatch apply this same test"
+    assert with_lenses =~ "carry it through into `escalation_reasons`"
+  end
+
+  test "the reasons cap is the contract's, and the prompt says codes go in first" do
+    # escalation_reasons is capped at maxItems, and Contract enforces it — so a verdict with every
+    # code plus a reason per finding is REFUSED whole, not truncated. Without a precedence rule the
+    # session either burns turns re-stating it or drops a code to fit, and dropping the code is the
+    # silent failure.
+    max =
+      LoopctlRunner.Contract.schema_def("RunnerTriageVerdict")
+      |> get_in(["properties", "escalation_reasons", "maxItems"])
+
+    prompt = build()
+    # NOT "at most N entries": bounds() already renders that for three different fields, so the
+    # assertion passed with the whole cap clause deleted and no value of maxItems could redden it.
+    assert prompt =~ ~r/entries in total and the whole verdict is\s+refused if it holds more/
+    assert prompt =~ ~r/EVERY code that\s+applies goes in FIRST/
+    assert prompt =~ "#{max} entries in total"
+  end
 end

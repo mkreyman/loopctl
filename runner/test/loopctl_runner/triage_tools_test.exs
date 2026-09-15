@@ -144,6 +144,45 @@ defmodule LoopctlRunner.TriageToolsTest do
 
       prompt = lens["prompt"]
 
+      # The gate compares entries WHOLE, so the codes are spelled here exactly or they never fire.
+      # A lens reports them and the session carries them into the verdict; that split is this
+      # repo's, because a lens here does not state a verdict at all.
+      assert prompt =~ "workflow_change_not_defect_fix", "#{name}: the workflow gating code"
+      assert prompt =~ "inverts_or_removes_deliberate_behaviour", "#{name}: the inverts code"
+      assert prompt =~ "already_implemented_at_head", "#{name}: the already-satisfied code"
+      assert prompt =~ "never invent one", "#{name}"
+      # BARE: a code in backticks is a different string to a whole-entry match.
+      assert prompt =~ "WRITE THE CODE BARE", "#{name}"
+
+      for code <- ~w(workflow_change_not_defect_fix inverts_or_removes_deliberate_behaviour
+                     already_implemented_at_head) do
+        refute prompt =~ "`" <> code, "#{name}: #{code} shown wrapped"
+        refute prompt =~ code <> "`", "#{name}: #{code} shown wrapped"
+      end
+
+      # And a lens still states no verdict, in any wording: "the verdict should escalate" is
+      # stating one, and it would make the lenses disagreeing unrepresentable.
+      refute prompt =~ "verdict should", "#{name}"
+      # Nor by deciding what the outcome is NOT: that rule is whole in the session's prompt, and
+      # half of it here is a lens judging an outcome in the one place it must not.
+      refute prompt =~ "It is not a reject", "#{name}"
+
+      # The operational test is carried in ITS OWN WORDS: the measurement that justifies it is a
+      # measurement of these words, so a paraphrase is a different rule with borrowed evidence.
+      assert prompt =~ "Does the CURRENT behaviour match what the system was built to do?",
+             "#{name}"
+
+      assert prompt =~
+               "A request for something the system never attempted at all is a workflow change.",
+             "#{name}"
+
+      refute prompt =~ ~r/\S  +\S/, "#{name}: the quote carries line-join padding"
+
+      # And the four outcomes of reading the code, which is what stops every ordinary defect
+      # being filed as already-implemented.
+      assert prompt =~ "The read has exactly four outcomes", "#{name}"
+      assert prompt =~ "SETTLES the claim", "#{name}"
+
       # No lens states the verdict: "the lenses disagree" has to stay representable.
       assert prompt =~ "do NOT state the verdict", "#{name}"
       assert prompt =~ "disagree", "#{name}"

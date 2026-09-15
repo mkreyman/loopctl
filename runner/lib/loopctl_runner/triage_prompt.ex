@@ -31,6 +31,42 @@ defmodule LoopctlRunner.TriagePrompt do
   @story_required @verdict_props |> Map.fetch!("story") |> Map.fetch!("required")
   @contradicts_item @verdict_props |> Map.fetch!("contradicts") |> Map.fetch!("items")
 
+  # Transcribed from `Loopctl.DeliveryGates.GateA`, whose @gating_codes map is keyed by the first
+  # two of these as whole strings (`Map.has_key?`), with every other code collected as a soft
+  # signal — which is where the third sits, recorded and never gating.
+  #
+  # WHAT THIS DOES NOT DO TODAY, stated because the opposite is the easy thing to assume: a
+  # `triage_verdict` message does NOT reach that gate. Gate A's input is a trio_outputs fact from
+  # the INTERACTIVE trio, and the wire path reads `outcome` alone — loopctl records
+  # `escalation_reasons` verbatim and matches nothing in it (loopctl-54, 2026-09-15). So nothing
+  # here is silently failing to gate right now; these codes are carried for the day a runner's
+  # verdict is what feeds Gate A, which is the whole point of the trio running unattended.
+  #
+  # On that day a reworded code stops the gate firing with nothing to notice — the 1.9.0 envelope
+  # failure again — so the vocabulary is being PUBLISHED in contract 1.9.3 as its own list in
+  # x-connection, deliberately not as an enum on the field, since escalation_reasons also carries
+  # the prose that makes an escalation actionable. When it lands, these three come from the
+  # vendored file and this comment goes with them.
+  @workflow_code "workflow_change_not_defect_fix"
+  @inverts_code "inverts_or_removes_deliberate_behaviour"
+  @already_code "already_implemented_at_head"
+
+  @max_reasons Contract.schema_def("RunnerTriageVerdict")
+               |> get_in(["properties", "escalation_reasons", "maxItems"]) ||
+                 raise("the vendored contract publishes no maxItems for escalation_reasons")
+
+  defp max_reasons, do: @max_reasons
+
+  @doc """
+  The codes a verdict spells exactly and bare, because the loop compares entries WHOLE.
+
+  Two of them GATE — `#{@workflow_code}` and `#{@inverts_code}` — and `#{@already_code}` is
+  recorded as a soft signal until its measured rate earns it a place among them. All three are
+  spelled the same way for the same reason; only their effect differs.
+  """
+  @spec reason_codes() :: %{gating: [String.t()], soft: [String.t()]}
+  def reason_codes, do: %{gating: [@workflow_code, @inverts_code], soft: [@already_code]}
+
   @doc """
   The prompt for `triage`, a `RunnerTriage` object, in the repository checked out at `repo`.
   """
@@ -81,7 +117,15 @@ defmodule LoopctlRunner.TriagePrompt do
     - `missing_information` is what a human would have to supply. An `escalate` that does not
       say what is missing sends someone back to the start of your own reading.
     - `escalation_reasons` is YOUR reason a human is needed, not loopctl's detector output below.
-      Meaningful on `escalate`.
+      It carries TWO different things, and only one of them depends on your outcome. The CODES
+      named under "The three codes" below go in on EVERY outcome, `story` and `reject` included —
+      a workflow change queued as a story with no code is the one thing the loop cannot see. The
+      plain sentences, one per reason, are what a human is needed FOR, and those are meaningful on
+      `escalate`. It holds at most #{max_reasons()} entries in total and the whole verdict is
+      refused if it holds more, never truncated, so when they will not all fit, EVERY code that
+      applies goes in FIRST and the sentences take what is left. A code is what the loop can act
+      on; a sentence is what a person reads, and a person can read the rest in
+      `missing_information` and `evidence`.
     - `contradicts` is a list of OBJECTS, not sentences: #{contradicts_shape()}. Use it for what
       this report disagrees with. A duplicate is NOT a contradiction.
     - `duplicate_of` is the UUID of an existing story this report already describes — a uuid, not
@@ -91,6 +135,59 @@ defmodule LoopctlRunner.TriagePrompt do
       contract's way: 6 bytes per character, 12 for one outside the Basic Multilingual Plane. An
       emoji therefore costs double, and every field at its maximum is already close to the cap, so
       keep the draft story to what it needs.
+
+    ## The three codes
+
+    Write each one BARE as its own entry: no backticks, no quotes, nothing before or after it. The
+    loop compares entries WHOLE, so an entry reading
+
+        #{@workflow_code} - the form never printed this
+
+    is a different string, is recorded as ordinary prose, and is acted on by nothing. Put the
+    sentence that explains it in an entry of its own. Never reword one and never coin one: an
+    invented code is prose, which is the same as saying nothing.
+
+    - #{@workflow_code} — the operational test below answered WORKFLOW CHANGE. Whatever your
+      outcome is.
+    - #{@inverts_code} — the request inverts or removes behaviour a previous story deliberately
+      added. Whatever your outcome is.
+    - #{@already_code} — the code already does, correctly, what is being asked. See the rule
+      below, which fixes the outcome. It is not gating today and you emit it every time it applies
+      anyway: the rate at which it fires is what decides whether it earns a gating place, and
+      dropping it as pointless is the one thing that keeps that rate at zero.
+
+    ## Defect fix or workflow change — the operational test
+
+    Apply this test, in these words. It is not a matter of taste and it is not yours to reword:
+
+    > Does the CURRENT behaviour match what the system was built to do? If the system is doing what
+    > it intends and the request wants that intent CHANGED, it is a workflow change. If the system
+    > is deviating from its own intent and the request wants it corrected, it is a defect fix. A
+    > request for something the system never attempted at all is a workflow change. A different
+    > default, a different order of operations, or a new step is a workflow change even when filed
+    > as a bug. A wrong value, a crash, a missing save, or a screen showing other than what it was
+    > built to show is a defect fix even when filed as a feature.
+
+    The title a reporter chose is not evidence — neither a [Bug] prefix nor a [Feature] one.#{lens_note(lenses)}
+
+    ## The request may already be satisfied at HEAD — one answer, not three
+
+    When the code shows that what the request asks for already exists — the module, the template,
+    the migration, a regression test, sometimes the ticket number in a moduledoc — the outcome is
+    `escalate`, and #{@already_code} goes in `escalation_reasons` as its own bare entry. The
+    sentence naming what was read is a separate entry beside it.
+
+    NOT `reject`, and NOT `story`. This is fixed, not a judgement call:
+
+    - `reject` means not actionable AT ALL. An already-shipped request is highly actionable — by a
+      person, in one message to the reporter — so rejecting it drops a real conversation.
+    - `story` would queue an unattended agent to build a thing that already exists.
+    - The reporter is usually not wrong. They are on a deployed version, this checkout is master,
+      and the two are not the same system; or they mean a VARIANT that was never built. Nothing in
+      this repository can tell those apart, which is precisely why a person has to.
+
+    That single case was 19 of the 21 lens disagreements measured across 26 real intake tickets,
+    and it is the largest source by an order of magnitude.
 
     Escalating is the `escalate` OUTCOME, stated in this verdict, and NOT `loop-escalate`. A
     report you cannot judge is work you CAN do, and its answer is a verdict. `loop-escalate` is
@@ -119,6 +216,18 @@ defmodule LoopctlRunner.TriagePrompt do
   # the Agent tool and without definitions — the implement launcher, which is the only wired one
   # today — must not be told to dispatch: the call would be denied silently under dontAsk and the
   # run would burn its turns on an instruction the harness refuses.
+  # Anything that says "your lenses" is FALSE on the branch that dispatches none — which is the
+  # only wired one today, since the implement launcher has no Agent tool. `readings/2` exists for
+  # exactly that reason: an instruction to dispatch, given to a session that cannot, is denied
+  # silently and burns turns. A rule added later must not route around it.
+  defp lens_note([]), do: ""
+
+  defp lens_note(_lenses),
+    do:
+      " The lenses you dispatch apply this same test in these same words and report the answer" <>
+        " to you; a lens reporting one of these codes is reporting a FACT it established, so" <>
+        " carry it through into `escalation_reasons` exactly as it wrote it."
+
   defp readings(lenses, report?)
 
   defp readings([], _report?) do
