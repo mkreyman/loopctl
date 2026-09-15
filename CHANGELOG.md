@@ -59,6 +59,25 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **An accepted triage verdict writes the story and QUEUES it (#803).** This is the join the
+  loop was missing: `Loopctl.Delivery.TriageVerdict`'s `story` route was empty, so an accepted
+  verdict left the story at `triaged` — and nothing in `lib/` wrote `triaged -> queued`, while
+  the dispatch driver selects stage rows at `queued`. The loop therefore had no continuation
+  at all: intake promoted a story, triage accepted it, and it stopped one stage short of the
+  only thing that could pick it up. An accepted verdict now replaces the stub row
+  (`TriageTrigger` writes loopctl's own facts — a repository and an issue number — precisely
+  so the reporter's title never wears a story's clothes, and its comment already said "triage
+  replaces this with the drafted title") with the drafted title, description and acceptance
+  criteria, and then advances to `queued`.
+
+  **Every drafted string is sanitised first** (`Loopctl.Delivery.Untrusted.sanitise/1`, new):
+  bidirectional overrides, zero-width characters, Unicode TAG runs and controls become visible
+  `<U+XXXX>` escapes, because a drafted title is composed by a session that has just read
+  reporter text and lands in a field a runner builds its prompt from. Ordinary prose is NOT
+  touched — a draft saying "ignore previous instructions" is stored verbatim, since that is a
+  semantic attack for the triage trio to catch and mangling prose would corrupt real stories.
+  An escalation or a rejection drafts nothing.
+
 - **The unattended dispatch driver, OFF by default (#803).** `Loopctl.Delivery.DispatchDriver`
   plus `Loopctl.Workers.DispatchDriverWorker`, scheduled every minute: it selects stage rows at
   `queued` fleet-wide, oldest first and bounded per pass, picks a runner of that tenant that is

@@ -29,7 +29,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
 
   | `outcome` | transitions | what the reporter is told |
   |---|---|---|
-  | `story` | `detected -> triaged` | nothing yet; the story goes on to be built |
+  | `story` | `detected -> triaged`, `triaged -> queued` | nothing yet; the story goes on to be built |
   | `escalate` | `detected -> triaged`, `triaged -> escalated` | nothing — a human is now looking |
   | `reject` | `detected -> triaged`, `triaged -> failed` | no change was needed, and why (`:not_actionable`) |
 
@@ -38,6 +38,26 @@ defmodule Loopctl.Delivery.TriageVerdict do
   what earns `:not_actionable` — reaching `failed` from anywhere else (a budget exhaustion,
   say) tells the reporter nothing. A verdict that jumped straight to `failed` would lose the
   one edge that distinguishes "we looked and no change was needed" from "this died".
+
+  ## An ACCEPTED verdict writes the drafted story and QUEUES it
+
+  `story` is the outcome that continues the loop, and until it took `{:triaged, :queued}` the
+  loop had no continuation at all: `Loopctl.Delivery.DispatchDriver` selects stage rows at
+  `queued`, nothing else in `lib/` writes that edge, and an accepted story therefore stopped
+  at `triaged` where no production code could reach it. The table below said "the story goes
+  on to be built" and nothing built it.
+
+  Two writes, in this order, and the order is the recoverable one:
+
+  1. the drafted `title`, `description` and `acceptance_criteria` replace the STUB row
+     `Loopctl.Delivery.TriageTrigger` created — that module says so itself ("triage replaces
+     this with the drafted title"), because its own title is loopctl's facts alone (a repo and
+     an issue number) and an implementer needs the story;
+  2. `triaged -> queued`.
+
+  A draft written with no queue advance is a story a later resend still queues. A queue
+  advance with no draft is a story a runner picks up carrying a stub title and no acceptance
+  criteria — work dispatched against nothing. So the draft goes first.
 
   ## The verdict is UNTRUSTED and this module does not change that
 
@@ -51,11 +71,14 @@ defmodule Loopctl.Delivery.TriageVerdict do
 
   import Ecto.Query
 
+  alias Loopctl.Audit
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.TriageVerdictRecord
+  alias Loopctl.Delivery.Untrusted
   alias Loopctl.Repo
   alias Loopctl.Runners.DispatchLedger
+  alias Loopctl.WorkBreakdown.Story
 
   @type outcome :: String.t()
   @type transition :: {StageMachine.stage(), StageMachine.stage(), StageMachine.edge()}
@@ -64,8 +87,12 @@ defmodule Loopctl.Delivery.TriageVerdict do
   # intermediate `triaged` is load-bearing rather than bookkeeping.
   @triaged {:detected, :triaged, :forward}
 
+  # Attribution for the drafted-story write. Not the runner's own label: the runner supplied a
+  # judgement, and writing it into the row is control's act, exactly as the transition is.
+  @draft_actor "control:triage_draft"
+
   @routes %{
-    "story" => [],
+    "story" => [{:triaged, :queued, :forward}],
     "escalate" => [{:triaged, :escalated, :triage_escalate}],
     "reject" => [{:triaged, :failed, :triage_reject}]
   }
@@ -108,12 +135,22 @@ defmodule Loopctl.Delivery.TriageVerdict do
   `escalate` and `reject` both terminate this loop's automatic handling; `story` is the only
   one that continues. Named rather than derived at each call site because "did triage finish
   the work" is asked in more than one place and inverting it by hand is how the two drift.
+
+  READ OFF THE DESTINATION, not off the number of transitions. It used to be
+  `length(transitions) > 1`, which was true of exactly the two terminal outcomes while `story`
+  took one transition — a proxy that inverted the day `story` gained its second, and it did:
+  an accepted verdict now also takes `triaged -> queued`, and this said the loop had finished
+  with the story it had just queued. The stage machine names the terminal stages; ask it.
   """
   @spec terminal?(outcome()) :: boolean()
   def terminal?(outcome) do
     case transitions_for(outcome) do
-      {:ok, transitions} -> length(transitions) > 1
-      {:error, _reason} -> false
+      {:ok, [_ | _] = transitions} ->
+        {_from, to, _edge} = List.last(transitions)
+        to in StageMachine.terminal_stages()
+
+      _no_transitions_or_unknown ->
+        false
     end
   end
 
@@ -213,7 +250,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
   # `stale_stage` on the first transition is the ordinary case — the story is already past
   # `detected`, so the work was done — and is a replay rather than a refusal.
   defp replay(tenant_id, runner_id, session, message, transitions, record) do
-    case advance_all(tenant_id, runner_id, session, message, transitions) do
+    case apply_verdict(tenant_id, runner_id, session, message, transitions) do
       :ok -> {:ok, %{record: record, replayed?: true}}
       {:error, :stale_stage} -> {:ok, %{record: record, replayed?: true}}
       {:error, reason} -> {:error, reason}
@@ -225,7 +262,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
   # holding no record to recognise — so the verdict could never be stored at all.
   defp fresh(tenant_id, runner_id, session, message, digest, transitions) do
     with {:ok, record} <- insert_record(tenant_id, session, message, digest),
-         :ok <- advance_all(tenant_id, runner_id, session, message, transitions) do
+         :ok <- apply_verdict(tenant_id, runner_id, session, message, transitions) do
       {:ok, %{record: record, replayed?: false}}
     else
       # The unique index racing another delivery of the SAME verdict — a rejoin whose old
@@ -315,6 +352,91 @@ defmodule Loopctl.Delivery.TriageVerdict do
 
   defp stringify(list) when is_list(list), do: Enum.map(list, &stringify/1)
   defp stringify(value), do: value
+
+  # THE DRAFT BEFORE THE TRANSITIONS, for the reason the moduledoc gives: a story that reaches
+  # `queued` carrying the stub row is work dispatched against a repository name and an issue
+  # number, while a draft with no advance is simply queued by the next resend.
+  #
+  # Idempotent by construction — it writes the same values from the same recorded verdict — so
+  # the replay path runs it too rather than assuming the first attempt got that far.
+  defp apply_verdict(tenant_id, runner_id, session, message, transitions) do
+    with :ok <- apply_draft(tenant_id, session, message) do
+      advance_all(tenant_id, runner_id, session, message, transitions)
+    end
+  end
+
+  # Only an accepted verdict drafts a story. An escalation or a rejection leaves the stub row
+  # exactly as it is: nobody is going to implement it, and the reporter's own words are in the
+  # intake record where a human reads them fenced.
+  # ON `Loopctl.Repo` UNDER `with_tenant/2`, like every other read and write this module makes
+  # and unlike `Loopctl.WorkBreakdown.Stories`, which is an `AdminRepo` context. The story is
+  # tenant-scoped content, so RLS plus an explicit predicate is the convention for touching it
+  # — and it keeps the draft on the SAME connection as the transitions that follow it, rather
+  # than splitting one verdict's effects across two pools.
+  defp apply_draft(tenant_id, session, %{verdict: %{outcome: "story", story: %{} = draft}}) do
+    in_tenant(tenant_id, fn ->
+      case Repo.one(
+             from s in Story, where: s.id == ^session.story_id and s.tenant_id == ^tenant_id
+           ) do
+        nil -> {:error, :unknown_story_stage}
+        story -> write_draft(tenant_id, story, draft)
+      end
+    end)
+  end
+
+  # `cast_triage_verdict/1` requires `story` when the outcome is `story` (its `story_pairing`
+  # rule), so this clause is unreachable through the channel. It is here because the
+  # alternative — falling through to the no-op below — would QUEUE the stub row: a runner
+  # would be sent a story whose title is a repository name and an issue number, with no
+  # acceptance criteria, which is work dispatched against nothing.
+  defp apply_draft(_tenant_id, _session, %{verdict: %{outcome: "story"}}),
+    do: {:error, {:invalid, ["story is required when outcome is story"]}}
+
+  defp apply_draft(_tenant_id, _session, _message), do: :ok
+
+  defp write_draft(tenant_id, story, draft) do
+    attrs = %{
+      title: Untrusted.sanitise(Map.get(draft, :title)),
+      description: Untrusted.sanitise(Map.get(draft, :description)),
+      acceptance_criteria: drafted_criteria(draft)
+    }
+
+    case story |> Story.update_changeset(attrs) |> Repo.update() do
+      {:ok, updated} -> log_draft(tenant_id, updated)
+      {:error, %Ecto.Changeset{}} -> {:error, :story_draft_invalid}
+    end
+  end
+
+  # The content change is recorded like any other story update. NOT chained: the chain already
+  # carries the transitions this draft precedes, and the verdict itself is stored whole in
+  # `triage_verdicts` — this is the ordinary audit row that says a title stopped being
+  # loopctl's stub and became the trio's draft, attributed to control rather than the runner.
+  defp log_draft(tenant_id, story) do
+    Audit.create_log_entry(tenant_id, %{
+      entity_type: "story",
+      entity_id: story.id,
+      action: "story_drafted_by_triage",
+      actor_type: "system",
+      actor_label: @draft_actor,
+      metadata: %{"criteria_count" => length(story.acceptance_criteria)}
+    })
+
+    :ok
+  end
+
+  # The wire carries plain strings; the column carries the `{id, description}` maps every
+  # other producer of a story writes, and `ImplementerInput.story_object/2` reads back. Ids
+  # are positional and loopctl's own, because the draft supplies none — and a criterion with
+  # an id it chose itself would be a reporter-shaped string in a field the loop reasons about.
+  defp drafted_criteria(%{acceptance_criteria: criteria}) when is_list(criteria) do
+    criteria
+    |> Enum.with_index(1)
+    |> Enum.map(fn {text, index} ->
+      %{"id" => "AC-#{index}", "description" => Untrusted.sanitise(text)}
+    end)
+  end
+
+  defp drafted_criteria(_draft), do: []
 
   defp advance_all(_tenant_id, _runner_id, _session, _message, []), do: :ok
 

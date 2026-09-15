@@ -120,11 +120,33 @@ defmodule Loopctl.Delivery.Untrusted do
 
   def neutralise(text) when is_binary(text) do
     text
+    |> sanitise()
+    |> String.split("\n")
+    |> Enum.map_join("\n", &(@line_prefix <> &1))
+  end
+
+  @doc """
+  The ESCAPING half alone — no fence, no line prefix — for text that is STORED rather than
+  rendered into a prompt (#803 §4).
+
+  A triage session drafts a story from reporter text, and those fields become a `stories` row
+  that a runner composes its prompt from. The fence is meaningless there (a title is not a
+  block) but the character escaping is not: a bidirectional override or a run of Unicode TAG
+  characters in a drafted title is invisible to every human who reads the story and arrives
+  intact in an implementer's prompt.
+
+  What it does NOT do is judge PROSE. "Ignore previous instructions" passes through verbatim,
+  because that is a semantic attack for the triage trio to catch and because mangling ordinary
+  words would corrupt legitimate stories. This removes only what cannot be seen.
+  """
+  @spec sanitise(String.t() | nil) :: String.t()
+  def sanitise(nil), do: ""
+
+  def sanitise(text) when is_binary(text) do
+    text
     |> String.replace_invalid("\uFFFD")
     |> String.replace("\r\n", "\n")
     |> escape()
-    |> String.split("\n")
-    |> Enum.map_join("\n", &(@line_prefix <> &1))
   end
 
   defp escape(text) do
