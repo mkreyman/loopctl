@@ -9,8 +9,28 @@ All notable changes to loopctl are documented here.
 - **Contract 1.10.0 — a `stage` refused `stale_stage` carries the ROW.** The refusal now
   answers with `stage`, `claim_epoch`, `lock_version`, `attempts` and `effects` beside the
   `reason` — the same shape the ok ack sends, from the same renderer
-  (`Loopctl.Delivery.RunnerStages.row_state/1`), so the two cannot drift. RE-VENDOR to pick up
-  the version, though nothing a 1.9.x runner does breaks: the fields are additive.
+  (`Loopctl.Delivery.RunnerStages.row_state/1`), so the two cannot drift. RE-VENDOR: a copy
+  taken at 1.9.3 has neither of the two new `x-connection` keys below, and the version string
+  is the only signal that it is missing them. Nothing a 1.9.x runner does breaks meanwhile —
+  the fields are additive.
+
+  **`x-connection.error_fields`** publishes what EVERY refusal carries beside its `reason`,
+  keyed by event then by code and COMPLETE: a code that carries nothing has an explicit `[]`,
+  so a lookup that finds nothing means the event or the code is not published rather than that
+  the refusal happens to be bare. It is keyed by event because `stale_stage` carries the row
+  on `stage` and nothing on `triage_verdict`, and because `rate_limited` carries the join
+  bucket's `max_joins`/`window_ms` on a join and a channel's `min_interval_ms` on a message —
+  a runner backing off on the wrong key sleeps on a number that is not there. Without it, the
+  whole of this release was learnable only by reading loopctl's source or by observing a
+  refusal in production.
+
+  **`x-connection.permanent_error_conditions` gains `stale_stage`**, which is transient for
+  `stage` in the ordinary case and PERMANENT when the stage the refusal names has no entry in
+  `stage_transitions` as its `from`. That is reachable rather than hypothetical: a session
+  calling `POST /stories/:id/escalate` with its own agent key moves its story to `escalated`
+  under the same `claim_epoch` while its run continues, so the runner's next ordinary report
+  is refused naming a terminal stage — and a runner following the transient/permanent split
+  alone would retry a message that can never succeed, for ever.
 
   The code's whole remedy, as the contract has prescribed since 1.4.0, is "re-read the story
   and send the transition that applies" — and `story_stages` has no runner-facing endpoint, by

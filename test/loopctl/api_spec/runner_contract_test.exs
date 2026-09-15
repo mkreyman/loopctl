@@ -37,7 +37,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   # The digest of the published document at the CURRENT version. Not a checksum of the file
   # for its own sake: it is what makes the version string mean something, per the test below.
-  @digest "fdd6c35e6f7d9cd7923a8134c0c1c2b84e031602f9db22d6af5a51dc13d54b18"
+  @digest "ff79aec9bc4bd9df33d5006bb971363cffa577a1095d370f02ea8e9e5c73f32e"
 
   describe "the checked-in export" do
     test "matches the declarations — run `mix loopctl.runner_contract` if this fails" do
@@ -91,6 +91,17 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       # Asserted against the ONE declaration both schemas read, never against a copy — a
       # literal here would let `RunnerJoin.kinds` and `RunnerDispatch.kind` drift apart while
       # this test stayed green, which is the failure `Kinds` exists to make impossible.
+      # 1.10.0: what each refusal carries beside its `reason`, per event and COMPLETE.
+      # Asserted against the declaration's own totality check rather than by listing it, and
+      # non-vacuously on the entry the release exists for.
+      assert RunnerContract.error_fields_complete?()
+      assert connection["error_fields"] == RunnerContract.error_fields()
+
+      assert connection["error_fields"]["stage"]["stale_stage"] ==
+               ~w(stage claim_epoch lock_version attempts effects)
+
+      assert connection["error_fields"]["triage_verdict"]["stale_stage"] == []
+
       assert connection["dispatchable_kinds"] == Kinds.dispatchable()
       assert connection["implied_kinds"] == Kinds.implied_by_silence()
 

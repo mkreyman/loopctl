@@ -1169,6 +1169,124 @@
     "dispatchable_kinds": [
       "implement"
     ],
+    "error_fields": {
+      "dispatch_reply": {
+        "already_replied": [],
+        "internal_error": [],
+        "invalid_payload": [
+          "details"
+        ],
+        "rate_limited": [
+          "min_interval_ms"
+        ],
+        "stale_claim_epoch": [],
+        "unknown_dispatch": []
+      },
+      "join": {
+        "forbidden_topic": [],
+        "invalid_payload": [
+          "details"
+        ],
+        "machine_mismatch": [
+          "declared"
+        ],
+        "not_authorized": [
+          "disconnecting"
+        ],
+        "rate_limited": [
+          "max_joins",
+          "window_ms"
+        ],
+        "unknown_topic": [],
+        "unsupported_contract_version": [
+          "sent",
+          "supported"
+        ]
+      },
+      "stage": {
+        "audit_chain_append_failed": [],
+        "dispatch_not_accepted": [],
+        "effect_conflict": [
+          "effects"
+        ],
+        "internal_error": [],
+        "invalid_payload": [
+          "details"
+        ],
+        "rate_limited": [
+          "min_interval_ms"
+        ],
+        "stale_claim_epoch": [],
+        "stale_stage": [
+          "stage",
+          "claim_epoch",
+          "lock_version",
+          "attempts",
+          "effects"
+        ],
+        "unknown_dispatch": [],
+        "unknown_story_stage": []
+      },
+      "status": {
+        "internal_error": [],
+        "invalid_payload": [
+          "details"
+        ],
+        "rate_limited": [
+          "min_interval_ms"
+        ]
+      },
+      "trace": {
+        "batch_too_large": [
+          "max_events",
+          "max_bytes"
+        ],
+        "dispatch_not_accepted": [],
+        "event_data_too_large": [
+          "seq",
+          "max_data_bytes",
+          "max_event_bytes"
+        ],
+        "internal_error": [],
+        "invalid_payload": [
+          "details"
+        ],
+        "rate_limited": [
+          "min_interval_ms"
+        ],
+        "run_mismatch": [],
+        "stale_claim_epoch": [],
+        "unknown_dispatch": []
+      },
+      "trace_cursor": {
+        "internal_error": [],
+        "invalid_payload": [
+          "details"
+        ],
+        "rate_limited": [
+          "min_interval_ms"
+        ]
+      },
+      "triage_verdict": {
+        "already_recorded": [],
+        "audit_chain_append_failed": [],
+        "dispatch_not_accepted": [],
+        "internal_error": [],
+        "invalid_payload": [
+          "details"
+        ],
+        "rate_limited": [
+          "min_interval_ms"
+        ],
+        "stale_claim_epoch": [],
+        "stale_stage": [],
+        "unknown_dispatch": [],
+        "unknown_story_stage": []
+      },
+      "unknown_event": {
+        "unknown_event": []
+      }
+    },
     "errors": {
       "dispatch_reply": [
         "rate_limited",
@@ -1383,7 +1501,8 @@
       }
     },
     "permanent_error_conditions": {
-      "dispatch_not_accepted": "Permanent unless an accept YOU sent for this dispatch is still unacknowledged. The refusal means the ledger row is not `accepted`, which covers `sent` (your accept has not landed yet - in flight, rate-limited, or carried across a rejoin, and the one case worth retrying), and `refused` and `superseded`, which are final and which no later accept can move. So retry, with backoff, only while an accept for this dispatch is outstanding AND you have not since refused it and its `claim_epoch` has not moved; otherwise give the run up, because nothing will move the row."
+      "dispatch_not_accepted": "Permanent unless an accept YOU sent for this dispatch is still unacknowledged. The refusal means the ledger row is not `accepted`, which covers `sent` (your accept has not landed yet - in flight, rate-limited, or carried across a rejoin, and the one case worth retrying), and `refused` and `superseded`, which are final and which no later accept can move. So retry, with backoff, only while an accept for this dispatch is outstanding AND you have not since refused it and its `claim_epoch` has not moved; otherwise give the run up, because nothing will move the row.",
+      "stale_stage": "Transient for `stage` in the ordinary case: the row moved, so read the row off this refusal and send the transition that applies from the `stage` it names. It is PERMANENT when no entry of `x-connection.stage_transitions` has that `stage` as its `from` - the story has reached a stage no runner can report out of, which a session reaches by escalating through the HTTP surface while its run continues. Stop, and end the run. For `triage_verdict` it is permanent unconditionally and carries no row: the story has left `detected` and the verdict's first transition can never match again."
     },
     "permanent_errors": {
       "*": [

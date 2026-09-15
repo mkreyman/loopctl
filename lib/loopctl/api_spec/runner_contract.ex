@@ -42,7 +42,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.9.1) `RunnerTriageVerdictMessage` and `RunnerTriageVerdictAck` are actually DEFINED. 1.9.0 named both in `x-connection` and published neither, so the envelope was unresolvable and a runner had to re-type it. RE-VENDOR: a copy taken at 1.9.0 is missing both, and the version string is the only signal that it is | | | | |
   | (1.9.2) a NULLABLE ENUM publishes `null` as a member. `incomplete` was typed `[string, null]` with an enum of five reasons, and under 2020-12 an enum constrains null too — so a runner validating a message against the published file could not SEND a real verdict beside `"incomplete": null`, while the mirror message validated. loopctl accepted both all along; the schema was what disagreed. Also publishes `x-connection.permanent_error_conditions`. RE-VENDOR to send both keys | | | | |
   | (1.9.3) `x-connection.triage_gating_reasons` publishes the `escalation_reasons` entries the control-side gate matches as whole strings, while the field itself stays free-form prose — and an escalate verdict must now carry at least one entry that is NOT a code, because a classification is not words a person can act on. RE-VENDOR: a copy taken at 1.9.2 has no such key to validate against | | | | |
-  | (1.10.0) a `stage` refused `stale_stage` carries the ROW — `stage`, `claim_epoch`, `lock_version`, `attempts`, `effects`, the same shape the ok ack sends. The remedy this code prescribes is to re-read the story and send the transition that applies, and there is no endpoint to read it from: the reply IS the read. A runner holding a `from` fallback list can delete it | | | | |
+  | (1.10.0) a `stage` refused `stale_stage` carries the ROW — `stage`, `claim_epoch`, `lock_version`, `attempts`, `effects`, the same shape the ok ack sends. The remedy this code prescribes is to re-read the story and send the transition that applies, and there is no endpoint to read it from: the reply IS the read. A runner holding a `from` fallback list can delete it. `x-connection.error_fields` publishes what EVERY refusal carries beside its `reason`, per event and complete, and `permanent_error_conditions` now names the one state in which `stale_stage` is permanent for `stage`. RE-VENDOR: a copy taken at 1.9.3 has neither key, and the version string is the only signal that it is missing them | | | | |
 
   ## The story object (since 1.5.0)
 
@@ -2018,6 +2018,13 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     # already has a verdict and the bytes just sent are NOT the same ones. An identical
     # resend is never refused — it is answered `ok` — so seeing this code means the two sides
     # disagree about what the session decided, which no retry can fix.
+    #
+    # `stale_stage` HERE CARRIES NO ROW, and that is the one asymmetry a runner writing a
+    # single handler for the code must know about (`x-connection.error_fields` says so per
+    # event, which is why that map is keyed by event). On `stage` the row is the remedy; here
+    # the story has left `detected`, the verdict's first transition can never match again, and
+    # the code is permanent — so handing back a row would suggest a retry this contract
+    # refuses.
     "triage_verdict" =>
       ~w(rate_limited invalid_payload unknown_dispatch dispatch_not_accepted stale_claim_epoch
          already_recorded unknown_story_stage stale_stage audit_chain_append_failed
@@ -2028,6 +2035,70 @@ defmodule Loopctl.ApiSpec.RunnerContract do
          machine_mismatch forbidden_topic unknown_topic),
     "unknown_event" => ~w(unknown_event)
   }
+
+  # WHAT EACH REFUSAL CARRIES BESIDE ITS `reason`, published rather than left in a moduledoc a
+  # vendoring runner never reads — the lesson 1.9.2 and 1.9.3 already paid for with
+  # `permanent_error_conditions` and `triage_gating_reasons`. A refusal's EXTRA FIELDS were
+  # the one part of this contract a holder could only learn by reading loopctl's source or by
+  # observing a refusal in production, and 1.10.0 is the release that makes that expensive:
+  # its whole point is that a `stale_stage` runner reads the row off the refusal instead of
+  # brute-forcing `from`, and a vendored copy said nothing about there being a row to read.
+  #
+  # COMPLETE, and per EVENT, with an explicit `[]` for every code that carries nothing. Both
+  # halves are deliberate. Per event, because `stale_stage` carries the row on `stage` and
+  # NOTHING on `triage_verdict` — the same code, two shapes, which a flat map cannot say and
+  # which is the same asymmetry `permanent_errors` already has to express. And explicit `[]`
+  # rather than absence, because a partial map is worse than none: a runner looking up a code
+  # it cannot find has no way to tell "carries nothing" from "nobody wrote this entry", and
+  # would reasonably assume the latter. `error_fields_complete?/0` is what keeps it total, and
+  # the contract test fails the moment a code is added to `@error_reasons` without one here.
+  #
+  # `rate_limited` is the reason this is keyed by event at all beyond `stale_stage`: on `join`
+  # it carries the join bucket's `max_joins`/`window_ms`, and on every message the channel's
+  # `min_interval_ms`. Same code, different fields, and a runner backing off on the wrong key
+  # sleeps for a number that is not there.
+  @error_field_overrides %{
+    "join" => %{
+      "rate_limited" => ~w(max_joins window_ms),
+      "not_authorized" => ~w(disconnecting),
+      "invalid_payload" => ~w(details),
+      "unsupported_contract_version" => ~w(sent supported),
+      "machine_mismatch" => ~w(declared)
+    },
+    "status" => %{"rate_limited" => ~w(min_interval_ms), "invalid_payload" => ~w(details)},
+    "dispatch_reply" => %{
+      "rate_limited" => ~w(min_interval_ms),
+      "invalid_payload" => ~w(details)
+    },
+    "trace" => %{
+      "rate_limited" => ~w(min_interval_ms),
+      "invalid_payload" => ~w(details),
+      "batch_too_large" => ~w(max_events max_bytes),
+      "event_data_too_large" => ~w(seq max_data_bytes max_event_bytes)
+    },
+    "trace_cursor" => %{
+      "rate_limited" => ~w(min_interval_ms),
+      "invalid_payload" => ~w(details)
+    },
+    "stage" => %{
+      "rate_limited" => ~w(min_interval_ms),
+      "invalid_payload" => ~w(details),
+      "effect_conflict" => ~w(effects),
+      # SINCE 1.10.0, and the reason for the release. The same shape the ok ack sends, so one
+      # parser serves both: the row this story's stage is actually at.
+      "stale_stage" => ~w(stage claim_epoch lock_version attempts effects)
+    },
+    "triage_verdict" => %{
+      "rate_limited" => ~w(min_interval_ms),
+      "invalid_payload" => ~w(details)
+    },
+    "unknown_event" => %{}
+  }
+
+  @error_fields Map.new(@error_reasons, fn {event, codes} ->
+                  overrides = Map.get(@error_field_overrides, event, %{})
+                  {event, Map.new(codes, &{&1, Map.get(overrides, &1, [])})}
+                end)
 
   # The runner-to-control events `LoopctlWeb.RunnerChannel.handle_in/3` acts on.
   @inbound_events ~w(status dispatch_reply trace trace_cursor stage triage_verdict)
@@ -2086,7 +2157,29 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   # Kept as TEXT and not as a second machine-readable rule, because the condition is about
   # the RUNNER's own state — what it has sent and not had acknowledged — which loopctl cannot
   # observe and therefore cannot express as a predicate over anything it publishes.
+  #
+  # `stale_stage` is the SECOND conditional member, and unlike the first its condition IS a
+  # predicate over what this contract publishes — which is why it is worth stating rather
+  # than leaving to instinct. `permanent_errors` calls it transient for `stage`, and that is
+  # right in the ordinary case: the row moved, you re-read it off the refusal and send the
+  # transition that applies. It is WRONG when the stage the refusal names has no transition
+  # out for a runner, and that is reachable in production rather than hypothetical: a session
+  # that calls `POST /stories/:id/escalate` with its own agent key moves its story to
+  # `escalated` under the same `claim_epoch`, so the runner's very next ordinary report is
+  # refused `stale_stage` naming a terminal stage. A runner following the transient/permanent
+  # split alone then retries a message that can never succeed, for ever. `stage_transitions`
+  # is the list to check it against, and it is published for exactly this kind of local
+  # decision.
   @permanent_error_conditions %{
+    "stale_stage" =>
+      "Transient for `stage` in the ordinary case: the row moved, so read the row off this " <>
+        "refusal and send the transition that applies from the `stage` it names. It is " <>
+        "PERMANENT when no entry of `x-connection.stage_transitions` has that `stage` as its " <>
+        "`from` - the story has reached a stage no runner can report out of, which a session " <>
+        "reaches by escalating through the HTTP surface while its run continues. Stop, and " <>
+        "end the run. For `triage_verdict` it is permanent unconditionally and carries no " <>
+        "row: the story has left `detected` and the verdict's first transition can never " <>
+        "match again.",
     "dispatch_not_accepted" =>
       "Permanent unless an accept YOU sent for this dispatch is still unacknowledged. " <>
         "The refusal means the ledger row is not `accepted`, which covers `sent` (your " <>
@@ -2158,6 +2251,30 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   """
   @spec permanent_error_conditions() :: %{String.t() => String.t()}
   def permanent_error_conditions, do: @permanent_error_conditions
+
+  @doc """
+  What each refusal carries BESIDE its `reason`, keyed by event then by code (1.10.0).
+
+  Complete: every code `error_reasons/0` publishes for an event has an entry here, and a code
+  that carries nothing has an explicit `[]`. So a lookup that finds nothing means the EVENT or
+  the CODE is not one this contract publishes — never that the refusal happens to be bare.
+  """
+  @spec error_fields() :: %{String.t() => %{String.t() => [String.t()]}}
+  def error_fields, do: @error_fields
+
+  @doc """
+  True when every event and code `error_reasons/0` publishes has an `error_fields/0` entry.
+
+  The totality this contract promises, as a function rather than a comment, so the test that
+  binds the two can ask instead of re-deriving it.
+  """
+  @spec error_fields_complete?() :: boolean()
+  def error_fields_complete? do
+    Enum.all?(@error_reasons, fn {event, codes} ->
+      published = Map.get(@error_fields, event, %{})
+      Enum.sort(Map.keys(published)) == Enum.sort(codes)
+    end)
+  end
 
   @doc """
   The `escalation_reasons` entries the control-side gate matches as whole strings (1.9.3).
@@ -2814,6 +2931,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
         # runner reads it in the same breath as the code it just got.
         "permanent_errors" => @permanent_errors,
         "permanent_error_conditions" => @permanent_error_conditions,
+        # WHAT EACH REFUSAL CARRIES BESIDE `reason`, per event, complete (1.10.0). Beside
+        # `errors` for the same reason `permanent_errors` is: a runner reads it in the same
+        # breath as the code it just got.
+        "error_fields" => @error_fields,
         "triage_gating_reasons" => GateA.gating_reason_codes(),
         "socket_path" => "/runner/socket/websocket",
         "credential_header" => "x-loopctl-runner-token",
