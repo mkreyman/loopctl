@@ -41,7 +41,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.9.0) a triage session's result comes back on its own `triage_verdict` message, carrying EXACTLY ONE of `verdict` or `incomplete`. Idempotent per dispatch: a byte-identical resend is answered `ok`. `x-connection.permanent_errors` says which refusals are worth resending | | | | |
   | (1.9.1) `RunnerTriageVerdictMessage` and `RunnerTriageVerdictAck` are actually DEFINED. 1.9.0 named both in `x-connection` and published neither, so the envelope was unresolvable and a runner had to re-type it. RE-VENDOR: a copy taken at 1.9.0 is missing both, and the version string is the only signal that it is | | | | |
   | (1.9.2) a NULLABLE ENUM publishes `null` as a member. `incomplete` was typed `[string, null]` with an enum of five reasons, and under 2020-12 an enum constrains null too — so a runner validating a message against the published file could not SEND a real verdict beside `"incomplete": null`, while the mirror message validated. loopctl accepted both all along; the schema was what disagreed. Also publishes `x-connection.permanent_error_conditions`. RE-VENDOR to send both keys | | | | |
-  | (1.9.3) `x-connection.triage_gating_reasons` publishes the `escalation_reasons` entries that GATE — matched as whole strings on the control side, while the field itself stays free-form prose. A reworded code silently does not gate, which had already happened on the interactive path | | | | |
+  | (1.9.3) `x-connection.triage_gating_reasons` publishes the `escalation_reasons` entries the control-side gate matches as whole strings, while the field itself stays free-form prose — and an escalate verdict must now carry at least one entry that is NOT a code, because a classification is not words a person can act on. RE-VENDOR: a copy taken at 1.9.2 has no such key to validate against | | | | |
 
   ## The story object (since 1.5.0)
 
@@ -202,13 +202,20 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     in it is worth resending unchanged.
 
   - `triage_gating_reasons` (`Loopctl.DeliveryGates.GateA.gating_reason_codes/0`) — the
-    `escalation_reasons` entries a triage verdict may carry that GATE, matched as whole
-    strings on the control side. Published for the reason the 1.9.0 envelope had to be: a
-    rule that decides an outcome, living in one side's prose, cannot be checked from the
-    other — and it had already failed exactly that way on the interactive path, where the
-    lens prompts asked for "one plain sentence per reason" and neither code could ever fire.
-    Validate the gating entries you emit against this list; everything else in the field is
-    prose and stays free.
+    `escalation_reasons` entries the control-side gate matches as WHOLE STRINGS. Published
+    for the reason the 1.9.0 envelope had to be: a rule that decides an outcome, living in
+    one side's prose, cannot be checked from the other — and it had already failed exactly
+    that way, where the lens prompts asked for "one plain sentence per reason" and neither
+    code could ever fire.
+
+    **WHAT IT DOES NOT MEAN, stated because the first draft of this line overstated it.** A
+    triage VERDICT's `escalation_reasons` gate nothing today: `Loopctl.Delivery.TriageVerdict`
+    records the field verbatim and routes on `outcome` alone, and `GateA`'s input is a
+    `trio_outputs` fact supplied to `POST /stories/:id/merge-precondition`. The two shapes do
+    not even correspond yet — the gate wants THREE outputs keyed `verdict` with a numeric
+    `confidence`, and a verdict is ONE message keyed `outcome` with an enum. So this list is
+    published to be EMITTED against, not to be relied on as gating from the runner side, and
+    wiring a verdict into that gate is a change that has to reconcile those shapes first.
 
   - `permanent_error_conditions` (`permanent_error_conditions/0`) — the ONE code in the list
     above whose permanence has a condition, published so a runner reads the condition rather
@@ -1224,14 +1231,17 @@ defmodule Loopctl.ApiSpec.RunnerContract do
             maxItems: @max_reasons,
             items: %Schema{type: :string, maxLength: @max_reason_length},
             description:
-              "Why this needs a human. Meaningful when `outcome` is `escalate`. FREE-FORM by " <>
-                "design — a sentence saying what a lens actually saw is what makes an " <>
-                "escalation actionable — but the entries in " <>
-                "`x-connection.triage_gating_reasons` are GATING CODES matched as whole " <>
-                "strings by the control-side gate that decides whether a human is asked. " <>
-                "Emit those verbatim, as their own entries, and put prose in other entries: " <>
-                "a reworded gating code does not gate, and nothing anywhere reports that it " <>
-                "failed to. A code NOT on that list is recorded and never gates."
+              "Why this needs a human. Meaningful when `outcome` is `escalate`. FREE-FORM: a " <>
+                "sentence saying what a lens actually saw is what makes an escalation " <>
+                "actionable, and at least one entry must be prose — a bare code is not words " <>
+                "a person can act on. WHAT LOOPCTL DOES WITH THIS FIELD TODAY: it records it " <>
+                "verbatim on the verdict and routes on `outcome` ALONE. No string here " <>
+                "changes what happens to the story. The codes in " <>
+                "`x-connection.triage_gating_reasons` are matched as whole strings by a " <>
+                "control-side gate that today reads a trio's outputs supplied to " <>
+                "`POST /stories/:id/merge-precondition`, NOT this message — so emit them " <>
+                "verbatim as their own entries to be ready for the day a runner's verdict is " <>
+                "what feeds that gate, and do not read them as gating from here yet."
           },
           missing_information: %Schema{
             type: :array,
@@ -2139,6 +2149,15 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   def permanent_error_conditions, do: @permanent_error_conditions
 
   @doc """
+  The `escalation_reasons` entries the control-side gate matches as whole strings (1.9.3).
+
+  A reading of `Loopctl.DeliveryGates.GateA`, never a copy — see `x-connection` in the
+  moduledoc for what the list does and does not mean today.
+  """
+  @spec gating_reason_codes() :: [String.t()]
+  def gating_reason_codes, do: GateA.gating_reason_codes()
+
+  @doc """
   True when `reason` can never be cleared by resending `event`.
 
   The reason this is a function and not a list the caller filters: `stale_stage` is transient
@@ -2436,10 +2455,34 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   # An escalation with nothing attached reaches a human who starts the same reading from the
   # beginning — the thing `missing_information` exists to prevent. Either field satisfies it:
   # one says why, the other says what is needed.
+  # AT LEAST ONE ENTRY THAT IS NOT A CODE. The guard below exists so an escalation reaches a
+  # human with something to read; publishing the gating vocabulary made a bare
+  # `["workflow_change_not_defect_fix"]` satisfy it, which is a classification and not words.
+  # With `@max_reasons` at 5 and three codes defined, a verdict emitting every code still has
+  # room for the sentence, so this costs a conforming runner nothing.
+  defp prose_entry?(reason) when is_binary(reason),
+    do: reason not in GateA.gating_reason_codes()
+
+  defp prose_entry?(_reason), do: false
+
   defp escalation_content(%{outcome: "escalate"} = verdict) do
-    if Enum.all?([:escalation_reasons, :missing_information], &(Map.get(verdict, &1, []) == [])),
-      do: ["an escalate outcome must carry escalation_reasons or missing_information"],
-      else: []
+    reasons = Map.get(verdict, :escalation_reasons, [])
+    missing = Map.get(verdict, :missing_information, [])
+
+    cond do
+      reasons == [] and missing == [] ->
+        ["an escalate outcome must carry escalation_reasons or missing_information"]
+
+      missing == [] and not Enum.any?(reasons, &prose_entry?/1) ->
+        [
+          "an escalate outcome must carry words a person can act on: every " <>
+            "escalation_reasons entry is a gating code, and a code is a classification " <>
+            "rather than a reason. Add a sentence, or missing_information"
+        ]
+
+      true ->
+        []
+    end
   end
 
   defp escalation_content(_verdict), do: []

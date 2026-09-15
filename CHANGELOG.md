@@ -15,6 +15,17 @@ All notable changes to loopctl are documented here.
   the lens prompts asked for "one plain sentence per reason", and neither code could fire at
   all. Both the runner session and the claude-config session asked for this independently.
 
+  **What it does NOT mean, stated because the first draft of the published description
+  overstated it:** a triage verdict's `escalation_reasons` gate nothing today —
+  `TriageVerdict` records the field and routes on `outcome` alone, and the gate's input is a
+  `trio_outputs` fact supplied to `POST /stories/:id/merge-precondition`. The two shapes do
+  not correspond yet (three outputs keyed `verdict` with a numeric confidence, against one
+  message keyed `outcome` with an enum), so the list is published to be EMITTED against and
+  the wiring is a change that must reconcile them. An escalate verdict must also now carry at
+  least one entry that is NOT a code: publishing the vocabulary made a bare code satisfy the
+  "an escalation must carry something" guard, and a classification is not words a person can
+  act on.
+
   Published as a LIST rather than an enum on the field, deliberately: `escalation_reasons` is
   also where a lens says what it actually saw, and an enum would refuse the sentence that
   makes an escalation actionable. Validate the gating entries against the list; the rest of
