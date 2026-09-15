@@ -20,9 +20,13 @@
  *     tree, and an agent key is refused `insufficient_role` before anything is written.
  *   - `resolve_escalation` is the HUMAN half of the escalation pair: a `:user` key no dispatch
  *     minted. The agent key that raises an escalation is 403'd on it by design.
- *   - `force_unclaim_story` is gated `exact_role: :orchestrator`, so it needs the ORCH key and
- *     a higher-privileged one does NOT substitute: a `:user` or `:superadmin` key is 403'd
- *     there exactly as an agent key is. That is a chain-of-custody gate, not an oversight.
+ *   - `force_unclaim_story` is gated `exact_role: :orchestrator`
+ *     (`story_verification_controller.ex:29-30`), so it needs an ORCHESTRATOR-ROLE key and a
+ *     higher-privileged one does NOT substitute: `RequireRole`'s exact-role clause tests
+ *     `api_key.role == exact_role` (`require_role.ex:65-75`), so a `:user` or `:superadmin`
+ *     key is 403'd there exactly as an agent key is. That is a chain-of-custody gate, not an
+ *     oversight. WHICH ENV VAR carries that key is a separate question, and `index.js` decides
+ *     it in `lib/custody-key.js`: LOOPCTL_ORCH_KEY when set, else LOOPCTL_API_KEY.
  *   - `story_stage` is a read and takes whatever key the caller has.
  *
  * SINGLE SOURCE OF TRUTH: `index.js` injects `apiCall`, and the unit suite runs this code
@@ -34,20 +38,50 @@ const MISSING_USER_KEY =
   "which only an unlineaged user key may do.";
 
 const MISSING_ORCH_KEY =
-  "LOOPCTL_ORCH_KEY is required: force-unclaim is gated `exact_role: :orchestrator`, so a " +
-  "user or superadmin key is 403'd there like any other non-member. A higher-privileged key " +
-  "is not a way past it.";
+  "No API key is configured. Set LOOPCTL_ORCH_KEY to an orchestrator-role key (or " +
+  "LOOPCTL_API_KEY to one). Force-unclaim is gated `exact_role: :orchestrator`, so a user or " +
+  "superadmin key is 403'd there like any other non-member: a higher-privileged key is not a " +
+  "way past it.";
 
 function refuse(body) {
   return { error: true, status: 0, body };
 }
 
 /**
- * Every id this module has interpolates into a PATH, and the endpoint behind it casts
- * nothing: `Progress.force_unclaim_story/3` reaches `lock_story/2` (`progress.ex:3467`),
- * which puts `story_id` straight into an Ecto `where`, so a non-UUID raises
- * `Ecto.Query.CastError` and the caller gets a 500 instead of a usable refusal. The shape
- * check therefore belongs here, where it can say what is wrong.
+ * A client-side shape check on every id these verbs take.
+ *
+ * WHY, stated correctly — an earlier draft of this comment said a malformed id made the server
+ * "500", and it does not. loopctl has a deliberate backstop:
+ * `defimpl Plug.Exception, for: Ecto.Query.CastError` maps it to 404
+ * (`lib/loopctl_web/plugs/cast_error_handler.ex:26-29`), pinned by
+ * `test/loopctl_web/plugs/cast_error_handler_test.exs:9-12`. What the caller actually gets is
+ * `{"error": {"status": 404, "message": "Not found"}}` — the generic body
+ * `LoopctlWeb.ErrorJSON.render("404.json", …)` emits
+ * (`lib/loopctl_web/controllers/error_json.ex:13-15`, wired by `config/config.exs:344-347`).
+ *
+ * That 404 is the problem, not a 500. It is BYTE-IDENTICAL to the 404 for a perfectly
+ * well-formed id that names no story — `FallbackController` answers `{:error, :not_found}` with
+ * the same `%{error: %{status: 404, message: "Not found"}}`
+ * (`lib/loopctl_web/fallback_controller.ex:74-78`) — so it cannot tell an operator which
+ * of the two happened, and the two have opposite remedies: re-read the argument you passed, or
+ * go find the right story. The check here can tell them apart, and does it without a round trip.
+ *
+ * SCOPE OF THAT TRACE. The path read end to end is force-unclaim:
+ * `Progress.force_unclaim_story/3` reaches `lock_story/2` (`lib/loopctl/progress.ex:3467-3470`),
+ * which puts `story_id` straight into a `where` against a `:binary_id` column with no cast. The
+ * other three verbs are NOT claimed to reach that same code, and `place_dispatch` does not even
+ * put `story_id` in a path — it goes in the request body. They do not need to: a shape check is
+ * worth its line on any argument that must be a UUID, whatever the server would do with a value
+ * that is not one.
+ *
+ * THE REFUSAL CARRIES `status: 0`, NOT 404, and that is deliberate. Every local refusal in this
+ * client uses it — `refuse()` below, `apiCall`'s missing-key branch and its network/timeout
+ * branches (`index.js`) — and it means ONE thing: no request was sent, so no server said
+ * anything. The whole result object is JSON-stringified into the tool output (`toContent`,
+ * `index.js`), so a reader sees that 0. Stamping 404 on it instead would make a local refusal
+ * indistinguishable from the server's answer, which is precisely the ambiguity this check
+ * exists to remove. A caller branching on the status therefore sees `0` where it previously saw
+ * `404`; that is a shape change and the 2.97.0 CHANGELOG entry says so.
  *
  * The refusal names the SHAPE and never echoes the value. A malformed id is frequently a
  * token, a path or a pasted line that landed in the wrong argument, and a tool result goes
@@ -198,10 +232,12 @@ export async function resolveEscalation({ story_id, to, reason } = {}, { userKey
  * `@valid_transitions` (`progress.ex:3480`) has `pending: :contracted` and nothing else — so
  * `place_dispatch` run straight afterwards answers the IDENTICAL 409 `invalid_transition`.
  *
- * The remedy is two steps and the tool descriptions say so: `force_unclaim_story`, then
- * `contract_story`, then `place_dispatch`. (`resolve_escalation` is the one that does both for
- * you: `Escalations.prepare_story/5` releases AND re-contracts on the `queued` route,
- * `escalations.ex:335-342`.)
+ * The remedy is THREE CALLS, in this order, and the tool descriptions say so:
+ * `force_unclaim_story`, then `contract_story`, then `place_dispatch`. (An earlier draft called
+ * it "two steps" and then named three, which is worse than saying nothing: an operator counting
+ * steps runs two of the three and takes the 409 this copy exists to prevent.)
+ * (`resolve_escalation` is the one that does both for you: `Escalations.prepare_story/5`
+ * releases AND re-contracts on the `queued` route, `escalations.ex:335-342`.)
  *
  * ## WHEN A STORY IS ACTUALLY PARKED
  *
@@ -219,10 +255,23 @@ export async function resolveEscalation({ story_id, to, reason } = {}, { userKey
  *
  * No request body — the story is named in the path.
  *
- * ORCHESTRATOR key, and exactly that: the action is `exact_role: :orchestrator`, so a user or
- * superadmin key is refused. `LOOPCTL_API_KEY` is deliberately NOT consulted as a fallback
- * (`index.js` passes `exactKey`), because a global key of some other role would produce a 403
- * that reads like the story being unclaimable rather than the key being wrong.
+ * ORCHESTRATOR ROLE, and exactly that: the action is `exact_role: :orchestrator`
+ * (`story_verification_controller.ex:29-30`), so a user or superadmin key is refused —
+ * `RequireRole`'s exact-role clause tests `api_key.role == exact_role`
+ * (`require_role.ex:65-75`).
+ *
+ * WHICH ENV VAR supplies that key is `index.js`'s call, made in `lib/custody-key.js`:
+ * LOOPCTL_ORCH_KEY is sent EXACTLY when it is set, so `resolveKey` cannot discard an
+ * operator's deliberate choice in favour of a global LOOPCTL_API_KEY; when it is not set, the
+ * global key still goes, because an orchestrator-role LOOPCTL_API_KEY was a working and
+ * documented configuration before 2.97.0. The refusal below fires only when NEITHER is set.
+ *
+ * NOT because the 403 would be confusing. An earlier draft of this paragraph said a wrong-role
+ * global key "would produce a 403 that reads like the story being unclaimable rather than the
+ * key being wrong". That is false: `RequireRole` is mounted FIRST and halts with 403,
+ * `code: "insufficient_role"`, `required_roles: ["orchestrator"]` and "This endpoint requires
+ * the orchestrator role" (`require_role.ex:112-128`), so the request never reaches the
+ * controller and never reaches the custody 409s in `Progress`. The role error names the role.
  */
 export async function forceUnclaimStory({ story_id } = {}, { orchKey, apiCall } = {}) {
   if (!orchKey) return refuse(MISSING_ORCH_KEY);

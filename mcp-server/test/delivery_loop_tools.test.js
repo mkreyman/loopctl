@@ -286,10 +286,13 @@ describe("force_unclaim_story", () => {
 });
 
 describe("id validation — shared by every verb here", () => {
-  // `Progress.force_unclaim_story/3` reaches `lock_story/2` (`progress.ex:3467`), which puts
-  // `story_id` straight into an Ecto `where` with no cast. A non-UUID therefore raises
-  // `Ecto.Query.CastError` and the caller gets a 500 — not a refusal it can act on. Checking
-  // the SHAPE client-side turns that into an answer, and costs no round trip.
+  // NOT because the server 500s on a malformed id; it does not. `Ecto.Query.CastError` has a
+  // deliberate `Plug.Exception` impl returning 404 (`cast_error_handler.ex:26-29`, pinned by
+  // `cast_error_handler_test.exs:9-12`), and the body is the generic
+  // `{"error": {"status": 404, "message": "Not found"}}`. The problem is that this is the
+  // IDENTICAL answer a well-formed id naming no story gets (`fallback_controller.ex:74-78`),
+  // and the two have opposite remedies. Checking the SHAPE client-side tells them apart, and
+  // costs no round trip. See the block comment over `uuid()` in lib/delivery-loop.js.
   const MALFORMED = "not-a-uuid";
 
   test("refuses a malformed story_id on every verb that takes one, before any call", async () => {
@@ -360,6 +363,23 @@ describe("id validation — shared by every verb here", () => {
 
     assert.match(result.body, /is required/);
   });
+
+  test("a local refusal carries status 0, never the 404 the server would have sent", async () => {
+    // The shape decision this guard forces, pinned so it cannot drift back. `status: 0` is
+    // this client's marker for "no request was sent" — `apiCall`'s missing-key, network-error
+    // and timeout branches all use it. Stamping the refusal 404 instead would make it
+    // indistinguishable from the server's own answer for a malformed id
+    // (`cast_error_handler.ex:26-29`), which is the ambiguity the check exists to REMOVE.
+    const { calls, apiCall } = fakeApi();
+
+    const result = await forceUnclaimStory(
+      { story_id: "not-a-uuid" },
+      { orchKey: "orch-key", apiCall },
+    );
+
+    assert.equal(result.status, 0, "a local refusal must not claim a server answered");
+    assert.equal(calls.length, 0);
+  });
 });
 
 describe("the wiring in index.js", () => {
@@ -398,12 +418,13 @@ describe("the wiring in index.js", () => {
     }
   });
 
-  test("force_unclaim_story is pinned to the ORCH key, exactly", () => {
-    // `resolveKey` prefers a global LOOPCTL_API_KEY, and a global key of ANY other role —
-    // user and superadmin included — is 403'd by an `exact_role: :orchestrator` gate. Reading
-    // the env var is not enough on its own: without `exactKey` the request would still go out
-    // under whatever LOOPCTL_API_KEY holds, and the 403 would read as the story being
-    // unfreeable rather than the key being the wrong one.
+  test("force_unclaim_story selects its key the way every exact_role verb does", () => {
+    // The endpoint is `exact_role: :orchestrator` (`story_verification_controller.ex:29-30`),
+    // so it needs an orchestrator-ROLE key; which env var holds one is a separate question
+    // and `lib/custody-key.js` answers it — LOOPCTL_ORCH_KEY sent exactly when set, a global
+    // LOOPCTL_API_KEY otherwise. What this pins is that the handler does not answer it itself.
+    // The behaviour of that selection, including the orchestrator-only-global config, is
+    // tested in test/custody_key_pinning.test.js.
     const start = INDEX_SRC.indexOf("async function forceUnclaimStory(");
     assert.ok(start > -1, "the force_unclaim_story handler was not found");
 
@@ -412,21 +433,28 @@ describe("the wiring in index.js", () => {
     const end = INDEX_SRC.indexOf("\nasync function ", start + 1);
     assert.ok(end > start, "the handler has no following function to bound it");
 
-    // COMMENTS STRIPPED FIRST. The handler carries a comment explaining the pinning, and that
-    // comment names both `exactKey` and the env var — so the raw slice is satisfied by a site
-    // where the option has been commented OUT, which is the shape a disabling edit takes.
-    // Verified by mutation: without this, replacing the option line with a block comment left
-    // the suite green.
+    // COMMENTS STRIPPED FIRST. The handler carries a comment explaining the selection, and
+    // that comment names the same identifiers — so the raw slice is satisfied by a site where
+    // the wiring has been commented OUT, which is the shape a disabling edit takes. Verified
+    // by mutation: without this, replacing the wiring with a block comment left the suite
+    // green.
     const handler = INDEX_SRC.slice(start, end)
       .replace(/\/\*[\s\S]*?\*\//g, "")
       .replace(/\/\/[^\n]*/g, "");
 
     assert.match(
       handler,
-      /process\.env\.LOOPCTL_ORCH_KEY\b/,
-      "it does not read process.env.LOOPCTL_ORCH_KEY",
+      /orchestratorKeyArgs\(\)/,
+      "it does not call orchestratorKeyArgs, so its key selection is its own",
     );
-    assert.ok(handler.includes("exactKey: true"), "it does not pin the key exactly");
+    assert.ok(
+      handler.includes("orch.override") && handler.includes("orch.options"),
+      "it drops what orchestratorKeyArgs chose, so LOOPCTL_ORCH_KEY is no longer sent exactly",
+    );
+    assert.ok(
+      handler.includes("orchKey: orch.resolved"),
+      "its local refusal does not branch on the key that will actually be sent",
+    );
     assert.ok(
       !handler.includes("LOOPCTL_USER_KEY"),
       "it reaches for the user key, which that gate refuses",

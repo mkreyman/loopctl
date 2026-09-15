@@ -19,9 +19,10 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   **IT FREES THE STAGE; IT DOES NOT MAKE THE STORY PLACEABLE.** `Placement.claimable/2` wants
   `agent_status: :contracted` AND stage `queued`, and the release leaves the story at
   `:pending`, whose only transition is `pending -> contracted`. Run `place_dispatch` next and
-  you get back the identical 409 `invalid_transition`. The remedy is TWO STEPS:
-  `force_unclaim_story`, then `contract_story`, then `place_dispatch`. `resolve_escalation` is
-  the verb that does both for you — it releases AND re-contracts on its `queued` route.
+  you get back the identical 409 `invalid_transition`. The remedy is THREE CALLS, in this
+  order: `force_unclaim_story`, then `contract_story`, then `place_dispatch`.
+  `resolve_escalation` is the verb that does both for you — it releases AND re-contracts on
+  its `queued` route.
 
   **When to reach for it.** A story sitting at `claimed` with nobody on it is the residue of a
   compensation that did not complete, not what a refused dispatch normally leaves: placement
@@ -29,36 +30,62 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   the claim lease releases it unattended once `claimed_until` has passed. Use this tool to get
   the story back now rather than at lease expiry.
 
-  It needs `LOOPCTL_ORCH_KEY` and the key is pinned EXACTLY — no `LOOPCTL_API_KEY` fallback.
-  The action is `exact_role: :orchestrator`, so a user or superadmin key is 403'd there like
-  any other non-member, and a global key of the wrong role would turn that into a 403 reading
-  as the story being unfreeable. The orchestrator key must also be linked to a registered
-  agent, and the tenant must be human-anchored.
+  It needs an ORCHESTRATOR-ROLE key. The action is `exact_role: :orchestrator`, so a user or
+  superadmin key is 403'd there like any other non-member. Set `LOOPCTL_ORCH_KEY` and that is
+  the key sent, with no `LOOPCTL_API_KEY` substitution; with no orchestrator key set,
+  `LOOPCTL_API_KEY` is still sent, so an orchestrator-role global key works. The orchestrator
+  key must also be linked to a registered agent, and the tenant must be human-anchored.
 
 ### Changed
 
-- **`verify_story`, `reject_story`, `verify_all_in_epic` and `bulk_mark_complete` are pinned
-  to `LOOPCTL_ORCH_KEY` exactly.** All four are `exact_role: :orchestrator` endpoints, and all
-  four passed the orchestrator key WITHOUT `exactKey` — so `resolveKey` preferred a global
-  `LOOPCTL_API_KEY`, of any role, and sent it. The 403 that came back named a custody refusal
-  rather than a misconfigured key, which is the worst place to misattribute an error: this is
-  the neighbourhood of `self_verify_blocked`, an L6 byzantine signal. **If you relied on a
-  global key for those four, set `LOOPCTL_ORCH_KEY`** — they now refuse locally and name the
-  variable. `report_story` and `review_complete` are deliberately NOT pinned: their gates take
-  a role RANGE, so the fallback is what makes an agent-key-only configuration work.
+- **A `LOOPCTL_ORCH_KEY` you set is no longer discarded** by `verify_story`, `reject_story`,
+  `verify_all_in_epic`, `bulk_mark_complete` and `force_unclaim_story`. All five are
+  `exact_role: :orchestrator` endpoints, where the role hierarchy does not apply, and all five
+  passed the orchestrator key to `resolveKey` — which prefers a global `LOOPCTL_API_KEY` over
+  it. So an operator running `LOOPCTL_ORCH_KEY` for the custody verbs and `LOOPCTL_API_KEY` of
+  another role for everything else had the orchestrator key silently dropped on exactly the
+  calls they set it for. When `LOOPCTL_ORCH_KEY` is set, it is now the key sent.
+
+  **NOTHING BREAKS IF YOU HAVE ONLY A GLOBAL KEY.** `LOOPCTL_API_KEY` holding an
+  orchestrator-role key, with no `LOOPCTL_ORCH_KEY` at all, was documented and working, and
+  the gate accepts it — the server tests the key's ROLE, not which variable it came from. It
+  is still sent. The pin applies only when `LOOPCTL_ORCH_KEY` is set. (A draft of this release
+  pinned unconditionally, which refused that configuration locally and told the operator their
+  key was the wrong role when it was not.) `report_story` and `review_complete` are unpinned
+  for the same reason, one case wider: their gates take a role RANGE, and the fallback is what
+  makes an agent-key-only configuration work.
+
+  For the record, since this changelog claimed otherwise in an earlier draft: the 403 from an
+  `exact_role` gate is NOT ambiguous and never resembled a custody refusal.
+  `LoopctlWeb.Plugs.RequireRole` is mounted first and halts with `code: "insufficient_role"`,
+  `required_roles: ["orchestrator"]` and "This endpoint requires the orchestrator role" — the
+  request never reaches the controller, so it never reaches the `self_verify_blocked` family
+  of 409s at all.
 
 - **A missing exact key is reported by NAME.** `apiCall`'s `exactKey` branch answered every
   site with "Set LOOPCTL_USER_KEY ... to manage LLM configuration", which is right for
   `set_llm_config` and nonsense for a custody verb missing its orchestrator key. A new
-  `keyHint` names the variable the site is pinned to.
+  `keyHint` names the variable the site is pinned to, on all five custody verbs —
+  `force_unclaim_story` was the one that shipped without it in a draft of this release, so a
+  missing orchestrator key was reported to it as an LLM-configuration problem. The message
+  offers `LOOPCTL_API_KEY` as well, because that branch is reached only when BOTH are unset
+  and setting either to an orchestrator-role key works.
 
 - **A malformed id is refused client-side** by `place_dispatch`, `story_stage`,
-  `resolve_escalation` and `force_unclaim_story`. `Progress.force_unclaim_story/3` reaches
-  `lock_story/2`, which interpolates `story_id` into an Ecto `where` with no cast, so a
-  non-UUID raised `Ecto.Query.CastError` and came back as a 500 rather than something a caller
-  could act on. The refusal names the SHAPE and its length and never echoes the value — a
-  malformed id is often a token or a path pasted into the wrong argument, and a tool result
-  lands in the transcript.
+  `resolve_escalation` and `force_unclaim_story`. **This never produced a 500** — an earlier
+  draft of this entry said it did, and no shipped release behaved that way: loopctl maps
+  `Ecto.Query.CastError` to a 404 on purpose. What it produced is a 404 whose body is
+  byte-identical to the 404 for a well-formed id naming no story, so an operator could not
+  tell "you passed something that is not a UUID" from "that story does not exist" — two
+  problems with opposite remedies. The client check tells them apart without a round trip, and
+  it names the SHAPE and its length while never echoing the value: a malformed id is often a
+  token or a path pasted into the wrong argument, and a tool result lands in the transcript.
+
+  **Shape change for anything parsing the result:** a refusal from this check carries
+  `"status": 0` — this client's marker for "no request was sent", shared with its missing-key,
+  network-error and timeout refusals — where the same call previously came back `"status":
+  404` from the server. It is deliberately not stamped 404: a local refusal that looks like a
+  server answer restores the ambiguity the check exists to remove.
 
 ### Fixed
 

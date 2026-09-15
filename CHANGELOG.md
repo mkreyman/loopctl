@@ -252,8 +252,8 @@ All notable changes to loopctl are documented here.
   `queued`; the release leaves the story at `:pending`, whose only transition is
   `pending -> contracted`. An operator who read the old copy, ran the tool and then ran
   `place_dispatch` got back the identical 409 `invalid_transition` the copy claimed to cure.
-  The remedy is two steps and every description now says so: `force_unclaim_story`, then
-  `contract_story`, then `place_dispatch`. (`resolve_escalation` is the verb that does both —
+  The remedy is three calls, in this order, and every description now says so:
+  `force_unclaim_story`, then `contract_story`, then `place_dispatch`. (`resolve_escalation` is the verb that does both —
   `Escalations.prepare_story/5` releases and re-contracts on its `queued` route — which is why
   the entry below can claim placeability and this one cannot.)
 

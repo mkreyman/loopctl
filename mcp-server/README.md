@@ -67,8 +67,8 @@ Or if installed locally:
 | Variable | Description | Default |
 |---|---|---|
 | `LOOPCTL_SERVER` | loopctl server URL | `https://loopctl.com` |
-| `LOOPCTL_API_KEY` | Global API key override: used for every tool EXCEPT the exact-key ones below | -- |
-| `LOOPCTL_ORCH_KEY` | Orchestrator role API key (report, review, import, and the exact-key custody verbs `verify_story` / `reject_story` / `verify_all_in_epic` / `bulk_mark_complete` / `force_unclaim_story`) | -- |
+| `LOOPCTL_API_KEY` | Global API key override: used for every tool except the exact-key ones below, and for the `exact_role: :orchestrator` custody verbs when `LOOPCTL_ORCH_KEY` is unset | -- |
+| `LOOPCTL_ORCH_KEY` | Orchestrator role API key (report, review, import, and the `exact_role: :orchestrator` custody verbs `verify_story` / `reject_story` / `verify_all_in_epic` / `bulk_mark_complete` / `force_unclaim_story` — when it is set, it is the key those five send) | -- |
 | `LOOPCTL_AGENT_KEY` | Agent role API key (contract, claim, start, request-review) | -- |
 | `LOOPCTL_USER_KEY` | User role API key (minted at signup). Required for **first-time BYO LLM key provisioning** (`set_llm_config` / `llm_config` — see [First-time setup](#first-time-setup--provision-your-byo-llm-keys)) and for destructive admin tools like `knowledge_bulk_publish`, and for the [runner and delivery-loop tools](#runner-and-delivery-loop-tools). | -- |
 | `LOOPCTL_STH_STATE_PATH` | Absolute path for the witness-protocol STH cache file (see [Witness protocol](#witness-protocol-sth)). Optional. | per-(server + key) file under the OS temp dir |
@@ -77,20 +77,26 @@ Key resolution priority: `LOOPCTL_API_KEY` > tool-specific key > `LOOPCTL_ORCH_K
 
 **The exception: tools pinned to an EXACT key.** Some endpoints are gated `exact_role:`,
 where the role hierarchy does NOT apply — a higher-privileged key is refused there exactly
-as a lower one is. For those, `LOOPCTL_API_KEY` is deliberately never consulted, because a
-global key of the wrong role would go out under the wrong principal and take a 403 that
-reads as a refusal about the STORY rather than about the key. The tool names the variable
-it needs and refuses locally when it is unset:
+as a lower one is. For those tools the global override does not silently win over the
+variable the tool names, so a key you set for a specific role is the key that gets sent:
 
-| Tool | Pinned to |
-|---|---|
-| `verify_story`, `reject_story`, `verify_all_in_epic`, `bulk_mark_complete`, `force_unclaim_story` | `LOOPCTL_ORCH_KEY` (`exact_role: :orchestrator`) |
-| `place_dispatch`, `resolve_escalation` | `LOOPCTL_USER_KEY` (an unlineaged human principal) |
-| `set_llm_config`, `llm_config` and the other secret-managing tools | `LOOPCTL_USER_KEY` |
+| Tool | Key | When the override applies |
+|---|---|---|
+| `verify_story`, `reject_story`, `verify_all_in_epic`, `bulk_mark_complete`, `force_unclaim_story` | `LOOPCTL_ORCH_KEY` (`exact_role: :orchestrator`) | Pinned **when `LOOPCTL_ORCH_KEY` is set**. With no orchestrator key, `LOOPCTL_API_KEY` is still sent — set it to an orchestrator-role key and these work. |
+| `place_dispatch`, `resolve_escalation` | `LOOPCTL_USER_KEY` (an unlineaged human principal) | Always pinned; `LOOPCTL_API_KEY` is never consulted. |
+| `set_llm_config`, `llm_config` and the other secret-managing tools | `LOOPCTL_USER_KEY` | Always pinned; a secret operation must not run under a non-user global key. |
+
+Why pin at all: the priority above means `LOOPCTL_API_KEY` beats the variable a tool names,
+so an operator who sets `LOOPCTL_ORCH_KEY` for the custody verbs and `LOOPCTL_API_KEY` for
+everything else had the orchestrator key discarded on exactly the calls it was set for. It
+is **not** because the resulting 403 is confusing — `LoopctlWeb.Plugs.RequireRole` runs
+first and answers with `code: "insufficient_role"` and `required_roles: ["orchestrator"]`,
+which names the problem correctly.
 
 `report_story` and `review_complete` are NOT in this table: their gates take a role RANGE
 (`exact_role: [:agent, :orchestrator]` and `[:orchestrator, :user]`), so the
-`LOOPCTL_API_KEY` fallback is what makes an agent-key-only configuration work.
+`LOOPCTL_API_KEY` fallback is what makes an agent-key-only configuration work. The
+conditional pin in the first row is that same reasoning applied to the single-role gates.
 
 ## First-time setup — provision your BYO LLM keys
 
@@ -496,7 +502,7 @@ Enroll the dev machines that run the agent delivery loop, see which are connecte
 | `place_dispatch` | **Place a queued story on a runner** (`POST /api/v1/runners/:runner_id/dispatches`): claims it under a freshly minted custody dispatch and pushes the work. The control-side trigger of the delivery loop. Required: `story_id`, `runner_id` (from `runner_pool`). Optional: `kind` (`implement`, the only kind this tool sends — `triage` is dispatchable on the contract but placement CLAIMS the story, which triage must not do), `dispatch_id` (the idempotency key — generated when absent; pass the SAME one to retry rather than start a second session), `branch`, `base_branch`, `wall_clock_seconds`, `max_turns`. The story object is NOT a parameter: loopctl builds it from its own rows and refuses a caller-supplied one. The story must be `contracted` with its stage at `queued`. Requires `LOOPCTL_USER_KEY`. |
 | `story_stage` | **Where a story is in the delivery machine** (`GET /api/v1/stories/:id/stage`): stage, `claim_epoch`, `lock_version`, `attempts`, the runner holding it, and the escalation reason when parked. `stage: null` means the loop has never touched it. This is how you watch a run, and the only way to see why a stage report was refused `stale_stage`. `escalation_reason` is untrusted session text. Required: `story_id`. |
 | `resolve_escalation` | **Move an escalated story off `escalated`, as a human** (`POST /api/v1/stories/:id/stage/resolve`): `to` is `queued` (work it again), `done` or `failed`. The other half of `escalate_story` — without it a parked story stays parked for ever. Requires `LOOPCTL_USER_KEY` on a key no dispatch minted: a session cannot resolve the escalation it raised. Optional: `reason`. |
-| `force_unclaim_story` | **Take a story back from the agent holding it** (`POST /api/v1/stories/:id/force-unclaim`). Resets it to `agent_status: pending` with `assigned_agent_id` cleared AND makes the delivery stage row follow the release back to `queued`. **It frees the STAGE; it does not make the story placeable.** `place_dispatch` wants `contracted` + `queued` (see its own row in this table), and the release leaves the story at `pending`, whose only transition is `pending -> contracted` — so running `place_dispatch` next answers the identical 409 `invalid_transition`. The remedy is two steps: `force_unclaim_story`, then `contract_story`, then `place_dispatch`. A story parked at `claimed` with nobody on it is the residue of a compensation that did not complete, not what a refused dispatch normally leaves: placement releases the claim inline when a runner refuses, and the claim lease releases it unattended once `claimed_until` passes — reach for this to get it back now, or when both of those left it held. Requeues from any stage a claim holds; a stage no claim holds keeps its stage and is rebound to the new epoch; `done` and `failed` are untouched. For an ESCALATED story use `resolve_escalation` instead — that one releases AND re-contracts, so its `queued` really is placeable. Requires `LOOPCTL_ORCH_KEY`: the action is `exact_role: :orchestrator`, so a user or superadmin key is 403'd like any other non-member, and `LOOPCTL_API_KEY` is not a fallback for it. The orchestrator key must be linked to a registered agent (400 otherwise) and the tenant must be human-anchored (403 `custody_tier_required` otherwise). Does not touch `verified_status`. Safe to run twice: on an already-pending story the stage row is written only if it is stranded behind the story's claim epoch or still in flight. No request body. Required: `story_id` (refused locally if it is not a UUID). |
+| `force_unclaim_story` | **Take a story back from the agent holding it** (`POST /api/v1/stories/:id/force-unclaim`). Resets it to `agent_status: pending` with `assigned_agent_id` cleared AND makes the delivery stage row follow the release back to `queued`. **It frees the STAGE; it does not make the story placeable.** `place_dispatch` wants `contracted` + `queued` (see its own row in this table), and the release leaves the story at `pending`, whose only transition is `pending -> contracted` — so running `place_dispatch` next answers the identical 409 `invalid_transition`. The remedy is three calls, in this order: `force_unclaim_story`, then `contract_story`, then `place_dispatch`. A story parked at `claimed` with nobody on it is the residue of a compensation that did not complete, not what a refused dispatch normally leaves: placement releases the claim inline when a runner refuses, and the claim lease releases it unattended once `claimed_until` passes — reach for this to get it back now, or when both of those left it held. Requeues from any stage a claim holds; a stage no claim holds keeps its stage and is rebound to the new epoch; `done` and `failed` are untouched. For an ESCALATED story use `resolve_escalation` instead — that one releases AND re-contracts, so its `queued` really is placeable. Requires an orchestrator-ROLE key: the action is `exact_role: :orchestrator`, so a user or superadmin key is 403'd like any other non-member. Put it in `LOOPCTL_ORCH_KEY` (which is then the key sent, and a global `LOOPCTL_API_KEY` does not displace it) or, with no orchestrator key set, in `LOOPCTL_API_KEY`. The orchestrator key must be linked to a registered agent (400 otherwise) and the tenant must be human-anchored (403 `custody_tier_required` otherwise). Does not touch `verified_status`. Safe to run twice: on an already-pending story the stage row is written only if it is stranded behind the story's claim epoch or still in flight. No request body. Required: `story_id` (refused locally if it is not a UUID). |
 
 ### Dispatch & Chain of Custody (v2) Tools
 
