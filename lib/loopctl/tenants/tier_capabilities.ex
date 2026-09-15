@@ -102,8 +102,9 @@ defmodule Loopctl.Tenants.TierCapabilities do
        "LCP-1 §9.2 custody owner key (root of trust). Reading story status, history and " <>
        "artifact reports stays open."},
     {:dispatch, :human_anchored,
-     "Minting per-dispatch ephemeral keys and lineage paths (L4). Reading your own " <>
-       "dispatches stays open."},
+     "Minting per-dispatch ephemeral keys and lineage paths (L4), and PLACING a queued " <>
+       "story on a runner — which mints a session dispatch, claims the story under it and " <>
+       "pushes. Reading your own dispatches stays open."},
     {:runner_pool, :human_anchored,
      "Enrolling and revoking agent delivery loop runners (#801): a runner is a machine " <>
        "that executes dispatched sessions, so admitting one is an execution root. Listing " <>
@@ -168,7 +169,14 @@ defmodule Loopctl.Tenants.TierCapabilities do
       # :register_owner_key (the custody owner key is the root of trust).
       "LoopctlWeb.TenantController"
     ],
-    dispatch: ["LoopctlWeb.DispatchController"],
+    dispatch: [
+      "LoopctlWeb.DispatchController",
+      # #803 — the control-side dispatch trigger. It MINTS a session dispatch and its lineage
+      # (the same L4 act this surface is about), and additionally claims the story and pushes
+      # to the runner. Placed here rather than under `runner_pool`: that surface is about
+      # ADMITTING a machine, and this is about minting a credential for a session on one.
+      "LoopctlWeb.DispatchPlacementController"
+    ],
     runner_pool: ["LoopctlWeb.RunnerController"],
     issue_intake: ["LoopctlWeb.IntakeSourceController"],
     token_budgets: [

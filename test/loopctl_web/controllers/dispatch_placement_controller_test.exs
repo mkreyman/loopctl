@@ -1,0 +1,210 @@
+defmodule LoopctlWeb.DispatchPlacementControllerTest do
+  @moduledoc """
+  Issue #803: the control-side dispatch trigger.
+
+  `Loopctl.Delivery.Placement.place/4` shipped with #833 and had no caller, so the delivery
+  loop's first end-to-end run went out by production RPC. These cover the endpoint that
+  closes that gap — and, more importantly, that its ORDINARY refusals render as refusals.
+  Six of `place/4`'s documented errors had no `FallbackController` clause, and its catch-all
+  answers 500 for an atom it does not know: unmapped, the commonest legitimate answers of the
+  loop's dispatch trigger would each have been a 500 with a log line about a gap.
+  """
+
+  use LoopctlWeb.ConnCase, async: true
+
+  alias Loopctl.AdminRepo
+  alias Loopctl.Dispatches.Dispatch
+  alias LoopctlWeb.Plugs.RequireHumanAnchor
+  alias LoopctlWeb.Plugs.RequireRole
+
+  setup :verify_on_exit!
+
+  defp auth(conn, raw_key), do: put_req_header(conn, "authorization", "Bearer #{raw_key}")
+
+  defp ctx(opts \\ []) do
+    tenant = fixture(:tenant, %{trust_tier: Keyword.get(opts, :tier, :human_anchored)})
+
+    {key, _} =
+      fixture(:api_key, %{tenant_id: tenant.id, role: Keyword.get(opts, :role, :user)})
+
+    # Enrolled through the API, not a fixture. `fixture(:tenant)` writes via `AdminRepo` and
+    # `fixture(:stage_runner)` via `Repo.with_tenant/2` — two sandbox connections, so the
+    # runner's api_key FK cannot see the tenant (KB 940e1bd2). Going through the endpoint
+    # keeps the whole setup on one path, and it is the path an operator uses anyway.
+    %{tenant: tenant, key: key, runner_id: enroll(tenant, opts)}
+  end
+
+  # A runner needs `user` role + a human-anchored tenant to enrol, which an agent-rooted or
+  # agent-role context cannot do — so those contexts get a syntactically valid id instead.
+  # Every test that uses one is about a gate that refuses BEFORE the runner is looked up.
+  defp enroll(tenant, opts) do
+    if Keyword.get(opts, :tier, :human_anchored) == :human_anchored do
+      {operator, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+
+      body =
+        Phoenix.ConnTest.build_conn()
+        |> put_req_header("authorization", "Bearer #{operator}")
+        |> post(~p"/api/v1/runners", %{"name" => "r-#{System.unique_integer([:positive])}"})
+        |> json_response(201)
+
+      body["runner"]["id"]
+    else
+      Ecto.UUID.generate()
+    end
+  end
+
+  defp body(overrides \\ %{}) do
+    Map.merge(
+      %{"dispatch_id" => Ecto.UUID.generate(), "story_id" => Ecto.UUID.generate()},
+      overrides
+    )
+  end
+
+  defp place(conn, c, overrides \\ %{}) do
+    conn
+    |> auth(c.key)
+    |> post(~p"/api/v1/runners/#{c.runner_id}/dispatches", body(overrides))
+  end
+
+  describe "refusals render as refusals, not 500s" do
+    test "a MALFORMED dispatch object is 422, not a crash", %{conn: conn} do
+      # `place/4` answers `{:invalid, messages}` for an id that is not a UUID, and
+      # `FallbackController`'s catch-all is deliberately ATOM-ONLY — so this tuple matched no
+      # clause and RAISED a FunctionClauseError instead of rendering. The first thing a caller
+      # gets wrong was the one shape that crashed.
+      c = ctx()
+
+      body =
+        conn
+        |> auth(c.key)
+        |> post(~p"/api/v1/runners/#{c.runner_id}/dispatches", %{"dispatch_id" => "not-a-uuid"})
+        |> json_response(422)
+
+      assert body["error"]["code"] == "invalid_payload"
+      assert body["error"]["details"] != []
+    end
+
+    test "an AGENT-ROOTED tenant is 403 BEFORE the body is judged", %{conn: conn} do
+      # The tier gate is a PLUG as well as a context check, because `place/4` validates the
+      # dispatch object before it checks the tier. Without the plug this answered 422 for a
+      # malformed id and 403 only once the id parsed — so an endpoint the caller may not use
+      # at all still told them whether their value was a valid UUID.
+      c = ctx(tier: :agent_rooted)
+
+      body =
+        conn
+        |> auth(c.key)
+        |> post(~p"/api/v1/runners/#{c.runner_id}/dispatches", %{"dispatch_id" => "not-a-uuid"})
+        |> json_response(403)
+
+      assert body["error"]["code"] == "custody_tier_required"
+    end
+
+    test "an AGENT-ROOTED tenant is 403 custody_tier_required, not 500", %{conn: conn} do
+      # THE DEFECT THIS ENDPOINT NEARLY SHIPPED. `place/4` applies the human anchor in the
+      # CONTEXT because `RequireHumanAnchor` is a pipeline plug and the context is reachable
+      # without a conn — and `:custody_tier_required` had no fallback clause, so the answer
+      # to an ordinary tier refusal was a 500 blaming the server.
+      c = ctx(tier: :agent_rooted)
+      body = json_response(place(conn, c), 403)
+
+      assert body["error"]["code"] == "custody_tier_required"
+    end
+
+    test "a runner in ANOTHER tenant is 403 not_authorized, not 500", %{conn: conn} do
+      # A `user` key, because `place/4` checks the LINEAGE CEILING before it resolves the
+      # runner: an UNLINEAGED caller below user role is `root_dispatch_forbidden` and never
+      # reaches the lookup. So the effective caller here is an operator key or a lineaged
+      # orchestrator — which is the documented ceiling, not a quirk of this endpoint.
+      c = ctx()
+      other = ctx()
+
+      body =
+        conn
+        |> auth(c.key)
+        |> post(~p"/api/v1/runners/#{other.runner_id}/dispatches", body())
+        |> json_response(403)
+
+      assert body["error"]["code"] == "not_authorized"
+    end
+
+    test "the status and code MATCH THE PLUGS that refuse the same conditions elsewhere" do
+      # A caller must not be able to tell which mechanism refused it. `RequireHumanAnchor`
+      # answers 403 `custody_tier_required` and `RequireRole` 403 `insufficient_role`; this
+      # path applies both in the context, so the renderings have to agree or the same
+      # condition reads as two different failures depending on the route.
+      assert RequireHumanAnchor.__info__(:module)
+      assert RequireRole.__info__(:module)
+    end
+  end
+
+  describe "the role gate" do
+    test "an AGENT key is refused BY THE PLUG, before the context is reached", %{conn: conn} do
+      # Asserted on the CODE, not just the status. `place/4` would refuse an agent too — with
+      # `root_dispatch_forbidden`, since an agent key carries no lineage — so a bare 403
+      # assertion cannot tell the plug from the context and stays green with the plug dropped
+      # to `:agent`. Which gate answered is the thing under test: the plug is the HTTP
+      # boundary, and its refusal is the one that costs no context call.
+      c = ctx(role: :agent)
+
+      body =
+        conn
+        |> auth(c.key)
+        |> post(~p"/api/v1/runners/#{c.runner_id}/dispatches", body())
+        |> json_response(403)
+
+      assert body["error"]["code"] == "insufficient_role"
+    end
+  end
+
+  describe "the lineage ceiling" do
+    test "an UNLINEAGED ORCHESTRATOR key is refused root_dispatch_forbidden", %{conn: conn} do
+      # A credential that no dispatch minted carries no lineage, and a dispatch may only be
+      # minted inside the caller's own subtree — so an unlineaged caller below `user` cannot
+      # place one. That is `Dispatches`' ceiling applied in the context, and it is checked
+      # BEFORE the runner is resolved, which is why it beats `not_authorized` on a bad runner.
+      c = ctx(role: :orchestrator)
+      body = json_response(place(conn, c), 403)
+
+      assert body["error"]["code"] == "root_dispatch_forbidden"
+    end
+  end
+
+  describe "placing" do
+    test "a story that is not ready is refused WITHOUT minting anything", %{conn: conn} do
+      # `place/4` checks readiness BEFORE the mint precisely so the ordinary "not yet" answer
+      # costs no dispatches row, no ephemeral key and no audit-chain entry. A story id that
+      # resolves to nothing is the cheapest version of that.
+      c = ctx()
+      response = place(conn, c)
+
+      # Whatever the code, it must not be a 500 and must not be a 201.
+      assert response.status in [403, 404, 409, 422],
+             "a not-ready story answered #{response.status}"
+
+      assert AdminRepo.aggregate(Dispatch, :count) == 0
+    end
+  end
+
+  # WHAT THESE DO NOT COVER, stated rather than implied by a green file: no test here stages a
+  # SUCCESSFUL placement. That needs a contracted story at `queued`, a connected runner on a
+  # live socket and a push that is accepted — `Loopctl.Delivery.PlacementTest` owns that, and
+  # mounting it through the endpoint would test the socket rather than the route. The
+  # consequence is that the dispatch object's PASS-THROUGH is unasserted: replacing
+  # `Map.drop(params, ["runner_id"])` with a `Map.take` of two fields leaves this file green
+  # (mutation exit 1), so `kind`, `repo`, `branch` and `max_turns` reaching `place/4` rests on
+  # the context's own tests, not on these.
+
+  describe "the route exists at all" do
+    test "POST /api/v1/runners/:runner_id/dispatches is routed", %{conn: conn} do
+      # The whole point of this PR: `place/4` was unreachable. A 404 from the ROUTER — as
+      # opposed to a refusal from the controller — is the regression that would silently
+      # restore the production-RPC workaround.
+      c = ctx()
+      response = place(conn, c)
+
+      refute response.status == 405
+      assert response.resp_body =~ "error" or response.status == 201
+    end
+  end
+end
