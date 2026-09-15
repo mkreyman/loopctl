@@ -12,6 +12,22 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
 
   use Loopctl.DataCase, async: true
 
+  # WHAT THIS FILE CANNOT TEST, named so nobody concludes from its green that the class is
+  # covered. `triage_verdicts` is RLS-scoped, and under the SQL sandbox the connection OWNS
+  # the table, so a query made with NO tenant context still returns rows here and returns
+  # nothing in production. Removing `Repo.with_tenant/2` from the existence read leaves every
+  # assertion below passing (measured: mutation exit 1).
+  #
+  # Three instruments were tried and each proved inert, which is why there is no test rather
+  # than a weak one: asserting on results (the sandbox hides it), asserting a context is set
+  # anywhere in `apply/3` (`Stages` sets one on every transition), and asserting a context
+  # precedes the first `triage_verdicts` query (`DispatchLedger.accepted_session/3` always
+  # sets one first). An assertion that cannot go red reports a green that means nothing.
+  #
+  # The nesting half of the same class IS mechanised, in `StagesNestingGuardTest`. This half
+  # is held by inspection, and by every tenant-scoped read in this module going through one
+  # helper — `in_tenant/2` — so there is a single place to inspect.
+
   import Ecto.Query
 
   alias Loopctl.ApiSpec.RunnerContract.RunnerTriageVerdict
