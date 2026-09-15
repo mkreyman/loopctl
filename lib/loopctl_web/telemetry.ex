@@ -151,8 +151,9 @@ defmodule LoopctlWeb.Telemetry do
         event_name: [:loopctl, :runners, :declared_kind_refused],
         tags: [:kind, :outcome],
         description:
-          "Dispatches a runner refused `kind_not_supported`. `outcome` says what loopctl " <>
-            "did with it: `permanent` is an UNDECLARING runner, now barred from that kind " <>
+          "Dispatches a runner refused in a way that contradicts what it declared — " <>
+            "`kind_not_supported` on a kind it named, or a FAULT on one. `outcome` says " <>
+            "which and what loopctl did: `permanent` is an UNDECLARING runner, now barred from that kind " <>
             "for the life of its runners row — alert on this one, the machine stays " <>
             "connected and looks healthy; `suppressed` is a runner contradicting its own " <>
             "declaration, bounded to that connection; `not_declared` refused a kind it " <>

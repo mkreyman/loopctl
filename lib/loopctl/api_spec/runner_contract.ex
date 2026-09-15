@@ -327,10 +327,15 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     #
     # `triage` stays in the vocabulary and out of the dispatchable set. Narrowing an enum would
     # be a BREAKING change and a minor version may only add — and the vocabulary is what a
-    # runner declares and answers `kind_not_supported` about. What keeps triage off the wire is
-    # `cast_dispatch/1`: its input is the reporter's own words, which the implementer must never
-    # see (design §10), so it needs its own payload with its own fencing, and `RunnerDispatch`
-    # has no field that could carry it.
+    # runner declares and answers `kind_not_supported` about.
+    #
+    # DO NOT READ AN OLDER REASON HERE. This comment used to say triage was off the wire
+    # because `RunnerDispatch` had no field that could carry the reporter's words. Since
+    # 1.7.0 it has one — `RunnerTriage` — and the moduledoc was rewritten to say so. This was
+    # the surviving copy of the retired reason, in the module whose own comment two lines up
+    # argues that a second copy is the drift to avoid. What holds triage back now is the
+    # OTHER END: no deployed runner accepts the kind. The moduledoc has the full version;
+    # this stays one sentence so the two cannot diverge again.
     @all ["triage", "implement"]
     @dispatchable ["implement"]
 
@@ -573,20 +578,24 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     #
     # So the runner's contract for this field is: paste it into your prompt verbatim. Do not
     # parse it, reformat it, re-wrap it, strip the prefixes, or unwrap the fence.
-    # MEASURED, not chosen, and it is the smaller of two bounds rather than a third number.
-    # `ByteRule` charges six bytes per character, so the 48_000-byte object cap below binds
-    # at roughly 6_000 characters of reporter text — measured 2026-09-15: a 4_000-character
-    # body renders to 30_242 bytes and an 8_000-character one is refused. A `maxLength` of
-    # 40_000 would therefore be a cap that can NEVER bind, which is the same defect as a test
-    # that cannot fail: it reads as a limit and enforces nothing.
+    # SIZED SO THE WHOLE OBJECT AT EVERY MAXIMUM FITS, which is the third attempt at this
+    # number and the first that holds for every record rather than for the convenient one.
     #
-    # 6_000 is set slightly under what the byte rule admits so the FIELD cap is what a runner
-    # author sees and reasons about, and the object cap is the backstop rather than the
-    # surprise. The six-times charge is deliberate worst-case-encoder accounting, so an ASCII
-    # report of this length costs about 6 KB on the wire and the frame is nowhere near full;
-    # that conservatism is the contract's, not this field's, and is not relaxed here for one
-    # object.
-    @max_untrusted_length 6_000
+    # It was 40_000, a cap the 48_000-byte object could never reach. Round 1 measured the
+    # byte rule at ~7_400 characters and set 6_000 "slightly under what the byte rule
+    # admits". Round 3 measured that claim on an ESCALATED record — `escalation_reasons` at
+    # its own 20x100 maximum, `html_url` at 500 — and got 52_074 bytes: over the cap, so
+    # 6_000 was reachable only on a record the detector had never flagged. Two identical
+    # 5_500-character reports, one flagged and one not, would have taken different paths for
+    # a reason no declared bound could explain.
+    #
+    # 5_000 is measured against the worst case, not the convenient one: 46_074 bytes with
+    # every other field of this object at its own maximum. A test asserts it.
+    #
+    # The six-times charge is deliberate worst-case-encoder accounting, so an ASCII report of
+    # this length costs about 5 KB on the wire and the frame is nowhere near full. That
+    # conservatism is the contract's and is not relaxed here for one object.
+    @max_untrusted_length 5_000
     @max_url_length 500
     @max_reasons 20
     @max_reason_length 100
@@ -934,12 +943,24 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     # than inventing a number.
     @confidences ["low", "medium", "high"]
 
-    @max_reasons 20
-    @max_reason_length 300
-    @max_missing 20
-    @max_missing_length 300
-    @max_evidence 20
-    @max_evidence_length 200
+    @max_reasons 5
+    @max_reason_length 150
+    # EVERY CAP BELOW IS SIZED SO THAT A VERDICT AT ALL OF THEM AT ONCE FITS, which is a
+    # stronger invariant than the one round 1 settled for and is the only one that never
+    # surprises a session. Round 1 asserted that no single field's maximum exceeds the object
+    # cap; round 3 measured that a draft story at its own declared maxima cost 47_424 of
+    # 48_000, so a single 200-character `evidence` entry — the field this schema calls the
+    # cheapest defence against a confident verdict with nothing behind it — was REFUSED. Each
+    # cap was individually reachable and the combination was not, which is the same "reads as
+    # a limit, is not what binds" defect one level up again.
+    #
+    # Measured at these values: the story is 23_814 bytes and a verdict with every field at
+    # its maximum is 45_322 against the 48_000 cap. A test asserts that, so the caps cannot
+    # drift apart from the budget again.
+    @max_evidence 6
+    @max_evidence_length 150
+    @max_missing 5
+    @max_missing_length 150
 
     # THE DRAFT STORY'S OWN CAPS, smaller than `RunnerStory`'s and not derived from them.
     # Measured: `RunnerStory`'s maxima nested here cost 294_202 bytes against this object's
@@ -949,19 +970,20 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     #
     # `title` and `domain_reference` keep `RunnerStory`'s values because they are already
     # small enough to be reachable; only the fields that blew the budget are reduced.
-    @max_story_description 1_500
-    @max_story_criteria 8
-    @max_story_criterion_length 250
-    @max_story_test_cases 8
-    @max_story_test_case_length 250
-    @max_story_touches 15
-    @max_story_touch_length 100
+    @max_story_description 900
+    @max_story_criteria 5
+    @max_story_criterion_length 200
+    @max_story_test_cases 4
+    @max_story_test_case_length 200
+    @max_story_touches 8
+    @max_story_touch_length 80
+    @max_story_domain_reference 300
     # Also measured down: 20 entries of a 200-character ref and a 500-character why cost
     # 86_842 bytes, nearly twice this object's whole budget. Ten contradictions is already
     # more than a verdict a human will read can carry.
-    @max_contradicts 10
-    @max_contradict_ref_length 150
-    @max_contradict_why_length 300
+    @max_contradicts 3
+    @max_contradict_ref_length 100
+    @max_contradict_why_length 200
     @contradict_kinds ["story", "kb", "code"]
 
     # The same budget as a dispatch object, for the same frame — a verdict arrives INBOUND
@@ -1083,10 +1105,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
                 maxItems: @max_story_touches,
                 items: %Schema{type: :string, maxLength: @max_story_touch_length}
               },
-              domain_reference: %Schema{
-                type: :string,
-                maxLength: RunnerStory.max_domain_reference_length()
-              }
+              domain_reference: %Schema{type: :string, maxLength: @max_story_domain_reference}
             }
           },
           escalation_reasons: %Schema{

@@ -571,6 +571,23 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
   # hold a uuid (228) or more. A string with no maxLength is charged at the longest thing the
   # contract actually puts in one, so the guard errs toward refusing rather than admitting.
   defp widest_value(%OpenApiSpex.Schema{type: :string}), do: String.duplicate("x", 36)
+
+  # AN UNBOUNDED ARRAY OR OBJECT IS THE SAME HOLE, and the round-2 fix closed it only for
+  # strings. An array with no `maxItems`, or an object with no `properties`, fell through to
+  # the catch-all and was charged 12 bytes — so the guard written to catch a field that can
+  # overrun the object cap would have reported an UNBOUNDED field as fitting, which is the
+  # cap-that-cannot-bind defect inside the test that exists to prevent it. Raising rather
+  # than guessing a number: a field with no bound has no widest value, and silently charging
+  # one is how this went wrong twice.
+  defp widest_value(%OpenApiSpex.Schema{type: type} = sub) when type in [:array, :object] do
+    raise """
+    #{inspect(type)} schema with no bound: #{inspect(sub)}
+
+    An array needs maxItems and an object needs properties, or this guard cannot measure it
+    and would report an unbounded field as fitting the object cap.
+    """
+  end
+
   defp widest_value(_sub), do: ""
 
   defp unknown_keywords(%{} = schema, known) do
@@ -733,6 +750,47 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
                RunnerContract.cast_triage_verdict(
                  verdict(%{"outcome" => "escalate", "escalation_reasons" => ["ambiguous"]})
                )
+    end
+
+    # #835 round 3, finding 1, and the invariant that replaces round 1's weaker one. Round 1
+    # asserted that no SINGLE field's maximum exceeds the object cap; round 3 measured that a
+    # draft story at its own declared maxima cost 47_424 of 48_000, so one 200-character
+    # evidence entry was refused. Every cap was individually reachable and the combination
+    # was not — the same "reads as a limit, is not what binds" defect one level up.
+    #
+    # A verdict at EVERY maximum at once must fit. That is stronger, it is what a session
+    # actually hits, and it is the only version that never surprises: a verdict inside every
+    # published bound is accepted, full stop.
+    test "a verdict with every field at its declared maximum fits the object cap" do
+      widest =
+        RunnerContract.RunnerTriageVerdict.schema().properties
+        |> Map.new(fn {name, sub} -> {name, widest_value(sub)} end)
+        |> Map.put(:outcome, "story")
+        |> Map.put(:confidence, "high")
+
+      bytes = ByteRule.bytes(widest)
+      cap = RunnerContract.RunnerTriageVerdict.max_bytes()
+
+      assert bytes <= cap,
+             "a verdict inside every declared bound costs #{bytes} against a cap of #{cap}, " <>
+               "so some field's published limit cannot be used with the others"
+    end
+
+    test "a triage object with every field at its declared maximum fits the object cap" do
+      # The same property for the dispatch half, and the case round 3 measured: untrusted's
+      # cap was reachable only on a record the injection detector had never flagged, so two
+      # identical reports took different paths for a reason no declared bound explained.
+      widest =
+        RunnerContract.RunnerTriage.schema().properties
+        |> Map.new(fn {name, sub} -> {name, widest_value(sub)} end)
+        |> Map.put(:truncated, true)
+        |> Map.put(:issue_number, 999_999)
+
+      bytes = ByteRule.bytes(widest)
+      cap = RunnerContract.RunnerTriage.max_bytes()
+
+      assert bytes <= cap,
+             "a triage object inside every declared bound costs #{bytes} against #{cap}"
     end
 
     test "undeclared keys are dropped rather than carried" do

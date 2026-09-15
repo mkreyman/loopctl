@@ -159,7 +159,7 @@
             },
             "untrusted": {
               "description": "The reporter's title, body and labels, ALREADY RENDERED as ONE fenced untrusted-data block. OPAQUE: paste it into your prompt verbatim and do not parse it, split it, reformat it, re-wrap it, strip its line prefixes or unwrap its fence. One block rather than one per field on purpose — splitting it would make the RUNNER decide how a title, a body and a label relate, which is a structural claim about reporter text that neither side can make safely. If a future session needs the title as its own field, loopctl will derive a separate TRUSTED one; do not recover it from here.",
-              "maxLength": 6000,
+              "maxLength": 5000,
               "type": "string"
             }
           },
@@ -805,7 +805,7 @@
         },
         "untrusted": {
           "description": "The reporter's title, body and labels, ALREADY RENDERED as ONE fenced untrusted-data block. OPAQUE: paste it into your prompt verbatim and do not parse it, split it, reformat it, re-wrap it, strip its line prefixes or unwrap its fence. One block rather than one per field on purpose — splitting it would make the RUNNER decide how a title, a body and a label relate, which is a structural claim about reporter text that neither side can make safely. If a future session needs the title as its own field, loopctl will derive a separate TRUSTED one; do not recover it from here.",
-          "maxLength": 6000,
+          "maxLength": 5000,
           "type": "string"
         }
       },
@@ -842,11 +842,11 @@
                 "type": "string"
               },
               "ref": {
-                "maxLength": 150,
+                "maxLength": 100,
                 "type": "string"
               },
               "why": {
-                "maxLength": 300,
+                "maxLength": 200,
                 "type": "string"
               }
             },
@@ -857,7 +857,7 @@
             ],
             "type": "object"
           },
-          "maxItems": 10,
+          "maxItems": 3,
           "type": "array"
         },
         "duplicate_of": {
@@ -871,28 +871,28 @@
         "escalation_reasons": {
           "description": "Why this needs a human. Meaningful when `outcome` is `escalate`.",
           "items": {
-            "maxLength": 300,
+            "maxLength": 150,
             "type": "string"
           },
-          "maxItems": 20,
+          "maxItems": 5,
           "type": "array"
         },
         "evidence": {
           "description": "What the session actually read: file paths with optional line numbers, knowledge-base article ids. It makes a verdict checkable by someone who does not re-run it, which is the cheapest defence against a confident verdict with nothing behind it. Capped hard: it is session-authored.",
           "items": {
-            "maxLength": 200,
+            "maxLength": 150,
             "type": "string"
           },
-          "maxItems": 20,
+          "maxItems": 6,
           "type": "array"
         },
         "missing_information": {
           "description": "What the session would need in order to reach a verdict — the field that makes an escalation actionable rather than putting a human back at the start of the same reading.",
           "items": {
-            "maxLength": 300,
+            "maxLength": 150,
             "type": "string"
           },
-          "maxItems": 20,
+          "maxItems": 5,
           "type": "array"
         },
         "outcome": {
@@ -908,26 +908,26 @@
           "properties": {
             "acceptance_criteria": {
               "items": {
-                "maxLength": 250,
+                "maxLength": 200,
                 "type": "string"
               },
-              "maxItems": 8,
+              "maxItems": 5,
               "type": "array"
             },
             "description": {
-              "maxLength": 1500,
+              "maxLength": 900,
               "type": "string"
             },
             "domain_reference": {
-              "maxLength": 500,
+              "maxLength": 300,
               "type": "string"
             },
             "test_cases": {
               "items": {
-                "maxLength": 250,
+                "maxLength": 200,
                 "type": "string"
               },
-              "maxItems": 8,
+              "maxItems": 4,
               "type": "array"
             },
             "title": {
@@ -936,10 +936,10 @@
             },
             "touches": {
               "items": {
-                "maxLength": 100,
+                "maxLength": 80,
                 "type": "string"
               },
-              "maxItems": 15,
+              "maxItems": 8,
               "type": "array"
             }
           },
@@ -1103,7 +1103,7 @@
             "max_length": 500
           },
           "untrusted": {
-            "max_length": 6000
+            "max_length": 5000
           }
         },
         "max_bytes": 48000
@@ -1111,16 +1111,16 @@
       "triage_verdict": {
         "fields": {
           "escalation_reasons": {
-            "max_item_length": 300,
-            "max_items": 20
+            "max_item_length": 150,
+            "max_items": 5
           },
           "evidence": {
-            "max_item_length": 200,
-            "max_items": 20
+            "max_item_length": 150,
+            "max_items": 6
           },
           "missing_information": {
-            "max_item_length": 300,
-            "max_items": 20
+            "max_item_length": 150,
+            "max_items": 5
           }
         },
         "max_bytes": 48000

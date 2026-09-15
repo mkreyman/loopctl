@@ -676,9 +676,10 @@ defmodule LoopctlWeb.RunnerChannel do
   # the worst case it could report is the same defect as the event that had no metric at
   # all, one layer in.
   #
-  # `outcome` separates the two, and both tags are bounded: `kind` comes from the LEDGER row
-  # of a dispatch loopctl itself sent, so it is from `dispatchable_kinds` and never a
-  # runner-supplied string, and `outcome` is two literals. Ids stay in the logs.
+  # `outcome` separates them, and both tags are bounded: `kind` comes from the LEDGER row of
+  # a dispatch loopctl itself sent, so it is from `dispatchable_kinds` and never a
+  # runner-supplied string, and `outcome` is four literals — `permanent`, `suppressed`,
+  # `not_declared` and `declared_but_faulted`. Ids stay in the logs.
   defp emit_kind_refused(tenant_id, runner, %{kind: kind}, declared, forced)
        when is_binary(kind) do
     outcome =
