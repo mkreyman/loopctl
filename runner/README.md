@@ -13,13 +13,14 @@ BEAM cluster. See `docs/agent-delivery-loop.md` section 2 for why.
 ## Status
 
 Build order steps **1a** and **1b** are implemented: hand-filed story runs (1a), and the daemon
-that keeps this machine joined to loopctl's runner pool (1b), on runner contract 1.4.0.
+that keeps this machine joined to loopctl's runner pool (1b), on runner contract 1.6.0.
 
 The daemon has a dispatch accept path, off by default. With `control.accepts_dispatches` false
 (the default) it reports `draining: true` and refuses every `dispatch` with `dispatches_disabled`.
 With it true, a dispatch passes the local allow-list (`LoopctlRunner.DispatchPolicy`: draining,
 capacity, free disk, repo, branch prefix, wall clock, turns, token budget), must be an `implement`
-dispatch, and must carry a well-formed `story` object (contract 1.5.0); anything else is refused
+dispatch, and must carry a well-formed `story` object (typed on the dispatch since contract 1.5.0); anything
+else is refused
 with a reason. An accepted dispatch runs `claude -p` in a worktree on the dispatch's branch, with a
 prompt built from a fixed local template in which every story field is fenced as untrusted data,
 and the runner config's own `allowed_tools`, under `--permission-mode dontAsk` so nothing else

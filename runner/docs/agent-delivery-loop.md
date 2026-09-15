@@ -62,8 +62,14 @@ never as a query parameter. Rotating that key through `/api_keys` is refused; ro
 `DELETE /api/v1/runners/:id` and re-enrolling.
 
 **Contract.** The wire contract is JSON Schema, `priv/runner_contract/v1.json` in mkreyman/loopctl
-(`contract_version` 1.5.0), vendored into this repo rather than re-typed. The join payload must
-declare `machine` exactly equal to the enrolled name. Joins are budgeted at 30 per minute per
+(`contract_version` 1.6.0), vendored into this repo rather than re-typed. The join payload must
+declare `machine` exactly equal to the enrolled name. It SHOULD also declare `kinds`, the
+dispatch kinds this machine runs: the field is optional, and since 1.6.0 a PRESENT AND NON-EMPTY
+one is the only thing loopctl consults for that runner. Absent or empty is read as
+`x-connection.implied_kinds` and decided by loopctl's ledger as before — where a
+`kind_not_supported` reply is permanent for the life of the runner's row. Declaring on every
+join is therefore what makes a kind refusal recoverable, and an empty array is not a way to
+refuse work; `draining` is. Joins are budgeted at 30 per minute per
 runner, a join refused as `not_authorized` disconnects the socket, status updates are at least
 1s apart, and unknown fields are dropped at every depth.
 

@@ -6,7 +6,8 @@ defmodule LoopctlRunner.ContractTest do
   defp join(overrides \\ %{}) do
     Map.merge(
       %{
-        "contract_version" => "1.5.0",
+        "contract_version" => "1.6.0",
+        "kinds" => ["implement"],
         "machine" => "minis",
         "cores" => 16,
         "memory_mb" => 28_000,
@@ -19,13 +20,14 @@ defmodule LoopctlRunner.ContractTest do
     )
   end
 
-  test "the vendored contract is v1.5.0 and names the socket and header the client uses" do
-    assert Contract.version() == "1.5.0"
+  test "the vendored contract is v1.6.0 and names the socket and header the client uses" do
+    assert Contract.version() == "1.6.0"
 
     assert %{
              "credential_header" => "x-loopctl-runner-token",
              "socket_path" => "/runner/socket/websocket",
-             "topic" => "runner:{runner_id}"
+             "topic" => "runner:{runner_id}",
+             "implied_kinds" => ["implement"]
            } = Contract.connection()
   end
 
@@ -67,6 +69,47 @@ defmodule LoopctlRunner.ContractTest do
 
   test "a complete join validates" do
     assert Contract.validate("RunnerJoin", join()) == :ok
+  end
+
+  test "the declared kinds are bounded by the contract, and this runner's fit" do
+    kinds = LoopctlRunner.Control.kinds()
+    assert Contract.validate("RunnerJoin", join(%{"kinds" => kinds})) == :ok
+
+    # Absent and empty both mean implied_kinds; neither is refused on the wire.
+    assert Contract.validate("RunnerJoin", Map.delete(join(), "kinds")) == :ok
+    assert Contract.validate("RunnerJoin", join(%{"kinds" => []})) == :ok
+
+    # The bounds come from the vendored file, never re-typed: a lowered one must fail here.
+    schema = Contract.schema_def("RunnerJoin")
+    max_items = schema["properties"]["kinds"]["maxItems"]
+    max_length = schema["properties"]["kinds"]["items"]["maxLength"]
+
+    assert {:error, [msg]} =
+             Contract.validate(
+               "RunnerJoin",
+               join(%{"kinds" => [String.duplicate("k", max_length + 1)]})
+             )
+
+    assert msg =~ "longer than #{max_length}"
+
+    assert {:error, [msg]} =
+             Contract.validate(
+               "RunnerJoin",
+               join(%{"kinds" => List.duplicate("implement", max_items + 1)})
+             )
+
+    assert msg =~ "more than #{max_items} items"
+
+    assert Enum.all?(kinds, &(String.length(&1) <= max_length))
+    assert length(kinds) <= max_items
+  end
+
+  test "the declaration is exactly the kinds the accept path can actually run" do
+    # Widening @kinds declares a capability loopctl then sends. The accept path requires a story
+    # object, which the contract allows only on an implement dispatch, so any other declared kind
+    # is refused as `other` — suppressing nothing, recording nothing, and soaking that kind for
+    # as long as it is declared. A new kind needs its payload and its own accept path first.
+    assert LoopctlRunner.Control.kinds() == ["implement"]
   end
 
   test "each constraint the contract declares is enforced" do

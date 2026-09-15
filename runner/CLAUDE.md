@@ -40,16 +40,24 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
   than being skipped, so a definition carrying one would refuse every payload on this side.
   `Contract.validate_against/3` tests a keyword on an inline schema before the vendored file
   uses it; loopctl's own test fails when its enforced set exceeds its exported set.
-- **A refusal naming a capability must be a real capability statement**, and
-  **`kind_not_supported` for `implement` would take this machine out of ALL work, permanently**.
-  loopctl records the refusal in `DispatchLedger`, keyed by kind: a cached negative with no
-  expiry and no clearing path, cleared only by revoking and re-enrolling the runner. `implement`
-  is the only dispatchable kind, so a refusal of it ends dispatch to this machine while it stays
-  connected and looks healthy. Today the only site that answers this reason is
-  `Control.implement_kind/1`, which fires for a kind that is NOT `implement` — so the ledger
-  caches that other kind and `implement` dispatch is untouched. Keep it that way: nothing here
-  may answer `kind_not_supported` for anything but a real capability statement, and a transient
-  local condition gets its own `DispatchPolicy` reason instead.
+- **A refusal naming a capability must be a real capability statement.** `kind_not_supported`
+  says this runner never runs that kind. The only site that answers it is
+  `Control.declared_kind/1`, for a kind outside `@kinds`; nothing else here may, and a transient
+  local condition gets its own `DispatchPolicy` reason instead. What the reply costs depends
+  entirely on whether the join declared kinds: for a runner that declares none, loopctl records
+  it in `DispatchLedger`, keyed by kind, with no expiry and no clearing path short of revoking
+  and re-enrolling — and since `implement` is the only dispatchable kind, refusing it there ends
+  dispatch to that machine while it stays connected and looks healthy.
+- **This runner declares its kinds on every join** (`RunnerJoin.kinds`, contract 1.6.0), from the
+  one `@kinds` list in `Control` that `declared_kind/1` also reads, so the permanence above does
+  not apply to it: loopctl reads a present, non-empty declaration INSTEAD of its ledger, and a
+  declared kind refused anyway is suppressed for the rest of that connection and re-sent on the
+  next one that declares it. Keep the two sides on one list — a declaration the check does not
+  honour is a self-contradiction, and a check stricter than the declaration loses that kind's
+  work. `@kinds` must never be empty (a compile-time raise refuses it): loopctl reads an empty
+  array as no declaration and falls back to the ledger. Draining is how this runner stops taking
+  work. Adding a kind is not enough to run it — the accept path requires a `story`, which only an
+  `implement` dispatch carries, so a new kind needs its payload and its own accept path first.
 - **The daemon starts only under `LOOPCTL_RUNNER_DAEMON=1`**, so `mix loopctl.run` never joins
   the pool.
 - **A loop session asks for a human by running `priv/bin/loop-escalate`**, the one command the

@@ -57,7 +57,13 @@ defmodule LoopctlRunner.ControlTest do
     assert_receive {:test_loopctl, {:join, ^runner_id, join}}, 5_000
     assert Contract.validate("RunnerJoin", join) == :ok
     assert join["machine"] == "testbox"
-    assert join["contract_version"] == "1.5.0"
+    assert join["contract_version"] == "1.6.0"
+    # Declared on EVERY join, from the same list the kind check reads.
+    assert join["kinds"] == LoopctlRunner.Control.kinds()
+    assert join["kinds"] == ["implement"]
+    # Non-empty ON THE WIRE, which is where it decides anything: loopctl reads an empty array as
+    # no declaration at all and falls back to its permanent ledger.
+    refute join["kinds"] == []
     assert join["repos"] == ["mkreyman/home_care_billing"]
     assert %{"sampled_at" => _, "free_disk_mb" => _} = join["sample"]
 
@@ -1527,9 +1533,12 @@ defmodule LoopctlRunner.ControlTest do
       assert %{"decision" => "refused", "reason" => "kind_not_supported", "detail" => detail} =
                reply
 
-      assert detail == "triage dispatches are not supported by this runner yet"
+      # The refusal names the declaration, from the same list the join sends.
+      assert detail == "this runner runs only: implement"
+      assert detail =~ Enum.join(LoopctlRunner.Control.kinds(), ", ")
 
-      # Permanent, so it wins over a transient policy refusal: at capacity, still kind_not_supported.
+      # The kind is judged before policy, so a draining runner still answers kind_not_supported
+      # rather than draining: the reason states a capability, not a moment.
       Control.set_draining(pid, true)
       TestLoopctl.Endpoint.broadcast(topic, "dispatch", story_dispatch(%{"kind" => "triage"}))
 

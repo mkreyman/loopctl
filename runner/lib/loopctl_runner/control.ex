@@ -4,7 +4,9 @@ defmodule LoopctlRunner.Control do
 
   A client, never a cluster peer. It connects to `/runner/socket/websocket` with the
   token in the `x-loopctl-runner-token` header, joins its own topic `runner:<runner_id>`
-  with a `RunnerJoin` payload, and pushes a `RunnerStatus` every `status_interval_s`.
+  with a `RunnerJoin` payload — which declares `kinds`, the dispatch kinds this machine runs, the
+  one field in it that changes what loopctl sends — and pushes a `RunnerStatus` every
+  `status_interval_s`.
   loopctl tracks the joined channel in its tenant-scoped Presence set; the channel dying
   with the socket IS the liveness signal, so there is nothing here to deregister.
 
@@ -26,9 +28,11 @@ defmodule LoopctlRunner.Control do
     1. a `dispatch_id` this runner already started is never run again: the same `claim_epoch`
        is answered `accepted` again (loopctl answers an identical repeat `ok`), another is
        refused `other`;
-    2. `kind` must be `implement`: any other is refused `kind_not_supported`, before the policy,
-       because loopctl reads that reason as permanent for this runner and a transient refusal
-       (draining, at capacity) would have it keep sending the kind;
+    2. the `kind` must be one this runner declared (`@kinds`): any other is refused
+       `kind_not_supported`, before the policy, because that reason states a capability and a
+       transient refusal (draining, at capacity) is a statement about a moment — answering the
+       capability first is what keeps the two from being confused. Since 1.6.0 the refusal lasts
+       the connection for a runner that declares, and is permanent for one that does not;
     3. `LoopctlRunner.DispatchPolicy` — its reason and detail on a refusal, with `in_flight`
        counting every run this process accepted from the moment it accepted it;
     4. the dispatch must carry a `story` object meeting what the schema cannot say, chiefly
@@ -169,10 +173,38 @@ defmodule LoopctlRunner.Control do
   @terminal_internal_error_attempts 8
   # The longest wait between stage retries.
   @max_stage_backoff_ms 5_000
-  # The refusal of a dispatch whose kind this runner does not run (contract 1.5.0): a capability
-  # statement, which loopctl reads as permanent for this runner, not a fault.
+  # The kinds this runner runs, declared on every join (`RunnerJoin.kinds`, contract 1.6.0) and
+  # checked against every dispatch. ONE list, read by both: a declaration the kind check does not
+  # honour is a self-contradiction loopctl suppresses for the rest of the connection, and a kind
+  # check stricter than the declaration takes the machine out of that kind's work.
+  # Fixed here, never from a story or the config, so nothing on the wire can widen it.
+  #
+  # ADDING A KIND HERE IS NOT ENOUGH TO RUN IT. The accept path below is implement-only: it
+  # requires a `story` object, which the contract allows only on an implement dispatch. Declaring
+  # a kind whose dispatch this runner cannot accept makes loopctl send it — the declaration
+  # decides — and every one is refused as `other`, which suppresses nothing and records nothing,
+  # so the machine soaks that kind for as long as it declares it. A new kind needs its payload,
+  # its own contained tool set and its own accept path first; `control_test` holds that canary.
+  #
+  # EMPTY IS THE ONE VALUE THAT MUST NEVER SHIP. loopctl reads an empty array as no declaration
+  # at all, falls back to its ledger, keeps sending `implement`, and caches the refusal
+  # permanently for the life of this runner's row — the exact trap declaring exists to escape.
+  # Draining is how this runner says it wants no work.
+  @kinds ["implement"]
+
+  if @kinds == [],
+    do:
+      raise(
+        "@kinds must never be empty: loopctl reads an empty declaration as none, falls back to " <>
+          "its permanent kind ledger, and this runner then refuses work it cannot recover from. " <>
+          "Use draining to stop taking work."
+      )
+
+  # The refusal of a dispatch whose kind this runner does not run: a capability statement, not a
+  # fault. Since 1.6.0 it is permanent only for a runner that declares nothing; this one declares,
+  # so loopctl re-sends the kind on a later connection that declares it.
   @kind_refusal_reason "kind_not_supported"
-  @kind_refusal "triage dispatches are not supported by this runner yet"
+  @kind_refusal "this runner runs only: " <> Enum.join(@kinds, ", ")
 
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -214,6 +246,7 @@ defmodule LoopctlRunner.Control do
     payload =
       %{
         "contract_version" => Contract.version(),
+        "kinds" => @kinds,
         "machine" => control.machine,
         "cores" => capacity["cores"],
         "memory_mb" => capacity["memory_mb"],
@@ -1126,7 +1159,7 @@ defmodule LoopctlRunner.Control do
     config = %{a.config | control: %{a.config.control | accepts_dispatches: a.accepts_dispatches}}
     state = %{draining: a.draining, in_flight: in_flight(a), free_disk_mb: &free_disk_mb(a, &1)}
 
-    with :ok <- implement_kind(dispatch),
+    with :ok <- declared_kind(dispatch),
          {:accept, fields} <- a.decide.(dispatch, config, state),
          {:ok, story_object} <- dispatch_story(dispatch),
          {:ok, story} <- local_story(dispatch, fields, story_object, a.config) do
@@ -1134,8 +1167,12 @@ defmodule LoopctlRunner.Control do
     end
   end
 
-  defp implement_kind(%{"kind" => "implement"}), do: :ok
-  defp implement_kind(_dispatch), do: {:refuse, @kind_refusal_reason, @kind_refusal}
+  defp declared_kind(%{"kind" => kind}) when kind in @kinds, do: :ok
+  defp declared_kind(_dispatch), do: {:refuse, @kind_refusal_reason, @kind_refusal}
+
+  @doc "The dispatch kinds this runner declares and runs."
+  @spec kinds() :: [String.t()]
+  def kinds, do: @kinds
 
   defp dispatch_story(dispatch) do
     case DispatchRun.story_object(dispatch) do
