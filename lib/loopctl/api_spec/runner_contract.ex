@@ -39,6 +39,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.7.0) a `triage` dispatch carries a `RunnerTriage` whose `untrusted` field is the reporter's own words, already fenced | | | | |
   | (1.8.0) `x-connection.limits` publishes every bounded field at every depth. A `fields` entry may now be a nested map, and an ARRAY of objects publishes its element bounds under `item_fields` — never `fields`, which always means the bounds of the object you are looking at | | | | |
   | (1.9.0) a triage session's result comes back on its own `triage_verdict` message, carrying EXACTLY ONE of `verdict` or `incomplete`. Idempotent per dispatch: a byte-identical resend is answered `ok`. `x-connection.permanent_errors` says which refusals are worth resending | | | | |
+  | (1.9.1) `RunnerTriageVerdictMessage` and `RunnerTriageVerdictAck` are actually DEFINED. 1.9.0 named both in `x-connection` and published neither, so the envelope was unresolvable and a runner had to re-type it. RE-VENDOR: a copy taken at 1.9.0 is missing both, and the version string is the only signal that it is | | | | |
 
   ## The story object (since 1.5.0)
 
@@ -257,7 +258,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   alias Loopctl.Delivery.StageMachine
   alias OpenApiSpex.Schema
 
-  @version "1.9.0"
+  @version "1.9.1"
   @major 1
 
   defmodule ByteRule do
@@ -1326,10 +1327,27 @@ defmodule Loopctl.ApiSpec.RunnerContract do
             minimum: 0,
             description: "The `claim_epoch` of the dispatch being answered, echoed."
           },
-          verdict: %Schema{
-            allOf: [RunnerTriageVerdict],
-            nullable: true,
-            description: "The session's judgement. Forbidden when `incomplete` is present."
+          # INLINED, exactly as `RunnerDispatch` inlines `story` and `triage`. `allOf` is
+          # ENFORCED by OpenApiSpex and NOT published by the export, so a runner validating
+          # against the vendored contract would have passed a verdict loopctl then refused —
+          # for a rule it could not read. The export's own guard says so and caught it.
+          #
+          # `nullable` AND the description are RESTORED ONTO the inlined schema, and both were
+          # lost by the first inlining. The nullable is the one that mattered: the replaced
+          # property accepted `"verdict": null` and `RunnerTriageVerdict.schema()` does not, so
+          # a runner whose serializer emits every declared key — Go without `omitempty`, serde
+          # without `skip_serializing_if` — sending `"verdict": null` beside a real
+          # `incomplete` was refused `invalid_payload`. That code is in `permanent_errors`, so
+          # the correct client behaviour is NOT to resend and the run's only output is lost for
+          # good. The asymmetry was the tell: `incomplete` and `detail` stayed nullable, so the
+          # same runner could send a verdict and could never send an incomplete.
+          verdict: %{
+            RunnerTriageVerdict.schema()
+            | nullable: true,
+              description:
+                "The session's judgement. Forbidden when `incomplete` is present. Its own " <>
+                  "fields are inlined here rather than referenced, so the whole shape is " <>
+                  "resolvable from this message."
           },
           incomplete: %Schema{
             type: :string,
@@ -1878,6 +1896,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     RunnerStory,
     RunnerTriage,
     RunnerTriageVerdict,
+    RunnerTriageVerdictMessage,
+    RunnerTriageVerdictAck,
     RunnerDispatch,
     RunnerDispatchReply,
     RunnerTraceEvent,

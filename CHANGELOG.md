@@ -4,6 +4,31 @@ All notable changes to loopctl are documented here.
 
 ## [Unreleased] — 2026-08-21 — The provenance harvest runs on a cadence
 
+### Fixed
+
+- **Contract 1.9.1 — the envelope is actually published, and re-vendoring is signalled.**
+  1.9.0 named `RunnerTriageVerdictMessage` and `RunnerTriageVerdictAck` in `x-connection` and
+  defined neither. **A copy of `v1.json` taken at 1.9.0 is missing both**, and the version
+  string was the only thing that could tell a holder to take it again — so this bumps, even
+  though 1.9.0's DECLARED shape is unchanged. `supported_version/1` matches on the major, so
+  the bump breaks no handshake.
+
+- **Contract 1.9.0 named two schemas `$defs` did not define.** `x-connection.events.triage_verdict`
+  pointed at `RunnerTriageVerdictMessage` and `x-connection.replies.triage_verdict` at
+  `RunnerTriageVerdictAck`, and neither was in `@schemas` — the list `$defs` is built from. So
+  a vendoring runner could resolve the verdict OBJECT and not the ENVELOPE, and would have had
+  to re-type `dispatch_id`, `claim_epoch`, the exactly-one-of rule and the `incomplete` enum
+  from a commit message into its own source. That is exactly what publishing
+  `x-connection.permanent_errors` and `x-connection.limits` exists to prevent. Found by the
+  `loopctl-runner` session attempting to vendor it, not by this repo's suite; a guard now
+  asserts the map is TOTAL.
+
+  Also: the envelope declared its `verdict` with `allOf`, which OpenApiSpex ENFORCES and the
+  export does not publish — so a runner validating against the vendored contract would have
+  passed a verdict loopctl then refused, for a rule it could not read. It is inlined now, as
+  `RunnerDispatch` already inlines `story` and `triage`. The export's own keyword guard
+  caught that one.
+
 ### Added
 
 - **`POST /api/v1/runners/:runner_id/dispatches` — the control-side dispatch trigger (#803).**

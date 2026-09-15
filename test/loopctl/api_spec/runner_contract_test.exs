@@ -40,12 +40,22 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       assert File.read!(path) == RunnerContract.encoded_json_schema()
     end
 
-    test "declares every schema the contract names, and requires parent on trace events" do
+    test "publishes one $defs entry per module, and requires parent on trace events" do
       defs = RunnerContract.json_schema()["$defs"]
 
-      for mod <- RunnerContract.schema_modules() do
-        assert Map.has_key?(defs, mod.schema().title)
-      end
+      # NOT `for mod <- schema_modules(), assert Map.has_key?(defs, mod.schema().title)`, which
+      # is what this was and which is TRUE BY CONSTRUCTION: `defs` is built by mapping that
+      # same list, so the loop asserts a map contains the keys it was just built from. It
+      # stayed green through the 1.9.0 defect its own name describes — mutation-proved:
+      # deleting a module from `@schemas` left it passing.
+      #
+      # The COUNT is what that loop was reaching for, and it closes a hole nothing else does:
+      # `Map.new/2` silently DROPS a module whose `title` duplicates another's, and titles
+      # already diverge from module names here (`RunnerStage` publishes as
+      # `"RunnerStageEffects"`). A collision would eat an entry with no error, and the two
+      # definitions no `x-connection` name references are exactly the ones the totality guard
+      # could not notice going missing.
+      assert map_size(defs) == length(RunnerContract.schema_modules())
 
       assert "parent" in defs["RunnerTraceEvent"]["required"]
       assert defs["RunnerTraceEvent"]["properties"]["parent"]["type"] == ["string", "null"]
@@ -56,8 +66,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.9.0"
-      assert schema["x-contract-version"] == "1.9.0"
+      assert RunnerContract.version() == "1.9.1"
+      assert schema["x-contract-version"] == "1.9.1"
 
       assert %{
                "dispatch_reply" => "RunnerDispatchReply",
@@ -1394,6 +1404,97 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       assert_raise ArgumentError, ~r/array of arrays/, fn ->
         RunnerContract.Limits.of(schema, 100)
       end
+    end
+  end
+
+  describe "the published schema map is TOTAL" do
+    test "every name in events and replies resolves to a $defs definition" do
+      # 1.9.0 SHIPPED WITHOUT THIS and the runner session found it, not the suite. Both new
+      # modules were written, cast against, tested and named in `x-connection` — and neither
+      # was added to `@schemas`, which is what builds `$defs`. So the published contract
+      # pointed at two definitions it did not contain.
+      #
+      # The cost is precisely what `permanent_errors` was published to avoid: a vendoring
+      # runner cannot resolve the envelope, so it re-types `dispatch_id`, `claim_epoch`, the
+      # exactly-one-of rule and the `incomplete` enum from a COMMIT MESSAGE into its own
+      # source — and then nothing on either side can check the two agree. The 1.8.0 lesson
+      # was to read bounds from the contract instead of re-typing them; this made that
+      # impossible for the one message it was published for.
+      schema = RunnerContract.json_schema()
+      defs = Map.keys(schema["$defs"]) |> MapSet.new()
+      connection = schema["x-connection"]
+
+      named =
+        connection["events"]
+        |> Map.values()
+        |> Enum.concat(Map.values(connection["replies"]))
+        |> MapSet.new()
+
+      dangling = MapSet.difference(named, defs)
+
+      assert MapSet.size(dangling) == 0,
+             "x-connection names schemas $defs does not define: " <>
+               inspect(MapSet.to_list(dangling))
+
+      # NEVER VACUOUS — against SHRINKING, which is the quiet failure. (Not against a rename:
+      # that makes `Map.values(nil)` raise, which is loud and needs no guard.)
+      assert MapSet.size(named) >= 10
+    end
+
+    test "every OTHER cross-reference in x-connection is total too" do
+      # The `$defs` check above closes ONE class. Four more could dangle exactly the same way
+      # and none was guarded — measured clean today, which is the moment to pin them rather
+      # than after a runner finds the next one by trying to vendor it.
+      connection = RunnerContract.json_schema()["x-connection"]
+      events = connection["events"] |> Map.keys() |> MapSet.new()
+      errors = connection["errors"] |> Map.keys() |> MapSet.new()
+      inbound = MapSet.new(RunnerContract.inbound_events())
+
+      # `join` is the phx_join reply and `unknown_event` answers anything unnamed; neither is
+      # an event in the map, and both legitimately carry refusals.
+      assert MapSet.difference(errors, MapSet.union(events, MapSet.new(~w(join unknown_event)))) ==
+               MapSet.new(),
+             "an errors entry names something that is not an event"
+
+      # The direction that actually bites: an event a runner may SEND with no published
+      # refusals is one whose failures it cannot branch on.
+      assert MapSet.difference(inbound, errors) == MapSet.new(),
+             "an inbound event publishes no refusal codes"
+
+      assert MapSet.difference(MapSet.new(Map.keys(connection["replies"])), events) ==
+               MapSet.new(),
+             "a replies entry names something that is not an event"
+
+      # A permanent code no event can return is dead text a runner branches on for ever.
+      reasons = connection["errors"] |> Map.values() |> List.flatten() |> MapSet.new()
+
+      permanent =
+        connection["permanent_errors"]
+        |> Map.values()
+        |> List.flatten()
+        |> MapSet.new()
+
+      assert MapSet.difference(permanent, reasons) == MapSet.new(),
+             "permanent_errors names a code no event can return"
+
+      # ITS KEYS TOO, not only its values. `permanent_error?/2` reads
+      # `Map.get(@permanent_errors, event, [])`, so a MISTYPED event key silently degrades
+      # every code under it from permanent to transient — and a conforming runner then retries
+      # a doomed verdict for ever, which is the failure the "*"-plus-per-event split exists to
+      # prevent. `"*"` is the deliberate non-event key.
+      assert connection["permanent_errors"]
+             |> Map.keys()
+             |> MapSet.new()
+             |> MapSet.delete("*")
+             |> MapSet.difference(events) == MapSet.new(),
+             "permanent_errors is keyed by something that is not an event"
+
+      # Non-vacuous where it can be. Not because a rename would compare empty sets — renaming
+      # `events` makes `Map.values(nil)` raise, which is loud — but because the maps SHRINKING
+      # is the quiet failure: a set that lost most of its members still satisfies every
+      # difference assertion above.
+      assert MapSet.size(inbound) >= 5
+      assert MapSet.size(permanent) >= 10
     end
   end
 
