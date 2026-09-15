@@ -4,6 +4,36 @@ All notable changes to loopctl are documented here.
 
 ## [Unreleased] — 2026-08-21 — The provenance harvest runs on a cadence
 
+### Added
+
+- **Contract 1.9.3 — `x-connection.triage_gating_reasons` publishes the gating vocabulary.**
+  `Loopctl.DeliveryGates.GateA` matches two `escalation_reasons` entries as WHOLE STRINGS to
+  decide whether a human is asked, while the contract typed that field as free-form text with
+  no enum — so the rule deciding the outcome lived in one side's prose and could not be
+  checked from the other. That is the 1.9.0 envelope failure again, and it had already
+  happened on the interactive path: until today no file in `claude-config` named either code,
+  the lens prompts asked for "one plain sentence per reason", and neither code could fire at
+  all. Both the runner session and the claude-config session asked for this independently.
+
+  **What it does NOT mean, stated because the first draft of the published description
+  overstated it:** a triage verdict's `escalation_reasons` gate nothing today —
+  `TriageVerdict` records the field and routes on `outcome` alone, and the gate's input is a
+  `trio_outputs` fact supplied to `POST /stories/:id/merge-precondition`. The two shapes do
+  not correspond yet (three outputs keyed `verdict` with a numeric confidence, against one
+  message keyed `outcome` with an enum), so the list is published to be EMITTED against and
+  the wiring is a change that must reconcile them. An escalate verdict must also now carry at
+  least one entry that is NOT a code: publishing the vocabulary made a bare code satisfy the
+  "an escalation must carry something" guard, and a classification is not words a person can
+  act on.
+
+  Published as a LIST rather than an enum on the field, deliberately: `escalation_reasons` is
+  also where a lens says what it actually saw, and an enum would refuse the sentence that
+  makes an escalation actionable. Validate the gating entries against the list; the rest of
+  the field stays prose. The list is derived from `GateA.gating_reason_codes/0` and asserted
+  against it, so the published contract and the gate that reads it cannot drift. A code not on
+  it — `already_implemented_at_head` today — is recorded and never gates until its measured
+  rate earns a place.
+
 ### Fixed
 
 - **Contract 1.9.2 — a nullable enum publishes `null` as a member.** `incomplete` was typed
@@ -94,6 +124,33 @@ All notable changes to loopctl are documented here.
 
   **A rule now governs this**, in `CLAUDE.md`: an operator-facing endpoint is not done until an
   MCP tool calls it, in the same PR.
+
+- **An accepted triage verdict writes the story and QUEUES it (#803).** This is the join the
+  loop was missing: `Loopctl.Delivery.TriageVerdict`'s `story` route was empty, so an accepted
+  verdict left the story at `triaged` — and nothing in `lib/` wrote `triaged -> queued`, while
+  the dispatch driver selects stage rows at `queued`. The loop therefore had no continuation
+  at all: intake promoted a story, triage accepted it, and it stopped one stage short of the
+  only thing that could pick it up. An accepted verdict now replaces the stub row
+  (`TriageTrigger` writes loopctl's own facts — a repository and an issue number — precisely
+  so the reporter's title never wears a story's clothes, and its comment already said "triage
+  replaces this with the drafted title") with the drafted title, description and acceptance
+  criteria, and then advances to `queued`.
+
+  **Every drafted string is sanitised first** (`Loopctl.Delivery.Untrusted.sanitise/1`, new):
+  bidirectional overrides, zero-width characters, Unicode TAG runs and controls become visible
+  `<U+XXXX>` escapes, because a drafted title is composed by a session that has just read
+  reporter text and lands in a field a runner builds its prompt from. Ordinary prose is NOT
+  touched — a draft saying "ignore previous instructions" is stored verbatim, since that is a
+  semantic attack for the triage trio to catch and mangling prose would corrupt real stories.
+  An escalation or a rejection drafts nothing, and a draft loopctl could not DISPATCH — one
+  whose sanitised title exceeds the cap the stored story is judged against, one whose title is
+  empty, or one stating no acceptance criteria — is ESCALATED rather than queued, leaving the
+  stub row intact. A half-applied route (the first transition committed, the second not) is
+  COMPLETED by the resend, including after a claim reclaim, rather than reported as a clean
+  run: nothing else in `lib/` writes `triaged -> queued`, so a story stranded there was dead. The draft's
+  `test_cases`, `touches` and `domain_reference` are kept under `metadata["triage_draft"]`:
+  the story row has no columns for them and they are dispatch options, but dropping them lost
+  what a session wrote.
 
 - **A placed dispatch carries the STORY, built server-side (#803).** `Placement.place/4` now
   builds the `implement` dispatch's `story` object from loopctl's own rows
