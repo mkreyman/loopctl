@@ -250,6 +250,17 @@ calling `/memory/recall` and `/knowledge/search` separately.
   `meta.results_ranking: "heuristic_cross_source"`) **plus** the untouched
   per-source `memory` and `knowledge` envelopes so callers can re-rank.
   Cross-source scores are heuristic, not calibrated.
+- **`meta.answer_confidence` says whether the knowledge results are ANSWERS**
+  (`answer` / `weak` / `none`), beside `meta.provenance` and `meta.confidence`
+  lifted from the hybrid resolver. Semantic search has no no-answer mode, so a
+  query with nothing relevant still returns its nearest neighbours, ranked and
+  scored — every client that tried to threshold that had to invent a floor, and
+  the measured bands overlapped (real tops 0.372-0.600, junk tops 0.005-0.456).
+  The verdict is separation within this query's own returned knowledge rows, not
+  a constant, so it survives a change of fusion, embedding model or corpus size.
+  All three describe the KNOWLEDGE half: `none` means the corpus returned
+  nothing, even when the memory half answered. Do not re-derive a threshold from
+  `confidence`.
 - **Query validation up front**: a non-string / blank / whitespace-only `query`
   is `422` (`invalid_query`); a query longer than **500 characters** is `422`
   (`query_too_long`) — rejected *before* any embedding is generated, matching
