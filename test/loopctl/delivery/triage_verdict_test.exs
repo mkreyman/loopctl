@@ -278,26 +278,115 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
 
       assert TriageVerdictRecord.digest(a) == TriageVerdictRecord.digest(stringified)
 
+      # PRESENT-WITH-NULL vs ABSENT. `verdict`, `incomplete` and `detail` are all
+      # `nullable: true`, so a runner may send `"incomplete": null` beside a verdict — and the
+      # cast KEEPS a present-null key while dropping an absent one. A retry path that rebuilds
+      # the object without the nulls would otherwise be refused `already_recorded`,
+      # permanently, for the same verdict.
+      assert TriageVerdictRecord.digest(%{outcome: "story", detail: nil}) ==
+               TriageVerdictRecord.digest(%{outcome: "story"})
+
+      # AND A LONG STRING IS NOT TRUNCATED. `inspect/1` stops at 4096 characters by default,
+      # so two different verdicts sharing a long prefix would digest the same and the second
+      # would be accepted as a REPLAY of the first — a different verdict applied silently,
+      # which on a reject is a second close on the reporter's ticket. No field reaches 4096
+      # today; this is the guard for when one does.
+      long = String.duplicate("a", 5_000)
+
+      refute TriageVerdictRecord.digest(%{d: long <> "x"}) ==
+               TriageVerdictRecord.digest(%{d: long <> "y"})
+
       # And it still separates things that really differ, so the guard is not vacuous.
       refute TriageVerdictRecord.digest(a) ==
                TriageVerdictRecord.digest(%{a | confidence: "low"})
     end
 
-    test "A FAILED TRANSITION ROLLS THE RECORD BACK, so the resend can still land" do
-      # The asymmetry that forced one transaction. Recorded first and transitioned second,
-      # a failure here would leave a row that makes every resend report success while the
-      # story sits at `detected` for ever.
-      %{story: story, runner: runner, record: record} = session(stage: :queued)
+    test "A RECORD WHOSE TRANSITIONS DID NOT LAND IS REPAIRED BY THE RESEND" do
+      # The record and the transitions are NOT atomic and cannot be: `Stages.advance/4` calls
+      # `Repo.with_tenant/2`, which refuses to be nested — and `Loopctl.Repo`'s own comment
+      # says that guard is inert under the sandbox, "i.e. for the entire test suite", so
+      # wrapping them looked green here and would have raised on every real verdict in
+      # production, taking the channel down with it.
+      #
+      # So "recorded but not transitioned" is a REAL state, and what makes the pair converge
+      # is the resend the runner is already told to make. Staged directly, because the window
+      # it opens is between two statements and cannot be hit from outside.
+      %{story: story, runner: runner, record: record} = session()
+      message = verdict_message(record, verdict("reject"))
 
-      assert {:error, _reason} =
-               TriageVerdict.apply(
-                 story.tenant_id,
-                 runner.id,
-                 verdict_message(record, verdict("reject"))
-               )
+      as_tenant(story.tenant_id, fn ->
+        Repo.insert!(%TriageVerdictRecord{
+          tenant_id: story.tenant_id,
+          dispatch_id: record.dispatch_id,
+          story_id: story.id,
+          claim_epoch: @epoch,
+          payload_digest: TriageVerdictRecord.digest(message),
+          outcome: "reject",
+          confidence: "high",
+          payload: %{"outcome" => "reject"}
+        })
+      end)
 
+      assert stage_of(story) == :detected
+
+      # A replay that TRUSTED the record would answer ok here and leave the story at
+      # `detected` for ever, with every resend reporting success — the exact failure the
+      # discarded transaction was there to prevent.
+      assert {:ok, %{replayed?: true}} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+
+      assert stage_of(story) == :failed
+      assert length(records(story.tenant_id)) == 1
+    end
+
+    test "a replay whose transitions ALREADY landed is ok, not a refusal" do
+      # The other half of the repair: `stale_stage` on the first transition means the story is
+      # already past `detected`, so the work was done. Refusing there would tell a runner its
+      # successful verdict failed.
+      %{story: story, runner: runner, record: record} = session()
+      message = verdict_message(record, verdict("reject"))
+
+      assert {:ok, %{replayed?: false}} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+      assert {:ok, %{replayed?: true}} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+      assert stage_of(story) == :failed
+    end
+
+    test "a CHANGESET failure is NOT reported as already_recorded" do
+      # Collapsing every changeset error into `already_recorded` told a runner — permanently,
+      # since the contract publishes that code as permanent — that a DIFFERENT verdict was on
+      # file, when the real cause was a length validation or a CHECK constraint. It also
+      # logged nothing, so the true cause was unrecoverable from the refusal.
+      %{story: story, runner: runner, record: record} = session()
+
+      over_long = %{
+        dispatch_id: record.dispatch_id,
+        claim_epoch: record.claim_epoch,
+        incomplete: "session_crashed",
+        detail: String.duplicate("d", 1_000)
+      }
+
+      assert {:error, {:invalid, fields}} =
+               TriageVerdict.apply(story.tenant_id, runner.id, over_long)
+
+      assert "detail" in fields
       assert records(story.tenant_id) == []
-      assert stage_of(story) == :queued
+    end
+
+    test "the RACED insert re-reads and replays rather than refusing" do
+      # Two deliveries of the SAME verdict in flight at once — a rejoin whose old channel is
+      # still draining, two sockets, two nodes. The loser trips the unique index, and refusing
+      # it `already_recorded` would be a PERMANENT refusal for an identical verdict: the
+      # contract tells a conforming runner not to resend that code, so the documented close of
+      # this race ("the runner resends, which then finds the row") could never happen.
+      #
+      # The window is between two statements and cannot be hit from outside, so the row is
+      # planted first and the SECOND delivery is the one under test.
+      %{story: story, runner: runner, record: record} = session()
+      message = verdict_message(record, verdict("reject"))
+
+      assert {:ok, %{replayed?: false}} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+
+      # Byte-identical, so it is the same verdict however it arrived.
+      assert {:ok, %{replayed?: true}} = TriageVerdict.apply(story.tenant_id, runner.id, message)
     end
 
     test "a stale claim epoch is refused before anything is written" do

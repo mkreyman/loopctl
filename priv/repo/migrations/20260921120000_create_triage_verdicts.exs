@@ -45,12 +45,19 @@ defmodule Loopctl.Repo.Migrations.CreateTriageVerdicts do
   ## Isolation
 
   `tenant_id` on every row, RLS ENABLED (not FORCE — the production role owns the table
-  without BYPASSRLS), and the composite foreign keys carry `tenant_id` so a row can never
-  reference another tenant's dispatch or story.
+  without BYPASSRLS), and every read goes through `Repo.with_tenant/2` so the policy applies.
 
-  `ON DELETE NO ACTION`, never RESTRICT, for the reason migration `20260918100000` states at
-  length: a tenant cascade deletes in an order Postgres chooses, and RESTRICT turns that into
-  a failure the sweep swallows.
+  THERE IS NO FOREIGN KEY ON `dispatch_id` OR `story_id`, deliberately, and an earlier draft
+  of this note claimed composite tenant-carrying ones that do not exist — which would have
+  left a later reader auditing cross-tenant reachability satisfied by a paragraph instead of
+  by the schema. The reason there is none is the same reason `story_id` is denormalised here:
+  this row is the record of what triage DECIDED, and it has to outlive the dispatch, which is
+  pruned. A reference would either block that pruning or delete the record with it.
+
+  What stands in for the FK is that neither id is ever taken from the wire: `dispatch_id` is
+  resolved through `DispatchLedger.accepted_session/3`, which is scoped to the tenant AND the
+  runner, and `story_id` is read off that session rather than supplied. A row naming another
+  tenant's dispatch cannot be produced by the only path that writes one.
   """
 
   use Ecto.Migration

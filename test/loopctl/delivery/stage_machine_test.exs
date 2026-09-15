@@ -226,8 +226,12 @@ defmodule Loopctl.Delivery.StageMachineTest do
     # thing a session reports is the DEPLOY, and `deployed` is not terminal — so the SUCCESS
     # path released no slot inline and waited out heal's wall-clock bound. The session ending
     # is not the story ending, and that is the distinction the set now draws.
+    # `:triaged` joined the set in 1.9.0 for the same reason `:deployed` did: a TRIAGE session
+    # stops the moment it states its verdict, and a `story` outcome — the common case — stops
+    # there, so leaving it out held the triage dispatch's slot until the lease reclaim swept
+    # it. No other session arrives at `:triaged`.
     assert Enum.sort(StageMachine.session_ends_at()) ==
-             Enum.sort(StageMachine.terminal_stages() ++ [:deployed])
+             Enum.sort(StageMachine.terminal_stages() ++ [:deployed, :triaged])
 
     for stage <- StageMachine.stages() do
       assert StageMachine.ends_session?(stage) == stage in StageMachine.session_ends_at()

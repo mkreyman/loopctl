@@ -63,9 +63,16 @@ defmodule Loopctl.Delivery.TriageVerdictRecord do
     :sha256 |> :crypto.hash(canonical(term)) |> Base.encode16(case: :lower)
   end
 
+  # NIL-VALUED KEYS ARE DROPPED, and that is not tidiness. `verdict`, `incomplete` and
+  # `detail` are all `nullable: true` on the wire, so a runner may send `"incomplete": null`
+  # beside a verdict — and the cast KEEPS a key that is present-with-null while dropping one
+  # that is absent. A runner whose first attempt emits explicit nulls and whose retry path
+  # rebuilds the object without them would get `already_recorded`, permanently, for the same
+  # verdict: exactly the failure this digest exists to prevent, one level down.
   defp canonical(%{} = map) when not is_struct(map) do
     inner =
       map
+      |> Enum.reject(fn {_k, v} -> is_nil(v) end)
       |> Enum.map(fn {k, v} -> {to_string(k), v} end)
       |> Enum.sort_by(&elem(&1, 0))
       |> Enum.map_join(",", fn {k, v} -> canonical(k) <> ":" <> canonical(v) end)
@@ -77,7 +84,16 @@ defmodule Loopctl.Delivery.TriageVerdictRecord do
     do: "[" <> Enum.map_join(list, ",", &canonical/1) <> "]"
 
   defp canonical(nil), do: "null"
-  defp canonical(value) when is_binary(value), do: inspect(value)
+
+  # `printable_limit: :infinity`, because `inspect/1` TRUNCATES a binary at 4096 characters by
+  # default — so two different verdicts sharing a 4096-character prefix would digest
+  # identically and the second would be accepted as a REPLAY of the first. That is the
+  # dangerous direction: a different verdict applied silently, which on a reject is a second
+  # close on the reporter's ticket. No field cap reaches 4096 today; the moment one grows past
+  # it, this would have become live and silent.
+  defp canonical(value) when is_binary(value),
+    do: inspect(value, printable_limit: :infinity, limit: :infinity)
+
   defp canonical(value), do: to_string(value)
 
   @doc """

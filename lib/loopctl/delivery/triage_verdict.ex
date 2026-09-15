@@ -186,44 +186,78 @@ defmodule Loopctl.Delivery.TriageVerdict do
   defp record_and_advance(tenant_id, runner_id, session, message, transitions) do
     digest = TriageVerdictRecord.digest(message)
 
-    # THE EXISTENCE CHECK IS OUTSIDE THE TRANSACTION, and deliberately: neither of its two
-    # answers needs one. A byte-identical resend writes nothing, and a differing one is
-    # refused before any write. Only the insert-and-advance below is atomic, and the race
-    # between this read and that insert is closed by `triage_verdicts_dispatch_uidx` rather
-    # than by holding a transaction open across a decision that does not need it.
-    case existing(tenant_id, message.dispatch_id) do
+    # INSIDE `with_tenant/2`, because `triage_verdicts` is RLS-scoped and a read with no
+    # tenant context matches NOTHING under the `Loopctl.Repo` role — `current_tenant_id()` is
+    # NULL and the policy excludes every row. Bare, this read always answered `nil` in
+    # production, so the replay branch could never be taken: every byte-identical resend fell
+    # through to the insert, tripped the unique index and was refused `already_recorded`, and
+    # the feature's central guarantee inverted into a permanent refusal. Invisible in tests,
+    # where the sandbox connection owns the table and no policy applies.
+    case in_tenant(tenant_id, fn -> existing(tenant_id, message.dispatch_id) end) do
       %TriageVerdictRecord{payload_digest: ^digest} = record ->
-        # THE RESEND. Same bytes, already applied — answered ok, and nothing is applied a
-        # second time. The transition this verdict drove is not undoable (a reject closes the
-        # reporter's ticket), so a second apply is a second close on a real person's ticket.
-        {:ok, %{record: record, replayed?: true}}
+        replay(tenant_id, runner_id, session, message, transitions, record)
 
       %TriageVerdictRecord{} ->
         {:error, :already_recorded}
 
       nil ->
-        transact(tenant_id, runner_id, session, message, digest, transitions)
+        fresh(tenant_id, runner_id, session, message, digest, transitions)
     end
   end
 
-  defp transact(tenant_id, runner_id, session, message, digest, transitions) do
-    # `Repo` inside `Repo.with_tenant/2`, never `AdminRepo`: this is ordinary tenant-scoped
-    # delivery state, and `Loopctl.Delivery.Stages` — the transition this wraps — works the
-    # same way. Reaching for the BYPASSRLS repo here would put the one write that records an
-    # untrusted payload outside the policy scoping every other row it sits beside.
-    tenant_id
-    |> Repo.with_tenant(fn ->
-      Repo.transaction(fn ->
-        insert_and_advance(tenant_id, runner_id, session, message, digest, transitions)
-      end)
-    end)
-    |> unwrap()
+  # THE RESEND, and it RE-ATTEMPTS rather than trusting the record. See the moduledoc: the
+  # record and the transitions are not atomic, so a record whose transitions did not land is
+  # a real state, and answering ok to it would strand the story at `detected` while every
+  # resend reported success.
+  #
+  # `stale_stage` on the first transition is the ordinary case — the story is already past
+  # `detected`, so the work was done — and is a replay rather than a refusal.
+  defp replay(tenant_id, runner_id, session, message, transitions, record) do
+    case advance_all(tenant_id, runner_id, session, message, transitions) do
+      :ok -> {:ok, %{record: record, replayed?: true}}
+      {:error, :stale_stage} -> {:ok, %{record: record, replayed?: true}}
+      {:error, reason} -> {:error, reason}
+    end
   end
 
-  # `Repo.with_tenant/2` wraps the transaction's own result, so a caller would otherwise see
-  # `{:ok, {:ok, _}}` and `{:ok, {:error, _}}`.
-  defp unwrap({:ok, result}), do: result
-  defp unwrap(other), do: other
+  # RECORD FIRST, then transition. The other order cannot be repaired: a transition that
+  # landed with no record leaves the resend re-attempting it, getting `stale_stage`, and
+  # holding no record to recognise — so the verdict could never be stored at all.
+  defp fresh(tenant_id, runner_id, session, message, digest, transitions) do
+    with {:ok, record} <- insert_record(tenant_id, session, message, digest),
+         :ok <- advance_all(tenant_id, runner_id, session, message, transitions) do
+      {:ok, %{record: record, replayed?: false}}
+    else
+      # The unique index racing another delivery of the SAME verdict — a rejoin whose old
+      # channel is still draining, two sockets, two nodes. Re-read and compare rather than
+      # refusing: `already_recorded` is published as PERMANENT, so a conforming runner would
+      # never resend and the documented close of this race could not happen.
+      {:error, :unique_violation} ->
+        raced(tenant_id, runner_id, session, message, digest, transitions)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp raced(tenant_id, runner_id, session, message, digest, transitions) do
+    case in_tenant(tenant_id, fn -> existing(tenant_id, message.dispatch_id) end) do
+      %TriageVerdictRecord{payload_digest: ^digest} = record ->
+        replay(tenant_id, runner_id, session, message, transitions, record)
+
+      _other ->
+        {:error, :already_recorded}
+    end
+  end
+
+  # `Repo.with_tenant/2` wraps its function's result, so a caller would otherwise see
+  # `{:ok, {:ok, _}}`.
+  defp in_tenant(tenant_id, fun) do
+    case Repo.with_tenant(tenant_id, fun) do
+      {:ok, result} -> result
+      other -> other
+    end
+  end
 
   defp existing(tenant_id, dispatch_id) do
     Repo.one(
@@ -232,16 +266,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
     )
   end
 
-  defp insert_and_advance(tenant_id, runner_id, session, message, digest, transitions) do
-    with {:ok, record} <- insert(tenant_id, session, message, digest),
-         :ok <- advance_all(tenant_id, runner_id, session, message, transitions) do
-      %{record: record, replayed?: false}
-    else
-      {:error, reason} -> Repo.rollback(reason)
-    end
-  end
-
-  defp insert(tenant_id, session, message, digest) do
+  defp insert_record(tenant_id, session, message, digest) do
     verdict = Map.get(message, :verdict)
 
     attrs = %{
@@ -260,14 +285,26 @@ defmodule Loopctl.Delivery.TriageVerdict do
       payload_digest: digest
     }
     |> TriageVerdictRecord.create_changeset(attrs)
-    |> Repo.insert()
+    |> then(fn changeset -> in_tenant(tenant_id, fn -> Repo.insert(changeset) end) end)
     |> case do
-      {:ok, record} -> {:ok, record}
-      # The unique index racing another connection: the same message arriving twice at once
-      # is a resend, not a conflict, so it is the `already_recorded` refusal and the runner
-      # resends — which then finds the row and is answered ok.
-      {:error, %Ecto.Changeset{}} -> {:error, :already_recorded}
+      {:ok, record} ->
+        {:ok, record}
+
+      # BY NAME, not a catch-all. Collapsing every changeset failure into `already_recorded`
+      # told a runner — permanently — that a DIFFERENT verdict was on file, when the real
+      # cause was a CHECK constraint or a length validation, and that cause was never logged.
+      # Only the unique index means "already there".
+      {:error, %Ecto.Changeset{} = changeset} ->
+        if unique_violation?(changeset),
+          do: {:error, :unique_violation},
+          else: {:error, {:invalid, Enum.map(changeset.errors, fn {f, _} -> to_string(f) end)}}
     end
+  end
+
+  defp unique_violation?(%Ecto.Changeset{errors: errors}) do
+    Enum.any?(errors, fn {_field, {_message, opts}} ->
+      Keyword.get(opts, :constraint) == :unique
+    end)
   end
 
   # Atom keys are what the cast produces and jsonb round-trips as strings, so a digest taken

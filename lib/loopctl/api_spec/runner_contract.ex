@@ -1356,6 +1356,45 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     )
   end
 
+  defmodule RunnerTriageVerdictAck do
+    @moduledoc """
+    The reply to a `triage_verdict` (1.9.0).
+
+    DECLARED, because `replayed` is load-bearing for a documented protocol rather than
+    informational: the message's own contract tells a runner to distinguish a fresh apply
+    from a resend by this field, and a runner vendoring `v1.json` had nothing to read it
+    from. (`stage`'s ack is still undeclared, which is a pre-existing gap and not one this
+    field can afford to share.)
+    """
+
+    require OpenApiSpex
+
+    OpenApiSpex.schema(
+      %{
+        title: "RunnerTriageVerdictAck",
+        description: "The reply to an accepted `triage_verdict`.",
+        type: :object,
+        required: [:recorded_at, :replayed],
+        properties: %{
+          recorded_at: %Schema{
+            type: :string,
+            format: :"date-time",
+            description:
+              "When the verdict was FIRST recorded — unchanged by a resend, so it dates the " <>
+                "original delivery rather than the latest one."
+          },
+          replayed: %Schema{
+            type: :boolean,
+            description:
+              "False on the delivery that recorded this verdict, true on any resend of it. " <>
+                "A resend applies no second transition."
+          }
+        }
+      },
+      struct?: false
+    )
+  end
+
   defmodule RunnerDispatch do
     @moduledoc false
     require OpenApiSpex
@@ -1941,11 +1980,21 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   #
   # Everything NOT here is worth resending unchanged — and for `triage_verdict` that is the
   # correct move on any of them, because an identical resend is idempotent.
-  @permanent_errors ~w(invalid_payload not_authorized unsupported_contract_version
-                       machine_mismatch forbidden_topic unknown_topic unknown_event
-                       unknown_dispatch stale_claim_epoch already_replied already_recorded
-                       dispatch_not_accepted run_mismatch effect_conflict
-                       audit_chain_append_failed unknown_story_stage)
+  # A FLAT LIST CANNOT SAY THIS, and the first version was a flat list. `stale_stage` is
+  # TRANSIENT for `stage` — the runner re-reads the story and sends the transition that now
+  # applies — and PERMANENT for `triage_verdict`, where it means the story has left `detected`
+  # and the verdict's first transition can never match again, so a conforming runner following
+  # a global list would retry a doomed verdict for ever.
+  #
+  # `"*"` is what holds for every event; an event's own entry ADDS to it and never subtracts,
+  # so a code cannot be permanent globally and transient for one message.
+  @permanent_errors %{
+    "*" => ~w(invalid_payload not_authorized unsupported_contract_version machine_mismatch
+         forbidden_topic unknown_topic unknown_event unknown_dispatch stale_claim_epoch
+         already_replied already_recorded dispatch_not_accepted run_mismatch effect_conflict
+         audit_chain_append_failed unknown_story_stage),
+    "triage_verdict" => ~w(stale_stage)
+  }
 
   # `stage` is a bucket for the same reason, and a bigger one. A machine at `max_sessions: 2`
   # runs two stories at once, each walking a thirteen-stage line, and a runner that has been
@@ -1989,13 +2038,27 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   def triage_verdict_burst, do: @triage_verdict_burst
 
   @doc """
-  The refusal codes no resend can clear, across every event (1.9.0).
+  The refusal codes no resend can clear, per event (1.9.0).
 
-  A runner branches on this rather than on a list copied into its own source. Everything not
-  named here is worth resending unchanged.
+  `"*"` holds for every event; an event's own key ADDS to it. A runner branches on this
+  rather than on a list copied into its own source, and `permanent_error?/2` is the reading
+  of it — everything not named is worth resending unchanged.
   """
-  @spec permanent_errors() :: [String.t()]
+  @spec permanent_errors() :: %{String.t() => [String.t()]}
   def permanent_errors, do: @permanent_errors
+
+  @doc """
+  True when `reason` can never be cleared by resending `event`.
+
+  The reason this is a function and not a list the caller filters: `stale_stage` is transient
+  for `stage` and permanent for `triage_verdict`, so reading the global set alone gives the
+  wrong answer for one of them whichever way it is written.
+  """
+  @spec permanent_error?(String.t(), String.t()) :: boolean()
+  def permanent_error?(event, reason) do
+    reason in Map.fetch!(@permanent_errors, "*") or
+      reason in Map.get(@permanent_errors, event, [])
+  end
 
   @doc """
   The `stage` bucket: `capacity` transitions back to back, refilled one per
@@ -2632,7 +2695,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
         "implied_kinds" => Kinds.implied_by_silence(),
         "replies" => %{
           "trace" => "RunnerTraceAck",
-          "trace_cursor" => "RunnerTraceAck"
+          "trace_cursor" => "RunnerTraceAck",
+          "triage_verdict" => "RunnerTriageVerdictAck"
         },
         "errors" => @error_reasons,
         "limits" => %{

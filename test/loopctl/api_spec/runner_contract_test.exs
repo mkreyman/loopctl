@@ -68,7 +68,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
       assert connection["replies"] == %{
                "trace" => "RunnerTraceAck",
-               "trace_cursor" => "RunnerTraceAck"
+               "trace_cursor" => "RunnerTraceAck",
+               "triage_verdict" => "RunnerTriageVerdictAck"
              }
 
       # #803: the kind lists are published so a runner reads them rather than parsing prose.
@@ -1481,20 +1482,27 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     end
 
     test "permanence is PUBLISHED, so a runner branches on the contract not on a copied list" do
-      permanent = RunnerContract.permanent_errors()
-
-      # The ones whose remedy is "stop": resending cannot change any of them.
+      # The ones whose remedy is "stop": resending cannot change any of them, on any event.
       for code <- ~w(invalid_payload stale_claim_epoch unknown_dispatch already_recorded) do
-        assert code in permanent
+        assert RunnerContract.permanent_error?("triage_verdict", code)
+        assert RunnerContract.permanent_error?("stage", code)
       end
 
-      # And the ones whose remedy is "send it again" must NOT be in it, or a runner told to
-      # stop on a rate limit loses the run's whole output.
+      # And the ones whose remedy is "send it again" must NOT be, or a runner told to stop on
+      # a rate limit loses the run's whole output — a verdict cannot be re-derived.
       for code <- ~w(rate_limited internal_error) do
-        refute code in permanent
+        refute RunnerContract.permanent_error?("triage_verdict", code)
       end
 
-      assert RunnerContract.json_schema()["x-connection"]["permanent_errors"] == permanent
+      # PER EVENT, which a flat list cannot express. `stale_stage` is transient for `stage` —
+      # re-read the story and send what applies — and permanent for `triage_verdict`, where it
+      # means the story has left `detected` and the verdict's first transition can never match
+      # again. A runner following a global list would retry a doomed verdict for ever.
+      assert RunnerContract.permanent_error?("triage_verdict", "stale_stage")
+      refute RunnerContract.permanent_error?("stage", "stale_stage")
+
+      assert RunnerContract.json_schema()["x-connection"]["permanent_errors"] ==
+               RunnerContract.permanent_errors()
     end
   end
 
