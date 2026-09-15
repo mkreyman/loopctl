@@ -359,6 +359,98 @@ mix test --failed      # Re-run failed tests
 mix ecto.reset         # Drop, create, migrate
 ```
 
+## Implementing: an ENGINEER AGENT writes the code, not the session's own Edit calls
+
+Mark's instruction, 2026-09-15, verbatim: *"make it a standing rule that you dispatch an
+engineer agent on high effort for any implementation and fixes. I see it over and over again
+that sessions doing direct editing are doing sloppy job..."*
+
+**WHO THIS ADDRESSES: the session that owns the delivery loop, and nobody else.** If you are a
+dispatched agent reading this file, it is not for you — your dispatch prompt is your mandate
+(Subagent Subordination Rule), you have no Agent tool to re-delegate with, and you implement
+what you were asked for. This section binds the session doing the dispatching, exactly as
+step 2 of the delivery loop does.
+
+**The rule.** For any change to CODE, dispatch `elixir-engineer` — or `typescript-engineer`
+under `mcp-server/`, which is plain ESM JavaScript on `node --test` with no tsconfig and no
+TypeScript anywhere, so say so in the prompt or it will go looking for one. Do NOT pass a
+`model` override: both agent definitions already pin `model: opus` and `effort: high`, a
+dispatcher cannot raise that, and an override can only lower it.
+
+**The dispatch prompt carries step 2's inner loop, or the rule buys nothing.** The evidence
+below is led by three tests that could not fail, and a fresh context writes an unfalsifiable
+assertion exactly as easily as a tired one — nothing about delegating fixes that by itself.
+So require, in the prompt: `mix format`, `mix compile --warnings-as-errors`, the tests for the
+files touched, `mix credo --strict`, and **for every assertion added, a `bin/mutate.sh`
+invocation reported back with its exit code**. A report without those is not done, and the
+reconcile read below is where you check it rather than take it.
+
+**Then the session keeps the loop:** reconcile the agent's output against the diff, commit,
+PR, review gate, merge. The agent leaves its changes uncommitted — its correct end state. What
+this buys is a read by a principal that did not write the lines; it is not an independent
+review, because you wrote the prompt, and it does not reduce the review gate by one round.
+
+**Under the step-1 worktree fan-out this changes nothing.** There, an agent per worktree
+already owns step 2 through the PR of step 3 with the git grant armed, and that agent is now
+an engineer agent carrying the prompt above. A session running N worktrees does not reconcile
+N agents' output before their commits — it keeps steps 4 and 5, as step 1 says. The
+reconcile-then-commit shape is for WIP=1, where the session is the one committing.
+
+### The floor, drawn where it actually holds
+
+Edit directly only where the change asserts NOTHING ABOUT HOW THE CODE WORKS:
+
+- a version bump, a CHANGELOG entry, a formatting fix, regenerating a checked-in artifact;
+- a merge conflict whose resolution is TEXTUAL — both sides kept, a CHANGELOG stanza, an
+  import list — and never one where you are choosing which side's behaviour survives;
+- prose that describes process rather than mechanism, like this section.
+
+**A COMMENT OR A DOC SENTENCE THAT ASSERTS A MECHANISM IS INSIDE THE RULE**, and that is the
+correction round 1 of #860 made to this floor. The first draft tested on "does it change
+behaviour", which let the doc-and-comment class through — and two of the four defects below
+are exactly that class, a contract sentence and a code comment. A floor that excludes half its
+own evidence is not a floor.
+
+Note what is NOT on this list: *"a rename the compiler verifies"*, which was on the first
+draft and is unsafe here. The Elixir compiler resolves direct calls; it does not see `apply/3`,
+atoms built at runtime, module names in `config/*.exs`, Oban worker strings, telemetry event
+names, JSON field names, or a test asserting on a string. A hand-rename can pass
+`mix compile --warnings-as-errors` and break a dynamic caller.
+
+### The evidence, with the ids so it is checkable
+
+One session, 2026-09-15, five PRs on the delivery loop (#855, #856, #857, #859, and the
+#854 fixes), every change hand-edited. What `/code-review high` found AFTER each was committed
+and pushed:
+
+- **three tests that could not fail**, each written to pin a NEW guard, each caught only by
+  `bin/mutate.sh` afterwards — and one needed the right mutation to show at all;
+- **a false claim deleted from one file and left standing in another by the same commit**
+  (#857: the runner contract's "fenced" sentence, removed there and left in
+  `triage_verdict.ex` forty lines above the code making it false);
+- **a comment claiming signal codes reached the audit chain when they reached a different
+  table, then rewritten wrong a SECOND time while being corrected** (#857);
+- **a change that made a case worse than before it** (`8049c258`: a length bound moved onto
+  escaped text while the caller-facing bound stayed raw, so a conforming caller's escalation
+  was refused and lost — the exact failure that change existed to end);
+- **a `git add -u` that swept an unrelated file into a security PR** (`4834799c`, undone by
+  `4d08ac31`) — the sweep failure the deny-list on `git add -A` exists to prevent, which `-u`
+  is not covered by. It happened while this very section was being written.
+
+None is a typing error. They are judgement errors made at depth in a long session.
+
+**What the dispatch actually changes**, stated precisely because a rule adopted for the wrong
+reason is dropped for the wrong reason: the agent is the same model and can make the same
+judgement errors. What differs is a FRESH CONTEXT on one task rather than a session carrying
+hundreds of thousands of tokens of unrelated history — every failure above happened deep into
+a long session — a system prompt carrying this stack's conventions, and a read inserted
+between writing and committing where today one principal does both.
+
+**What would overturn it, with a baseline so the test is runnable:** the batch above averaged
+roughly six confirmed findings per PR at `/code-review high`. If agent-written changes under
+the same gate average the same or worse across a comparable batch, the rule is not buying what
+it claims and should be revisited rather than defended.
+
 ## Merging: this repo's rules OVERRIDE delivery-loop step 5
 
 Mark's decisions, 2026-09-15, after a night of four sequential PRs. **These override the
