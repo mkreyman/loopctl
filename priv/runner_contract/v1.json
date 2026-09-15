@@ -1003,7 +1003,8 @@
             "wall_clock_exceeded",
             "checkout_unreadable",
             "no_verdict_written",
-            "verdict_invalid"
+            "verdict_invalid",
+            null
           ],
           "type": [
             "string",
@@ -1381,6 +1382,9 @@
         "refill_interval_ms": 1000
       }
     },
+    "permanent_error_conditions": {
+      "dispatch_not_accepted": "Permanent unless an accept YOU sent for this dispatch is still unacknowledged. The refusal means the ledger row is not `accepted`, which covers `sent` (your accept has not landed yet - in flight, rate-limited, or carried across a rejoin, and the one case worth retrying), and `refused` and `superseded`, which are final and which no later accept can move. So retry, with backoff, only while an accept for this dispatch is outstanding AND you have not since refused it and its `claim_epoch` has not moved; otherwise give the run up, because nothing will move the row."
+    },
     "permanent_errors": {
       "*": [
         "invalid_payload",
@@ -1509,5 +1513,5 @@
     ],
     "topic": "runner:{runner_id}"
   },
-  "x-contract-version": "1.9.1"
+  "x-contract-version": "1.9.2"
 }
