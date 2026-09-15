@@ -55,8 +55,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.6.0"
-      assert schema["x-contract-version"] == "1.6.0"
+      assert RunnerContract.version() == "1.7.0"
+      assert schema["x-contract-version"] == "1.7.0"
 
       assert %{
                "dispatch_reply" => "RunnerDispatchReply",
@@ -558,6 +558,71 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
         end
 
     own ++ nested
+  end
+
+  # #803/#804. `story` and `triage` are DISJOINT by construction: the object carrying the
+  # reporter's words may never ride an implement dispatch, because the implementing session
+  # must never see reporter text (design section 10). Stated as two independent rules rather
+  # than one either/or, so a dispatch carrying BOTH is refused twice rather than passing
+  # whichever test it happened to satisfy.
+  describe "cast_dispatch/1 triage (contract 1.7.0)" do
+    defp triage_dispatch(overrides) do
+      Map.merge(
+        %{
+          "dispatch_id" => Ecto.UUID.generate(),
+          "story_id" => Ecto.UUID.generate(),
+          "kind" => "triage",
+          "repo" => "mkreyman/home_care_billing",
+          "base_branch" => "master",
+          "branch" => "feature/x",
+          "claim_epoch" => 0,
+          "wall_clock_seconds" => 3600,
+          "max_turns" => 40
+        },
+        overrides
+      )
+    end
+
+    defp triage_object(overrides \\ %{}) do
+      Map.merge(
+        %{
+          "record_id" => Ecto.UUID.generate(),
+          "issue_number" => 412,
+          "html_url" => "https://github.com/mkreyman/home_care_billing/issues/412",
+          "untrusted" => "fenced block",
+          "truncated" => false
+        },
+        overrides
+      )
+    end
+
+    test "a triage object on an IMPLEMENT dispatch is refused" do
+      dispatch = triage_dispatch(%{"kind" => "implement", "triage" => triage_object()})
+
+      assert {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(dispatch)
+      assert Enum.any?(errors, &(&1 =~ "triage is only allowed when kind is triage"))
+    end
+
+    test "a dispatch carrying BOTH objects is refused for both, not just one" do
+      story = %{"id" => Ecto.UUID.generate(), "title" => "t", "description" => "d"}
+
+      dispatch =
+        triage_dispatch(%{"kind" => "implement", "triage" => triage_object(), "story" => story})
+
+      assert {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(dispatch)
+      assert Enum.any?(errors, &(&1 =~ "story.id must be the dispatch's story_id"))
+      assert Enum.any?(errors, &(&1 =~ "triage is only allowed when kind is triage"))
+    end
+
+    test "a triage whose record_id is the story_id is refused as a conflated payload" do
+      id = Ecto.UUID.generate()
+
+      dispatch =
+        triage_dispatch(%{"story_id" => id, "triage" => triage_object(%{"record_id" => id})})
+
+      assert {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(dispatch)
+      assert Enum.any?(errors, &(&1 =~ "must be the intake record"))
+    end
   end
 
   describe "cast_join/1 kinds (contract 1.6.0)" do

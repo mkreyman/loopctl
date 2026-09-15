@@ -37,7 +37,18 @@ defmodule Loopctl.Delivery.ImplementerInputTest do
     "lib/loopctl/intake/record.ex",
     "lib/loopctl/intake/ticket_facts.ex",
     "lib/loopctl/delivery/untrusted.ex",
-    "lib/loopctl/delivery/injection_detector.ex"
+    "lib/loopctl/delivery/injection_detector.ex",
+    # #804, contract 1.7.0. The builder of the `triage` dispatch object, and the only module
+    # that carries reporter text TOWARD a runner — which is what makes it an owner rather
+    # than a violation: it reads the untrusted fields for the express purpose of rendering
+    # every one of them through `Untrusted.render/2`. Its own test asserts that, by mutation:
+    # replacing a render with the raw field reddens three assertions.
+    #
+    # It is the boundary's most load-bearing entry, so the thing to check when reviewing a
+    # change to it is not whether it names these fields but whether it still fences all of
+    # them. A future module added here on the grounds that it "only reads the title" is the
+    # failure this list exists to make visible.
+    "lib/loopctl/delivery/triage_payload.ex"
   ]
 
   # `id` is on the list for `story_object/2` (contract 1.5.0): the dispatch carries the

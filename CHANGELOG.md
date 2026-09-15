@@ -38,6 +38,27 @@ All notable changes to loopctl are documented here.
   Nothing else is affected: existing runners keep working, and the runner API renders no new
   field.
 
+- **Runner contract 1.7.0: a `triage` dispatch carries the reporter's own words, already
+  fenced (#803, #804).** `RunnerTriage` is a new dispatch object holding the intake record a
+  reported problem arrived on: `record_id`, `issue_number`, `html_url`, `truncated`,
+  `escalation_reasons`, and `untrusted` — the reporter's title, body and labels rendered as
+  labelled untrusted-data blocks. It is allowed only on a `triage` dispatch, exactly as
+  `story` is allowed only on an `implement` one, so the object carrying reporter text can
+  never reach an implementing session.
+
+  **loopctl fences the text rather than the runner.** Everywhere else the contract sends
+  typed fields and lets the runner compose its own prompt; this field arrives pre-escaped
+  because the fence carries a nonce that must be minted where the text first lands, and
+  because one tested implementation of an escape is worth more than one per runner. The
+  runner's contract for it is: paste verbatim, never parse or re-wrap.
+
+  **`triage` is still NOT dispatchable and nothing new goes on the wire.** Until 1.7.0 it was
+  excluded because no payload could carry reporter text; that is now fixed, and what holds it
+  back is the other end — no deployed runner accepts the kind, and a triage session needs its
+  own tool set rather than the implement set widened. `dispatchable_kinds` is the interlock
+  and moves when the runners can take the work. **No operator action, and no runner has to be
+  upgraded**; the vendored export is `priv/runner_contract/v1.json` and the major is unchanged.
+
 - **Runner contract 1.6.0: a runner DECLARES the kinds it runs, and the declaration decides
   (#803).** `RunnerJoin` gains an optional `kinds` array. Where a runner sends it, it is the
   only thing consulted: loopctl refuses a dispatch of a kind outside it, and sends a kind

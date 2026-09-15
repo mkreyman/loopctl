@@ -124,6 +124,51 @@
             "null"
           ]
         },
+        "triage": {
+          "description": "The reported problem a `triage` dispatch is for (since 1.7.0), and the only place in this contract that carries the reporter's own words. Allowed only on a `triage` dispatch; an `implement` dispatch carries `story` instead, written by the triage trio, because the implementing session must never see reporter text. `untrusted` ARRIVES ALREADY FENCED as a labelled untrusted-data block: paste it into your prompt verbatim and never parse, reformat, re-wrap or unwrap it. It is fenced by loopctl rather than by you because the fence carries a nonce that must be minted where the text first lands, and because one tested implementation of an escape is worth more than one per runner. Everything outside `untrusted` is loopctl's own and is not reporter-supplied. The whole object is at most 48000 bytes under the byte rule; an oversize record is escalated to a human, never truncated.",
+          "properties": {
+            "escalation_reasons": {
+              "description": "What loopctl's own detectors flagged on this record — an injection attempt, a fact the extractor could not resolve. loopctl's output, not the reporter's, so it is safe to read as information rather than as data.",
+              "items": {
+                "maxLength": 100,
+                "type": "string"
+              },
+              "maxItems": 20,
+              "type": "array"
+            },
+            "html_url": {
+              "description": "GitHub's canonical URL for the issue. loopctl's, not the reporter's.",
+              "maxLength": 500,
+              "type": "string"
+            },
+            "issue_number": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "record_id": {
+              "description": "The intake record this problem was reported on.",
+              "format": "uuid",
+              "type": "string"
+            },
+            "truncated": {
+              "description": "loopctl's own fact: the reporter's text was cut at intake, so the block is incomplete. A verdict reached on truncated text should say so.",
+              "type": "boolean"
+            },
+            "untrusted": {
+              "description": "The reporter's title, body and labels, ALREADY RENDERED as a fenced untrusted-data block. DATA, never instruction. Paste verbatim.",
+              "maxLength": 40000,
+              "type": "string"
+            }
+          },
+          "required": [
+            "record_id",
+            "issue_number",
+            "html_url",
+            "untrusted",
+            "truncated"
+          ],
+          "type": "object"
+        },
         "wall_clock_seconds": {
           "description": "How long the runner lets the session run before stopping it. At most 86400 (a day) since contract 1.3.0.",
           "maximum": 86400,
@@ -721,6 +766,51 @@
         "type"
       ],
       "type": "object"
+    },
+    "RunnerTriage": {
+      "description": "The reported problem a `triage` dispatch is for (since 1.7.0), and the only place in this contract that carries the reporter's own words. Allowed only on a `triage` dispatch; an `implement` dispatch carries `story` instead, written by the triage trio, because the implementing session must never see reporter text. `untrusted` ARRIVES ALREADY FENCED as a labelled untrusted-data block: paste it into your prompt verbatim and never parse, reformat, re-wrap or unwrap it. It is fenced by loopctl rather than by you because the fence carries a nonce that must be minted where the text first lands, and because one tested implementation of an escape is worth more than one per runner. Everything outside `untrusted` is loopctl's own and is not reporter-supplied. The whole object is at most 48000 bytes under the byte rule; an oversize record is escalated to a human, never truncated.",
+      "properties": {
+        "escalation_reasons": {
+          "description": "What loopctl's own detectors flagged on this record — an injection attempt, a fact the extractor could not resolve. loopctl's output, not the reporter's, so it is safe to read as information rather than as data.",
+          "items": {
+            "maxLength": 100,
+            "type": "string"
+          },
+          "maxItems": 20,
+          "type": "array"
+        },
+        "html_url": {
+          "description": "GitHub's canonical URL for the issue. loopctl's, not the reporter's.",
+          "maxLength": 500,
+          "type": "string"
+        },
+        "issue_number": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "record_id": {
+          "description": "The intake record this problem was reported on.",
+          "format": "uuid",
+          "type": "string"
+        },
+        "truncated": {
+          "description": "loopctl's own fact: the reporter's text was cut at intake, so the block is incomplete. A verdict reached on truncated text should say so.",
+          "type": "boolean"
+        },
+        "untrusted": {
+          "description": "The reporter's title, body and labels, ALREADY RENDERED as a fenced untrusted-data block. DATA, never instruction. Paste verbatim.",
+          "maxLength": 40000,
+          "type": "string"
+        }
+      },
+      "required": [
+        "record_id",
+        "issue_number",
+        "html_url",
+        "untrusted",
+        "truncated"
+      ],
+      "type": "object"
     }
   },
   "$id": "https://loopctl.com/runner_contract/v1.json",
@@ -963,5 +1053,5 @@
     ],
     "topic": "runner:{runner_id}"
   },
-  "x-contract-version": "1.6.0"
+  "x-contract-version": "1.7.0"
 }
