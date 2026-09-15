@@ -86,6 +86,45 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
 - **Tests never record environment VALUES.** The dev machines carry live credentials in the
   environment, and a failing assertion prints whatever it compared.
 
+## How changes get made here
+
+- **Implementation is DISPATCHED, not typed by the session.** Any change to ELIXIR code — a
+  feature, a fix, a refactor, and the fixes a review round asks for — goes to `elixir-engineer`.
+  Mark, 2026-09-15: *"make it a standing rule that you dispatch an engineer agent on high effort
+  for any implementation and fixes. I see it over and over again that sessions doing direct
+  editing are doing sloppy job."*
+- **Dispatch it with NO `model` override.** "High effort" is a property of the agent's own
+  definition, which lives in `claude-config` and is not this repo's to re-state — pinning its
+  values here would be the re-typing the contract rule forbids, drifting silently the first time
+  that repo changes or a machine has not pulled. The Agent tool's `model` argument OVERRIDES that
+  definition, so passing one is how a dispatch quietly buys something weaker than the rule
+  promises. Name the agent; pass nothing else about how it runs.
+- **What this rule does NOT route, because no agent here fits it**: the shell and unit files —
+  `priv/bin/session-launcher.sh`, `priv/bin/loop-escalate`, `priv/bin/loop-verdict`,
+  `rel/install.sh`, and the systemd and launchd templates. The engineer agents are Elixir and
+  TypeScript; there is no shell-capable one in the roster. Those stay with the session, and the
+  session says so in the PR — the same disclosure an inline fix carries. `session-launcher.sh` is
+  the one to be most careful with by hand: its teardown is load-bearing and macOS and Linux
+  diverge inside it.
+- **The review fixers are a carve-out, not a violation.** `/code-review --fix` applies findings to
+  the working tree itself, and `enhanced-review-workflow`'s FIXER commits by design. Both are
+  sanctioned by the delivery loop, so using them is compliance; what is not allowed is the session
+  typing the fix itself while a dispatch was available.
+- **The session keeps what the Subordination Rule gives no agent**: the branch, the commit, the
+  PR, the review gate, the merge, the deploy — and VERIFYING the agent's report. "All green" is a
+  claim: re-run the suite, read the diff, and re-run at least one mutation proof for any
+  ASSERTION THE CHANGE ADDED. A refactor that adds no assertion has nothing to falsify, and
+  claiming that step anyway is the false green this bar exists to prevent.
+- **Two bounds, so it is a rule and not a ritual.** Prose is not implementation — this file, a
+  doc, a PR body — and is written where it is read. A change statable completely in one command
+  needs no agent; one that needs a DECISION is implementation however few lines it is. And if
+  dispatch genuinely fails, do it inline and say so in the PR, never calling a restriction an
+  incapacity.
+- **No tidewave preflight here.** The global rule says to start the dev server before dispatching
+  an Elixir subagent. This repo has no `.mcp.json`, no endpoint and no `config/dev.exs` server —
+  step 1a has no server at all, and port 4040 is reserved for a step-1b app that does not exist
+  yet. There is nothing to preflight, and nothing degraded by its absence.
+
 ## Elixir / Phoenix guidelines
 
 These are the stock `phx.new` rules, condensed. Each line is a hard rule.
