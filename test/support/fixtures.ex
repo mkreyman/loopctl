@@ -2549,6 +2549,97 @@ defmodule Loopctl.Fixtures do
     end
   end
 
+  # An intake SOURCE and RECORD, with the project and epic they need, COMMITTED outside the
+  # sandbox (#803's `Loopctl.Delivery.TriageTrigger`). Promotion straddles both repos — the
+  # story is created in an `AdminRepo` transaction and `Loopctl.Delivery.Stages.open/3` then
+  # reads that story on the RLS `Loopctl.Repo` — and those are separate sandbox connections
+  # which cannot see each other's uncommitted rows, the same constraint
+  # `fixture(:committed_story)` carries.
+  #
+  # Same rules as `fixture(:committed_runner)`: only an `async: false` module may use it, and
+  # it must call `sweep_committed_runner_tenants/0` in `setup_all` and on exit.
+  #
+  # Pass `target_epic_id: nil` for the source that names no epic, which is the ESCALATION
+  # case rather than a degenerate one; omitting the key commits an epic and points the source
+  # at it. `:project_id` puts a second source in an existing project, which is what makes two
+  # repositories able to report the same issue number into one `stories.number` space.
+  #
+  # Returns `{source, record}`.
+  def fixture(:committed_intake, attrs) do
+    attrs = Enum.into(attrs, %{})
+    tenant_id = Map.fetch!(attrs, :tenant_id)
+    now = DateTime.utc_now()
+
+    Sandbox.unboxed_run(AdminRepo, fn ->
+      project_id =
+        Map.get_lazy(attrs, :project_id, fn ->
+          unique = System.unique_integer([:positive])
+
+          AdminRepo.insert!(%Project{
+            tenant_id: tenant_id,
+            name: "intake-#{unique}",
+            slug: "intake-#{unique}",
+            kind: :work,
+            status: :active
+          }).id
+        end)
+
+      # `Map.fetch/2`, not `Map.get/3`: an EXPLICIT nil is the case under test, so it must be
+      # distinguishable from the key being absent.
+      target_epic_id =
+        case Map.fetch(attrs, :target_epic_id) do
+          {:ok, id} ->
+            id
+
+          :error ->
+            # A BOUNDED epic number, deliberately, and not what `build(:epic)` gives.
+            # That builder uses a raw `System.unique_integer/1`, which is small when a file
+            # runs alone and six or seven digits in a full suite — and a story number's
+            # parts must be under 10_000, so an epic numbered above that makes every story
+            # in it unnumberable. `Loopctl.Delivery.TriageTrigger` refuses such an epic
+            # rather than emitting an illegal number (`:epic_number_unnumberable`), which is
+            # correct and is not what these tests are about; they need an epic a story can
+            # actually be numbered under. The refusal has its own test.
+            %Epic{tenant_id: tenant_id, project_id: project_id}
+            |> Epic.create_changeset(
+              build(:epic, %{
+                number:
+                  Map.get_lazy(attrs, :epic_number, fn ->
+                    rem(System.unique_integer([:positive]), 9_000) + 1
+                  end)
+              })
+            )
+            |> AdminRepo.insert!()
+            |> Map.fetch!(:id)
+        end
+
+      source =
+        AdminRepo.insert!(%IntakeSource{
+          tenant_id: tenant_id,
+          project_id: project_id,
+          target_epic_id: target_epic_id,
+          repo_full_name: Map.get(attrs, :repo_full_name, "mkreyman/home_care_billing"),
+          webhook_secret: :crypto.strong_rand_bytes(32) |> Base.encode16(case: :lower),
+          revoked_at: Map.get(attrs, :revoked_at),
+          inserted_at: now,
+          updated_at: now
+        })
+
+      record =
+        AdminRepo.insert!(%IntakeRecord{
+          tenant_id: tenant_id,
+          source_id: source.id,
+          project_id: project_id,
+          issue_number: Map.get(attrs, :issue_number, System.unique_integer([:positive])),
+          untrusted_title: Map.get(attrs, :untrusted_title, "a reported problem"),
+          inserted_at: now,
+          updated_at: now
+        })
+
+      {source, record}
+    end)
+  end
+
   # A PENDING issue-closure row (#805), inserted directly so a closer/worker test can start
   # from a verdict without walking a story through the stage machine to reach one.
   #

@@ -98,6 +98,7 @@ defmodule Loopctl.Intake do
   alias Loopctl.LocalGuc
   alias Loopctl.Projects.Project
   alias Loopctl.Tenants.Tenant
+  alias Loopctl.WorkBreakdown.Epic
 
   # The largest webhook body the intake route reads. An `issues` payload with a maximal
   # 65,536-character body, escaped, plus its repository and user objects, stays well under
@@ -165,11 +166,13 @@ defmodule Loopctl.Intake do
     secret = :crypto.strong_rand_bytes(32) |> Base.encode16(case: :lower)
     project_id = Map.get(attrs, :project_id) || Map.get(attrs, "project_id")
     repo = Map.get(attrs, :repo_full_name) || Map.get(attrs, "repo_full_name")
+    target_epic_id = Map.get(attrs, :target_epic_id) || Map.get(attrs, "target_epic_id")
 
     changeset =
       %Source{tenant_id: tenant_id, webhook_secret: secret}
       |> Source.create_changeset(%{repo_full_name: repo})
       |> put_project(tenant_id, project_id)
+      |> put_target_epic(tenant_id, target_epic_id)
 
     with {:ok, changeset} <- valid(changeset),
          {:ok, source} <- insert_source(tenant_id, changeset, opts) do
@@ -186,6 +189,36 @@ defmodule Loopctl.Intake do
         Ecto.Changeset.add_error(changeset, :project_id, message)
     end
   end
+
+  # OPTIONAL, and an absent value is not an error: see the schema. What IS an error is naming
+  # an epic that is not this tenant's or does not belong to this source's project — a source
+  # whose reports would land in another project's backlog is a mistake worth refusing at
+  # enrollment rather than discovering on the first webhook.
+  defp put_target_epic(changeset, _tenant_id, nil), do: changeset
+
+  defp put_target_epic(changeset, tenant_id, epic_id) do
+    project_id = Ecto.Changeset.get_field(changeset, :project_id)
+
+    case epic_in_project(tenant_id, project_id, epic_id) do
+      {:ok, epic} -> Ecto.Changeset.put_change(changeset, :target_epic_id, epic.id)
+      {:error, message} -> Ecto.Changeset.add_error(changeset, :target_epic_id, message)
+    end
+  end
+
+  defp epic_in_project(tenant_id, project_id, epic_id) when is_binary(project_id) do
+    with {:ok, id} <- Ecto.UUID.cast(epic_id),
+         %Epic{} = epic <- AdminRepo.get_by(Epic, id: id, tenant_id: tenant_id) do
+      if epic.project_id == project_id,
+        do: {:ok, epic},
+        else: {:error, "must belong to this source's project"}
+    else
+      _ -> {:error, "epic not found"}
+    end
+  end
+
+  # The project was already rejected, so there is nothing to check the epic against; the
+  # project's own error is the one worth showing.
+  defp epic_in_project(_tenant_id, _project_id, _epic_id), do: {:error, "project not found"}
 
   defp active_work_project(tenant_id, project_id) when is_binary(project_id) do
     with {:ok, id} <- Ecto.UUID.cast(project_id),
@@ -214,7 +247,8 @@ defmodule Loopctl.Intake do
                entity_id: source.id,
                payload: %{
                  "repo_full_name" => source.repo_full_name,
-                 "project_id" => source.project_id
+                 "project_id" => source.project_id,
+                 "target_epic_id" => source.target_epic_id
                }
              }) do
         source

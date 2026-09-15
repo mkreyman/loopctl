@@ -39,6 +39,14 @@ defmodule Loopctl.Intake.Source do
   schema "intake_sources" do
     tenant_field()
     belongs_to :project, Loopctl.Projects.Project
+
+    # WHERE A TRIAGED STORY LANDS (#803 §4). A story requires an epic and this source only
+    # knows its project, so without it the worker that turns a reported issue into a story
+    # has nowhere to put it. NULLABLE: a source enrolled before the field existed keeps
+    # working, and a record from a source that names no epic is ESCALATED to a human rather
+    # than landing in one chosen for it. Unset means the question has not been answered,
+    # which is not the same as any answer loopctl could invent.
+    belongs_to :target_epic, Loopctl.WorkBreakdown.Epic
     field :repo_full_name, :string
     field :webhook_secret, Loopctl.Vault.Binary, redact: true
     field :revoked_at, :utc_datetime_usec
