@@ -159,6 +159,67 @@ defmodule Loopctl.Delivery.TriagePayloadTest do
       refute Enum.any?(errors, &(&1 =~ "triage is only allowed"))
     end
 
+    # #835 round 1, finding 1 (HIGH). The byte rule admits about 7_400 rendered characters
+    # while `untrusted` declares maxLength 6_000, so a report in that window was accepted
+    # here and refused on the WIRE — after Placement had claimed the story and spent the
+    # dispatch_id, which is then :stale_claim_epoch for ever. The escalate path never ran.
+    test "a report over the declared field length is refused HERE, not on the wire" do
+      # 6_000 body renders past the 6_000-character field cap once the title and labels are
+      # added, and is well under the byte cap — the window the builder used to miss.
+      assert {:error, :triage_too_large} =
+               TriagePayload.build(record(%{untrusted_body: String.duplicate("x", 6_000)}))
+    end
+
+    # Finding 2, and reachable by an attacker rather than by a long report: intake accumulates
+    # reasons monotonically and never clears them, and the detector emits a code per signal
+    # per field, so the record that overflows is the most heavily attacked one.
+    test "too many escalation reasons is refused here, not on the wire" do
+      reasons = Enum.map(1..25, &"signal_#{&1}:untrusted_body")
+
+      assert {:error, :triage_too_large} =
+               TriagePayload.build(record(%{escalation_reasons: reasons}))
+    end
+
+    test "an over-long escalation reason is refused here, not on the wire" do
+      assert {:error, :triage_too_large} =
+               TriagePayload.build(record(%{escalation_reasons: [String.duplicate("r", 200)]}))
+    end
+
+    # The property the two above are really about: whatever this builder accepts, the wire
+    # accepts. Anything else means a record that loses its dispatch instead of reaching a
+    # human. Asserted against the real cast rather than against the caps.
+    test "everything build/1 accepts passes the contract's cast" do
+      for body_len <- [0, 100, 1_000, 3_000, 5_000, 5_500, 6_000, 7_000, 8_000] do
+        r = record(%{untrusted_body: String.duplicate("x", body_len)})
+
+        case TriagePayload.build(r) do
+          {:error, :triage_too_large} ->
+            :ok
+
+          {:ok, triage} ->
+            payload = %{
+              "dispatch_id" => Ecto.UUID.generate(),
+              "story_id" => Ecto.UUID.generate(),
+              "kind" => "triage",
+              "repo" => "mkreyman/home_care_billing",
+              "base_branch" => "master",
+              "branch" => "feature/x",
+              "claim_epoch" => 0,
+              "wall_clock_seconds" => 3600,
+              "max_turns" => 40,
+              "triage" => Map.new(triage, fn {k, v} -> {to_string(k), v} end)
+            }
+
+            {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(payload)
+
+            # The kind refusal is expected until triage is dispatchable. Anything ELSE means
+            # the builder accepted what the wire will not.
+            assert Enum.all?(errors, &(&1 =~ "not dispatchable")),
+                   "body #{body_len} built but the wire refused it: #{inspect(errors)}"
+        end
+      end
+    end
+
     test "the built object is within the contract's byte cap with room for the dispatch" do
       assert {:ok, triage} = TriagePayload.build(record())
       assert ByteRule.bytes(triage) < RunnerTriage.max_bytes()

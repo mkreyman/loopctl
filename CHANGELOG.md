@@ -42,7 +42,9 @@ All notable changes to loopctl are documented here.
   fenced (#803, #804).** `RunnerTriage` is a new dispatch object holding the intake record a
   reported problem arrived on: `record_id`, `issue_number`, `html_url`, `truncated`,
   `escalation_reasons`, and `untrusted` — the reporter's title, body and labels rendered as
-  labelled untrusted-data blocks. It is allowed only on a `triage` dispatch, exactly as
+  ONE labelled untrusted-data block. One rather than one per field on purpose: splitting it
+  would make the runner decide how a title, a body and a label relate, which is a structural
+  claim about text a stranger wrote. It is opaque — paste it, never parse or split it. It is allowed only on a `triage` dispatch, exactly as
   `story` is allowed only on an `implement` one, so the object carrying reporter text can
   never reach an implementing session.
 

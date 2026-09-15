@@ -83,12 +83,47 @@ defmodule Loopctl.Delivery.TriagePayload do
       escalation_reasons: record.escalation_reasons
     }
 
-    if ByteRule.bytes(triage) > RunnerTriage.max_bytes() do
-      {:error, :triage_too_large}
-    else
-      {:ok, triage}
+    case violations(triage) do
+      [] -> {:ok, triage}
+      _ -> {:error, :triage_too_large}
     end
   end
+
+  # EVERY DECLARED CAP, not just the byte rule — the same discipline
+  # `Loopctl.Delivery.ImplementerInput.violations/1` applies, for the same reason and after
+  # the same defect.
+  #
+  # Checking only the object cap left a window: the byte rule admits about 7_400 rendered
+  # characters while `untrusted` declares `maxLength: 6_000`, so a report between the two was
+  # accepted HERE and refused by `cast_dispatch/1` on the wire. That is not a cosmetic
+  # difference in where the error comes from. `:triage_too_large` is the caller's signal to
+  # escalate the record to a human; `invalid_payload` from `Runners.dispatch/3` arrives AFTER
+  # `Loopctl.Delivery.Placement.place/4` has claimed the story and minted the dispatch, and
+  # that `dispatch_id` is then spent for ever — every retry with it is `:stale_claim_epoch`.
+  # So a report in that window lost its dispatch instead of reaching a human.
+  #
+  # `escalation_reasons` is the same shape of gap and is reachable by an attacker rather than
+  # by a long report: `Loopctl.Intake` accumulates reasons monotonically and never clears
+  # them, and the detector emits a code per signal per field, so a reporter who trips enough
+  # distinct pairs across successive edits overflows `maxItems`. The record that fails is
+  # then the most heavily attacked one, which is the worst possible one to drop.
+  # No defensive fallback clauses: this function only ever sees the map `build/1` constructs
+  # immediately above, so a clause for "some other shape" is unreachable and dialyzer says so.
+  # A guard that cannot fire is the same defect as a cap that cannot bind, which is the thing
+  # this whole round is about.
+  defp violations(%{untrusted: untrusted, escalation_reasons: reasons} = triage) do
+    List.flatten([
+      over(String.length(untrusted), RunnerTriage.max_untrusted_length(), :untrusted),
+      over(length(reasons), RunnerTriage.max_reasons(), :reasons_count),
+      over(longest(reasons), RunnerTriage.max_reason_length(), :reason_length),
+      over(ByteRule.bytes(triage), RunnerTriage.max_bytes(), :bytes)
+    ])
+  end
+
+  defp over(actual, limit, tag), do: if(actual > limit, do: [tag], else: [])
+
+  defp longest([]), do: 0
+  defp longest(strings), do: strings |> Enum.map(&String.length/1) |> Enum.max()
 
   # ONE render call over the three fields joined. The join happens BEFORE the fence, so
   # every character of every field — separators included — goes through `neutralise/1` and

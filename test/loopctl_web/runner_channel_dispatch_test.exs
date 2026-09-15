@@ -890,6 +890,52 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       assert meta.outcome == "suppressed"
     end
 
+    # Found by the loopctl-runner session: a runner may declare a kind its accept path cannot
+    # run, refusing every dispatch of it as a FAULT rather than a capability statement. Both
+    # other outcome tags stay at zero while the machine eats dispatches, so this is the one
+    # shape the telemetry could not see. 1.7.0 makes declaring triage possible, so the blind
+    # spot would ship with it.
+    test "a FAULT on a declared kind is counted, and suppresses nothing",
+         %{runner: runner, raw: raw, channel: channel} do
+      channel = rejoin_declaring(channel, raw, runner, ["implement"])
+
+      ref =
+        :telemetry_test.attach_event_handlers(self(), [
+          [:loopctl, :runners, :declared_kind_refused]
+        ])
+
+      on_exit(fn -> :telemetry.detach(ref) end)
+
+      payload = dispatch_payload(runner.tenant_id)
+      assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
+      assert_push "dispatch", _, @reply_timeout
+
+      reply_ref =
+        push(channel, "dispatch_reply", %{
+          "dispatch_id" => payload["dispatch_id"],
+          "claim_epoch" => payload["claim_epoch"],
+          "decision" => "refused",
+          "reason" => "other",
+          "detail" => "the runner failed deciding this dispatch"
+        })
+
+      assert_reply reply_ref, :ok, _, @reply_timeout
+
+      assert_receive {[:loopctl, :runners, :declared_kind_refused], ^ref, %{count: 1}, meta},
+                     @reply_timeout
+
+      assert meta.outcome == "declared_but_faulted"
+
+      # A fault is transient by assumption, so nothing is suppressed and the next dispatch
+      # is still sent — the counter is the signal, not a bound.
+      assert Runners.suppressed_kinds(socket_meta(channel)) == []
+
+      assert :ok =
+               Runners.dispatch(runner.tenant_id, runner.id, dispatch_payload(runner.tenant_id))
+
+      assert_push "dispatch", _, @reply_timeout
+    end
+
     test "an ordinary refusal does not suppress a declared kind",
          %{runner: runner, raw: raw, channel: channel} do
       channel = rejoin_declaring(channel, raw, runner, ["implement"])

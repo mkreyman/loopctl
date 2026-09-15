@@ -836,11 +836,11 @@
                 "type": "string"
               },
               "ref": {
-                "maxLength": 200,
+                "maxLength": 150,
                 "type": "string"
               },
               "why": {
-                "maxLength": 500,
+                "maxLength": 300,
                 "type": "string"
               }
             },
@@ -851,7 +851,7 @@
             ],
             "type": "object"
           },
-          "maxItems": 20,
+          "maxItems": 10,
           "type": "array"
         },
         "duplicate_of": {
@@ -874,10 +874,10 @@
         "evidence": {
           "description": "What the session actually read: file paths with optional line numbers, knowledge-base article ids. It makes a verdict checkable by someone who does not re-run it, which is the cheapest defence against a confident verdict with nothing behind it. Capped hard: it is session-authored.",
           "items": {
-            "maxLength": 300,
+            "maxLength": 200,
             "type": "string"
           },
-          "maxItems": 40,
+          "maxItems": 20,
           "type": "array"
         },
         "missing_information": {
@@ -898,18 +898,18 @@
           "type": "string"
         },
         "story": {
-          "description": "The draft story, required when `outcome` is `story`. Bounded exactly as `RunnerStory` bounds the same fields, so one set of limits governs a story in both directions. No `id`: the story row already exists and loopctl owns its identity.",
+          "description": "The draft story, required when `outcome` is `story`. Its caps are SMALLER than `RunnerStory`'s and are not the same numbers: a story at `RunnerStory`'s maxima costs several times this whole object's 48000-byte budget, so inheriting them would have declared limits no field could reach. A draft written from one report is not an epic, and a story needing more than this is one to escalate rather than draft. These are still INDIVIDUAL maxima that do not sum to the object cap. No `id`: the story row exists and loopctl owns its identity.",
           "properties": {
             "acceptance_criteria": {
               "items": {
-                "maxLength": 500,
+                "maxLength": 250,
                 "type": "string"
               },
-              "maxItems": 20,
+              "maxItems": 8,
               "type": "array"
             },
             "description": {
-              "maxLength": 8000,
+              "maxLength": 1500,
               "type": "string"
             },
             "domain_reference": {
@@ -918,10 +918,10 @@
             },
             "test_cases": {
               "items": {
-                "maxLength": 500,
+                "maxLength": 250,
                 "type": "string"
               },
-              "maxItems": 20,
+              "maxItems": 8,
               "type": "array"
             },
             "title": {
@@ -930,10 +930,10 @@
             },
             "touches": {
               "items": {
-                "maxLength": 200,
+                "maxLength": 100,
                 "type": "string"
               },
-              "maxItems": 100,
+              "maxItems": 15,
               "type": "array"
             }
           },
@@ -1086,7 +1086,39 @@
       "trace_max_event_bytes": 12000,
       "trace_max_event_data_bytes": 6000,
       "trace_max_events": 20,
-      "trace_max_seq": 9223372036854775806
+      "trace_max_seq": 9223372036854775806,
+      "triage": {
+        "fields": {
+          "escalation_reasons": {
+            "max_item_length": 100,
+            "max_items": 20
+          },
+          "html_url": {
+            "max_length": 500
+          },
+          "untrusted": {
+            "max_length": 6000
+          }
+        },
+        "max_bytes": 48000
+      },
+      "triage_verdict": {
+        "fields": {
+          "escalation_reasons": {
+            "max_item_length": 300,
+            "max_items": 20
+          },
+          "evidence": {
+            "max_item_length": 200,
+            "max_items": 20
+          },
+          "missing_information": {
+            "max_item_length": 300,
+            "max_items": 20
+          }
+        },
+        "max_bytes": 48000
+      }
     },
     "replies": {
       "trace": "RunnerTraceAck",

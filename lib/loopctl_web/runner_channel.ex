@@ -602,7 +602,7 @@ defmodule LoopctlWeb.RunnerChannel do
   defp note_kind_refusal(socket, %{decision: "refused", reason: "kind_not_supported"}, record) do
     %{runner: runner, tenant_id: tenant_id, meta: meta} = socket.assigns
 
-    emit_kind_refused(tenant_id, runner, record, Runners.declared_kinds(meta))
+    emit_kind_refused(tenant_id, runner, record, Runners.declared_kinds(meta), nil)
 
     case {Runners.declared_kinds(meta), record.kind} do
       {{:declared, kinds}, kind} when is_binary(kind) ->
@@ -622,6 +622,36 @@ defmodule LoopctlWeb.RunnerChannel do
     end
   end
 
+  # A FAULT on a kind the runner DECLARED. Not a capability statement, so nothing is
+  # suppressed — a fault is transient by assumption and the next dispatch should be tried —
+  # but it is the same self-contradiction one step further in, and until now it was the one
+  # shape this telemetry could not see.
+  #
+  # Found by the `loopctl-runner` maintaining session, 2026-09-15, from its own side: a
+  # runner may declare a kind its ACCEPT PATH cannot actually run. Theirs requires a story
+  # object, which the contract allows only on an implement dispatch, so a runner declaring
+  # `triage` before its accept path exists refuses every triage dispatch with `other` —
+  # suppressing nothing, recording no `kind_not_supported`, and soaking the kind for as long
+  # as it is declared. Both existing outcome tags stay at zero while the machine eats
+  # dispatches. 1.7.0 is what makes declaring `triage` possible, so the blind spot ships with
+  # it unless it is closed here.
+  defp note_kind_refusal(socket, %{decision: "refused", reason: "other"}, record) do
+    %{runner: runner, tenant_id: tenant_id, meta: meta} = socket.assigns
+
+    with {:declared, kinds} <- Runners.declared_kinds(meta),
+         kind when is_binary(kind) <- record.kind,
+         true <- kind in kinds do
+      Logger.warning(
+        "runner declared kind #{kind} and then refused a dispatch of it as other; the " <>
+          "declaration and what the runner can actually run may have diverged"
+      )
+
+      emit_kind_refused(tenant_id, runner, record, {:declared, kinds}, "declared_but_faulted")
+    end
+
+    socket
+  end
+
   defp note_kind_refusal(socket, _reply, _record), do: socket
 
   # EMITTED ON EVERY `kind_not_supported`, NOT ONLY THE SUPPRESSED ONES — and that ordering
@@ -636,11 +666,19 @@ defmodule LoopctlWeb.RunnerChannel do
   # `outcome` separates the two, and both tags are bounded: `kind` comes from the LEDGER row
   # of a dispatch loopctl itself sent, so it is from `dispatchable_kinds` and never a
   # runner-supplied string, and `outcome` is two literals. Ids stay in the logs.
-  defp emit_kind_refused(tenant_id, runner, %{kind: kind}, declared) when is_binary(kind) do
+  defp emit_kind_refused(tenant_id, runner, %{kind: kind}, declared, forced)
+       when is_binary(kind) do
     outcome =
-      case declared do
-        {:declared, kinds} -> if kind in kinds, do: "suppressed", else: "not_declared"
-        {:implied, _} -> "permanent"
+      cond do
+        is_binary(forced) ->
+          forced
+
+        match?({:declared, _}, declared) ->
+          {:declared, kinds} = declared
+          if kind in kinds, do: "suppressed", else: "not_declared"
+
+        true ->
+          "permanent"
       end
 
     :telemetry.execute(
@@ -650,7 +688,7 @@ defmodule LoopctlWeb.RunnerChannel do
     )
   end
 
-  defp emit_kind_refused(_tenant_id, _runner, _record, _declared), do: :ok
+  defp emit_kind_refused(_tenant_id, _runner, _record, _declared, _forced), do: :ok
 
   # THE SUPPRESSION BELONGS TO THE CONNECTION THAT CARRIED THE DISPATCH, not to whichever one
   # the reply happens to arrive on. `DispatchLedger.record_reply/3` fences on

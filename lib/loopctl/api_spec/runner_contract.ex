@@ -619,6 +619,36 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     @spec max_url_length() :: pos_integer()
     def max_url_length, do: @max_url_length
 
+    @doc """
+    The bounds a runner cannot read off the schema, published in `x-connection.limits`. The
+    object cap is the one that matters: it is not a JSON Schema keyword, so a runner
+    pre-flighting a payload against the vendored contract sees the per-field `maxLength`
+    values and has no way to learn the object is also capped — the "refused for a reason the
+    author cannot read anywhere" failure the export's own note warns about.
+
+    At runtime, not compile time: `schema/0` is defined by the macro below.
+    """
+    @spec limits() :: %{String.t() => term()}
+    def limits do
+      fields =
+        for {name, sub} <- schema().properties,
+            bounds = field_bounds(sub),
+            bounds != %{},
+            into: %{},
+            do: {Atom.to_string(name), bounds}
+
+      %{"max_bytes" => @max_bytes, "fields" => fields}
+    end
+
+    defp field_bounds(%Schema{type: :array, maxItems: items, items: %Schema{maxLength: length}})
+         when is_integer(items) and is_integer(length),
+         do: %{"max_items" => items, "max_item_length" => length}
+
+    defp field_bounds(%Schema{type: :string, maxLength: length}) when is_integer(length),
+      do: %{"max_length" => length}
+
+    defp field_bounds(%Schema{}), do: %{}
+
     OpenApiSpex.schema(
       %{
         title: "RunnerTriage",
@@ -898,14 +928,51 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     @max_reason_length 300
     @max_missing 20
     @max_missing_length 300
-    @max_evidence 40
-    @max_evidence_length 300
-    @max_contradicts 20
-    @max_contradict_ref_length 200
-    @max_contradict_why_length 500
+    @max_evidence 20
+    @max_evidence_length 200
+
+    # THE DRAFT STORY'S OWN CAPS, smaller than `RunnerStory`'s and not derived from them.
+    # Measured: `RunnerStory`'s maxima nested here cost 294_202 bytes against this object's
+    # 48_000, so inheriting them gave the story six field caps none of which its own field
+    # could ever reach. A draft written from ONE report is not an epic, and a story needing
+    # more than this is one triage should be escalating rather than drafting.
+    #
+    # `title` and `domain_reference` keep `RunnerStory`'s values because they are already
+    # small enough to be reachable; only the fields that blew the budget are reduced.
+    @max_story_description 1_500
+    @max_story_criteria 8
+    @max_story_criterion_length 250
+    @max_story_test_cases 8
+    @max_story_test_case_length 250
+    @max_story_touches 15
+    @max_story_touch_length 100
+    # Also measured down: 20 entries of a 200-character ref and a 500-character why cost
+    # 86_842 bytes, nearly twice this object's whole budget. Ten contradictions is already
+    # more than a verdict a human will read can carry.
+    @max_contradicts 10
+    @max_contradict_ref_length 150
+    @max_contradict_why_length 300
     @contradict_kinds ["story", "kb", "code"]
 
-    # The same budget as a dispatch object, for the same frame.
+    # The same budget as a dispatch object, for the same frame — a verdict arrives INBOUND
+    # over the same 64 KB socket, so the arithmetic is the dispatch's.
+    #
+    # WHAT THIS CAP MEANS, stated because the first version of this module got it wrong.
+    # `ByteRule` charges six bytes per character, so 48_000 is about 8_000 CHARACTERS for the
+    # whole verdict. The per-field maxima below are INDIVIDUAL limits and do not sum to this;
+    # a verdict near several of them at once is refused on the object cap, exactly as
+    # `RunnerStory` documents of its own fields. What was wrong before was not that — it was
+    # claiming the draft story is "bounded exactly as `RunnerStory` bounds the same fields, so
+    # one set of limits governs in both directions". It is not: `RunnerStory` is capped at
+    # 48_000 as a whole object, and the same story nested inside a verdict shares that budget
+    # with everything else here, so a story valid OUTBOUND can be refused INBOUND. The claim
+    # is withdrawn rather than engineered around, because making it true would mean a verdict
+    # cap of 48_000 plus a story's worth on a frame that has not got it.
+    #
+    # The invariant that IS held, and is tested: no single field's declared maximum exceeds
+    # the object cap on its own. `evidence` did — 40 entries of 300 characters is about
+    # 72_000 bytes, more than the whole verdict may be — which is a cap that cannot be
+    # reached by the field it is written on, the same defect as one that cannot bind.
     @max_bytes 48_000
 
     @doc "Every outcome a verdict may carry."
@@ -923,6 +990,36 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     @doc "The most evidence entries, and the longest one."
     @spec max_evidence() :: pos_integer()
     def max_evidence, do: @max_evidence
+
+    @doc """
+    The bounds a runner cannot read off the schema, published in `x-connection.limits`. The
+    object cap is the one that matters: it is not a JSON Schema keyword, so a runner
+    pre-flighting a payload against the vendored contract sees the per-field `maxLength`
+    values and has no way to learn the object is also capped — the "refused for a reason the
+    author cannot read anywhere" failure the export's own note warns about.
+
+    At runtime, not compile time: `schema/0` is defined by the macro below.
+    """
+    @spec limits() :: %{String.t() => term()}
+    def limits do
+      fields =
+        for {name, sub} <- schema().properties,
+            bounds = field_bounds(sub),
+            bounds != %{},
+            into: %{},
+            do: {Atom.to_string(name), bounds}
+
+      %{"max_bytes" => @max_bytes, "fields" => fields}
+    end
+
+    defp field_bounds(%Schema{type: :array, maxItems: items, items: %Schema{maxLength: length}})
+         when is_integer(items) and is_integer(length),
+         do: %{"max_items" => items, "max_item_length" => length}
+
+    defp field_bounds(%Schema{type: :string, maxLength: length}) when is_integer(length),
+      do: %{"max_length" => length}
+
+    defp field_bounds(%Schema{}), do: %{}
 
     OpenApiSpex.schema(
       %{
@@ -949,31 +1046,32 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           story: %Schema{
             type: :object,
             description:
-              "The draft story, required when `outcome` is `story`. Bounded exactly as " <>
-                "`RunnerStory` bounds the same fields, so one set of limits governs a " <>
-                "story in both directions. No `id`: the story row already exists and " <>
-                "loopctl owns its identity.",
+              "The draft story, required when `outcome` is `story`. Its caps are SMALLER " <>
+                "than `RunnerStory`'s and are not the same numbers: a story at " <>
+                "`RunnerStory`'s maxima costs several times this whole object's " <>
+                "#{@max_bytes}-byte budget, so inheriting them would have declared limits " <>
+                "no field could reach. A draft written from one report is not an epic, and " <>
+                "a story needing more than this is one to escalate rather than draft. " <>
+                "These are still INDIVIDUAL maxima that do not sum to the object cap. No " <>
+                "`id`: the story row exists and loopctl owns its identity.",
             required: [:title, :description, :acceptance_criteria],
             properties: %{
               title: %Schema{type: :string, maxLength: RunnerStory.max_title_length()},
-              description: %Schema{
-                type: :string,
-                maxLength: RunnerStory.max_description_length()
-              },
+              description: %Schema{type: :string, maxLength: @max_story_description},
               acceptance_criteria: %Schema{
                 type: :array,
-                maxItems: RunnerStory.max_criteria(),
-                items: %Schema{type: :string, maxLength: RunnerStory.max_criterion_length()}
+                maxItems: @max_story_criteria,
+                items: %Schema{type: :string, maxLength: @max_story_criterion_length}
               },
               test_cases: %Schema{
                 type: :array,
-                maxItems: RunnerStory.max_test_cases(),
-                items: %Schema{type: :string, maxLength: RunnerStory.max_test_case_length()}
+                maxItems: @max_story_test_cases,
+                items: %Schema{type: :string, maxLength: @max_story_test_case_length}
               },
               touches: %Schema{
                 type: :array,
-                maxItems: RunnerStory.max_touches(),
-                items: %Schema{type: :string, maxLength: RunnerStory.max_touch_length()}
+                maxItems: @max_story_touches,
+                items: %Schema{type: :string, maxLength: @max_story_touch_length}
               },
               domain_reference: %Schema{
                 type: :string,
@@ -1777,6 +1875,19 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     end
   end
 
+  # A `triage` KIND carrying no `triage` object. The head above only matches when the key is
+  # present, so without this a dispatch with a template for the wrong job and no input passes
+  # every shape rule — which is precisely what the moduledoc claims this payload prevents.
+  # `kind_errors/1` masks it today because triage is not dispatchable; it stops masking it the
+  # moment the interlock moves, so the clause lands now rather than as part of that change.
+  #
+  # The mirror gap for `story` on an `implement` dispatch is pre-existing and is NOT fixed
+  # here: closing it would refuse every dispatch built before 1.5.0 carried a story, and it is
+  # a different change with a different blast radius. Named so the asymmetry is deliberate
+  # rather than an oversight.
+  defp triage_errors(%{kind: "triage"} = dispatch) when not is_map_key(dispatch, :triage),
+    do: ["a triage dispatch must carry the triage object"]
+
   defp triage_errors(_dispatch), do: []
 
   @doc """
@@ -2181,7 +2292,9 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           "dispatch_reply_burst" => @dispatch_reply_burst,
           "stage_burst" => @stage_burst,
           "stage_max_reason_length" => RunnerStage.max_reason_length(),
-          "story" => RunnerStory.limits()
+          "story" => RunnerStory.limits(),
+          "triage" => RunnerTriage.limits(),
+          "triage_verdict" => RunnerTriageVerdict.limits()
         },
         # The transition table a `stage` message is checked against, published so a runner
         # can refuse an impossible transition locally instead of learning it from a refusal.

