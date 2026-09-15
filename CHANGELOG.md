@@ -31,6 +31,37 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **The unattended dispatch driver, OFF by default (#803).** `Loopctl.Delivery.DispatchDriver`
+  plus `Loopctl.Workers.DispatchDriverWorker`, scheduled every minute: it selects stage rows at
+  `queued` fleet-wide, oldest first and bounded per pass, picks a runner of that tenant that is
+  both CONNECTED and has a free slot, and places the story through `Placement.place/4`. It is
+  the cadence half of the trigger the operator endpoint above gave an operator.
+
+  **Three new operator variables, documented in `deploy/FLY_SECRETS.md`, and the driver runs
+  only when all three are right.** `DISPATCH_DRIVER_ENABLED` defaults to FALSE and is exact
+  opt-in (`true` or `1`), so the cron entry runs from the deploy that ships it, places nothing
+  and reports a clean run until somebody turns it on — this is the one component of the loop
+  that spends money and runs code on someone's machine with nobody watching, and a default of
+  ON would make that a consequence of deploying rather than a decision.
+  `DISPATCH_WALL_CLOCK_SECONDS` and `DISPATCH_MAX_TURNS` have **NO DEFAULT**: enabled with
+  either unset, the driver places nothing and the job FAILS naming the key, rather than
+  dispatching on a figure nobody chose. A pass where every candidate errored also fails the
+  job — on a pool outage every candidate raises, the per-story rescue swallows each, and an
+  `:ok` there would have Oban record success with nothing retried and nothing alerting.
+
+  **It is inert in a second way until `place/4` builds the story object, and that is the next
+  change rather than a deferral.** An `implement` dispatch carries the story as typed fields;
+  neither placing caller builds that object today (the builder escalates an oversize story,
+  and that edge exists only once the story is claimed), so a placed dispatch names a
+  `story_id` and carries no work. The runner refuses it — confirmed against the runner
+  implementation, a clean immediate refusal that leaves no state — so the driver must not be
+  enabled until the object is built server-side.
+
+  Migration `20260921130000` adds the partial index the candidate read needs
+  (`story_stages (updated_at, story_id) WHERE stage = 'queued'`, built `CONCURRENTLY`, no
+  manual step): the only other index on the table is tenant-leading, and this read has no
+  tenant in its predicate.
+
 - **`POST /api/v1/runners/:runner_id/dispatches` — the control-side dispatch trigger (#803).**
   `Loopctl.Delivery.Placement.place/4` shipped with #833 and had NO CALLER: the mechanism was
   built, tested and documented, and nothing could reach it. The delivery loop's first

@@ -279,6 +279,49 @@ defmodule Loopctl.ObanPluginsConfigTest do
     end
   end
 
+  describe "DispatchDriverWorker crontab entry" do
+    setup do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+
+      {Oban.Plugins.Cron, cron_opts} =
+        Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      entry =
+        Enum.find(cron_opts[:crontab], fn
+          {_schedule, Loopctl.Workers.DispatchDriverWorker} -> true
+          {_schedule, Loopctl.Workers.DispatchDriverWorker, _opts} -> true
+          _ -> false
+        end)
+
+      %{entry: entry}
+    end
+
+    test "the DispatchDriverWorker entry exists in the crontab", %{entry: entry} do
+      assert entry,
+             "expected a DispatchDriverWorker crontab entry — #803 §3. Without one nothing " <>
+               "in lib/ calls Loopctl.Delivery.DispatchDriver.run/1, so a queued story is " <>
+               "placed only by an operator's POST and the loop never runs unattended. The " <>
+               "entry is safe to schedule unconditionally: the driver is off by default."
+    end
+
+    test "it runs every minute and takes no all_tenants fan-out", %{entry: entry} do
+      # Fleet-wide in ONE job (the candidate read is on AdminRepo across tenants), so there is
+      # no per-tenant child to fan out to. Every minute, like the triage trigger above and for
+      # the same reason: a candidate makes no outbound network call — local statements plus a
+      # push to an already-connected socket — so the cadence is bounded by AdminRepo's pool.
+      assert elem(entry, 0) == "* * * * *"
+      assert tuple_size(entry) == 2
+    end
+
+    test "it is NOT parked, because being off is a config decision and not a parking" do
+      # The #249 parking list below suppresses crons that run green while doing nothing. This
+      # one also does nothing today — the driver defaults to disabled — and must NOT be parked
+      # for it: parking is permanent until someone edits lib/, while the whole point here is
+      # that an operator turns the driver on with one environment variable and a restart.
+      refute Loopctl.Workers.DispatchDriverWorker in Loopctl.ObanConfig.parked_crons()
+    end
+  end
+
   describe "#249: inert KB crons are PARKED by default" do
     setup do
       plugins = Application.get_env(:loopctl, Oban)[:plugins]
