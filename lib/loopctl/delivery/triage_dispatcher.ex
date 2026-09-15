@@ -42,25 +42,36 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   Retry or remember. A story it could not dispatch stays at `detected` and is a candidate
   again next pass — the same shape as the triage trigger and the driver, for the same reason:
   the condition either clears on its own (no runner declaring `triage` yet) or needs a person.
-  The DISPATCH LEDGER is what stops a second one going out for a story already being triaged:
-  a `dispatch_id` is derived from the story and its epoch, so a pass that runs while a triage
-  session is live re-sends the same id, which the ledger answers rather than starting a second
-  session.
+
+  What stops a SECOND dispatch going out for a story already being triaged is `candidates/1`,
+  which excludes any story holding an unreleased triage dispatch. The `dispatch_id` itself is
+  generated fresh per attempt, like the driver's; see the comment above `dispatch/4` for why
+  deriving it from the story blocked re-triage permanently.
+
+  A story it can never dispatch does NOT sit here silently. `:triage_too_large` — a ticket
+  whose rendered object will not fit the contract's bound — is ESCALATED, because it is the
+  one refusal in this pass that needs a person rather than time, and `TriagePayload` says so
+  in its own moduledoc. The two `:blocked` shapes that remain are a project with no single
+  intake source and a record that has gone: neither is a candidate at all (the first is
+  excluded by the query, the second logs and is rare), so neither can head-of-line the queue.
   """
 
   import Ecto.Query
 
+  alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Delivery.TriagePayload
   alias Loopctl.Intake
+  alias Loopctl.Intake.Source
   alias Loopctl.Repo
   alias Loopctl.Runners
+  alias Loopctl.Runners.DispatchRecord
   alias Loopctl.Runners.Runner
   alias Loopctl.WorkBreakdown.Story
 
   require Logger
 
-  @type outcome :: :dispatched | :no_runner | :deferred | :blocked | :errored
+  @type outcome :: :dispatched | :no_runner | :deferred | :blocked | :escalated | :errored
 
   @kind "triage"
 
@@ -71,33 +82,93 @@ defmodule Loopctl.Delivery.TriageDispatcher do
   # something" in the log for a queue that is working exactly as intended — and the live case
   # is ordinary, because a story stays at `detected` until its verdict comes back, so a pass
   # that runs while its triage session is live meets its own reservation.
+  #
+  # A race is transient too, and classing one as `:blocked` is the same lie in the other
+  # direction: `:stale_claim_epoch` is the story's epoch moving between `fetch_story/2` and
+  # `record_sent/3`, and `:runner_not_connected` / `:runner_ambiguous` are the runner dropping
+  # its socket between the Presence read in `available_runner/2` and the push. Every one of
+  # them is gone by the next pass and none has an action a person could take. Telling an
+  # operator to intervene on the conditions that fix themselves is how the log stops being
+  # read at all.
+  #
+  # `:dispatch_already_replied` is NOT here any more, and that is the correction that matters:
+  # it used to be classed transient while being the most permanent state this pass could reach
+  # — an accepted session that died left it for ever, logged at `info` as the fleet being busy.
+  # It is now unreachable in that shape (`candidates/1` excludes a story with an unreleased
+  # dispatch), so what is left is a genuine race against a reply landing mid-pass, and a race
+  # is `:blocked` only if it cannot clear. This one clears when the ledger row releases.
   @transient [
     :capacity_busy,
     :busy,
     :admission_limit_reached,
     :runner_at_capacity,
     :rate_limited,
+    :stale_claim_epoch,
+    :runner_not_connected,
+    :runner_ambiguous,
     :dispatch_already_replied
   ]
 
   @doc """
-  Stories at `detected` that came from an intake record, oldest first, fair across tenants.
+  Stories at `detected` that came from an intake record, are under a project bound to exactly
+  one intake source, and have no triage session already running — oldest first, fair across
+  tenants.
 
   The intake record is required rather than optional: the triage payload IS the reporter's
   words, so a story with no record has nothing to triage and would be dispatched with an empty
   object. Those exist — a backfill, a story created through the API — and they are not this
   loop's work.
 
+  ## The two predicates that are here rather than discovered per story
+
+  BOTH close the same trap, which `DispatchDriver`'s own moduledoc records as a defect it
+  already paid for: nothing removes a dispatched triage story from this set — no claim is
+  taken and no stage row is written until the verdict lands — so a story this pass cannot
+  dispatch keeps its `updated_at` frozen at detection time and sits at the HEAD of an
+  oldest-first ranking for ever. Twenty of them fill every batch while the worker reports a
+  clean run.
+
+  - **One active intake source.** A project with none has no repository and a project with two
+    names no single one, so every story under it is `:blocked` permanently. The same predicate,
+    for the same reason, as the driver's.
+  - **No unreleased triage dispatch.** This is what replaced a `dispatch_id` DERIVED from the
+    story and its epoch. That derivation made a second pass during a live session harmless, and
+    bought it with two permanent blocks: nothing bumps `claim_epoch` on an unclaimed `detected`
+    story, so the id could never differ — a runner that took the dispatch and then went away
+    left `:dispatch_id_conflict` against the next runner for ever, and one that ACCEPTED and
+    then died without a verdict left `:dispatch_already_replied` for ever, logged at `info` as
+    though the fleet were merely busy. The ledger row is the better answer to the same
+    question, because it is the thing that ENDS: `Loopctl.Runners.Capacity.heal/3` releases a
+    reservation whose session outran its wall clock, so a dead triage session stops excluding
+    its story and the next pass sends a fresh dispatch.
+
   Public so the selection is falsifiable rather than buried in the pass.
   """
   @spec candidates(pos_integer()) :: [%{tenant_id: Ecto.UUID.t(), story_id: Ecto.UUID.t()}]
   def candidates(limit) when is_integer(limit) and limit > 0 do
+    bound_projects =
+      from src in Source,
+        where: is_nil(src.revoked_at),
+        group_by: [src.tenant_id, src.project_id],
+        having: count(src.id) == 1,
+        select: %{tenant_id: src.tenant_id, project_id: src.project_id}
+
+    live_triage =
+      from d in DispatchRecord,
+        where: d.kind == ^@kind and is_nil(d.released_at),
+        select: %{tenant_id: d.tenant_id, story_id: d.story_id}
+
     ranked =
       from s in StoryStage,
         join: st in Story,
         on: st.id == s.story_id and st.tenant_id == s.tenant_id,
+        join: b in subquery(bound_projects),
+        on: b.tenant_id == st.tenant_id and b.project_id == st.project_id,
+        left_join: live in subquery(live_triage),
+        on: live.tenant_id == s.tenant_id and live.story_id == s.story_id,
         where: s.stage == :detected,
         where: not is_nil(st.intake_record_id),
+        where: is_nil(live.story_id),
         select: %{
           tenant_id: s.tenant_id,
           story_id: s.story_id,
@@ -170,6 +241,7 @@ defmodule Loopctl.Delivery.TriageDispatcher do
     case send_triage(candidate, budgets) do
       :ok -> :dispatched
       {:error, :no_runner} -> :no_runner
+      {:error, :triage_too_large} -> escalate_too_large(candidate)
       {:error, reason} when reason in @transient -> deferred(candidate, reason)
       {:error, reason} -> blocked(candidate, reason)
     end
@@ -218,21 +290,17 @@ defmodule Loopctl.Delivery.TriageDispatcher do
     end
   end
 
-  # DERIVED FROM THE STORY AND ITS EPOCH, not generated, and that is what makes a second pass
-  # while a triage session is live harmless: the ledger already holds this id, so the re-send
-  # is answered as the retry it is instead of starting a second session on the same ticket.
-  # The epoch is in it because a story whose claim was released and re-detected is a different
-  # question, and its triage is a different dispatch.
-  defp dispatch_id(story) do
-    "triage:#{story.id}:#{story.claim_epoch}"
-    |> then(&:crypto.hash(:sha256, &1))
-    |> binary_part(0, 16)
-    |> Ecto.UUID.load!()
-  end
-
+  # FRESH PER ATTEMPT, as `DispatchDriver` generates one. It was derived from the story and its
+  # epoch, so that a second pass during a live session re-sent the same id and the ledger
+  # answered it as the retry it was. That worked and cost too much: nothing bumps `claim_epoch`
+  # on an unclaimed `detected` story, so the id could NEVER differ, and a dispatch that ended
+  # badly left a permanent block — `:dispatch_id_conflict` against any other runner, or
+  # `:dispatch_already_replied` for ever once a session accepted and then died. What the
+  # derivation was protecting is now a predicate in `candidates/1`: a story with an unreleased
+  # triage dispatch is not a candidate at all, and `Capacity.heal/3` is what ends that.
   defp dispatch(story, source, triage, budgets) do
     %{
-      "dispatch_id" => dispatch_id(story),
+      "dispatch_id" => Ecto.UUID.generate(),
       "story_id" => story.id,
       "kind" => @kind,
       "repo" => source.repo_full_name,
@@ -247,6 +315,59 @@ defmodule Loopctl.Delivery.TriageDispatcher do
       "max_turns" => budgets.max_turns,
       "triage" => Map.new(triage, fn {k, v} -> {to_string(k), v} end)
     }
+  end
+
+  # A TICKET NO SESSION CAN BE ASKED TO READ NEEDS A PERSON, NOT ANOTHER PASS. `TriagePayload`
+  # says so in its own moduledoc — "its caller escalates it to a human" — and this is the only
+  # caller. Logged and left, it was an ERROR line a minute for ever about a condition that
+  # cannot change by itself, on a story that then also sat at the head of the oldest-first
+  # ranking (`candidates/1` has no size predicate and cannot have one; the bound is on the
+  # RENDERED object).
+  #
+  # `detected` has no edge to `escalated`, so this takes the route the machine already has for
+  # exactly this conclusion: `detected -> triaged -> escalated` on `:triage_escalate`, which is
+  # what an escalating verdict takes. Two transactions, and the second failing leaves the story
+  # at `triaged` — where nothing re-dispatches it, which is correct: this pass never sends a
+  # triaged story, and an operator reading `triaged` with no verdict is looking at a story that
+  # needs them either way.
+  #
+  # `actor_role: :agent` with an EMPTY lineage, stated: this is a worker holding no credential,
+  # and `:agent` keeps the human-only edges out of reach whatever the default becomes.
+  defp escalate_too_large(%{tenant_id: tenant_id, story_id: story_id}) do
+    case fetch_story(tenant_id, story_id) do
+      {:ok, story} -> escalate_route(tenant_id, story)
+      {:error, reason} -> blocked(%{tenant_id: tenant_id, story_id: story_id}, reason)
+    end
+  end
+
+  defp escalate_route(tenant_id, story) do
+    opts = [
+      claim_epoch: story.claim_epoch,
+      actor_label: "worker:triage_dispatcher",
+      actor_role: :agent,
+      actor_lineage: []
+    ]
+
+    route = [
+      {{:detected, :triaged, :forward}, nil},
+      {{:triaged, :escalated, :triage_escalate}, "triage_dispatch:triage_too_large"}
+    ]
+
+    Enum.reduce_while(route, :escalated, fn {transition, reason}, _acc ->
+      case Stages.advance(tenant_id, story.id, transition, Keyword.put(opts, :reason, reason)) do
+        {:ok, _row} ->
+          {:cont, :escalated}
+
+        # Already taken — by a verdict that landed between the size refusal and here, or by the
+        # first half of an earlier attempt at this route. The next transition still applies.
+        {:error, :stale_stage} ->
+          {:cont, :escalated}
+
+        {:error, reason} ->
+          {:halt,
+           blocked(%{tenant_id: tenant_id, story_id: story.id}, {:escalate_failed, reason})}
+      end
+    end)
   end
 
   defp fetch_story(tenant_id, story_id) do

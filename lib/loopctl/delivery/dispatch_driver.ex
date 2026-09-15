@@ -245,10 +245,21 @@ defmodule Loopctl.Delivery.DispatchDriver do
   # `max_turns` has a minimum in the contract and no maximum, so its only ceiling is the one
   # above: a positive integer. Stated rather than left implicit, because the pair is read as a
   # pair and a silent `:infinity` for one of them is how the other's bound gets forgotten.
-  defp budget_maximum(:dispatch_wall_clock_seconds),
+  # ONE CEILING PER BUDGET KEY, and every key a caller may pass must have a clause — this is a
+  # private function on a public entry point, so a key it does not name is a
+  # `FunctionClauseError` inside an Oban worker rather than an error return. The triage pair
+  # (`Loopctl.Delivery.TriageDispatcher.budgets/0`, `DispatchPayload.fill/2` on a triage kind)
+  # had no clause, so setting `TRIAGE_WALL_CLOCK_SECONDS` — which is what the deploy doc tells
+  # an operator to do — crashed every pass, three Oban retries and a discard a minute, with no
+  # triage dispatch ever sent. It was green because the only budget test asserts the UNSET
+  # path, which returns before reaching here.
+  #
+  # Triage runs against the same wire field as implement, so it is bounded by the same
+  # contract maximum. It is not a policy choice: `cast_dispatch/1` refuses anything above it.
+  defp budget_maximum(key) when key in [:dispatch_wall_clock_seconds, :triage_wall_clock_seconds],
     do: RunnerContract.RunnerDispatch.max_wall_clock_seconds()
 
-  defp budget_maximum(:dispatch_max_turns), do: :infinity
+  defp budget_maximum(key) when key in [:dispatch_max_turns, :triage_max_turns], do: :infinity
 
   @doc "True when an operator has turned the driver on. Defaults to FALSE."
   @spec enabled?() :: boolean()

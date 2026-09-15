@@ -7675,13 +7675,16 @@ const TOOLS = [
         runner_id: { type: "string", description: "The runner to place it on (from runner_pool)." },
         kind: {
           type: "string",
-          enum: ["implement", "triage"],
+          enum: ["implement"],
           description:
-            "What the session is for. Both are dispatchable since contract 1.10.0, and " +
-            "`x-connection.dispatchable_kinds` is the live list — a kind not on it is refused " +
-            "after the claim, not before it. A `triage` dispatch also needs a runner that " +
-            "DECLARES `triage` on join: a machine that declares nothing is sent `implement` " +
-            "alone, by design.",
+            "What the session is for. `implement` is the only kind THIS tool sends, and the " +
+            "narrowness is deliberate rather than a gap in the contract: `triage` became " +
+            "dispatchable in 1.10.0, but placement CLAIMS the story — that is what mints the " +
+            "custody lineage — while a triage session only reads, and loopctl dispatches " +
+            "triage itself from `detected` without claiming anything. Asking for `triage` " +
+            "here would claim a story for a session that is only deciding whether it is work, " +
+            "put it at `claimed`, and send a triage dispatch carrying no reporter words at " +
+            "all, because nothing on this path builds the triage object.",
         },
         dispatch_id: {
           type: "string",

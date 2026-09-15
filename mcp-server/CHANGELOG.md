@@ -5,16 +5,19 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
-## 2.96.0 — 2026-09-15 (triage is dispatchable)
+## 2.96.0 — 2026-09-15 (triage is dispatchable, but not through this tool)
 
 ### Changed
 
-- **`place_dispatch`'s `kind` accepts `triage`** again, because contract 1.10.0 makes it
-  dispatchable: `x-connection.dispatchable_kinds` is now `triage` and `implement`. It was
-  narrowed to `implement` alone in 2.95.0 — correctly, since a kind loopctl does not send is
-  refused AFTER the claim rather than before it. A triage dispatch still reaches only a runner
-  that DECLARES `triage` on join; a machine that declares nothing is sent `implement` alone, by
-  design, which is what makes the contract bump safe ahead of the fleet.
+- **`place_dispatch`'s `kind` stays `implement` alone**, and the reason is now stated in the
+  tool's own description rather than left to be discovered. Contract 1.10.0 makes `triage`
+  dispatchable and loopctl sends it — from `Loopctl.Delivery.TriageDispatcher`, against stories
+  at `detected`, claiming nothing. PLACEMENT is the other thing: it claims the story, which is
+  what mints the custody lineage. Asking for `triage` here would claim a story for a session
+  that is only deciding whether it is work at all, put it at `claimed` (the stage an implement
+  session reports from), and send a triage dispatch carrying no reporter words at all, because
+  nothing on the placement path builds the triage object. A draft of this release widened the
+  enum to both kinds on the strength of the contract alone; the review of #854 caught it.
 
 ## 2.95.0 — 2026-09-15 (the delivery loop becomes reachable from a session)
 

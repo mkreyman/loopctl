@@ -18,8 +18,17 @@ All notable changes to loopctl are documented here.
   dispatch carrying the reporter's words, fenced, for every detected story that came from an
   intake record. It CLAIMS NOTHING — a triage session decides whether the story is work at
   all, and claiming would put it at `claimed`, the stage an implement session reports from.
-  The `dispatch_id` is derived from the story and its epoch, so a pass that runs while a
-  triage session is live does not start a second one on the same ticket.
+  A pass that runs while a triage session is live does not start a second one on the same
+  ticket: a story holding an UNRELEASED triage dispatch is not a candidate. That predicate is
+  in the candidate QUERY, beside the one that requires a project bound to exactly one intake
+  source, and both are there for the reason `DispatchDriver` already records — a triage
+  dispatch claims nothing and writes no stage row, so nothing else removes a story from this
+  set, and a story the pass can never dispatch keeps its `updated_at` frozen at detection
+  time and heads the oldest-first ranking for ever.
+
+  A ticket too large to describe within the contract is ESCALATED — `detected -> triaged ->
+  escalated`, the route an escalating verdict takes — because it needs a person rather than
+  another pass, and no query predicate can see it: the bound is on the rendered object.
 
   **Only a runner that DECLARES `triage` on join receives one.** `implied_by_silence` stays
   `implement` alone, so a machine built before the `kinds` field existed is sent exactly what
