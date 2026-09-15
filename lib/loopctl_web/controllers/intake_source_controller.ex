@@ -144,7 +144,8 @@ defmodule LoopctlWeb.IntakeSourceController do
   operation(:update,
     summary: "Repoint a GitHub intake source at an epic",
     description:
-      "Sets `target_epic_id` on an ACTIVE source, or clears it with an explicit null. The " <>
+      "Sets `target_epic_id` on an ACTIVE source, or clears it with an explicit null, and/or " <>
+        "`base_branch`. The " <>
         "epic must belong to this source\'s project. This is the remedy for a source enrolled " <>
         "before the field existed, or one whose reports are being retried because it names no " <>
         "epic: until it does, every record from it stays `pending_triage` and is retried, and " <>
@@ -167,6 +168,20 @@ defmodule LoopctlWeb.IntakeSourceController do
                "The epic triaged stories land in; it must belong to this source\'s project. " <>
                  "Null clears it, which returns the source to escalating nothing and " <>
                  "retrying every report."
+           },
+           base_branch: %Schema{
+             type: :string,
+             minLength: 1,
+             maxLength: 255,
+             description:
+               "The branch every dispatch for this repository is cut FROM, and the " <>
+                 "`base_branch` an unattended dispatch carries (#803). Defaults to " <>
+                 "`master`, which is what dispatches carried before the field existed; set " <>
+                 "it to `main` for a repository created on GitHub since 2020, or the loop " <>
+                 "places work against a branch that does not exist. OPTIONAL and NOT " <>
+                 "nullable, unlike `target_epic_id`: omitting it leaves the current value " <>
+                 "(there is no unanswered state for a branch a dispatch must name), and an " <>
+                 "explicit null is a 422."
            }
          }
        }},
@@ -212,16 +227,33 @@ defmodule LoopctlWeb.IntakeSourceController do
   def update(conn, %{"id" => source_id} = params) do
     tenant = conn.assigns.current_tenant
 
-    # `Map.get`, so an absent key and an explicit null are the SAME here — both nil — and that
-    # is deliberate: the body has exactly one field, so a PATCH that names nothing is a
-    # request to clear it rather than a no-op worth distinguishing. `target_epic_id` is
+    # `Map.get`, so an absent key and an explicit null are the SAME for the EPIC — both nil —
+    # and that is deliberate: it is a nullable field whose unset state means "not answered",
+    # so a PATCH that does not name it is a request to clear it. `target_epic_id` is
     # `required` in the request schema, which is what makes "absent" an OpenAPI error rather
     # than a silent clear for anyone reading the spec.
+    #
+    # `base_branch` takes the OPPOSITE rule and must: it is NOT NULL, every dispatch has to
+    # name one, and there is no state that means "unanswered". So it is changed only when the
+    # key is PRESENT — `Map.has_key?`, not `Map.get` — and a PATCH repointing the epic leaves
+    # the branch exactly where it was instead of resetting it to a default the operator
+    # already overrode.
     with {:ok, source} <-
            Intake.repoint_source(tenant.id, source_id, Map.get(params, "target_epic_id"),
              actor_lineage: actor_lineage(conn)
-           ) do
+           ),
+         {:ok, source} <- maybe_set_base_branch(conn, tenant.id, source, params) do
       json(conn, %{source: source})
+    end
+  end
+
+  defp maybe_set_base_branch(conn, tenant_id, source, params) do
+    if Map.has_key?(params, "base_branch") do
+      Intake.set_base_branch(tenant_id, source.id, params["base_branch"],
+        actor_lineage: actor_lineage(conn)
+      )
+    else
+      {:ok, source}
     end
   end
 

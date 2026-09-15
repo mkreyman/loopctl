@@ -318,6 +318,85 @@ defmodule Loopctl.Intake do
     end
   end
 
+  @doc """
+  Sets the branch dispatches for this source's repository are cut FROM (#803 round 1).
+
+  ACTIVE sources only, for the same reason `repoint_source/4` is: a revoked source will never
+  report again, and its rows exist to keep history readable rather than to be configured.
+
+  NOT NULLABLE, unlike the epic. An absent base branch is not a question loopctl can leave
+  unanswered — every `implement` dispatch must name one — so there is no clearing form here,
+  and a caller that wants the old behaviour sets `"master"` explicitly.
+  """
+  @spec set_base_branch(Ecto.UUID.t(), Ecto.UUID.t(), String.t(), keyword()) ::
+          {:ok, Source.t()} | {:error, Ecto.Changeset.t() | :not_found}
+  def set_base_branch(tenant_id, source_id, base_branch, opts \\ [])
+      when is_binary(tenant_id) and is_binary(source_id) do
+    case active_source_of(tenant_id, source_id) do
+      nil ->
+        {:error, :not_found}
+
+      %Source{} = source ->
+        changeset =
+          source
+          |> Ecto.Changeset.cast(%{base_branch: base_branch}, [:base_branch])
+          |> Ecto.Changeset.validate_required([:base_branch])
+          |> Ecto.Changeset.validate_length(:base_branch, min: 1, max: 255)
+
+        with {:ok, changeset} <- valid(changeset) do
+          rebase(tenant_id, changeset, opts)
+        end
+    end
+  end
+
+  @doc """
+  The ACTIVE intake source bound to `project_id`, which is what a dispatch reads its
+  repository and base branch from (#803 §3).
+
+  `{:error, {:no_intake_source, project_id}}` when the project has none and
+  `{:error, {:ambiguous_intake_source, project_id, count}}` when it has more than one — the
+  same two refusals `Loopctl.Delivery.MergePrecondition.repo_for_story/1` gives, because that
+  function is now a reading of this one. Two sources on one project is a configuration a
+  dispatcher must not choose between: each names its own repository, and picking either would
+  send the work to a repository nobody nominated.
+  """
+  @spec source_for_project(Ecto.UUID.t(), Ecto.UUID.t()) ::
+          {:ok, Source.t()}
+          | {:error,
+             {:no_intake_source, Ecto.UUID.t()}
+             | {:ambiguous_intake_source, Ecto.UUID.t(), pos_integer()}}
+  def source_for_project(tenant_id, project_id)
+      when is_binary(tenant_id) and is_binary(project_id) do
+    tenant_id
+    |> list_sources()
+    |> Enum.filter(&(&1.project_id == project_id))
+    |> case do
+      [source] -> {:ok, source}
+      [] -> {:error, {:no_intake_source, project_id}}
+      sources -> {:error, {:ambiguous_intake_source, project_id, length(sources)}}
+    end
+  end
+
+  # The same shape as `repoint/3`, under its own action name: an operator reading the chain
+  # must be able to tell a repoint from a rebase without opening the payload.
+  defp rebase(tenant_id, changeset, opts) do
+    AdminRepo.transaction(fn ->
+      with {:ok, source} <- AdminRepo.update(changeset),
+           {:ok, _entry} <-
+             AuditChain.append(tenant_id, %{
+               action: "intake_source_base_branch_set",
+               actor_lineage: Keyword.get(opts, :actor_lineage, []),
+               entity_type: "intake_source",
+               entity_id: source.id,
+               payload: %{"base_branch" => source.base_branch}
+             }) do
+        source
+      else
+        {:error, reason} -> AdminRepo.rollback(reason)
+      end
+    end)
+  end
+
   defp active_source_of(tenant_id, source_id) do
     case Ecto.UUID.cast(source_id) do
       {:ok, id} ->

@@ -32,6 +32,7 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Intake.Source
   alias Loopctl.Progress
+  alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.Runner
   alias Loopctl.WorkBreakdown.Stories
   alias LoopctlWeb.RunnerSocket
@@ -45,6 +46,7 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
   end
 
   @reply_timeout 2_000
+  @repo "mkreyman/home_care_billing"
   @budgets %{wall_clock_seconds: 3_600, max_turns: 50}
 
   setup do
@@ -57,7 +59,10 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
     # HUMAN-ANCHORED explicitly, like `PlacementTest`: `place/4` applies the L0 tier gate
     # itself and the committed tenant's column default is `:agent_rooted`.
     tenant = fixture(:committed_tenant, %{trust_tier: :human_anchored})
-    {raw, runner} = fixture(:committed_runner, %{tenant_id: tenant.id, name: "minis"})
+
+    {raw, runner} =
+      fixture(:committed_runner, %{tenant_id: tenant.id, name: "minis", max_sessions: 9})
+
     {_raw, _operator} = fixture(:committed_operator_key, %{tenant_id: tenant.id})
 
     %{tenant: tenant, runner: runner, runner_key: raw}
@@ -89,17 +94,66 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
     end
   end
 
-  describe "available_runner/1" do
+  describe "candidates/1 — the states a stage row alone cannot tell apart" do
+    test "a RELEASED story is not a candidate, however long it sits at queued", ctx do
+      story = queued_story(ctx)
+      assert story.id in candidate_ids(50)
+
+      # What every release does — the lease's `:runner_lost`, and `place/4`'s own undo on a
+      # push refusal: the stage row goes back to `queued` and `agent_status` becomes
+      # `:pending`. `Placement.place/4` refuses anything that is not `contracted`, and nothing
+      # in lib/ re-contracts a story, so on the stage row alone this story was selected for
+      # ever — with its `updated_at` frozen at the release, i.e. permanently at the head of an
+      # oldest-first queue. Twenty of them and the driver never reached a placeable story
+      # again, while every pass still reported a clean run.
+      unboxed(fn ->
+        {:ok, _} = Progress.force_unclaim_story(ctx.tenant.id, story.id, actor_label: "test")
+      end)
+
+      assert unboxed(fn -> Stages.get(ctx.tenant.id, story.id) end).stage == :queued
+      assert unboxed(fn -> reload(ctx.tenant.id, story.id) end).agent_status == :pending
+      refute story.id in candidate_ids(50)
+    end
+
+    test "the bound is shared FAIRLY: every tenant's oldest before any tenant's second", ctx do
+      first = queued_story(ctx)
+      second = queued_story(ctx)
+      unboxed(fn -> backdate(first.id, -600) end)
+      unboxed(fn -> backdate(second.id, -590) end)
+
+      other = fixture(:committed_tenant, %{trust_tier: :human_anchored})
+      other_story = queued_story(%{ctx | tenant: other})
+      unboxed(fn -> backdate(other_story.id, -60) end)
+
+      # On a plain global ordering the two oldest rows are BOTH the first tenant's, so a
+      # tenant with a full queue consumed every slot of every pass and no other tenant's work
+      # was ever looked at — the read is fleet-wide and the bound is one number for everybody.
+      # Ranked per tenant, the newer tenant's only story is reached in the same pass.
+      ids = candidate_ids(2)
+
+      assert first.id in ids
+      assert other_story.id in ids
+      refute second.id in ids
+
+      # And WITHIN a tenant it is still oldest-first, which is the half that cannot starve a
+      # story: the second story arrives once every tenant's first has been taken.
+      assert candidate_ids(3) == [first.id, other_story.id, second.id]
+    end
+  end
+
+  describe "available_runner/2" do
     test "nil when the tenant has no connected runner", ctx do
       # The runner ROW exists — the fixture enrolled it — and nothing is joined. A selection
       # on the row alone would return it here and place work on a machine that is not there.
-      assert unboxed(fn -> DispatchDriver.available_runner(ctx.tenant.id) end) == nil
+      assert unboxed(fn -> DispatchDriver.available_runner(ctx.tenant.id, @repo) end) == nil
     end
 
     test "the connected runner with a free slot", ctx do
       join_runner(ctx)
 
-      assert %Runner{} = found = unboxed(fn -> DispatchDriver.available_runner(ctx.tenant.id) end)
+      assert %Runner{} =
+               found = unboxed(fn -> DispatchDriver.available_runner(ctx.tenant.id, @repo) end)
+
       assert found.id == ctx.runner.id
     end
 
@@ -110,7 +164,7 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
       # CONNECTED and useless. `place/4` would take the claim, mint a dispatch and be refused
       # `:runner_at_capacity` on the push, then undo all of it — an undo per attempt is not a
       # selection strategy, which is why capacity is read here and not discovered there.
-      assert unboxed(fn -> DispatchDriver.available_runner(ctx.tenant.id) end) == nil
+      assert unboxed(fn -> DispatchDriver.available_runner(ctx.tenant.id, @repo) end) == nil
     end
 
     test "nil when the connected runner has been revoked", ctx do
@@ -119,7 +173,59 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
 
       # Revocation is what an operator does to stop a machine being used. A live socket does
       # not survive it as far as selection is concerned.
-      assert unboxed(fn -> DispatchDriver.available_runner(ctx.tenant.id) end) == nil
+      assert unboxed(fn -> DispatchDriver.available_runner(ctx.tenant.id, @repo) end) == nil
+    end
+
+    test "nil when the connected runner is DRAINING", ctx do
+      join_runner(ctx, %{"draining" => true})
+
+      # `draining` means the runner accepts no new work, and nothing server-side read it
+      # before this: `Runners.dispatch/3` leaves it to the runner, which refuses the push —
+      # AFTER the claim has committed and after `dispatch/3` has already answered `:ok`. So an
+      # operator draining a machine to stop new work got the work placed on it anyway, and the
+      # story sat at `claimed` with no session until its lease expired.
+      assert unboxed(fn -> DispatchDriver.available_runner(ctx.tenant.id, @repo) end) == nil
+    end
+
+    test "nil when the runner does not do this KIND", ctx do
+      join_runner(ctx, %{"kinds" => ["triage"]})
+
+      # Since 1.6.0 the runner's own declaration decides what it is sent, and `dispatch/3`
+      # checks it — after the claim and after the session dispatch has been minted. A
+      # triage-only runner therefore cost a `dispatches` row, an `api_keys` row and an
+      # IMMUTABLE chain entry per candidate per minute, for a refusal that was knowable from
+      # the join meta before anything was written.
+      assert unboxed(fn -> DispatchDriver.available_runner(ctx.tenant.id, @repo) end) == nil
+    end
+
+    test "nil when the runner does not have this REPO checked out", ctx do
+      join_runner(ctx, %{"repos" => ["mkreyman/cron_books"]})
+
+      # Same shape as draining: the runner refuses `repo_not_allowed`, and the refusal arrives
+      # too late to undo. Its declaration is on the join meta and says so beforehand.
+      assert unboxed(fn -> DispatchDriver.available_runner(ctx.tenant.id, @repo) end) == nil
+
+      # And the repo it DOES declare is placeable on the same connection, so this is the
+      # declaration binding rather than the runner being excluded for some other reason.
+      assert %Runner{} =
+               unboxed(fn ->
+                 DispatchDriver.available_runner(ctx.tenant.id, "mkreyman/cron_books")
+               end)
+    end
+
+    test "nil when the TENANT is at its admission limit, even with a free slot on the row",
+         ctx do
+      join_runner(ctx)
+
+      # The two limits are independent, and this is the state `RUNNER_MAX_IN_FLIGHT_SESSIONS`
+      # exists to produce: the fixture runner has `max_sessions: 9`, so the row has free slots
+      # while the tenant is at its fleet-wide cap. Checked only inside `Runners.dispatch/3`
+      # before this, which is after the claim — so every pass took up to twenty
+      # mint-claim-refuse-release cycles, each one a permanent chain entry.
+      unboxed(fn -> set_in_flight(ctx.runner.id, Capacity.limit()) end)
+
+      assert Capacity.limit() < ctx.runner.max_sessions
+      assert unboxed(fn -> DispatchDriver.available_runner(ctx.tenant.id, @repo) end) == nil
     end
 
     test "nil for a tenant whose runner belongs to somebody else", ctx do
@@ -129,7 +235,7 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
       # The presence pool is per tenant and so is the row read; this asserts they agree. A
       # name-keyed pool with a fleet-wide row read would place another tenant's work on this
       # machine the moment two tenants enrolled a runner called "minis".
-      assert unboxed(fn -> DispatchDriver.available_runner(other.id) end) == nil
+      assert unboxed(fn -> DispatchDriver.available_runner(other.id, @repo) end) == nil
     end
   end
 
@@ -196,7 +302,7 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
       assert pushed.wall_clock_seconds == @budgets.wall_clock_seconds
       assert pushed.max_turns == @budgets.max_turns
       assert pushed.base_branch == "master"
-      assert pushed.branch == "feature/story-#{story.number}"
+      assert pushed.branch == "feature/story-#{story.number}-#{String.slice(story.id, 0, 8)}"
 
       row = unboxed(fn -> Stages.get(ctx.tenant.id, story.id) end)
       assert row.stage == :claimed
@@ -226,16 +332,46 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
       assert unboxed(fn -> reload(ctx.tenant.id, story.id) end).agent_status == :contracted
     end
 
-    test "a story whose project has no intake source is unplaceable, and the pass goes on",
-         ctx do
-      # `MergePrecondition.repo_for_story/1` resolves the repository from the project's intake
-      # source, and `fixture(:committed_story)` creates a project with none — so this is the
-      # ordinary shape of a story the driver cannot address, not a contrived one. It must not
-      # take the pass down with it.
-      _unplaceable = queued_story(ctx)
+    test "the base branch comes from the SOURCE, not from a hardcoded master", ctx do
+      bind_repo(ctx, queued_story(ctx), @repo, "main")
+      channel = join_runner(ctx)
+
+      assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) == [:placed]
+      assert_push "dispatch", pushed, @reply_timeout
+
+      # GitHub has defaulted new repositories to `main` since 2020. Hardcoded, the dispatch
+      # named a base branch that does not exist, and the failure arrives after the claim: the
+      # runner refuses or cuts the worktree from the wrong ref, and the story comes back
+      # `queued` + `:pending`, which nothing re-contracts.
+      assert pushed.base_branch == "main"
+      leave_channel(channel)
+    end
+
+    test "a tenant whose only operator key has EXPIRED is blocked, not placed", ctx do
+      bind_repo(ctx, queued_story(ctx))
       join_runner(ctx)
 
-      assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) == [:unplaceable]
+      # Expiry is what key ROTATION uses (`Auth.expire_api_key/2`), so a rotated-out key is
+      # expired and NOT revoked — and `Placement.resolve_caller/2` validates neither, so an
+      # expired key here mints dispatches and drives custody transitions that the HTTP
+      # pipeline would have 401'd. Made worse by the oldest-first ordering, which deliberately
+      # picks the key most likely to have been rotated out.
+      unboxed(fn -> expire_operator_keys(ctx.tenant.id) end)
+
+      assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) == [:blocked]
+      refute_push "dispatch", _pushed
+    end
+
+    test "a story whose project has no intake source is BLOCKED, and the pass goes on", ctx do
+      # A project with no intake source has no repository, and `fixture(:committed_story)`
+      # creates exactly that — the ordinary shape of a story the driver cannot address. It is
+      # `:blocked` and not `:unplaceable` because nothing clears it on its own: somebody has
+      # to enrol a source. The distinction is the whole of what an operator reads when a queue
+      # stops draining, and it must not take the pass down with it either.
+      _blocked = queued_story(ctx)
+      join_runner(ctx)
+
+      assert unboxed(fn -> DispatchDriver.run_with(20, @budgets) end) == [:blocked]
     end
   end
 
@@ -290,7 +426,7 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
   # intake source, so a driver-placed story is unaddressable until this exists. Inserted rather
   # than taken from `fixture(:committed_intake, ...)`: that fixture makes its OWN project, and
   # the binding under test is the one between the story's project and a repository.
-  defp bind_repo(ctx, story, repo \\ "mkreyman/home_care_billing") do
+  defp bind_repo(ctx, story, repo \\ @repo, base_branch \\ "master") do
     now = DateTime.utc_now()
 
     unboxed(fn ->
@@ -298,6 +434,7 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
         tenant_id: ctx.tenant.id,
         project_id: story.project_id,
         repo_full_name: repo,
+        base_branch: base_branch,
         webhook_secret: :crypto.strong_rand_bytes(32) |> Base.encode16(case: :lower),
         inserted_at: now,
         updated_at: now
@@ -307,11 +444,15 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
     story
   end
 
-  defp join_runner(ctx) do
+  defp join_runner(ctx, overrides \\ %{}) do
     {:ok, socket} = connect(RunnerSocket, %{}, connect_info: connect_info(ctx.runner_key))
 
     {:ok, _reply, channel} =
-      subscribe_and_join(socket, "runner:" <> ctx.runner.id, join_payload("minis"))
+      subscribe_and_join(
+        socket,
+        "runner:" <> ctx.runner.id,
+        Map.merge(join_payload("minis"), overrides)
+      )
 
     # The join's own writes must be committed before the selection reads them.
     _ = :sys.get_state(channel.channel_pid)
@@ -350,6 +491,21 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
       AdminRepo.update_all(from(r in Runner, where: r.id == ^runner_id), set: [revoked_at: at])
   end
 
+  defp expire_operator_keys(tenant_id) do
+    past = DateTime.utc_now() |> DateTime.add(-60, :second)
+
+    {count, _} =
+      AdminRepo.update_all(
+        from(k in Loopctl.Auth.ApiKey, where: k.tenant_id == ^tenant_id and k.role == :user),
+        set: [expires_at: past]
+      )
+
+    # Non-vacuous: a tenant with no operator key at all would be blocked for a different
+    # reason and this test would pass without expiry having anything to do with it.
+    assert count > 0
+    count
+  end
+
   defp reload(tenant_id, story_id) do
     {:ok, story} = Stories.get_story(tenant_id, story_id)
     story
@@ -368,8 +524,8 @@ defmodule Loopctl.Delivery.DispatchDriverTest do
       "machine" => machine,
       "cores" => 16,
       "memory_mb" => 28_000,
-      "repos" => ["mkreyman/home_care_billing"],
-      "max_sessions" => 2,
+      "repos" => [@repo],
+      "max_sessions" => 9,
       "in_flight" => 0,
       "draining" => false
     }

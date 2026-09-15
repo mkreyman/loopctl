@@ -288,6 +288,79 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
                )
     end
 
+    test "sets the base branch, records it, and leaves the epic alone", %{conn: conn} do
+      ctx = operator_ctx()
+      epic = fixture(:epic, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      {_s, source} =
+        fixture(:intake_source, %{
+          tenant_id: ctx.tenant.id,
+          project_id: ctx.project.id,
+          target_epic_id: epic.id
+        })
+
+      # The column exists so a repository whose default branch is `main` can be dispatched
+      # into at all (#803 round 1, finding 7) — hardcoded `master`, the loop placed work
+      # against a branch that does not exist, and the failure arrives after the claim.
+      body =
+        conn
+        |> auth(ctx.operator_key)
+        |> patch(~p"/api/v1/intake/sources/#{source.id}", %{
+          "base_branch" => "main",
+          "target_epic_id" => epic.id
+        })
+        |> json_response(200)
+
+      assert body["source"]["base_branch"] == "main"
+      assert AdminRepo.get!(Source, source.id).base_branch == "main"
+
+      assert [_one] =
+               AdminRepo.all(
+                 from e in Entry,
+                   where:
+                     e.tenant_id == ^ctx.tenant.id and
+                       e.action == "intake_source_base_branch_set"
+               )
+    end
+
+    test "a PATCH that does not name the base branch leaves it where it was", %{conn: conn} do
+      ctx = operator_ctx()
+      epic = fixture(:epic, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      {_s, source} =
+        fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      {:ok, _} = Intake.set_base_branch(ctx.tenant.id, source.id, "main")
+
+      # THE OPPOSITE RULE TO `target_epic_id`, and it must be: the epic is nullable and unset
+      # means "not answered", so omitting it clears it — while the base branch is NOT NULL,
+      # every dispatch has to name one, and there is no unanswered state. Omitting it here
+      # must therefore leave an operator's override alone rather than reset it to the default
+      # they had already overridden.
+      body =
+        conn
+        |> auth(ctx.operator_key)
+        |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"target_epic_id" => epic.id})
+        |> json_response(200)
+
+      assert body["source"]["base_branch"] == "main"
+      assert body["source"]["target_epic_id"] == epic.id
+    end
+
+    test "an explicit null base branch is refused rather than stored", %{conn: conn} do
+      ctx = operator_ctx()
+
+      {_s, source} =
+        fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      conn
+      |> auth(ctx.operator_key)
+      |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"base_branch" => nil})
+      |> json_response(422)
+
+      assert AdminRepo.get!(Source, source.id).base_branch == "master"
+    end
+
     test "an explicit null clears the target", %{conn: conn} do
       ctx = operator_ctx()
       epic = fixture(:epic, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})

@@ -34,6 +34,8 @@ defmodule Loopctl.Workers.DispatchDriverWorker do
   @batch 20
 
   @impl Oban.Worker
+  @spec perform(Oban.Job.t()) ::
+          :ok | {:error, {:all_candidates_errored, pos_integer()}} | {:cancel, {:unset, atom()}}
   def perform(%Oban.Job{}) do
     case DispatchDriver.run(@batch) do
       {:ok, results} -> report(results)
@@ -57,6 +59,12 @@ defmodule Loopctl.Workers.DispatchDriverWorker do
   and a job that failed on it would retry, alert and eventually discard for a condition that
   is simply "nobody is working right now".
 
+  Neither is `:blocked`, and that one is the closer call. It means a state only a person can
+  clear — no operator key, no intake source, a halted or agent-rooted tenant — so retrying it
+  three times a minute would alert continuously about something no retry can fix. It is
+  surfaced at ERROR by the driver itself, naming the tenant and the reason, which is what an
+  operator needs and what an `:ok` at `info` was hiding.
+
   Public because a whole-pass failure is the one outcome a fixture cannot produce.
   """
   @spec run_result([DispatchDriver.outcome()]) ::
@@ -79,14 +87,20 @@ defmodule Loopctl.Workers.DispatchDriverWorker do
 
   # ENABLED AND HALF-CONFIGURED IS A FAILURE, not a quiet no-op. An operator who turned the
   # driver on and left a budget unset has said they want stories placed; answering `:ok` would
-  # leave them watching a queue that never drains with nothing to read. The job fails, Oban
-  # retries and then surfaces it, and the reason names the key.
+  # leave them watching a queue that never drains with nothing to read.
+  #
+  # CANCELLED RATHER THAN FAILED, and the difference is the cadence. `{:error, _}` from a
+  # `max_attempts: 3` worker scheduled every minute produces three failures and a discard per
+  # minute, for as long as the variable is unset — thousands of rows a day, an alert channel
+  # nobody can read, and a signal indistinguishable from noise. A cancellation is recorded
+  # once per pass, carries the reason, and is not retried, because a retry cannot change an
+  # environment variable. The log line is the operator's remedy and it names the key.
   defp misconfigured({:unset, key}) do
     Logger.error(
       "DispatchDriverWorker: enabled but #{key} is unset — placing nothing. " <>
         "Set it in config; there is deliberately no default."
     )
 
-    {:error, {:unset, key}}
+    {:cancel, {:unset, key}}
   end
 end

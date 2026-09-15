@@ -57,6 +57,18 @@ All notable changes to loopctl are documented here.
   implementation, a clean immediate refusal that leaves no state — so the driver must not be
   enabled until the object is built server-side.
 
+  **Review round 1 changed the selection and the eligibility rule substantially**, and two of
+  those are operator-visible. `intake_sources` gains a **`base_branch`** column (migration
+  `20260921140000`, NOT NULL, default `master`, no backfill and no manual step), settable on
+  `PATCH /api/v1/intake/sources/:id`: the driver hardcoded `master`, and a repository whose
+  default branch is `main` — GitHub's default since 2020 — was dispatched against a branch
+  that does not exist. Set it per repository BEFORE enabling the driver. And a candidate must
+  now be `contracted` as well as `queued`: every release path puts the stage row back to
+  `queued` while setting `agent_status: :pending`, which `place/4` refuses, so on the stage
+  row alone a released story was selected for ever with its `updated_at` frozen at the head of
+  the queue — twenty of those and the driver never reached a placeable story again while every
+  pass still reported success.
+
   Migration `20260921130000` adds the partial index the candidate read needs
   (`story_stages (updated_at, story_id) WHERE stage = 'queued'`, built `CONCURRENTLY`, no
   manual step): the only other index on the table is tenant-leading, and this read has no

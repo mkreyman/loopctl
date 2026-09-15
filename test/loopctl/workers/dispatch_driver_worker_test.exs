@@ -55,6 +55,17 @@ defmodule Loopctl.Workers.DispatchDriverWorkerTest do
     end
   end
 
+  describe "a pass that cannot run at all" do
+    test "a blocked pass is a successful job, because no retry can clear it" do
+      # `:blocked` is a state only a person can change — no operator key, no intake source, a
+      # halted or agent-rooted tenant. The driver logs each one at ERROR naming the tenant and
+      # the reason; failing the job as well would retry and alert three times a minute about
+      # something a retry cannot fix.
+      assert DispatchDriverWorker.run_result([:blocked, :blocked]) == :ok
+      assert DispatchDriverWorker.run_result([:blocked, :placed]) == :ok
+    end
+  end
+
   describe "batch_size/0" do
     test "the pass is bounded" do
       # Bounded per run, like every other drainer in this loop: the read is oldest-first, so

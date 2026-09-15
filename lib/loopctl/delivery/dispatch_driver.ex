@@ -21,42 +21,85 @@ defmodule Loopctl.Delivery.DispatchDriver do
 
   ## Selection
 
-  Oldest first, fleet-wide, bounded per pass. Oldest-first is the only order that cannot
-  starve a story, and it is what `Loopctl.Workers.TriageTriggerWorker.candidates/0` already
-  uses — one selection convention in this loop rather than two.
+  Oldest first, and FAIR ACROSS TENANTS: the read ranks each tenant's queue separately and
+  takes every tenant's oldest story before any tenant's second. One bound is shared by the
+  whole fleet, so a plain global ordering let one tenant with a full queue consume every slot
+  of every pass, and no other tenant's work was ever looked at. Oldest-first WITHIN a tenant
+  is the part that cannot starve a story, and it is what
+  `Loopctl.Workers.TriageTriggerWorker.candidates/0` already uses.
 
-  A runner is eligible when it is CONNECTED (Phoenix Presence, keyed by machine name) and has
-  a free slot (`in_flight < max_sessions` on its row). Both halves are required and neither
-  implies the other: a runner can hold slots while disconnected, and a connected one can be
-  full. Checked BEFORE placing rather than after, because `place/4` refuses
-  `:runner_at_capacity` only once the claim is taken, and an undo per attempt is not a
-  selection strategy.
+  A candidate must also be `contracted`. The stage row alone is not enough: every release
+  path — the lease's `:runner_lost`, `place/4`'s own undo — puts the row back to `queued`
+  while setting `agent_status: :pending`, and `Placement.place/4` refuses anything that is not
+  `contracted`. Selecting on the stage alone meant a released story was selected for ever,
+  with its `updated_at` frozen at the moment of release and therefore permanently near the
+  head of an oldest-first queue: twenty of them and the driver never reached a placeable story
+  again, while every pass still reported a clean run.
+
+  ## Eligibility is decided BEFORE the claim, on all four facts
+
+  A placement CLAIMS the story first and `Runners.dispatch/3` answers `:ok` the moment it
+  broadcasts, so anything discovered after that point is not a refusal the driver can undo —
+  it is a story stranded at `claimed` until its lease expires, and then `queued` +
+  `:pending`, which nothing re-contracts. So a runner is eligible only when it is
+
+    * CONNECTED (Phoenix Presence, keyed by machine name),
+    * not DRAINING, accepts the story's REPO, and does the dispatch KIND — the three facts on
+      its join meta, read through `Runners.accepts?/5`, which is the same rule `dispatch/3`
+      applies rather than a second copy of it,
+    * has a free slot on its row (`in_flight < max_sessions`), and
+    * its TENANT has admission headroom (`Loopctl.Runners.Capacity.admit/2`) — an independent
+      limit, and the state `RUNNER_MAX_IN_FLIGHT_SESSIONS` exists to produce is precisely one
+      where runners sit idle with free slots.
+
+  Each of those refusals, discovered after the claim instead, costs a `dispatches` row, an
+  `api_keys` row and an IMMUTABLE chain entry under the tenant's chain advisory lock, once per
+  candidate per minute, for ever.
 
   ## What it does NOT do
 
   Retry, back off, or remember. A story it could not place stays at `queued` and is a
   candidate again next pass, which is the same shape the triage trigger uses for the same
-  reason: the condition that blocked it (no free runner, a repo it cannot resolve) is one
-  that clears on its own or needs a human, and a driver that tracked attempts would be
-  inventing a policy nobody asked for.
+  reason: the condition that blocked it (no free runner, nothing connected) is one that clears
+  on its own, and a driver that tracked attempts would be inventing a policy nobody asked for.
+
+  What is NOT in that class is reported apart from it. A tenant with no operator key, a
+  halted tenant, an agent-rooted tenant and a project with no intake source are all states
+  that clear only when a person does something, so they are `:blocked` rather than
+  `:unplaceable` and they log at ERROR — a queue that never drains while every pass reports
+  `:ok` at `info` is indistinguishable from an empty one.
   """
 
   import Ecto.Query
 
-  alias Loopctl.Delivery.MergePrecondition
   alias Loopctl.Delivery.Placement
   alias Loopctl.Delivery.StoryStage
+  alias Loopctl.Intake
   alias Loopctl.Repo
   alias Loopctl.Runners
+  alias Loopctl.Runners.Capacity
   alias Loopctl.Runners.Runner
   alias Loopctl.WorkBreakdown.Story
 
   require Logger
 
-  @type outcome :: :placed | :no_runner | :unplaceable | :errored
+  @type outcome :: :placed | :no_runner | :unplaceable | :blocked | :errored
+
+  @typedoc "A selected stage row: the three fields a pass reads, not the whole struct."
+  @type candidate :: %{
+          tenant_id: Ecto.UUID.t(),
+          story_id: Ecto.UUID.t(),
+          updated_at: NaiveDateTime.t()
+        }
+
+  @kind "implement"
 
   @doc """
-  The stage rows this pass will attempt, oldest first, at most `limit`.
+  The stories this pass will attempt, at most `limit`, fairly across tenants.
+
+  `queued` AND `contracted` — see the moduledoc on why the stage row alone selected released
+  stories for ever. Ranked per tenant and ordered by that rank first, so a tenant with one
+  queued story is reached in the same pass as a tenant with two hundred.
 
   Fleet-wide and with no tenant in the predicate, exactly like the triage trigger's own
   candidate read — and carrying the same cost, which migration `20260921110000` documents for
@@ -65,43 +108,70 @@ defmodule Loopctl.Delivery.DispatchDriver do
 
   Public so the selection is falsifiable rather than buried in the pass.
   """
-  @spec candidates(pos_integer()) :: [StoryStage.t()]
+  @spec candidates(pos_integer()) :: [candidate()]
   def candidates(limit) when is_integer(limit) and limit > 0 do
-    Loopctl.AdminRepo.all(
+    ranked =
       from s in StoryStage,
+        join: st in Story,
+        on: st.id == s.story_id and st.tenant_id == s.tenant_id,
         where: s.stage == :queued,
-        order_by: [asc: s.updated_at, asc: s.story_id],
-        limit: ^limit
+        where: st.agent_status == :contracted,
+        select: %{
+          tenant_id: s.tenant_id,
+          story_id: s.story_id,
+          updated_at: s.updated_at,
+          rank:
+            over(row_number(),
+              partition_by: s.tenant_id,
+              order_by: [asc: s.updated_at, asc: s.story_id]
+            )
+        }
+
+    Loopctl.AdminRepo.all(
+      from r in subquery(ranked),
+        order_by: [asc: r.rank, asc: r.updated_at, asc: r.story_id],
+        limit: ^limit,
+        select: %{tenant_id: r.tenant_id, story_id: r.story_id, updated_at: r.updated_at}
     )
   end
 
   @doc """
-  A runner of `tenant_id` that is connected AND has a free slot, or `nil`.
+  A runner of `tenant_id` that would accept an `implement` dispatch for `repo` right now, or
+  `nil`.
 
-  Both halves, and neither implies the other. `Runners.pool/1` answers who is CONNECTED,
-  keyed by machine name; the `runners` row answers who has CAPACITY. A runner that crashed
-  holding slots is in the second set and not the first; a busy runner is in the first and not
-  the second. Placing on either is a claim taken and then undone.
+  Every half of the moduledoc's eligibility rule, in the order that costs least: the tenant's
+  admission headroom is one aggregate read and gates the whole pass for that tenant; the
+  presence metas answer draining, repos and kind with no database at all; the row read is what
+  answers capacity. Fewest slots first, so a fleet spreads rather than filling one machine.
   """
-  @spec available_runner(Ecto.UUID.t()) :: Runner.t() | nil
-  def available_runner(tenant_id) when is_binary(tenant_id) do
-    connected = tenant_id |> Runners.pool() |> Map.keys() |> MapSet.new()
-
-    if MapSet.size(connected) == 0 do
-      nil
-    else
-      names = MapSet.to_list(connected)
-
+  @spec available_runner(Ecto.UUID.t(), String.t()) :: Runner.t() | nil
+  def available_runner(tenant_id, repo) when is_binary(tenant_id) and is_binary(repo) do
+    with :ok <- Capacity.admit(Loopctl.AdminRepo, tenant_id),
+         [_ | _] = ids <- accepting_runner_ids(tenant_id, repo) do
       Loopctl.AdminRepo.one(
         from r in Runner,
           where: r.tenant_id == ^tenant_id,
           where: is_nil(r.revoked_at),
-          where: r.name in ^names,
+          where: r.id in ^ids,
           where: r.in_flight < r.max_sessions,
           order_by: [asc: r.in_flight],
           limit: 1
       )
+    else
+      _admission_reached_or_nobody_accepting -> nil
     end
+  end
+
+  # The runners whose OWN declaration admits this dispatch, read from the meta of the socket a
+  # push would reach. A machine with two live sockets on one credential is skipped rather than
+  # guessed at: `Runners.dispatch/3` refuses that as `:runner_ambiguous`, so placing on it
+  # would take a claim for a dispatch that cannot be delivered.
+  defp accepting_runner_ids(tenant_id, repo) do
+    for {_name, %{metas: [meta]}} <- Runners.pool(tenant_id),
+        runner_id = Map.get(meta, :runner_id),
+        is_binary(runner_id),
+        Runners.accepts?(tenant_id, runner_id, meta, @kind, repo) == :ok,
+        do: runner_id
   end
 
   @doc """
@@ -164,63 +234,101 @@ defmodule Loopctl.Delivery.DispatchDriver do
   Separate from `run/1` for the same reason `normalise_budget/2` is — the gates read
   application config, which a test may not set, so this is the only way the placing path is
   reachable from a test at all. `run/1` is the config decision; this is the work.
+
+  The tenant-level facts a pass resolves are cached ACROSS candidates and the runner facts
+  are not, and the split is deliberate: a tenant's operator key does not change while a pass
+  runs, while its runners' free slots change with every story this very pass places.
   """
   @spec run_with(pos_integer(), %{wall_clock_seconds: pos_integer(), max_turns: pos_integer()}) ::
           [outcome()]
   def run_with(limit, budgets) when is_integer(limit) and limit > 0 do
-    Enum.map(candidates(limit), &attempt(&1, budgets))
+    {outcomes, _cache} =
+      limit
+      |> candidates()
+      |> Enum.map_reduce(%{}, fn candidate, cache -> attempt(candidate, budgets, cache) end)
+
+    outcomes
   end
 
   # ONE STORY MAY NOT KILL THE PASS, the lesson `TriageTriggerWorker` records: the read is
   # oldest-first, so a story that raises sits at the head of every later batch too, and one
   # row would stall the fleet. EXITS as well as raises — a pool checkout timeout exits.
-  defp attempt(%StoryStage{} = stage, budgets) do
-    case place(stage, budgets) do
-      {:ok, _placed} -> :placed
-      {:error, :no_runner} -> :no_runner
-      {:error, reason} -> unplaceable(stage, reason)
-    end
+  defp attempt(candidate, budgets, cache) do
+    {result, cache} = place(candidate, budgets, cache)
+
+    outcome =
+      case result do
+        {:ok, _placed} ->
+          :placed
+
+        {:error, :no_runner} ->
+          :no_runner
+
+        {:error, reason} when reason in [:no_operator_key, :tenant_halted] ->
+          blocked(candidate, reason)
+
+        {:error, {:no_intake_source, _} = reason} ->
+          blocked(candidate, reason)
+
+        {:error, {:ambiguous_intake_source, _, _} = reason} ->
+          blocked(candidate, reason)
+
+        {:error, :custody_tier_required} ->
+          blocked(candidate, :custody_tier_required)
+
+        {:error, reason} ->
+          unplaceable(candidate, reason)
+      end
+
+    {outcome, cache}
   rescue
-    error -> errored(stage, Exception.format(:error, error, __STACKTRACE__))
+    error -> {errored(candidate, Exception.format(:error, error, __STACKTRACE__)), cache}
   catch
-    kind, value -> errored(stage, Exception.format(kind, value, __STACKTRACE__))
+    kind, value -> {errored(candidate, Exception.format(kind, value, __STACKTRACE__)), cache}
   end
 
-  defp place(%StoryStage{} = stage, budgets) do
-    # THE RUNNER FIRST, and the order is a decision rather than a habit: with nothing
-    # connected — the ordinary state of an idle fleet — every candidate answers `:no_runner`
-    # after one presence read, instead of resolving a repository and an operator key for work
-    # nobody is going to take. It also makes the pass's report say the true thing: a queue
-    # standing still because no machine is joined reads as `:no_runner` rather than as a
-    # property of the first story in it.
-    with %Runner{} = runner <- available_runner(stage.tenant_id) || {:error, :no_runner},
-         {:ok, story} <- fetch_story(stage),
-         {:ok, repo} <- MergePrecondition.repo_for_story(story),
-         {:ok, key} <- operator_key(stage.tenant_id) do
-      Placement.place(stage.tenant_id, runner.id, dispatch(stage, story, repo, budgets),
-        api_key: key,
-        actor_label: "worker:dispatch_driver"
-      )
+  defp place(candidate, budgets, cache) do
+    %{tenant_id: tenant_id, story_id: story_id} = candidate
+
+    with {:ok, story} <- fetch_story(tenant_id, story_id),
+         {:ok, source} <- Intake.source_for_project(tenant_id, story.project_id),
+         %Runner{} = runner <-
+           available_runner(tenant_id, source.repo_full_name) || {:error, :no_runner},
+         {{:ok, key}, cache} <- operator_key(tenant_id, cache) do
+      {Placement.place(tenant_id, runner.id, dispatch(story, source, budgets),
+         api_key: key,
+         actor_label: "worker:dispatch_driver"
+       ), cache}
     else
-      {:error, reason} -> {:error, reason}
-      nil -> {:error, :no_runner}
+      {{:error, _reason} = error, %{} = cache} -> {error, cache}
+      {:error, reason} -> {{:error, reason}, cache}
+      nil -> {{:error, :no_runner}, cache}
     end
   end
 
-  defp dispatch(%StoryStage{} = stage, story, repo, budgets) do
+  defp dispatch(story, source, budgets) do
     %{
       "dispatch_id" => Ecto.UUID.generate(),
-      "story_id" => stage.story_id,
-      "kind" => "implement",
-      "repo" => repo,
-      "branch" => "feature/story-#{story.number}",
-      "base_branch" => "master",
+      "story_id" => story.id,
+      "kind" => @kind,
+      "repo" => source.repo_full_name,
+      "branch" => branch_for(story),
+      "base_branch" => source.base_branch,
       "wall_clock_seconds" => budgets.wall_clock_seconds,
       "max_turns" => budgets.max_turns
     }
   end
 
-  defp fetch_story(%StoryStage{tenant_id: tenant_id, story_id: story_id}) do
+  # THE STORY ID IS IN THE BRANCH NAME because a story NUMBER is unique only within its
+  # project, and two projects may hold intake sources naming the SAME repository — nothing
+  # forbids it. Without the suffix, two different stories dispatched to one repository could
+  # be given one branch, and the second session would find the first's work already on it.
+  # Eight characters of the uuid, which is enough that a collision is not a thing that
+  # happens, and short enough to leave a branch name a person can read.
+  defp branch_for(%Story{} = story),
+    do: "feature/story-#{story.number}-#{String.slice(story.id, 0, 8)}"
+
+  defp fetch_story(tenant_id, story_id) do
     {:ok, story} =
       Repo.with_tenant(tenant_id, fn ->
         Repo.one(from s in Story, where: s.id == ^story_id and s.tenant_id == ^tenant_id)
@@ -235,34 +343,67 @@ defmodule Loopctl.Delivery.DispatchDriver do
   # would mean minting a credential for a worker, which is a root the custody chain does not
   # have. A tenant with no such key cannot be driven, and that is reported rather than
   # worked around.
-  defp operator_key(tenant_id) do
-    key =
-      Loopctl.AdminRepo.one(
-        from k in Loopctl.Auth.ApiKey,
-          where: k.tenant_id == ^tenant_id and k.role == :user,
-          where: is_nil(k.revoked_at),
-          order_by: [asc: k.inserted_at],
-          limit: 1
-      )
+  #
+  # NEITHER REVOKED NOR EXPIRED. `Loopctl.Auth` refuses an expired key on every request, and
+  # expiry is what key ROTATION uses — `expire_api_key/2` — so a rotated-out key is expired
+  # and not revoked. `Placement.resolve_caller/2` validates neither, so an expired key here
+  # would mint dispatches and drive custody transitions that the HTTP pipeline would have
+  # 401'd. Oldest first among what is left, which is the tenant's original operator key.
+  #
+  # CACHED PER PASS, keyed by tenant: it cannot change while a pass runs, and the read is on
+  # the three-connection AdminRepo pool that every authenticated request in the fleet shares.
+  defp operator_key(tenant_id, cache) do
+    case Map.fetch(cache, {:operator_key, tenant_id}) do
+      {:ok, cached} ->
+        {cached, cache}
 
-    if key, do: {:ok, key}, else: {:error, :no_operator_key}
+      :error ->
+        now = DateTime.utc_now()
+
+        key =
+          Loopctl.AdminRepo.one(
+            from k in Loopctl.Auth.ApiKey,
+              where: k.tenant_id == ^tenant_id and k.role == :user,
+              where: is_nil(k.revoked_at),
+              where: is_nil(k.expires_at) or k.expires_at > ^now,
+              order_by: [asc: k.inserted_at],
+              limit: 1
+          )
+
+        result = if key, do: {:ok, key}, else: {:error, :no_operator_key}
+        {result, Map.put(cache, {:operator_key, tenant_id}, result)}
+    end
   end
 
-  defp unplaceable(%StoryStage{} = stage, reason) do
+  defp unplaceable(candidate, reason) do
     Logger.info(
-      "DispatchDriver: leaving for the next pass: story_id=#{stage.story_id} " <>
+      "DispatchDriver: leaving for the next pass: story_id=#{candidate.story_id} " <>
         "reason=#{inspect(reason)}",
-      tenant_id: stage.tenant_id
+      tenant_id: candidate.tenant_id
     )
 
     :unplaceable
   end
 
-  defp errored(%StoryStage{} = stage, detail) do
+  # A STATE THAT CLEARS ONLY WHEN A PERSON ACTS, which is why it is not `:unplaceable` and why
+  # it is ERROR. The job still succeeds — retrying a misconfiguration every minute is noise,
+  # not a signal — but an operator watching a queue that never drains has something to read,
+  # and it names the tenant and the reason rather than leaving them to infer both from silence.
+  defp blocked(candidate, reason) do
+    Logger.error(
+      "DispatchDriver: BLOCKED until somebody changes something — this will not clear by " <>
+        "itself: story_id=#{candidate.story_id} reason=#{inspect(reason)}",
+      tenant_id: candidate.tenant_id
+    )
+
+    :blocked
+  end
+
+  defp errored(candidate, detail) do
     Logger.error(
       "DispatchDriver: candidate failed, continuing with the rest of the pass: " <>
-        "story_id=#{stage.story_id} detail=#{detail}",
-      tenant_id: stage.tenant_id
+        "story_id=#{candidate.story_id} detail=#{detail}",
+      tenant_id: candidate.tenant_id
     )
 
     :errored
