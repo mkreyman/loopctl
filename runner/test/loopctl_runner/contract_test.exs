@@ -651,4 +651,30 @@ defmodule LoopctlRunner.ContractTest do
 
     assert Contract.validate("RunnerTraceBatch", batch) == :ok
   end
+
+  test "every message and reply x-connection names is a schema the contract also defines" do
+    # A dangling name is not a documentation slip: it is the envelope going unpublished. loopctl's
+    # 1.9.0 named RunnerTriageVerdictMessage and RunnerTriageVerdictAck in x-connection and defined
+    # neither, so the only way to build a triage_verdict from that file was to re-type its shape out
+    # of the commit message that announced it — which is what publishing the bounds exists to end,
+    # and how the two sides' enums drift apart with nothing able to notice. Vendoring is a copy, so
+    # this is the first moment on this side that can catch it.
+    connection = Contract.connection()
+
+    # Per map, and by fetch!. Both halves are about the guard being able to fail: taken on the
+    # concatenation, an exporter that emitted an empty `events` while `replies` kept its entries
+    # would leave every event name unchecked with the assertion still green — the same shape as
+    # the 1.6.0 exporter drop this validator already carries a comment about. And Access would
+    # hand a missing map back as nil, so the red would be a BadMapError naming neither the key
+    # nor the contract; every other reader of this document uses fetch! for that reason.
+    for map <- ~w(events replies) do
+      named = Map.fetch!(connection, map)
+      assert named != %{}, "x-connection.#{map} names nothing at all"
+
+      for {event, name} <- named do
+        assert name in Contract.definitions(),
+               "x-connection.#{map}.#{event} names #{name}, which $defs does not define"
+      end
+    end
+  end
 end

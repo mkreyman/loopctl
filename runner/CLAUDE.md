@@ -35,6 +35,11 @@ Dev-machine runner for the loopctl agent delivery loop. The design is
   (`priv/runner_contract/v1.json`, copied from mkreyman/loopctl, never re-typed). When loopctl
   bumps the contract, copy the file again from loopctl MASTER, once it is merged AND deployed;
   a branch or an unmerged master is the same trap in the other direction. Do not edit it here.
+  **A version that names a schema it does not define is not vendorable yet**, and the fix is
+  never to write the missing definition on this side: an envelope transcribed out of loopctl's
+  commit message is the re-typing this rule forbids, and the two enums then drift with nothing
+  able to see it. Ask loopctl for the definition and vendor the version that carries it.
+  `contract_test.exs` fails on any `x-connection` event or reply name `$defs` does not resolve.
 - **A schema keyword is implemented in `Contract` before loopctl publishes it, and deployed on
   every runner before loopctl enforces it.** An unimplemented keyword FAILS validation rather
   than being skipped, so a definition carrying one would refuse every payload on this side.

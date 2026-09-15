@@ -42,6 +42,10 @@ defmodule LoopctlRunner.Contract do
   @spec schema_def(String.t()) :: map()
   def schema_def(name), do: Map.fetch!(Map.fetch!(@schema, "$defs"), name)
 
+  @doc "Every `$defs` entry the vendored contract publishes."
+  @spec definitions() :: [String.t()]
+  def definitions, do: @schema |> Map.fetch!("$defs") |> Map.keys() |> Enum.sort()
+
   @doc "Validates `payload` (string keys) against a `$defs` entry, e.g. \"RunnerJoin\"."
   @spec validate(String.t(), term()) :: :ok | {:error, [String.t()]}
   def validate(definition, payload) do
