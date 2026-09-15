@@ -22,12 +22,26 @@ defmodule LoopctlWeb.StoryEscalationController do
   alias Loopctl.ApiSpec.Schemas
   alias Loopctl.Delivery.Escalations
   alias Loopctl.Delivery.StageMachine
+  alias Loopctl.Delivery.Stages
   alias Loopctl.Dispatches
+  alias OpenApiSpex.Schema
 
   action_fallback LoopctlWeb.FallbackController
 
   plug LoopctlWeb.Plugs.RequireRole, [exact_role: :agent] when action in [:escalate]
-  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:escalate]
+
+  # THE OTHER SIDE OF THE SAME SEPARATION. `escalate` is `exact_role: :agent` so a human key
+  # cannot raise an escalation; `resolve` is `role: :user` so an agent key cannot clear one.
+  # The machine enforces the same thing itself (`human?/1` wants a `:user`+ role on a key no
+  # dispatch minted), and this is the gate that says so before any story is read.
+  plug LoopctlWeb.Plugs.RequireRole, [role: :user] when action in [:resolve]
+
+  # READS STAY OPEN, like every other read on this surface: an agent that cannot see the stage
+  # it is reporting against has to infer it from refusals, which is exactly what the runner
+  # did — three guesses in a row — for want of this endpoint.
+  plug LoopctlWeb.Plugs.RequireRole, [role: :agent] when action in [:show]
+
+  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:escalate, :resolve]
 
   # Counted in CODEPOINTS the way Postgres counts it (see `codepoints/1`), and read from
   # `Loopctl.Delivery.StageMachine`, the ONE place the bound is declared (#824 round 2).
@@ -115,6 +129,113 @@ defmodule LoopctlWeb.StoryEscalationController do
     }
   )
 
+  operation(:show,
+    summary: "Read a story's delivery stage",
+    description:
+      "The row `Loopctl.Delivery.Stages` keeps for this story: where it is in the delivery " <>
+        "machine, the `claim_epoch` every transition is fenced on, the `lock_version` and " <>
+        "`attempts`, the `runner_id` holding it, and the escalation reason when it is " <>
+        "parked. `null` when the story has no stage row, which means the delivery loop has " <>
+        "never touched it.\n\n" <>
+        "THE LOOP WAS UNOBSERVABLE WITHOUT THIS. Nothing on the API returned a stage, so an " <>
+        "operator watching a run could not see where a story was, and a runner refused " <>
+        "`stale_stage` could only guess which transition now applies — the deployed runner " <>
+        "brute-forces three of them. `escalation_reason` is UNTRUSTED session-authored text.",
+    parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
+    responses: %{
+      200 => {"The story's stage row, or null", "application/json", Schemas.StoryStageResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  operation(:resolve,
+    summary: "Resolve an escalated story, as a human",
+    description:
+      "Moves a story off `escalated` over `:human_resolution` — the edge the stage machine " <>
+        "reserves for a person. `to` is `queued` (send it back to be worked), `done` " <>
+        "(accept it as finished) or `failed` (close it as not going to happen).\n\n" <>
+        "Requires a role of at least `user` on a key NO DISPATCH MINTED, which is what the " <>
+        "machine itself means by a human: a session cannot escalate and then resolve its " <>
+        "own escalation. 409 when the story is not escalated — it says which stage it is " <>
+        "actually at, rather than the machine's `stale_stage`, which means something else.",
+    parameters: [id: [in: :path, type: :string, description: "Story UUID"]],
+    request_body:
+      {"Resolution", "application/json",
+       %Schema{
+         type: :object,
+         required: [:to],
+         properties: %{
+           to: %Schema{type: :string, enum: ~w(queued done failed)},
+           reason: %Schema{
+             type: :string,
+             description: "Optional note recorded on the transition, in the operator's words."
+           }
+         }
+       }},
+    responses: %{
+      200 => {"The story's new stage row", "application/json", Schemas.StoryStageResponse},
+      403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      409 => {"The story is not escalated", "application/json", Schemas.ErrorResponse},
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
+  @doc "GET /api/v1/stories/:id/stage"
+  def show(conn, %{"id" => story_id}) do
+    tenant_id = conn.assigns.current_api_key.tenant_id
+
+    case Stages.get(tenant_id, story_id) do
+      nil -> json(conn, %{stage: nil})
+      row -> json(conn, %{stage: render_stage(row)})
+    end
+  end
+
+  @doc "POST /api/v1/stories/:id/stage/resolve"
+  def resolve(conn, %{"id" => story_id} = params) do
+    api_key = conn.assigns.current_api_key
+    tenant_id = api_key.tenant_id
+
+    with {:ok, to} <- resolution_target(params),
+         {:ok, row} <-
+           Escalations.resolve(tenant_id, story_id,
+             to: to,
+             reason: Map.get(params, "reason"),
+             actor_label: actor_label(api_key),
+             actor_role: api_key.role,
+             # SERVER-resolved, and the half that makes the human gate mean anything: a key a
+             # dispatch minted carries a lineage, and `Stages.human?/1` refuses it however
+             # high its role. A body-supplied lineage would let a session claim to be a person.
+             actor_lineage: Dispatches.lineage_for_api_key(tenant_id, api_key.id)
+           ) do
+      json(conn, %{stage: render_stage(row)})
+    else
+      {:error, {:not_escalated, stage}} ->
+        conn
+        |> put_status(409)
+        |> json(%{
+          error: %{
+            status: 409,
+            code: "not_escalated",
+            message: "The story is at #{stage}, not escalated. There is nothing to resolve.",
+            stage: stage
+          }
+        })
+
+      other ->
+        other
+    end
+  end
+
+  defp resolution_target(params) do
+    case Map.get(params, "to") do
+      to when to in ~w(queued done failed) -> {:ok, String.to_existing_atom(to)}
+      _ -> {:error, :bad_request, "to must be one of queued, done, failed"}
+    end
+  end
+
   @doc "POST /api/v1/stories/:id/escalate"
   def escalate(conn, %{"id" => story_id} = params) do
     api_key = conn.assigns.current_api_key
@@ -192,6 +313,10 @@ defmodule LoopctlWeb.StoryEscalationController do
   defp render_stage(row) do
     %{
       story_id: row.story_id,
+      # WHICH MACHINE HAS IT, which the stage read promised and did not return. An operator
+      # watching a run wants the machine as much as the stage, and a story stuck at `claimed`
+      # is a question about a runner.
+      runner_id: row.runner_id,
       stage: row.stage,
       claim_epoch: row.claim_epoch,
       lock_version: row.lock_version,

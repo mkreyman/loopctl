@@ -158,6 +158,7 @@ defmodule Loopctl.Delivery.Placement do
 
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Auth.Role
+  alias Loopctl.Delivery.DispatchPayload
   alias Loopctl.Delivery.ImplementerInput
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryPayload
@@ -189,6 +190,11 @@ defmodule Loopctl.Delivery.Placement do
           | {:invalid, [String.t()]}
           | {:invalid_transition, map()}
           | :story_not_accepted
+          | :story_not_found
+          | {:no_intake_source, Ecto.UUID.t()}
+          | {:ambiguous_intake_source, Ecto.UUID.t(), pos_integer()}
+          | {:unset, atom()}
+          | {:over_contract_maximum, atom()}
           | {:story_not_dispatchable, [String.t()]}
           | {:story_no_longer_dispatchable, [String.t()]}
           | {:escalation_failed, term(), [String.t()]}
@@ -386,6 +392,7 @@ defmodule Loopctl.Delivery.Placement do
 
   defp resume_payload(tenant_id, dispatch, record) do
     with {:ok, story} <- Stories.get_story(tenant_id, record.story_id),
+         {:ok, dispatch} <- DispatchPayload.fill(tenant_id, dispatch),
          {:ok, dispatch} <- rebuild_story(dispatch, story) do
       {:ok, Map.put(dispatch, "claim_epoch", record.claim_epoch)}
     end
@@ -426,8 +433,21 @@ defmodule Loopctl.Delivery.Placement do
     end
   end
 
+  # FILLED AFTER THE RUNNER IS RESOLVED AND BEFORE ANYTHING IS MINTED, which is the only
+  # position that is right on both counts.
+  #
+  # After, because filling READS THE STORY: done any earlier, a caller aiming at another
+  # tenant's runner was answered `story_not_found` before it had been told it was not
+  # authorised — the wrong answer, and an existence oracle for ids it may not see.
+  #
+  # Before, because `RunnerDispatch` requires `repo`, `branch`, `base_branch` and both
+  # budgets, `cast_dispatch/1` applies no defaults, and that cast is the FIRST step of
+  # `Runners.dispatch/3` — which runs after a session dispatch has been minted, the story
+  # claimed, and two IMMUTABLE chain entries appended. A caller that omitted one of the five
+  # paid all of that and then got a 422. Every one of them is something loopctl can look up.
   defp claim_and_push(tenant_id, runner_id, dispatch, story_id, caller, opts) do
     with {:ok, agent_id} <- runner_agent_id(tenant_id, runner_id),
+         {:ok, dispatch} <- DispatchPayload.fill(tenant_id, dispatch),
          :ok <- claimable(tenant_id, story_id),
          {:ok, session} <- mint_session_dispatch(tenant_id, agent_id, story_id, caller, opts) do
       claim_then_push(tenant_id, runner_id, dispatch, story_id, agent_id, session, opts)
@@ -448,7 +468,18 @@ defmodule Loopctl.Delivery.Placement do
   # It cannot be complete, and is not meant to be: a story claimed between this read and the
   # claim's own lock takes `claim_story/3`'s refusal instead, and `claim_then_push/7` revokes
   # the dispatch minted for it. This bounds the COMMON case; that bounds the race.
-  defp claimable(tenant_id, story_id) do
+  @doc """
+  Whether a story is in a state a placement can take: `contracted`, with its stage row at
+  `queued`.
+
+  Public so the question can be ASKED — by a test proving that a story an operator re-queued
+  is actually placeable, and by anything that wants to know before it spends a mint. It is the
+  same read `place/4` makes, so an answer here and the placement's own decision cannot drift
+  apart; see the note below on why it is a pre-check and not the fence.
+  """
+  @spec claimable(Ecto.UUID.t(), Ecto.UUID.t()) ::
+          :ok | {:error, :invalid_transition | :wrong_stage | :not_found}
+  def claimable(tenant_id, story_id) do
     with {:ok, story} <- Stories.get_story(tenant_id, story_id) do
       cond do
         story.agent_status != :contracted -> {:error, :invalid_transition}

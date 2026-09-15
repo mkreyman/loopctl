@@ -412,6 +412,54 @@ defmodule LoopctlWeb.DispatchPlacementController do
   # so this path writes NOTHING: no escalation, no release, no chain entry. Telling the
   # operator "the claim was released" here, as the message above does, would be a false
   # statement about system state that they would then act on.
+  # THE STORY'S PROJECT IS BOUND TO NO REPOSITORY, or to two. Named rather than left to the
+  # contract's `invalid_payload`, because the remedy is an operator's and has nothing to do
+  # with the request: enrol an intake source for the project, or revoke the duplicate.
+  defp refuse(conn, {:no_intake_source, project_id}) do
+    error(conn, 409, "no_intake_source", %{
+      message:
+        "This story's project is bound to no repository, so a dispatch cannot name one. " <>
+          "Enrol an intake source for the project, or pass `repo` and `base_branch` " <>
+          "explicitly.",
+      project_id: project_id
+    })
+  end
+
+  defp refuse(conn, {:ambiguous_intake_source, project_id, count}) do
+    error(conn, 409, "ambiguous_intake_source", %{
+      message:
+        "This story's project has #{count} active intake sources, so loopctl cannot choose " <>
+          "the repository. Revoke the ones that no longer apply, or pass `repo` and " <>
+          "`base_branch` explicitly.",
+      project_id: project_id
+    })
+  end
+
+  # A BUDGET THE OPERATOR HAS NOT SET. No default, deliberately — see the driver's moduledoc —
+  # so this is configuration rather than a bad request, and the message names the key.
+  defp refuse(conn, {:unset, key}) do
+    error(conn, 409, "budget_unset", %{
+      message:
+        "#{key} is not configured and the request did not carry one. Set it, or pass " <>
+          "`wall_clock_seconds` and `max_turns` on the request. There is deliberately no " <>
+          "default: the budget is a cost decision and loopctl does not make it for you.",
+      key: to_string(key)
+    })
+  end
+
+  defp refuse(conn, {:over_contract_maximum, key}) do
+    error(conn, 409, "budget_over_maximum", %{
+      message: "#{key} is configured above the maximum the runner contract declares.",
+      key: to_string(key)
+    })
+  end
+
+  defp refuse(conn, :story_not_found) do
+    error(conn, 404, "story_not_found", %{
+      message: "No story with that id in this tenant."
+    })
+  end
+
   defp refuse(conn, {:story_no_longer_dispatchable, violations}) do
     error(conn, 422, "story_no_longer_dispatchable", %{
       message:

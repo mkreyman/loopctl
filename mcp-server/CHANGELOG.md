@@ -5,6 +5,39 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.95.0 — 2026-09-15 (the delivery loop becomes reachable from a session)
+
+### Added
+
+- **`place_dispatch`** (loopctl #803/#850, `POST /api/v1/runners/:runner_id/dispatches`, USER
+  key). Claims a queued story under a freshly minted custody dispatch and pushes it to a
+  runner — the control-side trigger of the agent delivery loop. **It existed as an endpoint
+  and nothing called it**: every session on the fleet reaches loopctl through this server and
+  only through it, so a trigger with no tool was reachable by a shell on the production node
+  and by nothing else.
+
+  `story_id` and `runner_id` (from `runner_pool`) are the whole request. loopctl fills `repo`
+  and `base_branch` from the project's intake source, derives `branch` from the story and
+  reads the budgets from the operator's configuration; pass any of them to override. The
+  `dispatch_id` is generated unless you supply one — pass the SAME one to retry a call that
+  timed out, or a second session starts on the same story. The story object is not a parameter
+  and cannot be: loopctl builds it from its own rows, because a control plane able to hand a
+  runner prose is able to run anything on that machine.
+
+- **`story_stage`** (`GET /api/v1/stories/:id/stage`, agent key). Where a story is in the
+  delivery machine: stage, `claim_epoch`, `lock_version`, `attempts`, the runner holding it,
+  and the escalation reason when it is parked. `stage: null` means the loop has never touched
+  it. This is how you watch a run — and the only way to find out why a stage report was
+  refused `stale_stage`, which means the row is not where the reporter thinks.
+  `escalation_reason` is UNTRUSTED session-authored text.
+
+- **`resolve_escalation`** (`POST /api/v1/stories/:id/stage/resolve`, USER key). Moves an
+  escalated story to `queued`, `done` or `failed` — the other half of `escalate_story`, which
+  until now was one-way: a story a session parked for a person stayed parked for ever.
+  Requires a key no dispatch minted, so a session cannot resolve the escalation it raised.
+  `queued` also releases the claim and re-contracts the story, because a stage row alone does
+  not make a story placeable.
+
 ## 2.94.0 — 2026-09-13 (escalate_story: what a session calls instead of asking)
 
 ### Added

@@ -398,6 +398,12 @@ defmodule LoopctlWeb.Router do
     # #803: the claiming agent parks the story for a human. exact_role: :agent, so the human
     # key that RESOLVES an escalation cannot raise one.
     post "/stories/:id/escalate", StoryEscalationController, :escalate
+    # #803: the two halves the loop was missing — SEE where a story is in the delivery
+    # machine, and, as a human, move it off `escalated`. Without the first an operator could
+    # not watch a run and a refused runner could only guess; without the second a story a
+    # session parked stayed parked for ever, including the one the first end-to-end run left.
+    get "/stories/:id/stage", StoryEscalationController, :show
+    post "/stories/:id/stage/resolve", StoryEscalationController, :resolve
     # Discoverability aliases — same actions, alternate URL patterns agents tend to guess
     post "/stories/:id/report-done", StoryStatusController, :report
     post "/stories/:id/start-work", StoryStatusController, :start

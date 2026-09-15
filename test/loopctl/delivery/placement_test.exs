@@ -95,6 +95,55 @@ defmodule Loopctl.Delivery.PlacementTest do
       assert pushed.story.acceptance_criteria == expected_criteria(story)
     end
 
+    test "the repo, base branch and branch are FILLED from loopctl's own records", ctx do
+      %{runner: runner, story: story} = ctx
+      source = unboxed(fn -> bind_repo(runner.tenant_id, story, "mkreyman/home_care_billing") end)
+
+      # `RunnerDispatch` requires `repo`, `branch`, `base_branch` and both budgets, and
+      # `cast_dispatch/1` applies no defaults — but that cast is the FIRST step of
+      # `Runners.dispatch/3`, which runs after the mint, the claim and two IMMUTABLE chain
+      # entries. So a caller that omitted one paid for all of that and got a 422. Each is
+      # something loopctl can look up, so it does, before anything is written.
+      #
+      # The budgets are PASSED here because the test environment configures neither, which is
+      # the next test.
+      minimal = %{
+        "dispatch_id" => Ecto.UUID.generate(),
+        "story_id" => story.id,
+        "kind" => "implement",
+        "wall_clock_seconds" => 3_600,
+        "max_turns" => 50
+      }
+
+      assert {:ok, _placed} = place(ctx, minimal)
+      assert_push "dispatch", pushed, @reply_timeout
+
+      assert pushed.repo == source.repo_full_name
+      assert pushed.base_branch == source.base_branch
+      assert pushed.branch == "feature/story-#{story.number}-#{String.slice(story.id, 0, 8)}"
+    end
+
+    test "a budget nobody configured is named BEFORE anything is minted", ctx do
+      %{runner: runner, story: story} = ctx
+      unboxed(fn -> bind_repo(runner.tenant_id, story, "mkreyman/cron_books") end)
+
+      minimal = %{
+        "dispatch_id" => Ecto.UUID.generate(),
+        "story_id" => story.id,
+        "kind" => "implement"
+      }
+
+      # NO DEFAULT is the policy — a budget is a cost decision loopctl does not make for an
+      # operator — so this is configuration rather than a bad request, and the refusal names
+      # the key. Before anything is minted, which is the difference from letting the contract
+      # refuse it: nothing is claimed and no chain entry is written.
+      assert {:error, {:unset, :dispatch_wall_clock_seconds}} = place(ctx, minimal)
+      refute_push "dispatch", _pushed
+
+      assert unboxed(fn -> Stages.get(runner.tenant_id, story.id) end).stage == :queued
+      assert unboxed(fn -> reload(runner.tenant_id, story.id) end).agent_status == :contracted
+    end
+
     test "a CALLER-supplied story object is refused, and nothing is claimed", ctx do
       %{runner: runner, story: story} = ctx
 
@@ -726,6 +775,22 @@ defmodule Loopctl.Delivery.PlacementTest do
         ),
         set: [description: String.duplicate("a", 20_000)]
       )
+  end
+
+  # The story's project bound to a repository, which is where the fill reads `repo` and
+  # `base_branch` from.
+  defp bind_repo(tenant_id, story, repo) do
+    now = DateTime.utc_now()
+
+    AdminRepo.insert!(%Loopctl.Intake.Source{
+      tenant_id: tenant_id,
+      project_id: story.project_id,
+      repo_full_name: repo,
+      base_branch: "master",
+      webhook_secret: :crypto.strong_rand_bytes(32) |> Base.encode16(case: :lower),
+      inserted_at: now,
+      updated_at: now
+    })
   end
 
   defp reload(tenant_id, story_id) do
