@@ -1517,5 +1517,5 @@
       "workflow_change_not_defect_fix"
     ]
   },
-  "x-contract-version": "1.9.3"
+  "x-contract-version": "1.10.0"
 }

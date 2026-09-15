@@ -45,8 +45,10 @@ defmodule Loopctl.Delivery.RunnerStages do
     finds the row past `from` and `Stages.advance/4` refuses `:stale_stage`. `apply/3` then
     RE-READS the row: at `to` under the caller's epoch, the replay is the runner asking for
     something that already happened, and it is answered `{:ok, row}`. Anywhere else it is a
-    genuine `:stale_stage` — the story moved somewhere the runner did not expect — and the
-    runner must re-read rather than resend.
+    genuine `{:stale_stage, row}` — the story moved somewhere the runner did not expect — and
+    the refusal CARRIES that row (`row_state/1`, the same shape as the ack), because the
+    remedy is to send the transition that applies and the row is the only thing that says
+    which one that is.
   - The slot release is idempotent by `slot_generation`
     (`Loopctl.Runners.Capacity.release/4`): the second call matches no row and decrements
     nothing. That is what makes the replay path safe to release on, which it must be — the
@@ -75,7 +77,7 @@ defmodule Loopctl.Delivery.RunnerStages do
           :unknown_dispatch
           | :dispatch_not_accepted
           | :stale_claim_epoch
-          | :stale_stage
+          | {:stale_stage, StoryStage.t()}
           | :unknown_story_stage
           | {:effect_conflict, map()}
           | :audit_chain_append_failed
@@ -132,6 +134,26 @@ defmodule Loopctl.Delivery.RunnerStages do
   end
 
   @doc """
+  A stage row as the wire states it: where the story IS, under which claim, and what
+  identities it holds.
+
+  ONE renderer, because two things send it and they must not be able to disagree — the `ok`
+  ack after a transition or a replay, and the `stale_stage` refusal, which is the same
+  question asked by a runner that guessed `from` wrong. A runner parses one shape either way,
+  and a field added here reaches both.
+  """
+  @spec row_state(StoryStage.t()) :: map()
+  def row_state(%StoryStage{} = row) do
+    %{
+      stage: Atom.to_string(row.stage),
+      claim_epoch: row.claim_epoch,
+      lock_version: row.lock_version,
+      attempts: row.attempts,
+      effects: recorded_effects(row)
+    }
+  end
+
+  @doc """
   The identities a story's stage row holds, as a `stage` ack and an `effect_conflict` refusal
   report them: every effect a runner may carry (`StageMachine.reportable_effects/0`) that is
   actually set. An absent key means nothing was recorded.
@@ -185,8 +207,15 @@ defmodule Loopctl.Delivery.RunnerStages do
       %StoryStage{stage: ^to, claim_epoch: ^epoch} = row ->
         replayed_effects_agree(row, stage, tenant_id, session)
 
-      %StoryStage{} ->
-        {:error, :stale_stage}
+      # THE REFUSAL CARRIES THE ROW (#849). The contract's remedy for `stale_stage` is "re-read
+      # the story and send the transition that applies", and until this carried the row there
+      # was nothing to read: `story_stages` has no runner-facing endpoint, by design, because
+      # the ack IS the read. A runner refused here could only guess, and the deployed one
+      # guessed by brute force — three `from` values in turn, three round trips, none of which
+      # could name where the row actually was, and an operator reading the journal could not
+      # either. The row is in hand at the moment of the refusal; sending it costs one map.
+      %StoryStage{} = row ->
+        {:error, {:stale_stage, row}}
     end
   end
 

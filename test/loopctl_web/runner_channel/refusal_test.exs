@@ -18,6 +18,8 @@ defmodule LoopctlWeb.RunnerChannel.RefusalTest do
   import ExUnit.CaptureLog
 
   alias Loopctl.ApiSpec.RunnerContract
+  alias Loopctl.Delivery.RunnerStages
+  alias Loopctl.Delivery.StoryStage
   alias LoopctlWeb.RunnerChannel.Refusal
 
   # Written by hand from `Loopctl.Delivery.Stages.advance_error/0`, which is a type and cannot
@@ -114,6 +116,29 @@ defmodule LoopctlWeb.RunnerChannel.RefusalTest do
       for reason <- [:stale_stage, :unknown_story_stage, :effect_conflict] do
         assert Refusal.for_message(reason) == %{reason: Atom.to_string(reason)}
       end
+    end
+
+    test "stale_stage CARRIES the row, in the shape the ok ack sends (#849)" do
+      row = %StoryStage{
+        stage: :queued,
+        claim_epoch: 7,
+        lock_version: 3,
+        attempts: 2,
+        branch: "feature/story-11-abcdef01"
+      }
+
+      refusal = Refusal.for_message({:stale_stage, row})
+
+      assert refusal.reason == "stale_stage"
+
+      # ONE SHAPE, asserted against the renderer the ack itself uses rather than by listing
+      # the keys again here. A test that restated the field list would stay green while the
+      # two drifted, which is the whole thing this refusal exists to prevent: the contract's
+      # remedy is "send the transition that applies", and the runner reads it off this map.
+      assert Map.delete(refusal, :reason) == RunnerStages.row_state(row)
+      assert refusal.stage == "queued"
+      assert refusal.claim_epoch == 7
+      assert refusal.effects == %{branch: "feature/story-11-abcdef01"}
     end
 
     test "a refused chain append is PERMANENT, never a retry instruction" do

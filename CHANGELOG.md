@@ -6,6 +6,21 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Contract 1.10.0 — a `stage` refused `stale_stage` carries the ROW.** The refusal now
+  answers with `stage`, `claim_epoch`, `lock_version`, `attempts` and `effects` beside the
+  `reason` — the same shape the ok ack sends, from the same renderer
+  (`Loopctl.Delivery.RunnerStages.row_state/1`), so the two cannot drift. RE-VENDOR to pick up
+  the version, though nothing a 1.9.x runner does breaks: the fields are additive.
+
+  The code's whole remedy, as the contract has prescribed since 1.4.0, is "re-read the story
+  and send the transition that applies" — and `story_stages` has no runner-facing endpoint, by
+  design, because the reply IS the read. Carrying the reason alone therefore made the
+  instruction unfollowable, and the deployed runner did the only thing left: it brute-forced
+  three `from` values in turn (`@fallback_froms`). On 2026-09-14 all three were refused, which
+  is three round trips that still could not name where the row was, and the operator reading
+  the journal could not name it either. The row was in hand at the moment of the refusal the
+  whole time. A runner holding a fallback list can delete it.
+
 - **Contract 1.9.3 — `x-connection.triage_gating_reasons` publishes the gating vocabulary.**
   `Loopctl.DeliveryGates.GateA` matches two `escalation_reasons` entries as WHOLE STRINGS to
   decide whether a human is asked, while the contract typed that field as free-form text with

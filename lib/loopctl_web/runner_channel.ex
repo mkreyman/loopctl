@@ -475,17 +475,10 @@ defmodule LoopctlWeb.RunnerChannel do
   # A stage row as it now stands. A runner whose acknowledgement was lost re-sends and gets
   # this back from the replay path, so where the story actually is never needs a second
   # endpoint.
-  defp stage_ack(row) do
-    %{
-      stage: Atom.to_string(row.stage),
-      claim_epoch: row.claim_epoch,
-      lock_version: row.lock_version,
-      attempts: row.attempts,
-      # The identities the row actually holds, so a runner can RECONCILE. Same helper the
-      # `effect_conflict` refusal uses, so the ack and the refusal cannot name different sets.
-      effects: RunnerStages.recorded_effects(row)
-    }
-  end
+  #
+  # Rendered by `RunnerStages.row_state/1` rather than here, because the `stale_stage` refusal
+  # sends the same row for the same reason (#849) and the two must not be able to drift.
+  defp stage_ack(row), do: RunnerStages.row_state(row)
 
   defp rate_limited(socket, event, min_interval_ms),
     do: refuse(socket, event, %{reason: "rate_limited", min_interval_ms: min_interval_ms})

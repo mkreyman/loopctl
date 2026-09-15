@@ -319,6 +319,45 @@ defmodule LoopctlWeb.RunnerChannelStageTest do
       assert second.stage == "reviewing"
     end
 
+    test "a stale_stage refusal carries the row ON THE WIRE, as the ack does (#849)", ctx do
+      %{channel: channel, dispatch_id: dispatch_id} = ctx
+
+      ref =
+        push(
+          channel,
+          "stage",
+          stage_message(dispatch_id, %{"from" => "implementing", "to" => "reviewing"})
+        )
+
+      assert_reply ref, :ok, ack, @reply_timeout
+
+      # A legal transition from a stage the row has not reached — the shape a runner sends
+      # when it has lost track, which is the case the contract answers with "re-read the
+      # story and send the transition that applies". Asserted at the CHANNEL and not only at
+      # `Refusal`, because what the runner can act on is the reply that leaves the socket:
+      # every field was in hand at the refusal and none of them used to be sent, so the
+      # deployed runner brute-forced three `from` values in turn and still could not name
+      # where the row was.
+      refill_bucket(channel)
+
+      ref =
+        push(
+          channel,
+          "stage",
+          stage_message(dispatch_id, %{"from" => "pr_open", "to" => "ci"})
+        )
+
+      assert_reply ref, :error, refusal, @reply_timeout
+
+      assert refusal.reason == "stale_stage"
+      assert refusal.stage == "reviewing"
+      assert refusal.stage == ack.stage
+      assert refusal.claim_epoch == ack.claim_epoch
+      assert refusal.lock_version == ack.lock_version
+      assert refusal.attempts == ack.attempts
+      assert refusal.effects == ack.effects
+    end
+
     test "a terminal outcome releases the session's slot", ctx do
       %{channel: channel, dispatch_id: dispatch_id, runner: runner} = ctx
 

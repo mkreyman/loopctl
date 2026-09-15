@@ -42,6 +42,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.9.1) `RunnerTriageVerdictMessage` and `RunnerTriageVerdictAck` are actually DEFINED. 1.9.0 named both in `x-connection` and published neither, so the envelope was unresolvable and a runner had to re-type it. RE-VENDOR: a copy taken at 1.9.0 is missing both, and the version string is the only signal that it is | | | | |
   | (1.9.2) a NULLABLE ENUM publishes `null` as a member. `incomplete` was typed `[string, null]` with an enum of five reasons, and under 2020-12 an enum constrains null too — so a runner validating a message against the published file could not SEND a real verdict beside `"incomplete": null`, while the mirror message validated. loopctl accepted both all along; the schema was what disagreed. Also publishes `x-connection.permanent_error_conditions`. RE-VENDOR to send both keys | | | | |
   | (1.9.3) `x-connection.triage_gating_reasons` publishes the `escalation_reasons` entries the control-side gate matches as whole strings, while the field itself stays free-form prose — and an escalate verdict must now carry at least one entry that is NOT a code, because a classification is not words a person can act on. RE-VENDOR: a copy taken at 1.9.2 has no such key to validate against | | | | |
+  | (1.10.0) a `stage` refused `stale_stage` carries the ROW — `stage`, `claim_epoch`, `lock_version`, `attempts`, `effects`, the same shape the ok ack sends. The remedy this code prescribes is to re-read the story and send the transition that applies, and there is no endpoint to read it from: the reply IS the read. A runner holding a `from` fallback list can delete it | | | | |
 
   ## The story object (since 1.5.0)
 
@@ -162,7 +163,11 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   whose first copy committed finds the row already at `to` under the same epoch and is
   answered `ok` with that row, so a re-send after a lost acknowledgement — which happens on
   every rolling deploy — never transitions twice. A message for a row that has moved somewhere
-  ELSE is `stale_stage`: re-read the story and send the transition that applies.
+  ELSE is `stale_stage`, and since 1.10.0 that refusal CARRIES THE ROW — the same
+  `{stage, claim_epoch, lock_version, attempts, effects}` the ok ack sends, beside the
+  `reason`. Send the transition that applies FROM the `stage` it names; do not guess by
+  trying each `from` in turn, and do not go looking for an endpoint to read the row from.
+  There is none, deliberately: the reply is the read.
 
   **A replay must carry the SAME identities its first copy did.** One that names a DIFFERENT
   value for an identity already recorded is `effect_conflict`, never `ok`: the case that
@@ -296,7 +301,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   alias Loopctl.DeliveryGates.GateA
   alias OpenApiSpex.Schema
 
-  @version "1.9.3"
+  @version "1.10.0"
   @major 1
 
   defmodule ByteRule do
@@ -1980,8 +1985,14 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     #
     # - `stale_stage` — the row is not at `from`. The message is well formed and the claim is
     #   fine, so `invalid_payload` (stop sending this) and `stale_claim_epoch` (stop working
-    #   the story) are both actively wrong. Re-read the story's stage and send the transition
-    #   that actually applies.
+    #   the story) are both actively wrong. Since 1.10.0 the refusal CARRIES the row — the
+    #   same `{stage, claim_epoch, lock_version, attempts, effects}` the ok ack sends — and
+    #   the transition that applies is read off it. Before that it carried the code alone,
+    #   which made the prescribed remedy unfollowable: `story_stages` has no runner-facing
+    #   endpoint by design, because the reply IS the read. The deployed runner did the only
+    #   thing left and brute-forced three `from` values in turn, all refused, none of them
+    #   naming where the row was, and the operator reading the journal could not name it
+    #   either (#849).
     # - `unknown_story_stage` — the dispatch's story has no stage row at all, which is a
     #   control-plane state the runner cannot fix by resending or by giving up the claim.
     #   `unknown_dispatch` would name the wrong object: the dispatch is known.
