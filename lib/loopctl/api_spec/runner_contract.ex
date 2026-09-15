@@ -40,6 +40,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.8.0) `x-connection.limits` publishes every bounded field at every depth. A `fields` entry may now be a nested map, and an ARRAY of objects publishes its element bounds under `item_fields` — never `fields`, which always means the bounds of the object you are looking at | | | | |
   | (1.9.0) a triage session's result comes back on its own `triage_verdict` message, carrying EXACTLY ONE of `verdict` or `incomplete`. Idempotent per dispatch: a byte-identical resend is answered `ok`. `x-connection.permanent_errors` says which refusals are worth resending | | | | |
   | (1.9.1) `RunnerTriageVerdictMessage` and `RunnerTriageVerdictAck` are actually DEFINED. 1.9.0 named both in `x-connection` and published neither, so the envelope was unresolvable and a runner had to re-type it. RE-VENDOR: a copy taken at 1.9.0 is missing both, and the version string is the only signal that it is | | | | |
+  | (1.9.2) a NULLABLE ENUM publishes `null` as a member. `incomplete` was typed `[string, null]` with an enum of five reasons, and under 2020-12 an enum constrains null too — so a message carrying a real verdict beside `"incomplete": null` was refused `invalid_payload`, permanently, while the mirror message was accepted. RE-VENDOR to send both keys | | | | |
 
   ## The story object (since 1.5.0)
 
@@ -199,6 +200,17 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     Branch on this rather than on a list copied into a runner's own source; everything not
     in it is worth resending unchanged.
 
+    ONE OF THEM IS PERMANENT ONLY ONCE THE RUNNER HAS NOTHING OUTSTANDING, and the list
+    cannot say so because the condition is the runner's own state rather than loopctl's.
+    `dispatch_not_accepted` means the ledger row for that dispatch is not `accepted` — which
+    is the ordinary TRANSIENT state while the runner's own accept reply is still in flight,
+    rate-limited, or being carried across a rejoin. A runner with an unacknowledged accept
+    for that dispatch may back off and retry; one with no accept outstanding must give the
+    run up, because nothing else will ever move the row. Both halves matter: retrying with
+    no accept outstanding is an unbounded loop against a doomed dispatch, and giving up with
+    one in flight throws away a run that was about to be acceptable. Raised by the
+    `loopctl-runner` session on 2026-09-15 rather than left to drift.
+
   Only a message that is ACTED ON counts: one refused before the database (`invalid_payload`,
   `batch_too_large`, `event_data_too_large`) neither starts a floor nor spends a reply, so
   a runner can correct it and resend at once. A message inside its limit is refused with
@@ -258,7 +270,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   alias Loopctl.Delivery.StageMachine
   alias OpenApiSpex.Schema
 
-  @version "1.9.1"
+  @version "1.9.2"
   @major 1
 
   defmodule ByteRule do
@@ -2813,7 +2825,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
         maxLength: schema.maxLength,
         maxItems: schema.maxItems,
         minProperties: schema.minProperties,
-        enum: schema.enum,
+        enum: exported_enum(schema),
         required: schema.required && Enum.map(schema.required, &to_string/1),
         additionalProperties: schema.additionalProperties,
         items: schema.items && schema_to_map(schema.items),
@@ -2827,4 +2839,28 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     type = to_string(schema.type)
     Map.put(base, "type", if(schema.nullable, do: [type, "null"], else: type))
   end
+
+  # A NULLABLE ENUM MUST PUBLISH `null` AS A MEMBER, and this is the whole fix of 1.9.2.
+  #
+  # `nullable` widens the exported `type` to `[t, "null"]` — and under JSON Schema 2020-12
+  # `enum` constrains EVERY instance, `null` included, so the two keywords contradict each
+  # other: the type says null is allowed and the enum says the only allowed values are the
+  # five listed strings. A validator that implements enum as written — the runner's does —
+  # refuses `"incomplete": null`, while `"verdict": null` beside a real `incomplete` is
+  # accepted, because that side is nullable with no enum.
+  #
+  # That asymmetry is the SAME defect 1.9.1 fixed on the other field, arriving from the other
+  # direction, and it has the same cost: the emitter it bites is the ordinary one — a struct
+  # serialised whole, sending every declared key — and the refusal is `invalid_payload`,
+  # which `permanent_errors` makes permanent, so the run's only output is lost and nothing
+  # resends. Found by the `loopctl-runner` session validating a real message against the
+  # vendored file, not by this repo's suite.
+  #
+  # Fixed HERE rather than on the one field, because the defect is a property of the
+  # translation and not of that schema: every nullable enum this contract ever declares would
+  # publish the same contradiction. `nullable_enums_publish_null` in the export test walks
+  # every published schema and binds it.
+  defp exported_enum(%Schema{enum: nil}), do: nil
+  defp exported_enum(%Schema{enum: enum, nullable: true}), do: enum ++ [nil]
+  defp exported_enum(%Schema{enum: enum}), do: enum
 end

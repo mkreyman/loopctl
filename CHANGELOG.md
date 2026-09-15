@@ -6,6 +6,30 @@ All notable changes to loopctl are documented here.
 
 ### Fixed
 
+- **Contract 1.9.2 — a nullable enum publishes `null` as a member.** `incomplete` was typed
+  `["string", "null"]` with an enum of the five reasons, and under JSON Schema 2020-12 an
+  `enum` constrains EVERY instance, `null` included — so the two keywords contradicted each
+  other and a validator implementing the enum as written refused `"incomplete": null`. The
+  mirror message was accepted, because `verdict` is nullable with no enum. **That asymmetry
+  is the same defect 1.9.1 fixed on the other field, arriving from the other side**, and it
+  costs the same thing: the emitter it bites is the ordinary one — a struct serialised whole,
+  every declared key present, the unused one null — the refusal is `invalid_payload`, and
+  `permanent_errors` makes that permanent, so the run's only output is lost and a conforming
+  runner does not resend. loopctl ITSELF accepted both shapes all along; only the published
+  schema disagreed, which is why no test here caught it. Found by the `loopctl-runner`
+  session validating a real message against the vendored file. Fixed in the EXPORT rather
+  than on the one field — the contradiction is a property of the translation, so any nullable
+  enum declared later would publish it too — and a guard now walks every published schema for
+  it. RE-VENDOR to send both keys.
+
+  Also published, as prose because a machine-readable list cannot hold it:
+  `dispatch_not_accepted` is permanent only once the runner has no accept of its own
+  outstanding for that dispatch. While its accept reply is in flight, rate-limited, or being
+  carried across a rejoin, the ledger row not being `accepted` yet is exactly what the
+  refusal reports, and a runner may back off and retry; with no accept outstanding nothing
+  will ever move the row and the run must be given up. Raised by the runner session as a
+  disagreement between its behaviour and this contract rather than left to drift.
+
 - **Contract 1.9.1 — the envelope is actually published, and re-vendoring is signalled.**
   1.9.0 named `RunnerTriageVerdictMessage` and `RunnerTriageVerdictAck` in `x-connection` and
   defined neither. **A copy of `v1.json` taken at 1.9.0 is missing both**, and the version

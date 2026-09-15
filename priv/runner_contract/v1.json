@@ -1003,7 +1003,8 @@
             "wall_clock_exceeded",
             "checkout_unreadable",
             "no_verdict_written",
-            "verdict_invalid"
+            "verdict_invalid",
+            null
           ],
           "type": [
             "string",
@@ -1509,5 +1510,5 @@
     ],
     "topic": "runner:{runner_id}"
   },
-  "x-contract-version": "1.9.1"
+  "x-contract-version": "1.9.2"
 }
