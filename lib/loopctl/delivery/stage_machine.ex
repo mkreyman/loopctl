@@ -83,7 +83,16 @@ defmodule Loopctl.Delivery.StageMachine do
 
   # Where the RUNNER'S SESSION ends and its capacity slot goes back. The terminals, plus the
   # deploy — see `session_ends_at/0` for why those are not the same set.
-  @session_ends_at @terminal ++ [:deployed]
+  # `:triaged` ENDS A SESSION TOO, and leaving it out held a slot nobody was using. A triage
+  # session stops the moment it states its verdict; `escalate` and `reject` land on terminal
+  # stages and released correctly, while `story` — the COMMON case — stopped at `:triaged` and
+  # left the triage dispatch's slot held on the runner until the lease reclaim swept it.
+  #
+  # No other session arrives here: `:triaged` is reached only by
+  # `Loopctl.Delivery.TriageVerdict`, and the implement session that picks the story up later
+  # holds its own dispatch and its own slot. So this ends the triage session without ending
+  # the story, which is exactly what `session_ends_at/0` means.
+  @session_ends_at @terminal ++ [:deployed, :triaged]
 
   @forward @main_line
            |> Enum.chunk_every(2, 1, :discard)

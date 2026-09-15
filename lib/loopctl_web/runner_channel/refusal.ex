@@ -89,8 +89,15 @@ defmodule LoopctlWeb.RunnerChannel.Refusal do
   # `unknown_story_stage` one has hit a condition it cannot clear by resending or by giving up
   # its claim, and an `effect_conflict` one must read the recorded identity off its last ack
   # and reconcile — never re-send, which is exactly what `invalid_payload` would tell it.
+  #
+  # `already_recorded` arrived with `triage_verdict` (1.9.0) and is PERMANENT, which is the
+  # opposite of how a resend is normally treated on that message: an identical resend is
+  # answered `ok` and never reaches here, so seeing this code means the bytes DIFFER from the
+  # verdict already recorded for this dispatch. A session cannot restate its verdict by
+  # design, so the two sides disagree about what it decided and no retry can settle that.
   @verbatim ~w(unknown_dispatch stale_claim_epoch already_replied dispatch_not_accepted
-               run_mismatch stale_stage unknown_story_stage effect_conflict)a
+               run_mismatch stale_stage unknown_story_stage effect_conflict
+               already_recorded)a
 
   def for_message(reason) when reason in @verbatim, do: %{reason: Atom.to_string(reason)}
 

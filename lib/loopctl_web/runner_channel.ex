@@ -102,6 +102,7 @@ defmodule LoopctlWeb.RunnerChannel do
   alias Loopctl.ApiSpec.RunnerContract
   alias Loopctl.ApiSpec.RunnerContract.Kinds
   alias Loopctl.Delivery.RunnerStages
+  alias Loopctl.Delivery.TriageVerdict
   alias Loopctl.LogValue
   alias Loopctl.Runners
   alias Loopctl.Runners.DispatchLedger
@@ -118,6 +119,9 @@ defmodule LoopctlWeb.RunnerChannel do
   @reply_refill_ms RunnerContract.dispatch_reply_burst() |> Map.fetch!("refill_interval_ms")
   @stage_capacity RunnerContract.stage_burst() |> Map.fetch!("capacity")
   @stage_refill_ms RunnerContract.stage_burst() |> Map.fetch!("refill_interval_ms")
+
+  @verdict_capacity RunnerContract.triage_verdict_burst() |> Map.fetch!("capacity")
+  @verdict_refill_ms RunnerContract.triage_verdict_burst() |> Map.fetch!("refill_interval_ms")
   @min_trace_interval_ms RunnerContract.min_interval_ms("trace")
   @min_cursor_interval_ms RunnerContract.min_interval_ms("trace_cursor")
   # How often an unknown event is LOGGED. It is answered `unknown_event` and counted in
@@ -155,6 +159,7 @@ defmodule LoopctlWeb.RunnerChannel do
        |> assign(:last_status_at, :never)
        |> assign(:reply_bucket, :full)
        |> assign(:stage_bucket, :full)
+       |> assign(:verdict_bucket, :full)
        |> assign(:last_trace_at, :never)
        |> assign(:last_cursor_at, :never)
        |> assign(:last_unknown_at, :never)
@@ -350,6 +355,42 @@ defmodule LoopctlWeb.RunnerChannel do
     else
       {:error, :rate_limited} -> rate_limited(socket, "stage", @stage_refill_ms)
       {:error, reason} -> refuse(socket, "stage", message_error(reason))
+    end
+  end
+
+  # What a triage session concluded (contract 1.9.0, #803). A separate message from `stage`
+  # because `:triage_escalate` is NOT a runner-reportable edge — the machine calls it a
+  # control-side verdict about a specific gate — so a runner cannot report its way to an
+  # escalation and a `stage` message could never carry the outcome at all.
+  #
+  # IDEMPOTENT, and the ack says which it was. A verdict is produced once per run and the
+  # session that wrote it has stopped, so a runner refused for any transient reason has no
+  # move except resending the same bytes; `replayed: true` tells it the resend landed on the
+  # verdict already recorded rather than applying anything twice.
+  defp handle_message("triage_verdict", payload, socket) do
+    now = System.monotonic_time(:millisecond)
+    %{runner: runner, tenant_id: tenant_id} = socket.assigns
+
+    with {:ok, message} <- RunnerContract.cast_triage_verdict_message(payload),
+         {:ok, bucket} <-
+           ReplyBucket.take(
+             socket.assigns.verdict_bucket,
+             now,
+             @verdict_capacity,
+             @verdict_refill_ms
+           ) do
+      socket = assign(socket, :verdict_bucket, bucket)
+
+      case TriageVerdict.apply(tenant_id, runner.id, message) do
+        {:ok, %{record: record, replayed?: replayed?}} ->
+          {:reply, {:ok, %{recorded_at: record.inserted_at, replayed: replayed?}}, socket}
+
+        {:error, reason} ->
+          refuse(socket, "triage_verdict", message_error(reason))
+      end
+    else
+      {:error, :rate_limited} -> rate_limited(socket, "triage_verdict", @verdict_refill_ms)
+      {:error, reason} -> refuse(socket, "triage_verdict", message_error(reason))
     end
   end
 

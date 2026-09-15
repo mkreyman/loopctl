@@ -56,8 +56,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.8.0"
-      assert schema["x-contract-version"] == "1.8.0"
+      assert RunnerContract.version() == "1.9.0"
+      assert schema["x-contract-version"] == "1.9.0"
 
       assert %{
                "dispatch_reply" => "RunnerDispatchReply",
@@ -68,7 +68,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
       assert connection["replies"] == %{
                "trace" => "RunnerTraceAck",
-               "trace_cursor" => "RunnerTraceAck"
+               "trace_cursor" => "RunnerTraceAck",
+               "triage_verdict" => "RunnerTriageVerdictAck"
              }
 
       # #803: the kind lists are published so a runner reads them rather than parsing prose.
@@ -1393,6 +1394,115 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       assert_raise ArgumentError, ~r/array of arrays/, fn ->
         RunnerContract.Limits.of(schema, 100)
       end
+    end
+  end
+
+  describe "the triage verdict message (1.9.0)" do
+    defp verdict_msg(attrs) do
+      Map.merge(
+        %{"dispatch_id" => Ecto.UUID.generate(), "claim_epoch" => 3},
+        attrs
+      )
+    end
+
+    # An `escalate` verdict, because it is the one that is complete with no nested story —
+    # `story` without a `story` is refused by the conditional rule, which the next test is
+    # about.
+    defp a_verdict,
+      do: %{
+        "outcome" => "escalate",
+        "confidence" => "high",
+        "escalation_reasons" => ["a human should look"]
+      }
+
+    test "exactly one of verdict and incomplete — both and neither are refused" do
+      # Checked in the CAST and not left to the schema, because expressing it needs a keyword
+      # (`oneOf`, `dependentRequired`) a vendoring runner's validator may not implement — and
+      # a rule the other side cannot check is one enforced by a 4xx nobody predicted.
+      assert {:ok, _} =
+               RunnerContract.cast_triage_verdict_message(
+                 verdict_msg(%{"verdict" => a_verdict()})
+               )
+
+      assert {:ok, _} =
+               RunnerContract.cast_triage_verdict_message(
+                 verdict_msg(%{"incomplete" => "session_crashed"})
+               )
+
+      for bad <- [%{}, %{"verdict" => a_verdict(), "incomplete" => "session_crashed"}] do
+        assert {:error, {:invalid, ["exactly_one_of_verdict_or_incomplete"]}} =
+                 RunnerContract.cast_triage_verdict_message(verdict_msg(bad))
+      end
+    end
+
+    test "the nested verdict goes through the SAME shape rules as a bare one" do
+      # One cast, one set of rules. A second reading of the same object is how the envelope
+      # and the verdict drift into disagreeing about what a valid verdict is — and the rule
+      # at stake is load-bearing: `story` is required when the outcome is `story`, and a
+      # verdict that says `story` and carries none has moved the work rather than done it.
+      says_story = %{"outcome" => "story", "confidence" => "high"}
+
+      assert {:error, _} = RunnerContract.cast_triage_verdict(says_story)
+
+      assert {:error, _} =
+               RunnerContract.cast_triage_verdict_message(verdict_msg(%{"verdict" => says_story}))
+    end
+
+    test "every incomplete reason the module names is accepted, and a made-up one is not" do
+      for reason <- RunnerContract.RunnerTriageVerdictMessage.incomplete_reasons() do
+        assert {:ok, %{incomplete: ^reason}} =
+                 RunnerContract.cast_triage_verdict_message(
+                   verdict_msg(%{"incomplete" => reason})
+                 )
+      end
+
+      assert {:error, _} =
+               RunnerContract.cast_triage_verdict_message(verdict_msg(%{"incomplete" => "bored"}))
+    end
+
+    test "verdict_invalid is one of them, because a written-then-refused verdict is its own state" do
+      # The session did not crash, did not run out of time and could read the checkout — it
+      # DID write something, which the runner's own validation then refused. None of the other
+      # reasons describes that, and it was missing until the runner session named it.
+      assert "verdict_invalid" in RunnerContract.RunnerTriageVerdictMessage.incomplete_reasons()
+    end
+
+    test "the message is a declared inbound event with its own errors and burst" do
+      # A handler with no declared event, or an event with no declared refusals, is the shape
+      # where a runner cannot tell a refusal it should resend from one it should not.
+      schema = RunnerContract.json_schema()
+      connection = schema["x-connection"]
+
+      assert connection["events"]["triage_verdict"] == "RunnerTriageVerdictMessage"
+
+      assert %{"capacity" => _, "refill_interval_ms" => _} =
+               connection["limits"]["triage_verdict_burst"]
+
+      assert "already_recorded" in connection["errors"]["triage_verdict"]
+    end
+
+    test "permanence is PUBLISHED, so a runner branches on the contract not on a copied list" do
+      # The ones whose remedy is "stop": resending cannot change any of them, on any event.
+      for code <- ~w(invalid_payload stale_claim_epoch unknown_dispatch already_recorded) do
+        assert RunnerContract.permanent_error?("triage_verdict", code)
+        assert RunnerContract.permanent_error?("stage", code)
+      end
+
+      # And the ones whose remedy is "send it again" must NOT be, or a runner told to stop on
+      # a rate limit loses the run's whole output — a verdict cannot be re-derived.
+      for code <- ~w(rate_limited internal_error) do
+        refute RunnerContract.permanent_error?("triage_verdict", code)
+      end
+
+      # PER EVENT, which a flat list cannot express. `stale_stage` is transient for `stage` —
+      # re-read the story and send what applies — and permanent for `triage_verdict`, where it
+      # means the story has left `detected` and the verdict's first transition can never match
+      # again. A runner following a global list would retry a doomed verdict for ever.
+      assert RunnerContract.permanent_error?("triage_verdict", "stale_stage")
+      refute RunnerContract.permanent_error?("stage", "stale_stage")
+
+      assert RunnerContract.json_schema()["x-connection"]["permanent_errors"] ==
+               RunnerContract.permanent_errors()
     end
   end
 

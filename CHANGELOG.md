@@ -6,6 +6,37 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **Runner contract 1.9.0: a triage session's verdict comes back (#803).** `cast_triage_verdict/1`
+  shipped in 1.7.0 with NO CALLER — the wire format existed and nothing on this side handled
+  one. `triage_verdict` is the message that carries it: `dispatch_id`, `claim_epoch`, and
+  exactly one of `verdict` or `incomplete`. It is its own message rather than a `stage`
+  report because `:triage_escalate` is deliberately not a runner-reportable edge, so a runner
+  could never report its way to an escalation; the session supplies its judgement and control
+  concludes the transition.
+
+  **`incomplete` is the end a triage run had no way to report.** A session can finish without
+  a verdict — it crashed, ran out of wall clock, could not read the checkout, wrote nothing,
+  or wrote something the runner's own validation refused (`verdict_invalid`, named by the
+  runner session that will hit it). Every reason escalates, and without it such a dispatch
+  stayed in flight for ever.
+
+  **Applying is idempotent per dispatch, and that is a correctness property with an outside
+  effect.** A verdict is recorded once per dispatch (`triage_verdicts`, unique on
+  `(tenant_id, dispatch_id)`); a byte-identical resend is answered `ok`, applies no second
+  transition and appends no second chain entry. It matters because the transition is not
+  undoable: a `reject` takes the story `triaged -> failed` on the `:triage_reject` edge, which
+  earns the reporter a `not_actionable` resolution and CLOSES her support ticket — so a double
+  apply is a second close on a real person's ticket. A resend carrying a DIFFERENT verdict is
+  refused `already_recorded`, permanently: a session cannot restate its verdict by design.
+
+  **Operators:** migration `20260921120000` creates `triage_verdicts` (RLS enabled, no
+  backfill, no manual step; it starts empty because nothing emits a verdict yet). The new
+  `x-connection.permanent_errors` publishes which refusal codes no resend can clear, so a
+  runner branches on the contract instead of a list copied into its own source.
+
+  Nothing dispatches a triage yet: `triage` stays out of `dispatchable_kinds`. This is the
+  receive half only, shipped early for the same reason 1.7.0 shipped the schema early.
+
 - **The loop refuses to merge its own control plane (#803, correction 11).**
   `Loopctl.Delivery.MergePrecondition` now answers `refuse` with
   `{:self_deploy_excluded, repo}` for a pull request against loopctl or claude-config, and
