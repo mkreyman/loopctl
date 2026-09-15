@@ -22,13 +22,17 @@ All notable changes to loopctl are documented here.
   enum declared later would publish it too — and a guard now walks every published schema for
   it. RE-VENDOR to send both keys.
 
-  Also published, as prose because a machine-readable list cannot hold it:
-  `dispatch_not_accepted` is permanent only once the runner has no accept of its own
-  outstanding for that dispatch. While its accept reply is in flight, rate-limited, or being
-  carried across a rejoin, the ledger row not being `accepted` yet is exactly what the
-  refusal reports, and a runner may back off and retry; with no accept outstanding nothing
-  will ever move the row and the run must be given up. Raised by the runner session as a
-  disagreement between its behaviour and this contract rather than left to drift.
+  Also new in the published contract: **`x-connection.permanent_error_conditions`**, which
+  carries the one permanent code whose permanence has a condition. `dispatch_not_accepted`
+  means the ledger row is not `accepted`, and that covers three states — `sent`, where the
+  runner's own accept simply has not landed yet (in flight, rate-limited, or carried across
+  a rejoin) and a backed-off retry is right, and `refused` and `superseded`, which are final
+  and which no later accept can move. A runner may therefore retry only while an accept it
+  sent for that dispatch is unacknowledged AND it has not since refused the dispatch or seen
+  its `claim_epoch` move; otherwise the run must be given up. It is TEXT rather than a second
+  predicate because the condition is about the runner's own outstanding messages, which
+  loopctl cannot observe. Raised by the runner session as a disagreement between its retry
+  behaviour and what this contract published, rather than left to drift.
 
 - **Contract 1.9.1 — the envelope is actually published, and re-vendoring is signalled.**
   1.9.0 named `RunnerTriageVerdictMessage` and `RunnerTriageVerdictAck` in `x-connection` and

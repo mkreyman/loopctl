@@ -40,7 +40,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.8.0) `x-connection.limits` publishes every bounded field at every depth. A `fields` entry may now be a nested map, and an ARRAY of objects publishes its element bounds under `item_fields` — never `fields`, which always means the bounds of the object you are looking at | | | | |
   | (1.9.0) a triage session's result comes back on its own `triage_verdict` message, carrying EXACTLY ONE of `verdict` or `incomplete`. Idempotent per dispatch: a byte-identical resend is answered `ok`. `x-connection.permanent_errors` says which refusals are worth resending | | | | |
   | (1.9.1) `RunnerTriageVerdictMessage` and `RunnerTriageVerdictAck` are actually DEFINED. 1.9.0 named both in `x-connection` and published neither, so the envelope was unresolvable and a runner had to re-type it. RE-VENDOR: a copy taken at 1.9.0 is missing both, and the version string is the only signal that it is | | | | |
-  | (1.9.2) a NULLABLE ENUM publishes `null` as a member. `incomplete` was typed `[string, null]` with an enum of five reasons, and under 2020-12 an enum constrains null too — so a message carrying a real verdict beside `"incomplete": null` was refused `invalid_payload`, permanently, while the mirror message was accepted. RE-VENDOR to send both keys | | | | |
+  | (1.9.2) a NULLABLE ENUM publishes `null` as a member. `incomplete` was typed `[string, null]` with an enum of five reasons, and under 2020-12 an enum constrains null too — so a runner validating a message against the published file could not SEND a real verdict beside `"incomplete": null`, while the mirror message validated. loopctl accepted both all along; the schema was what disagreed. Also publishes `x-connection.permanent_error_conditions`. RE-VENDOR to send both keys | | | | |
 
   ## The story object (since 1.5.0)
 
@@ -200,16 +200,24 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     Branch on this rather than on a list copied into a runner's own source; everything not
     in it is worth resending unchanged.
 
-    ONE OF THEM IS PERMANENT ONLY ONCE THE RUNNER HAS NOTHING OUTSTANDING, and the list
-    cannot say so because the condition is the runner's own state rather than loopctl's.
-    `dispatch_not_accepted` means the ledger row for that dispatch is not `accepted` — which
-    is the ordinary TRANSIENT state while the runner's own accept reply is still in flight,
-    rate-limited, or being carried across a rejoin. A runner with an unacknowledged accept
-    for that dispatch may back off and retry; one with no accept outstanding must give the
-    run up, because nothing else will ever move the row. Both halves matter: retrying with
-    no accept outstanding is an unbounded loop against a doomed dispatch, and giving up with
-    one in flight throws away a run that was about to be acceptable. Raised by the
-    `loopctl-runner` session on 2026-09-15 rather than left to drift.
+  - `permanent_error_conditions` (`permanent_error_conditions/0`) — the ONE code in the list
+    above whose permanence has a condition, published so a runner reads the condition rather
+    than inferring it. `dispatch_not_accepted` means the ledger row for that dispatch is not
+    `accepted`, and it covers three states: `sent` — the accept has not landed yet, which is
+    the ordinary TRANSIENT case while the runner's own accept reply is in flight,
+    rate-limited, or being carried across a rejoin — and `refused` or `superseded`, both of
+    which are FINAL and which no later accept can move.
+
+    So the condition is narrower than "an accept is outstanding", and the narrowing is the
+    whole content: a runner may back off and retry only while an accept it sent for THIS
+    dispatch is unacknowledged AND it has not since refused that dispatch or seen its claim
+    reclaimed — a refusal it sent itself, and a `claim_epoch` that has moved, are both things
+    the runner knows locally. With any of those, or with no accept outstanding at all, the
+    run must be given up: nothing will move the row, and retrying is an unbounded loop
+    against a doomed dispatch. Bounded either way — a lost accept reply after a reclaim is
+    the case that makes "an accept is outstanding" alone insufficient, and it is exactly the
+    case a rejoin produces. Raised by the `loopctl-runner` session on 2026-09-15, whose
+    retry behaviour disagreed with what this contract published, rather than left to drift.
 
   Only a message that is ACTED ON counts: one refused before the database (`invalid_payload`,
   `batch_too_large`, `event_data_too_large`) neither starts a floor nor spends a reply, so
@@ -2028,6 +2036,28 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     "triage_verdict" => ~w(stale_stage)
   }
 
+  # THE ONE CONDITIONAL MEMBER OF THE LIST ABOVE, published rather than left in a moduledoc a
+  # vendoring runner never reads. A flat list says "never resend", and for this code that is
+  # true in two of its three states and wrong in the third — so a runner following the list
+  # alone gives up a run that was about to be acceptable, and one following its own instinct
+  # retries a doomed dispatch for ever. Both were live: the `loopctl-runner` session retried
+  # it deliberately, with a comment, against what this contract published.
+  #
+  # Kept as TEXT and not as a second machine-readable rule, because the condition is about
+  # the RUNNER's own state — what it has sent and not had acknowledged — which loopctl cannot
+  # observe and therefore cannot express as a predicate over anything it publishes.
+  @permanent_error_conditions %{
+    "dispatch_not_accepted" =>
+      "Permanent unless an accept YOU sent for this dispatch is still unacknowledged. " <>
+        "The refusal means the ledger row is not `accepted`, which covers `sent` (your " <>
+        "accept has not landed yet - in flight, rate-limited, or carried across a rejoin, " <>
+        "and the one case worth retrying), and `refused` and `superseded`, which are final " <>
+        "and which no later accept can move. So retry, with backoff, only while an accept " <>
+        "for this dispatch is outstanding AND you have not since refused it and its " <>
+        "`claim_epoch` has not moved; otherwise give the run up, because nothing will move " <>
+        "the row."
+  }
+
   # `stage` is a bucket for the same reason, and a bigger one. A machine at `max_sessions: 2`
   # runs two stories at once, each walking a thirteen-stage line, and a runner that has been
   # offline through a rolling deploy ships every transition it buffered the moment it
@@ -2078,6 +2108,16 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   """
   @spec permanent_errors() :: %{String.t() => [String.t()]}
   def permanent_errors, do: @permanent_errors
+
+  @doc """
+  The conditions attached to a permanent code, keyed by code (1.9.2).
+
+  One entry today. A code named here is in `permanent_errors/0` as well and stays permanent
+  by default: this says when a resend is nevertheless worth making, in terms of the RUNNER's
+  own state, which is why it is text and not a predicate.
+  """
+  @spec permanent_error_conditions() :: %{String.t() => String.t()}
+  def permanent_error_conditions, do: @permanent_error_conditions
 
   @doc """
   True when `reason` can never be cleared by resending `event`.
@@ -2700,6 +2740,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
         # Beside `errors`, not inside `limits`: it is a property OF the refusal codes, and a
         # runner reads it in the same breath as the code it just got.
         "permanent_errors" => @permanent_errors,
+        "permanent_error_conditions" => @permanent_error_conditions,
         "socket_path" => "/runner/socket/websocket",
         "credential_header" => "x-loopctl-runner-token",
         "topic" => "runner:{runner_id}",
@@ -2847,7 +2888,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   # other: the type says null is allowed and the enum says the only allowed values are the
   # five listed strings. A validator that implements enum as written — the runner's does —
   # refuses `"incomplete": null`, while `"verdict": null` beside a real `incomplete` is
-  # accepted, because that side is nullable with no enum.
+  # accepted, because that side is nullable with no enum. loopctl's own cast accepts both —
+  # `OpenApiSpex.Cast` short-circuits on `nullable` before it reads the enum — so what was
+  # broken is the PUBLISHED schema, and the runner that obeys it cannot send a shape loopctl
+  # would have taken.
   #
   # That asymmetry is the SAME defect 1.9.1 fixed on the other field, arriving from the other
   # direction, and it has the same cost: the emitter it bites is the ordinary one — a struct

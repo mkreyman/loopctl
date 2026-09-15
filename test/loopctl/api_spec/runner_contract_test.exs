@@ -89,6 +89,14 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       assert connection["dispatchable_kinds"] == Kinds.dispatchable()
       assert connection["implied_kinds"] == Kinds.implied_by_silence()
 
+      # 1.9.2: the one permanent code whose permanence has a condition, published so a
+      # vendoring runner reads the condition instead of inferring it — asserted against the
+      # declaration, never a copy, and non-vacuously.
+      assert connection["permanent_error_conditions"] ==
+               RunnerContract.permanent_error_conditions()
+
+      assert Map.has_key?(connection["permanent_error_conditions"], "dispatch_not_accepted")
+
       assert connection["errors"] == RunnerContract.error_reasons()
       assert "unknown_event" in connection["errors"]["unknown_event"]
       assert "machine_mismatch" in connection["errors"]["join"]
@@ -196,13 +204,23 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       # TOTAL over every published schema rather than asserted on that one field, because the
       # defect is a property of the TRANSLATION: any nullable enum this contract declares
       # later would publish the same contradiction, and nothing else would notice.
-      offenders =
+      candidates =
         for {title, definition} <- RunnerContract.json_schema()["$defs"],
             {path, subschema} <- flatten_subschemas(definition, title),
             is_list(subschema["enum"]),
             is_list(subschema["type"]) and "null" in subschema["type"],
-            not Enum.member?(subschema["enum"], nil),
-            do: path
+            do: {path, subschema["enum"]}
+
+      # NON-VACUOUS FIRST, and this is the assertion that makes the rest mean anything. The
+      # only nullable enum published today sits at depth 2 (a property of a definition), so a
+      # `flatten_subschemas/2` that stopped at the top level would find NO candidates and the
+      # emptiness assertion below would pass with the defect present — a guard that goes
+      # green by not looking is the failure this whole change is about.
+      assert candidates != [],
+             "no nullable enum was found at all, so this guard is measuring nothing — the " <>
+               "walk is broken, or the exporter stopped emitting nullable enums"
+
+      offenders = for {path, enum} <- candidates, not Enum.member?(enum, nil), do: path
 
       assert offenders == [],
              "these nullable enums do not list null, so a validator implementing 2020-12 " <>
@@ -576,11 +594,11 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     for _ <- 1..:rand.uniform(8), into: "", do: <<Enum.random(alphabet)::utf8>>
   end
 
-  # Every `%Schema{}` reachable from one, as {dotted path, schema}, so an offender names the
-  # field rather than just the top-level message. Nested schemas are inlined by the exporter
-  # (`RunnerSample` inside `RunnerJoin`), so the walk has to follow properties AND items.
-  # Every subschema of an EXPORTED definition, with a dotted path for the failure message.
-  # Walks `properties` and `items`, which is the whole of what `schema_to_map/1` emits.
+  # Every subschema of an EXPORTED definition — string-keyed maps, not `%Schema{}` structs —
+  # as {dotted path, subschema}, so an offender names the field rather than just the
+  # top-level message. Follows `properties` and `items`, which is the whole of what
+  # `schema_to_map/1` emits: nested schemas are INLINED by the exporter (`RunnerSample`
+  # inside `RunnerJoin`), so there is nothing else to descend into.
   defp flatten_subschemas(%{} = definition, path) do
     children =
       Enum.flat_map(Map.get(definition, "properties", %{}), fn {name, child} ->
@@ -1543,6 +1561,17 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
              |> MapSet.delete("*")
              |> MapSet.difference(events) == MapSet.new(),
              "permanent_errors is keyed by something that is not an event"
+
+      # A CONDITION ON A CODE THAT IS NOT PERMANENT is dead text a runner branches on for
+      # ever, and a condition on a code no event returns is worse — it reads as a promise
+      # about a refusal that cannot arrive. Bound to the same two sets the codes are.
+      conditioned = connection["permanent_error_conditions"] |> Map.keys() |> MapSet.new()
+
+      assert MapSet.subset?(conditioned, permanent),
+             "permanent_error_conditions names a code that is not permanent"
+
+      assert MapSet.subset?(conditioned, reasons),
+             "permanent_error_conditions names a code no event can return"
 
       # Non-vacuous where it can be. Not because a rename would compare empty sets — renaming
       # `events` makes `Map.values(nil)` raise, which is loud — but because the maps SHRINKING
