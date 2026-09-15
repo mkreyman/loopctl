@@ -57,7 +57,7 @@ defmodule LoopctlRunner.ControlTest do
     assert_receive {:test_loopctl, {:join, ^runner_id, join}}, 5_000
     assert Contract.validate("RunnerJoin", join) == :ok
     assert join["machine"] == "testbox"
-    assert join["contract_version"] == "1.11.0"
+    assert join["contract_version"] == "1.12.0"
     # Declared on EVERY join, from the same list the kind check reads.
     assert join["kinds"] == LoopctlRunner.Control.kinds()
     assert join["kinds"] == ["implement"]
