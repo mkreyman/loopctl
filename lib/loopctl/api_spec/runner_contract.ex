@@ -1184,9 +1184,11 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           "What a `triage` session returns (since 1.7.0). SESSION-AUTHORED AND UNTRUSTED: " <>
             "it was composed by a session that had just read reporter text, so loopctl " <>
             "records and bounds it and never executes it. WHAT LOOPCTL DOES WITH `story` IS " <>
-            "NOT A FENCE, and this description said it was until 1.12.0: a drafted title, " <>
-            "description and criterion are escaped for invisible characters, SCREENED by the " <>
-            "injection detector, and then stored as loopctl's own story row - which " <>
+            "NOT A FENCE, and this description said it was until 1.12.0: EVERY drafted field " <>
+            "that can reach `RunnerStory` - title, description, each acceptance criterion, and " <>
+            "the `test_cases`, `touches` and `domain_reference` a dispatch may carry as " <>
+            "options - is escaped for invisible characters, SCREENED by the injection " <>
+            "detector, and then stored as loopctl's own story row - which " <>
             "`RunnerStory` later carries as ordinary typed fields, with no fence and no " <>
             "marker. A draft the screen flags is escalated to a human instead of queued, so " <>
             "it never reaches an implement dispatch at all; a draft that passes is " <>

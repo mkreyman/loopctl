@@ -24,13 +24,22 @@ All notable changes to loopctl are documented here.
   and goes on to an implementer session that has commit access.
 
   `Loopctl.Delivery.TriageVerdict` now SCREENS the draft with `InjectionDetector.scan/1` —
-  title, description and every acceptance criterion — and a flagged draft is **escalated to a
+  title, description, every acceptance criterion, and the `test_cases`, `touches` and
+  `domain_reference` a dispatch can carry as options — and a flagged draft is **escalated to a
   human instead of queued**, the same disposition an undispatchable draft already takes. Not
   refused and not truncated: a flagged draft is often a conscientious session quoting the
   attacker's words to explain why they are suspicious, which is exactly what a person should
   see and exactly what an implementer should not be handed unattended. The escalation reason
-  written to the append-only chain is loopctl's own detector vocabulary, never the drafted
-  prose.
+  recorded is loopctl's own detector vocabulary — the signal codes, on the transition's
+  `story_stage_events` row — never the drafted prose.
+
+  The screen acts on a NARROWER signal set than the intake scan, because the detector is
+  calibrated for reporter text where a false positive costs a human glance, while here it
+  stops the loop on work nobody attacked. Measured against this repo's own 244 committed user
+  stories: `agent_action` fires on "the CI hook must reject a git push that carries
+  --no-verify" and `fence_breakout` on "document the untrusted data fence", so neither acts on
+  a draft; `instruction_override` is clean on both near-misses and does.
+  `test/loopctl/delivery/draft_false_positive_test.exs` pins that rate against the corpus.
 
 - **Contract 1.11.0 — a `stage` refused `stale_stage` carries the ROW.** The refusal now
   answers with `stage`, `claim_epoch`, `lock_version`, `attempts` and `effects` beside the
