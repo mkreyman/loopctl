@@ -386,6 +386,43 @@ mix ecto.reset         # Drop, create, migrate
 - **MCP Server**: `mcp-server/` — statically declared typed tools for Claude Code agents (no curl needed), plus per-tenant generated `cr_*` Context Retriever tools; published as `loopctl-mcp-server` on npm. `mcp-server/README.md` is the source of truth for the list.
 - **Build Status**: memory-keeper key `build_status`, channel `loopctl`
 
+### Merging: arm it, and cut from fresh master
+
+Three rules, all of them Mark's, all from 2026-09-15. They exist because a night of four
+sequential PRs spent more wall clock on CI arithmetic than on the changes themselves.
+
+**1. A green PR with no conflicts MERGES AS IT IS — do not update the branch first.**
+`master`'s protection now has `required_status_checks.strict = false`, GitHub's "require
+branches to be up to date before merging" turned OFF. A pull request whose eight required
+checks passed and which has no merge conflict is mergeable even when master has moved under
+it. **Do not run `gh pr update-branch`, and do not merge master into a branch, to clear a
+`BEHIND` state** — there is no longer a `BEHIND` state to clear. Every such update restarted
+the whole suite on a new head, and the required set runs for minutes on ONE self-hosted runner
+that cancels in-flight jobs on every push: three of that night's four PRs paid for two or
+three full runs to merge one reviewed change. What `strict` bought against is narrow — a
+SEMANTIC conflict git cannot see, where two changes are each green against the old base and
+broken together — and that risk now sits with master's own post-merge CI rather than with
+every PR before it. **What would overturn it:** master breaking regularly on combinations no
+single PR could have caught; say so with the failures that prove it, because turning `strict`
+back on costs a whole CI run per PR.
+
+A TEXTUAL conflict is a different thing and still stops a merge: GitHub reports the PR
+`DIRTY`, no CI runs on it at all, and you merge master INTO the branch to resolve it (never a
+rebase — the Git rules forbid force-pushing a shared branch).
+
+**2. Arm auto-merge the moment the review round is done.** `gh pr merge <n> --squash --auto
+--delete-branch` — the repo allows auto-merge and deletes the branch on merge. A reviewed PR
+then lands by itself when its checks settle, instead of holding a slot in somebody's head
+until they remember to look. Arm it AFTER the review, never before: `--auto` on an unreviewed
+PR ships an unreviewed change, and the round is the gate.
+
+**3. Cut every branch from master AS IT IS NOW.** `git checkout master && git pull` first,
+every time. A branch cut from a stale master, or stacked on another feature branch, inherits
+that branch's commits in its own PR and its own diff — which makes a reviewer read two changes
+as one, and makes the second PR conflict on the CHANGELOG the moment the first merges. Stack
+deliberately and say so in the PR body when a change genuinely depends on an unmerged one;
+otherwise start from master.
+
 ### Doc hygiene: NEVER record inventory counts
 
 Do not write counts of things that grow — stories, epics, MCP tools, modules,
