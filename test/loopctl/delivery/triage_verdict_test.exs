@@ -87,6 +87,41 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
     end)
   end
 
+  defp bump_story_epoch(story) do
+    as_tenant(story.tenant_id, fn ->
+      {1, _} =
+        Repo.update_all(
+          from(s in Loopctl.WorkBreakdown.Story,
+            where: s.id == ^story.id and s.tenant_id == ^story.tenant_id
+          ),
+          inc: [claim_epoch: 1]
+        )
+    end)
+  end
+
+  defp correct_title(story, title) do
+    as_tenant(story.tenant_id, fn ->
+      {1, _} =
+        Repo.update_all(
+          from(s in Loopctl.WorkBreakdown.Story,
+            where: s.id == ^story.id and s.tenant_id == ^story.tenant_id
+          ),
+          set: [title: title]
+        )
+    end)
+  end
+
+  # The half-applied route: transition one landed, transition two did not.
+  defp advance_to_triaged(story) do
+    as_tenant(story.tenant_id, fn ->
+      {:ok, _row} =
+        Stages.advance(story.tenant_id, story.id, {:detected, :triaged, :forward},
+          claim_epoch: story.claim_epoch,
+          actor_label: "test"
+        )
+    end)
+  end
+
   defp as_tenant(tenant_id, fun) do
     {:ok, result} = Repo.with_tenant(tenant_id, fun)
     result
@@ -231,6 +266,152 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
 
       assert [%{"description" => "The total<U+200D> reconciles"}] =
                drafted_story.acceptance_criteria
+    end
+
+    test "a draft too big for the DISPATCH is escalated, and the stub row survives", ctx_free do
+      _ = ctx_free
+      %{story: story, runner: runner, record: record} = session()
+      before = reload_story(story)
+
+      # SANITISING EXPANDS TEXT: one bidirectional mark becomes eight characters. So a title
+      # inside the wire's 200 can land outside the 200 the DISPATCH judges the stored title
+      # against (`ImplementerInput.violations/1`), and a story queued in that state is refused
+      # by every placement for ever with nothing to move it. Escalated instead, a person sees
+      # it — and the stub row, which is the only usable thing on it, is left alone.
+      oversize = String.duplicate("\u202E", 40) <> String.duplicate("a", 160)
+
+      drafted = %{
+        outcome: "story",
+        confidence: "high",
+        story: %{title: oversize, description: "d", acceptance_criteria: ["c"]}
+      }
+
+      assert {:ok, _} =
+               TriageVerdict.apply(story.tenant_id, runner.id, verdict_message(record, drafted))
+
+      assert stage_of(story) == :escalated
+      assert reload_story(story).title == before.title
+    end
+
+    test "an EMPTY drafted title is escalated too, rather than blanking the stub" do
+      %{story: story, runner: runner, record: record} = session()
+      before = reload_story(story)
+
+      # The draft schema sets no `minLength` on the title and no `minItems` on the criteria, so
+      # this casts happily. Written, it would destroy `TriageTrigger`'s stub — the repository
+      # and issue number that are the only way to tell what the story is — and then queue a
+      # story no placement can dispatch.
+      drafted = %{
+        outcome: "story",
+        confidence: "high",
+        story: %{title: "", description: "", acceptance_criteria: []}
+      }
+
+      assert {:ok, _} =
+               TriageVerdict.apply(story.tenant_id, runner.id, verdict_message(record, drafted))
+
+      assert stage_of(story) == :escalated
+      assert reload_story(story).title == before.title
+    end
+
+    test "a verdict whose claim was RECLAIMED writes nothing at all" do
+      %{story: story, runner: runner, record: record} = session()
+      before = reload_story(story)
+
+      # `epoch_matches/2` compares the message against the DISPATCH record's epoch, which never
+      # moves; the fence that reads the story's own epoch lives inside `Stages.advance/4`,
+      # after the draft. So a zombie session whose claim was reclaimed got past the first check
+      # and overwrote a story a newer claim owns, and the advance then rolled back — leaving
+      # the stale draft on the row.
+      bump_story_epoch(story)
+
+      assert {:error, :stale_claim_epoch} =
+               TriageVerdict.apply(
+                 story.tenant_id,
+                 runner.id,
+                 verdict_message(record, %{
+                   outcome: "story",
+                   confidence: "high",
+                   story: %{title: "A newer claim owns this", description: "d"}
+                 })
+               )
+
+      assert reload_story(story).title == before.title
+    end
+
+    test "a resend AFTER the story moved on does not rewrite the row" do
+      %{story: story, runner: runner, record: record} = session()
+
+      drafted = %{
+        outcome: "story",
+        confidence: "high",
+        story: %{title: "The drafted title", description: "d", acceptance_criteria: ["c"]}
+      }
+
+      message = verdict_message(record, drafted)
+      assert {:ok, %{replayed?: false}} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+      assert stage_of(story) == :queued
+
+      # An operator corrects the story — the ordinary reason a title changes after triage —
+      # and then a duplicate frame arrives from a socket that was still draining, which is the
+      # case `raced/6` exists for. Applying the draft again silently reverts the correction and
+      # writes a second audit row saying triage drafted a story nothing re-drafted.
+      correct_title(story, "A human corrected this")
+
+      assert {:ok, %{replayed?: true}} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+      assert reload_story(story).title == "A human corrected this"
+    end
+
+    test "a route that landed HALFWAY is completed by the resend, not reported as done" do
+      %{story: story, runner: runner, record: record} = session()
+
+      drafted = %{
+        outcome: "story",
+        confidence: "high",
+        story: %{title: "Halfway", description: "d", acceptance_criteria: ["c"]}
+      }
+
+      message = verdict_message(record, drafted)
+
+      # THE STATE THE SECOND TRANSITION MAKES REACHABLE: the two advances are separate
+      # transactions, so a lock timeout, a chain-append failure or a node death between them
+      # leaves the row at `triaged`. Every resend used to re-attempt transition ONE, get
+      # `stale_stage`, return before transition TWO was tried, and answer `ok` — and nothing in
+      # `lib/` selects `triaged`, so the story was dead exactly where this module exists to
+      # stop it being dead.
+      advance_to_triaged(story)
+      assert stage_of(story) == :triaged
+
+      assert {:ok, _} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+      assert stage_of(story) == :queued
+    end
+
+    test "the draft's dispatch-only fields are kept on the story's metadata" do
+      %{story: story, runner: runner, record: record} = session()
+
+      drafted = %{
+        outcome: "story",
+        confidence: "high",
+        story: %{
+          title: "Keep the options",
+          description: "d",
+          acceptance_criteria: ["c"],
+          test_cases: ["A visit of 7 minutes bills one unit"],
+          touches: ["lib/home_care_billing/billing/visit.ex"],
+          domain_reference: "docs/architecture/timesheets.md"
+        }
+      }
+
+      assert {:ok, _} =
+               TriageVerdict.apply(story.tenant_id, runner.id, verdict_message(record, drafted))
+
+      # The story row has no columns for these and `ImplementerInput.story_object/2` takes all
+      # three as OPTIONS, so they belong to a dispatch rather than to the story — but dropping
+      # them told the session nothing and lost what it wrote.
+      assert %{"triage_draft" => kept} = reload_story(story).metadata
+      assert kept["test_cases"] == ["A visit of 7 minutes bills one unit"]
+      assert kept["touches"] == ["lib/home_care_billing/billing/visit.ex"]
+      assert kept["domain_reference"] == "docs/architecture/timesheets.md"
     end
 
     test "an escalation leaves the stub row exactly as it was" do

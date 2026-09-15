@@ -76,7 +76,12 @@ All notable changes to loopctl are documented here.
   reporter text and lands in a field a runner builds its prompt from. Ordinary prose is NOT
   touched — a draft saying "ignore previous instructions" is stored verbatim, since that is a
   semantic attack for the triage trio to catch and mangling prose would corrupt real stories.
-  An escalation or a rejection drafts nothing.
+  An escalation or a rejection drafts nothing, and a draft loopctl could not DISPATCH — one
+  whose sanitised title exceeds the cap the stored story is judged against, or one whose title
+  is empty — is ESCALATED rather than queued, leaving the stub row intact. The draft's
+  `test_cases`, `touches` and `domain_reference` are kept under `metadata["triage_draft"]`:
+  the story row has no columns for them and they are dispatch options, but dropping them lost
+  what a session wrote.
 
 - **The unattended dispatch driver, OFF by default (#803).** `Loopctl.Delivery.DispatchDriver`
   plus `Loopctl.Workers.DispatchDriverWorker`, scheduled every minute: it selects stage rows at
