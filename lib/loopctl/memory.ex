@@ -64,6 +64,7 @@ defmodule Loopctl.Memory do
   alias Loopctl.Knowledge.RankingPriors
   alias Loopctl.Knowledge.VectorSearch
   alias Loopctl.Llm.ProviderError
+  alias Loopctl.Memory.AnswerConfidence
   alias Loopctl.Memory.Memory, as: MemorySchema
   alias Loopctl.Memory.MemoryEmbedding
   alias Loopctl.Memory.PromotionTelemetry
@@ -1436,7 +1437,11 @@ defmodule Loopctl.Memory do
           degraded?: boolean(),              # knowledge errored/fell back OR memory did not run
           degraded_reason: String.t() | nil, # bounded tag naming why (nil when healthy)
           search_mode: String.t() | nil,     # lane the reported half served (nil = none)
-          results_ranking: String.t()        # "heuristic_cross_source" (see KNOWN BIAS)
+          results_ranking: String.t(),       # "heuristic_cross_source" (see KNOWN BIAS)
+          provenance: :curated | :retrieved | nil,  # the knowledge half's resolver decision
+          confidence: float() | nil,         # its absolute confidence in the top row
+          answer_confidence: :answer | :weak | :none,  # ARE these answers (#742)
+          importance_strength: float() | nil # the usage prior in force on the knowledge half
         }
       }
 
@@ -1677,7 +1682,22 @@ defmodule Loopctl.Memory do
         # cross-source heuristic and no prior touches it — and it is taken from the
         # knowledge envelope rather than re-resolved here, so there is one origin for the
         # number. `nil` when the knowledge half degraded before it ranked anything.
-        importance_strength: Map.get(knowledge_env.meta, :importance_strength)
+        importance_strength: Map.get(knowledge_env.meta, :importance_strength),
+        # --- Is this an ANSWER, or the nearest thing to one? (#742) ---------------------
+        # Semantic search has no no-answer mode: a procedural turn with nothing relevant
+        # in the corpus still gets three nearest neighbours back, ranked, with scores.
+        # Every client then re-derives its own floor to tell those apart — and the one
+        # that did measured REAL tops at 0.372-0.600 against JUNK tops at 0.005-0.456, a
+        # band that overlaps, so the constant was wrong in both directions at once. It was
+        # removed and the judgement handed to the reading agent.
+        #
+        # This is the same judgement made where the information actually is. Lifted, not
+        # recomputed: `provenance` and `confidence` are the hybrid resolver's own decision,
+        # already made on this pool, and re-deriving them here would be a second opinion
+        # that can disagree with the first.
+        provenance: Map.get(knowledge_env.meta, :provenance),
+        confidence: Map.get(knowledge_env.meta, :confidence),
+        answer_confidence: AnswerConfidence.verdict(knowledge_env, merged)
       }
     }
   end

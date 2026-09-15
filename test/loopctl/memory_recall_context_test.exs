@@ -334,6 +334,109 @@ defmodule Loopctl.MemoryRecallContextTest do
     do:
       envelope(%{total_count: 0, degraded?: true, fallback: true, fallback_reason: "bad_request"})
 
+  describe "recall_context/2 - is this an ANSWER, or the nearest thing to one? (#742)" do
+    test "an empty knowledge half is :none, never :weak" do
+      # The distinction a caller cannot make from a score list: nothing came back, versus
+      # something came back weakly. Semantic search has no no-answer mode, so a client that
+      # cannot tell these apart paraphrases silence as an answer.
+      scope = %Scope{
+        tenant_id: fixture(:tenant).id,
+        subject_id: "empty-#{System.unique_integer([:positive])}",
+        project_id: nil
+      }
+
+      result = Memory.recall_context(scope, query: "nothing here at all", limit: 5)
+
+      assert result.meta.answer_confidence == :none
+      assert Enum.filter(result.results, &(&1.source == :knowledge)) == []
+    end
+
+    test "A MEMORY ROW CANNOT MAKE IT AN ANSWER, which is the defect this shape had", ctx do
+      # THE HIGH FINDING, pinned. The first version judged over `memory ++ knowledge`, the
+      # exact pool `meta.results_ranking: "heuristic_cross_source"` warns is not calibrated:
+      # memory is raw cosine with a high floor (~0.3-0.8 for anything), a keyword-only
+      # knowledge row is `raw/(raw+1)` of ts_rank_cd (~0.02-0.2). A loosely-related memory
+      # against a flat knowledge field is a ratio of ten and read `:answer` by construction.
+      #
+      # Memory rows are the agent's OWN prior statements; "is this an answer" is a different
+      # question there, and answering it on one number across both scales was the error.
+      mem(ctx.scope, ctx.project.id, "reshipment for delayed orders remembered verbatim")
+
+      for n <- 1..3 do
+        article(ctx.tenant.id, ctx.project.id, "unrelated inventory note #{n}")
+      end
+
+      result = Memory.recall_context(ctx.scope, query: "reshipment", limit: 10)
+
+      assert Enum.any?(result.results, &(&1.source == :memory)),
+             "the memory row must be in the merged list, or this proves nothing"
+
+      # Whatever the knowledge half deserves, the MEMORY row must not be what earns it.
+      knowledge_rows = Enum.filter(result.results, &(&1.source == :knowledge))
+
+      without_memory =
+        Memory.recall_context(
+          Map.put(ctx.scope, :subject_id, "no-mem-#{System.unique_integer([:positive])}"),
+          query: "reshipment",
+          limit: 10
+        )
+
+      assert result.meta.answer_confidence == without_memory.meta.answer_confidence,
+             "the verdict changed when a memory row was present, so it is still reading " <>
+               "across two scales (knowledge rows: #{length(knowledge_rows)})"
+    end
+
+    test "a DEGRADED pool where half the field scored nothing is not an answer", ctx do
+      # The worst finding of the round. A median of zero was read as "the field behind the
+      # top is empty" when it means "half the field scored zero" — and during an embedding
+      # outage BOTH halves degrade together, so the single most degraded response the
+      # endpoint can produce shipped the strongest possible verdict.
+      for n <- 1..4 do
+        article(ctx.tenant.id, ctx.project.id, "degraded pool filler #{n}")
+      end
+
+      result = Memory.recall_context(ctx.scope, query: "filler", limit: 10)
+
+      # Whatever else is true, a pool this flat is never an answer.
+      assert result.meta.answer_confidence in [:weak, :none]
+    end
+
+    test "the merged meta lifts provenance and confidence from the knowledge half", ctx do
+      article(ctx.tenant.id, ctx.project.id, "reshipment for delayed orders")
+
+      result = Memory.recall_context(ctx.scope, query: "reshipment", limit: 5)
+      knowledge_meta = result.knowledge.meta
+
+      # ASSERTED AGAINST THE SOURCE, not merely present. `Map.has_key?` could not fail —
+      # the key is always written, so replacing the lift with a literal nil left it green,
+      # which the review demonstrated with the mutation.
+      assert result.meta.provenance == Map.get(knowledge_meta, :provenance)
+      assert result.meta.confidence == Map.get(knowledge_meta, :confidence)
+    end
+
+    test "the verdict describes the ROWS RETURNED, not the over-fetched pool", ctx do
+      # It used to be taken over `limit * over_fetch` candidates, so it described rows the
+      # caller never sees AND moved with `limit` — while the docstring claimed it did not.
+      for n <- 1..6 do
+        article(ctx.tenant.id, ctx.project.id, "reshipment variant #{n}")
+      end
+
+      small = Memory.recall_context(ctx.scope, query: "reshipment", limit: 2)
+      large = Memory.recall_context(ctx.scope, query: "reshipment", limit: 8)
+
+      # Not an equality assertion on the verdicts — a longer list genuinely can contain a
+      # different field. What must hold is that each verdict is about ITS OWN returned rows.
+      for result <- [small, large] do
+        knowledge_rows = Enum.filter(result.results, &(&1.source == :knowledge))
+
+        case result.meta.answer_confidence do
+          :none -> assert knowledge_rows == []
+          _other -> assert knowledge_rows != []
+        end
+      end
+    end
+  end
+
   describe "recall_context/2 - overall merged limit" do
     test "clamps the merged, re-ranked list to `limit`", ctx do
       for i <- 1..4, do: mem(ctx.scope, ctx.project.id, "reshipment memory #{i}")

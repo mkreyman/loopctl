@@ -4437,6 +4437,47 @@ defmodule Loopctl.ApiSpec.Schemas do
                   "order mixes memory's absolute cosine with knowledge's pool-normalized " <>
                   "score and is NOT a calibrated cross-source ranking."
             },
+            provenance: %Schema{
+              type: :string,
+              enum: ["curated", "retrieved"],
+              nullable: true,
+              description:
+                "Whether the knowledge half was answered by a GOVERNED curated article " <>
+                  "(`curated`) or by a fuzzy best match (`retrieved`). The hybrid " <>
+                  "resolver's own decision on this pool, lifted rather than recomputed. " <>
+                  "`null` WHENEVER THE CURATED LANE DID NOT RUN — which includes every " <>
+                  "keyword-only fallback, a fully ranked response. So `null` means `this " <>
+                  "was not resolved`, NOT `nothing was ranked`: read `search_mode` and " <>
+                  "`degraded_reason` for why, and note that a governed curated article is " <>
+                  "invisible on that path, so `answer_confidence` falls through to " <>
+                  "separation with no curated short-circuit available."
+            },
+            confidence: %Schema{
+              type: :number,
+              nullable: true,
+              description:
+                "The resolver's absolute confidence in the top knowledge result. Use " <>
+                  "`answer_confidence` to decide whether these are answers; this number " <>
+                  "is for comparing two responses, not for thresholding."
+            },
+            answer_confidence: %Schema{
+              type: :string,
+              enum: ["answer", "weak", "none"],
+              nullable: true,
+              description:
+                "WHETHER THESE ARE ANSWERS AT ALL. Semantic search has no no-answer mode, " <>
+                  "so a query with nothing relevant in the corpus still returns its " <>
+                  "nearest neighbours, ranked and scored. `answer` means the top result " <>
+                  "stands apart from the field (or a governed curated article won); " <>
+                  "`weak` means these are nearest neighbours, not answers; `none` means " <>
+                  "the corpus returned nothing. Judged against THIS query's own pool, " <>
+                  "never a constant — a fixed floor goes stale whenever fusion, the " <>
+                  "embedding model or the corpus size changes, which has happened once " <>
+                  "already. Do not re-derive your own threshold from `confidence`. It " <>
+                  "describes the KNOWLEDGE half only, as `provenance` and `confidence` do: " <>
+                  "`none` means the knowledge half returned nothing, and a recall whose " <>
+                  "memory half answered still reads `none` when the corpus did not."
+            },
             importance_strength: %Schema{
               type: :number,
               nullable: true,

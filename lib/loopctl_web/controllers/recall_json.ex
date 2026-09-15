@@ -130,7 +130,17 @@ defmodule LoopctlWeb.RecallJSON do
       search_mode: meta.search_mode,
       # Stable tag warning that the merged `data` order is a cross-source heuristic
       # (memory absolute cosine vs knowledge pool-normalized), NOT calibrated relevance.
-      results_ranking: meta.results_ranking
+      results_ranking: meta.results_ranking,
+      # --- Is this an answer, or the nearest thing to one? (#742) ---------------------
+      # `results_ranking` above warns that the ORDER is not calibrated. These say whether
+      # the thing at the top of it is an answer at all — which no score on this response
+      # could tell a reader, because a bare 0..1 number has no absolute meaning and every
+      # client that tried to give it one had to invent a floor that went stale.
+      provenance: meta[:provenance] && to_string(meta[:provenance]),
+      confidence: meta[:confidence],
+      # `answer` / `weak` / `none`. Judged against this query's own pool rather than a
+      # constant, so it survives a change of fusion, embedding model or corpus size.
+      answer_confidence: meta[:answer_confidence] && to_string(meta[:answer_confidence])
     }
     # The uniform tool-outcome classification (`LoopctlWeb.Outcome`), derived from the
     # keys immediately above and the MERGED `total_count` — so it describes the whole
