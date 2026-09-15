@@ -41,6 +41,17 @@ All notable changes to loopctl are documented here.
   the lens prompts asked for "one plain sentence per reason", and neither code could fire at
   all. Both the runner session and the claude-config session asked for this independently.
 
+  **What it does NOT mean, stated because the first draft of the published description
+  overstated it:** a triage verdict's `escalation_reasons` gate nothing today —
+  `TriageVerdict` records the field and routes on `outcome` alone, and the gate's input is a
+  `trio_outputs` fact supplied to `POST /stories/:id/merge-precondition`. The two shapes do
+  not correspond yet (three outputs keyed `verdict` with a numeric confidence, against one
+  message keyed `outcome` with an enum), so the list is published to be EMITTED against and
+  the wiring is a change that must reconcile them. An escalate verdict must also now carry at
+  least one entry that is NOT a code: publishing the vocabulary made a bare code satisfy the
+  "an escalation must carry something" guard, and a classification is not words a person can
+  act on.
+
   Published as a LIST rather than an enum on the field, deliberately: `escalation_reasons` is
   also where a lens says what it actually saw, and an enum would refuse the sentence that
   makes an escalation actionable. Validate the gating entries against the list; the rest of
@@ -103,6 +114,69 @@ All notable changes to loopctl are documented here.
   caught that one.
 
 ### Added
+
+- **The delivery loop is reachable from a session: `place_dispatch`, `story_stage`,
+  `resolve_escalation` (#803, #850).** Three MCP tools and the two endpoints two of them
+  needed. The placement endpoint shipped with #842 and NO tool called it — and `curl` at
+  loopctl is refused by the fleet's own guardrail — so the only way to place a dispatch was a
+  shell on the production node. That is the same defect as `place/4` shipping with no caller,
+  failing one layer later.
+
+  New: **`GET /api/v1/stories/:id/stage`** (any authenticated key) returns where a story is in
+  the delivery machine — stage, `claim_epoch`, `lock_version`, `attempts`, the runner holding
+  it, the escalation reason. Nothing on the API returned a stage before, so an operator could
+  not watch a run and a runner refused `stale_stage` could only guess which transition now
+  applies. **`POST /api/v1/stories/:id/stage/resolve`** (`role: :user`, human-anchored) moves
+  an escalated story to `queued`, `done` or `failed` over `:human_resolution` — the edge the
+  machine reserves for a person, which nothing in `lib/` or on the API could take, so a story
+  a session parked stayed parked for ever. An agent key is 403'd: the principal that raises an
+  escalation may not clear it.
+
+  **`place_dispatch` needs only a story and a runner.** `RunnerDispatch` requires `repo`,
+  `branch`, `base_branch` and both budgets and `cast_dispatch/1` applies no defaults — and
+  that cast is the FIRST step of the push, which runs after the claim and two immutable chain
+  entries, so a caller that omitted one paid for all of it and got a 422.
+  `Loopctl.Delivery.DispatchPayload` fills each from loopctl's own records: the repository and
+  its base branch from the project's intake source, the branch from the story, the budgets
+  from the operator's configuration. A value the caller passes always wins. An unset budget is
+  now a 409 naming the key, refused before anything is minted.
+
+  **Resolving a story to `queued` makes it PLACEABLE**, not just re-staged: escalating does
+  not release the claim, so the story stayed assigned to the stopped session at
+  `:implementing` while its row said `queued` — and `Placement.claimable/2` wants `contracted`
+  AND `queued`, so nothing would have taken a story an operator had deliberately re-queued.
+  The claim is released and the story re-contracted, and the transition is fenced on the epoch
+  that release produced.
+
+  **A rule now governs this**, in `CLAUDE.md`: an operator-facing endpoint is not done until an
+  MCP tool calls it, in the same PR.
+
+- **An accepted triage verdict writes the story and QUEUES it (#803).** This is the join the
+  loop was missing: `Loopctl.Delivery.TriageVerdict`'s `story` route was empty, so an accepted
+  verdict left the story at `triaged` — and nothing in `lib/` wrote `triaged -> queued`, while
+  the dispatch driver selects stage rows at `queued`. The loop therefore had no continuation
+  at all: intake promoted a story, triage accepted it, and it stopped one stage short of the
+  only thing that could pick it up. An accepted verdict now replaces the stub row
+  (`TriageTrigger` writes loopctl's own facts — a repository and an issue number — precisely
+  so the reporter's title never wears a story's clothes, and its comment already said "triage
+  replaces this with the drafted title") with the drafted title, description and acceptance
+  criteria, and then advances to `queued`.
+
+  **Every drafted string is sanitised first** (`Loopctl.Delivery.Untrusted.sanitise/1`, new):
+  bidirectional overrides, zero-width characters, Unicode TAG runs and controls become visible
+  `<U+XXXX>` escapes, because a drafted title is composed by a session that has just read
+  reporter text and lands in a field a runner builds its prompt from. Ordinary prose is NOT
+  touched — a draft saying "ignore previous instructions" is stored verbatim, since that is a
+  semantic attack for the triage trio to catch and mangling prose would corrupt real stories.
+  An escalation or a rejection drafts nothing, and a draft loopctl could not DISPATCH — one
+  whose sanitised title exceeds the cap the stored story is judged against, one whose title is
+  empty, or one stating no acceptance criteria — is ESCALATED rather than queued, leaving the
+  stub row intact. A half-applied route (the first transition committed, the second not) is
+  COMPLETED by the resend, including after a claim reclaim, rather than reported as a clean
+  run: nothing else in `lib/` writes `triaged -> queued`, so a story stranded there was dead. The draft's
+  `test_cases`, `touches` and `domain_reference` are kept under `metadata["triage_draft"]`:
+  the story row has no columns for them and they are dispatch options, but dropping them lost
+  what a session wrote.
 
 - **A placed dispatch carries the STORY, built server-side (#803).** `Placement.place/4` now
   builds the `implement` dispatch's `story` object from loopctl's own rows

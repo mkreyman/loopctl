@@ -869,7 +869,7 @@
           ]
         },
         "escalation_reasons": {
-          "description": "Why this needs a human. Meaningful when `outcome` is `escalate`. FREE-FORM by design — a sentence saying what a lens actually saw is what makes an escalation actionable — but the entries in `x-connection.triage_gating_reasons` are GATING CODES matched as whole strings by the control-side gate that decides whether a human is asked. Emit those verbatim, as their own entries, and put prose in other entries: a reworded gating code does not gate, and nothing anywhere reports that it failed to. A code NOT on that list is recorded and never gates.",
+          "description": "Why this needs a human. Meaningful when `outcome` is `escalate`. FREE-FORM: a sentence saying what a lens actually saw is what makes an escalation actionable, and at least one entry must be prose — a bare code is not words a person can act on. WHAT LOOPCTL DOES WITH THIS FIELD TODAY: it records it verbatim on the verdict and routes on `outcome` ALONE. No string here changes what happens to the story. The codes in `x-connection.triage_gating_reasons` are matched as whole strings by a control-side gate that today reads a trio's outputs supplied to `POST /stories/:id/merge-precondition`, NOT this message — so emit them verbatim as their own entries to be ready for the day a runner's verdict is what feeds that gate, and do not read them as gating from here yet.",
           "items": {
             "maxLength": 150,
             "type": "string"
@@ -1062,7 +1062,7 @@
               ]
             },
             "escalation_reasons": {
-              "description": "Why this needs a human. Meaningful when `outcome` is `escalate`. FREE-FORM by design — a sentence saying what a lens actually saw is what makes an escalation actionable — but the entries in `x-connection.triage_gating_reasons` are GATING CODES matched as whole strings by the control-side gate that decides whether a human is asked. Emit those verbatim, as their own entries, and put prose in other entries: a reworded gating code does not gate, and nothing anywhere reports that it failed to. A code NOT on that list is recorded and never gates.",
+              "description": "Why this needs a human. Meaningful when `outcome` is `escalate`. FREE-FORM: a sentence saying what a lens actually saw is what makes an escalation actionable, and at least one entry must be prose — a bare code is not words a person can act on. WHAT LOOPCTL DOES WITH THIS FIELD TODAY: it records it verbatim on the verdict and routes on `outcome` ALONE. No string here changes what happens to the story. The codes in `x-connection.triage_gating_reasons` are matched as whole strings by a control-side gate that today reads a trio's outputs supplied to `POST /stories/:id/merge-precondition`, NOT this message — so emit them verbatim as their own entries to be ready for the day a runner's verdict is what feeds that gate, and do not read them as gating from here yet.",
               "items": {
                 "maxLength": 150,
                 "type": "string"

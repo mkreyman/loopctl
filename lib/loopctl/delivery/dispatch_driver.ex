@@ -73,6 +73,7 @@ defmodule Loopctl.Delivery.DispatchDriver do
   import Ecto.Query
 
   alias Loopctl.ApiSpec.RunnerContract
+  alias Loopctl.Delivery.DispatchPayload
   alias Loopctl.Delivery.Placement
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Intake
@@ -347,27 +348,24 @@ defmodule Loopctl.Delivery.DispatchDriver do
     end
   end
 
+  # THE SAME DERIVATION AN OPERATOR'S PLACEMENT MAKES — `Loopctl.Delivery.DispatchPayload` —
+  # so the branch this driver would have chosen and the one
+  # `POST /api/v1/runners/:runner_id/dispatches` chooses are one name rather than two copies
+  # of one convention. The budgets are passed rather than re-read: a pass reads them once, so
+  # every story it places spends against the same policy even if an operator changes it
+  # mid-pass.
   defp dispatch(story, source, budgets) do
     %{
       "dispatch_id" => Ecto.UUID.generate(),
       "story_id" => story.id,
       "kind" => @kind,
       "repo" => source.repo_full_name,
-      "branch" => branch_for(story),
+      "branch" => DispatchPayload.branch_for(story),
       "base_branch" => source.base_branch,
       "wall_clock_seconds" => budgets.wall_clock_seconds,
       "max_turns" => budgets.max_turns
     }
   end
-
-  # THE STORY ID IS IN THE BRANCH NAME because a story NUMBER is unique only within its
-  # project, and two projects may hold intake sources naming the SAME repository — nothing
-  # forbids it. Without the suffix, two different stories dispatched to one repository could
-  # be given one branch, and the second session would find the first's work already on it.
-  # Eight characters of the uuid, which is enough that a collision is not a thing that
-  # happens, and short enough to leave a branch name a person can read.
-  defp branch_for(%Story{} = story),
-    do: "feature/story-#{story.number}-#{String.slice(story.id, 0, 8)}"
 
   defp fetch_story(tenant_id, story_id) do
     {:ok, story} =

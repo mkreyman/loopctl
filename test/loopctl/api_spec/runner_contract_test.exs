@@ -35,6 +35,10 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     "free_disk_mb" => 5_000
   }
 
+  # The digest of the published document at the CURRENT version. Not a checksum of the file
+  # for its own sake: it is what makes the version string mean something, per the test below.
+  @digest "7eff32a9c294aecb135faa154ab514da3d0a58ffb487e95b89e043aaa1f7fb62"
+
   describe "the checked-in export" do
     test "matches the declarations — run `mix loopctl.runner_contract` if this fails" do
       path = Path.join(File.cwd!(), RunnerContract.export_path())
@@ -243,6 +247,37 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
       assert kind["type"] == "string"
       refute Enum.member?(kind["enum"], nil)
+    end
+
+    test "the PUBLISHED CONTENT cannot change without the version changing" do
+      # `supported_version/1` checks the MAJOR only, so a runner that vendored at 1.9.2 joins a
+      # server publishing 1.9.3 without complaint — the version STRING is the only staleness
+      # signal this contract has, and nothing bound it to the content. The export test's own
+      # failure message says "run `mix loopctl.runner_contract`", which walks an author
+      # straight past the bump: regenerate, green, merge, and every vendored copy is silently
+      # behind.
+      #
+      # So the digest is pinned PER VERSION. Changing what is published now fails here until
+      # the version moves with it, and moving the version means writing the row in the table
+      # that tells a runner whether to re-vendor.
+      digest =
+        :sha256
+        |> :crypto.hash(RunnerContract.encoded_json_schema())
+        |> Base.encode16(case: :lower)
+
+      assert %{RunnerContract.version() => digest} == %{RunnerContract.version() => @digest},
+             """
+             The published contract changed without `@version` changing (or the version moved
+             and this digest did not).
+
+               version: #{RunnerContract.version()}
+               digest:  #{digest}
+               pinned:  #{@digest}
+
+             If the published SHAPE changed, bump `@version`, add its row to the table in the
+             moduledoc — saying whether a holder must RE-VENDOR — and update the digest here.
+             If only the version moved, update the digest.
+             """
     end
 
     test "uses only the JSON Schema keywords the runner's vendored validator implements" do
@@ -1682,6 +1717,41 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
       assert {:error, _} =
                RunnerContract.cast_triage_verdict_message(verdict_msg(%{"incomplete" => "bored"}))
+    end
+
+    test "an escalation of BARE CODES is refused: a code is not words a person can act on" do
+      # Publishing the gating vocabulary made this reachable. The guard exists so an escalation
+      # reaches a human with something to read; a verdict whose every reason is a gating code
+      # satisfies the letter of it and hands a person a classification. With five slots and
+      # three codes defined, a conforming runner still has room for the sentence.
+      codes = RunnerContract.gating_reason_codes()
+
+      assert {:error, {:invalid, messages}} =
+               RunnerContract.cast_triage_verdict(%{
+                 "outcome" => "escalate",
+                 "confidence" => "high",
+                 "escalation_reasons" => codes
+               })
+
+      assert Enum.any?(messages, &(&1 =~ "words a person can act on"))
+
+      # The same codes WITH a sentence beside them are fine — that is the shape the field's
+      # description asks for.
+      assert {:ok, _} =
+               RunnerContract.cast_triage_verdict(%{
+                 "outcome" => "escalate",
+                 "confidence" => "high",
+                 "escalation_reasons" => codes ++ ["the request flips a default #812 chose"]
+               })
+
+      # And so is a bare code beside `missing_information`, which is words by another name.
+      assert {:ok, _} =
+               RunnerContract.cast_triage_verdict(%{
+                 "outcome" => "escalate",
+                 "confidence" => "high",
+                 "escalation_reasons" => codes,
+                 "missing_information" => ["which of the two totals the reporter means"]
+               })
     end
 
     test "verdict_invalid is one of them, because a written-then-refused verdict is its own state" do

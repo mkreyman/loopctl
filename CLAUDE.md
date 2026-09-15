@@ -359,6 +359,67 @@ mix test --failed      # Re-run failed tests
 mix ecto.reset         # Drop, create, migrate
 ```
 
+## Merging: this repo's rules OVERRIDE delivery-loop step 5
+
+Mark's decisions, 2026-09-15, after a night of four sequential PRs. **These override the
+delivery loop's step 5 in `~/.claude/CLAUDE.md` where they differ** — that step says "use
+`gh pr update-branch` if behind", and for THIS repo that is now wrong, because the setting it
+was written for is off here. A subagent reads the fleet-wide file and may never reach this
+section, so a dispatch prompt that will merge must say so.
+
+**1. A green PR with no conflicts MERGES AS IT IS.** `master`'s protection has
+`required_status_checks.strict = false` — GitHub's "require branches to be up to date before
+merging", off. So a pull request whose required checks passed and which has no merge conflict
+is mergeable even when master has moved under it. **Do not run `gh pr update-branch`, and do
+not merge master into a branch, to clear a `BEHIND` state.** Read the required set when it
+matters rather than from a number here:
+
+    gh api repos/:owner/:repo/branches/master/protection/required_status_checks --jq .contexts
+
+Why: every update restarts the whole suite on a new head, and the required set takes minutes —
+five of its contexts run on the single self-hosted runner, the rest on `ubuntu-latest`. The
+saving is real but is not the whole of a PR's CI bill: review-fix pushes restart it too, and
+`ci.yml`'s `concurrency` group is keyed per REF with `cancel-in-progress` off for master, so a
+push cancels that branch's own in-flight run and never another PR's. Concurrent PRs do not
+cancel each other; do not serialise work on that belief.
+
+What `strict` bought against is narrow — a SEMANTIC conflict git cannot see, where two changes
+are each green against the old base and broken together — and that risk now sits with master's
+own post-merge run, which gates the deploy (`deploy` needs lint, test, security, dialyzer,
+pgbouncer-e2e, retrieval-eval and the smoke preflight). **What would overturn this:** master
+breaking repeatedly on combinations no single PR could have caught. Say so with the failures
+that prove it.
+
+A TEXTUAL conflict is a different thing and still stops a merge: the PR reads `DIRTY`, no CI
+runs on it at all (`ci.yml` triggers on `pull_request`, and GitHub raises no such event for a
+conflicting PR), and you merge master INTO the branch to resolve it. Never a rebase or a force
+push onto a shared branch — `~/.claude/CLAUDE.md`'s delivery loop deny-lists both.
+
+**2. Arm auto-merge once the review round is done**, never before: `--auto` on an unreviewed PR
+ships an unreviewed change, and the round is the gate.
+
+    gh pr merge <n> --squash --auto --delete-branch    # while checks are still running
+    gh pr merge <n> --squash --delete-branch           # when it is already green
+
+The second form is not a fallback to reach for after an error — it is the same decision for a
+PR whose checks have already settled, which is common because a review round takes minutes and
+so do the checks.
+
+**ARMING IT IS NOT FINISHING IT.** Auto-merge hands the merge to GitHub, and the rest of step 5
+still belongs to this session: come back to `git checkout master && git pull && git fetch
+--prune`, delete the local branch (`bin/delete-merged-branch.sh`), remove the worktree if there
+was one. And CHECK THAT IT LANDED before you report it: an armed PR that goes `DIRTY` when
+another lands first sits armed and unmerged for ever, and `--auto` makes that look like
+patience. `gh pr view <n> --json state` is the whole check.
+
+**3. Cut every branch from master as it is now** — `git checkout master && git pull` first.
+Stacking on another feature branch is the thing to avoid: its commits appear in your PR's own
+diff, so a reviewer reads two changes as one, and the second PR conflicts the moment the first
+merges. A cut from a merely STALE master does not do that — GitHub diffs against the merge
+base, so only your commits appear — what it costs is a textual conflict on a shared file
+(`CHANGELOG.md`, every time) and a combination nobody built until master built it. Stack
+deliberately when a change genuinely depends on an unmerged one, and say so in the PR body.
+
 ## Dialyzer Conventions
 
 - **Never use `@dialyzer` module attributes** to suppress warnings
@@ -403,6 +464,37 @@ The narrow exception is a cited config value that explains a BEHAVIOR, not a
 tally — e.g. AdminRepo's 3-connection pool (`config/runtime.exs:190`), which is
 *why* a heavy read starves the admin pool. Cite it at `file:line` so it can be
 re-checked.
+
+### An operator-facing endpoint is NOT DONE until an MCP tool calls it
+
+Mark, 2026-09-15: *"loopctl should be given the instruction to update its mcp as part of this
+development."* The tool ships in the SAME PR as the endpoint, not in a follow-up.
+
+This is not tidiness, it is reachability. **The MCP server is how every session on this fleet
+reaches loopctl, and it is the only way**: `claude-config`'s `hooks/orchestrator-guardrail.sh`
+refuses `curl` carrying `loopctl.com` or a `LOOPCTL_*_KEY` from any session, deliberately, and
+that guard is staying. An endpoint with no tool is reachable by exactly one thing — a human
+with `iex` on the production node.
+
+The case, and it is the same defect twice one layer apart. `Placement.place/4` shipped with
+#833 and had no caller, so the delivery loop's first end-to-end run went out by production
+RPC. #842 gave it an endpoint. Then the ENDPOINT shipped with no MCP tool, so the session
+orchestrating the loop — holding the story id, the runner id and the runner's free slots from
+`runner_pool` — still could not place a dispatch. A trigger nobody outside the app can pull is
+a function nobody calls, failing one layer later.
+
+So, for any endpoint an operator, an orchestrator or an agent is meant to use:
+
+- add the tool in `mcp-server/` (a `lib/` module with the request shape, a declaration and a
+  `case` in `index.js`, a row in `mcp-server/README.md`) in the same change;
+- pin the wiring in a test — a tool declared and not dispatched, or dispatched and not
+  declared, is the same invisible gap inside the MCP server (see
+  `test/delivery_loop_tools.test.js`);
+- say in the tool description what the endpoint REFUSES and which key it needs. A session
+  reads that description instead of the controller.
+
+Internal endpoints a machine calls — the runner socket, webhooks — are exempt: their caller is
+the machine, and it already exists.
 
 ### Doc hygiene: ALWAYS document a new env var or API constraint
 
