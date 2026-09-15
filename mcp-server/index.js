@@ -150,12 +150,21 @@ function cachedClientContextHeader() {
   return clientContextHeaderCache;
 }
 
-async function apiCall(method, path, body, keyOverride, { exactKey = false, timeoutMs } = {}) {
+async function apiCall(
+  method,
+  path,
+  body,
+  keyOverride,
+  { exactKey = false, timeoutMs, keyHint } = {},
+) {
   const url = `${getBaseUrl()}${path}`;
   // Secret-managing tools pass exactKey:true so the request uses the EXACT
   // role-pinned key (LOOPCTL_USER_KEY) and does NOT fall back to the global
   // LOOPCTL_API_KEY override — a secret op must never silently run under a
-  // non-user global key (review #12).
+  // non-user global key (review #12). `exact_role`-gated CUSTODY actions pass it
+  // for the same reason one layer over: a global key of any other role is 403'd
+  // by that gate, and the 403 reads as the story being unverifiable rather than
+  // the key being the wrong one.
   const key = exactKey ? keyOverride : resolveKey(keyOverride);
 
   if (!key) {
@@ -163,7 +172,12 @@ async function apiCall(method, path, body, keyOverride, { exactKey = false, time
       error: true,
       status: 0,
       body: exactKey
-        ? "No user-role API key configured. Set LOOPCTL_USER_KEY to a user-role key to manage LLM configuration."
+        ? // `keyHint` names the env var THIS site is pinned to. Without it the message
+          // below talks about LLM configuration, which is right for set_llm_config and
+          // actively misleading for a custody verb that is missing its orchestrator key.
+          keyHint
+          ? `No ${keyHint} configured. This tool is pinned to that exact key: LOOPCTL_API_KEY is deliberately not a fallback for it, because a global key of the wrong role is refused by the endpoint's gate.`
+          : "No user-role API key configured. Set LOOPCTL_USER_KEY to a user-role key to manage LLM configuration."
         : "No API key configured. Set LOOPCTL_API_KEY, LOOPCTL_ORCH_KEY, or LOOPCTL_AGENT_KEY.",
     };
   }
@@ -1251,7 +1265,13 @@ async function verifyStory({ story_id, summary, review_type, claim }) {
     "POST",
     `/api/v1/stories/${story_id}/verify`,
     body,
-    process.env.LOOPCTL_ORCH_KEY
+    process.env.LOOPCTL_ORCH_KEY,
+    // EXACT KEY. The endpoint is `exact_role: :orchestrator`, so a global
+    // LOOPCTL_API_KEY of ANY other role — user and superadmin included — is 403'd
+    // by that gate. Let `resolveKey` prefer it and the request goes out under the
+    // wrong principal and comes back with a 403 that reads as a custody refusal
+    // about the STORY rather than a misconfigured key.
+    { exactKey: true, keyHint: "LOOPCTL_ORCH_KEY" },
   );
   return toContent(result);
 }
@@ -1261,7 +1281,13 @@ async function rejectStory({ story_id, reason }) {
     "POST",
     `/api/v1/stories/${story_id}/reject`,
     { reason },
-    process.env.LOOPCTL_ORCH_KEY
+    process.env.LOOPCTL_ORCH_KEY,
+    // EXACT KEY. The endpoint is `exact_role: :orchestrator`, so a global
+    // LOOPCTL_API_KEY of ANY other role — user and superadmin included — is 403'd
+    // by that gate. Let `resolveKey` prefer it and the request goes out under the
+    // wrong principal and comes back with a 403 that reads as a custody refusal
+    // about the STORY rather than a misconfigured key.
+    { exactKey: true, keyHint: "LOOPCTL_ORCH_KEY" },
   );
   return toContent(result);
 }
@@ -1274,7 +1300,13 @@ async function bulkMarkComplete({ stories }) {
     "POST",
     "/api/v1/stories/bulk/mark-complete",
     { stories },
-    process.env.LOOPCTL_ORCH_KEY
+    process.env.LOOPCTL_ORCH_KEY,
+    // EXACT KEY. The endpoint is `exact_role: :orchestrator`, so a global
+    // LOOPCTL_API_KEY of ANY other role — user and superadmin included — is 403'd
+    // by that gate. Let `resolveKey` prefer it and the request goes out under the
+    // wrong principal and comes back with a 403 that reads as a custody refusal
+    // about the STORY rather than a misconfigured key.
+    { exactKey: true, keyHint: "LOOPCTL_ORCH_KEY" },
   );
   return toContent(result);
 }
@@ -1284,7 +1316,13 @@ async function verifyAllInEpic({ epic_id, review_type, summary }) {
     "POST",
     `/api/v1/epics/${epic_id}/verify-all`,
     { review_type, summary },
-    process.env.LOOPCTL_ORCH_KEY
+    process.env.LOOPCTL_ORCH_KEY,
+    // EXACT KEY. The endpoint is `exact_role: :orchestrator`, so a global
+    // LOOPCTL_API_KEY of ANY other role — user and superadmin included — is 403'd
+    // by that gate. Let `resolveKey` prefer it and the request goes out under the
+    // wrong principal and comes back with a 403 that reads as a custody refusal
+    // about the STORY rather than a misconfigured key.
+    { exactKey: true, keyHint: "LOOPCTL_ORCH_KEY" },
   );
   return toContent(result);
 }
@@ -7766,25 +7804,38 @@ const TOOLS = [
     name: "force_unclaim_story",
     description:
       "TAKE A STORY BACK from the agent holding it (POST /api/v1/stories/:id/force-unclaim). " +
-      "Two things happen and the SECOND is usually why you are here: the story resets to " +
-      "`agent_status: pending` with `assigned_agent_id` cleared, AND its delivery stage row " +
+      "Two things happen: the story resets to `agent_status: pending` with " +
+      "`assigned_agent_id` cleared, AND — in the same transaction — its delivery stage row " +
       "follows the release back to `queued`.\n\n" +
-      "That second half is what makes the story PLACEABLE again. When a runner refuses a " +
-      "dispatch the story is left parked at `claimed`, and place_dispatch on it answers 409 " +
-      "`invalid_transition` — the stage machine has no edge out of `claimed` except the ones " +
-      "the holder takes, so nothing else frees it. The release requeues from any stage a claim " +
-      "holds (`claimed`, `worktree`, `implementing`, `reviewing`, `pr_open`, `ci`); a stage no " +
-      "claim holds keeps its stage and is rebound to the new claim epoch; `done` and `failed` " +
-      "are left alone. An ESCALATED story is not this tool's job — use resolve_escalation.\n\n" +
+      "IT FREES THE STAGE; IT DOES NOT MAKE THE STORY PLACEABLE. place_dispatch wants " +
+      "`agent_status: contracted` AND stage `queued` (`Placement.claimable/2`), and the " +
+      "release leaves the story at `pending`, whose only transition is `pending -> " +
+      "contracted`. Run place_dispatch straight after this one and you get back the IDENTICAL " +
+      "409 `invalid_transition`. THE REMEDY IS TWO STEPS, in this order: force_unclaim_story, " +
+      "then contract_story, then place_dispatch.\n\n" +
+      "WHEN TO REACH FOR IT. A story sitting at `claimed` with nobody on it is the residue of " +
+      "a compensation that did not complete — it is NOT what a refused dispatch normally " +
+      "leaves. Placement answers a runner's refusal INLINE by releasing the claim itself " +
+      "(`Placement.undo_claim/5`), and if that release fails the claim lease is a further " +
+      "backstop: `Progress.reclaim_expired_claim/3` releases over `:runner_lost` and requeues " +
+      "the stage, unattended, once `claimed_until` has passed. Use this tool to get the story " +
+      "back NOW rather than at lease expiry, or when both of those have left it held.\n\n" +
+      "The release requeues from any stage a claim holds (`claimed`, `worktree`, " +
+      "`implementing`, `reviewing`, `pr_open`, `ci`); a stage no claim holds keeps its stage " +
+      "and is rebound to the new claim epoch; `done` and `failed` are left alone. An ESCALATED " +
+      "story is not this tool's job — use resolve_escalation, which releases AND re-contracts " +
+      "for you, so a story it sends to `queued` really is placeable.\n\n" +
       "REFUSALS. Requires LOOPCTL_ORCH_KEY: the action is `exact_role: :orchestrator`, so a " +
       "user or superadmin key is 403'd like any other non-member and reaching for a " +
       "higher-privileged key does NOT get past it. The orchestrator key must also be LINKED TO " +
       "A REGISTERED AGENT — an unlinked one is refused 400 naming that — and the tenant must be " +
       "human-anchored (403 `custody_tier_required` otherwise). 404 for an unknown story, 429 " +
-      "when rate limited.\n\n" +
-      "It does NOT touch `verified_status`, and it is idempotent: run it on an " +
-      "already-pending story and the stage row is still rebound, which is the remedy for a row " +
-      "stranded by an older release. It takes no request body.",
+      "when rate limited. A `story_id` that is not a UUID is refused here, before any call.\n\n" +
+      "It does NOT touch `verified_status`, and it is safe to run twice: on an already-pending " +
+      "story the stage row is written only when it needs to be — a row STRANDED behind the " +
+      "story's claim epoch is rebound to it (the remedy for a row an older release left " +
+      "behind) and an in-flight row is requeued, while a row already at that epoch is left " +
+      "exactly as it is. It takes no request body.",
     inputSchema: {
       type: "object",
       properties: {

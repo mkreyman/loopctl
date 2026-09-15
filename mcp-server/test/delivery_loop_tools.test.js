@@ -93,15 +93,13 @@ describe("place_dispatch", () => {
 
   test("carries the overrides it WAS given, including the repository", async () => {
     // An override is for the case the derivation cannot serve: a project bound to two sources,
-    // or a deliberate branch. `triage` is dispatchable since contract 1.10.0 — and reaches
-    // only a runner that DECLARES the kind on join.
+    // or a deliberate branch. `kind` is NOT one of them — see the enum test below.
     const { calls, apiCall } = fakeApi();
 
     await placeDispatch(
       {
         story_id: STORY_ID,
         runner_id: RUNNER_ID,
-        kind: "triage",
         repo: "mkreyman/home_care_billing",
         branch: "feature/x",
         base_branch: "main",
@@ -111,12 +109,37 @@ describe("place_dispatch", () => {
       deps({ apiCall }),
     );
 
-    assert.equal(calls[0].body.kind, "triage");
+    assert.equal(calls[0].body.kind, "implement");
     assert.equal(calls[0].body.repo, "mkreyman/home_care_billing");
     assert.equal(calls[0].body.branch, "feature/x");
     assert.equal(calls[0].body.base_branch, "main");
     assert.equal(calls[0].body.wall_clock_seconds, 900);
     assert.equal(calls[0].body.max_turns, 30);
+  });
+
+  test("`kind` is declared `implement` and nothing else", () => {
+    // This test used to pass `kind: "triage"` and assert it was forwarded, on a comment
+    // saying triage became dispatchable in contract 1.10.0. It did — from
+    // `Loopctl.Delivery.TriageDispatcher`, against stories at `detected`, claiming nothing.
+    // PLACEMENT claims the story, which is what mints the custody lineage, so 2.96.0 narrowed
+    // this tool's enum to `implement` alone. The old test pinned the opposite of the shipped
+    // contract.
+    //
+    // Source-pinned on the DECLARATION rather than on the call, because the enum is the only
+    // thing that refuses a caller: `placeDispatch` forwards whatever `kind` it is handed, and
+    // the MCP client is what validates against the schema. Widening the enum without coming
+    // back here turns this red.
+    const start = INDEX_SRC.indexOf('name: "place_dispatch"');
+    assert.ok(start > -1, "place_dispatch is not declared");
+
+    const end = INDEX_SRC.indexOf('name: "', start + 1);
+    assert.ok(end > start, "place_dispatch has no following declaration to bound it");
+
+    const declaration = INDEX_SRC.slice(start, end);
+    const declared = declaration.match(/kind: \{[\s\S]*?enum: (\[[^\]]*\])/);
+
+    assert.ok(declared, "place_dispatch declares no `kind` enum");
+    assert.equal(declared[1], '["implement"]');
   });
 
   test("refuses without a user key, and without either id — before any call", async () => {
@@ -262,20 +285,116 @@ describe("force_unclaim_story", () => {
   });
 });
 
+describe("id validation — shared by every verb here", () => {
+  // `Progress.force_unclaim_story/3` reaches `lock_story/2` (`progress.ex:3467`), which puts
+  // `story_id` straight into an Ecto `where` with no cast. A non-UUID therefore raises
+  // `Ecto.Query.CastError` and the caller gets a 500 — not a refusal it can act on. Checking
+  // the SHAPE client-side turns that into an answer, and costs no round trip.
+  const MALFORMED = "not-a-uuid";
+
+  test("refuses a malformed story_id on every verb that takes one, before any call", async () => {
+    const checks = [
+      ["place_dispatch", (api) => placeDispatch({ story_id: MALFORMED, runner_id: RUNNER_ID }, deps({ apiCall: api }))],
+      ["story_stage", (api) => storyStage({ story_id: MALFORMED }, { apiCall: api })],
+      ["resolve_escalation", (api) => resolveEscalation({ story_id: MALFORMED, to: "queued" }, deps({ apiCall: api }))],
+      ["force_unclaim_story", (api) => forceUnclaimStory({ story_id: MALFORMED }, { orchKey: "orch-key", apiCall: api })],
+    ];
+
+    for (const [name, run] of checks) {
+      const { calls, apiCall } = fakeApi();
+      const result = await run(apiCall);
+
+      assert.equal(result.error, true, `${name} accepted a malformed story_id`);
+      assert.match(result.body, /must be a UUID/, `${name} did not name the shape`);
+      assert.equal(calls.length, 0, `${name} sent a request anyway`);
+    }
+  });
+
+  test("refuses a malformed runner_id too", async () => {
+    const { calls, apiCall } = fakeApi();
+
+    const result = await placeDispatch(
+      { story_id: STORY_ID, runner_id: MALFORMED },
+      deps({ apiCall }),
+    );
+
+    assert.equal(result.error, true);
+    assert.match(result.body, /runner_id/);
+    assert.match(result.body, /must be a UUID/);
+    assert.equal(calls.length, 0);
+  });
+
+  test("names the SHAPE and never echoes the value back", async () => {
+    // A malformed id is frequently something pasted into the wrong argument — a token, a
+    // path, a whole line — and a tool result lands in the transcript. So the refusal says what
+    // was expected and how long the thing was, and repeats none of it.
+    const secretish = "lc_live_0123456789abcdefghijklmnop";
+    const { apiCall } = fakeApi();
+
+    const result = await forceUnclaimStory(
+      { story_id: secretish },
+      { orchKey: "orch-key", apiCall },
+    );
+
+    assert.equal(result.error, true);
+    assert.ok(!result.body.includes(secretish), "the refusal echoed the value");
+    assert.match(result.body, new RegExp(`${secretish.length}-character`));
+  });
+
+  test("a well-formed UUID still passes, in either case", async () => {
+    // The guard must not refuse what the server accepts: Ecto casts an upper-case UUID.
+    const { calls, apiCall } = fakeApi();
+
+    await forceUnclaimStory(
+      { story_id: STORY_ID.toUpperCase() },
+      { orchKey: "orch-key", apiCall },
+    );
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].path, `/api/v1/stories/${STORY_ID.toUpperCase()}/force-unclaim`);
+  });
+
+  test("a missing id is still `required`, not `malformed`", async () => {
+    const { apiCall } = fakeApi();
+    const result = await storyStage({}, { apiCall });
+
+    assert.match(result.body, /is required/);
+  });
+});
+
 describe("the wiring in index.js", () => {
-  test("every delivery-loop tool is declared, dispatched and documented", () => {
+  test("every delivery-loop tool is declared, dispatched TO ITS OWN HANDLER, and documented", () => {
     // The defect these tools exist for is a verb that exists and nothing calls. A tool
     // declared and not dispatched, or dispatched and not declared, is that same defect inside
     // the MCP server, and it is invisible until someone tries to use it.
-    for (const name of [
-      "place_dispatch",
-      "story_stage",
-      "resolve_escalation",
-      "force_unclaim_story",
-    ]) {
+    //
+    // THE CASE LABEL ALONE IS NOT THE WIRING, and the first version of this test asserted only
+    // that. Pointing `case "force_unclaim_story":` at `resolveEscalation(args)` left the whole
+    // suite green — the label was still there, so the grep still matched, while the tool called
+    // a different endpoint with a different key. So the HANDLER IDENTIFIER is asserted too,
+    // which is the thing that actually decides what the call does.
+    //
+    // Same for the README: a bare `includes(name)` matched the name anywhere in the file, and
+    // every one of these is named in surrounding prose, so a tool could lose its row and the
+    // test would not notice. The row is what an operator reads, so the row is what is pinned.
+    const wiring = {
+      place_dispatch: "placeDispatch",
+      story_stage: "storyStage",
+      resolve_escalation: "resolveEscalation",
+      force_unclaim_story: "forceUnclaimStory",
+    };
+
+    for (const [name, handler] of Object.entries(wiring)) {
       assert.ok(INDEX_SRC.includes(`name: "${name}"`), `${name} is not declared`);
-      assert.ok(INDEX_SRC.includes(`case "${name}":`), `${name} is not dispatched`);
-      assert.ok(README.includes(name), `${name} is not in the README tool list`);
+      assert.match(
+        INDEX_SRC,
+        new RegExp(`case "${name}":\\s*return await ${handler}\\(`),
+        `${name} is not dispatched to ${handler}()`,
+      );
+      assert.ok(
+        README.split("\n").some((line) => line.startsWith("| `" + name + "` |")),
+        `${name} has no row in a README tool table`,
+      );
     }
   });
 
@@ -293,8 +412,20 @@ describe("the wiring in index.js", () => {
     const end = INDEX_SRC.indexOf("\nasync function ", start + 1);
     assert.ok(end > start, "the handler has no following function to bound it");
 
-    const handler = INDEX_SRC.slice(start, end);
-    assert.ok(handler.includes("LOOPCTL_ORCH_KEY"), "it does not read LOOPCTL_ORCH_KEY");
+    // COMMENTS STRIPPED FIRST. The handler carries a comment explaining the pinning, and that
+    // comment names both `exactKey` and the env var — so the raw slice is satisfied by a site
+    // where the option has been commented OUT, which is the shape a disabling edit takes.
+    // Verified by mutation: without this, replacing the option line with a block comment left
+    // the suite green.
+    const handler = INDEX_SRC.slice(start, end)
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/\/\/[^\n]*/g, "");
+
+    assert.match(
+      handler,
+      /process\.env\.LOOPCTL_ORCH_KEY\b/,
+      "it does not read process.env.LOOPCTL_ORCH_KEY",
+    );
     assert.ok(handler.includes("exactKey: true"), "it does not pin the key exactly");
     assert.ok(
       !handler.includes("LOOPCTL_USER_KEY"),

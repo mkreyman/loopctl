@@ -5,18 +5,29 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
-## 2.97.0 — 2026-09-15 (a story a runner refused can be freed)
+## 2.97.0 — 2026-09-15 (a story stuck at `claimed` can be freed)
 
 ### Added
 
 - **`force_unclaim_story`** (loopctl #846, `POST /api/v1/stories/:id/force-unclaim`, ORCH key).
   Takes a story back from the agent holding it: `agent_status` to `pending`,
   `assigned_agent_id` cleared, and — in the same transaction — the delivery stage row follows
-  the release back to `queued`. **That second half is the point.** When a runner refuses a
-  dispatch the story is left parked at `claimed`, and `place_dispatch` on it answers 409
-  `invalid_transition`, because the stage machine has no edge out of `claimed` except the ones
-  the holder takes. The endpoint was the only thing that could free it and no tool called it,
-  so the session that placed the dispatch could not un-park the story it had parked.
+  the release back to `queued`. The endpoint was the only thing that could free such a story
+  and no tool called it, so it was reachable by a shell on the production node and by nothing
+  else.
+
+  **IT FREES THE STAGE; IT DOES NOT MAKE THE STORY PLACEABLE.** `Placement.claimable/2` wants
+  `agent_status: :contracted` AND stage `queued`, and the release leaves the story at
+  `:pending`, whose only transition is `pending -> contracted`. Run `place_dispatch` next and
+  you get back the identical 409 `invalid_transition`. The remedy is TWO STEPS:
+  `force_unclaim_story`, then `contract_story`, then `place_dispatch`. `resolve_escalation` is
+  the verb that does both for you — it releases AND re-contracts on its `queued` route.
+
+  **When to reach for it.** A story sitting at `claimed` with nobody on it is the residue of a
+  compensation that did not complete, not what a refused dispatch normally leaves: placement
+  answers a runner's refusal inline by releasing the claim itself, and if that release fails
+  the claim lease releases it unattended once `claimed_until` has passed. Use this tool to get
+  the story back now rather than at lease expiry.
 
   It needs `LOOPCTL_ORCH_KEY` and the key is pinned EXACTLY — no `LOOPCTL_API_KEY` fallback.
   The action is `exact_role: :orchestrator`, so a user or superadmin key is 403'd there like
@@ -24,11 +35,53 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   as the story being unfreeable. The orchestrator key must also be linked to a registered
   agent, and the tenant must be human-anchored.
 
+### Changed
+
+- **`verify_story`, `reject_story`, `verify_all_in_epic` and `bulk_mark_complete` are pinned
+  to `LOOPCTL_ORCH_KEY` exactly.** All four are `exact_role: :orchestrator` endpoints, and all
+  four passed the orchestrator key WITHOUT `exactKey` — so `resolveKey` preferred a global
+  `LOOPCTL_API_KEY`, of any role, and sent it. The 403 that came back named a custody refusal
+  rather than a misconfigured key, which is the worst place to misattribute an error: this is
+  the neighbourhood of `self_verify_blocked`, an L6 byzantine signal. **If you relied on a
+  global key for those four, set `LOOPCTL_ORCH_KEY`** — they now refuse locally and name the
+  variable. `report_story` and `review_complete` are deliberately NOT pinned: their gates take
+  a role RANGE, so the fallback is what makes an agent-key-only configuration work.
+
+- **A missing exact key is reported by NAME.** `apiCall`'s `exactKey` branch answered every
+  site with "Set LOOPCTL_USER_KEY ... to manage LLM configuration", which is right for
+  `set_llm_config` and nonsense for a custody verb missing its orchestrator key. A new
+  `keyHint` names the variable the site is pinned to.
+
+- **A malformed id is refused client-side** by `place_dispatch`, `story_stage`,
+  `resolve_escalation` and `force_unclaim_story`. `Progress.force_unclaim_story/3` reaches
+  `lock_story/2`, which interpolates `story_id` into an Ecto `where` with no cast, so a
+  non-UUID raised `Ecto.Query.CastError` and came back as a 500 rather than something a caller
+  could act on. The refusal names the SHAPE and its length and never echoes the value — a
+  malformed id is often a token or a path pasted into the wrong argument, and a tool result
+  lands in the transcript.
+
 ### Fixed
 
 - **`place_dispatch`'s README row no longer advertises `triage`.** 2.96.0 narrowed the `kind`
   enum to `implement` alone and corrected the tool description; the README row still offered
   `triage` as an option, which is the copy an operator reads first.
+
+- **The README's `[runner tools]` link pointed at an anchor that no longer exists** — the
+  heading became "Runner and delivery-loop tools". A dead anchor scrolls nowhere and reports
+  nothing, so a test now resolves every in-document link in the README against the headings it
+  actually has.
+
+- **The environment-variable table said `LOOPCTL_API_KEY` is "always used"**, which the
+  exact-key tools have never been. The table now states the exception and lists which tools
+  take it, and the `LOOPCTL_ORCH_KEY` row no longer reads "(verify, reject, review, import)".
+
+- **Two wiring tests could not fail.** The delivery-loop wiring check grepped only for
+  `case "<tool>":` — pointing that case body at a different handler left the whole suite green
+  — so it now asserts the dispatched IDENTIFIER, and the README half asserts a table ROW
+  rather than the name appearing anywhere in the file. A second test still passed
+  `kind: "triage"` to `place_dispatch` and asserted it was forwarded, pinning the opposite of
+  the enum 2.96.0 shipped; it now source-pins `enum: ["implement"]` and goes red if the enum
+  is widened.
 
 ## 2.96.0 — 2026-09-15 (triage is dispatchable, but not through this tool)
 

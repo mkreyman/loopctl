@@ -42,10 +42,34 @@ function refuse(body) {
   return { error: true, status: 0, body };
 }
 
+/**
+ * Every id this module has interpolates into a PATH, and the endpoint behind it casts
+ * nothing: `Progress.force_unclaim_story/3` reaches `lock_story/2` (`progress.ex:3467`),
+ * which puts `story_id` straight into an Ecto `where`, so a non-UUID raises
+ * `Ecto.Query.CastError` and the caller gets a 500 instead of a usable refusal. The shape
+ * check therefore belongs here, where it can say what is wrong.
+ *
+ * The refusal names the SHAPE and never echoes the value. A malformed id is frequently a
+ * token, a path or a pasted line that landed in the wrong argument, and a tool result goes
+ * into the transcript.
+ */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 function uuid(value, field) {
-  return typeof value === "string" && value.trim() !== ""
-    ? null
-    : refuse(`\`${field}\` is required.`);
+  if (typeof value !== "string" || value.trim() === "") {
+    return refuse(`\`${field}\` is required.`);
+  }
+
+  if (!UUID_RE.test(value)) {
+    return refuse(
+      `\`${field}\` must be a UUID (8-4-4-4 hex digits then 12, lowercase or upper). ` +
+        `Got a ${value.length}-character string that is not one. The value is not repeated ` +
+        `here: a malformed id is often something pasted into the wrong argument, and a tool ` +
+        `result lands in the transcript.`,
+    );
+  }
+
+  return null;
 }
 
 export function placementPath(runnerId) {
@@ -160,14 +184,38 @@ export async function resolveEscalation({ story_id, to, reason } = {}, { userKey
 /**
  * `POST /api/v1/stories/:id/force-unclaim`: take a story back off the agent holding it.
  *
- * TWO things happen, and the second is why a session reaches for this. `force_unclaim_story/3`
- * resets `agent_status` to `pending` and clears `assigned_agent_id`; then, in the SAME
+ * TWO things happen. `force_unclaim_story/3` resets `agent_status` to `pending` and clears
+ * `assigned_agent_id` (`release_claim_changes/1`, `progress.ex:1438`); then, in the SAME
  * transaction, `Stages.follow_release/5` makes the delivery stage row follow the release —
  * from any stage a claim holds (`claimed`, `worktree`, `implementing`, `reviewing`, `pr_open`,
- * `ci`) back to `queued`, rebound to the new claim epoch. That second half is what makes the
- * story PLACEABLE again: `place_dispatch` on a story parked at `claimed` is refused
- * `invalid_transition`, because the stage machine has no edge out of `claimed` except the ones
- * the holder takes.
+ * `ci`) back to `queued`, rebound to the new claim epoch.
+ *
+ * ## IT FREES THE STAGE. IT DOES NOT MAKE THE STORY PLACEABLE.
+ *
+ * This comment used to say the second half was "what makes the story PLACEABLE again", and
+ * that is false. `Placement.claimable/2` (`placement.ex:482-490`) wants `agent_status ==
+ * :contracted` AND stage `queued`; the release leaves the story at `:pending`, and
+ * `@valid_transitions` (`progress.ex:3480`) has `pending: :contracted` and nothing else — so
+ * `place_dispatch` run straight afterwards answers the IDENTICAL 409 `invalid_transition`.
+ *
+ * The remedy is two steps and the tool descriptions say so: `force_unclaim_story`, then
+ * `contract_story`, then `place_dispatch`. (`resolve_escalation` is the one that does both for
+ * you: `Escalations.prepare_story/5` releases AND re-contracts on the `queued` route,
+ * `escalations.ex:335-342`.)
+ *
+ * ## WHEN A STORY IS ACTUALLY PARKED
+ *
+ * Not on an ordinary refusal — that path self-heals. `Placement.place/4` answers a
+ * `Runners.dispatch/3` refusal INLINE with `undo_claim/5` (`placement.ex:562`, `:706-711`),
+ * which releases the claim through this same function, unrecords the session dispatch and
+ * revokes it. If that release itself fails, the claim lease is a further backstop:
+ * `Progress.reclaim_expired_claim/3` (`progress.ex:1612`) releases over `:runner_lost` and
+ * requeues the stage, swept by `ReclaimExpiredClaimsWorker` every five minutes once
+ * `claimed_until` has passed.
+ *
+ * So a story sitting at `claimed` with nobody on it is the RESIDUE OF A FAILED COMPENSATION,
+ * not what a refusal normally leaves. Reach for this tool to get the story back now instead of
+ * at lease expiry, or when both of those have left it held.
  *
  * No request body — the story is named in the path.
  *

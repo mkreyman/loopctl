@@ -240,18 +240,40 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
-- **A story a runner refused can be freed: `force_unclaim_story` (#846).** `POST
+- **A story stuck at `claimed` can be freed: `force_unclaim_story` (#846).** `POST
   /api/v1/stories/:id/force-unclaim` resets the story to `pending` AND makes its delivery
-  stage row follow the release back to `queued` — so it is what un-parks a story, not merely
-  what clears `assigned_agent_id`. It had no MCP tool, and every session on the fleet reaches
-  loopctl through the MCP server and only through it, so the session that placed a dispatch a
-  runner then refused could not free the story it had parked: the story sat at `claimed` and
-  `place_dispatch` answered 409 `invalid_transition`, the stage machine having no edge out of
-  `claimed` except the ones the holder takes. The tool needs `LOOPCTL_ORCH_KEY` and pins it
-  exactly — the action is `exact_role: :orchestrator`, so a user or superadmin key is 403'd
-  there like any other non-member and a global `LOOPCTL_API_KEY` of the wrong role would read
-  as the story being unfreeable. No endpoint changed; this is the tool the rule in `CLAUDE.md`
-  already required.
+  stage row follow the release back to `queued`. It had no MCP tool, and every session on the
+  fleet reaches loopctl through the MCP server and only through it, so a story left holding a
+  claim nobody was working could be freed by a shell on the production node and by nothing
+  else. No endpoint changed; this is the tool the rule in `CLAUDE.md` already required.
+
+  **It frees the STAGE. It does not make the story placeable, and the first draft of this
+  entry said it did.** `Placement.claimable/2` wants `agent_status: :contracted` AND stage
+  `queued`; the release leaves the story at `:pending`, whose only transition is
+  `pending -> contracted`. An operator who read the old copy, ran the tool and then ran
+  `place_dispatch` got back the identical 409 `invalid_transition` the copy claimed to cure.
+  The remedy is two steps and every description now says so: `force_unclaim_story`, then
+  `contract_story`, then `place_dispatch`. (`resolve_escalation` is the verb that does both —
+  `Escalations.prepare_story/5` releases and re-contracts on its `queued` route — which is why
+  the entry below can claim placeability and this one cannot.)
+
+  **Nor is a parked story what a refused dispatch normally leaves**, which the old copy also
+  said. `Placement.place/4` answers a `Runners.dispatch/3` refusal INLINE with `undo_claim/5`:
+  it releases the claim, unrecords the session dispatch and revokes it. If that release itself
+  fails, the claim lease is a further backstop — `Progress.reclaim_expired_claim/3` releases
+  over `:runner_lost` and requeues the stage, swept every five minutes once `claimed_until`
+  has passed. A story still at `claimed` with nobody on it is therefore the residue of a
+  compensation that did not complete, and this tool is for taking it back now rather than at
+  lease expiry.
+
+  The tool needs `LOOPCTL_ORCH_KEY` and pins it exactly — the action is
+  `exact_role: :orchestrator`, so a user or superadmin key is 403'd there like any other
+  non-member and a global `LOOPCTL_API_KEY` of the wrong role would read as the story being
+  unfreeable. **The same pinning now applies to `verify_story`, `reject_story`,
+  `verify_all_in_epic` and `bulk_mark_complete`**, which are gated `exact_role: :orchestrator`
+  by the same plug and were sending whatever `LOOPCTL_API_KEY` held. Set `LOOPCTL_ORCH_KEY`
+  if you were relying on a global key for those four: they now refuse locally, naming the
+  variable, instead of taking a 403 attributed to the wrong cause.
 
 - **The delivery loop is reachable from a session: `place_dispatch`, `story_stage`,
   `resolve_escalation` (#803, #850).** Three MCP tools and the two endpoints two of them
