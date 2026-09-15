@@ -554,23 +554,37 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
   # cap-that-cannot-bind defect one level up, in the test written to catch it.
   defp widest_field_bytes(sub), do: ByteRule.bytes(widest_value(sub))
 
-  defp widest_value(%OpenApiSpex.Schema{type: :string, maxLength: n}) when is_integer(n),
-    do: String.duplicate("x", n)
+  # AN ASTRAL CHARACTER, not "x", and this is the difference between a measurement and a
+  # reassurance. `ByteRule` charges 12 bytes for a character outside the BMP against 6 for one
+  # inside it, so a payload measured in ASCII reports half the cost a session can actually
+  # produce — and an emoji in a drafted story title is ordinary, not adversarial.
+  #
+  # The KB said so already (`b05ce162`, from contract 1.1): "worst-case frame tests must use
+  # control characters and astral characters at every max length ... not plain ASCII". I wrote
+  # this guard without searching, and the `loopctl-runner` session measured the gap instead:
+  # a verdict at every published maximum is about 45_352 bytes in BMP characters and about
+  # 88_282 in astral ones, against a 48_000 cap. So "inside every published bound is accepted"
+  # was true only for text nobody promised to send.
+  defp widest_value(sub), do: widest_value(sub, "x")
 
-  defp widest_value(%OpenApiSpex.Schema{type: :object, properties: props}) when is_map(props),
-    do: Map.new(props, fn {k, sub} -> {k, widest_value(sub)} end)
+  defp widest_value(%OpenApiSpex.Schema{type: :string, maxLength: n}, fill) when is_integer(n),
+    do: String.duplicate(fill, n)
 
-  defp widest_value(%OpenApiSpex.Schema{type: :array, maxItems: n, items: items})
+  defp widest_value(%OpenApiSpex.Schema{type: :object, properties: props}, fill)
+       when is_map(props),
+       do: Map.new(props, fn {k, sub} -> {k, widest_value(sub, fill)} end)
+
+  defp widest_value(%OpenApiSpex.Schema{type: :array, maxItems: n, items: items}, fill)
        when is_integer(n),
-       do: List.duplicate(widest_value(items), n)
+       do: List.duplicate(widest_value(items, fill), n)
 
-  defp widest_value(%OpenApiSpex.Schema{type: :integer}), do: 1
-  defp widest_value(%OpenApiSpex.Schema{type: :boolean}), do: true
+  defp widest_value(%OpenApiSpex.Schema{type: :integer}, _fill), do: 1
+  defp widest_value(%OpenApiSpex.Schema{type: :boolean}, _fill), do: true
 
   # An UNBOUNDED string is not free, and returning "" charged 12 bytes for a field that can
   # hold a uuid (228) or more. A string with no maxLength is charged at the longest thing the
   # contract actually puts in one, so the guard errs toward refusing rather than admitting.
-  defp widest_value(%OpenApiSpex.Schema{type: :string}), do: String.duplicate("x", 36)
+  defp widest_value(%OpenApiSpex.Schema{type: :string}, fill), do: String.duplicate(fill, 36)
 
   # AN UNBOUNDED ARRAY OR OBJECT IS THE SAME HOLE, and the round-2 fix closed it only for
   # strings. An array with no `maxItems`, or an object with no `properties`, fell through to
@@ -579,7 +593,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
   # cap-that-cannot-bind defect inside the test that exists to prevent it. Raising rather
   # than guessing a number: a field with no bound has no widest value, and silently charging
   # one is how this went wrong twice.
-  defp widest_value(%OpenApiSpex.Schema{type: type} = sub) when type in [:array, :object] do
+  defp widest_value(%OpenApiSpex.Schema{type: type} = sub, _fill)
+       when type in [:array, :object] do
     raise """
     #{inspect(type)} schema with no bound: #{inspect(sub)}
 
@@ -588,7 +603,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     """
   end
 
-  defp widest_value(_sub), do: ""
+  defp widest_value(_sub, _fill), do: ""
 
   defp unknown_keywords(%{} = schema, known) do
     own = Map.keys(schema) -- known
@@ -761,7 +776,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     # A verdict at EVERY maximum at once must fit. That is stronger, it is what a session
     # actually hits, and it is the only version that never surprises: a verdict inside every
     # published bound is accepted, full stop.
-    test "a verdict with every field at its declared maximum fits the object cap" do
+    test "a verdict at every declared maximum fits the object cap, in BMP text" do
       widest =
         RunnerContract.RunnerTriageVerdict.schema().properties
         |> Map.new(fn {name, sub} -> {name, widest_value(sub)} end)
@@ -776,7 +791,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
                "so some field's published limit cannot be used with the others"
     end
 
-    test "a triage object with every field at its declared maximum fits the object cap" do
+    test "a triage object at every declared maximum fits the object cap, in BMP text" do
       # The same property for the dispatch half, and the case round 3 measured: untrusted's
       # cap was reachable only on a record the injection detector had never flagged, so two
       # identical reports took different paths for a reason no declared bound explained.
@@ -791,6 +806,43 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
       assert bytes <= cap,
              "a triage object inside every declared bound costs #{bytes} against #{cap}"
+    end
+
+    # THE LIMIT OF THE TWO TESTS ABOVE, measured rather than left implicit. `ByteRule` charges
+    # 12 bytes for a character outside the BMP against 6 inside it, so a payload at every
+    # published character maximum in ASTRAL text costs about twice what those tests measure
+    # and does NOT fit. An emoji in a drafted title is ordinary, not adversarial.
+    #
+    # The caps are deliberately NOT sized for this. Doing so would halve a draft story's
+    # description to defend a case no session produces — every field entirely non-BMP — and
+    # the byte rule is already a worst-case-encoder bound, so sizing every cap for the worst
+    # case of every field at once is conservative twice over.
+    #
+    # What is done instead is to stop claiming the stronger guarantee and to publish the real
+    # one: the OBJECT CAP binds, and a session must check `ByteRule` rather than field
+    # lengths. This test pins the number so the gap is a measured fact in the suite rather
+    # than something a runner author discovers when a verdict is refused.
+    #
+    # Found by the `loopctl-runner` session. The KB had already said it — `b05ce162`, from
+    # contract 1.1: worst-case frame tests must use astral characters, not plain ASCII — and
+    # this guard was written without searching for it.
+    test "astral text at every maximum does NOT fit, and the contract says the cap binds" do
+      # The fill reaches EVERY string at every depth — the nested story's fields and the
+      # array items too, which is the half the first attempt at this test missed: filling
+      # only the top-level strings reported 45_880 and looked like it nearly fitted.
+      widest =
+        RunnerContract.RunnerTriageVerdict.schema().properties
+        |> Map.new(fn {name, sub} -> {name, widest_value(sub, "𝄞")} end)
+        |> Map.put(:outcome, "story")
+        |> Map.put(:confidence, "high")
+
+      cap = RunnerContract.RunnerTriageVerdict.max_bytes()
+      assert ByteRule.bytes(widest) > cap
+
+      # And the contract SAYS so, where a runner author reads it rather than only here.
+      description = RunnerContract.RunnerTriageVerdict.schema().description
+      assert description =~ "byte rule"
+      assert description =~ "outside the Basic Multilingual Plane"
     end
 
     test "undeclared keys are dropped rather than carried" do

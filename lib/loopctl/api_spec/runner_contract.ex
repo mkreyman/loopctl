@@ -316,6 +316,66 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     defp utf16_units(<<_byte, rest::binary>>, n), do: utf16_units(rest, n + 1)
   end
 
+  defmodule Limits do
+    @moduledoc false
+
+    alias OpenApiSpex.Schema
+
+    @doc """
+    The bounds a runner cannot read off the schema, for `x-connection.limits`.
+
+    ONE implementation, and it is one because there were three. `RunnerStory`,
+    `RunnerTriage` and `RunnerTriageVerdict` each carried an identical copy, which is the
+    drift this contract spends its comments warning about: the copies were not identical for
+    long. The first version handled a flat string and an array of strings only, so a nested
+    OBJECT and an array of objects published nothing — and because `RunnerStory` is flat its
+    own table looked complete, which made the gap read as a precedent rather than a bug.
+
+    The object cap is the value that matters most here: it is not a JSON Schema keyword, so a
+    runner pre-flighting a payload against the vendored contract cannot learn it any other
+    way.
+    """
+    @spec of(Schema.t(), pos_integer()) :: %{String.t() => term()}
+    def of(%Schema{} = schema, max_bytes) do
+      %{"max_bytes" => max_bytes, "fields" => fields(schema)}
+    end
+
+    defp fields(%Schema{properties: props}) when is_map(props) do
+      for {name, sub} <- props,
+          bounds = field_bounds(sub),
+          bounds != %{},
+          into: %{},
+          do: {Atom.to_string(name), bounds}
+    end
+
+    defp fields(%Schema{}), do: %{}
+
+    # EVERY BOUNDED FIELD AT EVERY DEPTH.
+    defp field_bounds(%Schema{type: :array, maxItems: items, items: %Schema{} = item})
+         when is_integer(items) do
+      Map.merge(%{"max_items" => items}, item_bounds(item))
+    end
+
+    defp field_bounds(%Schema{type: :string, maxLength: length}) when is_integer(length),
+      do: %{"max_length" => length}
+
+    defp field_bounds(%Schema{type: :object, properties: props}) when is_map(props) do
+      nested = fields(%Schema{type: :object, properties: props})
+      if nested == %{}, do: %{}, else: %{"fields" => nested}
+    end
+
+    defp field_bounds(%Schema{}), do: %{}
+
+    # An array's items are a string (its length is the bound a caller needs) or an object
+    # (its own fields are). `max_item_length` keeps the name the export already published for
+    # the string case, so a runner reading the old table still finds what it read before.
+    defp item_bounds(%Schema{type: :string, maxLength: length}) when is_integer(length),
+      do: %{"max_item_length" => length}
+
+    defp item_bounds(%Schema{type: :object} = item), do: field_bounds(item)
+    defp item_bounds(%Schema{}), do: %{}
+  end
+
   defmodule Kinds do
     @moduledoc false
 
@@ -556,6 +616,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     require OpenApiSpex
 
     alias Loopctl.ApiSpec.RunnerContract.ByteRule
+    alias Loopctl.ApiSpec.RunnerContract.Limits
 
     # THE REPORTER'S OWN WORDS, AND THE ONLY PLACE IN THIS CONTRACT THEY APPEAR (since
     # 1.7.0). An `implement` dispatch carries a story the trio wrote and never this — design
@@ -638,25 +699,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     At runtime, not compile time: `schema/0` is defined by the macro below.
     """
     @spec limits() :: %{String.t() => term()}
-    def limits do
-      fields =
-        for {name, sub} <- schema().properties,
-            bounds = field_bounds(sub),
-            bounds != %{},
-            into: %{},
-            do: {Atom.to_string(name), bounds}
-
-      %{"max_bytes" => @max_bytes, "fields" => fields}
-    end
-
-    defp field_bounds(%Schema{type: :array, maxItems: items, items: %Schema{maxLength: length}})
-         when is_integer(items) and is_integer(length),
-         do: %{"max_items" => items, "max_item_length" => length}
-
-    defp field_bounds(%Schema{type: :string, maxLength: length}) when is_integer(length),
-      do: %{"max_length" => length}
-
-    defp field_bounds(%Schema{}), do: %{}
+    def limits, do: Limits.of(schema(), @max_bytes)
 
     OpenApiSpex.schema(
       %{
@@ -672,8 +715,10 @@ defmodule Loopctl.ApiSpec.RunnerContract do
             "carries a nonce that must be minted where the text first lands, and because " <>
             "one tested implementation of an escape is worth more than one per runner. " <>
             "Everything outside `untrusted` is loopctl's own and is not reporter-supplied. " <>
-            "The whole object is at most #{@max_bytes} bytes under the byte rule; an " <>
-            "oversize record is escalated to a human, never truncated.",
+            "THE OBJECT CAP IS WHAT BINDS: at most #{@max_bytes} bytes under the byte " <>
+            "rule, which charges 6 bytes per character and 12 for one outside the Basic " <>
+            "Multilingual Plane, so the per-field maxima do not guarantee a payload that " <>
+            "fits. An oversize record is escalated to a human, never truncated.",
         type: :object,
         required: [:record_id, :issue_number, :html_url, :untrusted, :truncated],
         properties: %{
@@ -740,6 +785,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     require OpenApiSpex
 
     alias Loopctl.ApiSpec.RunnerContract.ByteRule
+    alias Loopctl.ApiSpec.RunnerContract.Limits
 
     # EVERY cap of the story object, declared once here (since 1.5.0). The schema below reads
     # them, `RunnerContract.cast_dispatch/1` enforces the byte cap from `max_bytes/0`,
@@ -837,25 +883,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     below and a module attribute cannot call it.
     """
     @spec limits() :: %{String.t() => term()}
-    def limits do
-      fields =
-        for {name, sub} <- schema().properties,
-            bounds = field_bounds(sub),
-            bounds != %{},
-            into: %{},
-            do: {Atom.to_string(name), bounds}
-
-      %{"max_bytes" => @max_bytes, "fields" => fields}
-    end
-
-    defp field_bounds(%Schema{type: :array, maxItems: items, items: %Schema{maxLength: length}})
-         when is_integer(items) and is_integer(length),
-         do: %{"max_items" => items, "max_item_length" => length}
-
-    defp field_bounds(%Schema{type: :string, maxLength: length}) when is_integer(length),
-      do: %{"max_length" => length}
-
-    defp field_bounds(%Schema{}), do: %{}
+    def limits, do: Limits.of(schema(), @max_bytes)
 
     OpenApiSpex.schema(
       %{
@@ -919,6 +947,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     require OpenApiSpex
 
     alias Loopctl.ApiSpec.RunnerContract.ByteRule
+    alias Loopctl.ApiSpec.RunnerContract.Limits
     alias Loopctl.ApiSpec.RunnerContract.RunnerStory
 
     # WHAT A TRIAGE SESSION RETURNS (since 1.7.0). On the wire and not a convention in a
@@ -1033,25 +1062,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     At runtime, not compile time: `schema/0` is defined by the macro below.
     """
     @spec limits() :: %{String.t() => term()}
-    def limits do
-      fields =
-        for {name, sub} <- schema().properties,
-            bounds = field_bounds(sub),
-            bounds != %{},
-            into: %{},
-            do: {Atom.to_string(name), bounds}
-
-      %{"max_bytes" => @max_bytes, "fields" => fields}
-    end
-
-    defp field_bounds(%Schema{type: :array, maxItems: items, items: %Schema{maxLength: length}})
-         when is_integer(items) and is_integer(length),
-         do: %{"max_items" => items, "max_item_length" => length}
-
-    defp field_bounds(%Schema{type: :string, maxLength: length}) when is_integer(length),
-      do: %{"max_length" => length}
-
-    defp field_bounds(%Schema{}), do: %{}
+    def limits, do: Limits.of(schema(), @max_bytes)
 
     OpenApiSpex.schema(
       %{
@@ -1068,8 +1079,14 @@ defmodule Loopctl.ApiSpec.RunnerContract do
             "`low` means the session would not act on this without a human reading the " <>
             "report, `medium` means the request is clear but something it could not check " <>
             "remains, `high` means it found the request actionable and contradicted by " <>
-            "nothing it read. The whole object is at most #{@max_bytes} bytes under the " <>
-            "byte rule.",
+            "nothing it read. THE OBJECT CAP IS WHAT BINDS: at most #{@max_bytes} bytes " <>
+            "under the byte rule, which charges 6 bytes per character and 12 for one " <>
+            "outside the Basic Multilingual Plane — so the per-field character maxima do " <>
+            "NOT guarantee a payload that fits. A verdict at every declared maximum fits in " <>
+            "ordinary text and does not once the text is astral, and an emoji in a drafted " <>
+            "title is enough to move it. Check the byte rule against `max_bytes` (published " <>
+            "in `x-connection.limits.triage_verdict`) rather than the field lengths: the " <>
+            "lengths bound one field each, the cap bounds the message.",
         type: :object,
         required: [:outcome, :confidence],
         properties: %{
@@ -1263,6 +1280,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     require OpenApiSpex
 
     alias Loopctl.ApiSpec.RunnerContract.ByteRule
+    alias Loopctl.ApiSpec.RunnerContract.Limits
 
     # Both under `ByteRule`. Referenced by the description, the export and
     # `RunnerContract.cast_trace_batch/1`. A schema-valid event with `data` at its cap and
@@ -1530,6 +1548,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     require OpenApiSpex
 
     alias Loopctl.ApiSpec.RunnerContract.ByteRule
+    alias Loopctl.ApiSpec.RunnerContract.Limits
     alias Loopctl.ApiSpec.RunnerContract.RunnerTraceEvent
 
     # Referenced by `maxItems` below and enforced by `RunnerContract.cast_trace_batch/1`.
