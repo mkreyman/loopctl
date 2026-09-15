@@ -359,6 +359,62 @@ mix test --failed      # Re-run failed tests
 mix ecto.reset         # Drop, create, migrate
 ```
 
+## Implementing: an ENGINEER AGENT writes the code, not the session's own Edit calls
+
+Mark's instruction, 2026-09-15, verbatim: *"make it a standing rule that you dispatch an
+engineer agent on high effort for any implementation and fixes. I see it over and over again
+that sessions doing direct editing are doing sloppy job..."*
+
+**This binds delivery-loop step 2 in this repo.** For any change to CODE — a feature, a bug
+fix, a review-finding fix, a refactor — dispatch `elixir-engineer` (or `typescript-engineer`
+under `mcp-server/`) on the highest-effort model available, rather than editing the files
+yourself.
+
+**The session keeps the loop.** Branch, RECONCILE the agent's output against the diff, commit,
+PR, review gate, merge. The agent leaves its changes uncommitted — that is its correct end
+state under the Subagent Subordination Rule — and you read them before they become a commit.
+That read is what the rule buys: an independent pair of eyes BEFORE the PR exists, rather than
+a reviewer finding it after the work is pushed.
+
+**The floor, named so this does not become ceremony.** Edit directly only where there is no
+judgement in the change: a version bump, a CHANGELOG entry, a formatting fix, a rename the
+compiler verifies, regenerating a checked-in artifact, resolving a conflict you already
+understand, or prose in a doc like this one. If you would have to decide anything about
+BEHAVIOUR, it is the agent's.
+
+### The evidence, because a rule without its case gets dropped at the first inconvenience
+
+One session, 2026-09-15, five PRs on the delivery loop, every change hand-edited by the
+session. What `/code-review high` found afterwards — i.e. after each was committed and pushed:
+
+- **Three tests that could not fail.** Each written to pin a NEW guard; each caught only by
+  `bin/mutate.sh` afterwards. One needed the right mutation to show at all — swapping a label
+  left the behaviour intact and came back green.
+- **A false claim deleted from one file and left standing in another by the same commit.** The
+  runner contract said loopctl fenced a field it does not fence; that sentence was removed
+  there and left in the module forty lines above the code making it false.
+- **A comment claiming signal codes reached the audit chain when they reached a different
+  table — then rewritten wrong a SECOND time while being corrected.**
+- **A change that made a case worse than before it.** A length bound moved onto escaped text
+  while the caller-facing bound stayed on the raw text, so a conforming caller's escalation was
+  refused and lost — the exact failure that change existed to end, one layer up.
+
+None is a typing error. They are judgement errors made at depth in a long session, and the
+shape they share is a claim written with more confidence than the code earns.
+
+**What the dispatch actually changes**, stated precisely because a rule adopted for the wrong
+reason is dropped for the wrong reason too: the agent is the same model and can make the same
+judgement errors. What differs is that it works in a FRESH CONTEXT on one task rather than
+inside a session carrying hundreds of thousands of tokens of unrelated history — every failure
+above happened deep into a long session — that its system prompt carries this stack's
+conventions, and that it inserts a read between writing and committing where today the same
+principal does both.
+
+It does NOT replace the review gate, and nothing here reduces it.
+
+**What would overturn it:** agent-written changes showing the same defect rate under review.
+Measure that rather than asserting it either way.
+
 ## Merging: this repo's rules OVERRIDE delivery-loop step 5
 
 Mark's decisions, 2026-09-15, after a night of four sequential PRs. **These override the
