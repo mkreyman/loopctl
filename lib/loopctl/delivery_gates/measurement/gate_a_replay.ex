@@ -46,8 +46,33 @@ defmodule Loopctl.DeliveryGates.Measurement.GateAReplay do
   alias Loopctl.DeliveryGates.GateA
   alias Loopctl.DeliveryGates.Measurement.Ticket
 
+  # READ OFF THE GATE, not restated. These two strings decide what the replay EMITS, and the
+  # gate decides what it MATCHES: spelled separately, a rename in `GateA` leaves this harness
+  # emitting the old spelling, the gate matching nothing, and `mix loopctl.gates.measure_a`
+  # reporting that code's rate as 0% — which reads as "it never fires" rather than "the
+  # measurement is broken". That number is what earns a code its gating place, so a silent
+  # zero is the worst answer this module can give.
+  #
+  # Positional: `gating_reason_codes/0` is the gate's own list, and the guard below fails the
+  # build if it stops being the two this harness knows how to produce signals for.
   @inverts "inverts_or_removes_deliberate_behaviour"
   @workflow "workflow_change_not_defect_fix"
+
+  @known_codes Enum.sort([@inverts, @workflow])
+
+  if Enum.sort(GateA.gating_reason_codes()) != @known_codes do
+    raise """
+    GateA's gating codes have changed and this replay harness has not.
+
+    gate:    #{inspect(Enum.sort(GateA.gating_reason_codes()))}
+    harness: #{inspect(@known_codes)}
+
+    The harness emits these strings to measure how often each code fires. A code the gate
+    matches and the harness never emits measures 0% for ever; a code the harness emits and
+    the gate does not match does the same. Add the signal that produces the new code, or
+    remove the one that is gone.
+    """
+  end
 
   # Anchored on whole words: "remove" must not fire on "removed the typo" only by being a
   # substring of something else, and "revert" must not fire on "reverting" being absent.
