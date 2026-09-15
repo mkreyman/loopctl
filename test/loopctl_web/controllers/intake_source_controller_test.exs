@@ -262,6 +262,96 @@ defmodule LoopctlWeb.IntakeSourceControllerTest do
     end
   end
 
+  describe "PATCH /api/v1/intake/sources/:id" do
+    test "repoints an active source and records it", %{conn: conn} do
+      ctx = operator_ctx()
+
+      {_s, source} =
+        fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      epic = fixture(:epic, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      body =
+        conn
+        |> auth(ctx.operator_key)
+        |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"target_epic_id" => epic.id})
+        |> json_response(200)
+
+      assert body["source"]["target_epic_id"] == epic.id
+      refute Map.has_key?(body["source"], "webhook_secret")
+      assert AdminRepo.get!(Source, source.id).target_epic_id == epic.id
+
+      assert [_one] =
+               AdminRepo.all(
+                 from e in Entry,
+                   where: e.tenant_id == ^ctx.tenant.id and e.action == "intake_source_repointed"
+               )
+    end
+
+    test "an explicit null clears the target", %{conn: conn} do
+      ctx = operator_ctx()
+      epic = fixture(:epic, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      {_s, source} =
+        fixture(:intake_source, %{
+          tenant_id: ctx.tenant.id,
+          project_id: ctx.project.id,
+          target_epic_id: epic.id
+        })
+
+      body =
+        conn
+        |> auth(ctx.operator_key)
+        |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"target_epic_id" => nil})
+        |> json_response(200)
+
+      assert body["source"]["target_epic_id"] == nil
+      assert AdminRepo.get!(Source, source.id).target_epic_id == nil
+    end
+
+    test "422 for an epic outside the source's project", %{conn: conn} do
+      ctx = operator_ctx()
+      other_project = fixture(:project, %{tenant_id: ctx.tenant.id})
+      epic = fixture(:epic, %{tenant_id: ctx.tenant.id, project_id: other_project.id})
+
+      {_s, source} =
+        fixture(:intake_source, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      assert conn
+             |> auth(ctx.operator_key)
+             |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"target_epic_id" => epic.id})
+             |> json_response(422)
+
+      assert AdminRepo.get!(Source, source.id).target_epic_id == nil
+    end
+
+    test "404 for another tenant's source, which is not repointed", %{conn: conn} do
+      ctx = operator_ctx()
+      {_s, other} = fixture(:intake_source, %{})
+      epic = fixture(:epic, %{tenant_id: ctx.tenant.id, project_id: ctx.project.id})
+
+      assert conn
+             |> auth(ctx.operator_key)
+             |> patch(~p"/api/v1/intake/sources/#{other.id}", %{"target_epic_id" => epic.id})
+             |> json_response(404)
+
+      assert AdminRepo.get!(Source, other.id).target_epic_id == nil
+    end
+
+    test "an agent-rooted tenant is refused: intake is a human-anchored surface", %{conn: conn} do
+      tenant = fixture(:tenant, %{trust_tier: :agent_rooted})
+      {operator_key, _} = fixture(:api_key, %{tenant_id: tenant.id, role: :user})
+      {_s, source} = fixture(:intake_source, %{tenant_id: tenant.id})
+
+      # The WRITE half of the surface is what the anchor gates, and a repoint redirects where
+      # outside text lands — the same act as enrolling the source, arriving later.
+      assert conn
+             |> auth(operator_key)
+             |> patch(~p"/api/v1/intake/sources/#{source.id}", %{"target_epic_id" => nil})
+             |> json_response(403)
+    end
+  end
+
   describe "DELETE /api/v1/intake/sources/:id" do
     test "revokes the source once, idempotently, with one audit entry", %{conn: conn} do
       ctx = operator_ctx()

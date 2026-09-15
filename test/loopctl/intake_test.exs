@@ -6,6 +6,7 @@ defmodule Loopctl.IntakeTest do
   alias Loopctl.Intake.Signature
   alias Loopctl.Intake.Source
   alias Loopctl.Projects.Project
+  alias Loopctl.WorkBreakdown.Epics
 
   setup :verify_on_exit!
 
@@ -195,6 +196,134 @@ defmodule Loopctl.IntakeTest do
     end
   end
 
+  describe "repoint_source/4" do
+    test "an active source is repointed at an epic of its project, and the act is recorded" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      {_secret, source} = fixture(:intake_source, %{tenant_id: tenant.id, project_id: project.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      assert source.target_epic_id == nil
+
+      assert {:ok, repointed} = Intake.repoint_source(tenant.id, source.id, epic.id)
+
+      assert repointed.target_epic_id == epic.id
+      assert AdminRepo.get!(Source, source.id).target_epic_id == epic.id
+
+      # The whole point of this endpoint is to change where outside text lands, on a
+      # human-anchored surface. An unrecorded repoint is a silent redirection of a project's
+      # intake, so the audit entry is part of the feature and not decoration.
+      assert %{"target_epic_id" => target} = latest_repoint_payload(tenant.id)
+      assert target == epic.id
+    end
+
+    test "an explicit nil clears the target, and the epic becomes deletable again" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      {_secret, source} =
+        fixture(:intake_source, %{
+          tenant_id: tenant.id,
+          project_id: project.id,
+          target_epic_id: epic.id
+        })
+
+      # The delete is BLOCKED while the source points at the epic — the positive control.
+      # Without it, the clear below would pass against an implementation that never wrote the
+      # reference in the first place.
+      assert {:error, _} = Epics.delete_epic(tenant.id, epic)
+
+      assert {:ok, cleared} = Intake.repoint_source(tenant.id, source.id, nil)
+      assert cleared.target_epic_id == nil
+
+      assert {:ok, _} = Epics.delete_epic(tenant.id, epic)
+    end
+
+    test "an epic outside the source's project is refused, and nothing is written" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      other_project = fixture(:project, %{tenant_id: tenant.id})
+      {_secret, source} = fixture(:intake_source, %{tenant_id: tenant.id, project_id: project.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: other_project.id})
+
+      assert {:error, changeset} = Intake.repoint_source(tenant.id, source.id, epic.id)
+      assert %{target_epic_id: ["must belong to this source's project"]} = errors_on(changeset)
+      assert AdminRepo.get!(Source, source.id).target_epic_id == nil
+    end
+
+    test "a REVOKED source is not found, so revoking stays a real remedy" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      {_secret, source} =
+        fixture(:intake_source, %{
+          tenant_id: tenant.id,
+          project_id: project.id,
+          target_epic_id: epic.id
+        })
+
+      assert {:ok, _revoked} = Intake.revoke_source(tenant.id, source.id)
+
+      # Revoking CLEARS the target precisely so the epic can be deleted, and the delete
+      # refusal NAMES revoking as the remedy. A repoint that could restore the reference
+      # would make that refusal a lie on a source that will never report again.
+      assert {:error, :not_found} = Intake.repoint_source(tenant.id, source.id, epic.id)
+      assert {:ok, _} = Epics.delete_epic(tenant.id, epic)
+    end
+
+    test "another tenant's source is not found, and a malformed id does not raise" do
+      tenant = fixture(:tenant)
+      other = fixture(:tenant)
+      {_secret, source} = fixture(:intake_source, %{tenant_id: other.id})
+
+      assert {:error, :not_found} = Intake.repoint_source(tenant.id, source.id, nil)
+      assert {:error, :not_found} = Intake.repoint_source(tenant.id, "not-a-uuid", nil)
+    end
+  end
+
+  describe "the target-epic foreign key constraint name" do
+    # THE NAME IS THE WHOLE MECHANISM, and it is the one thing a changeset cannot check for
+    # itself. `foreign_key_constraint(:target_epic_id)` DERIVES
+    # `intake_sources_target_epic_id_fkey` from the field, while the migration writes the
+    # constraint by hand as `intake_sources_target_epic_fkey` — no `_id` — because it is a
+    # COMPOSITE `(tenant_id, target_epic_id)` reference. A derived name that matches nothing
+    # never converts anything: the race each `foreign_key_constraint` call exists for raises
+    # `Postgrex.Error` and answers 500 instead of 422, and the code looks correct at both
+    # sites while doing nothing at either.
+    #
+    # The race cannot be staged from one process — it needs the epic deleted between the
+    # in-project check and the write — so this reconciles the NAMES the code declares against
+    # the names Postgres actually has, which is the same defect one layer up.
+    test "every name the code declares is a constraint Postgres has" do
+      declared =
+        ["lib/loopctl/intake.ex", "lib/loopctl/work_breakdown/epics.ex"]
+        |> Enum.flat_map(fn path ->
+          Regex.scan(~r/name: :(intake_sources_\w*target_epic\w*)/, File.read!(path))
+        end)
+        |> Enum.map(fn [_, name] -> name end)
+        |> Enum.uniq()
+
+      # Never vacuous: both call sites must be found, or a rename of the OPTION would make
+      # this guard pass by matching nothing.
+      assert length(declared) == 1,
+             "expected one shared constraint name, got #{inspect(declared)}"
+
+      actual =
+        AdminRepo.query!(
+          "SELECT conname FROM pg_constraint WHERE conrelid = 'intake_sources'::regclass AND contype = 'f'"
+        ).rows
+        |> List.flatten()
+
+      for name <- declared do
+        assert name in actual,
+               "the code names #{name}, Postgres has #{inspect(actual)} — " <>
+                 "an unmatched name converts no constraint error and 500s the race"
+      end
+    end
+  end
+
   describe "escalate_record/3" do
     # The audit log is HASH-CHAINED and append-only, so a repeat call is not a harmless no-op
     # update: it appends a second entry that says the same thing, for ever. The first version
@@ -249,6 +378,17 @@ defmodule Loopctl.IntakeTest do
 
       assert {:error, :not_found} = Intake.escalate_record(tenant.id, record.id, "reason")
     end
+  end
+
+  defp latest_repoint_payload(tenant_id) do
+    AdminRepo.one(
+      from e in "audit_chain",
+        where:
+          e.tenant_id == type(^tenant_id, :binary_id) and e.action == "intake_source_repointed",
+        order_by: [desc: e.chain_position],
+        limit: 1,
+        select: e.payload
+    )
   end
 
   defp latest_escalation_payload(tenant_id) do

@@ -409,7 +409,11 @@ defmodule Loopctl.WorkBreakdown.Epics do
   defp epic_delete_changeset(epic) do
     epic
     |> Ecto.Changeset.change()
-    |> Ecto.Changeset.foreign_key_constraint(:target_epic_id,
+    # `:id`, NOT `:target_epic_id`. The constraint lives on `intake_sources`, but the changeset
+    # being rendered is an EPIC, and a 422 whose errors map names a field the epic does not
+    # have tells a client to fix an attribute it never sent. `:id` is the epic, which is what
+    # the refusal is actually about.
+    |> Ecto.Changeset.foreign_key_constraint(:id,
       name: :intake_sources_target_epic_fkey,
       message: "is the target epic of an active intake source; revoke that source first"
     )

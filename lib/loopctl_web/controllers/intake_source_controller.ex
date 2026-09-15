@@ -25,7 +25,7 @@ defmodule LoopctlWeb.IntakeSourceController do
   action_fallback LoopctlWeb.FallbackController
 
   plug LoopctlWeb.Plugs.RequireRole, role: :user
-  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:create, :delete]
+  plug LoopctlWeb.Plugs.RequireHumanAnchor when action in [:create, :update, :delete]
   plug LoopctlWeb.Plugs.RequireUnlineagedCaller when action in [:create]
 
   tags(["Intake"])
@@ -141,6 +141,46 @@ defmodule LoopctlWeb.IntakeSourceController do
     }
   )
 
+  operation(:update,
+    summary: "Repoint a GitHub intake source at an epic",
+    description:
+      "Sets `target_epic_id` on an ACTIVE source, or clears it with an explicit null. The " <>
+        "epic must belong to this source\'s project. This is the remedy for a source enrolled " <>
+        "before the field existed, or one whose reports are being retried because it names no " <>
+        "epic: until it does, every record from it stays `pending_triage` and is retried, and " <>
+        "the moment it does they promote on the next run with nothing lost. Revoked sources " <>
+        "are 404 — revoking CLEARS the target so the epic can be deleted, and repointing one " <>
+        "would restore that block on a source that will never report again. Requires user " <>
+        "role and a human-anchored tenant. 422 when the epic is not in the project.",
+    parameters: [id: [in: :path, type: :string, description: "Intake source UUID"]],
+    request_body:
+      {"Repoint", "application/json",
+       %Schema{
+         type: :object,
+         required: [:target_epic_id],
+         properties: %{
+           target_epic_id: %Schema{
+             type: :string,
+             format: :uuid,
+             nullable: true,
+             description:
+               "The epic triaged stories land in; it must belong to this source\'s project. " <>
+                 "Null clears it, which returns the source to escalating nothing and " <>
+                 "retrying every report."
+           }
+         }
+       }},
+    responses: %{
+      200 =>
+        {"Intake source updated", "application/json",
+         %Schema{type: :object, properties: %{source: @source_schema}}},
+      403 => {"Forbidden", "application/json", Schemas.ErrorResponse},
+      404 => {"Not found", "application/json", Schemas.ErrorResponse},
+      422 => {"Validation error", "application/json", Schemas.ErrorResponse},
+      429 => {"Rate limit exceeded", "application/json", Schemas.RateLimitError}
+    }
+  )
+
   @doc "POST /api/v1/intake/sources"
   def create(conn, params) do
     tenant = conn.assigns.current_tenant
@@ -165,6 +205,23 @@ defmodule LoopctlWeb.IntakeSourceController do
         webhook_secret: secret,
         webhook_path: "/api/v1/intake/github/#{source.id}"
       })
+    end
+  end
+
+  @doc "PATCH /api/v1/intake/sources/:id"
+  def update(conn, %{"id" => source_id} = params) do
+    tenant = conn.assigns.current_tenant
+
+    # `Map.get`, so an absent key and an explicit null are the SAME here — both nil — and that
+    # is deliberate: the body has exactly one field, so a PATCH that names nothing is a
+    # request to clear it rather than a no-op worth distinguishing. `target_epic_id` is
+    # `required` in the request schema, which is what makes "absent" an OpenAPI error rather
+    # than a silent clear for anyone reading the spec.
+    with {:ok, source} <-
+           Intake.repoint_source(tenant.id, source_id, Map.get(params, "target_epic_id"),
+             actor_lineage: actor_lineage(conn)
+           ) do
+      json(conn, %{source: source})
     end
   end
 

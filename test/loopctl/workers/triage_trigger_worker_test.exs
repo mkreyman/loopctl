@@ -19,6 +19,7 @@ defmodule Loopctl.Workers.TriageTriggerWorkerTest do
   alias Ecto.Adapters.SQL.Sandbox
   alias Loopctl.AdminRepo
   alias Loopctl.Delivery.Stages
+  alias Loopctl.Intake
   alias Loopctl.Intake.Record
   alias Loopctl.Intake.Source
   alias Loopctl.WorkBreakdown.Stories
@@ -56,24 +57,53 @@ defmodule Loopctl.Workers.TriageTriggerWorkerTest do
       assert %Record{status: :pending_triage, escalation_reasons: []} = reload(record)
     end
 
-    test "a source naming no target epic escalates the record, naming the cause", %{
-      tenant: tenant
-    } do
-      {_source, record} =
+    test "a source naming no target epic RETRIES, and recovers when the source is repointed",
+         %{tenant: tenant} do
+      {source, record} =
         fixture(:committed_intake, %{tenant_id: tenant.id, target_epic_id: nil})
 
       assert :ok = run()
 
-      # `{:error, :no_target_epic}` out of `promote/1` is not the outcome that matters — the
-      # question has not been answered, and retrying it for ever against a condition only a
-      # person can clear is the failure this worker exists to avoid. The STATUS is what takes
-      # the record out of the candidate read and puts it in front of that person.
+      # NOT escalated, and this is the correction of the worst defect in this worker.
+      # Escalation is terminal — nothing un-escalates, and `candidates/0` requires
+      # `:pending_triage` — while `target_epic_id` is nullable precisely so that sources
+      # enrolled before the column existed keep working. Escalating here would have burned
+      # every record of every pre-migration source, fleet-wide, within one minute of deploy.
       record = reload(record)
-      assert record.status == :escalated
-      assert "triage_trigger:no_target_epic" in record.escalation_reasons
-      assert record.escalated_at
-
+      assert record.status == :pending_triage
+      assert record.escalation_reasons == []
+      assert record.escalated_at == nil
       assert story_for(record.id) == nil
+
+      # And the recovery is a real one, through the API rather than through SQL: naming the
+      # epic promotes the waiting record on the very next run, with nothing lost.
+      # UNBOXED, like every other write in this file: the worker runs outside the sandbox, so
+      # an epic created inside it does not exist as far as the repoint's in-project check is
+      # concerned, and the recovery would fail for a reason that is purely about the test.
+      #
+      # And the NUMBER is bounded, for the reason `fixture(:committed_intake, ...)` states at
+      # length: `build(:epic)` numbers from a raw `System.unique_integer/1`, which is small
+      # when this file runs alone and six or seven digits in a full suite — and a story number
+      # is `EPIC.SEQUENCE` with both parts under 10_000, so an epic above that makes every
+      # story in it unnumberable. This test passed alone and failed in the suite on exactly
+      # that: the recovery run escalated `:epic_number_unnumberable` instead of promoting.
+      epic =
+        unboxed(fn ->
+          epic =
+            fixture(:epic, %{
+              tenant_id: tenant.id,
+              project_id: source.project_id,
+              number: rem(System.unique_integer([:positive]), 9_000) + 1
+            })
+
+          {:ok, _} = Intake.repoint_source(tenant.id, source.id, epic.id)
+          epic
+        end)
+
+      assert :ok = run()
+
+      assert story = story_for(record.id)
+      assert story.epic_id == epic.id
     end
 
     test "an epic numbered past the story-number ceiling escalates too", %{tenant: tenant} do
@@ -180,8 +210,12 @@ defmodule Loopctl.Workers.TriageTriggerWorkerTest do
     end
 
     test "one bad record does not stop the others in the same run", %{tenant: tenant} do
+      # An UNNUMBERABLE epic, not a missing one: a missing target epic is a retry now, and a
+      # retry leaves the record exactly as a record the run never reached. This record has to
+      # be one whose handling is VISIBLE in the row, or the assertion below cannot tell "the
+      # run continued past it" from "the run stopped before it".
       {_bad_source, bad} =
-        fixture(:committed_intake, %{tenant_id: tenant.id, target_epic_id: nil})
+        fixture(:committed_intake, %{tenant_id: tenant.id, epic_number: 10_000})
 
       {_good_source, good} =
         fixture(:committed_intake, %{

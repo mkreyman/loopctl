@@ -219,7 +219,11 @@ defmodule Loopctl.WorkBreakdown.EpicsTest do
       # is the shape: through a bare struct it raised `Ecto.ConstraintError`, which the
       # fallback controller cannot render, so the operator got a 500 with no idea what was
       # pointing at the epic instead of a 422 telling them which source to repoint.
-      assert %{target_epic_id: [message]} = errors_on(changeset)
+      # On `:id`, not `:target_epic_id`. The constraint lives on `intake_sources`, but the
+      # changeset being rendered is an EPIC — a 422 keyed on a field the epic does not have
+      # tells the operator to fix an attribute they never sent.
+      refute Map.has_key?(errors_on(changeset), :target_epic_id)
+      assert %{id: [message]} = errors_on(changeset)
       assert message =~ "intake source"
 
       assert {:ok, _still_there} = Epics.get_epic(tenant.id, epic.id)

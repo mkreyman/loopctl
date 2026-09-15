@@ -190,10 +190,27 @@ defmodule Loopctl.Workers.TriageTriggerWorker do
     kind, value -> errored(record, Exception.format(kind, value, __STACKTRACE__))
   end
 
-  # The five reasons a person must answer. Each is a data question — name a target epic,
-  # renumber an epic, repair a record whose source is another tenant's — so none of them can
-  # clear itself, and retrying one is a loop with no end.
-  defp disposition(:no_target_epic), do: {:escalate, "triage_trigger:no_target_epic"}
+  # :no_target_epic is a RETRY, and that is the correction of the worst thing this worker
+  # nearly did.
+  #
+  # It escalated. Escalation sets `status: :escalated`, NOTHING un-escalates it — the `Record`
+  # moduledoc says so — and `candidates/0` requires `:pending_triage`. Meanwhile the migration
+  # that added `target_epic_id` promises every source enrolled before it "keeps working", and
+  # those sources all have it nil. So the first run after deploy would have permanently
+  # escalated every record of every pre-existing source, within a minute, with no API call
+  # able to recover any of them: recovery meant revoking the source (rotating its webhook
+  # secret, severing the GitHub binding), re-enrolling, and re-triggering a delivery per
+  # issue.
+  #
+  # Two things I built contradicted each other and the contradiction was invisible until
+  # someone read them together: a nullable column whose whole point is that old sources keep
+  # working, and a disposition that treats its absence as terminal.
+  #
+  # As a retry the record simply waits, costs a read and an error per run, and recovers by
+  # itself the moment the source names an epic. That is the honest shape for a condition an
+  # operator can clear, and it is why `PATCH /api/v1/intake/sources/:id` now exists — the
+  # remedy the escalation named but nothing implemented.
+  defp disposition(:no_target_epic), do: :retry
   defp disposition(:target_epic_missing), do: {:escalate, "triage_trigger:target_epic_missing"}
   defp disposition(:source_not_found), do: {:escalate, "triage_trigger:source_not_found"}
 

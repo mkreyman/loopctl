@@ -194,7 +194,11 @@ defmodule Loopctl.Intake do
   # an epic that is not this tenant's or does not belong to this source's project — a source
   # whose reports would land in another project's backlog is a mistake worth refusing at
   # enrollment rather than discovering on the first webhook.
-  defp put_target_epic(changeset, _tenant_id, nil), do: changeset
+  # An explicit `nil` CLEARS the target on a repoint, and means "not answered" on a create —
+  # the two callers differ and the changeset is what distinguishes them: a create starts from
+  # a struct whose field is already nil, so putting nil changes nothing.
+  defp put_target_epic(changeset, _tenant_id, nil),
+    do: Ecto.Changeset.put_change(changeset, :target_epic_id, nil)
 
   defp put_target_epic(changeset, tenant_id, epic_id) do
     project_id = Ecto.Changeset.get_field(changeset, :project_id)
@@ -206,7 +210,15 @@ defmodule Loopctl.Intake do
         # The read above is the READABLE error; this is the one that actually holds. An epic
         # deleted between that read and this insert would otherwise raise out of the
         # controller as a 500 instead of a 422 naming the field.
-        |> Ecto.Changeset.foreign_key_constraint(:target_epic_id)
+        # NAMED, because the derived default is wrong here. `foreign_key_constraint/2` builds
+        # `intake_sources_target_epic_id_fkey` from the field name; the migration calls the
+        # constraint `intake_sources_target_epic_fkey` — no `_id` — because it is a COMPOSITE
+        # `(tenant_id, target_epic_id)` reference written by hand. Unnamed it matched nothing,
+        # so the race this line exists for still raised a 500. `Epics.epic_delete_changeset/1`
+        # passes the same name and is what made the mismatch visible.
+        |> Ecto.Changeset.foreign_key_constraint(:target_epic_id,
+          name: :intake_sources_target_epic_fkey
+        )
 
       # The project was already rejected, so there is nothing to check an epic against and
       # the project's own error is the one worth showing. Attaching it to :target_epic_id
@@ -262,6 +274,73 @@ defmodule Loopctl.Intake do
                  "project_id" => source.project_id,
                  "target_epic_id" => source.target_epic_id
                }
+             }) do
+        source
+      else
+        {:error, reason} -> AdminRepo.rollback(reason)
+      end
+    end)
+  end
+
+  @doc """
+  Repoints an ACTIVE source at `target_epic_id`, or clears it with `nil` (#803 §4).
+
+  The remedy three review rounds named and nothing implemented. `target_epic_id` was
+  writable only at enrolment, so a source enrolled before the column existed — which the
+  migration promises keeps working — could never be given one, and the worker's own
+  escalation message told an operator to do something no API could do.
+
+  ACTIVE only. A revoked source has had its target cleared deliberately
+  (`Source.revoke_changeset/2`) so the epic it named can be deleted; letting a repoint
+  resurrect that reference would restore the delete-block on a source that will never report
+  again.
+
+  The epic must belong to this source's project, checked the same way enrolment checks it —
+  one derivation, so the two cannot disagree about what a valid target is.
+  """
+  @spec repoint_source(Ecto.UUID.t(), Ecto.UUID.t(), Ecto.UUID.t() | nil, keyword()) ::
+          {:ok, Source.t()} | {:error, Ecto.Changeset.t() | :not_found}
+  def repoint_source(tenant_id, source_id, target_epic_id, opts \\ [])
+      when is_binary(tenant_id) and is_binary(source_id) do
+    case active_source_of(tenant_id, source_id) do
+      nil ->
+        {:error, :not_found}
+
+      %Source{} = source ->
+        changeset =
+          source
+          |> Ecto.Changeset.change()
+          |> put_target_epic(tenant_id, target_epic_id)
+
+        with {:ok, changeset} <- valid(changeset) do
+          repoint(tenant_id, changeset, opts)
+        end
+    end
+  end
+
+  defp active_source_of(tenant_id, source_id) do
+    case Ecto.UUID.cast(source_id) do
+      {:ok, id} ->
+        AdminRepo.one(
+          from s in Source,
+            where: s.id == ^id and s.tenant_id == ^tenant_id and is_nil(s.revoked_at)
+        )
+
+      :error ->
+        nil
+    end
+  end
+
+  defp repoint(tenant_id, changeset, opts) do
+    AdminRepo.transaction(fn ->
+      with {:ok, source} <- AdminRepo.update(changeset),
+           {:ok, _entry} <-
+             AuditChain.append(tenant_id, %{
+               action: "intake_source_repointed",
+               actor_lineage: Keyword.get(opts, :actor_lineage, []),
+               entity_type: "intake_source",
+               entity_id: source.id,
+               payload: %{"target_epic_id" => source.target_epic_id}
              }) do
         source
       else
@@ -830,12 +909,45 @@ defmodule Loopctl.Intake do
           {:ok, Record.t()} | {:error, :not_found | term()}
   def escalate_record(tenant_id, record_id, reason)
       when is_binary(tenant_id) and is_binary(record_id) and is_binary(reason) do
-    case AdminRepo.get_by(Record, id: record_id, tenant_id: tenant_id) do
-      nil ->
-        {:error, :not_found}
+    # THE READ IS INSIDE THE WRITE'S TRANSACTION AND TAKES THE ROW LOCK, because the whole
+    # function is a read-modify-write of a LIST. Unlocked, two escalations of the same record
+    # — the delivery path recording an injection signal, this worker recording a triage
+    # failure — both read `escalation_reasons`, each subtracts against its own snapshot, and
+    # the second update writes a list assembled from the first's PRE-state. The loser's reason
+    # is gone from the row, and gone SILENTLY: both calls return `{:ok, record}`, both append
+    # an `intake_escalated` entry, so the audit chain records two escalations for a record
+    # that shows one. The signal dropped that way is the one worth keeping — an
+    # `untrusted_text` injection marker outranks "no target epic" every time.
+    AdminRepo.transaction(fn ->
+      tenant_id
+      |> locked_record(record_id)
+      |> escalate_locked(reason)
+    end)
+  end
 
-      %Record{} = record ->
-        escalate_new(record, [reason] -- record.escalation_reasons)
+  defp escalate_locked(nil, _reason), do: AdminRepo.rollback(:not_found)
+
+  defp escalate_locked(%Record{} = record, reason) do
+    case escalate_new(record, [reason] -- record.escalation_reasons) do
+      {:ok, updated} -> updated
+      {:error, failure} -> AdminRepo.rollback(failure)
+    end
+  end
+
+  # `FOR UPDATE`, and a cast that answers `:not_found` rather than raising: `get_by/3` on a
+  # malformed id raises `Ecto.Query.CastError`, which in the worker is a rescued exception and
+  # an `:errored` candidate instead of the plain not-found it is.
+  defp locked_record(tenant_id, record_id) do
+    case Ecto.UUID.cast(record_id) do
+      {:ok, id} ->
+        from(r in Record,
+          where: r.id == ^id and r.tenant_id == ^tenant_id,
+          lock: "FOR UPDATE"
+        )
+        |> AdminRepo.one()
+
+      :error ->
+        nil
     end
   end
 
@@ -844,19 +956,15 @@ defmodule Loopctl.Intake do
   defp escalate_new(record, new_reasons) do
     changes = escalation_changes(record, new_reasons, DateTime.utc_now())
 
-    AdminRepo.transaction(fn ->
-      # `updated`, not `record`, and the two are not interchangeable: `escalate/3` writes
-      # `escalation_reasons` into the audit entry, so passing the pre-update struct recorded
-      # the state BEFORE this escalation while `signals` carried the new reason — an entry
-      # disagreeing with itself, and disagreeing with what the delivery path writes for the
-      # same action.
-      with {:ok, updated} <- AdminRepo.update(Record.apply_changeset(record, changes)),
-           :ok <- escalate(updated, new_reasons, record.last_delivery_id) do
-        updated
-      else
-        {:error, reason} -> AdminRepo.rollback(reason)
-      end
-    end)
+    # `updated`, not `record`, and the two are not interchangeable: `escalate/3` writes
+    # `escalation_reasons` into the audit entry, so passing the pre-update struct recorded
+    # the state BEFORE this escalation while `signals` carried the new reason — an entry
+    # disagreeing with itself, and disagreeing with what the delivery path writes for the
+    # same action.
+    with {:ok, updated} <- AdminRepo.update(Record.apply_changeset(record, changes)),
+         :ok <- escalate(updated, new_reasons, record.last_delivery_id) do
+      {:ok, updated}
+    end
   end
 
   defp escalation_changes(_record, [], _now), do: %{}

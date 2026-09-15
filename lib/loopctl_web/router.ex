@@ -349,7 +349,7 @@ defmodule LoopctlWeb.Router do
     resources "/runners", RunnerController, only: [:create, :index, :delete]
 
     # Issue #803 — GitHub intake sources for the agent delivery loop
-    resources "/intake/sources", IntakeSourceController, only: [:create, :index, :delete]
+    resources "/intake/sources", IntakeSourceController, only: [:create, :index, :update, :delete]
 
     # Audit log
     get "/audit", AuditController, :index
