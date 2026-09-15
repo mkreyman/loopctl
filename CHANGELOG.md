@@ -76,6 +76,22 @@ All notable changes to loopctl are documented here.
   a session parked stayed parked for ever. An agent key is 403'd: the principal that raises an
   escalation may not clear it.
 
+  **`place_dispatch` needs only a story and a runner.** `RunnerDispatch` requires `repo`,
+  `branch`, `base_branch` and both budgets and `cast_dispatch/1` applies no defaults — and
+  that cast is the FIRST step of the push, which runs after the claim and two immutable chain
+  entries, so a caller that omitted one paid for all of it and got a 422.
+  `Loopctl.Delivery.DispatchPayload` fills each from loopctl's own records: the repository and
+  its base branch from the project's intake source, the branch from the story, the budgets
+  from the operator's configuration. A value the caller passes always wins. An unset budget is
+  now a 409 naming the key, refused before anything is minted.
+
+  **Resolving a story to `queued` makes it PLACEABLE**, not just re-staged: escalating does
+  not release the claim, so the story stayed assigned to the stopped session at
+  `:implementing` while its row said `queued` — and `Placement.claimable/2` wants `contracted`
+  AND `queued`, so nothing would have taken a story an operator had deliberately re-queued.
+  The claim is released and the story re-contracted, and the transition is fenced on the epoch
+  that release produced.
+
   **A rule now governs this**, in `CLAUDE.md`: an operator-facing endpoint is not done until an
   MCP tool calls it, in the same PR.
 

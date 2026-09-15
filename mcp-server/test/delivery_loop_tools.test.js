@@ -73,9 +73,14 @@ describe("place_dispatch", () => {
     assert.equal(calls[1].body.dispatch_id, "mine");
   });
 
-  test("omits the optional fields it was not given", async () => {
-    // Sent as nulls they would be a caller asserting "no branch", which the contract refuses;
-    // absent, loopctl fills them from its own records.
+  test("sends story, runner and kind alone — the server fills the rest", async () => {
+    // `repo`, `base_branch`, `branch` and both budgets are REQUIRED by the contract, and the
+    // first version of this test asserted their absence with a comment claiming loopctl filled
+    // them. It did not: `cast_dispatch/1` applies no defaults, so every call would have been
+    // refused — AFTER the claim and two immutable chain entries, because that cast is the
+    // first step of the push. The server derives them now
+    // (`Loopctl.Delivery.DispatchPayload`), which is what makes this body sufficient, and this
+    // test is only meaningful alongside the Elixir one that proves the derivation.
     const { calls, apiCall } = fakeApi();
 
     await placeDispatch({ story_id: STORY_ID, runner_id: RUNNER_ID }, deps({ apiCall }));
@@ -83,14 +88,17 @@ describe("place_dispatch", () => {
     assert.deepEqual(Object.keys(calls[0].body).sort(), ["dispatch_id", "kind", "story_id"]);
   });
 
-  test("carries the overrides it WAS given", async () => {
+  test("carries the overrides it WAS given, including the repository", async () => {
+    // An override is for the case the derivation cannot serve: a project bound to two sources,
+    // or a deliberate branch. `kind` stays `implement` here — `dispatchable_kinds` is the live
+    // list of what loopctl will send, and a kind not on it is refused after the claim.
     const { calls, apiCall } = fakeApi();
 
     await placeDispatch(
       {
         story_id: STORY_ID,
         runner_id: RUNNER_ID,
-        kind: "triage",
+        repo: "mkreyman/home_care_billing",
         branch: "feature/x",
         base_branch: "main",
         wall_clock_seconds: 900,
@@ -99,7 +107,7 @@ describe("place_dispatch", () => {
       deps({ apiCall }),
     );
 
-    assert.equal(calls[0].body.kind, "triage");
+    assert.equal(calls[0].body.repo, "mkreyman/home_care_billing");
     assert.equal(calls[0].body.branch, "feature/x");
     assert.equal(calls[0].body.base_branch, "main");
     assert.equal(calls[0].body.wall_clock_seconds, 900);

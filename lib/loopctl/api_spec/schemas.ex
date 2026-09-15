@@ -1602,8 +1602,22 @@ defmodule Loopctl.ApiSpec.Schemas do
       properties: %{
         stage: %Schema{
           type: :object,
+          # NULLABLE, and stated rather than implied: `GET /stories/:id/stage` answers
+          # `{"stage": null}` for a story the delivery loop has never touched, which is an
+          # ordinary state — every story created outside the loop is in it. Undeclared, the
+          # published contract refused a body the server sends, which is the defect contract
+          # 1.9.2 fixed one field along.
+          nullable: true,
           properties: %{
             story_id: %Schema{type: :string, format: :uuid},
+            runner_id: %Schema{
+              type: :string,
+              format: :uuid,
+              nullable: true,
+              description:
+                "The runner holding this story, while one does. Null before a placement and " <>
+                  "after the claim ends."
+            },
             stage: %Schema{
               type: :string,
               description: "The delivery stage the story is now at."

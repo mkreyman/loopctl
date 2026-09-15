@@ -313,6 +313,10 @@ defmodule LoopctlWeb.StoryEscalationController do
   defp render_stage(row) do
     %{
       story_id: row.story_id,
+      # WHICH MACHINE HAS IT, which the stage read promised and did not return. An operator
+      # watching a run wants the machine as much as the stage, and a story stuck at `claimed`
+      # is a question about a runner.
+      runner_id: row.runner_id,
       stage: row.stage,
       claim_epoch: row.claim_epoch,
       lock_version: row.lock_version,

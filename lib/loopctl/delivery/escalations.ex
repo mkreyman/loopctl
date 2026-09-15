@@ -64,6 +64,7 @@ defmodule Loopctl.Delivery.Escalations do
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.Stages
   alias Loopctl.Delivery.StoryStage
+  alias Loopctl.Progress
   alias Loopctl.Repo
   alias Loopctl.WorkBreakdown.Story
 
@@ -285,15 +286,58 @@ defmodule Loopctl.Delivery.Escalations do
 
     with :ok <- resolvable(to),
          {:ok, row} <- live_row(tenant_id, story_id),
-         :ok <- at_escalated(row) do
+         :ok <- at_escalated(row),
+         {:ok, epoch} <- prepare_story(tenant_id, story_id, to, row, opts) do
       Stages.advance(tenant_id, story_id, {:escalated, to, :human_resolution},
-        claim_epoch: row.claim_epoch,
+        claim_epoch: epoch,
         reason: Keyword.get(opts, :reason),
         actor_label: Keyword.get(opts, :actor_label),
         actor_role: Keyword.fetch!(opts, :actor_role),
         actor_lineage: Keyword.fetch!(opts, :actor_lineage)
       )
     end
+  end
+
+  # SENDING A STORY BACK TO `queued` HAS TO MAKE IT PLACEABLE, or it is a stage row that says
+  # one thing while the story says another. Escalating does NOT release the claim — the story
+  # is still assigned to the session that stopped, at `:implementing` — and
+  # `Placement.claimable/2` requires `agent_status == :contracted` AND stage `queued`. Moving
+  # the row alone left a story an operator had deliberately re-queued that no placement would
+  # take, and no lease recovers it either: the release sets `:pending`, which is not
+  # `:contracted` either.
+  #
+  # So the claim goes back and the story is re-contracted, in that order, and the epoch the
+  # transition is fenced on is read AFTER both — releasing bumps it.
+  #
+  # `done` and `failed` prepare nothing: the story is finished with, and re-contracting it
+  # would be inventing work.
+  defp prepare_story(tenant_id, story_id, :queued, _row, opts) do
+    label = Keyword.get(opts, :actor_label)
+
+    with {:ok, story} <- release_claim(tenant_id, story_id, label),
+         {:ok, story} <- recontract(tenant_id, story, label) do
+      {:ok, story.claim_epoch}
+    end
+  end
+
+  defp prepare_story(_tenant_id, _story_id, _to, row, _opts), do: {:ok, row.claim_epoch}
+
+  # Idempotent by `force_unclaim_story/3`'s own design: a story already at `:pending` — its
+  # claim released by the lease while it sat escalated — passes through with its current epoch.
+  defp release_claim(tenant_id, story_id, label) do
+    Progress.force_unclaim_story(tenant_id, story_id, actor_label: label)
+  end
+
+  # `pending -> contracted` is the only transition into the state a placement needs, and a
+  # story that is somehow already `contracted` is left alone rather than refused: the operator
+  # asked for a placeable story and it is one.
+  defp recontract(_tenant_id, %{agent_status: :contracted} = story, _label), do: {:ok, story}
+
+  defp recontract(tenant_id, story, label) do
+    Progress.contract_story(tenant_id, story.id, %{},
+      actor_label: label,
+      skip_contract_check: true
+    )
   end
 
   defp resolvable(to) do

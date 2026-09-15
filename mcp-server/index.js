@@ -3171,7 +3171,17 @@ async function placeDispatch(args) {
 }
 
 async function storyStage(args) {
-  return toContent(await storyStageRequest(args, { apiCall }));
+  // THE AGENT KEY IS EXPLICIT, like every other agent-facing tool here: `resolveKey` reads
+  // LOOPCTL_API_KEY, then an override, then LOOPCTL_ORCH_KEY — never LOOPCTL_AGENT_KEY. A
+  // session refused `stale_stage` is running on an agent key, and this read is what tells it
+  // where the row actually is, so on an agent-key-only config it has to work.
+  const key = process.env.LOOPCTL_AGENT_KEY;
+
+  return toContent(
+    await storyStageRequest(args, {
+      apiCall: (method, path, body) => apiCall(method, path, body, key),
+    }),
+  );
 }
 
 async function resolveEscalation(args) {
@@ -7650,10 +7660,14 @@ const TOOLS = [
       "(story_stage shows where it is).\n\n" +
       "The STORY OBJECT is not a parameter: loopctl builds it from its own rows and refuses a " +
       "caller-supplied one, because a control plane able to hand a runner prose is able to " +
-      "run anything on that machine. IDEMPOTENT on `dispatch_id`, which is generated for you " +
-      "unless you pass one — pass the SAME id to retry a call that timed out, or you start a " +
-      "second session on the same story. Requires LOOPCTL_USER_KEY: only an unlineaged user " +
-      "key may root the custody lineage this mints.",
+      "run anything on that machine. NEITHER IS THE REPOSITORY, THE BRANCH OR THE BUDGETS: " +
+      "loopctl fills `repo` and `base_branch` from the project's intake source, derives " +
+      "`branch` from the story, and reads the budgets from the operator's configuration — so " +
+      "`story_id` and `runner_id` are the whole request. Pass any of them to override. " +
+      "IDEMPOTENT on `dispatch_id`, which is generated for you unless you pass one — pass the " +
+      "SAME id to retry a call that timed out, or you start a second session on the same " +
+      "story. Requires LOOPCTL_USER_KEY: only an unlineaged user key may root the custody " +
+      "lineage this mints.",
     inputSchema: {
       type: "object",
       properties: {
@@ -7661,8 +7675,11 @@ const TOOLS = [
         runner_id: { type: "string", description: "The runner to place it on (from runner_pool)." },
         kind: {
           type: "string",
-          enum: ["implement", "triage"],
-          description: "What the session is for. Defaults to implement.",
+          enum: ["implement"],
+          description:
+            "What the session is for. `implement` is the only kind loopctl SENDS today — " +
+            "`x-connection.dispatchable_kinds` in the runner contract is the live list, and " +
+            "a kind that is not on it is refused after the claim, not before it.",
         },
         dispatch_id: {
           type: "string",

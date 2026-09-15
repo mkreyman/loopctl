@@ -78,6 +78,41 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
     )
   end
 
+  # ESCALATED AND COMMITTED, because resolving one crosses BOTH repos: `Stages` writes the row
+  # on the RLS `Loopctl.Repo` while `Progress.force_unclaim_story/3` and `contract_story/3`
+  # run on `AdminRepo`, and two sandbox connections cannot see each other's uncommitted rows —
+  # so a Repo-sandbox story is `:not_found` to the release the resolve has to make. Committed,
+  # both see it; `sweep_committed_runner_tenants/0` removes it at the module boundary.
+  defp committed_escalated_story do
+    tenant = fixture(:committed_tenant, %{trust_tier: :human_anchored})
+    {raw_key, _api_key, agent} = fixture(:committed_agent_key, %{tenant_id: tenant.id})
+    {operator_key, _operator} = fixture(:committed_operator_key, %{tenant_id: tenant.id})
+    story = fixture(:committed_story, %{tenant_id: tenant.id})
+
+    unboxed(fn ->
+      {1, _} =
+        AdminRepo.update_all(
+          from(s in Story, where: s.id == ^story.id),
+          set: [assigned_agent_id: agent.id, agent_status: :implementing, claim_epoch: @epoch]
+        )
+
+      fixture(:story_stage, %{
+        repo: AdminRepo,
+        tenant_id: tenant.id,
+        story_id: story.id,
+        stage: :escalated,
+        claim_epoch: @epoch,
+        escalation_reason: "parked by the first run"
+      })
+    end)
+
+    %{tenant: tenant, story: story, raw_key: raw_key, operator_key: operator_key}
+  end
+
+  defp unboxed(fun) do
+    Sandbox.unboxed_run(AdminRepo, fn -> Sandbox.unboxed_run(Repo, fun) end)
+  end
+
   describe "GET /api/v1/stories/:id/stage" do
     test "returns where the story is in the delivery machine", %{conn: conn} do
       %{story: story, raw_key: raw_key} = claimed_story(:worktree)
@@ -118,29 +153,41 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
   end
 
   describe "POST /api/v1/stories/:id/stage/resolve" do
-    test "a human sends an escalated story back to be worked", %{conn: conn} do
-      %{story: story, tenant: tenant} = claimed_story(:escalated)
-      {operator_key, _operator} = fixture(:committed_operator_key, %{tenant_id: tenant.id})
+    test "a human closes an escalated story as done", %{conn: conn} do
+      %{story: story, operator_key: operator_key} = committed_escalated_story()
 
       # The other half of `escalate`, and it had NO caller of any kind: `:human_resolution` is
       # in the stage machine, `Stages.advance/4` gates it, and nothing in `lib/` or on the API
       # could take it — so a story a session parked for a person stayed parked for ever,
       # including the one the loop's first end-to-end run left behind.
+      #
+      # `done` rather than `queued` HERE, and the reason is the harness rather than the rule:
+      # re-queueing also releases the claim and re-contracts the story, which runs on
+      # `AdminRepo` while the transition runs on `Loopctl.Repo` — two sandbox connections in
+      # this process, so the release's row lock is held for the rest of the test and the
+      # transition times out on it. That path is covered end to end, unboxed, in
+      # `Loopctl.Delivery.EscalationsResolveTest`.
       body =
         conn
         |> auth(operator_key)
         |> post(~p"/api/v1/stories/#{story.id}/stage/resolve", %{
-          "to" => "queued",
-          "reason" => "rescoped, go ahead"
+          "to" => "done",
+          "reason" => "the reporter withdrew it"
         })
         |> json_response(200)
 
-      assert body["stage"]["stage"] == "queued"
-      assert Stages.get(story.tenant_id, story.id).stage == :queued
+      assert body["stage"]["stage"] == "done"
+
+      # Read on the SANDBOX connection, not unboxed: the rows were committed by the fixture,
+      # but the transition the request just made lives in this process's `Loopctl.Repo`
+      # transaction — an unboxed read sees the committed `escalated` and would call a working
+      # write a failure.
+      assert as_tenant(story.tenant_id, fn -> Stages.get(story.tenant_id, story.id) end).stage ==
+               :done
     end
 
     test "an AGENT key cannot resolve, which is the separation", %{conn: conn} do
-      %{story: story, raw_key: raw_key} = claimed_story(:escalated)
+      %{story: story, raw_key: raw_key} = committed_escalated_story()
 
       # `escalate` is `exact_role: :agent` and this is `role: :user`, so the principal that
       # raises an escalation cannot clear it. The stage machine enforces the same thing itself
@@ -151,7 +198,7 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
       |> post(~p"/api/v1/stories/#{story.id}/stage/resolve", %{"to" => "queued"})
       |> json_response(403)
 
-      assert Stages.get(story.tenant_id, story.id).stage == :escalated
+      assert unboxed(fn -> Stages.get(story.tenant_id, story.id) end).stage == :escalated
     end
 
     test "a story that is NOT escalated is refused, and told which stage it is at", %{conn: conn} do
@@ -172,8 +219,7 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
     end
 
     test "a target the stage machine does not have is refused", %{conn: conn} do
-      %{story: story, tenant: tenant} = claimed_story(:escalated)
-      {operator_key, _operator} = fixture(:committed_operator_key, %{tenant_id: tenant.id})
+      %{story: story, operator_key: operator_key} = committed_escalated_story()
 
       # `escalated` leads to `queued`, `done` or `failed` and nowhere else. Sending a story
       # straight back to `implementing` would skip the claim it no longer has.
@@ -182,7 +228,7 @@ defmodule LoopctlWeb.StoryEscalationControllerTest do
       |> post(~p"/api/v1/stories/#{story.id}/stage/resolve", %{"to" => "implementing"})
       |> json_response(400)
 
-      assert Stages.get(story.tenant_id, story.id).stage == :escalated
+      assert unboxed(fn -> Stages.get(story.tenant_id, story.id) end).stage == :escalated
     end
   end
 

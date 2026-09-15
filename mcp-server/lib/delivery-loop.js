@@ -59,12 +59,30 @@ export function resolvePath(storyId) {
  * a second session, and a caller that cannot name it cannot retry safely. A caller repeating a
  * call after a timeout should pass the id it used the first time.
  *
+ * `repo`, `base_branch`, `branch`, `wall_clock_seconds` and `max_turns` are REQUIRED BY THE
+ * CONTRACT and are not required here, because loopctl fills each one from its own records
+ * (`Loopctl.Delivery.DispatchPayload`): the repository and its base branch from the project's
+ * intake source, the branch from the story, the budgets from the operator's configuration. An
+ * override passed here wins. This is not a convenience — a payload missing one of them is
+ * refused by `cast_dispatch/1`, which runs AFTER the claim and two immutable chain entries, so
+ * a client that had to know a repository name would pay for that mistake every time.
+ *
  * The STORY OBJECT is not a parameter and may not be: loopctl builds it from its own rows, and
  * a caller-supplied one is refused `story_not_accepted` — a control plane able to hand a runner
  * prose is able to run anything on that machine.
  */
 export async function placeDispatch(
-  { story_id, runner_id, dispatch_id, kind = "implement", branch, base_branch, wall_clock_seconds, max_turns } = {},
+  {
+    story_id,
+    runner_id,
+    dispatch_id,
+    kind = "implement",
+    repo,
+    branch,
+    base_branch,
+    wall_clock_seconds,
+    max_turns,
+  } = {},
   { userKey, apiCall, uuidv4 } = {},
 ) {
   if (!userKey) return refuse(MISSING_USER_KEY);
@@ -79,6 +97,7 @@ export async function placeDispatch(
   };
 
   for (const [key, value] of Object.entries({
+    repo,
     branch,
     base_branch,
     wall_clock_seconds,
