@@ -136,6 +136,25 @@ defmodule LoopctlWeb.Telemetry do
         description: "Runner-supplied ledger writes Postgres refused as data."
       ),
 
+      # Contract 1.6.0. A runner that DECLARED a kind on join and then answered
+      # `kind_not_supported` for it is contradicting itself, which is a bug on the runner.
+      # loopctl suppresses that kind for the rest of the connection, and that bound is
+      # PER-CONNECTION by design — so a machine flapping its socket re-declares the kind and
+      # resumes the churn, and the ledger row cannot tell that apart from one old refusal.
+      # This series is how that becomes visible: alert on a rate rather than on a single
+      # event, because one occurrence is a bug to find and a repeating one is a machine
+      # fighting the control plane.
+      #
+      # `kind` only. tenant and runner ids are unbounded and stay in the logs, like every
+      # other counter here.
+      counter("loopctl.runners.declared_kind_refused.count",
+        event_name: [:loopctl, :runners, :declared_kind_refused],
+        tags: [:kind],
+        description:
+          "Dispatches refused `kind_not_supported` by a runner that declared that kind on " <>
+            "join. Non-zero means a runner is contradicting its own declaration."
+      ),
+
       # Delivery-loop retention (#803 §11). `table` is one of two literals, so the tag is
       # bounded; tenant ids stay in the logs. `tenants_at_budget` is the one to alert on —
       # non-zero across consecutive runs means the pruner is not keeping up with the writes.

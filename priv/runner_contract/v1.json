@@ -217,6 +217,7 @@
         "kinds": {
           "description": "The dispatch kinds this machine runs (since 1.6.0). Where present and NON-EMPTY this is the ONLY thing consulted: loopctl refuses a kind outside it, and sends a kind inside it even where an earlier `kind_not_supported` reply is on record for this runner. Omitting it, or sending an EMPTY array, is read as declaring `implied_kinds` [\"implement\"] — what loopctl sent before the field existed. An empty array is therefore NOT how a runner says it wants no work; `draining` is. A kind this server does not know is IGNORED, not refused, so a runner upgraded ahead of loopctl still connects — but a declaration of ONLY unknown kinds leaves nothing this server can send, and the machine is then sent nothing until loopctl catches up. Duplicates are ignored. At most 20 entries, a size bound and not a statement about the vocabulary. Declare it on EVERY join: it is per-connection, so an upgraded runner becomes eligible for a new kind by reconnecting rather than by being re-enrolled.",
           "items": {
+            "maxLength": 64,
             "type": "string"
           },
           "maxItems": 20,

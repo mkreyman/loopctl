@@ -560,6 +560,41 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     own ++ nested
   end
 
+  describe "cast_join/1 kinds (contract 1.6.0)" do
+    # #834 round 3, finding 3. This value goes verbatim into the Presence meta, which
+    # Phoenix.Tracker replicates to EVERY node for the life of the socket and the pool read
+    # echoes. `maxItems` bounds the entry COUNT; the resource is count times length, and
+    # every other string in RunnerJoin is bounded by a pattern.
+    test "an over-long kind is refused, so the replicated meta cannot be inflated" do
+      long = String.duplicate("k", 65)
+
+      assert {:error, {:invalid, _}} =
+               RunnerContract.cast_join(Map.put(@join, "kinds", [long]))
+
+      assert {:ok, %{kinds: [_]}} =
+               RunnerContract.cast_join(Map.put(@join, "kinds", [String.duplicate("k", 64)]))
+    end
+
+    # The bound that must NOT exist: a kind this server has never heard of is carried, not
+    # refused, or a runner upgraded ahead of loopctl loses its connection entirely.
+    test "a kind this server does not know is accepted" do
+      assert {:ok, %{kinds: ["implement", "review"]}} =
+               RunnerContract.cast_join(Map.put(@join, "kinds", ["implement", "review"]))
+    end
+
+    test "an empty array and a duplicate are both accepted on the wire" do
+      assert {:ok, %{kinds: []}} = RunnerContract.cast_join(Map.put(@join, "kinds", []))
+
+      assert {:ok, %{kinds: ["implement", "implement"]}} =
+               RunnerContract.cast_join(Map.put(@join, "kinds", ["implement", "implement"]))
+    end
+
+    test "a non-string entry is refused, which is why declared_kinds keeps its own guard" do
+      assert {:error, {:invalid, _}} =
+               RunnerContract.cast_join(Map.put(@join, "kinds", ["implement", 3]))
+    end
+  end
+
   describe "cast_join/1" do
     test "accepts a valid payload and keeps only declared fields" do
       payload = @join |> Map.put("sample", @sample) |> Map.put("smuggled", "x")

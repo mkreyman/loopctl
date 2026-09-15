@@ -158,6 +158,12 @@ defmodule LoopctlWeb.RunnerChannel do
        |> assign(:last_cursor_at, :never)
        |> assign(:last_unknown_at, :never)
        |> assign(:last_unknown_info_at, :never)
+       # The dispatches THIS connection put on the wire. Per-connection on purpose: it is
+       # what lets a `kind_not_supported` reply be attributed to the connection that carried
+       # the dispatch rather than to whichever one the reply lands on
+       # (`note_kind_refusal/3`). Bounded by the runner's capacity, since a slot is held from
+       # push until the reply, and it dies with the channel.
+       |> assign(:pushed_dispatches, MapSet.new())
        |> assign(:presence_ref, nil)}
     else
       {:error, reason} -> {:error, refuse_join(socket, join_error(reason))}
@@ -598,7 +604,7 @@ defmodule LoopctlWeb.RunnerChannel do
 
     case {Runners.declared_kinds(meta), record.kind} do
       {{:declared, kinds}, kind} when is_binary(kind) ->
-        if kind in kinds do
+        if kind in kinds and pushed_here?(socket, record) do
           Logger.warning(
             "runner declared kind #{kind} and then refused it as kind_not_supported; " <>
               "suppressing that kind for the rest of this connection. Reconnecting clears it."
@@ -615,6 +621,26 @@ defmodule LoopctlWeb.RunnerChannel do
   end
 
   defp note_kind_refusal(socket, _reply, _record), do: socket
+
+  # THE SUPPRESSION BELONGS TO THE CONNECTION THAT CARRIED THE DISPATCH, not to whichever one
+  # the reply happens to arrive on. `DispatchLedger.record_reply/3` fences on
+  # `(tenant_id, runner_id, dispatch_id)` and `claim_epoch` — never on a socket — so a reply
+  # is accepted on ANY of the runner's channels.
+  #
+  # Without this, a reply that crosses a reconnect punishes the wrong connection: the runner
+  # decides locally it cannot run a dispatch, its socket drops before the reply flushes, it
+  # reconnects, re-declares the kind and sends the queued refusal — and the FRESH connection,
+  # which has contradicted nothing, is suppressed for its whole life. That also defeats the
+  # remedy this module and the pool's OpenAPI text both promise, "reconnecting clears it",
+  # for the connection that just performed it.
+  defp pushed_here?(%{assigns: %{pushed_dispatches: pushed}}, %{dispatch_id: id}),
+    do: MapSet.member?(pushed, id)
+
+  defp pushed_here?(_socket, _record), do: false
+
+  defp remember_pushed(socket, dispatch) do
+    update_in(socket.assigns.pushed_dispatches, &MapSet.put(&1, dispatch.dispatch_id))
+  end
 
   # THE DECLARATION IS LEFT EXACTLY AS THE RUNNER SENT IT. An earlier version of this took
   # the kind out of `:kinds`, which made the pool report a statement the machine never made:
@@ -668,7 +694,9 @@ defmodule LoopctlWeb.RunnerChannel do
     case DispatchLedger.record_push(socket.assigns.tenant_id, dispatch) do
       {:ok, :pushed} ->
         push(socket, "dispatch", dispatch)
-        {:noreply, socket}
+        # Remembered so a `kind_not_supported` reply can be attributed to the connection
+        # that actually carried the dispatch — see `note_kind_refusal/3`.
+        {:noreply, remember_pushed(socket, dispatch)}
 
       {:ok, {:already, decided}} ->
         log_undelivered(socket, dispatch, "another process already decided: #{decided}")

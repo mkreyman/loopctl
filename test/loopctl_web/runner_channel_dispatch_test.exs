@@ -780,6 +780,46 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       assert_push "dispatch", _, @reply_timeout
     end
 
+    # #834 round 3, finding 4. `record_reply/3` fences on (tenant, runner, dispatch_id) and
+    # claim_epoch, never on a socket, so a reply is accepted on ANY of the runner's channels.
+    # A refusal that crosses a reconnect would otherwise suppress the FRESH connection, which
+    # contradicted nothing — and defeat the "reconnecting clears it" remedy for the very
+    # connection that just performed it.
+    test "a refusal that crosses a reconnect does not suppress the new connection",
+         %{runner: runner, raw: raw, channel: channel} do
+      channel = rejoin_declaring(channel, raw, runner, ["implement"])
+
+      payload = dispatch_payload(runner.tenant_id)
+      assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
+      assert_push "dispatch", _, @reply_timeout
+
+      # The socket drops with the reply unflushed, and the runner reconnects declaring the
+      # same kind. This connection has been sent nothing.
+      channel = rejoin_declaring(channel, raw, runner, ["implement"])
+
+      # The queued refusal arrives here, naming the dispatch the PREVIOUS connection carried.
+      ref =
+        push(channel, "dispatch_reply", %{
+          "dispatch_id" => payload["dispatch_id"],
+          "claim_epoch" => payload["claim_epoch"],
+          "decision" => "refused",
+          "reason" => "kind_not_supported"
+        })
+
+      assert_reply ref, :ok, _, @reply_timeout
+
+      # It is still recorded — the ledger is where the refusal durably lives.
+      assert DispatchLedger.kind_unsupported?(runner.tenant_id, runner.id, "implement")
+
+      # But THIS connection is not suppressed, and still gets work.
+      assert Runners.suppressed_kinds(socket_meta(channel)) == []
+
+      assert :ok =
+               Runners.dispatch(runner.tenant_id, runner.id, dispatch_payload(runner.tenant_id))
+
+      assert_push "dispatch", _, @reply_timeout
+    end
+
     test "an ordinary refusal does not suppress a declared kind",
          %{runner: runner, raw: raw, channel: channel} do
       channel = rejoin_declaring(channel, raw, runner, ["implement"])

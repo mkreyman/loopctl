@@ -390,6 +390,12 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     # array a join may carry.
     @max_declared_kinds 20
 
+    # And the other half of that bound, which the entry count alone does not give: a kind is
+    # an identifier, and the longest this contract has ever named is nine characters. The
+    # size that matters is entries TIMES length, because the value is replicated to every
+    # node by Presence and echoed on the pool read.
+    @max_kind_length 64
+
     OpenApiSpex.schema(
       %{
         title: "RunnerJoin",
@@ -447,7 +453,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
             type: :boolean,
             description: "True when the runner accepts no new dispatches."
           },
-          # NOTHING HERE MAY REFUSE THE JOIN OVER THE CONTENT OF THIS ARRAY. A capability
+          # NOTHING HERE REFUSES A JOIN OVER WHICH KINDS THE ARRAY NAMES. A capability
           # declaration is the one field where being strict is backwards: a runner upgraded
           # ahead of loopctl — SAME MAJOR, so `supported_version/1` admits it — that declares
           # a kind this server has not heard of would be refused the socket entirely and
@@ -456,17 +462,32 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           # `RunnerChannel`, and `known_fields/2` dropping unknown KEYS in silence), and a
           # minor version is supposed to be additive in both directions.
           #
-          # So: no `enum` — an unknown kind is INTERSECTED away by
-          # `Loopctl.Runners.declared_kinds/1`, never refused here. No `minItems` or
-          # `uniqueItems` either; see the note above `@exported_keywords`, since a keyword
-          # this exporter cannot publish refuses a join for a reason the vendored contract
-          # does not state. `maxItems` stays and is a RESOURCE bound rather than a semantic
-          # one, set well above the vocabulary so it cannot be hit by a runner declaring
-          # kinds a later version adds, or by a duplicate.
+          # So there is no `enum`: an unknown kind is carried through and simply never
+          # matches, because `kind_supported/4` asks `kind in kinds`.
+          # `Loopctl.Runners.declared_kinds/1` returns the declaration VERBATIM — an
+          # intersection against `Kinds.all/0` was tried there and removed as inert, and its
+          # `@doc` records why; do not reintroduce one here in the schema either.
+          #
+          # SHAPE is still enforced, and that is a different thing from vocabulary. A
+          # non-string entry, more than `@max_declared_kinds` entries, or an entry longer
+          # than `@max_kind_length` refuses the join — `declared_kinds/1` keeps its own
+          # `is_binary` fallback because a meta can be built without passing this cast. Those
+          # bounds are about what the payload IS, not about which words a future runner may
+          # use, so none of them can drop a forward-version machine.
+          #
+          # No `minItems` or `uniqueItems`; see the note above `@exported_keywords`, since a
+          # keyword this exporter cannot publish refuses a join for a reason the vendored
+          # contract does not state.
+          #
+          # `maxLength` is the entry bound and it is load-bearing, not decoration: this value
+          # goes verbatim into the Presence meta, which `Phoenix.Tracker` replicates to EVERY
+          # node for the life of the socket, and `GET /api/v1/runners/pool` echoes it. Entries
+          # alone would otherwise let one machine carry ~64 KB (the endpoint's frame cap)
+          # where every other field in this schema keeps the meta near 10 KB.
           kinds: %Schema{
             type: :array,
             maxItems: @max_declared_kinds,
-            items: %Schema{type: :string},
+            items: %Schema{type: :string, maxLength: @max_kind_length},
             description:
               "The dispatch kinds this machine runs (since 1.6.0). Where present and " <>
                 "NON-EMPTY this is the ONLY thing consulted: loopctl refuses a kind " <>
