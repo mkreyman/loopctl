@@ -670,6 +670,16 @@ defmodule Loopctl.ObanConfig do
            # rather than a state an operator can be half in. Bounded per run. Keep in sync with
            # the crontab assertion in oban_plugins_config_test.exs.
            {"* * * * *", Loopctl.Workers.TriageDispatchWorker},
+           # #803 §3: the loop's LAST transition, `verified -> done`. Nothing in `lib/` wrote
+           # that edge, so a story that passed every gate stopped one stage from the end for
+           # ever — `verified` had no writable edge out at all, not even for an operator. NOT
+           # behind `:dispatch_driver_enabled`, unlike the three entries above, and that is
+           # deliberate: the flag gates STARTING sessions on somebody's machines, while this
+           # records that work already finished, so gating it would strand every in-flight
+           # story at the final stage the moment a fleet turned the driver off. Local reads
+           # only, no forge call. Bounded per run. Keep in sync with the crontab assertion in
+           # oban_plugins_config_test.exs.
+           {"* * * * *", Loopctl.Workers.StoryCompletionWorker},
            {"* * * * *", Loopctl.Workers.SystemConfigRefreshWorker},
            # #803 §11: retention for the delivery loop's two unbounded high-volume tables,
            # `runner_trace_events` and `intake_deliveries`. Nothing else deletes from either.

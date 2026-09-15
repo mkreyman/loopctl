@@ -41,6 +41,33 @@ All notable changes to loopctl are documented here.
   a draft; `instruction_override` is clean on both near-misses and does.
   `test/loopctl/delivery/draft_false_positive_test.exs` pins that rate against the corpus.
 
+- **The delivery loop can now FINISH: `verified -> done` has a writer (#803 §3).** Nothing in
+  `lib/` wrote that edge, so a story that passed every gate — triaged, queued, claimed,
+  implemented, reviewed, merged, deployed and verified — stopped one stage from the end of the
+  line and stayed there for ever. `verified` had no writable edge out at all: it is not a
+  runner source stage, it carries no `:session_escalated`, and `:human_resolution` LEAVES
+  `escalated` rather than reaching it, so not even an operator could move it.
+
+  `Loopctl.Delivery.Completion` plus `Loopctl.Workers.StoryCompletionWorker` (every minute)
+  advance a verified story once its outward obligation is SETTLED — its
+  `intake_issue_closures` row is `:closed`, **or there is no row at all** because the story
+  came from no intake record and owed the reporter nothing. That second
+  clause is load-bearing: keying completion on the closure row alone would strand every
+  backfill and every API-created story at `verified` for ever, which is the same defect one
+  layer down. A `:pending` row means the reporter has been promised something and nothing has
+  been said to them yet, so the story waits and the next pass asks again. **An `:abandoned`
+  row does not settle either**, though it looks terminal: `IssueClosures.requeue_abandoned/1`
+  reopens one, and `done` cannot be walked back — so a misconfigured `GITHUB_TOKEN` that
+  abandons a batch of closures must not cause that whole batch to be recorded as discharged a
+  minute before the operator fixes it.
+
+  **Not behind `:dispatch_driver_enabled`**, unlike the three delivery crons beside it. That
+  flag gates STARTING sessions on somebody's machines unattended; this records that work
+  already finished and spends nothing. Gating it would strand every in-flight story at the
+  final stage the moment a fleet turned the driver off — the absorbing state, on a switch.
+
+  No new operator variable, no migration, no manual step.
+
 - **Contract 1.11.0 — a `stage` refused `stale_stage` carries the ROW.** The refusal now
   answers with `stage`, `claim_epoch`, `lock_version`, `attempts` and `effects` beside the
   `reason` — the same shape the ok ack sends, from the same renderer

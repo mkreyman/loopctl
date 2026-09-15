@@ -353,6 +353,43 @@ defmodule Loopctl.ObanPluginsConfigTest do
     end
   end
 
+  describe "StoryCompletionWorker crontab entry" do
+    setup do
+      plugins = Application.get_env(:loopctl, Oban)[:plugins]
+
+      {Oban.Plugins.Cron, cron_opts} =
+        Enum.find(plugins, &match?({Oban.Plugins.Cron, _}, &1))
+
+      entry =
+        Enum.find(cron_opts[:crontab], fn
+          {_schedule, Loopctl.Workers.StoryCompletionWorker} -> true
+          {_schedule, Loopctl.Workers.StoryCompletionWorker, _opts} -> true
+          _ -> false
+        end)
+
+      %{entry: entry}
+    end
+
+    test "the StoryCompletionWorker entry exists in the crontab", %{entry: entry} do
+      assert entry,
+             "expected a StoryCompletionWorker crontab entry — #803 §3. Without one NOTHING " <>
+               "writes `verified -> done`: a story that passed every gate stops one stage " <>
+               "from the end of the line for ever, and `verified` has no other edge out — " <>
+               "not runner-reportable, no `:session_escalated`, and `:human_resolution` " <>
+               "LEAVES `escalated` rather than reaching it. Not even an operator can move it."
+    end
+
+    test "it is NOT parked, and NOT gated on the driver flag", %{entry: entry} do
+      refute Loopctl.Workers.StoryCompletionWorker in Loopctl.ObanConfig.parked_crons()
+
+      # The driver flag gates STARTING sessions on somebody's machines. This records that
+      # work already finished, so gating it would strand every in-flight story at the final
+      # stage the moment a fleet turned the driver off — the absorbing state, on a switch.
+      assert elem(entry, 0) == "* * * * *"
+      assert tuple_size(entry) == 2
+    end
+  end
+
   describe "#249: inert KB crons are PARKED by default" do
     setup do
       plugins = Application.get_env(:loopctl, Oban)[:plugins]
