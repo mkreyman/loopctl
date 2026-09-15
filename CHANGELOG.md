@@ -24,6 +24,19 @@ All notable changes to loopctl are documented here.
   UNLINEAGED key below `user` role is refused `root_dispatch_forbidden`. A `user` key or a
   lineaged orchestrator may place; an unlineaged orchestrator may not.
 
+  **A caller may not supply the `story` object.** `RunnerDispatch` carries the story as typed
+  fields and the runner composes its PROMPT from them; the contract's stated reason for that
+  shape is that "a control plane able to hand a runner prose to execute is able to run
+  anything on it". `Loopctl.Delivery.StoryPayload.build/3` is the server-side builder and
+  `place/4` does not call it, so the object was whatever the caller sent — unreachable while
+  `place/4` had no caller, and reachable the moment this endpoint existed. It is refused with
+  `422 story_not_accepted` rather than dropped, so a caller cannot believe it sent one.
+
+  **Consequence, stated plainly:** until `place/4` builds the story server-side, an implement
+  dispatch placed through this endpoint carries NO story object. The runner sees exactly what
+  loopctl vouched for, which is nothing. Wiring `StoryPayload.build/3` into the claim path is
+  the follow-on that makes implement placements complete.
+
   Six of `place/4`'s documented refusals had no `FallbackController` clause, and its catch-all
   answers 500 for an atom it does not know. They are mapped in the controller, with the status
   and code the PLUGS use for the same conditions elsewhere (503 `tenant_halted`, 403

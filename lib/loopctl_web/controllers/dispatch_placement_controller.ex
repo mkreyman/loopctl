@@ -152,8 +152,44 @@ defmodule LoopctlWeb.DispatchPlacementController do
     # `Runners.dispatch/3`, which casts it against `RunnerDispatch` and refuses anything the
     # contract does not declare. Picking fields out here would be a second, quieter schema
     # that drifts from the published one.
+    #
+    # EXCEPT `story`, which is REFUSED — see `caller_supplied_story?/1`.
     dispatch = Map.drop(params, ["runner_id"])
 
+    if caller_supplied_story?(dispatch),
+      do: refuse_story(conn),
+      else: do_place(conn, tenant, runner_id, dispatch)
+  end
+
+  # THE STORY OBJECT MAY NOT COME FROM THE WIRE, and this endpoint is what would have let it.
+  #
+  # `RunnerDispatch` carries the story as TYPED FIELDS — title, description, acceptance
+  # criteria — and the runner composes its prompt from them. The contract's own reason for
+  # that shape is security: "loopctl never sends a prompt ... because a dispatch runs as the
+  # machine's user and a control plane able to hand a runner prose to execute is able to run
+  # anything on it." A caller-supplied `story` IS prose handed to a runner, one level along.
+  #
+  # `Loopctl.Delivery.StoryPayload.build/3` is the server-side builder — "built from
+  # Postgres" — and `place/4` does not call it, so the object was whatever the caller sent.
+  # That was unreachable while `place/4` had no caller; THIS endpoint makes it reachable, so
+  # closing it belongs to this change and not to a later one.
+  #
+  # Refused rather than silently dropped: a caller that sent a story and got a dispatch with
+  # none would have no way to tell, and the runner would start work on a story object nobody
+  # intended. Until `place/4` builds it server-side, an implement dispatch placed here carries
+  # no story object and the runner sees exactly what loopctl vouched for — nothing.
+  defp caller_supplied_story?(dispatch), do: Map.has_key?(dispatch, "story")
+
+  defp refuse_story(conn) do
+    error(conn, 422, "story_not_accepted", %{
+      message:
+        "The story object is built by loopctl from its own records and may not be supplied " <>
+          "by a caller: a runner composes its prompt from those fields, so accepting them " <>
+          "here would let a caller hand a runner prose to execute. Send `story_id` alone."
+    })
+  end
+
+  defp do_place(conn, tenant, runner_id, dispatch) do
     case Placement.place(tenant.id, runner_id, dispatch,
            api_key: conn.assigns.current_api_key,
            actor_label: "api:dispatch_placement"
