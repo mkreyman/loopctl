@@ -43,6 +43,42 @@ defmodule Loopctl.Delivery.MergePrecondition do
      row recorded, which is the head CI ran on and the story was verified at. A push after
      either is ordinary work rather than an escalation, so it goes back to `implementing`
      on `:base_moved`; it does not merge, because no CI run and no verifier saw it.
+  6. **The repository is not one the loop deploys itself from** — issue #803's correction
+     11, and the only precondition decided before anything else, including a forge outage.
+     See below.
+
+  ## The loop may not merge its own control plane
+
+  loopctl deploys on every push to master AND IS the control plane: a story that changes
+  loopctl restarts the node holding its own `DurableServer`, and a rolling deploy drops
+  every runner socket — including the socket of the session that asked for the merge. So a
+  merge of this repository is not a merge that went wrong afterwards; it is one that cannot
+  report its own outcome. `claude-config` is excluded on the same ground one layer up: it is
+  symlinked into `~/.claude` on every machine in the fleet, so a change there rewrites the
+  instructions every session is running under, this one included.
+
+  This is `{:self_deploy_excluded, repo}`. It OVERRIDES the decision and replaces no part of
+  the analysis: every other gate still runs and every reason it finds is still reported, so
+  an ungated merge of this repository — the byzantine event correction 11 is actually about —
+  still names its sha, and the human who now has to merge by hand still sees which head and
+  how large a diff. What it does override is the decision itself, `:unevaluated` included,
+  and it clears `retry_after`: no retry can clear an exclusion, and leaving one tells a
+  session to come back for a decision that cannot change until
+  `max_consecutive_unevaluated` escalates it naming the forge rather than the policy.
+
+  The list reaches `judge/1` as a FACT (`:self_deploy_excluded`), resolved by `gather/3`
+  alongside the triggers, so `judge/1` stays the pure function this moduledoc promises.
+
+  The list is CONFIGURABLE (`:self_deploy_excluded_repos`) and defaults to the two repos
+  above, because "the repository this control plane deploys from" is the real invariant and
+  a hardcoded `mkreyman/loopctl` is simply wrong for anyone else running loopctl — a guard
+  that names one owner's slug is off by default for every other deployment, which is worse
+  than one that can be set. Matching is case-insensitive, as GitHub's own names are.
+
+  It is a REFUSAL rather than a silent skip: the story escalates to a human, who merges it
+  themselves. Nothing here can merge anything — this module returns a verdict and the
+  session acts on it — so refusing is the whole of the enforcement available, and that is
+  precisely why it must never be reachable past a branch that reports `:allow`.
 
   ## Gate A's inputs are caller-asserted, and every verdict says so
 
@@ -180,7 +216,11 @@ defmodule Loopctl.Delivery.MergePrecondition do
           required(:recorded_head_sha) => String.t() | nil,
           required(:recorded_allow_sha) => String.t() | nil,
           optional(:trio_outputs) => term(),
-          optional(:effect_proof) => map() | nil
+          optional(:effect_proof) => map() | nil,
+          # OPTIONAL, and the fallback behind it is deliberate: a caller of `judge/1` that
+          # omits it gets the configured list, because a guard that disappears when a fact is
+          # missing is the failure this key exists to prevent.
+          optional(:self_deploy_excluded) => [String.t()]
         }
 
   @type error :: :not_found | :no_stage | :wrong_stage
@@ -203,6 +243,12 @@ defmodule Loopctl.Delivery.MergePrecondition do
   # of escalating a story that would have recovered is one human glance, and the cost of not
   # escalating is a story nobody ever hears about again.
   @max_consecutive_unevaluated 5
+
+  # Issue #803, correction 11. loopctl IS the control plane and deploys on every push to
+  # master; claude-config is symlinked into ~/.claude on every machine in the fleet. See the
+  # moduledoc. Overridable with `config :loopctl, :self_deploy_excluded_repos, [...]`,
+  # because another deployment's control plane is not at this slug.
+  @default_self_deploy_excluded ["mkreyman/loopctl", "mkreyman/claude-config"]
 
   @doc "The hard bound the design fixes, whatever the configuration says."
   @spec hard_bound() :: %{max_files: pos_integer(), max_changed_lines: pos_integer()}
@@ -235,11 +281,50 @@ defmodule Loopctl.Delivery.MergePrecondition do
       recorded_head_sha: Map.get(facts, :recorded_head_sha)
     }
 
+    base
+    |> undecided(unevaluated_reasons(facts), input_reasons(facts), carried, facts)
+    |> exclude_self_deploy(facts)
+  end
+
+  # THE EXCLUSION OVERRIDES THE DECISION AND REPLACES NOTHING ELSE, which is the correction
+  # of the worst thing this guard did in its first form.
+  #
+  # It used to refuse from `base` before `decide/4` ran at all. That silenced
+  # `{:ungated_merge, sha, why}` and `:merged_without_sha` — this module's own comment calls
+  # the first "the loudest signal this module produces" and forbids suppressing it — on
+  # EXACTLY the repositories where it matters most. A merge of loopctl's own pull request
+  # with no recorded allow is the byzantine event correction 11 exists to catch, and the
+  # escalation would have read "we refuse to merge this repository" instead of "a merge
+  # nobody authorised landed at sha c…". It also left `head_sha`, `merge_sha`,
+  # `merge_base_sha` and `diffstat` nil, so the human who now has to merge by hand was told
+  # neither which head was refused nor how big the change is.
+  #
+  # Running the whole analysis and then overriding keeps every reason and every field. The
+  # decision is still unreachable-by-construction: `:allow`, `:already_merged`, `:head_moved`
+  # and `:unevaluated` all become `:refuse` here, and `retry_after` is cleared because no
+  # retry can clear an exclusion — `max_consecutive_unevaluated` would otherwise escalate it
+  # naming the forge rather than the policy.
+  defp exclude_self_deploy(verdict, facts) do
+    case self_deploy_reasons(facts) do
+      [] ->
+        verdict
+
+      excluded ->
+        %{
+          verdict
+          | decision: :refuse,
+            retry_after: nil,
+            reasons: Enum.uniq(excluded ++ verdict.reasons)
+        }
+    end
+  end
+
+  defp undecided(base, transient, other, carried, facts) do
     # A transient forge fault is decided FIRST and decides everything: nothing was
     # evaluated, so nothing transitions. The reasons still carry whatever else is known —
     # a caller fixing custody should not have to wait for the forge to come back to hear
     # about it — but the DECISION is that there is no verdict yet.
-    case {unevaluated_reasons(facts), input_reasons(facts)} do
+    case {transient, other} do
       {[_ | _] = transient, other} ->
         %{
           base
@@ -253,6 +338,67 @@ defmodule Loopctl.Delivery.MergePrecondition do
 
       {[], []} ->
         decide(base, facts, value(facts, :pull_request), carried)
+    end
+  end
+
+  @doc """
+  The repositories this loop will not merge, lowercased and validated. See the moduledoc.
+
+  Public so `GET`-ing a verdict can SHOW the list rather than leaving a caller to discover
+  it by being refused, the way `hard_bound/0` already does for the size bound.
+
+  NON-BINARY ENTRIES ARE DROPPED rather than mapped over. `String.downcase/1` raises on an
+  atom, on `nil`, and on a list that is not one — so a typo in the config turned every
+  merge-precondition call into a 500, and in one ordering a 500 AFTER the escalation had
+  already been written: an unreadable repo refuses `:repository_unresolved`, `enforce/3`
+  writes the transition, and only then does rendering the verdict raise. A guard whose
+  misconfiguration takes down the endpoint that reports it is worse than no guard.
+  """
+  @spec self_deploy_excluded_repos() :: [String.t()]
+  def self_deploy_excluded_repos,
+    do:
+      normalise_excluded(
+        Application.get_env(:loopctl, :self_deploy_excluded_repos, @default_self_deploy_excluded)
+      )
+
+  @doc """
+  The normalisation `self_deploy_excluded_repos/0` applies to a configured value.
+
+  Public and PURE so the misconfiguration cases can be tested without `Application.put_env`,
+  which this repo forbids in tests — the rule exists because VM-global state is not isolated
+  between async tests, and a guard's own test must not be the thing that breaks others.
+  """
+  @spec normalise_excluded(term()) :: [String.t()]
+  def normalise_excluded(configured) do
+    configured
+    |> List.wrap()
+    |> Enum.filter(&is_binary/1)
+    |> Enum.map(&String.downcase/1)
+  end
+
+  # A FACT, not a read of the application environment, and that is what keeps `judge/1`'s
+  # documented purity true — "no database, no forge, no application environment" is a claim
+  # this function was quietly falsifying. It also made the configurability UNTESTABLE: the
+  # list is set in no config file, this repo forbids `Application.put_env` in tests, so every
+  # test saw the default and deleting the `Application.get_env` call entirely left the suite
+  # green. Reaching it through the facts means a test names its own list, and an operator's
+  # list is exercised by the same code path as ours.
+  #
+  # `gather/3` resolves it; a caller of `judge/1` that omits it gets the configured list,
+  # because a guard that silently disappears when a fact is missing is the failure this whole
+  # PR is about.
+  defp self_deploy_reasons(facts) do
+    excluded = Map.get_lazy(facts, :self_deploy_excluded, &self_deploy_excluded_repos/0)
+
+    # An UNREADABLE repo is not judged here: it is already `:repository_unresolved` from
+    # `input_reasons/1`, and answering "not excluded" for a repository nobody could read
+    # would be the cap-that-cannot-bind shape this guard exists to avoid.
+    case value(facts, :repo) do
+      repo when is_binary(repo) ->
+        if String.downcase(repo) in excluded, do: [{:self_deploy_excluded, repo}], else: []
+
+      _unreadable ->
+        []
     end
   end
 
@@ -679,6 +825,10 @@ defmodule Loopctl.Delivery.MergePrecondition do
       head_files: repo_files(repo, pull_request, :head_sha, stage.head_sha),
       base_files: repo_files(repo, pull_request, :merge_base_sha, stage.head_sha),
       triggers: DeliveryGates.load_triggers(),
+      # Resolved HERE, with the other configured facts, so `judge/1` stays the pure function
+      # its moduledoc says it is and a test can name a different list without touching
+      # VM-global state.
+      self_deploy_excluded: self_deploy_excluded_repos(),
       custody: Progress.merge_custody_status(story),
       # The head CI ran on and the story was verified at, and the head a previous allow was
       # granted for. Both are read from the stage row, never from the caller.

@@ -153,6 +153,211 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
     end
   end
 
+  describe "the loop may not merge its own control plane (#803 correction 11)" do
+    # loopctl deploys on every push to master AND is the control plane: merging it restarts
+    # the node holding the story's own DurableServer and drops every runner socket, including
+    # the socket of the session that asked. claude-config is symlinked into ~/.claude on every
+    # machine, so a change there rewrites what every live session is running under.
+    test "an excluded repository refuses on facts that would otherwise ALLOW" do
+      clean = [files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 10}]
+
+      # The positive control, and it is the whole test: without it this would pass against an
+      # implementation that refused every repository, which is the same guard-that-cannot-
+      # distinguish defect one layer up.
+      assert judge(clean).decision == :allow
+
+      for repo <- ["mkreyman/loopctl", "mkreyman/claude-config"] do
+        verdict = judge(clean ++ [repo: {:ok, repo}])
+
+        assert verdict.decision == :refuse, "#{repo} was not refused"
+        assert {:self_deploy_excluded, repo} in verdict.reasons
+      end
+    end
+
+    test "the match is case-insensitive, as GitHub's own names are" do
+      verdict =
+        judge(
+          files: ["lib/widgets/thing.ex"],
+          diffstat: %{files: 1, changed_lines: 10},
+          repo: {:ok, "MKreyman/LoopCtl"}
+        )
+
+      assert verdict.decision == :refuse
+      # The reason carries the repo AS GIVEN, not the lowercased form it matched on: an
+      # operator reading the escalation is looking for the string they configured.
+      assert {:self_deploy_excluded, "MKreyman/LoopCtl"} in verdict.reasons
+    end
+
+    test "it is decided BEFORE a transient forge fault, so no retry is ever suggested" do
+      # `:unevaluated` carries a `retry_after` and counts toward
+      # `max_consecutive_unevaluated`. On a repository that can never be merged that is two
+      # wrongs: it tells the session to come back for a decision that cannot change, and when
+      # the count runs out it escalates naming the FORGE rather than the exclusion — so the
+      # human reads "GitHub was down" about a permanent policy.
+      verdict =
+        judge(
+          files: ["lib/widgets/thing.ex"],
+          diffstat: %{files: 1, changed_lines: 10},
+          repo: {:ok, "mkreyman/loopctl"},
+          head_files: {:error, {:github_rate_limited, 429, 60}}
+        )
+
+      assert verdict.decision == :refuse
+      assert verdict.retry_after == nil
+      assert {:self_deploy_excluded, "mkreyman/loopctl"} in verdict.reasons
+
+      # And the transient fault is still REPORTED — the refusal is not a reason to hide it.
+      assert {:head_files_unavailable, {:github_rate_limited, 429, 60}} in verdict.reasons
+    end
+
+    test "an ALREADY MERGED excluded repository refuses rather than reporting a clean run" do
+      # The event correction 11 exists to prevent, having happened. Reporting `already_merged`
+      # with no reasons would make the one occurrence of it the quietest verdict this module
+      # produces.
+      merged = [
+        merged?: true,
+        state: "closed",
+        merge_sha: String.duplicate("c", 40),
+        recorded_allow_sha: @head,
+        diffstat: %{files: 1, changed_lines: 1}
+      ]
+
+      # The positive control: these same facts on an ordinary repository ARE `already_merged`.
+      assert judge(merged).decision == :already_merged
+
+      verdict = judge(merged ++ [repo: {:ok, "mkreyman/loopctl"}])
+
+      assert verdict.decision == :refuse
+      assert {:self_deploy_excluded, "mkreyman/loopctl"} in verdict.reasons
+    end
+
+    test "an UNGATED merge of an excluded repository still names its sha" do
+      # THE FAILURE THIS GUARD'S FIRST VERSION CAUSED. Refusing before `decide/4` ran meant
+      # `ungated_reasons/2` was never evaluated, so a merge nobody authorised — on loopctl's
+      # own repository, which is precisely the byzantine event correction 11 is about — was
+      # reported as "we refuse to merge this repository" and the sha was never named. This
+      # module's own comment calls that the loudest signal it produces and forbids
+      # suppressing it; the guard did exactly that, for a different reason.
+      ungated = [
+        merged?: true,
+        state: "closed",
+        merge_sha: String.duplicate("c", 40),
+        recorded_allow_sha: nil,
+        diffstat: %{files: 1, changed_lines: 1}
+      ]
+
+      ordinary = judge(ungated)
+
+      assert {:ungated_merge, _sha, :no_recorded_allow} =
+               List.keyfind(ordinary.reasons, :ungated_merge, 0)
+
+      verdict = judge(ungated ++ [repo: {:ok, "mkreyman/loopctl"}])
+
+      assert verdict.decision == :refuse
+      assert {:self_deploy_excluded, "mkreyman/loopctl"} in verdict.reasons
+
+      # BOTH, not one: the exclusion overrides the DECISION and silences no analysis.
+      assert {:ungated_merge, _sha, :no_recorded_allow} =
+               List.keyfind(verdict.reasons, :ungated_merge, 0)
+    end
+
+    test "the refusal still carries the sha and the diffstat the operator needs" do
+      # The human now merging this by hand is told which head is refused and how big the
+      # change is. Refusing off the bare verdict left every one of these nil, which this
+      # module deliberately avoids on its other merged refusal.
+      verdict =
+        judge(
+          files: ["lib/widgets/thing.ex"],
+          diffstat: %{files: 3, changed_lines: 40},
+          repo: {:ok, "mkreyman/loopctl"}
+        )
+
+      assert verdict.decision == :refuse
+      assert verdict.head_sha == @head
+      assert verdict.merge_base_sha == @base
+      assert verdict.diffstat == %{files: 3, changed_lines: 40}
+    end
+
+    test "an OPERATOR'S OWN list is what binds, not only the default" do
+      # The configurability the CHANGELOG promises had no assertion behind it: the key is set
+      # in no config file, this repo forbids `Application.put_env` in tests, so every test saw
+      # the default and DELETING the `Application.get_env` call left the whole suite green.
+      # The list is a fact now, so this exercises an operator's list through the same code
+      # path as ours — and a self-hoster whose control plane is at another slug is no longer
+      # trusting an untested branch.
+      clean = [files: ["lib/widgets/thing.ex"], diffstat: %{files: 1, changed_lines: 10}]
+
+      # `acme/widgets` is the fixture repo every other test in this file merges happily.
+      assert judge(clean).decision == :allow
+
+      verdict = judge(clean ++ [self_deploy_excluded: ["acme/widgets"]])
+      assert verdict.decision == :refuse
+      assert {:self_deploy_excluded, "acme/widgets"} in verdict.reasons
+
+      # And ours stops binding under that list, so this reads the FACT rather than ORing it
+      # with the default. Asserted on the REASON, not on `:allow`: the triggers are resolved
+      # per repository, so naming a different repo moves Gate B and a decision assertion here
+      # would be measuring that instead of the exclusion.
+      under_other_list =
+        judge(clean ++ [repo: {:ok, "mkreyman/loopctl"}, self_deploy_excluded: ["acme/widgets"]])
+
+      refute {:self_deploy_excluded, "mkreyman/loopctl"} in under_other_list.reasons
+    end
+
+    test "a missing fact falls back to the configured list rather than disabling the guard" do
+      # A guard that silently disappears when a fact is absent is the failure this whole
+      # change is about. Every other test here calls `judge/1` through `facts/1`, which
+      # supplies the fact; this one deletes it deliberately.
+      #
+      # Asserted on the REASON and not on the decision: `mkreyman/loopctl` moves Gate B's
+      # trigger resolution, so the verdict is `:refuse` either way and a decision assertion
+      # would pass with the fallback deleted — it did, under mutation, until this changed.
+      facts =
+        Map.delete(
+          facts(
+            files: ["lib/widgets/thing.ex"],
+            diffstat: %{files: 1, changed_lines: 10},
+            repo: {:ok, "mkreyman/loopctl"}
+          ),
+          :self_deploy_excluded
+        )
+
+      assert {:self_deploy_excluded, "mkreyman/loopctl"} in MergePrecondition.judge(facts).reasons
+    end
+
+    test "a misconfigured list is normalised rather than raising mid-request" do
+      # `String.downcase/1` raises on an atom and on nil, and in one ordering the raise landed
+      # AFTER the escalation was written: an unreadable repo refuses `:repository_unresolved`,
+      # `enforce/3` writes the transition, and only rendering the verdict blows up — so the
+      # story is escalated and the caller gets a 500 with no verdict. A guard whose
+      # misconfiguration takes down the endpoint that reports it is worse than no guard.
+      #
+      # Tested through the PURE normaliser, not by setting the key: this repo forbids
+      # `Application.put_env` in tests because VM-global state is not isolated between async
+      # ones, and a guard's own test must not be what breaks the others.
+      assert MergePrecondition.normalise_excluded(nil) == []
+      assert MergePrecondition.normalise_excluded(:loopctl) == []
+      assert MergePrecondition.normalise_excluded("mkreyman/LoopCtl") == ["mkreyman/loopctl"]
+
+      assert MergePrecondition.normalise_excluded(["mkreyman/LoopCtl", :oops, nil, 7]) ==
+               ["mkreyman/loopctl"]
+    end
+
+    test "an UNREADABLE repository is repository_unresolved, not silently allowed through" do
+      # Answering "not excluded" for a repository nobody could read is the shape this guard
+      # exists to avoid. It is already refused upstream, and this pins that it still is.
+      verdict =
+        judge(
+          files: ["lib/widgets/thing.ex"],
+          diffstat: %{files: 1, changed_lines: 10},
+          repo: {:error, :no_intake_source}
+        )
+
+      assert verdict.decision == :refuse
+      assert {:repository_unresolved, :no_intake_source} in verdict.reasons
+    end
+  end
+
   describe "the hard bound" do
     test "12 files and 1000 lines pass" do
       verdict = judge(files: files(12), diffstat: %{files: 12, changed_lines: 1000})
@@ -788,6 +993,12 @@ defmodule Loopctl.Delivery.MergePreconditionJudgeTest do
       head_files: Keyword.get(opts, :head_files, {:ok, @repo_files}),
       base_files: Keyword.get(opts, :base_files, {:ok, @repo_files}),
       triggers: Keyword.get_lazy(opts, :triggers, &DeliveryGates.load_triggers/0),
+      self_deploy_excluded:
+        Keyword.get_lazy(
+          opts,
+          :self_deploy_excluded,
+          &MergePrecondition.self_deploy_excluded_repos/0
+        ),
       custody: Keyword.get(opts, :custody, :ok),
       recorded_head_sha: Keyword.get(opts, :recorded_head_sha, @head),
       recorded_allow_sha: Keyword.get(opts, :recorded_allow_sha),

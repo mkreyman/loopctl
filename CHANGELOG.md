@@ -6,6 +6,39 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **The loop refuses to merge its own control plane (#803, correction 11).**
+  `Loopctl.Delivery.MergePrecondition` now answers `refuse` with
+  `{:self_deploy_excluded, repo}` for a pull request against loopctl or claude-config, and
+  the story escalates to a human who merges it themselves. loopctl deploys on every push to
+  master AND IS the control plane, so merging it restarts the node holding that story's own
+  `DurableServer` and drops every runner socket — including the socket of the session that
+  asked, which therefore cannot report what happened. claude-config is excluded on the same
+  ground one layer up: it is symlinked into `~/.claude` on every machine, so a change there
+  rewrites the instructions every live session is running under.
+
+  It is decided BEFORE everything else, a forge outage included, because `unevaluated`
+  carries a `retry_after` and counts toward `max_consecutive_unevaluated` — on a repository
+  that can never be merged that tells a session to come back for a decision that cannot
+  change, and then escalates naming the forge rather than the policy.
+
+  **A story in an excluded repository now terminates at `escalated`, so its intake issue is
+  never closed automatically.** `StageMachine`'s resolution verdicts are reached from
+  `{:deployed, :verified}` and `{:triaged, :failed}`; a self-deploy refusal takes
+  `{:ci, :escalated, :merge_gate}`, and `:human_resolution` leads to `queued`, `done` or
+  `failed`, none of which produce a resolution. So the human who merges one of these by hand
+  also closes or comments on the reporter's issue by hand. loopctl's own repository is the
+  primary user of this loop, so that is a real population rather than a corner. Mapping a
+  human resolution onto an intake outcome belongs to #805, which owns the verdict-to-
+  resolution mapping and lands before the loop is turned on for a non-engineer reporter.
+
+  **Operators:** the list defaults to `mkreyman/loopctl` and `mkreyman/claude-config` and is
+  settable with `config :loopctl, :self_deploy_excluded_repos, ["owner/name", ...]` — set it
+  if your control plane is deployed from a different repository, because the default names
+  one owner's slugs and is simply wrong elsewhere. Matching is case-insensitive. The active
+  list is returned on every merge-precondition verdict as `self_deploy_excluded_repos`, so a
+  refusal can be told from a bug without reading the source. Config, not an environment
+  variable, deliberately: loosening this should cost a deploy.
+
 - **`PATCH /api/v1/intake/sources/:id` repoints a source at an epic (#803).** `target_epic_id`
   was writable only at enrolment, so a source enrolled before that column existed could never
   be given one — and a record from a source naming no epic is RETRIED, not escalated, so those
