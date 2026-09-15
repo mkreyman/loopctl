@@ -234,9 +234,11 @@ defmodule LoopctlRunner.TriagePrompt do
     """
   end
 
-  # Read from the SCHEMA, which is where the bounds that actually refuse a verdict live — the
-  # published `limits` table covers three array fields and not the draft story or `contradicts`,
-  # so a sentence built from it would be silent about exactly the caps a session hits. A shape
+  # Read from the SCHEMA, which is where every bound that refuses a verdict lives and cannot be
+  # out of date with itself. The published `limits` table is a convenience that has been wrong
+  # before: at 1.7.0 it covered three array fields and was silent about the draft story and
+  # `contradicts`, the caps a session actually hits, and 1.8.0 filled it in. Reading the schema
+  # was right then and costs nothing now, so it stays the source. A shape
   # this does not know how to describe is skipped rather than crashing prompt construction: a
   # missing sentence costs the session a retry it can make, and a CaseClauseError costs the run.
   defp max_bytes, do: LoopctlRunner.TriageVerdict.max_bytes()

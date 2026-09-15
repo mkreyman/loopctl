@@ -6,7 +6,7 @@ defmodule LoopctlRunner.ContractTest do
   defp join(overrides \\ %{}) do
     Map.merge(
       %{
-        "contract_version" => "1.7.0",
+        "contract_version" => "1.8.0",
         "kinds" => ["implement"],
         "machine" => "minis",
         "cores" => 16,
@@ -20,8 +20,8 @@ defmodule LoopctlRunner.ContractTest do
     )
   end
 
-  test "the vendored contract is v1.7.0 and names the socket and header the client uses" do
-    assert Contract.version() == "1.7.0"
+  test "the vendored contract is v1.8.0 and names the socket and header the client uses" do
+    assert Contract.version() == "1.8.0"
 
     assert %{
              "credential_header" => "x-loopctl-runner-token",
@@ -125,29 +125,102 @@ defmodule LoopctlRunner.ContractTest do
     refute "triage" in LoopctlRunner.Control.kinds()
   end
 
-  test "the published verdict limits do NOT cover every bounded field: the emitter reads the schema" do
-    # DispatchRun builds the story's bounds from limits.story.fields, which covers every bounded
-    # field of RunnerStory. The verdict's table does not: `contradicts` and the whole draft
-    # `story` sub-object are bounded in $defs and absent here. An emitter written to the story's
-    # pattern would therefore compile with NO bounds for the draft story and be refused on the
-    # wire. Raised with loopctl; pinned here so the emitter is not written against it, and so
-    # this fails loudly when the exporter is fixed and the bounds can come from one place.
-    covered =
-      Contract.connection()["limits"]["triage_verdict"]["fields"] |> Map.keys() |> Enum.sort()
+  test "the published limits match the schema at EVERY depth, elements under item_fields" do
+    # At 1.7.0 this table covered three array fields and was silent about the draft story and
+    # contradicts, so a test pinned the gap and went red when loopctl closed it in 1.8.0. What it
+    # asserts now is the property that makes the table usable by an emitter: every bound the
+    # schema declares is published, with the same number, at every depth — a top-level check
+    # would pass while a nested entry (story.fields.touches, contradicts.item_fields.why) was
+    # dropped, which is the same regression one level down. The nesting itself carries meaning:
+    # an ARRAY OF OBJECTS publishes ELEMENT bounds under `item_fields`, an OBJECT its own under
+    # `fields`, and a reader that confused them would apply a per-element cap to the array.
+    assert_published(
+      Contract.connection()["limits"]["triage_verdict"]["fields"],
+      Contract.schema_def("RunnerTriageVerdict")["properties"],
+      "triage_verdict"
+    )
 
-    assert covered == ~w(escalation_reasons evidence missing_information)
+    assert_published(
+      Contract.connection()["limits"]["triage"]["fields"],
+      Contract.schema_def("RunnerTriage")["properties"],
+      "triage"
+    )
 
+    # The one table production code compiles in: DispatchRun builds its bounds from
+    # limits.story.fields and then Map.takes the story down to those keys, so a dropped entry
+    # would silently strip the field from the story a session is handed, not merely unbound it.
+    assert_published(
+      Contract.connection()["limits"]["story"]["fields"],
+      Contract.schema_def("RunnerStory")["properties"],
+      "story"
+    )
+  end
+
+  # Both directions, at every depth: every bounded property is published, every published entry
+  # and every ATTRIBUTE of one corresponds to a bound the schema declares, and the numbers agree.
+  # One direction is not enough — a published `max_item_length` beside `item_fields` (a character
+  # cap on an object element) is meaningless, and an emitter reading the table would apply it.
+  defp assert_published(published, props, path) do
     bounded =
-      Contract.schema_def("RunnerTriageVerdict")["properties"]
-      |> Enum.filter(fn {_name, sub} ->
-        Map.has_key?(sub, "maxLength") or Map.has_key?(sub, "maxItems")
-      end)
+      props
+      |> Enum.filter(fn {_name, sub} -> bounded?(sub) end)
       |> Enum.map(&elem(&1, 0))
       |> Enum.sort()
 
-    assert "contradicts" in bounded
-    refute "contradicts" in covered
-    assert Map.has_key?(Contract.schema_def("RunnerTriageVerdict")["properties"], "story")
+    assert Enum.sort(Map.keys(published)) == bounded, "#{path}: published set differs"
+
+    for {name, limit} <- published do
+      sub = Map.fetch!(props, name)
+      assert Enum.sort(Map.keys(limit)) == expected_attributes(sub), "#{path}.#{name}: attributes"
+      assert_bounds(limit, sub, "#{path}.#{name}")
+    end
+  end
+
+  # What the schema's shape entitles a published entry to carry, and nothing else.
+  defp expected_attributes(sub) do
+    [
+      {"max_length", sub["maxLength"]},
+      {"max_items", sub["maxItems"]},
+      {"max_item_length", get_in(sub, ["items", "maxLength"])},
+      {"fields", sub["properties"]},
+      {"item_fields", get_in(sub, ["items", "properties"])}
+    ]
+    |> Enum.filter(fn {_key, declared} -> declared != nil end)
+    |> Enum.map(&elem(&1, 0))
+    |> Enum.sort()
+  end
+
+  # Bounded by what the schema DECLARES, not by shape: an object counts when something inside it
+  # is bounded (an object of unbounded fields has nothing to publish), and an array of bounded
+  # elements counts even with no maxItems of its own.
+  defp bounded?(sub) do
+    cond do
+      Map.has_key?(sub, "maxLength") or Map.has_key?(sub, "maxItems") -> true
+      props = sub["properties"] -> Enum.any?(props, fn {_name, s} -> bounded?(s) end)
+      items = sub["items"] -> bounded?(items)
+      true -> false
+    end
+  end
+
+  defp assert_bounds(limit, sub, path) do
+    if max = sub["maxLength"], do: assert(limit["max_length"] == max, "#{path}: max_length")
+    if max = sub["maxItems"], do: assert(limit["max_items"] == max, "#{path}: max_items")
+
+    if max = get_in(sub, ["items", "maxLength"]),
+      do: assert(limit["max_item_length"] == max, "#{path}: max_item_length")
+
+    # An object's own fields; never item_fields, which would say "each element" of a thing that
+    # has no elements.
+    if props = sub["properties"] do
+      assert Map.has_key?(limit, "fields"), "#{path}: a bounded object published no fields"
+      assert_published(limit["fields"], props, path)
+    end
+
+    # An array of objects: its ELEMENT bounds, and never under `fields`.
+    if props = get_in(sub, ["items", "properties"]) do
+      assert Map.has_key?(limit, "item_fields"), "#{path}: an array published no item_fields"
+      assert_published(limit["item_fields"], props, path <> "[]")
+    end
   end
 
   test "the validator cannot enforce the verdict's conditional shape, so the emitter must" do

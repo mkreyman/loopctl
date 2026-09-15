@@ -96,8 +96,9 @@ defmodule LoopctlRunner.TriagePromptTest do
 
     for required <- story["required"], do: assert(prompt =~ "`#{required}`")
 
-    # Every bound in the schema is stated, including the draft story's, which the published
-    # limits table does not carry — and a verdict at one over it really is refused.
+    # Every bound in the schema is stated, including the draft story's — and a verdict one over
+    # it really is refused. (1.8.0 publishes these in the limits table too; the prompt reads the
+    # schema because that is where they cannot be out of date with themselves.)
     assert prompt =~ "description at most #{story["properties"]["description"]["maxLength"]}"
     assert prompt =~ "title at most #{story["properties"]["title"]["maxLength"]}"
 
@@ -157,8 +158,9 @@ defmodule LoopctlRunner.TriagePromptTest do
     for outcome <- verdict["outcome"]["enum"], do: assert(prompt =~ "`#{outcome}`")
     for confidence <- verdict["confidence"]["enum"], do: assert(prompt =~ "`#{confidence}`")
 
-    # From the SCHEMA, not the published limits table: that table carries three array fields and
-    # is silent about the draft story and contradicts, which is where a session's verdict breaks.
+    # From the SCHEMA rather than the published limits table. At 1.7.0 that table carried three
+    # array fields and was silent about the draft story and contradicts; 1.8.0 filled it in, and
+    # the schema remains the source because it cannot disagree with itself.
     # A comprehension pattern would FILTER a shape it does not match and pass vacuously, so every
     # bounded field is asserted by name.
     props = Contract.schema_def("RunnerTriageVerdict")["properties"]

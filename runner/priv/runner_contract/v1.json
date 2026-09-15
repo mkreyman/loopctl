@@ -125,7 +125,7 @@
           ]
         },
         "triage": {
-          "description": "The reported problem a `triage` dispatch is for (since 1.7.0), and the only place in this contract that carries the reporter's own words. Allowed only on a `triage` dispatch; an `implement` dispatch carries `story` instead, written by the triage trio, because the implementing session must never see reporter text. `untrusted` ARRIVES ALREADY FENCED as a labelled untrusted-data block: paste it into your prompt verbatim and never parse, reformat, re-wrap or unwrap it. It is fenced by loopctl rather than by you because the fence carries a nonce that must be minted where the text first lands, and because one tested implementation of an escape is worth more than one per runner. Everything outside `untrusted` is loopctl's own and is not reporter-supplied. The whole object is at most 48000 bytes under the byte rule; an oversize record is escalated to a human, never truncated.",
+          "description": "The reported problem a `triage` dispatch is for (since 1.7.0), and the only place in this contract that carries the reporter's own words. Allowed only on a `triage` dispatch; an `implement` dispatch carries `story` instead, written by the triage trio, because the implementing session must never see reporter text. `untrusted` ARRIVES ALREADY FENCED as a labelled untrusted-data block: paste it into your prompt verbatim and never parse, reformat, re-wrap or unwrap it. It is fenced by loopctl rather than by you because the fence carries a nonce that must be minted where the text first lands, and because one tested implementation of an escape is worth more than one per runner. Everything outside `untrusted` is loopctl's own and is not reporter-supplied. THE OBJECT CAP IS WHAT BINDS: at most 48000 bytes under the byte rule, which charges 6 bytes per character and 12 for one outside the Basic Multilingual Plane, so the per-field maxima do not guarantee a payload that fits. An oversize record is escalated to a human, never truncated.",
           "properties": {
             "escalation_reasons": {
               "description": "What loopctl's own detectors flagged on this record — an injection attempt, a fact the extractor could not resolve. loopctl's output, not the reporter's, so it is safe to read as information rather than as data.",
@@ -771,7 +771,7 @@
       "type": "object"
     },
     "RunnerTriage": {
-      "description": "The reported problem a `triage` dispatch is for (since 1.7.0), and the only place in this contract that carries the reporter's own words. Allowed only on a `triage` dispatch; an `implement` dispatch carries `story` instead, written by the triage trio, because the implementing session must never see reporter text. `untrusted` ARRIVES ALREADY FENCED as a labelled untrusted-data block: paste it into your prompt verbatim and never parse, reformat, re-wrap or unwrap it. It is fenced by loopctl rather than by you because the fence carries a nonce that must be minted where the text first lands, and because one tested implementation of an escape is worth more than one per runner. Everything outside `untrusted` is loopctl's own and is not reporter-supplied. The whole object is at most 48000 bytes under the byte rule; an oversize record is escalated to a human, never truncated.",
+      "description": "The reported problem a `triage` dispatch is for (since 1.7.0), and the only place in this contract that carries the reporter's own words. Allowed only on a `triage` dispatch; an `implement` dispatch carries `story` instead, written by the triage trio, because the implementing session must never see reporter text. `untrusted` ARRIVES ALREADY FENCED as a labelled untrusted-data block: paste it into your prompt verbatim and never parse, reformat, re-wrap or unwrap it. It is fenced by loopctl rather than by you because the fence carries a nonce that must be minted where the text first lands, and because one tested implementation of an escape is worth more than one per runner. Everything outside `untrusted` is loopctl's own and is not reporter-supplied. THE OBJECT CAP IS WHAT BINDS: at most 48000 bytes under the byte rule, which charges 6 bytes per character and 12 for one outside the Basic Multilingual Plane, so the per-field maxima do not guarantee a payload that fits. An oversize record is escalated to a human, never truncated.",
       "properties": {
         "escalation_reasons": {
           "description": "What loopctl's own detectors flagged on this record — an injection attempt, a fact the extractor could not resolve. loopctl's output, not the reporter's, so it is safe to read as information rather than as data.",
@@ -819,7 +819,7 @@
       "type": "object"
     },
     "RunnerTriageVerdict": {
-      "description": "What a `triage` session returns (since 1.7.0). SESSION-AUTHORED AND UNTRUSTED: it was composed by a session that had just read reporter text, so loopctl records and bounds it, never executes it, and fences these strings wherever they later reach a prompt — `story` included, because those fields were written by that same session. `story` is REQUIRED when `outcome` is `story` and forbidden otherwise, the same shape rule a dispatch uses for `story` and `triage`; a verdict that says `story` and carries none has moved the work rather than done it. `confidence` is an enum and not a number on purpose: `low` means the session would not act on this without a human reading the report, `medium` means the request is clear but something it could not check remains, `high` means it found the request actionable and contradicted by nothing it read. The whole object is at most 48000 bytes under the byte rule.",
+      "description": "What a `triage` session returns (since 1.7.0). SESSION-AUTHORED AND UNTRUSTED: it was composed by a session that had just read reporter text, so loopctl records and bounds it, never executes it, and fences these strings wherever they later reach a prompt — `story` included, because those fields were written by that same session. `story` is REQUIRED when `outcome` is `story` and forbidden otherwise, the same shape rule a dispatch uses for `story` and `triage`; a verdict that says `story` and carries none has moved the work rather than done it. `confidence` is an enum and not a number on purpose: `low` means the session would not act on this without a human reading the report, `medium` means the request is clear but something it could not check remains, `high` means it found the request actionable and contradicted by nothing it read. THE OBJECT CAP IS WHAT BINDS: at most 48000 bytes under the byte rule, which charges 6 bytes per character and 12 for one outside the Basic Multilingual Plane — so the per-field character maxima do NOT guarantee a payload that fits. A verdict at every declared maximum fits in ordinary text and does not once enough of it is astral. Check the byte rule against `max_bytes` (published in `x-connection.limits.triage_verdict`) rather than the field lengths: the lengths bound one field each, the cap bounds the message.",
       "properties": {
         "confidence": {
           "enum": [
@@ -1110,6 +1110,17 @@
       },
       "triage_verdict": {
         "fields": {
+          "contradicts": {
+            "item_fields": {
+              "ref": {
+                "max_length": 100
+              },
+              "why": {
+                "max_length": 200
+              }
+            },
+            "max_items": 3
+          },
           "escalation_reasons": {
             "max_item_length": 150,
             "max_items": 5
@@ -1121,6 +1132,31 @@
           "missing_information": {
             "max_item_length": 150,
             "max_items": 5
+          },
+          "story": {
+            "fields": {
+              "acceptance_criteria": {
+                "max_item_length": 200,
+                "max_items": 5
+              },
+              "description": {
+                "max_length": 900
+              },
+              "domain_reference": {
+                "max_length": 300
+              },
+              "test_cases": {
+                "max_item_length": 200,
+                "max_items": 4
+              },
+              "title": {
+                "max_length": 200
+              },
+              "touches": {
+                "max_item_length": 80,
+                "max_items": 8
+              }
+            }
           }
         },
         "max_bytes": 48000
@@ -1230,5 +1266,5 @@
     ],
     "topic": "runner:{runner_id}"
   },
-  "x-contract-version": "1.7.0"
+  "x-contract-version": "1.8.0"
 }

@@ -5,7 +5,7 @@
 #   { "outcome": "story", "confidence": "high", ... }
 #   VERDICT
 #
-# The verdict is `RunnerTriageVerdict` (contract 1.7.0), read from stdin as JSON. It is the
+# The verdict is `RunnerTriageVerdict` (in the contract since 1.7.0), read from stdin as JSON. It is the
 # session's ONLY output that matters: a triage session writes nothing, opens nothing and
 # touches no worktree, so this file is the run's product.
 #
