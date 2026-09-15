@@ -2637,6 +2637,9 @@ defmodule Loopctl.Fixtures do
           project_id: project_id,
           issue_number: Map.get(attrs, :issue_number, System.unique_integer([:positive])),
           untrusted_title: Map.get(attrs, :untrusted_title, "a reported problem"),
+          # Overridable so a test can build a record the triage payload cannot fit: the bound
+          # is on the RENDERED object, so the only way to reach it is real reporter text.
+          untrusted_body: Map.get(attrs, :untrusted_body, ""),
           inserted_at: now,
           updated_at: now
         })

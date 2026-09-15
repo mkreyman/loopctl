@@ -193,6 +193,20 @@ case System.get_env("DISPATCH_MAX_TURNS") && Integer.parse(System.get_env("DISPA
   _ -> :ok
 end
 
+# #803 §4: the TRIAGE session's own budgets, separate from the implement ones because a triage
+# session reads a ticket and answers — a fraction of an implement run — and inheriting the
+# implement numbers would hand a reading session a day of wall clock. No default, same policy.
+case System.get_env("TRIAGE_WALL_CLOCK_SECONDS") &&
+       Integer.parse(System.get_env("TRIAGE_WALL_CLOCK_SECONDS")) do
+  {seconds, ""} when seconds > 0 -> config :loopctl, :triage_wall_clock_seconds, seconds
+  _ -> :ok
+end
+
+case System.get_env("TRIAGE_MAX_TURNS") && Integer.parse(System.get_env("TRIAGE_MAX_TURNS")) do
+  {turns, ""} when turns > 0 -> config :loopctl, :triage_max_turns, turns
+  _ -> :ok
+end
+
 endpoint_http = [
   # Transport-layer DoS backstop. `websocket_options` is a BANDIT server-level
   # setting (the Phoenix `socket "/live", websocket: [...]` DSL rejects

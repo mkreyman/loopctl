@@ -662,6 +662,14 @@ defmodule Loopctl.ObanConfig do
            # socket, so the bound is that pool and not anyone's rate limit. Bounded per run.
            # Keep in sync with the crontab assertion in oban_plugins_config_test.exs.
            {"* * * * *", Loopctl.Workers.DispatchDriverWorker},
+           # #803 §4: asks a runner to TRIAGE what intake detected — the hop between the
+           # intake drainer above and the driver below, and the one the loop did without while
+           # `triage` was not a dispatchable kind (contract 1.10.0). Same cadence and the same
+           # reason: local statements plus one push to a connected socket. OFF with the driver,
+           # under the same `:dispatch_driver_enabled`, so the unattended loop is one decision
+           # rather than a state an operator can be half in. Bounded per run. Keep in sync with
+           # the crontab assertion in oban_plugins_config_test.exs.
+           {"* * * * *", Loopctl.Workers.TriageDispatchWorker},
            {"* * * * *", Loopctl.Workers.SystemConfigRefreshWorker},
            # #803 §11: retention for the delivery loop's two unbounded high-volume tables,
            # `runner_trace_events` and `intake_deliveries`. Nothing else deletes from either.

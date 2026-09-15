@@ -37,7 +37,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   # The digest of the published document at the CURRENT version. Not a checksum of the file
   # for its own sake: it is what makes the version string mean something, per the test below.
-  @digest "0404de506f92bbd736eeabde790850efee91d91310c8a5ff36b9ce24077017ee"
+  @digest "7eff32a9c294aecb135faa154ab514da3d0a58ffb487e95b89e043aaa1f7fb62"
 
   describe "the checked-in export" do
     test "matches the declarations — run `mix loopctl.runner_contract` if this fails" do
@@ -71,8 +71,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.9.3"
-      assert schema["x-contract-version"] == "1.9.3"
+      assert RunnerContract.version() == "1.10.0"
+      assert schema["x-contract-version"] == "1.10.0"
 
       assert %{
                "dispatch_reply" => "RunnerDispatchReply",
@@ -1390,16 +1390,15 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       # Structural, not a comment: triage's input is the reporter's own words, which this
       # shape has no field for and the implementer must never see.
       #
-      # BOTH refusals are asserted, not just the first. The two are independent — the kind is
-      # not dispatchable, AND an implement story does not belong on a triage dispatch — and
-      # they are redundant only while `implement` is the sole dispatchable kind. Asserting
-      # only the kind would let the story-shape rule rot silently and then fail open the day
-      # triage gains its own payload, which is exactly when it becomes load-bearing.
+      # AND THIS IS THE DAY THE COMMENT ABOVE WARNED ABOUT. Until 1.10.0 two independent
+      # refusals covered this payload — the kind was not dispatchable, AND an implement story
+      # does not belong on a triage dispatch — and the first is now gone, which is precisely
+      # when the second becomes the one holding the rule up. It still holds.
       payload = with_story() |> Map.put("kind", "triage")
 
       assert {:error, {:invalid, messages}} = RunnerContract.cast_dispatch(payload)
-      assert Enum.any?(messages, &(&1 =~ "not dispatchable"))
       assert Enum.any?(messages, &(&1 =~ "story is only allowed when kind is implement"))
+      refute Enum.any?(messages, &(&1 =~ "not dispatchable"))
     end
 
     test "a story naming another story is refused" do
@@ -1802,17 +1801,30 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
   end
 
   describe "dispatchable kinds (1.5.0)" do
-    test "triage stays in the vocabulary and out of what loopctl sends" do
-      # Narrowing the enum would be a BREAKING change; a minor version may only add. So the
-      # kind stays declared — a runner answers `kind_not_supported` about it — and the CAST
-      # is what keeps it off the wire.
+    test "triage is dispatchable (1.10.0), and a triage dispatch casts" do
+      # The interlock moved because the other end moved: a runner composes its triage lenses
+      # and emits a `triage_verdict`, so the work has somewhere to land. The kind was kept in
+      # the enum throughout precisely so both sides could be built at once — narrowing an enum
+      # is breaking and a minor may only add.
       assert "triage" in RunnerDispatch.kinds()
-      refute "triage" in RunnerDispatch.dispatchable_kinds()
+      assert "triage" in RunnerDispatch.dispatchable_kinds()
 
-      assert {:error, {:invalid, messages}} =
-               RunnerContract.cast_dispatch(build(:runner_dispatch, %{"kind" => "triage"}))
+      assert {:ok, %{kind: "triage"}} =
+               RunnerContract.cast_dispatch(
+                 build(:runner_dispatch, %{
+                   "kind" => "triage",
+                   "triage" => triage_object()
+                 })
+               )
+    end
 
-      assert Enum.any?(messages, &(&1 =~ "not dispatchable"))
+    test "an UNDECLARING runner is still sent implement alone" do
+      # The asymmetry is the safety of the whole bump, and it is the thing a later change would
+      # be tempted to tidy away: a machine built before `kinds` existed says nothing on join,
+      # is read as declaring what loopctl sent then, and must keep being sent exactly that.
+      # Equalising the two lists would start sending triage to every runner ever built.
+      assert Kinds.implied_by_silence() == ["implement"]
+      refute "triage" in Kinds.implied_by_silence()
     end
 
     test "every dispatchable kind is a declared kind" do
