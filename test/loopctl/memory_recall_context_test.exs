@@ -24,6 +24,21 @@ defmodule Loopctl.MemoryRecallContextTest do
   alias Loopctl.Memory.Scope
   alias LoopctlWeb.Outcome
 
+  defp article_with_body do
+    tenant = fixture(:tenant)
+    project = fixture(:project, %{tenant_id: tenant.id})
+    Knowledge.reset_circuit_breaker(tenant.id)
+    article(tenant.id, project.id, "reshipment for delayed orders")
+
+    %{
+      scope: %Scope{
+        tenant_id: tenant.id,
+        subject_id: "s-#{System.unique_integer([:positive])}",
+        project_id: project.id
+      }
+    }
+  end
+
   defp article(tenant_id, project_id, title) do
     art =
       fixture(:article, %{
@@ -333,6 +348,76 @@ defmodule Loopctl.MemoryRecallContextTest do
   defp knowledge_unrunnable_env,
     do:
       envelope(%{total_count: 0, degraded?: true, fallback: true, fallback_reason: "bad_request"})
+
+  describe "recall_context/2 - is this an ANSWER, or the nearest thing to one? (#742)" do
+    test "an empty corpus is :none, never :weak" do
+      # The distinction a caller cannot make from a score list: nothing came back at all,
+      # versus something came back weakly. Semantic search has no no-answer mode, so a
+      # client that cannot tell these apart paraphrases silence as an answer.
+      scope = %Scope{
+        tenant_id: fixture(:tenant).id,
+        subject_id: "empty-#{System.unique_integer([:positive])}",
+        project_id: nil
+      }
+
+      result = Memory.recall_context(scope, query: "nothing here at all", limit: 5)
+
+      assert result.meta.answer_confidence == :none
+      assert result.results == []
+    end
+
+    test "a CURATED answer is :answer on the resolver's own decision, not a re-derivation" do
+      # `:curated` means a governed article cleared an absolute, scale-matched threshold AND
+      # beat the field by a margin — a stronger statement than separation could make. Lifted
+      # rather than recomputed, so this cannot disagree with `provenance` beside it.
+      env = %{meta: %{provenance: :curated}}
+
+      assert Memory.answer_confidence_for_test(env, []) == :answer
+      assert Memory.answer_confidence_for_test(env, [%{score: 0.001}]) == :answer
+    end
+
+    test "SEPARATION decides the rest: a top that stands apart is an answer" do
+      # Relative to this query's own pool, never a constant. A fixed floor goes stale the
+      # moment fusion, the embedding model or the corpus size changes — #470's move to RRF
+      # made the documented ~0.15 floor unreachable and every search read as a miss.
+      env = %{meta: %{provenance: :retrieved}}
+
+      # Top is 4x the median of the field behind it.
+      assert Memory.answer_confidence_for_test(env, [
+               %{score: 0.8},
+               %{score: 0.2},
+               %{score: 0.2}
+             ]) == :answer
+
+      # A flat field: three neighbours, none of them an answer.
+      assert Memory.answer_confidence_for_test(env, [
+               %{score: 0.42},
+               %{score: 0.40},
+               %{score: 0.38}
+             ]) == :weak
+    end
+
+    test "the verdict does not depend on how many rows the caller asked for" do
+      # A single row has nothing to be separated FROM, so calling it `:answer` would make
+      # the judgement a function of `limit` rather than of the corpus.
+      env = %{meta: %{provenance: :retrieved}}
+
+      assert Memory.answer_confidence_for_test(env, [%{score: 0.99}]) == :weak
+    end
+
+    test "the merged meta carries provenance and confidence from the knowledge half" do
+      # Lifted, not recomputed — the same rule `importance_strength` already follows, so
+      # there is one origin for each number and no second opinion that can disagree.
+      art = article_with_body()
+      scope = art.scope
+
+      result = Memory.recall_context(scope, query: "reshipment", limit: 5)
+
+      assert Map.has_key?(result.meta, :provenance)
+      assert Map.has_key?(result.meta, :confidence)
+      assert result.meta.answer_confidence in [:answer, :weak, :none]
+    end
+  end
 
   describe "recall_context/2 - overall merged limit" do
     test "clamps the merged, re-ranked list to `limit`", ctx do

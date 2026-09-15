@@ -1677,10 +1677,99 @@ defmodule Loopctl.Memory do
         # cross-source heuristic and no prior touches it — and it is taken from the
         # knowledge envelope rather than re-resolved here, so there is one origin for the
         # number. `nil` when the knowledge half degraded before it ranked anything.
-        importance_strength: Map.get(knowledge_env.meta, :importance_strength)
+        importance_strength: Map.get(knowledge_env.meta, :importance_strength),
+        # --- Is this an ANSWER, or the nearest thing to one? (#742) ---------------------
+        # Semantic search has no no-answer mode: a procedural turn with nothing relevant
+        # in the corpus still gets three nearest neighbours back, ranked, with scores.
+        # Every client then re-derives its own floor to tell those apart — and the one
+        # that did measured REAL tops at 0.372-0.600 against JUNK tops at 0.005-0.456, a
+        # band that overlaps, so the constant was wrong in both directions at once. It was
+        # removed and the judgement handed to the reading agent.
+        #
+        # This is the same judgement made where the information actually is. Lifted, not
+        # recomputed: `provenance` and `confidence` are the hybrid resolver's own decision,
+        # already made on this pool, and re-deriving them here would be a second opinion
+        # that can disagree with the first.
+        provenance: Map.get(knowledge_env.meta, :provenance),
+        confidence: Map.get(knowledge_env.meta, :confidence),
+        answer_confidence: answer_confidence(knowledge_env, candidates)
       }
     }
   end
+
+  # RELATIVE TO THIS QUERY'S OWN POOL, never to a constant. A fixed floor goes stale the
+  # moment fusion, the embedding model or the corpus size changes — which has happened
+  # once already: #470's move to RRF made the previously-documented ~0.15 floor
+  # unreachable, so every search read as a miss. What does not go stale is SEPARATION:
+  # whether the top result stands apart from the ones behind it.
+  #
+  #   * `:curated` provenance is `:answer` outright — a governed article cleared an
+  #     absolute, scale-matched threshold AND beat the field by a margin, which is a
+  #     stronger statement than anything this function could derive.
+  #   * no candidates at all is `:none`. Not "weak": the corpus said nothing, and a
+  #     caller that cannot tell those apart will paraphrase silence as an answer.
+  #   * otherwise the top score against the MEDIAN of the rest. A top that is not
+  #     meaningfully separated from its neighbours is a nearest-neighbour list, which is
+  #     what the injected recall block already tells agents it is showing them.
+  #
+  # Deliberately a bounded TAG and not a number: a number invites the threshold this
+  # exists to remove.
+  @answer_separation 1.5
+
+  @doc false
+  # Public ONLY so the verdict is testable on pools written for it. The real pools that
+  # reach it — an empty corpus, a flat field of neighbours, a curated hit — cannot all be
+  # staged through `recall_context/2` in one sandbox, and a rule this load-bearing should
+  # not be asserted only where it is convenient to arrange.
+  @spec answer_confidence_for_test(map(), [map()]) :: :answer | :weak | :none
+  def answer_confidence_for_test(knowledge_env, candidates),
+    do: answer_confidence(knowledge_env, candidates)
+
+  @spec answer_confidence(map(), [map()]) :: :answer | :weak | :none
+  defp answer_confidence(knowledge_env, candidates)
+
+  defp answer_confidence(%{meta: %{provenance: :curated}}, _candidates), do: :answer
+
+  defp answer_confidence(_knowledge_env, []), do: :none
+
+  defp answer_confidence(_knowledge_env, candidates) do
+    scores = candidates |> Enum.map(&candidate_score/1) |> Enum.sort(:desc)
+
+    case scores do
+      [] -> :none
+      [_only] -> :weak
+      [top | rest] -> separation(top, median(rest))
+    end
+  end
+
+  # One row is never an answer ON ITS OWN EVIDENCE: with nothing to compare against there
+  # is no separation to measure, and calling it `:answer` would make the verdict depend on
+  # how many rows the caller asked for.
+  defp separation(top, med) when is_number(top) and is_number(med) and med > 0 do
+    if top / med >= @answer_separation, do: :answer, else: :weak
+  end
+
+  # A zero or absent median means the field behind the top is empty rather than close, so
+  # the top stands alone — but only if it scored anything itself.
+  defp separation(top, _med) when is_number(top) and top > 0, do: :answer
+  defp separation(_top, _med), do: :weak
+
+  defp median([]), do: 0.0
+
+  defp median(scores) do
+    sorted = Enum.sort(scores)
+    count = length(sorted)
+    mid = div(count, 2)
+
+    case rem(count, 2) do
+      1 -> Enum.at(sorted, mid)
+      0 -> (Enum.at(sorted, mid - 1) + Enum.at(sorted, mid)) / 2
+    end
+  end
+
+  defp candidate_score(%{score: score}) when is_number(score), do: score
+  defp candidate_score(%{"score" => score}) when is_number(score), do: score
+  defp candidate_score(_candidate), do: 0.0
 
   # Run the knowledge half via `search_combined/3` with the merged `:with_global`
   # project scope, translating its `{:ok, env} | {:error, ...}` result into a UNIFORM

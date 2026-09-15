@@ -6,6 +6,26 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **`/api/v1/recall` says whether its results are ANSWERS (#742).** The response carried a
+  bare 0..1 `score` per row and nothing a reader could judge relevance by. Semantic search
+  has no no-answer mode, so a query with nothing relevant in the corpus still gets its
+  nearest neighbours back, ranked and scored — and every client then invents its own floor
+  to tell those apart. The one that did measured real top scores at 0.372-0.600 against junk
+  tops at 0.005-0.456: a band that overlaps, so the constant was wrong in both directions at
+  once.
+
+  `meta` now carries `provenance` (`curated` / `retrieved`) and `confidence`, both LIFTED
+  from the hybrid resolver that already decided them on this pool rather than recomputed,
+  plus `answer_confidence`: `answer`, `weak` or `none`. The verdict is made against this
+  query's own pool — the top result's separation from the field behind it — never against a
+  constant, because a fixed floor goes stale whenever fusion, the embedding model or the
+  corpus size changes. That is not hypothetical: #470's move to RRF made the previously
+  documented ~0.15 floor unreachable, and every search read as a miss.
+
+  `none` is distinct from `weak` on purpose: a caller that cannot tell an empty corpus from
+  a weak match will paraphrase silence as an answer. Additive — the recall hook and the MCP
+  `recall_context` path both read this envelope and neither changes.
+
 - **Runner contract 1.9.0: a triage session's verdict comes back (#803).** `cast_triage_verdict/1`
   shipped in 1.7.0 with NO CALLER — the wire format existed and nothing on this side handled
   one. `triage_verdict` is the message that carries it: `dispatch_id`, `claim_epoch`, and
