@@ -1,7 +1,7 @@
 defmodule LoopctlRunner.Contract do
   @moduledoc """
   The loopctl runner wire contract, vendored from mkreyman/loopctl
-  `priv/runner_contract/v1.json` (JSON Schema 2020-12, `x-contract-version` 1.6.0).
+  `priv/runner_contract/v1.json` (JSON Schema 2020-12, `x-contract-version` 1.7.0).
 
   The file is copied, never re-typed: the server casts every payload against the same
   document, drops unknown fields at every depth, and refuses a mismatched major version.
@@ -79,7 +79,7 @@ defmodule LoopctlRunner.Contract do
   defp keyword("type", types, value, path, _schema) do
     if Enum.any?(List.wrap(types), &type?(&1, value)),
       do: [],
-      else: ["#{path}: expected #{inspect(types)}, got #{inspect(value)}"]
+      else: ["#{path}: expected #{inspect(types)}, got #{shown(value, path)}"]
   end
 
   defp keyword("required", keys, value, path, _schema) when is_map(value) do
@@ -107,11 +107,13 @@ defmodule LoopctlRunner.Contract do
   defp keyword("pattern", pattern, value, path, _) when is_binary(value) do
     if Regex.match?(Regex.compile!(pattern), value),
       do: [],
-      else: ["#{path}: #{inspect(value)} does not match #{pattern}"]
+      else: ["#{path}: #{shown(value, path)} does not match #{pattern}"]
   end
 
   defp keyword("enum", allowed, value, path, _) do
-    if value in allowed, do: [], else: ["#{path}: #{inspect(value)} not in #{inspect(allowed)}"]
+    if value in allowed,
+      do: [],
+      else: ["#{path}: #{shown(value, path)} not in #{inspect(allowed)}"]
   end
 
   defp keyword("items", sub, value, path, _) when is_list(value) do
@@ -135,13 +137,13 @@ defmodule LoopctlRunner.Contract do
   defp keyword("format", "uuid", value, path, _) when is_binary(value) do
     if Regex.match?(~r/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/i, value),
       do: [],
-      else: ["#{path}: #{inspect(value)} is not a uuid"]
+      else: ["#{path}: #{shown(value, path)} is not a uuid"]
   end
 
   defp keyword("format", "date-time", value, path, _) when is_binary(value) do
     case DateTime.from_iso8601(value) do
       {:ok, _, _} -> []
-      {:error, _} -> ["#{path}: #{inspect(value)} is not an RFC 3339 date-time"]
+      {:error, _} -> ["#{path}: #{shown(value, path)} is not an RFC 3339 date-time"]
     end
   end
 
@@ -186,6 +188,40 @@ defmodule LoopctlRunner.Contract do
   defp json_value(list) when is_list(list), do: Enum.map(list, &json_value/1)
   defp json_value(map) when is_map(map), do: Map.new(map, fn {k, v} -> {k, json_value(v)} end)
   defp json_value(other), do: other
+
+  # An error names the value, because a refusal that does not is hard to act on — EXCEPT under a
+  # path carrying reporter text. `RunnerTriage.untrusted` is fenced by loopctl with a nonce the
+  # reporter cannot know, and the whole design says a runner never unwraps it; echoing it into a
+  # log line and into the refusal `detail` that goes back over the wire would do exactly that,
+  # unfenced, for any malformed triage dispatch. Validation runs BEFORE the kind check, so this
+  # is reachable by a loopctl bug attaching a triage object to any dispatch, not only by triage
+  # becoming dispatchable.
+  # `untrusted` is the reporter's own words, wherever it appears: `RunnerTriage.untrusted` when
+  # the definition is validated by name, `RunnerDispatch.triage.untrusted` when it arrives
+  # inline. A verdict is composed by a session that had just read those words, so its fields are
+  # untrusted the same way. Everything else names its value, loopctl's own `record_id`,
+  # `issue_number`, `html_url` and `escalation_reasons` included: those are how a malformed
+  # dispatch is diagnosed, and a refusal nobody can act on is its own defect.
+  @untrusted_leaf "untrusted"
+  @untrusted_definition "runnertriageverdict"
+
+  defp shown(value, path) do
+    down = String.downcase(path)
+
+    if String.ends_with?(down, @untrusted_leaf) or
+         String.starts_with?(down, @untrusted_definition),
+       do: "<#{type_of(value)}, not shown: untrusted>",
+       else: inspect(value)
+  end
+
+  defp type_of(value) when is_binary(value), do: "a string"
+  defp type_of(value) when is_list(value), do: "a list"
+  defp type_of(value) when is_map(value), do: "an object"
+  defp type_of(value) when is_integer(value), do: "an integer"
+  defp type_of(value) when is_number(value), do: "a number"
+  defp type_of(value) when is_boolean(value), do: "a boolean"
+  defp type_of(nil), do: "null"
+  defp type_of(_value), do: "a value"
 
   defp type?("object", v), do: is_map(v)
   defp type?("array", v), do: is_list(v)

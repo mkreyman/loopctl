@@ -62,7 +62,7 @@ never as a query parameter. Rotating that key through `/api_keys` is refused; ro
 `DELETE /api/v1/runners/:id` and re-enrolling.
 
 **Contract.** The wire contract is JSON Schema, `priv/runner_contract/v1.json` in mkreyman/loopctl
-(`contract_version` 1.6.0), vendored into this repo rather than re-typed. The join payload must
+(`contract_version` 1.7.0), vendored into this repo rather than re-typed. The join payload must
 declare `machine` exactly equal to the enrolled name. It SHOULD also declare `kinds`, the
 dispatch kinds this machine runs: the field is optional, and since 1.6.0 a PRESENT AND NON-EMPTY
 one is the only thing loopctl consults for that runner. Absent or empty is read as
@@ -113,23 +113,40 @@ The triage session queries the database directly, the way anyone on that machine
 machines already have full access. One correctness note: production mixes real agency billing
 with demo and test rows, discriminated only by `batches.original_filename`.
 
-Output contract:
+Output contract: **`RunnerTriageVerdict`, in the vendored contract since 1.7.0.** It is a schema
+loopctl validates on receipt, not a convention in a prompt, because a verdict whose shape drifts
+per runner or per prompt edit cannot be rejected when it is malformed. Read the bounds from
+`x-connection.limits.triage_verdict` and the schema; never re-type them here.
 
 ```json
 {
-  "verdict": "story" | "escalate" | "reject",
-  "story": { "title": "...", "acceptance_criteria": [...], "test_cases": [...],
-             "touches": ["lib/..."], "domain_reference": "docs/domain/....md | N/A — <reason>" },
-  "escalation_reasons": [...],
+  "outcome": "story" | "escalate" | "reject",
+  "confidence": "low" | "medium" | "high",
+  "story": { "title": "...", "description": "...", "acceptance_criteria": [...],
+             "test_cases": [...], "touches": ["lib/..."], "domain_reference": "..." },
+  "evidence": ["lib/foo.ex:42", "<kb article id>"],
+  "missing_information": ["..."],
+  "escalation_reasons": ["..."],
   "contradicts": [{"kind": "story"|"kb"|"code", "ref": "...", "why": "..."}],
-  "confidence": 0.0
+  "duplicate_of": "<story id>" | null
 }
 ```
 
-This contract does not exist yet. Neither agent definition emits a verdict, a confidence or any
-JSON, neither has `Write` in its `tools:` line, and `--json-schema` constrains a run's final
-result rather than a subagent's return. The contract has to be added to the agent bodies as a
-required final fenced block, with the dispatching session re-emitting the merged object.
+`outcome` and `confidence` are the only required fields. `confidence` is an enum and not a
+number on purpose: a session emitting 0.85 cannot say what would have made it 0.8. `story` is
+required when `outcome` is `story` — a verdict that says `story` and carries none has moved the
+work rather than done it — AND FORBIDDEN otherwise, so an `escalate` verdict must not attach a
+draft. Both halves are prose in the contract, expressible in neither the schema's keywords nor
+this validator, so the EMITTER enforces them and a mistake surfaces as a refusal on the wire.
+
+**Nothing emits this yet, and declaring the kind is not the remaining work.** `triage` is outside
+`Control.kinds()`, so loopctl sends none. Beyond the runner's accept path and its own contained
+tool set, the three trio agent definitions (`~/.claude/agents/triage-{analyst,architect,engineer}.md`)
+still emit the OLD shape — a `verdict` key rather than `outcome`, and a `0.0–1.0` confidence
+rather than the enum — none has `Write` in its `tools:` line, and `--json-schema` constrains a
+run's final result rather than a subagent's return. Those bodies have to carry the contract as a
+required final fenced block, with the dispatching session re-emitting the merged object, before
+Gate A below can compare anything.
 
 `reject` exists for the genuinely non-actionable. **It must not close the GitHub issue naively** —
 see §9.
@@ -145,7 +162,7 @@ prevent.
 - the request **contradicts** an existing story, KB decision, or documented behaviour
 - it **inverts or removes** behaviour a previous story deliberately added
 - it is a workflow change rather than a defect fix
-- the trio's `verdict` field disagrees across the three agents
+- the trio's `outcome` disagrees across the three agents (once their definitions emit it — see §4)
 
 **No file paths belong in Gate A.** An uncontested defect in the claims path is not something
 Mark needs to decide. Gate A's rate is measured and reported; a rate resembling 54% is a design
