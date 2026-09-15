@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# loop-verdict — the one way an unattended triage session states its verdict.
+#
+#   /abs/path/loop-verdict <<'VERDICT'
+#   { "outcome": "story", "confidence": "high", ... }
+#   VERDICT
+#
+# The verdict is `RunnerTriageVerdict` (contract 1.7.0), read from stdin as JSON. It is the
+# session's ONLY output that matters: a triage session writes nothing, opens nothing and
+# touches no worktree, so this file is the run's product.
+#
+# Why a command rather than a parsed transcript: the same reason escalation is one
+# (`loop-escalate`). A session's prose is untrusted text that has just read a reporter's
+# untrusted text; scraping a verdict out of it would be parsing the thing the fence exists to
+# keep unparsed. Here the session fills a form, and the runner validates it against the
+# contract before anything is sent.
+#
+# This script stores bytes and checks nothing about their meaning: the shape, the bounds and
+# the byte rule are `LoopctlRunner.TriageVerdict`'s to enforce, where the contract lives. It
+# caps what it will store so a runaway session cannot fill the disk, and refuses a second
+# verdict, since a run states one.
+
+set -u
+
+: "${LOOP_RUN_DIR:?loop-verdict only works inside a loop session}"
+
+# Above any verdict the contract admits (48000 bytes under its byte rule, which charges at
+# least 6 per character), and far below anything that threatens the disk.
+max_bytes=262144
+out="$LOOP_RUN_DIR/verdict.json"
+
+if [ -e "$out" ]; then
+    echo "a verdict was already stated for this run; it is the one that counts" >&2
+    exit 3
+fi
+
+if [ -t 0 ]; then
+    echo "usage: loop-verdict <<'VERDICT' {\"outcome\": ..., \"confidence\": ...} VERDICT" >&2
+    exit 2
+fi
+
+umask 077
+tmp=$(mktemp "$LOOP_RUN_DIR/.verdict.XXXXXX") || exit 1
+trap 'rm -f "$tmp"' EXIT
+
+# STRAIGHT TO THE FILE, never through a shell variable. Command substitution strips every
+# trailing newline and drops NUL bytes, so `$(head -c N)` measured a cut that landed on a newline
+# as exactly N — inside the cap — and stored the truncated fragment while telling the session it
+# had succeeded. Its retry then hit the one-verdict refusal, leaving the run's only product
+# unreadable. Measuring the FILE also measures bytes, which is what `head -c` reads: `${#var}`
+# counts characters under a UTF-8 locale, and agrees only for ASCII, which is why the first two
+# versions of this were wrong in the same direction.
+head -c "$((max_bytes + 1))" > "$tmp" || exit 1
+bytes=$(wc -c < "$tmp")
+
+if [ "$bytes" -gt "$max_bytes" ]; then
+    echo "the verdict is over $max_bytes bytes; nothing was recorded" >&2
+    exit 2
+fi
+
+if [ "$(tr -d '[:space:]' < "$tmp" | wc -c)" -eq 0 ]; then
+    echo "the verdict was empty; state one RunnerTriageVerdict object as JSON" >&2
+    exit 2
+fi
+
+# The shape a JSON object has, checked here so the message below is not a lie about bytes that
+# are plainly not a verdict. Everything else — the schema, the bounds, the byte rule, the
+# conditional story rule — is `LoopctlRunner.TriageVerdict`'s, where the contract lives.
+first=$(tr -d '[:space:]' < "$tmp" | head -c 1)
+last=$(tr -d '[:space:]' < "$tmp" | tail -c 1)
+
+if [ "$first" != "{" ] || [ "$last" != "}" ]; then
+    echo "the verdict is not a JSON object; state one RunnerTriageVerdict object as JSON" >&2
+    exit 2
+fi
+
+# `ln` refuses an existing target, so the claim is atomic. The check at the top reads better in
+# the usual case; it is not the guarantee, because the whole of stdin is read between it and here
+# and the Bash tool can run two of these at once — with `mv`, both would pass the check and the
+# LAST would win, which is the opposite of one verdict per run.
+if ! ln "$tmp" "$out" 2> "$tmp.err"; then
+    # Only an existing target means a verdict was already stated. Anything else — no hard links
+    # on this filesystem, a permissions change — is a write failure, and saying "already stated"
+    # would stop the session over a verdict that does not exist.
+    if [ -e "$out" ]; then
+        echo "a verdict was already stated for this run; it is the one that counts" >&2
+        rm -f "$tmp.err"
+        exit 3
+    fi
+
+    echo "the verdict could not be recorded: $(cat "$tmp.err")" >&2
+    rm -f "$tmp.err"
+    exit 1
+fi
+
+rm -f "$tmp.err"
+
+echo "Verdict recorded, and not yet validated: the runner checks it against the contract, and a
+run states one verdict, so this cannot be restated. Stop working now: make no further changes and
+end your turn."

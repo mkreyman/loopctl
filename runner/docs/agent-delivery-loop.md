@@ -373,11 +373,22 @@ is therefore launched with `--tools Read,Edit,Write,Glob,Grep,Bash`, `--strict-m
 --mcp-config '{"mcpServers":{}}'` and `--disallowedTools "mcp__*"`, fixed in the runner and never
 widened by a story or the config. A triage session (§4) needs its read-only lenses as agents, so it
 gets its own contained set — the Agent tool limited to the triage lenses, still no MCP — designed
-with its contract, not this set widened.
+with its contract, not this set widened. **The runner supplies those lens definitions itself, as
+`--agents` JSON.** It cannot inherit them: they are user-scope files (`~/.claude/agents/triage-*.md`)
+and `--setting-sources ""` is what keeps the operator's settings out, so a session launched
+without it has no definitions to dispatch and the trio silently degrades to one session doing all
+three lenses. Shipping them from the runner is also what makes the lens set a thing this repo
+tests rather than a thing a machine happens to have. **No MCP means no knowledge base**: a dispatched session
+never holds this machine's loopctl keys, so a lens that wants the KB gets what the runner puts in
+its prompt, or nothing. Its verdict leaves through `priv/bin/loop-verdict`, the one command it is
+pre-allowed, for the same reason escalation is a command: a verdict scraped out of a session's
+prose would be parsed from text that has just read the reporter's untrusted text.
 
-**Not `--bare`** (it would drop the login, CLAUDE.md and the guard hooks), which means every guard hook loads — including `gate-unmerged-pr.sh`, which blocks exactly
-the "merging nothing" end state build-order step 1 prescribes. The runner sets a loop-mode
-variable that gate exits 0 on.
+**Not `--bare`** — it drops the login, so the session cannot run at all. `--setting-sources ""`
+is what keeps the operator's settings out while keeping the login, so NO guard hook loads either:
+the loop-mode variable the runner sets (`LOOP_MODE`, `LOOP_STORY_FILE`) no longer stands
+`gate-unmerged-pr.sh` down, because that hook is not there to stand down. The variables remain for
+what the session's own commands read.
 
 ## 9. Merge, and what Larisa sees
 
