@@ -145,6 +145,33 @@ defmodule LoopctlWeb.RunnerUnsupportedKindsTest do
     assert entry["kinds"] == nil
   end
 
+  # #834 round 2, finding 4. A suppression is loopctl withholding work, not the machine
+  # revising its declaration — so the two are rendered as separate fields. Folding them made
+  # the pool report a statement the runner never made, which is the exact thing the null
+  # rendering above exists to avoid, committed from the other direction.
+  test "a suppressed kind is rendered apart from the declaration, which stays verbatim",
+       %{conn: conn} do
+    ctx = operator_ctx()
+    track(ctx.runner, %{kinds: ["triage", "implement"], suppressed_kinds: ["implement"]})
+
+    authed = auth(conn, ctx.operator_key)
+
+    assert [entry] = json_response(get(authed, ~p"/api/v1/runners/pool"), 200)["runners"]
+    assert entry["kinds"] == ["triage", "implement"]
+    assert entry["suppressed_kinds"] == ["implement"]
+  end
+
+  test "a runner with nothing suppressed renders an empty list, not a missing field",
+       %{conn: conn} do
+    ctx = operator_ctx()
+    track(ctx.runner, %{kinds: ["implement"]})
+
+    authed = auth(conn, ctx.operator_key)
+
+    assert [entry] = json_response(get(authed, ~p"/api/v1/runners/pool"), 200)["runners"]
+    assert entry["suppressed_kinds"] == []
+  end
+
   test "an ordinary refusal bars nothing", %{conn: conn} do
     ctx = operator_ctx()
     :ok = refuse_kind(ctx.runner, "draining")

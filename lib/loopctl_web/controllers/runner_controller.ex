@@ -218,6 +218,7 @@ defmodule LoopctlWeb.RunnerController do
                    :node,
                    :machine_id,
                    :kinds,
+                   :suppressed_kinds,
                    :unsupported_kinds
                  ],
                  properties: %{
@@ -284,6 +285,18 @@ defmodule LoopctlWeb.RunnerController do
                          "connected machine that never gets work is explained by this " <>
                          "field or by that one — read both. Per-CONNECTION, so it can " <>
                          "change when the runner reconnects."
+                   },
+                   suppressed_kinds: %Schema{
+                     type: :array,
+                     items: %Schema{type: :string},
+                     description:
+                       "Kinds this CONNECTION is not being sent because the runner " <>
+                         "declared one and then answered `kind_not_supported` for it. " <>
+                         "Held apart from `kinds`, which stays exactly what the machine " <>
+                         "said: a suppression is loopctl withholding work, not the runner " <>
+                         "changing its declaration. Cleared when the runner reconnects. A " <>
+                         "non-empty value is a BUG on the runner — it contradicted itself " <>
+                         "— and not a state to recover from by reconnecting."
                    },
                    unsupported_kinds: @unsupported_kinds_schema
                  }
@@ -401,6 +414,7 @@ defmodule LoopctlWeb.RunnerController do
       # Null, not [], for a runner that declared nothing: an empty declaration and no
       # declaration are DIFFERENT states here, and only one of them decides anything.
       kinds: declared_kinds(meta),
+      suppressed_kinds: Runners.suppressed_kinds(meta),
       unsupported_kinds: Map.get(barred, Map.get(meta, :runner_id), [])
     }
   end

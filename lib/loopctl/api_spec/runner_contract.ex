@@ -383,6 +383,13 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     alias Loopctl.ApiSpec.RunnerContract.Kinds
     alias Loopctl.ApiSpec.RunnerContract.RunnerSample
 
+    # A SIZE bound on `kinds`, deliberately not `length(Kinds.all())`. Tying it to the
+    # vocabulary would refuse the join of a runner declaring a kind a later version adds, or
+    # one that repeated an entry — both of which this field promises to ignore rather than
+    # punish. Generous enough that no honest runner reaches it, small enough to bound the
+    # array a join may carry.
+    @max_declared_kinds 20
+
     OpenApiSpex.schema(
       %{
         title: "RunnerJoin",
@@ -440,15 +447,26 @@ defmodule Loopctl.ApiSpec.RunnerContract do
             type: :boolean,
             description: "True when the runner accepts no new dispatches."
           },
-          # NO `minItems` or `uniqueItems`, deliberately — see the note above `@keywords` in
-          # `schema_to_map/1`. A constraint this exporter cannot publish is a constraint that
-          # refuses a join for a reason the vendored contract does not state, so the ENFORCED
-          # set is held equal to the PUBLISHED one: an empty array and a repeated kind are
-          # both accepted here and settled by `Loopctl.Runners.declared_kinds/1` instead.
+          # NOTHING HERE MAY REFUSE THE JOIN OVER THE CONTENT OF THIS ARRAY. A capability
+          # declaration is the one field where being strict is backwards: a runner upgraded
+          # ahead of loopctl — SAME MAJOR, so `supported_version/1` admits it — that declares
+          # a kind this server has not heard of would be refused the socket entirely and
+          # would drop out of the fleet. That is the opposite of the rolling-deploy
+          # discipline the rest of this module keeps (the two dispatch-message shapes in
+          # `RunnerChannel`, and `known_fields/2` dropping unknown KEYS in silence), and a
+          # minor version is supposed to be additive in both directions.
+          #
+          # So: no `enum` — an unknown kind is INTERSECTED away by
+          # `Loopctl.Runners.declared_kinds/1`, never refused here. No `minItems` or
+          # `uniqueItems` either; see the note above `@exported_keywords`, since a keyword
+          # this exporter cannot publish refuses a join for a reason the vendored contract
+          # does not state. `maxItems` stays and is a RESOURCE bound rather than a semantic
+          # one, set well above the vocabulary so it cannot be hit by a runner declaring
+          # kinds a later version adds, or by a duplicate.
           kinds: %Schema{
             type: :array,
-            maxItems: length(Kinds.all()),
-            items: %Schema{type: :string, enum: Kinds.all()},
+            maxItems: @max_declared_kinds,
+            items: %Schema{type: :string},
             description:
               "The dispatch kinds this machine runs (since 1.6.0). Where present and " <>
                 "NON-EMPTY this is the ONLY thing consulted: loopctl refuses a kind " <>
@@ -457,9 +475,14 @@ defmodule Loopctl.ApiSpec.RunnerContract do
                 "sending an EMPTY array, is read as declaring `implied_kinds` " <>
                 "#{inspect(Kinds.implied_by_silence())} — what loopctl sent before the " <>
                 "field existed. An empty array is therefore NOT how a runner says it wants " <>
-                "no work; `draining` is. Duplicates are accepted and ignored. Declare it " <>
-                "on EVERY join: it is per-connection, so an upgraded runner becomes " <>
-                "eligible for a new kind by reconnecting rather than by being re-enrolled."
+                "no work; `draining` is. A kind this server does not know is IGNORED, not " <>
+                "refused, so a runner upgraded ahead of loopctl still connects — but a " <>
+                "declaration of ONLY unknown kinds leaves nothing this server can send, " <>
+                "and the machine is then sent nothing until loopctl catches up. Duplicates " <>
+                "are ignored. At most #{@max_declared_kinds} entries, a size bound and not " <>
+                "a statement about the vocabulary. Declare it on EVERY join: it is " <>
+                "per-connection, so an upgraded runner becomes eligible for a new kind by " <>
+                "reconnecting rather than by being re-enrolled."
           },
           sample: RunnerSample.schema()
         }
@@ -715,8 +738,12 @@ defmodule Loopctl.ApiSpec.RunnerContract do
             "prompt — the runner composes its own from them. `story` is allowed only on an " <>
             "`implement` dispatch and its `id` must equal `story_id`. Only the kinds in " <>
             "`x-connection.dispatchable_kinds` are sent; a runner that does not do a kind " <>
-            "answers `kind_not_supported` and is not sent that kind again. " <>
-            "Declared in contract v1; emitted from #803.",
+            "answers `kind_not_supported`. Since 1.6.0 that answer is NOT permanent for a " <>
+            "runner that declares `kinds` on join: the declaration decides, so the same " <>
+            "kind IS sent again on a later connection that declares it, and a handler must " <>
+            "not assume one refusal ends the matter. It is suppressed for the rest of the " <>
+            "connection it was given on, and stays permanent only for a runner that " <>
+            "declares nothing. Declared in contract v1; emitted from #803.",
         type: :object,
         required: [
           :dispatch_id,
@@ -816,9 +843,15 @@ defmodule Loopctl.ApiSpec.RunnerContract do
 
     # `kind_not_supported` (since 1.5.0) is the one refusal that is a CAPABILITY STATEMENT
     # rather than a fault: this machine does not do this kind of work, and it will not do it
-    # after a retry either. loopctl treats it as PERMANENT for that runner and that kind and
-    # sends no more of them (`Loopctl.Runners.DispatchLedger.kind_unsupported?/3`), which is
-    # what makes it different from `draining` or `at_capacity` — those are about right now.
+    # after a retry either. That is what makes it different from `draining` or `at_capacity`,
+    # which are about right now.
+    #
+    # How long loopctl holds it depends on whether the runner DECLARES its kinds (1.6.0). For
+    # a runner that declares nothing it is permanent for that machine and that kind
+    # (`Loopctl.Runners.DispatchLedger.kind_unsupported?/3`). For one that declares, the
+    # declaration decides instead, and the refusal binds only the connection it was given on
+    # — a runner contradicting its own declaration is a bug on the runner rather than a state
+    # to recover from, and the bound is on the damage.
     # Like every refusal it gives the slot straight back, so it costs the runner no capacity,
     # and nothing reads a refusal as a health signal.
     @refusal_reasons ~w(dispatches_disabled draining at_capacity insufficient_disk

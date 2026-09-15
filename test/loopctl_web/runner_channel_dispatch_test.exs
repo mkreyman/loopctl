@@ -92,6 +92,10 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
   defp in_pool?(tenant_id, name), do: Map.has_key?(Runners.pool(tenant_id), name)
 
+  # The channel's own view of the runner's meta — what Presence replicates and what both
+  # `Runners.declared_kinds/1` and `Runners.suppressed_kinds/1` read at the decision.
+  defp socket_meta(channel), do: :sys.get_state(channel.channel_pid).assigns.meta
+
   # Reconnects a runner, joining with a different payload. The old channel must be GONE from
   # the pool first: two live sockets on one credential are `:runner_ambiguous`, which would
   # refuse a dispatch for a reason that has nothing to do with the kind under test. The unlink
@@ -730,7 +734,7 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
     # `kind_not_supported`, and such a runner keeps declaring the kind.
     test "a runner that refuses a kind it DECLARED is not sent it again on that connection",
          %{runner: runner, raw: raw, channel: channel} do
-      channel = rejoin_declaring(channel, raw, runner, ["implement"])
+      channel = rejoin_declaring(channel, raw, runner, ["triage", "implement"])
 
       first = dispatch_payload(runner.tenant_id)
       assert :ok = Runners.dispatch(runner.tenant_id, runner.id, first)
@@ -757,6 +761,13 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       refute_push "dispatch", _
       assert DispatchLedger.get_record(runner.tenant_id, second["dispatch_id"]) == nil
       assert in_flight_of(runner) == held - 1
+
+      # #834 round 2, finding 4. The DECLARATION is untouched — a suppression is loopctl
+      # withholding work, not the runner revising what it said. Folding the two made the
+      # pool report a machine that declared two kinds as a one-kind machine, and one that
+      # declared a single kind as having declared nothing at all.
+      assert {:declared, ["triage", "implement"]} = Runners.declared_kinds(socket_meta(channel))
+      assert Runners.suppressed_kinds(socket_meta(channel)) == ["implement"]
 
       # PER CONNECTION, and that is the whole design: the declaration it contradicts is
       # per-connection too, so reconnecting re-declares the kind and clears the suppression
@@ -791,6 +802,44 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
                Runners.dispatch(runner.tenant_id, runner.id, dispatch_payload(runner.tenant_id))
 
       assert_push "dispatch", _, @reply_timeout
+    end
+
+    # #834 round 2, finding 1. A runner upgraded ahead of loopctl passes the version check
+    # (same major) and may name a kind this server has never heard of. Refusing the PAYLOAD
+    # would drop that machine out of the fleet over a field whose whole purpose is to ADD
+    # capability — the opposite of the rolling-deploy discipline the dispatch message keeps.
+    test "a kind this server does not know is ignored, and the runner still joins",
+         %{runner: runner, raw: raw, channel: channel} do
+      channel = rejoin_declaring(channel, raw, runner, ["implement", "review"])
+
+      # It JOINED — the assertion `rejoin_declaring` would have failed on otherwise — and
+      # the known half of its declaration still decides. The unknown kind is kept VERBATIM
+      # rather than filtered out: membership already ignores it, and the pool should show
+      # what the machine actually said.
+      assert in_pool?(runner.tenant_id, runner.name)
+
+      assert {:declared, ["implement", "review"]} = Runners.declared_kinds(socket_meta(channel))
+
+      assert :ok =
+               Runners.dispatch(runner.tenant_id, runner.id, dispatch_payload(runner.tenant_id))
+
+      assert_push "dispatch", _, @reply_timeout
+    end
+
+    test "a declaration of ONLY unknown kinds is sent nothing, and is NOT read as silence",
+         %{runner: runner, raw: raw, channel: channel} do
+      # The case the intersection must not fold into `:implied`: the runner DID speak, and
+      # named nothing this server can send. Reading that as silence would dispatch
+      # `implement` to a machine that just said it does something else entirely.
+      _channel = rejoin_declaring(channel, raw, runner, ["review"])
+
+      payload = dispatch_payload(runner.tenant_id)
+
+      assert {:error, :kind_not_supported} =
+               Runners.dispatch(runner.tenant_id, runner.id, payload)
+
+      refute_push "dispatch", _
+      assert DispatchLedger.get_record(runner.tenant_id, payload["dispatch_id"]) == nil
     end
 
     test "a kind the runner did not declare is refused, and takes no slot or ledger row",

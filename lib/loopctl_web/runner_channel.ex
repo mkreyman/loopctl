@@ -616,15 +616,26 @@ defmodule LoopctlWeb.RunnerChannel do
 
   defp note_kind_refusal(socket, _reply, _record), do: socket
 
+  # THE DECLARATION IS LEFT EXACTLY AS THE RUNNER SENT IT. An earlier version of this took
+  # the kind out of `:kinds`, which made the pool report a statement the machine never made:
+  # one that declared ["triage", "implement"] and refused a single implement dispatch
+  # rendered as a triage-only machine, and one that declared ["implement"] and refused it
+  # rendered as having declared NOTHING — the same as a pre-1.6.0 runner. The suppression is
+  # a fact about what loopctl is withholding, not about what the runner said, so it lives in
+  # its own key and `Runners.kind_supported/4` subtracts it at the decision.
   defp suppress_kind(socket, meta, runner, tenant_id, kind) do
-    kinds = Enum.reject(Runners.declared_kinds(meta) |> elem(1), &(&1 == kind))
-    meta = Map.put(meta, :kinds, kinds)
+    meta = Map.update(meta, :suppressed_kinds, [kind], &Enum.uniq([kind | &1]))
 
-    # An EMPTY list here would read as "declared nothing" (`Runners.declared_kinds/1` fails
-    # safe to `:implied`), which would hand the runner straight back to the ledger — and for
-    # a machine that just refused its only kind, the ledger says the same thing. Either way
-    # it gets no more of that kind on this connection, which is the property wanted; the
-    # ledger row its refusal wrote is what a later connection reads.
+    # Countable, not just logged. The ledger row the refusal wrote is the durable record an
+    # operator reads (`unsupported_kinds`), but it cannot distinguish a machine that refused
+    # once from one cycling its socket and re-contradicting itself every connection — which
+    # is the residue the per-connection lifetime leaves. This event is what an alert counts.
+    :telemetry.execute(
+      [:loopctl, :runners, :declared_kind_refused],
+      %{count: 1},
+      %{tenant_id: tenant_id, runner_id: runner.id, kind: kind}
+    )
+
     {:ok, ref} =
       Presence.update(
         self(),

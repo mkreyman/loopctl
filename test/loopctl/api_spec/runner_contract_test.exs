@@ -197,15 +197,35 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       # Both reach the runner, so neither can refuse a join for an unpublished reason.
       transformed = MapSet.new([:title, :nullable])
 
+      # ANNOTATION-ONLY, and the reason this test cannot just be "every unexported field".
+      # None of these constrains a cast, so dropping one from the export costs a runner
+      # author documentation and never a refused join — which is the whole harm this guard
+      # is about. Flagging them would fail the build on an added `example:` with a message
+      # saying it is ENFORCED, which is false, and a remedy (publish it, upgrade every
+      # validator) that is wrong for a field nothing validates.
+      # DOCUMENTARY ONLY. `discriminator`, `$ref`, `anyOf`, `allOf`, `oneOf` and `not` are
+      # deliberately NOT here — each of them changes what a cast accepts, so the exporter
+      # dropping one is exactly the defect this test exists for. `readOnly`/`writeOnly` are
+      # also left out: they are inert for the plain casts this module makes today, but they
+      # do decide a cast under a read/write context, and a keyword that constrains under
+      # ANY reading belongs on the failing side of a guard like this.
+      annotations =
+        MapSet.new([:example, :examples, :deprecated, :externalDocs, :xml, :extensions])
+
       # Structural, not a copy: every field the Schema struct HAS, minus the ones the
-      # exporter carries either way. A new OpenApiSpex version adding a constraint keyword
-      # lands in this set automatically rather than being quietly allowed.
+      # exporter carries either way and the ones that constrain nothing. A new OpenApiSpex
+      # version adding a CONSTRAINT keyword lands in this set automatically rather than
+      # being quietly allowed — which is the direction that has to fail safe.
       never_published =
         %OpenApiSpex.Schema{}
         |> Map.from_struct()
         |> Map.keys()
-        |> Enum.reject(&(&1 in exported or &1 in transformed))
+        |> Enum.reject(&(&1 in exported or &1 in transformed or &1 in annotations))
         |> MapSet.new()
+
+      # The guard is worthless if everything is excluded, and the exclusion lists above are
+      # hand-maintained. Assert it still watches the keywords it was written for.
+      assert MapSet.subset?(MapSet.new([:minItems, :uniqueItems, :multipleOf]), never_published)
 
       offenders =
         for mod <- RunnerContract.schema_modules(),

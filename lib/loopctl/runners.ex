@@ -832,6 +832,9 @@ defmodule Loopctl.Runners do
       kind not in kinds ->
         {:error, :kind_not_supported}
 
+      kind in suppressed_kinds(meta) ->
+        {:error, :kind_not_supported}
+
       source == :declared ->
         :ok
 
@@ -842,6 +845,25 @@ defmodule Loopctl.Runners do
         :ok
     end
   end
+
+  @doc """
+  The kinds this CONNECTION has had suppressed because the runner declared one and then
+  answered `kind_not_supported` for it (`LoopctlWeb.RunnerChannel`). Held separately from
+  the declaration and never folded into it.
+
+  Keeping them apart is not tidiness — they answer different questions for different
+  readers. `declared_kinds/1` answers "what did this machine say it does", which the pool
+  renders verbatim; this answers "what is loopctl withholding from it right now". Folding a
+  suppression into the declaration made the pool report a statement the runner never made: a
+  machine that declared `["triage", "implement"]` and refused one `implement` dispatch
+  rendered as a triage-only machine, and one that declared `["implement"]` and refused it
+  rendered as having declared nothing at all — indistinguishable from a pre-1.6.0 runner.
+  """
+  @spec suppressed_kinds(map()) :: [String.t()]
+  def suppressed_kinds(%{suppressed_kinds: kinds}) when is_list(kinds),
+    do: Enum.filter(kinds, &is_binary/1)
+
+  def suppressed_kinds(meta) when is_map(meta), do: []
 
   @doc """
   The dispatch kinds a runner's join meta declares, tagged with where they came from:
@@ -858,6 +880,27 @@ defmodule Loopctl.Runners do
   non-empty list of binaries. The cast has already refused anything else, so this guard is
   against a meta built some other way (a test, a future writer) reading as a declaration it
   is not.
+
+  ## An unknown kind needs no filtering, and is returned VERBATIM
+
+  `RunnerJoin.kinds` carries no `enum`, on purpose: a runner upgraded ahead of loopctl —
+  same MAJOR, so the join is admitted — may declare a kind this server has never heard of,
+  and refusing the payload would drop that machine out of the fleet over a field that exists
+  to ADD capability. Dropping the `enum` is the whole of that fix.
+
+  This function then returns what the runner SAID, unfiltered. An intersection against
+  `Kinds.all/0` was tried and removed: `kind_supported/4` asks `kind in kinds`, so an
+  unknown entry can never match a kind loopctl is able to send and the filter changed no
+  decision — proved inert by mutation, the check stayed green with it gone. What it did
+  change was the pool, where it hid half of what a machine declared, which is the same
+  defect as folding a suppression into the declaration. Duplicates are ignored for the same
+  reason: membership does not care, so nothing has to remove them.
+
+  So a declaration of ONLY unknown kinds is `{:declared, [those]}` and every dispatch this
+  server can send is refused against it — the right answer, reached without a special case.
+  It is NOT read as silence: the runner did speak, and naming nothing loopctl knows is a
+  statement, not an absence. That machine is sent nothing until loopctl learns the kind, and
+  the pool shows exactly what it said.
   """
   @spec declared_kinds(map()) :: {:declared | :implied, [String.t()]}
   def declared_kinds(%{kinds: [_ | _] = kinds}) do
