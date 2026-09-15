@@ -37,7 +37,7 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   # The digest of the published document at the CURRENT version. Not a checksum of the file
   # for its own sake: it is what makes the version string mean something, per the test below.
-  @digest "7eff32a9c294aecb135faa154ab514da3d0a58ffb487e95b89e043aaa1f7fb62"
+  @digest "6d761f0baef0b2bf48c381f7b5929ccda5ae1f1b65f5d4a450206b0dbbb4bfa5"
 
   describe "the checked-in export" do
     test "matches the declarations — run `mix loopctl.runner_contract` if this fails" do
@@ -71,8 +71,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.10.0"
-      assert schema["x-contract-version"] == "1.10.0"
+      assert RunnerContract.version() == "1.11.0"
+      assert schema["x-contract-version"] == "1.11.0"
 
       assert %{
                "dispatch_reply" => "RunnerDispatchReply",
@@ -91,6 +91,17 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       # Asserted against the ONE declaration both schemas read, never against a copy — a
       # literal here would let `RunnerJoin.kinds` and `RunnerDispatch.kind` drift apart while
       # this test stayed green, which is the failure `Kinds` exists to make impossible.
+      # 1.10.0: what each refusal carries beside its `reason`, per event and COMPLETE.
+      # Asserted against the declaration's own totality check rather than by listing it, and
+      # non-vacuously on the entry the release exists for.
+      assert RunnerContract.error_fields_complete?()
+      assert connection["error_fields"] == RunnerContract.error_fields()
+
+      assert connection["error_fields"]["stage"]["stale_stage"] ==
+               ~w(stage claim_epoch lock_version attempts effects)
+
+      assert connection["error_fields"]["triage_verdict"]["stale_stage"] == []
+
       assert connection["dispatchable_kinds"] == Kinds.dispatchable()
       assert connection["implied_kinds"] == Kinds.implied_by_silence()
 

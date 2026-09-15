@@ -18,6 +18,8 @@ defmodule LoopctlWeb.RunnerChannel.RefusalTest do
   import ExUnit.CaptureLog
 
   alias Loopctl.ApiSpec.RunnerContract
+  alias Loopctl.Delivery.RunnerStages
+  alias Loopctl.Delivery.StoryStage
   alias LoopctlWeb.RunnerChannel.Refusal
 
   # Written by hand from `Loopctl.Delivery.Stages.advance_error/0`, which is a type and cannot
@@ -96,6 +98,45 @@ defmodule LoopctlWeb.RunnerChannel.RefusalTest do
       end
     end
 
+    test "error_fields publishes what each refusal ACTUALLY carries, and is complete" do
+      # THE HALF A CODE LIST CANNOT SAY. `error_reasons/0` tells a runner which codes it may
+      # see; nothing told it which of them carry anything to act on, so the extra fields were
+      # learnable only by reading loopctl's source or by watching a refusal in production.
+      # 1.10.0 is the release that makes that expensive — its whole point is that a
+      # `stale_stage` runner reads the row off the refusal — so the shape is published too.
+      assert RunnerContract.error_fields_complete?(),
+             "a code in error_reasons/0 has no error_fields/0 entry; a runner looking one up " <>
+               "cannot tell 'carries nothing' from 'nobody wrote this entry'"
+
+      fields = RunnerContract.error_fields()
+
+      # Asserted against the REFUSALS THEMSELVES, not against a second copy of the list. A
+      # published shape nobody produces is as bad as a produced shape nobody published.
+      produced = [
+        {"stage", {:stale_stage, %StoryStage{stage: :queued, claim_epoch: 1, lock_version: 2}}},
+        {"stage", {:effect_conflict, %{head_sha: String.duplicate("a", 40)}}},
+        {"trace", {:batch_too_large, 100, 200}},
+        {"trace", {:event_data_too_large, 3, 400, 500}},
+        {"stage", {:invalid, ["something"]}},
+        {"stage", :busy}
+      ]
+
+      for {event, reason} <- produced do
+        refusal = Refusal.for_message(reason)
+        code = refusal.reason
+        actual = refusal |> Map.delete(:reason) |> Map.keys() |> Enum.map(&Atom.to_string/1)
+
+        assert Enum.sort(actual) == Enum.sort(fields[event][code]),
+               "#{event}/#{code} carries #{inspect(Enum.sort(actual))} and publishes " <>
+                 "#{inspect(fields[event][code])}"
+      end
+
+      # The asymmetry the per-event keying exists for: the SAME code, two shapes.
+      assert fields["stage"]["stale_stage"] != []
+      assert fields["triage_verdict"]["stale_stage"] == []
+      assert Refusal.for_message(:stale_stage) == %{reason: "stale_stage"}
+    end
+
     test "internal_error is published for every inbound event" do
       # It is reachable on all of them: the catch-all is on the shared mapping, not on `stage`.
       for event <- RunnerContract.inbound_events() do
@@ -114,6 +155,37 @@ defmodule LoopctlWeb.RunnerChannel.RefusalTest do
       for reason <- [:stale_stage, :unknown_story_stage, :effect_conflict] do
         assert Refusal.for_message(reason) == %{reason: Atom.to_string(reason)}
       end
+    end
+
+    test "stale_stage CARRIES the row, in the shape the ok ack sends (#849)" do
+      row = %StoryStage{
+        stage: :queued,
+        claim_epoch: 7,
+        lock_version: 3,
+        attempts: %{"worktree" => 1},
+        branch: "feature/story-11-abcdef01"
+      }
+
+      refusal = Refusal.for_message({:stale_stage, row})
+
+      assert refusal.reason == "stale_stage"
+
+      # ONE SHAPE, asserted against the renderer the ack itself uses rather than by listing
+      # the keys again here. A test that restated the field list would stay green while the
+      # two drifted, which is the whole thing this refusal exists to prevent: the contract's
+      # remedy is "send the transition that applies", and the runner reads it off this map.
+      assert Map.delete(refusal, :reason) == RunnerStages.row_state(row)
+      assert refusal.stage == "queued"
+      assert refusal.claim_epoch == 7
+      assert refusal.attempts == %{"worktree" => 1}
+
+      # THE ONE NAME `row_state/1` MAY NEVER USE. The refusal is built by putting `:reason`
+      # ON TOP of the row, so a `:reason` key added to the row — the schema already carries
+      # `escalation_reason`, so it is not far-fetched — would reach the ack and be silently
+      # clobbered here, and the equality above passes either way. This is the assertion that
+      # makes that collision loud.
+      refute Map.has_key?(RunnerStages.row_state(row), :reason)
+      assert refusal.effects == %{branch: "feature/story-11-abcdef01"}
     end
 
     test "a refused chain append is PERMANENT, never a retry instruction" do

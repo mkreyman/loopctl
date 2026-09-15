@@ -22,6 +22,8 @@ defmodule LoopctlWeb.RunnerChannel.Refusal do
   require Logger
 
   alias Loopctl.ApiSpec.RunnerContract
+  alias Loopctl.Delivery.RunnerStages
+  alias Loopctl.Delivery.StoryStage
   alias Loopctl.Runners.Capacity
 
   @doc """
@@ -75,6 +77,20 @@ defmodule LoopctlWeb.RunnerChannel.Refusal do
   def for_message({:effect_conflict, effects}) when is_map(effects),
     do: %{reason: "effect_conflict", effects: effects}
 
+  # `stale_stage` CARRIES THE ROW (#849) — the same shape the `ok` ack sends, so a runner
+  # parses one thing either way. The contract's remedy for this code is "re-read the story and
+  # send the transition that applies", and `story_stages` has no runner-facing endpoint: the
+  # ack IS the read, by design. Without the row the instruction was unfollowable, and the
+  # deployed runner did the only thing left — brute-forced three `from` values in turn, all
+  # refused, none of them naming where the row was.
+  #
+  # The BARE atom keeps its clause below: `triage_verdict` is refused `stale_stage` too, from
+  # `Loopctl.Delivery.TriageVerdict`, where it means the story left `detected` and no
+  # transition applies at all. That one has nothing to hand back and is PERMANENT for that
+  # message, so carrying a row there would suggest a retry the contract refuses.
+  def for_message({:stale_stage, %StoryStage{} = row}),
+    do: Map.put(RunnerStages.row_state(row), :reason, "stale_stage")
+
   # The tenant's hash chain refused this transition's entry, so nothing was written. NOT
   # `rate_limited`: it is deterministic, the next attempt fails the same way, and every
   # custody transition in the tenant is failing until an operator acts. Its own permanent code,
@@ -85,7 +101,8 @@ defmodule LoopctlWeb.RunnerChannel.Refusal do
   #
   # `stale_stage`, `unknown_story_stage` and `effect_conflict` arrived with `stage` (1.4.0) and
   # are refusals of the CONTROL PLANE's state rather than of the message, which is why none is
-  # `invalid_payload`: a `stale_stage` runner re-reads the story and sends what applies, an
+  # `invalid_payload`: a `stale_stage` runner re-reads the story and sends what applies — off
+  # the row the clause above hands it, when there is one to hand — an
   # `unknown_story_stage` one has hit a condition it cannot clear by resending or by giving up
   # its claim, and an `effect_conflict` one must read the recorded identity off its last ack
   # and reconcile — never re-send, which is exactly what `invalid_payload` would tell it.

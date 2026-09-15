@@ -316,12 +316,20 @@ defmodule Loopctl.Delivery.RunnerStagesTest do
                )
 
       # A perfectly legal transition, sent by a runner two stages ahead of the row.
-      assert {:error, :stale_stage} =
+      assert {:error, {:stale_stage, row}} =
                RunnerStages.apply(
                  story.tenant_id,
                  runner.id,
                  message(record, %{from: :pr_open, to: :ci})
                )
+
+      # THE REFUSAL CARRIES THE ROW (#849). The contract tells a refused runner to re-read the
+      # story and send the transition that applies, and there is no endpoint to read it from —
+      # the reply is the read. Asserting the STAGE, not merely that a row came back: the row
+      # names `reviewing`, which is the one fact that turns three guessed round trips into one
+      # correct message.
+      assert row.stage == :reviewing
+      assert row.claim_epoch == @epoch
     end
 
     test "a transition the machine does not have is refused as a message fault" do
