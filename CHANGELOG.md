@@ -240,6 +240,19 @@ All notable changes to loopctl are documented here.
 
 ### Added
 
+- **A story a runner refused can be freed: `force_unclaim_story` (#846).** `POST
+  /api/v1/stories/:id/force-unclaim` resets the story to `pending` AND makes its delivery
+  stage row follow the release back to `queued` — so it is what un-parks a story, not merely
+  what clears `assigned_agent_id`. It had no MCP tool, and every session on the fleet reaches
+  loopctl through the MCP server and only through it, so the session that placed a dispatch a
+  runner then refused could not free the story it had parked: the story sat at `claimed` and
+  `place_dispatch` answered 409 `invalid_transition`, the stage machine having no edge out of
+  `claimed` except the ones the holder takes. The tool needs `LOOPCTL_ORCH_KEY` and pins it
+  exactly — the action is `exact_role: :orchestrator`, so a user or superadmin key is 403'd
+  there like any other non-member and a global `LOOPCTL_API_KEY` of the wrong role would read
+  as the story being unfreeable. No endpoint changed; this is the tool the rule in `CLAUDE.md`
+  already required.
+
 - **The delivery loop is reachable from a session: `place_dispatch`, `story_stage`,
   `resolve_escalation` (#803, #850).** Three MCP tools and the two endpoints two of them
   needed. The placement endpoint shipped with #842 and NO tool called it — and `curl` at

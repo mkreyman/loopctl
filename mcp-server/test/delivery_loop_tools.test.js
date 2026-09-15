@@ -1,7 +1,8 @@
 /**
- * #803/#850 on the MCP side: place_dispatch, story_stage, resolve_escalation.
+ * #803/#850/#846 on the MCP side: place_dispatch, story_stage, resolve_escalation,
+ * force_unclaim_story.
  *
- * These three exist because the endpoints behind them were unreachable from any session —
+ * These exist because the endpoints behind them were unreachable from any session —
  * `curl` at loopctl is refused by the fleet's guardrail, so a trigger with no tool is a verb
  * only a shell on the production node can use. The last block source-pins index.js so the
  * wiring cannot drift from the logic, which is the failure the tools themselves are about.
@@ -16,6 +17,8 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 import {
+  forceUnclaimPath,
+  forceUnclaimStory,
   placeDispatch,
   placementPath,
   resolveEscalation,
@@ -217,21 +220,92 @@ describe("resolve_escalation", () => {
   });
 });
 
+describe("force_unclaim_story", () => {
+  test("POSTs to the hyphenated force-unclaim route with no body", async () => {
+    // The route is `force-unclaim`. An underscore there is a 404 that reads like the story
+    // not existing, and the endpoint takes no body — the story is named in the path.
+    const { calls, apiCall } = fakeApi({ story: { agent_status: "pending" } });
+
+    await forceUnclaimStory({ story_id: STORY_ID }, { orchKey: "orch-key", apiCall });
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].method, "POST");
+    assert.equal(calls[0].path, `/api/v1/stories/${STORY_ID}/force-unclaim`);
+    assert.equal(calls[0].body, null);
+  });
+
+  test("refuses without the ORCH key, naming the gate a bigger key cannot pass", async () => {
+    // `exact_role: :orchestrator` is a chain-of-custody gate: a user or superadmin key is
+    // 403'd there like any other non-member. Saying WHICH key costs no round trip, and the
+    // server's reason code does not say it.
+    const { calls, apiCall } = fakeApi();
+
+    const result = await forceUnclaimStory(
+      { story_id: STORY_ID },
+      { orchKey: undefined, apiCall },
+    );
+
+    assert.equal(result.error, true);
+    assert.match(result.body, /LOOPCTL_ORCH_KEY/);
+    assert.match(result.body, /exact_role/);
+    assert.equal(calls.length, 0);
+  });
+
+  test("refuses without a story id, before any call", async () => {
+    const { calls, apiCall } = fakeApi();
+
+    const result = await forceUnclaimStory({}, { orchKey: "orch-key", apiCall });
+
+    assert.equal(result.error, true);
+    assert.match(result.body, /story_id/);
+    assert.equal(calls.length, 0);
+  });
+});
+
 describe("the wiring in index.js", () => {
-  test("all three tools are declared, dispatched and documented", () => {
+  test("every delivery-loop tool is declared, dispatched and documented", () => {
     // The defect these tools exist for is a verb that exists and nothing calls. A tool
     // declared and not dispatched, or dispatched and not declared, is that same defect inside
     // the MCP server, and it is invisible until someone tries to use it.
-    for (const name of ["place_dispatch", "story_stage", "resolve_escalation"]) {
+    for (const name of [
+      "place_dispatch",
+      "story_stage",
+      "resolve_escalation",
+      "force_unclaim_story",
+    ]) {
       assert.ok(INDEX_SRC.includes(`name: "${name}"`), `${name} is not declared`);
       assert.ok(INDEX_SRC.includes(`case "${name}":`), `${name} is not dispatched`);
       assert.ok(README.includes(name), `${name} is not in the README tool list`);
     }
   });
 
+  test("force_unclaim_story is pinned to the ORCH key, exactly", () => {
+    // `resolveKey` prefers a global LOOPCTL_API_KEY, and a global key of ANY other role —
+    // user and superadmin included — is 403'd by an `exact_role: :orchestrator` gate. Reading
+    // the env var is not enough on its own: without `exactKey` the request would still go out
+    // under whatever LOOPCTL_API_KEY holds, and the 403 would read as the story being
+    // unfreeable rather than the key being the wrong one.
+    const start = INDEX_SRC.indexOf("async function forceUnclaimStory(");
+    assert.ok(start > -1, "the force_unclaim_story handler was not found");
+
+    // Bounded by the NEXT function rather than a named neighbour, so inserting something
+    // between them cannot silently widen what this reads.
+    const end = INDEX_SRC.indexOf("\nasync function ", start + 1);
+    assert.ok(end > start, "the handler has no following function to bound it");
+
+    const handler = INDEX_SRC.slice(start, end);
+    assert.ok(handler.includes("LOOPCTL_ORCH_KEY"), "it does not read LOOPCTL_ORCH_KEY");
+    assert.ok(handler.includes("exactKey: true"), "it does not pin the key exactly");
+    assert.ok(
+      !handler.includes("LOOPCTL_USER_KEY"),
+      "it reaches for the user key, which that gate refuses",
+    );
+  });
+
   test("the paths the tools build are the routes loopctl serves", () => {
     assert.equal(placementPath(RUNNER_ID), `/api/v1/runners/${RUNNER_ID}/dispatches`);
     assert.equal(stagePath(STORY_ID), `/api/v1/stories/${STORY_ID}/stage`);
     assert.equal(resolvePath(STORY_ID), `/api/v1/stories/${STORY_ID}/stage/resolve`);
+    assert.equal(forceUnclaimPath(STORY_ID), `/api/v1/stories/${STORY_ID}/force-unclaim`);
   });
 });

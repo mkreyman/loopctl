@@ -1,16 +1,17 @@
 /**
- * The delivery loop's OPERATOR verbs (loopctl #803, #850).
+ * The delivery loop's OPERATOR verbs (loopctl #803, #850, #846).
  *
- * Three tools, and they exist because the endpoints behind them were unreachable from any
- * session on the fleet. `POST /api/v1/runners/:runner_id/dispatches` shipped with #842 and no
- * tool called it; `curl` at loopctl is refused by the fleet's own guardrail, deliberately; so
+ * These tools exist because the endpoints behind them were unreachable from any session on the
+ * fleet. `POST /api/v1/runners/:runner_id/dispatches` shipped with #842 and no tool called it;
+ * `curl` at loopctl is refused by the fleet's own guardrail, deliberately; so
  * the only way to place a dispatch was a shell on the production node. That is the same defect
  * as `place/4` shipping with no caller, failing one layer later — the trigger exists and
  * nothing outside the app can pull it.
  *
  * Mark's rule, 2026-09-15: an operator-facing endpoint is not done until an MCP tool calls it,
- * in the same change. These are that rule applied to the three verbs the loop needs to be
- * RUNNABLE (place a dispatch) and OBSERVABLE (read a story's stage, resolve an escalation).
+ * in the same change. These are that rule applied to the verbs the loop needs to be RUNNABLE
+ * (place a dispatch), OBSERVABLE (read a story's stage) and RECOVERABLE (resolve an
+ * escalation, free a story a runner refused).
  *
  * KEY SELECTION is behaviour, not a convention, so it lives here where a test can see it:
  *
@@ -19,6 +20,9 @@
  *     tree, and an agent key is refused `insufficient_role` before anything is written.
  *   - `resolve_escalation` is the HUMAN half of the escalation pair: a `:user` key no dispatch
  *     minted. The agent key that raises an escalation is 403'd on it by design.
+ *   - `force_unclaim_story` is gated `exact_role: :orchestrator`, so it needs the ORCH key and
+ *     a higher-privileged one does NOT substitute: a `:user` or `:superadmin` key is 403'd
+ *     there exactly as an agent key is. That is a chain-of-custody gate, not an oversight.
  *   - `story_stage` is a read and takes whatever key the caller has.
  *
  * SINGLE SOURCE OF TRUTH: `index.js` injects `apiCall`, and the unit suite runs this code
@@ -28,6 +32,11 @@
 const MISSING_USER_KEY =
   "LOOPCTL_USER_KEY is required: this verb claims a story and mints a custody dispatch, " +
   "which only an unlineaged user key may do.";
+
+const MISSING_ORCH_KEY =
+  "LOOPCTL_ORCH_KEY is required: force-unclaim is gated `exact_role: :orchestrator`, so a " +
+  "user or superadmin key is 403'd there like any other non-member. A higher-privileged key " +
+  "is not a way past it.";
 
 function refuse(body) {
   return { error: true, status: 0, body };
@@ -49,6 +58,11 @@ export function stagePath(storyId) {
 
 export function resolvePath(storyId) {
   return `/api/v1/stories/${encodeURIComponent(storyId)}/stage/resolve`;
+}
+
+/** Note the HYPHEN: the route is `force-unclaim`, not `force_unclaim`. */
+export function forceUnclaimPath(storyId) {
+  return `/api/v1/stories/${encodeURIComponent(storyId)}/force-unclaim`;
 }
 
 /**
@@ -141,4 +155,32 @@ export async function resolveEscalation({ story_id, to, reason } = {}, { userKey
   if (typeof reason === "string" && reason.trim() !== "") body.reason = reason;
 
   return apiCall("POST", resolvePath(story_id), body);
+}
+
+/**
+ * `POST /api/v1/stories/:id/force-unclaim`: take a story back off the agent holding it.
+ *
+ * TWO things happen, and the second is why a session reaches for this. `force_unclaim_story/3`
+ * resets `agent_status` to `pending` and clears `assigned_agent_id`; then, in the SAME
+ * transaction, `Stages.follow_release/5` makes the delivery stage row follow the release —
+ * from any stage a claim holds (`claimed`, `worktree`, `implementing`, `reviewing`, `pr_open`,
+ * `ci`) back to `queued`, rebound to the new claim epoch. That second half is what makes the
+ * story PLACEABLE again: `place_dispatch` on a story parked at `claimed` is refused
+ * `invalid_transition`, because the stage machine has no edge out of `claimed` except the ones
+ * the holder takes.
+ *
+ * No request body — the story is named in the path.
+ *
+ * ORCHESTRATOR key, and exactly that: the action is `exact_role: :orchestrator`, so a user or
+ * superadmin key is refused. `LOOPCTL_API_KEY` is deliberately NOT consulted as a fallback
+ * (`index.js` passes `exactKey`), because a global key of some other role would produce a 403
+ * that reads like the story being unclaimable rather than the key being wrong.
+ */
+export async function forceUnclaimStory({ story_id } = {}, { orchKey, apiCall } = {}) {
+  if (!orchKey) return refuse(MISSING_ORCH_KEY);
+
+  const bad = uuid(story_id, "story_id");
+  if (bad) return bad;
+
+  return apiCall("POST", forceUnclaimPath(story_id), null);
 }

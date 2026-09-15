@@ -48,6 +48,7 @@ import { enrollRunner, listRunners, revokeRunner, runnerPool } from "./lib/runne
 import { claimLeaseNotice, renewStoryClaim as renewStoryClaimRequest } from "./lib/claim-lease.js";
 import { escalateStory as escalateStoryRequest, escalationNotice } from "./lib/escalation.js";
 import {
+  forceUnclaimStory as forceUnclaimStoryRequest,
   placeDispatch as placeDispatchRequest,
   resolveEscalation as resolveEscalationRequest,
   storyStage as storyStageRequest,
@@ -3186,6 +3187,22 @@ async function storyStage(args) {
 
 async function resolveEscalation(args) {
   return toContent(await resolveEscalationRequest(args, deliveryDeps()));
+}
+
+// #846: force-unclaim is `exact_role: :orchestrator`, so this is the one delivery-loop verb
+// that needs the ORCH key — and it is pinned EXACTLY. `resolveKey` would prefer a global
+// LOOPCTL_API_KEY, and a global key of any other role (user included, superadmin included) is
+// 403'd by that gate, which reads like the story being unfreeable rather than the key being
+// the wrong one.
+async function forceUnclaimStory(args) {
+  const orchKey = process.env.LOOPCTL_ORCH_KEY;
+
+  return toContent(
+    await forceUnclaimStoryRequest(args, {
+      orchKey,
+      apiCall: (method, path, body) => apiCall(method, path, body, orchKey, { exactKey: true }),
+    }),
+  );
 }
 
 // US-26: Signed Tree Head retrieval
@@ -7745,6 +7762,37 @@ const TOOLS = [
       required: ["story_id", "to"],
     },
   },
+  {
+    name: "force_unclaim_story",
+    description:
+      "TAKE A STORY BACK from the agent holding it (POST /api/v1/stories/:id/force-unclaim). " +
+      "Two things happen and the SECOND is usually why you are here: the story resets to " +
+      "`agent_status: pending` with `assigned_agent_id` cleared, AND its delivery stage row " +
+      "follows the release back to `queued`.\n\n" +
+      "That second half is what makes the story PLACEABLE again. When a runner refuses a " +
+      "dispatch the story is left parked at `claimed`, and place_dispatch on it answers 409 " +
+      "`invalid_transition` — the stage machine has no edge out of `claimed` except the ones " +
+      "the holder takes, so nothing else frees it. The release requeues from any stage a claim " +
+      "holds (`claimed`, `worktree`, `implementing`, `reviewing`, `pr_open`, `ci`); a stage no " +
+      "claim holds keeps its stage and is rebound to the new claim epoch; `done` and `failed` " +
+      "are left alone. An ESCALATED story is not this tool's job — use resolve_escalation.\n\n" +
+      "REFUSALS. Requires LOOPCTL_ORCH_KEY: the action is `exact_role: :orchestrator`, so a " +
+      "user or superadmin key is 403'd like any other non-member and reaching for a " +
+      "higher-privileged key does NOT get past it. The orchestrator key must also be LINKED TO " +
+      "A REGISTERED AGENT — an unlinked one is refused 400 naming that — and the tenant must be " +
+      "human-anchored (403 `custody_tier_required` otherwise). 404 for an unknown story, 429 " +
+      "when rate limited.\n\n" +
+      "It does NOT touch `verified_status`, and it is idempotent: run it on an " +
+      "already-pending story and the stage row is still rebound, which is the remedy for a row " +
+      "stranded by an older release. It takes no request body.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        story_id: { type: "string", description: "The story UUID to free." },
+      },
+      required: ["story_id"],
+    },
+  },
 
   // LCP-1 §9 signed-profile tools
   {
@@ -8775,6 +8823,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     case "resolve_escalation":
       return await resolveEscalation(args);
+
+    case "force_unclaim_story":
+      return await forceUnclaimStory(args);
 
     case "register_custody_owner_key":
       return await registerCustodyOwnerKey(args);

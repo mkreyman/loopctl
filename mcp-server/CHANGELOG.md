@@ -5,6 +5,31 @@ All notable changes to `loopctl-mcp-server` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
+## 2.97.0 — 2026-09-15 (a story a runner refused can be freed)
+
+### Added
+
+- **`force_unclaim_story`** (loopctl #846, `POST /api/v1/stories/:id/force-unclaim`, ORCH key).
+  Takes a story back from the agent holding it: `agent_status` to `pending`,
+  `assigned_agent_id` cleared, and — in the same transaction — the delivery stage row follows
+  the release back to `queued`. **That second half is the point.** When a runner refuses a
+  dispatch the story is left parked at `claimed`, and `place_dispatch` on it answers 409
+  `invalid_transition`, because the stage machine has no edge out of `claimed` except the ones
+  the holder takes. The endpoint was the only thing that could free it and no tool called it,
+  so the session that placed the dispatch could not un-park the story it had parked.
+
+  It needs `LOOPCTL_ORCH_KEY` and the key is pinned EXACTLY — no `LOOPCTL_API_KEY` fallback.
+  The action is `exact_role: :orchestrator`, so a user or superadmin key is 403'd there like
+  any other non-member, and a global key of the wrong role would turn that into a 403 reading
+  as the story being unfreeable. The orchestrator key must also be linked to a registered
+  agent, and the tenant must be human-anchored.
+
+### Fixed
+
+- **`place_dispatch`'s README row no longer advertises `triage`.** 2.96.0 narrowed the `kind`
+  enum to `implement` alone and corrected the tool description; the README row still offered
+  `triage` as an option, which is the copy an operator reads first.
+
 ## 2.96.0 — 2026-09-15 (triage is dispatchable, but not through this tool)
 
 ### Changed
