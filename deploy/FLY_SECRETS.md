@@ -199,6 +199,19 @@ during an incident with `fly secrets set … && fly apps restart` — no deploy.
 |---------------------------------|---------|-------------|
 | `RUNNER_MAX_IN_FLIGHT_SESSIONS` | `6`     | The most runner sessions ONE tenant may have in flight across all its runners at once (#803). `Loopctl.Runners.dispatch/3` refuses past it with `:admission_limit_reached`, under a Postgres advisory lock, before any slot is reserved; each runner is separately capped at its enrolled `max_sessions`. It exists because every session of a tenant runs on one Anthropic account, whose rate limit is what bites on parallel work: **too HIGH** and the sessions throttle each other into 429s and slow turns, **too LOW** and runners sit idle with free slots while stories queue. Positive integer; unset, blank or malformed leaves the default rather than failing boot. Read on every dispatch, so it applies from the restart that sets it; slots already held are not revoked |
 
+#### Agent delivery loop: the unattended dispatch driver
+
+Three plain config variables (`fly.toml` `[env]` is fine — none of them is a credential), and
+they are a set: the driver runs only when all three are right, and says which one is not.
+**Turn it on last**, once runners are enrolled, connected and the queue holds work you are
+willing to have picked up unattended.
+
+| Variable                        | Default | Description |
+|---------------------------------|---------|-------------|
+| `DISPATCH_DRIVER_ENABLED`       | `false` | Whether `Loopctl.Delivery.DispatchDriver` places queued stories on connected runners without a human (#803). Its cron entry runs every minute either way; unset, it selects nothing and reports a clean run. **Opt-in and exact: only `true` or `1` enable it**, so a typo leaves the loop off rather than on. This is the one component that spends money and runs code on a runner's machine with nobody watching, which is why the default is off and why enabling takes a restart rather than a config reload |
+| `DISPATCH_WALL_CLOCK_SECONDS`   | unset   | The wall-clock budget minted into every dispatch the driver places. **NO DEFAULT: enabled with this unset, the driver places nothing and the job FAILS naming the key** — a default here would be our guess quietly becoming your cost policy. For scale: the one measured unattended run (2026-09-14, one story) took 28.8 minutes and about USD 10.40. Positive integer seconds; zero, negative or malformed is treated as unset |
+| `DISPATCH_MAX_TURNS`            | unset   | The turn budget minted into every dispatch, and the other half of the same gate — same failure, same reason, same shape. That measured run took 108 turns. Positive integer; zero, negative or malformed is treated as unset |
+
 #### Agent delivery loop: Gate B triggers
 
 Gate B (`Loopctl.DeliveryGates`) decides from these which paths a delivery-loop change may

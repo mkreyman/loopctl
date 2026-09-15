@@ -38,6 +38,7 @@ defmodule Loopctl.Intake.Source do
              :id,
              :project_id,
              :repo_full_name,
+             :base_branch,
              :target_epic_id,
              :revoked_at,
              :inserted_at,
@@ -56,6 +57,12 @@ defmodule Loopctl.Intake.Source do
     # which is not the same as any answer loopctl could invent.
     belongs_to :target_epic, Loopctl.WorkBreakdown.Epic
     field :repo_full_name, :string
+
+    # THE BRANCH A DISPATCH IS CUT FROM, per repository (#803 round 1, finding 7). NOT NULL
+    # with a default of "master", which is what every dispatch carried before the column
+    # existed; a repository whose default branch is `main` — GitHub's default since 2020 —
+    # is repointed through `PATCH /api/v1/intake/sources/:id` rather than by guessing.
+    field :base_branch, :string, default: "master"
     field :webhook_secret, Loopctl.Vault.Binary, redact: true
     field :revoked_at, :utc_datetime_usec
 
@@ -73,8 +80,9 @@ defmodule Loopctl.Intake.Source do
   @spec create_changeset(t(), map()) :: Ecto.Changeset.t()
   def create_changeset(%__MODULE__{} = source, attrs) do
     source
-    |> cast(attrs, [:repo_full_name])
-    |> validate_required([:repo_full_name])
+    |> cast(attrs, [:repo_full_name, :base_branch])
+    |> validate_required([:repo_full_name, :base_branch])
+    |> validate_length(:base_branch, min: 1, max: 255)
     |> validate_format(:repo_full_name, @repo_format, message: "must be owner/name")
     |> check_constraint(:repo_full_name, name: :intake_sources_repo_shape)
     |> unique_constraint(:repo_full_name,

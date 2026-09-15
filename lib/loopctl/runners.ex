@@ -825,6 +825,54 @@ defmodule Loopctl.Runners do
   #
   # The unlock is therefore precise. It reaches a runner that DECLARED the kind, and only that
   # runner, which is exactly the machine whose declaration is newer evidence than the cache.
+  @doc """
+  Whether a runner would ACCEPT a dispatch of `kind` for `repo` right now, judged from the
+  Presence meta of its live socket — the same three facts `dispatch/3` judges, read before
+  anything is claimed (#803 §3).
+
+  `dispatch/3` applies `kind` itself and leaves `draining` and `repos` to the runner, which
+  refuses them with `draining` and `repo_not_allowed`. That is correct for an operator-driven
+  push, where a refusal reaches a person. It is NOT enough for the unattended driver: a
+  placement CLAIMS the story first, and `dispatch/3` answers `:ok` the moment it broadcasts,
+  so a refusal the RUNNER makes arrives after the claim has committed — the story sits at
+  `claimed` with no session until its lease expires, and comes back `queued` with
+  `agent_status: :pending`, which no automated path re-contracts.
+
+  So the driver asks this BEFORE placing, and it asks it of the same meta the push would
+  reach. `kind_supported/4` is shared with `dispatch/3` rather than reimplemented, because a
+  second copy of the declaration-then-ledger rule is exactly how a pre-check and its
+  enforcement drift apart.
+
+  `:ok`, or `{:error, :runner_draining | :repo_not_allowed | :kind_not_supported}`.
+  """
+  @spec accepts?(Ecto.UUID.t(), Ecto.UUID.t(), map(), String.t(), String.t()) ::
+          :ok | {:error, :runner_draining | :repo_not_allowed | :kind_not_supported}
+  def accepts?(tenant_id, runner_id, meta, kind, repo)
+      when is_binary(kind) and is_binary(repo) do
+    cond do
+      Map.get(meta, :draining) == true -> {:error, :runner_draining}
+      not repo_allowed?(meta, repo) -> {:error, :repo_not_allowed}
+      true -> kind_supported(tenant_id, runner_id, meta, kind)
+    end
+  end
+
+  # A runner that declared NO repos has declared nothing to check — it is the pre-1.x shape
+  # and the field is required only from the contract's own version, so an empty or absent
+  # list is read as "ask the runner", which is the behaviour every caller had before this
+  # function existed. A non-empty list is a statement and is honoured.
+  #
+  # CASE-INSENSITIVELY, which is the same rule `Loopctl.Intake` applies when it decides
+  # whether a webhook's repository is the one a source is bound to. GitHub treats
+  # `owner/Repo` and `owner/repo` as one repository, so an exact comparison here would answer
+  # "this runner does not have that checkout" for a machine that plainly does — and for the
+  # unattended driver that answer is `:no_runner`, the one outcome that logs nothing at all.
+  defp repo_allowed?(%{repos: [_ | _] = repos}, repo) do
+    wanted = String.downcase(repo)
+    Enum.any?(repos, &(is_binary(&1) and String.downcase(&1) == wanted))
+  end
+
+  defp repo_allowed?(_meta, _repo), do: true
+
   defp kind_supported(tenant_id, runner_id, meta, kind) do
     {source, kinds} = declared_kinds(meta)
 

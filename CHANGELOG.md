@@ -83,6 +83,59 @@ All notable changes to loopctl are documented here.
   an MCP tool and the unattended driver are bound by the rule without passing through the HTTP
   edge.
 
+- **The unattended dispatch driver, OFF by default (#803).** `Loopctl.Delivery.DispatchDriver`
+  plus `Loopctl.Workers.DispatchDriverWorker`, scheduled every minute: it selects stage rows at
+  `queued` fleet-wide, oldest first and bounded per pass, picks a runner of that tenant that is
+  both CONNECTED and has a free slot, and places the story through `Placement.place/4`. It is
+  the cadence half of the trigger the operator endpoint above gave an operator.
+
+  **Three new operator variables, documented in `deploy/FLY_SECRETS.md`, and the driver runs
+  only when all three are right.** `DISPATCH_DRIVER_ENABLED` defaults to FALSE and is exact
+  opt-in (`true` or `1`), so the cron entry runs from the deploy that ships it, places nothing
+  and reports a clean run until somebody turns it on — this is the one component of the loop
+  that spends money and runs code on someone's machine with nobody watching, and a default of
+  ON would make that a consequence of deploying rather than a decision.
+  `DISPATCH_WALL_CLOCK_SECONDS` and `DISPATCH_MAX_TURNS` have **NO DEFAULT**: enabled with
+  either unset, the driver places nothing and the job FAILS naming the key, rather than
+  dispatching on a figure nobody chose. A pass where every candidate errored also fails the
+  job — on a pool outage every candidate raises, the per-story rescue swallows each, and an
+  `:ok` there would have Oban record success with nothing retried and nothing alerting.
+
+  **It is inert in a second way until `place/4` builds the story object, and that is the next
+  change rather than a deferral.** An `implement` dispatch carries the story as typed fields;
+  neither placing caller builds that object today (the builder escalates an oversize story,
+  and that edge exists only once the story is claimed), so a placed dispatch names a
+  `story_id` and carries no work. The runner refuses it — confirmed against the runner
+  implementation, a clean immediate refusal that leaves no state — so the driver must not be
+  enabled until the object is built server-side.
+
+  **Review round 1 changed the selection and the eligibility rule substantially**, and two of
+  those are operator-visible. `intake_sources` gains a **`base_branch`** column (migration
+  `20260921140000`, NOT NULL, default `master`, no backfill and no manual step), settable on
+  `PATCH /api/v1/intake/sources/:id`: the driver hardcoded `master`, and a repository whose
+  default branch is `main` — GitHub's default since 2020 — was dispatched against a branch
+  that does not exist. Set it per repository BEFORE enabling the driver. And a candidate must
+  now be `contracted` as well as `queued`: every release path puts the stage row back to
+  `queued` while setting `agent_status: :pending`, which `place/4` refuses, so on the stage
+  row alone a released story was selected for ever with its `updated_at` frozen at the head of
+  the queue — twenty of those and the driver never reached a placeable story again while every
+  pass still reported success.
+
+  Migration `20260921130000` adds the partial index the candidate read needs
+  (`story_stages (tenant_id, updated_at, story_id) WHERE stage = 'queued'`, built
+  `CONCURRENTLY`, no manual step): the key order is the candidate window's own PARTITION BY
+  plus its ORDER BY, and the only other index on the table is tenant-leading with the stage
+  nowhere in it.
+
+  **Round 2 added one more operator-visible change to the same PATCH.** `PATCH
+  /api/v1/intake/sources/:id` no longer treats an ABSENT `target_epic_id` as a request to
+  clear it: both fields are optional, a field you do not send is left alone, clearing the epic
+  takes an explicit null, and a body naming neither is a 422 `nothing_to_update`. Without that,
+  following the note above and setting the base branch before enabling the driver would have
+  un-pointed the source from its epic — which by that endpoint's own description strands every
+  record from it at `pending_triage`. Both fields are also written in ONE transaction now, so
+  a refused branch no longer leaves a committed repoint and its chain entry behind.
+
 - **`POST /api/v1/runners/:runner_id/dispatches` — the control-side dispatch trigger (#803).**
   `Loopctl.Delivery.Placement.place/4` shipped with #833 and had NO CALLER: the mechanism was
   built, tested and documented, and nothing could reach it. The delivery loop's first

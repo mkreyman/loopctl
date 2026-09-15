@@ -888,13 +888,8 @@ defmodule Loopctl.Delivery.MergePrecondition do
   """
   @spec repo_for_story(map()) :: fact(String.t())
   def repo_for_story(%{tenant_id: tenant_id, project_id: project_id}) do
-    tenant_id
-    |> Intake.list_sources()
-    |> Enum.filter(&(&1.project_id == project_id))
-    |> case do
-      [source] -> {:ok, source.repo_full_name}
-      [] -> {:error, {:no_intake_source, project_id}}
-      sources -> {:error, {:ambiguous_intake_source, project_id, length(sources)}}
+    with {:ok, source} <- Intake.source_for_project(tenant_id, project_id) do
+      {:ok, source.repo_full_name}
     end
   end
 
