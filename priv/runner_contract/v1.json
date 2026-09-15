@@ -137,9 +137,12 @@
               "type": "array"
             },
             "html_url": {
-              "description": "GitHub's canonical URL for the issue. loopctl's, not the reporter's.",
+              "description": "GitHub's canonical URL for the issue, or NULL. loopctl's, not the reporter's — `Loopctl.Intake.GithubPayload` derives it and deliberately yields nothing unless the payload's URL is exactly the canonical form for the bound repository and issue number, so an enterprise host, a renamed repo or a forged URL leaves it null. Nullable rather than required because it is informational: the session already has `record_id` and `issue_number`, and refusing a whole report because a convenience link did not parse would escalate the wrong thing. A template must handle the absence.",
               "maxLength": 500,
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "issue_number": {
               "minimum": 1,
@@ -780,9 +783,12 @@
           "type": "array"
         },
         "html_url": {
-          "description": "GitHub's canonical URL for the issue. loopctl's, not the reporter's.",
+          "description": "GitHub's canonical URL for the issue, or NULL. loopctl's, not the reporter's — `Loopctl.Intake.GithubPayload` derives it and deliberately yields nothing unless the payload's URL is exactly the canonical form for the bound repository and issue number, so an enterprise host, a renamed repo or a forged URL leaves it null. Nullable rather than required because it is informational: the session already has `record_id` and `issue_number`, and refusing a whole report because a convenience link did not parse would escalate the wrong thing. A template must handle the absence.",
           "maxLength": 500,
-          "type": "string"
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "issue_number": {
           "minimum": 1,

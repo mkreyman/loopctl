@@ -891,11 +891,19 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
     end
 
     # Found by the loopctl-runner session: a runner may declare a kind its accept path cannot
-    # run, refusing every dispatch of it as a FAULT rather than a capability statement. Both
-    # other outcome tags stay at zero while the machine eats dispatches, so this is the one
-    # shape the telemetry could not see. 1.7.0 makes declaring triage possible, so the blind
-    # spot would ship with it.
-    test "a FAULT on a declared kind is counted, and suppresses nothing",
+    # run, refusing every dispatch of it as a FAULT rather than a capability statement.
+    #
+    # Round 2 then scoped the counter to kinds BEYOND implied_kinds, because `other` is the
+    # contract's residual reason and `implement` is dispatchable and universally declared —
+    # counting faults there would drown the series in ordinary transient failures.
+    #
+    # THE CONSEQUENCE, ASSERTED RATHER THAN HIDDEN: the positive case is unreachable today.
+    # `implement` is the only dispatchable kind and it is in the implied set, so nothing can
+    # currently produce a fault on a kind outside it. What is testable now is the scoping
+    # decision itself — a fault on `implement` emits NOTHING — and that is what this asserts.
+    # The positive case becomes reachable when `triage` joins dispatchable_kinds, which is
+    # also when the failure mode it watches for becomes possible.
+    test "a FAULT on a declared kind inside the implied set is NOT counted",
          %{runner: runner, raw: raw, channel: channel} do
       channel = rejoin_declaring(channel, raw, runner, ["implement"])
 
@@ -921,13 +929,10 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
 
       assert_reply reply_ref, :ok, _, @reply_timeout
 
-      assert_receive {[:loopctl, :runners, :declared_kind_refused], ^ref, %{count: 1}, meta},
-                     @reply_timeout
+      refute_receive {[:loopctl, :runners, :declared_kind_refused], ^ref, _, _}, 300
 
-      assert meta.outcome == "declared_but_faulted"
-
-      # A fault is transient by assumption, so nothing is suppressed and the next dispatch
-      # is still sent — the counter is the signal, not a bound.
+      # And a fault suppresses nothing either way — it is transient by assumption, so the
+      # next dispatch is still sent.
       assert Runners.suppressed_kinds(socket_meta(channel)) == []
 
       assert :ok =

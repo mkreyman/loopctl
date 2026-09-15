@@ -677,7 +677,17 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           html_url: %Schema{
             type: :string,
             maxLength: @max_url_length,
-            description: "GitHub's canonical URL for the issue. loopctl's, not the reporter's."
+            nullable: true,
+            description:
+              "GitHub's canonical URL for the issue, or NULL. loopctl's, not the " <>
+                "reporter's — `Loopctl.Intake.GithubPayload` derives it and deliberately " <>
+                "yields nothing unless the payload's URL is exactly the canonical form for " <>
+                "the bound repository and issue number, so an enterprise host, a renamed " <>
+                "repo or a forged URL leaves it null. Nullable rather than required " <>
+                "because it is informational: the session already has `record_id` and " <>
+                "`issue_number`, and refusing a whole report because a convenience link " <>
+                "did not parse would escalate the wrong thing. A template must handle the " <>
+                "absence."
           },
           untrusted: %Schema{
             type: :string,
@@ -1912,7 +1922,16 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   """
   @spec cast_triage_verdict(term()) :: {:ok, map()} | {:error, term()}
   def cast_triage_verdict(payload) do
-    with {:ok, cast} <- cast(payload, RunnerTriageVerdict.schema()) do
+    # `values_ok/1` FIRST, as every other inbound cast does. This was the one runner-to-
+    # control cast that skipped it, and it is the worst one to skip: the verdict is the most
+    # free-form object a runner sends — a draft title, a description, acceptance criteria,
+    # evidence, a contradiction's prose — and those fields become a story row. A NUL byte is
+    # trivially reachable from the reporter text the authoring session had just read, which
+    # is the exact threat model this object is documented against; Postgres refuses one in
+    # `text` and in any jsonb string, so it would pass the cast and raise at the write, on
+    # every resend.
+    with :ok <- values_ok(payload),
+         {:ok, cast} <- cast(payload, RunnerTriageVerdict.schema()) do
       verdict = known_fields(cast, RunnerTriageVerdict.schema())
 
       case verdict_shape_errors(verdict) do
@@ -1922,26 +1941,57 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     end
   end
 
+  # ONE FUNCTION PER RULE, and they are independent `++` terms so a verdict breaking several
+  # is refused for each rather than for whichever was checked first. Split out when credo
+  # called the combined version too complex, which it was: four unrelated conditions sharing
+  # one body read as a checklist rather than as four things the contract says.
   defp verdict_shape_errors(verdict) do
-    outcome = Map.get(verdict, :outcome)
-    story = Map.get(verdict, :story)
+    story_pairing(verdict) ++
+      duplicate_pairing(verdict) ++
+      escalation_content(verdict) ++
+      verdict_size(verdict)
+  end
 
-    missing_story =
-      if outcome == "story" and is_nil(story),
-        do: ["a story outcome must carry the draft story"],
-        else: []
+  # A `story` outcome carrying no draft has moved the work rather than done it; a draft on
+  # any other outcome is a payload whose halves disagree about what was decided.
+  defp story_pairing(%{outcome: "story"} = verdict) do
+    if is_nil(Map.get(verdict, :story)),
+      do: ["a story outcome must carry the draft story"],
+      else: []
+  end
 
-    unexpected_story =
-      if outcome != "story" and not is_nil(story),
-        do: ["story is only allowed when outcome is story"],
-        else: []
+  defp story_pairing(verdict) do
+    if is_nil(Map.get(verdict, :story)),
+      do: [],
+      else: ["story is only allowed when outcome is story"]
+  end
 
-    oversize =
-      if ByteRule.bytes(verdict) > RunnerTriageVerdict.max_bytes(),
-        do: ["verdict exceeds #{RunnerTriageVerdict.max_bytes()} bytes under the byte rule"],
-        else: []
+  # Drafting new work and naming the story this duplicates are different decisions. A
+  # consumer reading `outcome` creates a row, one reading `duplicate_of` makes a link, and
+  # nothing records which was meant.
+  defp duplicate_pairing(%{outcome: "story"} = verdict) do
+    if is_nil(Map.get(verdict, :duplicate_of)),
+      do: [],
+      else: ["a story outcome must not also name duplicate_of"]
+  end
 
-    missing_story ++ unexpected_story ++ oversize
+  defp duplicate_pairing(_verdict), do: []
+
+  # An escalation with nothing attached reaches a human who starts the same reading from the
+  # beginning — the thing `missing_information` exists to prevent. Either field satisfies it:
+  # one says why, the other says what is needed.
+  defp escalation_content(%{outcome: "escalate"} = verdict) do
+    if Enum.all?([:escalation_reasons, :missing_information], &(Map.get(verdict, &1, []) == [])),
+      do: ["an escalate outcome must carry escalation_reasons or missing_information"],
+      else: []
+  end
+
+  defp escalation_content(_verdict), do: []
+
+  defp verdict_size(verdict) do
+    if ByteRule.bytes(verdict) > RunnerTriageVerdict.max_bytes(),
+      do: ["verdict exceeds #{RunnerTriageVerdict.max_bytes()} bytes under the byte rule"],
+      else: []
   end
 
   @doc """

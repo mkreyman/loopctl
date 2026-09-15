@@ -100,6 +100,7 @@ defmodule LoopctlWeb.RunnerChannel do
   require Logger
 
   alias Loopctl.ApiSpec.RunnerContract
+  alias Loopctl.ApiSpec.RunnerContract.Kinds
   alias Loopctl.Delivery.RunnerStages
   alias Loopctl.LogValue
   alias Loopctl.Runners
@@ -640,7 +641,19 @@ defmodule LoopctlWeb.RunnerChannel do
 
     with {:declared, kinds} <- Runners.declared_kinds(meta),
          kind when is_binary(kind) <- record.kind,
-         true <- kind in kinds do
+         true <- kind in kinds,
+         # SCOPED TO A KIND BEYOND THE HISTORIC BASELINE, which is the whole signal. `other`
+         # is the contract's RESIDUAL refusal reason: every anticipated local condition has
+         # its own code and anything else — an internal exception, a disk check that threw —
+         # lands here. `implement` is dispatchable and every runner declares it, so counting
+         # faults on it would drown the series in ordinary transient failures and hand an
+         # operator a "your declaration has diverged" warning for a runner that hiccuped.
+         #
+         # A fault on a kind OUTSIDE `implied_by_silence/0` is different in kind, not just in
+         # rate: nothing was ever sent for it before the runner declared it, so a structural
+         # failure there is the declaration outrunning the accept path — the case this exists
+         # to catch.
+         false <- kind in Kinds.implied_by_silence() do
       Logger.warning(
         "runner declared kind #{kind} and then refused a dispatch of it as other; the " <>
           "declaration and what the runner can actually run may have diverged"

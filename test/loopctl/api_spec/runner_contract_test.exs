@@ -544,20 +544,14 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   defp walk_schema(_other, _path), do: []
 
-  # The ByteRule cost of a field filled to every maximum it declares. Arrays are filled to
-  # maxItems with strings of maxLength; a nested object is the sum of its own widest fields.
-  defp widest_field_bytes(%OpenApiSpex.Schema{type: :array, maxItems: n, items: items})
-       when is_integer(n) do
-    ByteRule.bytes(List.duplicate(widest_value(items), n))
-  end
-
-  defp widest_field_bytes(%OpenApiSpex.Schema{type: :object, properties: props})
-       when is_map(props) do
-    props
-    |> Enum.map(fn {_k, sub} -> widest_field_bytes(sub) end)
-    |> Enum.sum()
-  end
-
+  # The ByteRule cost of a field filled to every maximum it declares — measured by BUILDING
+  # the widest value and charging it, never by summing parts.
+  #
+  # It summed sub-field costs for an object, which silently dropped ByteRule's container,
+  # per-member and object-key charges: for the verdict's nested story it computed 46_676
+  # against a real 47_170, under 900 bytes of slack the guard did not know it was spending.
+  # A field added later that overran the cap by a small margin would have passed. That is the
+  # cap-that-cannot-bind defect one level up, in the test written to catch it.
   defp widest_field_bytes(sub), do: ByteRule.bytes(widest_value(sub))
 
   defp widest_value(%OpenApiSpex.Schema{type: :string, maxLength: n}) when is_integer(n),
@@ -572,6 +566,11 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   defp widest_value(%OpenApiSpex.Schema{type: :integer}), do: 1
   defp widest_value(%OpenApiSpex.Schema{type: :boolean}), do: true
+
+  # An UNBOUNDED string is not free, and returning "" charged 12 bytes for a field that can
+  # hold a uuid (228) or more. A string with no maxLength is charged at the longest thing the
+  # contract actually puts in one, so the guard errs toward refusing rather than admitting.
+  defp widest_value(%OpenApiSpex.Schema{type: :string}), do: String.duplicate("x", 36)
   defp widest_value(_sub), do: ""
 
   defp unknown_keywords(%{} = schema, known) do
@@ -694,6 +693,46 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
                "#{inspect(mod)}.#{name} at its declared maximum costs #{cost} bytes against " <>
                  "an object cap of #{cap}, so the field cap can never be reached"
       end
+    end
+
+    # #835 round 2, finding 2. The one inbound cast that skipped values_ok/1, and the worst to
+    # skip: the verdict is the most free-form object a runner sends and its fields become a
+    # story row. A NUL passes the cast and raises at the Postgres write, on every resend.
+    test "a NUL anywhere in a verdict is refused, at any depth" do
+      assert {:error, _} =
+               RunnerContract.cast_triage_verdict(
+                 verdict(%{"outcome" => "story", "story" => draft_story(%{"title" => "a\0b"})})
+               )
+
+      assert {:error, _} =
+               RunnerContract.cast_triage_verdict(verdict(%{"evidence" => ["lib/a.ex\0"]}))
+    end
+
+    # Finding 4: a verdict must not say two things at once.
+    test "a story outcome naming a duplicate is refused" do
+      assert {:error, {:invalid, errors}} =
+               RunnerContract.cast_triage_verdict(
+                 verdict(%{
+                   "outcome" => "story",
+                   "story" => draft_story(),
+                   "duplicate_of" => Ecto.UUID.generate()
+                 })
+               )
+
+      assert Enum.any?(errors, &(&1 =~ "must not also name duplicate_of"))
+    end
+
+    test "an escalation with nothing attached is refused" do
+      assert {:error, {:invalid, errors}} =
+               RunnerContract.cast_triage_verdict(verdict(%{"outcome" => "escalate"}))
+
+      assert Enum.any?(errors, &(&1 =~ "escalation_reasons or missing_information"))
+
+      # Either field satisfies it: one says why, the other says what is needed.
+      assert {:ok, _} =
+               RunnerContract.cast_triage_verdict(
+                 verdict(%{"outcome" => "escalate", "escalation_reasons" => ["ambiguous"]})
+               )
     end
 
     test "undeclared keys are dropped rather than carried" do

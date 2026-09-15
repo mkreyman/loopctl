@@ -54,6 +54,22 @@ All notable changes to loopctl are documented here.
   because one tested implementation of an escape is worth more than one per runner. The
   runner's contract for it is: paste verbatim, never parse or re-wrap.
 
+  **A second schema ships in the same export: `RunnerTriageVerdict`**, what a triage session
+  returns — `outcome` (`story` / `escalate` / `reject`), `confidence` as an enum rather than a
+  number, the draft story required on a `story` outcome, `missing_information`, `evidence`,
+  `duplicate_of` and `contradicts`. It is in `priv/runner_contract/v1.json` under
+  `$defs.RunnerTriageVerdict` with its bounds in `x-connection.limits.triage_verdict`, and it
+  is the object a runner author implements to emit a verdict. It is SESSION-AUTHORED and not
+  trusted input: loopctl records and bounds it, never executes it, and fences its strings
+  wherever they reach another prompt. Nothing receives one yet.
+
+  **Operator-facing: a new tag value on an existing metric.**
+  `[:loopctl, :runners, :declared_kind_refused]` gains `outcome: "declared_but_faulted"` — a
+  runner that declared a kind and then FAULTED on it, meaning its declaration and what its
+  accept path can run have diverged. Anything alerting on that event's tags sees new
+  cardinality. It is scoped to kinds beyond `implied_kinds`, so ordinary transient faults on
+  `implement` do not raise it.
+
   **`triage` is still NOT dispatchable and nothing new goes on the wire.** Until 1.7.0 it was
   excluded because no payload could carry reporter text; that is now fixed, and what holds it
   back is the other end — no deployed runner accepts the kind, and a triage session needs its

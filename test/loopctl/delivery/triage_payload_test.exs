@@ -220,6 +220,37 @@ defmodule Loopctl.Delivery.TriagePayloadTest do
       end
     end
 
+    # #835 round 2, finding 1 (HIGH), and a defect in round 1's own fix: violations/1 checked
+    # four things and a nil html_url was not one of them. GithubPayload deliberately yields
+    # nil whenever the URL is not exactly the canonical form — an enterprise host, a renamed
+    # repo, a forged URL — and the column is the one nullable field on the record. Resolved
+    # by making the CONTRACT field nullable rather than by escalating: the link is
+    # informational, the session already has record_id and issue_number, and refusing a whole
+    # report because a convenience URL did not parse escalates the wrong thing.
+    test "a record with no html_url still builds, and the wire still accepts it" do
+      assert {:ok, triage} = TriagePayload.build(record(%{html_url: nil}))
+      assert triage.html_url == nil
+
+      payload = %{
+        "dispatch_id" => Ecto.UUID.generate(),
+        "story_id" => Ecto.UUID.generate(),
+        "kind" => "triage",
+        "repo" => "mkreyman/home_care_billing",
+        "base_branch" => "master",
+        "branch" => "feature/x",
+        "claim_epoch" => 0,
+        "wall_clock_seconds" => 3600,
+        "max_turns" => 40,
+        "triage" => Map.new(triage, fn {k, v} -> {to_string(k), v} end)
+      }
+
+      {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(payload)
+
+      # The kind refusal only. A nil html_url must not be what refuses it.
+      assert Enum.all?(errors, &(&1 =~ "not dispatchable")),
+             "a nil html_url was refused by the wire: #{inspect(errors)}"
+    end
+
     test "the built object is within the contract's byte cap with room for the dispatch" do
       assert {:ok, triage} = TriagePayload.build(record())
       assert ByteRule.bytes(triage) < RunnerTriage.max_bytes()
