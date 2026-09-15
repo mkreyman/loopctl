@@ -34,7 +34,15 @@ defmodule Loopctl.Intake.Source do
   @repo_format ~r/^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9._-]{1,100}$/
 
   @derive {Jason.Encoder,
-           only: [:id, :project_id, :repo_full_name, :revoked_at, :inserted_at, :updated_at]}
+           only: [
+             :id,
+             :project_id,
+             :repo_full_name,
+             :target_epic_id,
+             :revoked_at,
+             :inserted_at,
+             :updated_at
+           ]}
 
   schema "intake_sources" do
     tenant_field()

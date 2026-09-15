@@ -32,10 +32,19 @@ defmodule LoopctlWeb.IntakeSourceController do
 
   @source_schema %Schema{
     type: :object,
-    required: [:id, :project_id, :repo_full_name, :revoked_at, :inserted_at],
+    required: [:id, :project_id, :repo_full_name, :target_epic_id, :revoked_at, :inserted_at],
     properties: %{
       id: %Schema{type: :string, format: :uuid},
       project_id: %Schema{type: :string, format: :uuid},
+      target_epic_id: %Schema{
+        type: :string,
+        format: :uuid,
+        nullable: true,
+        description:
+          "The epic a story triaged from this source's issues is created in. NULL means " <>
+            "the question has not been answered, and a report arriving on such a source is " <>
+            "ESCALATED to a human rather than landing in an epic chosen for it."
+      },
       repo_full_name: %Schema{type: :string, pattern: Source.repo_format().source},
       revoked_at: %Schema{type: :string, format: :"date-time", nullable: true},
       inserted_at: %Schema{type: :string, format: :"date-time"},
@@ -54,7 +63,8 @@ defmodule LoopctlWeb.IntakeSourceController do
         "user role and a human-anchored tenant; a caller whose key was minted by a dispatch " <>
         "is refused with 403 `api_key_mint_forbidden`. 422 when the repository is not " <>
         "`owner/name`, an active source already binds it, or the project is missing, not a " <>
-        "work project, or archived. The secret is encrypted at rest.",
+        "work project, or archived, or `target_epic_id` names an epic that is not in that " <>
+        "project. The secret is encrypted at rest.",
     request_body:
       {"Intake source", "application/json",
        %Schema{
@@ -66,7 +76,16 @@ defmodule LoopctlWeb.IntakeSourceController do
              pattern: Source.repo_format().source,
              description: "The repository, e.g. `mkreyman/home_care_billing`."
            },
-           project_id: %Schema{type: :string, format: :uuid}
+           project_id: %Schema{type: :string, format: :uuid},
+           target_epic_id: %Schema{
+             type: :string,
+             format: :uuid,
+             description:
+               "Optional. The epic a story triaged from this source's issues is created " <>
+                 "in; it must belong to this source's project. Omit it and reports from " <>
+                 "this source are escalated to a human instead of becoming stories, which " <>
+                 "is the safe default rather than a guess."
+           }
          }
        }},
     responses: %{
@@ -126,7 +145,16 @@ defmodule LoopctlWeb.IntakeSourceController do
   def create(conn, params) do
     tenant = conn.assigns.current_tenant
 
-    attrs = %{repo_full_name: params["repo_full_name"], project_id: params["project_id"]}
+    # `target_epic_id` is OPTIONAL and is passed through as given, including absent: the
+    # context distinguishes "not answered" (nil, and reports escalate) from "answered wrongly"
+    # (an epic outside this source's project, refused at enrollment). Dropping it here is what
+    # made the column unreachable through every documented path — the only way to set it was
+    # direct SQL, so every promote escalated and the feature had no code path at all.
+    attrs = %{
+      repo_full_name: params["repo_full_name"],
+      project_id: params["project_id"],
+      target_epic_id: params["target_epic_id"]
+    }
 
     with {:ok, %{source: source, webhook_secret: secret}} <-
            Intake.create_source(tenant.id, attrs, actor_lineage: actor_lineage(conn)) do

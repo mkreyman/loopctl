@@ -4,6 +4,7 @@ defmodule Loopctl.IntakeTest do
   alias Loopctl.AdminRepo
   alias Loopctl.Intake
   alias Loopctl.Intake.Signature
+  alias Loopctl.Intake.Source
   alias Loopctl.Projects.Project
 
   setup :verify_on_exit!
@@ -90,6 +91,107 @@ defmodule Loopctl.IntakeTest do
                })
 
       assert %{project_id: ["must be an active work project"]} = errors_on(changeset)
+    end
+
+    test "an epic of the source's own project is accepted and recorded" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: project.id})
+
+      assert {:ok, %{source: source}} =
+               Intake.create_source(tenant.id, %{
+                 repo_full_name: "mkreyman/home_care_billing",
+                 project_id: project.id,
+                 target_epic_id: epic.id
+               })
+
+      # The positive control for the two refusals below: without it they would still pass on
+      # an implementation that refused EVERY target epic, which is the same unreachable column
+      # by another route.
+      assert source.target_epic_id == epic.id
+      assert AdminRepo.get!(Source, source.id).target_epic_id == epic.id
+    end
+
+    test "an epic outside the source's project is refused, naming the epic" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      other_project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: other_project.id})
+
+      assert {:error, changeset} =
+               Intake.create_source(tenant.id, %{
+                 repo_full_name: "mkreyman/home_care_billing",
+                 project_id: project.id,
+                 target_epic_id: epic.id
+               })
+
+      # A source whose reports would land in ANOTHER project's backlog is a mistake worth
+      # refusing at enrollment: the alternative is discovering it on the first webhook, by
+      # which point a reporter is waiting on a story nobody is looking at.
+      assert %{target_epic_id: ["must belong to this source's project"]} = errors_on(changeset)
+      assert Intake.list_sources(tenant.id) == []
+    end
+
+    test "an epic that does not resolve for this tenant is refused" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+      other_tenant_epic = fixture(:epic, %{})
+
+      # All three ways the id can fail to name one of THIS tenant's epics. The cross-tenant
+      # one is the isolation case: the read is tenant-scoped, so another tenant's epic is
+      # "not found" here and never a usable target.
+      for epic_id <- [Ecto.UUID.generate(), other_tenant_epic.id, "not-a-uuid"] do
+        assert {:error, changeset} =
+                 Intake.create_source(tenant.id, %{
+                   repo_full_name: "mkreyman/home_care_billing",
+                   project_id: project.id,
+                   target_epic_id: epic_id
+                 })
+
+        assert %{target_epic_id: ["epic not found"]} = errors_on(changeset)
+      end
+
+      assert Intake.list_sources(tenant.id) == []
+    end
+
+    test "omitting the target epic succeeds and leaves it nil" do
+      tenant = fixture(:tenant)
+      project = fixture(:project, %{tenant_id: tenant.id})
+
+      assert {:ok, %{source: source}} =
+               Intake.create_source(tenant.id, %{
+                 repo_full_name: "mkreyman/home_care_billing",
+                 project_id: project.id
+               })
+
+      # "Not answered" is a legal enrollment, not a validation failure: a record from such a
+      # source is ESCALATED to a human rather than landing in an epic chosen for it, which is
+      # the whole reason the column is nullable.
+      assert source.target_epic_id == nil
+      assert AdminRepo.get!(Source, source.id).target_epic_id == nil
+    end
+
+    test "an unusable project puts its error on project_id and NOT on target_epic_id" do
+      tenant = fixture(:tenant)
+      good_project = fixture(:project, %{tenant_id: tenant.id})
+      epic = fixture(:epic, %{tenant_id: tenant.id, project_id: good_project.id})
+      kb_project = fixture(:project, %{tenant_id: tenant.id, kind: :kb})
+
+      # Every shape of unusable project, each with a target epic that is real and is fine
+      # against SOME project — so an implementation that checks the epic against a project it
+      # has already rejected reports an epic problem the operator cannot act on, and hides
+      # the project problem they can.
+      for project_id <- [nil, Ecto.UUID.generate(), kb_project.id] do
+        assert {:error, changeset} =
+                 Intake.create_source(tenant.id, %{
+                   repo_full_name: "mkreyman/home_care_billing",
+                   project_id: project_id,
+                   target_epic_id: epic.id
+                 })
+
+        assert Keyword.has_key?(changeset.errors, :project_id)
+        refute Keyword.has_key?(changeset.errors, :target_epic_id)
+      end
     end
   end
 end

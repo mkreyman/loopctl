@@ -217,7 +217,13 @@ defmodule Loopctl.WorkBreakdown.Epics do
 
     multi =
       Multi.new()
-      |> Multi.delete(:epic, epic)
+      # A CHANGESET, not the bare struct, so the one FK onto `epics` that is RESTRICT rather
+      # than cascade comes back as a 422 naming the field instead of an `Ecto.ConstraintError`
+      # the fallback controller cannot render. `intake_sources.target_epic_id` is that FK
+      # (#803): an intake source pointing at this epic must be repointed or revoked first,
+      # which is the whole reason the reference restricts rather than nilifying — nilify would
+      # silently turn that source's next report into an escalation.
+      |> Multi.delete(:epic, epic_delete_changeset(epic))
       |> Audit.log_in_multi(:audit, fn %{epic: deleted} ->
         %{
           tenant_id: tenant_id,
@@ -389,5 +395,17 @@ defmodule Loopctl.WorkBreakdown.Epics do
     |> Enum.into(%{}, fn {status, count} ->
       {status, count}
     end)
+  end
+
+  # Names the restricting reference so its violation renders. `intake_sources.target_epic_id`
+  # is the only FK onto `epics` that is not `delete_all`, and the constraint name is
+  # Postgres's default for that column.
+  defp epic_delete_changeset(epic) do
+    epic
+    |> Ecto.Changeset.change()
+    |> Ecto.Changeset.foreign_key_constraint(:target_epic_id,
+      name: :intake_sources_target_epic_id_fkey,
+      message: "is the target epic of an intake source; repoint or revoke that source first"
+    )
   end
 end

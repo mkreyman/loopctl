@@ -200,8 +200,22 @@ defmodule Loopctl.Intake do
     project_id = Ecto.Changeset.get_field(changeset, :project_id)
 
     case epic_in_project(tenant_id, project_id, epic_id) do
-      {:ok, epic} -> Ecto.Changeset.put_change(changeset, :target_epic_id, epic.id)
-      {:error, message} -> Ecto.Changeset.add_error(changeset, :target_epic_id, message)
+      {:ok, epic} ->
+        changeset
+        |> Ecto.Changeset.put_change(:target_epic_id, epic.id)
+        # The read above is the READABLE error; this is the one that actually holds. An epic
+        # deleted between that read and this insert would otherwise raise out of the
+        # controller as a 500 instead of a 422 naming the field.
+        |> Ecto.Changeset.foreign_key_constraint(:target_epic_id)
+
+      # The project was already rejected, so there is nothing to check an epic against and
+      # the project's own error is the one worth showing. Attaching it to :target_epic_id
+      # told the caller an epic was wrong when a project was.
+      :project_invalid ->
+        changeset
+
+      {:error, message} ->
+        Ecto.Changeset.add_error(changeset, :target_epic_id, message)
     end
   end
 
@@ -216,9 +230,7 @@ defmodule Loopctl.Intake do
     end
   end
 
-  # The project was already rejected, so there is nothing to check the epic against; the
-  # project's own error is the one worth showing.
-  defp epic_in_project(_tenant_id, _project_id, _epic_id), do: {:error, "project not found"}
+  defp epic_in_project(_tenant_id, _project_id, _epic_id), do: :project_invalid
 
   defp active_work_project(tenant_id, project_id) when is_binary(project_id) do
     with {:ok, id} <- Ecto.UUID.cast(project_id),

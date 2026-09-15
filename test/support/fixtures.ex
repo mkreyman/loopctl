@@ -2457,6 +2457,10 @@ defmodule Loopctl.Fixtures do
 
   # A GitHub intake source (issue #803). Returns `{webhook_secret, source}` so a test can
   # sign deliveries. Auto-creates the tenant and an active work project when not given.
+  #
+  # `:target_epic_id` is passed through as given, nil included, because nil is the ENROLLED
+  # ANSWER "not answered" rather than an absent option — a source with one is what makes
+  # `epics.target_epic_id`'s ON DELETE RESTRICT reachable from a test.
   def fixture(:intake_source, attrs) do
     attrs = Enum.into(attrs, %{})
 
@@ -2475,7 +2479,8 @@ defmodule Loopctl.Fixtures do
     {:ok, %{source: source, webhook_secret: secret}} =
       Loopctl.Intake.create_source(tenant_id, %{
         repo_full_name: Map.get(attrs, :repo_full_name, "mkreyman/home_care_billing"),
-        project_id: project_id
+        project_id: project_id,
+        target_epic_id: Map.get(attrs, :target_epic_id)
       })
 
     {secret, source}

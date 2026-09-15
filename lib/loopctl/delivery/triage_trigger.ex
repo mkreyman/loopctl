@@ -74,7 +74,25 @@ defmodule Loopctl.Delivery.TriageTrigger do
   # number must be a non-negative integer below this.
   @max_number_part 10_000
 
-  @type error :: :no_target_epic | :source_revoked | :epic_number_unnumberable | term()
+  # EVERY reason this returns, spelled out and with no `| term()`. The trailing member made
+  # the union unfalsifiable — dialyzer cannot contradict it, so the spec could only ever be
+  # checked by reading, and it was wrong on two counts when it was: it listed a bare
+  # `:stage_not_opened` that `opened/2` never returns (it is always a tuple) and omitted
+  # `:linked_story_missing` entirely. A spec that cannot be wrong is a comment.
+  #
+  # `{:error, Ecto.Changeset.t()}` is the one open shape, and it is a real type rather than an
+  # escape hatch: `Stories.create_story/3` returns a changeset for a number collision, which
+  # is the case the moduledoc's retry argument is about.
+  @type error ::
+          :no_target_epic
+          | :source_revoked
+          | :epic_number_unnumberable
+          | :target_epic_missing
+          | :linked_story_missing
+          | {:stage_not_opened, :not_found | :busy}
+          | {:intake_record_already_linked, Ecto.UUID.t() | nil}
+          | :epic_not_found
+          | Ecto.Changeset.t()
 
   @doc """
   Creates the story for `record` and opens its delivery stage at `detected`.
@@ -87,7 +105,7 @@ defmodule Loopctl.Delivery.TriageTrigger do
     with {:ok, source} <- live_source(record),
          {:ok, epic_id} <- target_epic(source),
          {:ok, story} <- create(record, source, epic_id),
-         {_row, _} <- Stages.open(record.tenant_id, story.id, actor_label: @actor_label) do
+         {:ok, _row} <- opened(record.tenant_id, story.id) do
       {:ok, story}
     end
   end
@@ -95,6 +113,23 @@ defmodule Loopctl.Delivery.TriageTrigger do
   # A record whose source has since been revoked is not promoted. The webhook binding is gone,
   # so nothing can close the reporter's issue afterwards and a story nobody can answer is
   # worse than a record sitting still.
+  # A story with no stage row is INVISIBLE to the loop — `Placement` selects on that row and
+  # nothing else — so a failed open must not read as success. The first version matched
+  # `{_row, _}`, which `{:error, :busy}` satisfies just as well as `{:ok, row}`: a
+  # `lock_timeout` while the reclaimer held the story (an outcome `Stages` documents as
+  # ordinary and retryable) produced `{:ok, story}` here, the caller marked the record
+  # promoted, and the story sat for ever with nothing to advance it and nothing to retry it.
+  #
+  # The error is named rather than passed through so a caller can tell "this record has no
+  # story" from "this record has a story the loop cannot see": the second is safe to retry —
+  # `open/3` is idempotent on `(tenant_id, story_id)` — and the first is not the same act.
+  defp opened(tenant_id, story_id) do
+    case Stages.open(tenant_id, story_id, actor_label: @actor_label) do
+      {:ok, row} -> {:ok, row}
+      {:error, reason} -> {:error, {:stage_not_opened, reason}}
+    end
+  end
+
   defp live_source(%Record{tenant_id: tenant_id, source_id: source_id}) do
     case AdminRepo.get_by(Source, id: source_id, tenant_id: tenant_id) do
       %Source{revoked_at: nil} = source -> {:ok, source}
@@ -191,25 +226,47 @@ defmodule Loopctl.Delivery.TriageTrigger do
   # its epic's other stories are not, which is the numbering equivalent of guessing an epic —
   # and the operator's remedy, renumbering the epic, is one they can actually take. Same
   # choice as `:no_target_epic` and for the same reason.
+  # `get_by`, not `get_by!`. This function's whole contract is `{:ok, _} | {:error, _}`, and a
+  # `target_epic_id` that resolves to nothing — a deleted epic, a cross-tenant id — would
+  # otherwise raise `Ecto.NoResultsError` straight out of it. The caller's remedy for a
+  # misconfigured source is an escalation, not a crashed worker.
   defp story_number(tenant_id, epic_id) do
-    epic = AdminRepo.get_by!(Epic, id: epic_id, tenant_id: tenant_id)
+    case AdminRepo.get_by(Epic, id: epic_id, tenant_id: tenant_id) do
+      nil ->
+        {:error, :target_epic_missing}
 
-    if epic.number >= @max_number_part do
-      {:error, :epic_number_unnumberable}
-    else
-      {:ok, "#{epic.number}.#{next_sequence(tenant_id, epic_id, epic.number)}"}
+      %Epic{number: number} when number >= @max_number_part ->
+        {:error, :epic_number_unnumberable}
+
+      %Epic{} = epic ->
+        {:ok, "#{epic.number}.#{next_sequence(tenant_id, epic)}"}
     end
   end
 
-  # The highest MINOR already used under this epic's MAJOR, plus one. Read off `stories` rather
-  # than counted, so a deleted story does not hand its number to the next arrival.
-  defp next_sequence(tenant_id, epic_id, major) do
+  # The highest MINOR already used under this MAJOR anywhere in the PROJECT, plus one.
+  #
+  # Scoped to the project and not to the epic, because that is the scope the uniqueness has:
+  # `stories_tenant_id_project_id_number_index` is project-wide and nothing ties a story's
+  # MAJOR to its epic. An epic-scoped scan made the moduledoc's "the next run reads a sequence
+  # that is now free" false in the case this module itself creates — renumbering an epic is
+  # the remedy it recommends for `:epic_number_unnumberable`, which leaves stories numbered
+  # under the OLD major, and a later epic taking that number would have its scan come back
+  # empty, pick `.1`, collide on the project index and recompute the same number on every
+  # retry. The record would stall in `pending_triage` for ever rather than self-heal.
+  #
+  # Read off `stories` rather than counted, so a deleted story does not hand its number to the
+  # next arrival.
+  # Takes the `%Epic{}` `story_number/2` already loaded — tenant-scoped — rather than reading
+  # it again by id alone. The re-read was a second round trip on `AdminRepo`'s 3-connection
+  # pool for a row that was in hand, and it was the one query in this module carrying no
+  # `tenant_id` predicate, against the rule every other read here follows.
+  defp next_sequence(tenant_id, %Epic{project_id: project_id, number: major}) do
     prefix = "#{major}."
 
     used =
       AdminRepo.all(
         from s in Story,
-          where: s.tenant_id == ^tenant_id and s.epic_id == ^epic_id,
+          where: s.tenant_id == ^tenant_id and s.project_id == ^project_id,
           where: like(s.number, ^(prefix <> "%")),
           select: s.number
       )
