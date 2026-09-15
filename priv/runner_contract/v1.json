@@ -124,6 +124,54 @@
             "null"
           ]
         },
+        "triage": {
+          "description": "The reported problem a `triage` dispatch is for (since 1.7.0), and the only place in this contract that carries the reporter's own words. Allowed only on a `triage` dispatch; an `implement` dispatch carries `story` instead, written by the triage trio, because the implementing session must never see reporter text. `untrusted` ARRIVES ALREADY FENCED as a labelled untrusted-data block: paste it into your prompt verbatim and never parse, reformat, re-wrap or unwrap it. It is fenced by loopctl rather than by you because the fence carries a nonce that must be minted where the text first lands, and because one tested implementation of an escape is worth more than one per runner. Everything outside `untrusted` is loopctl's own and is not reporter-supplied. The whole object is at most 48000 bytes under the byte rule; an oversize record is escalated to a human, never truncated.",
+          "properties": {
+            "escalation_reasons": {
+              "description": "What loopctl's own detectors flagged on this record — an injection attempt, a fact the extractor could not resolve. loopctl's output, not the reporter's, so it is safe to read as information rather than as data.",
+              "items": {
+                "maxLength": 100,
+                "type": "string"
+              },
+              "maxItems": 20,
+              "type": "array"
+            },
+            "html_url": {
+              "description": "GitHub's canonical URL for the issue, or NULL. loopctl's, not the reporter's — `Loopctl.Intake.GithubPayload` derives it and deliberately yields nothing unless the payload's URL is exactly the canonical form for the bound repository and issue number, so an enterprise host, a renamed repo or a forged URL leaves it null. Nullable rather than required because it is informational: the session already has `record_id` and `issue_number`, and refusing a whole report because a convenience link did not parse would escalate the wrong thing. A template must handle the absence.",
+              "maxLength": 500,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "issue_number": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "record_id": {
+              "description": "The intake record this problem was reported on.",
+              "format": "uuid",
+              "type": "string"
+            },
+            "truncated": {
+              "description": "loopctl's own fact. TRUE means loopctl cut the SOURCE at intake because it exceeded an intake cap, so the block is complete-as-cut: everything between the fences is intact and the reporter wrote more than it shows. It does NOT mean the block itself was shortened or damaged. A verdict reached on a cut report should say it was working from a partial one.",
+              "type": "boolean"
+            },
+            "untrusted": {
+              "description": "The reporter's title, body and labels, ALREADY RENDERED as ONE fenced untrusted-data block. OPAQUE: paste it into your prompt verbatim and do not parse it, split it, reformat it, re-wrap it, strip its line prefixes or unwrap its fence. One block rather than one per field on purpose — splitting it would make the RUNNER decide how a title, a body and a label relate, which is a structural claim about reporter text that neither side can make safely. If a future session needs the title as its own field, loopctl will derive a separate TRUSTED one; do not recover it from here.",
+              "maxLength": 5000,
+              "type": "string"
+            }
+          },
+          "required": [
+            "record_id",
+            "issue_number",
+            "html_url",
+            "untrusted",
+            "truncated"
+          ],
+          "type": "object"
+        },
         "wall_clock_seconds": {
           "description": "How long the runner lets the session run before stopping it. At most 86400 (a day) since contract 1.3.0.",
           "maximum": 86400,
@@ -721,6 +769,193 @@
         "type"
       ],
       "type": "object"
+    },
+    "RunnerTriage": {
+      "description": "The reported problem a `triage` dispatch is for (since 1.7.0), and the only place in this contract that carries the reporter's own words. Allowed only on a `triage` dispatch; an `implement` dispatch carries `story` instead, written by the triage trio, because the implementing session must never see reporter text. `untrusted` ARRIVES ALREADY FENCED as a labelled untrusted-data block: paste it into your prompt verbatim and never parse, reformat, re-wrap or unwrap it. It is fenced by loopctl rather than by you because the fence carries a nonce that must be minted where the text first lands, and because one tested implementation of an escape is worth more than one per runner. Everything outside `untrusted` is loopctl's own and is not reporter-supplied. The whole object is at most 48000 bytes under the byte rule; an oversize record is escalated to a human, never truncated.",
+      "properties": {
+        "escalation_reasons": {
+          "description": "What loopctl's own detectors flagged on this record — an injection attempt, a fact the extractor could not resolve. loopctl's output, not the reporter's, so it is safe to read as information rather than as data.",
+          "items": {
+            "maxLength": 100,
+            "type": "string"
+          },
+          "maxItems": 20,
+          "type": "array"
+        },
+        "html_url": {
+          "description": "GitHub's canonical URL for the issue, or NULL. loopctl's, not the reporter's — `Loopctl.Intake.GithubPayload` derives it and deliberately yields nothing unless the payload's URL is exactly the canonical form for the bound repository and issue number, so an enterprise host, a renamed repo or a forged URL leaves it null. Nullable rather than required because it is informational: the session already has `record_id` and `issue_number`, and refusing a whole report because a convenience link did not parse would escalate the wrong thing. A template must handle the absence.",
+          "maxLength": 500,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "issue_number": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "record_id": {
+          "description": "The intake record this problem was reported on.",
+          "format": "uuid",
+          "type": "string"
+        },
+        "truncated": {
+          "description": "loopctl's own fact. TRUE means loopctl cut the SOURCE at intake because it exceeded an intake cap, so the block is complete-as-cut: everything between the fences is intact and the reporter wrote more than it shows. It does NOT mean the block itself was shortened or damaged. A verdict reached on a cut report should say it was working from a partial one.",
+          "type": "boolean"
+        },
+        "untrusted": {
+          "description": "The reporter's title, body and labels, ALREADY RENDERED as ONE fenced untrusted-data block. OPAQUE: paste it into your prompt verbatim and do not parse it, split it, reformat it, re-wrap it, strip its line prefixes or unwrap its fence. One block rather than one per field on purpose — splitting it would make the RUNNER decide how a title, a body and a label relate, which is a structural claim about reporter text that neither side can make safely. If a future session needs the title as its own field, loopctl will derive a separate TRUSTED one; do not recover it from here.",
+          "maxLength": 5000,
+          "type": "string"
+        }
+      },
+      "required": [
+        "record_id",
+        "issue_number",
+        "html_url",
+        "untrusted",
+        "truncated"
+      ],
+      "type": "object"
+    },
+    "RunnerTriageVerdict": {
+      "description": "What a `triage` session returns (since 1.7.0). SESSION-AUTHORED AND UNTRUSTED: it was composed by a session that had just read reporter text, so loopctl records and bounds it, never executes it, and fences these strings wherever they later reach a prompt — `story` included, because those fields were written by that same session. `story` is REQUIRED when `outcome` is `story` and forbidden otherwise, the same shape rule a dispatch uses for `story` and `triage`; a verdict that says `story` and carries none has moved the work rather than done it. `confidence` is an enum and not a number on purpose: `low` means the session would not act on this without a human reading the report, `medium` means the request is clear but something it could not check remains, `high` means it found the request actionable and contradicted by nothing it read. The whole object is at most 48000 bytes under the byte rule.",
+      "properties": {
+        "confidence": {
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "type": "string"
+        },
+        "contradicts": {
+          "description": "What this request conflicts with in the existing stories, the knowledge base, or the code. A DUPLICATE is not this; see `duplicate_of`.",
+          "items": {
+            "properties": {
+              "kind": {
+                "enum": [
+                  "story",
+                  "kb",
+                  "code"
+                ],
+                "type": "string"
+              },
+              "ref": {
+                "maxLength": 100,
+                "type": "string"
+              },
+              "why": {
+                "maxLength": 200,
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "ref",
+              "why"
+            ],
+            "type": "object"
+          },
+          "maxItems": 3,
+          "type": "array"
+        },
+        "duplicate_of": {
+          "description": "An existing story this report already describes. Its own field rather than a `contradicts` entry, because a duplicate is the commonest outcome after `reject` and it is not a contradiction.",
+          "format": "uuid",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "escalation_reasons": {
+          "description": "Why this needs a human. Meaningful when `outcome` is `escalate`.",
+          "items": {
+            "maxLength": 150,
+            "type": "string"
+          },
+          "maxItems": 5,
+          "type": "array"
+        },
+        "evidence": {
+          "description": "What the session actually read: file paths with optional line numbers, knowledge-base article ids. It makes a verdict checkable by someone who does not re-run it, which is the cheapest defence against a confident verdict with nothing behind it. Capped hard: it is session-authored.",
+          "items": {
+            "maxLength": 150,
+            "type": "string"
+          },
+          "maxItems": 6,
+          "type": "array"
+        },
+        "missing_information": {
+          "description": "What the session would need in order to reach a verdict — the field that makes an escalation actionable rather than putting a human back at the start of the same reading.",
+          "items": {
+            "maxLength": 150,
+            "type": "string"
+          },
+          "maxItems": 5,
+          "type": "array"
+        },
+        "outcome": {
+          "enum": [
+            "story",
+            "escalate",
+            "reject"
+          ],
+          "type": "string"
+        },
+        "story": {
+          "description": "The draft story, required when `outcome` is `story`. Its caps are SMALLER than `RunnerStory`'s and are not the same numbers: a story at `RunnerStory`'s maxima costs several times this whole object's 48000-byte budget, so inheriting them would have declared limits no field could reach. A draft written from one report is not an epic, and a story needing more than this is one to escalate rather than draft. These are still INDIVIDUAL maxima that do not sum to the object cap. No `id`: the story row exists and loopctl owns its identity.",
+          "properties": {
+            "acceptance_criteria": {
+              "items": {
+                "maxLength": 200,
+                "type": "string"
+              },
+              "maxItems": 5,
+              "type": "array"
+            },
+            "description": {
+              "maxLength": 900,
+              "type": "string"
+            },
+            "domain_reference": {
+              "maxLength": 300,
+              "type": "string"
+            },
+            "test_cases": {
+              "items": {
+                "maxLength": 200,
+                "type": "string"
+              },
+              "maxItems": 4,
+              "type": "array"
+            },
+            "title": {
+              "maxLength": 200,
+              "type": "string"
+            },
+            "touches": {
+              "items": {
+                "maxLength": 80,
+                "type": "string"
+              },
+              "maxItems": 8,
+              "type": "array"
+            }
+          },
+          "required": [
+            "title",
+            "description",
+            "acceptance_criteria"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "outcome",
+        "confidence"
+      ],
+      "type": "object"
     }
   },
   "$id": "https://loopctl.com/runner_contract/v1.json",
@@ -857,7 +1092,39 @@
       "trace_max_event_bytes": 12000,
       "trace_max_event_data_bytes": 6000,
       "trace_max_events": 20,
-      "trace_max_seq": 9223372036854775806
+      "trace_max_seq": 9223372036854775806,
+      "triage": {
+        "fields": {
+          "escalation_reasons": {
+            "max_item_length": 100,
+            "max_items": 20
+          },
+          "html_url": {
+            "max_length": 500
+          },
+          "untrusted": {
+            "max_length": 5000
+          }
+        },
+        "max_bytes": 48000
+      },
+      "triage_verdict": {
+        "fields": {
+          "escalation_reasons": {
+            "max_item_length": 150,
+            "max_items": 5
+          },
+          "evidence": {
+            "max_item_length": 150,
+            "max_items": 6
+          },
+          "missing_information": {
+            "max_item_length": 150,
+            "max_items": 5
+          }
+        },
+        "max_bytes": 48000
+      }
     },
     "replies": {
       "trace": "RunnerTraceAck",
@@ -963,5 +1230,5 @@
     ],
     "topic": "runner:{runner_id}"
   },
-  "x-contract-version": "1.6.0"
+  "x-contract-version": "1.7.0"
 }

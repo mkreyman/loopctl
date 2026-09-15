@@ -38,6 +38,45 @@ All notable changes to loopctl are documented here.
   Nothing else is affected: existing runners keep working, and the runner API renders no new
   field.
 
+- **Runner contract 1.7.0: a `triage` dispatch carries the reporter's own words, already
+  fenced (#803, #804).** `RunnerTriage` is a new dispatch object holding the intake record a
+  reported problem arrived on: `record_id`, `issue_number`, `html_url`, `truncated`,
+  `escalation_reasons`, and `untrusted` — the reporter's title, body and labels rendered as
+  ONE labelled untrusted-data block. One rather than one per field on purpose: splitting it
+  would make the runner decide how a title, a body and a label relate, which is a structural
+  claim about text a stranger wrote. It is opaque — paste it, never parse or split it. It is allowed only on a `triage` dispatch, exactly as
+  `story` is allowed only on an `implement` one, so the object carrying reporter text can
+  never reach an implementing session.
+
+  **loopctl fences the text rather than the runner.** Everywhere else the contract sends
+  typed fields and lets the runner compose its own prompt; this field arrives pre-escaped
+  because the fence carries a nonce that must be minted where the text first lands, and
+  because one tested implementation of an escape is worth more than one per runner. The
+  runner's contract for it is: paste verbatim, never parse or re-wrap.
+
+  **A second schema ships in the same export: `RunnerTriageVerdict`**, what a triage session
+  returns — `outcome` (`story` / `escalate` / `reject`), `confidence` as an enum rather than a
+  number, the draft story required on a `story` outcome, `missing_information`, `evidence`,
+  `duplicate_of` and `contradicts`. It is in `priv/runner_contract/v1.json` under
+  `$defs.RunnerTriageVerdict` with its bounds in `x-connection.limits.triage_verdict`, and it
+  is the object a runner author implements to emit a verdict. It is SESSION-AUTHORED and not
+  trusted input: loopctl records and bounds it, never executes it, and fences its strings
+  wherever they reach another prompt. Nothing receives one yet.
+
+  **Operator-facing: a new tag value on an existing metric.**
+  `[:loopctl, :runners, :declared_kind_refused]` gains `outcome: "declared_but_faulted"` — a
+  runner that declared a kind and then FAULTED on it, meaning its declaration and what its
+  accept path can run have diverged. Anything alerting on that event's tags sees new
+  cardinality. It is scoped to kinds beyond `implied_kinds`, so ordinary transient faults on
+  `implement` do not raise it.
+
+  **`triage` is still NOT dispatchable and nothing new goes on the wire.** Until 1.7.0 it was
+  excluded because no payload could carry reporter text; that is now fixed, and what holds it
+  back is the other end — no deployed runner accepts the kind, and a triage session needs its
+  own tool set rather than the implement set widened. `dispatchable_kinds` is the interlock
+  and moves when the runners can take the work. **No operator action, and no runner has to be
+  upgraded**; the vendored export is `priv/runner_contract/v1.json` and the major is unchanged.
+
 - **Runner contract 1.6.0: a runner DECLARES the kinds it runs, and the declaration decides
   (#803).** `RunnerJoin` gains an optional `kinds` array. Where a runner sends it, it is the
   only thing consulted: loopctl refuses a dispatch of a kind outside it, and sends a kind

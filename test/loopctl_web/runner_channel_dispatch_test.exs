@@ -890,6 +890,57 @@ defmodule LoopctlWeb.RunnerChannelDispatchTest do
       assert meta.outcome == "suppressed"
     end
 
+    # Found by the loopctl-runner session: a runner may declare a kind its accept path cannot
+    # run, refusing every dispatch of it as a FAULT rather than a capability statement.
+    #
+    # Round 2 then scoped the counter to kinds BEYOND implied_kinds, because `other` is the
+    # contract's residual reason and `implement` is dispatchable and universally declared —
+    # counting faults there would drown the series in ordinary transient failures.
+    #
+    # THE CONSEQUENCE, ASSERTED RATHER THAN HIDDEN: the positive case is unreachable today.
+    # `implement` is the only dispatchable kind and it is in the implied set, so nothing can
+    # currently produce a fault on a kind outside it. What is testable now is the scoping
+    # decision itself — a fault on `implement` emits NOTHING — and that is what this asserts.
+    # The positive case becomes reachable when `triage` joins dispatchable_kinds, which is
+    # also when the failure mode it watches for becomes possible.
+    test "a FAULT on a declared kind inside the implied set is NOT counted",
+         %{runner: runner, raw: raw, channel: channel} do
+      channel = rejoin_declaring(channel, raw, runner, ["implement"])
+
+      ref =
+        :telemetry_test.attach_event_handlers(self(), [
+          [:loopctl, :runners, :declared_kind_refused]
+        ])
+
+      on_exit(fn -> :telemetry.detach(ref) end)
+
+      payload = dispatch_payload(runner.tenant_id)
+      assert :ok = Runners.dispatch(runner.tenant_id, runner.id, payload)
+      assert_push "dispatch", _, @reply_timeout
+
+      reply_ref =
+        push(channel, "dispatch_reply", %{
+          "dispatch_id" => payload["dispatch_id"],
+          "claim_epoch" => payload["claim_epoch"],
+          "decision" => "refused",
+          "reason" => "other",
+          "detail" => "the runner failed deciding this dispatch"
+        })
+
+      assert_reply reply_ref, :ok, _, @reply_timeout
+
+      refute_receive {[:loopctl, :runners, :declared_kind_refused], ^ref, _, _}, 300
+
+      # And a fault suppresses nothing either way — it is transient by assumption, so the
+      # next dispatch is still sent.
+      assert Runners.suppressed_kinds(socket_meta(channel)) == []
+
+      assert :ok =
+               Runners.dispatch(runner.tenant_id, runner.id, dispatch_payload(runner.tenant_id))
+
+      assert_push "dispatch", _, @reply_timeout
+    end
+
     test "an ordinary refusal does not suppress a declared kind",
          %{runner: runner, raw: raw, channel: channel} do
       channel = rejoin_declaring(channel, raw, runner, ["implement"])

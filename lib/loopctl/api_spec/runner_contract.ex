@@ -36,6 +36,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.3.0) a dispatch's `wall_clock_seconds` is bounded: `RunnerDispatch.max_wall_clock_seconds/0` | | | | |
   | (1.5.0) an implement dispatch carries a `RunnerStory`, and a runner may refuse a kind with `kind_not_supported` | | | | |
   | (1.6.0) a runner DECLARES the kinds it runs on join (`RunnerJoin.kinds`); where present it is the only thing consulted | | | | |
+  | (1.7.0) a `triage` dispatch carries a `RunnerTriage` whose `untrusted` field is the reporter's own words, already fenced | | | | |
 
   ## The story object (since 1.5.0)
 
@@ -76,12 +77,21 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   is what loopctl will actually send, and `cast_dispatch/1` refuses anything else BEFORE a
   payload is recorded or broadcast. Today that is `implement` alone.
 
-  Triage is excluded structurally rather than by convention. Its input is the reporter's own
-  words, which the implementer must never see (design §10), so it needs its own payload with
-  its own fencing (`Loopctl.Delivery.Untrusted`) — and the implement payload has no field that
-  could carry it. A triage dispatch on this shape would reach a machine with no input and a
-  template for the wrong job. The `kind` enum keeps `triage` because narrowing an enum is a
-  BREAKING change and a minor version may only add; the refusal lives in the cast instead.
+  **Triage HAS its payload since 1.7.0 (`RunnerTriage`) and is still not dispatchable, and
+  the reason has changed — do not read the old one.** Until 1.7.0 it was excluded because the
+  implement payload had no field that could carry the reporter's words and a triage dispatch
+  would have reached a machine with no input. That is fixed: the object exists, it is
+  disjoint from `story`, and the cast refuses either one on the wrong kind.
+
+  What holds it back now is the OTHER END. No runner accepts the kind yet — the deployed
+  fleet answers `kind_not_supported` for anything but `implement` — and a triage session
+  needs a tool set of its own rather than the implement set widened, which is the runner's
+  work and not loopctl's. Sending the kind before that exists would spend a dispatch and a
+  round trip on a refusal, and against an UNDECLARING runner it would write a permanent
+  `kind_not_supported` for that machine (see `RunnerJoin.kinds`). So `dispatchable_kinds/0`
+  is the interlock: it moves when the runners can take the work, and the payload landing
+  first is what lets both sides be built at once. The `kind` enum keeps `triage` throughout
+  because narrowing an enum is a BREAKING change and a minor version may only add.
 
   A runner may also answer a dispatch with `kind_not_supported`, a CAPABILITY statement rather
   than a fault: this machine does not do this kind of work. loopctl records it and does not
@@ -238,7 +248,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   alias Loopctl.Delivery.StageMachine
   alias OpenApiSpex.Schema
 
-  @version "1.6.0"
+  @version "1.7.0"
   @major 1
 
   defmodule ByteRule do
@@ -317,10 +327,15 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     #
     # `triage` stays in the vocabulary and out of the dispatchable set. Narrowing an enum would
     # be a BREAKING change and a minor version may only add — and the vocabulary is what a
-    # runner declares and answers `kind_not_supported` about. What keeps triage off the wire is
-    # `cast_dispatch/1`: its input is the reporter's own words, which the implementer must never
-    # see (design §10), so it needs its own payload with its own fencing, and `RunnerDispatch`
-    # has no field that could carry it.
+    # runner declares and answers `kind_not_supported` about.
+    #
+    # DO NOT READ AN OLDER REASON HERE. This comment used to say triage was off the wire
+    # because `RunnerDispatch` had no field that could carry the reporter's words. Since
+    # 1.7.0 it has one — `RunnerTriage` — and the moduledoc was rewritten to say so. This was
+    # the surviving copy of the retired reason, in the module whose own comment two lines up
+    # argues that a second copy is the drift to avoid. What holds triage back now is the
+    # OTHER END: no deployed runner accepts the kind. The moduledoc has the full version;
+    # this stays one sentence so the two cannot diverge again.
     @all ["triage", "implement"]
     @dispatchable ["implement"]
 
@@ -536,6 +551,190 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     )
   end
 
+  defmodule RunnerTriage do
+    @moduledoc false
+    require OpenApiSpex
+
+    alias Loopctl.ApiSpec.RunnerContract.ByteRule
+
+    # THE REPORTER'S OWN WORDS, AND THE ONLY PLACE IN THIS CONTRACT THEY APPEAR (since
+    # 1.7.0). An `implement` dispatch carries a story the trio wrote and never this — design
+    # §10, the implementer never sees reporter text — so the two objects are disjoint by
+    # construction rather than by convention.
+    #
+    # `untrusted` ARRIVES ALREADY FENCED, and that is the decision worth defending here
+    # because the alternative looks more consistent. Everywhere else this contract sends
+    # typed fields and lets the runner compose, on the ground that a control plane able to
+    # hand a runner prose is able to run anything on it. Reporter text is the exception, and
+    # not because the principle is weaker: the principle is about who writes the
+    # INSTRUCTIONS, and the runner's template still writes every one of them.
+    #
+    # It is fenced here because the fence is three independent layers —
+    # `Loopctl.Delivery.Untrusted` prefixes every data line so a forged closing line arrives
+    # prefixed, escapes the fence brackets so the delimiter cannot appear inside, and carries
+    # a random nonce a closing line must repeat. A nonce has to be minted by whoever holds
+    # the text first, and a fence is worth nothing if ANY implementation of it is wrong. One
+    # tested implementation beats one per runner.
+    #
+    # So the runner's contract for this field is: paste it into your prompt verbatim. Do not
+    # parse it, reformat it, re-wrap it, strip the prefixes, or unwrap the fence.
+    # SIZED SO THE WHOLE OBJECT AT EVERY MAXIMUM FITS, which is the third attempt at this
+    # number and the first that holds for every record rather than for the convenient one.
+    #
+    # It was 40_000, a cap the 48_000-byte object could never reach. Round 1 measured the
+    # byte rule at ~7_400 characters and set 6_000 "slightly under what the byte rule
+    # admits". Round 3 measured that claim on an ESCALATED record — `escalation_reasons` at
+    # its own 20x100 maximum, `html_url` at 500 — and got 52_074 bytes: over the cap, so
+    # 6_000 was reachable only on a record the detector had never flagged. Two identical
+    # 5_500-character reports, one flagged and one not, would have taken different paths for
+    # a reason no declared bound could explain.
+    #
+    # 5_000 is measured against the worst case, not the convenient one: 46_074 bytes with
+    # every other field of this object at its own maximum. A test asserts it.
+    #
+    # The six-times charge is deliberate worst-case-encoder accounting, so an ASCII report of
+    # this length costs about 5 KB on the wire and the frame is nowhere near full. That
+    # conservatism is the contract's and is not relaxed here for one object.
+    @max_untrusted_length 5_000
+    @max_url_length 500
+    @max_reasons 20
+    @max_reason_length 100
+
+    # The whole object under `ByteRule`, on the same budget arithmetic as `RunnerStory` and
+    # deliberately the same number: a triage dispatch and an implement dispatch ride the same
+    # frame, so the object either fits the budget the frame can carry or it does not, and
+    # there is no reason for the two to differ. A record whose text exceeds it is escalated
+    # to a human rather than truncated — a triage verdict reached on half the reporter's
+    # words is worse than no verdict.
+    @max_bytes 48_000
+
+    @doc "The largest triage object, under the byte rule."
+    @spec max_bytes() :: pos_integer()
+    def max_bytes, do: @max_bytes
+
+    @doc "The longest rendered untrusted block."
+    @spec max_untrusted_length() :: pos_integer()
+    def max_untrusted_length, do: @max_untrusted_length
+
+    @doc "The most escalation reasons, and the longest one."
+    @spec max_reasons() :: pos_integer()
+    def max_reasons, do: @max_reasons
+
+    @doc "The longest escalation reason."
+    @spec max_reason_length() :: pos_integer()
+    def max_reason_length, do: @max_reason_length
+
+    @doc "The longest issue URL."
+    @spec max_url_length() :: pos_integer()
+    def max_url_length, do: @max_url_length
+
+    @doc """
+    The bounds a runner cannot read off the schema, published in `x-connection.limits`. The
+    object cap is the one that matters: it is not a JSON Schema keyword, so a runner
+    pre-flighting a payload against the vendored contract sees the per-field `maxLength`
+    values and has no way to learn the object is also capped — the "refused for a reason the
+    author cannot read anywhere" failure the export's own note warns about.
+
+    At runtime, not compile time: `schema/0` is defined by the macro below.
+    """
+    @spec limits() :: %{String.t() => term()}
+    def limits do
+      fields =
+        for {name, sub} <- schema().properties,
+            bounds = field_bounds(sub),
+            bounds != %{},
+            into: %{},
+            do: {Atom.to_string(name), bounds}
+
+      %{"max_bytes" => @max_bytes, "fields" => fields}
+    end
+
+    defp field_bounds(%Schema{type: :array, maxItems: items, items: %Schema{maxLength: length}})
+         when is_integer(items) and is_integer(length),
+         do: %{"max_items" => items, "max_item_length" => length}
+
+    defp field_bounds(%Schema{type: :string, maxLength: length}) when is_integer(length),
+      do: %{"max_length" => length}
+
+    defp field_bounds(%Schema{}), do: %{}
+
+    OpenApiSpex.schema(
+      %{
+        title: "RunnerTriage",
+        description:
+          "The reported problem a `triage` dispatch is for (since 1.7.0), and the only " <>
+            "place in this contract that carries the reporter's own words. Allowed only " <>
+            "on a `triage` dispatch; an `implement` dispatch carries `story` instead, " <>
+            "written by the triage trio, because the implementing session must never see " <>
+            "reporter text. `untrusted` ARRIVES ALREADY FENCED as a labelled untrusted-data " <>
+            "block: paste it into your prompt verbatim and never parse, reformat, re-wrap " <>
+            "or unwrap it. It is fenced by loopctl rather than by you because the fence " <>
+            "carries a nonce that must be minted where the text first lands, and because " <>
+            "one tested implementation of an escape is worth more than one per runner. " <>
+            "Everything outside `untrusted` is loopctl's own and is not reporter-supplied. " <>
+            "The whole object is at most #{@max_bytes} bytes under the byte rule; an " <>
+            "oversize record is escalated to a human, never truncated.",
+        type: :object,
+        required: [:record_id, :issue_number, :html_url, :untrusted, :truncated],
+        properties: %{
+          record_id: %Schema{
+            type: :string,
+            format: :uuid,
+            description: "The intake record this problem was reported on."
+          },
+          issue_number: %Schema{type: :integer, minimum: 1},
+          html_url: %Schema{
+            type: :string,
+            maxLength: @max_url_length,
+            nullable: true,
+            description:
+              "GitHub's canonical URL for the issue, or NULL. loopctl's, not the " <>
+                "reporter's — `Loopctl.Intake.GithubPayload` derives it and deliberately " <>
+                "yields nothing unless the payload's URL is exactly the canonical form for " <>
+                "the bound repository and issue number, so an enterprise host, a renamed " <>
+                "repo or a forged URL leaves it null. Nullable rather than required " <>
+                "because it is informational: the session already has `record_id` and " <>
+                "`issue_number`, and refusing a whole report because a convenience link " <>
+                "did not parse would escalate the wrong thing. A template must handle the " <>
+                "absence."
+          },
+          untrusted: %Schema{
+            type: :string,
+            maxLength: @max_untrusted_length,
+            description:
+              "The reporter's title, body and labels, ALREADY RENDERED as ONE fenced " <>
+                "untrusted-data block. OPAQUE: paste it into your prompt verbatim and do " <>
+                "not parse it, split it, reformat it, re-wrap it, strip its line prefixes " <>
+                "or unwrap its fence. One block rather than one per field on purpose — " <>
+                "splitting it would make the RUNNER decide how a title, a body and a label " <>
+                "relate, which is a structural claim about reporter text that neither side " <>
+                "can make safely. If a future session needs the title as its own field, " <>
+                "loopctl will derive a separate TRUSTED one; do not recover it from here."
+          },
+          truncated: %Schema{
+            type: :boolean,
+            description:
+              "loopctl's own fact. TRUE means loopctl cut the SOURCE at intake because it " <>
+                "exceeded an intake cap, so the block is complete-as-cut: everything " <>
+                "between the fences is intact and the reporter wrote more than it shows. " <>
+                "It does NOT mean the block itself was shortened or damaged. A verdict " <>
+                "reached on a cut report should say it was working from a partial one."
+          },
+          escalation_reasons: %Schema{
+            type: :array,
+            maxItems: @max_reasons,
+            items: %Schema{type: :string, maxLength: @max_reason_length},
+            description:
+              "What loopctl's own detectors flagged on this record — an injection attempt, " <>
+                "a fact the extractor could not resolve. loopctl's output, not the " <>
+                "reporter's, so it is safe to read as information rather than as data."
+          }
+        }
+      },
+      struct?: false
+    )
+  end
+
   defmodule RunnerStory do
     @moduledoc false
     require OpenApiSpex
@@ -715,6 +914,256 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     )
   end
 
+  defmodule RunnerTriageVerdict do
+    @moduledoc false
+    require OpenApiSpex
+
+    alias Loopctl.ApiSpec.RunnerContract.ByteRule
+    alias Loopctl.ApiSpec.RunnerContract.RunnerStory
+
+    # WHAT A TRIAGE SESSION RETURNS (since 1.7.0). On the wire and not a convention in a
+    # runner's prompt, because a convention has no schema: its shape drifts per runner and per
+    # prompt edit, and loopctl cannot REJECT a malformed verdict it never declared. Asked for
+    # by the `loopctl-runner` maintaining session on exactly that ground, 2026-09-15, and the
+    # session that has to emit it would rather fill a form than author a document — which is
+    # also the shape least steerable by the text it just read.
+    #
+    # **THIS OBJECT IS SESSION-AUTHORED AND IS NOT TRUSTED INPUT.** It was composed by a
+    # session whose whole job was to read attacker-controllable text, so every field here is
+    # potentially shaped by that text — including `story`, whose fields become a story row.
+    # loopctl RECORDS it, bounds it, and never executes it, and anything downstream that puts
+    # these strings into another prompt fences them exactly as reporter text is fenced. The
+    # trio is the laundering boundary the design relies on (§4, §10); this object is where
+    # that reliance is concentrated, so it is the thing to be suspicious of.
+    @outcomes ["story", "escalate", "reject"]
+
+    # An ENUM, not a float. A float invites 0.85, and nobody — not the session, not a reader —
+    # can say what would have made it 0.8, so it reads as precision that does not exist. Each
+    # level below states what it MEANS, so the session is choosing between descriptions rather
+    # than inventing a number.
+    @confidences ["low", "medium", "high"]
+
+    @max_reasons 5
+    @max_reason_length 150
+    # EVERY CAP BELOW IS SIZED SO THAT A VERDICT AT ALL OF THEM AT ONCE FITS, which is a
+    # stronger invariant than the one round 1 settled for and is the only one that never
+    # surprises a session. Round 1 asserted that no single field's maximum exceeds the object
+    # cap; round 3 measured that a draft story at its own declared maxima cost 47_424 of
+    # 48_000, so a single 200-character `evidence` entry — the field this schema calls the
+    # cheapest defence against a confident verdict with nothing behind it — was REFUSED. Each
+    # cap was individually reachable and the combination was not, which is the same "reads as
+    # a limit, is not what binds" defect one level up again.
+    #
+    # Measured at these values: the story is 23_814 bytes and a verdict with every field at
+    # its maximum is 45_322 against the 48_000 cap. A test asserts that, so the caps cannot
+    # drift apart from the budget again.
+    @max_evidence 6
+    @max_evidence_length 150
+    @max_missing 5
+    @max_missing_length 150
+
+    # THE DRAFT STORY'S OWN CAPS, smaller than `RunnerStory`'s and not derived from them.
+    # Measured: `RunnerStory`'s maxima nested here cost 294_202 bytes against this object's
+    # 48_000, so inheriting them gave the story six field caps none of which its own field
+    # could ever reach. A draft written from ONE report is not an epic, and a story needing
+    # more than this is one triage should be escalating rather than drafting.
+    #
+    # `title` and `domain_reference` keep `RunnerStory`'s values because they are already
+    # small enough to be reachable; only the fields that blew the budget are reduced.
+    @max_story_description 900
+    @max_story_criteria 5
+    @max_story_criterion_length 200
+    @max_story_test_cases 4
+    @max_story_test_case_length 200
+    @max_story_touches 8
+    @max_story_touch_length 80
+    @max_story_domain_reference 300
+    # Also measured down: 20 entries of a 200-character ref and a 500-character why cost
+    # 86_842 bytes, nearly twice this object's whole budget. Ten contradictions is already
+    # more than a verdict a human will read can carry.
+    @max_contradicts 3
+    @max_contradict_ref_length 100
+    @max_contradict_why_length 200
+    @contradict_kinds ["story", "kb", "code"]
+
+    # The same budget as a dispatch object, for the same frame — a verdict arrives INBOUND
+    # over the same 64 KB socket, so the arithmetic is the dispatch's.
+    #
+    # WHAT THIS CAP MEANS, stated because the first version of this module got it wrong.
+    # `ByteRule` charges six bytes per character, so 48_000 is about 8_000 CHARACTERS for the
+    # whole verdict. The per-field maxima below are INDIVIDUAL limits and do not sum to this;
+    # a verdict near several of them at once is refused on the object cap, exactly as
+    # `RunnerStory` documents of its own fields. What was wrong before was not that — it was
+    # claiming the draft story is "bounded exactly as `RunnerStory` bounds the same fields, so
+    # one set of limits governs in both directions". It is not: `RunnerStory` is capped at
+    # 48_000 as a whole object, and the same story nested inside a verdict shares that budget
+    # with everything else here, so a story valid OUTBOUND can be refused INBOUND. The claim
+    # is withdrawn rather than engineered around, because making it true would mean a verdict
+    # cap of 48_000 plus a story's worth on a frame that has not got it.
+    #
+    # The invariant that IS held, and is tested: no single field's declared maximum exceeds
+    # the object cap on its own. `evidence` did — 40 entries of 300 characters is about
+    # 72_000 bytes, more than the whole verdict may be — which is a cap that cannot be
+    # reached by the field it is written on, the same defect as one that cannot bind.
+    @max_bytes 48_000
+
+    @doc "Every outcome a verdict may carry."
+    @spec outcomes() :: [String.t()]
+    def outcomes, do: @outcomes
+
+    @doc "Every confidence level a verdict may carry."
+    @spec confidences() :: [String.t()]
+    def confidences, do: @confidences
+
+    @doc "The largest verdict, under the byte rule."
+    @spec max_bytes() :: pos_integer()
+    def max_bytes, do: @max_bytes
+
+    @doc "The most evidence entries, and the longest one."
+    @spec max_evidence() :: pos_integer()
+    def max_evidence, do: @max_evidence
+
+    @doc """
+    The bounds a runner cannot read off the schema, published in `x-connection.limits`. The
+    object cap is the one that matters: it is not a JSON Schema keyword, so a runner
+    pre-flighting a payload against the vendored contract sees the per-field `maxLength`
+    values and has no way to learn the object is also capped — the "refused for a reason the
+    author cannot read anywhere" failure the export's own note warns about.
+
+    At runtime, not compile time: `schema/0` is defined by the macro below.
+    """
+    @spec limits() :: %{String.t() => term()}
+    def limits do
+      fields =
+        for {name, sub} <- schema().properties,
+            bounds = field_bounds(sub),
+            bounds != %{},
+            into: %{},
+            do: {Atom.to_string(name), bounds}
+
+      %{"max_bytes" => @max_bytes, "fields" => fields}
+    end
+
+    defp field_bounds(%Schema{type: :array, maxItems: items, items: %Schema{maxLength: length}})
+         when is_integer(items) and is_integer(length),
+         do: %{"max_items" => items, "max_item_length" => length}
+
+    defp field_bounds(%Schema{type: :string, maxLength: length}) when is_integer(length),
+      do: %{"max_length" => length}
+
+    defp field_bounds(%Schema{}), do: %{}
+
+    OpenApiSpex.schema(
+      %{
+        title: "RunnerTriageVerdict",
+        description:
+          "What a `triage` session returns (since 1.7.0). SESSION-AUTHORED AND UNTRUSTED: " <>
+            "it was composed by a session that had just read reporter text, so loopctl " <>
+            "records and bounds it, never executes it, and fences these strings wherever " <>
+            "they later reach a prompt — `story` included, because those fields were " <>
+            "written by that same session. `story` is REQUIRED when `outcome` is `story` " <>
+            "and forbidden otherwise, the same shape rule a dispatch uses for `story` and " <>
+            "`triage`; a verdict that says `story` and carries none has moved the work " <>
+            "rather than done it. `confidence` is an enum and not a number on purpose: " <>
+            "`low` means the session would not act on this without a human reading the " <>
+            "report, `medium` means the request is clear but something it could not check " <>
+            "remains, `high` means it found the request actionable and contradicted by " <>
+            "nothing it read. The whole object is at most #{@max_bytes} bytes under the " <>
+            "byte rule.",
+        type: :object,
+        required: [:outcome, :confidence],
+        properties: %{
+          outcome: %Schema{type: :string, enum: @outcomes},
+          confidence: %Schema{type: :string, enum: @confidences},
+          story: %Schema{
+            type: :object,
+            description:
+              "The draft story, required when `outcome` is `story`. Its caps are SMALLER " <>
+                "than `RunnerStory`'s and are not the same numbers: a story at " <>
+                "`RunnerStory`'s maxima costs several times this whole object's " <>
+                "#{@max_bytes}-byte budget, so inheriting them would have declared limits " <>
+                "no field could reach. A draft written from one report is not an epic, and " <>
+                "a story needing more than this is one to escalate rather than draft. " <>
+                "These are still INDIVIDUAL maxima that do not sum to the object cap. No " <>
+                "`id`: the story row exists and loopctl owns its identity.",
+            required: [:title, :description, :acceptance_criteria],
+            properties: %{
+              title: %Schema{type: :string, maxLength: RunnerStory.max_title_length()},
+              description: %Schema{type: :string, maxLength: @max_story_description},
+              acceptance_criteria: %Schema{
+                type: :array,
+                maxItems: @max_story_criteria,
+                items: %Schema{type: :string, maxLength: @max_story_criterion_length}
+              },
+              test_cases: %Schema{
+                type: :array,
+                maxItems: @max_story_test_cases,
+                items: %Schema{type: :string, maxLength: @max_story_test_case_length}
+              },
+              touches: %Schema{
+                type: :array,
+                maxItems: @max_story_touches,
+                items: %Schema{type: :string, maxLength: @max_story_touch_length}
+              },
+              domain_reference: %Schema{type: :string, maxLength: @max_story_domain_reference}
+            }
+          },
+          escalation_reasons: %Schema{
+            type: :array,
+            maxItems: @max_reasons,
+            items: %Schema{type: :string, maxLength: @max_reason_length},
+            description: "Why this needs a human. Meaningful when `outcome` is `escalate`."
+          },
+          missing_information: %Schema{
+            type: :array,
+            maxItems: @max_missing,
+            items: %Schema{type: :string, maxLength: @max_missing_length},
+            description:
+              "What the session would need in order to reach a verdict — the field that " <>
+                "makes an escalation actionable rather than putting a human back at the " <>
+                "start of the same reading."
+          },
+          evidence: %Schema{
+            type: :array,
+            maxItems: @max_evidence,
+            items: %Schema{type: :string, maxLength: @max_evidence_length},
+            description:
+              "What the session actually read: file paths with optional line numbers, " <>
+                "knowledge-base article ids. It makes a verdict checkable by someone who " <>
+                "does not re-run it, which is the cheapest defence against a confident " <>
+                "verdict with nothing behind it. Capped hard: it is session-authored."
+          },
+          duplicate_of: %Schema{
+            type: :string,
+            format: :uuid,
+            nullable: true,
+            description:
+              "An existing story this report already describes. Its own field rather than " <>
+                "a `contradicts` entry, because a duplicate is the commonest outcome after " <>
+                "`reject` and it is not a contradiction."
+          },
+          contradicts: %Schema{
+            type: :array,
+            maxItems: @max_contradicts,
+            items: %Schema{
+              type: :object,
+              required: [:kind, :ref, :why],
+              properties: %{
+                kind: %Schema{type: :string, enum: @contradict_kinds},
+                ref: %Schema{type: :string, maxLength: @max_contradict_ref_length},
+                why: %Schema{type: :string, maxLength: @max_contradict_why_length}
+              }
+            },
+            description:
+              "What this request conflicts with in the existing stories, the knowledge " <>
+                "base, or the code. A DUPLICATE is not this; see `duplicate_of`."
+          }
+        }
+      },
+      struct?: false
+    )
+  end
+
   defmodule RunnerDispatch do
     @moduledoc false
     require OpenApiSpex
@@ -801,7 +1250,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           },
           max_turns: %Schema{type: :integer, minimum: 1},
           token_budget: %Schema{type: :integer, minimum: 1, nullable: true},
-          story: RunnerStory.schema()
+          story: RunnerStory.schema(),
+          triage: RunnerTriage.schema()
         }
       },
       struct?: false
@@ -1195,6 +1645,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     RunnerStatus,
     RunnerSample,
     RunnerStory,
+    RunnerTriage,
+    RunnerTriageVerdict,
     RunnerDispatch,
     RunnerDispatchReply,
     RunnerTraceEvent,
@@ -1396,7 +1848,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   end
 
   defp dispatch_shape_errors(dispatch) do
-    kind_errors(dispatch) ++ story_errors(dispatch)
+    kind_errors(dispatch) ++ story_errors(dispatch) ++ triage_errors(dispatch)
   end
 
   defp kind_errors(%{kind: kind}) do
@@ -1427,6 +1879,139 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   end
 
   defp story_errors(_dispatch), do: []
+
+  # The mirror of `story_errors/1`, and the pairing is the point: a `story` rides only an
+  # implement dispatch and a `triage` rides only a triage one, so the object carrying the
+  # reporter's words can never reach an implementing session (design §10). Stated as two
+  # independent rules rather than one either/or, so a dispatch carrying BOTH is refused
+  # twice rather than passing whichever test it happened to satisfy.
+  defp triage_errors(%{triage: triage, kind: kind, story_id: story_id}) do
+    cond do
+      kind != "triage" ->
+        ["triage is only allowed when kind is triage"]
+
+      Map.get(triage, :record_id) == story_id ->
+        # Not a type error — a value one, and it means a caller built the payload from the
+        # wrong id. The record and the stub story are different rows with different
+        # lifetimes, and a dispatch that conflates them would have triage read its own story.
+        ["triage.record_id must be the intake record, not the dispatch's story_id"]
+
+      ByteRule.bytes(triage) > RunnerTriage.max_bytes() ->
+        ["triage exceeds #{RunnerTriage.max_bytes()} bytes under the byte rule"]
+
+      true ->
+        []
+    end
+  end
+
+  # A `triage` KIND carrying no `triage` object. The head above only matches when the key is
+  # present, so without this a dispatch with a template for the wrong job and no input passes
+  # every shape rule — which is precisely what the moduledoc claims this payload prevents.
+  # `kind_errors/1` masks it today because triage is not dispatchable; it stops masking it the
+  # moment the interlock moves, so the clause lands now rather than as part of that change.
+  #
+  # The mirror gap for `story` on an `implement` dispatch is pre-existing and is NOT fixed
+  # here: closing it would refuse every dispatch built before 1.5.0 carried a story, and it is
+  # a different change with a different blast radius. Named so the asymmetry is deliberate
+  # rather than an oversight.
+  defp triage_errors(%{kind: "triage"} = dispatch) when not is_map_key(dispatch, :triage),
+    do: ["a triage dispatch must carry the triage object"]
+
+  defp triage_errors(_dispatch), do: []
+
+  @doc """
+  Validates a triage verdict (since 1.7.0). Returns the declared fields only, with atom
+  keys, or `{:error, {:invalid, messages}}`.
+
+  The schema cannot state the one rule that matters, so this does: a `story` outcome MUST
+  carry a draft story and every other outcome must not. A verdict saying `story` and
+  carrying none has moved the work rather than done it — a human re-reads the report and
+  writes the story by hand, which is the step triage exists to remove — and a draft story on
+  a `reject` is a payload whose two halves disagree about what was decided.
+
+  It is the same shape rule `cast_dispatch/1` applies to `story` and `triage`, and it is
+  stated the same way: as two independent conditions, so a verdict that breaks both is
+  refused for both.
+
+  **What this does NOT do is make the verdict trustworthy.** It bounds a session-authored
+  object composed by a session that had just read attacker-controllable text. Passing this
+  cast means the shape is right and the strings are within their caps; it says nothing about
+  whether the content was steered. Callers record it, never execute it, and fence its
+  strings wherever they reach another prompt.
+  """
+  @spec cast_triage_verdict(term()) :: {:ok, map()} | {:error, term()}
+  def cast_triage_verdict(payload) do
+    # `values_ok/1` FIRST, as every other inbound cast does. This was the one runner-to-
+    # control cast that skipped it, and it is the worst one to skip: the verdict is the most
+    # free-form object a runner sends — a draft title, a description, acceptance criteria,
+    # evidence, a contradiction's prose — and those fields become a story row. A NUL byte is
+    # trivially reachable from the reporter text the authoring session had just read, which
+    # is the exact threat model this object is documented against; Postgres refuses one in
+    # `text` and in any jsonb string, so it would pass the cast and raise at the write, on
+    # every resend.
+    with :ok <- values_ok(payload),
+         {:ok, cast} <- cast(payload, RunnerTriageVerdict.schema()) do
+      verdict = known_fields(cast, RunnerTriageVerdict.schema())
+
+      case verdict_shape_errors(verdict) do
+        [] -> {:ok, verdict}
+        errors -> {:error, {:invalid, errors}}
+      end
+    end
+  end
+
+  # ONE FUNCTION PER RULE, and they are independent `++` terms so a verdict breaking several
+  # is refused for each rather than for whichever was checked first. Split out when credo
+  # called the combined version too complex, which it was: four unrelated conditions sharing
+  # one body read as a checklist rather than as four things the contract says.
+  defp verdict_shape_errors(verdict) do
+    story_pairing(verdict) ++
+      duplicate_pairing(verdict) ++
+      escalation_content(verdict) ++
+      verdict_size(verdict)
+  end
+
+  # A `story` outcome carrying no draft has moved the work rather than done it; a draft on
+  # any other outcome is a payload whose halves disagree about what was decided.
+  defp story_pairing(%{outcome: "story"} = verdict) do
+    if is_nil(Map.get(verdict, :story)),
+      do: ["a story outcome must carry the draft story"],
+      else: []
+  end
+
+  defp story_pairing(verdict) do
+    if is_nil(Map.get(verdict, :story)),
+      do: [],
+      else: ["story is only allowed when outcome is story"]
+  end
+
+  # Drafting new work and naming the story this duplicates are different decisions. A
+  # consumer reading `outcome` creates a row, one reading `duplicate_of` makes a link, and
+  # nothing records which was meant.
+  defp duplicate_pairing(%{outcome: "story"} = verdict) do
+    if is_nil(Map.get(verdict, :duplicate_of)),
+      do: [],
+      else: ["a story outcome must not also name duplicate_of"]
+  end
+
+  defp duplicate_pairing(_verdict), do: []
+
+  # An escalation with nothing attached reaches a human who starts the same reading from the
+  # beginning — the thing `missing_information` exists to prevent. Either field satisfies it:
+  # one says why, the other says what is needed.
+  defp escalation_content(%{outcome: "escalate"} = verdict) do
+    if Enum.all?([:escalation_reasons, :missing_information], &(Map.get(verdict, &1, []) == [])),
+      do: ["an escalate outcome must carry escalation_reasons or missing_information"],
+      else: []
+  end
+
+  defp escalation_content(_verdict), do: []
+
+  defp verdict_size(verdict) do
+    if ByteRule.bytes(verdict) > RunnerTriageVerdict.max_bytes(),
+      do: ["verdict exceeds #{RunnerTriageVerdict.max_bytes()} bytes under the byte rule"],
+      else: []
+  end
 
   @doc """
   Validates a `dispatch_reply` payload. Returns the declared fields only, with atom keys, or
@@ -1776,7 +2361,9 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           "dispatch_reply_burst" => @dispatch_reply_burst,
           "stage_burst" => @stage_burst,
           "stage_max_reason_length" => RunnerStage.max_reason_length(),
-          "story" => RunnerStory.limits()
+          "story" => RunnerStory.limits(),
+          "triage" => RunnerTriage.limits(),
+          "triage_verdict" => RunnerTriageVerdict.limits()
         },
         # The transition table a `stage` message is checked against, published so a runner
         # can refuse an impossible transition locally instead of learning it from a refusal.

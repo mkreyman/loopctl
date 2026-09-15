@@ -443,7 +443,23 @@ defmodule Loopctl.Delivery.PlacementTest do
                :story,
                :story_id,
                :token_budget,
+               :triage,
                :wall_clock_seconds
+             ]
+
+      # `triage` (contract 1.7.0) is the second nested object and is pinned for the same
+      # reason as `story`. Answering the question this test exists to ask: none of its fields
+      # can carry a credential. Four are loopctl's own scalars, `escalation_reasons` is an
+      # array of loopctl's own detector codes, and `untrusted` is reporter text that has been
+      # through `Untrusted.render/2` — text a session must treat as data, which is the
+      # opposite of a credential and is fenced precisely so it cannot act as one.
+      assert RunnerContract.RunnerTriage.schema().properties |> Map.keys() |> Enum.sort() == [
+               :escalation_reasons,
+               :html_url,
+               :issue_number,
+               :record_id,
+               :truncated,
+               :untrusted
              ]
 
       assert RunnerContract.RunnerStory.schema().properties |> Map.keys() |> Enum.sort() == [
