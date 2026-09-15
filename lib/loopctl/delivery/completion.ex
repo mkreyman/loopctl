@@ -38,8 +38,8 @@ defmodule Loopctl.Delivery.Completion do
 
   A story at `verified` is `done` when its closure obligation is settled, which is EITHER:
 
-  - its `intake_issue_closures` row is terminal (`:closed` — loopctl closed the issue — or
-    `:abandoned` — it gave up, and a human has been left the row to read); or
+  - its `intake_issue_closures` row is `:closed` — loopctl told the reporter, and nothing
+    reopens a closed row; or
   - **there is no row at all**, because the story came from no intake record and therefore
     owed the reporter nothing. `record_issue_closure/3` writes a row only for a story with an
     `intake_record_id`, and a backfill or an API-created story has none.
@@ -50,9 +50,29 @@ defmodule Loopctl.Delivery.Completion do
   while doing it. A rule that only handles the case you were thinking about is how this stage
   became absorbing in the first place.
 
-  A `:pending` row is NOT settled and the story waits. It is not an error and nothing is
-  logged at error for it: the drainer is working, or is backing off, and the next sweep asks
-  again.
+  ## `:abandoned` DOES NOT SETTLE, and that is review round 1's correction
+
+  It looks terminal — the drainer gave up and left the row for a person — and the first
+  version of this module settled on exactly that reading. Wrong, because
+  `IssueClosures.requeue_abandoned/1` exists: an operator who fixes the cause (the standing
+  case is a `GITHUB_TOKEN` missing `issues: write`, which abandons every closure in its window
+  on the first attempt) puts those rows back to `:pending`, and the drainer then really does
+  post the comments and close the issues.
+
+  `done` is TERMINAL and excluded from `Stages.live_row/2`, so there is no walking it back.
+  Settling on `:abandoned` therefore meant: a misconfigured token abandons forty closures,
+  this sweep marks all forty stories `done` inside a minute, the operator fixes the token an
+  hour later, and forty reporters are told about work loopctl has already recorded as fully
+  discharged — with the machine unable to say otherwise. When the target stage cannot be left,
+  the conservative direction is the only safe one.
+
+  So an abandoned closure WAITS, exactly as a pending one does. That is not a stranded story:
+  the obligation is genuinely outstanding, `verified` is the honest place to rest while it is,
+  and one `requeue_abandoned/1` plus a drain moves it. The stage is not ABSORBING — it has a
+  writer — which is the property that matters and the one this module exists for.
+
+  A `:pending` row is unsettled for the plainer reason: the drainer is working, or is backing
+  off. Neither is an error and nothing is logged at error for them; the next sweep asks again.
 
   ## Where the state lives, and what a restart costs
 
@@ -87,8 +107,6 @@ defmodule Loopctl.Delivery.Completion do
   alias Loopctl.Delivery.StoryStage
   alias Loopctl.Intake.IssueClosure
 
-  @type outcome :: :completed | :waiting | :skipped
-
   @transition {:verified, :done, :forward}
 
   @doc """
@@ -102,14 +120,20 @@ defmodule Loopctl.Delivery.Completion do
 
   Public so the selection is falsifiable rather than buried in the pass.
   """
-  @spec candidates(pos_integer()) :: [%{tenant_id: Ecto.UUID.t(), story_id: Ecto.UUID.t()}]
+  @spec candidates(pos_integer()) :: [
+          %{tenant_id: Ecto.UUID.t(), story_id: Ecto.UUID.t(), claim_epoch: integer()}
+        ]
   def candidates(limit) when is_integer(limit) and limit > 0 do
     # UNSETTLED, not "has a row": a story with NO row owes nothing and is settled by having
-    # nothing to do. The anti-join below is what carries that — a `:pending` row excludes its
+    # nothing to do. The anti-join below is what carries that — an unsettled row excludes its
     # story, and the absence of a row does not.
+    #
+    # `!= :closed` rather than `== :pending`, which is round 1's correction: `:abandoned` is
+    # REOPENABLE by `IssueClosures.requeue_abandoned/1`, and `done` cannot be walked back. See
+    # the moduledoc.
     unsettled =
       from c in IssueClosure,
-        where: c.status == :pending,
+        where: c.status != :closed,
         select: %{tenant_id: c.tenant_id, story_id: c.story_id}
 
     ranked =
@@ -146,18 +170,33 @@ defmodule Loopctl.Delivery.Completion do
   of two nodes sweeping and never a failure. Every other `Stages.advance/4` refusal passes
   through under its own name.
 
-  It re-checks the settlement rule against the story rather than trusting the candidate row,
-  because the two are read at different instants and a closure row can be written between
-  them: `record_issue_closure/3` runs inside a terminal-verdict transition, and a story can
-  reach `verified` for a second time only by a path that would have moved it off `verified`
-  first. The re-check costs one indexed read and makes the pass correct under a race it would
-  otherwise resolve by completing a story whose reporter is still owed a comment.
+  It re-checks the settlement rule rather than trusting the candidate row. Round 1 of review
+  corrected WHICH race that closes, and the correction is worth keeping because the first
+  answer was the reassuring one:
+
+  - a FRESH closure row cannot appear for a story sitting at `verified`. `resolution_verdict/1`
+    maps only `{:deployed, :verified, :forward}` and `{:triaged, :failed, :triage_reject}`, and
+    `verified`'s own edges out are both terminal, so nothing can write one.
+  - what CAN happen is `IssueClosures.requeue_abandoned/1` turning a settled row unsettled
+    while the batch is in flight. The re-check narrows that window to the microseconds between
+    it and the commit; it does not close it, because `unsettled_closure?/2` runs outside
+    `Stages.advance/4`'s transaction and nothing locks the closure row.
+
+  That residue is accepted deliberately rather than overlooked. Closing it would mean taking
+  the closure row `FOR UPDATE` inside the stage transaction — a second table in a transaction
+  that already holds the story row and appends to the tenant's audit chain, for a race whose
+  loser is one story completing a few milliseconds before an operator's requeue. The operator
+  sees it in the requeue's own count, and the reporter still gets the comment, because
+  `IssueClosures.due/1` has no stage predicate and drains the row whatever stage its story
+  reached. What the FIRST version got wrong was not this window; it was settling on
+  `:abandoned` at all, which made the same operator action wrong for an entire batch rather
+  than for a microsecond.
   """
   @spec complete(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
-          {:ok, term()} | {:error, term()} | {:waiting, :closure_pending}
+          {:ok, term()} | {:error, term()} | {:waiting, :closure_unsettled}
   def complete(tenant_id, story_id, opts \\ []) do
-    if pending_closure?(tenant_id, story_id) do
-      {:waiting, :closure_pending}
+    if unsettled_closure?(tenant_id, story_id) do
+      {:waiting, :closure_unsettled}
     else
       Stages.advance(tenant_id, story_id, @transition,
         claim_epoch: Keyword.fetch!(opts, :claim_epoch),
@@ -177,11 +216,11 @@ defmodule Loopctl.Delivery.Completion do
   @spec transition() :: {atom(), atom(), atom()}
   def transition, do: @transition
 
-  defp pending_closure?(tenant_id, story_id) do
+  defp unsettled_closure?(tenant_id, story_id) do
     AdminRepo.exists?(
       from c in IssueClosure,
         where: c.tenant_id == ^tenant_id and c.story_id == ^story_id,
-        where: c.status == :pending
+        where: c.status != :closed
     )
   end
 end

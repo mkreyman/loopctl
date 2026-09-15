@@ -136,14 +136,41 @@ defmodule Loopctl.Delivery.CompletionTest do
       assert story.id in candidate_ids()
     end
 
-    test "an ABANDONED closure settles it too, deliberately", ctx do
+    test "an ABANDONED closure does NOT settle — it is reopenable", ctx do
       story = verified_story(ctx)
       closure(ctx, story, :abandoned)
 
-      # The drainer gave up and LEFT THE ROW for a person to read. Treating that as unsettled
-      # would hold the story at `verified` for ever over an outward act that is never going to
-      # happen — the same absorbing state, entered through the error path instead.
-      assert story.id in candidate_ids()
+      # ROUND 1'S CORRECTION, and the first version of this module got it the other way round
+      # on the reassuring reading: the drainer gave up, so surely the obligation is over.
+      # `IssueClosures.requeue_abandoned/1` says otherwise — an operator who fixes the cause
+      # (the standing case is a GITHUB_TOKEN missing `issues: write`, which abandons every
+      # closure in its window on the first attempt) puts the rows back to `:pending` and the
+      # drainer really does post the comments.
+      #
+      # `done` is TERMINAL and excluded from `live_row/2`, so there is no walking it back. The
+      # cost of being wrong here is one-directional: a misconfigured token abandons forty
+      # closures, this sweep marks forty stories `done` within the minute, and an hour later
+      # forty reporters are told about work the machine had already recorded as discharged.
+      refute story.id in candidate_ids()
+    end
+
+    test "a REQUEUED closure keeps its story out until it is actually closed", ctx do
+      # The operator action the rule above exists for, end to end: abandoned, requeued to
+      # pending, then closed. Only the last state settles.
+      story = verified_story(ctx)
+      closure(ctx, story, :abandoned)
+      refute story.id in candidate_ids()
+
+      unboxed(fn ->
+        AdminRepo.update_all(
+          from(c in Loopctl.Intake.IssueClosure,
+            where: c.tenant_id == ^ctx.tenant.id and c.story_id == ^story.id
+          ),
+          set: [status: :pending, abandoned_reason: nil, updated_at: DateTime.utc_now()]
+        )
+      end)
+
+      refute story.id in candidate_ids()
     end
 
     test "a story at any OTHER stage is nobody's business here", ctx do
@@ -179,7 +206,23 @@ defmodule Loopctl.Delivery.CompletionTest do
       story = verified_story(ctx)
       closure(ctx, story, :pending)
 
-      assert {:waiting, :closure_pending} = complete(story)
+      assert {:waiting, :closure_unsettled} = complete(story)
+      assert stage_of(story) == :verified
+    end
+
+    test "an ABANDONED closure stops the write too, not just the selection", ctx do
+      # THE RE-CHECK'S OWN CASE, reached by calling `complete/3` directly — which is what the
+      # requeue race looks like: the candidate was read while the row was `:closed`, an
+      # operator's `requeue_abandoned/1` landed, and the write must still decline.
+      #
+      # Written because the query and the re-check are two separate predicates, and a re-check
+      # that said `== :pending` while the query said `!= :closed` would pass every other test
+      # here: the only row that tells them apart is an abandoned one, and the query never
+      # hands one to the writer.
+      story = verified_story(ctx)
+      closure(ctx, story, :abandoned)
+
+      assert {:waiting, :closure_unsettled} = complete(story)
       assert stage_of(story) == :verified
     end
 

@@ -55,6 +55,20 @@ defmodule Loopctl.Workers.StoryCompletionWorkerTest do
     end
   end
 
+  describe "the job's own shape" do
+    test "it is UNIQUE across the states a retry can sit in" do
+      # Scheduled every minute with `max_attempts: 3`, a systemic failure leaves a RETRYABLE
+      # job that does not block the next cron insert — so without `:retryable` in this list the
+      # queue accumulates three failures plus a discard per minute, indefinitely. Found in
+      # review on a sibling worker (#826 round 3) and carried by three of them.
+      unique = StoryCompletionWorker.__opts__()[:unique]
+
+      assert unique, "an every-minute worker with retries must declare :unique"
+      assert :retryable in unique[:states]
+      assert :executing in unique[:states]
+    end
+  end
+
   describe "the batch bound" do
     test "a pass is bounded, so one sweep cannot take the whole table" do
       assert StoryCompletionWorker.batch_size() > 0

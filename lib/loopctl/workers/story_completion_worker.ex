@@ -32,7 +32,18 @@ defmodule Loopctl.Workers.StoryCompletionWorker do
   candidates because the read is oldest-first, so nothing starves.
   """
 
-  use Oban.Worker, queue: :default, max_attempts: 3
+  # `unique:` IS NOT OPTIONAL AT THIS CADENCE, and three siblings carry it for a reason found
+  # in review (#826 round 3, finding 2): scheduled every minute with `max_attempts: 3`, a
+  # systemic failure leaves a RETRYABLE job that does not block the next cron insert, so each
+  # tick adds a fresh job beside the backed-off one and the queue accumulates three failures
+  # plus a discard per minute indefinitely. The `states:` list is what makes the retryable one
+  # count. It also stops a slow pass overlapping the next tick, which would double this
+  # sweep's load on the three-connection AdminRepo pool in exactly the situation where it is
+  # already struggling.
+  use Oban.Worker,
+    queue: :default,
+    max_attempts: 3,
+    unique: [period: 60, states: [:available, :scheduled, :executing, :retryable]]
 
   alias Loopctl.Delivery.Completion
 
@@ -83,14 +94,31 @@ defmodule Loopctl.Workers.StoryCompletionWorker do
       {:ok, _row} ->
         :completed
 
-      # The row moved under the sweep: another node completed it, or something else advanced
-      # it. Neither is a fault and neither needs a person.
-      {:error, :stale_stage} ->
+      # THE ROW MOVED UNDER THE SWEEP, and none of these needs a person. `:stale_stage` is
+      # another node completing it or something else advancing it; `:stale_claim_epoch` is the
+      # story's epoch moving between the candidate read and the write — a human resolution, a
+      # release — and `:not_found` is the row going away.
+      #
+      # Logged at INFO, like `PostDeployVerificationWorker` logs the same set, and counted
+      # apart from `:errored`. At `error` they would be indistinguishable from the systemic
+      # failure `run_result/1` exists to surface — and worse, a single legacy row whose
+      # `story_stages.claim_epoch` disagrees with its story's would be refused on every pass,
+      # so once it was the only candidate left the job would fail EVERY MINUTE for ever on a
+      # condition that is not a fault.
+      {:error, reason} when reason in [:stale_stage, :stale_claim_epoch, :not_found] ->
+        Logger.info(
+          "StoryCompletionWorker: skipped, the row moved: story_id=#{candidate.story_id} " <>
+            "reason=#{inspect(reason)}",
+          tenant_id: candidate.tenant_id,
+          story_id: candidate.story_id
+        )
+
         :raced
 
-      # The closure row was written between the candidate read and the re-check. The story is
-      # a candidate again once the drainer settles it.
-      {:waiting, :closure_pending} ->
+      # The closure went unsettled between the candidate read and the re-check — in practice
+      # an operator's `requeue_abandoned/1`. The story is a candidate again once the drainer
+      # closes it.
+      {:waiting, :closure_unsettled} ->
         :waiting
 
       {:error, reason} ->
