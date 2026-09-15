@@ -207,25 +207,25 @@ defmodule Loopctl.Delivery.TriageTriggerTest do
       assert second.number == "43.2"
     end
 
-    test "a target epic that resolves to no epic of this tenant is refused, not raised", %{
-      tenant: tenant
-    } do
-      other_tenant = fixture(:committed_tenant, %{})
-      {other_source, _other_record} = fixture(:committed_intake, %{tenant_id: other_tenant.id})
-
-      {_source, record} =
-        fixture(:committed_intake, %{
-          tenant_id: tenant.id,
-          target_epic_id: other_source.target_epic_id
-        })
-
-      # The epic read is tenant-scoped, so another tenant's epic resolves to nothing here
-      # exactly as a deleted one would. Through `get_by!` that is an `Ecto.NoResultsError`
-      # out of a function whose whole contract is `{:ok, _} | {:error, _}` — one misconfigured
-      # source taking the worker down instead of escalating its own record.
-      assert {:error, :target_epic_missing} = unboxed(fn -> TriageTrigger.promote(record) end)
-      assert unboxed(fn -> stories_for_record(record.id) end) == 0
-    end
+    # WHY THERE IS NO TEST FOR :target_epic_missing, and why the branch stays anyway.
+    #
+    # There was one. It built a source in one tenant pointing at another tenant's epic, which
+    # was insertable while the reference was a single column onto `epics(id)`. Round 2 made it
+    # composite — `(tenant_id, target_epic_id) REFERENCES epics (tenant_id, id)` — for exactly
+    # the reason that fixture demonstrated, so the row the test needs is now refused by the
+    # database and the test raised out of its own setup.
+    #
+    # The branch is NOT deleted with the test. Both routes to it are now closed — a
+    # cross-tenant target by the composite FK, a deleted epic by `ON DELETE NO ACTION` plus
+    # `Epics.delete_epic/3`'s named constraint — so it is unreachable through every supported
+    # path, which is a statement about today's schema rather than a proof. It costs one clause
+    # and it fails CLOSED: the alternative to returning `:target_epic_missing` is
+    # `Ecto.NoResultsError` out of a function whose contract is ok-or-error, taking the worker
+    # down over one misconfigured source. A guard that cannot currently fire is worth keeping
+    # when the thing it replaces is a crash.
+    #
+    # What would make it testable again is a legitimate way to reach it. If one appears, the
+    # test comes back with it.
 
     test "a stage that could not be opened is an error, not a story the loop cannot see", %{
       tenant: tenant

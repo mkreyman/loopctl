@@ -89,6 +89,9 @@ defmodule Loopctl.Delivery.TriageTrigger do
           | :epic_number_unnumberable
           | :target_epic_missing
           | :linked_story_missing
+          | :intake_record_not_found
+          | :story_number_exhausted
+          | :source_not_found
           | {:stage_not_opened, :not_found | :busy}
           | {:intake_record_already_linked, Ecto.UUID.t() | nil}
           | :epic_not_found
@@ -131,9 +134,15 @@ defmodule Loopctl.Delivery.TriageTrigger do
   end
 
   defp live_source(%Record{tenant_id: tenant_id, source_id: source_id}) do
+    # The two are DIFFERENT facts and were reported as one. A revocation is the routine,
+    # expected outcome and will be filtered as noise wherever it is handled; a record whose
+    # source does not resolve at all — deleted, or a tenant mismatch between record and
+    # source — is the case where a human has to look at the data, and folding it into
+    # `:source_revoked` hid it in exactly the bucket nobody reads.
     case AdminRepo.get_by(Source, id: source_id, tenant_id: tenant_id) do
       %Source{revoked_at: nil} = source -> {:ok, source}
-      _ -> {:error, :source_revoked}
+      %Source{} -> {:error, :source_revoked}
+      nil -> {:error, :source_not_found}
     end
   end
 
@@ -239,7 +248,7 @@ defmodule Loopctl.Delivery.TriageTrigger do
         {:error, :epic_number_unnumberable}
 
       %Epic{} = epic ->
-        {:ok, "#{epic.number}.#{next_sequence(tenant_id, epic)}"}
+        numbered(epic, next_sequence(tenant_id, epic))
     end
   end
 
@@ -256,6 +265,20 @@ defmodule Loopctl.Delivery.TriageTrigger do
   #
   # Read off `stories` rather than counted, so a deleted story does not hand its number to the
   # next arrival.
+  # THE MINOR HAS THE SAME CEILING AS THE MAJOR, and guarding only the major left the failure
+  # this module's own comments say the project-wide scan exists to avoid. A sequence at or
+  # past 10_000 is rejected by `Story.validate_number_format/1` as an opaque changeset error,
+  # and it does not self-heal: every retry rescans, computes the same max plus one, and fails
+  # identically, so the record stalls in `pending_triage` for ever.
+  #
+  # It does not take 10_000 stories to get there. The scan is project-wide and reads whatever
+  # is in `stories`, so a single hand-authored `43.9999` anywhere in the project makes the
+  # next promote under epic 43 produce `43.10000`.
+  defp numbered(%Epic{number: major}, minor) when minor < @max_number_part,
+    do: {:ok, "#{major}.#{minor}"}
+
+  defp numbered(%Epic{}, _minor), do: {:error, :story_number_exhausted}
+
   # Takes the `%Epic{}` `story_number/2` already loaded — tenant-scoped — rather than reading
   # it again by id alone. The re-read was a second round trip on `AdminRepo`'s 3-connection
   # pool for a row that was in hand, and it was the one query in this module carrying no

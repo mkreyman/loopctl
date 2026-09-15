@@ -194,4 +194,79 @@ defmodule Loopctl.IntakeTest do
       end
     end
   end
+
+  describe "escalate_record/3" do
+    # The audit log is HASH-CHAINED and append-only, so a repeat call is not a harmless no-op
+    # update: it appends a second entry that says the same thing, for ever. The first version
+    # of this function relied on `escalation_changes/3` unioning the reason list, which made
+    # the ROW converge while the chain grew on every call — and its own docstring claimed a
+    # recorded reason was a no-op, which was false. The subtraction is what makes the claim
+    # true, and this is what proves it.
+    test "a reason already recorded writes nothing at all" do
+      tenant = fixture(:tenant)
+      record = fixture(:intake_record, %{tenant_id: tenant.id, repo: AdminRepo})
+
+      assert {:ok, escalated} =
+               Intake.escalate_record(tenant.id, record.id, "triage_trigger:no_target_epic")
+
+      assert escalated.status == :escalated
+      before = escalation_entries(tenant.id)
+      assert before >= 1
+
+      # Same reason again: the row is already correct and the chain must not grow.
+      assert {:ok, again} =
+               Intake.escalate_record(tenant.id, record.id, "triage_trigger:no_target_epic")
+
+      assert again.escalation_reasons == escalated.escalation_reasons
+      assert again.escalated_at == escalated.escalated_at
+      assert escalation_entries(tenant.id) == before
+    end
+
+    test "a NEW reason is recorded, and keeps the first escalated_at" do
+      tenant = fixture(:tenant)
+      record = fixture(:intake_record, %{tenant_id: tenant.id, repo: AdminRepo})
+
+      assert {:ok, first} = Intake.escalate_record(tenant.id, record.id, "reason_one")
+      assert {:ok, second} = Intake.escalate_record(tenant.id, record.id, "reason_two")
+
+      assert second.escalation_reasons == ["reason_one", "reason_two"]
+      # The clock is the moment a human first needed to look, not the latest symptom.
+      assert second.escalated_at == first.escalated_at
+      assert escalation_entries(tenant.id) == 2
+
+      # The entry must describe the record AFTER this escalation. Written from the pre-update
+      # struct it showed the state BEFORE — so the second entry's `escalation_reasons` would
+      # say ["reason_one"] while its `signals` said reason_two, an entry disagreeing with
+      # itself on an append-only chain nobody can correct later.
+      assert %{"escalation_reasons" => ["reason_one", "reason_two"]} =
+               latest_escalation_payload(tenant.id)
+    end
+
+    test "a record of another tenant is not found" do
+      tenant = fixture(:tenant)
+      other = fixture(:tenant)
+      record = fixture(:intake_record, %{tenant_id: other.id, repo: AdminRepo})
+
+      assert {:error, :not_found} = Intake.escalate_record(tenant.id, record.id, "reason")
+    end
+  end
+
+  defp latest_escalation_payload(tenant_id) do
+    AdminRepo.one(
+      from e in "audit_chain",
+        where: e.tenant_id == type(^tenant_id, :binary_id) and e.action == "intake_escalated",
+        order_by: [desc: e.chain_position],
+        limit: 1,
+        select: e.payload
+    )
+  end
+
+  defp escalation_entries(tenant_id) do
+    AdminRepo.aggregate(
+      from(e in "audit_chain",
+        where: e.tenant_id == type(^tenant_id, :binary_id) and e.action == "intake_escalated"
+      ),
+      :count
+    )
+  end
 end

@@ -86,5 +86,15 @@ defmodule Loopctl.Intake.Source do
 
   @doc "Changeset that revokes a source."
   @spec revoke_changeset(t(), DateTime.t()) :: Ecto.Changeset.t()
-  def revoke_changeset(%__MODULE__{} = source, now), do: change(source, revoked_at: now)
+  # CLEARS `target_epic_id` as well, and that is load-bearing rather than tidiness. The
+  # reference to `epics` refuses a delete while it stands, and revoking is the remedy the
+  # refusal NAMES — so if a revoked source kept pointing at its epic, the remedy would be a
+  # lie and the epic would be undeletable for ever with no action available short of SQL.
+  # (Re-enrolling the repository is allowed, because the active-repo uniqueness is partial on
+  # `revoked_at IS NULL`, so those dead references would accumulate invisibly.)
+  #
+  # Nothing is lost by clearing it: a revoked source produces no more reports, so where its
+  # stories would have landed is a question with no remaining subject.
+  def revoke_changeset(%__MODULE__{} = source, now),
+    do: change(source, revoked_at: now, target_epic_id: nil)
 end

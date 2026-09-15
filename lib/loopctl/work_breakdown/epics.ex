@@ -397,15 +397,21 @@ defmodule Loopctl.WorkBreakdown.Epics do
     end)
   end
 
-  # Names the restricting reference so its violation renders. `intake_sources.target_epic_id`
-  # is the only FK onto `epics` that is not `delete_all`, and the constraint name is
-  # Postgres's default for that column.
+  # Names the reference so its violation renders as a 422 instead of an `Ecto.ConstraintError`
+  # the fallback controller cannot turn into a response.
+  #
+  # `intake_sources.target_epic_fkey` is the only FK onto `epics` that is not `delete_all`,
+  # and the message names the ONE remedy that actually works. It used to say "repoint or
+  # revoke": there is no repoint path — no update route, and `create_changeset/2` does not
+  # cast the field — and revoking used to leave the reference standing, so both halves were
+  # false and the epic was undeletable for ever. `Source.revoke_changeset/2` now clears the
+  # target, which is what makes the remaining half true.
   defp epic_delete_changeset(epic) do
     epic
     |> Ecto.Changeset.change()
     |> Ecto.Changeset.foreign_key_constraint(:target_epic_id,
-      name: :intake_sources_target_epic_id_fkey,
-      message: "is the target epic of an intake source; repoint or revoke that source first"
+      name: :intake_sources_target_epic_fkey,
+      message: "is the target epic of an active intake source; revoke that source first"
     )
   end
 end

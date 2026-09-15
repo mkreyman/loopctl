@@ -807,6 +807,58 @@ defmodule Loopctl.Intake do
   defp ambiguous_at(nil), do: %{order_ambiguous: false, order_ambiguous_at: nil}
   defp ambiguous_at(%DateTime{} = at), do: %{order_ambiguous: true, order_ambiguous_at: at}
 
+  @doc """
+  Escalates `record` to a human with `reason`, idempotently (#803 §4).
+
+  The delivery loop's counterpart to the detector's own escalation: the trigger cannot make a
+  story from this record — its source names no epic, or names one that cannot carry a story
+  number — and that is a question for a person rather than something to guess at or retry.
+
+  Idempotent, and the SUBTRACTION is what makes it so rather than the union. A reason this
+  record already carries yields `{:ok, record}` with nothing written at all — no update, no
+  log line, and no second `intake_escalated` entry on the hash-chained audit log. The first
+  version relied on `escalation_changes/3` unioning the list, which made the row converge but
+  appended a chain entry on every call; the delivery path avoids that by computing
+  `new_reasons` BEFORE it calls, and this now does the same.
+
+  Until this existed, four places — this module's schema comment, the trigger's moduledoc, the
+  migration and the OpenAPI description — all said a record with no target epic was ESCALATED,
+  and nothing set the status. The record simply stayed `pending_triage` and was retried for
+  ever against a condition only a human could clear.
+  """
+  @spec escalate_record(Ecto.UUID.t(), Ecto.UUID.t(), String.t()) ::
+          {:ok, Record.t()} | {:error, :not_found | term()}
+  def escalate_record(tenant_id, record_id, reason)
+      when is_binary(tenant_id) and is_binary(record_id) and is_binary(reason) do
+    case AdminRepo.get_by(Record, id: record_id, tenant_id: tenant_id) do
+      nil ->
+        {:error, :not_found}
+
+      %Record{} = record ->
+        escalate_new(record, [reason] -- record.escalation_reasons)
+    end
+  end
+
+  defp escalate_new(record, []), do: {:ok, record}
+
+  defp escalate_new(record, new_reasons) do
+    changes = escalation_changes(record, new_reasons, DateTime.utc_now())
+
+    AdminRepo.transaction(fn ->
+      # `updated`, not `record`, and the two are not interchangeable: `escalate/3` writes
+      # `escalation_reasons` into the audit entry, so passing the pre-update struct recorded
+      # the state BEFORE this escalation while `signals` carried the new reason — an entry
+      # disagreeing with itself, and disagreeing with what the delivery path writes for the
+      # same action.
+      with {:ok, updated} <- AdminRepo.update(Record.apply_changeset(record, changes)),
+           :ok <- escalate(updated, new_reasons, record.last_delivery_id) do
+        updated
+      else
+        {:error, reason} -> AdminRepo.rollback(reason)
+      end
+    end)
+  end
+
   defp escalation_changes(_record, [], _now), do: %{}
 
   defp escalation_changes(record, new_reasons, now) do
