@@ -77,8 +77,11 @@ All notable changes to loopctl are documented here.
   touched — a draft saying "ignore previous instructions" is stored verbatim, since that is a
   semantic attack for the triage trio to catch and mangling prose would corrupt real stories.
   An escalation or a rejection drafts nothing, and a draft loopctl could not DISPATCH — one
-  whose sanitised title exceeds the cap the stored story is judged against, or one whose title
-  is empty — is ESCALATED rather than queued, leaving the stub row intact. The draft's
+  whose sanitised title exceeds the cap the stored story is judged against, one whose title is
+  empty, or one stating no acceptance criteria — is ESCALATED rather than queued, leaving the
+  stub row intact. A half-applied route (the first transition committed, the second not) is
+  COMPLETED by the resend, including after a claim reclaim, rather than reported as a clean
+  run: nothing else in `lib/` writes `triaged -> queued`, so a story stranded there was dead. The draft's
   `test_cases`, `touches` and `domain_reference` are kept under `metadata["triage_draft"]`:
   the story row has no columns for them and they are dispatch options, but dropping them lost
   what a session wrote.

@@ -87,7 +87,12 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
     end)
   end
 
-  defp bump_story_epoch(story) do
+  # What a RECLAIM leaves behind, both halves: `Progress.force_unclaim_story/3` bumps the
+  # story's epoch and `Stages.follow_release/5` REBINDS the row to it — a `triaged` row is not
+  # in flight, so it keeps its stage and takes the new number. Written directly rather than
+  # through `Progress`, which is an AdminRepo context and therefore a different sandbox
+  # connection in this `async: true` suite.
+  defp bump_story_epoch(story, rebind_row? \\ false) do
     as_tenant(story.tenant_id, fn ->
       {1, _} =
         Repo.update_all(
@@ -96,6 +101,16 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
           ),
           inc: [claim_epoch: 1]
         )
+
+      if rebind_row? do
+        {1, _} =
+          Repo.update_all(
+            from(r in Loopctl.Delivery.StoryStage,
+              where: r.story_id == ^story.id and r.tenant_id == ^story.tenant_id
+            ),
+            inc: [claim_epoch: 1]
+          )
+      end
     end)
   end
 
@@ -186,10 +201,16 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
     test "a story verdict advances detected -> triaged and records what was said" do
       %{story: story, runner: runner, record: record} = session()
 
+      # `acceptance_criteria` is REQUIRED of a draft by the contract, and a draft without one
+      # is refused rather than queued (see the criteria test below), so it is here too.
       drafted = %{
         outcome: "story",
         confidence: "high",
-        story: %{title: "A title", description: "A description"}
+        story: %{
+          title: "A title",
+          description: "A description",
+          acceptance_criteria: ["The total reconciles"]
+        }
       }
 
       assert {:ok, %{replayed?: false, record: saved}} =
@@ -332,7 +353,14 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
                  verdict_message(record, %{
                    outcome: "story",
                    confidence: "high",
-                   story: %{title: "A newer claim owns this", description: "d"}
+                   # A DISPATCHABLE draft, criteria and all: the only thing that may stop this
+                   # being written is the epoch. Without them the draft is refused for stating
+                   # no acceptance criteria, and deleting the epoch fence left this green.
+                   story: %{
+                     title: "A newer claim owns this",
+                     description: "d",
+                     acceptance_criteria: ["c"]
+                   }
                  })
                )
 
@@ -412,6 +440,51 @@ defmodule Loopctl.Delivery.TriageVerdictTest do
       assert kept["test_cases"] == ["A visit of 7 minutes bills one unit"]
       assert kept["touches"] == ["lib/home_care_billing/billing/visit.ex"]
       assert kept["domain_reference"] == "docs/architecture/timesheets.md"
+    end
+
+    test "a draft with NO acceptance criteria is escalated, not queued" do
+      %{story: story, runner: runner, record: record} = session()
+
+      # Neither the contract nor the dispatch refuses one: the draft schema sets `maxItems`
+      # and no `minItems`, and `ImplementerInput.violations/1` checks a blank TITLE and never
+      # an empty criteria list. A runner sent that story has a title and nothing to build
+      # against, which is the same "work dispatched against nothing" the blank title escalates
+      # for. Refused here rather than in `ImplementerInput`, which is shared with the backfill
+      # paths where a criterion-less story is legitimate history.
+      drafted = %{
+        outcome: "story",
+        confidence: "high",
+        story: %{title: "A perfectly good title", description: "d", acceptance_criteria: []}
+      }
+
+      assert {:ok, _} =
+               TriageVerdict.apply(story.tenant_id, runner.id, verdict_message(record, drafted))
+
+      assert stage_of(story) == :escalated
+    end
+
+    test "a RECLAIM between the two transitions does not strand the story at triaged" do
+      %{story: story, runner: runner, record: record} = session()
+
+      drafted = %{
+        outcome: "story",
+        confidence: "high",
+        story: %{title: "Queue me anyway", description: "d", acceptance_criteria: ["c"]}
+      }
+
+      message = verdict_message(record, drafted)
+
+      # The state a reclaim leaves: entering `triaged` ENDS the triage session, so the claim's
+      # lease runs out in the window between the two transitions of a `story` route. The
+      # reclaimer bumps the epoch and `follow_release/5` merely REBINDS a `triaged` row, since
+      # `triaged` is not an in-flight stage — so every later attempt at `triaged -> queued`
+      # died on `:stale_claim_epoch` before the compare-and-set, nothing else in `lib/` writes
+      # that edge, and `Escalations` cannot escalate a `triaged` row either.
+      advance_to_triaged(story)
+      bump_story_epoch(story, true)
+
+      assert {:ok, _} = TriageVerdict.apply(story.tenant_id, runner.id, message)
+      assert stage_of(story) == :queued
     end
 
     test "an escalation leaves the stub row exactly as it was" do

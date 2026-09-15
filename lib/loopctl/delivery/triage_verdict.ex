@@ -77,6 +77,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
   alias Loopctl.Delivery.ImplementerInput
   alias Loopctl.Delivery.StageMachine
   alias Loopctl.Delivery.Stages
+  alias Loopctl.Delivery.StoryStage
   alias Loopctl.Delivery.TriageVerdictRecord
   alias Loopctl.Delivery.Untrusted
   alias Loopctl.Repo
@@ -368,6 +369,15 @@ defmodule Loopctl.Delivery.TriageVerdict do
       :ok ->
         advance_all(tenant_id, runner_id, session, message, transitions, nil)
 
+      # OUTSIDE the transaction the draft was written in. `Audit.create_log_entry/2` writes on
+      # `AdminRepo` — a different pool, three connections wide — and a checkout timeout there
+      # RAISES rather than returning `{:error, _}`, so inside the transaction it would roll the
+      # drafted row back and escape as an exception rather than as any declared error. The
+      # audit row is a record OF a committed write, so it belongs after the commit.
+      {:drafted, story} ->
+        log_draft(tenant_id, story)
+        advance_all(tenant_id, runner_id, session, message, transitions, nil)
+
       # A DRAFT LOOPCTL CANNOT DISPATCH IS ESCALATED, NOT QUEUED, and the story keeps the stub
       # row it already had. The caps a stored story is judged against are the contract's own
       # (`ImplementerInput.violations/1`), and sanitising EXPANDS text — one bidirectional mark
@@ -435,6 +445,13 @@ defmodule Loopctl.Delivery.TriageVerdict do
   # passes that check, and without this one it would overwrite a story a newer claim owns,
   # with the advance then rolling back `:stale_claim_epoch` and the stale draft left behind.
   #
+  # It DECLINES TO DRAFT rather than failing the verdict, and that distinction is the whole of
+  # round 2's reclaim repair: a resend after a reclaim is exactly the message that has to
+  # finish a half-applied route, and refusing it here would have re-stranded the story this
+  # module just learned to rescue. Nothing is left unguarded by the softer answer — every
+  # transition still carries its own epoch fence, and the one place that fence is deliberately
+  # re-taken (`triaged -> queued`, after a reclaim) is guarded by the row's own stage instead.
+  #
   # The STAGE, because a replay is a success that applies nothing twice — `apply/3` says so —
   # and a duplicate frame from a draining socket can arrive after the story was queued,
   # dispatched, or corrected by an operator over `PATCH /api/v1/stories/:id`. Rewriting then
@@ -442,20 +459,32 @@ defmodule Loopctl.Delivery.TriageVerdict do
   # a story nothing re-drafted. `detected` and `triaged` are this verdict's own window.
   defp draft_if_still_ours(tenant_id, story, draft, message) do
     cond do
-      story.claim_epoch != message.claim_epoch -> {:error, :stale_claim_epoch}
-      stage_of(tenant_id, story.id) not in [:detected, :triaged] -> :ok
-      true -> write_draft(tenant_id, story, draft)
+      story.claim_epoch != message.claim_epoch -> :ok
+      stage_in_transaction(tenant_id, story.id) not in [:detected, :triaged] -> :ok
+      true -> drafted(write_draft(story, draft))
     end
   end
 
-  defp stage_of(tenant_id, story_id) do
-    case Stages.get(tenant_id, story_id) do
-      nil -> nil
-      row -> row.stage
-    end
+  # READ INLINE, NOT THROUGH `Stages.get/2`, and this is the defect class this repo keeps
+  # paying for. `Stages.get/2` opens `Repo.with_tenant/2` of its own, and this runs INSIDE the
+  # one `apply_draft/3` already opened — `Repo.assert_not_nested!/2` raises on that, in
+  # production, on every accepted verdict. It cannot fail in a test: the guard is inert under
+  # the SQL sandbox by design, which is why `StagesNestingGuardTest` reads the SOURCE, and why
+  # this change widens that guard to the tenant-scoped READS as well as `advance/4`.
+  defp stage_in_transaction(tenant_id, story_id) do
+    Repo.one(
+      from r in StoryStage,
+        where: r.tenant_id == ^tenant_id and r.story_id == ^story_id,
+        select: r.stage
+    )
   end
 
-  defp write_draft(tenant_id, story, draft) do
+  # The updated story travels OUT of the transaction so its audit row can be written after the
+  # commit — see `apply_verdict/5`.
+  defp drafted({:ok, story}), do: {:drafted, story}
+  defp drafted(other), do: other
+
+  defp write_draft(story, draft) do
     attrs = %{
       title: Untrusted.sanitise(Map.get(draft, :title)),
       description: Untrusted.sanitise(Map.get(draft, :description)),
@@ -463,10 +492,7 @@ defmodule Loopctl.Delivery.TriageVerdict do
       metadata: draft_metadata(story, draft)
     }
 
-    with :ok <- dispatchable(story, attrs),
-         {:ok, updated} <- write(story, attrs) do
-      log_draft(tenant_id, updated)
-    end
+    with :ok <- dispatchable(story, attrs), do: write(story, attrs)
   end
 
   # JUDGED AS THE DISPATCH WILL JUDGE IT, through the one derivation rather than a second copy
@@ -477,18 +503,39 @@ defmodule Loopctl.Delivery.TriageVerdict do
 
     case ImplementerInput.story_object(candidate) do
       {:ok, _object} ->
-        :ok
+        criteria_present(attrs)
 
       {:error, {:story_not_dispatchable, violations}} ->
         {:error, {:draft_not_dispatchable, violations}}
     end
   end
 
+  # A REFUSED CHANGESET IS A DRAFT THIS LOOP CANNOT USE, so it takes the same road as one over
+  # the caps: escalate, and leave the stub row. Answering the runner `invalid_payload` — which
+  # the contract publishes as permanent — left the story at `detected` with a recorded verdict
+  # and nobody looking at it, which is the stuck state the sibling branch exists to avoid.
+  # A STORY WITH NO ACCEPTANCE CRITERIA IS WORK DISPATCHED AGAINST NOTHING, and neither the
+  # contract nor the dispatch refuses one: the draft schema sets `maxItems` and no `minItems`,
+  # and `ImplementerInput.violations/1` checks a blank TITLE and never an empty list. Refused
+  # HERE rather than there, because that module is shared with the backfill and bulk paths
+  # where a criterion-less story is legitimate history.
+  defp criteria_present(%{acceptance_criteria: [_ | _]}), do: :ok
+
+  defp criteria_present(_attrs),
+    do: {:error, {:draft_not_dispatchable, ["the draft states no acceptance criteria"]}}
+
   defp write(story, attrs) do
     case story |> Story.update_changeset(attrs) |> Repo.update() do
-      {:ok, updated} -> {:ok, updated}
-      {:error, %Ecto.Changeset{}} -> {:error, :story_draft_invalid}
+      {:ok, updated} ->
+        {:ok, updated}
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        {:error, {:draft_not_dispatchable, changeset_violations(changeset)}}
     end
+  end
+
+  defp changeset_violations(changeset) do
+    for {field, {message, _opts}} <- changeset.errors, do: "#{field}: #{message}"
   end
 
   # THE THREE FIELDS THE STORY ROW HAS NO COLUMNS FOR — `test_cases`, `touches` and
@@ -585,9 +632,100 @@ defmodule Loopctl.Delivery.TriageVerdict do
       {:error, :not_found} ->
         {:error, :unknown_story_stage}
 
+      # THE ONE PLACE THE EPOCH FENCE PROTECTS NOTHING, and the story is stranded without this.
+      # Entering `triaged` ENDS the triage session (`StageMachine` counts it among the stages a
+      # session ends at), so the claim's lease starts running out in the window between the two
+      # transitions of a `story` route. If the second one fails there — a lock timeout, a chain
+      # append, a node dying — `ReclaimExpiredClaimsWorker` bumps the epoch and
+      # `Stages.follow_release/5` merely REBINDS a `triaged` row, because `triaged` is not an
+      # in-flight stage. Every later attempt then dies on `:stale_claim_epoch` before the
+      # compare-and-set is even reached, nothing else in `lib/` writes `triaged -> queued`, and
+      # `Escalations` cannot escalate a `triaged` row either: the story is dead at exactly the
+      # stage this module exists to move it past.
+      #
+      # So this re-attempts ONLY that transition, ONLY from `triaged`, and only with the
+      # story's CURRENT epoch read fresh. What the fence is for is stopping a zombie SESSION
+      # writing over live work; there is no session here — this one ended at `triaged` by
+      # definition — the verdict is already recorded, and queueing is the conclusion control
+      # already drew from it.
+      {:error, :stale_claim_epoch} ->
+        after_reclaim(tenant_id, runner_id, session, message, transition, rest, reason)
+
       {:error, other} ->
         {:error, other}
     end
+  end
+
+  # ONE re-attempt, made HERE rather than by recursing through the clause above, so a race
+  # cannot turn a repair into a loop: if the epoch moves again between the read and this
+  # advance, the refusal stands and the resend is what tries next.
+  # WHERE THE ROW ACTUALLY IS decides what a stale epoch means here, and there are three
+  # answers. A row that has already LEFT this transition's `from` took it — continue, exactly
+  # as for `:stale_stage`. A row sitting at `triaged` with `triaged -> queued` still to make is
+  # the reclaim case above — re-attempt it under the story's current epoch. Anything else is a
+  # genuine refusal and stands.
+  defp after_reclaim(tenant_id, runner_id, session, message, {from, to, _edge}, rest, reason) do
+    case stage_now(tenant_id, session.story_id) do
+      ^to ->
+        advance_all(tenant_id, runner_id, session, message, rest, reason)
+
+      :triaged when to == :queued ->
+        requeue_after_reclaim(tenant_id, runner_id, session, message, rest, reason)
+
+      ^from ->
+        {:error, :stale_claim_epoch}
+
+      _elsewhere ->
+        {:error, :stale_claim_epoch}
+    end
+  end
+
+  defp stage_now(tenant_id, story_id) do
+    in_tenant(tenant_id, fn ->
+      Repo.one(
+        from r in StoryStage,
+          where: r.tenant_id == ^tenant_id and r.story_id == ^story_id,
+          select: r.stage
+      )
+    end)
+  end
+
+  defp requeue_after_reclaim(tenant_id, runner_id, session, message, rest, reason) do
+    transition = {:triaged, :queued, :forward}
+
+    case moved_epoch(tenant_id, session.story_id, message.claim_epoch) do
+      nil ->
+        {:error, :stale_claim_epoch}
+
+      epoch ->
+        fenced = %{message | claim_epoch: epoch}
+        label = reason || "triage_verdict:requeued_after_reclaim"
+
+        case Stages.advance(
+               tenant_id,
+               session.story_id,
+               transition,
+               opts(runner_id, session, fenced, transition, label)
+             ) do
+          {:ok, _row} -> advance_all(tenant_id, runner_id, session, message, rest, reason)
+          {:error, :not_found} -> {:error, :unknown_story_stage}
+          {:error, other} -> {:error, other}
+        end
+    end
+  end
+
+  # The story's epoch when it has MOVED, `nil` otherwise — a story that is gone, and one whose
+  # epoch is the message's own, in which case the refusal was about something other than a
+  # reclaim and re-attempting under the same number would fail identically.
+  defp moved_epoch(tenant_id, story_id, sent_epoch) do
+    in_tenant(tenant_id, fn ->
+      Repo.one(
+        from s in Story,
+          where: s.id == ^story_id and s.tenant_id == ^tenant_id,
+          where: s.claim_epoch != ^sent_epoch,
+          select: s.claim_epoch
+      )
+    end)
   end
 
   defp opts(runner_id, session, message, {_from, to, _edge}, reason_override) do
