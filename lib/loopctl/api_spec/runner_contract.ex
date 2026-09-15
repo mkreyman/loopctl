@@ -1326,11 +1326,11 @@ defmodule Loopctl.ApiSpec.RunnerContract do
             minimum: 0,
             description: "The `claim_epoch` of the dispatch being answered, echoed."
           },
-          verdict: %Schema{
-            allOf: [RunnerTriageVerdict],
-            nullable: true,
-            description: "The session's judgement. Forbidden when `incomplete` is present."
-          },
+          # INLINED, exactly as `RunnerDispatch` inlines `story` and `triage`. `allOf` is
+          # ENFORCED by OpenApiSpex and NOT published by the export, so a runner validating
+          # against the vendored contract would have passed a verdict loopctl then refused —
+          # for a rule it could not read. The export's own guard says so and caught it.
+          verdict: RunnerTriageVerdict.schema(),
           incomplete: %Schema{
             type: :string,
             enum: @incomplete_reasons,
@@ -1878,6 +1878,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     RunnerStory,
     RunnerTriage,
     RunnerTriageVerdict,
+    RunnerTriageVerdictMessage,
+    RunnerTriageVerdictAck,
     RunnerDispatch,
     RunnerDispatchReply,
     RunnerTraceEvent,

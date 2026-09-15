@@ -1397,6 +1397,41 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
     end
   end
 
+  describe "the published schema map is TOTAL" do
+    test "every name in events and replies resolves to a $defs definition" do
+      # 1.9.0 SHIPPED WITHOUT THIS and the runner session found it, not the suite. Both new
+      # modules were written, cast against, tested and named in `x-connection` — and neither
+      # was added to `@schemas`, which is what builds `$defs`. So the published contract
+      # pointed at two definitions it did not contain.
+      #
+      # The cost is precisely what `permanent_errors` was published to avoid: a vendoring
+      # runner cannot resolve the envelope, so it re-types `dispatch_id`, `claim_epoch`, the
+      # exactly-one-of rule and the `incomplete` enum from a COMMIT MESSAGE into its own
+      # source — and then nothing on either side can check the two agree. The 1.8.0 lesson
+      # was to read bounds from the contract instead of re-typing them; this made that
+      # impossible for the one message it was published for.
+      schema = RunnerContract.json_schema()
+      defs = Map.keys(schema["$defs"]) |> MapSet.new()
+      connection = schema["x-connection"]
+
+      named =
+        connection["events"]
+        |> Map.values()
+        |> Enum.concat(Map.values(connection["replies"]))
+        |> MapSet.new()
+
+      dangling = MapSet.difference(named, defs)
+
+      assert MapSet.size(dangling) == 0,
+             "x-connection names schemas $defs does not define: " <>
+               inspect(MapSet.to_list(dangling))
+
+      # NEVER VACUOUS: the map must actually name things, or a rename of `events` would make
+      # this pass by comparing two empty sets.
+      assert MapSet.size(named) >= 10
+    end
+  end
+
   describe "the triage verdict message (1.9.0)" do
     defp verdict_msg(attrs) do
       Map.merge(

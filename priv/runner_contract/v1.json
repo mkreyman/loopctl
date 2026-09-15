@@ -956,6 +956,205 @@
         "confidence"
       ],
       "type": "object"
+    },
+    "RunnerTriageVerdictAck": {
+      "description": "The reply to an accepted `triage_verdict`.",
+      "properties": {
+        "recorded_at": {
+          "description": "When the verdict was FIRST recorded — unchanged by a resend, so it dates the original delivery rather than the latest one.",
+          "format": "date-time",
+          "type": "string"
+        },
+        "replayed": {
+          "description": "False on the delivery that recorded this verdict, true on any resend of it. A resend applies no second transition.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "recorded_at",
+        "replayed"
+      ],
+      "type": "object"
+    },
+    "RunnerTriageVerdictMessage": {
+      "description": "What a runner sends when a `triage` session is finished (since 1.9.0). Carries EXACTLY ONE of `verdict` and `incomplete`: a message with both, or with neither, is refused `invalid_payload`. `incomplete` is how a run that produced nothing usable is reported — a `stage` message cannot say it, because the edge it would need (`triage_escalate`) is a control-side verdict no runner may report. IDEMPOTENT PER DISPATCH: a byte-identical resend is answered `ok` and changes nothing, so resending is the correct response to any refusal listed outside `x-connection.permanent_errors`. A resend carrying a DIFFERENT verdict for the same dispatch is refused `already_recorded` and is permanent.",
+      "properties": {
+        "claim_epoch": {
+          "description": "The `claim_epoch` of the dispatch being answered, echoed.",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "detail": {
+          "description": "Optional operator-facing note beside an `incomplete` reason, e.g. which check refused the verdict. UNTRUSTED like every other runner-authored string: recorded and bounded, never executed and never put in a prompt unfenced.",
+          "maxLength": 300,
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dispatch_id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "incomplete": {
+          "description": "Why this run produced no usable verdict. Forbidden when `verdict` is present. `verdict_invalid` means the session DID write one and the runner's own validation refused it — a different state from writing none.",
+          "enum": [
+            "session_crashed",
+            "wall_clock_exceeded",
+            "checkout_unreadable",
+            "no_verdict_written",
+            "verdict_invalid"
+          ],
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "verdict": {
+          "description": "What a `triage` session returns (since 1.7.0). SESSION-AUTHORED AND UNTRUSTED: it was composed by a session that had just read reporter text, so loopctl records and bounds it, never executes it, and fences these strings wherever they later reach a prompt — `story` included, because those fields were written by that same session. `story` is REQUIRED when `outcome` is `story` and forbidden otherwise, the same shape rule a dispatch uses for `story` and `triage`; a verdict that says `story` and carries none has moved the work rather than done it. `confidence` is an enum and not a number on purpose: `low` means the session would not act on this without a human reading the report, `medium` means the request is clear but something it could not check remains, `high` means it found the request actionable and contradicted by nothing it read. THE OBJECT CAP IS WHAT BINDS: at most 48000 bytes under the byte rule, which charges 6 bytes per character and 12 for one outside the Basic Multilingual Plane — so the per-field character maxima do NOT guarantee a payload that fits. A verdict at every declared maximum fits in ordinary text and does not once enough of it is astral. Check the byte rule against `max_bytes` (published in `x-connection.limits.triage_verdict`) rather than the field lengths: the lengths bound one field each, the cap bounds the message.",
+          "properties": {
+            "confidence": {
+              "enum": [
+                "low",
+                "medium",
+                "high"
+              ],
+              "type": "string"
+            },
+            "contradicts": {
+              "description": "What this request conflicts with in the existing stories, the knowledge base, or the code. A DUPLICATE is not this; see `duplicate_of`.",
+              "items": {
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "story",
+                      "kb",
+                      "code"
+                    ],
+                    "type": "string"
+                  },
+                  "ref": {
+                    "maxLength": 100,
+                    "type": "string"
+                  },
+                  "why": {
+                    "maxLength": 200,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "ref",
+                  "why"
+                ],
+                "type": "object"
+              },
+              "maxItems": 3,
+              "type": "array"
+            },
+            "duplicate_of": {
+              "description": "An existing story this report already describes. Its own field rather than a `contradicts` entry, because a duplicate is the commonest outcome after `reject` and it is not a contradiction.",
+              "format": "uuid",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "escalation_reasons": {
+              "description": "Why this needs a human. Meaningful when `outcome` is `escalate`.",
+              "items": {
+                "maxLength": 150,
+                "type": "string"
+              },
+              "maxItems": 5,
+              "type": "array"
+            },
+            "evidence": {
+              "description": "What the session actually read: file paths with optional line numbers, knowledge-base article ids. It makes a verdict checkable by someone who does not re-run it, which is the cheapest defence against a confident verdict with nothing behind it. Capped hard: it is session-authored.",
+              "items": {
+                "maxLength": 150,
+                "type": "string"
+              },
+              "maxItems": 6,
+              "type": "array"
+            },
+            "missing_information": {
+              "description": "What the session would need in order to reach a verdict — the field that makes an escalation actionable rather than putting a human back at the start of the same reading.",
+              "items": {
+                "maxLength": 150,
+                "type": "string"
+              },
+              "maxItems": 5,
+              "type": "array"
+            },
+            "outcome": {
+              "enum": [
+                "story",
+                "escalate",
+                "reject"
+              ],
+              "type": "string"
+            },
+            "story": {
+              "description": "The draft story, required when `outcome` is `story`. Its caps are SMALLER than `RunnerStory`'s and are not the same numbers: a story at `RunnerStory`'s maxima costs several times this whole object's 48000-byte budget, so inheriting them would have declared limits no field could reach. A draft written from one report is not an epic, and a story needing more than this is one to escalate rather than draft. These are still INDIVIDUAL maxima that do not sum to the object cap. No `id`: the story row exists and loopctl owns its identity.",
+              "properties": {
+                "acceptance_criteria": {
+                  "items": {
+                    "maxLength": 200,
+                    "type": "string"
+                  },
+                  "maxItems": 5,
+                  "type": "array"
+                },
+                "description": {
+                  "maxLength": 900,
+                  "type": "string"
+                },
+                "domain_reference": {
+                  "maxLength": 300,
+                  "type": "string"
+                },
+                "test_cases": {
+                  "items": {
+                    "maxLength": 200,
+                    "type": "string"
+                  },
+                  "maxItems": 4,
+                  "type": "array"
+                },
+                "title": {
+                  "maxLength": 200,
+                  "type": "string"
+                },
+                "touches": {
+                  "items": {
+                    "maxLength": 80,
+                    "type": "string"
+                  },
+                  "maxItems": 8,
+                  "type": "array"
+                }
+              },
+              "required": [
+                "title",
+                "description",
+                "acceptance_criteria"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "outcome",
+            "confidence"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "dispatch_id",
+        "claim_epoch"
+      ],
+      "type": "object"
     }
   },
   "$id": "https://loopctl.com/runner_contract/v1.json",
