@@ -38,6 +38,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.6.0) a runner DECLARES the kinds it runs on join (`RunnerJoin.kinds`); where present it is the only thing consulted | | | | |
   | (1.7.0) a `triage` dispatch carries a `RunnerTriage` whose `untrusted` field is the reporter's own words, already fenced | | | | |
   | (1.8.0) `x-connection.limits` publishes every bounded field at every depth. A `fields` entry may now be a nested map, and an ARRAY of objects publishes its element bounds under `item_fields` — never `fields`, which always means the bounds of the object you are looking at | | | | |
+  | (1.9.0) a triage session's result comes back on its own `triage_verdict` message, carrying EXACTLY ONE of `verdict` or `incomplete`. Idempotent per dispatch: a byte-identical resend is answered `ok`. `x-connection.permanent_errors` says which refusals are worth resending | | | | |
 
   ## The story object (since 1.5.0)
 
@@ -189,6 +190,13 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     refused, and a rejoining runner ships up to 20 batches a second.
   - `dispatch_reply_burst` (`dispatch_reply_burst/0`) — a bucket of 8 replies that refills
     one every 250 ms, so several dispatches can be answered back to back.
+  - `triage_verdict_burst` (`triage_verdict_burst/0`) — a bucket of 4 that refills one a
+    second. A verdict is produced ONCE per run and cannot be re-derived once the session has
+    stopped, so this is sized against losing a run's whole output to a token bucket rather
+    than against a flood.
+  - `permanent_errors` (`permanent_errors/0`) — the refusal codes no resend can clear.
+    Branch on this rather than on a list copied into a runner's own source; everything not
+    in it is worth resending unchanged.
 
   Only a message that is ACTED ON counts: one refused before the database (`invalid_payload`,
   `batch_too_large`, `event_data_too_large`) neither starts a floor nor spends a reply, so
@@ -249,7 +257,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   alias Loopctl.Delivery.StageMachine
   alias OpenApiSpex.Schema
 
-  @version "1.8.0"
+  @version "1.9.0"
   @major 1
 
   defmodule ByteRule do
@@ -1235,6 +1243,119 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     )
   end
 
+  defmodule RunnerTriageVerdictMessage do
+    @moduledoc """
+    The `triage_verdict` message a runner sends when a triage session is FINISHED (1.9.0).
+
+    The verdict object itself (`RunnerTriageVerdict`) names no story, no dispatch and no
+    epoch — it is the session's judgement and nothing else — so this is the envelope that
+    says which run it is about. `dispatch_id` names the story on loopctl's side; a story id
+    is never taken from the wire.
+
+    ## Exactly one of `verdict` or `incomplete`
+
+    A triage run has two ends, and before 1.9.0 only one of them could be reported. Either
+    the session produced a verdict, or it did not — it crashed, it ran out of wall clock, it
+    could not read the checkout, it wrote nothing, or it wrote something the runner's own
+    validator refused. `:triage_escalate` is NOT a runner-reportable stage edge, so a
+    `stage` message could never carry "this run ended and produced nothing", and a dispatch
+    with no way to say that stays in flight for ever. `incomplete` is that way.
+
+    Every `incomplete` reason routes the same as an `escalate` verdict — a human looks —
+    because a triage run that produced nothing usable is the same outcome for the reporter
+    as one that produced a refusal, and telling them apart matters to the operators and not
+    to her. The enum exists so the operators CAN tell them apart.
+
+    `verdict_invalid` is the one that is easy to leave out and was: the session did not
+    crash, did not run out of time, read the checkout fine, and DID write something — which
+    its own runner then refused against the schema, the conditional-story rule or the byte
+    cap. It is a distinct state from writing nothing.
+
+    ## Resending is safe, and is the correct move on any transient refusal
+
+    A verdict is recorded once per dispatch. A byte-identical resend is answered `ok` with
+    the same ack, applies no second transition and appends no second chain entry — which
+    matters more than idempotency usually does, because the transition it drives is not
+    undoable: `triaged -> failed` earns the reporter a `not_actionable` resolution, so a
+    double apply is a second close on her ticket.
+
+    A resend carrying a DIFFERENT verdict for the same dispatch is refused
+    `already_recorded`, permanently. A session cannot restate its verdict by design, so a
+    differing resend is a defect on one side or the other, and silently taking the second
+    would erase the first.
+    """
+
+    require OpenApiSpex
+
+    alias Loopctl.ApiSpec.RunnerContract.RunnerTriageVerdict
+
+    # The session ended without a usable verdict. Every one escalates; the enum is what lets
+    # an operator tell a crash from a refused verdict without reading the run.
+    @incomplete_reasons ~w(session_crashed wall_clock_exceeded checkout_unreadable
+                           no_verdict_written verdict_invalid)
+
+    @max_detail_length 300
+
+    @doc "Every reason a triage run may report instead of a verdict."
+    @spec incomplete_reasons() :: [String.t()]
+    def incomplete_reasons, do: @incomplete_reasons
+
+    @doc "The cap on the optional free-text detail beside an `incomplete` reason."
+    @spec max_detail_length() :: pos_integer()
+    def max_detail_length, do: @max_detail_length
+
+    OpenApiSpex.schema(
+      %{
+        title: "RunnerTriageVerdictMessage",
+        description:
+          "What a runner sends when a `triage` session is finished (since 1.9.0). Carries " <>
+            "EXACTLY ONE of `verdict` and `incomplete`: a message with both, or with " <>
+            "neither, is refused `invalid_payload`. `incomplete` is how a run that produced " <>
+            "nothing usable is reported — a `stage` message cannot say it, because the edge " <>
+            "it would need (`triage_escalate`) is a control-side verdict no runner may " <>
+            "report. IDEMPOTENT PER DISPATCH: a byte-identical resend is answered `ok` and " <>
+            "changes nothing, so resending is the correct response to any refusal listed " <>
+            "outside `x-connection.permanent_errors`. A resend carrying a DIFFERENT verdict " <>
+            "for the same dispatch is refused `already_recorded` and is permanent.",
+        type: :object,
+        required: [:dispatch_id, :claim_epoch],
+        properties: %{
+          dispatch_id: %Schema{type: :string, format: :uuid},
+          claim_epoch: %Schema{
+            type: :integer,
+            minimum: 0,
+            description: "The `claim_epoch` of the dispatch being answered, echoed."
+          },
+          verdict: %Schema{
+            allOf: [RunnerTriageVerdict],
+            nullable: true,
+            description: "The session's judgement. Forbidden when `incomplete` is present."
+          },
+          incomplete: %Schema{
+            type: :string,
+            enum: @incomplete_reasons,
+            nullable: true,
+            description:
+              "Why this run produced no usable verdict. Forbidden when `verdict` is " <>
+                "present. `verdict_invalid` means the session DID write one and the " <>
+                "runner's own validation refused it — a different state from writing none."
+          },
+          detail: %Schema{
+            type: :string,
+            maxLength: @max_detail_length,
+            nullable: true,
+            description:
+              "Optional operator-facing note beside an `incomplete` reason, e.g. which " <>
+                "check refused the verdict. UNTRUSTED like every other runner-authored " <>
+                "string: recorded and bounded, never executed and never put in a prompt " <>
+                "unfenced."
+          }
+        }
+      },
+      struct?: false
+    )
+  end
+
   defmodule RunnerDispatch do
     @moduledoc false
     require OpenApiSpex
@@ -1774,6 +1895,14 @@ defmodule Loopctl.ApiSpec.RunnerContract do
       ~w(rate_limited invalid_payload unknown_dispatch dispatch_not_accepted stale_claim_epoch
          stale_stage unknown_story_stage effect_conflict audit_chain_append_failed
          internal_error),
+    # Since 1.9.0. `already_recorded` is the one that needs its meaning stated: this dispatch
+    # already has a verdict and the bytes just sent are NOT the same ones. An identical
+    # resend is never refused — it is answered `ok` — so seeing this code means the two sides
+    # disagree about what the session decided, which no retry can fix.
+    "triage_verdict" =>
+      ~w(rate_limited invalid_payload unknown_dispatch dispatch_not_accepted stale_claim_epoch
+         already_recorded unknown_story_stage stale_stage audit_chain_append_failed
+         internal_error),
     # Since 1.2.0. `join` is the `phx_join` reply; `unknown_event` answers any event this
     # map does not name, every time.
     "join" => ~w(rate_limited not_authorized invalid_payload unsupported_contract_version
@@ -1782,7 +1911,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   }
 
   # The runner-to-control events `LoopctlWeb.RunnerChannel.handle_in/3` acts on.
-  @inbound_events ~w(status dispatch_reply trace trace_cursor stage)
+  @inbound_events ~w(status dispatch_reply trace trace_cursor stage triage_verdict)
 
   # The minimum spacing, per channel, between two acted-on messages of one event. A message
   # inside it is refused with `rate_limited` and `min_interval_ms`. Each event has its OWN
@@ -1797,6 +1926,26 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   # `dispatch_reply` is a bucket rather than a floor: a runner handed several dispatches at
   # once answers them back to back, and a single per-runner gap refused the second answer.
   @dispatch_reply_burst %{"capacity" => 8, "refill_interval_ms" => 250}
+
+  # A verdict is produced ONCE per run, so the risk here is not a flood, it is a token bucket
+  # eating a run's entire output: a refused verdict cannot be re-derived, because the session
+  # has stopped and the runner records one verdict per run by design. Sized so a resend
+  # always lands well inside a run's remaining wall clock, and generous enough that a runner
+  # answering several finished triage sessions at once is never made to hold one.
+  @triage_verdict_burst %{"capacity" => 4, "refill_interval_ms" => 1_000}
+
+  # THE REFUSALS NO RESEND CAN CLEAR, published so a runner branches on the contract rather
+  # than on a list it copied into its own source. Asked for by the `loopctl-runner`
+  # maintaining session on that ground, 2026-09-15: it is the same lesson as reading the
+  # bounds from `x-connection.limits` instead of re-typing them.
+  #
+  # Everything NOT here is worth resending unchanged — and for `triage_verdict` that is the
+  # correct move on any of them, because an identical resend is idempotent.
+  @permanent_errors ~w(invalid_payload not_authorized unsupported_contract_version
+                       machine_mismatch forbidden_topic unknown_topic unknown_event
+                       unknown_dispatch stale_claim_epoch already_replied already_recorded
+                       dispatch_not_accepted run_mismatch effect_conflict
+                       audit_chain_append_failed unknown_story_stage)
 
   # `stage` is a bucket for the same reason, and a bigger one. A machine at `max_sessions: 2`
   # runs two stories at once, each walking a thirteen-stage line, and a runner that has been
@@ -1832,6 +1981,21 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   """
   @spec dispatch_reply_burst() :: %{String.t() => pos_integer()}
   def dispatch_reply_burst, do: @dispatch_reply_burst
+
+  @doc """
+  The `triage_verdict` bucket (1.9.0). See the note above `@triage_verdict_burst`.
+  """
+  @spec triage_verdict_burst() :: %{String.t() => pos_integer()}
+  def triage_verdict_burst, do: @triage_verdict_burst
+
+  @doc """
+  The refusal codes no resend can clear, across every event (1.9.0).
+
+  A runner branches on this rather than on a list copied into its own source. Everything not
+  named here is worth resending unchanged.
+  """
+  @spec permanent_errors() :: [String.t()]
+  def permanent_errors, do: @permanent_errors
 
   @doc """
   The `stage` bucket: `capacity` transitions back to back, refilled one per
@@ -2030,6 +2194,54 @@ defmodule Loopctl.ApiSpec.RunnerContract do
       end
     end
   end
+
+  @doc """
+  Casts a `triage_verdict` MESSAGE — the envelope plus exactly one of its two payloads.
+
+  The exactly-one rule is checked HERE and not left to the schema, for the same reason the
+  dispatch's `story`/`triage` rule is: JSON Schema can express it only with a keyword
+  (`oneOf`, or `dependentRequired`) that a vendoring runner's validator may not implement,
+  and a rule the other side cannot check is a rule that is enforced by a 4xx nobody
+  predicted. Both present, or neither, is `{:invalid, ["exactly_one_of_verdict_or_incomplete"]}`.
+
+  A `detail` string is admitted beside either, and ignored beside a verdict rather than
+  refused: it is operator-facing prose, and refusing a message over a field that changes no
+  decision would cost a run its whole output.
+  """
+  @spec cast_triage_verdict_message(term()) :: {:ok, map()} | {:error, term()}
+  def cast_triage_verdict_message(payload) do
+    with :ok <- values_ok(payload),
+         {:ok, cast} <- cast(payload, RunnerTriageVerdictMessage.schema()) do
+      message = known_fields(cast, RunnerTriageVerdictMessage.schema())
+
+      case message_shape_errors(message) do
+        [] -> cast_message_verdict(message)
+        errors -> {:error, {:invalid, errors}}
+      end
+    end
+  end
+
+  defp message_shape_errors(message) do
+    verdict? = not is_nil(Map.get(message, :verdict))
+    incomplete? = not is_nil(Map.get(message, :incomplete))
+
+    if verdict? == incomplete?,
+      do: ["exactly_one_of_verdict_or_incomplete"],
+      else: []
+  end
+
+  # The nested verdict goes through `cast_triage_verdict/1` ITSELF rather than being trusted
+  # because the envelope cast already walked it. One cast, one set of shape rules: the
+  # conditional `story` rule and the object cap live there, and a second reading of the same
+  # object is how the two drift into disagreeing about what a valid verdict is.
+  defp cast_message_verdict(%{verdict: verdict} = message) when not is_nil(verdict) do
+    case cast_triage_verdict(verdict) do
+      {:ok, cast} -> {:ok, %{message | verdict: cast}}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp cast_message_verdict(message), do: {:ok, message}
 
   # ONE FUNCTION PER RULE, and they are independent `++` terms so a verdict breaking several
   # is refused for each rather than for whichever was checked first. Split out when credo
@@ -2390,6 +2602,9 @@ defmodule Loopctl.ApiSpec.RunnerContract do
       "title" => "loopctl runner contract",
       "x-contract-version" => @version,
       "x-connection" => %{
+        # Beside `errors`, not inside `limits`: it is a property OF the refusal codes, and a
+        # runner reads it in the same breath as the code it just got.
+        "permanent_errors" => @permanent_errors,
         "socket_path" => "/runner/socket/websocket",
         "credential_header" => "x-loopctl-runner-token",
         "topic" => "runner:{runner_id}",
@@ -2403,6 +2618,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           "trace_event" => "RunnerTraceEvent",
           "disconnecting" => "RunnerDisconnecting",
           "stage" => "RunnerStageReport",
+          "triage_verdict" => "RunnerTriageVerdictMessage",
           "story" => "RunnerStory"
         },
         # The kinds loopctl will actually send. `RunnerDispatch.kind`'s enum is the
@@ -2430,6 +2646,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
           "trace_max_seq" => @max_seq,
           "min_interval_ms" => @min_interval_ms,
           "dispatch_reply_burst" => @dispatch_reply_burst,
+          "triage_verdict_burst" => @triage_verdict_burst,
           "stage_burst" => @stage_burst,
           "stage_max_reason_length" => RunnerStage.max_reason_length(),
           "story" => RunnerStory.limits(),
