@@ -37,6 +37,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   | (1.5.0) an implement dispatch carries a `RunnerStory`, and a runner may refuse a kind with `kind_not_supported` | | | | |
   | (1.6.0) a runner DECLARES the kinds it runs on join (`RunnerJoin.kinds`); where present it is the only thing consulted | | | | |
   | (1.7.0) a `triage` dispatch carries a `RunnerTriage` whose `untrusted` field is the reporter's own words, already fenced | | | | |
+  | (1.8.0) `x-connection.limits` publishes every bounded field at every depth, so a `fields` entry may now be a nested map | | | | |
 
   ## The story object (since 1.5.0)
 
@@ -248,7 +249,7 @@ defmodule Loopctl.ApiSpec.RunnerContract do
   alias Loopctl.Delivery.StageMachine
   alias OpenApiSpex.Schema
 
-  @version "1.7.0"
+  @version "1.8.0"
   @major 1
 
   defmodule ByteRule do
@@ -650,8 +651,16 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     # 5_500-character reports, one flagged and one not, would have taken different paths for
     # a reason no declared bound could explain.
     #
-    # 5_000 is measured against the worst case, not the convenient one: 46_074 bytes with
-    # every other field of this object at its own maximum. A test asserts it.
+    # 5_000 is measured against every other field of this object at its own maximum, IN BMP
+    # TEXT: 38_364 bytes against the 48_000 cap. That is the worst ORDINARY case and not the
+    # worst case simply — the same object in astral characters is 75_864, because the byte
+    # rule charges double outside the BMP.
+    #
+    # The caps are not sized for that, for the reason `RunnerTriageVerdict` states at length:
+    # doing so would halve what a reporter may write to defend a case no report produces, and
+    # the byte rule is already a worst-case-encoder bound. What holds instead is that the
+    # OBJECT CAP binds and `Loopctl.Delivery.TriagePayload` checks it — a report that does not
+    # fit is escalated to a human rather than cut. Both figures are pinned by tests.
     #
     # The six-times charge is deliberate worst-case-encoder accounting, so an ASCII report of
     # this length costs about 5 KB on the wire and the frame is nowhere near full. That
@@ -983,9 +992,15 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     # cap was individually reachable and the combination was not, which is the same "reads as
     # a limit, is not what binds" defect one level up again.
     #
-    # Measured at these values: the story is 23_814 bytes and a verdict with every field at
-    # its maximum is 45_322 against the 48_000 cap. A test asserts that, so the caps cannot
-    # drift apart from the budget again.
+    # Measured at these values, in BMP text: a verdict with every field at its maximum is
+    # 45_880 against the 48_000 cap. A test asserts it FITS — `bytes <= cap` — which is the
+    # claim that matters and is weaker than naming a figure; the figure is here so a later
+    # reader can tell whether the headroom has been spent, and is not what the suite checks.
+    #
+    # The headroom is 2_120 bytes and it is BMP-ONLY. `ByteRule` charges 12 for a character
+    # outside the Basic Multilingual Plane against 6 inside, so about 354 astral characters
+    # spend it — a handful of emoji do not, a title written in an astral script does. A
+    # separate test pins the astral figure rather than leaving it to be discovered.
     @max_evidence 6
     @max_evidence_length 150
     @max_missing 5
@@ -1083,8 +1098,8 @@ defmodule Loopctl.ApiSpec.RunnerContract do
             "under the byte rule, which charges 6 bytes per character and 12 for one " <>
             "outside the Basic Multilingual Plane — so the per-field character maxima do " <>
             "NOT guarantee a payload that fits. A verdict at every declared maximum fits in " <>
-            "ordinary text and does not once the text is astral, and an emoji in a drafted " <>
-            "title is enough to move it. Check the byte rule against `max_bytes` (published " <>
+            "ordinary text and does not once enough of it is astral. Check the byte rule " <>
+            "against `max_bytes` (published " <>
             "in `x-connection.limits.triage_verdict`) rather than the field lengths: the " <>
             "lengths bound one field each, the cap bounds the message.",
         type: :object,
@@ -1280,7 +1295,6 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     require OpenApiSpex
 
     alias Loopctl.ApiSpec.RunnerContract.ByteRule
-    alias Loopctl.ApiSpec.RunnerContract.Limits
 
     # Both under `ByteRule`. Referenced by the description, the export and
     # `RunnerContract.cast_trace_batch/1`. A schema-valid event with `data` at its cap and
@@ -1548,7 +1562,6 @@ defmodule Loopctl.ApiSpec.RunnerContract do
     require OpenApiSpex
 
     alias Loopctl.ApiSpec.RunnerContract.ByteRule
-    alias Loopctl.ApiSpec.RunnerContract.Limits
     alias Loopctl.ApiSpec.RunnerContract.RunnerTraceEvent
 
     # Referenced by `maxItems` below and enforced by `RunnerContract.cast_trace_batch/1`.

