@@ -158,7 +158,9 @@ defmodule Loopctl.Delivery.Placement do
 
   alias Loopctl.Auth.ApiKey
   alias Loopctl.Auth.Role
+  alias Loopctl.Delivery.ImplementerInput
   alias Loopctl.Delivery.Stages
+  alias Loopctl.Delivery.StoryPayload
   alias Loopctl.Dispatches
   alias Loopctl.Progress
   alias Loopctl.Runners
@@ -186,6 +188,10 @@ defmodule Loopctl.Delivery.Placement do
           | atom()
           | {:invalid, [String.t()]}
           | {:invalid_transition, map()}
+          | :story_not_accepted
+          | {:story_not_dispatchable, [String.t()]}
+          | {:story_no_longer_dispatchable, [String.t()]}
+          | {:escalation_failed, term(), [String.t()]}
 
   @doc """
   Claims `dispatch["story_id"]` for `runner_id` and pushes the dispatch to it.
@@ -193,9 +199,20 @@ defmodule Loopctl.Delivery.Placement do
   `dispatch` is a `RunnerDispatch` payload with STRING keys, exactly as
   `Loopctl.Runners.dispatch/3` takes one, except that it carries no `"claim_epoch"`: the epoch
   is not known until the claim commits, so any value under that key is REPLACED with the one
-  the claim produced. Everything else — `dispatch_id`, `story_id`, `kind`, the repo, the
-  branches, the wall clock, the story object — is the caller's and is validated by the
-  contract inside `Runners.dispatch/3`.
+  the claim produced. The `story` object is NOT the caller's either: a payload carrying one is
+  refused `:story_not_accepted`, and loopctl builds it from its own rows after the claim (see
+  `attach_story/6`). Everything else —
+  `dispatch_id`, `kind`, the repo, the branches, the wall clock — is the caller's and is
+  validated by the contract inside `Runners.dispatch/3`.
+
+  Three refusals come from the builder rather than from the caller's payload:
+  `{:story_not_dispatchable, violations}` means the story exceeds a contract cap and HAS BEEN
+  ESCALATED to a human (the claim is released, the stage row stays `escalated`);
+  `{:escalation_failed, reason, violations}` means it is neither dispatchable nor parked,
+  which is the outcome nothing downstream will pick up; and
+  `{:story_no_longer_dispatchable, violations}` is the RESUME's version — nothing was
+  written, the claim stands and the session under it is untouched, because a retry does not
+  own the claim it would be parking.
 
   The story must already be `contracted` (`Loopctl.Progress.contract_story/3`) and its stage
   row must be at `queued`. Both are checked BEFORE anything is minted, so the ordinary
@@ -259,7 +276,8 @@ defmodule Loopctl.Delivery.Placement do
           | {:error, error()}
   def place(tenant_id, runner_id, %{} = dispatch, opts)
       when is_binary(tenant_id) and is_binary(runner_id) do
-    with {:ok, dispatch_id} <- fetch_uuid(dispatch, "dispatch_id"),
+    with :ok <- no_caller_story(dispatch),
+         {:ok, dispatch_id} <- fetch_uuid(dispatch, "dispatch_id"),
          {:ok, story_id} <- fetch_uuid(dispatch, "story_id"),
          {:ok, caller} <- resolve_caller(tenant_id, Keyword.fetch!(opts, :api_key)),
          :ok <- not_halted(tenant_id),
@@ -270,6 +288,21 @@ defmodule Loopctl.Delivery.Placement do
         record -> resume(tenant_id, runner_id, dispatch, record)
       end
     end
+  end
+
+  # THE STORY OBJECT IS LOOPCTL'S TO BUILD, so a caller may not supply one. `attach_story/6`
+  # builds it from Postgres; a caller-supplied one would be prose handed to a runner one level
+  # along, which the contract's no-prompt rule exists to prevent — "a dispatch runs as the
+  # machine's user and a control plane able to hand a runner prose to execute is able to run
+  # anything on it".
+  #
+  # REFUSED rather than dropped, and refused HERE rather than only at the HTTP edge. The
+  # endpoint's own guard (`LoopctlWeb.DispatchPlacementController`) still answers with the
+  # better message, and this is what binds the callers that never touch it — a worker, an MCP
+  # tool, the unattended driver. A silently dropped object would have the caller believe the
+  # runner saw a story it never received.
+  defp no_caller_story(dispatch) do
+    if Map.has_key?(dispatch, "story"), do: {:error, :story_not_accepted}, else: :ok
   end
 
   # THE CALLER'S OWN LINEAGE AND ROLE, DERIVED FROM THE KEY IT AUTHENTICATED WITH — the same
@@ -312,14 +345,70 @@ defmodule Loopctl.Delivery.Placement do
     if Runners.custody_halted?(tenant_id), do: {:error, :tenant_halted}, else: :ok
   end
 
-  # A retry of a dispatch the ledger already holds. Nothing is claimed, minted or bumped: the
-  # placement already happened, and what is left is to put the frame on the wire again under
-  # the epoch the ORIGINAL claim produced. Pushing under a freshly read epoch instead would
-  # hand the runner a number its ledger row does not carry, and `record_sent/3` would refuse
-  # it as a `:dispatch_id_conflict`.
+  # A retry of a dispatch the ledger already holds. NOTHING IS CLAIMED, MINTED, BUMPED OR
+  # WRITTEN: the placement already happened, and what is left is to put the frame on the wire
+  # again under the epoch the ORIGINAL claim produced. Pushing under a freshly read epoch
+  # instead would hand the runner a number its ledger row does not carry, and `record_sent/3`
+  # would refuse it as a `:dispatch_id_conflict`.
+  #
+  # THE STORY OBJECT IS REBUILT HERE TOO, and leaving it out was the same defect this change
+  # exists to fix, left open on the retry path. The caller's map can never carry a `story` —
+  # `no_caller_story/1` refuses one — so a resume that pushed the caller's map verbatim pushed
+  # an implement dispatch with no story, which the runner refuses outright while this function
+  # answers `{:ok, ...}` as though work had been placed. And the retry is the ORDINARY path: a
+  # lost HTTP response, a failed broadcast or a dropped frame all leave the ledger row at
+  # `sent`, which is exactly what routes a re-send here.
+  #
+  # BUILT WITH THE PURE BUILDER, NOT `StoryPayload.build/3`, and that is the whole difference
+  # between this path and the claim path. `build/3` ESCALATES an undispatchable story — a
+  # stage transition and a chain entry — which is right where the caller owns the claim it is
+  # parking, and wrong here for three reasons this path cannot escape:
+  #
+  #   * the ledger's fences (`:dispatch_already_replied`, `:stale_claim_epoch`) live inside
+  #     `record_sent/3`, which a resume does not reach until the PUSH — so a duplicate retry of
+  #     an ALREADY-ANSWERED dispatch, or one whose claim has since been released and the story
+  #     re-placed, would have written an escalation over a story that is live under somebody
+  #     else's claim, and answered 422 or 500 where the pre-change code answered a fence;
+  #   * the escalation would be attributed to a dispatch this call did not mint and does not
+  #     own, or refused for want of a lineage it has no business resolving;
+  #   * a resume that escalated but did not release would leave the story `escalated` AND
+  #     claimed, with a live key and a ticking lease, while the refusal told the operator the
+  #     claim had gone back.
+  #
+  # So a story that no longer fits the contract is REFUSED here and nothing is written. The
+  # claim stands, the session under it is untouched, and the next placement through the claim
+  # path is what parks the story — with the fences applied first, where they belong.
   defp resume(tenant_id, runner_id, dispatch, record) do
-    payload = Map.put(dispatch, "claim_epoch", record.claim_epoch)
+    with {:ok, payload} <- resume_payload(tenant_id, dispatch, record) do
+      push_resumed(tenant_id, runner_id, payload, record)
+    end
+  end
 
+  defp resume_payload(tenant_id, dispatch, record) do
+    with {:ok, story} <- Stories.get_story(tenant_id, record.story_id),
+         {:ok, dispatch} <- rebuild_story(dispatch, story) do
+      {:ok, Map.put(dispatch, "claim_epoch", record.claim_epoch)}
+    end
+  end
+
+  # `ImplementerInput.story_object/2` is the pure half of `StoryPayload.build/3` — the same
+  # allowlist and the same caps, with no database write of any kind. Non-implement kinds carry
+  # no story object at all, exactly as on the claim path.
+  defp rebuild_story(dispatch, story) do
+    if Map.get(dispatch, "kind") == "implement" do
+      case ImplementerInput.story_object(story) do
+        {:ok, object} ->
+          {:ok, Map.put(dispatch, "story", object)}
+
+        {:error, {:story_not_dispatchable, violations}} ->
+          {:error, {:story_no_longer_dispatchable, violations}}
+      end
+    else
+      {:ok, dispatch}
+    end
+  end
+
+  defp push_resumed(tenant_id, runner_id, payload, record) do
     case Runners.dispatch(tenant_id, runner_id, payload) do
       :ok ->
         {:ok,
@@ -426,6 +515,7 @@ defmodule Loopctl.Delivery.Placement do
       )
 
     with {:ok, _row} <- advance,
+         {:ok, dispatch} <- attach_story(tenant_id, dispatch, story, session, epoch, opts),
          :ok <- Runners.dispatch(tenant_id, runner_id, Map.put(dispatch, "claim_epoch", epoch)) do
       {:ok,
        %{
@@ -440,6 +530,42 @@ defmodule Loopctl.Delivery.Placement do
         # `undo_claim/5` for why leaving the id behind is worse than leaving it unrevoked.
         undo_claim(tenant_id, story.id, session, reason, opts)
         {:error, reason}
+    end
+  end
+
+  # THE STORY OBJECT, BUILT HERE, WHICH IS THE ONLY PLACE IT CAN BE BUILT.
+  #
+  # An `implement` dispatch carries the story as TYPED FIELDS and never a prompt — the runner
+  # composes its own from them — so a dispatch with no `story` names a `story_id` and carries
+  # no work at all. The runner implementation refuses it outright ("the dispatch carries no
+  # story"), before composing anything, and does so identically on every redispatch: a clean,
+  # permanent, invisible no. Both callers of `place/4` sent exactly that until now — the
+  # operator endpoint refuses a CALLER-supplied object (rightly: a caller able to hand a
+  # runner prose is able to run anything on that machine) and nothing built a server-side one.
+  #
+  # AFTER THE CLAIM, not before, and that is forced rather than chosen. A story loopctl
+  # cannot describe within the contract's caps is ESCALATED rather than truncated, and
+  # `:session_escalated` leaves the in-flight stages only — at `queued` there is no edge, so
+  # the same refusal before the claim could not park the story and would leave it to be
+  # refused identically by every later pass.
+  #
+  # A refusal here therefore reaches the `else` below, and `undo_claim/5` does the right thing
+  # with an escalated row rather than fighting it: `Stages.follow_release/5` REQUEUES only an
+  # in-flight row and REBINDS anything else, so an escalated row keeps its stage and takes the
+  # new epoch. The claim goes back, the session dispatch is revoked, and the story stays where
+  # `StoryPayload.build/3` put it — with a human.
+  defp attach_story(tenant_id, dispatch, story, session, epoch, opts) do
+    if Map.get(dispatch, "kind") == "implement" do
+      case StoryPayload.build(tenant_id, story.id,
+             claim_epoch: epoch,
+             actor_lineage: session.lineage_path,
+             actor_label: Keyword.get(opts, :actor_label, "control:dispatch")
+           ) do
+        {:ok, object} -> {:ok, Map.put(dispatch, "story", object)}
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:ok, dispatch}
     end
   end
 
