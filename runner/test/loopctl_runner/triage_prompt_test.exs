@@ -28,7 +28,7 @@ defmodule LoopctlRunner.TriagePromptTest do
       TriagePrompt.build(
         Map.merge(@triage, overrides),
         "mkreyman/home_care_billing",
-        Keyword.put_new(opts, :token, "T0KEN")
+        opts |> Keyword.put_new(:token, "T0KEN") |> Keyword.put_new(:escalate_token, "3SC4L4T3")
       )
 
   defp build_with_lenses(overrides \\ %{}),

@@ -43,6 +43,10 @@ defmodule LoopctlRunner.TriagePrompt do
     # prompt forbids `loop-escalate` for a report it can judge, so the run would produce nothing.
     lenses = Keyword.get(opts, :lenses, [])
     token = Keyword.fetch!(opts, :token)
+    # Its own token, because the two commands are gated separately: minting an escalate token
+    # ARMS the check in `loop-escalate`, so a prompt that showed the verdict's would have the
+    # session refused every time it tried to say it could not work at all.
+    escalate_token = Keyword.fetch!(opts, :escalate_token)
 
     """
     You are triaging one reported problem for #{repo}, unattended, in a read-only checkout.
@@ -93,7 +97,7 @@ defmodule LoopctlRunner.TriagePrompt do
     for a session that cannot work at all — a checkout that will not read, tools that will not
     run — and it ENDS the run with no verdict. It takes your token too:
 
-        #{escalate_script()} #{token} <<'ESCALATION'
+        #{escalate_script()} #{escalate_token} <<'ESCALATION'
         <why this session cannot work at all>
         ESCALATION
 

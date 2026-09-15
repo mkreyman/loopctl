@@ -78,7 +78,7 @@ defmodule LoopctlRunner.TriageVerdict do
     else
       {:error, reason} ->
         File.rm(path)
-        {:error, "the verdict token could not be written: #{:file.format_error(reason)}"}
+        {:error, "#{name} could not be written: #{:file.format_error(reason)}"}
     end
   end
 
@@ -91,7 +91,8 @@ defmodule LoopctlRunner.TriageVerdict do
 
   `{:error, :none}` is the ordinary end of a run whose session stated nothing.
   """
-  @spec read(String.t()) :: {:ok, verdict()} | {:error, :none} | {:error, String.t()}
+  @spec read(String.t()) ::
+          {:ok, verdict()} | {:error, :none} | {:error, {:invalid | :unreadable, String.t()}}
   def read(run_dir) do
     path = file(run_dir)
 
@@ -103,17 +104,23 @@ defmodule LoopctlRunner.TriageVerdict do
         {:error, :none}
 
       {:error, reason} ->
-        {:error, "the verdict file could not be read: #{:file.format_error(reason)}"}
+        # The runner's problem, not the session's: blaming the session for a mode change or a
+        # failing volume would report a verdict it never wrote badly.
+        {:error,
+         {:unreadable, "the verdict file could not be read: #{:file.format_error(reason)}"}}
     end
   end
 
   defp decode(body) do
     case Jason.decode(body) do
-      {:ok, verdict} when is_map(verdict) -> validate(verdict)
-      {:ok, other} -> {:error, "the verdict is #{type_of(other)}, not a JSON object"}
-      {:error, _} -> {:error, "the verdict is not valid JSON"}
+      {:ok, verdict} when is_map(verdict) -> invalid(validate(verdict))
+      {:ok, other} -> {:error, {:invalid, "the verdict is #{type_of(other)}, not a JSON object"}}
+      {:error, _} -> {:error, {:invalid, "the verdict is not valid JSON"}}
     end
   end
+
+  defp invalid({:error, reason}) when is_binary(reason), do: {:error, {:invalid, reason}}
+  defp invalid(result), do: result
 
   @doc "Validates a verdict against the contract, its conditional shape and the byte rule."
   @spec validate(verdict()) :: {:ok, verdict()} | {:error, String.t()}

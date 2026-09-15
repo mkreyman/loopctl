@@ -54,6 +54,22 @@ detach() {
 
 init='{"type":"system","subtype":"init","session_id":"'"$sid"'","model":"fake","cwd":"'"$here"'","permissionMode":"auto"}'
 
+# A triage run's session states its verdict by running the verdict command with the token its
+# PROMPT carries — which is the whole point of the token, so the fake finds it the same way a
+# session would: in the prompt it was given, never in the environment.
+if [ -n "${FAKE_VERDICT:-}" ]; then
+    prompt=${*: -1}
+    token=$(printf '%s' "$prompt" | grep -oE 'loop-verdict [A-Za-z0-9_-]+' | head -1 | cut -d' ' -f2)
+    script=$(printf '%s' "$prompt" | grep -oE '/[^ ]*loop-verdict' | head -1)
+    printf '%s' "$FAKE_VERDICT" | "$script" "$token" > /dev/null 2>&1 || true
+fi
+
+if [ -n "${FAKE_ESCALATE:-}" ]; then
+    prompt=${*: -1}
+    escalate=$(printf '%s' "$prompt" | grep -oE '/[^ ]*loop-escalate [A-Za-z0-9_-]+' | head -1)
+    printf '%s' "$FAKE_ESCALATE" | $escalate > /dev/null 2>&1 || true
+fi
+
 case "${FAKE_CLAUDE_MODE:-stream}" in
     stream)
         echo "$init"

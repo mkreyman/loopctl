@@ -17,6 +17,80 @@ defmodule LoopctlRunner.TriageToolsTest do
     |> Enum.map(fn [_name, value] -> value end)
   end
 
+  test "an argv missing any containment flag is refused at launch" do
+    # Before the seam every launch went through claude_args/3, which pins these. A supplied argv
+    # that omits one launches an unattended session with the operator's settings, hooks, plugins
+    # and MCP servers — and nothing else in Session would notice.
+    for {flag, _} <- [
+          {"--setting-sources", ""},
+          {"--permission-mode", "dontAsk"},
+          {"--disallowedTools", "mcp__*"},
+          {"--mcp-config", ""},
+          # The values of these two are the run type's own, so the guard pins only their
+          # presence — and their absence is not cosmetic: without --tools the session's pool
+          # goes back to Agent, Workflow, Skill, SendMessage, WebFetch and every plugin tool
+          # (--disallowedTools mcp__* covers only the MCP half), and without --max-turns an
+          # unattended session has no turn ceiling at all.
+          {"--tools", ""},
+          {"--max-turns", ""}
+        ] do
+      argv =
+        TriageTools.claude_args("p", "the-id", TriagePrompt.system_prompt(), max_turns: 5)
+        |> drop_flag(flag)
+
+      assert {:session_start_failed, {%ArgumentError{message: message}, _}} =
+               catch_exit(launch(argv, "the-id"))
+
+      assert message =~ flag, "#{flag} was not required"
+    end
+  end
+
+  defp drop_flag(argv, flag) do
+    index = Enum.find_index(argv, &(&1 == flag))
+    List.delete_at(List.delete_at(argv, index), index)
+  end
+
+  defp launch(argv, session_id) do
+    story = %LoopctlRunner.Story{
+      id: "t",
+      repo: "r",
+      repo_path: "/tmp",
+      base: "main",
+      branch: "loop/t",
+      prompt: "p",
+      wall_clock_s: 60,
+      max_turns: 5
+    }
+
+    root = LoopctlRunner.TestSupport.tmp_dir!("argv")
+
+    LoopctlRunner.Session.run(
+      config: LoopctlRunner.TestSupport.config!(root),
+      story: story,
+      worktree: root,
+      run_dir: LoopctlRunner.TestSupport.tmp_dir!("argv-run"),
+      trace: self(),
+      parent: nil,
+      session_id: session_id,
+      argv: argv
+    )
+  end
+
+  test "an argv whose session id is not the session's is refused at launch" do
+    # LOOP_SESSION_ID, the process-group marker and the liveness transcript check are keyed to the
+    # id the Session tracks; an argv running under a different one makes a healthy session look
+    # parked, and the runner then terminates it.
+    argv = TriageTools.claude_args("p", "another-id", TriagePrompt.system_prompt(), max_turns: 5)
+
+    # The guard raises inside Session.init, which the GenServer turns into a start failure. The
+    # run directory is this test's own: Session writes state and stdout before the guard runs.
+    assert {:session_start_failed, {%ArgumentError{message: message}, _}} =
+             catch_exit(launch(argv, "the-tracked-id"))
+
+    assert message =~ "--session-id"
+    assert message =~ "the-tracked-id"
+  end
+
   test "the escalate command the system prompt names is one the session may run" do
     # Shipping the instruction without the rule would deny it silently under dontAsk: no
     # escalation line, no verdict, and a run that grinds to its turn limit.

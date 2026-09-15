@@ -94,14 +94,36 @@ defmodule LoopctlRunner.TriageVerdictTest do
       assert {:ok, %{"outcome" => "escalate"}} = TriageVerdict.read(run_dir)
     end
 
-    test "bytes that are not a verdict say so rather than being sent", %{run_dir: run_dir} do
+    test "bytes that are not a verdict say so, tagged as the SESSION's mistake", %{
+      run_dir: run_dir
+    } do
+      # :invalid is the session's — it wrote something that is not a verdict. A read failure is
+      # the runner's, and conflating them would report an operator's failing volume as a bad
+      # verdict the session never wrote.
       File.write!(TriageVerdict.file(run_dir), "I think this is a bug, probably")
-      assert TriageVerdict.read(run_dir) == state("the verdict is not valid JSON")
+      assert TriageVerdict.read(run_dir) == {:error, {:invalid, "the verdict is not valid JSON"}}
 
       File.write!(TriageVerdict.file(run_dir), ~s(["story"]))
 
       assert TriageVerdict.read(run_dir) ==
-               state("the verdict is a JSON array, not a JSON object")
+               {:error, {:invalid, "the verdict is a JSON array, not a JSON object"}}
+
+      File.write!(TriageVerdict.file(run_dir), ~s({"outcome":"story","confidence":"high"}))
+      assert {:error, {:invalid, reason}} = TriageVerdict.read(run_dir)
+      assert reason =~ "carries no draft story"
+    end
+
+    test "a verdict the runner cannot READ is the runner's problem, not the session's", %{
+      run_dir: run_dir
+    } do
+      path = TriageVerdict.file(run_dir)
+      File.write!(path, ~s({"outcome":"escalate","confidence":"high"}))
+      File.chmod!(path, 0o000)
+
+      on_exit(fn -> File.chmod(path, 0o600) end)
+
+      assert {:error, {:unreadable, reason}} = TriageVerdict.read(run_dir)
+      assert reason =~ "could not be read"
     end
   end
 

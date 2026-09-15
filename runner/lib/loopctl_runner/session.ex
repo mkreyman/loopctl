@@ -48,8 +48,9 @@ defmodule LoopctlRunner.Session do
   @doc """
   Runs the session to completion and returns its result.
 
-  Options: `:config`, `:story`, `:worktree`, `:run_dir`, `:trace`, `:system_prompt` (what
-  `--append-system-prompt` carries; the implement session's escalation prompt by default),
+  Options: `:config`, `:story`, `:worktree`, `:run_dir`, `:trace`, `:argv` (the whole argv, for a
+  run with its own contained set), `:system_prompt` (what `--append-system-prompt` carries on the
+  default argv; the implement session's escalation prompt),
   `:parent` (the run's
   trace seq), and optionally `:session_id` and `:env` (extra `{name, value}` pairs).
   """
@@ -138,6 +139,82 @@ defmodule LoopctlRunner.Session do
   @spec file_rules() :: [String.t()]
   def file_rules, do: @file_rules
 
+  # The argv a run wants. `:argv` is the seam a run with a different contained set uses — a
+  # triage run passes `LoopctlRunner.TriageTools.claude_args/4`'s result, which has its own tools,
+  # its own rules and the lens definitions. Without it this module would be the only launcher and
+  # every run would get the implement session's containment, silently.
+  defp argv(story, session_id, opts) do
+    case Keyword.get(opts, :argv) do
+      nil ->
+        claude_args(story, session_id, Keyword.get(opts, :system_prompt, escalation_prompt()))
+
+      argv when is_list(argv) ->
+        checked(argv, session_id)
+    end
+  end
+
+  # Every launch used to go through `claude_args/3`, which pins the containment. A supplied argv
+  # is checked for the same flags rather than trusted to repeat them: one missing
+  # `--setting-sources` launches an unattended session with the operator's settings, hooks,
+  # plugins and MCP servers, and nothing else in this module would notice. The session id is
+  # checked by VALUE — an argv that merely mentions it (in the prompt, in the agents JSON) while
+  # omitting the flag leaves the CLI generating its own, and the marker, LOOP_SESSION_ID and the
+  # liveness transcript then key to an id nothing runs under: a healthy session reads as parked,
+  # and the runner terminates it.
+  @required_argv %{
+    "--session-id" => :session_id,
+    "--permission-mode" => "dontAsk",
+    "--permission-prompts" => "none",
+    "--setting-sources" => "",
+    "--mcp-config" => ~s({"mcpServers":{}}),
+    "--disallowedTools" => "mcp__*"
+  }
+
+  # Pinned to a VALUE above; these two are pinned only to being there, because their values are
+  # the run type's own — a triage session's tool pool is not an implement session's. Missing
+  # `--max-turns` leaves an unattended session with no turn ceiling at all, and missing `--tools`
+  # hands its pool back Agent, Workflow, Skill, SendMessage, WebFetch and every plugin tool
+  # (`--disallowedTools mcp__*` covers only the MCP half).
+  @required_present ~w(--tools --max-turns)
+
+  defp checked(argv, session_id) do
+    unless "--strict-mcp-config" in argv do
+      raise ArgumentError, "a session's argv must carry --strict-mcp-config"
+    end
+
+    Enum.each(@required_present, fn flag ->
+      case value_after(argv, flag) do
+        value when is_binary(value) and value != "" ->
+          :ok
+
+        other ->
+          raise ArgumentError, "a session's argv must carry #{flag}, got #{inspect(other)}"
+      end
+    end)
+
+    Enum.each(@required_argv, fn {flag, expected} ->
+      expected = if expected == :session_id, do: session_id, else: expected
+
+      case value_after(argv, flag) do
+        ^expected ->
+          :ok
+
+        other ->
+          raise ArgumentError,
+                "a session's argv must carry #{flag} #{inspect(expected)}, not #{inspect(other)}"
+      end
+    end)
+
+    argv
+  end
+
+  defp value_after(argv, flag) do
+    case Enum.find_index(argv, &(&1 == flag)) do
+      nil -> nil
+      index -> Enum.at(argv, index + 1)
+    end
+  end
+
   @doc """
   The argv handed to claude-headless.sh.
 
@@ -201,11 +278,7 @@ defmodule LoopctlRunner.Session do
         :binary,
         :exit_status,
         cd: worktree,
-        args: [
-          stderr_log,
-          config.claude_launcher
-          | claude_args(story, session_id, Keyword.get(opts, :system_prompt, escalation_prompt()))
-        ],
+        args: [stderr_log, config.claude_launcher | argv(story, session_id, opts)],
         env: port_env(run_dir, session_id, config, Keyword.get(opts, :env, []))
       ])
 
