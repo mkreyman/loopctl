@@ -103,6 +103,62 @@ defmodule LoopctlWeb.RouteDiscoveryControllerTest do
                inspect(MapSet.to_list(missing))
     end
 
+    # The FOURTH closed set, and the one that shipped broken: #874 merged five intake routes
+    # and added no row here, so on release 671 GET /api/v1/routes returned 184 routes with
+    # not one of them. That is the reachability failure CLAUDE.md's "an operator-facing
+    # endpoint is NOT DONE until an MCP tool calls it" section names, one layer out — the
+    # tools existed, the discovery surface a session reads to FIND them did not. A loop with
+    # no intake source has no input, so an undiscoverable enrolment route is the difference
+    # between a delivery loop and a queue nobody can feed.
+    #
+    # PUT is excluded where its PATCH twin is indexed: `resources ... only: [:update]`
+    # generates both for one action, the MCP tool and the docs both name PATCH, and a second
+    # row for the same endpoint would be noise in a hand-curated index. A PUT-only route
+    # would still be required, so this cannot hide a whole endpoint.
+    test "every /api/v1/intake route in the router appears in the curated index" do
+      indexed =
+        LoopctlWeb.RouteDiscoveryController.curated_routes()
+        |> Enum.map(&{&1.method, &1.path})
+        |> MapSet.new()
+
+      router_intake =
+        LoopctlWeb.Router.__routes__()
+        |> Enum.filter(&String.starts_with?(&1.path, "/api/v1/intake"))
+        |> Enum.map(&{verb_string(&1.verb), &1.path})
+        |> Enum.reject(fn {method, path} ->
+          method == "PUT" and MapSet.member?(indexed, {"PATCH", path})
+        end)
+        |> MapSet.new()
+
+      assert MapSet.size(router_intake) > 0,
+             "the filter matched nothing — it has drifted from the router's shape and this " <>
+               "test is now vacuous"
+
+      missing = MapSet.difference(router_intake, indexed)
+
+      assert MapSet.equal?(missing, MapSet.new()),
+             "GitHub-intake routes missing from the curated /routes index: " <>
+               inspect(MapSet.to_list(missing))
+    end
+
+    # The create row is the one a session acts on, and two of its facts are the expensive
+    # ones to learn by probing: a dispatch-minted key can never call it however privileged
+    # it is, and the webhook secret is returned once and is then unrecoverable. Asserted on
+    # the text because the text is what the agent reads.
+    test "the intake enrolment row names the unlineaged-caller gate and the one-shot secret" do
+      row =
+        Enum.find(
+          LoopctlWeb.RouteDiscoveryController.curated_routes(),
+          &(&1.method == "POST" and &1.path == "/api/v1/intake/sources")
+        )
+
+      assert row, "POST /api/v1/intake/sources is not in the curated index"
+      assert row.description =~ "api_key_mint_forbidden"
+      assert row.description =~ ~r/UNLINEAGED/
+      assert row.description =~ ~r/EXACTLY ONCE/
+      assert row.description =~ "intake_source_enroll"
+    end
+
     test "every path in the curated index actually exists in the router" do
       router_paths =
         LoopctlWeb.Router.__routes__() |> Enum.map(& &1.path) |> MapSet.new()

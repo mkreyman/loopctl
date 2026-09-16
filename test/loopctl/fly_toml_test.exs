@@ -12,6 +12,9 @@ defmodule Loopctl.FlyTomlTest do
 
   use ExUnit.Case, async: true
 
+  alias Loopctl.Delivery.DispatchDriver
+  alias Loopctl.Runners.Capacity
+
   # Defaults of the dependencies whose own shutdown follows the socket drain, used unless
   # config sets them: ThousandIsland's `shutdown_timeout` and Oban's `shutdown_grace_period`.
   @bandit_shutdown_ms 15_000
@@ -129,6 +132,91 @@ defmodule Loopctl.FlyTomlTest do
              ) == may_suspend?,
              "auto_stop_machines=#{inspect(http["auto_stop_machines"])}, " <>
                "min_machines_running=#{min_running}, EXPECTED_APP_NODES=#{expected_nodes}"
+    end
+  end
+
+  describe "unattended dispatch driver budgets" do
+    # #803: the deployed budget must be one `DispatchDriver.normalise_budget/2` ACCEPTS —
+    # that function is where the runner contract's own ceiling
+    # (`RunnerContract.RunnerDispatch.max_wall_clock_seconds/0`) is read. Over it, nothing is
+    # refused per dispatch: the budget read fails before the pass runs, so both workers
+    # `{:cancel, ...}` every minute and the driver reads as enabled while placing nothing,
+    # visible only in a per-minute ERROR log nobody watches. Lowering the contract maximum
+    # below a deployed wall clock is the edit that does it.
+    for {var, key} <- [
+          {"DISPATCH_WALL_CLOCK_SECONDS", :dispatch_wall_clock_seconds},
+          {"DISPATCH_MAX_TURNS", :dispatch_max_turns},
+          {"TRIAGE_WALL_CLOCK_SECONDS", :triage_wall_clock_seconds},
+          {"TRIAGE_MAX_TURNS", :triage_max_turns}
+        ] do
+      test "#{var} is inside the bound DispatchDriver enforces" do
+        value = env_table("fly.toml")[unquote(var)]
+        assert value, "#{unquote(var)} is not set in [env]"
+        assert {budget, ""} = Integer.parse(value)
+
+        assert DispatchDriver.normalise_budget(budget, unquote(key)) ==
+                 {:ok, budget},
+               "#{unquote(var)}=#{budget} is outside the contract bound for #{unquote(key)}"
+      end
+    end
+
+    # The block's subject is declared cost policy, and this was the one value in it with
+    # nothing behind it: set to "99" the whole suite stayed green. Two arms, because the two
+    # ways to get it wrong fail in OPPOSITE directions and neither says anything at boot.
+    #
+    # ARM 1 — the value must be one `config/runtime.exs:161-168` ACCEPTS. That guard is
+    # `{sessions, ""} when sessions > 0` and silently leaves the default on anything else, so
+    # "0", "two" or a stray "2 " reads as UNSET and RAISES the fleet ceiling to the code
+    # default with nothing logged. Mirrored here rather than called because this variable has
+    # no parser of its own (unlike EXPECTED_APP_NODES / CLUSTER_PEERS_MAY_SUSPEND above); if
+    # the runtime guard ever loosens, this test is merely stricter than production, which is
+    # the safe direction.
+    #
+    # ARM 2 — it may never exceed what NOT SETTING IT would give. This line exists to LOWER
+    # the tenant-wide ceiling below the code default; a value above it silently buys more
+    # concurrency, and therefore more spend, than deleting the line entirely. Bounded by
+    # `Capacity.limit/0` read live rather than by a literal, so 1..default all pass and the
+    # policy can rise as the comment in fly.toml says it should — raising it past the default
+    # means editing `@default_limit`, which is the deliberate act this is asking for. A bare
+    # `<= 2` would freeze today's caution and train people to edit assertions instead.
+    test "RUNNER_MAX_IN_FLIGHT_SESSIONS is accepted by runtime.exs and never raises the default" do
+      value = env_table("fly.toml")["RUNNER_MAX_IN_FLIGHT_SESSIONS"]
+      assert value, "RUNNER_MAX_IN_FLIGHT_SESSIONS is not set in [env]"
+
+      assert {sessions, ""} = Integer.parse(value),
+             "#{inspect(value)} is not a bare integer, so runtime.exs silently ignores it " <>
+               "and the code default applies"
+
+      assert sessions > 0,
+             "#{sessions} is not positive, so runtime.exs silently ignores it and the code " <>
+               "default applies"
+
+      refute Application.get_env(:loopctl, :runner_max_in_flight_sessions),
+             "the test environment now configures this key, so Capacity.limit/0 below is no " <>
+               "longer the CODE default and this bound has quietly moved"
+
+      assert sessions <= Capacity.limit(),
+             "#{sessions} is above the code default #{Capacity.limit()}, so " <>
+               "this line RAISES the fleet ceiling instead of lowering it — deleting it " <>
+               "entirely would cost less"
+    end
+
+    # The invariant the deployed lease exists to hold: the runner hard-kills a session at
+    # DISPATCH_WALL_CLOCK_SECONDS, so a lease ABOVE that (plus teardown grace) can never
+    # release work an agent is still implementing. Inverted, `ReclaimExpiredClaimsWorker`
+    # force-unclaims live sessions and the duplicate-work race a claim exists to prevent is
+    # back — with nothing in the logs, because releasing a claim is a normal event.
+    test "STORY_CLAIM_LEASE_SECONDS outlasts the wall clock the runner kills a session at" do
+      env = env_table("fly.toml")
+
+      assert lease_value = env["STORY_CLAIM_LEASE_SECONDS"]
+      assert wall_clock_value = env["DISPATCH_WALL_CLOCK_SECONDS"]
+
+      lease = String.to_integer(lease_value)
+      wall_clock = String.to_integer(wall_clock_value)
+
+      assert lease > wall_clock,
+             "claim lease #{lease}s does not outlast the #{wall_clock}s dispatch wall clock"
     end
   end
 end
