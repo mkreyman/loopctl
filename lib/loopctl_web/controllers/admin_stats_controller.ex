@@ -20,7 +20,13 @@ defmodule LoopctlWeb.AdminStatsController do
 
   operation(:show,
     summary: "System-wide stats (admin)",
-    description: "Returns system-wide aggregate statistics. Requires superadmin.",
+    description:
+      "Returns system-wide aggregate statistics. Requires superadmin. " <>
+        "`total_api_keys` counts keys that can AUTHENTICATE right now: neither revoked nor " <>
+        "past `expires_at`. It tested revocation alone until 846.8, so it included every " <>
+        "expired-but-unrevoked key — a set that never empties, because " <>
+        "RevokeExpiredApiKeysWorker deliberately leaves user/superadmin keys and any key " <>
+        "with no agent un-revoked.",
     responses: %{
       200 =>
         {"System stats", "application/json",

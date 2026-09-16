@@ -916,6 +916,55 @@ defmodule LoopctlWeb.FallbackController do
   end
 
   # #803: the delivery stage machine refusing the TRANSITION a caller asked for. Distinct
+  # `Progress.force_unclaim_story/3`'s own 500, NAMED rather than left to the last clause.
+  # Two endpoints return it — `POST /stories/:id/force-unclaim` and
+  # `POST /stories/:id/stage/resolve`, whose `:queued` path releases the claim first — and
+  # without a clause here both answered a bare `internal_error` while the last clause logged
+  # "add a clause, or map it in the controller" on every occurrence. It is a known shape with
+  # a known remedy, so it says so: the release rolled back whole, the story is untouched, and
+  # re-running the call is the right next move.
+  def call(conn, {:error, :force_unclaim_failed}) do
+    conn
+    |> put_status(:internal_server_error)
+    |> json(%{
+      error: %{
+        status: 500,
+        code: "force_unclaim_failed",
+        message:
+          "The release rolled back at a step that is not supposed to be able to refuse. " <>
+            "The story is UNCHANGED — still claimed, still held — and nothing was written. " <>
+            "The cause is logged server-side with the step name. Re-run this call."
+      }
+    })
+  end
+
+  # `Loopctl.Delivery.Escalations.resolve/3`'s own refusal when the requested target is not a
+  # stage `:human_resolution` can reach. It is DECLARED in that module's public `@type
+  # error()` and had no clause here, so rendering it raised `FunctionClauseError` — the exact
+  # shape the last-clause note below says it deliberately does not absorb, which is right for
+  # an UNDECLARED shape and wrong for a declared one (846.8 review round 2).
+  #
+  # Unreachable over HTTP today: `StoryEscalationController.resolution_target/1` admits only
+  # `queued`, `done` and `failed`, and `StageMachine`'s `@human_resolution` has an edge to all
+  # three. So this is for a direct caller and for the day that enum and that table disagree —
+  # which is precisely when a raise would be least welcome.
+  #
+  # 422, not 409: the request is well formed and the story is genuinely escalated; what is
+  # wrong is the VALUE asked for.
+  def call(conn, {:error, {:unresolvable_target, to}}) do
+    conn
+    |> put_status(:unprocessable_entity)
+    |> json(%{
+      error: %{
+        status: 422,
+        code: "unresolvable_target",
+        message:
+          "There is no human resolution from `escalated` to `#{inspect(to)}`. Resolve to " <>
+            "queued, done or failed. Nothing was written."
+      }
+    })
+  end
+
   # from `{:invalid_transition, ctx}` above, which is the story lifecycle's and carries the
   # statuses it would have moved between; this one is bare because the stage machine's table
   # is a fixed triple and the caller already knows the one it sent.

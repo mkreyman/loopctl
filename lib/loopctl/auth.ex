@@ -142,26 +142,80 @@ defmodule Loopctl.Auth do
     end
   end
 
-  # Uncached DB read of the ACTIVE (non-revoked, non-expired) api_key for a hash,
-  # with :tenant preloaded (custody_halted_at). Mirrors the guards that make a
-  # cache HIT safe to re-enforce in `valid_now?/1`.
-  defp load_active_api_key(key_hash) do
-    query =
-      from ak in ApiKey,
-        where: ak.key_hash == ^key_hash,
-        where: is_nil(ak.revoked_at),
-        where: is_nil(ak.expires_at) or ak.expires_at > ^DateTime.utc_now(),
-        preload: [:tenant]
+  @doc """
+  Query over the api_keys that can AUTHENTICATE right now: not revoked, and not past
+  `expires_at`.
 
-    AdminRepo.one(query)
+  THE ONE DEFINITION OF "ACTIVE", and since 846.8's second review round it is one in the
+  code and not only in this sentence: `load_active_api_key/1` below — the read a request is
+  actually judged by — COMPOSES over this query instead of restating its clauses, and
+  `valid_now?/1`, which re-enforces the same rule on a cache hit and cannot be expressed as
+  a query at all, is held against it row by row in
+  `test/loopctl/auth/active_key_definition_test.exs`. A counter testing `revoked_at IS NULL` alone
+  answers a different question and overstates the live surface by every expired-but-unrevoked
+  row — a set that never drains, because `Loopctl.Workers.RevokeExpiredApiKeysWorker`
+  deliberately never revokes a `user`/`superadmin` key nor any key with a NULL `agent_id`
+  (revoking those destroys the rotate path and frees no
+  `api_keys_one_role_per_agent_idx` slot). Callers: `Loopctl.Tenants`' `active_api_keys/0`
+  behind the two admin counts, and `Loopctl.Knowledge.Analytics.get_agent_usage/3`'s
+  `api_key_count` and `top_articles`.
+
+  Composable and selects nothing, so a caller adds its own scoping and shape:
+
+      from(k in Auth.active_api_keys_query(), where: k.tenant_id == ^tid, select: count(k.id))
+
+  `now` is bound when the query is BUILT, matching `load_active_api_key/1`. The alternative,
+  `fragment("now()")`, is TRANSACTION time in PostgreSQL, which would make an expiry boundary
+  depend on how long a surrounding transaction had been open.
+
+  Not usable as an index predicate, and that is the whole reason the two notions can diverge:
+  a partial-index predicate must be IMMUTABLE and `now()` is STABLE, so
+  `api_keys_one_role_per_agent_idx` can only test revocation.
+  """
+  @spec active_api_keys_query() :: Ecto.Query.t()
+  def active_api_keys_query do
+    now = DateTime.utc_now()
+
+    from(ak in ApiKey,
+      where: is_nil(ak.revoked_at),
+      where: is_nil(ak.expires_at) or ak.expires_at > ^now
+    )
   end
 
-  # Re-enforces the SQL WHERE guards on a cache HIT: active iff not revoked AND
-  # (no expiry OR expiry still in the future).
-  defp valid_now?(%ApiKey{revoked_at: revoked_at}) when not is_nil(revoked_at), do: false
-  defp valid_now?(%ApiKey{expires_at: nil}), do: true
+  # Uncached DB read of the ACTIVE api_key for a hash, with :tenant preloaded
+  # (custody_halted_at).
+  #
+  # COMPOSED over `active_api_keys_query/0` rather than restating its two WHERE clauses
+  # (846.8 review round 2). That function is documented as THE ONE DEFINITION and this is the
+  # predicate it claims to be the definition OF, so a copy here made the claim false the
+  # moment either moved — on the one path where being wrong means a dead key authenticating.
+  # All this adds is the hash and the preload.
+  defp load_active_api_key(key_hash) do
+    from(ak in active_api_keys_query(), where: ak.key_hash == ^key_hash, preload: [:tenant])
+    |> AdminRepo.one()
+  end
 
-  defp valid_now?(%ApiKey{expires_at: expires_at}),
+  @doc """
+  Whether an api_key STRUCT can authenticate right now: not revoked, and not past its expiry.
+
+  THE IN-MEMORY TWIN of `active_api_keys_query/0`, and the two must answer identically for
+  every row. This one exists because a cache HIT never ran the SQL — `verify_api_key/1`
+  re-enforces the guards here before trusting a cached struct — so the definition genuinely
+  has to exist in both an Ecto and an Elixir encoding, and there is no expression both can
+  share.
+
+  Public for exactly one reason: that makes them holdable against each other.
+  `test/loopctl/auth/active_key_definition_test.exs` asserts, over the four boundary shapes
+  (revoked, expired, expiring in the future, never expiring), that membership in
+  `active_api_keys_query/0` equals this function's answer AND equals whether
+  `verify_api_key/1` succeeds. Before that, "the one definition" was a sentence in a
+  `@doc` with nothing making the three fail together.
+  """
+  @spec valid_now?(ApiKey.t()) :: boolean()
+  def valid_now?(%ApiKey{revoked_at: revoked_at}) when not is_nil(revoked_at), do: false
+  def valid_now?(%ApiKey{expires_at: nil}), do: true
+
+  def valid_now?(%ApiKey{expires_at: expires_at}),
     do: DateTime.compare(expires_at, DateTime.utc_now()) == :gt
 
   defp verify_and_touch(api_key, key_hash) do

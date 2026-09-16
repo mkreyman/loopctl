@@ -4,6 +4,7 @@ defmodule Loopctl.KnowledgeAnalyticsTest do
   setup :verify_on_exit!
 
   alias Loopctl.AdminRepo
+  alias Loopctl.Auth
   alias Loopctl.Knowledge
   alias Loopctl.Knowledge.Analytics
   alias Loopctl.Knowledge.ArticleAccessEvent
@@ -781,7 +782,7 @@ defmodule Loopctl.KnowledgeAnalyticsTest do
         })
       end
 
-      {:ok, _} = Loopctl.Auth.revoke_api_key(api_key)
+      {:ok, _} = Auth.revoke_api_key(api_key)
 
       rows = Knowledge.list_top_articles(tenant.id, group_by: :agent, since: hours_ago(1))
 
@@ -879,6 +880,127 @@ defmodule Loopctl.KnowledgeAnalyticsTest do
 
       assert {:error, :not_found} =
                Knowledge.get_agent_usage(tenant_a.id, agent_b.id)
+    end
+  end
+
+  describe "get_agent_usage/3 live breakdown counts ACTIVE keys, not merely un-revoked ones" do
+    # 846.8 review. `api_key_count` and `top_articles` are documented as the agent's CURRENT
+    # OPERATIONAL SURFACE, and both tested `revoked_at IS NULL` alone — the same defect AC-2
+    # fixed on the two admin counts, still standing on a third operator-facing surface
+    # (`knowledge_agent_usage`). All three now share `Auth.active_api_keys_query/0`.
+    #
+    # THE SEED IS A `:user`-ROLE KEY CARRYING AN `agent_id`, and it has to be, for the reason
+    # `test/loopctl/tenants/active_api_key_counts_test.exs` states: for any key the sweep DOES
+    # reach, the two definitions converge within a minute and a test cannot tell them apart.
+    # `RevokeExpiredApiKeysWorker` never revokes a `user`/`superadmin` key — and a `user` key
+    # may carry an `agent_id`, so it lands in this rollup and stays `revoked_at IS NULL` for
+    # ever.
+    test "an expired but unrevoked key leaves api_key_count and top_articles alone" do
+      tenant = fixture(:tenant)
+      agent = fixture(:agent, %{tenant_id: tenant.id, name: "rollup-agent"})
+
+      # Distinct roles: `api_keys_one_role_per_agent_idx` is partial on `revoked_at IS NULL`
+      # and cannot test expiry, so the expired key still occupies its own role's slot.
+      {_raw, expired} =
+        fixture(:api_key, %{tenant_id: tenant.id, agent_id: agent.id, role: :user, name: "e"})
+
+      {_raw, live} =
+        fixture(:api_key, %{tenant_id: tenant.id, agent_id: agent.id, role: :agent, name: "l"})
+
+      {:ok, expired} = Auth.expire_api_key(expired, DateTime.add(DateTime.utc_now(), -3600))
+
+      stale = fixture(:article, %{tenant_id: tenant.id, title: "read by the dead key"})
+      current = fixture(:article, %{tenant_id: tenant.id, title: "read by the live key"})
+
+      for _ <- 1..3 do
+        fixture(:article_access_event, %{
+          tenant_id: tenant.id,
+          article_id: stale.id,
+          api_key_id: expired.id
+        })
+      end
+
+      fixture(:article_access_event, %{
+        tenant_id: tenant.id,
+        article_id: current.id,
+        api_key_id: live.id
+      })
+
+      # The row is still un-revoked — the state the sweep leaves for ever — so without an
+      # expiry term this reads as two live keys and the dead key's article tops the list.
+      refute expired.revoked_at
+
+      assert {:ok, usage} = Knowledge.get_agent_usage(tenant.id, agent.id, since: hours_ago(1))
+
+      assert usage.api_key_count == 1
+      assert Enum.map(usage.top_articles, & &1.article_id) == [current.id]
+
+      # The historical aggregates are unchanged, which is the split AC-25.2.7 declares: the
+      # reads happened, and only the CURRENT-surface fields exclude them.
+      assert usage.total_reads == 4
+      assert usage.unique_articles == 2
+    end
+
+    test "a key expiring in the FUTURE and a key with no expiry are both live" do
+      # The positive control. Without it the assertion above is satisfied by a rollup that
+      # counts nothing and returns an empty list.
+      tenant = fixture(:tenant)
+      agent = fixture(:agent, %{tenant_id: tenant.id, name: "rollup-agent"})
+
+      {_raw, future} =
+        fixture(:api_key, %{tenant_id: tenant.id, agent_id: agent.id, role: :user, name: "f"})
+
+      {_raw, never} =
+        fixture(:api_key, %{tenant_id: tenant.id, agent_id: agent.id, role: :agent, name: "n"})
+
+      {:ok, future} = Auth.expire_api_key(future, DateTime.add(DateTime.utc_now(), 3600))
+
+      article = fixture(:article, %{tenant_id: tenant.id, title: "read by both"})
+
+      fixture(:article_access_event, %{
+        tenant_id: tenant.id,
+        article_id: article.id,
+        api_key_id: future.id
+      })
+
+      fixture(:article_access_event, %{
+        tenant_id: tenant.id,
+        article_id: article.id,
+        api_key_id: never.id
+      })
+
+      assert {:ok, usage} = Knowledge.get_agent_usage(tenant.id, agent.id, since: hours_ago(1))
+
+      assert usage.api_key_count == 2
+      assert [%{article_id: id, access_count: 2}] = usage.top_articles
+      assert id == article.id
+    end
+
+    test "a REVOKED key is still excluded (the original predicate is kept, not replaced)" do
+      tenant = fixture(:tenant)
+      agent = fixture(:agent, %{tenant_id: tenant.id, name: "rollup-agent"})
+
+      {_raw, revoked} =
+        fixture(:api_key, %{tenant_id: tenant.id, agent_id: agent.id, role: :user, name: "r"})
+
+      {_raw, _live} =
+        fixture(:api_key, %{tenant_id: tenant.id, agent_id: agent.id, role: :agent, name: "l"})
+
+      article = fixture(:article, %{tenant_id: tenant.id, title: "read by the revoked key"})
+
+      fixture(:article_access_event, %{
+        tenant_id: tenant.id,
+        article_id: article.id,
+        api_key_id: revoked.id
+      })
+
+      {:ok, _} = Auth.revoke_api_key(revoked)
+
+      assert {:ok, usage} = Knowledge.get_agent_usage(tenant.id, agent.id, since: hours_ago(1))
+
+      assert usage.api_key_count == 1
+      assert usage.top_articles == []
+      assert usage.total_reads == 1
     end
   end
 

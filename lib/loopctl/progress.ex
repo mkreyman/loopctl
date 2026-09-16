@@ -2807,77 +2807,54 @@ defmodule Loopctl.Progress do
 
   - `{:ok, %Story{}}` on success
   - `{:error, :not_found}` if story not found in tenant
+  - `{:error, %Ecto.Changeset{}}` if the release write itself is refused
+  - `{:error, :force_unclaim_failed}` if any LATER step of the transaction is — see the
+    result `case` below for which steps those are and why none of them can reach it today
+
+  The changeset shape is why this spec is not the `{:error, atom()}` it used to claim: the
+  `:story` clause has handed back a changeset since this function was written, so the spec
+  and the code disagreed. This is an OPERATOR'S REMEDY for a parked story — the one call
+  that unsticks a claim nothing else will release — so every refusal it can produce has to
+  be a value the caller can report, and a `@spec` it does not honour is the first step
+  towards a caller that believes it.
   """
   @spec force_unclaim_story(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) ::
-          {:ok, Story.t()} | {:error, atom()}
+          {:ok, Story.t()} | {:error, atom() | Ecto.Changeset.t()}
   def force_unclaim_story(tenant_id, story_id, opts \\ []) do
-    orchestrator_agent_id = Keyword.get(opts, :orchestrator_agent_id)
-    actor_id = Keyword.get(opts, :actor_id)
-    actor_label = Keyword.get(opts, :actor_label)
+    multi = force_unclaim_multi(tenant_id, story_id, opts)
 
-    multi =
-      Multi.new()
-      |> Multi.run(:lock, fn _repo, _changes ->
-        lock_story(tenant_id, story_id)
-      end)
-      |> Multi.run(:story, fn _repo, %{lock: story} ->
-        # Idempotent on STATE, not on the marker. A worked story can already sit at
-        # :pending with no stamp (reset before the column existed), and re-running
-        # force-unclaim is the operator's remedy for exactly that — returning the
-        # struct untouched made the remedy a no-op.
-        if story.agent_status == :pending do
-          retro_stamp_lifecycle(story)
-        else
-          story
-          |> Ecto.Changeset.change(release_claim_changes(story))
-          |> AdminRepo.update()
-        end
-      end)
-      # #803: the stage row follows the release in this transaction. On the idempotent
-      # :pending branch the epoch did not move, and this rebinds a row a release left behind
-      # before follow_release/5 existed — the same operator remedy as the retro-stamp above.
-      |> Multi.run(:stage, fn _repo, %{story: updated} ->
-        Stages.follow_release(tenant_id, updated.id, updated.claim_epoch, :claim_released,
-          actor_label: actor_label
-        )
-      end)
-      |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
-        %{
-          tenant_id: tenant_id,
-          entity_type: "story",
-          entity_id: updated.id,
-          action: "force_unclaimed",
-          actor_type: "api_key",
-          actor_id: actor_id,
-          actor_label: actor_label,
-          old_state: %{
-            "agent_status" => to_string(old.agent_status),
-            "assigned_agent_id" => old.assigned_agent_id
-          },
-          new_state: %{
-            "agent_status" => "pending",
-            "orchestrator_agent_id" => orchestrator_agent_id
-          }
-        }
-      end)
-      |> EventGenerator.generate_events(:webhook_events, fn %{story: updated, lock: old} ->
-        %{
-          tenant_id: tenant_id,
-          event_type: "story.force_unclaimed",
-          project_id: updated.project_id,
-          payload: %{
-            "event" => "story.force_unclaimed",
-            "story_id" => updated.id,
-            "project_id" => updated.project_id,
-            "epic_id" => updated.epic_id,
-            "old_status" => to_string(old.agent_status),
-            "new_status" => "pending",
-            "orchestrator_agent_id" => orchestrator_agent_id,
-            "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
-          }
-        }
-      end)
-
+    # ONE CLAUSE PER MULTI STEP, and deliberately NO catch-all. The Multi has five steps and
+    # this matched three of them, so a refusal at `:stage`, `:audit` or `:webhook_events` was
+    # a `CaseClauseError` — an exception out of the one call an operator makes to unstick a
+    # parked story, and one that contradicted this function's own `@spec` (846.8, AC-5).
+    #
+    # A catch-all would have been the wrong repair and is what this house style refuses (see
+    # `LoopctlWeb.DispatchController.revoke_ceiling/3`): it hides the SIXTH step somebody adds
+    # later, which is exactly how the defect arrived. `test/loopctl/progress/
+    # force_unclaim_result_coverage_test.exs` fails when a step name appears in the Multi and
+    # not here, so adding a step without deciding what its failure means is caught at the gate
+    # rather than in production. It reads the STEPS off the `%Ecto.Multi{}`
+    # `force_unclaim_multi/3` returns and the CLAUSES off this `case`'s AST — neither is a
+    # text scan, which is what it used to be and what kept having blind spots; the guard's own
+    # moduledoc states the two things it still cannot see, and both of those fail loud.
+    #
+    # ## None of the three added clauses can fire TODAY, and they are not pretending otherwise
+    #
+    #   * `:stage` — `Stages.follow_release/5` is specced `{:ok, StoryStage.t() | nil}` and
+    #     every one of its three branches returns `{:ok, _}` (`stages.ex:976-988`). Its own
+    #     failures are `true = ` and `{1, [updated]} = ` MATCHES and unguarded `AdminRepo`
+    #     statements, so they raise and abort the transaction rather than returning a tuple.
+    #   * `:audit` — `Audit.log_in_multi/3` inserts an `AuditLog.create_changeset/1` whose four
+    #     required fields (`entity_type`, `entity_id`, `action`, `actor_type`) are all set here
+    #     from literals or from `updated.id`, so the changeset is valid by construction. There
+    #     is no `unique_constraint` on that changeset either, so a database refusal raises.
+    #   * `:webhook_events` — `EventGenerator.generate_events/3` ends `{:ok, events}` on every
+    #     path and hard-matches `{:ok, _}` on the inserts underneath, so it too raises instead.
+    #
+    # So the shape that actually reaches a caller from those three is an EXCEPTION, which
+    # `Placement.release_claim/5` rescues by design. These clauses exist for the step that is
+    # added next, and the log line is what tells an operator which one it was — the returned
+    # atom names none of them, because `:webhook_events` is not a fact about the story.
     case AdminRepo.transaction(multi) do
       {:ok, %{story: updated}} ->
         revoke_released_session_credential(tenant_id, updated, opts)
@@ -2888,7 +2865,109 @@ defmodule Loopctl.Progress do
 
       {:error, :story, changeset, _} ->
         {:error, changeset}
+
+      {:error, step, reason, _} when step in [:stage, :audit, :webhook_events] ->
+        Logger.error(
+          "force_unclaim rolled back at a step that is not supposed to be able to refuse. " <>
+            "The story is UNCHANGED — still claimed, still held — and the remedy has to be " <>
+            "re-run. tenant_id=#{tenant_id} story_id=#{story_id} step=#{inspect(step)} " <>
+            "reason=#{inspect(reason)}",
+          tenant_id: tenant_id,
+          story_id: story_id
+        )
+
+        {:error, :force_unclaim_failed}
     end
+  end
+
+  @doc """
+  The `Ecto.Multi` `force_unclaim_story/3` runs. Builds nothing in the database and executes
+  no query; every step is a closure the transaction runs later.
+
+  PUBLIC SO THE STEPS CAN BE READ WITHOUT RUNNING THEM (846.8 review round 2), which is the
+  one thing that makes the drift guard in
+  `test/loopctl/progress/force_unclaim_result_coverage_test.exs` unable to MISS a step. That
+  guard exists because a step was once added here and the result `case` was not revisited;
+  it used to find the steps by scanning this file's text with a regex, and three review
+  rounds found three different spellings that scan could not see — a formatter-broken pipe,
+  an atom carrying a digit, and a step added anywhere other than a literal pipe in this
+  function. Every one of them failed SILENTLY GREEN, in the direction the guard exists to
+  prevent. `Ecto.Multi.to_list/1` on the value this returns is not a reading of the source,
+  it is the operation list itself, so that class of hole is gone rather than narrowed.
+
+  Same seam, and same justification, as `Loopctl.Delivery.Placement.escalate_unreleased_claim/6`
+  and `Loopctl.Delivery.StoryPayload.settle_if_parked/3`: published for a test that cannot
+  otherwise reach the state, with one production caller. Nothing else should call it —
+  running this Multi outside `force_unclaim_story/3` skips the credential revoke that
+  follows the commit.
+  """
+  @spec force_unclaim_multi(Ecto.UUID.t(), Ecto.UUID.t(), keyword()) :: Multi.t()
+  def force_unclaim_multi(tenant_id, story_id, opts \\ []) do
+    orchestrator_agent_id = Keyword.get(opts, :orchestrator_agent_id)
+    actor_id = Keyword.get(opts, :actor_id)
+    actor_label = Keyword.get(opts, :actor_label)
+
+    Multi.new()
+    |> Multi.run(:lock, fn _repo, _changes ->
+      lock_story(tenant_id, story_id)
+    end)
+    |> Multi.run(:story, fn _repo, %{lock: story} ->
+      # Idempotent on STATE, not on the marker. A worked story can already sit at
+      # :pending with no stamp (reset before the column existed), and re-running
+      # force-unclaim is the operator's remedy for exactly that — returning the
+      # struct untouched made the remedy a no-op.
+      if story.agent_status == :pending do
+        retro_stamp_lifecycle(story)
+      else
+        story
+        |> Ecto.Changeset.change(release_claim_changes(story))
+        |> AdminRepo.update()
+      end
+    end)
+    # #803: the stage row follows the release in this transaction. On the idempotent
+    # :pending branch the epoch did not move, and this rebinds a row a release left behind
+    # before follow_release/5 existed — the same operator remedy as the retro-stamp above.
+    |> Multi.run(:stage, fn _repo, %{story: updated} ->
+      Stages.follow_release(tenant_id, updated.id, updated.claim_epoch, :claim_released,
+        actor_label: actor_label
+      )
+    end)
+    |> Audit.log_in_multi(:audit, fn %{story: updated, lock: old} ->
+      %{
+        tenant_id: tenant_id,
+        entity_type: "story",
+        entity_id: updated.id,
+        action: "force_unclaimed",
+        actor_type: "api_key",
+        actor_id: actor_id,
+        actor_label: actor_label,
+        old_state: %{
+          "agent_status" => to_string(old.agent_status),
+          "assigned_agent_id" => old.assigned_agent_id
+        },
+        new_state: %{
+          "agent_status" => "pending",
+          "orchestrator_agent_id" => orchestrator_agent_id
+        }
+      }
+    end)
+    |> EventGenerator.generate_events(:webhook_events, fn %{story: updated, lock: old} ->
+      %{
+        tenant_id: tenant_id,
+        event_type: "story.force_unclaimed",
+        project_id: updated.project_id,
+        payload: %{
+          "event" => "story.force_unclaimed",
+          "story_id" => updated.id,
+          "project_id" => updated.project_id,
+          "epic_id" => updated.epic_id,
+          "old_status" => to_string(old.agent_status),
+          "new_status" => "pending",
+          "orchestrator_agent_id" => orchestrator_agent_id,
+          "timestamp" => DateTime.to_iso8601(DateTime.utc_now())
+        }
+      }
+    end)
   end
 
   # Taking a story back kills the credential the previous holder had. AFTER the commit,
@@ -2908,6 +2987,24 @@ defmodule Loopctl.Progress do
   # the wide case unacceptable. It does NOT clear `implementer_dispatch_id`: that is custody
   # provenance, `get_dispatch_lineage/2` reads a revoked row exactly as it reads a live one, and
   # every L4 comparison is therefore unchanged by this.
+  #
+  # NOT CLEARING IT HAS A COST, and it is stated here rather than left for a reader to
+  # discover: when this call is the remedy for a placement whose compensation could not revoke
+  # (`Delivery.Placement.undo_claim/5`), the credential dies but the story goes on naming the
+  # dispatch that never ran — so the next claimant is still refused on report if it holds a key
+  # no dispatch minted (`caller_lineage_required`) or one sharing that dispatch's chain
+  # (`self_report_blocked`), until a claim THROUGH A DISPATCH overwrites the column.
+  #
+  # Clearing it here would be worse, and the asymmetry is why this is not a TODO. Force-unclaim
+  # is the operator's release for ANY claimed story; from inside it, a story whose dispatch did
+  # nothing and one whose dispatch genuinely implemented it are the same shape. Clearing would
+  # therefore drop real provenance and reduce a dispatch-minted story to the pre-dispatch shape,
+  # where `lineage_status/2` returns `:ok` on the nil and the gates fall back to
+  # `assigned_agent_id` equality alone — letting a key in the implementer's own chain, on a
+  # different agent, report the work that chain did. `force_unclaim` is `exact_role:
+  # :orchestrator`, which is precisely the role that could arrange it. A narrower rule was
+  # looked for and none holds: `lifecycle_entered_at` is stamped by BOTH cases, and a second
+  # force-unclaim of an already-`pending` worked story is indistinguishable from the residue.
   #
   # AND IT SWALLOWS A RAISE, not only an `{:error, _}`. `Dispatches.revoke/3` returns tuples
   # from its own Multi, but the statements under it are ordinary AdminRepo calls on a

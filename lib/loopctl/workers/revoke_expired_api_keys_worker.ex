@@ -92,11 +92,16 @@ defmodule Loopctl.Workers.RevokeExpiredApiKeysWorker do
     for which the asymmetry does not hold — no slot freed, the rotate path destroyed.
 
     The cost accepted: an expired key OUTSIDE the index — `user`/`superadmin`, or any
-    role with a NULL `agent_id` — keeps reading as un-revoked in the operator-facing
-    "active keys" counts (`Loopctl.Tenants.tenant_stats/1`, `count_active_api_keys/0`),
-    which test `revoked_at IS NULL` alone. That is a COUNT being cosmetic, weighed
-    against a recovery path being destroyed. Fix it in those counters — they can test
-    `expires_at` freely, being ordinary queries — never by widening this sweep.
+    role with a NULL `agent_id` — stays `revoked_at IS NULL` for ever. That was a COUNT
+    being cosmetic, weighed against a recovery path being destroyed, and the counters
+    have since been fixed rather than this sweep widened (846.8, AC-2):
+    `Loopctl.Tenants`' private `active_api_keys/0` is the one predicate behind the operator-facing
+    "active keys" counts (`Loopctl.Tenants.list_tenants_admin/1` and `get_tenant_admin/1`
+    via `tenant_with_stats/1`, and `system_stats/0` via `count_active_api_keys/0`) and it
+    tests expiry as well as revocation, matching `Loopctl.Auth.load_active_api_key/1`.
+    Those are ordinary queries and may test `expires_at` freely; the partial unique index
+    may not. **So this sweep is not, and must not become, what makes a count true** —
+    widening it here to converge a number is the trade this section already refused.
   * **A NULL `expires_at` is never touched.** That is a non-expiring key —
     every legacy env-var key is one — and it is live by both notions.
   * **An already-revoked key is never touched**, so the sweep is idempotent and

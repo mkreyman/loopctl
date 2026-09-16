@@ -37,7 +37,10 @@ defmodule LoopctlWeb.AdminTenantController do
 
   operation(:index,
     summary: "List all tenants (admin)",
-    description: "Lists all tenants with summary stats. Requires superadmin.",
+    description:
+      "Lists all tenants with summary stats. Requires superadmin. " <>
+        "`api_key_count` counts keys that can AUTHENTICATE right now: neither revoked nor " <>
+        "past `expires_at` (846.8). It tested revocation alone before that.",
     parameters: [
       status: [in: :query, type: :string, description: "Filter by status"],
       search: [in: :query, type: :string, description: "Search by name or slug"],
@@ -54,7 +57,9 @@ defmodule LoopctlWeb.AdminTenantController do
 
   operation(:show,
     summary: "Get tenant detail (admin)",
-    description: "Returns full tenant detail with all summary stats.",
+    description:
+      "Returns full tenant detail with all summary stats. `api_key_count` counts keys " <>
+        "that can AUTHENTICATE right now: neither revoked nor past `expires_at` (846.8).",
     parameters: [id: [in: :path, type: :string, description: "Tenant UUID"]],
     responses: %{
       200 =>

@@ -335,6 +335,52 @@ All notable changes to loopctl are documented here.
 
 ### Fixed
 
+- **The "active API keys" counts ignored expiry (846.8).** `GET /api/v1/admin/stats`
+  (`total_api_keys`), `GET /api/v1/admin/tenants[/:id]` (`api_key_count`) and
+  `GET /api/v1/knowledge/agents/:id/usage` (MCP `knowledge_agent_usage`: `api_key_count`, and
+  the `top_articles` list it scopes to live keys) all counted `revoked_at IS NULL` alone, so
+  every expired-but-unrevoked key read as active. That set never drains on its own:
+  `RevokeExpiredApiKeysWorker` deliberately never revokes a `user`/`superadmin` key nor any
+  key with no `agent_id`, because doing so would destroy the rotate path without freeing an
+  `api_keys_one_role_per_agent_idx` slot — and a `user` key MAY carry an `agent_id`, so it
+  lands in the agent rollup too. All three now share the auth pipeline's own definition,
+  `Loopctl.Auth.active_api_keys_query/0` — not revoked AND not past `expires_at` — so
+  **the numbers an operator reads on those endpoints will DROP** to the keys that can
+  actually authenticate, and `top_articles` will drop reads made by an expired key. Nothing
+  about which keys work changed; only the counts did. The per-agent LEADERBOARD
+  (`GET /api/v1/knowledge/top-articles?group_by=agent`) is deliberately unchanged: its two
+  buckets are exact complements and the second is published as `"revoked"`.
+
+- **`POST /api/v1/stories/:id/force-unclaim` answered a stacktrace instead of an error
+  (846.8).** The controller matched only `{:ok, _}` and `{:error, :not_found}`, and the
+  context function matched three of its transaction's five steps — so any other refusal was
+  a `CaseClauseError`, i.e. an unrendered 500, on the one call an operator makes to unstick a
+  parked story. Refusals now render through the standard error body (422 for a rejected
+  release write, 500 with a logged reason otherwise), and the endpoint's OpenAPI operation
+  declares 400/422/500 alongside the 200/404/429 it listed before — a client generated from
+  the published schema previously had no case for any of the three.
+
+  **Error-code change:** that 500 now carries `code: "force_unclaim_failed"` where it
+  previously fell through to the generic `internal_error`. The message says the story is
+  unchanged and the call should be re-run.
+
+  **`POST /api/v1/stories/:id/stage/resolve` is affected too**, and was not before: resolving
+  an escalated story to `queued` RELEASES its claim first, so every refusal force-unclaim can
+  return is a refusal of that endpoint. It now declares 400, 422, 500 and 503 alongside the
+  statuses it already listed, and renders the same named 500. A caller resolving to `done` or
+  `failed` is unaffected — those release nothing.
+
+- **A placement that could not revoke its session credential erased the remedy for it
+  (846.8).** `Delivery.Placement`'s compensation cleared the story's
+  `implementer_dispatch_id` BEFORE revoking the dispatch, so a clear that succeeded ahead of a
+  revoke that failed left the operator holding a story that named nothing — while the
+  credential went on occupying the runner agent's one-key-per-role slot, refusing every later
+  placement onto that machine with 422 `agent already has an active key with this role` until
+  its TTL. **Operator-visible:** `POST /api/v1/stories/:id/force-unclaim` (MCP
+  `force_unclaim_story`) now recovers that state, which is what the placement's own error log
+  has always told you to run. Observed once in production on 2026-09-15: one story parked for
+  four hours.
+
 - **Contract 1.9.2 — a nullable enum publishes `null` as a member.** `incomplete` was typed
   `["string", "null"]` with an enum of the five reasons, and under JSON Schema 2020-12 an
   `enum` constrains EVERY instance, `null` included — so the two keywords contradicted each
